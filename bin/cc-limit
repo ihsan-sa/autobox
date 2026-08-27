@@ -4,16 +4,18 @@
 #   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0, or "clear" + exit 1
 #   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT
 #   cc-limit clear     forget it (every caller does this after a run that reached the API)
-# Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>" — shared, so a second loop waits
-# instead of burning its retries. No secrets in it. Env: CC_LIMIT_MAX_WAIT (default 21600 = 6 h)
+# Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>\t<model-family>" — shared, so a second
+# loop waits instead of burning its retries; the model is what cc-model needs to know whose limit it was (may be empty
+# when the message names none). No secrets in it. Env: CC_LIMIT_MAX_WAIT (default 21600 = 6 h)
 # · CC_LIMIT_MIN_WAIT (test hook: cap any sleep at N seconds).
 set -uo pipefail
+BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 S="$HOME/.cc/state/claude-limit"; now=$(date -u +%s); MAX="${CC_LIMIT_MAX_WAIT:-21600}"
-stamp(){ ends=0; src=""; first=0; [ -f "$S" ] && IFS=$'\t' read -r ends src first < "$S"; [[ "$ends" =~ ^[0-9]+$ ]] || ends=0; [[ "$first" =~ ^[0-9]+$ ]] || first=0; }
+stamp(){ ends=0; src=""; first=0; mdl=""; [ -f "$S" ] && IFS=$'\t' read -r ends src first mdl < "$S"; [[ "$ends" =~ ^[0-9]+$ ]] || ends=0; [[ "$first" =~ ^[0-9]+$ ]] || first=0; }
 case "${1:-}" in
   clear) rm -f "$S"; exit 0 ;;
   status) stamp; [ "$ends" -gt "$now" ] || { echo clear; exit 1; }
-    printf 'usage limit until %sZ (%dm left)\n' "$(date -u -d "@$ends" +%H:%M)" $(( (ends - now + 59) / 60 )); exit 0 ;;
+    printf 'usage limit until %sZ (%dm left)%s\n' "$(date -u -d "@$ends" +%H:%M)" $(( (ends - now + 59) / 60 )) "${mdl:+ [$mdl]}"; exit 0 ;;
   wait) stamp; s=$((ends - now)); [ "$s" -le 0 ] && exit 0
     { [ -n "${CC_LIMIT_MIN_WAIT:-}" ] && [ "$s" -gt "$CC_LIMIT_MIN_WAIT" ]; } && s="$CC_LIMIT_MIN_WAIT"
     [ "$s" -gt "$MAX" ] && exit 1; sleep "$s"; exit 0 ;;
@@ -41,11 +43,16 @@ elif m=$(grep -oiE "${RS}[0-9]{1,2}(:[0-9]{2})? *(am|pm)?" <<<"$txt" | head -1) 
   how="at"
 fi
 [[ "${u:-0}" =~ ^[0-9]+$ ]] || u=0
+# whose limit was it? the model family named anywhere in the message or the run's json (modelUsage keys carry it)
+newm=$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku)\b' <<<"$txt $(head -c 2000 "$j")" | head -1 | tr 'A-Z' 'a-z')
+case "$newm" in *fable*) newm=fable;; *opus*) newm=opus;; *sonnet*) newm=sonnet;; *haiku*) newm=haiku;; *) newm="";; esac
 stamp; same=0; { [ "$first" -gt 0 ] && [ "$ends" -gt $((now - 900)) ]; } && same=1   # still the same limit episode
 [ "$same" = 1 ] || first=$now
 if [ "$u" -le "$now" ]; then   # no time in the message: exponential backoff, remembered in the stamp (5, 10, 20, 40, 60 min)
   b=5; [ "$same" = 1 ] && case "$src" in backoff:[0-9]*) b=$(( ${src#backoff:} * 2 )); [ "$b" -gt 60 ] && b=60;; esac
   u=$((now + b * 60)); how="backoff:$b"
 fi
-mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\n' "$u" "$how" "$first" > "$S"
+[ -n "$newm" ] || newm="$mdl"   # same episode, a message that names no model: keep what we already knew
+mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\t%s\n' "$u" "$how" "$first" "$newm" > "$S"
+[ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" limited "$newm" "$newm limit" >/dev/null 2>&1   # a limit on the box's primary model moves every session to the fallback (cc-model decides if it was)
 echo "LIMIT $u"

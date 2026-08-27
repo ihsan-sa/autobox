@@ -173,6 +173,61 @@ CC_SLACK_CHANNEL=1 "$B/cc-slack" channel $REPO < "$T/fifo" > "$T/ch2.out" 2>/dev
 [ "$("$B/cc-slack" inject --no-start $REPO live-msg)" = delivered ] && ok "inject with a subscriber → delivered" || bad "deliver"
 sleep 5; grep -q queued-msg "$T/ch2.out" && grep -q live-msg "$T/ch2.out" && grep -q 'notifications/claude/channel' "$T/ch2.out" && ok "backlog flushed on subscribe + live event as notifications/claude/channel" || bad "channel notifications"
 kill $SD 2>/dev/null; pkill -f '^python3 .*cc-slack daemon --no-slack' 2>/dev/null; unset CC_SLACK_DIR
+echo "== model fallback (cc-model + cc-limit) =="
+# own HOME and own tmux server (TMUX unset, TMUX_TMPDIR into $T): the live sessions' models are never touched
+MH="$T/mh"; mkdir -p "$MH/.cc/state" "$T/fb"; printf '#!/usr/bin/env bash\ncat\n' > "$T/fb/cc-loop"; chmod +x "$T/fb/cc-loop"
+cat > "$T/probeclaude" <<'F'
+#!/usr/bin/env bash
+printf '{"is_error":false,"num_turns":1,"total_cost_usd":0.001,"result":"ok"}'
+F
+chmod +x "$T/probeclaude"
+MT(){ env -u TMUX TMUX_TMPDIR="$T" tmux "$@"; }
+ME(){ env -u TMUX TMUX_TMPDIR="$T" HOME="$MH" CC_TMUX_SESSION=_ccmodel CC_MODEL_PROC=cat \
+      CC_MODEL_PRIMARY='claude-fable-5[1m]' CC_MODEL_FALLBACK=claude-opus-5 "$@"; }
+M(){ ME "$B/cc-model" "$@"; }
+MT new-session -d -s _ccmodel -n sess 'bash -c "cat; true"'
+MT new-window -d -t _ccmodel -n wkr "bash -c '$T/fb/cc-loop; true'"   # a worker pane: cc-loop is its child and claude a grandchild
+sleep 1
+[ "$(M status)" = fable ] && ok "cc-model status: fable while nothing is limited" || bad "cc-model status: $(M status)"
+[ -z "$(M current)" ] && ok "cc-model current is empty with no override" || bad "cc-model current leaked a model"
+printf '{"is_error":true,"result":"claude-fable-5: You have hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}' > "$T/fab.json"
+ME "$B/cc-limit" check "$T/fab.json" >/dev/null
+[ "$(cut -f4 "$MH/.cc/state/claude-limit")" = fable ] && ok "cc-limit records the limited model (stamp field 4)" || bad "stamp model: $(cut -f4 "$MH/.cc/state/claude-limit" 2>/dev/null)"
+M status | grep -qE '^opus until [0-9]{2}:[0-9]{2}Z$' && ok "a fable limit puts the box on opus until the reset" || bad "cc-model status after a fable limit: $(M status)"
+[ "$(M current)" = claude-opus-5 ] && ok "cc-model current feeds --model to new sessions and workers" || bad "cc-model current: $(M current)"
+sleep 1
+MT capture-pane -p -t _ccmodel:sess | grep -q '/model claude-opus-5' && ok "switch typed /model into the live interactive session" || bad "nothing typed into the session"
+MT capture-pane -p -t _ccmodel:wkr | grep -q '/model' && bad "typed into a headless worker window!" || ok "headless worker window (cc-loop) skipped"
+n=$(grep -c ' model' "$MH/.cc/notify.log" 2>/dev/null)
+[ "$n" = 1 ] && ok "one line to the owner per switch (title '<box> model' -> #alerts)" || bad "switch notify count: $n"
+ME "$B/cc-limit" check "$T/fab.json" >/dev/null   # the same limit again
+[ "$(grep -c ' model' "$MH/.cc/notify.log" 2>/dev/null)" = 1 ] && ok "a second hit on the same limit is a no-op (idempotent)" || bad "switch not idempotent"
+mnow=$(date -u +%s); printf 'claude-opus-5\t%s\t%s\ttest\t0\n' "$((mnow-600))" "$((mnow-60))" > "$MH/.cc/state/model-override"
+: > "$MH/.cc/state/model.log"   # forget that switch: the 10-min anti-flap gap is not what this case is about
+nl0=$(wc -l < "$MH/.cc/notify.log")
+ME env CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick
+{ [ ! -f "$MH/.cc/state/model-override" ] && [ "$(M status)" = fable ]; } && ok "tick restores fable once the reset passed and the probe answered" || bad "override survived a successful probe"
+sleep 1
+MT capture-pane -p -t _ccmodel:sess | grep -qF '/model claude-fable-5[1m]' && ok "restore typed /model claude-fable-5[1m] into the live session" || bad "restore not typed"
+n=$(tail -n +$((nl0+1)) "$MH/.cc/notify.log" | grep -c 'is back'); [ "$n" = 1 ] && ok "exactly one 'Fable back' line to the owner" || bad "restore notify count: $n"
+# a live pane that mentions a limit: the probe decides, and one line fires once
+cat > "$T/failprobe" <<'F'
+#!/usr/bin/env bash
+printf '{"is_error":true,"result":"You have hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}'; exit 1
+F
+chmod +x "$T/failprobe"
+rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/claude-limit" "$MH/.cc/state/model-seen"; : > "$MH/.cc/state/model.log"
+mline(){ MT send-keys -t _ccmodel:sess -l -- "$1"; sleep 0.3; MT send-keys -t _ccmodel:sess Enter; sleep 0.5; }
+mline "Claude usage limit reached. Your limit resets at 11:40."
+ME env CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick
+[ "$(M status)" = fable ] && ok "a pane that mentions a limit while the model still answers does not switch" || bad "pane scan switched on a docs/question line: $(M status)"
+mline "Claude usage limit reached. Your limit resets at 12:40."
+ME env CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
+[ "$(M status)" = "opus until probe" ] && ok "a real limit line in a live pane switches the box (probe agrees)" || bad "pane scan: $(M status)"
+rm -f "$MH/.cc/state/model-override"; : > "$MH/.cc/state/model.log"
+ME env CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
+[ "$(M status)" = fable ] && ok "the same pane line never fires twice (per-window hash)" || bad "pane line fired again"
+for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 # cleanup
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 if [ -f "$T/stamp.bak" ]; then mv "$T/stamp.bak" ~/.cc/state/claude-limit; else rm -f ~/.cc/state/claude-limit; fi   # restore the live stamp (or leave none)

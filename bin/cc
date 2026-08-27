@@ -24,6 +24,7 @@ SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF"); ROOT=$(dirname "$BIN")   # hel
 DEV="$HOME/dev"; SESSION=main; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"; WTBASE="$HOME/.cc/worktrees"; STBASE="$HOME/.cc/state"; BOARD="$BIN/cc-board"
 SLACKON="$HOME/.cc/slack/enabled"   # `cc slack on` creates it: sessions load the Slack channel server (bin/cc-slack)
 chan_args(){ [ -f "$SLACKON" ] || return 0; printf '%s\n' --dangerously-load-development-channels "server:cc-slack"; }   # the server itself is registered in user scope by `cc slack on`; it finds its target from the cwd
+model_args(){ local m; m=$("$BIN/cc-model" current 2>/dev/null) && [ -n "$m" ] && printf '%s\n%s\n' --model "$m"; return 0; }   # while the box's primary model is limited, new sessions start on the fallback
 chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slack" accept-dialog "$1" >/dev/null 2>&1 & ); }; return 0; }   # auto-accepts the dev-channels dialog in that tmux window
 ensure_main(){ tmux has-session -t "$SESSION" 2>/dev/null || "$BIN/cc-boot"; }   # server creation goes through tmux-main.service (cgroup ownership; 2026-08-26 incident)
 attach_main(){ [ -t 0 ] || return 0; if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$SESSION" 2>/dev/null || true; else exec tmux attach -t "$SESSION"; fi; }
@@ -139,6 +140,7 @@ case "${1:-}" in
     sid=$("$BOARD" get "$repo" "$track" session_id); started=$("$BOARD" get "$repo" "$track" started); base=$(default_branch "$DEV/$repo")
     sp="You are an orchestrated session for track '$track' of repo '$repo' (own git worktree, branch track/$track). Durable state: journal $st/progress.md (read it first if it exists; append dated entries: done / next / gotchas — a fresh session rehydrates from it), task $st/task.md if present. Board: 'cc board show $repo'; report with 'cc board note $repo $track \"...\"' and 'cc board status $repo $track running|review|blocked'. Your work is auto-committed and pushed to track/$track after every turn — do NOT run git commit/push yourself, and never touch branch '$base'. When done run 'cc done $repo $track' (opens a PR; do not merge). Reach the owner only when truly blocked: 'cc-notify -t \"$repo/$track\" \"question\"'. Keep answers concise; use subagents for large read/search work to protect your context."
     args=(--append-system-prompt "$sp" --remote-control "$repo/$track"); mapfile -t CH < <(chan_args "$repo/$track"); args+=("${CH[@]}"); chan_accept "$repo/$track"
+    mapfile -t MO < <(model_args); args+=("${MO[@]}")
     # a session id whose transcript is gone (crash before the first write, or the 30-day prune) makes --resume fail forever: mint a fresh one instead
     [ "$started" = True ] && ! compgen -G "$HOME/.claude/projects/*/$sid.jsonl" >/dev/null 2>&1 && { sid=""; "$BOARD" note "$repo" "$track" "session transcript missing — new session id" >/dev/null 2>&1; }
     if [ "$force_cont" = "-c" ]; then args+=(--continue)
@@ -150,18 +152,18 @@ case "${1:-}" in
   __runmain)  # internal: planning session in the primary worktree
     repo="$2"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp="You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<instructions>\"' then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads."
-    mapfile -t CH < <(chan_args "$repo"); chan_accept "$repo"
-    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
+    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
     repo="$2"; alias="$3"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp="You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d; dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR). Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'."
     export CC_SLACK_ALIAS="$alias"
-    mapfile -t CH < <(chan_args "$repo"); chan_accept "$repo@$alias"
-    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo@$alias"
+    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runplain)  # internal: plain session in a folder that is not a git repo
     repo="$2"; cont="${3:-}"; cd "$DEV/$repo" || exit 1
-    mapfile -t CH < <(chan_args "$repo"); chan_accept "$repo"
-    "$CLAUDE" ${cont:+--continue} --remote-control "$repo" "${CH[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
+    "$CLAUDE" ${cont:+--continue} --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
 esac
 
 # ---- cc [-c] <repo> [track] [--go|--say ...] ----

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# cc-model — automatic model fallback. When the box's primary model hits its usage limit every live session
+# moves to the fallback model, and back when the limit lifts. LLM-free except one tiny probe.
+#   cc-model status                   "fable" (normal) | "opus until 11:40Z" | "opus until probe"
+#   cc-model current                  the override model, or nothing — cc / cc-loop / cc-rc pass it as --model
+#   cc-model switch <model> [reason]  write (or, for the primary model, clear) the override + retune live sessions
+#   cc-model limited <model> [reason] cc-limit calls this after a limited run: switch only if that WAS the primary
+#   cc-model tick                     what cc-model.timer runs every 60 s (see below)
+# tick: (1) normal — switch when cc-limit's stamp says the primary model is limited, or when a live session's pane
+#   shows a fresh "usage limit" line (each matched line fires once, and a probe has to agree — docs and questions
+#   mention limits too); (2) overridden — once `until` has passed, probe the primary model at most every 15 min and
+#   restore on the first answer; (3) never two switches within 10 min.
+# Retuning a session = typing "/model <model>" into its pane, cc-msg semantics. Effort is not touched (settings).
+# Override: ~/.cc/state/model-override = "<model>\t<since>\t<until-epoch|0>\t<reason>\t<last-probe-epoch>"
+# Log: ~/.cc/state/model.log = "<iso>\t<epoch>\t<event>\t<model>\t<detail>". No secrets in either.
+# Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
+#   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
+set -uo pipefail
+BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
+ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"
+PRIMARY="${CC_MODEL_PRIMARY:-claude-fable-5[1m]}"; FALLBACK="${CC_MODEL_FALLBACK:-claude-opus-5}"
+PROBEM="${CC_MODEL_PROBE:-claude-fable-5}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
+SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
+now=$(date -u +%s); mkdir -p "$ST"
+fam(){ local f; f=$(grep -oiE 'fable|opus|sonnet|haiku' <<<"${1:-}" | head -1 | tr 'A-Z' 'a-z'); echo "${f:-${1:-}}"; }
+label(){ case "$(fam "${1:-}")" in fable) echo "Fable 5";; opus) echo "Opus 5";; sonnet) echo "Sonnet 5";; haiku) echo "Haiku";; *) echo "${1:-}";; esac; }
+ov(){ model=""; since=0; till=0; reason=""; probed=0   # loads the override; exit 1 = none (the box is on its primary model)
+  [ -f "$OV" ] && IFS=$'\t' read -r model since till reason probed < "$OV"
+  [[ "${till:-}" =~ ^[0-9]+$ ]] || till=0; [[ "${probed:-}" =~ ^[0-9]+$ ]] || probed=0; [ -n "$model" ]; }
+limstamp(){ lim_till=0; lim_model=""   # cc-limit's shared stamp: "<until>\t<how>\t<first-seen>\t<model>"
+  [ -f "$ST/claude-limit" ] && IFS=$'\t' read -r lim_till _ _ lim_model < "$ST/claude-limit"
+  [[ "${lim_till:-}" =~ ^[0-9]+$ ]] || lim_till=0; }
+rate_ok(){ local l; l=$(awk -F'\t' '$3=="switch"{t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)   # one switch per 10 min, never a flap
+  [ $((now - l)) -ge "${CC_MODEL_MIN_GAP:-600}" ]; }
+sessions(){   # "<window-id> <window-name>" per live INTERACTIVE session: a pane whose DIRECT child is claude
+              # (a headless --go worker runs cc-loop in its pane and its claude is a grandchild — never a session)
+  local id pp name
+  while read -r id pp name; do
+    [ -n "${pp:-}" ] || continue
+    pgrep -P "$pp" -x "$PROC" >/dev/null 2>&1 || continue
+    pgrep -P "$pp" -f cc-loop >/dev/null 2>&1 && continue
+    printf '%s %s\n' "$id" "$name"
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{window_id} #{pane_pid} #{window_name}' 2>/dev/null)
+}
+type_into(){   # cc-msg semantics: never type over an open dialog; text and Enter as two calls (Enter is swallowed otherwise)
+  tmux capture-pane -p -t "$1" 2>/dev/null | grep -q 'Enter to confirm' && return 1
+  tmux send-keys -t "$1" -l -- "$2" 2>/dev/null || return 1
+  sleep 0.3; tmux send-keys -t "$1" Enter 2>/dev/null; }
+do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
+  local want="$1" why="${2:-}" m wf n=0 id name msg to=0
+  wf=$(fam "$want")
+  if [ "$wf" = "$(fam "$PRIMARY")" ]; then m="$PRIMARY"; elif [ "$wf" = "$(fam "$FALLBACK")" ]; then m="$FALLBACK"; else m="$want"; fi
+  if ov; then [ "$model" = "$m" ] && return 0; else [ "$m" = "$PRIMARY" ] && return 0; fi   # idempotent: callers may fire on every limited run
+  if [ "$m" = "$PRIMARY" ]; then rm -f "$OV"
+  else limstamp; [ "$lim_till" -gt "$now" ] && to="$lim_till"
+    printf '%s\t%s\t%s\t%s\t0\n' "$m" "$now" "$to" "$(tr -d '\t\n' <<<"$why")" > "$OV"; fi
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    if type_into "$id" "/model $m"; then n=$((n+1))
+    else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION:$name busy or unreachable" >> "$LOG"; fi
+  done < <(sessions)
+  printf '%s\t%s\tswitch\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n session(s); $why" >> "$LOG"
+  if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — every session is on it again."
+  elif [ "$to" -gt 0 ]; then msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z."
+  else msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until it answers again."; fi
+  "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
+probe(){   # is the primary model answering again? one cheap turn, no tools
+  local o="$ST/model-probe.json"
+  "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --max-budget-usd 0.05 --output-format json >"$o" 2>"$o.err" || return 1
+  grep -qiE 'usage limit|rate limit|rate_limit|429|too many requests' "$o" "$o.err" 2>/dev/null && return 1
+  [ "$(jq -r '.is_error // false' "$o" 2>/dev/null)" = true ] && return 1; return 0; }
+tick(){
+  local id name cap line h m
+  if ov; then   # ---- the fallback is on: restore once the limit has passed AND the primary model answers again
+    { [ "$till" -gt 0 ] && [ "$now" -lt "$till" ]; } && return 0
+    [ $((now - probed)) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0
+    printf '%s\t%s\t%s\t%s\t%s\n' "$model" "$since" "$till" "$reason" "$now" > "$OV"   # bank the attempt first: a hung probe must not rerun every minute
+    probe || { printf '%s\t%s\tprobe\t%s\tstill limited\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0; }
+    rate_ok && do_switch "$PRIMARY" "limit lifted (probe)"; return 0
+  fi
+  limstamp   # ---- normal: did the primary model just hit a limit?
+  if [ "$lim_till" -gt "$now" ] && [ -n "$lim_model" ] && [ "$(fam "$lim_model")" = "$(fam "$PRIMARY")" ]; then
+    rate_ok && do_switch "$FALLBACK" "$(fam "$PRIMARY") limit (cc-limit stamp)"; return 0; fi
+  while read -r id name; do [ -n "${id:-}" ] || continue   # a live session says it in its pane before any stamp exists
+    cap=$(tmux capture-pane -p -S -30 -t "$id" 2>/dev/null)
+    line=$(grep -iE 'usage limit|resets? at [0-9]' <<<"$cap" | tail -1); [ -n "$line" ] || continue
+    h=$(printf '%s' "$name$line" | md5sum | cut -c1-16)   # per-window hash: one hit fires once, however long the line stays on screen
+    grep -qxF "$h" "$SEEN" 2>/dev/null && continue
+    printf '%s\n' "$h" >> "$SEEN"; tail -n 50 "$SEEN" > "$SEEN.t" 2>/dev/null && mv "$SEEN.t" "$SEEN"
+    m=$(fam "$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku) [0-9]' <<<"$cap" | tail -1)")
+    [ -n "$m" ] || m=$(fam "$PRIMARY")   # the pane names no model: it runs the box default
+    [ "$m" = "$(fam "$PRIMARY")" ] || continue
+    rate_ok || return 0
+    probe && { printf '%s\t%s\tprobe\t%s\tpane line in %s was not a live limit\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "$name" >> "$LOG"; return 0; }
+    do_switch "$FALLBACK" "$m limit seen in $SESSION:$name"; return 0
+  done < <(sessions); return 0; }
+case "${1:-}" in
+  status)  if ov; then [ "$till" -gt 0 ] && printf '%s until %sZ\n' "$(fam "$model")" "$(date -u -d "@$till" +%H:%M)" || printf '%s until probe\n' "$(fam "$model")"
+           else fam "$PRIMARY"; fi ;;
+  current) ov && printf '%s\n' "$model" ;;
+  switch)  do_switch "${2:?usage: cc-model switch <model> [reason]}" "${3:-}" ;;
+  limited) [ "$(fam "${2:?usage: cc-model limited <model> [reason]}")" = "$(fam "$PRIMARY")" ] || exit 0
+           rate_ok && do_switch "$FALLBACK" "${3:-$(fam "$2") limit}" ;;
+  tick)    tick ;;
+  *) sed -n '2,8p' "$0" >&2; exit 2 ;;
+esac
+exit 0
