@@ -32,7 +32,8 @@ limstamp(){ lim_till=0; lim_model=""   # cc-limit's shared stamp: "<until>\t<how
   [[ "${lim_till:-}" =~ ^[0-9]+$ ]] || lim_till=0; }
 rate_ok(){ local l; l=$(awk -F'\t' '$3=="switch"{t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)   # one switch per 10 min, never a flap
   [ $((now - l)) -ge "${CC_MODEL_MIN_GAP:-600}" ]; }
-sessions(){   # "<window-id> <window-name>" per live INTERACTIVE session: a pane whose DIRECT child is claude
+sessions(){   # "<pane-id> <window-name>" per live INTERACTIVE session: a pane whose DIRECT child is claude (pane id, so a split
+              # window's non-claude active pane is never typed into)
               # (a headless --go worker runs cc-loop in its pane and its claude is a grandchild — never a session)
   local id pp name
   while read -r id pp name; do
@@ -40,7 +41,7 @@ sessions(){   # "<window-id> <window-name>" per live INTERACTIVE session: a pane
     pgrep -P "$pp" -x "$PROC" >/dev/null 2>&1 || continue
     pgrep -P "$pp" -f cc-loop >/dev/null 2>&1 && continue
     printf '%s %s\n' "$id" "$name"
-  done < <(tmux list-panes -s -t "$SESSION" -F '#{window_id} #{pane_pid} #{window_name}' 2>/dev/null)
+  done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id} #{pane_pid} #{window_name}' 2>/dev/null)
 }
 type_into(){   # cc-msg semantics: never type over an open dialog; text and Enter as two calls (Enter is swallowed otherwise)
   tmux capture-pane -p -t "$1" 2>/dev/null | grep -q 'Enter to confirm' && return 1
@@ -51,30 +52,41 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   wf=$(fam "$want")
   if [ "$wf" = "$(fam "$PRIMARY")" ]; then m="$PRIMARY"; elif [ "$wf" = "$(fam "$FALLBACK")" ]; then m="$FALLBACK"; else m="$want"; fi
   if ov; then [ "$model" = "$m" ] && return 0; else [ "$m" = "$PRIMARY" ] && return 0; fi   # idempotent: callers may fire on every limited run
-  if [ "$m" = "$PRIMARY" ]; then rm -f "$OV"
+  if [ "$m" = "$PRIMARY" ]; then rm -f "$OV" "$ST/model-skipped"
   else limstamp; [ "$lim_till" -gt "$now" ] && to="$lim_till"
     printf '%s\t%s\t%s\t%s\t0\n' "$m" "$now" "$to" "$(tr -d '\t\n' <<<"$why")" > "$OV"; fi
   while read -r id name; do [ -n "${id:-}" ] || continue
     if type_into "$id" "/model $m"; then n=$((n+1))
-    else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION:$name busy or unreachable" >> "$LOG"; fi
+    else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION:$name busy or unreachable" >> "$LOG"
+      printf '%s\n' "$id" >> "$ST/model-skipped"; fi   # a pane behind a dialog: retried on later ticks (F3)
   done < <(sessions)
   printf '%s\t%s\tswitch\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n session(s); $why" >> "$LOG"
   if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — every session is on it again."
   elif [ "$to" -gt 0 ]; then msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z."
   else msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until it answers again."; fi
   "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
-probe(){   # is the primary model answering again? one cheap turn, no tools
-  local o="$ST/model-probe.json"
-  "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --max-budget-usd 0.05 --output-format json >"$o" 2>"$o.err" || return 1
-  grep -qiE 'usage limit|rate limit|rate_limit|429|too many requests' "$o" "$o.err" 2>/dev/null && return 1
+probe(){   # is the primary model answering again? one cheap turn, no tools. 0 = answers · 1 = limited · 2 = could not run (unknown)
+  local o="$ST/model-probe.json" rc
+  [ -x "$CLAUDE" ] || return 2
+  timeout 60 "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --max-budget-usd 0.05 --output-format json >"$o" 2>"$o.err"; rc=$?
+  if grep -qiE 'usage limit|rate limit|rate_limit|429|too many requests' "$o" "$o.err" 2>/dev/null; then return 1; fi
+  [ "$rc" = 0 ] && jq -e . "$o" >/dev/null 2>&1 || return 2   # no answer at all (network, bad binary, timeout): unknown, never "limited"
   [ "$(jq -r '.is_error // false' "$o" 2>/dev/null)" = true ] && return 1; return 0; }
+lastprobe(){ cat "$ST/model-probed" 2>/dev/null || echo 0; }   # F2: the pane-detection probe is throttled like the restore probe
 tick(){
   local id name cap line h m
   if ov; then   # ---- the fallback is on: restore once the limit has passed AND the primary model answers again
+    if [ -s "$ST/model-skipped" ]; then   # F3: panes that were behind a dialog at switch time get another try
+      : > "$ST/model-skipped.n"
+      while read -r id; do [ -n "${id:-}" ] || continue
+        sessions | grep -q "^$id " || continue          # gone: nothing to do
+        type_into "$id" "/model $model" && printf '%s\t%s\tretyped\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$model" "$id" >> "$LOG" || printf '%s\n' "$id" >> "$ST/model-skipped.n"
+      done < "$ST/model-skipped"; mv "$ST/model-skipped.n" "$ST/model-skipped"; fi
     { [ "$till" -gt 0 ] && [ "$now" -lt "$till" ]; } && return 0
     [ $((now - probed)) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0
     printf '%s\t%s\t%s\t%s\t%s\n' "$model" "$since" "$till" "$reason" "$now" > "$OV"   # bank the attempt first: a hung probe must not rerun every minute
-    probe || { printf '%s\t%s\tprobe\t%s\tstill limited\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0; }
+    probe; case $? in 1) printf '%s\t%s\tprobe\t%s\tstill limited\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;;
+                      2) printf '%s\t%s\tprobe\t%s\tcould not run — unknown\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;; esac
     rate_ok && do_switch "$PRIMARY" "limit lifted (probe)"; return 0
   fi
   limstamp   # ---- normal: did the primary model just hit a limit?
@@ -85,12 +97,17 @@ tick(){
     line=$(grep -iE 'usage limit|resets? at [0-9]' <<<"$cap" | tail -1); [ -n "$line" ] || continue
     h=$(printf '%s' "$name$line" | md5sum | cut -c1-16)   # per-window hash: one hit fires once, however long the line stays on screen
     grep -qxF "$h" "$SEEN" 2>/dev/null && continue
-    printf '%s\n' "$h" >> "$SEEN"; tail -n 50 "$SEEN" > "$SEEN.t" 2>/dev/null && mv "$SEEN.t" "$SEEN"
+    printf '%s\n' "$h" >> "$SEEN"; tail -n 1000 "$SEEN" > "$SEEN.t" 2>/dev/null && mv "$SEEN.t" "$SEEN"
     m=$(fam "$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku) [0-9]' <<<"$cap" | tail -1)")
     [ -n "$m" ] || m=$(fam "$PRIMARY")   # the pane names no model: it runs the box default
     [ "$m" = "$(fam "$PRIMARY")" ] || continue
     rate_ok || return 0
-    probe && { printf '%s\t%s\tprobe\t%s\tpane line in %s was not a live limit\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "$name" >> "$LOG"; return 0; }
+    [ $((now - $(lastprobe))) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0   # F2: at most one confirming probe per 15 min
+    printf '%s\n' "$now" > "$ST/model-probed"
+    probe; case $? in
+      0) printf '%s\t%s\tprobe\t%s\tpane line in %s was not a live limit\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "$name" >> "$LOG"; return 0;;
+      2) printf '%s\t%s\tprobe\t%s\tcould not run — not switching on a pane line alone\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;;
+    esac
     do_switch "$FALLBACK" "$m limit seen in $SESSION:$name"; return 0
   done < <(sessions); return 0; }
 case "${1:-}" in

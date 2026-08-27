@@ -219,14 +219,17 @@ chmod +x "$T/failprobe"
 rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/claude-limit" "$MH/.cc/state/model-seen"; : > "$MH/.cc/state/model.log"
 mline(){ MT send-keys -t _ccmodel:sess -l -- "$1"; sleep 0.3; MT send-keys -t _ccmodel:sess Enter; sleep 0.5; }
 mline "Claude usage limit reached. Your limit resets at 11:40."
-ME env CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick
+ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick
 [ "$(M status)" = fable ] && ok "a pane that mentions a limit while the model still answers does not switch" || bad "pane scan switched on a docs/question line: $(M status)"
 mline "Claude usage limit reached. Your limit resets at 12:40."
-ME env CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
+ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
 [ "$(M status)" = "opus until probe" ] && ok "a real limit line in a live pane switches the box (probe agrees)" || bad "pane scan: $(M status)"
 rm -f "$MH/.cc/state/model-override"; : > "$MH/.cc/state/model.log"
-ME env CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
+ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
 [ "$(M status)" = fable ] && ok "the same pane line never fires twice (per-window hash)" || bad "pane line fired again"
+mline "Claude usage limit reached. Your limit resets at 13:40."
+ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE=/nonexistent/claude "$B/cc-model" tick
+[ "$(M status)" = fable ] && ok "a pane line with a probe that cannot run does not switch (unknown, not limited)" || bad "switched on an unrunnable probe: $(M status)"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 # cleanup
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
