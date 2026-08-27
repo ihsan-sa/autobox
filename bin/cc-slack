@@ -30,7 +30,8 @@ Thread status v3 (at most ONE bot-managed mark per root): ❓ = it needs YOU (we
 replies again (never a stop signal: the session keeps working and keeps replying there) · 👀 on your message = received,
 any OTHER reaction of ours on it is the session's answer (that thread turns 🟠) · your 👍/👎 on one of our messages is
 delivered to that session as its confirmation. A request that takes more than one turn: react 🔧 (hammer_and_wrench) on the
-thread ROOT when you start, keep replying in the thread, and react ✅ (white_check_mark) on the root ONLY when it is fully
+thread ROOT when you start (the bot also adds a 🔧 by itself while your pane is mid-turn on the thread it last handed you,
+and takes that one off ≈1 min after you go idle), keep replying in the thread, and react ✅ (white_check_mark) on the root ONLY when it is fully
 done — the owner reads 🔧/✅ on the root as working/done; a plain reply is "handled", not "done". A newer message in the
 thread makes an older 🔧/✅ stale (it is stripped): react 🔧 again after a follow-up if you are still on it. Log longer non-track work
 with `cc quick doing "…"` / `cc quick done "…"` so the Home tab lists it while it runs.
@@ -232,6 +233,15 @@ def tmux_window(name):
         if wname == name:
             return wid, cmd
     return None, None
+
+
+WORKING_FOOTER = "esc to interrupt"                            # Claude Code's footer for the whole of a turn (thinking, tools, reply)
+
+
+def pane_working(wid):
+    """Is the Claude Code in this pane mid-turn? LLM-free: one capture, one string."""
+    rc, pane = tmux("capture-pane", "-p", "-t", wid)
+    return rc == 0 and WORKING_FOOTER in pane
 
 
 def pane_idle(wid):
@@ -465,8 +475,15 @@ def home_workers():
     return out
 
 
+def home_track_shown(status, pr_state):
+    """Home is for what runs or needs the owner: a finished track (done/merged) leaves it the moment it finishes, unless its
+    PR is still open (a 👍 is owed). The board and `cc digest` keep the history."""
+    return status not in ("done", "merged") or str(pr_state or "").upper().startswith("OPEN")
+
+
 def home_tracks(workers, prs):
-    """Every board track — the same data cc-digest prints — read straight off the sidecar boards (no subprocess)."""
+    """Board tracks that are running, waiting or in trouble — the same data cc-digest prints — read straight off the sidecar
+    boards (no subprocess); finished ones drop off (home_track_shown)."""
     out = []
     for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
         try:
@@ -483,6 +500,8 @@ def home_tracks(workers, prs):
                     pass                                  # a run file still being written is not an error
             wt, pr, status = f"{HOME}/.cc/worktrees/{repo}/{tr}/.cc", str(t.get("pr") or ""), t.get("status", "?")
             num = pr.rstrip("/").rsplit("/", 1)[-1]        # the board stores a number or the full PR url
+            if not home_track_shown(status, prs.get((repo, pr)) if pr else None):
+                continue
             bits = [f"{len(runs)} it" if runs else "", f"${cost:.2f}" if cost else "",
                     f"PR #{num} {prs.get((repo, pr), '')}".strip() if pr else "",
                     "commit!" if os.path.exists(f"{wt}/checkpoint.err") else "",
@@ -514,6 +533,8 @@ class Daemon:
         self.use_slack = use_slack and bool(self.cfg.get("SLACK_BOT_TOKEN") and self.cfg.get("SLACK_APP_TOKEN"))
         self.lock = threading.Lock()
         self.subs = collections.defaultdict(list)          # target -> [Conn]
+        self.working = {}                                   # target -> (chat, root, since): the 🔧 WE hold while its pane is mid-turn
+        self.idle_ticks = collections.Counter()             # target -> ticks its pane has been idle (the 🔧 comes off at 2)
         self.queues = collections.defaultdict(collections.deque)   # target -> deque[(t, payload, alias)]
         self.execs = collections.OrderedDict()               # chat -> ThreadPoolExecutor(1): message/edit events stay in order per chat
         self.seen = collections.OrderedDict()
@@ -915,7 +936,7 @@ class Daemon:
                 text += f"\n[attached: {names} — saved on the box, paths in file_paths]"
             else:
                 text += f"\n[attached: {names} — could not be downloaded (files:read scope? size > 50 MB?)]"
-        self.last_chat[target] = (chat, thread)
+        self.last_chat[target] = (chat, thread or ts)      # the ROOT of the thread it last heard from (busy_cycle marks it)
         res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=route_alias)
         react(self.cfg, chat, ts, "eyes")
         if res == "delivered":
@@ -1739,8 +1760,46 @@ class Daemon:
             if wid and not pane_idle(wid) and accept_prompts(wid):
                 log(f"unstick {target}: pressed a startup prompt in {window_for(target)}")
 
+    def busy_cycle(self):
+        """Every tick (30 s), LLM-free: a subscribed session whose pane is mid-turn gets a 🔧 on the root of the thread it
+        last heard from — the owner sees *working* without the session having to remember to react. After two idle ticks
+        (≈ 60 s) the 🔧 WE put there comes off and the plain rules take over (a reply already made it stale anyway). A 🔧 the
+        session set itself is never placed over or taken off here."""
+        if not self.use_slack:
+            return
+        for target in list(self.subs):
+            if not self.subs.get(target):
+                continue
+            wid, _ = tmux_window(window_for(target))
+            busy = bool(wid) and pane_working(wid)
+            held, last = self.working.get(target), self.last_chat.get(target)
+            if busy:
+                self.idle_ticks.pop(target, None)
+                if last and (held is None or held[:2] != tuple(last)):
+                    if held:
+                        self.drop_wrench(target)          # it moved on to another thread: the old 🔧 goes with it
+                    chat, root = last
+                    if f"{chat}:{root}:hammer_and_wrench" in self.marks:
+                        continue                          # the session marked it itself: theirs to keep
+                    if self.session_mark(chat, root, "hammer_and_wrench"):
+                        self.working[target] = (chat, root, time.time())
+            elif held:
+                self.idle_ticks[target] += 1
+                if self.idle_ticks[target] >= 2:
+                    self.drop_wrench(target)
+
+    def drop_wrench(self, target):
+        chat, root, since = self.working.pop(target)
+        self.idle_ticks.pop(target, None)
+        if self.marks.get(f"{chat}:{root}:hammer_and_wrench", 0) > since + 1:
+            return                                        # the session re-set it itself since we did: not ours any more
+        react(self.cfg, chat, root, "hammer_and_wrench", remove=True)
+        self.session_mark(chat, root, "hammer_and_wrench", removed=True)
+        self.mark_dirty({"type": "reaction_removed", "item": {"channel": chat, "ts": root}})   # the sweep re-marks the root
+
     def loop_tick(self, n):
         self.unstick()                                   # a started session that never subscribed may be waiting on a prompt
+        self._safe(self.busy_cycle)                      # 🔧 follows what is actually running
         self.board_cycle()
         now = time.time()
         for chat, when in list(self.alarms.items()):
@@ -1974,7 +2033,7 @@ class Daemon:
             snap = self.snap.get(chat)
             marks = collections.Counter(m for m, _, _ in snap[1] if m) if snap else None
             chans.append({"name": name,
-                          "session": ("🟢 live" if self.subs.get(target) else
+                          "session": ("🔧 working" if self.working.get(target) else "🟢 live" if self.subs.get(target) else
                                       "🟡 idle" if window_for(target) in wins else "⚪ none") if target
                                      else "◽ not a session",   # #approvals, #alerts: real channels, no session behind them
                           "marks": "–" if marks is None else (" ".join(f"{m}{n}" for m, n in sorted(marks.items())) or "clear")})
@@ -4017,6 +4076,27 @@ def cmd_selfcheck():
           "thread; un-flagging brings the ✅ back, not a 10 h stall ❓)",
           rmFK == [("reactions.remove", "9.0", "question")] and dmFK.status_cache[("CQ", "8.0")] == "white_check_mark"
           and dmFK.status_cache[("CQ", "9.0")] is None)
+    dmBZ = Daemon(use_slack=False); dmBZ.use_slack = True; dmBZ.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
+    dmBZ.subs["repo"].append(object()); dmBZ.last_chat["repo"] = ("CB", "50.0")
+    _twBZ, _pwBZ, _rcBZ = globals()["tmux_window"], globals()["pane_working"], globals()["react"]
+    busyBZ, marksBZ, rmBZ = {"v": True}, [], []
+    globals()["tmux_window"] = lambda name: ("@1", "node"); globals()["pane_working"] = lambda wid: busyBZ["v"]
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False: rmBZ.append((name, remove))
+    dmBZ.session_mark = lambda chat, ts, name, removed=False: marksBZ.append((ts, name, removed)) or True
+    try:
+        dmBZ.busy_cycle(); dmBZ.busy_cycle()                  # mid-turn twice: ONE 🔧, held
+        busyBZ["v"] = False; dmBZ.busy_cycle(); held1 = "repo" in dmBZ.working   # one idle tick: still held
+        dmBZ.busy_cycle(); gone = "repo" not in dmBZ.working  # second idle tick: off
+        busyBZ["v"] = True; dmBZ.marks["CB:50.0:hammer_and_wrench"] = 1.0; dmBZ.busy_cycle()   # the session's own 🔧: left alone
+    finally:
+        globals()["tmux_window"], globals()["pane_working"], globals()["react"] = _twBZ, _pwBZ, _rcBZ
+    check("auto 🔧: a session mid-turn gets ONE 🔧 on the thread it last heard from; it survives one idle tick and comes off after two "
+          "(≈60 s); a 🔧 the session set itself is never placed over or taken off",
+          marksBZ == [("50.0", "hammer_and_wrench", False), ("50.0", "hammer_and_wrench", True)] and held1 and gone
+          and rmBZ == [("hammer_and_wrench", True)] and "repo" not in dmBZ.working)
+    check("Home: a finished track leaves the dashboard as soon as it is done/merged unless its PR still waits for a 👍",
+          home_track_shown("running", None) and home_track_shown("blocked", None) and not home_track_shown("done", None)
+          and not home_track_shown("merged", "MERGED") and home_track_shown("done", "OPEN/APPROVED"))
     check("our own ✅/🔧 on a root are remembered with their time (and forgotten when taken back); ✅ on the root marks done instantly",
           "CQ:7.0:hammer_and_wrench" in dmOR.marks and "CQ:7.0:white_check_mark" not in dmOR.marks and setOR[0] == "✅")
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
