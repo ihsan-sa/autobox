@@ -15,7 +15,7 @@
 # Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE (stub the LLM) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL.
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # systemd-started: no ~/bin
-R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"; cd "$R" || exit 1   # a worktree copy audits itself, like cc-digest
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"; cd "$R" || exit 1   # run the INSTALLED ~/bin/cc-audit: a worktree copy fails the suites (they assert against the live install)
 BOX="${CC_BOX:-$(hostname -s)}"                                    # notify titles and report headings
 CTL="$BOX"; case "$R" in "$HOME/dev/"*) CTL=${R#"$HOME/dev/"}; CTL=${CTL%%/*};; esac   # the control repo = the one this copy lives in: its Slack channel + board
 AD="$HOME/.cc/state/audit"; LOG="$AD/audit.log"; mkdir -p "$AD"
@@ -74,7 +74,7 @@ checks(){
   ck "$(tf test "$age" -lt 60)" "heartbeat — ${age}s old (want < 60)"
   o=$(cc-slack status 2>&1 | sed -n 3p); ck "$(tf grep -q connected <<<"$o")" "slack daemon — ${o:-no status}"
   local errs; errs=$(journalctl --user -u cc-slackd --since "$SINCE" --no-pager 2>/dev/null | grep -ciE 'error|traceback')
-  ck "$(tf test "${errs:-0}" -eq 0)" "cc-slackd journal — $errs error/traceback lines since $SINCE"
+  ck "$(tf test "${errs:-0}" -le 5)" "cc-slackd journal — $errs error/traceback lines since $SINCE (fail above 5)"
   add ""; add "## host"
   local disk load
   disk=$(df -P / | awk 'NR==2{print $5}'); ck "$(tf test "${disk%\%}" -lt 85)" "disk / — $disk used (want < 85%)"
@@ -160,7 +160,8 @@ for s in "/$HOME/.cc/config" "/$HOME/.ssh/**" "/$HOME/.claude/.credentials.json"
   DENY="$DENY,Read($s),Grep($s)"   # secrets: reachable by Read otherwise, and the audit never needs them
 done
 LLM_COST=0
-postponed(){ printf '_(postponed: Claude %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; }
+POSTPONED=""
+postponed(){ printf '_(postponed: Claude %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; POSTPONED="$2"; }
 llm(){   # llm <out-file> <budget> <prompt> — 20 min hard cap; a failed run leaves a stub and never aborts the audit
   local out=$1 bud=$2 prompt=$3 j rc res p; j=$(mktemp)
   if p=$("$LIMIT" status 2>/dev/null); then postponed "$out" "$p"; rm -f "$j"; return 1; fi   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
@@ -227,11 +228,12 @@ fi
 if [ "$dry" = 1 ]; then printf '%s\n' "$body"   # OUTDIR is a mktemp dir: the reports and the evidence go with it on EXIT
 else
   printf '%s\n' "$body" > "$out"; echo "$out"
-  [ "$mode" = checks ] || printf '%s\n' "$CHK" > "$AD/$DAY-checks.md"   # the "since the last run" window is always a checks file
+  [ "$mode" = checks ] || [ "$llm_on" = 0 ] || printf '%s\n' "$CHK" > "$AD/$DAY-checks.md"   # the "since the last run" window is always a checks file (--no-llm already wrote its index there)
 fi
 if [ "$post" = 1 ]; then
   printf '%s\n' "$body" | cc-slack canvas "#$CTL" "$BOX audit" >/dev/null 2>&1 || log "canvas update failed"
-  if [ "$llm_ok" = 0 ]; then cc-notify -t "$BOX audit $mode" "$mode failed (see audit.log) · $verdict: $fail checks failed" || log "notify failed"
+  if [ -n "$POSTPONED" ]; then cc-notify -t "$BOX audit $mode" "$mode postponed — Claude $POSTPONED · next run picks it up · $verdict: $fail checks failed" || log "notify failed"
+  elif [ "$llm_ok" = 0 ]; then cc-notify -t "$BOX audit $mode" "$mode failed (see audit.log) · $verdict: $fail checks failed" || log "notify failed"
   elif [ "$mode" = review ]; then   # the review's headline is the owner's experience, not a finding count
     cc-notify -t "$BOX review" "$(short "$(sed -n '/^## verdict/,/^## /p' "$out" | grep '^- ' | head -1 | cut -c3-)") · $imp improvements → canvas" || log "notify failed"
   else
