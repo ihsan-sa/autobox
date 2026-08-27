@@ -8,7 +8,7 @@ Shallow first: the six moves, then who is who, then each channel in detail. Sour
 3. **Phone app → Code → session** — Remote Control: the *same* session, but you see its screen, can stop it, and type when Slack is the wrong shape (long pastes, approvals).
 4. **Laptop: `ssh` + `cc <repo>`** — the same session again, in tmux. Everything you say in Slack, the app or the terminal lands in one conversation per project.
 5. **Hands-off work** — in `#<repo>`: "dispatch a worker on track *name* to do *X*", or on the box `cc <repo> <track> --go "X"`. It runs headless on its own branch, ends with a PR and a ping in `#<repo>`. Nothing merges without you.
-6. **Dashboard — tap the bot in the sidebar → *Home*** — one live view of the whole box, refreshed every 30 s and never posted as a message: units 🟢/🔴, every channel with its session and its open ❓, every track with iteration/cost/PR (🏃 = a worker is running), the last audit verdict and boot. Read-only; `!status` `!threads` `!digest` say the same in text.
+6. **Dashboard — tap the bot in the sidebar → *Home*** — one live view of the whole box, refreshed the instant you open it, every second for the first minute, within ~2 s of any event, otherwise every 30 s and never posted as a message: units 🟢/🔴, every channel with its session and its open ❓, every track with iteration/cost/PR (🏃 = a worker is running), the last audit verdict and boot. Read-only; `!status` `!threads` `!digest` say the same in text.
 
 ## Who is who
 | Agent | Where it lives | Reach it | Does |
