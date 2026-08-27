@@ -319,6 +319,29 @@ def load_marks():
         return {}
 
 
+LAST = "last.json"                                             # {"<target>": [chat, root]}: the thread each session last heard from
+
+
+def load_last():
+    try:
+        return {k: tuple(v) for k, v in json.load(open(f"{DIR}/{LAST}")).items()}
+    except Exception:
+        return {}
+
+
+def save_last(last):
+    """busy_cycle's 🔧 needs to know which thread a session is on; without this a daemon restart forgot it until the
+    owner's next message."""
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        tmp = f"{DIR}/{LAST}.tmp"
+        with open(tmp, "w") as f:
+            os.fchmod(f.fileno(), 0o600); json.dump({k: list(v) for k, v in last.items()}, f)
+        os.replace(tmp, f"{DIR}/{LAST}")
+    except Exception as e:
+        log(f"last.json: {e!r}")
+
+
 def save_marks(marks):
     keep = {k: v for k, v in marks.items() if v >= time.time() - 30 * 86400}
     marks.clear(); marks.update(keep)
@@ -538,7 +561,7 @@ class Daemon:
         self.queues = collections.defaultdict(collections.deque)   # target -> deque[(t, payload, alias)]
         self.execs = collections.OrderedDict()               # chat -> ThreadPoolExecutor(1): message/edit events stay in order per chat
         self.seen = collections.OrderedDict()
-        self.last_chat = {}                                 # target -> (chat, thread)
+        self.last_chat = load_last()                        # target -> (chat, root): survives a restart (busy_cycle's 🔧)
         self.thread_owner = {}                              # (chat, thread_ts) -> alias|None (None = main); routing cache
         self.known_aliases = collections.defaultdict(set)   # target -> {alias, ...} ever subscribed (daemon lifetime)
         self.reply_cache = {}                               # (chat, root_ts) -> (latest_reply, last msg): a thread whose
@@ -937,6 +960,7 @@ class Daemon:
             else:
                 text += f"\n[attached: {names} — could not be downloaded (files:read scope? size > 50 MB?)]"
         self.last_chat[target] = (chat, thread or ts)      # the ROOT of the thread it last heard from (busy_cycle marks it)
+        save_last(self.last_chat)
         res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=route_alias)
         react(self.cfg, chat, ts, "eyes")
         if res == "delivered":
@@ -2554,6 +2578,9 @@ def cmd_post_approval(argv):
 
 
 def cmd_selfcheck():
+    global DIR
+    import tempfile
+    DIR = tempfile.mkdtemp(prefix="cc-slack-selfcheck-")     # every state file a case touches (marks, flags, queue, last…) lands here, never in the live dir
     """Unit checks that need no Slack: mrkdwn, chunking, target detection, validation. Exit 1 on any failure."""
     import contextlib, io, tempfile
     fails = []
