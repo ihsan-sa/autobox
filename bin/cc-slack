@@ -66,6 +66,7 @@ STATUS_EMOJI = {"❓": "question", "🔴": "red_circle",           # status v3, 
                 "✅": "white_check_mark", "🔧": "hammer_and_wrench"}   # set by the SESSION on its root: ✅ fully done · 🔧 still working
 LEGACY_STATUS = ("large_yellow_circle",)                       # v1's 🟡 dot: reconcile strips it wherever it still finds one (our old ✅ acks stay: under v3 they read as "answered")
 STATUS_NAMES = tuple(STATUS_EMOJI.values()) + LEGACY_STATUS
+OWNER_ACK = re.compile(r"^\s*(ok(ay)?|k|kk|thanks?( you)?|thx|ty|great|cool|nice|perfect|good|sounds good|got it|noted|👍|:\+1:|:thumbsup:)[.!]*\s*$", re.I)
 SESSION_MARKS = ("white_check_mark", "hammer_and_wrench")    # the SESSION's own statements on a root (done / working): a 🏁 leaves them
 BOOK_NAMES = tuple(n for n in STATUS_NAMES if n not in SESSION_MARKS)   # the bot's bookkeeping (❓🔴🟠 + the v1 dot): what a 🏁 strips
 REACTION_CHAR = {"+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "👎", "white_check_mark": "✅", "x": "❌",
@@ -1529,9 +1530,14 @@ class Daemon:
         if root is None:
             return base                                # without the root there is nothing more to read
         ours = {r["name"] for r in root.get("reactions", []) if self.bot_user in r.get("users", [])}
+        # the owner's bare "ok" / "thanks" after our mark closes the matter, it does not re-open it (a ✅ would otherwise go
+        # stale and the thread turn 🔴, then stall); anything they actually ask still outranks the marks
+        ack = last.get("user") == self.cfg.get("SLACK_OWNER_ID") and bool(OWNER_ACK.match(last.get("text") or ""))
         def fresh(name):   # newer than the thread's last message; with no recorded time, only an unanswered root is surely so
             t = self.marks.get(f"{chat}:{root['ts']}:{name}")
-            return t >= float(last["ts"]) if t is not None else last["ts"] == root["ts"]
+            if t is None:
+                return last["ts"] == root["ts"]
+            return ack or t >= float(last["ts"])
         if "white_check_mark" in ours and fresh("white_check_mark"):
             return "✅"                                # the session declared the task fully done — after the last word in the thread
         if "hammer_and_wrench" in ours and fresh("hammer_and_wrench"):
@@ -4081,6 +4087,10 @@ def cmd_selfcheck():
     dmPM.marks = {f"CP:{rootD['ts']}:white_check_mark": nowP - 3600}   # ✅ set an hour ago, then the session said more: stale
     check("root marks: an older ✅/🔧 (set before the thread's last message) is stale and no longer outranks the current state",
           dmPM.root_mark(ours_reply, nowP, rootD, "CP") == "🟠")
+    check("root marks: the owner's bare \"ok\"/\"thanks\" after our ✅ keeps the thread done; a real follow-up re-opens it (🔴)",
+          dmPM.root_mark({"ts": str(nowP - 60), "user": "UOWNER", "text": "Ok"}, nowP, rootD, "CP") == "✅"
+          and dmPM.root_mark({"ts": str(nowP - 60), "user": "UOWNER", "text": "thanks!"}, nowP, rootD, "CP") == "✅"
+          and dmPM.root_mark({"ts": str(nowP - 60), "user": "UOWNER", "text": "ok but why?"}, nowP, rootD, "CP") == "🔴")
     dmOR = Daemon(use_slack=False); dmOR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmOR.bot_user = "UBOT"
     dmOR.route = lambda chat, ctype=None: "r"; dmOR.reacted_message = lambda chat, ts: ({"ts": ts, "user": "UOWNER", "text": "q"}, ts)
     setOR = []; dmOR.set_mark = lambda chat, root, want: setOR.append(want)
