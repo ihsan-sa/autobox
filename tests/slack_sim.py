@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""sim_v2.py — READ-ONLY harness (status v2 oracle: ❓ = needs you): simulates Slack + owner/session activity against cc-slack's Daemon and scores the
-thread-status reaction mechanism. Usage: python3 sim.py [path/to/cc-slack] [--days 3] [--chats 3] [--seeds 1,2,3] [-v]
+"""slack_sim.py — READ-ONLY harness (status v3 oracle: ❓ needs you · 🔴 the session owes you · 🟠 handled): simulates Slack +
+owner/session activity against cc-slack's Daemon and scores the thread-status reaction mechanism, the 🏁 flag file, the
+delivery of the owner's reactions to sessions, and sessions that answer with a reaction instead of words.
+Usage: python3 slack_sim.py [path/to/cc-slack] [--days 3] [--chats 3] [--seeds 1,2,3] [-v]
 Prints one summary line per metric; `score:` is the single number to minimise (lower = better)."""
 import sys, os, json, random, collections, importlib.machinery as M
 
@@ -22,6 +24,7 @@ class FakeTime:               # stands in for the `time` module inside cc-slack
     def sleep(self, s): pass
     def strftime(self, fmt, t=None): return "T"
     def gmtime(self, *a): return None
+    def localtime(self, *a): return None
     def monotonic(self): return self.now
 
 class FakeSlack:
@@ -99,18 +102,41 @@ class FakeSlack:
         if method in ("pins.remove", "chat.delete", "users.info", "conversations.info"):
             return {"ok": True, "user": {"real_name": "x"}, "channel": {"name": "x"}}
         raise RuntimeError(f"{method}: unsupported_in_sim")
-    def owner_react(self, chat, ts, name):
+    def owner_react(self, chat, ts, name, remove=False):
         m = self.find(chat, ts)
         r = next((x for x in m["reactions"] if x["name"] == name), None)
-        if r: r["users"].append(OWNER)
+        if remove:
+            if r and OWNER in r["users"]:
+                r["users"].remove(OWNER)
+                if not r["users"]: m["reactions"].remove(r)
+        elif r: r["users"].append(OWNER)
         else: m["reactions"].append({"name": name, "users": [OWNER], "count": 1})
-        self.events.append({"type": "reaction_added", "user": OWNER, "reaction": name, "item": {"type": "message", "channel": chat, "ts": ts}})
+        self.events.append({"type": "reaction_removed" if remove else "reaction_added", "user": OWNER, "reaction": name,
+                            "event_ts": f"{self.clock.now:.3f}", "item": {"type": "message", "channel": chat, "ts": ts}})
+    def session_react(self, chat, ts, name):
+        """A session answering the owner with the `react` MCP tool: our bot user reacts (and takes its own 👀 off), so the
+        daemon hears a reaction_added of its OWN — which under addendum 2 settles that thread."""
+        m = self.find(chat, ts)
+        r = next((x for x in m["reactions"] if x["name"] == name), None)
+        if r:
+            if BOT not in r["users"]: r["users"].append(BOT)
+        else: m["reactions"].append({"name": name, "users": [BOT], "count": 1})
+        eyes = next((x for x in m["reactions"] if x["name"] == "eyes" and BOT in x["users"]), None)
+        if eyes:
+            eyes["users"].remove(BOT)
+            if not eyes["users"]: m["reactions"].remove(eyes)
+        self.calls["session:react"] += 2                 # the session's own two calls, not the daemon's cost
+        self.events.append({"type": "reaction_added", "user": BOT, "reaction": name,
+                            "event_ts": f"{self.clock.now:.3f}", "item": {"type": "message", "channel": chat, "ts": ts}})
+
     def bot_status(self, root):
         return next((STATUS[r["name"]] for r in root["reactions"] if r["name"] in STATUS and BOT in r["users"]), None)
 
 def scenario(rng, chats, days, t0):
-    """Owner/session activity as a time-ordered list of (t, kind, args). Threads: owner asks → session replies (usually) →
-    sometimes owner follows up → sometimes 🏁. Nudges/reactions come from the daemon itself."""
+    """Owner/session activity as a time-ordered list of (t, kind, args). Threads: owner asks → session replies (usually,
+    in words or — addendum 2 — with a 👍/✅ reaction on the owner's own message) →
+    sometimes owner follows up → sometimes 👍 → sometimes 🏁, and a flagged thread is sometimes un-flagged or re-opened by
+    a new reply (v3: the stale 🏁 stays visible and must be ignored). Nudges/marks come from the daemon itself."""
     ev = []; tid = 0
     for chat in chats:
         t = t0
@@ -134,6 +160,8 @@ def scenario(rng, chats, days, t0):
                     ev.append((cur, "perm", {"chat": chat, "tid": tid, "text": "🔐 `repo` wants to run *Bash*: gh pr merge\nReply `yes abcde` or `no abcde`"})); owner_last = False
                     cur += rng.uniform(60, 4 * 3600); ev.append((cur, "followup", {"chat": chat, "tid": tid, "text": "yes abcde"})); owner_last = True
                     cur += rng.uniform(15, 120); ev.append((cur, "reply", {"chat": chat, "tid": tid, "text": f"merged {tid}.{hop}"})); owner_last = False
+                elif r < 0.32:   # no text needed: the session answers with a 👍/✅ on the owner's message (addendum 2)
+                    ev.append((cur, "react_answer", {"chat": chat, "tid": tid, "emoji": rng.choice(["+1", "white_check_mark"])})); owner_last = False
                 else:
                     ev.append((cur, "reply", {"chat": chat, "tid": tid, "text": f"answer {tid}.{hop}"})); owner_last = False
                 if rng.random() < 0.5:                      # owner follows up → the session answers again next hop
@@ -142,8 +170,18 @@ def scenario(rng, chats, days, t0):
                     break
             if owner_last:                                  # a trailing follow-up always gets its answer
                 cur += rng.uniform(15, 600); ev.append((cur, "reply", {"chat": chat, "tid": tid, "text": f"answer {tid}.final"})); owner_last = False
+            if not owner_last and rng.random() < 0.25:      # the owner's 👍 on the last answer: confirmation, not a status change
+                cur += rng.uniform(30, 3600); ev.append((cur, "praise", {"chat": chat, "tid": tid, "emoji": "+1"}))
             if not owner_last and rng.random() < 0.35:
                 cur += rng.uniform(600, 86400); ev.append((cur, "flag", {"chat": chat, "tid": tid}))
+                r2 = rng.random()
+                if r2 < 0.3:                                # taken back: every mark must come back too
+                    cur += rng.uniform(300, 7200); ev.append((cur, "unflag", {"chat": chat, "tid": tid}))
+                elif r2 < 0.6:                              # a new reply re-opens a flagged thread (the 🏁 reaction stays, ignored)
+                    cur += rng.uniform(300, 7200)
+                    ev.append((cur, "askback", {"chat": chat, "tid": tid, "text": f"one more thing {tid} — should I ship it?"}))
+                    cur += rng.uniform(300, 7200); ev.append((cur, "followup", {"chat": chat, "tid": tid, "text": f"yes, ship {tid}"}))
+                    cur += rng.uniform(15, 600); ev.append((cur, "reply", {"chat": chat, "tid": tid, "text": f"shipped {tid}"}))
     ev.sort(key=lambda e: e[0]); return ev
 
 def run(seed, cs_path):
@@ -153,17 +191,25 @@ def run(seed, cs_path):
     STATUS.clear(); STATUS.update({v: k for k, v in cs.STATUS_EMOJI.items()})
     cs.time = clock; cs.api = slack.api; cs.log = (print if VERBOSE else (lambda *a, **k: None))
     cs.outbox = lambda *a, **k: None
+    cs.load_flags = lambda: {}; cs.save_flags = lambda flags: None   # READ-ONLY harness: never touch ~/.cc/slack/flags.json
     d = cs.Daemon(use_slack=False)
-    d.cfg = {"SLACK_OWNER_ID": OWNER, "SLACK_BOT_TOKEN": "xoxb-fake"}; d.bot_user = BOT
+    d.cfg = {"SLACK_OWNER_ID": OWNER, "SLACK_BOT_TOKEN": "xoxb-fake"}; d.bot_user = BOT; d.bot_id = BOTID
     chats = [f"C{i}" for i in range(CHATS)]
     d.route = lambda chat, ctype=None: f"repo{chat[1:]}" if chat in chats else None
     d.chan_name = lambda c: f"repo{c[1:]}"; d.user_name = lambda u: u
-    d.deliver = lambda target, payload, **k: "delivered"
+    delivered = []
+    d.deliver = lambda target, payload, **k: delivered.append(payload) or "delivered"
+    for c in chats:                                  # one live session per chat: reactions are delivered only to those
+        d.subs[f"repo{c[1:]}"] = [cs.Conn(None, f"repo{c[1:]}", {"alias": None})]
     d.command = lambda *a, **k: None
     d.legacy_cleanup = lambda *a, **k: None
     events = scenario(rng, chats, DAYS, t0 + 60)
     roots = {}                      # tid -> (chat, ts)
-    truth_last = {}                 # tid -> ("owner"|"session", t, flagged)
+    ours = {}                       # tid -> ts of the session's newest message (what the owner reacts to)
+    reacted = []                    # (tid, ts) the owner reacted to: each must reach the session
+    truth_last = {}                 # tid -> ["owner"|"session"|"needs_owner", t, flag_t|None]  (t = the last MESSAGE's time)
+    truth_touch = {}                # tid -> when the truth last changed (a reaction answer changes it without a message)
+    owner_msg = {}                  # tid -> ts of the owner's newest message (what a session reacts to)
     wrong_s = 0.0; lat = []; pending = {}   # tid -> (truth_changed_at)  for latency
     cause = collections.Counter(); nudged_roots = set()
     n = 0; ei = 0; end = t0 + DAYS * 86400 + 3600
@@ -175,33 +221,46 @@ def run(seed, cs_path):
         while ei < len(events) and events[ei][0] <= clock.now:
             t, kind, a = events[ei]; ei += 1
             if kind == "ask":
-                m = slack.post(a["chat"], a["text"], user=OWNER); roots[a["tid"]] = (a["chat"], m["ts"]); truth_last[a["tid"]] = ["owner", clock.now, False]
+                m = slack.post(a["chat"], a["text"], user=OWNER); roots[a["tid"]] = (a["chat"], m["ts"]); truth_last[a["tid"]] = ["owner", clock.now, None]
+                owner_msg[a["tid"]] = m["ts"]
             elif kind == "reply":
                 chat, rts = roots[a["tid"]]
                 slack.calls["session:react"] += 2   # session-side 👀→✅ swap on the owner's message: constant, not the daemon's doing
-                slack.post(chat, a["text"], bot=True, thread=rts); truth_last[a["tid"]][0:2] = ["session", clock.now]
+                ours[a["tid"]] = slack.post(chat, a["text"], bot=True, thread=rts)["ts"]; truth_last[a["tid"]][0:2] = ["session", clock.now]
             elif kind in ("askback", "perm"):
-                chat, rts = roots[a["tid"]]; slack.post(chat, a["text"], bot=True, thread=rts); truth_last[a["tid"]][0:2] = ["needs_owner", clock.now]
+                chat, rts = roots[a["tid"]]
+                ours[a["tid"]] = slack.post(chat, a["text"], bot=True, thread=rts)["ts"]; truth_last[a["tid"]][0:2] = ["needs_owner", clock.now]
             elif kind == "followup":
-                chat, rts = roots[a["tid"]]; slack.post(chat, a["text"], user=OWNER, thread=rts); truth_last[a["tid"]][0:2] = ["owner", clock.now]
-            elif kind == "flag":
-                chat, rts = roots[a["tid"]]; slack.owner_react(chat, rts, "checkered_flag"); truth_last[a["tid"]][2] = True
+                chat, rts = roots[a["tid"]]
+                owner_msg[a["tid"]] = slack.post(chat, a["text"], user=OWNER, thread=rts)["ts"]; truth_last[a["tid"]][0:2] = ["owner", clock.now]
+            elif kind == "react_answer":                    # the session answers with an emoji: no message, but the thread is handled
+                chat, _ = roots[a["tid"]]; slack.session_react(chat, owner_msg[a["tid"]], a["emoji"])
+                truth_last[a["tid"]][0] = "session"          # the owner's message stays the last one (48 h ages from IT)
+            elif kind == "flag":                            # a 🏁 anywhere in the thread: here on the root
+                chat, rts = roots[a["tid"]]; slack.owner_react(chat, rts, "checkered_flag"); truth_last[a["tid"]][2] = clock.now
+            elif kind == "unflag":
+                chat, rts = roots[a["tid"]]; slack.owner_react(chat, rts, "checkered_flag", remove=True); truth_last[a["tid"]][2] = None
+            elif kind == "praise" and a["tid"] in ours:     # 👍 on one of OUR messages → the session must be told
+                chat, _ = roots[a["tid"]]; slack.owner_react(chat, ours[a["tid"]], a["emoji"]); reacted.append((a["tid"], ours[a["tid"]]))
+            truth_touch[a["tid"]] = clock.now
             feed()
         feed()
         d.loop_tick(n); feed()
-        # score the owner's view at the end of the tick (v2: ❓ = needs you; nothing = in the session's hands / settled)
+        # score the owner's view at the end of the tick (v3: ❓ needs you · 🔴 the session owes you · 🟠 handled · none = closed/stale)
         for tid, (chat, rts) in roots.items():
-            root = slack.find(chat, rts); who, tlast, flagged = truth_last[tid]
-            if flagged or clock.now - tlast >= 48 * 3600: want = None
+            root = slack.find(chat, rts); who, tlast, flag_t = truth_last[tid]
+            if flag_t is not None and flag_t >= tlast: want = None      # 🏁 newer than every message: no mark at all
+            elif clock.now - tlast >= 48 * 3600: want = None            # 48 h quiet: even 🟠 expires
             elif who == "needs_owner": want = "❓"
-            elif who == "owner" and clock.now - tlast >= 30 * 60: want = "❓"      # stalled: no answer for 30 min
-            else: want = None
+            elif who == "owner": want = "❓" if clock.now - tlast >= 30 * 60 else "🔴"   # stalled at 30 min
+            else: want = "🟠"                                           # answered, nothing asked: handled
             have = slack.bot_status(root)
             if have != want:
                 wrong_s += TICK; pending.setdefault(tid, clock.now)
-                if want is None and who == "owner": cause["false_needs_you_while_session_works"] += TICK
+                if clock.now - max(truth_touch.get(tid, tlast), flag_t or 0) < 120: cause["latency_<2min"] += TICK
                 elif want is None: cause["stale_or_flagged_not_cleared"] += TICK
-                elif who == "needs_owner" and clock.now - tlast < 120: cause["latency_<2min"] += TICK
+                elif want == "🟠": cause["handled_not_marked"] += TICK
+                elif want == "🔴": cause["owed_not_marked"] += TICK
                 elif who == "needs_owner": cause["session_ask_or_prompt_not_flagged"] += TICK
                 else: cause["stall_not_flagged"] += TICK
             elif tid in pending:
@@ -209,7 +268,10 @@ def run(seed, cs_path):
     per_day = DAYS
     api_total = sum(v for k, v in slack.calls.items() if not k.startswith("session:"))
     muts = slack.calls["reactions.add"] + slack.calls["reactions.remove"]
-    return {"api_calls_per_day": api_total / per_day, "reads_per_day": (slack.calls["conversations.history"] + slack.calls["conversations.replies"]) / per_day,
+    got = {(p["meta"]["thread_ts"], p["meta"]["ts"]) for p in delivered if (p.get("meta") or {}).get("kind") == "reaction"}
+    missed = [t for t in reacted if (roots[t[0]][1], t[1]) not in got]
+    return {"reactions_delivered": len(got), "reactions_missed": len(missed), "reactions_expected": len(reacted),
+            "api_calls_per_day": api_total / per_day, "reads_per_day": (slack.calls["conversations.history"] + slack.calls["conversations.replies"]) / per_day,
             "mutations_per_day": muts / per_day, "posts_per_day": slack.calls["chat.postMessage"] / per_day,
             "wrong_minutes_per_day": wrong_s / 60 / per_day, "mean_fix_latency_s": (sum(lat) / len(lat)) if lat else 0.0,
             "p95_fix_latency_s": (sorted(lat)[int(len(lat) * 0.95)] if lat else 0.0), "threads": len(roots),
@@ -223,6 +285,7 @@ if __name__ == "__main__":
         if VERBOSE: print(f"seed {s}: {json.dumps(r)}", file=sys.stderr)
     out = {k: sum(v) / len(v) for k, v in agg.items()}
     out["score"] = out["wrong_minutes_per_day"] + 0.05 * out["api_calls_per_day"]
-    keys = ["score", "wrong_minutes_per_day", "api_calls_per_day", "reads_per_day", "mutations_per_day", "posts_per_day", "mean_fix_latency_s", "p95_fix_latency_s", "threads"]
+    keys = ["score", "wrong_minutes_per_day", "api_calls_per_day", "reads_per_day", "mutations_per_day", "posts_per_day",
+            "mean_fix_latency_s", "p95_fix_latency_s", "threads", "reactions_expected", "reactions_delivered", "reactions_missed"]
     for k in keys + sorted(k for k in out if k.startswith("cause:")):
         print(f"{k}: {out[k]:.3f}")
