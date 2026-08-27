@@ -478,7 +478,8 @@ class Daemon:
         self.bot_user = None
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
-        self.forgotten = set()                              # chats that answered not_in_channel / is_archived — never swept or nudged again
+        self.forgotten = set()
+        self.home_dirty, self.home_at = True, 0.0           # App Home: event-driven refresh (home_loop)                              # chats that answered not_in_channel / is_archived — never swept or nudged again
         self.pair_code = None
         self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy, self.home_off, self.home_fails = [], {}, 0.0, False, False, 0   # App Home dashboard
         self.t0 = time.time()
@@ -734,6 +735,8 @@ class Daemon:
                 text0 = self.clean(ev.get("text") or "")
                 if target0 and at_token(text0, self.bot_user):
                     thread0 = ev.get("thread_ts") or ts0
+                    if ev.get("thread_ts"):
+                        self.reopen_thread(chat0, thread0, ts0)   # our own reply re-opens a closed thread too
                     old0 = self.thread_owner.get((chat0, thread0))
                     new0 = self.update_owner(target0, chat0, thread0, thread0, text0)
                     if old0 != new0:
@@ -749,6 +752,8 @@ class Daemon:
             self.seen.popitem(last=False)
         user, chat, ctype, ts = ev.get("user"), ev["channel"], ev.get("channel_type"), ev["ts"]
         thread = ev.get("thread_ts") or ts
+        if ev.get("thread_ts"):
+            self.reopen_thread(chat, thread, ts)           # a newer message re-opens a closed thread (owner rule)
         text = SENT_USING_RE.sub("", (ev.get("text") or "").strip())   # claude.ai's Slack connector appends "*Sent using* Claude"
         is_bot = bool(ev.get("bot_id") or user == self.bot_user)
         is_ours = ev.get("bot_id") == self.bot_id if ev.get("bot_id") else user == self.bot_user
@@ -995,28 +1000,45 @@ class Daemon:
         delete the owner's reaction — from then on that 🏁 is stale and ignored."""
         root_ts, root = (ts, None) if (chat, ts) in self.status_cache else self.thread_root(chat, ts)
         key = f"{chat}:{root_ts}"
-        if removed:
-            self.flags.pop(key, None)
-        else:
-            self.flags[key] = flag_ts
-        save_flags(self.flags)
-        if removed:
-            return
         tok = self.cfg.get("SLACK_BOT_TOKEN")
+        if removed:
+            self.flags.pop(key, None); save_flags(self.flags)
+            self.unmirror(chat, root_ts)                   # the owner took the 🏁 back: our mirror on the root goes too
+            return
+        self.flags[key] = flag_ts; save_flags(self.flags)
         believed = self.status_cache.get((chat, root_ts), "?")
         if believed == "?" and root is not None:
             believed = next(iter(self.bot_status(root.get("reactions", []))), None)
-        mirrored = root is not None and any(r["name"] == "checkered_flag" and self.bot_user in r.get("users", [])
-                                            for r in root.get("reactions", []))
         # reactions.remove only ever removes OUR OWN reaction, so a blind sweep can never touch the owner's 🏁
-        wipe = (list(STATUS_NAMES) + ["checkered_flag"] if believed == "?"
-                else ([believed] if believed else []) + (["checkered_flag"] if mirrored else []))
-        for name in wipe:
+        for name in (list(STATUS_NAMES) if believed == "?" else ([believed] if believed else [])):
             try:
                 api("reactions.remove", tok, channel=chat, timestamp=root_ts, name=name)
             except Exception:
                 pass   # that mark was not on the message — fine
         self.status_cache[(chat, root_ts)] = None
+        mirrored = root is not None and any(r["name"] == "checkered_flag" and self.bot_user in r.get("users", [])
+                                            for r in root.get("reactions", []))
+        if ts != root_ts and not mirrored:                 # 🏁 on a reply: mirror it on the top-level message, where you look
+            try:
+                api("reactions.add", tok, channel=chat, timestamp=root_ts, name="checkered_flag")
+            except Exception:
+                pass
+
+    def unmirror(self, chat, root_ts):
+        """Take OUR 🏁 mirror off a thread root (the owner's own reactions are theirs; we never touch them)."""
+        try:
+            api("reactions.remove", self.cfg.get("SLACK_BOT_TOKEN"), channel=chat, timestamp=root_ts, name="checkered_flag")
+        except Exception:
+            pass
+
+    def reopen_thread(self, chat, thread, ts):
+        """A message newer than the thread's 🏁 re-opens it (owner rule): our mirror comes off the root so the flag no
+        longer shows at the top. The entry in the file STAYS (its old time already reads as stale — dropping it would let
+        the owner's still-visible 🏁 re-close the thread on the next sweep); the owner's 🏁 itself is theirs to keep."""
+        key = f"{chat}:{thread}"
+        if thread and thread != ts and key in self.flags and float(ts) > self.flags[key]:
+            self.unmirror(chat, thread)
+            log(f"thread {chat}/{thread} re-opened by a new message")
 
     def reacted_message(self, chat, ts):
         """(the message a reaction points at, its thread root ts). conversations.history is top-level only, and
@@ -1380,6 +1402,7 @@ class Daemon:
                 log(f"nudge: {chat}: {e!r}")
 
     def mark_dirty(self, ev):
+        self.home_dirty = True                             # anything the daemon saw is worth a dashboard refresh
         """Flag a chat's thread-reaction state stale on any event the daemon actually processes (message incl. handled subtypes, reaction_added)."""
         et = ev.get("type")
         if et == "message" and ev.get("subtype") in (None, "file_share", "thread_broadcast", "message_deleted", "message_changed"):
@@ -1549,7 +1572,17 @@ class Daemon:
         if n % 30 == 0:
             self.sweep_cycle()
             self.nudge_cycle()
-        self._safe(self.publish_home)   # the App Home dashboard, every tick — one views.publish, no message
+
+    def home_loop(self):
+        """App Home cadence: republish within ~2 s of any event the daemon processed (self.home_dirty), and at least every
+        30 s regardless — one views.publish per refresh, no reads, no messages. Owner asked for 'as fast as possible'."""
+        while True:
+            time.sleep(2)
+            try:
+                if self.home_dirty or time.time() - getattr(self, "home_at", 0) >= 30:
+                    self.home_dirty = False; self.home_at = time.time(); self.publish_home()
+            except Exception as e:
+                log(f"home_loop: {e!r}")
 
     def nudge_loop(self):
         n = 0
@@ -1826,6 +1859,7 @@ class Daemon:
         self.single_instance()
         threading.Thread(target=self.serve_unix, daemon=True).start()
         threading.Thread(target=self.nudge_loop, daemon=True).start()
+        threading.Thread(target=self.home_loop, daemon=True).start()   # dashboard: instant on events, 5 s heartbeat
         log(f"router on {SOCK}")
         if self.use_slack:
             self.start_slack()
@@ -2843,7 +2877,7 @@ def cmd_selfcheck():
         globals()["api"] = real_api_fl
     check("owner's 🏁 resolves the thread's root, strips the bot's mark instantly (❓/🔴/🟠 and any v1 dot) and records the "
           "flag time; a stranger's 🏁 does nothing — V3",
-          owner_flag == [("conversations.replies", None)] + [("reactions.remove", n) for n in STATUS_NAMES + ("checkered_flag",)]
+          owner_flag == [("conversations.replies", None)] + [("reactions.remove", n) for n in STATUS_NAMES]
           and stranger_flag == [] and dmFl.flags.get("C1:3.3") and flag_writes)
     check("owner's 🏁: when the cache knows which mark is on the root, exactly one remove (research e0180ec/9afaca9)",
           known_flag == [("reactions.remove", "question")] and dmFl.status_cache[("C1", "3.4")] is None)
@@ -3271,7 +3305,7 @@ def cmd_selfcheck():
     finally:
         globals()["api"] = real_api
     check("DM reactions route as 'im': the owner's 🏁 strips the status mark and marks the board dirty in a DM too — L17",
-          calls17 == [("conversations.replies", None)] + [("reactions.remove", n) for n in STATUS_NAMES + ("checkered_flag",)]
+          calls17 == [("conversations.replies", None)] + [("reactions.remove", n) for n in STATUS_NAMES]
           and (dmL17.board.get("D1") or {}).get("dirty_at") and all(c == "im" for _, c in seen17))
     dmSU = Daemon(use_slack=False)
     class FakeSrv:
@@ -3471,11 +3505,10 @@ def cmd_selfcheck():
           "and the flag time is keyed by the root (owner addendum)",
           flags_added == {"CF:9300.1": 1700.0} and ("reactions.remove", "question", "9300.1") in on_reply
           and not any(t == "9300.2" for m, _, t in on_reply if m.startswith("reactions.")))
-    check("flags: the bot never mirrors a 🏁 — a 🏁 of its own comes off with the marks (reactions.remove only ever "
-          "removes our own, never the owner's)",
-          ("reactions.remove", "checkered_flag", "9300.1") in on_reply)
-    check("flags: taking the 🏁 off only drops the file entry — the sweep (this event marked the chat dirty) re-marks it",
-          dmV3b.flags == {} and not any(m == "reactions.remove" for m, _, _ in off_flag))
+    check("flags: a 🏁 on a reply is MIRRORED onto the top-level message (our own 🏁 there; never touching the owner's) — owner rule",
+          ("reactions.add", "checkered_flag", "9300.1") in on_reply and not ("reactions.remove", "checkered_flag", "9300.1") in on_reply)
+    check("flags: taking the 🏁 off drops the file entry and our mirror — the sweep (this event marked the chat dirty) re-marks it",
+          dmV3b.flags == {} and ("reactions.remove", "checkered_flag", "9300.1") in off_flag)
     dmRx = Daemon(use_slack=False); dmRx.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
     dmRx.bot_user = "UBOT"; dmRx.bot_id = "BBOT"
     dmRx.route = lambda chat, ctype=None: "r"; dmRx.chan_name = lambda c: "repo"; dmRx.user_name = lambda u: "Ihsan"
@@ -3658,6 +3691,25 @@ def cmd_selfcheck():
           one and opened)
     check("publish_home: a missing scope disables the dashboard after 3 failures (no error loop), unpaired publishes nothing",
           dmH.home_off and dmH.home_fails == 3 and not hsaid and dmU.home_fails == 0)
+    dmMF = Daemon(use_slack=False); dmMF.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dmMF.bot_user = "UBOT"
+    dmMF.route = lambda chat, ctype=None: "r"; mf_calls = []
+    def mf_api(method, token, **kw):
+        mf_calls.append((method, kw.get("name"), kw.get("timestamp")))
+        return {"messages": [{"ts": "5.0", "thread_ts": "5.0", "reactions": []}]} if method == "conversations.replies" else {}
+    _apiMF = globals()["api"]
+    try:
+        globals()["api"] = mf_api
+        dmMF.on_reaction({"type": "reaction_added", "reaction": "checkered_flag", "user": "UOWNER", "event_ts": "5.5",
+                          "item": {"type": "message", "channel": "C9", "ts": "5.3"}})
+        mirrored_add = ("reactions.add", "checkered_flag", "5.0") in mf_calls; mf_calls.clear()
+        dmMF.reopen_thread("C9", "5.0", "6.0")
+        reopened = ("reactions.remove", "checkered_flag", "5.0") in mf_calls and dmMF.flags.get("C9:5.0") == 5.5   # entry kept (stale), mirror gone
+        rootF = {"ts": "5.0", "reactions": [{"name": "checkered_flag", "users": ["UOWNER"]}]}
+        still_open = not dmMF.flagged("C9", rootF, "6.0")
+    finally:
+        globals()["api"] = _apiMF
+    check("🏁 on a reply is mirrored onto the root; a newer message re-opens the thread (mirror removed, stale entry kept so the "
+          "owner's visible 🏁 cannot re-close it) — owner rule", mirrored_add and reopened and still_open)
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     print(f"selfcheck: {len(fails)} failed")

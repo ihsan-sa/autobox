@@ -4,7 +4,8 @@ owner/session activity against cc-slack's Daemon and scores the thread-status re
 delivery of the owner's reactions to sessions, and sessions that answer with a reaction instead of words.
 Usage: python3 slack_sim.py [path/to/cc-slack] [--days 3] [--chats 3] [--seeds 1,2,3] [-v]
 Prints one summary line per metric; `score:` is the single number to minimise (lower = better)."""
-import sys, os, json, random, collections, importlib.machinery as M
+import sys, os, json, random, collections, importlib.machinery as M, tempfile
+os.environ["CC_SLACK_DIR"] = tempfile.mkdtemp(prefix="slack-sim-")   # the daemon module persists flags/outbox under CC_SLACK_DIR: never the live ~/.cc/slack
 
 argv = sys.argv[1:]
 path = argv.pop(0) if argv and not argv[0].startswith("-") else os.path.expanduser("~/bin/cc-slack")
