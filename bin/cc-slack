@@ -1102,6 +1102,8 @@ class Daemon:
                                        "already closed — nothing to do" if done else
                                        "merged ✅ (squash, remote branch deleted)" if ok else f"merge failed ❌\n```\n{out}\n```")
         self.say(chat, text, ts)
+        if ok and "auto-merge armed" not in out and not done:
+            self.mark_merged(repo, n)                      # the board still said "review": a 👍-merge is the end of that track
         if not ok and not done:
             self.merge_failed(repo, n, last, msg.get("text") or "")
         return text
@@ -1128,6 +1130,21 @@ class Daemon:
             return msgs[0] if msgs and msgs[0].get("ts") == ts else None
         except Exception as e:
             log(f"conversations.history failed: {e}"); return None
+
+    def mark_merged(self, repo, n, run=subprocess.run):
+        """After a 👍-merge: flip the PR's track (branch track/<x>) to `merged` on the board, with a note — Home/!digest
+        used to keep saying "review" until someone ran cc rm."""
+        try:
+            r = run(["gh", "pr", "view", str(n), "--json", "headRefName"], cwd=f"{DEV}/{repo}", capture_output=True, text=True, timeout=30)
+            head = json.loads(r.stdout or "{}").get("headRefName", "") if r.returncode == 0 else ""
+            if not head.startswith("track/"):
+                return
+            track = head[len("track/"):]
+            run([f"{BIN}/cc-board", "status", repo, track, "merged"], capture_output=True, text=True, timeout=15)
+            run([f"{BIN}/cc-board", "note", repo, track, f"merged via 👍 (PR #{n})"], capture_output=True, text=True, timeout=15)
+            self.home_dirty = True
+        except Exception as e:
+            log(f"mark_merged {repo}#{n}: {e!r}")
 
     def merge(self, repo, n, run=subprocess.run):
         """gh pr merge --squash --delete-branch in ~/dev/<repo>; -R <owner/repo> makes gh skip the *local* branch (it lives in a cc
@@ -3725,6 +3742,30 @@ def cmd_selfcheck():
     dmHB.home_dirty = False; dmHB.home_burst_until = 1061.0; burst = dmHB.home_due(1001.0); after_burst = dmHB.home_at = 1061.0; after = dmHB.home_due(1062.0)
     check("App Home cadence: 1 s while the tab is open (60 s after app_home_opened), ~2 s after an event, 30 s heartbeat, never faster — owner rule",
           not quiet and heartbeat and not ev_fast and ev_2s and burst and not after)
+    dmMM = Daemon(use_slack=False); dmMM.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmMM.bot_user = "UBOT"
+    mm_calls = []
+    def mm_run(a, **k):
+        mm_calls.append(a)
+        class R: returncode = 0; stdout = '{"headRefName": "track/t9"}'; stderr = ""
+        return R()
+    dmMM.mark_merged("repo", "7", run=mm_run)
+    check("a 👍-merge flips the PR's track to `merged` on the board (status + note) — Home/!digest no longer say review",
+          any(a[-3:] == ["repo", "t9", "merged"] for a in mm_calls if a and a[0].endswith("cc-board") and a[1] == "status")
+          and any(a[1] == "note" and "PR #7" in a[-1] for a in mm_calls if a and a[0].endswith("cc-board")))
+    marked = []; dmMM.mark_merged = lambda repo, n: marked.append((repo, n)); dmMM.say = lambda *a, **k: None
+    nameMM = next(d for d in sorted(os.listdir(DEV)) if not d.startswith(".") and os.path.isdir(f"{DEV}/{d}/.git"))
+    dmMM.fetch_message = lambda chat, ts: {"user": "UBOT", "text": f"[{nameMM}] PR #7: t — https://x/7"}
+    dmMM.merge = lambda repo, n: (True, "merged"); dmMM.merge_failed = lambda *a, **k: None
+    _reactMM = globals()["react"]; globals()["react"] = lambda *a, **k: None
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmMM.on_approval("CAPPR", "1.1", "+1")
+            dmMM.merge = lambda repo, n: (True, "not mergeable yet — auto-merge armed: …")
+            dmMM.on_approval("CAPPR", "1.1", "+1")
+    finally:
+        globals()["react"] = _reactMM
+    check("on_approval marks the track merged only when the merge really happened (not when auto-merge was merely armed)",
+          marked == [(nameMM, "7")])
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     print(f"selfcheck: {len(fails)} failed")
