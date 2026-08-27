@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# cc-audit — hands-off recurring audit of this box. Reports live in ~/.cc/state/audit/; Slack gets ONE line
+# (the long form goes to the control repo's channel canvas). Never fixes anything: monthly findings land on the board as a
+# track the planning session dispatches when the owner says so.
+#   cc-audit checks|review|weekly|monthly|auto [--dry] [--no-post] [--no-llm]
+#   checks = mechanical, no LLM · review = checks + an LLM read of how well the box served the OWNER over 3 days
+#   weekly = checks + one LLM code audit (area rotates by ISO week) · monthly = checks + all four areas + a synthesis
+#   auto (the timer, 03:30 UTC): day 1 -> monthly · Sunday -> weekly · every 3rd day-of-year -> review · else quiet.
+#   --dry: everything (reports, evidence) goes to a mktemp dir wiped on exit and the report prints to stdout — but
+#          the LLM modes still SPEND. --no-llm (implies --no-post) skips the LLM: checks + evidence index only.
+# READ-ONLY BY CONSTRUCTION: the LLM child gets Read/Grep/Glob/LS and nothing that can write or run a command —
+# see the three layers at the ALLOW/DENY definitions below. Everything it needs is collected by THIS script into
+# <run>/evidence/ first, so it never needs a shell. CC_ROLE=worker is exported for anything that reads it, but the
+# child loads no settings and therefore no hooks: cc-guard does NOT gate it — the tool set is the guarantee.
+# Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE (stub the LLM) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL.
+set -uo pipefail
+case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # systemd-started: no ~/bin
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"; cd "$R" || exit 1   # a worktree copy audits itself, like cc-digest
+BOX="${CC_BOX:-$(hostname -s)}"                                    # notify titles and report headings
+CTL="$BOX"; case "$R" in "$HOME/dev/"*) CTL=${R#"$HOME/dev/"}; CTL=${CTL%%/*};; esac   # the control repo = the one this copy lives in: its Slack channel + board
+AD="$HOME/.cc/state/audit"; LOG="$AD/audit.log"; mkdir -p "$AD"
+CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"; LIMIT="$(dirname "$(readlink -f "$0")")/cc-limit"   # sibling, like the rest: a worktree copy uses its own
+BUD_REVIEW="${CC_AUDIT_BUDGET_REVIEW:-6}"; BUD_CODE="${CC_AUDIT_BUDGET_WEEKLY:-8}"; BUD_MONTH="${CC_AUDIT_BUDGET_MONTHLY_TOTAL:-30}"
+DAY="${CC_AUDIT_DATE:-$(date -u +%F)}"; STAMP="$(date -u +%FT%TZ)"
+log(){ printf '%s\t%s\n' "$STAMP" "$*" >> "$LOG"; }
+USAGE="usage: cc-audit checks|review|weekly|monthly|auto [--dry] [--no-post] [--no-llm]"
+mode=""; dry=0; post=1; llm_on=1
+for a in "$@"; do case "$a" in
+  checks|review|weekly|monthly|auto) mode="$a" ;;
+  --dry) dry=1; post=0 ;;
+  --no-post) post=0 ;;
+  --no-llm) llm_on=0; post=0 ;;   # a cheap test flag: never post a report the LLM never wrote
+  *) echo "$USAGE" >&2; exit 2 ;;
+esac; done
+[ -n "$mode" ] || { echo "$USAGE" >&2; exit 2; }
+if [ "$mode" = auto ]; then   # %-d/%-j: no leading zero, or bash reads them as octal
+  dom=$(date -u -d "$DAY" +%-d); dow=$(date -u -d "$DAY" +%u); doy=$(date -u -d "$DAY" +%-j)
+  if [ "$dom" = 1 ]; then mode=monthly; elif [ "$dow" = 7 ]; then mode=weekly
+  elif [ $((doy % 3)) -eq 0 ]; then mode=review; else log "auto: nothing due on $DAY"; exit 0; fi
+  log "auto: $DAY -> $mode"
+fi
+OUTDIR="$AD"; [ "$dry" = 1 ] && { OUTDIR=$(mktemp -d "${TMPDIR:-/tmp}/cc-audit.XXXXXX") && trap 'rm -rf "$OUTDIR"' EXIT || exit 1; }
+EV="$OUTDIR/$DAY-$mode/evidence"; mkdir -p "$EV" || exit 1
+prev=$(ls -t "$AD"/*-checks.md 2>/dev/null | head -1)   # the last report: the window for "since the last run"
+floor_days(){ case $1 in review) echo 3;; weekly) echo 7;; monthly) echo 30;; *) echo 1;; esac; }   # the window never shrinks below this
+SINCE_TS=$(date -u -d "$DAY -$(floor_days "$mode") days" +%s)
+if [ -n "$prev" ]; then p=$(stat -c %Y "$prev" 2>/dev/null || echo 0); [ "$p" -lt "$SINCE_TS" ] && SINCE_TS=$p; fi
+SINCE=$(date -u -d "@$SINCE_TS" +'%F %T')
+
+# ---- checks: every check records PASS/FAIL and CONTINUES; one broken check never ends the run ----
+pass=0; fail=0; RPT=""
+add(){ RPT+="$1"$'\n'; }
+row(){ local st=$1; shift; add "- **$st** $*"; if [ "$st" = PASS ]; then pass=$((pass+1)); else fail=$((fail+1)); fi; }
+ck(){ local st=FAIL; [ "$1" = 0 ] && st=PASS; shift; row "$st" "$@"; }   # ck <rc> <text…>
+tf(){ if "$@"; then echo 0; else echo 1; fi; }                          # a condition as an rc, e.g. ck "$(tf test 1 -lt 2)" …
+checks(){
+  add "# $BOX audit — checks — $STAMP"; add ""; add "_window: since $SINCE UTC_"; add ""; add "## suites"
+  local o rc
+  o=$(bash tests/check.sh 2>&1); rc=$?; ck $rc "tests/check.sh — $(printf '%s' "$o" | tail -1)"
+  o=$(env -u CC_ROLE CC_NOTIFY_LOG_ONLY=1 tests/selftest.sh </dev/null 2>&1); rc=$?
+  ck $rc "tests/selftest.sh — $(printf '%s' "$o" | grep -o '== result:.*==' | tail -1)"
+  o=$(cc-slack selfcheck 2>&1); rc=$?; ck $rc "cc-slack selfcheck — $(printf '%s' "$o" | tail -1)"
+  o=$(python3 tests/slack_sim.py bin/cc-slack 2>&1); rc=$?
+  ck $rc "slack_sim — $(printf '%s' "$o" | grep -E '^(score|wrong_minutes_per_day|api_calls_per_day):' | tr '\n' ' ')"
+  add ""; add "## services"
+  local u bad=""
+  for u in tmux-main.service cc-heartbeat.service cc-slackd.service cc-digest.timer cc-audit.timer; do
+    o=$(systemctl --user is-active "$u" 2>&1); [ "$o" = active ] || bad="$bad $u=$o"
+  done
+  o=$(systemctl --user is-failed cc-boot-notify.service 2>&1)   # a oneshot: it has run and gone inactive, only "failed" is a fault
+  [ "$o" = failed ] && bad="$bad cc-boot-notify.service=failed"
+  ck "$(tf test -z "$bad")" "user units —${bad:- all 6 active/expected}"
+  local hb age; hb=$(cat "$HOME/.cc/state/heartbeat" 2>/dev/null); age=$(( $(date -u +%s) - $(date -u -d "${hb:-@0}" +%s 2>/dev/null || echo 0) ))
+  ck "$(tf test "$age" -lt 60)" "heartbeat — ${age}s old (want < 60)"
+  o=$(cc-slack status 2>&1 | sed -n 3p); ck "$(tf grep -q connected <<<"$o")" "slack daemon — ${o:-no status}"
+  local errs; errs=$(journalctl --user -u cc-slackd --since "$SINCE" --no-pager 2>/dev/null | grep -ciE 'error|traceback')
+  ck "$(tf test "${errs:-0}" -eq 0)" "cc-slackd journal — $errs error/traceback lines since $SINCE"
+  add ""; add "## host"
+  local disk load
+  disk=$(df -P / | awk 'NR==2{print $5}'); ck "$(tf test "${disk%\%}" -lt 85)" "disk / — $disk used (want < 85%)"
+  load=$(cut -d' ' -f1-3 /proc/loadavg); ck "$(tf awk -v l="${load%% *}" -v n="$(nproc)" 'BEGIN{exit !(l < n*2)}')" "load — $load on $(nproc) cores"
+  o=$(diff <(jq -S . config/claude-settings.json 2>/dev/null) <(jq -S . "$HOME/.claude/settings.json" 2>/dev/null) 2>&1)
+  ck "$(tf test -z "$o")" "settings drift — $([ -z "$o" ] && echo 'repo == ~/.claude/settings.json' || echo "$(grep -c '^[<>]' <<<"$o") lines differ")"
+  add ""; add "## install"
+  local f miss=0 dang
+  for f in bin/*; do [ -f "$f" ] && [ -x "$f" ] || continue
+    [ -x "$HOME/bin/$(basename "$f")" ] || miss=$((miss+1)); done   # -x follows the link, so a dangling one fails too
+  dang=$(find "$HOME/bin" -maxdepth 1 -type l ! -xtype f 2>/dev/null | wc -l)
+  ck "$(tf test $((miss + dang)) -eq 0)" "$HOME/bin links — $miss of bin/* unlinked, $dang dangling"
+  local hd="$R/../home" tot=0                 # the private overlay's ~ docs (a bare core clone has none)
+  miss=0; for f in "$hd"/*.md; do [ -f "$f" ] || continue; tot=$((tot+1)); [ -L "$HOME/$(basename "$f")" ] || miss=$((miss+1)); done
+  ck "$(tf test "$miss" -eq 0)" "home doc symlinks — $miss of $tot missing"
+  add ""; add "## leftovers"
+  local old orph stale
+  old=$(docker ps -a --filter status=exited --filter name=ccbox --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -cE 'day|days|weeks|months')   # "About a day ago" counts
+  ck "$(tf test "${old:-0}" -eq 0)" "ccbox containers — $old stopped for a day or more"
+  orph=0; for f in "$HOME"/.cc/worktrees/*/*; do [ -d "$f" ] || continue
+    cc-board get "$(basename "$(dirname "$f")")" "$(basename "$f")" title >/dev/null 2>&1 || orph=$((orph+1)); done
+  ck "$(tf test "$orph" -eq 0)" "worktrees — $orph with no board entry"
+  stale=$(jq -r '.projects // {} | keys[]' "$HOME/.claude.json" 2>/dev/null | while read -r f; do [ -d "$f" ] || echo x; done | wc -l)
+  ck "$(tf test "${stale:-0}" -eq 0)" "$HOME/.claude.json trust — $stale entries whose dir is gone"
+  local spend
+  spend=$(find "$HOME/.cc/state" -path '*/runs/*.json' -newermt "@$SINCE_TS" -print0 2>/dev/null |
+          xargs -0 cat 2>/dev/null | jq -s 'map(.total_cost_usd // 0) | add // 0' 2>/dev/null)
+  add ""; add "- worker spend since $SINCE: \$$(printf '%.2f' "${spend:-0}")"
+}
+
+# ---- evidence: THIS script runs every command; the LLM only reads the files ----
+ev(){ local f="$EV/$1"; shift; "$@" >"$f" 2>&1; local rc=$?; [ $rc -eq 0 ] || printf '\n(collector exited %s: %s)\n' "$rc" "$*" >>"$f"; }
+collect_review(){
+  ev 01-slack-channels.txt cc-slack channels
+  local c
+  for c in $(grep -o '^#[a-z0-9_-]*' "$EV/01-slack-channels.txt" 2>/dev/null); do
+    ev "02-slack-${c#\#}.txt" cc-slack history "$c" 50
+  done
+  local dm; dm=$(grep -ho '\bD0[A-Z0-9]\{6,\}' "$HOME"/.cc/slack/*.log "$HOME"/.cc/slack/*.json 2>/dev/null | sort -u | head -1)
+  if [ -n "$dm" ]; then ev 03-slack-dm.txt cc-slack history "$dm" 50
+  else echo "(no DM channel id found in ~/.cc/slack — the owner DM was not read)" > "$EV/03-slack-dm.txt"; fi
+  local b; for b in "$HOME"/.cc/boards/*.json; do [ -f "$b" ] && cp "$b" "$EV/04-board-$(basename "$b")"; done
+  local t n; while IFS= read -r t; do
+    n=$(sed "s|^$HOME/.cc/state/||; s|/|-|g" <<<"$t"); tail -400 "$t" > "$EV/05-track-$n" 2>/dev/null
+  done < <(find "$HOME/.cc/state" -mindepth 3 -maxdepth 3 \( -name progress.md -o -name loop.log \) -newermt "@$SINCE_TS" 2>/dev/null)
+  tail -400 "$HOME/.cc/notify.log" > "$EV/06-notify.log" 2>/dev/null
+  ev 07-slackd-journal.txt journalctl --user -u cc-slackd --since "$SINCE" --no-pager
+  ev 08-git-log.txt git -C "$R" log --stat -40
+  printf '%s\n' "cc-slack history prints 'HH:MM user: text' and does NOT expose message ts, so thread-level reads" \
+    "(cc-slack thread <chan> <ts>) could not be collected: ❓ marks and per-thread latency are a known gap here." \
+    > "$EV/09-gaps.txt"
+}
+collect_code(){
+  ev 01-git-log.txt git -C "$R" log --stat -60
+  ev 02-git-diff-stat.txt git -C "$R" diff HEAD~30 --stat
+  printf '%s\n' "The repo itself is your evidence: it is the working directory ($R) and Read/Grep/Glob/LS reach it." \
+    > "$EV/03-repo.txt"
+}
+scrub(){ sed -ri 's/xox[bapesr]-[A-Za-z0-9-]{6,}/[redacted-token]/g' "$EV"/* 2>/dev/null; }   # no secret ever reaches the LLM's evidence
+
+# ---- the LLM passes: no Bash, no writes, evidence-only ----
+AREAS=(core slack ccbox boot)
+files_for(){ case $1 in
+  core)  echo "bin/cc bin/cc-board bin/cc-loop bin/cc-checkpoint bin/cc-guard bin/cc-digest bin/cc-msg bin/cc-trust" ;;
+  slack) echo "bin/cc-slack slack/app-manifest.json tests/slack_sim.py" ;;
+  ccbox) echo "bin/ccbox ccbox/" ;;
+  boot)  echo "bin/cc-boot bin/cc-rc bin/cc-boot-notify bin/cc-heartbeat bin/cc-notify bin/box-status install.sh config/systemd-user/ docs/ templates/" ;;
+esac; }
+# Read-only by construction, in three layers, because no one of them is enough:
+#   --setting-sources ''  ~/.claude/settings.json is NOT loaded, so its wide allow tier cannot union with the
+#                         allow-list below; the allow-list becomes the session's whole permission surface. (It also
+#                         drops the hooks, so a nested run can never checkpoint-commit either.)
+#   --strict-mcp-config   with no --mcp-config, every MCP server is off: no cc-slack channel tool to post with.
+#   --disallowedTools     names the escape hatches that are exposed without asking permission. `Bash` alone is NOT
+#                         enough: a probe run reached the shell through `Monitor` and wrote a file (2026-08-27).
+# Verified adversarially: a run ordered to create ./probe.txt by any means answers BLOCKED and creates nothing.
+# Read/Grep ARE scopeable by path — `//abs/path` in a rule is one leading `/` plus $HOME, hence "/$HOME" below —
+# so the secret stores are denied too; the evidence dir under ~/.cc/state stays readable. Verified: a run told to
+# read ~/.cc/config gets "Permission to read … has been denied" from Read AND from Grep.
+ALLOW="Read,Grep,Glob,LS"
+DENY="Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree"
+for s in "/$HOME/.cc/config" "/$HOME/.ssh/**" "/$HOME/.claude/.credentials.json" "/$HOME/.claude.json"; do
+  DENY="$DENY,Read($s),Grep($s)"   # secrets: reachable by Read otherwise, and the audit never needs them
+done
+LLM_COST=0
+postponed(){ printf '_(postponed: Claude %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; }
+llm(){   # llm <out-file> <budget> <prompt> — 20 min hard cap; a failed run leaves a stub and never aborts the audit
+  local out=$1 bud=$2 prompt=$3 j rc res p; j=$(mktemp)
+  if p=$("$LIMIT" status 2>/dev/null); then postponed "$out" "$p"; rm -f "$j"; return 1; fi   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
+  CC_ROLE=worker timeout 20m "$CLAUDE" -p "$prompt" --model claude-opus-5 --max-budget-usd "$bud" --max-turns 60 \
+    --output-format json --setting-sources '' --strict-mcp-config --disable-slash-commands \
+    --allowedTools "$ALLOW" --disallowedTools "$DENY" >"$j" 2>>"$LOG"
+  rc=$?
+  if p=$("$LIMIT" check "$j" 2>/dev/null); then   # hit it mid-audit: record it, postpone, leave the stamp for everyone else
+    postponed "$out" "usage limit until $(date -u -d "@${p#LIMIT }" +%H:%M)Z"; rm -f "$j"; return 1; fi
+  res=$(jq -r '.result // empty' "$j" 2>/dev/null); LLM_COST=$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null)
+  if [ -n "$res" ]; then printf '%s\n' "$res" > "$out"; else printf '_(audit run failed: rc=%s)_\n' "$rc" > "$out"; log "llm $out failed rc=$rc"; fi
+  rm -f "$j"; [ -n "$res" ]
+}
+AREA_OUT=""
+area_audit(){   # area_audit <area> [kind] -> sets AREA_OUT (a command substitution would swallow LLM_COST)
+  local a=$1; AREA_OUT="$OUTDIR/$DAY-${2:-weekly}-$a.md"
+  llm "$AREA_OUT" "$BUD_CODE" "$(sed -e "s|@BOX@|$BOX|g" -e "s|@AREA@|$a|g" -e "s|@FILES@|$(files_for "$a")|g" -e "s|@EVIDENCE@|$EV|g" config/audit-prompt.md)"
+}
+count(){ local n; n=$(grep -c "\*\*$2\*\*" "$1" 2>/dev/null); echo "${n:-0}"; }   # grep -c prints 0 AND exits 1: no `|| echo 0`, that would print twice
+under(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a < b)}'; }
+short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; printf '%s' "$s"; }   # a phone-readable cut: on a space, never mid-word
+
+# ---- run ----
+log "start mode=$mode dry=$dry post=$post llm=$llm_on day=$DAY since=$SINCE ev=$EV"
+checks
+verdict=$([ "$fail" -eq 0 ] && echo OK || echo ATTENTION)
+add ""; add "**verdict: $verdict — $fail of $((pass+fail)) checks failed**"
+CHK="$RPT"; printf '%s\n' "$CHK" > "$EV/00-checks.md"
+hi=0; med=0; imp=0; llm_ok=1; body="$CHK"; out="$OUTDIR/$DAY-checks.md"
+case "$mode" in review) collect_review ;; weekly|monthly) collect_code ;; esac
+scrub
+if [ "$mode" != checks ] && [ "$llm_on" = 0 ]; then
+  body="$CHK"$'\n\n'"## evidence collected (--no-llm, no LLM run)"$'\n'"$(cd "$EV" && ls -la | sed 's/^/    /')"
+elif [ "$mode" = review ]; then   # the every-3-days run: how well the box served the OWNER, not how the code reads
+  out="$OUTDIR/$DAY-review.md"
+  llm "$out" "$BUD_REVIEW" "$(sed -e "s|@BOX@|$BOX|g" -e "s|@DAYS@|$(floor_days review)|g" -e "s|@SINCE@|$SINCE|g" -e "s|@EVIDENCE@|$EV|g" config/audit-review-prompt.md)" || llm_ok=0
+  imp=$(count "$out" IMPROVEMENT)
+  body="$(cat "$out")"$'\n\n'"---"$'\n\n'"$CHK"
+elif [ "$mode" = weekly ]; then
+  area=${AREAS[$(( $(date -u -d "$DAY" +%-V) % 4 ))]}
+  area_audit "$area" || llm_ok=0
+  hi=$(count "$AREA_OUT" HIGH); med=$(count "$AREA_OUT" MED); out=$AREA_OUT
+  body="$(cat "$out")"$'\n\n'"---"$'\n\n'"$CHK"
+elif [ "$mode" = monthly ]; then
+  ym=$(date -u -d "$DAY" +%Y-%m); reports=(); spent=0
+  for a in "${AREAS[@]}"; do
+    under "$spent" "$BUD_MONTH" || { log "monthly: aggregate cap \$$BUD_MONTH reached, skipping area $a"; continue; }
+    area_audit "$a" monthly || llm_ok=0
+    reports+=("$AREA_OUT"); spent=$(awk -v a="$spent" -v b="$LLM_COST" 'BEGIN{printf "%.4f", a+b}')
+  done
+  for f in "${reports[@]}"; do hi=$((hi + $(count "$f" HIGH))); med=$((med + $(count "$f" MED))); done
+  out="$OUTDIR/$DAY-monthly-synthesis.md"; last=$(ls -t "$AD"/*-monthly-synthesis.md 2>/dev/null | head -1)
+  if under "$spent" "$BUD_MONTH"; then
+    llm "$out" "$BUD_CODE" "Read these four area audits of the box $BOX: ${reports[*]}${last:+ and the previous synthesis $last}.
+Write at most 40 lines of markdown: '## top findings' (the handful that actually matter, each with file:line),
+'## trends' (what got better or worse since last month${last:+, comparing against $last}; say 'no prior report' if there is none),
+'## delete or simplify' (code or docs that should simply go). No preamble, no repetition of every finding." || llm_ok=0
+  else printf '_(synthesis skipped: aggregate cap $%s reached after $%s)_\n' "$BUD_MONTH" "$spent" > "$out"; llm_ok=0; fi
+  [ "$dry" = 1 ] || [ "$llm_ok" = 0 ] ||   # a dry run reads and prints; it never puts a track on the board the planning session watches
+    cc-board add "$CTL" "audit-$(date -u -d "$DAY" +%Y%m)" "monthly audit $ym: $hi high / $med med" "$out" >/dev/null 2>&1 ||
+    log "board add failed for audit-$(date -u -d "$DAY" +%Y%m)"
+  body="$(cat "$out")"$'\n\n'"---"$'\n\n'"$CHK"
+fi
+if [ "$dry" = 1 ]; then printf '%s\n' "$body"   # OUTDIR is a mktemp dir: the reports and the evidence go with it on EXIT
+else
+  printf '%s\n' "$body" > "$out"; echo "$out"
+  [ "$mode" = checks ] || printf '%s\n' "$CHK" > "$AD/$DAY-checks.md"   # the "since the last run" window is always a checks file
+fi
+if [ "$post" = 1 ]; then
+  printf '%s\n' "$body" | cc-slack canvas "#$CTL" "$BOX audit" >/dev/null 2>&1 || log "canvas update failed"
+  if [ "$llm_ok" = 0 ]; then cc-notify -t "$BOX audit $mode" "$mode failed (see audit.log) · $verdict: $fail checks failed" || log "notify failed"
+  elif [ "$mode" = review ]; then   # the review's headline is the owner's experience, not a finding count
+    cc-notify -t "$BOX review" "$(short "$(sed -n '/^## verdict/,/^## /p' "$out" | grep '^- ' | head -1 | cut -c3-)") · $imp improvements → canvas" || log "notify failed"
+  else
+    cc-notify -t "$BOX audit $mode" "$verdict: $fail checks failed · $hi/$med findings · canvas updated" || log "notify failed"
+  fi
+fi
+log "done mode=$mode verdict=$verdict fail=$fail high=$hi med=$med imp=$imp llm_ok=$llm_ok out=$out"
+exit 0

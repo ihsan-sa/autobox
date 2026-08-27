@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# cc-guard — PreToolUse hook: deterministic human gates for AUTONOMOUS sessions (workers/tracks/loops).
+# Applies when CC_ROLE=worker is set, or the session cwd is inside a cc track worktree (.cc/track marker) —
+# so interactive TRACK sessions are gated too (intended); plain operator/planning sessions are not.
+# Denies (exit 2 + reason) the four owner gates:
+#   1. merge to default branch / deploy      2. external comms in owner's name
+#   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
+set -uo pipefail
+command -v jq >/dev/null 2>&1 || { [ "${CC_ROLE:-}" = worker ] && { echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2; }; exit 0; }
+inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""' <<<"$inp"); cwd=$(realpath -m -- "${cwd:-/}" 2>/dev/null || echo "$cwd")
+# A command position: start, after a separator/substitution, or after wrapper words that hide the real command
+# (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
+AT='(^|[;&|(){}`]|\$\() *(((then|else|elif|do|time|env|nohup|xargs|command|eval|exec|sudo|bash|sh|-c)|[A-Za-z_][A-Za-z0-9_]*=[^ ]*) +)*'
+if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones and their subagents included): nothing may kill the shared tmux server
+  u=$(jq -r '.tool_input.command // ""' <<<"$inp"); u=${u//\"/}; u=${u//\'/}
+  { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
+    || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
+fi
+role="${CC_ROLE:-}"
+if [ "$role" != worker ]; then
+  d="$cwd"; while [ -n "$d" ] && [ "$d" != / ]; do [ -f "$d/.cc/track" ] && { role=worker; break; }; d=$(dirname "$d"); done
+fi
+[ "$role" = worker ] || exit 0
+deny(){ echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
+case "$tool" in
+  Bash)
+    cmd=$(jq -r '.tool_input.command // ""' <<<"$inp"); cmd=${cmd//\"/}; cmd=${cmd//\'/}
+    # 1. merge/deploy
+    grep -qE "$AT"'gh +pr +merge' <<<"$cmd" && deny "merging a PR"
+    grep -qE 'git +push[^;&|]*( -f|--force|--force-with-lease)' <<<"$cmd" && deny "force push"
+    grep -qE 'git +push[^;&|]*\b(main|master)\b' <<<"$cmd" && deny "pushing to the default branch"
+    grep -qE 'git +(checkout|switch) +(main|master)\b' <<<"$cmd" && deny "switching to the default branch inside a track"
+    grep -qE 'git +(symbolic-ref|update-ref|checkout +-B|switch +-C)' <<<"$cmd" && deny "repointing a ref/HEAD (the checkpoint hook would then commit+push that branch)"
+    grep -qE "$AT"'(vercel|netlify|fly|heroku|kubectl|terraform|ansible|aws|gcloud|az) +(deploy|apply|--prod|up\b)' <<<"$cmd" && deny "deploying"
+    # 2. external comms
+    grep -qE "$AT"'gh +(issue +(create|comment)|pr +(comment|review|close|reopen)|release +create)' <<<"$cmd" && deny "public GitHub comms"
+    grep -qE "$AT"'gh +(repo +(delete|archive)|api)\b' <<<"$cmd" && deny "gh repo delete/archive or a raw gh api call"
+    grep -qE "$AT"'(mail|sendmail|msmtp|mutt)\b' <<<"$cmd" && deny "sending email"
+    # 3. destructive / infra
+    grep -qE "$AT"'cc +slack +off' <<<"$cmd" && deny "cc slack off (drops the owner's live Slack link)"
+    grep -qE '(^|[;&|(){}`]|\$\() *[^ ]*cc-slack +(inject|post|post-approval)\b' <<<"$cmd" && deny "posting to the owner's Slack (cc-slack inject/post)"   # any path to the binary
+    grep -qE "$AT"'sudo\b' <<<"$cmd" && deny "sudo / host changes"
+    grep -qE 'rm +(-[a-zA-Z-]+ +)*-[a-zA-Z]*r[a-zA-Z]* +(-[a-zA-Z-]+ +)*(~|[$]HOME|\.\.|/home|/etc|/var|/usr|/)([*/ ]|$)' <<<"$cmd" && deny "recursive delete outside the worktree"
+    grep -qE "$AT"'docker +(system +prune|rm|rmi|volume +rm)' <<<"$cmd" && deny "destroying docker resources"
+    grep -qE "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' <<<"$cmd" && deny "host/network/service changes"
+    grep -qE 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' <<<"$cmd" && deny "destructive git"
+    ;;
+  Edit|Write|MultiEdit|NotebookEdit)
+    fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
+    fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ traversal resolves before the match
+    case "$fp" in
+      "$cwd"/*|"$cwd") ;;                          # inside the worktree: fine
+      /tmp/*|"$HOME"/.cc/state/*) ;;               # scratch + track state: fine
+      *) deny "editing outside the worktree ($fp)";;
+    esac ;;
+esac
+exit 0

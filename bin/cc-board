@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""cc-board — shared per-repo task/status board for orchestrated Claude sessions.
+Board file: ~/.cc/boards/<repo>.json  (sidecar; never in git, so no merge noise).
+Every orchestrated session reads/writes it so sessions know what the others are doing."""
+import sys, os, json, time, fcntl
+BOARDS = os.path.expanduser("~/.cc/boards")
+STATES = ["todo","running","review","blocked","merged","done"]
+def now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def bpath(repo): return os.path.join(BOARDS, repo + ".json")
+def _load(repo):
+    p = bpath(repo)
+    if not os.path.exists(p): return None
+    with open(p) as f: return json.load(f)
+def _save(repo, d):
+    os.makedirs(BOARDS, exist_ok=True)
+    d["updated"] = now()
+    tmp = bpath(repo) + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    os.replace(tmp, bpath(repo))
+class Lock:
+    def __init__(self, repo):
+        os.makedirs(BOARDS, exist_ok=True)
+        self.f = open(os.path.join(BOARDS, repo + ".lock"), "w")
+    def __enter__(self): fcntl.flock(self.f, fcntl.LOCK_EX); return self
+    def __exit__(self,*a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+def need(repo):
+    d = _load(repo)
+    if d is None: sys.exit(f"cc-board: no board for '{repo}' (run: cc-board init {repo} <path> <branch>)")
+    return d
+USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"list":1}
+def main(a):
+    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show|json|list|rm|tracks} ...")
+    cmd = a[0]
+    if cmd in USAGE and len(a) < USAGE[cmd]:   # a short call must say so, not traceback
+        sys.exit(f"cc-board {cmd}: needs {USAGE[cmd]-1} argument(s), got {len(a)-1}")
+    if cmd == "init":
+        repo, path, branch = a[1], a[2], (a[3] if len(a)>3 else "main")
+        with Lock(repo):
+            d = _load(repo) or {"repo":repo,"tracks":{},"log":[]}
+            d.update({"path":path,"default_branch":branch,"created":d.get("created",now())})
+            _save(repo, d)
+        print(f"board ready: {repo} ({path}, base {branch})")
+    elif cmd == "add":
+        repo, track, title = a[1], a[2], a[3]
+        instr = " ".join(a[4:])
+        with Lock(repo):
+            d = need(repo)
+            t = d["tracks"].get(track, {})
+            t.update({"title":title,"instructions":instr,
+                      "status":t.get("status","todo"),
+                      "branch":t.get("branch",f"track/{track}"),
+                      "worktree":t.get("worktree", os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}")),
+                      "session_id":t.get("session_id",""),"started":t.get("started",False),
+                      "pr":t.get("pr",""),"notes":t.get("notes",[]),
+                      "created":t.get("created",now()),"updated":now()})
+            d["tracks"][track]=t
+            d["log"].append({"ts":now(),"track":track,"msg":f"added: {title}"})
+            _save(repo,d)
+        print(f"track '{track}' added to {repo}")
+    elif cmd == "set":
+        repo, track, key, val = a[1], a[2], a[3], a[4]
+        with Lock(repo):
+            d = need(repo)
+            if track not in d["tracks"]: sys.exit(f"no track '{track}'")
+            if key=="started": val = val.lower() in ("1","true","yes")
+            d["tracks"][track][key]=val; d["tracks"][track]["updated"]=now()
+            _save(repo,d)
+    elif cmd == "get":
+        repo, track, key = a[1], a[2], a[3]
+        d = need(repo); print(d["tracks"].get(track,{}).get(key,""))
+    elif cmd == "status":
+        repo, track, st = a[1], a[2], a[3]
+        if st not in STATES: sys.exit(f"status must be one of {STATES}")
+        with Lock(repo):
+            d = need(repo)
+            if track not in d["tracks"]: sys.exit(f"no track '{track}'")
+            d["tracks"][track]["status"]=st; d["tracks"][track]["updated"]=now()
+            d["log"].append({"ts":now(),"track":track,"msg":f"status -> {st}"})
+            _save(repo,d)
+        print(f"{repo}/{track}: {st}")
+    elif cmd == "note":
+        repo, track = a[1], a[2]; msg=" ".join(a[3:])
+        with Lock(repo):
+            d = need(repo)
+            if track not in d["tracks"]: sys.exit(f"no track '{track}'")
+            d["tracks"][track].setdefault("notes",[]).append({"ts":now(),"msg":msg})
+            d["tracks"][track]["updated"]=now()
+            d["log"].append({"ts":now(),"track":track,"msg":msg})
+            _save(repo,d)
+    elif cmd == "rm":
+        repo, track = a[1], a[2]
+        with Lock(repo):
+            d = need(repo); d["tracks"].pop(track,None)
+            d["log"].append({"ts":now(),"track":track,"msg":"removed"})
+            _save(repo,d)
+    elif cmd == "tracks":
+        d = need(a[1]); print("\n".join(d["tracks"].keys()))
+    elif cmd == "json":
+        print(json.dumps(need(a[1]), indent=2))
+    elif cmd == "list":
+        if not os.path.isdir(BOARDS): return
+        for fn in sorted(os.listdir(BOARDS)):
+            if not fn.endswith(".json"): continue
+            try: d = _load(fn[:-5]) or {}
+            except Exception as e:   # one unreadable board must not hide every other repo
+                print(f"{fn}: unreadable ({e})", file=sys.stderr); continue
+            for tr,t in d.get("tracks",{}).items():
+                print(f"{d.get('repo',fn[:-5])}\t{tr}\t{t.get('status','?')}\t{t.get('title','')}")
+    elif cmd == "show":
+        d = need(a[1])
+        ico = {"todo":"·","running":"▶","review":"◆","blocked":"■","merged":"✓","done":"✓"}
+        print(f"\n\033[1m{d['repo']}\033[0m  base:{d.get('default_branch','main')}  {d.get('path','')}")
+        if not d["tracks"]: print("  (no tracks yet)")
+        for tr,t in d["tracks"].items():
+            print(f"  {ico.get(t.get('status'),'?')} \033[1m{tr}\033[0m [{t.get('status')}]  {t.get('title','')}")
+            if t.get("instructions"): print(f"      task: {t['instructions'][:200]}")
+            if t.get("pr"): print(f"      PR: {t['pr']}")
+            for n in t.get("notes",[])[-3:]: print(f"      - {n['msg'][:160]}")
+        print()
+    else:
+        sys.exit(f"cc-board: unknown command '{cmd}'")
+if __name__ == "__main__":
+    main(sys.argv[1:])

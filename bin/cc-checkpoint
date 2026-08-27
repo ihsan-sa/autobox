@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# cc-checkpoint — auto-commit+push a track worktree. Wired as a Claude Stop hook (runs after each turn).
+# No-op unless the cwd is inside a cc track worktree (marker: <worktree-root>/.cc/track). Never touches
+# the primary worktree / default branch (no marker there), so main/planning sessions stay clean.
+# Refuses (and logs to .cc/checkpoint.err) when HEAD is not the track's own branch — a session can rewrite
+# HEAD with git symbolic-ref — or when the staged names look like secrets. Push stderr → .cc/push.err.
+# Always exits 0 so it can never block a session.
+SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
+{
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+  [ -f "$root/.cc/track" ] || exit 0
+  cd "$root" || exit 0
+  refuse(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$root/.cc/checkpoint.err"; git reset -q 2>/dev/null; exit 0; }   # unstage too: a refused secret must not sit in the index
+  track=$(sed -n 2p "$root/.cc/track"); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
+  [ -n "$track" ] && [ "$branch" = "track/$track" ] || refuse "refused: HEAD is '$branch', not 'track/$track' — checkpoint only ever commits the track's own branch"
+  git add -A 2>/dev/null || exit 0
+  if git diff --cached --quiet 2>/dev/null; then exit 0; fi   # nothing changed
+  bad=$(git diff --cached --diff-filter=A --name-only | grep -E "$SECRETS" | head -5 | tr '\n' ' ')   # only NEW files: a repo that already tracks .env.example is not leaking
+  [ -z "$bad" ] || refuse "refused: staged files look like secrets: $bad (remove or ignore them, then the next turn commits)"
+  files=$(git diff --cached --name-only | wc -l | tr -d ' ')
+  # Commit identity: git's own config normally, overridden by CC_GIT_NAME/CC_GIT_EMAIL in ~/.cc/config
+  # (read, not sourced — that file holds tokens and none of them belong in this git's environment).
+  ident=(); cfg="$HOME/.cc/config"
+  n=$(sed -n 's/^CC_GIT_NAME=//p'  "$cfg" 2>/dev/null | tail -1); [ -n "$n" ] && ident+=(-c "user.name=$n")
+  e=$(sed -n 's/^CC_GIT_EMAIL=//p' "$cfg" 2>/dev/null | tail -1); [ -n "$e" ] && ident+=(-c "user.email=$e")
+  git "${ident[@]}" commit -q -m "wip: checkpoint $(date -u +%FT%TZ) [$files file(s)] [cc]" 2>/dev/null || exit 0
+  rm -f "$root/.cc/checkpoint.err"
+  if git remote get-url origin >/dev/null 2>&1; then   # push failures never block, but they must not be invisible either (cc ls / digest show "push!")
+    if git push -q -u origin "$branch" 2>"$root/.cc/push.err.tmp"; then rm -f "$root/.cc/push.err" "$root/.cc/push.err.tmp"
+    else mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; fi
+  fi
+} >/dev/null 2>&1
+exit 0

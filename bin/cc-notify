@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# cc-notify — reach the owner. Always logs to ~/.cc/notify.log; pushes via ntfy and/or Slack when configured.
+#   cc-notify [-t title] [-p low|default|high|urgent] "message"     (or message on stdin)
+#   cc-notify setup        create the ntfy topic + show the phone subscription steps
+#   cc-notify test         send a test push
+# Exit: 0 if at least one configured channel took the message (or none is configured — the log is the channel),
+#   1 only if every configured channel failed, so callers (cc-boot-notify) can retry on status instead of on text.
+# Config: ~/.cc/config  (NTFY_TOPIC=..., NTFY_SERVER=https://ntfy.sh, SLACK_WEBHOOK=https://hooks.slack.com/...;
+#   with SLACK_BOT_TOKEN set (cc slack setup) the bot posts instead — into #<repo> when the title starts with a repo name, else #alerts, else SLACK_CHANNEL)
+set -uo pipefail
+CFG="$HOME/.cc/config"; LOG="$HOME/.cc/notify.log"; mkdir -p "$HOME/.cc"
+[ -f "$CFG" ] && . "$CFG"
+NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
+BOX="${CC_BOX:-$(hostname -s)}"   # this box's name (override with CC_BOX in ~/.cc/config): default title + ntfy topic prefix
+title="$BOX"; prio="default"
+case "${1:-}" in
+  setup)
+    if [ -z "${NTFY_TOPIC:-}" ]; then NTFY_TOPIC="$BOX-$(tr -dc a-z0-9 </dev/urandom | head -c 12)"; echo "NTFY_TOPIC=$NTFY_TOPIC" >> "$CFG"; fi
+    echo "ntfy topic: $NTFY_TOPIC"; echo "Phone: install the 'ntfy' app (iOS/Android) -> Subscribe to topic -> enter: $NTFY_TOPIC"
+    echo "Then run: cc-notify test"; exit 0 ;;
+  test) exec "$0" -t "$BOX test" "Notifications work. $(date -u +%H:%M) UTC" ;;
+esac
+while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; *) break;; esac; done
+msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
+printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n' ' ')" >> "$LOG"
+[ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && exit 0   # tests set this: log, never push
+# post <url> <curl args...> — url via -K (kept out of argv/ps), body via stdin (a message starting with @ is text, not a filename)
+post() { local u=$1; shift; curl -sS --fail --max-time 10 --data-binary @- -K <(printf 'url = "%s"\n' "$u") "$@" >/dev/null 2>&1; }
+tried=0; ok=0
+if [ -n "${NTFY_TOPIC:-}" ]; then
+  tried=$((tried + 1))
+  if printf '%s' "$msg" | post "$NTFY_SERVER/$NTFY_TOPIC" -H "Title: $title" -H "Priority: $prio" -H "Tags: robot"
+    then ok=$((ok + 1)); else echo "cc-notify: ntfy push failed (logged)" >&2; fi
+fi
+if [ -n "${SLACK_BOT_TOKEN:-}" ] || [ -n "${SLACK_WEBHOOK:-}" ]; then   # one channel: the bot, else the webhook
+  tried=$((tried + 1)); bang=$( { [ "$prio" = high ] || [ "$prio" = urgent ]; } && echo ' :rotating_light:')
+  if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post --route "$title" "$(printf '*%s*%s\n%s' "$title" "$bang" "$msg")" >/dev/null 2>&1; then
+    ok=$((ok + 1))   # posted by the bot (project channel or SLACK_CHANNEL)
+  elif [ -n "${SLACK_WEBHOOK:-}" ] &&
+       jq -cn --arg t "$title" --arg m "$msg" --arg b "$bang" \
+         'def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
+          {text: ("*" + ($t|esc) + "*" + $b + "\n" + ($m|esc))}' |
+       post "$SLACK_WEBHOOK" -H 'Content-Type: application/json'; then
+    ok=$((ok + 1))
+  else
+    echo "cc-notify: slack post failed (logged)" >&2
+  fi
+fi
+[ "$tried" -eq 0 ] && exit 0                 # nothing configured: the log is the only channel, that is not a failure
+[ "$ok" -gt 0 ] || exit 1                    # every configured channel failed — the caller may retry
+exit 0

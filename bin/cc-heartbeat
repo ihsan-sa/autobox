@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# cc-heartbeat — 10 s fsync'd "alive" timestamp so a sudden power loss can be dated to ~10 s (gaps are POST-dominated; 1 Hz cost ~7 GB/day on the SSD for ±1 s nobody needs).
+# On start it compares the previous run's last-alive time with this boot and appends one line to
+# ~/.cc/state/power-events.log (read by cc-boot-notify), labelled cause=clean-reboot|power-loss|unknown from the previous
+# boot's journal (did PID 1 reach reboot/poweroff.target?). A restart within the same boot logs nothing.
+# `cc-heartbeat --dry-run [<last_alive>]` prints the line it would log (default last_alive: the current stamp), touches nothing, exits.
+set -uo pipefail
+hb="$HOME/.cc/state/heartbeat"; log="$HOME/.cc/state/power-events.log"
+dry=0; [ "${1:-}" = --dry-run ] && dry=1
+[ $dry = 1 ] || mkdir -p "$HOME/.cc/state"
+boot=$(date -u -d "$(uptime -s)" +%FT%TZ 2>/dev/null || date -u +%FT%TZ)
+boot_s=$(date -u -d "$boot" +%s)
+prev_cause() {  # how the previous boot ended, from its journal (readable by the box user: group adm; same test as cc-boot-notify)
+  local j; j=$(journalctl -b -1 _PID=1 -o cat --no-pager 2>/dev/null)
+  if [ -z "$j" ]; then echo unknown
+  elif grep -qE 'Reached target (reboot|poweroff|halt|shutdown)\.target|^Shutting down\.$' <<<"$j"; then echo clean-reboot
+  else echo power-loss; fi
+}
+emit() { if [ $dry = 1 ]; then echo "DRY-RUN (not written): $1"; else echo "$1" >> "$log"; fi; }
+prev=""; [ -s "$hb" ] && prev=$(cat "$hb"); [ $dry = 1 ] && [ -n "${2:-}" ] && prev=$2
+if [ -n "$prev" ]; then
+  prev_s=$(date -u -d "$prev" +%s 2>/dev/null || echo 0)
+  if [ "$prev_s" -lt "$boot_s" ]; then
+    gap=$((boot_s - prev_s)); cause=$(prev_cause)
+    case $cause in clean-reboot) note="gap = shutdown + POST + kernel start";; *) note="gap = outage + POST + kernel start";; esac
+    emit "$(date -u +%FT%TZ) boot=$boot last_alive=$prev gap=${gap}s cause=$cause ($note)"
+    [ $dry = 1 ] || logger -t cc-heartbeat "previous run last alive at $prev; this boot at $boot; gap ${gap}s; cause $cause"
+  elif [ $dry = 1 ]; then echo "DRY-RUN: last_alive=$prev is not before boot=$boot — same boot, nothing would be logged"
+  fi
+else
+  emit "$(date -u +%FT%TZ) boot=$boot last_alive=none (first run)"
+fi
+[ $dry = 1 ] && exit 0
+# fsync the file AND its directory: without the second sync the rename can still be in the dir's
+# journal-only state when power drops, and the stamp reverts to the previous value (~10 s of extra dark time).
+hbdir=$(dirname "$hb")
+while :; do
+  date -u +%FT%TZ > "$hb.tmp" && sync "$hb.tmp" && mv -f "$hb.tmp" "$hb" && sync "$hbdir"
+  sleep 10
+done

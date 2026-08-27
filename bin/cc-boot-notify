@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# cc-boot-notify — one Slack/ntfy message per boot (via cc-notify): when the box came up, whether the
+# previous boot ended cleanly or by power loss / hard reset, and how long it was dark (from cc-heartbeat).
+# The "announced" stamp is written only after cc-notify accepts the message, so a boot whose network never
+# came back stays unannounced and is retried by the next `systemctl --user start cc-boot-notify` (the unit
+# runs with TimeoutStartSec=infinity: the wait-for-network + retries can outlast any finite timeout).
+set -uo pipefail
+log="$HOME/.cc/state/power-events.log"
+notify="$HOME/bin/cc-notify"
+# announce each boot exactly once: a re-run in the same boot (installer re-enable, manual start) must stay silent
+stamp="$HOME/.cc/state/boot-announced"; bootid=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || uptime -s)
+[ "$(cat "$stamp" 2>/dev/null)" = "$bootid" ] && exit 0
+[ -x "$notify" ] || { echo "cc-boot-notify: $notify is missing — nothing announced" >&2; exit 1; }
+hhmmss() { local t=${1#*T}; printf '%s' "${t%Z}"; }   # 2026-08-27T04:05:06Z -> 04:05:06 (the message says UTC once)
+boot=$(date -u -d "$(uptime -s)" +%FT%TZ)
+# the last line the previous boot managed to flush to disk — journald writes in batches, so it lags the actual end by up to ~5 min
+prev_end=$(journalctl -b -1 --utc -o short-iso --no-pager 2>/dev/null | tail -n1 | cut -c12-19)
+# cc-heartbeat appends this boot's line right after it starts; wait for a line fresh for THIS boot (±120 s, avoids ±1 s uptime -s mismatch)
+line=""; bs=$(date -u -d "$boot" +%s)
+for _ in $(seq 1 15); do
+  line=$(tail -n1 "$log" 2>/dev/null); lb=$(sed -n 's/.*boot=\([^ ]*\).*/\1/p' <<<"$line")
+  ls=$(date -u -d "$lb" +%s 2>/dev/null || echo 0); d=$((bs-ls)); [ "${d#-}" -le 120 ] && break; line=""; sleep 1
+done
+alive=$(sed -n 's/.*last_alive=\([^ ]*\).*/\1/p' <<<"$line"); gap=$(sed -n 's/.*gap=\([0-9]*\)s.*/\1/p' <<<"$line")
+cause=$(sed -n 's/.*cause=\([a-z-]*\).*/\1/p' <<<"$line")
+case "$cause" in
+  clean-reboot) why="clean shutdown/reboot"; prio=default ;;
+  power-loss)   why="NOT a clean shutdown → power loss or hard reset"; prio=high ;;
+  *)            why="unknown (no heartbeat line for this boot)"; prio=default ;;
+esac
+hb=""; [ -n "$gap" ] && hb=" Last heartbeat $(hhmmss "$alive") → kernel up $(hhmmss "$boot"): ${gap}s dark (incl. POST)."
+por=$(sudo -n smartctl -A /dev/sda 2>/dev/null | awk '$1==235{print $NF}')
+today=$(journalctl --list-boots --utc --no-pager 2>/dev/null | awk -v d="$(date -u +%F)" '$4==d' | wc -l)
+msg="Up at $(hhmmss "$boot") UTC. Previous boot's last journal write ${prev_end:-?} UTC (flushed, up to ~5 min before the actual end) — ${why}.${hb} Sudden-power-loss count (SSD attr 235): ${por:-?}. Boots today: ${today}."
+# wait for the network (WiFi + DNS take a while after boot), then post; retry while cc-notify reports every channel down
+for _ in $(seq 1 60); do curl -s --max-time 5 -o /dev/null https://hooks.slack.com/ || curl -s --max-time 5 -o /dev/null "${NTFY_SERVER:-https://ntfy.sh}/" && break; sleep 5; done   # any channel reachable = network is back
+posted=0
+for i in 1 2 3 4 5 6; do
+  if "$notify" -t "${CC_BOX:-$(hostname -s)} boot" -p "$prio" "$msg"; then posted=1; break; fi
+  [ "$i" = 6 ] || sleep $((i * 10))
+done
+printf '%s\n' "$msg"
+[ "$posted" = 1 ] || { echo "cc-boot-notify: no channel took the message — leaving this boot unannounced so a later run retries" >&2; exit 1; }
+printf '%s\n' "$bootid" > "$stamp"

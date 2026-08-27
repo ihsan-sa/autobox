@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# cc-digest — one-screen status of all orchestrated work (boards, tracks, PRs). `--notify` pushes it to the owner.
+set -uo pipefail
+B="$(dirname "$(readlink -f "$0")")"; BOARD="$B/cc-board"; out=""   # sibling, so a worktree copy tests itself
+add(){ out+="$1"$'\n'; }
+mapfile -t rows < <("$BOARD" list 2>/dev/null)
+if [ ${#rows[@]} -eq 0 ]; then add "no tracks"; else
+  for r in "${rows[@]}"; do repo=$(cut -f1 <<<"$r"); tr=$(cut -f2 <<<"$r"); st=$(cut -f3 <<<"$r"); ti=$(cut -f4 <<<"$r")
+    pr=$("$BOARD" get "$repo" "$tr" pr 2>/dev/null); prs=""
+    [ -n "$pr" ] && prs=" PR:$(gh pr view "$pr" --json state,reviewDecision -q '.state + (if .reviewDecision != "" then "/"+.reviewDecision else "" end)' 2>/dev/null || echo '?')"
+    last=$("$BOARD" json "$repo" 2>/dev/null | jq -r --arg t "$tr" '.tracks[$t].notes[-1].msg // ""' | tr '\n' ' ' | cut -c1-110)
+    cost=$(cat ~/.cc/state/"$repo"/"$tr"/runs/*.json 2>/dev/null | jq -s 'map(.total_cost_usd // 0) | add // 0' 2>/dev/null); cs=""; [ -n "$cost" ] && [ "$cost" != 0 ] && cs=$(printf ' $%.2f' "$cost")
+    ps=""; [ -f ~/.cc/worktrees/"$repo"/"$tr"/.cc/checkpoint.err ] && ps=" commit!"; [ -f ~/.cc/worktrees/"$repo"/"$tr"/.cc/push.err ] && ps="$ps push!"   # the checkpoint hook refused / could not push
+    flag=""; case "$st" in blocked) flag=" ❓ needs you";; review) [ -n "$pr" ] && flag=" ❓ PR to review";; esac   # phone-first: one bullet per track, needs-you marked
+    title=""; [ "$ti" != "$tr" ] && title=" — ${ti:0:60}"
+    add "• *$repo/$tr* $st$flag$title$prs$cs$ps"; [ -n "$last" ] && add "    ↳ $last"; done; fi
+lim=$("$B/cc-limit" status 2>/dev/null) && add "• ⏳ Claude $lim"   # nothing while it is clear
+live=$(tmux list-windows -t main -F '#W' 2>/dev/null | grep -v '^box$' | tr '\n' ' ')   # box = the always-on boot session, not project work
+add "• live: ${live:-none}"
+printf '%s' "$out"
+[ "${1:-}" = "--notify" ] && "$HOME/bin/cc-notify" -t "${CC_BOX:-$(hostname -s)} digest" "$out"
+exit 0

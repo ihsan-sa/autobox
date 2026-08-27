@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# cc-limit — LLM-free detection of Claude usage/rate limits, and one shared "wait until it resets" stamp.
+#   cc-limit check <claude-json> [<stderr-file>]   prints "LIMIT <epoch>" + exit 0 when that run hit a limit, else exit 1
+#   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0, or "clear" + exit 1
+#   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT
+#   cc-limit clear     forget it (every caller does this after a run that reached the API)
+# Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>" — shared, so a second loop waits
+# instead of burning its retries. No secrets in it. Env: CC_LIMIT_MAX_WAIT (default 21600 = 6 h)
+# · CC_LIMIT_MIN_WAIT (test hook: cap any sleep at N seconds).
+set -uo pipefail
+S="$HOME/.cc/state/claude-limit"; now=$(date -u +%s); MAX="${CC_LIMIT_MAX_WAIT:-21600}"
+stamp(){ ends=0; src=""; first=0; [ -f "$S" ] && IFS=$'\t' read -r ends src first < "$S"; [[ "$ends" =~ ^[0-9]+$ ]] || ends=0; [[ "$first" =~ ^[0-9]+$ ]] || first=0; }
+case "${1:-}" in
+  clear) rm -f "$S"; exit 0 ;;
+  status) stamp; [ "$ends" -gt "$now" ] || { echo clear; exit 1; }
+    printf 'usage limit until %sZ (%dm left)\n' "$(date -u -d "@$ends" +%H:%M)" $(( (ends - now + 59) / 60 )); exit 0 ;;
+  wait) stamp; s=$((ends - now)); [ "$s" -le 0 ] && exit 0
+    { [ -n "${CC_LIMIT_MIN_WAIT:-}" ] && [ "$s" -gt "$CC_LIMIT_MIN_WAIT" ]; } && s="$CC_LIMIT_MIN_WAIT"
+    [ "$s" -gt "$MAX" ] && exit 1; sleep "$s"; exit 0 ;;
+  check) ;;
+  *) sed -n '2,6p' "$0" >&2; exit 2 ;;
+esac
+# ---- check: is_error / a run that produced no result (a non-zero rc), AND limit wording somewhere in result or stderr
+j="${2:?usage: cc-limit check <claude-json> [<stderr-file>]}"; res=""
+res=$(jq -r '[.result?, .error?, .subtype?] | map(select(type == "string")) | join(" ")' "$j" 2>/dev/null)
+{ [ "$(jq -r '.is_error // empty' "$j" 2>/dev/null)" = true ] || [ -z "$res" ]; } || exit 1
+txt="$res $(tail -c 4000 "${3:-/dev/null}" 2>/dev/null)"
+grep -qiE 'usage limit|rate limit|rate_limit|429|too many requests|overloaded|resets? (at )?' <<<"$txt" || exit 1
+RS='reset[a-z]*[^0-9]{0,8}'   # "resets at ", "reset: ", "resets " — a bare timestamp in a log line must not count as the reset
+tz=UTC; z=$(grep -oE '[A-Za-z]+/[A-Za-z_]+' <<<"$txt" | head -1); [ -n "$z" ] && [ -f "/usr/share/zoneinfo/$z" ] && tz="$z"
+u=0; how=""
+if m=$(grep -oiE "${RS}[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?" <<<"$txt" | head -1) && [ -n "$m" ]; then
+  u=$(TZ="$tz" date -d "$(grep -oE '[0-9]{4}-.*' <<<"$m")" +%s 2>/dev/null); how=iso
+elif m=$(grep -oiE 'reset[a-z]* in +[0-9]+ *[a-z]+' <<<"$txt" | head -1) && [ -n "$m" ]; then
+  n=$(grep -oE '[0-9]+' <<<"$m"); case "$(grep -oiE '[a-z]+$' <<<"$m" | tr A-Z a-z)" in
+    h*) u=$((now + n * 3600));; s*) u=$((now + n));; *) u=$((now + n * 60));; esac; how=in
+elif m=$(grep -oiE "${RS}[0-9]{1,2}(:[0-9]{2})? *(am|pm)?" <<<"$txt" | head -1) && [ -n "$m" ]; then
+  c=$(grep -oiE '[0-9]{1,2}(:[0-9]{2})? *(am|pm)?$' <<<"$m")
+  u=$(TZ="$tz" date -d "$c" +%s 2>/dev/null)                                        # a clock time
+  [ -n "$u" ] && [ "$u" -le "$now" ] && u=$(TZ="$tz" date -d "tomorrow $c" +%s 2>/dev/null)   # …already past today = tomorrow
+  how="at"
+fi
+[[ "${u:-0}" =~ ^[0-9]+$ ]] || u=0
+stamp; same=0; { [ "$first" -gt 0 ] && [ "$ends" -gt $((now - 900)) ]; } && same=1   # still the same limit episode
+[ "$same" = 1 ] || first=$now
+if [ "$u" -le "$now" ]; then   # no time in the message: exponential backoff, remembered in the stamp (5, 10, 20, 40, 60 min)
+  b=5; [ "$same" = 1 ] && case "$src" in backoff:[0-9]*) b=$(( ${src#backoff:} * 2 )); [ "$b" -gt 60 ] && b=60;; esac
+  u=$((now + b * 60)); how="backoff:$b"
+fi
+mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\n' "$u" "$how" "$first" > "$S"
+echo "LIMIT $u"

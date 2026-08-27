@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# cc — Claude Code sessions on this box: tmux + git worktrees + shared board + autonomous workers.
+#
+#   cc                        attach tmux "main"
+#   cc <repo>                 MAIN/planning session for ~/dev/<repo> (primary worktree, default branch)
+#   cc <repo> <track>         TRACK session: own worktree + branch track/<track>, own context (created on first use)
+#   cc <repo> <track> --go "instruction" [--loop N] [--budget USD] [--model M]
+#                             autonomous headless worker (ralph loop via cc-loop) on that track; ends with a PR
+#                             --go "" re-dispatches the task.md already there (e.g. after answering a BLOCKED)
+#   cc <repo> <track> --say "text"           type text into that track's running interactive session
+#   cc handoff <repo> <track> ask the running session to journal a handoff, then restart it with fresh context
+#   cc resume                 menu of every session (mains + tracks) -> pick to reattach/resume
+#   cc ls | cc digest         live windows + board status | full digest (cc digest --notify pushes it)
+#   cc done <repo> <track>    push + open a PR into the default branch (nothing auto-merges)
+#   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
+#   cc board <args>           shared board (cc board show <repo>)      cc -c <repo> [track]  force --continue
+#   cc slack on|off|status|setup|channels|mkchannel <repo>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session, DMs the box
+#   cc rc status|restart      the always-on boot session (window box); restart to pick up new flags (ends its conversation)
+set -uo pipefail
+# Every session and worker starts through this script. Panes spawned from a systemd-started client (boot, cc-slackd) arrive without ~/bin,
+# so make PATH right here once instead of relying on who spawned the window.
+case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH
+SELF=$(readlink -f "$0"); BIN=$(dirname "$SELF"); ROOT=$(dirname "$BIN")   # helpers come from the same bin/ as this copy (~/bin symlinks resolve into the repo; a track worktree tests its own); ROOT = the core tree
+DEV="$HOME/dev"; SESSION=main; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"; WTBASE="$HOME/.cc/worktrees"; STBASE="$HOME/.cc/state"; BOARD="$BIN/cc-board"
+SLACKON="$HOME/.cc/slack/enabled"   # `cc slack on` creates it: sessions load the Slack channel server (bin/cc-slack)
+chan_args(){ [ -f "$SLACKON" ] || return 0; printf '%s\n' --dangerously-load-development-channels "server:cc-slack"; }   # the server itself is registered in user scope by `cc slack on`; it finds its target from the cwd
+chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slack" accept-dialog "$1" >/dev/null 2>&1 & ); }; return 0; }   # auto-accepts the dev-channels dialog in that tmux window
+ensure_main(){ tmux has-session -t "$SESSION" 2>/dev/null || "$BIN/cc-boot"; }   # server creation goes through tmux-main.service (cgroup ownership; 2026-08-26 incident)
+attach_main(){ [ -t 0 ] || return 0; if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$SESSION" 2>/dev/null || true; else exec tmux attach -t "$SESSION"; fi; }
+win_id(){ tmux list-windows -t "$SESSION" -F '#{window_id} #W' 2>/dev/null | awk -v n="$1" '$2==n{print $1; exit}'; }   # address windows by id: names with . or / break -t main:<name>
+have_window(){ [ -n "$(win_id "$1")" ]; }
+pane_live(){ local p; p=$(tmux list-panes -t "$(win_id "$1")" -F '#{pane_pid}' 2>/dev/null | head -1); [ -n "$p" ] && pgrep -P "$p" >/dev/null 2>&1; }   # wrapper bash always shows as pane cmd; a session/worker = it has a child
+default_branch(){ git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || echo main; }
+valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
+lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
+unlock(){ exec 9>&-; }
+usage(){ sed -n '2,19p' "$0"; }
+
+ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
+  local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base
+  valid_name "$repo"; valid_name "$track"
+  git -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "cc: ~/dev/$repo is not a git repo — tracks need git"; exit 1; }
+  git -C "$DEV/$repo" check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "cc: '$branch' is not a usable branch name"; exit 1; }
+  if [ ! -d "$wt" ]; then
+    mkdir -p "$WTBASE/$repo"; git -C "$DEV/$repo" worktree prune   # a hand-deleted dir stays registered ("missing but already registered")
+    git -C "$DEV/$repo" fetch -q origin 2>/dev/null || true; base=$(default_branch "$DEV/$repo")
+    if git -C "$DEV/$repo" show-ref --verify --quiet "refs/heads/$branch"; then git -C "$DEV/$repo" worktree add -q "$wt" "$branch"
+    elif git -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$branch"; then git -C "$DEV/$repo" worktree add -q --track -b "$branch" "$wt" "origin/$branch"   # re-created track: keep its upstream, don't fork from local HEAD
+    elif git -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then git -C "$DEV/$repo" worktree add -q -b "$branch" "$wt" "origin/$base"
+    else git -C "$DEV/$repo" worktree add -q -b "$branch" "$wt"; fi
+    git -C "$wt" rev-parse --show-toplevel >/dev/null 2>&1 || { rm -rf "$wt"; echo "cc: could not create the worktree $wt (git error above) — nothing was stamped"; exit 1; }
+    gcd=$(git -C "$DEV/$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$DEV/$repo/.git")
+    mkdir -p "$gcd/info"; grep -qxF '.cc/' "$gcd/info/exclude" 2>/dev/null || echo '.cc/' >> "$gcd/info/exclude"
+    mkdir -p "$wt/.cc"; printf '%s\n%s\n' "$repo" "$track" > "$wt/.cc/track"
+    "$BIN/cc-trust" "$wt" >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$STBASE/$repo/$track"
+  "$BOARD" json "$repo" >/dev/null 2>&1 || "$BOARD" init "$repo" "$DEV/$repo" "$(default_branch "$DEV/$repo")" >/dev/null
+  [ -n "$("$BOARD" get "$repo" "$track" branch 2>/dev/null)" ] || "$BOARD" add "$repo" "$track" "$track" "" >/dev/null
+  "$BOARD" set "$repo" "$track" worktree "$wt"
+  [ -n "$("$BOARD" get "$repo" "$track" session_id)" ] || "$BOARD" set "$repo" "$track" session_id "$(cat /proc/sys/kernel/random/uuid)"
+}
+
+case "${1:-}" in
+  "") ensure_main; attach_main; exit 0 ;;
+  -h|--help) usage; exit 0 ;;
+  board) shift; exec "$BOARD" "$@" ;;
+  slack)  # cc slack on|off|status|setup|channels|mkchannel|manifest — Slack ↔ sessions through Claude Code channels (bin/cc-slack, unit cc-slackd)
+    case "${2:-status}" in
+      on)  mkdir -p ~/.cc/slack; [ -x ~/.cc/slack/venv/bin/python ] || { python3 -m venv ~/.cc/slack/venv && ~/.cc/slack/venv/bin/pip install -q -r "$ROOT/slack/requirements.txt"; }
+           "$CLAUDE" mcp remove --scope user cc-slack >/dev/null 2>&1; "$CLAUDE" mcp add --scope user cc-slack -- "$BIN/cc-slack" channel >/dev/null && echo "registered MCP server cc-slack (user scope)"
+           systemctl --user daemon-reload; systemctl --user enable --now cc-slackd.service && touch "$SLACKON"
+           echo "cc-slack on: sessions started from now on carry the Slack channel. Live sessions pick it up after a restart (cc handoff <repo> <track>; boot session: cc rc restart)."
+           "$BIN/cc-slack" status;;
+      off) rm -f "$SLACKON"; "$CLAUDE" mcp remove --scope user cc-slack >/dev/null 2>&1; systemctl --user disable --now cc-slackd.service; echo "cc-slack off: new sessions have no Slack channel; live ones keep theirs until restarted";;
+      setup|channels|status|mkchannel|manifest) shift; exec "$BIN/cc-slack" "$@";;
+      *) echo "cc slack on|off|status|setup|channels|mkchannel <repo>|manifest"; exit 1;;
+    esac; exit 0 ;;
+  rc)  # cc rc status|restart — the always-on boot session (window "box": cc-rc → Remote Control "$(hostname)", Slack target "box")
+    case "${2:-status}" in
+      restart) tmux has-session -t "$SESSION" 2>/dev/null || { ensure_main; echo "tmux $SESSION was down — started it, and the boot session came up with it (nothing to restart)."; exit 0; }
+               w=$(win_id box)   # only now: before ensure_main the server may not exist yet, and we would open a second box window
+               tmux run-shell -b "tmux new-window -d -t $SESSION -n box -c $DEV $BIN/cc-rc${w:+; tmux kill-window -t $w}"
+               echo "boot session restarting (window box). The old Remote-Control conversation ends — in the phone app pick session '$(hostname)' again.";;
+      *) w=$(win_id box); if [ -n "$w" ]; then echo "boot window box: $(tmux list-panes -t "$w" -F '#{pane_current_command}' | head -1); Slack channel for new sessions: $([ -f "$SLACKON" ] && echo on || echo off)"; else echo "no boot window — cc rc restart"; fi;;
+    esac; exit 0 ;;
+  digest) shift; exec "$BIN/cc-digest" "$@" ;;
+  ls) echo "== live windows (tmux $SESSION) =="; tmux list-windows -t "$SESSION" -F '  #I #W  [#{pane_current_command}]' 2>/dev/null || echo "  (none)"
+      lim=$("$BIN/cc-limit" status 2>/dev/null) && echo "== ⏳ Claude $lim =="
+      echo "== board =="
+      while IFS=$'\t' read -r r t s ti; do [ -z "$r" ] && continue; p=""   # the checkpoint hook fails quietly by design; these two files are how you hear about it
+        [ -f "$WTBASE/$r/$t/.cc/checkpoint.err" ] && p="  commit!"; [ -f "$WTBASE/$r/$t/.cc/push.err" ] && p="$p  push!"
+        printf "  %-16s %-14s %-9s %s%s\n" "$r" "$t" "$s" "$ti" "$p"; done < <("$BOARD" list 2>/dev/null); exit 0 ;;
+  resume)
+    echo "Sessions:"; i=0; declare -a SEL
+    while read -r w; do case "$w" in */*|box) ;; *) i=$((i+1)); SEL[$i]="main|$w|"; printf "  %2d) [main]   %s\n" "$i" "$w";; esac; done < <(tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null)
+    while IFS=$'\t' read -r repo tr st ti; do [ -z "$repo" ] && continue; i=$((i+1)); SEL[$i]="track|$repo|$tr"; live=""; have_window "$repo/$tr" && live=" (live)"; printf "  %2d) [%s]%s %s / %s — %s\n" "$i" "$st" "$live" "$repo" "$tr" "$ti"; done < <("$BOARD" list 2>/dev/null)
+    [ "$i" = 0 ] && { echo "  (nothing yet — start with: cc <repo> [track])"; exit 0; }
+    printf "pick #: "; read -r n; [ -z "${n:-}" ] && exit 0
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { echo "no such option"; exit 1; }
+    IFS='|' read -r kind a2 a3 <<<"${SEL[$n]}"
+    if [ "$kind" = main ]; then ensure_main; tmux select-window -t "$(win_id "$a2")"; attach_main; else exec "$SELF" "$a2" "$a3"; fi; exit 0 ;;
+  done)
+    repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"
+    wt="$WTBASE/$repo/$track"; [ -d "$wt" ] || { echo "no worktree for $repo/$track"; exit 1; }
+    base=$(default_branch "$DEV/$repo"); branch="track/$track"
+    ( cd "$wt" && CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
+    if git -C "$wt" remote get-url origin >/dev/null 2>&1; then   # a PR on an un-pushed branch is worse than no PR: stop here and say why
+      git -C "$wt" push -u origin "$branch" 2>"$wt/.cc/push.err" >/dev/null || { echo "cc: push failed — no PR opened:"; tail -3 "$wt/.cc/push.err"; exit 1; }
+      rm -f "$wt/.cc/push.err"
+    fi
+    title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"; instr=$("$BOARD" get "$repo" "$track" instructions)
+    [ -f "$STBASE/$repo/$track/task.md" ] && instr="$(cat "$STBASE/$repo/$track/task.md")"
+    url=$(cd "$wt" && gh pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null)   # `gh pr view` also returns a MERGED PR and would silently reuse it
+    [ -z "$url" ] && url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$(printf '%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$track" "$repo" "$track")" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
+    if [ -n "$url" ]; then "$BOARD" set "$repo" "$track" pr "$url"; "$BOARD" status "$repo" "$track" review >/dev/null; echo "PR: $url"; [ -f "$SLACKON" ] && "$BIN/cc-slack" post-approval "$repo" "$url" >/dev/null 2>&1 || true; else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi; exit 0 ;;
+  rm)
+    repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"; wt="$WTBASE/$repo/$track"
+    real=$(readlink -f "$wt" 2>/dev/null); [ -n "$real" ] || real=$(readlink -m "$wt")
+    case "$real" in "$WTBASE"/?*/?*) ;; *) echo "cc: refusing to remove '$wt' — it resolves to $real, outside $WTBASE"; exit 1;; esac
+    id=$(win_id "$repo/$track"); [ -n "$id" ] && tmux kill-window -t "$id" 2>/dev/null
+    git -C "$DEV/$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$real"
+    git -C "$DEV/$repo" worktree prune 2>/dev/null; git -C "$DEV/$repo" branch -D "track/$track" >/dev/null 2>&1 || true
+    "$BIN/cc-trust" rm "$wt" >/dev/null 2>&1 || true
+    rm -rf "${STBASE:?}/${repo:?}/${track:?}"; rmdir "$WTBASE/$repo" "$STBASE/$repo" 2>/dev/null   # leave no empty per-repo shells behind
+    "$BOARD" rm "$repo" "$track" >/dev/null 2>&1; echo "removed $repo/$track (remote branch, if pushed, left intact)"; exit 0 ;;
+  handoff)
+    repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"; w="$repo/$track"; st="$STBASE/$repo/$track"
+    have_window "$w" || { echo "no live window $w"; exit 1; }
+    before=$(stat -c %Y "$st/progress.md" 2>/dev/null || echo 0)
+    "$BIN/cc-msg" "$w" "Handoff: append to $st/progress.md a dated handoff entry for a fresh session — what is done, what is next (ordered), gotchas/decisions — then run /exit." || { echo "cc: cc-msg could not reach $w (dialog open, or no interactive session) — not restarting"; exit 1; }
+    for _ in $(seq 1 120); do pane_live "$w" || break; sleep 5; done
+    ! pane_live "$w" || { echo "session did not exit in 10 min; handoff journal may still be written. Not restarting."; exit 1; }
+    [ "$(stat -c %Y "$st/progress.md" 2>/dev/null || echo 0)" != "$before" ] || { echo "cc: $st/progress.md never changed — no handoff journal was written, so a fresh context would start blind. Not restarting (read the pane, then: cc $repo $track)"; exit 1; }
+    tmux kill-window -t "$(win_id "$w")"; "$BOARD" set "$repo" "$track" session_id "$(cat /proc/sys/kernel/random/uuid)"; "$BOARD" set "$repo" "$track" started false
+    "$BOARD" note "$repo" "$track" "handoff: restarted with fresh context" >/dev/null; exec "$SELF" "$repo" "$track" ;;
+  __run)   # internal: interactive track session inside its worktree
+    repo="$2"; track="$3"; force_cont="${4:-}"; wt="$WTBASE/$repo/$track"; st="$STBASE/$repo/$track"; cd "$wt" || exit 1
+    sid=$("$BOARD" get "$repo" "$track" session_id); started=$("$BOARD" get "$repo" "$track" started); base=$(default_branch "$DEV/$repo")
+    sp="You are an orchestrated session for track '$track' of repo '$repo' (own git worktree, branch track/$track). Durable state: journal $st/progress.md (read it first if it exists; append dated entries: done / next / gotchas — a fresh session rehydrates from it), task $st/task.md if present. Board: 'cc board show $repo'; report with 'cc board note $repo $track \"...\"' and 'cc board status $repo $track running|review|blocked'. Your work is auto-committed and pushed to track/$track after every turn — do NOT run git commit/push yourself, and never touch branch '$base'. When done run 'cc done $repo $track' (opens a PR; do not merge). Reach the owner only when truly blocked: 'cc-notify -t \"$repo/$track\" \"question\"'. Keep answers concise; use subagents for large read/search work to protect your context."
+    args=(--append-system-prompt "$sp" --remote-control "$repo/$track"); mapfile -t CH < <(chan_args "$repo/$track"); args+=("${CH[@]}"); chan_accept "$repo/$track"
+    # a session id whose transcript is gone (crash before the first write, or the 30-day prune) makes --resume fail forever: mint a fresh one instead
+    [ "$started" = True ] && ! compgen -G "$HOME/.claude/projects/*/$sid.jsonl" >/dev/null 2>&1 && { sid=""; "$BOARD" note "$repo" "$track" "session transcript missing — new session id" >/dev/null 2>&1; }
+    if [ "$force_cont" = "-c" ]; then args+=(--continue)
+    elif [ "$started" = True ] && [ -n "$sid" ]; then args+=(--resume "$sid")
+    else [ -n "$sid" ] || { sid=$(cat /proc/sys/kernel/random/uuid); "$BOARD" set "$repo" "$track" session_id "$sid"; }
+         args+=(--session-id "$sid"); "$BOARD" set "$repo" "$track" started true; fi
+    "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
+    "$CLAUDE" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+  __runmain)  # internal: planning session in the primary worktree
+    repo="$2"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
+    sp="You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<instructions>\"' then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads."
+    mapfile -t CH < <(chan_args "$repo"); chan_accept "$repo"
+    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+  __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
+    repo="$2"; alias="$3"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
+    sp="You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d; dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR). Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'."
+    export CC_SLACK_ALIAS="$alias"
+    mapfile -t CH < <(chan_args "$repo"); chan_accept "$repo@$alias"
+    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+  __runplain)  # internal: plain session in a folder that is not a git repo
+    repo="$2"; cont="${3:-}"; cd "$DEV/$repo" || exit 1
+    mapfile -t CH < <(chan_args "$repo"); chan_accept "$repo"
+    "$CLAUDE" ${cont:+--continue} --remote-control "$repo" "${CH[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+esac
+
+# ---- cc [-c] <repo> [track] [--go|--say ...] ----
+CONT=""; [ "$1" = "-c" ] && { CONT="-c"; shift; }
+repo="${1:?repo}"; track="${2:-}"; shift; [ -n "$track" ] && shift
+valid_name "$repo"
+ensure_main; "$BIN/cc-trust" "$DEV/$repo" >/dev/null 2>&1 || true
+if [ "$track" = "--orch" ]; then
+  alias="${1:-}"; [[ "$alias" =~ ^[a-z0-9-]{2,20}$ ]] || { echo "cc: --orch alias must match ^[a-z0-9-]{2,20}\$"; exit 1; }
+  win="$repo@$alias"; lock "$HOME/.cc/win.lock"
+  have_window "$win" || tmux new-window -d -t "$SESSION" -n "$win" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runorch %q %q' "$CLAUDE" "$SELF" "$repo" "$alias")"
+  unlock; [ -t 0 ] && tmux select-window -t "$(win_id "$win")"; attach_main; exit 0
+fi
+case "$track" in --*) echo "cc: '$track' is an option, not a track — use: cc $repo <track> $track ..."; exit 1;; ?*) valid_name "$track";; esac
+if [ -z "$track" ]; then
+  [ -d "$DEV/$repo" ] || { echo "cc: no ~/dev/$repo (typo? create it first: mkdir ~/dev/$repo)"; exit 1; }
+  lock "$HOME/.cc/win.lock"
+  if have_window "$repo" && ! pane_live "$repo"; then tmux kill-window -t "$(win_id "$repo")"; fi   # claude exited, only the fallback shell is left
+  if git -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1; then have_window "$repo" || tmux new-window -d -t "$SESSION" -n "$repo" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runmain %q' "$CLAUDE" "$SELF" "$repo")"
+  else have_window "$repo" || tmux new-window -d -t "$SESSION" -n "$repo" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runplain %q %q' "$CLAUDE" "$SELF" "$repo" "$CONT")"; fi
+  unlock; [ -t 0 ] && tmux select-window -t "$(win_id "$repo")"; attach_main; exit 0
+fi
+ensure_track "$repo" "$track"; win="$repo/$track"; wt="$WTBASE/$repo/$track"; st="$STBASE/$repo/$track"
+mode=""; text=""; LOOPN=1; XTRA=()
+while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; shift;; --loop) LOOPN="$2"; shift;; --budget|--model|--effort|--turns) XTRA+=("$1" "$2"); shift;; *) echo "cc: unknown option $1"; exit 1;; esac; shift; done
+case "$mode" in
+  say) have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
+  go)  if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
+       if [ -n "$text" ]; then printf '%s\n' "$text" > "$st/task.md"; "$BOARD" set "$repo" "$track" instructions "$text"
+       else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi
+       for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree
+         [ "$(readlink -f /proc/$pid/cwd 2>/dev/null)" = "$(readlink -f "$wt")" ] || continue
+         echo "cc: killing orphaned worker pid $pid in $wt" | tee -a "$st/loop.log"
+         pg=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')   # take its whole group (claude + tools), but never our own
+         if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$pid" 2>/dev/null; fi; done
+       "$BOARD" note "$repo" "$track" "dispatched headless worker (loop $LOOPN)" >/dev/null
+       xq=""; [ ${#XTRA[@]} -gt 0 ] && xq=$(printf ' %q' "${XTRA[@]}")   # printf %q with no argument emits '' — cc-loop would see an empty arg
+       lock "$st/.lock"; [ -n "$(win_id "$win")" ] && tmux kill-window -t "$(win_id "$win")"
+       pre=""; [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && pre="CC_NOTIFY_LOG_ONLY=1 "   # tests: the new tmux window has the server's env, not ours — carry the log-only flag across or the test worker's DONE notice really posts
+       tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
+       unlock; echo "worker started in tmux main:$win — watch: cc $repo $track ; log: $st/loop.log"; exit 0 ;;
+esac
+lock "$st/.lock"
+if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # dead window (claude exited, `exec bash`): recreate instead of attaching to a shell
+have_window "$win" || { tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf 'CC_CLAUDE=%q %q __run %q %q %q' "$CLAUDE" "$SELF" "$repo" "$track" "$CONT")"; "$BOARD" status "$repo" "$track" running >/dev/null 2>&1; }
+unlock; [ -t 0 ] && tmux select-window -t "$(win_id "$win")"; attach_main
