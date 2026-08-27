@@ -479,7 +479,8 @@ class Daemon:
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
         self.forgotten = set()
-        self.home_dirty, self.home_at = True, 0.0           # App Home: event-driven refresh (home_loop)                              # chats that answered not_in_channel / is_archived — never swept or nudged again
+        self.home_dirty, self.home_at = True, 0.0           # App Home: event-driven refresh (home_loop)
+        self.home_burst_until = 0.0                          # after app_home_opened: 1 s refreshes for 60 s (owner rule), then 30 s                              # chats that answered not_in_channel / is_archived — never swept or nudged again
         self.pair_code = None
         self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy, self.home_off, self.home_fails = [], {}, 0.0, False, False, 0   # App Home dashboard
         self.t0 = time.time()
@@ -721,6 +722,7 @@ class Daemon:
     def on_event(self, ev):
         self.mark_dirty(ev)
         if ev.get("type") == "app_home_opened":
+            self.home_burst_until = time.time() + 60   # the owner is looking: instant, then every second for a minute, then 30 s
             return self.publish_home()          # the owner tapped the bot: refresh the dashboard now, never post
         if ev.get("type") in ("reaction_added", "reaction_removed"):
             return self.on_reaction(ev)
@@ -1573,14 +1575,19 @@ class Daemon:
             self.sweep_cycle()
             self.nudge_cycle()
 
+    def home_due(self, now):
+        """When to republish: every second while the owner has the tab open (60 s after app_home_opened), within ~2 s of any
+        event otherwise, and at least every 30 s — one views.publish per refresh, no reads, no messages."""
+        since = now - self.home_at
+        return (now < self.home_burst_until and since >= 1) or (self.home_dirty and since >= 2) or since >= 30
+
     def home_loop(self):
-        """App Home cadence: republish within ~2 s of any event the daemon processed (self.home_dirty), and at least every
-        30 s regardless — one views.publish per refresh, no reads, no messages. Owner asked for 'as fast as possible'."""
         while True:
-            time.sleep(2)
+            time.sleep(1)
             try:
-                if self.home_dirty or time.time() - getattr(self, "home_at", 0) >= 30:
-                    self.home_dirty = False; self.home_at = time.time(); self.publish_home()
+                now = time.time()
+                if self.home_due(now):
+                    self.home_dirty = False; self.home_at = now; self.publish_home()
             except Exception as e:
                 log(f"home_loop: {e!r}")
 
@@ -1848,6 +1855,8 @@ class Daemon:
         try:
             api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"], view=view)
         except Exception as e:
+            if "ratelimited" in str(e):
+                self.home_burst_until = 0.0              # Slack said slow down: back to the event-driven cadence
             self.home_fails += 1
             if self.home_fails >= 3:
                 self.home_off = True; self.home_retry_at = time.time() + 600
@@ -3710,6 +3719,12 @@ def cmd_selfcheck():
         globals()["api"] = _apiMF
     check("🏁 on a reply is mirrored onto the root; a newer message re-opens the thread (mirror removed, stale entry kept so the "
           "owner's visible 🏁 cannot re-close it) — owner rule", mirrored_add and reopened and still_open)
+    dmHB = Daemon(use_slack=False); dmHB.home_at = 1000.0; dmHB.home_dirty = False; dmHB.home_burst_until = 0.0
+    quiet = dmHB.home_due(1010.0); heartbeat = dmHB.home_due(1030.0)
+    dmHB.home_dirty = True; ev_fast = dmHB.home_due(1001.0); ev_2s = dmHB.home_due(1002.0)
+    dmHB.home_dirty = False; dmHB.home_burst_until = 1061.0; burst = dmHB.home_due(1001.0); after_burst = dmHB.home_at = 1061.0; after = dmHB.home_due(1062.0)
+    check("App Home cadence: 1 s while the tab is open (60 s after app_home_opened), ~2 s after an event, 30 s heartbeat, never faster — owner rule",
+          not quiet and heartbeat and not ev_fast and ev_2s and burst and not after)
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     print(f"selfcheck: {len(fails)} failed")
