@@ -70,7 +70,13 @@ class FakeSlack:
         if method == "conversations.history":
             if self.rng.random() < self.flake: return {"ok": True, "messages": []}
             lim = min(int(p.get("limit", 100)), 1000)
-            return {"ok": True, "messages": list(reversed(self.roots[p["channel"]]))[:lim]}
+            msgs = list(reversed(self.roots[p["channel"]]))
+            inc = str(p.get("inclusive", "false")).lower() == "true"
+            if p.get("latest"):   # Slack semantics: newest first, bounded by latest/oldest (reacted_message anchors on these)
+                l = float(p["latest"]); msgs = [m for m in msgs if (float(m["ts"]) <= l if inc else float(m["ts"]) < l)]
+            if p.get("oldest"):
+                o = float(p["oldest"]); msgs = [m for m in msgs if (float(m["ts"]) >= o if inc else float(m["ts"]) > o)]
+            return {"ok": True, "messages": msgs[:lim]}
         if method == "conversations.replies":
             chat, ts = p["channel"], p["ts"]; root = self.find(chat, ts)
             msgs = [root] + self.replies[(chat, ts)]
@@ -235,8 +241,9 @@ def run(seed, cs_path):
                 chat, rts = roots[a["tid"]]
                 owner_msg[a["tid"]] = slack.post(chat, a["text"], user=OWNER, thread=rts)["ts"]; truth_last[a["tid"]][0:2] = ["owner", clock.now]
             elif kind == "react_answer":                    # the session answers with an emoji: no message, but the thread is handled
-                chat, _ = roots[a["tid"]]; slack.session_react(chat, owner_msg[a["tid"]], a["emoji"])
-                truth_last[a["tid"]][0] = "session"          # the owner's message stays the last one (48 h ages from IT)
+                chat, rts = roots[a["tid"]]; slack.session_react(chat, owner_msg[a["tid"]], a["emoji"])
+                # a ✅ from the session on the ROOT means "fully done" (owner rule 20:1x); any other reaction = handled
+                truth_last[a["tid"]][0] = "done" if (a["emoji"] == "white_check_mark" and owner_msg[a["tid"]] == rts) else "session"
             elif kind == "flag":                            # a 🏁 anywhere in the thread: here on the root
                 chat, rts = roots[a["tid"]]; slack.owner_react(chat, rts, "checkered_flag"); truth_last[a["tid"]][2] = clock.now
             elif kind == "unflag":
@@ -250,10 +257,11 @@ def run(seed, cs_path):
         # score the owner's view at the end of the tick (v3: ❓ needs you · 🔴 the session owes you · 🟠 handled · none = closed/stale)
         for tid, (chat, rts) in roots.items():
             root = slack.find(chat, rts); who, tlast, flag_t = truth_last[tid]
-            if flag_t is not None and flag_t >= tlast: want = None      # 🏁 newer than every message: no mark at all
+            if flag_t is not None and flag_t >= tlast: want = "✅" if who == "done" else None   # 🏁 newer than every message: bookkeeping off; the session's ✅ stays
             elif clock.now - tlast >= 48 * 3600: want = None            # 48 h quiet: even 🟠 expires
             elif who == "needs_owner": want = "❓"
             elif who == "owner": want = "❓" if clock.now - tlast >= 30 * 60 else "🔴"   # stalled at 30 min
+            elif who == "done": want = "✅"                             # the session marked the root fully done
             else: want = "🟠"                                           # answered, nothing asked: handled
             have = slack.bot_status(root)
             if have != want:

@@ -29,7 +29,10 @@ Thread status v3 (at most ONE bot-managed mark per root): ❓ = it needs YOU (we
 (gone after 48 h of quiet) · your 🏁 on ANY message of a thread removes every mark and stops its nudges until someone
 replies again (never a stop signal: the session keeps working and keeps replying there) · 👀 on your message = received,
 any OTHER reaction of ours on it is the session's answer (that thread turns 🟠) · your 👍/👎 on one of our messages is
-delivered to that session as its confirmation.
+delivered to that session as its confirmation. A request that takes more than one turn: react 🔧 (hammer_and_wrench) on the
+thread ROOT when you start, keep replying in the thread, and react ✅ (white_check_mark) on the root ONLY when it is fully
+done — the owner reads 🔧/✅ on the root as working/done; a plain reply is "handled", not "done". Log longer non-track work
+with `cc quick doing "…"` / `cc quick done "…"` so the Home tab lists it while it runs.
 App Home: the daemon republishes a whole-box dashboard (units, channels, tracks, last audit) into the owner's Home tab
 every 30 s and on app_home_opened — one views.publish, never a message. Needs home_tab_enabled + the app_home_opened bot
 event in core/slack/app-manifest.json (re-paste it, Reinstall); without them it logs one line and gives up until restart.
@@ -57,12 +60,15 @@ ALERTS = "alerts"                                              # #alerts is not 
 ALERT_KINDS = ("boot", "limit", "audit", "review", "digest", "alerts", "cc-rc", "heartbeat", "power")   # "<box> <kind>" notify titles → #alerts even when the box shares its name with a repo
 NUDGE_PREFIXES = ("❓ still waiting", "⏳ no answer", "🔴 still open")   # our own nudge posts (v1's too): never an answer
 STATUS_EMOJI = {"❓": "question", "🔴": "red_circle",           # status v3, at most ONE bot-managed root mark: ❓ needs YOU ·
-                "🟠": "large_orange_circle"}                    # 🔴 the session owes you · 🟠 handled (expires after 48 h quiet)
+                "🟠": "large_orange_circle",                    # 🔴 the session owes you · 🟠 handled (expires after 48 h quiet)
+                "✅": "white_check_mark", "🔧": "hammer_and_wrench"}   # set by the SESSION on its root: ✅ fully done · 🔧 still working
 LEGACY_STATUS = ("large_yellow_circle",)                       # v1's 🟡 dot: reconcile strips it wherever it still finds one (our old ✅ acks stay: under v3 they read as "answered")
 STATUS_NAMES = tuple(STATUS_EMOJI.values()) + LEGACY_STATUS
+SESSION_MARKS = ("white_check_mark", "hammer_and_wrench")    # the SESSION's own statements on a root (done / working): a 🏁 leaves them
+BOOK_NAMES = tuple(n for n in STATUS_NAMES if n not in SESSION_MARKS)   # the bot's bookkeeping (❓🔴🟠 + the v1 dot): what a 🏁 strips
 REACTION_CHAR = {"+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "👎", "white_check_mark": "✅", "x": "❌",
                  "eyes": "👀", "heavy_check_mark": "✔️", "raised_hands": "🙌", "tada": "🎉"}   # what the owner's reaction is called when we hand it to a session
-OUR_ANSWER_SKIP = frozenset(STATUS_NAMES) | {"eyes", "checkered_flag"}   # our OWN reactions that answer nothing:
+OUR_ANSWER_SKIP = (frozenset(STATUS_NAMES) - {"white_check_mark"}) | {"eyes", "checkered_flag"}   # our OWN reactions that answer nothing:
                                                                # 👀 only says "received", the marks and a 🏁 are bookkeeping
 FLAGS = "flags.json"                                           # {"<chat>:<root_ts>": <flag_ts>}: WHEN the owner 🏁'd a thread (a newer message re-opens it)
 STALE_AFTER = 48 * 3600                                        # a thread quiet this long leaves the buckets (and loses its mark)
@@ -290,6 +296,31 @@ def load_flags():
         return {}
 
 
+MARKS = "marks.json"
+
+
+def load_marks():
+    """When WE last put a ✅ (done) or 🔧 (working) on a thread root: {"<chat>:<root_ts>:<reaction>": <ts>}. Reactions
+    carry no time, so an old ✅ must not outrank later talk in the thread — only a mark newer than the last message counts."""
+    try:
+        return {k: float(v) for k, v in json.load(open(f"{DIR}/{MARKS}")).items()}
+    except Exception:
+        return {}
+
+
+def save_marks(marks):
+    keep = {k: v for k, v in marks.items() if v >= time.time() - 30 * 86400}
+    marks.clear(); marks.update(keep)
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        tmp = f"{DIR}/{MARKS}.tmp"
+        with open(tmp, "w") as f:
+            os.fchmod(f.fileno(), 0o600); json.dump(keep, f)
+        os.replace(tmp, f"{DIR}/{MARKS}")
+    except Exception as e:
+        log(f"marks: save failed: {e!r}")
+
+
 def save_flags(flags):
     """Atomic, 0600, pruned: a flag older than 30 days can never matter again (its thread left the 48 h window long ago)."""
     keep = {k: v for k, v in flags.items() if v >= time.time() - 30 * 86400}
@@ -344,18 +375,29 @@ def _home_sec(text):
     return {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}
 
 
+QUICK_LOG = f"{HOME}/.cc/state/quick.log"
+
+
 def home_quick(hours=24, n=8):
-    """Small tasks sessions logged with `cc quick` (~/.cc/state/quick.log: epoch<TAB>status<TAB>repo<TAB>text): newest first."""
-    out = []
+    """Small tasks sessions logged with `cc quick` (epoch<TAB>status<TAB>repo<TAB>text): the ones still IN PROGRESS,
+    newest first — a later `done` line with the same text retires its `doing` line. The owner wants to see what is
+    running, not what finished (finished work reaches them as replies)."""
+    doing, done = {}, set()
     try:
         cut = time.time() - hours * 3600
-        for line in open(f"{HOME}/.cc/state/quick.log"):
+        for line in open(QUICK_LOG):
             parts = line.rstrip("\n").split("\t", 3)
-            if len(parts) == 4 and parts[0].isdigit() and float(parts[0]) >= cut:
-                out.append({"when": time.strftime("%H:%M", time.gmtime(float(parts[0]))), "status": parts[1], "repo": parts[2], "text": parts[3][:120]})
+            if len(parts) != 4 or not parts[0].isdigit() or float(parts[0]) < cut:
+                continue
+            key = (parts[2], parts[3][:120])
+            if parts[1] == "doing":
+                doing[key] = float(parts[0]); done.discard(key)
+            else:
+                done.add(key)
     except Exception:
         return []
-    return list(reversed(out))[:n]
+    live = sorted(((t, k) for k, t in doing.items() if k not in done), reverse=True)[:n]
+    return [{"when": time.strftime("%H:%M", time.gmtime(t)), "status": "doing", "repo": k[0], "text": k[1]} for t, k in live]
 
 
 def home_blocks(st):
@@ -371,7 +413,7 @@ def home_blocks(st):
     b += [{"type": "divider"}, _home_sec("*Work*" if fields else "*Work*\n_no tracks_")]
     quick = st.get("quick") or []
     if quick:
-        b += [_home_sec("*Quick tasks (24 h)*\n" + "\n".join(f"{'✅' if q['status'] == 'done' else '🔧'} {q['when']} {q['repo']} · {q['text']}" for q in quick)[:2900])]
+        b += [_home_sec("*In progress (no track)*\n" + "\n".join(f"🔧 since {q['when']} · {q['repo']} · {q['text']}" for q in quick)[:2900])]
     for i in range(0, len(fields), 6):          # Slack allows 10 fields per section; 6 keeps the two phone columns readable
         b.append({"type": "section", "fields": [{"type": "mrkdwn", "text": f} for f in fields[i:i + 6]]})
     b += [{"type": "divider"}, _home_sec("*Last audit*\n" + (st.get("audit") or "_none yet_")),
@@ -482,6 +524,7 @@ class Daemon:
                                                             # (chat, root_ts) already nudged -> ts of the message it nudged about
         self.board = {}                                     # chat -> {"dirty_at": float|None}; dirty tracker for reconcile_reactions
         self.status_cache = {}                              # (chat, root_ts) -> the mark we believe is on that root (None = clean)
+        self.marks = load_marks()                            # "<chat>:<root>:<reaction>" -> when we set ✅/🔧 (v3 marks)
         self.flags = load_flags()                            # "<chat>:<root_ts>" -> ts of the owner's 🏁; a newer message un-flags it (V3)
         self.alarms = {}                                    # chat -> when a status changes on its own (30 min stall / 48 h expiry)
         self.snap = {}                                      # chat -> (t, buckets): reconcile's snapshot, reused by the nudge cycle
@@ -1017,8 +1060,21 @@ class Daemon:
     def on_own_reaction(self, chat, ts, name, removed):
         """WE reacted on the owner's message: that IS the answer (👍 yes · 👎 no · ✅ done · …), so the 👀 comes off and the
         thread stops owing them — 🟠 now, not on the next sweep. 👀 and our own marks are bookkeeping and change nothing;
-        taking a reaction back leaves it to the sweep (this event already marked the chat dirty) to put the ball back."""
-        if name in OUR_ANSWER_SKIP or not self.route(chat, "im" if chat.startswith("D") else None):
+        taking a reaction back leaves it to the sweep (this event already marked the chat dirty) to put the ball back.
+        Our ✅ (done) / 🔧 (working) on a ROOT are remembered with their time: only a mark newer than the thread's last
+        message counts (reactions carry no time of their own)."""
+        if not self.route(chat, "im" if chat.startswith("D") else None):
+            return None
+        if name in ("white_check_mark", "hammer_and_wrench"):
+            _, root0 = self.reacted_message(chat, ts)
+            if root0 == ts:                                # on the root: a session-set done/working mark
+                key = f"{chat}:{root0}:{name}"
+                if removed:
+                    self.marks.pop(key, None)
+                else:
+                    self.marks[key] = time.time()
+                save_marks(self.marks)
+        if name in OUR_ANSWER_SKIP:
             return None
         msg, root = self.reacted_message(chat, ts)
         if not msg or self.is_ours(msg) or msg.get("user") != self.cfg.get("SLACK_OWNER_ID"):
@@ -1026,7 +1082,7 @@ class Daemon:
         if removed:
             return None
         react(self.cfg, chat, ts, "eyes", remove=True)     # we answered: the "received" ack has served its purpose
-        self.set_mark(chat, root, "🟠")
+        self.set_mark(chat, root, "✅" if (name == "white_check_mark" and ts == root) else "🟠")   # ✅ on the root = fully done (owner rule)
         return None
 
     def thread_root(self, chat, ts):
@@ -1055,13 +1111,16 @@ class Daemon:
         believed = self.status_cache.get((chat, root_ts), "?")
         if believed == "?" and root is not None:
             believed = next(iter(self.bot_status(root.get("reactions", []))), None)
-        # reactions.remove only ever removes OUR OWN reaction, so a blind sweep can never touch the owner's 🏁
-        for name in (list(STATUS_NAMES) if believed == "?" else ([believed] if believed else [])):
+        # reactions.remove only ever removes OUR OWN reaction, so a blind sweep can never touch the owner's 🏁.
+        # The session's own ✅ (done) / 🔧 (still working) are not bookkeeping: they stay through a 🏁 (work may go on
+        # under a closed thread — owner rule), and they are what un-flagging restores.
+        keep = believed if believed in SESSION_MARKS else None
+        for name in (list(BOOK_NAMES) if believed == "?" else ([believed] if believed and not keep else [])):
             try:
                 api("reactions.remove", tok, channel=chat, timestamp=root_ts, name=name)
             except Exception:
                 pass   # that mark was not on the message — fine
-        self.status_cache[(chat, root_ts)] = None
+        self.status_cache[(chat, root_ts)] = keep if believed != "?" else "?"
         mirrored = root is not None and any(r["name"] == "checkered_flag" and self.bot_user in r.get("users", [])
                                             for r in root.get("reactions", []))
         if ts != root_ts and not mirrored:                 # 🏁 on a reply: mirror it on the top-level message, where you look
@@ -1347,7 +1406,7 @@ class Daemon:
                 if float(root["ts"]) >= cutoff and ((self.is_ours(root) and asks_owner(root.get("text") or ""))
                                                     or (root.get("user") == self.cfg.get("SLACK_OWNER_ID") and not self.is_ours(root))) \
                         and not self.flagged(chat, root, root["ts"]):
-                    out.append((self.root_mark(root, now), root, root))
+                    out.append((self.root_mark(root, now, root, chat), root, root))
                 continue
             latest = str(root.get("latest_reply") or root["ts"])
             if float(latest) < cutoff:
@@ -1371,7 +1430,7 @@ class Daemon:
                 continue
             if self.flagged(chat, root, last["ts"]):
                 continue                            # the owner's 🏁 is newer than everything in the thread: no mark, no nudge
-            out.append((self.root_mark(last, now), root, last))
+            out.append((self.root_mark(last, now, root, chat), root, last))
         return out
 
     def flagged(self, chat, root, last_ts):
@@ -1402,7 +1461,21 @@ class Daemon:
         return any(r.get("name") not in OUR_ANSWER_SKIP and self.bot_user in (r.get("users") or [])
                    for r in (msg.get("reactions") or []))
 
-    def root_mark(self, last, now):
+    def root_mark(self, last, now, root=None, chat=None):
+        base = self.base_mark(last, now)
+        if base in ("❓", "🔴") or root is None:
+            return base                                # the owner's turn always shows; without the root there is nothing more to read
+        ours = {r["name"] for r in root.get("reactions", []) if self.bot_user in r.get("users", [])}
+        def fresh(name):   # newer than the thread's last message; with no recorded time, only an unanswered root is surely so
+            t = self.marks.get(f"{chat}:{root['ts']}:{name}")
+            return t >= float(last["ts"]) if t is not None else last["ts"] == root["ts"]
+        if "white_check_mark" in ours and fresh("white_check_mark"):
+            return "✅"                                # the session declared the task fully done — after the last word in the thread
+        if "hammer_and_wrench" in ours and fresh("hammer_and_wrench"):
+            return "🔧"                                # the session is still working on it (multi-turn task)
+        return base                                    # an older ✅/🔧 is stale: the sweep strips it
+
+    def base_mark(self, last, now):
         """Status v3: the ONE mark the thread's newest message earns. ❓ = it needs the OWNER — our last word asks them
         something (a 🔐 prompt, a block, a trailing question), or theirs has gone 30 min unanswered (a stalled session).
         🔴 = the session owes them: their word is the last one and still fresh (it turns ❓ at 30 min) — unless we already
@@ -1594,6 +1667,9 @@ class Daemon:
             current = self.bot_status(root.get("reactions", []))
             want = desired.get(ts)
             stale = [c for c in current if c != want]
+            if want is None and any(c in SESSION_MARKS for c in stale) \
+                    and self.flagged(chat, root, str(root.get("latest_reply") or ts)):
+                stale = [c for c in stale if c not in SESSION_MARKS]   # 🏁'd thread: the session's ✅/🔧 stay (only bookkeeping goes)
             add = bool(want) and want not in current
             if not stale and not add:
                 self.status_cache[(chat, ts)] = want
@@ -2970,7 +3046,7 @@ def cmd_selfcheck():
         globals()["api"] = real_api_fl
     check("owner's 🏁 resolves the thread's root, strips the bot's mark instantly (❓/🔴/🟠 and any v1 dot) and records the "
           "flag time; a stranger's 🏁 does nothing — V3",
-          owner_flag == [("conversations.replies", None)] + [("reactions.remove", n) for n in STATUS_NAMES]
+          owner_flag == [("conversations.replies", None)] + [("reactions.remove", n) for n in BOOK_NAMES]
           and stranger_flag == [] and dmFl.flags.get("C1:3.3") and flag_writes)
     check("owner's 🏁: when the cache knows which mark is on the root, exactly one remove (research e0180ec/9afaca9)",
           known_flag == [("reactions.remove", "question")] and dmFl.status_cache[("C1", "3.4")] is None)
@@ -3398,7 +3474,7 @@ def cmd_selfcheck():
     finally:
         globals()["api"] = real_api
     check("DM reactions route as 'im': the owner's 🏁 strips the status mark and marks the board dirty in a DM too — L17",
-          calls17 == [("conversations.replies", None)] + [("reactions.remove", n) for n in STATUS_NAMES]
+          calls17 == [("conversations.replies", None)] + [("reactions.remove", n) for n in BOOK_NAMES]
           and (dmL17.board.get("D1") or {}).get("dirty_at") and all(c == "im" for _, c in seen17))
     dmSU = Daemon(use_slack=False)
     class FakeSrv:
@@ -3861,8 +3937,55 @@ def cmd_selfcheck():
     dmQ.queues.clear(); dmQ.save_queues()
     hbQ = home_blocks({"box": "abox", "now": "1", "quick": [{"when": "19:58", "status": "done", "repo": "r", "text": "fixed x"}, {"when": "20:01", "status": "doing", "repo": "r", "text": "y"}]})
     txtQ = json.dumps(hbQ, ensure_ascii=False)
-    check("Home: quick tasks (cc quick) render as a 24 h list with ✅ done / 🔧 doing; absent when there are none",
-          "Quick tasks" in txtQ and "✅ 19:58 r · fixed x" in txtQ and "🔧 20:01 r · y" in txtQ and "Quick tasks" not in json.dumps(home_blocks({"box": "abox", "now": "1"})))
+    check("Home: in-progress quick tasks render; absent when there are none",
+          "In progress" in txtQ and "🔧 since 20:01 · r · y" in txtQ and "In progress" not in json.dumps(home_blocks({"box": "abox", "now": "1"})))
+    import tempfile as _tfq
+    qf = _tfq.NamedTemporaryFile("w", delete=False, suffix=".log"); nowq = int(time.time())
+    qf.write(f"{nowq-300}\tdoing\tr\tlong task\n{nowq-200}\tdoing\tr\tother\n{nowq-100}\tdone\tr\tlong task\n"); qf.close()
+    _ql = globals()["QUICK_LOG"]; globals()["QUICK_LOG"] = qf.name
+    try:
+        hq = home_quick()
+    finally:
+        globals()["QUICK_LOG"] = _ql; os.unlink(qf.name)
+    check("cc quick: Home lists only work still in progress — a later `done` line retires its `doing` line",
+          [q["text"] for q in hq] == ["other"])
+    dmPM = Daemon(use_slack=False); dmPM.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmPM.bot_user = "UBOT"; dmPM.bot_id = "BBOT"
+    nowP = time.time(); ours_reply = {"ts": str(nowP - 60), "user": "UBOT", "text": "on it"}
+    rootW = {"ts": str(nowP - 600), "reactions": [{"name": "hammer_and_wrench", "users": ["UBOT"]}]}
+    rootD = {"ts": str(nowP - 600), "reactions": [{"name": "white_check_mark", "users": ["UBOT"]}, {"name": "hammer_and_wrench", "users": ["UBOT"]}]}
+    owner_last = {"ts": str(nowP - 60), "user": "UOWNER", "text": "and this?"}
+    dmPM.marks = {f"CP:{rootW['ts']}:hammer_and_wrench": nowP - 30, f"CP:{rootD['ts']}:white_check_mark": nowP - 30, f"CP:{rootD['ts']}:hammer_and_wrench": nowP - 30}
+    check("root marks: the session's own 🔧 on the root shows working, its ✅ shows done (✅ beats 🔧), the owner's fresh reply beats both (🔴), a question beats everything (❓)",
+          dmPM.root_mark(ours_reply, nowP, rootW, "CP") == "🔧" and dmPM.root_mark(ours_reply, nowP, rootD, "CP") == "✅"
+          and dmPM.root_mark(owner_last, nowP, rootD, "CP") == "🔴" and dmPM.root_mark({"ts": str(nowP - 60), "user": "UBOT", "text": "which one?"}, nowP, rootD, "CP") == "❓"
+          and dmPM.root_mark(ours_reply, nowP, {"ts": "1", "reactions": []}, "CP") == "🟠")
+    dmPM.marks = {f"CP:{rootD['ts']}:white_check_mark": nowP - 3600}   # ✅ set an hour ago, then the session said more: stale
+    check("root marks: an older ✅/🔧 (set before the thread's last message) is stale and no longer outranks the current state",
+          dmPM.root_mark(ours_reply, nowP, rootD, "CP") == "🟠")
+    dmOR = Daemon(use_slack=False); dmOR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmOR.bot_user = "UBOT"
+    dmOR.route = lambda chat, ctype=None: "r"; dmOR.reacted_message = lambda chat, ts: ({"ts": ts, "user": "UOWNER", "text": "q"}, ts)
+    setOR = []; dmOR.set_mark = lambda chat, root, want: setOR.append(want)
+    _reactOR = globals()["react"]; globals()["react"] = lambda *a, **k: None
+    try:
+        dmOR.on_own_reaction("CQ", "7.0", "white_check_mark", False)
+        dmOR.on_own_reaction("CQ", "7.0", "hammer_and_wrench", False)
+        dmOR.on_own_reaction("CQ", "7.0", "white_check_mark", True)
+    finally:
+        globals()["react"] = _reactOR
+    dmFK = Daemon(use_slack=False); dmFK.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmFK.bot_user = "UBOT"
+    dmFK.status_cache[("CQ", "8.0")] = "white_check_mark"; dmFK.status_cache[("CQ", "9.0")] = "question"
+    _fk = globals()["api"]; rmFK = []
+    globals()["api"] = lambda m, tok, **p: rmFK.append((m, p.get("timestamp"), p.get("name")))
+    try:
+        dmFK.on_flag("CQ", "8.0", False, 100.0); dmFK.on_flag("CQ", "9.0", False, 100.0)
+    finally:
+        globals()["api"] = _fk
+    check("owner's 🏁 strips the bot's bookkeeping mark but leaves the session's own ✅ on the root (work may go on under a closed "
+          "thread; un-flagging brings the ✅ back, not a 10 h stall ❓)",
+          rmFK == [("reactions.remove", "9.0", "question")] and dmFK.status_cache[("CQ", "8.0")] == "white_check_mark"
+          and dmFK.status_cache[("CQ", "9.0")] is None)
+    check("our own ✅/🔧 on a root are remembered with their time (and forgotten when taken back); ✅ on the root marks done instantly",
+          "CQ:7.0:hammer_and_wrench" in dmOR.marks and "CQ:7.0:white_check_mark" not in dmOR.marks and setOR[0] == "✅")
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     print(f"selfcheck: {len(fails)} failed")
