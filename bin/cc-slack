@@ -331,8 +331,11 @@ def home_blocks(st):
 
 def home_windows():
     """{window name: pane command} for tmux session main — one call, reused by every row of the dashboard."""
-    rc, out = tmux("list-windows", "-t", "main", "-F", "#W\t#{pane_current_command}")
-    return dict((l.split("\t") + [""])[:2] for l in out.splitlines() if l) if rc == 0 else {}
+    try:   # bounded: a wedged tmux must never stall the 30 s loop (nudges, sweeps and the board reconcile share it)
+        r = subprocess.run(["tmux", "list-windows", "-t", "main", "-F", "#W\t#{pane_current_command}"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return {}
+    return dict((l.split("\t") + [""])[:2] for l in r.stdout.splitlines() if l) if r.returncode == 0 else {}
 
 
 def home_units():
@@ -1561,7 +1564,7 @@ class Daemon:
             threading.Thread(target=self._safe, args=(self.home_slow_refresh,), daemon=True).start()
         wins, chans = home_windows(), []
         known = self.home_chans or sorted((c, self.names.get(c, c)) for c in     # before the first refresh: what we already know
-                                          {c for c, _ in self.last_chat.values()} | set(self.board))
+                                          {c for c, _ in list(self.last_chat.values())} | set(self.board))
         for chat, name in known:
             self.names.setdefault(chat, name)              # route() resolves the name: we already have it, don't pay conversations.info
             target = self.route(chat, "im" if str(chat).startswith("D") else None)
@@ -1617,8 +1620,11 @@ class Daemon:
         if self.home_off or not (self.use_slack and self.cfg.get("SLACK_OWNER_ID") and self.cfg.get("SLACK_BOT_TOKEN")):
             return
         try:
-            api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"],
-                view=json.dumps({"type": "home", "blocks": home_blocks(self.home_state())}))
+            view = json.dumps({"type": "home", "blocks": home_blocks(self.home_state())})   # a local failure here is a bug, not a Slack refusal
+        except Exception as e:
+            log(f"app home: state/blocks failed ({e!r})"); return
+        try:
+            api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"], view=view)
         except Exception as e:
             self.home_fails += 1
             if self.home_fails >= 3:
