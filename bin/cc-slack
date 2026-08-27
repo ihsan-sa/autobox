@@ -26,6 +26,9 @@ In-Slack commands (owner only, any channel or thread): `!help !ping !status !dig
 `!restart <box|repo[/track]|slack|tmux>` and `!reboot` (both confirm-gated). A `!command` root is never a tracked thread.
 Thread status (one bot-managed mark): ❓ on a root = it needs YOU (we asked something, or your last word went 30 min
 unanswered) · no mark = in the session's hands or settled · your 🏁 closes it · 👀 on your message = received.
+App Home: the daemon republishes a whole-box dashboard (units, channels, tracks, last audit) into the owner's Home tab
+every 30 s and on app_home_opened — one views.publish, never a message. Needs home_tab_enabled + the app_home_opened bot
+event in core/slack/app-manifest.json (re-paste it, Reinstall); without them it logs one line and gives up until restart.
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
 """
 import collections, glob, json, os, re, socket, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request
@@ -293,6 +296,121 @@ class Conn:
             self.sock.sendall((json.dumps(obj) + "\n").encode())
 
 
+# ---------------------------------------------------------------- App Home dashboard (one live view, never a message)
+HOME_UNITS = (("tmux-main", "tmux-main.service"), ("cc-slackd", "cc-slackd.service"),
+              ("heartbeat", "cc-heartbeat.service"), ("audit", "cc-audit.timer"))
+HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
+HOME_MAXBLK, HOME_MAXFIELD = 100, 2000         # Slack's caps on one published view
+HOME_ICON = {"todo": "·", "running": "▶️", "review": "🔶", "blocked": "⛔", "merged": "✅", "done": "✅"}
+HOME_RANK = ("blocked", "review", "running", "todo", "merged", "done")   # phone-first: what needs the owner sorts to the top
+HOME_FOOT = "updated every 30 s · `!status` `!threads` `!digest` for text"
+
+
+def _home_sec(text):
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}
+
+
+def home_blocks(st):
+    """PURE: dashboard state -> Block Kit blocks, so selfcheck can assert the shape on a fixture. Emoji are the only graphics."""
+    b = [{"type": "header", "text": {"type": "plain_text", "text": f"{st.get('box', 'box')} · {st.get('now', '')}"[:150]}},
+         {"type": "context", "elements": [{"type": "mrkdwn", "text": ("  ".join(f"{'🟢' if ok else '🔴'} {n}" for n, ok in st.get("units", ()))
+                                                                      + "   ·   " + st.get("load", "")).strip(" ·")[:2900] or "·"}]}]
+    if st.get("limit"):
+        b.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"⏳ Claude {st['limit']}"[:2900]}]})
+    lines = [f"*#{c['name']}* · {c['session']} · {c['marks']}" for c in st.get("channels", ())][:40]
+    b += [{"type": "divider"}, _home_sec("*Channels*\n" + ("\n".join(lines) or "_none yet_"))]
+    fields = [f"{t['emoji']} *{t['name']}* · {t['status']}\n{t['detail']}"[:HOME_MAXFIELD] for t in st.get("tracks", ())][:60]
+    b += [{"type": "divider"}, _home_sec("*Work*" if fields else "*Work*\n_no tracks_")]
+    for i in range(0, len(fields), 6):          # Slack allows 10 fields per section; 6 keeps the two phone columns readable
+        b.append({"type": "section", "fields": [{"type": "mrkdwn", "text": f} for f in fields[i:i + 6]]})
+    b += [{"type": "divider"}, _home_sec("*Last audit*\n" + (st.get("audit") or "_none yet_")),
+          {"type": "context", "elements": [{"type": "mrkdwn", "text": (st.get("boot") or "no boot record")[:2900]}]},
+          {"type": "context", "elements": [{"type": "mrkdwn", "text": HOME_FOOT}]}]
+    return b if len(b) <= HOME_MAXBLK else b[:HOME_MAXBLK - 1] + b[-1:]
+
+
+def home_windows():
+    """{window name: pane command} for tmux session main — one call, reused by every row of the dashboard."""
+    rc, out = tmux("list-windows", "-t", "main", "-F", "#W\t#{pane_current_command}")
+    return dict((l.split("\t") + [""])[:2] for l in out.splitlines() if l) if rc == 0 else {}
+
+
+def home_units():
+    """[(short name, is-active)] — one systemctl call for all of them; anything we could not read counts as down."""
+    try:
+        got = subprocess.run(["systemctl", "--user", "is-active", *[u for _, u in HOME_UNITS]],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+    except Exception:
+        got = []
+    return [(n, i < len(got) and got[i] == "active") for i, (n, _) in enumerate(HOME_UNITS)]
+
+
+def home_load():
+    v = os.statvfs("/")
+    return f"💽 {100 - v.f_bavail * 100 // max(1, v.f_blocks)}% of {v.f_frsize * v.f_blocks >> 30}G   ·   📈 {os.getloadavg()[0]:.2f}"
+
+
+def home_workers():
+    """{"repo/track"} with a live worker. tmux reports the pane's shell, not the `claude -p` beneath it, so ask /proc:
+    cc-loop runs claude with the track worktree as its cwd, and so does an attached `cc <repo> <track>` session."""
+    out, root = set(), f"{HOME}/.cc/worktrees/"
+    try:
+        pids = subprocess.run(["pgrep", "-x", "claude"], capture_output=True, text=True, timeout=5).stdout.split()
+    except Exception:
+        return out
+    for p in pids:
+        try:
+            cwd = os.readlink(f"/proc/{p}/cwd")
+        except OSError:
+            continue                                      # the process ended between pgrep and here
+        if cwd.startswith(root):
+            out.add("/".join(cwd[len(root):].split("/")[:2]))
+    return out
+
+
+def home_tracks(workers, prs):
+    """Every board track — the same data cc-digest prints — read straight off the sidecar boards (no subprocess)."""
+    out = []
+    for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
+        try:
+            d = json.load(open(fn))
+        except Exception:
+            continue                                      # one unreadable board must not blank the whole dashboard
+        repo = d.get("repo") or os.path.basename(fn)[:-5]
+        for tr, t in d.get("tracks", {}).items():
+            runs, cost = glob.glob(f"{HOME}/.cc/state/{repo}/{tr}/runs/*.json"), 0.0
+            for f in runs:
+                try:
+                    cost += json.load(open(f)).get("total_cost_usd") or 0
+                except Exception:
+                    pass                                  # a run file still being written is not an error
+            wt, pr, status = f"{HOME}/.cc/worktrees/{repo}/{tr}/.cc", str(t.get("pr") or ""), t.get("status", "?")
+            num = pr.rstrip("/").rsplit("/", 1)[-1]        # the board stores a number or the full PR url
+            bits = [f"{len(runs)} it" if runs else "", f"${cost:.2f}" if cost else "",
+                    f"PR #{num} {prs.get((repo, pr), '')}".strip() if pr else "",
+                    "commit!" if os.path.exists(f"{wt}/checkpoint.err") else "",
+                    "push!" if os.path.exists(f"{wt}/push.err") else ""]
+            out.append({"emoji": "🏃" if f"{repo}/{tr}" in workers else HOME_ICON.get(status, "·"),
+                        "name": f"{repo}/{tr}", "status": status, "detail": " · ".join(x for x in bits if x) or "—",
+                        "rank": HOME_RANK.index(status) if status in HOME_RANK else len(HOME_RANK)})
+    return sorted(out, key=lambda t: (t["rank"], t["name"]))
+
+
+def home_audit():
+    """(verdict line of the newest cc-audit review, last power-events line) — both plain file reads."""
+    v, reps = "", sorted(glob.glob(f"{HOME}/.cc/state/audit/*-review.md"))
+    if reps:
+        lines = open(reps[-1], errors="replace").read().splitlines()
+        i = next((k for k, l in enumerate(lines) if l.strip().startswith("## verdict")), None)
+        body = next((l.lstrip("-* ").strip() for l in lines[i + 1:i + 6] if l.strip()), "") if i is not None else ""
+        v = f"`{os.path.basename(reps[-1])[:10]}` {body}"[:900]
+    try:
+        boot = open(f"{HOME}/.cc/state/power-events.log", errors="replace").read().splitlines()[-1]
+    except Exception:
+        boot = ""
+    return v, (f"last boot: {boot}"[:900] if boot else "")
+
+
 class Daemon:
     def __init__(self, use_slack):
         self.cfg = load_cfg()
@@ -324,6 +442,7 @@ class Daemon:
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
         self.forgotten = set()                              # chats that answered not_in_channel / is_archived — never swept or nudged again
         self.pair_code = None
+        self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy, self.home_off, self.home_fails = [], {}, 0.0, False, False, 0   # App Home dashboard
         self.t0 = time.time()
         self.connected = False
 
@@ -562,6 +681,8 @@ class Daemon:
 
     def on_event(self, ev):
         self.mark_dirty(ev)
+        if ev.get("type") == "app_home_opened":
+            return self.publish_home()          # the owner tapped the bot: refresh the dashboard now, never post
         if ev.get("type") == "reaction_added":
             return self.on_reaction(ev)
         if ev.get("type") == "message" and ev.get("subtype") in ("message_deleted", "message_changed"):
@@ -1240,6 +1361,7 @@ class Daemon:
         if n % 30 == 0:
             self.sweep_cycle()
             self.nudge_cycle()
+        self._safe(self.publish_home)   # the App Home dashboard, every tick — one views.publish, no message
 
     def nudge_loop(self):
         n = 0
@@ -1428,6 +1550,82 @@ class Daemon:
                 while len(self.execs) > 64:              # bound the per-chat executors on a busy workspace
                     self.execs.popitem(last=False)[1].shutdown(wait=False)
         return ex.submit(self._safe, self.on_event, ev)
+
+    # -- App Home dashboard -------------------------------------------------------
+    def home_state(self):
+        """What the dashboard shows. Everything here is free (daemon memory, tmux, the filesystem) except the channel list
+        and the PR states, which a background thread refreshes every HOME_SLOW s — a slow `gh` can never stall the loop.
+        Thread marks come from reconcile's cached snapshot: the dashboard adds no Slack history reads of its own."""
+        if time.time() - self.home_slow_at > HOME_SLOW and not self.home_slow_busy:
+            self.home_slow_busy = True
+            threading.Thread(target=self._safe, args=(self.home_slow_refresh,), daemon=True).start()
+        wins, chans = home_windows(), []
+        known = self.home_chans or sorted((c, self.names.get(c, c)) for c in     # before the first refresh: what we already know
+                                          {c for c, _ in self.last_chat.values()} | set(self.board))
+        for chat, name in known:
+            self.names.setdefault(chat, name)              # route() resolves the name: we already have it, don't pay conversations.info
+            target = self.route(chat, "im" if str(chat).startswith("D") else None)
+            snap = self.snap.get(chat)
+            marks = collections.Counter(m for m, _, _ in snap[1] if m) if snap else None
+            chans.append({"name": name,
+                          "session": ("🟢 live" if self.subs.get(target) else
+                                      "🟡 idle" if window_for(target) in wins else "⚪ none") if target
+                                     else "◽ not a session",   # #approvals, #alerts: real channels, no session behind them
+                          "marks": "–" if marks is None else (" ".join(f"{m}{n}" for m, n in sorted(marks.items())) or "clear")})
+        try:
+            r = subprocess.run([f"{BIN}/cc-limit", "status"], capture_output=True, text=True, timeout=5)
+            limit = r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            limit = ""
+        verdict, boot = home_audit()
+        return {"box": BOX, "now": time.strftime("%H:%M UTC", time.gmtime()), "units": home_units(),
+                "load": home_load(), "limit": limit, "channels": chans, "tracks": home_tracks(home_workers(), self.home_prs),
+                "audit": verdict, "boot": boot}
+
+    def home_slow_refresh(self):
+        """Background thread: the two dashboard inputs that cost a network call. A failure just leaves the last values in place."""
+        try:
+            tok = self.cfg.get("SLACK_BOT_TOKEN")
+            if tok:
+                r = api("conversations.list", tok, types="public_channel,private_channel", exclude_archived="true", limit="200")
+                chans = sorted((c["id"], c["name"]) for c in r.get("channels", ()) if c.get("is_member"))
+                self.names.update(dict(chans))
+                self.home_chans = chans
+            want, prs = [], {}
+            for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
+                try:
+                    d = json.load(open(fn))
+                except Exception:
+                    continue
+                repo = d.get("repo") or os.path.basename(fn)[:-5]
+                want += [(repo, str(t["pr"])) for t in d.get("tracks", {}).values() if t.get("pr")]
+            for repo, n in want[:8]:                       # bounded: the dashboard is never worth a long stall
+                try:
+                    p = subprocess.run(["gh", "pr", "view", n, "--json", "state,reviewDecision", "-q",
+                                        '.state + (if .reviewDecision != "" then "/" + .reviewDecision else "" end)'],
+                                       cwd=f"{DEV}/{repo}", capture_output=True, text=True, timeout=15)
+                    prs[(repo, n)] = p.stdout.strip() if p.returncode == 0 else "?"
+                except Exception:
+                    prs[(repo, n)] = "?"
+            self.home_prs = prs
+        finally:
+            self.home_slow_at, self.home_slow_busy = time.time(), False
+
+    def publish_home(self):
+        """The whole dashboard in one views.publish, replaced in place — the App Home tab never receives a message.
+        Three failures in a row (missing scope, home tab never enabled) turn it off until the daemon restarts."""
+        if self.home_off or not (self.use_slack and self.cfg.get("SLACK_OWNER_ID") and self.cfg.get("SLACK_BOT_TOKEN")):
+            return
+        try:
+            api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"],
+                view=json.dumps({"type": "home", "blocks": home_blocks(self.home_state())}))
+        except Exception as e:
+            self.home_fails += 1
+            if self.home_fails >= 3:
+                self.home_off = True
+                log(f"app home: off until restart ({e}) — re-paste core/slack/app-manifest.json (home_tab_enabled + app_home_opened), then Reinstall")
+        else:
+            self.home_fails = 0
 
     def run(self):
         self.single_instance()
@@ -2977,6 +3175,51 @@ def cmd_selfcheck():
     dmAM = Daemon(use_slack=False); okAM, msgAM = dmAM.merge("repo", "7", run=runAM)
     check("👍-merge on a not-yet-mergeable PR arms auto-merge (--auto) instead of failing silently",
           okAM and "auto-merge armed" in msgAM and any("--auto" in a for a in callsAM))
+    hfix = {"box": "abox", "now": "18:42 UTC", "units": [("tmux-main", True), ("cc-slackd", False)],
+            "load": "💽 31% of 458G   ·   📈 0.42", "limit": "usage limit until 19:00Z (18m left)",
+            "channels": [{"name": f"c{i}", "session": "🟢 live", "marks": "❓2"} for i in range(50)],
+            "tracks": [{"emoji": "🏃", "name": f"abox/t{i}", "status": "running", "detail": "3 it · $1.20 · PR #7 OPEN · commit!"}
+                       for i in range(90)],
+            "audit": "`2026-08-27` shipped a lot, served the owner poorly at the message layer", "boot": "last boot: 2026-08-27T05:54:29Z"}
+    hb = home_blocks(hfix)
+    hfields = [f for blk in hb for f in blk.get("fields", [])]
+    htext = json.dumps(hb, ensure_ascii=False)
+    check("home_blocks: one view within Slack's caps (≤100 blocks, every field ≤2000 chars) — a 90-track board still publishes",
+          len(hb) <= HOME_MAXBLK and hfields and all(len(f["text"]) <= HOME_MAXFIELD for f in hfields)
+          and all(len(b.get("fields", ())) <= 10 for b in hb)
+          and all(len(b.get("text", {}).get("text", "")) <= 3000 for b in hb))
+    check("home_blocks: header, unit dots, limit, channels, work fields, audit, boot and the footer are all there",
+          hb[0] == {"type": "header", "text": {"type": "plain_text", "text": "abox · 18:42 UTC"}}
+          and "🟢 tmux-main" in htext and "🔴 cc-slackd" in htext and "⏳ Claude usage limit until 19:00Z" in htext
+          and "*Channels*" in htext and "*#c0* · 🟢 live · ❓2" in htext and "*Work*" in htext
+          and "🏃 *abox/t0* · running" in htext and "*Last audit*" in htext and "last boot: 2026-08-27T05:54:29Z" in htext
+          and hb[-1]["elements"][0]["text"] == HOME_FOOT)
+    hempty = home_blocks({})
+    check("home_blocks: pure and total — an empty state still renders one valid view (no crash, no limit line)",
+          home_blocks(hfix) == hb and len(hempty) < len(hb) and "⏳" not in json.dumps(hempty)
+          and "_none yet_" in json.dumps(hempty) and "_no tracks_" in json.dumps(hempty)
+          and all(b["type"] in ("header", "context", "section", "divider") for b in hempty))
+    dmH = Daemon(use_slack=False); dmH.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmH.use_slack = True
+    dmH.home_state = lambda: dict(hfix)
+    hsaid, hcalls = [], []
+    dmH.say = lambda chat, text, thread=None: hsaid.append(text)
+    globals()["api"] = lambda m, t, **kw: hcalls.append((m, kw.get("user_id"), kw.get("view"))) or {"ok": True}
+    try:
+        dmH.publish_home()
+        one = len(hcalls) == 1 and hcalls[0][:2] == ("views.publish", "UOWNER") and json.loads(hcalls[0][2])["type"] == "home"
+        dmH.on_event({"type": "app_home_opened", "user": "UOWNER", "tab": "home"})     # opening the tab republishes, never posts
+        opened = len(hcalls) == 2 and not hsaid
+        globals()["api"] = lambda m, t, **kw: (_ for _ in ()).throw(RuntimeError("views.publish: missing_scope"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(4):
+                dmH.publish_home()
+        dmU = Daemon(use_slack=False); dmU.cfg = {}; dmU.use_slack = True; dmU.publish_home()   # unpaired: nothing at all
+    finally:
+        globals()["api"] = real_api
+    check("publish_home: one views.publish to the owner's home tab, and app_home_opened republishes it — never a message",
+          one and opened)
+    check("publish_home: a missing scope disables the dashboard after 3 failures (no error loop), unpaired publishes nothing",
+          dmH.home_off and dmH.home_fails == 3 and not hsaid and dmU.home_fails == 0)
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0
