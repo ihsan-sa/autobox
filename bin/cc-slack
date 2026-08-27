@@ -68,7 +68,7 @@ FLAGS = "flags.json"                                           # {"<chat>:<root_
 STALE_AFTER = 48 * 3600                                        # a thread quiet this long leaves the buckets (and loses its mark)
 STALL_AFTER = 30 * 60                                          # the owner's last word unanswered this long = a stalled session
 PR_RE = re.compile(r"^\[([a-z0-9_-]+)\] PR #([0-9]+):")
-QUEUE_TTL = 900                                                # a message queued for a session that never came up is dropped (and the owner told) after 15 min
+QUEUE_TTL = 4 * 3600                                                # a message queued for a session that never came up is dropped (and the owner told) after 15 min
 SECRET_RE = re.compile(r"(xox[abpsr]-[A-Za-z0-9-]+|Authorization:\s*\S+(?:\s+\S+)?|Bearer\s+[A-Za-z0-9._~+/=-]{8,}"
                         r"|AKIA[0-9A-Z]{12,}|gh[pousr]_[A-Za-z0-9]{20,})")   # what a tool preview relayed to Slack must never carry
 for _p in glob.glob(f"{HOME}/.cc/slack/venv/lib/python*/site-packages"):   # slack_sdk lives in the venv
@@ -479,12 +479,36 @@ class Daemon:
         self.bot_id = None                                  # our own B… id: bot-authored posts carry bot_id and no user
         self.default_chats = {}                             # target -> fallback chat for relays (resolved once per daemon life)
         self.forgotten = set()
+        self.load_queues()                                  # queued messages persisted by an earlier daemon life
         self.home_dirty, self.home_at = True, 0.0           # App Home: event-driven refresh (home_loop)
         self.home_burst_until = 0.0                          # after app_home_opened: 1 s refreshes for 60 s (owner rule), then 30 s                              # chats that answered not_in_channel / is_archived — never swept or nudged again
         self.pair_code = None
         self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy, self.home_off, self.home_fails = [], {}, 0.0, False, False, 0   # App Home dashboard
         self.t0 = time.time()
         self.connected = False
+
+    def save_queues(self):
+        """Queued messages survive a daemon restart or a reboot (they used to vanish silently — an owner request was lost that way)."""
+        try:
+            data = {t: [[ts, payload, alias] for ts, payload, alias in q] for t, q in self.queues.items() if q}
+            tmp = f"{DIR}/queue.json.tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, f"{DIR}/queue.json")
+        except Exception as e:
+            log(f"save_queues: {e!r}")
+
+    def load_queues(self):
+        try:
+            data = json.load(open(f"{DIR}/queue.json"))
+        except Exception:
+            return
+        for t, entries in data.items():
+            for ts, payload, alias in entries:
+                if time.time() - float(ts) < QUEUE_TTL:
+                    self.queues[t].append((float(ts), payload, alias))
+        if any(self.queues.values()):
+            log(f"restored queued messages: { {t: len(q) for t, q in self.queues.items() if q} }")
 
     # -- local router -------------------------------------------------------------
     def serve_unix(self):
@@ -515,6 +539,7 @@ class Daemon:
                     backlog = [e for e in (q or []) if e[2] == alias]   # each entry waits for ITS alias (main's backlog is not an orch's)
                     for e in backlog:
                         q.remove(e)
+                    self.save_queues()
                 if alias:
                     self.known_aliases[target].add(alias)
                     self.chan_notice(target, f"🤖 @{alias} joined — @ it to hand it threads; @main brings the main session back.")
@@ -584,7 +609,7 @@ class Daemon:
         if sent:
             return "delivered"
         with self.lock:
-            self.queues[target].append((time.time(), payload, alias))
+            self.queues[target].append((time.time(), payload, alias)); self.save_queues()
         if autostart and self.cfg.get("SLACK_AUTOSTART", "1") == "1":
             return self.autostart(target)
         return "queued"
@@ -594,6 +619,8 @@ class Daemon:
         win = window_for(target)
         wid, cmd = tmux_window(win)
         if wid and not pane_idle(wid):
+            if accept_prompts(wid):                     # stuck on a startup dialog: press it through and let it subscribe
+                log(f"autostart {target}: pressed a startup prompt in {win}"); self.starting[target] = time.time(); return "starting"
             return "live-no-channel"                    # something runs there (session without the channel, or a --go worker)
         if track_missing(target):
             return "no-track"                           # #repo--typo: `cc repo typo` would create the track — never from Slack
@@ -1738,6 +1765,8 @@ class Daemon:
                 for t, q in list(self.queues.items()):
                     while q and time.time() - q[0][0] > QUEUE_TTL:
                         expired.append((t, q.popleft()[1]))
+                if expired:
+                    self.save_queues()
             for t, payload in expired:
                 self.expired(t, payload)
 
@@ -3785,6 +3814,20 @@ def cmd_selfcheck():
         globals()["react"] = _reactMM
     check("a failed 👍-merge marks the track blocked with the reason; an armed auto-merge leaves a note (status unchanged) — owner rule",
           len(prs) == 2 and prs[0][0] == "blocked" and prs[0][1].startswith("merge FAILED") and prs[1][0] is None and prs[1][1].startswith("👍 seen"))
+    pressedP = []; _tmuxP = globals()["tmux"]
+    globals()["tmux"] = lambda *a: (pressedP.append(a) or (0, "")) if a[0] == "send-keys" else (0, "MCP servers may execute code or access system resources.\n  ❯ 1. Use this MCP server\n  Enter to confirm · Esc to cancel")
+    try:
+        okP = accept_prompts("@9")
+    finally:
+        globals()["tmux"] = _tmuxP
+    check("startup prompts: the MCP-server trust dialog is pressed through (option 2 + Enter) — a session stuck there never joins Slack",
+          okP and [a[-1] for a in pressedP] == ["2", "Enter"])
+    dmQ = Daemon(use_slack=False); dmQ.cfg = {"SLACK_OWNER_ID": "UOWNER"}
+    dmQ.queues["repoq"].append((time.time(), {"type": "message", "content": "keep me", "meta": {}}, None)); dmQ.save_queues()
+    dmQ2 = Daemon(use_slack=False)
+    check("queued messages survive a daemon restart (queue.json) — an owner request was lost to an in-memory queue on 2026-08-27",
+          [e[1]["content"] for e in dmQ2.queues.get("repoq", [])] == ["keep me"])
+    dmQ.queues.clear(); dmQ.save_queues()
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     print(f"selfcheck: {len(fails)} failed")
@@ -3918,22 +3961,39 @@ def display_name(target, alias=None):
     return f"{BOX} · " + ("box" if target == "box" else "planning" if target == CTL else target)
 
 
-def cmd_accept_dialog(win, seconds=120):
-    """Auto-accept the --dangerously-load-development-channels warning in a tmux window (first option = local development)."""
-    deadline = time.time() + seconds
+def accept_prompts(wid):
+    """Press through the two startup dialogs that block a session from ever loading its channel: Claude Code's MCP-server
+    trust prompt ("Use this MCP server" — option 2 = this and all future servers in the project) and the development-channels
+    warning. Returns True when something was pressed (the session is now starting), False when the pane shows no prompt."""
+    rc, pane = tmux("capture-pane", "-p", "-t", wid)
+    if rc != 0:
+        return False
+    if "Use this MCP server" in pane or "MCP servers may execute code" in pane:
+        tmux("send-keys", "-t", wid, "-l", "--", "2"); time.sleep(0.3); tmux("send-keys", "-t", wid, "Enter")
+        return True
+    if "development channels" in pane or "local development" in pane:
+        tmux("send-keys", "-t", wid, "Enter")
+        time.sleep(1.5)
+        rc, pane = tmux("capture-pane", "-p", "-t", wid)
+        if "local development" in pane:          # still open: select the first option explicitly
+            tmux("send-keys", "-t", wid, "Up", "Enter")
+        return True
+    return False
+
+
+def cmd_accept_dialog(win, seconds=180):
+    """Auto-accept the startup dialogs in a tmux window (dev-channels warning, MCP-server trust) for up to `seconds`."""
+    deadline = time.time() + seconds; pressed = 0
     while time.time() < deadline:
         wid, _ = tmux_window(win)
-        if wid:
-            rc, pane = tmux("capture-pane", "-p", "-t", wid)
-            if "development channels" in pane or "local development" in pane:
-                tmux("send-keys", "-t", wid, "Enter")
-                time.sleep(1.5)
-                rc, pane = tmux("capture-pane", "-p", "-t", wid)
-                if "local development" in pane:          # still open: select the first option explicitly
-                    tmux("send-keys", "-t", wid, "Up", "Enter")
+        if wid and accept_prompts(wid):
+            pressed += 1; time.sleep(2)               # a second prompt may follow the first (trust, then dev-channels)
+            if pressed >= 2:
                 return 0
+        elif pressed:
+            return 0
         time.sleep(1)
-    return 1
+    return 0 if pressed else 1
 
 
 def cmd_history(argv):
