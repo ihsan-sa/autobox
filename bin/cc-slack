@@ -1804,6 +1804,8 @@ class Daemon:
             wid, _ = tmux_window(window_for(target))
             busy = bool(wid) and pane_working(wid)
             held, last = self.working.get(target), self.last_chat.get(target)
+            if held is None and last and self.marks.get(f"{last[0]}:{last[1]}:hammer_and_wrench:auto"):
+                held = self.working[target] = (last[0], last[1], self.marks[f"{last[0]}:{last[1]}:hammer_and_wrench:auto"])   # ours from before a restart: adopt it, so it still comes off
             if busy:
                 self.idle_ticks.pop(target, None)
                 if last and (held is None or held[:2] != tuple(last)):
@@ -1814,6 +1816,7 @@ class Daemon:
                         continue                          # the session marked it itself (🔧), or declared it done (✅): a turn in a done thread does not un-do it
                     if self.session_mark(chat, root, "hammer_and_wrench"):
                         self.working[target] = (chat, root, time.time())
+                        self.marks[f"{chat}:{root}:hammer_and_wrench:auto"] = time.time(); save_marks(self.marks)   # remembered as OURS across a restart
             elif held:
                 self.idle_ticks[target] += 1
                 if self.idle_ticks[target] >= 2:
@@ -1822,6 +1825,7 @@ class Daemon:
     def drop_wrench(self, target):
         chat, root, since = self.working.pop(target)
         self.idle_ticks.pop(target, None)
+        self.marks.pop(f"{chat}:{root}:hammer_and_wrench:auto", None)
         if self.marks.get(f"{chat}:{root}:hammer_and_wrench", 0) > since + 1:
             return                                        # the session re-set it itself since we did: not ours any more
         react(self.cfg, chat, root, "hammer_and_wrench", remove=True)
@@ -4127,12 +4131,15 @@ def cmd_selfcheck():
         dmBZ.busy_cycle(); gone = "repo" not in dmBZ.working  # second idle tick: off
         busyBZ["v"] = True; dmBZ.marks["CB:50.0:hammer_and_wrench"] = 1.0; dmBZ.busy_cycle()   # the session's own 🔧: left alone
         dmBZ.marks.clear(); dmBZ.marks["CB:50.0:white_check_mark"] = 1.0; dmBZ.busy_cycle()   # a done (✅) thread: no 🔧 over it
+        dmBZ.marks.clear(); dmBZ.marks["CB:50.0:hammer_and_wrench:auto"] = 5.0; dmBZ.working.clear()   # "after a restart": ours, still on the root
+        busyBZ["v"] = False; dmBZ.busy_cycle(); dmBZ.busy_cycle(); adopted = marksBZ[-1] == ("50.0", "hammer_and_wrench", True) and "CB:50.0:hammer_and_wrench:auto" not in dmBZ.marks
     finally:
         globals()["tmux_window"], globals()["pane_working"], globals()["react"] = _twBZ, _pwBZ, _rcBZ
     check("auto 🔧: a session mid-turn gets ONE 🔧 on the thread it last heard from; it survives one idle tick and comes off after two "
-          "(≈60 s); a 🔧 the session set itself is never placed over or taken off, and a ✅ (done) root gets no 🔧 at all",
-          marksBZ == [("50.0", "hammer_and_wrench", False), ("50.0", "hammer_and_wrench", True)] and held1 and gone
-          and rmBZ == [("hammer_and_wrench", True)] and "repo" not in dmBZ.working)
+          "(≈60 s); a 🔧 the session set itself is never placed over or taken off, a ✅ (done) root gets no 🔧 at all, and one of "
+          "ours from before a restart is adopted and still comes off",
+          marksBZ == [("50.0", "hammer_and_wrench", False), ("50.0", "hammer_and_wrench", True), ("50.0", "hammer_and_wrench", True)] and held1 and gone
+          and rmBZ[0] == ("hammer_and_wrench", True) and len(rmBZ) == 2 and adopted and "repo" not in dmBZ.working)
     check("Home: a finished track leaves the dashboard as soon as it is done/merged unless its PR still waits for a 👍",
           home_track_shown("running", None) and home_track_shown("blocked", None) and not home_track_shown("done", None)
           and not home_track_shown("merged", "MERGED") and home_track_shown("done", "OPEN/APPROVED"))
