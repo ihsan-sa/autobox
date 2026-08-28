@@ -84,6 +84,7 @@ ORCH_KEEP = 7 * 86400                                          # how long an arc
 ORCH_IDLE = 24 * 3600                                          # an orch channel whose orch window has been gone this long is archived (daily janitor)
 CHAN_MAX = 80                                                  # Slack's cap on a channel name
 B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+CANVASES = "canvases.json"                                     # {"<chat>": {canvas_id, title, updated}}: the canvas WE keep for a channel (see canvas_of)
 FLAGS = "flags.json"                                           # {"<chat>:<root_ts>": <flag_ts>}: WHEN the owner 🏁'd a thread (a newer message re-opens it)
 STALE_AFTER = 48 * 3600                                        # a thread quiet this long leaves the buckets (and loses its mark)
 STALL_AFTER = 30 * 60                                          # the owner's last word unanswered this long = a stalled session
@@ -3060,10 +3061,21 @@ def cmd_selfcheck():
             return {"user_id": "UBOT"}
         if method == "users.info":
             return {"user": {"real_name": "Owner"}}
-        if method == "conversations.info":
-            return {"channel": {"properties": {"canvas": {"file_id": "EXIST1"}} if kw.get("channel") == "C2" else {}}}
+        if method == "conversations.info":     # C2 the documented field · C6/C7 the canvas TAB this plan fills in instead · the rest: nothing
+            return {"channel": {"properties": {"C2": {"canvas": {"file_id": "EXIST1"}},
+                                               "C6": {"tabs": [{"type": "bookmarks"}, {"type": "canvas", "data": {"file_id": "TAB6"}}]},
+                                               "C7": {"tabs": [{"type": "canvas", "data": {"file_id": "TAB7"}}]}}.get(kw.get("channel"), {})}}
+        if method == "files.list":
+            fid = {"C4": "FLIST4", "C5": "FEXIST5"}.get(kw.get("channel"))
+            if kw.get("channel") == "C5" and not any(m == "conversations.canvases.create" for m, _ in acalls2):
+                fid = None                         # C5: nothing to find yet → create runs → and Slack says it exists after all
+            return {"files": [{"id": fid, "filetype": "quip"}] if fid else []}
         if method == "conversations.canvases.create":
+            if kw.get("channel_id") in ("C5", "C8"):
+                raise RuntimeError("conversations.canvases.create: free_team_canvas_tab_already_exists")
             return {"canvas_id": "NEW1"}
+        if method == "canvases.edit" and kw.get("canvas_id") == "STALE7":
+            raise RuntimeError("canvases.edit: file_not_found")
         return {}
     try:
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
@@ -3096,19 +3108,42 @@ def cmd_selfcheck():
         acalls2.clear(); cmd_pin(["C1", "100.1"], remove=True)
         check("unpin: pins.remove(channel, timestamp)", acalls2[-1][0] == "pins.remove")
         real_stdin = sys.stdin
+        def canvas_run(chan):
+            sys.stdin = io.StringIO("# hi"); acalls2.clear()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cmd_canvas([chan, "Title"])
+            return rc, out.getvalue().strip(), err.getvalue(), [m for m, _ in acalls2]
         try:
-            sys.stdin = io.StringIO("# hi")
-            acalls2.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
-                cmd_canvas(["C1", "Title"])
-            check("canvas: no existing canvas → canvases.create", any(m == "conversations.canvases.create" for m, _ in acalls2))
-            sys.stdin = io.StringIO("# hi")
-            acalls2.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
-                cmd_canvas(["C2", "Title"])
-            check("canvas: existing canvas → canvases.edit replaces wholesale", any(m == "canvases.edit" for m, _ in acalls2))
+            rc, out, err, ms = canvas_run("C1")
+            check("canvas: no canvas anywhere → canvases.create, and the new id is remembered",
+                  rc == 0 and out == "NEW1" and "conversations.canvases.create" in ms and load_canvases()["C1"]["canvas_id"] == "NEW1")
+            rc, out, err, ms = canvas_run("C2")
+            check("canvas: existing canvas → canvases.edit replaces wholesale",
+                  rc == 0 and out == "EXIST1" and "canvases.edit" in ms and "conversations.canvases.create" not in ms)
+            rc, out, err, ms = canvas_run("C6")
+            check("canvas: this plan reports the canvas as a TAB, not properties.canvas → still an edit",
+                  rc == 0 and out == "TAB6" and "canvases.edit" in ms and "conversations.canvases.create" not in ms)
+            rc, out, err, ms = canvas_run("C1")
+            check("canvas: the remembered id is used as it is — no conversations.info, no lookup",
+                  rc == 0 and out == "NEW1" and ms == ["canvases.edit"])
+            rc, out, err, ms = canvas_run("C4")
+            check("canvas: conversations.info reports none → files.list finds it → edit, never create",
+                  rc == 0 and out == "FLIST4" and "canvases.edit" in ms and "conversations.canvases.create" not in ms)
+            rc, out, err, ms = canvas_run("C5")
+            check("canvas: create → free_team_canvas_tab_already_exists → resolve and edit, not an error",
+                  rc == 0 and out == "FEXIST5" and "canvases.edit" in ms
+                  and ms.index("conversations.canvases.create") < ms.index("canvases.edit"))
+            rc, out, err, ms = canvas_run("C8")
+            check("canvas: the canvas exists but nothing can resolve it → exit 1, and the operator is told which",
+                  rc == 1 and out == "" and "already has a canvas" in err and "free_team_canvas_tab_already_exists" not in err)
+            remember_canvas("C7", "STALE7", "Title")
+            rc, out, err, ms = canvas_run("C7")
+            check("canvas: a remembered canvas Slack no longer has → resolved again, not a dead end",
+                  rc == 0 and out == "TAB7" and ms.count("canvases.edit") == 2 and "conversations.info" in ms)
         finally:
             sys.stdin = real_stdin
+            os.path.exists(f"{DIR}/{CANVASES}") and os.unlink(f"{DIR}/{CANVASES}")
         acalls2.clear()
         ch = Channel("box"); ch.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
         real_role = os.environ.pop("CC_ROLE", None)        # the selfcheck itself may run inside a --go worker
@@ -4807,6 +4842,53 @@ def cmd_pin(argv, remove=False):
     return 0
 
 
+def load_canvases():
+    """Which canvas is which channel's, as we last saw it (see CANVASES). Read from disk on every use, like the other
+    small tables: a canvas is written from the CLI, never from the daemon, so there is no cache to invalidate."""
+    try:
+        d = json.load(open(f"{DIR}/{CANVASES}"))
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def remember_canvas(chat, canvas_id, title):
+    """Atomic, 0600, like flags/marks. This table is what makes the SECOND `cc-slack canvas` an edit: on a free plan
+    Slack may report no canvas for a channel that has one, and then a create comes back free_team_canvas_tab_already_exists."""
+    cans = load_canvases()
+    cans[chat] = {"canvas_id": canvas_id, "title": title, "updated": int(time.time())}
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        tmp = f"{DIR}/{CANVASES}.tmp"
+        with open(tmp, "w") as f:
+            os.fchmod(f.fileno(), 0o600); json.dump(cans, f)
+        os.replace(tmp, f"{DIR}/{CANVASES}")
+    except Exception as e:
+        log(f"canvases: save failed: {e!r}")      # only costs the next call a lookup
+
+
+def canvas_of(tok, chat):
+    """The id of the channel's existing canvas, or None — asked of Slack itself, in one conversations.info: the
+    documented properties.canvas.file_id, and the canvas TAB (properties.tabs) this workspace's plan fills in instead."""
+    try:
+        props = api("conversations.info", tok, channel=chat)["channel"].get("properties") or {}
+    except Exception:
+        return None                               # a channel we cannot read is the create branch's problem to report
+    return ((props.get("canvas") or {}).get("file_id")
+            or next((t["data"]["file_id"] for t in (props.get("tabs") or [])
+                     if t.get("type") == "canvas" and (t.get("data") or {}).get("file_id")), None))
+
+
+def canvas_in_files(tok, chat):
+    """Last resort: the channel's canvas as a file shared into it (a canvas is a "quip" file). This is the only lookup
+    that answers when conversations.info reports no canvas at all — which is exactly when a create would be rejected."""
+    try:
+        files = api("files.list", tok, channel=chat, types="canvases", count="200").get("files") or []
+    except Exception:
+        return None
+    return next((f["id"] for f in files if f.get("id") and f.get("filetype") in ("quip", "canvas")), None)
+
+
 def cmd_canvas(argv):
     """canvas <#chan|C…> <title>, markdown on stdin. Creates the channel's canvas if it has none, else replaces its content wholesale."""
     if len(argv) != 2:
@@ -4815,15 +4897,37 @@ def cmd_canvas(argv):
     if not tok:
         print("cc-slack canvas: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
     chat, title, md = resolve_chat(cfg, argv[0]), argv[1], sys.stdin.read()
+    changes = json.dumps([{"operation": "replace", "document_content": {"type": "markdown", "markdown": md}}])
+    def replace(cid):
+        api("canvases.edit", tok, canvas_id=cid, changes=changes); return cid
     try:
-        info = api("conversations.info", tok, channel=chat)["channel"]
-        canvas_id = ((info.get("properties") or {}).get("canvas") or {}).get("file_id")
-        if canvas_id:
-            api("canvases.edit", tok, canvas_id=canvas_id,
-                changes=json.dumps([{"operation": "replace", "document_content": {"type": "markdown", "markdown": md}}]))
-        else:
-            canvas_id = api("conversations.canvases.create", tok, channel_id=chat,
-                            document_content=json.dumps({"type": "markdown", "markdown": md}), title=title)["canvas_id"]
+        canvas_id, cached = None, (load_canvases().get(chat) or {}).get("canvas_id")
+        if cached:                                # the id we wrote last time: no lookup at all in the common case
+            try:
+                canvas_id = replace(cached)
+            except RuntimeError as e:
+                if "not_found" not in str(e):
+                    raise
+                log(f"canvas: {cached} is gone — resolving {chat}'s canvas again")
+        if not canvas_id:
+            found = canvas_of(tok, chat) or canvas_in_files(tok, chat)
+            if found:
+                canvas_id = replace(found)
+            else:
+                try:
+                    canvas_id = api("conversations.canvases.create", tok, channel_id=chat,
+                                    document_content=json.dumps({"type": "markdown", "markdown": md}), title=title)["canvas_id"]
+                except RuntimeError as e:
+                    if "free_team_canvas_tab_already_exists" not in str(e):
+                        raise
+                    found = canvas_in_files(tok, chat)     # Slack says one exists, so it does: find it and replace it
+                    if not found:
+                        print(f"cc-slack canvas: {argv[0]} already has a canvas, but its id could not be resolved "
+                              "(conversations.info and files.list both report none) — open the channel's canvas tab and "
+                              "pass its F… id to canvases.edit by hand", file=sys.stderr)
+                        return 1
+                    canvas_id = replace(found)
+        remember_canvas(chat, canvas_id, title)
     except Exception as e:
         print(f"cc-slack canvas: {e}", file=sys.stderr); return 1
     print(canvas_id or ""); return 0
