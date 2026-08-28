@@ -511,6 +511,7 @@ class Conn:
 # ---------------------------------------------------------------- App Home dashboard (one live view, never a message)
 HOME_UNITS = (("tmux-main", "tmux-main.service"), ("cc-slackd", "cc-slackd.service"),
               ("heartbeat", "cc-heartbeat.service"), ("audit", "cc-audit.timer"))
+HOME_CACHE = 5                                 # seconds a costly dashboard input (tmux/systemctl/pgrep/cc-limit) is reused for
 PRESENCE_EVERY = 30                            # how often the daemon asks Slack whether the owner is active (one cheap call)
 AWAY_GRACE = 60                                # …and how long the 1 s dashboard cadence outlives them going idle (owner rule)
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
@@ -571,6 +572,20 @@ def home_blocks(st):
           {"type": "context", "elements": [{"type": "mrkdwn", "text": (st.get("boot") or "no boot record")[:2900]}]},
           {"type": "context", "elements": [{"type": "mrkdwn", "text": HOME_FOOT}]}]
     return b if len(b) <= HOME_MAXBLK else b[:HOME_MAXBLK - 1] + b[-1:]
+
+
+_CACHE = {}
+
+
+def cached(key, ttl, fn):
+    """Memoise one dashboard input for ttl seconds. At the 1 s cadence the costly inputs (a tmux, systemctl or pgrep
+    subprocess each) cannot meaningfully change every second, and paying for them 60×/min was most of the dashboard's cost."""
+    now, hit = time.time(), _CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _CACHE[key] = (now, val)
+    return val
 
 
 def home_windows():
@@ -2458,7 +2473,7 @@ class Daemon:
         if time.time() - self.home_slow_at > HOME_SLOW and not self.home_slow_busy:
             self.home_slow_busy = True
             threading.Thread(target=self._safe, args=(self.home_slow_refresh,), daemon=True).start()
-        wins, chans, orchs = home_windows(), [], load_orchs()
+        wins, chans, orchs = cached("wins", HOME_CACHE, home_windows), [], cached("orchs", HOME_CACHE, load_orchs)
         known = self.home_chans or sorted((c, self.names.get(c, c)) for c in     # before the first refresh: what we already know
                                           {c for c, _ in list(self.last_chat.values())} | set(self.board))
         for chat, name, depth in home_chan_order(known, orchs):
@@ -2476,15 +2491,18 @@ class Daemon:
                                       "🟡 idle" if (f"{target}@{alias}" if alias else window_for(target)) in wins else "⚪ none") if target
                                      else "◽ not a session",   # #approvals, #alerts: real channels, no session behind them
                           "marks": "–" if marks is None else (" ".join(f"{m}{n}" for m, n in sorted(marks.items())) or "clear")})
-        try:
-            r = subprocess.run([f"{BIN}/cc-limit", "status"], capture_output=True, text=True, timeout=5)
-            limit = r.stdout.strip() if r.returncode == 0 else ""
-        except Exception:
-            limit = ""
-        verdict, boot = home_audit()
-        return {"box": BOX, "now": time.strftime("%H:%M:%S UTC", time.gmtime()), "units": home_units(),
-                "load": home_load(), "limit": limit, "channels": chans, "tracks": home_tracks(home_workers(), self.home_prs),
-                "quick": home_quick(),
+        def limit_now():
+            try:
+                r = subprocess.run([f"{BIN}/cc-limit", "status"], capture_output=True, text=True, timeout=5)
+                return r.stdout.strip() if r.returncode == 0 else ""
+            except Exception:
+                return ""
+        verdict, boot = cached("audit", HOME_CACHE, home_audit)
+        # the clock and the box's vitals are read every time (they are file reads); everything that costs a process is cached
+        return {"box": BOX, "now": time.strftime("%H:%M:%S UTC", time.gmtime()), "units": cached("units", HOME_CACHE, home_units),
+                "load": home_load(), "limit": cached("limit", HOME_CACHE, limit_now), "channels": chans,
+                "tracks": cached("tracks", HOME_CACHE, lambda: home_tracks(home_workers(), self.home_prs)),
+                "quick": cached("quick", HOME_CACHE, home_quick),
                 "audit": verdict, "boot": boot}
 
     def home_slow_refresh(self):
@@ -4522,6 +4540,16 @@ def cmd_selfcheck():
     dmHB.home_dirty = False; dmHB.home_burst_until = 1061.0; burst = dmHB.home_due(1001.0); after_burst = dmHB.home_at = 1061.0; after = dmHB.home_due(1062.0)
     check("App Home cadence: 1 s while the tab is open (60 s after app_home_opened), ~2 s after an event, 30 s heartbeat, never faster — owner rule",
           not quiet and heartbeat and not ev_fast and ev_2s and burst and not after)
+    _cc = dict(_CACHE); _CACHE.clear()
+    hitsCA = []
+    v1 = cached("t", 5, lambda: hitsCA.append(1) or "a")
+    v2 = cached("t", 5, lambda: hitsCA.append(1) or "b")
+    _CACHE["t"] = (time.time() - 9, "a")
+    v3 = cached("t", 5, lambda: hitsCA.append(1) or "c")
+    _CACHE.clear(); _CACHE.update(_cc)
+    check("dashboard cache: a costly input (a tmux/systemctl/pgrep subprocess) is reused inside its window and re-read after "
+          "it — at the 1 s cadence this is the difference between ~38 ms and ~1 ms per refresh",
+          (v1, v2, v3) == ("a", "a", "c") and len(hitsCA) == 2)
     dmPR = Daemon(use_slack=False); dmPR.use_slack = True
     dmPR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
     dmPR.home_at, dmPR.home_burst_until = 2000.0, 0.0
