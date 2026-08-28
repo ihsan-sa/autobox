@@ -511,6 +511,8 @@ class Conn:
 # ---------------------------------------------------------------- App Home dashboard (one live view, never a message)
 HOME_UNITS = (("tmux-main", "tmux-main.service"), ("cc-slackd", "cc-slackd.service"),
               ("heartbeat", "cc-heartbeat.service"), ("audit", "cc-audit.timer"))
+PRESENCE_EVERY = 30                            # how often the daemon asks Slack whether the owner is active (one cheap call)
+AWAY_GRACE = 60                                # …and how long the 1 s dashboard cadence outlives them going idle (owner rule)
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
 HOME_MAXBLK, HOME_MAXFIELD = 100, 2000         # Slack's caps on one published view
 HOME_ICON = {"todo": "·", "running": "▶️", "review": "🔶", "blocked": "⛔", "merged": "✅", "done": "🔶"}   # done only shows while its PR waits for a 👍
@@ -777,7 +779,8 @@ class Daemon:
         self.forgotten = set()
         self.load_queues()                                  # queued messages persisted by an earlier daemon life
         self.home_dirty, self.home_at = True, 0.0           # App Home: event-driven refresh (home_loop)
-        self.home_burst_until = 0.0                          # after app_home_opened: 1 s refreshes for 60 s (owner rule), then 30 s                              # chats that answered not_in_channel / is_archived — never swept or nudged again
+        self.home_burst_until = 0.0                          # after app_home_opened: 1 s refreshes for 60 s (owner rule), then 30 s
+        self.presence, self.presence_at, self.away_since = None, 0.0, 0.0   # is the owner's Slack open? (users.getPresence, every PRESENCE_EVERY s)                              # chats that answered not_in_channel / is_archived — never swept or nudged again
         self.pair_code = None
         self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy, self.home_off, self.home_fails = [], {}, 0.0, False, False, 0   # App Home dashboard
         self.t0 = time.time()
@@ -2217,17 +2220,41 @@ class Daemon:
             self.sweep_cycle()
             self.nudge_cycle()
 
+    def presence_poll(self, now):
+        """Is the owner on Slack right now? One users.getPresence every PRESENCE_EVERY s — Slack's own idea of "active"
+        (a client open and not idle), which is what the owner asked the dashboard's speed to follow."""
+        if not (self.use_slack and self.cfg.get("SLACK_OWNER_ID") and self.cfg.get("SLACK_BOT_TOKEN")):
+            return
+        if now - self.presence_at < PRESENCE_EVERY:
+            return
+        self.presence_at = now
+        try:
+            p = api("users.getPresence", self.cfg["SLACK_BOT_TOKEN"], user=self.cfg["SLACK_OWNER_ID"]).get("presence")
+        except Exception as e:
+            log(f"presence: {e!r}"); return
+        if p == "active":
+            self.away_since = 0.0
+        elif self.presence == "active":
+            self.away_since = now                        # just went away: the fast cadence has one more minute to run
+        self.presence = p
+
+    def home_fast(self, now):
+        """The owner is watching: their Slack is active, they just opened the Home tab, or they went away < AWAY_GRACE ago."""
+        return (self.presence == "active" or now < self.home_burst_until
+                or bool(self.away_since and now - self.away_since < AWAY_GRACE))
+
     def home_due(self, now):
-        """When to republish: every second while the owner has the tab open (60 s after app_home_opened), within ~2 s of any
-        event otherwise, and at least every 30 s — one views.publish per refresh, no reads, no messages."""
+        """When to republish: every second while the owner is on Slack (and for AWAY_GRACE after they go idle — owner rule
+        2026-08-28), within ~2 s of any event otherwise, and at least every 30 s — one views.publish, no reads, no messages."""
         since = now - self.home_at
-        return (now < self.home_burst_until and since >= 1) or (self.home_dirty and since >= 2) or since >= 30
+        return (self.home_fast(now) and since >= 1) or (self.home_dirty and since >= 2) or since >= 30
 
     def home_loop(self):
         while True:
             time.sleep(1)
             try:
                 now = time.time()
+                self.presence_poll(now)
                 if self.home_due(now):
                     self.home_dirty = False; self.home_at = now; self.publish_home()
             except Exception as e:
@@ -2506,7 +2533,9 @@ class Daemon:
             api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"], view=view)
         except Exception as e:
             if "ratelimited" in str(e):
-                self.home_burst_until = 0.0              # Slack said slow down: back to the event-driven cadence
+                # Slack said slow down: drop out of the fast cadence for a minute, however active the owner looks
+                self.home_burst_until, self.presence, self.away_since = 0.0, None, 0.0
+                self.presence_at = time.time() + 60
             self.home_fails += 1
             if self.home_fails >= 3:
                 self.home_off = True; self.home_retry_at = time.time() + 600
@@ -4493,6 +4522,23 @@ def cmd_selfcheck():
     dmHB.home_dirty = False; dmHB.home_burst_until = 1061.0; burst = dmHB.home_due(1001.0); after_burst = dmHB.home_at = 1061.0; after = dmHB.home_due(1062.0)
     check("App Home cadence: 1 s while the tab is open (60 s after app_home_opened), ~2 s after an event, 30 s heartbeat, never faster — owner rule",
           not quiet and heartbeat and not ev_fast and ev_2s and burst and not after)
+    dmPR = Daemon(use_slack=False); dmPR.use_slack = True
+    dmPR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
+    dmPR.home_at, dmPR.home_burst_until = 2000.0, 0.0
+    presPR = {"v": "active"}; seenPR = []
+    _apiPR = globals()["api"]
+    globals()["api"] = lambda m, tok, **p: (seenPR.append((m, p.get("user"))), {"presence": presPR["v"]})[1]
+    try:
+        dmPR.presence_poll(2000.0); active = dmPR.home_due(2001.0)                       # on Slack: every second
+        dmPR.presence_at = 0.0; presPR["v"] = "away"; dmPR.presence_poll(2100.0)         # just went idle…
+        dmPR.home_at = 2100.0; grace = dmPR.home_due(2101.0)                             # …one more minute of 1 s
+        dmPR.home_at = 2161.0; cooled = dmPR.home_due(2162.0); beat = dmPR.home_due(2191.0)
+        dmPR.presence_at = 2161.0; dmPR.presence_poll(2170.0); throttled = len(seenPR)   # …and one call per 30 s, not per tick
+    finally:
+        globals()["api"] = _apiPR
+    check("App Home follows the owner's Slack: active → every second; a minute of grace after they go idle; then the 30 s "
+          "heartbeat again — one users.getPresence per 30 s, never per tick",
+          active and grace and not cooled and beat and throttled == 2 and seenPR[0] == ("users.getPresence", "UOWNER"))
     dmMM = Daemon(use_slack=False); dmMM.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmMM.bot_user = "UBOT"
     mm_calls = []
     def mm_run(a, **k):
