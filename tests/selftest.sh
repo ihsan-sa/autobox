@@ -241,7 +241,7 @@ cat > "$T/creditprobe" <<'F'
 printf '{"subtype":"success","is_error":true,"result":"You'"'"'re out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage, to continue."}'; exit 1
 F
 chmod +x "$T/creditprobe"
-mline "Claude usage limit reached for Fable 5. Your limit resets at 14:40."
+mline "You are out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models."
 ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/creditprobe" "$B/cc-model" tick
 [ "$(M status)" = "opus until probe" ] && ok "\"out of usage credits\" counts as limited (whatever the exit status)" || bad "credit exhaustion not treated as a limit: $(M status)"
 rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen"; : > "$MH/.cc/state/model.log"
