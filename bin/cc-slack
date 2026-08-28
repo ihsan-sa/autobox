@@ -590,9 +590,83 @@ def home_units():
     return [(n, i < len(got) and got[i] == "active") for i, (n, _) in enumerate(HOME_UNITS)]
 
 
-def home_load():
+RAPL = "/sys/class/powercap/intel-rapl:0/energy_uj"             # package energy counter, µJ (root-only until a udev rule opens it)
+_METRIC_PREV = {}                                              # counters from the last dashboard refresh: CPU busy, RAPL energy
+
+
+def _readfile(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def home_cpu(now):
+    """Busy % since the previous refresh, from /proc/stat's own counters (no sampling sleep, nothing to install)."""
+    parts = _readfile("/proc/stat").split("\n")[0].split()[1:]
+    if not parts:
+        return None
+    v = [int(x) for x in parts if x.isdigit()]
+    total, idle = sum(v), sum(v[3:5])                          # idle + iowait
+    prev = _METRIC_PREV.get("cpu")
+    _METRIC_PREV["cpu"] = (total, idle)
+    if not prev or total <= prev[0]:
+        return None                                            # first look (or a counter reset): no delta to report yet
+    dt, di = total - prev[0], idle - prev[1]
+    return max(0.0, min(100.0, 100.0 * (dt - di) / dt))
+
+
+def home_watts(now):
+    """Package power draw in W, from the RAPL energy counter's delta. Needs the counter to be readable (udev rule
+    60-rapl-readable.rules); without it, or before the second reading, there is simply no watt figure."""
+    raw = _readfile(RAPL)
+    if not raw.isdigit():
+        return None
+    uj = int(raw)
+    prev = _METRIC_PREV.get("rapl")
+    _METRIC_PREV["rapl"] = (now, uj)
+    if not prev or now - prev[0] < 1 or uj < prev[1]:          # the counter wraps: skip that one interval
+        return None
+    return (uj - prev[1]) / 1e6 / (now - prev[0])
+
+
+def home_temp():
+    """The warmest CPU-ish thermal zone in °C (x86_pkg_temp / coretemp / acpitz), or None on a box without them."""
+    best = None
+    for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        t = _readfile(f"{z}/temp")
+        if t.lstrip("-").isdigit() and _readfile(f"{z}/type") in ("x86_pkg_temp", "coretemp", "acpitz", "cpu-thermal"):
+            best = max(best or -273, int(t) / 1000)
+    return best
+
+
+def home_load(now=None):
+    """The box's own vitals, one line: disk · RAM · swap (only when in use) · CPU % · load · package watts · temp · uptime.
+    Every figure is a plain file read; the CPU and watt figures are deltas between dashboard refreshes."""
+    now = time.time() if now is None else now
     v = os.statvfs("/")
-    return f"💽 {100 - v.f_bavail * 100 // max(1, v.f_blocks)}% of {v.f_frsize * v.f_blocks >> 30}G   ·   📈 {os.getloadavg()[0]:.2f}"
+    mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", _readfile("/proc/meminfo"), re.M))
+    tot, avail = int(mem.get("MemTotal", 0)), int(mem.get("MemAvailable", 0))
+    sw, swf = int(mem.get("SwapTotal", 0)), int(mem.get("SwapFree", 0))
+    out = [f"💽 {100 - v.f_bavail * 100 // max(1, v.f_blocks)}% of {v.f_frsize * v.f_blocks >> 30}G"]
+    if tot:
+        out.append(f"🧠 {(tot - avail) / 1048576:.1f}/{tot / 1048576:.0f}G ({100 - avail * 100 // tot}%)")
+    if sw and sw - swf > 64 * 1024:                            # swap only shows once something is actually in it
+        out.append(f"🔁 swap {(sw - swf) / 1048576:.1f}G")
+    cpu = home_cpu(now)
+    out.append(f"⚙️ {cpu:.0f}%   ·   📈 {os.getloadavg()[0]:.2f}" if cpu is not None else f"📈 {os.getloadavg()[0]:.2f}")
+    w = home_watts(now)
+    if w is not None:
+        out.append(f"⚡ {w:.1f}W")
+    t = home_temp()
+    if t is not None:
+        out.append(f"🌡 {t:.0f}°C")
+    up = _readfile("/proc/uptime").split(" ")[0]
+    if up.replace(".", "").isdigit():
+        h = float(up) / 3600
+        out.append(f"⏱ up {h / 24:.1f}d" if h >= 48 else f"⏱ up {h:.1f}h")
+    return "   ·   ".join(out)
 
 
 def home_workers():
@@ -4570,6 +4644,24 @@ def cmd_selfcheck():
           "ours from before a restart is adopted and still comes off",
           marksBZ == [("50.0", "hammer_and_wrench", False)] and held1 and gone
           and rmBZ == [("hammer_and_wrench", True), ("hammer_and_wrench", True)] and adopted and "repo" not in dmBZ.working)
+    _mp = dict(_METRIC_PREV); _METRIC_PREV.clear()
+    with tempfile.NamedTemporaryFile("w", suffix=".uj", delete=False) as fW:
+        fW.write("1000000")
+    _rapl = globals()["RAPL"]; globals()["RAPL"] = fW.name
+    try:
+        w0 = home_watts(1000.0)                                  # first look: a counter, not yet a rate
+        open(fW.name, "w").write("5000000")                      # +4 J over 2 s = 2 W
+        w1 = home_watts(1002.0)
+        _METRIC_PREV.pop("rapl", None); home_watts(1000.0)
+        open(fW.name, "w").write("10")                           # the counter wrapped: no reading, never a negative one
+        w2 = home_watts(1002.0)
+        vitals = home_load()
+    finally:
+        globals()["RAPL"] = _rapl; os.unlink(fW.name); _METRIC_PREV.clear(); _METRIC_PREV.update(_mp)
+    check("Home vitals: watts come from the energy counter's delta (none on the first look or across a wrap), and the line "
+          "carries disk, RAM, load and uptime",
+          w0 is None and abs(w1 - 2.0) < 0.01 and w2 is None
+          and all(x in vitals for x in ("💽", "🧠", "📈", "⏱")))
     check("Home: a finished track leaves the dashboard as soon as it is done/merged unless its PR still waits for a 👍",
           home_track_shown("running", None) and home_track_shown("blocked", None) and not home_track_shown("done", None)
           and not home_track_shown("merged", "MERGED") and home_track_shown("done", "OPEN/APPROVED"))

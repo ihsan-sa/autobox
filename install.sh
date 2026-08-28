@@ -88,6 +88,11 @@ if [ "$etc" = 1 ]; then
     if [ -f "$h.bak" ]; then sudo mv -f "$h.bak" "$h"; else sudo rm -f "$h"; fi
     echo "install.sh: sshd -t rejected the new $h — restored the previous sshd config, nothing changed" >&2; exit 1
   fi
+  if [ -f "$E/60-rapl-readable.rules" ]; then   # the dashboard's watt figure: one read-only sysfs counter
+    sudo install -m 644 "$E/60-rapl-readable.rules" /etc/udev/rules.d/60-rapl-readable.rules
+    sudo udevadm control --reload-rules 2>/dev/null || true
+    sudo udevadm trigger --subsystem-match=powercap --action=change 2>/dev/null || true
+  fi
   echo "/etc configs installed (sshd -t passed)"
 fi
 [ -n "$O" ] && git -C "$O" rev-parse --git-dir >/dev/null 2>&1 &&
