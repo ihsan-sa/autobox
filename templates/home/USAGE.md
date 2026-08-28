@@ -10,7 +10,7 @@ Shallow first. Each section: the 2–3 things you actually type. Details: `core/
 ## Sessions (`cc`)
 - `cc <repo>` — planning session for `~/dev/<repo>` (main branch; plans, dispatches, reviews PRs; never merges).
 - `cc <repo> <track>` — a worker session on its own worktree + branch `track/<track>`. Auto-commits + pushes after every turn. Finish with `cc done <repo> <track>` → PR.
-- `cc <repo> --orch <alias>` — a peer orchestrator session in the primary worktree (planning-session conventions), addressable in that repo's Slack channel as `@<alias>` alongside the main session.
+- `cc <repo> --orch <alias> ["brief"]` — a peer orchestrator session in the primary worktree (planning-session conventions), addressable in that repo's Slack channel as `@<alias>` alongside the main session **and in its own channel** `#<parent>-<alias>-<id>` (created on start, nested when an orch spawns an orch, no `@` needed in there; routing table `~/.cc/slack/orchs.json`). Archived when the session exits, by `cc slack archive <#chan>`, or by the daily janitor 24 h after the orch is gone.
 - `cc resume` — menu of all sessions by name/status. `cc ls` / `cc digest` — what's running and where things stand.
 - Reconnect = same `cc …` command; it reattaches to the live session. `cc -c <repo> [track]` only if the process died.
 

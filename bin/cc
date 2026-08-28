@@ -8,6 +8,7 @@
 #                             autonomous headless worker (ralph loop via cc-loop) on that track; ends with a PR
 #                             --go "" re-dispatches the task.md already there (e.g. after answering a BLOCKED)
 #   cc <repo> <track> --say "text"           type text into that track's running interactive session
+#   cc <repo> --orch <alias> ["brief"]       peer orchestrator session, its own Slack channel (archived when it exits)
 #   cc handoff <repo> <track> ask the running session to journal a handoff, then restart it with fresh context
 #   cc resume                 menu of every session (mains + tracks) -> pick to reattach/resume
 #   cc ls | cc digest         live windows + board status | full digest (cc digest --notify pushes it)
@@ -15,7 +16,7 @@
 #   cc done <repo> <track>    push + open a PR into the default branch (nothing auto-merges)
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
 #   cc board <args>           shared board (cc board show <repo>)      cc -c <repo> [track]  force --continue
-#   cc slack on|off|status|setup|channels|mkchannel <repo>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session, DMs the box
+#   cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session, DMs the box
 #   cc rc status|restart      the always-on boot session (window box); restart to pick up new flags (ends its conversation)
 set -uo pipefail
 # Every session and worker starts through this script. Panes spawned from a systemd-started client (boot, cc-slackd) arrive without ~/bin,
@@ -36,7 +37,7 @@ default_branch(){ git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/H
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
 lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,19p' "$0"; }
+usage(){ sed -n '2,20p' "$0"; }
 
 ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
   local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base
@@ -75,8 +76,8 @@ case "${1:-}" in
            echo "cc-slack on: sessions started from now on carry the Slack channel. Live sessions pick it up after a restart (cc handoff <repo> <track>; boot session: cc rc restart)."
            "$BIN/cc-slack" status;;
       off) rm -f "$SLACKON"; "$CLAUDE" mcp remove --scope user cc-slack >/dev/null 2>&1; systemctl --user disable --now cc-slackd.service; echo "cc-slack off: new sessions have no Slack channel; live ones keep theirs until restarted";;
-      setup|channels|status|mkchannel|manifest) shift; exec "$BIN/cc-slack" "$@";;
-      *) echo "cc slack on|off|status|setup|channels|mkchannel <repo>|manifest"; exit 1;;
+      setup|channels|status|mkchannel|archive|orch-channel|manifest) shift; exec "$BIN/cc-slack" "$@";;
+      *) echo "cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest"; exit 1;;
     esac; exit 0 ;;
   rc)  # cc rc status|restart — the always-on boot session (window "box": cc-rc → Remote Control "$(hostname)", Slack target "box")
     case "${2:-status}" in
@@ -119,7 +120,9 @@ case "${1:-}" in
     [ -f "$STBASE/$repo/$track/task.md" ] && instr="$(cat "$STBASE/$repo/$track/task.md")"
     url=$(cd "$wt" && gh pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null)   # `gh pr view` also returns a MERGED PR and would silently reuse it
     [ -z "$url" ] && url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$(printf '%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$track" "$repo" "$track")" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
-    if [ -n "$url" ]; then "$BOARD" set "$repo" "$track" pr "$url"; "$BOARD" status "$repo" "$track" review >/dev/null; echo "PR: $url"; [ -f "$SLACKON" ] && "$BIN/cc-slack" post-approval "$repo" "$url" >/dev/null 2>&1 || true; else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi; exit 0 ;;
+    if [ -n "$url" ]; then "$BOARD" set "$repo" "$track" pr "$url"; "$BOARD" status "$repo" "$track" review >/dev/null; echo "PR: $url"; [ -f "$SLACKON" ] && "$BIN/cc-slack" post-approval "$repo" "$url" >/dev/null 2>&1 || true; else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi
+    [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$track" >/dev/null 2>&1   # if that name was an orch with its own channel, it is done: archive it
+    exit 0 ;;
   rm)
     repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"; wt="$WTBASE/$repo/$track"
     real=$(readlink -f "$wt" 2>/dev/null); [ -n "$real" ] || real=$(readlink -m "$wt")
@@ -161,10 +164,12 @@ case "${1:-}" in
     "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
     repo="$2"; alias="$3"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
-    sp="You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d; dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR). Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'."
+    sp="You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d, and every thread in your OWN channel (#<parent>-$alias-<id>, created for you — no @ needed there; your replies land wherever the message came from). Dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR); an orch you spawn with 'cc $repo --orch <alias> \"<brief>\"' gets its own channel under yours. Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'."
     export CC_SLACK_ALIAS="$alias"
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo@$alias"
-    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}"
+    [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$alias" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
+    echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runplain)  # internal: plain session in a folder that is not a git repo
     repo="$2"; cont="${3:-}"; cd "$DEV/$repo" || exit 1
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
@@ -177,10 +182,15 @@ repo="${1:?repo}"; track="${2:-}"; shift; [ -n "$track" ] && shift
 valid_name "$repo"
 ensure_main; "$BIN/cc-trust" "$DEV/$repo" >/dev/null 2>&1 || true
 if [ "$track" = "--orch" ]; then
-  alias="${1:-}"; [[ "$alias" =~ ^[a-z0-9-]{2,20}$ ]] || { echo "cc: --orch alias must match ^[a-z0-9-]{2,20}\$"; exit 1; }
+  alias="${1:-}"; brief="${2:-}"; [[ "$alias" =~ ^[a-z0-9-]{2,20}$ ]] || { echo "cc: --orch alias must match ^[a-z0-9-]{2,20}\$"; exit 1; }
   win="$repo@$alias"; lock "$HOME/.cc/win.lock"
   have_window "$win" || tmux new-window -d -t "$SESSION" -n "$win" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runorch %q %q' "$CLAUDE" "$SELF" "$repo" "$alias")"
-  unlock; [ -t 0 ] && tmux select-window -t "$(win_id "$win")"; attach_main; exit 0
+  unlock
+  if [ -f "$SLACKON" ]; then   # its own channel, once (nested under the spawner's when an orch spawns an orch); @alias in #<repo> keeps working either way
+    oc=("$BIN/cc-slack" orch-channel "$repo" "$alias"); [ -n "${CC_SLACK_ALIAS:-}" ] && oc+=(--parent-alias "$CC_SLACK_ALIAS"); [ -n "$brief" ] && oc+=(--brief "$brief")
+    ( "${oc[@]}" >/dev/null 2>&1 & )
+  fi
+  [ -t 0 ] && tmux select-window -t "$(win_id "$win")"; attach_main; exit 0
 fi
 case "$track" in --*) echo "cc: '$track' is an option, not a track — use: cc $repo <track> $track ..."; exit 1;; ?*) valid_name "$track";; esac
 if [ -z "$track" ]; then

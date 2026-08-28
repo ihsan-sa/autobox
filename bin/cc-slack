@@ -15,12 +15,17 @@
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md   pin a message · replace a channel canvas
   cc-slack status | channels | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>
   cc-slack mkchannel <name>… [--private]   create #<name> if missing, join it, invite the owner, set the topic (one per project)
+  cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]   give a sub-orchestrator its own channel
+                                      <parent name minus its id>-<alias>-<4 base36 chars>; recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it)
+  cc-slack archive <#chan|C…> | archive --orch <target> <alias>   archive a sub-orch channel; it stops routing and leaves the Home tab
   cc-slack selfcheck                  unit checks (no Slack needed); tests/selftest.sh runs it
   cc-slack manifest --print | --config-token xoxe.xoxp-… --app A0…   paste-ready manifest (placeholders filled) | push it onto an existing app;
                                       the owner still taps Reinstall (bot token) and generates the app-level token
 
 Routing: Slack #<repo> → planning session of ~/dev/<repo>; #<repo>--<track> → that track's session; DMs and #box →
-the box's own boot Remote-Control session (tmux window "box", target "box"). Extend/override in ~/.cc/slack/routes.json
+the box's own boot Remote-Control session (tmux window "box", target "box"). A sub-orchestrator gets its OWN channel
+(~/.cc/slack/orchs.json: chat -> target/alias/parent): a message there reaches that orch exactly as an "@alias" in the
+repo channel does, and an "@main"/"@other" there still hands the thread over. Extend/override in ~/.cc/slack/routes.json
 ({"C0123…": "myapp", "#ops": "box"}). Only the paired owner (SLACK_OWNER_ID) is heard; everyone else is dropped.
 In-Slack commands (owner only, any channel or thread): `!help !ping !status !digest !sessions !start !say !threads !box`
 `!restart <box|repo[/track]|slack|tmux>` and `!reboot` (both confirm-gated). A `!command` root is never a tracked thread.
@@ -73,6 +78,11 @@ REACTION_CHAR = {"+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "
                  "eyes": "👀", "heavy_check_mark": "✔️", "raised_hands": "🙌", "tada": "🎉"}   # what the owner's reaction is called when we hand it to a session
 OUR_ANSWER_SKIP = (frozenset(STATUS_NAMES) - {"white_check_mark"}) | {"eyes", "checkered_flag"}   # our OWN reactions that answer nothing:
                                                                # 👀 only says "received", the marks and a 🏁 are bookkeeping
+ORCHS = "orchs.json"                                           # {"<chat>": {target, alias, parent, name, created, seen, archived}}: a sub-orch's OWN channel
+ORCH_ID_RE = re.compile(r"-[a-z0-9]{4}$")                      # the 4-char tail an orch channel name ends with (stripped when it spawns its own)
+ORCH_IDLE = 24 * 3600                                          # an orch channel whose orch window has been gone this long is archived (daily janitor)
+CHAN_MAX = 80                                                  # Slack's cap on a channel name
+B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 FLAGS = "flags.json"                                           # {"<chat>:<root_ts>": <flag_ts>}: WHEN the owner 🏁'd a thread (a newer message re-opens it)
 STALE_AFTER = 48 * 3600                                        # a thread quiet this long leaves the buckets (and loses its mark)
 STALL_AFTER = 30 * 60                                          # the owner's last word unanswered this long = a stalled session
@@ -298,6 +308,81 @@ def load_routes():
         return {}
 
 
+def load_orchs():
+    """The sub-orchestrator routing table (see ORCHS): a message in one of these channels belongs to that repo's orch for
+    that alias, exactly like an `@alias` in the repo channel. Read from disk on every use, like routes.json — one small
+    file read, and no cache to invalidate when the CLI (`cc slack archive`) writes it under a running daemon."""
+    try:
+        d = json.load(open(f"{DIR}/{ORCHS}"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_orchs(orchs):
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        tmp = f"{DIR}/{ORCHS}.tmp"
+        with open(tmp, "w") as f:
+            os.fchmod(f.fileno(), 0o600); json.dump(orchs, f)
+        os.replace(tmp, f"{DIR}/{ORCHS}")
+    except Exception as e:
+        log(f"orchs: save failed: {e!r}")
+
+
+def orch_lookup(orchs, target, alias):
+    """The live (non-archived) channel of <target>@<alias>, or None."""
+    return next((c for c, e in orchs.items() if not e.get("archived") and e.get("target") == target
+                 and e.get("alias") == alias), None)
+
+
+def orch_id(at=None):
+    """4 lowercase base36 chars from the spawn time — short, unique enough (it cycles every ~19 days) and derivable in a test."""
+    n, out = int(at if at is not None else time.time()), ""
+    while n:
+        n, r = divmod(n, 36); out = B36[r] + out
+    return (out or "0")[-4:].rjust(4, "0")
+
+
+def orch_chan_name(parent_name, alias, at=None, parent_is_orch=False):
+    """`<parent channel name minus its own id>-<alias>-<id>` — so #myrepo → myrepo-helper-k7q2, and an orch spawned from
+    myrepo-helper-k7q2 gets myrepo-helper-<alias>-<newid> (ONE id, always at the end). Lowercase, [a-z0-9-], ≤ 80 chars:
+    the base is trimmed, never the alias or the id, so the name stays unique."""
+    slug = lambda x: re.sub(r"[^a-z0-9-]+", "-", (x or "").lower()).strip("-")
+    base = ORCH_ID_RE.sub("", parent_name or "") if parent_is_orch else (parent_name or "")
+    tail = f"-{slug(alias) or 'orch'}-{orch_id(at)}"
+    return (slug(base)[:max(0, CHAN_MAX - len(tail))].rstrip("-") + tail).lstrip("-")[:CHAN_MAX]
+
+
+def orch_purpose(brief, by, at=None, link=""):
+    """The channel purpose: the brief's first line (≤150 chars) + who spawned it, when, and the thread it came from."""
+    first = (brief or "").strip().splitlines()
+    head = " ".join(first[0].split())[:150] if first else ""
+    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(at if at is not None else time.time()))
+    return " · ".join(x for x in (head, f"spawned by {by} {when}" + (f" from {link}" if link else "")) if x)[:250]
+
+
+def home_chan_order(known, orchs):
+    """[(chat, name, depth)] for the dashboard: a sub-orch channel is a CHILD of the channel it was spawned from —
+    parents first (by name), children under them by creation, depth = how deep to indent. Archived orch channels are
+    gone from Home entirely (they no longer route either)."""
+    rows = [(c, n) for c, n in known if not (orchs.get(c) or {}).get("archived")]
+    ids, kids, tops = {c for c, _ in rows}, collections.defaultdict(list), []
+    for c, n in rows:
+        parent = (orchs.get(c) or {}).get("parent")
+        (kids[parent] if parent in ids and parent != c else tops).append((c, n))
+    out, seen = [], set()
+    def walk(chat, name, depth):
+        if chat in seen:
+            return                                     # a hand-edited table could name a cycle: render each channel once
+        seen.add(chat); out.append((chat, name, depth))
+        for kc, kn in sorted(kids.get(chat, ()), key=lambda r: float((orchs.get(r[0]) or {}).get("created") or 0)):
+            walk(kc, kn, depth + 1)
+    for c, n in sorted(tops, key=lambda r: r[1]):
+        walk(c, n, 0)
+    return out
+
+
 def load_flags():
     """The owner's 🏁 per thread: {"<chat>:<root_ts>": <flag_ts>}. Slack never tells us how old a reaction is and the bot may
     not remove the owner's, so the flag TIME is ours to keep: a message newer than it re-opens the thread, and a restart
@@ -443,7 +528,8 @@ def home_blocks(st):
                                                                       + "   ·   " + st.get("load", "")).strip(" ·")[:2900] or "·"}]}]
     if st.get("limit"):
         b.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"⏳ Claude {st['limit']}"[:2900]}]})
-    lines = [f"*#{c['name']}* · {c['session']} · {c['marks']}" for c in st.get("channels", ())][:40]
+    lines = ["    " * c.get("depth", 0) + ("↳ " if c.get("depth") else "")   # a sub-orch's channel sits indented under its parent
+             + f"*#{c['name']}* · {c['session']} · {c['marks']}" for c in st.get("channels", ())][:40]
     b += [{"type": "divider"}, _home_sec("*Channels*\n" + ("\n".join(lines) or "_none yet_"))]
     fields = [f"{t['emoji']} *{t['name']}* · {t['status']}\n{t['detail']}"[:HOME_MAXFIELD] for t in st.get("tracks", ())][:60]
     b += [{"type": "divider"}, _home_sec("*Work*" if fields else "*Work*\n_no tracks_")]
@@ -677,6 +763,19 @@ class Daemon:
                 res = self.deliver(target, {"type": "message", "content": first.get("content", ""), "meta": meta},
                                    autostart=first.get("start", True))
                 c.sendall((json.dumps({"ok": True, "result": res}) + "\n").encode())
+            elif "orch" in first:                   # {"orch": target, "alias":…, "parent_alias":…, "brief":…} — `cc <repo> --orch <alias>`
+                try:
+                    res = self.ensure_orch_channel(first["orch"], first.get("alias") or "",
+                                                   first.get("parent_alias") or None, first.get("brief") or "")
+                except Exception as e:
+                    log(f"orch channel: {e!r}"); res = {"ok": False, "error": str(e)[:200]}
+                c.sendall((json.dumps(res) + "\n").encode())
+            elif "archive" in first:                  # {"archive": chat|"", "target":…, "alias":…}
+                try:
+                    res = self.archive_orch(first.get("archive") or None, first.get("target"), first.get("alias"))
+                except Exception as e:
+                    log(f"archive: {e!r}"); res = {"ok": False, "error": str(e)[:200]}
+                c.sendall((json.dumps(res) + "\n").encode())
             elif "status" in first:
                 with self.lock:
                     subs = {t: [x.info.get("alias") for x in v] for t, v in self.subs.items() if v}
@@ -784,6 +883,98 @@ class Daemon:
         if member:
             self.say(cid, text)
 
+    def permalink(self, chat, ts):
+        """Slack link to one message, for the channel purpose ("… from <link>"). Best effort: no link is not an error."""
+        try:
+            return api("chat.getPermalink", self.cfg.get("SLACK_BOT_TOKEN"), channel=chat, message_ts=ts).get("permalink") or ""
+        except Exception:
+            return ""
+
+    def orch_parent(self, target, parent_alias=None):
+        """(chat, name) of the channel the SPAWNING session lives in: its own orch channel when an orch spawns an orch,
+        else the repo's #<repo>[--<track>] channel. (None, None) if we cannot see one."""
+        if parent_alias:
+            orchs = load_orchs()
+            cid = orch_lookup(orchs, target, parent_alias)
+            if cid:
+                return cid, orchs[cid].get("name") or self.chan_name(cid)
+        try:
+            cid, _member = find_channel(self.cfg, target.replace("/", "--"))
+        except Exception as e:
+            log(f"orch parent {target}: {e!r}"); return None, None
+        return (cid, self.chan_name(cid)) if cid else (None, None)
+
+    def ensure_orch_channel(self, target, alias, parent_alias=None, brief="", at=None):
+        """Give <target>@<alias> its own channel if it has none: created/joined/owner-invited like `cc-slack mkchannel`,
+        purpose = the brief + who spawned it, recorded in orchs.json (that IS the routing table), and announced with ONE
+        line in the parent thread that asked for it. Idempotent: an orch that already has a live channel keeps it."""
+        if not (valid_target(target) and re.fullmatch(r"[a-z0-9-]{2,20}", alias or "")):
+            return {"ok": False, "error": "bad target/alias"}
+        if not self.cfg.get("SLACK_BOT_TOKEN"):
+            return {"ok": False, "error": "no SLACK_BOT_TOKEN"}
+        orchs = load_orchs()
+        cid = orch_lookup(orchs, target, alias)
+        if cid:
+            return {"ok": True, "created": False, "channel": cid, "name": orchs[cid].get("name")}
+        at = time.time() if at is None else at
+        pchat, pname = self.orch_parent(target, parent_alias)
+        name = orch_chan_name(pname or target.replace("/", "--"), alias, at, bool(pchat and pchat in orchs))
+        cid, how = ensure_channel(self.cfg, name)
+        last = self.last_chat.get(target)
+        thread = last[1] if last and pchat and last[0] == pchat else None    # the thread that asked for it, if we know it
+        try:
+            api("conversations.setPurpose", self.cfg["SLACK_BOT_TOKEN"], channel=cid,
+                purpose=orch_purpose(brief, f"{target}@{parent_alias}" if parent_alias else target, at,
+                                     self.permalink(pchat, thread) if thread else ""))
+        except Exception as e:
+            log(f"orch channel #{name}: purpose: {e!r}")   # a purpose is decoration; the channel and the route are what matter
+        orchs[cid] = {"target": target, "alias": alias, "parent": pchat, "name": name,
+                      "created": at, "seen": at, "archived": False}
+        save_orchs(orchs)
+        self.names[cid] = name
+        self.known_aliases[target].add(alias)
+        log(f"orch channel #{name} ({cid}) {how} for {target}@{alias}")
+        if pchat:
+            self.say(pchat, f"🤖 @{alias} has its own channel: #{name}", thread)
+        return {"ok": True, "created": True, "channel": cid, "name": name}
+
+    def archive_orch(self, chat=None, target=None, alias=None):
+        """The orch finished (its session exited, `cc slack archive`, or the janitor): archive the channel and stop
+        routing it. Idempotent — an unknown or already-archived channel is a no-op, never an error."""
+        orchs = load_orchs()
+        cid = chat or (orch_lookup(orchs, target, alias) if target and alias else None)
+        if not cid or cid not in orchs:
+            return {"ok": True, "archived": False, "channel": cid, "error": "no orch channel"}
+        if orchs[cid].get("archived"):
+            return {"ok": True, "archived": False, "channel": cid, "name": orchs[cid].get("name")}
+        ok = archive_channel(self.cfg, cid, orchs)
+        if ok:
+            save_orchs(orchs)
+            log(f"orch channel #{orchs[cid].get('name')} ({cid}) archived")
+        return {"ok": ok, "archived": ok, "channel": cid, "name": orchs[cid].get("name")}
+
+    def orch_sweep(self):
+        """Stamp every orch channel whose orch is up, and archive one that has been gone for ORCH_IDLE (the daily janitor,
+        riding the 15 min sweep): an orch channel outlives its orch by at most a day, and archived never routes again."""
+        orchs = load_orchs()
+        live = {c for c, e in orchs.items() if not e.get("archived")}
+        if not live:
+            return
+        wins, now, dirty = home_windows(), time.time(), False
+        for cid in live:
+            e = orchs[cid]
+            target, alias = e.get("target"), e.get("alias")
+            with self.lock:
+                up = any((c.info.get("alias") or None) == alias for c in self.subs.get(target, ()))
+            if up or f"{target}@{alias}" in wins:
+                if now - float(e.get("seen") or 0) > 300:
+                    e["seen"] = now; dirty = True
+            elif now - float(e.get("seen") or e.get("created") or now) >= ORCH_IDLE and archive_channel(self.cfg, cid, orchs):
+                log(f"orch janitor: #{e.get('name')} archived — {target}@{alias} gone for {ORCH_IDLE // 3600} h")
+                dirty = True
+        if dirty:
+            save_orchs(orchs)
+
     def user_name(self, uid):
         if uid not in self.users:
             try:
@@ -794,6 +985,9 @@ class Daemon:
         return self.users[uid]
 
     def route(self, chat, ctype):
+        e = load_orchs().get(chat)                       # a sub-orch's own channel: every message there is that orch's (chan_alias)
+        if e and not e.get("archived"):
+            return e.get("target") if valid_target(e.get("target")) else None
         if ctype == "im":
             return "box"
         routes = load_routes()
@@ -803,19 +997,32 @@ class Daemon:
             t = name.replace("--", "/", 1)
         return t if valid_target(t) else None
 
+    def chan_alias(self, chat):
+        """The orch a whole channel belongs to (None = the repo's main session): in an orch's OWN channel a plain message
+        is its message, no @token needed — an @main / @<other> there still hands the thread over."""
+        e = load_orchs().get(chat) or {}
+        return None if e.get("archived") else (e.get("alias") or None)
+
+    def aliases_for(self, target):
+        """Aliases whose @token we honour: the ones that subscribed this daemon life, plus every live orch CHANNEL's —
+        the table is on disk, so routing survives a daemon restart the in-memory set does not."""
+        return set(self.known_aliases.get(target, ())) | {e["alias"] for e in load_orchs().values()
+                                                          if e.get("alias") and not e.get("archived") and e.get("target") == target}
+
     def update_owner(self, target, chat, thread, in_thread, text):
         """@token ownership bookkeeping, run for every author (bot included) before the owner gate. Returns the
-        delivery alias for a live-or-known conn (None = main)."""
+        delivery alias for a live-or-known conn (None = main; an orch channel's own alias unless a token says otherwise)."""
+        base = self.chan_alias(chat)
         tok = at_token(text, self.bot_user)
-        if tok and (tok in (target, "main") or tok in self.known_aliases.get(target, ())):
+        if tok and (tok in (target, "main") or tok in self.aliases_for(target)):
             alias = None if tok in (target, "main") else tok
             self.thread_owner[(chat, thread)] = alias
             return alias
         if not in_thread:
-            return None
+            return base
         key = (chat, thread)
         if key not in self.thread_owner:
-            self.thread_owner[key] = self.scan_owner(target, chat, thread)
+            self.thread_owner[key] = self.scan_owner(target, chat, thread, base)
         return self.thread_owner[key]
 
     def notify_owner_change(self, target, chat, thread, new, old):
@@ -828,18 +1035,19 @@ class Daemon:
                               "content": f"🔁 this thread was handed to you by {frm} — read it and pick it up."},
                      autostart=False, alias=new)
 
-    def scan_owner(self, target, chat, thread):
-        """Cache-miss fallback: the thread's newest 20 messages (cursor-paginated), scanned backwards for an @token/username-suffix alias."""
+    def scan_owner(self, target, chat, thread, default=None):
+        """Cache-miss fallback: the thread's newest 20 messages (cursor-paginated), scanned backwards for an @token/username-suffix
+        alias. No token anywhere → `default` (the channel's own orch, or main)."""
         try:
             msgs = replies_tail(self.cfg, chat, thread, 20)
         except Exception:
-            return None
+            return default
         for m in reversed(msgs):
             uname = m.get("username") or ""
             tok = at_token((m.get("text") or "").strip()) or (uname.rsplit(" · ", 1)[-1] if " · " in uname else None)
-            if tok and (tok in (target, "main") or tok in self.known_aliases.get(target, ())):
+            if tok and (tok in (target, "main") or tok in self.aliases_for(target)):
                 return None if tok in (target, "main") else tok
-        return None
+        return default
 
     def clean(self, text):
         if self.bot_user:
@@ -1238,7 +1446,7 @@ class Daemon:
         msg, root = self.reacted_message(chat, ts)
         if not msg or not self.is_ours(msg):
             return None                                    # their reaction on their own (or a stranger's) message tells a session nothing
-        alias = self.thread_owner.get((chat, root))
+        alias = self.thread_owner.get((chat, root), self.chan_alias(chat))
         with self.lock:
             if not any((c.info.get("alias") or None) == alias for c in self.subs.get(target, [])):
                 return None                                # the session that owns this thread is not up
@@ -1778,6 +1986,7 @@ class Daemon:
                 self.reconcile_reactions(chat)
             except Exception as e:
                 log(f"sweep: {chat}: {e!r}")
+        self._safe(self.orch_sweep)
 
     def unstick(self):
         """Every tick: for each target with queued messages and a live window that has not subscribed for 30 s, press any
@@ -2059,17 +2268,20 @@ class Daemon:
         if time.time() - self.home_slow_at > HOME_SLOW and not self.home_slow_busy:
             self.home_slow_busy = True
             threading.Thread(target=self._safe, args=(self.home_slow_refresh,), daemon=True).start()
-        wins, chans = home_windows(), []
+        wins, chans, orchs = home_windows(), [], load_orchs()
         known = self.home_chans or sorted((c, self.names.get(c, c)) for c in     # before the first refresh: what we already know
                                           {c for c, _ in list(self.last_chat.values())} | set(self.board))
-        for chat, name in known:
+        for chat, name, depth in home_chan_order(known, orchs):
             self.names.setdefault(chat, name)              # route() resolves the name: we already have it, don't pay conversations.info
             target = self.route(chat, "im" if str(chat).startswith("D") else None)
+            alias = (orchs.get(chat) or {}).get("alias")   # a sub-orch channel reports ITS orch, not the repo's main session
+            with self.lock:
+                live = any((c.info.get("alias") or None) == alias for c in self.subs.get(target, ())) if alias else bool(self.subs.get(target))
             snap = self.snap.get(chat)
             marks = collections.Counter(m for m, _, _ in snap[1] if m in HOME_MARKS) if snap else None   # only what is live
-            chans.append({"name": name,
-                          "session": ("🔧 working" if self.working.get(target) else "🟢 live" if self.subs.get(target) else
-                                      "🟡 idle" if window_for(target) in wins else "⚪ none") if target
+            chans.append({"name": name, "depth": depth,
+                          "session": ("🔧 working" if not alias and self.working.get(target) else "🟢 live" if live else
+                                      "🟡 idle" if (f"{target}@{alias}" if alias else window_for(target)) in wins else "⚪ none") if target
                                      else "◽ not a session",   # #approvals, #alerts: real channels, no session behind them
                           "marks": "–" if marks is None else (" ".join(f"{m}{n}" for m, n in sorted(marks.items())) or "clear")})
         try:
@@ -2530,6 +2742,45 @@ def find_channel(cfg, name):
             return None, False
 
 
+def ensure_channel(cfg, name, private=False):
+    """#name exists, the bot is in it and the owner is invited → (id, "created"|"joined"|"member"). One place for it:
+    `mkchannel` and a sub-orch's own channel are the same three calls (channels:manage covers all of them)."""
+    tok = cfg["SLACK_BOT_TOKEN"]
+    cid, member = find_channel(cfg, name)
+    how = "member"
+    if not cid:
+        cid = api("conversations.create", tok, name=name, is_private="true" if private else "false")["channel"]["id"]; how = "created"
+    elif not member:
+        api("conversations.join", tok, channel=cid); how = "joined"
+    owner = cfg.get("SLACK_OWNER_ID")
+    if owner:
+        try:
+            api("conversations.invite", tok, channel=cid, users=owner)
+        except RuntimeError as e:
+            if "already_in_channel" not in str(e):
+                log(f"invite owner to #{name}: {e}")
+    try:
+        os.unlink(f"{DIR}/channels.json")            # the name→id cache predates this channel
+    except FileNotFoundError:
+        pass
+    return cid, how
+
+
+def archive_channel(cfg, cid, orchs=None):
+    """conversations.archive + mark it archived in the routing table (the caller saves). Already archived / gone counts as
+    done; any other refusal leaves the entry alone, so the channel keeps routing instead of going silently deaf."""
+    ok = True
+    try:
+        api("conversations.archive", cfg["SLACK_BOT_TOKEN"], channel=cid)
+    except Exception as e:
+        ok = any(w in str(e) for w in ("already_archived", "channel_not_found"))
+        if not ok:
+            log(f"archive {cid}: {e!r}")
+    if ok and orchs is not None and cid in orchs:
+        orchs[cid]["archived"] = True
+    return ok
+
+
 def cmd_mkchannel(argv):
     cfg = load_cfg(); tok = cfg.get("SLACK_BOT_TOKEN")
     if not tok:
@@ -2539,21 +2790,8 @@ def cmd_mkchannel(argv):
     if not names:
         print("cc-slack mkchannel <name>… [--private]"); return 2
     for name in names:
-        cid, member = find_channel(cfg, name)
-        if not cid:
-            cid = api("conversations.create", tok, name=name, is_private="true" if private else "false")["channel"]["id"]
-            print(f"created #{name} ({cid})")
-        elif not member:
-            api("conversations.join", tok, channel=cid); print(f"joined existing #{name}")
-        else:
-            print(f"#{name} exists, bot is a member")
-        owner = cfg.get("SLACK_OWNER_ID")
-        if owner:
-            try:
-                api("conversations.invite", tok, channel=cid, users=owner)
-            except RuntimeError as e:
-                if "already_in_channel" not in str(e):
-                    print(f"  invite owner: {e}")
+        cid, how = ensure_channel(cfg, name, private)
+        print(f"created #{name} ({cid})" if how == "created" else f"joined existing #{name}" if how == "joined" else f"#{name} exists, bot is a member")
         target = name.replace("--", "/", 1)
         try:
             api("conversations.setTopic", tok, channel=cid,
@@ -2564,11 +2802,53 @@ def cmd_mkchannel(argv):
         except RuntimeError as e:
             print(f"  topic: {e}")
         print(f"  #{name} → {target if valid_target(target) else '(PR approvals)' if name == APPROVALS else '(unmapped)'}")
-    try:
-        os.unlink(f"{DIR}/channels.json")
-    except FileNotFoundError:
-        pass
     return 0
+
+
+def cmd_orch_channel(argv):
+    """orch-channel <target> <alias> [--parent-alias <a>] [--brief <text>] — `cc <repo> --orch <alias>` calls this so the
+    orch gets its own channel. The DAEMON does the work (it knows the parent thread and is the single writer of orchs.json);
+    with no daemon there is simply no channel — the orch is still reachable as `@alias` in the repo channel."""
+    opts, pos, i = {"--parent-alias": None, "--brief": ""}, [], 0
+    while i < len(argv):
+        if argv[i] in opts:
+            opts[argv[i]] = argv[i + 1] if i + 1 < len(argv) else ""; i += 2
+        else:
+            pos.append(argv[i]); i += 1
+    if len(pos) != 2:
+        print("cc-slack orch-channel <target> <alias> [--parent-alias <a>] [--brief <text>]", file=sys.stderr); return 2
+    try:
+        r = sock_request({"orch": pos[0], "alias": pos[1], "parent_alias": opts["--parent-alias"], "brief": opts["--brief"]}, timeout=60)
+    except Exception as e:
+        print(f"cc-slack orch-channel: daemon not running ({e.__class__.__name__}) — no channel, @{pos[1]} still works in #{pos[0]}", file=sys.stderr); return 1
+    if not r.get("ok"):
+        print(f"cc-slack orch-channel: {r.get('error')}", file=sys.stderr); return 1
+    print(f"#{r.get('name')} ({r.get('channel')}){'' if r.get('created') else ' — already had one'}"); return 0
+
+
+def cmd_archive(argv):
+    """archive <#chan|C…> | --orch <target> <alias> — archive a sub-orch's channel and stop routing it. Plain Web API +
+    the table on disk, so it works with the daemon down (that is the point: `cc` calls it when an orch session exits)."""
+    cfg = load_cfg()
+    if not cfg.get("SLACK_BOT_TOKEN"):
+        print("cc-slack archive: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
+    orchs = load_orchs()
+    if argv[:1] == ["--orch"]:
+        if len(argv) != 3:
+            print("cc-slack archive --orch <target> <alias>", file=sys.stderr); return 2
+        cid = orch_lookup(orchs, argv[1], argv[2])
+        if not cid:
+            print(f"no live orch channel for {argv[1]}@{argv[2]} — nothing to archive"); return 0
+    elif len(argv) == 1 and argv[0]:
+        cid = argv[0] if re.fullmatch(r"[CG][A-Z0-9]+", argv[0]) else (find_channel(cfg, argv[0].lstrip("#").lower())[0] or "")
+        if not cid:
+            print(f"cc-slack archive: no channel {argv[0]}", file=sys.stderr); return 1
+    else:
+        print("cc-slack archive <#chan|C…> | --orch <target> <alias>", file=sys.stderr); return 2
+    ok = archive_channel(cfg, cid, orchs)
+    save_orchs(orchs)
+    print(f"{'archived' if ok else 'could NOT archive'} {cid}" + (f" (#{orchs[cid].get('name')})" if cid in orchs else ""))
+    return 0 if ok else 1
 
 
 def cmd_post_approval(argv):
@@ -4145,6 +4425,101 @@ def cmd_selfcheck():
           and not home_track_shown("merged", "MERGED") and home_track_shown("done", "OPEN/APPROVED"))
     check("our own ✅/🔧 on a root are remembered with their time (and forgotten when taken back); ✅ on the root marks done instantly",
           "CQ:7.0:hammer_and_wrench" in dmOR.marks and "CQ:7.0:white_check_mark" not in dmOR.marks and setOR[0] == "✅")
+    # -- PART 8: sub-orchestrators get their OWN channel (routing table orchs.json, create/archive, Home rows) -------
+    T8 = 1787880617                                   # a fixed spawn time: the 4-char id is derived from it
+    check("orch id: 4 lowercase base36 chars derived from the spawn time",
+          orch_id(T8) == "ghih" and re.fullmatch(r"[a-z0-9]{4}", orch_id(T8)) and orch_id(0) == "0000")
+    check("orch channel name: <parent name minus its own id>-<alias>-<id>; a nested one keeps ONE id, at the end",
+          orch_chan_name("myrepo", "cctest", T8) == "myrepo-cctest-ghih"
+          and orch_chan_name("myrepo-cctest-ghih", "helper", T8, parent_is_orch=True) == "myrepo-cctest-helper-ghih"
+          and orch_chan_name("myrepo--track", "helper", T8) == "myrepo--track-helper-ghih")
+    long8 = orch_chan_name("r" * 200, "orchestrator-alias", T8)
+    check("orch channel name: Slack's 80-char cap trims the BASE (never the alias or the id); lowercase [a-z0-9-] only",
+          len(long8) == CHAN_MAX and long8.endswith("-orchestrator-alias-ghih") and re.fullmatch(r"[a-z0-9-]+", long8)
+          and orch_chan_name("My Repo#1", "A B", T8) == "my-repo-1-a-b-ghih")
+    check("orch purpose: the brief's FIRST line (≤150 chars) + who spawned it, when, and the thread it came from",
+          orch_purpose("Ship the parser\nand then rest", "myrepo", T8, "https://s/x").startswith("Ship the parser · spawned by myrepo 2026-08-2")
+          and "and then rest" not in orch_purpose("Ship the parser\nand then rest", "myrepo", T8)
+          and "https://s/x" in orch_purpose("b", "myrepo", T8, "https://s/x") and len(orch_purpose("x" * 400, "myrepo", T8)) <= 250)
+    with tempfile.TemporaryDirectory(dir=DEV, prefix="_selfcheck") as d8:
+        r8 = os.path.basename(d8)                     # a real folder in ~/dev: valid_target() only routes to one
+        save_orchs({"CORCH": {"target": r8, "alias": "cctest", "parent": "CPAR", "name": f"{r8}-cctest-ghih", "created": 100, "seen": 100, "archived": False},
+                    "COLD": {"target": r8, "alias": "gone", "parent": "CPAR", "name": f"{r8}-gone-aaaa", "created": 100, "seen": 100, "archived": True}})
+        dm8 = Daemon(use_slack=False); dm8.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dm8.bot_user = "UBOT"
+        dm8.set_mark = lambda *a: None                # the mark machinery has its own checks; this one is about routing
+        dm8.chan_name = lambda c: {"CORCH": f"{r8}-cctest-ghih", "CPAR": r8}.get(c, c)
+        got8, said8 = [], []
+        dm8.deliver = lambda target, payload, autostart=True, alias=None: got8.append((target, alias, payload.get("content"))) or "delivered"
+        dm8.say = lambda chat, text, thread=None: said8.append(text)
+        _rc8, _api8, _hw8, _fc8 = globals()["react"], globals()["api"], globals()["home_windows"], globals()["find_channel"]
+        globals()["react"] = lambda *a, **k: None
+        try:
+            dm8.subs[r8] = [Conn(None, r8, {"alias": "cctest"}), Conn(None, r8, {"alias": None})]
+            dm8.on_event({"type": "message", "channel": "CORCH", "ts": "8.1", "user": "UOWNER", "text": "how far are you?", "channel_type": "channel"})
+            dm8.on_event({"type": "message", "channel": "CORCH", "ts": "8.2", "user": "UOWNER", "text": "@main take this one", "channel_type": "channel"})
+            dm8.on_event({"type": "message", "channel": "CPAR", "ts": "8.3", "user": "UOWNER", "text": "plain repo question", "channel_type": "channel"})
+            check("route: a message in an orch's own channel goes to (that repo, that alias) with no @ needed; @main there still "
+                  "hands the thread to the main session; a plain message in #<repo> still goes to main",
+                  dm8.route("CORCH", None) == r8 and dm8.chan_alias("CORCH") == "cctest"
+                  and got8 == [(r8, "cctest", "how far are you?"), (r8, None, "@main take this one"), (r8, None, "plain repo question")])
+            check("route: an ARCHIVED orch channel is unroutable — it is history, not a session (and its alias is nobody's)",
+                  dm8.route("COLD", None) is None and dm8.chan_alias("COLD") is None)
+            check("route: an orch channel's alias is honoured for @tokens across a daemon restart (the table is on disk, "
+                  "known_aliases is not)", dm8.aliases_for(r8) == {"cctest"} and not dm8.known_aliases.get(r8))
+            arch8 = []
+            globals()["api"] = lambda m, tok, **kw: arch8.append((m, kw.get("channel"))) or {}
+            globals()["home_windows"] = lambda: {}
+            dm8.subs[r8] = [Conn(None, r8, {"alias": "livekid"})]
+            o8 = load_orchs(); o8["CORCH"]["seen"] = time.time() - ORCH_IDLE - 60
+            o8["CLIVE"] = {"target": r8, "alias": "livekid", "parent": "CPAR", "name": f"{r8}-livekid-bbbb", "created": 100, "seen": 100, "archived": False}
+            save_orchs(o8); dm8.orch_sweep(); aft8 = load_orchs()
+            check("orch janitor: an orch gone ≥ 24 h has its channel archived (and stops routing); one whose orch is up is only stamped",
+                  aft8["CORCH"]["archived"] and arch8 == [("conversations.archive", "CORCH")] and dm8.route("CORCH", None) is None
+                  and not aft8["CLIVE"]["archived"] and aft8["CLIVE"]["seen"] > 100)
+            dm9 = Daemon(use_slack=False); dm9.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
+            dm9.last_chat[r8] = ("CPAR", "77.7")      # the thread that asked for it: the one line goes there
+            said9, api9 = [], []
+            dm9.say = lambda chat, text, thread=None: said9.append((chat, text, thread))
+            globals()["find_channel"] = lambda cfg, name: ("CPAR", True) if name == r8 else (None, False)
+            globals()["api"] = lambda m, tok, **kw: api9.append((m, kw)) or (
+                {"channel": {"id": "CNEW9"}} if m == "conversations.create" else
+                {"permalink": "https://slack/x"} if m == "chat.getPermalink" else {"channel": {"name": r8}})
+            name9 = orch_chan_name(r8, "cctest2", T8)   # the temp repo's name is slugged for Slack ([a-z0-9-], no leading -)
+            res9 = dm9.ensure_orch_channel(r8, "cctest2", brief="Ship the parser\nand then rest", at=T8)
+            again9 = dm9.ensure_orch_channel(r8, "cctest2", brief="Ship the parser", at=T8)
+            tbl9 = load_orchs().get("CNEW9") or {}
+            purp9 = next((kw.get("purpose") for m, kw in api9 if m == "conversations.setPurpose"), "")
+            check("orch channel: created + joined + owner invited + purpose set, recorded in the table, and ONE line in the parent "
+                  "thread that asked for it — nothing else is posted",
+                  res9 == {"ok": True, "created": True, "channel": "CNEW9", "name": name9} and name9.endswith("-cctest2-ghih")
+                  and [m for m, _ in api9] == ["conversations.info", "conversations.create", "conversations.invite", "chat.getPermalink", "conversations.setPurpose"]
+                  and purp9.startswith("Ship the parser · spawned by ") and "https://slack/x" in purp9
+                  and tbl9["target"] == r8 and tbl9["alias"] == "cctest2" and tbl9["parent"] == "CPAR" and tbl9["created"] == T8
+                  and said9 == [("CPAR", f"🤖 @cctest2 has its own channel: #{name9}", "77.7")])
+            n_api9 = len(api9)
+            check("orch channel: an orch that already has one keeps it — no second channel, no second post",
+                  again9 == {"ok": True, "created": False, "channel": "CNEW9", "name": name9} and len(api9) == n_api9 and len(said9) == 1)
+            check("orch channel: a bad target/alias creates nothing", not dm9.ensure_orch_channel(r8, "BAD Alias")["ok"]
+                  and not dm9.ensure_orch_channel("no-such-repo-zz", "kid")["ok"] and len(api9) == n_api9)
+            arch9 = dm9.archive_orch(target=r8, alias="cctest2")
+            check("archive: the orch finished → conversations.archive + archived in the table → it never routes again",
+                  arch9["ok"] and arch9["archived"] and load_orchs()["CNEW9"]["archived"] and dm9.route("CNEW9", None) is None
+                  and dm9.archive_orch(target=r8, alias="nobody")["archived"] is False)
+        finally:
+            globals()["react"], globals()["api"], globals()["home_windows"], globals()["find_channel"] = _rc8, _api8, _hw8, _fc8
+            os.path.exists(f"{DIR}/{ORCHS}") and os.unlink(f"{DIR}/{ORCHS}")
+    orderH = home_chan_order([("CPAR", "myrepo"), ("CORCH", "myrepo-cctest-ghih"), ("CSUB", "myrepo-cctest-helper-m3x1"),
+                              ("CZ", "zeta"), ("CARCH", "myrepo-old-zzzz")],
+                             {"CORCH": {"parent": "CPAR", "created": 20}, "CSUB": {"parent": "CORCH", "created": 30},
+                              "CARCH": {"parent": "CPAR", "created": 10, "archived": True}})
+    check("Home: sub channels sit under their parent (depth = indent level), parents by name, children by creation; an "
+          "archived orch channel is off the dashboard",
+          orderH == [("CPAR", "myrepo", 0), ("CORCH", "myrepo-cctest-ghih", 1), ("CSUB", "myrepo-cctest-helper-m3x1", 2), ("CZ", "zeta", 0)])
+    hbO = home_blocks({"box": "b", "now": "1", "channels": [{"name": n, "depth": d, "session": "🔧 working", "marks": "❓1"} for _, n, d in orderH]})
+    txtO = next(b["text"]["text"] for b in hbO if b.get("text", {}).get("text", "").startswith("*Channels*"))
+    check("Home: a sub channel is rendered indented under its parent row (↳), a top-level one is not",
+          txtO == ("*Channels*\n*#myrepo* · 🔧 working · ❓1\n    ↳ *#myrepo-cctest-ghih* · 🔧 working · ❓1"
+                   "\n        ↳ *#myrepo-cctest-helper-m3x1* · 🔧 working · ❓1\n*#zeta* · 🔧 working · ❓1"))
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     print(f"selfcheck: {len(fails)} failed")
@@ -4438,6 +4813,10 @@ def main(argv):
         return cmd_channels()
     elif cmd == "mkchannel":
         return cmd_mkchannel(rest)
+    elif cmd == "orch-channel":
+        return cmd_orch_channel(rest)
+    elif cmd == "archive":
+        return cmd_archive(rest)
     elif cmd == "manifest":
         return cmd_manifest(rest)
     elif cmd == "selfcheck":
