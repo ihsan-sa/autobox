@@ -43,6 +43,14 @@ link "$R/config/tmux.conf" ~/.tmux.conf
 for u in tmux-main.service cc-heartbeat.service cc-boot-notify.service cc-digest.service cc-digest.timer cc-audit.service cc-audit.timer cc-model.service cc-model.timer cc-slackd.service; do
   link "$R/config/systemd-user/$u" ~/.config/systemd/user/"$u"
 done
+# the overlay's own user units, for what only that box runs: linked like core's, never enabled here — which of
+# them should start is the box owner's call (`systemctl --user enable --now <unit>` once, after this installer).
+if [ -n "$O" ]; then
+  for f in "$O"/config/systemd-user/*.service "$O"/config/systemd-user/*.timer; do
+    [ -f "$f" ] || continue
+    link "$f" ~/.config/systemd/user/"$(basename "$f")"
+  done
+fi
 
 if [ -f ~/.claude/settings.json ]; then
   cmp -s "$R/config/claude-settings.json" ~/.claude/settings.json ||

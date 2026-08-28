@@ -10,6 +10,7 @@ my-box/                 private repo (the overlay)
 ├── home/               CLAUDE.md RUNBOOK.md COMMS.md USAGE.md  → symlinked into ~
 ├── bin-private/        scripts only this box has            → symlinked into ~/bin
 ├── config/etc/         this box's sshd / unattended-upgrades
+├── config/systemd-user/  user units only this box runs      → symlinked into ~/.config/systemd/user (enable by hand)
 ├── docs/               this box's incidents, audits, guides
 └── tests/check-extra.sh   optional: static checks for the files above (the pre-commit hook runs it after core's)
 ```
@@ -33,6 +34,9 @@ A bare clone of autobox works too — it just has no overlay, so `install.sh` li
 5. **`config/etc/`** (optional) — if this box's sshd or unattended-upgrades policy differs from
    `core/templates/config/etc/`, put your versions here and `install.sh --etc` uses them instead.
 6. **`bin-private/`** (optional) — scripts that only make sense on this box (they get linked into `~/bin` like core's).
+7. **`config/systemd-user/`** (optional) — `*.service` / `*.timer` for what only this box runs (typically driving a
+   `bin-private/` script). `install.sh` links them next to core's; unlike core's it never enables them — do that once
+   yourself with `systemctl --user enable --now <unit>`, so nothing starts on your box that you did not ask for.
 
 ## Keeping core in sync
 
