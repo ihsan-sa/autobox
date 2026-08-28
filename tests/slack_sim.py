@@ -18,6 +18,7 @@ VERBOSE = "-v" in argv; FLAKE = float(opt("--flake", "0.02"))
 TICK = 30                     # daemon loop_tick cadence (s)
 OWNER, BOT, BOTID = "UOWNER", "UBOT", "BBOT"
 STATUS = {}   # filled from the module under test (cs.STATUS_EMOJI: char -> reaction name)
+WORKN = set()  # …and cs.WORK_NAMES: the work slot (🔧/✅), which stands beside the conversation mark
 
 class FakeTime:               # stands in for the `time` module inside cc-slack
     def __init__(self, t0): self.now = t0
@@ -136,8 +137,13 @@ class FakeSlack:
         self.events.append({"type": "reaction_added", "user": BOT, "reaction": name,
                             "event_ts": f"{self.clock.now:.3f}", "item": {"type": "message", "channel": chat, "ts": ts}})
 
-    def bot_status(self, root):
-        return next((STATUS[r["name"]] for r in root["reactions"] if r["name"] in STATUS and BOT in r["users"]), None)
+    def bot_status(self, root):   # the CONVERSATION slot: whose turn it is
+        return next((STATUS[r["name"]] for r in root["reactions"]
+                     if r["name"] in STATUS and r["name"] not in WORKN and BOT in r["users"]), None)
+
+    def bot_work(self, root):     # the WORK slot: 🔧 on it · ✅ done — it stands NEXT TO the conversation mark
+        return next((STATUS[r["name"]] for r in root["reactions"]
+                     if r["name"] in WORKN and BOT in r["users"]), None)
 
 def scenario(rng, chats, days, t0):
     """Owner/session activity as a time-ordered list of (t, kind, args). Threads: owner asks → session replies (usually,
@@ -196,6 +202,7 @@ def run(seed, cs_path):
     clock = FakeTime(t0); slack = FakeSlack(clock, random.Random(seed + 1000), flake=FLAKE)
     cs = M.SourceFileLoader(f"cs{seed}", cs_path).load_module()
     STATUS.clear(); STATUS.update({v: k for k, v in cs.STATUS_EMOJI.items()})
+    WORKN.clear(); WORKN.update(cs.WORK_NAMES)
     cs.time = clock; cs.api = slack.api; cs.log = (print if VERBOSE else (lambda *a, **k: None))
     cs.outbox = lambda *a, **k: None
     cs.load_flags = lambda: {}; cs.save_flags = lambda flags: None   # READ-ONLY harness: never touch ~/.cc/slack/flags.json
@@ -257,14 +264,15 @@ def run(seed, cs_path):
         # score the owner's view at the end of the tick (v3: ❓ needs you · 🔴 the session owes you · 🟠 handled · none = closed/stale)
         for tid, (chat, rts) in roots.items():
             root = slack.find(chat, rts); who, tlast, flag_t = truth_last[tid]
-            if flag_t is not None and flag_t >= tlast: want = "✅" if who == "done" else None   # 🏁 newer than every message: bookkeeping off; the session's ✅ stays
+            work = "✅" if who == "done" else None                  # the session's own ✅ survives a 🏁 and the 48 h janitor
+            if flag_t is not None and flag_t >= tlast: want = None      # 🏁 newer than every message: the bookkeeping mark comes off
             elif clock.now - tlast >= 48 * 3600: want = None            # 48 h quiet: even 🟠 expires
+            elif who == "done": want = None                            # done is the whole story: no turn mark beside the ✅
             elif who == "needs_owner": want = "❓"
             elif who == "owner": want = "❓" if clock.now - tlast >= 30 * 60 else "🔴"   # stalled at 30 min
-            elif who == "done": want = "✅"                             # the session marked the root fully done
             else: want = "🟠"                                           # answered, nothing asked: handled
-            have = slack.bot_status(root)
-            if have != want:
+            have, havew = slack.bot_status(root), slack.bot_work(root)
+            if have != want or havew != work:
                 wrong_s += TICK; pending.setdefault(tid, clock.now)
                 if clock.now - max(truth_touch.get(tid, tlast), flag_t or 0) < 120: cause["latency_<2min"] += TICK
                 elif want is None: cause["stale_or_flagged_not_cleared"] += TICK
