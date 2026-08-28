@@ -46,7 +46,7 @@ every 30 s and on app_home_opened — one views.publish, never a message. Needs 
 event in core/slack/app-manifest.json (re-paste it, Reinstall); without them it logs one line and gives up until restart.
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
 """
-import collections, contextlib, fcntl, glob, json, os, re, socket, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request
+import collections, contextlib, fcntl, glob, json, os, re, socket, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 CFG = f"{HOME}/.cc/config"
@@ -1664,6 +1664,16 @@ class Daemon:
                          cwd=cwd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
                 if r2.returncode == 0:
                     return True, "not mergeable yet — auto-merge armed: it lands the moment the branch is mergeable (the planning session resolves conflicts)"
+            except Exception:
+                pass
+        if r.returncode != 0:
+            # GitHub answers a second, overlapping merge with "Merge already in progress" — and the FIRST one usually lands.
+            # Never report a failure without asking what actually happened to the PR (2026-08-28: #27 was merged and still
+            # told the owner it had failed).
+            try:
+                v = run(["gh", "pr", "view", n, "--json", "state,mergedAt"], cwd=cwd, capture_output=True, text=True, timeout=30)
+                if v.returncode == 0 and (json.loads(v.stdout).get("state") == "MERGED"):
+                    return True, "already merged (a second merge overlapped the first)"
             except Exception:
                 pass
         return r.returncode == 0, out
@@ -4662,6 +4672,19 @@ def cmd_selfcheck():
           "carries disk, RAM, load and uptime",
           w0 is None and abs(w1 - 2.0) < 0.01 and w2 is None
           and all(x in vitals for x in ("💽", "🧠", "📈", "⏱")))
+    dmMG = Daemon(use_slack=False)
+    callsMG = []
+    def runMG(a, **k):
+        callsMG.append(a[:3])
+        if a[:3] == ["gh", "pr", "merge"]:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="GraphQL: Merge already in progress (mergePullRequest)")
+        if a[:4] == ["gh", "pr", "view", "27"]:
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({"state": "MERGED", "mergedAt": "now", "title": "t"}), stderr="")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+    okMG, whyMG = dmMG.merge("myrepo", "27", run=runMG)
+    check("a 👍 merge that raced another one is not reported as a failure: gh says \"Merge already in progress\", the PR says "
+          "MERGED, so the owner is told it merged",
+          okMG and "already merged" in whyMG)
     check("Home: a finished track leaves the dashboard as soon as it is done/merged unless its PR still waits for a 👍",
           home_track_shown("running", None) and home_track_shown("blocked", None) and not home_track_shown("done", None)
           and not home_track_shown("merged", "MERGED") and home_track_shown("done", "OPEN/APPROVED"))
