@@ -227,9 +227,33 @@ ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
 rm -f "$MH/.cc/state/model-override"; : > "$MH/.cc/state/model.log"
 ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
 [ "$(M status)" = fable ] && ok "the same pane line never fires twice (per-window hash)" || bad "pane line fired again"
-mline "Claude usage limit reached. Your limit resets at 13:40."
+mline "Claude usage limit reached for Fable 5. Your limit resets at 13:40."
 ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE=/nonexistent/claude "$B/cc-model" tick
 [ "$(M status)" = fable ] && ok "a pane line with a probe that cannot run does not switch (unknown, not limited)" || bad "switched on an unrunnable probe: $(M status)"
+# … and that line is NOT used up: the next tick, with a probe that runs, still switches (2026-08-27: one unrunnable
+# probe swallowed the only limit line of the day and the box stayed on a model that would not answer)
+ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/failprobe" "$B/cc-model" tick
+[ "$(M status)" = "opus until probe" ] && ok "a line an inconclusive probe could not judge fires again on the next tick" || bad "pane line was consumed by an unrunnable probe: $(M status)"
+rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen"; : > "$MH/.cc/state/model.log"
+# the CLI says a credit balance is empty, not "usage limit" — same thing for us, and it exits non-zero
+cat > "$T/creditprobe" <<'F'
+#!/usr/bin/env bash
+printf '{"subtype":"success","is_error":true,"result":"You'"'"'re out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage, to continue."}'; exit 1
+F
+chmod +x "$T/creditprobe"
+mline "Claude usage limit reached for Fable 5. Your limit resets at 14:40."
+ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/creditprobe" "$B/cc-model" tick
+[ "$(M status)" = "opus until probe" ] && ok "\"out of usage credits\" counts as limited (whatever the exit status)" || bad "credit exhaustion not treated as a limit: $(M status)"
+rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen"; : > "$MH/.cc/state/model.log"
+# the probe's OWN run failed (its budget cap, its turn cap): unknown — never "the model is limited"
+cat > "$T/budgetprobe" <<'F'
+#!/usr/bin/env bash
+printf '{"subtype":"error_max_budget_usd","is_error":true,"result":null}'; exit 1
+F
+chmod +x "$T/budgetprobe"
+mline "Claude usage limit reached for Fable 5. Your limit resets at 15:40."
+ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/budgetprobe" "$B/cc-model" tick
+{ [ "$(M status)" = fable ] && grep -q 'error_max_budget_usd' "$MH/.cc/state/model.log"; } && ok "a probe that broke on its own budget is unknown, and says so in the log" || bad "budget-capped probe misread: $(M status)"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 # cleanup
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO" | cut -d' ' -f1); do tmux kill-window -t "$id"; done

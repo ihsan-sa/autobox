@@ -18,7 +18,7 @@
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"
-PRIMARY="${CC_MODEL_PRIMARY:-claude-fable-5[1m]}"; FALLBACK="${CC_MODEL_FALLBACK:-claude-opus-5}"
+PRIMARY="${CC_MODEL_PRIMARY:-claude-fable-5[1m]}"; FALLBACK="${CC_MODEL_FALLBACK:-claude-opus-5[1m]}"
 PROBEM="${CC_MODEL_PROBE:-claude-fable-5}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
 now=$(date -u +%s); mkdir -p "$ST"
@@ -65,16 +65,25 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   elif [ "$to" -gt 0 ]; then msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z."
   else msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until it answers again."; fi
   "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
+# every wording the CLI uses when the model itself will not answer: a usage limit, a rate limit, or an exhausted
+# credit balance ("You're out of usage credits…" — 2026-08-28: this one was read as "could not run" and never switched)
+LIMIT_RE='usage limit|rate limit|rate_limit|429|too many requests|usage credits|out of credits|insufficient credits'
 probe(){   # is the primary model answering again? one cheap turn, no tools. 0 = answers · 1 = limited · 2 = could not run (unknown)
-  local o="$ST/model-probe.json" rc
+  local o="$ST/model-probe.json" rc sub
   [ -x "$CLAUDE" ] || return 2
-  timeout 60 "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --max-budget-usd 0.05 --output-format json >"$o" 2>"$o.err"; rc=$?
-  if grep -qiE 'usage limit|rate limit|rate_limit|429|too many requests' "$o" "$o.err" 2>/dev/null; then return 1; fi
-  [ "$rc" = 0 ] && jq -e . "$o" >/dev/null 2>&1 || return 2   # no answer at all (network, bad binary, timeout): unknown, never "limited"
-  [ "$(jq -r '.is_error // false' "$o" 2>/dev/null)" = true ] && return 1; return 0; }
+  # --setting-sources '' keeps the probe off this box's settings/MCP servers: a plain turn, cents not dollars
+  timeout 60 "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --setting-sources '' \
+      --max-budget-usd "${CC_MODEL_PROBE_BUDGET:-0.50}" --output-format json >"$o" 2>"$o.err"; rc=$?
+  grep -qiE "$LIMIT_RE" "$o" "$o.err" 2>/dev/null && return 1   # said so in words: limited, whatever the exit status
+  jq -e . "$o" >/dev/null 2>&1 || return 2                      # no JSON at all (network, bad binary, timeout): unknown
+  sub=$(jq -r '.subtype // ""' "$o" 2>/dev/null)
+  case "$sub" in error_max_budget_usd|error_max_turns|error_during_execution) probe_why="$sub"; return 2;; esac   # the RUN failed, not the model
+  [ "$(jq -r '.is_error // false' "$o" 2>/dev/null)" = true ] && return 1
+  [ "$rc" = 0 ] || { probe_why="exit $rc"; return 2; }
+  return 0; }
 lastprobe(){ cat "$ST/model-probed" 2>/dev/null || echo 0; }   # F2: the pane-detection probe is throttled like the restore probe
 tick(){
-  local id name cap line h m
+  local id name cap line h m rc
   if ov; then   # ---- the fallback is on: restore once the limit has passed AND the primary model answers again
     if [ -s "$ST/model-skipped" ]; then   # F3: panes that were behind a dialog at switch time get another try
       : > "$ST/model-skipped.n"
@@ -85,8 +94,8 @@ tick(){
     { [ "$till" -gt 0 ] && [ "$now" -lt "$till" ]; } && return 0
     [ $((now - probed)) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0
     printf '%s\t%s\t%s\t%s\t%s\n' "$model" "$since" "$till" "$reason" "$now" > "$OV"   # bank the attempt first: a hung probe must not rerun every minute
-    probe; case $? in 1) printf '%s\t%s\tprobe\t%s\tstill limited\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;;
-                      2) printf '%s\t%s\tprobe\t%s\tcould not run — unknown\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;; esac
+    probe_why=""; probe; case $? in 1) printf '%s\t%s\tprobe\t%s\tstill limited\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;;
+                      2) printf '%s\t%s\tprobe\t%s\tcould not run — unknown (%s)\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-no json}" >> "$LOG"; return 0;; esac
     rate_ok && do_switch "$PRIMARY" "limit lifted (probe)"; return 0
   fi
   limstamp   # ---- normal: did the primary model just hit a limit?
@@ -97,16 +106,19 @@ tick(){
     line=$(grep -iE 'usage limit|resets? at [0-9]' <<<"$cap" | tail -1); [ -n "$line" ] || continue
     h=$(printf '%s' "$name$line" | md5sum | cut -c1-16)   # per-window hash: one hit fires once, however long the line stays on screen
     grep -qxF "$h" "$SEEN" 2>/dev/null && continue
-    printf '%s\n' "$h" >> "$SEEN"; tail -n 1000 "$SEEN" > "$SEEN.t" 2>/dev/null && mv "$SEEN.t" "$SEEN"
     m=$(fam "$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku) [0-9]' <<<"$cap" | tail -1)")
     [ -n "$m" ] || m=$(fam "$PRIMARY")   # the pane names no model: it runs the box default
     [ "$m" = "$(fam "$PRIMARY")" ] || continue
     rate_ok || return 0
     [ $((now - $(lastprobe))) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0   # F2: at most one confirming probe per 15 min
     printf '%s\n' "$now" > "$ST/model-probed"
-    probe; case $? in
+    probe_why=""; probe; rc=$?
+    # the line is only "used up" once the probe DECIDED (answers / limited). After an inconclusive probe it must fire
+    # again on a later tick — 2026-08-27 a single unrunnable probe swallowed the only limit line of the day.
+    [ "$rc" = 2 ] || { printf '%s\n' "$h" >> "$SEEN"; tail -n 1000 "$SEEN" > "$SEEN.t" 2>/dev/null && mv "$SEEN.t" "$SEEN"; }
+    case "$rc" in
       0) printf '%s\t%s\tprobe\t%s\tpane line in %s was not a live limit\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "$name" >> "$LOG"; return 0;;
-      2) printf '%s\t%s\tprobe\t%s\tcould not run — not switching on a pane line alone\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;;
+      2) printf '%s\t%s\tprobe\t%s\tcould not run — not switching on a pane line alone (%s)\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-no json}" >> "$LOG"; return 0;;
     esac
     do_switch "$FALLBACK" "$m limit seen in $SESSION:$name"; return 0
   done < <(sessions); return 0; }
