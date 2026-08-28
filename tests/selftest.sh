@@ -190,6 +190,10 @@ MT new-window -d -t _ccmodel -n wkr "bash -c '$T/fb/cc-loop; true'"   # a worker
 sleep 1
 [ "$(M status)" = fable ] && ok "cc-model status: fable while nothing is limited" || bad "cc-model status: $(M status)"
 [ -z "$(M current)" ] && ok "cc-model current is empty with no override" || bad "cc-model current leaked a model"
+printf '{"is_error":true,"result":"claude-fable-5: You are out of usage credits. Run /usage-credits to keep using Fable 5.","total_cost_usd":0}' > "$T/cred.json"
+ME "$B/cc-limit" check "$T/cred.json" >/dev/null
+{ ME "$B/cc-limit" status | grep -q 'usage limit until'; } && ok "cc-limit: an exhausted credit balance is a limit too (backoff, no reset time in the message)" || bad "cc-limit missed the credit wording"
+rm -f "$MH/.cc/state/claude-limit"
 printf '{"is_error":true,"result":"claude-fable-5: You have hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}' > "$T/fab.json"
 ME "$B/cc-limit" check "$T/fab.json" >/dev/null
 [ "$(cut -f4 "$MH/.cc/state/claude-limit")" = fable ] && ok "cc-limit records the limited model (stamp field 4)" || bad "stamp model: $(cut -f4 "$MH/.cc/state/claude-limit" 2>/dev/null)"
@@ -254,6 +258,13 @@ chmod +x "$T/budgetprobe"
 mline "Claude usage limit reached for Fable 5. Your limit resets at 15:40."
 ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/budgetprobe" "$B/cc-model" tick
 { [ "$(M status)" = fable ] && grep -q 'error_max_budget_usd' "$MH/.cc/state/model.log"; } && ok "a probe that broke on its own budget is unknown, and says so in the log" || bad "budget-capped probe misread: $(M status)"
+rm -f "$MH/.cc/state/model-override"; : > "$MH/.cc/state/model.log"
+# a mid-conversation /model opens a "Switch model?" confirmation: unanswered, the session sits on the dialog and stays
+# on the model that will not answer (2026-08-28: that is exactly what every live session did)
+MT send-keys -t _ccmodel:sess -l -- "Switch model? 1. Yes, switch to Opus 5"; sleep 0.3; MT send-keys -t _ccmodel:sess Enter; sleep 0.5
+ME env CC_MODEL_DIALOG_WAIT=0.5 "$B/cc-model" switch opus "dialog case" >/dev/null 2>&1
+sleep 1
+MT capture-pane -p -t _ccmodel:sess | tail -n 3 | grep -qx '1' && ok "a Switch-model confirmation is answered, so the switch actually takes" || bad "the switch left the confirmation dialog open"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 # cleanup
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
