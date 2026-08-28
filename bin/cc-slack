@@ -45,7 +45,7 @@ every 30 s and on app_home_opened — one views.publish, never a message. Needs 
 event in core/slack/app-manifest.json (re-paste it, Reinstall); without them it logs one line and gives up until restart.
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
 """
-import collections, glob, json, os, re, socket, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request
+import collections, contextlib, fcntl, glob, json, os, re, socket, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 CFG = f"{HOME}/.cc/config"
@@ -80,6 +80,7 @@ OUR_ANSWER_SKIP = (frozenset(STATUS_NAMES) - {"white_check_mark"}) | {"eyes", "c
                                                                # 👀 only says "received", the marks and a 🏁 are bookkeeping
 ORCHS = "orchs.json"                                           # {"<chat>": {target, alias, parent, name, created, seen, archived}}: a sub-orch's OWN channel
 ORCH_ID_RE = re.compile(r"-[a-z0-9]{4}$")                      # the 4-char tail an orch channel name ends with (stripped when it spawns its own)
+ORCH_KEEP = 7 * 86400                                          # how long an archived orch stays in the table before it is forgotten
 ORCH_IDLE = 24 * 3600                                          # an orch channel whose orch window has been gone this long is archived (daily janitor)
 CHAN_MAX = 80                                                  # Slack's cap on a channel name
 B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -308,13 +309,33 @@ def load_routes():
         return {}
 
 
+@contextlib.contextmanager
+def orchs_locked():
+    """Hold the orch table while a caller reads-modifies-writes it. Two processes write it — the daemon (create, janitor)
+    and the CLI's `cc-slack archive`, which `cc` runs when an orch session exits — and a lost update silently strands a
+    channel with no route. The lock file is separate: os.replace() swaps the table's inode."""
+    os.makedirs(DIR, exist_ok=True)
+    with open(f"{DIR}/{ORCHS}.lock", "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except Exception:
+            pass                                         # a filesystem without locks is still better served by going ahead
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
 def load_orchs():
     """The sub-orchestrator routing table (see ORCHS): a message in one of these channels belongs to that repo's orch for
     that alias, exactly like an `@alias` in the repo channel. Read from disk on every use, like routes.json — one small
     file read, and no cache to invalidate when the CLI (`cc slack archive`) writes it under a running daemon."""
     try:
         d = json.load(open(f"{DIR}/{ORCHS}"))
-        return d if isinstance(d, dict) else {}
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}   # one hand-edited entry must not drop every message
     except Exception:
         return {}
 
@@ -912,8 +933,9 @@ class Daemon:
             return {"ok": False, "error": "bad target/alias"}
         if not self.cfg.get("SLACK_BOT_TOKEN"):
             return {"ok": False, "error": "no SLACK_BOT_TOKEN"}
-        orchs = load_orchs()
-        cid = orch_lookup(orchs, target, alias)
+        with orchs_locked():
+            orchs = load_orchs()
+            cid = orch_lookup(orchs, target, alias)
         if cid:
             return {"ok": True, "created": False, "channel": cid, "name": orchs[cid].get("name")}
         at = time.time() if at is None else at
@@ -928,52 +950,60 @@ class Daemon:
                                      self.permalink(pchat, thread) if thread else ""))
         except Exception as e:
             log(f"orch channel #{name}: purpose: {e!r}")   # a purpose is decoration; the channel and the route are what matter
-        orchs[cid] = {"target": target, "alias": alias, "parent": pchat, "name": name,
-                      "created": at, "seen": at, "archived": False}
-        save_orchs(orchs)
+        with orchs_locked():
+            orchs = load_orchs()
+            orchs[cid] = {"target": target, "alias": alias, "parent": pchat, "name": name,
+                          "created": at, "seen": at, "archived": False}
+            save_orchs(orchs)
         self.names[cid] = name
         self.known_aliases[target].add(alias)
         log(f"orch channel #{name} ({cid}) {how} for {target}@{alias}")
-        if pchat:
-            self.say(pchat, f"🤖 @{alias} has its own channel: #{name}", thread)
+        if pchat and thread:
+            self.say(pchat, f"🤖 @{alias} has its own channel: #{name}", thread)   # in the thread that asked, or not at all
         return {"ok": True, "created": True, "channel": cid, "name": name}
 
     def archive_orch(self, chat=None, target=None, alias=None):
         """The orch finished (its session exited, `cc slack archive`, or the janitor): archive the channel and stop
         routing it. Idempotent — an unknown or already-archived channel is a no-op, never an error."""
-        orchs = load_orchs()
-        cid = chat or (orch_lookup(orchs, target, alias) if target and alias else None)
-        if not cid or cid not in orchs:
-            return {"ok": True, "archived": False, "channel": cid, "error": "no orch channel"}
-        if orchs[cid].get("archived"):
-            return {"ok": True, "archived": False, "channel": cid, "name": orchs[cid].get("name")}
-        ok = archive_channel(self.cfg, cid, orchs)
-        if ok:
-            save_orchs(orchs)
+        with orchs_locked():
+            orchs = load_orchs()
+            cid = chat or (orch_lookup(orchs, target, alias) if target and alias else None)
+            if not cid or cid not in orchs:
+                return {"ok": True, "archived": False, "channel": cid, "error": "no orch channel"}
+            if orchs[cid].get("archived"):
+                return {"ok": True, "archived": False, "channel": cid, "name": orchs[cid].get("name")}
+            ok = archive_channel(self.cfg, cid, orchs)
+            if ok:
+                save_orchs(orchs)
             log(f"orch channel #{orchs[cid].get('name')} ({cid}) archived")
         return {"ok": ok, "archived": ok, "channel": cid, "name": orchs[cid].get("name")}
 
     def orch_sweep(self):
-        """Stamp every orch channel whose orch is up, and archive one that has been gone for ORCH_IDLE (the daily janitor,
-        riding the 15 min sweep): an orch channel outlives its orch by at most a day, and archived never routes again."""
-        orchs = load_orchs()
-        live = {c for c, e in orchs.items() if not e.get("archived")}
-        if not live:
-            return
-        wins, now, dirty = home_windows(), time.time(), False
-        for cid in live:
-            e = orchs[cid]
-            target, alias = e.get("target"), e.get("alias")
-            with self.lock:
-                up = any((c.info.get("alias") or None) == alias for c in self.subs.get(target, ()))
-            if up or f"{target}@{alias}" in wins:
-                if now - float(e.get("seen") or 0) > 300:
-                    e["seen"] = now; dirty = True
-            elif now - float(e.get("seen") or e.get("created") or now) >= ORCH_IDLE and archive_channel(self.cfg, cid, orchs):
-                log(f"orch janitor: #{e.get('name')} archived — {target}@{alias} gone for {ORCH_IDLE // 3600} h")
-                dirty = True
-        if dirty:
-            save_orchs(orchs)
+        """Stamp every orch channel whose orch is up, archive one that has been gone for ORCH_IDLE (the daily janitor,
+        riding the 15 min sweep), and forget an archived one after ORCH_KEEP: an orch channel outlives its orch by at
+        most a day, archived never routes again, and the table — read on every event — never grows without bound."""
+        with self.lock:                                  # snapshot first: the table lock must never wrap the daemon's own
+            subbed = {t: {(c.info.get("alias") or None) for c in v} for t, v in self.subs.items()}
+        wins, now = home_windows(), time.time()
+        with orchs_locked():
+            orchs = load_orchs()
+            dirty = False
+            for cid, e in list(orchs.items()):
+                if e.get("archived"):
+                    if now - float(e.get("seen") or e.get("created") or now) > ORCH_KEEP:
+                        orchs.pop(cid, None); dirty = True
+                    continue
+                target, alias = e.get("target"), e.get("alias")
+                # a window whose pane has fallen back to a plain shell is a FINISHED orch: counting it as live would keep
+                # the janitor stamping a dead orch's channel forever
+                if alias in subbed.get(target, ()) or wins.get(f"{target}@{alias}", "bash") not in ("bash", "sh", "zsh", ""):
+                    if now - float(e.get("seen") or 0) > 300:
+                        e["seen"] = now; dirty = True
+                elif now - float(e.get("seen") or e.get("created") or now) >= ORCH_IDLE and archive_channel(self.cfg, cid, orchs):
+                    log(f"orch janitor: #{e.get('name')} archived — {target}@{alias} gone for {ORCH_IDLE // 3600} h")
+                    dirty = True
+            if dirty:
+                save_orchs(orchs)
 
     def user_name(self, uid):
         if uid not in self.users:
@@ -2843,10 +2873,14 @@ def cmd_archive(argv):
         cid = argv[0] if re.fullmatch(r"[CG][A-Z0-9]+", argv[0]) else (find_channel(cfg, argv[0].lstrip("#").lower())[0] or "")
         if not cid:
             print(f"cc-slack archive: no channel {argv[0]}", file=sys.stderr); return 1
+        if cid not in orchs:                             # this command archives SUB-ORCH channels; #<repo> and #alerts are not its business
+            print(f"cc-slack archive: {argv[0]} is not a sub-orch channel (archive it in Slack if you mean it)", file=sys.stderr); return 1
     else:
         print("cc-slack archive <#chan|C…> | --orch <target> <alias>", file=sys.stderr); return 2
-    ok = archive_channel(cfg, cid, orchs)
-    save_orchs(orchs)
+    with orchs_locked():
+        orchs = load_orchs()
+        ok = archive_channel(cfg, cid, orchs)
+        save_orchs(orchs)
     print(f"{'archived' if ok else 'could NOT archive'} {cid}" + (f" (#{orchs[cid].get('name')})" if cid in orchs else ""))
     return 0 if ok else 1
 
@@ -4476,6 +4510,17 @@ def cmd_selfcheck():
             check("orch janitor: an orch gone ≥ 24 h has its channel archived (and stops routing); one whose orch is up is only stamped",
                   aft8["CORCH"]["archived"] and arch8 == [("conversations.archive", "CORCH")] and dm8.route("CORCH", None) is None
                   and not aft8["CLIVE"]["archived"] and aft8["CLIVE"]["seen"] > 100)
+            o8b = load_orchs(); o8b["CDEAD"] = {"target": r8, "alias": "deadkid", "parent": "CPAR", "name": f"{r8}-deadkid-cccc",
+                                                "created": 100, "seen": time.time() - ORCH_IDLE - 60, "archived": False}
+            o8b["CSTALE"] = {"target": r8, "alias": "old", "parent": "CPAR", "name": f"{r8}-old-dddd",
+                             "created": 100, "seen": time.time() - ORCH_KEEP - 60, "archived": True}
+            save_orchs(o8b)
+            globals()["home_windows"] = lambda: {f"{r8}@deadkid": "bash"}   # window still there, pane back to a shell
+            arch8.clear(); dm8.orch_sweep(); aft8b = load_orchs()
+            globals()["home_windows"] = lambda: {}
+            check("orch janitor: a window whose pane fell back to a shell is a finished orch (its channel is archived), and an "
+                  "archived entry is forgotten after a week so the table stays a routing table",
+                  aft8b["CDEAD"]["archived"] and "CSTALE" not in aft8b)
             dm9 = Daemon(use_slack=False); dm9.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
             dm9.last_chat[r8] = ("CPAR", "77.7")      # the thread that asked for it: the one line goes there
             said9, api9 = [], []
