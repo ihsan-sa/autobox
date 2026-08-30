@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""cc-vitals — 24 h of the box's own vitals: one honest row a minute, normalised onto a single 0-100 axis.
+
+WHY A RECORDER AT ALL. One instantaneous read a minute is a sample, not a minute: CPU and power swing hard from
+second to second, so any single read is unrepresentative of the minute it stands for. This records the minute
+itself — and the two kinds of metric are NOT aggregated the same way:
+
+  COUNTERS — CPU busy (/proc/stat), package energy (RAPL). Monotonic totals, so the delta across the whole
+    minute IS that minute's exact mean: no sampling error at all, and nothing to gain from reading them more
+    than twice.
+  GAUGES — RAM, load, temperature, disk. Nothing accumulates, so they are sampled every SAMPLE seconds and the
+    MEAN is stored. The MAX is stored beside it: a minute that averaged 55 °C but touched 79 °C is a fact the
+    mean hides, and it is the one worth seeing on a graph.
+
+REAL UNITS ON DISK, NORMALISED ON READ. Rows carry watts, °C and GiB, plus the capacities they are a fraction
+of. Normalisation happens in `series`, so a bigger disk or a lifted power limit re-scales the picture instead
+of quietly falsifying the history already written.
+
+ONE CHART, ONE AXIS (owner, 2026-08-30 — this overrides the small-multiples design). Every series is plotted as
+a percentage of its OWN capacity on a single 0-100 axis: disk % used, RAM % of total, CPU %, load as % of core
+count, temperature as % of its throttle point, watts as % of the package limit. That is one honest axis, not two
+y-scales pretending to be one; the legend carries the real numbers, so the shapes are comparable and the values
+are still true.
+
+THE RENDERER IS A SEAM, AND IT IS THE ONLY THING NOT DONE. Nothing on this box can draw a PNG (no matplotlib, no
+PIL) and installing one is an owner-gated host change that has not been answered. Everything up to the pixels is
+built and tested; render_png() is one function that raises RendererUnavailable, and render_text() — block
+sparklines, no dependencies — works today. When the answer comes, that one function is the whole change.
+
+  cc-vitals record [--once]         the recorder: one row a minute, then re-render (never in the tab's own path)
+  cc-vitals series [--hours 24]     aggregated + normalised series, JSON on stdout
+  cc-vitals render [--backend auto|text|png]   rewrite current.json + current.txt|png, atomically, in place
+  cc-vitals show [--width N]        the text chart on stdout
+  cc-vitals selfcheck               tests; touches nothing outside a temp dir
+"""
+import glob
+import json
+import os
+import re
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+DIR = os.environ.get("CC_VITALS_DIR") or f"{HOME}/.cc/state/vitals"
+RAPL = os.environ.get("CC_VITALS_RAPL") or "/sys/class/powercap/intel-rapl:0"
+THERMAL = os.environ.get("CC_VITALS_THERMAL") or "/sys/class/thermal"
+PROCFS = os.environ.get("CC_VITALS_PROC") or "/proc"
+ROOTFS = os.environ.get("CC_VITALS_ROOT") or "/"
+PERIOD = 60          # one row per wall-clock minute; rows are stamped with the minute they COVER
+SAMPLE = 6           # gauges every 6 s -> 10 samples a minute (a mean, not a lucky read)
+KEEP_DAYS = 3        # 24 h of chart from ~290 KB/day of jsonl; a spare day covers a late look
+STALE = 300          # a current.* older than this is not "current" and the tab must say so
+TJMAX = 100.0        # the throttle denominator when a zone declares no usable passive/hot trip
+
+# ONE FIXED HUE PER METRIC, ASSIGNED IN THIS ORDER AND NEVER RECYCLED (owner, 2026-08-30). Slots come from the
+# validated categorical palette in the dataviz reference, in its published order; slots 7 (violet) and 8 (red)
+# are reserved for the next two metrics — a 9th never gets a generated hue, it folds in or the chart splits.
+# The SURFACE is picked, not flipped: a PNG cannot answer the viewer's theme, so it is drawn opaque on the dark
+# surface, where all six hues clear 3:1 (three of them do not on the light one). It reads as a card in Slack's
+# light theme instead of fighting it, and it is the same image in both.
+# Colour never identifies a series on its own: every line is labelled, the legend is always present and carries
+# the real number, and each series has its own dash for print / forced-colours / the two CVD pairs that sit in
+# the warn band (magenta-aqua, yellow-orange).
+SURFACE = {"mode": "dark", "bg": "#1a1a19", "ink": "#ffffff", "ink2": "#c3c2b7", "grid": "#383835"}
+SPEC = [
+    {"key": "cpu",   "label": "CPU",   "slot": 1, "hue": "blue",    "light": "#2a78d6", "colour": "#3987e5", "dash": "solid",     "kind": "counter"},
+    {"key": "ram",   "label": "RAM",   "slot": 2, "hue": "orange",  "light": "#eb6834", "colour": "#d95926", "dash": "6 2",       "kind": "gauge", "band": True},
+    {"key": "load",  "label": "load",  "slot": 3, "hue": "aqua",    "light": "#1baf7a", "colour": "#199e70", "dash": "2 2",       "kind": "gauge"},
+    {"key": "temp",  "label": "temp",  "slot": 4, "hue": "yellow",  "light": "#eda100", "colour": "#c98500", "dash": "8 3 2 3",   "kind": "gauge", "band": True},
+    {"key": "watts", "label": "power", "slot": 5, "hue": "magenta", "light": "#e87ba4", "colour": "#d55181", "dash": "1 3",       "kind": "counter"},
+    {"key": "disk",  "label": "disk",  "slot": 6, "hue": "green",   "light": "#008300", "colour": "#008300", "dash": "10 4",      "kind": "gauge"},
+]
+AGG = {"counter": "delta across the whole minute (the minute's exact mean)",
+       "gauge": "mean of the minute's samples (max kept beside it)"}
+
+
+def _read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:00Z", time.gmtime(t))
+
+
+# ---------------------------------------------------------------- capacities: what each metric is a % OF ----
+_ZONE = []
+
+
+def zone():
+    """(temp file, throttle °C) for ONE thermal zone, chosen by type and then held. The dashboard picks the
+    warmest zone on every read, which is right for "how hot is it now" and wrong for a time series: a line that
+    silently changes sensor is a line that lies. Preference order is package first, chassis last."""
+    if _ZONE:
+        return _ZONE[0]                                          # settled once: 10 samples a minute, forever
+    zones = {}
+    for z in sorted(glob.glob(f"{THERMAL}/thermal_zone*")):
+        zones.setdefault(_read(f"{z}/type"), z)
+    for want in ("x86_pkg_temp", "coretemp", "cpu-thermal", "acpitz"):
+        if want in zones:
+            z = zones[want]
+            # The denominator is the THROTTLE point (passive/hot), never `critical`: critical is the shutdown
+            # trip, and dividing by 119 °C would flatten the one line worth watching. No usable trip -> TJMAX.
+            trips = [int(_read(f"{z}/trip_point_{i}_temp") or -1) / 1000
+                     for i in range(16) if _read(f"{z}/trip_point_{i}_type") in ("passive", "hot")]
+            trips = [t for t in trips if t > 0]
+            _ZONE.append((f"{z}/temp", max(trips) if trips else TJMAX))
+            return _ZONE[0]
+    _ZONE.append((None, TJMAX))
+    return _ZONE[0]
+
+
+def power_limit():
+    """The package's long-term power limit in W — the honest denominator for watts. Short-term (a boost window
+    of a couple of ms) is not what a per-minute mean is a fraction of."""
+    for c in sorted(glob.glob(f"{RAPL}/constraint_*_name")):
+        if _read(c) == "long_term":
+            uw = _read(c.replace("_name", "_power_limit_uw"))
+            if uw.isdigit() and int(uw) > 0:
+                return int(uw) / 1e6
+    return None
+
+
+def caps():
+    """What every metric is a percentage of, discovered at RUNTIME — never a constant in this file. A capacity
+    this box cannot report comes back None and that metric simply gets no line: a series with no honest
+    denominator does not belong on a normalised axis."""
+    v = os.statvfs(ROOTFS)
+    mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", _read(f"{PROCFS}/meminfo"), re.M))
+    tot = int(mem.get("MemTotal", 0))
+    _, tj = zone()
+    return {"cores": os.cpu_count() or None,
+            "ram_gb": round(tot / 1048576, 2) if tot else None,
+            "disk_gb": round(v.f_frsize * v.f_blocks / 2**30, 1) or None,
+            "temp_c": tj,
+            "watts": power_limit()}
+
+
+# ------------------------------------------------------------------------------- reading the box, one minute --
+def counters():
+    """The monotonic totals, read once at each end of the minute. Nothing here sleeps."""
+    out = {"cpu": None, "uj": None, "wrap": None}
+    parts = _read(f"{PROCFS}/stat").split("\n")[0].split()[1:]
+    v = [int(x) for x in parts if x.isdigit()]
+    if v:
+        out["cpu"] = (sum(v), sum(v[3:5]))                       # (total, idle+iowait)
+    uj = _read(f"{RAPL}/energy_uj")
+    if uj.isdigit():
+        out["uj"] = int(uj)
+        w = _read(f"{RAPL}/max_energy_range_uj")
+        out["wrap"] = int(w) if w.isdigit() else None
+    return out
+
+
+def gauges():
+    """One instant of every gauge. Called SAMPLE seconds apart; all plain file reads, no subprocess."""
+    v = os.statvfs(ROOTFS)
+    mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", _read(f"{PROCFS}/meminfo"), re.M))
+    tot, avail = int(mem.get("MemTotal", 0)), int(mem.get("MemAvailable", 0))
+    tz, _ = zone()
+    t = _read(tz) if tz else ""
+    return {"ram": round((tot - avail) / 1048576, 3) if tot else None,
+            "load": round(os.getloadavg()[0], 2),
+            # Used includes the root-reserved blocks, so this sits a little above `df`'s figure, which hides
+            # them from its denominator. % of the filesystem's real size is the one that belongs on this axis.
+            "disk": round((v.f_blocks - v.f_bfree) * v.f_frsize / 2**30, 2),
+            "temp": round(int(t) / 1000, 2) if t.lstrip("-").isdigit() else None}
+
+
+def aggregate(c0, c1, dt, samples, cap, start):
+    """The whole aggregation, as a pure function of two counter reads and a list of gauge samples — which is why
+    it can be tested without waiting a minute for anything."""
+    row = {"t": _iso(start), "s": len(samples), "dt": round(dt, 2), "cap": cap}
+    row["cpu"] = cpu_pct(c0, c1)
+    row["watts"] = watts(c0, c1, dt)
+    for k in ("ram", "load", "temp", "disk"):
+        vals = [s[k] for s in samples if s.get(k) is not None]
+        row[k] = {"m": round(sum(vals) / len(vals), 3), "x": round(max(vals), 3)} if vals else None
+    return row
+
+
+def cpu_pct(c0, c1):
+    """Busy % for the minute, exact: (busy delta / total delta). No sampling, so nothing to be unlucky about."""
+    if not c0.get("cpu") or not c1.get("cpu"):
+        return None
+    dtot, didle = c1["cpu"][0] - c0["cpu"][0], c1["cpu"][1] - c0["cpu"][1]
+    if dtot <= 0:
+        return None                                              # counter reset (a reboot inside the minute)
+    return round(max(0.0, min(100.0, 100.0 * (dtot - didle) / dtot)), 2)
+
+
+def watts(c0, c1, dt):
+    """Mean package draw for the minute from the RAPL energy delta. The counter wraps at max_energy_range_uj;
+    when the box tells us the range we add it back rather than throw the minute away, and a figure that comes
+    out impossible after that is dropped instead of drawn."""
+    u0, u1 = c0.get("uj"), c1.get("uj")
+    if u0 is None or u1 is None or dt <= 0:
+        return None
+    d = u1 - u0
+    if d < 0:
+        if not c0.get("wrap"):
+            return None
+        d += c0["wrap"]
+    w = d / 1e6 / dt
+    return round(w, 3) if 0 <= w < 1000 else None
+
+
+def record_minute(period=PERIOD, sample=SAMPLE):
+    """One row: counters at both ends of the window, gauges every `sample` seconds in between. Deadlines are
+    computed from a monotonic start, so a slow sample steals from the next one instead of drifting the minute."""
+    t0, m0 = time.time(), time.monotonic()
+    cap, c0, got = caps(), counters(), [gauges()]
+    n = 1
+    while n * sample < period:
+        d = (m0 + n * sample) - time.monotonic()
+        if d > 0:
+            time.sleep(d)
+        got.append(gauges())
+        n += 1
+    d = (m0 + period) - time.monotonic()
+    if d > 0:
+        time.sleep(d)
+    return aggregate(c0, counters(), time.monotonic() - m0, got, cap, t0 - (t0 % period))
+
+
+# ------------------------------------------------------------------------------------------------- storage ---
+def _day(t):
+    return time.strftime("%Y-%m-%d", time.gmtime(t))
+
+
+def append(row):
+    os.makedirs(DIR, exist_ok=True)
+    with open(f"{DIR}/{row['t'][:10]}.jsonl", "a") as f:
+        f.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def prune(now=None):
+    """A day older than KEEP_DAYS is not history, it is 290 KB nobody will read."""
+    keep = {_day((now or time.time()) - i * 86400) for i in range(KEEP_DAYS)}
+    for f in glob.glob(f"{DIR}/????-??-??.jsonl"):
+        if os.path.basename(f)[:-6] not in keep:
+            os.unlink(f)
+
+
+def rows(hours=24, now=None):
+    """Every row inside the window, oldest first. A half-written last line (power cut mid-append) is skipped,
+    not fatal: the chart is worth more than the minute it loses."""
+    now = now or time.time()
+    out = []
+    for day in sorted({_day(now - i * 3600) for i in range(int(hours) + 2)}):
+        for line in _read(f"{DIR}/{day}.jsonl").splitlines():
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("t"):
+                out.append(r)
+    cut = _iso(now - hours * 3600)
+    return sorted([r for r in out if r["t"] >= cut], key=lambda r: r["t"])
+
+
+# ------------------------------------------------------------- normalisation: six metrics, one 0-100 axis ---
+def cap_of(key, cap):
+    return {"cpu": 100.0, "ram": cap.get("ram_gb"), "load": cap.get("cores"),
+            "temp": cap.get("temp_c"), "watts": cap.get("watts"), "disk": cap.get("disk_gb")}.get(key)
+
+
+def norm(key, real, cap):
+    """Real value -> % of that metric's own capacity. NOT clipped: load can exceed the core count and a box that
+    is over its limit must be able to say so. The renderer clips the axis and flags it; the data stays true."""
+    c = cap_of(key, cap)
+    return None if real is None or not c else round(100.0 * real / c, 2)
+
+
+def text(key, real, cap):
+    """The legend's real number — the reason a normalised axis is still honest."""
+    c = cap_of(key, cap)
+    if real is None:
+        return "—"
+    return {"cpu": lambda: f"{real:.0f}%",
+            "ram": lambda: f"{real:.1f}/{c:.0f}G",
+            "load": lambda: f"{real:.2f}",
+            "temp": lambda: f"{real:.0f}°C",
+            "watts": lambda: f"{real:.1f}W",
+            "disk": lambda: f"{real:.0f}/{c:.0f}G"}[key]()
+
+
+def cap_text(key, cap):
+    c = cap_of(key, cap)
+    return {"cpu": "100%", "ram": f"{c:.0f}G", "load": f"{cap.get('cores')} cores",
+            "temp": f"{c:.0f}°C throttle", "watts": f"{c:.0f}W limit", "disk": f"{c:.0f}G"}[key] if c else ""
+
+
+def value(row, key):
+    v = row.get(key)
+    if isinstance(v, dict):
+        return v.get("m"), v.get("x")
+    return v, None
+
+
+def build(hours=24, now=None, data=None):
+    """The chart's whole payload: a DENSE minute axis, so a minute with no row is a null and reads as a break.
+    Interpolating across a power cut would draw a line through time the box spent switched off."""
+    now = now or time.time()
+    data = rows(hours, now) if data is None else data
+    end = now - (now % 60) - 60          # the last COMPLETE minute: the one in progress has no row yet, and an
+    n = int(hours * 60) + 1              # axis ending on it would put a permanent gap at the right of every chart
+    t0 = end - (n - 1) * 60
+    at = {r["t"]: r for r in data}
+    cap = (data[-1].get("cap") if data else None) or caps()
+    out = []
+    for s in SPEC:
+        k = s["key"]
+        if not cap_of(k, cap):
+            continue                                             # no honest denominator -> no line, not a guess
+        col = dict(s)
+        col.pop("band", None)
+        pts, real, band, over = [], [], [], False
+        for i in range(n):
+            r = at.get(_iso(t0 + i * 60))
+            m, x = value(r, k) if r else (None, None)
+            # Each row is normalised against ITS OWN recorded capacity: history stays true across a disk resize.
+            rc = (r.get("cap") if r else None) or cap
+            p = norm(k, m, rc)
+            pts.append(p)
+            real.append(m)
+            band.append(norm(k, x, rc))
+            over = over or (p is not None and p > 100)
+        cur = next((i for i in range(n - 1, -1, -1) if pts[i] is not None), None)
+        col.update({"cap": cap_of(k, cap), "cap_text": cap_text(k, cap), "agg": AGG[s["kind"]],
+                    "norm": pts, "real": real, "norm_max": band if s.get("band") else None, "over": over,
+                    "now": {"norm": pts[cur], "real": real[cur], "text": text(k, real[cur], cap)} if cur is not None
+                           else {"norm": None, "real": None, "text": "—"}})
+        out.append(col)
+    # Counted off the AXIS, not off the file: a row outside the window must not be reported as recorded, or
+    # `minutes` and a chart of six empty lines say different things about the same window.
+    placed = sum(1 for i in range(n) if _iso(t0 + i * 60) in at)
+    return {"generated": _iso(now), "window_h": hours, "t0": int(t0), "step": 60, "n": n,
+            "minutes": placed, "gaps": n - placed, "stale_after": STALE,
+            "surface": SURFACE, "caps": cap,
+            "axis": {"min": 0, "max": 100, "label": "% of each metric's own capacity",
+                     "note": "one axis, six capacities; the legend carries the real numbers. Values over 100 "
+                             "are real (load can exceed the core count) — the renderer clips and flags them."},
+            "series": out}
+
+
+# ----------------------------------------------------------------------------------------- THE ONE SEAM -----
+class RendererUnavailable(Exception):
+    """The chart cannot be drawn on this box yet — see render_png()."""
+
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def render_text(spec, width=60):
+    """The fallback that works TODAY, with nothing installed: one block sparkline per metric, the label beside
+    it (never colour alone) and the real number at the end. Empty buckets stay blank, so a gap looks like one."""
+    out = [f"vitals · last {spec['window_h']}h · {spec['minutes']} of {spec['n']} minutes recorded"
+           f"{' · ' + str(spec['gaps']) + ' missing' if spec['gaps'] > 0 else ''} · {spec['generated']}"]
+    for s in spec["series"]:
+        bar = ""
+        for i in range(width):
+            lo, hi = i * spec["n"] // width, max(i * spec["n"] // width + 1, (i + 1) * spec["n"] // width)
+            vals = [v for v in s["norm"][lo:hi] if v is not None]
+            bar += BLOCKS[0] if not vals else BLOCKS[max(1, min(8, int(sum(vals) / len(vals) / 12.5) + 1))]
+        out.append(f"{s['label']:>5} {bar} {s['now']['text']:>11}  /{s['cap_text']}"
+                   + ("  ⚠ over" if s["over"] else ""))
+    span = f"{spec['window_h']:g}h ago"
+    out.append(f"      {span}{'now'.rjust(max(1, width - len(span)))}   block height = 0-100% of each "
+               f"metric's own capacity")
+    return "\n".join(out) + "\n"
+
+
+def render_png(spec, out):
+    """THE SEAM, AND THE ONLY THING LEFT. Drawing a PNG needs a charting library and this box has none — no
+    matplotlib, no PIL — so installing one is a host change only the owner may approve. That question is open
+    (board note, 2026-08-30), so this raises instead of guessing.
+
+    When the answer comes, THIS FUNCTION IS THE WHOLE CHANGE: `spec` already carries everything a renderer
+    needs — the dense minute axis (t0/step/n), each series' normalised points, its max band where the owner
+    wanted one, its fixed colour for both surfaces, its dash, its label and its legend text. Draw a 0-100 axis,
+    clip anything above it and mark the series `over`, plot on SURFACE['bg'] opaque, label every line, keep the
+    legend. Nothing else in this file moves."""
+    raise RendererUnavailable("no charting library on this box (no matplotlib, no PIL); installing one is an "
+                              "owner-gated host change and the answer is still open — text chart written instead")
+
+
+BACKENDS = {"text": "txt", "png": "png"}
+
+
+def render(backend="auto", width=60, spec=None):
+    """Rewrite the current chart IN PLACE — one file per backend, never a growing pile of images. Written to a
+    temp file and renamed, so a tab reading while we write never sees half a chart."""
+    spec = spec or build()
+    os.makedirs(DIR, exist_ok=True)
+    wrote, why = [], ""
+
+    def put(name, data):
+        tmp = f"{DIR}/.{name}.tmp"
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(tmp, mode) as f:
+            f.write(data)
+        os.replace(tmp, f"{DIR}/{name}")
+        wrote.append(name)
+
+    put("current.json", json.dumps(spec, separators=(",", ":")))   # the data the tab reads, chart or no chart
+    if backend in ("auto", "png"):
+        try:
+            put("current.png", render_png(spec, f"{DIR}/current.png"))
+        except RendererUnavailable as e:
+            why = str(e)
+            if backend == "png":
+                raise
+    if backend in ("auto", "text") or why:
+        put("current.txt", render_text(spec, width))
+    return wrote, why
+
+
+# ------------------------------------------------------------------------------------------------ commands ---
+def cmd_record(opt):
+    period, sample = int(opt.get("--period", PERIOD)), int(opt.get("--sample", SAMPLE))
+    if period == PERIOD and "--once" not in opt:
+        time.sleep(PERIOD - (time.time() % PERIOD))               # land rows on the wall-clock minute
+    while True:
+        row = record_minute(period, sample)
+        append(row)
+        prune()
+        try:
+            render()                     # on a real change, once a minute — never inside the tab's refresh path
+        except Exception as e:
+            print(f"cc-vitals: render failed: {e}", file=sys.stderr)
+        if "--once" in opt:
+            print(json.dumps(row, separators=(",", ":")))
+            return 0
+
+
+def cmd_series(opt):
+    print(json.dumps(build(float(opt.get("--hours", 24))), indent=None if "--raw" in opt else 1))
+    return 0
+
+
+def cmd_render(opt):
+    wrote, why = render(opt.get("--backend", "auto"), int(opt.get("--width", 60)))
+    print(f"cc-vitals: wrote {', '.join(wrote)} in {DIR}" + (f"\ncc-vitals: {why}" if why else ""))
+    return 0
+
+
+def cmd_show(opt):
+    sys.stdout.write(render_text(build(float(opt.get("--hours", 24))), int(opt.get("--width", 60))))
+    return 0
+
+
+def flags(argv):
+    opt = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            opt[a] = argv[i + 1]
+            i += 2
+        else:
+            opt[a] = True
+            i += 1
+    return opt
+
+
+def main(argv):
+    cmds = {"record": cmd_record, "series": cmd_series, "render": cmd_render, "show": cmd_show,
+            "selfcheck": lambda o: selfcheck()}
+    cmd = argv[0] if argv else ""
+    if cmd not in cmds or "--help" in argv or "-h" in argv:
+        print(__doc__.strip())
+        return 0 if cmd in cmds else 2
+    return cmds[cmd](flags(argv[1:]))
+
+
+
+
+# ----------------------------------------------------------------------------------------------- selfcheck ---
+CAP = {"cores": 6, "ram_gb": 30.6, "disk_gb": 457.0, "temp_c": 100.0, "watts": 35.0}
+
+
+def _row(t, cap=None, cpu=10.0, w=8.0, ram=4.3, load=3.0, temp=55.0, tx=79.0, disk=49.0):
+    return {"t": _iso(t), "s": 10, "dt": 60.0, "cap": cap or CAP, "cpu": cpu, "watts": w,
+            "ram": {"m": ram, "x": ram}, "load": {"m": load, "x": load},
+            "temp": {"m": temp, "x": tx}, "disk": {"m": disk, "x": disk}}
+
+
+def selfcheck():
+    """Everything that does not need pixels, proved: the two aggregations, the normalisation, the gaps, the
+    palette rules and the seam. Runs in a temp dir — the live vitals are never read or written."""
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="cc-vitals-")
+    live, globals()["DIR"] = DIR, tmp
+    n = [0, 0]
+
+    def check(name, ok):
+        n[0 if ok else 1] += 1
+        print(f"  {'OK' if ok else 'XX'} {name}")
+
+    try:
+        # -- COUNTERS: the delta across the minute IS the minute's mean, so these are exact, not sampled ------
+        c0 = {"cpu": (1000, 800), "uj": 1_000_000, "wrap": 262_143_328_850}
+        c1 = {"cpu": (2000, 1050), "uj": 601_000_000, "wrap": 262_143_328_850}
+        r = aggregate(c0, c1, 60.0, [gauges()], CAP, 0)
+        check("counter CPU: 1000 ticks, 250 idle -> exactly 75% busy for the minute", r["cpu"] == 75.0)
+        check("counter power: 600 J over 60 s -> exactly 10.0 W", r["watts"] == 10.0)
+        check("a counter reset mid-minute, as a restart does, drops the figure instead of drawing a spike",
+              cpu_pct({"cpu": (2000, 1050)}, {"cpu": (10, 5)}) is None)
+        w = {"cpu": None, "uj": 500_000, "wrap": 262_143_328_850}
+        check("RAPL wrap is added back, not thrown away",
+              watts({"cpu": None, "uj": 262_143_000_000, "wrap": 262_143_328_850}, w, 60.0) is not None)
+        check("a wrap we cannot size is dropped rather than invented",
+              watts({"cpu": None, "uj": 262_143_000_000, "wrap": None}, w, 60.0) is None)
+
+        # -- GAUGES: mean AND max, because the mean hides the spike the owner asked to see ---------------------
+        g = [{"ram": 4.0, "load": 1.0, "temp": 45.0, "disk": 49.0},
+             {"ram": 6.0, "load": 3.0, "temp": 79.0, "disk": 49.0},
+             {"ram": 5.0, "load": 2.0, "temp": 41.0, "disk": 49.0}]
+        r = aggregate(c0, c1, 60.0, g, CAP, 0)
+        check("gauge mean is the mean of the minute's samples, not one lucky read", r["temp"]["m"] == 55.0)
+        check("the minute that averaged 55 C but touched 79 C keeps the 79", r["temp"]["x"] == 79.0)
+        check("RAM keeps its max too", r["ram"]["x"] == 6.0)
+        check("a sensor this box does not have is None, not a zero on the chart",
+              aggregate(c0, c1, 60.0, [{"ram": 4.0, "load": 1.0, "disk": 9.0, "temp": None}], CAP, 0)["temp"] is None)
+
+        # -- NORMALISATION: six capacities, one 0-100 axis -----------------------------------------------------
+        check("load 3.00 on 6 cores is 50% of the box", norm("load", 3.0, CAP) == 50.0)
+        check("55 C against a 100 C throttle is 55%", norm("temp", 55.0, CAP) == 55.0)
+        check("17.5 W against a 35 W package limit is 50%", norm("watts", 17.5, CAP) == 50.0)
+        check("49 G of 457 G is 10.72%", norm("disk", 49.0, CAP) == 10.72)
+        check("the legend carries the real number, so the axis can be a percentage",
+              text("ram", 4.3, CAP) == "4.3/31G" and text("temp", 55.0, CAP) == "55°C")
+        check("load over the core count is NOT clamped - a box over its limit must be able to say so",
+              norm("load", 9.0, CAP) == 150.0)
+        s = build(0.05, now=600, data=[_row(600 - 60, load=9.0)])
+        check("...and the series is flagged `over` for the renderer to mark",
+              [x for x in s["series"] if x["key"] == "load"][0]["over"] is True)
+
+        # -- REAL UNITS ON DISK: capacity changes re-scale the picture, they do not rewrite history ------------
+        big = dict(CAP, disk_gb=914.0)
+        s = build(0.05, now=600, data=[_row(600 - 120, cap=CAP), _row(600 - 60, cap=big)])
+        d = [x for x in s["series"] if x["key"] == "disk"][0]
+        check("a row is normalised against the capacity IT recorded: disk grew, same 49 G, half the %",
+              d["norm"][-2] == 10.72 and d["norm"][-1] == 5.36 and d["real"][-1] == 49.0)
+
+        # -- GAPS: a power cut is a break in the line, never a line drawn through the dark ---------------------
+        s = build(0.05, now=600, data=[_row(600 - 180), _row(600 - 60)])
+        c = [x for x in s["series"] if x["key"] == "cpu"][0]
+        check("a minute with no row is a null on a dense axis, not an interpolation",
+              c["norm"] == [None, 10.0, None, 10.0])
+        check("the axis ends on the last COMPLETE minute, so a chart never opens with a trailing gap",
+              s["t0"] + (s["n"] - 1) * s["step"] == 540)
+        check("the payload says how much of the window is missing", s["gaps"] == 2 and s["minutes"] == 2)
+        check("`now` is the newest minute that has data", c["now"]["real"] == 10.0)
+
+        # -- a metric with no honest denominator gets no line --------------------------------------------------
+        s = build(0.05, now=600, data=[_row(600 - 60, cap=dict(CAP, watts=None))])
+        check("no package power limit -> no watts line, rather than a guessed one",
+              not [x for x in s["series"] if x["key"] == "watts"])
+
+        # -- PALETTE: one fixed hue per metric, in a fixed order, never recycled -------------------------------
+        hues = [x["hue"] for x in SPEC]
+        check("six metrics, six hues, no hue used twice", len(hues) == len(set(hues)) == 6)
+        check("slots are the fixed published order 1..6, never reassigned",
+              [x["slot"] for x in SPEC] == [1, 2, 3, 4, 5, 6])
+        check("no series is identified by colour alone: every one has a label and its own dash",
+              all(x["label"] and x["dash"] for x in SPEC) and len({x["dash"] for x in SPEC}) == 6)
+        check("the surface is chosen, not flipped: one opaque image for both Slack themes",
+              SURFACE["mode"] == "dark" and SURFACE["bg"].startswith("#"))
+        s = build(0.05, now=600, data=[_row(600 - 60)])
+        check("every series ships both surfaces' hex, so the seam never has to pick a colour",
+              all(x["colour"] and x["light"] for x in s["series"]))
+        check("temperature and RAM carry the max band the owner asked for; the others do not",
+              all((x["norm_max"] is not None) == (x["key"] in ("temp", "ram")) for x in s["series"]))
+
+        # -- THE SEAM ------------------------------------------------------------------------------------------
+        try:
+            render_png(s, f"{tmp}/x.png")
+            ok = False
+        except RendererUnavailable as e:
+            ok = "owner" in str(e)
+        check("the PNG backend refuses out loud, owner-gated, instead of half-drawing", ok)
+        t = render_text(s, 20)
+        check("the text chart works today with nothing installed", "CPU" in t and "temp" in t)
+        check("...and labels each line with its real number", "/457G" in t)
+        wrote, why = render("auto")
+        check("render writes the data payload whether or not a chart can be drawn", "current.json" in wrote)
+        check("auto falls back to the text chart and says why", "current.txt" in wrote and "matplotlib" in why)
+        check("no PNG is left claiming to be current",
+              "current.png" not in wrote and not os.path.exists(f"{tmp}/current.png"))
+        check("current.json is valid JSON with a dense axis", json.load(open(f"{tmp}/current.json"))["step"] == 60)
+        check("nothing is left half-written: temp files are renamed into place", not glob.glob(f"{tmp}/.*.tmp"))
+
+        # -- STORAGE -------------------------------------------------------------------------------------------
+        append(_row(600))
+        append(_row(660))
+        check("rows append one JSON line per minute to that UTC day's file",
+              len(_read(f"{tmp}/1970-01-01.jsonl").splitlines()) == 2)
+        open(f"{tmp}/2000-01-01.jsonl", "w").write("{}\n")
+        open(f"{tmp}/{_day(time.time())}.jsonl", "a").write("not json\n")
+        prune()
+        check("days past KEEP_DAYS are pruned, today's is kept",
+              not os.path.exists(f"{tmp}/2000-01-01.jsonl") and os.path.exists(f"{tmp}/{_day(time.time())}.jsonl"))
+        check("a half-written last line is skipped, it does not take the chart down", isinstance(rows(24), list))
+
+        # -- and one real minute end to end, short --------------------------------------------------------------
+        r = record_minute(period=2, sample=1)
+        check("record_minute reads this box and returns a whole row",
+              r["s"] >= 2 and r["cap"]["cores"] and r["load"]["m"] is not None and r["dt"] >= 2)
+        check("the row is stamped with the minute it covers, on the minute", r["t"].endswith(":00Z"))
+    finally:
+        globals()["DIR"] = live
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"cc-vitals selfcheck: {n[0]} passed, {n[1]} failed")
+    return 1 if n[1] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
