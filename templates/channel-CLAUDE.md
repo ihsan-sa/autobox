@@ -39,8 +39,9 @@ A message that reveals something broken, or asks for a change, is the signal. Do
 
 1. Answer in the thread — what is happening, whether it is their side or ours, what happens next.
 2. In the same breath, put it in front of the owner: `@`-mention them in that thread (a real Slack
-   mention, so their phone buzzes) — and `cc-notify -t {{TARGET}} "<one line: what is needed, who asked>"`
-   when it is urgent or they are not in the channel. `cc-notify` stays allowed for exactly this.
+   mention, so their phone buzzes) — and `cc-notify "<one line: what is needed, who asked>"` when it is
+   urgent or they are not in the channel. That one reaches them directly — a DM and a phone push, never this
+   channel, where it would be read by everyone except them. `cc-notify` stays allowed for exactly this.
 3. Say in the thread that you have flagged it, then stop. They decide and do it; you do not.
 
 One line, the asker's words, no essay. A request nobody told the owner about is a request that never happens.

@@ -121,6 +121,29 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t
 [ "$(g Bash '{"command":"cc r t --go x"}' "$mf")" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$HOME" | CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
+echo "== cc-notify: an escalation reaches the OWNER, not the channel it came from =="
+# own HOME (the box's real config and owner id stay out of this) + a stub bot: the args cc-notify hands cc-slack ARE the routing
+NH="$T/nh"; mkdir -p "$NH/bin" "$NH/.cc" "$T/chan/.cc" "$T/plain"; : > "$T/chan/.cc/member-facing"
+cat > "$NH/bin/cc-slack" <<F
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$T/slack.args"
+F
+chmod +x "$NH/bin/cc-slack"; printf 'SLACK_BOT_TOKEN=xoxb-test\nSLACK_OWNER_ID=UOWNER\n' > "$NH/.cc/config"
+N(){ w=$1; shift; : > "$T/slack.args"
+     ( cd "$w" && env -u CC_NOTIFY_LOG_ONLY HOME="$NH" CC_NOTIFY_LOG="$NH/.cc/notify.log" "$B/cc-notify" "$@" >/dev/null 2>&1 ); }
+N "$T/chan" "Alice needs the staging DB restored"
+{ grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args"; } \
+  && ok "a member-facing session's escalation DMs the owner, never its own channel" || bad "escalation went to the channel: $(cat "$T/slack.args")"
+grep -q 'chan escalation' "$T/slack.args" && ok "it says where it came from (default title '<session dir> escalation')" || bad "escalation title: $(head -1 "$T/slack.args")"
+N "$T/plain" --owner "the disk is filling up"
+grep -q -- '-c UOWNER' "$T/slack.args" && ok "--owner reaches the owner from any session" || bad "--owner ignored: $(cat "$T/slack.args")"
+N "$T/plain" -t "$REPO/w1 done" "PR: x"
+{ grep -q -- "--route $REPO/w1 done" "$T/slack.args" && ! grep -q -- '-c ' "$T/slack.args"; } \
+  && ok "no regression: an ordinary notice still routes by title (#<repo>, #alerts)" || bad "routing changed: $(cat "$T/slack.args")"
+printf 'SLACK_BOT_TOKEN=xoxb-test\n' > "$NH/.cc/config"   # owner not paired
+N "$T/chan" "Bob asks for an API key"
+{ grep -q -- '-c #alerts' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args"; } \
+  && ok "unpaired owner: the escalation falls back to #alerts, still not the member channel" || bad "unpaired escalation: $(cat "$T/slack.args")"
 echo "== --say / --go / cc-loop =="
 "$B/cc" $REPO w1 --say hello >/dev/null 2>&1 && bad "--say should fail with no live session" || ok "--say refuses when no session"
 tmux new-window -d -t main -n "$REPO/m7" "sleep 30"; sleep 1   # M7: a headless worker's pane is a shell — typed text would run as a command
@@ -321,6 +344,10 @@ ME env CC_MODEL_DIALOG_WAIT=0.5 "$B/cc-model" switch opus "dialog case" >/dev/nu
 sleep 1
 MT capture-pane -p -t _ccmodel:sess | tail -n 3 | grep -qx '1' && ok "a Switch-model confirmation is answered, so the switch actually takes" || bad "the switch left the confirmation dialog open"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
+
+echo "== cc-reconcile (board vs reality: decision table + one end-to-end apply, no network) =="
+rec=$("$B/cc-reconcile" selfcheck 2>&1)
+grep -q '0 failed' <<<"$rec" && ok "cc-reconcile selfcheck: ${rec##*: }" || bad "cc-reconcile selfcheck: $rec"
 
 echo "== cc-publish: core/ publishes itself =="
 PUB="$T/mirror.git"; git init -q --bare "$PUB"

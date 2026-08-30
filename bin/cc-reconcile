@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""cc-reconcile — make the board match reality, and say so when it cannot.
+
+The board (~/.cc/boards/<repo>.json) is a file sessions write between turns; the box is what is actually
+true. They drift: a worker is killed and its track stays `running` for days, a PR merges and its track stays
+`review`, a worktree is deleted under a live entry. Everything downstream — `cc digest`, the Slack Home tab,
+the owner's idea of what the box is doing — reads the board, so that drift is exactly what the owner sees.
+
+  cc-reconcile [repo …]              report the drift, change nothing
+  cc-reconcile --apply               …and fix what is mechanically decidable
+  cc-reconcile --apply --notify      …and push what is NOT to the owner (once a day per finding)
+  cc-reconcile selfcheck             the decision table + one end-to-end run, no network
+    also: --json · -q · --no-net (never ask GitHub) · --grace SEC (default 600) · --repeat SEC (default 86400)
+
+TWO KINDS OF DRIFT, and telling them apart is the whole job. A DECIDABLE one has exactly one right answer in
+the evidence — the PR merged, so the track is merged — and is applied. An UNDECIDABLE one needs a person — a
+PR closed without merging, a worktree gone, work that never committed — and is reported, never guessed at.
+This tool only ever writes a track's status (through cc-board, so the lock is respected) and a note saying it
+did. It deletes nothing, opens nothing, merges nothing.
+
+WHAT COUNTS AS ALIVE — the one fact a file cannot hold, and the one this leans on hardest before demoting
+anything: a `claude` whose cwd is the track's worktree (the Home tab's rule), a `cc-loop <repo> <track>`
+(alive for hours with no claude under it while it waits out a usage limit), or a live pane in the track's
+tmux window. Any of the three and the track is running, whatever the board says. Missing that would turn
+this into a tool that stops work instead of describing it — hence also --grace, below.
+
+Exit: 0 the board matches reality · 1 something needs a person · 2 usage error.
+"""
+import calendar, glob, json, os, re, shutil, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))      # siblings come from the same bin/ as this copy: a worktree tests itself
+BOARDS, WTS, STATE = f"{HOME}/.cc/boards", f"{HOME}/.cc/worktrees", f"{HOME}/.cc/state"
+GRACE = 600        # a track the board touched less than this ago is left alone: `cc --go` writes the board, then claude takes a moment to appear
+REPEAT = 86400     # a finding that persists is worth one push a day, not one every timer tick
+PRMAX = 40         # PR lookups per run — a timer job must never stall on the network
+TERMINAL = ("merged", "done")
+
+
+def now():
+    return time.time()
+
+
+def epoch(ts):
+    """Board timestamps are UTC '2026-08-30T21:01:43Z'; anything else is 'long ago', never 'in the future'."""
+    try:
+        return float(calendar.timegm(time.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ")))
+    except Exception:
+        return 0.0
+
+
+# ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
+def procs():
+    """One pass over /proc → (live tracks by process, {ppids}). Two signals, one walk: a `claude` sitting in a
+    track worktree (the same rule the Home tab uses) and a `cc-loop <repo> <track>`, which is the only thing
+    alive while a loop waits out a usage limit. The ppid set is what makes a tmux pane 'live' below."""
+    live, ppids, root = set(), set(), WTS + os.sep
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for ln in f:
+                    if ln.startswith("PPid:"):
+                        ppids.add(ln.split()[1])
+                        break
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+            comm = open(f"/proc/{pid}/comm").read().strip()
+        except OSError:
+            continue                                    # gone between listdir and here, or not ours to read
+        for i, a in enumerate(argv):                    # `cc-loop <repo> <track> …`, however the shebang re-wrote argv[0]
+            if a and os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
+                live.add(f"{argv[i + 1]}/{argv[i + 2]}")
+                break
+        if comm == "claude":
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                continue
+            if cwd.startswith(root):
+                live.add("/".join(cwd[len(root):].split(os.sep)[:2]))
+    return live, ppids
+
+
+def tmux_live(ppids):
+    """Tracks whose tmux window still has something running in it. `cc` leaves a dead window behind an exited
+    session (`exec bash`), so a window alone proves nothing: the pane's shell must have a child, exactly as
+    `cc` decides it (pane_live)."""
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{window_name}\t#{pane_pid}"],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return set()
+    live = set()
+    for ln in out.stdout.splitlines():
+        name, _, pid = ln.partition("\t")
+        if name.count("/") == 1 and pid.strip() in ppids:
+            live.add(name)
+    return live
+
+
+def journal(repo, track):
+    """(kind, text) from the LAST STATUS line a worker left — the box's own protocol for 'I finished' and
+    'I need you'. A fresh dispatch appends after it, so only the last line speaks."""
+    try:
+        body = open(f"{STATE}/{repo}/{track}/progress.md", errors="replace").read().splitlines()[-400:]
+    except OSError:
+        return (None, "")
+    for ln in reversed(body):
+        s = ln.strip()
+        if s.upper().startswith("STATUS: DONE"):
+            return ("DONE", "")
+        if s.upper().startswith("STATUS: BLOCKED"):
+            return ("BLOCKED", s[len("STATUS: BLOCKED"):].lstrip(": ").strip())
+    return (None, "")
+
+
+def loop_end(repo, track):
+    """cc-loop's own last word ('exit 4: No commits or journal change…'), but only if it came AFTER the last
+    iteration it started — a loop killed mid-iteration ended with no word at all, and that is a finding."""
+    try:
+        body = open(f"{STATE}/{repo}/{track}/loop.log", errors="replace").read().splitlines()[-200:]
+    except OSError:
+        return ""
+    for ln in reversed(body):
+        m = re.search(r"\bexit (\d+): (.+)", ln)
+        if m:
+            return f"exit {m.group(1)}: {m.group(2)}"[:160]
+        if re.search(r"\biter \d+/\d+ start", ln):
+            return ""
+    return ""
+
+
+def pr_state(repo, url, net=True):
+    """MERGED / OPEN / CLOSED, '?' when the answer could not be had (no network, no gh, no such PR), None when
+    we never asked. '?' is reported, never acted on: an unreachable GitHub is not evidence about a track."""
+    if not net or not url or not shutil.which("gh"):
+        return None if not net else "?"
+    cwd = f"{HOME}/dev/{repo}"
+    try:
+        p = subprocess.run(["gh", "pr", "view", str(url), "--json", "state", "-q", ".state"],
+                           cwd=cwd if os.path.isdir(cwd) else None, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return "?"
+    s = p.stdout.strip().upper()
+    return s if s in ("MERGED", "OPEN", "CLOSED") else "?"
+
+
+def has_remote(repo):
+    try:
+        return subprocess.run(["git", "-C", f"{HOME}/dev/{repo}", "remote", "get-url", "origin"],
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+# ── the decision ─────────────────────────────────────────────────────────────────────────────────────────
+def decide(f):
+    """Pure — facts in, verdicts out, so the selfcheck can drive every branch without a box around it.
+
+    Returns [(kind, status|None, why)]:  fix = decidable, applied silently · ask = needs a person, applied
+    when it also has one right status and always reported · info = could not tell, only printed."""
+    st, live, pr, has_pr = f["status"], f["live"], f.get("pr_state") or "", bool(f.get("pr"))
+    jk, jt = f.get("journal") or (None, "")
+    out, settled = [], False
+    if live and st in ("todo", "blocked"):
+        out.append(("fix", "running", "a worker is in its worktree"))
+        settled = True
+    elif not live and st == "running" and f["age"] >= f.get("grace", GRACE):
+        settled = True                                  # nobody is working on it: the board's own word for that is decided here, once
+        if jk == "BLOCKED":
+            out.append(("ask", "blocked", "it stood down: " + (jt or "no question in its journal")))
+        elif jk == "DONE" and pr == "MERGED":
+            out.append(("fix", "merged", "it finished and its PR merged"))
+        elif jk == "DONE" and has_pr:
+            out.append(("fix", "review", "it finished and its PR is open"))
+        elif jk == "DONE":
+            out.append(("ask", "review", "it finished but no PR was ever opened"))
+        elif f.get("loop_end"):
+            out.append(("ask", "blocked", "its loop stopped — " + f["loop_end"]))
+        elif pr == "MERGED":
+            out.append(("fix", "merged", "its PR merged"))
+        elif pr == "OPEN":
+            out.append(("fix", "review", "its PR is open"))
+        else:
+            out.append(("ask", "blocked", "no worker, and nothing says why (killed, or the box restarted)"))
+    if not settled:                                     # the PR is the harder fact: it outranks any status but a live process
+        if pr == "MERGED" and st != "merged":
+            out.append(("fix", "merged", "its PR merged"))
+        elif pr == "OPEN" and st in TERMINAL:
+            out.append(("fix", "review", "its PR is still open"))
+        elif pr == "CLOSED" and st not in TERMINAL:
+            out.append(("ask", None, "its PR was closed without merging"))
+        elif pr == "?":
+            out.append(("info", None, "could not read its PR state"))
+    if st == "review" and not has_pr and f.get("has_remote"):
+        out.append(("ask", None, "it is waiting on a PR that was never opened"))
+    if not f["wt_exists"] and st not in TERMINAL + ("todo",):
+        out.append(("ask", None, "its worktree is gone"))   # a `todo` track has never been started: it is SUPPOSED to have no worktree
+    if f.get("commit_err"):
+        out.append(("ask", None, "its last checkpoint would not commit — that work is only in the worktree"))
+    if f.get("push_err"):
+        out.append(("ask", None, "its branch is not pushed"))
+    return out
+
+
+# ── the run ──────────────────────────────────────────────────────────────────────────────────────────────
+def facts(repos, net=True, grace=GRACE):
+    """Every board track, with what the box says about it. Yields (repo, track, board_track, facts)."""
+    live, ppids = procs()
+    live |= tmux_live(ppids)
+    prs, remotes, t0 = 0, {}, now()
+    for fn in sorted(glob.glob(f"{BOARDS}/*.json")):
+        try:
+            d = json.load(open(fn))
+        except Exception:
+            continue                                    # one unreadable board must not hide every other repo
+        repo = d.get("repo") or os.path.basename(fn)[:-5]
+        if repos and repo not in repos:
+            continue
+        for track, t in sorted(d.get("tracks", {}).items()):
+            st = t.get("status", "")
+            pr = t.get("pr", "")
+            want_pr = bool(pr) and st != "merged"   # `merged` is the one status this tool derives FROM the PR: re-reading it every tick buys nothing
+            ask_pr = want_pr and prs < PRMAX        # over the cap the PR is UNKNOWN, not absent — a run that ran out of budget says so
+            prs += bool(ask_pr)
+            wt = t.get("worktree") or f"{WTS}/{repo}/{track}"
+            if repo not in remotes:
+                remotes[repo] = has_remote(repo)
+            yield repo, track, t, {
+                "repo": repo, "track": track, "status": st, "pr": pr,
+                "pr_state": pr_state(repo, pr, net) if ask_pr else ("?" if want_pr and net else None),
+                "live": f"{repo}/{track}" in live, "wt_exists": os.path.isdir(wt),
+                "age": max(0.0, t0 - epoch(t.get("updated") or t.get("created"))), "grace": grace,
+                "journal": journal(repo, track), "loop_end": loop_end(repo, track),
+                "commit_err": os.path.exists(f"{wt}/.cc/checkpoint.err"),
+                "push_err": os.path.exists(f"{wt}/.cc/push.err"), "has_remote": remotes[repo]}
+
+
+def orphans(repos):
+    """Worktrees with no board entry at all — real work the board has never heard of. Reported only: inventing
+    a track from a directory name is the kind of guess this tool exists to avoid."""
+    known = set()
+    for fn in glob.glob(f"{BOARDS}/*.json"):
+        try:
+            d = json.load(open(fn))
+        except Exception:
+            return []                                   # an unreadable board makes every track look orphaned: say nothing
+        repo = d.get("repo") or os.path.basename(fn)[:-5]
+        known |= {f"{repo}/{t}" for t in d.get("tracks", {})}
+    out = []
+    for p in sorted(glob.glob(f"{WTS}/*/*")):
+        repo, track = p.split(os.sep)[-2:]
+        if os.path.isdir(p) and f"{repo}/{track}" not in known and (not repos or repo in repos):
+            out.append((repo, track, ("ask", None, "a worktree with no board entry")))
+    return out
+
+
+def board(*args):
+    try:
+        return subprocess.run([f"{BIN}/cc-board", *args], capture_output=True, text=True, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
+def ledger(path, write=None):
+    """The 'already told the owner' ledger: {finding: when}. A finding that persists is worth one push a day,
+    not one every timer tick — and one that has gone away is dropped, so its return is news again."""
+    if write is None:
+        try:
+            return json.load(open(path))
+        except Exception:
+            return {}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    json.dump(write, open(tmp, "w"))
+    os.replace(tmp, path)
+    return write
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    repos, apply_, notify, as_json, quiet, net, grace, repeat = [], False, False, False, False, True, GRACE, REPEAT
+    while argv:
+        a = argv.pop(0)
+        if a == "--apply":
+            apply_ = True
+        elif a == "--notify":
+            notify = True
+        elif a == "--json":
+            as_json = True
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a == "--no-net":
+            net = False
+        elif a in ("--grace", "--repeat"):
+            if not argv or not argv[0].lstrip("-").isdigit():
+                print(f"cc-reconcile: {a} needs a number of seconds", file=sys.stderr)
+                return 2
+            v = int(argv.pop(0))
+            grace, repeat = (v, repeat) if a == "--grace" else (grace, v)
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a.startswith("-"):
+            print(f"cc-reconcile: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            repos.append(a)
+    for r in repos:   # a named repo with no board is a typo, not "nothing to reconcile"
+        if not os.path.exists(f"{BOARDS}/{r}.json"):
+            print(f"cc-reconcile: no board for '{r}'", file=sys.stderr)
+            return 2
+    recs, tracks = [], 0
+    for repo, track, t, f in facts(repos, net, grace):
+        tracks += 1
+        for kind, st, why in decide(f):
+            recs.append({"repo": repo, "track": track, "kind": kind, "from": f["status"], "to": st, "why": why})
+    for repo, track, (kind, st, why) in orphans(repos):
+        recs.append({"repo": repo, "track": track, "kind": kind, "from": "", "to": st, "why": why})
+    for r in recs:
+        r["applied"] = bool(apply_ and r["to"] and r["to"] != r["from"]
+                            and board("status", r["repo"], r["track"], r["to"])
+                            and board("note", r["repo"], r["track"],
+                                      f"reconciled: {r['from']} → {r['to']} ({r['why']})"))
+    if apply_ and any(r["applied"] for r in recs):
+        os.makedirs(STATE, exist_ok=True)
+        with open(f"{STATE}/reconcile.log", "a") as log:
+            for r in (x for x in recs if x["applied"]):
+                log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t"
+                          f"{r['repo']}/{r['track']}\t{r['from']} -> {r['to']}\t{r['why']}\n")
+    asks = [r for r in recs if r["kind"] == "ask"]
+    if as_json:
+        print(json.dumps({"tracks": tracks, "records": recs}, indent=2))
+    elif not quiet:
+        for r in recs:
+            move = f"{r['from']} → {r['to']}" if r["to"] and r["to"] != r["from"] else ""
+            word = {"ask": "needs you", "info": "unknown"}.get(r["kind"], "fixed" if r["applied"] else "would fix")
+            print(f"  {word:<9}  {r['repo']}/{r['track']:<16} {move:<20} {r['why']}")
+        info = sum(r["kind"] == "info" for r in recs)
+        print(f"{len(recs) - len(asks) - info} {'fixed' if apply_ else 'to fix'} · {len(asks)} needs you · "
+              f"{info} unknown  ({tracks} tracks)" if recs else f"the board matches reality ({tracks} tracks)")
+    if notify:
+        path = f"{STATE}/reconcile.seen.json"
+        old, t0 = ledger(path), now()
+        keys = {f"{r['repo']}/{r['track']}: {r['why']}": r for r in asks}
+        fresh = [r for k, r in keys.items() if t0 - float(old.get(k, 0) or 0) >= repeat]
+        told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
+        if keys or old:   # only findings that are still true survive the write: one that comes back is news again
+            ledger(path, {k: (t0 if k in told else old.get(k, 0)) for k in keys})
+        if fresh:
+            one = {r["repo"] for r in fresh}
+            title = f"{one.pop()} board" if len(one) == 1 else "board"   # cc-notify routes a title that starts with a repo name into that repo's channel
+            body = "\n".join(f"• {r['repo']}/{r['track']} — {r['why']}"
+                             + (f" (set to {r['to']})" if r["applied"] else "") for r in fresh)
+            subprocess.run([f"{BIN}/cc-notify", "-t", title,
+                            f"The board did not match the box, and this part needs you:\n{body}"],
+                           capture_output=True, timeout=30)
+    return 1 if asks else 0
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    """The decision table, then one end-to-end run against a throwaway HOME. No network, no Slack, no board
+    but its own. Usage: cc-reconcile selfcheck"""
+    import tempfile
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+        else:
+            f += 1
+            print(f"  ✗ {name}")
+
+    def F(**kw):
+        d = {"status": "running", "pr": "", "pr_state": None, "live": False, "wt_exists": True,
+             "age": 10 ** 6, "grace": GRACE, "journal": (None, ""), "loop_end": "",
+             "commit_err": False, "push_err": False, "has_remote": True}
+        d.update(kw)
+        return d
+
+    def one(**kw):
+        r = decide(F(**kw))
+        return (r[0][0], r[0][1]) if r else ("none", None)
+
+    # a live process outranks the board, and a dead one never outranks a fresh dispatch
+    ok("live worker in a blocked track → running", one(status="blocked", live=True) == ("fix", "running"))
+    ok("live worker in a merged track is not un-merged", one(status="merged", live=True, pr="u", pr_state="MERGED") == ("none", None))
+    ok("running + no worker, but dispatched seconds ago → left alone", one(age=5, grace=600) == ("none", None))
+    # running with nobody working on it: the evidence decides which word replaces it
+    ok("journal BLOCKED → blocked, and the owner is asked",
+       decide(F(journal=("BLOCKED", "which one?")))[0][:2] == ("ask", "blocked"))
+    ok("the blocked question is carried, not summarised", "which one?" in decide(F(journal=("BLOCKED", "which one?")))[0][2])
+    ok("journal DONE + merged PR → merged", one(journal=("DONE", ""), pr="u", pr_state="MERGED") == ("fix", "merged"))
+    ok("journal DONE + open PR → review", one(journal=("DONE", ""), pr="u", pr_state="OPEN") == ("fix", "review"))
+    ok("journal DONE + no PR → asks (nobody opened one)", one(journal=("DONE", "")) == ("ask", "review"))
+    ok("loop exit → blocked, with the loop's own reason", decide(F(loop_end="exit 4: stalled"))[0][:2] == ("ask", "blocked"))
+    ok("nothing says why → blocked and the owner hears about it", one() == ("ask", "blocked"))
+    # the PR outranks a stale status
+    ok("review + merged PR → merged", one(status="review", pr="u", pr_state="MERGED") == ("fix", "merged"))
+    ok("merged + open PR → review", one(status="merged", pr="u", pr_state="OPEN") == ("fix", "review"))
+    ok("closed-not-merged PR is never guessed at", one(status="review", pr="u", pr_state="CLOSED") == ("ask", None))
+    ok("an unreadable PR state is unknown, not a fix", one(status="review", pr="u", pr_state="?") == ("info", None))
+    ok("no network → no PR verdict at all", one(status="review", pr="u", pr_state=None) == ("none", None))
+    # what only a person can settle
+    ok("a missing worktree is reported, not repaired", ("ask", None, "its worktree is gone") in decide(F(status="review", pr="u", wt_exists=False)))
+    ok("a merged track's missing worktree is normal", decide(F(status="merged", wt_exists=False)) == [])
+    ok("a track that never started is not missing a worktree", decide(F(status="todo", wt_exists=False)) == [])
+    ok("a refused checkpoint is a finding", any("checkpoint" in w for _, _, w in decide(F(status="review", pr="u", commit_err=True))))
+    ok("an unpushed branch is a finding", any("not pushed" in w for _, _, w in decide(F(status="review", pr="u", push_err=True))))
+    ok("review with no PR and a remote → asks", any("never opened" in w for _, _, w in decide(F(status="review"))))
+    ok("review with no PR and no remote is silent", decide(F(status="review", has_remote=False)) == [])
+    ok("a quiet track says nothing", decide(F(status="review", pr="u", pr_state="OPEN")) == [])
+
+    # end to end: a real board, a real worktree, a real apply — in a HOME of its own
+    with tempfile.TemporaryDirectory() as th:
+        env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log")
+        repo = "selfcheckrepo"
+        os.makedirs(f"{th}/.cc/worktrees/{repo}/t1", exist_ok=True)
+        os.makedirs(f"{th}/.cc/worktrees/{repo}/t3", exist_ok=True)
+        os.makedirs(f"{th}/.cc/state/{repo}/t1", exist_ok=True)
+        open(f"{th}/.cc/state/{repo}/t1/progress.md", "w").write("- did a thing\nSTATUS: BLOCKED: which schema?\n")
+
+        def cb(*a):
+            return subprocess.run([f"{BIN}/cc-board", *a], env=env, capture_output=True, text=True, timeout=30)
+
+        cb("init", repo, f"{th}/dev/{repo}", "main")
+        cb("add", repo, "t1", "a track that stood down", "")
+        cb("status", repo, "t1", "running")
+        r = subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--apply", "--notify",
+                            "--no-net", "--grace", "0"], env=env, capture_output=True, text=True, timeout=120)
+        ok("end to end: exits 1 when something needs a person", r.returncode == 1)
+        ok("end to end: the stalled track is blocked on the board now",
+           cb("get", repo, "t1", "status").stdout.strip() == "blocked")
+        ok("end to end: the board carries a note saying it was reconciled",
+           any("reconciled: running → blocked" in n["msg"]
+               for n in json.loads(cb("json", repo).stdout)["tracks"]["t1"]["notes"]))
+        ok("end to end: the question from the journal reached the report", "which schema?" in r.stdout)
+        ok("end to end: the orphaned worktree is reported", f"{repo}/t3" in r.stdout)
+        ok("end to end: the owner was told once", sum("board" in ln for ln in
+                                                      open(f"{th}/notify.log").read().splitlines()) == 1)
+        r2 = subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--apply", "--notify",
+                             "--no-net", "--grace", "0"], env=env, capture_output=True, text=True, timeout=120)
+        ok("end to end: a second run does not page the owner again",
+           sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines()) == 1)
+        ok("end to end: and it is idempotent — the track stays blocked",
+           cb("get", repo, "t1", "status").stdout.strip() == "blocked" and r2.returncode == 1)
+    print(f"cc-reconcile selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

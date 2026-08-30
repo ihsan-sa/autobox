@@ -37,6 +37,7 @@ The level below `~/COMMS.md`: how a channel becomes a session, what the marks an
 
 ## What arrives on its own — nobody asks for these
 - `cc-notify` into `#<repo>` (worker done / blocked / stalled, PR links), boot notices and the daily digest into `#<box>` or `SLACK_CHANNEL`, plus ntfy pushes to the phone.
+- **An escalation is delivered, not routed.** A member-facing session's `cc-notify`, or any `--owner` one, comes to you as a DM and a phone push — never into the channel it came from, where everyone except you would read it.
 - **Claude usage limit:** one `<box> limit` notice in `#alerts` with the reset time. Workers and the box session pause and resume on their own, nothing counted as a failure, and `!status` / `!digest` show `⏳ Claude usage limit until 11:40Z` until it lifts.
 - **The primary model at its limit:** the box moves to the fallback and back, one `<box> model` line in `#alerts` each time. Live sessions are retuned in place, new ones start on the fallback, until the primary answers a probe again (`cc-model status`).
 - **The audit is one line, never a wall of text:** `cc-audit` (03:30 UTC — review every 3rd day, weekly on Sundays, monthly on the 1st) posts one line into `#<box>` and the whole report on the **`#<box>` canvas**. Monthly findings also land on the board as `audit-<yyyymm>`; nothing gets fixed until you say so.

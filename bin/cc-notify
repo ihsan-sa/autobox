@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # cc-notify — reach the owner. Always logs to ~/.cc/notify.log; pushes via ntfy and/or Slack when configured.
-#   cc-notify [-t title] [-p low|default|high|urgent] "message"     (or message on stdin)
+#   cc-notify [-t title] [-p low|default|high|urgent] [--owner] "message"     (or message on stdin)
 #   cc-notify setup        create the ntfy topic + show the phone subscription steps
 #   cc-notify test         send a test push
 # Exit: 0 if at least one configured channel took the message (or none is configured — the log is the channel),
 #   1 only if every configured channel failed, so callers (cc-boot-notify) can retry on status instead of on text.
 # Config: ~/.cc/config  (NTFY_TOPIC=..., NTFY_SERVER=https://ntfy.sh, SLACK_WEBHOOK=https://hooks.slack.com/...;
 #   with SLACK_BOT_TOKEN set (cc slack setup) the bot posts instead — into #<repo> when the title starts with a repo name, else #alerts, else SLACK_CHANNEL)
+# ESCALATION — with --owner, or from a member-facing session (cc-guard's `.cc/member-facing` marker, walked up from the
+#   cwd): the bot DMs the OWNER instead of routing by title. Such a session's own channel is where the members are, so an
+#   escalation routed there reaches everyone except the one person it is for. Unpaired owner: #alerts, never that channel.
+#   The session dir's name — which is its channel's too — becomes the default title.
 # Env: CC_NOTIFY_LOG_ONLY (log, never push) · CC_NOTIFY_LOG (test hook: write the log somewhere else, so a run counts
 #   its own lines instead of the owner's).
 set -uo pipefail
@@ -22,7 +26,13 @@ case "${1:-}" in
     echo "Then run: cc-notify test"; exit 0 ;;
   test) exec "$0" -t "$BOX test" "Notifications work. $(date -u +%H:%M) UTC" ;;
 esac
-while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; *) break;; esac; done
+# Is this an escalation? Same walk as cc-guard: the marker is the truth, CC_ROLE only a convenience. `from` is the
+# session dir's name — its Slack channel's name too — and it makes a better default title than the box's.
+owner=0; from=""; [ "${CC_ROLE:-}" = member ] && owner=1
+d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
+  [ -f "$d/.cc/member-facing" ] && { owner=1; from=${d##*/}; break; }; d=${d%/*}; done
+[ -n "$from" ] && title="$from escalation"
+while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;; *) break;; esac; done
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
 printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n' ' ')" >> "$LOG"
 [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && exit 0   # tests set this: log, never push
@@ -36,8 +46,10 @@ if [ -n "${NTFY_TOPIC:-}" ]; then
 fi
 if [ -n "${SLACK_BOT_TOKEN:-}" ] || [ -n "${SLACK_WEBHOOK:-}" ]; then   # one channel: the bot, else the webhook
   tried=$((tried + 1)); bang=$( { [ "$prio" = high ] || [ "$prio" = urgent ]; } && echo ' :rotating_light:')
-  if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post --route "$title" "$(printf '*%s*%s\n%s' "$title" "$bang" "$msg")" >/dev/null 2>&1; then
-    ok=$((ok + 1))   # posted by the bot (project channel or SLACK_CHANNEL)
+  # an escalation is DELIVERED, not routed: the owner's DM — unpaired, #alerts (cc-slack falls that back to SLACK_CHANNEL)
+  if [ "$owner" = 1 ]; then dest=(-c "${SLACK_OWNER_ID:-#${SLACK_ALERTS:-alerts}}"); else dest=(--route "$title"); fi
+  if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post "${dest[@]}" "$(printf '*%s*%s\n%s' "$title" "$bang" "$msg")" >/dev/null 2>&1; then
+    ok=$((ok + 1))   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)
   elif [ -n "${SLACK_WEBHOOK:-}" ] &&
        jq -cn --arg t "$title" --arg m "$msg" --arg b "$bang" \
          'def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
