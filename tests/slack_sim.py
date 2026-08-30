@@ -210,7 +210,7 @@ def run(seed, cs_path):
     d.cfg = {"SLACK_OWNER_ID": OWNER, "SLACK_BOT_TOKEN": "xoxb-fake"}; d.bot_user = BOT; d.bot_id = BOTID
     chats = [f"C{i}" for i in range(CHATS)]
     d.route = lambda chat, ctype=None: f"repo{chat[1:]}" if chat in chats else None
-    d.chan_name = lambda c: f"repo{c[1:]}"; d.user_name = lambda u: u
+    d.chan_name = lambda c: f"repo{c[1:]}"; d.user_name = lambda u: u; d.user_info = lambda u: (u, u)
     delivered = []
     d.deliver = lambda target, payload, **k: delivered.append(payload) or "delivered"
     for c in chats:                                  # one live session per chat: reactions are delivered only to those

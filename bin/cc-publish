@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# cc-publish — publish this repo's `core/` prefix to its own public repo, one commit per publish.
+#   cc-publish [--dry-run] [--from <sha>] [--message <text>]   publish, if the public repo is behind
+#   cc-publish status                                          one line: configured? in sync?
+#   cc-publish setup <url> [repo] [prefix]                     write the config keys into ~/.cc/config
+#
+# WHAT SHIPS is the prefix and nothing else: the whole tree at <prefix> goes, unfiltered. This script never picks
+# paths, never rewrites content, never cherry-picks — the public/private boundary is the directory boundary, drawn
+# once where the code lives, not re-decided at publish time. Its ONE veto is the identity gate: if anything in that
+# tree (a file's contents, a file's name, or the commit message about to be written) matches this box's own name,
+# the publish ABORTS loudly and pushes nothing. Shipping a trimmed tree is never an option — a red gate is a bug in
+# the source repo, and it is fixed there.
+#
+# ONE COMMIT PER PUBLISH, parented on the public repo's tip: the private repo's history stays private. A
+# history-preserving `git subtree split` would republish every past commit of the prefix, so any identity that ever
+# sat there — even long since fixed — would ship in `git log -p` forever (#32-#37 were exactly that).
+#
+# The source is always origin/<default branch>, freshly fetched: only merged, pushed code is ever published, whatever
+# branch or worktree the caller happens to be sitting in.
+#
+# Config — ~/.cc/config, each key overridable from the environment. With no PUBLISH_REMOTE this is a no-op, so a bare
+# clone of the public repo never tries to publish anything:
+#   PUBLISH_REMOTE   git URL of the public repo                 (unset = publishing is off)
+#   PUBLISH_REPO     control repo under ~/dev to publish from   (default: the repo $PWD is in)
+#   PUBLISH_PREFIX   the directory that ships                   (default: core)
+#   PUBLISH_BRANCH   branch on the public repo                  (default: main)
+#   PUBLISH_DENY     extra ERE that must never appear in it     (this box's user, host and repo names always deny)
+#   PUBLISH_ALLOW    paths inside the prefix the gate skips     (default: LICENSE README.md — they name the public repo)
+set -uo pipefail
+BIN="$(dirname "$(realpath "$0")")"; CFG="$HOME/.cc/config"
+STATE="${CC_PUBLISH_STATE:-$HOME/.cc/state}"   # log + lock; tests point it at their own dir so two runs never share a lock
+LOG="$STATE/publish.log"; mkdir -p "$STATE"
+E_REMOTE="${PUBLISH_REMOTE:-}"; E_REPO="${PUBLISH_REPO:-}"; E_PREFIX="${PUBLISH_PREFIX:-}"
+E_BRANCH="${PUBLISH_BRANCH:-}"; E_DENY="${PUBLISH_DENY:-}"; E_ALLOW="${PUBLISH_ALLOW:-}"
+# shellcheck disable=SC1090
+[ -f "$CFG" ] && . "$CFG"
+REMOTE="${E_REMOTE:-${PUBLISH_REMOTE:-}}"; REPO="${E_REPO:-${PUBLISH_REPO:-}}"
+PREFIX="${E_PREFIX:-${PUBLISH_PREFIX:-core}}"; BRANCH="${E_BRANCH:-${PUBLISH_BRANCH:-main}}"
+DENY_X="${E_DENY:-${PUBLISH_DENY:-}}"; ALLOW="${E_ALLOW:-${PUBLISH_ALLOW:-LICENSE README.md}}"
+
+mode=publish; dry=0; from=""; msg=""
+while [ $# -gt 0 ]; do case "$1" in
+  status)         mode=status; shift ;;
+  setup)          mode=setup; shift; break ;;
+  -n|--dry-run)   dry=1; shift ;;
+  --from)         from="${2:-}"; shift 2 ;;
+  -m|--message)   msg="${2:-}"; shift 2 ;;
+  -h|--help)      sed -n '2,6p' "$0"; exit 0 ;;
+  *) echo "usage: cc-publish [--dry-run] [--from <sha>] [--message <text>] | status | setup <url> [repo] [prefix]" >&2; exit 2 ;;
+esac; done
+
+if [ "$mode" = setup ]; then
+  [ -n "${1:-}" ] || { echo "usage: cc-publish setup <public-repo-url> [control-repo] [prefix]" >&2; exit 2; }
+  { echo "PUBLISH_REMOTE=$1"
+    [ -n "${2:-}" ] && echo "PUBLISH_REPO=$2"
+    [ -n "${3:-}" ] && echo "PUBLISH_PREFIX=$3"; } >> "$CFG"
+  echo "wrote the publish keys to $CFG — check with: cc-publish status"; exit 0
+fi
+
+# A publish that cannot happen is not silent: it reaches the owner (ntfy/Slack) and leaves a line in the log.
+die() {
+  printf 'cc-publish: %s\n' "$1" >&2
+  printf '%s\tABORT\t%s\n' "$(date -u +%FT%TZ)" "$(printf '%s' "$1" | tr '\n' ' ')" >> "$LOG"
+  [ -x "$BIN/cc-notify" ] && "$BIN/cc-notify" -p high -t "${REPO:+[$REPO] }publish blocked" "$1" >/dev/null 2>&1   # a title starting with the repo routes to its channel
+  exit 1
+}
+if [ -z "$REMOTE" ]; then
+  [ "$mode" = status ] && echo "publish: off (no PUBLISH_REMOTE in ~/.cc/config — see \`cc-publish setup\`)"
+  exit 0
+fi
+if [ -n "$REPO" ]; then R="$HOME/dev/$REPO"; else R="$(git rev-parse --show-toplevel 2>/dev/null)"; fi
+git -C "${R:-/nonexistent}" rev-parse --git-dir >/dev/null 2>&1 || die "no git repo to publish from (PUBLISH_REPO=${REPO:-unset}, cwd=$PWD)"
+
+SRCBR="$(git -C "$R" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"; SRCBR="${SRCBR#origin/}"
+# Named refs, never FETCH_HEAD: any other session fetching in the same repo would overwrite it under us.
+git -C "$R" fetch -q --no-tags origin "+${SRCBR:=main}:refs/remotes/origin/$SRCBR" || die "cannot fetch origin/$SRCBR in $R"
+SRC="$(git -C "$R" rev-parse "refs/remotes/origin/$SRCBR")" || die "cannot resolve origin/$SRCBR"
+TREE="$(git -C "$R" rev-parse "$SRC:$PREFIX" 2>/dev/null)" || die "no '$PREFIX/' in $SRCBR at ${SRC:0:8} — nothing to publish"
+
+# The identity gate. The strings are computed here, never written down: a script that lives INSIDE the published
+# prefix cannot carry the very names it exists to keep out. A box is identified by its user, its host and its
+# control repo; PUBLISH_DENY adds whatever else this box calls itself (IPs, tailnet, serial).
+lit() { sed 's/[][\\.^$*+?(){}|]/\\&/g' <<<"$1"; }
+DENY="$(lit "$(id -un)")|$(lit "$(hostname -s)")"
+[ -n "$REPO" ] && DENY="$DENY|$(lit "$REPO")"
+[ -n "$DENY_X" ] && DENY="$DENY|$DENY_X"
+paths=("$PREFIX"); for a in $ALLOW; do paths+=(":!$PREFIX/$a"); done
+hits="$(git -C "$R" grep -I -i -n -E "$DENY" "$SRC" -- "${paths[@]}" 2>/dev/null | head -10)"
+[ -z "$hits" ] || die "identity gate: '$PREFIX/' at ${SRC:0:8} names this box — NOTHING was published (fix it in the source repo; the tree is never trimmed to get past this):
+$hits"
+names="$(git -C "$R" ls-tree -r --name-only "$TREE" | grep -iE "$DENY" | head -10)"
+[ -z "$names" ] || die "identity gate: a file NAME under '$PREFIX/' names this box — NOTHING was published:
+$names"
+
+exec 9>"$STATE/publish.lock"
+flock -n 9 || { echo "cc-publish: another publish is running"; exit 0; }
+ls="$(git ls-remote --heads "$REMOTE" "$BRANCH")" || die "cannot reach the public repo ($REMOTE)"
+PARENT=""; PTREE=""
+if [ -n "$ls" ]; then
+  git -C "$R" fetch -q --no-tags "$REMOTE" "+$BRANCH:refs/cc-publish/$BRANCH" || die "cannot fetch $BRANCH from the public repo"
+  PARENT="$(git -C "$R" rev-parse "refs/cc-publish/$BRANCH")"; PTREE="$(git -C "$R" rev-parse "$PARENT^{tree}")"
+fi
+if [ "$mode" = status ]; then
+  if   [ "$PTREE" = "$TREE" ]; then echo "publish: in sync — $PREFIX/ at ${SRC:0:8} is ${PARENT:0:8} on $BRANCH"
+  elif [ -n "$PARENT" ];       then echo "publish: behind — $PREFIX/ at ${SRC:0:8} differs from ${PARENT:0:8} on $BRANCH"
+  else                              echo "publish: never published — $PREFIX/ at ${SRC:0:8}, no $BRANCH on the public repo yet"; fi
+  exit 0
+fi
+[ "$PTREE" = "$TREE" ] && { echo "cc-publish: already up to date ($PREFIX/ == $BRANCH at ${PARENT:0:8})"; exit 0; }
+
+if [ -z "$msg" ]; then
+  # What changed since last time: the previous publish says where it came from, so the range is exact. Without that
+  # trailer (the first publish onto a repo filled by hand) it is just the newest subject.
+  base="$from"
+  [ -z "$base" ] && [ -n "$PARENT" ] && base="$(git -C "$R" log -1 --format=%B "$PARENT" | sed -n 's/^Published-From: *//p' | tail -1)"
+  git -C "$R" cat-file -e "${base:-x}^{commit}" 2>/dev/null || base=""
+  subs=()
+  [ -n "$base" ] && mapfile -t subs < <(git -C "$R" log --format=%s "$base..$SRC" -- "$PREFIX")
+  [ "${#subs[@]}" -gt 0 ] || mapfile -t subs < <(git -C "$R" log -1 --format=%s "$SRC")
+  msg="${subs[0]}"
+  [ "${#subs[@]}" -gt 1 ] && msg="$msg"$'\n\n'"$(printf -- '- %s\n' "${subs[@]:1}")"
+  msg="$msg"$'\n\n'"Published-From: $SRC"
+fi
+grep -qiE "$DENY" <<<"$msg" && die "identity gate: the commit message names this box — NOTHING was published. Re-run with --message '<text>':
+$(grep -inE "$DENY" <<<"$msg" | head -5)"
+
+par=(); [ -n "$PARENT" ] && par=(-p "$PARENT")
+COMMIT="$(git -C "$R" commit-tree "$TREE" "${par[@]}" -m "$msg")" || die "commit-tree failed"
+if [ "$dry" = 1 ]; then
+  echo "cc-publish (dry run): would push ${COMMIT:0:8} (tree ${TREE:0:8}) onto $BRANCH${PARENT:+ after ${PARENT:0:8}} of $REMOTE"
+  [ -n "$PARENT" ] && git -C "$R" diff --stat "$PARENT" "$COMMIT" | tail -25
+  sed 's/^/  | /' <<<"$msg"; exit 0
+fi
+# Plain push, no lease and no force: the parent IS the tip we just read, so this is a fast-forward or it fails. A
+# public repo that moved under us keeps its commits — re-running rebuilds on the new tip.
+git -C "$R" push --quiet "$REMOTE" "$COMMIT:refs/heads/$BRANCH" || die "push to the public repo failed (it may have moved — re-run)"
+printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "${SRC:0:12}" "${COMMIT:0:12}" "$BRANCH" >> "$LOG"
+echo "cc-publish: published $PREFIX/ at ${SRC:0:8} as ${COMMIT:0:8} on $BRANCH"

@@ -43,9 +43,19 @@ A bare clone of autobox works too — it just has no overlay, so `install.sh` li
 From the overlay repo, on the default branch:
 
 ```
+cc-publish setup <autobox-url> <your-repo>       # once: writes PUBLISH_* into ~/.cc/config
+cc-publish status                                # in sync? behind?
+cc-publish --dry-run                             # the exact commit it would push
 git subtree pull --prefix=core <autobox-url> main --squash    # take upstream changes
-git subtree push --prefix=core <autobox-url> main             # publish yours
 ```
 
-Nothing under `core/` may name your box. `core/tests/check.sh` is static-only for that reason, and the pre-commit hook
-runs it on every commit to the default branch.
+Publishing then happens **by itself after every merge** to your default branch, and `cc-publish` is safe to run by hand
+any time — it is idempotent. It sends the *whole* `core/` tree of `origin/<default branch>` as one commit on top of the
+public repo's tip; it never picks paths and never publishes anything outside the prefix, so the only thing that decides
+what is public is where you put the file.
+
+Nothing under `core/` may name your box — not its contents, not a file name, not the commit subject. `cc-publish`
+checks all three against your user, host and repo names (add IPs, serials or a tailnet with `PUBLISH_DENY=`) and
+**aborts the whole publish** on a hit rather than shipping a trimmed tree; the failure reaches you through `cc-notify`.
+`core/tests/check.sh` is static-only for the same reason, and the pre-commit hook runs it on every commit to the
+default branch. Publishing is off until `PUBLISH_REMOTE` exists, so a bare clone of autobox never publishes anything.

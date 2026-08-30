@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# cc-guard — PreToolUse hook: deterministic human gates for AUTONOMOUS sessions (workers/tracks/loops).
-# Applies when CC_ROLE=worker is set, or the session cwd is inside a cc track worktree (.cc/track marker) —
+# cc-guard — PreToolUse hook: deterministic human gates for AUTONOMOUS and MEMBER-FACING sessions.
+# Applies when CC_ROLE=worker|member is set, or the session cwd is under a dir marked .cc/track (a cc track
+# worktree, role=worker) or .cc/member-facing (a session anybody in a Slack channel can talk to, role=member) —
 # so interactive TRACK sessions are gated too (intended); plain operator/planning sessions are not.
+# The MARKER is the truth: CC_ROLE is only a convenience, the walk works with no env at all.
 # Denies (exit 2 + reason) the four owner gates:
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
+# role=member = every worker gate PLUS: no dispatching workers, no reading the box's secrets, no re-wiring Slack.
 set -uo pipefail
-command -v jq >/dev/null 2>&1 || { [ "${CC_ROLE:-}" = worker ] && { echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2; }; exit 0; }
+# No jq = no cwd, so no marker walk either: fail CLOSED on the role we do know from the env (cc sets it for both).
+command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}" in worker|member) echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2;; esac; exit 0; }
 inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""' <<<"$inp"); cwd=$(realpath -m -- "${cwd:-/}" 2>/dev/null || echo "$cwd")
 # A command position: start, after a separator/substitution, or after wrapper words that hide the real command
 # (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
@@ -17,11 +21,16 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
 role="${CC_ROLE:-}"
-if [ "$role" != worker ]; then
-  d="$cwd"; while [ -n "$d" ] && [ "$d" != / ]; do [ -f "$d/.cc/track" ] && { role=worker; break; }; d=$(dirname "$d"); done
+if [ "$role" != member ]; then   # walk up for a marker — one stat per level, no config to parse. A marker only makes the
+  d="$cwd"                       # gates STRICTER (member wins over an inherited CC_ROLE=worker) and never clears the env role.
+  while [ -n "$d" ] && [ "$d" != / ]; do
+    [ -f "$d/.cc/member-facing" ] && { role=member; break; }   # a session anybody in Slack can talk to
+    [ -f "$d/.cc/track" ] && { role=worker; break; }
+    d=$(dirname "$d"); done
 fi
-[ "$role" = worker ] || exit 0
+case "$role" in worker|member) ;; *) exit 0;; esac
 deny(){ echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
+secret_path(){ case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json) return 0;; esac; return 1; }
 case "$tool" in
   Bash)
     cmd=$(jq -r '.tool_input.command // ""' <<<"$inp"); cmd=${cmd//\"/}; cmd=${cmd//\'/}
@@ -44,14 +53,33 @@ case "$tool" in
     grep -qE "$AT"'docker +(system +prune|rm|rmi|volume +rm)' <<<"$cmd" && deny "destroying docker resources"
     grep -qE "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' <<<"$cmd" && deny "host/network/service changes"
     grep -qE 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' <<<"$cmd" && deny "destructive git"
+    # 4. member-facing only: a member must not be able to make the box SPEND or LEAK. Be honest about the ceiling —
+    #    a Bash blocklist is not a sandbox: it stops accidents and casual prompt-injection, not a determined attacker
+    #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays
+    #    allowed on purpose: it is how this session escalates to the owner.
+    if [ "$role" = member ]; then
+      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (cc --go)"
+      grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (cc-loop)"
+      grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
+      SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.ssh\b|\.claude/settings\.json)'
+      RD='(cat|tac|less|more|head|tail|nl|cut|grep|egrep|fgrep|rg|sed|awk|xxd|od|base64|strings|sort|uniq|jq|python[0-9.]* +-c|source|\.)'
+      grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && deny "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json)"
+      grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|archive)\b' <<<"$cmd" && deny "re-wiring the box's Slack (cc slack: off, setup, mkchannel, archive)"
+    fi
     ;;
+  Read|NotebookRead|Grep|Glob)   # member only: gating those three files in Bash would be theatre if a file-reading TOOL served them
+    [ "$role" = member ] || exit 0
+    fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // ""' <<<"$inp")
+    [ -n "$fp" ] && fp=$(realpath -m -- "$fp" 2>/dev/null || echo "$fp")
+    secret_path "$fp" && deny "reading the box's secrets ($fp)" ;;
   Edit|Write|MultiEdit|NotebookEdit)
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
     fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ traversal resolves before the match
     case "$fp" in
-      "$cwd"/*|"$cwd") ;;                          # inside the worktree: fine
-      /tmp/*|"$HOME"/.cc/state/*) ;;               # scratch + track state: fine
-      *) deny "editing outside the worktree ($fp)";;
+      "$cwd"/*|"$cwd") ;;                          # inside the worktree / the session's own dir: fine
+      /tmp/*) ;;                                   # scratch: fine
+      "$HOME"/.cc/state/*) [ "$role" = member ] && deny "writing another session's state ($fp) — a task.md there is work the box would run";;   # track state: workers only
+      *) deny "editing outside this session's directory ($fp)";;
     esac ;;
 esac
 exit 0

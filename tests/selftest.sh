@@ -2,46 +2,62 @@
 # selftest.sh — end-to-end test of the cc layer against a throwaway local repo (bare "remote"). No API calls:
 export CC_NOTIFY_LOG_ONLY=1   # never push to the owner from tests
 export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage limit resets' is capped at 1 s
-# claude is stubbed (CC_CLAUDE). Safe to run anytime; cleans up after itself.  Usage: tests/selftest.sh
+# claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside another copy of itself in another
+# worktree: every run is namespaced (see $RUN below) and cleans up after itself.  Usage: tests/selftest.sh
 # Exercises the bin/ THIS file ships with (a track worktree tests its own copy, not the ~/bin symlinks).
 set -uo pipefail
 exec </dev/null; unset CC_ROLE   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a caller's worker role (the guard probes set it themselves)
 B="$(cd "$(dirname "$0")/../bin" && pwd)"
 pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+1)); echo "  ✗ $1"; }
-REPO=_cctest; T=~/.cc/selftest; rm -rf "$T" ~/dev/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock; mkdir -p "$T"
-cp ~/.cc/state/claude-limit "$T/stamp.bak" 2>/dev/null || true   # never wipe a LIVE usage-limit stamp: snapshot, restore at the end
-for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
+# Every run owns a namespace ($RUN): repo name, fixture dir, notify log, usage-limit stamp, tmux windows and
+# processes all carry it. Two selftests (two worktrees, one box) must never read, write or kill each other's things
+# — a global `pkill` here once failed 4 tests in a run that was, on its own, green.
+RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"
+export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
+export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
+MT(){ env -u TMUX TMUX_TMPDIR="$T" tmux "$@"; }   # the model section's scratch tmux server: own socket, under $T
+wins(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | awk -v r="$1" '$2==r || index($2,r"/")==1 {print $1}'; }
+KIDS=""   # long-lived fixtures started below; the trap takes each one's whole process group, by PID, never by pattern
+cleanup(){ rc=$?; trap - EXIT
+  for p in $KIDS; do pg=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+    if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$p" 2>/dev/null; fi; done
+  MT kill-server 2>/dev/null   # the scratch server and its panes die WITH the run: one `cat` fixture outlived a run by 2.5 h
+  for id in $(wins "$REPO"); do tmux kill-window -t "$id"; done
+  rm -rf "$T" ~/dev/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock
+  ( exec 9>~/.claude.json.lock; flock 9; jq '.projects |= with_entries(select(.key | test("/'"$REPO"'(/|$)") | not))' ~/.claude.json > ~/.claude.json.$RUN.sel && mv ~/.claude.json.$RUN.sel ~/.claude.json ) 2>/dev/null   # leave no trust entries behind
+  rm -f ~/.claude.json.$RUN.sel; exit $rc; }
+trap cleanup EXIT INT TERM HUP
 git init -q --bare "$T/remote.git"; git clone -q "$T/remote.git" ~/dev/$REPO 2>/dev/null
 ( cd ~/dev/$REPO && git config user.email t@t && git config user.name t && echo x > r.md && git add -A && git commit -qm init && git branch -M main && git push -q -u origin main && git remote set-head origin -a >/dev/null 2>&1 )
 export CC_CLAUDE=/bin/true
 # stub claude for cc-loop: writes a journal entry + a file, 2nd iteration says DONE
-cat > "$T/fakeclaude" <<'F'
+cat > "$T/fakeclaude" <<F
 #!/usr/bin/env bash
-st=~/.cc/state/_cctest/w1; n=$(ls $st/runs/*.json 2>/dev/null | wc -l)
-echo "iteration work $n" > "work-$n.txt"; echo "- $(date -u +%T) did step $n" >> "$st/progress.md"
-[ "$n" -ge 2 ] && echo "STATUS: DONE" >> "$st/progress.md"
-printf '{"is_error":false,"num_turns":2,"total_cost_usd":0.01,"session_id":"x","result":"ok %s"}' "$n"
+st=$HOME/.cc/state/$REPO/w1; n=\$(ls \$st/runs/*.json 2>/dev/null | wc -l)
+echo "iteration work \$n" > "work-\$n.txt"; echo "- \$(date -u +%T) did step \$n" >> "\$st/progress.md"
+[ "\$n" -ge 2 ] && echo "STATUS: DONE" >> "\$st/progress.md"
+printf '{"is_error":false,"num_turns":2,"total_cost_usd":0.01,"session_id":"x","result":"ok %s"}' "\$n"
 F
 # stub claude that always hits its turn cap while still doing real work (M6: capped != failed)
-cat > "$T/cappedclaude" <<'F'
+cat > "$T/cappedclaude" <<F
 #!/usr/bin/env bash
-st=~/.cc/state/_cctest/w2; n=$(ls $st/runs/*.json 2>/dev/null | wc -l)
-echo "capped work $n" > "capped-$n.txt"; echo "- capped iteration $n" >> "$st/progress.md"
+st=$HOME/.cc/state/$REPO/w2; n=\$(ls \$st/runs/*.json 2>/dev/null | wc -l)
+echo "capped work \$n" > "capped-\$n.txt"; echo "- capped iteration \$n" >> "\$st/progress.md"
 printf '{"is_error":true,"subtype":"error_max_turns","num_turns":80,"total_cost_usd":0.5,"session_id":"x","result":"hit the turn cap"}'
 F
 # stub claude that hangs, to prove a killed loop takes its child with it (H4)
-cat > "$T/sleepclaude" <<'F'
+cat > "$T/sleepclaude" <<F
 #!/usr/bin/env bash
-echo "- sleeping iteration" >> ~/.cc/state/_cctest/w3/progress.md
+echo "- sleeping iteration" >> $HOME/.cc/state/$REPO/w3/progress.md
 sleep 30
 printf '{"is_error":false,"num_turns":1,"total_cost_usd":0.01,"session_id":"x","result":"ok"}'
 F
 # stub claude that reports a usage limit on its first call and works on the second (M10: a limit is not a failure)
-cat > "$T/limitclaude" <<'F'
+cat > "$T/limitclaude" <<F
 #!/usr/bin/env bash
-st=~/.cc/state/_cctest/w4; n=$(ls $st/runs/*.json 2>/dev/null | wc -l)   # the loop already created THIS run's file
-[ "$n" -le 1 ] && { printf '{"is_error":true,"result":"You'"'"'ve hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}'; exit 0; }
-echo "- work after the limit lifted" >> "$st/progress.md"; echo "STATUS: DONE" >> "$st/progress.md"
+st=$HOME/.cc/state/$REPO/w4; n=\$(ls \$st/runs/*.json 2>/dev/null | wc -l)   # the loop already created THIS run's file
+[ "\$n" -le 1 ] && { printf '{"is_error":true,"result":"You'"'"'ve hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}'; exit 0; }
+echo "- work after the limit lifted" >> "\$st/progress.md"; echo "STATUS: DONE" >> "\$st/progress.md"
 printf '{"is_error":false,"num_turns":1,"total_cost_usd":0.01,"session_id":"x","result":"ok"}'
 F
 chmod +x "$T/fakeclaude" "$T/cappedclaude" "$T/sleepclaude" "$T/limitclaude"
@@ -86,20 +102,39 @@ for probe in 'Bash|{"command":"$(gh pr merge 1)"}' 'Bash|{"command":"bash -c \"g
   [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 2 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "guard blocks all 13 bypass probes (quoting, wrappers, tmux kills, traversal)" || bad "guard bypass:$miss"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
+# member-facing: the .cc/member-facing marker alone (NO CC_ROLE — the env is a convenience) = every worker gate plus spend/leak/wiring
+mf="$T/member"; mkdir -p "$mf/.cc"; : > "$mf/.cc/member-facing"; touch "$mf/note.md"
+m(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' 'Bash|{"command":"cc r t --go build it"}'
+    'Bash|{"command":"cc board add r t title text --go"}' 'Bash|{"command":"cc-loop r t"}' 'Bash|{"command":"claude -p do it"}'
+    'Bash|{"command":"cat ~/.cc/config"}' 'Bash|{"command":"tail -5 $HOME/.ssh/id_ed25519"}'
+    'Bash|{"command":"cc slack off"}' 'Bash|{"command":"cc slack mkchannel help"}'
+    "Read|{\"file_path\":\"$HOME/.cc/config\"}" "Edit|{\"file_path\":\"$HOME/member-probe.txt\"}")
+miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 2 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "member-facing marker denies all 12 probes (merge/host, dispatch, secrets, Slack wiring, edit outside)" || bad "member gate misses:$miss"
+miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 0 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "no regression: an unmarked cwd (planning session) is gated by none of them" || bad "unmarked cwd gated:$miss"
+miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t help the owner must decide this"}' \
+             'Bash|{"command":"git log --oneline -5"}' "Read|{\"file_path\":\"$mf/note.md\"}" "Edit|{\"file_path\":\"$mf/note.md\"}"; do
+  [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 0 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "member-facing session still reads, edits in place and escalates with cc-notify" || bad "member gate over-blocks:$miss"
+[ "$(g Bash '{"command":"cc r t --go x"}' "$mf")" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
+[ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$HOME" | CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
+[ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
 echo "== --say / --go / cc-loop =="
 "$B/cc" $REPO w1 --say hello >/dev/null 2>&1 && bad "--say should fail with no live session" || ok "--say refuses when no session"
 tmux new-window -d -t main -n "$REPO/m7" "sleep 30"; sleep 1   # M7: a headless worker's pane is a shell — typed text would run as a command
 "$B/cc-msg" "$REPO/m7" "hello" >"$T/m7.out" 2>&1; [ $? != 0 ] && grep -q 'task.md' "$T/m7.out" && ok "cc-msg refuses a window with no interactive claude" || bad "cc-msg typed into a headless pane"
 tmux kill-window -t "$(tmux list-windows -t main -F '#{window_id} #W' | awk -v n="$REPO/m7" '$2==n{print $1}')" 2>/dev/null
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w1$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
-nl0=$(wc -l < ~/.cc/notify.log 2>/dev/null || echo 0)
+nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
 CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev/null 2>&1
 for _ in $(seq 1 40); do grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null && grep -qE 'DONE' ~/.cc/state/$REPO/w1/loop.log 2>/dev/null && break; sleep 1; done
 grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null && ok "loop ran to DONE via journal" || bad "loop DONE"
 [ "$(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)" = 2 ] && ok "loop stopped after DONE (2 iterations, not 3)" || bad "loop iteration count: $(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)"
 git -C "$T/remote.git" log --oneline track/w1 2>/dev/null | grep -q 'wip: checkpoint' && ok "loop iterations were checkpointed + pushed" || bad "loop checkpoint"
-for _ in $(seq 1 30); do tail -n +$((nl0+1)) ~/.cc/notify.log 2>/dev/null | grep -q "$REPO/w1 done" && break; sleep 1; done   # cc-loop writes it from its tmux window, a beat after DONE
-tail -n +$((nl0+1)) ~/.cc/notify.log 2>/dev/null | grep -q "$REPO/w1 done" && ok "owner notified on DONE (log backend)" || bad "notify"
+for _ in $(seq 1 30); do tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && break; sleep 1; done   # cc-loop writes it from its tmux window, a beat after DONE
+tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && ok "owner notified on DONE (log backend)" || bad "notify"
 st=$("$B/cc-board" get $REPO w1 status); [ "$st" = review ] && ok "board -> review after done (PR skipped: no gh remote)" || bad "board status after done: $st"
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
@@ -119,7 +154,7 @@ for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=
 [ "$gone" = yes ] && ok "killing the loop kills its claude child (no orphan left in the worktree)" || { bad "orphaned claude survived the loop kill"; pkill -f "$T/sleepclaude"; }
 wait $lp 2>/dev/null; "$B/cc" rm $REPO w3 >/dev/null 2>&1
 echo "== usage limits (cc-limit + cc-loop) =="
-L(){ HOME="$T/lh" "$B/cc-limit" "$@"; }; mkdir -p "$T/lh"; lf="$T/lim.json"; miss=""   # own HOME: the table never touches the box's real stamp
+L(){ HOME="$T/lh" CC_LIMIT_STAMP="$T/lh/claude-limit" "$B/cc-limit" "$@"; }; mkdir -p "$T/lh"; lf="$T/lim.json"; miss=""   # own HOME: the table never touches the box's real stamp
 say(){ printf '{"is_error":%s,"result":"%s","total_cost_usd":0}' "$1" "$2" > "$lf"; }
 while IFS='|' read -r want iserr text; do [ -z "$want" ] && continue
   say "$iserr" "$text"; L check "$lf" >/dev/null; [ "$?" = "$want" ] || miss="$miss [$text]"; L clear; done <<'CASES'
@@ -144,14 +179,14 @@ say true "API Error 429"; b1=$(L check "$lf"); say true "API Error 429"; b2=$(L 
   ok "cc-limit backs off 5 -> 10 min when the message carries no reset time" || bad "backoff: $b1 then $b2"; L clear
 "$B/cc" $REPO w4 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w4$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
-echo "work through a usage limit" > ~/.cc/state/$REPO/w4/task.md; nl0=$(wc -l < ~/.cc/notify.log 2>/dev/null || echo 0)
+echo "work through a usage limit" > ~/.cc/state/$REPO/w4/task.md; nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
 "$B/cc-limit" clear; CC_CLAUDE="$T/limitclaude" "$B/cc-loop" $REPO w4 --max-iter 2 --quiet >/dev/null 2>&1; rc=$?
 runs=$(ls ~/.cc/state/$REPO/w4/runs/*.json 2>/dev/null | wc -l)
 { [ "$rc" = 0 ] && [ "$runs" = 2 ] && grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w4/progress.md; } &&
   ok "a limited run is retried, not counted: 2 runs, 1 iteration, DONE (exit 0)" || bad "limit loop: rc=$rc runs=$runs"
 { grep -q 'usage limit — waiting until' ~/.cc/state/$REPO/w4/loop.log && ! grep -q '^.* error (' ~/.cc/state/$REPO/w4/loop.log; } &&
   ok "the limit was logged and did not count as an error" || bad "limit log/errs: $(grep -c 'error (' ~/.cc/state/$REPO/w4/loop.log) error lines"
-n=$(tail -n +$((nl0+1)) ~/.cc/notify.log 2>/dev/null | grep -c "$(hostname) limit")
+n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "$(hostname) limit")
 [ "$n" = 1 ] && ok "owner told exactly once per limit episode (title '$(hostname) limit' -> #alerts)" || bad "limit notify count: $n"
 [ "$("$B/cc-limit" status)" = clear ] && ok "the stamp is cleared by the run that got through" || bad "stamp left behind"
 "$B/cc" rm $REPO w4 >/dev/null 2>&1
@@ -164,15 +199,35 @@ echo "== cc-slack (local router + channel server; no Slack, no API) =="
 export CC_SLACK_DIR="$T/slack"; mkdir -p "$CC_SLACK_DIR"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"chat_id":"local","text":"pong"}}}' | timeout 10 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch.out"
 grep -q '"claude/channel"' "$T/ch.out" && grep -q '"name": "reply"' "$T/ch.out" && ok "channel server: claude/channel capability + reply tool" || bad "channel handshake"
+# the session prompt the host actually receives must say who may speak and what a member may not authorize
+grep -q 'role=' "$T/ch.out" && grep -q 'role=\\"member\\"' "$T/ch.out" && grep -q 'CANNOT' "$T/ch.out" \
+  && ok "channel server: the prompt names role=owner/member and what a member cannot authorize" || bad "member policy in the session prompt"
 grep -q $'\tpost\tlocal\t' "$CC_SLACK_DIR/outbox.log" 2>/dev/null && ok "reply without a token → outbox log" || bad "outbox"
-setsid nohup "$B/cc-slack" daemon --no-slack >"$T/slackd.log" 2>&1 & SD=$!; sleep 1
+# sending a FILE from a session: the tool exists, refuses a path outside its roots, and never claims a send it did not make
+FSEND=$(mktemp /tmp/ccsel-XXXXXX.png); printf 'PNGDATA' > "$FSEND"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"/etc/hostname\",\"chat_id\":\"local\"}}}" "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"$FSEND\",\"chat_id\":\"local\",\"thread_ts\":\"1.1\",\"text\":\"the render\"}}}" | timeout 10 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch3.out"
+grep -q '"name": "file"' "$T/ch3.out" && grep -q 'outside the folders a session may send from' "$T/ch3.out" \
+  && grep -q '"isError": true' "$T/ch3.out" && ok "channel server: the file tool refuses a path outside the session's roots" || bad "file tool bounds"
+grep -q 'NOT sent' "$T/ch3.out" && grep -q $'\tfile\tlocal\t' "$CC_SLACK_DIR/outbox.log" \
+  && ok "file to chat_id local → outbox line, and the tool says it was NOT sent" || bad "file outbox honesty"
+rm -f "$FSEND"
+ln -sf "$B/cc-slack" "$T/ccslackd"   # a per-run name in the daemon's argv: ours is identifiable, and no other run's pattern kill can match it
+setsid nohup "$T/ccslackd" daemon --no-slack >"$T/slackd.log" 2>&1 & SD=$!; KIDS="$KIDS $SD"; sleep 1
 [ "$("$B/cc-slack" inject --no-start $REPO queued-msg)" = queued ] && ok "inject with no subscriber → queued" || bad "queue"
 # the channel server links to the daemon only after the host's notifications/initialized (+2 s) — feed a real MCP handshake, then hold the pipe open
-rm -f "$T/fifo"; mkfifo "$T/fifo"; ( exec 3>"$T/fifo"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3; sleep 8; exec 3>&- ) &
-CC_SLACK_CHANNEL=1 "$B/cc-slack" channel $REPO < "$T/fifo" > "$T/ch2.out" 2>/dev/null & sleep 3
+rm -f "$T/fifo"; mkfifo "$T/fifo"; ( exec 3>"$T/fifo"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3; sleep 8; exec 3>&- ) & KIDS="$KIDS $!"
+CC_SLACK_CHANNEL=1 "$B/cc-slack" channel $REPO < "$T/fifo" > "$T/ch2.out" 2>/dev/null & KIDS="$KIDS $!"; sleep 3
 [ "$("$B/cc-slack" inject --no-start $REPO live-msg)" = delivered ] && ok "inject with a subscriber → delivered" || bad "deliver"
 sleep 5; grep -q queued-msg "$T/ch2.out" && grep -q live-msg "$T/ch2.out" && grep -q 'notifications/claude/channel' "$T/ch2.out" && ok "backlog flushed on subscribe + live event as notifications/claude/channel" || bad "channel notifications"
-kill $SD 2>/dev/null; pkill -f '^python3 .*cc-slack daemon --no-slack' 2>/dev/null; unset CC_SLACK_DIR
+grep -q '"role": "owner"' "$T/ch2.out" && ok "delivered meta carries role (a local inject is owner-level)" || bad "role in delivered meta"
+"$B/cc-slack" 2>&1 | grep -q -- 'PRIVATE unless --public' && "$B/cc-slack" 2>&1 | grep -q 'ANYONE who can post in a routed channel is heard' \
+  && ok "help: channels are private by default; anyone in a routed channel is heard" || bad "cc-slack help policy"
+"$B/cc-slack" 2>&1 | grep -q 'EVERY channel the bot is in answers' \
+  && "$B/cc-slack" status 2>/dev/null | grep -q 'policy: every channel the bot is in answers' \
+  && ok "help + status state the policy: every channel answers, DMs are the owner's, #approvals/#alerts are not sessions" || bad "cc-slack channel-is-a-session policy"
+pg=$(ps -o pgid= -p "$SD" 2>/dev/null | tr -d ' ')   # OUR daemon, by recorded pid and its group — a bare pattern would kill another run's
+if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$SD" 2>/dev/null; fi
+for _ in 1 2 3 4 5; do kill -0 "$SD" 2>/dev/null || break; sleep 0.4; done; unset CC_SLACK_DIR
 echo "== model fallback (cc-model + cc-limit) =="
 # own HOME and own tmux server (TMUX unset, TMUX_TMPDIR into $T): the live sessions' models are never touched
 MH="$T/mh"; mkdir -p "$MH/.cc/state" "$T/fb"; printf '#!/usr/bin/env bash\ncat\n' > "$T/fb/cc-loop"; chmod +x "$T/fb/cc-loop"
@@ -181,8 +236,8 @@ cat > "$T/probeclaude" <<'F'
 printf '{"is_error":false,"num_turns":1,"total_cost_usd":0.001,"result":"ok"}'
 F
 chmod +x "$T/probeclaude"
-MT(){ env -u TMUX TMUX_TMPDIR="$T" tmux "$@"; }
 ME(){ env -u TMUX TMUX_TMPDIR="$T" HOME="$MH" CC_TMUX_SESSION=_ccmodel CC_MODEL_PROC=cat \
+      CC_NOTIFY_LOG="$MH/.cc/notify.log" CC_LIMIT_STAMP="$MH/.cc/state/claude-limit" \
       CC_MODEL_PRIMARY='claude-fable-5[1m]' CC_MODEL_FALLBACK=claude-opus-5 "$@"; }
 M(){ ME "$B/cc-model" "$@"; }
 MT new-session -d -s _ccmodel -n sess 'bash -c "cat; true"'
@@ -266,9 +321,33 @@ ME env CC_MODEL_DIALOG_WAIT=0.5 "$B/cc-model" switch opus "dialog case" >/dev/nu
 sleep 1
 MT capture-pane -p -t _ccmodel:sess | tail -n 3 | grep -qx '1' && ok "a Switch-model confirmation is answered, so the switch actually takes" || bad "the switch left the confirmation dialog open"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
-# cleanup
-for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
-if [ -f "$T/stamp.bak" ]; then mv "$T/stamp.bak" ~/.cc/state/claude-limit; else rm -f ~/.cc/state/claude-limit; fi   # restore the live stamp (or leave none)
-rm -rf "$T" ~/dev/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock
-( exec 9>~/.claude.json.lock; flock 9; jq '.projects |= with_entries(select(.key | test("/'"$REPO"'(/|$)") | not))' ~/.claude.json > ~/.claude.json.sel && mv ~/.claude.json.sel ~/.claude.json ) 2>/dev/null   # leave no trust entries behind
+
+echo "== cc-publish: core/ publishes itself =="
+PUB="$T/mirror.git"; git init -q --bare "$PUB"
+cd ~/dev/$REPO || exit 1
+pub(){ env CC_PUBLISH_STATE="$T" PUBLISH_REMOTE="$PUB" PUBLISH_REPO=$REPO PUBLISH_PREFIX=core PUBLISH_BRANCH=main PUBLISH_ALLOW=LICENSE "$B/cc-publish"; }
+mkdir -p core/bin && echo generic > core/bin/tool && echo "overlay only" > private.md
+git add -A && git commit -qm "core: a generic tool" >/dev/null && git push -q origin HEAD
+pub >/dev/null 2>&1
+[ "$(git rev-parse main:core)" = "$(git -C "$PUB" rev-parse 'main^{tree}' 2>/dev/null)" ] && ok "publishes the WHOLE prefix (published tree == core/, nothing filtered)" || bad "published tree differs from core/"
+git -C "$PUB" ls-tree -r --name-only main | grep -q private.md && bad "the overlay leaked into the public repo" || ok "nothing outside core/ ships"
+[ "$(git -C "$PUB" rev-list --count main)" = 1 ] && ok "one commit per publish — the private repo's own history stays private" || bad "published more than one commit"
+pub 2>&1 | grep -q "already up to date" && ok "a publish with nothing new is a no-op" || bad "re-publish was not a no-op"
+# the ONE veto: this box's own name inside the prefix stops the publish dead — it is never trimmed out to get past it
+was=$(git -C "$PUB" rev-parse main)
+echo "built for $(id -un) on $(hostname -s)" > core/bin/leak
+git add -A && git commit -qm "core: a leak" >/dev/null && git push -q origin HEAD
+out=$(pub 2>&1); rc=$?
+{ [ $rc != 0 ] && grep -q "identity gate" <<<"$out" && [ "$(git -C "$PUB" rev-parse main)" = "$was" ]; } && ok "identity inside core/ ABORTS the publish and pushes nothing" || bad "identity gate did not stop the publish: $out"
+git rm -q core/bin/leak && git commit -qm "core: no leak" >/dev/null && git push -q origin HEAD
+pub >/dev/null 2>&1
+{ [ "$(git rev-parse main:core)" = "$(git -C "$PUB" rev-parse 'main^{tree}')" ] && git -C "$PUB" ls-tree -r --name-only main | grep -qx bin/tool; } && ok "with the leak fixed the whole prefix ships again, untrimmed" || bad "publish after the fix was incomplete"
+was=$(git -C "$PUB" rev-parse main); echo wip > core/bin/wip; git add -A; git commit -qm "core: never pushed" >/dev/null
+pub >/dev/null 2>&1
+[ "$(git -C "$PUB" rev-parse main)" = "$was" ] && ok "only origin's default branch is published — local, unpushed work is not" || bad "unpushed work reached the public repo"
+git reset -q --hard origin/main
+env CC_PUBLISH_STATE="$T" PUBLISH_REMOTE= PUBLISH_REPO=$REPO "$B/cc-publish" status 2>&1 | grep -q "publish: off" && ok "no PUBLISH_REMOTE: publishing is simply off (a bare clone never publishes)" || bad "unconfigured publish is not off"
+cd ~ || exit 1
+# cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
+# trap does it on every path out, including a kill, so nothing this run started can outlive it
 echo "== result: $pass passed, $fail failed =="; [ $fail = 0 ]

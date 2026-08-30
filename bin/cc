@@ -16,7 +16,8 @@
 #   cc done <repo> <track>    push + open a PR into the default branch (nothing auto-merges)
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
 #   cc board <args>           shared board (cc board show <repo>)      cc -c <repo> [track]  force --continue
-#   cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session, DMs the box
+#   cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session
+#                                              anyone in the channel is heard (membership is the access control), DMs are the owner's; new channels are private
 #   cc rc status|restart      the always-on boot session (window box); restart to pick up new flags (ends its conversation)
 set -uo pipefail
 # Every session and worker starts through this script. Panes spawned from a systemd-started client (boot, cc-slackd) arrive without ~/bin,
@@ -28,6 +29,8 @@ SLACKON="$HOME/.cc/slack/enabled"   # `cc slack on` creates it: sessions load th
 chan_args(){ [ -f "$SLACKON" ] || return 0; printf '%s\n' --dangerously-load-development-channels "server:cc-slack"; }   # the server itself is registered in user scope by `cc slack on`; it finds its target from the cwd
 model_args(){ local m; m=$("$BIN/cc-model" current 2>/dev/null) && [ -n "$m" ] && printf '%s\n%s\n' --model "$m"; return 0; }   # while the box's primary model is limited, new sessions start on the fallback
 chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slack" accept-dialog "$1" >/dev/null 2>&1 & ); }; return 0; }   # auto-accepts the dev-channels dialog in that tmux window
+member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
+MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed)."
 ensure_main(){ tmux has-session -t "$SESSION" 2>/dev/null || "$BIN/cc-boot"; }   # server creation goes through tmux-main.service (cgroup ownership; 2026-08-26 incident)
 attach_main(){ [ -t 0 ] || return 0; if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$SESSION" 2>/dev/null || true; else exec tmux attach -t "$SESSION"; fi; }
 win_id(){ tmux list-windows -t "$SESSION" -F '#{window_id} #W' 2>/dev/null | awk -v n="$1" '$2==n{print $1; exit}'; }   # address windows by id: names with . or / break -t main:<name>
@@ -161,6 +164,7 @@ case "${1:-}" in
     repo="$2"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp="You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<instructions>\"' then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads."
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
+    member_facing "$DEV/$repo" && { export CC_ROLE=member; sp="$sp $MEMBER_SP"; }   # convenience only — the marker is what cc-guard actually reads
     "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
     repo="$2"; alias="$3"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
@@ -173,7 +177,8 @@ case "${1:-}" in
   __runplain)  # internal: plain session in a folder that is not a git repo
     repo="$2"; cont="${3:-}"; cd "$DEV/$repo" || exit 1
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
-    "$CLAUDE" ${cont:+--continue} --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    MF=(); member_facing "$DEV/$repo" && { export CC_ROLE=member; MF=(--append-system-prompt "$MEMBER_SP"); }   # a member-facing folder need not be a git repo
+    "$CLAUDE" ${cont:+--continue} --remote-control "$repo" "${CH[@]}" "${MO[@]}" "${MF[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
 esac
 
 # ---- cc [-c] <repo> [track] [--go|--say ...] ----
@@ -219,7 +224,8 @@ case "$mode" in
        "$BOARD" note "$repo" "$track" "dispatched headless worker (loop $LOOPN)" >/dev/null
        xq=""; [ ${#XTRA[@]} -gt 0 ] && xq=$(printf ' %q' "${XTRA[@]}")   # printf %q with no argument emits '' — cc-loop would see an empty arg
        lock "$st/.lock"; [ -n "$(win_id "$win")" ] && tmux kill-window -t "$(win_id "$win")"
-       pre=""; [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && pre="CC_NOTIFY_LOG_ONLY=1 "   # tests: the new tmux window has the server's env, not ours — carry the log-only flag across or the test worker's DONE notice really posts
+       pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP; do   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp
+         [ -n "${!v:-}" ] && pre="$pre$(printf '%s=%q ' "$v" "${!v}")"; done
        tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
        unlock; echo "worker started in tmux main:$win — watch: cc $repo $track ; log: $st/loop.log"; exit 0 ;;
 esac

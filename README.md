@@ -12,8 +12,9 @@ sandbox runs the unrestricted ones. Thread marks tell you at a glance what needs
 - Hooks — `cc-checkpoint` (auto-commit+push in worktrees only), `cc-guard` (owner gates for autonomous sessions).
 - `ccbox` — bypass-permissions Claude in Docker with an egress allowlist.
 - `cc-audit` — recurring reviews of how well the box served you (3-day), code audits (weekly, monthly).
+- `cc-publish` — a private box keeps this tree as `core/` and mirrors it back here after every merge, gated on its own name never shipping.
 - Boot/notify — survives power cuts and reboots; Slack/ntfy notices; daily digest.
-- Tests: `tests/check.sh`, `tests/selftest.sh` (34 checks, no API calls), `cc-slack selfcheck`, `tests/slack_sim.py`.
+- Tests: `tests/check.sh`, `tests/selftest.sh` (84 checks, no API calls), `cc-slack selfcheck`, `tests/slack_sim.py`.
 
 ## Install (Ubuntu, 10 minutes)
 1. `git clone https://github.com/ihsan-sa/autobox ~/dev/autobox && ~/dev/autobox/install.sh`
