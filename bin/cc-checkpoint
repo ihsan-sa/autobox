@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 # cc-checkpoint — auto-commit+push a track worktree. Wired as a Claude Stop hook (runs after each turn).
-# No-op unless the cwd is inside a cc track worktree (marker: <worktree-root>/.cc/track). Never touches
+# It also records how full the session's context is (cc-context --record), for EVERY session, track or not:
+# the Stop payload's `transcript_path` is the only handle on that number and this hook is where it arrives.
+# Committing is what needs a track: no-op unless the cwd is inside one (marker: <worktree-root>/.cc/track). Never touches
 # the primary worktree / default branch (no marker there), so main/planning sessions stay clean.
 # Refuses (and logs to .cc/checkpoint.err) when HEAD is not the track's own branch — a session can rewrite
 # HEAD with git symbolic-ref — or when the staged names look like secrets. Push stderr → .cc/push.err.
 # Always exits 0 so it can never block a session.
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
+BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
+# The hook's JSON payload (verified fields: session_id, transcript_path, cwd, stop_hook_active, …) — read
+# before anything can exit, capped, and never fatal: measuring a context must not cost a session its commit.
+# cc-context answers with a Stop decision when the session has crossed a context line; it is relayed AFTER
+# the commit below, so the work is safely on the branch before the session is asked to journal it.
+[ -t 0 ] || payload=$(timeout 5 cat)
+[ -n "${payload:-}" ] && say=$(printf '%s' "$payload" | timeout 20 "$BIN/cc-context" --record 2>/dev/null)
+exec 8>&1   # the hook's real stdout: every exit below is inside a block that discards stdout, the relay is not
+relay(){ [ -n "${say:-}" ] && printf '%s\n' "$say" >&8; return 0; }
+trap relay EXIT
 {
   root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
   [ -f "$root/.cc/track" ] || exit 0

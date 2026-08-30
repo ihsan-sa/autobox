@@ -9,7 +9,8 @@
 #                             --go "" re-dispatches the task.md already there (e.g. after answering a BLOCKED)
 #   cc <repo> <track> --say "text"           type text into that track's running interactive session
 #   cc <repo> --orch <alias> ["brief"]       peer orchestrator session, its own Slack channel (archived when it exits)
-#   cc handoff <repo> <track> ask the running session to journal a handoff, then restart it with fresh context
+#   cc handoff <repo> <track> [--over [PCT]]  ask the running session to journal a handoff, then restart it with
+#                             fresh context; --over only if its context REALLY is that full (cc-context; bare = the 40% line)
 #   cc resume                 menu of every session (mains + tracks) -> pick to reattach/resume
 #   cc ls | cc digest         live windows + board status | full digest (cc digest --notify pushes it)
 #   cc quick [doing|done] "…"  log a small task done without a track (Slack Home shows the last 24 h)
@@ -40,7 +41,7 @@ default_branch(){ git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/H
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
 lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,20p' "$0"; }
+usage(){ sed -n '2,23p' "$0"; }
 
 ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
   local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base
@@ -98,9 +99,14 @@ case "${1:-}" in
   ls) echo "== live windows (tmux $SESSION) =="; tmux list-windows -t "$SESSION" -F '  #I #W  [#{pane_current_command}]' 2>/dev/null || echo "  (none)"
       lim=$("$BIN/cc-limit" status 2>/dev/null) && echo "== ⏳ Claude $lim =="
       echo "== board =="
+      declare -A CTX; while IFS=$'\t' read -r cr ct cp _ _ _ ca cl cpend; do   # last measured context per track (the Stop hook records it; newest first, so the first wins)
+        [ -n "${cr:-}" ] && [ "$cr" != - ] && [ -z "${CTX[$cr/$ct]:-}" ] && [ "${ca:-0}" -lt 86400 ] || continue
+        CTX["$cr/$ct"]="  ctx $cp%"; case "$cl" in journal) CTX["$cr/$ct"]+=" journal!";; handoff|ceiling) CTX["$cr/$ct"]+=" handoff!";; esac
+        [ "$cpend" = pending ] && CTX["$cr/$ct"]+=" (pending)"
+      done < <("$BIN/cc-context" --all 2>/dev/null)
       while IFS=$'\t' read -r r t s ti; do [ -z "$r" ] && continue; p=""   # the checkpoint hook fails quietly by design; these two files are how you hear about it
         [ -f "$WTBASE/$r/$t/.cc/checkpoint.err" ] && p="  commit!"; [ -f "$WTBASE/$r/$t/.cc/push.err" ] && p="$p  push!"
-        printf "  %-16s %-14s %-9s %s%s\n" "$r" "$t" "$s" "$ti" "$p"; done < <("$BOARD" list 2>/dev/null); exit 0 ;;
+        printf "  %-16s %-14s %-9s %s%s%s\n" "$r" "$t" "$s" "$ti" "${CTX[$r/$t]:-}" "$p"; done < <("$BOARD" list 2>/dev/null); exit 0 ;;
   resume)
     echo "Sessions:"; i=0; declare -a SEL
     while read -r w; do case "$w" in */*|box) ;; *) i=$((i+1)); SEL[$i]="main|$w|"; printf "  %2d) [main]   %s\n" "$i" "$w";; esac; done < <(tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null)
@@ -113,6 +119,10 @@ case "${1:-}" in
   done)
     repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"
     wt="$WTBASE/$repo/$track"; [ -d "$wt" ] || { echo "no worktree for $repo/$track"; exit 1; }
+    # Two callers reach this for one track — the loop when the worker writes STATUS: DONE, a session when it finishes by
+    # hand — and each used to open its own PR (#24/#25, #29/#30, same head SHA). One at a time, then reuse what is there.
+    mkdir -p "$wt/.cc"; exec 9>"$wt/.cc/done.lock"
+    flock -w "${CC_DONE_LOCK_WAIT:-600}" 9 || { echo "cc: another 'cc done $repo $track' is still running — nothing opened"; exit 1; }   # CC_DONE_LOCK_WAIT: test hook
     base=$(default_branch "$DEV/$repo"); branch="track/$track"
     ( cd "$wt" && CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
     if git -C "$wt" remote get-url origin >/dev/null 2>&1; then   # a PR on an un-pushed branch is worse than no PR: stop here and say why
@@ -122,7 +132,18 @@ case "${1:-}" in
     title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"; instr=$("$BOARD" get "$repo" "$track" instructions)
     [ -f "$STBASE/$repo/$track/task.md" ] && instr="$(cat "$STBASE/$repo/$track/task.md")"
     url=$(cd "$wt" && gh pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null)   # `gh pr view` also returns a MERGED PR and would silently reuse it
-    [ -z "$url" ] && url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$(printf '%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$track" "$repo" "$track")" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
+    if [ -z "$url" ]; then   # no OPEN PR is not the same as no PR: a squash-merge deletes the branch, so the late caller
+      tip=$(git -C "$wt" rev-parse "$branch" 2>/dev/null)   # saw nothing open and opened a duplicate of commits already merged
+      merged=$(cd "$wt" && gh pr list --head "$branch" --state merged --limit 20 --json url,headRefOid -q "[.[]|select(.headRefOid==\"$tip\")][0].url" 2>/dev/null)
+      if [ -n "$merged" ]; then   # same tip, already merged: nothing to review — no second PR and no second approval card
+        "$BOARD" set "$repo" "$track" pr "$merged"; "$BOARD" status "$repo" "$track" merged >/dev/null
+        "$BOARD" note "$repo" "$track" "cc done: $branch was already merged as $merged (no new commits) — no duplicate PR" >/dev/null 2>&1 || true
+        echo "already merged: $merged (no commits on $branch beyond it)"
+        [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$track" >/dev/null 2>&1
+        exit 0
+      fi
+      url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$(printf '%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$track" "$repo" "$track")" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
+    fi
     if [ -n "$url" ]; then "$BOARD" set "$repo" "$track" pr "$url"; "$BOARD" status "$repo" "$track" review >/dev/null; echo "PR: $url"; [ -f "$SLACKON" ] && "$BIN/cc-slack" post-approval "$repo" "$url" >/dev/null 2>&1 || true; else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi
     [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$track" >/dev/null 2>&1   # if that name was an orch with its own channel, it is done: archive it
     exit 0 ;;
@@ -138,7 +159,15 @@ case "${1:-}" in
     "$BOARD" rm "$repo" "$track" >/dev/null 2>&1; echo "removed $repo/$track (remote branch, if pushed, left intact)"; exit 0 ;;
   handoff)
     repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"; w="$repo/$track"; st="$STBASE/$repo/$track"
+    over=""; ovarg=(); [ "${4:-}" = --over ] && { over="${5:-any}"; [ "$over" = any ] && ovarg=(--over) || ovarg=(--over "$over"); }   # bare --over = the handoff line for THAT session's window (floors included)
     have_window "$w" || { echo "no live window $w"; exit 1; }
+    # A handoff costs the session its working memory, so it goes on the measured number, never on a hunch.
+    if [ -n "$over" ]; then ctx=$("$BIN/cc-context" "$repo" "$track" "${ovarg[@]}" 2>/dev/null); rc=$?
+      line="under $over%"; [ "$over" = any ] && line="under the handoff line"
+      [ "$rc" = 2 ] && { echo "cc: cannot measure $w's context (no answered turn yet) — not handing off on a guess"; exit 1; }
+      [ "$rc" = 1 ] && { echo "cc: $w is at ${ctx%%  *}, $line — nothing to hand off"; exit 0; }
+      echo "cc: $w is at ${ctx%%  *} (over ${line#under }) — handing off"
+    else ctx=$("$BIN/cc-context" "$repo" "$track" 2>/dev/null) && echo "cc: $w is at ${ctx%%  *} — handing off"; fi
     before=$(stat -c %Y "$st/progress.md" 2>/dev/null || echo 0)
     "$BIN/cc-msg" "$w" "Handoff: append to $st/progress.md a dated handoff entry for a fresh session — what is done, what is next (ordered), gotchas/decisions — then run /exit." || { echo "cc: cc-msg could not reach $w (dialog open, or no interactive session) — not restarting"; exit 1; }
     for _ in $(seq 1 120); do pane_live "$w" || break; sleep 5; done
@@ -149,7 +178,7 @@ case "${1:-}" in
   __run)   # internal: interactive track session inside its worktree
     repo="$2"; track="$3"; force_cont="${4:-}"; wt="$WTBASE/$repo/$track"; st="$STBASE/$repo/$track"; cd "$wt" || exit 1
     sid=$("$BOARD" get "$repo" "$track" session_id); started=$("$BOARD" get "$repo" "$track" started); base=$(default_branch "$DEV/$repo")
-    sp="You are an orchestrated session for track '$track' of repo '$repo' (own git worktree, branch track/$track). Durable state: journal $st/progress.md (read it first if it exists; append dated entries: done / next / gotchas — a fresh session rehydrates from it), task $st/task.md if present. Board: 'cc board show $repo'; report with 'cc board note $repo $track \"...\"' and 'cc board status $repo $track running|review|blocked'. Your work is auto-committed and pushed to track/$track after every turn — do NOT run git commit/push yourself, and never touch branch '$base'. When done run 'cc done $repo $track' (opens a PR; do not merge). Reach the owner only when truly blocked: 'cc-notify -t \"$repo/$track\" \"question\"'. Keep answers concise; use subagents for large read/search work to protect your context."
+    sp="You are an orchestrated session for track '$track' of repo '$repo' (own git worktree, branch track/$track). Durable state: journal $st/progress.md (read it first if it exists; append dated entries: done / next / gotchas — a fresh session rehydrates from it), task $st/task.md if present. Board: 'cc board show $repo'; report with 'cc board note $repo $track \"...\"' and 'cc board status $repo $track running|review|blocked'. Your work is auto-committed and pushed to track/$track after every turn — do NOT run git commit/push yourself, and never touch branch '$base'. When done run 'cc done $repo $track' (opens a PR; do not merge). Reach the owner only when truly blocked: 'cc-notify -t \"$repo/$track\" \"question\"'. Keep answers concise; use subagents for large read/search work to protect your context — 'cc-context' says how full it actually is, and you will be told when it is time to write a handoff entry so a fresh session can take over."
     args=(--append-system-prompt "$sp" --remote-control "$repo/$track"); mapfile -t CH < <(chan_args "$repo/$track"); args+=("${CH[@]}"); chan_accept "$repo/$track"
     mapfile -t MO < <(model_args); args+=("${MO[@]}")
     # a session id whose transcript is gone (crash before the first write, or the 30-day prune) makes --resume fail forever: mint a fresh one instead
@@ -162,7 +191,7 @@ case "${1:-}" in
     "$CLAUDE" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmain)  # internal: planning session in the primary worktree
     repo="$2"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
-    sp="You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<instructions>\"' then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads."
+    sp="You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<instructions>\"' then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
     member_facing "$DEV/$repo" && { export CC_ROLE=member; sp="$sp $MEMBER_SP"; }   # convenience only — the marker is what cc-guard actually reads
     "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;

@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""cc-context — how full a Claude session's context REALLY is, read off its own transcript.
+
+  cc-context                       the session running in $PWD (newest transcript for this cwd)
+  cc-context <repo> <track>        that track's session (session id from the board)
+  cc-context --transcript PATH | --session ID
+  cc-context --all                 TSV of every recorded session: repo track pct used window src age level pending
+  cc-context --record              stdin = a Stop hook payload -> measure, record, and tell the session
+  cc-context --thresholds          "<journal> <handoff> <ceiling>" (percentages)
+  cc-context --handoffs [--json]   the durable handoff record: one countable line per crossing
+  cc-context selfcheck             fixtures for the parser, the window chain and the record store
+    also: --json · -q (exit code only) · --over [PCT] (exit 0 at/over, 1 under, 2 unmeasurable;
+          bare = that session's own handoff line, floors and window included)
+
+THREE LINES, EACH A PERCENTAGE OF THE WINDOW WITH A FLOOR UNDER IT (all six in ~/.cc/config):
+  30%, never under 60k   journal — the session is told, once, to append its handoff entry now
+  40%, never under 90k   hand off — due, but only when nothing is in flight
+  60%                    ceiling — hand off regardless of what is in flight
+                         CC_CONTEXT_{WARN,HANDOFF}_PCT · CC_CONTEXT_{WARN,HANDOFF}_MIN · CC_CONTEXT_CEILING_PCT
+On the 1M window the box's sessions run that is 300k / 400k / 600k. They are early on purpose: this is about
+how SHARP a session is, not about running out of room. The evidence says there is no plateau to sit just
+below — Chroma's "Context Rot" finds degradation at every input length it tested, and NoLiMa has 10 of 12
+long-context models below half their short-context score by 32k, a quarter of the advertised window. So the
+question is not where the cliff is but how low we can sit and still get work done.
+
+A PERCENTAGE, AND A FLOOR. Degradation tracks ABSOLUTE tokens far more than the fraction used, so a smaller
+window does not buy a session more good tokens. But a bare percentage of a small window lands under what a
+session needs to do anything (30% of 128k is 38k, most of it prompt and tools). The floor reads: as low as we
+can sit, but never so low that a session is handed off before it can work — 60k/90k on a 200k model.
+
+PENDING, NOT IMMEDIATE. Crossing the handoff line sets a handoff PENDING; it does not restart anything. The
+restart happens at the first turn where nothing is in flight — no background or scheduled task, no unfinished
+merge/rebase, nothing uncommitted or unpushed in any worktree of this repo (see `in_flight`, which is
+deliberately pessimistic: a wrong "idle" reading is a handoff in the middle of something, and mid-task state
+lives in no file). The 60% ceiling goes anyway: past it, what a degraded session gets wrong costs more than
+the in-flight state it drops. A session with no live tmux window (a headless worker) is never restarted from
+here — its loop already gives it a fresh context — so it is told to journal instead.
+
+THE RECORD. Every crossing appends one JSON line to ~/.cc/state/context/handoffs.jsonl: when, which session,
+repo/track, the percentage and the token count, and which line fired (journal · handoff · ceiling, and the
+`-deferred` forms when something was in flight). Countable with `wc -l`, so a reader never parses prose.
+
+The message is delivered through the Stop hook's own reply channel: `{"decision":"block","reason":…}` makes
+the session continue and do what the reason says (verified 2026-08-30 — it works headless too), and the
+payload's `stop_hook_active` is what stops that from repeating. It is said once per line crossed, and only to
+a session that HAS a journal to write (a track): an owner's conversation is not interrupted to write one.
+
+WHY A TOOL AND NOT A GUESS. Handing off (`cc handoff`) costs a session its working memory, so it must happen
+on evidence: too early wastes a good context, too late and auto-compaction has already thrown work away.
+Nothing in the box knew the number — the decision was a human's hunch about how long a session had been up.
+
+THE STOP HOOK CANNOT TELL YOU (verified empirically 2026-08-30, Claude Code 2.1.251, by wiring a hook that
+dumps its stdin). The whole payload is: session_id, transcript_path, cwd, prompt_id, permission_mode,
+hook_event_name, stop_hook_active, last_assistant_message, background_tasks, session_crons. No token counts,
+no percentage. What it does give is `transcript_path`, and the transcript holds the truth.
+
+USED = the last assistant entry's `message.usage`: input_tokens + cache_creation + cache_read. That IS the
+prompt the model just saw, cache or not. If a `compact_boundary` follows it (Claude compacted after the last
+answer) its `compactMetadata.postTokens` is the number instead — the old figure describes a context that no
+longer exists. Sidechain (subagent) entries never count: they have their own window.
+
+WINDOW is the part worth being honest about, because the transcript's `message.model` has the `[1m]` beta
+suffix stripped — "claude-opus-5" alone cannot tell 200k from 1M, and getting that wrong reports 75% at 15%.
+Sources, in order, first one wins, and the source is always printed:
+  env         CC_CTX_WINDOW
+  compacted   this session's own `compact_boundary.preTokens` — where IT actually hit the wall
+  cost-state  the transcript's `cost-state.modelUsage` keys, the exact model id, suffix and all
+  process     the live `claude` process's --model, matched by session id, or by cwd for a headless
+              worker (`claude -p` is given no --session-id, so its id is nowhere on its command line)
+  cc-model    the model the box currently starts sessions with, when it is the same family — it also RAISES a
+              process/cost-state window: a headless worker is launched `--model claude-opus-5` with no suffix
+              while the box runs that same family at 1M, and one box does not run one family at two sizes
+  assumed     nothing said: 200k, flagged as an assumption in every output (never silently)
+Then evidence overrides all of it: used above the window means the window is bigger, so it is raised.
+
+Records: ~/.cc/state/context/<session-id>.json (the Stop hook writes one per turn; pruned after 7 days),
+plus the append-only handoffs.jsonl above, which is never pruned.
+Env: CC_CTX_WINDOW · CC_CTX_BOX_MODEL · CC_CTX_RECORDS (a test run keeps its records out of the box's).
+"""
+import glob, json, os, re, subprocess, sys, time
+
+STATE = os.path.expanduser("~/.cc/state")
+RECORDS = os.environ.get("CC_CTX_RECORDS") or os.path.join(STATE, "context")
+PROJECTS = os.path.expanduser("~/.claude/projects")
+BIN = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_WINDOW = 200_000
+BIG_WINDOW = 1_000_000
+TAIL = 256 * 1024          # enough for many turns; grown when no assistant entry is in it
+MAX_TAIL = 32 * 1024 * 1024
+PRUNE_AFTER = 7 * 86400
+
+
+def cfg(name, default):
+    """A number from the environment, else ~/.cc/config (read, never sourced — that file holds tokens)."""
+    v = os.environ.get(name)
+    if v is None:
+        try:
+            with open(os.path.expanduser("~/.cc/config")) as f:
+                for l in f:
+                    if l.startswith(name + "="):
+                        v = l.split("=", 1)[1].strip()
+        except OSError:
+            pass
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def thresholds(window=BIG_WINDOW):
+    """The three lines, in TOKENS, for a window: a percentage each, with a floor under the first two.
+    Degradation tracks absolute tokens more than the fraction used, so a small window does not buy a session
+    more good tokens — but a bare percentage of one lands under what a session needs to do anything at all
+    (30% of 128k is 38k, most of it prompt and tools). Floors keep the rule 'as low as we can sit, never so
+    low that a session is handed off before it can work'. The ceiling never sits under the handoff line."""
+    j = max(window * cfg("CC_CONTEXT_WARN_PCT", 30.0) / 100, cfg("CC_CONTEXT_WARN_MIN", 60000))
+    h = max(window * cfg("CC_CONTEXT_HANDOFF_PCT", 40.0) / 100, cfg("CC_CONTEXT_HANDOFF_MIN", 90000))
+    return j, h, max(window * cfg("CC_CONTEXT_CEILING_PCT", 60.0) / 100, h)
+
+
+LEVELS = ["journal", "handoff", "ceiling"]
+
+
+def level_of(used, window):
+    j, h, c = thresholds(window)
+    return "ceiling" if used >= c else ("handoff" if used >= h else ("journal" if used >= j else None))
+
+
+def human(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 1000:
+        return f"{round(n/1000)}k"
+    return str(n)
+
+
+def tail_lines(path, nbytes):
+    """The last <=nbytes of a file as whole lines (a truncated first line is dropped)."""
+    with open(path, "rb") as f:
+        size = f.seek(0, 2)
+        start = max(0, size - nbytes)
+        f.seek(start)
+        buf = f.read()
+    if start:
+        buf = buf.split(b"\n", 1)[1] if b"\n" in buf else b""
+    return [l for l in buf.decode("utf-8", "replace").split("\n") if l.strip()]
+
+
+def scan(lines):
+    """Last assistant usage, last compact boundary, last cost-state, the session's cwd."""
+    usage = model = None
+    compact = cost_models = cwd = None
+    seen_assistant_at = compact_at = -1
+    for i, line in enumerate(lines):
+        if '"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue                                   # a half-written last line is normal while a session runs
+        if not isinstance(d, dict) or d.get("isSidechain"):
+            continue
+        cwd = d.get("cwd") or cwd
+        t = d.get("type")
+        if t == "assistant":
+            m = d.get("message") or {}
+            u = m.get("usage") or {}
+            if u:
+                usage, model, seen_assistant_at = u, m.get("model"), i
+        elif t == "system" and d.get("subtype") == "compact_boundary":
+            compact, compact_at = d.get("compactMetadata") or {}, i
+        elif t == "cost-state":
+            mu = d.get("modelUsage") or {}
+            if mu:
+                cost_models = list(mu)
+    return usage, model, compact, compact_at, seen_assistant_at, cost_models, cwd
+
+
+def window_from_model(model):
+    return BIG_WINDOW if model and "[1m]" in model else DEFAULT_WINDOW
+
+
+def family(model):
+    m = re.search(r"fable|opus|sonnet|haiku", model or "", re.I)
+    return m.group(0).lower() if m else None
+
+
+def process_model(session_id, cwd=None):
+    """The --model a live session was launched with — the only place the [1m] suffix survives.
+    By session id when the command line carries one; otherwise by cwd, which is how a headless
+    worker is found (it is given no --session-id at all). Ambiguous cwd -> no answer."""
+    by_cwd = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if not cmd or "claude" not in os.path.basename(cmd[0]):
+            continue
+        model = None
+        for i, a in enumerate(cmd):
+            if a == "--model" and i + 1 < len(cmd):
+                model = cmd[i + 1]
+            elif a.startswith("--model="):
+                model = a.split("=", 1)[1]
+        if not model:
+            continue                                   # says nothing about the window; and a `grep <sid>` is not a session
+        if session_id and session_id in cmd:
+            return model
+        try:
+            if cwd and os.readlink(f"/proc/{pid}/cwd") == cwd:
+                by_cwd.append(model)
+        except OSError:
+            continue
+    return by_cwd[0] if len(set(by_cwd)) == 1 else None
+
+
+def box_model():
+    """What the box starts sessions with now: the model override, else the settings default.
+    CC_CTX_BOX_MODEL overrides both (empty = don't ask the box; the selfcheck sets it)."""
+    v = os.environ.get("CC_CTX_BOX_MODEL")
+    if v is not None:
+        return v or None
+    try:
+        m = subprocess.run([os.path.join(BIN, "cc-model"), "current"],
+                           capture_output=True, text=True, timeout=10).stdout.strip()
+        if m:
+            return m
+    except Exception:
+        pass
+    try:
+        with open(os.path.expanduser("~/.claude/settings.json")) as f:
+            return (json.load(f).get("model") or "").strip() or None
+    except Exception:
+        return None
+
+
+def measure(path, session_id=None):
+    """{used, window, pct, ...} for a transcript, or None when it holds no usable turn yet."""
+    n = TAIL
+    while True:
+        lines = tail_lines(path, n)
+        usage, model, compact, compact_at, assistant_at, cost_models, cwd = scan(lines)
+        if usage or compact or n >= MAX_TAIL or n >= os.path.getsize(path):
+            break
+        n *= 8
+    if not usage and not compact:
+        return None
+    used = 0
+    if usage:
+        used = (usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0))
+    compacted = False
+    if compact and compact_at > assistant_at and compact.get("postTokens"):
+        used, compacted = compact["postTokens"], True     # the pre-compact number describes a context that is gone
+
+    window, src = None, None
+    env = os.environ.get("CC_CTX_WINDOW")
+    if env and env.isdigit():
+        window, src = int(env), "env"
+    if window is None and compact and compact.get("preTokens"):
+        pre = compact["preTokens"]                        # where this very session hit the wall: the best evidence there is
+        window, src = (BIG_WINDOW if pre > DEFAULT_WINDOW * 1.25 else DEFAULT_WINDOW), "compacted"
+    if window is None and cost_models:
+        window, src = max(window_from_model(m) for m in cost_models), "cost-state"
+    if window is None:
+        pm = process_model(session_id, cwd)
+        if pm:
+            window, src, model = window_from_model(pm), "process", pm
+    if window is None:
+        bm = box_model()
+        if bm and family(bm) and family(bm) == family(model):   # same family, so the same window; a different one says nothing
+            window, src, model = window_from_model(bm), "cc-model", bm
+    if src in ("process", "cost-state"):
+        bm = box_model()                                  # the box runs ONE model family, and it runs it at one size:
+        if bm and family(bm) == family(model) and window_from_model(bm) > window:   # a headless worker is launched
+            window, src = window_from_model(bm), src + "+cc-model"                  # `--model claude-opus-5`, no suffix
+    if window is None:
+        window, src = DEFAULT_WINDOW, "assumed"
+    if used > window:                                     # evidence beats every assumption above it
+        window, src = BIG_WINDOW if used <= BIG_WINDOW else used, src + "+observed"
+    return {"used": used, "window": window, "pct": round(100.0 * used / window, 1),
+            "model": model, "window_src": src, "compacted": compacted,
+            "transcript": path, "session_id": session_id,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+# ---- finding a session's transcript ------------------------------------------------------------
+
+def transcript_for_session(sid):
+    hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def transcript_for_cwd(cwd):
+    d = os.path.join(PROJECTS, re.sub(r"[/.]", "-", os.path.realpath(cwd)))
+    hits = [p for p in glob.glob(os.path.join(d, "*.jsonl"))]
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def board_get(repo, track, field):
+    try:
+        r = subprocess.run([os.path.join(BIN, "cc-board"), "get", repo, track, field],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def resolve(repo=None, track=None, sid=None, cwd=None):
+    """-> (transcript_path, session_id) or (None, None)."""
+    if sid:
+        return transcript_for_session(sid), sid
+    if repo and track:
+        sid = board_get(repo, track, "session_id")
+        p = transcript_for_session(sid) if sid else None
+        if not p:
+            p = transcript_for_cwd(os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}"))
+        return p, (sid or None)
+    p = transcript_for_cwd(cwd or os.getcwd())
+    return p, (os.path.basename(p)[:-6] if p else None)
+
+
+# ---- records -----------------------------------------------------------------------------------
+
+def track_of(cwd):
+    try:
+        with open(os.path.join(cwd, ".cc/track")) as f:
+            repo, track = [l.strip() for l in f.read().splitlines()[:2]]
+        return repo, track
+    except Exception:
+        return None, None
+
+
+def git(cwd, *args):
+    try:
+        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=20)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def in_flight(payload, cwd):
+    """Why this session must NOT be restarted right now, or None. Deliberately pessimistic: a wrong 'idle'
+    reading is a handoff in the middle of something, and the state a session holds mid-task is in nobody's
+    file. Anything git cannot answer counts as busy."""
+    if payload.get("background_tasks"):
+        return "a background task is still running"
+    if payload.get("session_crons"):
+        return "a scheduled task is pending"
+    if payload.get("stop_hook_active"):
+        return "another Stop hook is holding the session"
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    if not top:
+        return None                                   # not a repo: git has nothing half-done to lose
+    wts = git(cwd, "worktree", "list", "--porcelain")
+    if wts is None:
+        return "git could not be read"
+    for l in wts.splitlines():                        # every worktree of this repo: a planning session's
+        if not l.startswith("worktree "):             # own conflict resolution happens inside a track's
+            continue
+        w = l.split(" ", 1)[1]
+        gd = git(w, "rev-parse", "--absolute-git-dir")
+        if gd is None:
+            return f"git could not be read in {os.path.basename(w)}"
+        for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply"):
+            if os.path.exists(os.path.join(gd, marker)):
+                return f"a merge/rebase is unfinished in {os.path.basename(w)}"
+        st = git(w, "status", "--porcelain")
+        if st is None:
+            return f"git could not be read in {os.path.basename(w)}"
+        if st:
+            return f"uncommitted work in {os.path.basename(w)}"
+        ahead = git(w, "rev-list", "--count", "@{upstream}..HEAD")
+        if ahead and ahead != "0":
+            return f"unpushed commits in {os.path.basename(w)}"
+    return None
+
+
+def ledger(m, kind, why=""):
+    """One countable line per crossing — the App Home's handoff count is a `wc -l`, not a prose search."""
+    os.makedirs(RECORDS, exist_ok=True)
+    row = {"ts": m["ts"], "kind": kind, "session_id": m.get("session_id"), "repo": m.get("repo"),
+           "track": m.get("track"), "pct": m["pct"], "used": m["used"], "window": m["window"],
+           "model": m.get("model"), "cwd": m.get("cwd")}
+    if why:
+        row["why"] = why
+    with open(os.path.join(RECORDS, "handoffs.jsonl"), "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def handoffs():
+    """Every crossing ever recorded, oldest first. The App Home's count is len() of this."""
+    out = []
+    try:
+        with open(os.path.join(RECORDS, "handoffs.jsonl")) as f:
+            for l in f:
+                try:
+                    out.append(json.loads(l))
+                except Exception:
+                    continue                       # one bad line never hides the rest
+    except OSError:
+        pass
+    return out
+
+
+def have_window(repo, track):
+    """Is there a live tmux window to restart? A headless worker has none — its loop is its handoff."""
+    try:
+        r = subprocess.run(["tmux", "list-windows", "-t", "main", "-F", "#W"],
+                           capture_output=True, text=True, timeout=10)
+        return f"{repo}/{track}" in r.stdout.split()
+    except Exception:
+        return False
+
+
+def handoff(repo, track):
+    """Start `cc handoff` detached and return at once: this runs inside the session's own Stop hook, and
+    `cc handoff` waits for that session to exit before it restarts it."""
+    try:
+        os.makedirs(RECORDS, exist_ok=True)
+        log = open(os.path.join(RECORDS, "handoff.log"), "a")
+        subprocess.Popen([os.path.join(BIN, "cc"), "handoff", repo, track],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def journal_of(m):
+    return (f"~/.cc/state/{m['repo']}/{m['track']}/progress.md" if m.get("track")
+            else f"~/.cc/state/{m['repo']}/planning-handoff.md")
+
+
+def told(m, lvl, deferred="", restartable=True):
+    """What the session is told when it crosses a line — the Stop hook's reason."""
+    s = (f"CONTEXT {m['pct']:.0f}% ({human(m['used'])} of {human(m['window'])}). Append a dated handoff entry to "
+         f"{journal_of(m)} now, while there is still room to write a good one: what is done, what is next "
+         f"(ordered), gotchas. Write it from what you already know — do not go looking, and a line or two is "
+         f"enough if that is all there is. A fresh session starts from that file and from nothing else.")
+    if lvl == "journal":
+        return s + " Then carry on."
+    if deferred:
+        return s + (f" A handoff is now PENDING: it happens at the first turn with nothing in flight, and right "
+                    f"now {deferred}. Finish that; nothing is being restarted underneath you.")
+    if not restartable:
+        return s + (" There is no interactive session to restart here, so this entry IS the handoff — the next "
+                    "iteration starts from it and from nothing else.")
+    return s + " This session is being handed off now."
+
+
+def record(payload):
+    """Called by the Stop hook. Never raises: a measurement must not be able to break a session."""
+    sid = payload.get("session_id") or ""
+    path = payload.get("transcript_path") or ""
+    cwd = payload.get("cwd") or ""
+    if not path or not os.path.exists(path):
+        path = transcript_for_session(sid) if sid else None
+    if not path or not os.path.exists(path):
+        return None
+    m = measure(path, sid)
+    if not m:
+        return None
+    root = git(cwd, "rev-parse", "--show-toplevel") if cwd else ""
+    repo, track = track_of(root or cwd or "")
+    if not repo and cwd and os.path.dirname(os.path.realpath(cwd)) == os.path.expanduser("~/dev"):
+        repo = os.path.basename(os.path.realpath(cwd))   # a planning session: ~/dev/<repo>, no track marker
+    m.update({"cwd": cwd, "repo": repo, "track": track, "level": level_of(m["used"], m["window"])})
+    os.makedirs(RECORDS, exist_ok=True)
+    p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
+    was = {}
+    try:
+        with open(p) as f:
+            was = json.load(f) or {}
+    except Exception:
+        pass
+    m["told"] = was.get("told")
+    m["handed_off"] = was.get("handed_off")
+    lvl = m["level"]
+    # Only a session with a journal to write is ever interrupted — an owner's conversation is not.
+    # never twice: once a handoff is taken, this session is being replaced and has nothing left to be told
+    if lvl and repo and not m["handed_off"] and not payload.get("stop_hook_active"):
+        busy = in_flight(payload, cwd) if lvl != "ceiling" else None   # the ceiling goes regardless
+        live = track and have_window(repo, track)      # no window = a headless worker: its loop is its handoff
+        if lvl != "journal" and not busy and live:
+            m["handed_off"] = m["ts"]                  # written before it is launched: never launched twice
+            ledger(m, lvl)
+            handoff(repo, track)
+        elif LEVELS.index(lvl) > LEVELS.index(was.get("told") or LEVELS[0]) or not was.get("told"):
+            m["told"] = lvl                            # said once per line crossed, not once per turn
+            m["say"] = told(m, lvl, busy or "", bool(live))
+            ledger(m, lvl if lvl == "journal" else lvl + "-deferred", busy or ("no live session to restart"
+                                                                              if not live else ""))
+    m["pending"] = bool(lvl and lvl != "journal" and not m["handed_off"])
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(m, f)
+    os.replace(tmp, p)
+    now = time.time()
+    for old in glob.glob(os.path.join(RECORDS, "*.json")):
+        try:
+            if now - os.path.getmtime(old) > PRUNE_AFTER:
+                os.remove(old)
+        except OSError:
+            pass
+    return m
+
+
+def records():
+    out = []
+    for p in sorted(glob.glob(os.path.join(RECORDS, "*.json"))):
+        try:
+            with open(p) as f:
+                d = json.load(f)
+            d["age"] = int(time.time() - os.path.getmtime(p))
+            out.append(d)
+        except Exception:
+            continue
+    out.sort(key=lambda d: d["age"])
+    return out
+
+
+def newest_per_track(rs):
+    """A track keeps its name across handoffs but not its session id: newest record wins."""
+    best = {}
+    for d in rs:
+        if not d.get("repo") or not d.get("track"):
+            continue
+        k = (d["repo"], d["track"])
+        if k not in best:                                # records() is already newest-first
+            best[k] = d
+    return best
+
+
+# ---- output ------------------------------------------------------------------------------------
+
+def line(m):
+    s = f"{m['pct']:.0f}%  {human(m['used'])}/{human(m['window'])}"
+    if m.get("model"):
+        s += f"  {m['model']}"
+    s += f"  window from {m['window_src']}"
+    if m["window_src"] == "assumed":
+        s += " — NO evidence for the window, so the % may be wrong"
+    if m.get("compacted"):
+        s += "  (just compacted)"
+    lvl = m.get("level") or level_of(m["used"], m["window"])
+    if lvl:
+        s += {"journal": "  — journal a handoff", "handoff": "  — hand off",
+              "ceiling": "  — hand off NOW (ceiling)"}[lvl]
+    if m.get("pending"):
+        s += "  (handoff pending)"
+    return s
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    as_json = quiet = do_all = do_record = do_handoffs = False
+    over = None
+    path = sid = repo = track = None
+    args = []
+    while argv:
+        a = argv.pop(0)
+        if a == "--json":
+            as_json = True
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a == "--all":
+            do_all = True
+        elif a == "--thresholds":
+            print(" ".join(f"{cfg(k, d):g}" for k, d in (("CC_CONTEXT_WARN_PCT", 30.0),
+                                                         ("CC_CONTEXT_HANDOFF_PCT", 40.0),
+                                                         ("CC_CONTEXT_CEILING_PCT", 60.0))))
+            return 0
+        elif a == "--record":
+            do_record = True
+        elif a == "--handoffs":
+            do_handoffs = True
+        elif a == "--over":
+            over = float(argv.pop(0)) if argv and not argv[0].startswith("-") and argv[0][:1].isdigit() \
+                else "level"                      # bare --over = the handoff line for THAT session's window
+        elif a == "--transcript":
+            path = argv.pop(0)
+        elif a == "--session":
+            sid = argv.pop(0)
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a.startswith("-"):
+            print(f"cc-context: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            args.append(a)
+    if len(args) >= 2:
+        repo, track = args[0], args[1]
+
+    if do_record:
+        try:
+            payload = json.load(sys.stdin)
+            m = record(payload if isinstance(payload, dict) else {})
+            if m and m.get("say"):   # the Stop hook's own reply channel: the session continues and does this
+                print(json.dumps({"decision": "block", "reason": m["say"]}))
+        except Exception:
+            pass
+        return 0
+
+    if do_handoffs:
+        hs = handoffs()
+        if as_json:
+            print(json.dumps(hs, indent=2))
+            return 0
+        for h in hs:
+            print(f"{h.get('ts')}\t{h.get('kind')}\t{(h.get('repo') or '-')}/{(h.get('track') or '-')}"
+                  f"\t{h.get('pct')}\t{h.get('used')}\t{h.get('window')}\t{h.get('session_id') or '-'}")
+        return 0
+
+    if do_all:
+        rs = records()
+        if as_json:
+            print(json.dumps(rs, indent=2))
+            return 0
+        for d in rs:
+            print(f"{d.get('repo') or '-'}\t{d.get('track') or '-'}\t{d['pct']:.0f}\t{d['used']}"
+                  f"\t{d['window']}\t{d['window_src']}\t{d['age']}\t{d.get('level') or '-'}"
+                  f"\t{'pending' if d.get('pending') else '-'}")
+        return 0
+
+    if not path:
+        path, sid = resolve(repo, track, sid)
+    if not path or not os.path.exists(path):
+        if not quiet:
+            what = f"{repo}/{track}" if repo else (sid or os.getcwd())
+            print(f"cc-context: no transcript for {what}", file=sys.stderr)
+        return 2
+    m = measure(path, sid)
+    if not m:
+        if not quiet:
+            print(f"cc-context: {path} has no answered turn yet", file=sys.stderr)
+        return 2
+    if as_json:
+        print(json.dumps(m, indent=2))
+    elif not quiet:
+        print(line(m))
+    if over is not None:
+        if over == "level":
+            return 0 if (m.get("level") or level_of(m["used"], m["window"])) in ("handoff", "ceiling") else 1
+        return 0 if m["pct"] >= over else 1
+    return 0
+
+
+# ---- selfcheck ---------------------------------------------------------------------------------
+
+def selfcheck():
+    import tempfile
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+        else:
+            f += 1
+            print(f"  FAIL {name}")
+
+    def tx(entries):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+        return path
+
+    def asst(model, inp, cc, cr, out=10, side=False):
+        return {"type": "assistant", "isSidechain": side, "message": {
+            "model": model, "usage": {"input_tokens": inp, "cache_creation_input_tokens": cc,
+                                      "cache_read_input_tokens": cr, "output_tokens": out}}}
+
+    env0 = os.environ.pop("CC_CTX_WINDOW", None)
+    box0 = os.environ.get("CC_CTX_BOX_MODEL")
+    os.environ["CC_CTX_BOX_MODEL"] = ""        # hermetic: what THIS box runs must not decide a fixture's window
+
+    # used = input + cache_creation + cache_read of the LAST assistant turn
+    t = tx([asst("claude-opus-5", 5, 100, 200), asst("claude-opus-5", 10, 1000, 9000)])
+    m = measure(t)
+    ok("used = last turn's input+cache_creation+cache_read", m["used"] == 10010)
+    ok("assumed window is flagged", m["window"] == DEFAULT_WINDOW and m["window_src"] == "assumed")
+    ok("assumption is stated in the output", "NO evidence" in line(m))
+
+    # a subagent's window is its own: sidechain entries never count
+    m = measure(tx([asst("claude-opus-5", 10, 1000, 9000), asst("claude-opus-5", 0, 0, 500000, side=True)]))
+    ok("sidechain entries are ignored", m["used"] == 10010)
+
+    # cost-state carries the exact model id, [1m] and all
+    m = measure(tx([asst("claude-opus-5", 10, 1000, 9000),
+                    {"type": "cost-state", "modelUsage": {"claude-opus-5[1m]": {"inputTokens": 1}}}]))
+    ok("cost-state gives the 1M window", m["window"] == BIG_WINDOW and m["window_src"] == "cost-state")
+    ok("pct is against the real window", m["pct"] == 1.0)
+
+    # a compact boundary AFTER the last answer replaces the number and dates the window
+    m = measure(tx([asst("claude-opus-5", 10, 1000, 989000),
+                    {"type": "system", "subtype": "compact_boundary",
+                     "compactMetadata": {"trigger": "auto", "preTokens": 1000830, "postTokens": 14226}}]))
+    ok("post-compact used = postTokens", m["used"] == 14226 and m["compacted"])
+    ok("the session's own compaction sizes the window", m["window"] == BIG_WINDOW and m["window_src"] == "compacted")
+
+    m = measure(tx([asst("claude-sonnet-5", 10, 1000, 189000),
+                    {"type": "system", "subtype": "compact_boundary",
+                     "compactMetadata": {"preTokens": 190000, "postTokens": 9000}}]))
+    ok("compacting at 190k means a 200k window", m["window"] == DEFAULT_WINDOW)
+
+    # never a percentage above 100: evidence beats the assumption
+    m = measure(tx([asst("claude-opus-5", 0, 0, 640000)]))
+    ok("used above the assumed window raises it", m["window"] == BIG_WINDOW and m["pct"] == 64.0)
+    ok("the override is visible in the source", m["window_src"] == "assumed+observed")
+
+    # the box's own model answers only for its own family: opus-5 and opus-5[1m] are one model, fable is not
+    os.environ["CC_CTX_BOX_MODEL"] = "claude-opus-5[1m]"
+    m = measure(tx([asst("claude-opus-5", 10, 1000, 9000)]))
+    ok("cc-model's [1m] sizes a same-family session", m["window"] == BIG_WINDOW and m["window_src"] == "cc-model")
+    m = measure(tx([asst("claude-sonnet-5", 10, 1000, 9000)]))
+    ok("a different family says nothing", m["window_src"] == "assumed")
+    m = measure(tx([asst("claude-opus-5", 10, 1000, 9000),
+                    {"type": "cost-state", "modelUsage": {"claude-opus-5": {"inputTokens": 1}}}]))
+    ok("a suffix-less id is raised to the size the box runs that family at",
+       m["window"] == BIG_WINDOW and m["window_src"] == "cost-state+cc-model")
+    os.environ["CC_CTX_BOX_MODEL"] = ""
+
+    os.environ["CC_CTX_WINDOW"] = "500000"
+    m = measure(tx([asst("claude-opus-5", 0, 0, 250000)]))
+    ok("CC_CTX_WINDOW wins", m["window"] == 500000 and m["pct"] == 50.0 and m["window_src"] == "env")
+    del os.environ["CC_CTX_WINDOW"]
+
+    # a transcript with nothing answered yet, and a half-written last line (a live session)
+    ok("no answered turn -> None", measure(tx([{"type": "user", "message": {"role": "user"}}])) is None)
+    t = tx([asst("claude-opus-5", 10, 1000, 9000)])
+    with open(t, "a") as fh:
+        fh.write('{"type":"assistant","message":{"usa')
+    ok("a half-written last line is skipped", measure(t)["used"] == 10010)
+
+    # the tail is grown until a turn is found: a big transcript whose last turns are far back
+    big = tx([asst("claude-opus-5", 1, 2, 3)] + [{"type": "user", "pad": "x" * 4000} for _ in range(200)])
+    ok("tail grows past 256k of padding", measure(big)["used"] == 6)
+
+    # records: written from a Stop payload, read back newest-first per track
+    with tempfile.TemporaryDirectory() as d:
+        global RECORDS
+        keep, RECORDS = RECORDS, os.path.join(d, "context")
+        t = tx([asst("claude-opus-5", 10, 1000, 9000)])
+        r = record({"session_id": "sid-1", "transcript_path": t, "cwd": d})
+        ok("record writes a measurement", r and r["used"] == 10010)
+        ok("record file is keyed by session id", os.path.exists(os.path.join(RECORDS, "sid-1.json")))
+        ok("a payload with no transcript records nothing", record({"session_id": "x"}) is None)
+        os.makedirs(os.path.join(d, "wt/.cc"), exist_ok=True)
+        with open(os.path.join(d, "wt/.cc/track"), "w") as fh:
+            fh.write("repo1\ntrack1\n")
+        record({"session_id": "sid-2", "transcript_path": t, "cwd": os.path.join(d, "wt")})
+        rs = records()
+        ok("--all lists both records", len(rs) == 2)
+        best = newest_per_track(rs)
+        ok("repo/track comes off the .cc/track marker", ("repo1", "track1") in best)
+
+        # the three lines: a percentage each, with a floor under the first two
+        ok("30/40/60 of the 1M window", thresholds(BIG_WINDOW) == (300000.0, 400000.0, 600000.0))
+        ok("the floors hold a 200k window up", thresholds(DEFAULT_WINDOW) == (60000.0, 90000.0, 120000.0))
+        ok("on 128k the floor is the whole rule", thresholds(128000) == (60000.0, 90000.0, 90000.0))
+        ok("the ceiling is never under the handoff", thresholds(100000)[2] >= thresholds(100000)[1])
+        ok("levels, in order", [level_of(u, BIG_WINDOW) for u in (299999, 300000, 400000, 600000)]
+                               == [None, "journal", "handoff", "ceiling"])
+        ok("the same rule fires on a 200k model", level_of(60000, DEFAULT_WINDOW) == "journal")
+
+        # nothing real is ever restarted from a selfcheck: the two shell-outs are stubbed
+        global have_window, handoff
+        hw0, ho0, live, launched = have_window, handoff, [True], []
+        have_window = lambda r, t: live[0]
+        handoff = lambda r, t: launched.append((r, t)) or True
+
+        wt = os.path.join(d, "wt")
+        subprocess.run(["git", "init", "-q", wt], check=False)      # a real repo: in_flight reads git, not a flag
+
+        def at(used, sid, **extra):
+            t2 = tx([asst("claude-opus-5", 0, 0, used),
+                     {"type": "cost-state", "modelUsage": {"claude-opus-5[1m]": {"inputTokens": 1}}}])
+            return record({"session_id": sid, "transcript_path": t2, "cwd": wt, **extra})
+
+        r = at(320000, "sid-3")
+        ok("crossing the journal line tells the session", r["level"] == "journal" and "handoff entry" in r["say"])
+        ok("the message names the journal, not the tool", "repo1/track1/progress.md" in r["say"])
+        ok("the same line is not said twice", not at(320000, "sid-3").get("say"))
+
+        # the handoff line with work in flight: PENDING, and nothing is restarted underneath the session
+        r = at(420000, "sid-3")
+        ok("in flight -> the handoff is pending, not taken", r["pending"] and not r["handed_off"] and not launched)
+        ok("the session is told what it is waiting on", "PENDING" in r["say"] and "uncommitted work" in r["say"])
+        r = at(420000, "sid-3", background_tasks=[{"id": "1"}])
+        ok("a background task counts as in flight", r["pending"] and not launched)
+
+        # the ceiling goes regardless: past it, a degraded session costs more than the state it drops
+        r = at(650000, "sid-3")
+        ok("the ceiling hands off with work still in flight", r["level"] == "ceiling" and r["handed_off"]
+           and launched == [("repo1", "track1")])
+        ok("a handoff already taken is never taken twice", at(650000, "sid-3")["handed_off"] == r["handed_off"]
+           and len(launched) == 1)
+
+        # nothing in flight: the pending handoff is taken at the next turn
+        for a in (["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+            subprocess.run(["git", "-C", wt, *a], check=False, capture_output=True)
+        ok("a committed worktree is not in flight", in_flight({}, wt) is None)
+        r = at(420000, "sid-6")
+        ok("idle -> the handoff is executed", r["handed_off"] and len(launched) == 2)
+
+        # a headless worker has no window to restart; its loop is the handoff, so it is told to journal
+        live[0] = False
+        r = at(420000, "sid-7")
+        ok("no live session -> told, never restarted", not r["handed_off"] and "IS the handoff" in r["say"])
+        live[0] = True
+
+        r = at(420000, "sid-8", stop_hook_active=True)
+        ok("never while a Stop hook is already holding the session", "say" not in r)
+        t9 = tx([asst("claude-opus-5", 0, 0, 470000),
+                 {"type": "cost-state", "modelUsage": {"claude-opus-5[1m]": {"inputTokens": 1}}}])
+        r = record({"session_id": "sid-9", "transcript_path": t9, "cwd": d})
+        ok("a session with no journal is not interrupted", r["level"] == "handoff" and "say" not in r)
+
+        # the durable record: one countable line per crossing, no prose to parse
+        hs = handoffs()
+        ok("every crossing is on the ledger, and only crossings", len(hs) == 5)
+        ok("the ledger says which line fired", [h["kind"] for h in hs]
+           == ["journal", "handoff-deferred", "ceiling", "handoff", "handoff-deferred"])
+        ok("a ledger line carries when/who/how full", all(h.get("ts") and h.get("pct") and h.get("used")
+                                                          and h.get("window") and h.get("session_id") for h in hs))
+        ok("repo and track are on it, so a count can be per track",
+           all(h["repo"] == "repo1" and h["track"] == "track1" for h in hs))
+        ok("a deferred line says what it was waiting on", any("uncommitted" in (h.get("why") or "") for h in hs))
+        ok("the ledger outlives the per-session records", os.path.exists(os.path.join(RECORDS, "handoffs.jsonl")))
+        have_window, handoff = hw0, ho0
+
+        RECORDS = keep
+
+    if env0 is not None:
+        os.environ["CC_CTX_WINDOW"] = env0
+    if box0 is None:
+        os.environ.pop("CC_CTX_BOX_MODEL", None)
+    else:
+        os.environ["CC_CTX_BOX_MODEL"] = box0
+    print(f"cc-context selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)

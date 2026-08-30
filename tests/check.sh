@@ -10,6 +10,8 @@ shellcheck -S warning -e SC1090,SC1010 "${sh[@]}"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py "$@"
 for f in slack/*.json config/claude-settings.json; do jq -e . "$f" >/dev/null; done
 H=$(mktemp -d); ln -s "$PWD/bin" "$H/bin"   # verify the units against THIS tree's bin/, not against what the box happens to have linked
-v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service 2>&1 | grep -v '^\s*$' || true); rm -rf "$H"
+v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config/systemd-user/*.timer 2>&1 | grep -v '^\s*$' || true); rm -rf "$H"
 [ -z "$v" ] || { echo "$v"; exit 1; }
+# a unit nobody links is a unit that never runs: install.sh names them one by one, so adding a file is not enough
+for u in config/systemd-user/*; do grep -qF "$(basename "$u")" install.sh || { echo "check.sh: $u is not linked by install.sh"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units)"

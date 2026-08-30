@@ -10,7 +10,8 @@
   cc-slack post [-c CHANNEL] [--thread TS] [--route TITLE] "text"   post as the bot (cc-notify uses --route)
   cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--title T] [-m "text"]   upload a file as the bot;
                                       --thread lands it in that thread (default target: DM the owner); Web API only
-  cc-slack post-approval <repo> <pr-number|url>   "[repo] PR #n: title — url" into #approvals; the owner's :+1: there squash-merges it (daemon)
+  cc-slack post-approval [--force] <repo> <pr-number|url>   "[repo] PR #n: title — url" into #approvals; the owner's :+1: there
+                                      squash-merges it (daemon). One card per PR: a second caller finds the first and does nothing (--force re-posts)
   cc-slack history <#chan|C…|D…> [n] | thread <#chan|C…> <ts> [n]   read a channel / a full thread (newest first, cursor-paged)
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>          rewrite / delete one of the BOT's own posts (signed ones too)
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md   pin a message · replace a channel canvas
@@ -60,9 +61,11 @@ when the work is finished — a plain reply is "handled", not
 "done". A newer message makes an older 🔧/✅ stale (it is stripped): react 🔧 again after a follow-up if you are still on it. Log longer non-track work
 with `cc quick doing "…"` / `cc quick done "…"` so the Home tab lists it while it runs.
 App Home: the daemon republishes a whole-box dashboard into the owner's Home tab every 30 s and on app_home_opened —
-one views.publish, never a message. What is RUNNING and what NEEDS YOU sit above the fold; the backlog, the channels,
-the load, the audit and the boot line sit below it. Up to three buttons come with it, and every one of them is gated on
-the owner's user id (a Home tab is per-user, so a button is not a permission). Needs home_tab_enabled, the
+one views.publish, never a message. What is RUNNING and what NEEDS YOU sit above the fold; the backlog, the board-view
+buttons, the channels, the load, the handoff count, the audit and the boot line sit below it. NEEDS YOU and the backlog
+print EVERY row — they are the two lists the tab exists for. Up to three buttons sit above the fold and three board
+views below, and every one of them is gated on the owner's user id (a Home tab is per-user, so a button is not a
+permission); an accepted press is logged as well as a refused one. Needs home_tab_enabled, the
 app_home_opened bot event and interactivity in core/slack/app-manifest.json (re-paste it, Reinstall); without the first
 two it logs one line and gives up until restart.
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
@@ -85,6 +88,7 @@ PERM_RE = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$", re.I)
 SENT_USING_RE = re.compile(r"\s*\*Sent using\*\s+\S+\s*$")     # claude.ai's Slack connector signs every message it sends
 CHUNK = 3900
 APPROVALS = "approvals"                                        # #approvals is not a session: the owner's :+1: on a bot post there merges the PR
+MERGE_RECHECK, MERGE_RECHECK_EVERY = 6, 2.0                    # "Merge already in progress": re-read the PR for ~12 s before calling it a failure
 ALERTS = "alerts"                                              # #alerts is not a session: machinery notices (boot, limits, audits, digest) land there
 ALERT_KINDS = ("boot", "limit", "audit", "review", "digest", "alerts", "cc-rc", "heartbeat", "power")   # "<box> <kind>" notify titles → #alerts even when the box shares its name with a repo
 NUDGE_PREFIXES = ("❓ still waiting", "⏳ no answer", "🔴 still open")   # our own nudge posts (v1's too): never an answer
@@ -884,11 +888,14 @@ HOME_FAST = 5                                  # dashboard refresh while the own
                                                # views.publish is a ~50/min method and 1 s sat at the edge of it all day)
 PRESENCE_EVERY = 30                            # how often the daemon asks Slack whether the owner is active (one cheap call)
 AWAY_GRACE = 60                                # …and how long the 1 s dashboard cadence outlives them going idle (owner rule)
+HOME_LEDGER = 1 << 18                          # bytes of cc-context's handoff ledger the dashboard reads (its tail)
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
-HOME_MAXBLK, HOME_MAXTEXT = 16, 2900           # OUR budget for one published view (Slack allows 100 blocks and 3000 chars a
+HOME_MAXBLK, HOME_MAXTEXT = 18, 2900           # OUR budget for one published view (Slack allows 100 blocks and 3000 chars a
                                                # text): a Home tab that has to be scrolled has already lost its five-second
-                                               # glance. Direction 1a fits the whole tab in 14 blocks busy, 10 quiet, 11
-                                               # degraded — so 16 is a ceiling that a real board should never touch.
+                                               # glance. The tab is 15 blocks busy, 11 quiet, 12 degraded, 16 with a
+                                               # handoff line — a ceiling a real board stays UNDER, not one it sits on.
+                                               # Note what does NOT grow it: the whole backlog and every ❓ are one section
+                                               # block each however long they get, so showing all of both costs 0 blocks.
 HOME_MARKS = ("❓", "🔴", "🔧")                 # the channel rows count only live threads: needs you · owed · working (🟠/✅ are history)
 # ── THE ONE VOCABULARY (handoff §02). A track has exactly one state, and BOTH its emoji and the word printed beside it
 #    come out of this row — so they can never disagree again. Everywhere else on the tab an emoji means one thing and
@@ -897,12 +904,26 @@ HOME_MARKS = ("❓", "🔴", "🔧")                 # the channel rows count on
 HOME_STATE = {"running": ("🏃", "running"), "blocked": ("⛔", "blocked"), "queued": ("⏳", "queued"),
               "done": ("✅", "done"), "review": ("✅", "done"),   # `done`/`review` only survive home_track_shown while the PR waits
               "merged": ("✅", "merged")}
+HOME_ALIAS = {"todo": "queued"}                        # the one word an older board file still says for `queued`
 HOME_STALE = ("blocked", "review", "done", "merged")   # board states a live process contradicts → the line says `board stale`
 HOME_RANK = ("running", "blocked", "review", "done", "merged", "queued")   # what the owner must see first, first
-HOME_RUN, HOME_NEED, HOME_BACK, HOME_CHANS = 5, 4, 3, 6    # lines each band prints before it collapses to "+k more"
+HOME_RUN, HOME_CHANS = 5, 6                    # lines the RUNNING and CHANNELS bands print before they collapse to "+k more"
+HOME_LIST, HOME_SLICE = 2400, 12               # …but BACKLOG and NEEDS YOU print EVERY row (owner, 2026-08-30, thread
+                                               # 1788129807: "what happenend to showing all the backlog items and all ?
+                                               # items and not defaulting to showing only a few"). Their only cap left is
+                                               # a CHARACTER budget for one Slack text (the hard limit is 3000), and it
+                                               # is a safety valve: "+k more" appears when a row would otherwise be cut
+                                               # in half, never because the tab decided three was enough. The backlog's
+                                               # budget is the tighter one, so §01d still holds — the backlog tail goes
+                                               # before the ❓ tail, which is the last thing on the tab to be touched.
+                                               # HOME_SLICE: rows one board-view button DMs before it says how many more.
 HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT, HOME_BTN = 40, 24, 26, 180, 18   # phone widths: a line · a track name · an ask · the audit · a button label
-HOME_CUT = ("boot", "audit", "channels", "backlog")   # …and the order they go in when even that does not fit (§01d)
-HOME_ACT = ("restart_unit", "open_channel", "open_board", "next_track", "home_logs")   # Home buttons that reach the daemon
+HOME_CUT = ("boot", "handoffs", "audit", "channels", "backlog", "views")   # …and the order they go in when even that does not fit (§01d)
+HOME_ACT = ("restart_unit", "open_channel", "open_board", "next_track", "home_logs",
+            "board_todo", "board_running", "board_done")   # Home buttons that reach the daemon
+HOME_VIEWS = (("board_todo", "To do", ("queued",)), ("board_running", "Running", ("running",)),
+              ("board_done", "Done", ("done", "review", "merged")))   # the board VIEW buttons, in the order they sit —
+HOME_VIEW = {a: (lab, st) for a, lab, st in HOME_VIEWS}   # one slice of the board each, DM'd, never the whole board
 
 
 def _home_sec(text):
@@ -1063,6 +1084,90 @@ def home_marks(marks):
     return " ".join(f"{m}{n}" for m, n in sorted((marks or {}).items()) if n)
 
 
+def home_list(lines, more, budget=HOME_LIST):
+    """A whole list as one Slack text — EVERY row (owner, 2026-08-30, thread 1788129807), with `more(k)` appended only
+    when the character budget would otherwise cut a row in half. That is the difference this function exists to make:
+    "+k more" used to be the default (the first 3 of the backlog, the first 4 of NEEDS YOU) and is now the safety valve,
+    so a board that grows DEGRADES instead of the tab quietly hiding the thing it is there to show."""
+    lines = [l for l in lines if l]
+    kept = list(lines)
+    while kept:
+        text = "\n".join(kept + ([more(len(lines) - len(kept))] if len(kept) < len(lines) else []))
+        if len(text) <= budget:
+            return text
+        kept.pop()
+    return more(len(lines))[:budget] if lines else ""
+
+
+def home_board_rows():
+    """(repo, track, status, title, updated) for EVERY track on every sidecar board — including the finished ones the tab
+    itself drops (home_track_shown). This is what the board VIEW buttons read: one plain file pass shared by all three of
+    them (`cached`), never a subprocess per press."""
+    out = []
+    for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
+        try:
+            d = json.load(open(fn))
+        except Exception:
+            continue                                      # one unreadable board must not empty every other repo's slice
+        repo = d.get("repo") or os.path.basename(fn)[:-5]
+        for tr, t in (d.get("tracks") or {}).items():
+            out.append((repo, tr, str(t.get("status") or "?"), str(t.get("title") or ""), str(t.get("updated") or "")))
+    return out
+
+
+def home_word(status):
+    """A BOARD status in the tab's vocabulary. `todo` is the word the board wrote for `queued` before the two were made
+    one word, so older boards still say it; anything unrecognised is `queued`, the same fallback the state ladder uses,
+    so a slice and a row can never file the same track differently. Unlike home_track_state this asks nothing about live
+    processes: a board view reports what the BOARD says, which is exactly what the owner pressed the button to read."""
+    st = HOME_ALIAS.get(str(status or ""), str(status or ""))
+    return st if st in HOME_STATE else "queued"
+
+
+def home_slice(rows, states, label, n=HOME_SLICE):
+    """PURE: one board view as the DM prints it — the tracks whose state (home_word) is in `states`, newest first. An
+    empty slice is a SENTENCE: a button that answers with an empty code block has told the owner nothing."""
+    hit = sorted((r for r in rows if home_word(r[2]) in states), key=lambda r: r[4], reverse=True)
+    if not hit:
+        return f"nothing is *{label.lower()}* on the board."
+    out = [f"*{label}* · {len(hit)}"]
+    for repo, tr, status, title, _ in hit[:n]:
+        out.append(f"{HOME_STATE.get(home_word(status), ('·', ''))[0]} {repo}/{home_short(tr)}"
+                   + (f" — {home_clip(title, 60)}" if title else ""))
+    if len(hit) > n:
+        out.append(f"_+{len(hit) - n} more — `cc board show <repo>`_")
+    return "\n".join(out)
+
+
+def home_handoffs(day=None):
+    """How often sessions handed off TODAY, and the last one — one grey line below the fold. `cc-context` appends one
+    JSON row per crossing to ~/.cc/state/context/handoffs.jsonl, so this is a read and a count, not a search.
+    Zero handoffs render nothing, like every other empty band.
+
+    ONLY THE TAIL. That ledger is append-only and deliberately never pruned, so it grows for the life of the box while
+    this runs on every publish — read the last HOME_LEDGER bytes, which is many days of crossings, and drop the first
+    row because a seek lands mid-line."""
+    day, n, last = day or time.strftime("%Y-%m-%d", time.gmtime()), 0, None
+    try:
+        with open(f"{HOME}/.cc/state/context/handoffs.jsonl", "rb") as f:
+            size = f.seek(0, 2)
+            f.seek(max(0, size - HOME_LEDGER))
+            rows = f.read().decode("utf-8", "replace").splitlines()[1 if size > HOME_LEDGER else 0:]
+    except OSError:
+        return {}
+    for line in rows:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue                                      # one bad row never hides the rest (cc-context reads it so too)
+        if str(r.get("ts") or "").startswith(day):
+            n, last = n + 1, r
+    if not n:
+        return {}
+    ts, who = str(last.get("ts") or ""), "/".join(str(x) for x in (last.get("repo"), last.get("track")) if x)
+    return {"today": n, "when": f"{ts[11:16]}Z" if len(ts) > 15 else "", "who": home_repo(who) if who else ""}
+
+
 def home_needs(st, names=None):
     """PURE: the ONE ranked list of everything waiting on the owner (§03 #3) — threads by age descending, then PRs owed a
     👍, then blocked tracks. Every row carries the ASK, never a count: "2 threads waiting" is the line the owner called
@@ -1129,13 +1234,18 @@ def home_parts(st):
       2 tally + running   RUNNING n · BLOCKED n · QUEUED n, then one dense line per thing actually running. A unit that
                           is down and a Claude usage limit sort ABOVE the running rows: the owner must not have to
                           scroll to learn the box is impaired. Nothing running is a SENTENCE, never a gap.
-      3 needs you         threads waiting (age + the ask), PRs owed a 👍, blocked tracks — one notation, ranked, ≤4
-                          lines. The whole band is absent when nothing needs them; it is never present and empty.
+      3 needs you         threads waiting (age + the ask), PRs owed a 👍, blocked tracks — one notation, ranked, ALL
+                          of them. The whole band is absent when nothing needs them; it is never present and empty.
       4 actions           ≤3 buttons, owner-gated (see home_buttons / Daemon.on_action)
       5 divider           THE FOLD. Everything below is secondary by contract.
-      6 backlog           ⏳ ≤3 + "+k more on the board"; while a usage limit holds, the count and the hour, no lines
+      6 backlog           ⏳ EVERY queued track; while a usage limit holds, the count and the hour, no lines
+      6b board views      To do · Running · Done — three buttons that DM one slice of the board each
       7 channels          only the ones where something is happening; the quiet ones are a number, never lines
-      8-10 load · audit · units+boot    grey, one line each, cheapest to skip and first to be cut (HOME_CUT)
+      8-11 load · handoffs · audit · units+boot   grey, one line each, cheapest to skip and first to be cut (HOME_CUT)
+
+    THE LISTS ARE WHOLE (owner, 2026-08-30, thread 1788129807). The backlog used to stop at 3 and NEEDS YOU at 4, each
+    with a "+k more" the owner had to leave Slack to read — the tab hiding the two things it exists to show. Both now
+    print every row, and "+k more" survives only as the character-budget safety valve inside home_list.
 
     Phone first: one line per item, ~40 rendered characters (two-column `fields` truncate there and are gone from here).
     Emoji are the only graphics and every one comes from HOME_STATE or the table above it."""
@@ -1171,10 +1281,9 @@ def home_parts(st):
 
     # 3 — the band that answers "does this need me?", absent when the answer is no
     needs = home_needs(st, names)
-    if needs:
-        shown = needs if len(needs) <= HOME_NEED else needs[:HOME_NEED - 1]
-        text = "\n".join(shown) + (f"\n_+{len(needs) - len(shown)} more waiting → #{box}_" if len(needs) > len(shown) else "")
-        p += [("needs", _home_ctx(f"NEEDS YOU · {len(needs)}")), ("needs", _home_sec(text))]
+    if needs:                                                # EVERY ❓, and the widest budget on the tab: this is the band
+        p += [("needs", _home_ctx(f"NEEDS YOU · {len(needs)}")),   # the owner opens the tab for, so it is the last thing
+              ("needs", _home_sec(home_list(needs, lambda k: f"_+{k} more waiting → #{box}_", HOME_MAXTEXT)))]
 
     # 4, 5 — the buttons, then the fold
     btns = home_buttons(st, needs)
@@ -1186,10 +1295,14 @@ def home_parts(st):
     if queued:
         p.append(("backlog", _home_ctx(f"BACKLOG · {len(queued)}" + (f" · HELD UNTIL {until}" if limit else " · NEXT UP"))))
         if not limit:                                            # while Claude is limited nothing here can start: the count says it all
-            lines = [home_fit(f"⏳ {home_repo(t.get('name'))}", (t.get("detail") or "").split(" · ")) for t in queued[:HOME_BACK]]
-            if len(queued) > HOME_BACK:
-                lines.append(f"_+{len(queued) - HOME_BACK} more on the board_")
-            p.append(("backlog", _home_sec("\n".join(lines))))
+            lines = [home_fit(f"⏳ {home_repo(t.get('name'))}", (t.get("detail") or "").split(" · ")) for t in queued]
+            p.append(("backlog", _home_sec(home_list(lines, lambda k: f"_+{k} more on the board_"))))   # every queued track
+
+    # 6b — the board VIEW buttons: one slice each, DM'd. They sit BELOW the fold, so §03's top row still holds ≤3 buttons
+    #      with one primary, and they are the last thing home_cut drops — when a long board costs the tab its backlog
+    #      lines, the button that prints them is exactly what the owner still needs.
+    if tracks:
+        p.append(("views", {"type": "actions", "elements": [_home_btn(lab, aid) for aid, lab, _ in HOME_VIEWS]}))
 
     # 7 — channels: only where something is happening. A quiet channel is a number, never a line (§04).
     act, hushed = [], []
@@ -1210,6 +1323,11 @@ def home_parts(st):
 
     # 8-10 — grey, one line each, and the first things to go when the tab will not fit
     p.append(("load", _home_ctx(st.get("load") or "")))
+    hnd, hn = st.get("handoffs") or {}, int(_home_num((st.get("handoffs") or {}).get("today")))
+    if hn:                                                   # how often sessions ran out of context today; zero is silent
+        p.append(("handoffs", _home_ctx(" · ".join(x for x in (f"{hn} handoff{'s' if hn != 1 else ''} today",
+                                                               f"last {hnd.get('when', '')} {hnd.get('who', '')}".strip()
+                                                               if hnd.get("when") or hnd.get("who") else "") if x))))
     if st.get("audit"):
         p.append(("audit", _home_ctx(" ".join(f"audit {st.get('audit_at', '')}".split()) + " — " + home_clip(st["audit"], HOME_AUDIT))))
     roll = " · ".join([f"{n} ok" for n, ok, _ in units if ok] + [f"{n} 🔴" for n, ok, _ in units if not ok])
@@ -2259,6 +2377,12 @@ class Daemon:
             return None
         if self.chan_name(chat) == APPROVALS:              # #approvals is not a session: PR merges only, and only on add
             return None if removed else self.on_approval(chat, ts, ev.get("reaction"), who)
+        if not removed and who == self.cfg.get("SLACK_OWNER_ID") and ev.get("reaction") not in OUR_ANSWER_SKIP \
+                and any(m in ("❓", "🔴") for p in self.pairs.get(chat, {}).values() for m in p):
+            self.arm(chat, time.time())   # their verdict settles the thread (answered_by_them): re-read this chat on the
+                                          # next tick rather than leaving a ❓ standing until the sweep gets to it. Only
+                                          # when this chat HAS something waiting — a 👍 on a settled thread changes nothing
+                                          # and is not worth a read (the sweep still covers a snapshot we do not have yet)
         return self.deliver_reaction(chat, ts, ev.get("reaction"), removed, who)
 
     def forget_cached_reply(self, chat, ts):
@@ -2473,7 +2597,8 @@ class Daemon:
         meta = {"chat_id": "local", "thread_ts": "", "ts": str(time.time()), "user": "approvals", "role": "owner",
                 "channel": "#" + APPROVALS, "target": repo}
         self.deliver(repo, {"type": "message", "meta": meta,
-                            "content": f"PR #{n} merge failed: {reason}. Resolve on its track branch and re-post to #approvals."})
+                            "content": f"PR #{n} merge failed: {reason}. Resolve on its track branch, then re-post the card "
+                                       f"(`cc-slack post-approval --force {repo} {n}` — without --force the old card wins)."})
 
     def fetch_message(self, chat, ts):
         try:
@@ -2551,13 +2676,19 @@ class Daemon:
         if r.returncode != 0:
             # GitHub answers a second, overlapping merge with "Merge already in progress" — and the FIRST one usually lands.
             # Never report a failure without asking what actually happened to the PR (2026-08-28: #27 was merged and still
-            # told the owner it had failed).
-            try:
-                v = run(["gh", "pr", "view", n, "--json", "state,mergedAt"], cwd=cwd, capture_output=True, text=True, timeout=30)
-                if v.returncode == 0 and (json.loads(v.stdout).get("state") == "MERGED"):
-                    return True, "already merged (a second merge overlapped the first)"
-            except Exception:
-                pass
+            # told the owner it had failed). Asking ONCE is not enough: the first merge is still in flight, so the PR reads
+            # OPEN for a second or two and the owner gets a failure for a PR that lands moments later (2026-08-30: #32).
+            # "in progress" means someone else is mid-merge, so wait it out before believing the PR is still open.
+            tries = MERGE_RECHECK if "already in progress" in out.lower() else 1
+            for i in range(tries):
+                try:
+                    v = run(["gh", "pr", "view", n, "--json", "state,mergedAt"], cwd=cwd, capture_output=True, text=True, timeout=30)
+                    if v.returncode == 0 and (json.loads(v.stdout).get("state") == "MERGED"):
+                        return True, "already merged (a second merge overlapped the first)"
+                except Exception:
+                    pass
+                if i + 1 < tries:
+                    time.sleep(MERGE_RECHECK_EVERY)
         return r.returncode == 0, out
 
     MEMBER_CMDS = ("help", "status")   # everything else steers the box, and only the owner steers the box
@@ -2753,6 +2884,17 @@ class Daemon:
         return any(r.get("name") not in OUR_ANSWER_SKIP and self.bot_user in (r.get("users") or [])
                    for r in (msg.get("reactions") or []))
 
+    def answered_by_them(self, msg):
+        """THE OWNER'S reaction on one of OUR messages IS their answer, the mirror of answered_by_us: 👍 yes · 👎 no ·
+        ❌ can't · ✅ done — a verdict either way, so the thread is handled and never needs them again (owner, 2026-08-30:
+        "i already thumbs up this. the automatic hook should realize i thumbs upped this" — the ❓ arrived half an hour
+        after their 👍). 👀 says only "received" and the status marks are bookkeeping: those settle nothing. Theirs alone —
+        a member cannot close a thread that is waiting on the owner. Read off `reactions`, so it survives a restart and a
+        missed event."""
+        owner = self.cfg.get("SLACK_OWNER_ID")
+        return bool(owner) and any(r.get("name") not in OUR_ANSWER_SKIP and owner in (r.get("users") or [])
+                                   for r in (msg.get("reactions") or []))
+
     def root_mark(self, last, now, root=None, chat=None):
         """The ONE mark this thread is filed under (buckets, `!threads`, Home): its work mark when that is the whole story
         (✅ done, 🔧 working with nothing owed), otherwise whose turn it is."""
@@ -2810,6 +2952,9 @@ class Daemon:
         author (the message was deleted) or a stranger's word earns no mark at all."""
         text = (last.get("text") or "").strip()
         if self.is_ours(last):
+            if self.answered_by_them(last):
+                return "🟠"   # they answered it with a reaction (👍/👎/❌/…): handled — never ❓, never nudged, and the
+                              # 30 min stall alarm is re-planned as a 48 h expiry, so no ❓ half an hour later
             if text.startswith(NUDGE_PREFIXES):
                 return "❓"   # our own nudge is not an answer: whatever it nudged about still needs the owner (S3)
             return "❓" if (asks_owner(text) or self.declared(chat, root, last)) else "🟠"
@@ -3507,6 +3652,7 @@ class Daemon:
                 "load": home_load(), "limit": cached("limit", HOME_CACHE, limit_now), "channels": chans,
                 "tracks": tracks, "last": last, "waits": waits,
                 "quick": cached("quick", HOME_CACHE, home_quick),
+                "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
                 "audit_at": audit_at, "audit": verdict, "boot": boot}
 
     def home_slow_refresh(self):
@@ -3565,12 +3711,14 @@ class Daemon:
                 self.dm_user(user, "That button belongs to the box's owner — service changes and spend are theirs to "
                                    "authorise, so nothing was run. Ask them in the channel and they can tap it.")
                 continue
+            log(f"home: {aid} {val!r} by {user}")   # a press that runs leaves a trace too: a silent button is undebuggable
             self.home_act(aid, val, user)
         self.home_dirty = True
 
     def home_act(self, aid, val, user):
         """What a Home button does, once the gate has passed. Only `restart_unit` changes anything on the box; the rest
-        read. `next_track` deliberately does NOT dispatch a worker: a worker is spend, and spend takes a budget and a
+        read — and the three board views share ONE cached board read between them, never a subprocess per press.
+        `next_track` deliberately does NOT dispatch a worker: a worker is spend, and spend takes a budget and a
         turn count the owner sets — so the button hands them the command instead of guessing one for them."""
         if aid == "restart_unit":
             unit = dict(HOME_UNITS).get(val)
@@ -3587,6 +3735,9 @@ class Daemon:
             self.dm_user(user, f"<#{cid}>" if cid else f"#{val}")
         elif aid == "open_board":
             self.dm_user(user, "```\n" + self.run_out([f"{BIN}/cc-board", "list"])[:2500] + "\n```")
+        elif aid in HOME_VIEW:
+            label, states = HOME_VIEW[aid]
+            self.dm_user(user, home_slice(cached("board_rows", HOME_CACHE, home_board_rows), states, label)[:2500])
         elif aid == "home_logs":
             unit = dict(HOME_UNITS).get(val) or "cc-slackd.service"
             self.dm_user(user, f"`{unit}`\n```\n" + self.run_out(
@@ -4253,11 +4404,32 @@ def cmd_archive(argv):
     return 0 if ok else 1
 
 
+def approval_card_ts(cfg, cid, repo, n, limit=200):
+    """ts of the card the daemon would merge on — a post of OURS matching "[repo] PR #n: …" — or None. Two actors reach
+    a finished track (the loop when it ends, a session when it merges) and each used to post its own card; two cards mean
+    two :+1:, two overlapping merges, and a "merge failed" for one that actually landed. #approvals is itself the record of
+    who got there first, so ask it rather than keep state: a card the owner deleted is gone, and posting again is correct.
+    Matches on our own user id, exactly as on_approval does, so a human's lookalike text never suppresses a real card."""
+    try:
+        me = api("auth.test", cfg["SLACK_BOT_TOKEN"]).get("user_id")
+        msgs = api("conversations.history", cfg["SLACK_BOT_TOKEN"], channel=cid, limit=str(limit))["messages"]
+    except Exception as e:
+        log(f"post-approval: could not read #{APPROVALS} ({e}) — posting anyway"); return None
+    for m in msgs:
+        g = PR_RE.match(m.get("text") or "")
+        if g and m.get("user") == me and g.group(1) == repo and g.group(2) == str(n):
+            return m.get("ts")
+    return None
+
+
 def cmd_post_approval(argv):
-    """post-approval <repo> <n|url> — "[repo] PR #n: title — url" into #approvals (the daemon merges it on the owner's :+1:). Exit 2 usage, 3 no token, 1 gh/Slack."""
+    """post-approval [--force] <repo> <n|url> — "[repo] PR #n: title — url" into #approvals (the daemon merges it on the owner's
+    :+1:). One card per PR: whoever gets there second finds the first and exits 0 without posting. --force posts regardless —
+    after a failed merge the session is told to re-post. Exit 2 usage, 3 no token, 1 gh/Slack."""
+    force = "--force" in argv; argv = [a for a in argv if a != "--force"]
     m = re.fullmatch(r"(?:https://github\.com/[^/\s]+/[^/\s]+/pull/)?([0-9]+)/?", argv[1] if len(argv) == 2 else "")
     if not m or not re.fullmatch(r"[a-z0-9_-]+", argv[0]) or not os.path.isdir(f"{DEV}/{argv[0]}/.git"):
-        print("cc-slack post-approval <repo-in-~/dev> <pr-number|pr-url>", file=sys.stderr); return 2
+        print("cc-slack post-approval [--force] <repo-in-~/dev> <pr-number|pr-url>", file=sys.stderr); return 2
     repo, n, cfg = argv[0], m.group(1), load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("cc-slack post-approval: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
@@ -4265,6 +4437,11 @@ def cmd_post_approval(argv):
     cid, member = find_channel(cfg, APPROVALS)
     if r.returncode != 0 or not (cid and member):
         print(f"cc-slack post-approval: {r.stderr.strip()[-300:] or f'no #{APPROVALS} channel the bot is in (cc slack mkchannel {APPROVALS})'}", file=sys.stderr); return 1
+    if not force:
+        have = approval_card_ts(cfg, cid, repo, n)
+        if have:
+            log(f"post-approval: [{repo}] PR #{n} already has a card ({have}) — second caller posts nothing")
+            print(have); return 0
     pr = json.loads(r.stdout)
     _, ts = post(cfg, cid, f"[{repo}] PR #{n}: {pr['title']} — {pr['url']}  ·  :+1: from the owner merges (squash)")
     print(ts or ""); return 0
@@ -4432,7 +4609,8 @@ def cmd_selfcheck():
             check("reaction: merged/closed/success route nothing out of #approvals", quiet)
             check("reaction: failed merge → cc-notify -p high + inject into the repo's planning session",
                   notes == [[f"{BIN}/cc-notify", "-p", "high", "-t", f"[{name}] PR #7 merge failed", "GraphQL: not mergeable — https://x/7"]]
-                  and injected == [(name, f"PR #7 merge failed: GraphQL: not mergeable. Resolve on its track branch and re-post to #approvals.")])
+                  and injected == [(name, f"PR #7 merge failed: GraphQL: not mergeable. Resolve on its track branch, then "
+                                          f"re-post the card (`cc-slack post-approval --force {name} 7` — without --force the old card wins).")])
             rec = []; stub = lambda cmd, **kw: rec.append(cmd) or type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
             check("merge: gh pr merge <n> --squash --delete-branch -R owner/repo, no --subject when title fetch fails (bad JSON here)",
                   Daemon.merge(dm, name, "7", run=stub)[0] and rec[-1] == ["gh", "pr", "merge", "7", "--squash", "--delete-branch", "-R", "o/r"])
@@ -4444,6 +4622,46 @@ def cmd_selfcheck():
                 return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
             check("merge: --subject uses the PR title, not gh's commit-log default",
                   Daemon.merge(dm, name, "7", run=stub2)[0] and rec2[-1] == ["gh", "pr", "merge", "7", "--squash", "--delete-branch", "-R", "o/r", "--subject", "Add reboot command (#7)"])
+            # "Merge already in progress": the FIRST merge is still in flight, so the PR reads OPEN for a second or two.
+            # Asking once told the owner a PR had failed that landed moments later (2026-08-30, PR #32).
+            real_recheck, real_every = MERGE_RECHECK, MERGE_RECHECK_EVERY
+            globals()["MERGE_RECHECK_EVERY"] = 0
+            try:
+                views = []
+                def stub3(cmd, **kw):
+                    if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt" in cmd:
+                        views.append(1)                    # OPEN while the other merge runs, MERGED from the 3rd look on
+                        return type("R", (), {"returncode": 0, "stderr": "", "stdout": json.dumps(
+                            {"state": "MERGED" if len(views) >= 3 else "OPEN", "mergedAt": None})})()
+                    if cmd[:3] == ["gh", "pr", "merge"]:
+                        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "GraphQL: Merge already in progress (mergePullRequest)"})()
+                    return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
+                okp, outp = Daemon.merge(dm, name, "7", run=stub3)
+                check("merge: 'Merge already in progress' is re-read until the first merge lands — never reported as a failure",
+                      okp and "already merged" in outp and len(views) == 3)
+                views2 = []
+                def stub4(cmd, **kw):
+                    if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt" in cmd:
+                        views2.append(1); return type("R", (), {"returncode": 0, "stderr": "", "stdout": json.dumps({"state": "OPEN", "mergedAt": None})})()
+                    if cmd[:3] == ["gh", "pr", "merge"]:
+                        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "GraphQL: not mergeable"})()
+                    return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
+                okq, outq = Daemon.merge(dm, name, "7", run=stub4)
+                check("merge: a failure that is NOT an overlap is still checked once and still reported failed",
+                      not okq and "not mergeable" in outq and len(views2) == 1)
+                globals()["MERGE_RECHECK"] = 2
+                views3 = []
+                def stub5(cmd, **kw):
+                    if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt" in cmd:
+                        views3.append(1); return type("R", (), {"returncode": 0, "stderr": "", "stdout": json.dumps({"state": "OPEN", "mergedAt": None})})()
+                    if cmd[:3] == ["gh", "pr", "merge"]:
+                        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "GraphQL: Merge already in progress (mergePullRequest)"})()
+                    return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
+                okr, _ = Daemon.merge(dm, name, "7", run=stub5)
+                check("merge: an overlap that never lands gives up after MERGE_RECHECK looks and reports the failure",
+                      not okr and len(views3) == 2)
+            finally:
+                globals()["MERGE_RECHECK"], globals()["MERGE_RECHECK_EVERY"] = real_recheck, real_every
         subprocess.run = real_run
         check("valid_target", valid_target(name) and valid_target(f"{name}/t1") and valid_target("box")
               and not valid_target("no-such-repo-zz") and not valid_target("../x") and not valid_target(""))
@@ -4634,6 +4852,53 @@ def cmd_selfcheck():
             check("post: CC_SLACK_PLAIN_NAME=1 disables the username", acalls2[-1][1]["username"] is None)
         finally:
             del os.environ["CC_SLACK_PLAIN_NAME"]
+        # One card per PR. The loop posts one when the track finishes and a session posts one when it merges; two cards
+        # mean two 👍, two overlapping merges and a false "merge failed" (the owner deleted three by hand, 2026-08-30).
+        with tempfile.TemporaryDirectory(dir=DEV, prefix="_selfcheck") as d2:
+            rname = os.path.basename(d2); os.makedirs(f"{d2}/.git")
+            cards = [{"ts": "9.1", "user": "UBOT", "text": f"[{rname}] PR #7: t — https://x/7  ·  :+1: from the owner merges (squash)"},
+                     {"ts": "9.2", "user": "UOWNER", "text": f"[{rname}] PR #8: a human typing the same shape"}]
+            hist, posted, real_post, real_find, real_run2 = list(cards), [], post, find_channel, subprocess.run
+            def api2(method, token, **kw):
+                if method == "auth.test":
+                    return {"user_id": "UBOT"}
+                if method == "conversations.history":
+                    return {"messages": hist}
+                return real_api(method, token, **kw)
+            try:
+                globals()["api"] = api2
+                globals()["find_channel"] = lambda cfg, n: ("CAPPR", True)
+                globals()["post"] = lambda cfg, chat, text, thread=None, username=None: posted.append(text) or (1, "9.9")
+                subprocess.run = lambda cmd, **kw: type("R", (), {"returncode": 0, "stderr": "",
+                                                                  "stdout": json.dumps({"title": "t", "url": "https://x/7"})})()
+                with contextlib.redirect_stdout(io.StringIO()) as o1:
+                    rc1 = cmd_post_approval([rname, "7"])
+                check("post-approval: a card for that PR is already up → the second caller posts nothing and exits 0 with its ts",
+                      rc1 == 0 and not posted and o1.getvalue().strip() == "9.1")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc2 = cmd_post_approval([rname, "--force", "https://github.com/o/r/pull/7"])
+                check("post-approval: --force posts anyway — after a failed merge the session is told to re-post the card",
+                      rc2 == 0 and len(posted) == 1)
+                posted.clear(); hist = [cards[1]]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc3 = cmd_post_approval([rname, "7"])
+                check("post-approval: a human's lookalike text is not a card, and a PR with none gets one (a deleted card comes back)",
+                      rc3 == 0 and len(posted) == 1)
+                posted.clear(); hist = list(cards)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc4 = cmd_post_approval([rname, "8"])
+                check("post-approval: the match is that PR's number, not any card in the channel", rc4 == 0 and len(posted) == 1)
+                def api_dead(method, token, **kw):
+                    if method == "auth.test":
+                        return {"user_id": "UBOT"}
+                    raise RuntimeError("conversations.history: ratelimited")
+                globals()["api"] = api_dead; posted.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc5 = cmd_post_approval([rname, "7"])
+                check("post-approval: #approvals unreadable → post rather than lose the card (a missing card cannot be approved)",
+                      rc5 == 0 and len(posted) == 1)
+            finally:
+                globals()["post"], globals()["find_channel"], subprocess.run = real_post, real_find, real_run2
     finally:
         globals()["load_cfg"], globals()["api"] = real_load_cfg, real_api
         if real_role is not None:
@@ -5998,6 +6263,38 @@ def cmd_selfcheck():
           and dmA.root_mark(dict(stale_o, reactions=[{"name": "eyes", "users": ["UBOT"]}]), nowA2) == "❓"
           and dmA.root_mark(dict(stale_o, reactions=[{"name": "red_circle", "users": ["UBOT"]}]), nowA2) == "❓"
           and dmA.root_mark(dict(fresh_o, reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2) == "🔴")
+    # THEIR reaction on OUR message is the mirror of the two checks above (owner, 2026-08-30: "i already thumbs up this.
+    # the automatic hook should realize i thumbs upped this" — the ❓ arrived 30 min after their 👍).
+    ask_b = {"bot_id": "B01", "ts": str(nowA2 - 40 * 60), "text": "🔐 `myrepo` wants to run *Bash*"}
+    check("root_mark: the owner's 👍 on OUR ask is their answer — 🟠 now and still 🟠 once the 30 min stall would have "
+          "fired; 👎 and ❌ settle it too (a no is an answer)",
+          dmA.root_mark(dict(ask_b, reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2) == "🟠"
+          and dmA.root_mark(dict(ask_b, reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2 + 40 * 60) == "🟠"
+          and dmA.root_mark(dict(ask_b, reactions=[{"name": "-1", "users": ["UOWNER"]}]), nowA2) == "🟠"
+          and dmA.root_mark(dict(ask_b, reactions=[{"name": "x", "users": ["UOWNER"]}]), nowA2) == "🟠")
+    check("root_mark: their 👀 is 'received', not an answer, and a MEMBER cannot close a thread that waits on the owner — "
+          "both still ❓; their 👍 on our own nudge does settle it",
+          dmA.root_mark(dict(ask_b, reactions=[{"name": "eyes", "users": ["UOWNER"]}]), nowA2) == "❓"
+          and dmA.root_mark(dict(ask_b, reactions=[{"name": "+1", "users": ["UMEM"]}]), nowA2) == "❓"
+          and dmA.root_mark(dict(ask_b, text=NUDGE_PREFIXES[0] + " (40m): ship it?",
+                                 reactions=[{"name": "+1", "users": ["UOWNER"]}]), nowA2) == "🟠")
+    dmAl2 = Daemon(use_slack=False); dmAl2.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmAl2.bot_user = "UBOT"
+    liked = dict(ask_b, ts=str(nowA2 - 60), reactions=[{"name": "+1", "users": ["UOWNER"]}])
+    dmAl2.plan_alarm("CA3", [(dmAl2.root_mark(liked, nowA2), {"ts": "1"}, liked)])
+    check("alarms: their 👍 DISARMS the stall — the chat is re-checked at the 48 h expiry, not 30 min later with a ❓",
+          int(dmAl2.alarms["CA3"] - float(liked["ts"])) == STALE_AFTER)
+    dmR = Daemon(use_slack=False); dmR.cfg = {"SLACK_OWNER_ID": "UOWNER"}; dmR.bot_user = "UBOT"
+    dmR.route = lambda chat, ctype=None: "r"; dmR.chan_name = lambda c: "proj"; dmR.deliver_reaction = lambda *a, **k: None
+    rx = lambda who, name: dmR.on_reaction({"type": "reaction_added", "reaction": name, "user": who,
+                                            "item": {"type": "message", "channel": "CR", "ts": "5.1"}})
+    rx("UOWNER", "+1"); quiet_chat = "CR" not in dmR.alarms      # nothing waits in this chat: a 👍 is not worth a read
+    dmR.pairs["CR"] = {"5.0": ("❓", None)}
+    rx("UOWNER", "eyes"); seen_eyes = "CR" in dmR.alarms
+    rx("UMEM", "+1"); seen_mem = "CR" in dmR.alarms
+    rx("UOWNER", "+1"); armed_now = dmR.alarms.get("CR", 0) <= time.time()
+    check("reaction: with a ❓ standing, the owner's verdict re-checks that chat on the next tick so the ❓ comes off in "
+          "seconds — a 👀, a member's 👍, or a chat with nothing waiting arms nothing",
+          quiet_chat and not seen_eyes and not seen_mem and armed_now)
     rootsA = [{"ts": str(nowA2 - 40 * 60), "user": "UOWNER", "text": "ship it?", "reactions": [{"name": "+1", "users": ["UBOT"]}]},
               {"ts": str(nowA2 - 41 * 60), "user": "UOWNER", "text": "and this one?"}]
     saidA = []; dmA.say = lambda chat, text, thread=None: saidA.append(text)
@@ -6124,7 +6421,9 @@ def cmd_selfcheck():
                         return False
         return True
 
-    # ── §05, verbatim: the engineer's reference output for state (a). `  ↳` is the real payload's indent —
+    # ── §05, verbatim except where the OWNER amended it after 1a shipped (2026-08-30, thread 1788129807):
+    #    the backlog prints all ten queued tracks, not three and a "+7 more", and the board VIEW buttons sit
+    #    under it. The rest is the engineer's reference output for state (a). `  ↳` is the real payload's indent —
     #    Slack collapses ordinary leading spaces, which is the sub-channel bug this direction also fixes.
     HREF = json.loads(r'''{"type": "home", "blocks": [
       {"type": "header", "text": {"type": "plain_text", "text": "abox · 07:58Z", "emoji": true}},
@@ -6138,7 +6437,11 @@ def cmd_selfcheck():
         {"type": "button", "text": {"type": "plain_text", "text": "Board", "emoji": true}, "action_id": "open_board"}]},
       {"type": "divider"},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "BACKLOG · 10 · NEXT UP"}]},
-      {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ sandbox/rug-align\n⏳ abox/audit-retry\n⏳ abox/notes-index\n_+7 more on the board_"}},
+      {"type": "section", "text": {"type": "mrkdwn", "text": "⏳ sandbox/rug-align\n⏳ abox/audit-retry\n⏳ abox/notes-index\n⏳ abox/queued0\n⏳ abox/queued1\n⏳ abox/queued2\n⏳ abox/queued3\n⏳ abox/queued4\n⏳ abox/queued5\n⏳ abox/queued6"}},
+      {"type": "actions", "elements": [
+        {"type": "button", "text": {"type": "plain_text", "text": "To do", "emoji": true}, "action_id": "board_todo"},
+        {"type": "button", "text": {"type": "plain_text", "text": "Running", "emoji": true}, "action_id": "board_running"},
+        {"type": "button", "text": {"type": "plain_text", "text": "Done", "emoji": true}, "action_id": "board_done"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "CHANNELS"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "🟢 *#abox* · ❓1 🔴2\n  ↳ 🟡 #abox-carpet · ❓1\n_5 quiet channels hidden_"}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "💽 16% of 456G · 🧠 4.3/31G (15%) · 📈 2.60 · 🌡 57°C · ⏱ up 6.2h"}]},
@@ -6164,9 +6467,11 @@ def cmd_selfcheck():
             "boot": "last boot 01:41Z (power cut)", "last": None}
     hb = home_blocks(hfix)
     htxt = json.dumps(hb, ensure_ascii=False)
-    check("home_blocks (a) BUSY is byte-for-byte the handoff's reference output (§05): 14 blocks, the tally, the running "
-          "lines, the ranked needs-you band, three buttons, the fold, the backlog, the channels and three grey lines",
-          hb == HREF["blocks"] and len(hb) == 14 and home_blocks(hfix) == hb)
+    check("home_blocks (a) BUSY is byte-for-byte the reference output (§05 + the owner's amendment): 15 blocks — the "
+          "tally, the running lines, the ranked needs-you band, three buttons, the fold, the WHOLE backlog (all ten, no "
+          "\"+k more\"), the three board-view buttons, the channels and three grey lines",
+          hb == HREF["blocks"] and len(hb) == 15 and home_blocks(hfix) == hb
+          and hb[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in htxt)
     check("home_track_state: the LADDER, and a live process WINS — a board that disagrees is printed as `board stale`, "
           "never silently believed or silently ignored; an unknown status is `queued`, never a stateless \"?\"",
           (home_track_state("blocked", True), home_track_state("blocked", False), home_track_state("todo", True),
@@ -6244,22 +6549,25 @@ def cmd_selfcheck():
                           "boot": "last boot 01:41Z (power cut)",
                           "last": {"name": "abox/slack-home", "verb": "merged", "when": "08:40Z", "at": "x"}})
     qtxt = json.dumps(hquiet, ensure_ascii=False)
-    check("home_blocks (b) QUIET: 10 blocks — nothing running is a SENTENCE with the last thing that finished, the "
-          "needs-you and channels bands are ABSENT rather than empty, and the primary button becomes the next track",
-          len(hquiet) == 10 and hquiet[1]["elements"][0]["text"] == "NOTHING RUNNING · QUEUED 11"
+    check("home_blocks (b) QUIET: 11 blocks — nothing running is a SENTENCE with the last thing that finished, the "
+          "needs-you and channels bands are ABSENT rather than empty, the primary button becomes the next track, and "
+          "all eleven queued tracks are printed, not three",
+          len(hquiet) == 11 and hquiet[1]["elements"][0]["text"] == "NOTHING RUNNING · QUEUED 11"
           and hquiet[2]["text"]["text"] == "✅ last: abox/slack-home · merged 08:40Z"
           and "NEEDS YOU" not in qtxt and "CHANNELS" not in qtxt and "BACKLOG · 11 · NEXT UP" in qtxt
+          and hquiet[6]["text"]["text"].count("⏳") == 11 and "more on the board" not in qtxt
           and [e["action_id"] for e in hquiet[3]["elements"]] == ["next_track", "open_board"]
+          and [e["action_id"] for e in hquiet[7]["elements"]] == ["board_todo", "board_running", "board_done"]
           and hno_empty_header(hquiet) and hbudget(hquiet) and hvocab(hquiet))
     hdeg = home_blocks(dict(hfix, units=[("tmux-main", True, ""), ("audit", True, ""), ("cc-slackd", False, "3 restarts · failed")],
                             limit="usage limit until 09:00Z (18m left)", waits=[{"ch": "abox", "age": 2460, "ask": "approve deploy"}],
                             tracks=[t for t in hfix["tracks"] if t["state"] == "queued"] + [dict(hfix["tracks"][2])],
                             channels=[dict(c, session="⚪ none", marks={}) for c in hfix["channels"]], last=None))
     dtxt = json.dumps(hdeg, ensure_ascii=False)
-    check("home_blocks (c) DEGRADED: 11 blocks — the unit that is down and the usage limit sort ABOVE everything the "
+    check("home_blocks (c) DEGRADED: 12 blocks — the unit that is down and the usage limit sort ABOVE everything the "
           "box is doing, the backlog is HELD (a count, no lines it cannot start), the roll-call comes back, and the "
           "primary button is the restart",
-          len(hdeg) == 11 and hdeg[2]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 09:00Z")
+          len(hdeg) == 12 and hdeg[2]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 09:00Z")
           and "BACKLOG · 10 · HELD UNTIL 09:00Z" in dtxt and "⏳ sandbox/rug-align" not in dtxt
           and [e["action_id"] for e in hdeg[5]["elements"]] == ["restart_unit", "home_logs", "open_board"]
           and hdeg[5]["elements"][0]["style"] == "danger"
@@ -6274,20 +6582,118 @@ def cmd_selfcheck():
                                        for i in range(2)]
                                     + [{"state": "queued", "name": n, "detail": "—", "rank": 5} for n in hqueued]))
     otxt = json.dumps(hover, ensure_ascii=False)
-    check("home_blocks (d) OVERFLOW: 13 tracks, 8 channels, 6 asks — every band collapses to a count instead of "
-          "growing, and the tab still fits ≤%d blocks" % HOME_MAXBLK,
+    check("home_blocks (d) OVERFLOW: 13 tracks, 8 channels, 6 asks — the bands the owner reads (NEEDS YOU, BACKLOG) "
+          "print EVERY row, the ones they skim (running, channels) still collapse to a count, and the tab fits ≤%d "
+          "blocks" % HOME_MAXBLK,
           hbudget(hover) and hno_empty_header(hover) and hvocab(hover)
-          and "_+1 more running_" in otxt and "NEEDS YOU · 6" in otxt and "_+3 more waiting → #abox_" in otxt
-          and len([l for l in hover[4]["text"]["text"].split("\n")]) == 4       # ≤4 lines, three of them real asks
-          and "_+7 more on the board_" in otxt and "_5 quiet channels hidden_" in otxt and len(hover) == 14)
-    check("home_cut: over budget, things go in the OWNER's order (§01d) — boot, then the audit, then the channels, then "
-          "the backlog — and what is running or needs them is never what gets cut",
-          [t for t, _ in home_cut(home_parts(hfix), 13)].count("boot") == 0
-          and [t for t, _ in home_cut(home_parts(hfix), 13)].count("audit") == 1
-          and [t for t, _ in home_cut(home_parts(hfix), 12)].count("audit") == 0
-          and [t for t, _ in home_cut(home_parts(hfix), 10)].count("channels") == 0
-          and all(t in [x for x, _ in home_cut(home_parts(hfix), 8)] for t in ("head", "tally", "needs", "actions"))
-          and len(home_cut(home_parts(hfix), 8)) == 8)
+          and "_+1 more running_" in otxt and "NEEDS YOU · 6" in otxt and "more waiting" not in otxt
+          and len(hover[4]["text"]["text"].split("\n")) == 6                   # all six asks, none behind a count
+          and hover[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in otxt
+          and "_5 quiet channels hidden_" in otxt and len(hover) == 15)
+    hcut = lambda n: [t for t, _ in home_cut(home_parts(hfix), n)]
+    check("home_cut: over budget, things go in the OWNER's order (§01d) — boot, the handoff line, the audit, the "
+          "channels, the backlog, and the board-view buttons last of the demoted half, because when a long board costs "
+          "the tab its backlog LINES the button that prints them is exactly what is still worth a block. What is "
+          "running, and the ❓ band, are never what gets cut",
+          "boot" not in hcut(14) and "audit" in hcut(14)
+          and "audit" not in hcut(13) and "channels" in hcut(13)
+          and "channels" not in hcut(11) and "backlog" in hcut(11)
+          and "backlog" not in hcut(9) and "views" in hcut(9)
+          and "views" not in hcut(8)
+          and all(t in hcut(8) for t in ("head", "tally", "needs", "actions")) and len(hcut(8)) == 8
+          and all(t in hcut(6) for t in ("head", "tally", "needs")))
+    # ── THE LISTS ARE WHOLE (owner, 2026-08-30, thread 1788129807: "what happenend to showing all the backlog items and
+    #    all ? items and not defaulting to showing only a few?"). Both bands are one section block however long they get,
+    #    so this costs no blocks; the character budget is the only cap left, and it is a valve, not a policy.
+    hlong = home_blocks(dict(hfix, waits=[{"ch": f"c{i}", "age": 60 * (i + 1), "ask": f"ask {i}"} for i in range(7)],
+                             tracks=[{"state": "queued", "name": f"abox/q{i}", "detail": "—", "rank": 5} for i in range(12)]))
+    ltxt = json.dumps(hlong, ensure_ascii=False)
+    check("home_blocks: a 12-track backlog prints 12 lines and a 7-deep NEEDS YOU prints 7 — the two bands the owner "
+          "opens the tab FOR are never summarised into a count they must leave Slack to expand",
+          "NEEDS YOU · 7" in ltxt and len(hlong[4]["text"]["text"].split("\n")) == 7
+          and hlong[8]["text"]["text"].count("⏳") == 12
+          and "more waiting" not in ltxt and "more on the board" not in ltxt
+          and hbudget(hlong) and hno_empty_header(hlong) and hvocab(hlong))
+    hvalve = home_blocks(dict(hfix, waits=[], tracks=[{"state": "queued", "name": f"abox/{'q' * 28}{i}",
+                                                       "detail": "—", "rank": 5} for i in range(200)]))
+    vlines = hvalve[6]["text"]["text"].split("\n")
+    check("home_list: the character budget is a SAFETY VALVE, not a policy — a 200-track board degrades to whole rows "
+          "plus a count, and never to a row cut in half",
+          hbudget(hvalve) and vlines[-1].startswith("_+") and vlines[-1].endswith("more on the board_")
+          and all(l.startswith("⏳") for l in vlines[:-1]) and len(vlines) > 20
+          and home_list(["a", "b", "c"], lambda k: f"_+{k}_") == "a\nb\nc"
+          and home_list(["aaaa", "bbbb", "cccc"], lambda k: f"_+{k}_", 13) == "aaaa\n_+2_"
+          and home_list([], lambda k: f"_+{k}_") == "")
+    # ── the board VIEW buttons: one slice each, DM'd, and the same gate as every other button
+    hrows = [("abox", "home-lists", "running", "Home shows all of the backlog", "2026-08-30T22:49:00Z"),
+             ("abox", "help-perms", "todo", "loosen two lines", "2026-08-30T20:00:00Z"),
+             ("abox", "rug-align", "queued", "", "2026-08-30T21:00:00Z"),
+             ("abox", "carpet", "merged", "rectify the carpet", "2026-08-30T19:00:00Z"),
+             ("abox", "notes", "review", "notes index", "2026-08-30T18:00:00Z")]
+    hsl = {lab: home_slice(hrows, sts, lab) for _, lab, sts in HOME_VIEWS}
+    check("board views: each button DMs ONE slice of the board, newest first and in the tab's own vocabulary — `todo` on "
+          "a board written before the rename still counts as `queued`, and an empty slice is a SENTENCE, not an empty block",
+          hsl["Running"].startswith("*Running* · 1") and "abox/home-lists" in hsl["Running"]
+          and "rug-align" not in hsl["Running"] and hsl["To do"].startswith("*To do* · 2")
+          and home_word("todo") == "queued" and home_word("running") == "running" and home_word("?") == "queued"
+          and hsl["To do"].index("abox/rug-align") < hsl["To do"].index("abox/help-perms")
+          and hsl["Done"].startswith("*Done* · 2") and "abox/carpet — rectify the carpet" in hsl["Done"]
+          and home_slice([], ("running",), "Running") == "nothing is *running* on the board."
+          and home_slice(hrows, ("blocked",), "Blocked") == "nothing is *blocked* on the board."
+          and home_slice([("r", f"t{i}", "queued", "", f"{i:04d}") for i in range(HOME_SLICE + 3)],
+                         ("queued",), "To do").endswith("_+3 more — `cc board show <repo>`_"))
+    dmV = Daemon(use_slack=False); dmV.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmV.use_slack = True
+    vdms, vlog = [], io.StringIO()
+    dmV.dm_user = lambda user, text: vdms.append((user, text))
+    _rows = globals()["home_board_rows"]
+    _CACHE.pop("board_rows", None)                 # the three views share one cached read; this run must not inherit it
+    globals()["home_board_rows"] = lambda: hrows
+    try:
+        with contextlib.redirect_stderr(vlog):
+            for aid in ("board_todo", "board_running", "board_done"):
+                dmV.on_action({"type": "block_actions", "user": {"id": "UMEMBER"}, "actions": [{"action_id": aid}]})
+            vrefused = len(vdms) == 3 and all("owner" in t for _, t in vdms)
+            vdms.clear()
+            dmV.on_action({"type": "block_actions", "user": {"id": "UOWNER"}, "actions": [{"action_id": "board_todo"}]})
+    finally:
+        globals()["home_board_rows"] = _rows
+        _CACHE.pop("board_rows", None)
+    check("a NEW button is not a way round the gate: every board view is refused for a member exactly like Restart is — "
+          "and an ACCEPTED press now leaves a line in the log, because a button that runs silently is undebuggable",
+          vrefused and len(vdms) == 1 and vdms[0][0] == "UOWNER" and vdms[0][1].startswith("*To do* · 2")
+          and "home: board_todo" in vlog.getvalue() and "by UOWNER" in vlog.getvalue()
+          and all(a in HOME_ACT for a, _, _ in HOME_VIEWS))
+    # ── the handoff count: how often sessions ran out of context today (cc-context's own ledger, one read and a count)
+    _homeH, hh, hh0 = globals()["HOME"], tempfile.mkdtemp(prefix="cc-slack-hnd-"), tempfile.mkdtemp(prefix="cc-slack-nil-")
+    try:
+        globals()["HOME"] = hh
+        os.makedirs(f"{hh}/.cc/state/context")
+        open(f"{hh}/.cc/state/context/handoffs.jsonl", "w").write(
+            '{"ts": "2026-08-29T23:00:00Z", "repo": "abox", "track": "yesterday"}\n'
+            'half a line that never finished being written\n'
+            '{"ts": "2026-08-30T09:10:00Z", "repo": "abox", "track": "morning"}\n'
+            '{"ts": "2026-08-30T21:40:00Z", "repo": "abox", "track": "slack-home"}\n')
+        hnd_day, hnd_quiet = home_handoffs("2026-08-30"), home_handoffs("2026-08-28")
+        with open(f"{hh}/.cc/state/context/handoffs.jsonl", "r+") as f:   # …and a ledger past the tail budget: the box
+            pad = json.dumps({"ts": "2020-01-01T00:00:00Z", "repo": "old", "track": "x" * 200}) + "\n"
+            body = f.read()                              # keeps this file for the life of the box, so only its END is read
+            f.seek(0); f.write(pad * (HOME_LEDGER // len(pad) + 20) + body)
+        hnd_big = home_handoffs("2026-08-30")
+        globals()["HOME"] = hh0
+        hnd_none = home_handoffs()
+    finally:
+        globals()["HOME"] = _homeH
+        subprocess.run(["rm", "-rf", hh, hh0], check=False)
+    hhb = home_blocks(dict(hfix, handoffs={"today": 3, "when": "21:40Z", "who": "abox/slack-home"}))
+    check("home_handoffs: today's crossings counted off cc-context's ledger (a torn line is skipped, yesterday's are "
+          "not today's, and only the file's TAIL is ever read), rendered as one grey line below the fold — and ZERO renders nothing, like every empty band",
+          hnd_day == {"today": 2, "when": "21:40Z", "who": "abox/slack-home"}
+          and hnd_big == hnd_day                         # a ledger far past the tail budget answers the same
+          and hnd_quiet == {} and hnd_none == {}
+          and "3 handoffs today · last 21:40Z abox/slack-home" in json.dumps(hhb, ensure_ascii=False)
+          and "1 handoff today" in json.dumps(home_blocks(dict(hfix, handoffs={"today": 1})), ensure_ascii=False)
+          and "handoff" not in json.dumps(home_blocks(dict(hfix, handoffs={"today": 0})), ensure_ascii=False)
+          and hbudget(hhb) and hno_empty_header(hhb) and len(hhb) == 16)
     hempty = home_blocks({})
     hjunk = [{"tracks": [{"state": "running"}, {}], "channels": [{"name": None, "depth": "x"}], "units": [("u",)],
               "waits": [{"age": "nonsense"}]}, {"units": [], "tracks": None, "channels": None, "waits": None},
@@ -6329,7 +6735,8 @@ def cmd_selfcheck():
           refused and hacted == [("restart_unit", "cc-slackd", "UOWNER")] and len(hdms) == 2
           and home_allowed("U1", "U1") and not home_allowed("U1", "U2") and not home_allowed("U1", "")
           and not home_allowed("", "") and not home_allowed(None, None)
-          and set(HOME_ACT) == {"restart_unit", "open_channel", "open_board", "next_track", "home_logs"})
+          and set(HOME_ACT) == {"restart_unit", "open_channel", "open_board", "next_track", "home_logs",
+                                "board_todo", "board_running", "board_done"})
     dmH = Daemon(use_slack=False); dmH.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmH.use_slack = True
     dmH.home_state = lambda: dict(hfix)
     hsaid, hcalls = [], []

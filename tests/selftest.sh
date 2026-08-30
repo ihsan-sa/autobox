@@ -23,7 +23,7 @@ cleanup(){ rc=$?; trap - EXIT
     if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$p" 2>/dev/null; fi; done
   MT kill-server 2>/dev/null   # the scratch server and its panes die WITH the run: one `cat` fixture outlived a run by 2.5 h
   for id in $(wins "$REPO"); do tmux kill-window -t "$id"; done
-  rm -rf "$T" ~/dev/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock
+  rm -rf "$T" ~/dev/$REPO ~/.cc/worktrees/$REPO ~/.cc/state/$REPO ~/.cc/boards/$REPO.json ~/.cc/boards/$REPO.lock ~/.claude/projects/$REPO-ctx
   ( exec 9>~/.claude.json.lock; flock 9; jq '.projects |= with_entries(select(.key | test("/'"$REPO"'(/|$)") | not))' ~/.claude.json > ~/.claude.json.$RUN.sel && mv ~/.claude.json.$RUN.sel ~/.claude.json ) 2>/dev/null   # leave no trust entries behind
   rm -f ~/.claude.json.$RUN.sel; exit $rc; }
 trap cleanup EXIT INT TERM HUP
@@ -89,6 +89,55 @@ mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/nu
 [ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
+echo "== cc-context (the real number, and what refuses to run without it) =="
+ctx=$("$B/cc-context" selfcheck 2>&1)
+grep -q '0 failed' <<<"$ctx" && ok "cc-context selfcheck: ${ctx##*: }" || bad "cc-context selfcheck: $ctx"
+export CC_CTX_RECORDS="$T/ctx" CC_CTX_BOX_MODEL=   # records under $T, and this box's own model never sizes a fixture
+PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1
+sid=$("$B/cc-board" get $REPO w1 session_id)
+printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":19000,"output_tokens":5}}}\n' > "$PD/$sid.jsonl"
+"$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1)"
+out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
+{ [ $rc = 0 ] && grep -q 'under 90%' <<<"$out" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
+  && ok "handoff --over leaves a session that is not full alone" || bad "handoff --over 90 at 10%: rc=$rc $out"
+mv "$PD/$sid.jsonl" "$T/tx.jsonl"                  # nothing measurable: the answer is 'no', not a guess
+out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
+{ [ $rc = 1 ] && grep -q 'not handing off on a guess' <<<"$out" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
+  && ok "an unmeasurable context refuses the handoff instead of guessing" || bad "unmeasurable handoff: rc=$rc $out"
+mv "$T/tx.jsonl" "$PD/$sid.jsonl"
+# the Stop hook is the only place the transcript path is handed over: it must record from the payload
+printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 \
+  | ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
+[ -s "$T/ctx/$sid.json" ] && grep -q '"pct": 10' "$T/ctx/$sid.json" && ok "the Stop hook records the measurement it was handed" || bad "no record from the Stop hook"
+grep -q 'decision' "$T/ctx/$sid.json" && bad "a session under the line was told something" || ok "under the journal line the session is left alone"
+# over the line: the hook answers on stdout with the Stop decision that makes the session journal (once)
+pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
+rm -f "$T/ctx/$sid.json"
+# the fixture is 20k of a 200k window, so the floors (60k/90k) are lowered out of the way for these cases
+CTXP="CC_CONTEXT_WARN_MIN=0 CC_CONTEXT_HANDOFF_MIN=0"
+d1=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=5 CC_CONTEXT_HANDOFF_PCT=45 "$B/cc-checkpoint" ))
+{ grep -q '"decision": "block"' <<<"$d1" && grep -q "state/$REPO/w1/progress.md" <<<"$d1"; } \
+  && ok "over the journal line the hook tells the session to write its handoff entry" || bad "no Stop decision: $d1"
+d2=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=5 CC_CONTEXT_HANDOFF_PCT=45 "$B/cc-checkpoint" ))
+[ -z "$d2" ] && ok "it is said once, not every turn" || bad "the session was told twice: $d2"
+d3=$(pay ',"stop_hook_active":true' | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2 "$B/cc-checkpoint" ))
+[ -z "$d3" ] && ok "never while a Stop hook is already holding the session" || bad "blocked a session that was already held: $d3"
+# past the handoff line with something in flight: PENDING, and the session keeps working — nothing is restarted
+d4=$(pay ',"background_tasks":[{"id":"x"}]' | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2 "$B/cc-checkpoint" ))
+{ grep -q 'PENDING' <<<"$d4" && grep -q 'background task' <<<"$d4" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
+  && ok "past the handoff line with work in flight the handoff is pending, not taken" || bad "pending handoff: $d4"
+grep -q '"pending": true' "$T/ctx/$sid.json" && ok "the pending handoff is on the record" || bad "no pending flag: $(cat "$T/ctx/$sid.json")"
+# the durable record: one countable line per crossing, which line fired, and no prose to parse
+[ "$("$B/cc-context" --handoffs 2>/dev/null | wc -l)" = 2 ] && ok "every crossing is one countable line on the ledger" || bad "ledger: $("$B/cc-context" --handoffs)"
+"$B/cc-context" --handoffs | cut -f2 | tr '\n' ' ' | grep -q 'journal handoff-deferred' \
+  && ok "the ledger says which line fired" || bad "ledger kinds: $("$B/cc-context" --handoffs | cut -f2 | tr '\n' ' ')"
+out=$("$B/cc" handoff $REPO w1 --over 2>&1); rc=$?
+{ [ $rc = 0 ] && grep -q 'under the handoff line' <<<"$out"; } && ok "a bare --over uses that session's own handoff line" || bad "bare --over: rc=$rc $out"
+lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 10%" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column"
+( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" </dev/null )   # no payload (run by hand): still commits, records nothing new
+[ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ] && ok "the hook still commits when it is given no payload" || bad "checkpoint broke without a Stop payload"
+unset CC_CTX_BOX_MODEL
+
 echo "== guard =="
 g(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?; }
 [ "$(g Bash '{"command":"gh pr merge 1"}' "$wt")" = 2 ] && ok "guard blocks merge in a track (by cwd marker)" || bad "guard merge"
@@ -159,6 +208,36 @@ git -C "$T/remote.git" log --oneline track/w1 2>/dev/null | grep -q 'wip: checkp
 for _ in $(seq 1 30); do tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && break; sleep 1; done   # cc-loop writes it from its tmux window, a beat after DONE
 tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && ok "owner notified on DONE (log backend)" || bad "notify"
 st=$("$B/cc-board" get $REPO w1 status); [ "$st" = review ] && ok "board -> review after done (PR skipped: no gh remote)" || bad "board status after done: $st"
+# P1-P4: one branch, one PR. The loop calls `cc done` when the worker writes STATUS: DONE and a session calls it when it
+# finishes by hand; a squash-merge deletes the branch, so the late caller saw nothing OPEN and opened a duplicate of commits
+# GitHub had already merged (#24/#25 and #29/#30 — same headRefOid). The stub gh never prints a URL from `pr create`, so
+# `cc done` takes its "PR creation failed" branch and no Slack call is ever made from this section.
+mkdir -p "$T/ghbin"
+cat > "$T/ghbin/gh" <<'F'
+#!/usr/bin/env bash
+D=$(dirname "$(dirname "$0")")
+case "$*" in
+  *"pr list"*"--state open"*)   exit 0 ;;                                            # nothing open on this branch
+  *"pr list"*"--state merged"*) [ -s "$D/merged.oid" ] && grep -qF "$(cat "$D/merged.oid")" <<<"$*" && cat "$D/merged.url"; exit 0 ;;
+  *"pr create"*) echo create >> "$D/gh.create"; echo "(no url from this stub)"; exit 0 ;;
+esac
+exit 0
+F
+chmod +x "$T/ghbin/gh"; : > "$T/gh.create"; : > "$T/merged.oid"; echo "https://example.invalid/pull/29" > "$T/merged.url"
+"$B/cc" $REPO w5 >/dev/null 2>&1; sleep 1
+for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w5$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
+PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 >/dev/null 2>&1
+[ "$(wc -l < "$T/gh.create")" = 1 ] && ok "cc done: nothing open and nothing merged for this branch → one PR is opened (P1)" || bad "cc done opened $(wc -l < "$T/gh.create") PRs"
+git -C ~/.cc/worktrees/$REPO/w5 rev-parse track/w5 > "$T/merged.oid"   # that PR was squash-merged: same commits, branch gone
+PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 > "$T/done2.out" 2>&1
+[ "$(wc -l < "$T/gh.create")" = 1 ] && grep -q 'already merged' "$T/done2.out" && ok "cc done: those commits are already merged → NO second PR, and it says which one (P2)" || bad "cc done opened a duplicate PR: $(cat "$T/done2.out")"
+st=$("$B/cc-board" get $REPO w5 status); [ "$st" = merged ] && ok "cc done: the board says merged, not review-forever (P3)" || bad "board after an already-merged done: $st"
+echo "more work after the merge" > ~/.cc/worktrees/$REPO/w5/after.txt   # cc done checkpoints this itself: a NEW tip
+PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 >/dev/null 2>&1
+[ "$(wc -l < "$T/gh.create")" = 2 ] && ok "cc done: a commit AFTER the merge is new work → a second PR is right (P4)" || bad "cc done skipped a PR for real new commits"
+( exec 9>~/.cc/worktrees/$REPO/w5/.cc/done.lock; flock 9; sleep 3 ) & lk=$!   # a first `cc done` still inside the list→create window
+sleep 1; CC_DONE_LOCK_WAIT=1 PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 > "$T/done5.out" 2>&1; rc5=$?; wait $lk 2>/dev/null
+[ "$rc5" = 1 ] && grep -q 'still running' "$T/done5.out" && [ "$(wc -l < "$T/gh.create")" = 2 ] && ok "cc done: two callers at once are serialised — the second opens nothing (P5)" || bad "cc done raced itself: rc=$rc5 creates=$(wc -l < "$T/gh.create")"
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
@@ -366,8 +445,13 @@ echo "built for $(id -un) on $(hostname -s)" > core/bin/leak
 git add -A && git commit -qm "core: a leak" >/dev/null && git push -q origin HEAD
 out=$(pub 2>&1); rc=$?
 { [ $rc != 0 ] && grep -q "identity gate" <<<"$out" && [ "$(git -C "$PUB" rev-parse main)" = "$was" ]; } && ok "identity inside core/ ABORTS the publish and pushes nothing" || bad "identity gate did not stop the publish: $out"
+# on a timer the same abort comes back every 15 min: it must page the owner ONCE, and still fail loudly each run
+paged(){ grep -c "publish blocked" "$T/notify.log" 2>/dev/null || echo 0; }
+n=$(paged); out=$(pub 2>&1); rc=$?
+{ [ "$(paged)" = "$n" ] && [ $rc != 0 ] && grep -q "identity gate" <<<"$out"; } && ok "the same abort pages the owner once, not once per timer tick (it still fails loudly)" || bad "a repeated abort re-paged the owner (was $n, now $(paged))"
 git rm -q core/bin/leak && git commit -qm "core: no leak" >/dev/null && git push -q origin HEAD
 pub >/dev/null 2>&1
+[ -f "$T/publish.notified" ] && bad "a publish that got through still remembers the old abort — it would never page again" || ok "a publish that gets through forgets the abort, so the same reason pages again if it returns"
 { [ "$(git rev-parse main:core)" = "$(git -C "$PUB" rev-parse 'main^{tree}')" ] && git -C "$PUB" ls-tree -r --name-only main | grep -qx bin/tool; } && ok "with the leak fixed the whole prefix ships again, untrimmed" || bad "publish after the fix was incomplete"
 was=$(git -C "$PUB" rev-parse main); echo wip > core/bin/wip; git add -A; git commit -qm "core: never pushed" >/dev/null
 pub >/dev/null 2>&1

@@ -40,7 +40,7 @@ fi
 link "$R/ccbox" ~/ccbox
 link "$R/config/tmux.conf" ~/.tmux.conf
 # the live user units (cc-mcp is retired — its unit is parked in mcp/)
-for u in tmux-main.service cc-heartbeat.service cc-boot-notify.service cc-digest.service cc-digest.timer cc-audit.service cc-audit.timer cc-model.service cc-model.timer cc-reconcile.service cc-reconcile.timer cc-slackd.service; do
+for u in tmux-main.service cc-heartbeat.service cc-boot-notify.service cc-digest.service cc-digest.timer cc-audit.service cc-audit.timer cc-model.service cc-model.timer cc-reconcile.service cc-reconcile.timer cc-publish.service cc-publish.timer cc-slackd.service; do
   link "$R/config/systemd-user/$u" ~/.config/systemd/user/"$u"
 done
 # the overlay's own user units, for what only that box runs: linked like core's, never enabled here — which of
@@ -69,8 +69,10 @@ B
 if [ "$services" = 1 ]; then
   sudo -n loginctl enable-linger "$USER" 2>/dev/null || true
   systemctl --user daemon-reload
-  # cc-slackd is linked but not enabled here: `cc slack on` owns it (it needs the tokens first).
-  systemctl --user enable --now tmux-main.service cc-heartbeat.service cc-digest.timer cc-audit.timer cc-model.timer cc-reconcile.timer
+  # cc-slackd is linked but not enabled here: `cc slack on` owns it (it needs the tokens first). cc-publish.timer IS
+  # enabled here: unconfigured it exits at once, and after a later `cc-publish setup` publishing must not wait for a
+  # second install.
+  systemctl --user enable --now tmux-main.service cc-heartbeat.service cc-digest.timer cc-audit.timer cc-model.timer cc-reconcile.timer cc-publish.timer
   systemctl --user enable cc-boot-notify.service && systemctl --user start --no-block cc-boot-notify.service   # oneshot that may wait minutes for the network: never block the installer
   # last, and non-fatal: a missing python3-venv must not cost you the links above
   [ -x ~/.cc/slack/venv/bin/python ] ||

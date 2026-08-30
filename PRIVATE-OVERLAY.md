@@ -50,11 +50,13 @@ cc-publish --dry-run                             # the exact commit it would pus
 git subtree pull --prefix=core <autobox-url> main --squash    # take upstream changes
 ```
 
-Publishing then happens **by itself after every merge** to your default branch, and `cc-publish` is idempotent, so it is
-safe to run by hand any time. It sends the *whole* `core/` tree of `origin/<default branch>` as one commit on the public
-repo's tip and never picks paths — the only thing that decides what is public is where you put the file.
+Publishing then happens **by itself**, within 15 min of any merge to your default branch (`cc-publish.timer`, enabled by
+`install.sh`) — nothing has to notice the merge, and `cc-publish` is idempotent, so it is also safe to run by hand any
+time. It sends the *whole* `core/` tree of `origin/<default branch>` as one commit on the public repo's tip and never
+picks paths — the only thing that decides what is public is where you put the file.
 
 Nothing under `core/` may name your box — not its contents, not a file name, not the commit subject. `cc-publish` checks
 all three against your user, host and repo names (add IPs, serials or a tailnet with `PUBLISH_DENY=`) and **aborts the
-whole publish** on a hit rather than shipping a trimmed tree, telling you through `cc-notify`. The pre-commit hook blocks
-the same strings earlier. Publishing is off until `PUBLISH_REMOTE` exists, so a bare clone of autobox never publishes.
+whole publish** on a hit rather than shipping a trimmed tree, telling you through `cc-notify` — once per reason, since
+the timer keeps retrying. The pre-commit hook blocks the same strings earlier. Publishing is off until
+`PUBLISH_REMOTE` exists, so a bare clone of autobox never publishes.

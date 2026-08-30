@@ -18,6 +18,10 @@
 # The source is always origin/<default branch>, freshly fetched: only merged, pushed code is ever published, whatever
 # branch or worktree the caller happens to be sitting in.
 #
+# WHEN IT RUNS: `cc-publish.timer`, every 15 min. Nothing has to *notice* a merge for the public repo to catch up — a
+# merge from a session, from the web, from another machine all publish the same way, and the Slack daemon's call after
+# a 👍-merge is only a fast path. Every run is idempotent: already in sync is exit 0 and no commit.
+#
 # Config — ~/.cc/config, each key overridable from the environment. With no PUBLISH_REMOTE this is a no-op, so a bare
 # clone of the public repo never tries to publish anything:
 #   PUBLISH_REMOTE   git URL of the public repo                 (unset = publishing is off)
@@ -29,7 +33,8 @@
 set -uo pipefail
 BIN="$(dirname "$(realpath "$0")")"; CFG="$HOME/.cc/config"
 STATE="${CC_PUBLISH_STATE:-$HOME/.cc/state}"   # log + lock; tests point it at their own dir so two runs never share a lock
-LOG="$STATE/publish.log"; mkdir -p "$STATE"
+LOG="$STATE/publish.log"; SEEN="$STATE/publish.notified"   # the abort the owner was last paged about (see die)
+mkdir -p "$STATE"
 KEYS="PUBLISH_REMOTE PUBLISH_REPO PUBLISH_PREFIX PUBLISH_BRANCH PUBLISH_DENY PUBLISH_ALLOW"
 for v in $KEYS; do eval "[ -n \"\${$v+x}\" ] && E_$v=\"\$$v\""; done   # SET in the env, empty included: `PUBLISH_REMOTE= cc-publish`
 # shellcheck disable=SC1090                                              # means "off", and must not fall through to the config
@@ -60,12 +65,19 @@ fi
 
 # A publish that cannot happen is not silent: it reaches the owner (ntfy/Slack) and leaves a line in the log.
 die() {
+  local sig; sig="$(cksum <<<"$1")"
   printf 'cc-publish: %s\n' "$1" >&2
   printf '%s\tABORT\t%s\n' "$(date -u +%FT%TZ)" "$(printf '%s' "$1" | tr '\n' ' ')" >> "$LOG"
   # Only a REAL publish pages the owner. `status` is a query and `--dry-run` is a rehearsal: neither is a failure of
   # the box, and a read-only command that pushes a phone alert teaches its reader to ignore the alert.
-  [ "$mode" = publish ] && [ "$dry" = 0 ] && [ -x "$BIN/cc-notify" ] &&
+  # Once per REASON, too, now that a timer runs this unattended every few minutes: a stuck cause — a gate hit, a
+  # remote that is down — would otherwise page the same alert all day, which teaches the same lesson. The stderr
+  # line, the log and the unit's own failure still say it every run; the next publish that gets through forgets the
+  # reason, so it pages again if it comes back.
+  if [ "$mode" = publish ] && [ "$dry" = 0 ] && [ -x "$BIN/cc-notify" ] && [ "$(cat "$SEEN" 2>/dev/null)" != "$sig" ]; then
+    printf '%s\n' "$sig" > "$SEEN"
     "$BIN/cc-notify" -p high -t "${REPO:+[$REPO] }publish blocked" "$1" >/dev/null 2>&1   # a title starting with the repo routes to its channel
+  fi
   exit 1
 }
 if [ -z "$REMOTE" ]; then
@@ -110,7 +122,7 @@ if [ "$mode" = status ]; then
   else                              echo "publish: never published — $PREFIX/ at ${SRC:0:8}, no $BRANCH on the public repo yet"; fi
   exit 0
 fi
-[ "$PTREE" = "$TREE" ] && { echo "cc-publish: already up to date ($PREFIX/ == $BRANCH at ${PARENT:0:8})"; exit 0; }
+[ "$PTREE" = "$TREE" ] && { rm -f "$SEEN"; echo "cc-publish: already up to date ($PREFIX/ == $BRANCH at ${PARENT:0:8})"; exit 0; }
 
 if [ -z "$msg" ]; then
   # What changed since last time: the previous publish says where it came from, so the range is exact. Without that
@@ -139,4 +151,5 @@ fi
 # public repo that moved under us keeps its commits — re-running rebuilds on the new tip.
 git -C "$R" push --quiet "$REMOTE" "$COMMIT:refs/heads/$BRANCH" || die "push to the public repo failed (it may have moved — re-run)"
 printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "${SRC:0:12}" "${COMMIT:0:12}" "$BRANCH" >> "$LOG"
+rm -f "$SEEN"
 echo "cc-publish: published $PREFIX/ at ${SRC:0:8} as ${COMMIT:0:8} on $BRANCH"
