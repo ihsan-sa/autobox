@@ -22,7 +22,8 @@ A bare clone of autobox works too — it just has no overlay, so `install.sh` li
 1. **`home/`** — copy `core/templates/home/*.md` to `<overlay>/home/` and replace every `<placeholder>`:
    `<box>` (the box's name, must match `hostname -s` or whatever you set as `CC_BOX`), `<user>`, `<owner-email>`,
    `<control-repo>`, `<tailscale-ip>`, `<tailnet>`, `<public-hostname>`, `<rescue-ip>`, `<iface>`, `<mac>`, SSIDs, hardware.
-   These four files are the box's own memory: `CLAUDE.md` is what every Claude session on it reads first.
+   These four files are the box's own memory: `CLAUDE.md` is what every Claude session on it reads first, so keep it
+   short — the machine's specs, power and disk history belong in `<overlay>/docs/hardware.md`, which it links.
 2. **`~/.cc/config`** (mode 600, never committed) — `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_OWNER_ID`,
    `SLACK_WEBHOOK`, `SLACK_CHANNEL`, `NTFY_TOPIC`, and `CC_BOX` if the box's name is not `hostname -s`.
    `cc slack setup` and `cc-notify setup` write these for you.
@@ -49,13 +50,11 @@ cc-publish --dry-run                             # the exact commit it would pus
 git subtree pull --prefix=core <autobox-url> main --squash    # take upstream changes
 ```
 
-Publishing then happens **by itself after every merge** to your default branch, and `cc-publish` is safe to run by hand
-any time — it is idempotent. It sends the *whole* `core/` tree of `origin/<default branch>` as one commit on top of the
-public repo's tip; it never picks paths and never publishes anything outside the prefix, so the only thing that decides
-what is public is where you put the file.
+Publishing then happens **by itself after every merge** to your default branch, and `cc-publish` is idempotent, so it is
+safe to run by hand any time. It sends the *whole* `core/` tree of `origin/<default branch>` as one commit on the public
+repo's tip and never picks paths — the only thing that decides what is public is where you put the file.
 
-Nothing under `core/` may name your box — not its contents, not a file name, not the commit subject. `cc-publish`
-checks all three against your user, host and repo names (add IPs, serials or a tailnet with `PUBLISH_DENY=`) and
-**aborts the whole publish** on a hit rather than shipping a trimmed tree; the failure reaches you through `cc-notify`.
-`core/tests/check.sh` is static-only for the same reason, and the pre-commit hook runs it on every commit to the
-default branch. Publishing is off until `PUBLISH_REMOTE` exists, so a bare clone of autobox never publishes anything.
+Nothing under `core/` may name your box — not its contents, not a file name, not the commit subject. `cc-publish` checks
+all three against your user, host and repo names (add IPs, serials or a tailnet with `PUBLISH_DENY=`) and **aborts the
+whole publish** on a hit rather than shipping a trimmed tree, telling you through `cc-notify`. The pre-commit hook blocks
+the same strings earlier. Publishing is off until `PUBLISH_REMOTE` exists, so a bare clone of autobox never publishes.

@@ -325,7 +325,7 @@ for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT ki
 echo "== cc-publish: core/ publishes itself =="
 PUB="$T/mirror.git"; git init -q --bare "$PUB"
 cd ~/dev/$REPO || exit 1
-pub(){ env CC_PUBLISH_STATE="$T" PUBLISH_REMOTE="$PUB" PUBLISH_REPO=$REPO PUBLISH_PREFIX=core PUBLISH_BRANCH=main PUBLISH_ALLOW=LICENSE "$B/cc-publish"; }
+pub(){ env CC_PUBLISH_STATE="$T" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE="$PUB" PUBLISH_REPO=$REPO PUBLISH_PREFIX=core PUBLISH_BRANCH=main PUBLISH_ALLOW=LICENSE "$B/cc-publish"; }
 mkdir -p core/bin && echo generic > core/bin/tool && echo "overlay only" > private.md
 git add -A && git commit -qm "core: a generic tool" >/dev/null && git push -q origin HEAD
 pub >/dev/null 2>&1
@@ -346,7 +346,7 @@ was=$(git -C "$PUB" rev-parse main); echo wip > core/bin/wip; git add -A; git co
 pub >/dev/null 2>&1
 [ "$(git -C "$PUB" rev-parse main)" = "$was" ] && ok "only origin's default branch is published — local, unpushed work is not" || bad "unpushed work reached the public repo"
 git reset -q --hard origin/main
-env CC_PUBLISH_STATE="$T" PUBLISH_REMOTE= PUBLISH_REPO=$REPO "$B/cc-publish" status 2>&1 | grep -q "publish: off" && ok "no PUBLISH_REMOTE: publishing is simply off (a bare clone never publishes)" || bad "unconfigured publish is not off"
+env CC_PUBLISH_STATE="$T" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE= PUBLISH_REPO=$REPO "$B/cc-publish" status 2>&1 | grep -q "publish: off" && ok "no PUBLISH_REMOTE: publishing is simply off (a bare clone never publishes)" || bad "unconfigured publish is not off"
 cd ~ || exit 1
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
