@@ -244,6 +244,8 @@ def run(seed, cs_path):
             elif kind in ("askback", "perm"):
                 chat, rts = roots[a["tid"]]
                 ours[a["tid"]] = slack.post(chat, a["text"], bot=True, thread=rts)["ts"]; truth_last[a["tid"]][0:2] = ["needs_owner", clock.now]
+                d.declare_needs(chat, rts)   # the SENDER decides: reply(needs_owner) / the 🔐 prompt records it. Nothing
+                                             # reads a NEEDS YOU out of the text any more, so the sim must declare too.
             elif kind == "followup":
                 chat, rts = roots[a["tid"]]
                 owner_msg[a["tid"]] = slack.post(chat, a["text"], user=OWNER, thread=rts)["ts"]; truth_last[a["tid"]][0:2] = ["owner", clock.now]
