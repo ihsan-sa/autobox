@@ -1,6 +1,6 @@
 # <box> — Usage
 
-Shallow first. Each section: the 2–3 things you actually type. Why it is shaped this way: `core/docs/DESIGN.md`. Talking to projects and agents: `COMMS.md`.
+Shallow first. Each section: the 2–3 things you actually type. Why it is shaped this way: `core/docs/DESIGN.md`. Talking to projects and agents: `COMMS.md`, and the Slack mechanics `SLACK.md`.
 
 ## Connect
 - Laptop: `ssh <user>@<tailscale-ip>` (Tailscale) · anywhere: `ssh <box>` (Cloudflare, OTP) · rescue cable: `ssh <user>@<rescue-ip>`
@@ -11,8 +11,10 @@ Shallow first. Each section: the 2–3 things you actually type. Why it is shape
 - `cc <repo>` — planning session for `~/dev/<repo>` (main branch; plans, dispatches, reviews PRs; never merges).
 - `cc <repo> <track>` — worker session on its own worktree + branch `track/<track>`. Auto-commits and pushes after every turn. Finish with `cc done <repo> <track>` → PR.
 - `cc <repo> --orch <alias> ["brief"]` — a peer orchestrator in the primary worktree, addressable as `@<alias>` in that repo's channel and in its own `#<parent>-<alias>-<id>` (routing table `~/.cc/slack/orchs.json`). Archived when the session exits, by `cc slack archive <#chan>`, or by the daily janitor 24 h after it is gone.
-- `cc resume` — menu of all sessions by name/status. `cc ls` / `cc digest` — what's running and where things stand.
-- Reconnect = the same `cc …` command. `cc -c <repo> [track]` only if the process died.
+- `cc` on its own attaches the tmux session. `cc resume` — menu of all sessions by name/status. `cc ls` / `cc digest` — what's running and where things stand.
+- Reconnect = the same `cc …` command. `cc -c <repo> [track]` only if the process died. `cc rm <repo> <track>` removes a track (worktree, local branch, board entry, state).
+- `cc rc status|restart` — the always-on box session in window `box`; restarting ends its current conversation, so pick `<box>` again in the app.
+- Slack, the phone app and tmux can hold the *same* session at once. Between sessions Claude uses its native `SendMessage` (session name = window name); you don't relay.
 
 ## Autonomous work (hands-off)
 - `cc <repo> <track> --go "instruction"` — headless worker: fresh context per iteration, journal at `~/.cc/state/<repo>/<track>/progress.md`, ends with a PR and a phone push. Options: `--loop N` (iterations, default 1) `--budget USD` (per iteration, default 8) `--turns N` (default 80) `--model sonnet`.
@@ -38,7 +40,7 @@ Shallow first. Each section: the 2–3 things you actually type. Why it is shape
 - Every boot posts one message (`cc-boot-notify`): time up, whether the last boot ended cleanly or by power loss, and seconds dark. `cc-heartbeat` keeps a 10 s fsync'd stamp; events accumulate in `~/.cc/state/power-events.log` (`cause=clean-reboot` or `cause=power-loss`).
 
 ## Slack, two-way (`cc slack`)
-How the conversation itself works — channels, threads, marks, who may do what, the free `!` commands and the agent-facing `cc-slack` ones — is `COMMS.md`. Here: the setup and the box-side commands.
+How the conversation itself works — channels, threads, marks, who may do what, the free `!` commands and the agent-facing `cc-slack` ones — is `SLACK.md`. Here: the setup and the box-side commands.
 - One Slack app ("<box>", Socket Mode: no inbound port, no tunnel). Once: `cc slack setup` prints the 5 steps — create the app from `slack/app-manifest.json`, `cc slack setup --bot xoxb-… --app xapp-… --owner-email you@x`, `cc slack on`, then `cc slack mkchannel <repo>` per project (**private by default**, `--public` opts out; a `#<repo>--<sub>` name inherits `#<repo>`'s people). The bot cannot create the app itself.
 - `cc slack status|channels|off|archive <#chan>`. Extra routes: `~/.cc/slack/routes.json`. From the shell, `cc-slack inject <target> "text"` pushes a message the same way; with Slack off the reply lands in `~/.cc/slack/outbox.log`. `cc-notify` posts into `#<repo>` when the title starts with a repo name.
 - Sessions pick up their channel when (re)started after `cc slack on` — for the boot session see RUNBOOK. Built on Claude Code *channels* (research preview, loaded with the development flag).

@@ -1,74 +1,31 @@
 # <box> — Talking to your projects and agents
 
-The six moves, who is who, then the detail. Source of truth: `~/dev/<control-repo>/home/COMMS.md`.
+**How do I reach a project or agent, and who answers?** That is all this file. Below it: the Slack mechanics — channels, threads, marks, reactions, who may do what, what arrives on its own — in `~/SLACK.md`; the commands in `~/USAGE.md`. Source of truth: `~/dev/<control-repo>/home/COMMS.md`.
 
-## The six moves
-1. **Slack `#<repo>`** — ask or instruct, the answer comes back in a thread. Phone-first. The repo's planning session answers; if none is running it is started for you.
-2. **DM the bot** (or `#box`) — the box itself: status, ops, starting things, "what's running?".
-3. **Phone app → Code → session** — the *same* session with its live screen: stop it, or type when Slack is the wrong shape (long pastes, approvals).
-4. **Laptop: `ssh` + `cc <repo>`** — the same session again, in tmux. Slack, the app and the terminal are one conversation per project.
-5. **Hands-off work** — in `#<repo>`: "dispatch a worker on track *name* to do *X*", or on the box `cc <repo> <track> --go "X"`. Headless, own branch, ends in a PR and a ping. Nothing merges without you.
-6. **Dashboard — tap the bot in the sidebar → *Home*** — one live view: units 🟢/🔴, every channel with its session and open ❓, every track with iteration/cost/PR (🏃 = a worker is running), the last audit and boot. Refreshes within ~2 s of an event, otherwise every 30 s; read-only, never posted as a message. `!status` `!threads` `!digest` say the same in text.
+## The six ways in
+1. **Slack `#<repo>`** — ask or instruct; that repo's planning session answers in a thread, started for you if it isn't up. Phone-first, and the one to reach for.
+2. **DM the bot** (or `#box`) — the box itself: status, ops, starting things.
+3. **Phone app → Code → session** — the *same* session with its live screen, for long pastes, approvals, or stopping it.
+4. **`ssh` + `cc <repo>`** — the same session again, in tmux. Slack, the app and the terminal are one conversation per project.
+5. **Hands-off** — in `#<repo>`: "dispatch a worker on track *name* to do *X*", or `cc <repo> <track> --go "X"`. Own branch, ends in a PR and a ping. Nothing merges without you.
+6. **Home tab** — tap the bot in the Slack sidebar: what is running, what needs you, every track's cost and PR. Live and read-only. `!status` `!threads` `!digest` say the same in text.
 
-## Who is who
-| Agent | Where it lives | Reach it | Does |
-|---|---|---|---|
-| **box** session | tmux `main:box`, `~/dev`, Remote-Control name `<box>` | DM the bot · `#box` · phone app "<box>" · `cc` then window `box` | ops, status, starting/stopping things, questions about the box |
-| **`<repo>` planning session** | tmux window `<repo>`, `~/dev/<repo>` on the default branch | `#<repo>` · phone app `<repo>` · `cc <repo>` | plans, dispatches tracks, reviews PRs; never merges, never auto-commits |
-| **`<repo>/<track>` session** | window `<repo>/<track>`, own worktree + branch `track/<track>` | `#<repo>--<track>` · phone app `<repo>/<track>` · `cc <repo> <track>` | does one unit of work; every turn is auto-committed and pushed |
-| **headless worker** (`--go`) | same worktree, no chat, fresh context per iteration | `cc <repo> <track>` shows its window; log `~/.cc/state/<repo>/<track>/loop.log` | executes a task file; `STATUS: DONE` → PR; `STATUS: BLOCKED` → pings you |
+## Who answers
+| Agent | Reach it | Does |
+|---|---|---|
+| **box** session | DM the bot · `#box` · phone app "<box>" · `cc`, window `box` | ops, status, starting and stopping things |
+| **`<repo>` planning session** | `#<repo>` · phone app `<repo>` · `cc <repo>` | plans, dispatches tracks, reviews PRs; never merges, never auto-commits |
+| **`<repo>/<track>` session** | `#<repo>--<track>` · phone app `<repo>/<track>` · `cc <repo> <track>` | one unit of work on its own worktree and branch, auto-committed every turn |
+| **headless worker** (`--go`) | no chat — `cc <repo> <track>` shows its window, log `~/.cc/state/<repo>/<track>/loop.log` | runs a task file; `DONE` → PR, `BLOCKED` → pings you |
 
-Sessions are named after what they own, so the Slack channel, the phone-app entry and the tmux window share the name. (Claude.ai / Claude Desktop check in through the owner's **Slack** connector.)
-
-## Slack in detail
-- **Channels are projects.** `#<repo>` ↔ `~/dev/<repo>`; `#<repo>--<track>` ↔ that track; DM or `#box` ↔ the box. Anything else: name a channel after a folder in `~/dev`, or map it in `~/.cc/slack/routes.json` (`{"#ops": "box"}`). `cc slack mkchannel <repo>` creates and wires one, **private by default** (`--public` opts out); a `#<repo>--<sub>` name starts with `#<repo>`'s people in it. An already-public channel stays public — no bot API converts one, so `cc slack channels` flags it and you flip it in Slack (Settings → Change to private). In a public channel *anyone in the workspace* reaches that session.
-- **Every channel is a session.** A channel the bot is in that maps to nothing else becomes one on its **first message**: the box creates `~/dev/<channel name>` — lower-cased `[a-z0-9-]` — with a `CLAUDE.md`, the marker `.cc/member-facing` and a git repo, starts the session there and says so. It is member-facing and read-only outside its own directory: anything needing a change comes to you, in the thread and via `cc-notify`. Capped at **3 new dirs an hour**; past that you are asked to create the dir by hand. Never for DMs, `#approvals`/`#alerts`, an archived sub-orch channel, or a name that normalises to nothing. **To promote one:** move or rename `~/dev/<name>`, add a git remote, drop `.cc/member-facing`.
-- **A track channel whose worker is headless** cannot chat. Your question goes to the **`<repo>` session**, prefixed `[asked in #<repo>--<track> while its headless worker runs]`; it answers in that channel and says so there. The worker is untouched.
-- **Peer orchestrators.** `cc <repo> --orch <alias>` starts a peer session in the same channel for long or vague work. Hand it a thread by opening your message with `@<alias>`; `@main` brings the main session back.
-- **Sub-orchs get their own channel.** `cc <repo> --orch <alias> "brief"` also creates `#<parent channel>-<alias>-<id>` (orchs spawned by orchs nest), invites you, puts the brief in the channel purpose and posts the link in the thread that asked. In there you need no `@`, though `@main` / `@<other>` still hand a thread over. Archived when the orch exits — `cc slack archive <#chan>`, or a daily janitor after 24 h gone. Archived channels neither route nor show on Home, where sub channels sit indented under their parent.
-- **Sessions can @-mention people.** A handle (`@ada.byron`), a display or real name, or a first name (`@ada`) all resolve: that channel's members first, then the workspace. Two people answering to the same form leaves it as plain text. It only notifies someone **already in the channel** — the bot never invites anyone — and `@main` / `@<alias>` still mean a session, not a person.
-- **Threads are conversations.** The session replies in a thread under your message; continue there. A new top-level message is a new topic; the session keeps its own memory either way.
-- **Marks say whose turn it is.** A thread root carries two at once. Turn: ❓ = *you* must act (a 🔐 prompt, `STATUS: BLOCKED`, a question, or your own last word 30 min unanswered — a stalled session: `!restart <target>`) · 🔴 = the session owes you, still inside its 30 min · 🟠 = it answered and asked nothing, clearing after 48 h quiet · none = closed or gone quiet. Work: 🔧 = still on it · ✅ = finished. So 🔧🔴 = working *and* owes you a word, a 🔧 keeps a thread from ageing into ❓, and a channel with no ❓ has nothing waiting on you. Marks appear within ~45 s (🔐 prompts and your own messages instantly) and change on their own.
-- **On your own messages:** 👀 = the session has it, and it comes off when it answers · any other reaction *from the session* is its answer when no words were needed (👍 yes · 👎 no · ✅ done · ❌ can't · 🤔 unclear), and the thread turns 🟠 · ✅/❌ = your `yes <id>`/`no <id>` was delivered · "⏳ starting…" = your message is queued until the session is up.
-- **Your 🏁 closes a thread; your 👍 answers it.** 🏁 on *any* message of a thread clears its root's marks and stops its nudges; reply there again and it re-opens. It never stops the work and never speaks for the session. Every other reaction you put on a *session's* message reaches it as `👍 on your 07:12 reply: "…"` — 👍 = act, don't ask again · 👎 = no · anything else arrives as itself. Only a session already running hears it. 🏁 is the only reaction you ever need to set.
-- **Open threads nudge themselves.** Every 15 min, a ❓ thread that has needed you for over 30 min gets one in-thread reminder carrying the actual ask, never repeated, never on a thread you have 🏁'd: `❓ still waiting for you (33m): <the question>`, or `⏳ no answer for 33m — !restart <target> if the session is wedged` when the session is the quiet one. `!threads` is the same state on demand.
-- **Free commands** (no tokens spent): `!status` live sessions + board · `!digest` all tracks with PR state and cost · `!sessions` who is subscribed · `!start` this channel's session · `!say <text>` type into a session that has no channel · `!restart box|<repo>[/track]|slack|tmux` recover a wedged session or the daemon, no live session needed · `!reboot` reboot the box · `!threads` this channel's open threads as *needs you* (❓) / *with the session* (🔴) / *handled* (🟠) · `!box` health · `!ping` · `!help`. `!restart tmux` and `!reboot` need a confirm — see RUNBOOK.
-- **Agent parity on the box** (`cc-slack <cmd>`, for you and sessions, not Slack commands): `history`/`thread` pull compact recent messages · `edit`/`unsay` fix or remove the bot's own posts · `pin`/`unpin` · `canvas` replaces a channel's canvas from stdin markdown. Sessions get the same as MCP tools; posts show as `<box> · <session>`.
-- **Approvals.** A session's permission prompt reaches you as `🔐 … Reply "yes abcde" or "no abcde"`. Answer there or in the terminal — first answer wins. Owner gates (merge, deploy, destructive/host changes, external comms) are hard-blocked for autonomous sessions and *asked* of interactive ones.
-- **PR merges.** Every finished track's PR lands in `#approvals` as `[<repo>] PR #<n>: <title> — <url>`. React 👍 and the box squash-merges it and deletes the remote branch; the outcome comes back in the thread. A 👍 on anything but the bot's own PR post is ignored. A **failed** merge pushes to your phone, posts in `#<repo>` and is injected into that repo's session, so an agent picks up the fix.
-- **Attachments.** Photos, screenshots and files you send land in `~/.cc/slack/files/` and the session reads them; images render.
-- **Shared messages.** Forward or share a message into a channel with the bot and the session gets its content as one bracketed line — `[shared message from #help by ada at 2026-08-30 05:33Z: …]` — even when your own text is nothing but the mention.
-- **Who can talk: anyone who can post in a channel that routes to a session.** Channel membership *is* the access control — you curate it, and whoever is in the channel is answered exactly as you are (the session sees `role="member"`). What a member **cannot** do: authorize an owner gate (merge to main, deploy, spend over budget, destructive or host/network/service changes, external comms in your name), answer a `🔐` prompt, run a `!` command beyond `!help`/`!status`, or hand a thread over with `@<alias>`. The session does the ungated part, says which part needs you, and **@-mentions you in that thread**.
-- **Their reactions count as yours.** A member's 👍 on a PR post in `#approvals` merges it, their 🏁 closes a thread, and any other reaction reaches the session tagged with their name and `role="member"`. Yours alone: reactions in a **DM**, and **permission answers** — `yes <id>` is authorization, not a verdict.
-- **A member-facing session is gated by code, not by its CLAUDE.md.** Put `.cc/member-facing` in the folder (`~/dev/<repo>/.cc/member-facing`) and `cc-guard` treats *every* session started there as role=member: on top of the owner gates, and edits outside that folder, it refuses to **dispatch work** (`cc … --go`, `cc-loop`, a headless `claude -p`), to **read the box's secrets** (`~/.cc/config`, `~/.ssh`, `~/.claude/settings.json` — by shell command *and* by file-reading tool) and to **re-wire Slack** (`cc slack` off/setup/mkchannel/archive). `cc-notify` stays open, so it can always ask you. The marker is the trigger, so it holds for subagents and for a session you start by hand, and only you lift a gate, one call at a time. **Honest ceiling:** a blocklist, not a sandbox — for real isolation run that session in `ccbox`.
-- **DMs are yours alone.** A DM reaches the box session, the most privileged target, and no channel gates it — so a non-owner DM gets 👋 and one line, never a session.
-- **What arrives on its own:** `cc-notify` into `#<repo>` (worker done / blocked / stalled, PR links), boot notices and the daily digest into `#<box>` or `SLACK_CHANNEL`, plus ntfy pushes to the phone.
-- **The primary model at its limit:** the box moves to the fallback and back, one `<box> model` line in `#alerts` each time. Live sessions are retuned in place, new ones start on the fallback, until the primary answers a probe again (`cc-model status`).
-- **The audit is one line, never a wall of text:** `cc-audit` (03:30 UTC — review every 3rd day, weekly on Sundays, monthly on the 1st) posts one line into `#<box>` and the whole report on the **`#<box>` canvas**. Monthly findings also land on the board as `audit-<yyyymm>`; nothing gets fixed until you say so.
-- **The review reads you, not the code:** every third day it goes through your channels, threads, boards and journals and reports how long you waited for replies, where a message ignored your style rule (quoting it), what burned budget without a result, and **what you had to do by hand that should have been automatic**.
-- **Long tasks:** a one-line ack, then the result. **Messages are structured, not long** — section bullets, a sub-bullet only for detail you will act on. Reference material goes where it belongs, linked in one line: the channel's *canvas* (living project state), the repo's `docs/` (lasting reports), the track journal (running detail).
-- **Files from the box.** `cc-slack post --file <path> [--to #<repo>|C…|U…] [--thread <ts>] [--title <t>] [-m <text>]` uploads as the bot; default target is your DM. A session does the same with the `file` MCP tool: when the answer *is* a render, a chart or a screenshot it attaches the image in the thread that asked. It may only read from its own folder, `/tmp` or `~/.cc/slack/files`, 25 MB max.
-- **Nothing answers?** `!ping` → `cc slack status` on the box → `journalctl --user -u cc-slackd -n 30`. A session started before `cc slack on` has no channel: restart it and message again — `cc handoff <repo> <track>` for a track, `cc rc restart` for the box session, and for a planning session `tmux kill-window -t main:<repo>` then `cc <repo>`.
-
-## Claude Code sessions (phone app or terminal)
-- `cc` attach tmux · `cc <repo>` planning session · `cc <repo> <track>` track session · `cc resume` menu · `cc ls` / `cc digest` what's live and where things stand.
-- Reconnect = the same command; sessions survive disconnects and reboots. `cc -c <repo>` only if a process died.
-- Nudge a running session: `cc <repo> <track> --say "text"` · `cc handoff <repo> <track>` (journal + fresh context) · `cc done <repo> <track>` (PR) · `cc rm` (remove a track).
-- Between sessions, Claude uses its native `SendMessage` (session name = window name); you don't relay.
-- Phone app: Code → the session name. Remote Control shows the live screen; Slack and the app can hold the same session at once.
-- Box session: `cc rc status|restart`. Restarting ends its current conversation — pick `<box>` again in the app.
-
-## Hands-off work and what needs you
-- `cc <repo> <track> --go "task" [--loop N] [--budget USD] [--model sonnet]` — fresh context per iteration, journal at `~/.cc/state/<repo>/<track>/progress.md`, capped by budget and turns, ends in a PR and a ping. Or say it in `#<repo>`.
-- It stops and pings you when **BLOCKED** (answer: edit the task file, rerun) or stalled. Answer questions in `#<repo>`; the planning session can re-dispatch.
-- **You decide:** merges to main, deploys, spend beyond budgets, anything destructive or host/network-level, messages sent in your name. Everything else the agents do on their own.
+Everything is named after what it owns, so the Slack channel, the phone-app entry and the tmux window share one name. (Claude.ai and Claude Desktop check in through the owner's **Slack** connector.)
 
 ## Cheat sheet
-    Slack #myapp "what's the state of step1?"       answer in a thread from that repo's session
-    Slack DM "start myapp and summarize the board"  the box session does it
-    Slack #myapp "!digest"                          all tracks, PR state, cost — no tokens
-    Slack "yes kqmtr"                                        approve a relayed permission prompt
-    Phone app → Code → myapp                        same session, live screen
-    ssh <box>; cc myapp                             same session, terminal
-    cc myapp step2 --go "…"                         headless worker → PR → ping in #myapp
-    cc slack status | cc rc restart | box-status             when something's quiet
+    Slack #myapp "what's the state of step1?"   that repo's session answers in a thread
+    Slack #myapp "!digest"                      all tracks, PR state, cost — no tokens
+    Slack "yes kqmtr"                           approve a relayed permission prompt
+    Slack DM "what's running?"                  the box session answers
+    ssh <box>; cc myapp                         the same session, terminal
+    cc myapp step2 --go "…"                     headless worker → PR → ping in #myapp
+
+Nothing answers? `!ping`, then `~/SLACK.md`.
