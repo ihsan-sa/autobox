@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""cc-scope — the ask ledger: every ask the owner makes is written down, and 'done' is measured against it.
+
+The board tracks what the BOX decided to do. Nothing tracked what the OWNER asked for, so a compound ask
+("do X, and also Y") was closed on X, and a standing rule said once in a thread was forgotten by the next
+session. This is the missing half: one row per ask, opened when it is made, closed only against evidence.
+
+Ledger: ~/.cc/scope/<repo>.json  (sidecar like the board — never in git, so no merge noise).
+Every owner message the capture path saw is logged to ~/.cc/scope/seen.log whether it was captured or not:
+the classifier below is a filter, not an oracle, and `cc-scope missed` is how a miss is found and added.
+
+An ask moves  open → claimed → delivered → verified,  or leaves the queue as  declined.
+Settled is verified or declined; everything else is still work, and `check` exits 1 while any of it is left.
+DECLINED IS A DECISION, NOT A DROP: a session may judge that something should not be built, and that is a
+legitimate answer — but it must say why, in its own words, and the reason stays in the ledger next to the ask.
+`--why` is therefore required. An omission leaves an open item; a decision leaves a reason; the two can never
+be mistaken for each other, which is the whole point of writing the asks down.
+
+  cc-scope add <repo> "<ask>" [--src REF] [--track T] [--done-when "..."] [--who W] [--at ISO]
+  cc-scope list [<repo>] [--all] [--status S] [--track T] [--json]   unsettled asks (all repos if none named)
+  cc-scope show <repo> <id>                                          one ask in full: parts, repeats, notes
+  cc-scope claim <repo> <id> [--track T]                             a session/track has taken it on
+  cc-scope deliver <repo> <id> --evidence "<what proves it>"         built, not yet confirmed landed
+  cc-scope verify <repo> <id> [--evidence "…"]                       done, and measured against the ask
+  cc-scope decline <repo> <id> --why "<why it should not be built>"  a decision, kept in the ledger
+  cc-scope track|note <repo> <id> "<text>"                           link an ask to a track / add a note
+  cc-scope check <repo> [--track T]                                  exit 1 while anything is unsettled
+  cc-scope capture <repo> [--src REF] [--who W]                      classify a message on stdin
+  cc-scope missed [<repo>] [--since HOURS]                           owner messages the classifier skipped
+  cc-scope digest [<repo>] · count [<repo>] · import <repo> <file> · selfcheck
+  cc-scope hook                                                      UserPromptSubmit hook (silent, always 0)
+"""
+import sys, os, re, json, time, fcntl, hashlib, calendar
+
+HOME = os.path.expanduser("~")
+SCOPE = os.environ.get("CC_SCOPE_DIR", os.path.join(HOME, ".cc", "scope"))
+SEEN = "seen.log"
+STATES = ["open", "claimed", "delivered", "verified", "declined"]
+SETTLED = ("verified", "declined")   # off the queue. Declined is settled and STAYS VISIBLE — see the header
+MARK = {"open": "·", "claimed": "▸", "delivered": "→", "verified": "✓", "declined": "⊘"}
+MAXTEXT = 800          # a whole essay is not an ask; the source ref is how you read the rest
+SEEN_KEEP = 400        # lines of seen.log kept — enough to catch a miss the same day
+
+
+def now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def path(repo): return os.path.join(SCOPE, repo + ".json")
+
+
+class Lock:
+    def __init__(self, repo):
+        os.makedirs(SCOPE, exist_ok=True)
+        self.f = open(os.path.join(SCOPE, repo + ".lock"), "w")
+    def __enter__(self): fcntl.flock(self.f, fcntl.LOCK_EX); return self
+    def __exit__(self, *a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+
+
+def load(repo):
+    try:
+        with open(path(repo)) as f: return json.load(f)
+    except (OSError, ValueError): return {"repo": repo, "asks": {}}
+
+
+def save(repo, d):
+    os.makedirs(SCOPE, exist_ok=True)
+    d["updated"] = now()
+    tmp = path(repo) + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    os.replace(tmp, path(repo))
+
+
+def repos():
+    try: return sorted(f[:-5] for f in os.listdir(SCOPE) if f.endswith(".json"))
+    except OSError: return []
+
+
+# ---- what counts as an ask -------------------------------------------------------------------------
+# Deterministic, no LLM: the capture path runs on every prompt and must be cheap, silent and predictable.
+# It keeps DIRECTIVES — the things that outlive the reply. A plain question is answered in the reply and
+# would bury the ledger, so it is logged to seen.log and not opened; `missed` is where you go looking.
+ACK = re.compile(r"^\W*(thanks?|thx|ty|ok(ay)?|k|cool|nice|great|good|sure|yes|yeah|yep|no|nope|perfect|"
+                 r"lgtm|got ?it|right|agreed|👍|👌|🙏|🎉|❤️)\b", re.I)
+CUE_START = re.compile(r"^\W*(add|allow|always|answer|archive|ask|attach|be|break|build|cancel|change|"
+                       r"check|clean|close|come|connect|cut|delete|deny|deploy|describe|disable|do|don'?t|"
+                       r"drop|enable|ensure|explain|fix|fold|give|go|group|handle|have|hide|hold|install|"
+                       r"keep|kill|label|leave|let|link|list|log|look|make|mark|merge|move|name|never|open|"
+                       r"ping|post|prefer|print|pull|push|put|react|read|reduce|remind|remove|rename|reply|"
+                       r"report|restart|review|rewrite|run|say|send|set|share|show|sort|split|start|stop|"
+                       r"switch|take|tell|test|track|try|turn|update|upload|use|verify|wait|write)\b", re.I)
+CUE_ANY = re.compile(r"\b(should|shouldn'?t|must|from now on|going forward|i want|i'?d like|i would like|"
+                     r"can you|could you|would you|please|needs? to|has to|have to|make sure|instead of|"
+                     r"stop \w+ing|no longer|(is|are|was|were|does|do)n'?t work(ing)?|not work(ing)?|i don'?t like|"
+                     r"i do not like|not intuitive|rather than)\b", re.I)
+SPLIT = re.compile(r"(?<=[.!?;])\s+|\n+")
+
+
+def parts_of(text):
+    """The directive sentences inside a message. A compound ask is where scope goes missing, so they are
+    kept separately and shown by `show` — the row is the message, the parts are what it actually asked."""
+    out = []
+    for s in SPLIT.split(text):
+        s = s.strip(" -*·\t")
+        if len(s.split()) < 2 or ACK.match(s): continue
+        if CUE_START.match(s) or CUE_ANY.search(s): out.append(s[:200])
+    return out
+
+
+def is_ask(text):
+    t = text.strip()
+    if not t or t.startswith(("!", "/")): return False        # a free ! command / slash command is not an ask
+    if len(t.split()) < 3 and ACK.match(t): return False
+    if ACK.match(t) and len(t.split()) < 6: return False       # "thanks, that looks great"
+    return bool(parts_of(t))
+
+
+def norm(text):
+    return re.sub(r"[^a-z0-9 ]", "", re.sub(r"\s+", " ", text.lower())).strip()
+
+
+def fingerprint(text): return hashlib.sha1(norm(text).encode()).hexdigest()[:12]
+
+
+# ---- the ledger ------------------------------------------------------------------------------------
+def add(repo, text, who="owner", src="", track="", done_when="", at="", replay=False):
+    """Returns (id, repeated). The same ask made twice does not open a second row — it bumps `repeats`,
+    which is the signal that matters: 'asked twice, no answer yet' is a line from a real handoff. Asked
+    again after it was DECLINED, it goes back on the queue (the reason stays); asked again after it was
+    VERIFIED it is a new row, because that is a regression, not a repeat. `replay` (import) matches every
+    status and changes nothing — re-running a seed file must be a no-op, not a second ledger."""
+    text = " ".join(text.split())[:MAXTEXT]
+    if not text: return None, False
+    fp = fingerprint(text)
+    with Lock(repo):
+        d = load(repo)
+        for a in d["asks"].values():
+            if a["fp"] != fp: continue
+            if replay: return a["id"], True
+            if a["status"] == "verified": continue
+            a["repeats"] = a.get("repeats", 1) + 1
+            a.setdefault("seen", []).append({"ts": at or now(), "src": src})
+            if a["status"] == "declined":
+                a["status"] = "open"; a["closed"] = ""
+                a["notes"].append({"ts": now(), "msg": "asked again after it was declined — back on the "
+                                                       "queue, with the reason it was declined kept above"})
+            save(repo, d)
+            return a["id"], True
+        n = 1
+        while "a%d" % n in d["asks"]: n += 1
+        aid = "a%d" % n
+        d["asks"][aid] = {"id": aid, "text": text, "parts": parts_of(text), "fp": fp, "who": who,
+                          "src": src, "track": track, "done_when": done_when, "status": "open",
+                          "asked": at or now(), "repeats": 1, "evidence": "", "reason": "", "closed": "",
+                          "notes": []}
+        save(repo, d)
+        return aid, False
+
+
+def get(repo, aid):
+    a = load(repo)["asks"].get(aid)
+    if not a: sys.exit("cc-scope: %s has no ask '%s'" % (repo, aid))
+    return a
+
+
+def edit(repo, aid, fn):
+    with Lock(repo):
+        d = load(repo)
+        if aid not in d["asks"]: sys.exit("cc-scope: %s has no ask '%s'" % (repo, aid))
+        fn(d["asks"][aid]); save(repo, d)
+
+
+def select(repo, status=None, track=None, everything=False):
+    """No status named = the unsettled ones: what is still owed. A declined ask is settled — it is a decision
+    already taken, so it stops being work — but `--all` and `--status declined` still show it, with its reason."""
+    asks = sorted(load(repo)["asks"].values(), key=lambda a: a["asked"])
+    if not everything:
+        asks = [a for a in asks if (a["status"] == status if status else a["status"] not in SETTLED)]
+    if track: asks = [a for a in asks if a.get("track") == track]
+    return asks
+
+
+def line(repo, a, many=False):
+    flag = " ⚠ asked %d×" % a["repeats"] if a.get("repeats", 1) > 1 else ""
+    tail = " [%s]" % a["track"] if a.get("track") else ""
+    head = "%s/" % repo if many else ""
+    why = "\n       ⊘ %s" % a["reason"] if a["status"] == "declined" and a.get("reason") else ""
+    return "%s %s%-4s %s%s%s%s" % (MARK.get(a["status"], "?"), head, a["id"], a["text"][:96], tail, flag, why)
+
+
+# ---- capture ---------------------------------------------------------------------------------------
+TAG = re.compile(r"<channel\s([^>]*)>", re.S)
+ATTR = re.compile(r'(\w+)="([^"]*)"')
+
+
+def strip_tag(text):
+    """Slack arrives wrapped in a <channel …> tag. Returns (body, attrs) — the tag carries who is speaking
+    (role=owner|member) and where, both of which decide whether this is an owner ask and how to cite it."""
+    m = TAG.search(text)
+    if not m: return text.strip(), {}
+    attrs = dict(ATTR.findall(m.group(1)))
+    body = (text[:m.start()] + text[m.end():])
+    body = re.sub(r"</channel>", "", body).strip()
+    return body, attrs
+
+
+def log_seen(repo, decision, text, src):
+    try:
+        os.makedirs(SCOPE, exist_ok=True)
+        p = os.path.join(SCOPE, SEEN)
+        with open(p, "a") as f:
+            f.write("%s\t%s\t%s\t%s\t%s\n" % (now(), repo, decision, src or "-",
+                                              " ".join(text.split())[:160]))
+        with open(p) as f: lines = f.readlines()
+        if len(lines) > SEEN_KEEP * 2:                      # trim in batches, not on every write
+            with open(p + ".tmp", "w") as f: f.writelines(lines[-SEEN_KEEP:])
+            os.replace(p + ".tmp", p)
+    except OSError: pass
+
+
+# The Slack path: a channel message reaches the session as a user turn, so the UserPromptSubmit hook sees it
+# with its <channel …> tag intact and `capture` takes the rest from there — no hook inside cc-slack. If a
+# delivery ever bypasses that turn, one line in cc-slack's deliver() closes the gap and nothing else changes:
+#   subprocess.run([f"{BIN}/cc-scope", "capture", repo, "--src", f"slack {chan} {thread_ts}"], input=text, text=True)
+def capture(repo, text, who="owner", src=""):
+    body, attrs = strip_tag(text)
+    if attrs:
+        if attrs.get("role") and attrs["role"] != "owner":
+            log_seen(repo, "skip:not-owner", body, src); return None, False   # the ledger is the OWNER's asks
+        who = attrs.get("user") or who
+        if not src and attrs.get("channel"):
+            src = "slack %s %s" % (attrs["channel"], attrs.get("thread_ts") or attrs.get("ts") or "")
+    if not is_ask(body):
+        log_seen(repo, "skip:no-directive", body, src); return None, False
+    aid, repeated = add(repo, body, who=who, src=src.strip())
+    log_seen(repo, "kept:%s%s" % (aid, "+" if repeated else ""), body, src)
+    return aid, repeated
+
+
+def repo_of(cwd):
+    """A session's repo from its cwd: ~/dev/<repo> or ~/.cc/worktrees/<repo>/<track>."""
+    cwd = os.path.realpath(cwd or "")
+    for base, depth in ((os.path.join(HOME, "dev"), 1), (os.path.join(HOME, ".cc", "worktrees"), 1)):
+        base = os.path.realpath(base)
+        if cwd == base or cwd.startswith(base + os.sep):
+            rest = cwd[len(base):].strip(os.sep).split(os.sep)
+            if rest and rest[0]: return rest[0]
+    return ""
+
+
+def worker_cwd(cwd):
+    """A track worktree (marker .cc/track) is a WORKER: its prompts are the task it was dispatched with,
+    not asks the owner made. Same marker cc-guard walks, for the same reason — the marker is the truth."""
+    d = os.path.realpath(cwd or "")
+    while d and d != "/":
+        if os.path.exists(os.path.join(d, ".cc", "track")): return True
+        d = os.path.dirname(d)
+    return False
+
+
+def hook():
+    """UserPromptSubmit. Prints NOTHING (stdout would land in the session's context) and always exits 0:
+    a ledger that can break a session is worse than no ledger."""
+    try:
+        payload = json.load(sys.stdin)
+        text = payload.get("prompt") or ""
+        cwd = payload.get("cwd") or os.getcwd()
+        if not text.strip(): return
+        _, attrs = strip_tag(text)
+        if not attrs:                                        # no channel tag: a prompt typed into the session
+            if os.environ.get("CC_ROLE") in ("worker", "member") or worker_cwd(cwd): return
+        repo = repo_of(cwd) or os.environ.get("CC_REPO") or "box"
+        src = "slack" if attrs else "terminal %s" % (payload.get("session_id") or "")[:8]
+        capture(repo, text, src="" if attrs else src)
+    except Exception: pass
+
+
+# ---- commands --------------------------------------------------------------------------------------
+def opt(args, name, default=""):
+    if name in args:
+        i = args.index(name)
+        v = args[i + 1] if len(args) > i + 1 else ""
+        del args[i:i + 2]
+        return v
+    return default
+
+
+def flag(args, name):
+    if name in args: args.remove(name); return True
+    return False
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"): sys.exit(__doc__)
+    cmd, args = argv[0], list(argv[1:])
+    js = flag(args, "--json")
+
+    if cmd == "add":
+        repo, text = args[0], args[1]
+        aid, rep = add(repo, text, who=opt(args, "--who", "owner"), src=opt(args, "--src"),
+                       track=opt(args, "--track"), done_when=opt(args, "--done-when"),
+                       at=opt(args, "--at"))
+        print("%s %s%s" % (repo, aid, " (asked again)" if rep else ""))
+
+    elif cmd == "capture":
+        repo = args[0]
+        aid, rep = capture(repo, sys.stdin.read(), who=opt(args, "--who", "owner"), src=opt(args, "--src"))
+        print("%s %s" % (repo, aid + (" (asked again)" if rep else "")) if aid else "not an ask (logged)")
+
+    elif cmd == "list":
+        status, track, everything = opt(args, "--status") or None, opt(args, "--track") or None, flag(args, "--all")
+        rs = [args[0]] if args else repos()
+        rows = [(r, a) for r in rs for a in select(r, status, track, everything)]
+        if js: print(json.dumps([a for _, a in rows], indent=2)); return
+        if not rows: print("no asks" if everything else "nothing %s" % (status or "unsettled")); return
+        for r, a in rows: print(line(r, a, many=len(rs) > 1))
+
+    elif cmd == "show":
+        a = get(args[0], args[1])
+        print("%s %s [%s]%s" % (args[0], a["id"], a["status"],
+                                "  ⚠ asked %d×" % a["repeats"] if a.get("repeats", 1) > 1 else ""))
+        print("  asked   %s by %s%s" % (a["asked"], a["who"], "  (%s)" % a["src"] if a["src"] else ""))
+        if a.get("track"):     print("  track   %s" % a["track"])
+        if a.get("done_when"): print("  done when %s" % a["done_when"])
+        if a.get("reason"):    print("  declined because %s" % a["reason"])
+        print("  %s" % a["text"])
+        for p in a.get("parts", []): print("    – %s" % p)
+        for s in a.get("seen", []): print("  again   %s %s" % (s["ts"], s.get("src", "") or "-"))
+        if a["evidence"]: print("  evidence %s%s" % (a["evidence"], "  (%s)" % a["closed"] if a["closed"] else ""))
+        for n in a["notes"]: print("  note    %s %s" % (n["ts"], n["msg"]))
+
+    elif cmd in ("claim", "deliver", "verify", "declined", "decline", "done", "drop"):
+        state = {"claim": "claimed", "deliver": "delivered", "verify": "verified", "done": "verified",
+                 "decline": "declined", "declined": "declined", "drop": "declined"}[cmd]
+        repo, aid = args[0], args[1]
+        track, ev, why = opt(args, "--track"), opt(args, "--evidence"), opt(args, "--why")
+        if state == "delivered" and not ev:
+            sys.exit("cc-scope: deliver needs --evidence — an ask is not built by saying so")
+        if state == "verified" and not (ev or load(repo)["asks"].get(aid, {}).get("evidence")):
+            sys.exit("cc-scope: verify needs --evidence — name what proves it (a PR, a commit, the file it "
+                     "now lives in), or deliver it with the evidence first")
+        if state == "declined" and not why:   # the reason IS the decision: without one this is a drop, and a drop
+            sys.exit("cc-scope: decline needs --why — a decline without a reason is the drop this ledger exists "
+                     "to catch. Say, in your own words, why it should not be built.")
+        def upd(a):
+            a["status"] = state
+            if track: a["track"] = track
+            if ev: a["evidence"] = ev
+            if why: a["reason"] = why
+            a["closed"] = now() if state in SETTLED else ""
+        edit(repo, aid, upd)
+        print("%s %s %s" % (repo, aid, state))
+
+    elif cmd == "track":
+        edit(args[0], args[1], lambda a: a.update(track=args[2])); print("%s %s → %s" % tuple(args[:3]))
+
+    elif cmd == "note":
+        edit(args[0], args[1], lambda a: a["notes"].append({"ts": now(), "msg": args[2]}))
+        print("%s %s noted" % (args[0], args[1]))
+
+    elif cmd == "check":          # 'done' measured against the asks: exit 1 while anything is still open
+        repo = args[0]; track = opt(args, "--track") or None
+        open_ = select(repo, None, track)
+        where = " for %s" % track if track else ""
+        if not open_: print("cc-scope: nothing unsettled%s" % where); return 0
+        print("cc-scope: %d unsettled ask(s)%s — each one is verified against evidence "
+              "(`cc-scope verify %s <id> --evidence \"PR #64\"`) or declined with a reason "
+              "(`cc-scope decline %s <id> --why \"…\"`). Leaving it is the one thing that is not a decision:"
+              % (len(open_), where, repo, repo))
+        for a in open_: print("  " + line(repo, a))
+        return 1
+
+    elif cmd in ("count", "digest"):
+        rs = [args[0]] if args else repos()
+        n = sum(len(select(r)) for r in rs)
+        again = sum(1 for r in rs for a in select(r) if a.get("repeats", 1) > 1)
+        if cmd == "count": print(n); return
+        if n: print("• 📋 %d ask%s of yours still open%s" % (n, "" if n == 1 else "s",
+                                              " (%d asked more than once)" % again if again else ""))
+
+    elif cmd == "missed":
+        since = float(opt(args, "--since", "24")) * 3600
+        repo = args[0] if args else None
+        cut = time.time() - since
+        try: rows = open(os.path.join(SCOPE, SEEN)).read().splitlines()
+        except OSError: rows = []
+        out = []
+        for r in rows:
+            f = r.split("\t")
+            if len(f) < 5 or not f[2].startswith("skip"): continue
+            if repo and f[1] != repo: continue
+            try:
+                if calendar.timegm(time.strptime(f[0], "%Y-%m-%dT%H:%M:%SZ")) < cut: continue
+            except ValueError: continue
+            out.append("  %s %s  %s" % (f[0], f[1], f[4]))
+        print("owner messages the classifier did not open an ask for (last %gh):" % (since / 3600) if out
+              else "nothing skipped in the last %gh" % (since / 3600))
+        for o in out[-40:]: print(o)
+
+    elif cmd == "import":         # seed/replay: <at>TAB<src>TAB<track>TAB<status>TAB<evidence>TAB<text>
+        repo, f = args[0], args[1]
+        n = new = 0
+        for raw in open(f):
+            raw = raw.rstrip("\n")
+            if not raw.strip() or raw.lstrip().startswith("#"): continue
+            c = raw.split("\t")
+            if len(c) < 6: sys.exit("cc-scope import: 6 tab-separated columns expected, got %d: %s" % (len(c), raw[:60]))
+            at, src, track, status, ev, text = [x.strip() for x in c[:6]]
+            aid, rep = add(repo, text, src=src, track=track, at=at, replay=True)
+            n += 1; new += 0 if rep else 1
+            if status and status != "open":
+                if status not in STATES: sys.exit("cc-scope import: '%s' is not one of %s" % (status, "/".join(STATES)))
+                edit(repo, aid, lambda a, s=status, e=ev: a.update(   # no `closed` on a backfill: when it was
+                    status=s, **({"reason": e} if s == "declined" else {"evidence": e})))   # settled is not recorded
+        print("cc-scope: imported %d ask(s) into %s (%d new)" % (n, repo, new))
+
+    elif cmd == "hook":
+        hook()
+
+    elif cmd == "selfcheck":
+        return selfcheck()
+
+    else:
+        sys.exit(__doc__)
+    return 0
+
+
+# ---- selfcheck -------------------------------------------------------------------------------------
+def selfcheck():
+    global SCOPE
+    import tempfile, shutil
+    SCOPE = tempfile.mkdtemp(prefix="cc-scope-selfcheck-")
+    p = f = 0
+    def ok(n): nonlocal p; p += 1; print("  ✓ %s" % n)
+    def bad(n): nonlocal f; f += 1; print("  ✗ %s" % n)
+    def t(n, cond): ok(n) if cond else bad(n)
+    try:
+        R = "_scopetest"
+        t("an imperative is an ask", is_ask("add a scope ledger to the digest"))
+        t("a standing rule is an ask", is_ask("from now on lead with the TLDR"))
+        t("a complaint that names the fix is an ask", is_ask("the thread marks aren't working reliably, make them stick"))
+        t("a bare thanks is not an ask", not is_ask("thanks!"))
+        t("an ack with a few words is not an ask", not is_ask("ok cool, thanks a lot"))
+        t("a ! command is not an ask", not is_ask("!status"))
+        t("a plain question is not opened as an ask", not is_ask("how full is the context?"))
+        t("a compound ask keeps both parts",
+          len(parts_of("react with :ok_hand: in #approvals. this should also remove it from the board.")) == 2)
+
+        a1, rep = add(R, "make the digest show open asks", src="slack #demo 1788")
+        t("add opens an ask", a1 == "a1" and not rep)
+        a2, rep = add(R, "Make the digest   show open ASKS!", src="slack #demo 1799")
+        t("the same ask twice is one row with repeats=2", a2 == a1 and rep and get(R, a1)["repeats"] == 2)
+        t("check exits 1 while an ask is unsettled", quiet(["check", R]) == 1)
+        quiet(["claim", R, a1, "--track", "digest"])
+        t("a claimed ask is still work", get(R, a1)["status"] == "claimed" and quiet(["check", R]) == 1)
+        try:
+            quiet(["deliver", R, a1]); bad("deliver without evidence is refused")
+        except SystemExit as e: t("deliver without evidence is refused", "evidence" in str(e))
+        quiet(["deliver", R, a1, "--evidence", "PR #64"])
+        t("a delivered ask is still work until it is verified",
+          get(R, a1)["status"] == "delivered" and quiet(["check", R]) == 1)
+        quiet(["verify", R, a1])
+        t("verify inherits the evidence it was delivered with",
+          get(R, a1)["status"] == "verified" and get(R, a1)["evidence"] == "PR #64")
+        t("check exits 0 once nothing is unsettled", quiet(["check", R]) == 0)
+        a3, _ = add(R, "rewrite the whole box in rust")
+        try:
+            quiet(["verify", R, a3]); bad("verify without any evidence is refused")
+        except SystemExit as e: t("verify without any evidence is refused", "evidence" in str(e))
+
+        # A decline is a DECISION: it needs a reason, it leaves the queue, and it stays in the ledger.
+        try:
+            quiet(["decline", R, a3]); bad("decline without a reason is refused")
+        except SystemExit as e: t("decline without a reason is refused", "why" in str(e))
+        quiet(["decline", R, a3, "--why", "no reader would gain anything and the box would be down for a week"])
+        t("a declined ask stops counting as work", quiet(["check", R]) == 0)
+        t("a declined ask stays in the ledger with its reason",
+          get(R, a3)["status"] == "declined" and "down for a week" in get(R, a3)["reason"])
+        t("the reason is on the line you actually read",
+          "down for a week" in run_capture(["list", R, "--status", "declined"]))
+        t("a declined ask is not hidden by --all", a3 in run_capture(["list", R, "--all"]))
+
+        t("a replay matches any status and changes nothing",
+          add(R, "make the digest show open asks", replay=True) == (a1, True) and get(R, a1)["repeats"] == 2)
+        quiet(["decline", R, a3, "--why", "still no"]) if get(R, a3)["status"] != "declined" else None
+        a4, rep4 = add(R, "rewrite the whole box in rust")
+        t("asked again after a decline, it is back on the queue with the reason kept",
+          a4 == a3 and rep4 and get(R, a3)["status"] == "open" and "down for a week" in get(R, a3)["reason"])
+        quiet(["decline", R, a3, "--why", "same answer as before"])
+        a5, rep5 = add(R, "make the digest show open asks")
+        t("asked again after it was verified, it is a NEW row — that is a regression, not a repeat",
+          a5 != a1 and not rep5)
+        quiet(["decline", R, a5, "--why", "fixture"])
+
+        add(R, "always run the gates before a PR", track="gates")
+        t("check --track only measures that track's asks", quiet(["check", R, "--track", "nope"]) == 0)
+        t("check --track sees its own", quiet(["check", R, "--track", "gates"]) == 1)
+
+        aid, _ = capture(R, '<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.2" '
+                            'user="ada.byron" role="owner" channel="#demo">\nplease put the open asks on Home',
+                         src="")
+        t("an owner Slack message is captured with its thread as the source",
+          aid and get(R, aid)["src"].startswith("slack #demo 17.1"))
+        t("a member's message is not an owner ask",
+          capture(R, '<channel source="cc-slack" role="member" channel="#help" user="sam">fix the printer')[0] is None)
+        t("a skipped message is still logged, so a miss can be found",
+          "skip:not-owner" in open(os.path.join(SCOPE, SEEN)).read())
+
+        t("the hook is silent on a worker's own task prompt", capture_worker_silent())
+        n = int(run_capture(["count", R]))
+        t("count is the number of unsettled asks", n == len(select(R)))
+        t("digest says nothing when nothing is open", run_capture(["digest", "_empty"]).strip() == "")
+    finally:
+        shutil.rmtree(SCOPE, ignore_errors=True)
+    print("== cc-scope selfcheck: %d passed, %d failed ==" % (p, f))
+    return 1 if f else 0
+
+
+def quiet(argv):
+    """main() with its stdout swallowed — the selfcheck asserts on exit codes, not on the printed report."""
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf): return main(argv) or 0
+
+
+def run_capture(argv):
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf): main(argv)
+    return buf.getvalue()
+
+
+def capture_worker_silent():
+    """The hook must ignore a track worktree — cc dispatches workers by writing their task into the prompt."""
+    import tempfile, shutil, io, contextlib
+    d = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(d, ".cc")); open(os.path.join(d, ".cc", "track"), "w").write("r\nt\n")
+        payload = json.dumps({"prompt": "build the ledger and open a PR", "cwd": d, "session_id": "x"})
+        old = sys.stdin; sys.stdin = io.StringIO(payload)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): hook()
+        sys.stdin = old
+        return buf.getvalue() == "" and not os.path.exists(path(repo_of(d) or "box"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]) or 0)
+    except IndexError: sys.exit(__doc__)
+    except BrokenPipeError: sys.exit(0)

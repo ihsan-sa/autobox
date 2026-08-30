@@ -458,6 +458,10 @@ pub >/dev/null 2>&1
 [ "$(git -C "$PUB" rev-parse main)" = "$was" ] && ok "only origin's default branch is published — local, unpushed work is not" || bad "unpushed work reached the public repo"
 git reset -q --hard origin/main
 env CC_PUBLISH_STATE="$T" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE= PUBLISH_REPO=$REPO "$B/cc-publish" status 2>&1 | grep -q "publish: off" && ok "no PUBLISH_REMOTE: publishing is simply off (a bare clone never publishes)" || bad "unconfigured publish is not off"
+echo "== ask ledger (cc-scope) =="
+# The ledger has no fixtures to build: its selfcheck works in a temp dir of its own and removes it on the way out.
+sc=$("$B/cc-scope" selfcheck 2>&1)
+grep -q "0 failed" <<<"$sc" && ok "cc-scope selfcheck: $(tail -1 <<<"$sc")" || bad "cc-scope selfcheck: $(tail -1 <<<"$sc")"
 cd ~ || exit 1
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
