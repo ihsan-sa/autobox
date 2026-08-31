@@ -65,7 +65,8 @@ when the work is finished — a plain reply is "handled", not
 with `cc quick doing "…"` / `cc quick done "…"` so the Home tab lists it while it runs.
 App Home: the daemon republishes a whole-box dashboard into the owner's Home tab every 30 s and on app_home_opened —
 one views.publish, never a message. What is RUNNING and what NEEDS YOU sit above the fold; the backlog, the board-view
-buttons, the channels, the load, the handoff count, the audit and the boot line sit below it. NEEDS YOU and the backlog
+buttons, the channels, ONE CHART OF THE BOX'S VITALS OVER 24 H (cc-vitals draws the PNG; it is uploaded once per
+redraw and the same file id is reused by every republish), the load, the handoff count, the audit and the boot line sit below it. NEEDS YOU and the backlog
 print EVERY row — they are the two lists the tab exists for. Up to three buttons sit above the fold and three board
 views below, and every one of them is gated on the owner's user id (a Home tab is per-user, so a button is not a
 permission); an accepted press is logged as well as a refused one. Needs home_tab_enabled, the
@@ -73,7 +74,7 @@ app_home_opened bot event and interactivity in core/slack/app-manifest.json (re-
 two it logs one line and gives up until restart.
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
 """
-import collections, contextlib, fcntl, glob, json, os, re, socket, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
+import collections, contextlib, fcntl, glob, hashlib, io, json, os, re, socket, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 CFG = f"{HOME}/.cc/config"
@@ -937,6 +938,27 @@ HOME_MAXBLK, HOME_MAXTEXT = 18, 2900           # OUR budget for one published vi
                                                # all of all three costs 0 blocks. What DID cost two is the channels
                                                # band now rendering when nothing in it is busy (quiet, degraded).
 HOME_MARKS = ("❓", "🔴", "🔧")                 # the channel rows count only live threads: needs you · owed · working (🟠/✅ are history)
+# ── THE CHART ON THE TAB (owner, a18/a20: "a graph of system resources … one chart with everything", ON THE HOME
+#    PAGE). cc-vitals draws it; everything here is about getting a LOCAL PNG onto a view Slack renders.
+#    WHAT SLACK ALLOWS, established by probe 2026-08-31 against the real workspace, because the docs do not say it:
+#      · an `image` block on a home view takes `slack_file:{id}` — but the file must be SHARED somewhere first.
+#        An unshared upload (completeUploadExternal with no channel_id) is refused: `invalid slack file`.
+#      · sharing is NOT instant. For a few seconds after the upload files.info still reports `shares:{}` and the
+#        publish is still refused; it becomes valid on its own. So a new file is used only once it VERIFIES.
+#      · the id is then reusable for as long as the file lives. THIS IS THE WHOLE DESIGN: the tab republishes every
+#        5 s and re-uploads NOTHING. A new upload happens only when the picture's bytes actually change.
+#    Where the bytes go: a private channel whose only member is the bot (VITALS_STORE). The owner is not in it and
+#    never sees it — publishing the view is what silently shares the file with them. Uploading into a channel they
+#    read would post one image message per redraw, which is exactly the noise a dashboard must not make.
+VITALS_DIR = os.environ.get("CC_VITALS_DIR") or f"{HOME}/.cc/state/vitals"
+VITALS_STORE = "cc-vitals-store"               # bot-only private channel: the box's own picture store, not a channel for people
+VITALS_EVERY = 300                             # how often the picture is REDRAWN and (if it changed) re-uploaded. A 24 h chart
+                                               # moves ~0.3 % in five minutes, so this is honest; it is also 12 uploads an hour
+                                               # against a views.publish cadence of 5 s, i.e. the tab costs no upload at all.
+VITALS_STALE = 900                             # older than this and the tab SAYS how old the drawing is (3 missed redraws).
+                                               # A picture that cannot say it is old is worse than no picture: current.png
+                                               # sat four hours behind the data on 2026-08-31 and the tab would have lied.
+VITALS_TIMEOUT = 60                            # a wedged renderer must never hold the dashboard thread
 # ── THE ONE VOCABULARY (handoff §02). A track has exactly one state, and BOTH its emoji and the word printed beside it
 #    come out of this row — so they can never disagree again. Everywhere else on the tab an emoji means one thing and
 #    only that: ❓ waiting on the owner (a thread, or a PR owed a 👍) · 🔧 work with no track · 🔴 a unit down ·
@@ -959,7 +981,11 @@ HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and
                                                # HOME_SLICE: rows one board-view button DMs before it says how many more.
 HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT, HOME_BTN = 40, 24, 26, 180, 18   # phone widths: a line · a track name · an ask · the audit · a button label
 HOME_DEPTH = 4                                 # deepest sub-channel indent the phone column takes; deeper nests flatten to it
-HOME_CUT = ("boot", "handoffs", "audit", "channels", "backlog", "views")   # …and the order they go in when even that does not fit (§01d)
+HOME_CUT = ("boot", "handoffs", "audit", "chart", "channels", "backlog", "views")   # …and the order they go in when even
+                                               # that does not fit (§01d). The chart goes after the grey one-liners and before
+                                               # the channels: it is 2 blocks, the most a single cut can free, and the `load`
+                                               # line under it carries the same numbers in words. A tab that dropped RUNNING
+                                               # to keep a picture would have failed at its job.
 HOME_ACT = ("restart_unit", "open_channel", "open_board", "next_track", "home_logs",
             "board_todo", "board_running", "board_done")   # Home buttons that reach the daemon
 HOME_VIEWS = (("board_todo", "To do", ("queued",)), ("board_running", "Running", ("running",)),
@@ -1368,7 +1394,12 @@ def home_parts(st):
         p += [("channels", _home_ctx("CHANNELS")),
               ("channels", _home_sec(home_list(lines, lambda k: f"_+{k} more channels_", HOME_MAXTEXT)))]
 
-    # 8-10 — grey, one line each, and the first things to go when the tab will not fit
+    # 8 — THE CHART, and directly under it the same vitals as numbers. The picture is what the owner asked for
+    #     (a18/a20) and the line is what stays true when there is no picture: they sit together, below the fold,
+    #     because neither of them answers "does this need me?".
+    p += home_chart_blocks(st.get("chart"))
+
+    # 9-11 — grey, one line each, and the first things to go when the tab will not fit
     p.append(("load", _home_ctx(st.get("load") or "")))
     hnd, hn = st.get("handoffs") or {}, int(_home_num((st.get("handoffs") or {}).get("today")))
     if hn:                                                   # how often sessions ran out of context today; zero is silent
@@ -1384,8 +1415,8 @@ def home_parts(st):
 
 
 def home_cut(parts, maxblk=HOME_MAXBLK):
-    """Over budget, things go in the owner's order (§01d): the boot line, then the audit, then the channels, then the
-    backlog. What is RUNNING and the NEEDS YOU band are never cut — they are the two questions the tab exists to answer,
+    """Over budget, things go in the owner's order (§01d): the boot line, then the audit, then the CHART, then the
+    channels, then the backlog. What is RUNNING and the NEEDS YOU band are never cut — they are the two questions the tab exists to answer,
     and a tab that drops them to make room for the audit paragraph has failed at its whole job."""
     out = list(parts)
     for tag in HOME_CUT:
@@ -1528,6 +1559,32 @@ def home_load(now=None):
         h = float(up) / 3600
         out.append(f"⏱ up {h / 24:.1f}d" if h >= 48 else f"⏱ up {h:.1f}h")
     return "   ·   ".join(out)
+
+
+def home_chart_line(chart, now=None):
+    """PURE: the one grey line under the picture — what it covers, and HOW OLD THE DRAWING IS whenever it is not
+    fresh. A chart with no age on it is a chart that claims to be `now`, which is the exact failure this feature
+    was written after (current.png four hours behind current.txt, and nothing on the tab said so)."""
+    if not chart:
+        return ""
+    drawn = float(chart.get("drawn") or 0)
+    age = max(0, int((now or time.time()) - drawn))
+    when = "" if not drawn else "" if age < VITALS_STALE else f"⚠ drawn {home_age(age)} ago"
+    bits = [chart.get("covers") or "", when or ("⚠ age unknown" if not drawn else "")]
+    return " · ".join(x for x in bits if x)
+
+
+def home_chart_blocks(chart):
+    """PURE: the chart bands, or nothing at all. Nothing at all is a legitimate answer — no recorder yet, a render
+    that failed, an upload Slack refused — and it must cost the rest of the tab NOTHING (see publish_home)."""
+    if not chart or not chart.get("file"):
+        return []
+    out = [("chart", {"type": "image", "alt_text": chart.get("alt") or "the box's vitals, last 24h",
+                      "slack_file": {"id": chart["file"]}})]
+    line = home_chart_line(chart)
+    if line:
+        out.append(("chart", _home_ctx(line)))
+    return out
 
 
 def home_workers():
@@ -1698,6 +1755,7 @@ class Daemon:
         self.presence, self.presence_at, self.away_since = None, 0.0, 0.0   # is the owner's Slack open? (users.getPresence, every PRESENCE_EVERY s)                              # chats that answered not_in_channel / is_archived — never swept or nudged again
         self.pair_code = None
         self.home_chans, self.home_prs, self.home_slow_at, self.home_slow_busy, self.home_off, self.home_fails = [], {}, 0.0, False, False, 0   # App Home dashboard
+        self.chart, self.chart_sig, self.chart_at, self.chart_busy, self.chart_store = {}, "", 0.0, False, ""   # the vitals picture on the tab
         self.t0 = time.time()
         self.connected = False
 
@@ -3740,6 +3798,9 @@ class Daemon:
         if time.time() - self.home_slow_at > HOME_SLOW and not self.home_slow_busy:
             self.home_slow_busy = True
             threading.Thread(target=self._safe, args=(self.home_slow_refresh,), daemon=True).start()
+        if time.time() - self.chart_at > VITALS_EVERY and not self.chart_busy:
+            self.chart_busy = True                           # the picture redraws itself, off this thread (chart_refresh)
+            threading.Thread(target=self._safe, args=(self.chart_refresh,), daemon=True).start()
         wins, chans, orchs = cached("wins", HOME_CACHE, home_windows), [], cached("orchs", HOME_CACHE, load_orchs)
         waits, now = [], time.time()
         known = self.home_chans or sorted((c, self.names.get(c, c)) for c in     # before the first refresh: what we already know
@@ -3778,7 +3839,85 @@ class Daemon:
                 "tracks": tracks, "last": last, "waits": waits,
                 "quick": cached("quick", HOME_CACHE, home_quick),
                 "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
-                "audit_at": audit_at, "audit": verdict, "boot": boot}
+                "audit_at": audit_at, "audit": verdict, "boot": boot, "chart": self.chart}
+
+    def chart_store_id(self):
+        """The bot-only private channel the pictures live in, made once and remembered. It exists so an upload can
+        be SHARED (Slack refuses an unshared file in an image block) without any human being shown anything."""
+        if self.chart_store:
+            return self.chart_store
+        tok = self.cfg["SLACK_BOT_TOKEN"]
+        try:
+            self.chart_store = api("conversations.create", tok, name=VITALS_STORE, is_private="true")["channel"]["id"]
+        except Exception as e:
+            if "name_taken" not in str(e):
+                raise
+            self.chart_store = next((c["id"] for c in api("conversations.list", tok, types="private_channel",
+                                                          exclude_archived="true", limit="1000").get("channels") or ()
+                                     if c.get("name") == VITALS_STORE), "")
+            if not self.chart_store:
+                raise RuntimeError(f"#{VITALS_STORE} exists but this app is not in it — invite the app, or archive it")
+        return self.chart_store
+
+    def chart_upload(self, png, title):
+        """Upload one drawing and return its file id ONCE SLACK WILL ACCEPT IT IN A VIEW. The wait is the point:
+        for a few seconds after completeUploadExternal the file is not yet shared and views.publish refuses it, so
+        handing the id straight to the tab would publish a broken block. Returns "" if it never verifies."""
+        tok = self.cfg["SLACK_BOT_TOKEN"]
+        up = api("files.getUploadURLExternal", tok, filename="vitals.png", length=str(len(png)))
+        with urllib.request.urlopen(urllib.request.Request(up["upload_url"], data=png, method="POST"), timeout=60) as r:
+            r.read()
+        fid = api("files.completeUploadExternal", tok, channel_id=self.chart_store_id(),
+                  files=json.dumps([{"id": up["file_id"], "title": title}]))["files"][0]["id"]
+        for _ in range(10):                                  # ~3 s in practice; a share that never lands is not our file
+            time.sleep(2)
+            try:
+                if (api("files.info", tok, file=fid).get("file") or {}).get("shares"):
+                    return fid
+            except Exception:
+                pass
+        log(f"app home: chart {fid} never became shareable — leaving the tab's picture as it was")
+        return ""
+
+    def chart_refresh(self):
+        """Redraw the picture, and upload it ONLY if the bytes changed. Runs on its own thread every VITALS_EVERY s:
+        never in the publish path (matplotlib is not something a 5 s dashboard loop may wait for), and never relying
+        on the recorder to have drawn it — the recorder is a long-lived process that may be running older code, which
+        is exactly how current.png ended up four hours behind the data it was drawn from."""
+        if not os.path.exists(f"{BIN}/cc-vitals"):
+            self.chart_at, self.chart_busy = time.time(), False
+            return                                           # a box with no recorder simply has no picture, and says nothing
+        try:
+            subprocess.run([f"{BIN}/cc-vitals", "render", "--backend", "auto", "--if-stale", str(VITALS_EVERY)],
+                           capture_output=True, timeout=VITALS_TIMEOUT)
+            png = open(f"{VITALS_DIR}/current.png", "rb").read()
+            spec = json.load(open(f"{VITALS_DIR}/current.json"))
+            drawn = os.path.getmtime(f"{VITALS_DIR}/current.png")
+            covers = (f"vitals · last {spec.get('window_h', 24):g}h · {spec.get('minutes', 0)} of "
+                      f"{spec.get('n', 0)} minutes recorded"
+                      + (f" · {spec['gaps']} missing" if spec.get("gaps") else ""))
+            sig = hashlib.sha256(png).hexdigest()
+            if sig == self.chart_sig and self.chart.get("file"):
+                self.chart = dict(self.chart, drawn=drawn, covers=covers)   # same picture: keep the id, upload NOTHING
+                return
+            if not (self.use_slack and self.cfg.get("SLACK_BOT_TOKEN")):
+                return
+            fid = self.chart_upload(png, f"box vitals {time.strftime('%H:%MZ', time.gmtime(drawn))}")
+            if not fid:
+                return
+            was = self.chart.get("file")
+            self.chart, self.chart_sig = {"file": fid, "drawn": drawn, "covers": covers,
+                                          "alt": f"one chart of the box's vitals — {covers}"}, sig
+            self.home_dirty = True                           # the picture changed: show it on the next tick, not in 30 s
+            if was:                                          # exactly one drawing in the workspace, never a pile
+                try:
+                    api("files.delete", self.cfg["SLACK_BOT_TOKEN"], file=was)
+                except Exception as e:
+                    log(f"app home: could not delete the previous chart {was} ({e})")
+        except Exception as e:
+            log(f"app home: chart refresh failed ({e!r}) — the tab keeps the picture it has")
+        finally:
+            self.chart_at, self.chart_busy = time.time(), False
 
     def home_slow_refresh(self):
         """Background thread: the two dashboard inputs that cost a network call. A failure just leaves the last values in place."""
@@ -3891,12 +4030,18 @@ class Daemon:
         if not (self.use_slack and self.cfg.get("SLACK_OWNER_ID") and self.cfg.get("SLACK_BOT_TOKEN")):
             return
         try:
-            view = json.dumps({"type": "home", "blocks": home_blocks(self.home_state())})   # a local failure here is a bug, not a Slack refusal
+            st = self.home_state()
+            view = json.dumps({"type": "home", "blocks": home_blocks(st)})   # a local failure here is a bug, not a Slack refusal
         except Exception as e:
             log(f"app home: state/blocks failed ({e!r})"); return
         try:
             api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"], view=view)
         except Exception as e:
+            # HOME NEVER BREAKS BECAUSE A PICTURE FAILED. A file Slack has since deleted, or one that stopped being
+            # shared, fails the WHOLE view — so drop the image and publish the dashboard anyway. The dropped file is
+            # forgotten, so the next chart_refresh uploads a fresh one instead of retrying a dead id forever.
+            if st.get("chart") and self.retry_without_chart(st):
+                return
             if "ratelimited" in str(e):
                 # Slack said slow down: drop out of the fast cadence for a minute, however active the owner looks
                 self.home_burst_until, self.presence, self.away_since = 0.0, None, 0.0
@@ -3908,6 +4053,19 @@ class Daemon:
                     "app_home_opened + interactivity, which the Home buttons need), then Reinstall")
         else:
             self.home_fails = 0
+
+    def retry_without_chart(self, st):
+        """One re-publish with the picture removed. True when the dashboard got through without it — the failure was
+        the image, the owner still has their tab, and nothing counts against the three-strikes home_off backoff."""
+        try:
+            blocks = home_blocks(dict(st, chart=None))
+            api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"],
+                view=json.dumps({"type": "home", "blocks": blocks}))
+        except Exception:
+            return False                                     # not the picture's fault: fall through to the real handler
+        log(f"app home: Slack refused the chart ({self.chart.get('file')}) — published without it, redrawing next tick")
+        self.chart, self.chart_sig, self.chart_at, self.home_fails = {}, "", 0.0, 0
+        return True
 
     def run(self):
         self.single_instance()
@@ -6652,7 +6810,10 @@ def cmd_selfcheck():
 
     def hbudget(bs):
         btns = [e for b in bs if b["type"] == "actions" for e in b["elements"]]
-        return (len(bs) <= HOME_MAXBLK and all(b["type"] in ("header", "context", "section", "divider", "actions") for b in bs)
+        return (len(bs) <= HOME_MAXBLK
+                and all(b["type"] in ("header", "context", "section", "divider", "actions", "image") for b in bs)
+                and all(b.get("alt_text") and (b.get("slack_file") or b.get("image_url"))    # an image block Slack will take
+                        for b in bs if b["type"] == "image")
                 and not any(b.get("fields") for b in bs) and all(len(t) <= 3000 for t in htexts(bs))
                 and all(len(b["elements"]) <= 3 for b in bs if b["type"] == "actions")
                 and all(len(e["text"]["text"]) <= HOME_BTN for e in btns)
@@ -6890,6 +7051,93 @@ def cmd_selfcheck():
           and "views" not in hcut(8)
           and all(t in hcut(8) for t in ("head", "tally", "needs", "actions")) and len(hcut(8)) == 8
           and all(t in hcut(6) for t in ("head", "tally", "needs")))
+    # ── THE CHART ON THE TAB (owner a18/a20: "a graph of system resources … on the main home page"). Two blocks, below
+    #    the fold, sitting on top of the `load` line that says the same numbers in words.
+    hchart = {"file": "F1", "drawn": 1000.0, "covers": "vitals · last 24h · 118 of 1440 minutes recorded",
+              "alt": "one chart of the box's vitals"}
+    hcb = home_blocks(dict(hfix, chart=hchart))
+    himg = [b for b in hcb if b["type"] == "image"]
+    check("the published view CONTAINS THE CHART: one image block referencing the uploaded Slack file, with alt text, "
+          "and the grey line under it saying what the picture covers — this, and not a renderable PNG, is the ask",
+          len(himg) == 1 and himg[0]["slack_file"] == {"id": "F1"} and himg[0]["alt_text"]
+          and "118 of 1440 minutes" in json.dumps(hcb, ensure_ascii=False)
+          and hbudget(hcb) and hno_empty_header(hcb) and len(hcb) == len(hb) + 2)
+    check("HOW OLD THE DRAWING IS is visible the moment it is not fresh, and silent while it is — a picture that "
+          "cannot say it is stale is worse than no picture (current.png sat 4 h behind the data on 2026-08-31)",
+          "⚠" not in home_chart_line(hchart, now=1000.0 + VITALS_STALE - 1)
+          and home_chart_line(hchart, now=1000.0 + 1200).endswith("⚠ drawn 20m ago")
+          and "⚠ drawn" in json.dumps(home_blocks(dict(hfix, chart=dict(hchart, drawn=time.time() - 3600))),
+                                      ensure_ascii=False)
+          and home_chart_line({}) == "" and home_chart_line(None) == ""
+          # …and a drawing with no timestamp says so, instead of claiming to be 56 years old or claiming to be now
+          and home_chart_line({"covers": "c"}) == "c · ⚠ age unknown")
+    check("no picture is a legitimate answer — no recorder yet, a render that failed, an upload Slack refused: the "
+          "chart bands simply do not render and the REST OF THE TAB IS UNTOUCHED",
+          home_chart_blocks(None) == [] and home_chart_blocks({}) == [] and home_chart_blocks({"drawn": 1}) == []
+          and home_blocks(dict(hfix, chart=None)) == hb and home_blocks(dict(hfix, chart={})) == hb)
+
+    #    …and the daemon half: the picture is redrawn on a timer, and uploaded ONLY when its bytes changed.
+    dmV = Daemon(use_slack=False); dmV.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    dmV.use_slack, dmV.chart_store = True, "CSTORE"
+    vt, _apiV = tempfile.mkdtemp(prefix="cc-slack-vit-"), globals()["api"]
+    vcalls, vput = [], []
+    def apiV(method, token, **kw):
+        vcalls.append(method)
+        if method == "files.getUploadURLExternal":
+            return {"upload_url": "https://files.slack.test/up", "file_id": f"F{len(vcalls)}"}
+        if method == "files.completeUploadExternal":
+            return {"files": [{"id": json.loads(kw["files"])[0]["id"]}]}
+        if method == "files.info":
+            return {"file": {"shares": {"private": {"CSTORE": [{"ts": "1.1"}]}}}}
+        return {"ok": True}
+    try:
+        globals()["api"] = apiV
+        globals()["VITALS_DIR"] = vt
+        _open, _sleep = urllib.request.urlopen, time.sleep
+        urllib.request.urlopen = lambda req, timeout=None: contextlib.closing(io.BytesIO(b""))
+        time.sleep = lambda _s: None                             # the share-settle wait, without the waiting
+        open(f"{vt}/current.png", "wb").write(b"\x89PNG one")
+        json.dump({"window_h": 24, "minutes": 118, "n": 1440, "gaps": 2}, open(f"{vt}/current.json", "w"))
+        dmV.chart_refresh()
+        first, n1 = dict(dmV.chart), len([c for c in vcalls if c.startswith("files.")])
+        dmV.chart_refresh()                                      # SAME bytes: nothing may go over the wire
+        n2 = len([c for c in vcalls if c.startswith("files.")])
+        open(f"{vt}/current.png", "wb").write(b"\x89PNG two")    # a NEW picture: upload it, and bin the old one
+        dmV.chart_refresh()
+        deleted = "files.delete" in vcalls
+    finally:
+        globals()["api"], globals()["VITALS_DIR"] = _apiV, os.environ.get("CC_VITALS_DIR") or f"{HOME}/.cc/state/vitals"
+        urllib.request.urlopen, time.sleep = _open, _sleep
+        subprocess.run(["rm", "-rf", vt], check=False)
+    check("a refresh with NO NEW DATA re-uploads NOTHING: the file id is reused for every 5 s republish, and only a "
+          "picture whose bytes actually changed costs an upload — then the previous one is deleted, so the workspace "
+          "holds exactly one drawing, never one per refresh",
+          first.get("file") and first["covers"].endswith("2 missing") and n1 == 3 and n2 == n1
+          and dmV.chart["file"] != first["file"] and deleted and dmV.home_dirty)
+
+    #    …and the promise that matters most: HOME NEVER BREAKS BECAUSE A PICTURE FAILED.
+    dmX = Daemon(use_slack=False); dmX.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    dmX.use_slack, dmX.chart, dmX.chart_sig = True, {"file": "FDEAD", "drawn": time.time(), "covers": "c"}, "sig"
+    dmX.home_state = lambda: dict(hfix, chart=dmX.chart)
+    xviews = []
+    def apiX(method, token, **kw):
+        if method == "views.publish":
+            xviews.append(kw["view"])
+            if "FDEAD" in kw["view"]:
+                raise RuntimeError("views.publish: invalid_arguments")
+        return {"ok": True}
+    try:
+        globals()["api"] = apiX
+        dmX.publish_home()
+    finally:
+        globals()["api"] = _apiV
+    check("a chart Slack refuses does NOT cost the owner their dashboard: the view republishes WITHOUT the image, "
+          "the failure is not counted toward the three-strikes home_off backoff, and the dead file is forgotten so "
+          "the next redraw uploads a fresh one instead of retrying a corpse forever",
+          len(xviews) == 2 and "FDEAD" in xviews[0] and "image" not in xviews[1]
+          and "RUNNING 2" in xviews[1] and "carpet-rectify" in xviews[1]
+          and dmX.home_fails == 0 and not dmX.home_off and dmX.chart == {} and dmX.chart_at == 0.0)
+
     # ── THE LISTS ARE WHOLE (owner, 2026-08-30, thread 1788129807: "what happenend to showing all the backlog items and
     #    all ? items and not defaulting to showing only a few?"). Both bands are one section block however long they get,
     #    so this costs no blocks; the character budget is the only cap left, and it is a valve, not a policy.

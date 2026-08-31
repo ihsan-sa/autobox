@@ -29,7 +29,8 @@ sparklines, no dependencies — works today. When the answer comes, that one fun
 
   cc-vitals record [--once]         the recorder: one row a minute, then re-render (never in the tab's own path)
   cc-vitals series [--hours 24]     aggregated + normalised series, JSON on stdout
-  cc-vitals render [--backend auto|text|png]   rewrite current.json + current.txt|png, atomically, in place
+  cc-vitals render [--backend auto|text|png] [--if-stale SEC]   rewrite current.json + current.txt|png,
+                                    atomically, in place; --if-stale redraws only a picture older than SEC
   cc-vitals show [--width N]        the text chart on stdout
   cc-vitals selfcheck               tests; touches nothing outside a temp dir
 """
@@ -445,9 +446,28 @@ def render_png(spec, out):
 BACKENDS = {"text": "txt", "png": "png"}
 
 
-def render(backend="auto", width=60, spec=None):
+def drawn_at(name="current.png"):
+    """When the drawing on disk was made (mtime), or 0 — the ONE fact a tab needs to say how old its picture is."""
+    try:
+        return os.path.getmtime(f"{DIR}/{name}")
+    except OSError:
+        return 0.0
+
+
+def fresh(sec, name="current.png"):
+    """Is the drawing younger than `sec`? The whole point of --if-stale: a redraw every minute costs matplotlib
+    for a 24 h chart that moved 0.07 %, and a redraw NEVER is how current.png sat four hours behind the data."""
+    return (time.time() - drawn_at(name)) < float(sec)
+
+
+def render(backend="auto", width=60, spec=None, if_stale=None):
     """Rewrite the current chart IN PLACE — one file per backend, never a growing pile of images. Written to a
-    temp file and renamed, so a tab reading while we write never sees half a chart."""
+    temp file and renamed, so a tab reading while we write never sees half a chart.
+
+    `if_stale` makes the call IDEMPOTENT: a caller on a timer asks for a redraw every tick and pays for one only
+    when the picture is actually older than that many seconds. Returns ([], "") when it skipped."""
+    if if_stale is not None and fresh(if_stale) and fresh(if_stale, "current.json"):
+        return [], ""
     spec = spec or build()
     os.makedirs(DIR, exist_ok=True)
     wrote, why = [], ""
@@ -497,7 +517,12 @@ def cmd_series(opt):
 
 
 def cmd_render(opt):
-    wrote, why = render(opt.get("--backend", "auto"), int(opt.get("--width", 60)))
+    stale = opt.get("--if-stale")
+    wrote, why = render(opt.get("--backend", "auto"), int(opt.get("--width", 60)),
+                        if_stale=None if stale in (None, True) else float(stale))
+    if not wrote:
+        print(f"cc-vitals: current (drawn {int(time.time() - drawn_at())}s ago) — nothing redrawn")
+        return 0
     print(f"cc-vitals: wrote {', '.join(wrote)} in {DIR}" + (f"\ncc-vitals: {why}" if why else ""))
     return 0
 
@@ -655,6 +680,18 @@ def selfcheck():
               "current.txt" in wrote2 and "matplotlib" in why2)
         check("current.json is valid JSON with a dense axis", json.load(open(f"{tmp}/current.json"))["step"] == 60)
         check("nothing is left half-written: temp files are renamed into place", not glob.glob(f"{tmp}/.*.tmp"))
+
+        # -- --if-stale: the flag that keeps a tab's picture honest without redrawing it every tick -------------
+        check("a fresh picture is NOT redrawn: --if-stale skips, and says so by writing nothing",
+              render("auto", if_stale=3600) == ([], ""))
+        old_t = drawn_at()
+        os.utime(f"{tmp}/current.png", (old_t - 7200, old_t - 7200))
+        os.utime(f"{tmp}/current.json", (old_t - 7200, old_t - 7200))
+        check("a stale one IS redrawn — this is the bug that left current.png four hours behind the data",
+              "current.png" in render("auto", if_stale=300)[0] and drawn_at() > old_t - 60)
+        check("drawn_at reports the age of the drawing itself, which is what a tab must show when it is old",
+              drawn_at() > 0 and fresh(300) and not fresh(0.0001))
+        check("a picture that was never drawn is not silently 'now'", drawn_at("nosuch.png") == 0.0)
 
         # -- STORAGE -------------------------------------------------------------------------------------------
         append(_row(600))
