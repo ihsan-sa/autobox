@@ -33,8 +33,15 @@ to know which half: that is the remembering this tool exists to remove, put back
 Re-running is the recovery, and is safe: an already-merged PR, an existing card, a settled ledger row and a
 unit that is already on are each "nothing to do".
 
-Exit: 0 landed · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a cosmetic step
-wants a hand · 2 usage.
+MERGED IS NOT DELIVERED, and this is where that is decided. The ledger step no longer closes an ask: it marks
+it `merged`, which is still work. The LAST step runs each of those rows' own check — a command whose exit code
+decides — and it runs last on purpose, after install.sh and after the unit came back, because until then the
+box is still executing the old code and a check that passed there would be measuring nothing. Only a check
+exiting 0 makes a row delivered. A row that names no check is reported UNVERIFIED and stays open, which is the
+honest answer and the point: an ask nobody can measure is not an ask that is done.
+
+Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
+cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
 import glob, json, os, re, shutil, subprocess, sys, tempfile, urllib.parse, urllib.request
 
@@ -56,6 +63,7 @@ CARD = "ok_hand"                          # the mark for "landed". The daemon pu
 # on, and the run exits 3 so the operator still knows one of them wants a hand.
 FATAL = ("gates", "merge", "install", "units", "restart")
 COSMETIC = 3                              # exit code for "the box is right, its bookkeeping is not"
+UNVERIFIED = 4                            # "the box is deployed, and nothing has confirmed the owner can see it"
 
 
 class Failed(Exception):
@@ -151,6 +159,7 @@ class Land:
         self.changed = None      # [(status, path)] this landing makes; worked out once, when it is first needed
         self.head = ""           # the PR head as a SHA — never "FETCH_HEAD", which the pull below overwrites
         self.restarted = []
+        self.unverified = []     # ledger rows this landing could not confirm: named, and left open
 
     def base(self):
         return board(self.repo).get("default_branch") or "main"
@@ -291,26 +300,38 @@ class Land:
         return f"board: {self.repo}/{t} -> {st}"
 
     # -- 5. the ask ledger ---------------------------------------------------------------------------------
+    def ledger_rows(self, t):
+        """The unsettled rows on this track, or None if there is no ledger here at all."""
+        rc, o = sh([f"{BIN}/cc-scope", "list", self.repo, "--track", t, "--json"])
+        if rc:
+            return None
+        try:
+            return json.loads(o or "[]")
+        except ValueError:
+            return []
+
     def close_ledger(self):
         """What the OWNER asked for, which the board does not track. A track whose work left no PR sat open for
-        half an hour because the only thing that could close this was somebody remembering to."""
+        half an hour because the only thing that could close this was somebody remembering to.
+
+        This step used to VERIFY the rows, against the PR number, right here — before install.sh had linked
+        anything and before the daemon had been restarted. That is how an ask was closed while the owner's
+        screen still showed the old thing, twice, and he was the one who noticed. It now records the merge and
+        nothing more; delivery is the last step, and it is decided by a command, not by this sentence."""
         t = self.find_track()
         if not t:
             raise Skip("no track — no ledger rows to close")
-        rc, o = sh([f"{BIN}/cc-scope", "list", self.repo, "--track", t, "--json"])
-        if rc:
+        asks = self.ledger_rows(t)
+        if asks is None:
             raise Skip(f"no ask ledger for {self.repo}")
-        try:
-            asks = json.loads(o or "[]")
-        except ValueError:
-            asks = []
         if not asks:
             raise Skip(f"no unsettled ask on track {t}")
         for a in asks:
-            rc, o = sh([f"{BIN}/cc-scope", "verify", self.repo, a["id"], "--evidence", self.what()])
+            rc, o = sh([f"{BIN}/cc-scope", "merged", self.repo, a["id"], "--evidence", self.what()])
             if rc:
-                raise Failed(f"cc-scope verify {a['id']}: {last(o)}")
-        return f"ledger: {len(asks)} ask(s) on {t} verified ({', '.join(a['id'] for a in asks)})"
+                raise Failed(f"cc-scope merged {a['id']}: {last(o)}")
+        return (f"ledger: {len(asks)} ask(s) on {t} marked MERGED — not delivered until their own checks pass "
+                f"below ({', '.join(a['id'] for a in asks)})")
 
     # -- 6. pull, install, daemon-reload -------------------------------------------------------------------
     def install(self):
@@ -396,6 +417,41 @@ class Land:
             raise Skip("nothing running uses the files this change touched" + tail)
         return f"restarted: {', '.join(self.restarted)}{tail}"
 
+    # -- 9. delivery: the ask's own check, run last of all ---------------------------------------------------
+    def verify_delivery(self):
+        """Merged is not delivered. Each ledger row this landing touched names its own verification — a command
+        whose EXIT CODE decides — and `cc-scope deliver` runs it: 0 the row is delivered, anything else and the
+        row stays open with the failure written on it. It is last in the sequence because everything above it is
+        what makes the check true: the pull, install.sh linking a file that was only added, the unit coming back
+        on the new code. Run any earlier and it would be measuring the box as it was.
+
+        A row that names no check comes back 2, and that is not a failure of the row — it is the honest answer.
+        It is reported UNVERIFIED, it stays on the queue, and somebody either gives it a check or puts their own
+        name on it. The one outcome this must never produce is a row that reads delivered because a PR merged."""
+        t = self.find_track()
+        if not t:
+            raise Skip("no track — no ask to check")
+        asks = self.ledger_rows(t)
+        if asks is None:
+            raise Skip(f"no ask ledger for {self.repo}")
+        rows = [a for a in asks if a.get("status") in ("open", "claimed", "merged")]
+        if not rows:
+            raise Skip(f"no ask on track {t} waiting to be delivered")
+        good, red, bare = [], [], []
+        for a in rows:
+            rc = sh([f"{BIN}/cc-scope", "deliver", self.repo, a["id"]], timeout=900)[0]
+            (good if rc == 0 else bare if rc == 2 else red).append(a["id"])
+        self.unverified = red + bare
+        if not self.unverified:
+            return f"delivered — every check ran here and passed: {', '.join(good)}"
+        bits = ([f"delivered: {', '.join(good)}"] if good else [])
+        if red:
+            bits.append(f"CHECK FAILED, still open: {', '.join(red)}")
+        if bare:
+            bits.append(f"names no check, UNVERIFIED and still open: {', '.join(bare)}")
+        raise Failed("; ".join(bits) + f" — `cc-scope show {self.repo} <id>` for what happened, "
+                     f"`cc-scope check-cmd {self.repo} <id> \"<cmd>\"` to give a row a check")
+
     # -- the sequence, in two halves ------------------------------------------------------------------------
     def pr_steps(self):
         """About THIS change: gate it, merge it, and record that it landed."""
@@ -405,7 +461,8 @@ class Land:
     def deploy_steps(self):
         """About the BOX: they do the same thing whether one change landed or three, which is what lets a batch
         run them once at the end instead of once per PR."""
-        return [("install", self.install), ("units", self.enable_units), ("restart", self.restart)]
+        return [("install", self.install), ("units", self.enable_units), ("restart", self.restart),
+                ("verify", self.verify_delivery)]
 
     def steps(self):
         return self.pr_steps() + self.deploy_steps()
@@ -442,7 +499,9 @@ class Land:
                           "every step already done is a no-op the second time.", file=sys.stderr)
                     return 1
                 self.hurt.append(name)   # cosmetic: the box is right, so the rest of the sequence still runs
-        return COSMETIC if self.hurt else 0
+        if not self.hurt:
+            return 0
+        return UNVERIFIED if "verify" in self.hurt else COSMETIC
 
     def run(self):
         if not self.load():
@@ -450,7 +509,13 @@ class Land:
         return self.done(self.walk(self.steps()))
 
     def done(self, rc):
-        if rc == COSMETIC:
+        if rc == UNVERIFIED:
+            rest = [h for h in self.hurt if h != "verify"]
+            print(f"merged and deployed — but NOT delivered: nothing here could confirm {', '.join(self.unverified)} "
+                  f"reached anyone, so {'they stay' if len(self.unverified) > 1 else 'it stays'} open. That is the "
+                  f"honest answer, not a broken landing: `cc-scope unverified {self.repo}`."
+                  + (f" ({', '.join(rest)} also wants a hand.)" if rest else ""))
+        elif rc == COSMETIC:
             print(f"landed — the box is deployed, but {', '.join(self.hurt)} did not go through. Re-run the same "
                   f"command to retry just those: everything else is a no-op the second time.")
         elif rc == 0:
@@ -479,6 +544,22 @@ def run_batch(repo, prs):
         return [c for L in lands for c in Land.changed_files(L)]     # PR's squash commit is only here after the pull
     deploy.changed_files = everything
     deploy.hurt = [h for L in lands for h in L.hurt]
+    def every_track():   # the deploy is shared; the asks are not — each PR's own track has its own rows to check
+        msgs, bad = [], []
+        for L in lands:
+            try:
+                msgs.append(Land.verify_delivery(L))
+            except Skip as e:
+                msgs.append(str(e))
+            except Failed as e:
+                bad.append(str(e))
+            deploy.unverified += L.unverified
+        if bad:
+            raise Failed("; ".join(bad))
+        if not msgs:
+            raise Skip("no ask to check")
+        return "; ".join(msgs)
+    deploy.verify_delivery = every_track
     return deploy.done(deploy.walk(deploy.deploy_steps()))
 
 
@@ -500,6 +581,13 @@ def cmd_selfcheck():
     def ran(*words):
         return [c for c in calls if all(w in " ".join(c) for w in words)]
 
+    def ran_sub(tool, sub, *rest):
+        """`ran` matches anywhere in the joined argv, which includes argv[0] — and argv[0] is a path this file
+        happens to live under. A checkout in a directory named after what it is testing made two assertions
+        here pass on the path alone. This one pins the tool and its SUB-COMMAND by position."""
+        return [c for c in calls if os.path.basename(c[0]) == tool and len(c) > 1 and c[1] == sub
+                and all(w in " ".join(c[1:]) for w in rest)]
+
     LINKED, BODY, BOARD, errs = [[]], [{}], [{}], []   # errs: a case queues Slack errors for the next reactions.add
 
     def fake_slack(method, token, **kw):
@@ -508,6 +596,7 @@ def cmd_selfcheck():
         reacted.append((method, kw.get("name"), kw.get("timestamp")))
         return {"ok": True}
 
+    REAL = {k: globals()[k] for k in ("sh", "bot_token", "slack", "linked_units", "read_unit", "board", "repo_root")}
     globals().update(sh=fake_sh, bot_token=lambda: "xoxb-selfcheck", slack=fake_slack,
                      linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
                      board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland")
@@ -631,14 +720,63 @@ def cmd_selfcheck():
     check("a re-run after the merge still knows what landed (the squash commit), so the deploy steps still work",
           L.changed_files() == [("A", "core/config/systemd-user/cc-new.service")])
 
-    # …and the ask ledger closes on the PR path too — that is what a 👍-merge, which reaches this through
-    # cc-slack, has to close: thirteen rows read `open` under merged tracks for want of somebody typing it
+    # …and the ask ledger picks the PR path up too — that is what a 👍-merge, which reaches this through
+    # cc-slack, has to record: thirteen rows read `open` under merged tracks for want of somebody typing it.
+    # But it records MERGED, and merged is not delivered: closing the row here, on the PR number, before
+    # install.sh has run and before the daemon is back, is exactly how an ask was marked done twice while the
+    # owner's screen still showed the old thing. Delivery is decided further down, by a command.
     L = fresh(pr=7)
     L.facts["state"] = "MERGED"
     world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a31", "status": "open"}]))
     msg = L.close_ledger()
-    check("an already-merged PR still closes its track's open asks, against the PR itself",
-          "a31" in msg and ran("cc-scope", "verify", "myrepo", "a31", "PR #7 a change"))
+    check("an already-merged PR records the merge on its track's open asks",
+          "a31" in msg and ran_sub("cc-scope", "merged", "myrepo", "a31", "PR #7 a change"))
+    check("...as MERGED, never verified — the ledger is never told a PR number closed an ask",
+          "MERGED" in msg and not ran_sub("cc-scope", "verify") and not ran_sub("cc-scope", "deliver"))
+
+    # ---- delivery: the row's own check, run last, and its exit code is the whole answer -------------------
+    # A check that FAILS cannot make a row delivered. This is the merged-but-not-deployed case: the PR is in,
+    # the daemon was never restarted, the thing the owner would look at is still the old thing.
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a31", "status": "merged"}]))
+    world[f"{BIN}/cc-scope deliver"] = (1, "check failed")
+    e = caught(L.verify_delivery)
+    check("a row whose check fails cannot reach delivered — it is named and stays open",
+          isinstance(e, Failed) and "CHECK FAILED" in str(e) and "a31" in str(e) and L.unverified == ["a31"])
+
+    # A row with no check at all is the honest case, and it is NOT quietly counted as done
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a31", "status": "merged"}]))
+    world[f"{BIN}/cc-scope deliver"] = (2, "names no check")
+    e = caught(L.verify_delivery)
+    check("a row with no check is reported UNVERIFIED and stays open — an honest 'nobody looked' is the product",
+          isinstance(e, Failed) and "UNVERIFIED" in str(e) and L.unverified == ["a31"])
+
+    # …and a check that passes is the only thing that delivers
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a31", "status": "merged"}]))
+    world[f"{BIN}/cc-scope deliver"] = (0, "")
+    msg = L.verify_delivery()
+    check("a check that passes is what makes a row delivered, and the ledger runs it rather than being told",
+          "a31" in msg and ran_sub("cc-scope", "deliver", "myrepo", "a31") and not L.unverified)
+
+    # the whole run: merged, installed, restarted — and still not delivered, so not exit 0
+    L = fresh(pr=7)
+    world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a31", "status": "open"}]))
+    world[f"{BIN}/cc-scope deliver"] = (2, "names no check")
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rc = L.run()
+    check("a landing nothing could confirm ends 4, NOT 0 — the box says merged, and says so plainly",
+          rc == UNVERIFIED and L.unverified == ["a31"])
+    check("...and it still merged, still deployed, and still marked the row merged: the landing is not undone",
+          ran("gh pr merge") and ran("git", "pull", "--ff-only") and ran_sub("cc-scope", "merged", "a31"))
+
+    # a re-run is a no-op: a delivered row is settled, so `list` no longer returns it and nothing is re-run
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-scope list"] = (0, "[]")
+    check("a re-run after delivery checks nothing again",
+          isinstance(caught(L.verify_delivery), Skip) and not ran_sub("cc-scope", "deliver"))
 
     # 6. only what the change touched is restarted — and never the box's tmux server
     L = fresh(pr=7)
@@ -659,15 +797,18 @@ def cmd_selfcheck():
           isinstance(caught(L.merge), Skip) and isinstance(caught(L.card), Skip) and not ran("post-approval"))
     check("no PR: the board row closes as 'done' — it has no PR to be 'merged'",
           "-> done" in L.close_board() and ran("cc-board", "status", "myrepo", "w1", "done"))
-    check("no PR: the ledger row closes against the note the caller gave",
-          "a24" in L.close_ledger() and ran("cc-scope", "verify", "myrepo", "a24", "settings edit outside the repo"))
+    check("no PR: the ledger row records the merge against the note the caller gave",
+          "a24" in L.close_ledger() and ran_sub("cc-scope", "merged", "myrepo", "a24",
+                                                "settings edit outside the repo"))
 
     # 8. the sequence itself, and what each step's failure means
-    check("the steps are the nine remembered ones, in that order",
+    check("the steps are the remembered ones, in that order — and the check that says it reached the owner is "
+          "LAST, after install.sh and the restart, because before those the box still runs the old code",
           [n for n, _ in Land("myrepo", pr=1).steps()] ==
-          ["gates", "merge", "card", "board", "ledger", "install", "units", "restart"])
-    check("the fatal steps are exactly the ones that leave the box wrong; card, board and ledger are not among them",
-          set(FATAL) == {n for n, _ in Land("myrepo", pr=1).steps()} - {"card", "board", "ledger"})
+          ["gates", "merge", "card", "board", "ledger", "install", "units", "restart", "verify"])
+    check("the fatal steps are exactly the ones that leave the box wrong; card, board, ledger and the delivery "
+          "check are not among them — nothing follows the check, and a landing it cannot confirm is still landed",
+          set(FATAL) == {n for n, _ in Land("myrepo", pr=1).steps()} - {"card", "board", "ledger", "verify"})
 
     # 9. a batch: every PR merged on its own, the box deployed once at the end
     fresh(pr=7)
@@ -683,6 +824,60 @@ def cmd_selfcheck():
         rcB = run_batch("myrepo", [7, 8])
     check("a batch that cannot merge one of them deploys NOTHING: the box is never half of a landing",
           rcB == 1 and not ran("git", "pull", "--ff-only"))
+
+    # 10. the seam itself, with the fakes taken back off: the REAL cc-scope, in a real subprocess, on a
+    # throwaway ledger. Everything above stubs sh(), so nothing above proves the one thing this depends on —
+    # that "0 delivered / 1 the check failed / 2 there is no check" survives the process boundary. It is the
+    # contract that decides whether an ask closes, so it is checked against the other program, not a stand-in.
+    globals().update(REAL)
+    scope_dir = tempfile.mkdtemp(prefix="cc-land-selfcheck-scope-")
+    env = dict(os.environ, CC_SCOPE_DIR=scope_dir)
+    R, TR = "_landselfcheck", "w1"
+    seen = f"{scope_dir}/what-the-owner-would-see"
+
+    def scope(*a):
+        r = subprocess.run([f"{BIN}/cc-scope", *a], capture_output=True, text=True, env=env,
+                           stdin=subprocess.DEVNULL, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+    # MUTATED, not rebound: sh() below shells out with env=None, and the child inherits the real process
+    # environment from the C level — a plain dict swapped in here would never reach it.
+    had = os.environ.get("CC_SCOPE_DIR")
+    os.environ["CC_SCOPE_DIR"] = scope_dir
+    try:
+        scope("add", R, "put the chart where I can see it", "--track", TR)
+        scope("check-cmd", R, "a1", f"test -f {seen}")
+        L = Land(R, track=TR, note="a config edit")
+        merged_msg = L.close_ledger()
+        red = caught(L.verify_delivery)
+        check("across a real subprocess: a merged row whose check fails is NOT delivered and stays open",
+              "MERGED" in merged_msg and isinstance(red, Failed) and "CHECK FAILED" in str(red)
+              and scope("check", R)[0] == 1 and scope("unverified", R)[0] == 1)
+        open(seen, "w").write("now it is true\n")     # i.e. the deploy that had not happened yet
+        green = L.verify_delivery()
+        check("across a real subprocess: once the observable fact is true the same check delivers the row, "
+              "and the evidence recorded is the check itself — never the PR number",
+              "a1" in green and not L.unverified and scope("check", R)[0] == 0
+              and "check passed" in scope("show", R, "a1")[1])
+        check("across a real subprocess: re-running the seam is a no-op",
+              isinstance(caught(L.verify_delivery), Skip) and isinstance(caught(L.close_ledger), Skip)
+              and scope("check", R)[0] == 0)
+
+        scope("add", R, "make the updates read warmer", "--track", TR)   # nothing can mechanically measure this
+        L2 = Land(R, track=TR, note="a tone pass")
+        L2.close_ledger()
+        bare = caught(L2.verify_delivery)
+        check("across a real subprocess: an ask no command can measure is UNVERIFIED and stays open — an honest "
+              "'nobody looked' is the product here, and a false 'delivered' is the failure it exists to stop",
+              isinstance(bare, Failed) and "UNVERIFIED" in str(bare) and scope("check", R)[0] == 1)
+        check("...and a person may still close it with their own word, which is still counted as never measured",
+              scope("verify", R, "a2", "--evidence", "read the last six updates myself")[0] == 0
+              and scope("check", R)[0] == 0 and scope("unverified", R)[0] == 1)
+    finally:
+        os.environ.pop("CC_SCOPE_DIR", None)
+        if had is not None:
+            os.environ["CC_SCOPE_DIR"] = had
+        shutil.rmtree(scope_dir, ignore_errors=True)
 
     print(f"cc-land selfcheck: {len(fails)} failed")
     return 1 if fails else 0

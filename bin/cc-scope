@@ -9,19 +9,36 @@ Ledger: ~/.cc/scope/<repo>.json  (sidecar like the board — never in git, so no
 Every owner message the capture path saw is logged to ~/.cc/scope/seen.log whether it was captured or not:
 the classifier below is a filter, not an oracle, and `cc-scope missed` is how a miss is found and added.
 
-An ask moves  open → claimed → delivered → verified,  or leaves the queue as  declined.
-Settled is verified or declined; everything else is still work, and `check` exits 1 while any of it is left.
+An ask moves  open → claimed → merged → delivered → verified,  or leaves the queue as  declined.
+
+MERGED IS NOT DELIVERED. A merge puts code on the default branch; it does not put anything on the owner's
+screen. The daemon still runs the old code until it is restarted, the file is not linked until install.sh
+runs, the tab does not carry the block until it is rendered. Rows were closed on "merged as PR #N" and the
+owner himself found the chart was not there — so a PR number is no longer evidence of delivery, and no
+sentence is. A row names its OWN verification, `check`: a shell command whose EXIT CODE decides. `deliver`
+RUNS it. Exit 0 and the row is delivered, because something observable was true at that moment. Anything
+else and the row stays exactly where it was.
+
+A ROW WITH NO CHECK IS NOT DONE, IT IS UNVERIFIED. That is the honest answer and it is the point: not every
+ask has a mechanical check, and where one genuinely cannot exist the row stays on the queue and says so
+(`unverified`) rather than quietly counting as done. A person may still close it with `verify --evidence`,
+which is them putting their own name on it — but that is a person's word, in a terminal, and it is refused
+outright while the row names a check that has not passed. Nothing automated can reach `verified`.
+
 DECLINED IS A DECISION, NOT A DROP: a session may judge that something should not be built, and that is a
 legitimate answer — but it must say why, in its own words, and the reason stays in the ledger next to the ask.
 `--why` is therefore required. An omission leaves an open item; a decision leaves a reason; the two can never
 be mistaken for each other, which is the whole point of writing the asks down.
 
-  cc-scope add <repo> "<ask>" [--src REF] [--track T] [--done-when "..."] [--who W] [--at ISO]
+  cc-scope add <repo> "<ask>" [--src REF] [--track T] [--done-when "..."] [--check "<cmd>"] [--who W] [--at ISO]
   cc-scope list [<repo>] [--all] [--status S] [--track T] [--json]   unsettled asks (all repos if none named)
   cc-scope show <repo> <id>                                          one ask in full: parts, repeats, notes
   cc-scope claim <repo> <id> [--track T]                             a session/track has taken it on
-  cc-scope deliver <repo> <id> --evidence "<what proves it>"         built, not yet confirmed landed
-  cc-scope verify <repo> <id> [--evidence "…"]                       done, and measured against the ask
+  cc-scope check-cmd <repo> <id> "<command>"                         the row's own verification; exit 0 = true
+  cc-scope merged <repo> <id> --evidence "<PR or commit>"            it landed. NOT delivered — still work
+  cc-scope deliver <repo> <id>                                       RUNS the check; exit 0 → delivered
+  cc-scope verify <repo> <id> [--evidence "…"]                       a PERSON measured it against the ask
+  cc-scope unverified [<repo>]                                       landed with nothing observed; exit 1 if any
   cc-scope decline <repo> <id> --why "<why it should not be built>"  a decision, kept in the ledger
   cc-scope track|note <repo> <id> "<text>"                           link an ask to a track / add a note
   cc-scope check <repo> [--track T]                                  exit 1 while anything is unsettled
@@ -29,15 +46,22 @@ be mistaken for each other, which is the whole point of writing the asks down.
   cc-scope missed [<repo>] [--since HOURS]                           owner messages the classifier skipped
   cc-scope digest [<repo>] · count [<repo>] · import <repo> <file> · selfcheck
   cc-scope hook                                                      UserPromptSubmit hook (silent, always 0)
+
+Exit, for the commands a caller acts on: 0 did it · 1 the check ran and FAILED · 2 the row names no check.
 """
-import sys, os, re, json, time, fcntl, hashlib, calendar
+import sys, os, re, json, time, fcntl, hashlib, calendar, subprocess
 
 HOME = os.path.expanduser("~")
 SCOPE = os.environ.get("CC_SCOPE_DIR", os.path.join(HOME, ".cc", "scope"))
 SEEN = "seen.log"
-STATES = ["open", "claimed", "delivered", "verified", "declined"]
-SETTLED = ("verified", "declined")   # off the queue. Declined is settled and STAYS VISIBLE — see the header
-MARK = {"open": "·", "claimed": "▸", "delivered": "→", "verified": "✓", "declined": "⊘"}
+STATES = ["open", "claimed", "merged", "delivered", "verified", "declined"]
+# Off the queue. `merged` is deliberately NOT here — that is the whole fix: code on the default branch is
+# still work until something observes it. Declined is settled and STAYS VISIBLE — see the header.
+SETTLED = ("delivered", "verified", "declined")
+DONE = ("delivered", "verified")     # it actually happened, by a check or by a person's own word
+MARK = {"open": "·", "claimed": "▸", "merged": "→", "delivered": "✓", "verified": "✓", "declined": "⊘"}
+EXAMPLES = "systemctl --user is-active <unit> · test bin/x -nt <the merge> · a grep of what the tab renders"
+CHECK_TIMEOUT = 300  # a verification is meant to be CHEAP: one grep, one systemctl is-active, one curl
 MAXTEXT = 800          # a whole essay is not an ask; the source ref is how you read the rest
 SEEN_KEEP = 400        # lines of seen.log kept — enough to catch a miss the same day
 
@@ -120,7 +144,7 @@ def fingerprint(text): return hashlib.sha1(norm(text).encode()).hexdigest()[:12]
 
 
 # ---- the ledger ------------------------------------------------------------------------------------
-def add(repo, text, who="owner", src="", track="", done_when="", at="", replay=False):
+def add(repo, text, who="owner", src="", track="", done_when="", check="", at="", replay=False):
     """Returns (id, repeated). The same ask made twice does not open a second row — it bumps `repeats`,
     which is the signal that matters: 'asked twice, no answer yet' is a line from a real handoff. Asked
     again after it was DECLINED, it goes back on the queue (the reason stays); asked again after it was
@@ -134,7 +158,7 @@ def add(repo, text, who="owner", src="", track="", done_when="", at="", replay=F
         for a in d["asks"].values():
             if a["fp"] != fp: continue
             if replay: return a["id"], True
-            if a["status"] == "verified": continue
+            if a["status"] in DONE and settled(a): continue
             a["repeats"] = a.get("repeats", 1) + 1
             a.setdefault("seen", []).append({"ts": at or now(), "src": src})
             if a["status"] == "declined":
@@ -149,9 +173,46 @@ def add(repo, text, who="owner", src="", track="", done_when="", at="", replay=F
         d["asks"][aid] = {"id": aid, "text": text, "parts": parts_of(text), "fp": fp, "who": who,
                           "src": src, "track": track, "done_when": done_when, "status": "open",
                           "asked": at or now(), "repeats": 1, "evidence": "", "reason": "", "closed": "",
-                          "notes": []}
+                          "check": check.strip(), "checked": {}, "notes": []}
         save(repo, d)
         return aid, False
+
+
+# ---- the verification: a command, not a sentence ---------------------------------------------------
+def repo_dir(repo):
+    """Where a row's check runs. The repo's own checkout if there is one, so a check can say `test -x bin/x`;
+    otherwise the home directory, which is where a deployed thing actually lives."""
+    p = os.path.join(HOME, "dev", repo)
+    return p if os.path.isdir(p) else HOME
+
+
+def has_check(a): return bool((a.get("check") or "").strip())
+
+
+def passed(a): return (a.get("checked") or {}).get("rc") == 0
+
+
+def settled(a):
+    """Off the queue. `delivered` counts only if a check ACTUALLY PASSED. Every row this code delivers has
+    one by construction — but rows written before it exists sit in `delivered` on sentences like "merged as
+    PR #64 on main; deployed", which is the precise thing that is no longer evidence. Promoting those to
+    settled because the word matches would close five real asks nobody ever measured, which is the failure
+    this whole file is here to stop, committed by the fix for it. They go back on the queue instead."""
+    if a.get("status") == "delivered":
+        return passed(a)
+    return a.get("status") in SETTLED
+
+
+def run_check(repo, a):
+    """(rc, output). The EXIT CODE is the whole answer — a check prints for the human reading the failure,
+    and decides nothing by what it prints. Anything that goes wrong running it is a failure, not a pass:
+    the one direction this must never err in is towards 'delivered'."""
+    try:
+        r = subprocess.run(["bash", "-c", a["check"]], cwd=repo_dir(repo), capture_output=True, text=True,
+                           timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout + r.stderr
+    except Exception as e:
+        return 127, "%s: %s" % (e.__class__.__name__, e)
 
 
 def get(repo, aid):
@@ -172,7 +233,7 @@ def select(repo, status=None, track=None, everything=False):
     already taken, so it stops being work — but `--all` and `--status declined` still show it, with its reason."""
     asks = sorted(load(repo)["asks"].values(), key=lambda a: a["asked"])
     if not everything:
-        asks = [a for a in asks if (a["status"] == status if status else a["status"] not in SETTLED)]
+        asks = [a for a in asks if (a["status"] == status if status else not settled(a))]
     if track: asks = [a for a in asks if a.get("track") == track]
     return asks
 
@@ -182,6 +243,13 @@ def line(repo, a, many=False):
     tail = " [%s]" % a["track"] if a.get("track") else ""
     head = "%s/" % repo if many else ""
     why = "\n       ⊘ %s" % a["reason"] if a["status"] == "declined" and a.get("reason") else ""
+    # A merged row is the one the ledger used to call done. It says so on the line you actually read, because
+    # "has home been updated yet?" is the question this is here to answer without anyone having to go and look.
+    if a["status"] == "merged":
+        why = "\n       ⚠ merged, NOT delivered — %s" % ("its check has not passed: %s" % a["check"] if has_check(a)
+                                                         else "it names no check, so nothing has observed it")
+    elif a["status"] == "delivered" and not passed(a):
+        why = "\n       ⚠ NOT delivered — closed on a sentence before a check was required, so it is back on the queue"
     return "%s %s%-4s %s%s%s%s" % (MARK.get(a["status"], "?"), head, a["id"], a["text"][:96], tail, flag, why)
 
 
@@ -296,7 +364,7 @@ def main(argv):
         repo, text = args[0], args[1]
         aid, rep = add(repo, text, who=opt(args, "--who", "owner"), src=opt(args, "--src"),
                        track=opt(args, "--track"), done_when=opt(args, "--done-when"),
-                       at=opt(args, "--at"))
+                       check=opt(args, "--check"), at=opt(args, "--at"))
         print("%s %s%s" % (repo, aid, " (asked again)" if rep else ""))
 
     elif cmd == "capture":
@@ -326,16 +394,68 @@ def main(argv):
         if a["evidence"]: print("  evidence %s%s" % (a["evidence"], "  (%s)" % a["closed"] if a["closed"] else ""))
         for n in a["notes"]: print("  note    %s %s" % (n["ts"], n["msg"]))
 
-    elif cmd in ("claim", "deliver", "verify", "declined", "decline", "done", "drop"):
-        state = {"claim": "claimed", "deliver": "delivered", "verify": "verified", "done": "verified",
+    elif cmd == "check-cmd":
+        repo, aid, c = args[0], args[1], args[2].strip()
+        if not c: sys.exit("cc-scope: check-cmd needs a command — one that exits 0 only when the ask is TRUE")
+        edit(repo, aid, lambda a: a.update(check=c, checked={}))
+        print("%s %s check: %s" % (repo, aid, c))
+
+    elif cmd == "deliver":
+        # THE HOLE THIS CLOSES: this used to take `--evidence "merged as PR #N"` and believe it. It now runs
+        # the row's own check and believes only the exit code. There is no argument that can talk it round.
+        repo, aid = args[0], args[1]
+        track, ev = opt(args, "--track"), opt(args, "--evidence")
+        a = get(repo, aid)
+        if track: edit(repo, aid, lambda x: x.update(track=track))
+        if not has_check(a):
+            print("cc-scope: %s %s names no check — UNVERIFIED. It stays '%s' and it stays on the queue: a merge\n"
+                  "  is not delivery, and nothing here has observed this reach anyone. Give it one —\n"
+                  "    cc-scope check-cmd %s %s '<command that exits 0 only when the ask is true>'\n"
+                  "  (%s)\n"
+                  "  or, if no mechanical check can exist, put your own name on it and say what you looked at:\n"
+                  "    cc-scope verify %s %s --evidence \"...\"" % (repo, aid, a["status"], repo, aid, EXAMPLES,
+                                                                   repo, aid),
+                  file=sys.stderr)
+            return 2
+        rc, o = run_check(repo, a)
+        tail = " ".join((o or "").split())[-300:]
+        def upd(x):
+            x["checked"] = {"ts": now(), "cmd": x["check"], "rc": rc, "out": tail}
+            if rc == 0:
+                x["status"], x["closed"] = "delivered", now()
+                x["evidence"] = ((ev + " \u00b7 ") if ev else "") + "check passed: " + x["check"]
+            else:
+                x["notes"].append({"ts": now(), "msg": "check FAILED (rc %d) %s \u2014 %s" % (rc, x["check"], tail[:160])})
+        edit(repo, aid, upd)
+        if rc:
+            print("cc-scope: %s %s is NOT delivered — its check failed (rc %d), so it stays '%s' and stays open.\n"
+                  "  %s\n  %s" % (repo, aid, rc, a["status"], a["check"], tail[:200] or "(no output)"),
+                  file=sys.stderr)
+            return 1
+        print("%s %s delivered — its check passed: %s" % (repo, aid, a["check"]))
+
+    elif cmd in ("claim", "merged", "verify", "declined", "decline", "done", "drop"):
+        state = {"claim": "claimed", "merged": "merged", "verify": "verified", "done": "verified",
                  "decline": "declined", "declined": "declined", "drop": "declined"}[cmd]
         repo, aid = args[0], args[1]
         track, ev, why = opt(args, "--track"), opt(args, "--evidence"), opt(args, "--why")
-        if state == "delivered" and not ev:
-            sys.exit("cc-scope: deliver needs --evidence — an ask is not built by saying so")
-        if state == "verified" and not (ev or load(repo)["asks"].get(aid, {}).get("evidence")):
-            sys.exit("cc-scope: verify needs --evidence — name what proves it (a PR, a commit, the file it "
-                     "now lives in), or deliver it with the evidence first")
+        a = load(repo)["asks"].get(aid, {})
+        if state == "merged":
+            if not ev:
+                sys.exit("cc-scope: merged needs --evidence — the PR or commit that landed")
+            if a.get("status") in DONE:   # a re-run must never drag a delivered row backwards
+                print("%s %s is already %s — a re-merge does not undo it" % (repo, aid, a["status"])); return 0
+        if state == "verified":
+            # A person may close what no machine can measure. They may NOT overrule a check they themselves wrote:
+            # a red check with a confident sentence beside it is the pair that closed two rows the owner then reopened.
+            if has_check(a) and not passed(a):
+                sys.exit("cc-scope: %s names a check and it has not passed — the ledger runs the check, it does "
+                         "not take a sentence for it.\n  %s\nRun it (`cc-scope deliver %s %s`), or replace it "
+                         "with one that can pass (`cc-scope check-cmd %s %s ...`)."
+                         % (aid, a["check"], repo, aid, repo, aid))
+            if not (ev or a.get("evidence")):
+                sys.exit("cc-scope: verify needs --evidence — name what YOU looked at, in your own words. This is "
+                         "the by-hand path for an ask no command can measure, so a PR number is not an answer.")
         if state == "declined" and not why:   # the reason IS the decision: without one this is a drop, and a drop
             sys.exit("cc-scope: decline needs --why — a decline without a reason is the drop this ledger exists "
                      "to catch. Say, in your own words, why it should not be built.")
@@ -346,7 +466,31 @@ def main(argv):
             if why: a["reason"] = why
             a["closed"] = now() if state in SETTLED else ""
         edit(repo, aid, upd)
-        print("%s %s %s" % (repo, aid, state))
+        print("%s %s %s%s" % (repo, aid, state,
+              " — NOT delivered: nothing has observed this yet" if state == "merged" else ""))
+
+    elif cmd == "unverified":
+        # The honest column. Every row the box has said landed, where no check has ever gone green: the merged
+        # ones still owed, and the ones a person closed on their own word. Both are real; neither was measured.
+        rs = [args[0]] if args else repos()
+        rows = [(r, a) for r in rs for a in select(r, None, opt(args, "--track") or None, everything=True)
+                if a["status"] in ("merged", "delivered", "verified") and not passed(a)]
+        if js: print(json.dumps([a for _, a in rows], indent=2)); return 1 if rows else 0
+        if not rows:
+            print("cc-scope: nothing unverified — everything the box says landed was checked, and it passed")
+            return 0
+        print("cc-scope: %d ask(s) the box says landed with nothing observed at the other end:" % len(rows))
+        for r, a in rows:
+            if a["status"] == "merged":
+                why = ("STILL OPEN, names no check — cc-scope check-cmd %s %s '<cmd>'" % (r, a["id"])
+                       if not has_check(a) else "STILL OPEN, its check has not passed: %s" % a["check"])
+            elif a["status"] == "delivered":   # written before a check was required — a sentence, not a measurement
+                why = "STILL OPEN, closed on a sentence: %s" % (a.get("evidence") or "no evidence")
+            else:   # verified: a person's own word, which is allowed and is not the same as measured
+                why = "closed by hand, never measured: %s" % (a.get("evidence") or "no evidence")
+            print("  %-4s %s%s" % (a["id"], "%s/" % r if len(rs) > 1 else "", a["text"][:88]))
+            print("       %s" % why)
+        return 1
 
     elif cmd == "track":
         edit(args[0], args[1], lambda a: a.update(track=args[2])); print("%s %s → %s" % tuple(args[:3]))
@@ -360,10 +504,14 @@ def main(argv):
         open_ = select(repo, None, track)
         where = " for %s" % track if track else ""
         if not open_: print("cc-scope: nothing unsettled%s" % where); return 0
-        print("cc-scope: %d unsettled ask(s)%s — each one is verified against evidence "
-              "(`cc-scope verify %s <id> --evidence \"PR #64\"`) or declined with a reason "
-              "(`cc-scope decline %s <id> --why \"…\"`). Leaving it is the one thing that is not a decision:"
-              % (len(open_), where, repo, repo))
+        m = sum(1 for a in open_ if a["status"] == "merged")
+        print("cc-scope: %d unsettled ask(s)%s%s. Each one is delivered by its OWN check passing "
+              "(`cc-scope check-cmd %s <id> \"<cmd>\"` then `cc-scope deliver %s <id>`), or closed by hand when "
+              "no command can measure it (`cc-scope verify %s <id> --evidence \"what you looked at\"`), or "
+              "declined with a reason (`cc-scope decline %s <id> --why \"…\"`). A PR number is not any of "
+              "those — leaving it is the one thing that is not a decision:"
+              % (len(open_), where, " — %d of them merged but NOT delivered" % m if m else "",
+                 repo, repo, repo, repo))
         for a in open_: print("  " + line(repo, a))
         return 1
 
@@ -372,8 +520,13 @@ def main(argv):
         n = sum(len(select(r)) for r in rs)
         again = sum(1 for r in rs for a in select(r) if a.get("repeats", 1) > 1)
         if cmd == "count": print(n); return
+        # "merged but not delivered" is its own number because it is the owner's own question — he asked
+        # "has it landed yet / what is not done yet" three times, and a single open count could not answer it.
+        m = sum(1 for r in rs for a in select(r) if a["status"] == "merged")
+        why = ", ".join(filter(None, ["%d merged but not delivered" % m if m else "",
+                                      "%d asked more than once" % again if again else ""]))
         if n: print("• 📋 %d ask%s of yours still open%s" % (n, "" if n == 1 else "s",
-                                              " (%d asked more than once)" % again if again else ""))
+                                                            " (%s)" % why if why else ""))
 
     elif cmd == "missed":
         since = float(opt(args, "--since", "24")) * 3600
@@ -450,16 +603,76 @@ def selfcheck():
         t("check exits 1 while an ask is unsettled", quiet(["check", R]) == 1)
         quiet(["claim", R, a1, "--track", "digest"])
         t("a claimed ask is still work", get(R, a1)["status"] == "claimed" and quiet(["check", R]) == 1)
+
+        # ---- MERGED IS NOT DELIVERED -------------------------------------------------------------------
+        # The failure this whole section exists for: rows were closed on "merged as PR #N" while the daemon
+        # still ran the old code, and the owner was the one who found out. A merge is now its own state, it
+        # is not settled, and the only thing that moves a row past it is a command exiting 0.
         try:
-            quiet(["deliver", R, a1]); bad("deliver without evidence is refused")
-        except SystemExit as e: t("deliver without evidence is refused", "evidence" in str(e))
-        quiet(["deliver", R, a1, "--evidence", "PR #64"])
-        t("a delivered ask is still work until it is verified",
-          get(R, a1)["status"] == "delivered" and quiet(["check", R]) == 1)
-        quiet(["verify", R, a1])
-        t("verify inherits the evidence it was delivered with",
-          get(R, a1)["status"] == "verified" and get(R, a1)["evidence"] == "PR #64")
-        t("check exits 0 once nothing is unsettled", quiet(["check", R]) == 0)
+            quiet(["merged", R, a1]); bad("merged without evidence is refused")
+        except SystemExit as e: t("merged without evidence is refused", "evidence" in str(e))
+        quiet(["merged", R, a1, "--evidence", "PR #64"])
+        t("a MERGED ask is still work — a PR number is not delivery",
+          get(R, a1)["status"] == "merged" and quiet(["check", R]) == 1)
+        t("the line you read says so, in as many words",
+          "NOT delivered" in run_capture(["list", R]) and "names no check" in run_capture(["list", R]))
+        t("a merged ask with no check is listed as unverified and stays open",
+          quiet(["unverified", R]) == 1 and "names no check" in run_capture(["unverified", R])
+          and get(R, a1)["status"] == "merged")
+
+        # a row with NO check cannot be delivered at all: exit 2, and it does not move
+        t("deliver on a row that names no check is refused (exit 2) and the row does not move",
+          quiet(["deliver", R, a1]) == 2 and get(R, a1)["status"] == "merged")
+
+        # a check that FAILS cannot reach delivered, however many times it is run
+        quiet(["check-cmd", R, a1, "exit 3"])
+        t("a row whose check fails is NOT delivered and stays exactly where it was",
+          quiet(["deliver", R, a1]) == 1 and get(R, a1)["status"] == "merged"
+          and get(R, a1)["checked"]["rc"] == 3)
+        t("the failure is written next to the ask, not swallowed",
+          any("check FAILED" in n["msg"] for n in get(R, a1)["notes"]))
+        try:
+            quiet(["verify", R, a1, "--evidence", "I looked and it is fine, honestly"])
+            bad("a red check cannot be talked round with a sentence")
+        except SystemExit as e:
+            t("a red check cannot be talked round with a sentence", "has not passed" in str(e))
+        t("...and the row is still not settled", get(R, a1)["status"] == "merged" and quiet(["check", R]) == 1)
+
+        # and a check that PASSES is what delivery means
+        quiet(["check-cmd", R, a1, "true"])
+        t("a check that passes is what makes a row delivered",
+          quiet(["deliver", R, a1]) == 0 and get(R, a1)["status"] == "delivered")
+        t("the evidence is the check itself, not a sentence about it",
+          "check passed: true" in get(R, a1)["evidence"])
+        t("a delivered ask is settled: it stops being work", quiet(["check", R]) == 0)
+        t("a delivered ask is not unverified", quiet(["unverified", R]) == 0)
+        t("re-running deliver is a no-op — same state, still delivered",
+          quiet(["deliver", R, a1]) == 0 and get(R, a1)["status"] == "delivered")
+        t("re-marking it merged does not drag a delivered row backwards",
+          quiet(["merged", R, a1, "--evidence", "PR #64 again"]) == 0 and get(R, a1)["status"] == "delivered")
+
+        # the by-hand path, for the ask no command can measure — it is a PERSON's word and it is marked as one
+        a2b, _ = add(R, "make the tone of the updates warmer")
+        t("an ask with no possible check still cannot be delivered", quiet(["deliver", R, a2b]) == 2)
+        quiet(["verify", R, a2b, "--evidence", "read the last six updates in the channel myself"])
+        t("a person may close what no command can measure", get(R, a2b)["status"] == "verified")
+        t("...and it is still counted as never measured",
+          quiet(["unverified", R]) == 1 and "closed by hand" in run_capture(["unverified", R]))
+
+        # A row written before any of this existed sits in `delivered` on a sentence. Reading it as settled
+        # now — same word, new meaning — would close it without anything ever having been measured, which is
+        # this bug wearing the fix's clothes. It goes back on the queue.
+        with Lock(R):
+            d = load(R); d["asks"][a1] = dict(d["asks"][a1], status="delivered", checked={},
+                                              evidence="merged as PR #64 on main; deployed"); save(R, d)
+        t("a row closed on a sentence before checks existed is NOT settled by the word 'delivered'",
+          quiet(["check", R]) == 1 and a1 in run_capture(["list", R]))
+        t("it says why, on the line you read", "back on the queue" in run_capture(["list", R]))
+        t("and it is reported unverified, with the sentence it was closed on",
+          quiet(["unverified", R]) == 1 and "closed on a sentence" in run_capture(["unverified", R]))
+        quiet(["check-cmd", R, a1, "true"]); quiet(["deliver", R, a1])
+        t("giving it a check that passes is what settles it", quiet(["check", R]) == 0)
+
         a3, _ = add(R, "rewrite the whole box in rust")
         try:
             quiet(["verify", R, a3]); bad("verify without any evidence is refused")
@@ -479,13 +692,15 @@ def selfcheck():
 
         t("a replay matches any status and changes nothing",
           add(R, "make the digest show open asks", replay=True) == (a1, True) and get(R, a1)["repeats"] == 2)
+        t("a check is carried on the row from the moment it is opened",
+          get(R, add(R, "keep the tmux server up", check="test -d /")[0])["check"] == "test -d /")
         quiet(["decline", R, a3, "--why", "still no"]) if get(R, a3)["status"] != "declined" else None
         a4, rep4 = add(R, "rewrite the whole box in rust")
         t("asked again after a decline, it is back on the queue with the reason kept",
           a4 == a3 and rep4 and get(R, a3)["status"] == "open" and "down for a week" in get(R, a3)["reason"])
         quiet(["decline", R, a3, "--why", "same answer as before"])
         a5, rep5 = add(R, "make the digest show open asks")
-        t("asked again after it was verified, it is a NEW row — that is a regression, not a repeat",
+        t("asked again after it was delivered, it is a NEW row — that is a regression, not a repeat",
           a5 != a1 and not rep5)
         quiet(["decline", R, a5, "--why", "fixture"])
 
@@ -514,10 +729,12 @@ def selfcheck():
 
 
 def quiet(argv):
-    """main() with its stdout swallowed — the selfcheck asserts on exit codes, not on the printed report."""
+    """main() with its output swallowed — the selfcheck asserts on exit codes, not on the printed report.
+    stderr too: the refusals below are meant to be long and explain themselves, and a passing suite should
+    not scroll a page of advice for a case that behaved exactly as it was asserted to."""
     import io, contextlib
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf): return main(argv) or 0
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf): return main(argv) or 0
 
 
 def run_capture(argv):
