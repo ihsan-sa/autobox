@@ -8,9 +8,11 @@
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
 # role=member = every worker gate PLUS: no dispatching workers, no reading the box's secrets, no re-wiring Slack.
+# It also gates whichever session is NOT live during an overlapping handoff (cc-handoff), by session id and
+# by $CC_HANDOFF rather than by a marker: the two sessions share one cwd, so the walk below cannot tell them apart.
 set -uo pipefail
 # No jq = no cwd, so no marker walk either: fail CLOSED on the role we do know from the env (cc sets it for both).
-command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}" in worker|member) echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2;; esac; exit 0; }
+command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in *worker*|*member*|*handoff*) echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2;; esac; exit 0; }
 inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""' <<<"$inp"); cwd=$(realpath -m -- "${cwd:-/}" 2>/dev/null || echo "$cwd")
 # A command position: start, after a separator/substitution, or after wrapper words that hide the real command
 # (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
@@ -28,12 +30,48 @@ if [ "$role" != member ]; then   # walk up for a marker — one stat per level, 
     [ -f "$d/.cc/track" ] && { role=worker; break; }
     d=$(dirname "$d"); done
 fi
+# An OVERLAPPING HANDOFF (cc-handoff): two sessions share this cwd, and exactly one of them is LIVE. The other
+# may read, search, think and ask its peer — it may not act on the world. A marker file could not do this: the
+# walk above is keyed on the cwd, which both sessions share, so it would gate the live one too. The keys here
+# are per-session instead — the payload's session_id for the predecessor (already running when the overlap
+# opened, so nothing could be put in its env) and $CC_HANDOFF for the successor (`cc __runnext` exports it;
+# the hook is a child of the claude process, not of the Bash tool, so the model cannot unset it).
+# SYMMETRIC ON PURPOSE: after cutover the PREDECESSOR is the non-live one, and a retired session that lingers
+# must not push a stale branch. Every unreadable case falls the same way — the successor is gated, the
+# predecessor is not — so a broken record can never leave the channel ownerless.
+handoff_gated=""
+if [ -n "${CC_HANDOFF:-}" ] || [ -d "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}" ]; then
+  sid=$(jq -r '.session_id // ""' <<<"$inp"); seen=""
+  for rec in "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}"/*.json; do
+    [ -f "$rec" ] || continue
+    v=$(jq -r --arg sid "$sid" --arg hid "${CC_HANDOFF:-}" '
+      if ((.id // "") == "" or (.target // "") == "") then "" else
+        (if .live == "successor" then "successor" else "predecessor" end) as $l |
+        (if $l == "successor" then "predecessor" else "successor" end) as $o |
+        if ($hid != "" and .id == $hid) then (if $l == "successor" then "mine" else "mine gate" end)
+        elif ($sid != "" and ((.[$o].session_id // "") == $sid)) then "gate"
+        else "" end
+      end' "$rec" 2>/dev/null) || v=""
+    case " $v " in *" mine "*) seen=1;; esac
+    case " $v " in *" gate "*) handoff_gated=1;; esac
+  done
+  # $CC_HANDOFF with no record to justify it (missing, corrupt, unreadable) = the successor stays gated.
+  [ -n "${CC_HANDOFF:-}" ] && [ -z "$seen" ] && handoff_gated=1
+fi
+[ -n "$handoff_gated" ] && [ "$role" != member ] && role=worker   # the four owner gates below, at least
 case "$role" in worker|member) ;; *) exit 0;; esac
 deny(){ echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
+denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
 secret_path(){ case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json) return 0;; esac; return 1; }
 case "$tool" in
   Bash)
     cmd=$(jq -r '.tool_input.command // ""' <<<"$inp"); cmd=${cmd//\"/}; cmd=${cmd//\'/}
+    if [ -n "$handoff_gated" ]; then   # on top of the four gates below: what only the LIVE session may do
+      grep -qE 'git +push\b' <<<"$cmd" && denyh "pushing while the other session is the live one (a retired session must not push a stale branch)"
+      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && denyh "dispatching a worker (cc --go)"
+      grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd" && denyh "dispatching a worker (cc-loop)"
+      grep -qE "$AT"'([^ ]*/)?cc +done\b' <<<"$cmd" && denyh "opening a PR (cc done)"
+    fi
     # 1. merge/deploy
     grep -qE "$AT"'gh +pr +merge' <<<"$cmd" && deny "merging a PR"
     grep -qE 'git +push[^;&|]*( -f|--force|--force-with-lease)' <<<"$cmd" && deny "force push"

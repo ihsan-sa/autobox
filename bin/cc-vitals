@@ -34,6 +34,8 @@ sparklines, no dependencies — works today. When the answer comes, that one fun
   cc-vitals selfcheck               tests; touches nothing outside a temp dir
 """
 import glob
+import datetime as dt
+import io
 import json
 import os
 import re
@@ -384,8 +386,60 @@ def render_png(spec, out):
     wanted one, its fixed colour for both surfaces, its dash, its label and its legend text. Draw a 0-100 axis,
     clip anything above it and mark the series `over`, plot on SURFACE['bg'] opaque, label every line, keep the
     legend. Nothing else in this file moves."""
-    raise RendererUnavailable("no charting library on this box (no matplotlib, no PIL); installing one is an "
-                              "owner-gated host change and the answer is still open — text chart written instead")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")                      # headless box: no display, never a GUI backend
+        import matplotlib.pyplot as plt
+        from matplotlib.dates import DateFormatter
+    except Exception as e:                         # a box without it still gets the text chart, never an exception
+        raise RendererUnavailable(f"matplotlib is not importable ({e}) — text chart written instead")
+
+    sf, ax_spec = spec["surface"], spec["axis"]
+    t0, step, n = spec["t0"], spec["step"], spec["n"]
+    xs = [dt.datetime.fromtimestamp(t0 + i * step, dt.timezone.utc) for i in range(n)]
+    dark = sf.get("mode") == "dark"
+
+    fig, ax = plt.subplots(figsize=(10.0, 4.4), dpi=110)
+    fig.patch.set_facecolor(sf["bg"]); ax.set_facecolor(sf["bg"])
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(sf["grid"])
+    ax.grid(True, axis="y", color=sf["grid"], linewidth=0.6, alpha=0.7)
+    ax.set_axisbelow(True)
+
+    for sr in spec["series"]:
+        colour = sr["colour"] if dark else sr.get("light", sr["colour"])
+        dash = sr.get("dash") or "solid"
+        style = {"linestyle": "solid"} if dash == "solid" else {"dashes": [float(x) for x in str(dash).split()]}
+        nan = float("nan")                         # a gap must BREAK the line, not join across the missing minutes
+        ys = [nan if v is None else min(v, ax_spec["max"]) for v in sr["norm"]]    # clip: `over` says it was higher
+        ax.plot(xs, ys, color=colour, linewidth=1.6, solid_capstyle="round",
+                label=f"{sr['label']} · {sr['now']['text']}" if isinstance(sr.get("now"), dict)
+                      and sr["now"].get("text") else sr["label"], **style)
+        band = sr.get("norm_max")                  # the max the mean would otherwise hide (temp, RAM)
+        if band:
+            hi = [nan if v is None else min(v, ax_spec["max"]) for v in band]
+            ax.fill_between(xs, ys, hi, color=colour, alpha=0.16, linewidth=0)
+
+    ax.set_ylim(ax_spec["min"], ax_spec["max"]); ax.set_xlim(xs[0], xs[-1])
+    ax.set_ylabel(ax_spec["label"], color=sf["ink2"], fontsize=9)
+    ax.tick_params(colors=sf["ink2"], labelsize=8.5)
+    ax.xaxis.set_major_formatter(DateFormatter("%H:%M", tz=dt.timezone.utc))
+    over = [sr["label"] for sr in spec["series"] if sr.get("over")]
+    title = f"{spec['minutes']} of {n} minutes recorded"
+    if over:
+        title += " · over 100%: " + ", ".join(over)          # clipped lines say so rather than lying flat at the top
+    ax.set_title(title, color=sf["ink2"], fontsize=9, loc="left")
+    leg = ax.legend(loc="upper left", ncol=3, fontsize=8.5, frameon=False,
+                    labelcolor=sf["ink"], borderaxespad=0.4)   # 6 series: a legend is not optional
+    for t in leg.get_texts():
+        t.set_color(sf["ink"])
+    fig.tight_layout(pad=0.8)
+    buf = io.BytesIO()                                         # RETURN the bytes: put() does the temp-file-and-rename,
+    fig.savefig(buf, format="png", facecolor=sf["bg"], edgecolor="none")   # so a tab reading mid-write never sees half
+    plt.close(fig)                                             # a chart. Opaque: Slack composites on its own surface.
+    return buf.getvalue()
 
 
 BACKENDS = {"text": "txt", "png": "png"}
@@ -578,21 +632,27 @@ def selfcheck():
         check("temperature and RAM carry the max band the owner asked for; the others do not",
               all((x["norm_max"] is not None) == (x["key"] in ("temp", "ram")) for x in s["series"]))
 
-        # -- THE SEAM ------------------------------------------------------------------------------------------
-        try:
-            render_png(s, f"{tmp}/x.png")
-            ok = False
-        except RendererUnavailable as e:
-            ok = "owner" in str(e)
-        check("the PNG backend refuses out loud, owner-gated, instead of half-drawing", ok)
+        # -- THE SEAM (closed 2026-08-31: the owner approved the install, so the renderer is real) --------------
+        png = render_png(s, f"{tmp}/x.png")
+        check("the PNG backend returns real PNG BYTES — put() does the atomic rename, so a tab reading while we "
+              "write never sees half a chart",
+              isinstance(png, bytes) and png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 4000)
         t = render_text(s, 20)
-        check("the text chart works today with nothing installed", "CPU" in t and "temp" in t)
+        check("the text chart still works, and is what a box with no library gets", "CPU" in t and "temp" in t)
         check("...and labels each line with its real number", "/457G" in t)
         wrote, why = render("auto")
         check("render writes the data payload whether or not a chart can be drawn", "current.json" in wrote)
-        check("auto falls back to the text chart and says why", "current.txt" in wrote and "matplotlib" in why)
-        check("no PNG is left claiming to be current",
-              "current.png" not in wrote and not os.path.exists(f"{tmp}/current.png"))
+        check("auto draws the picture AND keeps the text one beside it — the text is what shows while a fresh "
+              "image is being made, and in the first hour after a boot",
+              "current.png" in wrote and "current.txt" in wrote and not why)
+        _mpl = sys.modules.get("matplotlib")                  # a box WITHOUT the library must still degrade, not raise
+        sys.modules["matplotlib"] = None
+        try:
+            wrote2, why2 = render("auto")
+        finally:
+            sys.modules["matplotlib"] = _mpl if _mpl is not None else sys.modules.pop("matplotlib", None)
+        check("no library: it falls back to the text chart and says why, instead of raising",
+              "current.txt" in wrote2 and "matplotlib" in why2)
         check("current.json is valid JSON with a dense axis", json.load(open(f"{tmp}/current.json"))["step"] == 60)
         check("nothing is left half-written: temp files are renamed into place", not glob.glob(f"{tmp}/.*.tmp"))
 

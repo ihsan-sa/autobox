@@ -170,6 +170,39 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t
 [ "$(g Bash '{"command":"cc r t --go x"}' "$mf")" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$HOME" | CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
+echo "== overlapping handoff: two sessions, one cwd, exactly one of them live =="
+export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_WAIT=1   # never the box's own records, never a 10-min wait
+ho=$("$B/cc-handoff" selfcheck 2>&1 | tail -1)
+grep -q '0 failed' <<<"$ho" && ok "cc-handoff selfcheck: ${ho##*: }" || bad "cc-handoff selfcheck: $ho"
+st=$("$B/cc" handoff --status 2>&1); grep -q "no overlapping handoff is open" <<<"$st" && ok "cc handoff --status delegates by target" || bad "cc handoff --status: [$st]"
+out=$(CC_HANDOFF_OVERLAP=0 "$B/cc" handoff --overlap "$REPO" 2>&1); rc=$?
+{ [ $rc != 0 ] && grep -q "CC_HANDOFF_OVERLAP" <<<"$out"; } && ok "the overlap path is off until it is turned on (the old handoff is untouched)" || bad "overlap not gated by config: $out"
+# a real predecessor window; the successor's `claude` is /bin/true, so its pane falls through to the wrapper shell
+tmux new-window -d -t main -n "$REPO/hx" -c "$T" "bash -c 'sleep 300; :'"   # a real child: `pane_live` is what tells a session from a bare shell
+out=$(CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hx" --session sid-pre --in-flight "uncommitted work in hx" 2>&1)
+hid=$(jq -r .id "$T/handoff/$REPO--hx.json" 2>/dev/null)
+{ [ -n "$hid" ] && [ "$(jq -r .live "$T/handoff/$REPO--hx.json")" = predecessor ]; } && ok "the record names the predecessor as live from the first instant" || bad "overlap record: $out"
+grep -q "uncommitted work in hx" "$T/handoff/$REPO--hx.brief" 2>/dev/null && ok "the successor's brief carries what is unfinished RIGHT NOW" || bad "successor brief has no in-flight checklist"
+tmux list-windows -t main -F '#W' | grep -qx "$REPO/hx~next" && ok "the successor came up ALONGSIDE — the predecessor was not stopped" || bad "no successor window"
+CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hx" >/dev/null 2>&1 && bad "a second overlap was allowed for one target" || ok "an overlap is refused while one is open — one successor at a time"
+# the guard, from BOTH sides of the record. cwd is $T: no marker, so only the record can gate.
+h(){ printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s","session_id":"%s"}' "$1" "$T" "${3:-}" | env CC_HANDOFF="${2:-}" "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+miss=""; for c in "gh pr merge 1" "git push origin HEAD" "cc r t --go x" "cc done r t" "sudo apt install x"; do
+  [ "$(h "$c" "$hid")" = 2 ] || miss="$miss [$c]"; done
+[ -z "$miss" ] && ok "the non-live successor is denied merge/push/dispatch/PR/host — by its env, not by a marker" || bad "successor not gated:$miss"
+[ "$(h "git log --oneline" "$hid")" = 0 ] && ok "...and may still read, search and think" || bad "successor over-gated"
+[ "$(h "gh pr merge 1" "" sid-pre)" = 0 ] && ok "the LIVE predecessor is gated by none of it" || bad "predecessor gated while live"
+CC_HANDOFF="$hid" "$B/cc-handoff" --ready "$REPO/hx" >/dev/null 2>&1
+[ "$(jq -r .live "$T/handoff/$REPO--hx.json" 2>/dev/null)" = successor ] && ok "one atomic replace moves ownership — the successor is live" || bad "cutover did not move the record"
+{ [ "$(h "gh pr merge 1" "" sid-pre)" = 2 ] && [ "$(h "git push origin HEAD" "" sid-pre)" = 2 ]; } && ok "SYMMETRY: after cutover the retired PREDECESSOR is the gated one (no stale-branch push)" || bad "predecessor not gated after cutover"
+[ "$(h "gh pr merge 1" "$hid")" = 0 ] && ok "...and the successor, now live, is free" || bad "successor still gated after cutover"
+[ "$(h "gh pr merge 1" "no-such-record")" = 2 ] && ok "CC_HANDOFF with no record to justify it stays gated (missing = the predecessor is in charge)" || bad "unbacked CC_HANDOFF ungated"
+echo '{not json' > "$T/handoff/$REPO--hx.json"
+{ [ "$(h "gh pr merge 1" "" sid-pre)" = 0 ] && [ "$(h "gh pr merge 1" "$hid")" = 2 ]; } && ok "a corrupt record falls one way only: predecessor free, successor gated" || bad "corrupt record fell the wrong way"
+rm -f "$T/handoff/$REPO--hx.json"
+for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hx" '$2==r || $2==r"~next"{print $1}'); do tmux kill-window -t "$id"; done
+unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_WAIT
+
 echo "== cc-notify: an escalation reaches the OWNER, not the channel it came from =="
 # own HOME (the box's real config and owner id stay out of this) + a stub bot: the args cc-notify hands cc-slack ARE the routing
 NH="$T/nh"; mkdir -p "$NH/bin" "$NH/.cc" "$T/chan/.cc" "$T/plain"; : > "$T/chan/.cc/member-facing"

@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""cc-handoff — overlapping handoff: the successor starts ALONGSIDE its predecessor, reads the journal, asks
+what the journal missed, and only then retires it. Nothing has to be idle for a session to start, so there is
+nothing to defer on — which is what dissolves the "handoff PENDING, deferred again" loop.
+
+  cc-handoff --overlap <target> [--pct N] [--session ID] [--in-flight "…"]   start a successor alongside
+  cc-handoff --ready [<target>] [--forced]                run BY THE SUCCESSOR: preflight, commit, retire
+  cc-handoff --abandon <target> [--why "…"]               give up: successor's window goes, record clears
+  cc-handoff --due <target> [--over-ceiling]              the deadline: below the ceiling abandon, at/over force
+  cc-handoff --retire <target>                            internal: wait out the predecessor, rename, clear
+  cc-handoff --status [<target>] [--json]                 what phase, who is live, how long left
+  cc-handoff selfcheck
+
+TARGET is `<repo>` (a planning session) or `<repo>/<track>` — the same address the Slack layer routes on, and
+also the tmux window name in session `main`. The successor's window is `<target>~next` until cutover.
+
+THE INVARIANT. One record file, ~/.cc/state/handoff/<target>.json, names the LIVE session. The live one owns
+the channel and may act on the world; the other is muted and gated (cc-guard reads the same record). Cutover
+is ONE atomic os.replace() of that record — the single commit point — and everything after it is derived,
+idempotent and retried, never rolled back. Ownership only ever moves forward, on an explicit successful act,
+so every failure lands on "the predecessor is still in charge": a missing, corrupt or unreadable record means
+the predecessor keeps the channel and the successor stays gated.
+
+BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 45 min, ~/.cc/config). The watchdog is the
+predecessor's own Stop hook, which already runs every turn — no new timer, no new daemon. At the deadline the
+context ceiling decides: below it, abandon and tell the owner once; at or over it, force the cutover, or fall
+back to today's stop-then-restart `cc handoff`. The new path fails INTO the old one and cannot take it down.
+
+Env: CC_HANDOFF (the successor's own record id, exported into its process by `cc __runnext`) ·
+CC_HANDOFF_DIR, CC_CTX_RECORDS (test hooks: put the record and the ledger somewhere else).
+"""
+import json, os, re, shlex, subprocess, sys, time, uuid
+
+STATE = os.path.expanduser("~/.cc/state")
+HANDOFF = os.environ.get("CC_HANDOFF_DIR") or os.path.join(STATE, "handoff")
+RECORDS = os.environ.get("CC_CTX_RECORDS") or os.path.join(STATE, "context")
+BIN = os.path.dirname(os.path.realpath(__file__))
+SESSION = "main"
+NEXT = "~next"                     # the successor's window suffix; `~` is not legal in a repo/track name
+DEFAULT_MAX = 45 * 60
+TARGET_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$")
+
+
+def cfg(name, default):
+    """A number from the environment, else ~/.cc/config (read, never sourced — that file holds tokens)."""
+    v = os.environ.get(name)
+    if v is None:
+        try:
+            with open(os.path.expanduser("~/.cc/config")) as f:
+                for l in f:
+                    if l.startswith(name + "="):
+                        v = l.split("=", 1)[1].strip()
+        except OSError:
+            pass
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def enabled():
+    """Off until the channel layer can mute a non-live session: two sessions answering one channel is worse
+    than a handoff that defers. `CC_HANDOFF_OVERLAP=1` in ~/.cc/config turns the whole path on."""
+    return cfg("CC_HANDOFF_OVERLAP", 0) >= 1
+
+
+# ---- the record ----------------------------------------------------------------------------------------
+
+def slug(target):
+    return target.replace("/", "--")
+
+
+def path(target):
+    return os.path.join(HANDOFF, slug(target) + ".json")
+
+
+def read(target):
+    """The open overlap for this target, or None. Missing and corrupt read the same on purpose: both mean
+    'nobody has taken over', which is the direction every failure here must fall."""
+    try:
+        with open(path(target)) as f:
+            r = json.load(f)
+    except Exception:
+        return None
+    return r if isinstance(r, dict) and r.get("id") and r.get("target") else None
+
+
+def read_all():
+    out = []
+    for n in sorted(os.listdir(HANDOFF) if os.path.isdir(HANDOFF) else []):
+        if not n.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(HANDOFF, n)) as f:
+                r = json.load(f)
+        except Exception:
+            continue                      # one bad record never hides the rest
+        if isinstance(r, dict) and r.get("id") and r.get("target"):
+            out.append(r)
+    return out
+
+
+def by_id(hid):
+    for r in read_all():
+        if r.get("id") == hid:
+            return r
+    return None
+
+
+def write(rec):
+    """THE COMMIT POINT. One os.replace(): every consumer sees either the whole old record or the whole new
+    one, and there is no instant in which nobody is in charge."""
+    os.makedirs(HANDOFF, exist_ok=True)
+    p = path(rec["target"])
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, p)
+    return rec
+
+
+def brief_path(target):
+    return os.path.join(HANDOFF, slug(target) + ".brief")
+
+
+def clear(target):
+    for f in (path(target), brief_path(target)):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def live_side(rec):
+    return "successor" if rec.get("live") == "successor" else "predecessor"
+
+
+def ledger(rec, kind, why=""):
+    """One countable line per phase — the handoff count stays a `wc -l`. `phases` in the record is what makes
+    it once and not once per retry; an abandoned record is deleted, so a second --abandon is a no-op."""
+    if kind in rec.setdefault("phases", []):
+        return False
+    rec["phases"].append(kind)
+    os.makedirs(RECORDS, exist_ok=True)
+    repo, _, track = rec["target"].partition("/")
+    row = {"ts": time.time(), "kind": kind, "handoff": rec["id"], "target": rec["target"],
+           "repo": repo, "track": track or None, "pct": rec.get("pct_at_start"),
+           "session_id": (rec.get(live_side(rec)) or {}).get("session_id")}
+    if why:
+        row["why"] = why
+    with open(os.path.join(RECORDS, "handoffs.jsonl"), "a") as f:
+        f.write(json.dumps(row) + "\n")
+    return True
+
+
+# ---- tmux ----------------------------------------------------------------------------------------------
+
+def tmux(*args, timeout=10):
+    try:
+        r = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def win_id(name):
+    """Address windows by id: names with `.` or `/` break `-t main:<name>`."""
+    for l in (tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #W") or "").splitlines():
+        wid, _, n = l.partition(" ")
+        if n == name:
+            return wid
+    return None
+
+
+def pane_live(name):
+    """A window whose wrapper shell has a child = a real session; a bare fallback shell has none."""
+    wid = win_id(name)
+    if not wid:
+        return False
+    pids = (tmux("list-panes", "-t", wid, "-F", "#{pane_pid}") or "").split()
+    if not pids:
+        return False
+    try:
+        return subprocess.run(["pgrep", "-P", pids[0]], capture_output=True).returncode == 0
+    except Exception:
+        return False
+
+
+def run(argv, wait=True):
+    try:
+        if wait:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=60).returncode == 0
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def notify(title, msg):
+    run([os.path.join(BIN, "cc-notify"), "-t", title, msg])
+
+
+# ---- phases --------------------------------------------------------------------------------------------
+
+BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. Read {journal} first — that file, and \
+what your predecessor tells you, is everything you start from. You are NOT the live session yet: the live one \
+owns this target's channel and may act on the world, and cc-guard refuses merging, pushing, deploying, \
+dispatching workers, `cc done` and outward posts from you until you take over. Read, search, think and ask — \
+and NEVER ask your predecessor to run something you are denied. Your predecessor is still working in this same \
+directory: it is the peer whose tmux id is {tmux} in `ListAgents`, so reach it with `SendMessage` (bidirectional, \
+out of band from the channel) and ask what the journal does not answer; subscribe with notify_when_idle, which \
+is also how you hear if it exits. {flight} When you have the context and NOT BEFORE, run `cc-handoff --ready` — \
+that single call is the commit point: it makes you live and retires your predecessor. If you cannot get there, \
+say so in the journal; the overlap expires on its own and your predecessor simply carries on."""
+
+
+def start(target, pct=None, session_id="", flight=""):
+    """--overlap: the successor comes up beside the predecessor, muted and gated, with the same working
+    directory. Refused while a record for this target is open — one successor at a time, never a chain."""
+    if not TARGET_RE.match(target):
+        print(f"cc-handoff: '{target}' is not a target (<repo> or <repo>/<track>)", file=sys.stderr)
+        return 1
+    old = read(target)
+    if old:
+        print(f"cc-handoff: {target} already has an overlap open "
+              f"(phase {old.get('phase')}, live {live_side(old)}) — one successor at a time")
+        return 1
+    wid = win_id(target)
+    if not wid:
+        print(f"cc-handoff: no live window main:{target} — nothing to start alongside")
+        return 1
+    if win_id(target + NEXT):
+        print(f"cc-handoff: main:{target}{NEXT} already exists with no record — clear it by hand first")
+        return 1
+    now = time.time()
+    hid = uuid.uuid4().hex[:12]
+    sid = str(uuid.uuid4())
+    rec = {"id": hid, "target": target, "phase": "overlap", "live": "predecessor",
+           "predecessor": {"session_id": session_id or "", "tmux": wid, "window": target},
+           "successor": {"session_id": sid, "tmux": "", "window": target + NEXT},
+           "started": now, "deadline": now + cfg("CC_HANDOFF_OVERLAP_MAX", DEFAULT_MAX),
+           "pct_at_start": pct, "told_owner": None, "phases": []}
+    ledger(rec, "overlap-started")
+    write(rec)          # before the window, never after: a successor whose record is missing must find itself gated
+    repo, _, track = target.partition("/")
+    journal = (f"~/.cc/state/{repo}/{track}/progress.md" if track else f"~/.cc/state/{repo}/planning-handoff.md")
+    with open(brief_path(target), "w") as f:
+        f.write(BRIEF.format(target=target, journal=journal, tmux=wid,
+                             flight=(f"Unfinished RIGHT NOW, which a journal always omits: {flight} — ask about it."
+                                     if flight else "")))
+    cmd = ""
+    for v in ("CC_CLAUDE", "CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG", "CC_HANDOFF_DIR", "CC_CTX_RECORDS"):
+        if os.environ.get(v):                     # the new window has the tmux server's env, not ours
+            cmd += "%s=%s " % (v, shlex.quote(os.environ[v]))
+    cmd += "%s __runnext %s %s %s; echo; echo '[successor exited — shell stays]'; exec bash" % (
+        shlex.quote(os.path.join(BIN, "cc")), shlex.quote(target), hid, sid)
+    if tmux("new-window", "-d", "-t", SESSION, "-n", target + NEXT, cmd) is None:
+        clear(target)                             # nothing came up: leave no record claiming there is a successor
+        print(f"cc-handoff: could not start main:{target}{NEXT} — no overlap opened", file=sys.stderr)
+        return 1
+    rec["successor"]["tmux"] = win_id(target + NEXT) or ""
+    write(rec)
+    print(f"cc-handoff: {target} — successor started in main:{target}{NEXT} (id {hid}); "
+          f"it is muted and gated until it runs `cc-handoff --ready`")
+    return 0
+
+
+def ready(target=None, forced=False):
+    """--ready: run BY THE SUCCESSOR, because the session that knows whether the transfer worked is the one
+    that received it. Preflight, then the single os.replace(), then derive."""
+    hid = os.environ.get("CC_HANDOFF") or ""
+    rec = read(target) if target else (by_id(hid) if hid else None)
+    if not rec:
+        print(f"cc-handoff: no open overlap for {target or 'this session'}", file=sys.stderr)
+        return 1
+    target = rec["target"]
+    if live_side(rec) == "successor":
+        derive(rec)                                # idempotent: a retried --ready re-derives, never rolls back
+        print(f"cc-handoff: {target} already cut over")
+        return 0
+    if not forced and hid != rec["id"]:
+        print("cc-handoff: --ready belongs to the successor (its CC_HANDOFF must match the record); "
+              "the predecessor's watchdog uses --forced", file=sys.stderr)
+        return 1
+    if forced and not pane_live(rec["successor"]["window"]):
+        print(f"cc-handoff: {target} has no live successor to force onto", file=sys.stderr)
+        return 2
+    rec["live"] = "successor"                      # ---- THE COMMIT POINT ----
+    rec["phase"] = "cutover"
+    rec["cutover"] = time.time()
+    ledger(rec, "overlap-forced" if forced else "overlap-cutover")
+    write(rec)
+    derive(rec)
+    print(f"cc-handoff: {target} — the successor is live; the predecessor is journalling, then retiring")
+    return 0
+
+
+def derive(rec):
+    """Everything after the commit point: idempotent, retried, never rolled back. A failure here leaves the
+    record right about WHO IS LIVE and wrong only about cosmetics, and a later turn re-derives the same state."""
+    target = rec["target"]
+    repo, _, track = target.partition("/")
+    sid = (rec.get("successor") or {}).get("session_id")
+    if track and sid:
+        board = os.path.join(BIN, "cc-board")
+        run([board, "set", repo, track, "session_id", sid])
+        run([board, "set", repo, track, "started", "true"])
+        run([board, "note", repo, track, "handoff: the overlapping successor took over"])
+    if pane_live(target):
+        run([os.path.join(BIN, "cc-msg"), target,
+             f"Handoff complete: your successor is live and owns this target now. Append your final entry to "
+             f"the journal — what is done, what is next (ordered), gotchas — then run /exit. You are no longer "
+             f"the live session: merging, pushing, dispatching and posting outward are refused from here on."])
+    run([os.path.realpath(__file__), "--retire", target], wait=False)
+
+
+def retire(target):
+    """--retire: wait the predecessor out, then take its window name and clear the record. Only once its pane
+    is really gone — while it is alive the record must stay, because the record is what keeps it gated."""
+    rec = read(target)
+    if not rec or live_side(rec) != "successor":
+        return 0
+    deadline = time.time() + cfg("CC_HANDOFF_RETIRE_WAIT", 600)
+    while time.time() < deadline and pane_live(target):
+        time.sleep(5)
+    if pane_live(target):
+        print(f"cc-handoff: {target}'s predecessor is still running — it stays gated and keeps its window")
+        return 1
+    wid = win_id(target)
+    if wid:
+        tmux("kill-window", "-t", wid)
+    nid = win_id(target + NEXT)
+    if nid:
+        tmux("rename-window", "-t", nid, target)
+    rec["phase"] = "done"
+    write(rec)
+    clear(target)                                  # nobody is gated any more: the successor is the only session left
+    return 0
+
+
+def abandon(target, why=""):
+    """--abandon: the deadline below the ceiling. The successor's window goes, the record clears, the owner
+    hears it ONCE — the record's absence is what makes a second call a no-op. Never two sessions forever."""
+    rec = read(target)
+    if not rec:
+        return 0
+    if live_side(rec) == "successor":
+        print(f"cc-handoff: {target} has already cut over — nothing to abandon", file=sys.stderr)
+        return 1
+    wid = win_id(rec["successor"]["window"])
+    if wid:
+        tmux("kill-window", "-t", wid)
+    rec["told_owner"] = time.time()
+    ledger(rec, "overlap-abandoned", why)
+    clear(target)
+    notify(target, f"Overlapping handoff abandoned for {target}: {why or 'the successor never became ready'}. "
+                   f"The original session is still running and still in charge.")
+    print(f"cc-handoff: {target} — overlap abandoned, the predecessor carries on")
+    return 0
+
+
+def due(target, over_ceiling=False):
+    """--due: the predecessor's Stop hook, every turn. Silent until the deadline; then the ceiling decides."""
+    rec = read(target)
+    if not rec or live_side(rec) == "successor" or time.time() < rec.get("deadline", 0):
+        return 0
+    if not over_ceiling:
+        return abandon(target, "the successor did not become ready inside the overlap window")
+    if pane_live(rec["successor"]["window"]):
+        return ready(target, forced=True)          # it has the journal, which is all a fresh session ever got
+    repo, _, track = target.partition("/")
+    abandon(target, "at the context ceiling with no live successor")
+    if track:                                      # fall back INTO today's path: stop, journal, restart fresh
+        run([os.path.join(BIN, "cc"), "handoff", repo, track], wait=False)
+    else:
+        notify(target, f"{target} is at its context ceiling and the overlapping handoff did not take. "
+                       f"There is no stop-then-restart path for a planning session — it needs a hand.")
+    return 0
+
+
+def status(target=None, as_json=False):
+    recs = [r for r in ([read(target)] if target else read_all()) if r]
+    if as_json:
+        print(json.dumps(recs))
+        return 0 if recs else 1
+    if not recs:
+        print("no overlapping handoff is open" + (f" for {target}" if target else ""))
+        return 1
+    now = time.time()
+    for r in recs:
+        left = int((r.get("deadline", 0) - now) / 60)
+        alive = "alive" if pane_live(r["successor"]["window"]) else "gone"
+        print(f"{r['target']:<24} {r.get('phase', '?'):<9} live={live_side(r):<11} "
+              f"{left:>4}m left   successor main:{r['successor']['window']} ({alive})   id {r['id']}")
+    return 0
+
+
+# ---- selfcheck -----------------------------------------------------------------------------------------
+
+def selfcheck():
+    import tempfile
+    global HANDOFF, RECORDS, win_id, pane_live, tmux, run, notify
+    p = f = 0
+
+    def ok(what, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+            print(f"  ✓ {what}")
+        else:
+            f += 1
+            print(f"  ✗ {what}")
+
+    with tempfile.TemporaryDirectory() as d:
+        HANDOFF = os.path.join(d, "handoff")
+        RECORDS = os.path.join(d, "context")
+        # nothing real is started, killed or pushed from a selfcheck: tmux and the shell-outs are stubbed
+        wins, msgs = {"r1": "@1"}, []
+
+        def win_id(n):
+            return wins.get(n)
+
+        def pane_live(n):
+            return n in wins
+
+        def tmux(*a, **k):
+            if a[0] == "new-window":
+                wins[a[a.index("-n") + 1]] = "@%d" % (len(wins) + 1)
+            elif a[0] == "kill-window":
+                for n, i in list(wins.items()):
+                    if i == a[-1]:
+                        del wins[n]
+            elif a[0] == "rename-window":
+                for n, i in list(wins.items()):
+                    if i == a[a.index("-t") + 1]:
+                        wins[a[-1]] = wins.pop(n)
+            return ""
+
+        def run(argv, wait=True):
+            msgs.append(list(argv))
+            return True
+
+        def notify(t, m):
+            msgs.append(["notify", t, m])
+
+        ok("a target with a track slugs to one flat file",
+           os.path.basename(path("r1/t1")) == "r1--t1.json" and os.path.basename(path("r1")) == "r1.json")
+        ok("a target cannot escape the record dir", not TARGET_RE.match("../etc")
+           and not TARGET_RE.match("r1/t1/x") and TARGET_RE.match("r1/t1"))
+
+        os.environ.pop("CC_HANDOFF", None)
+        ok("no record at all -> nothing is open", read("r1") is None and status("r1") == 1)
+        ok("an overlap needs a live window", start("nosuch") == 1)
+        ok("an overlap starts on a live window", start("r1", pct=41.2) == 0)
+        rec = read("r1")
+        ok("the record names the predecessor as live", rec and rec["live"] == "predecessor")
+        ok("the deadline is bounded", rec["deadline"] - rec["started"] == DEFAULT_MAX)
+        ok("a second overlap for the same target is refused", start("r1") == 1)
+
+        os.environ["CC_HANDOFF"] = "wrong-id"
+        ok("--ready from a session whose CC_HANDOFF does not match is refused", ready("r1") == 1)
+        ok("...and the predecessor is still live", read("r1")["live"] == "predecessor")
+
+        os.environ["CC_HANDOFF"] = rec["id"]
+        ok("--ready with no target finds the record by CC_HANDOFF", by_id(rec["id"])["target"] == "r1")
+        ok("the successor cuts over", ready() == 0)
+        ok("the commit point moved ownership forward", read("r1")["live"] == "successor")
+        ok("the predecessor was told to journal and exit",
+           any("cc-msg" in a[0] for a in msgs if isinstance(a, list)))
+        ok("--ready is idempotent, never a rollback", ready() == 0 and read("r1")["live"] == "successor")
+        ok("--abandon after cutover is refused", abandon("r1") == 1 and read("r1")["live"] == "successor")
+
+        lines = [json.loads(l) for l in open(os.path.join(RECORDS, "handoffs.jsonl"))]
+        ok("one ledger line per phase, and never two",
+           [l["kind"] for l in lines] == ["overlap-started", "overlap-cutover"])
+
+        # a successor that dies before --ready: ownership never moved, so the predecessor never noticed
+        clear("r1")
+        os.environ.pop("CC_HANDOFF", None)
+        wins.pop("r1~next", None)
+        wins["r1"] = "@1"
+        ok("a fresh overlap opens once the last one is cleared", start("r1") == 0)
+        wins.pop("r1~next", None)                       # the successor's window is gone
+        ok("successor dead before --ready -> the predecessor is still live",
+           read("r1")["live"] == "predecessor" and ready("r1", forced=True) == 2)
+        ok("--due before the deadline does nothing", due("r1") == 0 and read("r1") is not None)
+
+        r = read("r1")
+        r["deadline"] = time.time() - 1
+        write(r)
+        ok("--due past the deadline below the ceiling abandons", due("r1") == 0 and read("r1") is None)
+        ok("the owner heard it once", sum(1 for m in msgs if m and m[0] == "notify") == 1)
+        ok("--due on a cleared record is a no-op (never twice)", due("r1") == 0
+           and sum(1 for m in msgs if m and m[0] == "notify") == 1)
+
+        # at the ceiling with no successor: fall back INTO today's stop-then-restart path
+        wins["r1/t1"] = "@2"
+        start("r1/t1")
+        r = read("r1/t1")
+        r["deadline"] = time.time() - 1
+        write(r)
+        wins.pop("r1/t1~next", None)
+        due("r1/t1", over_ceiling=True)
+        ok("at the ceiling with no successor, the old handoff path runs",
+           any(isinstance(a, list) and a[-2:] == ["r1", "t1"] and a[-3] == "handoff" for a in msgs))
+        ok("...and the record is cleared, so nothing stays gated", read("r1/t1") is None)
+
+        # a corrupt record reads exactly like a missing one: the predecessor is in charge
+        os.makedirs(HANDOFF, exist_ok=True)
+        with open(path("r1"), "w") as fh:
+            fh.write("{not json")
+        ok("a corrupt record is not an open overlap", read("r1") is None and read_all() == [])
+
+    print(f"cc-handoff selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+# ---- cli -----------------------------------------------------------------------------------------------
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "selfcheck":
+        return selfcheck()
+    cmd, rest = argv[0], argv[1:]
+    opt = {}
+    pos = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("--pct", "--session", "--why", "--in-flight"):
+            opt[a[2:].replace("-", "_")] = rest[i + 1] if i + 1 < len(rest) else ""
+            i += 1
+        elif a in ("--forced", "--over-ceiling", "--json"):
+            opt[a.lstrip("-").replace("-", "_")] = True
+        elif a.startswith("--"):
+            print(f"cc-handoff: unknown option {a}", file=sys.stderr)
+            return 1
+        else:
+            pos.append(a)
+        i += 1
+    target = pos[0] if pos else None
+    if target and not TARGET_RE.match(target):
+        print(f"cc-handoff: '{target}' is not a target (<repo> or <repo>/<track>)", file=sys.stderr)
+        return 1
+    if cmd == "--overlap":
+        if not target:
+            print("cc-handoff: --overlap needs a target", file=sys.stderr)
+            return 1
+        if not enabled():
+            print("cc-handoff: the overlapping handoff is off (set CC_HANDOFF_OVERLAP=1 in ~/.cc/config once "
+                  "the channel layer can mute a non-live session)", file=sys.stderr)
+            return 1
+        try:
+            pct = float(opt.get("pct"))
+        except (TypeError, ValueError):
+            pct = None
+        return start(target, pct, opt.get("session", ""), opt.get("in_flight", ""))
+    if cmd == "--ready":
+        return ready(target, bool(opt.get("forced")))
+    if cmd == "--abandon":
+        return abandon(target, opt.get("why", "")) if target else 1
+    if cmd == "--due":
+        return due(target, bool(opt.get("over_ceiling"))) if target else 1
+    if cmd == "--retire":
+        return retire(target) if target else 1
+    if cmd == "--status":
+        return status(target, bool(opt.get("json")))
+    print(__doc__.strip(), file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
