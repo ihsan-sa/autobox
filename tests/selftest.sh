@@ -330,7 +330,9 @@ json.dump(r, open(sys.argv[1], "w"))
 EOP
 for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hs" '$2==r{print $1}'); do tmux kill-window -t "$id"; done   # the predecessor crashed after the cutover
 "$B/cc-handoff" --sweep >/dev/null 2>&1
-[ ! -f "$T/handoff/$REPO--hs.json" ] && ok "a record whose predecessor is GONE past the grace is finalized by the sweep" || bad "stale record survived the sweep"
+[ -f "$T/handoff/$REPO--hs.json" ] && ok "one sweep alone leaves the record: a single 'gone' reading never un-gates" || bad "one sweep finalized alone"
+CC_HANDOFF_GONE_CONFIRM=0 "$B/cc-handoff" --sweep >/dev/null 2>&1
+[ ! -f "$T/handoff/$REPO--hs.json" ] && ok "a record whose predecessor is GONE past the grace is finalized by the sweep (two sweeps apart)" || bad "stale record survived the sweep"
 [ -f "$T/handoff/$hs.done" ] && ok "...the marker is written, so cc-guard un-gates the only session left" || bad "no completion marker from the sweep"
 [ "$(h "cc r t --go x" "$hs")" = 0 ] && ok "...and the survivor of a crashed retirement really is un-gated" || bad "the survivor of a swept handoff is still gated"
 tmux list-windows -t main -F '#{window_id} #W' | grep -qx "$ss $REPO/hs" && ok "...holding the target's window name, so an owner attaching lands on it" || bad "the successor did not take the window name"

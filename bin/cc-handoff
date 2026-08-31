@@ -271,8 +271,10 @@ def run(argv, wait=True):
     try:
         if wait:
             return subprocess.run(argv, capture_output=True, text=True, timeout=60).returncode == 0
-        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+        logd = os.path.join(os.path.expanduser("~"), ".cc", "state", "context")
+        os.makedirs(logd, exist_ok=True)           # a detached fallback that REFUSES must leave its one line somewhere
+        out = open(os.path.join(logd, "handoff.log"), "a")
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
         return True
     except Exception:
         return False
@@ -627,9 +629,24 @@ def sweep():
         target = rec["target"]
         if not TARGET_RE.match(target):
             continue                               # a record naming something that is not a target: not ours to act on
-        if not side_live(rec, "predecessor") and now - (rec.get("cutover") or rec.get("started") or 0) > grace:
-            finalize(rec, "the predecessor's session is gone")
+        pred_live = side_live(rec, "predecessor")
+        if pred_live and rec.get("gone_since"):
+            rec.pop("gone_since", None)            # it came back: a misread, which is exactly what the stamp absorbs
+            write(rec)
+        if not pred_live and now - (rec.get("cutover") or rec.get("started") or 0) > grace:
+            # TWO STRIKES, a sweep apart. One transient tmux/pgrep misread here would un-gate the successor while
+            # the predecessor keeps working — two un-gated voices, the 2026-08-31 incident class. The first sweep
+            # that finds nobody only writes down WHEN; the finalize needs a later sweep still finding nobody.
+            gone = rec.get("gone_since") or 0
+            if not gone:
+                rec["gone_since"] = now
+                write(rec)
+            elif now - gone >= cfg("CC_HANDOFF_GONE_CONFIRM", 300):
+                finalize(rec, "the predecessor's session is gone (two sweeps apart)")
         elif live_side(rec) == "predecessor" and now > rec.get("deadline", 0) + grace:
+            rec = read(target)                     # the DECIDING read: a --ready committing after the loop copied
+            if not rec or live_side(rec) != "predecessor" or now <= rec.get("deadline", 0) + grace:
+                continue                           # this record means the kill below would hit the LIVE successor
             wid = win_id((rec.get("successor") or {}).get("window") or "")
             if wid:
                 tmux("kill-window", "-t", wid)
@@ -868,8 +885,17 @@ def selfcheck():
         # expensive direction and every case below is about not taking one.
         r = cutover("s1")
         ok("a record whose predecessor is still there is left alone", sweep() == 0 and read("s1") is not None)
+        pw = wins["s1"]
         del wins["s1"]                                  # the predecessor is gone: --retire never got to finish
-        ok("a predecessor gone past the grace is finalized", sweep() == 0 and read("s1") is None)
+        ok("one sweep alone never finalizes — a single misread must not un-gate the successor",
+           sweep() == 0 and read("s1") is not None and bool(read("s1").get("gone_since")))
+        wins["s1"] = pw                                 # it came back: the "gone" was a misread
+        ok("...a predecessor seen again withdraws the stamp",
+           sweep() == 0 and read("s1") is not None and not read("s1").get("gone_since"))
+        del wins["s1"]
+        sweep()                                         # strike one: the stamp
+        rr = read("s1"); rr["gone_since"] = time.time() - 301; write(rr)   # a sweep later, still nobody
+        ok("a predecessor gone past the grace is finalized (two sweeps apart)", sweep() == 0 and read("s1") is None)
         ok("...with the marker cc-guard reads, so the survivor is not gated by the record of its own success",
            os.path.exists(done_path(r["id"])))
         ok("...and the successor is left holding the target's window name",
