@@ -7,10 +7,11 @@ true. They drift: a worker is killed and its track stays `running` for days, a P
 the owner's idea of what the box is doing — reads the board, so that drift is exactly what the owner sees.
 
   cc-reconcile [repo …]              report the drift, change nothing
-  cc-reconcile --apply               …and fix what is mechanically decidable
+  cc-reconcile --apply               …and fix what is mechanically decidable, and STOP a runaway
   cc-reconcile --apply --notify      …and push what is NOT to the owner (once a day per finding)
   cc-reconcile selfcheck             the decision table + one end-to-end run, no network
     also: --json · -q · --no-net (never ask GitHub) · --grace SEC (default 600) · --repeat SEC (default 86400)
+          --no-stop (report a runaway, never end it)
 
 TWO KINDS OF DRIFT, and telling them apart is the whole job. A DECIDABLE one has exactly one right answer in
 the evidence — the PR merged, so the track is merged — and is applied. An UNDECIDABLE one needs a person — a
@@ -24,9 +25,24 @@ anything: a `claude` whose cwd is the track's worktree (the Home tab's rule), a 
 tmux window. Any of the three and the track is running, whatever the board says. Missing that would turn
 this into a tool that stops work instead of describing it — hence also --grace, below.
 
+THE ONE RUNAWAY cc-loop CANNOT CATCH is its own. cc-loop judges a loop that is looping — three iterations in a
+row with nothing to show and it stops itself. A loop that is WEDGED never finishes an iteration, so it never
+reaches that judgement, and an ORPHANED worker has no loop above it at all (killing a loop's window re-parents
+its `claude` to systemd, still spending, still editing the worktree). Both are alive, so everything else here
+reads them as healthy. Two facts settle them, and both are cheap:
+  · orphan — a headless `claude` in a track worktree with no `cc-loop <repo> <track>` anywhere. Nothing will
+    time it out, reap it, or commit a line of what it writes. Ended on sight.
+  · wedged — a worker alive with the track's journal, loop log and worktree all untouched for 3 h. cc-loop caps
+    an iteration at 1 h and logs both ends, so three missed beats is not slow, it is stuck. Ended only after
+    TWO runs 20 min apart both saw it, and never while a usage limit is standing — that is a loop waiting, not
+    a loop wedged.
+Ending one means SIGTERM to its process group, `blocked` on the board, and one line to the owner with the
+numbers. There is no spend cap anywhere in this box (owner, 2026-08-31: "no spend cap as some just are
+expensive"): an expensive job that keeps moving is never touched by any of this.
+
 Exit: 0 the board matches reality · 1 something needs a person · 2 usage error.
 """
-import calendar, glob, json, os, re, shutil, subprocess, sys, time
+import calendar, glob, json, os, re, shutil, signal, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))      # siblings come from the same bin/ as this copy: a worktree tests itself
@@ -34,6 +50,8 @@ BOARDS, WTS, STATE = f"{HOME}/.cc/boards", f"{HOME}/.cc/worktrees", f"{HOME}/.cc
 GRACE = 600        # a track the board touched less than this ago is left alone: `cc --go` writes the board, then claude takes a moment to appear
 REPEAT = 86400     # a finding that persists is worth one push a day, not one every timer tick
 PRMAX = 40         # PR lookups per run — a timer job must never stall on the network
+WEDGED = 3 * 3600  # a worker alive with nothing moved for this long: cc-loop caps one iteration at 1 h and logs both ends
+WEDGE_SEEN = 5400  # …and only if the previous run saw it too, which on a 20-min timer is one strike, then another
 TERMINAL = ("merged", "done")
 QUEUED = ("queued", "todo")   # the board says `queued` (one vocabulary with the App Home tab); boards written before
                               # that change, and a hand that still types `todo`, mean both words must be READ here
@@ -53,10 +71,13 @@ def epoch(ts):
 
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
 def procs():
-    """One pass over /proc → (live tracks by process, {ppids}). Two signals, one walk: a `claude` sitting in a
-    track worktree (the same rule the Home tab uses) and a `cc-loop <repo> <track>`, which is the only thing
-    alive while a loop waits out a usage limit. The ppid set is what makes a tmux pane 'live' below."""
+    """One pass over /proc → (live tracks, {ppids}, {track: [worker pids]}, {track: [loop pids]}). Two signals,
+    one walk: a `claude` sitting in a track worktree (the same rule the Home tab uses) and a `cc-loop <repo>
+    <track>`, which is the only thing alive while a loop waits out a usage limit. The ppid set is what makes a
+    tmux pane 'live' below. A WORKER is a headless claude — the budget flag is on the command line of every one
+    of those and of no interactive session, which is exactly how `cc … --go` tells them apart."""
     live, ppids, root = set(), set(), WTS + os.sep
+    workers, loops = {}, {}
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -73,6 +94,7 @@ def procs():
         for i, a in enumerate(argv):                    # `cc-loop <repo> <track> …`, however the shebang re-wrote argv[0]
             if a and os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
                 live.add(f"{argv[i + 1]}/{argv[i + 2]}")
+                loops.setdefault(f"{argv[i + 1]}/{argv[i + 2]}", []).append(int(pid))
                 break
         if comm == "claude":
             try:
@@ -80,8 +102,50 @@ def procs():
             except OSError:
                 continue
             if cwd.startswith(root):
-                live.add("/".join(cwd[len(root):].split(os.sep)[:2]))
-    return live, ppids
+                key = "/".join(cwd[len(root):].split(os.sep)[:2])
+                live.add(key)
+                if any(a.startswith("--max-budget-usd") for a in argv):
+                    workers.setdefault(key, []).append(int(pid))
+    return live, ppids, workers, loops
+
+
+def idle_for(repo, track, wt):
+    """Seconds since the track last MOVED. Three places, because each one alone lies: the journal is written
+    once an iteration, the loop log twice, and the worktree only when there was code to show for it."""
+    newest = 0.0
+    st = f"{STATE}/{repo}/{track}"
+    for path in (f"{st}/progress.md", f"{st}/loop.log", f"{st}/runs", f"{wt}/.git"):
+        try:
+            newest = max(newest, os.stat(path).st_mtime)
+        except OSError:
+            pass
+    try:                                                # a worktree's .git is a FILE pointing at the real gitdir
+        gd = open(f"{wt}/.git").read().strip()
+        if gd.startswith("gitdir:"):
+            newest = max(newest, os.stat(os.path.join(gd[7:].strip(), "HEAD")).st_mtime)
+    except OSError:
+        pass
+    return max(0.0, now() - newest) if newest else 0.0  # nothing to read is not evidence of being stuck
+
+
+def limit_active():
+    """A Claude usage limit still standing. cc-limit owns the stamp; a loop waiting one out is not wedged."""
+    try:
+        return float(open(os.environ.get("CC_LIMIT_STAMP") or f"{STATE}/claude-limit").read().split()[0]) > now()
+    except Exception:
+        return False
+
+
+def runaway(f, seen_before, wedged=WEDGED):
+    """Pure — why this LIVE track is spending without working, or "". The orphan is unambiguous and immediate;
+    the wedged one has to be seen twice, because "nothing moved" is also what a slow hour looks like."""
+    if f.get("orphans"):
+        return ("a headless worker with no cc-loop above it — nothing will time it out, reap it or commit "
+                f"what it writes ({len(f['orphans'])} process(es), {f['idle'] / 3600:.1f} h since anything moved)")
+    if f.get("workers") and not f.get("limited") and f["idle"] >= wedged and seen_before:
+        return (f"its loop is wedged: alive with nothing moved for {f['idle'] / 3600:.1f} h — no commit, no "
+                "journal line, no iteration, and no usage limit to be waiting on")
+    return ""
 
 
 def tmux_live(ppids):
@@ -165,7 +229,10 @@ def decide(f):
     st, live, pr, has_pr = f["status"], f["live"], f.get("pr_state") or "", bool(f.get("pr"))
     jk, jt = f.get("journal") or (None, "")
     out, settled = [], False
-    if live and st in QUEUED + ("blocked",):
+    if f.get("stop_why"):               # spending without producing: the one live track this tool ends rather than describes
+        out.append(("stop", "blocked", f["stop_why"]))
+        settled = True
+    elif live and st in QUEUED + ("blocked",):
         out.append(("fix", "running", "a worker is in its worktree"))
         settled = True
     elif not live and st == "running" and f["age"] >= f.get("grace", GRACE):
@@ -207,10 +274,11 @@ def decide(f):
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────────────────
-def facts(repos, net=True, grace=GRACE):
+def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
     """Every board track, with what the box says about it. Yields (repo, track, board_track, facts)."""
-    live, ppids = procs()
+    live, ppids, workers, loops = procs()
     live |= tmux_live(ppids)
+    seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
     prs, remotes, t0 = 0, {}, now()
     for fn in sorted(glob.glob(f"{BOARDS}/*.json")):
         try:
@@ -229,14 +297,21 @@ def facts(repos, net=True, grace=GRACE):
             wt = t.get("worktree") or f"{WTS}/{repo}/{track}"
             if repo not in remotes:
                 remotes[repo] = has_remote(repo)
-            yield repo, track, t, {
+            key = f"{repo}/{track}"
+            f = {
                 "repo": repo, "track": track, "status": st, "pr": pr,
                 "pr_state": pr_state(repo, pr, net) if ask_pr else ("?" if want_pr and net else None),
                 "live": f"{repo}/{track}" in live, "wt_exists": os.path.isdir(wt),
                 "age": max(0.0, t0 - epoch(t.get("updated") or t.get("created"))), "grace": grace,
                 "journal": journal(repo, track), "loop_end": loop_end(repo, track),
                 "commit_err": os.path.exists(f"{wt}/.cc/checkpoint.err"),
-                "push_err": os.path.exists(f"{wt}/.cc/push.err"), "has_remote": remotes[repo]}
+                "push_err": os.path.exists(f"{wt}/.cc/push.err"), "has_remote": remotes[repo],
+                "workers": workers.get(key, []), "loops": loops.get(key, []), "limited": limited,
+                "orphans": workers.get(key, []) if not loops.get(key) else [],
+                "idle": idle_for(repo, track, wt) if workers.get(key) else 0.0}
+            f["stop_why"] = "" if no_stop else runaway(f, t0 - float(seen.get(key) or 0) <= WEDGE_SEEN, wedged)
+            f["wedged_now"] = bool(f["workers"] and not f["limited"] and f["idle"] >= wedged)
+            yield repo, track, t, f
 
 
 def orphans(repos):
@@ -256,6 +331,27 @@ def orphans(repos):
         if os.path.isdir(p) and f"{repo}/{track}" not in known and (not repos or repo in repos):
             out.append((repo, track, ("ask", None, "a worktree with no board entry")))
     return out
+
+
+def end_it(pids):
+    """SIGTERM to each process's whole group — the worker and the tools it started, exactly the care `cc … --go`
+    takes with an orphan. Never our own group, and a process that is already gone counts as ended."""
+    mine, ok = os.getpgid(0), False
+    for pid in pids:
+        try:
+            pg = os.getpgid(pid)
+        except OSError:
+            ok = True                                   # it left between the walk and here: that is the outcome we wanted
+            continue
+        try:
+            if pg != mine:
+                os.killpg(pg, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)            # not a group leader of its own: take just it
+            ok = True
+        except OSError:
+            pass
+    return ok
 
 
 def board(*args):
@@ -284,10 +380,13 @@ def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
     repos, apply_, notify, as_json, quiet, net, grace, repeat = [], False, False, False, False, True, GRACE, REPEAT
+    no_stop, wedged = False, int(os.environ.get("CC_RECONCILE_WEDGED") or WEDGED)   # env: tests do not wait three hours
     while argv:
         a = argv.pop(0)
         if a == "--apply":
             apply_ = True
+        elif a == "--no-stop":
+            no_stop = True
         elif a == "--notify":
             notify = True
         elif a == "--json":
@@ -314,14 +413,25 @@ def main(argv):
         if not os.path.exists(f"{BOARDS}/{r}.json"):
             print(f"cc-reconcile: no board for '{r}'", file=sys.stderr)
             return 2
-    recs, tracks = [], 0
-    for repo, track, t, f in facts(repos, net, grace):
+    recs, tracks, wedging = [], 0, {}
+    for repo, track, t, f in facts(repos, net, grace, no_stop, wedged):
         tracks += 1
+        if f.get("wedged_now"):
+            wedging[f"{repo}/{track}"] = now()          # one strike; the next run 20 min from now decides
         for kind, st, why in decide(f):
-            recs.append({"repo": repo, "track": track, "kind": kind, "from": f["status"], "to": st, "why": why})
+            rec = {"repo": repo, "track": track, "kind": kind, "from": f["status"], "to": st, "why": why}
+            if kind == "stop":
+                rec["pids"] = f["workers"] + f["loops"]
+            recs.append(rec)
+    ledger(f"{STATE}/wedged.json", wedging)             # only what is still wedged survives: one that recovers starts over
     for repo, track, (kind, st, why) in orphans(repos):
         recs.append({"repo": repo, "track": track, "kind": kind, "from": "", "to": st, "why": why})
     for r in recs:
+        if r["kind"] == "stop":         # the one record that ENDS something instead of describing it
+            r["applied"] = bool(apply_ and end_it(r["pids"])
+                                and board("status", r["repo"], r["track"], "blocked")
+                                and board("note", r["repo"], r["track"], f"stopped by cc-reconcile: {r['why']}"))
+            continue
         r["applied"] = bool(apply_ and r["to"] and r["to"] != r["from"]
                             and board("status", r["repo"], r["track"], r["to"])
                             and board("note", r["repo"], r["track"],
@@ -330,15 +440,18 @@ def main(argv):
         os.makedirs(STATE, exist_ok=True)
         with open(f"{STATE}/reconcile.log", "a") as log:
             for r in (x for x in recs if x["applied"]):
+                what = "STOPPED" if r["kind"] == "stop" else f"{r['from']} -> {r['to']}"
                 log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t"
-                          f"{r['repo']}/{r['track']}\t{r['from']} -> {r['to']}\t{r['why']}\n")
-    asks = [r for r in recs if r["kind"] == "ask"]
+                          f"{r['repo']}/{r['track']}\t{what}\t{r['why']}\n")
+    asks = [r for r in recs if r["kind"] in ("ask", "stop")]   # a runaway that was ended is still a person's to settle
     if as_json:
         print(json.dumps({"tracks": tracks, "records": recs}, indent=2))
     elif not quiet:
         for r in recs:
             move = f"{r['from']} → {r['to']}" if r["to"] and r["to"] != r["from"] else ""
-            word = {"ask": "needs you", "info": "unknown"}.get(r["kind"], "fixed" if r["applied"] else "would fix")
+            word = {"ask": "needs you", "info": "unknown",
+                    "stop": "stopped" if r["applied"] else "runaway"}.get(
+                        r["kind"], "fixed" if r["applied"] else "would fix")
             print(f"  {word:<9}  {r['repo']}/{r['track']:<16} {move:<20} {r['why']}")
         info = sum(r["kind"] == "info" for r in recs)
         print(f"{len(recs) - len(asks) - info} {'fixed' if apply_ else 'to fix'} · {len(asks)} needs you · "
@@ -420,6 +533,27 @@ def selfcheck():
     ok("review with no PR and no remote is silent", decide(F(status="review", has_remote=False)) == [])
     ok("a quiet track says nothing", decide(F(status="review", pr="u", pr_state="OPEN")) == [])
 
+    # the runaway cc-loop cannot catch: its own. Both shapes are ALIVE, which is why nothing else here sees them
+    def W(**kw):
+        d = {"orphans": [], "workers": [111], "loops": [222], "limited": False, "idle": 4 * 3600}
+        d.update(kw)
+        return d
+
+    ok("an orphaned worker — no cc-loop above it — is ended on sight, first sighting and all",
+       "no cc-loop above it" in runaway(W(orphans=[111], loops=[]), False))
+    ok("a worker under its loop, moving, is left alone", runaway(W(idle=60), True) == "")
+    ok("wedged for hours but seen only once → not yet; one run is not two",
+       runaway(W(), False) == "")
+    ok("wedged for hours and the run before saw it too → ended", "wedged" in runaway(W(), True))
+    ok("a loop waiting out a usage limit is waiting, not wedged", runaway(W(limited=True), True) == "")
+    ok("a loop between iterations, with no worker under it, is not wedged", runaway(W(workers=[]), True) == "")
+    ok("an expensive job that keeps moving is never a runaway — there is no spend cap anywhere here",
+       runaway(W(idle=30), True) == "")
+    ok("…and decide() ends it instead of calling it healthy",
+       decide(F(status="running", live=True, stop_why="x"))[0][:2] == ("stop", "blocked"))
+    ok("a track being ended is not also 'fixed' to running",
+       len(decide(F(status="queued", live=True, stop_why="x"))) == 1)
+
     # end to end: a real board, a real worktree, a real apply — in a HOME of its own
     with tempfile.TemporaryDirectory() as th:
         env = dict(os.environ, HOME=th, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log")
@@ -453,6 +587,16 @@ def selfcheck():
            sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines()) == 1)
         ok("end to end: and it is idempotent — the track stays blocked",
            cb("get", repo, "t1", "status").stdout.strip() == "blocked" and r2.returncode == 1)
+        victim = subprocess.Popen(["sleep", "60"], start_new_session=True)   # its own group, so nothing else is in range
+        ended = end_it([victim.pid])
+        try:
+            victim.wait(timeout=10)
+            died = True
+        except Exception:
+            victim.kill()
+            died = False
+        ok("ending a runaway really ends it, group and all", ended and died)
+        ok("a process that is already gone counts as ended, not as a failure", end_it([victim.pid]))
     print(f"cc-reconcile selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 

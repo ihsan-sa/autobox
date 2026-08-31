@@ -7,12 +7,12 @@ headless workers that end in PRs; a 👍 in `#approvals` merges. Deterministic h
 sandbox runs the unrestricted ones. Thread marks tell you at a glance what needs you (❓), nothing else does.
 
 ## What you get
-- `cc` — sessions, tracks (worktree + branch), headless `--go` workers, `done` → PR, `digest`, `handoff`.
+- `cc` — sessions, tracks (worktree + branch), headless `--go` workers, `done` → PR, `digest`, `handoff`. No spend cap: a worker still committing carries past its step limit, and one that stops producing stops itself.
 - `cc-slack` — two-way Slack: `#<repo>` ↔ that repo's session, DMs ↔ the box; permission prompts relayed; `!status`/`!threads`/`!restart` without tokens.
 - Hooks — `cc-checkpoint` (auto-commit+push in worktrees only), `cc-guard` (owner gates for autonomous sessions).
 - `ccbox` — bypass-permissions Claude in Docker with an egress allowlist.
 - `cc-audit` — recurring reviews of how well the box served you (3-day), code audits (weekly, monthly).
-- `cc-reconcile` — the board against the box every 20 min: applies the drift that has one right answer (a PR merged, a worker is gone), reports the drift that needs you.
+- `cc-reconcile` — the board against the box every 20 min: applies the drift that has one right answer (a PR merged, a worker is gone), ends a worker that is spending without working, reports the rest.
 - `cc-publish` — a private box keeps this tree as `core/` and mirrors it back here after every merge, gated on its own name never shipping.
 - Boot/notify — survives power cuts and reboots; Slack/ntfy notices; daily digest.
 - Tests: `tests/check.sh`, `tests/selftest.sh` (84 checks, no API calls), `cc-slack selfcheck`, `tests/slack_sim.py`.

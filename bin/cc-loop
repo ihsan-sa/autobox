@@ -2,12 +2,28 @@
 # cc-loop — autonomous "ralph loop": run headless Claude on a task, fresh context each iteration, rehydrating
 # from a durable progress journal + git, until the task reports DONE / BLOCKED / stalls / caps are hit.
 #   cc-loop <repo> <track> [--once] [--max-iter N=10] [--budget USD/iter=8] [--turns N=80] [--model M] [--effort E] [--quiet]
+# THE STEP LIMIT IS A CHECKPOINT, NOT A VERDICT: reaching --max-iter with work COMMITTED in that iteration buys
+# another N iterations, as often as it keeps committing. There is no spend cap (owner, 2026-08-31: "no spend cap
+# as some just are expensive") — what stops a loop is not being expensive, it is not producing:
+# RUNAWAY — three iterations in a row that show nothing for their money, judged against THIS track's own history:
+#   · committed nothing and left the journal untouched · repeated the previous outcome verbatim without committing
+#   · spent 5x what a committed iteration has cost this track, with no commit for two iterations.
+# One of those is normal. Three consecutively is a loop going nowhere, so it is stopped, the board says `blocked`,
+# and the owner is told once with the numbers.
+# WHAT A LEGITIMATE EXPENSIVE JOB LOOKS LIKE HERE, and why it survives: a $25-an-iteration opus worker on a
+# 40-step refactor commits something most iterations and journals every one. Signal 1 needs BOTH to fail;
+# signal 2 needs the model's own summary to repeat verbatim; signal 3 measures it against ITS OWN mean cost
+# per committed iteration, so $25 is the yardstick, not the alarm — it would have to spend $125 without one
+# commit. And all three are consecutive counters that a single good iteration resets. That job runs, past
+# its step limit, for as long as it keeps producing; what it may never do is spend without producing.
 # Task text:  ~/.cc/state/<repo>/<track>/task.md      (written by `cc <repo> <track> --go "..."` or by hand)
 # Journal:    ~/.cc/state/<repo>/<track>/progress.md  (worker appends; a fresh iteration reads it)
 # Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch).
-# Exit: 0 done | 3 blocked (owner notified) | 4 stalled | 5 errors | 6 max-iter | 7 capped twice with no progress
+# Exit: 0 done | 3 blocked (owner notified) | 5 errors | 6 step limit with nothing committed | 7 capped twice
+#       with no progress | 9 runaway (spending without producing — see above)
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
+# Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # headless workers: same PATH guarantee as cc (systemd-started clients lack ~/bin)
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
@@ -17,6 +33,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --once) MAXI=1;; --max-iter) MAXI="$2"; shift;; --budget) BUDGET="$2"; shift;; --turns) TURNS="$2"; shift;;
   --model) MODEL="$2"; shift;; --effort) EFFORT="$2"; shift;; --quiet) QUIET=1;; *) echo "cc-loop: unknown arg $1" >&2; exit 2;; esac; shift; done
 [[ "$MAXI" =~ ^[0-9]+$ ]] && [ "$MAXI" -ge 1 ] || { echo "cc-loop: --max-iter must be a positive integer (got '$MAXI')" >&2; exit 2; }
+BATCH="$MAXI"; RUNN="${CC_LOOP_RUNAWAY_N:-3}"; RUNX="${CC_LOOP_RUNAWAY_X:-5}"   # one batch of steps; the runaway rule's two dials
 ST="$HOME/.cc/state/$repo/$track"; WT="$HOME/.cc/worktrees/$repo/$track"; BOARD="$BIN/cc-board"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 mkdir -p "$ST/runs"; [ -s "$ST/task.md" ] || { echo "cc-loop: no task at $ST/task.md (use: cc $repo $track --go \"...\")" >&2; exit 2; }
 [ -d "$WT" ] || { echo "cc-loop: no worktree $WT (run: cc $repo $track)" >&2; exit 2; }
@@ -32,14 +49,16 @@ stop(){ local code="$1" title="$2" msg="$3"   # every non-zero exit leaves the b
   "$BOARD" status "$repo" "$track" blocked >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
   log "exit $code: $msg"; "$BIN/cc-notify" -p high -t "$repo/$track $title" "$msg"; exit "$code"; }
 base=$(git -C "$HOME/dev/$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); base="${base:-main}"
-SP="You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry at the end of this iteration: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$base' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Be concise in the journal."
+SP="You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$base' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Be concise in the journal."
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
-i=0; errs=0; caps=0; stall=0; spent=0; limited=0   # limited: the owner has already been told about THIS limit episode
+i=0; errs=0; caps=0; spent=0; limited=0   # limited: the owner has already been told about THIS limit episode
+barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway rule's memory: this track measured against itself
 while [ $i -lt "$MAXI" ]; do
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
     "$BIN/cc-limit" wait || stop 8 "waiting" "Claude $p — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""; fi
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
-  prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Then append your journal entry. Iteration %s of %s.\n' "$(cat "$ST/task.md")" "$(tail -c 6000 "$ST/progress.md")" "$i" "$MAXI")
+  cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
+  prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(tail -c 6000 "$ST/progress.md")" "$i" "$MAXI" "$cont")
   args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP")
   m="$MODEL"; [ -n "$m" ] || m=$("$BIN/cc-model" current 2>/dev/null)   # no explicit --model: follow the box's override (a Fable limit puts everything on Opus)
   [ -n "$m" ] && args+=(--model "$m"); [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
@@ -75,6 +94,25 @@ while [ $i -lt "$MAXI" ]; do
   elif [ "$rc" != 0 ] || [ "$iserr" = true ]; then errs=$((errs+1)); log "error ($errs): $( { head -c 300 "$out.err" 2>/dev/null; [ -s "$out.err" ] || jq -r '"\(.subtype // "")\ \(.result // "" | tostring)"' "$out" 2>/dev/null | head -c 300; } | tr '\n' ' ')"   # a run that errored in-band leaves .err empty: say why from the json
        [ $errs -ge 2 ] && stop 5 "errored" "2 consecutive failures; see $LOG"
   else errs=0; caps=0; fi
-  if [ "$moved" = no ]; then stall=$((stall+1)); [ $stall -ge 2 ] && stop 4 "stalled" "No commits or journal change for 2 iterations; see $LOG"; else stall=0; fi
+  # ── the runaway rule: progress-free SPEND, and every number it uses comes from this track's own history ──
+  committed=no; [ "$before_head" != "$after_head" ] && committed=yes
+  sig=$(jq -r '"\(.subtype // "")|\(.is_error // false)|\((.result // "")|tostring)"' "$out" 2>/dev/null | tr -d '\n' | head -c 160)
+  if [ "$committed" = yes ]; then cn=$((cn+1)); ccost=$(awk -v a="$ccost" -v b="$sincecost" -v c="${cost:-0}" 'BEGIN{printf "%.4f", a+b+c}'); sincecost=0; nocommit=0
+  else sincecost=$(awk -v a="$sincecost" -v b="${cost:-0}" 'BEGIN{printf "%.4f", a+b}'); nocommit=$((nocommit+1)); fi
+  yard=$(awk -v c="$ccost" -v n="$cn" -v b="$BUDGET" 'BEGIN{printf "%.4f", (n>0 ? c/n : b)}')   # what an iteration that DID commit costs this track; before the first one, its own budget
+  why=""
+  if [ "$moved" = no ]; then why="committed nothing and left the journal untouched"
+  elif [ "$committed" = no ] && [ -n "$prevsig" ] && [ "$sig" = "$prevsig" ]; then why="repeated the previous iteration's outcome word for word, with nothing committed"
+  elif [ "$nocommit" -ge 2 ] && awk -v s="$sincecost" -v y="$yard" -v x="$RUNX" 'BEGIN{exit !(y > 0 && s >= x * y)}'; then
+    why="spent \$$sincecost since its last commit — ${RUNX}x what a committed iteration costs this track (\$$yard)"; fi
+  prevsig="$sig"
+  if [ -n "$why" ]; then barren=$((barren+1)); log "runaway signal $barren/$RUNN: $why"
+    [ "$barren" -ge "$RUNN" ] && stop 9 "is running away" "$RUNN iterations in a row with nothing to show for the money: $why. That is $i iterations, \$$spent, last commit $nocommit iteration(s) ago. Nothing capped it — the work itself stopped moving. Read $LOG, then re-scope the task or stop the track."
+  else barren=0; fi
+  # The step limit is a checkpoint, not a verdict: still committing means still working, and nothing caps the spend.
+  if [ $i -ge "$MAXI" ] && [ "$committed" = yes ]; then
+    rounds=$((rounds+1)); MAXI=$((MAXI + BATCH))
+    log "step limit reached with work committed — carrying on for $BATCH more (round $rounds, \$$spent)"
+    "$BOARD" note "$repo" "$track" "picked itself up at the step limit: $i iterations, \$$spent, still committing" >/dev/null 2>&1; fi
 done
-stop 6 "paused" "Hit $MAXI iterations (\$$spent) without DONE. Continue with: cc $repo $track --go \"\" --loop N"
+stop 6 "paused" "Hit $MAXI iterations (\$$spent) and the last one committed nothing, so it did not carry itself on. Continue with: cc $repo $track --go \"\" --loop N"

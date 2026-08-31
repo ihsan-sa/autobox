@@ -42,7 +42,7 @@ F
 cat > "$T/cappedclaude" <<F
 #!/usr/bin/env bash
 st=$HOME/.cc/state/$REPO/w2; n=\$(ls \$st/runs/*.json 2>/dev/null | wc -l)
-echo "capped work \$n" > "capped-\$n.txt"; echo "- capped iteration \$n" >> "\$st/progress.md"
+if [ "\$n" -lt 4 ]; then echo "capped work \$n" > "capped-\$n.txt"; echo "- capped iteration \$n" >> "\$st/progress.md"; fi
 printf '{"is_error":true,"subtype":"error_max_turns","num_turns":80,"total_cost_usd":0.5,"session_id":"x","result":"hit the turn cap"}'
 F
 # stub claude that hangs, to prove a killed loop takes its child with it (H4)
@@ -276,7 +276,8 @@ sleep 1; CC_DONE_LOCK_WAIT=1 PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 > "$T/d
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 echo "do capped work" > ~/.cc/state/$REPO/w2/task.md
 CC_CLAUDE="$T/cappedclaude" "$B/cc-loop" $REPO w2 --max-iter 3 --quiet >/dev/null 2>&1; rc=$?
-[ "$rc" = 6 ] && [ "$(ls ~/.cc/state/$REPO/w2/runs/*.json 2>/dev/null | wc -l)" = 3 ] && ok "productive but capped iterations are not failures (ran 3, exit 6 not 5)" || bad "capped loop: rc=$rc runs=$(ls ~/.cc/state/$REPO/w2/runs/*.json 2>/dev/null | wc -l)"
+runs=$(ls ~/.cc/state/$REPO/w2/runs/*.json 2>/dev/null | wc -l)
+{ [ "$rc" != 5 ] && [ "$runs" -gt 3 ]; } && ok "productive but capped iterations are not failures — the loop ran past its 3-step limit ($runs runs, not exit 5)" || bad "capped loop: rc=$rc runs=$runs"
 grep -q 'capped' ~/.cc/state/$REPO/w2/loop.log && [ "$("$B/cc-board" get $REPO w2 status)" = blocked ] && ok "cap logged + board left blocked, not running" || bad "capped log/board status"
 # H4: a killed loop must not leave claude re-parented to systemd, still editing the worktree
 "$B/cc" $REPO w3 >/dev/null 2>&1; sleep 1
@@ -288,6 +289,53 @@ kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
 [ "$gone" = yes ] && ok "killing the loop kills its claude child (no orphan left in the worktree)" || { bad "orphaned claude survived the loop kill"; pkill -f "$T/sleepclaude"; }
 wait $lp 2>/dev/null; "$B/cc" rm $REPO w3 >/dev/null 2>&1
+echo "== the step limit carries on, and a runaway does not (cc-loop) =="
+# Every stub here is the same shape: it decides per iteration whether to COMMIT (a file in the worktree),
+# whether to JOURNAL, and what it cost. That pair is the whole runaway rule, and the money is never the reason.
+mkclaude(){ cat > "$T/$1" <<F
+#!/usr/bin/env bash
+st=$HOME/.cc/state/$REPO/$2; n=\$(ls \$st/runs/*.json 2>/dev/null | wc -l)   # cc-loop opens THIS run's json before it starts us: n is 1 on the first iteration
+$3
+printf '{"is_error":%s,"num_turns":2,"total_cost_usd":%s,"session_id":"x","result":"%s"}' "\${err:-false}" "\${cost:-0.5}" "\${res:-ok \$n}"
+F
+chmod +x "$T/$1"; }
+mktrack(){ "$B/cc" $REPO "$1" >/dev/null 2>&1; sleep 1; for id in $(wins "$REPO/$1"); do tmux kill-window -t "$id"; done; echo "$2" > ~/.cc/state/$REPO/$1/task.md; }
+lg(){ cat ~/.cc/state/$REPO/$1/loop.log; }
+nruns(){ ls ~/.cc/state/$REPO/$1/runs/*.json 2>/dev/null | wc -l; }
+
+# 1+2: three iterations in a row with nothing to show stop the loop, and the owner hears once, not three times
+mktrack w8 "spin forever"; mkclaude spinclaude w8 ':'   # commits nothing, journals nothing, ever
+nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
+CC_CLAUDE="$T/spinclaude" "$B/cc-loop" $REPO w8 --max-iter 20 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 9 ] && [ "$(nruns w8)" = 3 ]; } && ok "three progress-free iterations stop the loop (exit 9 after 3, not 20)" || bad "runaway: rc=$rc runs=$(nruns w8)"
+lg w8 | grep -q 'runaway signal 3/3' && [ "$("$B/cc-board" get $REPO w8 status)" = blocked ] && ok "…the reason is in the log and the board says blocked — a state a person must settle" || bad "runaway log/board: $(lg w8 | tail -2)"
+n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "w8 is running away")
+[ "$n" = 1 ] && ok "…and the owner is told once, with the numbers — not once per barren iteration" || bad "runaway notify count: $n"
+
+# 3: an expensive job that keeps producing is never touched. $50 an iteration, and no cap anywhere.
+mktrack w9 "expensive but productive"
+mkclaude richclaude w9 'cost=50; echo "work $n" > "rich-$n.txt"; echo "- did step $n" >> "$st/progress.md"; [ "$n" -ge 2 ] && echo "STATUS: DONE" >> "$st/progress.md"'
+CC_CLAUDE="$T/richclaude" "$B/cc-loop" $REPO w9 --max-iter 3 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 0 ] && ! lg w9 | grep -q 'runaway signal'; } && ok "an expensive job that keeps committing runs untouched (\$100, no cap, no signal)" || bad "expensive job flagged: rc=$rc $(lg w9 | grep runaway | head -1)"
+
+# 4+5: the step limit carries on when that iteration COMMITTED, and stops when it did not
+mktrack w10 "carry on once"
+mkclaude carryclaude w10 'if [ "$n" -lt 2 ]; then echo "work $n" > "carry-$n.txt"; fi; echo "- step $n" >> "$st/progress.md"'
+CC_CLAUDE="$T/carryclaude" "$B/cc-loop" $REPO w10 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$(nruns w10)" = 2 ] && [ "$(lg w10 | grep -c 'carrying on')" = 1 ]; } && ok "the step limit is a checkpoint: an iteration that committed buys another batch" || bad "carry-on: runs=$(nruns w10) carried=$(lg w10 | grep -c 'carrying on')"
+{ [ "$rc" = 6 ] && lg w10 | grep -q 'committed nothing, so it did not carry itself on'; } && ok "…and an iteration that committed nothing does not — the loop stops at exit 6" || bad "step limit without commits: rc=$rc"
+
+# 6: neither a question for a person nor a run of errors is ever carried on
+mktrack w11 "ask something"
+mkclaude askclaude w11 'echo "work $n" > "ask-$n.txt"; echo "- step $n" >> "$st/progress.md"; echo "STATUS: BLOCKED: which schema?" >> "$st/progress.md"'
+CC_CLAUDE="$T/askclaude" "$B/cc-loop" $REPO w11 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 3 ] && [ "$(nruns w11)" = 1 ] && ! lg w11 | grep -q 'carrying on'; } && ok "STATUS: BLOCKED is never carried on — it is a question, even with work committed" || bad "blocked carried on: rc=$rc runs=$(nruns w11)"
+mktrack w12 "fail every time"
+mkclaude failclaude w12 'err=true; res="fatal: it broke"'
+CC_CLAUDE="$T/failclaude" "$B/cc-loop" $REPO w12 --max-iter 5 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 5 ] && [ "$(nruns w12)" = 2 ] && ! lg w12 | grep -q 'carrying on'; } && ok "an error is never carried on either — two in a row and it stops (exit 5)" || bad "error carried on: rc=$rc runs=$(nruns w12)"
+for t in w8 w9 w10 w11 w12; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
+
 echo "== usage limits (cc-limit + cc-loop) =="
 L(){ HOME="$T/lh" CC_LIMIT_STAMP="$T/lh/claude-limit" "$B/cc-limit" "$@"; }; mkdir -p "$T/lh"; lf="$T/lim.json"; miss=""   # own HOME: the table never touches the box's real stamp
 say(){ printf '{"is_error":%s,"result":"%s","total_cost_usd":0}' "$1" "$2" > "$lf"; }
