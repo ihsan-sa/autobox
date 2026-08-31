@@ -2,13 +2,24 @@
 # cc-audit — hands-off recurring audit of this box. Reports live in ~/.cc/state/audit/; Slack gets ONE line
 # (the long form goes to the control repo's channel canvas). Never fixes anything: monthly findings land on the board as a
 # track the planning session dispatches when the owner says so.
-#   cc-audit checks|review|weekly|monthly|delete|auto|selfcheck [--dry] [--no-post] [--no-llm]
+#   cc-audit checks|review|weekly|monthly|delete|arch|patterns|auto|scopes|selfcheck [--scope N] [--dry] [--no-post] [--no-llm]
 #   checks = mechanical, no LLM · review = checks + an LLM read of how well the box served the OWNER over 3 days
 #   weekly = checks + one LLM code audit (area rotates by ISO week) · monthly = checks + all four areas + a synthesis
 #   delete = checks + a SECOND OPINION on one question — what should simply go — asked of ANOTHER model (codex).
 #           Same evidence, same report/canvas/notify path as the rest; it is a backend swap, not a second audit system.
+#   arch   = the deep review. The WHOLE architecture read by codex — how the pieces fit, which seams are wrong, what
+#           is structurally fragile — and it answers in RECOMMENDATIONS, each concrete enough to become a track brief.
+#           `--scope <name>` aims the same review at one part and collects only that part's evidence. Runs `patterns`
+#           first and hands codex the result, so the code review is informed by how the box actually fails in practice.
+#   patterns = the Slack failure-pattern pass, on its own. A CLAUDE pass, not codex, and that is the design, not a
+#           fallback: codex runs `--sandbox read-only` with no network and cannot reach Slack, and opening the network
+#           would widen the one wall this script exists to keep. So Claude reads the history and writes a file; codex
+#           reads the file. What it looks for is what repeats — see config/audit-patterns-prompt.md.
+#   scopes = print the scopes `--scope` accepts. DERIVED from the repo (every command in bin/, every top-level
+#           directory), never a table in this file: a table would rot the first time a command was added or renamed.
 #   selfcheck = the codex path against stub binaries: no network, no spend, nothing written outside its own temp dir.
 #   auto (the timer, 03:30 UTC): day 1 -> monthly · day 15 -> delete · Sunday -> weekly · every 3rd day-of-year -> review · else quiet.
+#           `arch` is NOT on the rotation: it is long and deep, and it is dispatched when someone wants it.
 #   --dry: everything (reports, evidence) goes to a mktemp dir wiped on exit and the report prints to stdout — but
 #          the LLM modes still SPEND. --no-llm (implies --no-post) skips the LLM: checks + evidence index only.
 # READ-ONLY BY CONSTRUCTION: the LLM child gets Read/Grep/Glob/LS and nothing that can write or run a command —
@@ -19,8 +30,14 @@
 # model MAY run shell commands — it just cannot write or reach the network through them. `--ignore-user-config` and
 # `--ignore-rules` keep the box's own codex config and execpolicy from widening that. Do not describe it as the
 # tool-removal wall above: there, no shell exists; here, the shell exists and is caged.
+# NO TIME CAP ON THE SECOND OPINION. codex_run is bounded by SILENCE, never by elapsed time (owner, 2026-08-31): a
+# review still emitting after three hours is working, and killing it wastes the whole run. `codex exec --json` streams
+# JSONL events as it goes — verified against a real run before this was written, which is the only reason a silence
+# guard is honest here — so "no output at all for CC_AUDIT_SILENCE seconds" is a real hang signal. When it fires the
+# report SAYS the run was abandoned and how long it had been silent; a killed run is never presented as a review.
 # Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE / CC_CODEX (stub either model) · CODEX_MODEL / CODEX_EFFORT
-# (else ~/.cc/config, else codex's own defaults) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL.
+# (else ~/.cc/config, else codex's own defaults) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL
+# · CC_AUDIT_SILENCE (seconds of total silence before a codex run is abandoned; default 2700) · CC_AUDIT_POLL.
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # systemd-started: no ~/bin
 R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"; cd "$R" || exit 1   # run the INSTALLED ~/bin/cc-audit: a worktree copy fails the suites (they assert against the live install)
@@ -36,19 +53,60 @@ CODEX="${CC_CODEX:-codex}"   # the second opinion's model. Not a hard dependency
 cfgval(){ [ -f "$HOME/.cc/config" ] || return 0; sed -n "s/^[[:space:]]*$1=//p" "$HOME/.cc/config" | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
 CODEX_MODEL="${CODEX_MODEL:-$(cfgval CODEX_MODEL)}"; CODEX_EFFORT="${CODEX_EFFORT:-$(cfgval CODEX_EFFORT)}"
 BUD_REVIEW="${CC_AUDIT_BUDGET_REVIEW:-6}"; BUD_CODE="${CC_AUDIT_BUDGET_WEEKLY:-8}"; BUD_MONTH="${CC_AUDIT_BUDGET_MONTHLY_TOTAL:-30}"
+BUD_PATTERNS="${CC_AUDIT_BUDGET_PATTERNS:-10}"   # the Slack pass reads a lot of history and is the half that carries the value
 DAY="${CC_AUDIT_DATE:-$(date -u +%F)}"; STAMP="$(date -u +%FT%TZ)"
 log(){ printf '%s\t%s\n' "$STAMP" "$*" >> "$LOG"; }
-USAGE="usage: cc-audit checks|review|weekly|monthly|delete|auto|selfcheck [--dry] [--no-post] [--no-llm]"
-mode=""; dry=0; post=1; llm_on=1
-for a in "$@"; do case "$a" in
-  checks|review|weekly|monthly|delete|auto) mode="$a" ;;
+USAGE="usage: cc-audit checks|review|weekly|monthly|delete|arch|patterns|auto|scopes|selfcheck [--scope <name>] [--dry] [--no-post] [--no-llm]"
+
+# ---- scopes: DERIVED, so the list cannot rot ----
+# A scope is a subsystem keyword. The names come from the repo itself, in two families:
+#   · every executable in bin/, with the `cc-` prefix stripped — `slack`, `board`, `handoff`, `land`, `ccbox`…
+#   · every top-level directory — `tests`, `docs`, `templates`, `slack`, `config`, `ccbox`…
+# A name in both families means both (scope `slack` = bin/cc-slack AND slack/). Adding or renaming a command changes
+# the scope list on its own; nothing here lists them, which is the difference between this and AREAS/files_for above.
+# A scope's FILE SET is its coupling neighbourhood, also derived: the command, the same-named directory, and every
+# file in the repo that names the command. That is the real edge list — the systemd unit, the sim, the tests and
+# every other command that shells out to it come along without anyone remembering to add them.
+# (Unrelated to the `cc-scope` command, which is the owner's ask ledger. Different namespace, same English word.)
+scope_token(){ local s=$1; if [ -x "bin/cc-$s" ]; then echo "cc-$s"; elif [ -x "bin/$s" ]; then echo "$s"; else echo "$s"; fi; }
+scope_list(){
+  { local f d b
+    for f in bin/*; do [ -f "$f" ] && [ -x "$f" ] || continue; b=$(basename "$f"); printf '%s\n' "${b#cc-}"; done
+    for d in */; do [ -d "$d" ] || continue; printf '%s\n' "${d%/}"; done
+  } | sort -u
+}
+scope_valid(){ scope_list | grep -qxF -- "$1"; }
+scope_files(){   # <scope> -> repo-relative paths, the command first, then its neighbourhood, capped and ranked
+  local s=$1 t; t=$(scope_token "$s")
+  { [ -e "bin/$t" ] && printf 'bin/%s\n' "$t"
+    [ -d "$s" ] && find "$s" -type f -not -path '*/.git/*' 2>/dev/null
+    # -w so scope `cc` matches the word, not every `cc-*` in the tree; ranked by how often each file names it, so a
+    # capped list keeps the closest callers and drops the file that mentions it once in passing.
+    grep -rcw --exclude-dir=.git -- "$t" . 2>/dev/null | grep -v ':0$' |
+      sort -t: -k2,2nr | cut -d: -f1 | sed 's|^\./||'
+  } | awk '!seen[$0]++' | head -60
+}
+mode=""; dry=0; post=1; llm_on=1; SCOPE=""; want_scope=0
+for a in "$@"; do
+  if [ "$want_scope" = 1 ]; then SCOPE="$a"; want_scope=0; continue; fi
+  case "$a" in
+  checks|review|weekly|monthly|delete|arch|patterns|auto|scopes) mode="$a" ;;
   selfcheck) mode="$a"; dry=1; post=0 ;;   # --dry already guarantees the one thing a selfcheck must guarantee: it writes nothing real
+  --scope) want_scope=1 ;;
+  --scope=*) SCOPE="${a#--scope=}" ;;
   --dry) dry=1; post=0 ;;
   --no-post) post=0 ;;
   --no-llm) llm_on=0; post=0 ;;   # a cheap test flag: never post a report the LLM never wrote
   *) echo "$USAGE" >&2; exit 2 ;;
 esac; done
+[ "$want_scope" = 0 ] || { echo "cc-audit: --scope needs a name" >&2; echo "$USAGE" >&2; exit 2; }
 [ -n "$mode" ] || { echo "$USAGE" >&2; exit 2; }
+[ "$mode" = scopes ] && { scope_list; exit 0; }
+if [ -n "$SCOPE" ]; then   # an unknown scope is a typo, and the fix is the list — never a silent whole-repo review
+  case "$mode" in arch) ;; *) echo "cc-audit: --scope applies to \`arch\` only (got $mode)" >&2; exit 2 ;; esac
+  scope_valid "$SCOPE" || { printf 'cc-audit: unknown scope "%s". Valid scopes:\n' "$SCOPE" >&2
+    scope_list | sed 's/^/  /' >&2; exit 2; }
+fi
 if [ "$mode" = auto ]; then   # %-d/%-j: no leading zero, or bash reads them as octal
   dom=$(date -u -d "$DAY" +%-d); dow=$(date -u -d "$DAY" +%u); doy=$(date -u -d "$DAY" +%-j)
   if [ "$dom" = 1 ]; then mode=monthly; elif [ "$dom" = 15 ]; then mode=delete   # mid-month, two weeks off the monthly: two independent reads of what to delete
@@ -151,6 +209,81 @@ collect_code(){
   printf '%s\n' "The repo itself is your evidence: it is the working directory ($R) and Read/Grep/Glob/LS reach it." \
     > "$EV/03-repo.txt"
 }
+collect_arch(){   # what a WHOLE-SYSTEM read needs, which is not what the delete question needed
+  local files paths label
+  if [ -n "$SCOPE" ]; then label="scope $SCOPE"; files=$(scope_files "$SCOPE")
+    { printf 'SCOPE: %s\nThe review is aimed at this part of the system ONLY. Its command is `bin/%s`.\n' "$SCOPE" "$(scope_token "$SCOPE")"
+      printf 'These %s files are the scope — everything that names that command, plus a same-named directory.\n' "$(printf '%s\n' "$files" | wc -l)"
+      printf 'Anything outside this list is CONTEXT, not subject matter: name it only where it explains a seam.\n\n'
+      printf '%s\n' "$files"; } > "$EV/01-scope.txt"
+  else label="the whole system"; files=$(git -C "$R" ls-files 2>/dev/null | grep -v '^docs/research/')
+    echo "(no --scope: the subject is the whole repo. \`cc-audit scopes\` lists the parts one can be aimed at.)" > "$EV/01-scope.txt"
+  fi
+  paths=$(printf '%s\n' "$files" | tr '\n' ' ')
+  # INTENT FIRST. A reviewer that has to infer why the system is shaped this way will invent a why and then find
+  # fault with its own invention. DESIGN.md says what was decided and what was deliberately NOT built.
+  cp "$R/docs/DESIGN.md" "$EV/02-design.md" 2>/dev/null || echo "(no docs/DESIGN.md)" > "$EV/02-design.md"
+  cp "$R/README.md" "$EV/03-readme.md" 2>/dev/null
+  # WHAT EACH COMMAND OWNS, in its own words: the header comment every command in this repo opens with.
+  { local f b
+    for f in bin/*; do [ -f "$f" ] && [ -x "$f" ] || continue; b=$(basename "$f")
+      [ -n "$SCOPE" ] && ! printf '%s\n' "$files" | grep -qxF "bin/$b" && continue
+      printf '=== bin/%s (%s lines) ===\n' "$b" "$(wc -l <"$f")"
+      sed -n '2,${/^[[:space:]]*#/!q;p;}' "$f" | head -25; printf '\n'
+    done; } > "$EV/04-commands.txt"
+  # THE COUPLING GRAPH, derived: who shells out to whom. This is the seam map — where two commands both touch the
+  # same thing, and where a command has no caller at all.
+  { local a b
+    for a in bin/*; do [ -f "$a" ] && [ -x "$a" ] || continue; a=$(basename "$a")
+      printf '%s -> ' "$a"
+      for b in bin/*; do [ -f "$b" ] && [ -x "$b" ] || continue; b=$(basename "$b"); [ "$a" = "$b" ] && continue
+        grep -qw -- "$b" "bin/$a" 2>/dev/null && printf '%s ' "$b"; done; printf '\n'
+    done; } > "$EV/05-callgraph.txt"
+  # WHERE THE STATE LIVES, and who writes it: the board, the ledgers, the journals, the marks. Two commands writing
+  # one file is the single most common structural fault in this repo's history, and this is where it shows.
+  { printf '# every ~/.cc path each command names (the state each one owns or shares)\n\n'
+    local f; for f in bin/*; do [ -f "$f" ] && [ -x "$f" ] || continue
+      [ -n "$SCOPE" ] && ! printf '%s\n' "$files" | grep -qxF "$f" && continue
+      printf '=== %s ===\n' "$f"
+      grep -ohE '(~|\$HOME|\$\{HOME\})/\.cc[A-Za-z0-9._/<>${}-]*' "$f" 2>/dev/null | sort -u | sed 's/^/  /'
+    done; } > "$EV/06-state-map.txt"
+  { printf '# units, timers and what they run — the parts that fire with no one watching\n\n'
+    cat config/systemd-user/*.service config/systemd-user/*.timer 2>/dev/null; } > "$EV/07-units.txt"
+  # WHERE THE MASS IS. A 2900-line command and a 40-line one are different kinds of risk.
+  ev 08-sizes.txt bash -c "wc -l $paths 2>/dev/null | sort -rn"
+  ev 09-git-log.txt git -C "$R" log --stat -60
+  ev 10-churn.txt bash -c "git -C '$R' log --format= --name-only -200 2>/dev/null | grep . | sort | uniq -c | sort -rn | head -40"
+  # What the suites ASSERT, in their own words: the section headers and the text of each passing assertion. This is
+  # the only cheap way to see what is not covered, and "not covered" is where a structural recommendation belongs.
+  { printf '# what the suites assert — section headers and assertion text. What is absent here is untested.\n\n'
+    grep -hoE '^echo "== .*=="|\bok "[^"]{1,120}"' tests/*.sh ../tests/*.sh 2>/dev/null |
+      sed -e 's/^echo "== /\n## /' -e 's/ =="$//' -e 's/^ok "/  - /' -e 's/"$//' | head -260; } > "$EV/11-test-coverage.txt"
+  printf '%s\n' "The repo itself is your evidence: it is the working directory ($R) and you may read any of it." \
+    "Subject of this review: $label." > "$EV/12-repo.txt"
+}
+collect_patterns(){   # what the Slack failure-pattern pass reads. Claude's evidence, not codex's.
+  ev 01-slack-channels.txt cc-slack channels
+  local c
+  for c in $(grep -o '^#[a-z0-9_-]*' "$EV/01-slack-channels.txt" 2>/dev/null); do
+    ev "02-slack-${c#\#}.txt" cc-slack history "$c" 400   # deep: a pattern is only a pattern across many days
+  done
+  local dm; dm=$(grep -ho '\bD0[A-Z0-9]\{6,\}' "$HOME"/.cc/slack/*.log "$HOME"/.cc/slack/*.json 2>/dev/null | sort -u | head -1)
+  if [ -n "$dm" ]; then ev 03-slack-dm.txt cc-slack history "$dm" 400
+  else echo "(no DM channel id found in ~/.cc — the owner DM was not read)" > "$EV/03-slack-dm.txt"; fi
+  # THE ASK LEDGER IS THE OTHER HALF OF THE ANSWER. cc-scope already records what the owner asked and whether it was
+  # measured as delivered; `delivered` that never reached `verified`, and `missed`, are two of the patterns by name.
+  ev 04-asks.json cc-scope list --all --json
+  ev 05-asks-missed.txt cc-scope missed --since 336
+  local b; for b in "$HOME"/.cc/boards/*.json; do [ -f "$b" ] && cp "$b" "$EV/06-board-$(basename "$b")"; done
+  local t n; while IFS= read -r t; do
+    n=$(sed "s|^$HOME/.cc/state/||; s|/|-|g" <<<"$t"); tail -300 "$t" > "$EV/07-track-$n" 2>/dev/null
+  done < <(find "$HOME/.cc/state" -mindepth 3 -maxdepth 3 -name progress.md -newermt "@$SINCE_TS" 2>/dev/null)
+  tail -600 "$HOME/.cc/notify.log" > "$EV/08-notify.log" 2>/dev/null
+  ev 09-git-log.txt git -C "$R" log --format='%h %ad %s' --date=short -80
+  printf '%s\n' "cc-slack history prints 'HH:MM user: text' and does NOT expose message ts, so thread-level reads" \
+    "(cc-slack thread <chan> <ts>) could not be collected: per-thread latency is a known gap here. Judge an" \
+    "unanswered thread from the transcript order instead, and say when you are unsure." > "$EV/10-gaps.txt"
+}
 scrub(){ sed -ri 's/xox[bapesr]-[A-Za-z0-9-]{6,}/[redacted-token]/g' "$EV"/* 2>/dev/null; }   # no secret ever reaches the LLM's evidence
 
 # ---- the LLM passes: no Bash, no writes, evidence-only ----
@@ -179,6 +312,7 @@ for s in "/$HOME/.cc/config" "/$HOME/.ssh/**" "/$HOME/.claude/.credentials.json"
 done
 LLM_COST=0
 POSTPONED=""
+dur(){ local s=${1:-0}; if [ "$s" -lt 90 ]; then printf '%ss' "$s"; else printf '%sm %ss' $((s/60)) $((s%60)); fi; }   # how long it ran, in the report: the only cost signal this mode has
 postponed(){ printf '_(postponed: %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; POSTPONED="$2"; }   # $2 names the model too: two backends postpone here now
 llm(){   # llm <out-file> <budget> <prompt> — 20 min hard cap; a failed run leaves a stub and never aborts the audit
   local out=$1 bud=$2 prompt=$3 j rc res p; j=$(mktemp)
@@ -194,37 +328,114 @@ llm(){   # llm <out-file> <budget> <prompt> — 20 min hard cap; a failed run le
   rm -f "$j"; [ -n "$res" ]
 }
 # codex_run <out-file> <prompt> — the second opinion. Same contract as llm(): it writes the report or a stub, returns
-# non-zero on failure, and NEVER aborts the audit. Two differences from llm(), both deliberate:
-#   · no --max-budget-usd — codex has no such flag. The bounds are the 20 min cap and the prompt's line limit; the
-#     spend lands on the owner's codex plan, not on the audit budgets, so LLM_COST stays 0 for this mode.
+# non-zero on failure, and NEVER aborts the audit. Three differences from llm(), all deliberate:
+#   · no --max-budget-usd — codex has no such flag. The spend lands on the owner's codex plan, not on the audit
+#     budgets, so LLM_COST stays 0 for this mode. There is no budget gate here on purpose: "no spend cap as some just
+#     are expensive" (owner). What IS owed is legibility, so the report says how long the run took.
+#   · NO TIME CAP. A `timeout 20m` used to bound this. It is gone (owner, 2026-08-31): an architecture review that is
+#     still working after an hour is doing the job it was asked to do, and cutting it off throws away the whole run.
+#     The guard is SILENCE instead — `--json` makes codex stream JSONL events (thread.started, each command it runs,
+#     each message) as it goes, so a stream that has not moved at all is a real hang and a slow stream is not.
+#     CC_AUDIT_SILENCE is 45 minutes: the longest gap seen between events on a real ultra run was under a minute, and
+#     the threshold has to clear not the observed gap but the worst uninterrupted think a harder question could
+#     provoke — so it is set two orders of magnitude above what was measured. It exists to stop a wedged process
+#     holding the timer forever, not to bound thinking, and a guard that ever kills a working review is worse than
+#     no guard at all. If it fires, CODEX_ABANDONED carries the silence and the report says so in its first line.
 #   · the preflight. `codex login status` is instant and offline; without it a logged-out box retries a 401 five
 #     times (~30 s) and then dies with a stack of ERROR lines, which reads as a broken audit rather than a missing login.
+SILENCE="${CC_AUDIT_SILENCE:-2700}"; POLL="${CC_AUDIT_POLL:-2}"
+CODEX_ABANDONED=""; CODEX_SECS=0
 codex_run(){
-  local out=$1 prompt=$2 rc last err when
+  local out=$1 prompt=$2 rc last err when stream pid t0 quiet=0 seen=-1 sz idle why=''
+  CODEX_ABANDONED=""; CODEX_SECS=0
   if ! command -v "$CODEX" >/dev/null 2>&1; then   # core/ ships to boxes that have no codex at all: "run codex login" would be a lie there
     postponed "$out" "codex is not installed on this box"; return 1; fi
   if ! "$CODEX" login status >/dev/null 2>&1; then
     postponed "$out" "codex is not logged in (run \`codex login\` on the box)"; return 1; fi
   last=$(mktemp) || return 1; err=$(mktemp) || { rm -f "$last"; return 1; }
+  stream="${out%.md}-codex-stream.jsonl"; : > "$stream" 2>/dev/null || stream=$(mktemp) || { rm -f "$last" "$err"; return 1; }
   local -a args=(exec "$prompt" --sandbox read-only --ignore-user-config --ignore-rules --ephemeral --color never
-                 --cd "$R" --output-last-message "$last")
+                 --json --cd "$R" --output-last-message "$last")
   [ -n "$CODEX_MODEL" ] && args+=(--model "$CODEX_MODEL")
   [ -n "$CODEX_EFFORT" ] && args+=(-c "model_reasoning_effort=$CODEX_EFFORT")   # a `-c key=value` config override, NOT a flag: there is no --effort
-  CC_ROLE=worker timeout 20m "$CODEX" "${args[@]}" </dev/null >/dev/null 2>"$err"
-  rc=$?; cat "$err" >> "$LOG"
-  if [ $rc -eq 0 ] && [ -s "$last" ]; then cat "$last" > "$out"; rm -f "$last" "$err"; return 0; fi
-  if grep -qi 'usage limit' "$err"; then   # the codex plan's limit is a POSTPONEMENT, not a fault — exactly as a Claude usage limit is in llm().
-    when=$(grep -oiE 'try again at [0-9]{1,2}:[0-9]{2}( ?[AaPp]\.?[Mm]\.?)?' "$err" | head -1)   # observed live 2026-08-31: an ultra run spent 260k tokens, then this
-    postponed "$out" "codex usage limit${when:+ — $when}"; rm -f "$last" "$err"; return 1; fi
-  printf '_(codex second opinion failed: rc=%s — see audit.log)_\n' "$rc" > "$out"   # an empty answer is a failure too: never post a blank report as a finding-free one
-  log "codex $out failed rc=$rc"; rm -f "$last" "$err"; return 1
+  # THE REVIEW IS ONE AGENT. codex ships a `collab` tool that lets the model spawn sub-agent threads, and on a job
+  # this size it always tries to: "parallelise the review" is the obvious move. It cannot. The spawn fails with
+  # `agent thread limit reached`, and the model then loops on `collab_tool_call tool:"wait"` against a receiver list
+  # that is EMPTY, ~30 s a turn, until the turn dies. Watched twice on 2026-08-31: a probe survived it (rc=0 after
+  # 267 s, four wasted `wait` calls) and the first real arch run did not (rc=1 after 485 s, 92 events, no report).
+  # Turning the feature off removes the tool, so there is nothing to spawn and nothing to wait on.
+  # `-c features.X=false` and not `--disable X`: they mean the same thing today, but `--disable` on a feature name
+  # this codex does not know is a HARD ERROR (rc=1, "Unknown feature flag"), so the day OpenAI renames or retires
+  # `multi_agent` the `--disable` form breaks EVERY review on every box core/ ships to. The `-c` form ignores a key
+  # it does not recognise (verified against 0.151.0), which degrades to today's behaviour instead of to no review.
+  args+=(-c "features.multi_agent=false")
+  t0=$(date +%s)
+  CC_ROLE=worker "$CODEX" "${args[@]}" </dev/null >"$stream" 2>"$err" & pid=$!
+  idle=$t0
+  while kill -0 "$pid" 2>/dev/null; do   # liveness = the stream grew. Elapsed time is never consulted.
+    sz=$(( $(stat -c %s "$stream" 2>/dev/null || echo 0) + $(stat -c %s "$err" 2>/dev/null || echo 0) ))
+    if [ "$sz" -ne "$seen" ]; then seen=$sz; idle=$(date +%s); fi
+    quiet=$(( $(date +%s) - idle ))
+    if [ "$quiet" -ge "$SILENCE" ]; then
+      CODEX_ABANDONED=$quiet; kill "$pid" 2>/dev/null; sleep "$POLL"; kill -9 "$pid" 2>/dev/null; break; fi
+    sleep "$POLL"
+  done
+  wait "$pid" 2>/dev/null; rc=$?
+  CODEX_SECS=$(( $(date +%s) - t0 ))
+  cat "$err" >> "$LOG"; log "codex ran ${CODEX_SECS}s rc=$rc stream=$(wc -c <"$stream" 2>/dev/null) events=$(wc -l <"$stream" 2>/dev/null)"
+  if [ -n "$CODEX_ABANDONED" ]; then   # NEVER present a killed run as a completed review, even if a partial answer landed
+    printf '_(**abandoned as hung** after %s — no output of any kind for the last %s. This is NOT a completed review: whatever it had worked out was lost with the process.)_\n' \
+      "$(dur "$CODEX_SECS")" "$(dur "$CODEX_ABANDONED")" > "$out"
+    log "codex $out abandoned: silent ${CODEX_ABANDONED}s of ${CODEX_SECS}s"; rm -f "$last" "$err"; return 1; fi
+  if [ $rc -eq 0 ] && [ -s "$last" ]; then cat "$last" > "$out"; rm -f "$last" "$err" "$stream"; return 0; fi
+  # FROM HERE DOWN THE RUN FAILED, so the event stream is kept: `rc=1` with an empty stderr is otherwise
+  # undebuggable, and that is exactly how the first real run of this mode failed (2026-08-31).
+  tail -3 "$stream" >> "$LOG" 2>/dev/null
+  # The codex plan's limit is a POSTPONEMENT, not a fault — exactly as a Claude usage limit is in llm(). LOOK IN BOTH
+  # PLACES: hit before the first token it lands on stderr, but hit MID-RUN under `--json` it arrives as an event on
+  # the stream instead, and reading only stderr called the first real arch run a failure when it was a postponement
+  # (observed 2026-08-31: 485s of work, 92 events, then the plan ran dry and stderr said nothing).
+  if grep -qi 'usage limit' "$err" "$stream"; then
+    when=$(grep -hoiE 'try again at [0-9]{1,2}:[0-9]{2}( ?[AaPp]\.?[Mm]\.?)?' "$err" "$stream" | head -1)
+    postponed "$out" "codex usage limit${when:+ — $when} (ran $(dur "$CODEX_SECS") first)"; rm -f "$last" "$err"; return 1; fi
+  # A FOURTH sentence, for the one cause this box has already paid two whole runs to diagnose. `multi_agent=false`
+  # above should make it unreachable — but `-c` on a key codex does not know is a silent no-op (that is exactly why
+  # it was chosen over `--disable`), so the day OpenAI renames the key this comes back looking like a bare rc=1.
+  # Naming it means the report diagnoses itself instead of costing another two iterations of stream archaeology.
+  grep -q 'agent thread limit reached' "$stream" "$err" 2>/dev/null &&
+    why=' It died trying to spawn its own sub-agents (`agent thread limit reached`), then waited on ones that never started — so `features.multi_agent=false` did not take. Check whether codex has renamed that config key.'
+  printf '_(codex second opinion failed: rc=%s after %s.%s Its event stream is kept at `%s` (%s events) — start there, not in audit.log, which sees only stderr.)_\n' \
+    "$rc" "$(dur "$CODEX_SECS")" "$why" "$stream" "$(wc -l <"$stream" 2>/dev/null)" > "$out"   # an empty answer is a failure too: never post a blank report as a finding-free one
+  log "codex $out failed rc=$rc stream kept at $stream"; rm -f "$last" "$err"; return 1
 }
+# The two deep-review prompts are assembled HERE, by one function each, because the selfcheck asserts against these
+# and not against a copy: the proof that `13-slack-failures.md` reaches codex is only worth anything if the string
+# it checks is the string the real run sends.
+arch_subject(){
+  if [ -n "$SCOPE" ]; then printf 'THE SUBJECT OF THIS REVIEW IS THE SCOPE `%s` AND NOTHING ELSE — its files are listed in `01-scope.txt`, and a recommendation about anything outside them does not belong in this report.' "$SCOPE"
+  else printf 'The subject is the WHOLE system: every command in bin/ and how they compose. Do not review one file at a time.'; fi
+}
+arch_prompt(){ sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" -e "s|@LAST@|${1:-none}|g" -e "s|@SUBJECT@|$(arch_subject)|g" "$R/config/audit-arch-prompt.md"; }
+patterns_prompt(){ sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" "$R/config/audit-patterns-prompt.md"; }
 AREA_OUT=""
 area_audit(){   # area_audit <area> [kind] -> sets AREA_OUT (a command substitution would swallow LLM_COST)
   local a=$1; AREA_OUT="$OUTDIR/$DAY-${2:-weekly}-$a.md"
   llm "$AREA_OUT" "$BUD_CODE" "$(sed -e "s|@BOX@|$BOX|g" -e "s|@AREA@|$a|g" -e "s|@FILES@|$(files_for "$a")|g" -e "s|@EVIDENCE@|$EV|g" config/audit-prompt.md)"
 }
 count(){ local n; n=$(grep -c "\*\*$2\*\*" "$1" 2>/dev/null); echo "${n:-0}"; }   # grep -c prints 0 AND exits 1: no `|| echo 0`, that would print twice
+# How many failure patterns the Slack pass found. `count` alone is not enough here and the first real run proved it:
+# the prompt asks for a literal `**PATTERN**` marker, the model titled each pattern in its own bold instead, and a
+# 9.4 KB report with ten patterns in it counted as ZERO. That number is not cosmetic — it is what the review line
+# tells the owner was fed to codex, so a miscount became the sentence "0 Slack failure patterns fed in" about a file
+# codex had in hand the whole time. The marker is still what we ask for; this falls back to the report's own
+# top-level bold bullets when the model renamed it, so the count degrades to roughly-right instead of to a lie.
+pat_count(){ local n; n=$(count "$1" PATTERN); [ "$n" -gt 0 ] || n=$(grep -c '^[-*] \*\*' "$1" 2>/dev/null); echo "${n:-0}"; }
+kb(){ awk -v b="$(stat -c %s "$1" 2>/dev/null || echo 0)" 'BEGIN{printf (b<1024 ? "%d B" : "%.1f KB"), (b<1024 ? b : b/1024)}'; }
+# fed_line <patterns-file> <ok> <count> <cost> — what the review says about its Slack half. It reports the FILE
+# codex was handed, not just a marker count, because a count can be wrong and a file on disk cannot: the sentence
+# "0 Slack failure patterns fed in" was printed once about a file that was fed in, and that must not be sayable.
+fed_line(){ if [ "$2" = 1 ]; then printf '%s failure patterns fed to codex as `%s` (%s, Claude $%.2f)' "$3" "$(basename "$1")" "$(kb "$1")" "${4:-0}"
+  else printf '**no Slack failure patterns fed in** — the Claude pass did not run, so codex reviewed without them'; fi; }
 under(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a < b)}'; }
 short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; printf '%s' "$s"; }   # a phone-readable cut: on a space, never mid-word
 
@@ -232,9 +443,10 @@ short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; p
 # The logged-out branch is the one that matters today: codex is installed on this box but NOT logged in, so this is
 # the path the FIRST scheduled `delete` run will actually take. It is asserted here rather than described in a doc.
 selfcheck(){
-  local d n=0 f=0 out rc LOG POSTPONED CODEX CODEX_MODEL CODEX_EFFORT   # dynamically scoped: codex_run/postponed see these, never the box's
-  d=$(mktemp -d "${TMPDIR:-/tmp}/cc-audit-sc.XXXXXX") || return 1
+  local d n=0 f=0 out rc LOG POSTPONED CODEX CODEX_MODEL CODEX_EFFORT SILENCE POLL CODEX_ABANDONED CODEX_SECS
+  d=$(mktemp -d "${TMPDIR:-/tmp}/cc-audit-sc.XXXXXX") || return 1   # dynamically scoped above: codex_run/postponed see these, never the box's
   LOG="$d/audit.log"; out="$d/report.md"; POSTPONED=""; CODEX_MODEL="gpt-sc-test"; CODEX_EFFORT="ultra"
+  SILENCE=2700; POLL=0.05   # the real default silence; a fast poll so eleven stub runs do not cost eleven sleeps
   sck(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   ntf(){ if "$@"; then echo 1; else echo 0; fi; }   # tf's inverse: the assertion is that the command FAILS
   cat > "$d/logged-out" <<'S'
@@ -300,7 +512,16 @@ S
   CODEX_MODEL=""; CODEX_EFFORT=""; : > "$d/argv"; codex_run "$out" "p"; rc=$?
   sck "$(tf test $rc -eq 0)" "no model/effort configured: the run still works"
   sck "$(ntf grep -qx -- '--model' "$d/argv")" "no model configured: no --model is invented"
-  sck "$(ntf grep -qx -- '-c' "$d/argv")" "no effort configured: no -c override is invented"
+  sck "$(ntf grep -q 'model_reasoning_effort' "$d/argv")" "no effort configured: no effort override is invented"
+  sck "$(tf grep -qx -- 'features.multi_agent=false' "$d/argv")" "...but sub-agents stay off regardless: that one is not a preference"
+
+  # 2c. THE REVIEW IS ONE AGENT, and that is an argv fact. codex's `collab` tool killed the first real arch run: the
+  # model tried to parallelise the review, the spawn hit `agent thread limit reached`, and it then looped on `wait`
+  # against an empty receiver list until the turn died (rc=1, 485 s, 92 events, no report). The feature must be off,
+  # and off by the form that survives OpenAI renaming it — `--disable <unknown-name>` exits 1 and would take every
+  # review on every box with it.
+  sck "$(ntf grep -qx -- '--disable' "$d/argv")" "sub-agents are off by \`-c\`, not \`--disable\`: an unknown feature name must not hard-fail the run"
+  sck "$(tf grep -qi 'do not spawn sub-agents' <<<"$(arch_prompt none)")" "the prompt says so too, in case the flag is ever silently ignored"
   CODEX_MODEL="gpt-sc-test"; CODEX_EFFORT="ultra"
 
   # 3. codex ran and failed, or ran and said nothing — a stub, never a blank report posted as 'no findings'
@@ -311,6 +532,25 @@ S
   CODEX="$d/says-nothing"; codex_run "$out" "p"; rc=$?
   sck "$(tf test $rc -ne 0)" "empty answer: treated as a failure"
   sck "$(tf test -s "$out")" "empty answer: the report is a stub, never an empty file"
+
+  # 3a. died mid-run on codex's own sub-agent limit. THREE FAILURES MUST READ AS THREE SENTENCES (owner,
+  # 2026-08-31): out of credits, died mid-run, and went quiet are different things to do next, and only the last
+  # is what the liveness guard is for. This is the middle one, and it is the one that actually happened: the first
+  # real arch run died here at 485s. `features.multi_agent=false` prevents it — the second real run went 1217s
+  # with zero collab events — but a silently-renamed config key would bring it back, so the report must name it.
+  cat > "$d/collab-wedge" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+echo '{"type":"item.completed","item":{"id":"item_1","type":"error","message":"collab spawn failed: agent thread limit reached"}}'
+exit 1
+S
+  chmod +x "$d/collab-wedge"
+  CODEX="$d/collab-wedge"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "sub-agent wedge: codex_run reports failure"
+  sck "$(tf grep -q 'agent thread limit reached' "$out")" "sub-agent wedge: the report NAMES the cause, not a bare rc=1"
+  sck "$(tf grep -q 'renamed that config key' "$out")" "sub-agent wedge: …and says what to check, so it self-diagnoses"
+  sck "$(tf test -z "$POSTPONED")" "sub-agent wedge: a crash is not a postponement — different sentence from the usage limit"
+  sck "$(ntf grep -qi 'abandoned as hung' "$out")" "sub-agent wedge: …and not the silence guard either — it never went quiet"
 
   # 3b. the codex plan's usage limit — postponed like Claude's, never reported as "failed (see audit.log)"
   cat > "$d/out-of-credit" <<'S'
@@ -327,9 +567,118 @@ S
   sck "$(ntf grep -q 'rc=1' "$out")" "usage limit: no bare exit code shown where a reason belongs"
   sck "$(tf test -n "$POSTPONED")" "usage limit: Slack gets the postponed line"
 
+  # 3c. …and the SAME limit arriving mid-run on the --json stream instead of stderr. This is how it actually
+  # arrived on the first real run, and reading stderr alone reported a postponement as a failure. The event below
+  # is not invented: it is the verbatim shape a live limit produced on 2026-08-31 04:10Z, stderr silent, the whole
+  # message on the stream as `{"type":"error"...}` followed by `turn.failed`.
+  cat > "$d/limit-midrun" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+echo '{"type":"turn.started"}'
+echo '{"type":"error","message":"You'"'"'ve hit your usage limit. Upgrade to Pro or try again at 8:11 AM."}'
+exit 1
+S
+  chmod +x "$d/limit-midrun"
+  CODEX="$d/limit-midrun"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "limit mid-run: codex_run reports failure to its caller"
+  sck "$(tf grep -q 'postponed' "$out")" "limit mid-run: POSTPONED, though the limit arrived on the event stream and not on stderr"
+  sck "$(tf grep -q '8:11 AM' "$out")" "limit mid-run: the report carries when it resets"
+  sck "$(tf test -n "$POSTPONED")" "limit mid-run: Slack gets the postponed line"
+
   # 4. the prompt this mode sends must exist and ask for the marker `count` greps for
   sck "$(tf test -r "$R/config/audit-delete-prompt.md")" "the delete prompt ships with the script"
   sck "$(tf grep -q 'DELETE' "$R/config/audit-delete-prompt.md")" "the prompt asks for the **DELETE** marker the report counts"
+  sck "$(tf test -r "$R/config/audit-arch-prompt.md")" "the architecture prompt ships with the script"
+  sck "$(tf grep -q 'CHANGE' "$R/config/audit-arch-prompt.md")" "the arch prompt asks for the **CHANGE** marker the report counts"
+  sck "$(tf grep -q 'RECOMMENDATIONS, NOT FINDINGS' "$R/config/audit-arch-prompt.md")" "the arch prompt asks for recommendations, not a list of findings"
+  sck "$(tf test -r "$R/config/audit-patterns-prompt.md")" "the failure-pattern prompt ships with the script"
+  sck "$(tf grep -q 'PATTERN' "$R/config/audit-patterns-prompt.md")" "the patterns prompt asks for the **PATTERN** marker the report counts"
+
+  # 4b. THE PATTERN COUNT MUST NOT UNDERSTATE THE FILE. The first real run counted 0 against a 9.4 KB ten-pattern
+  # report because the model titled each pattern in its own bold instead of using the literal marker — and the
+  # review line then told the owner "0 Slack failure patterns fed in" about a file codex had in hand.
+  printf '## patterns\n- **PATTERN** a — 1\n- **PATTERN** b — 2\n' > "$d/marked.md"
+  sck "$(tf test "$(pat_count "$d/marked.md")" -eq 2)" "patterns: the literal **PATTERN** marker is counted"
+  printf '## patterns\n- **DELIVERY MEASURED AT MERGE** — 6 instances.\n  - evidence: x\n- **BRIEF DESTROYED** — 4.\n' > "$d/renamed.md"
+  sck "$(tf test "$(pat_count "$d/renamed.md")" -eq 2)" "patterns: a report that renamed the marker still counts, rather than reading as empty"
+  sck "$(ntf test "$(pat_count "$d/renamed.md")" -eq 0)" "patterns: ...which is the exact miscount that produced \"0 fed in\" for a 9.4 KB report"
+  sck "$(tf grep -q '13-slack-failures.md' <<<"$(fed_line "$EV/13-slack-failures.md" 1 10 0.42)")" "the review line names the FILE codex was handed, not only a count"
+  sck "$(ntf grep -q 'no Slack failure patterns fed in' <<<"$(fed_line "$d/renamed.md" 1 2 0)")" "a report that was fed in never reads as 'no failure patterns fed in'"
+  sck "$(tf grep -q 'no Slack failure patterns fed in' <<<"$(fed_line "$d/renamed.md" 0 0 0)")" "...and a pass that genuinely did not run says exactly that"
+
+
+  # 5. NO TIME CAP — the whole point of this change. Asserted against the function's own source, because the only
+  # other way to prove "not bounded at 20 minutes" is to sit here for 20 minutes.
+  sck "$(ntf grep -qE '(^|[^[:alnum:]_])timeout [0-9]' <<<"$(declare -f codex_run)")" "no timeout: the review is not bounded by elapsed time"
+  sck "$(tf grep -q 'CC_AUDIT_SILENCE' <<<"$(declare -p SILENCE 2>/dev/null; grep -n CC_AUDIT_SILENCE "$R/bin/cc-audit")")" "the bound is silence, and it is configurable"
+  sck "$(tf grep -qx -- '--json' "$d/argv")" "--json is passed: without the event stream there is nothing to measure silence against"
+
+  # 5b. the guard FIRES on a genuinely silent process — and says so, rather than posting a killed run as a review
+  cat > "$d/hangs" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+echo '{"type":"turn.started"}'
+sleep 300
+S
+  # 5c. …and NEVER fires on one that is slow but still emitting, even past the silence threshold in total elapsed time
+  cat > "$d/slow-but-alive" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+o=""; p=0; for a in "$@"; do [ "$p" = 1 ] && { o=$a; p=0; }; [ "$a" = --output-last-message ] && p=1; done
+i=0; while [ $i -lt 25 ]; do echo '{"type":"item.completed"}'; sleep 0.2; i=$((i+1)); done
+[ -n "$o" ] && printf '## verdict\n- fine\n## recommendations\n- **CHANGE** do a thing\n' > "$o"
+exit 0
+S
+  chmod +x "$d/hangs" "$d/slow-but-alive"
+  SILENCE=1   # the guard threshold, for these two cases only
+  CODEX="$d/hangs"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "hung: codex_run reports failure"
+  sck "$(tf test -n "$CODEX_ABANDONED")" "hung: the guard fired on silence"
+  sck "$(tf grep -q 'abandoned as hung' "$out")" "hung: the report says it was ABANDONED — never presented as a completed review"
+  sck "$(tf grep -qE 'no output of any kind for the last [0-9]' "$out")" "hung: the report says how long it had been silent"
+  sck "$(tf test -z "$POSTPONED")" "hung: a hang is not a postponement"
+  SILENCE=2   # 5s of work in 0.2s steps: never 2s silent, but far past 2s elapsed — elapsed must not matter
+  CODEX="$d/slow-but-alive"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -eq 0)" "slow but emitting: NOT killed, though it ran longer than the silence threshold"
+  sck "$(tf test -z "$CODEX_ABANDONED")" "slow but emitting: the guard stayed out of the way"
+  sck "$(tf test "$CODEX_SECS" -ge 4)" "the run's duration is measured — it is the only cost signal this mode has"
+  SILENCE=2700   # back to the shipped default for the rest of the checks
+
+  # 6. SCOPES are derived from the repo, not listed in this file: adding a command must add a scope by itself.
+  sck "$(tf test "$(scope_list | wc -l)" -gt 10)" "scopes: the list is non-trivial"
+  sck "$(tf scope_valid slack)" "scopes: \`slack\` is a scope (bin/cc-slack + slack/)"
+  sck "$(tf scope_valid handoff)" "scopes: \`handoff\` is a scope"
+  sck "$(ntf scope_valid no-such-part)" "scopes: an unknown name is rejected"
+  sck "$(ntf grep -qE 'slack|handoff|board' <<<"$(declare -f scope_list scope_files scope_token)")" "scopes: not one scope name appears in the code that derives them — nothing to rot"
+  local sf; sf=$(scope_files handoff)
+  sck "$(tf grep -qxF 'bin/cc-handoff' <<<"$sf")" "scope handoff: its own command is in the file set"
+  sck "$(tf grep -qxF 'bin/cc-context' <<<"$sf")" "scope handoff: a coupled command comes along, derived — nobody listed it"
+  sck "$(ntf grep -qxF 'bin/ccbox' <<<"$sf")" "scope handoff: an UNRELATED command does not — the scope really is scoped"
+  sck "$(tf test "$(scope_files handoff | wc -l)" -lt "$(scope_files cc | wc -l)")" "scope: a small part collects less evidence than the front door"
+
+  # 7. THE SLACK REPORT REACHES CODEX. Not "the path is in the prompt" — the stub resolves the evidence dir OUT of
+  # the prompt it was handed, reads 13-slack-failures.md from it, and echoes it back as its answer. The token can
+  # only appear in the report if the file was on disk and findable from the prompt text alone.
+  local EV SCOPE BOX; EV="$d/ev"; SCOPE=""; BOX="sc-box"; mkdir -p "$EV"
+  printf '## patterns\n- **PATTERN** merge path skips its after-steps — 3 instances. SC-TOKEN-7f3a\n' > "$EV/13-slack-failures.md"
+  cat > "$d/reads-evidence" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+o=""; p=0; for a in "$@"; do [ "$p" = 1 ] && { o=$a; p=0; }; [ "$a" = --output-last-message ] && p=1; done
+# the prompt is the only place the evidence dir is named; find it there and read the file it points at
+ev=$(printf '%s\n' "$@" | grep -oE '/[^ `]*cc-audit-sc[^ `]*/ev' | head -1)
+{ echo "## verdict"; echo "- **CHANGE** from the evidence:"; cat "$ev/13-slack-failures.md" 2>/dev/null; } > "$o"
+exit 0
+S
+  chmod +x "$d/reads-evidence"
+  CODEX="$d/reads-evidence"; codex_run "$out" "$(arch_prompt none)"; rc=$?
+  sck "$(tf test $rc -eq 0)" "slack->codex: the arch run completes"
+  sck "$(tf grep -q '13-slack-failures.md' <<<"$(arch_prompt none)")" "slack->codex: the prompt names the failure-pattern report"
+  sck "$(tf grep -q 'SC-TOKEN-7f3a' "$out")" "slack->codex: codex actually READ that file — its content is in the report"
+  sck "$(tf grep -q '02-design.md' <<<"$(arch_prompt none)")" "arch: DESIGN.md is fed in, so intent is read rather than invented"
+  sck "$(tf grep -q 'WHOLE system' <<<"$(arch_prompt none)")" "arch: with no scope, the subject is the whole architecture"
+  SCOPE=slack
+  sck "$(tf grep -qF 'SCOPE `slack` AND NOTHING ELSE' <<<"$(arch_prompt none)")" "arch --scope: the prompt says which scope it is running"
 
   unset CC_SC_ARGV; rm -rf "$d"
   echo "cc-audit selfcheck: $((n - f)) passed, $f failed"
@@ -343,8 +692,9 @@ checks
 verdict=$([ "$fail" -eq 0 ] && echo OK || echo ATTENTION)
 add ""; add "**verdict: $verdict — $fail of $((pass+fail)) checks failed**"
 CHK="$RPT"; printf '%s\n' "$CHK" > "$EV/00-checks.md"
-hi=0; med=0; imp=0; del=0; llm_ok=1; body="$CHK"; out="$OUTDIR/$DAY-checks.md"
-case "$mode" in review) collect_review ;; weekly|monthly|delete) collect_code ;; esac
+hi=0; med=0; imp=0; del=0; chg=0; pat=0; pat_ok=1; PAT_COST=0; RUNLINE=""; llm_ok=1; body="$CHK"; out="$OUTDIR/$DAY-checks.md"
+case "$mode" in review) collect_review ;; weekly|monthly|delete) collect_code ;;
+  patterns) collect_patterns ;; arch) collect_arch ;; esac
 scrub
 if [ "$mode" != checks ] && [ "$llm_on" = 0 ]; then
   body="$CHK"$'\n\n'"## evidence collected (--no-llm, no LLM run)"$'\n'"$(cd "$EV" && ls -la | sed 's/^/    /')"
@@ -366,6 +716,38 @@ elif [ "$mode" = delete ]; then   # one question, another model, the same eviden
     cc-board add "$CTL" "delete-$(date -u -d "$DAY" +%Y%m)" "codex second opinion: $del deletion candidates" "$out" >/dev/null 2>&1 ||
     log "board add failed for delete-$(date -u -d "$DAY" +%Y%m)"
   body="$(cat "$out")"$'\n\n'"---"$'\n\n'"$CHK"
+elif [ "$mode" = patterns ]; then   # the Slack half on its own: Claude reads the conversation, writes the failure-pattern report
+  out="$OUTDIR/$DAY-patterns.md"
+  llm "$out" "$BUD_PATTERNS" "$(patterns_prompt)" || llm_ok=0
+  pat=$(pat_count "$out")
+  body="$(cat "$out")"$'\n\n'"---"$'\n\n'"$CHK"
+elif [ "$mode" = arch ]; then   # the deep review: Claude on the conversation, then codex on the architecture, reading both
+  out="$OUTDIR/$DAY-arch${SCOPE:+-$SCOPE}.md"; last=$(ls -t "$AD"/*-arch"${SCOPE:+-$SCOPE}".md 2>/dev/null | head -1)
+  # Step 1: the Slack failure-pattern pass. Its report becomes evidence file 13 — the one codex is told to weigh
+  # hardest — so the two halves meet in a FILE, which is what lets a no-network sandbox learn how the box really
+  # fails. A postponed or failed pass must not sink the review: codex is told it is reviewing without it.
+  pev="$EV/13-slack-failures.md"
+  psave=$EV; EV="$(dirname "$psave")/patterns-evidence"; mkdir -p "$EV"
+  collect_patterns; scrub
+  pat_ok=1
+  llm "$pev" "$BUD_PATTERNS" "$(patterns_prompt)" ||
+    { pat_ok=0; printf '_(the Slack failure-pattern pass did not run: %s. This review had no record of how the box fails in practice.)_\n' \
+      "${POSTPONED:-it failed, see audit.log}" > "$pev"; }
+  EV=$psave; scrub   # the Claude pass may have quoted Slack verbatim: re-scrub before codex is pointed at the dir
+  pat=$(pat_count "$pev"); PAT_COST=$LLM_COST; POSTPONED=""   # a postponed Slack pass must not report the WHOLE review as postponed
+  # Step 2: codex, on the architecture, with that file in hand. No time cap; the silence guard is in codex_run.
+  codex_run "$out" "$(arch_prompt "${last:-none}")" || llm_ok=0
+  chg=$(count "$out" CHANGE)
+  # The one cost signal this mode has: LLM_COST stays 0 (the spend is on the owner's codex plan), so say the time.
+  # The Slack half is reported as the FILE codex was given, not as a marker count. The first real run said "0 Slack
+  # failure patterns fed in" about a 9.4 KB ten-pattern report that was sitting in the evidence dir the whole run —
+  # the count was wrong and the sentence built on it was worse. What is true and checkable is whether the file was
+  # written and how big it is, so that is what the line says; the count rides along and can only ever understate.
+  RUNLINE="_review: ${SCOPE:-whole architecture} · codex ${CODEX_MODEL:-default}${CODEX_EFFORT:+ effort $CODEX_EFFORT} · ran $(dur "$CODEX_SECS") · $(fed_line "$pev" "$pat_ok" "$pat" "$PAT_COST")_"
+  body="$RUNLINE"$'\n\n'"$(cat "$out")"$'\n\n'"---"$'\n\n'"## Slack failure patterns (Claude pass, evidence for the above)"$'\n\n'"$(cat "$pev")"$'\n\n'"---"$'\n\n'"$CHK"
+  [ "$dry" = 1 ] || [ "$llm_ok" = 0 ] ||   # like monthly and delete: a recommendation becomes work only on the board, and only the owner says go
+    cc-board add "$CTL" "arch-${SCOPE:-all}-$(date -u -d "$DAY" +%Y%m%d)" "architecture review${SCOPE:+ ($SCOPE)}: $chg recommendations" "$out" >/dev/null 2>&1 ||
+    log "board add failed for arch-${SCOPE:-all}"
 elif [ "$mode" = monthly ]; then
   ym=$(date -u -d "$DAY" +%Y-%m); reports=(); spent=0
   for a in "${AREAS[@]}"; do
@@ -393,8 +775,14 @@ else
 fi
 if [ "$post" = 1 ]; then
   printf '%s\n' "$body" | cc-slack canvas "#$CTL" "$BOX audit" >/dev/null 2>&1 || log "canvas update failed"
-  if [ -n "$POSTPONED" ]; then cc-notify -t "$BOX audit $mode" "$mode postponed — $POSTPONED · next run picks it up · $verdict: $fail checks failed" || log "notify failed"
+  if [ -n "$CODEX_ABANDONED" ]; then   # a hung run is its own outcome: never let it read as a review that found nothing
+    cc-notify -t "$BOX audit $mode" "$mode ABANDONED as hung after $(dur "$CODEX_SECS") — silent $(dur "$CODEX_ABANDONED"). No review was produced; rerun it." || log "notify failed"
+  elif [ -n "$POSTPONED" ]; then cc-notify -t "$BOX audit $mode" "$mode postponed — $POSTPONED · next run picks it up · $verdict: $fail checks failed" || log "notify failed"
   elif [ "$llm_ok" = 0 ]; then cc-notify -t "$BOX audit $mode" "$mode failed (see audit.log) · $verdict: $fail checks failed" || log "notify failed"
+  elif [ "$mode" = arch ]; then   # the headline is how much there is to change, and what it cost in time
+    cc-notify -t "$BOX architecture review" "${SCOPE:-whole architecture}: $chg recommendations, $pat failure patterns · ran $(dur "$CODEX_SECS") · board arch-${SCOPE:-all}-$(date -u -d "$DAY" +%Y%m%d) → canvas" || log "notify failed"
+  elif [ "$mode" = patterns ]; then
+    cc-notify -t "$BOX failure patterns" "$pat recurring failure patterns in the Slack history → canvas" || log "notify failed"
   elif [ "$mode" = delete ]; then   # the delete headline is how much there is to throw away
     cc-notify -t "$BOX audit delete" "second opinion (codex): $del to delete · board delete-$(date -u -d "$DAY" +%Y%m) · $verdict: $fail checks failed → canvas" || log "notify failed"
   elif [ "$mode" = review ]; then   # the review's headline is the owner's experience, not a finding count
@@ -403,5 +791,5 @@ if [ "$post" = 1 ]; then
     cc-notify -t "$BOX audit $mode" "$verdict: $fail checks failed · $hi/$med findings · canvas updated" || log "notify failed"
   fi
 fi
-log "done mode=$mode verdict=$verdict fail=$fail high=$hi med=$med imp=$imp del=$del llm_ok=$llm_ok out=$out"
+log "done mode=$mode scope=${SCOPE:-none} verdict=$verdict fail=$fail high=$hi med=$med imp=$imp del=$del chg=$chg pat=$pat codex_secs=$CODEX_SECS abandoned=${CODEX_ABANDONED:-no} llm_ok=$llm_ok out=$out"
 exit 0
