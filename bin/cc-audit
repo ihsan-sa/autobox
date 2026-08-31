@@ -138,14 +138,13 @@ checks(){
   o=$(bin/cc-vitals selfcheck 2>&1); rc=$?; ck $rc "cc-vitals selfcheck — $(printf '%s' "$o" | tail -1)"
   o=$(python3 tests/slack_sim.py bin/cc-slack 2>&1); rc=$?
   ck $rc "slack_sim — $(printf '%s' "$o" | grep -E '^(score|wrong_minutes_per_day|api_calls_per_day):' | tr '\n' ' ')"
+  o=$(bin/cc-units selfcheck 2>&1); rc=$?; ck $rc "cc-units selfcheck — $(printf '%s' "$o" | tail -1)"
+  o=$(bin/cc-settings selfcheck 2>&1); rc=$?; ck $rc "cc-settings selfcheck — $(printf '%s' "$o" | tail -1)"
   add ""; add "## services"
-  local u bad=""
-  for u in tmux-main.service cc-heartbeat.service cc-slackd.service cc-digest.timer cc-audit.timer; do
-    o=$(systemctl --user is-active "$u" 2>&1); [ "$o" = active ] || bad="$bad $u=$o"
-  done
-  o=$(systemctl --user is-failed cc-boot-notify.service 2>&1)   # a oneshot: it has run and gone inactive, only "failed" is a fault
-  [ "$o" = failed ] && bad="$bad cc-boot-notify.service=failed"
-  ck "$(tf test -z "$bad")" "user units —${bad:- all 6 active/expected}"
+  # Every unit in config/units.json, to that unit's own policy — no list here. The old list named five and the
+  # installer enabled eight, so the model, reconcile and publish timers could land switched off unseen; and a
+  # timer that is `active` but has no next trigger (a reloaded, unrestarted OnCalendar) counted as up.
+  o=$(bin/cc-units check 2>&1); rc=$?; ck $rc "$o"
   local hb age; hb=$(cat "$HOME/.cc/state/heartbeat" 2>/dev/null); age=$(( $(date -u +%s) - $(date -u -d "${hb:-@0}" +%s 2>/dev/null || echo 0) ))
   ck "$(tf test "$age" -lt 60)" "heartbeat — ${age}s old (want < 60)"
   o=$(cc-slack status 2>&1 | sed -n 3p); ck "$(tf grep -q connected <<<"$o")" "slack daemon — ${o:-no status}"
@@ -155,8 +154,10 @@ checks(){
   local disk load
   disk=$(df -P / | awk 'NR==2{print $5}'); ck "$(tf test "${disk%\%}" -lt 85)" "disk / — $disk used (want < 85%)"
   load=$(cut -d' ' -f1-3 /proc/loadavg); ck "$(tf awk -v l="${load%% *}" -v n="$(nproc)" 'BEGIN{exit !(l < n*2)}')" "load — $load on $(nproc) cores"
-  o=$(diff <(jq -S . config/claude-settings.json 2>/dev/null) <(jq -S . "$HOME/.claude/settings.json" 2>/dev/null) 2>&1)
-  ck "$(tf test -z "$o")" "settings drift — $([ -z "$o" ] && echo 'repo == ~/.claude/settings.json' || echo "$(grep -c '^[<>]' <<<"$o") lines differ")"
+  # The MANAGED subset only. This used to diff the whole file and fail on "N lines differ", which weighed a theme
+  # change exactly as much as an unregistered hook — so it sat red for days with a real gate missing inside it and
+  # nobody could tell. cc-settings names what is unapplied, and a user's own keys are not drift.
+  o=$(bin/cc-settings check 2>&1); rc=$?; ck $rc "$o"
   add ""; add "## install"
   local f miss=0 dang
   for f in bin/*; do [ -f "$f" ] && [ -x "$f" ] || continue

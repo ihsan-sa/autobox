@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# cc-units — the one reader of config/units.json, the core unit manifest. Three lists used to be hardcoded in
+# three files (install.sh linked one set, install.sh enabled another, cc-audit health-checked a third) and they
+# had drifted: the model, reconcile and publish timers were enabled by the installer and invisible to the audit.
+#   cc-units list                      every row: unit  enable  start  health  restart
+#   cc-units link                      the unit filenames to symlink (all of them)
+#   cc-units enable                    unit<TAB>start, for the rows the installer switches on
+#   cc-units check                     is-enabled/is-active/list-timers vs the manifest; one line, exit 1 on a fault
+#   cc-units restart-for <path…>       unit<TAB>restart|rearm|owner for the units a change touches
+#   cc-units policy <unit> <field>     one cell, for anything that wants a single answer
+#   cc-units selfcheck                 the manifest's own invariants, against no live systemd at all
+# `restart-for` is the answer to "a .timer edit is invisible to an ExecStart-basename test": a changed OnCalendar
+# needs the timer RESTARTED and re-armed, and `daemon-reload` alone leaves it with `Trigger: n/a` — no next run.
+set -uo pipefail
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+M="${CC_UNITS_MANIFEST:-$R/config/units.json}"
+UD="${CC_UNITS_DIR:-$R/config/systemd-user}"
+USAGE="usage: cc-units list|link|enable|check|restart-for <path…>|policy <unit> <field>|selfcheck"
+command -v jq >/dev/null 2>&1 || { echo "cc-units: jq is missing" >&2; exit 2; }
+[ -f "$M" ] || { echo "cc-units: no manifest at $M" >&2; exit 2; }
+
+rows(){ jq -r '.units[] | [.unit, .enable, .start, .health, .restart] | @tsv' "$M"; }
+cell(){ jq -r --arg u "$1" --arg f "$2" '.units[] | select(.unit==$u) | .[$f] // ""' "$M"; }
+sc(){ systemctl --user "$@" 2>&1; }   # never fails the caller: an is-* answer is the value, not the exit code
+
+# ---- check: what the audit asks. Every `required` row must be enabled and healthy; an `owner` row is checked
+# only once the owner has enabled it (a bare clone with no Slack tokens is not a broken box); a `timer` row is
+# started by its own timer and is neither. A timer that is active but has no next trigger is DOWN, not up.
+check(){
+  local u en st he re bad="" n=0 state trig lnk="${CC_UNITS_LINKDIR:-$HOME/.config/systemd/user}"
+  while IFS=$'\t' read -r u en st he re; do
+    [ -n "$u" ] || continue
+    # linked first, for EVERY row. A `timer` row is skipped by everything below, so an unlinked cc-*.service
+    # would otherwise be invisible until its timer fired and found nothing to start.
+    [ -e "$lnk/$u" ] || { bad="$bad $u=unlinked"; continue; }
+    case "$en" in
+      required) state=$(sc is-enabled "$u")
+                case "$state" in enabled|enabled-runtime|static|generated|indirect) ;; *) bad="$bad $u=not-enabled($state)"; continue;; esac ;;
+      owner)    state=$(sc is-enabled "$u"); case "$state" in enabled|enabled-runtime) ;; *) continue;; esac ;;   # off by the owner's choice: not a fault
+      timer)    continue ;;
+    esac
+    n=$((n+1))
+    case "$he" in
+      active)     state=$(sc is-active "$u"); [ "$state" = active ] || { bad="$bad $u=$state"; continue; } ;;
+      not-failed) [ "$(sc is-failed "$u")" = failed ] && { bad="$bad $u=failed"; continue; } ;;
+    esac
+    if [ "$re" = rearm ]; then   # armed, not merely active: a changed OnCalendar reloaded but not restarted sits at `Trigger: n/a`
+      trig=$(sc list-timers --all --no-pager "$u" | awk 'NR==2{print $1}')
+      case "$trig" in ""|"n/a"|"-") bad="$bad $u=not-armed" ;; esac
+    fi
+  done < <(rows)
+  if [ -n "$bad" ]; then echo "user units —$bad"; return 1; fi
+  echo "user units — all $n enabled, active and armed as config/units.json declares"
+}
+
+# ---- restart-for: the landing's policy. A unit is touched when the change edits ITS OWN unit file, or any file
+# its Exec* lines run. `restart` and `rearm` are done by the landing; `owner` is recorded and left alone.
+restart_for(){
+  local u en st he re f b changed=" " ln tok hit
+  for f in "$@"; do changed="$changed$(basename -- "$f") "; done
+  while IFS=$'\t' read -r u en st he re; do
+    [ -n "$u" ] && [ "$re" != none ] || continue
+    hit=0
+    case "$changed" in *" $u "*) hit=1 ;; esac                       # the unit file itself moved (a .timer schedule change)
+    if [ "$hit" = 0 ] && [ -f "$UD/$u" ]; then
+      while IFS= read -r ln; do
+        for tok in $ln; do case "$tok" in */*) b=$(basename -- "$tok"); case "$changed" in *" $b "*) hit=1 ;; esac ;; esac; done
+      done < <(sed -n 's/^Exec[A-Za-z]*=//p' "$UD/$u")
+    fi
+    [ "$hit" = 1 ] && printf '%s\t%s\n' "$u" "$re"
+  done < <(rows)
+  return 0   # the loop's status is the last row's `&&`, so a final unmatched row would report failure: no match is not an error
+}
+
+selfcheck(){
+  local n=0 f=0 u en st he re out
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a check that PRINTS (jq -e) must not leak into the verdict
+  k "$(t jq -e . "$M")" "manifest is valid json"
+  k "$(t test "$(rows | wc -l)" -gt 0)" "manifest has rows"
+  # every declared unit exists, and every unit file is declared: adding a file without a row must FAIL, loudly
+  out=""; while IFS=$'\t' read -r u _; do [ -f "$UD/$u" ] || out="$out $u"; done < <(rows)
+  k "$(t test -z "$out")" "every manifest row has a unit file —${out:- none missing}"
+  out=""; for u in "$UD"/*; do [ -f "$u" ] || continue; rows | cut -f1 | grep -qxF "$(basename "$u")" || out="$out $(basename "$u")"; done
+  k "$(t test -z "$out")" "every unit file has a manifest row —${out:- none missing}"
+  # the field vocabulary: a typo in a policy word must not read as "nothing to do"
+  out=""; while IFS=$'\t' read -r u en st he re; do
+    case "$en" in required|owner|timer) ;; *) out="$out $u:enable=$en";; esac
+    case "$st" in now|no-block|none) ;; *) out="$out $u:start=$st";; esac
+    case "$he" in active|not-failed|none) ;; *) out="$out $u:health=$he";; esac
+    case "$re" in restart|rearm|owner|none) ;; *) out="$out $u:restart=$re";; esac
+  done < <(rows)
+  k "$(t test -z "$out")" "every policy word is one of the known values —${out:- all known}"
+  # a .timer is rearm and a .service is never rearm: the whole point of the field
+  out=""; while IFS=$'\t' read -r u en st he re; do
+    case "$u" in *.timer) [ "$re" = rearm ] || out="$out $u";; *.service) [ "$re" = rearm ] && out="$out $u";; esac
+  done < <(rows)
+  k "$(t test -z "$out")" "every timer re-arms and no service does —${out:- correct}"
+  # the proven cost, 2026-08-31: editing cc-digest.timer's OnCalendar restarts and re-arms the TIMER
+  out=$(restart_for core/config/systemd-user/cc-digest.timer)
+  k "$(t grep -qx 'cc-digest.timer	rearm' <<<"$out")" "a changed .timer file re-arms that timer (#86's silent switch-off)"
+  # and a changed script still reaches the unit whose ExecStart runs it
+  out=$(restart_for core/bin/cc-slack)
+  k "$(t grep -qx 'cc-slackd.service	restart' <<<"$out")" "a changed script restarts the unit whose ExecStart runs it"
+  out=$(restart_for core/bin/cc-rc)
+  k "$(t grep -qx 'tmux-main.service	owner' <<<"$out")" "the shared tmux server is reported as the owner's action, never restarted"
+  out=$(restart_for core/bin/cc-digest)
+  k "$(t test -z "$out")" "a timer-driven oneshot's script needs no restart — its next firing picks it up"
+  # a caller gates on this: "nothing to restart" must exit 0, or every landing that touches no unit reads as failed
+  "$0" restart-for core/bin/cc-digest >/dev/null 2>&1; k $? "…and exits 0 saying so"
+  "$0" restart-for core/config/systemd-user/cc-digest.timer >/dev/null 2>&1; k $? "restart-for exits 0 when it does match"
+  # an unlinked unit is a fault even for a `timer` row, which every other test skips
+  out=$(CC_UNITS_LINKDIR="$UD/no-such-link-dir" check 2>&1)   # a path that cannot exist: no temp dir to leak
+  k "$(t grep -q 'cc-digest.service=unlinked' <<<"$out")" "an unlinked timer-driven .service is reported, not skipped"
+  # a unit the installer enables must have somewhere to be enabled FROM
+  out=""; while IFS=$'\t' read -r u en st he re; do
+    [ "$en" = required ] || continue
+    case "$u" in *.timer) continue;; esac
+    grep -q '^\[Install\]' "$UD/$u" 2>/dev/null || out="$out $u"
+  done < <(rows)
+  k "$(t test -z "$out")" "every required .service has an [Install] section —${out:- all do}"
+  echo "cc-units selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+
+case "${1:-}" in
+  list)        rows ;;
+  link)        rows | cut -f1 ;;
+  enable)      rows | awk -F'\t' '$2=="required"{print $1"\t"$3}' ;;
+  check)       check ;;
+  restart-for) shift; [ $# -gt 0 ] || { echo "$USAGE" >&2; exit 2; }; restart_for "$@" ;;
+  policy)      [ $# -eq 3 ] || { echo "$USAGE" >&2; exit 2; }; cell "$2" "$3" ;;
+  selfcheck)   selfcheck ;;
+  *)           echo "$USAGE" >&2; exit 2 ;;
+esac

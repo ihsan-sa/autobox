@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# cc-settings — reconcile ~/.claude/settings.json against the MANAGED subset in config/claude-managed.json:
+# the hook registrations the box's mechanical gates are made of, plus the deny rules that must never go missing.
+# Everything else in that file belongs to whoever uses the box: never touched, never reported as drift.
+#   cc-settings check     one line naming exactly what is unapplied; exit 1 when anything is. install + audit use this.
+#   cc-settings show      one line per managed entry, with why each one exists
+#   cc-settings apply     OWNER ONLY, at a terminal: back up, then add the missing HOOKS. Never `permissions`.
+#   cc-settings selfcheck its own cases, against fixture files — the live settings are never read, never written
+#
+# WHY NOTHING AUTOMATIC WRITES THIS FILE. ~/.claude/settings.json holds `permissions`, and a hook entry runs a
+# command on every prompt: anything able to edit it can grant itself capabilities. cc-guard lists it as a secret
+# path and it stays that way. So `check` is what the box runs — install.sh and cc-audit only ever REPORT — while
+# `apply` refuses inside a Claude Code session, refuses without a terminal, refuses in a track worktree, and
+# re-reads its own output to prove `permissions` came through byte-identical before it replaces anything. A
+# missing deny rule is named and printed for the owner to paste; it is never written.
+#
+# PROVEN COST (2026-08-31): the UserPromptSubmit hook was canonical in config/ for days and never applied to the
+# live file, so the ask ledger captured nothing automatically — 27 rows were typed in by hand. The audit had been
+# failing on it the whole time, as "27 lines differ", where a theme change weighed exactly as much as a missing
+# gate. Nobody acted on it. Naming the subset is what turns that report into something anyone can act on.
+set -uo pipefail
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+M="${CC_SETTINGS_MANIFEST:-$R/config/claude-managed.json}"
+S="${CC_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+DEF="$R/config/claude-settings.json"
+USAGE="usage: cc-settings check|show|apply|selfcheck"
+command -v jq >/dev/null 2>&1 || { echo "cc-settings: jq is missing" >&2; exit 2; }
+[ -f "$M" ] || { echo "cc-settings: no manifest at $M" >&2; exit 2; }
+
+# A hook with no matcher has an EMPTY field, and tab is an IFS *whitespace* character: `IFS=$'\t' read` silently
+# folds two tabs into one and every field after the empty matcher shifts left. So the field separator here is
+# US (0x1f), which is not whitespace and cannot appear in a path or a matcher.
+US=$'\x1f'
+# $HOME, ${HOME}, ~ and the literal path are ONE command. The live file is written by whoever last edited it and
+# Claude Code expands nothing, so comparing raw strings is how two of the original 27 "differing lines" arose.
+norm(){ local c=$1; c=${c//\$\{HOME\}/$HOME}; c=${c//\$HOME/$HOME}; case $c in \~/*) c="$HOME/${c#\~/}";; esac
+        printf '%s' "$c" | tr -s ' \t' ' ' | sed 's/^ *//; s/ *$//'; }
+want_hooks(){ jq -r '.hooks[] | [.event, (.matcher // ""), .command, (.why // "")] | join("\u001f")' "$M"; }
+want_deny(){ jq -r '.deny[]' "$M"; }
+live_hooks(){ jq -r '(.hooks // {}) | to_entries[] as $e | $e.value[]? | (.matcher // "") as $m
+                     | (.hooks // [])[] | select(.type == "command") | [$e.key, $m, .command] | join("\u001f")' "$S" 2>/dev/null; }
+live_deny(){ jq -r '(.permissions.deny // [])[]' "$S" 2>/dev/null; }
+
+# add_hook <file> <event> <matcher> <command> — the ONE mutation this command can make, on stdout. It only ever
+# assigns under `.hooks`: no path in it names `.permissions`, and apply proves that against its own output too.
+add_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
+      .hooks //= {} | .hooks[$ev] //= []
+    | if ([.hooks[$ev][] | select((.matcher // "") == $m)] | length) > 0
+      then .hooks[$ev] |= map(if (.matcher // "") == $m then .hooks = ((.hooks // []) + [{type:"command", command:$c}]) else . end)
+      else .hooks[$ev] += [ (if $m == "" then {hooks:[{type:"command", command:$c}]}
+                                         else {matcher:$m, hooks:[{type:"command", command:$c}]} end) ] end
+  ' "$1"; }
+
+# scan sets MISSING (one row per unapplied entry: "hook<US>event<US>matcher<US>command<US>why", or
+# "deny<US>rule", or "absent<US>path") and UNRELATED (lines outside the subset — context, never a fault).
+MISSING=""; UNRELATED=0
+scan(){
+  MISSING=""; UNRELATED=0
+  local ev m cmd why rule found lev lm lcmd live ld n
+  [ -f "$S" ] || { MISSING="absent$US$S"; return; }
+  live=$(live_hooks)
+  while IFS=$US read -r ev m cmd why; do
+    [ -n "$ev" ] || continue
+    found=0
+    while IFS=$US read -r lev lm lcmd; do
+      [ "$lev" = "$ev" ] && [ "$(norm "$lm")" = "$(norm "$m")" ] && [ "$(norm "$lcmd")" = "$(norm "$cmd")" ] && { found=1; break; }
+    done <<<"$live"
+    [ "$found" = 1 ] || MISSING+="hook$US$ev$US$m$US$cmd$US$why"$'\n'
+  done < <(want_hooks)
+  ld=$(live_deny)
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    grep -qxF "$rule" <<<"$ld" || MISSING+="deny$US$rule"$'\n'
+  done < <(want_deny)
+  n=$(diff <(jq -S . "$DEF" 2>/dev/null) <(jq -S . "$S" 2>/dev/null) 2>/dev/null | grep -c '^[<>]')
+  UNRELATED=${n:-0}
+}
+miss_of(){ grep "^$1$US" <<<"$MISSING"; }   # never matches when MISSING is empty: grep, not a case glob
+
+# one line the owner can act on, and an exit code the caller can gate on
+check(){
+  local kind a hooks="" denies=""
+  scan
+  if miss_of absent >/dev/null; then echo "settings — $S does not exist (run install.sh once)"; return 1; fi
+  while IFS=$US read -r kind a _; do
+    case "$kind" in hook) hooks="$hooks $a" ;; deny) denies="$denies $a" ;; esac
+  done <<<"$MISSING"
+  if [ -z "$hooks$denies" ]; then
+    echo "settings — all $( { want_hooks; want_deny; } | grep -c .) managed entries applied ($UNRELATED unrelated line(s) differ, not managed)"
+    return 0
+  fi
+  printf 'settings — UNAPPLIED:%s%s — cc-settings show, then %s\n' \
+    "${hooks:+ hook$hooks}" "${denies:+ deny$denies}" \
+    "$([ -n "$hooks" ] && echo 'cc-settings apply (owner, at a terminal)' || echo 'add the deny rule(s) by hand')"
+  return 1
+}
+
+show(){
+  local ev m cmd why rule
+  scan
+  printf 'manifest: %s\nlive:     %s\n\n' "$M" "$S"
+  while IFS=$US read -r ev m cmd why; do
+    [ -n "$ev" ] || continue
+    if grep -qF "hook$US$ev$US$m$US$cmd" <<<"$MISSING"; then
+      printf '  MISSING  hook %-16s %s\n           why: %s\n' "$ev" "$(norm "$cmd")" "$why"
+    else printf '  ok       hook %-16s %s\n' "$ev" "$(norm "$cmd")"; fi
+  done < <(want_hooks)
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    if grep -qxF "deny$US$rule" <<<"$MISSING"; then
+      printf '  MISSING  deny %s\n           add it by hand — cc-settings never writes `permissions`\n' "$rule"
+    else printf '  ok       deny %s\n' "$rule"; fi
+  done < <(want_deny)
+  printf '\n%s line(s) outside the managed subset differ from %s — not managed, not drift.\n' "$UNRELATED" "${DEF#"$R"/}"
+  [ -z "$MISSING" ]
+}
+
+# ---- apply: the owner's own hand, at a terminal. Never a session, never `permissions`. ----
+refuse(){ echo "cc-settings apply: $1" >&2
+          echo "  Deliberate: $S decides what a session may do, so only the owner edits it." >&2
+          echo "  Type \`cc-settings apply\` yourself in a shell on the box. \`cc-settings show\` says what is missing." >&2
+          exit 3; }
+apply(){
+  local d ev m cmd tmp bak orig_perm new_perm ans n=0
+  [ -z "${CLAUDECODE:-}${CLAUDE_CODE_SESSION_ID:-}${CLAUDE_CODE_ENTRYPOINT:-}" ] || refuse "refusing — this is running inside a Claude Code session"
+  [ -z "${CC_ROLE:-}" ] || refuse "refusing — CC_ROLE=${CC_ROLE} (a worker or member session)"
+  { [ -t 0 ] && [ -t 1 ]; } || refuse "refusing — no terminal (this is only ever typed by hand)"
+  d=$PWD; while [ -n "$d" ] && [ "$d" != / ]; do [ -e "$d/.cc/track" ] && refuse "refusing — $d is a track worktree"; d=$(dirname "$d"); done
+  [ -f "$S" ] || { echo "cc-settings: no $S — run install.sh once first" >&2; exit 2; }
+
+  scan
+  if ! miss_of hook >/dev/null; then
+    echo "cc-settings: every managed hook is already applied — nothing to write."
+    miss_of deny >/dev/null && { echo; show; }
+    exit 0
+  fi
+  echo "About to add these hook registrations to $S:"
+  while IFS=$US read -r _ ev m cmd _; do printf '  %-16s %s%s\n' "$ev" "$(norm "$cmd")" "${m:+   (matcher: $m)}"; done < <(miss_of hook)
+  if miss_of deny >/dev/null; then
+    echo "Also missing, and NOT written by this command — paste these in yourself:"
+    miss_of deny | cut -d"$US" -f2 | sed 's/^/  /'
+  fi
+  printf 'Everything else in the file is kept as it is. Apply? [y/N] '
+  read -r ans </dev/tty; case "$ans" in y|Y|yes|YES) ;; *) echo "nothing changed."; exit 0;; esac
+
+  orig_perm=$(jq -S -c '.permissions // null' "$S")
+  bak="$S.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -a "$S" "$bak" || { echo "cc-settings: could not back up to $bak — nothing changed" >&2; exit 1; }
+  tmp="$S.new.$$"; cp -a "$S" "$tmp" || exit 1
+  while IFS=$US read -r _ ev m cmd _; do
+    [ -n "$ev" ] || continue
+    if add_hook "$tmp" "$ev" "$m" "$cmd" > "$tmp.j"
+    then mv -f "$tmp.j" "$tmp"
+    else rm -f "$tmp" "$tmp.j"; echo "cc-settings: jq failed on $ev — nothing changed ($bak holds the backup)" >&2; exit 1; fi
+    n=$((n+1))
+  done < <(miss_of hook)
+
+  jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "cc-settings: the result is not valid json — nothing changed" >&2; exit 1; }
+  new_perm=$(jq -S -c '.permissions // null' "$tmp")   # the promise, checked rather than asserted
+  [ "$new_perm" = "$orig_perm" ] || { rm -f "$tmp"; echo "cc-settings: that rewrite would have changed \`permissions\` — refused, nothing changed" >&2; exit 1; }
+  mv -f "$tmp" "$S" || { echo "cc-settings: could not replace $S — $bak holds the backup" >&2; exit 1; }
+  echo "applied $n hook registration(s). Backup: $bak"
+  echo "Claude Code reads settings at session start: restart any session that has to be gated by them."
+}
+
+selfcheck(){
+  local d n=0 f=0 S M DEF out rc
+  d=$(mktemp -d "${TMPDIR:-/tmp}/cc-settings-sc.XXXXXX") || return 1   # S/M/DEF are local: every case runs against fixtures
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a case that PRINTS (jq -e) must not leak into the verdict
+  M="$R/config/claude-managed.json"; DEF="$R/config/claude-settings.json"
+  k "$(t jq -e . "$M")" "the managed manifest is valid json"
+  k "$(t test "$(jq '.hooks | length' "$M")" -eq 3)" "the manifest names three hook registrations"
+  # the shipped default must satisfy the subset itself, or a fresh box installs a file that is already wrong
+  S="$DEF"; scan
+  k "$(t test -z "$MISSING")" "config/claude-settings.json satisfies its own managed subset${MISSING:+ — missing: $(tr '\n' ' ' <<<"$MISSING")}"
+  # THE PROVEN CASE: canonical in config/, absent from the live file. It must be NAMED, not counted.
+  jq 'del(.hooks.UserPromptSubmit)' "$DEF" > "$d/no-scope.json"; S="$d/no-scope.json"
+  scan; k "$(t grep -q "^hook${US}UserPromptSubmit" <<<"$MISSING")" "a missing UserPromptSubmit hook is detected"
+  out=$(check); rc=$?
+  k "$(t grep -q 'UserPromptSubmit' <<<"$out")" "…and check names it in one line: ${out}"
+  k "$(t test "$rc" -ne 0)" "…and check exits non-zero, so a caller can gate on it"
+  # unrelated settings are NOT drift: theme, model, a custom key and EXTRA allow/deny rules all pass
+  jq '.theme="dark" | .model="other" | .permissions.allow += ["Bash(cowsay:*)"]
+      | .permissions.deny += ["Bash(git push --force:*)"] | .customKey={a:1}' "$DEF" > "$d/custom.json"; S="$d/custom.json"
+  scan; k "$(t test -z "$MISSING")" "unrelated keys, a custom key and EXTRA allow/deny rules are not drift"
+  k "$(t test "$UNRELATED" -gt 0)" "…while the unrelated lines are still counted as context ($UNRELATED)"
+  # $HOME / ${HOME} / ~ / the literal path are one registration — two of the original 27 "differing lines"
+  jq --arg h "$HOME" '.hooks.PreToolUse[0].hooks[0].command = $h + "/bin/cc-guard"
+                      | .hooks.Stop[0].hooks[0].command = "~/bin/cc-checkpoint"
+                      | .hooks.UserPromptSubmit[0].hooks[0].command = "${HOME}/bin/cc-scope  hook"' "$DEF" > "$d/expanded.json"
+  S="$d/expanded.json"; scan
+  k "$(t test -z "$MISSING")" "\$HOME, \${HOME}, ~ and the literal path are all the same registration"
+  # a required deny rule that has gone missing is reported, by name
+  jq '.permissions.deny = ["Bash(*sysrq-trigger*)"]' "$DEF" > "$d/thin-deny.json"; S="$d/thin-deny.json"
+  scan; k "$(t test "$(miss_of deny | grep -c .)" -eq 2)" "two missing required deny rules are reported"
+  k "$(t grep -q 'by hand' <<<"$(check)")" "…and check says to add them by hand, not to run apply"
+  # right event, wrong matcher: a narrowed guard leaves tools ungated, so it is drift
+  jq '.hooks.PreToolUse[0].matcher = "Bash"' "$DEF" > "$d/narrow.json"; S="$d/narrow.json"
+  scan; k "$(t grep -q "^hook${US}PreToolUse" <<<"$MISSING")" "a narrowed PreToolUse matcher is drift, not a match"
+  # an EXTRA hook of the user's own, alongside the managed ones, is not drift either
+  jq '.hooks.Stop[0].hooks += [{type:"command", command:"$HOME/bin/mine"}]' "$DEF" > "$d/extra-hook.json"
+  S="$d/extra-hook.json"; scan
+  k "$(t test -z "$MISSING")" "a user's own extra hook alongside a managed one is preserved, not drift"
+  # a settings file that does not exist at all is its own answer, not a crash
+  S="$d/nope.json"; scan; k "$(t grep -q '^absent' <<<"$MISSING")" "an absent settings file is reported as absent"
+  # the three walls on apply, each proved on its own
+  out=$(CLAUDECODE=1 "$0" apply 2>&1); k "$(t grep -q 'inside a Claude Code session' <<<"$out")" "apply refuses inside a Claude Code session"
+  out=$(env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT CC_ROLE=worker "$0" apply 2>&1)
+  k "$(t grep -q 'CC_ROLE=worker' <<<"$out")" "apply refuses for a worker or member session"
+  out=$(env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT -u CC_ROLE "$0" apply </dev/null 2>&1)
+  k "$(t grep -q 'no terminal' <<<"$out")" "apply refuses with no terminal"
+  # THE WRITE ITSELF. add_hook is the only mutation apply can make, so run it — no terminal needed — over a file
+  # carrying the owner's own permissions, hooks and keys, and check what came out the other side.
+  jq --arg h "$HOME" '.theme="dark" | .customKey={a:1}
+      | .permissions.allow += ["Bash(cowsay:*)"] | .permissions.deny += ["Bash(git push --force:*)"]
+      | .hooks.Stop[0].hooks += [{type:"command", command:($h + "/bin/mine")}]
+      | del(.hooks.UserPromptSubmit)' "$DEF" > "$d/live.json"
+  add_hook "$d/live.json" UserPromptSubmit "" '$HOME/bin/cc-scope hook' > "$d/applied.json"
+  k "$(t jq -e . "$d/applied.json")" "add_hook produces valid json"
+  k "$(t diff <(jq -S .permissions "$d/live.json") <(jq -S .permissions "$d/applied.json"))" \
+     "a write leaves \`permissions\` byte-identical — allow and deny both"
+  k "$(t diff <(jq -S 'del(.hooks)' "$d/live.json") <(jq -S 'del(.hooks)' "$d/applied.json"))" \
+     "…and every key outside .hooks byte-identical (theme, model, customKey included)"
+  k "$(t grep -q "$HOME/bin/mine" "$d/applied.json")" "…and the user's own extra hook survives"
+  S="$d/applied.json"; scan
+  k "$(t test -z "$MISSING")" "…and the file it wrote now satisfies the managed subset"
+  k "$(t test "$(jq '[.. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 4)" \
+     "…with exactly one registration added, not a duplicate of the three that were there"
+  # a second run is a no-op: apply must never stack the same registration twice
+  add_hook "$d/applied.json" UserPromptSubmit "" '$HOME/bin/cc-scope hook' > "$d/twice.json"
+  S="$d/twice.json"; scan
+  k "$(t test -z "$MISSING")" "applying twice still satisfies the subset (scan matches on content, not count)"
+  # the guard rail that catches a future edit to add_hook: apply re-reads permissions before it swaps the file
+  out=$(sed -n '/^apply(){/,/^}$/p' "$(readlink -f "$0")")
+  k "$(t grep -q 'new_perm=\$(jq -S -c' <<<"$out")" "apply re-reads \`permissions\` from its own output"
+  k "$(t grep -q '\[ "\$new_perm" = "\$orig_perm" \]' <<<"$out")" "…and refuses the swap unless it is byte-identical"
+  rm -rf "$d"
+  echo "cc-settings selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+
+case "${1:-}" in
+  check)     check ;;
+  show)      show ;;
+  apply)     apply ;;
+  selfcheck) selfcheck ;;
+  *)         echo "$USAGE" >&2; exit 2 ;;
+esac

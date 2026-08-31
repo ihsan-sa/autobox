@@ -39,8 +39,14 @@ if [ -n "$O" ]; then
 fi
 link "$R/ccbox" ~/ccbox
 link "$R/config/tmux.conf" ~/.tmux.conf
-# the live user units (cc-mcp is retired — its unit is parked in mcp/)
-for u in tmux-main.service cc-heartbeat.service cc-boot-notify.service cc-digest.service cc-digest.timer cc-audit.service cc-audit.timer cc-model.service cc-model.timer cc-reconcile.service cc-reconcile.timer cc-publish.service cc-publish.timer cc-slackd.service cc-vitals.service; do
+# the live user units, from config/units.json — the ONE list (cc-mcp is retired: its unit is parked in mcp/).
+# Which are linked, which are enabled and which the audit health-checks used to be three hardcoded lists in two
+# files, and they had drifted apart: the model, reconcile and publish timers were enabled here and invisible to
+# `cc-audit checks`. Adding a timer is now its unit files plus one row in that manifest, and nothing else.
+# assigned first, on purpose: `for u in $(cmd)` does not trip set -e, so an unreadable manifest (no jq, no file)
+# would print its error and go on to link NOTHING — the one failure mode a hardcoded list could not have.
+core_units=$("$R/bin/cc-units" link)
+for u in $core_units; do
   link "$R/config/systemd-user/$u" ~/.config/systemd/user/"$u"
 done
 # the overlay's own user units, for what only that box runs: linked like core's, never enabled here — which of
@@ -52,9 +58,13 @@ if [ -n "$O" ]; then
   done
 fi
 
+# ~/.claude/settings.json: this installer NEVER writes an existing one, and that is not laziness. That file holds
+# `permissions`, and a hook entry runs a command on every prompt, so anything able to edit it can widen what a
+# session may do — cc-guard lists it as a secret path. What the installer owes is a precise report: not "27 lines
+# differ" (which weighed a theme change the same as a missing gate, and was ignored for days) but the managed
+# entries that are unapplied, by name. `cc-settings apply` is the owner's own hand, at a terminal. See cc-settings.
 if [ -f ~/.claude/settings.json ]; then
-  cmp -s "$R/config/claude-settings.json" ~/.claude/settings.json ||
-    echo "note: ~/.claude/settings.json differs from config/claude-settings.json ($(diff "$R/config/claude-settings.json" ~/.claude/settings.json | grep -c '^[<>]') lines) — reconcile by hand, this installer never overwrites it"
+  "$R/bin/cc-settings" check || true   # a drifted subset must never abort the install: it is a report, not a gate
 else
   mkdir -p ~/.claude; cp "$R/config/claude-settings.json" ~/.claude/settings.json; echo "installed default ~/.claude/settings.json"
 fi
@@ -69,12 +79,17 @@ B
 if [ "$services" = 1 ]; then
   sudo -n loginctl enable-linger "$USER" 2>/dev/null || true
   systemctl --user daemon-reload
-  # cc-slackd and cc-vitals are linked but NOT enabled here: `cc slack on` owns the first (it needs the
-  # tokens), and starting an always-on recorder is the box owner's call. cc-publish.timer IS
-  # enabled here: unconfigured it exits at once, and after a later `cc-publish setup` publishing must not wait for a
-  # second install.
-  systemctl --user enable --now tmux-main.service cc-heartbeat.service cc-digest.timer cc-audit.timer cc-model.timer cc-reconcile.timer cc-publish.timer
-  systemctl --user enable cc-boot-notify.service && systemctl --user start --no-block cc-boot-notify.service   # oneshot that may wait minutes for the network: never block the installer
+  # Which units come on, and how, is `enable`/`start` in config/units.json — with the reason on each row. The two
+  # the installer deliberately leaves off (cc-slackd, cc-vitals) are marked enable=owner there, not omitted here.
+  enable_rows=$("$R/bin/cc-units" enable)   # likewise: read the rows before the loop, so a failure aborts the install
+  while IFS=$'\t' read -r u start; do
+    [ -n "$u" ] || continue
+    case "$start" in
+      no-block) systemctl --user enable "$u" && systemctl --user start --no-block "$u" ;;   # may wait minutes for the network: never block the installer
+      now)      systemctl --user enable --now "$u" ;;
+      *)        systemctl --user enable "$u" ;;
+    esac
+  done <<<"$enable_rows"
   # last, and non-fatal: a missing python3-venv must not cost you the links above
   [ -x ~/.cc/slack/venv/bin/python ] ||
     { python3 -m venv ~/.cc/slack/venv && ~/.cc/slack/venv/bin/pip install -q -r "$R/slack/requirements.txt" && echo "slack venv created"; } ||

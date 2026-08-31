@@ -95,10 +95,8 @@ PERM_RE = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$", re.I)
 SENT_USING_RE = re.compile(r"\s*\*Sent using\*\s+\S+\s*$")     # claude.ai's Slack connector signs every message it sends
 CHUNK = 3900
 APPROVALS = "approvals"                                        # #approvals is not a session: the owner's :+1: on a bot post there merges the PR
-MERGE_RECHECK, MERGE_RECHECK_EVERY = 6, 2.0                    # "Merge already in progress": re-read the PR for ~12 s before calling it a failure
-LAND_COSMETIC = 3                                              # cc-land's "the box is deployed, its bookkeeping is not"
 REEXEC = "CC_SLACK_REEXEC"                                     # set on a re-exec'd channel server: the host initialised the copy before it
-GIT_WORK = threading.Lock()                                    # cc-land pulls and cc-publish fetches in the SAME checkout: one at a time
+GIT_WORK = threading.Lock()                                    # two publishes fetching the same checkout at once race index.lock
 ALERTS = "alerts"                                              # #alerts is not a session: machinery notices (boot, limits, audits, digest) land there
 ALERT_KINDS = ("boot", "limit", "audit", "review", "digest", "alerts", "cc-rc", "heartbeat", "power")   # "<box> <kind>" notify titles → #alerts even when the box shares its name with a repo
 NUDGE_PREFIXES = ("❓ still waiting", "⏳ no answer", "🔴 still open")   # our own nudge posts (v1's too): never an answer
@@ -160,6 +158,10 @@ for _p in glob.glob(f"{HOME}/.cc/slack/venv/lib/python*/site-packages"):   # sla
 
 
 # ---------------------------------------------------------------- shared helpers
+def last_line(text):
+    return next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")
+
+
 def log(*a):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), *a, file=sys.stderr, flush=True)
 
@@ -2721,8 +2723,19 @@ class Daemon:
         return None
 
     def on_approval(self, chat, ts, reaction, who=None):
-        """A :+1: from ANYONE in #approvals on the bot's own "[repo] PR #n: …" post → squash-merge: the owner curates that
-        channel's membership, so being in it IS the approval right. Stateless: the message is re-read from Slack."""
+        """A :+1: from ANYONE in #approvals on the bot's own "[repo] PR #n: …" post hands that PR to cc-land — the one
+        thing on this box that merges. The owner curates that channel's membership, so being in it IS the approval
+        right. Stateless: the message is re-read from Slack.
+
+        THIS USED TO MERGE, HERE, and call cc-land afterwards. So cc-land found the PR already in, said "gates guard
+        the merge, and it has happened", and skipped them — on 2026-08-31 every landing the owner approved went in
+        ungated, and the line that said so read like ordinary output for hours. The gates, the merge and the deploy
+        are one transaction now, and it does not live on this thread: the deploy restarts this very daemon, so
+        anything that ran here would be killed half-way through its own install (PR #87 merged and never installed
+        for exactly that reason). All that happens here is validate → enqueue → start the worker.
+
+        FAIL CLOSED. If the queue cannot be written or the worker will not start, this says so in the channel and
+        NOTHING merges. There is no fallback that merges without gates; that fallback is the bug."""
         if reaction not in ("+1", "thumbsup"):
             return None
         msg = self.fetch_message(chat, ts) or {}
@@ -2730,36 +2743,53 @@ class Daemon:
         if msg.get("user") != self.bot_user or not m or not os.path.isdir(f"{DEV}/{m.group(1)}/.git"):
             log(f"approvals: ignored :+1: on {ts} (not a bot PR post)"); return None
         repo, n = m.groups()
+        name = self.user_name(who) if who else ""
         if who:
-            log(f"approvals: [{repo}] PR #{n} approved by {self.user_name(who)} ({self.role_of(who)})")
-        ok, out = self.merge(repo, n)
-        last = next((l.strip() for l in reversed(out.splitlines()) if l.strip()), "")
-        done = any(w in out for w in ("already merged", "is closed", "already closed"))   # gh: nothing left to merge
-        log(f"approvals: [{repo}] PR #{n} merge {'ok' if ok else 'FAILED'}: {last}")
-        react(self.cfg, chat, ts, "white_check_mark" if ok or done else "x")
-        text = f"[{repo}] PR #{n}: " + ("already merged — nothing to do" if "already merged" in out else
-                                       "already closed — nothing to do" if done else
-                                       "merged ✅ (squash, remote branch deleted)" if ok else f"merge failed ❌\n```\n{out}\n```")
-        self.say(chat, text, ts)
-        if ok and "auto-merge armed" in out:
-            self.mark_pr(repo, n, None, f"👍 seen — auto-merge armed (PR #{n}): lands when the branch is mergeable")
-        elif ok and not done:
-            self.mark_merged(repo, n)                      # the board still said "review": a 👍-merge is the end of that track
-        if ok and "auto-merge armed" not in out:
-            self.publish_soon(repo)                        # the default branch moved: mirror the published prefix (no-op unless this repo has one)
-            self.land_soon(repo, n, chat, ts)              # …and the box still owes the merge its deploy: cc-land, off this thread
-        if not ok and not done:
-            self.mark_pr(repo, n, "blocked", f"merge FAILED (PR #{n}): {last[:120]}")   # the board/Home show it, not just the thread
-            self.merge_failed(repo, n, last, msg.get("text") or "")
-        return text
+            log(f"approvals: [{repo}] PR #{n} approved by {name} ({self.role_of(who)})")
+        ok, out = self.queue_land(repo, n, chat, ts, name)
+        log(f"approvals: [{repo}] PR #{n} queue {'ok' if ok else 'FAILED'}: {last_line(out)}")
+        if not ok:
+            react(self.cfg, chat, ts, "x")
+            text = (f"[{repo}] PR #{n}: NOT merged ❌ — the landing queue would not take it, and nothing here merges "
+                    f"without it:\n```\n{out[-1200:]}\n```")
+            self.say(chat, text, ts)
+            self.land_blocked(repo, n, last_line(out), msg.get("text") or "")
+            return text
+        react(self.cfg, chat, ts, "eyes")     # seen and queued; the ✅/❌ and the one reply come from the landing itself
+        return f"[{repo}] PR #{n}: queued for cc-land — gates, then the merge, then the deploy"
 
-    def merge_failed(self, repo, n, reason, post_text):
-        """A 👍-merge that did not happen must not die in #approvals — no session routes there, so the thread reply reaches nobody.
-        Push it to the owner (ntfy + #<repo>, via cc-notify's own routing) and hand it to the repo's planning session on the normal
-        inject path; with no session live, deliver() queues it and autostarts one."""
+    def queue_land(self, repo, n, chat, ts, who="", run=subprocess.run):
+        """cc-land owns the queue's format, its lock and its worker; this only asks, and reports what it said. Its exit
+        code is the whole answer: non-zero means nothing merged and nothing will until somebody acts."""
+        try:
+            r = run([f"{BIN}/cc-land", "queue", repo, str(n), "--chat", chat, "--ts", ts]
+                    + (["--who", who] if who else []),
+                    capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip() or "(no output)"
+        except Exception as e:
+            return False, f"{e.__class__.__name__}: {e}"[-300:]
+
+    def land_sweep(self, run=subprocess.run):
+        """Re-drive whatever is still on the queue. A landing stops at its first real failure — which is right — but
+        until this existed nothing ever asked again, so PR #87 sat merged-and-undeployed until a person noticed. It
+        also runs on the first tick after a reboot, which is how a landing interrupted by one is finished, and it
+        catches a merge made in GitHub's own UI. Starting the worker is cheap and idempotent: if one is already
+        running it takes the lock, and the second stands down."""
+        try:
+            r = run([f"{BIN}/cc-land", "work", "--detach"], capture_output=True, text=True, timeout=120,
+                    stdin=subprocess.DEVNULL)
+            if r.returncode:
+                log(f"land sweep: {last_line((r.stdout or '') + (r.stderr or ''))}")
+        except Exception as e:
+            log(f"land sweep: {e!r}")
+
+    def land_blocked(self, repo, n, reason, post_text):
+        """A 👍 that could not even be queued must not die in #approvals — no session routes there, so the thread reply
+        reaches nobody. Push it to the owner (ntfy + #<repo>, via cc-notify's own routing) and hand it to the repo's
+        planning session on the normal inject path; with no session live, deliver() queues it and autostarts one."""
         url = re.search(r"https?://\S+", post_text)
         try:
-            subprocess.run([f"{BIN}/cc-notify", "-p", "high", "-t", f"[{repo}] PR #{n} merge failed",
+            subprocess.run([f"{BIN}/cc-notify", "-p", "high", "-t", f"[{repo}] PR #{n} was NOT merged",
                             f"{reason} — {url.group(0)}" if url else reason],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         except Exception as e:
@@ -2767,8 +2797,9 @@ class Daemon:
         meta = {"chat_id": "local", "thread_ts": "", "ts": str(time.time()), "user": "approvals", "role": "owner",
                 "channel": "#" + APPROVALS, "target": repo}
         self.deliver(repo, {"type": "message", "meta": meta,
-                            "content": f"PR #{n} merge failed: {reason}. Resolve on its track branch, then re-post the card "
-                                       f"(`cc-slack post-approval --force {repo} {n}` — without --force the old card wins)."})
+                            "content": f"PR #{n} was approved but could not even be queued: {reason}. Nothing merged. "
+                                       f"Fix that, then `cc-land queue {repo} {n}` — or re-post the card "
+                                       f"(`cc-slack post-approval --force {repo} {n}`) and let the 👍 do it."})
 
     def fetch_message(self, chat, ts):
         try:
@@ -2777,73 +2808,6 @@ class Daemon:
         except Exception as e:
             log(f"conversations.history failed: {e}"); return None
 
-    def mark_pr(self, repo, n, status, note, run=subprocess.run):
-        """Reflect a 👍-merge outcome on the PR's track (branch track/<x>): `merged`, `blocked` (merge failed) or a note only
-        (auto-merge armed) — so the board, Home and !digest tell the truth instead of "review" forever."""
-        try:
-            r = run(["gh", "pr", "view", str(n), "--json", "headRefName"], cwd=f"{DEV}/{repo}", capture_output=True, text=True, timeout=30)
-            head = json.loads(r.stdout or "{}").get("headRefName", "") if r.returncode == 0 else ""
-            if not head.startswith("track/"):
-                return
-            track = head[len("track/"):]
-            if status:
-                run([f"{BIN}/cc-board", "status", repo, track, status], capture_output=True, text=True, timeout=15)
-            run([f"{BIN}/cc-board", "note", repo, track, note], capture_output=True, text=True, timeout=15)
-            self.home_dirty = True
-        except Exception as e:
-            log(f"mark_pr {repo}#{n}: {e!r}")
-
-    def mark_merged(self, repo, n, run=subprocess.run):
-        self.mark_pr(repo, n, "merged", f"merged via 👍 (PR #{n})", run=run)
-
-    def land(self, repo, n, chat, ts, run=subprocess.run):
-        """Everything a merge still owes the box — the #approvals card, the board row, the ask ledger, install.sh,
-        daemon-reload, the units the change ADDED (they land switched off), a restart of whatever moved — is
-        cc-land's sequence, and there is exactly ONE copy of it. The 👍 path used to run none of it, so it only ever
-        ran when a session remembered to type it: on 2026-08-31 thirteen ledger rows still read `open` under tracks
-        that had all merged, and three units sat switched off for an hour after landing. The PR is already in by
-        the time this runs, so cc-land skips its gates — what is left is the deploy and the bookkeeping.
-        Its exit says what happened: 0 all of it · 3 the box is deployed but a cosmetic step wants a hand, which is
-        the thread's business · anything else means the box may be WRONG, which is the owner's.
-        A change to this very file ends in `systemctl restart cc-slackd`, which kills this thread mid-sentence —
-        that is the deploy working, and the restart is the last step, so nothing is left half-done by it."""
-        with GIT_WORK:
-            try:
-                r = run([f"{BIN}/cc-land", repo, str(n)], capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL)
-                rc, out = r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
-            except Exception as e:
-                rc, out = 1, f"{e.__class__.__name__}: {e}"
-        tail = "\n".join(out.splitlines()[-14:]) or "(no output)"
-        log(f"land [{repo}] PR #{n}: exit {rc}: {out.splitlines()[-1] if out else ''}")
-        if rc == 0:
-            return None                       # the merge reply already said it landed; saying it twice is noise
-        if rc == LAND_COSMETIC:
-            self.say(chat, f"[{repo}] PR #{n}: deployed — its bookkeeping did not all go through:\n```\n{tail}\n```", ts)
-            return None
-        self.say(chat, f"[{repo}] PR #{n}: merged, but the after-merge sequence STOPPED ❌\n```\n{tail}\n```", ts)
-        self.land_failed(repo, n, tail)
-        return None
-
-    def land_failed(self, repo, n, tail):
-        """A deploy that stopped halfway leaves the box wrong, and no session reads #approvals — so this goes the same
-        way a failed merge does: to the owner, and to the repo's own planning session."""
-        try:
-            subprocess.run([f"{BIN}/cc-notify", "-p", "high", "-t", f"[{repo}] PR #{n} merged, deploy stopped",
-                            tail.splitlines()[-1][:300] if tail else "no output"],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-        except Exception as e:
-            log(f"cc-notify failed: {e}")
-        meta = {"chat_id": "local", "thread_ts": "", "ts": str(time.time()), "user": "approvals", "role": "owner",
-                "channel": "#" + APPROVALS, "target": repo}
-        self.deliver(repo, {"type": "message", "meta": meta,
-                            "content": f"PR #{n} merged, but the after-merge sequence stopped:\n{tail[-600:]}\n"
-                                       f"Fix that, then re-run it — every step already done is a no-op the second time."})
-
-    def land_soon(self, repo, n, chat, ts):
-        """Off the reaction path, like publish_soon: install.sh, a daemon-reload and a restart take minutes, and the
-        merge reply must not wait for them. The merge has already happened, so nothing in here can undo it."""
-        threading.Thread(target=self._safe, args=(self.land, repo, n, chat, ts), daemon=True).start()
-
     def publish(self, repo, run=subprocess.run):
         """core/ publishes itself: a merge landed on the default branch, so the published prefix goes to its own public
         repo. Scoped to the single repo that has one (PUBLISH_REPO in ~/.cc/config) and a no-op on a box that configured
@@ -2851,7 +2815,7 @@ class Daemon:
         and an abort reaches the OWNER through cc-notify — this log line is only for the daemon's own trail."""
         if not repo or (self.cfg.get("PUBLISH_REPO") or "") != repo:
             return None
-        with GIT_WORK:      # cc-land is pulling the same checkout on its own thread; two git jobs there race index.lock
+        with GIT_WORK:      # one at a time in this checkout: two git jobs there race index.lock
             try:
                 r = run([f"{BIN}/cc-publish"], capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
                 out = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
@@ -2863,52 +2827,6 @@ class Daemon:
     def publish_soon(self, repo):
         """Off the reaction/tick path: a fetch + a push to a public repo must never hold up the merge reply."""
         threading.Thread(target=self._safe, args=(self.publish, repo), daemon=True).start()
-
-    def merge(self, repo, n, run=subprocess.run):
-        """gh pr merge --squash --delete-branch in ~/dev/<repo>; -R <owner/repo> makes gh skip the *local* branch (it lives in a cc
-        worktree, deleting it would fail and abort the remote delete) and remove only the remote one. --subject uses the PR title
-        (gh's own default squash subject is unusable: it's the *branch's commit log*, e.g. "wip: checkpoint ..."); any failure to
-        fetch it just omits --subject (gh falls back to its own default). Returns (ok, last lines of gh output)."""
-        cwd = f"{DEV}/{repo}"
-        try:
-            slug = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$", run(["git", "remote", "get-url", "origin"], cwd=cwd, capture_output=True, text=True, timeout=10).stdout or "")
-            subject = []
-            try:
-                tv = run(["gh", "pr", "view", n, "--json", "title"], cwd=cwd, capture_output=True, text=True, timeout=30)
-                if tv.returncode == 0:
-                    subject = ["--subject", f"{json.loads(tv.stdout)['title']} (#{n})"]
-            except Exception:
-                pass
-            r = run(["gh", "pr", "merge", n, "--squash", "--delete-branch"] + (["-R", slug.group(1)] if slug else []) + subject,
-                    cwd=cwd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
-        except Exception as e:
-            return False, f"{e.__class__.__name__}: {e}"[-300:]
-        out = "\n".join(((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-4:]) or "(no output)"
-        if r.returncode != 0 and "--auto" in out:   # not mergeable yet (conflicts / checks): arm auto-merge so the 👍 is not a no-op
-            try:
-                r2 = run(["gh", "pr", "merge", n, "--squash", "--delete-branch", "--auto"] + (["-R", slug.group(1)] if slug else []) + subject,
-                         cwd=cwd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
-                if r2.returncode == 0:
-                    return True, "not mergeable yet — auto-merge armed: it lands the moment the branch is mergeable (the planning session resolves conflicts)"
-            except Exception:
-                pass
-        if r.returncode != 0:
-            # GitHub answers a second, overlapping merge with "Merge already in progress" — and the FIRST one usually lands.
-            # Never report a failure without asking what actually happened to the PR (2026-08-28: #27 was merged and still
-            # told the owner it had failed). Asking ONCE is not enough: the first merge is still in flight, so the PR reads
-            # OPEN for a second or two and the owner gets a failure for a PR that lands moments later (2026-08-30: #32).
-            # "in progress" means someone else is mid-merge, so wait it out before believing the PR is still open.
-            tries = MERGE_RECHECK if "already in progress" in out.lower() else 1
-            for i in range(tries):
-                try:
-                    v = run(["gh", "pr", "view", n, "--json", "state,mergedAt"], cwd=cwd, capture_output=True, text=True, timeout=30)
-                    if v.returncode == 0 and (json.loads(v.stdout).get("state") == "MERGED"):
-                        return True, "already merged (a second merge overlapped the first)"
-                except Exception:
-                    pass
-                if i + 1 < tries:
-                    time.sleep(MERGE_RECHECK_EVERY)
-        return r.returncode == 0, out
 
     MEMBER_CMDS = ("help", "status")   # everything else steers the box, and only the owner steers the box
 
@@ -3591,8 +3509,11 @@ class Daemon:
         if n % 30 == 0:
             self.sweep_cycle()
             self.nudge_cycle()
-        if n % 120 == 0:                                 # hourly catch-up: a merge this box never saw (auto-merge landing
-            self.publish_soon(self.cfg.get("PUBLISH_REPO") or "")   # later, a merge from GitHub's own UI) still publishes
+        if n == 1 or n % 10 == 0:                        # every 5 min, and on the first tick after a reboot: finish a
+            self._safe(self.land_sweep)                  # landing left half-done, retry a deploy that failed, and deploy
+                                                         # a merge nobody here made (GitHub's UI, an auto-merge landing)
+        if n % 120 == 0:                                 # hourly catch-up: a merge this box never saw still publishes
+            self.publish_soon(self.cfg.get("PUBLISH_REPO") or "")
 
     def presence_poll(self, now):
         """Is the owner on Slack right now? One users.getPresence every PRESENCE_EVERY s — Slack's own idea of "active"
@@ -4546,7 +4467,7 @@ def cmd_post(argv):
         if len(words) >= 2 and words[1].lower() in ALERT_KINDS and words[0].lower() in (socket.gethostname().split(".")[0].lower(), "box"):
             chan = "#" + (cfg.get("SLACK_ALERTS") or ALERTS)   # "<box> boot|limit|audit|review|digest": machinery, never a project thread
         else:
-            name = re.split(r"[/\s\]]", route.strip().lstrip("["), 1)[0].lower()   # "[repo] PR #n …" (merge_failed titles) → repo
+            name = re.split(r"[/\s\]]", route.strip().lstrip("["), 1)[0].lower()   # "[repo] PR #n …" (landing titles) → repo
             chan = "#" + name if name else None
     if chan and chan.startswith("#"):
         chan = resolve_channel(cfg, chan[1:])
@@ -4844,17 +4765,21 @@ def cmd_selfcheck():
     # and a temp one. (The product-side gate is in cc-notify: a synthetic repo name is never pushed, from anywhere.)
     os.environ["CC_NOTIFY_LOG_ONLY"] = "1"
     os.environ["CC_NOTIFY_LOG"] = tempfile.mktemp(prefix="_selfcheck_notify_")
-    # …and the same for the WORK those threads do. Every :+1: case runs the real on_approval, which owes the merge a
-    # deploy — so land_soon() shelled to the REAL cc-land, and publish_soon() to the real cc-publish. Against a fixture
-    # that is only noise; but `nameMM` below is deliberately the first REAL repo in ~/dev (on_approval requires a repo
-    # that exists), so `cc-land ai-ee 7` ran for real, six times, and paged the owner with a title indistinguishable
-    # from a real failed deploy — which the synthetic-name gate cannot catch, because the name is real. cc-land deploys:
-    # install.sh, daemon-reload, systemctl restart. It stopped at "no PR #7" by luck, not by design. So the class is
-    # pinned for the whole run, once: a case that asserts on these still sets its own (an instance attribute shadows
-    # this), and land()/publish() themselves are still exercised directly with an injected `run`.
+    # …and the same for the WORK those cases set off. Every :+1: case runs the real on_approval, and every tick case
+    # runs the real loop_tick — so queue_land() shelled to the REAL cc-land and publish_soon() to the real cc-publish.
+    # Against a fixture that is only noise; but `nameMM` below is deliberately the first REAL repo in ~/dev
+    # (on_approval requires a repo that exists), so it ran for real, six times, and paged the owner with a title
+    # indistinguishable from a real failed deploy — which the synthetic-name gate cannot catch, because the name is
+    # real. It is worse now than it was then: `cc-land queue` writes a REAL job into the box's landing queue and
+    # starts a REAL worker, which gates, MERGES and deploys. So the class is pinned for the whole run, once: a case
+    # that asserts on these sets its own (an instance attribute shadows this), and the methods themselves are still
+    # exercised directly, through the names kept here, with an injected `run`.
     deferred = []
-    real_land_soon, real_publish_soon = Daemon.land_soon, Daemon.publish_soon
-    Daemon.land_soon = lambda self, repo, n, chat, ts: deferred.append(("land", repo, n))
+    real_queue_land, real_land_sweep = Daemon.queue_land, Daemon.land_sweep
+    real_publish_soon = Daemon.publish_soon
+    Daemon.queue_land = lambda self, repo, n, chat, ts, who="", run=None: (
+        deferred.append(("queue", repo, n)) or (True, f"[{repo}] PR #{n} queued (a stand-in for the selfcheck)"))
+    Daemon.land_sweep = lambda self, run=None: deferred.append(("sweep", "", ""))
     Daemon.publish_soon = lambda self, repo: deferred.append(("publish", repo))
     real_notify_log = f"{HOME}/.cc/notify.log"
     before_notify = os.path.getsize(real_notify_log) if os.path.exists(real_notify_log) else None
@@ -4997,89 +4922,79 @@ def cmd_selfcheck():
         posts = {"1.1": {"user": "UBOT", "text": f"[{name}] PR #7: t — https://x/7"}, "1.2": {"user": "UOWNER", "text": f"[{name}] PR #8: t"},
                  "1.3": {"user": "UBOT", "text": f"merged [{name}] PR #9:"}, "1.4": {"user": "UBOT", "text": "[no-such-repo-zz] PR #1: t"}}
         dm.fetch_message = lambda chat, ts: posts.get(ts); said, calls = [], []
-        dm.say = lambda chat, text, thread=None: said.append((chat, thread)); dm.merge = lambda repo, n: calls.append((repo, n)) or (True, "✓ Squashed and merged")
+        dm.say = lambda chat, text, thread=None: said.append((chat, thread))
+        qok = [True]
+        dm.queue_land = lambda repo, n, chat, ts, who="", run=None: calls.append((repo, n, chat, ts, who)) or (
+            (True, f"[{repo}] PR #{n} queued — the gates run first, then the merge, then the deploy") if qok[0]
+            else (False, "cc-land: cannot write /home/x/.cc/state/land/x-7.json: Read-only file system — nothing merged"))
         ev = lambda **k: {"type": "reaction_added", "reaction": "+1", "user": "UOWNER", "item": {"type": "message", "channel": "CAPPR", "ts": "1.1"}, **k}
         it = lambda ts, chan="CAPPR", kind="message": {"type": kind, "channel": chan, "ts": ts}
         dm.users.update({"UOWNER": ("The Owner", "owner"), "UMEM": ("Ada", "ada.byron")})
         bad = [ev(user="UMEM", item=it("1.2")), ev(reaction="eyes"), ev(item=it("1.1", "CREPO")), ev(item=it("1.2")), ev(item=it("1.3")), ev(item=it("1.4")),
                ev(item=it("1.1", kind="file")), ev(item=it("9.9")), {"type": "message", "channel": "CAPPR", "ts": "1", "user": "UOWNER", "text": "hi"}]
-        notes, injected, real_run = [], [], subprocess.run     # merge-failure routing: no real cc-notify, no real session inject
+        notes, injected, real_run = [], [], subprocess.run     # failure routing: no real cc-notify, no real session inject
         subprocess.run = lambda cmd, **kw: notes.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         dm.deliver = lambda target, payload, **kw: injected.append((target, payload["content"]))
-        with contextlib.redirect_stderr(io.StringIO()):
-            check("reaction: wrong emoji/channel, non-bot author (a member's :+1: on one too), bad text, unknown repo/ts, "
-                  "non-message, plain message → ignored",
-                  all(dm.on_event(e) is None for e in bad) and not calls and not said)
-            out = dm.on_event(ev(reaction="thumbsup"))
-            check("reaction: owner's :+1: on the bot's PR post → merge(repo, n) once, ✅ text, threaded reply",
-                  calls == [(name, "7")] and "merged ✅" in (out or "") and said == [("CAPPR", "1.1")])
-            calls.clear(); said.clear()
-            out5 = dm.on_event(ev(user="UMEM"))
-            check("reaction: a MEMBER's :+1: on that same post merges exactly as the owner's — the owner curates who is in "
-                  "#approvals, so being in that channel IS the approval right (owner's decision, 2026-08-30)",
-                  calls == [(name, "7")] and "merged ✅" in (out5 or "") and said == [("CAPPR", "1.1")])
-            dm.merge = lambda repo, n: (True, "! Pull request x#7 was already merged"); out2 = dm.on_event(ev())
-            dm.merge = lambda repo, n: (False, "X Pull request #7 is closed"); out4 = dm.on_event(ev())
-            quiet = not notes and not injected              # success + already merged/closed: nobody is pinged, nothing injected
-            dm.merge = lambda repo, n: (False, "X Pull Request has merge conflicts\nGraphQL: not mergeable"); out3 = dm.on_event(ev())
-            check("reaction: already merged/closed → plain notice; gh failure → ❌ + stderr tail",
-                  "already merged" in out2 and "already closed" in out4 and "failed ❌" in out3 and "GraphQL" in out3)
-            check("reaction: merged/closed/success route nothing out of #approvals", quiet)
-            check("reaction: failed merge → cc-notify -p high + inject into the repo's planning session",
-                  notes == [[f"{BIN}/cc-notify", "-p", "high", "-t", f"[{name}] PR #7 merge failed", "GraphQL: not mergeable — https://x/7"]]
-                  and injected == [(name, f"PR #7 merge failed: GraphQL: not mergeable. Resolve on its track branch, then "
-                                          f"re-post the card (`cc-slack post-approval --force {name} 7` — without --force the old card wins).")])
-            rec = []; stub = lambda cmd, **kw: rec.append(cmd) or type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
-            check("merge: gh pr merge <n> --squash --delete-branch -R owner/repo, no --subject when title fetch fails (bad JSON here)",
-                  Daemon.merge(dm, name, "7", run=stub)[0] and rec[-1] == ["gh", "pr", "merge", "7", "--squash", "--delete-branch", "-R", "o/r"])
-            rec2 = []
-            def stub2(cmd, **kw):
-                rec2.append(cmd)
-                if cmd[:3] == ["gh", "pr", "view"]:
-                    return type("R", (), {"returncode": 0, "stdout": json.dumps({"title": "Add reboot command"}), "stderr": ""})()
-                return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
-            check("merge: --subject uses the PR title, not gh's commit-log default",
-                  Daemon.merge(dm, name, "7", run=stub2)[0] and rec2[-1] == ["gh", "pr", "merge", "7", "--squash", "--delete-branch", "-R", "o/r", "--subject", "Add reboot command (#7)"])
-            # "Merge already in progress": the FIRST merge is still in flight, so the PR reads OPEN for a second or two.
-            # Asking once told the owner a PR had failed that landed moments later (2026-08-30, PR #32).
-            real_recheck, real_every = MERGE_RECHECK, MERGE_RECHECK_EVERY
-            globals()["MERGE_RECHECK_EVERY"] = 0
-            try:
-                views = []
-                def stub3(cmd, **kw):
-                    if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt" in cmd:
-                        views.append(1)                    # OPEN while the other merge runs, MERGED from the 3rd look on
-                        return type("R", (), {"returncode": 0, "stderr": "", "stdout": json.dumps(
-                            {"state": "MERGED" if len(views) >= 3 else "OPEN", "mergedAt": None})})()
-                    if cmd[:3] == ["gh", "pr", "merge"]:
-                        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "GraphQL: Merge already in progress (mergePullRequest)"})()
-                    return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
-                okp, outp = Daemon.merge(dm, name, "7", run=stub3)
-                check("merge: 'Merge already in progress' is re-read until the first merge lands — never reported as a failure",
-                      okp and "already merged" in outp and len(views) == 3)
-                views2 = []
-                def stub4(cmd, **kw):
-                    if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt" in cmd:
-                        views2.append(1); return type("R", (), {"returncode": 0, "stderr": "", "stdout": json.dumps({"state": "OPEN", "mergedAt": None})})()
-                    if cmd[:3] == ["gh", "pr", "merge"]:
-                        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "GraphQL: not mergeable"})()
-                    return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
-                okq, outq = Daemon.merge(dm, name, "7", run=stub4)
-                check("merge: a failure that is NOT an overlap is still checked once and still reported failed",
-                      not okq and "not mergeable" in outq and len(views2) == 1)
-                globals()["MERGE_RECHECK"] = 2
-                views3 = []
-                def stub5(cmd, **kw):
-                    if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt" in cmd:
-                        views3.append(1); return type("R", (), {"returncode": 0, "stderr": "", "stdout": json.dumps({"state": "OPEN", "mergedAt": None})})()
-                    if cmd[:3] == ["gh", "pr", "merge"]:
-                        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "GraphQL: Merge already in progress (mergePullRequest)"})()
-                    return type("R", (), {"returncode": 0, "stdout": "git@github.com:o/r.git\n", "stderr": ""})()
-                okr, _ = Daemon.merge(dm, name, "7", run=stub5)
-                check("merge: an overlap that never lands gives up after MERGE_RECHECK looks and reports the failure",
-                      not okr and len(views3) == 2)
-            finally:
-                globals()["MERGE_RECHECK"], globals()["MERGE_RECHECK_EVERY"] = real_recheck, real_every
+        marks, real_react_ap = [], react
+        globals()["react"] = lambda cfg, chat, ts, name, remove=False: marks.append((chat, ts, name))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                check("reaction: wrong emoji/channel, non-bot author (a member's :+1: on one too), bad text, unknown repo/ts, "
+                      "non-message, plain message → ignored",
+                      all(dm.on_event(e) is None for e in bad) and not calls and not said and not marks)
+                out = dm.on_event(ev(reaction="thumbsup"))
+                check("reaction: a :+1: on the bot's PR post MERGES NOTHING HERE — it hands the PR to cc-land, the one "
+                      "thing on this box that merges, and the gates run before that merge. Merging here and calling "
+                      "cc-land afterwards is how every PR the owner approved on 2026-08-31 went in ungated",
+                      calls == [(name, "7", "CAPPR", "1.1", "The Owner")] and "queued" in (out or ""))
+                check("reaction: a queued 👍 is marked 👀 and says nothing else — the landing owns the ✅/❌ and the one "
+                      "result the owner reads, and it can only say it once the gates, the merge and the deploy are done",
+                      marks == [("CAPPR", "1.1", "eyes")] and not said and not notes and not injected)
+                calls.clear(); marks.clear()
+                out5 = dm.on_event(ev(user="UMEM"))
+                check("reaction: a MEMBER's :+1: is worth exactly the owner's — the owner curates who is in #approvals, "
+                      "so being in that channel IS the approval right (owner's decision, 2026-08-30)",
+                      calls == [(name, "7", "CAPPR", "1.1", "Ada")] and "queued" in (out5 or "")
+                      and marks == [("CAPPR", "1.1", "eyes")])
+                calls.clear(); marks.clear(); qok[0] = False
+                out6 = dm.on_event(ev())
+                check("reaction: FAIL CLOSED — a queue that will not take the PR is ❌ and a plain 'NOT merged' in the "
+                      "thread. Nothing here merges without the queue, and there is no fallback that merges without the "
+                      "gates: that fallback was the bug",
+                      "NOT merged" in (out6 or "") and "Read-only file system" in (out6 or "")
+                      and marks == [("CAPPR", "1.1", "x")] and said == [("CAPPR", "1.1")])
+                check("reaction: ...and it does not die in #approvals, which no session reads — the owner is paged and "
+                      "the repo's own planning session is told, in as many words, that nothing merged",
+                      notes and notes[-1][:5] == [f"{BIN}/cc-notify", "-p", "high", "-t",
+                                                  f"[{name}] PR #7 was NOT merged"]
+                      and injected and injected[-1][0] == name and "could not even be queued" in injected[-1][1]
+                      and "Nothing merged" in injected[-1][1])
+                qok[0] = True
+                del dm.queue_land          # nothing stubbing it now: the 👍 path lands on the process-wide pin at the
+                dm.on_event(ev())          # top of this selfcheck, which is the only thing standing between a fixture
+        finally:                           # and a REAL job in this box's landing queue
+            globals()["react"] = real_react_ap
+        qrec = []
+        okq, outq = real_queue_land(dm, name, "7", "CAPPR", "1.1", "The Owner",
+                                    run=lambda cmd, **kw: qrec.append(cmd) or type("R", (), {"returncode": 0, "stdout": "queued\n", "stderr": ""})())
+        check("queue_land: cc-land owns the queue's format, its lock and its worker — this only asks, and hands over "
+              "the thread the 👍 was given in so the landing can answer where it was approved",
+              okq and qrec == [[f"{BIN}/cc-land", "queue", name, "7", "--chat", "CAPPR", "--ts", "1.1",
+                                "--who", "The Owner"]])
+        okf, outf = real_queue_land(dm, name, "7", "CAPPR", "1.1",
+                                    run=lambda cmd, **kw: type("R", (), {"returncode": 1, "stdout": "", "stderr": "the worker would not start"})())
+        check("queue_land: cc-land's EXIT CODE is the whole answer — non-zero means nothing merged and nothing will "
+              "until somebody acts, which is what goes in the channel instead of a merge",
+              not okf and "would not start" in outf)
+        okx, outx = real_queue_land(dm, name, "7", "CAPPR", "1.1",
+                                    run=lambda cmd, **kw: (_ for _ in ()).throw(OSError("no such file")))
+        check("queue_land: a queue command that will not even run is a failure too, never a quiet merge",
+              not okx and "OSError" in outx)
+        swept = []
+        real_land_sweep(dm, run=lambda cmd, **kw: swept.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+        check("land_sweep: asks the worker to drain the queue, off the reaction path — that is what finishes a landing "
+              "a reboot interrupted, retries the deploy PR #87 never got, and lands a merge made in GitHub's own UI",
+              swept == [[f"{BIN}/cc-land", "work", "--detach"]])
         subprocess.run = real_run
         check("valid_target", valid_target(name) and valid_target(f"{name}/t1") and valid_target("box")
               and not valid_target("no-such-repo-zz") and not valid_target("../x") and not valid_target(""))
@@ -5886,10 +5801,20 @@ def cmd_selfcheck():
     dmD = Daemon(use_slack=False); bc_calls, nc_calls, sw_calls = [], [], []
     dmD.board_cycle = lambda: bc_calls.append(1); dmD.nudge_cycle = lambda: nc_calls.append(1)
     dmD.sweep_cycle = lambda: sw_calls.append(1)
-    for i in range(1, 61):
+    sweeps0 = len([1 for k, *_ in deferred if k == "sweep"])   # land_sweep is NOT stubbed here: it is the process pin
+    for i in range(1, 61):                                     # that catches it, and this is what proves that pin works
         dmD.loop_tick(i)
     check("loop_tick: board debounce every tick · status sweep + nudges every 15 min (fake clock) — S2/V4",
           len(bc_calls) == 60 and len(sw_calls) == 2 and len(nc_calls) == 2)
+    check("loop_tick: the landing queue is re-driven on the FIRST tick and every 5 min after — the first one finishes "
+          "a landing a reboot interrupted, and the rest are the retry a stopped deploy never had",
+          len([1 for k, *_ in deferred if k == "sweep"]) - sweeps0 == 7)
+    dmP = Daemon(use_slack=False); dmP.cfg = {"PUBLISH_REPO": "ctl"}
+    dmP.board_cycle = dmP.sweep_cycle = dmP.nudge_cycle = lambda: None
+    dmP.loop_tick(120)
+    check("loop_tick: the public mirror still gets its hourly catch-up — nothing here notices a merge any more, so "
+          "the merge nobody here made is the ONLY case left (cc-publish.timer is the primary path either way)",
+          ("publish", "ctl") in deferred)
     dmA = Daemon(use_slack=False); rec_a = []
     dmA.board_cycle = dmA.sweep_cycle = dmA.nudge_cycle = lambda: None
     dmA.reconcile_reactions = lambda chat, cap=10: rec_a.append(chat)
@@ -6192,7 +6117,7 @@ def cmd_selfcheck():
             cmd_post(["--route", "[myrepo] PR #3: fix things", "merge failed"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
-    check("post --route: a merge_failed title '[repo] PR #n …' lands in #repo, not SLACK_CHANNEL — L16",
+    check("post --route: a landing's title '[repo] PR #n …' lands in #repo, not SLACK_CHANNEL — L16",
           posted16 == ["C-myrepo"])
     postedA = []
     try:
@@ -6585,19 +6510,16 @@ def cmd_selfcheck():
         globals()["api"] = _apiG
     check("archived/left chat: not_in_channel forgets it (no board, alarm, last_chat or fallback left) — no 15-min error loop",
           "CGONE" in dmG.forgotten and "CGONE" not in dmG.board and "CGONE" not in dmG.alarms and "repo" not in dmG.last_chat and "repo" not in dmG.default_chats)
-    callsAM = []
-    def runAM(a, **k):
-        callsAM.append(a)
-        class R: pass
-        r = R(); r.stdout = ""; r.stderr = ""
-        if a[:2] == ["git", "remote"]: r.returncode = 0; r.stdout = "git@github.com:o/r.git"
-        elif "--json" in a: r.returncode = 0; r.stdout = '{"title": "t"}'
-        elif "--auto" in a: r.returncode = 0
-        else: r.returncode = 1; r.stderr = "X Pull request is not mergeable: add the `--auto` flag"
-        return r
-    dmAM = Daemon(use_slack=False); okAM, msgAM = dmAM.merge("repo", "7", run=runAM)
-    check("👍-merge on a not-yet-mergeable PR arms auto-merge (--auto) instead of failing silently",
-          okAM and "auto-merge armed" in msgAM and any("--auto" in a for a in callsAM))
+    # The 👍 path used to merge right here, and when the PR was not mergeable yet it armed GitHub's own merge-later
+    # — which then landed whenever GitHub felt like it, past no gates, with nothing deploying it afterwards. Both are
+    # gone, and what keeps them gone is that this file no longer knows how to merge anything. cc-land is the sole
+    # merger; a second copy of the merge is a second way to skip the gates.
+    ownSC = open(os.path.realpath(__file__)).read()
+    check("cc-slack cannot merge, at all: the argv that merges a PR, and the flag that hands the merge to GitHub to "
+          "do later, appear nowhere in it — so nothing here can reach around the gates that guard the merge",
+          ('"pr", ' + '"merge"') not in ownSC and ("--" + "auto") not in ownSC
+          and not hasattr(Daemon, "merge") and not hasattr(Daemon, "mark_merged")
+          and not hasattr(Daemon, "land_soon"))
     # -- PART 6: status v3 (❓ needs you · 🔴 the session owes you · 🟠 handled) + the 🏁 flag file ------------------
     nowF = time.time()
     f_roots = [{"ts": "9200.1", "reply_count": 1, "latest_reply": str(nowF - 40 * 60), "user": "UOWNER", "text": "flag me"}]
@@ -7450,78 +7372,24 @@ def cmd_selfcheck():
           active and not too_soon and grace and not cooled and beat and throttled == 2
           and seenPR[0] == ("users.getPresence", "UOWNER"))
     dmMM = Daemon(use_slack=False); dmMM.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmMM.bot_user = "UBOT"
-    mm_calls = []
-    def mm_run(a, **k):
-        mm_calls.append(a)
-        class R: returncode = 0; stdout = '{"headRefName": "track/t9"}'; stderr = ""
-        return R()
-    dmMM.mark_merged("repo", "7", run=mm_run)
-    check("a 👍-merge flips the PR's track to `merged` on the board (status + note) — Home/!digest no longer say review",
-          any(a[-3:] == ["repo", "t9", "merged"] for a in mm_calls if a and a[0].endswith("cc-board") and a[1] == "status")
-          and any(a[1] == "note" and "PR #7" in a[-1] for a in mm_calls if a and a[0].endswith("cc-board")))
-    marked = []; dmMM.mark_merged = lambda repo, n: marked.append((repo, n)); dmMM.say = lambda *a, **k: None
     nameMM = next(d for d in sorted(os.listdir(DEV)) if not d.startswith(".") and os.path.isdir(f"{DEV}/{d}/.git"))
     dmMM.fetch_message = lambda chat, ts: {"user": "UBOT", "text": f"[{nameMM}] PR #7: t — https://x/7"}
-    dmMM.merge = lambda repo, n: (True, "merged"); dmMM.merge_failed = lambda *a, **k: None
-    _reactMM = globals()["react"]; globals()["react"] = lambda *a, **k: None
+    dmMM.say = lambda *a, **k: None
+    dmMM.home_dirty, qMM = False, []
+    dmMM.queue_land = lambda repo, n, chat, ts, who="", run=None: qMM.append((repo, n)) or (True, "queued")
+    _reactMM, _runMM, runsMM = globals()["react"], subprocess.run, []
+    globals()["react"] = lambda *a, **k: None
+    subprocess.run = lambda cmd, **kw: runsMM.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             dmMM.on_approval("CAPPR", "1.1", "+1")
-            dmMM.merge = lambda repo, n: (True, "not mergeable yet — auto-merge armed: …")
-            dmMM.on_approval("CAPPR", "1.1", "+1")
     finally:
-        globals()["react"] = _reactMM
-    check("on_approval marks the track merged only when the merge really happened (not when auto-merge was merely armed)",
-          marked == [(nameMM, "7")])
-    pub = []; dmMM.publish_soon = pub.append; dmMM.mark_pr = lambda *a, **k: None
-    globals()["react"] = lambda *a, **k: None
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmMM.merge = lambda repo, n: (True, "merged")
-            dmMM.on_approval("CAPPR", "1.1", "+1")                                        # it landed: the default branch moved
-            dmMM.merge = lambda repo, n: (True, "not mergeable yet — auto-merge armed: …")
-            dmMM.on_approval("CAPPR", "1.1", "+1")                                        # nothing has landed yet
-            dmMM.merge = lambda repo, n: (False, "X Pull request is not mergeable: conflicts")
-            dmMM.on_approval("CAPPR", "1.1", "+1")                                        # nothing landed at all
-    finally:
-        globals()["react"] = _reactMM
-    check("a 👍-merge that LANDED publishes core/ (auto-merge merely armed, or a merge that failed, publishes nothing)",
-          pub == [nameMM])
-    # …and the merge OWES the box a deploy: the 👍 path runs the same sequence a session would have typed
-    dmL = Daemon(use_slack=False); dmL.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmL.bot_user = "UBOT"
-    landedL, saidL = [], []
-    dmL.mark_pr = lambda *a, **k: None; dmL.publish_soon = lambda r: None
-    dmL.say = lambda chat, text, ts=None, **k: saidL.append(text)
-    dmL.fetch_message = lambda chat, ts: {"user": "UBOT", "text": f"[{nameMM}] PR #7: t — https://x/7"}
-    dmL.land_soon = lambda repo, n, chat, ts: landedL.append((repo, n, chat, ts))
-    globals()["react"] = lambda *a, **k: None
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmL.merge = lambda repo, n: (True, "merged")
-            dmL.on_approval("CAPPR", "1.1", "+1")
-            dmL.merge = lambda repo, n: (True, "not mergeable yet — auto-merge armed: …")
-            dmL.on_approval("CAPPR", "1.1", "+1")
-    finally:
-        globals()["react"] = _reactMM
-    check("a 👍-merge runs the whole after-merge sequence off the reaction thread — the #approvals card, the board, "
-          "the ask ledger, install.sh, the units it added and the restarts; an armed auto-merge runs none of it yet",
-          landedL == [(nameMM, "7", "CAPPR", "1.1")])
-    runsL, saidL[:] = [], []
-    class _RL:
-        def __init__(self, rc, out):
-            self.returncode, self.stdout, self.stderr = rc, out, ""
-    def land_run(rc, out):
-        return lambda a, **k: (runsL.append(a), _RL(rc, out))[1]
-    dmL.land(nameMM, "7", "CAPPR", "1.1", run=land_run(0, "landed."))
-    quiet = len(runsL) == 1 and runsL[0][0].endswith("cc-land") and runsL[0][1:] == [nameMM, "7"] and saidL == []
-    dmL.land(nameMM, "7", "CAPPR", "1.1", run=land_run(LAND_COSMETIC, "  ✗ card: message_not_found\nlanded — the box is deployed"))
-    failedL = []; dmL.land_failed = lambda *a: failedL.append(a)
-    dmL.land(nameMM, "7", "CAPPR", "1.1", run=land_run(1, "  ✗ install: install.sh: boom"))
-    check("that sequence IS cc-land — one copy of it, called with the repo and the PR — and a clean run says nothing "
-          "more in the thread (the merge reply already did)", quiet)
-    check("a cosmetic step failing there is reported in the thread and stops nothing; a step that leaves the box "
-          "WRONG also reaches the owner",
-          len(saidL) == 2 and "deployed" in saidL[0] and "STOPPED" in saidL[1] and len(failedL) == 1)
+        globals()["react"], subprocess.run = _reactMM, _runMM
+    check("a 👍 hands the PR over and does nothing else with it — no board write, no ask ledger, no card, no publish, "
+          "no cc-notify. Every one of those is a claim about a merge that has not happened yet, and the landing makes "
+          "them itself, each one only once it is true",
+          qMM == [(nameMM, "7")] and not runsMM and not dmMM.home_dirty)
+
     # the channel server runs the code that is DEPLOYED, not the code it started with
     fR = tempfile.NamedTemporaryFile("w", delete=False, suffix="-cc-slack"); fR.write("x"); fR.close()
     _slR, _sR, _smR = SELF_LINK, SELF, SELF_MTIME
@@ -7553,18 +7421,6 @@ def cmd_selfcheck():
     dmPB.cfg = {}; dmPB.publish("ctl", run=pb_run)
     check("publishing is scoped to the one repo that has a public mirror: no PUBLISH_REPO, or any other repo, runs nothing",
           skipped and len(ran) == 1 and ran[0][0].endswith("cc-publish"))
-    prs = []; dmMM.mark_pr = lambda repo, n, status, note, run=None: prs.append((status, note[:14]))
-    dmMM.merge = lambda repo, n: (False, "X Pull request is not mergeable: conflicts")
-    globals()["react"] = lambda *a, **k: None
-    try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            dmMM.on_approval("CAPPR", "1.1", "+1")
-            dmMM.merge = lambda repo, n: (True, "not mergeable yet — auto-merge armed: …")
-            dmMM.on_approval("CAPPR", "1.1", "+1")
-    finally:
-        globals()["react"] = _reactMM
-    check("a failed 👍-merge marks the track blocked with the reason; an armed auto-merge leaves a note (status unchanged) — owner rule",
-          len(prs) == 2 and prs[0][0] == "blocked" and prs[0][1].startswith("merge FAILED") and prs[1][0] is None and prs[1][1].startswith("👍 seen"))
     pressedP = []; _tmuxP = globals()["tmux"]
     globals()["tmux"] = lambda *a: (pressedP.append(a) or (0, "")) if a[0] == "send-keys" else (0, "MCP servers may execute code or access system resources.\n  ❯ 1. Use this MCP server\n  Enter to confirm · Esc to cancel")
     try:
@@ -7955,19 +7811,6 @@ def cmd_selfcheck():
           "carries disk, RAM, load and uptime",
           w0 is None and abs(w1 - 2.0) < 0.01 and w2 is None
           and all(x in vitals for x in ("💽", "🧠", "📈", "⏱")))
-    dmMG = Daemon(use_slack=False)
-    callsMG = []
-    def runMG(a, **k):
-        callsMG.append(a[:3])
-        if a[:3] == ["gh", "pr", "merge"]:
-            return types.SimpleNamespace(returncode=1, stdout="", stderr="GraphQL: Merge already in progress (mergePullRequest)")
-        if a[:4] == ["gh", "pr", "view", "27"]:
-            return types.SimpleNamespace(returncode=0, stdout=json.dumps({"state": "MERGED", "mergedAt": "now", "title": "t"}), stderr="")
-        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
-    okMG, whyMG = dmMG.merge("myrepo", "27", run=runMG)
-    check("a 👍 merge that raced another one is not reported as a failure: gh says \"Merge already in progress\", the PR says "
-          "MERGED, so the owner is told it merged",
-          okMG and "already merged" in whyMG)
     check("Home: a finished track leaves the dashboard as soon as it is done/merged unless its PR still waits for a 👍",
           home_track_shown("running", None) and home_track_shown("blocked", None) and not home_track_shown("done", None)
           and not home_track_shown("merged", "MERGED") and home_track_shown("done", "OPEN/APPROVED"))
@@ -8208,7 +8051,7 @@ def cmd_selfcheck():
         for _f in (ORCHS, PROVISIONED):
             os.path.exists(f"{DIR}/{_f}") and os.unlink(f"{DIR}/{_f}")
     check("selfcheck: the channel-is-a-session checks never touched the real ~/dev", DEV == f"{HOME}/dev" and not os.path.exists(devP))
-    deadline = time.time() + 20                              # land_soon/publish_soon work OFF-thread: let them finish before judging
+    deadline = time.time() + 20                              # publish_soon works OFF-thread: let it finish before judging
     for t in threading.enumerate():
         if t is not threading.current_thread():
             t.join(timeout=max(0.0, deadline - time.time()))
@@ -8216,11 +8059,14 @@ def cmd_selfcheck():
     check("selfcheck: NOTHING this run could reach the owner — the whole process is pinned log-only, so not even a "
           "background land/publish thread can page them about a fixture", after_notify == before_notify)
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
-    check("selfcheck: no case shelled out to the real cc-land or cc-publish — the deploy the 👍 path owes a merge is "
-          "pinned for the whole process, and cases DID reach that pin (it is load-bearing, not decoration)",
-          Daemon.land_soon is not real_land_soon and Daemon.publish_soon is not real_publish_soon
-          and any(k == "land" for k, *_ in deferred) and any(k == "publish" for k, *_ in deferred))
-    Daemon.land_soon, Daemon.publish_soon = real_land_soon, real_publish_soon
+    check("selfcheck: no case shelled out to the real cc-land or cc-publish — a queue command here would write a real "
+          "landing job into this box's own queue and start a real worker that gates, MERGES and deploys, so the class "
+          "is pinned for the whole process, and cases DID reach that pin (it is load-bearing, not decoration)",
+          Daemon.queue_land is not real_queue_land and Daemon.land_sweep is not real_land_sweep
+          and Daemon.publish_soon is not real_publish_soon and any(k == "queue" for k, *_ in deferred)
+          and any(k == "sweep" for k, *_ in deferred) and any(k == "publish" for k, *_ in deferred))
+    Daemon.queue_land, Daemon.land_sweep = real_queue_land, real_land_sweep
+    Daemon.publish_soon = real_publish_soon
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0

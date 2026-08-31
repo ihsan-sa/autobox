@@ -3,14 +3,16 @@
 
   cc-land <repo> <pr-number> [<pr-number> …]      the PR path; several PRs deploy once, at the end
   cc-land <repo> --track <t> --note "<what>"      work with no PR (a config edit, a host change)
+  cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does
+  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min)
   cc-land selfcheck                               the decision table; no network, no systemctl
 
 Landing a change used to be nine separate things to remember — gates, merge, the #approvals card, the mark on
 it, the board, the ask ledger, install.sh, switching on what landed switched off, restarting what moved — and
 in one night every one of them was forgotten at least once. This runs them in that order, prints one line per
-step, and stops at the first real failure rather than leaving half of it done. It adds no state, no daemon
-and no timer: every step is a call to something that already exists (gh, cc-slack, cc-board, cc-scope,
-install.sh, systemctl).
+step, and stops at the first real failure rather than leaving half of it done. Every step is a call to something
+that already exists (gh, cc-slack, cc-board, cc-scope, install.sh, systemctl); the ONE thing it owns is the queue
+under `~/.cc/state/land/`, and it owns that because a landing has to survive the process that started it.
 
 WHAT IT WILL NOT DO, and why each line is here:
   · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
@@ -21,6 +23,17 @@ WHAT IT WILL NOT DO, and why each line is here:
     back. Enabling the added ones is the step a worker structurally cannot do: cc-guard denies it systemctl.
   · It never restarts the unit that owns the shared tmux server. That would take every session on the box
     down, this one included; if the change moved what that unit runs, it says so and leaves it to a person.
+
+THE ONLY THING ON THIS BOX THAT MERGES. A 👍 in #approvals used to squash-merge inside the Slack daemon and call this
+afterwards — so every step below ran against a PR that was already in, the gates reported "gates guard the merge, and
+it has happened", and on 2026-08-31 every landing the owner approved went in ungated. The 👍 now only writes
+`~/.cc/state/land/<repo>-<pr>.json` and starts `cc-land work`; the gates, the merge and the deploy are one
+transaction, in one place, in that order. The queue is a FILE because the deploy restarts the very daemon that asked
+for it: a thread there dies mid-install (that is how PR #87 merged and never installed), while the job on disk
+survives that restart, a kill and a reboot, and the next `work` picks it up where it stopped. The worker holds one
+flock, so two of them cannot merge one PR twice; `queue` never overwrites a job already waiting, so two 👍 on one
+card are still one landing. A merge this box never made — GitHub's own UI, an auto-merge landing later — is caught the
+same way: `work` compares origin's default branch against the SHA install.sh last ran on, and deploys the difference.
 
 A step that cannot run because the box has no such thing (Slack not set up, no board row, no ledger row) is a
 SKIP: it reports and the sequence carries on. A step that was asked to do something and could not is a
@@ -43,7 +56,7 @@ honest answer and the point: an ask nobody can measure is not an ask that is don
 Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
 cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
-import glob, json, os, re, shutil, subprocess, sys, tempfile, urllib.parse, urllib.request
+import fcntl, glob, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy (like `cc`)
@@ -51,6 +64,12 @@ DEV = f"{HOME}/dev"
 CFG = f"{HOME}/.cc/config"
 BOARDS = f"{HOME}/.cc/boards"
 UNITS = f"{HOME}/.config/systemd/user"
+LANDQ = f"{HOME}/.cc/state/land"          # the landing queue: one job file per PR, plus what each repo has installed
+LAND_TRIES = 3                            # a deploy that keeps failing stops re-driving itself and says so, once
+CATCHUP_EVERY = 900                       # how often the box POLLS origin for a merge nobody here made. The queue is
+                                          # drained every sweep — it needs no polling — but this asks every repo's
+                                          # remote, and one slow or unreachable remote must never sit in front of the
+                                          # landing a 👍 is waiting on.
 # The gates, in the order a person runs them: the cheap static ones first, the slow end-to-end one last. A repo
 # with none of them lands ungated and says so — this is a general tool, not one tree's own script.
 GATES = ("core/tests/check.sh", "tests/check.sh", "tests/check-extra.sh", "core/tests/selftest.sh", "tests/selftest.sh")
@@ -62,6 +81,11 @@ CARD = "ok_hand"                          # the mark for "landed". The daemon pu
 # board, ledger — is a record of what happened, not the thing that happened: it reports ✗, the sequence carries
 # on, and the run exits 3 so the operator still knows one of them wants a hand.
 FATAL = ("gates", "merge", "install", "units", "restart")
+# …and of those, the ones worth trying AGAIN unattended. A red gate and a refused merge are verdicts: re-running them
+# burns a whole suite to be told the same thing, and they want a person. install/units/restart fail on the STATE of
+# the box — a checkout parked on a feature branch, a unit mid-restart — which the next attempt may well find fixed, and
+# PR #87 sat merged-and-undeployed for exactly the want of that second attempt.
+RETRY = ("install", "units", "restart")
 COSMETIC = 3                              # exit code for "the box is right, its bookkeeping is not"
 UNVERIFIED = 4                            # "the box is deployed, and nothing has confirmed the owner can see it"
 
@@ -131,6 +155,52 @@ def read_unit(name):
         return ""
 
 
+def stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def write_atomic(path, obj):
+    """A reader — the next worker, after a kill — sees the whole job or the previous one, never half of one."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def job_path(repo, pr):
+    """One file per PR, and the NAME is the idempotency key: two 👍 on one card, or a 👍 while the worker is
+    already on it, are one job and therefore one merge."""
+    return f"{LANDQ}/{repo}-{pr}.json"
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def applied_sha(repo):
+    """The default-branch SHA install.sh last ran on. This is what "deployed" MEANS on this box, and the only
+    thing that can tell a merge somebody made in GitHub's UI from one this box has already applied."""
+    return (read_json(f"{LANDQ}/{repo}.applied") or {}).get("sha", "")
+
+
+def record_applied(repo, sha):
+    write_atomic(f"{LANDQ}/{repo}.applied", {"sha": sha, "at": stamp()})
+
+
 def out(mark, text):
     print(f"  {mark} {text}", flush=True)
 
@@ -151,8 +221,12 @@ def name_status(text):
 
 # ── the landing ──────────────────────────────────────────────────────────────────────────────────────────
 class Land:
-    def __init__(self, repo, pr=None, track=None, note=""):
+    def __init__(self, repo, pr=None, track=None, note="", span=None):
         self.repo, self.pr, self.track, self.note = repo, pr, track, note
+        self.span = span         # (installed_sha, tip_sha): a deploy with no PR, catching the box up to a merge it missed
+        self.job = ""            # the queue file this landing is running out of, if any — the stage is written to it
+        self.stopped = ""        # the step that stopped it, so the worker knows whether trying again could differ
+        self.why = ""            # …and what it said
         self.root = repo_root(repo)
         self.hurt = []           # cosmetic steps that failed: reported, not fatal, named again at the end
         self.facts = {}          # what GitHub says about the PR
@@ -165,7 +239,11 @@ class Land:
         return board(self.repo).get("default_branch") or "main"
 
     def what(self):
-        return f"PR #{self.pr} {self.facts.get('title', '')}".strip() if self.pr else self.note
+        if self.pr:
+            return f"PR #{self.pr} {self.facts.get('title', '')}".strip()
+        if self.span:
+            return f"{self.base()} {self.span[0][:7]}..{self.span[1][:7]}"
+        return self.note
 
     # -- 1. gates ------------------------------------------------------------------------------------------
     def gates(self):
@@ -212,7 +290,9 @@ class Land:
         answer is the same list, which is what makes the deploy steps below survive a re-run."""
         if self.changed is None:
             self.changed = []
-            if self.head:
+            if self.span:       # asked for AFTER install()'s pull, so both ends are in the checkout by now
+                self.changed = name_status(sh(["git", "diff", "--name-status", self.span[0], self.span[1]], cwd=self.root)[1])
+            elif self.head:
                 rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root)
                 if not rc:
                     self.changed = name_status(sh(["git", "diff", "--name-status", o.strip(), self.head], cwd=self.root)[1])
@@ -222,18 +302,45 @@ class Land:
         return self.changed
 
     # -- 2. merge ------------------------------------------------------------------------------------------
+    def slug(self):
+        """owner/repo, off the remote. Used only to make gh leave the LOCAL branch alone — see merge()."""
+        m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$",
+                      sh(["git", "remote", "get-url", "origin"], cwd=self.root, timeout=30)[1].strip())
+        return m.group(1) if m else ""
+
+    def merged_now(self):
+        """Ask GitHub what actually became of the PR. gh reporting a failure does not mean the merge did not
+        happen — an overlapping one lands and the loser is told it failed — and telling the owner a PR did NOT
+        merge when it did is worse than either (twice in August)."""
+        rc, o = sh(["gh", "pr", "view", str(self.pr), "--json", "state,mergedAt"], cwd=self.root, timeout=60)
+        try:
+            return rc == 0 and json.loads(o).get("state") == "MERGED"
+        except ValueError:
+            return False
+
     def merge(self):
+        """The one place on this box that merges, and it runs AFTER the gates. --subject is the PR title: gh's own
+        default squash subject is the branch's commit log ("wip: checkpoint …"), and that is what the default
+        branch would then read as. -R makes gh delete only the REMOTE branch — the local one is checked out in a
+        track worktree, so deleting it fails, and that failure takes the remote delete down with it."""
         if not self.pr:
             raise Skip("no PR to merge — this is the no-PR path")
         if self.facts.get("state") == "MERGED":
             return f"PR #{self.pr} was already merged — nothing to do"
-        rc, o = sh(["gh", "pr", "merge", str(self.pr), "--squash", "--delete-branch"], cwd=self.root, timeout=300)
+        slug, title = self.slug(), self.facts.get("title") or ""
+        argv = (["gh", "pr", "merge", str(self.pr), "--squash", "--delete-branch"]
+                + (["-R", slug] if slug else []) + (["--subject", f"{title} (#{self.pr})"] if title else []))
+        rc, o = sh(argv, cwd=self.root, timeout=300)
         done = any(w in o for w in ("already merged", "is closed", "already closed"))   # gh: nothing left to merge
+        if rc and ("--auto" in o or "auto-merge" in o):
+            # NOT armed, here or anywhere: an armed auto-merge lands whenever GitHub decides to, with nothing
+            # gating it and nothing deploying it afterwards. A PR that is not mergeable yet wants a person.
+            raise Failed(f"PR #{self.pr} is not mergeable yet (checks pending, or it needs a rebase) — nothing was "
+                         f"merged, and no auto-merge was armed. Sort that out, then 👍 it again")
         if rc and not done:
-            raise Failed(f"gh pr merge #{self.pr}: {last(o)}")
-        if "auto-merge armed" in o:
-            raise Failed(f"PR #{self.pr} did not merge now — auto-merge is armed, so it lands later and none of "
-                         f"the deploy below would match it. Re-run cc-land once it is in")
+            if not self.merged_now():
+                raise Failed(f"gh pr merge #{self.pr}: {last(o)}")
+            return f"PR #{self.pr} merged (a second merge overlapped this one; GitHub says it is in)"
         return f"PR #{self.pr} merged (squash, remote branch deleted)"
 
     # -- 3. the #approvals card, and the mark on it --------------------------------------------------------
@@ -351,6 +458,15 @@ class Land:
         if rc:
             raise Failed(f"{inst}: {last(o)}")
         sh(["systemctl", "--user", "daemon-reload"], timeout=120)
+        # What is INSTALLED, written down: the next sweep compares origin against this, which is how a merge made in
+        # GitHub's own UI — or an auto-merge landing an hour later — is noticed at all. Recorded only here, because
+        # only here has install.sh actually run on it.
+        rc, o = sh(["git", "rev-parse", "HEAD"], cwd=self.root)
+        if not rc:
+            try:
+                record_applied(self.repo, o.strip())
+            except OSError as e:
+                out("·", f"could not record the applied SHA: {e}")   # the deploy happened; only the note about it failed
         return f"pulled {self.base()}, ran {inst}, daemon-reload"
 
     # -- 7. units this change ADDED, which land switched off -----------------------------------------------
@@ -469,6 +585,9 @@ class Land:
 
     def load(self):
         """What GitHub says about the PR, read once, before anything runs."""
+        if self.span:
+            print(f"deploying [{self.repo}] {self.what()} — merged without this box, so it was never installed")
+            return True
         if not self.pr:
             print(f"landing [{self.repo}] {self.track}: {self.note}")
             return True
@@ -488,12 +607,14 @@ class Land:
     def walk(self, steps):
         """0 all well · 1 a step the box depends on failed and nothing after it ran · COSMETIC only bookkeeping did."""
         for name, fn in steps:
+            self.mark_stage(name)
             try:
                 out("✓", fn())
             except Skip as e:
                 out("·", str(e))
             except Failed as e:
                 out("✗", f"{name}: {e}")
+                self.stopped, self.why = name, str(e)
                 if name in FATAL:
                     print("cc-land: STOPPED there — nothing after it ran. Fix that and re-run the same command: "
                           "every step already done is a no-op the second time.", file=sys.stderr)
@@ -502,6 +623,21 @@ class Land:
         if not self.hurt:
             return 0
         return UNVERIFIED if "verify" in self.hurt else COSMETIC
+
+    def mark_stage(self, name):
+        """Where the landing had got to, on disk, before the step runs. A kill between two steps is then a fact the
+        next worker can read rather than guess at — and the guess that matters is "did the merge happen", which it
+        never has to make: `gh pr view` answers it, and an already-merged PR skips the gates and the merge alone."""
+        if not self.job:
+            return
+        job = read_json(self.job)
+        if job is None:
+            return
+        job["stage"], job["at"] = name, stamp()
+        try:
+            write_atomic(self.job, job)
+        except OSError:
+            pass
 
     def run(self):
         if not self.load():
@@ -561,6 +697,276 @@ def run_batch(repo, prs):
         return "; ".join(msgs)
     deploy.verify_delivery = every_track
     return deploy.done(deploy.walk(deploy.deploy_steps()))
+
+
+
+# ── the queue: a landing that outlives the process that asked for it ────────────────────────────────
+def start_worker():
+    """Not a thread, and not a child of whoever asked. The deploy this starts RESTARTS the Slack daemon, and anything
+    in that daemon's control group dies with it half-way through install.sh — that is how PR #87 merged and was never
+    installed, with nothing left running to retry. A transient systemd unit outlives the process that asked for it and
+    outlives the restart it performs. Returns (started, how)."""
+    unit = f"cc-land-work-{os.getpid()}-{int(time.time())}"
+    rc, o = sh(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}",
+                "--description=cc-land: drain the landing queue", f"{BIN}/cc-land", "work"], timeout=120)
+    if rc == 0:
+        return True, unit
+    try:    # no user manager (a container, a cron): a detached child still lands it, and the job file is the retry
+        os.makedirs(LANDQ, exist_ok=True)
+        f = open(f"{LANDQ}/work.log", "a")
+        subprocess.Popen([f"{BIN}/cc-land", "work"], start_new_session=True, stdin=subprocess.DEVNULL, stdout=f, stderr=f)
+        return True, "a detached child (no systemd --user here)"
+    except Exception as e:
+        return False, f"systemd-run: {last(o)}; detached: {e.__class__.__name__}: {e}"
+
+
+def say_result(job, r):
+    """The one thing the owner sees. It goes back to the thread the 👍 was given in — and a landing that did NOT land
+    also goes to them and to the repo's own session, because nobody reads #approvals and a stopped deploy leaves the
+    box running the old code."""
+    chat, ts, repo, pr = job.get("chat") or "", job.get("ts") or "", job.get("repo") or "", job.get("pr")
+    tok = bot_token()
+    if chat and ts and tok:
+        try:    # ✅ only when nothing here wants a person: a merged PR whose deploy STOPPED leaves the box running
+            slack("reactions.add", tok, channel=chat, timestamp=ts,      # the old code, and ✅ on that reads as done
+                  name="white_check_mark" if r.get("ok") else "x")
+        except Exception as e:
+            print(f"cc-land: could not mark the approval: {e}", file=sys.stderr)
+    if chat:
+        sh([f"{BIN}/cc-slack", "post", "-c", chat] + (["--thread", ts] if ts else []) + [r.get("text", "")], timeout=180)
+    if r.get("ok"):
+        return
+    title = f"[{repo}] " + (f"PR #{pr} " if pr else "") + "landing stopped"
+    sh([f"{BIN}/cc-notify", "-p", "high", "-t", title, r.get("short", "")[:300]], timeout=60)
+    again = f"cc-land queue {repo} {pr}" if pr else "cc-land work"
+    sh([f"{BIN}/cc-slack", "inject", repo,
+        f"{r.get('text', '')}\nNothing re-drives this now — fix it, then `{again}`: every step already done is a "
+        f"no-op the second time."], timeout=120)
+
+
+def finish(path, job):
+    """Say it once, then forget the job. ‘Said’ is written down before the file goes, so a kill after the message went
+    out cannot send a second one, and a kill before it cannot swallow the only word the owner gets."""
+    if not job.get("posted"):
+        say_result(job, job.get("result") or {})
+        job["posted"] = True
+        try:
+            write_atomic(path, job)
+        except OSError:
+            pass
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def result_of(L, rc, job, tail):
+    """What this landing ends up meaning, in one sentence the owner can act on — and whether the PR is IN, which is
+    the only fact that decides between ‘approved and done’ and ‘approved and nothing happened’."""
+    what = f"[{L.repo}] " + (f"PR #{L.pr}" if L.pr else L.what())
+    tries = job.get("attempts", 1)
+    if rc == 0:
+        short = f"{what}: landed ✅ — gated, merged, deployed, and its check ran here and passed."
+    elif rc == COSMETIC:
+        short = f"{what}: landed ✅ — gated, merged and deployed; a bookkeeping step wants a hand."
+    elif rc == UNVERIFIED:
+        short = f"{what}: merged and deployed ✅ — but nothing here could confirm you can see it, so the ask stays open."
+    elif L.stopped in ("gates", "load"):
+        short = f"{what}: NOT merged ❌ — {L.why[:200] or 'the box could not read it'}"
+    elif L.stopped == "merge":
+        short = f"{what}: NOT merged ❌ — {L.why[:200]}"
+    else:
+        short = (f"{what}: merged, but the deploy stopped at {L.stopped} ❌ after {tries} tries — the box is still "
+                 f"running the old code.")
+    return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short,
+            "text": short if rc == 0 else f"{short}\n```\n{tail[-900:]}\n```"}
+
+
+def run_job(path, job):
+    """One job, start to finish, here. Everything durable happens BEFORE the thing it describes: the attempt is
+    counted before the merge is attempted, the result is written before it is said, and ‘said’ before the job is
+    forgotten. So a kill at any point converges to at most one merge and at most one message — and the question a
+    resumed worker would otherwise have to guess at, ‘did the merge happen’, it never asks: `gh pr view` answers it,
+    and an already-merged PR skips the gates and the merge and goes straight on to the deploy."""
+    import contextlib, io
+    repo, pr, span = job.get("repo") or "", job.get("pr"), job.get("span")
+    job["attempts"], job["at"] = job.get("attempts", 0) + 1, stamp()
+    write_atomic(path, job)                    # counted before anything irreversible: a kill mid-merge is still a try
+    L = Land(repo, pr=pr) if pr else Land(repo, span=tuple(span))
+    L.job = path
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        if L.load():
+            rc = L.walk(L.steps() if pr else L.deploy_steps())
+        else:
+            rc, L.stopped, L.why = 1, "load", f"cannot read PR #{pr} in {L.root}"
+    print(buf.getvalue(), end="", flush=True)
+    tail = "\n".join(x for x in buf.getvalue().splitlines() if x.strip())
+    if rc == 1 and (L.stopped in RETRY or L.stopped == "load") and job["attempts"] < LAND_TRIES:
+        job["last"] = f"{L.stopped}: {L.why}"[:400]
+        write_atomic(path, job)                # kept, so the next sweep re-drives it — the retry PR #87 never had
+        return (f"[{repo}] {L.what()}: {L.stopped} failed on try {job['attempts']} of {LAND_TRIES} — "
+                f"the next sweep runs it again")
+    job["state"], job["result"] = "done", result_of(L, rc, job, tail)
+    write_atomic(path, job)                    # decided, on disk, before a word of it is said
+    finish(path, job)
+    return job["result"]["short"]
+
+
+def run_one(path):
+    job = read_json(path)
+    if not job or not job.get("repo") or not (job.get("pr") or job.get("span")):
+        os.replace(path, path + ".unreadable")   # never guess at a landing: keep the file, merge nothing
+        return f"{os.path.basename(path)}: not a job this understands — moved aside, nothing merged"
+    if job.get("state") == "done":
+        finish(path, job)                        # killed between deciding and saying it: say it now, once
+        return (job.get("result") or {}).get("short", "")
+    if job.get("attempts", 0) >= LAND_TRIES:
+        finish(path, job)                        # gave up earlier and never got to speak
+        return (job.get("result") or {}).get("short", "")
+    return run_job(path, job)
+
+
+def known_repos():
+    """Every repo this box tracks — the boards name them — plus any it has already deployed."""
+    names = {os.path.basename(x)[:-5] for x in glob.glob(f"{BOARDS}/*.json")}
+    names |= {os.path.basename(x)[:-len(".applied")] for x in glob.glob(f"{LANDQ}/*.applied")}
+    return sorted(n for n in names if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", n))
+
+
+def catchup():
+    """A merge this box never made still owes it a deploy. PR #78 was merged from GitHub's own UI and the box stayed
+    on #77 — nothing on the 👍 path could have noticed, because nothing asked. This asks the one question that has
+    an answer without GitHub: has origin's default branch moved past the SHA install.sh last ran on. Returns the
+    repos it queued a deploy for."""
+    made = []
+    for repo in known_repos():
+        root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
+        if not os.path.isdir(f"{root}/.git") or os.path.exists(job_path(repo, "deploy")):
+            continue
+        if sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=60)[0]:
+            continue                                     # no remote, no network: nothing to compare against
+        rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
+        if rc:
+            continue
+        tip, have = o.strip(), applied_sha(repo)
+        if not have:
+            # Nothing recorded yet, so read it off the checkout: ~/bin points into it, and what is checked out is what
+            # runs. Only while it is ON the default branch, though — parked on a feature branch it says nothing about
+            # main, and a wrong seed here would either deploy the wrong span or hide a real gap for good.
+            if sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root)[1].strip() != base:
+                continue
+            rc, o = sh(["git", "rev-parse", "HEAD"], cwd=root)
+            if rc:
+                continue
+            have = o.strip()
+            record_applied(repo, have)
+        if have == tip:
+            continue
+        write_atomic(job_path(repo, "deploy"),
+                     {"repo": repo, "pr": None, "span": [have, tip], "queued_at": stamp(), "attempts": 0,
+                      "stage": "queued", "why": f"origin/{base} moved to {tip[:7]} without this box "
+                                                f"— what is installed is {have[:7]}"})
+        made.append(repo)
+    return made
+
+
+def due_catchup():
+    """True at most once every CATCHUP_EVERY. Stamped on disk, so it survives the process and the reboot, and so a
+    sweep every five minutes stays as cheap as the queue it exists to drain."""
+    f = f"{LANDQ}/.catchup"
+    try:
+        if time.time() - os.path.getmtime(f) < CATCHUP_EVERY:
+            return False
+    except OSError:
+        pass
+    try:
+        open(f, "w").close()
+    except OSError:
+        pass
+    return True
+
+
+def cmd_work(argv):
+    """Drain the queue, then catch the box up. ONE worker runs at a time — the flock is what makes ‘at most one
+    merge’ true no matter how many 👍, timers and reboots ask for one at once; a second worker finds the lock held,
+    says so and exits, because the one holding it will get to the same jobs."""
+    if "--detach" in argv:
+        ok, how = start_worker()
+        print(f"cc-land: worker started ({how})" if ok else f"cc-land: the worker would not start: {how}",
+              file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+    os.makedirs(LANDQ, exist_ok=True)
+    lock = open(f"{LANDQ}/.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("cc-land: another worker holds the queue — it lands what is in it, so this one stands down")
+        return 0
+    lines = []
+    try:
+        for path in sorted(glob.glob(f"{LANDQ}/*.json")):
+            lines.append(run_one(path))          # every sweep: this is what finishes a landing a reboot interrupted
+        if "--catch-up" in argv or due_catchup():
+            for repo in catchup():
+                lines.append(run_one(job_path(repo, "deploy")))
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    for x in lines:
+        if x:
+            print(x)
+    if not lines:
+        print("cc-land: nothing queued, and nothing has landed behind this box's back")
+    return 0
+
+
+def cmd_queue(argv):
+    """Put a PR on the queue and start the worker. This is the whole of what a 👍 does now, and its EXIT CODE is the
+    caller's answer: non-zero means nothing has merged and nothing will until somebody acts, which is what cc-slack
+    puts in the channel rather than merging anyway."""
+    repo, pr, chat, ts, who, start = "", "", "", "", "", True
+    rest = list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--chat" and rest:
+            chat = rest.pop(0)
+        elif a == "--ts" and rest:
+            ts = rest.pop(0)
+        elif a == "--who" and rest:
+            who = rest.pop(0)
+        elif a == "--no-start":
+            start = False
+        elif not repo:
+            repo = a
+        elif not pr:
+            pr = a
+        else:
+            print(f"cc-land queue: unexpected '{a}'", file=sys.stderr)
+            return 2
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo or "") or not re.fullmatch(r"[0-9]+", pr or ""):
+        print('cc-land: queue takes <repo> <pr-number> [--chat C… --ts 1788… --who name]', file=sys.stderr)
+        return 2
+    path = job_path(repo, pr)
+    if os.path.exists(path):
+        print(f"[{repo}] PR #{pr} is already queued — one job per PR, so two 👍 are still one landing")
+    else:
+        try:
+            write_atomic(path, {"repo": repo, "pr": int(pr), "chat": chat, "ts": ts, "who": who,
+                                "queued_at": stamp(), "attempts": 0, "stage": "queued"})
+        except OSError as e:
+            print(f"cc-land: cannot write {path}: {e} — nothing merged", file=sys.stderr)
+            return 1
+        print(f"[{repo}] PR #{pr} queued — the gates run first, then the merge, then the deploy")
+    if not start:
+        return 0
+    ok, how = start_worker()
+    if not ok:
+        print(f"cc-land: queued, but the worker would not start ({how}) — nothing has merged. `cc-land work` runs it",
+              file=sys.stderr)
+        return 1
+    print(f"cc-land: worker started ({how})")
+    return 0
 
 
 # ── selfcheck: the decision table, with the whole outside world stood in for ─────────────────────────────
@@ -825,7 +1231,199 @@ def cmd_selfcheck():
     check("a batch that cannot merge one of them deploys NOTHING: the box is never half of a landing",
           rcB == 1 and not ran("git", "pull", "--ff-only"))
 
-    # 10. the seam itself, with the fakes taken back off: the REAL cc-scope, in a real subprocess, on a
+    # 10. the queue: at most one merge however many 👍, kills, sweeps and reboots ask for one at once
+    qdir = tempfile.mkdtemp(prefix="cc-land-selfcheck-q-")
+    real_q, real_start, real_repos = LANDQ, start_worker, known_repos
+    started = []
+    os.makedirs("/tmp/_ccland/.git", exist_ok=True)      # repo_root is faked to it; catchup asks if it is a repo
+    globals().update(LANDQ=qdir, known_repos=lambda: [],
+                     start_worker=lambda: (started.append(1), (True, "a stand-in worker"))[1])
+
+    def quiet(fn, *a):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return fn(*a)
+
+    def gh_merges():
+        return [c for c in calls if c[:3] == ["gh", "pr", "merge"]]
+
+    try:
+        # ---- the 👍 itself. It does not merge. That it used to is the whole finding: cc-slack merged and THEN
+        # called this, so every landing the owner approved on 2026-08-31 skipped the gates that guard the merge.
+        fresh(pr=7)
+        rcQ = quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1", "--who", "the owner"])
+        job = read_json(job_path("myrepo", 7))
+        check("a 👍 merges nothing itself: it writes one job and starts a worker, and the merge happens later, "
+              "after the gates — merging here first is how a night of approvals went in ungated",
+              rcQ == 0 and started and not gh_merges() and job.get("pr") == 7
+              and job.get("chat") == "CAPPR" and job.get("ts") == "1.1")
+        rcQ = quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "9.9"])
+        check("a second 👍 on the same card is the SAME job — the file name is the idempotency key, so two "
+              "approvals, or a 👍 while the worker is already on it, are still one merge",
+              rcQ == 0 and len(glob.glob(f"{qdir}/myrepo-*.json")) == 1
+              and read_json(job_path("myrepo", 7)).get("ts") == "1.1")
+
+        # ---- fail closed, both ways. Nothing here has a fallback that merges: that fallback IS the bug.
+        os.unlink(job_path("myrepo", 7))
+        globals()["start_worker"] = lambda: (False, "systemd-run: no user manager; detached: OSError")
+        rcQ = quiet(cmd_queue, ["myrepo", "7"])
+        check("queued but the worker will not start is a FAILURE the caller must act on — cc-slack says so in the "
+              "channel instead of merging anyway, and the job it wrote is left for the next sweep to finish",
+              rcQ == 1 and not gh_merges() and os.path.exists(job_path("myrepo", 7)))
+        os.unlink(job_path("myrepo", 7))
+        globals().update(start_worker=lambda: (started.append(1), (True, "a stand-in worker"))[1],
+                         LANDQ=f"{qdir}/wall/queue")
+        open(f"{qdir}/wall", "w").close()                # a queue directory that cannot be made
+        check("a queue that cannot be written merges nothing either: a landing nobody wrote down is a landing "
+              "nothing can finish, retry or report",
+              quiet(cmd_queue, ["myrepo", "9"]) == 1 and not gh_merges())
+        globals()["LANDQ"] = qdir
+
+        # ---- the worker, end to end: gates, THEN the merge, then the deploy, then one word to the owner.
+        fresh(pr=7)
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        world["git rev-parse HEAD"] = (0, "deadbeef\n")
+        world[f"{BIN}/cc-scope list"] = (0, "[]")
+        real_access, os.access = os.access, lambda p, m: p.endswith(("core/tests/check.sh", "core/install.sh"))
+        try:
+            quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+            quiet(cmd_work, [])
+        finally:
+            os.access = real_access
+        gate_at = next((i for i, c in enumerate(calls) if c[0].endswith("core/tests/check.sh")), -1)
+        merge_at = next((i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "merge"]), -1)
+        check("the worker gates the PR and only THEN merges it — one merge, and the gate is a condition of it "
+              "rather than a report on something that has already happened",
+              gate_at >= 0 and merge_at > gate_at and len(gh_merges()) == 1)
+        check("...and the merge is squashed under the PR's own title, leaving the LOCAL track branch alone (-R): "
+              "gh's default subject is the branch's wip log, and deleting a branch a worktree has checked out "
+              "fails and takes the remote delete with it",
+              "--subject" in gh_merges()[0] and "a change (#7)" in gh_merges()[0])
+        check("one landing, one owner-visible result, in the thread the 👍 was given in — and then the job is gone",
+              len(reacted) == 1 and reacted[0][1] == "white_check_mark" and reacted[0][2] == "1.1"
+              and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and not os.path.exists(job_path("myrepo", 7)))
+        check("the commit the box now runs is written down, by the step that installed it — that record is the "
+              "only thing that can tell a merge this box applied from one made behind its back",
+              applied_sha("myrepo") == "deadbeef")
+
+        # ---- one worker at a time. This is what makes "at most one merge" true when a 👍, a five-minute sweep
+        # and a reboot all ask for one in the same second.
+        fresh(pr=7)
+        quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+        held = open(f"{qdir}/.lock", "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            rcW = quiet(cmd_work, [])
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            held.close()
+        check("a second worker finds the lock held and stands down without touching the queue — the one holding "
+              "it reaches the same jobs, so a race ends in one merge, not two",
+              rcW == 0 and not gh_merges() and os.path.exists(job_path("myrepo", 7)))
+
+        # ---- killed at each stage, resumed. The question "did the merge happen" is never guessed at.
+        fresh(pr=7)
+        world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        world[f"{BIN}/cc-scope list"] = (0, "[]")
+        write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1",
+                                             "attempts": 1, "stage": "card"})
+        quiet(cmd_work, [])
+        check("killed AFTER the merge and resumed, the same job does not merge again: it asks GitHub what became "
+              "of the PR rather than reading its own notes, and an already-merged PR goes straight to the deploy",
+              not gh_merges() and ran("git", "pull", "--ff-only") and not os.path.exists(job_path("myrepo", 7)))
+
+        fresh(pr=7)
+        write_atomic(job_path("myrepo", 7),
+                     {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1", "state": "done",
+                      "result": {"ok": True, "text": "[myrepo] PR #7: landed ✅"}})
+        quiet(cmd_work, [])
+        check("killed between deciding the result and saying it, the next sweep says it — once. The result is on "
+              "disk before it is spoken, so the owner's one word cannot be swallowed by a kill",
+              len(ran_sub("cc-slack", "post")) == 1 and not os.path.exists(job_path("myrepo", 7)))
+        fresh(pr=7)
+        write_atomic(job_path("myrepo", 7),
+                     {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1", "state": "done", "posted": True,
+                      "result": {"ok": True, "text": "[myrepo] PR #7: landed ✅"}})
+        quiet(cmd_work, [])
+        check("...and killed AFTER saying it, it is not said twice: 'posted' is written down before the file goes",
+              not ran_sub("cc-slack", "post") and not os.path.exists(job_path("myrepo", 7)))
+
+        fresh(pr=7)
+        write_atomic(job_path("myrepo", 11), {"queued_at": stamp()})      # half a job: no repo, no PR
+        quiet(cmd_work, [])
+        check("a job file this cannot make sense of is moved aside, not guessed at — nothing merges on a landing "
+              "the box cannot read",
+              not gh_merges() and os.path.exists(job_path("myrepo", 11) + ".unreadable"))
+        os.unlink(job_path("myrepo", 11) + ".unreadable")
+
+        # ---- the retry PR #87 never had, and the point it stops.
+        fresh(pr=7)
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "track/w1\n")     # install refuses: not the default branch
+        world[f"{BIN}/cc-scope list"] = (0, "[]")
+        write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1", "attempts": 0})
+        quiet(cmd_work, [])
+        kept = read_json(job_path("myrepo", 7))
+        check("a deploy that fails on the STATE of the box is KEPT and re-driven — PR #87 merged, its install "
+              "refused because the checkout sat on a feature branch, and nothing ever asked a second time",
+              kept and kept["attempts"] == 1 and "install" in (kept.get("last") or "")
+              and not ran_sub("cc-slack", "post"))
+        quiet(cmd_work, [])
+        quiet(cmd_work, [])
+        check("...and it gives up after 3 tries rather than retrying for ever — and the owner hears about it "
+              "exactly once, in the thread and on their phone",
+              read_json(job_path("myrepo", 7)) is None and len(ran_sub("cc-slack", "post")) == 1
+              and len(ran("cc-notify", "landing stopped")) == 1 and reacted[-1][1] == "x")
+
+        fresh(pr=7)
+        world["gh pr merge"] = (1, "GraphQL: Pull request is not mergeable (mergePullRequest); try --auto")
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        write_atomic(job_path("myrepo", 7), {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1"})
+        quiet(cmd_work, [])
+        check("a PR that is not mergeable yet arms NOTHING and deploys nothing: an armed auto-merge lands when "
+              "GitHub feels like it, ungated and undeployed, which is the fallback this replaced",
+              not ran("gh pr merge", "--auto") and not ran("git", "pull", "--ff-only")
+              and reacted and reacted[-1][1] == "x" and not os.path.exists(job_path("myrepo", 7)))
+
+        fresh(pr=7)
+        world["gh pr merge"] = (1, "failed to merge: Merge already in progress")
+        world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))
+        L = Land("myrepo", pr=7)
+        L.facts = dict(FACTS)
+        check("gh saying a merge failed is not the same as it not happening: the PR is re-read before anyone is "
+              "told it did not land (twice in August an owner was told a merge failed that had landed)",
+              "overlapped" in L.merge())
+
+        # ---- a merge this box never made. Nothing on the 👍 path can notice one; this asks the only question
+        # that has an answer without GitHub — has origin moved past what install.sh last ran on.
+        globals()["known_repos"] = lambda: ["myrepo"]
+        fresh(pr=7)
+        record_applied("myrepo", "aaaaaaa")
+        world["git rev-parse origin/main"] = (0, "bbbbbbb\n")
+        made = catchup()
+        dep = read_json(job_path("myrepo", "deploy"))
+        check("a PR merged in GitHub's own UI still deploys: origin's default branch is past what this box "
+              "installed, so the box queues the deploy nobody asked it for (PR #78 left it a commit behind)",
+              made == ["myrepo"] and dep and dep["span"] == ["aaaaaaa", "bbbbbbb"] and dep["pr"] is None)
+        os.unlink(job_path("myrepo", "deploy"))
+        record_applied("myrepo", "bbbbbbb")
+        check("...and a box already on that commit queues nothing — the sweep is silent when there is nothing to "
+              "catch up on",
+              catchup() == [] and not os.path.exists(job_path("myrepo", "deploy")))
+        os.unlink(f"{qdir}/myrepo.applied")
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "track/w1\n")
+        check("with nothing recorded yet and the checkout parked on a feature branch, the box refuses to GUESS "
+              "what it has installed: a wrong seed there deploys the wrong span or hides the gap for good",
+              catchup() == [] and not applied_sha("myrepo"))
+        for stale in glob.glob(f"{qdir}/.catchup"):
+            os.unlink(stale)
+        check("that poll asks every repo's remote, so it runs at most every 15 min — the QUEUE is drained on every "
+              "sweep, and one unreachable origin must not sit in front of the landing a 👍 is waiting on",
+              due_catchup() and not due_catchup() and CATCHUP_EVERY == 900)
+    finally:
+        globals().update(LANDQ=real_q, start_worker=real_start, known_repos=real_repos)
+        shutil.rmtree(qdir, ignore_errors=True)
+
+    # 11. the seam itself, with the fakes taken back off: the REAL cc-scope, in a real subprocess, on a
     # throwaway ledger. Everything above stubs sh(), so nothing above proves the one thing this depends on —
     # that "0 delivered / 1 the check failed / 2 there is no check" survives the process boundary. It is the
     # contract that decides whether an ask closes, so it is checked against the other program, not a stand-in.
@@ -886,6 +1484,10 @@ def cmd_selfcheck():
 def main(argv):
     if argv and argv[0] == "selfcheck":
         return cmd_selfcheck()
+    if argv and argv[0] == "queue":
+        return cmd_queue(argv[1:])
+    if argv and argv[0] == "work":
+        return cmd_work(argv[1:])
     if len(argv) < 2 or argv[0].startswith("-"):
         print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
         return 2
