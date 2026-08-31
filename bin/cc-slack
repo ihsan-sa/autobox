@@ -196,7 +196,7 @@ def set_cfg(key, value):
     os.replace(tmp, CFG)
 
 
-def api(method, token, **params):
+def slack_api(method, token, **params):
     """Slack Web API call (form-encoded, works for every method). Raises RuntimeError on !ok."""
     data = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
     req = urllib.request.Request(f"https://slack.com/api/{method}", data=data,
@@ -206,6 +206,63 @@ def api(method, token, **params):
     if not out.get("ok"):
         raise RuntimeError(f"{method}: {out.get('error')}" + (f" (needed {out['needed']})" if out.get("needed") else ""))
     return out
+
+
+class EffectDenied(RuntimeError):
+    """An external effect a test never declared. Never raised by the daemon: EFFECTS.real() declares them all."""
+
+
+class Effects:
+    """ONE object holding every way cc-slack leaves its own process: the Slack Web API, a shell-out to another cc-*
+    tool, and ~/dev — the one tree it writes outside its own state dir. The daemon installs Effects.real() and behaves
+    exactly as it did before. A test installs one that declares only what it means to exercise, and every other effect
+    DENIES: it raises instead of calling Slack, instead of shelling to the real cc-land, instead of reading whatever
+    repositories this box happens to have. That last one is why this exists — selfcheck used to pick the first real
+    repo out of ~/dev and provision dirs into it, so it could not run on a clone and its coverage depended on the box.
+    A denial is recorded as well as raised, because plenty of these calls sit inside an `except Exception: log(...)`:
+    the exception alone would be swallowed, the record is what makes the run end red."""
+
+    def __init__(self, name, api=None, run=None, popen=None, dev=None):
+        self.name, self.api_impl, self.run_impl, self.popen_impl = name, api, run, popen
+        self.dev = dev if dev is not None else f"{HOME}/dev"
+        self.denied = []
+
+    @classmethod
+    def real(cls):
+        return cls("real", api=slack_api, run=subprocess.run, popen=subprocess.Popen)
+
+    def deny(self, kind, what):
+        self.denied.append(f"{kind}: {what}")
+        raise EffectDenied(f"{self.name} effects: {kind} not declared — {what}")
+
+    def api(self, method, token, **params):
+        if self.api_impl is None:
+            self.deny("Slack API", method)
+        return self.api_impl(method, token, **params)
+
+    def run(self, cmd, **kw):
+        if self.run_impl is None:
+            self.deny("subprocess", " ".join(str(c) for c in cmd)[:160])
+        return self.run_impl(cmd, **kw)
+
+    def popen(self, cmd, **kw):
+        if self.popen_impl is None:
+            self.deny("subprocess", " ".join(str(c) for c in cmd)[:160])
+        return self.popen_impl(cmd, **kw)
+
+    def install(self):
+        """Bind this adapter in and hand back the one it replaced — install() that to put things back."""
+        was = globals().get("EFFECTS")
+        globals()["EFFECTS"], globals()["DEV"] = self, self.dev
+        return was
+
+
+def api(method, token, **params):
+    """The Slack Web API, through the adapter — see Effects."""
+    return EFFECTS.api(method, token, **params)
+
+
+EFFECTS = Effects.real()
 
 
 def at_token(text, bot_user=None):
@@ -2012,7 +2069,7 @@ class Daemon:
         no_tmux = tmux("has-session", "-t", "main")[0] != 0
         if no_tmux:                                     # cc needs the "main" server: without it every start fails silently
             try:
-                r = subprocess.run([f"{BIN}/cc-boot"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                r = EFFECTS.run([f"{BIN}/cc-boot"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
             except subprocess.TimeoutExpired:
                 log(f"autostart {target}: cc-boot timed out (60 s)"); return "starting"
             if r.returncode != 0:
@@ -2023,8 +2080,8 @@ class Daemon:
                 tmux("new-window", "-d", "-t", "main", "-n", "box", "-c", DEV, f"{BIN}/cc-rc")
         else:
             repo, _, track = target.partition("/")
-            proc = subprocess.Popen([f"{BIN}/cc", repo] + ([track] if track else []), stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+            proc = EFFECTS.popen([f"{BIN}/cc", repo] + ([track] if track else []), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
             if proc.poll() not in (None, 0):            # cc died instantly (bad target, missing worktree): say so in the log
                 log(f"autostart {target}: cc exited rc={proc.returncode} {(proc.stderr.read() or b'')[:200]!r}")
         log(f"autostart {target}")
@@ -2787,26 +2844,26 @@ class Daemon:
         react(self.cfg, chat, ts, "eyes")     # seen and queued; the ✅/❌ and the one reply come from the landing itself
         return f"[{repo}] PR #{n}: queued for cc-land — gates, then the merge, then the deploy"
 
-    def queue_land(self, repo, n, chat, ts, who="", run=subprocess.run):
+    def queue_land(self, repo, n, chat, ts, who="", run=None):
         """cc-land owns the queue's format, its lock and its worker; this only asks, and reports what it said. Its exit
         code is the whole answer: non-zero means nothing merged and nothing will until somebody acts."""
         try:
-            r = run([f"{BIN}/cc-land", "queue", repo, str(n), "--chat", chat, "--ts", ts]
-                    + (["--who", who] if who else []),
-                    capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            r = (run or EFFECTS.run)([f"{BIN}/cc-land", "queue", repo, str(n), "--chat", chat, "--ts", ts]
+                                     + (["--who", who] if who else []),
+                                     capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip() or "(no output)"
         except Exception as e:
             return False, f"{e.__class__.__name__}: {e}"[-300:]
 
-    def land_sweep(self, run=subprocess.run):
+    def land_sweep(self, run=None):
         """Re-drive whatever is still on the queue. A landing stops at its first real failure — which is right — but
         until this existed nothing ever asked again, so PR #87 sat merged-and-undeployed until a person noticed. It
         also runs on the first tick after a reboot, which is how a landing interrupted by one is finished, and it
         catches a merge made in GitHub's own UI. Starting the worker is cheap and idempotent: if one is already
         running it takes the lock, and the second stands down."""
         try:
-            r = run([f"{BIN}/cc-land", "work", "--detach"], capture_output=True, text=True, timeout=120,
-                    stdin=subprocess.DEVNULL)
+            r = (run or EFFECTS.run)([f"{BIN}/cc-land", "work", "--detach"], capture_output=True, text=True,
+                                     timeout=120, stdin=subprocess.DEVNULL)
             if r.returncode:
                 log(f"land sweep: {last_line((r.stdout or '') + (r.stderr or ''))}")
         except Exception as e:
@@ -2818,9 +2875,9 @@ class Daemon:
         planning session on the normal inject path; with no session live, deliver() queues it and autostarts one."""
         url = re.search(r"https?://\S+", post_text)
         try:
-            subprocess.run([f"{BIN}/cc-notify", "-p", "high", "-t", f"[{repo}] PR #{n} was NOT merged",
-                            f"{reason} — {url.group(0)}" if url else reason],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+            EFFECTS.run([f"{BIN}/cc-notify", "-p", "high", "-t", f"[{repo}] PR #{n} was NOT merged",
+                         f"{reason} — {url.group(0)}" if url else reason],
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         except Exception as e:
             log(f"cc-notify failed: {e}")
         meta = {"chat_id": "local", "thread_ts": "", "ts": str(time.time()), "user": "approvals", "role": "owner",
@@ -2837,7 +2894,7 @@ class Daemon:
         except Exception as e:
             log(f"conversations.history failed: {e}"); return None
 
-    def publish(self, repo, run=subprocess.run):
+    def publish(self, repo, run=None):
         """core/ publishes itself: a merge landed on the default branch, so the published prefix goes to its own public
         repo. Scoped to the single repo that has one (PUBLISH_REPO in ~/.cc/config) and a no-op on a box that configured
         none. It decides NOTHING about what ships: cc-publish splits the whole prefix or aborts on its identity gate,
@@ -2846,7 +2903,8 @@ class Daemon:
             return None
         with GIT_WORK:      # one at a time in this checkout: two git jobs there race index.lock
             try:
-                r = run([f"{BIN}/cc-publish"], capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+                r = (run or EFFECTS.run)([f"{BIN}/cc-publish"], capture_output=True, text=True, timeout=300,
+                                         stdin=subprocess.DEVNULL)
                 out = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
                 log(f"publish [{repo}]: {out[-1] if out else '(nothing to do)'}")
             except Exception as e:
@@ -3813,7 +3871,7 @@ class Daemon:
                           "marks": None if marks is None else dict(marks)})   # counts, not a string: home_blocks owns every notation
         def limit_now():
             try:
-                r = subprocess.run([f"{BIN}/cc-limit", "status"], capture_output=True, text=True, timeout=5)
+                r = EFFECTS.run([f"{BIN}/cc-limit", "status"], capture_output=True, text=True, timeout=5)
                 return r.stdout.strip() if r.returncode == 0 else ""
             except Exception:
                 return ""
@@ -3874,8 +3932,8 @@ class Daemon:
             self.chart_at, self.chart_busy = time.time(), False
             return                                           # a box with no recorder simply has no picture, and says nothing
         try:
-            subprocess.run([f"{BIN}/cc-vitals", "render", "--backend", "auto", "--if-stale", str(VITALS_EVERY)],
-                           capture_output=True, timeout=VITALS_TIMEOUT)
+            EFFECTS.run([f"{BIN}/cc-vitals", "render", "--backend", "auto", "--if-stale", str(VITALS_EVERY)],
+                        capture_output=True, timeout=VITALS_TIMEOUT)
             png = open(f"{VITALS_DIR}/current.png", "rb").read()
             spec = json.load(open(f"{VITALS_DIR}/current.json"))
             drawn = os.path.getmtime(f"{VITALS_DIR}/current.png")
@@ -4781,6 +4839,27 @@ def cmd_selfcheck():
     DIR = tempfile.mkdtemp(prefix="cc-slack-selfcheck-")     # every state file a case touches (marks, flags, queue, last…) lands here, never in the live dir
     """Unit checks that need no Slack: mrkdwn, chunking, target detection, validation. Exit 1 on any failure."""
     import contextlib, io, tempfile
+    # EVERY EXTERNAL EFFECT IS DENIED FOR THE WHOLE RUN, and ~/dev is a scratch tree (see Effects). A case that wants
+    # one declares it — `globals()["api"] = fake` for Slack, `EFFECTS.run_impl = fake` for a shell-out — and puts it
+    # back. Undeclared, a call raises here instead of reaching Slack, shelling to the real tools, or reading this box's
+    # repositories; and it is recorded, so an `except Exception` that swallows the raise still ends the run red. This
+    # is what makes `cc-slack selfcheck` runnable on a bare clone with no ~/.cc and no network, which is what makes it
+    # usable as a health probe and a ledger check-cmd.
+    scratch_dev = tempfile.mkdtemp(prefix="cc-slack-selfcheck-dev-")
+    real_effects = Effects("selfcheck", dev=scratch_dev).install()
+
+    @contextlib.contextmanager
+    def offline_slack():
+        """A Slack that is reachable and has nothing to say — DECLARED, so it is not a denial, and empty, so no case
+        can accidentally assert on it. For the cases whose subject is not the API call they make on the way: routing
+        an event also marks it and reads its thread root. Those calls used to go out over the wire, for real."""
+        was = globals()["api"]
+        globals()["api"] = lambda method, token, **kw: {}
+        try:
+            yield
+        finally:
+            globals()["api"] = was
+
     fails = []
     def check(name, cond):
         print(("  ✓ " if cond else "  ✗ ") + name)
@@ -4961,8 +5040,8 @@ def cmd_selfcheck():
         dm.users.update({"UOWNER": ("The Owner", "owner"), "UMEM": ("Ada", "ada.byron")})
         bad = [ev(user="UMEM", item=it("1.2")), ev(reaction="eyes"), ev(item=it("1.1", "CREPO")), ev(item=it("1.2")), ev(item=it("1.3")), ev(item=it("1.4")),
                ev(item=it("1.1", kind="file")), ev(item=it("9.9")), {"type": "message", "channel": "CAPPR", "ts": "1", "user": "UOWNER", "text": "hi"}]
-        notes, injected, real_run = [], [], subprocess.run     # failure routing: no real cc-notify, no real session inject
-        subprocess.run = lambda cmd, **kw: notes.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        notes, injected = [], []                               # failure routing: no real cc-notify, no real session inject
+        EFFECTS.run_impl = lambda cmd, **kw: notes.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         dm.deliver = lambda target, payload, **kw: injected.append((target, payload["content"]))
         marks, real_react_ap = [], react
         globals()["react"] = lambda cfg, chat, ts, name, remove=False: marks.append((chat, ts, name))
@@ -5024,7 +5103,7 @@ def cmd_selfcheck():
         check("land_sweep: asks the worker to drain the queue, off the reaction path — that is what finishes a landing "
               "a reboot interrupted, retries the deploy PR #87 never got, and lands a merge made in GitHub's own UI",
               swept == [[f"{BIN}/cc-land", "work", "--detach"]])
-        subprocess.run = real_run
+        EFFECTS.run_impl = None
         check("valid_target", valid_target(name) and valid_target(f"{name}/t1") and valid_target("box")
               and not valid_target("no-such-repo-zz") and not valid_target("../x") and not valid_target(""))
         real_tmux, real_tw, real_popen = tmux, tmux_window, subprocess.Popen
@@ -5034,25 +5113,28 @@ def cmd_selfcheck():
         try:
             globals()["tmux"] = lambda *a: tcalls.append(a) or (0, "")
             globals()["tmux_window"] = lambda w: ("@9", "bash") if w == "box" else (None, None)
-            subprocess.Popen = lambda *a, **k: scalls.append(a[0])
+            subprocess.Popen = lambda *a, **k: scalls.append(a[0])      # systemctl: a plain system command
+            EFFECTS.popen_impl = lambda cmd, **k: scalls.append(cmd)     # `cc`: a cc-* tool, so it goes through the adapter
             dm.cmd_restart("nope-nope", "C1", None)
             check("restart: unknown target rejected with usage", "usage" in said3[-1])
             dm.cmd_restart("box", "C1", None)
             check("restart: box kills its window then autostarts",
                   tcalls and tcalls[-1][:2] == ("kill-window", "-t") and acalls == ["box"] and "restarting `box`" in said3[-1])
-            wt = f"{HOME}/.cc/worktrees/{name}/t1"
-            os.makedirs(wt, exist_ok=True)
-            try:
-                dm.cmd_restart(f"{name}/t1", "C1", None)
-                check("restart: repo/track target also kill-window+autostart", acalls[-1] == f"{name}/t1")
-            finally:
-                os.rmdir(wt); os.rmdir(os.path.dirname(wt))
-            n_acalls = len(acalls)
-            dm.cmd_restart(f"{name}/typo", "C1", None)
-            check("restart: a track with no worktree is refused, never created from Slack (L15)",
-                  len(acalls) == n_acalls and "no worktree" in said3[-1])
-            check("autostart: a missing track worktree returns no-track instead of running `cc repo track` (L15)",
-                  Daemon.autostart(dm, f"{name}/typo") == "no-track")
+            _homeW = globals()["HOME"]                  # these cases need a track worktree to exist and one to be
+            with tempfile.TemporaryDirectory() as hw:   # missing; both go in a scratch HOME, because writing into the
+                try:                                    # live ~/.cc/worktrees is the same sin as picking a real repo —
+                    globals()["HOME"] = hw              # and on a bare clone that tree is not there to write into
+                    os.makedirs(f"{hw}/.cc/worktrees/{name}/t1")
+                    dm.cmd_restart(f"{name}/t1", "C1", None)
+                    check("restart: repo/track target also kill-window+autostart", acalls[-1] == f"{name}/t1")
+                    n_acalls = len(acalls)
+                    dm.cmd_restart(f"{name}/typo", "C1", None)
+                    check("restart: a track with no worktree is refused, never created from Slack (L15)",
+                          len(acalls) == n_acalls and "no worktree" in said3[-1])
+                    check("autostart: a missing track worktree returns no-track instead of running `cc repo track` (L15)",
+                          Daemon.autostart(dm, f"{name}/typo") == "no-track")
+                finally:
+                    globals()["HOME"] = _homeW
             dm.cmd_restart("slack", "C1", None)
             check("restart: slack replies first, then restarts cc-slackd detached",
                   said3[-1].startswith("restarting the Slack daemon") and scalls[-1] == ["systemctl", "--user", "restart", "cc-slackd"])
@@ -5081,6 +5163,7 @@ def cmd_selfcheck():
             check("reboot: expired confirmation re-warns, does not reboot", "confirm" in said3[-1] and len(scalls) == n + 1)
         finally:
             globals()["tmux"], globals()["tmux_window"], subprocess.Popen = real_tmux, real_tw, real_popen
+            EFFECTS.popen_impl = None
     check("channel name → target", "a--b".replace("--", "/", 1) == "a/b")
     with contextlib.redirect_stderr(io.StringIO()):   # usage paths return before any token is read or used
         check("post-approval: usage errors exit 2 (no args, unknown repo, bad number, bad url)", cmd_post_approval([]) == 2
@@ -5346,8 +5429,9 @@ def cmd_selfcheck():
                   "bot_id": "BSTRANGER", "text": "@ai-dev take it", "channel_type": "channel"})
     check("bot_message from ANOTHER app's bot never flips thread ownership (M2)",
           dm5.thread_owner[("C1", "5.5")] is None and len(handed) == n_handed)
-    dm5.on_event({"type": "message", "channel": "C1", "ts": "5.9", "thread_ts": "5.5", "user": "UOTHER",
-                  "text": "@ai-dev take it", "channel_type": "channel"})
+    with offline_slack():             # a member's message: the name lookup and the mark are not this case's subject
+        dm5.on_event({"type": "message", "channel": "C1", "ts": "5.9", "thread_ts": "5.5", "user": "UOTHER",
+                      "text": "@ai-dev take it", "channel_type": "channel"})
     check("a channel member's '@alias' never flips thread ownership (M2) — they are heard, they do not steer",
           dm5.thread_owner[("C1", "5.5")] is None)
     check("route: @repo / @main at start → main, ownership flips in the cache", dm5.update_owner("r", "C1", "1.1", "1.1", "@r over to you") is None
@@ -5368,10 +5452,11 @@ def cmd_selfcheck():
         globals()["api"] = real_api2
     dm5.route = lambda *a: "r"; delivered5 = []; dm5.deliver = lambda *a, **k: delivered5.append((a, k)) or "delivered"
     dm5.clear_needs = lambda *a, **k: None   # the instant V3 clear is covered on its own below; not this test's concern
-    dm5.on_event({"type": "message", "channel": "C3", "ts": "5.1", "user": "UBOT", "text": "@ai-dev status?"})
-    check("bot message: updates ownership but is never routed/delivered", dm5.thread_owner[("C3", "5.1")] == "ai-dev" and not delivered5)
-    said5.clear()
-    dm5.on_event({"type": "message", "channel": "C3", "ts": "5.2", "thread_ts": "5.1", "user": "UOWNER", "text": "any update?"})
+    with offline_slack():
+        dm5.on_event({"type": "message", "channel": "C3", "ts": "5.1", "user": "UBOT", "text": "@ai-dev status?"})
+        check("bot message: updates ownership but is never routed/delivered", dm5.thread_owner[("C3", "5.1")] == "ai-dev" and not delivered5)
+        said5.clear()
+        dm5.on_event({"type": "message", "channel": "C3", "ts": "5.2", "thread_ts": "5.1", "user": "UOWNER", "text": "any update?"})
     check("route: alias with no live conn → not-running reply naming `cc <repo> --orch <alias>`, nothing delivered or queued",
           said5 and "@ai-dev is not running here" in said5[-1] and "cc r --orch ai-dev" in said5[-1] and not delivered5 and not dm5.queues["r"])
     cmain, corch = Conn(None, "r", {"alias": None}), Conn(None, "r", {"alias": "ai-dev"})
@@ -6130,8 +6215,9 @@ def cmd_selfcheck():
     dmA1.say = lambda *a, **k: None
     try:
         globals()["react"] = lambda cfg, chat, ts, name, remove=False: None
-        dmA1.on_event({"type": "message", "channel": "D1", "ts": "2.1", "user": "UOWNER", "channel_type": "im",
-                       "text": "yes abcde *Sent using* Claude"})
+        with offline_slack():
+            dmA1.on_event({"type": "message", "channel": "D1", "ts": "2.1", "user": "UOWNER", "channel_type": "im",
+                           "text": "yes abcde *Sent using* Claude"})
     finally:
         globals()["react"] = real_react
     check("claude.ai's '*Sent using* Claude' suffix is stripped before PERM_RE — `yes <id>` answers the prompt — A1",
@@ -7158,6 +7244,7 @@ def cmd_selfcheck():
         return {"ok": True}
     try:
         globals()["api"] = apiV
+        EFFECTS.run_impl = lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         globals()["VITALS_DIR"] = vt
         _open, _sleep = urllib.request.urlopen, time.sleep
         urllib.request.urlopen = lambda req, timeout=None: contextlib.closing(io.BytesIO(b""))
@@ -7173,6 +7260,7 @@ def cmd_selfcheck():
         deleted = "files.delete" in vcalls
     finally:
         globals()["api"], globals()["VITALS_DIR"] = _apiV, os.environ.get("CC_VITALS_DIR") or f"{HOME}/.cc/state/vitals"
+        EFFECTS.run_impl = None
         urllib.request.urlopen, time.sleep = _open, _sleep
         subprocess.run(["rm", "-rf", vt], check=False)
     check("a refresh with NO NEW DATA re-uploads NOTHING: the file id is reused for every 5 s republish, and only a "
@@ -7448,7 +7536,8 @@ def cmd_selfcheck():
           active and not too_soon and grace and not cooled and beat and throttled == 2
           and seenPR[0] == ("users.getPresence", "UOWNER"))
     dmMM = Daemon(use_slack=False); dmMM.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmMM.bot_user = "UBOT"
-    nameMM = next(d for d in sorted(os.listdir(DEV)) if not d.startswith(".") and os.path.isdir(f"{DEV}/{d}/.git"))
+    nameMM = "mmrepo"                                   # a FIXTURE repo, not whatever this box has: on_approval needs a
+    os.makedirs(f"{DEV}/{nameMM}/.git", exist_ok=True)  # repo dir to exist, and picking a real one paged the owner
     dmMM.fetch_message = lambda chat, ts: {"user": "UBOT", "text": f"[{nameMM}] PR #7: t — https://x/7"}
     dmMM.say = lambda *a, **k: None
     dmMM.home_dirty, qMM = False, []
@@ -7607,10 +7696,11 @@ def cmd_selfcheck():
           and dmFK.status_cache[("CQ", "9.0")] is None)
     dmBZ = Daemon(use_slack=False); dmBZ.use_slack = True; dmBZ.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}
     dmBZ.subs["repo"].append(object()); dmBZ.last_chat["repo"] = ("CB", "50.0")
-    _twBZ, _pwBZ, _rcBZ = globals()["tmux_window"], globals()["pane_working"], globals()["react"]
+    _twBZ, _pwBZ, _rcBZ, _apiBZ = globals()["tmux_window"], globals()["pane_working"], globals()["react"], api
     busyBZ, marksBZ, rmBZ = {"v": True}, [], []
     globals()["tmux_window"] = lambda name: ("@1", "node"); globals()["pane_working"] = lambda wid: busyBZ["v"]
     globals()["react"] = lambda cfg, chat, ts, name, remove=False: rmBZ.append((name, remove))
+    globals()["api"] = lambda method, token, **kw: {}         # the marks are the subject; the reads they make are not
     dmBZ.session_mark = lambda chat, ts, name, removed=False: marksBZ.append((ts, name, removed)) or True
     dmBZ.set_work = lambda chat, ts, want: rmBZ.append(("hammer_and_wrench", want is None))
     try:
@@ -7634,7 +7724,8 @@ def cmd_selfcheck():
             dmBZ.busy_cycle()
         stranded = "gone" not in dmBZ.working                 # …the holder still lets it go (it would sit forever)
     finally:
-        globals()["tmux_window"], globals()["pane_working"], globals()["react"] = _twBZ, _pwBZ, _rcBZ
+        globals()["tmux_window"], globals()["pane_working"] = _twBZ, _pwBZ
+        globals()["react"], globals()["api"] = _rcBZ, _apiBZ
     check(f"auto 🔧: a session mid-turn gets ONE 🔧 on the thread it last heard from; it survives {WORK_IDLE_TICKS - 1} idle "
           f"ticks and comes off after {WORK_IDLE_TICKS} (≈{WORK_IDLE_TICKS // 2} min — a pause between turns of a live "
           "conversation must not blink it); a 🔧 the session set itself is never placed over or taken off, a ✅ (done) root "
@@ -7920,6 +8011,7 @@ def cmd_selfcheck():
         dm8.say = lambda chat, text, thread=None: said8.append(text)
         _rc8, _api8, _hw8, _fc8 = globals()["react"], globals()["api"], globals()["home_windows"], globals()["find_channel"]
         globals()["react"] = lambda *a, **k: None
+        globals()["api"] = lambda method, token, **kw: {}     # routing is the subject; the thread reads it makes are not
         try:
             dm8.subs[r8] = [Conn(None, r8, {"alias": "cctest"}), Conn(None, r8, {"alias": None})]
             dm8.on_event({"type": "message", "channel": "CORCH", "ts": "8.1", "user": "UOWNER", "text": "how far are you?", "channel_type": "channel"})
@@ -8050,11 +8142,15 @@ def cmd_selfcheck():
     check("channel name → target: lower-cased, folded to [a-z0-9-], the first `--` still <repo>/<track>; nothing valid → None",
           (chan_target("Random"), chan_target("my_chan"), chan_target("repo--track"), chan_target("ops--a--b"),
            chan_target("\u65e5\u672c"), chan_target("--")) == ("random", "my-chan", "repo/track", "ops/a--b", None, None))
-    _devP, _reactP = DEV, react
+    _devP, _reactP, _apiP = DEV, react, api
     devP = tempfile.mkdtemp(prefix="cc-slack-devP-")
     try:
-        globals()["DEV"] = devP                          # every dir these checks create lands here, never in the real ~/dev
+        globals()["DEV"] = devP                          # every dir these checks create lands here, never in the scratch one
         globals()["react"] = lambda *a, **k: None
+        globals()["api"] = lambda method, token, **kw: {}     # provisioning is the subject; the marks it makes are not
+        os.path.exists(f"{DIR}/{PROVISIONED}") and os.unlink(f"{DIR}/{PROVISIONED}")   # this block owns the ledger: an
+        # earlier case provisions a dir too, and its entry would eat one of the hourly cap this block counts on. That
+        # only passed before because the dir it makes already existed on THIS box, from an earlier run of this command.
         os.mkdir(f"{devP}/myrepo")
         save_orchs({"CORCHP": {"target": "myrepo", "alias": "kid", "name": "myrepo-kid-abcd"},
                     "CDEADP": {"target": "myrepo", "alias": "old", "name": "myrepo-old-zzzz", "archived": True}})
@@ -8122,11 +8218,12 @@ def cmd_selfcheck():
               and delivL[1][1] == "[asked in #myrepo--w1 while its headless worker runs] is it done?"
               and len(saidL) == 1 and "headless worker" in saidL[0] and "`myrepo` session is answering" in saidL[0])
     finally:
-        globals()["DEV"], globals()["react"] = _devP, _reactP
+        globals()["DEV"], globals()["react"], globals()["api"] = _devP, _reactP, _apiP
         subprocess.run(["rm", "-rf", devP])
         for _f in (ORCHS, PROVISIONED):
             os.path.exists(f"{DIR}/{_f}") and os.unlink(f"{DIR}/{_f}")
-    check("selfcheck: the channel-is-a-session checks never touched the real ~/dev", DEV == f"{HOME}/dev" and not os.path.exists(devP))
+    check("selfcheck: the channel-is-a-session checks never touched the ~/dev they were handed",
+          DEV == scratch_dev and not os.path.exists(devP))
     deadline = time.time() + 20                              # publish_soon works OFF-thread: let it finish before judging
     for t in threading.enumerate():
         if t is not threading.current_thread():
@@ -8144,6 +8241,15 @@ def cmd_selfcheck():
     Daemon.queue_land, Daemon.land_sweep = real_queue_land, real_land_sweep
     Daemon.publish_soon = real_publish_soon
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
+    denied = list(EFFECTS.denied)
+    real_effects.install()
+    subprocess.run(["rm", "-rf", scratch_dev])
+    check("selfcheck: not one case reached an EXTERNAL effect it had not declared — no Slack call, no shell-out to "
+          "another cc-* tool, no repository of this box's. Denials are counted here as well as raised because most of "
+          "these calls sit inside an `except Exception: log(...)`, so the raise alone would vanish: "
+          + ("; ".join(denied[:3]) if denied else "none"), not denied)
+    check("selfcheck: it ran on a scratch ~/dev and put the real one back — this command has to work on a bare clone",
+          DEV == f"{HOME}/dev" and EFFECTS.api_impl is slack_api and not os.path.exists(scratch_dev))
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0
 
