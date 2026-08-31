@@ -2,17 +2,25 @@
 # cc-audit — hands-off recurring audit of this box. Reports live in ~/.cc/state/audit/; Slack gets ONE line
 # (the long form goes to the control repo's channel canvas). Never fixes anything: monthly findings land on the board as a
 # track the planning session dispatches when the owner says so.
-#   cc-audit checks|review|weekly|monthly|auto [--dry] [--no-post] [--no-llm]
+#   cc-audit checks|review|weekly|monthly|delete|auto|selfcheck [--dry] [--no-post] [--no-llm]
 #   checks = mechanical, no LLM · review = checks + an LLM read of how well the box served the OWNER over 3 days
 #   weekly = checks + one LLM code audit (area rotates by ISO week) · monthly = checks + all four areas + a synthesis
-#   auto (the timer, 03:30 UTC): day 1 -> monthly · Sunday -> weekly · every 3rd day-of-year -> review · else quiet.
+#   delete = checks + a SECOND OPINION on one question — what should simply go — asked of ANOTHER model (codex).
+#           Same evidence, same report/canvas/notify path as the rest; it is a backend swap, not a second audit system.
+#   selfcheck = the codex path against stub binaries: no network, no spend, nothing written outside its own temp dir.
+#   auto (the timer, 03:30 UTC): day 1 -> monthly · day 15 -> delete · Sunday -> weekly · every 3rd day-of-year -> review · else quiet.
 #   --dry: everything (reports, evidence) goes to a mktemp dir wiped on exit and the report prints to stdout — but
 #          the LLM modes still SPEND. --no-llm (implies --no-post) skips the LLM: checks + evidence index only.
 # READ-ONLY BY CONSTRUCTION: the LLM child gets Read/Grep/Glob/LS and nothing that can write or run a command —
 # see the three layers at the ALLOW/DENY definitions below. Everything it needs is collected by THIS script into
 # <run>/evidence/ first, so it never needs a shell. CC_ROLE=worker is exported for anything that reads it, but the
 # child loads no settings and therefore no hooks: cc-guard does NOT gate it — the tool set is the guarantee.
-# Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE (stub the LLM) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL.
+# The codex second opinion is walled DIFFERENTLY, and weaker: `--sandbox read-only` is codex's own sandbox, so the
+# model MAY run shell commands — it just cannot write or reach the network through them. `--ignore-user-config` and
+# `--ignore-rules` keep the box's own codex config and execpolicy from widening that. Do not describe it as the
+# tool-removal wall above: there, no shell exists; here, the shell exists and is caged.
+# Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE / CC_CODEX (stub either model) · CODEX_MODEL / CODEX_EFFORT
+# (else ~/.cc/config, else codex's own defaults) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL.
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # systemd-started: no ~/bin
 R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"; cd "$R" || exit 1   # run the INSTALLED ~/bin/cc-audit: a worktree copy fails the suites (they assert against the live install)
@@ -20,13 +28,21 @@ BOX="${CC_BOX:-$(hostname -s)}"                                    # notify titl
 CTL="$BOX"; case "$R" in "$HOME/dev/"*) CTL=${R#"$HOME/dev/"}; CTL=${CTL%%/*};; esac   # the control repo = the one this copy lives in: its Slack channel + board
 AD="$HOME/.cc/state/audit"; LOG="$AD/audit.log"; mkdir -p "$AD"
 CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"; LIMIT="$(dirname "$(readlink -f "$0")")/cc-limit"   # sibling, like the rest: a worktree copy uses its own
+CODEX="${CC_CODEX:-codex}"   # the second opinion's model. Not a hard dependency: a box without codex postpones, like a box whose codex is logged out
+# Its model and reasoning effort come from ~/.cc/config (CODEX_MODEL/CODEX_EFFORT); the environment wins over the file.
+# BOTH ARE OPTIONAL AND NOTHING IS HARDCODED: unset means the flag is not passed at all and codex uses its own default,
+# so a published core/ on a box that set neither still works. Only these two keys are read — cc-audit never *sources*
+# ~/.cc/config, because every key in it (the Slack tokens included) would then be inherited by the model child.
+cfgval(){ [ -f "$HOME/.cc/config" ] || return 0; sed -n "s/^[[:space:]]*$1=//p" "$HOME/.cc/config" | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
+CODEX_MODEL="${CODEX_MODEL:-$(cfgval CODEX_MODEL)}"; CODEX_EFFORT="${CODEX_EFFORT:-$(cfgval CODEX_EFFORT)}"
 BUD_REVIEW="${CC_AUDIT_BUDGET_REVIEW:-6}"; BUD_CODE="${CC_AUDIT_BUDGET_WEEKLY:-8}"; BUD_MONTH="${CC_AUDIT_BUDGET_MONTHLY_TOTAL:-30}"
 DAY="${CC_AUDIT_DATE:-$(date -u +%F)}"; STAMP="$(date -u +%FT%TZ)"
 log(){ printf '%s\t%s\n' "$STAMP" "$*" >> "$LOG"; }
-USAGE="usage: cc-audit checks|review|weekly|monthly|auto [--dry] [--no-post] [--no-llm]"
+USAGE="usage: cc-audit checks|review|weekly|monthly|delete|auto|selfcheck [--dry] [--no-post] [--no-llm]"
 mode=""; dry=0; post=1; llm_on=1
 for a in "$@"; do case "$a" in
-  checks|review|weekly|monthly|auto) mode="$a" ;;
+  checks|review|weekly|monthly|delete|auto) mode="$a" ;;
+  selfcheck) mode="$a"; dry=1; post=0 ;;   # --dry already guarantees the one thing a selfcheck must guarantee: it writes nothing real
   --dry) dry=1; post=0 ;;
   --no-post) post=0 ;;
   --no-llm) llm_on=0; post=0 ;;   # a cheap test flag: never post a report the LLM never wrote
@@ -35,7 +51,8 @@ esac; done
 [ -n "$mode" ] || { echo "$USAGE" >&2; exit 2; }
 if [ "$mode" = auto ]; then   # %-d/%-j: no leading zero, or bash reads them as octal
   dom=$(date -u -d "$DAY" +%-d); dow=$(date -u -d "$DAY" +%u); doy=$(date -u -d "$DAY" +%-j)
-  if [ "$dom" = 1 ]; then mode=monthly; elif [ "$dow" = 7 ]; then mode=weekly
+  if [ "$dom" = 1 ]; then mode=monthly; elif [ "$dom" = 15 ]; then mode=delete   # mid-month, two weeks off the monthly: two independent reads of what to delete
+  elif [ "$dow" = 7 ]; then mode=weekly
   elif [ $((doy % 3)) -eq 0 ]; then mode=review; else log "auto: nothing due on $DAY"; exit 0; fi
   log "auto: $DAY -> $mode"
 fi
@@ -162,19 +179,45 @@ for s in "/$HOME/.cc/config" "/$HOME/.ssh/**" "/$HOME/.claude/.credentials.json"
 done
 LLM_COST=0
 POSTPONED=""
-postponed(){ printf '_(postponed: Claude %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; POSTPONED="$2"; }
+postponed(){ printf '_(postponed: %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; POSTPONED="$2"; }   # $2 names the model too: two backends postpone here now
 llm(){   # llm <out-file> <budget> <prompt> — 20 min hard cap; a failed run leaves a stub and never aborts the audit
   local out=$1 bud=$2 prompt=$3 j rc res p; j=$(mktemp)
-  if p=$("$LIMIT" status 2>/dev/null); then postponed "$out" "$p"; rm -f "$j"; return 1; fi   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
+  if p=$("$LIMIT" status 2>/dev/null); then postponed "$out" "Claude $p"; rm -f "$j"; return 1; fi   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
   CC_ROLE=worker timeout 20m "$CLAUDE" -p "$prompt" --model claude-opus-5 --max-budget-usd "$bud" --max-turns 60 \
     --output-format json --setting-sources '' --strict-mcp-config --disable-slash-commands \
     --allowedTools "$ALLOW" --disallowedTools "$DENY" >"$j" 2>>"$LOG"
   rc=$?
   if p=$("$LIMIT" check "$j" 2>/dev/null); then   # hit it mid-audit: record it, postpone, leave the stamp for everyone else
-    postponed "$out" "usage limit until $(date -u -d "@${p#LIMIT }" +%H:%M)Z"; rm -f "$j"; return 1; fi
+    postponed "$out" "Claude usage limit until $(date -u -d "@${p#LIMIT }" +%H:%M)Z"; rm -f "$j"; return 1; fi
   res=$(jq -r '.result // empty' "$j" 2>/dev/null); LLM_COST=$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null)
   if [ -n "$res" ]; then printf '%s\n' "$res" > "$out"; else printf '_(audit run failed: rc=%s)_\n' "$rc" > "$out"; log "llm $out failed rc=$rc"; fi
   rm -f "$j"; [ -n "$res" ]
+}
+# codex_run <out-file> <prompt> — the second opinion. Same contract as llm(): it writes the report or a stub, returns
+# non-zero on failure, and NEVER aborts the audit. Two differences from llm(), both deliberate:
+#   · no --max-budget-usd — codex has no such flag. The bounds are the 20 min cap and the prompt's line limit; the
+#     spend lands on the owner's codex plan, not on the audit budgets, so LLM_COST stays 0 for this mode.
+#   · the preflight. `codex login status` is instant and offline; without it a logged-out box retries a 401 five
+#     times (~30 s) and then dies with a stack of ERROR lines, which reads as a broken audit rather than a missing login.
+codex_run(){
+  local out=$1 prompt=$2 rc last err when
+  if ! command -v "$CODEX" >/dev/null 2>&1; then   # core/ ships to boxes that have no codex at all: "run codex login" would be a lie there
+    postponed "$out" "codex is not installed on this box"; return 1; fi
+  if ! "$CODEX" login status >/dev/null 2>&1; then
+    postponed "$out" "codex is not logged in (run \`codex login\` on the box)"; return 1; fi
+  last=$(mktemp) || return 1; err=$(mktemp) || { rm -f "$last"; return 1; }
+  local -a args=(exec "$prompt" --sandbox read-only --ignore-user-config --ignore-rules --ephemeral --color never
+                 --cd "$R" --output-last-message "$last")
+  [ -n "$CODEX_MODEL" ] && args+=(--model "$CODEX_MODEL")
+  [ -n "$CODEX_EFFORT" ] && args+=(-c "model_reasoning_effort=$CODEX_EFFORT")   # a `-c key=value` config override, NOT a flag: there is no --effort
+  CC_ROLE=worker timeout 20m "$CODEX" "${args[@]}" </dev/null >/dev/null 2>"$err"
+  rc=$?; cat "$err" >> "$LOG"
+  if [ $rc -eq 0 ] && [ -s "$last" ]; then cat "$last" > "$out"; rm -f "$last" "$err"; return 0; fi
+  if grep -qi 'usage limit' "$err"; then   # the codex plan's limit is a POSTPONEMENT, not a fault — exactly as a Claude usage limit is in llm().
+    when=$(grep -oiE 'try again at [0-9]{1,2}:[0-9]{2}( ?[AaPp]\.?[Mm]\.?)?' "$err" | head -1)   # observed live 2026-08-31: an ultra run spent 260k tokens, then this
+    postponed "$out" "codex usage limit${when:+ — $when}"; rm -f "$last" "$err"; return 1; fi
+  printf '_(codex second opinion failed: rc=%s — see audit.log)_\n' "$rc" > "$out"   # an empty answer is a failure too: never post a blank report as a finding-free one
+  log "codex $out failed rc=$rc"; rm -f "$last" "$err"; return 1
 }
 AREA_OUT=""
 area_audit(){   # area_audit <area> [kind] -> sets AREA_OUT (a command substitution would swallow LLM_COST)
@@ -185,14 +228,123 @@ count(){ local n; n=$(grep -c "\*\*$2\*\*" "$1" 2>/dev/null); echo "${n:-0}"; } 
 under(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a < b)}'; }
 short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; printf '%s' "$s"; }   # a phone-readable cut: on a space, never mid-word
 
+# ---- selfcheck: every branch of codex_run(), against stub codex binaries. No network, no spend, no real files ----
+# The logged-out branch is the one that matters today: codex is installed on this box but NOT logged in, so this is
+# the path the FIRST scheduled `delete` run will actually take. It is asserted here rather than described in a doc.
+selfcheck(){
+  local d n=0 f=0 out rc LOG POSTPONED CODEX CODEX_MODEL CODEX_EFFORT   # dynamically scoped: codex_run/postponed see these, never the box's
+  d=$(mktemp -d "${TMPDIR:-/tmp}/cc-audit-sc.XXXXXX") || return 1
+  LOG="$d/audit.log"; out="$d/report.md"; POSTPONED=""; CODEX_MODEL="gpt-sc-test"; CODEX_EFFORT="ultra"
+  sck(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  ntf(){ if "$@"; then echo 1; else echo 0; fi; }   # tf's inverse: the assertion is that the command FAILS
+  cat > "$d/logged-out" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 1
+echo "codex exec was reached while logged out" >&2; exit 9
+S
+  cat > "$d/answers" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+printf '%s\n' "$@" > "$CC_SC_ARGV"
+o=""; p=0; for a in "$@"; do [ "$p" = 1 ] && { o=$a; p=0; }; [ "$a" = --output-last-message ] && p=1; done
+[ -n "$o" ] && printf '## delete or simplify\n- **DELETE** `bin/x:1` — dead.\n' > "$o"
+exit 0
+S
+  cat > "$d/crashes" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+exit 3
+S
+  cat > "$d/says-nothing" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+o=""; p=0; for a in "$@"; do [ "$p" = 1 ] && { o=$a; p=0; }; [ "$a" = --output-last-message ] && p=1; done
+[ -n "$o" ] && : > "$o"
+exit 0
+S
+  chmod +x "$d/logged-out" "$d/answers" "$d/crashes" "$d/says-nothing"
+  export CC_SC_ARGV="$d/argv"
+
+  # 1. logged out — postpone, do not fail, and do not call the model at all
+  CODEX="$d/logged-out"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "logged out: codex_run reports failure to its caller"
+  sck "$(tf grep -q 'not logged in' "$out")" "logged out: the report the owner reads says why"
+  sck "$(tf grep -q 'postponed' "$out")" "logged out: it is POSTPONED — the next scheduled run picks it up"
+  sck "$(tf grep -q 'codex login' "$out")" "logged out: the report names the one command that fixes it"
+  sck "$(tf test -n "$POSTPONED")" "logged out: Slack gets the postponed line, not a failure line"
+  sck "$(tf grep -q '^codex ' <<<"$POSTPONED")" "logged out: the Slack line names codex — it must not read 'Claude codex is not logged in'"
+  sck "$(ntf grep -q 'rc=9' "$out")" "logged out: codex exec is never reached (no 401 retry storm)"
+
+  # 1b. codex absent entirely — a published core/ on a box that never installed it
+  CODEX="$d/no-such-codex"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "not installed: codex_run reports failure"
+  sck "$(tf grep -q 'not installed' "$out")" "not installed: says so, rather than telling the owner to run a login that cannot work"
+
+  # 2. logged in and answering — the report IS the model's answer, and the sandbox flags really go over
+  CODEX="$d/answers"; POSTPONED=""; : > "$d/argv"; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -eq 0)" "answered: codex_run succeeds"
+  sck "$(tf grep -q 'DELETE' "$out")" "answered: the model's last message is the report"
+  sck "$(tf test -z "$POSTPONED")" "answered: nothing is postponed"
+  sck "$(tf grep -qx -- '--sandbox' "$d/argv")" "answered: --sandbox is passed"
+  sck "$(tf grep -qx -- 'read-only' "$d/argv")" "answered: the sandbox is read-only — the model cannot write"
+  sck "$(tf grep -qx -- '--ignore-user-config' "$d/argv")" "answered: the box's own codex config cannot widen the sandbox"
+  sck "$(tf grep -qx -- '--ignore-rules' "$d/argv")" "answered: no execpolicy .rules file can widen it either"
+  sck "$(tf grep -qx -- '--ephemeral' "$d/argv")" "answered: no session files are left on the box"
+
+  sck "$(tf grep -qx -- '--model' "$d/argv")" "answered: --model is passed"
+  sck "$(tf grep -qx -- 'gpt-sc-test' "$d/argv")" "answered: the model comes from CODEX_MODEL/~/.cc/config, not from a hardcoded id"
+  sck "$(tf grep -qx -- '-c' "$d/argv")" "answered: the effort goes over as a -c override (there is no --effort flag)"
+  sck "$(tf grep -qx -- 'model_reasoning_effort=ultra' "$d/argv")" "answered: the effort comes from CODEX_EFFORT/~/.cc/config"
+
+  # 2b. neither key set anywhere — pass no flag at all and let codex use its own default (a bare core/ install)
+  CODEX_MODEL=""; CODEX_EFFORT=""; : > "$d/argv"; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -eq 0)" "no model/effort configured: the run still works"
+  sck "$(ntf grep -qx -- '--model' "$d/argv")" "no model configured: no --model is invented"
+  sck "$(ntf grep -qx -- '-c' "$d/argv")" "no effort configured: no -c override is invented"
+  CODEX_MODEL="gpt-sc-test"; CODEX_EFFORT="ultra"
+
+  # 3. codex ran and failed, or ran and said nothing — a stub, never a blank report posted as 'no findings'
+  CODEX="$d/crashes"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "crashed: codex_run reports failure"
+  sck "$(tf grep -q 'rc=3' "$out")" "crashed: the report carries the exit code, not silence"
+  sck "$(tf test -z "$POSTPONED")" "crashed: a crash is a failure, not a postponement"
+  CODEX="$d/says-nothing"; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "empty answer: treated as a failure"
+  sck "$(tf test -s "$out")" "empty answer: the report is a stub, never an empty file"
+
+  # 3b. the codex plan's usage limit — postponed like Claude's, never reported as "failed (see audit.log)"
+  cat > "$d/out-of-credit" <<'S'
+#!/bin/sh
+[ "$1" = login ] && exit 0
+echo "ERROR: You've hit your usage limit. Upgrade to Pro or try again at 5:21 AM." >&2
+exit 1
+S
+  chmod +x "$d/out-of-credit"
+  CODEX="$d/out-of-credit"; POSTPONED=""; codex_run "$out" "p"; rc=$?
+  sck "$(tf test $rc -ne 0)" "usage limit: codex_run reports failure to its caller"
+  sck "$(tf grep -q 'postponed' "$out")" "usage limit: POSTPONED, not 'failed (see audit.log)'"
+  sck "$(tf grep -q '5:21 AM' "$out")" "usage limit: the report carries when it resets"
+  sck "$(ntf grep -q 'rc=1' "$out")" "usage limit: no bare exit code shown where a reason belongs"
+  sck "$(tf test -n "$POSTPONED")" "usage limit: Slack gets the postponed line"
+
+  # 4. the prompt this mode sends must exist and ask for the marker `count` greps for
+  sck "$(tf test -r "$R/config/audit-delete-prompt.md")" "the delete prompt ships with the script"
+  sck "$(tf grep -q 'DELETE' "$R/config/audit-delete-prompt.md")" "the prompt asks for the **DELETE** marker the report counts"
+
+  unset CC_SC_ARGV; rm -rf "$d"
+  echo "cc-audit selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+[ "$mode" = selfcheck ] && { selfcheck; exit $?; }
+
 # ---- run ----
 log "start mode=$mode dry=$dry post=$post llm=$llm_on day=$DAY since=$SINCE ev=$EV"
 checks
 verdict=$([ "$fail" -eq 0 ] && echo OK || echo ATTENTION)
 add ""; add "**verdict: $verdict — $fail of $((pass+fail)) checks failed**"
 CHK="$RPT"; printf '%s\n' "$CHK" > "$EV/00-checks.md"
-hi=0; med=0; imp=0; llm_ok=1; body="$CHK"; out="$OUTDIR/$DAY-checks.md"
-case "$mode" in review) collect_review ;; weekly|monthly) collect_code ;; esac
+hi=0; med=0; imp=0; del=0; llm_ok=1; body="$CHK"; out="$OUTDIR/$DAY-checks.md"
+case "$mode" in review) collect_review ;; weekly|monthly|delete) collect_code ;; esac
 scrub
 if [ "$mode" != checks ] && [ "$llm_on" = 0 ]; then
   body="$CHK"$'\n\n'"## evidence collected (--no-llm, no LLM run)"$'\n'"$(cd "$EV" && ls -la | sed 's/^/    /')"
@@ -205,6 +357,14 @@ elif [ "$mode" = weekly ]; then
   area=${AREAS[$(( $(date -u -d "$DAY" +%-V) % 4 ))]}
   area_audit "$area" || llm_ok=0
   hi=$(count "$AREA_OUT" HIGH); med=$(count "$AREA_OUT" MED); out=$AREA_OUT
+  body="$(cat "$out")"$'\n\n'"---"$'\n\n'"$CHK"
+elif [ "$mode" = delete ]; then   # one question, another model, the same evidence the weekly/monthly passes read
+  out="$OUTDIR/$DAY-delete.md"; last=$(ls -t "$AD"/*-delete.md 2>/dev/null | head -1)
+  codex_run "$out" "$(sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" -e "s|@LAST@|${last:-none}|g" config/audit-delete-prompt.md)" || llm_ok=0
+  del=$(count "$out" DELETE)
+  [ "$dry" = 1 ] || [ "$llm_ok" = 0 ] ||   # like monthly: a finding only becomes work when it is on the board, and only the owner says go
+    cc-board add "$CTL" "delete-$(date -u -d "$DAY" +%Y%m)" "codex second opinion: $del deletion candidates" "$out" >/dev/null 2>&1 ||
+    log "board add failed for delete-$(date -u -d "$DAY" +%Y%m)"
   body="$(cat "$out")"$'\n\n'"---"$'\n\n'"$CHK"
 elif [ "$mode" = monthly ]; then
   ym=$(date -u -d "$DAY" +%Y-%m); reports=(); spent=0
@@ -233,13 +393,15 @@ else
 fi
 if [ "$post" = 1 ]; then
   printf '%s\n' "$body" | cc-slack canvas "#$CTL" "$BOX audit" >/dev/null 2>&1 || log "canvas update failed"
-  if [ -n "$POSTPONED" ]; then cc-notify -t "$BOX audit $mode" "$mode postponed — Claude $POSTPONED · next run picks it up · $verdict: $fail checks failed" || log "notify failed"
+  if [ -n "$POSTPONED" ]; then cc-notify -t "$BOX audit $mode" "$mode postponed — $POSTPONED · next run picks it up · $verdict: $fail checks failed" || log "notify failed"
   elif [ "$llm_ok" = 0 ]; then cc-notify -t "$BOX audit $mode" "$mode failed (see audit.log) · $verdict: $fail checks failed" || log "notify failed"
+  elif [ "$mode" = delete ]; then   # the delete headline is how much there is to throw away
+    cc-notify -t "$BOX audit delete" "second opinion (codex): $del to delete · board delete-$(date -u -d "$DAY" +%Y%m) · $verdict: $fail checks failed → canvas" || log "notify failed"
   elif [ "$mode" = review ]; then   # the review's headline is the owner's experience, not a finding count
     cc-notify -t "$BOX review" "$(short "$(sed -n '/^## verdict/,/^## /p' "$out" | grep '^- ' | head -1 | cut -c3-)") · $imp improvements → canvas" || log "notify failed"
   else
     cc-notify -t "$BOX audit $mode" "$verdict: $fail checks failed · $hi/$med findings · canvas updated" || log "notify failed"
   fi
 fi
-log "done mode=$mode verdict=$verdict fail=$fail high=$hi med=$med imp=$imp llm_ok=$llm_ok out=$out"
+log "done mode=$mode verdict=$verdict fail=$fail high=$hi med=$med imp=$imp del=$del llm_ok=$llm_ok out=$out"
 exit 0

@@ -548,6 +548,11 @@ echo "== landing (cc-land) =="
 # the world is stood in for. Nothing here reaches git, Slack, systemd or the board.
 sc=$("$B/cc-land" selfcheck 2>&1)
 grep -q "cc-land selfcheck: 0 failed" <<<"$sc" && ok "$(tail -1 <<<"$sc")" || bad "$(tail -1 <<<"$sc")"
+echo "== cc-audit: the second opinion on what to delete (codex) =="
+# No fixtures: `cc-audit selfcheck` stubs codex logged-out/answering/crashing/silent in a temp dir of its own and
+# removes it. It exits before checks() runs, so calling it from here does NOT recurse back into this file.
+sc=$("$B/cc-audit" selfcheck 2>&1)
+grep -q "0 failed" <<<"$sc" && ok "cc-audit selfcheck: $(tail -1 <<<"$sc")" || bad "cc-audit selfcheck: $(tail -1 <<<"$sc")"
 cd ~ || exit 1
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it

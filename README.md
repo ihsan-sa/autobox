@@ -11,7 +11,7 @@ sandbox runs the unrestricted ones. Thread marks tell you at a glance what needs
 - `cc-slack` — two-way Slack: `#<repo>` ↔ that repo's session, DMs ↔ the box; permission prompts relayed; `!status`/`!threads`/`!restart` without tokens.
 - Hooks — `cc-checkpoint` (auto-commit+push in worktrees only), `cc-guard` (owner gates for autonomous sessions).
 - `ccbox` — bypass-permissions Claude in Docker with an egress allowlist.
-- `cc-audit` — recurring reviews of how well the box served you (3-day), code audits (weekly, monthly).
+- `cc-audit` — recurring reviews of how well the box served you (3-day), code audits (weekly, monthly), and a second opinion from another model on what to delete (day 15).
 - `cc-reconcile` — the board against the box every 20 min: applies the drift that has one right answer (a PR merged, a worker is gone), ends a worker that is spending without working, reports the rest.
 - `cc-publish` — a private box keeps this tree as `core/` and mirrors it back here after every merge, gated on its own name never shipping.
 - Boot/notify — survives power cuts and reboots; Slack/ntfy notices; daily digest.
