@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""cc-owed — what a session still owes Slack, told to it at the end of its turn instead of remembered.
+
+  cc-owed                          what the session in $PWD owes (one line each; exit 1 when anything is)
+  cc-owed <repo> <track>           that track's session · --transcript PATH · --session ID · --json
+  cc-owed --check                  stdin = a Stop hook payload -> the Stop decision that says it, else nothing
+                                   --with '<json>' carries another hook's decision through, ours first
+  cc-owed --ledger [--json]        the durable record: one countable line per debt ever said
+  cc-owed selfcheck                fixtures for the scan, the two debts, the cancels and the once-only rule
+
+WHY A HOOK AND NOT A RULE. The owner, 2026-08-31: "you sometimes forget to respond in slack or miss
+messages... not labelling questions. this could be a symptom of a too complex system". The only thing
+tracking what a session still owed was the session, and something that forgets cannot notice that it
+forgot. So the box measures it where it already measures how full a context is — the Stop hook, after
+every turn — and says it once. Not a line in a prompt: more rules are the thing being objected to.
+
+TWO DEBTS, both read off the session's OWN transcript (the Stop payload's `transcript_path` is the handle):
+  a word    someone wrote to this session and the turn is ending with nothing said in that thread. What
+            happens today instead: five idle minutes later cc-slack posts a 👍 for it ("handled"), which
+            is true and says nothing.
+  a label   the newest word in a thread is OUR OWN question, posted without `needs_owner` — so the thread
+            is on no list of theirs and nothing else will ever put it there. ❓ is the sender's to declare
+            (#36): the box still never infers one from prose, it asks the session that wrote it to decide.
+
+WHY THE TRANSCRIPT AND NOT A SECOND STORE. Whose turn it is (🔴/🟠) is computed live inside the daemon from
+Slack's own history and never lands in a file — re-deriving it here would mean reading Slack, which is a
+second source of truth for the one thing cc-slack owns. The transcript is not one: it is this session's own
+record of what it was handed and what it said, and it is the only place that knows whether the session
+answered. cc-slack's files are consulted for exactly what they do record — a 🏁, a ✅, a ❓ declaration.
+
+THE THREAD'S NEWEST EVENT DECIDES, and only that: a message of theirs with a word of ours after it is
+settled, our question with their answer after it is settled. One debt per thread, never a backlog of them.
+
+THE MARKS ARE READ, NEVER RECOMPUTED. cc-slack owns them and is their one writer; this asks Slack nothing
+and writes nothing of its own into ~/.cc/slack. Two files cancel a debt:
+  flags.json    a human 🏁'd the thread after that message — closed, nothing is owed in it
+  marks.json    `:white_check_mark` the session called the thread done · `:question` somebody already
+                declared it needs the owner (a `reply(needs_owner=true)`, or cc-slack's own 🔐 prompt),
+                within cc-slack's own 60 s grace of the word in question
+
+SAID ONCE per debt, never while another Stop hook is holding the session, never for a `chat_id="local"`
+injection (there is no thread on Slack to answer), and never more than MAX_SAY at a time. Every debt said
+appends one JSON line to ~/.cc/state/owed/owed.jsonl — countable with `wc -l`, so a reader never parses
+prose — and the per-session record beside it is what makes it once (pruned after 7 days).
+
+NEVER BLOCKS A TURN. Every path here exits 0 and swallows its own errors: `--check` is a filter in the
+Stop hook, and `--with` means a fault in this tool cannot cost the session the context hook's message.
+Env: CC_OWED_RECORDS · CC_SLACK_DIR (both so a test run keeps out of the box's own state).
+"""
+import calendar, glob, json, os, re, sys, time
+
+STATE = os.path.expanduser("~/.cc/state")
+RECORDS = os.environ.get("CC_OWED_RECORDS") or os.path.join(STATE, "owed")
+SLACK_DIR = os.environ.get("CC_SLACK_DIR") or os.path.expanduser("~/.cc/slack")
+PROJECTS = os.path.expanduser("~/.claude/projects")
+TAIL = 512 * 1024          # many turns of transcript; truncation can only hide an old debt, never invent one
+PRUNE_AFTER = 7 * 86400
+GRACE = 60                 # cc-slack's DECLARE_GRACE: a declaration covers what its sender posts within a minute of it
+MAX_SAY = 3
+
+SENDERS = {"mcp__cc-slack__reply", "mcp__cc-slack__file", "mcp__cc-slack__react"}
+CHAN_RX = re.compile(r'<channel\s+([^>]*?)>\n?(.*?)</channel>', re.S)
+ATTR_RX = re.compile(r'([a-z_]+)="([^"]*)"')
+CHAT_RX = re.compile(r'\b[CDG][A-Z0-9]{6,}\b')      # a Slack channel/DM id on a command line
+TS_RX = re.compile(r'\b\d{10}\.\d{6}\b')            # a Slack message ts on one
+
+
+def load_slack(name):
+    """One of cc-slack's own state files, read and never written: {"<key>": <epoch>}."""
+    try:
+        with open(os.path.join(SLACK_DIR, name)) as f:
+            return {k: float(v) for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def tail_lines(path, nbytes):
+    """The last <=nbytes of a file as whole lines (a truncated first line is dropped)."""
+    with open(path, "rb") as f:
+        size = f.seek(0, 2)
+        start = max(0, size - nbytes)
+        f.seek(start)
+        buf = f.read()
+    if start:
+        buf = buf.split(b"\n", 1)[1] if b"\n" in buf else b""
+    return [l for l in buf.decode("utf-8", "replace").split("\n") if l.strip()]
+
+
+def epoch(iso):
+    """A transcript entry's ISO timestamp as a UTC epoch (0.0 when it has none)."""
+    try:
+        return float(calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return 0.0
+
+
+def text_of(message):
+    c = (message or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def question(text):
+    """THE question OUR OWN word ends on, or "". The LAST line only, outside code fences, never a quote of
+    theirs: a rhetorical question in the middle of an answer is not an ask. The box's own two forms (a 🔐 prompt,
+    a worker's STATUS: BLOCKED) declare themselves in cc-slack and are not this hook's business. Wider than
+    cc-slack's asks_owner on purpose — that one decides what the OWNER sees, this one only ever reaches the
+    session that wrote the words, and it can say no by ignoring it."""
+    t = text or ""
+    if t.strip().startswith("🔐") or any(l.lstrip().upper().startswith("STATUS: BLOCKED") for l in t.splitlines()):
+        return ""
+    parts = t.split("```")
+    body = "".join(parts[i] for i in range(0, len(parts), 2))
+    lines = [l.strip() for l in body.splitlines() if l.strip()]
+    last = lines[-1] if lines else ""
+    return last if last.endswith("?") and not last.startswith(">") else ""
+
+
+def words(name, inp):
+    """Every word this tool call says on Slack: (chat, {ts it lands on} or None, text, needs_owner, is a reply).
+    None = a post with no thread of its own, which settles anything owed in that channel rather than one thread."""
+    inp = inp if isinstance(inp, dict) else {}
+    if name in SENDERS:
+        chat = str(inp.get("chat_id") or "")
+        ids = {str(inp.get(k)) for k in ("thread_ts", "ts") if inp.get(k)}
+        if chat:
+            return [(chat, ids or None, str(inp.get("text") or ""), bool(inp.get("needs_owner")),
+                     name.endswith("reply"))]
+    if name == "Bash":                      # `cc-slack post`/`react` from a script does the same job as the tool
+        cmd = str(inp.get("command") or "")
+        if "cc-slack" in cmd and re.search(r"\b(post|react)\b", cmd):
+            ids = set(TS_RX.findall(cmd)) or None
+            return [(c, ids, "", False, False) for c in set(CHAT_RX.findall(cmd))]
+    return []
+
+
+def scan(path):
+    """The NEWEST event in every Slack thread this transcript touches: {(chat, root): event}. An event is either
+    a message handed to this session (`in`) or a word of ours (`out`)."""
+    st = {}
+    for line in tail_lines(path, TAIL):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue                        # a half-written last line is normal while a session runs
+        if not isinstance(d, dict):
+            continue
+        at, t = epoch(d.get("timestamp") or ""), d.get("type")
+        if t == "user":
+            for attrs, body in CHAN_RX.findall(text_of(d.get("message") or {})):
+                a = dict(ATTR_RX.findall(attrs))
+                chat, root = a.get("chat_id") or "", a.get("thread_ts") or a.get("ts") or ""
+                if a.get("source") != "cc-slack" or not chat or not root or chat == "local":
+                    continue                # an injection on the box has no Slack thread to owe a word to
+                if a.get("kind") == "reaction":
+                    continue                # their 👍/👎 IS the answer ("act without asking again") — it owes no
+                                            # word, and skipping it leaves an older unanswered message the newest
+                body, ts = body.strip(), a.get("ts") or root
+                if body.startswith("[") and body.endswith("]"):
+                    cur = st.get((chat, root))      # cc-slack's own notice ABOUT a message, not a word from them:
+                    if cur and cur["kind"] == "in" and cur["ts"] == ts:   # "deleted … — disregard it" settles what
+                        del st[(chat, root)]                              # that message owed. (An edit notice carries
+                    continue                                              # the new text after the "]" and is a word.)
+                st[(chat, root)] = {"kind": "in", "chat": chat, "root": root, "ts": ts,
+                                    "who": a.get("user") or "someone", "role": a.get("role") or "",
+                                    "chan": a.get("channel") or chat, "text": body, "at": at}
+        elif t == "assistant":
+            for c in (d.get("message") or {}).get("content") or []:
+                if not isinstance(c, dict) or c.get("type") != "tool_use":
+                    continue
+                for chat, ids, text, needs, is_reply in words(c.get("name") or "", c.get("input")):
+                    out = {"kind": "out", "chat": chat, "text": text, "needs": needs, "reply": is_reply, "at": at}
+                    if ids is None:         # a word into the channel itself: everything open there has had one
+                        for k in [k for k in st if k[0] == chat]:
+                            st[k] = carry(st[k], out)
+                        continue
+                    hit = [k for k in st if k[0] == chat and (k[1] in ids or st[k].get("ts") in ids)]
+                    for k in hit:
+                        st[k] = carry(st[k], out)
+                    if not hit and is_reply:
+                        root = str((inp_root(c.get("input")) or ""))
+                        if root:            # a thread whose inbound message is older than this transcript's tail
+                            st[(chat, root)] = dict(out, root=root)
+    return st
+
+
+def carry(prev, out):
+    """Our word takes the thread over — but the channel's name and who is in it belong to the thread."""
+    return dict(out, root=prev["root"], chan=prev.get("chan"), who=prev.get("who"))
+
+
+def inp_root(inp):
+    inp = inp if isinstance(inp, dict) else {}
+    return inp.get("thread_ts") or inp.get("ts")
+
+
+def debts(path, marks=None, flags=None):
+    """What is owed right now, newest first. A debt is a thread whose newest event leaves the ball here."""
+    marks = load_slack("marks.json") if marks is None else marks
+    flags = load_slack("flags.json") if flags is None else flags
+    out = []
+    for (chat, root), e in scan(path).items():
+        when = float(e.get("ts") or root or 0) if e["kind"] == "in" else e["at"]
+        if flags.get(f"{chat}:{root}", 0) >= when:
+            continue                                              # a human 🏁'd it after that: the thread is closed
+        q = marks.get(f"{chat}:{root}:question", 0)
+        if q and q + GRACE >= when:
+            continue                                              # already declared: the ball is theirs, not ours
+        if e["kind"] == "in":
+            if marks.get(f"{chat}:{root}:white_check_mark", 0) >= when:
+                continue                                          # the session called the thread done
+            out.append(dict(e, kind="word", key=f"word:{chat}:{e.get('ts') or root}"))
+        elif e.get("reply") and not e["needs"] and question(e["text"]):
+            out.append(dict(e, kind="label", key=f"label:{chat}:{root}:{int(when)}"))
+    out.sort(key=lambda d: -(d["at"] or 0))
+    return out
+
+
+# ---- what the session is told ------------------------------------------------------------------
+
+def age(since):
+    """How long it has waited, in the shortest form that is true."""
+    d = time.time() - (since or 0)
+    if not since or d < 60:
+        return "just now"
+    for n, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if d >= n:
+            return f"{int(d // n)}{unit}"
+    return "just now"
+
+
+def excerpt(t, n=70):
+    s = " ".join((t or "").split())
+    return (s[:n - 1] + "…") if len(s) > n else s
+
+
+def told(d):
+    if d["kind"] == "word":
+        return (f"OWED — {d['who']} wrote in {d['chan']} {age(float(d.get('ts') or 0))} ago and this turn is ending "
+                f"with nothing said in that thread: "
+                f"\"{excerpt(d['text'])}\". Answer it now — reply(chat_id=\"{d['chat']}\", thread_ts=\"{d['root']}\", "
+                f"ts=\"{d['ts']}\"), or react on that ts when 👍/👎/❌ says all of it. Two words of your own beat the "
+                f"👍 the box posts for a session that finishes silently.")
+    return (f"UNLABELLED — your last word in {d.get('chan') or d['chat']} ({age(d['at'])} ago) asks them something without "
+            f"needs_owner, so the thread is on no list of theirs and nothing else will put it there: "
+            f"\"{excerpt(question(d['text']) or d['text'])}\". If you have STOPPED until they answer, say so — "
+            f"reply(chat_id=\"{d['chat']}\", "
+            f"thread_ts=\"{d['root']}\", needs_owner=true). If you are not waiting on them, ignore this.")
+
+
+def line(d):
+    return (f"{d['kind']}\t{d.get('chan') or d['chat']}\t{age(float(d.get('ts') or 0) or d['at'])}"
+            f"\t{d.get('who') or 'us'}\t{excerpt(question(d['text']) if d['kind'] == 'label' else d['text'], 60)}"
+            f"\t{d['chat']}\t{d['root']}")
+
+
+# ---- the record: once each, and countable ------------------------------------------------------
+
+def ledger(d, m):
+    os.makedirs(RECORDS, exist_ok=True)
+    row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": d["kind"], "chat": d["chat"],
+           "root": d["root"], "msg_ts": d.get("ts"), "chan": d.get("chan"), "who": d.get("who"),
+           "session_id": m.get("session_id"), "repo": m.get("repo"), "track": m.get("track")}
+    with open(os.path.join(RECORDS, "owed.jsonl"), "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def ledger_rows():
+    out = []
+    try:
+        with open(os.path.join(RECORDS, "owed.jsonl")) as f:
+            for l in f:
+                try:
+                    out.append(json.loads(l))
+                except Exception:
+                    continue                       # one bad line never hides the rest
+    except OSError:
+        pass
+    return out
+
+
+def track_of(cwd):
+    try:
+        with open(os.path.join(cwd, ".cc/track")) as f:
+            repo, track = [l.strip() for l in f.read().splitlines()[:2]]
+        return repo, track
+    except Exception:
+        return None, None
+
+
+def prune():
+    now = time.time()
+    for old in glob.glob(os.path.join(RECORDS, "*.json")):
+        try:
+            if now - os.path.getmtime(old) > PRUNE_AFTER:
+                os.remove(old)
+        except OSError:
+            pass
+
+
+def check(payload):
+    """Called by the Stop hook. Never raises: what a session owes must not be able to break it."""
+    if payload.get("stop_hook_active"):
+        return None                                   # another hook is holding the session; it is not being told twice
+    sid, path = payload.get("session_id") or "", payload.get("transcript_path") or ""
+    if not path or not os.path.exists(path):
+        hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl")) if sid else []
+        path = max(hits, key=os.path.getmtime) if hits else ""
+    if not path or not os.path.exists(path):
+        return None
+    ds = debts(path)
+    if not ds:
+        return None
+    cwd = payload.get("cwd") or ""
+    repo, track = track_of(cwd)
+    p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
+    rec = {}
+    try:
+        with open(p) as f:
+            rec = json.load(f) or {}
+    except Exception:
+        pass
+    said = rec.get("told") or {}
+    fresh = [d for d in ds if d["key"] not in said][:MAX_SAY]     # said once per debt, not once per turn
+    if not fresh:
+        return None
+    now = time.time()
+    for d in fresh:
+        said[d["key"]] = now
+        ledger(d, {"session_id": sid, "repo": repo, "track": track})
+    os.makedirs(RECORDS, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"ts": now, "cwd": cwd, "repo": repo, "track": track,
+                   "told": {k: v for k, v in said.items() if v >= now - PRUNE_AFTER}}, f)
+    os.replace(tmp, p)
+    prune()
+    return " ".join(told(d) for d in fresh)
+
+
+def merge(say, carried):
+    """One Stop decision out of two hooks' worth of things to say — what is OWED comes first: a session about to
+    hand off has to pay its debts before it goes."""
+    reasons = [r for r in (say, (json.loads(carried).get("reason") if carried else None)) if r]
+    return json.dumps({"decision": "block", "reason": "\n\n".join(reasons)}) if reasons else ""
+
+
+# ---- finding a session's transcript ------------------------------------------------------------
+
+def transcript_for_cwd(cwd):
+    d = os.path.join(PROJECTS, re.sub(r"[/.]", "-", os.path.realpath(cwd)))
+    hits = glob.glob(os.path.join(d, "*.jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def resolve(repo=None, track=None, sid=None):
+    if sid:
+        hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
+        return max(hits, key=os.path.getmtime) if hits else None
+    if repo and track:
+        return transcript_for_cwd(os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}"))
+    return transcript_for_cwd(os.getcwd())
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    as_json = do_check = do_ledger = False
+    path = sid = carried = None
+    args = []
+    while argv:
+        a = argv.pop(0)
+        if a == "--json":
+            as_json = True
+        elif a == "--check":
+            do_check = True
+        elif a == "--ledger":
+            do_ledger = True
+        elif a == "--with":
+            carried = argv.pop(0) if argv else None
+        elif a == "--transcript":
+            path = argv.pop(0)
+        elif a == "--session":
+            sid = argv.pop(0)
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a.startswith("-"):
+            print(f"cc-owed: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            args.append(a)
+
+    if do_check:
+        say = None
+        try:
+            payload = json.load(sys.stdin)
+            say = check(payload if isinstance(payload, dict) else {})
+        except Exception:
+            pass                                      # a debt this tool cannot read is not a session's problem
+        try:
+            out = merge(say, carried)
+        except Exception:
+            out = carried or ""                       # whatever the other hook said still goes, unchanged
+        if out:
+            print(out)
+        return 0
+
+    if do_ledger:
+        rows = ledger_rows()
+        if as_json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        for r in rows:
+            print(f"{r.get('ts')}\t{r.get('kind')}\t{(r.get('repo') or '-')}/{(r.get('track') or '-')}"
+                  f"\t{r.get('chan') or r.get('chat')}\t{r.get('root')}")
+        return 0
+
+    if not path:
+        path = resolve(args[0] if args else None, args[1] if len(args) > 1 else None, sid)
+    if not path or not os.path.exists(path):
+        print("cc-owed: no transcript for that session", file=sys.stderr)
+        return 2
+    ds = debts(path)
+    if as_json:
+        print(json.dumps(ds, indent=2))
+    else:
+        for d in ds:
+            print(line(d))
+    return 1 if ds else 0
+
+
+# ---- selfcheck ---------------------------------------------------------------------------------
+
+def selfcheck():
+    import tempfile
+    global RECORDS, SLACK_DIR
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        print(("ok   " if cond else "FAIL ") + name)
+        p, f = p + (1 if cond else 0), f + (0 if cond else 1)
+
+    tmp = tempfile.mkdtemp(prefix="cc-owed.")
+    RECORDS, SLACK_DIR = os.path.join(tmp, "rec"), os.path.join(tmp, "slack")
+    os.makedirs(SLACK_DIR)
+    T0 = 1700000000.0
+    CHAT, ROOT = "C111AAA22", "1700000000.000100"
+
+    def iso(t):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    def msg(text="do the thing", ts=ROOT, root=ROOT, chat=CHAT, chan="#one", who="Owner", at=T0 + 1, kind=""):
+        tag = (f'<channel source="cc-slack" chat_id="{chat}" thread_ts="{root}" ts="{ts}" user="{who}" '
+               f'{f"""kind="{kind}" """ if kind else ""}role="owner" channel="{chan}" target="one">\n{text}\n</channel>')
+        return {"type": "user", "timestamp": iso(at), "message": {"role": "user", "content": tag}}
+
+    def use(name, inp, at=T0 + 2):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"role": "assistant", "content": [{"type": "tool_use", "name": name, "input": inp}]}}
+
+    def rep(text="on it", needs=False, root=ROOT, ts=ROOT, chat=CHAT, at=T0 + 2, **extra):
+        inp = {"chat_id": chat, "text": text, "thread_ts": root, "ts": ts}
+        if needs:
+            inp["needs_owner"] = True
+        inp.update(extra)
+        return use("mcp__cc-slack__reply", inp, at)
+
+    n = [0]
+
+    def tx(*entries):
+        n[0] += 1
+        path = os.path.join(tmp, f"t{n[0]}.jsonl")
+        with open(path, "w") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+        return path
+
+    def kinds(path, **kw):
+        return [d["kind"] for d in debts(path, **kw)]
+
+    # --- the scan: the thread's newest event, and only that, decides
+    ok("a message with no word after it is owed", kinds(tx(msg())) == ["word"])
+    ok("a reply in that thread settles it", kinds(tx(msg(), rep())) == [])
+    ok("a reply BEFORE it does not — their word is the newer one",
+       kinds(tx(rep(at=T0), msg(at=T0 + 5))) == ["word"])
+    ok("a react on the message answers it", kinds(tx(msg(), use("mcp__cc-slack__react",
+                                                               {"chat_id": CHAT, "ts": ROOT, "emoji": "+1"}))) == [])
+    ok("a file sent into the thread answers it", kinds(tx(msg(), use("mcp__cc-slack__file",
+                                                                     {"chat_id": CHAT, "path": "/tmp/x.png",
+                                                                      "thread_ts": ROOT}))) == [])
+    ok("`cc-slack post` from a script counts as a word",
+       kinds(tx(msg(), use("Bash", {"command": f"cc-slack post {CHAT} --thread {ROOT} 'done'"}))) == [])
+    ok("a word in another thread of the same channel does not answer this one",
+       kinds(tx(msg(), rep(root="1700000009.000900", ts="1700000009.000900"))) == ["word"])
+    ok("two unanswered threads are two debts",
+       sorted(d["root"] for d in debts(tx(msg(), msg(root="1700000009.000900", ts="1700000009.000900")))) ==
+       [ROOT, "1700000009.000900"])
+    ok("an injected local message has no Slack thread to owe", kinds(tx(msg(chat="local"))) == [])
+    ok("a deletion notice settles what that message owed — it says disregard it",
+       kinds(tx(msg(), msg("[the owner deleted their 23:43 message — disregard it]", at=T0 + 9))) == [])
+    ok("an edit notice is the message again, and still owes a word",
+       kinds(tx(msg(), msg("[the owner edited their 23:43 message; new text:] do the other thing", at=T0 + 9)))
+       == ["word"])
+    ok("a notice about a message they have since replaced does not settle the newer one",
+       kinds(tx(msg(), msg("later", ts="1700000050.000500", at=T0 + 50),
+                msg("[the owner deleted their 23:43 message — disregard it]", at=T0 + 60))) == ["word"])
+    ok("their 👍 on our reply is an answer, not a question",
+       kinds(tx(msg('👍 on your reply: "done"', ts="1700000020.000200", kind="reaction"))) == [])
+    ok("...and it does not bury an older message they are still waiting on",
+       kinds(tx(msg(at=T0 + 1), msg('👍 on your reply: "ok"', ts="1700000020.000200", kind="reaction",
+                                    at=T0 + 20))) == ["word"])
+    ok("a message from another source is not ours to answer",
+       kinds(tx({"type": "user", "timestamp": iso(T0), "message": {"role": "user", "content": "<channel "
+                 'source="other" chat_id="C9" thread_ts="1.0" ts="1.0">hi</channel>'}})) == [])
+
+    # --- the cancels, read out of cc-slack's own files
+    ok("a 🏁 after their message closes the thread",
+       kinds(tx(msg()), flags={f"{CHAT}:{ROOT}": float(ROOT) + 1}, marks={}) == [])
+    ok("a 🏁 older than their message does not",
+       kinds(tx(msg()), flags={f"{CHAT}:{ROOT}": float(ROOT) - 1}, marks={}) == ["word"])
+    ok("a ✅ newer than their message: the session called the thread done",
+       kinds(tx(msg()), marks={f"{CHAT}:{ROOT}:white_check_mark": float(ROOT) + 1}, flags={}) == [])
+    ok("a ❓ declared within the grace puts the ball in their court",
+       kinds(tx(msg()), marks={f"{CHAT}:{ROOT}:question": float(ROOT)}, flags={}) == [])
+    ok("a stale ❓ does not — their newer word re-owes it",
+       kinds(tx(msg()), marks={f"{CHAT}:{ROOT}:question": float(ROOT) - GRACE - 1}, flags={}) == ["word"])
+
+    # --- the second debt: our own question, on nobody's list
+    ok("our question with no needs_owner is unlabelled",
+       kinds(tx(msg(), rep("shall i deploy it?"))) == ["label"])
+    ok("needs_owner IS the declaration", kinds(tx(msg(), rep("shall i deploy it?", needs=True))) == [])
+    ok("their answer after our question ends it",
+       kinds(tx(msg(at=T0), rep("shall i deploy it?", at=T0 + 2), msg("yes", ts="1700000030.000300", at=T0 + 30)))
+       == ["word"])
+    ok("a ❓ recorded for that thread is the same declaration",
+       kinds(tx(msg(), rep("shall i deploy it?")), marks={f"{CHAT}:{ROOT}:question": T0 + 2}, flags={}) == [])
+    ok("a question that is not the last word is not an ask",
+       kinds(tx(msg(), rep("why? because it was faster. done."))) == [])
+    ok("a question inside a code block is not an ask",
+       kinds(tx(msg(), rep("ran it:\n```\necho ok?\n```"))) == [])
+    ok("quoting their question back is not asking one",
+       kinds(tx(msg(), rep("> is it done?"))) == [])
+    ok("the box's own two forms declare themselves and are not this hook's business",
+       kinds(tx(msg(), rep("🔐 may I run this?"))) == [] and
+       kinds(tx(msg(), rep("STATUS: BLOCKED: which one?"))) == [])
+
+    # --- the Stop decision: once, silent when held, and it never writes cc-slack's files
+    before = sorted(os.listdir(SLACK_DIR))
+    t = tx(msg())
+    pay = {"session_id": "sess-1", "transcript_path": t, "cwd": tmp}
+    d1 = check(dict(pay))
+    ok("the hook says what is owed, with the call that pays it",
+       bool(d1) and "OWED" in d1 and f'chat_id="{CHAT}"' in d1 and "#one" in d1)
+    ok("it is said once, not every turn", check(dict(pay)) is None)
+    ok("never while another Stop hook is holding the session",
+       check(dict(pay, stop_hook_active=True, session_id="sess-2")) is None)
+    ok("a new debt in the same session is still said",
+       bool(check({"session_id": "sess-1", "transcript_path": tx(msg(), msg(ts="1700000040.000400", at=T0 + 40)),
+                   "cwd": tmp})))
+    ok("nothing owed says nothing at all", check({"session_id": "sess-3", "transcript_path": tx(msg(), rep()),
+                                                  "cwd": tmp}) is None)
+    ok("a payload with no transcript is silent, not an error",
+       check({"session_id": "nope", "transcript_path": "/nonexistent"}) is None and check({}) is None)
+    with open(os.path.join(SLACK_DIR, "marks.json"), "w") as fh:
+        fh.write("{not json at all")                   # cc-slack half-way through its own atomic write, or worse
+    with open(os.path.join(SLACK_DIR, "flags.json"), "w") as fh:
+        fh.write("")
+    ok("a malformed mark file cancels nothing and breaks nothing",
+       kinds(tx(msg())) == ["word"] and load_slack("marks.json") == {})
+    os.remove(os.path.join(SLACK_DIR, "marks.json")); os.remove(os.path.join(SLACK_DIR, "flags.json"))
+    half = tx(msg())
+    with open(half, "a") as fh:
+        fh.write('{"type":"user","message":{"content":"<channel sourc')     # a line still being written
+    ok("a half-written transcript line is skipped, not fatal", kinds(half) == ["word"])
+    ok("the age of the debt is said, and its first words",
+       "just now" in told(debts(tx(msg(ts=str(time.time()), root=str(time.time()))))[0]))
+    ok("cc-slack's own files are only ever read", sorted(os.listdir(SLACK_DIR)) == before)
+    ok("every debt said is one countable line on the ledger", len(ledger_rows()) == 2)
+    ok("the ledger says which debt, and whose session",
+       ledger_rows()[0]["kind"] == "word" and ledger_rows()[0]["session_id"] == "sess-1")
+
+    # --- --with: this hook carries the other one's decision, ours first
+    ctx = json.dumps({"decision": "block", "reason": "CONTEXT 42%. Journal now."})
+    m = json.loads(merge("OWED — answer them.", ctx))
+    ok("both hooks say their piece in one decision, what is owed first",
+       m["decision"] == "block" and m["reason"].startswith("OWED") and "CONTEXT 42%" in m["reason"])
+    ok("nothing owed passes the other hook's decision through untouched",
+       json.loads(merge(None, ctx))["reason"] == "CONTEXT 42%. Journal now.")
+    ok("nothing at all from either hook says nothing", merge(None, None) == "" and merge(None, "") == "")
+
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"cc-owed selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -136,6 +136,40 @@ out=$("$B/cc" handoff $REPO w1 --over 2>&1); rc=$?
 lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 10%" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column"
 ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" </dev/null )   # no payload (run by hand): still commits, records nothing new
 [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ] && ok "the hook still commits when it is given no payload" || bad "checkpoint broke without a Stop payload"
+
+echo "== cc-owed (the same hook says what is still owed in Slack) =="
+owc=$("$B/cc-owed" selfcheck 2>&1)
+grep -q '0 failed' <<<"$owc" && ok "cc-owed selfcheck: ${owc##*: }" || bad "cc-owed selfcheck: $owc"
+OWD="$T/owed"; SLD="$T/slackdir"; mkdir -p "$SLD"     # records and cc-slack's marks both under $T: never the box's own
+CH=C0TEST0001; RT=1700000000.000100
+hook(){ pay "${2:-}" | ( cd ~/.cc/worktrees/$REPO/w1 && env CC_OWED_RECORDS="$OWD" CC_SLACK_DIR="$SLD" ${1:+env $1} "$B/cc-checkpoint" ); }
+cat >> "$PD/$sid.jsonl" <<EOF
+{"type":"user","timestamp":"2026-01-01T01:00:00Z","message":{"role":"user","content":"<channel source=\"cc-slack\" chat_id=\"$CH\" thread_ts=\"$RT\" ts=\"$RT\" user=\"Owner\" role=\"owner\" channel=\"#one\" target=\"one\">\ndid it land\n</channel>"}}
+EOF
+o1=$(hook)
+{ grep -q 'OWED' <<<"$o1" && grep -q "$CH" <<<"$o1" && grep -q 'did it land' <<<"$o1"; } \
+  && ok "a message nothing answered is said back to the session, with the call that pays it" || bad "no owed decision: $o1"
+[ -z "$(hook)" ] && ok "it is said once, not every turn" || bad "the session was told twice: $(hook)"
+"$B/cc-owed" --transcript "$PD/$sid.jsonl" >/dev/null 2>&1; [ $? = 1 ] \
+  && ok "a debt is an exit code too, for anything that asks" || bad "cc-owed --transcript did not report the debt"
+rm -f "$T/ctx/$sid.json" "$OWD/$sid.json"    # both hooks fresh: one decision must carry both, owed first
+o2=$(hook "$CTXP CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2" ',"background_tasks":[{"id":"x"}]')
+{ grep -q 'OWED' <<<"$o2" && grep -q 'CONTEXT 10%' <<<"$o2" && [ "$(grep -c decision <<<"$o2")" = 1 ]; } \
+  && ok "the context line and the debt arrive as ONE decision, the debt first" || bad "hooks did not merge: $o2"
+python3 - "$SLD/marks.json" "$CH:$RT:white_check_mark" <<'PY'   # cc-slack's own file, written here as it writes it
+import json, sys
+json.dump({sys.argv[2]: 9999999999.0}, open(sys.argv[1], "w"))
+PY
+rm -f "$OWD/$sid.json"
+[ -z "$(hook)" ] && ok "a ✅ the session put on the thread settles it — cc-slack's marks are read, not recomputed" \
+  || bad "a done thread was still owed: $(hook)"
+rm -f "$SLD/marks.json" "$OWD/$sid.json"
+cat >> "$PD/$sid.jsonl" <<EOF
+{"type":"assistant","timestamp":"2026-01-01T01:01:00Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__cc-slack__reply","input":{"chat_id":"$CH","thread_ts":"$RT","ts":"$RT","text":"it landed"}}]}}
+EOF
+[ -z "$(hook)" ] && ok "a word in that thread ends the debt" || bad "answered thread still owed: $(hook)"
+[ "$(env CC_OWED_RECORDS="$OWD" "$B/cc-owed" --ledger | wc -l)" = 2 ] \
+  && ok "every debt said is one countable line on the ledger" || bad "ledger: $(env CC_OWED_RECORDS="$OWD" "$B/cc-owed" --ledger)"
 unset CC_CTX_BOX_MODEL
 
 echo "== guard =="
