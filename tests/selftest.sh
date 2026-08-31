@@ -275,6 +275,60 @@ git -C "$T/remote.git" log --oneline track/w1 2>/dev/null | grep -q 'wip: checkp
 for _ in $(seq 1 30); do tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && break; sleep 1; done   # cc-loop writes it from its tmux window, a beat after DONE
 tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && ok "owner notified on DONE (log backend)" || bad "notify"
 st=$("$B/cc-board" get $REPO w1 status); [ "$st" = review ] && ok "board -> review after done (PR skipped: no gh remote)" || bad "board status after done: $st"
+
+echo "== --go is a covering note, never a replacement for the brief (#71) =="
+# #71 stopped `--go "text"` overwriting task.md — but it then synced the BOARD from that file, so a brief that
+# lived ONLY on the board (`cc board add`, the route sp_main tells every planning session to use) was still
+# destroyed on both sides. That is how the same bug reached a fourth track on 2026-08-31: a 4590-byte brief
+# became one 138-byte sentence, on the board as well as in task.md. These pin every side of it.
+godisp(){ "$B/cc" $REPO "$1" --go "$2" >/dev/null 2>&1; sleep 1
+  for id in $(wins "$REPO/$1"); do tmux kill-window -t "$id"; done
+  for _ in 1 2 3 4 5; do [ -z "$(wins "$REPO/$1")" ] && break; sleep 1; done; }
+BRIEF=$(printf 'BRIEF HEAD: the carefully written plan.\n%s\nBRIEF TAIL: the last item.' "$(for i in $(seq 1 60); do echo "brief detail line $i"; done)")
+
+# THE #71 REGRESSION CASE: the brief is on the board and task.md does not exist yet — the exact live shape.
+"$B/cc-board" add $REPO g1 "g1" "$BRIEF" >/dev/null
+godisp g1 "Work the board brief in full."
+tm=~/.cc/state/$REPO/g1/task.md; bi=$("$B/cc-board" get $REPO g1 instructions)
+{ grep -q 'BRIEF HEAD' "$tm" && grep -q 'BRIEF TAIL' "$tm" && grep -q 'Work the board brief in full.' "$tm"; } \
+  && ok "#71: --go on a board-only brief keeps the WHOLE brief in task.md and adds the note" \
+  || bad "#71: task.md is $(wc -c < "$tm" 2>/dev/null) bytes, first line: $(head -1 "$tm" 2>/dev/null)"
+{ grep -q 'BRIEF HEAD' <<<"$bi" && grep -q 'BRIEF TAIL' <<<"$bi" && grep -q 'Work the board brief in full.' <<<"$bi"; } \
+  && ok "#71: the board's instructions still hold the brief (they used to be cut to the one-line note)" \
+  || bad "#71: board instructions cut to $(wc -c <<<"$bi") bytes"
+[ "$(head -1 "$tm")" = "Work the board brief in full." ] \
+  && ok "#71: the --go note sits ABOVE the brief, so the worker reads it first" || bad "note is not line 1: $(head -1 "$tm")"
+
+# Re-dispatch must be idempotent, and `--go ""` must move nothing at all.
+b0=$(cat "$tm"); i0=$("$B/cc-board" get $REPO g1 instructions)
+godisp g1 "Work the board brief in full."
+[ "$(cat "$tm")" = "$b0" ] && ok "re-dispatching with the same note stacks nothing up" || bad "the same note was added twice"
+godisp g1 ""
+{ [ "$(cat "$tm")" = "$b0" ] && [ "$("$B/cc-board" get $REPO g1 instructions)" = "$i0" ]; } \
+  && ok '--go "" re-dispatches and changes neither task.md nor the board' || bad '--go "" moved task.md or the board'
+
+# The half #71 did fix: brief in task.md, nothing on the board.
+mkdir -p ~/.cc/state/$REPO/g2; printf '%s\n' "$BRIEF" > ~/.cc/state/$REPO/g2/task.md
+godisp g2 "the covering note"
+tm2=~/.cc/state/$REPO/g2/task.md
+{ grep -q 'BRIEF HEAD' "$tm2" && grep -q 'BRIEF TAIL' "$tm2" && [ "$(head -1 "$tm2")" = "the covering note" ]; } \
+  && ok "brief in task.md only: the note goes above it and the brief survives" || bad "file-only brief: $(head -1 "$tm2")"
+
+# Both sides hold something different: the dispatch merges, it does not pick one and drop the other.
+mkdir -p ~/.cc/state/$REPO/g3; printf 'a line somebody left in the file\n' > ~/.cc/state/$REPO/g3/task.md
+"$B/cc-board" add $REPO g3 "g3" "$BRIEF" >/dev/null
+godisp g3 "dispatch note"
+tm3=~/.cc/state/$REPO/g3/task.md
+{ grep -q 'BRIEF HEAD' "$tm3" && grep -q 'a line somebody left in the file' "$tm3" && grep -q 'dispatch note' "$tm3"; } \
+  && ok "board brief and a different task.md: both are kept, neither is overwritten" || bad "merge dropped a side: $(wc -c < "$tm3") bytes"
+
+# No brief anywhere: --go still works, and the note becomes the task on both sides.
+godisp g4 "just do this one thing"
+tm4=~/.cc/state/$REPO/g4/task.md
+[ "$(cat "$tm4" 2>/dev/null)" = "just do this one thing" ] \
+  && ok "--go on a track with no brief still works (the note becomes the task)" || bad "no-brief task.md: $(cat "$tm4" 2>/dev/null)"
+[ "$("$B/cc-board" get $REPO g4 instructions)" = "just do this one thing" ] \
+  && ok "--go on a track with no brief puts the note on the board too" || bad "no-brief board: $("$B/cc-board" get $REPO g4 instructions)"
 # P1-P4: one branch, one PR. The loop calls `cc done` when the worker writes STATUS: DONE and a session calls it when it
 # finishes by hand; a squash-merge deletes the branch, so the late caller saw nothing OPEN and opened a duplicate of commits
 # GitHub had already merged (#24/#25 and #29/#30 — same headRefOid). The stub gh never prints a URL from `pr create`, so

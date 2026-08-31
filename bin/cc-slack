@@ -79,19 +79,25 @@ HOME = os.path.expanduser("~")
 CFG = f"{HOME}/.cc/config"
 DIR = os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack")
 SOCK = f"{DIR}/sock"
-BIN = os.path.dirname(os.path.realpath(__file__))    # helpers come from the same bin/ as this copy (like `cc`)
+SELF_LINK = os.path.abspath(__file__)                # how this copy was invoked — usually the ~/bin symlink
+SELF = os.path.realpath(SELF_LINK)                   # …and where that points: the file a deploy actually rewrites
+SELF_MTIME = os.path.getmtime(SELF)                  # what it was when this process started (see Channel.stale)
+BIN = os.path.dirname(SELF)                          # helpers come from the same bin/ as this copy (like `cc`)
 ROOT = os.path.dirname(BIN)                          # the core tree: slack/app-manifest.json lives here
 DEV = f"{HOME}/dev"
 BOX = os.environ.get("CC_BOX") or socket.gethostname().split(".")[0]   # this box's name: it signs every post
 CTL = BOX                                            # the box's control repo = the one this copy lives in
-if os.path.realpath(__file__).startswith(DEV + os.sep):
-    CTL = os.path.realpath(__file__)[len(DEV) + 1:].split(os.sep)[0]
+if SELF.startswith(DEV + os.sep):
+    CTL = SELF[len(DEV) + 1:].split(os.sep)[0]
 VERSION = "0.1"
 PERM_RE = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$", re.I)
 SENT_USING_RE = re.compile(r"\s*\*Sent using\*\s+\S+\s*$")     # claude.ai's Slack connector signs every message it sends
 CHUNK = 3900
 APPROVALS = "approvals"                                        # #approvals is not a session: the owner's :+1: on a bot post there merges the PR
 MERGE_RECHECK, MERGE_RECHECK_EVERY = 6, 2.0                    # "Merge already in progress": re-read the PR for ~12 s before calling it a failure
+LAND_COSMETIC = 3                                              # cc-land's "the box is deployed, its bookkeeping is not"
+REEXEC = "CC_SLACK_REEXEC"                                     # set on a re-exec'd channel server: the host initialised the copy before it
+GIT_WORK = threading.Lock()                                    # cc-land pulls and cc-publish fetches in the SAME checkout: one at a time
 ALERTS = "alerts"                                              # #alerts is not a session: machinery notices (boot, limits, audits, digest) land there
 ALERT_KINDS = ("boot", "limit", "audit", "review", "digest", "alerts", "cc-rc", "heartbeat", "power")   # "<box> <kind>" notify titles → #alerts even when the box shares its name with a repo
 NUDGE_PREFIXES = ("❓ still waiting", "⏳ no answer", "🔴 still open")   # our own nudge posts (v1's too): never an answer
@@ -2647,6 +2653,7 @@ class Daemon:
             self.mark_merged(repo, n)                      # the board still said "review": a 👍-merge is the end of that track
         if ok and "auto-merge armed" not in out:
             self.publish_soon(repo)                        # the default branch moved: mirror the published prefix (no-op unless this repo has one)
+            self.land_soon(repo, n, chat, ts)              # …and the box still owes the merge its deploy: cc-land, off this thread
         if not ok and not done:
             self.mark_pr(repo, n, "blocked", f"merge FAILED (PR #{n}): {last[:120]}")   # the board/Home show it, not just the thread
             self.merge_failed(repo, n, last, msg.get("text") or "")
@@ -2695,6 +2702,54 @@ class Daemon:
     def mark_merged(self, repo, n, run=subprocess.run):
         self.mark_pr(repo, n, "merged", f"merged via 👍 (PR #{n})", run=run)
 
+    def land(self, repo, n, chat, ts, run=subprocess.run):
+        """Everything a merge still owes the box — the #approvals card, the board row, the ask ledger, install.sh,
+        daemon-reload, the units the change ADDED (they land switched off), a restart of whatever moved — is
+        cc-land's sequence, and there is exactly ONE copy of it. The 👍 path used to run none of it, so it only ever
+        ran when a session remembered to type it: on 2026-08-31 thirteen ledger rows still read `open` under tracks
+        that had all merged, and three units sat switched off for an hour after landing. The PR is already in by
+        the time this runs, so cc-land skips its gates — what is left is the deploy and the bookkeeping.
+        Its exit says what happened: 0 all of it · 3 the box is deployed but a cosmetic step wants a hand, which is
+        the thread's business · anything else means the box may be WRONG, which is the owner's.
+        A change to this very file ends in `systemctl restart cc-slackd`, which kills this thread mid-sentence —
+        that is the deploy working, and the restart is the last step, so nothing is left half-done by it."""
+        with GIT_WORK:
+            try:
+                r = run([f"{BIN}/cc-land", repo, str(n)], capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL)
+                rc, out = r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+            except Exception as e:
+                rc, out = 1, f"{e.__class__.__name__}: {e}"
+        tail = "\n".join(out.splitlines()[-14:]) or "(no output)"
+        log(f"land [{repo}] PR #{n}: exit {rc}: {out.splitlines()[-1] if out else ''}")
+        if rc == 0:
+            return None                       # the merge reply already said it landed; saying it twice is noise
+        if rc == LAND_COSMETIC:
+            self.say(chat, f"[{repo}] PR #{n}: deployed — its bookkeeping did not all go through:\n```\n{tail}\n```", ts)
+            return None
+        self.say(chat, f"[{repo}] PR #{n}: merged, but the after-merge sequence STOPPED ❌\n```\n{tail}\n```", ts)
+        self.land_failed(repo, n, tail)
+        return None
+
+    def land_failed(self, repo, n, tail):
+        """A deploy that stopped halfway leaves the box wrong, and no session reads #approvals — so this goes the same
+        way a failed merge does: to the owner, and to the repo's own planning session."""
+        try:
+            subprocess.run([f"{BIN}/cc-notify", "-p", "high", "-t", f"[{repo}] PR #{n} merged, deploy stopped",
+                            tail.splitlines()[-1][:300] if tail else "no output"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            log(f"cc-notify failed: {e}")
+        meta = {"chat_id": "local", "thread_ts": "", "ts": str(time.time()), "user": "approvals", "role": "owner",
+                "channel": "#" + APPROVALS, "target": repo}
+        self.deliver(repo, {"type": "message", "meta": meta,
+                            "content": f"PR #{n} merged, but the after-merge sequence stopped:\n{tail[-600:]}\n"
+                                       f"Fix that, then re-run it — every step already done is a no-op the second time."})
+
+    def land_soon(self, repo, n, chat, ts):
+        """Off the reaction path, like publish_soon: install.sh, a daemon-reload and a restart take minutes, and the
+        merge reply must not wait for them. The merge has already happened, so nothing in here can undo it."""
+        threading.Thread(target=self._safe, args=(self.land, repo, n, chat, ts), daemon=True).start()
+
     def publish(self, repo, run=subprocess.run):
         """core/ publishes itself: a merge landed on the default branch, so the published prefix goes to its own public
         repo. Scoped to the single repo that has one (PUBLISH_REPO in ~/.cc/config) and a no-op on a box that configured
@@ -2702,12 +2757,13 @@ class Daemon:
         and an abort reaches the OWNER through cc-notify — this log line is only for the daemon's own trail."""
         if not repo or (self.cfg.get("PUBLISH_REPO") or "") != repo:
             return None
-        try:
-            r = run([f"{BIN}/cc-publish"], capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
-            out = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
-            log(f"publish [{repo}]: {out[-1] if out else '(nothing to do)'}")
-        except Exception as e:
-            log(f"publish [{repo}]: {e!r}")
+        with GIT_WORK:      # cc-land is pulling the same checkout on its own thread; two git jobs there race index.lock
+            try:
+                r = run([f"{BIN}/cc-publish"], capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+                out = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+                log(f"publish [{repo}]: {out[-1] if out else '(nothing to do)'}")
+            except Exception as e:
+                log(f"publish [{repo}]: {e!r}")
         return None
 
     def publish_soon(self, repo):
@@ -3951,6 +4007,9 @@ class Channel:
         loop = self.loop = self.aio.get_running_loop()
         reader = self.aio.StreamReader()
         await loop.connect_read_pipe(lambda: self.aio.StreamReaderProtocol(reader), sys.stdin.buffer)
+        if os.environ.get(REEXEC) and not self.link_started:
+            self.link_started = True                        # a re-exec lands mid-session: the host initialised the copy
+            self.aio.create_task(self._link_when_ready())   # before us and never says so twice, so the link starts itself
         while True:
             line = await reader.readline()
             if not line:
@@ -3963,7 +4022,38 @@ class Channel:
                 await self.handle(msg)
             except Exception as e:
                 log(f"channel error: {e!r}")
+            if self.should_reexec(msg.get("method")):
+                self.reexec()
         os._exit(0)
+
+    # ── running the code that is deployed, not the code we started with ──────────────────────────────────
+    def stale(self):
+        """Has this file been replaced under us? A session's channel server is a child of that session's own
+        `claude` and keeps the bytes it started with for the session's whole life — so install.sh plus a
+        `systemctl restart cc-slackd` updates the daemon and silently un-deploys every cc-slack change for every
+        session already open. On 2026-08-31 a retired session posted into a channel 45 s after its cutover: the
+        mute that would have refused it had been deployed hours earlier, into a file that process no longer read."""
+        try:
+            now = os.path.realpath(SELF_LINK)   # the ~/bin symlink may point somewhere new since we started
+            return now != SELF or os.path.getmtime(now) != SELF_MTIME
+        except OSError:
+            return False                        # mid-install the file can be briefly absent: ask again next time
+
+    def should_reexec(self, method):
+        """Only between requests, and only after a tools/call: there the host has our answer and is waiting on
+        nothing, so becoming a new process loses nothing. During the handshake it would drop a message the host
+        sends exactly once — and that message is what subscribes this session to Slack."""
+        return method == "tools/call" and self.stale()
+
+    def reexec(self):
+        """Same pid, same stdin and stdout: a stdio server can step into the deployed copy without the host
+        noticing. Cheap enough to need no machinery — no version negotiation, no state to carry, no restart."""
+        log(f"channel: {SELF_LINK} was redeployed — re-exec into it")
+        try:
+            sys.stdout.buffer.flush()
+            os.execve(sys.executable, [sys.executable, SELF_LINK] + sys.argv[1:], {**os.environ, REEXEC: "1"})
+        except Exception as e:
+            log(f"channel: re-exec failed ({e!r}) — carrying on with the code we have")
 
     async def handle(self, msg):
         m, id_, p = msg.get("method"), msg.get("id"), msg.get("params") or {}
@@ -7055,6 +7145,60 @@ def cmd_selfcheck():
         globals()["react"] = _reactMM
     check("a 👍-merge that LANDED publishes core/ (auto-merge merely armed, or a merge that failed, publishes nothing)",
           pub == [nameMM])
+    # …and the merge OWES the box a deploy: the 👍 path runs the same sequence a session would have typed
+    dmL = Daemon(use_slack=False); dmL.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmL.bot_user = "UBOT"
+    landedL, saidL = [], []
+    dmL.mark_pr = lambda *a, **k: None; dmL.publish_soon = lambda r: None
+    dmL.say = lambda chat, text, ts=None, **k: saidL.append(text)
+    dmL.fetch_message = lambda chat, ts: {"user": "UBOT", "text": f"[{nameMM}] PR #7: t — https://x/7"}
+    dmL.land_soon = lambda repo, n, chat, ts: landedL.append((repo, n, chat, ts))
+    globals()["react"] = lambda *a, **k: None
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmL.merge = lambda repo, n: (True, "merged")
+            dmL.on_approval("CAPPR", "1.1", "+1")
+            dmL.merge = lambda repo, n: (True, "not mergeable yet — auto-merge armed: …")
+            dmL.on_approval("CAPPR", "1.1", "+1")
+    finally:
+        globals()["react"] = _reactMM
+    check("a 👍-merge runs the whole after-merge sequence off the reaction thread — the #approvals card, the board, "
+          "the ask ledger, install.sh, the units it added and the restarts; an armed auto-merge runs none of it yet",
+          landedL == [(nameMM, "7", "CAPPR", "1.1")])
+    runsL, saidL[:] = [], []
+    class _RL:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+    def land_run(rc, out):
+        return lambda a, **k: (runsL.append(a), _RL(rc, out))[1]
+    dmL.land(nameMM, "7", "CAPPR", "1.1", run=land_run(0, "landed."))
+    quiet = len(runsL) == 1 and runsL[0][0].endswith("cc-land") and runsL[0][1:] == [nameMM, "7"] and saidL == []
+    dmL.land(nameMM, "7", "CAPPR", "1.1", run=land_run(LAND_COSMETIC, "  ✗ card: message_not_found\nlanded — the box is deployed"))
+    failedL = []; dmL.land_failed = lambda *a: failedL.append(a)
+    dmL.land(nameMM, "7", "CAPPR", "1.1", run=land_run(1, "  ✗ install: install.sh: boom"))
+    check("that sequence IS cc-land — one copy of it, called with the repo and the PR — and a clean run says nothing "
+          "more in the thread (the merge reply already did)", quiet)
+    check("a cosmetic step failing there is reported in the thread and stops nothing; a step that leaves the box "
+          "WRONG also reaches the owner",
+          len(saidL) == 2 and "deployed" in saidL[0] and "STOPPED" in saidL[1] and len(failedL) == 1)
+    # the channel server runs the code that is DEPLOYED, not the code it started with
+    fR = tempfile.NamedTemporaryFile("w", delete=False, suffix="-cc-slack"); fR.write("x"); fR.close()
+    _slR, _sR, _smR = SELF_LINK, SELF, SELF_MTIME
+    globals().update(SELF_LINK=fR.name, SELF=os.path.realpath(fR.name), SELF_MTIME=os.path.getmtime(fR.name))
+    try:
+        chR = Channel("box")
+        untouched = chR.should_reexec("tools/call")
+        os.utime(fR.name, (0, 0))
+        movedR, midR = chR.should_reexec("tools/call"), chR.should_reexec("initialize")
+        os.unlink(fR.name)
+        goneR = chR.stale()
+    finally:
+        globals().update(SELF_LINK=_slR, SELF=_sR, SELF_MTIME=_smR)
+    check("a session's channel server re-execs once its own file has been redeployed under it, and not while the "
+          "file is unchanged — otherwise every cc-slack fix stays inert in every session already open",
+          movedR and not untouched)
+    check("…and only between requests, after a tools/call: mid-handshake it would drop the one message that "
+          "subscribes the session to Slack", not midR)
+    check("a file that is briefly absent mid-install is not a redeploy — it is asked again next time", not goneR)
     dmPB = Daemon(use_slack=False); dmPB.cfg = {"PUBLISH_REPO": "ctl"}
     ran = []
     def pb_run(a, **k):

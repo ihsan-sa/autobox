@@ -7,6 +7,7 @@
 #   cc <repo> <track> --go "instruction" [--loop N] [--budget USD] [--model M]
 #                             autonomous headless worker (ralph loop via cc-loop) on that track; ends with a PR
 #                             --go "" re-dispatches the task.md already there (e.g. after answering a BLOCKED)
+#                             the instruction is a covering note ADDED ABOVE any existing brief, never over it
 #   cc <repo> <track> --say "text"           type text into that track's running interactive session
 #   cc <repo> --orch <alias> ["brief"]       peer orchestrator session, its own Slack channel (archived when it exits)
 #   cc handoff <repo> <track> [--over [PCT]]  ask the running session to journal a handoff, then restart it with
@@ -265,12 +266,24 @@ while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; s
 case "$mode" in
   say) have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
   go)  if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
-       # APPEND, never overwrite: the board task is the brief, and `--go "…"` is one more instruction on top of it.
-       # It used to replace both, so dispatching a track that already had a brief silently destroyed it — three
-       # workers ran on a one-line prompt on 2026-08-31 before anyone noticed the briefs were gone.
+       # The brief is ONE thing kept in TWO places: the board's `instructions` and $st/task.md. `cc board add`
+       # writes only the board; a person or a worker may write only the file. So RECONCILE both before dispatch,
+       # then treat `--go "…"` as a covering note ON TOP of the brief — never a replacement for it. Replacing a
+       # brief is an explicit act (`cc board set … instructions`), never a side effect of dispatching.
+       # #71 fixed only half of this: it guarded task.md but still pushed the file OVER the board, so a
+       # board-only brief — the normal `cc board add` route — was destroyed on both sides a fourth time
+       # (2026-08-31, cc-land-fixes: 4590 bytes became one sentence). Regression test: "the #71 case" in selftest.sh.
+       binstr=$("$BOARD" get "$repo" "$track" instructions 2>/dev/null)
+       if [ -n "$binstr" ]; then   # whichever side holds the brief, keep it: seed an empty file, merge a board brief the file has not got
+         if [ ! -s "$st/task.md" ]; then printf '%s\n' "$binstr" > "$st/task.md"
+         else case "$(cat "$st/task.md")" in *"$binstr"*) ;; *) printf '\n%s\n' "$binstr" >> "$st/task.md";; esac; fi
+       fi
        if [ -n "$text" ]; then
-         if [ -s "$st/task.md" ] && ! grep -qxF "$text" "$st/task.md"; then printf '\n%s\n' "$text" >> "$st/task.md"
-         elif [ ! -s "$st/task.md" ]; then printf '%s\n' "$text" > "$st/task.md"; fi
+         case "$(cat "$st/task.md" 2>/dev/null)" in
+           *"$text"*) ;;   # a re-dispatch repeating the same note: don't stack it up
+           *) { printf '%s\n' "$text"; if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } > "$st/task.md.tmp"
+              mv "$st/task.md.tmp" "$st/task.md" ;;
+         esac
          "$BOARD" set "$repo" "$track" instructions "$(cat "$st/task.md")"
        else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi
        for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree

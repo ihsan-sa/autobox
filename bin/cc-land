@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cc-land — one command lands a change, so that none of it has to be remembered.
 
-  cc-land <repo> <pr-number>                      the PR path
+  cc-land <repo> <pr-number> [<pr-number> …]      the PR path; several PRs deploy once, at the end
   cc-land <repo> --track <t> --note "<what>"      work with no PR (a config edit, a host change)
   cc-land selfcheck                               the decision table; no network, no systemctl
 
@@ -24,10 +24,17 @@ WHAT IT WILL NOT DO, and why each line is here:
 
 A step that cannot run because the box has no such thing (Slack not set up, no board row, no ledger row) is a
 SKIP: it reports and the sequence carries on. A step that was asked to do something and could not is a
-FAILURE and stops the sequence. Re-running is the recovery, and is safe: an already-merged PR, an existing
-card, a settled ledger row and a unit that is already on are each "nothing to do".
+FAILURE — and what a failure MEANS depends on the step. A failure that would leave the box WRONG (a red gate,
+a merge that did not happen, install.sh, a unit, a restart) stops everything: there is no point deploying on
+top of a merge that never landed. A failure in the BOOKKEEPING — the #approvals card, the board row, the ask
+ledger — is cosmetic, so it is reported and the sequence carries ON. A card somebody had deleted while tidying
+duplicates once stopped a landing before install.sh, which left the box half-deployed and the operator having
+to know which half: that is the remembering this tool exists to remove, put back in a worse place.
+Re-running is the recovery, and is safe: an already-merged PR, an existing card, a settled ledger row and a
+unit that is already on are each "nothing to do".
 
-Exit: 0 landed · 1 a step failed (nothing after it ran) · 2 usage.
+Exit: 0 landed · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a cosmetic step
+wants a hand · 2 usage.
 """
 import glob, json, os, re, shutil, subprocess, sys, tempfile, urllib.parse, urllib.request
 
@@ -44,6 +51,11 @@ FAILED_RE = re.compile(r"(\d+) failed")   # a suite ending "0 failed" passed; "1
 NEVER = "tmux-main.service"               # restarting it takes the shared tmux server — every session on the box — down
 CARD = "ok_hand"                          # the mark for "landed". The daemon puts ✅ on a PR the owner merged with a 👍;
                                           # keeping them apart is what tells "I merged this" from "you approved this"
+# The steps a failure of which leaves the BOX wrong, so nothing after them may run. Everything else — card,
+# board, ledger — is a record of what happened, not the thing that happened: it reports ✗, the sequence carries
+# on, and the run exits 3 so the operator still knows one of them wants a hand.
+FATAL = ("gates", "merge", "install", "units", "restart")
+COSMETIC = 3                              # exit code for "the box is right, its bookkeeping is not"
 
 
 class Failed(Exception):
@@ -134,6 +146,7 @@ class Land:
     def __init__(self, repo, pr=None, track=None, note=""):
         self.repo, self.pr, self.track, self.note = repo, pr, track, note
         self.root = repo_root(repo)
+        self.hurt = []           # cosmetic steps that failed: reported, not fatal, named again at the end
         self.facts = {}          # what GitHub says about the PR
         self.changed = None      # [(status, path)] this landing makes; worked out once, when it is first needed
         self.head = ""           # the PR head as a SHA — never "FETCH_HEAD", which the pull below overwrites
@@ -147,8 +160,13 @@ class Land:
 
     # -- 1. gates ------------------------------------------------------------------------------------------
     def gates(self):
+        """Gate BEFORE merging, never after. Once a PR is in, the gates guard nothing — the change is on the default
+        branch whatever they say — and running them anyway cost a three-PR landing five minutes of suite it could
+        not act on. The no-PR path still gates: there the checkout IS what is about to be deployed."""
+        if self.pr and self.facts.get("state") == "MERGED":
+            raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
         tree, tmp = self.root, None
-        if self.pr and self.facts.get("state") != "MERGED":
+        if self.pr:
             if self.facts.get("mergeable") == "CONFLICTING":
                 raise Failed(f"PR #{self.pr} conflicts with {self.base()} — rebase it, then land it")
             rc, o = sh(["git", "fetch", "-q", "origin", f"pull/{self.pr}/head"], cwd=self.root, timeout=300)
@@ -212,21 +230,31 @@ class Land:
     # -- 3. the #approvals card, and the mark on it --------------------------------------------------------
     def card(self):
         """post-approval already IS "find this PR's card, post one only if there is none" — so call it and mark
-        whatever it hands back. Posting a second card is the bug that put three of them in the channel."""
+        whatever it hands back. Posting a second card is the bug that put three of them in the channel; posting
+        NO card is the bug that stopped a whole landing dead. So one card, and if Slack says that card is gone
+        (somebody deleted it while tidying those duplicates) it is re-posted with --force and marked instead."""
         if not self.pr:
             raise Skip("no PR — no card to place")
-        rc, o = sh([f"{BIN}/cc-slack", "post-approval", self.repo, str(self.pr)], timeout=120)
+        ts, tok, chat = self.post_card(), bot_token(), self.approvals_channel()
+        if not (ts and tok and chat):
+            raise Skip("no #approvals channel the bot is in — the card is unmarked")
+        r = slack("reactions.add", tok, channel=chat, timestamp=ts, name=CARD)
+        again = ""
+        if r.get("error") == "message_not_found":
+            again, ts = " (the card it found had been deleted — re-posted)", self.post_card(force=True)
+            r = slack("reactions.add", tok, channel=chat, timestamp=ts, name=CARD)
+        if not r.get("ok") and r.get("error") != "already_reacted":
+            raise Failed(f"reactions.add on the card for PR #{self.pr}: {r.get('error')}")
+        return f"#approvals: the one card for PR #{self.pr} marked :{CARD}:{again}"
+
+    def post_card(self, force=False):
+        argv = [f"{BIN}/cc-slack", "post-approval"] + (["--force"] if force else []) + [self.repo, str(self.pr)]
+        rc, o = sh(argv, timeout=120)
         if rc == 3:
             raise Skip("Slack is not set up on this box — no card")
         if rc:
             raise Failed(f"cc-slack post-approval: {last(o)}")
-        ts, tok, chat = last(o), bot_token(), self.approvals_channel()
-        if not (ts and tok and chat):
-            raise Skip("no #approvals channel the bot is in — the card is unmarked")
-        r = slack("reactions.add", tok, channel=chat, timestamp=ts, name=CARD)
-        if not r.get("ok") and r.get("error") != "already_reacted":
-            raise Failed(f"reactions.add on the card for PR #{self.pr}: {r.get('error')}")
-        return f"#approvals: the one card for PR #{self.pr} marked :{CARD}:"
+        return last(o)
 
     def approvals_channel(self):
         """cc-slack owns which channel that is, and prints it — asking beats keeping a second copy of the answer."""
@@ -368,38 +396,90 @@ class Land:
             raise Skip("nothing running uses the files this change touched" + tail)
         return f"restarted: {', '.join(self.restarted)}{tail}"
 
-    def steps(self):
-        return [("gates", self.gates), ("merge", self.merge), ("card", self.card), ("board", self.close_board),
-                ("ledger", self.close_ledger), ("install", self.install), ("units", self.enable_units),
-                ("restart", self.restart)]
+    # -- the sequence, in two halves ------------------------------------------------------------------------
+    def pr_steps(self):
+        """About THIS change: gate it, merge it, and record that it landed."""
+        return [("gates", self.gates), ("merge", self.merge), ("card", self.card),
+                ("board", self.close_board), ("ledger", self.close_ledger)]
 
-    def run(self):
-        if self.pr:
-            rc, o = sh(["gh", "pr", "view", str(self.pr), "--json",
-                        "title,url,state,mergeable,headRefName,mergeCommit"], cwd=self.root, timeout=120)
-            if rc:
-                print(f"cc-land: cannot read PR #{self.pr} in {self.root}: {last(o)}", file=sys.stderr)
-                return 1
-            try:
-                self.facts = json.loads(o)
-            except ValueError:
-                print(f"cc-land: gh returned no PR #{self.pr}", file=sys.stderr)
-                return 1
-            print(f"landing [{self.repo}] PR #{self.pr}: {self.facts.get('title', '')}")
-        else:
+    def deploy_steps(self):
+        """About the BOX: they do the same thing whether one change landed or three, which is what lets a batch
+        run them once at the end instead of once per PR."""
+        return [("install", self.install), ("units", self.enable_units), ("restart", self.restart)]
+
+    def steps(self):
+        return self.pr_steps() + self.deploy_steps()
+
+    def load(self):
+        """What GitHub says about the PR, read once, before anything runs."""
+        if not self.pr:
             print(f"landing [{self.repo}] {self.track}: {self.note}")
-        for name, fn in self.steps():
+            return True
+        rc, o = sh(["gh", "pr", "view", str(self.pr), "--json",
+                    "title,url,state,mergeable,headRefName,mergeCommit"], cwd=self.root, timeout=120)
+        if rc:
+            print(f"cc-land: cannot read PR #{self.pr} in {self.root}: {last(o)}", file=sys.stderr)
+            return False
+        try:
+            self.facts = json.loads(o)
+        except ValueError:
+            print(f"cc-land: gh returned no PR #{self.pr}", file=sys.stderr)
+            return False
+        print(f"landing [{self.repo}] PR #{self.pr}: {self.facts.get('title', '')}")
+        return True
+
+    def walk(self, steps):
+        """0 all well · 1 a step the box depends on failed and nothing after it ran · COSMETIC only bookkeeping did."""
+        for name, fn in steps:
             try:
                 out("✓", fn())
             except Skip as e:
                 out("·", str(e))
             except Failed as e:
                 out("✗", f"{name}: {e}")
-                print("cc-land: STOPPED there — nothing after it ran. Fix that and re-run the same command: "
-                      "every step already done is a no-op the second time.", file=sys.stderr)
-                return 1
-        print("landed.")
-        return 0
+                if name in FATAL:
+                    print("cc-land: STOPPED there — nothing after it ran. Fix that and re-run the same command: "
+                          "every step already done is a no-op the second time.", file=sys.stderr)
+                    return 1
+                self.hurt.append(name)   # cosmetic: the box is right, so the rest of the sequence still runs
+        return COSMETIC if self.hurt else 0
+
+    def run(self):
+        if not self.load():
+            return 1
+        return self.done(self.walk(self.steps()))
+
+    def done(self, rc):
+        if rc == COSMETIC:
+            print(f"landed — the box is deployed, but {', '.join(self.hurt)} did not go through. Re-run the same "
+                  f"command to retry just those: everything else is a no-op the second time.")
+        elif rc == 0:
+            print("landed.")
+        return rc
+
+
+def run_batch(repo, prs):
+    """Several PRs, one deploy. Each is gated, merged and recorded on its own; install.sh, daemon-reload, the units
+    and the restarts then run ONCE over everything that landed — they do the same thing after the third PR as after
+    the first, and doing them per PR is most of what made landing three of them slow. A PR that fails fatally stops
+    the batch there, with nothing deployed: the ones before it are merged and can be re-run in one go."""
+    lands = []
+    for p in prs:
+        L = Land(repo, pr=p)
+        if not L.load():
+            return 1
+        if L.walk(L.pr_steps()) == 1:
+            print(f"cc-land: PR #{p} did not land — nothing was deployed for any of them. Fix that, then re-run "
+                  f"the same command.", file=sys.stderr)
+            return 1
+        lands.append(L)
+    print(f"deploying the {len(lands)} of them, once:")
+    deploy = lands[-1]
+    def everything():   # every file the batch put on the default branch — asked for LATE, because an already-merged
+        return [c for L in lands for c in Land.changed_files(L)]     # PR's squash commit is only here after the pull
+    deploy.changed_files = everything
+    deploy.hurt = [h for L in lands for h in L.hurt]
+    return deploy.done(deploy.walk(deploy.deploy_steps()))
 
 
 # ── selfcheck: the decision table, with the whole outside world stood in for ─────────────────────────────
@@ -420,16 +500,22 @@ def cmd_selfcheck():
     def ran(*words):
         return [c for c in calls if all(w in " ".join(c) for w in words)]
 
-    LINKED, BODY, BOARD = [[]], [{}], [{}]
-    globals().update(sh=fake_sh, bot_token=lambda: "xoxb-selfcheck",
-                     slack=lambda m, t, **kw: (reacted.append((m, kw.get("name"), kw.get("timestamp"))) or {"ok": True}),
+    LINKED, BODY, BOARD, errs = [[]], [{}], [{}], []   # errs: a case queues Slack errors for the next reactions.add
+
+    def fake_slack(method, token, **kw):
+        if errs:
+            return {"ok": False, "error": errs.pop(0)}
+        reacted.append((method, kw.get("name"), kw.get("timestamp")))
+        return {"ok": True}
+
+    globals().update(sh=fake_sh, bot_token=lambda: "xoxb-selfcheck", slack=fake_slack,
                      linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
                      board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland")
     FACTS = {"title": "a change", "state": "OPEN", "mergeable": "MERGEABLE",
              "headRefName": "track/w1", "mergeCommit": None}
 
     def fresh(**kw):
-        calls.clear(); reacted.clear(); world.clear()
+        calls.clear(); reacted.clear(); world.clear(); errs.clear()
         LINKED[0] = ["cc-new.service", "cc-slackd.service", NEVER]
         BODY[0] = {"cc-new.service": "[Service]\nExecStart=%h/bin/cc-new\n[Install]\nWantedBy=default.target\n",
                    "cc-new.timer": "[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n",
@@ -459,25 +545,53 @@ def cmd_selfcheck():
     check("a failing gate stops before install.sh and before any systemctl", not ran("install.sh") and not ran("systemctl"))
 
     # …and a gate's verdict is its own tally, not just its exit code (a suite can exit 0 and say "1 failed")
-    L = fresh(pr=7)
-    L.facts["state"] = "MERGED"
+    L = fresh(track="w1", note="a config edit")
     world["/tmp/_ccland/tests/check.sh"] = (0, "== result: 3 passed, 1 failed ==")
     real_access, os.access = os.access, lambda p, m: p.endswith("tests/check.sh")
     try:
         red = isinstance(caught(L.gates), Failed)
+        LM = fresh(pr=7); LM.facts["state"] = "MERGED"
+        merged_skips = caught(LM.gates)
     finally:
         os.access = real_access
     check("a gate that exits 0 but reports '1 failed' is a failure", red)
+    # gate BEFORE the merge, never after: three already-merged PRs meant three full suites, five minutes of a
+    # verdict nothing could act on — the change is on the default branch whatever the suite says
+    check("an already-merged PR runs no gate at all, and does not even fetch its head",
+          isinstance(merged_skips, Skip) and not ran("check.sh") and not ran("git", "fetch"))
 
     # 2. one card per PR: post-approval decides that, cc-land marks whatever it hands back
     L = fresh(pr=7)
     world[f"{BIN}/cc-slack post-approval"] = (0, "1788000000.000100\n")
     world[f"{BIN}/cc-slack status"] = (0, "approvals: #approvals C0APPROVE — a :+1: from anyone merges it\n")
     msg = L.card()
-    check("the card step calls post-approval once and never with --force (a second card is the duplicate bug)",
+    check("the card step calls post-approval once and, while the card is there, never with --force (a second card "
+          "is the duplicate bug)",
           len(ran("post-approval")) == 1 and "--force" not in " ".join(ran("post-approval")[0]))
     check("the card that came back is marked, by channel and timestamp",
           reacted == [("reactions.add", CARD, "1788000000.000100")] and CARD in msg)
+
+    # …and a card DELETED under us (tidying duplicates) is re-posted and marked — cosmetic, and it once stopped a
+    # whole landing before install.sh, leaving the operator to work out which half had run
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-slack post-approval"] = (0, "1788000000.000100\n")
+    world[f"{BIN}/cc-slack post-approval --force"] = (0, "1788000000.000900\n")
+    world[f"{BIN}/cc-slack status"] = (0, "approvals: #approvals C0APPROVE — a :+1: from anyone merges it\n")
+    errs.append("message_not_found")
+    msg = L.card()
+    check("a card that Slack says is gone is re-posted (--force) and the new one marked — the step succeeds",
+          len(ran("post-approval", "--force")) == 1 and reacted == [("reactions.add", CARD, "1788000000.000900")]
+          and "re-posted" in msg)
+
+    # 2b. a cosmetic step that fails anyway is reported, and everything after it still runs
+    L = fresh(pr=7)
+    world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+    L.card = lambda: (_ for _ in ()).throw(Failed("reactions.add: message_not_found"))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rc = L.run()
+    check("a card that cannot be placed does not halt the sequence: the board, the ledger and the deploy still run, "
+          "and the run ends 3 — 'the box is right, its bookkeeping is not'",
+          rc == COSMETIC and L.hurt == ["card"] and ran("cc-board", "status") and ran("git", "pull", "--ff-only"))
 
     # 3. Slack not being set up is a skip, not a failure: the merge has already happened
     L = fresh(pr=7)
@@ -517,6 +631,15 @@ def cmd_selfcheck():
     check("a re-run after the merge still knows what landed (the squash commit), so the deploy steps still work",
           L.changed_files() == [("A", "core/config/systemd-user/cc-new.service")])
 
+    # …and the ask ledger closes on the PR path too — that is what a 👍-merge, which reaches this through
+    # cc-slack, has to close: thirteen rows read `open` under merged tracks for want of somebody typing it
+    L = fresh(pr=7)
+    L.facts["state"] = "MERGED"
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a31", "status": "open"}]))
+    msg = L.close_ledger()
+    check("an already-merged PR still closes its track's open asks, against the PR itself",
+          "a31" in msg and ran("cc-scope", "verify", "myrepo", "a31", "PR #7 a change"))
+
     # 6. only what the change touched is restarted — and never the box's tmux server
     L = fresh(pr=7)
     L.changed = [("M", "core/bin/cc-slack")]
@@ -539,10 +662,27 @@ def cmd_selfcheck():
     check("no PR: the ledger row closes against the note the caller gave",
           "a24" in L.close_ledger() and ran("cc-scope", "verify", "myrepo", "a24", "settings edit outside the repo"))
 
-    # 8. the sequence itself
+    # 8. the sequence itself, and what each step's failure means
     check("the steps are the nine remembered ones, in that order",
           [n for n, _ in Land("myrepo", pr=1).steps()] ==
           ["gates", "merge", "card", "board", "ledger", "install", "units", "restart"])
+    check("the fatal steps are exactly the ones that leave the box wrong; card, board and ledger are not among them",
+          set(FATAL) == {n for n, _ in Land("myrepo", pr=1).steps()} - {"card", "board", "ledger"})
+
+    # 9. a batch: every PR merged on its own, the box deployed once at the end
+    fresh(pr=7)
+    world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rcB = run_batch("myrepo", [7, 8])
+    check("a batch gates and merges each PR, then pulls, installs and restarts ONCE — running the deploy per PR is "
+          "most of what made landing three of them slow",
+          rcB == 0 and len(ran("gh pr merge")) == 2 and len(ran("git", "pull", "--ff-only")) == 1)
+    fresh(pr=7)
+    world["gh pr merge 8"] = (1, "X could not merge")
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rcB = run_batch("myrepo", [7, 8])
+    check("a batch that cannot merge one of them deploys NOTHING: the box is never half of a landing",
+          rcB == 1 and not ran("git", "pull", "--ff-only"))
 
     print(f"cc-land selfcheck: {len(fails)} failed")
     return 1 if fails else 0
@@ -559,12 +699,16 @@ def main(argv):
         print(f"cc-land: '{repo}' is not a repo name", file=sys.stderr)
         return 2
     if re.fullmatch(r"[0-9]+", rest[0]):
-        if len(rest) > 1:
-            print("cc-land: the PR path takes nothing after the number", file=sys.stderr)
+        if not all(re.fullmatch(r"[0-9]+", a) for a in rest):
+            print("cc-land: the PR path takes PR numbers and nothing else", file=sys.stderr)
             return 2
-        land = Land(repo, pr=int(rest[0]))
+        prs = [int(a) for a in rest]
+        if len(prs) != len(set(prs)):
+            print("cc-land: the same PR twice", file=sys.stderr)
+            return 2
+        land = Land(repo, pr=prs[0])
     else:
-        track = note = ""
+        prs, track, note = [], "", ""
         while rest:
             a = rest.pop(0)
             if a == "--track" and rest:
@@ -582,7 +726,7 @@ def main(argv):
     if not os.path.isdir(f"{land.root}/.git"):
         print(f"cc-land: {land.root} is not a git repo", file=sys.stderr)
         return 2
-    return land.run()
+    return run_batch(repo, prs) if len(prs) > 1 else land.run()
 
 
 if __name__ == "__main__":
