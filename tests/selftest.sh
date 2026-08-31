@@ -314,6 +314,42 @@ w=$(tmux list-windows -t main -F '#{window_id} #W')
 [ "$(h "cc r t --go x" "$hz")" = 0 ] && ok "TONIGHT'S CASE: a COMPLETED handoff does not brick the session that won it (it still dispatches, PRs and pushes)" || bad "the survivor of a completed handoff is gated"
 [ "$(h "cc r t --go x" "no-such-record")" = 2 ] && ok "...while a record missing for any OTHER reason gates exactly as before" || bad "an unbacked CC_HANDOFF was let through"
 for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hz" '$2==r || $2==r"~next"{print $1}'); do tmux kill-window -t "$id"; done
+
+# THE SWEEP, on real windows. Every phase above is driven by a session's own Stop hook — which is exactly what
+# a session that CRASHED no longer has. On 2026-08-31 a retirement dying between the marker and the record
+# would have left the survivor gated with nothing left to reap it; the cc-reconcile timer is what reaps it now.
+tmux new-window -d -t main -n "$REPO/hs" -c "$T" "bash -c 'sleep 300; :'"
+CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hs" --session sid-pre-s >/dev/null 2>&1
+hs=$(jq -r .id "$T/handoff/$REPO--hs.json" 2>/dev/null); ss=$(jq -r .successor.tmux "$T/handoff/$REPO--hs.json" 2>/dev/null)
+"$B/cc-handoff" --sweep >/dev/null 2>&1
+[ -f "$T/handoff/$REPO--hs.json" ] && ok "the sweep leaves an overlap that is inside its deadline alone" || bad "a live overlap was swept"
+python3 - "$T/handoff/$REPO--hs.json" <<'EOP'
+import json, sys, time
+r = json.load(open(sys.argv[1])); r["live"] = "successor"; r["phase"] = "cutover"; r["cutover"] = time.time() - 600
+json.dump(r, open(sys.argv[1], "w"))
+EOP
+for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hs" '$2==r{print $1}'); do tmux kill-window -t "$id"; done   # the predecessor crashed after the cutover
+"$B/cc-handoff" --sweep >/dev/null 2>&1
+[ ! -f "$T/handoff/$REPO--hs.json" ] && ok "a record whose predecessor is GONE past the grace is finalized by the sweep" || bad "stale record survived the sweep"
+[ -f "$T/handoff/$hs.done" ] && ok "...the marker is written, so cc-guard un-gates the only session left" || bad "no completion marker from the sweep"
+[ "$(h "cc r t --go x" "$hs")" = 0 ] && ok "...and the survivor of a crashed retirement really is un-gated" || bad "the survivor of a swept handoff is still gated"
+tmux list-windows -t main -F '#{window_id} #W' | grep -qx "$ss $REPO/hs" && ok "...holding the target's window name, so an owner attaching lands on it" || bad "the successor did not take the window name"
+# the other half: an overlap that never reached --ready expires QUIETLY — its predecessor never stopped working
+nb=$(cat "$CC_NOTIFY_LOG" 2>/dev/null | wc -l)
+tmux new-window -d -t main -n "$REPO/hq" -c "$T" "bash -c 'sleep 300; :'"
+CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hq" --session sid-pre-q >/dev/null 2>&1
+python3 - "$T/handoff/$REPO--hq.json" <<'EOP'
+import json, sys, time
+r = json.load(open(sys.argv[1])); r["deadline"] = time.time() - 600
+json.dump(r, open(sys.argv[1], "w"))
+EOP
+"$B/cc-handoff" --sweep >/dev/null 2>&1
+{ [ ! -f "$T/handoff/$REPO--hq.json" ] && ! tmux list-windows -t main -F '#W' | grep -qx "$REPO/hq~next"; }   && ok "an overdue overlap that never reached --ready expires, successor window and all" || bad "overdue overlap not expired"
+[ "$(cat "$CC_NOTIFY_LOG" 2>/dev/null | wc -l)" = "$nb" ] && ok "...quietly: nothing was pushed to the owner about a session that never stopped working" || bad "the quiet expiry paged the owner"
+tmux list-windows -t main -F '#W' | grep -qx "$REPO/hq" && ok "...and the predecessor carries on, untouched" || bad "the quiet expiry took the predecessor's window"
+for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO" '$2 ~ "^"r"/(hs|hq)(~next)?$"{print $1}'); do tmux kill-window -t "$id"; done
+# the sweep has NO unit of its own: the existing reconcile timer is what gives it a turn (review rec #8)
+grep -q 'cc-handoff", "--sweep"' "$B/cc-reconcile" && [ ! -e "$(dirname "$B")/config/systemd-user/cc-handoff.timer" ]   && ok "the sweep rides the existing cc-reconcile timer — no new unit" || bad "the sweep is not wired through cc-reconcile"
 unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_GRACE
 
 echo "== cc-notify: an escalation reaches the OWNER, not the channel it came from =="

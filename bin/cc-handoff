@@ -5,11 +5,21 @@ nothing to defer on — which is what dissolves the "handoff PENDING, deferred a
 
   cc-handoff --overlap <target> [--pct N] [--session ID] [--in-flight "…"]   start a successor alongside
   cc-handoff --ready [<target>] [--forced]                run BY THE SUCCESSOR: preflight, commit, retire
+  cc-handoff --replace <target> [--over [PCT]]            the OLD path: journal, exit, restart on fresh context
   cc-handoff --abandon <target> [--why "…"]               give up: successor's window goes, record clears
   cc-handoff --due <target> [--over-ceiling]              the deadline: below the ceiling abandon, at/over force
+  cc-handoff --event <target> [--level L] [--pct N] [--session ID] [--in-flight "…"] [--live] [--taken]
+                                    a context line was crossed (cc-context): decide and take the phase, print it
+  cc-handoff --sweep                records no session is left to finish (run from the cc-reconcile timer)
   cc-handoff --retire <target>                            internal: END the predecessor, rename, clear
   cc-handoff --status [<target>] [--json]                 what phase, who is live, how long left
   cc-handoff selfcheck
+
+ONE OWNER (2026-08-31, review rec #8). The handoff path used to be three files: `cc` held the stop-then-restart
+sequence, `cc-context` decided which phase to take, and this file held the overlap. That split is what let a
+survivor's un-gate depend on a marker nobody swept. Now `cc-context` MEASURES and emits one --event; every phase
+decision, both paths and the sweep live here. `cc handoff <repo> <track>` delegates to --replace, and the overlap
+still fails INTO it.
 
 TARGET is `<repo>` (a planning session) or `<repo>/<track>` — the same address the Slack layer routes on, and
 also the tmux window name in session `main`. The successor's window is `<target>~next` until cutover.
@@ -25,6 +35,11 @@ BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 45 min, ~/.cc/conf
 predecessor's own Stop hook, which already runs every turn — no new timer, no new daemon. At the deadline the
 context ceiling decides: below it, abandon and tell the owner once; at or over it, force the cutover, or fall
 back to today's stop-then-restart `cc handoff`. The new path fails INTO the old one and cannot take it down.
+
+NOTHING IS LEFT TO A SESSION THAT MAY BE GONE. Every phase above is driven by a session's own Stop hook, which
+is exactly what a crashed one no longer has — so --sweep, on the EXISTING cc-reconcile timer, finishes what no
+session can: a record whose predecessor is gone past the grace is finalized (the marker cc-guard reads, then the
+record), and an overlap that never reached --ready expires quietly past its deadline.
 
 RETIREMENT ENDS THE PREDECESSOR. A session cannot exit itself — `/exit` is a slash command a human types into
 the TUI — so waiting for its pane to disappear waits for an event only a watching person can cause. --retire
@@ -213,9 +228,8 @@ def win_id(name):
     return None
 
 
-def pane_live(name):
+def pane_live_id(wid):
     """A window whose wrapper shell has a child = a real session; a bare fallback shell has none."""
-    wid = win_id(name)
     if not wid:
         return False
     pids = (tmux("list-panes", "-t", wid, "-F", "#{pane_pid}") or "").split()
@@ -225,6 +239,18 @@ def pane_live(name):
         return subprocess.run(["pgrep", "-P", pids[0]], capture_output=True).returncode == 0
     except Exception:
         return False
+
+
+def pane_live(name):
+    return pane_live_id(win_id(name))
+
+
+def side_live(rec, side):
+    """Is that side's SESSION still there — asked BOTH ways, because either one alone says 'gone' too easily: by
+    the window name it should hold, and by the window id the record names (a renamed window is still that
+    session). The sweep un-gates on this answer, so a false 'gone' is the expensive direction."""
+    s = rec.get(side) or {}
+    return pane_live(s.get("window") or "") or pane_live_id(s.get("tmux") or "")
 
 
 def win_alive(wid):
@@ -454,13 +480,162 @@ def due(target, over_ceiling=False):
         return abandon(target, "the successor did not become ready inside the overlap window")
     if pane_live(rec["successor"]["window"]):
         return ready(target, forced=True)          # it has the journal, which is all a fresh session ever got
-    repo, _, track = target.partition("/")
+    _, _, track = target.partition("/")
     abandon(target, "at the context ceiling with no live successor")
-    if track:                                      # fall back INTO today's path: stop, journal, restart fresh
-        run([os.path.join(BIN, "cc"), "handoff", repo, track], wait=False)
+    if track:                                      # fall back INTO the old path: stop, journal, restart fresh
+        run([os.path.realpath(__file__), "--replace", target], wait=False)
     else:
         notify(target, f"{target} is at its context ceiling and the overlapping handoff did not take. "
                        f"There is no stop-then-restart path for a planning session — it needs a hand.")
+    return 0
+
+
+def replace(target, over=None):
+    """--replace: the ORIGINAL handoff, and the one the overlap falls back INTO — tell the session to journal,
+    wait for it to exit, then restart it on a fresh context. It was `cc handoff <repo> <track>` until
+    2026-08-31; `cc` still spells it that way and delegates here, so the lifecycle has one owner and one file
+    to read. Every refusal leaves the session running and says why: a restart that loses a context nobody
+    journalled is worse than no restart.
+    A handoff costs the session its working memory, so --over decides on the MEASURED number, never a hunch."""
+    repo, _, track = target.partition("/")
+    if not track:
+        print(f"cc-handoff: {target} is a planning session — there is no stop-then-restart path for one",
+              file=sys.stderr)
+        return 1
+    if not win_id(target):
+        print(f"cc-handoff: no live window {target}")
+        return 1
+    st = os.path.join(STATE, repo, track)
+    jrn = os.path.join(st, "progress.md")
+    if over:
+        argv = [os.path.join(BIN, "cc-context"), repo, track, "--over"] + ([] if over == "any" else [over])
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+            rc, ctx = r.returncode, r.stdout.split("  ")[0].strip()
+        except Exception:
+            rc, ctx = 2, ""
+        line = "under the handoff line" if over == "any" else f"under {over}%"
+        if rc == 2:
+            print(f"cc-handoff: cannot measure {target}'s context (no answered turn yet) — "
+                  f"not handing off on a guess")
+            return 1
+        if rc == 1:
+            print(f"cc-handoff: {target} is at {ctx}, {line} — nothing to hand off")
+            return 0
+        print(f"cc-handoff: {target} is at {ctx} (over {line[len('under '):]}) — handing off")
+    else:
+        try:
+            r = subprocess.run([os.path.join(BIN, "cc-context"), repo, track],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                print(f"cc-handoff: {target} is at {r.stdout.split('  ')[0].strip()} — handing off")
+        except Exception:
+            pass
+    def mtime():
+        try:
+            return os.stat(jrn).st_mtime
+        except OSError:
+            return 0
+    before = mtime()
+    if not run([os.path.join(BIN, "cc-msg"), target,
+                f"Handoff: append to {jrn} a dated handoff entry for a fresh session — what is done, what is "
+                f"next (ordered), gotchas/decisions — then run /exit."]):
+        print(f"cc-handoff: cc-msg could not reach {target} (dialog open, or no interactive session) — "
+              f"not restarting", file=sys.stderr)
+        return 1
+    for _ in range(120):
+        if not pane_live(target):
+            break
+        time.sleep(5)
+    if pane_live(target):
+        print("cc-handoff: session did not exit in 10 min; the handoff journal may still be written. "
+              "Not restarting.", file=sys.stderr)
+        return 1
+    if mtime() == before:
+        print(f"cc-handoff: {jrn} never changed — no handoff journal was written, so a fresh context would "
+              f"start blind. Not restarting (read the pane, then: cc {repo} {track})", file=sys.stderr)
+        return 1
+    wid = win_id(target)
+    if wid:
+        tmux("kill-window", "-t", wid)
+    board = os.path.join(BIN, "cc-board")
+    run([board, "set", repo, track, "session_id", str(uuid.uuid4())])
+    run([board, "set", repo, track, "started", "false"])
+    run([board, "note", repo, track, "handoff: restarted with fresh context"])
+    run([os.path.join(BIN, "cc"), repo, track])
+    return 0
+
+
+def event(target, level="", pct=None, session="", busy="", live=False, taken=False):
+    """--event: the ONE call cc-context makes. It measures and says WHAT was crossed; which phase that means is
+    decided here, in the file that owns every phase. Returns the action taken, for the caller's own record:
+      ""         nothing — the line was the journal nudge, or a phase is already open, or nothing could start
+      "overlap"  a successor is coming up alongside (the predecessor is not interrupted)
+      "replace"  the old stop-then-restart path is running, detached
+    `taken` = that session has already taken a phase, or a Stop hook is holding it: nothing NEW starts, but the
+    level still decides the watchdog below, which is why cc-context sends it either way.
+    Never from the SUCCESSOR: $CC_HANDOFF is in its environment and nowhere else, and a session must not police,
+    abandon or restart the handoff it is itself the second half of."""
+    if os.environ.get("CC_HANDOFF"):
+        return ""
+    if read(target):
+        due(target, level == "ceiling")     # an overlap is open: its deadline, every turn, from the predecessor
+    if taken or not level or level == "journal" or not live or read(target):
+        return ""                           # the journal line is a nudge, not a phase; and one phase at a time
+    if enabled() and start(target, pct, session, busy) == 0:
+        return "overlap"                    # nothing has to be idle: starting a second session interrupts nobody
+    if "/" in target and not busy:          # the overlap is off or would not open: fail INTO the old path, which
+        run([os.path.realpath(__file__), "--replace", target], wait=False)   # DOES have to wait for idle
+        return "replace"
+    return ""
+
+
+def finalize(rec, why):
+    """A retirement nobody is left to finish. mark_done() BEFORE clear(), always: that order is the only reason
+    the survivor of a completed handoff is not gated by the record of its own success."""
+    target = rec["target"]
+    nid = win_id(target + NEXT)
+    if nid and not win_id(target):                 # the predecessor is gone: its name is free
+        tmux("rename-window", "-t", nid, target)
+    rec["phase"] = "done"
+    ledger(rec, "overlap-swept", why)
+    write(rec)
+    mark_done(rec)
+    clear(target)
+    repo, _, track = target.partition("/")
+    if track:
+        run([os.path.join(BIN, "cc-board"), "note", repo, track, f"handoff: swept — {why}"])
+    print(f"cc-handoff: {target} — {why}; the record is finalized and nothing is gated by it")
+
+
+def sweep():
+    """--sweep: the reaper, run from the EXISTING cc-reconcile timer (no new unit). Everything else here is
+    driven by a session's own Stop hook, which is precisely what a crashed session no longer has: a retirement
+    that dies between mark_done() and clear() leaves the survivor gated by the record of its own success, and a
+    predecessor that dies mid-overlap leaves a record nothing reaps. Two cases, both unambiguous:
+      the predecessor's session is GONE past the retire grace -> finalize. Nobody but the successor is in
+        charge of that target, and a record saying otherwise is gating the only session left.
+      an overlap that never reached --ready is past its deadline -> it expires QUIETLY. The predecessor never
+        stopped working and was never told anything, so there is nothing to tell it now; --due, which the
+        predecessor's own hook runs, gets first refusal (hence the extra grace) and tells the owner when it acts.
+    A sweep only ever un-gates, so a WRONG 'gone' is the expensive direction: if tmux cannot be read at all —
+    no server, no session main — every window looks gone, so nothing is swept."""
+    if tmux("list-windows", "-t", SESSION, "-F", "#{window_id}") is None:
+        return 0
+    grace, now = cfg("CC_HANDOFF_RETIRE_GRACE", 120), time.time()
+    for rec in read_all():
+        target = rec["target"]
+        if not TARGET_RE.match(target):
+            continue                               # a record naming something that is not a target: not ours to act on
+        if not side_live(rec, "predecessor") and now - (rec.get("cutover") or rec.get("started") or 0) > grace:
+            finalize(rec, "the predecessor's session is gone")
+        elif live_side(rec) == "predecessor" and now > rec.get("deadline", 0) + grace:
+            wid = win_id((rec.get("successor") or {}).get("window") or "")
+            if wid:
+                tmux("kill-window", "-t", wid)
+            ledger(rec, "overlap-expired", "the overlap window passed with no --ready")
+            clear(target)
+            print(f"cc-handoff: {target} — the overlap expired without a cutover; the predecessor carries on")
     return 0
 
 
@@ -592,8 +767,8 @@ def selfcheck():
         write(r)
         wins.pop("r1/t1~next", None)
         due("r1/t1", over_ceiling=True)
-        ok("at the ceiling with no successor, the old handoff path runs",
-           any(isinstance(a, list) and a[-2:] == ["r1", "t1"] and a[-3] == "handoff" for a in msgs))
+        ok("at the ceiling with no successor, the old path runs — and it is OURS now, not a call back into cc",
+           any(isinstance(a, list) and a[-2:] == ["--replace", "r1/t1"] for a in msgs))
         ok("...and the record is cleared, so nothing stays gated", read("r1/t1") is None)
 
         # ---- retirement ENDS the predecessor. A session cannot exit itself, so the grace expires into a KILL.
@@ -659,6 +834,77 @@ def selfcheck():
         os.environ.pop("CC_HANDOFF_DONE_TTL", None)
         os.environ.pop("CC_HANDOFF", None)
 
+        # ---- --event: cc-context measures and says which LINE was crossed; the PHASE is decided here
+        ov0 = os.environ.get("CC_HANDOFF_OVERLAP")
+        os.environ["CC_HANDOFF_OVERLAP"] = "1"
+        wins["e1/t"] = "@e1"
+        ok("the journal line is a nudge, not a phase", event("e1/t", "journal", live=True) == ""
+           and read("e1/t") is None)
+        ok("no live window, no phase — a headless worker's loop is its handoff", event("e1/t", "handoff") == "")
+        ok("the handoff line starts the successor ALONGSIDE, work in flight or not",
+           event("e1/t", "handoff", 41.0, "sid-e", "uncommitted work in t", live=True) == "overlap"
+           and read("e1/t")["live"] == "predecessor")
+        ok("...and what is unfinished RIGHT NOW goes into its brief",
+           "uncommitted work in t" in open(brief_path("e1/t")).read())
+        ok("...while it is open, no second phase is taken for that target",
+           event("e1/t", "ceiling", live=True) == "")
+        clear("e1/t")
+        wins.pop("e1/t~next", None)
+        os.environ["CC_HANDOFF_OVERLAP"] = "0"
+        ok("with the overlap off the event fails INTO the old path — and it is ours to run",
+           event("e1/t", "handoff", live=True) == "replace"
+           and any(isinstance(a, list) and a[-2:] == ["--replace", "e1/t"] for a in msgs))
+        ok("...which is the one that HAS to wait for idle, so work in flight defers it",
+           event("e1/t", "handoff", busy="uncommitted work in t", live=True) == "")
+        ok("a planning session has no stop-then-restart path to fall into", event("e1", "ceiling", live=True) == "")
+        ok("a session that already took a phase only runs the watchdog",
+           event("e1/t", "ceiling", live=True, taken=True) == "")
+        os.environ["CC_HANDOFF"] = "somebody-elses-handoff"
+        ok("the SUCCESSOR never drives the handoff it is the second half of",
+           event("e1/t", "ceiling", live=True) == "" and read("e1/t") is None)
+        os.environ.pop("CC_HANDOFF", None)
+
+        # ---- --sweep: what no session is left to finish. It only ever UN-GATES, so a wrong "gone" is the
+        # expensive direction and every case below is about not taking one.
+        r = cutover("s1")
+        ok("a record whose predecessor is still there is left alone", sweep() == 0 and read("s1") is not None)
+        del wins["s1"]                                  # the predecessor is gone: --retire never got to finish
+        ok("a predecessor gone past the grace is finalized", sweep() == 0 and read("s1") is None)
+        ok("...with the marker cc-guard reads, so the survivor is not gated by the record of its own success",
+           os.path.exists(done_path(r["id"])))
+        ok("...and the successor is left holding the target's window name",
+           wins.get("s1") == r["successor"]["tmux"] and "s1~next" not in wins)
+        ok("...one ledger line, saying it was swept",
+           [json.loads(l)["kind"] for l in open(os.path.join(RECORDS, "handoffs.jsonl"))][-1] == "overlap-swept")
+        ok("...and a swept record is not swept again", sweep() == 0 and read("s1") is None)
+
+        os.environ.pop("CC_HANDOFF", None)
+        told = sum(1 for m in msgs if m and m[0] == "notify")
+        wins["s2"] = "@s2"
+        start("s2")
+        ok("an overlap still inside its deadline is not swept", sweep() == 0 and read("s2") is not None)
+        rr = read("s2")
+        rr["deadline"] = time.time() - 1
+        write(rr)
+        ok("an overdue overlap that never reached --ready expires",
+           sweep() == 0 and read("s2") is None and "s2~next" not in wins)
+        ok("...QUIETLY: its predecessor never stopped working, so there is nothing to tell the owner",
+           sum(1 for m in msgs if m and m[0] == "notify") == told)
+
+        wins["s3"] = "@s3"
+        start("s3")
+        keep_tmux = tmux
+        tmux = lambda *a, **k: None                     # noqa: E731 — the tmux server cannot be read at all
+        ok("with tmux unreadable nothing is swept: every window would look gone",
+           sweep() == 0 and read("s3") is not None)
+        tmux = keep_tmux
+        clear("s3")
+        wins.pop("s3~next", None)
+        if ov0 is None:
+            os.environ.pop("CC_HANDOFF_OVERLAP", None)
+        else:
+            os.environ["CC_HANDOFF_OVERLAP"] = ov0
+
         # a corrupt record reads exactly like a missing one: the predecessor is in charge
         os.makedirs(HANDOFF, exist_ok=True)
         with open(path("r1"), "w") as fh:
@@ -683,10 +929,16 @@ def main(argv):
     i = 0
     while i < len(rest):
         a = rest[i]
-        if a in ("--pct", "--session", "--why", "--in-flight"):
+        if a in ("--pct", "--session", "--why", "--in-flight", "--level"):
             opt[a[2:].replace("-", "_")] = rest[i + 1] if i + 1 < len(rest) else ""
             i += 1
-        elif a in ("--forced", "--over-ceiling", "--json"):
+        elif a == "--over":                 # its value is optional: bare --over = that session's own handoff line
+            if i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+                opt["over"] = rest[i + 1]
+                i += 1
+            else:
+                opt["over"] = "any"
+        elif a in ("--forced", "--over-ceiling", "--json", "--live", "--taken"):
             opt[a.lstrip("-").replace("-", "_")] = True
         elif a.startswith("--"):
             print(f"cc-handoff: unknown option {a}", file=sys.stderr)
@@ -713,6 +965,23 @@ def main(argv):
         return start(target, pct, opt.get("session", ""), opt.get("in_flight", ""))
     if cmd == "--ready":
         return ready(target, bool(opt.get("forced")))
+    if cmd == "--replace":
+        return replace(target, opt.get("over")) if target else 1
+    if cmd == "--sweep":
+        return sweep()
+    if cmd == "--event":
+        if not target:
+            return 1
+        try:
+            pct = float(opt.get("pct"))
+        except (TypeError, ValueError):
+            pct = None
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):   # stdout is the answer; a phase's own words are not
+            act = event(target, opt.get("level", ""), pct, opt.get("session", ""),
+                        opt.get("in_flight", ""), bool(opt.get("live")), bool(opt.get("taken")))
+        print(json.dumps({"action": act}))
+        return 0
     if cmd == "--abandon":
         return abandon(target, opt.get("why", "")) if target else 1
     if cmd == "--due":

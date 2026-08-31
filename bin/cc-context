@@ -36,13 +36,14 @@ lives in no file). The 60% ceiling goes anyway: past it, what a degraded session
 the in-flight state it drops. A session with no live tmux window (a headless worker) is never restarted from
 here — its loop already gives it a fresh context — so it is told to journal instead.
 
-OR AN OVERLAP, WHICH REMOVES THE WAIT. With CC_HANDOFF_OVERLAP=1 the handoff and ceiling lines start the
-successor ALONGSIDE instead (cc-handoff --overlap): it reads the journal, asks the predecessor what the
-journal missed, and takes over only when it says so. Starting a second session interrupts nobody, so there is
-nothing to defer on and the "PENDING, deferred again" loop above cannot happen; `in_flight` is kept but
-demoted to the successor's opening checklist. The deadline is policed from here, in the predecessor's own
-Stop hook — no new timer — and past it the ceiling decides: below it abandon, at or over it force the
-cutover or fall back to the stop-then-restart path above. The new path fails INTO the old one.
+THIS FILE MEASURES; IT DECIDES NO PHASES (review rec #8, 2026-08-31). Crossing a line emits ONE event —
+`cc-handoff --event <target> --level …` — and cc-handoff, which owns the whole handoff lifecycle, decides what
+it means: start a successor ALONGSIDE (CC_HANDOFF_OVERLAP=1: it reads the journal, asks what the journal
+missed, and takes over only when it says so), fall back to the stop-then-restart path above, or nothing. The
+deadline of an open overlap is policed by the same event, from the predecessor's own Stop hook, which already
+runs every turn — no new timer. What comes back is recorded here, and the session is told in the same reply.
+Because an overlap interrupts nobody there is nothing to defer on, so the "PENDING, deferred again" loop above
+cannot happen while it is on; `in_flight` is kept, demoted to the successor's opening checklist.
 
 THE RECORD. Every crossing appends one JSON line to ~/.cc/state/context/handoffs.jsonl: when, which session,
 repo/track, the percentage and the token count, and which line fired (journal · handoff · ceiling, and the
@@ -434,44 +435,32 @@ def overlap_open(target):
     return os.path.exists(os.path.join(HANDOFF, target.replace("/", "--") + ".json"))
 
 
-def overlap(target, m, busy=""):
-    """Start the successor ALONGSIDE. Unlike `cc handoff` this only writes a record and opens a tmux window,
-    so it is fast and safe to wait for — and the hook learns whether the overlap really opened."""
-    argv = [os.path.join(BIN, "cc-handoff"), "--overlap", target, "--pct", f"{m['pct']:.1f}"]
+def event(target, m, level, busy="", live=False, taken=False):
+    """THE ONE CALL OUT. This file measures a context and says which LINE was crossed; cc-handoff owns every
+    phase that follows — the deadline of an overlap already open, whether this crossing starts one, whether it
+    falls back to the stop-then-restart path, and the sweep for records no session is left to finish. Before
+    review rec #8 that decision was made here, from a third file's building blocks, and `cc` held a fourth
+    piece of it. The level always goes out, even when this session can take no more phases (`taken`), because
+    the watchdog for an overlap already open decides on it: at the ceiling it FORCES the cutover, below it
+    abandons. -> the action cc-handoff took: "overlap", "replace", or "" (nothing).
+    Answered on stdout as JSON so a phase's own words cannot be mistaken for the answer; anything unreadable
+    reads as "" — the session is then simply TOLD, which is the direction every failure here must fall."""
+    argv = [os.path.join(BIN, "cc-handoff"), "--event", target, "--level", level or "",
+            "--pct", f"{m['pct']:.1f}"]
+    if taken:
+        argv += ["--taken"]                # this session has already taken a phase, or a Stop hook is holding
+                                           # it: the watchdog still runs on the level, nothing new starts
     if m.get("session_id"):
         argv += ["--session", m["session_id"]]
     if busy:
         argv += ["--in-flight", busy]      # what a journal always omits: what is unfinished RIGHT NOW
+    if live:
+        argv += ["--live"]                 # no live tmux window = a headless worker: its loop is its handoff
     try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=60).returncode == 0
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=90)
+        return (json.loads(r.stdout or "{}") or {}).get("action") or ""
     except Exception:
-        return False
-
-
-def due(target, over_ceiling):
-    """The overlap's deadline, policed by the predecessor's own Stop hook — it already runs every turn and the
-    predecessor is by definition still working, so there is no new timer and no new daemon."""
-    try:
-        os.makedirs(RECORDS, exist_ok=True)
-        log = open(os.path.join(RECORDS, "handoff.log"), "a")
-        subprocess.Popen([os.path.join(BIN, "cc-handoff"), "--due", target]
-                         + (["--over-ceiling"] if over_ceiling else []),
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-    except Exception:
-        pass
-
-
-def handoff(repo, track):
-    """Start `cc handoff` detached and return at once: this runs inside the session's own Stop hook, and
-    `cc handoff` waits for that session to exit before it restarts it."""
-    try:
-        os.makedirs(RECORDS, exist_ok=True)
-        log = open(os.path.join(RECORDS, "handoff.log"), "a")
-        subprocess.Popen([os.path.join(BIN, "cc"), "handoff", repo, track],
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-        return True
-    except Exception:
-        return False
+        return ""
 
 
 def journal_of(m):
@@ -531,26 +520,27 @@ def record(payload):
     # Only a session with a journal to write is ever interrupted — an owner's conversation is not.
     # never twice: once a handoff is taken, this session is being replaced and has nothing left to be told
     target = f"{repo}/{track}" if track else repo
-    # The overlap's deadline, every turn — but never from the SUCCESSOR (CC_HANDOFF is in its env and nowhere
-    # else): a session must not police, or abandon, the handoff it is itself the second half of.
-    if repo and not os.environ.get("CC_HANDOFF") and overlap_open(target):
-        due(target, m["used"] >= thresholds(m["window"])[2])
-    if lvl and repo and not m["handed_off"] and not payload.get("stop_hook_active"):
-        busy = in_flight(payload, cwd) if lvl != "ceiling" else None   # the ceiling goes regardless
-        live = have_window(target)                     # no window = a headless worker: its loop is its handoff
-        # An overlap does NOT wait for `not busy`: starting a second session interrupts nobody, which is the
-        # whole point — it is what dissolves the "deferred again" loop. in_flight is kept, demoted to the
-        # successor's opening checklist. It is refused while one is already open, so nothing chains.
-        if (lvl != "journal" and live and not overlap_open(target)
-                and not os.environ.get("CC_HANDOFF") and overlap(target, m, busy or "")):
+    live = have_window(target) if repo else False      # no window = a headless worker: its loop is its handoff
+    # Anything the crossing MEANS is cc-handoff's to decide (review rec #8) — including the deadline of an
+    # overlap already open, which is why this fires with no level too. Never from the SUCCESSOR: $CC_HANDOFF is
+    # in its env and nowhere else, and a session must not police, abandon or restart the handoff it is itself
+    # the second half of. cc-handoff refuses that too — this is the cheap half of the same rule, so the one
+    # session in a hundred that IS a successor does not fork a process every turn to be told no.
+    act = ""
+    taken = bool(m["handed_off"]) or bool(payload.get("stop_hook_active"))
+    fresh = bool(lvl) and bool(repo) and not taken
+    busy = in_flight(payload, cwd) if (fresh and lvl != "ceiling") else None   # the ceiling goes regardless
+    if repo and not os.environ.get("CC_HANDOFF") and (lvl or overlap_open(target)):
+        act = event(target, m, lvl or "", busy or "", live, taken)
+    if fresh:
+        if act == "overlap":                           # a successor is coming up alongside: nothing is restarted
             m["handed_off"] = m["ts"]
             m["told"] = lvl
             m["say"] = told(m, lvl, overlapped=True)
             ledger(m, lvl)
-        elif lvl != "journal" and not busy and live and track:
-            m["handed_off"] = m["ts"]                  # written before it is launched: never launched twice
+        elif act == "replace":                         # the old path: it will ask this session to journal and exit
+            m["handed_off"] = m["ts"]
             ledger(m, lvl)
-            handoff(repo, track)
         elif LEVELS.index(lvl) > LEVELS.index(was.get("told") or LEVELS[0]) or not was.get("told"):
             restartable = bool(live) and bool(track)   # only a track has the stop-then-restart path
             m["told"] = lvl                            # said once per line crossed, not once per turn
@@ -842,24 +832,26 @@ def selfcheck():
                                == [None, "journal", "handoff", "ceiling"])
         ok("the same rule fires on a 200k model", level_of(60000, DEFAULT_WINDOW) == "journal")
 
-        # nothing real is ever restarted or started from a selfcheck: the shell-outs are stubbed
-        global have_window, handoff, overlap, overlap_open, due
-        hw0, ho0, ov0, oo0, du0 = have_window, handoff, overlap, overlap_open, due
-        live, launched, started, dues, on = [True], [], [], [], [False]
+        # nothing real is ever restarted or started from a selfcheck: the ONE shell-out is stubbed. It stands
+        # in for cc-handoff, which owns the phases — so this fixture answers exactly as that CLI does, with the
+        # action it took, and these cases assert what THIS file does with the answer, never what cc-handoff
+        # decides (that has its own selfcheck, and selftest.sh drives the two together on real windows).
+        global have_window, overlap_open, event
+        hw0, ev0, oo0 = have_window, event, overlap_open
+        live, events, started, on = [True], [], [], [False]
         have_window = lambda t: live[0]
-        handoff = lambda r, t: launched.append((r, t)) or True
 
-        def overlap(t, m, busy=""):          # noqa: F811 — the stub, restored below
-            if not on[0]:
-                return False
-            started.append((t, busy))
-            return True
+        def event(t, m, level, busy="", live_=False, taken=False):   # noqa: F811 — the stub, restored below
+            events.append((t, level, busy, live_, taken))
+            if taken or not level or level == "journal" or not live_ or any(x[0] == t for x in started):
+                return ""
+            if on[0]:
+                started.append((t, busy))
+                return "overlap"
+            return "replace" if "/" in t and not busy else ""
 
         def overlap_open(t):                 # noqa: F811
             return on[0] and any(x[0] == t for x in started)
-
-        def due(t, over):                    # noqa: F811
-            dues.append((t, over))
 
         wt = os.path.join(d, "wt")
         subprocess.run(["git", "init", "-q", wt], check=False)      # a real repo: in_flight reads git, not a flag
@@ -876,37 +868,44 @@ def selfcheck():
 
         # the handoff line with work in flight: PENDING, and nothing is restarted underneath the session
         r = at(420000, "sid-3")
-        ok("in flight -> the handoff is pending, not taken", r["pending"] and not r["handed_off"] and not launched)
+        ok("in flight -> the handoff is pending, not taken", r["pending"] and not r["handed_off"]
+           and events[-1][1:3] == ("handoff", in_flight({}, wt)))
         ok("the session is told what it is waiting on", "PENDING" in r["say"] and "uncommitted work" in r["say"])
+        n0 = len([e for e in events if e[1] == "handoff" and not e[2]])
         r = at(420000, "sid-3", background_tasks=[{"id": "1"}])
-        ok("a background task counts as in flight", r["pending"] and not launched)
+        ok("a background task counts as in flight", r["pending"] and not r["handed_off"]
+           and len([e for e in events if e[1] == "handoff" and not e[2]]) == n0)
 
         # the ceiling goes regardless: past it, a degraded session costs more than the state it drops
         r = at(650000, "sid-3")
         ok("the ceiling hands off with work still in flight", r["level"] == "ceiling" and r["handed_off"]
-           and launched == [("repo1", "track1")])
+           and events[-1][1:3] == ("ceiling", ""))
         ok("a handoff already taken is never taken twice", at(650000, "sid-3")["handed_off"] == r["handed_off"]
-           and len(launched) == 1)
+           and events[-1][4] is True)                   # the event still goes out, flagged: it is the watchdog's
 
         # nothing in flight: the pending handoff is taken at the next turn
         for a in (["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
             subprocess.run(["git", "-C", wt, *a], check=False, capture_output=True)
         ok("a committed worktree is not in flight", in_flight({}, wt) is None)
         r = at(420000, "sid-6")
-        ok("idle -> the handoff is executed", r["handed_off"] and len(launched) == 2)
+        ok("idle -> the handoff is executed", r["handed_off"] and events[-1][1:3] == ("handoff", ""))
 
         # a headless worker has no window to restart; its loop is the handoff, so it is told to journal
         live[0] = False
         r = at(420000, "sid-7")
-        ok("no live session -> told, never restarted", not r["handed_off"] and "IS the handoff" in r["say"])
+        ok("no live session -> told, never restarted", not r["handed_off"] and "IS the handoff" in r["say"]
+           and events[-1][3] is False)                  # the fact goes out with the event; the phase is not ours
         live[0] = True
 
         r = at(420000, "sid-8", stop_hook_active=True)
-        ok("never while a Stop hook is already holding the session", "say" not in r)
+        ok("never while a Stop hook is already holding the session", "say" not in r
+           and not r["handed_off"] and events[-1][4] is True)
         t9 = tx([asst("claude-opus-5", 0, 0, 470000),
                  {"type": "cost-state", "modelUsage": {"claude-opus-5[1m]": {"inputTokens": 1}}}])
+        n2 = len(events)
         r = record({"session_id": "sid-9", "transcript_path": t9, "cwd": d})
-        ok("a session with no journal is not interrupted", r["level"] == "handoff" and "say" not in r)
+        ok("a session with no journal is not interrupted", r["level"] == "handoff" and "say" not in r
+           and len(events) == n2)                       # …and nothing outside this file was even asked
 
         # the durable record: one countable line per crossing, no prose to parse
         hs = handoffs()
@@ -930,24 +929,29 @@ def selfcheck():
         ok("work in flight still defers the OLD path", in_flight({}, wt))
         r = at(420000, "sid-10")
         ok("the overlap starts with work in flight — nothing to defer on",
-           r["handed_off"] and started == [("repo1/track1", in_flight({}, wt))] and len(launched) == 2)
+           r["handed_off"] and started == [("repo1/track1", in_flight({}, wt))])
         ok("the session is told its successor is alive, not that it is being restarted",
            "SUCCESSOR" in r["say"] and "not live yet" in r["say"] and "PENDING" not in r["say"])
         ok("in_flight is demoted to the successor's opening checklist", "uncommitted work" in started[0][1])
         r2 = at(430000, "sid-10")
         ok("an overlap is never started twice for one target", len(started) == 1 and not r2.get("say"))
-        ok("the deadline is policed every turn while a record is open", dues and dues[-1] == ("repo1/track1", False))
-        at(650000, "sid-10")
-        ok("...and the ceiling is what the watchdog is told to decide on", dues[-1] == ("repo1/track1", True))
+        # the deadline of an open overlap is the same event, with no level: this file has nothing to say about
+        # a turn that crossed nothing, but cc-handoff still has a watchdog to run on it
+        ok("an open overlap is handed the turn even when no line was crossed",
+           at(100000, "sid-10") and events[-1][:2] == ("repo1/track1", ""))
+        ok("...and once a phase is taken the MEASUREMENT still goes out, flagged, so the watchdog can decide "
+           "on it: at the ceiling it forces the cutover instead of abandoning",
+           at(650000, "sid-10") and events[-1][:2] == ("repo1/track1", "ceiling") and events[-1][4] is True)
 
         os.environ["CC_HANDOFF"] = "x"       # the SUCCESSOR shares this cwd: it must not police its own handoff
-        n = len(dues)
+        n = len(events)
         at(420000, "sid-11")
-        ok("the successor never polices the overlap it is half of", len(dues) == n and len(started) == 1)
+        ok("the successor never even emits the event for a handoff it is half of",
+           len(events) == n and len(started) == 1)
         os.environ.pop("CC_HANDOFF", None)
         on[0] = False
         os.remove(os.path.join(wt, "dirty.txt"))
-        have_window, handoff, overlap, overlap_open, due = hw0, ho0, ov0, oo0, du0
+        have_window, event, overlap_open = hw0, ev0, oo0
 
         RECORDS = keep
 
