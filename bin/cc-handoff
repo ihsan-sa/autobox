@@ -7,7 +7,7 @@ nothing to defer on — which is what dissolves the "handoff PENDING, deferred a
   cc-handoff --ready [<target>] [--forced]                run BY THE SUCCESSOR: preflight, commit, retire
   cc-handoff --abandon <target> [--why "…"]               give up: successor's window goes, record clears
   cc-handoff --due <target> [--over-ceiling]              the deadline: below the ceiling abandon, at/over force
-  cc-handoff --retire <target>                            internal: wait out the predecessor, rename, clear
+  cc-handoff --retire <target>                            internal: END the predecessor, rename, clear
   cc-handoff --status [<target>] [--json]                 what phase, who is live, how long left
   cc-handoff selfcheck
 
@@ -26,7 +26,13 @@ predecessor's own Stop hook, which already runs every turn — no new timer, no 
 context ceiling decides: below it, abandon and tell the owner once; at or over it, force the cutover, or fall
 back to today's stop-then-restart `cc handoff`. The new path fails INTO the old one and cannot take it down.
 
+RETIREMENT ENDS THE PREDECESSOR. A session cannot exit itself — `/exit` is a slash command a human types into
+the TUI — so waiting for its pane to disappear waits for an event only a watching person can cause. --retire
+therefore gives it CC_HANDOFF_RETIRE_GRACE (120 s: a turn in flight, and the journal flushed) and then KILLS
+its window. The grace expires into a kill, never into "it keeps its window".
+
 Env: CC_HANDOFF (the successor's own record id, exported into its process by `cc __runnext`) ·
+CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DONE_TTL (~/.cc/config) ·
 CC_HANDOFF_DIR, CC_CTX_RECORDS (test hooks: put the record and the ledger somewhere else).
 """
 import json, os, re, shlex, subprocess, sys, time, uuid
@@ -132,6 +138,40 @@ def clear(target):
             pass
 
 
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")       # a record id, and safe to build a filename from
+
+
+def done_path(hid):
+    """Where a COMPLETED retirement is remembered, keyed on the successor's own $CC_HANDOFF id."""
+    return os.path.join(HANDOFF, hid + ".done") if ID_RE.match(hid or "") else None
+
+
+def mark_done(rec):
+    """Evidence that the retirement FINISHED, and it must outlive clear(). The successor keeps $CC_HANDOFF for
+    the life of its process (by design — the model must not be able to unset it), so without this a handoff
+    that went RIGHT is indistinguishable from a record lost because something went WRONG, and cc-guard gates
+    the only session left. On 2026-08-31 that bricked the session that won the first real handoff: it lost
+    dispatch mid-sentence. Written BEFORE clear(), so there is no instant in which the record is gone and the
+    reason it is gone is not on disk."""
+    p = done_path(rec.get("id") or "")
+    if not p:
+        return False
+    os.makedirs(HANDOFF, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"id": rec["id"], "target": rec.get("target"), "retired": time.time()}, f)
+    os.replace(tmp, p)
+    for n in sorted(os.listdir(HANDOFF)):          # no session outlives the TTL, so an older marker is litter
+        if n.endswith(".done") and n != os.path.basename(p):
+            q = os.path.join(HANDOFF, n)
+            try:
+                if os.path.getmtime(q) < time.time() - cfg("CC_HANDOFF_DONE_TTL", 30 * 86400):
+                    os.remove(q)
+            except OSError:
+                pass
+    return True
+
+
 def live_side(rec):
     return "successor" if rec.get("live") == "successor" else "predecessor"
 
@@ -185,6 +225,20 @@ def pane_live(name):
         return subprocess.run(["pgrep", "-P", pids[0]], capture_output=True).returncode == 0
     except Exception:
         return False
+
+
+def win_alive(wid):
+    """Is that window id still on the server? Ids are never reused, so this is the one safe way to ask."""
+    return bool(wid) and wid in (tmux("list-windows", "-t", SESSION, "-F", "#{window_id}") or "").split()
+
+
+def self_wid():
+    """The window THIS process is running in, from $TMUX_PANE — never a bare `display-message`, which answers
+    with whatever window is ACTIVE and would cheerfully name somebody else's session."""
+    pane = os.environ.get("TMUX_PANE") or ""
+    if not pane:
+        return ""
+    return (tmux("display-message", "-p", "-t", pane, "#{window_id}") or "").strip()
 
 
 def run(argv, wait=True):
@@ -316,27 +370,57 @@ def derive(rec):
     run([os.path.realpath(__file__), "--retire", target], wait=False)
 
 
+def refuse_kill(rec, wid):
+    """THE ONE GENUINELY DANGEROUS ACT IN THIS FILE. Killing the wrong window ends a working session and loses
+    a context nobody can get back, so the kill is fenced by three refusals and each says which one it was.
+    A caller that gets a reason back must kill NOTHING."""
+    if not wid:
+        return "there is no window left to end"
+    if wid != ((rec.get("predecessor") or {}).get("tmux") or ""):
+        return (f"tmux window {wid} is not the one the record names as the predecessor "
+                f"({(rec.get('predecessor') or {}).get('tmux') or 'none'})")
+    if wid == ((rec.get("successor") or {}).get("tmux") or ""):
+        return "the record names the same window on both sides"
+    if wid == self_wid():
+        return "that is the window --retire is running in"
+    return ""
+
+
 def retire(target):
-    """--retire: wait the predecessor out, then take its window name and clear the record. Only once its pane
-    is really gone — while it is alive the record must stay, because the record is what keeps it gated."""
+    """--retire: END the predecessor, take its window name, clear the record — every time, not only when a
+    human happened to be watching. The old wait-it-out could never complete on its own: a session has no way
+    to exit itself, so 'still running, it keeps its window' was the normal outcome, and on 2026-08-31 a
+    retired session ran on for 35 minutes as a second live voice on the same channel (its window still the
+    ACTIVE one, so an owner attaching landed on it). The grace period is for a turn in flight and the journal
+    flush; it expires into a kill.
+    Kills ONLY the pane the record names as the predecessor, ONLY once the record says the successor is live,
+    and never the caller's own — see refuse_kill(). No record, or no cutover: nothing is killed at all."""
     rec = read(target)
     if not rec or live_side(rec) != "successor":
-        return 0
-    deadline = time.time() + cfg("CC_HANDOFF_RETIRE_WAIT", 600)
+        return 0                                   # missing, corrupt, or before cutover: kill NOTHING
+    deadline = time.time() + cfg("CC_HANDOFF_RETIRE_GRACE", 120)
     while time.time() < deadline and pane_live(target):
         time.sleep(5)
-    if pane_live(target):
-        print(f"cc-handoff: {target}'s predecessor is still running — it stays gated and keeps its window")
-        return 1
-    wid = win_id(target)
-    if wid:
+    wid = win_id(target)                           # the window still carrying the predecessor's name
+    pre = (rec.get("predecessor") or {}).get("tmux") or ""
+    if not wid and win_alive(pre):
+        wid = pre                                  # renamed out from under us — the record still names the id,
+    if wid:                                        # and a live predecessor must never outlive its own record
+        why = refuse_kill(rec, wid)
+        if why:                                    # the record and tmux disagree: the record stays, and so does the gate
+            print(f"cc-handoff: {target}'s predecessor was NOT ended — {why}. It keeps its window and "
+                  f"everything stays gated; this needs a hand.", file=sys.stderr)
+            return 1
         tmux("kill-window", "-t", wid)
     nid = win_id(target + NEXT)
     if nid:
         tmux("rename-window", "-t", nid, target)
     rec["phase"] = "done"
+    ledger(rec, "overlap-retired")
     write(rec)
+    mark_done(rec)                                 # before clear(), always: it is what tells cc-guard this went RIGHT
     clear(target)                                  # nobody is gated any more: the successor is the only session left
+    print(f"cc-handoff: {target} — the predecessor is ended, the successor has its window, nothing is gated")
     return 0
 
 
@@ -401,7 +485,7 @@ def status(target=None, as_json=False):
 
 def selfcheck():
     import tempfile
-    global HANDOFF, RECORDS, win_id, pane_live, tmux, run, notify
+    global HANDOFF, RECORDS, win_id, pane_live, tmux, run, notify, self_wid
     p = f = 0
 
     def ok(what, cond):
@@ -417,15 +501,20 @@ def selfcheck():
         HANDOFF = os.path.join(d, "handoff")
         RECORDS = os.path.join(d, "context")
         # nothing real is started, killed or pushed from a selfcheck: tmux and the shell-outs are stubbed
-        wins, msgs = {"r1": "@1"}, []
+        wins, msgs, dead, me = {"r1": "@1"}, [], set(), [""]
 
         def win_id(n):
             return wins.get(n)
 
         def pane_live(n):
-            return n in wins
+            return n in wins and n not in dead      # `dead` = the window is still there, the session in it is not
+
+        def self_wid():
+            return me[0]                            # the window --retire is pretending to run in
 
         def tmux(*a, **k):
+            if a[0] == "list-windows":
+                return "\n".join(wins.values())
             if a[0] == "new-window":
                 wins[a[a.index("-n") + 1]] = "@%d" % (len(wins) + 1)
             elif a[0] == "kill-window":
@@ -506,6 +595,69 @@ def selfcheck():
         ok("at the ceiling with no successor, the old handoff path runs",
            any(isinstance(a, list) and a[-2:] == ["r1", "t1"] and a[-3] == "handoff" for a in msgs))
         ok("...and the record is cleared, so nothing stays gated", read("r1/t1") is None)
+
+        # ---- retirement ENDS the predecessor. A session cannot exit itself, so the grace expires into a KILL.
+        os.environ["CC_HANDOFF_RETIRE_GRACE"] = "0"
+
+        def cutover(t):
+            """a target at the moment after the commit point: predecessor alive, successor waiting"""
+            wins[t] = "@" + t
+            start(t)
+            os.environ["CC_HANDOFF"] = read(t)["id"]
+            ready(t)
+            return read(t)
+
+        os.environ.pop("CC_HANDOFF", None)
+        wins["r2"] = "@r2"
+        ok("--retire with no record kills nothing", retire("r2") == 0 and wins.get("r2") == "@r2")
+        start("r2")
+        ok("--retire BEFORE cutover kills nothing", retire("r2") == 0 and wins.get("r2") == "@r2"
+           and read("r2") is not None)
+        clear("r2")
+        del wins["r2~next"]
+
+        r = cutover("r2")
+        suc = r["successor"]["tmux"]
+        ok("a predecessor still alive after the grace is ENDED, and its window name taken",
+           retire("r2") == 0 and wins.get("r2") == suc and "r2~next" not in wins)
+        ok("...the record is cleared afterwards, so nothing stays gated", read("r2") is None)
+        ok("...and the completed retirement is remembered where clear() cannot reach it (2026-08-31: a "
+           "finished handoff gated the only session left)", os.path.exists(done_path(r["id"])))
+        marked = done_path(r["id"])
+        ok("one ledger line for the retirement",
+           [json.loads(l)["kind"] for l in open(os.path.join(RECORDS, "handoffs.jsonl"))][-1] == "overlap-retired")
+
+        r = cutover("r3")
+        dead.add("r3")                                  # /exit was typed: the window is a bare shell now
+        ok("a predecessor that already exited still renames and clears (today's path, unchanged)",
+           retire("r3") == 0 and wins.get("r3") == r["successor"]["tmux"] and read("r3") is None)
+
+        r = cutover("r4")
+        me[0] = r["predecessor"]["tmux"]                # --retire called from the very window it would kill
+        ok("--retire never kills the pane it is called from",
+           retire("r4") == 1 and wins.get("r4") == r["predecessor"]["tmux"] and read("r4") is not None)
+        me[0] = ""
+        r["predecessor"]["tmux"] = "@somebody-else"     # the record and tmux disagree about who is there
+        write(r)
+        ok("a window the record does not name as the predecessor is not killed",
+           retire("r4") == 1 and wins.get("r4") == "@r4" and read("r4") is not None)
+        ok("...and a refused kill leaves no completion marker: the successor stays gated",
+           not os.path.exists(done_path(r["id"])))
+        clear("r4")                                     # a refused retirement keeps its record: the rest of the check wants a clean dir
+
+        r = cutover("r6")
+        wins["r6-renamed"] = wins.pop("r6")              # its window no longer carries the target's name
+        ok("a predecessor whose window was renamed is still ended, by the id the record names",
+           retire("r6") == 0 and r["predecessor"]["tmux"] not in wins.values()
+           and wins.get("r6") == r["successor"]["tmux"] and read("r6") is None)
+
+        r = cutover("r5")
+        os.environ["CC_HANDOFF_DONE_TTL"] = "0"         # every marker is now older than the TTL
+        retire("r5")
+        ok("a completion marker is pruned once no session can still be holding that id",
+           os.path.exists(done_path(r["id"])) and not os.path.exists(marked))
+        os.environ.pop("CC_HANDOFF_DONE_TTL", None)
+        os.environ.pop("CC_HANDOFF", None)
 
         # a corrupt record reads exactly like a missing one: the predecessor is in charge
         os.makedirs(HANDOFF, exist_ok=True)

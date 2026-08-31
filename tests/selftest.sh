@@ -184,6 +184,15 @@ for probe in 'Bash|{"command":"$(gh pr merge 1)"}' 'Bash|{"command":"bash -c \"g
              "Edit|{\"file_path\":\"$wt/../../../../etc/passwd\"}"; do
   [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 2 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "guard blocks all 13 bypass probes (quoting, wrappers, tmux kills, traversal)" || bad "guard bypass:$miss"
+# A HEREDOC BODY IS DATA — except when something on the line would run it, and then it is a command again.
+miss=""; for probe in 'Bash|{"command":"bash <<E\ngh pr merge 1\nE"}' 'Bash|{"command":"cat <<E\ngh pr merge 1"}' \
+             'Bash|{"command":"ssh box <<E\nsudo reboot\nE"}' 'Bash|{"command":"xargs -0 <<E\ngh pr merge 1\nE"}'; do
+  [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 2 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "a heredoc an interpreter would RUN, and one that never ends, both fail closed" || bad "heredoc bypass:$miss"
+miss=""; for probe in 'Bash|{"command":"cat >> notes.md <<E\nthe owner decides: gh pr merge, cc-land, sudo anything\nE"}' \
+             'Bash|{"command":"git commit -F - <<E\nfix: stop cc-land running twice\nE"}'; do
+  [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 0 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "...but prose that merely NAMES a gated command is written, not refused (brief, journal, commit message)" || bad "guard reads prose as a command:$miss"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
 # member-facing: the .cc/member-facing marker alone (NO CC_ROLE — the env is a convenience) = every worker gate plus spend/leak/wiring
 mf="$T/member"; mkdir -p "$mf/.cc"; : > "$mf/.cc/member-facing"; touch "$mf/note.md"
@@ -205,7 +214,7 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$HOME" | CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
 echo "== overlapping handoff: two sessions, one cwd, exactly one of them live =="
-export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_WAIT=1   # never the box's own records, never a 10-min wait
+export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1   # never the box's own records, never a 2-min grace
 ho=$("$B/cc-handoff" selfcheck 2>&1 | tail -1)
 grep -q '0 failed' <<<"$ho" && ok "cc-handoff selfcheck: ${ho##*: }" || bad "cc-handoff selfcheck: $ho"
 st=$("$B/cc" handoff --status 2>&1); grep -q "no overlapping handoff is open" <<<"$st" && ok "cc handoff --status delegates by target" || bad "cc handoff --status: [$st]"
@@ -235,7 +244,22 @@ echo '{not json' > "$T/handoff/$REPO--hx.json"
 { [ "$(h "gh pr merge 1" "" sid-pre)" = 0 ] && [ "$(h "gh pr merge 1" "$hid")" = 2 ]; } && ok "a corrupt record falls one way only: predecessor free, successor gated" || bad "corrupt record fell the wrong way"
 rm -f "$T/handoff/$REPO--hx.json"
 for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hx" '$2==r || $2==r"~next"{print $1}'); do tmux kill-window -t "$id"; done
-unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_WAIT
+# RETIREMENT ENDS THE PREDECESSOR, end to end on real windows. A session cannot exit itself (`/exit` is typed
+# by a human), so the old wait-it-out never completed on its own: on 2026-08-31 a retired session ran on for
+# 35 minutes as a second live voice, its window still the ACTIVE one. The grace expires into a kill.
+tmux new-window -d -t main -n "$REPO/hz" -c "$T" "bash -c 'sleep 300; :'"
+CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hz" --session sid-pre-z >/dev/null 2>&1
+hz=$(jq -r .id "$T/handoff/$REPO--hz.json" 2>/dev/null); pz=$(jq -r .predecessor.tmux "$T/handoff/$REPO--hz.json" 2>/dev/null); sz=$(jq -r .successor.tmux "$T/handoff/$REPO--hz.json" 2>/dev/null)
+CC_HANDOFF="$hz" "$B/cc-handoff" --ready "$REPO/hz" >/dev/null 2>&1     # --ready fires --retire in the background
+for _ in $(seq 60); do [ -f "$T/handoff/$REPO--hz.json" ] || break; sleep 0.5; done
+w=$(tmux list-windows -t main -F '#{window_id} #W')
+{ ! grep -q "^$pz " <<<"$w"; } && ok "the predecessor is ENDED by the grace, not waited out (it cannot exit itself)" || bad "the predecessor kept its window after --retire"
+{ grep -qx "$sz $REPO/hz" <<<"$w" && ! grep -q "$REPO/hz~next" <<<"$w"; } && ok "...and the successor holds its window name, so an owner attaching lands on the live session" || bad "successor window not renamed: $(grep "$REPO/hz" <<<"$w")"
+[ ! -f "$T/handoff/$REPO--hz.json" ] && ok "...and the record is cleared, so nothing is gated by it any more" || bad "record survived the retirement"
+[ "$(h "cc r t --go x" "$hz")" = 0 ] && ok "TONIGHT'S CASE: a COMPLETED handoff does not brick the session that won it (it still dispatches, PRs and pushes)" || bad "the survivor of a completed handoff is gated"
+[ "$(h "cc r t --go x" "no-such-record")" = 2 ] && ok "...while a record missing for any OTHER reason gates exactly as before" || bad "an unbacked CC_HANDOFF was let through"
+for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hz" '$2==r || $2==r"~next"{print $1}'); do tmux kill-window -t "$id"; done
+unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_GRACE
 
 echo "== cc-notify: an escalation reaches the OWNER, not the channel it came from =="
 # own HOME (the box's real config and owner id stay out of this) + a stub bot: the args cc-notify hands cc-slack ARE the routing

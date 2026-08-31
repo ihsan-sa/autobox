@@ -17,8 +17,35 @@ inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""'
 # A command position: start, after a separator/substitution, or after wrapper words that hide the real command
 # (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
 AT='(^|[;&|(){}`]|\$\() *(((then|else|elif|do|time|env|nohup|xargs|command|eval|exec|sudo|bash|sh|-c)|[A-Za-z_][A-Za-z0-9_]*=[^ ]*) +)*'
+# A HEREDOC BODY IS DATA, NOT A COMMAND. The rules grep raw text, so a brief, a journal entry or a commit
+# message that merely NAMES a forbidden command was refused for containing it — writing the brief for this fix
+# was itself blocked that way. So heredoc bodies are dropped before matching. Quoted strings are NOT dropped:
+# `bash -c "…"` is a real command and must still be seen. Two fences keep the drop honest: a body goes only if
+# its terminator really appears later (an unterminated `<<` swallows nothing), and never when anything on the
+# same line could EXECUTE it — an interpreter, eval, xargs, ssh, sudo fed a heredoc really does run its body,
+# and that is the one case where the body IS the command. Both fail CLOSED, back to matching the raw text.
+X='(^|[;&|(){}`]|[$][(])[ \t]*(((then|else|do|time|env|nohup|xargs|command|sudo)|[A-Za-z_][A-Za-z0-9_]*=[^ \t]+)[ \t]+)*([^ \t]*/)?(bash|sh|zsh|ksh|dash|python[0-9.]*|perl|ruby|node|php|awk|sed|eval|exec|source|[.]|xargs|env|ssh|sudo|systemd-run)([ \t]|$)'
+hay(){   # the text the rules match: heredoc bodies out, quotes stripped
+  local c=$1
+  case "$c" in *'<<'*) c=$(awk -v X="$X" '
+      { L[NR] = $0 }
+      END { b = 0
+        for (i = 1; i <= NR; i++) {
+          if (b) { if (L[i] ~ t) b = 0; continue }
+          print L[i]                                        # the line that OPENS a heredoc is still a command
+          n = index(L[i], "<<"); if (n == 0) continue
+          head = substr(L[i], 1, n - 1); rest = substr(L[i], n + 2)
+          if (index(rest, "<<") > 0) continue               # two on one line: too clever to reason about
+          if (!match(rest, "^-?[ \t]*[\"\047]?[A-Za-z_][A-Za-z0-9_]*")) continue   # `<<<` and shifts are not heredocs
+          w = substr(rest, RSTART, RLENGTH); sub("^-?[ \t]*[\"\047]?", "", w)
+          if (head ~ X) continue                            # the body would be RUN: it stays in the haystack
+          t = "^[ \t]*" w "[ \t]*$"
+          for (j = i + 1; j <= NR; j++) if (L[j] ~ t) { b = 1; break }
+        } }' <<<"$c");; esac
+  c=${c//\"/}; printf '%s' "${c//\'/}"
+}
 if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones and their subagents included): nothing may kill the shared tmux server
-  u=$(jq -r '.tool_input.command // ""' <<<"$inp"); u=${u//\"/}; u=${u//\'/}
+  u=$(hay "$(jq -r '.tool_input.command // ""' <<<"$inp")")
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
@@ -55,8 +82,21 @@ if [ -n "${CC_HANDOFF:-}" ] || [ -d "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}"
     case " $v " in *" mine "*) seen=1;; esac
     case " $v " in *" gate "*) handoff_gated=1;; esac
   done
-  # $CC_HANDOFF with no record to justify it (missing, corrupt, unreadable) = the successor stays gated.
-  [ -n "${CC_HANDOFF:-}" ] && [ -z "$seen" ] && handoff_gated=1
+  # $CC_HANDOFF with no record to justify it (missing, corrupt, unreadable) = the successor stays gated —
+  # UNLESS the handoff FINISHED. `cc-handoff --retire` ends with clear(), so a record that is gone because
+  # everything went RIGHT looks exactly like one lost because something went WRONG; retirement therefore
+  # leaves a <id>.done marker first, and that marker is the whole difference. Without it the last step of a
+  # handoff bricks the session that won it — 2026-08-31, the survivor lost dispatch, PRs and pushes for the
+  # rest of its life, and could not even dispatch the fix for its own gate. Only ever WITHHOLDS the gate,
+  # never lifts one: a session gated by the record of a LATER handoff stays gated by it.
+  if [ -n "${CC_HANDOFF:-}" ] && [ -z "$seen" ]; then
+    retired=""
+    case "$CC_HANDOFF" in
+      ""|*[!A-Za-z0-9_-]*) ;;   # not a record id, so never a path we build: a corrupt env gates like a corrupt record
+      *) [ -f "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}/$CC_HANDOFF.done" ] && retired=1;;
+    esac
+    [ -n "$retired" ] || handoff_gated=1
+  fi
 fi
 [ -n "$handoff_gated" ] && [ "$role" != member ] && role=worker   # the four owner gates below, at least
 case "$role" in worker|member) ;; *) exit 0;; esac
@@ -65,7 +105,7 @@ denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an
 secret_path(){ case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json) return 0;; esac; return 1; }
 case "$tool" in
   Bash)
-    cmd=$(jq -r '.tool_input.command // ""' <<<"$inp"); cmd=${cmd//\"/}; cmd=${cmd//\'/}
+    cmd=$u   # the universal block above already built it: one jq and at most one awk per call, not two
     if [ -n "$handoff_gated" ]; then   # on top of the four gates below: what only the LIVE session may do
       grep -qE 'git +push\b' <<<"$cmd" && denyh "pushing while the other session is the live one (a retired session must not push a stale branch)"
       grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && denyh "dispatching a worker (cc --go)"
