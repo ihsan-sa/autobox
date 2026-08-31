@@ -509,6 +509,9 @@ mktrack w11 "ask something"
 mkclaude askclaude w11 'echo "work $n" > "ask-$n.txt"; echo "- step $n" >> "$st/progress.md"; echo "STATUS: BLOCKED: which schema?" >> "$st/progress.md"'
 CC_CLAUDE="$T/askclaude" "$B/cc-loop" $REPO w11 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
 { [ "$rc" = 3 ] && [ "$(nruns w11)" = 1 ] && ! lg w11 | grep -q 'carrying on'; } && ok "STATUS: BLOCKED is never carried on — it is a question, even with work committed" || bad "blocked carried on: rc=$rc runs=$(nruns w11)"
+# …and the word it leaves is `waiting`, not `blocked`: the loop is the first to know a person is being asked, and it
+# must write what cc-reconcile and the Home tab already read out of that same journal line, or the tab prints drift.
+[ "$("$B/cc-board" get $REPO w11 status)" = waiting ] && ok "…and the board says `waiting`, the one word that reaches the owner's NEEDS YOU list — not `blocked`, which is every other way a loop stops" || bad "exit 3 board status: $("$B/cc-board" get $REPO w11 status)"
 mktrack w12 "fail every time"
 mkclaude failclaude w12 'err=true; res="fatal: it broke"'
 CC_CLAUDE="$T/failclaude" "$B/cc-loop" $REPO w12 --max-iter 5 --quiet >/dev/null 2>&1; rc=$?
@@ -687,6 +690,36 @@ for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT ki
 echo "== cc-reconcile (board vs reality: decision table + one end-to-end apply, no network) =="
 rec=$("$B/cc-reconcile" selfcheck 2>&1)
 grep -q '0 failed' <<<"$rec" && ok "cc-reconcile selfcheck: ${rec##*: }" || bad "cc-reconcile selfcheck: $rec"
+
+echo "== what the snapshot's four readers do with it (waiting vs the clock, and without it) =="
+# cc-reconcile's own selfcheck covers PRODUCING the snapshot; this covers the two things that only break in the
+# readers. Its own HOME, because ~/.cc/state/reconcile.json is a fixed path and this box's live one must not move.
+SH=$T/snaphome; mkdir -p "$SH/.cc/state" "$SH/dev/sr"
+sb(){ HOME=$SH "$B/cc-board" "$@"; }
+sb init sr "$SH/dev/sr" main >/dev/null; for t in s_ask s_clock s_stop; do sb add sr $t "title $t" "" >/dev/null; done
+sb status sr s_ask waiting >/dev/null; sb status sr s_clock running >/dev/null; sb status sr s_stop blocked >/dev/null
+# NO snapshot yet: every key a reader looks up is unset. `cc ls` runs under `set -u`, and a missing default there
+# killed the whole listing rather than one column — a stale timer must never cost the owner his board.
+lsn=$(HOME=$SH "$B/cc" ls 2>&1); lsrc=$?
+[ $lsrc = 0 ] && grep -q 's_ask' <<<"$lsn" && ok "no snapshot: \`cc ls\` still prints every track (a missing key must not kill the listing)" || bad "cc ls without a snapshot: rc=$lsrc"
+grep -q '❓' <<<"$lsn" && ok "no snapshot: a waiting track is still marked, with no question to show" || bad "cc ls dropped the waiting mark"
+dgn=$(HOME=$SH "$B/cc-digest" 2>/dev/null)
+dga=$(grep s_ask <<<"$dgn")
+grep -q '❓ needs you' <<<"$dga" && ! grep -q 'needs you:' <<<"$dga" && ok "no snapshot: the digest still says he is needed, with no colon trailing a question it does not have" || bad "digest fallback wording: $dga"
+# the snapshot cc-reconcile leaves behind — a question a PERSON must answer, and a loop waiting on the CLOCK while
+# its board word is still `running` (it hit the limit mid-run). The clock is never "needs you".
+cat > "$SH/.cc/state/reconcile.json" <<JSON
+{"at":"now","epoch":$(date -u +%s),"limit_until":0,"tracks":{
+ "sr/s_ask":{"state":"waiting","board":"waiting","live":true,"waiting_on":"person","why":"which syllabus?"},
+ "sr/s_clock":{"state":"running","board":"running","live":true,"waiting_on":"clock","why":"a Claude usage limit"},
+ "sr/s_stop":{"state":"blocked","board":"blocked","live":false,"waiting_on":"","why":""}}}
+JSON
+lss=$(HOME=$SH "$B/cc" ls 2>&1); dgs=$(HOME=$SH "$B/cc-digest" 2>/dev/null)
+grep -q 'which syllabus?' <<<"$lss" && grep -q 'which syllabus?' <<<"$dgs" && ok "snapshot: \`cc ls\` and the digest print the same question, from the one file" || bad "the question did not reach both readers"
+grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$lss")" && grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$dgs")" && ok "snapshot: a loop held by the limit says so in both — whatever word it wears (\`running\` here, not \`blocked\`)" || bad "clock row invisible while the board says running"
+! grep -q 'needs you' <<<"$(grep s_clock <<<"$dgs")" && ok "snapshot: the clock is NOT on his list — there is nothing for him to answer" || bad "a usage limit was reported as needing the owner"
+grep -q '⛔ stopped' <<<"$(grep s_stop <<<"$dgs")" && ! grep -q 'needs you' <<<"$(grep s_stop <<<"$dgs")" && ok "snapshot: a track that merely stopped reads as stopped, not as a question" || bad "a stopped track was filed as needing him"
+rm -rf "$SH"
 
 echo "== cc-publish: core/ publishes itself =="
 PUB="$T/mirror.git"; git init -q --bare "$PUB"

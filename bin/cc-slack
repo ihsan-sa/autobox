@@ -999,14 +999,21 @@ VITALS_STALE = 900                             # older than this and the tab SAY
 VITALS_TIMEOUT = 60                            # a wedged renderer must never hold the dashboard thread
 # ── THE ONE VOCABULARY (handoff §02). A track has exactly one state, and BOTH its emoji and the word printed beside it
 #    come out of this row — so they can never disagree again. Everywhere else on the tab an emoji means one thing and
-#    only that: ❓ waiting on the owner (a thread, or a PR owed a 👍) · 🔧 work with no track · 🔴 a unit down ·
-#    ⛔ blocked, or a usage limit · 🟢/🟡/⚪ a channel's session.
-HOME_STATE = {"running": ("🏃", "running"), "blocked": ("⛔", "blocked"), "queued": ("⏳", "queued"),
+#    only that: ❓ waiting on the owner (a thread, a PR owed a 👍, or a TRACK that stopped to ask) · 🔧 work with no
+#    track · 🔴 a unit down · ⛔ blocked, or a usage limit · 🟢/🟡/⚪ a channel's session.
+HOME_STATE = {"running": ("🏃", "running"), "waiting": ("❓", "waiting"), "blocked": ("⛔", "blocked"),
+              "queued": ("⏳", "queued"),
               "done": ("✅", "done"), "review": ("✅", "done"),   # `done`/`review` only survive home_track_shown while the PR waits
               "merged": ("✅", "merged")}
+# `waiting` is the one state that means A PERSON MUST ANSWER, and it takes the ❓ for exactly that reason: it is the
+# same mark a thread and an unreviewed PR wear, and the owner reads all three as "this one is mine". It is NOT
+# `blocked` — blocked is everything else that stopped (a loop that gave up, a usage limit, a kill), and blocked is
+# not on his list. Five sessions each sat four hours with a question while this table only knew how to say `running`
+# (owner, 2026-08-31: "ok fix"); cc-reconcile decides the word, home_track_state reaches the same one from the same
+# journal line, and neither ever reads it out of prose.
 HOME_ALIAS = {"todo": "queued"}                        # the one word an older board file still says for `queued`
 HOME_STALE = ("blocked", "review", "done", "merged")   # board states a live process contradicts → the line says `board stale`
-HOME_RANK = ("running", "blocked", "review", "done", "merged", "queued")   # what the owner must see first, first
+HOME_RANK = ("running", "waiting", "blocked", "review", "done", "merged", "queued")   # what the owner must see first, first
 HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and CHANNELS print EVERY row (owner,
                                                # 2026-08-30, thread 1788129807: "what happenend to showing all the
                                                # backlog items and all ? items and not defaulting to showing only a
@@ -1026,7 +1033,7 @@ HOME_CUT = ("boot", "handoffs", "audit", "chart", "channels", "backlog", "views"
                                                # to keep a picture would have failed at its job.
 HOME_ACT = ("restart_unit", "open_channel", "open_board", "next_track", "home_logs",
             "board_todo", "board_running", "board_done")   # Home buttons that reach the daemon
-HOME_VIEWS = (("board_todo", "To do", ("queued",)), ("board_running", "Running", ("running",)),
+HOME_VIEWS = (("board_todo", "To do", ("queued",)), ("board_running", "Running", ("running", "waiting")),
               ("board_done", "Done", ("done", "review", "merged")))   # the board VIEW buttons, in the order they sit —
 HOME_VIEW = {a: (lab, st) for a, lab, st in HOME_VIEWS}   # one slice of the board each, DM'd, never the whole board
 
@@ -1052,15 +1059,24 @@ def _home_btn(label, action, value="", url="", style=""):
     return b
 
 
-def home_track_state(status, live):
-    """ONE state for a track, decided once by a LADDER (handoff §02), from two sources that contradict each other in the
-    live data every day:  alive → running · else board=blocked → blocked · else board∈{done,merged,review} → ✅ · else queued.
+def home_track_state(status, live, asked=False):
+    """ONE state for a track, decided once by a LADDER (handoff §02), from sources that contradict each other in the live
+    data every day:  it asked → waiting · else alive → running · else board=blocked → blocked · else board∈{done,merged,
+    review} → ✅ · else queued.
 
-    PROCESS PRESENCE WINS. A `claude` running in the track's worktree is the strongest fact the box has about that track,
-    and it is the fact the owner is asking about when they open the tab. The board is a file a worker updates between
-    turns; when it disagrees the line still says `running` and the disagreement is printed as `· board stale`
-    (home_track_stale) so the owner can see WHICH source is behind, instead of the tab silently picking one. A status
-    nobody recognises is `queued`, never a bare "?" — the vocabulary has no room for a state with no word."""
+    A DECLARATION OUTRANKS PRESENCE, and that rung is the top one for a reason. Presence used to win outright, so five
+    course sessions that had each stopped to ask the owner a question were printed as `running` for four hours and
+    reached no list of his (owner, 2026-08-31: "ok fix"). A live pid says a process exists; it does not say anything is
+    going to happen. `asked` is the worker's OWN `STATUS: BLOCKED: <question>` line (home_reason), the box's
+    sender-decides protocol and the same fact cc-reconcile settles the board with — so the tab and the board reach one
+    word from one source, and neither ever infers it from journal prose.
+
+    PROCESS PRESENCE STILL WINS OVER THE BOARD. A `claude` in the worktree with nothing declared is the strongest fact
+    the box has; the board is a file a worker updates between turns, and when it disagrees the line says `running` with
+    `· board stale` beside it (home_track_stale) instead of the tab silently picking one. A status nobody recognises is
+    `queued`, never a bare "?" — the vocabulary has no room for a state with no word."""
+    if asked and status not in ("merged", "done"):
+        return "waiting"                     # …and a finished track is never re-opened by an old question in its journal
     if live:
         return "running"
     if status in HOME_STATE and status != "running":
@@ -1293,9 +1309,13 @@ def home_needs(st, names=None):
         if pr.get("num") and pr.get("owed") and t.get("state") in ("review", "done"):
             out.append((1, 0.0, f"❓ *PR #{pr['num']}*" + (f" {pr['repo']}" if pr.get("repo") else "") + " · awaiting review"))
     for t in tracks:
-        if t.get("state") == "blocked" and t.get("reason"):
-            out.append((2, 0.0, f"⛔ *{names.get(t.get('name'), home_short(t.get('name')))}* · "
-                                f"{home_ask(t.get('reason') or 'blocked')}"))   # the reason is an ask like any other: one line
+        # `waiting` FIRST, then `blocked`: both carry the worker's own question, and the one that stopped to ask
+        # outranks the one that merely stopped. A track with no reason is on neither list — the board's word alone
+        # has never put a row here, and a session waiting on the CLOCK (a usage limit) is not waiting on him at all.
+        if t.get("state") in ("waiting", "blocked") and t.get("reason"):
+            out.append((2 if t.get("state") == "waiting" else 3, 0.0,
+                        f"{HOME_STATE[t['state']][0]} *{names.get(t.get('name'), home_short(t.get('name')))}* · "
+                        f"{home_ask(t.get('reason') or 'blocked')}"))   # the reason is an ask like any other: one line
     return [line for _, _, line in sorted(out, key=lambda r: (r[0], r[1], r[2]))]
 
 
@@ -1360,6 +1380,7 @@ def home_parts(st):
              for u in (st.get("units") or ()) if u]                          # hint, a fixture need not
     names, box = home_names(tracks), st.get("box") or "box"
     run = [t for t in tracks if t.get("state") == "running"]
+    waiting = [t for t in tracks if t.get("state") == "waiting"]
     blocked = [t for t in tracks if t.get("state") == "blocked"]
     queued = [t for t in tracks if t.get("state") == "queued"]
     limit, until = st.get("limit") or "", home_until(st.get("limit"))
@@ -1369,6 +1390,9 @@ def home_parts(st):
 
     # 2 — the tally, then what is running. Zero counts are omitted, never printed as 0.
     p.append(("tally", _home_ctx(" · ".join(x for x in ((f"RUNNING {len(run)}" if run else "NOTHING RUNNING"),
+                                                        # counted separately and never as RUNNING: they are stopped, and
+                                                        # the count is the owner's own backlog, not the box's
+                                                        f"WAITING ON YOU {len(waiting)}" if waiting else "",
                                                         f"BLOCKED {len(blocked)}" if blocked else "",
                                                         f"QUEUED {len(queued)}" if queued else "") if x))))
     rows = [f"🔴 *{n} down*" + (f" · {h}" if h else "") for n, ok, h in units if not ok]
@@ -1379,8 +1403,9 @@ def home_parts(st):
              for q in quick]                                    # work a session did without a track: running, no board row
     if not rows:                                             # nothing runs AND nothing is wrong: say so in words, never
         last = st.get("last") or {}                          # leave the block the owner looks at first empty
-        rows.append(f"✅ last: {last['name']} · {last.get('verb', 'done')} {last.get('when', '')}".rstrip()
-                    if last.get("name") else "_the board is clear_")
+        rows.append("_nothing is running — what is waiting is below_" if waiting else
+                    (f"✅ last: {last['name']} · {last.get('verb', 'done')} {last.get('when', '')}".rstrip()
+                     if last.get("name") else "_the board is clear_"))
     p.append(("tally", _home_sec(home_list(rows, lambda k: f"_+{k} more running_", HOME_MAXTEXT))))
 
     # 3 — the band that answers "does this need me?", absent when the answer is no
@@ -1698,15 +1723,16 @@ def home_tracks(workers, prs):
             wt, pr, status = f"{HOME}/.cc/worktrees/{repo}/{tr}/.cc", str(t.get("pr") or ""), t.get("status", "?")
             num = pr.rstrip("/").rsplit("/", 1)[-1]        # the board stores a number or the full PR url
             live = f"{repo}/{tr}" in workers
-            state = home_track_state(status, live)         # ONE state, by the ladder: a live process outranks the board…
             if not home_track_shown(status, prs.get((repo, pr)) if pr else None):
                 upd = str(t.get("updated") or "")          # finished and its PR is settled: it leaves the tab, but the
                 if last is None or upd > last["at"]:       # newest of them is the quiet tab's one line
-                    last = {"at": upd, "name": f"{repo}/{tr}", "verb": HOME_STATE.get(state, ("", "done"))[1],
+                    last = {"at": upd, "name": f"{repo}/{tr}",              # no journal read here: a done/merged track
+                            "verb": HOME_STATE.get(home_track_state(status, live), ("", "done"))[1],   # is never `waiting`
                             "when": f"{upd[11:16]}Z" if len(upd) > 15 else ""}
                 continue
+            reason = home_reason(repo, tr)                 # read for EVERY track still on the tab, not just the ones the
+            state = home_track_state(status, live, bool(reason))   # board calls blocked: the declaration DECIDES (§02)
             prst = str(prs.get((repo, pr), "") if pr else "").upper()
-            reason = home_reason(repo, tr) if state == "blocked" else ""
             bits = ["board stale" if (home_track_stale(status, live) or (state == "blocked" and not reason)) else "",
                     # …and says so, instead of silently picking one — the journal contradicting the board counts too
                     "commit!" if os.path.exists(f"{wt}/checkpoint.err") else "",
@@ -6910,13 +6936,24 @@ def cmd_selfcheck():
           and hb[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in htxt
           and len(hb[11]["text"]["text"].split("\n")) == 7 and "quiet channel" not in htxt
           and "more channels" not in htxt)
-    check("home_track_state: the LADDER, and a live process WINS — a board that disagrees is printed as `board stale`, "
-          "never silently believed or silently ignored; an unknown status is `queued`, never a stateless \"?\"",
+    check("home_track_state: the LADDER, and a live process WINS OVER THE BOARD — a board that disagrees is printed as "
+          "`board stale`, never silently believed or silently ignored; an unknown status is `queued`, never a "
+          "stateless \"?\"",
           (home_track_state("blocked", True), home_track_state("blocked", False), home_track_state("todo", True),
            home_track_state("todo", False), home_track_state("merged", False), home_track_state("mystery", False))
           == ("running", "blocked", "running", "queued", "merged", "queued")
           and home_track_stale("blocked", True) and not home_track_stale("todo", True)
           and not home_track_stale("blocked", False) and hvocab(hb))
+    check("home_track_state: …but a DECLARATION outranks the pid. A session that stopped to ask the owner something is "
+          "`waiting`, not `running` — the bug that had five course sessions reading as running for four hours while "
+          "each one sat on a question (owner, 2026-08-31). A worker between iterations declared nothing and is still "
+          "running, and a finished track is never re-opened by an old question in its journal",
+          (home_track_state("running", True, True), home_track_state("running", True, False),
+           home_track_state("waiting", False, True), home_track_state("queued", False, True),
+           home_track_state("merged", False, True), home_track_state("done", False, True))
+          == ("waiting", "running", "waiting", "waiting", "merged", "done")
+          and not home_track_stale("waiting", True)          # a live pid in a track that asked is normal, not drift
+          and HOME_STATE["waiting"] == ("❓", "waiting") and HOME_RANK.index("waiting") < HOME_RANK.index("blocked"))
     check("home_blocks: a needs-you row carries the ASK, not a count (§04) — where, how long, and the thing the owner "
           "can answer without opening anything, threads ranked oldest first",
           "❓ *#abox* · 12m · pick a branch name" in htxt and "❓ *#sandbox* · 3m · confirm delete" in htxt
@@ -6927,6 +6964,14 @@ def cmd_selfcheck():
           # a blocked track's reason is an ask too: `STATUS: BLOCKED: …` out of the worker's journal, cut to one line
           and home_needs({"tracks": [{"state": "blocked", "name": "r/t", "reason": "cc-guard blocks the force-with-lease "
                                       "push of the rebase — push it yourself"}]}) == ["⛔ *t* · cc-guard blocks the force…"])
+    check("home_needs: a WAITING track is a row and wears the ❓ — the same mark a thread and an unreviewed PR wear, "
+          "because the owner reads all three as \"this one is mine\" — and it ranks above a track that merely stopped",
+          home_needs({"tracks": [{"state": "waiting", "name": "r/t", "reason": "which syllabus do you want?"}]})
+          == ["❓ *t* · which syllabus do you want"]
+          and home_needs({"tracks": [{"state": "blocked", "name": "r/b", "reason": "no GH token"},
+                                     {"state": "waiting", "name": "r/w", "reason": "ship it?"}]})
+              == ["❓ *w* · ship it", "⛔ *b* · no GH token"]
+          and home_needs({"tracks": [{"state": "waiting", "name": "r/t", "reason": ""}]}) == [])
     # ── NEEDS YOU IS NEVER WRONG: every row is a fact the box HAS. The owner's tab showed three things needing them
     #    and none did (2026-08-30) — a PR it could not see the state of, one they had already approved, and a track
     #    whose journal had moved past its own block.
@@ -6969,9 +7014,11 @@ def cmd_selfcheck():
           "was stopped by the loop's step limit, not by a question, so it does not claim the owner is being asked",
           reasons == ("which deploy key should I use", "", "", ""))
     check("home_tracks: the board saying `blocked` after its journal moved on is a stale board, printed as such — the "
-          "track stays on the tab, and off the owner's NEEDS YOU list",
-          rows == ["⛔ *stuck* · which deploy key should I…"]
-          and details == {"abox/moved": "board stale", "abox/stuck": "—"})
+          "track stays on the tab, and off the owner's NEEDS YOU list. And the one still asking is `waiting`, from "
+          "the SAME journal line cc-reconcile settles the board with, so the tab and the board cannot disagree",
+          rows == ["❓ *stuck* · which deploy key should I…"]
+          and details == {"abox/moved": "board stale", "abox/stuck": "—"}
+          and {t["name"]: t["state"] for t in htr} == {"abox/moved": "blocked", "abox/stuck": "waiting"})
     check("home_blocks: the phone line — short names, facts dropped RIGHT TO LEFT (PR, then $, then iterations) so the "
           "leftmost fact survives, and a sub-channel indented with NB-spaces Slack cannot collapse",
           home_short("sandbox/subproj-carpet-rectify") == "subproj-carpet-rectify"
@@ -7247,6 +7294,30 @@ def cmd_selfcheck():
           and "handoff" not in json.dumps(home_blocks(dict(hfix, handoffs={"today": 0})), ensure_ascii=False)
           and hbudget(hhb) and hno_empty_header(hhb) and len(hhb) == 16)
     hempty = home_blocks({})
+    hwait = home_blocks({"box": "abox", "now": "10:15Z", "units": [("tmux-main", True, "")], "load": "📈 0.30",
+                         "channels": [], "waits": [], "quick": [], "boot": "",
+                         "last": {"name": "abox/old", "verb": "merged", "when": "08:40Z", "at": "x"},
+                         "tracks": [{"state": "waiting", "name": f"lesson/ece{n}", "detail": "—", "rank": 1,
+                                     "reason": "which syllabus should I build from"} for n in (203, 206, 207)]})
+    wtxt = json.dumps(hwait, ensure_ascii=False)
+    check("home_blocks (c) WAITING — the shape the owner was shown on 2026-08-31: three sessions each stopped on a "
+          "question for him. The tally counts them as WAITING ON YOU and NOT as running, the top block points at the "
+          "band instead of claiming the board is clear or naming the last merge, and every one of them is a NEEDS YOU "
+          "row he can answer without opening anything",
+          hwait[1]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 3"
+          and hwait[2]["text"]["text"] == "_nothing is running — what is waiting is below_"
+          and hwait[3]["elements"][0]["text"] == "NEEDS YOU · 3"
+          and hwait[4]["text"]["text"].count("❓") == 3
+          and "❓ *ece203* · which syllabus should I b…" in wtxt
+          and "🏃" not in wtxt and "RUNNING 3" not in wtxt and "the board is clear" not in wtxt
+          and "✅ last" not in wtxt)
+    check("home_blocks: …and one waiting track is not the same as one BLOCKED track — the blocked one is off his list "
+          "(it stopped, it is not asking) and is never counted as waiting on him",
+          json.dumps(home_blocks({"box": "abox", "now": "10:15Z", "units": [], "load": "", "channels": [],
+                                  "waits": [], "quick": [], "boot": "", "last": None,
+                                  "tracks": [{"state": "blocked", "name": "r/t", "detail": "—", "rank": 2,
+                                              "reason": ""}]}), ensure_ascii=False).count("WAITING ON YOU") == 0)
+
     hjunk = [{"tracks": [{"state": "running"}, {}], "channels": [{"name": None, "depth": "x"}], "units": [("u",)],
               "waits": [{"age": "nonsense"}]}, {"units": [], "tracks": None, "channels": None, "waits": None},
              {"units": [("a", True, "h"), ("b", False)], "limit": "weird", "audit": "x" * 4000, "boot": None},

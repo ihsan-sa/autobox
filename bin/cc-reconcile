@@ -9,6 +9,7 @@ the owner's idea of what the box is doing — reads the board, so that drift is 
   cc-reconcile [repo …]              report the drift, change nothing
   cc-reconcile --apply               …and fix what is mechanically decidable, and STOP a runaway
   cc-reconcile --apply --notify      …and push what is NOT to the owner (once a day per finding)
+  cc-reconcile snapshot              print the read-only state snapshot (and refresh it), ask nothing of the network
   cc-reconcile selfcheck             the decision table + one end-to-end run, no network
     also: --json · -q · --no-net (never ask GitHub) · --grace SEC (default 600) · --repeat SEC (default 86400)
           --no-stop (report a runaway, never end it)
@@ -24,6 +25,18 @@ anything: a `claude` whose cwd is the track's worktree (the Home tab's rule), a 
 (alive for hours with no claude under it while it waits out a usage limit), or a live pane in the track's
 tmux window. Any of the three and the track is running, whatever the board says. Missing that would turn
 this into a tool that stops work instead of describing it — hence also --grace, below.
+
+WHAT COUNTS AS WAITING, which is NOT the opposite of alive. `running` used to mean "a process exists", so five
+sessions that had each stopped to ask the owner a question were indexed as running for four hours and reached no
+list of his (owner, 2026-08-31: "ok fix"). The question is not whether a pid is there — all five were — but
+whether anything happens WITHOUT HIM. A worker's own `STATUS: BLOCKED: <question>` line is the declaration, and
+it outranks presence: that track is `waiting`, and it is an `ask` for as long as the question stands. A loop
+sitting out a usage limit is waiting on the CLOCK, gets its own row and never reaches him. A worker between
+iterations has declared nothing and is simply running. See waits_for(); nothing is ever inferred from prose.
+
+THE SNAPSHOT (~/.cc/state/reconcile.json, review rec #7). Every unfiltered run writes what it just decided —
+effective state, live presence, who each track waits on and why. This tool is the sole decider; `cc-digest` and
+`cc ls` read that file rather than re-deriving any of it, and fall back to the board when it is missing or stale.
 
 THE ONE RUNAWAY cc-loop CANNOT CATCH is its own. cc-loop judges a loop that is looping — three iterations in a
 row with nothing to show and it stops itself. A loop that is WEDGED never finishes an iteration, so it never
@@ -136,6 +149,16 @@ def limit_active():
         return False
 
 
+def limit_until():
+    """When the standing usage limit lifts (epoch), or 0. The snapshot carries the hour so a consumer can say
+    "held until 17:06" without re-reading cc-limit's stamp."""
+    try:
+        t = float(open(os.environ.get("CC_LIMIT_STAMP") or f"{STATE}/claude-limit").read().split()[0])
+        return t if t > now() else 0.0
+    except Exception:
+        return 0.0
+
+
 def runaway(f, seen_before, wedged=WEDGED):
     """Pure — why this LIVE track is spending without working, or "". The orphan is unambiguous and immediate;
     the wedged one has to be seen twice, because "nothing moved" is also what a slow hour looks like."""
@@ -146,6 +169,30 @@ def runaway(f, seen_before, wedged=WEDGED):
         return (f"its loop is wedged: alive with nothing moved for {f['idle'] / 3600:.1f} h — no commit, no "
                 "journal line, no iteration, and no usage limit to be waiting on")
     return ""
+
+
+def waits_for(f):
+    """Pure — ("person"|"clock"|"", why): who this track is waiting on. THE ROW THIS TOOL WAS MISSING. Five course
+    sessions sat four hours with a question for the owner while everything here said `running`, because every rule
+    below asks "is a process alive" and all five were. Alive is not the question. The question is whether anything
+    happens WITHOUT HIM.
+
+    A PERSON, and only because the worker SAID SO. The one thing that declares it is the worker's own
+    `STATUS: BLOCKED: <question>` line — the box's sender-decides protocol, the same line the Home tab reads. Journal
+    PROSE is never read for this: "waiting for the syllabus" in a sentence is not a declaration, and a NEEDS YOU row
+    the owner cannot act on costs more than the row we leave out. A declaration OUTRANKS a live process, because a
+    worker that wrote it has stopped whatever its pid is still doing.
+
+    THE CLOCK IS NOT A PERSON. A `cc-loop` sitting out a Claude usage limit resumes by itself at a known hour; telling
+    the owner to act on it is telling him to do nothing. It is its own row, with its own word, and it never reaches
+    NEEDS YOU. Narrow on purpose — a live loop with no worker under it, while a limit stands — so that a track merely
+    stopped for some other reason is not quietly filed under the clock."""
+    jk, jt = f.get("journal") or (None, "")
+    if jk == "BLOCKED":
+        return ("person", jt or "it stood down without saying what it needs")
+    if f.get("limited") and f.get("loops") and not f.get("workers"):
+        return ("clock", "a Claude usage limit — the loop resumes by itself, nobody is being asked")
+    return ("", "")
 
 
 def tmux_live(ppids):
@@ -227,19 +274,27 @@ def decide(f):
     Returns [(kind, status|None, why)]:  fix = decidable, applied silently · ask = needs a person, applied
     when it also has one right status and always reported · info = could not tell, only printed."""
     st, live, pr, has_pr = f["status"], f["live"], f.get("pr_state") or "", bool(f.get("pr"))
-    jk, jt = f.get("journal") or (None, "")
+    jk = (f.get("journal") or (None, ""))[0]
+    who, wwhy = waits_for(f)      # waits_for owns the question itself: this only needs to know DONE from not-DONE
     out, settled = [], False
     if f.get("stop_why"):               # spending without producing: the one live track this tool ends rather than describes
         out.append(("stop", "blocked", f["stop_why"]))
         settled = True
-    elif live and st in QUEUED + ("blocked",):
+    elif who == "person" and st not in TERMINAL:
+        # ABOVE THE PRESENCE RULE ON PURPOSE. `waiting` is reported every run, not just the run that sets it: the
+        # finding is "he is being waited on", and that stays true — and stays worth one push a day — for as long as
+        # the question does. It goes back to `running` by itself the moment the journal's newest STATUS is not BLOCKED.
+        out.append(("ask", "waiting", "it is waiting on you: " + wwhy))
+        settled = True
+    elif who == "clock" and st not in TERMINAL + QUEUED:
+        out.append(("held", None, "waiting on the clock, not on you: " + wwhy))   # never an `ask`: there is nothing to answer
+        settled = True
+    elif live and st in QUEUED + ("blocked", "waiting"):
         out.append(("fix", "running", "a worker is in its worktree"))
         settled = True
-    elif not live and st == "running" and f["age"] >= f.get("grace", GRACE):
+    elif not live and st in ("running", "waiting") and f["age"] >= f.get("grace", GRACE):
         settled = True                                  # nobody is working on it: the board's own word for that is decided here, once
-        if jk == "BLOCKED":
-            out.append(("ask", "blocked", "it stood down: " + (jt or "no question in its journal")))
-        elif jk == "DONE" and pr == "MERGED":
+        if jk == "DONE" and pr == "MERGED":
             out.append(("fix", "merged", "it finished and its PR merged"))
         elif jk == "DONE" and has_pr:
             out.append(("fix", "review", "it finished and its PR is open"))
@@ -271,6 +326,31 @@ def decide(f):
     if f.get("push_err"):
         out.append(("ask", None, "its branch is not pushed"))
     return out
+
+
+def effective(f, recs):
+    """Pure — THE ONE WORD for a track (review rec #7: this tool is the sole decider). What decide() would set
+    outranks the board, because decide() has just looked at the box and the board is a file somebody wrote between
+    turns. No record with a status means nothing here disagrees, and the board's own word stands."""
+    for _, st, _ in recs:
+        if st:
+            return st
+    return f["status"] or "queued"
+
+
+def snapshot(rows, limit=0.0):
+    """The read-only answer to "what is every track, really", as a dict ready for ~/.cc/state/reconcile.json.
+
+    ONE DECIDER, NOT A SECOND TRUTH. The board holds the word; this holds the three things one word cannot — who a
+    track is waiting on (a person, the clock, or nobody), why, and whether anything is alive — so `cc-digest` and
+    `cc ls`, which have no process table of their own, print what the Home tab prints instead of each guessing.
+    It is an OUTPUT: nothing here ever reads it back, and a consumer that finds it missing or stale falls back to
+    the board rather than going blind."""
+    return {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "epoch": int(now()),
+            "limit_until": int(limit or 0),
+            "tracks": {f"{repo}/{track}": {"state": state, "board": f["status"], "live": bool(f["live"]),
+                                           "waiting_on": who, "why": why}
+                       for repo, track, f, state, who, why in rows}}
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -379,6 +459,9 @@ def ledger(path, write=None):
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
+    snap_only = argv[:1] == ["snapshot"]
+    if snap_only:
+        argv = argv[1:] + ["--no-net"]              # a snapshot is a local read: it must never stall on GitHub
     repos, apply_, notify, as_json, quiet, net, grace, repeat = [], False, False, False, False, True, GRACE, REPEAT
     no_stop, wedged = False, int(os.environ.get("CC_RECONCILE_WEDGED") or WEDGED)   # env: tests do not wait three hours
     while argv:
@@ -413,13 +496,17 @@ def main(argv):
         if not os.path.exists(f"{BOARDS}/{r}.json"):
             print(f"cc-reconcile: no board for '{r}'", file=sys.stderr)
             return 2
-    recs, tracks, wedging = [], 0, {}
+    recs, tracks, wedging, snaprows = [], 0, {}, []
     for repo, track, t, f in facts(repos, net, grace, no_stop, wedged):
         tracks += 1
         if f.get("wedged_now"):
             wedging[f"{repo}/{track}"] = now()          # one strike; the next run 20 min from now decides
-        for kind, st, why in decide(f):
-            rec = {"repo": repo, "track": track, "kind": kind, "from": f["status"], "to": st, "why": why}
+        mine = decide(f)
+        state = effective(f, mine)
+        who, why = waits_for(f) if state not in TERMINAL else ("", "")   # a finished track waits on nobody, whatever
+        snaprows.append((repo, track, f, state, who, why))               # its journal still says three weeks later
+        for kind, st, why_ in mine:
+            rec = {"repo": repo, "track": track, "kind": kind, "from": f["status"], "to": st, "why": why_}
             if kind == "stop":
                 rec["pids"] = f["workers"] + f["loops"]
             recs.append(rec)
@@ -443,19 +530,34 @@ def main(argv):
                 what = "STOPPED" if r["kind"] == "stop" else f"{r['from']} -> {r['to']}"
                 log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t"
                           f"{r['repo']}/{r['track']}\t{what}\t{r['why']}\n")
+    snap = snapshot(snaprows, limit_until())
+    if not repos:                                   # a filtered run knows about one repo: it must never clobber the whole box's
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            tmp = f"{STATE}/reconcile.json.tmp"
+            json.dump(snap, open(tmp, "w"), indent=2)
+            os.replace(tmp, f"{STATE}/reconcile.json")
+        except OSError:
+            pass                                    # a snapshot nobody could write is a consumer falling back, not a failed run
+    if snap_only:
+        print(json.dumps(snap, indent=2))
+        return 0
     asks = [r for r in recs if r["kind"] in ("ask", "stop")]   # a runaway that was ended is still a person's to settle
     if as_json:
         print(json.dumps({"tracks": tracks, "records": recs}, indent=2))
     elif not quiet:
         for r in recs:
             move = f"{r['from']} → {r['to']}" if r["to"] and r["to"] != r["from"] else ""
-            word = {"ask": "needs you", "info": "unknown",
+            word = {"ask": "needs you", "info": "unknown", "held": "held",
                     "stop": "stopped" if r["applied"] else "runaway"}.get(
                         r["kind"], "fixed" if r["applied"] else "would fix")
             print(f"  {word:<9}  {r['repo']}/{r['track']:<16} {move:<20} {r['why']}")
         info = sum(r["kind"] == "info" for r in recs)
-        print(f"{len(recs) - len(asks) - info} {'fixed' if apply_ else 'to fix'} · {len(asks)} needs you · "
-              f"{info} unknown  ({tracks} tracks)" if recs else f"the board matches reality ({tracks} tracks)")
+        held = sum(r["kind"] == "held" for r in recs)   # known, and not the owner's: it says so in its own word
+        print(" · ".join(x for x in (f"{len(recs) - len(asks) - info - held} {'fixed' if apply_ else 'to fix'}",
+                                     f"{len(asks)} needs you", f"{held} held on the clock" if held else "",
+                                     f"{info} unknown") if x) + f"  ({tracks} tracks)"
+              if recs else f"the board matches reality ({tracks} tracks)")
     if notify:
         path = f"{STATE}/reconcile.seen.json"
         old, t0 = ledger(path), now()
@@ -493,7 +595,8 @@ def selfcheck():
     def F(**kw):
         d = {"status": "running", "pr": "", "pr_state": None, "live": False, "wt_exists": True,
              "age": 10 ** 6, "grace": GRACE, "journal": (None, ""), "loop_end": "",
-             "commit_err": False, "push_err": False, "has_remote": True}
+             "commit_err": False, "push_err": False, "has_remote": True,
+             "limited": False, "loops": [], "workers": []}
         d.update(kw)
         return d
 
@@ -506,8 +609,8 @@ def selfcheck():
     ok("live worker in a merged track is not un-merged", one(status="merged", live=True, pr="u", pr_state="MERGED") == ("none", None))
     ok("running + no worker, but dispatched seconds ago → left alone", one(age=5, grace=600) == ("none", None))
     # running with nobody working on it: the evidence decides which word replaces it
-    ok("journal BLOCKED → blocked, and the owner is asked",
-       decide(F(journal=("BLOCKED", "which one?")))[0][:2] == ("ask", "blocked"))
+    ok("journal BLOCKED → waiting, and the owner is asked",
+       decide(F(journal=("BLOCKED", "which one?")))[0][:2] == ("ask", "waiting"))
     ok("the blocked question is carried, not summarised", "which one?" in decide(F(journal=("BLOCKED", "which one?")))[0][2])
     ok("journal DONE + merged PR → merged", one(journal=("DONE", ""), pr="u", pr_state="MERGED") == ("fix", "merged"))
     ok("journal DONE + open PR → review", one(journal=("DONE", ""), pr="u", pr_state="OPEN") == ("fix", "review"))
@@ -532,6 +635,45 @@ def selfcheck():
     ok("review with no PR and a remote → asks", any("never opened" in w for _, _, w in decide(F(status="review"))))
     ok("review with no PR and no remote is silent", decide(F(status="review", has_remote=False)) == [])
     ok("a quiet track says nothing", decide(F(status="review", pr="u", pr_state="OPEN")) == [])
+
+    # WAITING — the row this tool was missing (owner, 2026-08-31). Alive is not the question; "does anything happen
+    # without him" is. Every case here is about telling the three idle shapes apart.
+    ok("a session ALIVE with a question for the owner is waiting, not running — the declaration outranks the pid, "
+       "which is the whole bug: five of these said `running` for four hours",
+       decide(F(status="running", live=True, journal=("BLOCKED", "which syllabus?")))[0][:2] == ("ask", "waiting"))
+    ok("…and it is an ASK, so it reaches him, every run, for as long as the question stands",
+       decide(F(status="waiting", live=True, journal=("BLOCKED", "which syllabus?")))[0][0] == "ask")
+    ok("a worker BETWEEN ITERATIONS declared nothing and is simply running — not waiting on anyone",
+       waits_for(F(live=True, loops=[2], workers=[1])) == ("", "")
+       and decide(F(status="queued", live=True, loops=[2], workers=[1]))[0][:2] == ("fix", "running"))
+    ok("a loop sitting out a usage limit waits on the CLOCK, not on a person, and never becomes an `ask`",
+       waits_for(F(limited=True, loops=[2]))[0] == "clock"
+       and [k for k, _, _ in decide(F(status="blocked", live=True, limited=True, loops=[2]))] == ["held"])
+    ok("…and the two are told apart by WHO, not by the word `blocked`",
+       waits_for(F(journal=("BLOCKED", "ship it?")))[0] == "person"
+       and waits_for(F(limited=True, loops=[2]))[0] == "clock")
+    ok("a limit standing over a track that is actually WORKING is not the clock's doing",
+       waits_for(F(limited=True, loops=[2], workers=[1])) == ("", ""))
+    ok("a stood-down track goes back to running by itself once its journal stops saying BLOCKED",
+       decide(F(status="waiting", live=True))[0][:2] == ("fix", "running"))
+    ok("…and with nobody in the worktree either, `waiting` is reconciled like a stale `running` is",
+       decide(F(status="waiting", live=False))[0][:2] == ("ask", "blocked"))
+    ok("a merged track is never re-opened by an old question in its journal",
+       decide(F(status="merged", journal=("BLOCKED", "old"), pr="u", pr_state="MERGED")) == [])
+    ok("STATUS: BLOCKED with no question is still a declaration — it stopped, and only a person restarts it",
+       decide(F(journal=("BLOCKED", "")))[0][:2] == ("ask", "waiting"))
+    ok("nothing is ever inferred from prose: a journal that merely TALKS about waiting declares nothing",
+       waits_for(F(journal=(None, "waiting on the owner for the syllabus"))) == ("", ""))
+    # the snapshot: one decider, and a word for every track (rec #7)
+    ok("the snapshot's word is what decide() would set, not what the board says",
+       effective(F(status="running", live=True, journal=("BLOCKED", "q")),
+                 decide(F(status="running", live=True, journal=("BLOCKED", "q")))) == "waiting")
+    ok("…and the board's own word when nothing disagrees with it",
+       effective(F(status="review", pr="u", pr_state="OPEN"), []) == "review")
+    ok("the snapshot carries who and why, which one status word cannot",
+       snapshot([("r", "t", F(status="running", live=True), "waiting", "person", "which syllabus?")])
+       ["tracks"]["r/t"] == {"state": "waiting", "board": "running", "live": True,
+                             "waiting_on": "person", "why": "which syllabus?"})
 
     # the runaway cc-loop cannot catch: its own. Both shapes are ALIVE, which is why nothing else here sees them
     def W(**kw):
@@ -572,10 +714,11 @@ def selfcheck():
         r = subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--apply", "--notify",
                             "--no-net", "--grace", "0"], env=env, capture_output=True, text=True, timeout=120)
         ok("end to end: exits 1 when something needs a person", r.returncode == 1)
-        ok("end to end: the stalled track is blocked on the board now",
-           cb("get", repo, "t1", "status").stdout.strip() == "blocked")
+        ok("end to end: the track that stood down says `waiting` on the board now — not `running`, and not the "
+           "`blocked` that reads the same as a loop that gave up",
+           cb("get", repo, "t1", "status").stdout.strip() == "waiting")
         ok("end to end: the board carries a note saying it was reconciled",
-           any("reconciled: running → blocked" in n["msg"]
+           any("reconciled: running → waiting" in n["msg"]
                for n in json.loads(cb("json", repo).stdout)["tracks"]["t1"]["notes"]))
         ok("end to end: the question from the journal reached the report", "which schema?" in r.stdout)
         ok("end to end: the orphaned worktree is reported", f"{repo}/t3" in r.stdout)
@@ -585,8 +728,17 @@ def selfcheck():
                              "--no-net", "--grace", "0"], env=env, capture_output=True, text=True, timeout=120)
         ok("end to end: a second run does not page the owner again",
            sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines()) == 1)
-        ok("end to end: and it is idempotent — the track stays blocked",
-           cb("get", repo, "t1", "status").stdout.strip() == "blocked" and r2.returncode == 1)
+        ok("end to end: and it is idempotent — the track stays waiting",
+           cb("get", repo, "t1", "status").stdout.strip() == "waiting" and r2.returncode == 1)
+        r3 = subprocess.run([sys.executable, os.path.realpath(__file__), "snapshot"],
+                            env=env, capture_output=True, text=True, timeout=120)
+        snp = json.loads(r3.stdout)
+        ok("end to end: `snapshot` prints every track's real state, who it waits on and why",
+           snp["tracks"][f"{repo}/t1"]["state"] == "waiting"
+           and snp["tracks"][f"{repo}/t1"]["waiting_on"] == "person"
+           and "which schema?" in snp["tracks"][f"{repo}/t1"]["why"])
+        ok("end to end: …and leaves it on disk for cc-digest and `cc ls` to read",
+           json.load(open(f"{th}/.cc/state/reconcile.json"))["tracks"][f"{repo}/t1"]["state"] == "waiting")
         victim = subprocess.Popen(["sleep", "60"], start_new_session=True)   # its own group, so nothing else is in range
         ended = end_it([victim.pid])
         try:

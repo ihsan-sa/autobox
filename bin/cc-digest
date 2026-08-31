@@ -4,6 +4,15 @@ set -uo pipefail
 B="$(dirname "$(readlink -f "$0")")"; BOARD="$B/cc-board"; out=""   # sibling, so a worktree copy tests itself
 add(){ out+="$1"$'\n'; }
 mapfile -t rows < <("$BOARD" list 2>/dev/null)
+# THE SNAPSHOT IS THE DECIDER (cc-reconcile, review rec #7): effective state, and who each track waits on. The board
+# holds one word; this holds the thing one word cannot — whether a stopped track is waiting on a PERSON or on the
+# CLOCK. Stale or missing, we fall back to the board rather than going blind: a digest is never worth a stall.
+SNAP="$HOME/.cc/state/reconcile.json"; SNAP_FRESH=3600   # ~3 ticks of the 20-min cc-reconcile timer
+declare -A EFF WHO WHY
+if [ -r "$SNAP" ] && [ "$(( $(date -u +%s) - $(jq -r '.epoch // 0' "$SNAP" 2>/dev/null || echo 0) ))" -lt "$SNAP_FRESH" ]; then
+  while IFS=$'\t' read -r k es ew ey; do [ -n "${k:-}" ] && { EFF["$k"]=$es; WHO["$k"]=$ew; WHY["$k"]=$ey; }
+  done < <(jq -r '.tracks // {} | to_entries[] | [.key, (.value.state//""), (.value.waiting_on//""), (.value.why//"")] | @tsv' "$SNAP" 2>/dev/null)
+fi
 declare -A CTX; while IFS=$'\t' read -r cr ct cp _ _ _ ca cl cpend; do   # a context is news once it is due a journal; below that it changes nothing. cc-context names the line — it knows each session's own window and floors
   [ -n "${cr:-}" ] && [ "$cr" != - ] && [ -z "${CTX[$cr/$ct]:-}" ] && [ "${ca:-0}" -lt 86400 ] || continue
   case "$cl" in journal) CTX["$cr/$ct"]=" 🧠 ctx $cp% — journal";; handoff) CTX["$cr/$ct"]=" 🧠 ctx $cp% — hand off";; ceiling) CTX["$cr/$ct"]=" 🧠 ctx $cp% — hand off NOW";; esac
@@ -16,7 +25,17 @@ if [ ${#rows[@]} -eq 0 ]; then add "no tracks"; else
     last=$("$BOARD" json "$repo" 2>/dev/null | jq -r --arg t "$tr" '.tracks[$t].notes[-1].msg // ""' | tr '\n' ' ' | cut -c1-110)
     cost=$(cat ~/.cc/state/"$repo"/"$tr"/runs/*.json 2>/dev/null | jq -s 'map(.total_cost_usd // 0) | add // 0' 2>/dev/null); cs=""; [ -n "$cost" ] && [ "$cost" != 0 ] && cs=$(printf ' $%.2f' "$cost")
     ps=""; [ -f ~/.cc/worktrees/"$repo"/"$tr"/.cc/checkpoint.err ] && ps=" commit!"; [ -f ~/.cc/worktrees/"$repo"/"$tr"/.cc/push.err ] && ps="$ps push!"   # the checkpoint hook refused / could not push
-    flag=""; case "$st" in blocked) flag=" ❓ needs you";; review) [ -n "$pr" ] && flag=" ❓ PR to review";; esac   # phone-first: one bullet per track, needs-you marked
+    st="${EFF[$repo/$tr]:-$st}"   # what cc-reconcile decided, not the word a worker last wrote between turns
+    # phone-first: one bullet per track, and ONLY a question a person must answer is marked "needs you". A track held
+    # by a usage limit is waiting on the clock and starts again by itself; a track that merely stopped is not asking.
+    why=$(printf '%s' "${WHY[$repo/$tr]:-}" | tr '\n' ' ' | cut -c1-60)
+    flag=""; case "$st" in
+      waiting) flag=" ❓ needs you${why:+: $why}";;   # a stale snapshot leaves no question: still say he is needed, just without one
+      blocked) [ "${WHO[$repo/$tr]:-}" != clock ] && flag=" ⛔ stopped";;
+      review) [ -n "$pr" ] && flag=" ❓ PR to review";;
+    esac
+    # the clock gets its row whatever word the track wears — a loop that hit the limit mid-run still says `running`
+    [ "${WHO[$repo/$tr]:-}" = clock ] && flag=" ⏳ held by the usage limit"
     title=""; [ "$ti" != "$tr" ] && title=" — ${ti:0:60}"
     add "• *$repo/$tr* $st$flag$title$prs$cs$ps${CTX[$repo/$tr]:-}"; [ -n "$last" ] && add "    ↳ $last"; done; fi
 asks=$("$B/cc-scope" digest 2>/dev/null); [ -n "$asks" ] && add "$asks"   # what the OWNER asked for and has not had closed — the board only knows what the box took on

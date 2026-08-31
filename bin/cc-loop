@@ -19,7 +19,7 @@
 # Task text:  ~/.cc/state/<repo>/<track>/task.md      (written by `cc <repo> <track> --go "..."` or by hand)
 # Journal:    ~/.cc/state/<repo>/<track>/progress.md  (worker appends; a fresh iteration reads it)
 # Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch).
-# Exit: 0 done | 3 blocked (owner notified) | 5 errors | 6 step limit with nothing committed | 7 capped twice
+# Exit: 0 done | 3 waiting on the owner, board `waiting` (notified) | 5 errors | 6 step limit with nothing committed | 7 capped twice
 #       with no progress | 9 runaway (spending without producing — see above)
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
@@ -45,8 +45,11 @@ kill_child(){ [ -n "$child" ] || return 0   # only ever signal a group we own: i
   if [ "$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ')" = "$child" ]; then kill -TERM -- -"$child" 2>/dev/null; sleep 2; kill -KILL -- -"$child" 2>/dev/null
   else kill -TERM "$child" 2>/dev/null; fi; }
 trap 'kill_child; log "signalled — iteration aborted and its claude killed"; exit 130' HUP INT TERM   # tmux kill-window would otherwise re-parent claude to systemd, still editing this worktree
-stop(){ local code="$1" title="$2" msg="$3"   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
-  "$BOARD" status "$repo" "$track" blocked >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
+stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}"   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
+  # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
+  # writes the same word cc-reconcile would 20 min later — otherwise the board says `blocked` while the Home tab, reading
+  # the very journal line this exit came from, already says `waiting`, and the tab prints the two of them as drift.
+  "$BOARD" status "$repo" "$track" "$st" >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
   log "exit $code: $msg"; "$BIN/cc-notify" -p high -t "$repo/$track $title" "$msg"; exit "$code"; }
 base=$(git -C "$HOME/dev/$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); base="${base:-main}"
 SP="You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$base' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Be concise in the journal."
@@ -87,7 +90,7 @@ while [ $i -lt "$MAXI" ]; do
     log "DONE"; "$BIN/cc" done "$repo" "$track" 2>&1 | tail -1 | tee -a "$LOG" >&2
     "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $("$BOARD" get "$repo" "$track" pr)"; exit 0; fi
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
-    stop 3 "needs you" "$q  (answer: append it to $ST/task.md, drop the STATUS line from $ST/progress.md, then: cc $repo $track --go \"\")"; fi
+    stop 3 "needs you" "$q  (answer: append it to $ST/task.md, drop the STATUS line from $ST/progress.md, then: cc $repo $track --go \"\")" waiting; fi
   if [[ "$subtype" == error_max_* ]] && [ "$moved" = yes ]; then errs=0; caps=0; log "capped ($subtype) but the iteration produced work — not an error, continuing"
   elif [[ "$subtype" == error_max_* ]]; then caps=$((caps+1)); log "capped ($subtype) with nothing to show ($caps)"
        [ $caps -ge 2 ] && stop 7 "hit its cap" "Two capped iterations with no commits or journal change (\$$spent). Raise --budget/--turns or split the task; log: $LOG"
