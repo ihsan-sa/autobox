@@ -19,7 +19,8 @@
 #   cc quick [doing|done] "…"  log a small task done without a track (Slack Home shows the last 24 h)
 #   cc done <repo> <track>    push + open a PR into the default branch (nothing auto-merges)
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
-#   cc board <args>           shared board (cc board show <repo>)      cc -c <repo> [track]  force --continue
+#   cc board <args>           shared board (cc board show <repo>; --all also shows finished tracks)
+#                             cc -c <repo> [track]  force --continue
 #   cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session
 #                                              anyone in the channel is heard (membership is the access control), DMs are the owner's; new channels are private
 #   cc rc status|restart      the always-on boot session (window box); restart to pick up new flags (ends its conversation)
@@ -36,7 +37,7 @@ chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slac
 sp_track(){ local repo="$1" track="$2" base="$3" st="$STBASE/$1/$2"
   printf %s "You are an orchestrated session for track '$track' of repo '$repo' (own git worktree, branch track/$track). Durable state: journal $st/progress.md (read it first if it exists; append dated entries: done / next / gotchas — a fresh session rehydrates from it), task $st/task.md if present. Board: 'cc board show $repo'; report with 'cc board note $repo $track \"...\"' and 'cc board status $repo $track running|review|blocked'. Your work is auto-committed and pushed to track/$track after every turn — do NOT run git commit/push yourself, and never touch branch '$base'. When done run 'cc done $repo $track' (opens a PR; do not merge). Reach the owner only when truly blocked: 'cc-notify -t \"$repo/$track\" \"question\"'. Keep answers concise; use subagents for large read/search work to protect your context — 'cc-context' says how full it actually is, and you will be told when it is time to write a handoff entry so a fresh session can take over."; }
 sp_main(){ local repo="$1" base="$2"
-  printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<instructions>\"' then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."; }
+  printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<brief>\"' (the brief's one home is ~/.cc/state/$repo/<track>/task.md; add and --go only ever ADD to it — replacing one is 'cc board set $repo <track> instructions \"...\"') then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."; }
 member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
 MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed)."
 ensure_main(){ tmux has-session -t "$SESSION" 2>/dev/null || "$BIN/cc-boot"; }   # server creation goes through tmux-main.service (cgroup ownership; 2026-08-26 incident)
@@ -148,8 +149,8 @@ case "${1:-}" in
       git -C "$wt" push -u origin "$branch" 2>"$wt/.cc/push.err" >/dev/null || { echo "cc: push failed — no PR opened:"; tail -3 "$wt/.cc/push.err"; exit 1; }
       rm -f "$wt/.cc/push.err"
     fi
-    title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"; instr=$("$BOARD" get "$repo" "$track" instructions)
-    [ -f "$STBASE/$repo/$track/task.md" ] && instr="$(cat "$STBASE/$repo/$track/task.md")"
+    title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"
+    instr=$("$BOARD" get "$repo" "$track" instructions)   # the brief, from its one home: $STBASE/$repo/$track/task.md
     url=$(cd "$wt" && gh pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null)   # `gh pr view` also returns a MERGED PR and would silently reuse it
     if [ -z "$url" ]; then   # no OPEN PR is not the same as no PR: a squash-merge deletes the branch, so the late caller
       tip=$(git -C "$wt" rev-parse "$branch" 2>/dev/null)   # saw nothing open and opened a duplicate of commits already merged
@@ -278,25 +279,22 @@ while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; s
 case "$mode" in
   say) have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
   go)  if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
-       # The brief is ONE thing kept in TWO places: the board's `instructions` and $st/task.md. `cc board add`
-       # writes only the board; a person or a worker may write only the file. So RECONCILE both before dispatch,
-       # then treat `--go "…"` as a covering note ON TOP of the brief — never a replacement for it. Replacing a
-       # brief is an explicit act (`cc board set … instructions`), never a side effect of dispatching.
-       # #71 fixed only half of this: it guarded task.md but still pushed the file OVER the board, so a
-       # board-only brief — the normal `cc board add` route — was destroyed on both sides a fourth time
-       # (2026-08-31, cc-land-fixes: 4590 bytes became one sentence). Regression test: "the #71 case" in selftest.sh.
-       binstr=$("$BOARD" get "$repo" "$track" instructions 2>/dev/null)
-       if [ -n "$binstr" ]; then   # whichever side holds the brief, keep it: seed an empty file, merge a board brief the file has not got
-         if [ ! -s "$st/task.md" ]; then printf '%s\n' "$binstr" > "$st/task.md"
-         else case "$(cat "$st/task.md")" in *"$binstr"*) ;; *) printf '\n%s\n' "$binstr" >> "$st/task.md";; esac; fi
-       fi
+       # THE BRIEF HAS ONE HOME: $st/task.md. It used to have two — that file and the board's `instructions` —
+       # merged by substring on every dispatch, and that merge destroyed the brief it was dispatched with on FOUR
+       # tracks (#71 and #79 each fixed one variant; on 2026-08-31 a 4590-byte brief became one sentence, on both
+       # sides at once). There is nothing to reconcile now: the board carries a display title, `cc board add`
+       # writes the file, and dispatching only ever ADDS to it — one atomic write, the note on top so the worker
+       # reads it first. Replacing a brief stays an explicit act (`cc board set … instructions`), never a side
+       # effect of dispatching. Regression tests: "the #71 case" in selftest.sh, and `cc-board selfcheck`.
+       mkdir -p "$st"
+       "$BOARD" get "$repo" "$track" instructions >/dev/null 2>&1   # migrates a pre-#94 board copy into the file, once
        if [ -n "$text" ]; then
-         case "$(cat "$st/task.md" 2>/dev/null)" in
-           *"$text"*) ;;   # a re-dispatch repeating the same note: don't stack it up
-           *) { printf '%s\n' "$text"; if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } > "$st/task.md.tmp"
-              mv "$st/task.md.tmp" "$st/task.md" ;;
-         esac
-         "$BOARD" set "$repo" "$track" instructions "$(cat "$st/task.md")"
+         t0=$(printf '%s' "$text"); n=$(printf '%s' "$t0" | wc -c)   # both sides trailing-newline-stripped by $( )
+         if [ "$(head -c "$n" "$st/task.md" 2>/dev/null)" != "$t0" ]; then   # not already on top (a re-dispatch
+           { printf '%s\n' "$text"                                          # repeating its note): don't stack it up.
+             if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } > "$st/task.md.tmp"   # this only ever looks
+           mv "$st/task.md.tmp" "$st/task.md"                                # at the head, which this same code
+         fi                                                                  # wrote — never at the brief below it
        else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi
        for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree
          [ "$(readlink -f /proc/$pid/cwd 2>/dev/null)" = "$(readlink -f "$wt")" ] || continue

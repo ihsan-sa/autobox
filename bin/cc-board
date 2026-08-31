@@ -2,7 +2,7 @@
 """cc-board — shared per-repo task/status board for orchestrated Claude sessions.
 Board file: ~/.cc/boards/<repo>.json  (sidecar; never in git, so no merge noise).
 Every orchestrated session reads/writes it so sessions know what the others are doing."""
-import sys, os, json, time, fcntl
+import sys, os, json, time, fcntl, calendar
 BOARDS = os.path.expanduser("~/.cc/boards")
 # ONE VOCABULARY with the App Home tab (§02 of the Home handoff: the word is "queued", never "todo"). The board used to
 # write `todo` and the tab only printed "queued" by accident — `todo` is not a state it knows, so it fell through the
@@ -36,9 +36,60 @@ def need(repo):
     d = _load(repo)
     if d is None: sys.exit(f"cc-board: no board for '{repo}' (run: cc-board init {repo} <path> <branch>)")
     return d
-USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"list":1}
+# ── THE BRIEF HAS ONE HOME: ~/.cc/state/<repo>/<track>/task.md ──────────────────────────────────────────────────
+# It used to have two — this JSON's `instructions` and that file — reconciled by substring on every dispatch, and
+# that merge destroyed the brief it was dispatched with on FOUR tracks (#71 and #79 each fixed one variant; a
+# 4590-byte brief became one sentence on 2026-08-31). Two authorities cannot be kept equal, so there is now one:
+# the file. This JSON keeps a display `title` and nothing a worker is meant to read. `instructions` survives only
+# as the NAME callers already type for the brief — get/set route it to the file, they never touch the JSON.
+STATE = os.path.expanduser("~/.cc/state")
+def tpath(repo, track): return os.path.join(STATE, repo, track, "task.md")
+def read_brief(repo, track):
+    try:
+        with open(tpath(repo, track), errors="replace") as f: return f.read()
+    except OSError: return ""
+def write_brief(repo, track, text):
+    p = tpath(repo, track); os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"                                  # atomic: a half-written brief is worse than an old one
+    with open(tmp, "w") as f: f.write(text if text.endswith("\n") else text + "\n")
+    os.replace(tmp, p)
+def brief(repo, track):
+    """The brief, migrating a pre-#94 board copy into the file ONCE, on the first read of it. Never call this while
+    holding Lock(repo): it takes the lock itself, and flock on a second fd of the same file deadlocks its owner."""
+    b = read_brief(repo, track)
+    if b.strip(): return b
+    try: legacy = ((_load(repo) or {}).get("tracks") or {}).get(track, {}).get("instructions") or ""
+    except Exception: return b     # unlocked and cheap: the common case is nothing to migrate, and pays no lock
+    if not legacy.strip(): return b
+    with Lock(repo):               # there IS an old copy: move it under the lock, re-reading in case of a race
+        d = _load(repo); t = ((d or {}).get("tracks") or {}).get(track) or {}
+        legacy = t.pop("instructions", "") or ""
+        if not legacy.strip(): return read_brief(repo, track)   # somebody else migrated it while we waited
+        try: write_brief(repo, track, legacy)                   # a brief that cannot be written is still ANSWERED,
+        except OSError: return legacy                           # and its JSON copy kept — `show` must not die on it
+        _save(repo, d)                                          # the file holds it now: drop the copy, one authority
+    return legacy
+# ── A FINISHED TRACK LEAVES THE DEFAULT VIEW (owner, 2026-08-30: "this should also remove it from the board") ──
+# Not instantly: for SHOWN_FOR after the merge it stays, so the session that landed it — and an owner who looks
+# straight after being told — sees WHAT landed rather than a row that vanished. Two hours is longer than any one
+# merge-and-follow-up and short enough that a day's work does not pile up on the board. After that the row is
+# history: `--all` still prints it, `cc digest` and the log still hold it, and nothing is deleted. The Slack Home
+# tab drops finished tracks the moment they finish (cc-slack home_track_shown) — it is a NEEDS-YOU surface, this
+# is a working view, so this one lingers. Filter at render: no archive file to get out of step with the board.
+SHOWN_FOR = 2 * 3600
+FINISHED = ("merged", "done")
+def age(ts):
+    """Seconds since an ISO stamp this board wrote; a missing or unparseable one reads as ancient, so a row that
+    cannot prove it is recent is treated as old rather than pinned to the view forever."""
+    try: return max(0.0, time.time() - calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError): return float("inf")
+def shown(t, for_=SHOWN_FOR):
+    """PURE: is this row on the DEFAULT board view? (cc-board selfcheck pins it.)"""
+    return t.get("status") not in FINISHED or age(t.get("updated")) < for_
+
+USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"list":1,"selfcheck":1}
 def main(a):
-    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show|json|list|rm|tracks} ...")
+    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|list|rm|tracks|selfcheck} ...")
     cmd = a[0]
     if cmd in USAGE and len(a) < USAGE[cmd]:   # a short call must say so, not traceback
         sys.exit(f"cc-board {cmd}: needs {USAGE[cmd]-1} argument(s), got {len(a)-1}")
@@ -52,10 +103,18 @@ def main(a):
     elif cmd == "add":
         repo, track, title = a[1], a[2], a[3]
         instr = " ".join(a[4:])
+        have = brief(repo, track)            # migrate a legacy JSON copy FIRST — the pop below would drop it
+        if instr.strip():                    # the brief goes to its one home; the board JSON keeps the title
+            if not have.strip(): write_brief(repo, track, instr)
+            elif instr.strip() not in have:   # something is already there: APPEND. Never clobber a brief as a side
+                write_brief(repo, track, have.rstrip("\n") + "\n\n" + instr)   # effect of another command — that
+                print(f"cc-board add: {repo}/{track} already had a brief — appended rather than replaced.\n"
+                      f"  replace it deliberately: cc-board set {repo} {track} instructions '<brief>'", file=sys.stderr)
         with Lock(repo):
             d = need(repo)
             t = d["tracks"].get(track, {})
-            t.update({"title":title,"instructions":instr,
+            t.pop("instructions", None)                 # a re-add drops the pre-#94 copy too
+            t.update({"title":title,
                       "status":state(t.get("status","queued")),
                       "branch":t.get("branch",f"track/{track}"),
                       "worktree":t.get("worktree", os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}")),
@@ -68,6 +127,10 @@ def main(a):
         print(f"track '{track}' added to {repo}")
     elif cmd == "set":
         repo, track, key, val = a[1], a[2], a[3], a[4]
+        if key == "instructions":            # replacing a brief is an EXPLICIT act, and this is the verb for it
+            if track not in need(repo)["tracks"]: sys.exit(f"no track '{track}'")
+            brief(repo, track)               # migrate first, so the old copy cannot come back over the new one
+            write_brief(repo, track, val); return
         with Lock(repo):
             d = need(repo)
             if track not in d["tracks"]: sys.exit(f"no track '{track}'")
@@ -77,6 +140,7 @@ def main(a):
             _save(repo,d)
     elif cmd == "get":
         repo, track, key = a[1], a[2], a[3]
+        if key == "instructions": print(brief(repo, track), end=""); return
         d = need(repo); print(d["tracks"].get(track,{}).get(key,""))
     elif cmd == "status":
         repo, track, st = a[1], a[2], state(a[3])
@@ -117,17 +181,101 @@ def main(a):
             for tr,t in d.get("tracks",{}).items():
                 print(f"{d.get('repo',fn[:-5])}\t{tr}\t{t.get('status','?')}\t{t.get('title','')}")
     elif cmd == "show":
-        d = need(a[1])
+        rest = [x for x in a[1:] if x != "--all"]; allrows = "--all" in a[1:]
+        if not rest: sys.exit("cc-board show: needs a repo")
+        repo = rest[0]; d = need(repo)
         ico = {"queued":"·","todo":"·","running":"▶","waiting":"❓","review":"◆","blocked":"■","merged":"✓","done":"✓"}
+        rows = [(tr,t) for tr,t in d["tracks"].items() if allrows or shown(t)]
+        hid = len(d["tracks"]) - len(rows)
         print(f"\n\033[1m{d['repo']}\033[0m  base:{d.get('default_branch','main')}  {d.get('path','')}")
         if not d["tracks"]: print("  (no tracks yet)")
-        for tr,t in d["tracks"].items():
+        elif not rows: print("  (nothing open)")
+        for tr,t in rows:
             print(f"  {ico.get(t.get('status'),'?')} \033[1m{tr}\033[0m [{t.get('status')}]  {t.get('title','')}")
-            if t.get("instructions"): print(f"      task: {t['instructions'][:200]}")
+            b = brief(repo, tr).strip()   # a legacy row migrates on this read, like every other read of the brief
+            if b: print(f"      task: {b[:200]}")
             if t.get("pr"): print(f"      PR: {t['pr']}")
             for n in t.get("notes",[])[-3:]: print(f"      - {n['msg'][:160]}")
+        if hid: print(f"  \033[2m({hid} finished — cc board show {repo} --all)\033[0m")
         print()
+    elif cmd == "selfcheck":
+        sys.exit(selfcheck())
     else:
         sys.exit(f"cc-board: unknown command '{cmd}'")
+
+def selfcheck():
+    """STATIC: the two rules this file owns, checked against fixtures — no board, no state dir, no clock beyond
+    its own. Run by tests/check.sh, so a regression fails the commit rather than the next `cc board show`."""
+    n = 0
+    def ok(what, cond):
+        nonlocal n
+        print(("  ok   " if cond else "  FAIL ") + what)
+        if not cond: n += 1
+    old_ = lambda st: {"status": st, "updated": "2000-01-01T00:00:00Z"}
+    new_ = lambda st: {"status": st, "updated": now()}
+    print("cc-board selfcheck")
+    ok("a running track is on the default view", shown(new_("running")) and shown(old_("running")))
+    ok("a track just merged is still shown, so the owner sees what landed", shown(new_("merged")))
+    ok("…and leaves once the window is past", not shown(old_("merged")) and not shown(old_("done")))
+    ok("a stamp that cannot be read counts as old, never as pinned", not shown({"status": "merged"})
+       and not shown({"status": "done", "updated": "yesterday"}))
+    ok("blocked and waiting never leave — they are what the board is for",
+       shown(old_("blocked")) and shown(old_("waiting")) and shown(old_("review")))
+    ok("the window is what the comment above it says", SHOWN_FOR == 2 * 3600 and shown(new_("merged"), 0) is False)
+    # …and the invariant the whole change exists for, exercised for real in a HOME of its own: the brief lands in
+    # the file, the JSON never carries a copy, and every route ADDS to a brief rather than eating it.
+    import subprocess, tempfile, shutil
+    th = tempfile.mkdtemp(prefix="ccboard-sc-")
+    try:
+        def run(*args): return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
+                                              env={**os.environ, "HOME": th}, capture_output=True, text=True)
+        run("init", "r", "/tmp/r", "main"); run("add", "r", "t1", "T", "THE BRIEF, in full.")
+        blob = run("json", "r").stdout
+        ok("`add` writes the brief to task.md", open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "THE BRIEF, in full.")
+        ok("…and the board JSON keeps no copy of it", "instructions" not in blob and "THE BRIEF" not in blob)
+        ok("`get instructions` reads that file", run("get", "r", "t1", "instructions").stdout.strip() == "THE BRIEF, in full.")
+        run("add", "r", "t1", "T", "a one-line note")
+        body = open(f"{th}/.cc/state/r/t1/task.md").read()
+        ok("`add` appends to a brief instead of overwriting it (four tracks lost one that way)",
+           "THE BRIEF, in full." in body and "a one-line note" in body)
+        run("add", "r", "t1", "T", "a one-line note")
+        ok("…and adding the same thing twice stacks nothing up",
+           open(f"{th}/.cc/state/r/t1/task.md").read() == body)
+        run("set", "r", "t1", "instructions", "REPLACED")
+        ok("`set instructions` is the explicit way to replace it",
+           open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "REPLACED")
+        # migration: a row written before this still carries the brief in the JSON, and is moved once
+        d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"]["t2"] = {"title": "T2", "status": "queued",
+            "instructions": "AN OLD BRIEF", "updated": now()}
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        got = run("get", "r", "t2", "instructions").stdout.strip()
+        ok("a pre-#94 board copy migrates into task.md on first read",
+           got == "AN OLD BRIEF" and open(f"{th}/.cc/state/r/t2/task.md").read().strip() == "AN OLD BRIEF")
+        ok("…and is gone from the JSON afterwards, so there is only ever one authority",
+           "AN OLD BRIEF" not in run("json", "r").stdout)
+        ok("`show` prints the brief from the file", "REPLACED" in run("show", "r").stdout)
+        d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"]["t3"] = {"title": "T3", "status": "queued",
+            "instructions": "A THIRD OLD BRIEF", "updated": now()}
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        run("add", "r", "t3", "renamed")     # a bare re-add drops the JSON copy — it must migrate it, not lose it
+        ok("a re-add of a legacy row migrates its brief before dropping the JSON copy",
+           open(f"{th}/.cc/state/r/t3/task.md").read().strip() == "A THIRD OLD BRIEF"
+           and "A THIRD OLD BRIEF" not in run("json", "r").stdout)
+        # a13's own proof, on rendered output rather than on the predicate: a merged row past its window is not in
+        # `cc board show`, IS in `--all`, and the view says it hid something. This is the ledger row's check-cmd.
+        run("add", "r", "m1", "M1 LANDED"); run("status", "r", "m1", "merged")
+        fresh = run("show", "r").stdout
+        d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"]["m1"]["updated"] = "2000-01-01T00:00:00Z"
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        stale = run("show", "r").stdout
+        ok("a13: a just-merged row is on the default board, one past its window is not",
+           "M1 LANDED" in fresh and "M1 LANDED" not in stale)
+        ok("a13: `--all` still prints it, and the default view says it hid something",
+           "M1 LANDED" in run("show", "r", "--all").stdout and "finished" in stale)
+    finally:
+        shutil.rmtree(th, ignore_errors=True)
+    print(f"cc-board selfcheck: {n} failed")
+    return 1 if n else 0
+
 if __name__ == "__main__":
     main(sys.argv[1:])

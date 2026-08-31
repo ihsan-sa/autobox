@@ -16,5 +16,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # config/units.json is the one list and `cc-units selfcheck` fails when it and config/systemd-user/ disagree in
 # either direction — a new unit file without a row, or a row without a file. Both selfchecks are static: they read
 # this tree and their own fixtures, never live systemd and never ~/.claude/settings.json.
-for c in cc-units cc-settings; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+# cc-board's is the same shape: the default board view's filter, and the one-authority rule for the brief, both
+# against its own fixtures in a HOME of its own — never this box's board.
+for c in cc-units cc-settings cc-board; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

@@ -372,6 +372,9 @@ echo "== --go is a covering note, never a replacement for the brief (#71) =="
 # lived ONLY on the board (`cc board add`, the route sp_main tells every planning session to use) was still
 # destroyed on both sides. That is how the same bug reached a fourth track on 2026-08-31: a 4590-byte brief
 # became one 138-byte sentence, on the board as well as in task.md. These pin every side of it.
+# The FIFTH variant is now impossible rather than fixed: there is one authority, $st/task.md, and the board JSON
+# carries no copy to reconcile against. So these also pin the absence of that copy, and the one-off migration of
+# the copies boards written before this still hold.
 godisp(){ "$B/cc" $REPO "$1" --go "$2" >/dev/null 2>&1; sleep 1
   for id in $(wins "$REPO/$1"); do tmux kill-window -t "$id"; done
   for _ in 1 2 3 4 5; do [ -z "$(wins "$REPO/$1")" ] && break; sleep 1; done; }
@@ -385,8 +388,11 @@ tm=~/.cc/state/$REPO/g1/task.md; bi=$("$B/cc-board" get $REPO g1 instructions)
   && ok "#71: --go on a board-only brief keeps the WHOLE brief in task.md and adds the note" \
   || bad "#71: task.md is $(wc -c < "$tm" 2>/dev/null) bytes, first line: $(head -1 "$tm" 2>/dev/null)"
 { grep -q 'BRIEF HEAD' <<<"$bi" && grep -q 'BRIEF TAIL' <<<"$bi" && grep -q 'Work the board brief in full.' <<<"$bi"; } \
-  && ok "#71: the board's instructions still hold the brief (they used to be cut to the one-line note)" \
-  || bad "#71: board instructions cut to $(wc -c <<<"$bi") bytes"
+  && ok "#71: 'cc-board get … instructions' still answers with the whole brief — from the file" \
+  || bad "#71: get instructions returned $(wc -c <<<"$bi") bytes"
+grep -q 'BRIEF HEAD' ~/.cc/boards/$REPO.json \
+  && bad "the board JSON still carries a copy of the brief — there are two authorities again" \
+  || ok "the board JSON carries NO copy of the brief: one authority, nothing to reconcile"
 [ "$(head -1 "$tm")" = "Work the board brief in full." ] \
   && ok "#71: the --go note sits ABOVE the brief, so the worker reads it first" || bad "note is not line 1: $(head -1 "$tm")"
 
@@ -397,6 +403,27 @@ godisp g1 "Work the board brief in full."
 godisp g1 ""
 { [ "$(cat "$tm")" = "$b0" ] && [ "$("$B/cc-board" get $REPO g1 instructions)" = "$i0" ]; } \
   && ok '--go "" re-dispatches and changes neither task.md nor the board' || bad '--go "" moved task.md or the board'
+
+# A board written BEFORE this change still holds the brief in its JSON: the first read moves it, once, and the
+# copy is gone afterwards. Without this, every track that existed at the upgrade would have lost its brief.
+mkdir -p ~/.cc/state/$REPO/g5
+"$B/cc-board" add $REPO g5 "g5" >/dev/null
+python3 - "$REPO" <<'MIG'
+import json, os, sys
+p = os.path.expanduser(f"~/.cc/boards/{sys.argv[1]}.json"); d = json.load(open(p))
+d["tracks"]["g5"]["instructions"] = "LEGACY BRIEF: written when the board still held one."
+json.dump(d, open(p, "w"), indent=2)
+MIG
+g5=$("$B/cc-board" get $REPO g5 instructions)
+{ [ "$g5" = "LEGACY BRIEF: written when the board still held one." ] \
+  && grep -q 'LEGACY BRIEF' ~/.cc/state/$REPO/g5/task.md; } \
+  && ok "migration: a pre-#94 board brief is answered with, and moved into, task.md" || bad "migration lost it: $g5"
+grep -q 'LEGACY BRIEF' ~/.cc/boards/$REPO.json \
+  && bad "migration left the copy in the board JSON" || ok "migration: …and the JSON copy is gone, so it can never come back over the file"
+godisp g5 "note after the migration"
+{ [ "$(head -1 ~/.cc/state/$REPO/g5/task.md)" = "note after the migration" ] \
+  && grep -q 'LEGACY BRIEF' ~/.cc/state/$REPO/g5/task.md; } \
+  && ok "migration: a dispatch afterwards adds its note and keeps the migrated brief" || bad "dispatch after migration lost the brief"
 
 # The half #71 did fix: brief in task.md, nothing on the board.
 mkdir -p ~/.cc/state/$REPO/g2; printf '%s\n' "$BRIEF" > ~/.cc/state/$REPO/g2/task.md
@@ -419,7 +446,39 @@ tm4=~/.cc/state/$REPO/g4/task.md
 [ "$(cat "$tm4" 2>/dev/null)" = "just do this one thing" ] \
   && ok "--go on a track with no brief still works (the note becomes the task)" || bad "no-brief task.md: $(cat "$tm4" 2>/dev/null)"
 [ "$("$B/cc-board" get $REPO g4 instructions)" = "just do this one thing" ] \
-  && ok "--go on a track with no brief puts the note on the board too" || bad "no-brief board: $("$B/cc-board" get $REPO g4 instructions)"
+  && ok "--go on a track with no brief: the note IS the brief, and the board reads it back" || bad "no-brief board: $("$B/cc-board" get $REPO g4 instructions)"
+# `cc board add` must never eat a brief that is already there — the failure mode all of the above exists for.
+"$B/cc-board" add $REPO g4 "g4" "a different brief entirely" >/dev/null 2>&1
+{ grep -q 'just do this one thing' "$tm4" && grep -q 'a different brief entirely' "$tm4"; } \
+  && ok "cc-board add APPENDS to an existing brief, it never overwrites one" || bad "add clobbered task.md: $(cat "$tm4")"
+"$B/cc-board" set $REPO g4 instructions "an explicitly replaced brief" >/dev/null
+[ "$(cat "$tm4")" = "an explicitly replaced brief" ] \
+  && ok "…and 'cc-board set … instructions' is the explicit way to replace one" || bad "set instructions: $(cat "$tm4")"
+
+echo "== a finished track leaves the default board view (a13) =="
+# owner, 2026-08-30: "this should also remove it from the board". Filter at render — no archive file to drift.
+# A row stays for cc-board's SHOWN_FOR window after it finishes so the owner sees WHAT landed; then it is history,
+# and `--all` still prints it. Backdating `updated` is how the window is crossed without waiting two hours.
+"$B/cc-board" add $REPO m1 "m1 landed" >/dev/null; "$B/cc-board" status $REPO m1 merged >/dev/null
+"$B/cc-board" show $REPO | grep -q 'm1 landed' \
+  && ok "a13: a just-merged track is still on the board, so the owner sees what landed" || bad "a13: it vanished immediately"
+python3 - "$REPO" <<'BACK'
+import json, os, sys
+p = os.path.expanduser(f"~/.cc/boards/{sys.argv[1]}.json"); d = json.load(open(p))
+d["tracks"]["m1"]["updated"] = "2000-01-01T00:00:00Z"
+json.dump(d, open(p, "w"), indent=2)
+BACK
+"$B/cc-board" show $REPO | grep -q 'm1 landed' \
+  && bad "a13: a merged track is still on the default board after its window" \
+  || ok "a13: past its window, a merged track is gone from the default 'cc board show'"
+"$B/cc-board" show $REPO --all | grep -q 'm1 landed' \
+  && ok "a13: --all still prints it — the history is filtered, never deleted" || bad "a13: --all lost it"
+"$B/cc-board" show $REPO | grep -q 'finished' \
+  && ok "a13: the default view SAYS it hid something, so nobody wonders where it went" || bad "a13: the view hid a row silently"
+"$B/cc-board" show $REPO | grep -q 'g1' \
+  && ok "a13: an unfinished track is untouched by the filter" || bad "a13: the filter dropped a live track"
+o=$("$B/cc-board" selfcheck 2>&1); grep -q ': 0 failed' <<<"$o" \
+  && ok "cc-board selfcheck: 0 failed" || { bad "cc-board selfcheck"; echo "$o" | grep FAIL | head -5; }
 # P1-P4: one branch, one PR. The loop calls `cc done` when the worker writes STATUS: DONE and a session calls it when it
 # finishes by hand; a squash-merge deletes the branch, so the late caller saw nothing OPEN and opened a duplicate of commits
 # GitHub had already merged (#24/#25 and #29/#30 — same headRefOid). The stub gh never prints a URL from `pr create`, so
@@ -511,7 +570,7 @@ CC_CLAUDE="$T/askclaude" "$B/cc-loop" $REPO w11 --max-iter 1 --quiet >/dev/null 
 { [ "$rc" = 3 ] && [ "$(nruns w11)" = 1 ] && ! lg w11 | grep -q 'carrying on'; } && ok "STATUS: BLOCKED is never carried on — it is a question, even with work committed" || bad "blocked carried on: rc=$rc runs=$(nruns w11)"
 # …and the word it leaves is `waiting`, not `blocked`: the loop is the first to know a person is being asked, and it
 # must write what cc-reconcile and the Home tab already read out of that same journal line, or the tab prints drift.
-[ "$("$B/cc-board" get $REPO w11 status)" = waiting ] && ok "…and the board says `waiting`, the one word that reaches the owner's NEEDS YOU list — not `blocked`, which is every other way a loop stops" || bad "exit 3 board status: $("$B/cc-board" get $REPO w11 status)"
+[ "$("$B/cc-board" get $REPO w11 status)" = waiting ] && ok "…and the board says \`waiting\`, the one word that reaches the owner's NEEDS YOU list — not \`blocked\`, which is every other way a loop stops" || bad "exit 3 board status: $("$B/cc-board" get $REPO w11 status)"
 mktrack w12 "fail every time"
 mkclaude failclaude w12 'err=true; res="fatal: it broke"'
 CC_CLAUDE="$T/failclaude" "$B/cc-loop" $REPO w12 --max-iter 5 --quiet >/dev/null 2>&1; rc=$?
