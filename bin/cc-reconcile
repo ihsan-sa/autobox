@@ -575,13 +575,32 @@ def main(argv):
         if keys or old:   # only findings that are still true survive the write: one that comes back is news again
             ledger(path, {k: (t0 if k in told else old.get(k, 0)) for k in keys})
         if fresh:
-            one = {r["repo"] for r in fresh}
-            title = f"{one.pop()} board" if len(one) == 1 else "board"   # cc-notify routes a title that starts with a repo name into that repo's channel
-            body = "\n".join(f"• {r['repo']}/{r['track']} — {r['why']}"
-                             + (f" (set to {r['to']})" if r["applied"] else "") for r in fresh)
-            subprocess.run([f"{BIN}/cc-notify", "-t", title,
-                            f"The board did not match the box, and this part needs you:\n{body}"],
-                           capture_output=True, timeout=30)
+            # THE SESSION FIRST (owner, 2026-08-31, thread 1788215141): most board-vs-box drift — a finished
+            # worker with no PR, a closed PR, a gone worktree — is the live planning session's to fix, not an
+            # owner decision. Each finding is offered to that repo's session; the owner is paged only with what
+            # no session took (`inject --no-start`: a dead daemon or no session window refuses, and THAT pages).
+            # Tradeoff, named: a live session that drops an inject keeps the finding off the owner's phone for
+            # the repeat window — cc-owed and the digest still carry the track meanwhile.
+            inj = os.environ.get("CC_RECONCILE_INJECT") or f"{BIN}/cc-slack"
+            paged = []
+            for r in fresh:
+                line = (f"board watchdog: {r['repo']}/{r['track']} — {r['why']}"
+                        + (f" (set to {r['to']})" if r["applied"] else ""))
+                try:
+                    took = subprocess.run([inj, "inject", "--no-start", r["repo"], line],
+                                          capture_output=True, timeout=30).returncode == 0
+                except Exception:
+                    took = False
+                if not took:
+                    paged.append(r)
+            if paged:
+                one = {r["repo"] for r in paged}
+                title = f"{one.pop()} board" if len(one) == 1 else "board"   # cc-notify routes a title that starts with a repo name into that repo's channel
+                body = "\n".join(f"• {r['repo']}/{r['track']} — {r['why']}"
+                                 + (f" (set to {r['to']})" if r["applied"] else "") for r in paged)
+                subprocess.run([f"{BIN}/cc-notify", "-t", title,
+                                f"The board did not match the box, and this part needs you:\n{body}"],
+                               capture_output=True, timeout=30)
     return 1 if asks else 0
 
 
@@ -738,6 +757,18 @@ def selfcheck():
            sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines()) == 1)
         ok("end to end: and it is idempotent — the track stays waiting",
            cb("get", repo, "t1", "status").stdout.strip() == "waiting" and r2.returncode == 1)
+        # the session-first offer: a finding a live session ACCEPTS pages nobody; one nobody takes still pages.
+        argvN = [sys.executable, os.path.realpath(__file__), repo, "--apply", "--notify",
+                 "--no-net", "--grace", "0", "--repeat", "0"]
+        base = sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines())
+        subprocess.run(argvN, env=dict(env, CC_RECONCILE_INJECT="/bin/true"),
+                       capture_output=True, text=True, timeout=120)
+        ok("end to end: a finding the live session accepts pages nobody",
+           sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines()) == base)
+        subprocess.run(argvN, env=dict(env, CC_RECONCILE_INJECT="/bin/false"),
+                       capture_output=True, text=True, timeout=120)
+        ok("end to end: …and one nobody took still pages the owner",
+           sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines()) == base + 1)
         r3 = subprocess.run([sys.executable, os.path.realpath(__file__), "snapshot"],
                             env=env, capture_output=True, text=True, timeout=120)
         snp = json.loads(r3.stdout)
