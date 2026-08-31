@@ -49,14 +49,13 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
-role="${CC_ROLE:-}"
-if [ "$role" != member ]; then   # walk up for a marker — one stat per level, no config to parse. A marker only makes the
-  d="$cwd"                       # gates STRICTER (member wins over an inherited CC_ROLE=worker) and never clears the env role.
-  while [ -n "$d" ] && [ "$d" != / ]; do
-    [ -f "$d/.cc/member-facing" ] && { role=member; break; }   # a session anybody in Slack can talk to
-    [ -f "$d/.cc/track" ] && { role=worker; break; }
-    d=$(dirname "$d"); done
-fi
+role="${CC_ROLE:-}"; mdir=""
+d="$cwd"                         # walk up for a marker — one stat per level, no config to parse. A marker only makes the
+while [ -n "$d" ] && [ "$d" != / ]; do   # gates STRICTER (member wins over an inherited CC_ROLE=worker) and never clears the env role.
+  if [ -f "$d/.cc/member-facing" ]; then role=member; mdir="$d"; break; fi   # a session anybody in Slack can talk to
+  if [ -f "$d/.cc/track" ]; then [ "$role" = member ] || role=worker; break; fi
+  d=$(dirname "$d"); done
+# $mdir is the member-facing session dir, and its basename is its Slack channel: the refusal below is posted there.
 # An OVERLAPPING HANDOFF (cc-handoff): two sessions share this cwd, and exactly one of them is LIVE. The other
 # may read, search, think and ask its peer — it may not act on the world. A marker file could not do this: the
 # walk above is keyed on the cwd, which both sessions share, so it would gate the live one too. The keys here
@@ -100,7 +99,46 @@ if [ -n "${CC_HANDOFF:-}" ] || [ -d "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}"
 fi
 [ -n "$handoff_gated" ] && [ "$role" != member ] && role=worker   # the four owner gates below, at least
 case "$role" in worker|member) ;; *) exit 0;; esac
-deny(){ echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
+# A REFUSAL IN A MEMBER-FACING CHANNEL IS AN ASK, NOT A DEAD END. This is the only place that knows a member's
+# request was stopped, and until now both halves ended here: the member saw nothing (one asked twice for images
+# this gate refused) and the owner was never told there was anything to approve. A gate that stops work without
+# producing a visible ask is indistinguishable from the box ignoring somebody. So a member-facing deny now emits
+# BOTH, mechanically, instead of relying on the session to remember to: a 🔐 line in the member's own channel
+# (the box's sweep marks a 🔐 message ❓ = needs you, so it also lands on the owner's tab) and a cc-notify
+# escalation, which from a member-facing dir is delivered to the owner rather than routed back into that channel.
+# WORKER AND HANDOFF DENIALS ARE UNTOUCHED — they have a board, a journal and a STATUS: BLOCKED line — and so are
+# the owner's own channels, which are not member-facing sessions.
+# Bounded three ways: nothing runs unless role=member, one ask per channel+reason per ASK_TTL (a session retrying
+# a blocked command must not spray the channel), and `timeout` on both calls so a slow Slack cannot hang a hook.
+ASKS="${CC_GUARD_ASKS:-$HOME/.cc/guard-asks}"; ASK_TTL="${CC_GUARD_ASK_TTL:-1800}"
+ask_owner(){
+  local why=$1 chan="" key f was now c bin
+  [ -n "$mdir" ] && chan=${mdir##*/}
+  if [ -n "$chan" ] && [ -f "$HOME/.cc/slack/provisioned.json" ]; then   # the dir's name and its channel's can differ
+    c=$(jq -r --arg t "$chan" '.[$t].chan // empty' "$HOME/.cc/slack/provisioned.json" 2>/dev/null) || c=""
+    [ -n "$c" ] && chan=$c
+  fi
+  now=$(date +%s); key=$(printf '%s\n%s' "${chan:-nochan}" "$why" | cksum | tr -cd '0-9')
+  mkdir -p "$ASKS" 2>/dev/null || return 0
+  f="$ASKS/$key"
+  if [ -f "$f" ]; then
+    was=$(cat "$f" 2>/dev/null) || was=0
+    case "$was" in ''|*[!0-9]*) was=0;; esac
+    [ $((now - was)) -lt "$ASK_TTL" ] && return 0    # already asked, and the owner has not had time to answer
+  fi
+  printf '%s\n' "$now" > "$f"
+  bin="$HOME/bin"; [ -x "$bin/cc-slack" ] || bin=$(dirname -- "$0")
+  # The member sees it. 🔐 is the box's own "nothing happens until the owner answers" form, and the sweep reads it.
+  [ -n "$chan" ] && [ -x "$bin/cc-slack" ] && timeout 20 "$bin/cc-slack" post -c "#$chan" \
+    "$(printf '🔐 I cannot do that part myself: %s.\nI have asked the owner to approve it — nothing more happens here until they do. Anything that needs no approval I am still doing.' "$why")" >/dev/null 2>&1
+  bin="$HOME/bin"; [ -x "$bin/cc-notify" ] || bin=$(dirname -- "$0")
+  # ...and the owner is told there is something to approve. --owner delivers it (a DM), never back into the channel.
+  [ -x "$bin/cc-notify" ] && ( cd "${mdir:-/}" 2>/dev/null || cd /
+    timeout 25 "$bin/cc-notify" --owner -p high \
+      "$(printf 'Needs you: a member-facing session was refused — %s%s. I told them it is with you.' "$why" "${chan:+ (#$chan)}")" >/dev/null 2>&1 )
+  return 0
+}
+deny(){ [ "$role" = member ] && ask_owner "$1"; echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
 denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
 secret_path(){ case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json) return 0;; esac; return 1; }
 case "$tool" in

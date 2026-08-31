@@ -113,8 +113,13 @@ grep -q 'decision' "$T/ctx/$sid.json" && bad "a session under the line was told 
 # over the line: the hook answers on stdout with the Stop decision that makes the session journal (once)
 pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
 rm -f "$T/ctx/$sid.json"
-# the fixture is 20k of a 200k window, so the floors (60k/90k) are lowered out of the way for these cases
-CTXP="CC_CONTEXT_WARN_MIN=0 CC_CONTEXT_HANDOFF_MIN=0"
+# the fixture is 20k of a 200k window, so the floors (60k/90k) are lowered out of the way for these cases.
+# CC_HANDOFF_OVERLAP=0 pins the OTHER branch out of the way: `cc-handoff` reads that key from ~/.cc/config when
+# the env is silent, so once the owner turned overlapping handoffs on, these four checks stopped exercising the
+# deferral they were written for and started asserting against the overlap path — a red gate that came from the
+# BOX's config, not from the tree. The overlap branch has its own section below, which sets the key per command.
+CTXP="CC_CONTEXT_WARN_MIN=0 CC_CONTEXT_HANDOFF_MIN=0 CC_HANDOFF_OVERLAP=0"
+export CC_HANDOFF_OVERLAP=0   # for the calls in this section that do not go through $CTXP
 d1=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=5 CC_CONTEXT_HANDOFF_PCT=45 "$B/cc-checkpoint" ))
 { grep -q '"decision": "block"' <<<"$d1" && grep -q "state/$REPO/w1/progress.md" <<<"$d1"; } \
   && ok "over the journal line the hook tells the session to write its handoff entry" || bad "no Stop decision: $d1"
@@ -137,6 +142,7 @@ lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 10%" <<<"$lsout" && ok "cc ls 
 ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" </dev/null )   # no payload (run by hand): still commits, records nothing new
 [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ] && ok "the hook still commits when it is given no payload" || bad "checkpoint broke without a Stop payload"
 
+unset CC_HANDOFF_OVERLAP   # the overlap section below decides for itself, per command
 echo "== cc-owed (the same hook says what is still owed in Slack) =="
 owc=$("$B/cc-owed" selfcheck 2>&1)
 grep -q '0 failed' <<<"$owc" && ok "cc-owed selfcheck: ${owc##*: }" || bad "cc-owed selfcheck: $owc"
@@ -195,13 +201,22 @@ miss=""; for probe in 'Bash|{"command":"cat >> notes.md <<E\nthe owner decides: 
 [ -z "$miss" ] && ok "...but prose that merely NAMES a gated command is written, not refused (brief, journal, commit message)" || bad "guard reads prose as a command:$miss"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
 # member-facing: the .cc/member-facing marker alone (NO CC_ROLE — the env is a convenience) = every worker gate plus spend/leak/wiring
+# A MEMBER DENY NOW SPEAKS (see below), so every member probe runs against a STUB HOME: a fake ~/bin/cc-slack and
+# ~/bin/cc-notify that only record their argv, and a ~/.cc/config with no real token. Nothing in this file may
+# reach the workspace, and the secret-path probes are the stub's own files so `secret_path` still matches.
+GH="$T/ghome"; mkdir -p "$GH/bin" "$GH/.cc" "$GH/.ssh"; : > "$GH/.cc/config"; : > "$GH/.ssh/id_ed25519"
+cat > "$GH/bin/cc-slack" <<F
+#!/usr/bin/env bash
+printf 'BOT: %s\n' "\$*" >> "$T/guard.args"
+F
+sed 's/BOT:/NOTIFY:/' "$GH/bin/cc-slack" > "$GH/bin/cc-notify"; chmod +x "$GH/bin/cc-slack" "$GH/bin/cc-notify"
 mf="$T/member"; mkdir -p "$mf/.cc"; : > "$mf/.cc/member-facing"; touch "$mf/note.md"
-m(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+m(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" "$B/cc-guard" >/dev/null 2>&1; echo $?; }
 MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' 'Bash|{"command":"cc r t --go build it"}'
     'Bash|{"command":"cc board add r t title text --go"}' 'Bash|{"command":"cc-loop r t"}' 'Bash|{"command":"claude -p do it"}'
     'Bash|{"command":"cat ~/.cc/config"}' 'Bash|{"command":"tail -5 $HOME/.ssh/id_ed25519"}'
     'Bash|{"command":"cc slack off"}' 'Bash|{"command":"cc slack mkchannel help"}'
-    "Read|{\"file_path\":\"$HOME/.cc/config\"}" "Edit|{\"file_path\":\"$HOME/member-probe.txt\"}")
+    "Read|{\"file_path\":\"$GH/.cc/config\"}" "Edit|{\"file_path\":\"$GH/member-probe.txt\"}")
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 2 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "member-facing marker denies all 12 probes (merge/host, dispatch, secrets, Slack wiring, edit outside)" || bad "member gate misses:$miss"
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 0 ] || miss="$miss ${probe#*|}"; done
@@ -210,9 +225,34 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t
              'Bash|{"command":"git log --oneline -5"}' "Read|{\"file_path\":\"$mf/note.md\"}" "Edit|{\"file_path\":\"$mf/note.md\"}"; do
   [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "member-facing session still reads, edits in place and escalates with cc-notify" || bad "member gate over-blocks:$miss"
-[ "$(g Bash '{"command":"cc r t --go x"}' "$mf")" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
-[ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$HOME" | CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
+[ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
+[ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
+# A REFUSAL IN A MEMBER-FACING CHANNEL IS AN ASK, NOT SILENCE — the member sees it AND the owner is told.
+# Both halves used to end at the deny: the member got nothing, the owner was never told there was anything to
+# approve, and a gate that stops work without producing a visible ask looks exactly like the box ignoring somebody.
+ask(){ rm -rf "$T/asks"; : > "$T/guard.args"
+       printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$1" "$2" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" ${3:+CC_ROLE=$3} "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+SEND="cc-slack post --file /tmp/carpet.png"   # the 2026-08-30 incident itself: a member asked twice for images
+[ "$(ask "$SEND" "$mf")" = 2 ] && ok "the member's request is still refused — the gate did not soften" || bad "member deny lost"
+grep -q "^BOT: post -c #member .*posting to the owner" "$T/guard.args" \
+  && ok "...and the MEMBER sees why, in their own channel (the dir's name is the channel's)" || bad "nothing reached the member: $(cat "$T/guard.args")"
+grep -q '🔐' "$T/guard.args" \
+  && ok "...as the box's own 🔐 form, which the daemon's sweep marks ❓ needs-you on the owner's tab" || bad "no 🔐 in the channel post"
+grep -q "^NOTIFY: --owner -p high .*posting to the owner" "$T/guard.args" \
+  && ok "...and the OWNER is told there is something to approve (--owner: a DM, never that channel)" || bad "the owner was not told: $(cat "$T/guard.args")"
+: > "$T/guard.args"   # same channel, same reason, straight away: the session retrying must not spray the channel
+printf '{"tool_name":"Bash","tool_input":{"command":"cc-slack post -c x hi"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" "$B/cc-guard" >/dev/null 2>&1
+[ ! -s "$T/guard.args" ] && ok "one ask per channel+reason per TTL, however often the session retries" || bad "the deny sprayed: $(cat "$T/guard.args")"
+[ "$(ask "$SEND" "$mf")" = 2 ] && [ -s "$T/guard.args" ] && ok "...and a fresh window asks again (the TTL is a delay, not a mute)" || bad "the ask never comes back"
+: > "$T/guard.args"; [ "$(ask "gh pr merge 1" "$wt" worker)" = 2 ] && [ ! -s "$T/guard.args" ] \
+  && ok "a WORKER deny is untouched: it has a board, a journal and STATUS: BLOCKED, and posts nothing" || bad "a track deny posted to Slack: $(cat "$T/guard.args")"
+: > "$T/guard.args"; [ "$(ask "gh pr merge 1" "$GH")" = 0 ] && [ ! -s "$T/guard.args" ] \
+  && ok "the owner's own sessions are unaffected — not gated, and nothing posted anywhere" || bad "an ungated cwd posted: $(cat "$T/guard.args")"
+: > "$T/guard.args"; rm -rf "$T/asks"
+printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1
+{ grep -q '^NOTIFY: --owner' "$T/guard.args" && ! grep -q '^BOT:' "$T/guard.args"; } \
+  && ok "CC_ROLE=member with no marker: the owner is still told, and nothing is posted to a channel we cannot name" || bad "markerless member ask: $(cat "$T/guard.args")"
 echo "== overlapping handoff: two sessions, one cwd, exactly one of them live =="
 export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1   # never the box's own records, never a 2-min grace
 ho=$("$B/cc-handoff" selfcheck 2>&1 | tail -1)
@@ -277,9 +317,21 @@ N "$T/chan" "Alice needs the staging DB restored"
 grep -q 'chan escalation' "$T/slack.args" && ok "it says where it came from (default title '<session dir> escalation')" || bad "escalation title: $(head -1 "$T/slack.args")"
 N "$T/plain" --owner "the disk is filling up"
 grep -q -- '-c UOWNER' "$T/slack.args" && ok "--owner reaches the owner from any session" || bad "--owner ignored: $(cat "$T/slack.args")"
-N "$T/plain" -t "$REPO/w1 done" "PR: x"
-{ grep -q -- "--route $REPO/w1 done" "$T/slack.args" && ! grep -q -- '-c ' "$T/slack.args"; } \
+N "$T/plain" -t "demorepo/w1 done" "PR: x"     # a REAL repo name: this fixture's own is _cctest…, which the gate below stops on purpose
+{ grep -q -- "--route demorepo/w1 done" "$T/slack.args" && ! grep -q -- '-c ' "$T/slack.args"; } \
   && ok "no regression: an ordinary notice still routes by title (#<repo>, #alerts)" || bad "routing changed: $(cat "$T/slack.args")"
+# THROWAWAY TEST STATE MUST NEVER PAGE THE OWNER: four days of "[_cctest…] PR #7 merged, deploy stopped" in #alerts
+# came from selfchecks whose failures are REAL calls to cc-notify. The gate is here, at the one door every outward
+# notification goes through, so it holds for a caller nobody thought to configure. The line is still LOGGED — the
+# trail is all a fixture was ever meant to leave.
+N "$T/plain" -t "[$REPO] PR #7 merged, deploy stopped" "cc-land: not a git repo"
+{ [ ! -s "$T/slack.args" ] && grep -q "$REPO" "$NH/.cc/notify.log"; } \
+  && ok "a synthetic repo name (_cctest…/_selfcheck…) is logged and never pushed — a fixture cannot page the owner" \
+  || bad "test state reached the owner: $(cat "$T/slack.args")"
+N "$T/plain" -t "myrepo_cctesting deploy" "real"
+grep -q -- '--route' "$T/slack.args" \
+  && ok "…and a real repo that merely contains the word still pages (the gate is anchored, not a substring match)" \
+  || bad "real repo swallowed by the synthetic-name gate"
 printf 'SLACK_BOT_TOKEN=xoxb-test\n' > "$NH/.cc/config"   # owner not paired
 N "$T/chan" "Bob asks for an API key"
 { grep -q -- '-c #alerts' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args"; } \
