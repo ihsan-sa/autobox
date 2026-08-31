@@ -6,7 +6,12 @@ export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage li
 # worktree: every run is namespaced (see $RUN below) and cleans up after itself.  Usage: tests/selftest.sh
 # Exercises the bin/ THIS file ships with (a track worktree tests its own copy, not the ~/bin symlinks).
 set -uo pipefail
-exec </dev/null; unset CC_ROLE   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a caller's worker role (the guard probes set it themselves)
+exec </dev/null; unset CC_ROLE CC_HANDOFF   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
+# caller's worker role NOR ITS HANDOFF ID — the guard and overlap probes set both themselves. $CC_HANDOFF stays in a
+# session's environment for the life of that session, deliberately, so the model cannot unset it; a suite that
+# inherits it is asserting against whoever happens to be running it. On 2026-08-31 that produced FOUR separate red
+# gates in one night, in both directions: cases that passed only for a handoff survivor, and cases that failed only
+# for one. Each was patched individually and the class came back within the hour. Unset it once, here, for all of it.
 B="$(cd "$(dirname "$0")/../bin" && pwd)"
 pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+1)); echo "  ✗ $1"; }
 # Every run owns a namespace ($RUN): repo name, fixture dir, notify log, usage-limit stamp, tmux windows and
@@ -15,6 +20,9 @@ pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
+export CC_HANDOFF_DIR="$T/handoff"        # not ~/.cc/state/handoff: an overlap case writes REAL records, and they
+                                          # outlived the run — `cc-handoff --status` was listing a week of _cctest
+                                          # successors, and cc-guard walks that directory on every single call.
 MT(){ env -u TMUX TMUX_TMPDIR="$T" tmux "$@"; }   # the model section's scratch tmux server: own socket, under $T
 wins(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | awk -v r="$1" '$2==r || index($2,r"/")==1 {print $1}'; }
 KIDS=""   # long-lived fixtures started below; the trap takes each one's whole process group, by PID, never by pattern
@@ -114,10 +122,17 @@ grep -q 'decision' "$T/ctx/$sid.json" && bad "a session under the line was told 
 pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
 rm -f "$T/ctx/$sid.json"
 # the fixture is 20k of a 200k window, so the floors (60k/90k) are lowered out of the way for these cases.
-# CC_HANDOFF_OVERLAP=0 pins the OTHER branch out of the way: `cc-handoff` reads that key from ~/.cc/config when
-# the env is silent, so once the owner turned overlapping handoffs on, these four checks stopped exercising the
-# deferral they were written for and started asserting against the overlap path — a red gate that came from the
-# BOX's config, not from the tree. The overlap branch has its own section below, which sets the key per command.
+# CC_HANDOFF_OVERLAP=0 is PINNED, like the overlap section below pins it per command. These four cases assert
+# the classic stop-then-restart path (PENDING, deferred while work is in flight), and `cc-context` takes that
+# path only when the overlap is off — or when $CC_HANDOFF is set, which is the trap. Unpinned they read the
+# key from the BOX's ~/.cc/config, so once the owner turned overlapping handoffs on they stopped exercising
+# the deferral they were written for and started asserting against the overlap path.
+# MEASURED 2026-08-31, because the number is the argument: main gave 163/0 to the one session holding
+# $CC_HANDOFF and 159/4 to every worker, the owner, and every fresh session. Five consecutive workers saw the
+# red, called it "pre-existing, not mine" — each correctly — and none could prove it, because the only session
+# placed to adjudicate was the one that could not reproduce it. A suite must assert the path it NAMES, not the
+# one the box happens to be configured for. The overlap path has its own cases below and in `cc-context
+# selfcheck`; this path must keep working because the new one fails INTO it.
 CTXP="CC_CONTEXT_WARN_MIN=0 CC_CONTEXT_HANDOFF_MIN=0 CC_HANDOFF_OVERLAP=0"
 export CC_HANDOFF_OVERLAP=0   # for the calls in this section that do not go through $CTXP
 d1=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=5 CC_CONTEXT_HANDOFF_PCT=45 "$B/cc-checkpoint" ))
