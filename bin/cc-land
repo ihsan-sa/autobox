@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""cc-land — one command lands a change, so that none of it has to be remembered.
+
+  cc-land <repo> <pr-number>                      the PR path
+  cc-land <repo> --track <t> --note "<what>"      work with no PR (a config edit, a host change)
+  cc-land selfcheck                               the decision table; no network, no systemctl
+
+Landing a change used to be nine separate things to remember — gates, merge, the #approvals card, the mark on
+it, the board, the ask ledger, install.sh, switching on what landed switched off, restarting what moved — and
+in one night every one of them was forgotten at least once. This runs them in that order, prints one line per
+step, and stops at the first real failure rather than leaving half of it done. It adds no state, no daemon
+and no timer: every step is a call to something that already exists (gh, cc-slack, cc-board, cc-scope,
+install.sh, systemctl).
+
+WHAT IT WILL NOT DO, and why each line is here:
+  · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
+    afterwards — not against the default branch, which does not contain the change, so gating it there would
+    be a green light for code nobody ran. A red gate or a conflicting PR stops everything before the merge.
+  · It only ever switches ON a unit this change ADDED. A unit that is off is usually off for a reason (no
+    tokens yet, somebody's call), so it stays off and is named in the output instead of started behind their
+    back. Enabling the added ones is the step a worker structurally cannot do: cc-guard denies it systemctl.
+  · It never restarts the unit that owns the shared tmux server. That would take every session on the box
+    down, this one included; if the change moved what that unit runs, it says so and leaves it to a person.
+
+A step that cannot run because the box has no such thing (Slack not set up, no board row, no ledger row) is a
+SKIP: it reports and the sequence carries on. A step that was asked to do something and could not is a
+FAILURE and stops the sequence. Re-running is the recovery, and is safe: an already-merged PR, an existing
+card, a settled ledger row and a unit that is already on are each "nothing to do".
+
+Exit: 0 landed · 1 a step failed (nothing after it ran) · 2 usage.
+"""
+import glob, json, os, re, shutil, subprocess, sys, tempfile, urllib.parse, urllib.request
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy (like `cc`)
+DEV = f"{HOME}/dev"
+CFG = f"{HOME}/.cc/config"
+BOARDS = f"{HOME}/.cc/boards"
+UNITS = f"{HOME}/.config/systemd/user"
+# The gates, in the order a person runs them: the cheap static ones first, the slow end-to-end one last. A repo
+# with none of them lands ungated and says so — this is a general tool, not one tree's own script.
+GATES = ("core/tests/check.sh", "tests/check.sh", "tests/check-extra.sh", "core/tests/selftest.sh", "tests/selftest.sh")
+FAILED_RE = re.compile(r"(\d+) failed")   # a suite ending "0 failed" passed; "1 failed" did not, whatever it exited with
+NEVER = "tmux-main.service"               # restarting it takes the shared tmux server — every session on the box — down
+CARD = "ok_hand"                          # the mark for "landed". The daemon puts ✅ on a PR the owner merged with a 👍;
+                                          # keeping them apart is what tells "I merged this" from "you approved this"
+
+
+class Failed(Exception):
+    """A step that was asked to do something and could not. Nothing after it runs."""
+
+
+class Skip(Exception):
+    """A step with nothing to do here (no Slack, no board row, no ledger row). Reported; the sequence goes on."""
+
+
+# ── the outside world, each in one place, so `selfcheck` can stand in for all of it ──────────────────────
+def sh(argv, cwd=None, timeout=300):
+    """(returncode, output) — stdout and stderr together, never a raise: every caller decides what failure means."""
+    try:
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout + r.stderr
+    except Exception as e:
+        return 127, f"{e.__class__.__name__}: {e}"
+
+
+def slack(method, token, **kw):
+    data = urllib.parse.urlencode({k: v for k, v in kw.items() if v is not None}).encode()
+    req = urllib.request.Request("https://slack.com/api/" + method, data=data,
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def bot_token():
+    """Out of ~/.cc/config — the same file, and the same one key, that cc-slack and cc-notify read."""
+    try:
+        for ln in open(CFG):
+            ln = ln.strip()
+            if ln.startswith("SLACK_BOT_TOKEN") and "=" in ln:
+                return ln.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return os.environ.get("SLACK_BOT_TOKEN", "")
+
+
+def board(repo):
+    try:
+        with open(f"{BOARDS}/{repo}.json") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def repo_root(repo):
+    """Where the repo actually is: the board knows, and a repo with no board is the usual ~/dev/<repo>."""
+    p = board(repo).get("path") or ""
+    return p if p and os.path.isdir(f"{p}/.git") else f"{DEV}/{repo}"
+
+
+def linked_units():
+    """The unit FILES this box has linked — the only ones systemctl can be asked anything about."""
+    return sorted(os.path.basename(p) for p in glob.glob(f"{UNITS}/*.service") + glob.glob(f"{UNITS}/*.timer"))
+
+
+def read_unit(name):
+    try:
+        return open(f"{UNITS}/{name}", errors="replace").read()
+    except OSError:
+        return ""
+
+
+def out(mark, text):
+    print(f"  {mark} {text}", flush=True)
+
+
+def last(text, n=200):
+    return next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")[-n:]
+
+
+def name_status(text):
+    """git --name-status output -> [(status, path)]. 'A' is what tells a unit this change ADDED from one it touched."""
+    rows = []
+    for ln in (text or "").splitlines():
+        f = ln.split("\t")
+        if len(f) >= 2 and f[0]:
+            rows.append((f[0][0], f[-1]))
+    return rows
+
+
+# ── the landing ──────────────────────────────────────────────────────────────────────────────────────────
+class Land:
+    def __init__(self, repo, pr=None, track=None, note=""):
+        self.repo, self.pr, self.track, self.note = repo, pr, track, note
+        self.root = repo_root(repo)
+        self.facts = {}          # what GitHub says about the PR
+        self.changed = None      # [(status, path)] this landing makes; worked out once, when it is first needed
+        self.head = ""           # the PR head as a SHA — never "FETCH_HEAD", which the pull below overwrites
+        self.restarted = []
+
+    def base(self):
+        return board(self.repo).get("default_branch") or "main"
+
+    def what(self):
+        return f"PR #{self.pr} {self.facts.get('title', '')}".strip() if self.pr else self.note
+
+    # -- 1. gates ------------------------------------------------------------------------------------------
+    def gates(self):
+        tree, tmp = self.root, None
+        if self.pr and self.facts.get("state") != "MERGED":
+            if self.facts.get("mergeable") == "CONFLICTING":
+                raise Failed(f"PR #{self.pr} conflicts with {self.base()} — rebase it, then land it")
+            rc, o = sh(["git", "fetch", "-q", "origin", f"pull/{self.pr}/head"], cwd=self.root, timeout=300)
+            if rc:
+                raise Failed(f"cannot fetch PR #{self.pr}: {last(o)}")
+            rc, o = sh(["git", "rev-parse", "FETCH_HEAD"], cwd=self.root)
+            if rc:
+                raise Failed(f"cannot resolve the head of PR #{self.pr}: {last(o)}")
+            self.head = o.strip()
+            tmp = tempfile.mkdtemp(prefix="cc-land-")
+            tree = f"{tmp}/head"
+            rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, self.head], cwd=self.root, timeout=300)
+            if rc:
+                raise Failed(f"cannot check out PR #{self.pr}: {last(o)}")
+        try:
+            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK)]
+            if not found:
+                raise Skip(f"no gates in {self.repo} ({GATES[0]}, {GATES[2]}, …) — landing ungated")
+            for g in found:
+                rc, o = sh([f"{tree}/{g}"], cwd=tree, timeout=3600)
+                bad = FAILED_RE.search(o)
+                if rc or (bad and bad.group(1) != "0"):
+                    raise Failed(f"gate {g} did not pass: {last(o)}")
+            on = f"PR #{self.pr}" if self.head else f"the {self.base()} checkout"
+            return f"{len(found)} gate(s) passed on {on}: {', '.join(found)}"
+        finally:
+            if tmp:
+                sh(["git", "worktree", "remove", "--force", tree], cwd=self.root)
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    def changed_files(self):
+        """What this landing puts on the default branch. Before the merge that is the PR head against its base;
+        after it (a re-run, or a PR merged by a 👍 earlier) it is the squash commit itself — either way the
+        answer is the same list, which is what makes the deploy steps below survive a re-run."""
+        if self.changed is None:
+            self.changed = []
+            if self.head:
+                rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root)
+                if not rc:
+                    self.changed = name_status(sh(["git", "diff", "--name-status", o.strip(), self.head], cwd=self.root)[1])
+            elif (self.facts.get("mergeCommit") or {}).get("oid"):
+                sha = self.facts["mergeCommit"]["oid"]
+                self.changed = name_status(sh(["git", "show", "--name-status", "--format=", sha], cwd=self.root)[1])
+        return self.changed
+
+    # -- 2. merge ------------------------------------------------------------------------------------------
+    def merge(self):
+        if not self.pr:
+            raise Skip("no PR to merge — this is the no-PR path")
+        if self.facts.get("state") == "MERGED":
+            return f"PR #{self.pr} was already merged — nothing to do"
+        rc, o = sh(["gh", "pr", "merge", str(self.pr), "--squash", "--delete-branch"], cwd=self.root, timeout=300)
+        done = any(w in o for w in ("already merged", "is closed", "already closed"))   # gh: nothing left to merge
+        if rc and not done:
+            raise Failed(f"gh pr merge #{self.pr}: {last(o)}")
+        if "auto-merge armed" in o:
+            raise Failed(f"PR #{self.pr} did not merge now — auto-merge is armed, so it lands later and none of "
+                         f"the deploy below would match it. Re-run cc-land once it is in")
+        return f"PR #{self.pr} merged (squash, remote branch deleted)"
+
+    # -- 3. the #approvals card, and the mark on it --------------------------------------------------------
+    def card(self):
+        """post-approval already IS "find this PR's card, post one only if there is none" — so call it and mark
+        whatever it hands back. Posting a second card is the bug that put three of them in the channel."""
+        if not self.pr:
+            raise Skip("no PR — no card to place")
+        rc, o = sh([f"{BIN}/cc-slack", "post-approval", self.repo, str(self.pr)], timeout=120)
+        if rc == 3:
+            raise Skip("Slack is not set up on this box — no card")
+        if rc:
+            raise Failed(f"cc-slack post-approval: {last(o)}")
+        ts, tok, chat = last(o), bot_token(), self.approvals_channel()
+        if not (ts and tok and chat):
+            raise Skip("no #approvals channel the bot is in — the card is unmarked")
+        r = slack("reactions.add", tok, channel=chat, timestamp=ts, name=CARD)
+        if not r.get("ok") and r.get("error") != "already_reacted":
+            raise Failed(f"reactions.add on the card for PR #{self.pr}: {r.get('error')}")
+        return f"#approvals: the one card for PR #{self.pr} marked :{CARD}:"
+
+    def approvals_channel(self):
+        """cc-slack owns which channel that is, and prints it — asking beats keeping a second copy of the answer."""
+        o = sh([f"{BIN}/cc-slack", "status"], timeout=60)[1]
+        m = re.search(r"^approvals: #\S+ (C[A-Z0-9]+)", o, re.M)
+        return m.group(1) if m else ""
+
+    # -- 4. the board --------------------------------------------------------------------------------------
+    def find_track(self):
+        """The track that carries this PR: the board row naming it, else the row whose branch is the PR's head."""
+        if self.track:
+            return self.track
+        rows = board(self.repo).get("tracks", {})
+        for name, t in rows.items():
+            if re.search(rf"/pull/{self.pr}(?:/|$)", t.get("pr") or ""):
+                return name
+        head = self.facts.get("headRefName") or ""
+        for name, t in rows.items():
+            if head and t.get("branch") == head:
+                return name
+        return ""
+
+    def close_board(self):
+        t = self.find_track()
+        if not t:
+            raise Skip(f"no track on the board carries PR #{self.pr} — nothing to close")
+        if t not in board(self.repo).get("tracks", {}):
+            raise Failed(f"the {self.repo} board has no track '{t}'")
+        st = "merged" if self.pr else "done"
+        rc, o = sh([f"{BIN}/cc-board", "status", self.repo, t, st])
+        if rc:
+            raise Failed(f"cc-board status: {last(o)}")
+        sh([f"{BIN}/cc-board", "note", self.repo, t, f"landed by cc-land: {self.what()}"])
+        return f"board: {self.repo}/{t} -> {st}"
+
+    # -- 5. the ask ledger ---------------------------------------------------------------------------------
+    def close_ledger(self):
+        """What the OWNER asked for, which the board does not track. A track whose work left no PR sat open for
+        half an hour because the only thing that could close this was somebody remembering to."""
+        t = self.find_track()
+        if not t:
+            raise Skip("no track — no ledger rows to close")
+        rc, o = sh([f"{BIN}/cc-scope", "list", self.repo, "--track", t, "--json"])
+        if rc:
+            raise Skip(f"no ask ledger for {self.repo}")
+        try:
+            asks = json.loads(o or "[]")
+        except ValueError:
+            asks = []
+        if not asks:
+            raise Skip(f"no unsettled ask on track {t}")
+        for a in asks:
+            rc, o = sh([f"{BIN}/cc-scope", "verify", self.repo, a["id"], "--evidence", self.what()])
+            if rc:
+                raise Failed(f"cc-scope verify {a['id']}: {last(o)}")
+        return f"ledger: {len(asks)} ask(s) on {t} verified ({', '.join(a['id'] for a in asks)})"
+
+    # -- 6. pull, install, daemon-reload -------------------------------------------------------------------
+    def install(self):
+        """~/bin points INTO this checkout, so the pull alone updates every script that already existed.
+        install.sh is what links a file the change ADDED — and a file nothing links is a file that never runs."""
+        rc, o = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.root)
+        cur = o.strip()
+        if rc or cur != self.base():
+            raise Failed(f"{self.root} is on '{cur}', not '{self.base()}' — land from the default-branch checkout")
+        rc, o = sh(["git", "pull", "--ff-only", "-q"], cwd=self.root, timeout=300)
+        if rc:
+            raise Failed(f"git pull --ff-only in {self.root}: {last(o)}")
+        inst = next((p for p in ("core/install.sh", "install.sh") if os.access(f"{self.root}/{p}", os.X_OK)), "")
+        if not inst:
+            raise Skip("no install.sh in this repo — nothing to link")
+        rc, o = sh([f"{self.root}/{inst}"], cwd=os.path.dirname(f"{self.root}/{inst}"), timeout=900)
+        if rc:
+            raise Failed(f"{inst}: {last(o)}")
+        sh(["systemctl", "--user", "daemon-reload"], timeout=120)
+        return f"pulled {self.base()}, ran {inst}, daemon-reload"
+
+    # -- 7. units this change ADDED, which land switched off -----------------------------------------------
+    def enable_units(self):
+        added = [os.path.basename(p) for st, p in self.changed_files()
+                 if st == "A" and re.search(r"systemd-user/[^/]+\.(service|timer)$", p)]
+        linked, done, notes = linked_units(), [], []
+        for u in added:
+            stem = u.rsplit(".", 1)[0]
+            if u.endswith(".service") and f"{stem}.timer" in added + linked:
+                notes.append(f"{u} is started by {stem}.timer, never enabled itself")
+                continue
+            if u.endswith(".service") and "[Install]" not in read_unit(u):
+                notes.append(f"{u} has no [Install] — something else starts it")
+                continue
+            if u not in linked:
+                notes.append(f"{u} is not linked (install.sh names its units one by one — add it there)")
+                continue
+            if sh(["systemctl", "--user", "is-enabled", u], timeout=60)[1].strip() == "enabled":
+                notes.append(f"{u} was already on")   # enabled = somebody has already decided; --now only ever mattered once
+                continue
+            rc, o = sh(["systemctl", "--user", "enable", "--now", u], timeout=120)
+            if rc:
+                raise Failed(f"systemctl enable --now {u}: {last(o)}")
+            done.append(u)
+        # Named, never touched. "enabled" is the test, not "active": a oneshot that has run is enabled and idle, and
+        # calling that switched off would cry wolf on every landing.
+        off = [u for u in linked if u.endswith(".service") and u not in added and "[Install]" in read_unit(u)
+               and sh(["systemctl", "--user", "is-enabled", u], timeout=60)[1].strip() != "enabled"]
+        if off:
+            notes.append("off by somebody's choice, left alone: " + ", ".join(off))
+        tail = " — " + "; ".join(notes) if notes else ""
+        if not done:
+            raise Skip("no unit added by this change" + tail)
+        return f"switched on: {', '.join(done)}" + tail
+
+    # -- 8. restart only what moved ------------------------------------------------------------------------
+    def restart(self):
+        """A running unit whose ExecStart runs a script this change touched. Read off the unit file, so a unit
+        added tomorrow needs no entry anywhere."""
+        moved = {os.path.basename(p) for st, p in self.changed_files() if st != "D"}
+        if not moved:
+            raise Skip("no file list for this landing — nothing to restart")
+        held = []
+        for u in linked_units():
+            if not u.endswith(".service"):
+                continue
+            runs = {os.path.basename(tok) for ln in re.findall(r"^Exec[A-Za-z]*=(.*)$", read_unit(u), re.M)
+                    for tok in ln.split() if "/" in tok}      # paths only: a bare word like `main` is an argument, not a script
+            if not runs & moved:
+                continue
+            if u == NEVER:
+                held.append(u)
+                continue
+            if sh(["systemctl", "--user", "is-active", u], timeout=60)[1].strip() != "active":
+                continue                                   # not running: its next start picks the new code up
+            rc, o = sh(["systemctl", "--user", "restart", u], timeout=180)
+            if rc:
+                raise Failed(f"systemctl restart {u}: {last(o)}")
+            self.restarted.append(u)
+        tail = (f"; {NEVER} runs a script that moved too — restarting it would take every session on this box "
+                f"down, so do it by hand (`cc rc restart`)") if held else ""
+        if not self.restarted:
+            raise Skip("nothing running uses the files this change touched" + tail)
+        return f"restarted: {', '.join(self.restarted)}{tail}"
+
+    def steps(self):
+        return [("gates", self.gates), ("merge", self.merge), ("card", self.card), ("board", self.close_board),
+                ("ledger", self.close_ledger), ("install", self.install), ("units", self.enable_units),
+                ("restart", self.restart)]
+
+    def run(self):
+        if self.pr:
+            rc, o = sh(["gh", "pr", "view", str(self.pr), "--json",
+                        "title,url,state,mergeable,headRefName,mergeCommit"], cwd=self.root, timeout=120)
+            if rc:
+                print(f"cc-land: cannot read PR #{self.pr} in {self.root}: {last(o)}", file=sys.stderr)
+                return 1
+            try:
+                self.facts = json.loads(o)
+            except ValueError:
+                print(f"cc-land: gh returned no PR #{self.pr}", file=sys.stderr)
+                return 1
+            print(f"landing [{self.repo}] PR #{self.pr}: {self.facts.get('title', '')}")
+        else:
+            print(f"landing [{self.repo}] {self.track}: {self.note}")
+        for name, fn in self.steps():
+            try:
+                out("✓", fn())
+            except Skip as e:
+                out("·", str(e))
+            except Failed as e:
+                out("✗", f"{name}: {e}")
+                print("cc-land: STOPPED there — nothing after it ran. Fix that and re-run the same command: "
+                      "every step already done is a no-op the second time.", file=sys.stderr)
+                return 1
+        print("landed.")
+        return 0
+
+
+# ── selfcheck: the decision table, with the whole outside world stood in for ─────────────────────────────
+def cmd_selfcheck():
+    import contextlib, io
+    fails, calls, reacted, world = [], [], [], {}
+
+    def check(name, cond):
+        print(("  ✓ " if cond else "  ✗ ") + name)
+        if not cond:
+            fails.append(name)
+
+    def fake_sh(argv, cwd=None, timeout=300):
+        calls.append(argv)
+        key = max((k for k in world if " ".join(argv).startswith(k)), key=len, default=None)
+        return world[key] if key else (0, "")
+
+    def ran(*words):
+        return [c for c in calls if all(w in " ".join(c) for w in words)]
+
+    LINKED, BODY, BOARD = [[]], [{}], [{}]
+    globals().update(sh=fake_sh, bot_token=lambda: "xoxb-selfcheck",
+                     slack=lambda m, t, **kw: (reacted.append((m, kw.get("name"), kw.get("timestamp"))) or {"ok": True}),
+                     linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
+                     board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland")
+    FACTS = {"title": "a change", "state": "OPEN", "mergeable": "MERGEABLE",
+             "headRefName": "track/w1", "mergeCommit": None}
+
+    def fresh(**kw):
+        calls.clear(); reacted.clear(); world.clear()
+        LINKED[0] = ["cc-new.service", "cc-slackd.service", NEVER]
+        BODY[0] = {"cc-new.service": "[Service]\nExecStart=%h/bin/cc-new\n[Install]\nWantedBy=default.target\n",
+                   "cc-new.timer": "[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n",
+                   "cc-slackd.service": "[Service]\nExecStart=%h/bin/cc-slack daemon\n[Install]\nWantedBy=default.target\n",
+                   NEVER: "[Service]\nExecStart=/usr/bin/tmux new-session -d -s main %h/bin/cc-rc\n[Install]\n"}
+        BOARD[0] = {"default_branch": "main", "path": "/tmp/_ccland",
+                    "tracks": {"w1": {"pr": "https://github.com/o/r/pull/7", "branch": "track/w1", "status": "review"}}}
+        world["gh pr view"] = (0, json.dumps(FACTS))
+        for q in ("is-active", "is-enabled"):                            # it always is: the box's own tmux server
+            world[f"systemctl --user {q} {NEVER}"] = (0, "active\n" if q == "is-active" else "enabled\n")
+        L = Land("myrepo", **kw)
+        L.facts = dict(FACTS)
+        return L
+
+    def caught(fn):
+        try:
+            return fn()
+        except Exception as e:
+            return e
+
+    # 1. a red gate refuses to merge, and refuses to deploy — the whole reason they run first
+    L = fresh(pr=7)
+    L.gates = lambda: (_ for _ in ()).throw(Failed("gate tests/check.sh did not pass: 1 failed"))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        rc = L.run()          # a real run, start to finish; its own report is not this report
+    check("a failing gate stops the landing and nothing is merged", rc == 1 and not ran("gh pr merge"))
+    check("a failing gate stops before install.sh and before any systemctl", not ran("install.sh") and not ran("systemctl"))
+
+    # …and a gate's verdict is its own tally, not just its exit code (a suite can exit 0 and say "1 failed")
+    L = fresh(pr=7)
+    L.facts["state"] = "MERGED"
+    world["/tmp/_ccland/tests/check.sh"] = (0, "== result: 3 passed, 1 failed ==")
+    real_access, os.access = os.access, lambda p, m: p.endswith("tests/check.sh")
+    try:
+        red = isinstance(caught(L.gates), Failed)
+    finally:
+        os.access = real_access
+    check("a gate that exits 0 but reports '1 failed' is a failure", red)
+
+    # 2. one card per PR: post-approval decides that, cc-land marks whatever it hands back
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-slack post-approval"] = (0, "1788000000.000100\n")
+    world[f"{BIN}/cc-slack status"] = (0, "approvals: #approvals C0APPROVE — a :+1: from anyone merges it\n")
+    msg = L.card()
+    check("the card step calls post-approval once and never with --force (a second card is the duplicate bug)",
+          len(ran("post-approval")) == 1 and "--force" not in " ".join(ran("post-approval")[0]))
+    check("the card that came back is marked, by channel and timestamp",
+          reacted == [("reactions.add", CARD, "1788000000.000100")] and CARD in msg)
+
+    # 3. Slack not being set up is a skip, not a failure: the merge has already happened
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-slack post-approval"] = (3, "no SLACK_BOT_TOKEN")
+    check("Slack not set up: the card is skipped and the landing carries on", isinstance(caught(L.card), Skip))
+
+    # 4. a unit this change ADDED is switched on; one it merely touched, or one that is off, is not
+    L = fresh(pr=7)
+    L.changed = [("A", "core/config/systemd-user/cc-new.service"), ("M", "core/bin/cc-slack")]
+    msg = L.enable_units()
+    check("a newly added unit is enabled and started", "cc-new.service" in msg and len(ran("enable", "--now", "cc-new.service")) == 1)
+    check("a unit that is simply off is never switched on, only named",
+          not ran("enable", "--now", "cc-slackd.service") and "cc-slackd.service" in msg)
+
+    # …and an added service that has a timer is left to its timer
+    L = fresh(pr=7)
+    LINKED[0].append("cc-new.timer")
+    L.changed = [("A", "core/config/systemd-user/cc-new.service"), ("A", "core/config/systemd-user/cc-new.timer")]
+    L.enable_units()
+    check("an added service with a timer: the timer is enabled, the service is not",
+          ran("enable", "--now", "cc-new.timer") and not ran("enable", "--now", "cc-new.service"))
+
+    # 5. a re-run changes nothing
+    L = fresh(pr=7)
+    L.changed = [("A", "core/config/systemd-user/cc-new.service")]
+    world["systemctl --user is-enabled"] = (0, "enabled\n")
+    world["systemctl --user is-active"] = (0, "active\n")
+    check("a re-run enables nothing that is already on",
+          isinstance(caught(L.enable_units), Skip) and not ran("enable", "--now"))
+    L = fresh(pr=7)
+    L.facts["state"] = "MERGED"
+    check("a re-run of an already-merged PR does not call gh pr merge",
+          "already merged" in L.merge() and not ran("gh pr merge"))
+    L = fresh(pr=7)
+    L.facts.update(state="MERGED", mergeCommit={"oid": "deadbee"})
+    world["git show --name-status"] = (0, "A\tcore/config/systemd-user/cc-new.service\n")
+    check("a re-run after the merge still knows what landed (the squash commit), so the deploy steps still work",
+          L.changed_files() == [("A", "core/config/systemd-user/cc-new.service")])
+
+    # 6. only what the change touched is restarted — and never the box's tmux server
+    L = fresh(pr=7)
+    L.changed = [("M", "core/bin/cc-slack")]
+    world["systemctl --user is-active"] = (0, "active\n")
+    L.restart()
+    check("the unit whose ExecStart runs the moved script is restarted, alone",
+          L.restarted == ["cc-slackd.service"] and not ran("restart", "cc-new.service"))
+    L = fresh(pr=7)
+    L.changed = [("M", "core/bin/cc-rc")]
+    msg = str(caught(L.restart))
+    check(f"{NEVER} is never restarted from here, only reported", not ran("restart", NEVER) and NEVER in msg)
+
+    # 7. the no-PR path — the one that left a track open for half an hour
+    L = fresh(track="w1", note="settings edit outside the repo")
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a24", "status": "open"}]))
+    check("no PR: nothing is merged and no card is posted",
+          isinstance(caught(L.merge), Skip) and isinstance(caught(L.card), Skip) and not ran("post-approval"))
+    check("no PR: the board row closes as 'done' — it has no PR to be 'merged'",
+          "-> done" in L.close_board() and ran("cc-board", "status", "myrepo", "w1", "done"))
+    check("no PR: the ledger row closes against the note the caller gave",
+          "a24" in L.close_ledger() and ran("cc-scope", "verify", "myrepo", "a24", "settings edit outside the repo"))
+
+    # 8. the sequence itself
+    check("the steps are the nine remembered ones, in that order",
+          [n for n, _ in Land("myrepo", pr=1).steps()] ==
+          ["gates", "merge", "card", "board", "ledger", "install", "units", "restart"])
+
+    print(f"cc-land selfcheck: {len(fails)} failed")
+    return 1 if fails else 0
+
+
+def main(argv):
+    if argv and argv[0] == "selfcheck":
+        return cmd_selfcheck()
+    if len(argv) < 2 or argv[0].startswith("-"):
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+        return 2
+    repo, rest = argv[0], argv[1:]
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo):
+        print(f"cc-land: '{repo}' is not a repo name", file=sys.stderr)
+        return 2
+    if re.fullmatch(r"[0-9]+", rest[0]):
+        if len(rest) > 1:
+            print("cc-land: the PR path takes nothing after the number", file=sys.stderr)
+            return 2
+        land = Land(repo, pr=int(rest[0]))
+    else:
+        track = note = ""
+        while rest:
+            a = rest.pop(0)
+            if a == "--track" and rest:
+                track = rest.pop(0)
+            elif a == "--note" and rest:
+                note = rest.pop(0)
+            else:
+                print(f"cc-land: unexpected '{a}'", file=sys.stderr)
+                return 2
+        if not track or not note:
+            print('cc-land: work with no PR needs both --track <t> and --note "<what changed>" '
+                  "(the note is the evidence the ask ledger closes against)", file=sys.stderr)
+            return 2
+        land = Land(repo, track=track, note=note)
+    if not os.path.isdir(f"{land.root}/.git"):
+        print(f"cc-land: {land.root} is not a git repo", file=sys.stderr)
+        return 2
+    return land.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

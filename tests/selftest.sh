@@ -495,6 +495,11 @@ echo "== ask ledger (cc-scope) =="
 # The ledger has no fixtures to build: its selfcheck works in a temp dir of its own and removes it on the way out.
 sc=$("$B/cc-scope" selfcheck 2>&1)
 grep -q "0 failed" <<<"$sc" && ok "cc-scope selfcheck: $(tail -1 <<<"$sc")" || bad "cc-scope selfcheck: $(tail -1 <<<"$sc")"
+echo "== landing (cc-land) =="
+# Its decision table only: the real thing merges, installs and starts services, so every call it would make to
+# the world is stood in for. Nothing here reaches git, Slack, systemd or the board.
+sc=$("$B/cc-land" selfcheck 2>&1)
+grep -q "cc-land selfcheck: 0 failed" <<<"$sc" && ok "$(tail -1 <<<"$sc")" || bad "$(tail -1 <<<"$sc")"
 cd ~ || exit 1
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
