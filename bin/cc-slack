@@ -46,6 +46,9 @@ Only the owner steers the box: permission answers, `!` commands beyond !help/!st
 App Home are owner-only, and a member cannot authorize what the box gates on the owner.
 In-Slack commands (`!help`/`!status` anyone, the rest owner only, any channel or thread): `!help !ping !status !digest !sessions !start !say !threads !box`
 `!restart <box|repo[/track]|slack|tmux>` and `!reboot` (both confirm-gated). A `!command` root is never a tracked thread.
+One channel, one voice: while `cc-handoff` has an overlap open on a target, both its sessions are subscribed but only
+the one the record calls live is delivered to (permission answers included), and the muted one's reply/react/file are
+refused. No record, or one that cannot be read, leaves the predecessor in charge.
 Thread status v3 (at most ONE bot-managed mark per root): ❓ = it needs YOU (we asked something, or your last word went
 30 min unanswered) · 🔴 = the session owes you (your word is the last one, under 30 min) · 🟠 = handled, nothing to do
 (gone after 48 h of quiet) · your 🏁 on ANY message of a thread removes every mark and stops its nudges until someone
@@ -868,6 +871,35 @@ def sock_request(obj, timeout=10):
         buf += d
     s.close()
     return json.loads(buf or b"{}")
+
+
+# ------------------------------------------------- one channel, one voice (cc-handoff's overlapping handoff)
+HANDOFF_DIR = os.environ.get("CC_HANDOFF_DIR") or f"{HOME}/.cc/state/handoff"
+
+
+def handoff_record(target):
+    """The open overlap record for <target>, written by cc-handoff, or None when no handoff is open (then
+    nothing here changes). It names which of the two sessions is LIVE: the live one owns the channel, the
+    other is muted. Read from disk on every use, like routes.json — a cached copy would outlive the cutover
+    by exactly the seconds in which a channel has two voices. A record we cannot parse is still a record:
+    {} says "an overlap is open, and I do not know who is live", and the caller keeps the predecessor."""
+    try:
+        with open(f"{HANDOFF_DIR}/{target.replace('/', '--')}.json") as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f"handoff record for {target}: {e!r}")
+        return {}
+    return rec if isinstance(rec, dict) and rec.get("id") else {}
+
+
+def handoff_muted(rec, handoff_id):
+    """Is the session that subscribed with this CC_HANDOFF id the NON-live side of `rec`? The successor is the
+    one whose id matches the record (cc-guard keys on the same thing); any other session of that target is the
+    predecessor — which is what an unreadable record leaves in charge."""
+    side = "successor" if handoff_id and handoff_id == rec.get("id") else "predecessor"
+    return side != ("successor" if rec.get("live") == "successor" else "predecessor")
 
 
 # ---------------------------------------------------------------- daemon
@@ -1708,11 +1740,16 @@ class Daemon:
             first = json.loads(f.readline() or b"{}")
             if "hello" in first:
                 target, alias = first["hello"], first.get("alias") or None
-                conn = Conn(c, target, {"pid": first.get("pid"), "since": time.time(), "alias": alias})
+                hid = first.get("handoff") or None       # a SIDE of an open handoff, not an alias: no join notice, not @-addressable
+                conn = Conn(c, target, {"pid": first.get("pid"), "since": time.time(), "alias": alias, "handoff": hid})
                 with self.lock:
                     self.subs[target].append(conn)
                     q = self.queues.get(target)
-                    backlog = [e for e in (q or []) if e[2] == alias]   # each entry waits for ITS alias (main's backlog is not an orch's)
+                    peers = [x for x in self.subs[target] if (x.info.get("alias") or None) == alias]
+                    # each entry waits for ITS alias (main's backlog is not an orch's) — and the muted half of a
+                    # handoff takes none of it: under a live session it would answer beside it, and if that session
+                    # is gone this conn is the promoted one and the backlog is its.
+                    backlog = [e for e in (q or []) if e[2] == alias] if conn in self.live_conns(target, peers) else []
                     for e in backlog:
                         q.remove(e)
                     self.save_queues()
@@ -1720,7 +1757,7 @@ class Daemon:
                 if alias:
                     self.known_aliases[target].add(alias)
                     self.chan_notice(target, f"🤖 @{alias} joined — @ it to hand it threads; @main brings the main session back.")
-                log(f"subscribe {target} alias={alias} pid={first.get('pid')} backlog={len(backlog)}")
+                log(f"subscribe {target} alias={alias}{' handoff=' + hid if hid else ''} pid={first.get('pid')} backlog={len(backlog)}")
                 for t, payload, _a in backlog:
                     if time.time() - t < QUEUE_TTL:
                         conn.send(payload)
@@ -1782,16 +1819,34 @@ class Daemon:
                 alias = conn.info.get("alias")
                 if alias:
                     self.chan_notice(conn.target, f"🤖 @{alias} left.")
-                log(f"unsubscribe {conn.target} alias={alias} pid={conn.info.get('pid')}")
+                log(f"unsubscribe {conn.target} alias={alias}"
+                    f"{' handoff=' + conn.info['handoff'] if conn.info.get('handoff') else ''} pid={conn.info.get('pid')}")
             try:
                 c.close()
             except Exception:
                 pass
 
+    def live_conns(self, target, conns):
+        """One channel, one voice. While a handoff overlap is open on <target>, two sessions are subscribed and
+        only the one the record calls live is delivered to — the muted one would answer the same message, and
+        would take a permission answer the live one is waiting on. Only ever with MORE THAN ONE candidate: a
+        lone conn is delivered to whatever the record says, so nothing is queued for a session that is gone and
+        the survivor is promoted. An aliased conn is an orch, not a side of the handoff, and is left alone."""
+        sides = [c for c in conns if not (c.info.get("alias") or None)]
+        if len(sides) < 2:
+            return conns
+        rec = handoff_record(target)
+        if rec is None:
+            return conns                                   # no overlap open: exactly today's path
+        live = [c for c in sides if not handoff_muted(rec, c.info.get("handoff"))]
+        keep = min(live or sides, key=lambda c: c.info.get("since") or 0)   # nobody live → the earliest subscriber, i.e. the predecessor
+        return [c for c in conns if c is keep or (c.info.get("alias") or None)]
+
     def deliver(self, target, payload, autostart=True, alias=None):
         every = payload.get("type") == "permission"   # the prompt can come from any alias — answer them all, one of them is waiting
         with self.lock:
             conns = [c for c in self.subs.get(target, []) if every or (c.info.get("alias") or None) == alias]
+        conns = self.live_conns(target, conns)        # …but never the muted half of a handoff, whatever it asked
         sent = 0
         for conn in conns:
             try:
@@ -3882,6 +3937,7 @@ class Channel:
     def __init__(self, target):
         self.target, self.cfg, self.link, self.daemon_ok = target, load_cfg(), None, None
         self.alias = os.environ.get("CC_SLACK_ALIAS") or None   # set by `cc <repo> --orch <alias>`; peer session, same target
+        self.handoff = os.environ.get("CC_HANDOFF") or None     # set by `cc __runnext`: this session is the SUCCESSOR of that record
         self.link_started = False   # daemon link starts only after the host's notifications/initialized (else backlog is emitted pre-handshake and dropped)
         import asyncio
         self.aio = asyncio
@@ -3937,9 +3993,22 @@ class Channel:
         elif id_ is not None:
             await self.send({"jsonrpc": "2.0", "id": id_, "error": {"code": -32601, "message": f"unknown method {m}"}})
 
+    def muted(self):
+        """The non-live side of an open handoff may READ Slack and must not speak into it. The daemon's mute
+        covers what it hands us; these tools call the Slack API straight from this process, so they carry
+        their own. An orch is not a side of the handoff (it has its own channel), and is never muted."""
+        if self.alias:
+            return False
+        rec = handoff_record(self.target)
+        return rec is not None and handoff_muted(rec, self.handoff)
+
     def call(self, name, a):
         if os.environ.get("CC_ROLE") == "worker":
             return "Slack tools are for interactive sessions", True   # a --go worker must not post to the owner's channels
+        if name in ("reply", "react", "file") and self.muted():
+            return ("not sent — a handoff overlap is open on this target and the OTHER session is live: it owns the "
+                    "channel until the cutover, so nothing you post here would be the box's one voice. Read the "
+                    "thread, ask it what you need, and speak once you are live (`cc-handoff --status`)."), True
         try:
             if name == "reply":
                 chat = a.get("chat_id") or ""
@@ -4023,7 +4092,8 @@ class Channel:
             try:
                 r, w = await self.aio.open_unix_connection(SOCK)
                 self.link = w
-                w.write((json.dumps({"hello": self.target, "alias": self.alias, "pid": os.getpid()}) + "\n").encode()); await w.drain()
+                w.write((json.dumps({"hello": self.target, "alias": self.alias, "handoff": self.handoff,
+                                     "pid": os.getpid()}) + "\n").encode()); await w.drain()
                 if self.daemon_ok is not True:
                     log(f"linked to cc-slackd as {self.target}"); self.daemon_ok = True
                 while True:
@@ -5651,6 +5721,83 @@ def cmd_selfcheck():
     a8.close()
     check("hello: only the entries queued for THIS alias are flushed; the orch's stay queued — M8",
           [p.get("content") for p in flushed8] == ["for main"] and len(dmM8b.queues["r"]) == 1)
+    # ---- H: one channel, one voice. While cc-handoff has an overlap open, both sessions of a target are
+    #      subscribed and only the one the record calls live may be delivered to, or spoken from.
+    real_hdir, roleH = HANDOFF_DIR, None
+    hdir = tempfile.mkdtemp(prefix="cc-slack-handoff-")
+    globals()["HANDOFF_DIR"] = hdir
+    def rec_write(target, live, hid="h1"):
+        with open(f"{hdir}/{target.replace('/', '--')}.json", "w") as f:
+            json.dump({"id": hid, "target": target, "phase": "overlap", "live": live}, f)
+    def two_sides(target="r", extra=()):
+        pre = Conn(None, target, {"alias": None, "handoff": None, "since": 100.0})
+        suc = Conn(None, target, {"alias": None, "handoff": "h1", "since": 200.0})
+        got = []
+        for who, cn in (("pre", pre), ("suc", suc), *extra):
+            cn.send = (lambda w: lambda p: got.append(w))(who)
+        dm = Daemon(use_slack=False); dm.subs[target] = [pre, suc, *(c for _, c in extra)]
+        return dm, got
+    try:
+        dmH1, gotH1 = two_sides()
+        rec_write("r", "predecessor")
+        dmH1.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
+        check("handoff: the successor is muted while the record calls the predecessor live — one channel, one voice — H1",
+              gotH1 == ["pre"])
+        dmH2, gotH2 = two_sides()
+        rec_write("r", "successor")
+        dmH2.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
+        check("handoff: after the cutover the same message reaches the successor, and only it — H2", gotH2 == ["suc"])
+        orchH = Conn(None, "r", {"alias": "ai-dev", "handoff": None, "since": 300.0})
+        dmH3, gotH3 = two_sides(extra=(("orch", orchH),))
+        rec_write("r", "predecessor")
+        dmH3.deliver("r", {"type": "permission", "request_id": "abcde", "behavior": "allow"}, autostart=False, alias="ai-dev")
+        check("handoff: a permission answer fans out to every alias but the muted side — the successor cannot take "
+              "the yes the predecessor is waiting on — H3", gotH3 == ["pre", "orch"])
+        dmH4, gotH4 = two_sides()
+        os.remove(f"{hdir}/r.json")
+        dmH4.deliver("r", {"type": "message", "content": "no overlap open"}, autostart=False)
+        check("handoff: with no record, two conns of a target are both delivered to — exactly today's path — H4",
+              gotH4 == ["pre", "suc"])
+        dmH5, gotH5 = two_sides()
+        open(f"{hdir}/r.json", "w").write("{ this is not json")
+        with contextlib.redirect_stderr(io.StringIO()):
+            dmH5.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
+        check("handoff: an unreadable record still means an overlap — the earliest subscriber, the predecessor, "
+              "keeps the channel — H5", gotH5 == ["pre"])
+        dmH6, gotH6 = two_sides()
+        rec_write("r", "predecessor")
+        dmH6.subs["r"] = [c for c in dmH6.subs["r"] if c.info.get("handoff")]   # the live session's conn is gone
+        dmH6.deliver("r", {"type": "message", "content": "who answers?"}, autostart=False)
+        check("handoff: the last conn standing is promoted, not muted — nothing is queued for a session that is "
+              "gone — H6", gotH6 == ["suc"])
+        dmH7 = Daemon(use_slack=False); dmH7.queues.clear()   # an earlier case's save_queues() is in this run's scratch DIR
+        liveH7 = Conn(None, "r", {"alias": None, "handoff": None, "since": 1.0}); liveH7.send = lambda p: None
+        dmH7.subs["r"] = [liveH7]
+        dmH7.queues["r"].append((time.time(), {"type": "message", "content": "for the live one"}, None))
+        a7, b7 = socket.socketpair()
+        a7.sendall(json.dumps({"hello": "r", "handoff": "h1", "pid": 1}).encode() + b"\n"); a7.shutdown(socket.SHUT_WR)
+        dmH7.handle_conn(b7)
+        flushed7 = [l for l in a7.makefile("rb").read().splitlines() if l.strip()]
+        a7.close()
+        check("handoff: the successor subscribes with a handoff id and no alias (no '🤖 @… joined', not @-addressable) "
+              "and drains none of the live session's backlog — H7", not flushed7 and len(dmH7.queues["r"]) == 1)
+        chH = Channel("r"); chH.cfg = {}; chH.handoff = "h1"
+        roleH = os.environ.pop("CC_ROLE", None)     # a --go worker is refused one line earlier; this is a session
+        rec_write("r", "predecessor")
+        outH = [chH.call("reply", {"chat_id": "C1", "text": "hi"}),
+                chH.call("react", {"chat_id": "C1", "ts": "1.1", "emoji": "eyes"}),
+                chH.call("file", {"chat_id": "C1", "path": "/etc/hostname"})]
+        check("handoff: a muted session's own reply/react/file are refused in its process — these never touch the "
+              "socket, so a daemon-side mute would leave it able to speak — H8",
+              all(err and "OTHER session is live" in txt for txt, err in outH))
+        rec_write("r", "successor")
+        txtH9, errH9 = chH.call("reply", {"chat_id": "C1", "text": "hi"})
+        check("handoff: one os.replace() later the same session speaks — the mute is the record, nothing else — H9",
+              not errH9 and "logged" in txtH9)
+    finally:
+        globals()["HANDOFF_DIR"] = real_hdir
+        if roleH is not None:
+            os.environ["CC_ROLE"] = roleH
     dmM10 = Daemon(use_slack=False)
     dmM10.loop_tick = lambda n: (_ for _ in ()).throw(RuntimeError("boom"))
     ticks10 = []
