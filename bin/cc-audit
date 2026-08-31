@@ -2,6 +2,8 @@
 # cc-audit — hands-off recurring audit of this box. Reports live in ~/.cc/state/audit/; Slack gets ONE line
 # (the long form goes to the control repo's channel canvas). Never fixes anything: monthly findings land on the board as a
 # track the planning session dispatches when the owner says so.
+# It does own ONE thing, though: the `main-gate` board row. Every mode runs the `## suites` gates, and the first red one
+# becomes a single row on the control repo's board that updates in place and closes itself on green — see main_gate().
 #   cc-audit checks|review|weekly|monthly|delete|arch|patterns|auto|scopes|selfcheck [--scope N] [--dry] [--no-post] [--no-llm]
 #   checks = mechanical, no LLM · review = checks + an LLM read of how well the box served the OWNER over 3 days
 #   weekly = checks + one LLM code audit (area rotates by ISO week) · monthly = checks + all four areas + a synthesis
@@ -18,7 +20,8 @@
 #   scopes = print the scopes `--scope` accepts. DERIVED from the repo (every command in bin/, every top-level
 #           directory), never a table in this file: a table would rot the first time a command was added or renamed.
 #   selfcheck = the codex path against stub binaries: no network, no spend, nothing written outside its own temp dir.
-#   auto (the timer, 03:30 UTC): day 1 -> monthly · day 15 -> delete · Sunday -> weekly · every 3rd day-of-year -> review · else quiet.
+#   auto (the timer, 03:30 UTC): day 1 -> monthly · day 15 -> delete · Sunday -> weekly · every 3rd day-of-year -> review ·
+#           else the gates and the main-gate row alone — a quiet day is quiet to the owner, not blind to a red main.
 #           `arch` is NOT on the rotation: it is long and deep, and it is dispatched when someone wants it.
 #   --dry: everything (reports, evidence) goes to a mktemp dir wiped on exit and the report prints to stdout — but
 #          the LLM modes still SPEND. --no-llm (implies --no-post) skips the LLM: checks + evidence index only.
@@ -45,6 +48,9 @@ BOX="${CC_BOX:-$(hostname -s)}"                                    # notify titl
 CTL="$BOX"; case "$R" in "$HOME/dev/"*) CTL=${R#"$HOME/dev/"}; CTL=${CTL%%/*};; esac   # the control repo = the one this copy lives in: its Slack channel + board
 AD="$HOME/.cc/state/audit"; LOG="$AD/audit.log"; mkdir -p "$AD"
 CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"; LIMIT="$(dirname "$(readlink -f "$0")")/cc-limit"   # sibling, like the rest: a worktree copy uses its own
+# The main-gate row is written through the CLI and never into the board file. Off $R, not $0 like LIMIT above: the cd
+# on line 3 has already happened by here, so a relative `core/bin/cc-audit` no longer resolves through readlink -f.
+BOARD="${CC_BOARD:-$R/bin/cc-board}"
 CODEX="${CC_CODEX:-codex}"   # the second opinion's model. Not a hard dependency: a box without codex postpones, like a box whose codex is logged out
 # Its model and reasoning effort come from ~/.cc/config (CODEX_MODEL/CODEX_EFFORT); the environment wins over the file.
 # BOTH ARE OPTIONAL AND NOTHING IS HARDCODED: unset means the flag is not passed at all and codex uses its own default,
@@ -86,7 +92,7 @@ scope_files(){   # <scope> -> repo-relative paths, the command first, then its n
       sort -t: -k2,2nr | cut -d: -f1 | sed 's|^\./||'
   } | awk '!seen[$0]++' | head -60
 }
-mode=""; dry=0; post=1; llm_on=1; SCOPE=""; want_scope=0
+mode=""; dry=0; post=1; llm_on=1; SCOPE=""; want_scope=0; gate_only=0
 for a in "$@"; do
   if [ "$want_scope" = 1 ]; then SCOPE="$a"; want_scope=0; continue; fi
   case "$a" in
@@ -110,8 +116,12 @@ fi
 if [ "$mode" = auto ]; then   # %-d/%-j: no leading zero, or bash reads them as octal
   dom=$(date -u -d "$DAY" +%-d); dow=$(date -u -d "$DAY" +%u); doy=$(date -u -d "$DAY" +%-j)
   if [ "$dom" = 1 ]; then mode=monthly; elif [ "$dom" = 15 ]; then mode=delete   # mid-month, two weeks off the monthly: two independent reads of what to delete
+  elif [ "$dom" = 8 ]; then mode=arch   # the deep second-opinion pass, monthly, a week off both: the owner asked for it "every so now and then" (a23), and by-hand-only meant never
   elif [ "$dow" = 7 ]; then mode=weekly
-  elif [ $((doy % 3)) -eq 0 ]; then mode=review; else log "auto: nothing due on $DAY"; exit 0; fi
+  # A QUIET DAY STILL RUNS THE GATES. It used to exit here, which left the main-gate row up to three days stale —
+  # and a baseline that is red for three days is exactly the week rec #9 came out of. So: checks, the row, nothing
+  # else. No report, no canvas, no notify; the only trace a quiet day leaves is the row, and only when main is red.
+  elif [ $((doy % 3)) -eq 0 ]; then mode=review; else mode=checks; gate_only=1; log "auto: nothing due on $DAY — the main-gate row only"; fi
   log "auto: $DAY -> $mode"
 fi
 OUTDIR="$AD"; [ "$dry" = 1 ] && { OUTDIR=$(mktemp -d "${TMPDIR:-/tmp}/cc-audit.XXXXXX") && trap 'rm -rf "$OUTDIR"' EXIT || exit 1; }
@@ -123,23 +133,49 @@ if [ -n "$prev" ]; then p=$(stat -c %Y "$prev" 2>/dev/null || echo 0); [ "$p" -l
 SINCE=$(date -u -d "@$SINCE_TS" +'%F %T')
 
 # ---- checks: every check records PASS/FAIL and CONTINUES; one broken check never ends the run ----
-pass=0; fail=0; RPT=""
+pass=0; fail=0; RPT=""; SUITE_FAIL=""
 add(){ RPT+="$1"$'\n'; }
 row(){ local st=$1; shift; add "- **$st** $*"; if [ "$st" = PASS ]; then pass=$((pass+1)); else fail=$((fail+1)); fi; }
 ck(){ local st=FAIL; [ "$1" = 0 ] && st=PASS; shift; row "$st" "$@"; }   # ck <rc> <text…>
 tf(){ if "$@"; then echo 0; else echo 1; fi; }                          # a condition as an rc, e.g. ck "$(tf test 1 -lt 2)" …
+fail_line(){   # fail_line <output> <summary> — the first line of a failure somebody can ACT on. A suite opens with a
+  local l      # banner and ends with a tally, and neither says what broke; the ✗ line does. No such line: the tally.
+  l=$(printf '%s\n' "$1" | sed 's/\x1b\[[0-9;]*m//g' | grep -m1 -aE '✗|✘|FAIL|Fail|ERROR|Error|error:|not ok')
+  short "$(printf '%s' "${l:-$2}" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//')"
+}
+gate(){   # gate <rc> <name> <summary> <output> — a `## suites` check, which also feeds the main-gate row
+  ck "$1" "$2 — $3"
+  # The FIRST red gate owns the row; a later one is the same red. Five workers meeting one broken baseline is what
+  # this replaces, and five rows would be that same week over again with a board standing in for the five journals.
+  [ "$1" = 0 ] || [ -n "$SUITE_FAIL" ] || SUITE_FAIL="$2 — $(fail_line "${4:-}" "$3")"
+}
+slack_probe(){   # slack_probe <cc-slack status output> — prints the line worth showing, rc 0 when the daemon is connected.
+  # The WHOLE output, never a fixed line. This read `sed -n 3p`, PR #92 reshuffled status so line 3 became the policy
+  # line, and the check sat red against a daemon that was up the entire time. A line's POSITION is not a contract.
+  local dl; dl=$(grep -m1 -aE 'connected|^daemon:' <<<"$1")
+  short "$(printf '%s' "${dl:-${1:-no status}}" | tr -s '[:space:]' ' ')"
+  grep -qaw connected <<<"$1"   # -w, or "slack disconnected" passes on the substring: the down case must not read as up
+}
+spend_since(){   # spend_since <state root> <epoch> — worker $ since <epoch>, summed PER FILE and skipping what will
+  # not parse. One `jq -s` over every run json concatenated failed WHOLE on a single bad document — and a worker
+  # mid-run always has a half-written one — so on exactly the busy days this matters, spend reported $0.00.
+  find "$1" -path '*/runs/*.json' -newermt "@$2" -print0 2>/dev/null |
+    xargs -0 -I{} jq -r '.total_cost_usd // 0' {} 2>/dev/null | awk '{s+=$1} END{printf "%.2f", s+0}'
+}
 checks(){
   add "# $BOX audit — checks — $STAMP"; add ""; add "_window: since $SINCE UTC_"; add ""; add "## suites"
+  # THE BASELINE. Red here belongs to main, not to whichever track happens to run next — every one of them hits it
+  # and none of them can own it. So these go through gate(), and main_gate() below turns the first red into ONE row.
   local o rc
-  o=$(bash tests/check.sh 2>&1); rc=$?; ck $rc "tests/check.sh — $(printf '%s' "$o" | tail -1)"
+  o=$(bash tests/check.sh 2>&1); rc=$?; gate $rc "tests/check.sh" "$(printf '%s' "$o" | tail -1)" "$o"
   o=$(env -u CC_ROLE CC_NOTIFY_LOG_ONLY=1 tests/selftest.sh </dev/null 2>&1); rc=$?
-  ck $rc "tests/selftest.sh — $(printf '%s' "$o" | grep -o '== result:.*==' | tail -1)"
-  o=$(cc-slack selfcheck 2>&1); rc=$?; ck $rc "cc-slack selfcheck — $(printf '%s' "$o" | tail -1)"
-  o=$(bin/cc-vitals selfcheck 2>&1); rc=$?; ck $rc "cc-vitals selfcheck — $(printf '%s' "$o" | tail -1)"
+  gate $rc "tests/selftest.sh" "$(printf '%s' "$o" | grep -o '== result:.*==' | tail -1)" "$o"
+  o=$(cc-slack selfcheck 2>&1); rc=$?; gate $rc "cc-slack selfcheck" "$(printf '%s' "$o" | tail -1)" "$o"
+  o=$(bin/cc-vitals selfcheck 2>&1); rc=$?; gate $rc "cc-vitals selfcheck" "$(printf '%s' "$o" | tail -1)" "$o"
   o=$(python3 tests/slack_sim.py bin/cc-slack 2>&1); rc=$?
-  ck $rc "slack_sim — $(printf '%s' "$o" | grep -E '^(score|wrong_minutes_per_day|api_calls_per_day):' | tr '\n' ' ')"
-  o=$(bin/cc-units selfcheck 2>&1); rc=$?; ck $rc "cc-units selfcheck — $(printf '%s' "$o" | tail -1)"
-  o=$(bin/cc-settings selfcheck 2>&1); rc=$?; ck $rc "cc-settings selfcheck — $(printf '%s' "$o" | tail -1)"
+  gate $rc "slack_sim" "$(printf '%s' "$o" | grep -E '^(score|wrong_minutes_per_day|api_calls_per_day):' | tr '\n' ' ')" "$o"
+  o=$(bin/cc-units selfcheck 2>&1); rc=$?; gate $rc "cc-units selfcheck" "$(printf '%s' "$o" | tail -1)" "$o"
+  o=$(bin/cc-settings selfcheck 2>&1); rc=$?; gate $rc "cc-settings selfcheck" "$(printf '%s' "$o" | tail -1)" "$o"
   add ""; add "## services"
   # Every unit in config/units.json, to that unit's own policy — no list here. The old list named five and the
   # installer enabled eight, so the model, reconcile and publish timers could land switched off unseen; and a
@@ -147,7 +183,7 @@ checks(){
   o=$(bin/cc-units check 2>&1); rc=$?; ck $rc "$o"
   local hb age; hb=$(cat "$HOME/.cc/state/heartbeat" 2>/dev/null); age=$(( $(date -u +%s) - $(date -u -d "${hb:-@0}" +%s 2>/dev/null || echo 0) ))
   ck "$(tf test "$age" -lt 60)" "heartbeat — ${age}s old (want < 60)"
-  o=$(cc-slack status 2>&1 | sed -n 3p); ck "$(tf grep -q connected <<<"$o")" "slack daemon — ${o:-no status}"
+  o=$(slack_probe "$(cc-slack status 2>&1)"); rc=$?; ck $rc "slack daemon — $o"
   local errs; errs=$(journalctl --user -u cc-slackd --since "$SINCE" --no-pager 2>/dev/null | grep -ciE 'error|traceback')
   ck "$(tf test "${errs:-0}" -le 5)" "cc-slackd journal — $errs error/traceback lines since $SINCE (fail above 5)"
   add ""; add "## host"
@@ -176,10 +212,45 @@ checks(){
   ck "$(tf test "$orph" -eq 0)" "worktrees — $orph with no board entry"
   stale=$(jq -r '.projects // {} | keys[]' "$HOME/.claude.json" 2>/dev/null | while read -r f; do [ -d "$f" ] || echo x; done | wc -l)
   ck "$(tf test "${stale:-0}" -eq 0)" "$HOME/.claude.json trust — $stale entries whose dir is gone"
-  local spend
-  spend=$(find "$HOME/.cc/state" -path '*/runs/*.json' -newermt "@$SINCE_TS" -print0 2>/dev/null |
-          xargs -0 cat 2>/dev/null | jq -s 'map(.total_cost_usd // 0) | add // 0' 2>/dev/null)
-  add ""; add "- worker spend since $SINCE: \$$(printf '%.2f' "${spend:-0}")"
+  add ""; add "- worker spend since $SINCE: \$$(spend_since "$HOME/.cc/state" "$SINCE_TS")"
+}
+
+# ---- the main-gate row: ONE board row that owns "main's own suite is red" ----
+# In one week five workers hit the same red baseline, five journals said "pre-existing, not mine", all five were
+# right, and nobody owned it (arch review 2026-08-31, rec #9). This row is the owner. The rules ARE the design:
+#   · ONE row, fixed track name, and this function is the only thing that writes it. Never a second, never per-run.
+#   · The SAME red writes nothing at all — not a note, not a timestamp. A red that has not changed is not news, and
+#     a row that renoises itself every run is the thing this replaces.
+#   · Green closes it. The row exists only while main is red, so its presence on the board is the whole message.
+#   · ONCE SOMEBODY STARTS IT, IT IS THEIRS: a row with a worktree (or started) is an ordinary track from then on and
+#     this function only ever reads it. cc-reconcile decides a started track's status, and two writers would fight.
+# `queued` is deliberate and not interchangeable: it is the one live status cc-reconcile does not read as broken when
+# there is no worktree ("a queued track has never been started: it is SUPPOSED to have no worktree"). `blocked` would
+# have reconcile report "its worktree is gone" to the owner every single run.
+MG=main-gate
+mg_get(){ "$BOARD" get "$CTL" "$MG" "$1" 2>/dev/null; }
+mg_adopted(){ local wt; wt=$(mg_get worktree)          # the row's OWN worktree, defaulted the way cc-reconcile defaults it
+  [ -d "${wt:-$HOME/.cc/worktrees/$CTL/$MG}" ] && return 0
+  case "$(mg_get started)" in True|true|1|yes) return 0 ;; *) return 1 ;; esac; }
+main_gate(){   # main_gate <"<gate> — <first line>" | ""> — idempotent: the same argument twice writes once
+  local f=$1 have title
+  have=$(mg_get title) || true
+  if [ -z "$f" ]; then
+    [ -n "$have" ] || return 0                     # green, no row: the normal day, and it says nothing
+    case "$have" in "main is red: "*) ;;           # the one destructive thing here only ever undoes cc-audit's own
+      *) log "main-gate: a row this did not write is sitting on that name — left alone"; return 0 ;; esac
+    mg_adopted && { log "main-gate: green, but it was started — its worker and cc-reconcile close it"; return 0; }
+    "$BOARD" rm "$CTL" "$MG" >/dev/null 2>&1 || { log "main-gate: board rm failed"; return 1; }
+    log "main-gate: green — row closed"; return 0
+  fi
+  title="main is red: $f"
+  [ "$have" = "$title" ] && return 0               # same red, same row: nothing to write
+  mg_adopted && { log "main-gate: still red, already started — left to its worker"; return 0; }
+  "$BOARD" add "$CTL" "$MG" "$title" \
+    "main's own suite is red — every track dispatched now hits it and none of them can own it. Reproduce: \`cc-audit checks --dry\`. Fix on a branch off the default branch; cc-audit closes this row itself when the suite is green." \
+    >/dev/null 2>&1 || { log "main-gate: board add failed (no board for $CTL?)"; return 1; }
+  "$BOARD" note "$CTL" "$MG" "$STAMP $f" >/dev/null 2>&1
+  log "main-gate: red — $title"
 }
 
 # ---- evidence: THIS script runs every command; the LLM only reads the files ----
@@ -681,6 +752,82 @@ S
   SCOPE=slack
   sck "$(tf grep -qF 'SCOPE `slack` AND NOTHING ELSE' <<<"$(arch_prompt none)")" "arch --scope: the prompt says which scope it is running"
 
+
+  # 8. THE MAIN-GATE ROW. Driven through the REAL cc-board — a stub would only prove this function talks to a stub —
+  # against a throwaway $HOME, so every write lands in $d and the box's own board is never touched. `local HOME` is
+  # what makes that true for the cc-board child too: bash's dynamic scope reaches exported variables.
+  local HOME CTL SUITE_FAIL pass fail RPT   # NOT BOARD: it is an absolute sibling path and must survive the fake $HOME
+  HOME="$d/home"; CTL=sc-repo; pass=0; fail=0; RPT=""
+  mkdir -p "$HOME/.cc"
+  "$BOARD" init "$CTL" "$d/repo" main >/dev/null 2>&1
+  local RED='tests/check.sh — ✗ the digest names the timezone'
+  main_gate "$RED"
+  sck "$(tf grep -q '^main is red: tests/check.sh' <<<"$(mg_get title)")" "main-gate: a red baseline puts ONE row on the board"
+  sck "$(tf grep -q 'digest names the timezone' <<<"$(mg_get title)")" "main-gate: the row carries the failing gate AND the first line of the failure"
+  sck "$(tf test "$(mg_get status)" = queued)" "main-gate: it lands \`queued\` — cc-reconcile reads any other live status with no worktree as broken"
+  sck "$(tf test "$("$BOARD" tracks "$CTL" | grep -c .)" -eq 1)" "main-gate: exactly one row"
+  sck "$(tf grep -q 'cc-audit checks --dry' <<<"$(mg_get instructions)")" "main-gate: whoever picks it up is told how to reproduce it"
+
+  "$BOARD" json "$CTL" > "$d/board-1"
+  main_gate "$RED"
+  "$BOARD" json "$CTL" > "$d/board-2"
+  sck "$(tf cmp -s "$d/board-1" "$d/board-2")" "main-gate: the SAME red again writes nothing at all — not a row, not a note, not a timestamp"
+  sck "$(tf test "$("$BOARD" tracks "$CTL" | grep -c .)" -eq 1)" "main-gate: ...and never a second row"
+
+  main_gate 'tests/selftest.sh — ✗ the 👍 runs the gates before it merges'
+  sck "$(tf grep -q 'selftest.sh' <<<"$(mg_get title)")" "main-gate: a DIFFERENT failure updates the one row in place"
+  sck "$(tf test "$("$BOARD" tracks "$CTL" | grep -c .)" -eq 1)" "main-gate: ...still one row"
+  sck "$(tf test "$("$BOARD" json "$CTL" | jq '.tracks["main-gate"].notes | length')" -eq 2)" "main-gate: one note per CHANGE of failure, so the row carries its own history"
+
+  main_gate ""
+  sck "$(tf test "$("$BOARD" tracks "$CTL" | grep -c .)" -eq 0)" "main-gate: green closes the row — the board shows main red only while it IS red"
+  "$BOARD" json "$CTL" > "$d/board-3"; main_gate ""; "$BOARD" json "$CTL" > "$d/board-4"
+  sck "$(tf cmp -s "$d/board-3" "$d/board-4")" "main-gate: green twice writes nothing — the daily timer is silent on a healthy box"
+
+  # once a session takes the row it is an ordinary track: cc-reconcile owns its status and this must stop writing
+  main_gate "$RED"; mkdir -p "$HOME/.cc/worktrees/$CTL/$MG"
+  "$BOARD" json "$CTL" > "$d/board-5"
+  main_gate 'cc-units selfcheck — ✗ something else entirely'; main_gate ""
+  "$BOARD" json "$CTL" > "$d/board-6"
+  sck "$(tf cmp -s "$d/board-5" "$d/board-6")" "main-gate: once a worker is in its worktree, cc-audit never writes that row again"
+  sck "$(tf test "$("$BOARD" tracks "$CTL" | grep -c .)" -eq 1)" "main-gate: ...and green does not yank a row somebody is working in"
+  rmdir "$HOME/.cc/worktrees/$CTL/$MG"
+  "$BOARD" add "$CTL" "$MG" "somebody typed this row by hand" "not cc-audit's" >/dev/null
+  main_gate ""
+  sck "$(tf test "$("$BOARD" tracks "$CTL" | grep -c .)" -eq 1)" "main-gate: a row on that name it did not write is never deleted — the only destructive step undoes its own work"
+  "$BOARD" rm "$CTL" "$MG"
+
+  # what feeds it: the FIRST red gate, and a line of the failure worth reading
+  SUITE_FAIL=""
+  gate 1 "tests/check.sh" "3 failed" "$(printf 'suite\n  ✓ a\n  ✗ the row it wrote was the wrong row\n  ✓ b\n')"
+  gate 1 "tests/selftest.sh" "1 failed" "  ✗ a second red"
+  sck "$(tf grep -q 'the row it wrote was the wrong row' <<<"$SUITE_FAIL")" "suites: the row gets the first line that FAILED, never the banner"
+  sck "$(ntf grep -q 'selftest' <<<"$SUITE_FAIL")" "suites: the FIRST red gate owns the row — a second red is the same red, not a second row"
+  SUITE_FAIL=""; gate 0 "tests/check.sh" "OK" "check.sh: OK"
+  sck "$(tf test -z "$SUITE_FAIL")" "suites: a green gate feeds nothing"
+  sck "$(tf test "$(fail_line "no marker anywhere in here" "== result: 2 failed ==")" = "== result: 2 failed ==")" "suites: output with no failure line falls back to the tally, rather than to a banner"
+  sck "$(ntf grep -q $'\x1b' <<<"$(fail_line "$(printf '\033[31m  ✗ coloured\033[0m')" x)")" "suites: colour codes never reach the board title"
+
+  # 9. the two probes that were reading the wrong thing. Both failed SILENTLY — a green box looking red, and a busy
+  # week costing $0.00 — which is the failure mode a check must not have, so both are pinned here.
+  local st5; st5=$(printf 'tokens: bot set\nwho is heard: channels\npolicy: every channel answers\napprovals: #approvals\ndaemon: up 2508s, slack connected, bot U0B\nsubscribed sessions: somerepo [main]\n')
+  out=$(slack_probe "$st5"); rc=$?
+  sck $rc "slack probe: a connected daemon passes wherever its line sits — #92 pushed it to line 5 and line 3 became policy"
+  sck "$(tf grep -q '^daemon: up 2508s' <<<"$out")" "slack probe: the row names the daemon line, not whichever line is third"
+  out=$(slack_probe "$(printf 'tokens: bot set\npolicy: x\ndaemon: down, slack disconnected\n')"); rc=$?
+  sck "$(tf test $rc -ne 0)" "slack probe: a daemon that is actually down still fails"
+  out=$(slack_probe ""); rc=$?
+  sck "$(tf test $rc -ne 0)" "slack probe: no output at all is a failure, not a pass"
+  sck "$(tf test "$out" = "no status")" "slack probe: ...and says so"
+
+  local rd="$d/state/w/runs"; mkdir -p "$rd"
+  echo '{"total_cost_usd":1.25}' > "$rd/a.json"; echo '{"total_cost_usd":0.75}' > "$rd/b.json"
+  sck "$(tf test "$(spend_since "$d/state" 0)" = 2.00)" "spend: the run costs are summed"
+  : > "$rd/half-written.json"; echo '{"total_cost' > "$rd/corrupt.json"; echo '{"other":1}' > "$rd/nocost.json"
+  sck "$(tf test "$(spend_since "$d/state" 0)" = 2.00)" "spend: one unparseable run json — a worker mid-run always has one — no longer zeroes the whole week"
+  sck "$(tf test "$(spend_since "$d/state" $(( $(date -u +%s) + 60 )))" = 0.00)" "spend: nothing inside the window is \$0.00, not empty"
+  sck "$(tf test "$(spend_since "$d/no-such-dir" 0)" = 0.00)" "spend: no state dir at all is \$0.00, not empty"
+
   unset CC_SC_ARGV; rm -rf "$d"
   echo "cc-audit selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
@@ -690,6 +837,11 @@ S
 # ---- run ----
 log "start mode=$mode dry=$dry post=$post llm=$llm_on day=$DAY since=$SINCE ev=$EV"
 checks
+[ "$dry" = 1 ] || main_gate "$SUITE_FAIL"   # ONE owned row for main's baseline, in every mode: they all run checks
+if [ "$gate_only" = 1 ]; then               # the quiet auto day ends here, having written at most one board row
+  rmdir "$EV" "$(dirname "$EV")" 2>/dev/null   # no evidence was collected: do not leave an empty dir behind each day
+  log "done mode=gate-only fail=$fail suite_fail=${SUITE_FAIL:-none}"; exit 0
+fi
 verdict=$([ "$fail" -eq 0 ] && echo OK || echo ATTENTION)
 add ""; add "**verdict: $verdict — $fail of $((pass+fail)) checks failed**"
 CHK="$RPT"; printf '%s\n' "$CHK" > "$EV/00-checks.md"

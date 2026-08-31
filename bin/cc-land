@@ -209,6 +209,15 @@ def last(text, n=200):
     return next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")[-n:]
 
 
+def gate_fail(text):
+    """The line somebody can ACT on when a gate goes red: the ✗/FAIL case lines, never whatever stdout+stderr
+    happened to print last — that tail was noise on both misread failures of 2026-08-31 (a heredoc fragment
+    once, a fixture line once). No marker anywhere: fall back to the last line as before."""
+    hits = [l.strip() for l in (text or "").splitlines()
+            if re.search(r"✗|✘|FAIL|Error\b|error:|not ok|Traceback", l)]
+    return " · ".join(hits[:3])[:400] or last(text)
+
+
 def name_status(text):
     """git --name-status output -> [(status, path)]. 'A' is what tells a unit this change ADDED from one it touched."""
     rows = []
@@ -276,7 +285,12 @@ class Land:
                 rc, o = sh([f"{tree}/{g}"], cwd=tree, timeout=3600)
                 bad = FAILED_RE.search(o)
                 if rc or (bad and bad.group(1) != "0"):
-                    raise Failed(f"gate {g} did not pass: {last(o)}")
+                    keep = f"{tempfile.gettempdir()}/cc-land-gate-{self.repo}-{self.pr or 'base'}.log"
+                    try:
+                        open(keep, "w").write(o or "")
+                    except OSError:
+                        keep = "not saved"
+                    raise Failed(f"gate {g} did not pass: {gate_fail(o)}  [full output: {keep}]")
             on = f"PR #{self.pr}" if self.head else f"the {self.base()} checkout"
             return f"{len(found)} gate(s) passed on {on}: {', '.join(found)}"
         finally:
@@ -993,6 +1007,11 @@ def cmd_selfcheck():
         here pass on the path alone. This one pins the tool and its SUB-COMMAND by position."""
         return [c for c in calls if os.path.basename(c[0]) == tool and len(c) > 1 and c[1] == sub
                 and all(w in " ".join(c[1:]) for w in rest)]
+
+    check("a red gate is reported by its ✗ line, not by whatever printed last",
+          gate_fail("banner\n  ✓ ok\n  ✗ the row was wrong\nsome stderr noise") == "✗ the row was wrong")
+    check("…and with no failure marker anywhere, the last line still stands",
+          gate_fail("banner\nall quiet") == "all quiet")
 
     LINKED, BODY, BOARD, errs = [[]], [{}], [{}], []   # errs: a case queues Slack errors for the next reactions.add
 
