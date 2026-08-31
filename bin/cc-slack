@@ -892,10 +892,12 @@ HOME_LEDGER = 1 << 18                          # bytes of cc-context's handoff l
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
 HOME_MAXBLK, HOME_MAXTEXT = 18, 2900           # OUR budget for one published view (Slack allows 100 blocks and 3000 chars a
                                                # text): a Home tab that has to be scrolled has already lost its five-second
-                                               # glance. The tab is 15 blocks busy, 11 quiet, 12 degraded, 16 with a
+                                               # glance. The tab is 15 blocks busy, 13 quiet, 14 degraded, 16 with a
                                                # handoff line — a ceiling a real board stays UNDER, not one it sits on.
-                                               # Note what does NOT grow it: the whole backlog and every ❓ are one section
-                                               # block each however long they get, so showing all of both costs 0 blocks.
+                                               # Note what does NOT grow it: the whole backlog, every ❓ and every
+                                               # channel are one section block each however long they get, so showing
+                                               # all of all three costs 0 blocks. What DID cost two is the channels
+                                               # band now rendering when nothing in it is busy (quiet, degraded).
 HOME_MARKS = ("❓", "🔴", "🔧")                 # the channel rows count only live threads: needs you · owed · working (🟠/✅ are history)
 # ── THE ONE VOCABULARY (handoff §02). A track has exactly one state, and BOTH its emoji and the word printed beside it
 #    come out of this row — so they can never disagree again. Everywhere else on the tab an emoji means one thing and
@@ -907,18 +909,18 @@ HOME_STATE = {"running": ("🏃", "running"), "blocked": ("⛔", "blocked"), "qu
 HOME_ALIAS = {"todo": "queued"}                        # the one word an older board file still says for `queued`
 HOME_STALE = ("blocked", "review", "done", "merged")   # board states a live process contradicts → the line says `board stale`
 HOME_RANK = ("running", "blocked", "review", "done", "merged", "queued")   # what the owner must see first, first
-HOME_CHANS = 6                                 # active channels printed before the rest are counted as quiet (raised
-                                               # to "all of them" by the owner, 2026-08-30 — kept as the budget's floor)
-HOME_LIST, HOME_SLICE = 2400, 12               # …but RUNNING, BACKLOG and NEEDS YOU print EVERY row (owner, 2026-08-30,
-                                               # 1788129807: "what happenend to showing all the backlog items and all ?
-                                               # items and not defaulting to showing only a few"). Their only cap left is
-                                               # a CHARACTER budget for one Slack text (the hard limit is 3000), and it
-                                               # is a safety valve: "+k more" appears when a row would otherwise be cut
-                                               # in half, never because the tab decided three was enough. The backlog's
-                                               # budget is the tighter one, so §01d still holds — the backlog tail goes
-                                               # before the ❓ tail, which is the last thing on the tab to be touched.
+HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and CHANNELS print EVERY row (owner,
+                                               # 2026-08-30, thread 1788129807: "what happenend to showing all the
+                                               # backlog items and all ? items and not defaulting to showing only a
+                                               # few", then 1788133685: "also show all channels"). Their only cap left
+                                               # is a CHARACTER budget for one Slack text (the hard limit is 3000), and
+                                               # it is a safety valve: "+k more" appears when a row would otherwise be
+                                               # cut in half, never because the tab decided six was enough. The
+                                               # backlog's budget is the tighter one, so §01d still holds — the backlog
+                                               # tail goes before the ❓ tail, the last thing on the tab to be touched.
                                                # HOME_SLICE: rows one board-view button DMs before it says how many more.
 HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT, HOME_BTN = 40, 24, 26, 180, 18   # phone widths: a line · a track name · an ask · the audit · a button label
+HOME_DEPTH = 4                                 # deepest sub-channel indent the phone column takes; deeper nests flatten to it
 HOME_CUT = ("boot", "handoffs", "audit", "channels", "backlog", "views")   # …and the order they go in when even that does not fit (§01d)
 HOME_ACT = ("restart_unit", "open_channel", "open_board", "next_track", "home_logs",
             "board_todo", "board_running", "board_done")   # Home buttons that reach the daemon
@@ -1241,12 +1243,13 @@ def home_parts(st):
       5 divider           THE FOLD. Everything below is secondary by contract.
       6 backlog           ⏳ EVERY queued track; while a usage limit holds, the count and the hour, no lines
       6b board views      To do · Running · Done — three buttons that DM one slice of the board each
-      7 channels          only the ones where something is happening; the quiet ones are a number, never lines
+      7 channels          EVERY channel the box knows of, one line each — the busy ones first, then the quiet
       8-11 load · handoffs · audit · units+boot   grey, one line each, cheapest to skip and first to be cut (HOME_CUT)
 
-    THE LISTS ARE WHOLE (owner, 2026-08-30, thread 1788129807). The backlog used to stop at 3 and NEEDS YOU at 4, each
-    with a "+k more" the owner had to leave Slack to read — the tab hiding the two things it exists to show. Both now
-    print every row, and "+k more" survives only as the character-budget safety valve inside home_list.
+    THE LISTS ARE WHOLE (owner, 2026-08-30, threads 1788129807 then 1788133685: "also show all channels"). The backlog
+    used to stop at 3, NEEDS YOU at 4 and CHANNELS at 6 busy lines plus a count of the quiet — each with a summary the
+    owner had to leave Slack to expand, the tab hiding the things it exists to show. All four bands now print every
+    row, and "+k more" survives only as the character-budget safety valve inside home_list.
 
     Phone first: one line per item, ~40 rendered characters (two-column `fields` truncate there and are gone from here).
     Emoji are the only graphics and every one comes from HOME_STATE or the table above it."""
@@ -1303,22 +1306,29 @@ def home_parts(st):
     if tracks:
         p.append(("views", {"type": "actions", "elements": [_home_btn(lab, aid) for aid, lab, _ in HOME_VIEWS]}))
 
-    # 7 — channels: only where something is happening. A quiet channel is a number, never a line (§04).
-    act, hushed = [], []
-    for c in chans:
-        (act if str(c.get("session") or "")[:1] in ("🟢", "🟡", "🔧") or home_marks(c.get("marks")) else hushed).append(c)
-    if act:
-        lines = []
-        for c in act[:HOME_CHANS]:
+    # 7 — channels: EVERY channel the box knows of, one line each (owner, 2026-08-30, thread 1788133685: "also show all
+    #     channels"). This band was the last one that hid: §04 capped it at six lines and turned the rest into
+    #     "_k quiet channels hidden_", which is exactly the summarising the owner has now removed from RUNNING, NEEDS
+    #     YOU and BACKLOG. The busy ones come first — a session that is up, or live thread marks — and the quiet ones
+    #     follow by name; the only cap left is home_list's character valve, as everywhere else. A parent and the
+    #     sub-channels under it move as ONE family, so ranking by activity can never leave a `↳` row under a stranger.
+    if chans:
+        fams = []                                            # [[family is busy?, [rows]]], in home_chan_order's order
+        for c in chans:
             sess, m, nm = str(c.get("session") or "").split(" ")[0], home_marks(c.get("marks")), str(c.get("name") or "?")
-            lines.append(("\u00a0\u00a0" * c.get("depth", 0) + "↳ " if c.get("depth") else "")   # NB-spaces: Slack
-                         + f"{sess} " + (f"#{nm}" if c.get("depth") else f"*#{nm}*")               # collapses ordinary ones
-                         + (f" · {m}" if m else ""))
-        if len(act) > HOME_CHANS:
-            hushed += act[HOME_CHANS:]
-        if hushed:
-            lines.append(f"_{len(hushed)} quiet channel{'s' if len(hushed) != 1 else ''} hidden_")
-        p += [("channels", _home_ctx("CHANNELS")), ("channels", _home_sec("\n".join(lines)))]
+            d = min(int(_home_num(c.get("depth"))), HOME_DEPTH)   # totality: `depth` is live input, and a bad one
+            row = (("\u00a0\u00a0" * d + "↳ " if d else "")       # costs a line's indent, never the tab. NB-spaces:
+                   + f"{sess} " + (f"#{nm}" if d else f"*#{nm}*")  # Slack collapses the ordinary kind
+                   + (f" · {m}" if m else ""))
+            busy = str(c.get("session") or "")[:1] in ("🟢", "🟡", "🔧") or bool(m)
+            if d and fams:
+                fams[-1][0] = fams[-1][0] or busy
+                fams[-1][1].append(row)
+            else:
+                fams.append([busy, [row]])
+        lines = [r for _, rows in sorted(fams, key=lambda f: not f[0]) for r in rows]   # stable: busy families first
+        p += [("channels", _home_ctx("CHANNELS")),
+              ("channels", _home_sec(home_list(lines, lambda k: f"_+{k} more channels_", HOME_MAXTEXT)))]
 
     # 8-10 — grey, one line each, and the first things to go when the tab will not fit
     p.append(("load", _home_ctx(st.get("load") or "")))
@@ -6425,10 +6435,18 @@ def cmd_selfcheck():
                         return False
         return True
 
-    # ── §05, verbatim except where the OWNER amended it after 1a shipped (2026-08-30, thread 1788129807):
-    #    the backlog prints all ten queued tracks, not three and a "+7 more", and the board VIEW buttons sit
-    #    under it. The rest is the engineer's reference output for state (a). `  ↳` is the real payload's indent —
-    #    Slack collapses ordinary leading spaces, which is the sub-channel bug this direction also fixes.
+    # ── §05, verbatim except where the OWNER has amended it since 1a shipped. The reference is EDITED ON PURPOSE
+    #    and still checked by equality — that is what stops the tab drifting; a spec that quietly stopped being
+    #    asserted would stop being a spec. Superseded lines of docs/2026-08-30-home-handoff.dc.html, on whose word:
+    #      · thread 1788129807 ("all the backlog items and all ? items … not defaulting to showing only a few")
+    #        — §01 lines 217/267/358, §03 line 489 ("per queued q, ≤3") and §05 line 578: the backlog prints all ten
+    #        queued tracks, not three and a "_+7 more on the board_", and the three board VIEW buttons sit under it.
+    #      · thread 1788133685 ("also show all channels") — §01 lines 224 and 368, §03 lines 496-497 ("Max 6 lines",
+    #        "_{k} quiet channels hidden_") and §05 line 580: CHANNELS prints EVERY channel, busy families first,
+    #        and the band renders whenever the box knows of one. §01 line 376's cut order still holds, but its
+    #        "quiet channels" step is now the whole band (HOME_CUT "channels") — no quiet remainder is left to drop.
+    #    The rest is the engineer's reference output for state (a). `  ↳` is the real payload's indent — Slack
+    #    collapses ordinary leading spaces, which is the sub-channel bug this direction also fixes.
     HREF = json.loads(r'''{"type": "home", "blocks": [
       {"type": "header", "text": {"type": "plain_text", "text": "abox · 07:58Z", "emoji": true}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "RUNNING 2 · BLOCKED 1 · QUEUED 10"}]},
@@ -6447,7 +6465,7 @@ def cmd_selfcheck():
         {"type": "button", "text": {"type": "plain_text", "text": "Running", "emoji": true}, "action_id": "board_running"},
         {"type": "button", "text": {"type": "plain_text", "text": "Done", "emoji": true}, "action_id": "board_done"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "CHANNELS"}]},
-      {"type": "section", "text": {"type": "mrkdwn", "text": "🟢 *#abox* · ❓1 🔴2\n  ↳ 🟡 #abox-carpet · ❓1\n_5 quiet channels hidden_"}},
+      {"type": "section", "text": {"type": "mrkdwn", "text": "🟢 *#abox* · ❓1 🔴2\n  ↳ 🟡 #abox-carpet · ❓1\n⚪ *#quiet0*\n⚪ *#quiet1*\n⚪ *#quiet2*\n⚪ *#quiet3*\n⚪ *#quiet4*"}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "💽 16% of 456G · 🧠 4.3/31G (15%) · 📈 2.60 · 🌡 57°C · ⏱ up 6.2h"}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "audit 06:00Z — no drift; 2 stale branches on sandbox."}]},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "units ok · last boot 01:41Z (power cut)"}]}]}''')
@@ -6471,11 +6489,13 @@ def cmd_selfcheck():
             "boot": "last boot 01:41Z (power cut)", "last": None}
     hb = home_blocks(hfix)
     htxt = json.dumps(hb, ensure_ascii=False)
-    check("home_blocks (a) BUSY is byte-for-byte the reference output (§05 + the owner's amendment): 15 blocks — the "
-          "tally, the running lines, the ranked needs-you band, three buttons, the fold, the WHOLE backlog (all ten, no "
-          "\"+k more\"), the three board-view buttons, the channels and three grey lines",
+    check("home_blocks (a) BUSY is byte-for-byte the reference output (§05 + the owner's two amendments): 15 blocks — "
+          "the tally, the running lines, the ranked needs-you band, three buttons, the fold, the WHOLE backlog (all "
+          "ten, no \"+k more\"), the three board-view buttons, ALL SEVEN channels and three grey lines",
           hb == HREF["blocks"] and len(hb) == 15 and home_blocks(hfix) == hb
-          and hb[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in htxt)
+          and hb[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in htxt
+          and len(hb[11]["text"]["text"].split("\n")) == 7 and "quiet channel" not in htxt
+          and "more channels" not in htxt)
     check("home_track_state: the LADDER, and a live process WINS — a board that disagrees is printed as `board stale`, "
           "never silently believed or silently ignored; an unknown status is `queued`, never a stateless \"?\"",
           (home_track_state("blocked", True), home_track_state("blocked", False), home_track_state("todo", True),
@@ -6553,12 +6573,14 @@ def cmd_selfcheck():
                           "boot": "last boot 01:41Z (power cut)",
                           "last": {"name": "abox/slack-home", "verb": "merged", "when": "08:40Z", "at": "x"}})
     qtxt = json.dumps(hquiet, ensure_ascii=False)
-    check("home_blocks (b) QUIET: 11 blocks — nothing running is a SENTENCE with the last thing that finished, the "
-          "needs-you and channels bands are ABSENT rather than empty, the primary button becomes the next track, and "
-          "all eleven queued tracks are printed, not three",
-          len(hquiet) == 11 and hquiet[1]["elements"][0]["text"] == "NOTHING RUNNING · QUEUED 11"
+    check("home_blocks (b) QUIET: 13 blocks — nothing running is a SENTENCE with the last thing that finished, the "
+          "needs-you band is ABSENT rather than empty, the CHANNELS band is PRESENT for a channel with nothing "
+          "happening in it (owner: \"also show all channels\"), the primary button becomes the next track, and all "
+          "eleven queued tracks are printed, not three",
+          len(hquiet) == 13 and hquiet[1]["elements"][0]["text"] == "NOTHING RUNNING · QUEUED 11"
           and hquiet[2]["text"]["text"] == "✅ last: abox/slack-home · merged 08:40Z"
-          and "NEEDS YOU" not in qtxt and "CHANNELS" not in qtxt and "BACKLOG · 11 · NEXT UP" in qtxt
+          and "NEEDS YOU" not in qtxt and "BACKLOG · 11 · NEXT UP" in qtxt
+          and hquiet[8]["elements"][0]["text"] == "CHANNELS" and hquiet[9]["text"]["text"] == "⚪ *#abox*"
           and hquiet[6]["text"]["text"].count("⏳") == 11 and "more on the board" not in qtxt
           and [e["action_id"] for e in hquiet[3]["elements"]] == ["next_track", "open_board"]
           and [e["action_id"] for e in hquiet[7]["elements"]] == ["board_todo", "board_running", "board_done"]
@@ -6568,11 +6590,12 @@ def cmd_selfcheck():
                             tracks=[t for t in hfix["tracks"] if t["state"] == "queued"] + [dict(hfix["tracks"][2])],
                             channels=[dict(c, session="⚪ none", marks={}) for c in hfix["channels"]], last=None))
     dtxt = json.dumps(hdeg, ensure_ascii=False)
-    check("home_blocks (c) DEGRADED: 12 blocks — the unit that is down and the usage limit sort ABOVE everything the "
-          "box is doing, the backlog is HELD (a count, no lines it cannot start), the roll-call comes back, and the "
-          "primary button is the restart",
-          len(hdeg) == 12 and hdeg[2]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 09:00Z")
+    check("home_blocks (c) DEGRADED: 14 blocks — the unit that is down and the usage limit sort ABOVE everything the "
+          "box is doing, the backlog is HELD (a count, no lines it cannot start), all seven channels are still listed "
+          "though not one of them is busy, the roll-call comes back, and the primary button is the restart",
+          len(hdeg) == 14 and hdeg[2]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 09:00Z")
           and "BACKLOG · 10 · HELD UNTIL 09:00Z" in dtxt and "⏳ sandbox/rug-align" not in dtxt
+          and len(hdeg[10]["text"]["text"].split("\n")) == 7 and "quiet channel" not in dtxt
           and [e["action_id"] for e in hdeg[5]["elements"]] == ["restart_unit", "home_logs", "open_board"]
           and hdeg[5]["elements"][0]["style"] == "danger"
           and "units: tmux-main ok · audit ok · cc-slackd 🔴 · last boot 01:41Z (power cut)" in dtxt
@@ -6586,14 +6609,38 @@ def cmd_selfcheck():
                                        for i in range(2)]
                                     + [{"state": "queued", "name": n, "detail": "—", "rank": 5} for n in hqueued]))
     otxt = json.dumps(hover, ensure_ascii=False)
-    check("home_blocks (d) OVERFLOW: 13 tracks, 8 channels, 6 asks — RUNNING, NEEDS YOU and BACKLOG all print EVERY "
-          "row (owner, 2026-08-30: \"always show ALL that are running, all that need me, and all backlog dont hide "
-          "any\"), only CHANNELS still collapses, and the tab fits ≤%d blocks" % HOME_MAXBLK,
+    check("home_blocks (d) OVERFLOW: 13 tracks, 10 channels, 6 asks — RUNNING, NEEDS YOU, BACKLOG and now CHANNELS all "
+          "print EVERY row (owner, 2026-08-30: \"always show ALL that are running, all that need me, and all backlog "
+          "dont hide any\", then \"also show all channels\"), NOTHING on the tab is behind a count, and it still fits "
+          "≤%d blocks — the four whole lists cost one section block each however long they get" % HOME_MAXBLK,
           hbudget(hover) and hno_empty_header(hover) and hvocab(hover)
           and "more running" not in otxt and "NEEDS YOU · 6" in otxt and "more waiting" not in otxt
           and len(hover[4]["text"]["text"].split("\n")) == 6                   # all six asks, none behind a count
           and hover[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in otxt
-          and "_5 quiet channels hidden_" in otxt and len(hover) == 15)
+          and len(hover[11]["text"]["text"].split("\n")) == 10 and "quiet channel" not in otxt
+          and "more channels" not in otxt and len(hover) == 15)
+    # The busy FAMILY sorts first, whole: #abox and the four ↳ rows under it stay together and stay in their own
+    # order, and no `↳` row is ever printed under a channel that is not its parent.
+    NB = "\u00a0\u00a0"                             # the indent Slack cannot collapse, as home_parts writes it
+    check("home_blocks: CHANNELS ranks by activity a FAMILY at a time — a parent and its sub-channels move together, "
+          "so busy-first ordering can never orphan an indented row",
+          hover[11]["text"]["text"].split("\n")[:5]
+          == ["🟢 *#abox* · ❓1 🔴2", f"{NB}↳ 🟡 #abox-carpet · ❓1"]
+             + [f"{NB}↳ 🟢 #sub{i} · ❓1" for i in range(3)]
+          and all(l.startswith("⚪ *#quiet") for l in hover[11]["text"]["text"].split("\n")[5:])
+          # a quiet parent with a busy child sorts up WITH its child, and keeps it
+          and next(b["text"]["text"] for b in home_blocks({"box": "b", "now": "1", "channels": [
+              {"name": "hushed", "depth": 0, "session": "⚪ none", "marks": {}},
+              {"name": "loud", "depth": 0, "session": "⚪ none", "marks": {}},
+              {"name": "loud-kid", "depth": 1, "session": "🟢 live", "marks": {}}]})
+                  if b["type"] == "section" and "#loud" in b["text"]["text"])
+          == f"⚪ *#loud*\n{NB}↳ 🟢 #loud-kid\n⚪ *#hushed*"
+          # every channel renders, so `depth` is now live input on EVERY row: junk costs an indent, a runaway
+          # nest flattens at HOME_DEPTH, and neither costs the tab (the fuzz case above proves the no-crash half)
+          and [l.count("\u00a0") for l in next(b["text"]["text"] for b in home_blocks({"box": "b", "now": "1",
+              "channels": [{"name": "top", "depth": 0}, {"name": "deep", "depth": 9},
+                           {"name": "junk", "depth": "x"}]}) if b["type"] == "section"
+              and "#top" in b["text"]["text"]).split("\n")] == [0, 2 * HOME_DEPTH, 0])
     hcut = lambda n: [t for t, _ in home_cut(home_parts(hfix), n)]
     check("home_cut: over budget, things go in the OWNER's order (§01d) — boot, the handoff line, the audit, the "
           "channels, the backlog, and the board-view buttons last of the demoted half, because when a long board costs "
