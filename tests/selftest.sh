@@ -687,6 +687,13 @@ sleep 1
 MT capture-pane -p -t _ccmodel:sess | tail -n 3 | grep -qx '1' && ok "a Switch-model confirmation is answered, so the switch actually takes" || bad "the switch left the confirmation dialog open"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 
+echo "== cc-trust prune (recorded trust vs real dirs) =="
+TH=$T/trusthome; mkdir -p "$TH/real-dir"
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":true},"/gone/nowhere-%s":{"hasTrustDialogAccepted":true}}}' "$TH/real-dir" "$$" > "$TH/.claude.json"
+HOME=$TH "$B/cc-trust" prune >/dev/null
+jq -e --arg d "$TH/real-dir" '.projects[$d]' "$TH/.claude.json" >/dev/null && [ "$(jq '.projects | length' "$TH/.claude.json")" = 1 ] \
+  && ok "prune drops the gone dir and keeps the living one" || bad "prune: $(cat "$TH/.claude.json")"
+
 echo "== cc-reconcile (board vs reality: decision table + one end-to-end apply, no network) =="
 rec=$("$B/cc-reconcile" selfcheck 2>&1)
 grep -q '0 failed' <<<"$rec" && ok "cc-reconcile selfcheck: ${rec##*: }" || bad "cc-reconcile selfcheck: $rec"
@@ -706,6 +713,14 @@ grep -q '❓' <<<"$lsn" && ok "no snapshot: a waiting track is still marked, wit
 dgn=$(HOME=$SH "$B/cc-digest" 2>/dev/null)
 dga=$(grep s_ask <<<"$dgn")
 grep -q '❓ needs you' <<<"$dga" && ! grep -q 'needs you:' <<<"$dga" && ok "no snapshot: the digest still says he is needed, with no colon trailing a question it does not have" || bad "digest fallback wording: $dga"
+# an EMPTY or non-JSON snapshot must read as stale, not kill the reader: jq on empty input exits 0 with no
+# output at all, and `$(( now - ))` is a bash abort — this guard exists precisely for the file the writer got wrong.
+: > "$SH/.cc/state/reconcile.json"
+lse=$(HOME=$SH "$B/cc" ls 2>&1); lserc=$?
+[ $lserc = 0 ] && grep -q 's_ask' <<<"$lse" && ok "empty snapshot: \`cc ls\` treats it as stale and still prints the board" || bad "empty snapshot killed cc ls: rc=$lserc — $lse"
+printf 'not json' > "$SH/.cc/state/reconcile.json"
+dge=$(HOME=$SH "$B/cc-digest" 2>/dev/null); dgerc=$?
+[ $dgerc = 0 ] && grep -q 's_ask' <<<"$dge" && ok "corrupt snapshot: the digest falls back to the board" || bad "corrupt snapshot broke the digest: rc=$dgerc"
 # the snapshot cc-reconcile leaves behind — a question a PERSON must answer, and a loop waiting on the CLOCK while
 # its board word is still `running` (it hit the limit mid-run). The clock is never "needs you".
 cat > "$SH/.cc/state/reconcile.json" <<JSON

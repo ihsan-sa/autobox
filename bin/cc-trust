@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # cc-trust [rm] <dir> — mark <dir> as a trusted Claude Code workspace in ~/.claude.json so the
 # "Is this a project you trust?" prompt never blocks an unattended session; `rm` drops the entry
-# (cc rm calls it, so removed tracks leave nothing behind). Idempotent, and locked: live sessions
+# (cc rm calls it, so removed tracks leave nothing behind); `prune` drops every entry whose dir no
+# longer exists (the reconcile timer calls it). Idempotent, and locked: live sessions
 # rewrite the same file, so a read-modify-mv without flock loses their updates.
 set -euo pipefail
-mode="set"; [ "${1:-}" = rm ] && { mode="rm"; shift; }
-d="$(readlink -f "${1:?usage: cc-trust [rm] <dir>}")"; f="$HOME/.claude.json"
-[ -f "$f" ] || echo '{}' > "$f"
+mode="set"; case "${1:-}" in rm) mode="rm"; shift;; prune) mode="prune"; shift;; esac
+f="$HOME/.claude.json"; [ -f "$f" ] || echo '{}' > "$f"
+[ "$mode" = prune ] || d="$(readlink -f "${1:?usage: cc-trust [rm] <dir> | cc-trust prune}")"
 exec 9>"$f.lock"; flock 9
+if [ "$mode" = prune ]; then   # entries whose dir is GONE: nothing live re-adds one, so dropping them races nobody
+  n=0
+  while IFS= read -r p; do
+    [ -e "$p" ] && continue
+    jq --arg d "$p" 'del(.projects[$d])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; n=$((n+1))
+  done < <(jq -r '.projects // {} | keys[]' "$f")
+  echo "cc-trust: pruned $n entry(ies) whose dir is gone"; exit 0
+fi
 if [ "$mode" = rm ]; then jq --arg d "$d" 'del(.projects[$d])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; exit 0; fi
 jq -e --arg d "$d" '.projects[$d].hasTrustDialogAccepted == true' "$f" >/dev/null 2>&1 && exit 0
 jq --arg d "$d" '.projects[$d] = ((.projects[$d] // {}) + {hasTrustDialogAccepted: true})' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
