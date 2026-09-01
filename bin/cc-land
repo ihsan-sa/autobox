@@ -251,6 +251,34 @@ def job_path(repo, pr):
     return f"{LANDQ}/{repo}-{pr}.json"
 
 
+def ledger(line):
+    """One line per event in `{LANDQ}/queue.log`, KEPT after the job file is drained. On 2026-08-31 a job for `ai-ee 7`
+    — a PR that never existed — ran three times and paged the owner six; by the time anyone looked the queue had
+    forgotten it, and nothing on the box said what had queued it (a selfcheck, it turned out, days later)."""
+    try:
+        os.makedirs(LANDQ, exist_ok=True)
+        with open(f"{LANDQ}/queue.log", "a") as f:
+            f.write(f"{stamp()}\t{line}\n")
+    except OSError:
+        pass
+
+
+def asked_by():
+    """Who handed this over: the parent process, its command line and where it stood — the one fact about a job that
+    neither its file name nor the 👍's thread carries, and the first thing anyone asks of a landing nobody meant."""
+    ppid = os.getppid()
+    try:
+        with open(f"/proc/{ppid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        cmd = "?"
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = "?"
+    return f"pid {ppid} `{cmd[:160]}` in {cwd}"
+
+
 def read_json(path):
     try:
         with open(path) as f:
@@ -1037,6 +1065,8 @@ def finish(path, job):
     out cannot send a second one, and a kill before it cannot swallow the only word the owner gets."""
     if not job.get("posted"):
         say_result(job, job.get("result") or {})
+        r = job.get("result") or {}
+        ledger(f"done {job.get('repo')}#{job.get('pr') or 'deploy'} rc={r.get('rc')} {r.get('short', '')}")
         job["posted"] = True
         try:
             write_atomic(path, job)
@@ -1069,6 +1099,8 @@ def result_of(L, rc, job, tail):
     else:
         short = (f"{what}: merged, but the deploy stopped at {L.stopped} ❌ after {tries} tries — the box is still "
                  f"running the old code.")
+    if L.stopped == "load" and job.get("by"):     # a phantom PR: the culprit is the caller, so say who that was
+        short += f" — queued by {job['by'][:160]}"
     return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short,
             "text": short if rc == 0 else f"{short}\n```\n{tail[-900:]}\n```"}
 
@@ -1156,8 +1188,9 @@ def catchup():
             continue
         write_atomic(job_path(repo, "deploy"),
                      {"repo": repo, "pr": None, "span": [have, tip], "queued_at": stamp(), "attempts": 0,
-                      "stage": "queued", "why": f"origin/{base} moved to {tip[:7]} without this box "
-                                                f"— what is installed is {have[:7]}"})
+                      "stage": "queued", "by": "the catch-up sweep",
+                      "why": f"origin/{base} moved to {tip[:7]} without this box — what is installed is {have[:7]}"})
+        ledger(f"queued {repo}#deploy span={have[:7]}..{tip[:7]} by=the catch-up sweep")
         made.append(repo)
     return made
 
@@ -1238,16 +1271,18 @@ def cmd_queue(argv):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo or "") or not re.fullmatch(r"[0-9]+", pr or ""):
         print('cc-land: queue takes <repo> <pr-number> [--chat C… --ts 1788… --who name]', file=sys.stderr)
         return 2
-    path = job_path(repo, pr)
+    path, by = job_path(repo, pr), asked_by()
     if os.path.exists(path):
         print(f"[{repo}] PR #{pr} is already queued — one job per PR, so two 👍 are still one landing")
+        ledger(f"again {repo}#{pr} by={by}")
     else:
         try:
-            write_atomic(path, {"repo": repo, "pr": int(pr), "chat": chat, "ts": ts, "who": who,
+            write_atomic(path, {"repo": repo, "pr": int(pr), "chat": chat, "ts": ts, "who": who, "by": by,
                                 "queued_at": stamp(), "attempts": 0, "stage": "queued"})
         except OSError as e:
             print(f"cc-land: cannot write {path}: {e} — nothing merged", file=sys.stderr)
             return 1
+        ledger(f"queued {repo}#{pr} who={who or '-'} chat={chat or '-'} by={by}")
         print(f"[{repo}] PR #{pr} queued — the gates run first, then the merge, then the deploy")
     if not start:
         return 0
@@ -1779,6 +1814,11 @@ def cmd_selfcheck():
               "after the gates — merging here first is how a night of approvals went in ungated",
               rcQ == 0 and started and not gh_merges() and job.get("pr") == 7
               and job.get("chat") == "CAPPR" and job.get("ts") == "1.1")
+        check("the job says WHAT queued it — the parent process, its command line, its cwd — and the queue log keeps "
+              "that line after the file is drained (a selfcheck queued `ai-ee 7` on 2026-08-31, a PR that never "
+              "existed, and once the queue had drained it nothing on the box could say what had)",
+              (job.get("by") or "").startswith(f"pid {os.getppid()} `") and job["by"].endswith(f" in {os.getcwd()}")
+              and f"\tqueued myrepo#7 who=the owner chat=CAPPR by={job['by']}\n" in open(f"{qdir}/queue.log").read())
         rcQ = quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "9.9"])
         check("a second 👍 on the same card is the SAME job — the file name is the idempotency key, so two "
               "approvals, or a 👍 while the worker is already on it, are still one merge",
@@ -1824,6 +1864,9 @@ def cmd_selfcheck():
         check("one landing, one owner-visible result, in the thread the 👍 was given in — and then the job is gone",
               len(reacted) == 1 and reacted[0][1] == "white_check_mark" and reacted[0][2] == "1.1"
               and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and not os.path.exists(job_path("myrepo", 7)))
+        check("...and with the file gone the queue log still says who queued it and what came of it",
+              re.search(r"\tqueued myrepo#7 .*\n(.*\n)*.*\tdone myrepo#7 rc=0 \[myrepo\] PR #7: landed",
+                        open(f"{qdir}/queue.log").read()))
         check("the commit the box now runs is written down, by the step that installed it — that record is the "
               "only thing that can tell a merge this box applied from one made behind its back",
               applied_sha("myrepo") == "deadbeef")
@@ -1894,6 +1937,18 @@ def cmd_selfcheck():
               "the box cannot read",
               not gh_merges() and os.path.exists(job_path("myrepo", 11) + ".unreadable"))
         os.unlink(job_path("myrepo", 11) + ".unreadable")
+
+        # ---- a PR that does not exist. The 2026-08-31 phantom: six pages for `ai-ee 7`, and the culprit unnamed.
+        fresh(pr=7)
+        world["gh pr view"] = (1, "GraphQL: Could not resolve to a PullRequest with the number of 7.")
+        quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+        for _ in range(LAND_TRIES):
+            quiet(cmd_work, [])
+        paged = ran("cc-notify", "landing stopped")
+        check("a PR the box cannot read is NOT merged, said once — and the sentence names what queued it, which is "
+              "the one line that would have said 'a selfcheck' on 2026-08-31 instead of six alarms",
+              len(paged) == 1 and not gh_merges() and "NOT merged" in paged[0][-1]
+              and f"queued by pid {os.getppid()} `" in paged[0][-1] and not os.path.exists(job_path("myrepo", 7)))
 
         # ---- the retry PR #87 never had, and the point it stops.
         fresh(pr=7)
