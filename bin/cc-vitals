@@ -22,6 +22,12 @@ count, temperature as % of its throttle point, watts as % of the package limit. 
 y-scales pretending to be one; the legend carries the real numbers, so the shapes are comparable and the values
 are still true.
 
+THE RESOLVER IS A READING TOO (2026-09-01). Two GitHub failures that morning ("Could not resolve host github.com",
+04:37Z and 04:40Z) and cc-slackd's error cluster 5 were one DNS blip, and nothing on the box noticed it. So each
+row also carries one lookup of github.com and slack.com through the SYSTEM resolver — getent, the nsswitch path git
+and curl take — under a hard 2 s timeout, and #alerts hears about a FLIP only: down once, then back once with the
+outage length, never a line a minute while it stays down. Resolver config and the network are never touched here.
+
 THE RENDERER IS A SEAM, AND IT IS THE ONLY THING NOT DONE. Nothing on this box can draw a PNG (no matplotlib, no
 PIL) and installing one is an owner-gated host change that has not been answered. Everything up to the pixels is
 built and tested; render_png() is one function that raises RendererUnavailable, and render_text() — block
@@ -40,6 +46,8 @@ import io
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import time
 
@@ -54,6 +62,10 @@ SAMPLE = 6           # gauges every 6 s -> 10 samples a minute (a mean, not a lu
 KEEP_DAYS = 3        # 24 h of chart from ~290 KB/day of jsonl; a spare day covers a late look
 STALE = 300          # a current.* older than this is not "current" and the tab must say so
 TJMAX = 100.0        # the throttle denominator when a zone declares no usable passive/hot trip
+HOSTS = ("github.com", "slack.com")   # what the box cannot work without: git/gh, and the Slack API
+DNS_TIMEOUT = 2.0    # a lookup slower than this IS the outage, for git and curl alike
+GETENT = os.environ.get("CC_VITALS_GETENT") or "getent"   # the system resolver; selfcheck points this at a stub
+BIN = os.path.dirname(os.path.realpath(__file__))
 
 # ONE FIXED HUE PER METRIC, ASSIGNED IN THIS ORDER AND NEVER RECYCLED (owner, 2026-08-30). Slots come from the
 # validated categorical palette in the dataviz reference, in its published order; slots 7 (violet) and 8 (red)
@@ -216,6 +228,8 @@ def record_minute(period=PERIOD, sample=SAMPLE):
     computed from a monotonic start, so a slow sample steals from the next one instead of drifting the minute."""
     t0, m0 = time.time(), time.monotonic()
     cap, c0, got = caps(), counters(), [gauges()]
+    dn = dns()                       # once a minute, at most 2 s a host: deadlines below are monotonic, so a slow
+                                     # lookup shifts the first sample, never the minute
     n = 1
     while n * sample < period:
         d = (m0 + n * sample) - time.monotonic()
@@ -226,7 +240,79 @@ def record_minute(period=PERIOD, sample=SAMPLE):
     d = (m0 + period) - time.monotonic()
     if d > 0:
         time.sleep(d)
-    return aggregate(c0, counters(), time.monotonic() - m0, got, cap, t0 - (t0 % period))
+    row = aggregate(c0, counters(), time.monotonic() - m0, got, cap, t0 - (t0 % period))
+    row["dns"] = dn
+    return row
+
+
+# ---------------------------------------------------------------------- the resolver: one lookup a minute ----
+def resolve(host, timeout=DNS_TIMEOUT):
+    """ms for a lookup that answered, None for one that failed or hung. `getent hosts` is the system resolver
+    itself — /etc/hosts, resolved, DNS in nsswitch order — so it fails exactly when git and curl would. The
+    timeout is a kill, not a hint: a hung resolver must never become a hung recorder."""
+    t = time.monotonic()
+    try:
+        ok = subprocess.run([GETENT, "hosts", host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=timeout).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        ok = False
+    return round((time.monotonic() - t) * 1000) if ok else None
+
+
+def dns():
+    """The reading: {host: ms | None}, once per row."""
+    return {h: resolve(h) for h in HOSTS}
+
+
+def dns_flip(reading, now=None):
+    """This tick against the last one ON DISK: the one line #alerts should hear, or None. Down is any host
+    unresolved; back is all of them answering. State is a file, not a variable, because the recorder restarts
+    (RestartSec=10) and an outage must not be announced twice — nor re-announced by every tick it lasts."""
+    now = now or time.time()
+    path = f"{DIR}/dns.json"
+    try:
+        prev = json.loads(_read(path) or "{}")
+    except Exception:
+        prev = {}
+    down = sorted(h for h, ms in reading.items() if ms is None)
+    since, line = prev.get("since"), None
+    if down and not since:
+        state = {"since": now, "hosts": down}
+        line = f"dns down: {', '.join(down)} unresolved ({DNS_TIMEOUT:g} s timeout)"
+    elif down:
+        state = dict(prev, hosts=sorted(set(prev.get("hosts") or []) | set(down)))   # still down: say nothing
+    elif since:
+        state = {}
+        line = f"dns back after {max(1, round((now - since) / 60))} min ({', '.join(prev.get('hosts') or [])})"
+    else:
+        return None                                              # up, was up: the normal minute
+    if state != prev:
+        os.makedirs(DIR, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(state, f)
+        os.replace(path + ".tmp", path)
+    return line
+
+
+def alert(line):
+    """The box's one door outward. "<host> alerts" is the title shape cc-slack routes to #alerts even on a box that
+    shares its name with a repo. The DOWN line may not get out — Slack's host is one of the two that just failed —
+    which is why the BACK line carries the outage length; cc-notify logs both regardless. Never fatal: the row is
+    the recorder's job, the notice is a courtesy."""
+    box = socket.gethostname().split(".")[0]
+    try:
+        subprocess.run([f"{BIN}/cc-notify", "-t", f"{box} alerts", line],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except Exception as e:
+        print(f"cc-vitals: notify failed: {e}", file=sys.stderr)
+
+
+def watch(reading):
+    """The per-tick half: a flip becomes one alert. Returns what was said, if anything."""
+    line = dns_flip(reading)
+    if line:
+        alert(line)
+    return line
 
 
 # ------------------------------------------------------------------------------------------------- storage ---
@@ -343,7 +429,7 @@ def build(hours=24, now=None, data=None):
     placed = sum(1 for i in range(n) if _iso(t0 + i * 60) in at)
     return {"generated": _iso(now), "window_h": hours, "t0": int(t0), "step": 60, "n": n,
             "minutes": placed, "gaps": n - placed, "stale_after": STALE,
-            "surface": SURFACE, "caps": cap,
+            "surface": SURFACE, "caps": cap, "dns": data[-1].get("dns") if data else None,
             "axis": {"min": 0, "max": 100, "label": "% of each metric's own capacity",
                      "note": "one axis, six capacities; the legend carries the real numbers. Values over 100 "
                              "are real (load can exceed the core count) — the renderer clips and flags them."},
@@ -501,6 +587,7 @@ def cmd_record(opt):
     while True:
         row = record_minute(period, sample)
         append(row)
+        watch(row.get("dns") or {})  # a flip is one line to #alerts; a steady state, up or down, is silence
         prune()
         try:
             render()                     # on a real change, once a minute — never inside the tab's refresh path
@@ -705,11 +792,63 @@ def selfcheck():
               not os.path.exists(f"{tmp}/2000-01-01.jsonl") and os.path.exists(f"{tmp}/{_day(time.time())}.jsonl"))
         check("a half-written last line is skipped, it does not take the chart down", isinstance(rows(24), list))
 
+        # -- THE RESOLVER, stubbed: a reading like the others, and #alerts hears a FLIP only --------------------
+        def stub(body):                                          # a fake `getent hosts <host>`; $2 is the host
+            path = f"{tmp}/getent"
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+            return path
+        said, live_getent, live_alert = [], GETENT, alert
+        globals()["alert"] = said.append
+        try:
+            globals()["GETENT"] = stub("exit 0")
+            r = dns()
+            check("both hosts answer -> a ms reading per host, kept in the row like the other readings",
+                  set(r) == set(HOSTS) and all(isinstance(v, int) for v in r.values()))
+            check("up, and was up: nothing said, no state file", watch(r) is None and not said
+                  and not os.path.exists(f"{tmp}/dns.json"))
+            globals()["GETENT"] = stub('[ "$2" = github.com ] && exit 2; exit 0')
+            r = dns()
+            check("a failed lookup is None, not a number", r["github.com"] is None and r["slack.com"] is not None)
+            check("the first failed lookup is the DOWN flip, naming the host that failed",
+                  watch(r) and len(said) == 1 and "down" in said[0] and "github.com" in said[0]
+                  and "slack.com" not in said[0])
+            globals()["GETENT"] = stub("exit 2")
+            r = dns()
+            check("still down, now both hosts: NO repeat — an outage is one line, not one a minute",
+                  dns_flip(r, now=time.time() + 60) is None and dns_flip(r, now=time.time() + 120) is None
+                  and watch(r) is None and len(said) == 1)
+            globals()["GETENT"] = stub("sleep 5")
+            t = time.monotonic()
+            check("a HUNG resolver is None after the timeout, not a hung recorder",
+                  resolve("github.com", timeout=0.3) is None and time.monotonic() - t < 2)
+            globals()["GETENT"] = stub("exit 0")
+            r = dns()
+            up = dns_flip(r, now=time.time() + 240)
+            check("back: the UP flip once, carrying the outage length and every host that was out",
+                  bool(up) and "back after 4 min" in up and "github.com, slack.com" in up)
+            check("...and the state is cleared, so the next blip is a new outage, not a repeat",
+                  dns_flip(r) is None and json.loads(_read(f"{tmp}/dns.json")) == {})
+        finally:
+            globals()["GETENT"], globals()["alert"] = live_getent, live_alert
+        # the door itself: cc-notify told to log and not push, and a _selfcheck marker its own gate stops anyway
+        env = {k: os.environ.get(k) for k in ("CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG")}
+        os.environ.update(CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{tmp}/notify.log")
+        try:
+            alert("dns back after 1 min (_selfcheck)")
+        finally:
+            for k, v in env.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        check("a flip goes out through cc-notify under the '<box> alerts' title cc-slack routes to #alerts",
+              f"\t{socket.gethostname().split('.')[0]} alerts\tdns back" in _read(f"{tmp}/notify.log"))
+
         # -- and one real minute end to end, short --------------------------------------------------------------
         r = record_minute(period=2, sample=1)
         check("record_minute reads this box and returns a whole row",
               r["s"] >= 2 and r["cap"]["cores"] and r["load"]["m"] is not None and r["dt"] >= 2)
         check("the row is stamped with the minute it covers, on the minute", r["t"].endswith(":00Z"))
+        check("...with the resolver reading in it", set(r["dns"]) == set(HOSTS))
     finally:
         globals()["DIR"] = live
         shutil.rmtree(tmp, ignore_errors=True)
