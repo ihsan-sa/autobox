@@ -330,6 +330,18 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t
              'Bash|{"command":"git log --oneline -5"}' "Read|{\"file_path\":\"$mf/note.md\"}" "Edit|{\"file_path\":\"$mf/note.md\"}"; do
   [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "member-facing session still reads, edits in place and escalates with cc-notify" || bad "member gate over-blocks:$miss"
+# The probes above hand payloads STRAIGHT to cc-guard. Live, Claude Code runs the hook only for tools the PreToolUse
+# MATCHER names — and Read|NotebookRead|Grep|Glob had a deny branch for days that no call ever reached, because the
+# matcher stopped at NotebookEdit (audit 2026-09-01 F1). So: every tool cc-guard has a case branch for must be in the
+# matcher, in BOTH files that carry it (the managed manifest the drift check reads, the default install.sh copies).
+C="$B/../config"; mm=$(jq -r '.hooks[] | select(.event=="PreToolUse") | .matcher' "$C/claude-managed.json")
+ms=$(jq -r '.hooks.PreToolUse[] | select(any(.hooks[]; .command|test("cc-guard"))) | .matcher' "$C/claude-settings.json")
+gt=$(grep -oE '^  [A-Za-z|]+\)' "$B/cc-guard" | tr -d ' )' | tr '|' '\n' | sort -u)   # the guard's own case labels
+miss=""; for tool in $gt; do for f in managed:"$mm" settings:"$ms"; do
+  tr '|' '\n' <<<"${f#*:}" | grep -qx "$tool" || miss="$miss ${f%%:*}:$tool"; done; done
+[ -n "$gt" ] && grep -qx Read <<<"$gt" && [ "$mm" = "$ms" ] && [ -z "$miss" ] \
+  && ok "the PreToolUse matcher carries every tool cc-guard gates ($(tr '\n' ' ' <<<"$gt"| sed 's/ $//')), identically in claude-managed.json and claude-settings.json" \
+  || bad "PreToolUse matcher does not reach the guard: missing[$miss] managed=[$mm] settings=[$ms]"
 # A MEMBER WORKSPACE is the one member that DOES dispatch — inside itself and nowhere else. The marker is
 # .cc/member-workspace at ~/dev/<handle>, and a TRACK of that workspace inherits the tier rather than being promoted
 # to the ordinary worker one by its own .cc/track. Defence in depth: docs/design-member-workspaces.md, "the boundary".
