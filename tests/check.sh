@@ -18,5 +18,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # this tree and their own fixtures, never live systemd and never ~/.claude/settings.json.
 # cc-board's is the same shape: the default board view's filter, and the one-authority rule for the brief, both
 # against its own fixtures in a HOME of its own — never this box's board.
-for c in cc-units cc-settings cc-board; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+# cc-config's is the same: its own config file in a temp dir, never this box's — precedence, locking, and the
+# one that matters, that a value like $(…) is read back as those characters and executes nothing.
+for c in cc-units cc-settings cc-board cc-config; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

@@ -265,6 +265,9 @@ printf '{"tool_name":"Bash","tool_input":{"command":"cc-slack post -c x hi"},"cw
 : > "$T/guard.args"; [ "$(ask "gh pr merge 1" "$GH")" = 0 ] && [ ! -s "$T/guard.args" ] \
   && ok "the owner's own sessions are unaffected — not gated, and nothing posted anywhere" || bad "an ungated cwd posted: $(cat "$T/guard.args")"
 : > "$T/guard.args"; rm -rf "$T/asks"
+[ "$(ask "cc-config list" "$mf")" = 2 ] && ok "the box's config is not a member's to read — its one sanctioned reader is denied too" || bad "cc-config list slipped the member gate"
+[ "$(ask "cc-config set SLACK_APP_TOKEN x" "$mf")" = 2 ] && ok "...nor to rewrite" || bad "cc-config set slipped the member gate"
+: > "$T/guard.args"; rm -rf "$T/asks"   # leave the harness state as found: the cases below read these fresh
 printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1
 { grep -q '^NOTIFY: --owner' "$T/guard.args" && ! grep -q '^BOT:' "$T/guard.args"; } \
   && ok "CC_ROLE=member with no marker: the owner is still told, and nothing is posted to a channel we cannot name" || bad "markerless member ask: $(cat "$T/guard.args")"
@@ -362,8 +365,11 @@ cat > "$NH/bin/cc-slack" <<F
 printf '%s\n' "\$*" >> "$T/slack.args"
 F
 chmod +x "$NH/bin/cc-slack"; printf 'SLACK_BOT_TOKEN=xoxb-test\nSLACK_OWNER_ID=UOWNER\n' > "$NH/.cc/config"
+# -u for every config key: the environment now WINS over the file (cc-config's one rule), so a key exported by
+# whatever session is running this would beat the fixture's own config below.
 N(){ w=$1; shift; : > "$T/slack.args"
-     ( cd "$w" && env -u CC_NOTIFY_LOG_ONLY HOME="$NH" CC_NOTIFY_LOG="$NH/.cc/notify.log" "$B/cc-notify" "$@" >/dev/null 2>&1 ); }
+     ( cd "$w" && env -u CC_NOTIFY_LOG_ONLY -u SLACK_BOT_TOKEN -u SLACK_OWNER_ID -u SLACK_WEBHOOK -u SLACK_ALERTS \
+           -u NTFY_TOPIC -u NTFY_SERVER -u CC_BOX HOME="$NH" CC_NOTIFY_LOG="$NH/.cc/notify.log" "$B/cc-notify" "$@" >/dev/null 2>&1 ); }
 N "$T/chan" "Alice needs the staging DB restored"
 { grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args"; } \
   && ok "a member-facing session's escalation DMs the owner, never its own channel" || bad "escalation went to the channel: $(cat "$T/slack.args")"

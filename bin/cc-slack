@@ -77,7 +77,6 @@ Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHAN
 import collections, contextlib, fcntl, glob, hashlib, io, json, os, re, socket, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
-CFG = f"{HOME}/.cc/config"
 DIR = os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack")
 SOCK = f"{DIR}/sock"
 SELF_LINK = os.path.abspath(__file__)                # how this copy was invoked — usually the ~/bin symlink
@@ -166,34 +165,29 @@ def log(*a):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), *a, file=sys.stderr, flush=True)
 
 
+# ~/.cc/config is read and written by cc-config alone: one parser, one precedence rule (the environment wins),
+# and writes serialised by a lock — `setup` writes three keys while the daemon may be writing the owner id. The
+# file is never sourced anywhere, which is the point: it holds this bot's tokens.
+CFG_KEYS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_OWNER_ID", "SLACK_CHANNEL", "SLACK_AUTOSTART")
+
+
 def load_cfg():
+    """Every key in the file, plus the five above when only the environment has them."""
     cfg = {}
     try:
-        for line in open(CFG):
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip().strip('"').strip("'")
-    except FileNotFoundError:
-        pass
-    for k in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_OWNER_ID", "SLACK_CHANNEL", "SLACK_AUTOSTART"):
-        if os.environ.get(k):
-            cfg[k] = os.environ[k]
+        out = subprocess.run([f"{BIN}/cc-config", "list", *CFG_KEYS], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=10).stdout
+    except Exception:
+        return cfg
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            cfg[k] = v
     return cfg
 
 
 def set_cfg(key, value):
-    lines = []
-    try:
-        lines = open(CFG).read().splitlines()
-    except FileNotFoundError:
-        pass
-    lines = [l for l in lines if not l.startswith(key + "=")] + [f"{key}={value}"]
-    tmp = CFG + ".tmp"
-    with open(tmp, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CFG)
+    subprocess.run([f"{BIN}/cc-config", "set", key, value], stdin=subprocess.DEVNULL, timeout=10)
 
 
 def slack_api(method, token, **params):

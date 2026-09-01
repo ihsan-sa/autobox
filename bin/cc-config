@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# cc-config — the one reader and writer of ~/.cc/config. Every tool that needs a key comes through here, so the
+# file has one format, one precedence rule, and is never executed.
+#   cc-config get KEY [default]   the value; exit 0 it was set, 1 it fell back to <default> (empty if none given)
+#   cc-config set KEY VALUE       replaces every earlier line for KEY; mode 600, under a lock, atomic rename
+#   cc-config unset KEY           exit 0 it was there, 1 it was not
+#   cc-config list [KEY…]         KEY=VALUE for every key in the file, plus any KEY named here that only the environment has
+#   cc-config path                where the file is
+#   cc-config selfcheck           this reader's own invariants, in a config of its own
+#
+# NEVER SOURCED, ANYWHERE. That file holds the box's Slack tokens, and a config that is `.`-ed is code: a value
+# like $(rm -rf ~) RUNS, and every key in it lands in the environment of whatever the script spawns next. Here a
+# value is a literal string end to end — `set K '$(x)'` stores those characters and `get K` prints them back,
+# having run nothing. Two of the four readers this replaced sourced the file.
+#
+# PRECEDENCE: the environment wins over the file, and a variable that is SET wins even when it is EMPTY —
+# `PUBLISH_REMOTE= cc-publish` means "off" and must not fall through to whatever the file says. One rule for
+# every consumer: of the four that used to read this file, two had the file win instead.
+#
+# FORMAT, unchanged — no migration: KEY=VALUE one per line; blank lines and #-comments ignored; whitespace around
+# key and value trimmed; one layer of matching "…" or '…' quotes stripped; the LAST line for a key wins. A line
+# whose key is not a shell variable name is not a key: no command here reads it, and set/unset leave it in place.
+#
+# CC_CONFIG points this at another file (tests, and the selfcheck below).
+set -uo pipefail
+CFG="${CC_CONFIG:-$HOME/.cc/config}"
+SELF="$(realpath "$0")"
+USAGE="usage: cc-config get KEY [default] | set KEY VALUE | unset KEY | list [KEY…] | path | selfcheck"
+umask 077   # this file is secrets: never create it, its lock or its temp file group- or world-readable
+
+key_ok(){ case "$1" in ""|[!A-Za-z_]*|*[!A-Za-z0-9_]*) return 1;; esac; return 0; }
+
+# The key a config line declares, or nothing. The one place the format is decided.
+line_key(){
+  local l="$1" k
+  l="${l#"${l%%[![:space:]]*}"}"                                     # leading whitespace
+  case "$l" in ''|'#'*) return 1;; *=*) ;; *) return 1;; esac
+  k="${l%%=*}"; k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+  key_ok "$k" || return 1
+  printf '%s' "$k"
+}
+
+line_value(){
+  local v="$1"
+  v="${v#*=}"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  case "$v" in '"'*'"'|"'"*"'") v="${v:1:${#v}-2}" ;; esac        # ONE layer of matching quotes, and nothing else
+  printf '%s' "$v"
+}
+
+declare -A FVAL=(); FKEYS=()
+load_file(){
+  local line k
+  [ -f "$CFG" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    k="$(line_key "$line")" || continue
+    [ -n "${FVAL[$k]+x}" ] || FKEYS+=("$k")                        # first appearance fixes the order, last wins the value
+    FVAL["$k"]="$(line_value "$line")"
+  done < "$CFG"
+}
+
+# Rewrite the file without KEY, appending KEY=VALUE when keep=1. Returns 0 if a line for KEY was there.
+rewrite(){
+  local k="$1" keep="$2" v="${3-}" line lk tmp rc=1
+  case "$CFG" in */*) mkdir -p "${CFG%/*}" || { echo "cc-config: cannot create ${CFG%/*}" >&2; exit 1; };; esac
+  # One writer at a time. Without this, two `set`s that read the same file both write their own copy of it and
+  # the first key is simply gone — `cc slack setup` writes three keys, and cc-notify setup writes while it does.
+  exec 9>"$CFG.lock" || { echo "cc-config: cannot lock $CFG" >&2; exit 1; }
+  command -v flock >/dev/null 2>&1 && flock 9
+  tmp="$CFG.tmp.$$"
+  : > "$tmp" || { echo "cc-config: cannot write $CFG" >&2; exit 1; }
+  if [ -f "$CFG" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      lk="$(line_key "$line")" && [ "$lk" = "$k" ] && { rc=0; continue; }
+      printf '%s\n' "$line" >> "$tmp"                              # comments and anything unparseable are kept as they are
+    done < "$CFG"
+  fi
+  [ "$keep" = 1 ] && printf '%s=%s\n' "$k" "$v" >> "$tmp"
+  mv -f "$tmp" "$CFG" || { rm -f "$tmp"; echo "cc-config: cannot replace $CFG" >&2; exit 1; }
+  exec 9>&-
+  return "$rc"
+}
+
+get(){
+  local k="$1" def="${2-}"
+  key_ok "$k" || { echo "cc-config: not a variable name: $k" >&2; exit 2; }
+  if printenv -- "$k" >/dev/null 2>&1; then printenv -- "$k"; return 0; fi   # the ENVIRONMENT wins, empty included — printenv, not ${!k}: the shell's OWN state (CFG, HOSTNAME, FVAL) is nobody's environment
+  load_file
+  if [ -n "${FVAL[$k]+x}" ]; then printf '%s\n' "${FVAL[$k]}"; return 0; fi
+  printf '%s\n' "$def"; return 1
+}
+
+list(){
+  local k
+  load_file
+  for k in ${FKEYS[@]+"${FKEYS[@]}"}; do
+    if [ -n "${!k+x}" ]; then printf '%s=%s\n' "$k" "${!k}"; else printf '%s=%s\n' "$k" "${FVAL[$k]}"; fi
+  done
+  for k in "$@"; do                                                # named keys the file does not have but the environment does
+    key_ok "$k" || continue
+    [ -n "${FVAL[$k]+x}" ] && continue
+    [ -n "${!k+x}" ] && printf '%s=%s\n' "$k" "${!k}"
+  done
+  return 0
+}
+
+selfcheck(){
+  local n=0 f=0 out rc i   # T is NOT local: the EXIT trap that removes it fires outside this function
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
+  T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+  # Fixture keys are neutral names (ALPHA/BETA…): core/ is published, and nothing in it may name a box.
+  cat > "$T/config" <<'EOF'
+# a comment, and a blank line follow
+
+ALPHA=one
+  BETA = "two"
+GAMMA='three'
+ALPHA=four
+not a key at all
+DOLLAR=$(touch @T@/pwned-file)
+BACKTICK=`touch @T@/pwned-tick`
+SEMI=x; touch @T@/pwned-semi
+EOF
+  sed -i "s#@T@#$T#g" "$T/config"
+  C(){ CC_CONFIG="$T/config" "$SELF" "$@"; }
+
+  k "$(t test "$(C get ALPHA)" = four)" "the last line for a key wins"
+  k "$(t test "$(C get BETA)" = two)" "whitespace around key and value trimmed, one layer of quotes stripped"
+  k "$(t test "$(C get GAMMA)" = three)" "single quotes too"
+  C get ALPHA >/dev/null; k $? "a key that is set exits 0"
+  k "$(t test "$(C get NOPE fallback)" = fallback)" "an absent key gives the default"
+  C get NOPE fallback >/dev/null; rc=$?; k "$(t test $rc = 1)" "…and exits 1, so a caller can tell a default from a value"
+  k "$(t test -z "$(C get NOPE)")" "an absent key with no default is empty"
+  # PRECEDENCE — one rule, both directions
+  k "$(t test "$(export ALPHA=env; C get ALPHA)" = env)" "the environment wins over the file"
+  k "$(t test -z "$(export ALPHA=''; C get ALPHA)")" "…and a variable SET but EMPTY wins too ('KEY= cmd' means off)"
+  out=$(C get CFG shell-state-must-not-leak); rc=$?
+  k "$(t test "$out" = shell-state-must-not-leak -a "$rc" = 1)" "the shell's OWN variables (CFG) are nobody's environment — only printenv's world counts"
+  ( export ALPHA=''; C get ALPHA >/dev/null ); k $? "…exiting 0: it was set, it was just empty"
+  # NO EVAL — the whole reason this file exists
+  k "$(t test "$(C get DOLLAR)" = '$(touch '"$T"'/pwned-file)')" "a \$(…) value is returned as literal characters"
+  k "$(t test "$(C get BACKTICK)" = '`touch '"$T"'/pwned-tick`')" "…and a backtick value too"
+  k "$(t test "$(C get SEMI)" = "x; touch $T/pwned-semi")" "…and a value with a ; command after it"
+  k "$(t test ! -e "$T/pwned-file" -a ! -e "$T/pwned-tick" -a ! -e "$T/pwned-semi")" "reading the file executed NOTHING"
+  C list >/dev/null; k $? "list reads the same file without executing it"
+  k "$(t test ! -e "$T/pwned-file")" "…still nothing executed"
+  k "$(t grep -qx 'not a key at all' "$T/config")" "a line that is not KEY=VALUE is left alone"
+  # list
+  out="$(C list)"
+  k "$(t grep -qx 'ALPHA=four' <<<"$out")" "list gives each file key once, at its resolved value"
+  k "$(t test "$(grep -c '^ALPHA=' <<<"$out")" = 1)" "…once, not once per line"
+  out="$(export ALPHA=env DELTA=only-in-env; C list DELTA)"
+  k "$(t grep -qx 'ALPHA=env' <<<"$out")" "list applies the same precedence"
+  k "$(t grep -qx 'DELTA=only-in-env' <<<"$out")" "a named key the environment alone has is listed (cc-slack's five)"
+  k "$(t test -z "$(export DELTA=only-in-env; C list | grep '^DELTA=')")" "…and is not, when it was not named"
+  # set / unset
+  C set NEW 'a value with spaces' && k 0 "set exits 0" || k 1 "set exits 0"
+  k "$(t test "$(C get NEW)" = 'a value with spaces')" "…and reads back exactly"
+  C set NEW 'second'
+  k "$(t test "$(grep -c '^NEW=' "$T/config")" = 1)" "set replaces, it does not append a second line"
+  k "$(t grep -q '^# a comment' "$T/config")" "…and keeps the comments"
+  C set EVIL '$(touch '"$T"'/pwned-set)'
+  k "$(t test "$(C get EVIL)" = '$(touch '"$T"'/pwned-set)' -a ! -e "$T/pwned-set")" "a \$(…) written by set stays a string"
+  C unset NEW; k $? "unset exits 0 when the key was there"
+  k "$(t test -z "$(C get NEW)")" "…and the key is gone"
+  C unset NEVERSET >/dev/null 2>&1; rc=$?; k "$(t test $rc = 1)" "unset exits 1 when it was not"
+  k "$(t test "$(stat -c %a "$T/config")" = 600)" "the file stays mode 600 — it holds tokens"
+  C set BAD-NAME v >/dev/null 2>&1; rc=$?; k "$(t test $rc = 2)" "a key that is not a variable name is refused"
+  C set MULTI "$(printf 'a\nb')" >/dev/null 2>&1; rc=$?; k "$(t test $rc = 2)" "a value with a newline is refused: it would forge a second key"
+  # LOCKING: twenty writers, each read-modify-writing the whole file. Unlocked, most of these keys are lost.
+  : > "$T/many"
+  for i in $(seq 1 20); do CC_CONFIG="$T/many" "$SELF" set "K$i" "v$i" & done
+  wait 2>/dev/null
+  k "$(t test "$(grep -c '^K[0-9]*=v[0-9]*$' "$T/many")" = 20)" "twenty concurrent writers all land (flock'd read-modify-write)"
+  echo "cc-config selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+
+case "${1:-}" in
+  get)       shift; [ $# -ge 1 ] && [ $# -le 2 ] || { echo "$USAGE" >&2; exit 2; }; get "$@" ;;
+  set)       shift; [ $# -eq 2 ] || { echo "$USAGE" >&2; exit 2; }
+             key_ok "$1" || { echo "cc-config: not a variable name: $1" >&2; exit 2; }
+             case "$2" in *$'\n'*) echo "cc-config: a value cannot contain a newline" >&2; exit 2;; esac
+             rewrite "$1" 1 "$2"; exit 0 ;;
+  unset)     shift; [ $# -eq 1 ] || { echo "$USAGE" >&2; exit 2; }
+             key_ok "$1" || { echo "cc-config: not a variable name: $1" >&2; exit 2; }
+             rewrite "$1" 0 ;;
+  list)      shift; list "$@" ;;
+  path)      printf '%s\n' "$CFG" ;;
+  selfcheck) selfcheck ;;
+  *)         echo "$USAGE" >&2; exit 2 ;;
+esac
