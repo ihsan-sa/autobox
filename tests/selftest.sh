@@ -449,7 +449,7 @@ printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}
 { grep -q '^NOTIFY: --owner' "$T/guard.args" && ! grep -q '^BOT:' "$T/guard.args"; } \
   && ok "CC_ROLE=member with no marker: the owner is still told, and nothing is posted to a channel we cannot name" || bad "markerless member ask: $(cat "$T/guard.args")"
 echo "== overlapping handoff: two sessions, one cwd, exactly one of them live =="
-export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1   # never the box's own records, never a 2-min grace
+export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records, never a 2-min grace or a 10-min drain
 ho=$("$B/cc-handoff" selfcheck 2>&1 | tail -1)
 grep -q '0 failed' <<<"$ho" && ok "cc-handoff selfcheck: ${ho##*: }" || bad "cc-handoff selfcheck: $ho"
 st=$("$B/cc" handoff --status 2>&1); grep -q "no overlapping handoff is open" <<<"$st" && ok "cc handoff --status delegates by target" || bad "cc handoff --status: [$st]"
@@ -477,9 +477,12 @@ miss=""; for c in "gh pr merge 1" "git push origin HEAD" "cc r t --go x" "cc don
 [ -z "$miss" ] && ok "the non-live successor is denied merge/push/dispatch/PR/host — by its env, not by a marker" || bad "successor not gated:$miss"
 [ "$(h "git log --oneline" "$hid")" = 0 ] && ok "...and may still read, search and think" || bad "successor over-gated"
 [ "$(h "gh pr merge 1" "" sid-pre)" = 0 ] && ok "the LIVE predecessor is gated by none of it" || bad "predecessor gated while live"
+pp=$(tmux list-panes -t "$(jq -r .predecessor.tmux "$T/handoff/$REPO--hx.json")" -F '#{pane_id}' 2>/dev/null | head -1)
+[ "$(TMUX_PANE=$pp h "gh pr merge 1" "" "")" = 0 ] && ok "...nor by its pane while it is live" || bad "predecessor gated by pane while live (pane $pp)"
 CC_HANDOFF="$hid" "$B/cc-handoff" --ready "$REPO/hx" >/dev/null 2>&1
 [ "$(jq -r .live "$T/handoff/$REPO--hx.json" 2>/dev/null)" = successor ] && ok "one atomic replace moves ownership — the successor is live" || bad "cutover did not move the record"
 { [ "$(h "gh pr merge 1" "" sid-pre)" = 2 ] && [ "$(h "git push origin HEAD" "" sid-pre)" = 2 ]; } && ok "SYMMETRY: after cutover the retired PREDECESSOR is the gated one (no stale-branch push)" || bad "predecessor not gated after cutover"
+[ "$(TMUX_PANE=$pp h "gh pr merge 1" "" "")" = 2 ] && ok "...by its PANE too: a planning predecessor's session_id is empty on the record, and the drain is 10 min" || bad "predecessor with no session_id not gated by pane (pane $pp)"
 [ "$(h "gh pr merge 1" "$hid")" = 0 ] && ok "...and the successor, now live, is free" || bad "successor still gated after cutover"
 [ "$(h "gh pr merge 1" "no-such-record")" = 2 ] && ok "CC_HANDOFF with no record to justify it stays gated (missing = the predecessor is in charge)" || bad "unbacked CC_HANDOFF ungated"
 echo '{not json' > "$T/handoff/$REPO--hx.json"
@@ -511,7 +514,7 @@ ev=$(CC_HANDOFF="$hz" CC_HANDOFF_OVERLAP=1 "$B/cc-handoff" --event "$REPO/hz" --
 ev=$(CC_HANDOFF="$hz-still-open" CC_HANDOFF_OVERLAP=1 "$B/cc-handoff" --event "$REPO/hz" --level handoff --pct 51.5 --live 2>/dev/null)
 { [ "$(jq -r .action <<<"$ev")" = "" ] && [ ! -f "$T/handoff/$REPO--hz.json" ]; } \
   && ok "...while a handoff still OPEN keeps its successor out of it — the rule only relaxes once <id>.done is there" || bad "an open handoff did not hold: [$ev]"
-for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hz" '$2==r || $2==r"~next"{print $1}'); do tmux kill-window -t "$id"; done
+for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hz" '$2==r || $2==r"~next" || $2==r"~old"{print $1}'); do tmux kill-window -t "$id"; done
 
 # THE SWEEP, on real windows. Every phase above is driven by a session's own Stop hook — which is exactly what
 # a session that CRASHED no longer has. On 2026-08-31 a retirement dying between the marker and the record
@@ -550,7 +553,7 @@ tmux list-windows -t main -F '#W' | grep -qx "$REPO/hq" && ok "...and the predec
 for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO" '$2 ~ "^"r"/(hs|hq)(~next)?$"{print $1}'); do tmux kill-window -t "$id"; done
 # the sweep has NO unit of its own: the existing reconcile timer is what gives it a turn (review rec #8)
 grep -q 'cc-handoff", "--sweep"' "$B/cc-reconcile" && [ ! -e "$(dirname "$B")/config/systemd-user/cc-handoff.timer" ]   && ok "the sweep rides the existing cc-reconcile timer — no new unit" || bad "the sweep is not wired through cc-reconcile"
-unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_GRACE
+unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_GRACE CC_HANDOFF_DRAIN
 
 echo "== cc-notify: an escalation reaches the OWNER, not the channel it came from =="
 # own HOME (the box's real config and owner id stay out of this) + a stub bot: the args cc-notify hands cc-slack ARE the routing

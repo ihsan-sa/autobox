@@ -45,7 +45,7 @@ be mistaken for each other, which is the whole point of writing the asks down.
   cc-scope capture <repo> [--src REF] [--who W]                      classify a message on stdin
   cc-scope missed [<repo>] [--since HOURS]                           owner messages the classifier skipped
   cc-scope digest [<repo>] · count [<repo>] · import <repo> <file> · selfcheck
-  cc-scope hook                                                      UserPromptSubmit hook (silent, always 0)
+  cc-scope hook                                                      UserPromptSubmit hook (always 0; speaks only for cc-handoff --relay)
 
 Exit, for the commands a caller acts on: 0 did it · 1 the check ran and FAILED · 2 the row names no check.
 """
@@ -352,14 +352,30 @@ def not_a_person(text, attrs):
     return False
 
 
+def relayed(payload):
+    """`cc-handoff --relay`, with the hook's own payload: it answers with a block decision (JSON on stdout) when
+    this session is the RETIRING side of a handoff and the prompt went to its successor, and with nothing
+    otherwise. Its stdout is handed back as ours; any failure is no decision — the hook must never break a session."""
+    try:
+        r = subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-handoff"), "--relay"],
+                           input=json.dumps(payload), capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and r.stdout.strip():
+            sys.stdout.write(r.stdout); sys.stdout.flush()
+            return True
+    except Exception: pass
+    return False
+
+
 def hook():
-    """UserPromptSubmit. Prints NOTHING (stdout would land in the session's context) and always exits 0:
-    a ledger that can break a session is worse than no ledger."""
+    """UserPromptSubmit. Prints NOTHING of its own (stdout would land in the session's context) and always exits
+    0: a ledger that can break a session is worse than no ledger. The one thing it passes through is cc-handoff's
+    --relay decision — a prompt typed into a retiring session goes to its successor and is blocked here."""
     try:
         payload = json.load(sys.stdin)
         text = payload.get("prompt") or ""
         cwd = payload.get("cwd") or os.getcwd()
         if not text.strip(): return
+        if relayed(payload): return                          # the successor's ask now, not this session's
         _, attrs = strip_tag(text)
         if not_a_person(text, attrs): return                 # machine chatter, not an ask — see NOT_A_PERSON
         if not attrs:                                        # no channel tag: a prompt typed into the session
@@ -783,6 +799,15 @@ def selfcheck():
         t("an owner Slack message still records",
           hook_asks('<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.2" user="ada.byron" '
                     'role="owner" channel="#demo">put the open asks on Home, please') == 1)
+        # ---- THE RETIRING SIDE OF A HANDOFF: cc-handoff --relay decides (payload over stdin), the hook hands it back
+        retired = {"id": "fixture", "target": "_hooktest", "live": "successor", "phase": "retired",
+                   "predecessor": {"session_id": "sid-retired", "tmux": "", "window": "_hooktest~old"},
+                   "successor": {"session_id": "sid-live", "tmux": "", "window": "_hooktest"}}
+        n, out = hook_run("please add the relay case to the hook", sid="sid-retired", record=retired)
+        t("a prompt into a RETIRED session comes back blocked with the pointer, and opens no row",
+          n == 0 and '"block"' in out and "use window _hooktest" in out)
+        t("...and from any other session the same prompt is neither blocked nor lost",
+          hook_run("please add the relay case to the hook", record=retired) == (1, ""))
         n = int(run_capture(["count", R]))
         t("count is the number of unsettled asks", n == len(select(R)))
         t("digest says nothing when nothing is open", run_capture(["digest", "_empty"]).strip() == "")
@@ -809,19 +834,26 @@ def run_capture(argv):
 
 
 def hook_asks(text):
-    """Run the UserPromptSubmit hook over one prompt; returns how many rows the ledger gained. The hook's
+    return hook_run(text)[0]
+
+
+def hook_run(text, sid="selfcheck", record=None):
+    """Run the UserPromptSubmit hook over one prompt: (rows the ledger gained, what it printed). The hook's
     other two guards are neutralised: the selfcheck usually runs inside a worker's worktree, which would
-    pass every skip case for entirely the wrong reason and fail the two that must still record."""
+    pass every skip case for entirely the wrong reason and fail the two that must still record. Hermetic:
+    `cc-handoff --relay` reads CC_HANDOFF_DIR, and here that is the temp dir — `record` (a handoff record) or
+    nothing — never the box's own."""
     import tempfile, shutil, io, contextlib
     d = tempfile.mkdtemp(prefix="cc-scope-hooktest-")       # under /tmp: no .cc/track marker, no repo name
-    keep, old = {k: os.environ.get(k) for k in ("CC_ROLE", "CC_REPO")}, sys.stdin
-    os.environ.pop("CC_ROLE", None); os.environ["CC_REPO"] = "_hooktest"
+    keep, old = {k: os.environ.get(k) for k in ("CC_ROLE", "CC_REPO", "CC_HANDOFF_DIR")}, sys.stdin
+    os.environ.pop("CC_ROLE", None); os.environ["CC_REPO"] = "_hooktest"; os.environ["CC_HANDOFF_DIR"] = d
+    if record: json.dump(record, open(os.path.join(d, "fixture.json"), "w"))
     try:
         before = len(load("_hooktest")["asks"])
-        sys.stdin = io.StringIO(json.dumps({"prompt": text, "cwd": d, "session_id": "selfcheck"}))
+        sys.stdin = io.StringIO(json.dumps({"prompt": text, "cwd": d, "session_id": sid}))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf): hook()
-        return len(load("_hooktest")["asks"]) - before
+        return len(load("_hooktest")["asks"]) - before, buf.getvalue()
     finally:
         sys.stdin = old
         for k, v in keep.items(): os.environ.pop(k, None) if v is None else os.environ.update({k: v})
