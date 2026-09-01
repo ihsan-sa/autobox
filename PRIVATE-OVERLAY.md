@@ -15,7 +15,7 @@ my-box/                 private repo (the overlay)
 └── tests/check-extra.sh   optional: static checks for the files above (the pre-commit hook runs it after core's)
 ```
 
-A bare clone of autobox works too — it just has no overlay, so `install.sh` links `core/bin` and nothing else.
+A bare clone of autobox works too — it just has no overlay, so `install.sh` links `bin/`, the units and `~/WORKING.md`, and seeds `~/CLAUDE.md` and the guides from `templates/home/` (only where absent — the placeholders are yours to fill; see the README's *Blank box*).
 
 ## What a new box fills in
 

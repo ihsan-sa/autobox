@@ -22,17 +22,19 @@ sandbox runs the unrestricted ones. Thread marks tell you at a glance what needs
 - Boot/notify — survives power cuts and reboots; Slack/ntfy notices; daily digest.
 - Tests: `tests/check.sh`, `tests/selftest.sh` (200+ checks, no API calls), `cc-slack selfcheck`, `tests/slack_sim.py`.
 
-## Install (Ubuntu, 10 minutes)
-1. `git clone https://github.com/ihsan-sa/autobox ~/dev/autobox && ~/dev/autobox/install.sh`
-2. `cp templates/home/* ~/` and fill the placeholders (box name, owner, reach paths).
-3. Slack: create an app from `slack/app-manifest.json` (replace `<box>` in it), then `cc slack setup --bot xoxb-… --app xapp-…` and `cc slack on`.
-4. `cc-notify setup` (ntfy topic), `claude` login once, `cc <repo>` for each project in `~/dev`.
+## Blank box
+Hand this repo to a Claude agent on a fresh Ubuntu box and it can do everything below except the owner's lines:
+1. `git clone https://github.com/ihsan-sa/autobox ~/dev/autobox && ~/dev/autobox/install.sh` — links `bin/` into `~/bin`, arms the user units, seeds `~/CLAUDE.md` (the box contract: autonomy norm, approval list, doc pointers) and the guides from `templates/home/` where absent — `<placeholders>` stay for the owner — links `~/WORKING.md`, installs the default Claude settings. Idempotent; never rewrites a file already at `~`.
+2. **Owner:** `claude` login once · a Slack app from `slack/app-manifest.json`, then `cc slack setup --bot xoxb-… --app xapp-… --owner-email you@…` and `cc slack on` · `cc-notify setup` · fill the never-touch list in `~/CLAUDE.md`. Tokens and approvals never come from the agent.
+3. `cc <repo>` for each project in `~/dev` (a message in its Slack channel starts one too).
+4. **Owner:** switch on `cc-pulse.timer` (installed off; `cc-pulse --dry` first — `~/USAGE.md` has the line). From then on the box wakes each session every 2 h and it works the loop in `WORKING.md` on its own; what still needs the owner is the approval list in `~/CLAUDE.md`, and it reaches them by @-mention.
+A box that grows things of its own keeps them in a private overlay: `PRIVATE-OVERLAY.md`.
 
 ## Layout
-`bin/` scripts (symlinked into `~/bin`) · `ccbox/` sandbox image · `config/` units + settings · `slack/` manifest · `tests/` · `docs/DESIGN.md` why the system is shaped this way · `docs/WORKING.md` what a session does between tasks · `templates/` + `PRIVATE-OVERLAY.md` what a box adds privately.
+`bin/` scripts (symlinked into `~/bin`) · `ccbox/` sandbox image · `config/` units + settings · `slack/` manifest · `tests/` · `docs/DESIGN.md` why the system is shaped this way · `docs/WORKING.md` what a session does between tasks · `templates/home/` the `~` docs a blank box starts with · `PRIVATE-OVERLAY.md` what a box adds privately.
 
 ## Rules the box follows
-Owner approves merges, deploys, spend over budget, destructive/host changes. Sessions never commit on the default branch; workers never merge. Slack messages stay short — long form goes to a canvas or a doc.
+Sessions decide and act on their own; the owner is @-mentioned only for the approval list. Owner approves merges, deploys, spend over budget, destructive/host changes. Sessions never commit on the default branch; workers never merge. Slack messages stay short — long form goes to a canvas or a doc.
 
 The box names itself from `hostname -s` (override with `CC_BOX`); that name titles its notifications, its Remote-Control
 session and its Slack posts. A private box can carry this tree as `core/` inside its own repo — see `PRIVATE-OVERLAY.md`.

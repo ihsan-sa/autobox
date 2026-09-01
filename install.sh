@@ -37,6 +37,18 @@ if [ -n "$O" ]; then
     [ -f "$f" ] && link "$f" ~/"$(basename "$f")"
   done
 fi
+# ~/CLAUDE.md and the guides beside it: whatever is still absent at ~ after the overlay's links is seeded ONCE from
+# templates/home/ — a copy, `<box>` and `<user>` filled in, the other <placeholders> the owner's to replace. A file
+# already there (the overlay's link, or the owner's own) is never rewritten: it is the box's memory, not the installer's.
+# This is what makes a bare clone a box with the same contract as any other: the autonomy norm, the approval list and the
+# doc pointers arrive with the scripts, instead of being copied by hand (or not).
+box=$("$R/bin/cc-config" get CC_BOX "$(hostname -s)" 2>/dev/null) || true
+for f in "$R"/templates/home/*.md; do
+  d=~/"$(basename "$f")"
+  if [ -e "$d" ] || [ -L "$d" ]; then continue; fi
+  sed "s|<box>|$box|g; s|<user>|${USER:-$(id -un)}|g" "$f" > "$d"
+  echo "seeded $d from templates/home/ — fill in its <placeholders>"
+done
 link "$R/ccbox" ~/ccbox
 link "$R/docs/WORKING.md" ~/WORKING.md          # what a session does between tasks — at ~ beside the guides it is read with
 link "$R/config/tmux.conf" ~/.tmux.conf

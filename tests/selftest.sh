@@ -1097,6 +1097,30 @@ pub >/dev/null 2>&1
 [ "$(git -C "$PUB" rev-parse main)" = "$was" ] && ok "only origin's default branch is published — local, unpushed work is not" || bad "unpushed work reached the public repo"
 git reset -q --hard origin/main
 env CC_PUBLISH_STATE="$T" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE= PUBLISH_REPO=$REPO "$B/cc-publish" status 2>&1 | grep -q "publish: off" && ok "no PUBLISH_REMOTE: publishing is simply off (a bare clone never publishes)" || bad "unconfigured publish is not off"
+echo "== install.sh on a blank HOME (the bare-clone bootstrap) =="
+# THIS tree, copied as a bare autobox clone (a dir not named core/ has no overlay), installed into an empty HOME with
+# --no-services: nothing enabled or started, no privileges, nothing of this box's touched. ccbox/env is a token file
+# and stays behind. The fixtures ($T) go with the run's EXIT trap.
+IR="$T/autobox"; IH="$T/blank"; mkdir -p "$IR" "$IH"
+tar -C "$B/.." --exclude=./ccbox/env --exclude=__pycache__ -cf - . | tar -C "$IR" -xf -
+inst(){ ( cd "$IH" && env HOME="$IH" USER=tester CC_BOX=testbox GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$T/install.log" 2>&1; }
+inst && ok "install.sh runs clean on a blank HOME (--no-services)" || bad "install.sh failed on a blank HOME: $(tail -3 "$T/install.log" | tr '\n' ' ')"
+[ "$(readlink -f "$IH/bin/cc")" = "$IR/bin/cc" ] && [ "$(readlink -f "$IH/bin/cc-pulse")" = "$IR/bin/cc-pulse" ] && ok "bin/* linked into ~/bin from the installed tree" || bad "~/bin links missing or pointing elsewhere"
+miss=""; for u in $("$IR/bin/cc-units" link); do [ -L "$IH/.config/systemd/user/$u" ] || miss="$miss $u"; done
+[ -z "$miss" ] && ok "every unit in the manifest is linked, cc-pulse.timer included (switching on is the services step)" || bad "units not linked:$miss"
+{ [ -f "$IH/CLAUDE.md" ] && [ ! -L "$IH/CLAUDE.md" ] && grep -q '^# testbox — ' "$IH/CLAUDE.md" && grep -q 'Autonomy is the norm' "$IH/CLAUDE.md" && grep -q 'The owner approves' "$IH/CLAUDE.md" && grep -q '~/WORKING.md' "$IH/CLAUDE.md" && ! grep -q '<user>' "$IH/CLAUDE.md"; } && ok "~/CLAUDE.md seeded as a copy of the contract, <box>/<user> filled in, the rest left to the owner" || bad "~/CLAUDE.md not seeded as the box contract"
+miss=""; for g in USAGE COMMS RUNBOOK SLACK; do [ -f "$IH/$g.md" ] || miss="$miss $g"; done
+[ -z "$miss" ] && ok "the guides the contract points at exist at ~ (USAGE COMMS RUNBOOK SLACK)" || bad "guides missing:$miss"
+[ "$(readlink -f "$IH/WORKING.md")" = "$IR/docs/WORKING.md" ] && ok "~/WORKING.md links to the tree's docs/WORKING.md" || bad "~/WORKING.md not linked"
+[ -f "$IH/.claude/settings.json" ] && env HOME="$IH" CC_SETTINGS_FILE="$IH/.claude/settings.json" "$IR/bin/cc-settings" check >/dev/null 2>&1 && ok "default ~/.claude/settings.json installed and satisfies the managed subset" || bad "settings.json missing or drifted from claude-managed.json"
+# the second run is the deploy path (every landing re-runs install.sh): it must change nothing, and an existing
+# ~/CLAUDE.md — here the owner's own — is never rewritten
+echo "# mine" > "$IH/CLAUDE.md"
+snap(){ ( cd "$IH" && { find . -printf '%P %y %l\n' | sort; find . -type f -exec md5sum {} + | sort; } | md5sum ); }
+s1=$(snap); inst; s2=$(snap)
+[ "$s1" = "$s2" ] && ok "a second install.sh run changes nothing (idempotent — the deploy path)" || bad "the second install.sh run changed the HOME"
+[ "$(cat "$IH/CLAUDE.md")" = "# mine" ] && ok "an existing ~/CLAUDE.md is never rewritten" || bad "install.sh overwrote ~/CLAUDE.md"
+[ "$(grep -c 'autobox PATH' "$IH/.bashrc")" = 1 ] && ok "~/.bashrc gets the PATH block once" || bad "PATH block appended more than once"
 echo "== ask ledger (cc-scope) =="
 # The ledger has no fixtures to build: its selfcheck works in a temp dir of its own and removes it on the way out.
 sc=$("$B/cc-scope" selfcheck 2>&1)
