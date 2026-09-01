@@ -27,7 +27,12 @@ for f in "$R"/bin/*; do
   [ -f "$f" ] && [ -x "$f" ] || continue        # skip dirs (bin/__pycache__) and non-executables
   link "$f" ~/bin/"$(basename "$f")"
 done
-find ~/bin -maxdepth 1 -type l ! -xtype f -delete   # prune links whose target left the repo or is not a file (renamed/retired scripts, __pycache__)
+# prune the links THIS tree made whose target left it or is not a file (renamed/retired scripts, __pycache__).
+# Only those: a dangling link the owner or another tool put in ~/bin is not the installer's to delete (it used to).
+for l in ~/bin/*; do
+  [ -L "$l" ] && [ ! -f "$l" ] || continue
+  case "$(readlink "$l")" in "${O:-$R}"/*) rm -f "$l" ;; esac
+done
 if [ -n "$O" ]; then
   for f in "$O"/bin-private/*; do                # the overlay's own scripts, linked exactly like core's
     [ -f "$f" ] && [ -x "$f" ] || continue

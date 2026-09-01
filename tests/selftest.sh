@@ -1148,6 +1148,12 @@ tar -C "$B/.." --exclude=./ccbox/env --exclude=__pycache__ -cf - . | tar -C "$IR
 inst(){ ( cd "$IH" && env HOME="$IH" USER=tester CC_BOX=testbox GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$T/install.log" 2>&1; }
 inst && ok "install.sh runs clean on a blank HOME (--no-services)" || bad "install.sh failed on a blank HOME: $(tail -3 "$T/install.log" | tr '\n' ' ')"
 [ "$(readlink -f "$IH/bin/cc")" = "$IR/bin/cc" ] && [ "$(readlink -f "$IH/bin/cc-pulse")" = "$IR/bin/cc-pulse" ] && ok "bin/* linked into ~/bin from the installed tree" || bad "~/bin links missing or pointing elsewhere"
+# the prune is scoped to what this tree linked: a stale link of its own (target left the tree) goes, a dangling
+# link someone ELSE put in ~/bin stays — install.sh used to delete every dangling link in ~/bin, whoever made it
+ln -s "$IR/bin/retired-script" "$IH/bin/retired-script"; ln -s "$T/never-ours" "$IH/bin/foreign"
+inst
+[ ! -L "$IH/bin/retired-script" ] && [ -L "$IH/bin/foreign" ] && ok "prune removes only this tree's stale ~/bin links — a foreign dangling link is left alone" || bad "prune scope: retired link $([ -L "$IH/bin/retired-script" ] && echo kept || echo gone), foreign link $([ -L "$IH/bin/foreign" ] && echo kept || echo gone)"
+rm -f "$IH/bin/foreign"
 miss=""; for u in $("$IR/bin/cc-units" link); do [ -L "$IH/.config/systemd/user/$u" ] || miss="$miss $u"; done
 [ -z "$miss" ] && ok "every unit in the manifest is linked, cc-pulse.timer included (switching on is the services step)" || bad "units not linked:$miss"
 { [ -f "$IH/CLAUDE.md" ] && [ ! -L "$IH/CLAUDE.md" ] && grep -q '^# testbox — ' "$IH/CLAUDE.md" && grep -q 'Autonomy is the norm' "$IH/CLAUDE.md" && grep -q 'The owner approves' "$IH/CLAUDE.md" && grep -q '~/WORKING.md' "$IH/CLAUDE.md" && ! grep -q '<user>' "$IH/CLAUDE.md"; } && ok "~/CLAUDE.md seeded as a copy of the contract, <box>/<user> filled in, the rest left to the owner" || bad "~/CLAUDE.md not seeded as the box contract"
