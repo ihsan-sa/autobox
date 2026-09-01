@@ -1849,6 +1849,38 @@ def home_blocks(st):
     return [b for _, b in home_cut(home_parts(st), HOME_MAXBLK)]
 
 
+def home_text(parts):
+    """PURE: the tab as plain text, by band — what a reader sees, minus the buttons — so nothing has to re-render it."""
+    out = {}
+    for tag, b in parts:
+        if b.get("type") in ("header", "section"):
+            t = (b.get("text") or {}).get("text") or ""
+        elif b.get("type") == "context":
+            t = " ".join((e.get("text") or "") for e in (b.get("elements") or ()) if e.get("type") == "mrkdwn")
+        else:
+            continue
+        if t.strip():
+            out.setdefault(tag, []).append(t)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def home_dump(st):
+    """~/.cc/state/home.json = {at, text, state}: the tab exactly as published, as text by band, plus its inputs minus
+    the picture. cc-secretary judges the owner's view from THIS rather than re-implementing the tab. Written atomically,
+    and Home never breaks because the dump did. A daemon whose DIR is redirected (selfcheck, the simulator) writes it
+    under THAT dir: the first version wrote the live path and a fixture tab reached the secretary as the owner's view."""
+    try:
+        d = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "text": home_text(home_cut(home_parts(st), HOME_MAXBLK)),
+             "state": {k: v for k, v in st.items() if k != "chart"}}
+        path = f"{HOME}/.cc/state/home.json" if DIR == f"{HOME}/.cc/slack" else f"{DIR}/home.json"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(f"{path}.tmp", "w") as f:
+            json.dump(d, f, default=str)
+        os.replace(f"{path}.tmp", path)
+    except Exception as e:
+        log(f"app home: dump failed ({e!r})")
+
+
 _CACHE = {}
 
 
@@ -4431,6 +4463,7 @@ class Daemon:
             view = json.dumps({"type": "home", "blocks": home_blocks(st)})   # a local failure here is a bug, not a Slack refusal
         except Exception as e:
             log(f"app home: state/blocks failed ({e!r})"); return
+        home_dump(st)                                        # the same tab as text, for readers that must not re-render it
         try:
             api("views.publish", self.cfg["SLACK_BOT_TOKEN"], user_id=self.cfg["SLACK_OWNER_ID"], view=view)
         except Exception as e:
@@ -7782,6 +7815,10 @@ def cmd_selfcheck():
           and hb[8]["text"]["text"].count("⏳") == 10 and "more on the board" not in htxt
           and len(hb[11]["text"]["text"].split("\n")) == 7 and "quiet channel" not in htxt
           and "more channels" not in htxt)
+    ht = home_text(home_cut(home_parts(hfix), HOME_MAXBLK))
+    check("home_text: the same tab as text by band — the whole backlog and the needs-you band read back, no buttons",
+          ht["backlog"].count("⏳") == 10 and "NEEDS YOU" in ht["needs"] and ht["head"].startswith("abox")
+          and "actions" not in ht and "views" not in ht and "button" not in json.dumps(ht, ensure_ascii=False))
     check("home_track_state: the LADDER, and a live process WINS OVER THE BOARD — a board that disagrees is printed as "
           "`board stale`, never silently believed or silently ignored; an unknown status is `queued`, never a "
           "stateless \"?\"",
@@ -9251,6 +9288,9 @@ def cmd_selfcheck():
     Daemon.queue_land, Daemon.land_sweep = real_queue_land, real_land_sweep
     Daemon.publish_soon = real_publish_soon
     check("selfcheck: no check wrote the live ~/.cc/slack/flags.json", not os.path.exists(f"{DIR}/{FLAGS}.selfcheck"))
+    check("selfcheck: the Home dump of a fixture tab landed under the redirected DIR, never in the live ~/.cc/state "
+          "(a fixture tab reached cc-secretary as the owner's view once, 2026-09-01)",
+          os.path.exists(f"{DIR}/home.json") and json.load(open(f"{DIR}/home.json"))["state"].get("box") == "abox")
     denied = list(EFFECTS.denied)
     real_effects.install()
     subprocess.run(["rm", "-rf", scratch_dev])

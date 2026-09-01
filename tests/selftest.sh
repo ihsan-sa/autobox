@@ -1074,6 +1074,11 @@ echo "== cc-pulse (the drive loop: whole-machine enumeration, start, tick, and t
 pul=$("$B/cc-pulse" selfcheck 2>&1)
 grep -q '0 failed' <<<"$pul" && ok "cc-pulse selfcheck: ${pul##*: }" || bad "cc-pulse selfcheck: $pul"
 
+echo "== cc-secretary (the judgment layer: fixtures, a fake model, the whole escalation ladder, no network) =="
+# Its own HOME, stub tmux/ps/claude/cc-slack/cc-notify — it reads no pane and reaches no session on this box.
+secr=$("$B/cc-secretary" selfcheck 2>&1)
+grep -q '0 failed' <<<"$secr" && ok "cc-secretary selfcheck: ${secr##*: }" || bad "cc-secretary selfcheck: $secr"
+
 echo "== what the snapshot's four readers do with it (waiting vs the clock, and without it) =="
 # cc-reconcile's own selfcheck covers PRODUCING the snapshot; this covers the two things that only break in the
 # readers. Its own HOME, because ~/.cc/state/reconcile.json is a fixed path and this box's live one must not move.
