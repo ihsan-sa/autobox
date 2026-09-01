@@ -822,6 +822,15 @@ for _ in $(seq 1 10); do pgrep -f "$T/sleepclaude" >/dev/null && break; sleep 1;
 kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
 [ "$gone" = yes ] && ok "killing the loop kills its claude child (no orphan left in the worktree)" || { bad "orphaned claude survived the loop kill"; pkill -f "$T/sleepclaude"; }
+wait $lp 2>/dev/null
+# H4b: …and from a launcher that IGNORES HUP — a `setsid nohup cc-loop` typed out of a session shell, the shape of the
+# relaunch-orphans incident. exec keeps SIG_IGN and bash cannot trap a signal ignored at entry, so the loop's HUP trap was a
+# no-op and its claude lived on. cc-loop puts its signals back to default at launch, before that trap is set.
+( trap '' HUP; exec env CC_CLAUDE="$T/sleepclaude" "$B/cc-loop" $REPO w3 --max-iter 1 --quiet ) >/dev/null 2>&1 & lp=$!
+for _ in $(seq 1 10); do pgrep -f "$T/sleepclaude" >/dev/null && break; sleep 1; done
+kill -HUP $lp 2>/dev/null; gone=no
+for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
+[ "$gone" = yes ] && ok "…and from a launcher that ignores HUP (setsid nohup out of a session shell): the loop resets its signals at launch, so the kill still takes its claude" || { bad "HUP-ignoring launcher: the loop kept SIG_IGN and its claude survived (relaunch orphans)"; pkill -f "$T/sleepclaude"; kill -TERM $lp 2>/dev/null; }
 wait $lp 2>/dev/null; "$B/cc" rm $REPO w3 >/dev/null 2>&1
 echo "== the step limit carries on, and a runaway does not (cc-loop) =="
 # Every stub here is the same shape: it decides per iteration whether to COMMIT (a file in the worktree),
@@ -889,7 +898,20 @@ CC_CLAUDE="$T/hookclaude" "$B/cc-loop" $REPO w14 --max-iter 1 --quiet >/dev/null
   && ok "loop-side git (the checkpoint) runs the MAIN checkout's hooks, never the one the worker just wrote into its worktree" \
   || bad "host ran the worktree's hook: rc=$rc main=$([ -e "$st14/hook-main" ] && echo ran || echo no) wt=$([ -e "$st14/hook-wt" ] && echo RAN || echo no) last=$(git -C ~/.cc/worktrees/$REPO/w14 log -1 --format=%s)"
 git -C ~/dev/$REPO config --unset core.hooksPath; rm -f ~/dev/$REPO/hooks/pre-commit; rmdir ~/dev/$REPO/hooks
-for t in w8 w9 w10 w11 w12 w13 w14; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
+# 9: DONE is the worker's word; done is `cc done`'s (monthly audit 2026-09-01 F3). The push behind it died — a DNS blip at
+# 05:07Z, a refused lease — and the loop, piping `cc done` through tail -1, notified DONE with `PR: ` empty, exited 0, and
+# the board went green over work no PR carried. Here the remote refuses that one branch, the way a dead network would.
+mktrack w15 "finish, and lose the push"
+mkclaude doneclaude w15 'echo "work $n" > "done-$n.txt"; echo "- step $n" >> "$st/progress.md"; echo "STATUS: DONE" >> "$st/progress.md"'
+mkdir -p "$T/remote.git/hooks"; printf '#!/bin/sh\nwhile read o n r; do [ "$r" = refs/heads/track/w15 ] && { echo "the network went away" >&2; exit 1; }; done; exit 0\n' > "$T/remote.git/hooks/pre-receive"; chmod +x "$T/remote.git/hooks/pre-receive"
+nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
+CC_CLAUDE="$T/doneclaude" "$B/cc-loop" $REPO w15 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+rm -f "$T/remote.git/hooks/pre-receive"
+{ [ "$rc" = 4 ] && [ "$("$B/cc-board" get $REPO w15 status)" = blocked ] && "$B/cc-board" get $REPO w15 notes | grep -q 'loop exit 4: .*push failed' \
+  && ! tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 done" && tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 finished, but opened no PR"; } \
+  && ok "STATUS: DONE over a dead push is not done: cc done's failure reaches the loop — exit 4, board blocked with the reason, no DONE notice (audit F3)" \
+  || bad "a dead push finished green: rc=$rc status=$("$B/cc-board" get $REPO w15 status) notes=$("$B/cc-board" get $REPO w15 notes | tail -c 200)"
+for t in w8 w9 w10 w11 w12 w13 w14 w15; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
 echo "== usage limits (cc-limit + cc-loop) =="
 L(){ HOME="$T/lh" CC_LIMIT_STAMP="$T/lh/claude-limit" "$B/cc-limit" "$@"; }; mkdir -p "$T/lh"; lf="$T/lim.json"; miss=""   # own HOME: the table never touches the box's real stamp

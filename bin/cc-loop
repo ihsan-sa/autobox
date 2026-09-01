@@ -26,8 +26,8 @@
 # A run that came back with NOTHING is rerun as the same iteration — not an error, not an iteration. A run that
 # committed or journalled COUNTS like any other; only the model changes (F4, refusal_step). Off the end of the chain:
 # with nothing to show it stops (10); with work, the work stands and the loop carries on, on the same model.
-# Exit: 0 done | 3 waiting on the owner, board `waiting` (notified) | 5 errors | 6 step limit with nothing committed | 7 capped twice
-#       with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
+# Exit: 0 done | 3 waiting on the owner, board `waiting` (notified) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (notified)
+#     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
 # Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
@@ -35,6 +35,17 @@
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # headless workers: same PATH guarantee as cc (systemd-started clients lack ~/bin)
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
+# The loop's SIGNALS are its own, not the launcher's. A cc-loop started `setsid nohup` out of a session shell inherits SIGHUP
+# ignored; exec keeps that, and bash silently cannot trap a signal ignored at entry — so the HUP trap below did nothing and
+# killing the loop left claude alive in the worktree (the relaunch-orphans incident; the trap #134 found under selftest.sh).
+# Bash cannot undo it, so the script goes once through python, which puts HUP/INT/QUIT/TERM back to default — the way tmux
+# and systemd start things — and PIPE/XFSZ with them, which python itself ignores and would otherwise hand down.
+if [ -z "${CC_LOOP_SIGNALS:-}" ] && command -v python3 >/dev/null 2>&1; then
+  CC_LOOP_SIGNALS=1 exec python3 -c 'import os, signal, sys
+for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGPIPE, signal.SIGXFSZ): signal.signal(s, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' "$(readlink -f "$0")" "$@"
+fi
+unset CC_LOOP_SIGNALS   # our children start from the same defaults, and none of them needs to know how
 refusal_note(){   # $1 iteration · $2 the model that refused · $3 the one it moved to ("" = the chain ends here)
                   # $4 why · $5 kept|rerun|stopped → the journal's own line, for the next fresh context to read
   local to="${3:+only the model changed, to $3 per the cc-model chain}"; to="${to:-no model is left on the cc-model chain, so it carries on on the same one}"
@@ -178,7 +189,11 @@ while [ $i -lt "$MAXI" ]; do
   newprog=$(grep -vxFf "$SNAP" "$ST/progress.md" 2>/dev/null)   # only THIS iteration's lines count, even if the worker rewrote the file (a re-dispatched track must not "finish" on an old STATUS line)
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1
-    log "DONE"; env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1 | tail -1 | tee -a "$LOG" >&2
+    log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?   # captured, never `| tail -1`: the pipe dropped the status
+    printf '%s\n' "$dout" >> "$LOG"; dlast=$(printf '%s\n' "$dout" | grep -v '^[[:space:]]*$' | tail -1); printf '%s\n' "$dlast" >&2
+    # DONE is the worker's word; done is `cc done`'s. A push a DNS blip killed, a lease refused: the loop used to notify DONE with
+    # `PR: ` empty and exit 0, and the board went green over work no PR carried (monthly audit 2026-09-01 F3; 05:07Z janitor-containers).
+    [ "$drc" = 0 ] || stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed (rc $drc): ${dlast:-no output}. Fix the cause, then: cc done $repo $track"
     "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $("$BOARD" get "$repo" "$track" pr)"; exit 0; fi
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
     stop 3 "needs you" "$q  (answer: append it to $ST/task.md, drop the STATUS line from $ST/progress.md, then: cc $repo $track --go \"\")" waiting; fi
