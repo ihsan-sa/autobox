@@ -56,6 +56,9 @@ RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
 export CC_HANDOFF_DIR="$T/handoff"        # not ~/.cc/state/handoff: an overlap case writes REAL records, and they
+export CC_HANDOFF_KICK_WAIT=0          # every real --overlap leaves a detached --kick child: with a wait it polls tmux for
+export CC_HANDOFF_NO_KICK=1   # ...and no --kick child at all: a fixture successor never boots, and a kick that cannot land pages the owner
+                                          # 4 min and recreates $T/ctx/handoff.log after the trap; with none it gives up at once
                                           # outlived the run — `cc-handoff --status` was listing a week of _cctest
                                           # successors, and cc-guard walks that directory on every single call.
 MT(){ env -u TMUX TMUX_TMPDIR="$T" tmux "$@"; }   # the model section's scratch tmux server: own socket, under $T
@@ -429,12 +432,19 @@ st=$("$B/cc" handoff --status 2>&1); grep -q "no overlapping handoff is open" <<
 out=$(CC_HANDOFF_OVERLAP=0 "$B/cc" handoff --overlap "$REPO" 2>&1); rc=$?
 { [ $rc != 0 ] && grep -q "CC_HANDOFF_OVERLAP" <<<"$out"; } && ok "the overlap path is off until it is turned on (the old handoff is untouched)" || bad "overlap not gated by config: $out"
 # a real predecessor window; the successor's `claude` is /bin/true, so its pane falls through to the wrapper shell
+for t in hq hs hx hz; do mkdir -p ~/.cc/worktrees/$REPO/$t; done   # the successor's pane IS `cc __runnext` (exec: claude must be the pane's
+                                          # direct child for cc-msg), and that cds into the track's worktree or exits
 tmux new-window -d -t main -n "$REPO/hx" -c "$T" "bash -c 'sleep 300; :'"   # a real child: `pane_live` is what tells a session from a bare shell
 out=$(CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hx" --session sid-pre --in-flight "uncommitted work in hx" 2>&1)
 hid=$(jq -r .id "$T/handoff/$REPO--hx.json" 2>/dev/null)
 { [ -n "$hid" ] && [ "$(jq -r .live "$T/handoff/$REPO--hx.json")" = predecessor ]; } && ok "the record names the predecessor as live from the first instant" || bad "overlap record: $out"
 grep -q "uncommitted work in hx" "$T/handoff/$REPO--hx.brief" 2>/dev/null && ok "the successor's brief carries what is unfinished RIGHT NOW" || bad "successor brief has no in-flight checklist"
 tmux list-windows -t main -F '#W' | grep -qx "$REPO/hx~next" && ok "the successor came up ALONGSIDE — the predecessor was not stopped" || bad "no successor window"
+# THE SUCCESSOR MUST ACCEPT ITS OWN STARTUP DIALOG. Its window is "<target>~next"; `cc __runnext` knew only
+# the target, so it accepted in the PREDECESSOR's window and its own sat on the --dangerously-load-development-
+# channels confirmation until a human noticed (2026-09-01 02:10Z; the 2026-08-28 incident, again).
+tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>/dev/null | grep -q "CC_HANDOFF_WINDOW='$REPO/hx~next'" \
+  && ok "the successor is started knowing its OWN window, so it accepts its own dialog and does not park on it" || bad "no CC_HANDOFF_WINDOW on the successor: $(tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>&1)"
 CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hx" >/dev/null 2>&1 && bad "a second overlap was allowed for one target" || ok "an overlap is refused while one is open — one successor at a time"
 # the guard, from BOTH sides of the record. cwd is $T: no marker, so only the record can gate.
 h(){ printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s","session_id":"%s"}' "$1" "$T" "${3:-}" | env CC_HANDOFF="${2:-}" "$B/cc-guard" >/dev/null 2>&1; echo $?; }
@@ -466,6 +476,17 @@ w=$(tmux list-windows -t main -F '#{window_id} #W')
 [ ! -f "$T/handoff/$REPO--hz.json" ] && ok "...and the record is cleared, so nothing is gated by it any more" || bad "record survived the retirement"
 [ "$(h "cc r t --go x" "$hz")" = 0 ] && ok "TONIGHT'S CASE: a COMPLETED handoff does not brick the session that won it (it still dispatches, PRs and pushes)" || bad "the survivor of a completed handoff is gated"
 [ "$(h "cc r t --go x" "no-such-record")" = 2 ] && ok "...while a record missing for any OTHER reason gates exactly as before" || bad "an unbacked CC_HANDOFF was let through"
+# TONIGHT'S OTHER HALF, end to end: that survivor must also be able to hand ITSELF off. $CC_HANDOFF dies with
+# the successor's process, not with the handoff, so read as a bare flag it silenced cc-context and cc-handoff
+# for the rest of that session's life — the box could overlap a target exactly ONCE, and on 2026-09-01 the
+# planning session sat past the hand-off line all evening at 51.5% until a human started the handoff by hand.
+ev=$(CC_HANDOFF="$hz" CC_HANDOFF_OVERLAP=1 "$B/cc-handoff" --event "$REPO/hz" --level handoff --pct 51.5 --live 2>/dev/null)
+{ [ "$(jq -r .action <<<"$ev")" = overlap ] && [ -f "$T/handoff/$REPO--hz.json" ]; } \
+  && ok "TONIGHT'S CASE: past the hand-off line, the survivor of a RETIRED handoff opens one of its own — the overlap is not a one-shot" || bad "no overlap opened for the survivor: [$ev]"
+"$B/cc-handoff" --abandon "$REPO/hz" >/dev/null 2>&1
+ev=$(CC_HANDOFF="$hz-still-open" CC_HANDOFF_OVERLAP=1 "$B/cc-handoff" --event "$REPO/hz" --level handoff --pct 51.5 --live 2>/dev/null)
+{ [ "$(jq -r .action <<<"$ev")" = "" ] && [ ! -f "$T/handoff/$REPO--hz.json" ]; } \
+  && ok "...while a handoff still OPEN keeps its successor out of it — the rule only relaxes once <id>.done is there" || bad "an open handoff did not hold: [$ev]"
 for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hz" '$2==r || $2==r"~next"{print $1}'); do tmux kill-window -t "$id"; done
 
 # THE SWEEP, on real windows. Every phase above is driven by a session's own Stop hook — which is exactly what

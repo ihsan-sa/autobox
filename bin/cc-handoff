@@ -11,6 +11,7 @@ nothing to defer on — which is what dissolves the "handoff PENDING, deferred a
   cc-handoff --event <target> [--level L] [--pct N] [--session ID] [--in-flight "…"] [--live] [--taken]
                                     a context line was crossed (cc-context): decide and take the phase, print it
   cc-handoff --sweep                records no session is left to finish (run from the cc-reconcile timer)
+  cc-handoff --kick <target> [<id>]         internal: brief the successor once it is up, and check it landed
   cc-handoff --retire <target>                            internal: END the predecessor, rename, clear
   cc-handoff --status [<target>] [--json]                 what phase, who is live, how long left
   cc-handoff selfcheck
@@ -46,8 +47,10 @@ the TUI — so waiting for its pane to disappear waits for an event only a watch
 therefore gives it CC_HANDOFF_RETIRE_GRACE (120 s: a turn in flight, and the journal flushed) and then KILLS
 its window. The grace expires into a kill, never into "it keeps its window".
 
-Env: CC_HANDOFF (the successor's own record id, exported into its process by `cc __runnext`) ·
-CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DONE_TTL (~/.cc/config) ·
+Env: CC_HANDOFF (the successor's own record id, exported into its process by `cc __runnext`; it OUTLIVES the
+handoff, so `<id>.done` and not the variable is what says one is still open — mid_handoff) · CC_HANDOFF_WINDOW
+(the successor's own tmux window, so it accepts its own startup dialog) ·
+CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT (~/.cc/config) ·
 CC_HANDOFF_DIR, CC_CTX_RECORDS (test hooks: put the record and the ledger somewhere else).
 """
 import json, os, re, shlex, subprocess, sys, time, uuid
@@ -186,6 +189,24 @@ def mark_done(rec):
     return True
 
 
+def mid_handoff():
+    """Is this session the second half of a handoff that is STILL GOING ON? `cc __runnext` exports $CC_HANDOFF
+    into a successor and it lives as long as that PROCESS — by design, so the model cannot unset it. So the
+    variable answers "was this session BORN a successor", which is not the question anything here asks: once
+    the handoff RETIRES, the successor is the only session left and must be able to hand ITSELF off in turn.
+    Read as a bare flag it does the opposite — 2026-09-01: the planning session won an overlap at 03:06Z, ran
+    all evening past the hand-off line to 51.5%, and no event ever fired, because it still carried
+    CC_HANDOFF=bbbae9cd948f whose <id>.done had been on disk since 03:56Z. The overlap was a thing the box
+    could do exactly ONCE per target, and the box's own handoff had to be started by hand.
+    <id>.done is the same evidence cc-guard already un-gates on (cc-guard:84 — a record that is gone because
+    everything went RIGHT vs one lost because something went WRONG); three files now read $CC_HANDOFF the same
+    way. An id we cannot account for still holds: every failure here falls towards not policing your own."""
+    hid = os.environ.get("CC_HANDOFF") or ""
+    if not hid:
+        return False
+    return not (ID_RE.match(hid) and os.path.exists(os.path.join(HANDOFF, hid + ".done")))
+
+
 def live_side(rec):
     return "successor" if rec.get("live") == "successor" else "predecessor"
 
@@ -266,13 +287,22 @@ def self_wid():
     return (tmux("display-message", "-p", "-t", pane, "#{window_id}") or "").strip()
 
 
+def handoff_log():
+    """Where a DETACHED child's one line goes. Resolved at CALL time, from $CC_CTX_RECORDS then $HOME — the
+    two things a test redirects. It followed neither (it rebuilt the path from `~` at the moment of the call,
+    and RECORDS was fixed at import), so a selftest's own `--retire` wrote _cctest lines into the box's REAL
+    ~/.cc/state/context/handoff.log — 2026-09-01, found in it."""
+    return os.path.join(os.environ.get("CC_CTX_RECORDS")
+                        or os.path.join(os.path.expanduser("~"), ".cc", "state", "context"), "handoff.log")
+
+
 def run(argv, wait=True):
     try:
         if wait:
             return subprocess.run(argv, capture_output=True, text=True, timeout=60).returncode == 0
-        logd = os.path.join(os.path.expanduser("~"), ".cc", "state", "context")
-        os.makedirs(logd, exist_ok=True)           # a detached fallback that REFUSES must leave its one line somewhere
-        out = open(os.path.join(logd, "handoff.log"), "a")
+        log = handoff_log()
+        os.makedirs(os.path.dirname(log), exist_ok=True)   # a detached fallback that REFUSES must leave its one line somewhere
+        out = open(log, "a")
         subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
         return True
     except Exception:
@@ -285,16 +315,17 @@ def notify(title, msg):
 
 def alert(msg):
     """#alerts (owner, 2026-09-01): every handover leaves one line there. Best-effort like notify —
-    a handover must never fail on Slack being down. Under a harness (CC_NOTIFY_LOG_ONLY, the same
-    switch every suite already sets) it goes to the log file instead: three _cctest handovers hit
-    the REAL #alerts from inside a gate run the first night this shipped."""
-    if os.environ.get("CC_NOTIFY_LOG_ONLY"):
+    a handover must never fail on Slack being down. Test state never pages: cc-notify's rule, which the
+    Slack layer's post command does not apply — a synthetic _cctest/_selfcheck name, or CC_NOTIFY_LOG_ONLY
+    (every suite sets it), goes to the log file instead of #alerts: three _cctest handovers hit the REAL
+    #alerts from inside a gate run the first night this shipped."""
+    if os.environ.get("CC_NOTIFY_LOG_ONLY") or re.search(r"(^|[^A-Za-z0-9])_(cctest|selfcheck)", msg):
         try:
             with open(os.environ.get("CC_NOTIFY_LOG") or os.path.expanduser("~/.cc/state/notify.log"), "a") as fh:
                 fh.write(f"alerts\t{msg}\n")
         except OSError:
             pass
-        return
+        return logd("not posted (test state): " + msg)
     run([os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts", msg])
 
 
@@ -310,6 +341,138 @@ out of band from the channel) and ask what the journal does not answer; subscrib
 is also how you hear if it exits. {flight} When you have the context and NOT BEFORE, run `cc-handoff --ready` — \
 that single call is the commit point: it makes you live and retires your predecessor. If you cannot get there, \
 say so in the journal; the overlap expires on its own and your predecessor simply carries on."""
+
+
+def journal_for(target):
+    repo, _, track = target.partition("/")
+    return f"~/.cc/state/{repo}/{track}/progress.md" if track else f"~/.cc/state/{repo}/planning-handoff.md"
+
+
+def logd(msg):
+    """One line where a DETACHED child's output already goes — the only trace a process with no terminal leaves."""
+    try:
+        log = handoff_log()
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a") as f:
+            f.write("%s cc-handoff: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg))
+    except Exception:
+        pass
+
+
+PROMPT_LINE = re.compile(r"^[^\w>]*>(.*)$")   # Claude Code's `>` — a taken turn in the transcript, or the input box
+IDLE_HINT = "? for shortcuts"                    # under the input box while the session waits for a turn
+WORKING = "esc to interrupt"                     # the footer for the whole of a turn (cc-slack's WORKING_FOOTER)
+
+
+def screen(wid, history=0):
+    """What the pane shows now — and, with `history`, that many lines above it too. Dialogs are judged on the
+    visible screen only: a dialog pressed through hours ago is still in the scrollback."""
+    return tmux("capture-pane", "-p", *(("-S", str(-history)) if history else ()), "-t", wid) or ""
+
+
+def dialog_open(wid):
+    """Is a startup confirmation up in that pane — Claude Code's development-channels warning, or the MCP trust
+    prompt? Keys typed while one is up go INTO IT, not into the session behind it."""
+    return any(s in screen(wid) for s in ("Enter to confirm", "development channels", "local development",
+                                          "Use this MCP server"))
+
+
+def prompt_rendered(wid):
+    """Has the session drawn its input box? The pane is live the instant the shell forks cc, long before Claude
+    Code draws anything — liveness says nothing about whether keys will reach a session."""
+    pane = screen(wid)
+    return IDLE_HINT in pane or any(PROMPT_LINE.match(l) for l in pane.splitlines())
+
+
+def box_holds(pane, text):
+    """Is the text still SITTING in the input box — typed, Enter not taken? The box is the bottom-most `>` line
+    on screen (a taken turn's echo sits above it); an idle box is empty or shows a placeholder, never the text."""
+    last = None
+    for l in pane.splitlines():
+        m = PROMPT_LINE.match(l)
+        if m:
+            last = m.group(1)
+    return last is not None and "".join(text.split())[:12] in "".join(last.split())
+
+
+def landed(wid, text):
+    """Did the prompt reach the SESSION as a turn — not the dialog on top of it, and not the input box alone?
+    Read the pane back (scrollback too: a quick first reply pushes the echo up) and compare with ALL whitespace
+    removed, because the TUI wraps a typed line at the pane width. An echo proves the keys arrived; the turn is
+    proven by the working footer, or by the text having LEFT the input box (the 03:32Z successor sat with the
+    brief typed and untaken at an empty prompt)."""
+    pane = screen(wid, history=120)
+    if "".join(text.split())[:48] not in "".join(pane.split()):
+        return False
+    return WORKING in pane or not box_holds(pane, text)
+
+
+KICK = ("cc-handoff{hid}: you are the SUCCESSOR for {target} — your handoff brief is in your system prompt. "
+        "Start now: read {journal}, ask the predecessor what the journal left out, and run `cc-handoff --ready` "
+        "only once you have the context.")
+
+
+def kick(target, hid=""):
+    """--kick, detached by start(): put the opening prompt IN FRONT OF the successor, and CHECK IT LANDED.
+    The brief rides in --append-system-prompt, which no session ever acts on by itself — with no first user
+    turn a successor just sits there. On 2026-09-01 one sat blank for 25 minutes: the startup dialog ate the
+    prompt typed at it, the window looked perfectly healthy, and nothing ever read the pane back. Liveness is
+    no signal (the pane is live before anything is drawn), so type only once the dialog has shown AND cleared,
+    or a prompt is on screen — pressing the dialog through from here too, because this path must not depend
+    on the Slack layer being set up — then read the pane back, and keep sending until it is SEEN to land or
+    the wait runs out; then tell the owner rather than leave a silent session sitting beside a live one."""
+    win = target + NEXT
+    wait = cfg("CC_HANDOFF_KICK_WAIT", 240)
+    pause = 2 if wait else 0                       # a fixture sets the wait to 0 and gets no naps with it
+    deadline = time.time() + wait
+    text = KICK.format(hid=(" " + hid) if hid else "", target=target, journal=journal_for(target))
+    seen = asked = False                           # seen: a dialog was on screen; asked: cc-slack is pressing it
+    tries = 0
+    while True:
+        if not read(target):
+            return 0                               # abandoned while we waited: nothing to brief
+        wid = win_id(win)
+        up = bool(wid) and pane_live(win)
+        if up and dialog_open(wid):
+            seen = True
+            if not asked:
+                run([os.path.join(BIN, "cc-slack"), "accept-dialog", win], wait=False)
+                asked = True                       # cc-slack watches that window for 3 min of its own accord
+        elif up and (seen or tries or prompt_rendered(wid) or time.time() >= deadline):
+            tries += 1                             # at the deadline with nothing recognisable drawn: one try, judged like any other
+            run([os.path.join(BIN, "cc-msg"), win, text])      # refuses by itself while a dialog is up
+            for _ in range(5):                     # the TUI takes a moment to echo a turn
+                time.sleep(pause)
+                if landed(wid, text):
+                    logd(f"{target}: the successor's opening prompt landed (try {tries})")
+                    return 0
+        if time.time() >= deadline:
+            return kick_lost(target, f"its opening prompt did not land in {tries} tries" if tries
+                             else "it never got past its startup dialog" if seen else "it never drew a prompt")
+        time.sleep(pause)
+
+
+def kick_lost(target, why):
+    """A successor that never got its prompt is a session sitting silent beside a live one. Only the owner can
+    unstick it, so it goes to #alerts and into the target's journal — the two places the next reader looks —
+    and the record runs to its own deadline either way, so nothing is left half-owned."""
+    line = (f"{target}: the successor came up but {why} — it is sitting blank in main:{target}{NEXT}; "
+            f"brief it by hand (`cc-msg {target}{NEXT} …`) or `cc-handoff --abandon {target}`")
+    logd("NO opening prompt — " + line)
+    alert("⚠️ " + line)
+    journal(target, line)
+    return 1
+
+
+def journal(target, line):
+    """One dated line in the target's own journal — the file every successor reads first."""
+    try:
+        p = os.path.expanduser(journal_for(target))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a") as f:
+            f.write("\n## %s — cc-handoff\n%s\n" % (time.strftime("%Y-%m-%d %H:%MZ", time.gmtime()), line))
+    except Exception:
+        pass
 
 
 def start(target, pct=None, session_id="", flight=""):
@@ -340,24 +503,34 @@ def start(target, pct=None, session_id="", flight=""):
            "pct_at_start": pct, "told_owner": None, "phases": []}
     ledger(rec, "overlap-started")
     write(rec)          # before the window, never after: a successor whose record is missing must find itself gated
-    repo, _, track = target.partition("/")
-    journal = (f"~/.cc/state/{repo}/{track}/progress.md" if track else f"~/.cc/state/{repo}/planning-handoff.md")
     with open(brief_path(target), "w") as f:
-        f.write(BRIEF.format(target=target, journal=journal, tmux=wid,
+        f.write(BRIEF.format(target=target, journal=journal_for(target), tmux=wid,
                              flight=(f"Unfinished RIGHT NOW, which a journal always omits: {flight} — ask about it."
                                      if flight else "")))
-    cmd = ""
+    # The successor's OWN window name, carried into it: `cc __runnext` knows the target but not this suffix, so
+    # it was accepting the startup dialog in the PREDECESSOR's window and its own sat on the development-channels
+    # confirmation until a human noticed (2026-09-01 02:10Z, the third time this shape of bug has parked a session).
+    cmd = "CC_HANDOFF_WINDOW=%s " % shlex.quote(target + NEXT)
     for v in ("CC_CLAUDE", "CC_NOTIFY_LOG_ONLY", "CC_NOTIFY_LOG", "CC_HANDOFF_DIR", "CC_CTX_RECORDS"):
         if os.environ.get(v):                     # the new window has the tmux server's env, not ours
             cmd += "%s=%s " % (v, shlex.quote(os.environ[v]))
-    cmd += "%s __runnext %s %s %s; echo; echo '[successor exited — shell stays]'; exec bash" % (
-        shlex.quote(os.path.join(BIN, "cc")), shlex.quote(target), hid, sid)
+    # `exec`: the pane's shell BECOMES cc, so claude is the pane's direct child — the one place cc-msg's
+    # `pgrep -P` looks (forked, claude was a grandchild and every automatic kick was refused). __runnext's own
+    # tail already ends in `exec bash`, so nothing is lost.
+    cmd += "exec %s __runnext %s %s %s" % (shlex.quote(os.path.join(BIN, "cc")), shlex.quote(target), hid, sid)
     if tmux("new-window", "-d", "-t", SESSION, "-n", target + NEXT, cmd) is None:
         clear(target)                             # nothing came up: leave no record claiming there is a successor
         print(f"cc-handoff: could not start main:{target}{NEXT} — no overlap opened", file=sys.stderr)
         return 1
     rec["successor"]["tmux"] = win_id(target + NEXT) or ""
     write(rec)
+    # Detached, because the successor takes a minute to boot and this call is on a Stop hook: it waits out the
+    # startup dialog, sends the opening prompt and verifies the pane took it. Without it the successor has a
+    # brief and no first turn — a window that looks right and a session doing nothing.
+    if os.environ.get("CC_HANDOFF_NO_KICK"):   # a suite's fixture window never boots a claude: a kick there can only
+        logd(f"kick skipped for {target} (CC_HANDOFF_NO_KICK)")   # end in kick_lost, which pages — and tests must not
+    else:
+        run([os.path.realpath(__file__), "--kick", target, hid], wait=False)
     print(f"cc-handoff: {target} — successor started in main:{target}{NEXT} (id {hid}); "
           f"it is muted and gated until it runs `cc-handoff --ready`")
     return 0
@@ -591,9 +764,9 @@ def event(target, level="", pct=None, session="", busy="", live=False, taken=Fal
       "replace"  the old stop-then-restart path is running, detached
     `taken` = that session has already taken a phase, or a Stop hook is holding it: nothing NEW starts, but the
     level still decides the watchdog below, which is why cc-context sends it either way.
-    Never from the SUCCESSOR: $CC_HANDOFF is in its environment and nowhere else, and a session must not police,
-    abandon or restart the handoff it is itself the second half of."""
-    if os.environ.get("CC_HANDOFF"):
+    Never from the SUCCESSOR of an OPEN handoff: a session must not police, abandon or restart the handoff it
+    is itself the second half of — but only while that handoff is still open (mid_handoff)."""
+    if mid_handoff():
         return ""
     if read(target):
         due(target, level == "ceiling")     # an overlap is open: its deadline, every turn, from the predecessor
@@ -692,9 +865,11 @@ def status(target=None, as_json=False):
 # ---- selfcheck -----------------------------------------------------------------------------------------
 
 def selfcheck():
+    os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the harness switch reroutes alert(); these cases assert the REAL path via the stubbed run()
     import tempfile
-    global HANDOFF, RECORDS, win_id, pane_live, tmux, run, notify, self_wid
+    global HANDOFF, RECORDS, win_id, pane_live, tmux, run, notify, alert, self_wid
+    real_alert = alert
     p = f = 0
 
     def ok(what, cond):
@@ -710,7 +885,7 @@ def selfcheck():
         HANDOFF = os.path.join(d, "handoff")
         RECORDS = os.path.join(d, "context")
         # nothing real is started, killed or pushed from a selfcheck: tmux and the shell-outs are stubbed
-        wins, msgs, dead, me = {"r1": "@1"}, [], set(), [""]
+        wins, msgs, dead, me, tcalls, panes = {"r1": "@1"}, [], set(), [""], [], {}
 
         def win_id(n):
             return wins.get(n)
@@ -722,8 +897,11 @@ def selfcheck():
             return me[0]                            # the window --retire is pretending to run in
 
         def tmux(*a, **k):
+            tcalls.append(a)
             if a[0] == "list-windows":
                 return "\n".join(wins.values())
+            if a[0] == "capture-pane":
+                return shown(a[-1])
             if a[0] == "new-window":
                 wins[a[a.index("-n") + 1]] = "@%d" % (len(wins) + 1)
             elif a[0] == "kill-window":
@@ -736,12 +914,36 @@ def selfcheck():
                         wins[a[-1]] = wins.pop(n)
             return ""
 
+        # the fake TUI: a pane is a string, or a callable drawing the screen of the moment. `tui` is its
+        # keyboard log — when accept-dialog was asked per window, and what was typed where, and when.
+        BOX = '╭──────────────────────╮\n│ > Try "fix the bug"   │\n╰──────────────────────╯'
+        IDLE = BOX + "\n  " + IDLE_HINT
+        DIALOG = ("WARNING: Loading development channels can be unsafe.\n ❯ 1. I am using this for local "
+                  "development\n   2. Exit\n Enter to confirm · Esc to cancel")
+        tui = {"asked": {}, "typed": []}
+
+        def shown(wid):
+            v = panes.get(wid, "")
+            return v() if callable(v) else v
+
         def run(argv, wait=True):
             msgs.append(list(argv))
+            if argv[0].endswith("cc-slack") and argv[1:2] == ["accept-dialog"]:
+                tui["asked"][argv[2]] = time.time()
+            if argv[0].endswith("cc-msg"):        # the keyboard: keys reach whatever is in FRONT of the pane —
+                wid = wins.get(argv[1])           # a dialog if one is up (cc-msg refuses), else the session
+                if wid is None or any(x in shown(wid) for x in ("Enter to confirm", "development channels")):
+                    return False
+                tui["typed"].append((wid, argv[2], time.time()))
+                if not callable(panes.get(wid)):  # a static screen: draw the taken turn the way the TUI does
+                    panes[wid] = shown(wid) + "\n> " + argv[2] + "\n\n✻ Thinking… (" + WORKING + ")\n" + BOX
             return True
 
         def notify(t, m):
             msgs.append(["notify", t, m])
+
+        def alert(m):                              # the real one is gated on the caller's env; its shape is kept
+            msgs.append([os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts", m])
 
         ok("a target with a track slugs to one flat file",
            os.path.basename(path("r1/t1")) == "r1--t1.json" and os.path.basename(path("r1")) == "r1.json")
@@ -756,6 +958,124 @@ def selfcheck():
         ok("the record names the predecessor as live", rec and rec["live"] == "predecessor")
         ok("the deadline is bounded", rec["deadline"] - rec["started"] == DEFAULT_MAX)
         ok("a second overlap for the same target is refused", start("r1") == 1)
+        nw = [a for a in tcalls if a[0] == "new-window"][-1]
+        ok("the successor is told ITS OWN window name, so it accepts the startup dialog in its own pane and "
+           "not in its predecessor's — one parked on that confirmation until a human noticed (2026-09-01)",
+           "CC_HANDOFF_WINDOW='r1~next' " in nw[-1] and nw[nw.index("-n") + 1] == "r1~next")
+        # Hermetic on purpose: the CALLER's $HOME and $CC_CTX_RECORDS are exactly what this case is about, so
+        # neither may decide it — selftest.sh sets the latter, and the case passed alone and failed in the run.
+        env0 = {k: os.environ.get(k) for k in ("HOME", "CC_CTX_RECORDS")}
+        os.environ.pop("CC_CTX_RECORDS", None)
+        os.environ["HOME"] = os.path.join(d, "fakehome")
+        got = [handoff_log()]
+        os.environ["CC_CTX_RECORDS"] = RECORDS
+        got.append(handoff_log())
+        ok("a detached child's log follows $HOME, and $CC_CTX_RECORDS ahead of it — a fixture leaves no line "
+           "in the box's real handoff.log",
+           got == [os.path.join(d, "fakehome", ".cc", "state", "context", "handoff.log"),
+                   os.path.join(RECORDS, "handoff.log")])
+        for k, v in env0.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+        # ---- the successor must be BRIEFED, and the brief SEEN to land. The brief itself rides in the system
+        # prompt, which nothing acts on by itself; on 2026-09-01 a successor sat blank for 25 min because the
+        # startup dialog ate the prompt typed at it and nobody read the pane back.
+        env1 = {k: os.environ.get(k) for k in ("CC_HANDOFF_KICK_WAIT", "CC_CTX_RECORDS", "HOME", "CC_NOTIFY_LOG_ONLY",
+                                               "CC_HANDOFF_NO_KICK")}
+        os.environ["CC_HANDOFF_KICK_WAIT"] = "0"        # no naps, and no waiting on a window that will not come
+        os.environ.pop("CC_HANDOFF_NO_KICK", None)      # the suite sets it for ITS fixtures; these cases are about the kick
+        os.environ["CC_CTX_RECORDS"] = RECORDS          # ...and the detached child's log line stays in here
+        os.environ["HOME"] = os.path.join(d, "fakehome")   # ...as does the journal line kick_lost() leaves
+        ok("start() leaves a detached child to brief the successor",
+           any(isinstance(a, list) and a[-3:-1] == ["--kick", "r1"] for a in msgs))
+        ok("...and the successor's pane shell EXECS cc, so claude is the pane's direct child — where cc-msg looks "
+           "(forked, it was a grandchild and every automatic kick was refused)",
+           re.search(r" exec \S*cc __runnext ", nw[-1]) and not nw[-1].endswith("exec bash"))
+        nid = wins["r1~next"]
+        panes[nid] = IDLE
+        ok("a successor at its prompt gets its opening prompt — a brief in the system prompt starts no turn",
+           kick("r1", "abc") == 0)
+        last = [a for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg")][-1]
+        ok("...typed into r1~next, ITS window, naming what it is the successor of",
+           last[1] == "r1~next" and "SUCCESSOR for r1" in last[2])
+        t = last[2]
+        ok("...and landing is checked by reading the pane BACK", landed(nid, t))
+        wrap = "\n".join(t[i:i + 17] for i in range(0, len(t), 17))   # the TUI wraps at the pane width
+        panes[nid] = "> " + wrap + "\n\n⏺ Read(progress.md)\n" + IDLE
+        ok("...a wrapped echo above the successor's first tool line counts as landed", landed(nid, t))
+        panes[nid] = "│ > " + t[:40] + "\n│   " + t[40:80] + "\n  " + IDLE_HINT
+        ok("...but the text still SITTING in the input box does not — Enter was not taken (03:32Z's successor)",
+           not landed(nid, t))
+        panes[nid] = "Welcome to Claude Code\n" + IDLE
+        ok("...and a pane that never took it does not pass as landed", not landed(nid, t))
+        ok("the child's one log line stays inside the fixture — no test writes real state",
+           os.path.exists(os.path.join(RECORDS, "handoff.log")))
+
+        posts = lambda: sum(1 for a in msgs if isinstance(a, list) and a[1:4] == ["post", "-c", "#alerts"])
+        typed = lambda: sum(1 for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg"))
+        told0, typed0 = posts(), typed()
+        panes[nid] = "Do you trust the files in this folder?\n  Enter to confirm · Esc to cancel"
+        ok("a prompt is never typed at an open dialog — that is the dialog eating it, again",
+           kick("r1", "abc") == 1 and typed() == typed0)
+        ok("...cc-slack is asked to press through THAT window first",
+           any(isinstance(a, list) and a[:3] == [os.path.join(BIN, "cc-slack"), "accept-dialog", "r1~next"]
+               for a in msgs))
+        ok("...and a successor left blank goes to #alerts, not left silent beside a live session",
+           posts() == told0 + 1)
+        jp = os.path.join(d, "fakehome", ".cc", "state", "r1", "planning-handoff.md")
+        ok("...and into the target's journal, where the next session reads first",
+           os.path.exists(jp) and "sitting blank in main:r1~next" in open(jp).read())
+        panes[nid] = lambda: ""                          # live, and never draws a thing
+        told0, typed0 = posts(), typed()
+        ok("a pane that never drew a prompt is NOT a dialog: one try at the deadline, judged by the pane — "
+           "which took nothing, so the owner hears", kick("r1", "abc") == 1 and typed() == typed0 + 1 and posts() == told0 + 1)
+
+        # THE LATE DIALOG, on the real loop with a fake clock: the pane is live from the first instant (the
+        # shell forked cc), Claude Code draws the dialog seconds later, and it clears only once pressed.
+        real_t, real_s = time.time, time.sleep
+        clk = [real_t()]
+        time.time = lambda: clk[0]
+        time.sleep = lambda n: clk.__setitem__(0, clk[0] + (n or 1))
+        os.environ["CC_HANDOFF_KICK_WAIT"] = "60"
+        tui["asked"].pop("r1~next", None)                # the earlier dialog's press is not this one's
+        t0 = clk[0]
+
+        def late():
+            if clk[0] - t0 < 4:
+                return ""                                        # booting: live, nothing drawn yet
+            asked = tui["asked"].get("r1~next")
+            if asked is None or clk[0] < asked + 3:
+                return DIALOG                                    # up until cc-slack presses it through
+            turns = [x for x in tui["typed"] if x[0] == nid and x[2] >= asked + 3]
+            return IDLE if not turns else "> " + turns[-1][1] + "\n\n✻ Thinking… (" + WORKING + ")\n" + BOX
+
+        panes[nid] = late
+        n0, typed0 = len(tui["typed"]), typed()
+        acc0 = sum(1 for a in msgs if isinstance(a, list) and a[1:3] == ["accept-dialog", "r1~next"])
+        rc = kick("r1", "abc")
+        sent = tui["typed"][n0:]
+        ok("a dialog that draws LATE is waited out: the prompt is typed once, after it has shown AND cleared",
+           rc == 0 and len(sent) == 1 and typed() == typed0 + 1
+           and sent[0][2] >= tui["asked"]["r1~next"] + 3 and clk[0] - t0 < 60)
+        ok("...and cc-slack was asked to press it through, once",
+           sum(1 for a in msgs if isinstance(a, list) and a[1:3] == ["accept-dialog", "r1~next"]) == acc0 + 1)
+        tui["asked"].pop("r1~next"); t0 = clk[0]
+        panes[nid] = lambda: "" if clk[0] - t0 < 4 else DIALOG   # a dialog nobody's Enter ever clears
+        n0, told0 = len(tui["typed"]), posts()
+        ok("...a dialog that never clears is never typed at, and the owner hears within the wait",
+           kick("r1", "abc") == 1 and len(tui["typed"]) == n0 and posts() == told0 + 1 and clk[0] - t0 <= 62)
+        time.time, time.sleep = real_t, real_s
+
+        # the real alert() and its gate: test state stops at the log (the Slack layer applies no such rule)
+        os.environ.pop("CC_NOTIFY_LOG_ONLY", None)
+        n0 = posts(); real_alert("🔁 _cctest99/hx: handover"); real_alert("🔁 _selfcheck/hx: handover")
+        ok("alert() never posts a synthetic _cctest/_selfcheck name to the box's #alerts", posts() == n0)
+        os.environ["CC_NOTIFY_LOG_ONLY"] = "1"; real_alert("🔁 realrepo: handover")
+        ok("...nor anything with CC_NOTIFY_LOG_ONLY set, which every suite sets", posts() == n0)
+        os.environ.pop("CC_NOTIFY_LOG_ONLY", None); real_alert("🔁 realrepo: handover")
+        ok("...while a real handover's line goes through", posts() == n0 + 1)
+        for k, v in env1.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
         os.environ["CC_HANDOFF"] = "wrong-id"
         ok("--ready from a session whose CC_HANDOFF does not match is refused", ready("r1") == 1)
@@ -788,10 +1108,11 @@ def selfcheck():
         r = read("r1")
         r["deadline"] = time.time() - 1
         write(r)
+        told1 = sum(1 for m in msgs if m and m[0] == "notify")     # a count, not a total: the cases above tell the owner too
         ok("--due past the deadline below the ceiling abandons", due("r1") == 0 and read("r1") is None)
-        ok("the owner heard it once", sum(1 for m in msgs if m and m[0] == "notify") == 1)
+        ok("the owner heard it once", sum(1 for m in msgs if m and m[0] == "notify") == told1 + 1)
         ok("--due on a cleared record is a no-op (never twice)", due("r1") == 0
-           and sum(1 for m in msgs if m and m[0] == "notify") == 1)
+           and sum(1 for m in msgs if m and m[0] == "notify") == told1 + 1)
 
         # at the ceiling with no successor: fall back INTO today's stop-then-restart path
         wins["r1/t1"] = "@2"
@@ -896,7 +1217,20 @@ def selfcheck():
         os.environ["CC_HANDOFF"] = "somebody-elses-handoff"
         ok("the SUCCESSOR never drives the handoff it is the second half of",
            event("e1/t", "ceiling", live=True) == "" and read("e1/t") is None)
+        # …while it is OPEN. $CC_HANDOFF outlives the handoff (it dies with the successor's PROCESS), so read
+        # as a bare flag it made the overlap a one-shot per target and the box's own handoff had to be started
+        # by hand — 2026-09-01. <id>.done, the marker retirement leaves, is the whole difference.
+        os.environ["CC_HANDOFF_OVERLAP"] = "1"
+        open(os.path.join(HANDOFF, "somebody-elses-handoff.done"), "w").write("{}")
+        ok("once its own handoff has RETIRED, the successor hands off in ITS turn",
+           event("e1/t", "handoff", live=True) == "overlap" and read("e1/t") is not None)
+        clear("e1/t")
+        wins.pop("e1/t~next", None)
+        os.environ["CC_HANDOFF"] = "../../../etc/passwd"
+        ok("a $CC_HANDOFF that is not a record id holds like an open one — no path is built from it either",
+           mid_handoff() and event("e1/t", "handoff", live=True) == "" and read("e1/t") is None)
         os.environ.pop("CC_HANDOFF", None)
+        os.environ["CC_HANDOFF_OVERLAP"] = "0"
 
         # ---- --sweep: what no session is left to finish. It only ever UN-GATES, so a wrong "gone" is the
         # expensive direction and every case below is about not taking one.
@@ -1010,6 +1344,8 @@ def main(argv):
         except (TypeError, ValueError):
             pct = None
         return start(target, pct, opt.get("session", ""), opt.get("in_flight", ""))
+    if cmd == "--kick":                            # internal: the detached child start() leaves behind
+        return kick(target, pos[1] if len(pos) > 1 else "") if target else 1
     if cmd == "--ready":
         return ready(target, bool(opt.get("forced")))
     if cmd == "--replace":

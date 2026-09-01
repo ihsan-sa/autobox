@@ -433,6 +433,21 @@ def overlap_open(target):
     return os.path.exists(os.path.join(HANDOFF, target.replace("/", "--") + ".json"))
 
 
+def mid_handoff():
+    """Is this session the second half of a handoff that is STILL OPEN? $CC_HANDOFF is exported into a
+    successor by `cc __runnext` and outlives the handoff itself — it says "born a successor", not "still
+    being handed off". Read as a bare flag it silences this file for the REST of that session's life: on
+    2026-09-01 the planning session won an overlap in the morning and then sat past the hand-off line all
+    evening at 51.5% with no event ever emitted. <id>.done is the marker cc-guard already un-gates on; see
+    cc-handoff.mid_handoff for the long version. Unaccountable id -> still held: a session must never police
+    the handoff it is the second half of, and every failure here falls that way."""
+    hid = os.environ.get("CC_HANDOFF") or ""
+    if not hid:
+        return False
+    return not (re.match(r"^[A-Za-z0-9_-]{1,64}$", hid)
+                and os.path.exists(os.path.join(HANDOFF, hid + ".done")))
+
+
 def event(target, m, level, busy="", live=False, taken=False):
     """THE ONE CALL OUT. This file measures a context and says which LINE was crossed; cc-handoff owns every
     phase that follows — the deadline of an overlap already open, whether this crossing starts one, whether it
@@ -520,15 +535,17 @@ def record(payload):
     target = f"{repo}/{track}" if track else repo
     live = have_window(target) if repo else False      # no window = a headless worker: its loop is its handoff
     # Anything the crossing MEANS is cc-handoff's to decide (review rec #8) — including the deadline of an
-    # overlap already open, which is why this fires with no level too. Never from the SUCCESSOR: $CC_HANDOFF is
-    # in its env and nowhere else, and a session must not police, abandon or restart the handoff it is itself
-    # the second half of. cc-handoff refuses that too — this is the cheap half of the same rule, so the one
-    # session in a hundred that IS a successor does not fork a process every turn to be told no.
+    # overlap already open, which is why this fires with no level too. Never from the successor of an OPEN
+    # handoff: a session must not police, abandon or restart the handoff it is itself the second half of. Only
+    # while it is open, though — once it retires the successor is the only session left and must hand ITSELF
+    # off in turn (mid_handoff; reading $CC_HANDOFF as a bare flag is what stopped that all of 2026-09-01).
+    # cc-handoff refuses the same way — this is the cheap half of the rule, so the one session in a hundred
+    # that IS mid-handoff does not fork a process every turn to be told no.
     act = ""
     taken = bool(m["handed_off"]) or bool(payload.get("stop_hook_active"))
     fresh = bool(lvl) and bool(repo) and not taken
     busy = in_flight(payload, cwd) if (fresh and lvl != "ceiling") else None   # the ceiling goes regardless
-    if repo and not os.environ.get("CC_HANDOFF") and ((fresh and lvl != "journal") or overlap_open(target)):
+    if repo and not mid_handoff() and ((fresh and lvl != "journal") or overlap_open(target)):
         act = event(target, m, lvl or "", busy or "", live, taken)
     if fresh:
         if act == "overlap":                           # a successor is coming up alongside: nothing is restarted
@@ -805,8 +822,10 @@ def selfcheck():
 
     # records: written from a Stop payload, read back newest-first per track
     with tempfile.TemporaryDirectory() as d:
-        global RECORDS
+        global RECORDS, HANDOFF
         keep, RECORDS = RECORDS, os.path.join(d, "context")
+        keeph, HANDOFF = HANDOFF, os.path.join(d, "handoff")   # mid_handoff() reads <id>.done from here: a
+        os.makedirs(HANDOFF, exist_ok=True)                    # fixture must never write into the box's own
         t = tx([asst("claude-opus-5", 10, 1000, 9000)])
         r = record({"session_id": "sid-1", "transcript_path": t, "cwd": d})
         ok("record writes a measurement", r and r["used"] == 10010)
@@ -948,12 +967,27 @@ def selfcheck():
         at(420000, "sid-11")
         ok("the successor never even emits the event for a handoff it is half of",
            len(events) == n and len(started) == 1)
+        # …but only while that handoff is OPEN. $CC_HANDOFF lives as long as the successor's process, so read
+        # as a bare flag it silenced this file for the rest of that session's life and the box could overlap a
+        # target exactly once, ever — 2026-09-01, the planning session sat past the hand-off line all evening
+        # at 51.5% and the handoff had to be started by hand. <id>.done is the difference (cc-guard:84).
+        open(os.path.join(HANDOFF, "x.done"), "w").write("{}")
+        started.clear()                      # …which is also what retiring did: the record was cleared with it
+        n = len(events)
+        r = at(420000, "sid-12")
+        ok("a session whose own handoff has RETIRED hands off in its turn — no overlap is a one-shot",
+           len(events) == n + 1 and len(started) == 1 and r["handed_off"] and "SUCCESSOR" in r["say"])
+        os.environ["CC_HANDOFF"] = "../../etc/passwd"
+        n, ns = len(events), len(started)
+        at(430000, "sid-13")
+        ok("a $CC_HANDOFF we cannot account for still holds — failure falls towards not policing your own",
+           len(events) == n and len(started) == ns)
         os.environ.pop("CC_HANDOFF", None)
         on[0] = False
         os.remove(os.path.join(wt, "dirty.txt"))
         have_window, event, overlap_open = hw0, ev0, oo0
 
-        RECORDS = keep
+        RECORDS, HANDOFF = keep, keeph
 
     if env0 is not None:
         os.environ["CC_CTX_WINDOW"] = env0
