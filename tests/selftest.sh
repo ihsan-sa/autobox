@@ -7,12 +7,14 @@ export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage li
 # cleans up after itself.  Usage: tests/selftest.sh
 # Exercises the bin/ THIS file ships with (a track worktree tests its own copy, not the ~/bin symlinks).
 set -uo pipefail
-exec </dev/null; unset CC_ROLE CC_HANDOFF   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
+exec </dev/null; unset CC_ROLE CC_HANDOFF CLAUDECODE "${!CLAUDE_@}"   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
 # caller's worker role NOR ITS HANDOFF ID — the guard and overlap probes set both themselves. $CC_HANDOFF stays in a
 # session's environment for the life of that session, deliberately, so the model cannot unset it; a suite that
 # inherits it is asserting against whoever happens to be running it. On 2026-08-31 that produced FOUR separate red
 # gates in one night, in both directions: cases that passed only for a handoff survivor, and cases that failed only
 # for one. Each was patched individually and the class came back within the hour. Unset it once, here, for all of it.
+# NOR THE SESSION a land was typed in: CLAUDECODE=1, CLAUDE_PID, CLAUDE_CODE_* rode every chain a Claude Code shell
+# started on 2026-09-01 (02:54–04:05Z) — the same class: a suite carrying them asserts against whoever runs it.
 B="$(cd "$(dirname "$0")/../bin" && pwd)"
 SELF="$(readlink -f "$0")"
 # ── one run at a time ────────────────────────────────────────────────────────────────────────────────────────
@@ -38,8 +40,16 @@ if [ -z "${CC_SELFTEST_HELD:-}" ]; then
   # (case H4 below is exactly that) used to pin this lock long after its run was gone, leaving the next run queued
   # behind a pid that was already dead — for as long as the orphan lived. Nothing below this line can hold the
   # lock; this shell can, it does nothing else until the suite returns, and it lets go on every path out.
+  # …and the suite's SIGNALS are its own as well, not the launcher's. A `nohup`'d launch (every land chain the
+  # planning session ran out of its shell on 2026-09-01) leaves SIGHUP ignored; exec keeps that, and bash silently
+  # cannot trap a signal ignored at entry — cc-loop's HUP trap did nothing, and H4 ("orphaned claude survived the
+  # loop kill") went red 3/3 from that shell and green from tmux, with the env unset for good measure and the real
+  # difference unnoticed. Bash cannot undo it either, so the exec goes through python, which puts HUP/INT/QUIT/TERM
+  # back to default — the way tmux and systemd start things. (Repro: nohup a cc-loop, HUP it, its claude lives on.)
   export CC_SELFTEST_HELD=$$
-  "$SELF" "$@" {LK}>&-; exit $?
+  python3 -c 'import os, signal, sys
+for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM): signal.signal(s, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' "$SELF" "$@" {LK}>&-; exit $?
 fi
 HOLDER=$CC_SELFTEST_HELD; unset CC_SELFTEST_HELD   # our children must not think they are already inside the lock
 if [ -n "${CC_SELFTEST_LOCK_ONLY:-}" ]; then   # the case below re-runs this file to here and no further —

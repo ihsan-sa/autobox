@@ -67,7 +67,7 @@ honest answer and the point: an ask nobody can measure is not an ask that is don
 Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
 cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
-import fcntl, glob, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse, urllib.request
+import fcntl, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy (like `cc`)
@@ -146,13 +146,28 @@ class Skip(Exception):
 
 
 # ── the outside world, each in one place, so `selfcheck` can stand in for all of it ──────────────────────
-def sh(argv, cwd=None, timeout=300):
+def sh(argv, cwd=None, timeout=300, **kw):
     """(returncode, output) — stdout and stderr together, never a raise: every caller decides what failure means."""
     try:
-        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, **kw)
         return r.returncode, r.stdout + r.stderr
     except Exception as e:
         return 127, f"{e.__class__.__name__}: {e}"
+
+
+def clean_start():
+    """A gate starts the way systemd would start it, not the way its launcher happens to be: the session's own
+    variables gone, the signals at their defaults. Whoever types `cc-land` in a Claude Code shell hands every gate
+    CLAUDECODE=1, CLAUDE_PID and CLAUDE_CODE_* — a suite carrying those asserts against that session — and a `nohup`
+    launch hands it SIGHUP ignored, which exec keeps and bash silently cannot trap: cc-loop's HUP trap was a no-op,
+    and selftest's H4 (a HUP'd loop must kill its claude) went red 3/3 in every nohup'd chain of 2026-09-01
+    02:54–04:05Z, then green from tmux with nothing else changed. sh(**clean_start()) for every gate."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE" and not k.startswith("CLAUDE_")}
+
+    def dfl():
+        for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+            signal.signal(s, signal.SIG_DFL)
+    return {"env": env, "preexec_fn": dfl}
 
 
 def slack(method, token, **kw):
@@ -486,7 +501,7 @@ class Land:
                 "--json-schema", REVIEW_SCHEMA,
                 "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands",
                 "--add-dir", tmp, "--allowedTools", REVIEW_ALLOW, "--disallowedTools", REVIEW_DENY]
-        rc, o = sh(argv, cwd=tmp, timeout=1800)
+        rc, o = sh(argv, cwd=tmp, timeout=1800, **clean_start())
         try:
             j = json.loads(o)
         except ValueError:
@@ -542,7 +557,7 @@ class Land:
             if not found:
                 raise Skip(f"no gates in {self.repo} ({GATES[0]}, {GATES[2]}, …) — landing ungated")
             for g in found:
-                rc, o = sh([f"{tree}/{g}"], cwd=tree, timeout=3600)
+                rc, o = sh([f"{tree}/{g}"], cwd=tree, timeout=3600, **clean_start())
                 bad = FAILED_RE.search(o)
                 if rc or (bad and bad.group(1) != "0"):
                     keep = f"{tempfile.gettempdir()}/cc-land-gate-{self.repo}-{self.pr or 'base'}.log"
@@ -1263,7 +1278,7 @@ def cmd_selfcheck():
         if not cond:
             fails.append(name)
 
-    def fake_sh(argv, cwd=None, timeout=300):
+    def fake_sh(argv, cwd=None, timeout=300, **kw):
         calls.append(argv)
         cwds.append(cwd)                  # where a command RAN is part of what it does — see the reviewer's cwd
         key = max((k for k in world if " ".join(argv).startswith(k)), key=len, default=None)
@@ -1283,6 +1298,29 @@ def cmd_selfcheck():
           gate_fail("banner\n  ✓ ok\n  ✗ the row was wrong\nsome stderr noise") == "✗ the row was wrong")
     check("…and with no failure marker anywhere, the last line still stands",
           gate_fail("banner\nall quiet") == "all quiet")
+
+    # A gate starts clean (clean_start): what a `nohup cc-land …` typed in a Claude Code shell hands down is stood in
+    # for here — CLAUDE* in the env, SIGHUP ignored — and a probe gate reports what it actually got. `sh` is still
+    # the real one at this point; the probe is the subprocess path, not the fake world.
+    probe = tempfile.mkdtemp(prefix="cc-land-selfcheck-clean-")
+    with open(f"{probe}/gate.sh", "w") as f:
+        f.write("#!/usr/bin/env bash\nenv | grep -E '^CLAUDE'; grep SigIgn /proc/$$/status\n")
+    os.chmod(f"{probe}/gate.sh", 0o755)
+    hup_ign = lambda o: int((re.search(r"SigIgn:\s*([0-9a-f]+)", o) or [0, "1"])[1], 16) & 1
+    was = {k: os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_PID")}
+    os.environ.update(CLAUDECODE="1", CLAUDE_PID="42"); old_hup = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        dirty = sh([f"{probe}/gate.sh"], cwd=probe, timeout=10)[1]
+        rc, clean = sh([f"{probe}/gate.sh"], cwd=probe, timeout=10, **clean_start())
+    finally:
+        signal.signal(signal.SIGHUP, old_hup)
+        for k, v in was.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        shutil.rmtree(probe, ignore_errors=True)
+    check("control: without the scrub a gate inherits the session's CLAUDE* and an ignored SIGHUP",
+          "CLAUDECODE=1" in dirty and hup_ign(dirty) == 1)
+    check("a gate starts clean: no CLAUDE* from the session, SIGHUP back to default (nohup'd chains, H4 red 3/3 "
+          "on 2026-09-01)", rc == 0 and "CLAUDE" not in clean and hup_ign(clean) == 0)
 
     def REVIEWED(verdict, where="", what="", fix="", cost=0.42):
         """What `claude -p --output-format json --json-schema …` hands back — the fake model, standing in for the
