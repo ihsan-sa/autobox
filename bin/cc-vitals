@@ -28,6 +28,12 @@ row also carries one lookup of github.com and slack.com through the SYSTEM resol
 and curl take — under a hard 2 s timeout, and #alerts hears about a FLIP only: down once, then back once with the
 outage length, never a line a minute while it stays down. Resolver config and the network are never touched here.
 
+THE MAIN CHECKOUT IS A READING TOO (2026-09-01, later that day). ~/bin symlinks into the control repo's main
+checkout, so what is on disk there IS the live cc layer — and at 09:38Z two of its binaries were overwritten with an
+unreviewed PR head and nothing noticed for 2.5 h. So each row also asks git, READ-ONLY, whether that checkout is a
+clean origin/<default> or behind it: tracked files modified, a branch that is not the default, or commits ahead of
+origin all count; an untracked file (a session's .claude/) and being behind (a pull pending) do not. Same flip rule.
+
 THE RENDERER IS A SEAM, AND IT IS THE ONLY THING NOT DONE. Nothing on this box can draw a PNG (no matplotlib, no
 PIL) and installing one is an owner-gated host change that has not been answered. Everything up to the pixels is
 built and tested; render_png() is one function that raises RendererUnavailable, and render_text() — block
@@ -66,6 +72,9 @@ HOSTS = ("github.com", "slack.com")   # what the box cannot work without: git/gh
 DNS_TIMEOUT = 2.0    # a lookup slower than this IS the outage, for git and curl alike
 GETENT = os.environ.get("CC_VITALS_GETENT") or "getent"   # the system resolver; selfcheck points this at a stub
 BIN = os.path.dirname(os.path.realpath(__file__))
+GIT = os.environ.get("CC_VITALS_GIT") or "git"      # selfcheck points this at a stub for the hang case
+REPO = os.environ.get("CC_VITALS_REPO") or BIN      # the control repo = the checkout this copy lives in (~/bin ->
+GIT_TIMEOUT = 15                                    # <repo>/core/bin); git finds the top from any dir inside it
 
 # ONE FIXED HUE PER METRIC, ASSIGNED IN THIS ORDER AND NEVER RECYCLED (owner, 2026-08-30). Slots come from the
 # validated categorical palette in the dataviz reference, in its published order; slots 7 (violet) and 8 (red)
@@ -228,8 +237,8 @@ def record_minute(period=PERIOD, sample=SAMPLE):
     computed from a monotonic start, so a slow sample steals from the next one instead of drifting the minute."""
     t0, m0 = time.time(), time.monotonic()
     cap, c0, got = caps(), counters(), [gauges()]
-    dn = dns()                       # once a minute, at most 2 s a host: deadlines below are monotonic, so a slow
-                                     # lookup shifts the first sample, never the minute
+    dn, co = dns(), checkout()       # once a minute, at most 2 s a host and 15 s a git call: deadlines below are
+                                     # monotonic, so a slow lookup shifts the first sample, never the minute
     n = 1
     while n * sample < period:
         d = (m0 + n * sample) - time.monotonic()
@@ -241,7 +250,7 @@ def record_minute(period=PERIOD, sample=SAMPLE):
     if d > 0:
         time.sleep(d)
     row = aggregate(c0, counters(), time.monotonic() - m0, got, cap, t0 - (t0 % period))
-    row["dns"] = dn
+    row["dns"], row["checkout"] = dn, co
     return row
 
 
@@ -264,16 +273,27 @@ def dns():
     return {h: resolve(h) for h in HOSTS}
 
 
+def _state(name):
+    """A flip's memory, from disk: a file, not a variable, because the recorder restarts (RestartSec=10) and a
+    fault must not be announced twice — nor re-announced by every tick it lasts."""
+    try:
+        return json.loads(_read(f"{DIR}/{name}") or "{}")
+    except Exception:
+        return {}
+
+
+def _save(name, state):
+    os.makedirs(DIR, exist_ok=True)
+    with open(f"{DIR}/{name}.tmp", "w") as f:
+        json.dump(state, f)
+    os.replace(f"{DIR}/{name}.tmp", f"{DIR}/{name}")
+
+
 def dns_flip(reading, now=None):
     """This tick against the last one ON DISK: the one line #alerts should hear, or None. Down is any host
-    unresolved; back is all of them answering. State is a file, not a variable, because the recorder restarts
-    (RestartSec=10) and an outage must not be announced twice — nor re-announced by every tick it lasts."""
+    unresolved; back is all of them answering."""
     now = now or time.time()
-    path = f"{DIR}/dns.json"
-    try:
-        prev = json.loads(_read(path) or "{}")
-    except Exception:
-        prev = {}
+    prev = _state("dns.json")
     down = sorted(h for h, ms in reading.items() if ms is None)
     since, line = prev.get("since"), None
     if down and not since:
@@ -287,10 +307,79 @@ def dns_flip(reading, now=None):
     else:
         return None                                              # up, was up: the normal minute
     if state != prev:
-        os.makedirs(DIR, exist_ok=True)
-        with open(path + ".tmp", "w") as f:
-            json.dump(state, f)
-        os.replace(path + ".tmp", path)
+        _save("dns.json", state)
+    return line
+
+
+# ------------------------------------------------------------- the main checkout: one git status a minute ----
+def git(*args, cwd=None, timeout=GIT_TIMEOUT):
+    """stdout of one READ-ONLY git command, or None when it failed or hung. The recorder never fetches, pulls,
+    checks out or writes in the checkout it watches — it is the thing that has to notice such writes — and it
+    takes no optional lock, so a status here never trips over cc-land's pull, nor the pull over it."""
+    try:
+        p = subprocess.run([GIT, "--no-optional-locks", "-C", cwd or REPO, *args],   # never index.lock: a
+                           capture_output=True, text=True, timeout=timeout)         # pull may be running there
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return p.stdout.rstrip("\n") if p.returncode == 0 else None
+
+
+def checkout(repo=None):
+    """The reading: {top, branch, default, dirty: [paths], ahead, behind} for the checkout `repo` is inside, or
+    None where none can be read (a box installed from a tarball; git hung). Dirty means TRACKED files changed,
+    staged or not — an untracked file is a session's scratch, not a live binary swapped. Behind is a pull
+    pending, and fine. origin/<default> is the LOCAL ref: no network, ever."""
+    top = git("rev-parse", "--show-toplevel", cwd=repo)
+    st = git("status", "--porcelain", "--untracked-files=no", cwd=repo) if top is not None else None
+    if st is None:
+        return None
+    head = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", cwd=repo) or ""
+    default = head.split("/", 1)[1] if "/" in head else "main"
+    branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo) or "?"
+    lr = (git("rev-list", "--left-right", "--count", f"origin/{default}...HEAD", cwd=repo) or "0 0").split()
+    return {"top": top, "branch": "detached HEAD" if branch == "HEAD" else branch, "default": default,
+            "dirty": sorted(l[3:].split(" -> ")[-1] for l in st.splitlines() if l.strip()),
+            "ahead": int(lr[1]), "behind": int(lr[0])}
+
+
+def wrong(reading):
+    """What is not right about the checkout, in the words #alerts will read; [] for a clean origin/<default>
+    or one behind it."""
+    if not reading:
+        return []
+    w = []
+    if reading["dirty"]:
+        w.append("modified " + ", ".join(reading["dirty"]))
+    if reading["branch"] != reading["default"]:
+        w.append(f"on {reading['branch']}, not {reading['default']}")
+    if reading["ahead"]:
+        w.append(f"{reading['ahead']} commit{'s' if reading['ahead'] != 1 else ''} ahead of origin/{reading['default']}")
+    return w
+
+
+def checkout_flip(reading, now=None):
+    """The resolver's flip rule, on the checkout: one line when it stops being a clean origin/<default>, one when
+    it is again, silence in between — and silence while it cannot be read: an unknown is not a fact, and must
+    not close an open fault."""
+    if reading is None:
+        return None
+    now = now or time.time()
+    prev = _state("checkout.json")
+    w, since, line = wrong(reading), prev.get("since"), None
+    top, default = reading["top"].replace(HOME, "~", 1), reading["default"]
+    if w and not since:
+        state = {"since": now, "what": w}
+        line = f"main checkout {top} is not a clean origin/{default} (~/bin runs from it): " + "; ".join(w)
+    elif w:
+        state = dict(prev, what=sorted(set(prev.get("what") or []) | set(w)))   # still wrong: say nothing
+    elif since:
+        state = {}
+        line = (f"main checkout {top} is a clean origin/{default} again after {max(1, round((now - since) / 60))}"
+                f" min ({'; '.join(prev.get('what') or [])})")
+    else:
+        return None                                              # clean, was clean: the normal minute
+    if state != prev:
+        _save("checkout.json", state)
     return line
 
 
@@ -307,12 +396,12 @@ def alert(line):
         print(f"cc-vitals: notify failed: {e}", file=sys.stderr)
 
 
-def watch(reading):
-    """The per-tick half: a flip becomes one alert. Returns what was said, if anything."""
-    line = dns_flip(reading)
-    if line:
-        alert(line)
-    return line
+def watch(row):
+    """The per-tick half: every flip in the row becomes one alert. Returns what was said."""
+    said = [l for l in (dns_flip(row.get("dns") or {}), checkout_flip(row.get("checkout"))) if l]
+    for l in said:
+        alert(l)
+    return said
 
 
 # ------------------------------------------------------------------------------------------------- storage ---
@@ -430,6 +519,7 @@ def build(hours=24, now=None, data=None):
     return {"generated": _iso(now), "window_h": hours, "t0": int(t0), "step": 60, "n": n,
             "minutes": placed, "gaps": n - placed, "stale_after": STALE,
             "surface": SURFACE, "caps": cap, "dns": data[-1].get("dns") if data else None,
+            "checkout": data[-1].get("checkout") if data else None,
             "axis": {"min": 0, "max": 100, "label": "% of each metric's own capacity",
                      "note": "one axis, six capacities; the legend carries the real numbers. Values over 100 "
                              "are real (load can exceed the core count) — the renderer clips and flags them."},
@@ -587,7 +677,7 @@ def cmd_record(opt):
     while True:
         row = record_minute(period, sample)
         append(row)
-        watch(row.get("dns") or {})  # a flip is one line to #alerts; a steady state, up or down, is silence
+        watch(row)                   # a flip is one line to #alerts; a steady state, good or bad, is silence
         prune()
         try:
             render()                     # on a real change, once a minute — never inside the tab's refresh path
@@ -806,19 +896,19 @@ def selfcheck():
             r = dns()
             check("both hosts answer -> a ms reading per host, kept in the row like the other readings",
                   set(r) == set(HOSTS) and all(isinstance(v, int) for v in r.values()))
-            check("up, and was up: nothing said, no state file", watch(r) is None and not said
+            check("up, and was up: nothing said, no state file", not watch({"dns": r}) and not said
                   and not os.path.exists(f"{tmp}/dns.json"))
             globals()["GETENT"] = stub('[ "$2" = github.com ] && exit 2; exit 0')
             r = dns()
             check("a failed lookup is None, not a number", r["github.com"] is None and r["slack.com"] is not None)
             check("the first failed lookup is the DOWN flip, naming the host that failed",
-                  watch(r) and len(said) == 1 and "down" in said[0] and "github.com" in said[0]
+                  watch({"dns": r}) and len(said) == 1 and "down" in said[0] and "github.com" in said[0]
                   and "slack.com" not in said[0])
             globals()["GETENT"] = stub("exit 2")
             r = dns()
             check("still down, now both hosts: NO repeat — an outage is one line, not one a minute",
                   dns_flip(r, now=time.time() + 60) is None and dns_flip(r, now=time.time() + 120) is None
-                  and watch(r) is None and len(said) == 1)
+                  and not watch({"dns": r}) and len(said) == 1)
             globals()["GETENT"] = stub("sleep 5")
             t = time.monotonic()
             check("a HUNG resolver is None after the timeout, not a hung recorder",
@@ -843,12 +933,89 @@ def selfcheck():
         check("a flip goes out through cc-notify under the '<box> alerts' title cc-slack routes to #alerts",
               f"\t{socket.gethostname().split('.')[0]} alerts\tdns back" in _read(f"{tmp}/notify.log"))
 
+        # -- THE MAIN CHECKOUT, on a throwaway clone: clean is silence, anything else is one line, back is one ---
+        genv = dict(os.environ, HOME=tmp, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
+                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+        def g(*a, cwd=None):
+            subprocess.run(["git", *a], cwd=cwd, env=genv, check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+
+        def commit(repo, name, body):
+            with open(f"{repo}/{name}", "w") as fh:
+                fh.write(body)
+            g("add", "-A", cwd=repo)
+            g("commit", "-qm", name, cwd=repo)
+        origin, box = f"{tmp}/origin", f"{tmp}/dev/box"
+        g("init", "-q", "-b", "main", origin)
+        commit(origin, "f", "one\n")
+        os.makedirs(f"{box}")
+        g("clone", "-q", origin, box)
+        os.makedirs(f"{box}/core/bin")                           # where this script would live in it
+        said.clear()
+        globals()["alert"] = said.append
+        try:
+            r = checkout(f"{box}/core/bin")
+            check("a clean clone, read from a dir inside it as ~/bin -> <repo>/core/bin is: on the default branch, "
+                  "nothing modified, level with origin", bool(r) and r["top"] == box and r["branch"] == r["default"]
+                  == "main" and r["dirty"] == [] and r["ahead"] == r["behind"] == 0)
+            check("clean, was clean: nothing said, no state file", not watch({"checkout": r}) and not said
+                  and not os.path.exists(f"{tmp}/checkout.json"))
+            with open(f"{box}/f", "w") as fh:
+                fh.write("overwritten\n")
+            with open(f"{box}/scratch", "w") as fh:
+                fh.write("x")
+            r = checkout(box)
+            check("a tracked file rewritten in place is dirty; the untracked file beside it is not",
+                  r["dirty"] == ["f"])
+            check("the first dirty tick is the flip: one line naming the checkout and the file",
+                  watch({"checkout": r}) and len(said) == 1 and f"main checkout {box}" in said[0]
+                  and "not a clean origin/main" in said[0] and "modified f" in said[0] and "scratch" not in said[0])
+            g("checkout", "-q", "-b", "track/x", cwd=box)
+            r = checkout(box)
+            check("still wrong, now off the branch too: NO repeat", r["branch"] == "track/x"
+                  and checkout_flip(r, now=time.time() + 60) is None and len(said) == 1)
+            globals()["GIT"] = stub("sleep 5")
+            t = time.monotonic()
+            check("a HUNG git is None after the timeout, not a hung recorder — and an unreadable tick does not "
+                  "close the open fault", git("status", cwd=box, timeout=0.3) is None and time.monotonic() - t < 2
+                  and checkout_flip(None) is None and _state("checkout.json").get("since"))
+            globals()["GIT"] = "git"
+            g("checkout", "-q", "-f", "main", cwd=box)
+            r = checkout(box)
+            back = checkout_flip(r, now=time.time() + 150 * 60)
+            check("a clean main again (scratch still untracked): the UP line once, with the length and what was wrong",
+                  r["dirty"] == [] and bool(back) and "clean origin/main again after 150 min" in back
+                  and "modified f" in back and "track/x" in back)
+            check("...and the state is cleared", checkout_flip(r) is None
+                  and json.loads(_read(f"{tmp}/checkout.json")) == {})
+            commit(box, "g", "local\n")
+            r = checkout(box)
+            check("a commit origin does not have is ahead, and a fault",
+                  r["ahead"] == 1 and "1 commit ahead of origin/main" in (checkout_flip(r) or ""))
+            g("reset", "-q", "--hard", "origin/main", cwd=box)
+            check("level again: closed", "again after" in (checkout_flip(checkout(box), now=time.time() + 60) or ""))
+            commit(origin, "h", "upstream\n")
+            g("fetch", "-q", cwd=box)
+            r = checkout(box)
+            check("behind origin is a pull pending, not a fault", r["behind"] == 1 and wrong(r) == []
+                  and checkout_flip(r) is None)
+            g("init", "-q", "-b", "trunk", f"{tmp}/o2")
+            commit(f"{tmp}/o2", "f", "1\n")
+            g("clone", "-q", f"{tmp}/o2", f"{tmp}/trunk")
+            check("the default branch is whatever origin's HEAD says, not the word main",
+                  checkout(f"{tmp}/trunk")["default"] == "trunk" and wrong(checkout(f"{tmp}/trunk")) == [])
+            check("no checkout at all is None, not a fault", checkout(tmp) is None and checkout_flip(None) is None)
+        finally:
+            globals()["GIT"], globals()["alert"] = "git", live_alert
+
         # -- and one real minute end to end, short --------------------------------------------------------------
         r = record_minute(period=2, sample=1)
         check("record_minute reads this box and returns a whole row",
               r["s"] >= 2 and r["cap"]["cores"] and r["load"]["m"] is not None and r["dt"] >= 2)
         check("the row is stamped with the minute it covers, on the minute", r["t"].endswith(":00Z"))
         check("...with the resolver reading in it", set(r["dns"]) == set(HOSTS))
+        check("...and the checkout reading (this copy lives in a repo)", "checkout" in r and r["checkout"]["top"])
     finally:
         globals()["DIR"] = live
         shutil.rmtree(tmp, ignore_errors=True)
