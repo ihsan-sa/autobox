@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # cc-notify — reach the owner. Always logs to ~/.cc/notify.log; pushes via ntfy and/or Slack when configured.
-#   cc-notify [-t title] [-p low|default|high|urgent] [--owner] "message"     (or message on stdin)
+#   cc-notify [-t title] [-p low|default|high|urgent] [--owner] [--decision] "message"   (or message on stdin)
 #   cc-notify setup        create the ntfy topic + show the phone subscription steps
 #   cc-notify test         send a test push
 # Exit: 0 if at least one configured channel took the message (or none is configured — the log is the channel),
 #   1 only if every configured channel failed, so callers (cc-boot-notify) can retry on status instead of on text.
+# THE NOTIFICATION LADDER (owner, 2026-09-01) — route by what it COSTS the owner to read, cheapest rung that does the
+#   job. This script owns rungs 1, 4 and 5; the other three belong to tools that already exist.
+#     1 @-mention in the main channel = "you, now"        --decision   (blocked decision · approval-class action
+#       waiting · an incident touching money, access or anything outward). RARE: a mention that could have waited is a bug.
+#     2 needs_owner = "you, next time you open Slack"     the session's own `reply` tool (NEEDS YOU list), not this script
+#     3 #approvals card = "one tap when convenient"       cc-slack post-approval
+#     4 #alerts = notable, nothing to do                  the default, for a "<box> boot|limit|power|audit" title
+#     5 #<repo>-updates = ambient, zero attention debt    the default, for a title starting with a repo name
+#     6 anything that can wait for the digest, waits      cc-digest --notify (it posts on rung 5)
+#   The litmus is in ~/COMMS.md: needs a decision → mention · needs a tap → approvals · notable only → alerts · else updates.
 # Config: ~/.cc/config  (NTFY_TOPIC=..., NTFY_SERVER=https://ntfy.sh, SLACK_WEBHOOK=https://hooks.slack.com/...;
-#   with SLACK_BOT_TOKEN set (cc slack setup) the bot posts instead — into #<repo> when the title starts with a repo name, else #alerts, else SLACK_CHANNEL)
+#   with SLACK_BOT_TOKEN set (cc slack setup) the bot posts instead — into #<repo>-updates when the title starts with a
+#   repo name (#<repo> itself with --decision), else #alerts, else SLACK_CHANNEL)
 # ESCALATION — with --owner, or from a member-facing session (cc-guard's `.cc/member-facing` marker, walked up from the
 #   cwd): the bot DMs the OWNER instead of routing by title. Such a session's own channel is where the members are, so an
 #   escalation routed there reaches everyone except the one person it is for. Unpaired owner: #alerts, never that channel.
@@ -25,7 +36,7 @@ SLACK_WEBHOOK="$(cfg SLACK_WEBHOOK)"; SLACK_BOT_TOKEN="$(cfg SLACK_BOT_TOKEN)"
 SLACK_OWNER_ID="$(cfg SLACK_OWNER_ID)"; SLACK_ALERTS="$(cfg SLACK_ALERTS)"
 CC_NOTIFY_LOG_ONLY="$(cfg CC_NOTIFY_LOG_ONLY)"
 BOX="$(cfg CC_BOX)"; BOX="${BOX:-$(hostname -s)}"   # this box's name (override with CC_BOX in ~/.cc/config): default title + ntfy topic prefix
-title="$BOX"; prio="default"
+title="$BOX"; prio="default"; decision=0
 case "${1:-}" in
   setup)
     if [ -z "$NTFY_TOPIC" ]; then NTFY_TOPIC="$BOX-$(tr -dc a-z0-9 </dev/urandom | head -c 12)"; "$BIN/cc-config" set NTFY_TOPIC "$NTFY_TOPIC"; fi
@@ -39,7 +50,8 @@ owner=0; from=""; [ "${CC_ROLE:-}" = member ] && owner=1
 d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
   [ -f "$d/.cc/member-facing" ] && { owner=1; from=${d##*/}; break; }; d=${d%/*}; done
 [ -n "$from" ] && title="$from escalation"
-while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;; *) break;; esac; done
+while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
+  --decision) decision=1; shift;; *) break;; esac; done
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
 printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n' ' ')" >> "$LOG"
 # THROWAWAY TEST STATE MUST NEVER PAGE THE OWNER. Selfchecks and selftests work on synthetic repos named
@@ -67,7 +79,8 @@ fi
 if [ -n "${SLACK_BOT_TOKEN:-}" ] || [ -n "${SLACK_WEBHOOK:-}" ]; then   # one channel: the bot, else the webhook
   tried=$((tried + 1)); bang=$( { [ "$prio" = high ] || [ "$prio" = urgent ]; } && echo ' :rotating_light:')
   # an escalation is DELIVERED, not routed: the owner's DM — unpaired, #alerts (cc-slack falls that back to SLACK_CHANNEL)
-  if [ "$owner" = 1 ]; then dest=(-c "${SLACK_OWNER_ID:-#${SLACK_ALERTS:-alerts}}"); else dest=(--route "$title"); fi
+  if [ "$owner" = 1 ]; then dest=(-c "${SLACK_OWNER_ID:-#${SLACK_ALERTS:-alerts}}")   # a DM already IS rung 1
+  else dest=(--route "$title"); [ "$decision" = 1 ] && dest+=(--mention); fi   # --decision: the main channel, @-mentioned
   if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post "${dest[@]}" "$(printf '*%s*%s\n%s' "$title" "$bang" "$msg")" >/dev/null 2>&1; then
     ok=$((ok + 1))   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)
   elif [ -n "${SLACK_WEBHOOK:-}" ] &&

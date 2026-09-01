@@ -257,9 +257,10 @@ MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' '
     'Bash|{"command":"cc board add r t title text --go"}' 'Bash|{"command":"cc-loop r t"}' 'Bash|{"command":"claude -p do it"}'
     'Bash|{"command":"cat ~/.cc/config"}' 'Bash|{"command":"tail -5 $HOME/.ssh/id_ed25519"}'
     'Bash|{"command":"cc slack off"}' 'Bash|{"command":"cc slack mkchannel help"}'
+    'Bash|{"command":"cc-slack updates-sweep"}'
     "Read|{\"file_path\":\"$GH/.cc/config\"}" "Edit|{\"file_path\":\"$GH/member-probe.txt\"}")
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 2 ] || miss="$miss ${probe#*|}"; done
-[ -z "$miss" ] && ok "member-facing marker denies all 12 probes (merge/host, dispatch, secrets, Slack wiring, edit outside)" || bad "member gate misses:$miss"
+[ -z "$miss" ] && ok "member-facing marker denies all 13 probes (merge/host, dispatch, secrets, Slack wiring incl. updates-sweep, edit outside)" || bad "member gate misses:$miss"
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "no regression: an unmarked cwd (planning session) is gated by none of them" || bad "unmarked cwd gated:$miss"
 miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t help the owner must decide this"}' \
@@ -405,6 +406,15 @@ grep -q -- '-c UOWNER' "$T/slack.args" && ok "--owner reaches the owner from any
 N "$T/plain" -t "demorepo/w1 done" "PR: x"     # a REAL repo name: this fixture's own is _cctest…, which the gate below stops on purpose
 { grep -q -- "--route demorepo/w1 done" "$T/slack.args" && ! grep -q -- '-c ' "$T/slack.args"; } \
   && ok "no regression: an ordinary notice still routes by title (#<repo>, #alerts)" || bad "routing changed: $(cat "$T/slack.args")"
+# THE LADDER (owner, 2026-09-01): the rung is a routing decision, and --decision is the only thing that buys rung 1.
+! grep -q -- '--mention' "$T/slack.args" \
+  && ok "...and it is ambient — no --mention, so cc-slack aims it at the #<repo>-updates lane (rung 5)" || bad "an ordinary notice @-mentioned the owner: $(cat "$T/slack.args")"
+N "$T/plain" --decision -t "demorepo blocked" "which database do I restore?"
+{ grep -q -- '--mention' "$T/slack.args" && grep -q -- '--route demorepo blocked' "$T/slack.args"; } \
+  && ok "--decision is rung 1: same route, plus --mention — the MAIN channel and a real @-mention of the owner" || bad "--decision did not ask for a mention: $(cat "$T/slack.args")"
+N "$T/chan" --decision "the staging DB restore needs your call"
+{ grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--mention' "$T/slack.args"; } \
+  && ok "--decision from a member-facing session still DMs the owner — a DM already IS rung 1, and the mention would have gone to the members" || bad "--decision leaked into the member channel: $(cat "$T/slack.args")"
 # THROWAWAY TEST STATE MUST NEVER PAGE THE OWNER: four days of "[_cctest…] PR #7 merged, deploy stopped" in #alerts
 # came from selfchecks whose failures are REAL calls to cc-notify. The gate is here, at the one door every outward
 # notification goes through, so it holds for a caller nobody thought to configure. The line is still LOGGED — the

@@ -35,4 +35,3 @@ Getting in, and what to do when it breaks. The commands themselves are `~/USAGE.
 - No host firewall (ufw/nftables); Docker manages only its own container rules.
 - sshd: socket-activated (`ssh.socket`), key-only — `PasswordAuthentication no` + `KbdInteractiveAuthentication no` via `/etc/ssh/sshd_config.d/10-hardening.conf` (overrides 50-cloud-init.conf; keep a backup of the original). Tailscale SSH is separate (tailscaled) and unaffected.
 - Reboots: the ask-gate stays in `~/.claude/settings.json` — the harness classifier blocks Claude from removing its own gate — and reboots are independently classifier-gated. Verify boot-time WiFi/Tailscale autoconnect and the tmux-main session across one reboot. Unattended-upgrades: security pockets only, no auto-reboot. Sleep/suspend/hibernate targets masked.
-- Owner TODO: home-router DHCP reservation for `<mac>`.

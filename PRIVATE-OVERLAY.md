@@ -7,7 +7,7 @@ it also links the overlay's `home/*.md` and `bin-private/*`, and prefers the ove
 ```
 my-box/                 private repo (the overlay)
 ├── core/               this tree, added with: git subtree add --prefix=core <autobox-url> main --squash
-├── home/               CLAUDE.md RUNBOOK.md COMMS.md USAGE.md  → symlinked into ~
+├── home/               CLAUDE.md RUNBOOK.md COMMS.md USAGE.md SLACK.md  → symlinked into ~
 ├── bin-private/        scripts only this box has            → symlinked into ~/bin
 ├── config/etc/         this box's sshd / unattended-upgrades
 ├── config/systemd-user/  user units only this box runs      → symlinked into ~/.config/systemd/user (enable by hand)
