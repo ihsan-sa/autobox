@@ -1052,6 +1052,52 @@ sleep 1
 MT capture-pane -p -t _ccmodel:sess | tail -n 3 | grep -qx '1' && ok "a Switch-model confirmation is answered, so the switch actually takes" || bad "the switch left the confirmation dialog open"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 
+echo "== ccbox: a new box's ~/.claude gets the login and nothing else =="
+# The seed runs in a throwaway container (no docker here), so the snippet itself runs on stub files: the newest
+# credentials win, .claude.json keeps oauthAccount only (never project history), nothing to copy writes nothing.
+S=$T/seed; mkdir -p "$S/src/ccbox-claude" "$S/src/ccbox-claude-old" "$S/dst"
+snip=$(grep -o "'D=/home/node/.claude;.*rm -f \$D/.claude.json'" "$B/ccbox" | sed "s|^'||; s|'\$||; s|/home/node/.claude|$S/dst|g; s|/src/|$S/src/|g")
+[ -n "$snip" ] && ok "ccbox carries the seed snippet" || bad "seed snippet not found in ccbox"
+echo '{"t":"old"}' > "$S/src/ccbox-claude-old/.credentials.json"; touch -d '2 days ago' "$S/src/ccbox-claude-old/.credentials.json"
+echo '{"t":"new"}' > "$S/src/ccbox-claude/.credentials.json"; chmod 600 "$S/src/ccbox-claude/.credentials.json"
+echo '{"oauthAccount":{"e":"a@b"},"projects":{"/workspace/x":{"history":["prompt"]}},"theme":"dark"}' > "$S/src/ccbox-claude/.claude.json"
+sh -c "$snip"
+[ "$(cat "$S/dst/.credentials.json" 2>/dev/null)" = '{"t":"new"}' ] && [ "$(stat -c %a "$S/dst/.credentials.json")" = 600 ] \
+  && ok "the newest credentials are copied, mode kept" || bad "seed: $(ls -la "$S/dst")"
+[ "$(jq -c . "$S/dst/.claude.json" 2>/dev/null)" = '{"oauthAccount":{"e":"a@b"}}' ] \
+  && ok ".claude.json keeps oauthAccount only — no project history" || bad "seed .claude.json: $(cat "$S/dst/.claude.json" 2>/dev/null)"
+rm -f "$S/dst"/.claude.json "$S/dst"/.credentials.json; echo '{"theme":"dark"}' > "$S/src/ccbox-claude/.claude.json"; sh -c "$snip"
+[ -f "$S/dst/.credentials.json" ] && [ ! -e "$S/dst/.claude.json" ] \
+  && ok "no oauthAccount → no .claude.json (the entrypoint makes its own)" || bad "seed without oauthAccount: $(ls -A "$S/dst")"
+rm -f "$S/dst"/.credentials.json "$S"/src/*/.credentials.json; sh -c "$snip"; rc=$?
+[ "$rc" = 0 ] && [ -z "$(ls -A "$S/dst")" ] && ok "nothing to copy → nothing written, exit 0" || bad "seed with no source: rc=$rc $(ls -A "$S/dst")"
+
+echo "== ccbox: a headless --cmd, and the seed helper's image (docker stubbed) =="
+# A docker stub records every call and plays a box whose project image exists, whose ~/.claude volume does not and
+# whose command prints a line and exits 3 — the two things review-139 caught: the seed copy must run in the BASE
+# image (every box's login is mounted into it, and a project image comes from a Dockerfile its own agent can write),
+# and a --cmd run with no TTY must hand back the command's output and exit status instead of "did not come up".
+X=$T/ccbox; mkdir -p "$X/bin" "$X/home/dev" "$X/cfg"; : > "$X/cfg/env"; : > "$X/cfg/allowed-domains"
+printf '#!/bin/sh\necho docker\n' > "$X/bin/id"   # ccbox's d() calls plain docker when the user is in the docker group
+cat > "$X/bin/docker" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$X/calls"
+case "\$1 \$2" in
+  "image inspect") case "\$3" in ccbox:latest|ccbox-proj:latest) exit 0 ;; *) exit 1 ;; esac ;;   # base AND project image exist
+  "inspect --type") echo false ;;    # the container is not running
+  "volume inspect") exit 1 ;;        # a NEW box
+  "volume ls") echo ccbox-claude ;;  # one volume to seed from
+  "logs -f") printf 'Firewall configuration complete\nhi from the box\n' ;;
+  "wait ccbox-proj") echo 3 ;;
+esac
+EOF
+chmod +x "$X/bin/docker" "$X/bin/id"
+out=$(PATH="$X/bin:$PATH" HOME=$X/home CCBOX_CFG=$X/cfg "$B/ccbox" proj --cmd 'echo hi' 2>&1 </dev/null); rc=$?
+[ "$rc" = 3 ] && grep -q 'hi from the box' <<<"$out" && ok "a no-TTY --cmd prints the command's output and exits with its status (3)" || bad "headless --cmd: rc=$rc out=$out"
+seed=$(grep '^run --rm ' "$X/calls"); start=$(grep '^run -d ' "$X/calls")
+grep -q ' ccbox:latest -c ' <<<"$seed" && ! grep -q 'ccbox-proj:latest' <<<"$seed" && grep -q ' ccbox-proj:latest$' <<<"$start" && grep -q 'CCBOX_TTY=0' <<<"$start" \
+  && ok "the seed copy runs in the base image while the box runs its project image; CCBOX_TTY=0 passed in" || bad "seed: $seed / start: $start"
+
 echo "== cc-trust prune (recorded trust vs real dirs) =="
 TH=$T/trusthome; mkdir -p "$TH/real-dir"
 printf '{"projects":{"%s":{"hasTrustDialogAccepted":true},"/gone/nowhere-%s":{"hasTrustDialogAccepted":true}}}' "$TH/real-dir" "$$" > "$TH/.claude.json"

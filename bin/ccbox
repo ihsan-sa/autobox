@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 # ccbox — sandboxed, bypass-permissions Claude Code in a Docker container (one container per ~/dev/<name>).
-#   ccbox <name> [--open-egress] [-c]   start or attach: ONLY ~/dev/<name> is mounted (as /workspace/<name>);
-#                                       shared volume ccbox-claude keeps the Claude login; egress limited to
-#                                       ~/ccbox/allowed-domains (+GitHub) unless --open-egress; -c = claude --continue.
+#   ccbox <name> [--open-egress] [-c]   start or attach: ONLY ~/dev/<name> is mounted (as /workspace/<name>); ~/.claude is the
+#                                       box's own volume ccbox-claude-<name> (a new one gets just the login copied in); egress
+#                                       limited to ~/ccbox/allowed-domains (+GitHub) unless --open-egress; -c = claude --continue.
 #                                       Options apply when the container is CREATED — to change them: ccbox stop <name>.
 #   ccbox <name> --image IMG           use a project image instead of ccbox:latest (default: ccbox-<name>:latest if it exists)
-#   ccbox <name> --cmd "shell cmd"      run that command in the container's tmux instead of interactive claude (headless runs)
+#   ccbox <name> --cmd "shell cmd"      run that command in the container instead of interactive claude; from a terminal it runs in
+#                                       tmux and a shell follows it, without a TTY (a timer, a worker) it runs without tmux and
+#                                       ccbox prints its output and exits with its status (both stay in ccbox logs <name>)
 #   ccbox ls | stop <name> | rm <name> | shell <name> | logs <name> | build [<name>]
 #     build <name> builds ccbox-<name>:latest from ~/dev/<name>/docker/Dockerfile (context = ~/dev/<name>)
 set -euo pipefail
-CFG="${CCBOX_CFG:-$HOME/ccbox}"; IMAGE="${CCBOX_IMAGE:-ccbox:latest}"; PROJECTS="$HOME/dev"
+CFG="${CCBOX_CFG:-$HOME/ccbox}"; BASE="${CCBOX_IMAGE:-ccbox:latest}"; IMAGE="$BASE"; PROJECTS="$HOME/dev"   # BASE is built from $CFG: the one image the host controls
 # The repo this very script lives in is the box's control repo (~/bin is symlinked into it): never sandbox that one.
 SELF=$(readlink -f "$0"); CTL=""; case "$SELF" in "$PROJECTS"/*) CTL=${SELF#"$PROJECTS"/}; CTL=${CTL%%/*};; esac
 d(){ if id -nG | grep -qw docker; then docker "$@"; else sudo -n docker "$@"; fi; }   # docker group needs a re-login; sudo fallback
-build(){ d build --pull --build-arg CLAUDE_CODE_VERSION="$(npm view @anthropic-ai/claude-code version 2>/dev/null || echo latest)" -t "$IMAGE" "$CFG"; }
+build(){ d build --pull --build-arg CLAUDE_CODE_VERSION="$(npm view @anthropic-ai/claude-code version 2>/dev/null || echo latest)" -t "$BASE" "$CFG"; }
 cmd="${1:-}"; shift || true
 case "$cmd" in
-  ""|-h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+  ""|-h|--help) sed -n '2,11p' "$0"; exit 0 ;;
   build) if [ -n "${1:-}" ]; then df="$PROJECTS/$1/docker/Dockerfile"; [ -f "$df" ] || { echo "no $df"; exit 1; }; d build -t "ccbox-$1:latest" -f "$df" "$PROJECTS/$1"; else build; fi; exit 0 ;;
   ls)    d ps -a --filter name='^ccbox-' --format 'table {{.Names}}\t{{.Status}}\t{{.Label "ccbox.egress"}}\t{{.RunningFor}}'; exit 0 ;;
   stop)  d stop "ccbox-${1:?name}"; exit 0 ;;
@@ -29,21 +31,33 @@ while [ $# -gt 0 ]; do case "$1" in --open-egress) OPEN=1; OPTS=1 ;; -c|--contin
 [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "bad project name: $NAME"; exit 1; }
 [ -z "$CTL" ] || [ "$NAME" != "$CTL" ] || { echo "refusing: $CTL is this box's control repo (its bin/ is symlinked into ~/bin, so a bypass-permissions sandbox would edit the host). Use: cc $CTL"; exit 1; }
 [ -r "$CFG/env" ] || { echo "missing $CFG/env — cp $CFG/env.example $CFG/env, chmod 600, add tokens"; exit 1; }
-C="ccbox-$NAME"; DIR="$PROJECTS/$NAME"; EG=allowlist; [ "$OPEN" = 0 ] || EG=open
+C="ccbox-$NAME"; DIR="$PROJECTS/$NAME"; EG=allowlist; [ "$OPEN" = 0 ] || EG=open; TTY=$([ -t 0 ] && echo 1 || echo 0)
 if [ -n "$IMG" ]; then IMAGE="$IMG"; elif d image inspect "ccbox-$NAME:latest" >/dev/null 2>&1; then IMAGE="ccbox-$NAME:latest"; fi   # project image wins
 if [ "$(d inspect --type container -f '{{.State.Running}}' "$C" 2>/dev/null || echo false)" = true ]; then
   [ "$OPTS" = 0 ] || { echo "$C already running (egress: $(d inspect --type container -f '{{index .Config.Labels "ccbox.egress"}}' "$C")) — ccbox stop $NAME first"; exit 1; }
 else
   mkdir -p "$DIR"; d rm -f "$C" >/dev/null 2>&1 || true
-  d image inspect "$IMAGE" >/dev/null 2>&1 || { [ "$IMAGE" = "${CCBOX_IMAGE:-ccbox:latest}" ] && build; } || { echo "image $IMAGE not found (ccbox build <name>)"; exit 1; }
+  d image inspect "$IMAGE" >/dev/null 2>&1 || { [ "$IMAGE" = "$BASE" ] && build; } || { echo "image $IMAGE not found (ccbox build <name>)"; exit 1; }
+  V="ccbox-claude-$NAME"                           # this box's own ~/.claude. A NEW one is seeded with the login and nothing else (no transcripts,
+  if ! d volume inspect "$V" >/dev/null 2>&1; then  # memory or history) from whichever ccbox-claude* volume refreshed it last — so no box logs in twice
+    src=(); for v in $(d volume ls -q --filter name=ccbox-claude); do src+=(-v "$v:/src/$v:ro"); done
+    if [ ${#src[@]} -gt 0 ]; then   # the copy runs in the BASE image, never the project one: every box's login is mounted into it, and a project image comes from a Dockerfile its own agent can write
+      d image inspect "$BASE" >/dev/null 2>&1 || build
+      d run --rm --network none --entrypoint sh "${src[@]}" -v "$V":/home/node/.claude "$BASE" -c \
+        'D=/home/node/.claude; c=$(ls -t /src/*/.credentials.json 2>/dev/null | head -1) && [ -n "$c" ] || exit 0; cp -p "$c" $D/ && jq "select(.oauthAccount)|{oauthAccount}" "${c%/*}/.claude.json" > $D/.claude.json 2>/dev/null; [ -s $D/.claude.json ] || rm -f $D/.claude.json' >/dev/null
+    fi
+  fi
   d run -d --name "$C" --hostname "$C" --init --label ccbox.egress="$EG" \
     --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv6.conf.default.disable_ipv6=1 --memory 8g --pids-limit 4096 \
     -v "$DIR":"/workspace/$NAME" -w "/workspace/$NAME" \
-    -v ccbox-claude:/home/node/.claude -v "ccbox-hist-$NAME":/commandhistory \
+    -v "$V":/home/node/.claude -v "ccbox-hist-$NAME":/commandhistory \
     -v "$CFG/allowed-domains":/etc/ccbox/allowed-domains:ro \
-    --env-file "$CFG/env" -e CCBOX_NAME="$NAME" -e CCBOX_OPEN_EGRESS="$OPEN" -e CCBOX_CLAUDE_ARGS="$CONT" -e CCBOX_CMD="$CMD" \
+    --env-file "$CFG/env" -e CCBOX_NAME="$NAME" -e CCBOX_OPEN_EGRESS="$OPEN" -e CCBOX_CLAUDE_ARGS="$CONT" -e CCBOX_CMD="$CMD" -e CCBOX_TTY="$TTY" \
     "$IMAGE" >/dev/null
-  ok=0                                             # ready = firewall done + tmux up; give up early if the container died
+  if [ -n "$CMD" ] && [ "$TTY" = 0 ]; then   # headless --cmd runs without tmux (entrypoint): its output and exit status are ccbox's, and stay in `ccbox logs`
+    d logs -f "$C" || true; rc=$(d wait "$C" 2>/dev/null) || rc=1; exit "$rc"
+  fi
+  ok=0                                            # ready = firewall done + tmux up; give up early if the container died
   for _ in $(seq 1 180); do
     d logs "$C" 2>&1 | grep -qE 'Firewall configuration complete|egress OPEN' && d exec "$C" tmux has-session -t main 2>/dev/null && { ok=1; break; }
     [ "$(d inspect --type container -f '{{.State.Running}}' "$C" 2>/dev/null || echo false)" = true ] || break
