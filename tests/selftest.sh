@@ -89,6 +89,32 @@ printf 'x\n' > "$wt/.env.local"; ( cd "$wt" && "$B/cc-checkpoint" )
 rm -f "$wt/.env.local" "$wt/.cc/checkpoint.err"
 touch "$wt/.cc/push.err"; lsout=$("$B/cc" ls 2>/dev/null)   # capture, don't pipe: grep -q would SIGPIPE cc and pipefail would call that a failure
 grep -q 'push!' <<<"$lsout" && ok "cc ls surfaces a failed push" || bad "push.err invisible"; rm -f "$wt/.cc/push.err"
+# ── the lease. 2026-08-31: a track rebased its own branch, the plain push was rejected non-fast-forward, and it
+# finished green with everything committed and NO PR — only the watchdog saw it. A track branch has exactly one
+# writer, so its own rewrite has to land; a write it did NOT make has to stop it dead, and out loud.
+echo pre > "$wt/pre.txt"; ( cd "$wt" && "$B/cc-checkpoint" )   # a commit of OUR OWN to rewrite below: later cases still read the branch this suite built above
+( cd "$wt" && git commit -q --amend -m "rewritten by a rebase" )   # what a rebase leaves behind: a diverged branch
+echo rebased > "$wt/b.txt"; ( cd "$wt" && "$B/cc-checkpoint" )
+{ [ "$(git -C "$T/remote.git" rev-parse track/w1)" = "$(git -C "$wt" rev-parse HEAD)" ] && [ ! -f "$wt/.cc/push.err" ]; } \
+  && ok "checkpoint pushes a branch this worktree rebased — the lease holds, no non-fast-forward dead end" || bad "a rebased branch never reached the remote"
+git clone -q "$T/remote.git" "$T/foreign" 2>/dev/null   # somebody ELSE writes to that branch: the one case the lease exists for
+( cd "$T/foreign" && git config user.email o@o && git config user.name o && git checkout -q track/w1 \
+  && echo not-ours > f.txt && git add -A && git commit -qm "a write this track did not make" && git push -q origin track/w1 )
+fw=$(git -C "$T/remote.git" rev-parse track/w1)
+( cd "$wt" && git commit -q --amend -m "and this track rebases again" )   # diverged too, so a plain push could not have landed either
+echo more > "$wt/c.txt"; ( cd "$wt" && "$B/cc-checkpoint" )
+[ "$(git -C "$T/remote.git" rev-parse track/w1)" = "$fw" ] && ok "a foreign write is NOT overwritten — the lease refuses rather than force" || bad "the lease clobbered somebody else's commit"
+{ grep -q 'push refused' "$wt/.cc/push.err" && grep -q '^STATUS: BLOCKED: push refused' ~/.cc/state/$REPO/w1/progress.md \
+  && "$B/cc-board" show $REPO 2>/dev/null | grep -q 'push refused'; } \
+  && ok "...and says so in all three places at once: push.err (cc ls), the journal (STATUS: BLOCKED stops the loop) and the board" \
+  || bad "the refusal was silent somewhere — err=$(grep -c refused "$wt/.cc/push.err" 2>/dev/null) journal=$(grep -c 'STATUS: BLOCKED' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null) board=$("$B/cc-board" show $REPO 2>/dev/null | grep -c 'push refused')"
+echo again > "$wt/c2.txt"; ( cd "$wt" && "$B/cc-checkpoint" )   # the hook fires again next turn (with work, or it never reaches the push) and the branch is still blocked
+[ "$(grep -c '^STATUS: BLOCKED: push refused' ~/.cc/state/$REPO/w1/progress.md)" = 1 ] && ok "a hook firing every turn does not spam the journal with the same refusal" || bad "duplicate STATUS lines: $(grep -c '^STATUS: BLOCKED' ~/.cc/state/$REPO/w1/progress.md)"
+( cd "$wt" && git fetch -q origin && git rebase -q origin/track/w1 >/dev/null 2>&1 )   # the human answer: take the foreign commit in, then carry on
+echo after > "$wt/d.txt"; ( cd "$wt" && "$B/cc-checkpoint" )
+{ [ "$(git -C "$T/remote.git" rev-parse track/w1)" = "$(git -C "$wt" rev-parse HEAD)" ] && [ ! -f "$wt/.cc/push.err" ]; } \
+  && ok "once the foreign commit is rebased in, the very next checkpoint pushes again (the block is not sticky)" || bad "still blocked after the branch was reconciled"
+rm -rf "$T/foreign"
 # H2: a hand-deleted worktree dir stays registered in git; cc must prune + rebuild it, never stamp a plain dir
 rm -rf "$wt"; "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 [ "$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" = "$(readlink -f "$wt")" ] && [ -f "$wt/.cc/track" ] && ok "hand-deleted worktree is rebuilt as a real worktree" || bad "worktree rebuilt as a plain dir"
@@ -406,7 +432,8 @@ CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev
 for _ in $(seq 1 40); do grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null && grep -qE 'DONE' ~/.cc/state/$REPO/w1/loop.log 2>/dev/null && break; sleep 1; done
 grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null && ok "loop ran to DONE via journal" || bad "loop DONE"
 [ "$(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)" = 2 ] && ok "loop stopped after DONE (2 iterations, not 3)" || bad "loop iteration count: $(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)"
-git -C "$T/remote.git" log --oneline track/w1 2>/dev/null | grep -q 'wip: checkpoint' && ok "loop iterations were checkpointed + pushed" || bad "loop checkpoint"
+rlog=$(git -C "$T/remote.git" log --oneline track/w1 2>/dev/null)   # capture, don't pipe: grep -q exits on the first match, git log takes SIGPIPE and pipefail calls the whole line a failure once the branch has more than a handful of commits
+grep -q 'wip: checkpoint' <<<"$rlog" && ok "loop iterations were checkpointed + pushed" || bad "loop checkpoint — remote track/w1: $(head -3 <<<"$rlog" | tr '\n' ' ') | push.err: $(tr '\n' ' ' < ~/.cc/worktrees/$REPO/w1/.cc/push.err 2>/dev/null)"
 for _ in $(seq 1 30); do tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && break; sleep 1; done   # cc-loop writes it from its tmux window, a beat after DONE
 tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && ok "owner notified on DONE (log backend)" || bad "notify"
 st=$("$B/cc-board" get $REPO w1 status); [ "$st" = review ] && ok "board -> review after done (PR skipped: no gh remote)" || bad "board status after done: $st"
@@ -553,6 +580,26 @@ PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 >/dev/null 2>&1
 ( exec 9>~/.cc/worktrees/$REPO/w5/.cc/done.lock; flock 9; sleep 3 ) & lk=$!   # a first `cc done` still inside the list→create window
 sleep 1; CC_DONE_LOCK_WAIT=1 PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 > "$T/done5.out" 2>&1; rc5=$?; wait $lk 2>/dev/null
 [ "$rc5" = 1 ] && grep -q 'still running' "$T/done5.out" && [ "$(wc -l < "$T/gh.create")" = 2 ] && ok "cc done: two callers at once are serialised — the second opens nothing (P5)" || bad "cc done raced itself: rc=$rc5 creates=$(wc -l < "$T/gh.create")"
+# P6: THE 2026-08-31 CASE END TO END — the track rebased its own branch before finishing. The plain push died
+# non-fast-forward, so `cc done` opened no PR and the work sat on the branch until the watchdog found it.
+( cd ~/.cc/worktrees/$REPO/w5 && git commit -q --amend -m "rebased before finishing" )
+echo "work that must not be stranded" > ~/.cc/worktrees/$REPO/w5/late.txt
+PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 > "$T/done6.out" 2>&1; rc6=$?
+{ [ "$rc6" = 0 ] && [ "$(wc -l < "$T/gh.create")" = 3 ] \
+  && [ "$(git -C "$T/remote.git" rev-parse track/w5)" = "$(git -C ~/.cc/worktrees/$REPO/w5 rev-parse HEAD)" ]; } \
+  && ok "cc done: a track that rebased its own branch still pushes it and still gets a PR (P6)" \
+  || bad "rebase-then-done stranded the work: rc=$rc6 creates=$(wc -l < "$T/gh.create") $(cat "$T/done6.out")"
+# P7: and the other way — a foreign write on that branch stops `cc done` dead. No PR over the top of somebody else.
+( cd "$T" && git clone -q "$T/remote.git" foreign5 2>/dev/null && cd foreign5 && git config user.email o@o && git config user.name o \
+  && git checkout -q track/w5 && echo not-ours > z.txt && git add -A && git commit -qm "a write w5 did not make" && git push -q origin track/w5 )
+fw5=$(git -C "$T/remote.git" rev-parse track/w5)
+( cd ~/.cc/worktrees/$REPO/w5 && git commit -q --amend -m "diverged too" )
+PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 > "$T/done7.out" 2>&1; rc7=$?
+{ [ "$rc7" != 0 ] && [ "$(wc -l < "$T/gh.create")" = 3 ] && [ "$(git -C "$T/remote.git" rev-parse track/w5)" = "$fw5" ] \
+  && grep -q 'no PR opened' "$T/done7.out" && grep -q '^STATUS: BLOCKED: push refused' ~/.cc/state/$REPO/w5/progress.md; } \
+  && ok "cc done: a foreign write on the branch opens no PR, overwrites nothing, and says why (P7)" \
+  || bad "cc done over a foreign write: rc=$rc7 creates=$(wc -l < "$T/gh.create") $(cat "$T/done7.out")"
+rm -rf "$T/foreign5"
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
@@ -800,6 +847,11 @@ jq -e --arg d "$TH/real-dir" '.projects[$d]' "$TH/.claude.json" >/dev/null && [ 
 echo "== cc-reconcile (board vs reality: decision table + one end-to-end apply, no network) =="
 rec=$("$B/cc-reconcile" selfcheck 2>&1)
 grep -q '0 failed' <<<"$rec" && ok "cc-reconcile selfcheck: ${rec##*: }" || bad "cc-reconcile selfcheck: $rec"
+
+echo "== cc-janitor (the weekly sweep: decision table + one end-to-end pass over a fake box) =="
+# Its own HOME, board, origin and stub tmux/gh — nothing here can reach this box's tmux server or GitHub.
+jan=$("$B/cc-janitor" selfcheck 2>&1)
+grep -q '0 failed' <<<"$jan" && ok "cc-janitor selfcheck: ${jan##*: }" || bad "cc-janitor selfcheck: $jan"
 
 echo "== what the snapshot's four readers do with it (waiting vs the clock, and without it) =="
 # cc-reconcile's own selfcheck covers PRODUCING the snapshot; this covers the two things that only break in the

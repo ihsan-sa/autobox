@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""cc-janitor — the weekly sweep: remove what is PROVEN dead, report everything else.
+
+Tracks, branches and tmux windows outlive the work they were made for. Clearing them used to be something the
+box owner noticed and asked for, which is the wrong shape for a chore that comes round every week (owner,
+2026-08-31: "these cleanups should be regular tasks"). This is that pass, encoded, on a timer.
+
+  cc-janitor <repo> [<repo> …] [--dry]      sweep exactly the repos named — never any other
+  cc-janitor --configured [--dry]           the repos in CC_JANITOR_REPOS (~/.cc/config); the timer's form
+  cc-janitor selfcheck                      the decision table + one end-to-end run, no network
+    also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
+
+PER REPO, NEVER ACROSS THEM. Every entry point takes repo names. There is no "sweep everything" — a tool that
+deletes has to be pointed, and the timer is pointed by a config line the owner writes.
+
+THE ONE RULE ABOVE THE RULES: delete only what is PROVEN dead. Anything uncertain — a PR that closed without
+merging, a branch nobody opened one for, a window with something running in it, a worktree with uncommitted
+work — is REPORTED and left exactly where it is. This tool has no "probably".
+
+  1. a board track `merged`/`done` for more than 48 h  →  `cc rm <repo> <track>`, which already takes the
+     worktree, the tmux window, the local branch, the trust entry, the state dir and the board row. A track
+     whose worktree still has uncommitted changes is reported instead — that is unsaved work, not a leftover.
+  2. a remote branch `track/*` whose PR is MERGED  →  deleted on origin. No PR, or an OPEN or CLOSED one, is
+     reported. GitHub is asked once per repo (`gh pr list`), and an answer that cannot be had is not evidence.
+  3. a tmux window `<repo>/<track>` whose track is gone from the board (or terminal on it) AND whose pane is a
+     bare shell  →  killed. `<repo>/<track>~next`, the leftover half of a handoff, follows its base track.
+  4. never: the repo's own planning window (the one named `<repo>` exactly), a window with a live process, or
+     anything whose track is queued/running/waiting/review/blocked. Only `merged` and `done` are ever swept.
+
+LIVENESS IS NOT DECIDED HERE. `cc-reconcile` already owns "what is really alive", and two definitions of that
+would drift into a tool that kills working sessions. This reads its snapshot (~/.cc/state/reconcile.json,
+refreshed first when stale) and treats `live` as final. The snapshot only covers tracks the board knows, so a
+window for a track that was never on it falls back to the pane test `cc` itself uses (pane_live: the pane's
+shell has a child) — the same rule, not a second one. Both must be quiet before anything is killed.
+
+Every action goes to ~/.cc/state/janitor.log. `--dry` prints what it would do and writes nothing at all.
+Exit: 0 done (with or without findings) · 2 usage.
+"""
+import calendar, json, os, shutil, signal, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy: a worktree tests itself
+BOARDS, WTS, STATE, DEV = f"{HOME}/.cc/boards", f"{HOME}/.cc/worktrees", f"{HOME}/.cc/state", f"{HOME}/dev"
+LOG, SNAP = f"{STATE}/janitor.log", f"{STATE}/reconcile.json"
+STALE = 48 * 3600     # a terminal track younger than this is still being looked at — the owner reads a board, not a graveyard
+SNAP_MAX = 3600       # cc-reconcile runs every 20 min; older than this is not evidence, so we ask it for a fresh one
+PRMAX = 200           # one `gh pr list` per repo, capped: a timer job must never stall on the network
+TERMINAL = ("merged", "done")
+NEXT = "~next"        # cc-handoff's successor window suffix; `~` is not legal in a repo or track name
+
+
+def now():
+    return time.time()
+
+
+def epoch(ts):
+    """Board timestamps are UTC '2026-08-30T21:01:43Z'; anything else is 'long ago', never 'in the future'."""
+    try:
+        return float(calendar.timegm(time.strptime(str(ts), "%Y-%m-%dT%H:%M:%SZ")))
+    except Exception:
+        return 0.0
+
+
+def dur(s):
+    return f"{int(s // 86400)}d" if s >= 86400 else f"{int(s // 3600)}h"
+
+
+# ── the decisions: pure, so the selfcheck drives every branch with no box around it ──────────────────────
+def track_verdict(f):
+    """Rule 1. f: {status, age, dirty, snap} → (rm|report|keep, why). `snap` is cc-reconcile's row for this
+    track, or None when it has none. Age first, so a track that merged an hour ago is simply young rather
+    than a finding: the noisy half of a report is the half nobody reads."""
+    if f["status"] not in TERMINAL:
+        return ("keep", "")                             # rule 4: only merged and done are ever swept
+    if f["age"] <= f.get("stale", STALE):
+        return ("keep", "")
+    snap = f.get("snap")
+    if snap and snap.get("live"):
+        return ("report", "still alive — a session is in it")
+    if snap and snap.get("state") not in TERMINAL:
+        return ("report", f"the board says {f['status']}, cc-reconcile says {snap.get('state')}")
+    if f["dirty"]:
+        return ("report", "uncommitted changes in its worktree")
+    return ("rm", f"{f['status']} for {dur(f['age'])}")
+
+
+def branch_verdict(f):
+    """Rule 2. f: {board, pr, dirty} → (delete|report|keep, why). `board` is the track's board status, '' when
+    the board has never heard of it; `pr` is MERGED/OPEN/CLOSED, '?' when GitHub could not answer, None when
+    no PR exists. Only MERGED is proof; everything else is somebody's unfinished business."""
+    if f["board"] and f["board"] not in TERMINAL:
+        return ("keep", "")                             # rule 4
+    if f["dirty"]:
+        return ("report", "its worktree has uncommitted changes")
+    if f["pr"] == "MERGED":
+        return ("delete", "its PR is merged")
+    if f["pr"] in ("OPEN", "CLOSED"):
+        return ("report", f"its PR is {f['pr'].lower()}")
+    if f["pr"] == "?":
+        return ("report", "its PR state could not be read")
+    return ("report", "no PR was ever opened for it")
+
+
+def window_verdict(f):
+    """Rules 3 and 4. f: {board, bare} → (kill|report|keep, why). `bare` is already the AND of cc-reconcile's
+    liveness and the pane test — one of them saying "alive" is enough to keep it."""
+    if f["board"] and f["board"] not in TERMINAL:
+        return ("keep", "")                             # rule 4
+    if not f["bare"]:
+        return ("report", "a live process is still in it")
+    return ("kill", "a bare shell on a track that is " + (f["board"] or "not on the board"))
+
+
+# ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
+def board(repo):
+    try:
+        return json.load(open(f"{BOARDS}/{repo}.json"))
+    except Exception:
+        return None
+
+
+def terminal_since(d, track, t):
+    """When the track's status LAST became merged/done. The board's own `updated` is bumped by every note too,
+    so a merged track somebody commented on would look days younger than it is; the log says when the word
+    actually changed. Falls back to `updated` for a board written before that entry, or migrated."""
+    for e in reversed(d.get("log") or []):
+        if e.get("track") == track and str(e.get("msg", "")).startswith("status -> "):
+            return epoch(e.get("ts")) if e["msg"][len("status -> "):].strip() in TERMINAL else 0.0
+    return epoch(t.get("updated") or t.get("created"))
+
+
+def snapshot(refresh=True):
+    """cc-reconcile's read-only view of what is alive. Refreshed first when stale — `snapshot` is a local read
+    that asks nothing of the network. NOT under --dry, which writes nothing anywhere, not even another tool's
+    cache; a preview that finds the snapshot stale says so instead, because without it this cannot see who is
+    alive and its verdicts would be more confident than the real pass. Returns (tracks, stale)."""
+    if os.environ.get("CC_JANITOR_NO_SNAP"):        # tests: the no-snapshot path must be reachable on demand
+        return {}, True
+    try:
+        fresh = now() - os.stat(SNAP).st_mtime < SNAP_MAX
+    except OSError:
+        fresh = False
+    if not fresh and refresh:
+        try:
+            subprocess.run([f"{BIN}/cc-reconcile", "snapshot"], capture_output=True, timeout=120)
+            fresh = now() - os.stat(SNAP).st_mtime < SNAP_MAX
+        except Exception:
+            pass
+    try:
+        return (json.load(open(SNAP)).get("tracks") or {}), not fresh
+    except Exception:
+        return {}, True
+
+
+def dirty(wt):
+    """Uncommitted work in a worktree — untracked files included, which is exactly the case that stings: a
+    worker that wrote a file and never added it. A path with no `.git` in it is not a worktree at all (gone, or
+    an empty shell `cc rm` will take): git holds nothing there, so there is nothing to lose. Anything git
+    itself refuses to answer about counts as work in progress and gets reported."""
+    if not os.path.exists(f"{wt}/.git"):
+        return False
+    try:
+        p = subprocess.run(["git", "-C", wt, "status", "--porcelain"], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return True
+    return p.returncode != 0 or bool(p.stdout.strip())
+
+
+def windows():
+    """[(id, name)] in tmux session `main` — addressed by id, because a name with a `/` in it breaks `-t`."""
+    try:
+        p = subprocess.run(["tmux", "list-windows", "-t", "main", "-F", "#{window_id}\t#{window_name}"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    out = []
+    for ln in p.stdout.splitlines():
+        wid, _, name = ln.partition("\t")
+        if wid and name:
+            out.append((wid, name))
+    return out
+
+
+def pane_bare(wid):
+    """`cc`'s own pane_live test, negated: the wrapper bash is always the pane command, so a window holding a
+    session or a worker is one whose pane shell HAS A CHILD. No child, nothing is running in there."""
+    try:
+        p = subprocess.run(["tmux", "list-panes", "-t", wid, "-F", "#{pane_pid}"],
+                           capture_output=True, text=True, timeout=20)
+        pid = (p.stdout.splitlines() or [""])[0].strip()
+        if not pid:
+            return False                                # no pane to read → not proven bare
+        return subprocess.run(["pgrep", "-P", pid], capture_output=True, timeout=20).returncode != 0
+    except Exception:
+        return False
+
+
+def pr_states(repo, net=True):
+    """{branch: MERGED|OPEN|CLOSED} for the repo, in ONE call. A branch absent from the map has no PR; when
+    GitHub could not be asked at all the map is None, and every branch reads '?' — an unreachable GitHub is
+    not evidence about a branch, and this deletes nothing on it."""
+    cwd = f"{DEV}/{repo}"
+    if not net or not shutil.which("gh") or not os.path.isdir(cwd):
+        return None
+    try:
+        p = subprocess.run(["gh", "pr", "list", "--state", "all", "--limit", str(PRMAX),
+                            "--json", "number,state,headRefName"], cwd=cwd, capture_output=True, text=True, timeout=60)
+        rows = json.loads(p.stdout) if p.returncode == 0 else None
+    except Exception:
+        rows = None
+    if rows is None:
+        return None
+    out = {}
+    for r in rows:                                      # newest first: an older PR on the same branch never overwrites
+        out.setdefault(r.get("headRefName") or "", str(r.get("state", "")).upper())
+    return out
+
+
+def remote_tracks(repo):
+    """The `track/*` branches on origin, or None when origin could not be listed (no remote, no network)."""
+    try:
+        p = subprocess.run(["git", "-C", f"{DEV}/{repo}", "ls-remote", "--heads", "origin", "refs/heads/track/*"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    return [ln.split("refs/heads/")[-1] for ln in p.stdout.splitlines() if "refs/heads/track/" in ln]
+
+
+# ── the run ──────────────────────────────────────────────────────────────────────────────────────────────
+class Run:
+    """One sweep. Holds the log handle, the dry-run flag and the tally, so every rule reports the same way."""
+
+    def __init__(self, dry=False):
+        self.dry, self.did, self.said = dry, [], []
+
+    def log(self, repo, verb, target, why):
+        line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {repo} {verb} {target} — {why}"
+        if self.dry:
+            print(f"  would {verb} {target} — {why}")
+            return
+        print(f"  {verb} {target} — {why}")
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(LOG, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass                                        # a log nobody could write must not stop the sweep
+
+    def act(self, repo, verb, target, why, run):
+        """Do one thing, or say what it would have been. A failure is logged and the sweep carries on: one
+        stuck worktree must not leave the other nine behind it unswept."""
+        if self.dry:
+            self.log(repo, verb, target, why)
+            self.did.append(target)
+            return True
+        try:
+            p = subprocess.run(run, capture_output=True, text=True, timeout=300)
+        except Exception as e:
+            p = None
+            err = str(e)
+        if p is not None and p.returncode == 0:
+            self.log(repo, verb, target, why)
+            self.did.append(target)
+            return True
+        err = (p.stderr or p.stdout).strip().splitlines()[-1] if p is not None and (p.stderr or p.stdout).strip() else \
+            (err if p is None else f"exit {p.returncode}")
+        self.report(repo, target, f"{verb} failed: {err}")
+        return False
+
+    def report(self, repo, target, why):
+        self.said.append((target, why))
+        self.log(repo, "report", target, why)
+
+
+def sweep(repo, r, net=True, stale=STALE):
+    """One repo, the four rules in order. Rule 1 first, because `cc rm` takes the window and the board row with
+    it — so rules 2 and 3 read a board that has already had the dead swept out of it."""
+    print(f"cc-janitor {repo}{' (dry run)' if r.dry else ''}")
+    d = board(repo)
+    if d is None:
+        r.report(repo, repo, "no board — nothing to sweep")
+        return
+    snap, no_snap = snapshot(refresh=not r.dry)     # NOT `stale`: that name is this function's 48 h threshold
+    if no_snap:
+        print("  note: cc-reconcile's snapshot is stale — this pass cannot see which tracks are still alive,")
+        print("        so nothing is removed or killed this pass: report-only, the next fresh snapshot sweeps")
+
+    # 1 — terminal tracks
+    for track, t in sorted((d.get("tracks") or {}).items()):
+        wt = t.get("worktree") or f"{WTS}/{repo}/{track}"
+        f = {"status": t.get("status", ""), "age": max(0.0, now() - terminal_since(d, track, t)),
+             "snap": snap.get(f"{repo}/{track}"), "stale": stale,
+             "dirty": dirty(wt) if t.get("status", "") in TERMINAL else False}
+        verdict, why = track_verdict(f)
+        if verdict == "rm" and no_snap:
+            verdict, why = "report", f"would rm ({why}) — held: no fresh liveness snapshot"
+        if verdict == "rm":
+            wid = next((w for w, n in windows() if n == f"{repo}/{track}"), "")
+            if wid and not pane_bare(wid):
+                verdict, why = "report", "would rm — held: its window is running something"
+        if verdict == "rm":
+            r.act(repo, "rm", f"{repo}/{track}", why, [f"{BIN}/cc", "rm", repo, track])
+        elif verdict == "report":
+            r.report(repo, f"{repo}/{track}", why)
+
+    # 2 — remote branches. The board is re-read: rule 1 has just taken rows off it.
+    d = board(repo) or d
+    tracks = d.get("tracks") or {}
+    branches = remote_tracks(repo)
+    if branches is None:
+        r.report(repo, f"origin/{repo}", "origin could not be listed — no branch was touched")
+    else:
+        prs = pr_states(repo, net)
+        for b in sorted(branches):
+            track = b[len("track/"):]
+            t = tracks.get(track) or {}
+            f = {"board": t.get("status", ""), "pr": "?" if prs is None else prs.get(b),
+                 "dirty": dirty(t.get("worktree") or f"{WTS}/{repo}/{track}")}
+            verdict, why = branch_verdict(f)
+            if verdict == "delete":
+                r.act(repo, "delete", f"origin/{b}", why, ["git", "-C", f"{DEV}/{repo}", "push", "origin", "--delete", b])
+            elif verdict == "report":
+                r.report(repo, f"origin/{b}", why)
+
+    # 3 and 4 — tmux windows. The planning window is named `<repo>` exactly and is never a candidate here.
+    for wid, name in windows():
+        if not name.startswith(f"{repo}/"):
+            continue
+        track = name[len(repo) + 1:]
+        if track.endswith(NEXT):                        # a handoff successor follows its base track's rule
+            track = track[:-len(NEXT)]
+        if not track:
+            continue
+        t = tracks.get(track) or {}
+        alive = (snap.get(f"{repo}/{track}") or {}).get("live")
+        f = {"board": t.get("status", ""), "bare": not alive and pane_bare(wid)}
+        verdict, why = window_verdict(f)
+        if verdict == "kill":
+            r.act(repo, "kill", f"window {name}", why, ["tmux", "kill-window", "-t", wid])
+        elif verdict == "report":
+            r.report(repo, f"window {name}", why)
+
+
+def configured():
+    """The repos the timer sweeps: CC_JANITOR_REPOS in ~/.cc/config, whitespace separated. Unset means this box
+    has not pointed the janitor at anything yet, and a janitor with no target does nothing rather than guess."""
+    val = os.environ.get("CC_JANITOR_REPOS", "")
+    if not val:
+        try:
+            for ln in open(f"{HOME}/.cc/config"):
+                if ln.strip().startswith("CC_JANITOR_REPOS="):
+                    val = ln.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            pass
+    return val.split()
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    dry = "--dry" in argv
+    net = "--no-net" not in argv
+    repos = [a for a in argv if not a.startswith("-")]
+    if "--configured" in argv:
+        repos = configured()
+        if not repos:
+            print("cc-janitor: no repos configured (CC_JANITOR_REPOS in ~/.cc/config) — nothing swept")
+            return 0
+    if not repos:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        print("usage: cc-janitor <repo> [<repo> …] [--dry] | --configured [--dry] | selfcheck", file=sys.stderr)
+        return 2
+    r = Run(dry)
+    for repo in repos:
+        if "/" in repo or repo.startswith("."):
+            print(f"cc-janitor: '{repo}' is not a repo name", file=sys.stderr)
+            return 2
+        sweep(repo, r, net)
+    print(f"cc-janitor: {len(r.did)} swept, {len(r.said)} reported"
+          f"{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
+    return 0
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    """The decision table, then one end-to-end sweep of a fake box: its own HOME, its own board, its own
+    worktrees, a bare repo standing in for origin, and stub `tmux`/`gh` on PATH. Nothing here touches this
+    box's tmux server, its boards or GitHub, and every fixture name is a placeholder."""
+    import tempfile
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+        else:
+            f += 1
+            print(f"  FAIL {name}")
+
+    # rule 1 — a terminal track, and the four things that stop it being swept
+    def T(**kw):
+        d = {"status": "merged", "age": 5 * 86400, "dirty": False, "snap": None}
+        d.update(kw)
+        return d
+
+    ok("a track merged for days is removed", track_verdict(T())[0] == "rm")
+    ok("…and `done` is swept exactly like `merged`", track_verdict(T(status="done"))[0] == "rm")
+    ok("a track merged an hour ago is left alone — and says nothing, because young is not a finding",
+       track_verdict(T(age=3600)) == ("keep", ""))
+    ok("UNCOMMITTED WORK SURVIVES: the worktree is reported, never removed",
+       track_verdict(T(dirty=True))[0] == "report" and "uncommitted" in track_verdict(T(dirty=True))[1])
+    ok("a track cc-reconcile still calls live is reported, whatever the board says",
+       track_verdict(T(snap={"live": True, "state": "merged"}))[0] == "report")
+    ok("…and so is one the snapshot and the board disagree about",
+       track_verdict(T(snap={"live": False, "state": "running"}))[0] == "report")
+    ok("a snapshot that agrees is no obstacle", track_verdict(T(snap={"live": False, "state": "merged"}))[0] == "rm")
+    for st in ("queued", "running", "waiting", "review", "blocked"):
+        ok(f"rule 4: a {st} track is never touched", track_verdict(T(status=st)) == ("keep", ""))
+
+    # rule 2 — the remote branch
+    def B(**kw):
+        d = {"board": "", "pr": None, "dirty": False}
+        d.update(kw)
+        return d
+
+    ok("a branch whose PR merged is deleted on origin", branch_verdict(B(pr="MERGED"))[0] == "delete")
+    ok("a branch with NO PR is reported, never deleted", branch_verdict(B())[0] == "report")
+    ok("an open PR's branch is reported", branch_verdict(B(pr="OPEN"))[0] == "report")
+    ok("a PR that CLOSED without merging is reported — the one case a guess would cost real work",
+       branch_verdict(B(pr="CLOSED"))[0] == "report")
+    ok("a PR state that could not be read is reported, not acted on", branch_verdict(B(pr="?"))[0] == "report")
+    ok("rule 4: a merged PR does not free a branch whose track is still running",
+       branch_verdict(B(board="running", pr="MERGED")) == ("keep", ""))
+    ok("…nor one whose worktree has uncommitted changes",
+       branch_verdict(B(pr="MERGED", dirty=True))[0] == "report")
+    ok("a merged PR on a track already merged on the board is deleted",
+       branch_verdict(B(board="merged", pr="MERGED"))[0] == "delete")
+
+    # rules 3 and 4 — the tmux window
+    def W(**kw):
+        d = {"board": "", "bare": True}
+        d.update(kw)
+        return d
+
+    ok("a bare shell on a track the board never heard of is killed", window_verdict(W())[0] == "kill")
+    ok("…and on a merged track too", window_verdict(W(board="merged"))[0] == "kill")
+    ok("A LIVE WINDOW SURVIVES: it is reported, never killed", window_verdict(W(bare=False))[0] == "report")
+    ok("rule 4: a window whose track is still running is left alone and unremarked",
+       window_verdict(W(board="running")) == ("keep", ""))
+    ok("…for every non-terminal word the board has",
+       all(window_verdict(W(board=s)) == ("keep", "") for s in ("queued", "waiting", "review", "blocked")))
+
+    # end to end: a fake box of its own — board, worktrees, origin, tmux and gh all stubbed
+    with tempfile.TemporaryDirectory() as th:
+        repo = "sampleproj"
+        fake, dev, wts = f"{th}/fakebin", f"{th}/dev/{repo}", f"{th}/.cc/worktrees/{repo}"
+        os.makedirs(fake)
+        os.makedirs(f"{th}/.cc/state", exist_ok=True)
+        env = dict(os.environ, HOME=th, PATH=f"{fake}:{os.environ.get('PATH', '')}",
+                   CC_FAKE_TMUX=f"{th}/tmux.txt", CC_FAKE_GH=f"{th}/gh.json",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for name, body in (("tmux", FAKE_TMUX), ("gh", FAKE_GH)):
+            open(f"{fake}/{name}", "w").write(body)
+            os.chmod(f"{fake}/{name}", 0o755)
+
+        def sh(*a, **kw):
+            return subprocess.run(a, env=env, capture_output=True, text=True, timeout=120, **kw)
+
+        # a real repo with a real "origin", so a branch deletion is a real branch deletion
+        sh("git", "init", "-q", "-b", "main", dev)
+        open(f"{dev}/README", "w").write("x\n")
+        sh("git", "-C", dev, "add", "-A")
+        sh("git", "-C", dev, "commit", "-qm", "init")
+        sh("git", "init", "-q", "--bare", f"{th}/origin.git")
+        sh("git", "-C", dev, "remote", "add", "origin", f"{th}/origin.git")
+        sh("git", "-C", dev, "push", "-q", "origin", "main")
+        for b in ("gone", "openpr", "nopr"):
+            sh("git", "-C", dev, "push", "-q", "origin", f"main:refs/heads/track/{b}")
+
+        def cb(*a):
+            return subprocess.run([f"{BIN}/cc-board", *a], env=env, capture_output=True, text=True, timeout=60)
+
+        cb("init", repo, dev, "main")
+        for track, st in (("gone", "merged"), ("dirtyone", "merged"), ("young", "merged"), ("busy", "running")):
+            cb("add", repo, track, track, "")
+            cb("status", repo, track, st)
+            os.makedirs(f"{wts}/{track}", exist_ok=True)
+        # one worktree with work nobody committed: it must come out the far side untouched
+        sh("git", "-C", dev, "worktree", "add", "-q", "-b", "track/dirtyone", f"{wts}/dirtyone", "main")
+        open(f"{wts}/dirtyone/scratch.txt", "w").write("not committed\n")
+        # backdate every merged track past the 48 h line except `young`, by rewriting the log the board keeps
+        bj = f"{th}/.cc/boards/{repo}.json"
+        d = json.load(open(bj))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5 * 86400))
+        for e in d["log"]:
+            if e.get("track") in ("gone", "dirtyone") and str(e.get("msg", "")).startswith("status -> "):
+                e["ts"] = old
+        json.dump(d, open(bj, "w"), indent=2)
+
+        # two panes: one with a child (live) and one without (bare) — the same fact `cc` reads off a real pane
+        # Groups of their own, with no handle on this process's stdout: a stray `sleep` holding the pipe open
+        # keeps a `… | tail` waiting for it, which is two silent minutes at the end of the suite.
+        def fixture(*cmd):
+            return subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        live = fixture("bash", "-c", "sleep 120; true")  # `; true`, or bash execs sleep in its own place and has no child
+        bare = fixture("sleep", "120")
+        time.sleep(0.4)                                 # the live pane's shell needs its child to exist first
+        tmuxf = f"{th}/tmux.txt"
+
+        def wins():
+            return [ln.split("\t")[1] for ln in open(tmuxf).read().splitlines() if ln.strip()]
+
+        def setwins():
+            open(tmuxf, "w").write(
+                f"@1\t{repo}\t{bare.pid}\n"                    # the planning window: bare, and never a candidate
+                f"@2\t{repo}/ghost\t{bare.pid}\n"              # no board row, nothing running → killed
+                f"@3\t{repo}/busy\t{bare.pid}\n"               # rule 4: its track is running
+                f"@4\t{repo}/held{NEXT}\t{live.pid}\n"         # a handoff leftover with a live process → reported
+                f"@5\t{repo}/stalenext{NEXT}\t{bare.pid}\n")   # …and one without → killed, like its base track
+        setwins()
+        json.dump([{"number": 1, "state": "MERGED", "headRefName": "track/gone"},
+                   {"number": 2, "state": "OPEN", "headRefName": "track/openpr"}], open(f"{th}/gh.json", "w"))
+
+        def run(*a):
+            return subprocess.run([sys.executable, os.path.realpath(__file__), repo, *a],
+                                  env=env, capture_output=True, text=True, timeout=300)
+
+        # --dry first, against the very same fixture the real run then gets
+        before = (sorted(json.load(open(bj))["tracks"]), sorted(wins()),
+                  sh("git", "-C", dev, "ls-remote", "--heads", "origin").stdout)
+        rd = run("--dry")
+        ok("--dry says what it would do", "would rm" in rd.stdout and "would delete" in rd.stdout)
+        ok("--DRY CHANGES NOTHING — board, windows and origin are all exactly as they were",
+           (sorted(json.load(open(bj))["tracks"]), sorted(wins()),
+            sh("git", "-C", dev, "ls-remote", "--heads", "origin").stdout) == before)
+        ok("--dry writes no log either, nor anyone else's file — it refreshes no snapshot to get its answer",
+           not os.path.exists(f"{th}/.cc/state/janitor.log") and not os.path.exists(f"{th}/.cc/state/reconcile.json"))
+        ok("…and says so, rather than let a preview look surer about what is alive than the real pass is",
+           "snapshot is stale" in rd.stdout)
+
+        rn = subprocess.run([sys.executable, os.path.realpath(__file__), repo],
+                            env=dict(env, CC_JANITOR_NO_SNAP="1"), capture_output=True, text=True, timeout=300)
+        ok("no liveness snapshot: the deletion rules HOLD — report-only, nothing removed",
+           "gone" in json.load(open(bj))["tracks"] and "held: no fresh liveness snapshot" in rn.stdout)
+
+        r1 = run()
+        b2 = json.load(open(bj))["tracks"]
+        ok("end to end: the track merged 5 days ago is gone — worktree, branch, board row and all",
+           "gone" not in b2 and not os.path.isdir(f"{wts}/gone"))
+        ok("end to end: UNCOMMITTED WORK SURVIVES the sweep", "dirtyone" in b2 and os.path.exists(f"{wts}/dirtyone/scratch.txt"))
+        ok("end to end: …and is reported so somebody deals with it", "uncommitted" in r1.stdout)
+        ok("end to end: a track merged minutes ago is still there", "young" in b2)
+        ok("end to end: rule 4 — the running track is untouched", "busy" in b2)
+        remote = sh("git", "-C", dev, "ls-remote", "--heads", "origin").stdout
+        ok("end to end: the merged PR's branch is gone from origin", "refs/heads/track/gone" not in remote)
+        ok("end to end: the open PR's branch is still there, and reported",
+           "refs/heads/track/openpr" in remote and "origin/track/openpr" in r1.stdout)
+        ok("end to end: a branch with no PR at all is still there, and reported",
+           "refs/heads/track/nopr" in remote and "no PR was ever opened" in r1.stdout)
+        w = wins()
+        ok("end to end: the bare window for a track the board never had is killed", f"{repo}/ghost" not in w)
+        ok("end to end: THE PLANNING WINDOW SURVIVES — it is named for the repo, not for a track", repo in w)
+        ok("end to end: A LIVE WINDOW SURVIVES, and is reported", f"{repo}/held{NEXT}" in w and "live process" in r1.stdout)
+        ok("end to end: a bare `~next` leftover follows its base track and is killed", f"{repo}/stalenext{NEXT}" not in w)
+        ok("end to end: rule 4 — the running track's window survives", f"{repo}/busy" in w)
+        log = open(f"{th}/.cc/state/janitor.log").read()
+        ok("end to end: every action is in the log, with what it was and why",
+           all(s in log for s in ("rm sampleproj/gone", "delete origin/track/gone", "kill window sampleproj/ghost"))
+           and "merged for 5d" in log)
+        ok("end to end: it exits 0 — a sweep with findings is the tool working", r1.returncode == 0)
+
+        setwins()
+        r2 = run()
+        ok("end to end: a second sweep finds nothing new to remove and still exits 0",
+           r2.returncode == 0 and "rm sampleproj" not in r2.stdout)
+        ok("end to end: …and it did not come back for the branch it already deleted",
+           "delete origin/track/gone" not in r2.stdout)
+
+        # a janitor with no target does nothing rather than guess
+        rc = subprocess.run([sys.executable, os.path.realpath(__file__), "--configured"],
+                            env=dict(env, CC_JANITOR_REPOS=""), capture_output=True, text=True, timeout=60)
+        ok("--configured with nothing configured sweeps nothing, and says so",
+           rc.returncode == 0 and "no repos configured" in rc.stdout)
+        ok("…and reads the repo list off the config when it is there",
+           configured.__doc__ is not None
+           and subprocess.run([sys.executable, os.path.realpath(__file__), "--configured", "--dry"],
+                              env=dict(env, CC_JANITOR_REPOS=repo), capture_output=True, text=True,
+                              timeout=300).stdout.startswith(f"cc-janitor {repo} (dry run)"))
+        ru = subprocess.run([sys.executable, os.path.realpath(__file__)], env=env,
+                            capture_output=True, text=True, timeout=60)
+        ok("no repo named is a usage error, never a sweep of everything", ru.returncode == 2)
+
+        for proc in (live, bare):                       # the group, so the `sleep` under the live shell goes too
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=10)
+    print(f"cc-janitor selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+FAKE_TMUX = r"""#!/usr/bin/env bash
+# selfcheck stub: windows are lines "id<TAB>name<TAB>pane_pid" in $CC_FAKE_TMUX. Speaks only the four verbs
+# cc and cc-janitor use, and kill-window really removes the row so the test can see it happen.
+set -u; F="$CC_FAKE_TMUX"; cmd="${1:-}"; shift || true
+fmt=""; targ=""
+while [ $# -gt 0 ]; do case "$1" in -F) fmt="${2:-}"; shift 2;; -t) targ="${2:-}"; shift 2;; *) shift;; esac; done
+case "$cmd" in
+  has-session) exit 0;;
+  list-windows|list-panes)
+    while IFS=$'\t' read -r id name pid; do
+      [ -n "${id:-}" ] || continue
+      case "$targ" in ""|main) ;; *) [ "$targ" = "$id" ] || continue;; esac
+      s="$fmt"; s="${s//\#\{window_id\}/$id}"; s="${s//\#\{window_name\}/$name}"
+      s="${s//\#\{pane_pid\}/$pid}"; s="${s//\#\{pane_current_command\}/bash}"
+      s="${s//\#W/$name}"; s="${s//\#I/${id#@}}"
+      printf '%s\n' "$s"
+    done < "$F";;
+  kill-window)
+    t=$(mktemp); awk -F'\t' -v k="$targ" '$1!=k' "$F" > "$t"; mv "$t" "$F";;
+esac
+exit 0
+"""
+
+FAKE_GH = r"""#!/usr/bin/env bash
+# selfcheck stub: `gh pr list --json …` answers with $CC_FAKE_GH; anything else is not asked for here.
+set -u
+case "${1:-} ${2:-}" in "pr list") cat "$CC_FAKE_GH";; *) exit 1;; esac
+"""
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

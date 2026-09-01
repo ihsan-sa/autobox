@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # cc-checkpoint — auto-commit+push a track worktree. Wired as a Claude Stop hook (runs after each turn).
+#   cc-checkpoint          commit whatever changed and push it (the hook; always exits 0, never blocks a session)
+#   cc-checkpoint --push   push only, and exit non-zero saying why if it cannot — `cc done` calls this, because a
+#                          PR on an un-pushed branch is worse than no PR
 # It also records how full the session's context is (cc-context --record) and what it still owes Slack
 # (cc-owed --check), for EVERY session, track or not: the Stop payload's `transcript_path` is the only
 # handle on either, and this hook is where it arrives.
@@ -7,9 +10,66 @@
 # the primary worktree / default branch (no marker there), so main/planning sessions stay clean.
 # Refuses (and logs to .cc/checkpoint.err) when HEAD is not the track's own branch — a session can rewrite
 # HEAD with git symbolic-ref — or when the staged names look like secrets. Push stderr → .cc/push.err.
-# Always exits 0 so it can never block a session.
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
+MODE=commit; case "${1:-}" in --push) MODE=push;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
+# ── the lease ────────────────────────────────────────────────────────────────────────────────────
+# A track branch has exactly one writer, so a worker that rebased its own branch must still reach the remote. A
+# plain push is rejected non-fast-forward there and the work never becomes a PR: on 2026-08-31 a track finished
+# green with everything committed and NO PR, and only the watchdog noticed. So a DIVERGED push carries a lease:
+# --force-with-lease with an EXPLICIT expected SHA, the one this worktree last pushed (.cc/pushed).
+# The bare --force-with-lease is not good enough. It leases against refs/remotes/origin/<branch>, and any
+# fetch (rebasing onto the default branch does one) refreshes that ref, after which it overwrites somebody
+# else's commit without a murmur — measured, not assumed. Given an explicit value git compare-and-swaps against
+# what is REALLY on the remote, so a refusal means exactly one thing: something this worktree did not write is on
+# that branch. That is never overwritten and never swallowed — see lease_refused.
+lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed · 2 the lease was refused
+  local branch="$1" lease
+  # Plain push FIRST, and force nothing when it works: a fast-forward never needed a lease. It is also how a
+  # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
+  # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
+  if git push -q -u origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+  grep -qE 'non-fast-forward|fetch first' "$root/.cc/push.err.tmp" || { mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
+  lease=$(cat "$root/.cc/pushed" 2>/dev/null)
+  # Nothing recorded yet (a track older than .cc/pushed): the tracking ref is the best account of the remote we
+  # have, and one push from here replaces the guess with the real thing.
+  [ -n "$lease" ] || lease=$(git rev-parse -q --verify "refs/remotes/origin/$branch" 2>/dev/null)
+  if [ -n "$lease" ]; then
+    if git push -q -u --force-with-lease="refs/heads/$branch:$lease" origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+    mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"
+    grep -qE 'stale info|non-fast-forward|fetch first' "$root/.cc/push.err" && return 2
+    return 1; fi
+  mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 2   # diverged with nothing to lease against: assume the worst, out loud
+}
+lease_keep(){ git rev-parse "$1" > "$root/.cc/pushed" 2>/dev/null   # next time's lease: what the remote holds, because we just put it there
+  rm -f "$root/.cc/push.err" "$root/.cc/push.err.tmp"; }
+lease_refused(){   # a write this worktree did not make, on a single-writer branch: say so three ways, never none
+  local branch="$1" repo track st msg
+  repo=$(sed -n 1p "$root/.cc/track" 2>/dev/null); track=$(sed -n 2p "$root/.cc/track" 2>/dev/null)
+  msg="push refused: origin/$branch is not what this worktree last pushed, so something else wrote to that branch. The work is committed here and was NOT overwritten. Read 'git fetch origin && git log origin/$branch' before anything else."
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$root/.cc/push.err"
+  [ -n "$repo" ] && [ -n "$track" ] || return 0
+  "$BIN/cc-board" note "$repo" "$track" "$msg" >/dev/null 2>&1
+  st="$HOME/.cc/state/$repo/$track/progress.md"; mkdir -p "$(dirname "$st")" 2>/dev/null || return 0   # a track whose journal has not been started yet is still owed the warning
+  # cc-loop greps ^STATUS: BLOCKED out of the journal after every iteration and stops the track there (board
+  # `waiting`, owner told once) — that is the whole point of writing it. Only skipped when the journal ALREADY
+  # ends with this, so a hook firing every turn cannot spam it; anything else and it is said again. Loud twice
+  # beats silent once, which is the bug this file exists to close.
+  [ "$(grep -v '^[[:space:]]*$' "$st" | tail -1)" = "STATUS: BLOCKED: $msg" ] && return 0
+  printf '\n%s cc-checkpoint: %s\nSTATUS: BLOCKED: %s\n' "$(date -u +%FT%TZ)" "$msg" "$msg" >> "$st"; }
+if [ "$MODE" = push ]; then   # push only: no payload to read, no commit, and a real exit code for `cc done`
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "cc-checkpoint --push: not inside a git worktree" >&2; exit 1; }
+  cd "$root" || exit 1
+  track=$(sed -n 2p "$root/.cc/track" 2>/dev/null); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
+  # The same rule the hook keeps: only ever the track's own branch. Without it a session that repointed HEAD
+  # could have `cc done` push the default branch for it.
+  [ -n "$track" ] && [ "$branch" = "track/$track" ] || { echo "cc-checkpoint --push: HEAD is '$branch', not 'track/$track' — refusing to push" >&2; exit 1; }
+  git remote get-url origin >/dev/null 2>&1 || exit 0   # no remote at all is not a failed push
+  lease_push "$branch"; rc=$?
+  [ "$rc" = 2 ] && lease_refused "$branch"
+  [ "$rc" = 0 ] || tail -3 "$root/.cc/push.err" >&2
+  exit "$rc"
+fi
 # The hook's JSON payload (verified fields: session_id, transcript_path, cwd, stop_hook_active, …) — read
 # before anything can exit, capped, and never fatal: measuring a context must not cost a session its commit.
 # cc-context answers with a Stop decision when the session has crossed a context line; it is relayed AFTER
@@ -42,8 +102,7 @@ trap relay EXIT
   git "${ident[@]}" commit -q -m "wip: checkpoint $(date -u +%FT%TZ) [$files file(s)] [cc]" 2>/dev/null || exit 0
   rm -f "$root/.cc/checkpoint.err"
   if git remote get-url origin >/dev/null 2>&1; then   # push failures never block, but they must not be invisible either (cc ls / digest show "push!")
-    if git push -q -u origin "$branch" 2>"$root/.cc/push.err.tmp"; then rm -f "$root/.cc/push.err" "$root/.cc/push.err.tmp"
-    else mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; fi
+    lease_push "$branch"; [ $? = 2 ] && lease_refused "$branch"
   fi
 } >/dev/null 2>&1
 exit 0
