@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# cc-sandbox — a worker's `claude -p` inside bwrap: the box's secrets, the container and tmux sockets, the other tracks and
+# the control plane's source are ABSENT from the process's world, not denied by a regex (docs: design-worker-sandbox, stage 1a).
+#   cc-sandbox <repo> <track> -- <cmd...>   CC_WORKER_SANDBOX=1 → bwrap around <cmd>; anything else → exec <cmd> untouched
+#   cc-sandbox selfcheck                    a scratch repo + worktree: the world inside is what this header says
+# INSIDE rw: the track worktree · the parent repo's .git (the worktree's .git is a pointer into it), with .git/config and
+#   .git/hooks held ro — the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks (cc-loop), and a
+#   worker must not re-point its hooksPath or its remotes, nor write a hook the host would run ·
+#   ~/.cc/state/<repo>/<track> · ~/.cc/boards · ~/.npm · ~/.cache · /tmp · a private ~/.claude with settings ro, this cwd's
+#   transcripts and the repo's memory rw, nothing else of it · a COPY of ~/.claude.json with every other project's history
+#   and the MCP servers stripped (Slack stops loading: workers do not post).
+# INSIDE ro: ~/bin and the bin it links into · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
+#   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
+#   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
+#   groups become nobody).
+# AUTH: claude reads a STRIPPED copy of ~/.claude/.credentials.json at its normal path — the current access token and its
+#   expiry, no refresh token — so the read claude needs is the one cc-guard's credential rule denies the worker, and nothing
+#   goes in the environment (CLAUDE_CODE_OAUTH_TOKEN is unset inside: `env` is not gated, that path is). An iteration is ≤1 h
+#   and whichever session next needs the token refreshes the real file, so a launch with <65 min left is logged: if it
+#   expires mid-run that iteration errors and the next one starts on a fresh copy.
+# NETWORK: untouched (--unshare-net is all-or-nothing, and "none" kills claude). Own pid namespace; same process group and
+#   --die-with-parent, so cc-loop's kill of the group and the `timeout` inside both end everything.
+# BREAKS INSIDE, BY DESIGN: git push and gh (no credential — cc-loop pushes and opens the PR from outside), cc-notify (no
+#   ~/.cc/config — `STATUS: BLOCKED` in the journal is the escalation), cc --go (no tmux). Missing a path? Add ONE bind line
+#   here, reviewable — never a wider one. Known cost: the parent .git is rw, so a worker CAN move refs of the main checkout;
+#   that is the worktree model, unchanged from before, and the reason stage 2 is a container. And a relative core.hooksPath
+#   (this repo's core/.githooks) names tracked files the worker edits: cc-loop's host-side git runs the main checkout's copy
+#   instead, but `cc done` typed by hand on that worktree still merges with the worktree's — review the branch first.
+set -uo pipefail
+H="$HOME"; SELF=$(readlink -f "$0")
+slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.claude/projects: every / and . becomes -
+build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the rw targets that may not exist yet are created
+  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f
+  proj="$H/.claude/projects/$(slug "$wt")"; mem="$H/.claude/projects/$(slug "$dev")/memory"
+  mkdir -p "$proj" "$mem" "$H/.npm" "$H/.cache" "$H/.cc/boards" "$st"
+  B=(--die-with-parent --unshare-pid
+     --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
+     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
+     --bind "$wt" "$wt" --bind "$dev/.git" "$dev/.git" --ro-bind "$dev/.git/config" "$dev/.git/config"
+     --bind "$st" "$st" --bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
+     --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin"
+     --ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json" --bind "$proj" "$proj" --bind "$mem" "$mem"
+     --unsetenv TMUX --unsetenv TMUX_PANE --unsetenv SSH_AUTH_SOCK --unsetenv DOCKER_HOST --unsetenv CLAUDE_CODE_OAUTH_TOKEN --chdir "$wt")
+  [ -d "$dev/.git/hooks" ] && B+=(--ro-bind "$dev/.git/hooks" "$dev/.git/hooks")   # the host's checkpoint runs hooks: none of them may be the worker's
+  cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
+  [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
+  [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)   # /etc/resolv.conf points here
+  for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
+launch(){   # $1 repo · $2 track · the rest is the command
+  local wt="$H/.cc/worktrees/$1/$2" cred="$H/.claude/.credentials.json" tok="" exp left
+  build "$1" "$2"; shift 2
+  [ -d "$wt" ] || { echo "cc-sandbox: no worktree $wt" >&2; exit 2; }
+  tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred" 2>/dev/null) || tok=""
+  if [ -z "$tok" ]; then echo "cc-sandbox: no access token in $cred — claude inside will not authenticate" >&2
+  else exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred" 2>/dev/null); left=$(( ${exp:-0} / 1000 - $(date +%s) ))
+    [ "$left" -lt 3900 ] && echo "cc-sandbox: the access token expires in $((left / 60)) min — if it does mid-run, this iteration errors and the next starts on the refreshed one" >&2; fi
+  # fd 3: the ~/.claude.json copy · fd 4: the credentials copy — claudeAiOauth minus its refresh token, nothing else of the file
+  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
+    3< <(jq --arg wt "$wt" '.projects |= ((. // {}) | with_entries(select(.key == $wt))) | .mcpServers = {}' "$H/.claude.json" 2>/dev/null || printf '{}') \
+    4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
+selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
+  local r="_ccsbx$$" dev wt st n=0 bad=0 out want
+  dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
+  t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
+  g(){ sed -n "s/^$1=//p" <<<"$out" | head -1; }
+  command -v bwrap >/dev/null 2>&1 || { echo "cc-sandbox selfcheck: bwrap is not installed"; return 1; }
+  mkdir -p "$dev" "$st" "$H/.cc/state/$r/u" "$H/.cc/worktrees/$r" || return 1
+  git -C "$dev" init -q -b main && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init || return 1
+  git -C "$dev" worktree add -q -b track/t "$wt" && git -C "$dev" worktree add -q -b track/u "$H/.cc/worktrees/$r/u" || return 1
+  mkdir -p "$wt/.cc"; : > "$wt/.cc/track"
+  # ON: what the world inside contains — every line a fact a reviewer of the bind list would ask about
+  out=$(CC_WORKER_SANDBOX=1 TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak "$SELF" "$r" t -- sh -c '
+    e(){ [ -e "$1" ] && echo present || echo absent; }
+    echo cred=$(jq -c "[(.claudeAiOauth.accessToken != null), (.claudeAiOauth.refreshToken != null), (keys | length)]" ~/.claude/.credentials.json 2>/dev/null)$(stat -c %a ~/.claude/.credentials.json 2>/dev/null)
+    echo gh=$(e ~/.config/gh); echo ccbox=$(e ~/ccbox); echo ccconfig=$(e ~/.cc/config); echo hooks=$(touch ~/dev/'"$r"'/.git/hooks/x 2>/dev/null && echo writable || echo ro)
+    echo ssh=$(e ~/.ssh); echo sock=$(e /var/run/docker.sock)$(e /run/docker.sock); echo tmux=${TMUX:-unset}
+    echo dockergrp=$(id -Gn | tr " " "\n" | grep -c "^docker$"); echo pid1=$(ls /proc | grep -c "^[0-9]" | awk "{print (\$1 < 20) ? \"few\" : \"many\"}")
+    echo cwd=$PWD; echo status=$(git status --short >/dev/null 2>&1 && echo ok || echo broken); echo common=$(git rev-parse --git-common-dir)
+    echo x > f && git add f && git -c user.name=t -c user.email=t@t commit -qm c >/dev/null 2>&1 && echo commit=ok || echo commit=broken
+    echo gitconfig=$(git config user.name z 2>/dev/null && echo writable || echo ro); echo bin=$(touch ~/bin/x 2>/dev/null && echo writable || echo ro)
+    echo tracks=$(ls ~/.cc/worktrees/'"$r"' | tr "\n" " "); echo states=$(ls ~/.cc/state/'"$r"' | tr "\n" " "); echo dev=$(ls -A ~/dev/'"$r"' | tr "\n" " ")
+    echo tok=${CLAUDE_CODE_OAUTH_TOKEN:+set}; echo cj=$(jq -r "(.projects|length),(.mcpServers|length)" ~/.claude.json | tr "\n" ","); echo settings=$(touch ~/.claude/settings.json 2>/dev/null && echo writable || echo ro)
+    echo tmp=$(touch /tmp/x && echo ok); echo runuser=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)' 2>&1)
+  want='[false,false,0]'; jq -e '.claudeAiOauth.accessToken' "$H/.claude/.credentials.json" >/dev/null 2>&1 && want='[true,false,1]'   # the real file has one → the copy has it, no refresh token, nothing else
+  t 'credentials: a stripped copy, mode 600' "$(g cred)" "${want}600";  t 'config/gh absent' "$(g gh)" absent;  t 'ccbox absent' "$(g ccbox)" absent;  t '.git/hooks is ro' "$(g hooks)" ro
+  t 'cc/config absent' "$(g ccconfig)" absent;  t 'ssh absent' "$(g ssh)" absent;  t 'the container socket absent' "$(g sock)" absentabsent
+  t 'TMUX unset' "$(g tmux)" unset;  t 'not in the docker group' "$(g dockergrp)" 0;  t 'own pid namespace' "$(g pid1)" few
+  t 'cwd is the worktree' "$(g cwd)" "$wt";  t 'git status works' "$(g status)" ok;  t 'the parent .git resolves' "$(g common)" "$dev/.git"
+  t 'a commit works' "$(g commit)" ok;  t '.git/config is ro' "$(g gitconfig)" ro;  t 'bin is ro' "$(g bin)" ro
+  t 'only this track is there' "$(g tracks)" t;  t 'only this track state' "$(g states)" t;  t 'the rest of the repo is gone' "$(g dev)" .git
+  t 'no token in the environment' "$(g tok)" "";  t 'claude.json copy: no other projects, no MCP' "$(g cj)" '0,0,'
+  t 'settings.json is ro' "$(g settings)" ro;  t '/tmp is writable' "$(g tmp)" ok;  t 'the host /run/user (its sockets) is not there' "$(g runuser)" 0
+  # OFF: nothing changes — argv byte for byte, the environment untouched
+  out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
+  t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
+  out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
+  git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$dev" worktree remove --force "$H/.cc/worktrees/$r/u" >/dev/null 2>&1
+  rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")"
+  printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
+case "${1:-}" in selfcheck) selfcheck; exit $?;; esac
+repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
+launch "$repo" "$track" "$@"

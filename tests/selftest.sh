@@ -174,6 +174,8 @@ rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
 echo "== cc-context (the real number, and what refuses to run without it) =="
 ctx=$("$B/cc-context" selfcheck 2>&1)
 grep -q '0 failed' <<<"$ctx" && ok "cc-context selfcheck: ${ctx##*: }" || bad "cc-context selfcheck: $ctx"
+sbx=$("$B/cc-sandbox" selfcheck 2>&1 | tail -1)   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
+grep -q '0 failed' <<<"$sbx" && ok "cc-sandbox selfcheck: ${sbx##*: }" || bad "cc-sandbox selfcheck: $sbx"
 export CC_CTX_RECORDS="$T/ctx" CC_CTX_BOX_MODEL=   # records under $T, and this box's own model never sizes a fixture
 PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1
 sid=$("$B/cc-board" get $REPO w1 session_id)
@@ -858,7 +860,25 @@ mktrack w12 "fail every time"
 mkclaude failclaude w12 'err=true; res="fatal: it broke"'
 CC_CLAUDE="$T/failclaude" "$B/cc-loop" $REPO w12 --max-iter 5 --quiet >/dev/null 2>&1; rc=$?
 { [ "$rc" = 5 ] && [ "$(nruns w12)" = 2 ] && ! lg w12 | grep -q 'carrying on'; } && ok "an error is never carried on either — two in a row and it stops (exit 5)" || bad "error carried on: rc=$rc runs=$(nruns w12)"
-for t in w8 w9 w10 w11 w12; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
+# 7+8: what the loop does OUTSIDE the worker's process (sandbox stage 1a, review of #129). A sandboxed worker's Stop hook
+# commits but cannot push (no credential inside), so the loop pushes whatever is ahead of origin — even with nothing
+# left to commit. And the hooks that loop-side git runs come from the MAIN checkout, never the worktree the worker edits.
+mktrack w13 "commit inside, push from outside"
+mkclaude insideclaude w13 'echo "committed inside $n" > "inside-$n.txt"; git add -A && git commit -qm "inside, unpushed"; echo "- step $n" >> "$st/progress.md"; echo "STATUS: BLOCKED: q" >> "$st/progress.md"'
+CC_CLAUDE="$T/insideclaude" "$B/cc-loop" $REPO w13 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 3 ] && [ -n "$(git -C "$T/remote.git" rev-parse -q --verify track/w13)" ] && [ "$(git -C "$T/remote.git" rev-parse -q --verify track/w13)" = "$(git -C ~/.cc/worktrees/$REPO/w13 rev-parse HEAD)" ]; } \
+  && ok "a commit the worker made itself reaches origin from outside the loop's checkpoint, with nothing left to commit (a sandboxed Stop hook cannot push)" \
+  || bad "inside commit never pushed: rc=$rc remote=$(git -C "$T/remote.git" rev-parse -q --verify track/w13) local=$(git -C ~/.cc/worktrees/$REPO/w13 rev-parse HEAD)"
+mktrack w14 "write a hook"; st14=~/.cc/state/$REPO/w14
+git -C ~/dev/$REPO config core.hooksPath hooks   # relative, like a repo that tracks its hooks (core/.githooks): git resolves it against whichever worktree it runs in
+mkdir -p ~/dev/$REPO/hooks; printf '#!/bin/sh\ntouch %s/hook-main\n' "$st14" > ~/dev/$REPO/hooks/pre-commit; chmod +x ~/dev/$REPO/hooks/pre-commit
+mkclaude hookclaude w14 'mkdir -p hooks; printf "#!/bin/sh\ntouch $st/hook-wt\n" > hooks/pre-commit; chmod +x hooks/pre-commit; echo "- step $n" >> "$st/progress.md"; echo "STATUS: BLOCKED: q" >> "$st/progress.md"'
+CC_CLAUDE="$T/hookclaude" "$B/cc-loop" $REPO w14 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+{ git -C ~/.cc/worktrees/$REPO/w14 log -1 --format=%s | grep -q '^wip: checkpoint' && [ -e "$st14/hook-main" ] && [ ! -e "$st14/hook-wt" ]; } \
+  && ok "loop-side git (the checkpoint) runs the MAIN checkout's hooks, never the one the worker just wrote into its worktree" \
+  || bad "host ran the worktree's hook: rc=$rc main=$([ -e "$st14/hook-main" ] && echo ran || echo no) wt=$([ -e "$st14/hook-wt" ] && echo RAN || echo no) last=$(git -C ~/.cc/worktrees/$REPO/w14 log -1 --format=%s)"
+git -C ~/dev/$REPO config --unset core.hooksPath; rm -f ~/dev/$REPO/hooks/pre-commit; rmdir ~/dev/$REPO/hooks
+for t in w8 w9 w10 w11 w12 w13 w14; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
 echo "== usage limits (cc-limit + cc-loop) =="
 L(){ HOME="$T/lh" CC_LIMIT_STAMP="$T/lh/claude-limit" "$B/cc-limit" "$@"; }; mkdir -p "$T/lh"; lf="$T/lim.json"; miss=""   # own HOME: the table never touches the box's real stamp

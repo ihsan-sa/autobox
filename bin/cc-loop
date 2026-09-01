@@ -31,6 +31,7 @@
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
 # Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
+# Env: CC_WORKER_SANDBOX=1 runs claude inside bwrap — secrets, sockets, other tracks absent (cc-sandbox; design-worker-sandbox stage 1a).
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # headless workers: same PATH guarantee as cc (systemd-started clients lack ~/bin)
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
@@ -117,6 +118,12 @@ if [ -f "$HOME/dev/$repo/.cc/member-workspace" ] && [ "${CC_MEMBER_SANDBOX:-}" !
   echo "cc-loop: $repo is a member workspace — its workers run inside the boundary (member-sandbox) or not at all" >&2; exit 2
 fi
 ST="$HOME/.cc/state/$repo/$track"; WT="$HOME/.cc/worktrees/$repo/$track"; BOARD="$BIN/cc-board"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
+# Host-side git on the worktree (the checkpoint, its push, cc done) runs the MAIN checkout's hooks, never the worktree's: with a
+# relative core.hooksPath (core/.githooks) a hook is a tracked file the worker edits, and this loop would run it with the host's
+# credentials, tmux and docker group — the very things the sandbox removes. Scoped to those calls, not exported: the worker's
+# own environment stays exactly what it was (cc-sandbox promises that byte for byte when it is off).
+hp=$(git -C "$HOME/dev/$repo" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$HOME/dev/$repo/.git/hooks";; /*) ;; *) hp="$HOME/dev/$repo/$hp";; esac
+HG=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp")
 mkdir -p "$ST/runs"; [ -s "$ST/task.md" ] || { echo "cc-loop: no task at $ST/task.md (use: cc $repo $track --go \"...\")" >&2; exit 2; }
 [ -d "$WT" ] || { echo "cc-loop: no worktree $WT (run: cc $repo $track)" >&2; exit 2; }
 touch "$ST/progress.md"; LOG="$ST/loop.log"; SNAP="$ST/.progress.snap"
@@ -150,7 +157,7 @@ while [ $i -lt "$MAXI" ]; do
   [ -n "$m" ] && args+=(--model "$m"); [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
   log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS)"
   out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"
-  ( cd "$WT" && CC_ROLE=worker exec timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration
+  ( cd "$WT" && CC_ROLE=worker exec "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
   child=$!; wait "$child"; rc=$?; child=""
   if lim=$("$BIN/cc-limit" check "$out" "$out.err"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
@@ -162,7 +169,8 @@ while [ $i -lt "$MAXI" ]; do
   cost=$(jq -r '.total_cost_usd // 0' "$out" 2>/dev/null); iserr=$(jq -r '.is_error // false' "$out" 2>/dev/null)
   turns=$(jq -r '.num_turns // 0' "$out" 2>/dev/null); subtype=$(jq -r '.subtype // ""' "$out" 2>/dev/null)
   spent=$(awk -v a="$spent" -v b="${cost:-0}" 'BEGIN{printf "%.4f", a+b}')
-  ( cd "$WT" && CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
+  ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
+  ( cd "$WT" && env "${HG[@]}" CC_ROLE=worker "$BIN/cc-checkpoint" --push ) || true   # …and push whatever is ahead of origin even with nothing left to commit: inside the sandbox the Stop hook commits but cannot push (no credential), and only this line can
   after_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); after_prog=$(md5sum "$ST/progress.md" | cut -c1-8)
   moved=no; { [ "$before_head" != "$after_head" ] || [ "$before_prog" != "$after_prog" ]; } && moved=yes
   log "iter $i end rc=$rc err=$iserr/$subtype turns=$turns cost=\$$cost total=\$$spent commits=$([ "$before_head" != "$after_head" ] && echo yes || echo no) journal=$([ "$before_prog" != "$after_prog" ] && echo updated || echo unchanged)"
@@ -170,7 +178,7 @@ while [ $i -lt "$MAXI" ]; do
   newprog=$(grep -vxFf "$SNAP" "$ST/progress.md" 2>/dev/null)   # only THIS iteration's lines count, even if the worker rewrote the file (a re-dispatched track must not "finish" on an old STATUS line)
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1
-    log "DONE"; "$BIN/cc" done "$repo" "$track" 2>&1 | tail -1 | tee -a "$LOG" >&2
+    log "DONE"; env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1 | tail -1 | tee -a "$LOG" >&2
     "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $("$BOARD" get "$repo" "$track" pr)"; exit 0; fi
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
     stop 3 "needs you" "$q  (answer: append it to $ST/task.md, drop the STATUS line from $ST/progress.md, then: cc $repo $track --go \"\")" waiting; fi
