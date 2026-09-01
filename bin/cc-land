@@ -728,22 +728,29 @@ class Land:
         rc, o = sh(["git", "pull", "--ff-only", "-q"], cwd=self.root, timeout=300)
         if rc:
             raise Failed(f"git pull --ff-only in {self.root}: {last(o)}")
+        # What is INSTALLED, written down: the next sweep compares origin against this, which is how a merge made in
+        # GitHub's own UI — or an auto-merge landing an hour later — is noticed at all. Recorded once install.sh has
+        # run — a failed install leaves the box "behind" on purpose, so the 15-min catch-up retries it — or, for a
+        # repo with no install.sh, right after the pull: ~/bin points into the checkout, so there the pull IS the
+        # deploy. While that record came after the Skip nothing was ever written, so every catch-up found the box
+        # behind, re-pulled, and re-announced a landing that had happened once (lesson-builder and
+        # lesson-builder-skill, every tick, all morning of 2026-09-01).
+        def note():
+            rc, o = sh(["git", "rev-parse", "HEAD"], cwd=self.root)
+            if not rc and o.strip():                             # an empty SHA is not a record, it is a lie
+                try:
+                    record_applied(self.repo, o.strip())
+                except OSError as e:
+                    out("·", f"could not record the applied SHA: {e}")   # the deploy happened; only the note about it failed
         inst = next((p for p in ("core/install.sh", "install.sh") if os.access(f"{self.root}/{p}", os.X_OK)), "")
         if not inst:
-            raise Skip("no install.sh in this repo — nothing to link")
+            note()
+            raise Skip(f"pulled {self.base()}; no install.sh in this repo — nothing to link")
         rc, o = sh([f"{self.root}/{inst}"], cwd=os.path.dirname(f"{self.root}/{inst}"), timeout=900)
         if rc:
             raise Failed(f"{inst}: {last(o)}")
         sh(["systemctl", "--user", "daemon-reload"], timeout=120)
-        # What is INSTALLED, written down: the next sweep compares origin against this, which is how a merge made in
-        # GitHub's own UI — or an auto-merge landing an hour later — is noticed at all. Recorded only here, because
-        # only here has install.sh actually run on it.
-        rc, o = sh(["git", "rev-parse", "HEAD"], cwd=self.root)
-        if not rc:
-            try:
-                record_applied(self.repo, o.strip())
-            except OSError as e:
-                out("·", f"could not record the applied SHA: {e}")   # the deploy happened; only the note about it failed
+        note()
         return f"pulled {self.base()}, ran {inst}, daemon-reload"
 
     # -- 8. units this change ADDED, which land switched off -----------------------------------------------
@@ -1257,6 +1264,11 @@ def cmd_queue(argv):
 def cmd_selfcheck():
     import contextlib, io
     fails, calls, cwds, reacted, world = [], [], [], [], {}
+    # Hermetic from the first line: every section below reaches install()/record_applied through the fake world, and
+    # the ledger it writes must be a scratch one — a selfcheck once wrote ~/.cc/state/land/myrepo.applied into the LIVE
+    # deploy ledger (2026-09-01), after which known_repos() carried a phantom repo on every catch-up tick.
+    _real_landq = LANDQ
+    globals().update(LANDQ=tempfile.mkdtemp(prefix="cc-land-selfcheck-h-"))
 
     def check(name, cond):
         print(("  ✓ " if cond else "  ✗ ") + name)
@@ -1936,6 +1948,26 @@ def cmd_selfcheck():
         check("...and a box already on that commit queues nothing — the sweep is silent when there is nothing to "
               "catch up on",
               catchup() == [] and not os.path.exists(job_path("myrepo", "deploy")))
+        # ---- a repo with NO install.sh: the pull is its whole deploy. The applied SHA used to be recorded only
+        # AFTER install.sh had run — so where there was none, the Skip came first and nothing was ever written, and
+        # every 15-min catch-up found origin past "what is installed", re-pulled, and told the channel it had landed
+        # again (lesson-builder and lesson-builder-skill, every tick, all morning of 2026-09-01).
+        fresh(pr=7)
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        world["git rev-parse HEAD"] = (0, "cccccc1\n")
+        world["git rev-parse origin/main"] = (0, "cccccc1\n")
+        world[f"{BIN}/cc-scope list"] = (0, "[]")
+        real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")   # gates, no install.sh
+        try:
+            quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+            quiet(cmd_work, [])
+        finally:
+            os.access = real_access
+        check("a repo with no install.sh lands ONCE: the pull is recorded as applied before the install step "
+              "skips, so the next catch-up sees origin == applied and queues nothing (with the record after the "
+              "skip, 'landed' was re-announced every 15 min)",
+              not ran("install.sh") and applied_sha("myrepo") == "cccccc1" and len(gh_merges()) == 1
+              and catchup() == [] and not os.path.exists(job_path("myrepo", "deploy")))
         os.unlink(f"{qdir}/myrepo.applied")
         world["git rev-parse --abbrev-ref HEAD"] = (0, "track/w1\n")
         check("with nothing recorded yet and the checkout parked on a feature branch, the box refuses to GUESS "
@@ -1947,7 +1979,7 @@ def cmd_selfcheck():
               "sweep, and one unreachable origin must not sit in front of the landing a 👍 is waiting on",
               due_catchup() and not due_catchup() and CATCHUP_EVERY == 900)
     finally:
-        globals().update(LANDQ=real_q, start_worker=real_start, known_repos=real_repos)
+        globals().update(LANDQ=_real_landq, start_worker=real_start, known_repos=real_repos)
         shutil.rmtree(qdir, ignore_errors=True)
 
     # 12. the seam itself, with the fakes taken back off: the REAL cc-scope, in a real subprocess, on a
