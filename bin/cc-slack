@@ -18,6 +18,9 @@
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>          rewrite / delete one of the BOT's own posts (signed ones too)
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md   pin a message · replace a channel canvas
   cc-slack status | channels | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>
+  cc-slack member add <@user>…        give each a PRIVATE #<handle> (+ -updates) with the owner in it and ~/dev/<handle>
+                                      — the same thing a `team_join` does by itself. Idempotent; the owner is exempt.
+  cc-slack members                    who has a workspace: handle → channels → folder → budget used today
   cc-slack mkchannel <name>… [--public]    create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the
                                       topic; a #<repo>--<sub> name also inherits #<repo>'s people (one channel per project).
                                       A repo channel comes as a PAIR: #<name>-updates is created and routed with it
@@ -802,6 +805,259 @@ def provision_dir(target, chan, at=None):
         log(f"provision {target}: state not saved: {e!r}")   # the dir exists; only the cap's memory is short
     log(f"provision {target}: ~/dev/{target} for #{chan} (member-facing)")
     return True, ""
+
+
+# ---------------------------------------------------------------- member workspaces (overlay: docs/design-member-workspaces.md)
+MEMBERS = "members.json"                                      # {"<handle>": {"uid": U…, "chan": name, "at": ts}}: who has a workspace
+MEMBER_MARKER = ".cc/member-workspace"                        # at ~/dev/<handle>: the ROOT of a member's world. cc-guard keys its
+                                                              # workspace rule on this file's PRESENCE and on the dir's name — never on
+                                                              # what is written inside it, which the member's own session could rewrite.
+MEMBER_DAILY_DEFAULT = 20                                     # USD/day a member's workspace may dispatch (config: MEMBER_DAILY_USD).
+                                                              # Below cc-loop's own default budget ($8/iteration) every dispatch is refused.
+MEMBER_MARKER_TEXT = ("# member workspace — the DIRECTORY NAME is the handle; nothing reads this file's contents\n"
+                      "# (overlay: docs/design-member-workspaces.md)\n")
+RESERVED_HANDLES = ("box", APPROVALS, ALERTS)                 # `box` is where DMs route; the other two are not sessions at all
+MEMBER_SPEND = f"{HOME}/.cc/state/member-spend.json"           # {"<handle>": {"day": "YYYY-MM-DD", "usd": n}} — written by `cc` at --go
+NEW_PROJECT_RE = re.compile(r"^\s*new\s+project\s+[`\"']?([A-Za-z0-9][A-Za-z0-9._-]{0,30})[`\"']?\s*$", re.I)
+MEMBER_README = """# {handle}
+
+Your workspace on {box}. Everything you make lives under this folder and nowhere else on the box.
+
+- `#{chan}` is this workspace. Say `new project <name>` there and you get `#{chan}--<name>`,
+  its updates lane and a project under here.
+- `#{chan}-updates` carries the automated flow — progress, budget notices, audits.
+
+The owner is in every channel the box makes for you. See `docs/design-member-workspaces.md`.
+"""
+
+
+def member_handle(name):
+    """A Slack handle folded into a target/channel name: lower case, anything outside [a-z0-9-] to `-`, no repeats
+    or edges. Same folding as chan_target, so `#<handle>` routes to `<handle>` by name and needs no route entry."""
+    h = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (name or "").lower())).strip("-")
+    return h[:40]
+
+
+def load_members():
+    try:
+        d = json.load(open(f"{DIR}/{MEMBERS}"))
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_members(m):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = f"{DIR}/{MEMBERS}.tmp"
+    with open(tmp, "w") as f:
+        os.fchmod(f.fileno(), 0o600); json.dump(m, f, indent=1, sort_keys=True)
+    os.replace(tmp, f"{DIR}/{MEMBERS}")
+
+
+def workspace_of(target):
+    """The member workspace `target` belongs to, or None. `<handle>` and `<handle>/<project>` both answer `<handle>`;
+    the marker file at ~/dev/<handle> is the truth, not members.json — a hand-made workspace works the same way."""
+    h = (target or "").partition("/")[0]
+    return h if h and os.path.isfile(f"{DEV}/{h}/{MEMBER_MARKER}") else None
+
+
+def member_authority(target, uid):
+    """"instructions" when `uid` is the member whose workspace `target` is: in their OWN channel their word is an
+    instruction, everywhere else a member is still weighed and not obeyed. Empty for anyone else, the owner included
+    (his role=owner already says it)."""
+    h = workspace_of(target)
+    m = load_members().get(h) if h else None
+    return "instructions" if m and uid and m.get("uid") == uid else ""
+
+
+def member_budget(cfg=None):
+    try:
+        v = float((cfg or {}).get("MEMBER_DAILY_USD") or MEMBER_DAILY_DEFAULT)
+    except (TypeError, ValueError):
+        v = MEMBER_DAILY_DEFAULT
+    return v
+
+
+def member_spent(handle, day=None):
+    """USD already committed by `handle`'s workspace today. Yesterday's row reads 0 — the ledger rolls by date, so
+    nothing has to sweep it."""
+    day = day or time.strftime("%Y-%m-%d")
+    try:
+        e = json.load(open(MEMBER_SPEND)).get(handle) or {}
+    except Exception:
+        return 0.0
+    try:
+        return float(e.get("usd") or 0) if e.get("day") == day else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def provision_member_workspace(handle, chan, at=None):
+    """~/dev/<handle> as the member's own repo: provision_dir's CLAUDE.md + `.cc/member-facing` + `git init`, plus a
+    README, a board of its own and `.cc/member-workspace`. Idempotent — an existing workspace is topped up, never
+    rebuilt. Returns (ok, why)."""
+    d = f"{DEV}/{handle}"
+    if needs_dir(handle):
+        ok, why = provision_dir(handle, chan, at)
+        if not ok:
+            return False, why
+    try:
+        os.makedirs(f"{d}/.cc", exist_ok=True)
+        with open(f"{d}/{MEMBER_MARKER}", "w") as f:
+            f.write(MEMBER_MARKER_TEXT)       # PRESENCE is the whole signal: the handle is the dir's name (cc-guard reads the path)
+        open(f"{d}/.cc/member-facing", "a").close()
+        if not os.path.exists(f"{d}/README.md"):
+            with open(f"{d}/README.md", "w") as f:
+                f.write(MEMBER_README.format(handle=handle, chan=chan, box=BOX))
+        if not os.path.isdir(f"{d}/.git"):
+            subprocess.run(["git", "init", "-q", d], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        # `.cc/` NEVER ENTERS A COMMIT — excluded before the `git add -A` below, exactly as `cc` does it for a track
+        # worktree. Committed markers travel into every worktree and checkpoint of this workspace as ordinary,
+        # editable files claiming an identity; the guard reads paths, but nothing should be tempted to read them.
+        with contextlib.suppress(OSError):
+            os.makedirs(f"{d}/.git/info", exist_ok=True)
+            ex = f"{d}/.git/info/exclude"
+            if ".cc/" not in (open(ex).read().split() if os.path.exists(ex) else []):
+                with open(ex, "a") as f:
+                    f.write(".cc/\n")
+        # A FIRST COMMIT, or the workspace has no branch to make a worktree from and `cc <handle> <project>` fails on
+        # the member's very first project ("invalid reference: HEAD"). An empty repo is not a repo tracks can grow on.
+        if subprocess.run(["git", "-C", d, "rev-parse", "-q", "--verify", "HEAD"], stdin=subprocess.DEVNULL,
+                          capture_output=True, timeout=30).returncode != 0:
+            subprocess.run(["git", "-C", d, "add", "-A"], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+            subprocess.run(["git", "-C", d, "-c", "user.name=cc", "-c", "user.email=cc@localhost",
+                            "commit", "-q", "-m", f"{handle}'s workspace"],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        EFFECTS.run([f"{BIN}/cc-board", "init", handle, d, "main"], stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=30)
+    except EffectDenied:
+        raise
+    except Exception as e:
+        log(f"member workspace {handle}: {e!r}")
+        return False, f"could not finish `~/dev/{handle}` ({e.__class__.__name__})"
+    return True, ""
+
+
+def reserved_name(name, routes=None, lane=True):
+    """Why the box must not make `#name` for a member, or "". A member's channel routes BY NAME, so a handle that
+    folds onto a name the box already answers to creates nothing: ensure_channel finds that channel and invites the
+    joiner INTO it. `box` (where the owner's DMs route), #approvals, #alerts, anybody's `-updates` lane and every
+    name or target in routes.json are the box's own — a joiner who folds onto one is told, not handed the channel."""
+    n = (name or "").lower()
+    if not n:
+        return "that name leaves nothing the box can use"
+    if n in RESERVED_HANDLES:
+        return f"`{n}` is one of the box's own channels"
+    if lane and main_lane(n):
+        return f"`{n}` reads as the updates lane of #{main_lane(n)}"
+    r = load_routes() if routes is None else routes
+    for k, v in (r or {}).items():
+        if str(k).lstrip("#").lower() == n or str(v or "").partition("/")[0].lower() == n:
+            return f"`{n}` is already routed to a session on this box"
+    return ""
+
+
+def member_uid_name(cfg, uid):
+    """(handle, refusal) for a user id — humans only. A bot, an app, a deleted account or Slackbot never gets a
+    workspace, and neither does an id Slack will not describe: guessing a handle would name somebody else's folder."""
+    try:
+        u = api("users.info", cfg["SLACK_BOT_TOKEN"], user=uid)["user"]
+    except EffectDenied:
+        raise
+    except Exception as e:
+        return None, f"cannot read {uid} from Slack ({e.__class__.__name__})"
+    if u.get("is_bot") or u.get("is_app_user") or u.get("deleted") or uid == "USLACKBOT":
+        return None, f"{uid} is a bot or a deleted account — no workspace"
+    h = member_handle(u.get("name") or (u.get("profile") or {}).get("display_name_normalized") or "")
+    return (h, "") if h else (None, f"{uid} has no handle the box can turn into a folder name")
+
+
+def ensure_member(cfg, uid, at=None):
+    """ONE join = one private channel pair + one workspace, for a non-owner. `cc-slack member add` and the team_join
+    event both land here — the event calls this, never a second copy of it. Every step under it is idempotent, so a
+    second join changes nothing and posts nothing. Returns (status, handle, message):
+    "owner" (exempt), "created", "exists", "refused"."""
+    at = time.time() if at is None else at
+    if not uid:
+        return "refused", None, "no user id"
+    if uid == cfg.get("SLACK_OWNER_ID"):
+        return "owner", None, "the owner owns the box — he gets no workspace of his own"
+    handle, why = member_uid_name(cfg, uid)
+    if not handle:
+        return "refused", None, why
+    members = load_members()
+    known = members.get(handle) or {}
+    if known.get("uid") and known["uid"] != uid:
+        return "refused", handle, f"#{handle} already belongs to {known['uid']} — two people cannot share one workspace"
+    if not known and os.path.isdir(f"{DEV}/{handle}") and not os.path.isfile(f"{DEV}/{handle}/{MEMBER_MARKER}"):
+        return "refused", handle, f"~/dev/{handle} is already a repo on this box — rename it, or give {uid} another handle"
+    if not known:
+        why = reserved_name(handle) or reserved_name(updates_name(handle), lane=False)   # its own lane is not a collision
+        if why:
+            return "refused", handle, f"{why} — {uid} needs a different handle before the box can make one"
+        for n in (handle, updates_name(handle)):
+            with contextlib.suppress(Exception):
+                if find_channel(cfg, n)[0]:   # somebody else's channel: creating would be JOINING, and inviting a stranger in
+                    return "refused", handle, f"#{n} already exists here — rename it or give {uid} another handle"
+    # WORKSPACE AND RECORD FIRST, CHANNELS AFTER. The other order made #<h> and #<h>-updates, then refused the
+    # provisioning (the hourly cap, a git error) with members.json unwritten — and every retry stopped above at
+    # "#<h> already exists here" until the owner archived both by hand. Now a join that stops early leaves either
+    # nothing or a record without channel ids, and the SAME call again finishes it: the record says the channels
+    # are this uid's, so an existing #<h> is completed (bot in, member and owner invited), never refused.
+    ok, why = provision_member_workspace(handle, handle, at)
+    if not ok:
+        return "refused", handle, why
+    rec = dict(known, uid=uid, chan=handle, updates=updates_name(handle), at=known.get("at") or at)
+    if rec != known:
+        members[handle] = rec
+        save_members(members)          # a record with no ids yet = a join half done; the ids follow
+    cid, how = ensure_channel(cfg, handle, True, invite=(uid,))
+    ucid, _ = ensure_updates_lane(cfg, handle, cid, True)
+    done = bool(known.get("chan_id")) and bool(known.get("updates_id"))   # both halves were already on record
+    members[handle] = dict(rec, chan_id=cid, updates_id=ucid)
+    if members[handle] != known:
+        try:
+            save_members(members)
+        except Exception as e:
+            log(f"member {handle}: state not saved: {e!r}")
+    if done:
+        return "exists", handle, f"#{handle} and ~/dev/{handle} already exist — nothing changed"
+    post(cfg, cid, f"Welcome — this channel is yours, and so is `~/dev/{handle}` on {BOX}. Say `new project <name>` "
+                   f"here and you get its own channel and folder. A session of your own starts once the sandbox that "
+                   f"keeps this workspace to itself lands (docs/design-member-workspaces.md); until then the box "
+                   f"creates the channels and folders and the owner is in all of them.")
+    log(f"member {handle} ({uid}): #{handle} {how}, #{updates_name(handle)}, ~/dev/{handle}")
+    return "created", handle, f"#{handle} + #{updates_name(handle)} + ~/dev/{handle}"
+
+
+def new_project(cfg, handle, project):
+    """`new project <x>` from a member's own channel: `#<handle>--<x>` and its updates lane (both start with
+    #<handle>'s people, so the member and the owner are in both), routed to `<handle>/<x>` by NAME — there is no
+    route to write. The worktree is not made here: `cc <handle> <x>` makes it on the first session, like any track.
+    Returns (ok, message)."""
+    project = member_handle(project)
+    if not project:
+        return False, "a project name has to survive as [a-z0-9-] — try another"
+    if not os.path.isfile(f"{DEV}/{handle}/{MEMBER_MARKER}"):
+        return False, f"~/dev/{handle} is not a member workspace"
+    name = f"{handle}--{project}"
+    why = reserved_name(name)      # `new project x-updates` would fold onto #<handle>--x's own lane
+    if why:
+        return False, f"{why} — pick another project name"
+    parent = None
+    with contextlib.suppress(Exception):
+        parent = find_channel(cfg, handle)[0]
+    m = load_members().get(handle) or {}
+    cid, how = ensure_channel(cfg, name, True, parent, invite=(m["uid"],) if m.get("uid") else ())
+    ensure_updates_lane(cfg, name, cid, True)
+    with contextlib.suppress(Exception):
+        api("conversations.setTopic", cfg["SLACK_BOT_TOKEN"], channel=cid,
+            topic=f"→ Claude session `{handle}/{project}` on {BOX} — {handle}'s project, messages here reach it")
+    EFFECTS.run([f"{BIN}/cc-board", "add", handle, project, project, ""], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=30)
+    log(f"member {handle}: project {project} ({how}) → {handle}/{project}")
+    return True, (f"`{handle}/{project}` — #{name} and #{updates_name(name)} are yours and the owner's. "
+                  f"Its session starts with the rest of this workspace's.")
 
 
 def detect_target(cwd=None):
@@ -2089,6 +2345,9 @@ class Daemon:
 
     def autostart(self, target):
         """No subscriber: start the session (or explain why one can't take the message). Returns a state string."""
+        if workspace_of(target):
+            return "no-sandbox"   # THE BOUNDARY: no member workspace session on the host, whatever asked for one —
+                                  # a message, a land_blocked hand-off, a queue flush (overlay: docs/design-member-workspaces.md).
         win = window_for(target)
         wid, cmd = tmux_window(win)
         if wid and not pane_idle(wid):
@@ -2373,8 +2632,48 @@ class Daemon:
         except Exception as e:
             log(f"post failed: {e}")
 
+    def on_team_join(self, ev):
+        """Somebody joined the workspace → they get a private channel of their own, its updates lane and ~/dev/<handle>.
+        Everything is in ensure_member (the same code `cc-slack member add` runs); this only unwraps the event and
+        never raises into the socket loop. The owner's own join does nothing: he owns the box."""
+        u = ev.get("user")
+        uid = (u.get("id") if isinstance(u, dict) else u) or ""
+        if uid[:1] not in ("U", "W"):   # W… is an Enterprise Grid user id: resolve_user takes them, so does this
+            return
+        try:
+            status, handle, msg = ensure_member(self.cfg, uid)
+        except Exception as e:
+            log(f"team_join {uid}: {e!r}"); return
+        log(f"team_join {uid}: {status} {handle or ''} — {msg}")
+
+    def member_channel(self, ws, target, text, chat, thread, ts, user, is_owner):
+        """A message in a member workspace channel, while NO member session may run on the host (see
+        docs/design-member-workspaces.md, "the boundary"). The daemon answers the one thing that has to work without
+        a session — `new project <x>` — and otherwise says once what is missing, rather than starting an unbounded
+        session for somebody the box cannot yet contain. The authority rule is computed here so it is the SAME rule
+        a session will see: the workspace's own member instructs in their own channel, anybody else is only weighed."""
+        authority = "instructions" if is_owner else member_authority(target, user)
+        m = NEW_PROJECT_RE.match(text or "")
+        if m and not authority:
+            self.say(chat, "only this workspace's own member or the owner starts a project here", thread)
+            return
+        if m:
+            try:
+                ok, msg = new_project(self.cfg, ws, m.group(1))
+            except Exception as e:
+                log(f"new project {ws}/{m.group(1)}: {e!r}")
+                ok, msg = False, f"could not create it ({e.__class__.__name__}) — the owner can see why on the box"
+            self.say(chat, msg if ok else f"❌ {msg}", thread)
+            return
+        if time.time() - self.told.get((target, "no-session"), 0) > 600:
+            self.told[(target, "no-session")] = time.time()
+            self.say(chat, f"Heard — but `{target}` has no session yet: one starts when the sandbox that keeps this "
+                           f"workspace to itself lands. `new project <name>` works here today.", thread)
+
     def on_event(self, ev):
         self.mark_dirty(ev)
+        if ev.get("type") == "team_join":
+            return self.on_team_join(ev)
         if ev.get("type") == "app_home_opened":
             self.home_burst_until = time.time() + 60   # the owner is looking: instant, then the fast cadence for a minute, then 30 s
             return self.publish_home()          # the owner tapped the bot: refresh the dashboard now, never post
@@ -2483,6 +2782,10 @@ class Daemon:
                                "(`#myapp`), `#repo--track` for a track, or `#box` for the box session; or add a route "
                                "in ~/.cc/slack/routes.json.", thread)
             return
+        ws = workspace_of(target)
+        if ws:   # a member's own world — answered by the daemon, never by a session on the host (the boundary)
+            react(self.cfg, chat, ts, "eyes")
+            return self.member_channel(ws, target, text, chat, thread, ts, user, is_owner)
         if needs_dir(target):   # a channel that is not a project yet becomes one HERE, on its first message — never in advance
             ok, why = provision_dir(target, self.chan_name(chat))
             if not ok:
@@ -2497,7 +2800,10 @@ class Daemon:
         meta = {"chat_id": chat, "thread_ts": thread, "ts": ts, "user": self.user_name(user),
                 "role": "owner" if is_owner else "member",
                 "channel": "dm" if ctype == "im" else "#" + self.chan_name(chat), "target": target,
-                "lane": "main" if ctype == "im" else lane_of(self.chan_name(chat), target)}
+                "lane": "main" if ctype == "im" else lane_of(self.chan_name(chat), target),
+                # Reached once member sessions can run (inside the boundary): today member_channel intercepts a
+                # workspace channel before this. The rule is computed in one place either way — member_authority.
+                **({"authority": "instructions"} if member_authority(target, user) else {})}
         if ev.get("files"):
             names = ", ".join(f.get("name", "file") for f in ev["files"])
             paths = self.fetch_files(ev["files"])
@@ -4720,11 +5026,13 @@ def inherit_members(cfg, parent, cid, name):
         return 0
 
 
-def ensure_channel(cfg, name, private=True, parent=None):
+def ensure_channel(cfg, name, private=True, parent=None, invite=()):
     """#name exists, the bot is in it and the owner is invited → (id, "created"|"joined"|"member"). One place for it:
     `mkchannel` and a sub-orch's own channel are the same three calls (channels:manage / groups:write cover all of them).
     PRIVATE by default: what the box creates is visible to the people invited to it, and those people ARE who the session
-    there answers. `parent` (a channel id) hands the new channel the parent's humans — on creation only, never a re-sync."""
+    there answers. `parent` (a channel id) hands the new channel the parent's humans — on creation only, never a re-sync.
+    `invite` = ids to put in alongside the owner (a member, for their own workspace and project channels). THE OWNER IS
+    NEVER OPTIONAL: every channel the box makes for somebody else is a channel he is in."""
     tok = cfg["SLACK_BOT_TOKEN"]
     cid, member = find_channel(cfg, name)
     how = "member"
@@ -4739,13 +5047,14 @@ def ensure_channel(cfg, name, private=True, parent=None):
             inherit_members(cfg, parent, cid, name)   # before the owner invite: one clean batch into an empty channel
     elif not member:
         api("conversations.join", tok, channel=cid); how = "joined"
-    owner = cfg.get("SLACK_OWNER_ID")
-    if owner:
+    for who in [cfg.get("SLACK_OWNER_ID")] + [u for u in invite if u]:
+        if not who:
+            continue
         try:
-            api("conversations.invite", tok, channel=cid, users=owner)
+            api("conversations.invite", tok, channel=cid, users=who)
         except RuntimeError as e:
             if "already_in_channel" not in str(e):
-                log(f"invite owner to #{name}: {e}")
+                log(f"invite {who} to #{name}: {e}")
     try:
         os.unlink(f"{DIR}/channels.json")            # the name→id cache predates this channel
     except FileNotFoundError:
@@ -4830,6 +5139,64 @@ def cmd_mkchannel(argv):
     print("Anyone you add to a channel can talk to that session and their reactions count as yours (:+1: merges, 🏁 closes); "
           "only you answer permission prompts and the owner gates.")
     return rc
+
+
+def resolve_user(cfg, who):
+    """A user id out of what a person types: `<@U123>`, `<@U123|name>`, `U123`, `@handle`, or a bare handle."""
+    t = (who or "").strip().lstrip("<").rstrip(">").split("|")[0].lstrip("@").strip()
+    if re.fullmatch(r"[UW][A-Z0-9]{6,}", t):
+        return t
+    table = user_table(cfg)
+    return table.get(t.lower()) or table.get(member_handle(t))
+
+
+def cmd_member(argv):
+    """`cc-slack member add <@user>…` — the owner's hand-run half of a team_join. Same ensure_member, same
+    idempotence: running it on somebody who already has a workspace prints so and changes nothing."""
+    cfg = load_cfg()
+    if not cfg.get("SLACK_BOT_TOKEN"):
+        print("no SLACK_BOT_TOKEN — cc slack setup first", file=sys.stderr); return 1
+    if len(argv) < 2 or argv[0] != "add":
+        print("cc-slack member add <@user>…", file=sys.stderr); return 2
+    rc = 0
+    for who in argv[1:]:
+        uid = resolve_user(cfg, who)
+        if not uid:
+            print(f"{who}: no such person in this workspace (give <@U…> or their handle)", file=sys.stderr); rc = 1; continue
+        try:
+            status, handle, msg = ensure_member(cfg, uid)
+        except Exception as e:
+            print(f"{who}: {e.__class__.__name__}: {e}", file=sys.stderr); rc = 1; continue
+        print(f"{who} → {status}: {msg}")
+        if status == "refused":
+            rc = 1
+    return rc
+
+
+def member_projects(handle):
+    """Project channels this workspace has, from its own board — one shell-out, and none if it has no board yet."""
+    try:
+        r = EFFECTS.run([f"{BIN}/cc-board", "json", handle], capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=15)
+        return sorted((json.loads(r.stdout) or {}).get("tracks") or {})
+    except Exception:
+        return []
+
+
+def cmd_members():
+    """handle → channel(s) → workspace → budget used today: who the box has let in, and what they have spent."""
+    cfg = load_cfg(); members = load_members(); cap = member_budget(cfg)
+    if not members:
+        print("no member workspaces yet — `cc-slack member add <@user>`, or let a team_join make one"); return 0
+    for h in sorted(members):
+        e = members[h]
+        chans = [f"#{e.get('chan') or h}", f"#{e.get('updates') or updates_name(h)}"]
+        chans += [f"#{h}--{p}" for p in member_projects(h)]
+        print(f"{h:<16} {e.get('uid') or '?':<12} ~/dev/{h:<16} ${member_spent(h):.2f}/${cap:.2f} today")
+        print(f"{'':<16} {', '.join(chans)}")
+    print("The owner is in every one of those channels. No member session runs yet: it starts inside the sandbox "
+          "(docs/design-member-workspaces.md).")
+    return 0
 
 
 def cmd_updates_sweep(argv):
@@ -8495,6 +8862,168 @@ def cmd_selfcheck():
         subprocess.run(["rm", "-rf", devP])
         for _f in (ORCHS, PROVISIONED):
             os.path.exists(f"{DIR}/{_f}") and os.unlink(f"{DIR}/{_f}")
+    # ---- MEMBER WORKSPACES (docs/design-member-workspaces.md). One join = one PRIVATE channel pair + one workspace;
+    #      the same join again = nothing; the OWNER's own join = nothing at all (he owns the box). The owner is in
+    #      every channel the box makes. And `new project x` from the member's own channel makes the project pair,
+    #      routed to <handle>/x by name — from the member or the owner, from nobody else.
+    class FakeWs:
+        """Just enough Slack for ensure_member/new_project: channels, who was invited to each, topics."""
+        def __init__(self):
+            self.chans, self.invites, self.created, self.topics = {}, {}, [], {}
+            self.posts, self.fail_create = [], False       # (channel name, text) of every post; Slack "down" for creates
+
+        def name_of(self, cid):
+            return next((n for n, c in self.chans.items() if c == cid), "")
+
+        def api(self, method, token, **kw):
+            if method == "conversations.list":
+                return {"channels": [{"id": c, "name": n, "is_member": True} for n, c in self.chans.items()]}
+            if method == "conversations.create":
+                if self.fail_create:
+                    raise RuntimeError("selfcheck: slack is down")
+                cid = f"C{len(self.chans) + 1}"; self.chans[kw["name"]] = cid; self.created.append(kw["name"])
+                return {"channel": {"id": cid}}
+            if method == "conversations.invite":
+                self.invites.setdefault(self.name_of(kw["channel"]), []).extend(
+                    u for u in kw["users"].split(",") if u not in self.invites.get(self.name_of(kw["channel"]), []))
+                return {"ok": True}
+            if method == "conversations.members":
+                return {"members": self.invites.get(self.name_of(kw["channel"]), [])}
+            if method == "users.info":
+                return {"user": {"id": kw["user"], "name": {"UALICE": "Alice.B", "UOWNER": "owner", "UBOX": "Box",
+                                                           "UUPD": "myproj-updates", "UCAROL": "Carol",
+                                                           "UDAVE": "Dave", "UERIN01": "Erin", "UFRANK": "Frank",
+                                                           "UGRACE": "Grace"}.get(kw["user"], kw["user"])}}
+            if method == "conversations.setTopic":
+                self.topics[kw["channel"]] = kw["topic"]; return {"ok": True}
+            if method == "chat.postMessage":
+                self.posts.append((self.name_of(kw.get("channel")), str(kw.get("text") or "")))
+            if method in ("conversations.join", "chat.postMessage", "reactions.add", "reactions.remove"):
+                return {"ok": True, "ts": "1.0", "channel": kw.get("channel")}
+            raise RuntimeError(f"selfcheck: unexpected {method}")
+
+    fkm = FakeWs()
+    cfgw = {"SLACK_BOT_TOKEN": "xoxb-selfcheck", "SLACK_OWNER_ID": "UOWNER"}
+    dmw = Daemon(use_slack=False); dmw.cfg = cfgw; dmw.bot_user, dmw.bot_id = "UBOT", "BBOT"
+    saidw = []; dmw.say = lambda chat, text, thread=None: saidw.append(text)
+    dmw.chan_name = lambda c: fkm.name_of(c)
+    _apim, _runm = globals()["api"], EFFECTS.run_impl
+    _routesm, _cfgm = globals()["load_routes"], globals()["load_cfg"]
+    try:
+        globals()["api"] = fkm.api
+        EFFECTS.run_impl = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "{}", "")
+        dmw.on_event({"type": "team_join", "user": {"id": "UALICE"}})
+        made1, mem1 = sorted(fkm.created), sorted(load_members())
+        dmw.on_event({"type": "team_join", "user": {"id": "UALICE"}})        # the same person joins twice
+        made2 = sorted(fkm.created)
+        dmw.on_event({"type": "team_join", "user": {"id": "UOWNER"}})        # …and the owner joins his own workspace
+        made3, mem3 = sorted(fkm.created), sorted(load_members())
+        wsdir = f"{DEV}/alice-b"
+        made_ws = (os.path.isfile(f"{wsdir}/{MEMBER_MARKER}") and os.path.isfile(f"{wsdir}/README.md")
+                   and os.path.isfile(f"{wsdir}/.cc/member-facing")
+                   and subprocess.run(["git", "-C", wsdir, "rev-parse", "-q", "--verify", "HEAD"],
+                                      capture_output=True).returncode == 0)   # a track needs a commit to branch from
+        tracked = subprocess.run(["git", "-C", wsdir, "ls-tree", "-r", "--name-only", "HEAD"],
+                                 capture_output=True, text=True).stdout.split()
+        marker_body = open(f"{wsdir}/{MEMBER_MARKER}").read()
+        routed = dmw.route(fkm.chans["alice-b"], "channel")
+        cid_a = fkm.chans["alice-b"]
+        dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.1", "user": "UALICE",
+                      "text": "new project todo", "channel_type": "channel"})
+        made4 = sorted(fkm.created)
+        routed_p = dmw.route(fkm.chans.get("alice-b--todo", "?"), "channel")
+        dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.2", "user": "USTRANGER",
+                      "text": "new project sneaky", "channel_type": "channel"})
+        made5 = sorted(fkm.created)
+        proj_upd = new_project(cfgw, "alice-b", "todo-updates")   # would fold onto #alice-b--todo's own lane
+        dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.3", "user": "UALICE",
+                      "text": "how is it going?", "channel_type": "channel"})
+        no_session = any("no session yet" in t for t in saidw)
+        # NAMES THE BOX ALREADY OWNS. A member channel routes by NAME, so a handle that folds onto one of them
+        # creates nothing — ensure_channel finds that channel and invites the joiner INTO it. `box` is where the
+        # owner's DMs route, `carol` is somebody else's channel, `dave` is in routes.json, and an `-updates` name
+        # is another channel's lane. Each must be refused before anything at all is made.
+        globals()["load_routes"] = lambda: {"#dave": "somerepo"}
+        fkm.chans["carol"] = "C90"
+        before_coll = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
+        coll = {u: ensure_member(cfgw, u)[0] for u in ("UBOX", "UUPD", "UCAROL", "UDAVE")}
+        after_coll = sorted(fkm.created), sorted(os.listdir(DEV)), sorted(load_members())
+        carol_untouched = "UCAROL" not in fkm.invites.get("carol", [])
+        # `cc-slack member add <@u>` is the owner's hand-run half of the same join — the same function, same
+        # idempotence, and it is the ONLY trigger until the app is reinstalled with the team_join event.
+        globals()["load_cfg"] = lambda: cfgw
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc_cli, made_cli = cmd_member(["add", "<@UERIN01>"]), sorted(fkm.created)
+            rc_cli2, made_cli2 = cmd_member(["add", "<@UERIN01>"]), sorted(fkm.created)
+        # A JOIN THAT STOPS HALF-WAY IS FINISHED BY THE NEXT ONE, never locked out. Channels used to come first: a
+        # refused provisioning (the hourly cap) left #<h> standing with no record, and every retry died on "#<h>
+        # already exists here". Frank: provisioning refused once. Grace: workspace made, then Slack went down.
+        _prov = globals()["provision_member_workspace"]
+        globals()["provision_member_workspace"] = lambda h, c, at=None: (False, "selfcheck: provisioning refused")
+        try:
+            st_f1 = ensure_member(cfgw, "UFRANK")[0]
+        finally:
+            globals()["provision_member_workspace"] = _prov
+        frank_half = (sorted(fkm.created), "frank" in load_members(), os.path.isdir(f"{DEV}/frank"))
+        st_f2 = ensure_member(cfgw, "UFRANK")[0]
+        frank_done = ({"frank", "frank-updates"} <= set(fkm.created)
+                      and (load_members().get("frank") or {}).get("chan_id") == fkm.chans.get("frank"))
+        late = time.time() + 2 * PROVISION_WINDOW      # grace joins in the next window: frank used the hour's last slot
+        fkm.fail_create = True
+        try:
+            ensure_member(cfgw, "UGRACE", late); st_g1 = "no error"
+        except RuntimeError:
+            st_g1 = "raised"
+        fkm.fail_create = False
+        grace_half = ("grace" in load_members(), "grace" not in fkm.chans, os.path.isfile(f"{DEV}/grace/{MEMBER_MARKER}"))
+        st_g2, st_g3 = ensure_member(cfgw, "UGRACE", late)[0], ensure_member(cfgw, "UGRACE", late)[0]
+        grace_done = ((load_members().get("grace") or {}).get("chan_id") == fkm.chans.get("grace")
+                      and {"UGRACE", "UOWNER"} <= set(fkm.invites.get("grace", [])))
+        welcomes = [c for c, t in fkm.posts if t.startswith("Welcome")]
+        started = list(dmw.queues) + list(dmw.subs)
+        owner_in_all = all("UOWNER" in fkm.invites.get(n, []) for n in fkm.created)   # every channel the box made, whoever it was for
+        member_in_all = (all("UALICE" in fkm.invites.get(n, []) for n in fkm.created if n.startswith("alice-b"))
+                         and "UERIN01" in fkm.invites.get("erin", []))
+    finally:
+        globals()["api"], EFFECTS.run_impl = _apim, _runm
+        globals()["load_routes"], globals()["load_cfg"] = _routesm, _cfgm
+    check("a team_join for a non-owner creates the PAIR (#<handle> + #<handle>-updates) and ~/dev/<handle> once — "
+          "and the same join again creates nothing, changes nothing and posts nothing",
+          made1 == ["alice-b", "alice-b-updates"] and mem1 == ["alice-b"] and made2 == made1 and made_ws)
+    check("the OWNER's own team_join creates nothing at all — he owns the whole box",
+          made3 == made2 and mem3 == mem1 and "owner" not in load_members())
+    check("routing needs no table: #<handle> IS the target and #<handle>--<x> IS <handle>/<x>",
+          routed == "alice-b" and routed_p == "alice-b/todo")
+    check("`new project todo` in the member's own channel creates #alice-b--todo and its updates lane…",
+          made4 == sorted(made1 + ["alice-b--todo", "alice-b--todo-updates"]))
+    check("…but only for the workspace's own member or the owner: anyone else in the channel creates nothing",
+          made5 == made4 and any("own member or the owner" in t for t in saidw))
+    check("THE OWNER IS IN EVERY CHANNEL THE BOX MADE, and so is the member",
+          owner_in_all and member_in_all and len(fkm.created) == 10)   # alice, alice--todo, erin, frank, grace pairs
+    check("no member SESSION is started on the host: the channel is answered by the daemon and says why "
+          "(docs/design-member-workspaces.md, \"the boundary\")", no_session and not started)
+    check("the workspace's identity is WHERE it is, not what is written in it: the marker's body says so, and `.cc/` "
+          "is excluded before the first commit — a committed marker would ride into every worktree as an editable "
+          "file claiming a handle",
+          "DIRECTORY NAME" in marker_body and "alice-b" not in marker_body
+          and tracked and not [f for f in tracked if f.startswith(".cc/")])
+    check("a handle the box already owns is REFUSED, not adopted: `box` (where DMs route), an `-updates` name, a "
+          "channel that already exists and a name in routes.json — nothing created, no channel joined, no stranger "
+          "invited into somebody else's channel",
+          set(coll.values()) == {"refused"} and after_coll == before_coll and carol_untouched)
+    check("`cc-slack member add <@u>` is the same join by hand — it creates the pair and the workspace, and running "
+          "it again changes nothing", rc_cli == 0 and rc_cli2 == 0
+          and made_cli == sorted(after_coll[0] + ["erin", "erin-updates"]) and made_cli2 == made_cli)
+    check("`new project <x>-updates` is refused: its channel would read as another project's updates lane",
+          proj_upd[0] is False and "updates lane" in proj_upd[1])
+    check("a join whose provisioning is refused makes NO channel and no record — and the same join again completes it",
+          st_f1 == "refused" and frank_half == (made_cli2, False, False) and st_f2 == "created" and frank_done)
+    check("a join that made the workspace and then lost Slack is finished by the next one: the record says the "
+          "channels are theirs, so #<h> is completed instead of refused as 'already exists' — and welcomed once",
+          st_g1 == "raised" and grace_half == (True, True, True) and st_g2 == "created" and st_g3 == "exists"
+          and grace_done and welcomes.count("frank") == 1 and welcomes.count("grace") == 1)
+
+
     check("selfcheck: the channel-is-a-session checks never touched the ~/dev they were handed",
           DEV == scratch_dev and not os.path.exists(devP))
     deadline = time.time() + 20                              # publish_soon works OFF-thread: let it finish before judging
@@ -8893,6 +9422,10 @@ def main(argv):
         return cmd_mkchannel(rest)
     elif cmd == "updates-sweep":
         return cmd_updates_sweep(rest)
+    elif cmd == "member":
+        return cmd_member(rest)
+    elif cmd == "members":
+        return cmd_members()
     elif cmd == "orch-channel":
         return cmd_orch_channel(rest)
     elif cmd == "archive":

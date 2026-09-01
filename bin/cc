@@ -40,6 +40,49 @@ sp_main(){ local repo="$1" base="$2"
   printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<brief>\"' (the brief's one home is ~/.cc/state/$repo/<track>/task.md; add and --go only ever ADD to it — replacing one is 'cc board set $repo <track> instructions \"...\"') then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."; }
 member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
 MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed)."
+MEMBER_SPEND="$STBASE/member-spend.json"   # {"<handle>": {"day": "YYYY-MM-DD", "usd": n}} — the ledger behind the per-workspace daily cap
+member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> is one member's whole world: docs/design-member-workspaces.md (overlay)
+sandbox_gate(){   # $1 repo — NO member workspace session runs on this host. The owner's rule is that a workspace
+  # "should not be able to access or read anything outside" itself, and that is an execution boundary, not a
+  # blocklist: until member-sandbox ships the boundary (and the member-scoped Slack link with it), every launch
+  # for a workspace target is refused here, whoever asked — Slack autostart, the daemon, a person at the terminal.
+  # Inside the boundary CC_MEMBER_SANDBOX=1 is set and the same command works. See the design doc, "The boundary".
+  member_workspace "$1" || return 0
+  [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && return 0
+  echo "cc: ~/dev/$1 is a member workspace — its sessions run only inside the boundary (track member-sandbox), never on the host. Refused."
+  return 1
+}
+member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_DAILY_USD/day. The cost is PRE-charged at
+  # dispatch (budget x loops), so the cap bounds exposure rather than accounting for it, and the owner is told in the
+  # workspace's own updates lane when it bites. Nothing here applies to any other repo.
+  member_workspace "$1" || return 0
+  local repo="$1" budget="" loops="${LOOPN:-1}" prev="" a want cap day cur spent
+  if [ ${#XTRA[@]} -gt 0 ]; then for a in "${XTRA[@]}"; do [ "$prev" = --budget ] && budget="$a"; prev="$a"; done; fi
+  # `--budget 1e9` was charged as $8 (not a number → the default) and passed through as-is: a cap the dispatch it
+  # gates then ignores. A budget the ledger cannot add up is refused here, before anything is charged (cc-loop too).
+  if [ -n "$budget" ] && ! [[ "$budget" =~ ^[0-9]+([.][0-9]+)?$ ]]; then echo "cc: --budget must be a plain number in USD (got '$budget')"; return 1; fi
+  [ -n "$budget" ] || budget=8      # cc-loop's own default when --budget is not given
+  case "$loops" in ''|*[!0-9]*) loops=1;; esac
+  want=$(awk -v b="$budget" -v n="$loops" 'BEGIN{printf "%.2f", b * n}')
+  cap=$("$BIN/cc-config" get MEMBER_DAILY_USD 20 2>/dev/null) || cap=20   # >= cc-loop's own default budget ($8/iter), or every plain --go is refused
+  case "$cap" in ''|*[!0-9.]*) cap=20;; esac
+  day=$(date -u +%F); mkdir -p "$STBASE"
+  exec 8>"$MEMBER_SPEND.lock" || return 0; flock 8            # two dispatches at once must not both see the same headroom
+  cur=$(jq -c . "$MEMBER_SPEND" 2>/dev/null) || cur='{}'; [ -n "$cur" ] || cur='{}'
+  spent=$(printf '%s' "$cur" | jq -r --arg h "$repo" --arg d "$day" 'if (.[$h].day // "") == $d then (.[$h].usd // 0) else 0 end' 2>/dev/null) || spent=0
+  case "$spent" in ''|*[!0-9.]*) spent=0;; esac
+  if awk -v s="$spent" -v w="$want" -v c="$cap" 'BEGIN{exit !(s + w > c)}'; then
+    exec 8>&-
+    echo "cc: $repo has used \$$spent of its \$$cap/day and this dispatch asks for \$$want — refused."
+    "$BIN/cc-slack" post -c "#$repo-updates" "💸 \`$repo\` has used its \$$cap for today, so a dispatch was refused. Raise \`MEMBER_DAILY_USD\` or let it roll over." >/dev/null 2>&1 || true
+    return 1
+  fi
+  printf '%s' "$cur" | jq --arg h "$repo" --arg d "$day" --argjson w "$want" \
+    '.[$h] = {day: $d, usd: ((if (.[$h].day // "") == $d then (.[$h].usd // 0) else 0 end) + $w)}' > "$MEMBER_SPEND.tmp" \
+    && mv "$MEMBER_SPEND.tmp" "$MEMBER_SPEND"
+  exec 8>&-
+  return 0
+}
 ensure_main(){ tmux has-session -t "$SESSION" 2>/dev/null || "$BIN/cc-boot"; }   # server creation goes through tmux-main.service (cgroup ownership; 2026-08-26 incident)
 attach_main(){ [ -t 0 ] || return 0; if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$SESSION" 2>/dev/null || true; else exec tmux attach -t "$SESSION"; fi; }
 win_id(){ tmux list-windows -t "$SESSION" -F '#{window_id} #W' 2>/dev/null | awk -v n="$1" '$2==n{print $1; exit}'; }   # address windows by id: names with . or / break -t main:<name>
@@ -240,6 +283,7 @@ esac
 CONT=""; [ "$1" = "-c" ] && { CONT="-c"; shift; }
 repo="${1:?repo}"; track="${2:-}"; shift; [ -n "$track" ] && shift
 valid_name "$repo"
+sandbox_gate "$repo" || exit 1     # before anything is created or attached: this is every launch path's one door
 ensure_main; "$BIN/cc-trust" "$DEV/$repo" >/dev/null 2>&1 || true
 if [ "$track" = "--orch" ]; then
   alias="${1:-}"; brief="${2:-}"; [[ "$alias" =~ ^[a-z0-9-]{2,20}$ ]] || { echo "cc: --orch alias must match ^[a-z0-9-]{2,20}\$"; exit 1; }
@@ -269,6 +313,7 @@ while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; s
 case "$mode" in
   say) have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
   go)  if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
+       member_gate "$repo" || exit 1
        # THE BRIEF HAS ONE HOME: $st/task.md. It used to have two — that file and the board's `instructions` —
        # merged by substring on every dispatch, and that merge destroyed the brief it was dispatched with on FOUR
        # tracks (#71 and #79 each fixed one variant; on 2026-08-31 a 4590-byte brief became one sentence, on both

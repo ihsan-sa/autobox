@@ -3,7 +3,8 @@
 export CC_NOTIFY_LOG_ONLY=1   # never push to the owner from tests
 export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage limit resets' is capped at 1 s
 # claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside another copy of itself in another
-# worktree: every run is namespaced (see $RUN below) and cleans up after itself.  Usage: tests/selftest.sh
+# worktree: every run is namespaced (see $RUN below), the two runs take turns (see the lock below) and each
+# cleans up after itself.  Usage: tests/selftest.sh
 # Exercises the bin/ THIS file ships with (a track worktree tests its own copy, not the ~/bin symlinks).
 set -uo pipefail
 exec </dev/null; unset CC_ROLE CC_HANDOFF   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
@@ -13,6 +14,40 @@ exec </dev/null; unset CC_ROLE CC_HANDOFF   # never inherit a tty (`cc` would at
 # gates in one night, in both directions: cases that passed only for a handoff survivor, and cases that failed only
 # for one. Each was patched individually and the class came back within the hour. Unset it once, here, for all of it.
 B="$(cd "$(dirname "$0")/../bin" && pwd)"
+SELF="$(readlink -f "$0")"
+# ── one run at a time ────────────────────────────────────────────────────────────────────────────────────────
+# $RUN namespaces everything this suite OWNS; it cannot namespace what the box only has one of — the live `main`
+# tmux server, ~/.claude.json, the cc-model dialog panes. Two suites at once fight over those, and on 2026-08-31/
+# 09-01 that cost three land cycles: red runs that were green alone. A false red is worse than a slow one — it can
+# false-open the main-gate row — so overlapping runs QUEUE here rather than race. Wait, never fail: the second run
+# is not wrong, it is early.
+LOCKF="${CC_SELFTEST_LOCK:-$HOME/.cc/selftest.lock}"; mkdir -p "$(dirname "$LOCKF")"
+if [ -z "${CC_SELFTEST_HELD:-}" ]; then
+  exec {LK}>>"$LOCKF"   # >> and never >: a waiter that truncated the file would wipe the pid it is about to read
+  if ! flock -n $LK; then
+    # Whoever holds it wrote their pid a hair after taking it, so what the file says for that hair is the pid the
+    # PREVIOUS run left. Read until the name is of something actually alive, then say it, once, and queue.
+    h=$(head -1 "$LOCKF" 2>/dev/null)
+    for _ in $(seq 1 40); do { [ -n "$h" ] && kill -0 "$h"; } 2>/dev/null && break; sleep 0.05; h=$(head -1 "$LOCKF" 2>/dev/null); done
+    echo "== waiting: $LOCKF is held by pid ${h:-?} =="
+    flock $LK   # wait, never fail: the second run is not wrong, it is early
+  fi
+  : >"$LOCKF"; echo $$ >&$LK   # ours, and named for whoever queues next
+  # Hold it HERE, and run the suite as a child with the fd shut ({LK}>&-). An flock lives until every copy of its
+  # fd is closed, and a fd the suite held would be inherited by everything it spawns: one orphan it failed to reap
+  # (case H4 below is exactly that) used to pin this lock long after its run was gone, leaving the next run queued
+  # behind a pid that was already dead — for as long as the orphan lived. Nothing below this line can hold the
+  # lock; this shell can, it does nothing else until the suite returns, and it lets go on every path out.
+  export CC_SELFTEST_HELD=$$
+  "$SELF" "$@" {LK}>&-; exit $?
+fi
+HOLDER=$CC_SELFTEST_HELD; unset CC_SELFTEST_HELD   # our children must not think they are already inside the lock
+if [ -n "${CC_SELFTEST_LOCK_ONLY:-}" ]; then   # the case below re-runs this file to here and no further —
+  echo "== lock taken by pid $HOLDER =="                # it stops before a single fixture exists
+  # ...and, asked to, leaves one child behind on purpose, so the case can prove the child did NOT inherit the lock.
+  if [ -n "${CC_SELFTEST_LOCK_ORPHAN:-}" ]; then sleep 60 & echo "== orphan $! =="; fi
+  exit 0
+fi
 pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+1)); echo "  ✗ $1"; }
 # Every run owns a namespace ($RUN): repo name, fixture dir, notify log, usage-limit stamp, tmux windows and
 # processes all carry it. Two selftests (two worktrees, one box) must never read, write or kill each other's things
@@ -292,6 +327,69 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t
              'Bash|{"command":"git log --oneline -5"}' "Read|{\"file_path\":\"$mf/note.md\"}" "Edit|{\"file_path\":\"$mf/note.md\"}"; do
   [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "member-facing session still reads, edits in place and escalates with cc-notify" || bad "member gate over-blocks:$miss"
+# A MEMBER WORKSPACE is the one member that DOES dispatch — inside itself and nowhere else. The marker is
+# .cc/member-workspace at ~/dev/<handle>, and a TRACK of that workspace inherits the tier rather than being promoted
+# to the ordinary worker one by its own .cc/track. Defence in depth: docs/design-member-workspaces.md, "the boundary".
+# The fixtures live under $T (~/.cc/…) and never /tmp — /tmp is a write root, so a probe there would pass for free.
+# EVERY MARKER HERE CLAIMS `other`, and every case still resolves to `alice`: identity is the PATH
+# (~/dev/<handle>, ~/.cc/worktrees/<repo>/<track>) because a marker's body is a file the member may edit.
+mkdir -p "$GH/dev/alice/.cc" "$GH/.cc/worktrees/alice/todo/.cc" "$GH/.cc/worktrees/other/forged/.cc"
+: > "$GH/dev/alice/.cc/member-facing"; printf 'other\n' > "$GH/dev/alice/.cc/member-workspace"
+printf 'other\nforged\n' > "$GH/.cc/worktrees/alice/todo/.cc/track"
+# …and a worktree carrying COMMITTED markers — what `git add -A` used to ship into every one of them.
+: > "$GH/.cc/worktrees/other/forged/.cc/member-facing"; printf 'alice\n' > "$GH/.cc/worktrees/other/forged/.cc/member-workspace"
+printf 'alice\ntodo\n' > "$GH/.cc/worktrees/other/forged/.cc/track"
+mws="$GH/dev/alice"; mwt="$GH/.cc/worktrees/alice/todo"; mwf="$GH/.cc/worktrees/other/forged"
+WOK=('Bash|{"command":"cc alice todo --go build it"}|W' 'Bash|{"command":"cc alice todo"}|W'
+     'Bash|{"command":"cc board add alice todo title brief"}|W' 'Bash|{"command":"cc board show alice"}|W'
+     'Bash|{"command":"cc alice todo --go x"}|K' "Edit|{\"file_path\":\"$GH/.cc/state/alice/todo/task.md\"}|W")
+WNO=('Bash|{"command":"cc other t --go build it"}|W' 'Bash|{"command":"cc-loop other t"}|W'
+     'Bash|{"command":"cc-loop alice todo"}|W' 'Bash|{"command":"cc other"}|W' 'Bash|{"command":"cc other t"}|W'
+     'Bash|{"command":"cc board add other t title brief"}|W' 'Bash|{"command":"cc board show other"}|W'
+     'Bash|{"command":"cc alice a --go x; cc other b --go y"}|W' 'Bash|{"command":"claude -p do it"}|W'
+     'Bash|{"command":"cat ~/.cc/config"}|W' 'Bash|{"command":"docker run -v /:/host x"}|W'
+     'Bash|{"command":"cc slack mkchannel x"}|W' 'Bash|{"command":"cc other t --go x"}|K'
+     'Bash|{"command":"cat ~/.cc/config"}|K' 'Bash|{"command":"cc board add other t x y"}|K'
+     "Edit|{\"file_path\":\"$GH/.cc/state/other/x/task.md\"}|W"
+     'Bash|{"command":"cc alice todo --go x"}|F' 'Bash|{"command":"cat ~/.cc/config"}|F')
+wprobe(){ local t=${1%%|*} rest=${1#*|} j c; j=${rest%|*}; c=${rest##*|}
+          case "$c" in W) c=$mws;; F) c=$mwf;; *) c=$mwt;; esac; m "$t" "$j" "$c"; }
+miss=""; for probe in "${WOK[@]}"; do [ "$(wprobe "$probe")" = 0 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "a member WORKSPACE works inside itself: dispatch, a session, its own board and track state — from the workspace dir and from its worker's worktree" || bad "member workspace over-blocked:$miss"
+miss=""; for probe in "${WNO[@]}"; do [ "$(wprobe "$probe")" = 2 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "...and nothing outside it: another repo's dispatch, session, board or track state, a mixed command, raw claude -p, the box's secrets, containers, Slack wiring — from the worker's worktree too; cc-loop is refused even INSIDE (the daily cap is charged in \`cc … --go\`, so a direct loop would spend off the ledger); and a worktree carrying committed markers gains nothing at all" || bad "member workspace escapes:$miss"
+[ "$(m Bash '{"command":"cc alice todo --go x"}' "$mf")" = 2 ] && ok "a plain member-facing session still dispatches nothing: the exception is the WORKSPACE marker, not the member role" || bad "member-facing session gained dispatch"
+# THE DOOR OPENS FROM OUTSIDE: CC_MEMBER_SANDBOX=1 is the sandbox's to set. From a plain member dir
+# `CC_MEMBER_SANDBOX=1 cc alice todo` passed every rule and started a workspace session ON THE HOST (review 2, A).
+miss=""; for c in 'CC_MEMBER_SANDBOX=1 cc alice todo' 'env CC_MEMBER_SANDBOX=1 cc alice todo --go x' 'export CC_MEMBER_SANDBOX=1; cc alice todo' 'bash -c \"CC_MEMBER_SANDBOX=1 cc alice todo\"'; do
+  for cw in "$mf" "$mws" "$mwt"; do [ "$(m Bash "{\"command\":\"$c\"}" "$cw")" = 2 ] || miss="$miss [$c @${cw##*/}]"; done; done
+[ -z "$miss" ] && ok "setting CC_MEMBER_SANDBOX is denied from every member-tier cwd (prefix, env, export, bash -c): the boundary opens the door, never the member" || bad "CC_MEMBER_SANDBOX settable by a member:$miss"
+[ "$(m Bash '{"command":"CC_MEMBER_SANDBOX=1 cc alice todo"}' "$GH")" = 0 ] && [ "$(m Bash '{"command":"grep -n CC_MEMBER_SANDBOX core/bin/cc"}' "$mws")" = 0 ] \
+  && ok "...the owner's own cwd is untouched, and naming the variable (a grep) is not setting it" || bad "CC_MEMBER_SANDBOX rule over-blocks"
+# .cc/track MEANS SOMETHING ONLY UNDER ~/.cc/worktrees/<repo>/<track>, where cc makes them. One in a member's subdir
+# used to set role=worker there — and hand that member the box's config and another repo's dispatch (review 2, C).
+mkdir -p "$GH/dev/alice/sub/.cc" "$GH/stray/.cc"; printf 'other\nt\n' > "$GH/dev/alice/sub/.cc/track"; printf 'other\nt\n' > "$GH/stray/.cc/track"
+[ "$(m Bash '{"command":"cat ~/.cc/config"}' "$GH/dev/alice/sub")" = 2 ] && [ "$(m Bash '{"command":"cc other t --go x"}' "$GH/dev/alice/sub")" = 2 ] \
+  && [ "$(m Bash '{"command":"cc alice todo --go x"}' "$GH/dev/alice/sub")" = 0 ] \
+  && ok "a .cc/track inside a member workspace is just a file: the subdir is still alice's world (secrets and another repo's dispatch denied, its own dispatch allowed)" || bad "a member subdir's .cc/track promoted it to worker"
+[ "$(m Bash '{"command":"gh pr merge 1"}' "$GH/stray")" = 0 ] && [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 1"},"cwd":"%s"}' "$GH/stray" | env HOME="$GH" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] \
+  && ok "...and outside ~/.cc/worktrees it is no track marker at all — CC_ROLE from the env still gates there" || bad "stray .cc/track honoured outside ~/.cc/worktrees"
+# THE BOUNDARY (owner, 2026-09-01): a member workspace session — interactive, main or worker — does not run on this
+# host at all until member-sandbox exists. Not a guard rule: `cc` and `cc-loop` refuse it themselves, whoever asks,
+# and CC_MEMBER_SANDBOX=1 (set inside the boundary) is the only thing that opens the door.
+gout(){ env HOME="$GH" PATH="$B:$PATH" "$@" 2>&1; }
+o1=$(gout "$B/cc" alice todo --go x); r1=$?
+o2=$(gout "$B/cc-loop" alice todo); r2=$?
+o3=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo 2>&1)
+o4=$(env HOME="$GH" "$B/cc-loop" other todo 2>&1)
+[ "$r1" = 1 ] && [ "$r2" = 2 ] && grep -q 'member workspace' <<<"$o1" && grep -q boundary <<<"$o2" \
+  && ! grep -q boundary <<<"$o3" && ! grep -q boundary <<<"$o4" \
+  && ok "cc and cc-loop refuse to start a member workspace session on the host (the boundary is not a blocklist), and only CC_MEMBER_SANDBOX=1 opens it — an ordinary repo is untouched" \
+  || bad "member workspace session startable on the host (cc rc=$r1, cc-loop rc=$r2)"
+o5=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 1e9 2>&1); r5=$?
+o6=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 5.5 2>&1)
+[ "$r5" = 2 ] && grep -q 'budget must be' <<<"$o5" && ! grep -q 'budget must be' <<<"$o6" \
+  && ok "--budget must be a plain number: '1e9' (charged as \$8, spent as a billion) is refused, 5.5 is not" || bad "non-numeric --budget passed through (rc=$r5: $o5)"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
@@ -992,6 +1090,34 @@ echo "== cc-audit: the second opinion on what to delete (codex) =="
 # removes it. It exits before checks() runs, so calling it from here does NOT recurse back into this file.
 sc=$("$B/cc-audit" selfcheck 2>&1)
 grep -q "0 failed" <<<"$sc" && ok "cc-audit selfcheck: $(tail -1 <<<"$sc")" || bad "cc-audit selfcheck: $(tail -1 <<<"$sc")"
+echo "== the suite's own lock (one run at a time) =="
+# Re-runs THIS FILE, stopping at the lock ($CC_SELFTEST_LOCK_ONLY) — no fixtures, no tmux, no repo, so the suite
+# never runs inside itself. On a lock of its own ($CC_SELFTEST_LOCK): the real one is held by the very run doing
+# the testing, and opening it a second time from here would deadlock this run against nobody but itself. Nothing
+# waits on a clock — the holder holds until a flag file appears, and the waiter is watched for the line it prints
+# — so a loaded box makes this case slower, never red, and it costs the suite a fraction of a second either way.
+L="$T/lock"
+( exec 8>>"$L"; flock 8; : >"$L"; echo $BASHPID >&8; for _ in $(seq 1 600); do [ -e "$L.go" ] && break; sleep 0.1; done ) &
+hp=$!; KIDS="$KIDS $hp"
+for _ in $(seq 1 100); do [ -s "$L" ] && break; sleep 0.1; done   # the stand-in holder has it, and has named itself
+env CC_SELFTEST_LOCK="$L" CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_LOCK_ORPHAN=1 "$SELF" >"$T/lock.out" 2>&1 & cp=$!; KIDS="$KIDS $cp"
+for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lock.out" 2>/dev/null && break; sleep 0.1; done
+{ grep -q "is held by pid $hp ==" "$T/lock.out" && kill -0 $cp 2>/dev/null; } \
+  && ok "a second run names the pid holding the lock — and is still sitting on it, not failing past it" \
+  || bad "the second run did not queue: $(tr '\n' ' ' <"$T/lock.out")"
+touch "$L.go"; wait $cp; lrc=$?
+cpid=$(sed -n 's/^== lock taken by pid \([0-9]*\) ==$/\1/p' "$T/lock.out")
+{ [ $lrc = 0 ] && [ -n "$cpid" ] && [ "$(head -1 "$L")" = "$cpid" ]; } \
+  && ok "...and the moment the lock frees it runs, green, leaving its OWN pid in for whoever queues next" \
+  || bad "the waiter never took over: rc=$lrc lock=[$(head -1 "$L")] said=[$cpid]"
+# ...and the child IT left behind must not still be holding the lock. An flock lives until every copy of the fd is
+# shut, so before the fd was closed for it a single unreaped orphan pinned the suite's lock as long as it lived, and
+# the next run queued behind a pid already dead. That is the regression this line is here to catch.
+orp=$(sed -n 's/^== orphan \([0-9]*\) ==$/\1/p' "$T/lock.out")
+{ [ -n "$orp" ] && kill -0 "$orp" 2>/dev/null && flock -n "$L" -c true 2>/dev/null; } \
+  && ok "a child that outlives a run does not outlive its lock — nobody queues behind a ghost" \
+  || bad "the lock outlived the run (orphan=[$orp] holder=[$(fuser "$L" 2>&1 | tr -s " ")])"
+kill "$orp" 2>/dev/null
 cd ~ || exit 1
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it

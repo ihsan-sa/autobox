@@ -10,6 +10,8 @@
 # EVERY gated role, worker included: no container runtime (this user is in group `docker`, which is root-equivalent)
 # and no reading the two files that ARE the box's credentials (~/.claude/.credentials.json, ~/ccbox/env).
 # role=member = every worker gate PLUS: no dispatching workers, no reading the box's other secrets, no re-wiring Slack.
+# A MEMBER WORKSPACE (~/dev/<handle>/.cc/member-workspace, and any track of it) is the one exception: it dispatches
+# workers and makes tracks INSIDE itself and nowhere else — docs/design-member-workspaces.md.
 # It also gates whichever session is NOT live during an overlapping handoff (cc-handoff), by session id and
 # by $CC_HANDOFF rather than by a marker: the two sessions share one cwd, so the walk below cannot tell them apart.
 set -uo pipefail
@@ -51,12 +53,33 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
-role="${CC_ROLE:-}"; mdir=""
+role="${CC_ROLE:-}"; mdir=""; mws=""
 d="$cwd"                         # walk up for a marker — one stat per level, no config to parse. A marker only makes the
 while [ -n "$d" ] && [ "$d" != / ]; do   # gates STRICTER (member wins over an inherited CC_ROLE=worker) and never clears the env role.
-  if [ -f "$d/.cc/member-facing" ]; then role=member; mdir="$d"; break; fi   # a session anybody in Slack can talk to
-  if [ -f "$d/.cc/track" ]; then [ "$role" = member ] || role=worker; break; fi
+  if [ -f "$d/.cc/member-facing" ]; then role=member; mdir="$d"
+    # A MEMBER WORKSPACE root: see below. Its handle is the DIRECTORY NAME — ~/dev/<handle>, nothing else — and
+    # never the marker's contents: every file under this dir is the member's own to edit, so a handle read out of
+    # one is a handle the session can rewrite (one line naming the box's repo would hand it that repo's authority).
+    [ -f "$d/.cc/member-workspace" ] && [ "$d" = "$HOME/dev/${d##*/}" ] && mws=${d##*/}
+    break; fi   # a session anybody in Slack can talk to
+  if [ -f "$d/.cc/track" ]; then
+    # A TRACK WORKTREE LIVES UNDER ~/.cc/worktrees/<repo>/<track> — `cc` makes them nowhere else — and ONLY THERE does
+    # .cc/track mean anything. Anywhere else it is a file somebody wrote, and the walk goes on past it to whatever
+    # marker sits above: honouring one in ~/dev/<h>/sub set role=worker there and handed that member the worker
+    # tier — the box's config and another repo's dispatch (review 2, C).
+    # A TRACK OF A MEMBER WORKSPACE IS STILL THAT MEMBER'S WORLD. The worktree lives under ~/.cc/worktrees, so its
+    # own marker says "worker" and would PROMOTE a member's worker out of the member tier — the one thing the
+    # workspace rule below must not allow. The rule follows the repo, not the worktree.
+    # WHICH repo comes from the worktree's PATH ($HOME/.cc/worktrees/<repo>/<track>), not from .cc/track: that
+    # file is inside the tree the worker may edit, so its first line is a claim, not an identity.
+    r=""; case "$d" in "$HOME"/.cc/worktrees/*/*) r=${d#"$HOME"/.cc/worktrees/}; r=${r%%/*};; *) d=$(dirname "$d"); continue;; esac
+    case "$r" in *[!A-Za-z0-9._-]*) r="";; esac
+    if [ -n "$r" ] && [ -f "$HOME/dev/$r/.cc/member-workspace" ]; then
+      role=member; mdir="$HOME/dev/$r"; mws="$r"
+    else [ "$role" = member ] || role=worker; fi
+    break; fi
   d=$(dirname "$d"); done
+case "$mws" in *[!a-z0-9-]*) mws="";; esac   # the handle goes into a regex below: [a-z0-9-] or nothing at all
 # $mdir is the member-facing session dir, and its basename is its Slack channel: the refusal below is posted there.
 # An OVERLAPPING HANDOFF (cc-handoff): two sessions share this cwd, and exactly one of them is LIVE. The other
 # may read, search, think and ask its peer — it may not act on the world. A marker file could not do this: the
@@ -142,6 +165,33 @@ ask_owner(){
 }
 deny(){ [ "$role" = member ] && ask_owner "$1"; echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
 denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
+ws_dispatch_ok(){   # EVERY dispatch in $1 names workspace $2 as its repo — and there is at least one to name.
+  # `cc <ws> <track> --go` is a workspace's ONLY dispatch form: it is where the daily cap is charged (cc: member_gate).
+  local c=$1 w=$2 all mine
+  [ -n "$w" ] || return 1
+  all=$(grep -oE '([^ ]*/)?cc +[A-Za-z0-9._-]+[^;&|]*--go\b' <<<"$c" | wc -l)
+  mine=$(grep -oE "([^ ]*/)?cc +$w +[^;&|]*--go\b" <<<"$c" | wc -l)
+  [ "$all" -gt 0 ] && [ "$all" = "$mine" ]
+}
+ws_cc_ok(){   # every `cc …` in $1 that NAMES A REPO names workspace $2 — sessions, board writes, done/rm/handoff.
+  # "Inside its own workspace" has to cover CREATION too: `cc board add <other> …` seeds work on another repo and
+  # `cc <other> <track>` builds a worktree and opens a session there, both as far outside as a dispatch is. Reads
+  # (`cc board show`, `cc ls`, `cc digest`) are left alone — this rule is about what a workspace may make.
+  local c=$1 w=$2 inv v r x ok=1; local -a a
+  [ -n "$w" ] || return 1
+  while IFS= read -r inv; do
+    inv=${inv#*cc }; read -r -a a <<<"$inv"; v=${a[0]:-}; r=""
+    case "$v" in
+      board) r=${a[2]:-}; case "$r" in -*) r="";; esac;;   # every board verb takes the repo there: reading another one is outside too
+      done|rm|handoff|-c) for x in "${a[@]:1}"; do case "$x" in -*) ;; *) r=$x; break;; esac; done;;
+      ""|-*|slack|rc|digest|quick|ls|resume) ;;
+      *) r=$v;;
+    esac
+    r=${r%%/*}                                       # `cc handoff --overlap <repo>/<track>`
+    [ -n "$r" ] && [ "$r" != "$w" ] && ok=""
+  done < <(grep -oE "$AT"'([^ ]*/)?cc +[^;&|]*' <<<"$c")
+  [ -n "$ok" ]
+}
 # TWO lists. secret_all() is the credentials NO gated role reads: ~/.claude/.credentials.json is the box's Claude
 # account and its spend, ~/ccbox/env is a GitHub PAT plus a deploy token — a worker holding either can spend or
 # push as the box, and a worker is exactly the session nobody is watching. secret_path() adds the box's OTHER
@@ -206,8 +256,28 @@ case "$tool" in
     #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays
     #    allowed on purpose: it is how this session escalates to the owner.
     if [ "$role" = member ]; then
-      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (cc --go)"
-      grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (cc-loop)"
+      # A MEMBER WORKSPACE DISPATCHES INSIDE ITSELF, AND ONLY THERE. ~/dev/<handle> is one member's whole world:
+      # tracks, workers and channels under `<handle>` are theirs to make. Keyed on the .cc/member-workspace marker
+      # at the root, never on a new role — a plain member-facing channel session still dispatches nothing at all.
+      # This is DEPTH, not containment: what keeps a workspace to itself is the boundary the session runs inside
+      # (docs/design-member-workspaces.md, "the boundary"), and this grep is what is left if that ever slips.
+      # THE BOUNDARY'S DOOR OPENS FROM OUTSIDE. cc and cc-loop start a workspace session only under CC_MEMBER_SANDBOX=1,
+      # which the sandbox sets — never a member-facing session: `CC_MEMBER_SANDBOX=1 cc alice todo` from a plain member
+      # dir passed every rule here and started a member workspace session ON THE HOST, the one thing the hard rule
+      # forbids (review 2, A). The ASSIGNMENT is refused (prefix, env, export); naming the variable in a grep is not.
+      grep -qE '(^|[^A-Za-z0-9_])CC_MEMBER_SANDBOX[+:]?=' <<<"$cmd" && deny "setting CC_MEMBER_SANDBOX — the boundary opens a workspace session from outside; a member-facing session never opens one on the host"
+      if ! ws_dispatch_ok "$cmd" "$mws"; then
+        grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && deny "${mws:+dispatching outside this workspace — }a member-facing session does not dispatch workers (cc --go)${mws:+; inside \`$mws\` it may}"
+      fi
+      # cc-loop is the runner UNDERNEATH `cc … --go`, and the day's budget is charged in `cc`, not here: calling it
+      # directly spends a workspace's money without ever touching the ledger. So a member never calls it at all.
+      if grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd"; then
+        if [ -n "$mws" ]; then deny "dispatching with cc-loop — inside \`$mws\` a worker starts with \`cc $mws <track> --go\`, the one form that charges the daily budget"
+        else deny "a member-facing session does not dispatch workers (cc-loop)"; fi
+      fi
+      if [ -n "$mws" ] && ! ws_cc_ok "$cmd" "$mws"; then
+        deny "creating outside \`$mws\` — this workspace makes tracks, boards and sessions under ~/dev/$mws and nowhere else"
+      fi
       grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
       SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.ssh\b|\.claude/settings\.json)'   # $RD is set above: these three ADD to the credentials no role reads
       grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && deny "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json)"
@@ -228,7 +298,11 @@ case "$tool" in
     case "$fp" in
       "$cwd"/*|"$cwd") ;;                          # inside the worktree / the session's own dir: fine
       /tmp/*) ;;                                   # scratch: fine
-      "$HOME"/.cc/state/*) [ "$role" = member ] && deny "writing another session's state ($fp) — a task.md there is work the box would run";;   # track state: workers only
+      "$HOME"/.cc/state/*)   # track state: workers, and a member workspace for the tracks that are its own
+        if [ "$role" = member ]; then
+          own=""; [ -n "$mws" ] && case "$fp" in "$HOME/.cc/state/$mws"|"$HOME/.cc/state/$mws"/*) own=1;; esac
+          [ -n "$own" ] || deny "writing another session's state ($fp) — a task.md there is work the box would run"
+        fi;;
       *) deny "editing outside this session's directory ($fp)";;
     esac ;;
 esac
