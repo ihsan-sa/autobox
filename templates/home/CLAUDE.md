@@ -8,5 +8,5 @@
   - The owner approves: merging to main, deploying, spend over budget, host/network/service changes, anything destructive, anything sent outward in their name.
   - Never touch: the interface the current session arrived on, the rescue address `<rescue-ip>`, the hotspot SSID. No host firewall, no partitioning, no reboot or shutdown without an explicit go-ahead.
 - **Writing to the owner.** Slack is short and plain — what happened, what it means, what they need to decide. No paths, SHAs, diff stats or test counts unless they ask. Depth goes to the track journal (`~/.cc/state/<repo>/<track>/progress.md`), `docs/`, or the channel canvas, linked in one line.
-- **Where things are explained.** `~/USAGE.md` the commands · `~/COMMS.md` reaching a project or agent · `~/RUNBOOK.md` getting in, and what to do when it breaks · `core/docs/DESIGN.md` why the system is shaped this way · `docs/` this box's incidents and audits.
+- **Where things are explained.** `~/USAGE.md` the commands · `~/COMMS.md` reaching a project or agent · `~/RUNBOOK.md` getting in, and what to do when it breaks · `core/docs/DESIGN.md` why the system is shaped this way · `~/WORKING.md` what a session does between tasks · `docs/` this box's incidents and audits.
 - Use subagents for large reads; journal before a handoff.

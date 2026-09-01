@@ -38,6 +38,7 @@ if [ -n "$O" ]; then
   done
 fi
 link "$R/ccbox" ~/ccbox
+link "$R/docs/WORKING.md" ~/WORKING.md          # what a session does between tasks — at ~ beside the guides it is read with
 link "$R/config/tmux.conf" ~/.tmux.conf
 # the live user units, from config/units.json — the ONE list (cc-mcp is retired: its unit is parked in mcp/).
 # Which are linked, which are enabled and which the audit health-checks used to be three hardcoded lists in two

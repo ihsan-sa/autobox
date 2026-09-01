@@ -14,6 +14,10 @@ STATES = ["queued","running","waiting","review","blocked","merged","done"]
 # a usage limit, a kill. Only `waiting` reaches the owner's NEEDS YOU list, and cc-reconcile is what writes it.
 ALIAS = {"todo":"queued"}
 def state(st): return ALIAS.get(st, st)
+def clean(s):
+    """A title is display text. argv arrives surrogateescaped, so a shell-mangled emoji is a lone surrogate — json.dump
+    stores it happily and every later print of the board raises. Replace it on the way in; never store one."""
+    return s.encode("utf-8", "replace").decode("utf-8")
 def now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 def bpath(repo): return os.path.join(BOARDS, repo + ".json")
 def _load(repo):
@@ -91,6 +95,7 @@ USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,
 def main(a):
     if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|list|rm|tracks|selfcheck} ...")
     cmd = a[0]
+    sys.stdout.reconfigure(errors="replace")   # a bad title already on disk prints as '?', never as a traceback
     if cmd in USAGE and len(a) < USAGE[cmd]:   # a short call must say so, not traceback
         sys.exit(f"cc-board {cmd}: needs {USAGE[cmd]-1} argument(s), got {len(a)-1}")
     if cmd == "init":
@@ -101,7 +106,7 @@ def main(a):
             _save(repo, d)
         print(f"board ready: {repo} ({path}, base {branch})")
     elif cmd == "add":
-        repo, track, title = a[1], a[2], a[3]
+        repo, track, title = a[1], a[2], clean(a[3])
         instr = " ".join(a[4:])
         have = brief(repo, track)            # migrate a legacy JSON copy FIRST — the pop below would drop it
         if instr.strip():                    # the brief goes to its one home; the board JSON keeps the title
@@ -136,6 +141,7 @@ def main(a):
             if track not in d["tracks"]: sys.exit(f"no track '{track}'")
             if key=="started": val = val.lower() in ("1","true","yes")
             if key=="status": val = state(val)   # `cc-board set … status todo` speaks the same word as `cc-board status`
+            if key=="title": val = clean(val)
             d["tracks"][track][key]=val; d["tracks"][track]["updated"]=now()
             _save(repo,d)
     elif cmd == "get":
@@ -272,6 +278,16 @@ def selfcheck():
            "M1 LANDED" in fresh and "M1 LANDED" not in stale)
         ok("a13: `--all` still prints it, and the default view says it hid something",
            "M1 LANDED" in run("show", "r", "--all").stdout and "finished" in stale)
+        # a shell-mangled emoji reaches argv as a lone surrogate; stored once, it turned every `show` into a traceback
+        bad = "T \udc94 mangled"
+        r = run("add", "r", "s1", bad); run("set", "r", "s1", "title", bad)
+        stored = json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["s1"]["title"]
+        ok("`add` and `set title` never store a lone surrogate", r.returncode == 0 and "\udc94" not in stored and "mangled" in stored)
+        d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"]["s1"]["title"] = bad   # one written before this fix
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        sh, ls = run("show", "r"), run("list")
+        ok("`show` and `list` print a bad title already on disk instead of crashing",
+           sh.returncode == 0 and ls.returncode == 0 and "mangled" in sh.stdout and "mangled" in ls.stdout)
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-board selfcheck: {n} failed")
