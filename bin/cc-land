@@ -53,7 +53,8 @@ a merge that did not happen, install.sh, a unit, a restart) stops everything: th
 top of a merge that never landed. A failure in the BOOKKEEPING — the #approvals card, the board row, the ask
 ledger — is cosmetic, so it is reported and the sequence carries ON. A card somebody had deleted while tidying
 duplicates once stopped a landing before install.sh, which left the box half-deployed and the operator having
-to know which half: that is the remembering this tool exists to remove, put back in a worse place.
+to know which half: that is the remembering this tool exists to remove, put back in a worse place. The card is
+never posted from here: a landed PR's card is EDITED to "landed ✓", and a landed PR with no card gets none.
 Re-running is the recovery, and is safe: an already-merged PR, an existing card, a settled ledger row and a
 unit that is already on are each "nothing to do".
 
@@ -635,40 +636,24 @@ class Land:
             return f"PR #{self.pr} merged (a second merge overlapped this one; GitHub says it is in)"
         return f"PR #{self.pr} merged (squash, remote branch deleted)"
 
-    # -- 4. the #approvals card, and the mark on it --------------------------------------------------------
+    # -- 4. the #approvals card: it stops reading as pending -----------------------------------------------
     def card(self):
-        """post-approval already IS "find this PR's card, post one only if there is none" — so call it and mark
-        whatever it hands back. Posting a second card is the bug that put three of them in the channel; posting
-        NO card is the bug that stopped a whole landing dead. So one card, and if Slack says that card is gone
-        (somebody deleted it while tidying those duplicates) it is re-posted with --force and marked instead."""
+        """The PR is in by now, so its card must stop looking like it still wants a 👍: `post-approval --landed`
+        finds it, edits it to "landed ✓ HH:MMZ" and marks it :ok_hand:. NEVER a new card from here — a landed PR
+        gets none (post-approval refuses, --force or not). The re-post this used to do when Slack said the card was
+        gone put six cards up for one PR in fifteen minutes (2026-09-01): the "gone" card was this tool reading
+        post-approval's stderr log line as the timestamp, since sh() joins stdout and stderr. No card at all is a
+        skip (the queue is right as it is); a card that is there and stayed pending is a FAILURE the owner sees."""
         if not self.pr:
             raise Skip("no PR — no card to place")
-        ts, tok, chat = self.post_card(), bot_token(), self.approvals_channel()
-        if not (ts and tok and chat):
-            raise Skip("no #approvals channel the bot is in — the card is unmarked")
-        r = slack("reactions.add", tok, channel=chat, timestamp=ts, name=CARD)
-        again = ""
-        if r.get("error") == "message_not_found":
-            again, ts = " (the card it found had been deleted — re-posted)", self.post_card(force=True)
-            r = slack("reactions.add", tok, channel=chat, timestamp=ts, name=CARD)
-        if not r.get("ok") and r.get("error") != "already_reacted":
-            raise Failed(f"reactions.add on the card for PR #{self.pr}: {r.get('error')}")
-        return f"#approvals: the one card for PR #{self.pr} marked :{CARD}:{again}"
-
-    def post_card(self, force=False):
-        argv = [f"{BIN}/cc-slack", "post-approval"] + (["--force"] if force else []) + [self.repo, str(self.pr)]
-        rc, o = sh(argv, timeout=120)
+        rc, o = sh([f"{BIN}/cc-slack", "post-approval", "--landed", self.repo, str(self.pr)], timeout=120)
         if rc == 3:
             raise Skip("Slack is not set up on this box — no card")
+        if rc == 4:
+            raise Skip(f"PR #{self.pr} has no card in #approvals — none posted (a landed PR must not look pending)")
         if rc:
-            raise Failed(f"cc-slack post-approval: {last(o)}")
-        return last(o)
-
-    def approvals_channel(self):
-        """cc-slack owns which channel that is, and prints it — asking beats keeping a second copy of the answer."""
-        o = sh([f"{BIN}/cc-slack", "status"], timeout=60)[1]
-        m = re.search(r"^approvals: #\S+ (C[A-Z0-9]+)", o, re.M)
-        return m.group(1) if m else ""
+            raise Failed(f"the card for PR #{self.pr} still reads as pending: {last(o)}")
+        return f"#approvals: the card for PR #{self.pr} reads landed ✓ and is marked :{CARD}:"
 
     # -- 5. the board --------------------------------------------------------------------------------------
     def find_track(self):
@@ -1569,28 +1554,29 @@ def cmd_selfcheck():
     check("an already-merged PR runs no gate at all, and does not even fetch its head",
           isinstance(merged_skips, Skip) and not ran("check.sh") and not ran("git", "fetch"))
 
-    # 3. one card per PR: post-approval decides that, cc-land marks whatever it hands back
+    # 3. the card: one post-approval --landed, never --force, never a bare post — a landed PR gets no new card from
+    # here. sh() joins stdout and stderr, and post-approval's find path logs to stderr: the "ts" this tool marked was
+    # that log line, Slack said message_not_found, and the --force re-post put six cards up for one PR (2026-09-01).
     L = fresh(pr=7)
-    world[f"{BIN}/cc-slack post-approval"] = (0, "1788000000.000100\n")
-    world[f"{BIN}/cc-slack status"] = (0, "approvals: #approvals C0APPROVE — a :+1: from anyone merges it\n")
+    world[f"{BIN}/cc-slack post-approval"] = (0, "1788000000.000100\n2026-09-01T04:33:58Z post-approval: [myrepo] PR #7 "
+                                                "merged — card 1788000000.000100 edited, nothing posted\n")
     msg = L.card()
-    check("the card step calls post-approval once and, while the card is there, never with --force (a second card "
-          "is the duplicate bug)",
-          len(ran("post-approval")) == 1 and "--force" not in " ".join(ran("post-approval")[0]))
-    check("the card that came back is marked, by channel and timestamp",
-          reacted == [("reactions.add", CARD, "1788000000.000100")] and CARD in msg)
-
-    # …and a card DELETED under us (tidying duplicates) is re-posted and marked — cosmetic, and it once stopped a
-    # whole landing before install.sh, leaving the operator to work out which half had run
+    check("the card step is one post-approval --landed — never --force, never a bare post — and a log line in the "
+          "output changes nothing",
+          [c[1:4] for c in ran("post-approval")] == [["post-approval", "--landed", "myrepo"]] and not reacted
+          and "landed" in msg and CARD in msg)
+    # …a landed PR with no card gets NONE: post-approval says so (exit 4) and the step skips — the queue is right as it is
     L = fresh(pr=7)
-    world[f"{BIN}/cc-slack post-approval"] = (0, "1788000000.000100\n")
-    world[f"{BIN}/cc-slack post-approval --force"] = (0, "1788000000.000900\n")
-    world[f"{BIN}/cc-slack status"] = (0, "approvals: #approvals C0APPROVE — a :+1: from anyone merges it\n")
-    errs.append("message_not_found")
-    msg = L.card()
-    check("a card that Slack says is gone is re-posted (--force) and the new one marked — the step succeeds",
-          len(ran("post-approval", "--force")) == 1 and reacted == [("reactions.add", CARD, "1788000000.000900")]
-          and "re-posted" in msg)
+    world[f"{BIN}/cc-slack post-approval"] = (4, "cc-slack post-approval: PR #7 is MERGED and #approvals has no card for it — none posted\n")
+    check("no card for a landed PR: nothing is posted, no --force, and the step skips saying so",
+          isinstance(caught(L.card), Skip) and len(ran("post-approval")) == 1 and not ran("post-approval", "--force"))
+    # …and a card that IS there but stayed pending is a failure the owner sees — not a skip, and never a re-post
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-slack post-approval"] = (1, "cc-slack post-approval: the card for PR #7 (1788000000.000100) was not edited: "
+                                                "chat.update: message_not_found\n")
+    e = caught(L.card)
+    check("a card that still reads as pending after the landing is a FAILURE (cosmetic, reported), never a --force re-post",
+          isinstance(e, Failed) and "message_not_found" in str(e) and not ran("post-approval", "--force"))
 
     # 2b. a cosmetic step that fails anyway is reported, and everything after it still runs
     L = fresh(pr=7)

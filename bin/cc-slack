@@ -12,8 +12,10 @@
                                       lane) and an @-mention of the owner. For a blocked decision only — see ~/COMMS.md
   cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--title T] [-m "text"]   upload a file as the bot;
                                       --thread lands it in that thread (default target: DM the owner); Web API only
-  cc-slack post-approval [--force] <repo> <pr-number|url>   "[repo] PR #n: title — url" into #approvals; the owner's :+1: there
-                                      squash-merges it (daemon). One card per PR: a second caller finds the first and does nothing (--force re-posts)
+  cc-slack post-approval [--force|--landed] <repo> <pr-number|url>   "[repo] PR #n: title — url" into #approvals; the owner's :+1:
+                                      there squash-merges it (daemon). One card per PR: a second caller finds the first and does nothing
+                                      (--force re-posts). A MERGED/CLOSED PR never gets one: its card is edited to "landed ✓" (--landed: on the caller's word)
+  cc-slack approvals-sweep [--dry-run] [--now]   edit every card whose PR is in (or closed) but still reads as pending; cc-reconcile gives it a turn
   cc-slack history <#chan|C…|D…> [n] | thread <#chan|C…> <ts> [n]   read a channel / a full thread (newest first, cursor-paged)
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>          rewrite / delete one of the BOT's own posts (signed ones too)
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md   pin a message · replace a channel canvas
@@ -5281,47 +5283,179 @@ def cmd_archive(argv):
     return 0 if ok else 1
 
 
-def approval_card_ts(cfg, cid, repo, n, limit=200):
-    """ts of the card the daemon would merge on — a post of OURS matching "[repo] PR #n: …" — or None. Two actors reach
-    a finished track (the loop when it ends, a session when it merges) and each used to post its own card; two cards mean
-    two :+1:, two overlapping merges, and a "merge failed" for one that actually landed. #approvals is itself the record of
-    who got there first, so ask it rather than keep state: a card the owner deleted is gone, and posting again is correct.
-    Matches on our own user id, exactly as on_approval does, so a human's lookalike text never suppresses a real card."""
-    try:
-        me = api("auth.test", cfg["SLACK_BOT_TOKEN"]).get("user_id")
-        msgs = api("conversations.history", cfg["SLACK_BOT_TOKEN"], channel=cid, limit=str(limit))["messages"]
-    except Exception as e:
-        log(f"post-approval: could not read #{APPROVALS} ({e}) — posting anyway"); return None
+LANDED_RE = re.compile(r"  ·  (?:landed ✓|closed ✗) \d\d:\d\dZ$")     # a card that no longer reads as pending
+PENDING_TAIL = re.compile(r"\s+·\s+:\+1:.*$", re.S)                       # "  ·  :+1: from the owner merges (squash)"
+SWEEP_EVERY = 900                                                        # approvals-sweep: one real sweep per 15 min unless --now
+SWEEP_MAX = 40                                                           # …and at most this many edits per run: under Slack's rate limit, over in a minute
+
+
+def approval_cards(cfg, cid, limit=200):
+    """Every card in #approvals — a post of OURS matching "[repo] PR #n: …" — newest first, as (repo, n, message).
+    Matches on our own user id, exactly as on_approval does, so a human's lookalike text is never a card. Raises
+    when the channel cannot be read: the caller decides whether that means post anyway or touch nothing."""
+    me = api("auth.test", cfg["SLACK_BOT_TOKEN"]).get("user_id")
+    msgs = api("conversations.history", cfg["SLACK_BOT_TOKEN"], channel=cid, limit=str(limit))["messages"]
+    out = []
     for m in msgs:
         g = PR_RE.match(m.get("text") or "")
-        if g and m.get("user") == me and g.group(1) == repo and g.group(2) == str(n):
-            return m.get("ts")
-    return None
+        if g and m.get("user") == me:
+            out.append((g.group(1), g.group(2), m))
+    return out
+
+
+def approval_card(cfg, cid, repo, n):
+    """The card the daemon would merge on (the newest, if there are several), or None. Two actors reach a finished
+    track (the loop when it ends, a session when it merges) and each used to post its own card; two cards mean two
+    :+1:, two overlapping merges, and a "merge failed" for one that actually landed. #approvals is itself the record
+    of who got there first, so ask it rather than keep state: a card the owner deleted is gone."""
+    return next((m for r, k, m in approval_cards(cfg, cid) if r == repo and k == str(n)), None)
+
+
+def approval_card_ts(cfg, cid, repo, n, limit=200):
+    m = approval_card(cfg, cid, repo, n)
+    return m.get("ts") if m else None
+
+
+def iso_hhmm(s):
+    """GitHub's "2026-09-01T04:33:58Z" → "04:33Z"; anything else → now."""
+    return f"{s[11:16]}Z" if isinstance(s, str) and re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d", s) else time.strftime("%H:%MZ", time.gmtime())
+
+
+def land_card(cfg, cid, m, state="MERGED", when=None):
+    """Edit one card so it stops reading as pending — "… · landed ✓ 04:33Z" (or "closed ✗") in place of the ":+1:
+    from the owner merges" tail — and put :ok_hand: on a landed one. #approvals is a queue the owner reads on a phone:
+    a card for a PR that is already in must not look like it still wants a 👍 (four of them did, 2026-09-01). The
+    "[repo] PR #n:" head stays, so the card is still found and a late 👍 still reaches the landing, which says "already
+    merged". Idempotent: an edited card is left alone. True when it edited."""
+    text, ts = m.get("text") or "", m.get("ts")
+    if LANDED_RE.search(text):
+        return False
+    tail = "  ·  landed ✓ " if state == "MERGED" else "  ·  closed ✗ "
+    api("chat.update", cfg["SLACK_BOT_TOKEN"], channel=cid, ts=ts,
+        text=PENDING_TAIL.sub("", text).rstrip() + tail + (when or time.strftime("%H:%MZ", time.gmtime())))
+    if state == "MERGED":
+        try:
+            api("reactions.add", cfg["SLACK_BOT_TOKEN"], channel=cid, timestamp=ts, name="ok_hand")
+        except Exception as e:
+            if "already_reacted" not in str(e):
+                raise
+    return True
+
+
+def pr_facts(repo, n):
+    """{"state", "mergedAt", "closedAt"} from gh, or None (no such repo here, no network, no such PR)."""
+    if not os.path.isdir(f"{DEV}/{repo}/.git"):
+        return None
+    try:
+        r = subprocess.run(["gh", "pr", "view", str(n), "--json", "state,mergedAt,closedAt"], cwd=f"{DEV}/{repo}",
+                           capture_output=True, text=True, timeout=30)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
 
 
 def cmd_post_approval(argv):
-    """post-approval [--force] <repo> <n|url> — "[repo] PR #n: title — url" into #approvals (the daemon merges it on the owner's
-    :+1:). One card per PR: whoever gets there second finds the first and exits 0 without posting. --force posts regardless —
-    after a failed merge the session is told to re-post. Exit 2 usage, 3 no token, 1 gh/Slack."""
-    force = "--force" in argv; argv = [a for a in argv if a != "--force"]
+    """post-approval [--force|--landed] <repo> <n|url> — "[repo] PR #n: title — url" into #approvals (the daemon merges it
+    on the owner's :+1:). One card per PR: whoever gets there second finds the first and exits 0 without posting; --force
+    posts regardless — after a FAILED merge the session is told to re-post. A PR GitHub says is MERGED or CLOSED never
+    gets a card, --force or not (a re-run of the landing over an already-merged list posted six for one PR, 2026-09-01):
+    the card it has is edited to "landed ✓" / "closed ✗" instead. --landed is that edit on the caller's word — the
+    landing has just merged it, whatever gh has caught up to — and never posts. Prints the card's ts. Exit 2 usage,
+    3 no token, 4 landed PR with no card (nothing to edit, nothing posted), 1 gh/Slack."""
+    force, landed = "--force" in argv, "--landed" in argv
+    argv = [a for a in argv if a not in ("--force", "--landed")]
     m = re.fullmatch(r"(?:https://github\.com/[^/\s]+/[^/\s]+/pull/)?([0-9]+)/?", argv[1] if len(argv) == 2 else "")
     if not m or not re.fullmatch(r"[a-z0-9_-]+", argv[0]) or not os.path.isdir(f"{DEV}/{argv[0]}/.git"):
-        print("cc-slack post-approval [--force] <repo-in-~/dev> <pr-number|pr-url>", file=sys.stderr); return 2
+        print("cc-slack post-approval [--force|--landed] <repo-in-~/dev> <pr-number|pr-url>", file=sys.stderr); return 2
     repo, n, cfg = argv[0], m.group(1), load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("cc-slack post-approval: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
-    r = subprocess.run(["gh", "pr", "view", n, "--json", "title,url"], cwd=f"{DEV}/{repo}", capture_output=True, text=True, timeout=60)
+    r = subprocess.run(["gh", "pr", "view", n, "--json", "title,url,state,mergedAt,closedAt"], cwd=f"{DEV}/{repo}",
+                       capture_output=True, text=True, timeout=60)
     cid, member = find_channel(cfg, APPROVALS)
     if r.returncode != 0 or not (cid and member):
         print(f"cc-slack post-approval: {r.stderr.strip()[-300:] or f'no #{APPROVALS} channel the bot is in (cc slack mkchannel {APPROVALS})'}", file=sys.stderr); return 1
-    if not force:
-        have = approval_card_ts(cfg, cid, repo, n)
-        if have:
-            log(f"post-approval: [{repo}] PR #{n} already has a card ({have}) — second caller posts nothing")
-            print(have); return 0
     pr = json.loads(r.stdout)
+    state = (pr.get("state") or "").upper()
+    done = landed or state in ("MERGED", "CLOSED")
+    try:
+        have = approval_card(cfg, cid, repo, n)
+    except Exception as e:
+        if done:
+            print(f"cc-slack post-approval: could not read #{APPROVALS} ({e}) — the card for PR #{n} is not edited", file=sys.stderr); return 1
+        log(f"post-approval: could not read #{APPROVALS} ({e}) — posting anyway"); have = None
+    if done:
+        if not have:
+            print(f"cc-slack post-approval: PR #{n} is {state or 'landed'} and #{APPROVALS} has no card for it — none posted "
+                  f"(a PR that is already in must not look pending)", file=sys.stderr); return 4
+        kind = "CLOSED" if state == "CLOSED" else "MERGED"
+        try:
+            did = land_card(cfg, cid, have, kind, iso_hhmm(pr.get("mergedAt") or pr.get("closedAt")))
+        except Exception as e:
+            print(f"cc-slack post-approval: the card for PR #{n} ({have.get('ts')}) was not edited: {e}", file=sys.stderr); return 1
+        log(f"post-approval: [{repo}] PR #{n} {kind.lower()} — card {have.get('ts')} {'edited' if did else 'already reads so'}, nothing posted")
+        print(have.get("ts")); return 0
+    if have and not force:
+        log(f"post-approval: [{repo}] PR #{n} already has a card ({have.get('ts')}) — second caller posts nothing")
+        print(have.get("ts")); return 0
     _, ts = post(cfg, cid, f"[{repo}] PR #{n}: {pr['title']} — {pr['url']}  ·  :+1: from the owner merges (squash)")
     print(ts or ""); return 0
+
+
+def cmd_approvals_sweep(argv):
+    """approvals-sweep [--dry-run] [--now] — every card of ours in #approvals that still says "merges" and whose PR GitHub
+    says is MERGED or CLOSED gets the "landed ✓" / "closed ✗" edit, once (an edited card no longer says "merges", so it
+    is never asked about again). The landing edits its own card; this catches the ones nothing did — a merge in
+    GitHub's UI, a card posted after the landing, the four from before the edit existed. cc-reconcile gives it a
+    turn every run; it sweeps for real at most once per SWEEP_EVERY unless --now. Exit 3 no token, 1 no channel."""
+    dry, now = "--dry-run" in argv, "--now" in argv
+    cfg = load_cfg()
+    if not cfg.get("SLACK_BOT_TOKEN"):
+        print("cc-slack approvals-sweep: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
+    stamp = f"{DIR}/approvals-sweep.at"
+    try:
+        age = time.time() - os.path.getmtime(stamp)
+    except OSError:
+        age = None
+    if age is not None and age < SWEEP_EVERY and not (now or dry):
+        print(f"swept {int(age // 60)} min ago — next in {int((SWEEP_EVERY - age) // 60) + 1} min (--now sweeps anyway)"); return 0
+    cid, member = find_channel(cfg, APPROVALS)
+    if not (cid and member):
+        print(f"cc-slack approvals-sweep: no #{APPROVALS} channel the bot is in", file=sys.stderr); return 1
+    try:
+        cards = approval_cards(cfg, cid)
+    except Exception as e:
+        print(f"cc-slack approvals-sweep: could not read #{APPROVALS} ({e})", file=sys.stderr); return 1
+    facts, edited, left = {}, [], 0
+    for repo, n, m in cards:
+        text = m.get("text") or ""
+        if "merges" not in text or LANDED_RE.search(text):
+            continue
+        if len(edited) >= SWEEP_MAX and not dry:
+            left += 1; continue                     # the rest next turn — one run stays short and under the rate limit
+        if (repo, n) not in facts:
+            facts[(repo, n)] = pr_facts(repo, n) or {}
+        f = facts[(repo, n)]
+        state = (f.get("state") or "").upper()
+        if state not in ("MERGED", "CLOSED"):
+            left += 1; continue
+        word = "landed ✓" if state == "MERGED" else "closed ✗"
+        try:
+            if dry or land_card(cfg, cid, m, state, iso_hhmm(f.get("mergedAt") or f.get("closedAt"))):
+                edited.append(f"[{repo}] PR #{n} {m.get('ts')} → {word}")
+                dry or time.sleep(0.5)              # two Slack calls per card; Tier 3 is ~50 a minute
+        except Exception as e:
+            print(f"  [{repo}] PR #{n} {m.get('ts')}: not edited — {e}", file=sys.stderr); left += 1
+    if not dry:
+        try:
+            os.makedirs(DIR, exist_ok=True); open(stamp, "a").close(); os.utime(stamp, None)
+        except OSError:
+            pass
+    for line in edited:
+        print("  " + line)
+    print(f"{len(edited)} card{'' if len(edited) == 1 else 's'} {'would be ' if dry else ''}edited · {left} still pending"
+          + (" (more than one run's worth — again with --now)" if len(edited) >= SWEEP_MAX else ""))
+    return 0
 
 
 def cmd_selfcheck():
@@ -5833,6 +5967,80 @@ def cmd_selfcheck():
                     rc5 = cmd_post_approval([rname, "7"])
                 check("post-approval: #approvals unreadable → post rather than lose the card (a missing card cannot be approved)",
                       rc5 == 0 and len(posted) == 1)
+                # A PR that is IN never gets a card — not even --force: the landing re-ran over an already-merged list and
+                # put six cards up for one PR (2026-09-01). The card it has stops reading as pending instead.
+                hist = [dict(c) for c in cards]; posted.clear(); edits, marks, asked = [], [], []
+                def api3(method, token, **kw):
+                    if method == "auth.test":
+                        return {"user_id": "UBOT"}
+                    if method == "conversations.history":
+                        return {"messages": hist}
+                    if method == "chat.update":
+                        edits.append((kw["ts"], kw["text"]))
+                        for h in hist:
+                            if h["ts"] == kw["ts"]:
+                                h["text"] = kw["text"]          # the channel reads back what was written
+                        return {"ok": True}
+                    if method == "reactions.add":
+                        marks.append((kw["timestamp"], kw["name"])); return {"ok": True}
+                    raise AssertionError(method)
+                gh = {"7": {"title": "t", "url": "https://x/7", "state": "MERGED", "mergedAt": "2026-09-01T04:33:58Z"}}
+                def run3(cmd, **kw):
+                    asked.append(cmd[3]); f = gh.get(cmd[3])
+                    return type("R", (), {"returncode": 0 if f else 1, "stderr": "" if f else "no such PR", "stdout": json.dumps(f or {})})()
+                globals()["api"], subprocess.run = api3, run3
+                with contextlib.redirect_stdout(io.StringIO()) as o6, contextlib.redirect_stderr(io.StringIO()):
+                    rc6 = cmd_post_approval([rname, "7"]); rc6f = cmd_post_approval([rname, "--force", "7"])
+                check("post-approval: a MERGED PR never gets a card, --force or not — the one it has is edited to 'landed ✓ HH:MMZ' "
+                      "(GitHub's merge time), marked :ok_hand: once, and its ts is what is printed",
+                      rc6 == 0 and rc6f == 0 and not posted and o6.getvalue().split() == ["9.1", "9.1"]
+                      and edits == [("9.1", f"[{rname}] PR #7: t — https://x/7  ·  landed ✓ 04:33Z")] and marks == [("9.1", "ok_hand")])
+                hist = [dict(cards[1])]; posted.clear()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as e7:
+                    rc7 = cmd_post_approval([rname, "7"]); rc7l = cmd_post_approval([rname, "--landed", "7"])
+                check("post-approval: a MERGED PR with no card gets none — exit 4, says so, the caller decides (--landed too)",
+                      rc7 == 4 and rc7l == 4 and not posted and "no card" in e7.getvalue())
+                hist = [dict(c) for c in cards]; edits.clear(); marks.clear()
+                gh["7"] = {"title": "t", "url": "https://x/7", "state": "OPEN"}
+                with contextlib.redirect_stdout(io.StringIO()) as o8, contextlib.redirect_stderr(io.StringIO()):
+                    rc8 = cmd_post_approval([rname, "--landed", "7"]); rc8b = cmd_post_approval([rname, "--landed", "7"])
+                check("post-approval --landed: on the caller's word (gh may not have caught up) the card is edited and marked, "
+                      "nothing is posted, and a second --landed changes nothing",
+                      rc8 == 0 and rc8b == 0 and not posted and o8.getvalue().split() == ["9.1", "9.1"] and len(edits) == 1
+                      and re.search(r"  ·  landed ✓ \d\d:\d\dZ$", edits[0][1]) and marks == [("9.1", "ok_hand")])
+                hist = [dict(c) for c in cards]; edits.clear()
+                def api4(method, token, **kw):
+                    if method == "chat.update":
+                        raise RuntimeError("chat.update: message_not_found")
+                    return api3(method, token, **kw)
+                globals()["api"] = api4
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as e9:
+                    rc9 = cmd_post_approval([rname, "--landed", "7"])
+                check("post-approval --landed: a card that cannot be edited is exit 1 with Slack's reason — never a re-post",
+                      rc9 == 1 and not posted and "message_not_found" in e9.getvalue())
+                # The sweep: what the landing missed. Keyed on the text — an edited card no longer says "merges", so it is
+                # never asked about again; gh is asked once per PR, not once per card.
+                def card_(ts, n, user="UBOT", tail="  ·  :+1: from the owner merges (squash)", repo=None):
+                    return {"ts": ts, "user": user, "text": f"[{repo or rname}] PR #{n}: t — https://x/{n}{tail}"}
+                hist = [card_("8.1", 5), card_("8.2", 5), card_("8.3", 6), card_("8.4", 7), card_("8.5", 5, user="UOWNER"),
+                        card_("8.6", 4, tail="  ·  landed ✓ 01:00Z"), card_("8.7", 1, repo="no-such-repo-zz"), card_("8.8", 3, tail="")]
+                gh.update({"5": {"state": "MERGED", "mergedAt": "2026-09-01T02:00:00Z"},
+                           "6": {"state": "CLOSED", "closedAt": "2026-09-01T03:00:00Z"}, "7": {"state": "OPEN"}})
+                globals()["api"] = api3; edits.clear(); marks.clear(); asked.clear()
+                with contextlib.redirect_stdout(io.StringIO()) as o10, contextlib.redirect_stderr(io.StringIO()):
+                    rc10 = cmd_approvals_sweep(["--now"])
+                check("approvals-sweep: every card of ours that still says 'merges' for a MERGED/CLOSED PR is edited — duplicates too, "
+                      "a closed one as 'closed ✗' without the mark; open, foreign, human, already-edited and tail-less cards are "
+                      "left; gh is asked once per PR",
+                      rc10 == 0 and [e[0] for e in edits] == ["8.1", "8.2", "8.3"] and edits[0][1].endswith("  ·  landed ✓ 02:00Z")
+                      and edits[2][1].endswith("  ·  closed ✗ 03:00Z") and marks == [("8.1", "ok_hand"), ("8.2", "ok_hand")]
+                      and sorted(asked) == ["5", "6", "7"] and "3 cards edited · 2 still pending" in o10.getvalue())
+                edits.clear(); marks.clear(); asked.clear()
+                with contextlib.redirect_stdout(io.StringIO()) as o11, contextlib.redirect_stderr(io.StringIO()):
+                    rc11 = cmd_approvals_sweep(["--now"]); rc12 = cmd_approvals_sweep([])
+                check("approvals-sweep: the edit is the record — a second run edits nothing and asks only about the open PR; "
+                      "without --now a sweep within the interval does not even read the channel",
+                      rc11 == 0 and rc12 == 0 and not edits and asked == ["7"] and "min ago" in o11.getvalue())
             finally:
                 globals()["post"], globals()["find_channel"], subprocess.run = real_post, real_find, real_run2
     finally:
@@ -9440,6 +9648,8 @@ def main(argv):
         return cmd_post_file(rest) if "--file" in rest else cmd_post(rest)
     elif cmd == "post-approval":
         return cmd_post_approval(rest)
+    elif cmd == "approvals-sweep":
+        return cmd_approvals_sweep(rest)
     elif cmd == "accept-dialog":
         return cmd_accept_dialog(rest[0] if rest else "box")
     elif cmd == "history":
