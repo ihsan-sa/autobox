@@ -18,10 +18,16 @@ Red beats new. Delivery beats development. Small-and-shippable beats big-and-hal
 
 ## dispatch judgement
 - One worker per file, always. Check the board's live tracks before dispatching.
-- A brief is one screen: the goal, the why, the files, the gates, what NOT to touch.
+- A brief is one screen: the goal, the why, the files, the gates, what NOT to touch —
+  and 3-5 testable done-criteria; the PR review verifies against those, briefed with the
+  contract and the diff, never the worker's own journal.
 - Small fix with no live collision → short branch by the planning session. More → a worker.
 
 ## model policy
+On each model upgrade, try deleting one harness crutch: every workaround encodes an
+assumption about model weakness, and those expire.
+
+
 Planning runs the strongest available model; workers run the strong-but-cheaper tier. Both names
 live in cc-model and nowhere else — when models change, change cc-model.
 
