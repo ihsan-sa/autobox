@@ -594,6 +594,19 @@ def react(cfg, chat, ts, name, remove=False):
         pass
 
 
+def set_reaction(tok, chat, ts, name, on):
+    """Put our reaction `name` on a message (on=True) or take it off, and answer True once that state HOLDS. Slack's
+    already_reacted on an add and no_reaction on a remove are the state already holding — a restart, a burst of our own
+    reaction events, set_mark and the sweep reaching the same root — not failures (21 of the 41 cc-slackd error lines of
+    the 2026-09-01 audit were these). Any other answer raises, and the caller logs it with what it was driving."""
+    try:
+        api("reactions.add" if on else "reactions.remove", tok, channel=chat, timestamp=ts, name=name)
+    except Exception as e:
+        if ("already_reacted" if on else "no_reaction") not in str(e):
+            raise
+    return True
+
+
 MAX_UPLOAD = 25 * 1024 * 1024   # a session sends renders and screenshots, not archives
 
 
@@ -1226,31 +1239,39 @@ def save_last(last):
         log(f"last.json: {e!r}")
 
 
+MARKS_LOCK = threading.Lock()   # marks.json and flags.json have ONE writer at a time: save_marks is reached from pool
+                                # threads, the sweep and under self.wrench, and two saves in the same second shared one
+                                # temp path — the second's os.replace found it gone (FileNotFoundError ×4, 2026-09-01 audit)
+
+
+def save_timed(name, d, what):
+    """Atomic, 0600, pruned IN PLACE: an entry older than 30 days can never matter again (its thread left the 48 h window
+    long ago). Under MARKS_LOCK, and the temp file is this call's own (mkstemp) — so a save never pulls the file from
+    under another, and a key another thread adds meanwhile is never dropped between a clear() and an update()."""
+    with MARKS_LOCK:
+        cutoff = time.time() - 30 * 86400
+        for k in [k for k, v in list(d.items()) if v < cutoff]:
+            d.pop(k, None)
+        tmp = None
+        try:
+            os.makedirs(DIR, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=DIR, prefix=f"{name}.", suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(fd, 0o600); json.dump(dict(d), f)
+            os.replace(tmp, f"{DIR}/{name}")
+        except Exception as e:
+            log(f"{what}: save failed: {e!r}")
+            if tmp:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+
+
 def save_marks(marks):
-    keep = {k: v for k, v in marks.items() if v >= time.time() - 30 * 86400}
-    marks.clear(); marks.update(keep)
-    try:
-        os.makedirs(DIR, exist_ok=True)
-        tmp = f"{DIR}/{MARKS}.tmp"
-        with open(tmp, "w") as f:
-            os.fchmod(f.fileno(), 0o600); json.dump(keep, f)
-        os.replace(tmp, f"{DIR}/{MARKS}")
-    except Exception as e:
-        log(f"marks: save failed: {e!r}")
+    save_timed(MARKS, marks, "marks")
 
 
 def save_flags(flags):
-    """Atomic, 0600, pruned: a flag older than 30 days can never matter again (its thread left the 48 h window long ago)."""
-    keep = {k: v for k, v in flags.items() if v >= time.time() - 30 * 86400}
-    flags.clear(); flags.update(keep)
-    try:
-        os.makedirs(DIR, exist_ok=True)
-        tmp = f"{DIR}/{FLAGS}.tmp"
-        with open(tmp, "w") as f:
-            os.fchmod(f.fileno(), 0o600); json.dump(keep, f)
-        os.replace(tmp, f"{DIR}/{FLAGS}")
-    except Exception as e:
-        log(f"flags: save failed: {e!r}")
+    save_timed(FLAGS, flags, "flags")
 
 
 def sock_request(obj, timeout=10):
@@ -3763,12 +3784,12 @@ class Daemon:
         self.note_change(chat, root_ts, slot, 1 + bool(believed and want))
         if believed:
             try:
-                api("reactions.remove", tok, channel=chat, timestamp=root_ts, name=believed)
+                set_reaction(tok, chat, root_ts, believed, False)
             except Exception as e:
                 log(f"reactions: mark {chat} {root_ts}: {e!r}")
         if want:
             try:
-                api("reactions.add", tok, channel=chat, timestamp=root_ts, name=want)
+                set_reaction(tok, chat, root_ts, want, True)
             except Exception as e:
                 log(f"reactions: mark {chat} {root_ts}: {e!r}")
         cache[key] = want
@@ -3873,12 +3894,12 @@ class Daemon:
                     self.note_change(chat, ts, slot, moved)
             for name in stale:
                 try:
-                    api("reactions.remove", tok, channel=chat, timestamp=ts, name=name)
+                    set_reaction(tok, chat, ts, name, False)
                 except Exception as e:
                     log(f"reactions: {chat} {ts}: {e!r}")
             for name in add:
                 try:
-                    api("reactions.add", tok, channel=chat, timestamp=ts, name=name)
+                    set_reaction(tok, chat, ts, name, True)
                 except Exception as e:
                     log(f"reactions: {chat} {ts}: {e!r}")
             self.remember(chat, ts, (set(current) - set(stale)) | set(add))
@@ -9362,6 +9383,67 @@ def cmd_selfcheck():
           "channels are theirs, so #<h> is completed instead of refused as 'already exists' — and welcomed once",
           st_g1 == "raised" and grace_half == (True, True, True) and st_g2 == "created" and st_g3 == "exists"
           and grace_done and welcomes.count("frank") == 1 and welcomes.count("grace") == 1)
+
+    # ── marks.json / flags.json under concurrent writers, and a mark already where we want it (2026-09-01 audit) ──
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_marks_") as tdm:
+        real_dirm, shared_m, shared_f, buf_race = DIR, {}, {}, io.StringIO()
+
+        def hammer(i, d, save):
+            for n in range(150):
+                d[f"C:{i}.{n}:white_check_mark"] = time.time()
+                save(d)
+        ths = ([threading.Thread(target=hammer, args=(i, shared_m, save_marks), name=f"selfcheck-marks-{i}") for i in range(2)]
+               + [threading.Thread(target=hammer, args=(i, shared_f, real_save_flags), name=f"selfcheck-flags-{i}") for i in range(2)])
+        try:
+            globals()["DIR"] = tdm
+            with contextlib.redirect_stderr(buf_race):
+                for t in ths:
+                    t.start()
+                for t in ths:
+                    t.join(30)
+            back_m, back_f = load_marks(), real_load_flags()
+        finally:
+            globals()["DIR"] = real_dirm
+        leftover = sorted(p for p in os.listdir(tdm) if p not in (MARKS, FLAGS))
+    check("marks.json/flags.json: two threads each saving 150 entries at once — every save lands, nothing is logged, "
+          "every key reads back and no temp file is left behind (one shared temp path let a save pull the file from "
+          "under another: FileNotFoundError ×4 in the 2026-09-01 audit)"
+          + (f" — logged: {buf_race.getvalue().strip().splitlines()[0][:80]}" if buf_race.getvalue() else "")
+          + (f" — leftover {leftover}" if leftover else ""),
+          not buf_race.getvalue() and not any(t.is_alive() for t in ths) and not leftover
+          and len(back_m) == 300 and set(back_m) == set(shared_m) and len(back_f) == 300 and set(back_f) == set(shared_f))
+    dmAR = Daemon(use_slack=False); dmAR.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmAR.bot_user = "UBOT"
+    ar_calls, buf_ar, buf_bad = [], io.StringIO(), io.StringIO()
+
+    def api_ar(method, token, **kw):
+        ar_calls.append((method, kw.get("name")))
+        if method in ("reactions.add", "reactions.remove"):
+            raise RuntimeError(f"{method}: " + ("already_reacted" if method == "reactions.add" else "no_reaction"))
+        raise RuntimeError(f"selfcheck: unexpected {method}")
+    was_api_ar = globals()["api"]
+    try:
+        globals()["api"] = api_ar
+        with contextlib.redirect_stderr(buf_ar):
+            dmAR.status_cache[("CA", "1.0")] = "large_orange_circle"
+            dmAR.set_mark("CA", "1.0", "🔴")                     # -🟠 answers no_reaction, +🔴 answers already_reacted
+            dmAR.work_cache[("CA", "2.0")] = None
+            dmAR.set_work("CA", "2.0", "✅")                     # +✅ answers already_reacted
+            ok_add = set_reaction("xoxb-x", "CA", "3.0", "red_circle", True)
+            ok_rm = set_reaction("xoxb-x", "CA", "3.0", "red_circle", False)
+        globals()["api"] = lambda method, token, **kw: (_ for _ in ()).throw(RuntimeError(f"{method}: channel_not_found"))
+        with contextlib.redirect_stderr(buf_bad):
+            dmAR.status_cache[("CA", "4.0")] = None
+            dmAR.set_mark("CA", "4.0", "🔴")
+    finally:
+        globals()["api"] = was_api_ar
+    check("reactions: already_reacted on an add and no_reaction on a remove are the wanted state ALREADY holding, not "
+          "errors — set_reaction answers True, set_mark updates its cache and logs nothing (21 of the 41 cc-slackd error "
+          "lines of the 2026-09-01 audit); any other answer is still logged",
+          ok_add is True and ok_rm is True and buf_ar.getvalue() == ""
+          and dmAR.status_cache[("CA", "1.0")] == "red_circle" and dmAR.work_cache[("CA", "2.0")] == "white_check_mark"
+          and ar_calls == [("reactions.remove", "large_orange_circle"), ("reactions.add", "red_circle"),
+                           ("reactions.add", "white_check_mark"), ("reactions.add", "red_circle"), ("reactions.remove", "red_circle")]
+          and "channel_not_found" in buf_bad.getvalue())
 
 
     check("selfcheck: the channel-is-a-session checks never touched the ~/dev they were handed",
