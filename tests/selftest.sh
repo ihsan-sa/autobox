@@ -747,6 +747,14 @@ BACK
   && ok "a13: an unfinished track is untouched by the filter" || bad "a13: the filter dropped a live track"
 o=$("$B/cc-board" selfcheck 2>&1); grep -q ': 0 failed' <<<"$o" \
   && ok "cc-board selfcheck: 0 failed" || { bad "cc-board selfcheck"; echo "$o" | grep FAIL | head -5; }
+# KIND=SESSION (owner, 2026-09-01): `cc <repo> <name> --session` marks a row a channel-like session — a long-lived
+# session with no task to finish. cc-reconcile leaves its status alone (a track with nobody in its worktree past
+# grace would be reconciled); the rest of the rule is pinned in cc-board's and cc-slack's selfchecks.
+"$B/cc" "$REPO" sess1 --session >/dev/null 2>&1
+[ "$("$B/cc-board" get "$REPO" sess1 kind)" = session ] && ok "cc <repo> <name> --session makes the row kind=session" || bad "--session did not set the kind: $("$B/cc-board" get "$REPO" sess1 kind)"
+"$B/cc-board" status "$REPO" sess1 running >/dev/null; for id in $(wins "$REPO/sess1"); do tmux kill-window -t "$id"; done   # nobody in it now
+"$B/cc-reconcile" "$REPO" --apply --no-net --grace 0 >/dev/null 2>&1
+[ "$("$B/cc-board" get "$REPO" sess1 status)" = running ] && ok "cc-reconcile --apply leaves a session row's status alone" || bad "reconcile flipped the session row to $("$B/cc-board" get "$REPO" sess1 status)"
 # P1-P4: one branch, one PR. The loop calls `cc done` when the worker writes STATUS: DONE and a session calls it when it
 # finishes by hand; a squash-merge deletes the branch, so the late caller saw nothing OPEN and opened a duplicate of commits
 # GitHub had already merged (#24/#25 and #29/#30 — same headRefOid). The stub gh never prints a URL from `pr create`, so

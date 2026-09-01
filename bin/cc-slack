@@ -1377,7 +1377,7 @@ HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and
                                                # HOME_SLICE: rows one board-view button DMs before it says how many more.
 HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT, HOME_BTN = 40, 24, 26, 180, 18   # phone widths: a line · a track name · an ask · the audit · a button label
 HOME_DEPTH = 4                                 # deepest sub-channel indent the phone column takes; deeper nests flatten to it
-HOME_CUT = ("boot", "handoffs", "audit", "chart", "channels", "backlog", "views")   # …and the order they go in when even
+HOME_CUT = ("boot", "handoffs", "audit", "chart", "sessions", "channels", "backlog", "views")   # …and the order they go in when even
                                                # that does not fit (§01d). The chart goes after the grey one-liners and before
                                                # the channels: it is 2 blocks, the most a single cut can free, and the `load`
                                                # line under it carries the same numbers in words. A tab that dropped RUNNING
@@ -1583,6 +1583,8 @@ def home_board_rows():
             continue                                      # one unreadable board must not empty every other repo's slice
         repo = d.get("repo") or os.path.basename(fn)[:-5]
         for tr, t in (d.get("tracks") or {}).items():
+            if (t.get("kind") or "track") == "session":
+                continue                                  # a session is never to do, running or done: not a board VIEW row
             out.append((repo, tr, str(t.get("status") or "?"), str(t.get("title") or ""), str(t.get("updated") or "")))
     return out
 
@@ -1670,6 +1672,12 @@ def home_needs(st, names=None):
             out.append((2 if t.get("state") == "waiting" else 3, 0.0,
                         f"{HOME_STATE[t['state']][0]} *{names.get(t.get('name'), home_short(t.get('name')))}* · "
                         f"{home_ask(t.get('reason') or 'blocked')}"))   # the reason is an ask like any other: one line
+    for s in st.get("sessions") or ():
+        # a SESSION (board kind=session) is never a track and never RUNNING, but the question it declared is the
+        # owner's to answer like any other — the 2026-08-31 fix above exists because five of these went unheard
+        # (review of #132). Same rank as a `waiting` track; the SESSIONS band below the fold carries it too.
+        if s.get("ask"):
+            out.append((2, 0.0, f"❓ *{home_short(s.get('name'))}* · {home_ask(s.get('ask'))}"))
     return [line for _, _, line in sorted(out, key=lambda r: (r[0], r[1], r[2]))]
 
 
@@ -1719,6 +1727,7 @@ def home_parts(st):
       5 divider           THE FOLD. Everything below is secondary by contract.
       6 backlog           ⏳ EVERY queued track; while a usage limit holds, the count and the hour, no lines
       6b board views      To do · Running · Done — three buttons that DM one slice of the board each
+      6c sessions         long-lived channel sessions (board kind=session) grouped under their repo — never RUNNING
       7 channels          EVERY channel the box knows of, one line each — the busy ones first, then the quiet
       8-11 load · handoffs · audit · units+boot   grey, one line each, cheapest to skip and first to be cut (HOME_CUT)
 
@@ -1730,13 +1739,15 @@ def home_parts(st):
     Phone first: one line per item, ~40 rendered characters (two-column `fields` truncate there and are gone from here).
     Emoji are the only graphics and every one comes from HOME_STATE or the table above it."""
     tracks, chans, quick = list(st.get("tracks") or ()), list(st.get("channels") or ()), list(st.get("quick") or ())
+    sessions = list(st.get("sessions") or ())
     units = [(u[0], len(u) > 1 and bool(u[1]), u[2] if len(u) > 2 else "")   # (name, ok[, hint]) — home_units carries the
              for u in (st.get("units") or ()) if u]                          # hint, a fixture need not
     names, box = home_names(tracks), st.get("box") or "box"
     run = [t for t in tracks if t.get("state") == "running"]
     waiting = [t for t in tracks if t.get("state") == "waiting"]
-    blocked = [t for t in tracks if t.get("state") == "blocked"]
-    queued = [t for t in tracks if t.get("state") == "queued"]
+    asking = [x for x in sessions if x.get("ask")]        # a session that declared a question is waiting on him exactly
+    blocked = [t for t in tracks if t.get("state") == "blocked"]   # as a `waiting` track is: it counts in the tally and
+    queued = [t for t in tracks if t.get("state") == "queued"]     # forbids "the board is clear" (review of #132, 2nd pass)
     limit, until = st.get("limit") or "", home_until(st.get("limit"))
 
     # 1 — the box, and when
@@ -1746,7 +1757,7 @@ def home_parts(st):
     p.append(("tally", _home_ctx(" · ".join(x for x in ((f"RUNNING {len(run)}" if run else "NOTHING RUNNING"),
                                                         # counted separately and never as RUNNING: they are stopped, and
                                                         # the count is the owner's own backlog, not the box's
-                                                        f"WAITING ON YOU {len(waiting)}" if waiting else "",
+                                                        f"WAITING ON YOU {len(waiting) + len(asking)}" if waiting or asking else "",
                                                         f"BLOCKED {len(blocked)}" if blocked else "",
                                                         f"QUEUED {len(queued)}" if queued else "") if x))))
     rows = [f"🔴 *{n} down*" + (f" · {h}" if h else "") for n, ok, h in units if not ok]
@@ -1757,7 +1768,7 @@ def home_parts(st):
              for q in quick]                                    # work a session did without a track: running, no board row
     if not rows:                                             # nothing runs AND nothing is wrong: say so in words, never
         last = st.get("last") or {}                          # leave the block the owner looks at first empty
-        rows.append("_nothing is running — what is waiting is below_" if waiting else
+        rows.append("_nothing is running — what is waiting is below_" if waiting or asking else
                     (f"✅ last: {last['name']} · {last.get('verb', 'done')} {last.get('when', '')}".rstrip()
                      if last.get("name") else "_the board is clear_"))
     p.append(("tally", _home_sec(home_list(rows, lambda k: f"_+{k} more running_", HOME_MAXTEXT))))
@@ -1786,6 +1797,25 @@ def home_parts(st):
     #      lines, the button that prints them is exactly what the owner still needs.
     if tracks:
         p.append(("views", {"type": "actions", "elements": [_home_btn(lab, aid) for aid, lab, _ in HOME_VIEWS]}))
+
+    # 6c — sessions: long-lived channel sessions (board kind=session — a course-builder's per-course sessions), grouped under
+    #      their repo the way sub-orch channels sit under theirs. NEVER in RUNNING or the tally: a live claude is a
+    #      session's normal state, not work in flight (owner, 2026-09-01: "more like channels within the course-builder";
+    #      the tab had five of them under 🏃). 🟢 has a claude in its worktree, ⚪ has none — the channels' own marks —
+    #      and a question it declared (home_reason) rides on its line, so the ❓ still says what it is.
+    if sessions:
+        byrepo = collections.defaultdict(list)
+        for sess in sessions:
+            byrepo[str(sess.get("repo") or "?")].append(sess)
+        lines = []
+        for repo in sorted(byrepo):
+            lines.append(f"*{repo}*")
+            for sess in sorted(byrepo[repo], key=lambda x: str(x.get("name") or "")):
+                ask = str(sess.get("ask") or "")
+                lines.append(f"\u00a0\u00a0↳ {'🟢' if sess.get('live') else '⚪'} {home_short(sess.get('name'))}"
+                             + (f" · ❓ {home_ask(ask)}" if ask else ""))
+        p += [("sessions", _home_ctx(f"SESSIONS · {len(sessions)}")),
+              ("sessions", _home_sec(home_list(lines, lambda k: f"_+{k} more sessions_")))]
 
     # 7 — channels: EVERY channel the box knows of, one line each (owner, 2026-08-30, thread 1788133685: "also show all
     #     channels"). This band was the last one that hid: §04 capped it at six lines and turned the rest into
@@ -2089,10 +2119,12 @@ def home_reason(repo, tr):
 
 
 def home_tracks(workers, prs):
-    """(tracks, last finished) — board tracks that are running, waiting or in trouble, the same data cc-digest prints,
-    read straight off the sidecar boards (no subprocess). Finished ones drop off (home_track_shown); the newest of them
-    comes back as `last`, which is the whole of what a quiet tab has to say."""
-    out, last = [], None
+    """(tracks, last finished, sessions) — board tracks that are running, waiting or in trouble, the same data cc-digest
+    prints, read straight off the sidecar boards (no subprocess). Finished ones drop off (home_track_shown); the newest
+    of them comes back as `last`, which is the whole of what a quiet tab has to say. A row of kind=session (cc-board
+    KINDS: a long-lived channel session, not a task) is never a track here — it goes to `sessions`, with whether a
+    claude is in its worktree and the question it declared, if any, and home_parts groups those under their repo."""
+    out, last, sessions = [], None, []
     for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
         try:
             d = json.load(open(fn))
@@ -2109,6 +2141,9 @@ def home_tracks(workers, prs):
             wt, pr, status = f"{HOME}/.cc/worktrees/{repo}/{tr}/.cc", str(t.get("pr") or ""), t.get("status", "?")
             num = pr.rstrip("/").rsplit("/", 1)[-1]        # the board stores a number or the full PR url
             live = f"{repo}/{tr}" in workers
+            if (t.get("kind") or "track") == "session":
+                sessions.append({"repo": repo, "name": tr, "live": live, "ask": home_reason(repo, tr)})
+                continue
             if not home_track_shown(status, prs.get((repo, pr)) if pr else None):
                 upd = str(t.get("updated") or "")          # finished and its PR is settled: it leaves the tab, but the
                 if last is None or upd > last["at"]:       # newest of them is the quiet tab's one line
@@ -2133,7 +2168,7 @@ def home_tracks(workers, prs):
                         "pr": {"num": num, "repo": repo, "url": pr if pr.startswith("http") else "",
                                "owed": prst.startswith("OPEN") and "APPROVED" not in prst}
                               if pr and not prst.startswith(("CLOSED", "MERGED")) else None})
-    return sorted(out, key=lambda t: (t["rank"], t["name"])), last
+    return sorted(out, key=lambda t: (t["rank"], t["name"])), last, sessions
 
 
 def home_audit():
@@ -4261,11 +4296,11 @@ class Daemon:
             except Exception:
                 return ""
         audit_at, verdict, boot = cached("audit", HOME_CACHE, home_audit)
-        tracks, last = cached("tracks", HOME_CACHE, lambda: home_tracks(home_workers(), self.home_prs))
+        tracks, last, sessions = cached("tracks", HOME_CACHE, lambda: home_tracks(home_workers(), self.home_prs))
         # the clock and the box's vitals are read every time (they are file reads); everything that costs a process is cached
         return {"box": BOX, "now": time.strftime("%H:%MZ", time.gmtime()), "units": cached("units", HOME_CACHE, home_units),
                 "load": home_load(), "limit": cached("limit", HOME_CACHE, limit_now), "channels": chans,
-                "tracks": tracks, "last": last, "waits": waits,
+                "tracks": tracks, "last": last, "waits": waits, "sessions": sessions,
                 "quick": cached("quick", HOME_CACHE, home_quick),
                 "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
                 "audit_at": audit_at, "audit": verdict, "boot": boot, "chart": self.chart}
@@ -7882,11 +7917,15 @@ def cmd_selfcheck():
         journal("stuck", "dispatched\nSTATUS: BLOCKED: which deploy key should I use\n")
         journal("moved", "asked\nSTATUS: BLOCKED: which deploy key\nanswered it myself\nSTATUS: DONE\n")
         journal("quiet", "dispatched, nothing to report yet\n")
+        journal("course1", "recon done\nSTATUS: BLOCKED: which syllabus?\n")
         reasons = (home_reason("abox", "stuck"), home_reason("abox", "moved"),
                    home_reason("abox", "quiet"), home_reason("abox", "no-such-track"))
-        json.dump({"repo": "abox", "tracks": {t: {"status": "blocked", "updated": "2026-08-30T21:00:00Z"}
-                                              for t in ("stuck", "moved")}}, open(f"{hr}/.cc/boards/abox.json", "w"))
-        htr, _ = home_tracks(set(), {})
+        json.dump({"repo": "abox", "tracks": dict({t: {"status": "blocked", "updated": "2026-08-30T21:00:00Z"}
+                                                   for t in ("stuck", "moved")},
+                                                  course1={"status": "running", "kind": "session", "updated": "2026-08-30T21:00:00Z"})},
+                  open(f"{hr}/.cc/boards/abox.json", "w"))
+        htr, _, hsess = home_tracks({"abox/course1"}, {})
+        hbrows = home_board_rows()
         details = {t["name"]: t["detail"] for t in htr}
         rows = home_needs({"tracks": htr})
     finally:
@@ -7902,6 +7941,39 @@ def cmd_selfcheck():
           rows == ["❓ *stuck* · which deploy key should I…"]
           and details == {"abox/moved": "board stale", "abox/stuck": "—"}
           and {t["name"]: t["state"] for t in htr} == {"abox/moved": "blocked", "abox/stuck": "waiting"})
+    check("home_tracks: a board row of kind=session is NOT a track — not on the running list, not in any board view — "
+          "it comes back on its own list with its liveness and the question it declared, for the SESSIONS band "
+          "(owner, 2026-09-01: course sessions are channels within the course-builder, not tasks)…",
+          hsess == [{"repo": "abox", "name": "course1", "live": True, "ask": "which syllabus?"}]
+          and not any("course1" in t["name"] for t in htr) and not any(r[1] == "course1" for r in hbrows)
+          and {r[1] for r in hbrows} == {"stuck", "moved"})
+    check("home_needs: …and its question still reaches NEEDS YOU, ranked with a waiting track — a session is not a "
+          "task, but what it asks is the owner's like anything else (review of #132); one with no ask adds no row",
+          home_needs({"tracks": htr, "sessions": hsess}) == ["❓ *course1* · which syllabus", "❓ *stuck* · which deploy key should I…"]
+          and home_needs({"sessions": [{"repo": "r", "name": "s", "live": True, "ask": ""}]}) == []
+          and home_needs({"tracks": [{"state": "blocked", "name": "r/b", "reason": "no GH token"}],
+                          "sessions": [{"repo": "r", "name": "s", "ask": "ship it?"}]}) == ["❓ *s* · ship it", "⛔ *b* · no GH token"])
+    hS = home_blocks(dict(hfix, sessions=[{"repo": "lesson", "name": "course2", "live": False, "ask": "which syllabus do you want? the 2025 one is online"},
+                                          {"repo": "lesson", "name": "course1", "live": True, "ask": ""},
+                                          {"repo": "abox", "name": "help", "live": True, "ask": ""}]))
+    sS = json.dumps(hS, ensure_ascii=False)
+    iS = next(i for i, b in enumerate(hS) if b["type"] == "context" and b["elements"][0]["text"] == "SESSIONS · 3")
+    hS0 = home_blocks(dict(hfix, sessions=[{"repo": "lesson", "name": "course1", "live": True, "ask": ""}]))   # no ask
+    hfold = lambda blocks: blocks[:blocks.index(next(b for b in blocks if b["type"] == "divider"))]   # above the fold
+    check("home_blocks: SESSIONS is its own band BELOW THE FOLD — grouped under the repo and indented the way sub-orch "
+          "channels are, 🟢/⚪ for a claude in the worktree, the ask on the line — and a session is never RUNNING: the "
+          "tally and the running lines are byte-for-byte the busy reference's, one with no ask moves nothing above the "
+          "fold, and one WITH an ask adds exactly its row to NEEDS YOU (review of #132: the question must not drop)",
+          hS[iS + 1]["text"]["text"] == "*abox*\n\u00a0\u00a0↳ 🟢 help\n*lesson*\n\u00a0\u00a0↳ 🟢 course1\n"
+                                        "\u00a0\u00a0↳ ⚪ course2 · ❓ which syllabus do you want"
+          and iS > next(i for i, b in enumerate(hS) if b["type"] == "divider")
+          and hfold(hS0) == hfold(hb) and "course2" not in json.dumps(hfold(hb), ensure_ascii=False)
+          and "❓ *course2* · which syllabus do you want" in json.dumps(hfold(hS), ensure_ascii=False)
+          and "RUNNING 2" in sS and sS.count("🏃") == 2 and "ece" not in sS.split("SESSIONS")[0]
+          and hbudget(hS) and hno_empty_header(hS)
+          and "SESSIONS" not in htxt and home_blocks(hfix) == hb       # no sessions, no band; a track-only tab is unchanged
+          and HOME_CUT.index("sessions") < HOME_CUT.index("channels")   # …and it is cut before the channels, after the chart
+          and "sessions" not in {t for t, _ in home_cut(home_parts(dict(hfix, sessions=[{"repo": "r", "name": "s"}])), 5)})
     check("home_blocks: the phone line — short names, facts dropped RIGHT TO LEFT (PR, then $, then iterations) so the "
           "leftmost fact survives, and a sub-channel indented with NB-spaces Slack cannot collapse",
           home_short("sandbox/subproj-carpet-rectify") == "subproj-carpet-rectify"
@@ -8181,11 +8253,12 @@ def cmd_selfcheck():
           and "handoff" not in json.dumps(home_blocks(dict(hfix, handoffs={"today": 0})), ensure_ascii=False)
           and hbudget(hhb) and hno_empty_header(hhb) and len(hhb) == 16)
     hempty = home_blocks({})
-    hwait = home_blocks({"box": "abox", "now": "10:15Z", "units": [("tmux-main", True, "")], "load": "📈 0.30",
-                         "channels": [], "waits": [], "quick": [], "boot": "",
-                         "last": {"name": "abox/old", "verb": "merged", "when": "08:40Z", "at": "x"},
-                         "tracks": [{"state": "waiting", "name": f"lesson/ece{n}", "detail": "—", "rank": 1,
-                                     "reason": "which syllabus should I build from"} for n in (203, 206, 207)]})
+    hwfix = {"box": "abox", "now": "10:15Z", "units": [("tmux-main", True, "")], "load": "📈 0.30",
+             "channels": [], "waits": [], "quick": [], "boot": "",
+             "last": {"name": "abox/old", "verb": "merged", "when": "08:40Z", "at": "x"},
+             "tracks": [{"state": "waiting", "name": f"lesson/course{n}", "detail": "—", "rank": 1,
+                         "reason": "which syllabus should I build from"} for n in (1, 2, 3)]}
+    hwait = home_blocks(hwfix)
     wtxt = json.dumps(hwait, ensure_ascii=False)
     check("home_blocks (c) WAITING — the shape the owner was shown on 2026-08-31: three sessions each stopped on a "
           "question for him. The tally counts them as WAITING ON YOU and NOT as running, the top block points at the "
@@ -8195,9 +8268,31 @@ def cmd_selfcheck():
           and hwait[2]["text"]["text"] == "_nothing is running — what is waiting is below_"
           and hwait[3]["elements"][0]["text"] == "NEEDS YOU · 3"
           and hwait[4]["text"]["text"].count("❓") == 3
-          and "❓ *ece203* · which syllabus should I b…" in wtxt
+          and "❓ *course1* · which syllabus should I b…" in wtxt
           and "🏃" not in wtxt and "RUNNING 3" not in wtxt and "the board is clear" not in wtxt
           and "✅ last" not in wtxt)
+    hwsess = dict(hwfix, tracks=[], sessions=[{"repo": "lesson", "name": f"course{n}", "live": True,
+                                               "ask": "which syllabus should I build from"} for n in (1, 2, 3, 4, 5)])
+    hws = home_blocks(hwsess)
+    wstxt = json.dumps(hws, ensure_ascii=False)
+    hwmix = home_blocks(dict(hwsess, tracks=hwfix["tracks"][:1]))
+    check("home_blocks (c) WAITING, the MIGRATED shape (review of #132, 2nd pass): the same five course rows as board "
+          "kind=session, no track running. Their declared questions count as WAITING ON YOU, the top block points at "
+          "the band instead of claiming the board is clear or naming the last merge, and NEEDS YOU carries all five — "
+          "a session with no question counts for nothing, and a waiting track plus asking sessions add up",
+          hws[1]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 5"
+          and hws[2]["text"]["text"] == "_nothing is running — what is waiting is below_"
+          and hws[3]["elements"][0]["text"] == "NEEDS YOU · 5"
+          and hws[4]["text"]["text"].count("❓") == 5
+          and "❓ *course1* · which syllabus should I b…" in wstxt
+          and "🏃" not in wstxt and "RUNNING" not in wstxt.replace("NOTHING RUNNING", "")
+          and "the board is clear" not in wstxt and "✅ last" not in wstxt
+          and hwmix[1]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 6"
+          and hwmix[3]["elements"][0]["text"] == "NEEDS YOU · 6"
+          and htexts(home_blocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1", "live": True,
+                                                         "ask": ""}])))[1] == "✅ last: abox/old · merged 08:40Z"
+          and "WAITING ON YOU" not in json.dumps(home_blocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1",
+                                                                                      "live": True, "ask": ""}]))))
     check("home_blocks: …and one waiting track is not the same as one BLOCKED track — the blocked one is off his list "
           "(it stopped, it is not asking) and is never counted as waiting on him",
           json.dumps(home_blocks({"box": "abox", "now": "10:15Z", "units": [], "load": "", "channels": [],

@@ -14,6 +14,13 @@ STATES = ["queued","running","waiting","review","blocked","merged","done"]
 # a usage limit, a kill. Only `waiting` reaches the owner's NEEDS YOU list, and cc-reconcile is what writes it.
 ALIAS = {"todo":"queued"}
 def state(st): return ALIAS.get(st, st)
+# A ROW'S KIND (owner, 2026-09-01): `track` is everything above — a brief, a worker or a session on it, a PR, done.
+# `session` is a long-lived channel session (a course-builder's per-course sessions): no brief needed, no PR, never done,
+# and alive is its NORMAL state — so cc-reconcile never touches its status, the Home tab groups it under its repo and
+# never counts it as running, and `list` says `session` where a track says its status (cc ls / digest / resume read
+# that column). Rows written before this carry no field and read as `track`. `cc <repo> <name> --session` sets it.
+KINDS = ("track", "session")
+def kind(t): return t.get("kind") or "track"
 def clean(s):
     """A title is display text. argv arrives surrogateescaped, so a shell-mangled emoji is a lone surrogate — json.dump
     stores it happily and every later print of the board raises. Replace it on the way in; never store one."""
@@ -119,7 +126,7 @@ def main(a):
             d = need(repo)
             t = d["tracks"].get(track, {})
             t.pop("instructions", None)                 # a re-add drops the pre-#94 copy too
-            t.update({"title":title,
+            t.update({"title":title, "kind":kind(t),
                       "status":state(t.get("status","queued")),
                       "branch":t.get("branch",f"track/{track}"),
                       "worktree":t.get("worktree", os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}")),
@@ -142,12 +149,15 @@ def main(a):
             if key=="started": val = val.lower() in ("1","true","yes")
             if key=="status": val = state(val)   # `cc-board set … status todo` speaks the same word as `cc-board status`
             if key=="title": val = clean(val)
+            if key=="kind" and val not in KINDS: sys.exit(f"kind must be one of {list(KINDS)}")
             d["tracks"][track][key]=val; d["tracks"][track]["updated"]=now()
             _save(repo,d)
     elif cmd == "get":
         repo, track, key = a[1], a[2], a[3]
         if key == "instructions": print(brief(repo, track), end=""); return
-        d = need(repo); print(d["tracks"].get(track,{}).get(key,""))
+        d = need(repo); t = d["tracks"].get(track)
+        if key == "kind": print(kind(t) if t is not None else ""); return   # a row with no field IS a track
+        print((t or {}).get(key,""))
     elif cmd == "status":
         repo, track, st = a[1], a[2], state(a[3])
         if st not in STATES: sys.exit(f"status must be one of {STATES}")
@@ -185,19 +195,22 @@ def main(a):
             except Exception as e:   # one unreadable board must not hide every other repo
                 print(f"{fn}: unreadable ({e})", file=sys.stderr); continue
             for tr,t in d.get("tracks",{}).items():
-                print(f"{d.get('repo',fn[:-5])}\t{tr}\t{t.get('status','?')}\t{t.get('title','')}")
+                st = "session" if kind(t) == "session" else t.get("status","?")   # what the row IS, for cc ls/digest/resume
+                print(f"{d.get('repo',fn[:-5])}\t{tr}\t{st}\t{t.get('title','')}")
     elif cmd == "show":
         rest = [x for x in a[1:] if x != "--all"]; allrows = "--all" in a[1:]
         if not rest: sys.exit("cc-board show: needs a repo")
         repo = rest[0]; d = need(repo)
         ico = {"queued":"·","todo":"·","running":"▶","waiting":"❓","review":"◆","blocked":"■","merged":"✓","done":"✓"}
         rows = [(tr,t) for tr,t in d["tracks"].items() if allrows or shown(t)]
+        rows.sort(key=lambda r: kind(r[1]) == "session")   # stable: the tracks, then the repo's sessions grouped under them
         hid = len(d["tracks"]) - len(rows)
         print(f"\n\033[1m{d['repo']}\033[0m  base:{d.get('default_branch','main')}  {d.get('path','')}")
         if not d["tracks"]: print("  (no tracks yet)")
         elif not rows: print("  (nothing open)")
         for tr,t in rows:
-            print(f"  {ico.get(t.get('status'),'?')} \033[1m{tr}\033[0m [{t.get('status')}]  {t.get('title','')}")
+            if kind(t) == "session": print(f"  ↳ \033[1m{tr}\033[0m [session]  {t.get('title','')}")
+            else: print(f"  {ico.get(t.get('status'),'?')} \033[1m{tr}\033[0m [{t.get('status')}]  {t.get('title','')}")
             b = brief(repo, tr).strip()   # a legacy row migrates on this read, like every other read of the brief
             if b: print(f"      task: {b[:200]}")
             if t.get("pr"): print(f"      PR: {t['pr']}")
@@ -288,6 +301,23 @@ def selfcheck():
         sh, ls = run("show", "r"), run("list")
         ok("`show` and `list` print a bad title already on disk instead of crashing",
            sh.returncode == 0 and ls.returncode == 0 and "mangled" in sh.stdout and "mangled" in ls.stdout)
+        # KIND: a row is a `track` unless it says `session`, and a session row says so wherever a row is printed
+        ok("a row with no kind field is a track, and `add` stamps the kind on a new row",
+           run("get", "r", "t2", "kind").stdout.strip() == "track"
+           and json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["t1"]["kind"] == "track")
+        r = run("set", "r", "t1", "kind", "channel")
+        ok("`set kind` takes track or session and nothing else",
+           r.returncode != 0 and run("get", "r", "t1", "kind").stdout.strip() == "track")
+        run("add", "r", "sess9", "a course session", ""); run("set", "r", "sess9", "kind", "session")
+        run("status", "r", "sess9", "running"); run("add", "r", "sess9", "a course session", "")
+        ok("a session row keeps its kind across a re-add", run("get", "r", "sess9", "kind").stdout.strip() == "session")
+        ls, sh = run("list").stdout, run("show", "r").stdout
+        ok("`list` says `session` in the status column for a session row — cc ls, cc digest and cc resume read that "
+           "column — and a track's status exactly as before",
+           "r\tsess9\tsession\t" in ls and "r\tt1\tqueued\t" in ls)
+        ok("`show` prints a session row after the tracks, indented, with no status icon; a track row as before",
+           "  ↳ \033[1msess9\033[0m [session]  a course session" in sh and "  · \033[1mt1\033[0m [queued]" in sh
+           and sh.index("[queued]") < sh.index("[session]"))
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-board selfcheck: {n} failed")

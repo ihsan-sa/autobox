@@ -299,6 +299,17 @@ def decide(f):
     st, live, pr, has_pr = f["status"], f["live"], f.get("pr_state") or "", bool(f.get("pr"))
     jk = (f.get("journal") or (None, ""))[0]
     who, wwhy = waits_for(f)      # waits_for owns the question itself: this only needs to know DONE from not-DONE
+    if (f.get("kind") or "track") == "session":
+        # A SESSION row (cc-board KINDS) is a channel, not a task: alive is its normal state and it is never done, so
+        # no rule below — presence, grace, PR, worktree, runaway — is drift for it (five were flipped to `running`
+        # on every tick before this; owner, 2026-09-01). The ONE row it shares with a track is the owner's question,
+        # the row waits_for() was written for: it is asked, set `waiting`, offered and paged exactly like a track's
+        # (review of #132), and clears the same way, the moment the journal's newest STATUS is not BLOCKED.
+        if who == "person" and st not in TERMINAL:
+            return [("ask", "waiting", "it is waiting on you: " + wwhy)]
+        if st == "waiting":
+            return [("fix", "running", "its question was answered")]
+        return []
     out, settled = [], False
     if f.get("stop_why"):               # spending without producing: the one live track this tool ends rather than describes
         out.append(("stop", "blocked", f["stop_why"]))
@@ -355,10 +366,11 @@ def effective(f, recs):
     """Pure — THE ONE WORD for a track (review rec #7: this tool is the sole decider). What decide() would set
     outranks the board, because decide() has just looked at the box and the board is a file somebody wrote between
     turns. No record with a status means nothing here disagrees, and the board's own word stands."""
-    for _, st, _ in recs:
-        if st:
-            return st
-    return f["status"] or "queued"
+    session = (f.get("kind") or "track") == "session"   # a channel's word is its kind (cc-board `list` says the same):
+    for _, st, _ in recs:                                # cc ls and cc digest never print `running` for one — `waiting`,
+        if st:                                           # the owner's question, is the one track word it wears
+            return "session" if session and st != "waiting" else st
+    return "session" if session else (f["status"] or "queued")
 
 
 def pending(f, state):
@@ -409,7 +421,7 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
                 remotes[repo] = has_remote(repo)
             key = f"{repo}/{track}"
             f = {
-                "repo": repo, "track": track, "status": st, "pr": pr,
+                "repo": repo, "track": track, "status": st, "pr": pr, "kind": t.get("kind") or "track",   # decide() narrows by kind
                 "pr_state": pr_state(repo, pr, net) if ask_pr else ("?" if want_pr and net else None),
                 "live": f"{repo}/{track}" in live, "wt_exists": os.path.isdir(wt),
                 "age": max(0.0, t0 - epoch(t.get("updated") or t.get("created"))), "grace": grace,
@@ -810,6 +822,33 @@ def selfcheck():
        decide(F(status="running", live=True, stop_why="x"))[0][:2] == ("stop", "blocked"))
     ok("a track being ended is not also 'fixed' to running",
        len(decide(F(status="queued", live=True, stop_why="x"))) == 1)
+    # KIND=SESSION — a channel, not a task (owner, 2026-09-01): every LIVENESS row of the table above is refused for
+    # one; the owner's question is the one row it keeps (review of #132), and its one word is its kind
+    ok("a session row is never moved by presence, grace, a PR, a worktree, DONE or a runaway — alive, dead past "
+       "grace, merged, wedged: decide() has nothing to say; the same facts on a track still decide it",
+       all(decide(F(kind="session", **kw)) == [] for kw in (
+           dict(status="running"), dict(status="blocked", live=True), dict(status="queued", live=True),
+           dict(status="review", pr="u", pr_state="MERGED"), dict(status="running", live=True, stop_why="x"),
+           dict(status="running", wt_exists=False, push_err=True), dict(status="running", journal=("DONE", ""))))
+       and decide(F(kind="track", status="blocked", live=True))[0][:2] == ("fix", "running")
+       and decide(F(status="blocked", live=True))[0][:2] == ("fix", "running"))
+    ok("…but a session with a question for the owner is WAITING like a track — the ask record, so it is set, offered "
+       "and paged: five course sessions are what waits_for() was written for, and kind=session must not silence them",
+       decide(F(kind="session", status="running", live=True, journal=("BLOCKED", "which syllabus?")))[0][:2] == ("ask", "waiting")
+       and "which syllabus?" in decide(F(kind="session", status="running", live=True, journal=("BLOCKED", "which syllabus?")))[0][2]
+       and decide(F(kind="session", status="running", live=False, journal=("BLOCKED", "which syllabus?")))[0][:2] == ("ask", "waiting")
+       and decide(F(kind="session", status="merged", journal=("BLOCKED", "old"))) == [])
+    ok("…and it clears the same way — `waiting` goes back to `running` once the journal stops saying BLOCKED, live "
+       "or not (liveness is not a session's concern), never to `blocked` as a dead track would",
+       decide(F(kind="session", status="waiting", live=True))[0][:2] == ("fix", "running")
+       and decide(F(kind="session", status="waiting", live=False))[0][:2] == ("fix", "running")
+       and decide(F(status="waiting", live=False))[0][:2] == ("ask", "blocked"))
+    ok("the ONE WORD for a session is its kind, `session` — cc ls and cc digest print that, never the `running` its "
+       "row carries — with `waiting` the one track word it wears; a track's word is unchanged",
+       effective(F(kind="session", status="running"), []) == "session"
+       and effective(F(kind="session", status="waiting"), [("fix", "running", "")]) == "session"
+       and effective(F(kind="session", status="running"), [("ask", "waiting", "")]) == "waiting"
+       and effective(F(status="running"), []) == "running" and effective(F(status="waiting"), [("fix", "running", "")]) == "running")
 
     # end to end: a real board, a real worktree, a real apply — in a HOME of its own
     with tempfile.TemporaryDirectory() as th:
@@ -866,6 +905,32 @@ def selfcheck():
            and "which schema?" in snp["tracks"][f"{repo}/t1"]["why"])
         ok("end to end: …and leaves it on disk for cc-digest and `cc ls` to read",
            json.load(open(f"{th}/.cc/state/reconcile.json"))["tracks"][f"{repo}/t1"]["state"] == "waiting")
+        # a SESSION row beside it: nobody in its worktree, past every grace, a question in its journal. The question
+        # is the owner's like a track's — `waiting`, reported, in the snapshot with who and why, paged when no session
+        # took it (review of #132) — but answered, the row goes back to `running` where a dead track is reconciled
+        os.makedirs(f"{th}/.cc/worktrees/{repo}/sess9", exist_ok=True)
+        os.makedirs(f"{th}/.cc/state/{repo}/sess9", exist_ok=True)
+        open(f"{th}/.cc/state/{repo}/sess9/progress.md", "w").write("- recon done\nSTATUS: BLOCKED: which syllabus?\n")
+        cb("add", repo, "sess9", "a course session", "")
+        cb("set", repo, "sess9", "kind", "session")
+        cb("status", repo, "sess9", "running")
+        rS = subprocess.run(argvN, env=dict(env, CC_RECONCILE_INJECT="/bin/false"), capture_output=True, text=True, timeout=120)
+        snap_ = lambda: json.loads(subprocess.run([sys.executable, os.path.realpath(__file__), "snapshot"], env=env,
+                                                  capture_output=True, text=True, timeout=120).stdout)["tracks"]
+        snpS = snap_().get(f"{repo}/sess9") or {}   # a filtered run never writes the file: `snapshot` is the unfiltered one
+        ok("end to end: a session's question reaches the owner like a track's — `waiting` on the board, in the run's "
+           "output, in the snapshot with who and why, and paged when no session took it",
+           cb("get", repo, "sess9", "status").stdout.strip() == "waiting" and "sess9" in rS.stdout
+           and snpS.get("state") == "waiting" and snpS.get("waiting_on") == "person" and "which syllabus?" in snpS.get("why", "")
+           and "sess9" in open(f"{th}/notify.log").read())
+        open(f"{th}/.cc/state/{repo}/sess9/progress.md", "w").write("- owner answered; building\n")
+        subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--apply", "--notify",
+                        "--no-net", "--grace", "0"], env=env, capture_output=True, text=True, timeout=120)
+        snpS = snap_()[f"{repo}/sess9"]
+        ok("end to end: …and answered, it goes back to `running` — never `blocked`, whatever its worktree says — and "
+           "its snapshot word is `session`, so cc ls and cc digest never print `running` for it",
+           cb("get", repo, "sess9", "status").stdout.strip() == "running"
+           and snpS["state"] == "session" and snpS["waiting_on"] == "")
         # the other half of waiting: it must CLEAR. The question is gone from the journal and nobody is in the
         # worktree, so the next apply reconciles the stale word instead of leaving `waiting` stuck on the board.
         # (With someone live it goes back to `running` — that leg is a decide() row above; liveness cannot be
