@@ -10,6 +10,7 @@ the owner's idea of what the box is doing — reads the board, so that drift is 
   cc-reconcile --apply               …and fix what is mechanically decidable, and STOP a runaway
   cc-reconcile --apply --notify      …and push what is NOT to the owner (once a day per finding)
   cc-reconcile snapshot              print the read-only state snapshot (and refresh it), ask nothing of the network
+  cc-reconcile view                  the snapshot as `cc ls` and cc-digest take it: TSV repo/track · state · waiting_on · why; no rows when missing or stale
   cc-reconcile selfcheck             the decision table + one end-to-end run, no network
     also: --json · -q · --no-net (never ask GitHub) · --grace SEC (default 600) · --repeat SEC (default 86400)
           --no-stop (report a runaway, never end it)
@@ -36,7 +37,7 @@ iterations has declared nothing and is simply running. See waits_for(); nothing 
 
 THE SNAPSHOT (~/.cc/state/reconcile.json, review rec #7). Every unfiltered run writes what it just decided —
 effective state, live presence, who each track waits on and why. This tool is the sole decider; `cc-digest` and
-`cc ls` read that file rather than re-deriving any of it, and fall back to the board when it is missing or stale.
+`cc ls` read it through `view` (one TSV row per track) rather than re-deriving any of it; missing or stale, the board's word stands.
 
 THE ONE RUNAWAY cc-loop CANNOT CATCH is its own. cc-loop judges a loop that is looping — three iterations in a
 row with nothing to show and it stops itself. A loop that is WEDGED never finishes an iteration, so it never
@@ -73,6 +74,7 @@ WEDGED = 3 * 3600  # a worker alive with nothing moved for this long: cc-loop ca
 WEDGE_SEEN = 5400  # …and only if the previous run saw it too, which on a 20-min timer is one strike, then another
 PENDING = 14400    # finished with an open PR for this long and nobody landing it: the session was told 12 times already
 TERMINAL = ("merged", "done")
+FRESH = 3600       # a snapshot older than this (~3 ticks of the 20-min timer) decides nothing: `view` prints no rows and its readers keep the board's word
 QUEUED = ("queued", "todo")   # the board says `queued` (one vocabulary with the App Home tab); boards written before
                               # that change, and a hand that still types `todo`, mean both words must be READ here
 
@@ -498,9 +500,34 @@ def ledger(path, write=None):
     return write
 
 
+def view():
+    """The snapshot as its shell readers take it — `cc ls` and cc-digest — so the freshness rule and the row shape live
+    here once: one TSV row per track, repo/track · state · waiting_on · why, escaped as jq's @tsv would, so a `read -r`
+    over it needs no thought. Missing, unreadable, not JSON, or past FRESH: no rows and exit 0 — the reader keeps the
+    board's own word, and never blocks on this."""
+    try:
+        snap = json.load(open(f"{STATE}/reconcile.json"))
+        epoch = snap.get("epoch") if isinstance(snap, dict) else None
+        if not isinstance(epoch, int) or epoch <= 0 or now() - epoch >= FRESH:
+            return 0
+        tracks = snap.get("tracks")
+    except (OSError, ValueError):
+        return 0
+
+    def cell(v):   # jq: `.x // ""` blanks null and false; @tsv escapes the four characters a TSV cannot carry
+        s = "" if v is None or v is False else str(v)
+        return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    rows = ["\t".join(cell(x) for x in (k, t.get("state"), t.get("waiting_on"), t.get("why")))
+            for k, t in (tracks.items() if isinstance(tracks, dict) else ()) if isinstance(t, dict)]
+    sys.stdout.buffer.write("".join(r + "\n" for r in rows).encode("utf-8"))   # the bytes jq gave, whatever the caller's locale
+    return 0
+
+
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
+    if argv[:1] == ["view"]:
+        return view()
     snap_only = argv[:1] == ["snapshot"]
     if snap_only:
         argv = argv[1:] + ["--no-net"]              # a snapshot is a local read: it must never stall on GitHub
@@ -905,6 +932,16 @@ def selfcheck():
            and "which schema?" in snp["tracks"][f"{repo}/t1"]["why"])
         ok("end to end: …and leaves it on disk for cc-digest and `cc ls` to read",
            json.load(open(f"{th}/.cc/state/reconcile.json"))["tracks"][f"{repo}/t1"]["state"] == "waiting")
+        view_ = lambda: subprocess.run([sys.executable, os.path.realpath(__file__), "view"], env=env,
+                                       capture_output=True, text=True, timeout=60)
+        rv = view_(); row = [ln.split("\t") for ln in rv.stdout.splitlines() if ln.startswith(f"{repo}/t1\t")]
+        ok("end to end: `view` hands the readers that row as TSV — key, state, who, why — from the file, not a rerun",
+           rv.returncode == 0 and len(row) == 1 and row[0][1:3] == ["waiting", "person"] and "which schema?" in row[0][3])
+        sp = f"{th}/.cc/state/reconcile.json"; fresh = open(sp).read()
+        open(sp, "w").write(json.dumps(dict(json.loads(fresh), epoch=int(now()) - FRESH - 1))); rv2 = view_()
+        open(sp, "w").write(fresh)
+        ok("end to end: …and a stale one is no rows at all, exit 0 — the reader keeps the board's word",
+           rv2.returncode == 0 and rv2.stdout == "")
         # a SESSION row beside it: nobody in its worktree, past every grace, a question in its journal. The question
         # is the owner's like a track's — `waiting`, reported, in the snapshot with who and why, paged when no session
         # took it (review of #132) — but answered, the row goes back to `running` where a dead track is reconciled
