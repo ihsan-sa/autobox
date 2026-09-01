@@ -323,6 +323,35 @@ def worker_cwd(cwd):
     return False
 
 
+# ---- what is not a person asking ------------------------------------------------------------------
+# Everything below reached UserPromptSubmit as a user turn and opened a row somebody then had to decline by
+# hand (a28, a29, a54, a60, a61, a63 on 2026-08-31). The ledger is the authority on what the OWNER asked
+# for, so a wrong row costs more than a missed one. Matched on the start of the prompt — every one of these
+# wrappers leads — and NOT written to seen.log: that file is 400 lines of owner messages the classifier may
+# have got wrong, and one night of task-notifications is enough to flush a real miss out of it.
+NOT_A_PERSON = (
+    "<task-notification",           # the harness reporting a background task or subagent finished
+    "<cross-session-message",       # a peer session writing into this one over its socket
+    "[SYSTEM NOTIFICATION",         # the harness in its own voice: limits, restarts, context
+    "[Cross-session idle notice]",  # the idle sweep saying another session went quiet
+    "<command-name",                # a slash command the session ran — the invocation, not an ask
+    "<local-command-stdout",        # ...and its output, handed back as the next turn
+)
+
+
+def not_a_person(text, attrs):
+    """True when this prompt was written by a machine. `attrs` is the <channel …> tag if there was one:
+    a Slack message is an owner ask only when a real owner really typed it in a real channel. `inject` is a
+    local, unauthenticated door any process on the box may use and it stamps role="owner" chat_id="local",
+    which is how the board watchdog's own line became an owner ask (a54)."""
+    if text.lstrip().startswith(NOT_A_PERSON): return True
+    if attrs:
+        if attrs.get("role") != "owner": return True                        # member, bot, anything but him
+        if attrs.get("chat_id") == "local" or attrs.get("channel") == "local": return True   # injected here
+        if attrs.get("source", "cc-slack") != "cc-slack": return True       # absent = the ordinary Slack path
+    return False
+
+
 def hook():
     """UserPromptSubmit. Prints NOTHING (stdout would land in the session's context) and always exits 0:
     a ledger that can break a session is worse than no ledger."""
@@ -332,6 +361,7 @@ def hook():
         cwd = payload.get("cwd") or os.getcwd()
         if not text.strip(): return
         _, attrs = strip_tag(text)
+        if not_a_person(text, attrs): return                 # machine chatter, not an ask — see NOT_A_PERSON
         if not attrs:                                        # no channel tag: a prompt typed into the session
             if os.environ.get("CC_ROLE") in ("worker", "member") or worker_cwd(cwd): return
         repo = repo_of(cwd) or os.environ.get("CC_REPO") or "box"
@@ -719,6 +749,40 @@ def selfcheck():
           "skip:not-owner" in open(os.path.join(SCOPE, SEEN)).read())
 
         t("the hook is silent on a worker's own task prompt", capture_worker_silent())
+
+        # ---- ONLY A PERSON OPENS A ROW ----------------------------------------------------------------
+        # One case per shape in NOT_A_PERSON. `would_have` is the half that matters: each fixture carries a
+        # real directive, so before the skip list every one of these opened a row that was declined by hand.
+        def would_have(x): return is_ask(strip_tag(x)[0])
+        def skipped(x): return would_have(x) and hook_asks(x) == 0
+        t("a harness task-notification is not an ask",
+          skipped("<task-notification>\n<task-id>b9j3x</task-id>\n"
+                  "<summary>the digest is not working, you must restart it</summary>\n</task-notification>"))
+        t("a peer session's cross-session-message is not an ask",
+          skipped('<cross-session-message from="uds:/run/user/1000/cc-socks/505378.sock" from-name="dev-2b">'
+                  "\nplease add the failing track to the board."))
+        t("a SYSTEM NOTIFICATION is not an ask",
+          skipped("[SYSTEM NOTIFICATION] the session is near its context limit and must be restarted before the next task"))
+        t("a cross-session idle notice is not an ask",
+          skipped('[Cross-session idle notice] "demo-01" is idle now; you should check what it left behind'))
+        t("a slash-command block is not an ask",
+          skipped("<command-name>/gates</command-name>\n<command-args>please run the gates and open the PR</command-args>"))
+        t("a local command's own stdout is not an ask",
+          skipped("<local-command-stdout>from now on the gates must be green before a PR</local-command-stdout>"))
+        t("the board watchdog talking to itself through inject is not an owner ask",
+          skipped('<channel source="cc-slack" chat_id="local" thread_ts="" ts="1788229590.5" user="local" '
+                  'role="owner" channel="local" target="demo">board watchdog: demo/worker-sandbox — '
+                  "it is waiting on you; ccbox refuses demo by design and runs claude with no "
+                  "cc-guard inside. (set to waiting)"))
+        t("a non-owner Slack message is not an ask, through the hook too",
+          skipped('<channel source="cc-slack" chat_id="C9" ts="18.1" user="sam" role="member" '
+                  'channel="#help">please fix the printer'))
+        # ...and the two things the filter must never eat.
+        t("an owner prompt typed in the terminal still records",
+          hook_asks("add the skip list to the ask-capture hook") == 1)
+        t("an owner Slack message still records",
+          hook_asks('<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.2" user="ada.byron" '
+                    'role="owner" channel="#demo">put the open asks on Home, please') == 1)
         n = int(run_capture(["count", R]))
         t("count is the number of unsettled asks", n == len(select(R)))
         t("digest says nothing when nothing is open", run_capture(["digest", "_empty"]).strip() == "")
@@ -742,6 +806,26 @@ def run_capture(argv):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf): main(argv)
     return buf.getvalue()
+
+
+def hook_asks(text):
+    """Run the UserPromptSubmit hook over one prompt; returns how many rows the ledger gained. The hook's
+    other two guards are neutralised: the selfcheck usually runs inside a worker's worktree, which would
+    pass every skip case for entirely the wrong reason and fail the two that must still record."""
+    import tempfile, shutil, io, contextlib
+    d = tempfile.mkdtemp(prefix="cc-scope-hooktest-")       # under /tmp: no .cc/track marker, no repo name
+    keep, old = {k: os.environ.get(k) for k in ("CC_ROLE", "CC_REPO")}, sys.stdin
+    os.environ.pop("CC_ROLE", None); os.environ["CC_REPO"] = "_hooktest"
+    try:
+        before = len(load("_hooktest")["asks"])
+        sys.stdin = io.StringIO(json.dumps({"prompt": text, "cwd": d, "session_id": "selfcheck"}))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): hook()
+        return len(load("_hooktest")["asks"]) - before
+    finally:
+        sys.stdin = old
+        for k, v in keep.items(): os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def capture_worker_silent():

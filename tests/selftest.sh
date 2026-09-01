@@ -246,6 +246,8 @@ miss=""; for probe in 'Bash|{"command":"cat >> notes.md <<E\nthe owner decides: 
 # ~/bin/cc-notify that only record their argv, and a ~/.cc/config with no real token. Nothing in this file may
 # reach the workspace, and the secret-path probes are the stub's own files so `secret_path` still matches.
 GH="$T/ghome"; mkdir -p "$GH/bin" "$GH/.cc" "$GH/.ssh"; : > "$GH/.cc/config"; : > "$GH/.ssh/id_ed25519"
+mkdir -p "$GH/.claude" "$GH/repo/core/ccbox"; : > "$GH/.claude/.credentials.json"     # empty stubs, never a real token
+: > "$GH/repo/core/ccbox/env"; : > "$GH/repo/core/ccbox/env.example"; ln -s "$GH/repo/core/ccbox" "$GH/ccbox"   # ~/ccbox IS a symlink on the box
 cat > "$GH/bin/cc-slack" <<F
 #!/usr/bin/env bash
 printf 'BOT: %s\n' "\$*" >> "$T/guard.args"
@@ -253,14 +255,37 @@ F
 sed 's/BOT:/NOTIFY:/' "$GH/bin/cc-slack" > "$GH/bin/cc-notify"; chmod +x "$GH/bin/cc-slack" "$GH/bin/cc-notify"
 mf="$T/member"; mkdir -p "$mf/.cc"; : > "$mf/.cc/member-facing"; touch "$mf/note.md"
 m(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+# STAGE 0 of the worker sandbox (docs/design-worker-sandbox.md §1): the two holes that were member-only are shut
+# for a WORKER too. the box user is in group `docker`, so `docker run -v /:/host` is root on the whole filesystem with no
+# escalation; ~/.claude/.credentials.json is the box's Claude account and its spend, ~/ccbox/env a GitHub PAT and a
+# deploy token. Same stub HOME as the member probes, and no probe reads a real credential — the guard matches the
+# PATH (realpath -m resolves one that need not exist), it never opens the file.
+w(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+WP=('Bash|{"command":"docker run -v /:/host alpine cat /host/etc/shadow"}' 'Bash|{"command":"podman run --rm alpine sh"}'
+    'Bash|{"command":"cat ~/.claude/.credentials.json"}' 'Bash|{"command":"jq -r .accessToken $HOME/.claude/.credentials.json"}'
+    'Bash|{"command":"grep VERCEL_TOKEN ~/ccbox/env"}' 'Bash|{"command":"source $HOME/ccbox/env"}'
+    "Bash|{\"command\":\"cat $GH/repo/core/ccbox/env\"}" 'Bash|{"command":"cat core/ccbox/env"}'
+    "Read|{\"file_path\":\"$GH/.claude/.credentials.json\"}" "Read|{\"file_path\":\"$GH/ccbox/env\"}"
+    "Read|{\"file_path\":\"$GH/repo/core/ccbox/env\"}")
+miss=""; for probe in "${WP[@]}"; do [ "$(w "${probe%%|*}" "${probe#*|}" "$wt")" = 2 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "a WORKER is denied containers and both credential files — by ~/ path, by real path and through a symlinked ~/ccbox alike" || bad "worker stage-0 gate misses:$miss"
+miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"git log --oneline -5"}' 'Bash|{"command":"cat ~/.cc/config"}' \
+             'Bash|{"command":"cat core/ccbox/env.example"}' "Read|{\"file_path\":\"$GH/repo/core/ccbox/env.example\"}" \
+             "Read|{\"file_path\":\"$GH/.cc/config\"}"; do
+  [ "$(w "${probe%%|*}" "${probe#*|}" "$wt")" = 0 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "...and no wider than that: env.example is not a credential, and the box's OTHER secrets stay member-only as before" || bad "worker gate over-blocks:$miss"
+[ "$(w Bash '{"command":"systemctl --user list-units"}' "$wt")" = 2 ] \
+  && ok "...and a worker's systemctl read is unchanged — denied before stage 0, denied after (the list sorts by spelling, not reach)" || bad "systemctl gate moved under stage 0"
 MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' 'Bash|{"command":"cc r t --go build it"}'
     'Bash|{"command":"cc board add r t title text --go"}' 'Bash|{"command":"cc-loop r t"}' 'Bash|{"command":"claude -p do it"}'
     'Bash|{"command":"cat ~/.cc/config"}' 'Bash|{"command":"tail -5 $HOME/.ssh/id_ed25519"}'
+    'Bash|{"command":"docker run -v /:/host alpine"}' 'Bash|{"command":"cat ~/.claude/.credentials.json"}'
+    'Bash|{"command":"head -1 ~/ccbox/env"}'
     'Bash|{"command":"cc slack off"}' 'Bash|{"command":"cc slack mkchannel help"}'
     'Bash|{"command":"cc-slack updates-sweep"}'
     "Read|{\"file_path\":\"$GH/.cc/config\"}" "Edit|{\"file_path\":\"$GH/member-probe.txt\"}")
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 2 ] || miss="$miss ${probe#*|}"; done
-[ -z "$miss" ] && ok "member-facing marker denies all 13 probes (merge/host, dispatch, secrets, Slack wiring incl. updates-sweep, edit outside)" || bad "member gate misses:$miss"
+[ -z "$miss" ] && ok "member-facing marker denies all 16 probes (merge/host, dispatch, secrets, containers, credentials, Slack wiring incl. updates-sweep, edit outside)" || bad "member gate misses:$miss"
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "no regression: an unmarked cwd (planning session) is gated by none of them" || bad "unmarked cwd gated:$miss"
 miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t help the owner must decide this"}' \

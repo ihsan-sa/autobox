@@ -7,7 +7,9 @@
 # Denies (exit 2 + reason) the four owner gates:
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
-# role=member = every worker gate PLUS: no dispatching workers, no reading the box's secrets, no re-wiring Slack.
+# EVERY gated role, worker included: no container runtime (this user is in group `docker`, which is root-equivalent)
+# and no reading the two files that ARE the box's credentials (~/.claude/.credentials.json, ~/ccbox/env).
+# role=member = every worker gate PLUS: no dispatching workers, no reading the box's other secrets, no re-wiring Slack.
 # It also gates whichever session is NOT live during an overlapping handoff (cc-handoff), by session id and
 # by $CC_HANDOFF rather than by a marker: the two sessions share one cwd, so the walk below cannot tell them apart.
 set -uo pipefail
@@ -140,7 +142,26 @@ ask_owner(){
 }
 deny(){ [ "$role" = member ] && ask_owner "$1"; echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
 denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
-secret_path(){ case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json) return 0;; esac; return 1; }
+# TWO lists. secret_all() is the credentials NO gated role reads: ~/.claude/.credentials.json is the box's Claude
+# account and its spend, ~/ccbox/env is a GitHub PAT plus a deploy token — a worker holding either can spend or
+# push as the box, and a worker is exactly the session nobody is watching. secret_path() adds the box's OTHER
+# secrets, which stay member-only, unchanged.
+# ~/ccbox is a SYMLINK into the repo (core/ccbox) and $fp arrives here already realpath'd, so matching the literal
+# path alone missed every real read of it — the Read tool still served the file with the rule in place. The case is
+# the cheap path (no fork for an ordinary file); only a name that could BE one of them is worth resolving.
+secret_all(){
+  case "$1" in
+    "$HOME"/.claude/.credentials.json|"$HOME"/ccbox/env) return 0;;
+    */.credentials.json|*/ccbox/env) ;;
+    *) return 1;;
+  esac
+  local f
+  for f in "$HOME/.claude/.credentials.json" "$HOME/ccbox/env"; do
+    [ "$1" = "$(realpath -m -- "$f" 2>/dev/null)" ] && return 0
+  done
+  return 1
+}
+secret_path(){ secret_all "$1" && return 0; case "$1" in "$HOME"/.cc/config|"$HOME"/.ssh|"$HOME"/.ssh/*|"$HOME"/.claude/settings.json) return 0;; esac; return 1; }
 case "$tool" in
   Bash)
     cmd=$u   # the universal block above already built it: one jq and at most one awk per call, not two
@@ -167,9 +188,19 @@ case "$tool" in
     grep -qE '(^|[;&|(){}`]|\$\() *[^ ]*cc-slack +(inject|post|post-approval)\b' <<<"$cmd" && deny "posting to the owner's Slack (cc-slack inject/post)"   # any path to the binary
     grep -qE "$AT"'sudo\b' <<<"$cmd" && deny "sudo / host changes"
     grep -qE 'rm +(-[a-zA-Z-]+ +)*-[a-zA-Z]*r[a-zA-Z]* +(-[a-zA-Z-]+ +)*(~|[$]HOME|\.\.|/home|/etc|/var|/usr|/)([*/ ]|$)' <<<"$cmd" && deny "recursive delete outside the worktree"
-    grep -qE "$AT"'docker +(system +prune|rm|rmi|volume +rm)' <<<"$cmd" && deny "destroying docker resources"
+    # The container runtime is a way AROUND every other line here, for a WORKER as much as for a member: this user
+    # is in group `docker`, so one `docker run -v /:/host` reads and writes the whole filesystem as root — the
+    # credentials below included — with no escalation at all. So it is denied for every gated role, which subsumes
+    # the narrower "destroying docker resources" rule this replaces. The sanctioned sandbox (ccbox) is the owner's.
+    grep -qE "$AT"'([^ ]*/)?(docker|podman|nerdctl)\b' <<<"$cmd" && deny "running a container (this user is in group docker, so a bind-mounted container reads and writes everything as root)"
     grep -qE "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' <<<"$cmd" && deny "host/network/service changes"
     grep -qE 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' <<<"$cmd" && deny "destructive git"
+    # The two files that ARE the box's credentials — no role reads them, and the member-only list below adds to this
+    # one rather than replacing it. Same honest ceiling as every line here: a blocklist stops accidents and casual
+    # prompt-injection, not a redirection or a script written first.
+    RD='(cat|tac|less|more|head|tail|nl|cut|grep|egrep|fgrep|rg|sed|awk|xxd|od|base64|strings|sort|uniq|jq|python[0-9.]* +-c|source|\.)'
+    grep -qE "$AT$RD"' +[^;&|]*(ccbox/env|\.credentials\.json)($|[^A-Za-z0-9_.-])' <<<"$cmd" \
+      && deny "reading the box's credentials (~/.claude/.credentials.json is the Claude account and its spend, ~/ccbox/env is a GitHub PAT and a deploy token)"
     # 4. member-facing only: a member must not be able to make the box SPEND or LEAK. Be honest about the ceiling —
     #    a Bash blocklist is not a sandbox: it stops accidents and casual prompt-injection, not a determined attacker
     #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays
@@ -178,24 +209,19 @@ case "$tool" in
       grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (cc --go)"
       grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (cc-loop)"
       grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
-      SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.ssh\b|\.claude/settings\.json)'
-      RD='(cat|tac|less|more|head|tail|nl|cut|grep|egrep|fgrep|rg|sed|awk|xxd|od|base64|strings|sort|uniq|jq|python[0-9.]* +-c|source|\.)'
+      SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.ssh\b|\.claude/settings\.json)'   # $RD is set above: these three ADD to the credentials no role reads
       grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && deny "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json)"
       grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' <<<"$cmd" && deny "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
       # cc-config is the one sanctioned reader of ~/.cc/config — which makes it the one clean way AROUND the
       # secrets line above for a session that may not see them. Members get neither the read nor the write.
       grep -qE "$AT"'([^ ]*/)?cc-config\b' <<<"$cmd" && deny "the box's config is not a member's to read or rewrite (cc-config)"
-      # The container runtime is a way AROUND every line above: this user is in the `docker` group, so one
-      # `docker run -v /:/host` is root-equivalent file access — the secrets included — with no escalation at all.
-      # A member-facing session has no business starting containers; the sanctioned sandbox (ccbox) is the owner's.
-      grep -qE "$AT"'([^ ]*/)?(docker|podman|nerdctl)\b' <<<"$cmd" && deny "a member-facing session does not run containers (a bind-mounted container reads everything this user can)"
     fi
     ;;
-  Read|NotebookRead|Grep|Glob)   # member only: gating those three files in Bash would be theatre if a file-reading TOOL served them
-    [ "$role" = member ] || exit 0
+  Read|NotebookRead|Grep|Glob)   # gating these files in Bash alone would be theatre if a file-reading TOOL served them
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // ""' <<<"$inp")
     [ -n "$fp" ] && fp=$(realpath -m -- "$fp" 2>/dev/null || echo "$fp")
-    secret_path "$fp" && deny "reading the box's secrets ($fp)" ;;
+    if [ "$role" = member ]; then secret_path "$fp" && deny "reading the box's secrets ($fp)"
+    else secret_all "$fp" && deny "reading the box's credentials ($fp)"; fi ;;
   Edit|Write|MultiEdit|NotebookEdit)
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
     fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ traversal resolves before the match
