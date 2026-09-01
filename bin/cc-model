@@ -5,16 +5,30 @@
 #   cc-model current                  the override model, or nothing — cc / cc-loop / cc-rc pass it as --model
 #   cc-model switch <model> [reason]  write (or, for the primary model, clear) the override + retune live sessions
 #   cc-model limited <model> [reason] cc-limit calls this after a limited run: switch only if that WAS the primary
+#   cc-model classify <json> [<err>] [<asked>]  what stopped a headless run, as "<class>\t<why>": ok | limit |
+#                                     refusal | error — the caller's reason to WAIT, to MOVE, or to retry
+#   cc-model chain                    the worker fallback chain, one model per line
+#   cc-model next [<model>]           the model after <model> on that chain (nothing, exit 1, at its end)
 #   cc-model tick                     what cc-model.timer runs every 60 s (see below)
+#   cc-model selfcheck                the classifier and the chain, on fixtures
 # tick: (1) normal — switch when cc-limit's stamp says the primary model is limited, or when a live session's pane
 #   shows a fresh "usage limit" line (each matched line fires once, and a probe has to agree — docs and questions
 #   mention limits too); (2) overridden — once `until` has passed, probe the primary model at most every 15 min and
 #   restore on the first answer; (3) never two switches within 10 min.
 # Retuning a session = typing "/model <model>" into its pane, cc-msg semantics. Effort is not touched (settings).
+# THE WORKER FALLBACK CHAIN LIVES HERE AND NOWHERE ELSE: fable -> opus -> sonnet. cc-loop asks `cc-model next`
+# instead of carrying a second copy of the order, so one edit here moves every caller (CC_MODEL_CHAIN overrides).
+# A REFUSAL OR A REROUTE IS NOT AN ERROR AND NOT A LIMIT. The classifier can stop a turn outright, and a model that
+# is withdrawn, suspended or not ours to call answers as a different one (the Fable suspension ran 19 days). Both
+# read as "the run failed" today, so the caller retries the same model and spends for a result that cannot change.
+# `classify` names both `refusal`, and the caller MOVES ALONG THE CHAIN. A limit still wins over everything — it is
+# a wait, not a move. IT ALL COMES FROM JSON FIELDS: see the doctrine above classify_run. Wording is read only from
+# `.result`, and only on a run the API itself ended, because a worker writing "I can't help with that" — or
+# "refused", or "usage limit" — in its own result is talking about its task, not about being refused.
 # Override: ~/.cc/state/model-override = "<model>\t<since>\t<until-epoch|0>\t<reason>\t<last-probe-epoch>"
 # Log: ~/.cc/state/model.log = "<iso>\t<epoch>\t<event>\t<model>\t<detail>". No secrets in either.
 # Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
-#   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
+#   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_CHAIN · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"
@@ -24,6 +38,22 @@ SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
 now=$(date -u +%s); mkdir -p "$ST"
 fam(){ local f; f=$(grep -oiE 'fable|opus|sonnet|haiku' <<<"${1:-}" | head -1 | tr 'A-Z' 'a-z'); echo "${f:-${1:-}}"; }
 label(){ case "$(fam "${1:-}")" in fable) echo "Fable 5";; opus) echo "Opus 5";; sonnet) echo "Sonnet 5";; haiku) echo "Haiku";; *) echo "${1:-}";; esac; }
+CHAIN="${CC_MODEL_CHAIN:-claude-fable-5 claude-opus-5 claude-sonnet-5}"   # the one copy of the order (see above)
+chain(){   # the canonical chain: ONE RUNG PER FAMILY, first mention wins. A CC_MODEL_CHAIN that names a family twice
+           # would otherwise walk in a circle, and a caller that reruns on each rung would never stop (F7).
+  local m f; local -a ms; local -A seen=(); read -r -a ms <<<"$CHAIN"
+  for m in "${ms[@]}"; do f=$(fam "$m"); [ -n "$f" ] || continue
+    [ -n "${seen[$f]:-}" ] && continue; seen[$f]=1; printf '%s\n' "$m"; done; }
+chain_next(){   # the model AFTER $1 on the chain, by family: "opus", "claude-opus-5" and "claude-opus-5[1m]" are one rung.
+                # A trailing [suffix] rides along: falling from fable[1m] to a bare opus silently drops the 1M context
+                # the caller was running with, and the rerun then fails for a reason nobody asked for (F7).
+  local src="${1:-}" w sfx m hit=0
+  [ -n "$(fam "$src")" ] || src="$PRIMARY"   # named nothing: start from where the box actually is
+  w=$(fam "$src"); sfx=$(grep -oE '\[[^][]*\]$' <<<"$src")
+  while read -r m; do
+    if [ "$hit" = 1 ]; then case "$m" in *']') printf '%s\n' "$m";; *) printf '%s%s\n' "$m" "$sfx";; esac; return 0; fi
+    [ "$(fam "$m")" = "$w" ] && hit=1
+  done < <(chain); return 1; }   # off the end of the chain (or a model that was never on it): nothing left to fall back to
 ov(){ model=""; since=0; till=0; reason=""; probed=0   # loads the override; exit 1 = none (the box is on its primary model)
   [ -f "$OV" ] && IFS=$'\t' read -r model since till reason probed < "$OV"
   [[ "${till:-}" =~ ^[0-9]+$ ]] || till=0; [[ "${probed:-}" =~ ^[0-9]+$ ]] || probed=0; [ -n "$model" ]; }
@@ -71,25 +101,78 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   elif [ "$to" -gt 0 ]; then msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z."
   else msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until it answers again."; fi
   "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
-# every wording the CLI uses when the model itself will not answer: a usage limit, a rate limit, or an exhausted
-# credit balance ("You're out of usage credits…" — 2026-08-28: this one was read as "could not run" and never switched)
-LIMIT_RE='usage limit|rate limit|rate_limit|429|too many requests|usage credits|out of credits|insufficient credits'
-probe(){   # is the primary model answering again? one cheap turn, no tools. 0 = answers · 1 = limited · 2 = could not run (unknown)
-  local o="$ST/model-probe.json" rc sub
+# ── CLASSIFICATION READS FIELDS, NEVER THE DOCUMENT ──────────────────────────────────────────────────────────────
+# A result JSON is kilobytes of numbers, uuids and the worker's own prose. Grepping it whole is how this classifier
+# came to be wrong on 41 of 48 real runs (2026-09-01 review): "429" sits inside uuids, token counts and dollar costs;
+# the literal `"refused":{…}` sits in `subagent_stats` of EVERY run; and a worker's result text says "refused" or
+# "usage limit" whenever it is describing its own work. So: jq the FIELDS, and read prose only from `.result`, only
+# when the API itself ended the run — never from a capped run, whose `.result` is the worker's last paragraph.
+# The CLI's own wording for a model that will not answer: a usage limit, a rate limit, or an exhausted credit balance
+# ("You're out of usage credits…" — 2026-08-28: this one was read as "could not run" and never switched).
+LIMIT_RE='usage limit|rate limit|rate_limit|too many requests|usage credits|out of credits|insufficient credits'
+# every wording that means the id we asked for is not ours to call: unknown, withdrawn, suspended, not permitted.
+# API SHAPES ONLY — never the bare words refused/declined/unavailable, which a worker writes about its own task.
+REFUSE_RE='model_not_found|invalid_model|unknown model|not a valid model|does not have access|no access to|permission_error|model[^"]{0,60}(not available|unavailable|deprecated|suspended|withdrawn|retired)|(unavailable|deprecated|suspended|withdrawn|retired|not available)[^"]{0,30}(to|for) this account'
+SIDECALL='haiku'   # the CLI's own small side-calls (titles, summaries) run on it in 36/36 real runs: never a reroute
+asked_fam(){   # the family the run WAS asked for. cc-loop passes nothing when there is no override — that is the
+               # NORMAL state, and the reroute check has to work in it (F3), so resolve it the way the run itself
+               # did: the model the caller named, else the box override, else the primary.
+  local w; w=$(fam "${1:-}"); [ -n "$w" ] && { printf '%s\n' "$w"; return 0; }
+  ov && w=$(fam "$model"); [ -n "$w" ] || w=$(fam "$PRIMARY"); printf '%s\n' "$w"; }
+served_fams(){   # $1 run json · $2 failed=yes|no → the families that actually did the work, the side-call model
+                 # excluded (F5: without that exclusion the answer was always "answered as haiku, not fable", 36/36 real runs)
+  local m f; local -a all=() main=()
+  while read -r m; do f=$(fam "$m"); [ -n "$f" ] || continue
+    all+=("$f"); [ "$f" = "$SIDECALL" ] || main+=("$f")
+  done < <(jq -r '[(.modelUsage? // {} | keys[]?), (.model? // empty)] | unique | .[]' "$1" 2>/dev/null)
+  [ ${#main[@]} -gt 0 ] && { printf '%s\n' "${main[@]}"; return 0; }
+  # only the side-call model ran. On a run that SUCCEEDED, that is what answered. On a run that FAILED, the primary
+  # never answered at all (a 529, a 500, an execution error) and the title call is the only usage there is — calling
+  # that "answered as haiku" walked cc-loop down the chain and off its end (exit 10) for one retryable error (re-review).
+  [ "${2:-no}" = yes ] && return 0
+  [ ${#all[@]} -gt 0 ] && printf '%s\n' "${all[@]}"; return 0; }
+classify_run(){   # $1 run json · $2 its stderr · $3 the model that was ASKED for → "<class>\t<why>", always exit 0
+  local j="${1:-}" e="${2:-}" want="${3:-}" err sub stop term astat res w sf served failed apisays
+  err=$(tail -c 4000 "${e:-/dev/null}" 2>/dev/null)   # the CLI's own channel — the worker's prose never lands here
+  if [ ! -s "$j" ] || ! jq -e 'type == "object"' "$j" >/dev/null 2>&1; then   # network, bad binary, timeout, an HTML 502
+    { grep -qiE "$LIMIT_RE" <<<"$err" || grep -qiE "$LIMIT_RE" "$j" 2>/dev/null; } && { printf 'limit\tsaid so in words\n'; return 0; }
+    [ -s "$j" ] && { printf 'error\tno json\n'; return 0; }
+    printf 'error\tno output\n'; return 0; fi
+  IFS=$'\t' read -r sub stop term astat < <(jq -r '[(.subtype // ""), (.stop_reason // ""), (.terminal_reason // ""), (.api_error_status // "" | tostring)] | @tsv' "$j" 2>/dev/null)
+  res=$(jq -r '.result // "" | tostring' "$j" 2>/dev/null)
+  failed=no; { [ "$(jq -r '.is_error // false' "$j" 2>/dev/null)" = true ] || [[ "$sub" == error_* ]]; } && failed=yes
+  # `.result` is the CLI's own message on a run the API ended, and the worker's last paragraph on a capped one.
+  # Only the first is evidence about the model; 9 of 10 real error_max_turns runs read as a refusal without this line.
+  apisays=no; { [ "$failed" = yes ] && [[ "$sub" != error_max_* ]]; } && apisays=yes
+  # ── a WAIT: cc-limit owns the clock, this only has to name it ──
+  [ "$astat" = 429 ] && { printf 'limit\tthe API answered 429\n'; return 0; }
+  { [ "$apisays" = yes ] && grep -qiE "$LIMIT_RE" <<<"$res"; } && { printf 'limit\tsaid so in words\n'; return 0; }
+  grep -qiE "$LIMIT_RE" <<<"$err" && { printf 'limit\tsaid so in words\n'; return 0; }
+  # ── a MOVE: the model would not answer AS ITSELF ──
+  [ "$stop" = refusal ] && { printf 'refusal\tthe classifier stopped the turn\n'; return 0; }
+  w=$(asked_fam "$want"); sf=$(served_fams "$j" "$failed"); served=$(paste -sd/ - <<<"$sf")
+  if [ -n "$w" ] && [ -n "$sf" ] && ! grep -qxF "$w" <<<"$sf"; then
+    printf 'refusal\tanswered as %s, not %s\n' "$served" "$w"; return 0; fi
+  { [ "$apisays" = yes ] && grep -qiE "$REFUSE_RE" <<<"$res"; } && { printf 'refusal\tthe model would not answer as itself\n'; return 0; }
+  # ── a RETRY, or nothing wrong at all ──
+  case "$sub" in error_*) printf 'error\t%s\n' "$sub"; return 0;; esac   # the RUN failed (cap, execution), not the model
+  { [ -n "$astat" ] && [ "$astat" != 429 ]; } && { printf 'error\tthe API answered %s\n' "$astat"; return 0; }   # a 529/500: retry, not wait
+  [ "$failed" = yes ] && { printf 'limit\tin-band error (%s) naming nothing — treated as a limit, as it has been since 2026-08-28\n' "${term:-no terminal_reason}"; return 0; }
+  printf 'ok\t\n'; return 0; }
+probe(){   # is the primary model answering again? one cheap turn, no tools.
+           # 0 = answers · 1 = limited · 2 = could not run (unknown) · 3 = refused or rerouted (moving beats retrying)
+  local o="$ST/model-probe.json" rc cl
   [ -x "$CLAUDE" ] || return 2
   # --setting-sources '' keeps the probe off this box's settings/MCP servers: a plain turn, cents not dollars
   timeout 60 "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --setting-sources '' \
       --max-budget-usd "${CC_MODEL_PROBE_BUDGET:-0.50}" --output-format json >"$o" 2>"$o.err"; rc=$?
-  grep -qiE "$LIMIT_RE" "$o" "$o.err" 2>/dev/null && return 1   # said so in words: limited, whatever the exit status
-  jq -e . "$o" >/dev/null 2>&1 || return 2                      # no JSON at all (network, bad binary, timeout): unknown
-  sub=$(jq -r '.subtype // ""' "$o" 2>/dev/null)
-  case "$sub" in error_max_budget_usd|error_max_turns|error_during_execution) probe_why="$sub"; return 2;; esac   # the RUN failed, not the model
-  [ "$(jq -r '.is_error // false' "$o" 2>/dev/null)" = true ] && return 1
+  cl=$(classify_run "$o" "$o.err" "$PROBEM"); probe_why="${cl#*$'\t'}"; cl="${cl%%$'\t'*}"   # the JSON before the exit code
+  case "$cl" in limit) return 1;; refusal) return 3;; error) return 2;; esac
   [ "$rc" = 0 ] || { probe_why="exit $rc"; return 2; }
   return 0; }
 lastprobe(){ cat "$ST/model-probed" 2>/dev/null || echo 0; }   # F2: the pane-detection probe is throttled like the restore probe
 tick(){
-  local id name cap line h m rc
+  local id name cap line h m rc nx
   if ov; then   # ---- the fallback is on: restore once the limit has passed AND the primary model answers again
     if [ -s "$ST/model-skipped" ]; then   # F3: panes that were behind a dialog at switch time get another try
       : > "$ST/model-skipped.n"
@@ -101,7 +184,8 @@ tick(){
     [ $((now - probed)) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0
     printf '%s\t%s\t%s\t%s\t%s\n' "$model" "$since" "$till" "$reason" "$now" > "$OV"   # bank the attempt first: a hung probe must not rerun every minute
     probe_why=""; probe; case $? in 1) printf '%s\t%s\tprobe\t%s\tstill limited\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;;
-                      2) printf '%s\t%s\tprobe\t%s\tcould not run — unknown (%s)\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-no json}" >> "$LOG"; return 0;; esac
+                      2) printf '%s\t%s\tprobe\t%s\tcould not run — unknown (%s)\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-no json}" >> "$LOG"; return 0;;
+                      3) printf '%s\t%s\trefusal\t%s\t%s — staying on %s\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-refused}" "$(fam "$model")" >> "$LOG"; return 0;; esac
     rate_ok && do_switch "$PRIMARY" "limit lifted (probe)"; return 0
   fi
   limstamp   # ---- normal: did the primary model just hit a limit?
@@ -125,9 +209,87 @@ tick(){
     case "$rc" in
       0) printf '%s\t%s\tprobe\t%s\tpane line in %s was not a live limit\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "$name" >> "$LOG"; return 0;;
       2) printf '%s\t%s\tprobe\t%s\tcould not run — not switching on a pane line alone (%s)\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-no json}" >> "$LOG"; return 0;;
+      3) nx=$(chain_next "$PRIMARY") || nx="$FALLBACK"   # not a limit, but the primary still will not do the work
+         printf '%s\t%s\trefusal\t%s\t%s — moving to %s\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-refused}" "$(fam "$nx")" >> "$LOG"
+         do_switch "$nx" "$(fam "$PRIMARY") refused or rerouted (probe): ${probe_why:-refused}"; return 0;;
     esac
     do_switch "$FALLBACK" "$m limit seen in $SESSION:$name"; return 0
   done < <(sessions); return 0; }
+selfcheck(){   # fixtures only: no network, no tmux, and none of this box's state is read or written.
+               # EVERY fixture is a REAL `claude -p --output-format json` result — sanitized (no session id, no prose)
+               # and bent by one jq expression. Hand-written stubs are exactly why the 2026-09-01 review found this
+               # classifier wrong on 41 of 48 real runs while its own selfcheck was green: the stubs carried none of
+               # the traps a real result carries. The three that matter are asserted below, so nobody simplifies
+               # them away: `subagent_stats.refused`, a "429" inside the uuid, and the haiku side-call.
+  local d n=0 bad=0 got real c1 c2 c3 exp other oldov="$OV" oldchain="$CHAIN"
+  d=$(mktemp -d) || return 1
+  t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
+  cl(){ classify_run "$1" "" "${2:-}" | cut -f1; }
+  real="$d/real.json"; cat > "$real" <<'JSON'
+{"type":"result","subtype":"success","is_error":false,"duration_ms":489371,"duration_api_ms":410311,"num_turns":68,"result":"ok","session_id":"00000000-0000-4000-8000-000000000000","total_cost_usd":3.6408924999999983,"usage":{"input_tokens":112,"cache_creation_input_tokens":92541,"cache_read_input_tokens":3953051,"output_tokens":29423,"service_tier":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":2737,"outputTokens":17,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.002822,"contextWindow":200000,"maxOutputTokens":32000,"canonicalModel":"claude-haiku-4-5","provider":"firstParty","costBasis":"list"},"claude-fable-5":{"inputTokens":112,"outputTokens":29423,"cacheReadInputTokens":3953051,"cacheCreationInputTokens":92541,"webSearchRequests":0,"costUSD":3.6380704999999987,"contextWindow":1000000,"maxOutputTokens":64000,"canonicalModel":"claude-fable-5","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"stop_reason":"end_turn","terminal_reason":"completed","queued_turn_count":0,"errors":null,"subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"uuid":"14144299-9e48-4299-8f0c-0000000429ab"}
+JSON
+  jq -e . "$real" >/dev/null 2>&1 || { echo "cc-model selfcheck: the real-result fixture is not json" >&2; rm -rf "$d"; return 1; }
+  b(){ jq -c "$2" "$real" > "$d/$1.json"; }   # a fixture is the real result plus one bend
+  t 'the fixture is a real result: subagent_stats.refused is in it' "$(jq -r '.subagent_stats.refused|keys|length' "$real")" 3
+  t 'the fixture is a real result: 429 sits inside its uuid'        "$(jq -r '.uuid' "$real" | grep -c 429)" 1
+  t 'the fixture is a real result: the haiku side-call is in it'    "$(jq -r '[.modelUsage|keys[]|select(test("haiku"))]|length' "$real")" 1
+  b ok      '.'
+  b capped  '.subtype="error_max_turns" | .is_error=true | .stop_reason="tool_use" | .terminal_reason="max_turns" | .errors=["Reached maximum number of turns (80)"] | .result="Wrote the gate. The `.env.local` write was refused, and the old model id is deprecated, so I stopped there."'
+  b limit429 '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=429 | .result="You'"'"'re out of usage credits. Switch to another model, or manage usage credits at the settings page, to continue."'
+  b credits '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .result="You'"'"'re out of usage credits. Switch to another model to continue."'
+  # the shape of every API-ended run on this box (2026-08-28): the primary never answered, so the haiku title call is the ONLY usage
+  b overloaded '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=529 | .result="API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}" | .modelUsage={"claude-haiku-4-5-20251001":{"inputTokens":9}}'
+  b stopped '.is_error=true | .subtype="error_during_execution" | .stop_reason="refusal" | .result=""'
+  b reroute '.modelUsage = {"claude-haiku-4-5-20251001":{"inputTokens":2737},"claude-opus-5":{"inputTokens":112}}'
+  b gone    '.is_error=true | .subtype="error_during_execution" | .result="model_not_found: claude-fable-5 is not available to this account"'
+  b both    '.is_error=true | .terminal_reason="api_error" | .result="refused: Claude usage limit reached"'
+  b budget  '.is_error=true | .subtype="error_max_budget_usd" | .result="I was still working when the budget ran out."'
+  b vague   '.is_error=true | .result="the API said no and named nothing"'
+  b innocent '.result="Done. The 2026-08-28 fix is why a bare stop_reason: refusal still reads as a limit, and I cannot assist with the part that needs the owner."'
+  printf '%s' '<html>502 Bad Gateway</html>' > "$d/html.json"
+  t 'a good run is ok'                    "$(cl "$d/ok.json" claude-fable-5)"        ok
+  t 'a capped run is an error, not a refusal' "$(cl "$d/capped.json" claude-fable-5)" error
+  t 'a 429 from the API is a limit'       "$(cl "$d/limit429.json" claude-fable-5)"  limit
+  t 'out of usage credits is a limit'     "$(cl "$d/credits.json" claude-fable-5)"   limit
+  t 'a 529 the primary never answered is an error, not a reroute' "$(cl "$d/overloaded.json" claude-fable-5)" error
+  t 'and it names the status'             "$(classify_run "$d/overloaded.json" "" claude-fable-5 | cut -f2)" "the API answered 529"
+  t 'stop_reason refusal is a refusal'    "$(cl "$d/stopped.json" claude-fable-5)"   refusal
+  t 'answering as opus is a refusal'      "$(cl "$d/reroute.json" claude-fable-5)"   refusal
+  t 'a withdrawn model is a refusal'      "$(cl "$d/gone.json" claude-fable-5)"      refusal
+  t 'limit wording beats refusal wording' "$(cl "$d/both.json" claude-fable-5)"      limit
+  t 'a budget cap is an error'            "$(cl "$d/budget.json" claude-fable-5)"    error
+  t 'no json at all is an error'          "$(cl "$d/html.json" claude-fable-5)"      error
+  t 'no output at all is an error'        "$(cl "$d/none.json" claude-fable-5)"      error
+  t 'an in-band error still reads limit'  "$(cl "$d/vague.json" claude-fable-5)"     limit
+  t 'refusal wording in a GOOD run is the worker talking' "$(cl "$d/innocent.json" claude-fable-5)" ok
+  t 'a haiku side-call is not a reroute'  "$(classify_run "$d/ok.json" "" claude-fable-5 | cut -f2)" ""
+  t 'the reroute says what answered'      "$(classify_run "$d/reroute.json" "" claude-fable-5 | cut -f2)" "answered as opus, not fable"
+  t 'the cap says which cap'              "$(classify_run "$d/capped.json" "" claude-fable-5 | cut -f2)" "error_max_turns"
+  : > "$d/empty.json"; printf 'Claude usage limit reached. Resets at 11:40Z\n' > "$d/empty.json.err"
+  t 'a limit that produced no json is still a limit' "$(classify_run "$d/empty.json" "$d/empty.json.err" claude-fable-5 | cut -f1)" limit
+  # F3: the normal state is NO --model at all. Bend the fixture to a family the box is not on, then ask with "".
+  OV="$d/no-override-here"   # hermetic: no override file, so the asked family falls to $PRIMARY, as a real run would
+  other=$(fam "$(chain_next "$PRIMARY")"); [ -n "$other" ] && [ "$other" != "$(fam "$PRIMARY")" ] || other=sonnet
+  jq -c --arg k "claude-$other-5" '.modelUsage = {"claude-haiku-4-5-20251001":{"inputTokens":9}} | .modelUsage[$k] = {"inputTokens":112}' "$real" > "$d/elsewhere.json"
+  t 'no --model given: the reroute is still seen' "$(classify_run "$d/elsewhere.json" "" "" | cut -f1)" refusal
+  t 'no --model given: it names both families'    "$(classify_run "$d/elsewhere.json" "" "" | cut -f2)" "answered as $other, not $(fam "$PRIMARY")"
+  t 'no --model given: a run on the primary is ok' "$(cl "$d/ok.json" "")" "$([ "$(fam "$PRIMARY")" = fable ] && echo ok || echo refusal)"
+  OV="$oldov"
+  c1=$(chain | sed -n 1p); c2=$(chain | sed -n 2p); c3=$(chain | tail -1)
+  [ -n "${CC_MODEL_CHAIN:-}" ] || t 'the shipped chain is fable, then opus, then sonnet' "$(chain | tr '\n' ' ')" 'claude-fable-5 claude-opus-5 claude-sonnet-5 '
+  t 'the chain walks to its next rung'    "$(chain_next "$c1")"          "$c2"
+  t 'a bare family word is the same rung' "$(chain_next "$(fam "$c1")")" "$c2"
+  case "$c2" in *']') exp="$c2";; *) exp="${c2}[1m]";; esac
+  t 'and a [1m] suffix rides along'       "$(chain_next "${c1}[1m]")"      "$exp"
+  t 'naming no model starts where the box is' "$(chain_next '')"         "$(chain_next "$PRIMARY")"
+  got=$(chain_next "$c3"); t 'the end of the chain is empty' "$got:$?" ":1"
+  CHAIN="$c1 $c2 $c1"   # F7: a chain that names a family twice must not walk in a circle for ever
+  t 'a repeated family is one rung'       "$(chain | wc -l)"             2
+  got=$(chain_next "$c2"); t 'so the walk still ends' "$got:$?" ":1"
+  CHAIN="$oldchain"
+  rm -rf "$d"
+  printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
+  [ "$bad" = 0 ]; }
 case "${1:-}" in
   status)  if ov; then [ "$till" -gt 0 ] && printf '%s until %sZ\n' "$(fam "$model")" "$(date -u -d "@$till" +%H:%M)" || printf '%s until probe\n' "$(fam "$model")"
            else fam "$PRIMARY"; fi ;;
@@ -135,7 +297,11 @@ case "${1:-}" in
   switch)  do_switch "${2:?usage: cc-model switch <model> [reason]}" "${3:-}" ;;
   limited) [ "$(fam "${2:?usage: cc-model limited <model> [reason]}")" = "$(fam "$PRIMARY")" ] || exit 0
            rate_ok && do_switch "$FALLBACK" "${3:-$(fam "$2") limit}" ;;
+  classify) shift; classify_run "${1:?usage: cc-model classify <json> [<err>] [<asked-model>]}" "${2:-}" "${3:-}" ;;
+  chain)   chain ;;
+  next)    chain_next "${2:-}" || exit 1 ;;
   tick)    tick ;;
-  *) sed -n '2,8p' "$0" >&2; exit 2 ;;
+  selfcheck) selfcheck || exit 1 ;;
+  *) sed -n '2,14p' "$0" >&2; exit 2 ;;
 esac
 exit 0

@@ -16,6 +16,9 @@ them, or do them. Work that serves no named goal is noise, however clever.
 
 Red beats new. Delivery beats development. Small-and-shippable beats big-and-half-done.
 
+The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wakes every session
+every 2 h and each one works the order above on its own — nothing here waits to be asked.
+
 ## dispatch judgement
 - One worker per file, always. Check the board's live tracks before dispatching.
 - A brief is one screen: the goal, the why, the files, the gates, what NOT to touch —

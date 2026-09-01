@@ -1,14 +1,44 @@
 #!/usr/bin/env bash
 # cc-msg — type a message into a running interactive Claude session (tmux window) as if you were at the keyboard.
 #   cc-msg <window> "text"      window = tmux window name in session main (e.g. myapp, myapp/step1)
-# Refuses windows without an interactive `claude` child: a headless --go worker's pane is a shell, and the text
+# Refuses windows with no interactive `claude` under them: a headless --go worker's pane is a shell, and the text
 # would sit on its tty and execute as a command when the loop ends. Give those work by appending to task.md.
+# Refuses a window with a DIALOG open: the keystrokes would answer it (see THE DIALOG GUARD below).
 # Note: between Claude sessions prefer the native SendMessage tool; this is the deterministic waker for scripts/humans.
 set -uo pipefail
 w="${1:?window}"; shift; text="${*:-$(cat)}"
 id=$(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | awk -v n="$w" '$2==n{print $1; exit}')   # by id: names with dots/slashes break -t main:<name>
 [ -n "$id" ] || { echo "cc-msg: no window main:$w" >&2; exit 1; }
 pp=$(tmux list-panes -t "$id" -F '#{pane_pid}' 2>/dev/null | head -1)
-pgrep -P "${pp:-0}" -x claude >/dev/null 2>&1 || { echo "cc-msg: main:$w runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
-tmux capture-pane -p -t "$id" 2>/dev/null | grep -q 'Enter to confirm' && { echo "cc-msg: main:$w has a dialog open — answer it first (tmux select-window -t $id)" >&2; exit 3; }
+
+# An interactive `claude` ANYWHERE under the pane, not just a direct child. `pgrep -P <pane_pid>` was the test
+# until 2026-08-31 and it is wrong for a whole class of session: `cc-handoff --overlap` starts its successor as
+# `bash -c '… cc __runnext …'`, so that session's claude is a GRANDCHILD — the direct-child test called it dead
+# and this script refused to type at a perfectly live session, every time, for as long as it lived.
+# `claude -p` is still refused: a headless worker prints and exits, and there is no prompt for the text to land in.
+claude_pids=$(ps -eo pid=,ppid=,comm= | awk -v root="${pp:-0}" '
+  { kids[$2] = kids[$2] " " $1; name[$1] = $3 }
+  END { q[1] = root; n = 1                                     # breadth-first over the pane subtree
+        for (i = 1; i <= n; i++) { m = split(kids[q[i]], c, " "); for (j = 1; j <= m; j++) q[++n] = c[j] }
+        for (i = 2; i <= n; i++) if (name[q[i]] == "claude") print q[i] }')
+live=""
+for pid in $claude_pids; do
+  tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qx -e '-p' -e '--print' || { live=1; break; }
+done
+[ -n "$live" ] || { echo "cc-msg: main:$w runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
+
+# THE DIALOG GUARD. A modal is waiting for a keypress, so the text — or the Enter after it, or a digit inside it —
+# ANSWERS it, and a tool-permission prompt answered by a script is an unattended approval of exactly what the owner
+# is gated on. These strings were captured off the real TUI on this box (Claude Code 2.1.252), not guessed:
+#   "Do you want to …"      the question line of every permission dialog (proceed? · allow this connection? ·
+#                           allow Claude to fetch this content? · use this API key?)
+#   "No, and tell Claude…"  option 3 of a tool dialog — and the ONLY marker left when the dialog is taller than
+#                           the pane and its footer has scrolled off (seen with the fetch prompt at 40 rows)
+#   "Esc to cancel"         the footer of the permission, folder-trust and /model dialogs
+#   "Enter to confirm"      the folder-trust dialog (the one string this guard used to have)
+#   "Would you like to proceed?"  the plan-mode approval (from the shipped binary's strings)
+# None of them shows "esc to interrupt", so a mid-turn test does NOT cover this.
+tmux capture-pane -p -t "$id" 2>/dev/null | grep -qF -e 'Do you want to' -e 'No, and tell Claude what to do differently' \
+  -e 'Esc to cancel' -e 'Enter to confirm' -e 'Would you like to proceed?' && {
+  echo "cc-msg: main:$w has a dialog open — answer it first, typing here would answer it for you (tmux select-window -t $id)" >&2; exit 3; }
 tmux send-keys -t "$id" -l -- "$text"; sleep 0.3; tmux send-keys -t "$id" Enter   # two calls: Enter is swallowed otherwise

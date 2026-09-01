@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""cc-pulse — the drive loop: every couple of hours the box wakes its own sessions, and each one decides for
+itself whether there is work. Nothing else on the box starts development; every other timer reacts to something
+that already happened. This is the one that makes the rest run continuously with no human poke.
+
+  cc-pulse                       THE WHOLE MACHINE — every repo with a board and every live orch
+  cc-pulse <target> [<target>…]  exactly those
+  cc-pulse --list                the targets this run would cover, one per line
+  cc-pulse --dry                 say what it would do; touch nothing, write nothing
+  cc-pulse selfcheck
+
+TARGET is `<repo>` (a planning session) or `<repo>@<alias>` (an orch) — the tmux window name in session `main`,
+which is also the address Slack routes on.
+
+NO LIST TO MAINTAIN. The targets are enumerated live, every run, from ~/.cc/boards/*.json and the orch routing
+table ~/.cc/slack/orchs.json. A repo registered or an orch spawned an hour ago is covered by the next pulse; a
+hand-written list would have to be remembered by whoever adds the next one, and would not be.
+
+IT ONLY WAKES. The pulse holds no opinion about what is due — it starts an idle session where there is none and
+types one line into every live one, and the SESSION judges. It dispatches nothing, spends nothing, and writes
+no state but its own log (~/.cc/state/pulse.log) and, once, a goals skeleton for a target that has none, so the
+tick never points at an empty file.
+
+NO PILEUPS. A session gets at most one tick per cycle, and none at all while it is mid-handoff (a successor is
+reading the journal — a tick would land on two sessions at once), while a DIALOG is open on its pane (typing
+would answer it, and a tool-permission prompt is the owner's to answer), while its pane is mid-turn (the last
+tick, or whatever the owner asked, is still unanswered) or while a tick from a previous run is younger than the
+gap below. Each of those is one line in the log and nothing else.
+
+TWO SWITCHES, because a loop that wakes the whole machine must be stoppable by whoever it wakes:
+  CC_PULSE=0 in ~/.cc/config   the drive loop is off — no run does anything, dry or not
+  ~/.cc/state/<target>/pulse.off   that one target is left alone; everything else still runs
+
+THE GAP IS SHORTER THAN THE PERIOD ON PURPOSE (CC_PULSE_GAP_MIN in ~/.cc/config, default 90 min against a 2 h
+timer). Equal, and a run that starts a second later than the one before it measures 1 h 59 m since its own last
+tick and skips — every other cycle, forever, and the drive loop quietly halves itself.
+
+Exit: 0 done, findings or not · 2 usage.
+"""
+import calendar
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+BIN = os.environ.get("CC_PULSE_BIN") or os.path.dirname(os.path.realpath(__file__))   # test hook: stub siblings
+BOARDS, STATE, DEV = f"{HOME}/.cc/boards", f"{HOME}/.cc/state", f"{HOME}/dev"
+ORCHS = f"{HOME}/.cc/slack/orchs.json"          # {"<chat>": {target, alias, parent, …, archived}} — cc-slack owns it
+LOG = f"{STATE}/pulse.log"
+LOG_MAX = 4000                                  # a 2 h timer over a dozen targets fills this in about a month
+GAP_MIN = 90                                    # minutes; see THE GAP above before changing it
+WORKING_FOOTER = "esc to interrupt"             # Claude Code's footer for the whole of a turn (same string cc-slack reads)
+# A MODAL IS WAITING FOR A KEYPRESS. None of these dialogs shows the working footer, so the mid-turn test does
+# not cover them, and the tick — its Enter, or a digit inside a target name — would ANSWER the dialog: on a
+# tool-permission prompt that is an unattended approval of exactly what the owner is gated on. Captured off the
+# real TUI (Claude Code 2.1.252): the question line of every permission dialog, option 3 of a tool dialog (the
+# only marker left when the dialog is taller than the pane and the footer has scrolled off), and the footer the
+# permission, folder-trust and /model dialogs share. cc-msg carries the same list and refuses to type either way.
+DIALOG_MARKS = ("Do you want to", "No, and tell Claude what to do differently", "Esc to cancel",
+                "Enter to confirm", "Would you like to proceed?")
+NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(@[a-z0-9-]{2,20})?")
+
+TICK = ("pulse: you are the independent engineer for {t}. Work the loop — WORKING.md order: red > "
+        "undelivered asks > board todo/queued > goals (~/.cc/state/{t}/goals.md). Decide and act; the owner "
+        "only for CLAUDE.md approval classes, via @-mention in Slack. Nothing due = do nothing, reply nothing.")
+
+GOALS = ("# goals — {t}\n\n"
+         "no goals recorded yet — derive them from the channel's history and canvas, propose them to the\n"
+         "owner via @-mention once, and keep this file as the answer.\n")
+
+
+def now():
+    return time.time()
+
+
+def stamp(t=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def epoch(s):
+    """A log timestamp back to seconds; anything unreadable is 'long ago', never 'in the future'."""
+    try:
+        return float(calendar.timegm(time.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ")))
+    except ValueError:
+        return 0.0
+
+
+def conf(key, default):
+    """A number from the environment, else ~/.cc/config, else the default. Same shape as every other knob."""
+    val = os.environ.get(key, "")
+    if not val:
+        try:
+            for ln in open(f"{HOME}/.cc/config"):
+                if ln.strip().startswith(key + "="):
+                    val = ln.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            pass
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def sh(*cmd, timeout=120):
+    """Run something and hand back the result, or None. A timer job never dies of a command that hung."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def why(p):
+    out = ((p.stderr or "") + (p.stdout or "")).strip() if p is not None else ""
+    if out:
+        return out.splitlines()[-1]
+    return "no answer" if p is None else f"exit {p.returncode}"
+
+
+# ── what is actually there ───────────────────────────────────────────────────────────────────────────────────
+def windows():
+    """name -> (window id, pane pid) in session main."""
+    p = sh("tmux", "list-windows", "-t", "main", "-F", "#{window_id}\t#{window_name}\t#{pane_pid}", timeout=20)
+    out = {}
+    if p is not None and p.returncode == 0:
+        for ln in p.stdout.splitlines():
+            f = ln.split("\t")
+            if len(f) >= 3 and f[1]:
+                out[f[1]] = (f[0], f[2])
+    return out
+
+
+def live_claude(pane_pid):
+    """Is there an interactive `claude` ANYWHERE under the pane's shell? cc-msg asks the narrower question —
+    a DIRECT child — and that is wrong here in the one case that matters: a session started by
+    `cc-handoff --overlap` runs `bash -c '… cc __runnext …'`, so its claude is a grandchild, and the direct-child
+    test calls the pane dead. Dead means rule 1, and rule 1 would start a SECOND session on a repo that already
+    has one — the very collision rule 4 exists to prevent, and it has been seen on a real box.
+    `-p` is excluded because a headless worker's claude is not something you can type at; a bare shell has no
+    claude under it at all."""
+    p = sh("ps", "-eo", "pid=,ppid=,comm=", timeout=20)
+    if p is None or p.returncode != 0:
+        return False
+    kids, name = {}, {}
+    for ln in p.stdout.splitlines():
+        f = ln.split(None, 2)
+        if len(f) == 3:
+            kids.setdefault(f[1], []).append(f[0])
+            name[f[0]] = f[2].strip()
+    seen, stack = set(), list(kids.get(str(pane_pid), []))
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if name.get(pid) == "claude" and not headless(pid):
+            return True
+        stack.extend(kids.get(pid, []))
+    return False
+
+
+def headless(pid):
+    """A `claude -p` prints and exits; there is no prompt to type a tick into."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return False
+    return b"-p" in argv or b"--print" in argv
+
+
+def screen(wid):
+    """What that pane shows right now. One capture answers both questions asked of it — no LLM, just strings."""
+    p = sh("tmux", "capture-pane", "-p", "-t", wid, timeout=20)
+    return p.stdout if (p is not None and p.returncode == 0) else ""
+
+
+def working(s):
+    """Is that pane mid-turn? The same test cc-slack makes."""
+    return WORKING_FOOTER in s
+
+
+def dialog(s):
+    """Is a modal waiting for a keypress? See DIALOG_MARKS — this is the guard that must never be loosened."""
+    return any(m in s for m in DIALOG_MARKS)
+
+
+def handoff_open(target):
+    """True open · False none · None cc-handoff could not answer. It owns the whole handoff lifecycle; this
+    only asks, and a target it has never heard of (an orch) is simply a target with no record."""
+    p = sh(f"{BIN}/cc-handoff", "--status", target, timeout=60)
+    if p is None:
+        return None
+    return True if p.returncode == 0 else (False if p.returncode == 1 else None)
+
+
+def discover():
+    """Every target on the box, right now: a board file is a repo, a live row in the orch table is an orch."""
+    out = []
+    for f in sorted(glob.glob(f"{BOARDS}/*.json")):
+        repo = os.path.basename(f)[:-5]
+        if not repo.startswith("_") and NAME.fullmatch(repo):
+            out.append(repo)
+    try:
+        table = json.load(open(ORCHS))
+    except (OSError, ValueError):
+        table = {}
+    for e in (table.values() if isinstance(table, dict) else []):
+        if not isinstance(e, dict) or e.get("archived"):        # archived = that orch is retired, not asleep
+            continue
+        t = f"{e.get('target', '')}@{e.get('alias', '')}"
+        if NAME.fullmatch(t) and t not in out:
+            out.append(t)
+    return out
+
+
+def last_tick(target):
+    """When this target was last woken, read off the log — which is the only record the pulse keeps."""
+    try:
+        lines = open(LOG).read().splitlines()
+    except OSError:
+        return 0.0
+    for ln in reversed(lines):
+        f = ln.split(None, 3)
+        if len(f) >= 3 and f[1] == target and f[2] == "tick":
+            return epoch(f[0])
+    return 0.0
+
+
+# ── the run ──────────────────────────────────────────────────────────────────────────────────────────────────
+class Run:
+    """One pass. Holds the dry-run flag and the tally so every target reports the same way."""
+
+    def __init__(self, dry=False):
+        self.dry, self.n = dry, {}
+
+    def log(self, target, verb, msg):
+        self.n[verb] = self.n.get(verb, 0) + 1
+        print(f"  {target:<24} {verb:<6} {msg}")
+        if self.dry:
+            return
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(LOG, "a") as f:
+                f.write(f"{stamp()} {target} {verb} — {msg}\n")
+        except OSError:
+            pass                                    # a log nobody can write must not stop the loop it drives
+
+    def trim(self):
+        if self.dry:
+            return
+        try:
+            lines = open(LOG).read().splitlines(True)
+            if len(lines) > LOG_MAX:
+                with open(LOG + ".tmp", "w") as f:
+                    f.writelines(lines[-LOG_MAX:])
+                os.replace(LOG + ".tmp", LOG)
+        except OSError:
+            pass
+
+
+def ensure_goals(target, r):
+    """Rule 3: a tick points at ~/.cc/state/<target>/goals.md, so a target with no such file gets a skeleton
+    that says how to fill it. The one file outside its own log that the pulse ever writes, and only when
+    there is none — an existing goals file is the session's, and is never touched."""
+    p = f"{STATE}/{target}/goals.md"
+    if os.path.exists(p):
+        return
+    if r.dry:
+        r.log(target, "goals", f"no goals file — would write the skeleton at {p}")
+        return
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "x") as f:
+            f.write(GOALS.format(t=target))
+    except OSError:
+        return
+    r.log(target, "goals", "no goals file — wrote the skeleton, so the tick points at something")
+
+
+def opted_out(target):
+    """`touch ~/.cc/state/<target>/pulse.off` and the pulse leaves that one alone. A session that wants to be
+    left alone, or an owner who wants one repo quiet, must not have to switch the whole drive loop off."""
+    return os.path.exists(f"{STATE}/{target}/pulse.off")
+
+
+def pulse(target, r):
+    """One target: start it if it is not there, tick it if it is, skip it if a tick would pile up."""
+    repo, orch = target.split("@")[0], "@" in target
+    if opted_out(target):
+        r.log(target, "skip", "pulse.off — this target has opted out of the drive loop")
+        return
+    ensure_goals(target, r)
+
+    # THE HANDOFF CHECK COMES FIRST, ahead of the window being looked at at all. It used to run only once the
+    # window was found live, and that order is a trap: a target mid-overlap whose predecessor claude has already
+    # exited (the window stays — `cc __runmain` ends in `exec bash`), or one caught in the kill→rename gap of a
+    # retire, reads as DEAD and takes the start branch. `cc <repo>` then puts a fresh un-gated session beside the
+    # gated successor, the handoff sweep reads the newcomer as "the predecessor came back", and the successor
+    # halfway through the journal is expired and killed.
+    h = handoff_open(target)
+    if h:
+        r.log(target, "skip", "mid-handoff — a successor is taking over; neither a tick nor a start belongs here")
+        return
+
+    w = windows().get(target)
+    if w is None or not live_claude(w[1]):
+        if h is None:
+            # Asymmetric on purpose. A tick sent while cc-handoff is unwell costs one line read by a session
+            # that may be busy; a START costs a whole second session on a repo that may be mid-handoff. Only
+            # the cheap half of this job is done blind.
+            r.log(target, "report", "no live session, and cc-handoff could not say whether one is being handed "
+                                    "over — not starting a second one blind")
+            return
+        if orch:
+            # Rule 1 stops at the repos on purpose. Starting an orch is not free the way an idle planning
+            # session is: `cc <repo> --orch <alias>` mints that orch a NEW Slack channel every time it starts
+            # one fresh, so a pulse that resurrects them would cut a channel every 2 h for every orch that
+            # ever exited. An orch is spawned by whoever needs it and archived when it goes.
+            r.log(target, "skip", "orch session gone — not restarted here (a fresh one would mint a new channel)")
+            return
+        if not os.path.isdir(f"{DEV}/{repo}"):
+            r.log(target, "skip", f"a board with no ~/dev/{repo} — nothing to start")
+            return
+        if r.dry:
+            r.log(target, "start", "no live session — would start an idle one" if w is None else
+                  "the window holds no session — would ask `cc` for one, which it refuses while that pane "
+                  "still has a child")
+            return
+        p = sh(f"{BIN}/cc", repo, timeout=120)
+        if p is None or p.returncode != 0:
+            r.log(target, "report", f"could not start a session: {why(p)}")
+            return
+        w2 = windows().get(target)
+        if w2 is not None and live_claude(w2[1]):
+            r.log(target, "start", "no live session — started an idle one; the next pulse ticks it")
+        else:
+            # `cc <repo>` replaces a window only when its pane has NO child at all, and the shell that
+            # `cc __runmain` execs when claude exits IS a child. So a window left behind by a dead session is
+            # not replaced by anything, and "started an idle one" would be a lie repeated every 2 h forever.
+            # Nobody sweeps a leftover PLANNING window either (cc-janitor only kills track windows), so the one
+            # line the pulse writes says what has to happen for it to start anything.
+            r.log(target, "report", "the window holds no session, and `cc` will not replace a window whose pane "
+                                    "still has a child — close it and the next pulse starts one")
+        return
+
+    if h is None:
+        # Ticking anyway is the deliberate choice: a pulse that cannot fire while one CLI is unwell stops the
+        # whole box's development, and the worst a tick costs is one line read by a session that is busy.
+        r.log(target, "report", "cc-handoff could not answer — ticking anyway")
+    scr = screen(w[0])
+    if dialog(scr):
+        r.log(target, "skip", "a dialog is open — typing here would answer it, and a permission prompt is the "
+                              "owner's to answer")
+        return
+    if working(scr):
+        r.log(target, "skip", "mid-turn — the last tick is still unanswered")
+        return
+    age = now() - last_tick(target)
+    gap = conf("CC_PULSE_GAP_MIN", GAP_MIN) * 60
+    if age < gap:
+        r.log(target, "skip", f"ticked {int(age // 60)}m ago — one tick per cycle")
+        return
+    if r.dry:
+        r.log(target, "tick", "live and idle — would tick")
+        return
+    p = sh(f"{BIN}/cc-msg", target, TICK.format(t=target), timeout=60)
+    if p is not None and p.returncode == 0:
+        r.log(target, "tick", "live and idle — woken")
+    else:
+        r.log(target, "report", f"tick failed: {why(p)}")
+
+
+def main(argv):
+    if argv and argv[0] == "selfcheck":
+        return selfcheck()
+    dry = listing = False
+    only = []
+    for a in argv:
+        if a == "--dry":
+            dry = True
+        elif a in ("--list", "-l"):
+            listing = True
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a.startswith("-"):
+            print(f"cc-pulse: unknown option {a}\nusage: cc-pulse [<target>…] [--dry] [--list] | selfcheck",
+                  file=sys.stderr)
+            return 2
+        else:
+            only.append(a)
+    targets = only or discover()
+    bad = [t for t in targets if not NAME.fullmatch(t)]
+    if bad:
+        print(f"cc-pulse: not a target name: {' '.join(bad)} (<repo> or <repo>@<alias>)", file=sys.stderr)
+        return 2
+    if listing:
+        print("\n".join(targets))
+        return 0
+    if conf("CC_PULSE", 1) == 0:                    # the kill switch: one line in ~/.cc/config stops the loop
+        print("cc-pulse: CC_PULSE=0 in ~/.cc/config — the drive loop is off; nothing woken")
+        return 0
+    if not targets:
+        print("cc-pulse: no boards and no live orchs — nothing to wake")
+        return 0
+
+    if not dry:                                     # a manual run during a timer run would double-tick everything
+        try:                                        # (a dry run collides with nothing, and takes no lock: it is read-only)
+            os.makedirs(STATE, exist_ok=True)
+            lock = open(f"{STATE}/pulse.lock", "w")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("cc-pulse: another pulse is running — this one stands down")
+            return 0
+
+    r = Run(dry)
+    print(f"cc-pulse {stamp()}{' (dry run)' if dry else ''} — {len(targets)} target(s)")
+    for t in targets:
+        pulse(t, r)
+    r.trim()
+    tally = " ".join(f"{v} {k}" for k, v in sorted(r.n.items())) or "nothing to do"
+    print(f"cc-pulse: {tally}{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
+    return 0
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    """A whole fake box: its own HOME with two boards and one orch, stub tmux/cc/cc-msg/cc-handoff, and real
+    processes standing in for the panes. Touches no tmux server, no board and no session on this machine, and
+    every fixture name is a placeholder."""
+    import shutil
+    import signal
+    import tempfile
+    global HOME, BOARDS, STATE, DEV, ORCHS, LOG, BIN
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+        else:
+            f += 1
+            print(f"  FAIL {name}")
+
+    with tempfile.TemporaryDirectory() as th:
+        HOME, BIN = th, f"{th}/bin"
+        BOARDS, STATE, DEV = f"{th}/.cc/boards", f"{th}/.cc/state", f"{th}/dev"
+        ORCHS, LOG = f"{th}/.cc/slack/orchs.json", f"{th}/.cc/state/pulse.log"
+        for d in (BIN, BOARDS, STATE, f"{th}/.cc/slack", f"{DEV}/alpha", f"{DEV}/beta"):
+            os.makedirs(d, exist_ok=True)
+        for name, body in (("tmux", FAKE_TMUX), ("cc", FAKE_CC), ("cc-msg", FAKE_MSG), ("cc-handoff", FAKE_HANDOFF)):
+            open(f"{BIN}/{name}", "w").write(body)
+            os.chmod(f"{BIN}/{name}", 0o755)
+        # a process whose name really is `claude`, for pgrep -x. A COPY OF BASH, not of sleep: this box's
+        # coreutils is a multi-call binary that refuses to run under any other name.
+        shutil.copy(os.path.realpath("/bin/bash"), f"{BIN}/claude")
+
+        tmuxf, calls = f"{th}/tmux.txt", f"{th}/calls.txt"
+        os.environ.update(PATH=BIN + os.pathsep + os.environ.get("PATH", ""), CC_FAKE_TMUX=tmuxf,
+                          CC_FAKE_CALLS=calls, CC_FAKE_BUSY="", CC_FAKE_DIALOG="", CC_FAKE_HANDOFF="",
+                          CC_FAKE_HANDOFF_BROKEN="", CC_PULSE_GAP_MIN="90", CC_PULSE="")
+
+        def fixture(*cmd):                          # own group, no handle on our stdout (a stray child holds a pipe open)
+            return subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # `; true` twice over: without it bash execs the next command in its own place, and neither the pane
+        # (which must have a child) nor the `claude` (which must not become `sleep`) would be what it claims.
+        live = fixture("bash", "-c", f"{BIN}/claude -c 'sleep 300; true'; true")
+        dead = fixture("sleep", "300")                            # a pane whose claude exited: a bare shell
+        # the `cc-handoff --overlap` shape: pane -> bash -> claude, one level deeper than a direct-child test sees
+        deep = fixture("bash", "-c", f"""bash -c "{BIN}/claude -c 'sleep 300; true'; true"; true""")
+        work = fixture("bash", "-c", f"{BIN}/claude -p -c 'sleep 300; true'; true")   # headless: prints and exits
+        # the shape `cc __runmain` leaves behind when its claude exits: `exec bash`, still a child of the pane
+        shell = fixture("bash", "-c", "sleep 300; true")
+        time.sleep(0.6)                                           # the live pane needs its child to exist first
+        os.environ["CC_FAKE_NEWPID"] = str(live.pid)
+
+        # two boards and one orch, plus an archived orch that must never be a target
+        open(f"{BOARDS}/alpha.json", "w").write("{}\n")
+        open(f"{BOARDS}/beta.json", "w").write("{}\n")
+        json.dump({"C1": {"target": "beta", "alias": "scout", "archived": False},
+                   "C2": {"target": "beta", "alias": "old", "archived": True}}, open(ORCHS, "w"))
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n@3\talpha/aworker\t{dead.pid}\n")
+        open(calls, "w").close()
+
+        def did():
+            return open(calls).read()
+
+        def logged():
+            try:
+                return open(LOG).read()
+            except OSError:
+                return ""
+
+        def since(prev):                            # only what the run just made — the log is cumulative
+            return logged()[len(prev):]
+
+        def run(*a):
+            open(calls, "w").close()
+            return main(list(a))
+
+        tg = discover()
+        ok("the targets are enumerated live — every board, plus every orch that is not archived",
+           tg == ["alpha", "beta", "beta@scout"])
+        ok("an ARCHIVED orch is retired, not asleep: it is no target", "beta@old" not in tg)
+
+        # ---- --dry touches nothing at all
+        run("--dry")
+        ok("--dry makes no call — no session started, nobody woken", did().strip() == "")
+        ok("--dry writes no log, and no goals skeleton either",
+           not os.path.exists(LOG) and not os.path.exists(f"{STATE}/alpha/goals.md"))
+
+        # ---- (0) one run, three targets, each getting what its state deserves
+        run()
+        L = logged()
+        ok("(0) one run covers the WHOLE machine: two boards and the orch, all three touched",
+           all(t in L for t in ("alpha", "beta", "beta@scout")))
+        ok("(0) …and a worker window is none of its business — it wakes sessions, not tracks",
+           "alpha/aworker" not in L)
+        ok("(1) a repo with no live session is started, idle", "cc alpha\n" in did() and "alpha start" in L)
+        ok("(1) …and is NOT ticked in the same run: a session that just started has nothing to be woken from",
+           "msg alpha " not in did())
+        ok("(2) the two live idle sessions are woken, exactly once each",
+           did().count("msg beta ") == 1 and did().count("msg beta@scout ") == 1)
+        ok("the tick names the target and its goals file, and hands the judgement to the session",
+           "independent engineer for beta@scout" in did() and "~/.cc/state/beta@scout/goals.md" in did()
+           and "Nothing due = do nothing" in did())
+        ok("(3) every target with no goals file got the skeleton, so no tick points at nothing",
+           all("no goals recorded yet" in open(f"{STATE}/{t}/goals.md").read() for t in tg))
+
+        # ---- (1) the started session is live one cycle later, and is ticked then
+        run()
+        ok("(1) one pulse cycle after the start, a live idle session is there and gets its tick",
+           "msg alpha " in did())
+        ok("(2) NO PILEUP: the two woken seconds ago are skipped, not woken again",
+           "msg beta " not in did() and "ticked 0m ago" in logged())
+
+        # ---- an existing goals file belongs to the session
+        open(f"{STATE}/beta/goals.md", "w").write("ship the thing\n")
+        run()
+        ok("a goals file that exists is never rewritten", open(f"{STATE}/beta/goals.md").read() == "ship the thing\n")
+
+        # ---- (3) mid-handoff and mid-turn, with the gap out of the way
+        os.environ.update(CC_PULSE_GAP_MIN="0", CC_FAKE_HANDOFF="beta", CC_FAKE_BUSY="@2")
+        run()
+        L = logged()
+        ok("(3) a mid-handoff session is skipped — a tick would land on two sessions at once",
+           "msg beta " not in did() and "beta skip — mid-handoff" in L)
+        ok("(3) …and a session mid-turn is skipped too: its last tick is still unanswered",
+           "msg beta@scout " not in did() and "mid-turn" in L)
+        ok("(3) both skips are one log line each, and nothing else happens", "beta report" not in L)
+
+        # ---- the gap is what stops a second tick, and it is configurable
+        os.environ.update(CC_FAKE_HANDOFF="", CC_FAKE_BUSY="")
+        run("beta")
+        ok("with the gap at zero the same session ticks again — the gap alone is what held it",
+           "msg beta " in did())
+        os.environ["CC_PULSE_GAP_MIN"] = "90"
+        run("beta")
+        ok("…and back at 90 min it does not", "msg beta " not in did())
+
+        # ---- a board with no repo checked out anywhere
+        open(f"{BOARDS}/delta.json", "w").write("{}\n")
+        run()
+        ok("a board with no ~/dev/<repo> is skipped, not started", "cc delta" not in did() and "nothing to start" in logged())
+
+        # ---- an orch whose session went away
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
+        run("beta@scout")
+        ok("an orch whose session is gone is logged, never resurrected — restarting one mints a Slack channel",
+           "cc beta" not in did() and "orch session gone" in logged())
+
+        # ---- it never wakes a pane with no interactive claude in it
+        open(tmuxf, "w").write(f"@1\tbeta\t{dead.pid}\n")
+        os.environ["CC_PULSE_GAP_MIN"] = "0"
+        run("beta")
+        ok("a window whose claude has exited is a dead window: it is restarted, never typed at",
+           "msg beta " not in did() and "cc beta\n" in did())
+
+        # ---- the successor of an overlap handoff, whose claude is a GRANDCHILD of the pane
+        open(tmuxf, "w").write(f"@1\tbeta\t{deep.pid}\n")
+        run("beta")
+        ok("an overlap-handoff successor is LIVE — its claude is a grandchild, and calling it dead would put a "
+           "SECOND session on the repo", "msg beta " in did() and "cc beta\n" not in did())
+
+        # ---- and the pane a subtree test must still refuse
+        open(tmuxf, "w").write(f"@1\tbeta\t{work.pid}\n")
+        run("beta")
+        ok("a headless `claude -p` under the pane is not a session to type at",
+           "msg beta " not in did())
+
+        # ---- the window a dead session leaves behind, which `cc` will not replace
+        open(tmuxf, "w").write(f"@1\tbeta\t{shell.pid}\n")
+        L0 = logged(); run("beta")
+        ok("a leftover shell (pane still has a child) is not restartable by `cc`: the pulse says exactly that "
+           "and claims no start it did not make",
+           "cc beta\n" in did() and "msg beta " not in did()
+           and "holds no session" in since(L0) and "beta start" not in since(L0))
+
+        # ---- (3) a handoff record is open and the window reads DEAD — the branch that used to skip the check
+        os.environ["CC_FAKE_HANDOFF"] = "beta"
+        open(tmuxf, "w").write(f"@1\tbeta\t{dead.pid}\n")
+        L0 = logged(); run("beta")
+        ok("(3) a record open + a dead window = NO START: a fresh un-gated session beside the successor is what "
+           "kills a handoff, so the check comes before the start decision",
+           "cc beta" not in did() and "mid-handoff" in since(L0))
+        os.environ["CC_FAKE_HANDOFF"] = ""
+
+        # ---- cc-handoff itself unwell: cheap things still happen, expensive ones do not
+        os.environ["CC_FAKE_HANDOFF_BROKEN"] = "1"
+        open(tmuxf, "w").write(f"@1\tbeta\t{dead.pid}\n")
+        L0 = logged(); run("beta")
+        ok("cc-handoff unwell + a dead window = no start either: a tick is cheap to get wrong, a second session "
+           "on a repo is not", "cc beta" not in did() and "not starting a second one blind" in since(L0))
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
+        L0 = logged(); run("beta")
+        ok("…but a LIVE session is still ticked while cc-handoff is unwell — the box does not stop for one CLI",
+           "msg beta " in did() and "ticking anyway" in since(L0))
+        os.environ["CC_FAKE_HANDOFF_BROKEN"] = ""
+
+        # ---- (4) a dialog is open: the tick would ANSWER it
+        os.environ["CC_FAKE_DIALOG"] = "@1"
+        L0 = logged(); run("beta")
+        ok("(4) a pane with a permission dialog open is never typed at — a tick would answer a prompt that is "
+           "the owner's to answer, and no dialog shows the mid-turn footer",
+           "msg beta " not in did() and "a dialog is open" in since(L0))
+        os.environ["CC_FAKE_DIALOG"] = ""
+
+        # ---- the per-target opt-out
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n")
+        open(f"{STATE}/beta/pulse.off", "w").close()
+        L0 = logged(); run("beta", "beta@scout")
+        ok("a target with pulse.off is left alone, and only that one",
+           "msg beta " not in did() and "pulse.off" in since(L0) and "msg beta@scout " in did())
+        os.remove(f"{STATE}/beta/pulse.off")
+
+        # ---- the kill switch
+        os.environ["CC_PULSE"] = "0"
+        L0 = logged(); rc = run("beta", "beta@scout")
+        ok("CC_PULSE=0 stops the whole drive loop: nothing started, nobody woken, nothing logged",
+           rc == 0 and did().strip() == "" and since(L0) == "")
+        os.environ["CC_PULSE"] = ""
+
+        # ---- usage
+        ok("a target name that is not one is a usage error, never a guess", main(["../etc/passwd"]) == 2)
+        ok("an unknown option is a usage error", main(["--nope"]) == 2)
+        ok("--list says what a run would cover and does nothing", main(["--list"]) == 0)
+
+        # ---- the log is the record, and it is bounded
+        os.environ["CC_PULSE_GAP_MIN"] = "90"
+        open(LOG, "w").write("x\n" * (LOG_MAX + 50))
+        run("beta")
+        ok("the log is trimmed to its cap — a 2 h timer must not grow a file forever",
+           len(open(LOG).read().splitlines()) <= LOG_MAX)
+
+        for proc in (live, dead, deep, work, shell):   # the group, so the sleep under the live shell goes too
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=10)
+
+    print(f"cc-pulse selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+FAKE_TMUX = r"""#!/usr/bin/env bash
+# selfcheck stub: windows are "id<TAB>name<TAB>pane_pid" lines in $CC_FAKE_TMUX, and capture-pane shows Claude's
+# working footer for the window ids in $CC_FAKE_BUSY, a permission dialog for those in $CC_FAKE_DIALOG (the real
+# wording, which carries NEITHER of the other two markers), and an idle prompt for every other.
+set -u; F="$CC_FAKE_TMUX"; cmd="${1:-}"; shift || true
+fmt=""; targ=""
+while [ $# -gt 0 ]; do case "$1" in -F) fmt="${2:-}"; shift 2;; -t) targ="${2:-}"; shift 2;; *) shift;; esac; done
+case "$cmd" in
+  list-windows)
+    while IFS=$'\t' read -r id name pid; do
+      [ -n "${id:-}" ] || continue
+      s="$fmt"; s="${s//\#\{window_id\}/$id}"; s="${s//\#\{window_name\}/$name}"; s="${s//\#\{pane_pid\}/$pid}"
+      printf '%s\n' "$s"
+    done < "$F";;
+  capture-pane)
+    case " ${CC_FAKE_DIALOG:-} " in *" $targ "*) printf 'Do you want to proceed?\n 1. Yes\n'; exit 0;; esac
+    case " ${CC_FAKE_BUSY:-} " in *" $targ "*) echo "esc to interrupt";; *) echo "> ";; esac;;
+esac
+exit 0
+"""
+
+FAKE_CC = r"""#!/usr/bin/env bash
+# selfcheck stub for `cc <repo>`, and it does what the real one does, not what would be convenient: `cc` kills an
+# existing window only when its pane has NO child, and creates one only when there is no window by that name. A
+# stub that always produced a live window would hide the case the real `cc` cannot fix — a pane whose claude has
+# exited but whose fallback shell is still a child of it — and the pulse would claim a start that never happened.
+set -u
+printf 'cc %s\n' "$*" >> "$CC_FAKE_CALLS"
+pid=$(awk -F'\t' -v n="$1" '$2==n{print $3; exit}' "$CC_FAKE_TMUX")
+if [ -n "$pid" ]; then
+  pgrep -P "$pid" >/dev/null 2>&1 && exit 0                  # pane_live: cc leaves the window exactly as it is
+  awk -F'\t' -v n="$1" '$2!=n' "$CC_FAKE_TMUX" > "$CC_FAKE_TMUX.tmp" && mv "$CC_FAKE_TMUX.tmp" "$CC_FAKE_TMUX"
+fi
+printf '@%s\t%s\t%s\n' "$(( $(wc -l < "$CC_FAKE_TMUX") + 90 ))" "$1" "$CC_FAKE_NEWPID" >> "$CC_FAKE_TMUX"
+"""
+
+FAKE_MSG = r"""#!/usr/bin/env bash
+# selfcheck stub for `cc-msg <window> <text>`: records who was typed at, and what.
+set -u
+printf 'msg %s :: %s\n' "${1:-}" "${2:-}" >> "$CC_FAKE_CALLS"
+"""
+
+FAKE_HANDOFF = r"""#!/usr/bin/env bash
+# selfcheck stub: `--status <target>` exits 0 when that target is in $CC_FAKE_HANDOFF (a handoff is open), 1 not,
+# and 2 when $CC_FAKE_HANDOFF_BROKEN is set — the CLI is there but cannot answer.
+set -u
+[ -n "${CC_FAKE_HANDOFF_BROKEN:-}" ] && exit 2
+case " ${CC_FAKE_HANDOFF:-} " in *" ${2:-} "*) exit 0;; esac
+exit 1
+"""
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

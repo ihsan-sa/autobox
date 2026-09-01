@@ -461,6 +461,22 @@ echo "== --say / --go / cc-loop =="
 tmux new-window -d -t main -n "$REPO/m7" "sleep 30"; sleep 1   # M7: a headless worker's pane is a shell — typed text would run as a command
 "$B/cc-msg" "$REPO/m7" "hello" >"$T/m7.out" 2>&1; [ $? != 0 ] && grep -q 'task.md' "$T/m7.out" && ok "cc-msg refuses a window with no interactive claude" || bad "cc-msg typed into a headless pane"
 tmux kill-window -t "$(tmux list-windows -t main -F '#{window_id} #W' | awk -v n="$REPO/m7" '$2==n{print $1}')" 2>/dev/null
+# M8: a pane with a claude under it AND a dialog on screen. The text, or the Enter after it, would ANSWER the
+# dialog, and a tool-permission prompt answered by a script is an unattended approval of what the owner gates on.
+# The pane is a copy of bash named `claude` (coreutils refuses to run under another name) with `; true` at every
+# level (bash exec-replaces itself on a lone final command, and the process must stay a `claude`).
+mkdir -p "$T/fakebin"; cp "$(readlink -f /bin/bash)" "$T/fakebin/claude"
+printf 'echo "Do you want to proceed?"\n"%s" -c "sleep 30; true"\ntrue\n' "$T/fakebin/claude" > "$T/m8.sh"
+tmux new-window -d -t main -n "$REPO/m8" "bash $T/m8.sh"; sleep 1
+"$B/cc-msg" "$REPO/m8" "hello" >"$T/m8.out" 2>&1; m8=$?
+{ [ $m8 = 3 ] && grep -q 'dialog' "$T/m8.out"; } && ok "cc-msg refuses a pane with a dialog open — it would answer a permission prompt" || bad "cc-msg typed at a pane with a dialog open (rc=$m8): $(cat "$T/m8.out")"
+# M9: the same pane WITHOUT the dialog line — the guard must not be a permanent refusal, and this claude is a
+# GRANDCHILD of the pane, the shape `cc-handoff --overlap` starts and the old direct-child test called dead.
+printf 'bash -c \x27"%s" -c "sleep 30; true"; true\x27\ntrue\n' "$T/fakebin/claude" > "$T/m9.sh"
+tmux new-window -d -t main -n "$REPO/m9" "bash $T/m9.sh"; sleep 1
+"$B/cc-msg" "$REPO/m9" "hello" >"$T/m9.out" 2>&1; m9=$?
+[ $m9 = 0 ] && ok "cc-msg types at an overlap successor, whose claude is a grandchild of the pane" || bad "cc-msg refused a live session (rc=$m9): $(cat "$T/m9.out")"
+for w in m8 m9; do tmux kill-window -t "$(tmux list-windows -t main -F '#{window_id} #W' | awk -v n="$REPO/$w" '$2==n{print $1}')" 2>/dev/null; done
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w1$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
 CC_CLAUDE="$T/fakeclaude" "$B/cc" $REPO w1 --go "build the thing" --loop 3 >/dev/null 2>&1
@@ -887,6 +903,12 @@ echo "== cc-janitor (the weekly sweep: decision table + one end-to-end pass over
 # Its own HOME, board, origin and stub tmux/gh — nothing here can reach this box's tmux server or GitHub.
 jan=$("$B/cc-janitor" selfcheck 2>&1)
 grep -q '0 failed' <<<"$jan" && ok "cc-janitor selfcheck: ${jan##*: }" || bad "cc-janitor selfcheck: $jan"
+
+echo "== cc-pulse (the drive loop: whole-machine enumeration, start, tick, and the three reasons not to) =="
+# Its own HOME with two boards and one orch, and stub tmux/cc/cc-msg/cc-handoff — it starts no session
+# on this box and types into none of the live ones.
+pul=$("$B/cc-pulse" selfcheck 2>&1)
+grep -q '0 failed' <<<"$pul" && ok "cc-pulse selfcheck: ${pul##*: }" || bad "cc-pulse selfcheck: $pul"
 
 echo "== what the snapshot's four readers do with it (waiting vs the clock, and without it) =="
 # cc-reconcile's own selfcheck covers PRODUCING the snapshot; this covers the two things that only break in the

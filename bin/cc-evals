@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# cc-evals — the suite that verifies the SYSTEM, not the code. The three PR gates say the scripts still parse and
+# still behave; this says the box can still do work it has already done. Today every case is deterministic and drives
+# this box's own scripts, so what it gates is the control plane and the worker guard — gating a model, prompt or
+# harness change needs a capability case that calls one, and there is none yet. Do not claim more than that in a
+# release note or a report. Design: <overlay>/docs/*-agent-evals-design.md
+#   cc-evals run [--set regression|capability|all] [--case <name>] [--json] [--no-record] | list | bless <case>
+#           | last | selfcheck
+# A case is one file with its metadata in its own header (no second list to drift from it) and one function:
+#   # @set: regression   # @kind: replay|property|capability   # @base: <sha>   # @title: …
+#   probe(){ … }   rc 0 = the invariant holds · 1 = violated · 2 = INCONCLUSIVE (the probe could not run at all)
+# A `replay` is judged on BOTH halves: it must FAIL on its pinned base snapshot and PASS on this tree. Head-passes
+# alone is what selftest.sh already gives; base-fails is the proof the probe bites. A replay that passes at base is
+# VACUOUS and counts as red — an eval that cannot fail proves nothing, and silently counting it green is worse than
+# not having it. rc 2 on either side is INCONCLUSIVE and never PASS: a snapshot that will not run is not evidence.
+set -uo pipefail
+R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"                 # the tree this copy ships with (core/)
+TOP="$(git -C "$R" rev-parse --show-toplevel 2>/dev/null || echo "$R")"  # the repo: overlay root, or autobox itself
+S="${CC_EVALS_HOME:-$HOME/.cc/evals}"        # snapshots, refs, salt, run records. NEVER in git — see `## refs` below
+SNAP="$S/snap"; REFS="${CC_EVALS_REFS:-$S/refs}"; SALT_F="$S/salt"; RUNS="$S/runs"
+CASES="${CC_EVALS_CASES:-}"
+[ -n "$CASES" ] || for d in "$TOP/evals/cases" "$R/evals/cases"; do [ -d "$d" ] && { CASES="$d"; break; }; done
+now_ms(){ local e=${EPOCHREALTIME:-}; e=${e//[!0-9]/}   # `date +%s%3N` is not portable: this box's date ignores the
+  if [ ${#e} -ge 13 ]; then echo $(( e / 1000 )); else echo $(( $(date +%s) * 1000 )); fi; }   # width and prints ns
+say(){ printf '%s\n' "$*"; }
+die(){ printf 'cc-evals: %s\n' "$*" >&2; exit 2; }
+
+# ---- case metadata: read out of the case file's own header, so adding a case adds nothing else ----
+meta(){ sed -n "s|^#[[:space:]]*@$2:[[:space:]]*||p" "$1" | head -1; }
+case_name(){ basename "$1" .sh; }
+cases_all(){ [ -n "$CASES" ] && [ -d "$CASES" ] || return 0; find "$CASES" -maxdepth 1 -name '*.sh' | sort; }
+
+# ---- the tree under test: a case reaches its scripts through $CC_EVALS_BIN and the tree they ship with through
+# $CC_EVALS_ROOT, because that pair differs between a private overlay (core/bin, core/) and a bare autobox (bin, .)
+# — a case must not have to know which of the two it is running on ----
+tree_bin(){ if [ -d "$1/core/bin" ]; then echo "$1/core/bin"; else echo "$1/bin"; fi; }
+
+# ---- snapshots: one `git archive` per pinned sha, kept. A replay's base must be FROZEN, so it is addressed by sha
+# and extracted once; nothing here ever checks out, fetches, or touches the working tree. ----
+snapshot(){   # snapshot <rev> -> prints the dir, or nothing and rc 1 when that commit is not in this clone
+  local rev=$1 sha d
+  sha=$(git -C "$TOP" rev-parse --verify --quiet "$rev^{commit}") || return 1
+  d="$SNAP/$sha"
+  if [ ! -d "$d" ]; then mkdir -p "$d.tmp.$$" || return 1
+    git -C "$TOP" archive "$sha" | tar -x -C "$d.tmp.$$" || { rm -rf "$d.tmp.$$"; return 1; }
+    mv "$d.tmp.$$" "$d" 2>/dev/null || rm -rf "$d.tmp.$$"; fi
+  [ -d "$d" ] && printf '%s' "$d"
+}
+
+# ---- running one probe: its own scratch HOME, its own metrics file, and nothing of the caller's environment that
+# could decide the answer. $CC_HANDOFF especially: a suite that inherits it asserts against whoever is running it,
+# which cost four red gates in one night on 2026-08-31 (see selftest.sh's header) ----
+PROBE_OUT=""; PROBE_COST=0; PROBE_LOOPS=0
+run_probe(){   # run_probe <case-file> <tree> -> rc from the probe; sets PROBE_OUT/COST/LOOPS
+  local f=$1 tree=$2 h m rc
+  h=$(mktemp -d "${TMPDIR:-/tmp}/cc-evals-h.XXXXXX") || return 2
+  m="$h/.metrics"; : > "$m"
+  local tb; tb=$(tree_bin "$tree")
+  PROBE_OUT=$(
+    export HOME="$h" CC_EVALS_METRICS="$m" CC_EVALS_TREE="$tree" CC_EVALS_BIN="$tb" CC_EVALS_ROOT="${tb%/bin}"
+    export CC_NOTIFY_LOG_ONLY=1 CC_NOTIFY_LOG="$h/notify.log"   # a probe never pushes to the owner
+    export TMUX_TMPDIR="$h"; unset TMUX     # …and never reaches the box's own tmux server: a probe that lists or
+    unset CC_HANDOFF CC_ROLE                # kills windows must find an empty server of its own, not the live one
+    cd "$h" || exit 2
+    set +o pipefail +u   # a probe is judged on ITS OWN answer, never on the runner's shell options: with pipefail
+                         # inherited, `cc ls | grep -q x` returns the SIGPIPE from the left side of a pipe grep had
+                         # every right to close early, and a perfectly good probe reads as a failure
+    exec </dev/null   # a probe NEVER inherits stdin: one `git` inside one probe ate the case list off the runner's
+                      # loop and the run stopped half way through, reporting green on the half it had reached.
+                      # The redirect belongs INSIDE here — `VAR=$(…) </dev/null` sets $? from the redirect, not the
+                      # probe, which read as "base passed" and turned all six cases VACUOUS in one go.
+    # shellcheck source=/dev/null
+    . "$f" || exit 2
+    probe "$tree" 2>&1
+  ); rc=$?
+  PROBE_COST=$(sed -n 's/^cost=//p' "$m" 2>/dev/null | awk '{s+=$1} END{printf "%.4f", s+0}')
+  PROBE_LOOPS=$(sed -n 's/^loops=//p' "$m" 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  rm -rf "$h"; return $rc
+}
+
+# ---- refs: the hidden half. A capability case's expected answer is never in the repo and never in plaintext — the
+# stored ref is sha256(salt ‖ normalised output), so a worker that finds this directory can still only VERIFY. ----
+norm(){   # everything that differs run to run, gone: colour, the scratch HOME, the tree path, trailing space
+  sed -e 's/\x1b\[[0-9;]*m//g' -e "s|${2:-/nonexistent-tree}|<tree>|g" -e 's|/tmp/cc-evals-h\.[A-Za-z0-9]*|<home>|g' \
+      -e 's/[[:space:]]*$//' <<<"$1" | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac
+}
+salt(){ [ -s "$SALT_F" ] || { mkdir -p "$S"; chmod 700 "$S" 2>/dev/null; (umask 077; head -c 32 /dev/urandom | base64 > "$SALT_F"); }
+        cat "$SALT_F"; }
+digest(){ printf '%s\n%s' "$(salt)" "$1" | sha256sum | cut -d' ' -f1; }
+
+# ---- one case, judged ----
+VERDICT=""; DETAIL=""; DUR=0; COST=0; LOOPS=0
+judge(){   # judge <case-file>
+  local f=$1 kind base t0 rc bd brc name cs
+  name=$(case_name "$f"); kind=$(meta "$f" kind); base=$(meta "$f" base); cs=$(meta "$f" set); cs=${cs:-regression}
+  VERDICT=FAIL; DETAIL=""; COST=0; LOOPS=0; t0=$(now_ms)
+  if [ "$kind" = replay ]; then
+    if [ -z "$base" ]; then VERDICT=INCONCLUSIVE; DETAIL="a replay with no @base: nothing to prove it bites"
+    elif ! bd=$(snapshot "$base"); then VERDICT=INCONCLUSIVE; DETAIL="base $base is not in this clone"
+    else
+      run_probe "$f" "$bd"; brc=$?
+      case $brc in
+        0) VERDICT=VACUOUS; DETAIL="the probe passes on base $base too — it does not test the fix" ;;
+        2) VERDICT=INCONCLUSIVE; DETAIL="base $base could not run the probe: $(printf '%s' "$PROBE_OUT" | tail -1)" ;;
+      esac
+    fi
+    [ "$VERDICT" = FAIL ] || { DUR=$(( $(now_ms) - t0 )); return; }   # base already decided it
+  fi
+  run_probe "$f" "$TOP"; rc=$?
+  COST=$PROBE_COST; LOOPS=$PROBE_LOOPS
+  if [ "$kind" = capability ]; then
+    # A MISSING REF IS NOT A FREE PASS. `rm` on one ref used to turn its case SKIP, i.e. green — the cheapest way
+    # to switch off the only graded case there is. It is SKIP on a box that has never blessed anything (a fresh
+    # install genuinely has no answers yet) and red everywhere else: in the regression set always, and in the
+    # capability set once this box holds any other ref, because then the ref went missing rather than never existed.
+    if [ ! -s "$REFS/$name.ref" ]; then
+      if [ "$cs" = regression ] || [ -n "$(find "$REFS" -maxdepth 1 -name '*.ref' -size +0c 2>/dev/null | head -1)" ]; then
+        VERDICT=FAIL; DETAIL="no blessed reference on a box that has them — deleted, not never blessed (cc-evals bless $name)"
+      else VERDICT=SKIP; DETAIL="no blessed reference (cc-evals bless $name)"; fi
+    elif [ $rc -ne 0 ]; then VERDICT=FAIL; DETAIL=$(printf '%s' "$PROBE_OUT" | tail -1)
+    elif [ "$(digest "$(norm "$PROBE_OUT" "$TOP")")" = "$(cat "$REFS/$name.ref")" ]; then VERDICT=PASS
+    else VERDICT=FAIL; DETAIL="output does not match the blessed reference"; fi
+  else
+    case $rc in 0) VERDICT=PASS ;; 2) VERDICT=INCONCLUSIVE; DETAIL=$(printf '%s' "$PROBE_OUT" | tail -1) ;;
+      *) VERDICT=FAIL; DETAIL=$(printf '%s' "$PROBE_OUT" | tail -1) ;; esac
+  fi
+  # "the regression set is free" was a promise in the docs and nowhere in the code: the set is author-written and the
+  # cost self-reported afterwards, so one case that starts calling a model would quietly put spend on every nightly
+  # audit. A regression case that reports any spend is red, whatever else it did — move it to the capability set.
+  if [ "$cs" = regression ] && awk -v c="$COST" 'BEGIN{exit !(c+0>0)}'; then
+    VERDICT=FAIL; DETAIL="a regression case must be free — this one reported \$$COST (the capability set is where spend belongs)"
+  fi
+  DUR=$(( $(now_ms) - t0 ))
+}
+
+# ---- run ----
+cmd_run(){
+  local want=regression one="" json=0 record=1
+  while [ $# -gt 0 ]; do case $1 in
+    --set) want=${2:?}; shift 2 ;; --case) one=${2:?}; shift 2 ;;
+    --json) json=1; shift ;; --no-record) record=0; shift ;;
+    *) die "run: unknown option $1" ;; esac; done
+  case $want in regression|capability|all) ;; *) die "run: --set must be regression, capability or all" ;; esac
+  local f n=0 p=0 fl=0 vac=0 sk=0 inc=0 incr=0 tc=0 tl=0 rows="" t0; t0=$(now_ms)
+  local list; list=$(cases_all)
+  if [ -z "$list" ]; then
+    say "cc-evals: no cases in ${CASES:-<none found>} — nothing to verify (a bare install has none)"; return 0; fi
+  say "cc-evals: $want set"
+  while IFS= read -r f <&3; do
+    [ -n "$f" ] || continue
+    local cs; cs=$(meta "$f" set); cs=${cs:-regression}
+    [ "$want" = all ] || [ "$cs" = "$want" ] || continue
+    [ -z "$one" ] || [ "$(case_name "$f")" = "$one" ] || continue
+    n=$((n+1)); judge "$f"
+    case $VERDICT in PASS) p=$((p+1));; FAIL) fl=$((fl+1));; VACUOUS) vac=$((vac+1));;
+      SKIP) sk=$((sk+1));; INCONCLUSIVE) inc=$((inc+1)); [ "$cs" != regression ] || incr=$((incr+1));; esac
+    tc=$(awk -v a="$tc" -v b="$COST" 'BEGIN{printf "%.4f", a+b}'); tl=$((tl + LOOPS))
+    printf '  %-12s %-26s %-8s %5s  %s\n' "$VERDICT" "$(case_name "$f")" "$(meta "$f" kind)" \
+      "$(awk -v m="$DUR" 'BEGIN{printf "%.1fs", m/1000}')" "$(meta "$f" title)"
+    [ -z "$DETAIL" ] || printf '               ↳ %s\n' "$DETAIL"
+    rows+=$(printf '{"name":"%s","set":"%s","kind":"%s","verdict":"%s","duration_s":%s,"cost_usd":%s,"loops":%s,"detail":"%s"}\n' \
+      "$(case_name "$f")" "$cs" "$(meta "$f" kind)" "$VERDICT" \
+      "$(awk -v m="$DUR" 'BEGIN{printf "%.3f", m/1000}')" "$COST" "$LOOPS" "$(printf '%s' "$DETAIL" | tr '"\n' "' " | tr -s ' ')")$'\n'
+  done 3<<<"$list"
+  local wall; wall=$(awk -v m="$(( $(now_ms) - t0 ))" 'BEGIN{printf "%.1f", m/1000}')
+  # ONE verdict line, last, and it is what cc-audit shows: red or green, what it cost, how long, how many loops.
+  # A REGRESSION CASE THAT COULD NOT RUN IS RED. An all-inconclusive run used to print "green — 0/10 passed": a
+  # baseline that stopped running reads exactly like a baseline that holds, which is the failure mode the whole
+  # suite exists to catch. Inconclusive stays soft only in the capability set, where a probe may need a live thing.
+  local verdict="green"; [ $((fl + vac + incr)) -eq 0 ] || verdict="RED"
+  local line
+  line=$(printf 'cc-evals: %s — %s/%s passed, %s failed, %s vacuous, %s inconclusive, %s skipped · $%s, %ss, %s loops (%s set)' \
+    "$verdict" "$p" "$n" "$fl" "$vac" "$inc" "$sk" "$tc" "$wall" "$tl" "$want")
+  if [ "$record" = 1 ]; then mkdir -p "$RUNS" 2>/dev/null
+    printf '%s' "$rows" | jq -s --arg s "$want" --arg v "$verdict" --arg st "$(date -u +%FT%TZ)" \
+      --argjson c "$tc" --argjson d "$wall" --argjson l "$tl" \
+      '{stamp:$st,set:$s,verdict:$v,cost_usd:$c,duration_s:$d,loops:$l,cases:.}' \
+      > "$RUNS/$(date -u +%Y%m%dT%H%M%SZ).json" 2>/dev/null; fi
+  if [ "$json" = 1 ]; then printf '%s' "$rows" | jq -s . ; fi
+  say "$line"
+  [ $((fl + vac + incr)) -eq 0 ]
+}
+
+cmd_list(){ local f; while IFS= read -r f; do [ -n "$f" ] || continue
+  printf '%-26s %-11s %-11s %s\n' "$(case_name "$f")" "$(meta "$f" set)" "$(meta "$f" kind)" "$(meta "$f" title)"
+  done <<<"$(cases_all)"; }
+
+# Blessing is a PERSON's act, and the wall around it is `cc-settings apply`'s, for the same reason: the reference is
+# the whole of what a graded case is judged against, so a process that can re-bless can grade itself. A worker that
+# widened cc-guard could otherwise run `cc-evals bless cap-guard-decision-table` and freeze the widened table as the
+# expected answer — the case would stay green through exactly the change it exists to catch.
+bless_refuse(){ printf 'cc-evals bless: %s\n' "$1" >&2
+  printf '  Deliberate: a blessed reference is the only thing a graded case is judged against, so only the owner\n' >&2
+  printf '  writes one. Type `cc-evals bless %s` yourself in a shell on the box.\n' "$2" >&2; exit 3; }
+cmd_bless(){   # bless <case> — run it HERE and freeze the answer, hidden.
+  local name=${1:?usage: cc-evals bless <case>} f="$CASES/${1}.sh" d
+  [ -z "${CC_ROLE:-}" ] || bless_refuse "refusing — CC_ROLE=${CC_ROLE} (a worker or member session)" "$name"
+  d=$PWD; while [ -n "$d" ] && [ "$d" != / ]; do
+    [ -e "$d/.cc/track" ] && bless_refuse "refusing — $d is a track worktree" "$name"; d=$(dirname "$d"); done
+  { [ -t 0 ] && [ -t 1 ]; } || bless_refuse "refusing — no terminal (this is only ever typed by hand)" "$name"
+  [ -f "$f" ] || die "no case $name in ${CASES:-<none>}"
+  run_probe "$f" "$TOP" || die "$name does not pass here — nothing worth blessing"
+  mkdir -p "$REFS"; chmod 700 "$S" "$REFS" 2>/dev/null
+  (umask 077; digest "$(norm "$PROBE_OUT" "$TOP")" > "$REFS/$name.ref")
+  say "cc-evals: blessed $name ($(wc -l <<<"$PROBE_OUT") lines, digest only — the answer itself is not stored)"
+}
+
+cmd_last(){ local f; f=$(find "$RUNS" -name '*.json' 2>/dev/null | sort | tail -1)
+  [ -n "$f" ] || { say "cc-evals: no run recorded yet"; return 1; }
+  jq -r '"cc-evals \(.stamp): \(.verdict) — \(.set) set, \([.cases[]|select(.verdict=="PASS")]|length)/\(.cases|length) passed, $\(.cost_usd), \(.duration_s)s, \(.loops) loops"' "$f"; }
+
+# ---- selfcheck: the runner's own gate. Fixture cases in a temp dir, never this box's real ones. ----
+selfcheck(){
+  local n=0 fl=0 d out
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; fl=$((fl+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
+  d=$(mktemp -d); trap 'rm -rf "$d"' RETURN
+  # a repo of its own with two commits, so "base" and "head" are real and frozen
+  git init -q "$d/repo"; mkdir -p "$d/repo/bin"
+  printf '#!/bin/sh\necho old\n' > "$d/repo/bin/thing"; chmod +x "$d/repo/bin/thing"
+  git -C "$d/repo" -c user.email=t@t -c user.name=t add -A >/dev/null
+  git -C "$d/repo" -c user.email=t@t -c user.name=t commit -qm base
+  local BASE; BASE=$(git -C "$d/repo" rev-parse HEAD)
+  printf '#!/bin/sh\necho new\n' > "$d/repo/bin/thing"
+  git -C "$d/repo" -c user.email=t@t -c user.name=t commit -qam head
+  mkdir -p "$d/cases" "$d/state"
+  mk(){ { printf '# @set: %s\n# @kind: %s\n# @base: %s\n# @title: %s\n' "$2" "$3" "$4" "$5"; printf '%s\n' "$6"; } > "$d/cases/$1.sh"; }
+  mk good regression replay "$BASE" 'the fix is in'          'probe(){ [ "$("$CC_EVALS_BIN"/thing)" = new ]; }'
+  mk vac  regression replay "$BASE" 'passes everywhere'      'probe(){ true; }'
+  mk bad  regression replay "$BASE" 'broken at head'         'probe(){ false; }'
+  mk inc  regression replay "$BASE" 'cannot run'             'probe(){ exit 2; }'
+  mk prop regression property ""    'no base needed'         'probe(){ [ -x "$CC_EVALS_BIN"/thing ]; }'
+  mk paid regression property ""    'reports its own spend'  'probe(){ echo cost=0.25 >> "$CC_EVALS_METRICS"; echo loops=3 >> "$CC_EVALS_METRICS"; }'
+  mk hom  regression property ""    'gets a scratch HOME'    'probe(){ [ "$HOME" != "'"$HOME"'" ] && [ -d "$HOME" ]; }'
+  mk pipe regression property ""    'pipes into an early exit'  'probe(){ seq 1 100000 | grep -q 7; }'
+  mk gred regression property ""    'reads stdin greedily'      'probe(){ cat >/dev/null; }'
+  mk cap  capability capability ""  'graded against a ref'   'probe(){ echo "the answer"; }'
+  mk cap2 capability capability ""  'graded, never blessed'  'probe(){ echo "another answer"; }'
+  mk capreg regression capability "" 'graded, in the nightly set' 'probe(){ echo "a third answer"; }'
+  # the runner tests the tree it LIVES in, so the fixture repo gets its own copy of it — that is what makes
+  # "base" and "head" below real commits rather than two directories that happen to differ
+  cp "$(readlink -f "$0")" "$d/repo/bin/cc-evals"; local RB="$d/repo/bin"
+  E(){ env CC_EVALS_HOME="$d/state" CC_EVALS_CASES="$d/cases" CC_EVALS_REFS="$d/state/refs" "$RB/cc-evals" "$@" 2>&1; }
+  out=$(E run --set regression --case good); k $? "a replay that fails on base and passes at head is PASS"
+  k "$(t grep -q '^  PASS ' <<<"$out")" "…and says PASS"
+  out=$(E run --set regression --case vac); k "$(t test $? -ne 0)" "a probe that passes on base too is red"
+  k "$(t grep -q 'VACUOUS' <<<"$out")" "…and is named VACUOUS, not counted green (an eval that cannot fail proves nothing)"
+  out=$(E run --set regression --case bad); k "$(t test $? -ne 0)" "a probe that fails at head is red"
+  k "$(t grep -q '^  FAIL ' <<<"$out")" "…and says FAIL"
+  out=$(E run --set regression --case inc); k "$(t test $? -ne 0)" "rc 2 in the regression set is RED: a baseline that cannot run is not a baseline that holds"
+  k "$(t grep -q 'INCONCLUSIVE' <<<"$out")" "…named INCONCLUSIVE, never PASS, and it is not counted as one"
+  k "$(t grep -qE 'RED — 0/1 passed' <<<"$out")" "…so an all-inconclusive run can never print green"
+  out=$(E run --set regression --case prop); k $? "a property case needs no base"
+  out=$(E run --set regression --case paid --json)
+  k "$(t grep -qE '"cost_usd": *0\.25' <<<"$out")" "a probe's own spend is recorded, not guessed"
+  k "$(t grep -qE '"loops": *3' <<<"$out")" "…and so are its loops"
+  k "$(t grep -q '"verdict": *"FAIL"' <<<"$out")" "a regression case that SPENDS is red — free is a rule, not a promise in the docs"
+  k "$(t grep -q 'must be free' <<<"$out")" "…and is told where spend belongs (the capability set)"
+  out=$(E run --set regression --case hom); k $? "a probe gets a scratch HOME, never the caller's"
+  out=$(E run --set regression --case pipe); k $? "a probe is judged on its own answer, not the runner's pipefail"
+  out=$(E run --set regression --case gred); k $? "a probe that reads stdin gets none of it…"
+  out=$(E run --set regression)
+  k "$(t test "$(grep -c '^  [A-Z]' <<<"$out")" = "$(grep -l '@set: regression' "$d"/cases/*.sh | wc -l)")" \
+    "…and cannot eat the case list: every case runs, not just the ones before it"
+  out=$(E run --set regression); k "$(t test $? -ne 0)" "one red case makes the whole run red"
+  k "$(t grep -q 'cc-evals: RED' <<<"$out")" "…and the last line is the verdict, red or green"
+  k "$(t grep -qv 'graded against a ref' <<<"$(grep '^  ' <<<"$out")")" "--set regression leaves the capability set out"
+  out=$(E run --set capability); local caprc=$?
+  k "$(t grep -q 'SKIP' <<<"$out")" "a capability case with no blessed reference is SKIP, not red — a fresh box has no refs"
+  k "$caprc" "…and does not make the run red"
+  out=$(E run --set regression --case capreg); k "$(t test $? -ne 0)" \
+    "…but an unblessed graded case in the NIGHTLY set is red: a nightly gate that grades nothing is not a gate"
+  # ## bless — a person's act. Everything below proves the wall, because a worker that can re-bless grades itself.
+  out=$(E bless cap 2>&1); k "$(t test $? -eq 3)" "bless refuses with no terminal (a session, a hook, a gate — none of them is the owner)"
+  k "$(t grep -q 'refusing' <<<"$out")" "…and says which wall it hit"
+  k "$(t test ! -e "$d/state/refs/cap.ref")" "…and wrote nothing"
+  # the allowed path needs a real terminal, so the fixture gets one: `script` is the only pty this gate can borrow.
+  bl(){ script -qec "env CC_EVALS_HOME='$d/state' CC_EVALS_CASES='$d/cases' CC_EVALS_REFS='$d/state/refs' '$RB/cc-evals' bless $1" /dev/null; }
+  if command -v script >/dev/null 2>&1; then
+    CC_ROLE=worker bl cap >/dev/null 2>&1; k "$(t test $? -eq 3)" "a worker is refused AT a terminal too — CC_ROLE is the wall, not the tty"
+    mkdir -p "$d/track/.cc"; : > "$d/track/.cc/track"
+    ( cd "$d/track" && bl cap ) >/dev/null 2>&1; k "$(t test $? -eq 3)" "…and so is anything run inside a track worktree"
+    k "$(t test ! -e "$d/state/refs/cap.ref")" "…neither of them left a reference behind"
+    # …from $d, not from wherever the gate was invoked: this selfcheck's own home is usually a track worktree, and
+    # being refused there is the wall working, not a failure
+    ( cd "$d" && unset CC_ROLE && bl cap ) >/dev/null 2>&1; k $? "the owner, at a terminal, outside a worktree, can bless"
+    k "$(t test -s "$d/state/refs/cap.ref")" "…and that writes the reference"
+  else echo "  --   no script(1) here: the allowed half of the bless wall is unchecked, and so are the refs below"; fi
+  if [ -s "$d/state/refs/cap.ref" ]; then
+    out=$(E run --set capability --case cap); k $? "a blessed capability case passes"
+    k "$(t grep -q '^  PASS ' <<<"$out")" "…against the hidden reference"
+    out=$(E run --set capability --case cap2); k "$(t test $? -ne 0)" \
+      "…and once this box holds refs, a case whose own ref is MISSING is red: deleting one must not read as a skip"
+    # ## refs — the four properties that make "hidden" true
+    k "$(t grep -qv 'the answer' "$d/state/refs/cap.ref")" "the reference is a DIGEST: the expected output is not in it"
+    k "$(t test "$(stat -c %a "$d/state/salt")" = 600)" "the salt is not readable by anyone else — without it the digest cannot be reproduced"
+    printf 'the answer\n' | sha256sum | cut -d' ' -f1 > "$d/plain"
+    k "$(t test "$(cat "$d/state/refs/cap.ref")" != "$(cat "$d/plain")")" "the digest is SALTED: guessing the output does not reproduce it"
+  fi
+  # scoped to evals/: this runs on every land, and a `*.ref` fixture or a `salt` script anywhere else in the repo is
+  # not this suite's business — a gate that fails forever on an unrelated filename is a gate someone deletes
+  k "$(t test -z "$(git -C "$TOP" ls-files -- evals 2>/dev/null | grep -E '(^|/)(salt|.*\.ref)$' | head -1)")" \
+    "no reference is tracked in git NOW"
+  k "$(t test -z "$(git -C "$TOP" log --all --pretty=format: --name-only --diff-filter=A -- evals 2>/dev/null | grep -E '(^|/)(salt|.*\.ref)$' | head -1)")" \
+    "…nor was one ever committed — a worker checkout cannot read the answers out of history either"
+  k "$(t sh -c '[ ! -d "$1" ] || ! git -C "$1" rev-parse --show-toplevel' sh "$REFS")" \
+    "the live refs directory is outside every git tree"
+  rm -rf "$d/cases"; mkdir -p "$d/cases"
+  out=$(E run --set regression); k $? "a bare install with no cases exits 0"
+  k "$(t grep -q 'no cases' <<<"$out")" "…and says so rather than reporting a green it did not earn"
+  echo "cc-evals selfcheck: $((n - fl)) passed, $fl failed"
+  [ "$fl" -eq 0 ]
+}
+
+case "${1:-}" in
+  run) shift; cmd_run "$@" ;;
+  list) cmd_list ;;
+  bless) shift; cmd_bless "$@" ;;
+  last) cmd_last ;;
+  selfcheck) selfcheck ;;
+  ""|-h|--help) sed -n '2,8p' "$0" | sed 's/^# \?//' ;;
+  *) die "unknown command: $1 (run|list|bless|last|selfcheck)" ;;
+esac
