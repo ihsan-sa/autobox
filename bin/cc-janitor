@@ -11,7 +11,8 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
     also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
 
 PER REPO, NEVER ACROSS THEM. Every entry point takes repo names. There is no "sweep everything" — a tool that
-deletes has to be pointed, and the timer is pointed by a config line the owner writes.
+deletes has to be pointed, and the timer is pointed by a config line the owner writes. Rule 5 is the one
+box-wide pass — a container is pointed by its name — and it runs with an empty CC_JANITOR_REPOS too.
 
 THE ONE RULE ABOVE THE RULES: delete only what is PROVEN dead. Anything uncertain — a PR that closed without
 merging, a branch nobody opened one for, a window with something running in it, a worktree with uncommitted
@@ -26,6 +27,10 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      bare shell  →  killed. `<repo>/<track>~next`, the leftover half of a handoff, follows its base track.
   4. never: the repo's own planning window (the one named `<repo>` exactly), a window with a live process, or
      anything whose track is queued/running/waiting/review/blocked. Only `merged` and `done` are ever swept.
+  5. a ccbox container — named `ccbox-*`, status exited — stopped for CC_JANITOR_CONTAINER_DAYS days (default 7,
+     0 = off)  →  `docker rm`. Never `rmi`: the image stays. Only ccbox's own containers, by name, never a running
+     one. A ccbox mounts one project dir and nothing else, so what a run meant to keep is already outside it;
+     after a week the stopped container is a leftover, not a result.
 
 LIVENESS IS NOT DECIDED HERE. `cc-reconcile` already owns "what is really alive", and two definitions of that
 would drift into a tool that kills working sessions. This reads its snapshot (~/.cc/state/reconcile.json,
@@ -47,6 +52,7 @@ SNAP_MAX = 3600       # cc-reconcile runs every 20 min; older than this is not e
 PRMAX = 200           # one `gh pr list` per repo, capped: a timer job must never stall on the network
 TERMINAL = ("merged", "done")
 NEXT = "~next"        # cc-handoff's successor window suffix; `~` is not legal in a repo or track name
+CONTAINER_DAYS = 7    # rule 5: a ccbox-* container stopped longer is a leftover; CC_JANITOR_CONTAINER_DAYS overrides, 0 = off
 
 
 def now():
@@ -109,6 +115,19 @@ def window_verdict(f):
     if not f["bare"]:
         return ("report", "a live process is still in it")
     return ("kill", "a bare shell on a track that is " + (f["board"] or "not on the board"))
+
+
+def container_verdict(f):
+    """Rule 5. f: {name, status, age, days} → (rm|report|keep, why). `age` is seconds since docker's FinishedAt,
+    None when that could not be read — and None is NOT "long ago" here: an unreadable clock holds the sweep.
+    Only ccbox's own containers, by name; only exited ones; young is not a finding."""
+    if not f["name"].startswith("ccbox-") or f["status"] != "exited":
+        return ("keep", "")
+    if f["age"] is None:
+        return ("report", "when it stopped could not be read")
+    if f["age"] < f.get("days", CONTAINER_DAYS) * 86400:
+        return ("keep", "")
+    return ("rm", f"a ccbox container stopped for {dur(f['age'])}")
 
 
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -228,6 +247,40 @@ def remote_tracks(repo):
     return [ln.split("refs/heads/")[-1] for ln in p.stdout.splitlines() if "refs/heads/track/" in ln]
 
 
+def stopped_at(ts):
+    """docker's FinishedAt, '2026-08-30T01:44:43.257081924Z' → epoch, or None when it cannot be read."""
+    e = epoch(str(ts).split(".")[0].rstrip("Z") + "Z")
+    return e if e > 0 else None
+
+
+def containers():
+    """ccbox's stopped containers, [(name, status, finished_epoch|None)], or None when docker could not be asked.
+    `ps` picks them (name ^ccbox-, status exited); `inspect` gives the exact stop — its "2 days ago" is prose,
+    not a clock. Plain `docker`, as cc-audit's leftovers check asks it: same user, same answer."""
+    try:
+        p = subprocess.run(["docker", "ps", "-a", "--filter", "name=^ccbox-", "--filter", "status=exited",
+                            "--format", "{{.Names}}"], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    names = [n.strip() for n in p.stdout.splitlines() if n.strip()]
+    if not names:
+        return []
+    try:
+        q = subprocess.run(["docker", "inspect", "--format", "{{.Name}}\t{{.State.Status}}\t{{.State.FinishedAt}}",
+                            *names], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    out = []
+    for ln in q.stdout.splitlines():                    # a row that is there is real, even if another name went missing
+        name, _, rest = ln.partition("\t")
+        status, _, fin = rest.partition("\t")
+        if name.strip():
+            out.append((name.strip().lstrip("/"), status.strip(), stopped_at(fin.strip())))
+    return out
+
+
 # ── the run ──────────────────────────────────────────────────────────────────────────────────────────────
 class Run:
     """One sweep. Holds the log handle, the dry-run flag and the tally, so every rule reports the same way."""
@@ -343,18 +396,51 @@ def sweep(repo, r, net=True, stale=STALE):
             r.report(repo, f"window {name}", why)
 
 
+def sweep_containers(r, days):
+    """Rule 5, once per run and box-wide: a ccbox is named for a ~/dev project, not for a repo on a board, so
+    `ccbox-` is the pointing. A box without docker has no ccbox and hears nothing about it."""
+    if days <= 0 or not shutil.which("docker"):
+        return
+    print(f"cc-janitor ccbox containers{' (dry run)' if r.dry else ''}")
+    rows = containers()
+    if rows is None:
+        r.report("ccbox", "docker", "docker could not be asked — no container was touched")
+        return
+    for name, status, fin in sorted(rows):
+        f = {"name": name, "status": status, "days": days, "age": None if fin is None else max(0.0, now() - fin)}
+        verdict, why = container_verdict(f)
+        if verdict == "rm":
+            r.act("ccbox", "rm", f"container {name}", why, ["docker", "rm", name])
+        elif verdict == "report":
+            r.report("ccbox", f"container {name}", why)
+
+
+def setting(key, default=""):
+    """A ~/.cc/config value through cc-config, the file's one reader: the environment wins, set-but-empty included."""
+    try:
+        p = subprocess.run([f"{BIN}/cc-config", "get", key, default], capture_output=True, text=True, timeout=20)
+        return p.stdout.strip()
+    except Exception:
+        return os.environ.get(key, default)
+
+
 def configured():
     """The repos the timer sweeps: CC_JANITOR_REPOS in ~/.cc/config, whitespace separated. Unset means this box
-    has not pointed the janitor at anything yet, and a janitor with no target does nothing rather than guess."""
-    val = os.environ.get("CC_JANITOR_REPOS", "")
-    if not val:
-        try:
-            for ln in open(f"{HOME}/.cc/config"):
-                if ln.strip().startswith("CC_JANITOR_REPOS="):
-                    val = ln.split("=", 1)[1].strip().strip("\"'")
-        except OSError:
-            pass
-    return val.split()
+    has not pointed the janitor at any repo yet, and a janitor with no target does nothing rather than guess."""
+    return setting("CC_JANITOR_REPOS").split()
+
+
+def container_days():
+    """Rule 5's threshold in days: CC_JANITOR_CONTAINER_DAYS, default 7. 0 turns the container sweep off, and so does
+    the key set but empty (`CC_JANITOR_CONTAINER_DAYS= cc-janitor …`, the box-wide off idiom) — never int(''). A value
+    that is not a number is the default — a typo must not become a one-day sweep."""
+    v = setting("CC_JANITOR_CONTAINER_DAYS", str(CONTAINER_DAYS)).strip()
+    if not v:
+        return 0
+    try:
+        return max(0, int(v))
+    except ValueError:
+        return CONTAINER_DAYS
 
 
 def main(argv):
@@ -365,10 +451,9 @@ def main(argv):
     repos = [a for a in argv if not a.startswith("-")]
     if "--configured" in argv:
         repos = configured()
-        if not repos:
-            print("cc-janitor: no repos configured (CC_JANITOR_REPOS in ~/.cc/config) — nothing swept")
-            return 0
-    if not repos:
+        if not repos:                                   # rule 5 still runs: a container is pointed by its name
+            print("cc-janitor: no repos configured (CC_JANITOR_REPOS in ~/.cc/config) — no repo swept")
+    elif not repos:
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
         print("usage: cc-janitor <repo> [<repo> …] [--dry] | --configured [--dry] | selfcheck", file=sys.stderr)
         return 2
@@ -378,6 +463,7 @@ def main(argv):
             print(f"cc-janitor: '{repo}' is not a repo name", file=sys.stderr)
             return 2
         sweep(repo, r, net)
+    sweep_containers(r, container_days())
     print(f"cc-janitor: {len(r.did)} swept, {len(r.said)} reported"
           f"{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
     return 0
@@ -452,6 +538,24 @@ def selfcheck():
     ok("…for every non-terminal word the board has",
        all(window_verdict(W(board=s)) == ("keep", "") for s in ("queued", "waiting", "review", "blocked")))
 
+    # rule 5 — the ccbox container
+    def C(**kw):
+        d = {"name": "ccbox-sample", "status": "exited", "age": 10 * 86400, "days": 7}
+        d.update(kw)
+        return d
+
+    ok("a ccbox container stopped for over a week is removed", container_verdict(C())[0] == "rm")
+    ok("…one stopped two days ago is left alone, and unremarked", container_verdict(C(age=2 * 86400)) == ("keep", ""))
+    ok("…and the week is the configured one", container_verdict(C(age=2 * 86400, days=1))[0] == "rm")
+    ok("A RUNNING CONTAINER IS NEVER A CANDIDATE, whatever its last stop says",
+       container_verdict(C(status="running")) == ("keep", ""))
+    ok("only ccbox's own, by name — the rest of the box's docker is not this tool's business",
+       container_verdict(C(name="other-sample", age=90 * 86400)) == ("keep", ""))
+    ok("a stop time that cannot be read holds the sweep and is reported — unknown is not 'long ago'",
+       container_verdict(C(age=None))[0] == "report")
+    ok("docker's FinishedAt reads, nanoseconds and all — and nonsense reads as None, never as 0",
+       stopped_at("2026-08-30T01:44:43.257081924Z") == epoch("2026-08-30T01:44:43Z") and stopped_at("not-a-time") is None)
+
     # end to end: a fake box of its own — board, worktrees, origin, tmux and gh all stubbed
     with tempfile.TemporaryDirectory() as th:
         repo = "sampleproj"
@@ -459,9 +563,9 @@ def selfcheck():
         os.makedirs(fake)
         os.makedirs(f"{th}/.cc/state", exist_ok=True)
         env = dict(os.environ, HOME=th, PATH=f"{fake}:{os.environ.get('PATH', '')}",
-                   CC_FAKE_TMUX=f"{th}/tmux.txt", CC_FAKE_GH=f"{th}/gh.json",
+                   CC_FAKE_TMUX=f"{th}/tmux.txt", CC_FAKE_GH=f"{th}/gh.json", CC_FAKE_DOCKER=f"{th}/docker.txt",
                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-        for name, body in (("tmux", FAKE_TMUX), ("gh", FAKE_GH)):
+        for name, body in (("tmux", FAKE_TMUX), ("gh", FAKE_GH), ("docker", FAKE_DOCKER)):
             open(f"{fake}/{name}", "w").write(body)
             os.chmod(f"{fake}/{name}", 0o755)
 
@@ -524,10 +628,22 @@ def selfcheck():
         setwins()
         json.dump([{"number": 1, "state": "MERGED", "headRefName": "track/gone"},
                    {"number": 2, "state": "OPEN", "headRefName": "track/openpr"}], open(f"{th}/gh.json", "w"))
+        # five containers on the fake docker, one of them rule 5's
+        dockf = f"{th}/docker.txt"
 
-        def run(*a):
+        def stamp(days):
+            return time.strftime("%Y-%m-%dT%H:%M:%S.123456789Z", time.gmtime(time.time() - days * 86400))
+
+        rows = (f"ccbox-old\texited\t{stamp(10)}\n"          # stopped 10 days ago → removed
+                f"ccbox-fresh\texited\t{stamp(2)}\n"         # stopped 2 days ago → left alone, unremarked
+                f"ccbox-live\trunning\t{stamp(30)}\n"        # running: never a candidate, whatever its last stop says
+                f"other-old\texited\t{stamp(30)}\n"          # not ccbox's → not this tool's business
+                f"ccbox-odd\texited\tnot-a-time\n")          # a stop time nobody can read → reported, kept
+        open(dockf, "w").write(rows)
+
+        def run(*a, **extra):
             return subprocess.run([sys.executable, os.path.realpath(__file__), repo, *a],
-                                  env=env, capture_output=True, text=True, timeout=300)
+                                  env=dict(env, **extra), capture_output=True, text=True, timeout=300)
 
         # --dry first, against the very same fixture the real run then gets
         before = (sorted(json.load(open(bj))["tracks"]), sorted(wins()),
@@ -541,6 +657,15 @@ def selfcheck():
            not os.path.exists(f"{th}/.cc/state/janitor.log") and not os.path.exists(f"{th}/.cc/state/reconcile.json"))
         ok("…and says so, rather than let a preview look surer about what is alive than the real pass is",
            "snapshot is stale" in rd.stdout)
+        ok("--dry previews the container sweep too, and removes none",
+           "would rm container ccbox-old" in rd.stdout and open(dockf).read() == rows)
+        ok("CC_JANITOR_CONTAINER_DAYS moves the line — 1 day would take the fresh one too",
+           "would rm container ccbox-fresh" in run("--dry", CC_JANITOR_CONTAINER_DAYS="1").stdout)
+        ok("…and 0 turns rule 5 off", "container" not in run("--dry", CC_JANITOR_CONTAINER_DAYS="0").stdout)
+        ok("…and so does the key set but empty — off, not int('') and not the 7-day default",
+           "container" not in run("--dry", CC_JANITOR_CONTAINER_DAYS="").stdout)
+        ok("a docker that cannot be asked is reported, and nothing is touched",
+           "docker could not be asked" in run("--dry", CC_FAKE_DOCKER_DOWN="1").stdout and open(dockf).read() == rows)
 
         rn = subprocess.run([sys.executable, os.path.realpath(__file__), repo],
                             env=dict(env, CC_JANITOR_NO_SNAP="1"), capture_output=True, text=True, timeout=300)
@@ -567,16 +692,25 @@ def selfcheck():
         ok("end to end: A LIVE WINDOW SURVIVES, and is reported", f"{repo}/held{NEXT}" in w and "live process" in r1.stdout)
         ok("end to end: a bare `~next` leftover follows its base track and is killed", f"{repo}/stalenext{NEXT}" not in w)
         ok("end to end: rule 4 — the running track's window survives", f"{repo}/busy" in w)
+        dk = open(dockf).read()
+        ok("end to end: the ccbox container stopped 10 days ago is removed — by the no-snapshot pass already, since\n"
+           "           docker's own status is a container's liveness and rule 5 waits for no cc-reconcile snapshot",
+           "ccbox-old" not in dk and "rm container ccbox-old" in rn.stdout)
+        ok("end to end: a ccbox stopped 2 days ago, a running one and a container that is not ccbox's all survive",
+           all(n in dk for n in ("ccbox-fresh", "ccbox-live", "other-old")) and "ccbox-fresh" not in r1.stdout)
+        ok("end to end: a container whose stop time cannot be read is kept, and reported",
+           "ccbox-odd" in dk and "container ccbox-odd" in r1.stdout)
         log = open(f"{th}/.cc/state/janitor.log").read()
         ok("end to end: every action is in the log, with what it was and why",
-           all(s in log for s in ("rm sampleproj/gone", "delete origin/track/gone", "kill window sampleproj/ghost"))
+           all(s in log for s in ("rm sampleproj/gone", "delete origin/track/gone", "kill window sampleproj/ghost",
+                                  "rm container ccbox-old"))
            and "merged for 5d" in log)
         ok("end to end: it exits 0 — a sweep with findings is the tool working", r1.returncode == 0)
 
         setwins()
         r2 = run()
         ok("end to end: a second sweep finds nothing new to remove and still exits 0",
-           r2.returncode == 0 and "rm sampleproj" not in r2.stdout)
+           r2.returncode == 0 and "rm sampleproj" not in r2.stdout and "rm container" not in r2.stdout)
         ok("end to end: …and it did not come back for the branch it already deleted",
            "delete origin/track/gone" not in r2.stdout)
 
@@ -631,6 +765,36 @@ FAKE_GH = r"""#!/usr/bin/env bash
 # selfcheck stub: `gh pr list --json …` answers with $CC_FAKE_GH; anything else is not asked for here.
 set -u
 case "${1:-} ${2:-}" in "pr list") cat "$CC_FAKE_GH";; *) exit 1;; esac
+"""
+
+FAKE_DOCKER = r"""#!/usr/bin/env bash
+# selfcheck stub: containers are lines "name<TAB>status<TAB>finishedAt" in $CC_FAKE_DOCKER. Speaks the three verbs
+# cc-janitor uses — `ps -a` honouring its name= and status= filters, `inspect`, `rm` (which really takes the row
+# out) — and nothing else: an `rmi` here is a failure, not a feature. $CC_FAKE_DOCKER_DOWN plays a daemon that is gone.
+set -u; F="$CC_FAKE_DOCKER"
+[ -z "${CC_FAKE_DOCKER_DOWN:-}" ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ps)
+    nre=""; st=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --filter) case "${2:-}" in name=*) nre="${2#name=}";; status=*) st="${2#status=}";; esac; shift 2;;
+      *) shift;; esac; done
+    while IFS=$'\t' read -r name status fin; do
+      [ -n "${name:-}" ] || continue
+      [ -z "$nre" ] || grep -qE -- "$nre" <<<"$name" || continue
+      [ -z "$st" ] || [ "$st" = "$status" ] || continue
+      printf '%s\n' "$name"
+    done < "$F";;
+  inspect)
+    while [ $# -gt 0 ]; do case "$1" in --format|-f) shift 2;; *) break;; esac; done
+    for n in "$@"; do awk -F'\t' -v k="$n" '$1==k{printf "/%s\t%s\t%s\n",$1,$2,$3}' "$F"; done;;
+  rm)
+    for n in "$@"; do case "$n" in -*) continue;; esac
+      t=$(mktemp); awk -F'\t' -v k="$n" '$1!=k' "$F" > "$t"; mv "$t" "$F"; done;;
+  *) echo "fake docker: '$cmd' is not a verb here" >&2; exit 1;;
+esac
+exit 0
 """
 
 
