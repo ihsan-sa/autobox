@@ -4,7 +4,7 @@
 # (a private overlay adds its own that way).
 set -e; cd "$(dirname "$0")/.."
 sh=(); py=()
-for f in bin/*; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
+for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
 bash -n "${sh[@]}"
 shellcheck -S warning -e SC1090,SC1010 "${sh[@]}"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py "$@"

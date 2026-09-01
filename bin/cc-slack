@@ -1173,11 +1173,13 @@ def orch_purpose(brief, by, at=None, link=""):
     return " · ".join(x for x in (head, f"spawned by {by} {when}" + (f" from {link}" if link else "")) if x)[:250]
 
 
-def home_chan_order(known, orchs):
+def home_chan_order(known, orchs, hide=()):
     """[(chat, name, depth)] for the dashboard: a sub-orch channel is a CHILD of the channel it was spawned from —
     parents first (by name), children under them by creation, depth = how deep to indent. Archived orch channels are
-    gone from Home entirely (they no longer route either)."""
-    rows = [(c, n) for c, n in known if not (orchs.get(c) or {}).get("archived")]
+    gone from Home entirely (they no longer route either), and so is VITALS_STORE — the bot-only picture store the
+    owner is not in, which the tab printed as a nameless "Private channel" (owner, 2026-09-01) — and any id in `hide`."""
+    rows = [(c, n) for c, n in known if not (orchs.get(c) or {}).get("archived")
+            and n != VITALS_STORE and c not in set(hide) and c]
     ids, kids, tops = {c for c, _ in rows}, collections.defaultdict(list), []
     for c, n in rows:
         parent = (orchs.get(c) or {}).get("parent")
@@ -1192,6 +1194,13 @@ def home_chan_order(known, orchs):
     for c, n in sorted(tops, key=lambda r: r[1]):
         walk(c, n, 0)
     return out
+
+
+def home_chan_keep(c):
+    """Does one conversations.list entry belong on the tab? The bot must be in it, it is not VITALS_STORE, and it is not
+    a channel whose only member is the bot — that one is a store, not a channel for people, and the owner (who is not in
+    it) saw it as a nameless "Private channel" (2026-09-01). A missing member count keeps the channel: never hide on a guess."""
+    return bool(c.get("is_member")) and c.get("name") != VITALS_STORE and _home_num(c.get("num_members", 2)) > 1
 
 
 def load_flags():
@@ -1489,9 +1498,21 @@ def home_fit(head, bits, width=HOME_LINE):
     bits = [b for b in (x.strip() for x in bits if x) if b and b not in ("—", "-")]
     while True:
         out = head + "".join(" · " + b for b in bits)
-        if not bits or len(out.replace("*", "").replace("_", "")) <= width:
+        if not bits or len(home_unlink(out).replace("*", "").replace("_", "")) <= width:   # a link is as wide as its label
             return out
         bits.pop()
+
+
+def home_link(text, url):
+    """`text` as a Slack link when the message it names is known, else the text itself: NEEDS YOU rows link the card,
+    thread or PR they wait on (owner, 2026-09-01: "very useful if these were links to the actual message/thread"), and a
+    row with no ts falls back to exactly the plain text it printed before."""
+    return f"<{url}|{text}>" if url else text
+
+
+def home_unlink(text):
+    """The width a line takes on the phone: `<url|label>` renders as `label`."""
+    return re.sub(r"<[^>|]*\|([^>]*)>", r"\1", str(text or ""))
 
 
 def _home_num(x):
@@ -1678,20 +1699,32 @@ def home_needs(st, names=None):
     tracks = list(st.get("tracks") or ())
     names = names or home_names(tracks)
     out = []
+    # EVERY ROW LINKS THE MESSAGE IT WAITS ON when the box knows one (owner, 2026-09-01): a thread row → its root's
+    # permalink (`link`, resolved once by the daemon and cached), a PR row → its #approvals card (`cards`), else the PR
+    # itself; a track that stopped to ask → the ❓ thread in its own channel, else its PR's card, else its PR. No ts
+    # known → the plain text it always printed. The link wraps the NAME, never the ask: home_ask clips text, and a
+    # clipped link is a broken one.
+    cards, thread = st.get("cards") or {}, {}
     for w in st.get("waits") or ():
         age = _home_num(w.get("age"))
-        out.append((0, -age, f"❓ *#{w.get('ch', '?')}* · {home_age(age)} · {home_ask(w.get('ask'))}"))
+        if w.get("link"):
+            thread.setdefault(str(w.get("ch") or ""), str(w["link"]))   # the oldest linked ❓ per channel
+        out.append((0, -age, f"❓ *{home_link('#' + str(w.get('ch', '?')), w.get('link'))}* · {home_age(age)} · {home_ask(w.get('ask'))}"))
+    def pr_link(pr):
+        return cards.get(f"{pr.get('repo', '')}#{pr.get('num', '')}") or pr.get("url") or ""
     for t in tracks:
         pr = t.get("pr") or {}
         if pr.get("num") and pr.get("owed") and t.get("state") in ("review", "done"):
-            out.append((1, 0.0, f"❓ *PR #{pr['num']}*" + (f" {pr['repo']}" if pr.get("repo") else "") + " · awaiting review"))
+            out.append((1, 0.0, f"❓ *{home_link('PR #' + str(pr['num']), pr_link(pr))}*"
+                        + (f" {pr['repo']}" if pr.get("repo") else "") + " · awaiting review"))
     for t in tracks:
         # `waiting` FIRST, then `blocked`: both carry the worker's own question, and the one that stopped to ask
         # outranks the one that merely stopped. A track with no reason is on neither list — the board's word alone
         # has never put a row here, and a session waiting on the CLOCK (a usage limit) is not waiting on him at all.
         if t.get("state") in ("waiting", "blocked") and t.get("reason"):
+            url = thread.get(str(t.get("name") or "").replace("/", "--")) or pr_link(t.get("pr") or {})
             out.append((2 if t.get("state") == "waiting" else 3, 0.0,
-                        f"{HOME_STATE[t['state']][0]} *{names.get(t.get('name'), home_short(t.get('name')))}* · "
+                        f"{HOME_STATE[t['state']][0]} *{home_link(names.get(t.get('name'), home_short(t.get('name'))), url)}* · "
                         f"{home_ask(t.get('reason') or 'blocked')}"))   # the reason is an ask like any other: one line
     for s in st.get("sessions") or ():
         # a SESSION (board kind=session) is never a track and never RUNNING, but the question it declared is the
@@ -1784,7 +1817,9 @@ def home_parts(st):
     rows = [f"🔴 *{n} down*" + (f" · {h}" if h else "") for n, ok, h in units if not ok]
     if limit:
         rows.append(f"⛔ *Usage limit* · no runs until {until}")
-    rows += [home_fit(f"🏃 *{names.get(t.get('name'), '?')}*", (t.get("detail") or "").split(" · ")) for t in run]
+    rows += [home_fit(f"🏃 *{names.get(t.get('name'), '?')}*",           # the row's `PR #n` bit opens the PR (2026-09-01)
+                      [home_link(b, (t.get("pr") or {}).get("url")) if b == f"PR #{(t.get('pr') or {}).get('num')}" else b
+                       for b in (t.get("detail") or "").split(" · ")]) for t in run]
     rows += [home_fit(f"🔧 *{q.get('repo', '?')}*", [q.get("text", ""), f"since {q.get('when', '')}"])
              for q in quick]                                    # work a session did without a track: running, no board row
     if not rows:                                             # nothing runs AND nothing is wrong: say so in words, never
@@ -2243,6 +2278,7 @@ class Daemon:
         self.flags = load_flags()                            # "<chat>:<root_ts>" -> ts of the owner's 🏁; a newer message un-flags it (V3)
         self.alarms = {}                                    # chat -> when a status changes on its own (30 min stall / 48 h expiry)
         self.snap = {}                                      # chat -> (t, buckets): reconcile's snapshot, reused by the nudge cycle
+        self.home_links, self.home_cards = {}, {}           # "<chat>:<ts>" -> (permalink, when) · "repo#n" -> its #approvals card's permalink
         self.legacy_cleaned = set()                         # chats where the old pinned 📋 board message has been deleted (once)
         self.edit_seen = collections.OrderedDict()          # (chat, ts, subtype) already handled — dedupes duplicate edit/delete events
         self.warned, self.told = set(), {}
@@ -4276,10 +4312,22 @@ class Daemon:
         return ex.submit(self._safe, self.on_event, ev)
 
     # -- App Home dashboard -------------------------------------------------------
+    def home_link(self, chat, ts):
+        """The permalink of one message, asked of Slack ONCE per message and kept for the daemon's life (a failure is
+        retried after HOME_SLOW s). The tab republishes every 5 s and every ❓ row carries one of these, so nothing here
+        may cost a call twice. Returns "" when Slack is off or the call failed — the row then prints plain text."""
+        key = f"{chat}:{ts}"
+        url, at = self.home_links.get(key, ("", 0.0))
+        if not url and (time.time() - at > HOME_SLOW or not at) and chat and ts and self.cfg.get("SLACK_BOT_TOKEN"):
+            url = self.permalink(chat, ts)
+            self.home_links[key] = (url, time.time())
+        return url
+
     def home_state(self):
         """What the dashboard shows. Everything here is free (daemon memory, tmux, the filesystem) except the channel list
         and the PR states, which a background thread refreshes every HOME_SLOW s — a slow `gh` can never stall the loop.
-        Thread marks come from reconcile's cached snapshot: the dashboard adds no Slack history reads of its own."""
+        Thread marks come from reconcile's cached snapshot: the dashboard adds no Slack history reads of its own (a ❓
+        root's permalink is the one exception, and home_link asks for it once)."""
         if time.time() - self.home_slow_at > HOME_SLOW and not self.home_slow_busy:
             self.home_slow_busy = True
             threading.Thread(target=self._safe, args=(self.home_slow_refresh,), daemon=True).start()
@@ -4290,7 +4338,7 @@ class Daemon:
         waits, now = [], time.time()
         known = self.home_chans or sorted((c, self.names.get(c, c)) for c in     # before the first refresh: what we already know
                                           {c for c, _ in list(self.last_chat.values())} | set(self.board))
-        for chat, name, depth in home_chan_order(known, orchs):
+        for chat, name, depth in home_chan_order(known, orchs, hide=(self.chart_store,)):   # never the picture store
             self.names.setdefault(chat, name)              # route() resolves the name: we already have it, don't pay conversations.info
             target = self.route(chat, "im" if str(chat).startswith("D") else None)
             alias = (orchs.get(chat) or {}).get("alias")   # a sub-orch channel reports ITS orch, not the repo's main session
@@ -4303,8 +4351,9 @@ class Daemon:
             for _, root, last in (snap[1] if snap else ()):
                 if (pairs.get(root["ts"]) or (None,))[0] == "❓":   # the conversation slot: this thread is waiting on the OWNER.
                     waits.append({"ch": name, "age": now - float(last["ts"]),   # Its age and its ask come out of the same
-                                  "ask": last.get("text") or root.get("text") or ""})   # snapshot reconcile already holds —
-                                                                    # one writer per mark (#36), and no Slack read of our own.
+                                  "ask": last.get("text") or root.get("text") or "",   # snapshot reconcile already holds —
+                                  "chat": chat, "ts": root["ts"],                # one writer per mark (#36), and no Slack read of our own.
+                                  "link": self.home_link(chat, root["ts"])})     # …and its permalink, so the row can open it
             chans.append({"name": name, "depth": depth,
                           "session": ("🔧 working" if not alias and self.working.get(target) else "🟢 live" if live else
                                       "🟡 idle" if (f"{target}@{alias}" if alias else window_for(target)) in wins else "⚪ none") if target
@@ -4321,7 +4370,7 @@ class Daemon:
         # the clock and the box's vitals are read every time (they are file reads); everything that costs a process is cached
         return {"box": BOX, "now": time.strftime("%H:%MZ", time.gmtime()), "units": cached("units", HOME_CACHE, home_units),
                 "load": home_load(), "limit": cached("limit", HOME_CACHE, limit_now), "channels": chans,
-                "tracks": tracks, "last": last, "waits": waits, "sessions": sessions,
+                "tracks": tracks, "last": last, "waits": waits, "sessions": sessions, "cards": dict(self.home_cards),
                 "quick": cached("quick", HOME_CACHE, home_quick),
                 "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
                 "audit_at": audit_at, "audit": verdict, "boot": boot, "chart": self.chart}
@@ -4410,9 +4459,10 @@ class Daemon:
             tok = self.cfg.get("SLACK_BOT_TOKEN")
             if tok:
                 r = api("conversations.list", tok, types="public_channel,private_channel", exclude_archived="true", limit="200")
-                chans = sorted((c["id"], c["name"]) for c in r.get("channels", ()) if c.get("is_member"))
+                chans = sorted((c["id"], c["name"]) for c in r.get("channels", ()) if home_chan_keep(c))   # never the picture store
                 self.names.update(dict(chans))
                 self.home_chans = chans
+                self.home_cards = self.home_card_links(next((c for c, n in chans if n == APPROVALS), ""))
             want, prs = [], {}
             for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
                 try:
@@ -4432,6 +4482,22 @@ class Daemon:
             self.home_prs = prs
         finally:
             self.home_slow_at, self.home_slow_busy = time.time(), False
+
+    def home_card_links(self, cid):
+        """{"repo#n": permalink} for the #approvals cards whose PR a board still names — read from the channel itself
+        (it IS the card store: approval_card) once per slow refresh, one getPermalink per card ever (home_link). A read
+        that fails keeps what we had: a stale link beats a row that stopped linking."""
+        if not cid:
+            return self.home_cards
+        try:
+            out = {}
+            for repo, n, m in approval_cards(self.cfg, cid):
+                if f"{repo}#{n}" not in out:                   # newest card first: it is the one a 👍 lands on, and the
+                    out[f"{repo}#{n}"] = self.home_link(cid, m.get("ts"))   # duplicates cost no call
+            return out
+        except Exception as e:
+            log(f"home: #{APPROVALS} cards: {e!r}")
+            return self.home_cards
 
     def dm_user(self, user, text):
         """One line, privately, to whoever pressed a Home button — the App Home tab has no ephemeral surface of its own."""
@@ -7825,7 +7891,7 @@ def cmd_selfcheck():
     HREF = json.loads(r'''{"type": "home", "blocks": [
       {"type": "header", "text": {"type": "plain_text", "text": "abox · 07:58Z", "emoji": true}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "RUNNING 2 · BLOCKED 1 · QUEUED 10"}]},
-      {"type": "section", "text": {"type": "mrkdwn", "text": "🏃 *carpet-rectify* · 1 it · $9.05 · PR #3\n🏃 *slack-home* · 4 it · $2.40"}},
+      {"type": "section", "text": {"type": "mrkdwn", "text": "🏃 *carpet-rectify* · 1 it · $9.05 · <https://github.com/sandbox/carpet/pull/3|PR #3>\n🏃 *slack-home* · 4 it · $2.40"}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "NEEDS YOU · 3"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "❓ *#abox* · 12m · pick a branch name\n❓ *#sandbox* · 3m · confirm delete\n⛔ *subproj-carpet* · no GH token"}},
       {"type": "actions", "elements": [
@@ -9444,6 +9510,69 @@ def cmd_selfcheck():
           and ar_calls == [("reactions.remove", "large_orange_circle"), ("reactions.add", "red_circle"),
                            ("reactions.add", "white_check_mark"), ("reactions.add", "red_circle"), ("reactions.remove", "red_circle")]
           and "channel_not_found" in buf_bad.getvalue())
+
+    # -- Home: NEEDS YOU rows link the message they wait on; the tab never lists the picture store (owner, 2026-09-01) --
+    lURL, lCARD, lTHR = "https://s.slack.com/archives/C1/p1", "https://s.slack.com/archives/CAPP/p7", "https://s.slack.com/archives/CT/p3"
+    lw = {"ch": "abox", "age": 720, "ask": "pick a branch name? cc-fix or fix/cc, either is fine"}
+    check("home: a ❓ thread row with a cached permalink links its channel name; the same row with no ts is the plain text "
+          "it always was (the ask is never inside the link: home_ask clips it)",
+          home_needs({"waits": [dict(lw, link=lURL)]}) == [f"❓ *<{lURL}|#abox>* · 12m · pick a branch name"]
+          and home_needs({"waits": [lw]}) == ["❓ *#abox* · 12m · pick a branch name"]
+          and home_needs({"waits": [dict(lw, link="", chat="C1", ts="1")]}) == ["❓ *#abox* · 12m · pick a branch name"])
+    lpr = {"num": "9", "repo": "r", "url": "https://github.com/r/r/pull/9", "owed": True}
+    check("home: a PR owed a 👍 links its #approvals card when the card is known, else the PR itself, else stays plain",
+          home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": lpr}], "cards": {"r#9": lCARD}}) == [f"❓ *<{lCARD}|PR #9>* r · awaiting review"]
+          and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": lpr}]}) == [f"❓ *<{lpr['url']}|PR #9>* r · awaiting review"]
+          and home_needs({"tracks": [{"state": "review", "name": "r/t", "pr": dict(lpr, url="")}]}) == ["❓ *PR #9* r · awaiting review"])
+    ltr = {"state": "waiting", "name": "r/t", "reason": "owner 👍 on the #approvals card for PR #9", "pr": lpr}
+    lrows = home_needs({"tracks": [ltr], "waits": [{"ch": "r--t", "age": 60, "ask": "may I?", "link": lTHR}], "cards": {"r#9": lCARD}})
+    check("home: a track that stopped to ask links the ❓ thread in its own channel first, else its PR's #approvals card, "
+          "else its PR, else plain — the screenshot row '❓ g0-run-refresh · owner 👍 on the #approvals…' opens the card",
+          lrows[1].startswith(f"❓ *<{lTHR}|t>* · owner 👍 on the #approvals") and lrows[0].startswith(f"❓ *<{lTHR}|#r--t>* · 1m")
+          and home_needs({"tracks": [ltr], "cards": {"r#9": lCARD}})[0].startswith(f"❓ *<{lCARD}|t>* · owner 👍")
+          and home_needs({"tracks": [ltr]})[0].startswith(f"❓ *<{lpr['url']}|t>* · owner 👍")
+          and home_needs({"tracks": [dict(ltr, pr=None)]})[0].startswith("❓ *t* · owner 👍")
+          and home_needs({"tracks": [dict(ltr, state="blocked", pr=None)]})[0].startswith("⛔ *t* · owner 👍"))
+    lrun = lambda url: next(b["text"]["text"] for b in home_blocks({"box": "b", "now": "1", "tracks": [
+        {"state": "running", "name": "a/b", "detail": "1 it · $0.50 · PR #3", "pr": {"num": "3", "repo": "a", "url": url}}]})
+        if b["type"] == "section")
+    check("home: a running track's `PR #n` bit is a link to the PR when the board knows its url, plain when it does not, "
+          "and home_fit measures a link by its label so the bit still fits the phone line (the golden tab above asserts it too)",
+          lrun("https://github.com/a/a/pull/3") == "🏃 *b* · 1 it · $0.50 · <https://github.com/a/a/pull/3|PR #3>"
+          and lrun("") == "🏃 *b* · 1 it · $0.50 · PR #3"
+          and home_fit("🏃 *t*", ["3 it", "$1.20", f"<{lpr['url']}|PR #9>"]) == f"🏃 *t* · 3 it · $1.20 · <{lpr['url']}|PR #9>"
+          and home_unlink(f"a <{lURL}|b> c") == "a b c")
+    import types as _types
+    lcalls = []
+    lstub = _types.SimpleNamespace(home_links={}, home_cards={"old#1": "x"}, cfg={"SLACK_BOT_TOKEN": "xoxb-selfcheck"},
+                                   permalink=lambda c, t: lcalls.append((c, t)) or (lURL if c == "C1" else ""))
+    lstub.home_link = lambda c, t: Daemon.home_link(lstub, c, t)
+    l1, l2, l3 = Daemon.home_link(lstub, "C1", "1"), Daemon.home_link(lstub, "C1", "1"), Daemon.home_link(lstub, "C2", "2")
+    l4 = Daemon.home_link(lstub, "C2", "2")
+    real_cards_fn = approval_cards
+    globals()["approval_cards"] = lambda cfg, cid: [("r", "9", {"ts": "7"}), ("r", "9", {"ts": "6"}), ("q", "2", {"ts": "5"})]
+    lcards = Daemon.home_card_links(lstub, "C1")
+    globals()["approval_cards"] = lambda cfg, cid: (_ for _ in ()).throw(RuntimeError("down"))
+    lkept, lnone = Daemon.home_card_links(lstub, "C1"), Daemon.home_card_links(lstub, "")
+    globals()["approval_cards"] = real_cards_fn
+    check("home: a permalink is asked of Slack once per message and remembered; a failure is remembered too (retried "
+          "after HOME_SLOW, not every 5 s); the #approvals read indexes the NEWEST card per PR and a read that fails "
+          "keeps the last index",
+          (l1, l2, l3, l4) == (lURL, lURL, "", "") and lcalls[:2] == [("C1", "1"), ("C2", "2")]
+          and lcards == {"r#9": lURL, "q#2": lURL} and lkept == {"old#1": "x"} and lnone == {"old#1": "x"}
+          and len(lcalls) == 4)
+    check("home: the channel list never shows VITALS_STORE or a channel whose only member is the bot — by name and id in "
+          "home_chan_order, by member count at the slow refresh; a missing count keeps the channel",
+          home_chan_order([("C1", "abox"), ("CV", VITALS_STORE), ("CX", "solo")], {}, hide=("CX",)) == [("C1", "abox", 0)]
+          and home_chan_order([("CV", VITALS_STORE), ("C1", "abox")], {}) == [("C1", "abox", 0)]
+          and home_chan_order([("C1", "abox")], {}, hide=("",)) == [("C1", "abox", 0)]
+          and [home_chan_keep(c) for c in ({"is_member": True, "name": "abox"}, {"is_member": True, "name": "x", "num_members": 1},
+                                           {"is_member": True, "name": VITALS_STORE, "num_members": 5},
+                                           {"is_member": False, "name": "y", "num_members": 3}, {"is_member": True, "name": "z", "num_members": 2})]
+              == [True, False, False, False, True]
+          and VITALS_STORE not in json.dumps(home_blocks({"box": "b", "now": "1", "channels": [
+              {"name": n, "depth": d, "session": "⚪ none", "marks": {}} for _, n, d in
+              home_chan_order([("C1", "abox"), ("CV", VITALS_STORE)], {})]}), ensure_ascii=False))
 
 
     check("selfcheck: the channel-is-a-session checks never touched the ~/dev they were handed",
