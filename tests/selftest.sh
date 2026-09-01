@@ -290,6 +290,25 @@ miss=""; for probe in 'Bash|{"command":"cat >> notes.md <<E\nthe owner decides: 
              'Bash|{"command":"git commit -F - <<E\nfix: stop cc-land running twice\nE"}'; do
   [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "...but prose that merely NAMES a gated command is written, not refused (brief, journal, commit message)" || bad "guard reads prose as a command:$miss"
+# 5. THE WORKTREE IS THE ONLY TREE A TRACK WRITES (2026-09-01: main's cc-handoff and cc-scope overwritten through a symlink farm into ~/dev/<repo>/core/bin)
+ln -s ~/dev/$REPO/r.md "/tmp/cc-selftest-$RUN-lnk"; mkdir -p "$T/farm"; ln -s ~/dev/$REPO/r.md "$T/farm/r.md"   # a /tmp symlink and a scratch "bin" that both point INTO the box's tree
+miss=""; for probe in "Write|{\"file_path\":\"$HOME/dev/$REPO/r.md\"}" "Edit|{\"file_path\":\"$HOME/bin/cc-guard\"}" "Write|{\"file_path\":\"/tmp/cc-selftest-$RUN-lnk\"}" \
+  "Write|{\"file_path\":\"$HOME/.cc/state/$REPO/w2/task.md\"}" "Bash|{\"command\":\"echo x > ~/dev/$REPO/r.md\"}" "Bash|{\"command\":\"cp core/bin/cc-guard ~/bin/cc-guard\"}" \
+  "Bash|{\"command\":\"cat x | tee -a \$HOME/dev/$REPO/r.md\"}" "Bash|{\"command\":\"install -m 755 x $HOME/bin/x\"}" "Bash|{\"command\":\"cp x $T/farm/r.md\"}" \
+  "Bash|{\"command\":\"sed -i s/a/b/ ~/dev/$REPO/r.md\"}" "Bash|{\"command\":\"git -C ~/dev/$REPO checkout track/w1 -- r.md\"}" "Bash|{\"command\":\"ln -sf $wt/a.txt ~/bin/a\"}" \
+  "Bash|{\"command\":\"cat x|tee -a ~/bin/y\"}" "Bash|{\"command\":\"echo d;cp x ~/bin/y\"}" "Bash|{\"command\":\"(cp x ~/bin/y)\"}" "Bash|{\"command\":\"foo;git -C ~/dev/$REPO checkout .\"}"; do
+  [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 2 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "a worker writes nothing into ~/dev/<repo> or ~/bin — by tool, redirect, cp/tee/install/sed -i/ln/git -C, through a /tmp or scratch symlink that resolves there, unspaced after ;|( too, or into another track's state" || bad "worker write fence misses:$miss"
+miss=""; for probe in "Write|{\"file_path\":\"$wt/notes.md\"}" "Write|{\"file_path\":\"/tmp/cc-selftest-$RUN.txt\"}" "Write|{\"file_path\":\"$HOME/.cc/state/$REPO/w1/progress.md\"}" \
+  "Bash|{\"command\":\"echo x > /tmp/cc-selftest-$RUN.txt\"}" "Bash|{\"command\":\"cat >> ~/.cc/state/$REPO/w1/progress.md <<E\\ndone\\nE\"}" "Bash|{\"command\":\"cp ~/dev/$REPO/r.md .\"}" \
+  "Bash|{\"command\":\"git -C ~/dev/$REPO log -1\"}" "Bash|{\"command\":\"git commit -m \\\"no cp into ~/bin\\\"\"}" "Bash|{\"command\":\"echo x > out.txt 2>&1\"}"; do
+  [ "$(g "${probe%%|*}" "${probe#*|}" "$wt")" = 0 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && ok "...and no wider: its worktree, /tmp, its own state dir, a READ from ~/dev, a git log there, and prose naming the verbs all pass" || bad "worker write fence over-blocks:$miss"
+slug=$(printf '%s' "$wt" | tr '/.' '--')   # a worker that cd'd into ~/dev/<repo>: no marker under its cwd, so the transcript path (the dir it started in) anchors the fence
+c(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s","transcript_path":"%s"}' "$1" "$2" "$3" "$HOME/.claude/projects/$slug/s.jsonl" | CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+[ "$(c Write "{\"file_path\":\"$HOME/dev/$REPO/r.md\"}" "$HOME/dev/$REPO")" = 2 ] && [ "$(c Bash '{"command":"echo x > r.md"}' "$HOME/dev/$REPO")" = 2 ] && [ "$(c Write "{\"file_path\":\"$wt/x.md\"}" "$HOME/dev/$REPO")" = 0 ] \
+  && ok "a worker that cd'd into ~/dev/<repo> is still fenced to its worktree — the transcript path says where it started" || bad "a cd'd worker is fenced by its cwd"
+rm -f "/tmp/cc-selftest-$RUN-lnk"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
 # member-facing: the .cc/member-facing marker alone (NO CC_ROLE — the env is a convenience) = every worker gate plus spend/leak/wiring
 # A MEMBER DENY NOW SPEAKS (see below), so every member probe runs against a STUB HOME: a fake ~/bin/cc-slack and
@@ -342,6 +361,9 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t
              'Bash|{"command":"git log --oneline -5"}' "Read|{\"file_path\":\"$mf/note.md\"}" "Edit|{\"file_path\":\"$mf/note.md\"}"; do
   [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "member-facing session still reads, edits in place and escalates with cc-notify" || bad "member gate over-blocks:$miss"
+miss=""; for probe in "Write|{\"file_path\":\"$GH/dev/other/x.md\"}" "Bash|{\"command\":\"cp x $GH/bin/cc-guard\"}" "Bash|{\"command\":\"echo x > ~/dev/other/x.md\"}"; do
+  [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 2 ] || miss="$miss ${probe#*|}"; done
+[ -z "$miss" ] && [ "$(m Bash "{\"command\":\"echo hi > $mf/notes.md\"}" "$mf")" = 0 ] && ok "a member is fenced the same way: ~/dev/<other> and ~/bin refused, its own dir not" || bad "member write fence:$miss"
 # The probes above hand payloads STRAIGHT to cc-guard. Live, Claude Code runs the hook only for tools the PreToolUse
 # MATCHER names — and Read|NotebookRead|Grep|Glob had a deny branch for days that no call ever reached, because the
 # matcher stopped at NotebookEdit (audit 2026-09-01 F1). So: every tool cc-guard has a case branch for must be in the

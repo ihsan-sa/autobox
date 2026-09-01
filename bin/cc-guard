@@ -53,32 +53,42 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
-role="${CC_ROLE:-}"; mdir=""; mws=""
+role="${CC_ROLE:-}"; mdir=""; mws=""; root=""; trepo=""; ttrack=""   # $root: the ONE tree this session writes (rule 5 below)
+track_dir(){   # $1 holds a .cc/track marker: rc 0 = a real track worktree, and role/root/repo/track are set from its PATH
+  # A TRACK WORKTREE LIVES UNDER ~/.cc/worktrees/<repo>/<track> — `cc` makes them nowhere else — and ONLY THERE does
+  # .cc/track mean anything. Anywhere else it is a file somebody wrote, and the walk goes on past it to whatever
+  # marker sits above: honouring one in ~/dev/<h>/sub set role=worker there and handed that member the worker
+  # tier — the box's config and another repo's dispatch (review 2, C).
+  # A TRACK OF A MEMBER WORKSPACE IS STILL THAT MEMBER'S WORLD. The worktree lives under ~/.cc/worktrees, so its
+  # own marker says "worker" and would PROMOTE a member's worker out of the member tier — the one thing the
+  # workspace rule below must not allow. The rule follows the repo, not the worktree.
+  # WHICH repo comes from the worktree's PATH ($HOME/.cc/worktrees/<repo>/<track>), not from .cc/track: that
+  # file is inside the tree the worker may edit, so its first line is a claim, not an identity.
+  local r t
+  case "$1" in "$HOME"/.cc/worktrees/*/*) r=${1#"$HOME"/.cc/worktrees/}; t=${r#*/}; t=${t%%/*}; r=${r%%/*};; *) return 1;; esac
+  case "$r$t" in *[!A-Za-z0-9._-]*) r=""; t="";; esac
+  root=$1; trepo=$r; ttrack=$t
+  if [ -n "$r" ] && [ -f "$HOME/dev/$r/.cc/member-workspace" ]; then role=member; mdir="$HOME/dev/$r"; mws="$r"
+  else [ "$role" = member ] || role=worker; fi
+}
 d="$cwd"                         # walk up for a marker — one stat per level, no config to parse. A marker only makes the
 while [ -n "$d" ] && [ "$d" != / ]; do   # gates STRICTER (member wins over an inherited CC_ROLE=worker) and never clears the env role.
-  if [ -f "$d/.cc/member-facing" ]; then role=member; mdir="$d"
+  if [ -f "$d/.cc/member-facing" ]; then role=member; mdir="$d"; root="$d"
     # A MEMBER WORKSPACE root: see below. Its handle is the DIRECTORY NAME — ~/dev/<handle>, nothing else — and
     # never the marker's contents: every file under this dir is the member's own to edit, so a handle read out of
     # one is a handle the session can rewrite (one line naming the box's repo would hand it that repo's authority).
     [ -f "$d/.cc/member-workspace" ] && [ "$d" = "$HOME/dev/${d##*/}" ] && mws=${d##*/}
     break; fi   # a session anybody in Slack can talk to
-  if [ -f "$d/.cc/track" ]; then
-    # A TRACK WORKTREE LIVES UNDER ~/.cc/worktrees/<repo>/<track> — `cc` makes them nowhere else — and ONLY THERE does
-    # .cc/track mean anything. Anywhere else it is a file somebody wrote, and the walk goes on past it to whatever
-    # marker sits above: honouring one in ~/dev/<h>/sub set role=worker there and handed that member the worker
-    # tier — the box's config and another repo's dispatch (review 2, C).
-    # A TRACK OF A MEMBER WORKSPACE IS STILL THAT MEMBER'S WORLD. The worktree lives under ~/.cc/worktrees, so its
-    # own marker says "worker" and would PROMOTE a member's worker out of the member tier — the one thing the
-    # workspace rule below must not allow. The rule follows the repo, not the worktree.
-    # WHICH repo comes from the worktree's PATH ($HOME/.cc/worktrees/<repo>/<track>), not from .cc/track: that
-    # file is inside the tree the worker may edit, so its first line is a claim, not an identity.
-    r=""; case "$d" in "$HOME"/.cc/worktrees/*/*) r=${d#"$HOME"/.cc/worktrees/}; r=${r%%/*};; *) d=$(dirname "$d"); continue;; esac
-    case "$r" in *[!A-Za-z0-9._-]*) r="";; esac
-    if [ -n "$r" ] && [ -f "$HOME/dev/$r/.cc/member-workspace" ]; then
-      role=member; mdir="$HOME/dev/$r"; mws="$r"
-    else [ "$role" = member ] || role=worker; fi
-    break; fi
+  if [ -f "$d/.cc/track" ] && track_dir "$d"; then break; fi
   d=$(dirname "$d"); done
+# A WORKER THAT `cd`s OUT OF ITS WORKTREE walks past no marker at all, and was fenced by its cwd — by wherever it had
+# just gone. The transcript path names the dir the session STARTED in (Claude Code slugs it: / and . become -), and
+# that is the worktree whatever the cwd says now. Env-only role and no marker: match the slug against the worktrees.
+if [ -z "$root" ] && [ "$role" = worker ]; then
+  slug=$(jq -r '.transcript_path // ""' <<<"$inp"); slug=${slug%/*}; slug=${slug##*/}
+  if [ -n "$slug" ]; then for w in "$HOME"/.cc/worktrees/*/*; do s=${w//\//-}; s=${s//./-}
+    [ "$s" = "$slug" ] || continue; [ -f "$w/.cc/track" ] && track_dir "$w"; break; done; fi
+fi
 case "$mws" in *[!a-z0-9-]*) mws="";; esac   # the handle goes into a regex below: [a-z0-9-] or nothing at all
 # $mdir is the member-facing session dir, and its basename is its Slack channel: the refusal below is posted there.
 # An OVERLAPPING HANDOFF (cc-handoff): two sessions share this cwd, and exactly one of them is LIVE. The other
@@ -127,6 +137,8 @@ if [ -n "${CC_HANDOFF:-}" ] || [ -d "${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}"
 fi
 [ -n "$handoff_gated" ] && [ "$role" != member ] && role=worker   # the four owner gates below, at least
 case "$role" in worker|member) ;; *) exit 0;; esac
+[ -n "$root" ] || root=$cwd   # nothing to anchor on (an env-only role, a handoff-gated session): the cwd, as before
+in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && case "$1" in "$mdir"|"$mdir"/*) return 0;; esac; return 1; }
 # A REFUSAL IN A MEMBER-FACING CHANNEL IS AN ASK, NOT A DEAD END. This is the only place that knows a member's
 # request was stopped, and until now both halves ended here: the member saw nothing (one asked twice for images
 # this gate refused) and the owner was never told there was anything to approve. A gate that stops work without
@@ -254,6 +266,47 @@ case "$tool" in
     RD='(cat|tac|less|more|head|tail|nl|cut|grep|egrep|fgrep|rg|sed|awk|xxd|od|base64|strings|sort|uniq|jq|python[0-9.]* +-c|source|\.)'
     grep -qE "$AT$RD"' +[^;&|]*(ccbox/env|\.credentials\.json)($|[^A-Za-z0-9_.-])' <<<"$cmd" \
       && deny "reading the box's credentials (~/.claude/.credentials.json is the Claude account and its spend, ~/ccbox/env is a GitHub PAT and a deploy token)"
+    # 5. THE WORKTREE IS THE ONLY TREE A TRACK WRITES. ~/dev/<repo> is the checkout the box RUNS and ~/bin symlinks into
+    #    it, so a write there is an unreviewed change to a live binary. 2026-09-01: a review agent's `cp x $S/bin/y` landed
+    #    in the live checkout's core/bin because $S/bin was a symlink farm into it — so every target is REALPATH'd and judged by
+    #    where it LANDS, never by how it was spelled. Verbs with a destination: redirections; cp/mv/ln/install/rsync (the
+    #    last arg, or -t); tee and sed -i (every file); dd of=; and git -C <there> with a verb that writes. A variable or
+    #    a glob in the target cannot be resolved and passes: the same honest ceiling as every other line here.
+    hit=""
+    wtgt(){ local t=$1   # rc 0 = $1 lands in ~/dev/* or ~/bin, outside this session's own tree; $hit says where
+      # shellcheck disable=SC2088  # a literal ~ in a case pattern is the point: it is being expanded by hand
+      case "$t" in '~') t=$HOME;; '~/'*) t=$HOME/${t#\~/};; '$HOME'|'${HOME}') t=$HOME;; '$HOME/'*) t=$HOME/${t#\$HOME/};; '${HOME}/'*) t=$HOME/${t#\$\{HOME\}/};; esac
+      case "$t" in ''|-*|*['$`*?[']*) return 1;; /*) ;; *) t=$cwd/$t;; esac
+      t=$(realpath -m -- "$t" 2>/dev/null) || return 1
+      case "$t" in "$HOME"/dev/*|"$HOME"/bin|"$HOME"/bin/*) in_root "$t" && return 1; hit=$t; return 0;; esac; return 1; }
+    wdeny(){ deny "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs and ~/bin symlinks into it — a track writes its worktree, /tmp and its own ~/.cc/state dir, and the rest arrives as a PR"; }
+    while IFS= read -r t; do wtgt "$t" && wdeny; done < <(grep -oE '(&>>?|[0-9]*>>?[|]?)[[:space:]]*[^[:space:];&|<>()]+' <<<"$cmd" | sed -E 's/^[^[:space:]]*>[|]?[[:space:]]*//')
+    while IFS= read -r inv; do
+      [[ $inv =~ (^|[^A-Za-z0-9_.-])(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+(.*)$ ]] || continue
+      v=${BASH_REMATCH[2]}; read -r -a a <<<"${BASH_REMATCH[3]}"; dst=""; last=""; skip=""; files=(); n=0; ef=""
+      case "$v" in
+        cp|mv|ln|install|rsync) for x in "${a[@]}"; do
+            if [ -n "$skip" ]; then dst=$x; skip=""; continue; fi
+            case "$x" in -t|--target-directory) skip=1;; --target-directory=*) dst=${x#*=};; -*) ;; *) last=$x;; esac; done
+          files=("${dst:-$last}");;
+        tee) for x in "${a[@]}"; do case "$x" in -*) ;; *) files+=("$x");; esac; done;;
+        sed) case " ${a[*]} " in *" -i"*|*" --in-place"*) ;; *) continue;; esac   # without -i sed writes nothing
+          for x in "${a[@]}"; do case "$x" in -e|-f|--expression|--file) ef=1;; esac; done
+          for x in "${a[@]}"; do   # the script is the first bare arg unless -e/-f carried it; the rest are files
+            if [ -n "$skip" ]; then skip=""; continue; fi
+            case "$x" in -e|-f|--expression|--file) skip=1;; -*) ;; *) n=$((n+1)); { [ -n "$ef" ] || [ "$n" -gt 1 ]; } && files+=("$x");; esac; done;;
+        dd) for x in "${a[@]}"; do case "$x" in of=*) files+=("${x#of=}");; esac; done;;
+      esac
+      for x in "${files[@]}"; do wtgt "$x" && wdeny; done
+    done < <(grep -oE "$AT"'([^ ]*/)?(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+[^;&|]*' <<<"$cmd")
+    while IFS= read -r inv; do   # git -C ~/dev/<repo> checkout|apply|stash|… rewrites that tree as surely as cp does
+      [[ $inv =~ (^|[^A-Za-z0-9_.-])git[[:space:]]+(.*)$ ]] || continue; read -r -a a <<<"${BASH_REMATCH[2]}"; skip=""; dirs=(); verb=""
+      for x in "${a[@]}"; do
+        if [ -n "$skip" ]; then [ "$skip" = d ] && dirs+=("$x"); skip=""; continue; fi
+        case "$x" in -C) skip=d;; -c|--git-dir|--work-tree) skip=x;; -*) ;; *) verb=$x; break;; esac; done
+      case "$verb" in add|am|apply|checkout|cherry-pick|clean|commit|merge|mv|pull|rebase|reset|restore|revert|rm|stash|switch|worktree|submodule|update-ref|symbolic-ref)
+        for x in "${dirs[@]}"; do wtgt "$x" && wdeny; done;; esac
+    done < <(grep -oE "$AT"'([^ ]*/)?git[[:space:]]+-C[[:space:]]+[^;&|]*' <<<"$cmd")
     # 4. member-facing only: a member must not be able to make the box SPEND or LEAK. Be honest about the ceiling —
     #    a Bash blocklist is not a sandbox: it stops accidents and casual prompt-injection, not a determined attacker
     #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays
@@ -297,16 +350,17 @@ case "$tool" in
     else secret_all "$fp" && deny "reading the box's credentials ($fp)"; fi ;;
   Edit|Write|MultiEdit|NotebookEdit)
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
-    fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ traversal resolves before the match
-    case "$fp" in
-      "$cwd"/*|"$cwd") ;;                          # inside the worktree / the session's own dir: fine
+    fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ AND a symlink resolve before the match: ~/bin/x IS ~/dev/<repo>/core/bin/x, and so is a symlink farm in /tmp
+    if ! in_root "$fp"; then case "$fp" in    # inside the worktree (rule 5: the marker root, not the cwd) / the member's own dir: fine
       /tmp/*) ;;                                   # scratch: fine
-      "$HOME"/.cc/state/*)   # track state: workers, and a member workspace for the tracks that are its own
+      "$HOME"/.cc/state/*)   # track state: this track's own; a member workspace's for the tracks that are its own
         if [ "$role" = member ]; then
           own=""; [ -n "$mws" ] && case "$fp" in "$HOME/.cc/state/$mws"|"$HOME/.cc/state/$mws"/*) own=1;; esac
           [ -n "$own" ] || deny "writing another session's state ($fp) — a task.md there is work the box would run"
+        elif [ -n "$trepo" ]; then case "$fp" in "$HOME/.cc/state/$trepo/$ttrack"|"$HOME/.cc/state/$trepo/$ttrack"/*) ;;
+          *) deny "writing another track's state ($fp) — this track's is ~/.cc/state/$trepo/$ttrack";; esac
         fi;;
-      *) deny "editing outside this session's directory ($fp)";;
-    esac ;;
+      *) deny "editing outside this session's worktree ($fp) — a track writes its worktree, /tmp and its own ~/.cc/state dir";;
+    esac; fi ;;
 esac
 exit 0
