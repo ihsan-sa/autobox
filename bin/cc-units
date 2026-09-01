@@ -46,7 +46,10 @@ check(){
     esac
     if [ "$re" = rearm ]; then   # armed, not merely active: a changed OnCalendar reloaded but not restarted sits at `Trigger: n/a`
       trig=$(sc list-timers --all --no-pager "$u" | awk 'NR==2{print $1}')
-      case "$trig" in ""|"n/a"|"-") bad="$bad $u=not-armed" ;; esac
+      case "$trig" in ""|"n/a"|"-")
+        # no NEXT while the timer's own service runs — it is computed after the run (the 03:30 audit failed its own timer, 2026-09-01)
+        case "$(sc is-active "${u%.timer}.service")" in active|activating) ;; *) bad="$bad $u=not-armed" ;; esac ;;
+      esac
     fi
   done < <(rows)
   if [ -n "$bad" ]; then echo "user units —$bad"; return 1; fi
@@ -76,6 +79,7 @@ selfcheck(){
   local n=0 f=0 u en st he re out
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a check that PRINTS (jq -e) must not leak into the verdict
+  nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }  # …and one that must NOT hold
   k "$(t jq -e . "$M")" "manifest is valid json"
   k "$(t test "$(rows | wc -l)" -gt 0)" "manifest has rows"
   # every declared unit exists, and every unit file is declared: adding a file without a row must FAIL, loudly
@@ -117,6 +121,13 @@ selfcheck(){
   # an unlinked unit is a fault even for a `timer` row, which every other test skips
   out=$(CC_UNITS_LINKDIR="$UD/no-such-link-dir" check 2>&1)   # a path that cannot exist: no temp dir to leak
   k "$(t grep -q 'cc-digest.service=unlinked' <<<"$out")" "an unlinked timer-driven .service is reported, not skipped"
+  # a timer whose own service is running shows NEXT '-' until the run ends: armed, not a fault (the 03:30 monthly audit
+  # reported cc-audit.timer=not-armed — itself, mid-run, 2026-09-01). sc is a function, so a subshell fakes systemd.
+  fake(){ local svc="$1"; shift; case "$1" in list-timers) ;; is-active) case "$2" in cc-audit.service) echo "$svc";; *) echo active;; esac;; is-failed) echo active;; *) echo enabled;; esac; }
+  out=$( sc(){ fake activating "$@"; }; CC_UNITS_LINKDIR="$UD" check 2>&1 )
+  k "$(nt grep -q 'cc-audit.timer=not-armed' <<<"$out")" "a timer with no NEXT whose service is running is armed, not a fault"
+  out=$( sc(){ fake inactive "$@"; }; CC_UNITS_LINKDIR="$UD" check 2>&1 )
+  k "$(t grep -q 'cc-audit.timer=not-armed' <<<"$out")" "…and with its service idle it is not-armed, as before"
   # a unit the installer enables must have somewhere to be enabled FROM
   out=""; while IFS=$'\t' read -r u en st he re; do
     [ "$en" = required ] || continue
