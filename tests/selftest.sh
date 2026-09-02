@@ -18,11 +18,24 @@ exec </dev/null; unset CC_ROLE CC_HANDOFF CLAUDECODE "${!CLAUDE_@}"   # never in
 B="$(cd "$(dirname "$0")/../bin" && pwd)"
 SELF="$(readlink -f "$0")"
 # ── one run at a time ────────────────────────────────────────────────────────────────────────────────────────
-# $RUN namespaces everything this suite OWNS; it cannot namespace what the box only has one of — the live `main`
-# tmux server, ~/.claude.json, the cc-model dialog panes. Two suites at once fight over those, and on 2026-08-31/
-# 09-01 that cost three land cycles: red runs that were green alone. A false red is worse than a slow one — it can
-# false-open the main-gate row — so overlapping runs QUEUE here rather than race. Wait, never fail: the second run
-# is not wrong, it is early.
+# $RUN namespaces everything this suite OWNS; it cannot namespace what the box only has one of. Overlapping runs
+# QUEUE here rather than race — wait, never fail: the second run is not wrong, it is early. A false red is worse
+# than a slow one (it can false-open the main-gate row), and on 2026-08-31/09-01 overlap cost three land cycles:
+# red runs that were green alone.
+#
+# MEASURED 2026-09-02, because this lock is expensive — a landing gates several queued PRs at once and every one of
+# those gate runs queues HERE, so a four-deep queue is ~20 min of wall clock per lane, on every repair round. Four
+# copies of this suite, from four separate trees, each given a lock of its own: 441 s for the slowest of the four
+# against 426 s for one alone. The box has the CPU; the lock costs the queue and buys back one thing:
+#   cc-reconcile's selfcheck runs its end-to-end block under a HOME of its own, but under a repo name that is a
+#   CONSTANT (`selfcheckrepo`, PR 9), and one of its fixtures is a real 60 s `cc-land selfcheckrepo 9` process.
+#   cc-reconcile reads the BOX-WIDE process table to see who is already landing what, so a second run sees the
+#   first run's lander and suppresses the offer it is asserting. 1 red in 6 concurrent runs; 3/3 green in sequence
+#   and 3/3 green under six CPU burners with no overlap — interference, not slowness.
+# The three reasons this lock was written for have all gone: the model dialog has its own tmux server (MT below),
+# the ~/.claude.json rewrite takes a lock and filters to $REPO, and nothing here writes any other global path.
+# Pin that fixture's repo name per process and the lock has nothing left to hold. That one line is in cc-reconcile,
+# which PR #190 has open, so it was not made here — until it is, this lock stays.
 LOCKF="${CC_SELFTEST_LOCK:-$HOME/.cc/selftest.lock}"; mkdir -p "$(dirname "$LOCKF")"
 if [ -z "${CC_SELFTEST_HELD:-}" ]; then
   exec {LK}>>"$LOCKF"   # >> and never >: a waiter that truncated the file would wipe the pid it is about to read
