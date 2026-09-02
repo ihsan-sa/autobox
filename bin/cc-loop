@@ -19,6 +19,9 @@
 # Task text:  ~/.cc/state/<repo>/<track>/task.md      (written by `cc <repo> <track> --go "..."` or by hand)
 # Journal:    ~/.cc/state/<repo>/<track>/progress.md  (worker appends; a fresh iteration reads it)
 # Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch).
+# Self-review: templates/self-review.md — the six kinds of finding the landing review keeps stopping PRs for. The worker
+#             prompt carries it verbatim (selfrev_block, inlined because a sandboxed worker has core/bin bound and not
+#             core/templates), and the worker reads its own `git diff origin/<base>` against it before STATUS: DONE.
 # A REFUSAL OR A REROUTE IS NEVER SILENTLY RETRIED. When cc-model classifies the run as `refusal` — the classifier
 # stopped the turn, or a model that is withdrawn or suspended answered as a different one — the same model asked
 # again gives the same answer, so the loop moves to the next model on the cc-model chain (`cc-model next`; the order
@@ -78,6 +81,15 @@ refusal_next(){   # $1 run json · $2 its stderr · $3 the model asked for → "
   nx=$("$BIN/cc-model" next "${3:-}" 2>/dev/null) || nx=""
   [ -n "$nx" ] || { printf '\t%s\n' "$why"; return 2; }
   printf '%s\t%s\n' "$nx" "$why"; return 0; }
+CHECKLIST="$(dirname "$BIN")/templates/self-review.md"   # the six recurring stops live in ONE place, and this is it
+selfrev_block(){   # $1 the base branch → the self-review paragraph the worker prompt carries, or NOTHING if the
+                   # checklist is missing. The worker reads the diff against it before STATUS: DONE, so the review
+                   # stops fewer PRs for what the worker could have seen itself. It is inlined rather than linked
+                   # because a sandboxed worker (cc-sandbox) has core/bin bound and no core/templates, and a prompt
+                   # that points at a path the worker cannot open is worse than one that says nothing.
+  [ -r "$CHECKLIST" ] || return 0
+  printf " Before you append 'STATUS: DONE', re-read \`git diff origin/%s\` against the LANDING SELF-REVIEW below and fix what it finds — it is templates/self-review.md, so an entry that is wrong is fixed THERE, not in this copy.\n\n%s\n" \
+    "$1" "$(cat "$CHECKLIST")"; }
 selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the model it moves to, what it does with
                # an iteration that was rerouted but still worked (F4), and the line it journals.
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
@@ -112,6 +124,19 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   grep -q "iteration 5 .*the loop stopped (exit 10)" "$d/progress.md"; t 'the stop line says it stopped' "$?" 0
   grep -q "iteration 5 .*reran it" "$d/progress.md"; t 'and never claims it reran' "$?" 1
   grep -qE '^STATUS' "$d/progress.md"; t 'no journal line is a STATUS line' "$?" 1
+  # the self-review block the worker prompt carries: KEPT when the checklist is there, SUPPRESSED when it is not,
+  # each on a fixture of its own — a prompt that names a checklist the worker cannot read is the thing to avoid.
+  local realcl="$CHECKLIST" blk
+  mkdir -p "$d/present"; printf '# Landing self-review\n\n1. **The contract says what the code now does.**\n' > "$d/present/self-review.md"
+  CHECKLIST="$d/present/self-review.md"; blk=$(selfrev_block trunk)
+  grep -q 'templates/self-review.md' <<<"$blk";               t 'the prompt names the checklist' "$?" 0
+  grep -q 'git diff origin/trunk' <<<"$blk";                  t 'and the base branch it is read against' "$?" 0
+  grep -q 'The contract says what the code now does' <<<"$blk"; t 'and carries the checklist itself, not a link a sandboxed worker cannot open' "$?" 0
+  CHECKLIST="$d/absent/self-review.md"   # a fresh path this selfcheck never created — not the fixture above, emptied
+  [ -z "$(selfrev_block trunk)" ];                            t 'no checklist file: the prompt promises nothing' "$?" 0
+  CHECKLIST="$realcl"
+  [ -r "$CHECKLIST" ];                                        t 'the shipped checklist is where the prompt says it is' "$?" 0
+  grep -q '^6\. ' "$CHECKLIST" 2>/dev/null;                    t 'and still carries all six entries' "$?" 0
   sed 's/^/  journal fixture | /' "$d/progress.md"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -152,7 +177,7 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}"   # every non-zer
   "$BOARD" status "$repo" "$track" "$st" >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
   log "exit $code: $msg"; "$BIN/cc-notify" -p high -t "$repo/$track $title" "$msg"; exit "$code"; }
 base=$(git -C "$HOME/dev/$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); base="${base:-main}"
-SP="You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$base' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Be concise in the journal."
+SP="You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$base' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Be concise in the journal.$(selfrev_block "$base")"
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
 i=0; errs=0; caps=0; spent=0; limited=0   # limited: the owner has already been told about THIS limit episode
 barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway rule's memory: this track measured against itself
