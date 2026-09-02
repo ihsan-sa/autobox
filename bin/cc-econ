@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+"""cc-econ — what an accepted PR COST, end to end, so a model or harness change is judged on dollars per accepted
+PR instead of dollars per turn.
+
+WHY. Dollars per turn is the number that misleads. PR #184 cut ~21% of the context a worker turn carries and the
+live A/B still cost 41% MORE, because clearing moved the prompt-cache boundary. Its knob stays off "until a week of
+cc-loop context-report on real tracks settles it, on dollars per accepted PR" — nothing could compute that figure.
+This does. An accepted PR is worth what it cost to get ACCEPTED: the worker's own loops, the fix rounds a review
+sent it back for, and the reviews themselves.
+
+THE POPULATION TRAP, which has cost this box two wrong conclusions. The ledger sees every claude process on the
+box, including interactive sessions; runs/*.json sees only headless worker loops. Summing one and comparing it to
+the other reads as a 24x bug that is not there. So every column here NAMES its population, and `pr` will not print
+a total without cross-checking the worker column against the workers' own run files first.
+
+  worker $, fix $   the loop's own run files (~/.cc/state/<repo>/<track>/runs/*.json), ONE RECORD PER ITERATION,
+                    each carrying Claude Code's own total_cost_usd. Population: headless worker loops, nothing
+                    else. A PR is worth what its track spent on IT, not what the last iteration did. The split is
+                    at the first fix-dispatch for that PR; an iteration starting AT or after that second is a fix
+                    round, because the lander writes the log line and then spawns. Bounded to ONE PR's life:
+                    iterations after its merge, or before the track's previous PR merged, are not its, so a merged
+                    PR's cost is frozen and re-running this next week reprints the same dollars.
+                    NOT the ledger, and that is not an oversight: a fix round RESUMES the worker's session (PR
+                    #184's fix ran under the session id of the iteration before it) and a ledger row folds to one
+                    per (session, model, day), so no ledger row can say which side of the dispatch it fell on.
+                    The ledger is the CROSS-CHECK instead — see below.
+  review $          the ledger (~/.cc/state/spend/*.tsv), rows whose cwd is a lander scratch worktree
+                    (/tmp/cc-land-*). A ledger row's stamp is the session's LAST ACTIVITY — cc-spend folds one row
+                    per (session, model, day) at the max record time — so every rule here is written in terms of
+                    when a review FINISHED, and none of them may claim a start. Attributed to a PR only when
+                    exactly one landing attempt was open then; `*` marks a PR whose window overlapped another's, so
+                    its number is a FLOOR. On a busy day almost every landing overlaps, so most per-PR cells are
+                    floors. The footer figure divides reviewer spend by the PRs the lander merged, needs no
+                    attribution at all, and is the one to compare across weeks. Both sides of it are cut to the
+                    SAME window and both count what COMPLETED in it — a review that finished, a PR that merged —
+                    because dividing every review the ledger holds by one day of merges reads a quarter high.
+  stopped, stops    a review that REFUSED to land: a `fix-dispatch` or `fix-none` event, which the lander writes
+                    only on a stopping verdict. Not a failed landing — a red gate, a stale ref or a conflict closes
+                    the attempt with rc!=0 and says nothing about the change.
+  rq                a COUNT of requeues, never dollars. A planning session is interactive and one transcript covers
+                    everything else it did that day; there is no honest way to bill part of it to one PR.
+  churn             a PROXY for an escaped defect: how many later PRs came STRAIGHT back to a file this one had
+                    just changed — only the NEXT PR to touch that file, from a different track, within 72 h.
+                    "Any later PR touching a shared file" was the first version and scored 101 on a busy day; on
+                    this box everything touches core/bin, so it measured traffic. Even sharpened it cannot tell a
+                    repair from a planned follow-up: a ranking signal between task classes over one period, never
+                    a defect count.
+
+WHAT IS LEFT OUT, and said so on every run rather than printed as $0.00: PRs merged before the ledger starts, and
+PRs no track row points at, so no run files can be found for them. Usually that means a person or a planning
+session landed it, whose interactive transcript cannot be billed to one PR. But it also catches a track's EARLIER
+PRs: the board carries one `pr` per track and the log names a track only when a review sent the PR back, so a
+track that landed twice cleanly resolves only its latest. That PR then keeps `after=None` and is billed the
+earlier one's iterations too. Nothing here can separate them, so the run says so rather than implying a cause.
+
+RESOLUTION. Run files are named for the UTC second the iteration started and landing events are UTC seconds; the
+split compares them as such, and the second a fix-dispatch shares with the run it spawned belongs to the fix. Git
+is read in UTC too — see git() — because a stamp rendered in the box's own zone with a literal Z would be hours
+out against both of the above on any box that does not keep UTC.
+
+Accepted means MERGED, and git is the judge, not the landing log: a PR counts only when a squash commit ending
+`(#N)` is on origin/<default>. The log says what the lander thought; the branch says what actually landed. The
+track behind a PR comes off the BOARD, whose every track row carries its PR's URL — the landing log names a track
+only on a fix-dispatch line, so trusting it would cost only the PRs that went wrong.
+
+  cc-econ pr [--repo R] [--days N|--week|--all] [--json]   one row per accepted PR
+  cc-econ by-model [--repo R] [--days N|--week|--all] [--bands]   the same PRs grouped by the model that did the
+                    work; --bands splits each model by PR size, which is the only view worth a routing decision
+  cc-econ selfcheck
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+H = os.path.expanduser("~")
+ST = os.path.join(H, ".cc", "state")
+LEDGER = os.path.join(ST, "spend")
+QUEUE = os.path.join(ST, "land", "queue.log")
+DEV = os.path.join(H, "dev")
+SCRATCH = "/tmp/cc-land-"                 # the throwaway worktree a review runs in; nothing else lives there
+COLS = ["ts", "session", "cwd", "repo", "track", "kind", "model", "in", "out", "cache_read", "cache_write", "est_usd"]
+CHURN_H = 72                              # the window the churn proxy looks forward over
+
+
+def parse_ts(s):
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, AttributeError):
+        return None
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------- the ledger (population: every claude process)
+
+def all_days():
+    """Every day the ledger has on disk, oldest first."""
+    return sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(LEDGER, "*.tsv"))
+                  if re.fullmatch(r"\d{4}-\d{2}-\d{2}", os.path.basename(p)[:-4]))
+
+
+def ledger():
+    """Every ledger row on disk, parsed. A torn or hand-edited row is skipped, never a crash mid-report."""
+    for day in all_days():
+        try:
+            fh = open(os.path.join(LEDGER, f"{day}.tsv"))
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                p = line.rstrip("\n").split("\t")
+                if len(p) != len(COLS):
+                    continue
+                r = dict(zip(COLS, p))
+                r["at"] = parse_ts(r["ts"])
+                if not r["at"]:
+                    continue
+                try:
+                    r["est_usd"] = float(r["est_usd"] or 0)
+                except ValueError:
+                    continue
+                yield r
+
+
+# ---------------------------------------------------------------- the landing log (population: landing attempts)
+
+EV = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\t(?P<verb>[a-z-]+) (?P<repo>[^#\s]+)#(?P<pr>\d+)"
+                r"(?P<rest>.*)$")
+
+
+def events(path=QUEUE):
+    """(at, verb, repo, pr, rest) for every landing event. Anything that is not one of those lines is ignored —
+    the log also carries free text the lander printed."""
+    try:
+        fh = open(path)
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            m = EV.match(line.rstrip("\n"))
+            if m:
+                at = parse_ts(m["ts"])
+                if at:
+                    yield at, m["verb"], m["repo"], int(m["pr"]), m["rest"]
+
+
+def landings(evs, repo):
+    """Per PR: the open->close windows of each landing attempt, the fix-dispatch stamps, the track, and the counts
+    the report needs. `queued` and `again` both OPEN an attempt; `done` closes it, whatever its rc — a landing that
+    failed on a gate is not a review sending the PR back, and only the fix lines below say that happened."""
+    per = {}
+    for at, verb, r, pr, rest in evs:
+        if r != repo:
+            continue
+        d = per.setdefault(pr, {"windows": [], "fixes": [], "stops": 0, "requeues": 0, "track": "", "attempts": 0})
+        if verb in ("queued", "again"):
+            d["windows"].append([at, None])
+            d["attempts"] += 1
+            if verb == "again" or d["attempts"] > 1:
+                d["requeues"] += 1
+        elif verb == "done":
+            for w in d["windows"]:
+                if w[1] is None:
+                    w[1] = at
+        elif verb in ("fix-dispatch", "fix-none"):
+            # A STOP is a review that refused to land, and these two lines are the only ones written when one does
+            # — the lander reaches them only on a stopping verdict. It is NOT `done rc!=0`, which was the first
+            # version of this and counted red gates, a stale pull ref, a merge conflict, and even rc=4 ("merged and
+            # deployed, but nothing here could confirm it") as reviews that sent the PR back. The report asks the
+            # owner to compare a cheaper reviewer against this column, so it has to be reviews and nothing else.
+            # The verdict on the line is not read: one fix-none path logs none at all, and which verdict stopped
+            # a PR is not a number this reports — that the review stopped it is.
+            d["stops"] += 1
+            if verb == "fix-dispatch":
+                d["fixes"].append(at)
+            t = re.search(r"track=(\S+)", rest)
+            if t:
+                d["track"] = t.group(1)
+        elif verb == "fix-pushed":
+            t = re.search(r"track=(\S+)", rest)
+            if t:
+                d["track"] = t.group(1)
+    return per
+
+
+# ---------------------------------------------------------------- git: what actually merged
+
+def git(repo, *a):
+    """Always in TZ=UTC. `--date=format-local:` renders whatever zone the box keeps, so on a box that is not
+    on UTC a stamp formatted with a literal `Z` is hours out — a PR merged 01:00Z falls out of a one-day window
+    while its reviews, which are true UTC, stay in. The same bug cost PR #182 a round."""
+    try:
+        p = subprocess.run(["git", "-C", os.path.join(DEV, repo), *a],
+                           capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, TZ="UTC"))
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout if p.returncode == 0 else ""
+
+
+def accepted(repo, base="origin/main"):
+    """{pr: {"sha","at","files","lines"}} for every squash commit on the default branch whose subject ends `(#N)`.
+    This, not the landing log, is what "accepted" means: the log says what the lander thought it did.
+
+    `at` is the COMMITTER date (%cd), the second the squash landed on the branch — not the author date, which a
+    rebase carries over from whenever the work was first written and which would put a PR in the wrong day."""
+    out = git(repo, "log", base, "--no-merges", "--date=format-local:%Y-%m-%dT%H:%M:%SZ",
+              "--pretty=format:%H\t%cd\t%s")
+    got = {}
+    for line in out.splitlines():
+        p = line.split("\t", 2)
+        if len(p) != 3:
+            continue
+        m = re.search(r"\(#(\d+)\)\s*$", p[2])
+        at = parse_ts(p[1])
+        if not m or not at:
+            continue
+        got.setdefault(int(m.group(1)), {"sha": p[0], "at": at, "subject": p[2]})
+    for pr, d in got.items():
+        d["files"], d["lines"] = set(), 0     # one `git show` for both: the files feed the churn proxy, the lines
+        for row in git(repo, "show", "--numstat", "--pretty=format:", d["sha"]).splitlines():
+            c = row.split("\t")               # are the only task-size proxy on disk, and size is what the model
+            if len(c) != 3:                   # comparison has to be controlled for
+                continue
+            d["files"].add(c[2])
+            if c[0].isdigit() and c[1].isdigit():
+                d["lines"] += int(c[0]) + int(c[1])     # a binary file prints `-` and adds no lines
+    return got
+
+
+def board_tracks(repo):
+    """{pr: track} off the board, which is where the link actually lives: a track row carries the URL of the PR it
+    produced. The landing log only names a track on a fix-dispatch line, so a PR that landed clean has none there —
+    reading the board first is the difference between costing every accepted PR and costing only the troubled ones.
+    READ ONLY: `pr` and `status` are set by a person or by the lander, and nothing here writes them back."""
+    try:
+        b = json.load(open(os.path.join(H, ".cc", "boards", f"{repo}.json")))
+    except (OSError, ValueError):
+        return {}
+    got = {}
+    for name, t in (b.get("tracks") or {}).items():
+        m = re.search(r"/pull/(\d+)", str(t.get("pr") or ""))
+        if m:
+            got[int(m.group(1))] = name
+    return got
+
+
+def churn_map(got, tracks):
+    """{pr: n} — the escaped-defect PROXY: how many later PRs came STRAIGHT back to a file this one had just
+    changed. Straight back is the whole point: only the very next PR to touch that file counts, from a different
+    track, within CHURN_H hours. "Any later PR touching a shared file" was the first version and it scored 101 on a
+    busy day — on this box everything touches core/bin, so it measured traffic, not defects.
+
+    Still a proxy, and it says nothing about WHY the next PR came: a planned follow-up scores the same as a repair.
+    Read it as a ranking signal between task classes over one period, never as a defect count."""
+    byfile = {}
+    for pr, d in got.items():
+        for f in d["files"]:
+            byfile.setdefault(f, []).append(pr)
+    n = {pr: set() for pr in got}
+    for f, prs in byfile.items():
+        prs.sort(key=lambda p: got[p]["at"])
+        for a, b in zip(prs, prs[1:]):
+            gap = got[b]["at"] - got[a]["at"]
+            if timedelta(0) < gap <= timedelta(hours=CHURN_H) and tracks.get(a, a) != tracks.get(b, b):
+                n[a].add(b)
+    return {pr: len(v) for pr, v in n.items()}
+
+
+# ---------------------------------------------------------------- assembling one PR
+
+RUNF = re.compile(r"^(\d{8}T\d{6}Z)-\d+\.json$")
+
+
+def track_bounds(got, tracks):
+    """{pr: (after, until)} — the slice of its track's life each accepted PR may be charged for. `until` is its own
+    merge stamp and `after` is the merge stamp of the PREVIOUS accepted PR of the same track.
+
+    Without this a PR is charged every iteration its track ever ran. A track that keeps working after its PR lands
+    would make that PR cost MORE next week than it does today, and a track re-briefed after a merge would bill the
+    second brief to the first PR — so the dollars-per-accepted-PR figure the routing recommendation rests on would
+    not be stable. Once a PR is merged its cost is frozen."""
+    by_t = {}
+    for pr, t in tracks.items():
+        if t and pr in got:
+            by_t.setdefault(t, []).append(pr)
+    bounds = {}
+    for t, prs in by_t.items():
+        prev = None
+        for p in sorted(prs, key=lambda x: got[x]["at"]):
+            bounds[p] = (prev, got[p]["at"])
+            prev = got[p]["at"]
+    return bounds
+
+
+def iterations(repo, track, after=None, until=None):
+    """One record per worker-loop ITERATION, off the loop's own run files. Population: headless worker loops, and
+    nothing else on the box. `after`/`until` bound it to one PR's life — see track_bounds. Both ends are UTC
+    seconds, the resolution a run file's name prints: an iteration running AT the merge second is that PR's, and
+    one at the previous PR's merge second is not (it belongs to the PR that had just landed).
+
+    The ledger cannot do this job. A fix round RESUMES the worker's session rather than starting a new one — PR
+    #184's fix ran under the same session id as the iteration before it — so a ledger row, which folds to one per
+    (session, model, day), cannot say which side of a fix-dispatch it fell. A run file is one iteration, carries
+    Claude Code's own total_cost_usd, and is named for the second it started. The ledger cross-checks the sum."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(ST, repo, track, "runs", "*.json"))):
+        m = RUNF.match(os.path.basename(f))
+        if not m:
+            continue
+        at = parse_ts(datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%SZ"))
+        # "an iteration running AT the merge second is that PR's, and one at the previous PR's merge second is
+        # not (it belongs to the PR that had just landed)"
+        if (until and at > until) or (after and at <= after):
+            continue
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue                          # a run still in flight writes an empty file; skip it, never crash
+        if not d.get("session_id"):
+            continue
+        mu = d.get("modelUsage") or {}
+        out.append({"at": at, "usd": float(d.get("total_cost_usd") or 0), "session": d["session_id"],
+                    "models": {k: float((v or {}).get("costUSD") or 0) for k, v in mu.items()}})
+    return out
+
+
+def did_the_work(models, total):
+    """The models that actually did the work, shortest name first. Every loop calls Haiku for a title or a summary
+    or two; naming it beside the model that wrote the PR would put almost every track in a `mixed` bucket and empty
+    the single-model rows the routing question needs. A model under 5% of the bill is not what did the work."""
+    return sorted(m.replace("claude-", "") for m, v in models.items() if v >= 0.05 * (total or 1))
+
+
+def split(runs, first_fix):
+    """(worker $, fix $, {model: $}). An iteration that started AT or after the first fix-dispatch is a fix round:
+    the lander writes that log line and then spawns, so the fix always starts at or after the stamp, and the second
+    it shares with it belongs to the fix. Both sides are UTC seconds, the resolution both sources print."""
+    worker = fix = 0.0
+    models = {}
+    for r in runs:
+        if first_fix and r["at"] >= first_fix:
+            fix += r["usd"]
+        else:
+            worker += r["usd"]
+        for k, v in r["models"].items():
+            models[k] = models.get(k, 0.0) + v
+    return worker, fix, models
+
+
+def reviewer_sessions(rows, since=None):
+    """{session: {"at","usd"}} for rows run in a lander scratch worktree. Population: landing reviews.
+
+    `at` is the session's LAST ACTIVITY, never its start, and nothing here may pretend otherwise: cc-spend folds
+    the ledger to one row per (session, model, day) stamped with the MAX record time it saw, so no start time
+    survives to be read. So `since` keeps a session that FINISHED inside the window — a review that began before
+    the cut and ended inside it is counted in it. That is the rule the other side of the division already uses,
+    since a PR is counted in the window it MERGED in, and both sides counting what COMPLETED in the window is the
+    pairing the per-PR figure needs. Dividing every review the ledger holds by one day of merges, which is what
+    this did before, read a quarter high."""
+    per = {}
+    for r in rows:
+        if not r["cwd"].startswith(SCRATCH) or (since is not None and r["at"] < since):
+            continue
+        s = per.setdefault(r["session"], {"at": r["at"], "usd": 0.0})
+        s["at"] = max(s["at"], r["at"])
+        s["usd"] += r["est_usd"]
+    return per
+
+
+def attribute_reviews(revs, land):
+    """A reviewer session belongs to a PR when exactly ONE landing window was open when it LAST ran. When two
+    were, it is left unattributed and the PRs it could belong to are flagged — a floor is honest, a guess is not.
+    The stamp is an end, not a start (see reviewer_sessions), so a review that ran while only one landing was open
+    and finished after a second had been queued falls in the unattributed pile instead of onto the wrong PR."""
+    per, ambiguous, unattributed = {}, set(), 0.0
+    for s in revs.values():
+        open_now = [pr for pr, d in land.items()
+                    for w in d["windows"] if w[0] <= s["at"] <= (w[1] or now())]
+        open_now = sorted(set(open_now))
+        if len(open_now) == 1:
+            per[open_now[0]] = per.get(open_now[0], 0.0) + s["usd"]
+        else:
+            unattributed += s["usd"]
+            ambiguous.update(open_now)
+    return per, ambiguous, unattributed
+
+
+def crosscheck(repo, tracks, rows):
+    """The workers' own run files are the second source, and the comparison is SESSION to SESSION — that is the
+    only like-for-like there is. total_cost_usd covers a run end to end and cannot be split by day, so the ledger
+    side sums every day on disk for those same sessions. Returns (runs_usd, n_runs, n_sessions, ledger_usd)."""
+    theirs, sids = 0.0, set()
+    for t in tracks:
+        for f in glob.glob(os.path.join(ST, repo, t, "runs", "*.json")):
+            try:
+                d = json.load(open(f))
+            except (OSError, ValueError):
+                continue                      # a run still in flight writes an empty file
+            sid = d.get("session_id")
+            if not sid:
+                continue
+            sids.add(sid)
+            theirs += float(d.get("total_cost_usd") or 0)
+    mine = sum(r["est_usd"] for r in rows if r["session"] in sids)
+    return theirs, len(sids), mine
+
+
+def coverage():
+    """The first day the ledger has. A PR merged before it CANNOT be costed — no rows exist for the work that made
+    it — and costing it anyway would print a $0.00 row that reads like a free PR. Those are excluded and counted."""
+    d = all_days()
+    return parse_ts(d[0] + "T00:00:00Z") if d else None
+
+
+def resolve_tracks(repo, land):
+    """The board is the primary link (every track row carries its PR's URL); the landing log's fix-dispatch line is
+    the fallback for a track the board has since dropped."""
+    tracks = dict(board_tracks(repo))
+    for pr, d in land.items():
+        if d.get("track") and pr not in tracks:
+            tracks[pr] = d["track"]
+    return tracks
+
+
+def report(repo, window_days, as_json=False):
+    rows = list(ledger())
+    since = None if window_days is None else now() - timedelta(days=window_days)
+    cov = coverage()
+    land = landings(events(), repo)
+    got = accepted(repo)
+    tracks = resolve_tracks(repo, land)
+    prs = sorted(pr for pr, d in got.items() if since is None or d["at"] >= since)
+    before = [pr for pr in prs if cov and got[pr]["at"] < cov]
+    prs = [pr for pr in prs if pr not in set(before)]
+    if not prs:
+        print(f"cc-econ: no accepted PR for {repo} the ledger can cost"
+              + (f" — {len(before)} merged before it starts ({cov:%Y-%m-%d})" if before else ""))
+        return 1
+    rev_per, ambiguous, rev_unattr = attribute_reviews(reviewer_sessions(rows, since), land)
+    rev_total = sum(rev_per.values()) + rev_unattr
+    ch = churn_map(got, tracks)
+    bnd = track_bounds(got, tracks)
+
+    out, no_track = [], []
+    for pr in prs:
+        d = land.get(pr, {})
+        t = tracks.get(pr, "")
+        runs = iterations(repo, t, *bnd.get(pr, (None, None))) if t else []
+        if not runs:
+            no_track.append(pr)             # no track row points at this PR — see the note this prints below
+            continue
+        worker, fix, models = split(runs, min(d["fixes"]) if d.get("fixes") else None)
+        out.append({
+            "pr": pr, "track": t, "merged": got[pr]["at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "lines": got[pr]["lines"], "band": band_of(got[pr]["lines"]), "iterations": len(runs), "worker_usd": round(worker, 4), "fix_usd": round(fix, 4),
+            "review_usd": round(rev_per.get(pr, 0.0), 4), "review_is_floor": pr in ambiguous,
+            "total_usd": round(worker + fix + rev_per.get(pr, 0.0), 4),
+            "fix_rounds": len(d.get("fixes", [])), "review_stops": d.get("stops", 0),
+            "requeues": d.get("requeues", 0), "churn": ch.get(pr, 0),
+            "models": did_the_work(models, worker + fix) or ["-"],
+        })
+    if not out:
+        print(f"cc-econ: no accepted PR for {repo} in the window came from a worker loop — nothing to cost")
+        return 1
+    theirs, nsids, mine = crosscheck(repo, {r["track"] for r in out}, rows)
+    gap = (mine - theirs) / theirs * 100 if theirs else 0.0
+    if as_json:
+        print(json.dumps({"repo": repo, "accepted": len(out), "prs": out,
+                          "no_worker_track": no_track, "before_ledger": before,
+                          "review_total_usd": round(rev_total, 4),
+                          "crosscheck": {"runs_usd": round(theirs, 4), "ledger_usd": round(mine, 4),
+                                         "sessions": nsids, "gap_pct": round(gap, 1)}}, indent=1))
+        return 0 if abs(gap) <= 10 or not theirs else 1
+
+    span = "every day the ledger covers" if window_days is None else f"the last {window_days} day(s)"
+    print(f"cc-econ: {repo}, {len(out)} accepted PR(s) from a worker loop, merged in {span}.")
+    print("  POPULATION — worker/fix $: the loop's own run files, one per ITERATION (headless worker loops, and")
+    print("  nothing else on the box); split at the first fix-dispatch. review $: ledger rows from a lander")
+    print("  scratch worktree, attributed only when one landing was open, * marks a FLOOR. rq is a COUNT, never")
+    print("  dollars — a planner shares one transcript with everything else it did. churn is a PROXY (--help).")
+    if no_track:
+        print(f"  {len(no_track)} more accepted PR(s) in this window have no track row pointing at them, so "
+              f"no run files can be found for them: landed by hand or by a planning session, whose spend cannot "
+              f"be billed to one PR — or landed by a track that has since moved on to another PR, in which case "
+              f"THIS PR's iterations are billed to that later one. Left out of every figure below.")
+    if before:
+        print(f"  {len(before)} merged before the ledger starts ({cov:%Y-%m-%d}) and cannot be costed at all.")
+    head = ["pr", "track", "worker $", "fix $", "review $", "total $", "it", "fix", "stop", "rq", "churn", "model"]
+    body = [[str(r["pr"]), r["track"], f"{r['worker_usd']:.2f}", f"{r['fix_usd']:.2f}",
+             f"{r['review_usd']:.2f}" + ("*" if r["review_is_floor"] else ""), f"{r['total_usd']:.2f}",
+             str(r["iterations"]), str(r["fix_rounds"]), str(r["review_stops"]), str(r["requeues"]),
+             str(r["churn"]), ",".join(r["models"])[:22]] for r in out]
+    w = [max(len(h), *(len(b[i]) for b in body)) for i, h in enumerate(head)]
+    print("  " + "  ".join(h.ljust(w[i]) for i, h in enumerate(head)))
+    for b in body:
+        print("  " + "  ".join(c.ljust(w[i]) for i, c in enumerate(b)))
+    tw = sum(r["worker_usd"] for r in out)
+    tf = sum(r["fix_usd"] for r in out)
+    n = len(out)
+    print(f"  per accepted PR, worker side: ${(tw + tf) / n:.2f} "
+          f"— worker ${tw / n:.2f} · fix rounds ${tf / n:.2f}, over {sum(r['iterations'] for r in out)} iteration(s)")
+    stopped = sum(1 for r in out if r["review_stops"])
+    print(f"  review-stop rate: {stopped}/{n} accepted PRs were sent back at least once "
+          f"({sum(r['fix_rounds'] for r in out)} fix round(s) in all) · "
+          f"churn proxy: {sum(r['churn'] for r in out)} later PR(s) reopened a file one of these touched")
+    # The review total covers EVERY landing attempt in the ledger, including attempts on PRs with no worker loop.
+    # Dividing it by `n` would be the population mistake this tool exists to avoid, so it is divided by the PRs the
+    # lander actually reviewed and got merged.
+    reviewed = len([pr for pr in land if pr in got and (cov is None or got[pr]["at"] >= cov)
+                    and (since is None or got[pr]["at"] >= since)])
+    if not rev_total:
+        # A silent $0.00 here would read as "reviews are free". They are not: it means no ledger row IN THIS
+        # WINDOW had a cwd under SCRATCH — either no landing was reviewed in it, or the lander renamed its dir.
+        print(f"  reviews: NOTHING FOUND — no ledger row in this window ran under {SCRATCH}*. Either no landing was reviewed in "
+              f"this window, or the lander renamed its scratch worktree and this column has gone blind. The "
+              f"worker figures above are unaffected; the review ones are missing, not zero.")
+    else:
+        span = ("over every landing attempt the ledger can see" if since is None
+                else f"over the reviews that FINISHED in the last {window_days} day(s)")
+        print(f"  reviews: ${rev_total:.2f} {span}, "
+          + (f"${rev_total / reviewed:.2f} per accepted PR the lander merged ({reviewed} of them, worker loop or "
+             f"not). That figure needs no attribution and is the one to compare across weeks."
+                 if reviewed else "and no accepted PR in this window went through it."))
+    if theirs:
+        print(f"  cross-check: {nsids} worker session(s) report ${theirs:.2f} end to end in their own run files; "
+              f"this ledger estimates ${mine:.2f} for them ({gap:+.1f}%).")
+        if abs(gap) > 10:
+            print("  THE TWO SOURCES DISAGREE BY MORE THAN 10% — do not quote these numbers until that is "
+                  "explained. Two wrong conclusions on this box started exactly here.")
+            return 1
+    else:
+        print("  cross-check: no run files for these tracks — a single unreconciled source. Do not quote it.")
+        return 1
+    return 0
+
+
+BANDS = ((0, 60, "<60 lines"), (60, 250, "60-250"), (250, None, ">250"))    # changed lines in the squash commit
+
+
+def median(xs):
+    v = sorted(xs)
+    return 0 if not v else (v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2)
+
+
+def band_of(n):
+    for lo, hi, name in BANDS:
+        if lo <= n and (hi is None or n < hi):
+            return name
+    return BANDS[-1][2]
+
+
+def by_model(repo, window_days, bands=False):
+    """The routing question: dollars per ACCEPTED PR, grouped by the model that did the work. A PR whose track ran
+    on more than one model lands in a `mixed` group of its own rather than being split — there is no honest way to
+    say which model earned which part of one accepted PR.
+
+    `bands` splits each model by the SIZE of the PR, and it is the only view of this table worth a decision. Models
+    are not handed the same work: on this box the cheap one drew the narrow single-file fixes and the expensive one
+    the new subsystems, so the ungrouped rows compare task classes wearing model names and reverse the sign of the
+    answer. Changed lines are a crude proxy for task class and the only one on disk; median $ and median lines are
+    printed beside the means so one huge PR in a small group is visible rather than silently deciding the row."""
+    rows = list(ledger())
+    since = None if window_days is None else now() - timedelta(days=window_days)
+    cov = coverage()
+    land = landings(events(), repo)
+    got = accepted(repo)
+    tracks = resolve_tracks(repo, land)
+    prs = sorted(pr for pr, d in got.items()
+                 if (since is None or d["at"] >= since) and (not cov or d["at"] >= cov))
+    ch = churn_map(got, tracks)
+    bnd = track_bounds(got, tracks)
+    groups = {}
+    for pr in prs:
+        t = tracks.get(pr, "")
+        runs = iterations(repo, t, *bnd.get(pr, (None, None))) if t else []
+        if not runs:
+            continue
+        d = land.get(pr, {})
+        worker, fix, models = split(runs, min(d["fixes"]) if d.get("fixes") else None)
+        big = did_the_work(models, worker + fix)
+        key = big[0] if len(big) == 1 else "mixed:" + ",".join(big) if big else "-"
+        if bands:
+            key = (band_of(got[pr]["lines"]), key)
+        g = groups.setdefault(key, {"n": 0, "usd": 0.0, "it": 0, "fix": 0, "stop": 0, "churn": 0,
+                                    "ln": 0, "each": [], "eachln": []})
+        g["n"] += 1
+        g["usd"] += worker + fix
+        g["it"] += len(runs)
+        g["fix"] += len(d.get("fixes", []))
+        g["stop"] += 1 if d.get("stops", 0) else 0
+        g["churn"] += ch.get(pr, 0)
+        g["ln"] += got[pr]["lines"]
+        g["each"].append(worker + fix)
+        g["eachln"].append(got[pr]["lines"])
+    if not groups:
+        print(f"cc-econ: no accepted PR for {repo} with worker spend in the window")
+        return 1
+    print(f"cc-econ: {repo} — worker+fix spend per ACCEPTED PR by the model that did the work "
+          f"(reviews excluded: they run on the lander's model, not the worker's)"
+          + (", split by the SIZE of the PR." if bands else "."))
+    head = (["band"] if bands else []) + [
+        "model", "accepted", "worker+fix $", "$/accepted PR", "median $", "median lines", "$/100 lines",
+        "iters/PR", "fix rounds/PR", "stopped", "churn/PR"]
+    order = [n for _, _, n in BANDS]      # bands in size order, dearest model per PR first inside each
+
+    def row(k, g):
+        return (list(k) if bands else [k]) + [
+            str(g["n"]), f"{g['usd']:.2f}", f"{g['usd'] / g['n']:.2f}", f"{median(g['each']):.2f}",
+            f"{median(g['eachln']):.0f}", f"{100 * g['usd'] / g['ln']:.2f}" if g["ln"] else "-",
+            f"{g['it'] / g['n']:.1f}", f"{g['fix'] / g['n']:.2f}", f"{g['stop']}/{g['n']}",
+            f"{g['churn'] / g['n']:.2f}"]
+
+    def sort_key(kv):
+        k, g = kv
+        return (order.index(k[0]), -g["usd"] / g["n"]) if bands else (0, -g["usd"] / g["n"])
+    body = [row(k, g) for k, g in sorted(groups.items(), key=sort_key)]
+    w = [max(len(h), *(len(b[i]) for b in body)) for i, h in enumerate(head)]
+    print("  " + "  ".join(h.ljust(w[i]) for i, h in enumerate(head)))
+    for b in body:
+        print("  " + "  ".join(c.ljust(w[i]) for i, c in enumerate(b)))
+    print("  A group of one or two PRs decides nothing. Read a row only once its `accepted` count is in double "
+          "figures, and read `stopped` and `churn` beside the dollars — a cheaper model that is sent back twice "
+          "as often is not cheaper.")
+    if not bands:
+        print("  These rows do NOT control for task size, and on this box that reverses the answer: run "
+              "`by-model --bands` and compare models inside one band before concluding anything about routing.")
+    return 0
+
+
+# ---------------------------------------------------------------- selfcheck
+
+def selfcheck():
+    """Fixtures of its own — a fake ledger, a fake landing log, a real throwaway git repo. Never this box's."""
+    import shutil
+    import tempfile
+    n = [0]
+
+    def ok(what, cond):
+        print(("  ok   " if cond else "  FAIL ") + what)
+        if not cond:
+            n[0] += 1
+
+    print("cc-econ selfcheck")
+
+    # ---- the landing log: what opens an attempt, what closes it, what counts as a stop
+    q = ["2026-09-01T10:00:00Z\tqueued r#1 who=- by=x",
+         "2026-09-01T10:30:00Z\tfix-dispatch r#1 track=t1 verdict=LAND-AFTER-FIX model=claude-opus-5 loop=1",
+         "2026-09-01T11:00:00Z\tdone r#1 rc=1 NOT merged — LAND-AFTER-FIX",
+         "2026-09-01T11:30:00Z\tqueued r#1 who=- by=x",
+         "2026-09-01T12:00:00Z\tdone r#1 rc=0 landed",
+         "a line the lander printed that is not an event",
+         "2026-09-01T10:05:00Z\tqueued r#2 who=- by=x",
+         "2026-09-01T12:30:00Z\tdone r#2 rc=0 landed",
+         # PR 3: a landing that FAILED without a review saying anything — a red gate, then a stale ref, then it
+         # landed clean. PR 4: a stop the lander could not dispatch, on the one path that logs no verdict= at all.
+         "2026-09-01T13:00:00Z\tqueued r#3 who=- by=x",
+         "2026-09-01T13:10:00Z\tdone r#3 rc=1 NOT merged — gate red",
+         "2026-09-01T13:20:00Z\tqueued r#3 who=- by=x",
+         "2026-09-01T13:30:00Z\tdone r#3 rc=4 merged and deployed, but nothing here could confirm it",
+         "2026-09-01T14:00:00Z\tqueued r#4 who=- by=x",
+         "2026-09-01T14:10:00Z\tfix-none r#4 — cannot write the verdict",
+         "2026-09-01T14:20:00Z\tdone r#4 rc=1 NOT merged"]
+    d = tempfile.mkdtemp(prefix="ccecon-sc-")
+    try:
+        qp = os.path.join(d, "queue.log")
+        open(qp, "w").write("\n".join(q) + "\n")
+        L = landings(list(events(qp)), "r")
+        ok("free text in the landing log is ignored, not parsed as an event", set(L) == {1, 2, 3, 4})
+        ok("a second `queued` for the same PR is a requeue, and the first is not",
+           L[1]["requeues"] == 1 and L[2]["requeues"] == 0)
+        ok("a stop is a review that REFUSED to land — the fix line the lander writes only on a stopping verdict",
+           L[1]["stops"] == 1)
+        ok("…and a landing that merely FAILED is not one: a red gate and an unconfirmable deploy say nothing "
+           "about the change, and counting them was inflating the column the report offers as a quality proxy",
+           L[3]["stops"] == 0 and L[2]["stops"] == 0)
+        ok("…while a stop the lander could not dispatch still counts, verdict= on the line or not",
+           L[4]["stops"] == 1)
+        ok("the track comes off the fix-dispatch line, which is the only place it appears",
+           L[1]["track"] == "t1" and L[2]["track"] == "")
+        ok("each attempt is its own open->close window", len(L[1]["windows"]) == 2
+           and L[1]["windows"][0][1] == parse_ts("2026-09-01T11:00:00Z"))
+
+        # ---- the worker/fix split, on its own run-file fixture. Three iterations that all RESUME one session —
+        # which is why the split cannot be done off the ledger — and the edge case: one starting on the very
+        # second of the fix-dispatch (10:30:00), which belongs to the fix.
+        globals()["ST"] = d
+        rd = os.path.join(d, "r", "t1", "runs")
+        os.makedirs(rd)
+        for stamp, cost, mu in [("20260901T101000Z-1", 10.0, {"claude-opus-5": 9.9, "claude-haiku-4-5": 0.1}),
+                                ("20260901T103000Z-1", 3.0, {"claude-opus-5": 3.0}),
+                                ("20260901T104500Z-2", 2.0, {"claude-opus-5": 2.0})]:
+            json.dump({"session_id": "sA", "total_cost_usd": cost,
+                       "modelUsage": {k: {"costUSD": v} for k, v in mu.items()}},
+                      open(os.path.join(rd, stamp + ".json"), "w"))
+        json.dump({}, open(os.path.join(rd, "20260901T110000Z-3.json"), "w"))
+        open(os.path.join(rd, "notes.txt"), "w").write("not a run file")
+        it = iterations("r", "t1")
+        ok("one record per ITERATION off the run files, even when they all resume ONE session — which is exactly "
+           "what the ledger cannot see", len(it) == 3 and {r["session"] for r in it} == {"sA"})
+        ok("…and a run still in flight (empty json) or a stray file in runs/ is skipped, not counted",
+           sum(r["usd"] for r in it) == 15.0)
+        dispatch = parse_ts("2026-09-01T10:30:00Z")   # this case's own boundary, not the one above
+        worker, fix, models = split(it, dispatch)
+        ok("an iteration that started BEFORE the first fix-dispatch is worker spend", worker == 10.0)
+        ok("…one that started ON the dispatch second is a FIX round, not worker spend — the lander writes the log "
+           "line and then spawns, so that second belongs to the fix", fix == 5.0)
+        ok("with no fix-dispatch at all, every iteration is worker spend and none is lost",
+           split(it, None) == (15.0, 0.0, models))
+        ok("the model mix comes from each run's own modelUsage, priced by Claude Code itself",
+           round(models["claude-opus-5"], 2) == 14.9 and models["claude-haiku-4-5"] == 0.1)
+
+        # ---- a merged PR's cost is FROZEN, on its own runs dir: one track, two accepted PRs, four iterations
+        # spread across both their lives. Unbounded, PR 8 is charged all four and grows every time the track runs.
+        rd2 = os.path.join(d, "r", "t2", "runs")
+        os.makedirs(rd2)
+        for stamp in ("20260901T090000Z-1", "20260901T100000Z-2", "20260901T120000Z-3", "20260901T140000Z-4"):
+            json.dump({"session_id": "sB", "total_cost_usd": 1.0, "modelUsage": {}},
+                      open(os.path.join(rd2, stamp + ".json"), "w"))
+        G = {8: {"at": parse_ts("2026-09-01T10:00:00Z")}, 9: {"at": parse_ts("2026-09-01T12:00:00Z")}}
+        B = track_bounds(G, {8: "t2", 9: "t2"})
+        ok("the first accepted PR of a track is charged from the beginning of that track's run files",
+           B[8] == (None, parse_ts("2026-09-01T10:00:00Z")))
+        ok("…and the next one starts where it left off, so a track re-briefed after a merge does not bill its "
+           "second brief to the first PR", B[9] == (parse_ts("2026-09-01T10:00:00Z"), G[9]["at"]))
+        ok("an iteration that started after a PR merged is not that PR's — its cost is frozen when it lands, so "
+           "re-running this next week reports the same dollars", len(iterations("r", "t2", *B[8])) == 2)
+        ok("…and the iteration running AT the merge second is the merging PR's, not the next one's",
+           [x["at"] for x in iterations("r", "t2", *B[9])] == [parse_ts("2026-09-01T12:00:00Z")])
+        ok("unbounded, the same track charges every iteration it ever ran to whichever PR asked — which is the "
+           "figure the routing recommendation would have rested on", len(iterations("r", "t2")) == 4)
+
+        # ---- review attribution, on a fixture of its own: two landings that overlap for part of their lives, so
+        # the same fixture holds a review that IS attributable and one that is not.
+        q2 = ["2026-09-01T09:00:00Z\tqueued r#5 who=- by=x", "2026-09-01T09:10:00Z\tqueued r#6 who=- by=x",
+              "2026-09-01T09:20:00Z\tdone r#5 rc=0 landed", "2026-09-01T09:40:00Z\tdone r#6 rc=0 landed"]
+        q2p = os.path.join(d, "queue2.log")
+        open(q2p, "w").write("\n".join(q2) + "\n")
+        L2 = landings(list(events(q2p)), "r")
+        rev = lambda t, u: {"at": parse_ts(t), "usd": u}   # noqa: E731  — `at` is a session's LAST activity
+        per, amb, un = attribute_reviews(
+            {"a": rev("2026-09-01T09:05:00Z", 1.5), "b": rev("2026-09-01T09:30:00Z", 2.0),
+             "c": rev("2026-09-01T09:15:00Z", 2.5)}, L2)
+        ok("a review inside exactly one open landing window is attributed to that PR",
+           per == {5: 1.5, 6: 2.0})
+        ok("…and one inside two overlapping windows is left unattributed, both PRs flagged as a floor",
+           un == 2.5 and amb == {5, 6})
+        ok("the two halves still add up to every dollar a reviewer spent",
+           sum(per.values()) + un == 6.0)
+
+        # ---- the window cuts BOTH sides of the per-PR review figure. Its own rows: one review inside a one-day
+        # window, one three days older, and one that is not a review at all.
+        lrows = [{"cwd": SCRATCH + "1", "session": "old", "at": parse_ts("2026-08-30T09:00:00Z"), "est_usd": 90.0},
+                 {"cwd": SCRATCH + "2", "session": "new", "at": parse_ts("2026-09-01T09:00:00Z"), "est_usd": 10.0},
+                 {"cwd": "/home/x/dev/r", "session": "int", "at": parse_ts("2026-09-01T09:00:00Z"), "est_usd": 5.0}]
+        cut = parse_ts("2026-09-01T00:00:00Z")
+        ok("a review that FINISHED before the window is not divided by the PRs merged inside it",
+           sum(v["usd"] for v in reviewer_sessions(lrows, cut).values()) == 10.0)
+        ok("…and with no window every review the ledger holds still counts",
+           sum(v["usd"] for v in reviewer_sessions(lrows).values()) == 100.0)
+        ok("…while an interactive session outside a lander scratch worktree is in neither",
+           "int" not in reviewer_sessions(lrows) and "int" not in reviewer_sessions(lrows, cut))
+        ok("a session the ledger folded into several model rows is stamped by its LAST one, because that is all "
+           "cc-spend keeps — nothing downstream may read it as a start",
+           reviewer_sessions([{"cwd": SCRATCH + "3", "session": "m", "at": parse_ts("2026-09-01T09:00:00Z"),
+                               "est_usd": 1.0},
+                              {"cwd": SCRATCH + "3", "session": "m", "at": parse_ts("2026-09-01T11:00:00Z"),
+                               "est_usd": 2.0}])["m"] == {"at": parse_ts("2026-09-01T11:00:00Z"), "usd": 3.0})
+
+        # ---- accepted means merged, and git is the judge
+        r = os.path.join(d, "repo")
+        os.makedirs(r)
+        g = ["git", "-C", r, "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(["git", "init", "-q", "-b", "main", r], check=True)
+        for i, (fn, subj) in enumerate([("a.txt", "first thing (#1)"), ("b.txt", "second (#2)"),
+                                        ("a.txt", "no pr number here"), ("c.txt", "third (#3)")]):
+            open(os.path.join(r, fn), "a").write(f"{i}\n")
+            subprocess.run([*g, "add", "-A"], check=True, capture_output=True)
+            subprocess.run([*g, "commit", "-qm", subj], check=True, capture_output=True)
+        globals()["DEV"] = d
+        A = accepted("repo", base="main")
+        ok("a PR counts as accepted only when a squash commit ending (#N) is on the branch",
+           set(A) == {1, 2, 3})
+        ok("…and each carries the files it touched, for the churn proxy",
+           A[1]["files"] == {"a.txt"} and A[3]["files"] == {"c.txt"})
+        # The stamp, on a commit whose two dates disagree and whose UTC hour falls in the PREVIOUS day in this
+        # box's zone. Both halves of the bug are here: a local-zone render with a literal Z, and %ad on a squash
+        # that git rebased, which carries the day the work was first written rather than the day it landed.
+        open(os.path.join(r, "d.txt"), "w").write("1\n2\n3\n")
+        subprocess.run([*g, "add", "-A"], check=True, capture_output=True)
+        subprocess.run([*g, "commit", "-qm", "fourth (#4)"], check=True, capture_output=True,
+                       env=dict(os.environ, TZ="America/Los_Angeles",
+                                GIT_AUTHOR_DATE="2026-08-01T00:00:00+0000",
+                                GIT_COMMITTER_DATE="2026-09-02T01:00:00+0000"))
+        was_tz = os.environ.get("TZ")           # the case has to BITE on a UTC runner too, so it sets a non-UTC
+        os.environ["TZ"] = "America/Los_Angeles"   # zone itself rather than trusting the one it inherited
+        try:
+            A = accepted("repo", base="main")
+        finally:
+            os.environ.pop("TZ") if was_tz is None else os.environ.__setitem__("TZ", was_tz)
+        ok("a merge stamp is read in UTC, whatever zone the box keeps — a local render with a literal Z put every "
+           "PR seven hours early and dropped the early-UTC ones out of a day window",
+           A[4]["at"] == parse_ts("2026-09-02T01:00:00Z"))
+        ok("…and it is when the squash LANDED (%cd), not the author date a rebase carried over",
+           A[4]["at"] != parse_ts("2026-08-01T00:00:00Z"))
+        ok("…and each carries its changed lines, the only task-size proxy on disk", A[4]["lines"] == 3)
+        # ---- churn, on a fixture of its own: PR 1 touches a.txt, and who comes back to it next decides the score.
+        C = {1: {"at": parse_ts("2026-09-01T00:00:00Z"), "files": {"a.txt"}},
+             9: {"at": parse_ts("2026-09-01T01:00:00Z"), "files": {"a.txt"}}}
+        ok("a different track coming straight back to a file an hour later scores 1",
+           churn_map(C, {1: "t1", 9: "t9"})[1] == 1)
+        ok("…but the SAME track coming back to its own file is one piece of work, not an escaped defect",
+           churn_map(C, {1: "t1", 9: "t1"})[1] == 0)
+        C[9]["at"] = parse_ts("2026-09-01T00:00:00Z") + timedelta(hours=CHURN_H + 1)
+        ok(f"…and past {CHURN_H} h it is ordinary maintenance", churn_map(C, {1: "t1", 9: "t9"})[1] == 0)
+        C[9]["at"] = parse_ts("2026-09-01T01:00:00Z")
+        C[5] = {"at": parse_ts("2026-09-01T00:30:00Z"), "files": {"a.txt"}}
+        ok("only the NEXT PR to touch the file counts against it — the one after that is answering PR 5, not "
+           "PR 1, and counting both is what scored 101 on a busy day",
+           churn_map(C, {1: "t1", 5: "t5", 9: "t9"}) == {1: 1, 5: 1, 9: 0})
+
+        # ---- the cross-check: one source is never enough, and the two are matched SESSION to session
+        rows = [{"repo": "r", "track": "t1", "kind": "headless", "session": "sA", "model": "claude-opus-5",
+                 "cwd": "/home/x/.cc/worktrees/r/t1", "est_usd": 15.6, "at": parse_ts("2026-09-01T10:40:00Z")},
+                {"repo": "r", "track": "session", "kind": "interactive", "session": "sPlanner",
+                 "model": "claude-opus-5", "cwd": "/home/x/dev/r", "est_usd": 99.0,
+                 "at": parse_ts("2026-09-01T10:50:00Z")}]
+        theirs, nsids, mine = crosscheck("r", {"t1"}, rows)
+        ok("the second source is the workers' own run files, matched SESSION to session",
+           theirs == 15.0 and nsids == 1 and mine == 15.6)
+        ok("the planner's interactive spend is in NEITHER side — the population mismatch that cost this box a "
+           "24x 'bug' cannot happen here", 99.0 not in (theirs, mine) and abs(mine - theirs) / theirs < 0.05)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    print(f"cc-econ selfcheck: {'all passed' if not n[0] else str(n[0]) + ' FAILED'}")
+    return 1 if n[0] else 0
+
+
+# ---------------------------------------------------------------- cli
+
+USAGE = ("usage: cc-econ pr [--repo R] [--days N|--week|--all] [--json]\n"
+         "       cc-econ by-model [--repo R] [--days N|--week|--all] [--bands]\n"
+         "       cc-econ selfcheck")
+
+
+def this_repo():
+    """The repo the caller is standing in — ~/dev/<repo> or ~/.cc/worktrees/<repo>/<track>. No repo name is written
+    down here: this script ships in the published tree, so it cannot carry the name of the box it runs on."""
+    cwd = os.path.realpath(os.getcwd())
+    for base, i in ((os.path.join(H, ".cc", "worktrees"), 0), (os.path.join(DEV), 0)):
+        if cwd.startswith(base + os.sep):
+            return cwd[len(base) + 1:].split(os.sep)[i]
+    return ""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, argv = argv[0], argv[1:]
+    if cmd == "selfcheck":
+        return selfcheck() if not argv else (print(USAGE, file=sys.stderr) or 2)
+    if cmd not in ("pr", "by-model"):
+        print(USAGE, file=sys.stderr)
+        return 2
+    repo, window, as_json, bands = this_repo(), 7, False, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--repo" and i + 1 < len(argv):
+            repo, i = argv[i + 1], i + 1
+        elif a == "--days" and i + 1 < len(argv):
+            try:
+                window = int(argv[i + 1])
+            except ValueError:
+                print(USAGE, file=sys.stderr)
+                return 2
+            i += 1
+        elif a == "--week":
+            window = 7
+        elif a == "--all":
+            window = None
+        elif a == "--json" and cmd == "pr":
+            as_json = True
+        elif a == "--bands" and cmd == "by-model":
+            bands = True
+        else:
+            print(USAGE, file=sys.stderr)
+            return 2
+        i += 1
+    if not repo:
+        print("cc-econ: no --repo, and this directory is not inside a repo or a worktree", file=sys.stderr)
+        return 2
+    return report(repo, window, as_json) if cmd == "pr" else by_model(repo, window, bands)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        os._exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

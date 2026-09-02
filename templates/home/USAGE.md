@@ -75,7 +75,7 @@ Shallow first. Each section: the 2–3 things you actually type. Why it is shape
 
 ## Does the box still work? (`cc-evals`)
 - `cc-evals run` — the **regression set**: frozen replays of work this box has already landed, each proved on a pinned base snapshot (the probe must FAIL there) as well as on this tree, plus the control-plane properties. Seconds, no spend, red or green — and the nightly audit runs the same set as one more `## suites` gate, so a red eval is the same single `main-gate` row as any other red baseline.
-- **What it covers today is the control plane and the worker guard**: every case drives this box's own scripts, none calls a model, so it does not yet gate a model, prompt or harness change — that needs a model-backed capability case, and there is none. `--set all` adds the graded capability case; `list | last | bless <case>` (blessing is the owner's, at a terminal). One file per case in `evals/cases/`, answers are salted digests in `~/.cc/evals/refs`, outside every git tree.
+- **The capability set is where a model is graded**, and it costs money, so no nightly gate runs it: `cc-evals run --set capability --show` puts a set of diffs to a model — some that break one of the landing self-review rules, some that break none — and prints its verdict on each. `CC_EVALS_MODEL=claude-sonnet-5 cc-evals run --set capability` asks another model the same questions, which is how a model, prompt or harness change is judged on quality rather than only on price. `list | last | bless <case>` (blessing is the owner's, at a terminal — a capability case has no reference until you type one, and reports red meanwhile). One file per case in `evals/cases/`, answers are salted digests in `~/.cc/evals/refs`, outside every git tree.
 
 ## What must be installed (`cc-units`, `cc-settings`)
 - `cc-units check` — every core user unit against `config/units.json`, the one list: enabled, active, and for a timer *armed* (active with no next trigger is down). `cc-units list|restart-for <files>` shows the manifest and what a change would need restarted. Adding a timer = its two unit files + one row.
@@ -110,3 +110,5 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc slack setup | on | status         Slack ↔ sessions       #<repo> in Slack talk to that session
     cc-scope list myapp                  asks still open        cc-scope unverified myapp  landed, nothing checked
     cc-spend  |  --by repo|track|model   token spend, biggest first    cc-spend phantoms    spend nobody watches
+    cc-econ pr [--week|--all]            what an accepted PR cost: worker + fix rounds + reviews, with stops and churn
+    cc-econ by-model --bands             the same PRs by model AND by PR size — the routing question

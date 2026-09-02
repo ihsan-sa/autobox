@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # cc-evals — the suite that verifies the SYSTEM, not the code. The three PR gates say the scripts still parse and
-# still behave; this says the box can still do work it has already done. Today every case is deterministic and drives
-# this box's own scripts, so what it gates is the control plane and the worker guard — gating a model, prompt or
-# harness change needs a capability case that calls one, and there is none yet. Do not claim more than that in a
-# release note or a report. Design: <overlay>/docs/*-agent-evals-design.md
-#   cc-evals run [--set regression|capability|all] [--case <name>] [--json] [--no-record] | list | bless <case>
-#           | last | selfcheck
+# still behave; this says the box can still do work it has already done. The REGRESSION set is deterministic and
+# drives this box's own scripts, so what it gates is the control plane and the worker guard — never a model. The
+# CAPABILITY set is where a model is graded: those cases put a question to one through `ask` and cost real money,
+# which is why no nightly gate runs them. Design: <overlay>/docs/*-agent-evals-design.md
+#   cc-evals run [--set regression|capability|all] [--case <name>] [--json] [--show] [--no-record] | list
+#           | bless <case>
+#           | last | selfcheck | ask [--budget N] [--schema <json>] < prompt
 # A case is one file with its metadata in its own header (no second list to drift from it) and one function:
 #   # @set: regression   # @kind: replay|property|capability   # @base: <sha>   # @title: …
 #   probe(){ … }   rc 0 = the invariant holds · 1 = violated · 2 = INCONCLUSIVE (the probe could not run at all)
+# rc 2 is INCONCLUSIVE in EVERY set, graded ones included: a usage limit or an API error means the question never
+# reached the model, and reporting that as a wrong answer is the one false signal an A/B between models must not
+# produce. It is soft outside the regression set, where a probe may need a live thing; there it is still red.
 # A `replay` is judged on BOTH halves: it must FAIL on its pinned base snapshot and PASS on this tree. Head-passes
 # alone is what selftest.sh already gives; base-fails is the proof the probe bites. A replay that passes at base is
 # VACUOUS and counts as red — an eval that cannot fail proves nothing, and silently counting it green is worse than
@@ -56,8 +60,15 @@ run_probe(){   # run_probe <case-file> <tree> -> rc from the probe; sets PROBE_O
   h=$(mktemp -d "${TMPDIR:-/tmp}/cc-evals-h.XXXXXX") || return 2
   m="$h/.metrics"; : > "$m"
   local tb; tb=$(tree_bin "$tree")
+  # $CC_EVALS_ASK — the only door from a probe to a model, and a shim rather than a path because the probe's HOME is
+  # a scratch dir with no credentials in it: the shim puts the REAL home back for the `claude` process alone, so a
+  # probe can spend money without being able to read the home it spent it from. Every probe gets it, not just the
+  # capability ones — a regression case that uses it goes red on the "must be free" rule below, which is the wall
+  # that already exists and does not need a second one here.
+  printf '#!/bin/sh\nHOME=%q exec %q ask "$@"\n' "$HOME" "$(readlink -f "$0")" > "$h/.ask" && chmod +x "$h/.ask"
   PROBE_OUT=$(
     export HOME="$h" CC_EVALS_METRICS="$m" CC_EVALS_TREE="$tree" CC_EVALS_BIN="$tb" CC_EVALS_ROOT="${tb%/bin}"
+    export CC_EVALS_ASK="$h/.ask"
     export CC_NOTIFY_LOG_ONLY=1 CC_NOTIFY_LOG="$h/notify.log"   # a probe never pushes to the owner
     export TMUX_TMPDIR="$h"; unset TMUX     # …and never reaches the box's own tmux server: a probe that lists or
     unset CC_HANDOFF CC_ROLE                # kills windows must find an empty server of its own, not the live one
@@ -76,6 +87,54 @@ run_probe(){   # run_probe <case-file> <tree> -> rc from the probe; sets PROBE_O
   PROBE_COST=$(sed -n 's/^cost=//p' "$m" 2>/dev/null | awk '{s+=$1} END{printf "%.4f", s+0}')
   PROBE_LOOPS=$(sed -n 's/^loops=//p' "$m" 2>/dev/null | awk '{s+=$1} END{print s+0}')
   rm -rf "$h"; return $rc
+}
+
+# ---- ask: a capability probe's model call, and the only one it gets. What has to be true of every graded question
+# lives here instead of in each case: one hardened arg set (no tools, no settings, no MCP, a turn cap, a budget cap),
+# the spend appended to the probe's own metrics so no case can forget to report what it burned, and a usage limit
+# answered with rc 2 — INCONCLUSIVE, because a question that never reached a model is not a model that answered
+# wrong. The model is $CC_EVALS_MODEL, defaulting to the one the lander reviews with, and it is env-only rather
+# than a flag because which model answered is a property of the RUN, not of one question — a case that could pick
+# its own would grade a model nobody asked for. That one variable is also the whole of an A/B:
+# `CC_EVALS_MODEL=claude-sonnet-5 cc-evals run --set capability` puts the same questions to the other model.
+# Env: CC_EVALS_MODEL · CC_EVALS_BUDGET (dollars per question, default 0.50) · CC_EVALS_THINK (MAX_THINKING_TOKENS;
+# unset = the CLI's own default) · CC_EVALS_CLAUDE (which binary — the selfcheck points it at a fake and spends 0).
+cmd_ask(){   # ask [--budget N] [--schema <json>] < prompt -> the answer on stdout; rc 2 = no answer
+  local model=${CC_EVALS_MODEL:-claude-opus-5} budget=${CC_EVALS_BUDGET:-0.50} schema="" prompt j rc out cl wd
+  while [ $# -gt 0 ]; do case $1 in
+    --budget) budget=${2:?}; shift 2 ;; --schema) schema=${2:?}; shift 2 ;;
+    *) die "ask: unknown option $1" ;; esac; done
+  prompt=$(cat); [ -n "$prompt" ] || { printf 'cc-evals ask: no prompt on stdin\n' >&2; return 2; }
+  cl=${CC_EVALS_CLAUDE:-claude}; command -v "$cl" >/dev/null 2>&1 || { printf 'cc-evals ask: no %s on PATH\n' "$cl" >&2; return 2; }
+  # --max-turns 3, not 1: the structured-output round trip is not always one turn — Opus with thinking on came back
+  # error_max_turns at 1 on questions Sonnet answered first time. There are no tools here, so a further turn can only
+  # finish the answer, and what actually bounds a question is the budget cap.
+  local args=(-p --model "$model" --max-budget-usd "$budget" --max-turns 3 --output-format json
+              --tools "" --setting-sources "" --strict-mcp-config --disable-slash-commands --no-session-persistence)
+  [ -z "$schema" ] || args+=(--json-schema "$schema")
+  j=$(mktemp) || return 2; local e; e=$(mktemp) || return 2
+  # cwd is a scratch dir OUTSIDE the real home on purpose: a session reads CLAUDE.md from its cwd and upwards, and
+  # HOME is this box's own tree, so asking from there would feed the box's instructions to the model being graded.
+  wd=$(mktemp -d) || return 2
+  # Two tries, and the second only for a blip: a case asks its questions one after another, so one API error late in
+  # a nine-question run throws away the eight already paid for. A usage limit is NOT retried — it is answered by
+  # waiting, not by asking again — and the budget cap is per question, so a retry cannot spend more than one more.
+  local lim err=""
+  for _ in 1 2; do
+    ( cd "$wd" && printf '%s' "$prompt" | CC_ROLE=worker ${CC_EVALS_THINK:+MAX_THINKING_TOKENS=$CC_EVALS_THINK} \
+        timeout 600 "$cl" "${args[@]}" > "$j" 2>"$e" ); rc=$?
+    [ -z "${CC_EVALS_METRICS:-}" ] || printf 'cost=%s\n' "$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null)" >> "$CC_EVALS_METRICS"
+    if lim=$("$(dirname "$(readlink -f "$0")")/cc-limit" check "$j" "$e" 2>/dev/null); then
+      printf 'cc-evals ask: a Claude usage limit (%s) — no answer, not a wrong one\n' "$lim" >&2
+      rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; return 2; fi
+    out=$(jq -r 'if (.structured_output|type) == "object" then (.structured_output|tojson) else (.result // "") end' "$j" 2>/dev/null)
+    if [ -n "$out" ] && [ "$(jq -r '.is_error // false' "$j" 2>/dev/null)" != true ]; then
+      rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; printf '%s\n' "$out"; return 0; fi
+    err=$(printf 'rc=%s %s %s %s' "$rc" "$(jq -r '.subtype // "no json"' "$j" 2>/dev/null)" \
+          "$(jq -r '(.result // "")[0:120]' "$j" 2>/dev/null)" "$(tail -1 "$e" 2>/dev/null)")
+  done
+  printf 'cc-evals ask: no answer from %s after two tries (%s)\n' "$model" "$err" >&2
+  rm -f "$j" "$e"; rmdir "$wd" 2>/dev/null; return 2
 }
 
 # ---- refs: the hidden half. A capability case's expected answer is never in the repo and never in plaintext — the
@@ -113,10 +172,13 @@ judge(){   # judge <case-file>
     # to switch off the only graded case there is. It is SKIP on a box that has never blessed anything (a fresh
     # install genuinely has no answers yet) and red everywhere else: in the regression set always, and in the
     # capability set once this box holds any other ref, because then the ref went missing rather than never existed.
+    # The ref check comes first because it is about this BOX, not about the answer: with no reference there is
+    # nothing to compare against however the probe went. The rc arms below then split a wrong answer from no answer.
     if [ ! -s "$REFS/$name.ref" ]; then
       if [ "$cs" = regression ] || [ -n "$(find "$REFS" -maxdepth 1 -name '*.ref' -size +0c 2>/dev/null | head -1)" ]; then
         VERDICT=FAIL; DETAIL="no blessed reference on a box that has them — deleted, not never blessed (cc-evals bless $name)"
       else VERDICT=SKIP; DETAIL="no blessed reference (cc-evals bless $name)"; fi
+    elif [ $rc -eq 2 ]; then VERDICT=INCONCLUSIVE; DETAIL=$(printf '%s' "$PROBE_OUT" | tail -1)
     elif [ $rc -ne 0 ]; then VERDICT=FAIL; DETAIL=$(printf '%s' "$PROBE_OUT" | tail -1)
     elif [ "$(digest "$(norm "$PROBE_OUT" "$TOP")")" = "$(cat "$REFS/$name.ref")" ]; then VERDICT=PASS
     else VERDICT=FAIL; DETAIL="output does not match the blessed reference"; fi
@@ -135,10 +197,10 @@ judge(){   # judge <case-file>
 
 # ---- run ----
 cmd_run(){
-  local want=regression one="" json=0 record=1
+  local want=regression one="" json=0 record=1 show=0
   while [ $# -gt 0 ]; do case $1 in
     --set) want=${2:?}; shift 2 ;; --case) one=${2:?}; shift 2 ;;
-    --json) json=1; shift ;; --no-record) record=0; shift ;;
+    --json) json=1; shift ;; --no-record) record=0; shift ;; --show) show=1; shift ;;
     *) die "run: unknown option $1" ;; esac; done
   case $want in regression|capability|all) ;; *) die "run: --set must be regression, capability or all" ;; esac
   local f n=0 p=0 fl=0 vac=0 sk=0 inc=0 incr=0 tc=0 tl=0 rows="" t0; t0=$(now_ms)
@@ -158,6 +220,12 @@ cmd_run(){
     printf '  %-12s %-26s %-8s %5s  %s\n' "$VERDICT" "$(case_name "$f")" "$(meta "$f" kind)" \
       "$(awk -v m="$DUR" 'BEGIN{printf "%.1fs", m/1000}')" "$(meta "$f" title)"
     [ -z "$DETAIL" ] || printf '               ↳ %s\n' "$DETAIL"
+    # --show: what the probe actually printed, which a graded case otherwise never shows — the verdict is a digest
+    # match and says only same-or-different, and reading a model's answers item by item is the whole of an A/B.
+    # It does not open the hidden half. What it prints is what THIS tree answered, which anyone could get by
+    # running the case's own subject; what stays hidden is whether that is the blessed answer, and blessing is
+    # still the owner's at a terminal.
+    [ "$show" = 1 ] && [ -n "$PROBE_OUT" ] && printf '%s\n' "$PROBE_OUT" | sed 's/^/               | /'
     rows+=$(printf '{"name":"%s","set":"%s","kind":"%s","verdict":"%s","duration_s":%s,"cost_usd":%s,"loops":%s,"detail":"%s"}\n' \
       "$(case_name "$f")" "$cs" "$(meta "$f" kind)" "$VERDICT" \
       "$(awk -v m="$DUR" 'BEGIN{printf "%.3f", m/1000}')" "$COST" "$LOOPS" "$(printf '%s' "$DETAIL" | tr '"\n' "' " | tr -s ' ')")$'\n'
@@ -291,6 +359,19 @@ selfcheck(){
     k "$(t grep -q '^  PASS ' <<<"$out")" "…against the hidden reference"
     out=$(E run --set capability --case cap2); k "$(t test $? -ne 0)" \
       "…and once this box holds refs, a case whose own ref is MISSING is red: deleting one must not read as a skip"
+    # ## rc 2 in the graded set. Run on `cap`, whose ref IS blessed, so what is under test is the rc handling and
+    # not the missing-ref arm above it. Both halves: no answer is soft, a wrong answer is still red.
+    mk cap capability capability "" 'graded against a ref' 'probe(){ echo "a limit, not an answer"; return 2; }'
+    out=$(E run --set capability --case cap)
+    k "$(t grep -q '^  INCONCLUSIVE ' <<<"$out")" \
+      "a graded question that never reached a model is INCONCLUSIVE, not FAIL — a usage limit is not the model answering wrong"
+    k "$(if grep -q '^  FAIL ' <<<"$out"; then echo 1; else echo 0; fi)" \
+      "…and nothing in that run is reported as a failure"
+    mk cap capability capability "" 'graded against a ref' 'probe(){ echo "a wrong answer"; return 1; }'
+    out=$(E run --set capability --case cap)
+    k "$(t grep -q '^  FAIL ' <<<"$out")" "…while a probe that ran and said no is still red: the soft arm is rc 2 alone"
+    mk cap capability capability "" 'graded against a ref' 'probe(){ echo "the answer"; }'
+
     # ## refs — the four properties that make "hidden" true
     k "$(t grep -qv 'the answer' "$d/state/refs/cap.ref")" "the reference is a DIGEST: the expected output is not in it"
     k "$(t test "$(stat -c %a "$d/state/salt")" = 600)" "the salt is not readable by anyone else — without it the digest cannot be reproduced"
@@ -305,6 +386,43 @@ selfcheck(){
     "…nor was one ever committed — a worker checkout cannot read the answers out of history either"
   k "$(t sh -c '[ ! -d "$1" ] || ! git -C "$1" rev-parse --show-toplevel' sh "$REFS")" \
     "the live refs directory is outside every git tree"
+  # ## ask — the door from a probe to a model, on a FAKE one: what is under test is the wall around the call, and a
+  # suite that spent real money to check its own plumbing would be a suite nobody runs.
+  cat > "$d/fakeclaude" <<'FAKE'
+#!/bin/sh
+cat >/dev/null
+echo call >> "$FAKE_CALLS"
+printf '%s\n' "$FAKE_JSON"
+FAKE
+  chmod +x "$d/fakeclaude"
+  local OK='{"is_error":false,"result":"FAKE-ANSWER","total_cost_usd":0.011}'
+  A(){ env CC_EVALS_HOME="$d/state" CC_EVALS_CASES="$d/cases" CC_EVALS_REFS="$d/state/refs" \
+        CC_EVALS_CLAUDE="$d/fakeclaude" FAKE_CALLS="$d/calls" FAKE_JSON="$1" CC_EVALS_METRICS="$d/metrics" \
+        "$RB/cc-evals" "${@:2}" 2>&1; }
+  absent(){ if grep -q "$1" <<<"$2"; then echo 1; else echo 0; fi; }
+  : > "$d/calls"; : > "$d/metrics"
+  out=$(A "$OK" ask <<<'a question'); k $? "ask hands back the model's answer"
+  k "$(t test "$out" = FAKE-ANSWER)" "…and only the answer"
+  k "$(t grep -q 'cost=0.011' "$d/metrics")" "…with the spend appended to the probe's metrics, not left to the case"
+  k "$(t test "$(wc -l < "$d/calls")" = 1)" "…asked once"
+  : > "$d/calls"
+  out=$(A '{"is_error":false,"result":"prose","structured_output":{"verdict":"LAND"},"total_cost_usd":0}' ask <<<'q')
+  k "$(t test "$out" = '{"verdict":"LAND"}')" "a schema answer comes back as the structure, not the prose beside it"
+  : > "$d/calls"
+  out=$(A '{"is_error":true,"result":""}' ask <<<'q'); k "$(t test $? -eq 2)" \
+    "a question that got no answer is rc 2 — INCONCLUSIVE, which is not a model answering wrong"
+  k "$(absent FAKE-ANSWER "$out")" "…and prints no answer of its own"
+  k "$(t test "$(wc -l < "$d/calls")" = 2)" "…after exactly one retry: one blip must not throw away the questions already paid for"
+  mk askcap capability capability "" 'reaches a model through ask' 'probe(){ printf q | "$CC_EVALS_ASK"; }'
+  mk askreg regression property   "" 'reaches a model, in the free set' 'probe(){ printf q | "$CC_EVALS_ASK" >/dev/null; }'
+  out=$(A "$OK" run --set capability --case askcap --show --no-record)
+  k "$(t grep -q 'FAKE-ANSWER' <<<"$out")" "a probe reaches a model through the shim, with no credentials of its own"
+  k "$(t grep -q '0.011' <<<"$out")" "…and that spend lands in the run's total"
+  out=$(A "$OK" run --set capability --case askcap --no-record)
+  k "$(absent FAKE-ANSWER "$out")" "…and without --show a graded case's output stays unread"
+  out=$(A "$OK" run --set regression --case askreg --no-record); k "$(t test $? -ne 0)" \
+    "a case that reaches a model in the FREE set is red — the door does not widen the rule it walks through"
+  rm -f "$d/cases/askcap.sh" "$d/cases/askreg.sh"
   rm -rf "$d/cases"; mkdir -p "$d/cases"
   out=$(E run --set regression); k $? "a bare install with no cases exits 0"
   k "$(t grep -q 'no cases' <<<"$out")" "…and says so rather than reporting a green it did not earn"
@@ -317,7 +435,8 @@ case "${1:-}" in
   list) cmd_list ;;
   bless) shift; cmd_bless "$@" ;;
   last) cmd_last ;;
+  ask) shift; cmd_ask "$@" ;;
   selfcheck) selfcheck ;;
-  ""|-h|--help) sed -n '2,8p' "$0" | sed 's/^# \?//' ;;
-  *) die "unknown command: $1 (run|list|bless|last|selfcheck)" ;;
+  ""|-h|--help) sed -n '2,9p' "$0" | sed 's/^# \?//' ;;
+  *) die "unknown command: $1 (run|list|bless|last|ask|selfcheck)" ;;
 esac

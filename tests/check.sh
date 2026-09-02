@@ -24,9 +24,11 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # prompts it may answer, the ones it must never touch, and the spool: no tmux of this box's is read or typed at.
 # cc-spend's ticks a synthetic transcript in a HOME of its own: the rates table, the offset/dedupe rules and both
 # phantom rules, never this box's ledger and never a model.
+# cc-econ's is fixtures of its own — a fake landing log, fake run files, a throwaway git repo — over the two
+# splits that decide every number it prints: worker vs fix round, and which population a dollar belongs to.
 # cc-time's is the clock rule itself: a known UTC instant rendered in a zone of its own (never this box's), and
 # cc-notify's one Slack-facing stamp driven through in log-only mode with the UTC log line beside it.
 # cc-guard's runs the gates themselves against fixtures in a HOME of its own, with the owner's two real
 # doors (cc-notify, cc-slack) stubbed: which denies page and which never do, and the worker kill fence.
-for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend cc-time cc-guard; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend cc-econ cc-time cc-guard; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"
