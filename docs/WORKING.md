@@ -20,7 +20,8 @@ Scripts hold the invariants (reconcile, audit, janitor); the secretary (`cc-secr
 hands you a `secretary/…` line; you decide — it is worth exactly one glance, and a wrong one costs nothing more.
 
 The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wakes every session
-every 2 h and each one works the order above on its own — nothing here waits to be asked.
+every 2 h — the tick carries what the files say (red main, open asks, queued rows, rows in flight) so an empty check
+is cheap — and each one works the order above on its own; nothing here waits to be asked.
 
 ## dispatch judgement
 - One worker per file, always. Check the board's live tracks before dispatching.

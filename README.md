@@ -27,7 +27,7 @@ Hand this repo to a Claude agent on a fresh Ubuntu box and it can do everything 
 1. `git clone https://github.com/ihsan-sa/autobox ~/dev/autobox && ~/dev/autobox/install.sh` — links `bin/` into `~/bin`, arms the user units, seeds `~/CLAUDE.md` (the box contract: autonomy norm, approval list, doc pointers) and the guides from `templates/home/` where absent — `<placeholders>` stay for the owner — links `~/WORKING.md`, installs the default Claude settings. Idempotent; never rewrites a file already at `~`.
 2. **Owner:** `claude` login once · a Slack app from `slack/app-manifest.json`, then `cc slack setup --bot xoxb-… --app xapp-… --owner-email you@…` and `cc slack on` · `cc-notify setup` · fill the never-touch list in `~/CLAUDE.md`. Tokens and approvals never come from the agent.
 3. `cc <repo>` for each project in `~/dev` (a message in its Slack channel starts one too).
-4. **Owner:** switch on `cc-pulse.timer` (installed off; `cc-pulse --dry` first — `~/USAGE.md` has the line). From then on the box wakes each session every 2 h and it works the loop in `WORKING.md` on its own; what still needs the owner is the approval list in `~/CLAUDE.md`, and it reaches them by @-mention.
+4. **Owner:** switch on `cc-pulse.timer` (installed off; `cc-pulse --dry-run` first — `~/USAGE.md` has the line). From then on the box wakes each session every 2 h and it works the loop in `WORKING.md` on its own; what still needs the owner is the approval list in `~/CLAUDE.md`, and it reaches them by @-mention.
 A box that grows things of its own keeps them in a private overlay: `PRIVATE-OVERLAY.md`.
 
 ## Layout
