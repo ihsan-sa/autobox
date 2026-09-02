@@ -28,6 +28,10 @@ still fails INTO it.
 TARGET is `<repo>` (a planning session) or `<repo>/<track>` — the same address the Slack layer routes on, and
 also the tmux window name in session `main`. The successor's window is `<target>~next` until cutover.
 
+ONLY AN INTERACTIVE SESSION IS HANDED OFF. A headless cc-loop iteration (CC_ROLE=worker) takes no phase at all:
+it journals, ends its turn, and the loop starts the next iteration on a fresh context reading that journal —
+that IS its handoff, and it costs no second session. See `worker`.
+
 THE INVARIANT. One record file, ~/.cc/state/handoff/<target>.json, names the LIVE session. The live one owns
 the channel and may act on the world; the other is muted and gated (cc-guard reads the same record). Cutover
 is ONE atomic os.replace() of that record — the single commit point — and everything after it is derived,
@@ -215,6 +219,18 @@ def mid_handoff():
     if not hid:
         return False
     return not (ID_RE.match(hid) and os.path.exists(os.path.join(HANDOFF, hid + ".done")))
+
+
+def worker():
+    """Is this turn a HEADLESS cc-loop iteration? Then it takes no phase: it journals, ENDS ITS TURN, and the
+    loop starts the next iteration with a fresh context reading that journal — that IS the handoff, and it
+    costs no second session. CC_ROLE=worker is the tell (cc-loop exports it around its `claude -p`, cc-secretary
+    around its own, and a Stop hook inherits it — cc-scope reads the same variable the same way).
+    The tmux window is NOT the tell, which is the whole bug: the LOOP holds the track's window while the session
+    inside it is headless, so a worker read as `live`. On 2026-09-01 spend-tracker's iteration opened an overlap
+    on that reading, and the INTERACTIVE successor it started finished the work, ran `cc done`, and then sat in
+    the track window forever — the Home tally showed the track RUNNING over a stale board."""
+    return os.environ.get("CC_ROLE") == "worker"
 
 
 def live_side(rec):
@@ -541,6 +557,10 @@ def start(target, pct=None, session_id="", flight=""):
     directory. Refused while a record for this target is open — one successor at a time, never a chain."""
     if not TARGET_RE.match(target):
         print(f"cc-handoff: '{target}' is not a target (<repo> or <repo>/<track>)", file=sys.stderr)
+        return 1
+    if worker():
+        print("cc-handoff: a worker iteration is not handed off — it journals, ends its turn, and its loop "
+              "starts the next one with a fresh context", file=sys.stderr)
         return 1
     old = read(target)
     if old:
@@ -919,8 +939,11 @@ def event(target, level="", pct=None, session="", busy="", live=False, taken=Fal
     `taken` = that session has already taken a phase, or a Stop hook is holding it: nothing NEW starts, but the
     level still decides the watchdog below, which is why cc-context sends it either way.
     Never from the SUCCESSOR of an OPEN handoff: a session must not police, abandon or restart the handoff it
-    is itself the second half of — but only while that handoff is still open (mid_handoff)."""
-    if mid_handoff():
+    is itself the second half of — but only while that handoff is still open (mid_handoff).
+    Never for a headless cc-loop iteration either (worker): its loop is its handoff, and there is nothing here
+    that is worth a second session. The level is still MEASURED and the session still told to journal — that is
+    cc-context's half — but no phase is opened, so the watchdog below is not run for it."""
+    if worker() or mid_handoff():
         return ""
     if read(target):
         due(target, level == "ceiling")     # an overlap is open: its deadline, every turn, from the predecessor
@@ -1170,6 +1193,10 @@ def selfcheck():
            and not TARGET_RE.match("r1/t1/x") and TARGET_RE.match("r1/t1"))
 
         os.environ.pop("CC_HANDOFF", None)
+        role0 = os.environ.pop("CC_ROLE", None)   # …and neither may the ROLE of whoever is running them: these
+                                                  # gates are run from a --go worker as often as from a session,
+                                                  # and `worker()` would then refuse every start below. Same trap
+                                                  # as $CC_HANDOFF above, restored at the end of the section.
         ok("no record at all -> nothing is open", read("r1") is None and status("r1") == 1)
         ok("an overlap needs a live window", start("nosuch") == 1)
         ok("an overlap starts on a live window", start("r1", pct=41.2) == 0)
@@ -1584,6 +1611,23 @@ def selfcheck():
         ok("...which is the one that HAS to wait for idle, so work in flight defers it",
            event("e1/t", "handoff", busy="uncommitted work in t", live=True) == "")
         ok("a planning session has no stop-then-restart path to fall into", event("e1", "ceiling", live=True) == "")
+        # ---- a headless cc-loop iteration takes NO phase, ever. Its window is live because the LOOP is in it.
+        wins["e1"] = "@e1p"
+        os.environ["CC_HANDOFF_OVERLAP"] = "1"
+        os.environ["CC_ROLE"] = "worker"
+        ok("the trigger is a no-op for a worker iteration — its loop is its handoff, and an overlap here left "
+           "an interactive successor sitting in the track window (2026-09-01, spend-tracker)",
+           event("e1/t", "handoff", 41.0, "sid-w", live=True) == "" and read("e1/t") is None)
+        ok("...at the ceiling too: nothing about a worker is worth a second session",
+           event("e1/t", "ceiling", 61.0, "sid-w", live=True) == "" and read("e1/t") is None)
+        ok("...and asked outright, --overlap refuses it rather than half-starting one",
+           start("e1/t", pct=61.0) == 1 and read("e1/t") is None and "e1/t~next" not in wins)
+        os.environ.pop("CC_ROLE", None)
+        ok("a planning session at the same line still gets its successor",
+           event("e1", "handoff", 41.0, "sid-p", live=True) == "overlap" and read("e1") is not None)
+        clear("e1")
+        wins.pop("e1~next", None)
+        os.environ["CC_HANDOFF_OVERLAP"] = "0"
         ok("a session that already took a phase only runs the watchdog",
            event("e1/t", "ceiling", live=True, taken=True) == "")
         os.environ["CC_HANDOFF"] = "somebody-elses-handoff"
@@ -1705,6 +1749,8 @@ def selfcheck():
         tmux = keep_tmux
         clear("s3")
         wins.pop("s3~next", None)
+        if role0 is not None:
+            os.environ["CC_ROLE"] = role0    # the caller's role back: a --go worker running the gates keeps it
         if ov0 is None:
             os.environ.pop("CC_HANDOFF_OVERLAP", None)
         else:

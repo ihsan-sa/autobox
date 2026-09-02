@@ -60,7 +60,7 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
   # dispatch (budget x loops), so the cap bounds exposure rather than accounting for it, and the owner is told in the
   # workspace's own updates lane when it bites. Nothing here applies to any other repo.
   member_workspace "$1" || return 0
-  local repo="$1" budget="" loops="${LOOPN:-1}" prev="" a want cap day cur spent
+  local repo="$1" budget="" loops="${LOOPN:-1}" prev="" a want cap day cur spent mention=0
   if [ ${#XTRA[@]} -gt 0 ]; then for a in "${XTRA[@]}"; do [ "$prev" = --budget ] && budget="$a"; prev="$a"; done; fi
   # `--budget 1e9` was charged as $8 (not a number → the default) and passed through as-is: a cap the dispatch it
   # gates then ignores. A budget the ledger cannot add up is refused here, before anything is charged (cc-loop too).
@@ -76,13 +76,35 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
   spent=$(printf '%s' "$cur" | jq -r --arg h "$repo" --arg d "$day" 'if (.[$h].day // "") == $d then (.[$h].usd // 0) else 0 end' 2>/dev/null) || spent=0
   case "$spent" in ''|*[!0-9.]*) spent=0;; esac
   if awk -v s="$spent" -v w="$want" -v c="$cap" 'BEGIN{exit !(s + w > c)}'; then
+    # Only the owner can raise the cap, so a refusal is a decision waiting on him rather than an ambient event: it
+    # @-mentions him in the workspace's own channel. ONCE a day — the day-stamp is claimed here, still under the
+    # ledger's lock, so of two refusals racing (or fifty in a --loop) exactly one posts and every other stays silent.
+    if [ "$(printf '%s' "$cur" | jq -r --arg h "$repo" --arg d "$day" '(.[$h].mentioned // "") == $d' 2>/dev/null)" != true ]; then
+      printf '%s' "$cur" | jq --arg h "$repo" --arg d "$day" \
+        '.[$h] = ((if (.[$h].day // "") == $d then .[$h] else {} end) + {day: $d, mentioned: $d})' > "$MEMBER_SPEND.tmp" \
+        && mv "$MEMBER_SPEND.tmp" "$MEMBER_SPEND" && mention=1
+    fi
     exec 8>&-
     echo "cc: $repo has used \$$spent of its \$$cap/day and this dispatch asks for \$$want — refused."
     "$BIN/cc-slack" post -c "#$repo-updates" "💸 \`$repo\` has used its \$$cap for today, so a dispatch was refused. Raise \`MEMBER_DAILY_USD\` or let it roll over." >/dev/null 2>&1 || true
+    if [ "$mention" = 1 ]; then
+      # DIRECT to the workspace's main channel: cc-notify's escalation walk turns a --decision raised from a
+      # member-facing cwd — and the workspace's own session is exactly who dispatches here — into an owner DM
+      # and drops the mention (review of #168). cmd_post prefixes <@owner>; -c is cwd-independent. The
+      # day-stamp holds only for a message somebody could hear: a failed post releases the claim, so the
+      # next refusal retries instead of inheriting a stamp for silence.
+      if ! "$BIN/cc-slack" post -c "#$repo" --mention \
+        "\`$repo\` hit its \$$cap/day (\$$spent used, this run asked \$$want) — raise it: \`cc-config set MEMBER_DAILY_USD <n>\`, or it resets at 00:00 UTC." >/dev/null 2>&1; then
+        { exec 8>"$MEMBER_SPEND.lock" && flock 8 \
+          && jq --arg h "$repo" 'del(.[$h].mentioned)' "$MEMBER_SPEND" > "$MEMBER_SPEND.tmp" 2>/dev/null \
+          && mv "$MEMBER_SPEND.tmp" "$MEMBER_SPEND"; } || true
+        exec 8>&-
+      fi
+    fi
     return 1
   fi
   printf '%s' "$cur" | jq --arg h "$repo" --arg d "$day" --argjson w "$want" \
-    '.[$h] = {day: $d, usd: ((if (.[$h].day // "") == $d then (.[$h].usd // 0) else 0 end) + $w)}' > "$MEMBER_SPEND.tmp" \
+    '.[$h] = ((if (.[$h].day // "") == $d then .[$h] else {} end) + {day: $d, usd: ((if (.[$h].day // "") == $d then (.[$h].usd // 0) else 0 end) + $w)})' > "$MEMBER_SPEND.tmp" \
     && mv "$MEMBER_SPEND.tmp" "$MEMBER_SPEND"
   exec 8>&-
   return 0

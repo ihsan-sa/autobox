@@ -227,6 +227,17 @@ grep -q '"pending": true' "$T/ctx/$sid.json" && ok "the pending handoff is on th
 [ "$("$B/cc-context" --handoffs 2>/dev/null | wc -l)" = 2 ] && ok "every crossing is one countable line on the ledger" || bad "ledger: $("$B/cc-context" --handoffs)"
 "$B/cc-context" --handoffs | cut -f2 | tr '\n' ' ' | grep -q 'journal handoff-deferred' \
   && ok "the ledger says which line fired" || bad "ledger kinds: $("$B/cc-context" --handoffs | cut -f2 | tr '\n' ' ')"
+# THE SAME LINE FROM A WORKER, with the overlap ON and the window live — because the LOOP is what is in that
+# window; the `claude -p` inside it is headless. Nothing is handed off: it is told to END ITS TURN, and one fixed
+# line goes into the journal, which is what stops cc-loop reading an iteration that ended itself as a refusal.
+# 2026-09-01, spend-tracker: the overlap here started an INTERACTIVE successor that finished the work, ran
+# `cc done`, and then sat in the track window forever with the Home tally showing the track RUNNING.
+rm -f "$T/ctx/$sid.json"; jw=~/.cc/state/$REPO/w1/progress.md; : > "$jw"
+d5=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_HANDOFF_OVERLAP=1 CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2 CC_ROLE=worker "$B/cc-checkpoint" ))
+{ grep -q 'END YOUR TURN' <<<"$d5" && ! grep -q 'PENDING' <<<"$d5" && grep -q '^- cc-context: iteration stopped at ' "$jw" \
+  && [ -z "$(wins "$REPO/w1~next")" ] && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
+  && ok "a worker at the handoff line is told to end its turn and its journal is marked — no successor, nothing restarted" \
+  || bad "worker at the handoff line: $d5 / journal: $(cat "$jw")"
 out=$("$B/cc" handoff $REPO w1 --over 2>&1); rc=$?
 { [ $rc = 0 ] && grep -q 'under the handoff line' <<<"$out"; } && ok "a bare --over uses that session's own handoff line" || bad "bare --over: rc=$rc $out"
 lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 10%" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column"
@@ -439,6 +450,38 @@ o5=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 1e9 2>&
 o6=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 5.5 2>&1)
 [ "$r5" = 2 ] && grep -q 'budget must be' <<<"$o5" && ! grep -q 'budget must be' <<<"$o6" \
   && ok "--budget must be a plain number: '1e9' (charged as \$8, spent as a billion) is refused, 5.5 is not" || bad "non-numeric --budget passed through (rc=$r5: $o5)"
+# A CAP THAT BITES MUST REACH THE ONE PERSON WHO CAN RAISE IT (owner, 2026-09-01: "it shouldnt fail silently. it
+# should notify their channel to tell me to bump them up"). The refusal only posted to #<handle>-updates — rung 5,
+# ambient, nobody is @'d — so a workspace could sit capped all day and the owner never knew. It now ALSO mentions him
+# in #<handle> itself (cc-notify --decision = rung 1), and exactly ONCE a day: the day-stamp is claimed under the
+# spend ledger's lock, so refusal number two — and a --loop's worth after it — says nothing.
+git -C "$GH/dev/alice" init -q && git -C "$GH/dev/alice" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+rm -f "$GH/.cc/state/member-spend.json"
+# a COPY of cc with a stub cc-slack beside it: BIN is cc's own dirname, so the stub sees the post's real args —
+# the destination is the assertion (review of #168: cc-notify's member-facing walk turned the mention into a DM).
+NB="$T/nb"; mkdir -p "$NB" "$GH/dev/alice/.cc"; : > "$GH/dev/alice/.cc/member-facing"; cp "$B/cc" "$NB/cc"
+for h in "$B"/cc-*; do ln -sf "$h" "$NB/$(basename "$h")"; done   # cc resolves EVERY helper through its own BIN
+rm -f "$NB/cc-slack"   # …and only the Slack one is the stub (a copy, not a symlink: readlink -f would escape)
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"; exit "${CAP_SLACK_RC:-0}"\n' "$T/cap.args" > "$NB/cc-slack"
+chmod +x "$NB/cc-slack"; : > "$T/cap.args"
+cap(){ ( cd "$GH/dev/alice" && env HOME="$GH" CC_MEMBER_SANDBOX=1 MEMBER_DAILY_USD=5 CAP_SLACK_RC="${CAP_SLACK_RC:-0}" "$NB/cc" alice todo --go x 2>&1 ); }
+c1=$(cap); r1=$?; m1=$(grep -c -- '--mention' "$T/cap.args" 2>/dev/null)
+grep -q 'refused' <<<"$c1" && [ "$r1" = 1 ] && [ "$m1" = 1 ] \
+  && grep -q -- '-c #alice --mention' "$T/cap.args" && grep -q -- '-c #alice-updates' "$T/cap.args" \
+  && ok "a member workspace over its daily cap @-mentions the owner IN ITS OWN CHANNEL, from the workspace's own cwd — not a DM, not -updates" \
+  || bad "capped dispatch did not mention the owner in #alice (rc=$r1, mentions=$m1): $(cat "$T/cap.args" 2>/dev/null)"
+c2=$(cap); m2=$(grep -c -- '--mention' "$T/cap.args" 2>/dev/null)
+mk=$(jq -r '.alice.mentioned // ""' "$GH/.cc/state/member-spend.json" 2>/dev/null)
+grep -q 'refused' <<<"$c2" && [ "$m2" = 1 ] && [ "$mk" = "$(date -u +%F)" ] \
+  && ok "…and only once that day: the second refusal still refuses and still posts to -updates, but the owner is not mentioned twice" \
+  || bad "the daily cap mentioned the owner more than once (mentions=$m2, marker='$mk')"
+rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
+CAP_SLACK_RC=1 cap >/dev/null; mkA=$(jq -r '.alice.mentioned // ""' "$GH/.cc/state/member-spend.json" 2>/dev/null)
+CAP_SLACK_RC=1 cap >/dev/null; m3=$(grep -c -- '--mention' "$T/cap.args" 2>/dev/null)
+[ -z "$mkA" ] && [ "$m3" = 2 ] \
+  && ok "…and a mention nobody heard releases the day-stamp: a failed post is retried on the next refusal, not inherited as silence" \
+  || bad "a failed mention kept its day-stamp (marker='$mkA', attempts=$m3)"
+rm -f "$GH/.cc/state/member-spend.json"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"

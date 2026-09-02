@@ -33,8 +33,11 @@ restart happens at the first turn where nothing is in flight — no background o
 merge/rebase, nothing uncommitted or unpushed in any worktree of this repo (see `in_flight`, which is
 deliberately pessimistic: a wrong "idle" reading is a handoff in the middle of something, and mid-task state
 lives in no file). The 60% ceiling goes anyway: past it, what a degraded session gets wrong costs more than
-the in-flight state it drops. A session with no live tmux window (a headless worker) is never restarted from
-here — its loop already gives it a fresh context — so it is told to journal instead.
+the in-flight state it drops. A HEADLESS WORKER is never restarted or handed off from here — its loop already
+gives it a fresh context — so it is told to journal and END ITS TURN, and one fixed line goes into the journal
+saying so, which is what stops cc-loop reading an iteration that ended itself as a refusal (`worker`, `MARK`).
+CC_ROLE=worker is the tell, not the tmux window: the loop HOLDS the track's window while the session inside it
+is headless, and reading the window as live is what handed spend-tracker an interactive successor (2026-09-01).
 
 THIS FILE MEASURES; IT DECIDES NO PHASES (review rec #8, 2026-08-31). Crossing a line emits ONE event —
 `cc-handoff --event <target> --level …` — and cc-handoff, which owns the whole handoff lifecycle, decides what
@@ -433,6 +436,40 @@ def overlap_open(target):
     return os.path.exists(os.path.join(HANDOFF, target.replace("/", "--") + ".json"))
 
 
+def worker():
+    """A headless cc-loop iteration (CC_ROLE=worker, exported by cc-loop around its `claude -p`; a Stop hook
+    inherits it). There is no interactive session here to restart, and none worth starting a successor beside:
+    the loop's NEXT iteration, reading the journal, is the handoff. The tmux window is not the tell — the LOOP
+    holds the track's window while the session inside it is headless, which is how spend-tracker's iteration
+    read as live, opened an overlap, and left an interactive successor sitting in the track window long after
+    the loop was done (2026-09-01). cc-handoff refuses the same way; this is the half that decides what the
+    session is TOLD."""
+    return os.environ.get("CC_ROLE") == "worker"
+
+
+MARK = "- cc-context: iteration stopped at "     # cc-loop greps this prefix (`ctx_stopped`) — the contract
+                                                 # between the two files, and the reason it is a fixed string.
+
+
+def mark_journal(m, lvl):
+    """A worker told to hand off ends its turn — write that in the JOURNAL, as a line nothing has to interpret.
+    cc-loop reads it and carries straight on to the next iteration: an iteration that ended ITSELF is neither a
+    refusal nor a reroute, and rerunning it would redo work the next fresh context can already read (the loop
+    misread exactly that on spend-tracker). Written here rather than asked of the model, because a marker a
+    model paraphrases is not a marker. Never raises: a note that cannot be written must not break a session."""
+    try:
+        pth = journal_path(m)
+        os.makedirs(os.path.dirname(pth), exist_ok=True)
+        with open(pth, "a") as f:
+            # unique per iteration ON PURPOSE: cc-loop's journal diff drops a line byte-identical to an earlier one,
+            # and two stops at the same rounded percentage would otherwise write the same line (review of #164).
+            who = f"{m.get('ts') or ''}, session {(m.get('session_id') or '?')[:8]}"
+            f.write(f"{MARK}{m['pct']:.0f}% of its context window ({lvl}, {who}) — it journalled and ended its turn; "
+                    f"the next iteration continues from this journal.\n")
+    except Exception:
+        pass
+
+
 def mid_handoff():
     """Is this session the second half of a handoff that is STILL OPEN? $CC_HANDOFF is exported into a
     successor by `cc __runnext` and outlives the handoff itself — it says "born a successor", not "still
@@ -481,7 +518,14 @@ def journal_of(m):
             else f"~/.cc/state/{m['repo']}/planning-handoff.md")
 
 
-def told(m, lvl, deferred="", restartable=True, overlapped=False):
+def journal_path(m):
+    """The same file journal_of() NAMES, as a path something can open. Built from STATE so a selfcheck writes
+    its fixtures into a temp dir and never into the box's real journals."""
+    return (os.path.join(STATE, m["repo"], m["track"], "progress.md") if m.get("track")
+            else os.path.join(STATE, m["repo"], "planning-handoff.md"))
+
+
+def told(m, lvl, deferred="", restartable=True, overlapped=False, ending=False):
     """What the session is told when it crosses a line — the Stop hook's reason."""
     s = (f"CONTEXT {m['pct']:.0f}% ({human(m['used'])} of {human(m['window'])}). Append a dated handoff entry to "
          f"{journal_of(m)} now, while there is still room to write a good one: what is done, what is next "
@@ -493,12 +537,21 @@ def told(m, lvl, deferred="", restartable=True, overlapped=False):
         return s + (" Your SUCCESSOR is already running alongside you, in this same directory, and it is not "
                     "live yet: it will message you for what the journal does not answer. Answer it, and carry "
                     "on — nothing is being restarted underneath you, and it takes over only when it says so.")
+    # `ending` is the WORKER's branch and only the worker's, before `deferred`: a worker with anything
+    # uncommitted was told a handoff was PENDING and to carry on — the one thing it must not do at its ceiling.
+    # Gated on `not restartable` it also caught planning sessions and windowless interactive ones, telling them
+    # a loop that does not exist would continue them (review of #164). What is in flight goes into the entry.
+    if ending:
+        return s + (f" Put what is unfinished right now into it — {deferred}." if deferred else "") + \
+            (" Then END YOUR TURN — do not start anything new, and do not hand off: there is no interactive "
+             "session to restart here, so this entry IS the handoff. The loop begins the next iteration from "
+             "it and from nothing else.")
     if deferred:
         return s + (f" A handoff is now PENDING: it happens at the first turn with nothing in flight, and right "
                     f"now {deferred}. Finish that; nothing is being restarted underneath you.")
     if not restartable:
         return s + (" There is no interactive session to restart here, so this entry IS the handoff — the next "
-                    "iteration starts from it and from nothing else.")
+                    "session starts from it and from nothing else.")
     return s + " This session is being handed off now."
 
 
@@ -533,7 +586,9 @@ def record(payload):
     # Only a session with a journal to write is ever interrupted — an owner's conversation is not.
     # never twice: once a handoff is taken, this session is being replaced and has nothing left to be told
     target = f"{repo}/{track}" if track else repo
-    live = have_window(target) if repo else False      # no window = a headless worker: its loop is its handoff
+    # no window = a headless worker: its loop is its handoff. So is a cc-loop ITERATION that happens to have
+    # one — the loop occupies the track's window while the session inside it is headless (worker).
+    live = bool(repo) and have_window(target) and not worker()
     # Anything the crossing MEANS is cc-handoff's to decide (review rec #8) — including the deadline of an
     # overlap already open, which is why this fires with no level too. Never from the successor of an OPEN
     # handoff: a session must not police, abandon or restart the handoff it is itself the second half of. Only
@@ -545,7 +600,10 @@ def record(payload):
     taken = bool(m["handed_off"]) or bool(payload.get("stop_hook_active"))
     fresh = bool(lvl) and bool(repo) and not taken
     busy = in_flight(payload, cwd) if (fresh and lvl != "ceiling") else None   # the ceiling goes regardless
-    if repo and not mid_handoff() and ((fresh and lvl != "journal") or overlap_open(target)):
+    # …and never from a worker either: cc-handoff refuses it a phase (its `worker`), so forking that process
+    # every turn, for what is a large share of this box's sessions, only buys a "no". Same cheap half of the
+    # rule as mid_handoff above — the authoritative half stays over there.
+    if repo and not mid_handoff() and not worker() and ((fresh and lvl != "journal") or overlap_open(target)):
         act = event(target, m, lvl or "", busy or "", live, taken)
     if fresh:
         if act == "overlap":                           # a successor is coming up alongside: nothing is restarted
@@ -559,9 +617,11 @@ def record(payload):
         elif LEVELS.index(lvl) > LEVELS.index(was.get("told") or LEVELS[0]) or not was.get("told"):
             restartable = bool(live) and bool(track)   # only a track has the stop-then-restart path
             m["told"] = lvl                            # said once per line crossed, not once per turn
-            m["say"] = told(m, lvl, busy or "", restartable)
+            m["say"] = told(m, lvl, busy or "", restartable, ending=worker())
             ledger(m, lvl if lvl == "journal" else lvl + "-deferred",
                    busy or ("no live session to restart" if not restartable else ""))
+            if worker() and track and lvl != "journal":
+                mark_journal(m, lvl)               # …and the loop reads that line instead of classifying the run
     m["pending"] = bool(lvl and lvl != "journal" and not m["handed_off"])
     tmp = p + ".tmp"
     with open(tmp, "w") as f:
@@ -748,6 +808,9 @@ def selfcheck():
     env0 = os.environ.pop("CC_CTX_WINDOW", None)
     box0 = os.environ.get("CC_CTX_BOX_MODEL")
     os.environ["CC_CTX_BOX_MODEL"] = ""        # hermetic: what THIS box runs must not decide a fixture's window
+    role0 = os.environ.pop("CC_ROLE", None)    # a --go worker runs these gates as often as a session does, and
+                                               # every case below would take the worker branch if its own role
+                                               # leaked in. Same trap as $CC_HANDOFF, restored at the end.
     hnd0 = os.environ.pop("CC_HANDOFF", None)  # …and WHO IS RUNNING THE TEST must not decide it either. The overlap
                                                # cases below are the only ones that read this, and they read it off
                                                # the ambient environment: `not os.environ.get("CC_HANDOFF")` is how a
@@ -822,7 +885,8 @@ def selfcheck():
 
     # records: written from a Stop payload, read back newest-first per track
     with tempfile.TemporaryDirectory() as d:
-        global RECORDS, HANDOFF
+        global RECORDS, HANDOFF, STATE
+        keeps, STATE = STATE, os.path.join(d, "state")     # mark_journal writes a real file: not the box's
         keep, RECORDS = RECORDS, os.path.join(d, "context")
         keeph, HANDOFF = HANDOFF, os.path.join(d, "handoff")   # mid_handoff() reads <id>.done from here: a
         os.makedirs(HANDOFF, exist_ok=True)                    # fixture must never write into the box's own
@@ -983,16 +1047,53 @@ def selfcheck():
         ok("a $CC_HANDOFF we cannot account for still holds — failure falls towards not policing your own",
            len(events) == n and len(started) == ns)
         os.environ.pop("CC_HANDOFF", None)
+
+        # ---- a cc-loop ITERATION is headless even though its window is live: the LOOP holds the track's tmux
+        # window while the session inside it is `claude -p`. Reading that window as live is what opened an
+        # overlap on spend-tracker and left an INTERACTIVE successor sitting in the track window long after the
+        # loop had finished, with the Home tally showing the track RUNNING over a stale board (2026-09-01).
+        started.clear()
+        os.environ["CC_ROLE"] = "worker"
+        jrn = os.path.join(STATE, "repo1", "track1", "progress.md")
+        n, ne = len(started), len(events)
+        r = at(420000, "sid-14")
+        ok("a worker takes no phase, live window or not — no successor, and not even a fork to be told no",
+           len(started) == n and len(events) == ne and not r["handed_off"])
+        ok("it is told to journal and END ITS TURN: the loop's next iteration is the handoff",
+           "END YOUR TURN" in r["say"] and "IS the handoff" in r["say"] and "SUCCESSOR" not in r["say"])
+        ok("...and the journal is MARKED, by this file, in a line cc-loop greps — not in prose a model chose",
+           open(jrn).read().startswith(MARK) and open(jrn).read().count("\n") == 1)
+        r = at(320000, "sid-15")
+        ok("the 30% nudge is not an ending: it says carry on, and nothing is marked",
+           "carry on" in r["say"] and open(jrn).read().count("\n") == 1)
+        r = at(420000, "sid-15b")
+        ls = open(jrn).read().splitlines()
+        ok("a second stop at the same percentage and level writes a DIFFERENT line: cc-loop's journal diff drops "
+           "a byte-identical one, and the iteration would be read as a refusal again",
+           len(ls) == 2 and ls[0] != ls[1] and all(x.startswith(MARK) for x in ls))
+        os.environ.pop("CC_ROLE", None)
+        r = at(420000, "sid-16")
+        ok("a planning session in the same window still gets its successor",
+           len(started) == n + 1 and r["handed_off"] and "SUCCESSOR" in r["say"])
+        live[0] = False
+        r = at(420000, "sid-17")
+        ok("a NON-worker that cannot be restarted still hears PENDING, not END YOUR TURN (review of #164): a "
+           "planning or windowless session with work in flight has no loop coming to continue it",
+           "PENDING" in (r.get("say") or "") and "END YOUR TURN" not in (r.get("say") or ""))
+        live[0] = True
+
         on[0] = False
         os.remove(os.path.join(wt, "dirty.txt"))
         have_window, event, overlap_open = hw0, ev0, oo0
 
-        RECORDS, HANDOFF = keep, keeph
+        RECORDS, HANDOFF, STATE = keep, keeph, keeps
 
     if env0 is not None:
         os.environ["CC_CTX_WINDOW"] = env0
     if hnd0 is not None:
         os.environ["CC_HANDOFF"] = hnd0        # put the caller's own handoff back: it gates them, and it is not ours
+    if role0 is not None:
+        os.environ["CC_ROLE"] = role0
     if box0 is None:
         os.environ.pop("CC_CTX_BOX_MODEL", None)
     else:

@@ -34,6 +34,9 @@
 # A run that came back with NOTHING is rerun as the same iteration — not an error, not an iteration. A run that
 # committed or journalled COUNTS like any other; only the model changes (F4, refusal_step). Off the end of the chain:
 # with nothing to show it stops (10); with work, the work stands and the loop carries on, on the same model.
+# AN ITERATION THAT ENDED ITSELF IS NOT CLASSIFIED AT ALL (ctx_stopped). A worker is never handed off: at its context
+# threshold cc-context tells it to journal and end its turn, and marks the journal — this loop reads that mark and
+# starts the next iteration on a fresh context, which IS the handoff. Nothing refused and nothing was rerouted.
 # Exit: 0 done | 3 waiting on the owner, board `waiting` (notified) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (notified)
 #     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
@@ -76,6 +79,14 @@ refusal_step(){   # $1 refusal_next's exit code · $2 whether the iteration prod
     2:yes) echo count;;   # the chain ends here but the work is real: keep it and carry on, on the same model
     *)     echo none;;    # not a refusal at all
   esac; }
+ctx_stopped(){   # $1 = the lines THIS iteration added to the journal -> did it end ITSELF at its context threshold?
+                 # A worker is never handed off (cc-handoff `worker`): at the threshold cc-context tells it to journal
+                 # and end its turn, and writes one fixed line into progress.md saying it did. That line is the whole
+                 # contract between the two files — cc-context owns the wording, this grep owns the prefix (the
+                 # selfcheck below checks the two still match). Such an iteration is ORDINARY: the model did not
+                 # refuse and was not rerouted, it did exactly what it was told, so it is not classified and not
+                 # rerun — the next fresh context simply continues from the journal. That IS the handoff.
+  grep -q '^- cc-context: iteration stopped at ' <<<"${1:-}"; }
 refusal_next(){   # $1 run json · $2 its stderr · $3 the model asked for → "<next>\t<why>"
                   # 0 = refused, move to <next> · 1 = not a refusal · 2 = refused with nothing left on the chain
                   # $3 may be empty — that is the normal state, and cc-model resolves it (the chain has one home)
@@ -151,6 +162,14 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   grep -q "iteration 5 .*the loop stopped (exit 10)" "$d/progress.md"; t 'the stop line says it stopped' "$?" 0
   grep -q "iteration 5 .*reran it" "$d/progress.md"; t 'and never claims it reran' "$?" 1
   grep -qE '^STATUS' "$d/progress.md"; t 'no journal line is a STATUS line' "$?" 1
+  # an iteration that ended ITSELF at its context threshold is not a refusal and not a reroute
+  ctx_stopped '- cc-context: iteration stopped at 41% of its context window (handoff) — it journalled and ended its turn; the next iteration continues from this journal.'
+  t 'an iteration that stopped for context is seen as that' "$?" 0
+  ctx_stopped "$(cat "$d/progress.md")"; t 'a refusal note is not mistaken for one' "$?" 1
+  ctx_stopped '- did the next step; cc-context: iteration stopped at 41%'; t 'only a line that STARTS with the marker counts' "$?" 1
+  ctx_stopped ""; t 'an iteration that journalled nothing is classified as before' "$?" 1
+  grep -qF -- "- cc-context: iteration stopped at " "$BIN/cc-context"
+  t 'the marker cc-context writes is still the one this file greps' "$?" 0
   # the self-review block the worker prompt carries: KEPT when the checklist is there, SUPPRESSED when it is not,
   # each on a fixture of its own — a prompt that names a checklist the worker cannot read is the thing to avoid.
   local realcl="$CHECKLIST" blk
@@ -258,24 +277,28 @@ while [ $i -lt "$MAXI" ]; do
     "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $("$BOARD" get "$repo" "$track" pr)"; exit 0; fi
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
     stop 3 "needs you" "$q  (answer: append it to $ST/task.md, drop the STATUS line from $ST/progress.md, then: cc $repo $track --go \"\")" waiting; fi
-  rn=$(refusal_next "$out" "$out.err" "$m"); rnrc=$?; rwhy=${rn#*$'\t'}; nx=""; [ "$rnrc" = 0 ] && nx=${rn%%$'\t'*}
-  case "$(refusal_step "$rnrc" "$moved")" in
-    rerun)   # nothing to show for it: the same model asked again gives the same answer
-      log "refused or rerouted on ${m:-the box default} ($rwhy) — nothing produced, so iteration $i reruns on $nx"
-      refusal_note "$i" "$m" "$nx" "$rwhy" rerun >> "$ST/progress.md"   # the next fresh context has to know why its model changed
-      "$BOARD" note "$repo" "$track" "model refused or rerouted ($rwhy) — now on $nx" >/dev/null 2>&1
-      MODEL="$nx"; i=$((i-1)); continue;;
-    count)   # F4: it committed, or it wrote the journal. Rerunning it would redo work the next context can read.
-      log "refused or rerouted on ${m:-the box default} ($rwhy) — but iteration $i produced work, so it counts${nx:+ and the model moves to $nx}"
-      if [ "$rnrc" = 0 ] || [ "$chainend" = 0 ]; then   # the end of the chain is said once, not once per iteration
-        refusal_note "$i" "$m" "$nx" "$rwhy" kept >> "$ST/progress.md"
-        "$BOARD" note "$repo" "$track" "model refused or rerouted ($rwhy) — ${nx:+now on $nx}${nx:-no model left on the chain, but the work stands}" >/dev/null 2>&1; fi
-      [ "$rnrc" = 2 ] && chainend=1
-      [ -n "$nx" ] && MODEL="$nx"; :;;   # …and on into the normal accounting below: this iteration is like any other
-    stop)
-      refusal_note "$i" "$m" "" "$rwhy" stopped >> "$ST/progress.md"
-      stop 10 "was refused" "Every model on the cc-model chain refused or was rerouted (last: ${m:-the box default}; ${rwhy:-refused}) and the last one produced nothing. The task is not the problem — check the models, then: cc $repo $track --go \"\"";;
-  esac
+  if ctx_stopped "$newprog"; then
+    log "iter $i ended itself at its context threshold — it journalled, so the next iteration continues from that"
+  else
+    rn=$(refusal_next "$out" "$out.err" "$m"); rnrc=$?; rwhy=${rn#*$'\t'}; nx=""; [ "$rnrc" = 0 ] && nx=${rn%%$'\t'*}
+    case "$(refusal_step "$rnrc" "$moved")" in
+      rerun)   # nothing to show for it: the same model asked again gives the same answer
+        log "refused or rerouted on ${m:-the box default} ($rwhy) — nothing produced, so iteration $i reruns on $nx"
+        refusal_note "$i" "$m" "$nx" "$rwhy" rerun >> "$ST/progress.md"   # the next fresh context has to know why its model changed
+        "$BOARD" note "$repo" "$track" "model refused or rerouted ($rwhy) — now on $nx" >/dev/null 2>&1
+        MODEL="$nx"; i=$((i-1)); continue;;
+      count)   # F4: it committed, or it wrote the journal. Rerunning it would redo work the next context can read.
+        log "refused or rerouted on ${m:-the box default} ($rwhy) — but iteration $i produced work, so it counts${nx:+ and the model moves to $nx}"
+        if [ "$rnrc" = 0 ] || [ "$chainend" = 0 ]; then   # the end of the chain is said once, not once per iteration
+          refusal_note "$i" "$m" "$nx" "$rwhy" kept >> "$ST/progress.md"
+          "$BOARD" note "$repo" "$track" "model refused or rerouted ($rwhy) — ${nx:+now on $nx}${nx:-no model left on the chain, but the work stands}" >/dev/null 2>&1; fi
+        [ "$rnrc" = 2 ] && chainend=1
+        [ -n "$nx" ] && MODEL="$nx"; :;;   # …and on into the normal accounting below: this iteration is like any other
+      stop)
+        refusal_note "$i" "$m" "" "$rwhy" stopped >> "$ST/progress.md"
+        stop 10 "was refused" "Every model on the cc-model chain refused or was rerouted (last: ${m:-the box default}; ${rwhy:-refused}) and the last one produced nothing. The task is not the problem — check the models, then: cc $repo $track --go \"\"";;
+    esac
+  fi
   if [[ "$subtype" == error_max_* ]] && [ "$moved" = yes ]; then errs=0; caps=0; log "capped ($subtype) but the iteration produced work — not an error, continuing"
   elif [[ "$subtype" == error_max_* ]]; then caps=$((caps+1)); log "capped ($subtype) with nothing to show ($caps)"
        [ $caps -ge 2 ] && stop 7 "hit its cap" "Two capped iterations with no commits or journal change (\$$spent). Raise --budget/--turns or split the task; log: $LOG"

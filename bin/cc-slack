@@ -7,9 +7,12 @@
                                       it in every session; the target comes from the session cwd unless given:
                                       ~/dev/<repo> → <repo>, a track worktree (.cc/track) → <repo>/<track>, ~/dev or ~ → box
   cc-slack inject [--no-start] <target> "text"      push a message into a session as if it came from Slack (tests/scripts)
-  cc-slack post [-c CHANNEL] [--thread TS] [--route TITLE] [--mention] "text"   post as the bot (cc-notify uses --route).
+  cc-slack post [-c CHANNEL] [--thread TS] [--route TITLE] [--mention] [--major] "text"   post as the bot (cc-notify uses --route).
                                       --mention = the top of the notification ladder: the MAIN channel (never the -updates
                                       lane) and an @-mention of the owner. For a blocked decision only — see ~/COMMS.md
+                                      -c '#<repo>' takes a question ('?'), a decision (❓ / an @-mention) or a MAJOR update
+                                      — --major (alias --main): something that changes what the owner would do today.
+                                      Anything else is routine → #<repo>-updates, one stderr line says so; --thread stays put
   cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--title T] [-m "text"]   upload a file as the bot;
                                       --thread lands it in that thread (default target: DM the owner); Web API only
   cc-slack post-approval [--force|--landed] <repo> <pr-number|url>   "[repo] PR #n: title — url" into #approvals; the owner's :+1:
@@ -26,7 +29,8 @@
   cc-slack mkchannel <name>… [--public]    create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the
                                       topic; a #<repo>--<sub> name also inherits #<repo>'s people (one channel per project).
                                       A repo channel comes as a PAIR: #<name>-updates is created and routed with it
-  cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent one-shot)
+  cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent one-shot;
+                                      a channel whose only member is the bot — the vitals store — gets none)
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]   give a sub-orchestrator its own channel
                                       <parent name minus its id>-<alias>-<4 base36 chars>; recorded in ~/.cc/slack/orchs.json (`cc <repo> --orch` calls it)
   cc-slack archive <#chan|C…> | archive --orch <target> <alias>   archive a sub-orch channel; it stops routing and leaves the Home tab
@@ -752,9 +756,10 @@ def main_lane(name):
 
 def lane_split(name):
     """Does #name get an -updates sibling? A repo channel does. #approvals and #alerts keep their own jobs, a lane is
-    never split again, and a `#<repo>--<track>` channel is not one either — a track is already a repo's detail lane."""
+    never split again, and a `#<repo>--<track>` channel is not one either — a track is already a repo's detail lane.
+    Nor the box's own picture store (VITALS_STORE): nobody talks there, so it has no second lane to talk in."""
     n = (name or "").lower()
-    return bool(n) and n not in (APPROVALS, ALERTS) and "--" not in n and not main_lane(n)
+    return bool(n) and n not in (APPROVALS, ALERTS, VITALS_STORE) and "--" not in n and not main_lane(n)
 
 
 def lane_of(name, target):
@@ -762,6 +767,28 @@ def lane_of(name, target):
     updates sibling of the channel that IS this target — a project genuinely called `foo-updates` is its own main lane."""
     base = main_lane((name or "").lstrip("#"))
     return UPDATES if base and base.replace("--", "/", 1) == target else "main"
+
+
+def routine_text(text):
+    """Nothing in it asks the owner for anything: no question mark, and no DECISION MARKER — a ❓, a 🔐 (cc-guard's
+    "nothing happens until the owner answers", which a member must see in their own channel) or an inline @-mention
+    (<@U…>, <!here>) — or the bare `@handle` a session actually types, which post() linkifies only AFTER this gate.
+    Links are dropped first, so a `?q=` in one is not a question. Words are not read: `decision` in a
+    sentence marks nothing, exactly as needs_owner is declared by the session and never guessed from its prose."""
+    t = re.sub(r"<?\bhttps?://\S*[^\s?]", "", text or "")   # stops short of a terminal ?, so "…/pull/1?" is still a question
+    if MENTION_RE.search(t):   # word-boundary-anchored: a@b.com and .../@x do not trigger; @main merely stays in main, the pre-gate behaviour
+        return False
+    return not re.search(r"[?？❓🔐]|<@[UW][A-Z0-9]+|<!(?:here|channel|everyone)>", t)
+
+
+def bot_only(cfg, cid):
+    """A channel whose only member is the bot: the box's own store, not a place people talk, so no -updates twin. On
+    2026-09-01 the sweep gave #cc-vitals-store one and the owner archived it by hand. Unknown (API refusal) → False,
+    which is the behaviour before this check existed; the sweep is idempotent, so a rerun settles it."""
+    try:
+        return len(channel_members(cfg, cid)) <= 1
+    except Exception:
+        return False
 
 
 def load_provisioned():
@@ -5273,12 +5300,14 @@ def cmd_setup(argv):
 def cmd_post(argv):
     cfg = load_cfg()
     chan = thread = route = None
-    mention = False
+    mention = major = False
     args = []
     i = 0
     while i < len(argv):
         if argv[i] == "--mention":
             mention = True; i += 1
+        elif argv[i] in ("--major", "--main"):
+            major = True; i += 1
         elif argv[i] == "-c":
             chan = argv[i + 1]; i += 2
         elif argv[i] == "--thread":
@@ -5302,6 +5331,17 @@ def cmd_post(argv):
         else:
             name = re.split(r"[/\s\]]", route.strip().lstrip("["), maxsplit=1)[0].lower()   # "[repo] PR #n …" (landing titles) → repo
             chan = "#" + (updates_name(name) if not mention and resolve_channel(cfg, updates_name(name)) else name) if name else None
+    if chan and chan.startswith("#") and not (mention or thread or major):
+        # THE MAIN LANE IS THE OWNER'S (owner, 2026-09-01, after a routine cross-session bug report sat in a main
+        # channel three hours after the split): -c '#<repo>' takes a question, a decision for him, or a MAJOR update —
+        # nothing routine.
+        # A question is a '?', a decision is a ❓ or an @-mention (inline, or --mention: rung 1), and major is the
+        # caller's own deliberate word, --major. Everything else is redirected to the -updates twin when the box has
+        # one. A --thread post is a reply and stays where its thread is; a raw C… id is the reply tool's door, not gated.
+        name = chan[1:].lower()
+        if lane_split(name) and routine_text(text) and resolve_channel(cfg, updates_name(name)):
+            print(f"cc-slack: routine → #{updates_name(name)} (#{name} takes a question, a decision or --major)", file=sys.stderr)
+            chan = "#" + updates_name(name)
     if chan and chan.startswith("#"):
         chan = resolve_channel(cfg, chan[1:])
     if not chan:                                     # no project channel for this title: machinery notices go to #alerts, then SLACK_CHANNEL
@@ -5585,7 +5625,8 @@ def cmd_updates_sweep(argv):
     """updates-sweep [--dry-run] — give every repo channel the bot is in its -updates sibling. Idempotent, so this is
     the ONE-SHOT for channels that predate the split; anything made after it gets the lane from `mkchannel`. Skipped:
     #approvals and #alerts (they keep their own jobs), a lane itself, a `#<repo>--<track>` channel and a sub-orch
-    channel — each of those is already somebody's detail lane and inherits the cap instead of being split again."""
+    channel — each of those is already somebody's detail lane and inherits the cap instead of being split again —
+    and any channel whose only member is the bot (#cc-vitals-store), which is a store, not a place people talk."""
     cfg = load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("no SLACK_BOT_TOKEN — cc slack setup first", file=sys.stderr); return 1
@@ -5597,7 +5638,7 @@ def cmd_updates_sweep(argv):
         if not cur:
             break
     have = {n for n, _ in seen}
-    todo = [(n, c) for n, c in sorted(seen) if lane_split(n)]
+    todo = [(n, c) for n, c in sorted(seen) if lane_split(n) and not bot_only(cfg, c)]
     for name, cid in todo:
         un = updates_name(name)
         if dry:
@@ -5609,7 +5650,7 @@ def cmd_updates_sweep(argv):
         except Exception as e:
             print(f"#{un}: {e}", file=sys.stderr); rc = 1; continue
         print(f"#{un} ({ucid}) {how} → {name.replace('--', '/', 1)}")
-    print(f"{len(todo)} repo channel(s); the rest are not split (#{APPROVALS}, #{ALERTS}, lanes, tracks, sub-orchs).")
+    print(f"{len(todo)} repo channel(s); the rest are not split (#{APPROVALS}, #{ALERTS}, lanes, tracks, sub-orchs, bot-only stores).")
     return rc
 
 
@@ -7379,6 +7420,46 @@ def cmd_selfcheck():
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
     check("the ladder: no SLACK_OWNER_ID — the rung-1 post still goes to the main channel, just without the <@…>",
           postedM == [("C-myrepo", "which database do I restore?")])
+    postedG, errG = [], io.StringIO()
+    real_um = unresolved_mentions
+    try:                                                     # THE MAIN LANE IS THE OWNER'S (owner, 2026-09-01): a question, a decision or a major
+        globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None: postedG.append(chat) or (1, "1.0")
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+        globals()["unresolved_mentions"] = lambda cfg, text, chat=None: []   # the fake token cannot ask users.list; the warning path has its own cases
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errG):
+            rcG = cmd_post(["-c", "#myrepo", "bug report from lesson-builder: the skill drops step 3"])   # routine → the twin
+            cmd_post(["-c", "#myrepo", "restore which database?"])                                       # a question → main
+            cmd_post(["-c", "#myrepo", "❓ blocked on the token"]); cmd_post(["-c", "#myrepo", "<@UOWNER> needs you"])   # decision markers → main
+            cmd_post(["-c", "#myrepo", "@ada.byron pick the rollback target"])                            # a bare @handle is one too: linkified only after the gate
+            cmd_post(["-c", "#myrepo", "🔐 I cannot do that part myself: it opens a port.\nI have asked the owner"])       # cc-guard's refusal: the member must see it
+            cmd_post(["-c", "#myrepo", "--thread", "1.0", "done, see above"])                            # a reply stays in its thread
+            cmd_post(["-c", "#myrepo", "--major", "the box lost its disk"]); cmd_post(["-c", "#myrepo", "--main", "same, old spelling"])
+            cmd_post(["-c", "#myrepo", "--mention", "approve the spend"])                                # rung 1 is never redirected
+            cmd_post(["-c", "#myrepo", "see <https://x.example/a?b=1|the run> — green"])                  # a '?' in a link is not a question
+            cmd_post(["-c", "#alerts", "box boot"]); cmd_post(["-c", "#myrepo--w1", "step 3 green"]); cmd_post(["-c", "#myrepo-updates", "digest"])
+            cmd_post(["-c", "C123", "raw id, routine"])                                                   # the reply tool's door: not gated
+    finally:
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["unresolved_mentions"] = real_um
+    check("the main lane is the owner's: a routine -c '#<repo>' post is redirected to #<repo>-updates and one stderr line says so "
+          "(exit 0); a question ('?'), a decision (❓ / 🔐 / an @-mention / --mention), a --thread reply and --major (alias --main) "
+          "stay in #<repo>; #alerts, a track channel, a lane and a raw id are untouched",
+          rcG == 0 and postedG == [f"C-myrepo-{UPDATES}"] + ["C-myrepo"] * 9 + [f"C-myrepo-{UPDATES}", "C-alerts", "C-myrepo--w1", f"C-myrepo-{UPDATES}", "C123"]
+          and errG.getvalue().count(f"routine → #myrepo-{UPDATES}") == 2 and len(errG.getvalue().strip().splitlines()) == 2)
+    check("a question mark glued to a trailing link is still a question (review-159), while a ?q= inside a link is not",
+          not routine_text("can I merge https://github.com/o/r/pull/159?") and routine_text("see https://x.y/a?q=1 done")
+          and not routine_text("<https://x.y/p|the PR>?"))
+    postedH = []
+    try:                                                     # …and a repo with no twin yet keeps its routine post: the gate redirects, it never drops
+        globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else f"C-{name}"
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None: postedH.append(chat) or (1, "1.0")
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cmd_post(["-c", "#myrepo", "routine, no twin yet"])
+    finally:
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+    check("no -updates twin on this box → the routine post stays in #<repo>, exactly as before the gate", postedH == ["C-myrepo"])
     dmL19 = Daemon(use_slack=False); said19 = []; dmL19.say = lambda chat, text, thread=None: said19.append(text)
     real_run19 = subprocess.run
     try:
@@ -9370,13 +9451,13 @@ def cmd_selfcheck():
         os.mkdir(f"{devU}/repou")
         cfgU = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
         globals()["load_cfg"] = lambda: dict(cfgU)
-        liveU, callsU = {}, []                       # the workspace: name -> id, as the two commands leave it
+        liveU, callsU, membersU = {}, [], {}         # the workspace: name -> id, as the two commands leave it; id -> who is in it
         def apiU(m, token, **kw):
             callsU.append((m, kw))
             if m == "conversations.create":
                 liveU[kw["name"]] = "C-" + kw["name"]; return {"channel": {"id": liveU[kw["name"]]}}
             if m == "conversations.members":
-                return {"members": ["UOWNER", "UMATE"]}
+                return {"members": membersU.get(kw.get("channel"), ["UOWNER", "UMATE"])}
             if m == "users.info":
                 return {"user": {}}
             if m == "conversations.list":
@@ -9411,6 +9492,13 @@ def cmd_selfcheck():
             rcU4 = cmd_updates_sweep([])
         check("updates-sweep runs twice with no second channel: the lane routes by NAME, so there is no table to drift",
               rcU4 == 0 and not [1 for m, _ in callsU if m == "conversations.create"])
+        callsU.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            liveU[VITALS_STORE] = "C-" + VITALS_STORE; liveU["lonely"] = "C-lonely"; membersU["C-lonely"] = ["UBOT"]
+            rcU5 = cmd_updates_sweep([]); rcU6 = cmd_mkchannel([VITALS_STORE])
+        check(f"updates-sweep and mkchannel: #{VITALS_STORE} (the box's picture store) and any channel whose only member is the "
+              "bot get NO -updates twin — on 2026-09-01 the sweep made one for the store and the owner archived it by hand",
+              (rcU5, rcU6) == (0, 0) and not [1 for m, _ in callsU if m == "conversations.create"] and not lane_split(VITALS_STORE))
     finally:
         globals()["api"], globals()["find_channel"], globals()["load_cfg"], globals()["DEV"] = _apiU, _fcU, _lcU, _devU
         os.path.exists(f"{DIR}/{ORCHS}") and os.unlink(f"{DIR}/{ORCHS}")
