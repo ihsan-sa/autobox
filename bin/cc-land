@@ -690,11 +690,27 @@ class Land:
         """The PR's head as a SHA, and its base brought up to date. The BASE fetch is not incidental: the diff and
         the changed-file list are taken from the merge-base against the LOCAL origin/<base>, and a checkout that
         has not fetched in a day makes that merge-base old — the reviewer is then handed commits that landed last
-        week as if this PR added them, and pays for reading them. Sets self.head and returns it."""
+        week as if this PR added them, and pays for reading them.
+
+        The head is read from the PR's own BRANCH ref, and `pull/<pr>/head` is only the fallback: GitHub's pull ref
+        lags the branch. On PR #182 (2026-09-02) pull/182/head was still at the pre-fix SHA 78 minutes after the fix
+        was pushed — so the tree fetched here would have been the old one, the reviewer re-reports findings that are
+        already fixed, the queue buys a repair round with nothing left to repair, and it repeats. A disagreement
+        between the two refs is said out loud and written to the ledger; repairing GitHub's ref is not this box's
+        job. Sets self.head and returns it."""
+        branch = (self.facts.get("headRefName") or "").strip()
+        pull = f"refs/pull/{self.pr}/head"
+        shas = remote_shas(self.repo, f"refs/heads/{branch}" if branch else "", pull)
+        on_branch, on_pull = shas.get(f"refs/heads/{branch}", ""), shas.get(pull, "")
+        if on_branch and on_pull and on_branch != on_pull:
+            out("!", f"PR #{self.pr}: GitHub's {pull} says {on_pull[:12]} but {branch} is at {on_branch[:12]} — "
+                     f"the pull ref is stale. Reading the branch.")
+            ledger(f"stale-pull-ref {self.repo}#{self.pr} pull={on_pull[:12]} {branch}={on_branch[:12]}")
         with git_lock(self.root):   # FETCH_HEAD is one file per repo: the fetch and the rev-parse that reads it
                                     # back are one operation, or a sibling thread's PR head is the answer
             sh(["git", "fetch", "-q", "origin", self.base()], cwd=self.root, timeout=300)   # stale is not fatal
-            rc, o = sh(["git", "fetch", "-q", "origin", f"pull/{self.pr}/head"], cwd=self.root, timeout=300)
+            spec = f"refs/heads/{branch}" if on_branch else f"pull/{self.pr}/head"
+            rc, o = sh(["git", "fetch", "-q", "origin", spec], cwd=self.root, timeout=300)
             if rc:
                 raise Failed(f"cannot fetch PR #{self.pr}: {last(o)}")
             rc, o = sh(["git", "rev-parse", "FETCH_HEAD"], cwd=self.root)
@@ -1569,6 +1585,37 @@ def pane_live(wid):
     return rc == 0
 
 
+def remote_head(repo, branch):
+    """The SHA `branch` really points at on origin, or "" if the remote cannot answer.
+
+    `gh pr view --json headRefOid` is not that SHA: it is a field of the PR object, and that object lags the ref
+    it describes. On PR #182 (2026-09-02) gh served 79fd93b with an updatedAt of 14:21Z for a branch that had been
+    at 48fff51 since 14:35Z, and it was still serving it 76 minutes later — so fix_progress read a real push as
+    'nothing pushed' and the job sat at fixing until its 90-minute deadline. ls-remote asks the remote itself, so
+    there is no object in between to go stale. Empty on any doubt (no branch name, a failed call, a deleted ref,
+    anything that is not a bare SHA), and the caller then keeps the PR object's answer — the same behaviour as
+    before this existed."""
+    return remote_shas(repo, f"refs/heads/{branch}").get(f"refs/heads/{branch}", "") if branch else ""
+
+
+def remote_shas(repo, *refs):
+    """{ref: sha} — what origin ITSELF says those refs point at, asked in one call. A ref the remote does not
+    answer for, or an answer that is not a bare SHA, is simply absent, and every caller then falls back to what
+    it had before."""
+    refs = [r for r in refs if r]
+    if not refs:
+        return {}
+    rc, o = sh(["git", "ls-remote", "origin", *refs], cwd=repo_root(repo), timeout=120)
+    if rc != 0:
+        return {}
+    got = {}
+    for row in (o or "").splitlines():
+        bits = row.split()
+        if len(bits) == 2 and re.fullmatch(r"[0-9a-f]{40}", bits[0]):
+            got[bits[1]] = bits[0]
+    return got
+
+
 def fix_progress(path, job):
     """A job waiting on the fix iteration it dispatched. A pushed head alone is NOT the round ending — the loop
     checkpoints and pushes every iteration (review-176c), so the head moving off the reviewed SHA re-queues the
@@ -1580,13 +1627,17 @@ def fix_progress(path, job):
     Returns a line to stand down with, or "" to run the job now."""
     fix = job.get("fix") or {}
     repo, pr = job.get("repo") or "", job.get("pr")
-    rc, o = sh(["gh", "pr", "view", str(pr), "--json", "headRefOid"], cwd=repo_root(repo), timeout=120)
-    head = ""
+    head, branch = "", ""
+    rc, o = sh(["gh", "pr", "view", str(pr), "--json", "headRefOid,headRefName"],
+               cwd=repo_root(repo), timeout=120)
     if rc == 0:
         try:
-            head = ((json.loads(o) or {}).get("headRefOid") or "").strip()
+            facts = json.loads(o) or {}
+            head = (facts.get("headRefOid") or "").strip()
+            branch = (facts.get("headRefName") or "").strip()
         except ValueError:
-            head = ""
+            head, branch = "", ""
+    head = remote_head(repo, branch) or head    # the REMOTE's own ref is the head; the PR object is only the fallback
     if head and head != fix.get("head"):
         late = stamp() >= (fix.get("deadline") or "")     # the deadline bounds EVERY wait here, whatever the track looks like
         if not late and track_running(repo, fix.get("track") or ""):
@@ -3015,6 +3066,74 @@ def cmd_selfcheck():
               "back to the ordinary path and the owner is told, once, that nothing was re-read",
               not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told()
               and not ran_sub("cc", "myrepo", "w1", "--go"))
+
+        # ...and where the head is READ from. The PR object lags the ref it describes: on PR #182 (2026-09-02) gh
+        # served a headRefOid 41 minutes older than the branch's real head, and was still serving it 76 minutes
+        # later — so a round that had pushed read as silent and the job sat at fixing to its deadline.
+        for name, gh_says, remote_says, requeues in [
+                ("the PR object is STALE (it still names the reviewed head) but origin's ref has moved: the push is "
+                 "seen, because the head is read from the remote and not from the PR object (PR #182)",
+                 "reviewed", "b" * 40, True),
+                ("...and the remote is believed the OTHER way too: the PR object naming a head origin's ref does "
+                 "not have (a force-push it caught mid-flight) is not a push, so no review is bought on a SHA that "
+                 "is not on the branch", "c" * 40, "reviewed", False)]:
+            landing(**AFTERFIX)
+            quiet(cmd_work, [])
+            reviewed = ((read_json(job_path("myrepo", 7)) or {}).get("fix") or {}).get("head") or ""
+            world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "review\n")   # the round has stopped: board word gone…
+            world["tmux list-windows"] = (0, "")                              # …and no window holding a loop either
+            world["gh pr view 7 --json headRefOid"] = (0, json.dumps(
+                {"headRefOid": reviewed if gh_says == "reviewed" else gh_says, "headRefName": "track/w1"}))
+            world["git ls-remote origin refs/heads/track/w1"] = (
+                0, f"{reviewed if remote_says == 'reviewed' else remote_says}\trefs/heads/track/w1\n")
+            n_pushed = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
+            quiet(cmd_work, [])
+            log = open(f"{LANDQ}/queue.log").read()
+            check(name, log.count("fix-pushed myrepo#7") == n_pushed + (1 if requeues else 0)
+                  and (("->" + (remote_says if requeues else "")[:12]) in log if requeues else True))
+        # the second case deliberately leaves the job WAITING, so drop it here rather than in the sweep that follows
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))
+
+        # ...and where the TREE the reviewer is handed comes from, which is the same staleness one layer down:
+        # GitHub's OWN pull/<pr>/head lags the branch. On PR #182 it was still at the pre-fix SHA 78 minutes after
+        # the fix was pushed, so a review bought on it reads the old tree, re-reports findings that are already
+        # fixed, and buys a repair round with nothing left to repair — on repeat.
+        BR, ON_BRANCH, ON_PULL = "track/w1", "a" * 40, "d" * 40
+        fetched = []
+        for k in [k for k in world if k.startswith("git ls-remote")]:
+            world.pop(k)            # these cases answer ls-remote themselves; the block above left a longer key
+        world["git fetch -q origin"] = lambda argv: (fetched.append(argv[-1]), (0, ""))[1]
+        world["git rev-parse FETCH_HEAD"] = lambda argv: (
+            0, (ON_BRANCH if fetched and fetched[-1].startswith("refs/heads/") else ON_PULL) + "\n")
+        for name, answer, spec, head, loud in [
+                ("the tree read is the BRANCH's, not GitHub's stale pull ref: with the two refs disagreeing the "
+                 "landing fetches refs/heads/<branch> and says so out loud, so no review is bought on the old tree "
+                 "(PR #182)", f"{ON_BRANCH}\trefs/heads/{BR}\n{ON_PULL}\trefs/pull/7/head\n",
+                 f"refs/heads/{BR}", ON_BRANCH, True),
+                ("...and with the two refs AGREEING nothing is said: preferring the branch must not page anyone on "
+                 "the ordinary PR", f"{ON_BRANCH}\trefs/heads/{BR}\n{ON_BRANCH}\trefs/pull/7/head\n",
+                 f"refs/heads/{BR}", ON_BRANCH, False),
+                ("...and a branch origin cannot answer for (deleted or renamed under the PR) falls back to "
+                 "pull/<pr>/head exactly as before", f"{ON_PULL}\trefs/pull/7/head\n",
+                 "pull/7/head", ON_PULL, False)]:
+            world["git ls-remote origin"] = (0, answer)
+            L = Land("myrepo", pr=7)
+            L.facts = dict(FACTS, headRefName=BR)
+            fetched.clear(); calls.clear()
+            n_stale = open(f"{LANDQ}/queue.log").read().count("stale-pull-ref") if os.path.exists(
+                f"{LANDQ}/queue.log") else 0
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                got = L.fetch_head()
+            said, stale = buf.getvalue(), open(f"{LANDQ}/queue.log").read().count("stale-pull-ref")
+            check(name, fetched[-1:] == [spec] and got == head
+                  and (("the pull ref is stale" in said and ON_BRANCH[:12] in said and ON_PULL[:12] in said
+                        and stale == n_stale + 1)
+                       if loud else ("stale" not in said and stale == n_stale)))
+        for k in ("git fetch -q origin", "git rev-parse FETCH_HEAD", "git ls-remote origin"):
+            world.pop(k, None)      # …and the callables above do not leak into the sections that follow
+
         shutil.rmtree(stdir, ignore_errors=True)
 
         # (5) SEVERAL jobs are read and gated AT ONCE, and the merges still happen one at a time, in queue order.

@@ -6,7 +6,11 @@
 #                                           one — for a repair round, where the context that found the bug is the
 #                                           expensive part; later iterations are fresh as always
 #                          [--no-extend]    the step limit is FINAL: no carry-on batches at --max-iter, so a caller
-#                                           that promised "one round" (cc-land's fix round) gets exactly that
+#                                           that promised "one round" (cc-land's fix round) gets exactly that.
+#                                           A bound reached with the last iteration COMMITTING is the round ending:
+#                                           exit 0 and no page, board `review` where the track has a PR to review
+#                                           and `blocked` where it has none. Only a bound reached with nothing
+#                                           committed is exit 6 / `blocked` / "paused".
 #   cc-loop worker-model [M]  the model a worker runs on, and why (worker_model below) — cc names it on its dispatch line
 #   cc-loop context-report <session.jsonl>…  what a turn of a past iteration actually carried, and what the context
 #                                            trim below would have left of it — the shadow week's one command
@@ -209,6 +213,31 @@ selfrev_block(){   # $1 the base branch → the self-review paragraph the worker
   [ -r "$CHECKLIST" ] || return 0
   printf " Before you append 'STATUS: DONE', re-read \`git diff origin/%s\` against the LANDING SELF-REVIEW below and fix what it finds — it is templates/self-review.md, so an entry that is wrong is fixed THERE, not in this copy.\n\n%s\n" \
     "$1" "$(cat "$CHECKLIST")"; }
+this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
+  # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
+  # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
+  # wrote it again, the difference came back empty, and the loop ran on past a task that was finished. Where a
+  # line IS is what makes it this iteration's; what it SAYS is not. The old rule's point is kept — from the first
+  # line that differs, everything is this iteration's, so a journal the worker rewrote counts from the rewrite
+  # and an untouched STATUS line from a previous dispatch is still invisible.
+  # …and the snapshot is matched BY NAME, not by `NR==FNR`: a track on its first iteration has an EMPTY journal,
+  # awk reads no record from it, and `NR==FNR` is then true for the SECOND file — every line of it swallowed as
+  # "already there", so the first STATUS line a new track ever writes was invisible (caught by selftest.sh's w11).
+  awk -v f1="$1" 'FILENAME==f1{a[FNR]=$0; n=FNR; next} !f && FNR<=n && a[FNR]==$0 {next} {f=1; print}' \
+      "$1" "$2" 2>/dev/null; }
+
+round_end(){   # $1 did the last iteration commit? · $2 the track's PR, if it has one → "<outcome>|<board word>"
+  # Under --no-extend the limit IS the end of the round — cc-land's fix round asks for exactly one — so an
+  # iteration that committed is the round FINISHING. Reporting that as "the last one committed nothing" and
+  # pausing the board read to the owner as a stall over a branch that had just been pushed.
+  # …and `review` is a CLAIM THAT THERE IS SOMETHING TO REVIEW, which cc-reconcile reads as one: a `review` row
+  # with no PR is "it is waiting on a PR that was never opened", filed to the owner every 20 minutes. --no-extend
+  # is a plain `cc` flag too, not only cc-land's fix round, and a hand-run bounded round need not have opened
+  # anything — so the word is `review` only where a PR exists to carry it, and otherwise `blocked`: what this line
+  # said before the round-over path existed, and what cc-reconcile itself settles a stopped loop on.
+  [ "${1:-no}" = yes ] || { printf 'paused|blocked\n'; return 0; }
+  [ -n "${2:-}" ] && printf 'over|review\n' || printf 'over|blocked\n'; }
+
 selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the model it moves to, what it does with
                # an iteration that was rerouted but still worked (F4), and the line it journals.
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
@@ -323,6 +352,34 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   t 'under the trigger the report says nothing would have gone' "$(sumf "$under" trimmed)" "$(sumf "$under" ctx)"
   [ "$(sumf "$over" trimmed)" -lt "$(sumf "$over" ctx)" ] && less=yes || less=no
   t 'over it, that turn would have carried less' "$less" yes
+  # ── "did this iteration do work?" — the two answers the loop got wrong, each on its own fixture ──
+  # (a) WHAT THIS ITERATION WROTE. By position, so a STATUS line that reads exactly like an older one still counts.
+  local snap now
+  mkdir -p "$d/it"; snap="$d/it/snap"; now="$d/it/progress.md"
+  printf 'iter 1: did a thing\nSTATUS: DONE\n' > "$snap"          # a previous dispatch already finished once…
+  cp "$snap" "$now"; printf 'iter 2: did the appended scope\nSTATUS: DONE\n' >> "$now"   # …and this one finished again
+  t 'a STATUS: DONE identical to one already in the journal is still THIS iteration'"'"'s: the loop finishes' \
+    "$(this_iteration "$snap" "$now" | grep -cE '^STATUS: DONE')" 1
+  cp "$snap" "$now"; printf 'iter 2: still working\n' >> "$now"   # the same snapshot, nothing declared this time
+  t '...and with nothing declared this iteration the old STATUS line stays invisible, so a re-dispatched track \
+does not finish on it' "$(this_iteration "$snap" "$now" | grep -cE '^STATUS: DONE')" 0
+  printf 'rewritten from scratch\nSTATUS: DONE\n' > "$now"        # the worker rewrote the file wholesale
+  t '...and a journal rewritten in place counts from the first line that differs, not from nothing' \
+    "$(this_iteration "$snap" "$now" | grep -cE '^STATUS: DONE')" 1
+  : > "$snap"; printf 'iter 1: the first thing this track ever wrote\nSTATUS: DONE\n' > "$now"
+  t '...and a track on its FIRST iteration, whose journal was empty when the snapshot was taken, is not swallowed \
+whole — the empty snapshot is the case that broke this (selftest w11)' \
+    "$(this_iteration "$snap" "$now" | grep -cE '^STATUS: DONE')" 1
+  # (b) WHAT HITTING THE STEP LIMIT MEANS. Committed = the round ending; nothing committed = paused.
+  t 'a bounded round whose last iteration COMMITTED is the round ending: exit 0, board review, nobody paged' \
+    "$(round_end yes 'https://x/pr/1')" 'over|review'
+  t '...but `review` is a claim there is something to review: a bounded round that opened no PR gets `blocked` \
+instead, or cc-reconcile files "waiting on a PR that was never opened" against it every 20 minutes' \
+    "$(round_end yes '')" 'over|blocked'
+  t '...and only a bound reached with nothing committed is a pause the owner hears about, PR or no PR' \
+    "$(round_end no 'https://x/pr/1')" 'paused|blocked'
+  grep -qF 'round_end "${committed:-no}"' "$0"
+  t 'and the loop body really asks it rather than deciding the same thing twice' "$?" 0
   sed 's/^/  journal fixture | /' "$d/progress.md"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -409,7 +466,7 @@ while [ $i -lt "$MAXI" ]; do
   moved=no; { [ "$before_head" != "$after_head" ] || [ "$before_prog" != "$after_prog" ]; } && moved=yes
   log "iter $i end rc=$rc err=$iserr/$subtype turns=$turns cost=\$$cost total=\$$spent commits=$([ "$before_head" != "$after_head" ] && echo yes || echo no) journal=$([ "$before_prog" != "$after_prog" ] && echo updated || echo unchanged)"
   [ "$QUIET" = 1 ] || jq -r '.result // ""' "$out" 2>/dev/null | tail -c 600 | sed 's/^/  │ /' >&2
-  newprog=$(grep -vxFf "$SNAP" "$ST/progress.md" 2>/dev/null)   # only THIS iteration's lines count, even if the worker rewrote the file (a re-dispatched track must not "finish" on an old STATUS line)
+  newprog=$(this_iteration "$SNAP" "$ST/progress.md")   # only THIS iteration's lines count, by position — see the function (a re-dispatched track must not "finish" on an old STATUS line, and must not MISS a new one that reads the same)
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1
     log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?   # captured, never `| tail -1`: the pipe dropped the status
@@ -470,4 +527,11 @@ while [ $i -lt "$MAXI" ]; do
     log "step limit reached with work committed — carrying on for $BATCH more (round $rounds, \$$spent)"
     "$BOARD" note "$repo" "$track" "picked itself up at the step limit: $i iterations, \$$spent, still committing" >/dev/null 2>&1; fi
 done
-stop 6 "paused" "Hit $MAXI iterations (\$$spent) and the last one committed nothing, so it did not carry itself on. Continue with: cc $repo $track --go \"\" --loop N"
+IFS='|' read -r ended bst <<<"$(round_end "${committed:-no}" "$("$BOARD" get "$repo" "$track" pr 2>/dev/null)")"
+if [ "$ended" = over ]; then   # bounded and still committing: the round did its job, so nobody is paged and the board says review
+  "$BOARD" status "$repo" "$track" "$bst" >/dev/null 2>&1
+  "$BOARD" note "$repo" "$track" "loop: round over at its $MAXI-iteration bound, \$$spent, the last iteration committed" >/dev/null 2>&1
+  log "exit 0: round over at its step limit with work committed"
+  "$BIN/cc-notify" -t "$repo/$track round over" "Ran its $MAXI iteration(s) (\$$spent) and committed on the last one — the round is over, not stalled. More with: cc $repo $track --go \"\" --loop N"
+  exit 0; fi
+stop 6 "$ended" "Hit $MAXI iterations (\$$spent) and the last one committed nothing, so it did not carry itself on. Continue with: cc $repo $track --go \"\" --loop N" "$bst"

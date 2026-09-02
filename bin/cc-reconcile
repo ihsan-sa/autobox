@@ -304,6 +304,30 @@ def alert(msg):
         pass
 
 
+def branch_unpushed(wt):
+    """Does this worktree really hold commits origin does not have? True yes · False no · None cannot tell.
+
+    `.cc/push.err` is not that answer. cc-checkpoint clears the marker on its OWN next successful push, but nothing
+    clears it when the branch gets to origin any other way — a person pushing by hand after a refused lease, the
+    other writer's work merging — and `lease_refused` APPENDS to it without ever pushing. So one bad minute left a
+    file that made this tool report `its branch is not pushed` about a branch that was pushed, every 20 minutes,
+    for as long as the file lived. A push updates the remote-tracking ref whoever makes it, so HEAD reachable from
+    `origin/<branch>` IS 'origin has this'. None on any doubt, and the caller then keeps the marker's answer."""
+    def git(*a):
+        try:
+            return subprocess.run(["git", "-C", wt, *a], capture_output=True, text=True, timeout=10)
+        except Exception:
+            return None
+    br = git("rev-parse", "--abbrev-ref", "HEAD")
+    if not br or br.returncode or br.stdout.strip() in ("", "HEAD"):
+        return None                      # no git here, or a detached HEAD: nothing this rule can say
+    up = git("rev-parse", "-q", "--verify", f"refs/remotes/origin/{br.stdout.strip()}")
+    if not up or up.returncode:
+        return None                      # the branch has never been on origin: nothing to compare it against
+    anc = git("merge-base", "--is-ancestor", "HEAD", up.stdout.strip())
+    return None if anc is None else anc.returncode != 0
+
+
 def has_remote(repo):
     try:
         return subprocess.run(["git", "-C", f"{HOME}/dev/{repo}", "remote", "get-url", "origin"],
@@ -345,7 +369,11 @@ def decide(f):
         if who == "person" and st not in TERMINAL:
             return [("ask", "waiting", "it is waiting on you: " + wwhy)]
         if st == "waiting":
-            return [("fix", "running", "its question was answered")]
+            # It has to leave `waiting` — that word is the owner's NEEDS YOU list, and an answered question must not
+            # sit on it. But the word it goes back to is one the box can SEE: `running` is a claim that a session is
+            # open, and a channel whose window is gone makes no such claim. The display side stopped printing it
+            # (#174); this is the board field, which was still flipped to `running` on every tick of a dead session.
+            return [("fix", "running" if f["live"] else "queued", "its question was answered")]
         return []
     out, settled = [], False
     if f.get("stop_why"):               # spending without producing: the one live track this tool ends rather than describes
@@ -405,7 +433,9 @@ def decide(f):
         out.append(("ask", None, "its worktree is gone"))   # a queued track has never been started: it is SUPPOSED to have no worktree
     if f.get("commit_err"):
         out.append(("ask", None, "its last checkpoint would not commit — that work is only in the worktree"))
-    if f.get("push_err"):
+    if f.get("push_err") and f.get("unpushed") is not False:
+        # THE MARKER IS NOT THE ANSWER — see branch_unpushed(). `is not False` on purpose: True is "origin really
+        # does not have it" and None is "could not tell", and only a plain "origin has it" silences the finding.
         out.append(("ask", None, "its branch is not pushed"))
     return out
 
@@ -557,6 +587,7 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
                 "journal": journal(repo, track), "loop_end": loop_end(repo, track),
                 "commit_err": os.path.exists(f"{wt}/.cc/checkpoint.err"),
                 "push_err": os.path.exists(f"{wt}/.cc/push.err"), "has_remote": remotes[repo],
+                "unpushed": branch_unpushed(wt) if os.path.exists(f"{wt}/.cc/push.err") else False,
                 "workers": workers.get(key, []), "loops": loops.get(key, []), "limited": limited,
                 "orphans": workers.get(key, []) if not loops.get(key) else [],
                 "idle": idle_for(repo, track, wt) if workers.get(key) else 0.0,
@@ -871,7 +902,7 @@ def selfcheck():
     def F(**kw):
         d = {"status": "running", "pr": "", "pr_state": None, "live": False, "wt_exists": True,
              "age": 10 ** 6, "grace": GRACE, "journal": (None, ""), "loop_end": "",
-             "commit_err": False, "push_err": False, "has_remote": True,
+             "commit_err": False, "push_err": False, "unpushed": True, "has_remote": True,
              "limited": False, "loops": [], "workers": [], "pane_idle": 0.0}
         d.update(kw)
         return d
@@ -910,7 +941,16 @@ def selfcheck():
        decide(F(status="queued", wt_exists=False)) == [] and decide(F(status="todo", wt_exists=False)) == []
        and decide(F(status="queued", live=True))[0][:2] == ("fix", "running"))
     ok("a refused checkpoint is a finding", any("checkpoint" in w for _, _, w in decide(F(status="review", pr="u", commit_err=True))))
-    ok("an unpushed branch is a finding", any("not pushed" in w for _, _, w in decide(F(status="review", pr="u", push_err=True))))
+    # THE MARKER IS NOT THE ANSWER: `.cc/push.err` survives a push made any way but cc-checkpoint's own next one
+    # (a person pushing after a refused lease), and one such file nagged a pushed worktree every 20 min for days.
+    unp = lambda **kw: any("not pushed" in w for _, _, w in decide(F(status="review", pr="u", **kw)))
+    ok("an unpushed branch is a finding: the marker AND commits origin does not have", unp(push_err=True, unpushed=True))
+    ok("…but the marker alone is not — a worktree origin already has is not nagged, however old its push.err",
+       not unp(push_err=True, unpushed=False))
+    ok("…and neither is a branch with work origin lacks but no failed push to say so",
+       not unp(push_err=False, unpushed=True))
+    ok("…while a branch the box could not judge (never fetched, detached HEAD) keeps the marker's answer, because "
+       "silence about a real unpushed branch is the worse of the two", unp(push_err=True, unpushed=None))
     ok("review with no PR and a remote → asks", any("never opened" in w for _, _, w in decide(F(status="review"))))
     ok("review with no PR and no remote is silent", decide(F(status="review", has_remote=False)) == [])
     ok("a quiet track says nothing", decide(F(status="review", pr="u", pr_state="OPEN")) == [])
@@ -1041,17 +1081,40 @@ def selfcheck():
        and "which syllabus?" in decide(F(kind="session", status="running", live=True, journal=("BLOCKED", "which syllabus?")))[0][2]
        and decide(F(kind="session", status="running", live=False, journal=("BLOCKED", "which syllabus?")))[0][:2] == ("ask", "waiting")
        and decide(F(kind="session", status="merged", journal=("BLOCKED", "old"))) == [])
-    ok("…and it clears the same way — `waiting` goes back to `running` once the journal stops saying BLOCKED, live "
-       "or not (liveness is not a session's concern), never to `blocked` as a dead track would",
+    ok("…and it clears the same way once the journal stops saying BLOCKED — never to the `blocked` a dead track "
+       "gets. The word it lands on is one the box can SEE: `running` where a session is open, `queued` where the "
+       "window is gone, because `running` is a claim that something is happening and nothing is (#174 stopped the "
+       "DISPLAY printing it; this is the board field, which was flipped back on every tick of a dead session)",
        decide(F(kind="session", status="waiting", live=True))[0][:2] == ("fix", "running")
-       and decide(F(kind="session", status="waiting", live=False))[0][:2] == ("fix", "running")
+       and decide(F(kind="session", status="waiting", live=False))[0][:2] == ("fix", "queued")
        and decide(F(status="waiting", live=False))[0][:2] == ("ask", "blocked"))
     ok("the ONE WORD for a session is its kind, `session` — cc ls and cc digest print that, never the `running` its "
        "row carries — with `waiting` the one track word it wears; a track's word is unchanged",
        effective(F(kind="session", status="running"), []) == "session"
        and effective(F(kind="session", status="waiting"), [("fix", "running", "")]) == "session"
        and effective(F(kind="session", status="running"), [("ask", "waiting", "")]) == "waiting"
+       and effective(F(kind="session", status="waiting"), [("fix", "queued", "")]) == "session"   # …and the dead one reads the same
        and effective(F(status="running"), []) == "running" and effective(F(status="waiting"), [("fix", "running", "")]) == "running")
+
+    # branch_unpushed on REAL git, because the fixture above only proves decide() reads the fact it is given
+    with tempfile.TemporaryDirectory() as tg:
+        def g(d, *a):
+            return subprocess.run(["git", "-C", d, *a], capture_output=True, text=True, timeout=30)
+        bare, wt2 = f"{tg}/origin.git", f"{tg}/wt"
+        g(tg, "init", "-q", "--bare", bare)
+        g(tg, "clone", "-q", bare, wt2)
+        g(wt2, "config", "user.email", "s@e"); g(wt2, "config", "user.name", "s")
+        open(f"{wt2}/a", "w").write("1")
+        g(wt2, "add", "a"); g(wt2, "commit", "-qm", "one")
+        ok("real git: a branch origin has never seen cannot be judged — None, so the marker's answer stands",
+           branch_unpushed(wt2) is None)
+        g(wt2, "push", "-q", "-u", "origin", "HEAD")
+        ok("real git: a branch origin HAS is not unpushed, whatever a leftover push.err says",
+           branch_unpushed(wt2) is False)
+        open(f"{wt2}/a", "w").write("2")
+        g(wt2, "commit", "-qam", "two")
+        ok("real git: a commit origin does not have IS unpushed", branch_unpushed(wt2) is True)
+        ok("real git: a directory that is not a checkout cannot be judged", branch_unpushed(tg + "/nope") is None)
 
     # end to end: a real board, a real worktree, a real apply — in a HOME of its own
     with tempfile.TemporaryDirectory() as th:
@@ -1120,7 +1183,8 @@ def selfcheck():
            rv2.returncode == 0 and rv2.stdout == "")
         # a SESSION row beside it: nobody in its worktree, past every grace, a question in its journal. The question
         # is the owner's like a track's — `waiting`, reported, in the snapshot with who and why, paged when no session
-        # took it (review of #132) — but answered, the row goes back to `running` where a dead track is reconciled
+        # took it (review of #132) — but answered with nobody on it, the row goes to `queued`, not to the `running`
+        # it used to be flipped back to on every tick and not to the `blocked` a dead track is reconciled to
         os.makedirs(f"{th}/.cc/worktrees/{repo}/sess9", exist_ok=True)
         os.makedirs(f"{th}/.cc/state/{repo}/sess9", exist_ok=True)
         open(f"{th}/.cc/state/{repo}/sess9/progress.md", "w").write("- recon done\nSTATUS: BLOCKED: which syllabus?\n")
@@ -1140,9 +1204,10 @@ def selfcheck():
         subprocess.run([sys.executable, os.path.realpath(__file__), repo, "--apply", "--notify",
                         "--no-net", "--grace", "0"], env=env, capture_output=True, text=True, timeout=120)
         snpS = snap_()[f"{repo}/sess9"]
-        ok("end to end: …and answered, it goes back to `running` — never `blocked`, whatever its worktree says — and "
-           "its snapshot word is `session`, so cc ls and cc digest never print `running` for it",
-           cb("get", repo, "sess9", "status").stdout.strip() == "running"
+        ok("end to end: …and answered, it leaves `waiting` — never to the `blocked` a dead track gets, and with no "
+           "session open on it, never to `running` either: the board field says `queued` and the snapshot word is "
+           "`session`, so cc ls and cc digest print neither",
+           cb("get", repo, "sess9", "status").stdout.strip() == "queued"
            and snpS["state"] == "session" and snpS["waiting_on"] == "")
         # the other half of waiting: it must CLEAR. The question is gone from the journal and nobody is in the
         # worktree, so the next apply reconciles the stale word instead of leaving `waiting` stuck on the board.

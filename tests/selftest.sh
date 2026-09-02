@@ -1062,6 +1062,27 @@ mktrack w12 "fail every time"
 mkclaude failclaude w12 'err=true; res="fatal: it broke"'
 CC_CLAUDE="$T/failclaude" "$B/cc-loop" $REPO w12 --max-iter 5 --quiet >/dev/null 2>&1; rc=$?
 { [ "$rc" = 5 ] && [ "$(nruns w12)" = 2 ] && ! lg w12 | grep -q 'carrying on'; } && ok "an error is never carried on either — two in a row and it stops (exit 5)" || bad "error carried on: rc=$rc runs=$(nruns w12)"
+# 6b: --no-extend — the bound cc-land's fix round asks for, and a plain `cc` flag besides (core/bin/cc:407). A
+# round that ends AT its bound having COMMITTED is over, not stalled: exit 0, no page, and the owner never reads
+# "the last one committed nothing" about a round that just pushed. The board word claims a review only where a PR
+# exists to carry it — cc-reconcile reads a `review` row with no PR as "it is waiting on a PR that was never
+# opened" and files that at the owner every 20 minutes, which is the class of false finding this change closes.
+mktrack w14 "one bounded round, with a PR"
+mkclaude boundclaude w14 'echo "work $n" > "bound-$n.txt"; echo "- step $n" >> "$st/progress.md"'
+"$B/cc-board" set $REPO w14 pr "https://example.invalid/pr/1" >/dev/null 2>&1
+nlb=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
+CC_CLAUDE="$T/boundclaude" "$B/cc-loop" $REPO w14 --max-iter 1 --no-extend --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ "$(nruns w14)" = 1 ] && ! lg w14 | grep -q 'carrying on' \
+  && [ "$("$B/cc-board" get $REPO w14 status)" = review ] \
+  && ! tail -n +$((nlb+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q 'committed nothing'; } \
+  && ok "a bounded round whose last iteration COMMITTED is over, not paused: exit 0, board \`review\`, and no 'committed nothing' line at the owner" \
+  || bad "no-extend with commits: rc=$rc runs=$(nruns w14) board=$("$B/cc-board" get $REPO w14 status)"
+mktrack w15 "one bounded round, no PR"
+mkclaude bound15claude w15 'echo "work $n" > "bound15-$n.txt"; echo "- step $n" >> "$st/progress.md"'
+CC_CLAUDE="$T/bound15claude" "$B/cc-loop" $REPO w15 --max-iter 1 --no-extend --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 0 ] && [ "$("$B/cc-board" get $REPO w15 status)" = blocked ]; } \
+  && ok "…and one that opened no PR lands on \`blocked\`, never \`review\` — the word cc-reconcile would settle it on anyway, and the one that files no finding" \
+  || bad "no-extend without a PR: rc=$rc board=$("$B/cc-board" get $REPO w15 status)"
 # 7+8: what the loop does OUTSIDE the worker's process (sandbox stage 1a, review of #129). A sandboxed worker's Stop hook
 # commits but cannot push (no credential inside), so the loop pushes whatever is ahead of origin — even with nothing
 # left to commit. And the hooks that loop-side git runs come from the MAIN checkout, never the worktree the worker edits.
@@ -1242,6 +1263,10 @@ ME(){ env -u TMUX TMUX_TMPDIR="$T" HOME="$MH" CC_TMUX_SESSION=_ccmodel CC_MODEL_
       CC_NOTIFY_LOG="$MH/.cc/notify.log" CC_LIMIT_STAMP="$MH/.cc/state/claude-limit" \
       CC_MODEL_PRIMARY='claude-fable-5[1m]' CC_MODEL_FALLBACK=claude-opus-5 "$@"; }
 M(){ ME "$B/cc-model" "$@"; }
+muntil(){   # how `cc-model status` must render the override's own until: the clock alone today, dated on any other
+            # day. HH:MMZ alone made a 24-hour override read as one that lapsed hours ago (2026-09-02).
+  local t; t=$(cut -f3 "$MH/.cc/state/model-override" 2>/dev/null)
+  [ "$(date -u -d "@$t" +%F)" = "$(date -u +%F)" ] && date -u -d "@$t" +%H:%MZ || date -u -d "@$t" +%FT%H:%MZ; }
 MT new-session -d -s _ccmodel -n sess 'bash -c "cat; true"'
 MT new-window -d -t _ccmodel -n wkr "bash -c '$T/fb/cc-loop; true'"   # a worker pane: cc-loop is its child and claude a grandchild
 sleep 1
@@ -1254,7 +1279,7 @@ rm -f "$MH/.cc/state/claude-limit"
 printf '{"is_error":true,"result":"claude-fable-5: You have hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}' > "$T/fab.json"
 ME "$B/cc-limit" check "$T/fab.json" >/dev/null
 [ "$(cut -f4 "$MH/.cc/state/claude-limit")" = fable ] && ok "cc-limit records the limited model (stamp field 4)" || bad "stamp model: $(cut -f4 "$MH/.cc/state/claude-limit" 2>/dev/null)"
-M status | grep -qE '^opus until [0-9]{2}:[0-9]{2}Z$' && ok "a fable limit puts the box on opus until the reset" || bad "cc-model status after a fable limit: $(M status)"
+{ [ "$(M status)" = "opus until $(muntil)" ] && [ "$(cut -f3 "$MH/.cc/state/model-override")" -gt "$(date -u +%s)" ]; } && ok "a fable limit puts the box on opus until the reset, dated whenever that reset is not today" || bad "cc-model status after a fable limit: $(M status), want opus until $(muntil)"
 [ "$(M current)" = claude-opus-5 ] && ok "cc-model current feeds --model to new sessions and workers" || bad "cc-model current: $(M current)"
 sleep 1
 MT capture-pane -p -t _ccmodel:sess | grep -q '/model claude-opus-5' && ok "switch typed /model into the live interactive session" || bad "nothing typed into the session"
@@ -1335,12 +1360,32 @@ mline "❯ Switch to Opus 5 (1M context) and continue"
 mline "  Manage usage credits on claude.ai"
 mline "Enter to confirm · Esc to cancel"
 ME env CC_CLAUDE=/nonexistent/claude "$B/cc-model" tick   # a probe here could only fail: the prompt must not need one
-M status | grep -qE '^opus until [0-9]{2}:[0-9]{2}Z$' && ok "the CLI's own limit prompt moves the box with no probe at all" || bad "limit prompt did not switch: $(M status)"
+[ "$(M status)" = "opus until $(muntil)" ] && ok "the CLI's own limit prompt moves the box with no probe at all, and the day it holds until is on the line — the prompt names no reset, so this one runs a day out" || bad "limit prompt did not switch: $(M status), want opus until $(muntil)"
 grep -q 'answered' "$MH/.cc/state/model.log" && ok "and the prompt in that pane is answered, so the session is not left sitting on it" || bad "the limit prompt was left unanswered"
 mnow=$(date -u +%s); printf 'claude-opus-5\t%s\t%s\tprompt\t0\n' "$((mnow-1200))" "$((mnow-60))" > "$MH/.cc/state/model-override"
 : > "$MH/.cc/state/model.log"
 ME env CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick   # …and a probe that ANSWERS is not proof: it may be paying credits
 { [ "$(M current)" = claude-opus-5 ] && grep -q 'not probing' "$MH/.cc/state/model.log"; } && ok "no restore while that wording is still on a pane (a probe cannot tell who paid)" || bad "restored while the limit prompt was still on the pane: $(M status)"
+# ── the retune pass INSIDE tick(), on a real pane — not only the decision function it calls ──
+# A session the CLI last put on another id of the primary's OWN family (`claude-fable-5` while the box wants
+# `claude-fable-5-1`, four times the cache-read price) is invisible to every family test in cc-model. This drives
+# the whole pass: the pane, the typing, the `retune` row it writes and the throttle that reads that row back. The
+# two are coupled by the shape of that row, and if they ever come apart this types /model into somebody's live
+# session once a minute — so the last case here proves it is that row, and nothing else, that keeps it quiet.
+MT kill-window -t _ccmodel:sess 2>/dev/null; MT new-window -d -t _ccmodel -n sess 'bash -c "cat; true"'; sleep 1
+rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen" "$MH/.cc/state/claude-limit"; : > "$MH/.cc/state/model.log"
+mline "❯ /model claude-fable-5"
+mline "  ⎿  Set model to Fable 5 and saved as your default for new sessions"
+MR(){ ME env CC_MODEL_PRIMARY='claude-fable-5-1[1m]' CC_MODEL_DIALOG_WAIT=0.2 CC_CLAUDE=/nonexistent/claude "$B/cc-model" "$@"; }
+mtyped(){ MT capture-pane -p -t _ccmodel:sess | grep -cF '/model claude-fable-5-1[1m]'; }
+mretunes(){ grep -c "$(printf '\tretune\t')" "$MH/.cc/state/model.log" 2>/dev/null || echo 0; }
+MR tick; sleep 1
+{ [ "$(mtyped)" -ge 1 ] && [ "$(mretunes)" = 1 ]; } && ok "a pane the CLI left on the primary's OLD id is retuned by tick itself: /model <primary> typed into it, one \`retune\` row in model.log" || bad "retune pass did not fire: typed=$(mtyped) rows=$(mretunes) log=$(cat "$MH/.cc/state/model.log")"
+mt1=$(mtyped)
+MR tick; sleep 1
+{ [ "$(mtyped)" = "$mt1" ] && [ "$(mretunes)" = 1 ]; } && ok "…and the next tick, inside CC_MODEL_RETUNE_GAP, types nothing more — the pane still reads as Fable 5, so without the throttle this would fire every 60 s" || bad "second tick retyped: typed=$(mtyped) was $mt1, rows=$(mretunes)"
+ME env CC_MODEL_PRIMARY='claude-fable-5-1[1m]' CC_MODEL_DIALOG_WAIT=0.2 CC_MODEL_RETUNE_GAP=0 CC_CLAUDE=/nonexistent/claude "$B/cc-model" tick; sleep 1
+{ [ "$(mtyped)" -gt "$mt1" ] && [ "$(mretunes)" = 2 ]; } && ok "…and it is that row that silences it: with the gap at 0 the same pane is retuned again, so the row the pass writes and the throttle that reads it cannot drift apart unnoticed" || bad "gap=0 did not retune again: typed=$(mtyped) was $mt1, rows=$(mretunes)"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 
 echo "== ccbox: a new box's ~/.claude gets the login and nothing else =="

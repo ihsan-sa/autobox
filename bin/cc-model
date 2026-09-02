@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # cc-model — automatic model fallback. When the box's primary model hits its usage limit every live session
 # moves to the fallback model, and back when the limit lifts. LLM-free except one tiny probe.
-#   cc-model status                   "fable" (normal) | "opus until 11:40Z" | "opus until probe"
+#   cc-model status                   "fable" (normal) | "opus until 11:40Z" | "opus until probe". An until that
+#                                     is not today is dated ("opus until 2026-09-03T12:51Z"): the clock alone made
+#                                     a 24-hour override read as one that lapsed hours ago.
 #   cc-model current                  the override model, or nothing — cc / cc-loop / cc-rc pass it as --model
 #   cc-model switch <model> [reason]  write (or, for the primary model, clear) the override + retune live sessions
 #   cc-model limited <model> [reason] cc-limit calls this after a limited run: switch only if that WAS the primary
@@ -22,6 +24,10 @@
 #   back into the prompt, and a pulse tick and two secretary findings were dropped on it); (2) overridden — once `until`
 #   has passed, probe the primary model at most every 15 min and restore on the first answer — unless a pane still
 #   shows the prompt or cc-limit's stamp still names the primary: then it cannot tell, and does not restore;
+#   (2b) NO OVERRIDE, SO THE BOX WANTS ITS PRIMARY: a session the CLI last put on ANOTHER ID OF THAT SAME FAMILY —
+#   `claude-fable-5` while the box is on `claude-fable-5-1`, whose cache reads bill at 4x — is retuned to the primary.
+#   Same family only (another family is the chain's, an override's or the owner's), read from the CLI's own "Set model
+#   to …" line and never from the pane at large, and at most once per pane per CC_MODEL_RETUNE_GAP;
 #   (3) never two switches within 10 min — and the override's `since` counts as a switch, not only the log line: that
 #   line is written after the retune, and on 2026-09-01 a restore slipped into the gap and undid the switch mid-typing.
 # Retuning a session = typing "/model <model>" into its pane THROUGH cc-msg (the one pane deliverer, with the dialog
@@ -38,7 +44,7 @@
 # Override: ~/.cc/state/model-override = "<model>\t<since>\t<until-epoch|0>\t<reason>\t<last-probe-epoch>"
 # Log: ~/.cc/state/model.log = "<iso>\t<epoch>\t<event>\t<model>\t<detail>". No secrets in either.
 # Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
-#   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_CHAIN · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
+#   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"
@@ -47,6 +53,43 @@ PROBEM="${CC_MODEL_PROBE:-claude-fable-5-1}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/
 SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
 now=$(date -u +%s); mkdir -p "$ST"
 fam(){ local f; f=$(grep -oiE 'fable|opus|sonnet|haiku' <<<"${1:-}" | head -1 | tr 'A-Z' 'a-z'); echo "${f:-${1:-}}"; }
+idname(){   # a model id → the name the CLI prints for it: claude-fable-5-1 → "Fable 5.1", claude-opus-5 → "Opus 5".
+            # fam() answers a DIFFERENT question — which rung of the chain a model is — and `claude-fable-5` and
+            # `claude-fable-5-1` are one rung, one family, and two very different bills: cc-spend prices the old id's
+            # cache reads at 4x, and the box spent about $140 on it on 2026-09-02 because a session parked there
+            # looked, to every family test in this file, exactly like a session on the primary. The [1m] suffix is a
+            # context knob, not a model, and the CLI spells it out as "(1M context)" anyway.
+  local f v; f=$(fam "${1:-}"); v=$(sed -e 's/\[.*$//' -e "s/^claude-$f-*//" <<<"${1:-}" | tr '-' '.')
+  { [ -n "$f" ] && [ -n "$v" ] && [ "$v" != "${1:-}" ]; } || return 1
+  printf '%s %s\n' "$(tr 'a-z' 'A-Z' <<<"${f:0:1}")${f:1}" "$v"; }
+pane_model(){   # $1 = a pane's live screen → the model the CLI ITSELF last said that session is on, or nothing. Off a
+                # live pane on this box (2026-09-02):  ❯ /model claude-fable-5[1m]
+                #                                        ⎿  Set model to Fable 5 and saved as your default for new sessions
+                # THE CLI'S OWN ANSWER, never the pane at large: a session with this file open in a pager, or a doc
+                # that names an id, has that id on its screen and is not running it — the trap the classifier below
+                # was rebuilt around (#155). A session whose answer line has scrolled off says nothing, and nothing
+                # is typed into it: a miss is cheap here, a stray /model into somebody's session is not.
+  grep -oE 'Set model to [A-Za-z]+ [0-9][0-9.]*' <<<"${1:-}" | tail -1 | sed 's/^Set model to //'; }
+retune_to(){    # $1 = a pane's live screen → the model to type into it, or nothing (exit 1) when it is where the box
+                # wants it. SAME FAMILY only: another family is the chain's business — an override, a limit, or the
+                # owner's own choice — and this pass must not undo one.
+  local said want; said=$(pane_model "${1:-}"); [ -n "$said" ] || return 1
+  want=$(idname "$PRIMARY") || return 1
+  [ "$said" = "$want" ] && return 1
+  [ "$(fam "$said")" = "$(fam "$PRIMARY")" ] || return 1
+  printf '%s\n' "$PRIMARY"; }
+retuned_recently(){   # $1 = pane id → 0 when this pane was retuned inside the last CC_MODEL_RETUNE_GAP (600 s). A pane
+                      # takes a moment to apply /model, and a pass that retyped on every tick would be typing into
+                      # somebody's session every minute.
+  local id="${1:-}" t
+  t=$(awk -F'\t' -v i="($id)" '$3=="retune" && index($5, i){t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)
+  [ "$((now - t))" -lt "${CC_MODEL_RETUNE_GAP:-600}" ]; }
+untilw(){   # $1 = an epoch → the way a person reads it. HH:MMZ alone lies the moment the until is not today: a 24-hour
+            # override read at 16:04Z as "until 12:51Z" looks like it lapsed three hours ago, and a handoff journal
+            # recorded exactly that (2026-09-02). Past today, the date comes with it.
+  local t="${1:-0}"
+  [ "$(date -u -d "@$t" +%F)" = "$(date -u -d "@$now" +%F)" ] && { date -u -d "@$t" +%H:%MZ; return 0; }
+  date -u -d "@$t" +%FT%H:%MZ; }
 label(){ case "$(fam "${1:-}")" in fable) echo "Fable 5.1";; opus) echo "Opus 5";; sonnet) echo "Sonnet 5";; haiku) echo "Haiku";; *) echo "${1:-}";; esac; }
 CHAIN="${CC_MODEL_CHAIN:-claude-fable-5-1 claude-opus-5 claude-sonnet-5}"   # the one copy of the order (see above)
 chain(){   # the canonical chain: ONE RUNG PER FAMILY, first mention wins. A CC_MODEL_CHAIN that names a family twice
@@ -301,6 +344,11 @@ classify_run(){   # $1 run json · $2 its stderr · $3 the model that was ASKED 
   # ── a MOVE: the model would not answer AS ITSELF ──
   [ "$stop" = refusal ] && { printf 'refusal\tthe classifier stopped the turn\n'; return 0; }
   w=$(asked_fam "$want"); sf=$(served_fams "$j" "$failed"); served=$(paste -sd/ - <<<"$sf")
+  # A run that took NO turns says nothing about the model it asked for: the only usage in the file is the CLI's own
+  # side-call. served_fams excluded that call on a run that FAILED but not on one that simply did nothing, so an empty
+  # success read as "answered as haiku, not fable" and walked cc-loop down the chain for a run with no work in it.
+  { [ "$failed" = no ] && [ "$sf" = "$SIDECALL" ] && [ "$(jq -r '.num_turns // -1' "$j" 2>/dev/null)" = 0 ]; } &&
+    { printf "ok\tan empty run: no turns, only the CLI's side-call\n"; return 0; }
   if [ -n "$w" ] && [ -n "$sf" ] && ! grep -qxF "$w" <<<"$sf"; then
     printf 'refusal\tanswered as %s, not %s\n' "$served" "$w"; return 0; fi
   { [ "$apisays" = yes ] && grep -qiE "$REFUSE_RE" <<<"$res"; } && { printf 'refusal\tthe model would not answer as itself\n'; return 0; }
@@ -364,6 +412,16 @@ tick(){
   limstamp   # ---- normal: did the primary model just hit a limit?
   if [ "$lim_till" -gt "$now" ] && [ -n "$lim_model" ] && [ "$(fam "$lim_model")" = "$(fam "$PRIMARY")" ]; then
     rate_ok && do_switch "$FALLBACK" "$(fam "$PRIMARY") limit (cc-limit stamp)"; return 0; fi
+  # ---- no override is in force, so the box wants PRIMARY: a session on another ID of that same family — the pane on
+  # `claude-fable-5` while the box is on `claude-fable-5-1` — is retuned. Nothing here could see that before: to fam()
+  # the two are one rung, and the sessions cc-model itself typed the old id into on 2026-09-01 were never moved back.
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    cap=$(pane_text "$id"); m=$(retune_to "$cap") || continue
+    retuned_recently "$id" && continue
+    type_into "$id" "$name" "/model $m" &&
+      printf '%s\t%s\tretune\t%s\t%s:%s (%s) was on %s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION" "$name" \
+             "$id" "$(pane_model "$cap")" >> "$LOG"
+  done < <(sessions)
   while read -r id name; do [ -n "${id:-}" ] || continue   # a live session says it in its pane before any stamp exists
     cap=$(tmux capture-pane -p -S -30 -t "$id" 2>/dev/null)
     line=$(grep -iE 'usage limit|resets? at [0-9]|out of usage credits|usage-credits' <<<"$cap" | tail -1); [ -n "$line" ] || continue
@@ -460,6 +518,15 @@ STUB
   t 'refusal wording in a GOOD run is the worker talking' "$(cl "$d/innocent.json" claude-fable-5)" ok
   t 'a haiku side-call is not a reroute'  "$(classify_run "$d/ok.json" "" claude-fable-5 | cut -f2)" ""
   t 'the reroute says what answered'      "$(classify_run "$d/reroute.json" "" claude-fable-5 | cut -f2)" "answered as opus, not fable"
+  # a run that did NOTHING: no turns, so the CLI's own side-call is the only usage there is. That read as
+  # "answered as haiku, not fable" — a refusal — and moved the chain for a run with no work in it.
+  b nothing  '.num_turns=0 | .modelUsage={"claude-haiku-4-5-20251001":{"inputTokens":9}}'
+  b sidecall '.num_turns=6 | .modelUsage={"claude-haiku-4-5-20251001":{"inputTokens":9}}'
+  t 'an empty run that succeeded is not a reroute'  "$(cl "$d/nothing.json" claude-fable-5)"  ok
+  t '...and it says the run was empty'              "$(classify_run "$d/nothing.json" "" claude-fable-5 | cut -f2)" \
+    "an empty run: no turns, only the CLI's side-call"
+  t '...while a run that TOOK turns and only the side-call answered is still a reroute' \
+    "$(cl "$d/sidecall.json" claude-fable-5)" refusal
   t 'the cap says which cap'              "$(classify_run "$d/capped.json" "" claude-fable-5 | cut -f2)" "error_max_turns"
   : > "$d/empty.json"; printf 'Claude usage limit reached. Resets at 11:40Z\n' > "$d/empty.json.err"
   t 'a limit that produced no json is still a limit' "$(classify_run "$d/empty.json" "$d/empty.json.err" claude-fable-5 | cut -f1)" limit
@@ -539,6 +606,30 @@ TXT
   printf '%s\tapi\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" > "$ST/claude-limit"
   t "a live cc-limit stamp cannot tell either"    "$(restore_blocked '' | grep -c 'still has')" 1
   ST="$oldst"
+  # ── the model a session is ON is asked by ID, not by family ──────────────────────────────────────────────────
+  # fam() is right for the CHAIN (one rung per family) and wrong for "is this session where the box wants it":
+  # a session left on `claude-fable-5` while the box is on `claude-fable-5-1` was invisible to every family test
+  # here, and its cache reads bill at 4x (about $140 on 2026-09-02).
+  local pid oldid
+  pid="${PRIMARY%%\[*}"; case "$pid" in *-1) oldid="${pid%-1}";; *) oldid="$pid-1";; esac
+  said(){   # a pane the CLI has just answered /model in, in the shape it really draws (captured 2026-09-02)
+    printf '%s\n' "❯ /model $1" \
+      "  ⎿  Set model to $(idname "$1")$([ "${1#*[}" != "$1" ] && printf ' (1M context)') and saved as your default for new sessions" "> "; }
+  t 'fam() cannot tell the primary from the id it replaced' "$(fam "$pid"):$(fam "$oldid")" "$(fam "$pid"):$(fam "$pid")"
+  t '...while the NAME the CLI prints does'                 \
+    "$([ "$(idname "$pid")" != "$(idname "$oldid")" ] && echo differ || echo same)" differ
+  t 'a pane the CLI last put on the OLD id of the primary family is retuned to the primary' \
+    "$(retune_to "$(said "$oldid")")" "$PRIMARY"
+  t '...and one already on the primary is left alone' \
+    "$(retune_to "$(said "$PRIMARY")" >/dev/null; echo $?)" 1
+  t '...and another FAMILY is not this pass to undo: an override or the owner put it there' \
+    "$(retune_to "$(said "$(chain_next "$PRIMARY")")" >/dev/null; echo $?)" 1
+  t '...and a pane that merely NAMES a model — this file in a pager, a doc — is never retuned on the word alone' \
+    "$(retune_to "  fam(){ ...; }   # $oldid and $pid are one family, and that is the bug" >/dev/null; echo $?)" 1
+  unset -f said
+  # …and an until is rendered as a person reads it: HH:MMZ alone made a 24-hour override look three hours expired
+  t 'an until later today is the clock alone' "$(untilw "$now")" "$(date -u -d "@$now" +%H:%MZ)"
+  t 'an until on another day carries its date' "$(untilw "$((now + 86400))")" "$(date -u -d "@$((now + 86400))" +%FT%H:%MZ)"
   c1=$(chain | sed -n 1p); c2=$(chain | sed -n 2p); c3=$(chain | tail -1)
   [ -n "${CC_MODEL_CHAIN:-}" ] || t 'the shipped chain is fable, then opus, then sonnet' "$(chain | tr '\n' ' ')" 'claude-fable-5-1 claude-opus-5 claude-sonnet-5 '
   t 'the chain walks to its next rung'    "$(chain_next "$c1")"          "$c2"
@@ -555,7 +646,7 @@ TXT
   printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
 case "${1:-}" in
-  status)  if ov; then [ "$till" -gt 0 ] && printf '%s until %sZ\n' "$(fam "$model")" "$(date -u -d "@$till" +%H:%M)" || printf '%s until probe\n' "$(fam "$model")"
+  status)  if ov; then [ "$till" -gt 0 ] && printf '%s until %s\n' "$(fam "$model")" "$(untilw "$till")" || printf '%s until probe\n' "$(fam "$model")"
            else fam "$PRIMARY"; fi ;;
   current) ov && printf '%s\n' "$model" ;;
   switch)  do_switch "${2:?usage: cc-model switch <model> [reason]}" "${3:-}" ;;
