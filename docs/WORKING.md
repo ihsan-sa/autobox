@@ -15,6 +15,7 @@ them, or do them. Work that serves no named goal is noise, however clever.
 4. Nothing? A review is due: spawn one (cc-audit review) on whatever broke most recently.
 
 Red beats new. Delivery beats development. Small-and-shippable beats big-and-half-done.
+The sweep spans both scales: the narrow red item and the meta-level shape of the system alike.
 
 Scripts hold the invariants (reconcile, audit, janitor); the secretary (`cc-secretary`) judges the raw evidence and
 hands you a `secretary/…` line; you decide — it is worth exactly one glance, and a wrong one costs nothing more.
@@ -24,23 +25,23 @@ every 2 h — the tick carries what the files say (red main, open asks, queued r
 is cheap — and each one works the order above on its own; nothing here waits to be asked.
 
 ## dispatch judgement
-- One worker per file, always. Check the board's live tracks before dispatching.
-- A brief is a GOAL, not a plan: what, why, the boundaries, and how done is judged —
-  3-5 testable done-criteria, on one screen. The worker chooses the implementation, the
-  tests and the docs; naming those for it buys a worse answer than it would have found.
-  The PR review verifies against the done-criteria, briefed with the contract and the
-  diff, never the worker's own journal.
+- Planner does it: <=2 files, ~60 lines, the fix already known, nothing live holding those files — short branch, PR like anything else.
+- Subagent: read-heavy work whose answer compresses. Delegate any read that would add more than ~10k to this session; cheapest model that holds quality; never for repo writes, never for grep-shaped exploration.
+- Worker: open design, more files, its own test cycle, unattended running, or a file another track holds. One worker per file: split by file or run in sequence (both research arms: never parallelise writers); check the board's live tracks first.
+- Lump sub-goals into one worker until the diff stops being reviewable in one sitting. Each one folded in saves a spinup, a gate run, a review and a landing.
+- A brief is a goal: what, why, the boundaries, 3-5 testable done-criteria — never the steps. The PR review gets the contract and the diff, never the worker's journal.
+- One repair round, resumed in the same worker session so its cache and its discovery survive. Never a fresh context re-deriving what it knew; never a second open-ended budget. Then split or escalate.
 - A LAND-AFTER-FIX is not yours to dispatch: the landing queue sends one fix iteration
   itself and re-queues the PR when that branch pushes. You hear about the second stop.
-- Small fix with no live collision → short branch by the planning session. More → a worker.
+- No worker-to-worker messaging, no agent teams. An orch (`cc <repo> --orch <alias>`) is a peer session with its own channel, not a layer under the planner.
+- Only decision-class events wake a session; everything else goes to a file it reads on its next turn. Events arriving together cost a fraction of the same events spread out.
+- Hand off when replaying the context per turn costs more than a handoff over the turns still to come: an event-driven planner around 40% of the window. A worker's iteration ends at that same 40% line: cc-context marks the journal, and cc-loop's next fresh iteration is the handoff. The 60% ceiling is the backstop for interactive sessions. Keep history append-only.
 
 ## model policy
-On each model upgrade, try deleting one harness crutch: every workaround encodes an
-assumption about model weakness, and those expire.
-
-
 Planning runs the strongest available model; workers run the strong-but-cheaper tier. Both names
 live in cc-model and nowhere else — when models change, change cc-model.
+- Effort is the cheap dial: high by default, down for routine turns, up for the hardest.
+- On each model upgrade, try deleting one harness crutch — and read the new model's own prompting guide first: a new model's regressions cost more than its crutches.
 
 ## testing bar
 Done means: the new branches have selfcheck cases, the whole suite is green, and anything a daemon
