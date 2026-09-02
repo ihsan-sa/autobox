@@ -458,6 +458,16 @@ grep -q '__runmember alice' "$T/tmux.log" && grep -q 'cc-sandbox member alice to
   && ! grep -q 'runmember other' "$T/tmux.log" && ! grep -q 'cc-sandbox member other' "$T/tmux.log" \
   && ok "...and the window cc opens for a member target IS the boundary: the session runs \`cc __runmember\` (which execs cc-sandbox member) and a --go loop runs \`cc-sandbox member <handle> <track> -- cc-loop\`, one wall not two, while an ordinary repo gets neither" \
   || bad "member launch is not inside the boundary: $(tr '\n' '|' < "$T/tmux.log")"
+# A REPO THE BOX ALREADY HAD BECOMES ONE THE SAME WAY. The four that exist came from cc-slack's join flow; `cc-sandbox
+# convert` is the path for a repo already on the box, and it writes the same markers — so every layer that reads them off
+# the path agrees. Here that means `cc`: the window it opens for a converted repo is the boundary, not a planning session.
+mkdir -p "$GH/dev/bob"; echo hi > "$GH/dev/bob/README.md"
+cv=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc-sandbox" convert bob 2>&1); rcv=$?
+mkdir -p "$GH/.cc/members/bob"; echo '{"claudeAiOauth": {"accessToken": "not-a-token"}}' > "$GH/.cc/members/bob/credentials.json"
+: > "$T/tmux.log"; sout "$B/cc" bob
+{ [ "$rcv" = 0 ] && grep -q '__runmember bob' "$T/tmux.log" && ! grep -q '__runmain bob' "$T/tmux.log"; } \
+  && ok "a repo converted with \`cc-sandbox convert\` is a member workspace to cc as well — the window it opens for it is the boundary, not a planning session" \
+  || bad "a converted repo did not become a workspace (rc=$rcv, tmux='$(tr '\n' '|' < "$T/tmux.log")'): $cv"
 # A REDIRECTED .git IS NOT THE HOST'S TO RUN (review-156c). A workspace track's gitlink and admin dir are written from INSIDE the
 # boundary, so `.git` can name a member git dir whose config carries core.fsmonitor = <payload> (or an ext:: remote), and `cc done
 # <h> <t>` on the host — what cc-loop's exit-4 message tells the owner to run — executed it as the owner: the hooksPath pin does not
@@ -540,8 +550,9 @@ n1=$(nocred alice); rn1=$?; n2=$(nocred alice todo); rn2=$?; n3=$(nocred alice t
   && ! grep -q 'new-window' "$T/tmux.log" && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] \
   && [ "$(grep -c -- '^post -c #alice .*needs a credential minted' "$T/cap.args")" = 3 ] \
   && [ "$(grep -c -- '^NOTIFY: -t alice --owner -- .*needs a credential minted' "$T/cap.args")" = 1 ] \
-  && [ "$(cat "$GH/.cc/members/alice/credential-asked")" = "$(date -u +%F)" ] && [ ! -f "$GH/.cc/state/member-spend.json" ]; } \
-  && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice hears why each time, the owner is paged once, the row never says running and nothing is charged" \
+  && [ "$(cat "$GH/.cc/members/alice/credential-asked")" = "$(date -u +%F)" ] && [ ! -f "$GH/.cc/state/member-spend.json" ] \
+  && grep -q 'cc-sandbox mint alice' <<<"$n1" && grep -q 'cc-sandbox mint alice' "$T/cap.args"; } \
+  && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice hears why each time, the owner is paged once with the command that mints one, the row never says running and nothing is charged" \
   || bad "a workspace without a credential still died in a pane (rc=$rn1/$rn2/$rn3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $n1"
 : > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-asked"   # a page nobody heard releases the stamp: the next attempt pages again
 printf '#!/usr/bin/env bash\nprintf "NOTIFY: %%s\\n" "$*" >> "%s"; exit 1\n' "$T/cap.args" > "$NB/cc-notify"

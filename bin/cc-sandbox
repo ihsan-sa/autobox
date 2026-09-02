@@ -10,11 +10,23 @@
 #     · ~/.cc/slack/member/<handle>/ seen AS ~/.cc/slack: the daemon's member-scoped socket, an `enabled` flag and the attachment cache —
 #     the bot token, the owner-level socket and every other channel stay outside · a private ~/.claude/projects, ~/.npm and ~/.cache under
 #     ~/.cc/members/<handle>/ · the control plane's core/bin bound ro AS ~/bin, so ~/dev/<control repo> does not exist inside · ONE credential
-#     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner, kept whole) and
+#     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner with
+#     `cc-sandbox mint`, kept whole) and
 #     never the owner's, because a member can print whatever is in there: with no credential of its own the workspace does not start · a
 #     ~/.claude.json copy holding only this workspace's projects and only the cc-slack MCP server. The environment is CLEARED and rebuilt
 #     (HOME, PATH, TERM, LANG…, CC_MEMBER_SANDBOX=1, CC_ROLE=member, git identity = the handle). ABSENT: every other ~/dev/*, ~/.cc/config,
 #     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets.
+#   cc-sandbox mint <handle> [--from <file>]   THE WORKSPACE'S OWN CREDENTIAL, the one thing `member` will not start without.
+#     It runs claude in a THROWAWAY HOME so <handle> logs in there, then installs what that login produced at
+#     ~/.cc/members/<handle>/credentials.json, mode 600 — the path and shape the boundary reads. `--from <file>` installs a
+#     credential a login made somewhere else. Nothing is invented, copied or forwarded, and the owner's own token never rides
+#     in on the environment. A credential that turns out to be the OWNER'S — his file, his access or refresh token, or a login
+#     signed in as his account — is REFUSED and nothing is written: inside the boundary a member can print whatever is there.
+#   cc-sandbox convert <repo>   ~/dev/<repo>, an ordinary repo already on this box, BECOMES a member workspace: the two
+#     markers, `.cc/` excluded from commits, `git init` and a first commit if it has neither, and a board of its own — the
+#     same workspace cc-slack's join flow makes, and it prints what it changed. Refused, with the reason: the box's own
+#     control repo, a repo with git worktrees or live tracks, and a handle the box already answers to (#box, #approvals,
+#     #alerts, an -updates lane, a name in routes.json). Then `mint`; the Slack channel pair stays the daemon's.
 # INSIDE rw: the track worktree · the parent repo's .git (the worktree's .git is a pointer into it), with .git/config and
 #   .git/hooks held ro — the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks (cc-loop), and a
 #   worker must not re-point its hooksPath or its remotes, nor write a hook the host would run ·
@@ -116,7 +128,10 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   [ -f "$H/.claude/settings.json" ] && B+=(--ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json")   # the hooks (cc-guard: depth inside the wall)
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
-  for v in TERM LANG LC_ALL COLORTERM USER LOGNAME SHELL CC_SLACK_CHANNEL CC_CLAUDE CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_GUARD_ASKS CC_GUARD_ASK_TTL; do
+  # CC_LOOP_TRIM crosses like the rest: it is set in front of a dispatch on the HOST, and the loop it steers runs in HERE
+  # (`cc <h> <t> --go` opens the window as `cc-sandbox member … -- cc-loop`), so without it a member's track is the one
+  # track on the box that cannot be trimmed from the dispatch line.
+  for v in TERM LANG LC_ALL COLORTERM USER LOGNAME SHELL CC_SLACK_CHANNEL CC_CLAUDE CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_LOOP_TRIM CC_GUARD_ASKS CC_GUARD_ASK_TTL; do
     [ -n "${!v:-}" ] && B+=(--setenv "$v" "${!v}"); done; :; }
 launch_member(){   # $1 handle · $2 track · the rest is the command — the WORKSPACE'S OWN credential, or no launch at all;
                    # a narrower ~/.claude.json
@@ -132,7 +147,7 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # #<h> and the owner — a refusal here lands in a pane nobody reads (review-156d).
   if ! { [ -s "$own" ] && jq -e '.claudeAiOauth.accessToken' "$own" >/dev/null 2>&1; }; then
     why=missing; [ -e "$own" ] && why="present, but has no .claudeAiOauth.accessToken"
-    echo "cc-sandbox: $h has no credential of its own ($own: $why) — a member workspace never starts on the OWNER's. Mint one for this workspace and put it at $own, in the shape of ~/.claude/.credentials.json ({\"claudeAiOauth\": {\"accessToken\": …}}); nothing starts here until then." >&2
+    echo "cc-sandbox: $h has no credential of its own ($own: $why) — a member workspace never starts on the OWNER's. Mint one: cc-sandbox mint $h — it walks the login and installs what that login produced at $own, mode 600. Nothing starts here until then." >&2
     exit 2
   fi
   cj=$(jq -c '{claudeAiOauth: .claudeAiOauth}' "$own")   # its own: kept whole, it can refresh itself
@@ -142,6 +157,109 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
     3< <(jq --arg d "$dev" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
            '{projects: ((.projects // {}) | with_entries(select(.key == $d or (.key | startswith($w))))), mcpServers: $m}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <(printf '%s' "$cj"); }
+CLAUDEBIN="${CC_CLAUDE:-$H/.local/bin/claude}"   # the same knob cc and cc-loop use to name claude
+handle_ok(){ [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]]; }   # a workspace's dir name IS its handle and its channel name
+owners_own(){   # $1 candidate credentials file · $2 the .claude.json that login wrote ("" = none) → prints WHY, exit 0, when it is the OWNER'S
+  # THE ONE JUDGEMENT THIS COMMAND EXISTS FOR — the brief's own line: "it never copies, forwards, reuses or falls back to the
+  # owner's own credential, and it must refuse if what it is about to install is the owner's". So: 0 (true) HERE means it IS
+  # his, and mint refuses on it. A member drives the session inside their boundary and can print whatever sits at
+  # ~/.claude/.credentials.json. Three ways it could be his, any one of which stops the mint BEFORE a byte is written: it is
+  # his file, it carries his token, or the login signed in as his account (a fresh token for the same account is still his).
+  local cand="$1" cj="${2:-}" oc="$H/.claude/.credentials.json" oj="$H/.claude.json" a b
+  if [ -e "$oc" ]; then
+    [ "$(readlink -f "$cand")" = "$(readlink -f "$oc")" ] && { echo "that file IS ~/.claude/.credentials.json — the owner's own"; return 0; }
+    a=$(jq -r '.claudeAiOauth.accessToken // empty' "$cand" 2>/dev/null); b=$(jq -r '.claudeAiOauth.accessToken // empty' "$oc" 2>/dev/null)
+    [ -n "$a" ] && [ "$a" = "$b" ] && { echo "it carries the owner's own access token"; return 0; }
+    a=$(jq -r '.claudeAiOauth.refreshToken // empty' "$cand" 2>/dev/null); b=$(jq -r '.claudeAiOauth.refreshToken // empty' "$oc" 2>/dev/null)
+    [ -n "$a" ] && [ "$a" = "$b" ] && { echo "it carries the owner's own refresh token"; return 0; }
+  fi
+  if [ -n "$cj" ] && [ -f "$cj" ] && [ -f "$oj" ]; then
+    a=$(jq -r '.oauthAccount.accountUuid // empty' "$cj" 2>/dev/null); b=$(jq -r '.oauthAccount.accountUuid // empty' "$oj" 2>/dev/null)
+    [ -n "$a" ] && [ "$a" = "$b" ] && { echo "that login signed in as the owner's own account"; return 0; }
+    a=$(jq -r '(.oauthAccount.emailAddress // empty) | ascii_downcase' "$cj" 2>/dev/null); b=$(jq -r '(.oauthAccount.emailAddress // empty) | ascii_downcase' "$oj" 2>/dev/null)
+    [ -n "$a" ] && [ "$a" = "$b" ] && { echo "that login signed in as the owner (same email address)"; return 0; }
+  fi
+  return 1; }
+mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and nothing else. No credential is invented here and
+  # none is forwarded: either claude runs in a throwaway HOME so <handle> logs in there, or --from names the file a login
+  # somewhere else produced. Both go through owners_own before a byte is written. Run inside a member's own boundary this
+  # writes into that tmpfs HOME and dies with it — ~/.cc/members is not bound in there.
+  local h="${1:-}" src="" cj="" scratch="" dest own why old=""
+  [ -n "$h" ] && shift
+  while [ $# -gt 0 ]; do case "$1" in
+    --from) src="${2:-}"; [ -n "$src" ] || { echo "cc-sandbox: --from needs a file" >&2; return 2; }; shift;;
+    *) echo "usage: cc-sandbox mint <handle> [--from <file>]" >&2; return 2;; esac; shift; done
+  handle_ok "$h" || { echo "cc-sandbox: '$h' is not a handle (lower case, digits and -)" >&2; return 2; }
+  [ -f "$H/dev/$h/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace — make one first (cc-sandbox convert $h), then mint into it" >&2; return 2; }
+  dest="$H/.cc/members/$h/credentials.json"
+  if [ -z "$src" ]; then
+    [ -x "$CLAUDEBIN" ] || { echo "cc-sandbox: no claude at $CLAUDEBIN — there is nothing to log in with" >&2; return 2; }
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/cc-mint-XXXXXX") || return 2; chmod 700 "$scratch"; mkdir -p "$scratch/.claude"
+    echo "cc-sandbox: logging $h in inside a throwaway HOME ($scratch) — nothing of yours is in there, and it is deleted after."
+    echo "  Sign in AS $h, not as yourself; then quit claude (/exit). Whatever that login wrote is what gets installed."
+    # the owner's token must not ride in on the environment either: with one of these set claude never asks who is logging in
+    ( cd "$scratch" && env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_CODE_API_KEY -u CLAUDE_CONFIG_DIR HOME="$scratch" "$CLAUDEBIN" )
+    src="$scratch/.claude/.credentials.json"; cj="$scratch/.claude.json"
+  else cj="$(dirname "$(dirname "$src")")/.claude.json"   # a login writes .claude.json a level above its .claude/: if it is there, WHO logged in is checkable too
+  fi
+  if ! { [ -s "$src" ] && jq -e '.claudeAiOauth.accessToken' "$src" >/dev/null 2>&1; }; then
+    why=missing; [ -e "$src" ] && why="no .claudeAiOauth.accessToken in it"
+    echo "cc-sandbox: that login produced no credential ($src: $why) — nothing was written to $dest." >&2
+    [ -n "$scratch" ] && rm -rf "$scratch"; return 2; fi
+  if why=$(owners_own "$src" "$cj"); then
+    echo "cc-sandbox: REFUSED — $why. A member can print whatever credential is inside their boundary, so the owner's never goes in. Nothing was written to $dest; log $h in as themselves and mint again." >&2
+    [ -n "$scratch" ] && rm -rf "$scratch"; return 2; fi
+  mkdir -p "$H/.cc/members/$h" && chmod 700 "$H/.cc/members/$h" \
+    || { echo "cc-sandbox: could not make $H/.cc/members/$h — nothing was installed" >&2; [ -n "$scratch" ] && rm -rf "$scratch"; return 2; }
+  [ -e "$dest" ] && old=" (replacing the one there since $(date -r "$dest" +%F 2>/dev/null))"
+  own="$dest.tmp.$$"
+  # 0600, and the shape `cc-sandbox member` reads: claudeAiOauth whole, refresh token included — the workspace refreshes itself
+  if ! ( umask 077; jq '{claudeAiOauth: .claudeAiOauth}' "$src" > "$own" ) || ! chmod 600 "$own" || ! mv "$own" "$dest"; then
+    rm -f "$own"; echo "cc-sandbox: could not write $dest" >&2; [ -n "$scratch" ] && rm -rf "$scratch"; return 2; fi
+  [ -n "$scratch" ] && rm -rf "$scratch"
+  echo "cc-sandbox: minted $h's credential at $dest, mode 600$old — that is the one file the boundary reads, and the only credential inside it."
+  echo "  Start the workspace: cc $h"; }
+convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, or is refused with the reason. The four that
+  # exist were made by cc-slack's join flow; a repo already on the box has no such path, and hand-editing the markers leaves
+  # out the board, the exclude and the first commit. This makes the same workspace that flow makes, and says what it changed.
+  local r="${1:-}" dev ctl live n why br x did=()
+  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  dev="$H/dev/$r"
+  [ -d "$dev" ] || { echo "cc-sandbox: no ~/dev/$r to convert" >&2; return 2; }
+  [ -f "$dev/.cc/member-workspace" ] && { echo "cc-sandbox: ~/dev/$r is already a member workspace — nothing changed."; return 0; }
+  # THE CONTROL REPO IS NOT SOMEBODY'S WORKSPACE. This command lives in it; converting it would put the box's own source —
+  # every script that runs the box, this one included — inside one member's world, where they may edit it.
+  ctl=$(dirname "$(dirname "$(dirname "$SELF")")")
+  if [ "$(readlink -f "$dev")" = "$(readlink -f "$ctl")" ] || [ -f "$dev/core/bin/cc-sandbox" ]; then
+    echo "cc-sandbox: refusing ~/dev/$r — it is the box's own control repo (this command ships in it). A member workspace cannot be the thing that runs the box." >&2; return 2; fi
+  # LIVE TRACKS RUN OUTSIDE THE BOUNDARY. Converting under them would leave half of this repo in and half out: their
+  # worktrees, state and windows were made on the host, and the workspace's are made inside.
+  live=""; n=$(git -C "$dev" worktree list --porcelain 2>/dev/null | grep -c '^worktree ') || n=0
+  [ "${n:-0}" -gt 1 ] && live="it has $((n - 1)) git worktree(s) of its own"
+  if [ -n "$(ls -A "$H/.cc/worktrees/$r" 2>/dev/null)" ]; then
+    live="${live:+$live, and }tracks live under ~/.cc/worktrees/$r ($(ls -A "$H/.cc/worktrees/$r" | tr '\n' ' ' | sed 's/ $//'))"; fi
+  [ -n "$live" ] && { echo "cc-sandbox: refusing ~/dev/$r — $live. Those run outside the boundary; finish or remove them (cc rm $r <track>), then convert." >&2; return 2; }
+  # A COLLIDING HANDLE IS REFUSED, NEVER ADOPTED (docs/design-member-workspaces.md, "Open risks"): a workspace routes by its
+  # NAME, so a name the box already answers to would hand this person a channel that is somebody else's.
+  why=""; case "$r" in box|approvals|alerts) why="\`$r\` is one of the box's own channels";; *-updates) why="\`$r\` reads as the updates lane of #${r%-updates}";; esac
+  if [ -z "$why" ] && [ -f "$H/.cc/slack/routes.json" ]; then
+    why=$(jq -r --arg n "$r" 'to_entries[] | select(((.key|tostring|ltrimstr("#")|ascii_downcase) == $n) or ((.value|tostring|split("/")[0]|ascii_downcase) == $n)) | "`" + $n + "` is already routed to a session on this box"' "$H/.cc/slack/routes.json" 2>/dev/null | head -1) || why=""; fi
+  [ -n "$why" ] && { echo "cc-sandbox: refusing ~/dev/$r — $why. Rename the repo to a free handle and convert that one." >&2; return 2; }
+  mkdir -p "$dev/.cc" || { echo "cc-sandbox: could not make $dev/.cc — nothing was changed" >&2; return 2; }
+  printf '%s\n%s\n' "# member workspace — the DIRECTORY NAME is the handle; nothing reads this file's contents" \
+                    "# (docs/design-member-workspaces.md)" > "$dev/.cc/member-workspace"
+  : >> "$dev/.cc/member-facing"; did+=(".cc/member-workspace and .cc/member-facing — the boundary and the guard tier key on these")
+  [ -e "$dev/.git" ] || { git -C "$dev" init -q >/dev/null 2>&1 && did+=("git init: a workspace's work is tracked"); }
+  mkdir -p "$dev/.git/info" 2>/dev/null
+  grep -qx '\.cc/' "$dev/.git/info/exclude" 2>/dev/null || { echo '.cc/' >> "$dev/.git/info/exclude" && did+=(".cc/ excluded from commits — a committed marker travels into every worktree as an editable file claiming an identity"); }
+  if ! git -C "$dev" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    git -C "$dev" add -A >/dev/null 2>&1 && git -C "$dev" -c user.name=cc -c user.email=cc@localhost commit -q -m "$r's workspace" >/dev/null 2>&1 \
+      && did+=("a first commit: with no HEAD there is nothing for its tracks to branch from"); fi
+  br=$(git -C "$dev" symbolic-ref --short HEAD 2>/dev/null) || br=main; [ -n "$br" ] || br=main
+  "$(dirname "$SELF")/cc-board" init "$r" "$dev" "$br" >/dev/null 2>&1 && did+=("its board (~/.cc/boards/$r.json) — rows it already had are kept")
+  echo "cc-sandbox: ~/dev/$r is a member workspace now. Changed:"
+  for x in ${did[@]+"${did[@]}"}; do echo "  - $x"; done
+  echo "Next: cc-sandbox mint $r — it starts on nothing else. Its Slack channel pair and members.json record are the daemon's: cc-slack member add <@user>."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
   local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner
@@ -155,14 +273,14 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   # access token: the command never runs — its marker must not come back — and the refusal says what to mint and where.
   rm -f "$own"; out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
   t 'member: with no credential of its own the workspace does NOT start — the owner'"'"'s is no fallback' "$rc/$(grep -c STARTED <<<"$out")" 2/0
-  t 'member: and the refusal says what to mint, and where' "$(grep -cF "Mint one for this workspace and put it at $own" <<<"$out")" 1
+  t 'member: and the refusal names the command that mints one' "$(grep -cF "Mint one: cc-sandbox mint $h" <<<"$out")" 1
   mkdir -p "$(dirname "$own")" && echo '{"claudeAiOauth": {}}' > "$own" || return 1
   out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
   t 'member: a credential file without an access token is no credential — still no start' "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'has no .claudeAiOauth.accessToken' <<<"$out")" 2/0/1
   # THE WORLD INSIDE, on a credential of its own (the fixture this needs, built here). Only booleans come back out — never a token.
   mine="mbr-only-access-$$"; miner="mbr-only-refresh-$$"
   jq -n --arg a "$mine" --arg r "$miner" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$own" || return 1
-  out=$(TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak SLACK_BOT_TOKEN=leak "$SELF" member "$h" t -- sh -c '
+  out=$(TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak SLACK_BOT_TOKEN=leak CC_LOOP_TRIM=trim-77 "$SELF" member "$h" t -- sh -c '
     e(){ [ -e "$1" ] && echo present || echo absent; }
     echo other=$(e ~/dev/'"$o"'); echo ctl=$(e '"$ctl"'); echo devls=$(ls -A ~/dev | tr "\n" " "); echo ccls=$(ls -A ~/.cc | sort | tr "\n" " ")
     echo ccconfig=$(e ~/.cc/config); echo ledger=$(e ~/.cc/state/member-spend.json); echo states=$(ls ~/.cc/state | tr "\n" " "); echo boards=$(ls ~/.cc/boards | sort | tr "\n" " ")
@@ -170,6 +288,7 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
     echo credfile=$([ -e ~/.cc/members ] && echo present || echo absent)
     echo ssh=$(e ~/.ssh); echo gh=$(e ~/.config/gh); echo gitconfig=$(e ~/.gitconfig); echo sock=$(e /var/run/docker.sock)$(e /run/docker.sock); echo tmux=${TMUX:-unset}
     echo env=$(env | grep -cE "^(CLAUDE_CODE_OAUTH_TOKEN|SLACK_BOT_TOKEN|TMUX)="); echo inside=${CC_MEMBER_SANDBOX:-unset}/${CC_ROLE:-unset}
+    echo trim=${CC_LOOP_TRIM:-unset}
     echo bin=$([ -L ~/bin/cc ] && echo symlink || echo file)$(touch ~/bin/x 2>/dev/null && echo -writable || echo -ro); echo slack=$(ls -A ~/.cc/slack | sort | tr "\n" " ")
     echo cwd=$PWD; echo status=$(git status --short >/dev/null 2>&1 && echo ok || echo broken)
     echo hooks=$(touch ~/dev/'"$h"'/.git/hooks/post-checkout 2>/dev/null && echo writable || echo ro)
@@ -193,6 +312,8 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'member: ssh absent' "$(g ssh)" absent;  t 'member: config/gh absent' "$(g gh)" absent
   t 'member: .gitconfig absent' "$(g gitconfig)" absent;  t 'member: the container socket absent' "$(g sock)" absentabsent;  t 'member: TMUX unset' "$(g tmux)" unset
   t 'member: the environment was cleared' "$(g env)" 0;  t 'member: CC_MEMBER_SANDBOX=1 and CC_ROLE=member inside' "$(g inside)" 1/member
+  # the clearing is a whitelist, not a wall: the knob a dispatch sets in front of the loop has to reach the loop, which runs in here
+  t 'member: …and the trim knob set in front of a member dispatch arrives inside, where the loop it steers runs' "$(g trim)" trim-77
   t 'member: ~/bin is the control bin itself, read-only' "$(g bin)" file-ro;  t 'member: ~/.cc/slack is the member dir' "$(g slack)" 'enabled files'
   t 'member: cwd is the track worktree' "$(g cwd)" "$H/.cc/worktrees/$h/t";  t 'member: git status works' "$(g status)" ok
   # the host runs git in this workspace: a hook or a hooksPath written from inside would execute out there, as the owner
@@ -209,6 +330,113 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
   rm -rf "${dev:?}" "${H:?}/dev/${o:?}" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$H/.cc/state/$o" "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.lock" "$H/.cc/boards/$o.json" \
          "$H/.cc/members/$h" "$H/.cc/slack/member/$h"; }
+selfcheck_mint(){   # MINTING AND CONVERTING, IN A HOME OF THEIR OWN. Everything either command reads or writes hangs off $fh —
+  # its own owner credential, its own ~/dev, its own ~/.cc — so the box's real ~/.claude is not something these cases have to
+  # avoid touching: it is not reachable from them, and the hash at the end says so out loud.
+  local fh real0 real1 dest d1 out rc r1 r2 sd o1 o2 cb
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxmint-XXXXXX") || return 1
+  real0=$(md5sum "$H/.claude/.credentials.json" 2>/dev/null | cut -d' ' -f1); real0="${real0:-absent}"
+  mkdir -p "$fh/.claude" "$fh/dev" "$fh/.local/bin" "$fh/.cc" || return 1
+  jq -n '{claudeAiOauth: {accessToken: "owner-access", refreshToken: "owner-refresh", expiresAt: 99999999999999}}' > "$fh/.claude/.credentials.json"
+  jq -n '{oauthAccount: {accountUuid: "owner-uuid", emailAddress: "owner@example.invalid"}}' > "$fh/.claude.json"
+  : > "$fh/.local/bin/claude"; chmod +x "$fh/.local/bin/claude"   # the member launch binds this one ro
+  # a stand-in for `claude`: a LOGIN writes a credential into whatever HOME it was handed, exactly where the real one does
+  cat > "$fh/login" <<'EOS'
+#!/bin/sh
+mkdir -p "$HOME/.claude"
+jq -n --arg a "$LOGIN_ACCESS" --arg r "$LOGIN_REFRESH" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$HOME/.claude/.credentials.json"
+[ -n "${LOGIN_UUID:-}" ] && jq -n --arg u "$LOGIN_UUID" --arg e "$LOGIN_EMAIL" '{oauthAccount: {accountUuid: $u, emailAddress: $e}}' > "$HOME/.claude.json"
+exit 0
+EOS
+  printf '#!/bin/sh\nexit 0\n' > "$fh/login-empty"; chmod +x "$fh/login" "$fh/login-empty"
+  # ── convert: an ordinary repo already on the box becomes the same workspace the join flow makes ────────────────────
+  mkdir -p "$fh/dev/alice"; echo hi > "$fh/dev/alice/README.md"
+  out=$(HOME="$fh" "$SELF" convert alice 2>&1); rc=$?
+  t 'convert: an ordinary repo becomes a workspace — both markers, a git repo, a HEAD its tracks can branch from' \
+    "$rc/$([ -f "$fh/dev/alice/.cc/member-workspace" ] && echo ws)/$([ -f "$fh/dev/alice/.cc/member-facing" ] && echo mf)/$(git -C "$fh/dev/alice" rev-parse -q --verify HEAD >/dev/null 2>&1 && echo head)" 0/ws/mf/head
+  t 'convert: .cc/ is excluded from its commits, and a board of its own exists' \
+    "$(grep -cx '\.cc/' "$fh/dev/alice/.git/info/exclude" 2>/dev/null)/$([ -f "$fh/.cc/boards/alice.json" ] && echo board)" 1/board
+  t 'convert: it says what it changed, and what has to happen next' "$(grep -c 'member-workspace' <<<"$out")/$(grep -c 'cc-sandbox mint alice' <<<"$out")" 1/1
+  out=$(HOME="$fh" "$SELF" convert alice 2>&1); rc=$?
+  t 'convert: converting one twice changes nothing and says so' "$rc/$(grep -c 'already a member workspace' <<<"$out")" 0/1
+  # ── convert: what must NOT be converted, each on a fixture of its own, each refused with its reason ────────────────
+  mkdir -p "$fh/dev/ctl/core/bin"; cp "$SELF" "$fh/dev/ctl/core/bin/cc-sandbox"; chmod +x "$fh/dev/ctl/core/bin/cc-sandbox"
+  out=$(HOME="$fh" "$fh/dev/ctl/core/bin/cc-sandbox" convert ctl 2>&1); rc=$?
+  t 'convert: the repo this cc-sandbox ships in is refused — the box cannot be one member'"'"'s world' \
+    "$rc/$(grep -c 'control repo' <<<"$out")/$([ -e "$fh/dev/ctl/.cc" ] && echo made || echo none)" 2/1/none
+  mkdir -p "$fh/dev/clone/core/bin"; : > "$fh/dev/clone/core/bin/cc-sandbox"
+  out=$(HOME="$fh" "$SELF" convert clone 2>&1); rc=$?
+  t '…and so is a copy of that repo this command does NOT ship in' \
+    "$rc/$(grep -c 'control repo' <<<"$out")/$([ -e "$fh/dev/clone/.cc" ] && echo made || echo none)" 2/1/none
+  mkdir -p "$fh/dev/proj" "$fh/.cc/worktrees/proj/t1"
+  out=$(HOME="$fh" "$SELF" convert proj 2>&1); rc=$?
+  t 'convert: a repo with a track live outside the boundary is refused, and the reason names the track' \
+    "$rc/$(grep -c 't1' <<<"$out")/$([ -e "$fh/dev/proj/.cc" ] && echo made || echo none)" 2/1/none
+  rmdir "$fh/.cc/worktrees/proj/t1"
+  # A BOARD THE REPO ALREADY HAD IS SOMEBODY'S WORK, not this command's to start over: converting adopts it, so a row a
+  # person put there and a status a person set are still there afterwards.
+  cb="$(dirname "$SELF")/cc-board"
+  HOME="$fh" "$cb" init proj "$fh/dev/proj" main >/dev/null 2>&1
+  HOME="$fh" "$cb" add proj t9 'a row that was already on the board' >/dev/null 2>&1
+  HOME="$fh" "$cb" set proj t9 status waiting >/dev/null 2>&1
+  out=$(HOME="$fh" "$SELF" convert proj 2>&1); rc=$?
+  t '…and that same repo converts once the track is gone, keeping the board rows it already had' \
+    "$rc/$([ -f "$fh/dev/proj/.cc/member-workspace" ] && echo ws)/$(HOME="$fh" "$cb" get proj t9 status 2>&1)" 0/ws/waiting
+  mkdir -p "$fh/dev/proj2" && git -C "$fh/dev/proj2" init -q -b main >/dev/null 2>&1 \
+    && git -C "$fh/dev/proj2" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$fh/dev/proj2" worktree add -q -b w "$fh/wt2" >/dev/null 2>&1
+  out=$(HOME="$fh" "$SELF" convert proj2 2>&1); rc=$?
+  t 'convert: a repo carrying a git worktree of its own is refused for the same reason' "$rc/$(grep -c 'git worktree' <<<"$out")" 2/1
+  mkdir -p "$fh/dev/box" "$fh/dev/alice-updates"
+  o1=$(HOME="$fh" "$SELF" convert box 2>&1); r1=$?; o2=$(HOME="$fh" "$SELF" convert alice-updates 2>&1); r2=$?
+  t 'convert: a handle the box already answers to is refused, never adopted (#box, an -updates lane)' \
+    "$r1/$r2/$([ -e "$fh/dev/box/.cc" ] && echo made || echo none)/$([ -e "$fh/dev/alice-updates/.cc" ] && echo made || echo none)/$(grep -c 'own channels' <<<"$o1")/$(grep -c 'updates lane' <<<"$o2")" 2/2/none/none/1/1
+  mkdir -p "$fh/.cc/slack" "$fh/dev/notes"; jq -n '{"#notes": "other/x"}' > "$fh/.cc/slack/routes.json"
+  out=$(HOME="$fh" "$SELF" convert notes 2>&1); rc=$?
+  t '…and one routes.json already points at a session on this box' "$rc/$(grep -c 'routed to a session' <<<"$out")/$([ -e "$fh/dev/notes/.cc" ] && echo made || echo none)" 2/1/none
+  mkdir -p "$fh/dev/free"; out=$(HOME="$fh" "$SELF" convert free 2>&1); rc=$?   # …and the same routes file does not refuse a handle it does NOT name
+  t '…while a handle that file does not name converts with it sitting right there' \
+    "$rc/$([ -f "$fh/dev/free/.cc/member-workspace" ] && echo ws)" 0/ws
+  rm -f "$fh/.cc/slack/routes.json"
+  # ── mint: what a login produced, and only that ────────────────────────────────────────────────────────────────────
+  dest="$fh/.cc/members/alice/credentials.json"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=alice-access LOGIN_REFRESH=alice-refresh LOGIN_UUID=alice-uuid LOGIN_EMAIL=alice@example.invalid "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: the login walk installs what THAT login produced, where the boundary reads it, mode 600' \
+    "$rc/$(jq -r '.claudeAiOauth.accessToken' "$dest" 2>/dev/null)/$(jq -r '.claudeAiOauth.refreshToken' "$dest" 2>/dev/null)/$(stat -c %a "$dest" 2>/dev/null)" 0/alice-access/alice-refresh/600
+  t 'mint: and nothing of that login but claudeAiOauth' "$(jq -r 'keys|join(",")' "$dest" 2>/dev/null)" claudeAiOauth
+  sd=$(sed -n 's/.*throwaway HOME (\([^)]*\)).*/\1/p' <<<"$out" | head -1)
+  t 'mint: the throwaway HOME it logged in with is named, and is gone afterwards' "${sd:+named}/$([ -n "$sd" ] && [ -e "$sd" ] && echo left || echo gone)" named/gone
+  d1=$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)
+  # THE REFUSAL THIS WHOLE WALL IS FOR. A member prints whatever credential is inside their boundary, so a mint that would
+  # install the OWNER'S must stop before it writes — his file, his token, or a login signed in as his account. Each of these
+  # deliberately reads the credential the case above minted ($d1): "nothing was written" is only a claim you can check
+  # against a file that was already there, and each of them refuses a fixture it builds itself.
+  out=$(env HOME="$fh" "$SELF" mint alice --from "$fh/.claude/.credentials.json" 2>&1); rc=$?
+  t 'mint: --from the owner'"'"'s own credential file is REFUSED, and the workspace'"'"'s own is left as it was' \
+    "$rc/$(grep -c REFUSED <<<"$out")/$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" "2/1/$d1"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=owner-access LOGIN_REFRESH=owner-refresh LOGIN_UUID=owner-uuid LOGIN_EMAIL=owner@example.invalid "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: a login that signed in as the owner himself is refused — his token never becomes a workspace'"'"'s' \
+    "$rc/$(grep -c "owner's own access token" <<<"$out")/$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" "2/1/$d1"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=fresh-access LOGIN_REFRESH=fresh-refresh LOGIN_UUID=owner-uuid LOGIN_EMAIL=owner@example.invalid "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: …and a FRESH token for his account is still his — the tokens differ, the account does not' \
+    "$rc/$(grep -c "as the owner's own account" <<<"$out")/$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" "2/1/$d1"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=other-access LOGIN_REFRESH=other-refresh LOGIN_UUID=other-uuid LOGIN_EMAIL=OWNER@Example.Invalid "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: …and so is one whose account id differs but whose address is his, in any case' \
+    "$rc/$(grep -c 'same email address' <<<"$out")/$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" "2/1/$d1"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login-empty" "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: a login that produced no credential installs nothing' "$rc/$(grep -c 'produced no credential' <<<"$out")/$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" "2/1/$d1"
+  mkdir -p "$fh/dev/bob"
+  out=$(env HOME="$fh" "$SELF" mint bob 2>&1); rc=$?
+  t 'mint: a repo that is not a member workspace is refused, and told what makes it one' \
+    "$rc/$(grep -c 'cc-sandbox convert bob' <<<"$out")/$([ -e "$fh/.cc/members/bob" ] && echo made || echo none)" 2/1/none
+  # ── and the pair end to end: a repo the box already had, converted and minted, is a workspace the boundary starts ──
+  out=$(env HOME="$fh" "$SELF" member alice -- sh -c 'echo inside=$(jq -r .claudeAiOauth.accessToken ~/.claude/.credentials.json)' 2>&1); rc=$?
+  t 'convert + mint: the boundary starts that workspace, and the one credential inside it is the minted one' \
+    "$rc/$(sed -n 's/^inside=//p' <<<"$out" | head -1)" 0/alice-access
+  real1=$(md5sum "$H/.claude/.credentials.json" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
+  t 'mint/convert: through all of that, the box'"'"'s real ~/.claude/.credentials.json is untouched' "$real1" "$real0"
+  git -C "$fh/dev/proj2" worktree remove --force "$fh/wt2" >/dev/null 2>&1
+  rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
   local r="_ccsbx$$" dev wt st n=0 bad=0 out want
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
@@ -246,16 +474,18 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
   out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
-  selfcheck_member
+  selfcheck_member; selfcheck_mint
   git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$dev" worktree remove --force "$H/.cc/worktrees/$r/u" >/dev/null 2>&1
   rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")"
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
 case "${1:-}" in selfcheck) selfcheck; exit $?;;
+  mint) shift; mint "$@"; exit $?;;
+  convert) shift; convert "${1:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ]; then tr="${1:-}"; shift; fi; [ "${1:-}" = -- ] && shift   # <handle> [<track>|""] [--] cmd
           [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] -- <cmd...>" >&2; exit 2; }
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
 launch "$repo" "$track" "$@"
