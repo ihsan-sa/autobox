@@ -207,9 +207,17 @@ def run_check(repo, a):
     """(rc, output). The EXIT CODE is the whole answer — a check prints for the human reading the failure,
     and decides nothing by what it prints. Anything that goes wrong running it is a failure, not a pass:
     the one direction this must never err in is towards 'delivered'."""
+    env = dict(os.environ)
+    # A check names the box's own tools the way a person would at a prompt (`cc-limit selfcheck`), so they have to
+    # BE on PATH when it runs. The landing queue's worker has a PATH without the user's bin dir, and three checks
+    # in a row died there with rc=127 while the same command passed by hand (2026-09-02) — a tooling failure read
+    # as "not delivered". The dir this file lives in is that bin dir, so prepend it and let a check stay readable.
+    # os.defpath is the floor: passing env= makes subprocess resolve the INTERPRETER through this PATH too, so an
+    # inherited PATH that is empty or broken would lose `bash` itself and every check would read as rc=127.
+    env["PATH"] = os.pathsep.join([os.path.dirname(os.path.realpath(__file__)), env.get("PATH", "") or os.defpath])
     try:
         r = subprocess.run(["bash", "-c", a["check"]], cwd=repo_dir(repo), capture_output=True, text=True,
-                           timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
+                           timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
         return r.returncode, r.stdout + r.stderr
     except Exception as e:
         return 127, "%s: %s" % (e.__class__.__name__, e)
@@ -638,6 +646,18 @@ def selfcheck():
         t("a bare thanks is not an ask", not is_ask("thanks!"))
         t("an ack with a few words is not an ask", not is_ask("ok cool, thanks a lot"))
         t("a ! command is not an ask", not is_ask("!status"))
+        # A check runs with this file's own bin dir on PATH, so a row may name a sibling tool plainly (review of
+        # the rc=127 landings, 2026-09-02): scrub PATH entirely and a bare sibling name still resolves.
+        _sib = os.path.basename(os.path.realpath(__file__))
+        _keep = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = ""
+            t("a check finds this file's siblings on PATH even when PATH is empty",
+              run_check(R, {"check": "command -v %s >/dev/null" % _sib})[0] == 0)
+            t("and a name that is not a sibling still fails, so PATH is prepended and not replaced",
+              run_check(R, {"check": "command -v definitely-not-a-tool-xyz >/dev/null"})[0] != 0)
+        finally:
+            os.environ["PATH"] = _keep
         t("a plain question is not opened as an ask", not is_ask("how full is the context?"))
         t("a compound ask keeps both parts",
           len(parts_of("react with :ok_hand: in #approvals. this should also remove it from the board.")) == 2)
