@@ -25,10 +25,16 @@
   cc-slack status | channels | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>
   cc-slack member add <@user>…        give each a PRIVATE #<handle> (+ -updates) with the owner in it and ~/dev/<handle>
                                       — the same thing a `team_join` does by itself. Idempotent; the owner is exempt.
+  cc-slack member instructions <handle>    put the member instructions (how a project channel is made, and by whom)
+                                      into that workspace's README, appending if it already has one of its own
   cc-slack members                    who has a workspace: handle → channels → folder → budget used today
   cc-slack mkchannel <name>… [--public]    create #<name> if missing (PRIVATE unless --public), join it, invite the owner, set the
                                       topic; a #<repo>--<sub> name also inherits #<repo>'s people (one channel per project).
                                       A repo channel comes as a PAIR: #<name>-updates is created and routed with it
+  cc-slack project <name>             FROM A MEMBER WORKSPACE'S SESSION: ask the daemon for #<this workspace>--<name>
+                                      and its updates lane. The workspace half comes from the socket, never from you,
+                                      so this cannot name another workspace's lane; at most 3 an hour. The human way in
+                                      stays `new project <name>` typed in the channel by the member or the owner
   cc-slack updates-sweep [--dry-run]  give every repo channel that predates the split its -updates lane (idempotent one-shot;
                                       a channel whose only member is the bot — the vitals store — gets none)
   cc-slack orch-channel <target> <alias> [--parent-alias A] [--brief "…"]   give a sub-orchestrator its own channel
@@ -174,6 +180,7 @@ _chan_members = {}                                           # chat -> (t, {uid,
 SHARED_MAX, SHARED_N = 1000, 3                               # a shared message folded into the text: chars per attachment, attachments
 PROVISIONED = "provisioned.json"                              # {"<target>": {"chan": name, "at": ts}}: session dirs the daemon created for a channel
 PROVISION_MAX, PROVISION_WINDOW = 3, 3600                    # at most 3 new session dirs an hour: a channel-creation spree must not spawn sessions without limit
+ASKED_PROJECTS = "asked-projects.json"                        # {"<ws>--<leaf>": {"ws":…, "at": ts}}: project channels a SESSION asked for, and the same hourly window
 for _p in glob.glob(f"{HOME}/.cc/slack/venv/lib/python*/site-packages"):   # slack_sdk lives in the venv
     sys.path.append(_p)
 
@@ -881,6 +888,24 @@ def save_provisioned(prov):
     os.replace(tmp, f"{DIR}/{PROVISIONED}")
 
 
+def load_asked():
+    """Project channels a session ASKED the daemon for: {"<ws>--<leaf>": {"ws":…, "at": ts}}. Its own ledger, not
+    provisioned.json: `#<ws>--<leaf>` never makes a session dir, so the dir cap would never see one of these."""
+    try:
+        d = json.load(open(f"{DIR}/{ASKED_PROJECTS}"))
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_asked(asked):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = f"{DIR}/{ASKED_PROJECTS}.tmp"
+    with open(tmp, "w") as f:
+        os.fchmod(f.fileno(), 0o600); json.dump(asked, f, indent=1, sort_keys=True)
+    os.replace(tmp, f"{DIR}/{ASKED_PROJECTS}")
+
+
 def needs_dir(target):
     """True for a fallback target whose session dir does not exist yet. `box` and any `<repo>/<track>` are never
     provisioned: the box session is the box's own, and a track worktree is `cc <repo> <track>`'s to create, never Slack's."""
@@ -960,15 +985,22 @@ MEMBER_MARKER_TEXT = ("# member workspace — the DIRECTORY NAME is the handle; 
                       "# (overlay: docs/design-member-workspaces.md)\n")
 RESERVED_HANDLES = ("box", APPROVALS, ALERTS)                 # `box` is where DMs route; the other two are not sessions at all
 MEMBER_SPEND = f"{HOME}/.cc/state/member-spend.json"           # {"<handle>": {"day": "YYYY-MM-DD", "usd": n}} — written by `cc` at --go
-NEW_PROJECT_RE = re.compile(r"^\s*new\s+project\s+[`\"']?([A-Za-z0-9][A-Za-z0-9._-]{0,30})[`\"']?\s*$", re.I)
+PROJECT_LEAF = r"[A-Za-z0-9][A-Za-z0-9._-]{0,30}"   # what a project may be called, in ONE place: the human phrase below and
+NEW_PROJECT_RE = re.compile(rf"^\s*new\s+project\s+[`\"']?({PROJECT_LEAF})[`\"']?\s*$", re.I)   # a session's `project` ask
+ASK_LEAF_RE = re.compile(rf"^{PROJECT_LEAF}$")     # take exactly the same names, because they are the same door
+MEMBER_INSTRUCTIONS = """## Project channels
+
+- `#{chan}` is this workspace. Say `new project <name>` there and you get `#{chan}--<name>`, its updates lane
+  and a project under here. That line counts only from you or the owner — a SESSION saying it is ignored, so a
+  session either asks you for it or runs `cc slack project <name>` itself, which asks the box for the same
+  channel — three an hour, that way.
+- `#{chan}-updates` carries the automated flow — progress, budget notices, audits.
+"""
 MEMBER_README = """# {handle}
 
 Your workspace on {box}. Everything you make lives under this folder and nowhere else on the box.
 
-- `#{chan}` is this workspace. Say `new project <name>` there and you get `#{chan}--<name>`,
-  its updates lane and a project under here.
-- `#{chan}-updates` carries the automated flow — progress, budget notices, audits.
-
+""" + MEMBER_INSTRUCTIONS + """
 The owner is in every channel the box makes for you. See `docs/design-member-workspaces.md`.
 """
 
@@ -1096,6 +1128,33 @@ def member_recovery(handle):
     return f"`mkdir -p ~/dev/{handle}/.cc && touch ~/dev/{handle}/{MEMBER_MARKER}` on the box"
 
 
+def ensure_member_readme(handle, chan, d=None):
+    """The member instructions in ~/dev/<handle>/README.md, never by overwriting one somebody wrote. Returns what it
+    did: "wrote" (there was no README), "merged" (there was one and it did not say how a project channel is made, so
+    the block is appended under it) or "kept".
+
+    THE SKIP THAT USED TO BE HERE IS THE BUG. This was `if not os.path.exists(README)`, so a workspace made from a
+    folder that already had a README — every `cc-sandbox convert`, and one real workspace on 2026-09-02 — silently
+    got no member instructions and looked fully provisioned doing it. Its session then had no way to know a project channel
+    is asked for, not requested from the owner. The durable carrier is the session prompt (`cc`'s MEMBER_SP); this is
+    the copy the member reads, so it is topped up rather than skipped."""
+    p = f"{d or f'{DEV}/{handle}'}/README.md"
+    try:
+        old = open(p).read()
+    except OSError:
+        old = None
+    if old is None:
+        with open(p, "w") as f:
+            f.write(MEMBER_README.format(handle=handle, chan=chan, box=BOX))
+        return "wrote"
+    if "cc slack project" in old:      # the newest half of the block: a README written before it is topped up once
+        return "kept"
+    with open(p, "a") as f:
+        f.write(("" if old.endswith("\n\n") else "\n" if old.endswith("\n") else "\n\n")
+                + MEMBER_INSTRUCTIONS.format(chan=chan))
+    return "merged"
+
+
 def provision_member_workspace(handle, chan, at=None, by=None):
     """~/dev/<handle> as the member's own repo: provision_dir's CLAUDE.md + `.cc/member-facing` + `git init`, plus a
     README, a board of its own and `.cc/member-workspace`. Idempotent — an existing workspace is topped up, never
@@ -1110,9 +1169,7 @@ def provision_member_workspace(handle, chan, at=None, by=None):
         with open(f"{d}/{MEMBER_MARKER}", "w") as f:
             f.write(MEMBER_MARKER_TEXT)       # PRESENCE is the whole signal: the handle is the dir's name (cc-guard reads the path)
         open(f"{d}/.cc/member-facing", "a").close()
-        if not os.path.exists(f"{d}/README.md"):
-            with open(f"{d}/README.md", "w") as f:
-                f.write(MEMBER_README.format(handle=handle, chan=chan, box=BOX))
+        ensure_member_readme(handle, chan, d)    # tops one up; NOT "skip if a README is already there" (see there)
         if not os.path.isdir(f"{d}/.git"):
             subprocess.run(["git", "init", "-q", d], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         # `.cc/` NEVER ENTERS A COMMIT — excluded before the `git add -A` below, exactly as `cc` does it for a track
@@ -1280,6 +1337,37 @@ def new_project(cfg, handle, project):
     log(f"member {handle}: project {project} ({how}) → {handle}/{project}")
     return True, (f"`{handle}/{project}` — #{name} and #{updates_name(name)} are yours and the owner's. "
                   f"Its session starts with the rest of this workspace's.")
+
+
+def ask_project(cfg, ws, leaf, at=None):
+    """A SESSION asks for a project channel under its own workspace; the daemon makes it. Returns (ok, message).
+
+    THE WORKSPACE HALF IS NEVER THE CALLER'S. `ws` comes from the member socket the ask arrived on — the same place
+    `reply` and `inject` get their scope — and the caller supplies only the leaf, so there is no string here that
+    could point the name at another workspace's lane. A leaf that tries to carry a workspace anyway (`a/b`, `a--b`)
+    is REFUSED rather than folded, because a caller that meant `#other--x` should be told no, not quietly given
+    `#<ws>--other-x`. Bounded by the same window as new session dirs (PROVISION_MAX an hour, per workspace): a
+    session in a loop must not fill the workspace with channels. Every refusal returns its reason — the asking
+    session is the only one who can act on it."""
+    at = time.time() if at is None else at
+    leaf = (leaf or "").strip()
+    if "/" in leaf or "--" in leaf:
+        return False, (f"the workspace half of a channel name is not yours to choose — ask for a plain project name "
+                       f"and you get #{ws}--<name> ({leaf!r} looks like it names a channel, not a project)")
+    if not ASK_LEAF_RE.match(leaf):
+        return False, ("a project name starts with a letter or digit and then [A-Za-z0-9._-], up to 31 characters "
+                       f"— {leaf!r} is not one")
+    asked = load_asked()
+    _, wait = provision_window(at, {k: v for k, v in asked.items() if v.get("ws") == ws})
+    if wait:
+        return False, (f"{ws} may ask for at most {PROVISION_MAX} project channels an hour and that is used up — "
+                       f"ask again for {leaf} in {wait_mins(wait)} min.")
+    ok, msg = new_project(cfg, ws, leaf)
+    if ok:
+        asked[f"{ws}--{member_handle(leaf)}"] = {"ws": ws, "at": at}   # the key IS the channel new_project just made
+        # (same folding), so asking twice for one name is the one channel it really is, and only a creation spends a slot
+        save_asked(asked)
+    return ok, msg
 
 
 def detect_target(cwd=None):
@@ -2822,7 +2910,7 @@ class Daemon:
             cwd = None
         return pid, uid, cwd
 
-    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate")
+    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project")
     OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post")
 
     def verbs_of(self, first):
@@ -2852,6 +2940,9 @@ class Daemon:
                     return "a member session has no alias"
             elif verb == "escalate":
                 pass                    # the one verb that leaves the workspace, and it leaves only towards the owner
+            elif verb == "project":
+                pass                    # names no channel and no workspace: ask_project DERIVES the name from this
+                                        # socket's own workspace, so there is nothing here to point somewhere else
             elif verb in self.MEMBER_VERBS:
                 chat = str(first[verb])
                 name = chat[1:] if chat.startswith("#") else self.chan_name(chat) if chat and chat != "local" else chat
@@ -2871,6 +2962,12 @@ class Daemon:
     def member_verb(self, h, first, verb):
         """The scoped Slack calls a boundary cannot make itself (no token inside). `verb` is the one refuse_reason
         authorised — never re-derived here, or a second key in the payload would run instead. Returns the response."""
+        if verb == "project":   # A SESSION ASKS, THE DAEMON MAKES IT. The boundary has no Slack token and no route to
+            # Slack, and must not be given one — so the ask crosses here, where the token already is, and comes back
+            # with its answer. The human `new project <name>` in the channel is untouched; this is a second door.
+            ok, msg = ask_project(self.cfg, h, str(first[verb] or ""))
+            log(f"project {h}: {str(first[verb])[:40]} ok={ok}")
+            return {"ok": True, "text": msg} if ok else {"ok": False, "error": msg}
         chat = str(first[verb]); target = str(first.get("target") or h)
         if chat.startswith("#"):
             chat = resolve_channel(self.cfg, chat[1:]) or chat
@@ -6107,12 +6204,28 @@ def resolve_user(cfg, who):
 def cmd_member(argv):
     """`cc-slack member add <@user>…` — the owner's hand-run half of a team_join. Same ensure_member, same
     idempotence: running it on somebody who already has a workspace prints so and changes nothing. Exempt from the
-    hourly provisioning cap — the cap is there to bound a channel-creation spree, and this is the owner typing."""
+    hourly provisioning cap — the cap is there to bound a channel-creation spree, and this is the owner typing.
+
+    `member instructions <handle>` is the other half: the member instructions into a workspace no join flow made
+    (`cc-sandbox convert` calls it). No token, no Slack, no member record — one README."""
+    if argv[:1] == ["instructions"]:
+        # For a workspace no join flow made: `cc-sandbox convert` writes the markers itself, so nothing ever wrote
+        # the member instructions into it. No token and no Slack — this touches that one workspace's README.
+        if len(argv) != 2:
+            print("cc-slack member instructions <handle>", file=sys.stderr); return 2
+        h = argv[1]
+        if not os.path.isfile(f"{DEV}/{h}/{MEMBER_MARKER}"):
+            print(f"~/dev/{h} is not a member workspace — nothing was written", file=sys.stderr); return 1
+        print({"wrote": "README.md: the member instructions — how a project channel is made, and by whom",
+               "merged": "README.md: the member instructions appended, under the README that was already there",
+               "kept": "README.md: it already says how a project channel is made — left as it is",
+               }[ensure_member_readme(h, h)])
+        return 0
     cfg = load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("no SLACK_BOT_TOKEN — cc slack setup first", file=sys.stderr); return 1
     if len(argv) < 2 or argv[0] != "add":
-        print("cc-slack member add <@user>…", file=sys.stderr); return 2
+        print("cc-slack member add <@user>… | member instructions <handle>", file=sys.stderr); return 2
     rc = 0
     for who in argv[1:]:
         uid = resolve_user(cfg, who)
@@ -10482,6 +10595,16 @@ def cmd_selfcheck():
         tracked = subprocess.run(["git", "-C", wsdir, "ls-tree", "-r", "--name-only", "HEAD"],
                                  capture_output=True, text=True).stdout.split()
         marker_body = open(f"{wsdir}/{MEMBER_MARKER}").read()
+        # THE SILENT SKIP, on a fixture of its own and in both directions. `~/dev/hank` is a folder that already has a
+        # README — every `cc-sandbox convert`, and one real workspace on 2026-09-02 — where `if not exists README`
+        # wrote nothing at all and left the workspace looking fully provisioned without the one instruction that stops
+        # its session asking the owner for a channel the box makes by itself. `~/dev/iris` is the other direction.
+        os.makedirs(f"{DEV}/hank", exist_ok=True); os.makedirs(f"{DEV}/iris", exist_ok=True)
+        with open(f"{DEV}/hank/README.md", "w") as fh:
+            fh.write("# hank\nnotes of my own\n")
+        provision_member_workspace("hank", "hank"); provision_member_workspace("iris", "iris")
+        hank_doc, iris_doc = open(f"{DEV}/hank/README.md").read(), open(f"{DEV}/iris/README.md").read()
+        hank_again = ensure_member_readme("hank", "hank"); hank_doc2 = open(f"{DEV}/hank/README.md").read()
         routed = dmw.route(fkm.chans["alice-b"], "channel")
         cid_a = fkm.chans["alice-b"]
         dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.1", "user": "UALICE",
@@ -10587,6 +10710,15 @@ def cmd_selfcheck():
     check("a team_join for a non-owner creates the PAIR (#<handle> + #<handle>-updates) and ~/dev/<handle> once — "
           "and the same join again creates nothing, changes nothing and posts nothing",
           made1 == ["alice-b", "alice-b-updates"] and mem1 == ["alice-b"] and made2 == made1 and made_ws)
+    check("a workspace made from a folder that ALREADY HAS A README no longer silently loses the member instructions: "
+          "the README that was there is KEPT and the block is appended under it — the phrase, that it counts only from "
+          "a person, and the session's own way in — while a folder with no README still gets the whole one, and a "
+          "top-up that finds the block already there changes nothing",
+          "notes of my own" in hank_doc and hank_doc.startswith("# hank")
+          and all(t in hank_doc for t in ("new project <name>", "cc slack project <name>",
+                                          "a SESSION saying it is ignored"))
+          and hank_again == "kept" and hank_doc2 == hank_doc
+          and iris_doc.startswith("# iris") and "new project <name>" in iris_doc)
     check("the OWNER's own team_join creates nothing at all — he owns the whole box",
           made3 == made2 and mem3 == mem1 and "owner" not in load_members())
     check("routing needs no table: #<handle> IS the target and #<handle>--<x> IS <handle>/<x>",
@@ -10866,6 +10998,29 @@ def cmd_selfcheck():
         # boundary cc-notify has no config to push with and would log to a tmpfs and exit 0, reaching nobody.
         r_esc = ms_req({"escalate": "blocked", "text": "the owner must decide this"})
         r_esc_empty = ms_req({"escalate": "blocked"})
+        # `project`: the SECOND door to a sub-channel. The creating half (new_project) is covered by its own cases and
+        # is stubbed here — what these prove is what the DOOR decides: whose workspace the name is built from, which
+        # asks are refused and with what reason, and that the hourly window is the dir cap's, per workspace.
+        madeMS = []; real_np_ms = globals()["new_project"]
+        globals()["new_project"] = lambda cfg, h, proj: (madeMS.append((h, proj)) or (True, f"`{h}/{proj}` — #{h}--{proj} is yours"))
+        save_asked({})
+        r_proj = ms_req({"project": "todo2"})
+        led_after = load_asked()
+        # THE ATTACK: a leaf that carries a workspace. `bob--x` folded rather than refused would hand alice a channel
+        # named after bob's lane; `bob/x` is the same trick with the target separator.
+        save_asked({})
+        r_proj_ws = ms_req({"project": "bob--x"}); r_proj_slash = ms_req({"project": "bob/x"})
+        r_proj_junk = ms_req({"project": "#alice"}); r_proj_empty = ms_req({"project": ""})
+        made_refused = list(madeMS); led_refused = load_asked()
+        # the window is PER WORKSPACE and it is the dir cap's own: alice's three do not stop bob, and two do not cap.
+        now_ms = time.time()
+        save_asked({f"alice--c{i}": {"ws": "alice", "at": now_ms} for i in range(PROVISION_MAX)})
+        r_proj_capped = ms_req({"project": "onemore"}); r_proj_bob = ms_req({"project": "hers"}, member="bob")
+        r_proj_main = ms_req({"project": "x"}, member=None, peer=(999999, os.getuid(), f"{DEV}/myrepo"))
+        save_asked({f"alice--c{i}": {"ws": "alice", "at": now_ms} for i in range(PROVISION_MAX - 1)})
+        r_proj_under = ms_req({"project": "fits"})
+        made_cap = list(madeMS)
+        globals()["new_project"] = real_np_ms
         held[0][0].close(); held[0][1].join(2)
         gone = not dmMS.subs.get("alice")
     globals()["post"], globals()["react"], globals()["api"], EFFECTS.run_impl = real_post_ms, real_react_ms, real_api_ms, real_run_ms
@@ -10908,6 +11063,25 @@ def cmd_selfcheck():
               for r in (r_two_dm, r_two_disp, r_two_own, r_two_main, r_none))
           and ran_two == ran_disp and not any(p[0] == "DM1" for p in postedMS)
           and r_str.get("ok") is False and "JSON object" in r_str.get("error", ""))
+    check("MEMBER socket: `project` is the SECOND door to a sub-channel — a session asks, the daemon creates. The "
+          "workspace half of the name is taken from THE SOCKET and never from the payload, so the only thing that "
+          "crosses is the leaf; the ask comes back with what was made",
+          r_proj.get("ok") and made_refused[:1] == [("alice", "todo2")] and "alice/todo2" in r_proj.get("text", "")
+          and list(led_after) == ["alice--todo2"] and (led_after.get("alice--todo2") or {}).get("ws") == "alice"
+          and r_proj_main.get("ok") is False and "member-socket verb" in r_proj_main.get("error", ""))
+    check("MEMBER socket: a leaf that tries to carry a workspace is REFUSED WITH THE REASON, not folded — `bob--x` and "
+          "`bob/x` from alice's socket would otherwise become #alice--bob-x, a channel named after another member's "
+          "lane; a leaf that is not a name at all, and an empty one, are refused too, and NOTHING is created",
+          all(r.get("ok") is False for r in (r_proj_ws, r_proj_slash, r_proj_junk, r_proj_empty))
+          and "not yours to choose" in r_proj_ws.get("error", "") and "not yours to choose" in r_proj_slash.get("error", "")
+          and "is not one" in r_proj_junk.get("error", "") and "is not one" in r_proj_empty.get("error", "")
+          and made_refused == [("alice", "todo2")] and led_refused == {})
+    check(f"MEMBER socket: asking is bounded by the SAME hourly window as new session dirs ({PROVISION_MAX}/h) and it is "
+          "PER WORKSPACE — alice's full hour refuses her next ask with the minutes to wait and creates nothing, does not "
+          "touch bob's, and one slot short of the cap still goes through",
+          r_proj_capped.get("ok") is False and "used up" in r_proj_capped.get("error", "")
+          and "min." in r_proj_capped.get("error", "") and r_proj_bob.get("ok") and r_proj_under.get("ok")
+          and made_cap == [("alice", "todo2"), ("bob", "hers"), ("alice", "fits")])
     check("MEMBER socket: `escalate` is the way out — inside the boundary cc-notify has no config to push with, so it "
           "hands the daemon the message and the daemon makes a REAL `cc-notify --owner` call on the host (the owner's "
           "DM, never the member's own channel where everyone but him reads it); an empty one is refused",
@@ -11453,6 +11627,18 @@ def main(argv):
             r = sock_request({"escalate": title, "priority": prio, "text": text}, timeout=60)
         except Exception as e:
             print(f"the workspace's Slack link did not answer ({e.__class__.__name__}) — nobody was told", file=sys.stderr); return 1
+        print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)
+        return 0 if r.get("ok") else 1
+    elif cmd == "project":   # inside a member boundary: the session ASKS, the daemon creates (Daemon.member_verb
+        # "project"). Only the leaf travels — the workspace half is the socket's, so this cannot name another lane.
+        name = rest[0] if rest else ""
+        if not name or name.startswith("-"):
+            print("cc-slack project <name>   ask for #<this workspace>--<name>", file=sys.stderr); return 2
+        try:
+            r = sock_request({"project": name}, timeout=120)   # longer than escalate's 60: making the pair is
+            # two channel creates, a topic and the invites, all inside the daemon's answer to this one request
+        except Exception as e:
+            print(f"the workspace's Slack link did not answer ({e.__class__.__name__}) — no channel was asked for", file=sys.stderr); return 1
         print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)
         return 0 if r.get("ok") else 1
     elif cmd == "status":

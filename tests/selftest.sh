@@ -379,6 +379,27 @@ MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' '
     "Read|{\"file_path\":\"$GH/.cc/config\"}" "Edit|{\"file_path\":\"$GH/member-probe.txt\"}")
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$mf")" = 2 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "member-facing marker denies all 16 probes (merge/host, dispatch, secrets, containers, credentials, Slack wiring incl. updates-sweep, edit outside)" || bad "member gate misses:$miss"
+# ...and a session refused mkchannel must be able to get a channel WITHOUT the owner: the working path is the member
+# typing `new project <name>` in the workspace channel (cc-slack's daemon makes it). A session that does not know that
+# escalates to a person for something the box does by itself — which is what happened at 18:50Z on 2026-09-02.
+sp=$(eval "$(sed -n 's/^MEMBER_SP=/x=/p' "$B/cc")"; printf '%s' "$x")
+case "$sp" in *'`new project <name>`'*'do not run cc slack mkchannel'*) mkp=0;; *) mkp=1;; esac
+[ "$mkp" = 0 ] && [ "$(m Bash '{"command":"cc slack mkchannel help"}' "$mf")" = 2 ] \
+  && grep -q 'new project <name>' "$B/../templates/home/COMMS.md" \
+  && ok "mkchannel is still refused a member-facing session AND it is now told where the channel really comes from: the prompt and COMMS name \`new project <name>\` — the refusal alone sent a session to the owner" \
+  || bad "MEMBER_SP/COMMS.md do not name the new-project path"
+# ...and the command that prompt names has to DISPATCH. `cc slack project` was advertised in MEMBER_SP, the member
+# README, both COMMS files and the design doc while `cc`'s slack case had no arm for it, so a session doing exactly
+# what it was told hit the usage line: nothing created, and no reason it could act on (review of PR #196). Its own
+# HOME, holding no socket, so this asks nothing of a live daemon: reaching cc-slack IS the answer that comes back.
+sd="$T/slack-dispatch"; mkdir -p "$sd/.cc"
+sp2=$(eval "$(sed -n 's/^MEMBER_SP=/x=/p' "$B/cc")"; printf '%s' "$x")
+dsp=$(env HOME="$sd" "$B/cc" slack project probe-x 2>&1); dspu=$(env HOME="$sd" "$B/cc" slack nosuchverb 2>&1)
+case "$sp2" in *'`cc slack project <name>`'*) spp=0;; *) spp=1;; esac
+[ "$spp" = 0 ] && grep -q 'Slack link did not answer' <<<"$dsp" && ! grep -q 'cc slack on|off' <<<"$dsp" \
+  && grep -q 'cc slack on|off' <<<"$dspu" \
+  && ok "the door the member prompt names is the door \`cc\` opens: \`cc slack project <name>\` reaches cc-slack (which answers that this HOME has no Slack link), while an unknown verb still falls to the usage line" \
+  || bad "cc slack project does not dispatch (prompt names it: $spp; got: $(tr '\n' '|' <<<"$dsp"))"
 miss=""; for probe in "${MP[@]}"; do [ "$(m "${probe%%|*}" "${probe#*|}" "$HOME")" = 0 ] || miss="$miss ${probe#*|}"; done
 [ -z "$miss" ] && ok "no regression: an unmarked cwd (planning session) is gated by none of them" || bad "unmarked cwd gated:$miss"
 miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"cc-notify -t help the owner must decide this"}' \

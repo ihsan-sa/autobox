@@ -29,6 +29,7 @@
 #                             cc -c <repo> [track]  force --continue
 #   cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session
 #                                              anyone in the channel is heard (membership is the access control), DMs are the owner's; new channels are private
+#   cc slack project <name>   from INSIDE a member workspace: ask the daemon for #<workspace>--<name> and its lane (it makes them; 3 an hour)
 #   cc rc status|restart      the always-on boot session (window box); restart to pick up new flags (ends its conversation)
 set -uo pipefail
 # Every session and worker starts through this script. Panes spawned from a systemd-started client (boot, cc-slackd) arrive without ~/bin,
@@ -46,7 +47,7 @@ sp_track(){ local repo="$1" track="$2" base="$3" st="$STBASE/$1/$2"
 sp_main(){ local repo="$1" base="$2"
   printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<brief>\"' (the brief's one home is ~/.cc/state/$repo/<track>/task.md; add and --go only ever ADD to it — replacing one is 'cc board set $repo <track> instructions \"...\"') then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."; }
 member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
-MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed — inside a member workspace's boundary it goes out over that workspace's own Slack link and reaches the owner, and tells you if it did not)."
+MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed — inside a member workspace's boundary it goes out over that workspace's own Slack link and reaches the owner, and tells you if it did not). A NEW PROJECT CHANNEL IS NOT ONE OF THOSE. In a member workspace you ask for one yourself: \`cc slack project <name>\` gets you #<workspace>--<name>, its updates lane and its board row (the folder comes with the first session), at most 3 an hour. The name is always under your own workspace — the workspace half is not yours to choose, and an ask that tries to carry one is refused with the reason. There is also a human way in, \`new project <name>\` typed in the workspace channel, but it ONLY counts from the member or the owner: a session saying it is ignored, so ask a person for that line rather than posting it yourself. Either way, do not run cc slack mkchannel and do not send the owner a request the box answers by itself."
 MEMBER_SPEND="$STBASE/member-spend.json"   # {"<handle>": {"day": "YYYY-MM-DD", "usd": n}} — the ledger behind the per-workspace daily cap
 member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> is one member's whole world: docs/design-member-workspaces.md (overlay)
 inside(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; }   # set by `cc-sandbox member`, never by hand: this process runs INSIDE a workspace's boundary
@@ -194,7 +195,7 @@ case "${1:-}" in
   "") ensure_main; attach_main; exit 0 ;;
   -h|--help) usage; exit 0 ;;
   board) shift; exec "$BOARD" "$@" ;;
-  slack)  # cc slack on|off|status|setup|channels|mkchannel|manifest — Slack ↔ sessions through Claude Code channels (bin/cc-slack, unit cc-slackd)
+  slack)  # cc slack on|off|status|setup|channels|mkchannel|manifest|project — Slack ↔ sessions through Claude Code channels (bin/cc-slack, unit cc-slackd)
     case "${2:-status}" in
       on)  mkdir -p ~/.cc/slack; [ -x ~/.cc/slack/venv/bin/python ] || { python3 -m venv ~/.cc/slack/venv && ~/.cc/slack/venv/bin/pip install -q -r "$ROOT/slack/requirements.txt"; }
            "$CLAUDE" mcp remove --scope user cc-slack >/dev/null 2>&1; "$CLAUDE" mcp add --scope user cc-slack -- "$BIN/cc-slack" channel >/dev/null && echo "registered MCP server cc-slack (user scope)"
@@ -202,8 +203,10 @@ case "${1:-}" in
            echo "cc-slack on: sessions started from now on carry the Slack channel. Live sessions pick it up after a restart (cc handoff <repo> <track>; boot session: cc rc restart)."
            "$BIN/cc-slack" status;;
       off) rm -f "$SLACKON"; "$CLAUDE" mcp remove --scope user cc-slack >/dev/null 2>&1; systemctl --user disable --now cc-slackd.service; echo "cc-slack off: new sessions have no Slack channel; live ones keep theirs until restarted";;
-      setup|channels|status|mkchannel|archive|orch-channel|manifest) shift; exec "$BIN/cc-slack" "$@";;
-      *) echo "cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest"; exit 1;;
+      setup|channels|status|mkchannel|archive|orch-channel|manifest|project) shift; exec "$BIN/cc-slack" "$@";;   # `project` is
+        # the member workspace's own door (MEMBER_SP tells a session to type it): without it here the advertised
+        # command dies on the usage arm below, having created nothing and said nothing a session can act on
+      *) echo "cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest|project <name>"; exit 1;;
     esac; exit 0 ;;
   rc)  # cc rc status|restart — the always-on boot session (window "box": cc-rc → Remote Control "$(hostname)", Slack target "box")
     case "${2:-status}" in
