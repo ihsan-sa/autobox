@@ -24,8 +24,13 @@ did. It deletes nothing, opens nothing, merges nothing.
 WHAT COUNTS AS ALIVE — the one fact a file cannot hold, and the one this leans on hardest before demoting
 anything: a `claude` whose cwd is the track's worktree (the Home tab's rule), a `cc-loop <repo> <track>`
 (alive for hours with no claude under it while it waits out a usage limit), or a live pane in the track's
-tmux window. Any of the three and the track is running, whatever the board says. Missing that would turn
+tmux window. Any of the three and the track is alive, whatever the board says. Missing that would turn
 this into a tool that stops work instead of describing it — hence also --grace, below.
+
+ALIVE IS NOT WORKING, though, and that is the third word. A live pane with nobody typing at it for 2 h is `idle`,
+not `running`: a track sat under 🏃 for 1 d 19 h because a session was parked at its prompt long after its headless
+loop had been aborted (owner, 2026-09-01). A worker or a `cc-loop` alive means work in flight whatever the keyboard
+shows, so neither is ever called idle, and a declared question outranks both. See idle_session().
 
 WHAT COUNTS AS WAITING, which is NOT the opposite of alive. `running` used to mean "a process exists", so five
 sessions that had each stopped to ask the owner a question were indexed as running for four hours and reached no
@@ -71,6 +76,7 @@ GRACE = 600        # a track the board touched less than this ago is left alone:
 REPEAT = 86400     # a finding that persists is worth one push a day, not one every timer tick
 PRMAX = 40         # PR lookups per run — a timer job must never stall on the network
 WEDGED = 3 * 3600  # a worker alive with nothing moved for this long: cc-loop caps one iteration at 1 h and logs both ends
+IDLE = 2 * 3600    # a live pane with nobody typing at it for this long: open is not working (owner, 2026-09-01)
 WEDGE_SEEN = 5400  # …and only if the previous run saw it too, which on a 20-min timer is one strike, then another
 PENDING = 14400    # finished with an open PR for this long and nobody landing it: the session was told 12 times already
 TERMINAL = ("merged", "done")
@@ -205,20 +211,32 @@ def waits_for(f):
 
 
 def tmux_live(ppids):
-    """Tracks whose tmux window still has something running in it. `cc` leaves a dead window behind an exited
-    session (`exec bash`), so a window alone proves nothing: the pane's shell must have a child, exactly as
-    `cc` decides it (pane_live)."""
+    """(tracks whose tmux window still has something running in it, {track: seconds since that window last moved}).
+    `cc` leaves a dead window behind an exited session (`exec bash`), so a window alone proves nothing: the pane's
+    shell must have a child, exactly as `cc` decides it (pane_live).
+
+    THE IDLE CLOCK IS `#{window_activity}`, the same field cc-secretary reads for the same question, taken off the
+    listing this already pays for. An open session is not a working one: the owner watched a track sit in RUNNING
+    for 1 d 19 h because a `claude` was at its prompt with nobody typing at it (2026-09-01). See idle_session()."""
     try:
-        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{window_name}\t#{pane_pid}"],
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{window_name}\t#{pane_pid}\t#{window_activity}"],
                              capture_output=True, text=True, timeout=10)
     except Exception:
-        return set()
-    live = set()
+        return set(), {}
+    live, idle, t0 = set(), {}, now()
     for ln in out.stdout.splitlines():
-        name, _, pid = ln.partition("\t")
-        if name.count("/") == 1 and pid.strip() in ppids:
-            live.add(name)
-    return live
+        f = ln.split("\t")
+        if len(f) < 2 or f[0].count("/") != 1 or f[1].strip() not in ppids:
+            continue
+        live.add(f[0])
+        try:                                            # a window with no activity stamp is not evidence of idleness
+            act = float(f[2]) if len(f) > 2 and f[2].strip() else 0.0
+        except ValueError:
+            act = 0.0
+        if act:
+            was = max(0.0, t0 - act)                    # a window last moved when its BUSIEST pane did
+            idle[f[0]] = min(idle[f[0]], was) if f[0] in idle else was
+    return live, idle
 
 
 def journal(repo, track):
@@ -293,6 +311,21 @@ def has_remote(repo):
 
 
 # ── the decision ─────────────────────────────────────────────────────────────────────────────────────────
+def idle_session(f, idle=IDLE):
+    """Pure — True when this track is LIVE ONLY because a session sits open at its prompt, and has for `idle`.
+
+    OPEN IS NOT WORKING, and the tab had no word for the difference: a track showed as running for 1 d 19 h because a
+    `claude` was parked at its prompt in the track's window, its headless loop having been aborted two days before
+    (owner, 2026-09-01: "why is 🏃 subproj-carpet-rectify · 1 it still in running"). Narrow on purpose, and it is the
+    narrowness that makes it safe:
+      · a WORKER or a `cc-loop` alive is work in flight whatever the pane shows — a headless iteration can think for an
+        hour without touching the window — so either one and this is False;
+      · no activity stamp (tmux silent, no window, a fixture that carries none) reads as 0 and is never idleness;
+      · it says nothing about WAITING. A worker's `STATUS: BLOCKED` outranks it in effective(), exactly as it outranks
+        presence — a track that stopped to ask is the owner's, not a quiet one."""
+    return bool(f.get("live")) and not f.get("workers") and not f.get("loops") and f.get("pane_idle", 0.0) >= idle
+
+
 def decide(f):
     """Pure — facts in, verdicts out, so the selfcheck can drive every branch without a box around it.
 
@@ -369,10 +402,13 @@ def effective(f, recs):
     outranks the board, because decide() has just looked at the box and the board is a file somebody wrote between
     turns. No record with a status means nothing here disagrees, and the board's own word stands."""
     session = (f.get("kind") or "track") == "session"   # a channel's word is its kind (cc-board `list` says the same):
-    for _, st, _ in recs:                                # cc ls and cc digest never print `running` for one — `waiting`,
-        if st:                                           # the owner's question, is the one track word it wears
-            return "session" if session and st != "waiting" else st
-    return "session" if session else (f["status"] or "queued")
+    word = next((st for _, st, _ in recs if st), "") or (f["status"] or "queued")
+    if session:                                          # cc ls and cc digest never print `running` for one — `waiting`,
+        return "session" if word != "waiting" else word  # the owner's question, is the one track word it wears
+    # …and `idle` is the word for the other half of that: RUNNING is a claim that something is happening, and a session
+    # parked at its prompt makes no such claim. Only ever narrows `running` — every word decide() reached first
+    # (`waiting`, `blocked`, `merged`) is a fact about the work, and outranks a fact about the keyboard.
+    return "idle" if word == "running" and idle_session(f) else word
 
 
 def pending(f, state):
@@ -393,7 +429,9 @@ def snapshot(rows, limit=0.0):
     return {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "epoch": int(now()),
             "limit_until": int(limit or 0),
             "tracks": {f"{repo}/{track}": {"state": state, "board": f["status"], "live": bool(f["live"]),
-                                           "waiting_on": who, "why": why}
+                                           "waiting_on": who, "why": why,
+                                           # seconds since the track's pane last moved: what tells `idle` from `running`
+                                           "idle_for": int(f.get("pane_idle") or 0)}
                        for repo, track, f, state, who, why in rows}}
 
 
@@ -438,7 +476,8 @@ def boards():
 def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
     """Every board track, with what the box says about it. Yields (repo, track, board_track, facts)."""
     live, ppids, workers, loops = procs()
-    live |= tmux_live(ppids)
+    tlive, pane_idle = tmux_live(ppids)
+    live |= tlive
     seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
     prs, remotes, t0 = 0, {}, now()
     for fn, d in boards():
@@ -467,7 +506,8 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
                 "push_err": os.path.exists(f"{wt}/.cc/push.err"), "has_remote": remotes[repo],
                 "workers": workers.get(key, []), "loops": loops.get(key, []), "limited": limited,
                 "orphans": workers.get(key, []) if not loops.get(key) else [],
-                "idle": idle_for(repo, track, wt) if workers.get(key) else 0.0}
+                "idle": idle_for(repo, track, wt) if workers.get(key) else 0.0,
+                "pane_idle": pane_idle.get(key, 0.0)}   # …and this one is the KEYBOARD's: see idle_session()
             f["stop_why"] = "" if no_stop else runaway(f, t0 - float(seen.get(key) or 0) <= WEDGE_SEEN, wedged)
             f["wedged_now"] = bool(f["workers"] and not f["limited"] and f["idle"] >= wedged)
             yield repo, track, t, f
@@ -768,13 +808,16 @@ def selfcheck():
         d = {"status": "running", "pr": "", "pr_state": None, "live": False, "wt_exists": True,
              "age": 10 ** 6, "grace": GRACE, "journal": (None, ""), "loop_end": "",
              "commit_err": False, "push_err": False, "has_remote": True,
-             "limited": False, "loops": [], "workers": []}
+             "limited": False, "loops": [], "workers": [], "pane_idle": 0.0}
         d.update(kw)
         return d
 
     def one(**kw):
         r = decide(F(**kw))
         return (r[0][0], r[0][1]) if r else ("none", None)
+
+    def eff(**kw):                                      # the ONE word: what a consumer of the snapshot reads
+        return effective(F(**kw), decide(F(**kw)))
 
     # a live process outranks the board, and a dead one never outranks a fresh dispatch
     ok("live worker in a blocked track → running", one(status="blocked", live=True) == ("fix", "running"))
@@ -845,13 +888,28 @@ def selfcheck():
     ok("the snapshot carries who and why, which one status word cannot",
        snapshot([("r", "t", F(status="running", live=True), "waiting", "person", "which syllabus?")])
        ["tracks"]["r/t"] == {"state": "waiting", "board": "running", "live": True,
-                             "waiting_on": "person", "why": "which syllabus?"})
+                             "waiting_on": "person", "why": "which syllabus?", "idle_for": 0})
+
+    # IDLE — a session open at its prompt is not a session working (owner, 2026-09-01)
+    ok("a live pane idle 3 h is `idle`, not running: nothing is happening at it",
+       eff(status="running", live=True, pane_idle=3 * 3600) == "idle")
+    ok("…and the snapshot says how long, so the tab can print it instead of a stale iteration count",
+       snapshot([("r", "t", F(status="running", live=True, pane_idle=3 * 3600), "idle", "", "")])
+       ["tracks"]["r/t"]["idle_for"] == 3 * 3600)
+    ok("a pane touched 10 min ago is simply running",
+       eff(status="running", live=True, pane_idle=600) == "running")
+    ok("a worker or a loop alive is work in flight whatever the keyboard shows",
+       not idle_session(F(live=True, workers=[1], pane_idle=10 ** 5))
+       and not idle_session(F(live=True, loops=[1], pane_idle=10 ** 5)))
+    ok("no activity stamp is not evidence of idleness",
+       not idle_session(F(live=True)) and eff(status="running", live=True) == "running")
+    ok("`idle` never touches what counts as WAITING: a declared question still outranks the keyboard",
+       eff(status="running", live=True, pane_idle=10 ** 5, journal=("BLOCKED", "q")) == "waiting")
+    ok("…nor what the tool STOPS: an orphan idle at its prompt is still an orphan",
+       eff(status="running", live=True, pane_idle=10 ** 5, workers=[1], stop_why="orphan") == "blocked")
 
     # PENDING — finished, PR open, and nobody landed it. Every row here is CONSISTENT: decide() has nothing to
     # say about any of them, which is exactly why four of them sat for a day (owner, 2026-09-01).
-    def eff(**kw):
-        return effective(F(**kw), decide(F(**kw)))
-
     ok("finished with an open PR and nobody landing it is pending",
        pending(F(status="review", pr="u", pr_state="OPEN"), eff(status="review", pr="u", pr_state="OPEN"))
        and decide(F(status="review", pr="u", pr_state="OPEN")) == [])

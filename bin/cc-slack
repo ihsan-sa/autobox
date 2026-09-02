@@ -78,7 +78,8 @@ when the work is finished — a plain reply is "handled", not
 "done". A newer message makes an older 🔧/✅ stale (it is stripped): react 🔧 again after a follow-up if you are still on it. Log longer non-track work
 with `cc quick doing "…"` / `cc quick done "…"` so the Home tab lists it while it runs.
 App Home: the daemon republishes a whole-box dashboard into the owner's Home tab every 30 s and on app_home_opened —
-one views.publish, never a message. What is RUNNING and what NEEDS YOU sit above the fold; the backlog, the board-view
+one views.publish, never a message. What is RUNNING, what is only IDLE (alive, nobody at it) and what NEEDS YOU sit
+above the fold; the backlog, the board-view
 buttons, the channels, ONE CHART OF THE BOX'S VITALS OVER 24 H (cc-vitals draws the PNG; it is uploaded once per
 redraw and the same file id is reused by every republish), the load, the handoff count, the audit and the boot line sit below it. NEEDS YOU and the backlog
 print EVERY row — they are the two lists the tab exists for. Up to three buttons sit above the fold and three board
@@ -1383,7 +1384,7 @@ VITALS_TIMEOUT = 60                            # a wedged renderer must never ho
 #    only that: ❓ waiting on the owner (a thread, a PR owed a 👍, or a TRACK that stopped to ask) · 🔧 work with no
 #    track · 🔴 a unit down · ⛔ blocked, or a usage limit · 🟢/🟡/⚪ a channel's session.
 HOME_STATE = {"running": ("🏃", "running"), "waiting": ("❓", "waiting"), "blocked": ("⛔", "blocked"),
-              "queued": ("⏳", "queued"),
+              "queued": ("⏳", "queued"), "idle": ("💤", "idle"),
               "done": ("✅", "done"), "review": ("✅", "done"),   # `done`/`review` only survive home_track_shown while the PR waits
               "merged": ("✅", "merged")}
 # `waiting` is the one state that means A PERSON MUST ANSWER, and it takes the ❓ for exactly that reason: it is the
@@ -1394,7 +1395,9 @@ HOME_STATE = {"running": ("🏃", "running"), "waiting": ("❓", "waiting"), "bl
 # journal line, and neither ever reads it out of prose.
 HOME_ALIAS = {"todo": "queued"}                        # the one word an older board file still says for `queued`
 HOME_STALE = ("blocked", "review", "done", "merged")   # board states a live process contradicts → the line says `board stale`
-HOME_RANK = ("running", "waiting", "blocked", "review", "done", "merged", "queued")   # what the owner must see first, first
+HOME_RANK = ("running", "waiting", "blocked", "idle", "review", "done", "merged", "queued")   # what the owner must see first, first
+HOME_IDLE = 2 * 3600                           # a live pane nobody has typed at for this long is `idle`, not `running` —
+                                               # the same threshold and the same tmux field cc-reconcile decides it with
 HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and CHANNELS print EVERY row (owner,
                                                # 2026-08-30, thread 1788129807: "what happenend to showing all the
                                                # backlog items and all ? items and not defaulting to showing only a
@@ -1407,7 +1410,7 @@ HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and
                                                # HOME_SLICE: rows one board-view button DMs before it says how many more.
 HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT, HOME_BTN = 40, 24, 26, 180, 18   # phone widths: a line · a track name · an ask · the audit · a button label
 HOME_DEPTH = 4                                 # deepest sub-channel indent the phone column takes; deeper nests flatten to it
-HOME_CUT = ("boot", "handoffs", "audit", "chart", "sessions", "channels", "backlog", "views")   # …and the order they go in when even
+HOME_CUT = ("boot", "handoffs", "audit", "chart", "idle", "sessions", "channels", "backlog", "views")   # …and the order they go in when even
                                                # that does not fit (§01d). The chart goes after the grey one-liners and before
                                                # the channels: it is 2 blocks, the most a single cut can free, and the `load`
                                                # line under it carries the same numbers in words. A tab that dropped RUNNING
@@ -1440,10 +1443,10 @@ def _home_btn(label, action, value="", url="", style=""):
     return b
 
 
-def home_track_state(status, live, asked=False):
+def home_track_state(status, live, asked=False, idle=0.0):
     """ONE state for a track, decided once by a LADDER (handoff §02), from sources that contradict each other in the live
-    data every day:  it asked → waiting · else alive → running · else board=blocked → blocked · else board∈{done,merged,
-    review} → ✅ · else queued.
+    data every day:  it asked → waiting · else alive but nobody at it → idle · else alive → running · else board=blocked
+    → blocked · else board∈{done,merged,review} → ✅ · else queued.
 
     A DECLARATION OUTRANKS PRESENCE, and that rung is the top one for a reason. Presence used to win outright, so five
     course sessions that had each stopped to ask the owner a question were printed as `running` for four hours and
@@ -1455,11 +1458,18 @@ def home_track_state(status, live, asked=False):
     PROCESS PRESENCE STILL WINS OVER THE BOARD. A `claude` in the worktree with nothing declared is the strongest fact
     the box has; the board is a file a worker updates between turns, and when it disagrees the line says `running` with
     `· board stale` beside it (home_track_stale) instead of the tab silently picking one. A status nobody recognises is
-    `queued`, never a bare "?" — the vocabulary has no room for a state with no word."""
+    `queued`, never a bare "?" — the vocabulary has no room for a state with no word.
+
+    …BUT PRESENCE IS NOT WORK. `idle` is seconds since the track's tmux window last moved, and past HOME_IDLE the row is
+    a session parked at its prompt, not an iteration: the owner watched one sit under 🏃 for 1 d 19 h with the iteration
+    count of a loop aborted two days earlier (2026-09-01, "why is 🏃 subproj-carpet-rectify · 1 it still in running").
+    The caller passes 0 for a track with a live LOOP or worker — a headless iteration can think for an hour without
+    touching the window — so only an unattended prompt ever reaches this rung, and cc-reconcile's idle_session() draws
+    the same line from the same tmux field."""
     if asked and status not in ("merged", "done"):
         return "waiting"                     # …and a finished track is never re-opened by an old question in its journal
     if live:
-        return "running"
+        return "idle" if _home_num(idle) >= HOME_IDLE else "running"
     if status in HOME_STATE and status != "running":
         return status
     return "queued"
@@ -1829,6 +1839,7 @@ def home_parts(st):
       2 tally + running   RUNNING n · BLOCKED n · QUEUED n, then one dense line per thing actually running. A unit that
                           is down and a Claude usage limit sort ABOVE the running rows: the owner must not have to
                           scroll to learn the box is impaired. Nothing running is a SENTENCE, never a gap.
+      2b idle             tracks alive with nobody at the keyboard for HOME_IDLE — how long, never an iteration count
       3 needs you         threads waiting (age + the ask), PRs owed a 👍, blocked tracks — one notation, ranked, ALL
                           of them. The whole band is absent when nothing needs them; it is never present and empty.
       4 actions           ≤3 buttons, owner-gated (see home_buttons / Daemon.on_action)
@@ -1852,6 +1863,7 @@ def home_parts(st):
              for u in (st.get("units") or ()) if u]                          # hint, a fixture need not
     names, box = home_names(tracks), st.get("box") or "box"
     run = [t for t in tracks if t.get("state") == "running"]
+    idling = [t for t in tracks if t.get("state") == "idle"]   # open at a prompt, nobody typing: not the same as working
     waiting = [t for t in tracks if t.get("state") == "waiting"]
     asking = [x for x in sessions if x.get("ask")]        # a session that declared a question is waiting on him exactly
     blocked = [t for t in tracks if t.get("state") == "blocked"]   # as a `waiting` track is: it counts in the tally and
@@ -1866,6 +1878,7 @@ def home_parts(st):
                                                         # counted separately and never as RUNNING: they are stopped, and
                                                         # the count is the owner's own backlog, not the box's
                                                         f"WAITING ON YOU {len(waiting) + len(asking)}" if waiting or asking else "",
+                                                        f"IDLE {len(idling)}" if idling else "",
                                                         f"BLOCKED {len(blocked)}" if blocked else "",
                                                         f"QUEUED {len(queued)}" if queued else "") if x))))
     rows = [f"🔴 *{n} down*" + (f" · {h}" if h else "") for n, ok, h in units if not ok]
@@ -1882,6 +1895,15 @@ def home_parts(st):
                     (f"✅ last: {last['name']} · {last.get('verb', 'done')} {last.get('when', '')}".rstrip()
                      if last.get("name") else "_the board is clear_"))
     p.append(("tally", _home_sec(home_list(rows, lambda k: f"_+{k} more running_", HOME_MAXTEXT))))
+
+    # 2b — IDLE: alive, and nothing happening at it. Its own band and never inside RUNNING, because 🏃 is a claim that
+    #      work is in flight and one of these was making it for 1 d 19 h (owner, 2026-09-01). Each row says how long it
+    #      has sat and NOT how many iterations some dead loop once ran. Cuttable (HOME_CUT): it is a nudge, not an alarm.
+    if idling:
+        p.append(("idle", _home_ctx(f"IDLE · {len(idling)}")))
+        p.append(("idle", _home_sec(home_list(
+            [home_fit(f"💤 *{names.get(t.get('name'), '?')}*", (t.get("detail") or "").split(" · ")) for t in idling],
+            lambda k: f"_+{k} more idle_"))))
 
     # 3 — the band that answers "does this need me?", absent when the answer is no
     needs = home_needs(st, names)
@@ -2194,6 +2216,43 @@ def home_workers():
     return out
 
 
+def home_loops():
+    """{"repo/track"} with a live `cc-loop` — the only thing that says an ITERATION COUNT is current. A track's
+    `runs/*.json` files outlive the loop that wrote them, so `3 it` stayed on a row for days after the loop was
+    aborted (owner, 2026-09-01); with no loop the count is history, and history belongs on the board."""
+    out = set()
+    try:
+        r = subprocess.run(["pgrep", "-af", "cc-loop"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return out                                        # pgrep unreadable: no count is claimed for anyone
+    for ln in r.stdout.splitlines():
+        m = re.search(r"(?:^|/)cc-loop (\S+) (\S+)", ln)
+        if m and " bash -c " not in f" {ln} ":            # the same match cc-secretary makes, minus a shell quoting one
+            out.add(f"{m.group(1)}/{m.group(2)}")
+    return out
+
+
+def home_idle():
+    """{window name: seconds since it last moved}, from tmux's own `#{window_activity}` — the field cc-secretary reads
+    to say how long a pane has been idle, and cc-reconcile to tell `idle` from `running`. Windows are named `repo/track`,
+    so the key is a track key already. One bounded call, cached with the rest of the dashboard's process work."""
+    try:
+        r = subprocess.run(["tmux", "list-windows", "-a", "-F", "#{window_name}\t#{window_activity}"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return {}
+    out, now = {}, time.time()
+    for ln in r.stdout.splitlines():
+        name, _, act = ln.partition("\t")
+        try:
+            when = float(act.strip())
+        except ValueError:
+            continue                                      # no activity stamp is not evidence that nobody is there
+        if name and when:
+            out[name] = max(0.0, now - when)
+    return out
+
+
 def home_track_shown(status, pr_state):
     """Home is for what runs or needs the owner: a finished track (done/merged) leaves it the moment it finishes, unless its
     PR is still open (a 👍 is owed). The board and `cc digest` keep the history."""
@@ -2228,12 +2287,17 @@ def home_reason(repo, tr):
     return ""                              # no STATUS line ever written: stopped, not asking
 
 
-def home_tracks(workers, prs):
+def home_tracks(workers, prs, idle=None, loops=None):
     """(tracks, last finished, sessions) — board tracks that are running, waiting or in trouble, the same data cc-digest
     prints, read straight off the sidecar boards (no subprocess). Finished ones drop off (home_track_shown); the newest
     of them comes back as `last`, which is the whole of what a quiet tab has to say. A row of kind=session (cc-board
     KINDS: a long-lived channel session, not a task) is never a track here — it goes to `sessions`, with whether a
-    claude is in its worktree and the question it declared, if any, and home_parts groups those under their repo."""
+    claude is in its worktree and the question it declared, if any, and home_parts groups those under their repo.
+
+    `idle` (home_idle) and `loops` (home_loops) are what tell a row that is WORKING from one that is merely OPEN, and
+    they answer two different halves of the same row: a track with no live loop is idle-eligible and never claims an
+    iteration count. Both default to empty, which is the old behaviour exactly — every row running, every count shown."""
+    idle, loops = idle or {}, loops or set()
     out, last, sessions = [], None, []
     for fn, d in home_boards():
         repo = d.get("repo") or os.path.basename(fn)[:-5]
@@ -2246,7 +2310,9 @@ def home_tracks(workers, prs):
                     pass                                  # a run file still being written is not an error
             wt, pr, status = f"{HOME}/.cc/worktrees/{repo}/{tr}/.cc", str(t.get("pr") or ""), t.get("status", "?")
             num = pr.rstrip("/").rsplit("/", 1)[-1]        # the board stores a number or the full PR url
-            live = f"{repo}/{tr}" in workers
+            key, live = f"{repo}/{tr}", f"{repo}/{tr}" in workers
+            looping = key in loops
+            sat = 0.0 if looping or not live else _home_num(idle.get(key))   # a loop working is never idle at the keyboard
             if (t.get("kind") or "track") == "session":
                 sessions.append({"repo": repo, "name": tr, "live": live, "ask": home_reason(repo, tr)})
                 continue
@@ -2258,13 +2324,17 @@ def home_tracks(workers, prs):
                             "when": f"{upd[11:16]}Z" if len(upd) > 15 else ""}
                 continue
             reason = home_reason(repo, tr)                 # read for EVERY track still on the tab, not just the ones the
-            state = home_track_state(status, live, bool(reason))   # board calls blocked: the declaration DECIDES (§02)
+            state = home_track_state(status, live, bool(reason), sat)   # board calls blocked: the declaration DECIDES (§02)
             prst = str(prs.get((repo, pr), "") if pr else "").upper()
             bits = ["board stale" if (home_track_stale(status, live) or (state == "blocked" and not reason)) else "",
                     # …and says so, instead of silently picking one — the journal contradicting the board counts too
                     "commit!" if os.path.exists(f"{wt}/checkpoint.err") else "",
                     "push!" if os.path.exists(f"{wt}/push.err") else "",
-                    f"{len(runs)} it" if runs else "", f"${cost:.2f}" if cost else "", f"PR #{num}" if pr else ""]
+                    f"idle {home_age(sat)}" if state == "idle" else "",
+                    # the count is a CLAIM THAT ITERATIONS ARE HAPPENING, so only a live loop may make it: the run files
+                    # outlive the loop and kept saying `1 it` two days after it was aborted (owner, 2026-09-01)
+                    f"{len(runs)} it" if runs and looping else "",
+                    f"${cost:.2f}" if cost else "", f"PR #{num}" if pr else ""]
             out.append({"state": state, "name": f"{repo}/{tr}", "detail": " · ".join(x for x in bits if x) or "—",
                         "rank": HOME_RANK.index(state) if state in HOME_RANK else len(HOME_RANK),
                         "reason": reason,
@@ -4416,7 +4486,8 @@ class Daemon:
             except Exception:
                 return ""
         audit_at, verdict, boot = cached("audit", HOME_CACHE, home_audit)
-        tracks, last, sessions = cached("tracks", HOME_CACHE, lambda: home_tracks(home_workers(), self.home_prs))
+        tracks, last, sessions = cached("tracks", HOME_CACHE,
+                                       lambda: home_tracks(home_workers(), self.home_prs, home_idle(), home_loops()))
         # the clock and the box's vitals are read every time (they are file reads); everything that costs a process is cached
         return {"box": BOX, "now": time.strftime("%H:%MZ", time.gmtime()), "units": cached("units", HOME_CACHE, home_units),
                 "load": home_load(), "limit": cached("limit", HOME_CACHE, limit_now), "channels": chans,
@@ -7987,6 +8058,26 @@ def cmd_selfcheck():
     check("home_text: the same tab as text by band — the whole backlog and the needs-you band read back, no buttons",
           ht["backlog"].count("⏳") == 10 and "NEEDS YOU" in ht["needs"] and ht["head"].startswith("abox")
           and "actions" not in ht and "views" not in ht and "button" not in json.dumps(ht, ensure_ascii=False))
+    # ── IDLE IS NOT RUNNING (owner, 2026-09-01: "why is 🏃 subproj-carpet-rectify · 1 it still in running"). The row
+    #    had a `claude` at its prompt for 1 d 19 h and the iteration count of a loop aborted two days before.
+    hidle = home_parts(dict(hfix, tracks=[{"state": "idle", "name": "sandbox/carpet-rectify", "detail": "idle 43h", "rank": 3},
+                                          {"state": "running", "name": "abox/slack-home", "detail": "4 it", "rank": 0}]))
+    hitxt = home_text(hidle)
+    check("home: an idle row renders in its OWN band, with how long it has sat and no iteration count — 🏃 is a claim "
+          "that work is in flight, the tally counts it apart from RUNNING, and the band is cuttable because it is a "
+          "nudge and not an alarm",
+          hitxt.get("idle") == "IDLE · 1\n💤 *carpet-rectify* · idle 43h"
+          and hitxt["tally"].startswith("RUNNING 1 · IDLE 1")
+          and "💤" not in hitxt["tally"] and "carpet-rectify" not in hitxt["tally"]
+          and "idle" not in {t for t, _ in home_cut(hidle, 5)}
+          and home_needs({"tracks": [{"state": "idle", "name": "r/t", "reason": "x"}]}) == [])
+    check("home_track_state: a live pane nobody has typed at for 2 h is `idle`, and a busy one is `running` — the "
+          "iteration count belongs to a LIVE LOOP, so home_tracks zeroes the idle clock while one is up and omits the "
+          "count while none is: the run files outlive the loop that wrote them",
+          (home_track_state("running", True, False, 3 * 3600), home_track_state("running", True, False, 600),
+           home_track_state("running", True, True, 3 * 3600), home_track_state("running", False, False, 3 * 3600),
+           home_track_state("merged", False, False, 3 * 3600))
+          == ("idle", "running", "waiting", "queued", "merged"))
     check("home_track_state: the LADDER, and a live process WINS OVER THE BOARD — a board that disagrees is printed as "
           "`board stale`, never silently believed or silently ignored; an unknown status is `queued`, never a "
           "stateless \"?\"",
@@ -8061,9 +8152,23 @@ def cmd_selfcheck():
         hbrows = home_board_rows()
         details = {t["name"]: t["detail"] for t in htr}
         rows = home_needs({"tracks": htr})
+        # …and the owner's row: a live pane, an aborted loop, and one run file left behind by it
+        journal("parked", "one iteration, then the loop was killed\n")
+        os.makedirs(f"{hr}/.cc/state/abox/parked/runs", exist_ok=True)
+        json.dump({"total_cost_usd": 0.5}, open(f"{hr}/.cc/state/abox/parked/runs/1.json", "w"))
+        json.dump({"repo": "abox", "tracks": {"parked": {"status": "running", "updated": "2026-08-30T21:00:00Z"}}},
+                  open(f"{hr}/.cc/boards/abox.json", "w"))
+        def parked(idle, loop):
+            r = home_tracks({"abox/parked"}, {}, {"abox/parked": idle}, {"abox/parked"} if loop else set())[0][0]
+            return (r["state"], r["detail"])
+        hparked = (parked(43 * 3600, False), parked(43 * 3600, True), parked(600, False))
     finally:
         globals()["HOME"] = _homeR
         subprocess.run(["rm", "-rf", hr], check=False)
+    check("home_tracks: THE OWNER'S ROW — a track whose pane has sat 43 h with its loop long dead is `idle 43h`, not "
+          "`🏃 · 1 it`: the count comes from a LIVE loop or not at all, and a loop that is up means the row is working "
+          "however quiet its window is (owner, 2026-09-01)",
+          hparked == (("idle", "idle 43h · $0.50"), ("running", "1 it · $0.50"), ("running", "$0.50")))
     check("home_reason: a block CLEARS ITSELF, and STOPPED IS NOT ASKING — the journal's newest STATUS line outranks "
           "the board, so a worker that ran on to STATUS: DONE stops asking; and a track that never wrote a STATUS line "
           "was stopped by the loop's step limit, not by a question, so it does not claim the owner is being asked",
