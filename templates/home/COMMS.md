@@ -40,6 +40,13 @@ Litmus: needs a decision → mention · needs a tap → approvals · notable onl
 
 Everything is named after what it owns, so the Slack channel, the phone-app entry and the tmux window share one name. (Claude.ai and Claude Desktop check in through the owner's **Slack** connector.)
 
+
+## Where an answer goes
+Split by **kind**, not by the surface the text appeared on. Answering is `~/CLAUDE.md`'s rule — reply where you were asked. This section is the other kind: what to do when you *need* the owner.
+- **Needing the owner** — a decision, an approval, a permission, a blocked action you cannot finish without them — leaves the terminal, whatever surface the problem appeared on, at the rung above that fits: rung 1 `cc-notify --decision` for a blocked decision or an approval-class action, rung 2 `reply(needs_owner=true)` for a question stalling one track. The owner reads Slack on a phone, so a line in a terminal or a row on a board does not reach them.
+- **Waiting in a terminal is not a rung.** A session with no `<channel>` tag to reply to still has `cc-notify`.
+- A result they are already waiting on in a terminal stays in that terminal.
+
 ## Channels are sessions
 - `#<repo>` ↔ `~/dev/<repo>`; `#<repo>-updates` the same session's automated lane; `#<repo>--<track>` that track; DM or `#box` the box. Anything else: name a channel after a folder in `~/dev`, or map it in `~/.cc/slack/routes.json`. `cc slack mkchannel <repo>` wires the pair, private by default (`--public` opts out); an already-public one is flagged by `cc slack channels` and flipped in Slack by hand.
 - A channel that maps to nothing becomes a session on its first message: `~/dev/<name>` is created with a `CLAUDE.md`, a git repo and the `.cc/member-facing` marker — read-only outside its folder, so changes come to you in the thread. 3 new dirs an hour; never for DMs, `#approvals`/`#alerts` or archived channels. To promote one: rename the folder, add a remote, drop the marker.

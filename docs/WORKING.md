@@ -27,7 +27,7 @@ is cheap — and each one works the order above on its own; nothing here waits t
 
 ## dispatch judgement
 - Planner does it: <=2 files, ~60 lines, the fix already known, nothing live holding those files — short branch, PR like anything else.
-- Subagent: read-heavy work whose answer compresses. Delegate any read that would add more than ~10k to this session; cheapest model that holds quality; never for repo writes, never for grep-shaped exploration.
+- Subagent: work that is bounded, already scoped, and finishes inside this session's life — a read whose answer compresses (delegate any that would add more than ~10k here), and equally a known fix, in its own worktree, committing and pushing itself. Cheapest model that holds quality; never for grep-shaped exploration. It costs a fraction of a worker: a bounded analysis ran to well under $1 where the same job as a worker is a $2.50-$9 repair round. Two things it cannot do — it dies with this session (a handoff killed one mid-flight on 2026-09-02 and the work was redone), and it inherits this session's reach rather than getting its own gates, journal and PR.
 - Worker: open design, more files, its own test cycle, unattended running, or a file another track holds. One worker per file: split by file or run in sequence (both research arms: never parallelise writers); check the board's live tracks first.
 - Lump sub-goals into one worker until the diff stops being reviewable in one sitting. Each one folded in saves a spinup, a gate run, a review and a landing.
 - A brief is a goal: what, why, the boundaries, 3-5 testable done-criteria — never the steps. The PR review gets the contract and the diff, never the worker's journal.
