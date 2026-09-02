@@ -1,31 +1,28 @@
 #!/usr/bin/env bash
-# cc-msg — type a message into a running interactive Claude session (tmux window) as if you were at the keyboard.
+# cc-msg — the ONE deliverer of a message into a running interactive Claude session (tmux window), as if you
+# were at the keyboard.  A message handed to it is NEVER DROPPED: it is typed, or it is spooled and typed by
+# the next drain.  (2026-09-01: 12 panes sat on a model-limit prompt, and every pulse tick and secretary
+# finding aimed at them was refused and thrown away — nobody was watching, and nothing said so.)
 #   cc-msg <window> "text"      window = tmux window name in session main (e.g. myapp, myapp/step1)
+#   cc-msg --drain [<window>]   deliver what is spooled, in order, while the pane is free (cc-msg.timer, 60 s)
+#   cc-msg selfcheck
+# Prints "queued" (rc 0) when the text went to the spool, nothing when it was typed.
+# The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
+# again later are a second message and are queued as one.
 # Refuses windows with no interactive `claude` under them: a headless --go worker's pane is a shell, and the text
 # would sit on its tty and execute as a command when the loop ends. Give those work by appending to task.md.
-# Refuses a window with a DIALOG open: the keystrokes would answer it (see THE DIALOG GUARD below).
 # Note: between Claude sessions prefer the native SendMessage tool; this is the deterministic waker for scripts/humans.
 set -uo pipefail
-w="${1:?window}"; shift; text="${*:-$(cat)}"
-id=$(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | awk -v n="$w" '$2==n{print $1; exit}')   # by id: names with dots/slashes break -t main:<name>
-[ -n "$id" ] || { echo "cc-msg: no window main:$w" >&2; exit 1; }
-pp=$(tmux list-panes -t "$id" -F '#{pane_pid}' 2>/dev/null | head -1)
-
-# An interactive `claude` ANYWHERE under the pane, not just a direct child. `pgrep -P <pane_pid>` was the test
-# until 2026-08-31 and it is wrong for a whole class of session: `cc-handoff --overlap` starts its successor as
-# `bash -c '… cc __runnext …'`, so that session's claude is a GRANDCHILD — the direct-child test called it dead
-# and this script refused to type at a perfectly live session, every time, for as long as it lived.
-# `claude -p` is still refused: a headless worker prints and exits, and there is no prompt for the text to land in.
-claude_pids=$(ps -eo pid=,ppid=,comm= | awk -v root="${pp:-0}" '
-  { kids[$2] = kids[$2] " " $1; name[$1] = $3 }
-  END { q[1] = root; n = 1                                     # breadth-first over the pane subtree
-        for (i = 1; i <= n; i++) { m = split(kids[q[i]], c, " "); for (j = 1; j <= m; j++) q[++n] = c[j] }
-        for (i = 2; i <= n; i++) if (name[q[i]] == "claude") print q[i] }')
-live=""
-for pid in $claude_pids; do
-  tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qx -e '-p' -e '--print' || { live=1; break; }
-done
-[ -n "$live" ] || { echo "cc-msg: main:$w runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
+BIN=$(dirname "$(readlink -f "$0")")
+STATE="$HOME/.cc/state"
+STAND_MIN="${CC_MSG_STAND_MIN:-10}"          # how long an unknown dialog may stand before the box is told, once
+KEY_WAIT="${CC_MSG_KEY_WAIT:-0.3}"           # between the text and its Enter (Enter is swallowed otherwise)
+DIALOG_WAIT="${CC_MSG_DIALOG_WAIT:-1.5}"     # after answering a known-safe prompt, before reading the pane again
+MAX_DRAIN="${CC_MSG_MAX_DRAIN:-20}"          # messages per window per drain: a tick must stay cheap
+DEDUP_S="${CC_MSG_DEDUP_S:-120}"             # a caller repeating ITS OWN line inside this many seconds is retrying,
+                                             # not sending twice; past it, the same words are a second message
+REPORT_TRIES="${CC_MSG_REPORT_TRIES:-3}"     # injects of one standing-dialog (or orphan) report that nobody heard
+                                             # before it stops: each is a NEW message in the told session's queue
 
 # THE DIALOG GUARD. A modal is waiting for a keypress, so the text — or the Enter after it, or a digit inside it —
 # ANSWERS it, and a tool-permission prompt answered by a script is an unattended approval of exactly what the owner
@@ -35,10 +32,573 @@ done
 #   "No, and tell Claude…"  option 3 of a tool dialog — and the ONLY marker left when the dialog is taller than
 #                           the pane and its footer has scrolled off (seen with the fetch prompt at 40 rows)
 #   "Esc to cancel"         the footer of the permission, folder-trust and /model dialogs
-#   "Enter to confirm"      the folder-trust dialog (the one string this guard used to have)
+#   "Enter to confirm"      the footer of every dialog with a confirm — the folder-trust one, and the model-limit
+#                           prompt too, which is why it marks a dialog but does not by itself make it the owner's
 #   "Would you like to proceed?"  the plan-mode approval (from the shipped binary's strings)
 # None of them shows "esc to interrupt", so a mid-turn test does NOT cover this.
-tmux capture-pane -p -t "$id" 2>/dev/null | grep -qF -e 'Do you want to' -e 'No, and tell Claude what to do differently' \
-  -e 'Esc to cancel' -e 'Enter to confirm' -e 'Would you like to proceed?' && {
-  echo "cc-msg: main:$w has a dialog open — answer it first, typing here would answer it for you (tmux select-window -t $id)" >&2; exit 3; }
-tmux send-keys -t "$id" -l -- "$text"; sleep 0.3; tmux send-keys -t "$id" Enter   # two calls: Enter is swallowed otherwise
+DIALOG_MARKS=('Do you want to' 'No, and tell Claude what to do differently' 'Esc to cancel' 'Enter to confirm'
+              'Would you like to proceed?')
+# …of which these are THE OWNER'S, always, whatever else is on the pane: a screen carrying one of them is never
+# answered here, and it vetoes the known-safe table below (a transcript can quote anything, a permission dialog
+# must never be pressed by a script). "Enter to confirm" is NOT one of them — it is the footer every dialog with
+# a confirm draws, including the model-limit prompt; the folder-trust dialog is named by its own words instead.
+PERMISSION_MARKS=('Do you want to' 'No, and tell Claude what to do differently' 'Would you like to proceed?'
+                  'I trust this folder')
+WORKING_MARK='esc to interrupt'              # Claude Code's footer for the whole of a turn (cc-pulse reads the same)
+
+# THE KNOWN-SAFE TABLE — the only prompts this script ever answers. One row: <key> TAB <substring> TAB <substring>…,
+# and EVERY substring must be on the pane for the row to fire. Both rows press Escape, and Escape on both means
+# KEEP WHAT THE SESSION ALREADY HAS: no model is switched, nothing is approved, nothing is spent.  Adding a row is
+# a decision about what a script may press unattended — the bar is that the worst case is a no-op.
+#   1  the model-limit prompt, in every wording it has ("You've reached your Fable limit … Switch to <m> and
+#      continue", "Switch to Fable 5? … runs on usage credits"): all of them offer "No, keep my current model",
+#      which is what Escape does, and all of them footer "Esc to cancel", which is the pane SAYING so.
+#   2  the /model confirm ("Switch model?" · "No, go back") left open in a live conversation
+KNOWN_SAFE=(
+  $'Escape\tkeep my current model\tEsc to cancel'
+  $'Escape\tSwitch model?\tNo, go back'
+)
+
+has(){ case "$2" in *"$1"*) return 0;; esac; return 1; }   # $1 needle in $2 haystack
+
+safe_key(){   # $1 = pane text → the keystroke that dismisses a KNOWN-SAFE prompt, or nothing at all
+  local s=$1 row m ok; local -a cols
+  for m in "${PERMISSION_MARKS[@]}"; do has "$m" "$s" && return 0; done   # the owner's, always: never answered
+  for row in "${KNOWN_SAFE[@]}"; do
+    IFS=$'\t' read -r -a cols <<<"$row"; ok=1
+    for m in "${cols[@]:1}"; do has "$m" "$s" || { ok=0; break; }; done
+    [ "$ok" = 1 ] && { printf '%s' "${cols[0]}"; return 0; }
+  done
+}
+
+blocked(){    # $1 = pane text → "" free · "busy" mid-turn · "dialog" a modal is up
+  local n     # MID-TURN IS ASKED FIRST, and it is not a near thing: no dialog draws the working footer, so a pane
+  has "$WORKING_MARK" "$1" && { echo busy; return 0; }   # showing both is a busy one with a dialog in its
+  for n in "${DIALOG_MARKS[@]}"; do has "$n" "$1" && { echo dialog; return 0; }; done   # scrollback — and Escape
+  :                                                      # there would INTERRUPT THE TURN, which is the one key
+}                                                        # press this script must never make by accident
+
+dialog_line(){   # the one line of a dialog worth repeating: its question. Read from the BOTTOM — a dialog is drawn
+  local l        # at the foot of the pane and the transcript above it asks questions of its own — and never a line
+  l=$(printf '%s\n' "$1" | grep -e 'Do you want to' -e 'Would you like to proceed' -e 'reached your' -e '?' | tail -1)
+  [ -n "$l" ] || l=$(printf '%s\n' "$1" | grep '[A-Za-z]' | tail -1)   # …with no letters in it: keys we just sent echo
+  printf '%s' "$l" | sed 's/^[^A-Za-z0-9]*//' | cut -c1-160
+}
+
+win_id(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null |
+            awk -v n="$1" '$2==n{print $1; exit}'; }        # by id: names with dots/slashes break -t main:<name>
+
+# An interactive `claude` ANYWHERE under the pane, not just a direct child. `pgrep -P <pane_pid>` was the test
+# until 2026-08-31 and it is wrong for a whole class of session: `cc-handoff --overlap` starts its successor as
+# `bash -c '… cc __runnext …'`, so that session's claude is a GRANDCHILD — the direct-child test called it dead
+# and this script refused to type at a perfectly live session, every time, for as long as it lived.
+# `claude -p` is still refused: a headless worker prints and exits, and there is no prompt for the text to land in.
+live_claude(){   # $1 = window id
+  local pp pids pid
+  pp=$(tmux list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -1)
+  pids=$(ps -eo pid=,ppid=,comm= | awk -v root="${pp:-0}" '
+    { kids[$2] = kids[$2] " " $1; name[$1] = $3 }
+    END { q[1] = root; n = 1                                   # breadth-first over the pane subtree
+          for (i = 1; i <= n; i++) { m = split(kids[q[i]], c, " "); for (j = 1; j <= m; j++) q[++n] = c[j] }
+          for (i = 2; i <= n; i++) if (name[q[i]] == "claude") print q[i] }')
+  for pid in $pids; do
+    [ -r "/proc/$pid/cmdline" ] || return 0                  # gone or not ours to read: treat it as the live one
+    tr '\0' '\n' < "/proc/$pid/cmdline" | grep -qx -e '-p' -e '--print' || return 0
+  done
+  return 1
+}
+
+# ONE LINE AT THE KEYBOARD. A newline in the TUI SUBMITS, so a two-line message typed literally makes the session
+# take its first line as a whole turn and types the rest into the next one (cc-handoff:759 joins its relay line for
+# exactly this reason, and Slack hands us multi-line text). Only the keystrokes are flattened: the spool keeps the
+# message whole, so whoever reads the queue still sees what was sent.
+type_at(){ local text; text=$(printf '%s' "$2" | tr '\n' ' ')
+           tmux send-keys -t "$1" -l -- "$text"; sleep "$KEY_WAIT"; tmux send-keys -t "$1" Enter; }  # two calls
+
+# ── the spool ────────────────────────────────────────────────────────────────────────────────────────────────
+# ~/.cc/state/<repo>[/<track>]/inbox.spool — append-only, one JSON object a line {at, from, text}, oldest first.
+# It sits beside that session's task.md and progress.md on purpose: whoever reads the track's state sees its
+# unread mail. A line that is not such an object (a kill mid-append, a hand-edit) is dropped by the drain and said
+# through cc-notify: the drain used to stop at it, every tick, for ever, and nothing said so (review-157e).
+# inbox.dialog beside it is the standing-dialog stamp: "<first-seen epoch>\t<reported 0|1>\t<report attempts>\t<line>"
+# — the attempt count is why a report that reached nobody is retried (REPORT_TRIES times) but paged only once.
+sdir(){ printf '%s/%s' "$STATE" "$1"; }
+lock(){ mkdir -p "$(sdir "$1")"; printf '%s/.inbox.lock' "$(sdir "$1")"; }
+
+spool_add(){  # $1 window  $2 text — under the lock, so a drain never rewrites the file mid-append. Prints the line.
+  local sp line from out now
+  sp="$(sdir "$1")/inbox.spool"
+  from=${CC_MSG_FROM:-$(ps -o comm= -p $PPID 2>/dev/null | tr -d ' \n')}; from=${from:-cc-msg}
+  now=$(date -u +%s)
+  line=$(jq -cn --arg at "$(date -u +%FT%TZ)" --arg from "$from" --arg text "$2" \
+                '{at:$at,from:$from,text:$text}') || return 1
+  out=$( ( flock -w 10 9 || exit 1
+    # A RETRY IS ONE MESSAGE; THE SAME WORDS LATER ARE TWO. Callers retry while their line has not appeared on
+    # the pane — the handoff opener does it several times a minute — and a queue is not the place to keep every
+    # attempt. But that is ALL this collapses: same sender, same text, inside DEDUP_S. A person who asks
+    # "status?" at 10:00 and again at 10:20 asked twice, and a queue that keeps one of them has dropped a
+    # message while telling them it was queued.
+    if [ -f "$sp" ] && dup=$(jq -c --arg t "$2" --arg f "$from" --argjson now "$now" --argjson w "$DEDUP_S" \
+         'select(.text == $t and .from == $f and (.at | fromdateiso8601) > ($now - $w))' < "$sp" 2>/dev/null | tail -1) \
+       && [ -n "$dup" ]; then printf '%s' "$dup"; exit 0; fi                     # the copy already queued
+    printf '%s\n' "$line" >> "$sp"; printf '%s' "$line" ) 9>"$(lock "$1")" )   # 9> is the SUBSHELL's, not the
+  [ $? = 0 ] || return 1                                                    # assignment's — flock reads fd 9
+  printf '%s' "$out"
+}
+
+spool_n(){ local sp; sp="$(sdir "$1")/inbox.spool"; if [ -f "$sp" ]; then wc -l < "$sp"; else echo 0; fi; }
+
+# ── the standing-dialog report ───────────────────────────────────────────────────────────────────────────────
+# A dialog nobody answers is the whole failure this script exists for: the queue behind it never moves, and on
+# this box that meant a silent session for hours. After STAND_MIN it is said ONCE — to the box's planning session
+# (which can look, and answer), and to the owner if they have asked to be paged (CC_SECRETARY_PAGES > 0) or if that
+# session could not be reached at all, which is the case nothing else would ever surface.
+# It is a dialog WITH MAIL BEHIND IT that is reported: a pane nobody is trying to reach is cc-secretary's beat,
+# not this script's, and this script only ever looks at the windows it has been handed something for.
+# WHO IS TOLD: the box's control repo — the checkout this copy of cc-msg lives in (~/bin is symlinks into its
+# core/bin) — because that repo's planning session is the one that can walk over to the window and answer it.
+# CC_MSG_REPORT_TO overrides it (e.g. "box", the Remote-Control session); "box" is also the fallback when this
+# copy does not live under ~/dev at all.
+cfg(){ "$BIN/cc-config" get "$1" 2>/dev/null; }
+ctl(){ local d=$BIN
+  case "$d" in "$HOME/dev/"*) d=${d#"$HOME/dev/"}; d=${d%%/*}; [ -n "$d" ] && { printf '%s' "$d"; return 0; };; esac
+  printf 'box'; }
+dialog_seen(){   # $1 window  $2 pane text
+  local f now first rep att line res rc n text tgt
+  f="$(sdir "$1")/inbox.dialog"; now=$(date +%s); line=$(dialog_line "$2")
+  if [ -f "$f" ]; then IFS=$'\t' read -r first rep att _ < "$f"; else first=$now; rep=0; att=0; fi
+  case "$first" in ''|*[!0-9]*) first=$now;; esac
+  case "$att" in ''|*[!0-9]*) att=0;; esac
+  [ "${rep:-0}" = 1 ] || rep=0
+  printf '%s\t%s\t%s\t%s\n' "$first" "$rep" "$att" "$line" > "$f"
+  { [ "$rep" = 1 ] || [ $((now - first)) -lt $((STAND_MIN * 60)) ]; } && return 0
+  [ "$att" -lt "$REPORT_TRIES" ] || return 0   # tried REPORT_TRIES times and heard by nobody: stop (see below)
+  n=$(spool_n "$1")
+  text="cc-msg: main:$1 has had a dialog open for ${STAND_MIN}+ min and $n message(s) are queued behind it — the session is unreachable until it is answered (tmux select-window -t main:$1). The dialog: $line"
+  # REPORTED ONCE MEANS HEARD ONCE. The stamp is closed only when the injector says the text reached a live session
+  # ("delivered" to its channel, or "typed" at its keyboard). "queued"/"spooled", or a daemon that was not running
+  # (a deploy restarts it, and a drain tick can fall in that second), mean NOBODY has read it: rep stays 0 and the
+  # next tick tries again. A report that could not be taken at all is the box going quiet with mail behind a dialog
+  # — that one reaches the owner whatever CC_SECRETARY_PAGES says, but only on the first failure, not every minute.
+  # AND ONLY REPORT_TRIES TIMES: the injector stamps every inject as a new message (a fresh meta.ts is its sender
+  # name, so this script's own retry-collapse never matches it), and with the told session simply not running each
+  # tick appended one more copy of this line to its queue — sixty an hour, flushed at it the moment it came up
+  # (review-157e). The owner has been paged by then; a report nobody could take three times waits for them.
+  # AND NEVER INTO THE PANE IT IS ABOUT: when the stuck window IS the session we would tell, the inject would come
+  # back through this same script (no subscriber → cc-slack types it → cc-msg → this dialog again, round and round).
+  tgt=${CC_MSG_REPORT_TO:-$(ctl)}
+  if [ "$tgt" = "$1" ]; then res='it is the stuck session itself'; rc=1
+  else res=$("$BIN/cc-slack" inject --no-start "$tgt" "$text" 2>/dev/null); rc=$?; fi
+  res=$(printf '%s' "$res" | tr -d '\r' | tail -1)
+  case "$rc:$res" in
+    0:delivered|0:typed) rep=1;;
+    *)                   att=$((att + 1));;
+  esac
+  printf '%s\t%s\t%s\t%s\n' "$first" "$rep" "$att" "$line" > "$f"
+  if [ "$rep" = 1 ]; then
+    case "$(cfg CC_SECRETARY_PAGES)" in ''|0|*[!0-9]*) ;;
+      *) "$BIN/cc-notify" -p high -t "[$1] a dialog has stood ${STAND_MIN} min" \
+           "$n message(s) queued behind it — $line" >/dev/null 2>&1;;
+    esac
+  elif [ "$att" = 1 ]; then
+    "$BIN/cc-notify" -p high -t "[$1] a dialog has stood ${STAND_MIN} min and no session could be told" \
+      "$n message(s) queued behind it; the box session could not be reached ('${res:-nothing}', rc $rc) — $line" >/dev/null 2>&1
+  fi
+  return 0
+}
+dialog_gone(){ rm -f "$(sdir "$1")/inbox.dialog"; }
+
+orphan_seen(){   # $1 window — its spool has NO window to drain into (a handoff rename, an exit; review-157b).
+                 # Same contract as dialog_seen: after STAND_MIN it is said ONCE, and only "delivered"/"typed"
+                 # counts as heard; a report nobody could take reaches the owner on its first failure only.
+  local f now first rep att res rc n text tgt sp
+  sp="$(sdir "$1")/inbox.spool"
+  now=$(date +%s); first=$(stat -c %Y "$sp" 2>/dev/null || echo "$now")
+  case "$first" in ''|*[!0-9]*) first=$now;; esac
+  [ $((now - first)) -ge $((STAND_MIN * 60)) ] || return 0
+  f="$(sdir "$1")/inbox.orphan"; rep=0; att=0
+  [ -f "$f" ] && IFS=$'\t' read -r rep att _ < "$f"
+  [ "${rep:-0}" = 1 ] && return 0
+  case "$att" in ''|*[!0-9]*) att=0;; esac
+  [ "$att" -lt "$REPORT_TRIES" ] || return 0   # bounded exactly as dialog_seen's: each try is a new message there
+  n=$(spool_n "$1")
+  text="cc-msg: $n message(s) are spooled for main:$1 but no such window exists — a rename or an exit left them behind ($(sdir "$1")/inbox.spool). Deliver or delete them; nothing drains this by itself."
+  tgt=${CC_MSG_REPORT_TO:-$(ctl)}
+  if [ "$tgt" = "$1" ]; then res='it is the stuck session itself'; rc=1
+  else res=$("$BIN/cc-slack" inject --no-start "$tgt" "$text" 2>/dev/null); rc=$?; fi
+  res=$(printf '%s' "$res" | tr -d '\r' | tail -1)
+  case "$rc:$res" in
+    0:delivered|0:typed) rep=1;;
+    *)                   att=$((att + 1));;
+  esac
+  printf '%s\t%s\n' "$rep" "$att" > "$f"
+  if [ "$rep" = 1 ]; then
+    case "$(cfg CC_SECRETARY_PAGES)" in ''|0|*[!0-9]*) ;;
+      *) "$BIN/cc-notify" -p high -t "[$1] spooled mail has no window" \
+           "$n message(s) with nowhere to go — $(sdir "$1")/inbox.spool" >/dev/null 2>&1;;
+    esac
+  elif [ "$att" = 1 ]; then
+    "$BIN/cc-notify" -p high -t "[$1] spooled mail has no window and no session could be told" \
+      "$n message(s) in $(sdir "$1")/inbox.spool ('${res:-nothing}', rc $rc)" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+# ── delivery ─────────────────────────────────────────────────────────────────────────────────────────────────
+free_pane(){  # $1 window  $2 window id → 0 when the pane will take keys now; answers a known-safe prompt first
+  local scr key st
+  scr=$(tmux capture-pane -p -t "$2" 2>/dev/null)
+  st=$(blocked "$scr")
+  if [ "$st" = dialog ]; then                  # ONLY a pane a dialog is actually holding is ever pressed: the same
+    key=$(safe_key "$scr")                     # words in a transcript are text, and a key sent at a free or busy
+    if [ -n "$key" ]; then                     # pane is a keystroke nobody asked for
+      tmux send-keys -t "$2" "$key"; sleep "$DIALOG_WAIT"
+      scr=$(tmux capture-pane -p -t "$2" 2>/dev/null); st=$(blocked "$scr")
+    fi
+  fi
+  case "$st" in
+    dialog) dialog_seen "$1" "$scr"; return 1;;
+    busy)   return 1;;                       # mid-turn is not a fault and is not reported: it ends by itself
+    *)      dialog_gone "$1"; return 0;;
+  esac
+}
+
+spool_pop(){ tail -n +2 "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }   # the head line is gone; under the lock
+
+drain_window(){   # $1 window — deliver the spool in order while the pane stays free; keeps what it cannot deliver
+  local sp id n=0 line text
+  sp="$(sdir "$1")/inbox.spool"; [ -s "$sp" ] || return 0
+  id=$(win_id "$1"); [ -n "$id" ] || { orphan_seen "$1"; return 0; }   # gone or not up yet: the spool waits, but not silently forever
+  live_claude "$id" || return 0
+  ( flock -w 10 9 || exit 1
+    while [ "$n" -lt "$MAX_DRAIN" ] && [ -s "$sp" ]; do
+      free_pane "$1" "$id" || break
+      line=$(head -1 "$sp")
+      # A LINE THAT IS NOT A MESSAGE IS DROPPED, NOT WAITED ON. Stopping at it (the rule until review-157e) left it
+      # at the head for every later tick: nothing behind it was ever typed, and nothing said so — the window exists
+      # and its pane is free, so neither report above ever fires. It is said through cc-notify instead.
+      if ! text=$(printf '%s' "$line" | jq -er '.text | strings' 2>/dev/null); then
+        spool_pop "$sp"
+        "$BIN/cc-notify" -t "[$1] a spool line was dropped" \
+          "not a message (no .text to type), so the drain discarded it rather than stop the queue at it: ${line:0:200}" >/dev/null 2>&1
+        n=$((n + 1)); continue
+      fi
+      type_at "$id" "$text"
+      spool_pop "$sp"
+      n=$((n + 1)); sleep "$KEY_WAIT"
+    done
+    [ -s "$sp" ] || rm -f "$sp" "$(sdir "$1")/inbox.orphan"
+  ) 9>"$(lock "$1")"
+}
+
+drain(){   # $1 = one window, or nothing = every window with a spool
+  local sp w
+  if [ $# -gt 0 ] && [ -n "${1:-}" ]; then drain_window "$1"; return 0; fi
+  for sp in "$STATE"/*/inbox.spool "$STATE"/*/*/inbox.spool; do
+    [ -f "$sp" ] || continue
+    w=${sp#"$STATE"/}; w=${w%/inbox.spool}
+    drain_window "$w"
+  done
+}
+
+send(){    # $1 window  $2 text — THE contract: delivered, or queued and reported as queued. Never dropped.
+  local id
+  id=$(win_id "$1") || true
+  [ -n "$id" ] || { echo "cc-msg: no window main:$1" >&2; exit 1; }
+  live_claude "$id" || { echo "cc-msg: main:$1 runs no interactive claude (headless worker or bare shell) — append to ~/.cc/state/<repo>/<track>/task.md instead" >&2; exit 1; }
+  local line sp                                   # ALWAYS the spool first, even for a free pane: it is what keeps
+  line=$(spool_add "$1" "$2") || { echo "cc-msg: could not spool for main:$1" >&2; exit 1; }   # a burst in order
+  drain_window "$1"                                       # …and what makes "never dropped" true of every path
+  sp="$(sdir "$1")/inbox.spool"
+  if [ -f "$sp" ] && grep -qxF "$line" "$sp"; then echo queued; fi
+  return 0
+}
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+# A whole fake box: its own HOME, a stub tmux whose pane text is a file this test rewrites, a stub ps that says a
+# claude lives under it, and stub cc-slack/cc-notify/cc-config that only record. It runs a COPY of this script
+# (so $BIN is the stub dir) and touches no tmux, no session and no state of this box's.
+FREE='> '
+BUSY='  ⏵⏵ working (esc to interrupt · 12s)'
+LIMIT="You've reached your Fable limit
+Fable 5 now uses usage credits.
+❯ 1. Switch to Opus 5 and continue
+  2. No, keep my current model
+  Esc to cancel"
+LIMIT2="Switch to Fable 5?
+Fable 5 runs on usage credits — you have CA\$0.00 in credits.
+Learn more: https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans
+❯ No, keep my current model
+  Manage usage credits on claude.ai
+Enter to confirm · Esc to cancel"
+MODEL='Switch model?
+This conversation is cached for the current model.
+❯ 1. Yes, switch to Opus 5
+  2. No, go back
+  Esc to cancel'
+PERM='Do you want to make this edit to cc-msg?
+❯ 1. Yes
+  2. No, and tell Claude what to do differently
+  Esc to cancel'
+TRAP='Do you want to run this command?
+  cat: You have reached your Fable limit — Switch to Opus 5 and continue / No, keep my current model
+❯ 1. Yes
+  2. No, and tell Claude what to do differently
+  Esc to cancel'
+
+selfcheck(){
+  local n=0 f=0 W='demo/t1' out rc
+  T=$(mktemp -d); trap 'rm -rf "$T"' EXIT      # T is deliberately NOT local: the EXIT trap runs after this frame
+  mkdir -p "$T/bin"
+  cat > "$T/bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  list-windows) [ -n "${CC_FAKE_WIN:-}" ] && printf '@1 %s\n' "$CC_FAKE_WIN";;
+  list-panes)   echo 991234;;
+  capture-pane) cat "$CC_FAKE_SCREEN" 2>/dev/null;;
+  send-keys)    shift; printf '%s\n' "$*" >> "$CC_FAKE_KEYS"
+                case "$*" in *Escape*) [ -n "${CC_FAKE_ESC_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac;;
+esac
+exit 0
+STUB
+  cat > "$T/bin/ps" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *-eo*) printf '991234 1 bash\n991235 991234 %s\n' "${CC_FAKE_PROC:-claude}";;   # a claude under the pane
+  *)     echo cc-test;;                                                           # ps -o comm= -p $PPID
+esac
+STUB
+  cat > "$T/bin/cc-slack" <<'STUB'
+#!/usr/bin/env bash
+printf 'inject %s\n' "$*" >> "$CC_FAKE_CALLS"
+printf '%s\n' "${CC_FAKE_INJECT:-delivered}"     # the verdict the real one prints: delivered · typed · queued · …
+exit "${CC_FAKE_INJECT_RC:-0}"
+STUB
+  cat > "$T/bin/cc-notify" <<'STUB'
+#!/usr/bin/env bash
+printf 'notify %s\n' "$*" >> "$CC_FAKE_CALLS"
+STUB
+  cat > "$T/bin/cc-config" <<'STUB'
+#!/usr/bin/env bash
+[ "${2:-}" = CC_SECRETARY_PAGES ] && echo "${CC_FAKE_PAGES:-0}"
+exit 0
+STUB
+  cp "$(readlink -f "${BASH_SOURCE[0]}")" "$T/bin/cc-msg"; chmod +x "$T"/bin/*
+  export PATH="$T/bin:$PATH" HOME="$T" CC_FAKE_SCREEN="$T/screen" CC_FAKE_KEYS="$T/keys" \
+         CC_FAKE_CALLS="$T/calls" CC_FAKE_WIN="$W" CC_FAKE_ESC_CLEARS=1 CC_FAKE_PROC=claude CC_FAKE_PAGES=0 \
+         CC_MSG_KEY_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck
+  local SP="$T/.cc/state/$W/inbox.spool" DG="$T/.cc/state/$W/inbox.dialog"
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
+  nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
+  scr(){ printf '%s\n' "$1" > "$T/screen"; }
+  reset(){ : > "$T/keys"; : > "$T/calls"; rm -rf "$T/.cc/state"; }
+  msg(){ "$T/bin/cc-msg" "$W" "$1"; }
+  keys(){ cat "$T/keys"; }
+  calls(){ cat "$T/calls"; }
+
+  # (1) a free pane: the text is typed, nothing is left behind
+  reset; scr "$FREE"; out=$(msg "hello one")
+  k "$(t test -z "$out")" "a free pane: delivered, and cc-msg stays silent (the contract every caller reads)"
+  k "$(t grep -qF 'hello one' "$T/keys")" "a free pane: the text reached the keyboard"
+  k "$(nt test -s "$SP")" "a free pane: the spool is emptied and removed, not left as a puddle"
+
+  # (1b) a MULTI-LINE message reaches the keyboard as ONE line — a newline there is a SUBMIT, and the session would
+  # take "deploy the fix" as the whole instruction and type "then tell me when green" into the next turn.
+  reset; scr "$FREE"; msg "$(printf 'first line\nsecond line')" >/dev/null
+  k "$(t grep -qF -- '-l -- first line second line' "$T/keys")" "a two-line message is typed as one send-keys line"
+  k "$(t test "$(wc -l < "$T/keys")" = 2)" "…and takes exactly one Enter: no half a message is submitted as a turn"
+  reset; scr "$PERM"; msg "$(printf 'first line\nsecond line')" >/dev/null
+  k "$(t sh -c "jq -e '.text == \"first line\nsecond line\"' < '$SP'")" "…while the spool keeps the message whole"
+
+  # (2)+(3) the two known-safe prompts are ANSWERED with Escape (= keep what the session has) and then delivered
+  reset; scr "$LIMIT"; msg "hello limit" >/dev/null
+  k "$(t grep -qF 'Escape' "$T/keys")" "the model-limit prompt is answered with Escape — the pane's current model is kept"
+  k "$(t grep -qF 'hello limit' "$T/keys")" "…and the message that was waiting behind it is delivered in the same call"
+  reset; scr "$LIMIT2"; msg "hello credits" >/dev/null
+  k "$(t grep -qF 'Escape' "$T/keys")" "the credits wording of the same prompt (footer 'Enter to confirm · Esc to cancel', no 'reached your') is answered too"
+  k "$(t grep -qF 'hello credits' "$T/keys")" "…and delivers: this is the pane a pulse tick and two secretary findings were thrown away at"
+  reset; scr "$MODEL"; msg "hello model" >/dev/null
+  k "$(t grep -qF 'Escape' "$T/keys")" "the /model confirm is answered with Escape — no model is switched"
+  k "$(t grep -qF 'hello model' "$T/keys")" "…and its message is delivered"
+
+  # (4) a permission dialog is NEVER answered — it is the owner's — and the message is spooled, not dropped
+  reset; scr "$PERM"; out=$(msg "hello perm")
+  k "$(t test "$out" = queued)" "a permission dialog: cc-msg says queued (rc 0), so no caller can read it as sent"
+  k "$(nt grep -q . "$T/keys")" "a permission dialog: NOT ONE keystroke — not Escape, not the text"
+  k "$(t test "$(wc -l < "$SP")" = 1)" "a permission dialog: one line in ~/.cc/state/$W/inbox.spool"
+  k "$(t sh -c "jq -e '.at and .from and .text == \"hello perm\"' < '$SP'")" "the spool line is JSON: at, from, text"
+
+  # (5) the trap: a permission dialog whose transcript QUOTES the limit prompt. The table must not fire on it.
+  reset; scr "$TRAP"; out=$(msg "hello trap")
+  k "$(t test "$out" = queued)" "a permission dialog that quotes the limit prompt is still queued, never answered"
+  k "$(nt grep -q . "$T/keys")" "…and still not one keystroke: a permission marker vetoes the known-safe table"
+
+  # (5b) a RETRY is one message; the SAME WORDS LATER ARE TWO. The collapse is bounded by CC_MSG_DEDUP_S and by
+  # the sender, or "status?" asked again twenty minutes on is answered "queued" and never arrives.
+  reset; scr "$PERM"; msg "again" >/dev/null; out=$(msg "again"); msg "different" >/dev/null
+  k "$(t test "$out" = queued)" "a repeat of a queued message still answers queued — the caller is not told it was dropped"
+  k "$(t test "$(wc -l < "$SP")" = 2)" "…and a retry inside the window is not queued twice: same text collapses, different text does not"
+  jq -c '.at = (now - 1200 | todateiso8601)' "$SP" > "$SP.old" && mv "$SP.old" "$SP"   # both copies age past the window
+  msg "again" >/dev/null
+  k "$(t test "$(wc -l < "$SP")" = 3)" "…the same text again past the window is a SECOND message, not a swallowed one"
+  CC_MSG_FROM=other "$T/bin/cc-msg" "$W" "again" >/dev/null                            # the fresh copy is selfcheck's
+  k "$(t test "$(wc -l < "$SP")" = 4)" "…and another sender's identical line is never someone else's retry"
+
+  # (5c) the folder-trust dialog shares the model-limit prompt's footer to the character. It is the owner's.
+  reset; scr "Accessing workspace: /home/box/dev/x
+Quick safety check: Is this a project you created or one you trust?
+❯ 1. Yes, I trust this folder
+  2. No, exit
+Enter to confirm · Esc to cancel"
+  out=$(msg "hello trust")
+  k "$(t test "$out" = queued)" "the folder-trust dialog is queued behind, never pressed — it shares the same footer"
+  k "$(nt grep -q . "$T/keys")" "…and takes no keystroke at all"
+
+  # (6) a busy pane: mid-turn is not a fault, but the message still waits rather than landing in the middle
+  reset; scr "$BUSY"; out=$(msg "hello busy")
+  k "$(t test "$out" = queued)" "a busy pane: queued"
+  k "$(nt grep -q . "$T/keys")" "a busy pane: nothing typed into the middle of a turn"
+  k "$(nt test -f "$DG")" "a busy pane is not reported as a standing dialog — it ends by itself"
+
+  # (6b) a pane mid-turn whose SCROLLBACK holds the limit prompt: busy is judged first, and Escape mid-turn would
+  # interrupt the turn — the one keystroke this script must never make by accident
+  reset; scr "$LIMIT
+$BUSY"; out=$(msg "hello mid-turn")
+  k "$(t test "$out" = queued)" "a busy pane whose scrollback quotes the limit prompt is queued, not pressed"
+  k "$(nt grep -q . "$T/keys")" "…mid-turn is judged before any dialog: no Escape lands in the middle of a turn"
+
+  # (7) the drain, in order
+  reset; scr "$PERM"; msg one >/dev/null; msg two >/dev/null; msg three >/dev/null
+  k "$(t test "$(wc -l < "$SP")" = 3)" "three messages behind a dialog: three spooled"
+  "$T/bin/cc-msg" --drain "$W"
+  k "$(nt grep -q . "$T/keys")" "the drain leaves the spool alone while the dialog is still up"
+  scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c -e ' one$' -e ' two$' -e ' three$' "$T/keys")" = 3)" "the drain delivers all three once the pane is free"
+  k "$(t test "$(grep -o -e 'one' -e 'two' -e 'three' "$T/keys" | tr '\n' ' ')" = 'one two three ')" "…oldest first: the spool is a queue, not a stack"
+  k "$(nt test -f "$SP")" "…and the drained spool is gone"
+
+  # (7b) A LINE THAT IS NOT A MESSAGE does not jam the queue. A kill mid-append leaves half a line (cc-slack reads
+  # the spool expecting one) and a hand-edit can leave anything; the drain used to stop at it every tick, for ever,
+  # with nothing said (review-157e). It is dropped, said through cc-notify, and the mail behind it is delivered.
+  reset; scr "$PERM"; msg "after junk" >/dev/null; msg "after junk too" >/dev/null
+  { echo 'not json'; cat "$SP"; } > "$SP.new" && mv "$SP.new" "$SP"
+  scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c -e ' after junk$' -e ' after junk too$' "$T/keys")" = 2)" "a spool headed by 'not json' still delivers the two good lines behind it"
+  k "$(nt grep -qF 'not json' "$T/keys")" "…and the junk never reaches the keyboard"
+  k "$(nt test -f "$SP")" "…and the spool is gone: nothing is jammed at its head"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…and the drop is said once through cc-notify, not silently"
+  k "$(t grep -qF 'not json' "$T/calls")" "…naming the line that was dropped"
+  reset; scr "$PERM"; msg "after null" >/dev/null
+  { printf '{"at":"2026-01-01T00:00:00Z","from":"x"}\n'; cat "$SP"; } > "$SP.new" && mv "$SP.new" "$SP"
+  scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
+  k "$(t grep -qF 'after null' "$T/keys")" "a line with no .text is dropped the same way and the one behind it delivered"
+  k "$(nt grep -q -- '-l -- null$' "$T/keys")" "…and the word 'null' is not what gets typed at the session"
+
+  # (8) --drain with no window sweeps every spool under ~/.cc/state
+  reset; scr "$PERM"; msg "sweep me" >/dev/null; scr "$FREE"; "$T/bin/cc-msg" --drain
+  k "$(t grep -qF 'sweep me' "$T/keys")" "cc-msg --drain with no argument finds the window's spool by itself"
+
+  # (9) a dialog that stands: reported ONCE, to the box session, and to the owner only when pages are on
+  reset; scr "$PERM"; msg "stuck" >/dev/null
+  k "$(nt grep -q inject "$T/calls")" "a dialog just seen is not reported — most are answered within a minute"
+  printf '%s\t0\tDo you want to make this edit?\n' "$(( $(date +%s) - 700 ))" > "$DG"   # 3 fields: a stamp an
+                                                                    # older copy left behind must still parse
+  "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c inject "$T/calls")" = 1)" "a dialog standing 10 min is told to the box's planning session"
+  k "$(t grep -q "main:$W" "$T/calls")" "…naming the window"
+  k "$(t grep -qF 'Do you want to' "$T/calls")" "…and the dialog text"
+  k "$(nt grep -q notify "$T/calls")" "…and NOT the owner: CC_SECRETARY_PAGES is 0"
+  k "$(nt grep -qE 'The dialog: *$' "$T/calls")" "…and the report names a line, not an empty one (keys already sent echo on the pane)"
+  "$T/bin/cc-msg" --drain "$W"; "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c inject "$T/calls")" = 1)" "ONCE: two more ticks on the same standing dialog say nothing"
+  reset; scr "$PERM"; CC_FAKE_PAGES=1 msg "stuck2" >/dev/null
+  stand(){ printf '%s\t0\t0\tDo you want to make this edit?\n' "$(( $(date +%s) - 700 ))" > "$DG"; }
+  stand
+  CC_FAKE_PAGES=1 "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "with CC_SECRETARY_PAGES>0 the owner is paged too, once"
+  scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
+  k "$(nt test -f "$DG")" "the standing-dialog stamp is cleared when the pane comes free"
+
+  # (9b) SAID IS NOT HEARD. The stamp closes only when the injector says a live session took the text; a daemon
+  # that is not running, or a verdict that means it was only parked, leaves it open for the next tick — and since
+  # nothing reached anyone at all, the owner is told once whatever CC_SECRETARY_PAGES says.
+  reset; scr "$PERM"; msg "stuck3" >/dev/null; stand
+  CC_FAKE_INJECT='daemon not running (ConnectionRefusedError) — cc slack on' CC_FAKE_INJECT_RC=1 \
+    "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^inject' "$T/calls")" = 1)" "the daemon is down: the report was attempted"
+  k "$(t test "$(cut -f2 "$DG")" = 0)" "…and NOT stamped as reported — a failed inject must not suppress every later try"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…with nothing said anywhere, the owner hears it once even at CC_SECRETARY_PAGES=0"
+  CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^inject' "$T/calls")" = 2)" "the next tick tries again"
+  k "$(t test "$(cut -f2 "$DG")" = 0)" "…and 'queued' is not heard either: the daemon parked it, no session read it"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner is not paged a second time: once a failure, not once a minute"
+  CC_FAKE_INJECT=typed "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(cut -f2 "$DG")" = 1)" "'typed' (cc-msg put it on the session's keyboard) IS heard: the stamp closes"
+  "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^inject' "$T/calls")" = 3)" "…and the tick after that says nothing: reported once, for real"
+
+  # (9b′) …AND NOT FOR EVER. Every inject is a NEW message to the daemon (it stamps a fresh meta.ts as the sender, so
+  # this script's own retry-collapse never matches it): with the told session not running, a retry a minute was a
+  # copy a minute in its queue, sixty an hour, flushed at it when it came up (review-157e). A report nobody hears is
+  # tried CC_MSG_REPORT_TRIES times and then left — the owner was paged on the first failure.
+  reset; scr "$PERM"; msg "stuck7" >/dev/null; stand
+  for _ in 1 2 3 4 5; do CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"; done
+  k "$(t test "$(grep -c '^inject' "$T/calls")" = 3)" "five ticks that nobody hears: three injects (CC_MSG_REPORT_TRIES), the fourth and fifth make none"
+  k "$(t test "$(cut -f3 "$DG")" = 3)" "…the stamp counts the tries"
+  k "$(t test "$(cut -f2 "$DG")" = 0)" "…and is still open: the stop is a bound, not a claim it was heard"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner was paged once, on the first failure, as before"
+
+  # (9c) WHO hears it: the control repo this copy of cc-msg lives in (~/dev/<repo>/core/bin, which ~/bin links to),
+  # whose planning session can walk over to the window — not a name written into the script.
+  reset; scr "$PERM"; msg "stuck4" >/dev/null; stand
+  mkdir -p "$T/dev/ctlrepo/core"; cp -r "$T/bin" "$T/dev/ctlrepo/core/bin"
+  "$T/dev/ctlrepo/core/bin/cc-msg" --drain "$W"
+  k "$(t grep -q 'no-start ctlrepo ' "$T/calls")" "the report goes to the control repo's session, derived from where this copy lives"
+  reset; scr "$PERM"; msg "stuck5" >/dev/null; stand
+  CC_MSG_REPORT_TO=box "$T/bin/cc-msg" --drain "$W"
+  k "$(t grep -q 'no-start box ' "$T/calls")" "…and CC_MSG_REPORT_TO overrides it (the Remote-Control session)"
+
+  # (9d) …and never into the pane it is about: the session we would tell IS the stuck one, so the report would be
+  # typed into that pane, spool behind the same dialog, and be reported again from there — a loop. The owner instead.
+  reset; scr "$PERM"; msg "stuck6" >/dev/null; stand
+  CC_MSG_REPORT_TO="$W" "$T/bin/cc-msg" --drain "$W"
+  k "$(nt grep -q '^inject' "$T/calls")" "the stuck window is the one that would hear it: nothing is injected — that is the loop"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…the owner is told instead, once"
+  k "$(t test "$(cut -f2 "$DG")" = 0)" "…and the stamp stays open in case the session comes back"
+
+  # (9e) a spool whose WINDOW is gone (a handoff rename, an exit): reported once through the same path — a spool
+  # nobody will ever drain must not stand silent (review-157b); and it still drains if the window comes back.
+  reset; scr "$PERM"; msg "stranded" >/dev/null                     # spools behind the dialog while the window exists
+  touch -d '20 minutes ago' "$SP"
+  CC_FAKE_WIN='' "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^inject' "$T/calls")" = 1)" "a spool with no window, older than STAND_MIN: the box session is told"
+  k "$(t grep -qF 'no such window' "$T/calls")" "…saying the window is gone, not that a dialog stands"
+  CC_FAKE_WIN='' "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c '^inject' "$T/calls")" = 1)" "…and ONCE: the next tick says nothing"
+  scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
+  k "$(t grep -qF 'stranded' "$T/keys")" "the window came back: the spool drains after all"
+  k "$(nt test -f "$T/.cc/state/$W/inbox.orphan")" "…and the orphan stamp is gone with it"
+  reset; scr "$PERM"; msg "stranded2" >/dev/null; touch -d '20 minutes ago' "$SP"
+  for _ in 1 2 3 4 5; do CC_FAKE_WIN='' CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"; done
+  k "$(t test "$(grep -c '^inject' "$T/calls")" = 3)" "…and a report of it that nobody hears is bounded the same way: three tries, then quiet"
+
+  # (10) what is still REFUSED: a pane with no interactive claude, and a window that does not exist
+  reset; scr "$FREE"; out=$(CC_FAKE_PROC=bash "$T/bin/cc-msg" "$W" "no claude here" 2>&1); rc=$?
+  k "$(t test "$rc" != 0)" "a pane with no interactive claude is still refused (rc≠0) — the text would run as a command"
+  k "$(t grep -q 'task.md' <<<"$out")" "…and still points at task.md"
+  k "$(nt test -f "$SP")" "…and nothing is spooled for it: a headless worker has no keyboard to drain to"
+  reset; scr "$FREE"; out=$(CC_FAKE_WIN=other "$T/bin/cc-msg" "$W" "nowhere" 2>&1); rc=$?
+  k "$(t test "$rc" != 0)" "an unknown window is still an error, not a queue that nothing will ever read"
+
+  echo "cc-msg selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" = 0 ]
+}
+
+
+case "${1:-}" in
+  --drain)    shift; drain "${1:-}";;
+  selfcheck)  selfcheck;;
+  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --drain [<window>] | cc-msg selfcheck' >&2; exit 2;;
+  *)          w=$1; shift; send "$w" "${*:-$(cat)}";;
+esac

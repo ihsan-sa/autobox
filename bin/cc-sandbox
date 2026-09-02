@@ -3,6 +3,18 @@
 # the control plane's source are ABSENT from the process's world, not denied by a regex (docs: design-worker-sandbox, stage 1a).
 #   cc-sandbox <repo> <track> -- <cmd...>   CC_WORKER_SANDBOX=1 → bwrap around <cmd>; anything else → exec <cmd> untouched
 #   cc-sandbox selfcheck                    a scratch repo + worktree: the world inside is what this header says
+#   cc-sandbox member <handle> [<track>] -- <cmd...>   A MEMBER WORKSPACE'S BOUNDARY (docs/design-member-workspaces.md): ALWAYS bwrap,
+#     no opt-in. Inside: ~/dev/<handle> rw (the whole workspace, its .git included — it is the member's own repo — but .git/config
+#     and .git/hooks ro: the host runs git in there and must not run what a member wrote) · ~/.cc/worktrees/<handle>
+#     and ~/.cc/state/<handle> rw (every track of the workspace, no other repo's) · the workspace's board FILE (~/.cc/boards/<handle>.json)
+#     · ~/.cc/slack/member/<handle>/ seen AS ~/.cc/slack: the daemon's member-scoped socket, an `enabled` flag and the attachment cache —
+#     the bot token, the owner-level socket and every other channel stay outside · a private ~/.claude/projects, ~/.npm and ~/.cache under
+#     ~/.cc/members/<handle>/ · the control plane's core/bin bound ro AS ~/bin, so ~/dev/<control repo> does not exist inside · ONE credential
+#     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner, kept whole) and
+#     never the owner's, because a member can print whatever is in there: with no credential of its own the workspace does not start · a
+#     ~/.claude.json copy holding only this workspace's projects and only the cc-slack MCP server. The environment is CLEARED and rebuilt
+#     (HOME, PATH, TERM, LANG…, CC_MEMBER_SANDBOX=1, CC_ROLE=member, git identity = the handle). ABSENT: every other ~/dev/*, ~/.cc/config,
+#     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets.
 # INSIDE rw: the track worktree · the parent repo's .git (the worktree's .git is a pointer into it), with .git/config and
 #   .git/hooks held ro — the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks (cc-loop), and a
 #   worker must not re-point its hooksPath or its remotes, nor write a hook the host would run ·
@@ -13,7 +25,8 @@
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
 #   groups become nobody).
-# AUTH: claude reads a STRIPPED copy of ~/.claude/.credentials.json at its normal path — the current access token and its
+# AUTH (a WORKER; a member workspace's is the `cc-sandbox member` paragraph above): claude reads a STRIPPED copy of
+#   ~/.claude/.credentials.json at its normal path — the current access token and its
 #   expiry, no refresh token — so the read claude needs is the one cc-guard's credential rule denies the worker, and nothing
 #   goes in the environment (CLAUDE_CODE_OAUTH_TOKEN is unset inside: `env` is not gated, that path is). An iteration is ≤1 h
 #   and whichever session next needs the token refreshes the real file, so a launch with <65 min left is logged: if it
@@ -54,10 +67,148 @@ launch(){   # $1 repo · $2 track · the rest is the command
   if [ -z "$tok" ]; then echo "cc-sandbox: no access token in $cred — claude inside will not authenticate" >&2
   else exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred" 2>/dev/null); left=$(( ${exp:-0} / 1000 - $(date +%s) ))
     [ "$left" -lt 3900 ] && echo "cc-sandbox: the access token expires in $((left / 60)) min — if it does mid-run, this iteration errors and the next starts on the refreshed one" >&2; fi
-  # fd 3: the ~/.claude.json copy · fd 4: the credentials copy — claudeAiOauth minus its refresh token, nothing else of the file
+  # fd 3: the ~/.claude.json copy — BUILT FROM A WHITELIST (projects, mcpServers), never the file minus a mask: Claude Code keeps
+  #       oauthAccount (the owner's email) and userID at the top level, and a mask copied them inside (review-156e)
+  #       fd 4: the credentials copy — claudeAiOauth minus its refresh token, nothing else of the file
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
-    3< <(jq --arg wt "$wt" '.projects |= ((. // {}) | with_entries(select(.key == $wt))) | .mcpServers = {}' "$H/.claude.json" 2>/dev/null || printf '{}') \
+    3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
+build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
+  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname
+  [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
+  cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"
+  mkdir -p "$m/claude/projects" "$m/npm" "$m/cache" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$sl/files" "$H/.cc/boards"; : >> "$sl/enabled"
+  [ -f "$H/.cc/boards/$h.json" ] || "$H/bin/cc-board" init "$h" "$dev" main >/dev/null 2>&1 || : > "$H/.cc/boards/$h.json"
+  : >> "$H/.cc/boards/$h.lock"
+  cb=$(dirname "$SELF")   # the bin THIS copy lives in (~/bin is symlinks into the control repo's core/bin; a track worktree tests its own), bound AS ~/bin
+  B=(--die-with-parent --unshare-pid --clearenv
+     --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
+     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
+     --bind "$dev" "$dev" --bind "$H/.cc/worktrees/$h" "$H/.cc/worktrees/$h" --bind "$H/.cc/state/$h" "$H/.cc/state/$h"
+     --bind "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.json" --bind "$H/.cc/boards/$h.lock" "$H/.cc/boards/$h.lock"
+     --bind "$sl" "$H/.cc/slack" --bind "$m/claude/projects" "$H/.claude/projects" --bind "$m/npm" "$H/.npm" --bind "$m/cache" "$H/.cache"
+     --ro-bind "$cb" "$H/bin" --ro-bind "$H/.local/bin/claude" "$H/.local/bin/claude"
+     --setenv HOME "$H" --setenv PATH "$H/bin:$H/.local/bin:/usr/local/bin:/usr/bin:/bin" --setenv CC_MEMBER_SANDBOX 1 --setenv CC_ROLE member
+     --setenv GIT_AUTHOR_NAME "$h" --setenv GIT_AUTHOR_EMAIL "$h@member.$(hostname -s)" --setenv GIT_COMMITTER_NAME "$h" --setenv GIT_COMMITTER_EMAIL "$h@member.$(hostname -s)"
+     --chdir "$cwd")
+  # THE WORKSPACE IS THE MEMBER'S; ITS .git/config AND .git/hooks ARE NOT. The HOST runs git in this very repo — `cc
+  # <h> <track>` fetches and adds a worktree here — so a hook the member drops in, a core.hooksPath they point at their
+  # own tree, or an `ext::sh -c …` remote would execute as the OWNER outside the boundary, where ~/.ssh, ~/.cc/config
+  # and the container socket are. Same guard build() gives a worker, and cc's host-side git pins core.hooksPath as well.
+  [ -f "$dev/.git/config" ] || git -C "$dev" init -q >/dev/null 2>&1   # the repo must exist OUT here first, or there is nothing to hold read-only
+  mkdir -p "$dev/.git/hooks" 2>/dev/null
+  [ -f "$dev/.git/config" ] && B+=(--ro-bind "$dev/.git/config" "$dev/.git/config")
+  [ -d "$dev/.git/hooks" ] && B+=(--ro-bind "$dev/.git/hooks" "$dev/.git/hooks")
+  # …and the per-track gitlinks (review-156b): the worktree tree is rw, so its `.git` FILE could otherwise be
+  # replaced with a member git dir whose hooks the host's checkpoint would run as the owner. The REDIRECT files are
+  # the repo's, not the member's — the gitlink, the admin dir's `commondir` (re-pointing it swaps in a member-owned
+  # common dir, config and hooks included) and `config.worktree` where it exists. The admin dir itself stays rw:
+  # the member's own commits write their index and HEAD there, which is why it cannot be held whole (the selfcheck's
+  # commit case proves it). config.worktree only binds when extensions.worktreeConfig is on, and $dev/.git/config is
+  # ro above; the host-side checkpoint pins core.hooksPath on top (core/bin/cc).
+  for twt in "$H/.cc/worktrees/$h"/*/; do
+    [ -f "${twt}.git" ] || continue
+    tname=$(basename "$twt")
+    B+=(--ro-bind "${twt}.git" "${twt}.git")
+    [ -f "$dev/.git/worktrees/$tname/commondir" ] && B+=(--ro-bind "$dev/.git/worktrees/$tname/commondir" "$dev/.git/worktrees/$tname/commondir")
+    [ -f "$dev/.git/worktrees/$tname/config.worktree" ] && B+=(--ro-bind "$dev/.git/worktrees/$tname/config.worktree" "$dev/.git/worktrees/$tname/config.worktree")
+  done
+  [ -f "$H/.claude/settings.json" ] && B+=(--ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json")   # the hooks (cc-guard: depth inside the wall)
+  [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
+  [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
+  for v in TERM LANG LC_ALL COLORTERM USER LOGNAME SHELL CC_SLACK_CHANNEL CC_CLAUDE CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_GUARD_ASKS CC_GUARD_ASK_TTL; do
+    [ -n "${!v:-}" ] && B+=(--setenv "$v" "${!v}"); done; :; }
+launch_member(){   # $1 handle · $2 track · the rest is the command — the WORKSPACE'S OWN credential, or no launch at all;
+                   # a narrower ~/.claude.json
+  local h="$1" tr="$2" dev="$H/dev/$1" cred="$H/.claude/.credentials.json" own="$H/.cc/members/$1/credentials.json" mcp='{}' cj why
+  build_member "$h" "$tr"; shift 2
+  [ -z "$tr" ] || [ -d "$H/.cc/worktrees/$h/$tr" ] || { echo "cc-sandbox: no worktree for $h/$tr" >&2; exit 2; }
+  # WHATEVER CREDENTIAL IS INSIDE, THE MEMBER CAN PRINT IT — they drive a session in there. So the owner's NEVER enters the
+  # boundary, stripped or not: a workspace runs on a credential minted for it at ~/.cc/members/<h>/credentials.json (host
+  # side, never bound — the member sees its CONTENT at ~/.claude/.credentials.json and not the file), and without one it
+  # does not start. The owner's used to be the fallback, announced on every launch; every workspace shipped without one,
+  # so every member session would have held the box's token from day one (review-156c). Fail closed, and say what to mint.
+  # This is the LAST wall: cc checks the same file on the host before it opens the window (member_credential), and tells
+  # #<h> and the owner — a refusal here lands in a pane nobody reads (review-156d).
+  if ! { [ -s "$own" ] && jq -e '.claudeAiOauth.accessToken' "$own" >/dev/null 2>&1; }; then
+    why=missing; [ -e "$own" ] && why="present, but has no .claudeAiOauth.accessToken"
+    echo "cc-sandbox: $h has no credential of its own ($own: $why) — a member workspace never starts on the OWNER's. Mint one for this workspace and put it at $own, in the shape of ~/.claude/.credentials.json ({\"claudeAiOauth\": {\"accessToken\": …}}); nothing starts here until then." >&2
+    exit 2
+  fi
+  cj=$(jq -c '{claudeAiOauth: .claudeAiOauth}' "$own")   # its own: kept whole, it can refresh itself
+  [ -f "$H/.cc/slack/enabled" ] && mcp=$(jq -cn --arg c "$H/bin/cc-slack" '{"cc-slack": {type: "stdio", command: $c, args: ["channel"], env: {}}}')
+  # fd 3: the ~/.claude.json copy · fd 4: $cj at $cred — that path is the DESTINATION inside; the content is the workspace's own
+  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
+    3< <(jq --arg d "$dev" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
+           '{projects: ((.projects // {}) | with_entries(select(.key == $d or (.key | startswith($w))))), mcpServers: $m}' "$H/.claude.json" 2>/dev/null || printf '{}') \
+    4< <(printf '%s' "$cj"); }
+selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
+                      # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner
+  dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
+  : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
+  git -C "$dev" init -q -b main && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init || return 1
+  git -C "$dev" worktree add -q -b track/t "$H/.cc/worktrees/$h/t" >/dev/null 2>&1 || return 1; mkdir -p "$H/.cc/worktrees/$h/t/.cc"; printf '%s\n%s\n' "$h" t > "$H/.cc/worktrees/$h/t/.cc/track"
+  ctl=$(dirname "$(dirname "$(dirname "$SELF")")")   # ~/dev/<control repo> (or the worktree this copy is tested from): must not exist inside
+  c="$H/.claude/.credentials.json"; own="$H/.cc/members/$h/credentials.json"
+  # NO CREDENTIAL OF ITS OWN → NO LAUNCH (review-156c: the owner's used to be the fallback here). None, then a file without an
+  # access token: the command never runs — its marker must not come back — and the refusal says what to mint and where.
+  rm -f "$own"; out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'member: with no credential of its own the workspace does NOT start — the owner'"'"'s is no fallback' "$rc/$(grep -c STARTED <<<"$out")" 2/0
+  t 'member: and the refusal says what to mint, and where' "$(grep -cF "Mint one for this workspace and put it at $own" <<<"$out")" 1
+  mkdir -p "$(dirname "$own")" && echo '{"claudeAiOauth": {}}' > "$own" || return 1
+  out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'member: a credential file without an access token is no credential — still no start' "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'has no .claudeAiOauth.accessToken' <<<"$out")" 2/0/1
+  # THE WORLD INSIDE, on a credential of its own (the fixture this needs, built here). Only booleans come back out — never a token.
+  mine="mbr-only-access-$$"; miner="mbr-only-refresh-$$"
+  jq -n --arg a "$mine" --arg r "$miner" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$own" || return 1
+  out=$(TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak SLACK_BOT_TOKEN=leak "$SELF" member "$h" t -- sh -c '
+    e(){ [ -e "$1" ] && echo present || echo absent; }
+    echo other=$(e ~/dev/'"$o"'); echo ctl=$(e '"$ctl"'); echo devls=$(ls -A ~/dev | tr "\n" " "); echo ccls=$(ls -A ~/.cc | sort | tr "\n" " ")
+    echo ccconfig=$(e ~/.cc/config); echo ledger=$(e ~/.cc/state/member-spend.json); echo states=$(ls ~/.cc/state | tr "\n" " "); echo boards=$(ls ~/.cc/boards | sort | tr "\n" " ")
+    echo mine=$(jq -c "[(.claudeAiOauth.accessToken == \"'"$mine"'\"), (.claudeAiOauth.refreshToken == \"'"$miner"'\"), (keys | length)]" '"$c"' 2>/dev/null)
+    echo credfile=$([ -e ~/.cc/members ] && echo present || echo absent)
+    echo ssh=$(e ~/.ssh); echo gh=$(e ~/.config/gh); echo gitconfig=$(e ~/.gitconfig); echo sock=$(e /var/run/docker.sock)$(e /run/docker.sock); echo tmux=${TMUX:-unset}
+    echo env=$(env | grep -cE "^(CLAUDE_CODE_OAUTH_TOKEN|SLACK_BOT_TOKEN|TMUX)="); echo inside=${CC_MEMBER_SANDBOX:-unset}/${CC_ROLE:-unset}
+    echo bin=$([ -L ~/bin/cc ] && echo symlink || echo file)$(touch ~/bin/x 2>/dev/null && echo -writable || echo -ro); echo slack=$(ls -A ~/.cc/slack | sort | tr "\n" " ")
+    echo cwd=$PWD; echo status=$(git status --short >/dev/null 2>&1 && echo ok || echo broken)
+    echo hooks=$(touch ~/dev/'"$h"'/.git/hooks/post-checkout 2>/dev/null && echo writable || echo ro)
+    echo gitcfg=$(git config --file ~/dev/'"$h"'/.git/config core.hooksPath /tmp 2>/dev/null && echo writable || echo ro)
+    echo hookspath=$(git -C ~/dev/'"$h"' config core.hooksPath 2>/dev/null || echo none)
+    echo trackgit=$( (rm -f ~/.cc/worktrees/'"$h"'/t/.git || echo x > ~/.cc/worktrees/'"$h"'/t/.git) 2>/dev/null && echo writable || echo ro)
+    echo commondir=$( (echo /tmp/evil > ~/dev/'"$h"'/.git/worktrees/t/commondir) 2>/dev/null && echo writable || echo ro)
+    echo x > f && git add f && git commit -qm c >/dev/null 2>&1 && echo commit=$(git log -1 --format=%an) || echo commit=broken
+    echo board=$(cc-board add '"$h"' t2 t2 "" >/dev/null 2>&1 && cc-board get '"$h"' t2 branch)
+    echo mcp=$(jq -r "(.mcpServers | keys | join(\",\")),(.projects | length)" ~/.claude.json | tr "\n" ",")
+    echo cjkeys=$(jq -r "keys|join(\",\")" ~/.claude.json)
+    echo pid1=$(ls /proc | grep -c "^[0-9]" | awk "{print (\$1 < 20) ? \"few\" : \"many\"}"); echo tmp=$(touch /tmp/x && echo ok)' 2>&1)
+  mcpw="cc-slack,"; [ -f "$H/.cc/slack/enabled" ] || mcpw=","
+  t 'member: another repo is ABSENT' "$(g other)" absent;  t 'member: the control repo path is ABSENT' "$(g ctl)" absent
+  t 'member: ~/dev holds the workspace alone' "$(g devls)" "$h";  t 'member: ~/.cc holds boards, slack, state, worktrees and nothing else' "$(g ccls)" 'boards slack state worktrees'
+  t 'member: ~/.cc/config absent' "$(g ccconfig)" absent;  t 'member: the spend ledger absent' "$(g ledger)" absent
+  t 'member: only its own state' "$(g states)" "$h";  t 'member: only its own board' "$(g boards)" "$h.json $h.lock"
+  t 'member: the credential inside is the workspace'"'"'s own, whole — the owner'"'"'s token never enters' "$(g mine)" '[true,true,1]'
+  t 'member: the credential FILE is still outside — only its content is inside' "$(g credfile)" absent
+  t 'member: and a workspace that has one is not refused' "$(grep -c "has no credential of its own" <<<"$out")" 0
+  t 'member: ssh absent' "$(g ssh)" absent;  t 'member: config/gh absent' "$(g gh)" absent
+  t 'member: .gitconfig absent' "$(g gitconfig)" absent;  t 'member: the container socket absent' "$(g sock)" absentabsent;  t 'member: TMUX unset' "$(g tmux)" unset
+  t 'member: the environment was cleared' "$(g env)" 0;  t 'member: CC_MEMBER_SANDBOX=1 and CC_ROLE=member inside' "$(g inside)" 1/member
+  t 'member: ~/bin is the control bin itself, read-only' "$(g bin)" file-ro;  t 'member: ~/.cc/slack is the member dir' "$(g slack)" 'enabled files'
+  t 'member: cwd is the track worktree' "$(g cwd)" "$H/.cc/worktrees/$h/t";  t 'member: git status works' "$(g status)" ok
+  # the host runs git in this workspace: a hook or a hooksPath written from inside would execute out there, as the owner
+  t 'member: .git/hooks is ro — no hook the host would run' "$(g hooks)" ro
+  t 'member: .git/config is ro — no core.hooksPath, no ext:: remote' "$(g gitcfg)" ro
+  t 'member: no core.hooksPath survives the attempt' "$(g hookspath)" none
+  t 'member: a track worktree gitlink is ro — it cannot become a member git dir' "$(g trackgit)" ro
+  t 'member: its commondir is ro — the common dir cannot be re-pointed at member files' "$(g commondir)" ro
+  t 'member: a commit works and is the handle'"'"'s' "$(g commit)" "$h";  t 'member: cc-board writes the bind-mounted board' "$(g board)" track/t2
+  t 'member: claude.json copy = its projects, the cc-slack MCP only' "$(g mcp)" "${mcpw}0,"
+  t 'member: that copy holds NOTHING but projects and mcpServers — no oauthAccount, no userID (review-156e)' "$(g cjkeys)" mcpServers,projects;  t 'member: own pid namespace' "$(g pid1)" few;  t 'member: /tmp writable' "$(g tmp)" ok
+  out=$("$SELF" member "$o" -- true 2>&1); t 'member: a repo without the marker is refused' "${out#*: ~/dev/}" "$o is not a member workspace (no .cc/member-workspace)"
+  rm -f "$own"
+  git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
+  rm -rf "${dev:?}" "${H:?}/dev/${o:?}" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$H/.cc/state/$o" "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.lock" "$H/.cc/boards/$o.json" \
+         "$H/.cc/members/$h" "$H/.cc/slack/member/$h"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
   local r="_ccsbx$$" dev wt st n=0 bad=0 out want
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
@@ -79,7 +230,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     echo x > f && git add f && git -c user.name=t -c user.email=t@t commit -qm c >/dev/null 2>&1 && echo commit=ok || echo commit=broken
     echo gitconfig=$(git config user.name z 2>/dev/null && echo writable || echo ro); echo bin=$(touch ~/bin/x 2>/dev/null && echo writable || echo ro)
     echo tracks=$(ls ~/.cc/worktrees/'"$r"' | tr "\n" " "); echo states=$(ls ~/.cc/state/'"$r"' | tr "\n" " "); echo dev=$(ls -A ~/dev/'"$r"' | tr "\n" " ")
-    echo tok=${CLAUDE_CODE_OAUTH_TOKEN:+set}; echo cj=$(jq -r "(.projects|length),(.mcpServers|length)" ~/.claude.json | tr "\n" ","); echo settings=$(touch ~/.claude/settings.json 2>/dev/null && echo writable || echo ro)
+    echo tok=${CLAUDE_CODE_OAUTH_TOKEN:+set}; echo cj=$(jq -r "(.projects|length),(.mcpServers|length)" ~/.claude.json | tr "\n" ","); echo cjkeys=$(jq -r "keys|join(\",\")" ~/.claude.json); echo settings=$(touch ~/.claude/settings.json 2>/dev/null && echo writable || echo ro)
     echo tmp=$(touch /tmp/x && echo ok); echo runuser=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)' 2>&1)
   want='[false,false,0]'; jq -e '.claudeAiOauth.accessToken' "$H/.claude/.credentials.json" >/dev/null 2>&1 && want='[true,false,1]'   # the real file has one → the copy has it, no refresh token, nothing else
   t 'credentials: a stripped copy, mode 600' "$(g cred)" "${want}600";  t 'config/gh absent' "$(g gh)" absent;  t 'ccbox absent' "$(g ccbox)" absent;  t '.git/hooks is ro' "$(g hooks)" ro
@@ -89,15 +240,21 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   t 'a commit works' "$(g commit)" ok;  t '.git/config is ro' "$(g gitconfig)" ro;  t 'bin is ro' "$(g bin)" ro
   t 'only this track is there' "$(g tracks)" t;  t 'only this track state' "$(g states)" t;  t 'the rest of the repo is gone' "$(g dev)" .git
   t 'no token in the environment' "$(g tok)" "";  t 'claude.json copy: no other projects, no MCP' "$(g cj)" '0,0,'
+  t 'claude.json copy: only projects and mcpServers, nothing of the account' "$(g cjkeys)" mcpServers,projects
   t 'settings.json is ro' "$(g settings)" ro;  t '/tmp is writable' "$(g tmp)" ok;  t 'the host /run/user (its sockets) is not there' "$(g runuser)" 0
   # OFF: nothing changes — argv byte for byte, the environment untouched
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
   out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
+  selfcheck_member
   git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$dev" worktree remove --force "$H/.cc/worktrees/$r/u" >/dev/null 2>&1
   rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")"
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
-case "${1:-}" in selfcheck) selfcheck; exit $?;; esac
+case "${1:-}" in selfcheck) selfcheck; exit $?;;
+  member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ]; then tr="${1:-}"; shift; fi; [ "${1:-}" = -- ] && shift   # <handle> [<track>|""] [--] cmd
+          [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] -- <cmd...>" >&2; exit 2; }
+          launch_member "$h" "$tr" "$@";;
+esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
 [ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added

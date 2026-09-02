@@ -46,19 +46,33 @@ sp_track(){ local repo="$1" track="$2" base="$3" st="$STBASE/$1/$2"
 sp_main(){ local repo="$1" base="$2"
   printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<brief>\"' (the brief's one home is ~/.cc/state/$repo/<track>/task.md; add and --go only ever ADD to it — replacing one is 'cc board set $repo <track> instructions \"...\"') then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."; }
 member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
-MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed)."
+MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed — inside a member workspace's boundary it goes out over that workspace's own Slack link and reaches the owner, and tells you if it did not)."
 MEMBER_SPEND="$STBASE/member-spend.json"   # {"<handle>": {"day": "YYYY-MM-DD", "usd": n}} — the ledger behind the per-workspace daily cap
 member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> is one member's whole world: docs/design-member-workspaces.md (overlay)
-sandbox_gate(){   # $1 repo — NO member workspace session runs on this host. The owner's rule is that a workspace
-  # "should not be able to access or read anything outside" itself, and that is an execution boundary, not a
-  # blocklist: until member-sandbox ships the boundary (and the member-scoped Slack link with it), every launch
-  # for a workspace target is refused here, whoever asked — Slack autostart, the daemon, a person at the terminal.
-  # Inside the boundary CC_MEMBER_SANDBOX=1 is set and the same command works. See the design doc, "The boundary".
-  member_workspace "$1" || return 0
-  [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && return 0
-  echo "cc: ~/dev/$1 is a member workspace — its sessions run only inside the boundary (track member-sandbox), never on the host. Refused."
-  return 1
-}
+inside(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; }   # set by `cc-sandbox member`, never by hand: this process runs INSIDE a workspace's boundary
+member_credential(){   # $1 handle · $2 track ("" = the main session) — THE HOST'S HALF OF THE CREDENTIAL WALL. A workspace
+  # runs only on a credential minted for it at ~/.cc/members/<h>/credentials.json (cc-sandbox member refuses without one), but
+  # that refusal landed in a tmux pane nobody reads: a member's message autostarted a window that died with the reason in it,
+  # the board row said running, and neither the member nor the owner heard a thing (review-156d). So the same file is checked
+  # HERE, before any window or board write: without it #<h> gets one line (the member sees why there is no answer), the owner
+  # is paged once a day (a stamp beside the file; released when the page failed, so the next attempt retries), and nothing
+  # opens. Returns 1 = do not start.
+  local h="$1" tr="${2:-}" own="$HOME/.cc/members/$1/credentials.json" stamp="$HOME/.cc/members/$1/credential-asked" what day
+  [ -s "$own" ] && jq -e '.claudeAiOauth.accessToken' "$own" >/dev/null 2>&1 && return 0
+  what="\`$h\`"; [ -n "$tr" ] && what="\`$h/$tr\`"
+  echo "cc: $h has no credential of its own ($own) — nothing starts until one is minted there; #$h was told, the owner is paged (once a day)."
+  "$BIN/cc-slack" post -c "#$h" "$what has no session yet: this workspace needs a credential minted by the owner before it can answer. He has been asked." >/dev/null 2>&1 || true
+  day=$(date -u +%F); mkdir -p "$(dirname "$stamp")"
+  if [ "$(cat "$stamp" 2>/dev/null)" != "$day" ]; then
+    "$BIN/cc-notify" -t "$h" --owner -- "$what needs a credential minted: a message in #$h tried to start its session and there is none at $own. Put one there in the shape of ~/.claude/.credentials.json ({\"claudeAiOauth\": {\"accessToken\": …}}); the next message starts it." >/dev/null 2>&1 && echo "$day" > "$stamp"
+  fi
+  return 1; }
+# THE BOUNDARY (docs/design-member-workspaces.md). A member workspace's session and every worker it dispatches run inside
+# `cc-sandbox member <handle> [<track>]`: only ~/dev/<handle>, its tracks and its member-scoped Slack socket exist there. The
+# host side of a launch (tmux, the board row, the budget ledger, the window) is this script OUTSIDE; claude and cc-loop go
+# in. Inside there is no tmux and no ledger, so `cc <h> <track> --go` writes the brief and asks the daemon (cc-slack dispatch)
+# to run the same command out here. The bare internals (__run*) refuse a workspace repo outside the boundary: depth.
+MEMBER_WS_SP="This session belongs to a MEMBER WORKSPACE and runs INSIDE its boundary: only its own folder, its tracks and its Slack channels exist here — nothing else of the box does, by design, so never treat a missing path, socket or tool as a fault to work around. Reaching the owner works from in here: 'cc-notify -t \"<what>\" \"...\"' is delivered to him by the box (it exits non-zero if it was not), and reply(needs_owner) marks the thread for him. Dispatch work with 'cc <handle> <track> --go \"...\"' (the box runs it inside the same boundary and charges the workspace's daily budget); a track session is opened from Slack (#<handle>--<track>) or by the owner, never from here."
 member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_DAILY_USD/day. The cost is PRE-charged at
   # dispatch (budget x loops), so the cap bounds exposure rather than accounting for it, and the owner is told in the
   # workspace's own updates lane when it bites. Nothing here applies to any other repo.
@@ -112,12 +126,37 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
   exec 8>&-
   return 0
 }
+write_brief(){   # $st/task.md from $text — THE BRIEF HAS ONE HOME (see the --go case for the history)
+  mkdir -p "$st"
+  "$BOARD" get "$repo" "$track" instructions >/dev/null 2>&1   # migrates a pre-#94 board copy into the file, once
+  if [ -n "$text" ]; then
+    t0=$(printf '%s' "$text"); n=$(printf '%s' "$t0" | wc -c)   # both sides trailing-newline-stripped by $( )
+    if [ "$(head -c "$n" "$st/task.md" 2>/dev/null)" != "$t0" ]; then   # not already on top (a re-dispatch
+      { printf '%s\n' "$text"                                          # repeating its note): don't stack it up.
+        if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } > "$st/task.md.tmp"   # this only ever looks
+      mv "$st/task.md.tmp" "$st/task.md"                                # at the head, which this same code
+    fi                                                                  # wrote — never at the brief below it
+  else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi
+  return 0; }
 ensure_main(){ tmux has-session -t "$SESSION" 2>/dev/null || "$BIN/cc-boot"; }   # server creation goes through tmux-main.service (cgroup ownership; 2026-08-26 incident)
 attach_main(){ [ -t 0 ] || return 0; if [ -n "${TMUX:-}" ]; then tmux switch-client -t "$SESSION" 2>/dev/null || true; else exec tmux attach -t "$SESSION"; fi; }
 win_id(){ tmux list-windows -t "$SESSION" -F '#{window_id} #W' 2>/dev/null | awk -v n="$1" '$2==n{print $1; exit}'; }   # address windows by id: names with . or / break -t main:<name>
 have_window(){ [ -n "$(win_id "$1")" ]; }
 pane_live(){ local p; p=$(tmux list-panes -t "$(win_id "$1")" -F '#{pane_pid}' 2>/dev/null | head -1); [ -n "$p" ] && pgrep -P "$p" >/dev/null 2>&1; }   # wrapper bash always shows as pane cmd; a session/worker = it has a child
-default_branch(){ git -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || echo main; }
+# CC'S OWN GIT RUNS EXECUTE NOTHING OF THE REPO. Creating a worktree is plumbing, not a checkout somebody asked for, and
+# for a MEMBER workspace the repo's contents are written from inside a boundary: a post-checkout hook there would run out
+# here as the owner. cc-sandbox holds .git/config and .git/hooks read-only inside; this is the same wall from the outside.
+GITNH=(-c core.hooksPath=/dev/null)
+member_gitdir(){   # $1 repo $2 worktree → 0 when a member workspace's track really hangs off ~/dev/<handle>/.git (an ordinary repo always passes)
+  # The gitlink and the admin dir behind it are written from INSIDE the boundary (`cc <h> <t> --go` runs ensure_track in there), so `.git`
+  # can name a member git dir whose config carries core.fsmonitor or an ext:: remote — code the host-side `cc done` would run as the
+  # owner, hooksPath pin or not (review-156c). Nothing but this rev-parse touches the worktree until its common dir is the workspace's own.
+  member_workspace "$1" || return 0
+  local main gcd; main=$(git "${GITNH[@]}" -C "$DEV/$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$DEV/$1/.git")
+  gcd=$(git "${GITNH[@]}" -C "$2" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  [ "$gcd" = "$main" ] && return 0
+  echo "cc: refusing to run git in $2 — its .git resolves to ${gcd:-nothing}, not $main: a member workspace's track hangs off ~/dev/$1/.git or nothing runs in it"; return 1; }
+default_branch(){ git "${GITNH[@]}" -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || echo main; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
 lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
@@ -126,17 +165,17 @@ usage(){ sed -n '2,25p' "$0"; }
 ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
   local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base
   valid_name "$repo"; valid_name "$track"
-  git -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "cc: ~/dev/$repo is not a git repo — tracks need git"; exit 1; }
-  git -C "$DEV/$repo" check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "cc: '$branch' is not a usable branch name"; exit 1; }
+  git "${GITNH[@]}" -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "cc: ~/dev/$repo is not a git repo — tracks need git"; exit 1; }
+  git "${GITNH[@]}" -C "$DEV/$repo" check-ref-format --branch "$branch" >/dev/null 2>&1 || { echo "cc: '$branch' is not a usable branch name"; exit 1; }
   if [ ! -d "$wt" ]; then
-    mkdir -p "$WTBASE/$repo"; git -C "$DEV/$repo" worktree prune   # a hand-deleted dir stays registered ("missing but already registered")
-    git -C "$DEV/$repo" fetch -q origin 2>/dev/null || true; base=$(default_branch "$DEV/$repo")
-    if git -C "$DEV/$repo" show-ref --verify --quiet "refs/heads/$branch"; then git -C "$DEV/$repo" worktree add -q "$wt" "$branch"
-    elif git -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$branch"; then git -C "$DEV/$repo" worktree add -q --track -b "$branch" "$wt" "origin/$branch"   # re-created track: keep its upstream, don't fork from local HEAD
-    elif git -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then git -C "$DEV/$repo" worktree add -q -b "$branch" "$wt" "origin/$base"
-    else git -C "$DEV/$repo" worktree add -q -b "$branch" "$wt"; fi
-    git -C "$wt" rev-parse --show-toplevel >/dev/null 2>&1 || { rm -rf "$wt"; echo "cc: could not create the worktree $wt (git error above) — nothing was stamped"; exit 1; }
-    gcd=$(git -C "$DEV/$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$DEV/$repo/.git")
+    mkdir -p "$WTBASE/$repo"; git "${GITNH[@]}" -C "$DEV/$repo" worktree prune   # a hand-deleted dir stays registered ("missing but already registered")
+    git "${GITNH[@]}" -C "$DEV/$repo" fetch -q origin 2>/dev/null || true; base=$(default_branch "$DEV/$repo")
+    if git "${GITNH[@]}" -C "$DEV/$repo" show-ref --verify --quiet "refs/heads/$branch"; then git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q "$wt" "$branch"
+    elif git "${GITNH[@]}" -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$branch"; then git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q --track -b "$branch" "$wt" "origin/$branch"   # re-created track: keep its upstream, don't fork from local HEAD
+    elif git "${GITNH[@]}" -C "$DEV/$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q -b "$branch" "$wt" "origin/$base"
+    else git "${GITNH[@]}" -C "$DEV/$repo" worktree add -q -b "$branch" "$wt"; fi
+    git "${GITNH[@]}" -C "$wt" rev-parse --show-toplevel >/dev/null 2>&1 || { rm -rf "$wt"; echo "cc: could not create the worktree $wt (git error above) — nothing was stamped"; exit 1; }
+    gcd=$(git "${GITNH[@]}" -C "$DEV/$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$DEV/$repo/.git")
     mkdir -p "$gcd/info"; grep -qxF '.cc/' "$gcd/info/exclude" 2>/dev/null || echo '.cc/' >> "$gcd/info/exclude"
     mkdir -p "$wt/.cc"; printf '%s\n%s\n' "$repo" "$track" > "$wt/.cc/track"
     "$BIN/cc-trust" "$wt" >/dev/null 2>&1 || true
@@ -148,6 +187,8 @@ ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry
   [ -n "$("$BOARD" get "$repo" "$track" session_id)" ] || "$BOARD" set "$repo" "$track" session_id "$(cat /proc/sys/kernel/random/uuid)"
 }
 
+case "${1:-}" in __run|__runmain|__runplain|__runorch|__runnext)   # depth: a workspace session starts through __runmember → cc-sandbox member, never bare
+  r="${2%%/*}"; member_workspace "$r" && ! inside && { echo "cc: ~/dev/$r is a member workspace — its sessions run only inside the boundary (cc $r ...), never bare on the host. Refused."; exit 1; };; esac
 case "${1:-}" in
   "") ensure_main; attach_main; exit 0 ;;
   -h|--help) usage; exit 0 ;;
@@ -213,13 +254,22 @@ case "${1:-}" in
     mkdir -p "$wt/.cc"; exec 9>"$wt/.cc/done.lock"
     flock -w "${CC_DONE_LOCK_WAIT:-600}" 9 || { echo "cc: another 'cc done $repo $track' is still running — nothing opened"; exit 1; }   # CC_DONE_LOCK_WAIT: test hook
     base=$(default_branch "$DEV/$repo"); branch="track/$track"
-    ( cd "$wt" && CC_ROLE=worker "$BIN/cc-checkpoint" ) || true
+    member_gitdir "$repo" "$wt" || exit 1   # BEFORE any git runs in the worktree: a redirected .git is refused, not run (review-156c)
+    # the MAIN checkout's hooks, never the worktree's: a member could otherwise plant a git dir whose hooks this
+    # host-side commit would run as the owner (review-156b) — same pin cc-loop applies to its own git calls
+    hp=$(git -C "$DEV/$repo" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$DEV/$repo/.git/hooks";; /*) ;; *) hp="$DEV/$repo/$hp";; esac
+    HG=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp")
+    ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" ) || true
+    if member_workspace "$repo" && ! git -C "$wt" remote get-url origin >/dev/null 2>&1; then   # a workspace lives on the box alone: the branch IS the delivery
+      "$BOARD" status "$repo" "$track" done >/dev/null; "$BOARD" note "$repo" "$track" "cc done: no remote, so no PR — the work is on track/$track in ~/dev/$repo" >/dev/null 2>&1 || true
+      echo "done: $repo has no remote, so no PR — track/$track is committed in ~/dev/$repo"; exit 0; fi
     if git -C "$wt" remote get-url origin >/dev/null 2>&1; then   # a PR on an un-pushed branch is worse than no PR: stop here and say why
       # cc-checkpoint --push owns the push, lease and all — a worker that rebased its own branch would otherwise be
       # rejected non-fast-forward here and finish green with no PR at all (2026-08-31). Exit 2 is the one case the
       # lease refuses: something else wrote to the branch. It has already journalled and told the board; do not
       # open a PR over the top of it.
-      ( cd "$wt" && CC_ROLE=worker "$BIN/cc-checkpoint" --push ) || { echo "cc: push failed — no PR opened (reason above; also in $wt/.cc/push.err)"; exit 1; }
+      member_gitdir "$repo" "$wt" || exit 1   # the same wall in front of the push (review-156c)
+      ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --push ) || { echo "cc: push failed — no PR opened (reason above; also in $wt/.cc/push.err)"; exit 1; }
     fi
     title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"
     instr=$("$BOARD" get "$repo" "$track" instructions)   # the brief, from its one home: $STBASE/$repo/$track/task.md
@@ -246,7 +296,7 @@ case "${1:-}" in
     case "$real" in "$WTBASE"/?*/?*) ;; *) echo "cc: refusing to remove '$wt' — it resolves to $real, outside $WTBASE"; exit 1;; esac
     id=$(win_id "$repo/$track"); [ -n "$id" ] && tmux kill-window -t "$id" 2>/dev/null
     git -C "$DEV/$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$real"
-    git -C "$DEV/$repo" worktree prune 2>/dev/null; git -C "$DEV/$repo" branch -D "track/$track" >/dev/null 2>&1 || true
+    git "${GITNH[@]}" -C "$DEV/$repo" worktree prune 2>/dev/null; git -C "$DEV/$repo" branch -D "track/$track" >/dev/null 2>&1 || true
     "$BIN/cc-trust" rm "$wt" >/dev/null 2>&1 || true
     rm -rf "${STBASE:?}/${repo:?}/${track:?}"; rmdir "$WTBASE/$repo" "$STBASE/$repo" 2>/dev/null   # leave no empty per-repo shells behind
     "$BOARD" rm "$repo" "$track" >/dev/null 2>&1; echo "removed $repo/$track (remote branch, if pushed, left intact)"; exit 0 ;;
@@ -270,6 +320,19 @@ case "${1:-}" in
          args+=(--session-id "$sid"); "$BOARD" set "$repo" "$track" started true; fi
     "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
     "$CLAUDE" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+  __runmember)  # internal: a MEMBER WORKSPACE session — the host side. Board and dialog bookkeeping here; claude inside cc-sandbox member.
+    repo="$2"; track="${3:-}"; force_cont="${4:-}"; export CC_ROLE=member; args=()
+    if [ -n "$track" ]; then wt="$WTBASE/$repo/$track"; cd "$wt" || exit 1; win="$repo/$track"; sp="$(sp_track "$repo" "$track" "$(default_branch "$DEV/$repo")") $MEMBER_SP $MEMBER_WS_SP"
+      sid=$("$BOARD" get "$repo" "$track" session_id); started=$("$BOARD" get "$repo" "$track" started)
+      [ "$started" = True ] && ! compgen -G "$HOME/.cc/members/$repo/claude/projects/*/$sid.jsonl" >/dev/null 2>&1 && { sid=""; "$BOARD" note "$repo" "$track" "session transcript missing — new session id" >/dev/null 2>&1; }   # transcripts live in the member's own ~/.claude
+      if [ "$force_cont" = "-c" ]; then args+=(--continue)
+      elif [ "$started" = True ] && [ -n "$sid" ]; then args+=(--resume "$sid")
+      else [ -n "$sid" ] || { sid=$(cat /proc/sys/kernel/random/uuid); "$BOARD" set "$repo" "$track" session_id "$sid"; }
+           args+=(--session-id "$sid"); "$BOARD" set "$repo" "$track" started true; fi
+      "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
+    else cd "$DEV/$repo" || exit 1; win="$repo"; sp="$(sp_main "$repo" "$(default_branch "$DEV/$repo")") $MEMBER_SP $MEMBER_WS_SP"; fi
+    args+=(--append-system-prompt "$sp"); mapfile -t CH < <(chan_args "$win"); args+=("${CH[@]}"); chan_accept "$win"; mapfile -t MO < <(model_args); args+=("${MO[@]}")   # no --remote-control: a member session is not on the owner's phone
+    "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runnext)  # internal: the SUCCESSOR of an overlapping handoff (cc-handoff --overlap started this window)
     target="$2"; hid="$3"; sid="$4"; repo="${target%%/*}"; track=""; [ "$target" != "$repo" ] && track="${target#*/}"
     if [ -n "$track" ]; then wt="$WTBASE/$repo/$track"; else wt="$DEV/$repo"; fi
@@ -311,9 +374,9 @@ esac
 CONT=""; [ "$1" = "-c" ] && { CONT="-c"; shift; }
 repo="${1:?repo}"; track="${2:-}"; shift; [ -n "$track" ] && shift
 valid_name "$repo"
-sandbox_gate "$repo" || exit 1     # before anything is created or attached: this is every launch path's one door
-ensure_main; "$BIN/cc-trust" "$DEV/$repo" >/dev/null 2>&1 || true
+inside || { ensure_main; "$BIN/cc-trust" "$DEV/$repo" >/dev/null 2>&1 || true; }   # inside the boundary there is no tmux server and the trust copy is already made
 if [ "$track" = "--orch" ]; then
+  member_workspace "$repo" && { echo "cc: a member workspace has no orchestrators — its one session lives in #$repo"; exit 1; }
   alias="${1:-}"; brief="${2:-}"; [[ "$alias" =~ ^[a-z0-9-]{2,20}$ ]] || { echo "cc: --orch alias must match ^[a-z0-9-]{2,20}\$"; exit 1; }
   win="$repo@$alias"; lock "$HOME/.cc/win.lock"; fresh=""
   if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # the orch exited, only the fallback shell is left
@@ -331,7 +394,10 @@ if [ -z "$track" ]; then
   [ -d "$DEV/$repo" ] || { echo "cc: no ~/dev/$repo (typo? create it first: mkdir ~/dev/$repo)"; exit 1; }
   lock "$HOME/.cc/win.lock"
   if have_window "$repo" && ! pane_live "$repo"; then tmux kill-window -t "$(win_id "$repo")"; fi   # claude exited, only the fallback shell is left
-  if git -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1; then have_window "$repo" || tmux new-window -d -t "$SESSION" -n "$repo" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runmain %q' "$CLAUDE" "$SELF" "$repo")"
+  if member_workspace "$repo"; then inside && { echo "cc: inside the boundary this session is opened from Slack (#$repo) or by the owner, not from here"; exit 1; }
+    if ! have_window "$repo"; then member_credential "$repo" "" || { unlock; exit 1; }   # no credential, no window: #<h> and the owner are told instead
+      tmux new-window -d -t "$SESSION" -n "$repo" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runmember %q ""' "$CLAUDE" "$SELF" "$repo")"; fi   # the boundary: __runmember → cc-sandbox member
+  elif git "${GITNH[@]}" -C "$DEV/$repo" rev-parse --git-dir >/dev/null 2>&1; then have_window "$repo" || tmux new-window -d -t "$SESSION" -n "$repo" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runmain %q' "$CLAUDE" "$SELF" "$repo")"
   else have_window "$repo" || tmux new-window -d -t "$SESSION" -n "$repo" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runplain %q %q' "$CLAUDE" "$SELF" "$repo" "$CONT")"; fi
   unlock; [ -t 0 ] && tmux select-window -t "$(win_id "$repo")"; attach_main; exit 0
 fi
@@ -344,7 +410,11 @@ while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; s
 [ -n "$SESS" ] && { "$BOARD" set "$repo" "$track" kind session || exit 1; }
 case "$mode" in
   say) have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
-  go)  if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
+  go)  if inside; then   # INSIDE the boundary: no tmux, no ledger. The brief is written here (this state dir is the workspace's own);
+         # the launch is brokered — the daemon runs `cc <h> <track> --go ""` on the host: budget gate, window and boundary included.
+         mkdir -p "$st"; write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}"; fi
+       if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
+       if member_workspace "$repo"; then member_credential "$repo" "$track" || exit 1; fi   # before the cap: nothing is charged for a launch that cannot happen
        member_gate "$repo" || exit 1
        # THE BRIEF HAS ONE HOME: $st/task.md. It used to have two — that file and the board's `instructions` —
        # merged by substring on every dispatch, and that merge destroyed the brief it was dispatched with on FOUR
@@ -353,16 +423,7 @@ case "$mode" in
        # writes the file, and dispatching only ever ADDS to it — one atomic write, the note on top so the worker
        # reads it first. Replacing a brief stays an explicit act (`cc board set … instructions`), never a side
        # effect of dispatching. Regression tests: "the #71 case" in selftest.sh, and `cc-board selfcheck`.
-       mkdir -p "$st"
-       "$BOARD" get "$repo" "$track" instructions >/dev/null 2>&1   # migrates a pre-#94 board copy into the file, once
-       if [ -n "$text" ]; then
-         t0=$(printf '%s' "$text"); n=$(printf '%s' "$t0" | wc -c)   # both sides trailing-newline-stripped by $( )
-         if [ "$(head -c "$n" "$st/task.md" 2>/dev/null)" != "$t0" ]; then   # not already on top (a re-dispatch
-           { printf '%s\n' "$text"                                          # repeating its note): don't stack it up.
-             if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } > "$st/task.md.tmp"   # this only ever looks
-           mv "$st/task.md.tmp" "$st/task.md"                                # at the head, which this same code
-         fi                                                                  # wrote — never at the brief below it
-       else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi
+       write_brief || exit 1
        for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree
          [ "$(readlink -f /proc/$pid/cwd 2>/dev/null)" = "$(readlink -f "$wt")" ] || continue
          echo "cc: killing orphaned worker pid $pid in $wt" | tee -a "$st/loop.log"
@@ -373,11 +434,21 @@ case "$mode" in
        lock "$st/.lock"; [ -n "$(win_id "$win")" ] && tmux kill-window -t "$(win_id "$win")"
        pre=""; for v in CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_LIMIT_STAMP CC_WORKER_SANDBOX CC_WORKER_MODEL; do   # tests: the new tmux window has the server's env, not ours — carry the log-only flag (or the worker's DONE notice really posts) and the run's own log/stamp
          [ -n "${!v:-}" ] && pre="$pre$(printf '%s=%q ' "$v" "${!v}")"; done
-       tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
+       if member_workspace "$repo"; then   # the loop itself runs INSIDE the boundary; cc-loop's own cc-sandbox call is then a no-op (CC_WORKER_SANDBOX unset) — one wall, not two
+         tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%s%q member %q %q -- cc-loop %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$BIN/cc-sandbox" "$repo" "$track" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
+       else
+         tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
+       fi
        wm=""; k=0; while [ "$k" -lt "${#XTRA[@]}" ]; do [ "${XTRA[$k]}" = --model ] && wm="${XTRA[$((k+1))]:-}"; k=$((k+1)); done
        unlock; echo "worker started on $(worker_model "$wm") in tmux main:$win — watch: cc $repo $track ; log: $st/loop.log"; exit 0 ;;
 esac
 lock "$st/.lock"
 if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # dead window (claude exited, `exec bash`): recreate instead of attaching to a shell
-have_window "$win" || { tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf 'CC_CLAUDE=%q %q __run %q %q %q' "$CLAUDE" "$SELF" "$repo" "$track" "$CONT")"; "$BOARD" status "$repo" "$track" running >/dev/null 2>&1; }
+if ! have_window "$win"; then
+  if member_workspace "$repo"; then inside && { echo "cc: inside the boundary a track session is opened from Slack (#$repo--$track) or by the owner, not from here"; exit 1; }
+    member_credential "$repo" "$track" || { unlock; exit 1; }   # no credential: no window, and the row below never says running
+    tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf 'CC_CLAUDE=%q %q __runmember %q %q %q' "$CLAUDE" "$SELF" "$repo" "$track" "$CONT")"   # the boundary
+  else tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf 'CC_CLAUDE=%q %q __run %q %q %q' "$CLAUDE" "$SELF" "$repo" "$track" "$CONT")"; fi
+  "$BOARD" status "$repo" "$track" running >/dev/null 2>&1
+fi
 unlock; [ -t 0 ] && tmux select-window -t "$(win_id "$win")"; attach_main

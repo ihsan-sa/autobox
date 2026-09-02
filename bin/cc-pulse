@@ -41,9 +41,8 @@ Every one of those is one line in the log with its reason, and `cc-pulse --dry-r
 for every target while touching nothing — no tick, no log, no mark.
 
 NO PILEUPS. A session gets at most one tick per cycle, and none at all while it is mid-handoff (a successor is
-reading the journal — a tick would land on two sessions at once), while a DIALOG is open on its pane (typing
-would answer it, and a tool-permission prompt is the owner's to answer), while its pane is mid-turn (the last
-tick, or whatever the owner asked, is still unanswered) or while a tick from a previous run is younger than the
+reading the journal — a tick would land on two sessions at once), while its pane is mid-turn (the last tick, or
+whatever the owner asked, is still unanswered) or while a tick from a previous run is younger than the
 gap below. Each of those is one line in the log and nothing else.
 
 TWO SWITCHES, because a loop that wakes the whole machine must be stoppable by whoever it wakes:
@@ -80,14 +79,10 @@ DONE_ROW = ("merged", "done")                   # a row in one of these is histo
 BOARD_DUE = ("queued", "blocked", "todo")       # work WAITING to be picked up; todo = older boards' spelling.
                                                 # Everything else that is not DONE_ROW is work in flight — see due()
 WORKING_FOOTER = "esc to interrupt"             # Claude Code's footer for the whole of a turn (same string cc-slack reads)
-# A MODAL IS WAITING FOR A KEYPRESS. None of these dialogs shows the working footer, so the mid-turn test does
-# not cover them, and the tick — its Enter, or a digit inside a target name — would ANSWER the dialog: on a
-# tool-permission prompt that is an unattended approval of exactly what the owner is gated on. Captured off the
-# real TUI (Claude Code 2.1.252): the question line of every permission dialog, option 3 of a tool dialog (the
-# only marker left when the dialog is taller than the pane and the footer has scrolled off), and the footer the
-# permission, folder-trust and /model dialogs share. cc-msg carries the same list and refuses to type either way.
-DIALOG_MARKS = ("Do you want to", "No, and tell Claude what to do differently", "Esc to cancel",
-                "Enter to confirm", "Would you like to proceed?")
+# A MODAL WAITING FOR A KEYPRESS IS CC-MSG'S PROBLEM, NOT THIS ONE'S. The pulse used to carry its own copy of
+# the dialog strings and skip such a pane — which is exactly how, on 2026-09-01, twelve sessions sat behind a
+# model-limit prompt and every tick aimed at them was thrown away silently. cc-msg is the one deliverer: it
+# answers the prompts that are safe to answer, and queues the tick behind anything else until the pane is free.
 NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(@[a-z0-9-]{2,20})?")
 
 TICK = ("pulse: you are the independent engineer for {t}. Off the files, right now: {s}. Work the loop — "
@@ -216,11 +211,6 @@ def screen(wid):
 def working(s):
     """Is that pane mid-turn? The same test cc-slack makes."""
     return WORKING_FOOTER in s
-
-
-def dialog(s):
-    """Is a modal waiting for a keypress? See DIALOG_MARKS — this is the guard that must never be loosened."""
-    return any(m in s for m in DIALOG_MARKS)
 
 
 def handoff_open(target):
@@ -491,10 +481,6 @@ def pulse(target, r):
         # whole box's development, and the worst a tick costs is one line read by a session that is busy.
         r.log(target, "report", "cc-handoff could not answer — ticking anyway")
     scr = screen(w[0])
-    if dialog(scr):
-        r.log(target, "skip", "a dialog is open — typing here would answer it, and a permission prompt is the "
-                              "owner's to answer")
-        return
     if working(scr):
         r.log(target, "skip", "mid-turn — the last tick is still unanswered")
         return
@@ -512,7 +498,10 @@ def pulse(target, r):
         # window knows this session has already looked; a tick that carried something clears it, so the next
         # quiet one is a fresh look and not the tail of an old window.
         set_quiet(target, not anything)
-        r.log(target, "tick", f"live and idle — woken: {why_due}")
+        if (p.stdout or "").strip() == "queued":            # a dialog is up, or the pane went busy under us
+            r.log(target, "tick", "queued — cc-msg holds it until the pane is free, and reports a dialog that stands")
+        else:
+            r.log(target, "tick", f"live and idle — woken: {why_due}")
     else:
         r.log(target, "report", f"tick failed: {why(p)}")
 
@@ -776,12 +765,14 @@ def selfcheck():
            "msg beta " in did() and "ticking anyway" in since(L0))
         os.environ["CC_FAKE_HANDOFF_BROKEN"] = ""
 
-        # ---- (4) a dialog is open: the tick would ANSWER it
+        # ---- (4) a dialog is open: the tick is HANDED TO cc-msg, which answers it or queues behind it.
+        # Until 2026-09-01 the pulse skipped here and the tick was gone — twelve sessions sat behind a model-limit
+        # prompt and heard nothing all afternoon. The guard did not move, it moved INTO the one deliverer.
         os.environ["CC_FAKE_DIALOG"] = "@1"
         L0 = logged(); run("beta")
-        ok("(4) a pane with a permission dialog open is never typed at — a tick would answer a prompt that is "
-           "the owner's to answer, and no dialog shows the mid-turn footer",
-           "msg beta " not in did() and "a dialog is open" in since(L0))
+        ok("(4) a pane with a dialog open is still ticked THROUGH cc-msg — it answers a known-safe prompt or "
+           "queues the tick; the pulse never drops one on the floor",
+           "msg beta " in did() and "queued" in since(L0))
         os.environ["CC_FAKE_DIALOG"] = ""
 
         # ---- the per-target opt-out
@@ -962,9 +953,12 @@ printf '@%s\t%s\t%s\n' "$(( $(wc -l < "$CC_FAKE_TMUX") + 90 ))" "$1" "$CC_FAKE_N
 """
 
 FAKE_MSG = r"""#!/usr/bin/env bash
-# selfcheck stub for `cc-msg <window> <text>`: records who was typed at, and what.
+# selfcheck stub for `cc-msg <window> <text>`: records who was typed at, and what. Speaks the real contract —
+# with a dialog up on that window it prints "queued" (rc 0), because cc-msg spools instead of dropping.
 set -u
 printf 'msg %s :: %s\n' "${1:-}" "${2:-}" >> "$CC_FAKE_CALLS"
+case " ${CC_FAKE_DIALOG:-} " in *" @1 "*) [ "${1:-}" = beta ] && echo queued;; esac
+exit 0
 """
 
 FAKE_SCOPE = r"""#!/usr/bin/env bash

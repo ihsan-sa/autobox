@@ -434,18 +434,48 @@ mkdir -p "$GH/dev/alice/sub/.cc" "$GH/stray/.cc"; printf 'other\nt\n' > "$GH/dev
   && ok "a .cc/track inside a member workspace is just a file: the subdir is still alice's world (secrets and another repo's dispatch denied, its own dispatch allowed)" || bad "a member subdir's .cc/track promoted it to worker"
 [ "$(m Bash '{"command":"gh pr merge 1"}' "$GH/stray")" = 0 ] && [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 1"},"cwd":"%s"}' "$GH/stray" | env HOME="$GH" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] \
   && ok "...and outside ~/.cc/worktrees it is no track marker at all — CC_ROLE from the env still gates there" || bad "stray .cc/track honoured outside ~/.cc/worktrees"
-# THE BOUNDARY (owner, 2026-09-01): a member workspace session — interactive, main or worker — does not run on this
-# host at all until member-sandbox exists. Not a guard rule: `cc` and `cc-loop` refuse it themselves, whoever asks,
-# and CC_MEMBER_SANDBOX=1 (set inside the boundary) is the only thing that opens the door.
+# THE BOUNDARY (owner, 2026-09-01). member-sandbox has now BUILT it, so the invariant changed shape: a member
+# workspace session no longer refuses to start — it starts INSIDE `cc-sandbox member`. What must never happen is a
+# BARE one on this host, so `cc`'s own internals (__run*) refuse a workspace repo outside the boundary, cc-loop still
+# refuses it, and the window `cc` opens for a member target IS the boundary. A stub tmux records the command `cc`
+# would run instead of opening a window — the tmux server here is this box's live one.
 gout(){ env HOME="$GH" PATH="$B:$PATH" "$@" 2>&1; }
-o1=$(gout "$B/cc" alice todo --go x); r1=$?
+o1=$(gout "$B/cc" __run alice todo); r1=$?
+o1b=$(gout "$B/cc" __runmain alice)
 o2=$(gout "$B/cc-loop" alice todo); r2=$?
 o3=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo 2>&1)
 o4=$(env HOME="$GH" "$B/cc-loop" other todo 2>&1)
-[ "$r1" = 1 ] && [ "$r2" = 2 ] && grep -q 'member workspace' <<<"$o1" && grep -q boundary <<<"$o2" \
-  && ! grep -q boundary <<<"$o3" && ! grep -q boundary <<<"$o4" \
-  && ok "cc and cc-loop refuse to start a member workspace session on the host (the boundary is not a blocklist), and only CC_MEMBER_SANDBOX=1 opens it — an ordinary repo is untouched" \
-  || bad "member workspace session startable on the host (cc rc=$r1, cc-loop rc=$r2)"
+[ "$r1" = 1 ] && [ "$r2" = 2 ] && grep -q 'never bare on the host' <<<"$o1" && grep -q 'never bare on the host' <<<"$o1b" \
+  && grep -q boundary <<<"$o2" && ! grep -q boundary <<<"$o3" && ! grep -q boundary <<<"$o4" \
+  && ok "no BARE member workspace session on this host: cc's own internals and cc-loop refuse one outside the boundary, and CC_MEMBER_SANDBOX=1 is still the only thing that opens it — an ordinary repo is untouched" \
+  || bad "member workspace session startable bare on the host (cc rc=$r1, cc-loop rc=$r2)"
+mkdir -p "$T/stub" "$GH/dev/other"; printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$TMUX_STUB_LOG"\nexit 0\n' > "$T/stub/tmux"; chmod +x "$T/stub/tmux"
+sout(){ env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_CLAUDE=/bin/true "$@" >/dev/null 2>&1; }
+( cd "$GH/dev/alice" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init ) 2>/dev/null   # a track needs git; the guard cases above are done with this dir
+mkdir -p "$GH/.cc/members/alice"; echo '{"claudeAiOauth": {"accessToken": "not-a-token"}}' > "$GH/.cc/members/alice/credentials.json"   # the workspace's OWN credential (a fake: cc checks the shape, never uses it) — without one cc opens nothing, see the review-156d case below
+: > "$T/tmux.log"; sout "$B/cc" alice; sout "$B/cc" other; sout "$B/cc" alice todo --go 'do a thing'
+grep -q '__runmember alice' "$T/tmux.log" && grep -q 'cc-sandbox member alice todo -- cc-loop' "$T/tmux.log" \
+  && ! grep -q 'runmember other' "$T/tmux.log" && ! grep -q 'cc-sandbox member other' "$T/tmux.log" \
+  && ok "...and the window cc opens for a member target IS the boundary: the session runs \`cc __runmember\` (which execs cc-sandbox member) and a --go loop runs \`cc-sandbox member <handle> <track> -- cc-loop\`, one wall not two, while an ordinary repo gets neither" \
+  || bad "member launch is not inside the boundary: $(tr '\n' '|' < "$T/tmux.log")"
+# A REDIRECTED .git IS NOT THE HOST'S TO RUN (review-156c). A workspace track's gitlink and admin dir are written from INSIDE the
+# boundary, so `.git` can name a member git dir whose config carries core.fsmonitor = <payload> (or an ext:: remote), and `cc done
+# <h> <t>` on the host — what cc-loop's exit-4 message tells the owner to run — executed it as the owner: the hooksPath pin does not
+# reach it (measured before the fix: the payload ran, rc=0, "no remote, so no PR"). Now `cc done` resolves the worktree's common dir
+# before any other git touches it and refuses anything but ~/dev/<h>/.git — and a track that really hangs off it still finishes.
+git init -q "$GH/dev/alice/evil" && git -C "$GH/dev/alice/evil" symbolic-ref HEAD refs/heads/track/todo && git -C "$GH/dev/alice/evil" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init \
+  && git -C "$GH/dev/alice/evil" config core.fsmonitor "sh -c 'touch $T/fsmon-ran' _"   # the payload goes in LAST: set before the commit above, that commit itself would fire it
+printf 'gitdir: %s\n' "$GH/dev/alice/evil/.git" > "$GH/.cc/worktrees/alice/todo/.git"
+od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice todo 2>&1); rd=$?
+{ [ "$rd" = 1 ] && grep -q '^cc: refusing to run git in ' <<<"$od" && grep -qF "$GH/.cc/worktrees/alice/todo" <<<"$od" && [ ! -e "$T/fsmon-ran" ]; } \
+  && ok "cc done on a workspace track whose .git names a member git dir refuses, names the worktree, and ran no git in it (review-156c)" \
+  || bad "cc done ran git against a redirected .git: rc=$rd payload=$([ -e "$T/fsmon-ran" ] && echo RAN || echo no) $od"
+rm -rf "$GH/dev/alice/evil" "$GH/.cc/worktrees/alice/todo/.git"
+git -C "$GH/dev/alice" worktree add -q -b track/t2 "$GH/.cc/worktrees/alice/t2" 2>/dev/null   # the genuine article: a track hanging off ~/dev/alice/.git
+od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t2 2>&1); rd=$?
+{ [ "$rd" = 0 ] && ! grep -q 'refusing to run git' <<<"$od" && grep -q 'no remote, so no PR' <<<"$od"; } \
+  && ok "...and a track that really hangs off ~/dev/<handle>/.git passes the same check and finishes (no remote → no PR)" || bad "cc done refused a genuine workspace track: rc=$rd $od"
+git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t2" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t2 >/dev/null 2>&1
 o5=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 1e9 2>&1); r5=$?
 o6=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 5.5 2>&1)
 [ "$r5" = 2 ] && grep -q 'budget must be' <<<"$o5" && ! grep -q 'budget must be' <<<"$o6" \
@@ -464,7 +494,12 @@ for h in "$B"/cc-*; do ln -sf "$h" "$NB/$(basename "$h")"; done   # cc resolves 
 rm -f "$NB/cc-slack"   # …and only the Slack one is the stub (a copy, not a symlink: readlink -f would escape)
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"; exit "${CAP_SLACK_RC:-0}"\n' "$T/cap.args" > "$NB/cc-slack"
 chmod +x "$NB/cc-slack"; : > "$T/cap.args"
-cap(){ ( cd "$GH/dev/alice" && env HOME="$GH" CC_MEMBER_SANDBOX=1 MEMBER_DAILY_USD=5 CAP_SLACK_RC="${CAP_SLACK_RC:-0}" "$NB/cc" alice todo --go x 2>&1 ); }
+# THE CAP IS CHARGED ON THE HOST, so this fixture is the HOST path — the stub tmux, not CC_MEMBER_SANDBOX=1. That
+# variable used to be the flag that got a workspace past the old sandbox_gate; it now means "inside the boundary",
+# where `cc … --go` writes the brief and brokers the launch to the daemon (core/bin/cc, the `go)` case) because the
+# ledger ~/.cc/state/member-spend.json does not exist in there. Setting it here would test the broker, not the cap.
+cap(){ ( cd "$GH/dev/alice" && env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_CLAUDE=/bin/true \
+           MEMBER_DAILY_USD=5 CAP_SLACK_RC="${CAP_SLACK_RC:-0}" "$NB/cc" alice todo --go x 2>&1 ); }
 c1=$(cap); r1=$?; m1=$(grep -c -- '--mention' "$T/cap.args" 2>/dev/null)
 grep -q 'refused' <<<"$c1" && [ "$r1" = 1 ] && [ "$m1" = 1 ] \
   && grep -q -- '-c #alice --mention' "$T/cap.args" && grep -q -- '-c #alice-updates' "$T/cap.args" \
@@ -481,7 +516,39 @@ CAP_SLACK_RC=1 cap >/dev/null; m3=$(grep -c -- '--mention' "$T/cap.args" 2>/dev/
 [ -z "$mkA" ] && [ "$m3" = 2 ] \
   && ok "…and a mention nobody heard releases the day-stamp: a failed post is retried on the next refusal, not inherited as silence" \
   || bad "a failed mention kept its day-stamp (marker='$mkA', attempts=$m3)"
+rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
+# …and the other side of that same wall: INSIDE the boundary the very same command charges nothing and opens no
+# window — it writes the brief and hands the daemon a `dispatch`, which is what charges the cap out here.
+ci=$( ( cd "$GH/dev/alice" && env HOME="$GH" CC_MEMBER_SANDBOX=1 MEMBER_DAILY_USD=5 "$NB/cc" alice todo --go 'from inside' 2>&1 ) ); ri=$?
+[ "$ri" = 0 ] && grep -q -- 'dispatch alice/todo --loop' "$T/cap.args" && ! grep -q -- '--mention' "$T/cap.args" \
+  && [ ! -f "$GH/.cc/state/member-spend.json" ] && grep -q 'from inside' "$GH/.cc/state/alice/todo/task.md" \
+  && ok "…and inside the boundary the same dispatch is BROKERED, not charged: the brief is written to the workspace's own state dir and the daemon is asked to run it on the host, where the ledger and this cap actually live" \
+  || bad "a dispatch from inside the boundary did not broker (rc=$ri, args='$(cat "$T/cap.args" 2>/dev/null)'): $ci"
 rm -f "$GH/.cc/state/member-spend.json"
+# NO CREDENTIAL, NO WINDOW — AND SOMEBODY IS TOLD (review-156d). cc-sandbox member refuses a workspace without its own
+# credential, but it refused INSIDE the tmux window cc had already opened: a member's message autostarted a pane that died
+# with the reason in it, the board row said running, and neither the member nor the owner heard a thing. cc now checks the
+# file on the host before any window or board write — the session, the track session and a --go alike — and says so where
+# it counts: one line in #<h> each time, the owner paged ONCE (a day-stamp beside the file), nothing opened, nothing charged.
+# Same stub HOME and stub bots as the cap: the page is asserted on cc-notify's argv and never sent.
+rm -f "$NB/cc-notify"; printf '#!/usr/bin/env bash\nprintf "NOTIFY: %%s\\n" "$*" >> "%s"\n' "$T/cap.args" > "$NB/cc-notify"; chmod +x "$NB/cc-notify"
+nocred(){ ( env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_CLAUDE=/bin/true "$NB/cc" "$@" 2>&1 ); }
+rm -f "$GH/.cc/members/alice/credentials.json" "$GH/.cc/members/alice/credential-asked"; : > "$T/cap.args"; : > "$T/tmux.log"
+env HOME="$GH" "$B/cc-board" status alice todo queued >/dev/null 2>&1
+n1=$(nocred alice); rn1=$?; n2=$(nocred alice todo); rn2=$?; n3=$(nocred alice todo --go x); rn3=$?
+{ [ "$rn1" = 1 ] && [ "$rn2" = 1 ] && [ "$rn3" = 1 ] && grep -q 'no credential of its own' <<<"$n1$n2$n3" \
+  && ! grep -q 'new-window' "$T/tmux.log" && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] \
+  && [ "$(grep -c -- '^post -c #alice .*needs a credential minted' "$T/cap.args")" = 3 ] \
+  && [ "$(grep -c -- '^NOTIFY: -t alice --owner -- .*needs a credential minted' "$T/cap.args")" = 1 ] \
+  && [ "$(cat "$GH/.cc/members/alice/credential-asked")" = "$(date -u +%F)" ] && [ ! -f "$GH/.cc/state/member-spend.json" ]; } \
+  && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice hears why each time, the owner is paged once, the row never says running and nothing is charged" \
+  || bad "a workspace without a credential still died in a pane (rc=$rn1/$rn2/$rn3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $n1"
+: > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-asked"   # a page nobody heard releases the stamp: the next attempt pages again
+printf '#!/usr/bin/env bash\nprintf "NOTIFY: %%s\\n" "$*" >> "%s"; exit 1\n' "$T/cap.args" > "$NB/cc-notify"
+nocred alice >/dev/null; nocred alice >/dev/null
+[ "$(grep -c -- '^NOTIFY:' "$T/cap.args")" = 2 ] && [ ! -e "$GH/.cc/members/alice/credential-asked" ] \
+  && ok "…and a page that failed leaves no day-stamp, so the next attempt pages again instead of inheriting silence" \
+  || bad "a failed page kept its day-stamp (pages=$(grep -c -- '^NOTIFY:' "$T/cap.args"), stamp=$(cat "$GH/.cc/members/alice/credential-asked" 2>/dev/null))"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
@@ -648,6 +715,12 @@ N "$T/plain" -t "demorepo/w1 done" "PR: x"     # a REAL repo name: this fixture'
 N "$T/plain" --decision -t "demorepo blocked" "which database do I restore?"
 { grep -q -- '--mention' "$T/slack.args" && grep -q -- '--route demorepo blocked' "$T/slack.args"; } \
   && ok "--decision is rung 1: same route, plus --mention — the MAIN channel and a real @-mention of the owner" || bad "--decision did not ask for a mention: $(cat "$T/slack.args")"
+# …and the member's own words are a MESSAGE, never flags: the daemon relays them after `--`, so a member who writes
+# "--decision" is escalating that text, not buying rung 1 — and not silently sending an empty one either.
+N "$T/plain" --owner -- --decision
+{ grep -q -- '-c UOWNER' "$T/slack.args" && grep -q -- '--decision' "$T/slack.args" && ! grep -q -- '--mention' "$T/slack.args"; } \
+  && ok "after --, a message that looks like a flag is the message — text somebody else wrote cannot become an option" \
+  || bad "-- did not end the options: $(cat "$T/slack.args")"
 N "$T/chan" --decision "the staging DB restore needs your call"
 { grep -q -- '-c UOWNER' "$T/slack.args" && ! grep -q -- '--mention' "$T/slack.args"; } \
   && ok "--decision from a member-facing session still DMs the owner — a DM already IS rung 1, and the mention would have gone to the members" || bad "--decision leaked into the member channel: $(cat "$T/slack.args")"
@@ -667,26 +740,54 @@ printf 'SLACK_BOT_TOKEN=xoxb-test\n' > "$NH/.cc/config"   # owner not paired
 N "$T/chan" "Bob asks for an API key"
 { grep -q -- '-c #alerts' "$T/slack.args" && ! grep -q -- '--route' "$T/slack.args"; } \
   && ok "unpaired owner: the escalation falls back to #alerts, still not the member channel" || bad "unpaired escalation: $(cat "$T/slack.args")"
+# INSIDE A MEMBER WORKSPACE'S BOUNDARY (cc-sandbox member) ~/.cc/config is ABSENT, so every rung above is unconfigured:
+# `tried` stayed 0 and this exited 0 having written a tmpfs log and reached NOBODY — a blocked member told its
+# escalation worked. The one door out is the workspace's own socket; the daemon holds the token and makes the call.
+rm -f "$NH/.cc/config"
+M(){ : > "$T/slack.args"
+     ( cd "$T/chan" && env -u CC_NOTIFY_LOG_ONLY -u SLACK_BOT_TOKEN -u SLACK_OWNER_ID -u SLACK_WEBHOOK -u SLACK_ALERTS \
+           -u NTFY_TOPIC -u NTFY_SERVER -u CC_BOX CC_MEMBER_SANDBOX=1 HOME="$NH" \
+           CC_NOTIFY_LOG="$NH/.cc/notify.log" "$B/cc-notify" "$@" >/dev/null 2>&1 ); }
+M -t "alice help" "I am blocked and need the owner"; mrc=$?
+{ [ "$mrc" = 0 ] && grep -qx 'escalate -t alice help -p default' "$T/slack.args"; } \
+  && ok "inside a member boundary the escalation goes out over the workspace's socket (cc-slack escalate) — the config it cannot see is not the route" \
+  || bad "in-boundary escalation: rc=$mrc args=$(cat "$T/slack.args")"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$NH/bin/cc-slack"; chmod +x "$NH/bin/cc-slack"
+M -t "alice help" "nobody is listening"; mrc=$?
+[ "$mrc" != 0 ] \
+  && ok "…and when the link does not take it, cc-notify FAILS — exiting 0 having reached nobody is what a blocked member cannot afford" \
+  || bad "an escalation that reached nobody still exited 0"
 echo "== --say / --go / cc-loop =="
 "$B/cc" $REPO w1 --say hello >/dev/null 2>&1 && bad "--say should fail with no live session" || ok "--say refuses when no session"
 tmux new-window -d -t main -n "$REPO/m7" "sleep 30"; sleep 1   # M7: a headless worker's pane is a shell — typed text would run as a command
 "$B/cc-msg" "$REPO/m7" "hello" >"$T/m7.out" 2>&1; [ $? != 0 ] && grep -q 'task.md' "$T/m7.out" && ok "cc-msg refuses a window with no interactive claude" || bad "cc-msg typed into a headless pane"
 tmux kill-window -t "$(tmux list-windows -t main -F '#{window_id} #W' | awk -v n="$REPO/m7" '$2==n{print $1}')" 2>/dev/null
-# M8: a pane with a claude under it AND a dialog on screen. The text, or the Enter after it, would ANSWER the
-# dialog, and a tool-permission prompt answered by a script is an unattended approval of what the owner gates on.
+# M8: a pane with a claude under it AND a permission dialog on screen. The text, or the Enter after it, would
+# ANSWER the dialog, and a tool-permission prompt answered by a script is an unattended approval of what the owner
+# gates on — so it is not typed. It is not thrown away either (2026-09-01: twelve panes on a model-limit prompt,
+# every tick and secretary finding aimed at them refused and lost): it goes to that session's inbox spool, cc-msg
+# says "queued", and the 60 s drain hands it over once the pane is free.
 # The pane is a copy of bash named `claude` (coreutils refuses to run under another name) with `; true` at every
 # level (bash exec-replaces itself on a lone final command, and the process must stay a `claude`).
 mkdir -p "$T/fakebin"; cp "$(readlink -f /bin/bash)" "$T/fakebin/claude"
 printf 'echo "Do you want to proceed?"\n"%s" -c "sleep 30; true"\ntrue\n' "$T/fakebin/claude" > "$T/m8.sh"
 tmux new-window -d -t main -n "$REPO/m8" "bash $T/m8.sh"; sleep 1
 "$B/cc-msg" "$REPO/m8" "hello" >"$T/m8.out" 2>&1; m8=$?
-{ [ $m8 = 3 ] && grep -q 'dialog' "$T/m8.out"; } && ok "cc-msg refuses a pane with a dialog open — it would answer a permission prompt" || bad "cc-msg typed at a pane with a dialog open (rc=$m8): $(cat "$T/m8.out")"
+m8sp=~/.cc/state/$REPO/m8/inbox.spool
+{ [ $m8 = 0 ] && grep -q '^queued$' "$T/m8.out" && jq -e '.text == "hello"' "$m8sp" >/dev/null 2>&1; } \
+  && ok "cc-msg spools for a pane with a dialog open — it would answer a permission prompt, and a dropped message is how a session goes silent" \
+  || bad "cc-msg did not queue behind a dialog (rc=$m8): $(cat "$T/m8.out") · spool: $(cat "$m8sp" 2>/dev/null)"
+"$B/cc-msg" --drain "$REPO/m8" >/dev/null 2>&1
+jq -e '.text == "hello"' "$m8sp" >/dev/null 2>&1 \
+  && ok "…and the drain leaves it spooled while the dialog is still up" || bad "the drain typed into a pane with a dialog open"
 # M9: the same pane WITHOUT the dialog line — the guard must not be a permanent refusal, and this claude is a
 # GRANDCHILD of the pane, the shape `cc-handoff --overlap` starts and the old direct-child test called dead.
 printf 'bash -c \x27"%s" -c "sleep 30; true"; true\x27\ntrue\n' "$T/fakebin/claude" > "$T/m9.sh"
 tmux new-window -d -t main -n "$REPO/m9" "bash $T/m9.sh"; sleep 1
 "$B/cc-msg" "$REPO/m9" "hello" >"$T/m9.out" 2>&1; m9=$?
-[ $m9 = 0 ] && ok "cc-msg types at an overlap successor, whose claude is a grandchild of the pane" || bad "cc-msg refused a live session (rc=$m9): $(cat "$T/m9.out")"
+{ [ $m9 = 0 ] && [ ! -s "$T/m9.out" ] && [ ! -s ~/.cc/state/$REPO/m9/inbox.spool ]; } \
+  && ok "cc-msg types at an overlap successor, whose claude is a grandchild of the pane — delivered, silent, spool empty" \
+  || bad "cc-msg refused a live session (rc=$m9): $(cat "$T/m9.out")"
 for w in m8 m9; do tmux kill-window -t "$(tmux list-windows -t main -F '#{window_id} #W' | awk -v n="$REPO/$w" '$2==n{print $1}')" 2>/dev/null; done
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w1$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
@@ -1042,10 +1143,29 @@ setsid nohup "$T/ccslackd" daemon --no-slack >"$T/slackd.log" 2>&1 & SD=$!; KIDS
 [ "$("$B/cc-slack" inject --no-start $REPO queued-msg)" = queued ] && ok "inject with no subscriber → queued" || bad "queue"
 # the channel server links to the daemon only after the host's notifications/initialized (+2 s) — feed a real MCP handshake, then hold the pipe open
 rm -f "$T/fifo"; mkfifo "$T/fifo"; ( exec 3>"$T/fifo"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3; sleep 8; exec 3>&- ) & KIDS="$KIDS $!"
-CC_SLACK_CHANNEL=1 "$B/cc-slack" channel $REPO < "$T/fifo" > "$T/ch2.out" 2>/dev/null & KIDS="$KIDS $!"; sleep 3
+( cd ~/dev/$REPO && CC_SLACK_CHANNEL=1 "$B/cc-slack" channel $REPO ) < "$T/fifo" > "$T/ch2.out" 2>/dev/null & KIDS="$KIDS $!"; sleep 3   # from the session's OWN cwd: the daemon serves a hello only to the session it claims to be (member-sandbox)
 [ "$("$B/cc-slack" inject --no-start $REPO live-msg)" = delivered ] && ok "inject with a subscriber → delivered" || bad "deliver"
 sleep 5; grep -q queued-msg "$T/ch2.out" && grep -q live-msg "$T/ch2.out" && grep -q 'notifications/claude/channel' "$T/ch2.out" && ok "backlog flushed on subscribe + live event as notifications/claude/channel" || bad "channel notifications"
 grep -q '"role": "owner"' "$T/ch2.out" && ok "delivered meta carries role (a local inject is owner-level)" || bad "role in delivered meta"
+# THE SOCKET IS NOT A HOLE THROUGH cc-guard (member-sandbox, audit row slack-socket). One mechanism, shared with the
+# member proxy: SO_PEERCRED must be this user, a `hello` is served only to a process whose cwd IS the target it claims
+# (so no local process can subscribe as another session and take its messages), and the owner-level {"post"} verb —
+# which posted anywhere as the bot for anyone on the box — is gone from the socket altogether.
+cat > "$T/sockask.py" <<'EOS'
+import json, os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["CC_SLACK_DIR"] + "/sock")
+s.sendall((sys.argv[1] + "\n").encode()); s.shutdown(socket.SHUT_WR); s.settimeout(4)
+try:                              # a hello that is SERVED says nothing back: it is a subscriber now, and stays one
+    sys.stdout.write(s.makefile("rb").readline().decode())
+except Exception:
+    pass
+EOS
+hp=$(cd "$T" && timeout 5 python3 "$T/sockask.py" "{\"hello\": \"$REPO\", \"pid\": 1}")
+hq=$(cd ~/dev/$REPO && timeout 5 python3 "$T/sockask.py" "{\"hello\": \"$REPO\", \"pid\": 1}")
+pp=$(timeout 5 python3 "$T/sockask.py" '{"post": "C1", "text": "as the bot"}')
+grep -q 'not that session' <<<"$hp" && [ -z "$hq" ] && grep -q 'not a socket verb' <<<"$pp" \
+  && ok "the daemon socket refuses a hello from a process that is not that session (cwd check on SO_PEERCRED's pid) and serves one from the session's own cwd, and the owner-level post verb is gone" \
+  || bad "socket peer check (foreign hello: ${hp:0:60} | own cwd: ${hq:0:60} | post: ${pp:0:60})"
 "$B/cc-slack" 2>&1 | grep -q -- 'PRIVATE unless --public' && "$B/cc-slack" 2>&1 | grep -q 'ANYONE who can post in a routed channel is heard' \
   && ok "help: channels are private by default; anyone in a routed channel is heard" || bad "cc-slack help policy"
 "$B/cc-slack" 2>&1 | grep -q 'EVERY channel the bot is in answers' \

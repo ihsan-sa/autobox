@@ -66,7 +66,7 @@ handoff, so `<id>.done` and not the variable is what says one is still open — 
 CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT (~/.cc/config) ·
 CC_HANDOFF_DIR, CC_CTX_RECORDS (test hooks: put the record and the ledger somewhere else).
 """
-import json, os, re, shlex, subprocess, sys, time, uuid
+import fcntl, json, os, re, shlex, shutil, subprocess, sys, time, uuid
 
 STATE = os.path.expanduser("~/.cc/state")
 HANDOFF = os.environ.get("CC_HANDOFF_DIR") or os.path.join(STATE, "handoff")
@@ -517,7 +517,8 @@ def kick(target, hid=""):
                 asked = True                       # cc-slack watches that window for 3 min of its own accord
         elif up and (seen or tries or prompt_rendered(wid) or time.time() >= deadline):
             tries += 1                             # at the deadline with nothing recognisable drawn: one try, judged like any other
-            run([os.path.join(BIN, "cc-msg"), win, text])      # refuses by itself while a dialog is up
+            run([os.path.join(BIN, "cc-msg"), win, text])      # never types over a dialog: it answers a known-safe
+                                                   # prompt, else spools (and collapses these retries into one line)
             for _ in range(5):                     # the TUI takes a moment to echo a turn
                 time.sleep(pause)
                 if landed(wid, text):
@@ -671,6 +672,23 @@ def derive(rec):
         cmds += ([";"] if cmds else []) + ["rename-window", "-t", suc, target]
     if cmds:
         tmux(*cmds)
+    # kick() spooled the opening prompt under the successor's STARTUP name (<target>~next); the rename above would
+    # strand that mail forever (review-157b) — it moves with the window, appended behind anything already spooled
+    # for the live name, and the ~next state dir (only ever cc-msg inbox files; `~` is not legal in a name) goes too.
+    nxt = os.path.join(STATE, target + NEXT)
+    nsp = os.path.join(nxt, "inbox.spool")
+    if os.path.exists(nsp):
+        tdir = os.path.join(STATE, target)
+        os.makedirs(tdir, exist_ok=True)
+        # UNDER CC-MSG'S OWN LOCK. Its 60 s drain rewrites <target>/inbox.spool as `tail -n +2 > tmp && mv`, so an
+        # append landing between that tail and its mv is replaced by the mv — and the rmtree below then deletes the
+        # only other copy, which is the exact stranding this hunk exists to prevent. Same file, same .inbox.lock.
+        with open(os.path.join(tdir, ".inbox.lock"), "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            with open(nsp) as src, open(os.path.join(tdir, "inbox.spool"), "a") as dst:
+                dst.write(src.read())
+            shutil.rmtree(nxt, ignore_errors=True)     # inside the lock: nothing is deleted that is not yet copied
+    shutil.rmtree(nxt, ignore_errors=True)             # …and the ~next dir goes whether or not it held mail
     if (rec["predecessor"].get("window"), rec["successor"].get("window"), rec["successor"].get("tmux")) != (old, target, suc):
         rec["predecessor"]["window"], rec["successor"]["window"], rec["successor"]["tmux"] = old, target, suc
         write(rec)
@@ -723,10 +741,10 @@ def relay(payload):
     the successor's window (cc-msg <target>) and blocked here with a pointer; once the drain is over (phase
     `retired`) it is refused with the pointer. Prints NOTHING — the hook then does nothing — in every other
     case: another session, a slash command (that is for THIS TUI: /exit is how a human ends it), a turn the harness
-    or a peer wrote (NOT_A_PERSON), the handoff's own line to the predecessor, and a relay cc-msg could not deliver
-    (a dialog up in the successor): then the
-    prompt stays with the session it was typed into, which is alive and answers it, and the journal keeps a copy.
-    Nothing typed is ever lost."""
+    or a peer wrote (NOT_A_PERSON), the handoff's own line to the predecessor, and a relay cc-msg could not take at
+    all (no window, no interactive claude there): then the prompt stays with the session it was typed into, which
+    is alive and answers it, and the journal keeps a copy. A relay cc-msg QUEUED (the successor's pane is busy or
+    holds a dialog) counts as relayed — its drain delivers it. Nothing typed is ever lost."""
     text = payload.get("prompt") or ""
     if not text.strip():
         return 0
@@ -805,6 +823,9 @@ def retire(target):
     nid = win_id(target + NEXT)                    # a successor still on its startup name: a cutover older than this code
     if nid and not win_id(target):
         tmux("rename-window", "-t", nid, target)
+    # mail addressed to the retired window dies with it: RETIRE_MSG may have spooled under <target>~old, and a
+    # spool whose window is gone would otherwise stand as junk and be reported as stranded (review-157b)
+    shutil.rmtree(os.path.join(STATE, target + OLD), ignore_errors=True)
     rec["phase"] = "done"
     ledger(rec, "overlap-retired")
     write(rec)
@@ -904,7 +925,7 @@ def replace(target, over=None):
     if not run([os.path.join(BIN, "cc-msg"), target,
                 f"Handoff: append to {jrn} a dated handoff entry for a fresh session — what is done, what is "
                 f"next (ordered), gotchas/decisions — then run /exit."]):
-        print(f"cc-handoff: cc-msg could not reach {target} (dialog open, or no interactive session) — "
+        print(f"cc-handoff: cc-msg could not reach {target} (no window, or no interactive session there) — "
               f"not restarting", file=sys.stderr)
         return 1
     for _ in range(120):
@@ -1095,7 +1116,7 @@ def selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the harness switch reroutes alert(); these cases assert the REAL path via the stubbed run()
     import tempfile
-    global HANDOFF, RECORDS, win_id, pane_live, pane_live_id, tmux, run, notify, alert, self_wid, age
+    global HANDOFF, RECORDS, STATE, win_id, pane_live, pane_live_id, tmux, run, notify, alert, self_wid, age
     real_alert = alert
     p = f = 0
 
@@ -1111,6 +1132,7 @@ def selfcheck():
     with tempfile.TemporaryDirectory() as d:
         HANDOFF = os.path.join(d, "handoff")
         RECORDS = os.path.join(d, "context")
+        STATE = os.path.join(d, "state")               # derive/retire touch spool dirs under it: never the real one
         # nothing real is started, killed or pushed from a selfcheck: tmux and the shell-outs are stubbed
         wins, msgs, dead, me, tcalls, panes = {"r1": "@1"}, [], set(), [""], [], {}
 
@@ -1172,8 +1194,10 @@ def selfcheck():
             msgs.append(list(argv))
             if argv[0].endswith("cc-slack") and argv[1:2] == ["accept-dialog"]:
                 tui["asked"][argv[2]] = time.time()
-            if argv[0].endswith("cc-msg"):        # the keyboard: keys reach whatever is in FRONT of the pane —
-                wid = wins.get(argv[1])           # a dialog if one is up (cc-msg refuses), else the session
+            if argv[0].endswith("cc-msg"):        # the keyboard: keys reach whatever is in FRONT of the pane, so
+                wid = wins.get(argv[1])           # the stub fails where cc-msg would not type — no window, or a
+                                                  # dialog it may not answer (the real one spools there; a handoff
+                                                  # that cannot type NOW is what these cases are about)
                 if wid is None or any(x in shown(wid) for x in ("Enter to confirm", "development channels")):
                     return False
                 tui["typed"].append((wid, argv[2], time.time()))
@@ -1437,6 +1461,39 @@ def selfcheck():
         ok("a predecessor that already exited still ends, renames and clears",
            retire("r3") == 0 and wins.get("r3") == r["successor"]["tmux"] and "r3~old" not in wins
            and read("r3") is None)
+
+        # kick() spools the opening prompt under the STARTUP name; cutover moves it to the live name, and
+        # retirement removes mail addressed to the dead ~old window (review-157b: both were stranded forever).
+        os.makedirs(os.path.join(STATE, "r9~next"), exist_ok=True)
+        with open(os.path.join(STATE, "r9~next", "inbox.spool"), "w") as fh:
+            fh.write('{"text":"opening prompt"}\n')
+        r = cutover("r9")
+        ok("cutover moves the ~next spool to the live name — the opening prompt is not stranded by the rename",
+           not os.path.exists(os.path.join(STATE, "r9~next"))
+           and open(os.path.join(STATE, "r9", "inbox.spool")).read() == '{"text":"opening prompt"}\n')
+        # ...and it takes cc-msg's own lock while it does it: the 60 s drain rewrites that same file as tail+mv,
+        # so an append the drain did not see is replaced by its mv — and the rmtree then deletes the only copy.
+        held, _fl = [], fcntl.flock
+        fcntl.flock = lambda fh, op: held.append((getattr(fh, "name", ""), op,
+                                                  os.path.exists(os.path.join(STATE, "r14", "inbox.spool"))))
+        try:
+            os.makedirs(os.path.join(STATE, "r14~next"), exist_ok=True)
+            with open(os.path.join(STATE, "r14~next", "inbox.spool"), "w") as fh:
+                fh.write('{"text":"opening prompt"}\n')
+            cutover("r14")
+        finally:
+            fcntl.flock = _fl
+        ok("...holding cc-msg's own .inbox.lock, taken before a byte is written and released after the ~next dir "
+           "is gone — outside it the drain's mv wins and the moved prompt is deleted with the dir it came from",
+           held[:1] == [(os.path.join(STATE, "r14", ".inbox.lock"), fcntl.LOCK_EX, False)]
+           and open(os.path.join(STATE, "r14", "inbox.spool")).read() == '{"text":"opening prompt"}\n'
+           and not os.path.exists(os.path.join(STATE, "r14~next")))
+
+        os.makedirs(os.path.join(STATE, "r9~old"), exist_ok=True)
+        with open(os.path.join(STATE, "r9~old", "inbox.spool"), "w") as fh:
+            fh.write('{"text":"retire msg"}\n')
+        ok("...and retirement leaves no ~old junk: mail addressed to the dead window dies with it",
+           retire("r9") == 0 and not os.path.exists(os.path.join(STATE, "r9~old")))
 
         r = cutover("r4")
         me[0] = r["predecessor"]["tmux"]                # --retire called from the very window it would kill

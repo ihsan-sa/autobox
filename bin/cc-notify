@@ -23,6 +23,8 @@
 #   escalation routed there reaches everyone except the one person it is for. Unpaired owner: #alerts, never that channel.
 #   The session dir's name — which is its channel's too — becomes the default title.
 # NEVER PUSHED: anything naming a synthetic test repo (_cctest…, _selfcheck…) is logged and stops there.
+# INSIDE A MEMBER BOUNDARY (CC_MEMBER_SANDBOX=1): none of the config below exists there, so the message goes out over the
+#   workspace's own socket instead (`cc-slack escalate`) and the daemon delivers it to the owner. A failure exits 1.
 # Env: CC_NOTIFY_LOG_ONLY (log, never push) · CC_NOTIFY_LOG (test hook: write the log somewhere else, so a run counts
 #   its own lines instead of the owner's).
 set -uo pipefail
@@ -51,7 +53,7 @@ d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
   [ -f "$d/.cc/member-facing" ] && { owner=1; from=${d##*/}; break; }; d=${d%/*}; done
 [ -n "$from" ] && title="$from escalation"
 while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
-  --decision) decision=1; shift;; *) break;; esac; done
+  --decision) decision=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
 printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n' ' ')" >> "$LOG"
 # THROWAWAY TEST STATE MUST NEVER PAGE THE OWNER. Selfchecks and selftests work on synthetic repos named
@@ -68,6 +70,13 @@ case " $title $msg " in
     echo "cc-notify: synthetic test state, logged and not pushed ($title)" >&2; exit 0;;
 esac
 [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && exit 0   # tests set this: log, never push
+# INSIDE A MEMBER WORKSPACE'S BOUNDARY (cc-sandbox member) there is no ~/.cc/config and no token: every rung below is
+# unconfigured, `tried` stays 0 and this would exit 0 having reached NOBODY — a blocked member told its escalation
+# worked. The one door out is the workspace's own socket; the daemon holds the token and delivers to the owner.
+if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
+  printf '%s' "$msg" | "$HOME/bin/cc-slack" escalate -t "$title" -p "$prio" && exit 0
+  echo "cc-notify: the workspace's Slack link did not take this — it is in $LOG and nowhere else" >&2; exit 1
+fi
 # post <url> <curl args...> — url via -K (kept out of argv/ps), body via stdin (a message starting with @ is text, not a filename)
 post() { local u=$1; shift; curl -sS --fail --max-time 10 --data-binary @- -K <(printf 'url = "%s"\n' "$u") "$@" >/dev/null 2>&1; }
 tried=0; ok=0

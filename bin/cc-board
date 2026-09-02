@@ -2,7 +2,7 @@
 """cc-board — shared per-repo task/status board for orchestrated Claude sessions.
 Board file: ~/.cc/boards/<repo>.json  (sidecar; never in git, so no merge noise).
 Every orchestrated session reads/writes it so sessions know what the others are doing."""
-import sys, os, json, time, fcntl, calendar
+import sys, os, json, time, fcntl, calendar, errno
 BOARDS = os.path.expanduser("~/.cc/boards")
 # ONE VOCABULARY with the App Home tab (§02 of the Home handoff: the word is "queued", never "todo"). The board used to
 # write `todo` and the tab only printed "queued" by accident — `todo` is not a state it knows, so it fell through the
@@ -58,12 +58,28 @@ def _load(repo):
     p = bpath(repo)
     if not os.path.exists(p): return None
     with open(p) as f: return json.load(f)
+# A rename that may fall back to writing in place — for ONE reason. Inside a member boundary the board FILE is bind-mounted
+# (cc-sandbox member) and nothing can be renamed over a mount point: rename(2) says EBUSY (measured; EXDEV/EINVAL/EPERM are
+# the other spellings a mount can give). A full disk, an I/O error or a read-only filesystem are NOT that: the first version
+# caught every OSError and `open(path, "w")` then truncated the live board to nothing before its write failed again — one
+# `cc-board note` on a full disk emptied a repo's board (review-156d). So the errno must be the mount's, the text is in
+# memory before the target is opened, and everything else re-raises with the previous board intact.
+MOUNT_ERRNOS = (errno.EBUSY, errno.EXDEV, errno.EINVAL, errno.EPERM)
 def _save(repo, d):
     os.makedirs(BOARDS, exist_ok=True)
     d["updated"] = now()
-    tmp = bpath(repo) + ".tmp"
+    p, tmp = bpath(repo), bpath(repo) + ".tmp"
     with open(tmp, "w") as f: json.dump(d, f, indent=2)
-    os.replace(tmp, bpath(repo))
+    try:
+        os.replace(tmp, p)               # atomic: the inode is swapped, a reader sees the old board or the new one
+    except OSError as e:
+        if e.errno not in MOUNT_ERRNOS:
+            try: os.unlink(tmp)          # the .tmp is garbage (and on a full disk, the space it took)
+            except OSError: pass
+            raise
+        with open(tmp) as f: text = f.read()
+        with open(p, "w") as f: f.write(text)   # in place, under the same lock every writer holds
+        os.unlink(tmp)
 class Lock:
     def __init__(self, repo):
         os.makedirs(BOARDS, exist_ok=True)
@@ -361,6 +377,31 @@ def selfcheck():
         lo, bo = run("list").stdout, run("boards").stdout.split()
         ok("…while the run that made a fixture — any process under its <pid> — sees it as a board without --all",
            f"{own}\tw1\trunning" in lo and "_cctest99999999" not in lo and bo == [own, "r"])
+        # A FAILED RENAME LEAVES THE PREVIOUS BOARD (review-156d). The in-place fallback exists for the bind-mounted board
+        # inside a member boundary — rename over a mount point is EBUSY — and for nothing else: a full or read-only disk used
+        # to truncate the live board to zero bytes on the way to failing. os.replace is stood in for; the board dir is this
+        # run's own; _save is called in-process, the way every writer calls it.
+        global BOARDS
+        real_boards, real_replace = BOARDS, os.replace
+        BOARDS = f"{th}/.cc/boards"
+        try:
+            before = open(f"{th}/.cc/boards/r.json").read()
+            def failing(code):
+                def rep(a, b): raise OSError(code, os.strerror(code))
+                return rep
+            for code in (errno.ENOSPC, errno.EROFS, errno.EIO):
+                os.replace = failing(code)
+                try: _save("r", {"repo": "r", "tracks": {}}); raised = False
+                except OSError as e: raised = e.errno == code
+                ok(f"a rename that fails with {errno.errorcode[code]} (full or read-only target) re-raises and leaves the previous board intact",
+                   raised and open(f"{th}/.cc/boards/r.json").read() == before and not os.path.exists(f"{th}/.cc/boards/r.json.tmp"))
+            os.replace = failing(errno.EBUSY)
+            _save("r", {"repo": "r", "tracks": {"z": {"status": "queued", "title": "in place"}}})
+            ok("…while the mount point's EBUSY writes in place, whole, and clears the .tmp",
+               json.load(open(f"{th}/.cc/boards/r.json"))["tracks"] == {"z": {"status": "queued", "title": "in place"}}
+               and not os.path.exists(f"{th}/.cc/boards/r.json.tmp"))
+        finally:
+            BOARDS, os.replace = real_boards, real_replace
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-board selfcheck: {n} failed")

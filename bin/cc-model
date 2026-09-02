@@ -91,12 +91,19 @@ type_into(){   # $1 pane id · $2 window name · $3 text. cc-msg IS the box's ty
                # reimplement either. It types by WINDOW name, so a split window is typed at its active pane; a claude
                # pane that is NOT its window's active pane is refused here, lands in model-skipped and is retried on a
                # later tick — cc-msg would type the /model line into whatever pane IS active and run it as a command.
+               # So does a line cc-msg only QUEUED: spooled is not typed, and a retune nobody typed is not done.
                # The direct tmux path below is for the test session only, where cc-msg's contract (session main, a real
                # interactive claude) cannot hold — the selfcheck and selftest run against `cat` in a scratch server.
-  local id="$1" name="$2" text="$3"
+  local id="$1" name="$2" text="$3" out
   if [ "$SESSION" = main ] && [ "$PROC" = claude ] && [ -x "$BIN/cc-msg" ]; then
     [ "$(tmux display-message -p -t "$id" '#{pane_active}' 2>/dev/null)" = 1 ] || return 1
-    "$BIN/cc-msg" "$name" "$text" >/dev/null 2>&1 || return 1
+    # QUEUED IS NOT TYPED. cc-msg answers rc 0 both when it typed the line and when it only SPOOLED it behind a
+    # dialog or a busy pane — that is its contract, and cc-slack, cc-pulse and cc-handoff read it. But a /model
+    # line sitting in a spool has retuned nothing: the "Switch model?" answer below would press at a dialog that
+    # is not there, and the drain types the line a minute later with nobody to confirm it, leaving the session on
+    # the exhausted model while the log says it switched. Queued = not done: skipped, and retried on a later tick.
+    out=$("$BIN/cc-msg" "$name" "$text" 2>/dev/null) || return 1
+    [ "$(printf '%s' "$out" | tr -d '\r' | tail -1)" = queued ] && return 1
   else
     tmux capture-pane -p -t "$id" 2>/dev/null | grep -q 'Enter to confirm' && return 1
     tmux send-keys -t "$id" -l -- "$text" 2>/dev/null || return 1
@@ -400,6 +407,28 @@ JSON
   t 'the fixture is a real result: subagent_stats.refused is in it' "$(jq -r '.subagent_stats.refused|keys|length' "$real")" 3
   t 'the fixture is a real result: 429 sits inside its uuid'        "$(jq -r '.uuid' "$real" | grep -c 429)" 1
   t 'the fixture is a real result: the haiku side-call is in it'    "$(jq -r '[.modelUsage|keys[]|select(test("haiku"))]|length' "$real")" 1
+
+  # type_into: QUEUED IS NOT TYPED (review of #157). cc-msg answers rc 0 for a line it typed AND for one it only
+  # spooled behind a dialog; counting the second as a retune leaves the session on the exhausted model and never
+  # retries it. Its own tmux and cc-msg are stubs here — this asserts the verdict, not the keyboard.
+  local ti_bin="$BIN" ti_sess="$SESSION" ti_proc="$PROC"
+  mkdir -p "$d/bin"
+  cat > "$d/bin/cc-msg" <<'STUB'
+#!/usr/bin/env bash
+[ -n "${CC_FAKE_MSG_OUT:-}" ] && printf '%s\n' "$CC_FAKE_MSG_OUT"
+exit "${CC_FAKE_MSG_RC:-0}"
+STUB
+  chmod +x "$d/bin/cc-msg"
+  tmux(){ case "${1:-}" in display-message) echo 1;; capture-pane) printf '> \n';; esac; return 0; }
+  BIN="$d/bin"; SESSION=main; PROC=claude; CC_MODEL_DIALOG_WAIT=0
+  CC_FAKE_MSG_OUT=queued type_into '%1' demo/t1 '/model opus'
+  t 'a /model line cc-msg only spooled is NOT a retune: the pane is skipped, and F3 retries it' "$?" 1
+  CC_FAKE_MSG_OUT='' type_into '%1' demo/t1 '/model opus'
+  t '...while a line it typed counts, silent and rc 0 as cc-msg reports a delivery' "$?" 0
+  CC_FAKE_MSG_RC=1 type_into '%1' demo/t1 '/model opus'
+  t '...and a pane cc-msg refuses outright is skipped as it always was' "$?" 1
+  unset -f tmux; BIN="$ti_bin"; SESSION="$ti_sess"; PROC="$ti_proc"; unset CC_MODEL_DIALOG_WAIT
+
   b ok      '.'
   b capped  '.subtype="error_max_turns" | .is_error=true | .stop_reason="tool_use" | .terminal_reason="max_turns" | .errors=["Reached maximum number of turns (80)"] | .result="Wrote the gate. The `.env.local` write was refused, and the old model id is deprecated, so I stopped there."'
   b limit429 '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=429 | .result="You'"'"'re out of usage credits. Switch to another model, or manage usage credits at the settings page, to continue."'

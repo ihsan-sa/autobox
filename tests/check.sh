@@ -20,7 +20,9 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # against its own fixtures in a HOME of its own — never this box's board.
 # cc-config's is the same: its own config file in a temp dir, never this box's — precedence, locking, and the
 # one that matters, that a value like $(…) is read back as those characters and executes nothing.
+# cc-msg's runs a whole fake box — its own HOME, a stub tmux whose pane text is a file, a stub ps — over the
+# prompts it may answer, the ones it must never touch, and the spool: no tmux of this box's is read or typed at.
 # cc-spend's ticks a synthetic transcript in a HOME of its own: the rates table, the offset/dedupe rules and both
 # phantom rules, never this box's ledger and never a model.
-for c in cc-units cc-settings cc-board cc-config cc-spend; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"
