@@ -58,8 +58,10 @@ reads them as healthy. Two facts settle them, and both are cheap:
 A THIRD SHAPE, and neither of the two above: a track that FINISHED, opened its PR, and nobody landed it.
 Board and box agree — `review`, PR open — so no drift fires and nothing here ever said a word, while four
 finished PRs sat until the owner asked (2026-09-01). It is not a person's decision, it is one command, so
-every run offers it to the repo's live session with no repeat window; only once it has stood past
-CC_PENDING_ALERT (default 4 h) does it become the owner's, as one #alerts line per window.
+the repo's live session is offered it ONCE per PR (and once more if it falls out of a lane unlanded); a row
+the board says is `waiting` — a person's word — and a PR already being landed (a live landing argv naming it,
+or a job under ~/.cc/state/land/) are skipped; only once it has stood past CC_PENDING_ALERT (default 4 h)
+does it become the owner's, as one #alerts line per window.
 
 Ending one means SIGTERM to its process group, `blocked` on the board, and one line to the owner with the
 numbers. There is no spend cap anywhere in this box (owner, 2026-08-31: "no spend cap as some just are
@@ -365,6 +367,17 @@ def decide(f):
         settled = True                                  # nobody is working on it: the board's own word for that is decided here, once
         if jk == "DONE" and pr == "MERGED":
             out.append(("fix", "merged", "it finished and its PR merged"))
+        elif st == "waiting" and (jk == "DONE" or pr == "OPEN"):
+            # `waiting` IS A PERSON'S WORD, like a session's kind: somebody typed it because what is left — landing
+            # this PR, answering this question — is theirs to do. Reconciling it to `review` erases that, and the
+            # pending watchdog below, which leaves a `waiting` row alone, would nag it on the very next tick
+            # (lessons#10, owner-gated merging, told five times; owner, 2026-09-01). Only the PR merging, above,
+            # moves it — that is a fact, not a word. A finish with no PR at all is still worth saying, with no
+            # status, so it is reported and the word stands.
+            if not has_pr:
+                out.append(("ask", None, "it finished but no PR was ever opened"))
+            elif pr == "CLOSED":
+                out.append(("ask", None, "its PR was closed without merging"))
         elif jk == "DONE" and has_pr:
             out.append(("fix", "review", "it finished and its PR is open"))
         elif jk == "DONE":
@@ -414,8 +427,48 @@ def effective(f, recs):
 def pending(f, state):
     """Pure — finished, PR open, nobody landed it. Nothing is WRONG here, which is the point: decide() has no
     record to make and the owner sees a consistent board. `?` and None are not OPEN — a PR state that could not
-    be read, or was never asked for, is not evidence that work is sitting."""
-    return state == "review" and (f.get("pr_state") or "") == "OPEN"
+    be read, or was never asked for, is not evidence that work is sitting. A board that says `waiting` is never
+    pending: a PERSON typed that word, and where merging is theirs (lessons#10) landing IS what they are being
+    waited on for. Read from the board, not from `state`, so the rule holds however the row is reconciled — and
+    decide() leaves a `waiting` word alone, so it holds on every tick, not just the first (review of #150)."""
+    return state == "review" and (f.get("pr_state") or "") == "OPEN" and f["status"] != "waiting"
+
+
+LAND_ARGV = re.compile(r"(?:^|[\s/])cc-land\s+(?:queue\s+)?([A-Za-z0-9_][A-Za-z0-9._-]*)"
+                       r"((?:\s+(?:--no-review|--re-review|[0-9]+))+)(?=\s|$)")
+
+
+def pr_number(url):
+    """The number a board row's `pr` ends in (a URL, `#12`, or just the digits); None when there is none."""
+    m = re.search(r"([0-9]+)/?\s*$", str(url or ""))
+    return int(m.group(1)) if m else None
+
+
+def landing():
+    """{(repo, pr)} somebody is already landing: named by a live cc-land argv (the PR path, or `queue`), or by a
+    job under ~/.cc/state/land/ — cc-land keeps that file until the landing is said and done. Nagging a session
+    about one of these is telling it to do what is being done (nine lines a tick, 2026-09-01)."""
+    out = set()
+    for path in glob.glob(f"{HOME}/.cc/state/land/*.json"):
+        try:
+            j = json.load(open(path))
+            if j.get("repo") and j.get("pr"):
+                out.add((j["repo"], int(j["pr"])))
+        except Exception:
+            continue                                # half-written, or a catch-up job with no PR: no PR named
+    me = os.getpid()
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            argv = open(f"/proc/{d}/cmdline", "rb").read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if any(os.path.basename(a) == "claude" for a in argv):
+            continue                                # a session's prompt QUOTES the command; it is not running it
+        for m in LAND_ARGV.finditer(" ".join(argv)):
+            out.update((m.group(1), int(n)) for n in re.findall(r"[0-9]+", m.group(2)))
+    return out
 
 
 def snapshot(rows, limit=0.0):
@@ -737,17 +790,25 @@ def main(argv):
         fresh = [r for k, r in keys.items() if t0 - float(old.get(k, 0) or 0) >= repeat]
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
         # PENDING — finished, PR open, unlanded. No `ask` above it and none coming: the board and the box agree.
-        # Landing it is one command, not a decision, so the session hears about it EVERY run with no repeat
-        # window; the owner hears about it only once it has stood past the window, and then once per window.
-        keep = {}
+        # Landing it is one command, not a decision — but the session hears it ONCE per PR, not every tick (nine
+        # identical lines a tick for PRs already queued in land lanes; owner, 2026-09-01), and the owner only once
+        # it has stood past the window, then once per window. Two rows are nobody's to nag: one the board says is
+        # `waiting` (pending() itself says why), and one whose PR somebody is landing — a live cc-land argv, or a
+        # job under ~/.cc/state/land/. Either drops the keys, so a PR that falls out of a lane unlanded is news
+        # again, once.
+        keep, busy = {}, None
         for repo, track, f, state, _, _ in snaprows:
             k, ak = f"pending {repo}/{track}", f"alerted {repo}/{track}"
+            ok_ = f"offered {repo}/{track} {f.get('pr') or ''}".rstrip()   # per PR: a new PR on the track is news again
             if not pending(f, state):
                 # a poll that came back `?` (timeout, auth blip, rate limit) is no evidence either way: no nag
                 # this run, but the clock keeps running. Only MERGED / CLOSED / None, or a board state that
                 # left review, drops the keys.
                 if state == "review" and f.get("pr_state") == "?":
-                    keep.update({x: old[x] for x in (k, ak) if old.get(x)})
+                    keep.update({x: old[x] for x in (k, ak, ok_) if old.get(x)})
+                continue
+            busy = landing() if busy is None else busy   # one process-table read a run, and only with something pending
+            if (repo, pr_number(f.get("pr"))) in busy:
                 continue
             first = float(old.get(k) or 0) or t0          # first seen pending, carried across runs
             last, stood = float(old.get(ak) or 0), t0 - first    # `held` is taken above, and means something else
@@ -758,11 +819,14 @@ def main(argv):
                       f"nobody has picked it up" + (f" · {f['pr']}" if f.get("pr") else ""))
             if last:
                 keep[ak] = last
-            offer(repo, f"board watchdog: {repo}/{track}: finished, PR open, not landed — review and land it"
-                        + (f" ({f['pr']})" if f.get("pr") else ""))
+            if old.get(ok_):
+                keep[ok_] = old[ok_]
+            elif offer(repo, f"board watchdog: {repo}/{track}: finished, PR open, not landed — review and land it"
+                             + (f" ({f['pr']})" if f.get("pr") else "")):
+                keep[ok_] = t0                            # a refused offer (no session) was not heard: still owed
         if repos:   # a filtered run knows its repos only: the others' entries are not its to drop (the snapshot's rule above)
             keep.update({x: v for x, v in old.items() if x.split(": ")[0].removeprefix("pending ")
-                         .removeprefix("alerted ").split("/")[0] not in repos})
+                         .removeprefix("alerted ").removeprefix("offered ").split("/")[0] not in repos})
         if keys or keep or old:   # only findings that are still true survive the write: one that comes back is news again
             ledger(path, dict({k: (t0 if k in told else old.get(k, 0)) for k in keys}, **keep))
         if fresh:
@@ -873,6 +937,16 @@ def selfcheck():
        decide(F(status="waiting", live=True))[0][:2] == ("fix", "running"))
     ok("…and with nobody in the worktree either, `waiting` is reconciled like a stale `running` is",
        decide(F(status="waiting", live=False))[0][:2] == ("ask", "blocked"))
+    ok("`waiting` with a PR open is a person's word and survives --apply: reconciling it to `review` would erase it "
+       "and the pending watchdog would nag on the next tick anyway (lessons#10; owner, 2026-09-01)",
+       decide(F(status="waiting", pr="u", pr_state="OPEN")) == []
+       and decide(F(status="waiting", pr="u", pr_state="OPEN", journal=("DONE", ""))) == []
+       and decide(F(status="running", pr="u", pr_state="OPEN"))[0][:2] == ("fix", "review"))
+    ok("…but the PR MERGING moves it: that is a fact, not a word — and a finish with no PR, or a PR closed "
+       "without merging, is still reported, without touching the word",
+       decide(F(status="waiting", pr="u", pr_state="MERGED", journal=("DONE", "")))[0][:2] == ("fix", "merged")
+       and decide(F(status="waiting", journal=("DONE", "")))[0][:2] == ("ask", None)
+       and decide(F(status="waiting", pr="u", pr_state="CLOSED", journal=("DONE", "")))[0][:2] == ("ask", None))
     ok("a merged track is never re-opened by an old question in its journal",
        decide(F(status="merged", journal=("BLOCKED", "old"), pr="u", pr_state="MERGED")) == [])
     ok("STATUS: BLOCKED with no question is still a declaration — it stopped, and only a person restarts it",
@@ -925,6 +999,11 @@ def selfcheck():
        "nobody in the worktree is a finished track, and pending",
        eff(status="running", pr="u", pr_state="OPEN") == "review"
        and pending(F(status="running", pr="u", pr_state="OPEN"), eff(status="running", pr="u", pr_state="OPEN")))
+    ok("…except the one word a PERSON typed: a `waiting` row is never pending, however it is reconciled — landing "
+       "is what it is waiting on (lessons#10 was nagged five times; owner, 2026-09-01)",
+       not pending(F(status="waiting", pr="u", pr_state="OPEN"), "review")
+       and not pending(F(status="waiting", pr="u", pr_state="OPEN"),
+                       eff(status="waiting", pr="u", pr_state="OPEN")))
 
     # the runaway cc-loop cannot catch: its own. Both shapes are ALIVE, which is why nothing else here sees them
     def W(**kw):
@@ -1103,22 +1182,56 @@ def selfcheck():
         ok("end to end: the pending key survives the ledger write, which used to keep `ask` findings only",
            float(json.load(open(seenp))[f"pending {repo}/t2"]) > 0)
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
-        ok("end to end: the offer repeats EVERY run — there is no repeat window on work that is simply not done",
-           offered() == 2)
+        ok("end to end: the offer is made ONCE per PR — the next run, nothing changed, says nothing to the session",
+           offered() == 1)
         led = json.load(open(seenp))                     # …and now it has stood there for five hours
         led[f"pending {repo}/t2"] = now() - 5 * 3600
         json.dump(led, open(seenp, "w"))
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: past the window nobody picked it up, so #alerts gets one line", alerted() == a0 + 1)
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
-        ok("end to end: …one per window, however many times the timer fires in it",
-           alerted() == a0 + 1 and offered() == 4)
+        ok("end to end: …one per window, however many times the timer fires in it — and still one offer",
+           alerted() == a0 + 1 and offered() == 1)
         os.remove(f"{th}/gh")                            # no gh = no PR answer at all, which is not evidence
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: with the PR state unreadable it goes quiet rather than guessing at unlanded work",
-           offered() == 4)
-        ok("end to end: …and keeps the keys: one failed poll does not restart the owner's clock",
-           all(x in json.load(open(seenp)) for x in (f"pending {repo}/t2", f"alerted {repo}/t2")))
+           offered() == 1)
+        ok("end to end: …and keeps the keys: one failed poll restarts neither the owner's clock nor the offer",
+           all(x in json.load(open(seenp)) for x in (f"pending {repo}/t2", f"alerted {repo}/t2",
+                                                       f"offered {repo}/t2 https://example.invalid/pr/9")))
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        os.chmod(f"{th}/gh", 0o755)
+        # the two rows the watchdog leaves alone. `waiting` is the board's own word for "the owner decides", and in
+        # a repo where merging is owner-gated that IS the landing (lessons#10 was told five times, 2026-09-01) —
+        # the ask path carries it. A PR somebody is landing is named by a job file, or by a live cc-land argv.
+        # …on a FRESH ledger, so the case asserts the skip and not the once-per-PR key that would suppress the
+        # offer anyway (review of #150): without the rule this run offers a second time.
+        json.dump({}, open(seenp, "w"))
+        cb("status", repo, "t2", "waiting")
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: a row the board says is `waiting` is not nagged about its PR", offered() == 1)
+        ok("end to end: …and --apply leaves that word alone, so the skip holds on every tick, not just the first",
+           cb("get", repo, "t2", "status").stdout.strip() == "waiting")
+        # the control: same clean ledger, same open PR, only the word differs — this one IS nagged, once
+        cb("status", repo, "t2", "review")
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …the same row back in `review` is offered once — the ledger was not what silenced it",
+           offered() == 2)
+        os.makedirs(f"{th}/.cc/state/land", exist_ok=True)
+        json.dump({"repo": repo, "pr": 9}, open(f"{th}/.cc/state/land/{repo}-9.json", "w"))
+        json.dump({}, open(seenp, "w"))                  # a clean ledger: only the job file can silence this run
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: a PR with a job in the landing queue is being landed — no nag", offered() == 2)
+        os.remove(f"{th}/.cc/state/land/{repo}-9.json")
+        open(f"{th}/cc-land", "w").write("#!/bin/sh\nsleep 60\n")   # a live argv naming the PR, not a real landing
+        os.chmod(f"{th}/cc-land", 0o755)
+        lander = subprocess.Popen([f"{th}/cc-land", repo, "9"], start_new_session=True)
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        lander.kill()
+        lander.wait(timeout=10)
+        ok("end to end: a PR named by a live cc-land argv is being landed — no nag", offered() == 2)
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …and one that falls out of a lane unlanded is news again, once", offered() == 3)
 
         victim = subprocess.Popen(["sleep", "60"], start_new_session=True)   # its own group, so nothing else is in range
         ended = end_it([victim.pid])
