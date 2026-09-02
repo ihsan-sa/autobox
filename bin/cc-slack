@@ -788,19 +788,42 @@ def needs_dir(target):
     return bool(target) and target != "box" and "/" not in target and not os.path.isdir(f"{DEV}/{target}")
 
 
-def provision_dir(target, chan, at=None):
+def provision_window(at, prov=None):
+    """(what fills the hourly cap right now, seconds until a slot frees). Only dirs the box made on its own count: one
+    the OWNER asked for by hand is recorded `by: owner` and never fills the window — his hand is not a creation spree.
+    `wait` is 0 while there is room, so `if wait:` IS "capped"."""
+    prov = load_provisioned() if prov is None else prov
+    recent = {k: v.get("at") or 0 for k, v in (prov or {}).items()
+              if at - (v.get("at") or 0) < PROVISION_WINDOW and (v.get("by") or "") != "owner"}
+    need = len(recent) - PROVISION_MAX + 1        # how many of them must age out before the next dir fits
+    wait = max(0, int(sorted(recent.values())[need - 1] + PROVISION_WINDOW - at) + 1) if need > 0 else 0
+    return sorted(recent), wait
+
+
+def wait_mins(wait):
+    return max(1, -(-int(wait) // 60))
+
+
+def cap_why(chan, wait, recovery):
+    """One line for a creation the hourly cap stopped: what the cap is, and the way out that actually works for THIS
+    kind of dir — a plain channel needs the dir made, a member handle needs the marker INSIDE it (ensure_member
+    refuses a bare `~/dev/<handle>` as "already a repo") — and either way, waiting is a real answer."""
+    return (f"I create at most {PROVISION_MAX} session dirs an hour and that is used up (#{chan} would be the next) — "
+            f"{recovery}, or wait {wait_mins(wait)} min.")
+
+
+def provision_dir(target, chan, at=None, by=None, recovery=None):
     """Make `~/dev/<target>` the session dir behind `#<chan>`, on that channel's FIRST message and never in advance:
     CLAUDE.md from templates/channel-CLAUDE.md, `.cc/member-facing` (anybody in a Slack channel can talk to this
     session, so cc-guard gates it from its first tool call), `git init` so its work is tracked. Returns (ok, why).
     Bounded by PROVISION_MAX per PROVISION_WINDOW — an already-provisioned dir is reused forever, the cap is on
-    creation only (this is only ever called when the dir does not exist)."""
+    creation only (this is only ever called when the dir does not exist). `by="owner"` is exempt and uncounted."""
     at = time.time() if at is None else at
     prov = load_provisioned()
-    recent = [k for k, v in prov.items() if at - (v.get("at") or 0) < PROVISION_WINDOW]
-    if len(recent) >= PROVISION_MAX:
-        log(f"provision cap: {len(recent)} session dirs in the last hour ({', '.join(sorted(recent))}) — #{chan} refused")
-        return False, (f"I create at most {PROVISION_MAX} session dirs an hour and that is used up "
-                       f"(#{chan} would be the next). Create `~/dev/{target}` on the box and message again.")
+    recent, wait = provision_window(at, prov)
+    if wait and by != "owner":
+        log(f"provision cap: {len(recent)} session dirs in the last hour ({', '.join(recent)}) — #{chan} refused")
+        return False, cap_why(chan, wait, recovery or f"create `~/dev/{target}` on the box and message again")
     d = f"{DEV}/{target}"
     try:
         os.makedirs(f"{d}/.cc", exist_ok=True)
@@ -814,7 +837,7 @@ def provision_dir(target, chan, at=None):
     except Exception as e:
         log(f"provision {target}: {e!r}")
         return False, f"could not create `~/dev/{target}` for #{chan} ({e.__class__.__name__}) — create it on the box and message again."
-    prov[target] = {"chan": chan, "at": at}
+    prov[target] = {"chan": chan, "at": at, **({"by": by} if by else {})}
     try:
         save_provisioned(prov)
     except Exception as e:
@@ -825,6 +848,10 @@ def provision_dir(target, chan, at=None):
 
 # ---------------------------------------------------------------- member workspaces (overlay: docs/design-member-workspaces.md)
 MEMBERS = "members.json"                                      # {"<handle>": {"uid": U…, "chan": name, "at": ts}}: who has a workspace
+MEMBER_RETRY = "member-retry.json"                            # {"<uid>": {"first": ts, "at": ts}}: joins the box could not finish
+                                                              # yet (hourly cap, Slack unreadable). A team_join arrives ONCE — refusing
+                                                              # it loses the person, so it waits here for member_retry_cycle
+MEMBER_RETRY_TTL = 24 * 3600                                  # a deferred join the box still cannot finish a day later is dropped, logged
 MEMBER_MARKER = ".cc/member-workspace"                        # at ~/dev/<handle>: the ROOT of a member's world. cc-guard keys its
                                                               # workspace rule on this file's PRESENCE and on the dir's name — never on
                                                               # what is written inside it, which the member's own session could rewrite.
@@ -870,6 +897,41 @@ def save_members(m):
     os.replace(tmp, f"{DIR}/{MEMBERS}")
 
 
+def load_retries():
+    """Joins waiting on the hourly cap: {uid: {"first": ts, "at": ts}}. Read from disk on every use, like members.json —
+    `cc-slack member add` and the daemon both write it."""
+    try:
+        d = json.load(open(f"{DIR}/{MEMBER_RETRY}"))
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_retries(r):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = f"{DIR}/{MEMBER_RETRY}.tmp"
+    with open(tmp, "w") as f:
+        os.fchmod(f.fileno(), 0o600); json.dump(r, f, indent=1, sort_keys=True)
+    os.replace(tmp, f"{DIR}/{MEMBER_RETRY}")
+
+
+def defer_member(uid, at):
+    """Park a join the cap stopped. `first` is the ORIGINAL deferral and never moves: the TTL measures how long this
+    person has been waiting, not how long since the last retry."""
+    r = load_retries()
+    r[uid] = {"first": (r.get(uid) or {}).get("first") or at, "at": at}
+    with contextlib.suppress(Exception):
+        save_retries(r)
+
+
+def drop_retry(uid):
+    """This join is settled (finished, or refused for a reason waiting will not fix) — stop retrying it."""
+    r = load_retries()
+    if r.pop(uid, None) is not None:
+        with contextlib.suppress(Exception):
+            save_retries(r)
+
+
 def workspace_of(target):
     """The member workspace `target` belongs to, or None. `<handle>` and `<handle>/<project>` both answer `<handle>`;
     the marker file at ~/dev/<handle> is the truth, not members.json — a hand-made workspace works the same way."""
@@ -908,13 +970,19 @@ def member_spent(handle, day=None):
         return 0.0
 
 
-def provision_member_workspace(handle, chan, at=None):
+def member_recovery(handle):
+    """The hand recovery for a member workspace the cap stopped. NOT "create ~/dev/<handle>": a bare dir is refused by
+    ensure_member as "already a repo on this box" — the marker inside it is what makes the dir a workspace."""
+    return f"`mkdir -p ~/dev/{handle}/.cc && touch ~/dev/{handle}/{MEMBER_MARKER}` on the box"
+
+
+def provision_member_workspace(handle, chan, at=None, by=None):
     """~/dev/<handle> as the member's own repo: provision_dir's CLAUDE.md + `.cc/member-facing` + `git init`, plus a
     README, a board of its own and `.cc/member-workspace`. Idempotent — an existing workspace is topped up, never
     rebuilt. Returns (ok, why)."""
     d = f"{DEV}/{handle}"
     if needs_dir(handle):
-        ok, why = provision_dir(handle, chan, at)
+        ok, why = provision_dir(handle, chan, at, by, member_recovery(handle))
         if not ok:
             return False, why
     try:
@@ -974,32 +1042,37 @@ def reserved_name(name, routes=None, lane=True):
 
 
 def member_uid_name(cfg, uid):
-    """(handle, refusal) for a user id — humans only. A bot, an app, a deleted account or Slackbot never gets a
-    workspace, and neither does an id Slack will not describe: guessing a handle would name somebody else's folder."""
+    """(handle, refusal, wait) for a user id — humans only. A bot, an app, a deleted account or Slackbot never gets a
+    workspace, and neither does an id Slack will not describe: guessing a handle would name somebody else's folder.
+    `wait` marks the ONE failure waiting fixes — Slack unreadable — so a join is parked over an outage, not dropped."""
     try:
         u = api("users.info", cfg["SLACK_BOT_TOKEN"], user=uid)["user"]
     except EffectDenied:
         raise
     except Exception as e:
-        return None, f"cannot read {uid} from Slack ({e.__class__.__name__})"
+        return None, f"cannot read {uid} from Slack ({e.__class__.__name__})", True
     if u.get("is_bot") or u.get("is_app_user") or u.get("deleted") or uid == "USLACKBOT":
-        return None, f"{uid} is a bot or a deleted account — no workspace"
+        return None, f"{uid} is a bot or a deleted account — no workspace", False
     h = member_handle(u.get("name") or (u.get("profile") or {}).get("display_name_normalized") or "")
-    return (h, "") if h else (None, f"{uid} has no handle the box can turn into a folder name")
+    return (h, "", False) if h else (None, f"{uid} has no handle the box can turn into a folder name", False)
 
 
-def ensure_member(cfg, uid, at=None):
+def ensure_member(cfg, uid, at=None, by=None):
     """ONE join = one private channel pair + one workspace, for a non-owner. `cc-slack member add` and the team_join
     event both land here — the event calls this, never a second copy of it. Every step under it is idempotent, so a
-    second join changes nothing and posts nothing. Returns (status, handle, message):
-    "owner" (exempt), "created", "exists", "refused"."""
+    second join changes nothing and posts nothing. `by="owner"` is the owner running `member add` by hand: exempt from
+    the hourly provisioning cap, because his hand is not a channel-creation storm. Returns (status, handle, message):
+    "owner" (exempt), "created", "exists", "deferred" (waiting on the cap), "refused"."""
     at = time.time() if at is None else at
     if not uid:
         return "refused", None, "no user id"
     if uid == cfg.get("SLACK_OWNER_ID"):
         return "owner", None, "the owner owns the box — he gets no workspace of his own"
-    handle, why = member_uid_name(cfg, uid)
+    handle, why, wait = member_uid_name(cfg, uid)
     if not handle:
+        if wait:            # Slack is down, not an answer: park it like a capped join rather than drop the person
+            defer_member(uid, at)
+            return "deferred", None, why
         return "refused", None, why
     members = load_members()
     known = members.get(handle) or {}
@@ -1020,9 +1093,21 @@ def ensure_member(cfg, uid, at=None):
     # "#<h> already exists here" until the owner archived both by hand. Now a join that stops early leaves either
     # nothing or a record without channel ids, and the SAME call again finishes it: the record says the channels
     # are this uid's, so an existing #<h> is completed (bot in, member and owner invited), never refused.
-    ok, why = provision_member_workspace(handle, handle, at)
+    # THE CAP NEVER REFUSES A JOIN. A team_join fires once; a refusal drops that person on the floor, and the old
+    # advice ("create ~/dev/<handle>") made a bare dir this same function then refused as "already a repo". So a
+    # capped join is parked and the daemon re-runs it when the window frees (member_retry_cycle).
+    if by != "owner" and needs_dir(handle):
+        recent, wait = provision_window(at)
+        if wait:
+            defer_member(uid, at)
+            log(f"member {handle} ({uid}): hourly cap ({', '.join(recent)}) — deferred, retried in ~{wait_mins(wait)} min")
+            return "deferred", handle, (f"#{handle}'s workspace waits on the hourly cap ({PROVISION_MAX} new session "
+                                        f"dirs an hour): the box finishes this join by itself in ~{wait_mins(wait)} min, "
+                                        f"or {member_recovery(handle)} to have it now.")
+    ok, why = provision_member_workspace(handle, handle, at, by)
     if not ok:
         return "refused", handle, why
+    drop_retry(uid)                    # the workspace exists: whatever the channels do now, there is nothing to defer
     rec = dict(known, uid=uid, chan=handle, updates=updates_name(handle), at=known.get("at") or at)
     if rec != known:
         members[handle] = rec
@@ -2892,6 +2977,27 @@ class Daemon:
             log(f"team_join {uid}: {e!r}"); return
         log(f"team_join {uid}: {status} {handle or ''} — {msg}")
 
+    def member_retry_cycle(self):
+        """Joins that could not be finished yet — the hourly cap, or Slack unreadable — re-run. A team_join fires
+        ONCE, so this is the whole difference between a person getting their workspace late and never getting it.
+        Anything but another deferral settles the entry, and so does MEMBER_RETRY_TTL: the box stops retrying a join
+        it can never finish."""
+        r = load_retries()
+        if not r:
+            return                                     # the common case: no file read beyond this, no Slack call
+        now = time.time()
+        for uid, e in sorted(r.items()):
+            try:
+                status, handle, msg = ensure_member(self.cfg, uid, now)
+            except Exception as ex:
+                log(f"member retry {uid}: {ex!r}"); continue
+            if status != "deferred":
+                drop_retry(uid)                        # ensure_member drops it too once the workspace exists; a refusal ends here
+                log(f"member retry {uid}: {status} {handle or ''} — {msg}")
+            elif now - (e.get("first") or now) > MEMBER_RETRY_TTL:
+                drop_retry(uid)
+                log(f"member retry {uid}: still deferred after {MEMBER_RETRY_TTL // 3600} h — dropped")
+
     def member_channel(self, ws, target, text, chat, thread, ts, user, is_owner):
         """A message in a member workspace channel, while NO member session may run on the host (see
         docs/design-member-workspaces.md, "the boundary"). The daemon answers the one thing that has to work without
@@ -4196,6 +4302,7 @@ class Daemon:
         if n == 1 or n % 10 == 0:                        # every 5 min, and on the first tick after a reboot: finish a
             self._safe(self.land_sweep)                  # landing left half-done, retry a deploy that failed, and deploy
                                                          # a merge nobody here made (GitHub's UI, an auto-merge landing)
+            self._safe(self.member_retry_cycle)          # …and give a join the hourly cap deferred its workspace
         if n % 120 == 0:                                 # hourly catch-up: a merge this box never saw still publishes
             self.publish_soon(self.cfg.get("PUBLISH_REPO") or "")
 
@@ -5426,7 +5533,8 @@ def resolve_user(cfg, who):
 
 def cmd_member(argv):
     """`cc-slack member add <@user>…` — the owner's hand-run half of a team_join. Same ensure_member, same
-    idempotence: running it on somebody who already has a workspace prints so and changes nothing."""
+    idempotence: running it on somebody who already has a workspace prints so and changes nothing. Exempt from the
+    hourly provisioning cap — the cap is there to bound a channel-creation spree, and this is the owner typing."""
     cfg = load_cfg()
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("no SLACK_BOT_TOKEN — cc slack setup first", file=sys.stderr); return 1
@@ -5438,7 +5546,7 @@ def cmd_member(argv):
         if not uid:
             print(f"{who}: no such person in this workspace (give <@U…> or their handle)", file=sys.stderr); rc = 1; continue
         try:
-            status, handle, msg = ensure_member(cfg, uid)
+            status, handle, msg = ensure_member(cfg, uid, by="owner")
         except Exception as e:
             print(f"{who}: {e.__class__.__name__}: {e}", file=sys.stderr); rc = 1; continue
         print(f"{who} → {status}: {msg}")
@@ -9471,7 +9579,8 @@ def cmd_selfcheck():
                 return {"user": {"id": kw["user"], "name": {"UALICE": "Alice.B", "UOWNER": "owner", "UBOX": "Box",
                                                            "UUPD": "myproj-updates", "UCAROL": "Carol",
                                                            "UDAVE": "Dave", "UERIN01": "Erin", "UFRANK": "Frank",
-                                                           "UGRACE": "Grace"}.get(kw["user"], kw["user"])}}
+                                                           "UGRACE": "Grace", "UHENRY": "Henry",
+                                                           "UIVY001": "Ivy"}.get(kw["user"], kw["user"])}}
             if method == "conversations.setTopic":
                 self.topics[kw["channel"]] = kw["topic"]; return {"ok": True}
             if method == "chat.postMessage":
@@ -9537,7 +9646,7 @@ def cmd_selfcheck():
         # refused provisioning (the hourly cap) left #<h> standing with no record, and every retry died on "#<h>
         # already exists here". Frank: provisioning refused once. Grace: workspace made, then Slack went down.
         _prov = globals()["provision_member_workspace"]
-        globals()["provision_member_workspace"] = lambda h, c, at=None: (False, "selfcheck: provisioning refused")
+        globals()["provision_member_workspace"] = lambda h, c, at=None, by=None: (False, "selfcheck: provisioning refused")
         try:
             st_f1 = ensure_member(cfgw, "UFRANK")[0]
         finally:
@@ -9557,6 +9666,44 @@ def cmd_selfcheck():
         st_g2, st_g3 = ensure_member(cfgw, "UGRACE", late)[0], ensure_member(cfgw, "UGRACE", late)[0]
         grace_done = ((load_members().get("grace") or {}).get("chan_id") == fkm.chans.get("grace")
                       and {"UGRACE", "UOWNER"} <= set(fkm.invites.get("grace", [])))
+        # THE HOURLY CAP NEVER REFUSES A JOIN (2026-09-01: three members were added by hand, and the 4th team_join
+        # came back "create ~/dev/<handle> and message again" — a join event fires ONCE, so the daemon dropped that
+        # person, and the advice would not have worked either). Henry joins with the hour full: parked, then given
+        # his workspace by the daemon once the window passes. The ledger is rewritten here so the cases above (whose
+        # entries sit at `late`, two windows out) cannot move this one.
+        now0 = time.time()
+        full = {f"cap{i}": {"chan": f"cap{i}", "at": now0} for i in range(PROVISION_MAX)}
+        save_provisioned(full)
+        st_h, _, h_msg = ensure_member(cfgw, "UHENRY", now0)
+        henry_parked = (list(load_retries()) == ["UHENRY"] and "henry" not in fkm.created
+                        and not os.path.isdir(f"{DEV}/henry") and "henry" not in load_members())
+        dmw.member_retry_cycle()                                   # still inside the hour: it waits, it is not dropped
+        henry_waits = list(load_retries()) == ["UHENRY"] and "henry" not in fkm.created
+        save_provisioned({k: dict(v, at=now0 - PROVISION_WINDOW - 1) for k, v in full.items()})
+        dmw.member_retry_cycle()                                   # the window passed: the daemon finishes the join
+        henry_done = (not load_retries() and {"henry", "henry-updates"} <= set(fkm.created)
+                      and os.path.isfile(f"{DEV}/henry/{MEMBER_MARKER}"))
+        # THE OWNER'S OWN HAND IS EXEMPT — `member add` is not a channel-creation spree — and what it makes does not
+        # fill the window for the next join either.
+        full = {f"cap{i}": {"chan": f"cap{i}", "at": time.time()} for i in range(PROVISION_MAX)}
+        save_provisioned(full)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc_ivy = cmd_member(["add", "<@UIVY001>"])
+        ivy_made = {"ivy", "ivy-updates"} <= set(fkm.created) and os.path.isfile(f"{DEV}/ivy/{MEMBER_MARKER}")
+        ivy_uncounted = provision_window(time.time())[0] == sorted(full)
+        # Slack being unreadable is not an answer about a person either — the retry file is the same waiting room.
+        def api_down(method, token, **kw):
+            if method == "users.info":
+                raise RuntimeError("selfcheck: slack is down")
+            return fkm.api(method, token, **kw)
+        globals()["api"] = api_down
+        try:
+            st_j = ensure_member(cfgw, "UJAMILA")[0]
+        finally:
+            globals()["api"] = fkm.api
+        jamila_parked = st_j == "deferred" and "UJAMILA" in load_retries()
+        drop_retry("UJAMILA")                                      # settled here: the rest of the run starts empty
+        chan_why = cap_why("chan-four", 90, "create `~/dev/chan-four` on the box and message again")
         welcomes = [c for c, t in fkm.posts if t.startswith("Welcome")]
         started = list(dmw.queues) + list(dmw.subs)
         owner_in_all = all("UOWNER" in fkm.invites.get(n, []) for n in fkm.created)   # every channel the box made, whoever it was for
@@ -9577,7 +9724,8 @@ def cmd_selfcheck():
     check("…but only for the workspace's own member or the owner: anyone else in the channel creates nothing",
           made5 == made4 and any("own member or the owner" in t for t in saidw))
     check("THE OWNER IS IN EVERY CHANNEL THE BOX MADE, and so is the member",
-          owner_in_all and member_in_all and len(fkm.created) == 10)   # alice, alice--todo, erin, frank, grace pairs
+          owner_in_all and member_in_all and len(fkm.created) == 14)   # alice, alice--todo, erin, frank, grace,
+                                                                       # henry, ivy pairs
     check("no member SESSION is started on the host: the channel is answered by the daemon and says why "
           "(docs/design-member-workspaces.md, \"the boundary\")", no_session and not started)
     check("the workspace's identity is WHERE it is, not what is written in it: the marker's body says so, and `.cc/` "
@@ -9600,6 +9748,20 @@ def cmd_selfcheck():
           "channels are theirs, so #<h> is completed instead of refused as 'already exists' — and welcomed once",
           st_g1 == "raised" and grace_half == (True, True, True) and st_g2 == "created" and st_g3 == "exists"
           and grace_done and welcomes.count("frank") == 1 and welcomes.count("grace") == 1)
+    check("A JOIN IS NEVER REFUSED BY THE HOURLY CAP: it is parked, it stays parked while the hour is still full, "
+          "and the daemon gives it the workspace by itself once the window passes — a team_join fires ONCE, so a "
+          "refusal is that person dropped",
+          st_h == "deferred" and henry_parked and henry_waits and henry_done)
+    check("the owner's own `member add` is exempt from the cap — his hand is not a channel-creation spree — and the "
+          "workspace it makes does not fill the window for the next join either",
+          rc_ivy == 0 and ivy_made and ivy_uncounted)
+    check("Slack being unreadable is not an answer about a person: a join whose users.info fails is parked with the "
+          "capped ones and retried, never refused", jamila_parked)
+    check("the cap says the recovery that actually WORKS: for a member handle the marker INSIDE the dir (a bare "
+          "`~/dev/<handle>` is refused as 'already a repo'), for a plain channel the dir itself — and either way, "
+          "how long simply waiting takes",
+          MEMBER_MARKER in h_msg and "~/dev/henry`" not in h_msg and " min" in h_msg
+          and "~/dev/chan-four`" in chan_why and MEMBER_MARKER not in chan_why and " min." in chan_why)
 
     # ── marks.json / flags.json under concurrent writers, and a mark already where we want it (2026-09-01 audit) ──
     with tempfile.TemporaryDirectory(prefix="_selfcheck_marks_") as tdm:
