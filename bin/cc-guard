@@ -7,6 +7,10 @@
 # Denies (exit 2 + reason) the four owner gates:
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
+# EVERY rule reads ONE anchor, so a word in front of a command turned all of them off at once (`timeout 5 tmux
+# kill-server` walked past the universal gate). The haystack now carries each statement AND every suffix of it,
+# plus what an option attaches after an `=` (`--filter=CMD` is run by a shell and is never its own word), so a
+# rule sees the command wherever a wrapper put it — cmdpos(), which is also where that fix's ceiling is.
 # A deny is one of TWO kinds. `deny` = the owner could say yes (merging, pushing, a comment in his name, an
 # email, a post to his Slack): from a member-facing session it also ASKS him, in that member's channel and by
 # DM. `never` = no yes exists for this tier (landing, dispatching a worker, host changes, the box's secrets,
@@ -47,9 +51,15 @@ if [ "${1:-}" = selfcheck ]; then
   # cases below need one they started themselves rather than a real session of this box's to point at.
   printf '#!/bin/sh\nsleep 45\n' > "$T/claude"; chmod +x "$T/claude"
   ok(){ n=$((n+1)); if [ "$2" = 0 ]; then echo "  ✓ $1"; else f=$((f+1)); echo "  ✗ $1"; fi; }
-  g(){ local t=$1 i=$2 c=$3; shift 3   # a payload through the gate, in a HOME of its own; rc is the answer
-    printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$t" "$i" "$c" \
-      | env HOME="$H" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$@" "$0" >/dev/null 2>&1; echo $?; }
+  g(){ local t=$1 i=$2 c=$3 pl; shift 3   # a payload through the gate, in a HOME of its own; rc is the answer
+    #  …and the REASON too, for a case that sets $GERR: rc 2 alone cannot say WHICH rule refused (case 11).
+    pl=$(printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$t" "$i" "$c")
+    # A PAYLOAD THAT IS NOT JSON IS NOT A TEST. jq fails, the guard sees no tool at all and exits 0, so a row
+    # asserting "still allowed" goes GREEN having gated nothing — one did, for a whole review round (#193).
+    # rc 99 is neither 0 nor 2, so it fails whichever side the case is asserting.
+    jq -e . >/dev/null 2>&1 <<<"$pl" || { echo 99; return; }
+    printf '%s' "$pl" \
+      | env HOME="$H" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$@" "$0" >/dev/null 2>"${GERR:-/dev/null}"; echo $?; }
 
   # 1. A DENY WITH NO YES IN IT DOES NOT PAGE. The landing tool from a member-facing session: refused, the
   #    member told in their own channel, and the owner left asleep (00:03Z, the DM that started this).
@@ -204,9 +214,123 @@ if [ "${1:-}" = selfcheck ]; then
   old=$(g Bash '{"command":"pkill --older 3600"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
   pf=$(g Bash "{\"command\":\"pkill -F $T/pidfile10\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
   qv=$(g Bash '{"command":"pkill -q 7"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  # …and `-O`, --older's short spelling, which was the one still open: with 3600 read as the pattern the -u
+  # behind it never reached the fence, so this selected every process of that uid and matched none of them.
+  sho=$(g Bash "{\"command\":\"pkill -O 3600 -u $(id -u)\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
   keep=$(g Bash "{\"command\":\"pkill --older 3600 -f $ok10\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
-  if [ "$old" = 2 ] && [ "$pf" = 2 ] && [ "$qv" = 2 ] && [ "$keep" = 0 ] && kill -0 "$om" 2>/dev/null; then r=0; else r=1; fi
-  ok "an option's value is not a pattern however it is spelled: --older, -F and -q consume theirs and are refused for naming no process, while the same --older carrying a pattern still resolves it" $r
+  shk=$(g Bash "{\"command\":\"pkill -O 3600 -f $ok10\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  if [ "$old" = 2 ] && [ "$pf" = 2 ] && [ "$qv" = 2 ] && [ "$sho" = 2 ] && [ "$keep" = 0 ] && [ "$shk" = 0 ] \
+     && kill -0 "$om" 2>/dev/null; then r=0; else r=1; fi
+  ok "an option's value is not a pattern however it is spelled: --older, its short -O, -F and -q consume theirs and are refused for naming no process, while the same option carrying a pattern still resolves it" $r
+
+  # 11. A WRAPPER WORD IS NOT A WAY PAST A GATE, AND THE ANCHOR IS ONE VARIABLE. `$AT` knew a fixed set of
+  #     wrappers, so any word outside it hid the command behind it — and $AT is interpolated into every rule
+  #     this file has, so that was ONE hole in all of them and not a hole in two. Measured 2026-09-02:
+  #     `pkill -f claude` refused and `timeout 5 pkill -f claude` allowed; `tmux kill-server` refused and
+  #     `setsid tmux kill-server` allowed — the shared tmux server every session on this box runs inside,
+  #     from any session, by prefixing one word. So the table below is one row per rule FAMILY, each in a
+  #     wrapper $AT never knew, and each must be REFUSED. Its own fixture: its own asks dir, its own call log,
+  #     and the handoff row its own empty record dir. The tiers: un = no role and no marker at all, which is
+  #     what makes the tmux rows the universal gate rather than a worker one.
+  ASKS=$T/asks11; CALLS=$T/calls11; : > "$CALLS"; NL11=$T/notify11.log; mkdir -p "$T/hd11"; GERR=$T/err11
+  r=0
+  # Each row asserts the REASON as well as rc 2, because rc 2 alone would stay green if some neighbouring rule
+  # happened to refuse the row — and the claim here is that the wrapped command reached ITS OWN rule.
+  while IFS='|' read -r fam tier why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"                                        # …and no row may pass on the reason a previous one left
+    case "$tier" in
+      un) got=$(g Bash "{\"command\":\"$what\"}" "$T");;
+      hg) got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$ CC_HANDOFF=h11 CC_HANDOFF_DIR="$T/hd11");;
+      mb) got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/_cctest1" CC_ROLE=member CC_GUARD_ROOT_PID=$$ CC_NOTIFY_LOG="$NL11");;
+      *)  got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$);;
+    esac
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 60 "$GERR")"; }
+  done <<W11
+tmux, the universal gate|un|shared tmux server|timeout 5 tmux kill-server
+tmux, a pathed wrapper|un|shared tmux server|/usr/bin/setsid tmux kill-server
+tmux, a shell keyword|un|shared tmux server|! nice -n 5 tmux kill-server
+tmux, systemd-run|un|shared tmux server|systemd-run --user tmux kill-session
+tmux, an interpreter running its quoted string|un|shared tmux server|bash -c 'timeout 5 tmux kill-server'
+an option that runs its value, spelled as two tokens|un|shared tmux server|man -P 'tmux kill-server' ls
+…and the same option spelled --opt=VALUE|un|shared tmux server|sort --compress-program='tmux kill-server'
+--opt=VALUE whose value is one bare word|wt|landing a change|sort --compress-program=cc-land
+a key=value carried in an option's own token|un|shared tmux server|git -c core.pager='tmux kill-server' log
+merge|wt|merging a PR|nice -n 5 gh pr merge 3
+land|wt|landing a change|stdbuf -o0 cc-land 7
+deploy|wt|deploying.|ionice vercel deploy --prod
+public github comms|wt|public GitHub comms|chrt -f 1 gh issue create -t x
+raw gh api|wt|raw gh api call|taskset -c 0 gh api /user
+email|wt|sending email|flock /tmp/l11 mail -s x owner@example.com
+the owner's slack link|wt|cc slack off|watch cc slack off
+posting as the owner|wt|posting to the owner's Slack|torify cc-slack post -c #x hi
+sudo|wt|sudo / host changes|unbuffer sudo id
+host/network/service|wt|host/network/service changes|doas systemctl restart nginx
+container runtime|wt|running a container|runuser -u nobody docker run -v /:/host alpine
+container runtime, compose|wt|running a container|timeout 5 docker-compose up -d
+the kill fence|wt|outside this worker's own process subtree|timeout 5 kill -9 1
+the kill fence, a wrapped pkill|wt|selector but no pattern|ionice pkill -u 1000
+the kill fence, stdbuf|wt|outside this worker's own process subtree|stdbuf -o0 kill -9 1
+the box's credentials|wt|reading the box's credentials|timeout 5 cat $H/ccbox/env
+write path, a copy into ~/bin|wt|writing into the box's live tree|nice -n 5 cp /tmp/x11 $H/bin/cc-guard
+write path, git -C the live tree|wt|writing into the box's live tree|setsid git -C $H/dev/myrepo checkout .
+a non-live handoff|hg|NON-LIVE side of an overlapping handoff|timeout 5 cc done
+member dispatch|mb|does not dispatch workers (cc --go)|nice -n 5 cc myrepo t11 --go
+member dispatch, cc-loop|mb|does not dispatch workers (cc-loop)|stdbuf -o0 cc-loop myrepo t11
+member, a headless claude|mb|a headless claude spends the owner's budget|timeout 5 claude -p hello
+member, the box's config|mb|the box's config is not a member's to read|ionice cc-config get slack
+member, the box's secrets|mb|reading the box's secrets|watch cat /home/demo/.cc/config
+a quoted message whose FIRST word is gated|wt|landing a change|git commit -m 'cc-land runs twice'
+…and through the universal gate as well|un|shared tmux server|git commit -m 'tmux kill-server is banned'
+su -c, where the quoted interior IS the command|un|shared tmux server|su -c 'tmux kill-server'
+su -c, with a wrapper inside the quotes too|un|shared tmux server|su -c 'timeout 5 tmux kill-server'
+W11
+  # …and the same option behind a pipe, which the table above cannot carry: `|` is its field separator.
+  : > "$GERR"; got=$(g Bash "{\"command\":\"echo x | split --filter='tmux kill-server' -\"}" "$T")
+  { [ "$got" = 2 ] && grep -qF 'shared tmux server' "$GERR"; } \
+    || { r=1; echo "      an --opt=VALUE after a pipe: rc $got, refused for: $(head -c 60 "$GERR")"; }
+  # …AND THE OTHER HALF, which is what the walk costs: it stops at a head that cannot run a later token, so a
+  # command that merely NAMES one of the words above is still allowed. `echo` and `grep` are the two that
+  # matter — quoting a forbidden command is how a brief, a board note and this file's own cases get written.
+  # NOT here, though it was: a regex alternation naming two gated commands (`grep -E 'cc-land|gh pr merge' …`)
+  # is REFUSED, escaped or quoted, because the as-typed line still carries a raw `|` for $AT to anchor on.
+  # That is true on main as well — measured both ways — so it is not this change's to assert either way.
+  while IFS='|' read -r fam tier what; do
+    [ -n "$fam" ] || continue
+    got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+    [ "$got" = 0 ] || { r=1; echo "      refused but should not be ($fam): $what"; }
+  done <<W11B
+naming a command is not running it|wt|echo timeout 5 sudo systemctl restart nginx
+grepping for one is not either|wt|grep -rn sudo core/bin
+an ordinary wrapped command|wt|timeout 5 ls -la /tmp
+an ordinary read|wt|nice -n 5 cat /tmp/x11
+a directory named docker is not the runtime|wt|for f in docker/Dockerfile docker/entrypoint; do echo x; done
+the same cc done, with no handoff to gate it|wt|timeout 5 cc done
+a commit message naming a command MID-SENTENCE|wt|git commit -m 'no cp into ~/bin'
+a board note naming one mid-sentence|wt|cc board note myrepo t11 'do not cc-land this yourself'
+an attached value that is a path and not a command|wt|./configure --prefix=/usr/local --with-x=no
+a make variable|wt|make CC=gcc PREFIX=/tmp/x11 -j4
+an attached value that is a dull command|wt|git -c core.pager=cat log --oneline
+W11B
+  # …and the two bounds the walk carries, which fail OPEN on purpose. Before them one statement of 3000 words
+  # — `for f in <3000 paths>` — cost 27 seconds inside a PreToolUse hook; the answer must arrive, and a long
+  # argument list must not be refused for being long. 10s against a measured 0.6s: this catches a hang, not a
+  # slow box.
+  big=$(printf myprog; i=0; while [ $i -lt 3000 ]; do printf ' arg%d' $i; i=$((i+1)); done)
+  t0=$SECONDS
+  got=$(g Bash "{\"command\":\"$big\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  { [ "$got" = 0 ] && [ $((SECONDS - t0)) -lt 10 ]; } \
+    || { r=1; echo "      a 3000-word statement was refused or took $((SECONDS - t0))s (rc $got)"; }
+  # …and the bounds are PER STATEMENT, which is the difference between a bound and a bypass. Spent across the
+  # whole command, that same long statement in FRONT of a wrapped stop used up the budget and the stop was
+  # never walked — rc 0 through the universal gate, measured (review of #193). Same statement, same wrapper,
+  # ungated tier: it must still be refused, and by the tmux gate itself.
+  : > "$GERR"
+  got=$(g Bash "{\"command\":\"$big; do :; done; timeout 5 tmux kill-server\"}" "$T")
+  { [ "$got" = 2 ] && grep -qF 'shared tmux server' "$GERR"; } \
+    || { r=1; echo "      a long statement in front of a wrapped stop: rc $got, refused for: $(head -c 60 "$GERR")"; }
+  ok "a wrapper word in front of a command reaches the same rule the bare command does — every rule family, in wrappers \$AT never knew — while naming one of those commands still does not run it" $r
 
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
@@ -216,6 +340,10 @@ fi
 inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""' <<<"$inp"); cwd=$(realpath -m -- "${cwd:-/}" 2>/dev/null || echo "$cwd")
 # A command position: start, after a separator/substitution, or after wrapper words that hide the real command
 # (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
+# THIS LIST IS NO LONGER WHAT CLOSES THE RULES — cmdpos() below is. Every word it does not know used to hide
+# what followed it, in all 24 rules that interpolate $AT: `timeout 5 pkill -f claude` and `setsid tmux
+# kill-server` went straight through, the universal tmux gate included. It stays because it is what matches the
+# line AS TYPED, and every rule below still expects it; cmdpos() puts the real command at ^ as well.
 AT='(^|[;&|(){}`]|\$\() *(((then|else|elif|do|time|env|nohup|xargs|command|eval|exec|sudo|bash|sh|-c)|[A-Za-z_][A-Za-z0-9_]*=[^ ]*) +)*'
 # A HEREDOC BODY IS DATA, NOT A COMMAND. The rules grep raw text, so a brief, a journal entry or a commit
 # message that merely NAMES a forbidden command was refused for containing it — writing the brief for this fix
@@ -225,7 +353,110 @@ AT='(^|[;&|(){}`]|\$\() *(((then|else|elif|do|time|env|nohup|xargs|command|eval|
 # same line could EXECUTE it — an interpreter, eval, xargs, ssh, sudo fed a heredoc really does run its body,
 # and that is the one case where the body IS the command. Both fail CLOSED, back to matching the raw text.
 X='(^|[;&|(){}`]|[$][(])[ \t]*(((then|else|do|time|env|nohup|xargs|command|sudo)|[A-Za-z_][A-Za-z0-9_]*=[^ \t]+)[ \t]+)*([^ \t]*/)?(bash|sh|zsh|ksh|dash|python[0-9.]*|perl|ruby|node|php|awk|sed|eval|exec|source|[.]|xargs|env|ssh|sudo|systemd-run)([ \t]|$)'
-hay(){   # the text the rules match: heredoc bodies out, quotes stripped
+# A WRAPPER WORD IS NOT A WAY PAST A GATE. $AT recognises a fixed set of wrappers, so ANY word it does not
+# know hid the command behind it — measured 2026-09-02: `pkill -f claude` refused, `timeout 5 pkill -f claude`
+# allowed; `tmux kill-server` refused, `setsid tmux kill-server` allowed. That is one hole in all 24 rules, not
+# two holes: merging, landing, deploying, containers, host changes, sudo, dispatch and the write-path rules
+# share the anchor. Seven holes in four rounds of the kill fence say a wrapper list cannot be completed, so
+# THE LIST CHANGES SIDES. cmdpos() walks each statement token by token and adds every SUFFIX to the haystack as
+# its own line, so a rule anchored at ^ sees the real command wherever a wrapper put it — and it splits a token
+# at its first `=` as well, because an option that hands its value to a shell can attach that value rather than
+# spell it as a second word: `split --filter=CMD`, `sort --compress-program=CMD`, `git -c core.pager=CMD` were
+# all still allowed when the two-token forms were refused (review-193b). The walk stops only at
+# a head that cannot execute a later token — $NOEXEC, things that read, print, match, move or delete an
+# argument and never run one. A head this does not know is walked THROUGH: an unlisted spelling costs a FALSE POSITIVE, never a
+# bypass, which is the kill fence's own shape (refuse what you cannot reduce) applied to the anchor.
+# NOEXEC is deliberately short and dull. Anything that can run an argument — a shell, an interpreter, awk, sed
+# (GNU `e`), find (-exec), xargs, ssh, env, systemd-run, tmux, gh, git, cc — is NOT on it and never should be.
+# THREE THAT LOOK DULL AND ARE NOT, removed after review-193b: `split --filter=CMD` and `sort --compress-program=CMD`
+# both hand their argument to sh, and `man -P PAGER` runs the pager. They read files, so they read as text tools —
+# but each has one option that executes, and flush() returns at the first NOEXEC head, so listing them stopped the
+# walk and left everything after them unanchored. The test for this list is not "does it read?" but "is there any
+# option that runs a word?"; when in doubt leave a head OFF, which costs a false positive and never a bypass.
+# The log readers on it earn their place: `last -x reboot shutdown` names two gated words and runs neither,
+# and refusing that is the complaint already on the backlog about a worker blocked for grepping "reboot".
+# IT IS ONE SHELL STRING AND IT HAS NO COMMENTS IN IT. A `#` inside single quotes is a word, not a comment,
+# so a note written here would put its own words — `reboot`, `shutdown` — on the list of heads the walk stops at.
+NOEXEC=': [ [[ true false test echo printf cd pwd export unset set local declare readonly read shift return
+  break continue wait jobs sleep seq date basename dirname realpath readlink mktemp
+  cat tac head tail nl wc uniq cut tr rev fold column comm join paste csplit tee
+  grep egrep fgrep rg ag ack diff cmp jq yq
+  ls stat file du df tree touch mkdir rmdir rm cp mv ln install chmod chown chgrp truncate dd
+  md5sum sha1sum sha256sum cksum base64 xxd od strings hexdump
+  ps pgrep pkill kill killall top free uptime uname hostname whoami id groups tty which type
+  last lastb lastlog journalctl dmesg w who users
+  curl wget ping dig host nslookup less more'
+# TWO BOUNDS, AND BOTH ARE PER STATEMENT, WHICH IS THE WHOLE POINT OF THEM. The walk is quadratic in the
+# length of a STATEMENT, and a single statement of 3000 words (`for f in <3000 paths>`) cost 27 seconds in a
+# PreToolUse hook — so at most 64 positions and 262144 bytes of expansion FOR EACH STATEMENT, reset in flush().
+# A budget spent across the whole command was a bypass and not a bound: `for f in <3000 args>; do :; done;
+# timeout 5 tmux kill-server` exhausted it in the first statement and the second was never walked, so the
+# universal gate never saw the stop (review of #193). What the bounds cost is one statement, never the command:
+# a wrapper prefix longer than 64 words, or a single statement whose suffixes exceed 256 KB — `nice -n 5`
+# eleven times over. That is the same honest ceiling as a pid held in a variable: this stops accidents and
+# casual prompt-injection, not somebody who has read the file. Neither binds on real work — on the ten longest
+# commands this box has ever run the walk is not measurable, because a long command line is many short
+# statements or a heredoc, and heredoc bodies are dropped above.
+# A QUOTED STRING IS AN ARGUMENT, NOT A COMMAND POSITION — the same rule as a heredoc body above, and for the
+# same reason: `git commit -m "no cp into ~/bin"` is a message ABOUT a command, and the suite has asserted since
+# the write fence landed that it must not be refused. So a quoted run is ONE token to the walk: a command
+# position may START at the quote — something could run the whole string — and never in the MIDDLE of it.
+# WHAT THAT COSTS, PLAINLY: a quoted string whose FIRST word is a gated command IS refused — `git commit -m
+# '<a gated command> did x'` is denied where `git commit -m 'no <gated command> here'` is not, and the leading
+# word is the whole difference. It is kept that way deliberately, because the position that reads the message
+# is the position that reads `su -c '<a gated command>'`; both sides are asserted below (review of #193).
+# THE SAME FENCE AS THE HEREDOC KEEPS IT HONEST: when anything on the line could EXECUTE a string ($Q — a shell,
+# an interpreter, eval, xargs, ssh, sudo, systemd-run), the quotes are ignored and the line is walked as raw
+# text as well, so `bash -c "timeout 5 pkill x"` still puts `pkill x` in command position. A line that ENDS
+# inside a quote is walked raw too. Both fences fail CLOSED, and both only ever ADD positions.
+# $Q IS THE ONE LIST IN HERE WHOSE GAP IS A BYPASS RATHER THAN A FALSE POSITIVE, so it carries everything
+# that runs a STRING, not just the shells: `su -c '<wrapper> <command>'` was allowed while `su -c '<command>'`
+# was refused, because a quoted run is one token and only its FIRST word is a command position — the interior
+# is walked only when this says something on the line could execute it. Anything that takes a command as an
+# argument as a STRING belongs here — `su -c`, `runuser -c`, `script -c`, `flock … -c`, `watch` (which runs
+# its argument through sh). Wrappers that take an ARGV rather than a string (chroot, nsenter, setsid, nice)
+# do not: the walk already steps past those. Each entry costs a false refusal when its word appears in quoted
+# prose beside a gated command, which is why this list is the string-runners and not every wrapper.
+Q='(^|[^A-Za-z0-9_.-])(bash|sh|zsh|ksh|dash|python[0-9.]*|perl|ruby|node|php|awk|sed|eval|exec|source|[.]|xargs|env|ssh|sudo|su|runuser|script|watch|flock|systemd-run)([^A-Za-z0-9_.-]|$)'
+cmdpos(){   # every position in $1 a command could START at, one per line, original text first
+  awk -v NE="$NOEXEC" -v Q="$Q" '
+    BEGIN { m = split(NE, a, /[ \t\n]+/); for (i = 1; i <= m; i++) if (a[i] != "") noexec[a[i]] = 1
+            SQ = sprintf("%c", 39) }                    # the two bounds are per statement: see flush()
+    function strip(s) { gsub("[\"" SQ "]", "", s); return s }
+    function flush(t, nt,   i, j, h, v, out, tail, budget) {   # every suffix of one statement, quotes off on the way out
+      budget = 262144                                   # PER STATEMENT. As a per-command budget, one long
+      for (i = 1; i <= nt && i <= 64 && budget > 0; i++) {  # statement switched the walk off for every later one
+        h = strip(t[i]); sub(/^.*\//, "", h)            # /usr/bin/timeout is timeout
+        if (h in noexec) return                         # it cannot run t[i+1]: nothing after this is a command
+        tail = ""; for (j = i + 1; j <= nt; j++) tail = tail " " t[j]
+        if (i < nt) { out = substr(tail, 2); budget -= length(out) + 1
+          print strip(out) }                            # …but a word this does not know might, so walk past it
+        v = strip(t[i])                                 # "an --opt=VALUE whose value is a command has to reach
+        if (match(v, /=/) && RSTART < length(v)) {      #  command position the same way an --opt VALUE one does"
+          out = substr(v, RSTART + 1) tail; budget -= length(out) + 1
+          print strip(out) }                            # (review-193b) — the value is not its own token, so the
+      }                                                 # loop above never reaches it: split it off at the first =
+    }
+    function scan(line, qa,   i, n, c, q, cur, nt, t) {   # returns non-empty if the line ended inside a quote
+      q = ""; cur = ""; nt = 0; n = length(line)
+      for (i = 1; i <= n; i++) { c = substr(line, i, 1)
+        if (q != "") { cur = cur c; if (c == q) q = ""; continue }
+        if (c == "\\") { cur = cur substr(line, i, 2); i++; continue }   # \| is an escaped char, not a pipe
+        if (qa && (c == "\"" || c == SQ)) { q = c; cur = cur c; continue }
+        if (c == " " || c == "\t") { if (cur != "") { t[++nt] = cur; cur = "" }; continue }
+        if (c == "$" && substr(line, i+1, 1) == "(") { if (cur != "") t[++nt] = cur
+          flush(t, nt); delete t; nt = 0; cur = ""; i++; continue }
+        if (index(";&|(){}`", c) > 0) { if (cur != "") t[++nt] = cur
+          flush(t, nt); delete t; nt = 0; cur = ""; continue }
+        cur = cur c }
+      if (cur != "") t[++nt] = cur
+      flush(t, nt)
+      return q
+    }
+    { print strip($0)                                   # the line as typed: no rule loses what it matched before
+      if (scan($0, 1) != "" || $0 ~ Q) scan($0, 0) }' <<<"$1"
+}
+hay(){   # the text the rules match: heredoc bodies out, quotes stripped, every command position at ^
   local c=$1
   case "$c" in *'<<'*) c=$(awk -v X="$X" '
       { L[NR] = $0 }
@@ -242,7 +473,7 @@ hay(){   # the text the rules match: heredoc bodies out, quotes stripped
           t = "^[ \t]*" w "[ \t]*$"
           for (j = i + 1; j <= NR; j++) if (L[j] ~ t) { b = 1; break }
         } }' <<<"$c");; esac
-  c=${c//\"/}; printf '%s' "${c//\'/}"
+  cmdpos "$c"          # …which strips the quotes itself: it needs them to tell an argument from a command
 }
 if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones and their subagents included): nothing may kill the shared tmux server
   u=$(hay "$(jq -r '.tool_input.command // ""' <<<"$inp")")
@@ -478,7 +709,11 @@ case "$tool" in
     # is in group `docker`, so one `docker run -v /:/host` reads and writes the whole filesystem as root — the
     # credentials below included — with no escalation at all. So it is denied for every gated role, which subsumes
     # the narrower "destroying docker resources" rule this replaces. The sanctioned sandbox (ccbox) is the owner's.
-    grep -qE "$AT"'([^ ]*/)?(docker|podman|nerdctl)\b' <<<"$cmd" && never "running a container (this user is in group docker, so a bind-mounted container reads and writes everything as root)"
+    # `…([^/A-Za-z0-9_.]|$)`, not `…\b`: with every command position now at ^ (cmdpos above), `\b` made the
+    # DIRECTORY `docker/Dockerfile` a container run — one `for f in docker/…` refused. A path INTO a dir named
+    # docker is not the runtime; a path TO the binary still is, and that is what the prefix ahead of it is for.
+    # `-` stays OUT of the exclusion on purpose: `docker-compose up` is the runtime and `\b` was what caught it.
+    grep -qE "$AT"'([^ ]*/)?(docker|podman|nerdctl)([^/A-Za-z0-9_.]|$)' <<<"$cmd" && never "running a container (this user is in group docker, so a bind-mounted container reads and writes everything as root)"
     grep -qE "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' <<<"$cmd" && never "host/network/service changes"
     grep -qE 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' <<<"$cmd" && never "destructive git"
     # 3b. A WORKER KILLS ONLY WHAT IT STARTED. 2026-09-02 11:15Z a worker went hunting a "stray" suite with
@@ -548,7 +783,9 @@ case "$tool" in
             # owns over an hour old, which is its own claude -p and its loop runner. Consumed here, those
             # commands reduce to NO pattern and land in the refusal below, which is where a selector that
             # names no process belongs (review of #181).
-            --older|-r|--runstates|-F|--pidfile|-q|--queue|--env|--cgroup) sk=1;;
+            # `-O` is --older's short spelling and was the one left: `pkill -O 3600 -u 1000` read 3600 as the
+            # pattern, so the -u never reached the fence at all — every process of that uid, unfenced.
+            -O|--older|-r|--runstates|-F|--pidfile|-q|--queue|--env|--cgroup) sk=1;;
             -f|--full) full=1;;
             -*) ;;                                     # a flag, a signal, or --opt=value: none of them a pattern
             *) [ -n "$pat" ] || pat=$y;;
