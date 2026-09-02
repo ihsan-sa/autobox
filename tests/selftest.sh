@@ -1077,7 +1077,35 @@ rm -f "$T/remote.git/hooks/pre-receive"
   && ! tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 done" && tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 finished, but opened no PR"; } \
   && ok "STATUS: DONE over a dead push is not done: cc done's failure reaches the loop — exit 4, board blocked with the reason, no DONE notice (audit F3)" \
   || bad "a dead push finished green: rc=$rc status=$("$B/cc-board" get $REPO w15 status) notes=$("$B/cc-board" get $REPO w15 notes | tail -c 200)"
-for t in w8 w9 w10 w11 w12 w13 w14 w15; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
+# 10: the context trim (CC_LOOP_TRIM) reaches the worker's own environment when it is on, and OFF IS THE DEFAULT —
+# off is the run this loop has always done, with no context edit in the request at all. It ships off so a week of
+# shadow measurement (`cc-loop context-report`) can decide it on dollars per accepted PR, not on tokens per turn.
+mktrack w16 "trimmed or not"
+mkclaude trimclaude w16 'echo "${CLAUDE_CODE_EXTRA_BODY:-none}" > "$st/extra-body"; echo "- step $n" >> "$st/progress.md"'
+: > "$T/trimcfg"   # its own empty config, so "off by default" is the default and not whatever this box has set
+CC_CONFIG="$T/trimcfg" CC_CLAUDE="$T/trimclaude" "$B/cc-loop" $REPO w16 --max-iter 1 --quiet >/dev/null 2>&1
+off=$(cat ~/.cc/state/$REPO/w16/extra-body 2>/dev/null)
+CC_LOOP_TRIM=1 CC_CONFIG="$T/trimcfg" CC_CLAUDE="$T/trimclaude" "$B/cc-loop" $REPO w16 --max-iter 1 --quiet >/dev/null 2>&1
+on=$(cat ~/.cc/state/$REPO/w16/extra-body 2>/dev/null)
+{ [ "$off" = none ] && [ "$(jq -r '.context_management.edits[0].type' <<<"$on" 2>/dev/null)" = clear_tool_uses_20250919 ] \
+  && [ "$(lg w16 | grep -c 'context trim on')" = 1 ]; } \
+  && ok "the context trim is off by default — the worker's environment carries no context edit at all — and CC_LOOP_TRIM=1 puts one there, on the run the log names" \
+  || bad "context trim wiring: off=$(head -c 60 <<<"$off") on=$(head -c 60 <<<"$on") logged=$(lg w16 | grep -c 'context trim on')"
+# 11: …and the knob survives the DISPATCH, which is the only way anyone sets it per run. `cc … --go` starts the loop
+# in a NEW TMUX WINDOW, and that window gets the tmux server's environment, not the caller's — so a knob that is not
+# in cc's `pre` whitelist is silently dropped and cc-config falls back to ~/.cc/config. That fails in BOTH directions
+# (`CC_LOOP_TRIM=0` in front of a box whose config says 1 still trims; `=1` on a box with no key does not), and a
+# shadow week comparing trimmed against untrimmed tracks would be measuring neither (review of #184). Own stub, own log.
+mktrack w17 "dispatched, trimmed or not"   # its own track and its own tmux stub: this case reads the command cc
+mkdir -p "$T/trimstub"; printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$TMUX_STUB_LOG"\nexit 0\n' > "$T/trimstub/tmux"   # would have launched, so nothing runs
+chmod +x "$T/trimstub/tmux"
+god(){ : > "$T/trimgo.log"; env PATH="$T/trimstub:$B:$PATH" TMUX_STUB_LOG="$T/trimgo.log" CC_CLAUDE=/bin/true "$@" \
+         "$B/cc" $REPO w17 --go 'trim or not' >/dev/null 2>&1; grep new-window "$T/trimgo.log"; }
+gnone=$(god env); gon=$(god env CC_LOOP_TRIM=1); goff=$(god env CC_LOOP_TRIM=0)
+{ ! grep -q CC_LOOP_TRIM <<<"$gnone" && grep -q 'CC_LOOP_TRIM=1 ' <<<"$gon" && grep -q 'CC_LOOP_TRIM=0 ' <<<"$goff"; } \
+  && ok "the trim knob survives \`cc --go\`: set in front of one dispatch it reaches the loop's own window — 0 as loudly as 1, so a box whose config says 1 can still run one track untrimmed — and nothing is carried when it is unset" \
+  || bad "CC_LOOP_TRIM does not cross the tmux window: unset='$(head -c 90 <<<"$gnone")' on='$(head -c 90 <<<"$gon")' off='$(head -c 90 <<<"$goff")'"
+for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
 echo "== usage limits (cc-limit + cc-loop) =="
 L(){ HOME="$T/lh" CC_LIMIT_STAMP="$T/lh/claude-limit" "$B/cc-limit" "$@"; }; mkdir -p "$T/lh"; lf="$T/lim.json"; miss=""   # own HOME: the table never touches the box's real stamp

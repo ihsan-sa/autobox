@@ -8,6 +8,8 @@
 #                          [--no-extend]    the step limit is FINAL: no carry-on batches at --max-iter, so a caller
 #                                           that promised "one round" (cc-land's fix round) gets exactly that
 #   cc-loop worker-model [M]  the model a worker runs on, and why (worker_model below) — cc names it on its dispatch line
+#   cc-loop context-report <session.jsonl>…  what a turn of a past iteration actually carried, and what the context
+#                                            trim below would have left of it — the shadow week's one command
 # THE STEP LIMIT IS A CHECKPOINT, NOT A VERDICT: reaching --max-iter with work COMMITTED in that iteration buys
 # another N iterations, as often as it keeps committing. There is no spend cap (owner, 2026-08-31: "no spend cap
 # as some just are expensive") — what stops a loop is not being expensive, it is not producing:
@@ -43,6 +45,8 @@
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
 # Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
+# Env: CC_LOOP_TRIM=1 (cc-config key or the environment) drops OLD TOOL RESULTS from a worker's context — off by
+#      default, and off is byte-for-byte the run this loop always did. What it is and what it measured: trim_body.
 # Env: CC_WORKER_SANDBOX=1 runs claude inside bwrap — secrets, sockets, other tracks absent (cc-sandbox; design-worker-sandbox stage 1a).
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # headless workers: same PATH guarantee as cc (systemd-started clients lack ~/bin)
@@ -116,6 +120,85 @@ last_session(){   # $1 a track's runs/ directory → the session id of its most 
     [ -n "$s" ] && { printf %s "$s"; return 0; }
   done < <(find "$1" -maxdepth 1 -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -20 | cut -d' ' -f2-)
   return 1; }
+
+# ── THE CONTEXT TRIM, off unless CC_LOOP_TRIM says otherwise ──────────────────────────────────────────────────
+# A worker replays every tool result it has ever seen on every turn: 63 turns averaging ~74k of context, most of
+# it stale output. With the knob on, the API drops the OLDER TOOL RESULTS from the request (context editing,
+# clear_tool_uses) before the model reads it. The tool CALL stays, so the worker still knows it ran the command
+# and only stops carrying the output. NOTHING ELSE IS TOUCHED: the brief, the constraints and the journal tail
+# travel in the -p prompt and in --append-system-prompt, which this edit cannot reach, and the last TRIM_KEEP
+# results — the current diff and test state — stay whole.
+# MEASURED ON THIS BOX (2026-09-02, A/B on one task): context per turn -30%, DOLLARS +41%. Clearing moves the
+# prompt-cache boundary, so the suffix is re-written at 1.25x instead of read at 0.1x. Tokens per turn and
+# dollars are not the same lever. That is why this ships OFF: a week of `cc-loop context-report` on real tracks
+# decides it, judged on dollars per accepted PR (codex efficiency review, 2026-09-02) and not on tokens.
+TRIM_TRIGGER=45000; TRIM_KEEP=6; TRIM_ATLEAST=8000   # ONE policy, read by the request body and by context-report
+trim_body(){   # what a trimmed run adds to CLAUDE_CODE_EXTRA_BODY, or NOTHING at all when the knob is off.
+               # cc-config's precedence is this knob's: the environment beats the file, so CC_LOOP_TRIM=0 in
+               # front of one dispatch turns it off for that run without touching the box's config. Across a
+               # `cc … --go` that rests on cc's `pre` whitelist carrying CC_LOOP_TRIM into the tmux window —
+               # drop it from that list and this silently reads the file instead (selftest, the cc-loop block).
+  case "$("$BIN/cc-config" get CC_LOOP_TRIM 0 2>/dev/null)" in 1|on|yes|true) ;; *) return 0;; esac
+  printf '{"context_management":{"edits":[{"type":"clear_tool_uses_20250919","trigger":{"type":"input_tokens","value":%s},"keep":{"type":"tool_uses","value":%s},"clear_at_least":{"type":"input_tokens","value":%s}}]}}\n' \
+    "$TRIM_TRIGGER" "$TRIM_KEEP" "$TRIM_ATLEAST"; }
+trim_replay(){   # $1 a session transcript (~/.claude/projects/<project>/<session>.jsonl) → what the policy above
+                 # would have done to that iteration: one KEPT|/CLEARED| line per part it carried, then
+                 # SUMMARY|turns|ctx|trimmed|pct. The BEFORE is measured, not guessed — a turn's context is what
+                 # the API billed for it (input + both cache counters); only the saving is modelled, from the
+                 # cleared tool results' own text. Every turn of a real iteration is in the file, so the method
+                 # is the same one the shadow week uses on a trimmed track.
+  [ -r "$1" ] || { echo "cc-loop: cannot read transcript $1" >&2; return 1; }
+  python3 - "$1" "$TRIM_TRIGGER" "$TRIM_KEEP" "$TRIM_ATLEAST" <<'PY'
+import json, sys
+path, trig, keep, atleast = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+def ex(s, n=400): return ' '.join(str(s).split())[:n]
+parts, tools, turns, seen = [], [], [], set()   # parts: [kind, text, tool_index or None]
+for line in open(path, errors='replace'):
+    try: r = json.loads(line)
+    except Exception: continue
+    m = r.get('message') or {}
+    if r.get('type') == 'user':
+        c = m.get('content')
+        for b in (c if isinstance(c, list) else [{'type': 'text', 'text': c or ''}]):
+            if not isinstance(b, dict): continue
+            if b.get('type') == 'tool_result':
+                s = b.get('content')
+                s = s if isinstance(s, str) else json.dumps(s)
+                parts.append(['tool_result', s, len(tools)]); tools.append(max(1, len(s) // 4))
+            elif b.get('type') == 'text' and b.get('text', '').strip():
+                parts.append(['prompt', b['text'], None])
+    elif r.get('type') == 'assistant':
+        for b in (m.get('content') or []):
+            if isinstance(b, dict) and b.get('type') == 'text' and b.get('text', '').strip():
+                parts.append(['said', b['text'], None])
+        mid = m.get('id')   # a transcript repeats one assistant message per content block; it is ONE turn
+        if mid is not None and mid in seen: continue
+        seen.add(mid)
+        u = m.get('usage') or {}
+        ctx = (u.get('input_tokens') or 0) + (u.get('cache_read_input_tokens') or 0) + (u.get('cache_creation_input_tokens') or 0)
+        if ctx: turns.append((ctx, len(tools)))
+def cleared_at(ctx, ntools):   # the policy, turn by turn: over the trigger, keep the last N, and only if the
+    if ctx <= trig or ntools <= keep: return 0   # saving is worth moving the cache boundary for
+    c = sum(tools[:ntools - keep])
+    return c if c >= atleast else 0
+tot = sum(c for c, _ in turns); saved = sum(cleared_at(c, n) for c, n in turns)
+gone = 0   # how many of the tool results the LAST turn no longer carried — what KEPT/CLEARED below report
+if turns and cleared_at(*turns[-1]): gone = turns[-1][1] - keep
+for kind, text, ti in parts:
+    print('%s|%s|%s' % ('CLEARED' if (ti is not None and ti < gone) else 'KEPT', kind, ex(text)))
+if not turns: sys.exit(0)   # nothing was billed in this file: no turn to report on, and the caller says so
+print('SUMMARY|turns=%d|ctx=%d|trimmed=%d|pct=%+.1f' % (len(turns), tot / len(turns), (tot - saved) / len(turns),
+      -100.0 * saved / tot if saved else 0.0))   # …and a turn that loses nothing prints +0.0, not -0.0
+PY
+}
+context_report(){   # `cc-loop context-report <session.jsonl>…` — one line per iteration: what a turn carried, what
+                    # it would have carried trimmed, and the fraction. The shadow week runs this and nothing else.
+  [ $# -gt 0 ] || { echo "usage: cc-loop context-report <session.jsonl>…" >&2; return 2; }
+  local f s rc=0
+  for f in "$@"; do
+    s=$(trim_replay "$f" | sed -n 's/^SUMMARY|//p') || { rc=1; continue; }
+    [ -n "$s" ] && printf '%s: %s\n' "$(basename "$f")" "${s//|/ }" || { printf '%s: no turns recorded\n' "$(basename "$f")"; rc=1; }
+  done; return $rc; }
 
 CHECKLIST="$(dirname "$BIN")/templates/self-review.md"   # the six recurring stops live in ONE place, and this is it
 selfrev_block(){   # $1 the base branch → the self-review paragraph the worker prompt carries, or NOTHING if the
@@ -204,16 +287,49 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   grep -q 'git diff origin/trunk' <<<"$blk";                  t 'and the base branch it is read against' "$?" 0
   grep -q 'The contract says what the code now does' <<<"$blk"; t 'and carries the checklist itself, not a link a sandboxed worker cannot open' "$?" 0
   CHECKLIST="$d/absent/self-review.md"   # a fresh path this selfcheck never created — not the fixture above, emptied
-  [ -z "$(selfrev_block trunk)" ];                            t 'no checklist file: the prompt promises nothing' "$?" 0
+  t 'no checklist file: the prompt promises nothing' "$(selfrev_block trunk)" ""  # compared, not tested: a $? here reads as the condition's
   CHECKLIST="$realcl"
-  [ -r "$CHECKLIST" ];                                        t 'the shipped checklist is where the prompt says it is' "$?" 0
+  t 'the shipped checklist is where the prompt says it is' "$(test -r "$CHECKLIST" && echo readable)" readable
   grep -q '^6\. ' "$CHECKLIST" 2>/dev/null;                    t 'and still carries all six entries' "$?" 0
+  # ── the context trim: what a worker's environment gets, and what a trimmed turn still carries ──
+  # OFF IS THE DEFAULT, and off means nothing at all — no context edit in the request, so the API drops
+  # nothing and the run is the one this loop has always done. The config is a scratch file, never the box's.
+  local body over under less
+  : > "$d/trimcfg"
+  t 'the knob is off by default: a worker run carries no context edit at all' \
+    "$(unset CC_LOOP_TRIM; CC_CONFIG="$d/trimcfg" trim_body)" ""
+  printf 'CC_LOOP_TRIM=1\n' > "$d/trimcfg"
+  body=$(unset CC_LOOP_TRIM; CC_CONFIG="$d/trimcfg" trim_body)
+  t 'on: the request carries the tool-result edit' "$(jq -r '.context_management.edits[0].type' <<<"$body" 2>/dev/null)" clear_tool_uses_20250919
+  t 'and it keeps the most recent results — the current diff and test state' "$(jq -r '.context_management.edits[0].keep.value' <<<"$body" 2>/dev/null)" "$TRIM_KEEP"
+  t 'the environment beats the file, so one dispatch opts out without touching the config' \
+    "$(CC_LOOP_TRIM=0 CC_CONFIG="$d/trimcfg" trim_body)" ""
+  # …and what the trim would take: two fixtures of its own, one turn over the trigger and one under it.
+  mktrim(){ local f="$1" ctx="$2" k pad; pad="OLD-SEARCH-HIT $(head -c 12000 /dev/zero | tr '\0' x)"   # $2 = what the API billed that turn
+    { jq -nc '{type:"user",message:{role:"user",content:[{type:"text",text:"# TASK  Build the widget. CONSTRAINT: never touch main, never edit outside the worktree."}]}}'
+      for k in 1 2 3 4 5 6 7 8 9; do jq -nc --arg c "tool-result-$k $pad" '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:"t",content:$c}]}}'; done
+      jq -nc --argjson n "$ctx" '{type:"assistant",message:{id:"m1",role:"assistant",content:[{type:"text",text:"check-extra case 3 is still red — UNRESOLVED, the next iteration has to fix it."}],usage:{input_tokens:$n,cache_read_input_tokens:0,cache_creation_input_tokens:0}}}'
+    } > "$f"; }
+  sumf(){ grep '^SUMMARY|' <<<"$1" | tr '|' '\n' | sed -n "s/^$2=//p"; }
+  mktrim "$d/over.jsonl" $((TRIM_TRIGGER + 20000)); mktrim "$d/under.jsonl" $((TRIM_TRIGGER - 1))
+  over=$(trim_replay "$d/over.jsonl"); under=$(trim_replay "$d/under.jsonl")
+  grep -q '^KEPT|prompt|.*Build the widget' <<<"$over";             t 'a trimmed turn still carries the brief' "$?" 0
+  grep -q '^KEPT|prompt|.*CONSTRAINT: never touch main' <<<"$over"; t 'and the constraints with it' "$?" 0
+  grep -q '^KEPT|said|.*UNRESOLVED' <<<"$over";                     t 'and the failure it has not fixed yet' "$?" 0
+  grep -q '^KEPT|tool_result|tool-result-9 ' <<<"$over";            t 'and the newest tool result: the diff and test state it is working on' "$?" 0
+  grep -q '^CLEARED|tool_result|tool-result-1 ' <<<"$over";         t 'what goes is the stale tool output' "$?" 0
+  grep -q '^CLEARED|tool_result|tool-result-9 ' <<<"$over";         t 'and never the newest' "$?" 1
+  grep -q '^CLEARED' <<<"$under";                                   t 'a turn under the trigger is left whole' "$?" 1
+  t 'under the trigger the report says nothing would have gone' "$(sumf "$under" trimmed)" "$(sumf "$under" ctx)"
+  [ "$(sumf "$over" trimmed)" -lt "$(sumf "$over" ctx)" ] && less=yes || less=no
+  t 'over it, that turn would have carried less' "$less" yes
   sed 's/^/  journal fixture | /' "$d/progress.md"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
 [ "${1:-}" = selfcheck ] && { selfcheck; exit $?; }
 [ "${1:-}" = worker-model ] && { worker_model "${2:-}"; exit 0; }   # cc asks this to name the model on its dispatch line
+[ "${1:-}" = context-report ] && { context_report "${@:2}"; exit $?; }
 repo="${1:?repo}"; track="${2:?track}"; shift 2
 MAXI=10; BUDGET=8; TURNS=80; MODEL=""; EFFORT=""; QUIET=0; RESUME=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
 while [ $# -gt 0 ]; do case "$1" in
@@ -272,9 +388,10 @@ while [ $i -lt "$MAXI" ]; do
     if sid=$(last_session "$ST/runs"); then args+=(--resume "$sid"); log "iter 1 resumes session $sid (--resume-last)"
     else log "iter 1 was asked to resume, but no run of this track recorded a session id — starting fresh"; fi
   fi
-  log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS, model ${m:-box default})"   # the model is in the log too (a survey of what workers ran on found this default wrong) — AFTER the "start (budget" prefix cc-secretary parses (review of #169)
+  TRIMENV=(); tb=$(trim_body); [ -n "$tb" ] && TRIMENV=("CLAUDE_CODE_EXTRA_BODY=$tb")   # empty unless CC_LOOP_TRIM is on: the child's environment is otherwise exactly what it always was
+  log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS, model ${m:-box default}${TRIMENV:+, context trim on})"   # the trim is named in the log so a shadow week can tell trimmed runs from the rest; the model is in the log too (a survey of what workers ran on found this default wrong) — AFTER the "start (budget" prefix cc-secretary parses (review of #169)
   out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"
-  ( cd "$WT" && CC_ROLE=worker exec "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
+  ( cd "$WT" && exec env CC_ROLE=worker "${TRIMENV[@]}" "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
   child=$!; wait "$child"; rc=$?; child=""
   if lim=$("$BIN/cc-limit" check "$out" "$out.err"); then   # usage/rate limit: this iteration never happened — no errs, no stall, no cap
     resets=$(date -u -d "@${lim#LIMIT }" +%H:%M)
