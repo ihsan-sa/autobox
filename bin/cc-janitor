@@ -7,12 +7,14 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
 
   cc-janitor <repo> [<repo> …] [--dry]      sweep exactly the repos named — never any other
   cc-janitor --configured [--dry]           the repos in CC_JANITOR_REPOS (~/.cc/config); the timer's form
+  cc-janitor --fixtures [--dry]             rule 6 alone, no repo: cc-reconcile's 20-min pass calls this
   cc-janitor selfcheck                      the decision table + one end-to-end run, no network
     also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
 
-PER REPO, NEVER ACROSS THEM. Every entry point takes repo names. There is no "sweep everything" — a tool that
-deletes has to be pointed, and the timer is pointed by a config line the owner writes. Rule 5 is the one
-box-wide pass — a container is pointed by its name — and it runs with an empty CC_JANITOR_REPOS too.
+PER REPO, NEVER ACROSS THEM — rules 1-4. Those entry points take repo names: a tool that deletes has to be
+pointed, and the timer is pointed by a config line the owner writes. Two passes are box-wide because what they
+sweep is pointed by its own name, not by a repo: rule 5 (a container names itself `ccbox-*`) and rule 6 (a
+fixture names itself `_cctest<pid>`). Both run on every invocation, with an empty CC_JANITOR_REPOS too.
 
 THE ONE RULE ABOVE THE RULES: delete only what is PROVEN dead. Anything uncertain — a PR that closed without
 merging, a branch nobody opened one for, a window with something running in it, a worktree with uncommitted
@@ -31,17 +33,23 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      0 = off)  →  `docker rm`. Never `rmi`: the image stays. Only ccbox's own containers, by name, never a running
      one. A ccbox mounts one project dir and nothing else, so what a run meant to keep is already outside it;
      after a week the stopped container is a leftover, not a result.
+  6. a selftest fixture — board, lock, worktrees, state, ~/dev clone, scratch dir, deploy-ledger marker, context
+     dir, tmux window, handoff-log lines, all named `_cctest<pid>` by core/tests/selftest.sh — whose <pid> is gone
+     → removed. THE PID IS THE WHOLE TEST: alive means the suite is running and everything it made is its. A suite
+     that died before its own trap left a board whose `waiting` row reached the owner's NEEDS YOU list (2026-09-01).
 
 LIVENESS IS NOT DECIDED HERE. `cc-reconcile` already owns "what is really alive", and two definitions of that
 would drift into a tool that kills working sessions. This reads its snapshot (~/.cc/state/reconcile.json,
 refreshed first when stale) and treats `live` as final. The snapshot only covers tracks the board knows, so a
 window for a track that was never on it falls back to the pane test `cc` itself uses (pane_live: the pane's
-shell has a child) — the same rule, not a second one. Both must be quiet before anything is killed.
+shell has a child) — the same rule, not a second one. Both must be quiet before anything is killed. Rule 6 is
+outside all of this: a suite pid is not a track, so the snapshot has nothing to say about it and `/proc/<pid>`
+is the whole test.
 
 Every action goes to ~/.cc/state/janitor.log. `--dry` prints what it would do and writes nothing at all.
 Exit: 0 done (with or without findings) · 2 usage.
 """
-import calendar, json, os, shutil, signal, subprocess, sys, time
+import calendar, glob, json, os, re, shutil, signal, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy: a worktree tests itself
@@ -53,6 +61,7 @@ PRMAX = 200           # one `gh pr list` per repo, capped: a timer job must neve
 TERMINAL = ("merged", "done")
 NEXT = "~next"        # cc-handoff's successor window suffix; `~` is not legal in a repo or track name
 CONTAINER_DAYS = 7    # rule 5: a ccbox-* container stopped longer is a leftover; CC_JANITOR_CONTAINER_DAYS overrides, 0 = off
+FIXTURE = "_cctest"   # rule 6: what core/tests/selftest.sh names everything one run makes — `_cctest<pid>`, pid = the suite
 
 
 def now():
@@ -415,6 +424,73 @@ def sweep_containers(r, days):
             r.report("ccbox", f"container {name}", why)
 
 
+def fixtures():
+    """{pid: [paths]} of every `_cctest<pid>` thing on this box: the board and its lock, worktrees, state, the ~/dev
+    clone, the run's scratch dir, its entry in the deploy ledger, its context dir — the namespace selftest.sh gives
+    one run (RUN=$$) and its own trap removes, when the run lives to reach the trap."""
+    found = {}
+    for pat in (f"{BOARDS}/{FIXTURE}*", f"{WTS}/{FIXTURE}*", f"{STATE}/{FIXTURE}*", f"{DEV}/{FIXTURE}*",
+                f"{HOME}/.cc/selftest-[0-9]*", f"{STATE}/land/{FIXTURE}*.applied", f"{HOME}/.claude/projects/{FIXTURE}*"):
+        for p in glob.glob(pat):
+            m = re.search(r"(?:_cctest|selftest-)(\d+)", os.path.basename(p))
+            if m:
+                found.setdefault(int(m.group(1)), []).append(p)
+    return found
+
+
+def fixture_pid(name):
+    """The suite pid a fixture's name carries (`_cctest<pid>`, `_cctest<pid>/w1`, `_cctest<pid>/hx~next`), or None."""
+    m = re.match(rf"{FIXTURE}(\d+)(?:[/~]|$)", name)
+    return int(m.group(1)) if m else None
+
+
+def sweep_fixtures(r):
+    """Rule 6, box-wide: what a selftest run left behind. Every fixture the suite makes carries the suite's pid, and a
+    suite that died mid-run (a kill, a usage limit, a reboot) never reached its own trap: a `_cctest<pid>` board whose
+    `waiting` row read like a real ask and reached the owner's NEEDS YOU list, a phantom repo in the deploy ledger on
+    every catch-up tick, lines in the handoff ledger the Home tab tails (2026-09-01). THE PID IS THE WHOLE TEST: alive →
+    the suite is running and everything it made is its (a reused pid keeps a leftover a while longer, which is the cheap
+    direction); gone → removed, and the ledger loses its lines. cc-reconcile's 20-min pass calls `--fixtures` for this
+    alone; the weekly run does it with the rest."""
+    found = fixtures()
+    wins = [(wid, name, fixture_pid(name)) for wid, name in windows() if fixture_pid(name) is not None]
+    for _, _, pid in wins:
+        found.setdefault(pid, [])
+    ledger = f"{STATE}/context/handoff.log"
+    try:
+        lines = open(ledger, errors="replace").read().splitlines(keepends=True)
+    except OSError:
+        lines = []
+    for ln in lines:
+        pid = fixture_pid(ln[ln.find(FIXTURE):]) if FIXTURE in ln else None
+        if pid is not None:
+            found.setdefault(pid, [])
+    dead = sorted(pid for pid in found if not os.path.exists(f"/proc/{pid}"))
+    if not dead:
+        return
+    print(f"cc-janitor selftest fixtures{' (dry run)' if r.dry else ''}")
+    for pid in dead:
+        why = f"left by selftest run {pid}, which is gone"
+        for p in sorted(found[pid]):
+            r.act("selftest", "rm", p, why, ["rm", "-rf", "--", p])
+        for wid, name, wpid in wins:
+            if wpid == pid:
+                r.act("selftest", "kill window", f"{name} ({wid})", why, ["tmux", "kill-window", "-t", wid])
+    keep = [ln for ln in lines if not (FIXTURE in ln and fixture_pid(ln[ln.find(FIXTURE):]) in dead)]
+    if len(keep) < len(lines):
+        why = f"{len(lines) - len(keep)} lines of selftest runs that are gone"
+        if not r.dry:
+            try:
+                with open(ledger + ".tmp", "w") as f:
+                    f.writelines(keep)
+                os.replace(ledger + ".tmp", ledger)
+            except OSError as e:
+                r.report("selftest", ledger, f"scrub failed: {e}")
+                return
+        r.log("selftest", "scrub", ledger, why)
+        r.did.append(ledger)
+
+
 def setting(key, default=""):
     """A ~/.cc/config value through cc-config, the file's one reader: the environment wins, set-but-empty included."""
     try:
@@ -448,22 +524,25 @@ def main(argv):
         return selfcheck()
     dry = "--dry" in argv
     net = "--no-net" not in argv
+    only_fixtures = "--fixtures" in argv                # rule 6 alone: cheap enough for cc-reconcile's 20-min pass
     repos = [a for a in argv if not a.startswith("-")]
     if "--configured" in argv:
         repos = configured()
         if not repos:                                   # rule 5 still runs: a container is pointed by its name
             print("cc-janitor: no repos configured (CC_JANITOR_REPOS in ~/.cc/config) — no repo swept")
-    elif not repos:
+    elif not repos and not only_fixtures:
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
-        print("usage: cc-janitor <repo> [<repo> …] [--dry] | --configured [--dry] | selfcheck", file=sys.stderr)
+        print("usage: cc-janitor <repo> [<repo> …] [--dry] | --configured [--dry] | --fixtures [--dry] | selfcheck", file=sys.stderr)
         return 2
     r = Run(dry)
-    for repo in repos:
-        if "/" in repo or repo.startswith("."):
-            print(f"cc-janitor: '{repo}' is not a repo name", file=sys.stderr)
-            return 2
-        sweep(repo, r, net)
-    sweep_containers(r, container_days())
+    if not only_fixtures:
+        for repo in repos:
+            if "/" in repo or repo.startswith("."):
+                print(f"cc-janitor: '{repo}' is not a repo name", file=sys.stderr)
+                return 2
+            sweep(repo, r, net)
+        sweep_containers(r, container_days())
+    sweep_fixtures(r)
     print(f"cc-janitor: {len(r.did)} swept, {len(r.said)} reported"
           f"{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
     return 0
@@ -727,6 +806,46 @@ def selfcheck():
         ru = subprocess.run([sys.executable, os.path.realpath(__file__)], env=env,
                             capture_output=True, text=True, timeout=60)
         ok("no repo named is a usage error, never a sweep of everything", ru.returncode == 2)
+
+        # rule 6: a selftest run's leftovers. Two fixtures, one whose suite is gone and one whose suite is alive (its
+        # pid is ours): the dead one's board, lock, worktree, state, clone, scratch dir, ledger entry, tmux window and
+        # handoff-ledger lines go; the live one's, and the real repo's line beside them, stay
+        deadp, livep = 99999999, os.getpid()
+        for pid in (deadp, livep):
+            fx = f"_cctest{pid}"
+            for d_ in (f"{th}/.cc/worktrees/{fx}/w1", f"{th}/.cc/state/{fx}/w1", f"{th}/dev/{fx}",
+                       f"{th}/.cc/selftest-{pid}", f"{th}/.cc/state/land", f"{th}/.cc/state/context"):
+                os.makedirs(d_, exist_ok=True)
+            cb("init", fx, f"{th}/dev/{fx}", "main")
+            open(f"{th}/.cc/state/land/{fx}.applied", "w").write("{}\n")
+            open(f"{th}/tmux.txt", "a").write(f"@9{int(pid == livep)}\t{fx}/w1\t1\n")
+        open(f"{th}/.cc/state/context/handoff.log", "w").write(
+            f"cc-handoff: _cctest{deadp}/hx — gone\ncc-handoff: _cctest{livep}/hx — live\ncc-handoff: {repo} — real\n")
+
+        def left(pid):
+            fx = f"_cctest{pid}"
+            return [x for x in (f"{th}/.cc/boards/{fx}.json", f"{th}/.cc/boards/{fx}.lock", f"{th}/.cc/worktrees/{fx}",
+                                f"{th}/.cc/state/{fx}", f"{th}/dev/{fx}", f"{th}/.cc/selftest-{pid}",
+                                f"{th}/.cc/state/land/{fx}.applied") if os.path.exists(x)]
+
+        before = left(deadp)
+        rd = subprocess.run([sys.executable, os.path.realpath(__file__), "--fixtures", "--dry"], env=env,
+                            capture_output=True, text=True, timeout=60)
+        ok("--fixtures --dry names what it would remove and removes nothing",
+           rd.returncode == 0 and f"would rm {th}/.cc/boards/_cctest{deadp}.json" in rd.stdout and left(deadp) == before)
+        rf = subprocess.run([sys.executable, os.path.realpath(__file__), "--fixtures"], env=env,
+                            capture_output=True, text=True, timeout=60)
+        led = open(f"{th}/.cc/state/context/handoff.log").read()
+        ok("--fixtures alone is a sweep, not a usage error, and a fixture whose suite is gone is removed whole: board, lock, "
+           "worktree, state, clone, scratch dir, deploy-ledger entry, tmux window, handoff-ledger lines",
+           rf.returncode == 0 and len(before) == 7 and left(deadp) == []
+           and f"_cctest{deadp}/w1" not in open(f"{th}/tmux.txt").read() and f"_cctest{deadp}" not in led)
+        ok("…and one whose suite is ALIVE is left whole, with the real repo's ledger line",
+           len(left(livep)) == 7 and f"_cctest{livep}/w1" in open(f"{th}/tmux.txt").read()
+           and f"_cctest{livep}/hx" in led and f"{repo} — real" in led)
+        ok("…and a second pass finds nothing and says nothing",
+           "selftest fixtures" not in subprocess.run([sys.executable, os.path.realpath(__file__), "--fixtures"], env=env,
+                                                     capture_output=True, text=True, timeout=60).stdout)
 
         for proc in (live, bare):                       # the group, so the `sleep` under the live shell goes too
             try:

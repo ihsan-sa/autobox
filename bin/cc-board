@@ -21,6 +21,33 @@ def state(st): return ALIAS.get(st, st)
 # that column). Rows written before this carry no field and read as `track`. `cc <repo> <name> --session` sets it.
 KINDS = ("track", "session")
 def kind(t): return t.get("kind") or "track"
+# A FIXTURE IS NOT A BOARD (owner, 2026-09-01). core/tests/selftest.sh names everything one run makes `_cctest<pid>` —
+# board, lock, worktree, state, tmux windows — and a suite that dies mid-run leaves them behind: one such board's
+# `waiting` row reached the owner's NEEDS YOU list. This is THE place that says what a real board is. A reader of
+# ~/.cc/boards either calls `cc-board boards` / `list` (cc-digest, cc ls, cc-audit) or, where it must stay in-process
+# (the Home tab, cc-reconcile, the landing queue), copies this one test and names it. `--all` is how a fixture is seen
+# from outside its run.
+FIXTURE = "_cctest"; _LIN = None
+def lineage():
+    """This process's pid chain to init, from /proc — cached: a tool's ancestry does not move while it runs."""
+    global _LIN
+    if _LIN is None:
+        _LIN, pid = set(), os.getpid()
+        while pid > 1 and pid not in _LIN:
+            _LIN.add(pid)
+            try:
+                with open(f"/proc/{pid}/status") as f: pid = int(next(l for l in f if l.startswith("PPid:")).split()[1])
+            except (OSError, StopIteration, ValueError): break
+    return _LIN
+def real(name):
+    """A `_cctest<pid>` board is a board only INSIDE the run that made it — to a process under <pid>, so the suite's own
+    `cc ls` / `cc digest` see their track — and nowhere else: no timer, Home tab or landing queue descends from a suite."""
+    n = os.path.basename(name).split(".", 1)[0]
+    return not n.startswith(FIXTURE) or (n[len(FIXTURE):].isdigit() and int(n[len(FIXTURE):]) in lineage())
+def boards(all_=False):
+    """Board names in BOARDS, sorted — the real ones, or every one with all_."""
+    if not os.path.isdir(BOARDS): return []
+    return sorted(fn[:-5] for fn in os.listdir(BOARDS) if fn.endswith(".json") and (all_ or real(fn)))
 def clean(s):
     """A title is display text. argv arrives surrogateescaped, so a shell-mangled emoji is a lone surrogate — json.dump
     stores it happily and every later print of the board raises. Replace it on the way in; never store one."""
@@ -98,9 +125,9 @@ def shown(t, for_=SHOWN_FOR):
     """PURE: is this row on the DEFAULT board view? (cc-board selfcheck pins it.)"""
     return t.get("status") not in FINISHED or age(t.get("updated")) < for_
 
-USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"list":1,"selfcheck":1}
+USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"list":1,"boards":1,"selfcheck":1}
 def main(a):
-    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|list|rm|tracks|selfcheck} ...")
+    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|list [--all]|boards [--all]|rm|tracks|selfcheck} ...")
     cmd = a[0]
     sys.stdout.reconfigure(errors="replace")   # a bad title already on disk prints as '?', never as a traceback
     if cmd in USAGE and len(a) < USAGE[cmd]:   # a short call must say so, not traceback
@@ -188,15 +215,15 @@ def main(a):
     elif cmd == "json":
         print(json.dumps(need(a[1]), indent=2))
     elif cmd == "list":
-        if not os.path.isdir(BOARDS): return
-        for fn in sorted(os.listdir(BOARDS)):
-            if not fn.endswith(".json"): continue
-            try: d = _load(fn[:-5]) or {}
+        for name in boards("--all" in a[1:]):   # real boards; a selftest fixture only with --all (FIXTURE above)
+            try: d = _load(name) or {}
             except Exception as e:   # one unreadable board must not hide every other repo
-                print(f"{fn}: unreadable ({e})", file=sys.stderr); continue
+                print(f"{name}.json: unreadable ({e})", file=sys.stderr); continue
             for tr,t in d.get("tracks",{}).items():
                 st = "session" if kind(t) == "session" else t.get("status","?")   # what the row IS, for cc ls/digest/resume
-                print(f"{d.get('repo',fn[:-5])}\t{tr}\t{st}\t{t.get('title','')}")
+                print(f"{d.get('repo',name)}\t{tr}\t{st}\t{t.get('title','')}")
+    elif cmd == "boards":
+        print("\n".join(boards("--all" in a[1:])))   # the names, one per line: what a shell reader of ~/.cc/boards iterates
     elif cmd == "show":
         rest = [x for x in a[1:] if x != "--all"]; allrows = "--all" in a[1:]
         if not rest: sys.exit("cc-board show: needs a repo")
@@ -318,6 +345,22 @@ def selfcheck():
         ok("`show` prints a session row after the tracks, indented, with no status icon; a track row as before",
            "  ↳ \033[1msess9\033[0m [session]  a course session" in sh and "  · \033[1mt1\033[0m [queued]" in sh
            and sh.index("[queued]") < sh.index("[session]"))
+        # A FIXTURE IS NOT A BOARD: a `_cctest<pid>` board with a waiting row beside the real one is in neither `list`
+        # nor `boards` unless `--all` asks — the one rule every reader of ~/.cc/boards calls or names
+        json.dump({"repo": "_cctest99999999", "tracks": {"w1": {"status": "waiting", "title": "push refused", "updated": now()}}},
+                  open(f"{th}/.cc/boards/_cctest99999999.json", "w"))
+        ls, la, bs, ba = run("list").stdout, run("list", "--all").stdout, run("boards").stdout, run("boards", "--all").stdout
+        ok("a `_cctest<pid>` board is a selftest fixture, not a board: `list` and `boards` skip it and print the real one beside it",
+           "_cctest" not in ls and "r\tt1\t" in ls and bs.split() == ["r"])
+        ok("…and `--all` is the only way to see it", "_cctest99999999\tw1\twaiting" in la and ba.split() == ["_cctest99999999", "r"])
+        # …but INSIDE its run it is a board: the suite's own `cc ls` / `cc digest` descend from <pid>. This selfcheck
+        # stands in for the suite — the cc-board it spawns is under our pid — and the 99999999 one stays hidden beside it
+        own = f"_cctest{os.getpid()}"
+        json.dump({"repo": own, "tracks": {"w1": {"status": "running", "title": "own run", "updated": now()}}},
+                  open(f"{th}/.cc/boards/{own}.json", "w"))
+        lo, bo = run("list").stdout, run("boards").stdout.split()
+        ok("…while the run that made a fixture — any process under its <pid> — sees it as a board without --all",
+           f"{own}\tw1\trunning" in lo and "_cctest99999999" not in lo and bo == [own, "r"])
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-board selfcheck: {n} failed")

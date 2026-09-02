@@ -398,16 +398,51 @@ def snapshot(rows, limit=0.0):
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────────────────
+_LIN = None
+def lineage():
+    """This process's pid chain to init, from /proc — cached: a tool's ancestry does not move while it runs."""
+    global _LIN
+    if _LIN is None:
+        _LIN, pid = set(), os.getpid()
+        while pid > 1 and pid not in _LIN:
+            _LIN.add(pid)
+            try:
+                with open(f"/proc/{pid}/status") as f: pid = int(next(l for l in f if l.startswith("PPid:")).split()[1])
+            except (OSError, StopIteration, ValueError): break
+    return _LIN
+
+
+def fixture(repo):
+    """A selftest suite's `_cctest<pid>` repo, seen from outside the run that made it. It is a repo — board AND
+    worktree — only to a process under <pid>; to anyone else it is scaffolding, never a finding. cc-board `real` is
+    the rule, copied here rather than called: one file pass, and the selfcheck's HOME is the environment's."""
+    return repo.startswith("_cctest") and not (repo[7:].isdigit() and int(repo[7:]) in lineage())
+
+
+def boards():
+    """Every REAL sidecar board, sorted: (path, board or None if unreadable). A suite that died mid-run left a
+    fixture board whose `waiting` row was reconciled, snapshotted and shown to the owner as real (2026-09-01);
+    cc-janitor --fixtures sweeps it once its pid is gone."""
+    out = []
+    for fn in sorted(glob.glob(f"{BOARDS}/*.json")):
+        n = os.path.basename(fn)[:-5]
+        if fixture(n):
+            continue
+        try:
+            out.append((fn, json.load(open(fn))))
+        except Exception:
+            out.append((fn, None))
+    return out
+
+
 def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
     """Every board track, with what the box says about it. Yields (repo, track, board_track, facts)."""
     live, ppids, workers, loops = procs()
     live |= tmux_live(ppids)
     seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
     prs, remotes, t0 = 0, {}, now()
-    for fn in sorted(glob.glob(f"{BOARDS}/*.json")):
-        try:
-            d = json.load(open(fn))
-        except Exception:
+    for fn, d in boards():
+        if d is None:
             continue                                    # one unreadable board must not hide every other repo
         repo = d.get("repo") or os.path.basename(fn)[:-5]
         if repos and repo not in repos:
@@ -442,16 +477,16 @@ def orphans(repos):
     """Worktrees with no board entry at all — real work the board has never heard of. Reported only: inventing
     a track from a directory name is the kind of guess this tool exists to avoid."""
     known = set()
-    for fn in glob.glob(f"{BOARDS}/*.json"):
-        try:
-            d = json.load(open(fn))
-        except Exception:
+    for fn, d in boards():
+        if d is None:
             return []                                   # an unreadable board makes every track look orphaned: say nothing
         repo = d.get("repo") or os.path.basename(fn)[:-5]
         known |= {f"{repo}/{t}" for t in d.get("tracks", {})}
     out = []
     for p in sorted(glob.glob(f"{WTS}/*/*")):
         repo, track = p.split(os.sep)[-2:]
+        if fixture(repo):
+            continue                                    # the suite's own scaffolding, not work: `known` never has it either
         if os.path.isdir(p) and f"{repo}/{track}" not in known and (not repos or repo in repos):
             out.append((repo, track, ("ask", None, "a worktree with no board entry")))
     return out
@@ -617,6 +652,10 @@ def main(argv):
             subprocess.run([f"{BIN}/cc-handoff", "--sweep"], capture_output=True, timeout=60)
         except Exception:                           # hook, which a session that CRASHED no longer has. cc-handoff
             pass                                    # owns what it sweeps and how — this timer only gives it a turn
+        try:                                        # and a selftest run's `_cctest<pid>` leftovers once that pid is gone:
+            subprocess.run([f"{BIN}/cc-janitor", "--fixtures"], capture_output=True, timeout=60)
+        except Exception:                           # a board with a `waiting` row reached the owner as real (2026-09-01).
+            pass                                    # cc-janitor owns the sweep (its weekly run does it too); this is a turn
         if net:
             try:                                    # and #approvals: a card whose PR is in reads as pending until it is
                 subprocess.run([f"{BIN}/cc-slack", "approvals-sweep"], capture_output=True, timeout=180)
@@ -1033,6 +1072,36 @@ def selfcheck():
             died = False
         ok("ending a runaway really ends it, group and all", ended and died)
         ok("a process that is already gone counts as ended, not as a failure", end_it([victim.pid]))
+        # A FIXTURE IS NOT A BOARD: a `_cctest<pid>` board — another suite's, ALIVE (a sleeper stands in for it: a
+        # sibling, not an ancestor) — beside the real one is neither reconciled nor in the snapshot cc-digest and the
+        # Home tab read; the sweep the unfiltered pass gives cc-janitor leaves it (its pid lives); and one whose <pid>
+        # is THIS pass's ancestor is the suite's own — reconciled like any board (the suite reads its own track)
+        other = subprocess.Popen(["sleep", "300"])
+        fx, own = f"_cctest{other.pid}", f"_cctest{os.getpid()}"
+        try:
+            for r in (fx, own):
+                cb("init", r, f"{th}/dev/{r}", "main")
+                cb("add", r, "w1", "push refused", "")
+                cb("status", r, "w1", "waiting")
+            for w in ("w1", "w5"):                      # the worktrees a suite lays down: one on its board, one not
+                os.makedirs(f"{th}/.cc/worktrees/{fx}/{w}", exist_ok=True)
+            rF = subprocess.run([sys.executable, os.path.realpath(__file__), "--apply", "--no-net", "--grace", "0"],
+                                env=env, capture_output=True, text=True, timeout=120)
+        finally:
+            other.kill(); other.wait()
+        snpF = json.load(open(f"{th}/.cc/state/reconcile.json"))["tracks"]
+        ok("a `_cctest<pid>` board is a selftest fixture, not a board: the unfiltered pass reconciles the real repo "
+           "beside it and never it — not in the output, not in the snapshot the digest and the Home tab read",
+           rF.returncode in (0, 1) and fx not in rF.stdout and not any(k.startswith(fx) for k in snpF)
+           and any(k.startswith(repo) for k in snpF))
+        ok("…and its WORKTREES are that suite's scaffolding too, never 'a worktree with no board entry': the run "
+           "prints every record, and neither the one on the fixture board nor the one with no row at all is there",
+           f"{fx}/w1" not in rF.stdout and f"{fx}/w5" not in rF.stdout)
+        ok("…and a fixture whose suite is alive survives the sweep that pass gives cc-janitor",
+           os.path.exists(f"{th}/.cc/boards/{fx}.json"))
+        ok("…while a `_cctest<pid>` board whose <pid> is this pass's own ancestor is the suite's own: reconciled and "
+           "snapshotted like any board — the suite's `cc ls` and `cc digest` must see their track",
+           any(k.startswith(own) for k in snpF))
     print(f"cc-reconcile selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 

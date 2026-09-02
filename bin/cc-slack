@@ -1613,16 +1613,45 @@ def home_list(lines, more, budget=HOME_LIST):
     return more(len(lines))[:budget] if lines else ""
 
 
+_LIN = None
+def lineage():
+    """This process's pid chain to init, from /proc — cached: a tool's ancestry does not move while it runs."""
+    global _LIN
+    if _LIN is None:
+        _LIN, pid = set(), os.getpid()
+        while pid > 1 and pid not in _LIN:
+            _LIN.add(pid)
+            try:
+                with open(f"/proc/{pid}/status") as f: pid = int(next(l for l in f if l.startswith("PPid:")).split()[1])
+            except (OSError, StopIteration, ValueError): break
+    return _LIN
+
+
+def home_boards():
+    """[(path, board)] for every REAL sidecar board — the one file pass every dashboard input reads boards through. A
+    `_cctest<pid>` board is a selftest suite's fixture, a board only to a process under <pid> (never this daemon):
+    cc-board `real` is the rule, copied here rather than called because the tab reads boards in-process (no subprocess
+    per refresh) and its selfcheck moves HOME, not the environment a child would see. A suite that died mid-run left
+    one whose `waiting` row put "w1 · push refused" on the owner's NEEDS YOU list (2026-09-01). An unreadable board is
+    skipped: it must not empty every other repo."""
+    out = []
+    for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
+        n = os.path.basename(fn)[:-5]
+        if n.startswith("_cctest") and not (n[7:].isdigit() and int(n[7:]) in lineage()):
+            continue
+        try:
+            out.append((fn, json.load(open(fn))))
+        except Exception:
+            continue
+    return out
+
+
 def home_board_rows():
     """(repo, track, status, title, updated) for EVERY track on every sidecar board — including the finished ones the tab
     itself drops (home_track_shown). This is what the board VIEW buttons read: one plain file pass shared by all three of
     them (`cached`), never a subprocess per press."""
     out = []
-    for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
-        try:
-            d = json.load(open(fn))
-        except Exception:
-            continue                                      # one unreadable board must not empty every other repo's slice
+    for fn, d in home_boards():
         repo = d.get("repo") or os.path.basename(fn)[:-5]
         for tr, t in (d.get("tracks") or {}).items():
             if (t.get("kind") or "track") == "session":
@@ -2181,11 +2210,7 @@ def home_tracks(workers, prs):
     KINDS: a long-lived channel session, not a task) is never a track here — it goes to `sessions`, with whether a
     claude is in its worktree and the question it declared, if any, and home_parts groups those under their repo."""
     out, last, sessions = [], None, []
-    for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
-        try:
-            d = json.load(open(fn))
-        except Exception:
-            continue                                      # one unreadable board must not blank the whole dashboard
+    for fn, d in home_boards():
         repo = d.get("repo") or os.path.basename(fn)[:-5]
         for tr, t in d.get("tracks", {}).items():
             runs, cost = glob.glob(f"{HOME}/.cc/state/{repo}/{tr}/runs/*.json"), 0.0
@@ -4464,11 +4489,7 @@ class Daemon:
                 self.home_chans = chans
                 self.home_cards = self.home_card_links(next((c for c, n in chans if n == APPROVALS), ""))
             want, prs = [], {}
-            for fn in sorted(glob.glob(f"{HOME}/.cc/boards/*.json")):
-                try:
-                    d = json.load(open(fn))
-                except Exception:
-                    continue
+            for fn, d in home_boards():
                 repo = d.get("repo") or os.path.basename(fn)[:-5]
                 want += [(repo, str(t["pr"])) for t in d.get("tracks", {}).values() if t.get("pr")]
             for repo, n in want[:8]:                       # bounded: the dashboard is never worth a long stall
@@ -9606,6 +9627,37 @@ def cmd_selfcheck():
           + ("; ".join(denied[:3]) if denied else "none"), not denied)
     check("selfcheck: it ran on a scratch ~/dev and put the real one back — this command has to work on a bare clone",
           DEV == f"{HOME}/dev" and EFFECTS.api_impl is slack_api and not os.path.exists(scratch_dev))
+    # A FIXTURE IS NOT A BOARD (owner, 2026-09-01): a `_cctest<pid>` board — a selftest suite's — beside a real one, each
+    # with the waiting row and live question that put "w1 · push refused" on the NEEDS YOU list. Every tab input reads
+    # boards through home_boards, so nothing the tab renders carries the fixture while the real board's row still shows.
+    _homeR = globals()["HOME"]
+    hr = tempfile.mkdtemp(prefix="cc-slack-fixture-")
+    try:
+        globals()["HOME"] = hr
+        os.makedirs(f"{hr}/.cc/boards")
+        for repo in ("abox", "_cctest99999999"):
+            os.makedirs(f"{hr}/.cc/state/{repo}/w1", exist_ok=True)
+            open(f"{hr}/.cc/state/{repo}/w1/progress.md", "w").write("STATUS: BLOCKED: push refused: origin/track\n")
+            json.dump({"repo": repo, "tracks": {"w1": {"status": "waiting", "title": "push refused", "pr": "",
+                                                       "updated": "2026-08-30T21:00:00Z"}}},
+                      open(f"{hr}/.cc/boards/{repo}.json", "w"))
+        ftr, _, _ = home_tracks(set(), {})
+        fneeds = "\n".join(home_needs({"tracks": ftr}))
+        fbrows, fboards = home_board_rows(), [os.path.basename(fn) for fn, _ in home_boards()]
+        own = f"_cctest{os.getpid()}"                    # …and INSIDE its run (our own pid: the suite reading its board) it is one
+        json.dump({"repo": own, "tracks": {}}, open(f"{hr}/.cc/boards/{own}.json", "w"))
+        fown = [os.path.basename(fn) for fn, _ in home_boards()]
+    finally:
+        globals()["HOME"] = _homeR
+        subprocess.run(["rm", "-rf", hr], check=False)
+    check("home_boards: a `_cctest<pid>` board is a selftest fixture, not a board — every tab input reads boards through "
+          "this one pass, so its waiting row never reaches NEEDS YOU, RUNNING or a board view, while the real one's does",
+          fboards == ["abox.json"] and [t["name"] for t in ftr] == ["abox/w1"]
+          and fneeds.count("❓") == 1 and "push refused" in fneeds and "_cctest" not in fneeds
+          and [r[0] for r in fbrows] == ["abox"])
+    check("home_boards: a `_cctest<pid>` board IS a board to a process under <pid> — the same rule as cc-board `real`, so "
+          "a suite reading its own board sees it while this daemon, never under a suite, does not",
+          fown == [f"{own}.json", "abox.json"])
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0
 
