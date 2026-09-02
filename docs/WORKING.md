@@ -18,7 +18,8 @@ Red beats new. Delivery beats development. Small-and-shippable beats big-and-hal
 The sweep spans both scales: the narrow red item and the meta-level shape of the system alike.
 
 Scripts hold the invariants (reconcile, audit, janitor); the secretary (`cc-secretary`) judges the raw evidence and
-hands you a `secretary/…` line; you decide — it is worth exactly one glance, and a wrong one costs nothing more.
+records every finding in its own ledger. It interrupts you only when a person, an approval or a choice the files
+cannot settle is needed — one `secretary/…` line, worth exactly one glance. The rest is `cc-secretary status`.
 
 The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wakes every session
 every 2 h — the tick carries what the files say (red main, open asks, queued rows, rows in flight) so an empty check
