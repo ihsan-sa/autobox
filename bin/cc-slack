@@ -7157,6 +7157,8 @@ def cmd_selfcheck():
     dmM5.dispatch({"type": "reaction_added", "item": {"channel": "CQ"}}, pool5)
     check("dispatch: one chat's messages run in the owner's order even when the first is slow — M5",
           order5 == ["1", "2"] and reacts5 == ["reaction_added"])
+    for ex5 in dmM5.execs.values():
+        ex5.shutdown(wait=True)                              # its idle worker would otherwise outlive every case: the end-of-run join waited 20 s on it
     cmain8, corch8 = Conn(None, "r", {"alias": None}), Conn(None, "r", {"alias": "ai-dev"})
     sent8 = []; cmain8.send = lambda p: sent8.append(("main", p)); corch8.send = lambda p: sent8.append(("ai-dev", p))
     dmM8 = Daemon(use_slack=False); dmM8.subs["r"] = [cmain8, corch8]
@@ -9906,13 +9908,51 @@ def cmd_selfcheck():
 
     check("selfcheck: the channel-is-a-session checks never touched the ~/dev they were handed",
           DEV == scratch_dev and not os.path.exists(devP))
-    deadline = time.time() + 20                              # publish_soon works OFF-thread: let it finish before judging
+    # Every thread a case set off is DONE before its effects are judged — joined here, and anything still alive at
+    # the deadline is NAMED, not waited out in silence. A thread that never ends must be ended by ITS case: the idle
+    # worker of the per-chat executor M5's dispatch() made blocked on its queue for ever, so this join proved
+    # nothing about it and burned the whole deadline (20 s of a 29 s run) — M5 now shuts its executor down.
+    deadline = time.time() + 20
     for t in threading.enumerate():
         if t is not threading.current_thread():
             t.join(timeout=max(0.0, deadline - time.time()))
-    after_notify = os.path.getsize(real_notify_log) if os.path.exists(real_notify_log) else None
-    check("selfcheck: NOTHING this run could reach the owner — the whole process is pinned log-only, so not even a "
-          "background land/publish thread can page them about a fixture", after_notify == before_notify)
+    lingering = [t.name for t in threading.enumerate() if t is not threading.current_thread()]
+    check("selfcheck: every thread a case set off has finished — a background land/publish is judged, never raced"
+          + (": still alive " + ", ".join(lingering) if lingering else ""), not lingering)
+    # THE PIN is what keeps a fixture off the owner's phone, so THE PIN is what is asserted: still set at the end (no
+    # case unset it or pointed it elsewhere) and every cc-notify of this run in the temp log, none in the real one.
+    # Until 2026-09-01 this asserted that the real ~/.cc/notify.log had not GROWN during the run — but that log is
+    # shared, and any other track finishing on this box inside those 29 s grew it: four cc-land gates went red that
+    # day on a check that passed every time standalone. What is ours to assert about the real log is narrower: no
+    # line it gained names a repo this run made up.
+    def gained(path, before):
+        """What `path` gained since it was `before` bytes long — from byte 0 when it did not exist then. A fixture
+        that pages the owner on a fresh box CREATES the real log, and a scan that skipped the no-file case let
+        exactly that pass (review of #148)."""
+        if not os.path.exists(path):
+            return ""
+        with open(path, "rb") as f:
+            f.seek(before or 0)
+            return f.read().decode("utf-8", "replace")
+    with tempfile.TemporaryDirectory(prefix="_selfcheck_nlog_") as td:
+        fresh = f"{td}/notify.log"
+        absent = gained(fresh, None)                                  # never created: nothing gained
+        open(fresh, "a").write("[mmrepo] PR #7 merged\n")            # created mid-run, no file at the start
+        created = gained(fresh, None)
+        mark = os.path.getsize(fresh)
+        open(fresh, "a").write("[other] fine\n")                     # existed at the start: only the tail
+        grown = gained(fresh, mark)
+    check("selfcheck: a real notify.log that did not exist when the run began is scanned from byte 0 — a fixture that "
+          "CREATES it on a fresh box is the one that paged the owner, not a pass",
+          absent == "" and "mmrepo" in created and grown == "[other] fine\n" and "mmrepo" not in grown)
+    grew = gained(real_notify_log, before_notify)
+    fixture_names = ("_selfcheck", "_cctest", "mmrepo", "myrepo", "no-such-repo-zz")
+    named = [n for n in fixture_names if n in grew]
+    check("selfcheck: NOTHING this run could reach the owner — the log-only pin is still on the whole process at the "
+          "end, its log is this run's temp file, and the real ~/.cc/notify.log gained no line about a fixture"
+          + (" (it did: " + ", ".join(named) + ")" if named else ""),
+          os.environ.get("CC_NOTIFY_LOG_ONLY") == "1" and "_selfcheck_notify_" in os.environ.get("CC_NOTIFY_LOG", "")
+          and not named)
     check("selfcheck: post()/outbox() calls this run went to a temp file — the real outbox.log is untouched", after_outbox == before_outbox)
     check("selfcheck: no case shelled out to the real cc-land or cc-publish — a queue command here would write a real "
           "landing job into this box's own queue and start a real worker that gates, MERGES and deploys, so the class "

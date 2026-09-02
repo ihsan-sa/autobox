@@ -977,7 +977,8 @@ grep -q "$REPO" <<<"$("$B/cc" digest)" && ok "digest lists the track" || bad "di
 "$B/cc" rm $REPO w1 >/dev/null 2>&1; [ ! -d ~/.cc/worktrees/$REPO/w1 ] && ok "rm removed worktree" || bad "rm"
 "$B/cc" rm $REPO w2 >/dev/null 2>&1
 echo "== cc-slack (local router + channel server; no Slack, no API) =="
-"$B/cc-slack" selfcheck >/dev/null 2>&1 && ok "cc-slack selfcheck (mrkdwn, chunks, target detection)" || bad "cc-slack selfcheck"
+"$B/cc-slack" selfcheck > "$T/slack-selfcheck.out" 2>&1 && ok "cc-slack selfcheck: $(tail -1 "$T/slack-selfcheck.out")" \
+  || { bad "cc-slack selfcheck: $(tail -1 "$T/slack-selfcheck.out")"; grep '✗' "$T/slack-selfcheck.out" | head -5; tail -5 "$T/slack-selfcheck.out"; }   # name the case: this went red 4× in gates on 09-01 as a bare ✗
 export CC_SLACK_DIR="$T/slack"; mkdir -p "$CC_SLACK_DIR"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"chat_id":"local","text":"pong"}}}' | timeout 10 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch.out"
 grep -q '"claude/channel"' "$T/ch.out" && grep -q '"name": "reply"' "$T/ch.out" && ok "channel server: claude/channel capability + reply tool" || bad "channel handshake"
