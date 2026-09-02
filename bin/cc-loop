@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # cc-loop — autonomous "ralph loop": run headless Claude on a task, fresh context each iteration, rehydrating
 # from a durable progress journal + git, until the task reports DONE / BLOCKED / stalls / caps are hit.
-#   cc-loop <repo> <track> [--once] [--max-iter N=10] [--budget USD/iter=8] [--turns N=80] [--model M] [--effort E] [--quiet]
+#   cc-loop <repo> <track> [--once] [--max-iter N=10] [--budget USD/iter=8] [--turns N=80] [--model M=CC_WORKER_MODEL] [--effort E] [--quiet]
 #                          [--resume-last]  iteration 1 continues this track's last claude session instead of a cold
 #                                           one — for a repair round, where the context that found the bug is the
 #                                           expensive part; later iterations are fresh as always
 #                          [--no-extend]    the step limit is FINAL: no carry-on batches at --max-iter, so a caller
 #                                           that promised "one round" (cc-land's fix round) gets exactly that
+#   cc-loop worker-model [M]  the model a worker runs on, and why (worker_model below) — cc names it on its dispatch line
 # THE STEP LIMIT IS A CHECKPOINT, NOT A VERDICT: reaching --max-iter with work COMMITTED in that iteration buys
 # another N iterations, as often as it keeps committing. There is no spend cap (owner, 2026-08-31: "no spend cap
 # as some just are expensive") — what stops a loop is not being expensive, it is not producing:
@@ -57,6 +58,15 @@ for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.S
 os.execv(sys.argv[1], sys.argv[1:])' "$(readlink -f "$0")" "$@"
 fi
 unset CC_LOOP_SIGNALS   # our children start from the same defaults, and none of them needs to know how
+worker_model(){   # $1 the dispatcher's --model, if any -> the model this worker runs on. THE WORKER DEFAULT LIVES HERE:
+                  # --model (the dispatcher's own call for THIS task -- fable[1m] for creative or sub-orchestrating work)
+                  # beats the cc-model override (a limit moves every session at once) beats CC_WORKER_MODEL. A worker is
+                  # not an orch: until 2026-09-01 one dispatched without --model silently ran on the box's interactive
+                  # default (Fable) while the policy said workers run on Opus, because only the override was passed on.
+  local m="${1:-}"
+  [ -n "$m" ] || m=$("$BIN/cc-model" current 2>/dev/null)
+  [ -n "$m" ] || m=$("$BIN/cc-config" get CC_WORKER_MODEL claude-opus-5)
+  printf '%s\n' "$m"; }
 refusal_note(){   # $1 iteration · $2 the model that refused · $3 the one it moved to ("" = the chain ends here)
                   # $4 why · $5 kept|rerun|stopped → the journal's own line, for the next fresh context to read
   local to="${3:+only the model changed, to $3 per the cc-model chain}"; to="${to:-no model is left on the cc-model chain, so it carries on on the same one}"
@@ -121,7 +131,7 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
                # `subagent_stats.refused` block, and a successful worker whose own prose says "refused". The full
                # sanitized real result lives in cc-model's selfcheck — this file only has to test the loop's reaction.
-  local d n=0 bad=0 out rc head nxt last
+  local d n=0 bad=0 out rc head nxt last wm
   head=$("$BIN/cc-model" chain | sed -n 1p); nxt=$("$BIN/cc-model" chain | sed -n 2p); last=$("$BIN/cc-model" chain | tail -1)
   [ -n "$head" ] && [ -n "$nxt" ] || { echo "cc-loop selfcheck: cc-model chain is shorter than two models" >&2; return 1; }
   d=$(mktemp -d) || return 1
@@ -139,6 +149,21 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   t 'chain exhausted with nothing produced: stop'      "$(refusal_step 2 no)"  stop
   t 'chain exhausted but the work is real: carry on'   "$(refusal_step 2 yes)" count
   t 'not a refusal at all: the loop does nothing'      "$(refusal_step 1 yes)" none
+  # WHAT A WORKER RUNS ON when the dispatcher named no model. Two stub cc-models: one box with no override, one moved by a limit.
+  # The config is a scratch file, not the box's: CC_WORKER_MODEL is a documented knob, and reading the real
+  # ~/.cc/config would turn these cases red the moment the owner sets it — a supported setting must not fail the suite.
+  mkdir -p "$d/nov" "$d/ov"; ln -sf "$BIN/cc-config" "$d/nov/cc-config"; ln -sf "$BIN/cc-config" "$d/ov/cc-config"
+  : > "$d/config"
+  printf '#!/bin/sh\nexit 0\n'               > "$d/nov/cc-model"
+  printf '#!/bin/sh\necho claude-sonnet-5\n' > "$d/ov/cc-model"
+  chmod +x "$d/nov/cc-model" "$d/ov/cc-model"
+  wm=$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/nov" worker_model "")
+  t 'no --model and no override: a worker runs on Opus, not the box default' "$wm" claude-opus-5
+  t 'CC_WORKER_MODEL moves that default'   "$(CC_CONFIG="$d/config" BIN="$d/nov" CC_WORKER_MODEL=claude-haiku-4-5-20251001 worker_model '')" claude-haiku-4-5-20251001
+  t 'a box override outranks it'           "$(unset CC_WORKER_MODEL; CC_CONFIG="$d/config" BIN="$d/ov" worker_model '')" claude-sonnet-5
+  t "--model is the dispatcher's call and passes through untouched" "$(CC_CONFIG="$d/config" BIN="$d/ov" worker_model 'fable[1m]')" 'fable[1m]'
+  [ -n "${CC_MODEL_CHAIN:-}" ] || t 'and the fallback chain carries on from it (opus -> sonnet)' "$("$BIN/cc-model" next "$wm")" "$last"
+
   # the journal fixtures: what the next fresh context reads, and what it must never be mistaken for
   refusal_note 3 "$head" "$nxt" 'the classifier stopped the turn' rerun > "$d/progress.md"
   refusal_note 4 "$head" "$nxt" 'answered as opus, not fable' kept >> "$d/progress.md"
@@ -188,6 +213,7 @@ otherwise start cold having been told to resume' "$(last_session "$d/runs")" the
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
 [ "${1:-}" = selfcheck ] && { selfcheck; exit $?; }
+[ "${1:-}" = worker-model ] && { worker_model "${2:-}"; exit 0; }   # cc asks this to name the model on its dispatch line
 repo="${1:?repo}"; track="${2:?track}"; shift 2
 MAXI=10; BUDGET=8; TURNS=80; MODEL=""; EFFORT=""; QUIET=0; RESUME=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
 while [ $# -gt 0 ]; do case "$1" in
@@ -236,7 +262,7 @@ while [ $i -lt "$MAXI" ]; do
   cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
   prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(tail -c 6000 "$ST/progress.md")" "$i" "$MAXI" "$cont")
   args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP")
-  m="$MODEL"; [ -n "$m" ] || m=$("$BIN/cc-model" current 2>/dev/null)   # no explicit --model: follow the box's override (a Fable limit puts everything on Opus)
+  m=$(worker_model "$MODEL")   # resolved every iteration, not pinned at dispatch: an override mid-loop (a limit) moves this worker too
   [ -n "$m" ] && args+=(--model "$m"); [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
   # --resume-last, first iteration only: continue the session this track last ran instead of opening a cold one.
   # A fix round dispatched by the landing queue is the case it exists for — the worker already read this code and
@@ -246,7 +272,7 @@ while [ $i -lt "$MAXI" ]; do
     if sid=$(last_session "$ST/runs"); then args+=(--resume "$sid"); log "iter 1 resumes session $sid (--resume-last)"
     else log "iter 1 was asked to resume, but no run of this track recorded a session id — starting fresh"; fi
   fi
-  log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS)"
+  log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS, model ${m:-box default})"   # the model is in the log too (a survey of what workers ran on found this default wrong) — AFTER the "start (budget" prefix cc-secretary parses (review of #169)
   out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"
   ( cd "$WT" && CC_ROLE=worker exec "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
   child=$!; wait "$child"; rc=$?; child=""

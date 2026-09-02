@@ -39,8 +39,10 @@ is cheap — and each one works the order above on its own; nothing here waits t
 - Hand off when replaying the context per turn costs more than a handoff over the turns still to come: an event-driven planner around 40% of the window. A worker's iteration ends at that same 40% line: cc-context marks the journal, and cc-loop's next fresh iteration is the handoff. The 60% ceiling is the backstop for interactive sessions. Keep history append-only.
 
 ## model policy
-Planning runs the strongest available model; workers run the strong-but-cheaper tier. Both names
-live in cc-model and nowhere else — when models change, change cc-model.
+Planning sessions and orchs run the strongest available model (cc-model's primary, Fable); a headless
+worker runs on CC_WORKER_MODEL (claude-opus-5) unless the dispatcher passes `--model` for that one
+task — a limit override outranks both. The order lives in cc-loop's `worker_model`; the names live in
+cc-model and nowhere else — when models change, change cc-model.
 - Effort is the cheap dial: high by default, down for routine turns, up for the hardest.
 - On each model upgrade, try deleting one harness crutch — and read the new model's own prompting guide first: a new model's regressions cost more than its crutches.
 

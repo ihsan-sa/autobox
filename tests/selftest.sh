@@ -1352,6 +1352,14 @@ echo "== cc-audit: the second opinion on what to delete (codex) =="
 # removes it. It exits before checks() runs, so calling it from here does NOT recurse back into this file.
 sc=$("$B/cc-audit" selfcheck 2>&1)
 grep -q "0 failed" <<<"$sc" && ok "cc-audit selfcheck: $(tail -1 <<<"$sc")" || bad "cc-audit selfcheck: $(tail -1 <<<"$sc")"
+echo "== the worker loop (cc-loop) =="
+# No fixtures: `cc-loop selfcheck` builds its own temp dir — stub cc-models, a scratch cc-config, journal fixtures —
+# and removes it. It exits at the dispatch line before any loop machinery, so calling it from here starts no worker,
+# no tmux window and no `claude -p`. Without this line the loop's cases ran nowhere: a regression that put workers
+# back on the box default instead of the worker model would have landed green.
+lp=$("$B/cc-loop" selfcheck 2>&1); lr=$(grep -o "cc-loop selfcheck: .*" <<<"$lp" | tail -1)   # its own tally line, not the journal fixtures it prints above it
+grep -q "0 failed" <<<"$lr" && ok "$lr" \
+  || { bad "cc-loop selfcheck: ${lr:-it printed no tally line}"; grep "^FAIL" <<<"$lp" | head -5; }   # no tally = it died = red, never a silent pass
 echo "== the suite's own lock (one run at a time) =="
 # Re-runs THIS FILE, stopping at the lock ($CC_SELFTEST_LOCK_ONLY) — no fixtures, no tmux, no repo, so the suite
 # never runs inside itself. On a lock of its own ($CC_SELFTEST_LOCK): the real one is held by the very run doing
