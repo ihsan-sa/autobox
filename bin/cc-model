@@ -13,9 +13,19 @@
 #   cc-model selfcheck                the classifier and the chain, on fixtures
 # tick: (1) normal — switch when cc-limit's stamp says the primary model is limited, or when a live session's pane
 #   shows a fresh "usage limit" line (each matched line fires once, and a probe has to agree — docs and questions
-#   mention limits too); (2) overridden — once `until` has passed, probe the primary model at most every 15 min and
-#   restore on the first answer; (3) never two switches within 10 min.
-# Retuning a session = typing "/model <model>" into its pane, cc-msg semantics. Effort is not touched (settings).
+#   mention limits too); (1b) THE CLI'S OWN LIMIT PROMPT NEEDS NO PROBE: "You've reached your Fable 5 limit … ❯ Switch
+#   to Opus 5 (1M context) and continue" (a dialog) or "● Fable 5 limit reached · continuing on Fable 5 uses usage
+#   credits …" (its notice) IS a limit of the model it names — the dialog is answered (Enter when the highlighted line
+#   is "Switch to <another model> … and continue", Esc on anything else), the box moves to the fallback until the reset
+#   the text names, else 24 h, and NOTHING PROBES while that wording is on any session pane: a probe that answers there
+#   is paying with usage credits, not proof the limit lifted (2026-09-01: one such "lifted" retuned 12 panes straight
+#   back into the prompt, and a pulse tick and two secretary findings were dropped on it); (2) overridden — once `until`
+#   has passed, probe the primary model at most every 15 min and restore on the first answer — unless a pane still
+#   shows the prompt or cc-limit's stamp still names the primary: then it cannot tell, and does not restore;
+#   (3) never two switches within 10 min — and the override's `since` counts as a switch, not only the log line: that
+#   line is written after the retune, and on 2026-09-01 a restore slipped into the gap and undid the switch mid-typing.
+# Retuning a session = typing "/model <model>" into its pane THROUGH cc-msg (the one pane deliverer, with the dialog
+#   guard); the answers to the CLI's own prompts (Enter/Esc, "1" to "Switch model?") are single keys. Effort is not touched.
 # THE WORKER FALLBACK CHAIN LIVES HERE AND NOWHERE ELSE: fable -> opus -> sonnet. cc-loop asks `cc-model next`
 # instead of carrying a second copy of the order, so one edit here moves every caller (CC_MODEL_CHAIN overrides).
 # A REFUSAL OR A REROUTE IS NOT AN ERROR AND NOT A LIMIT. The classifier can stop a turn outright, and a model that
@@ -60,7 +70,10 @@ ov(){ model=""; since=0; till=0; reason=""; probed=0   # loads the override; exi
 limstamp(){ lim_till=0; lim_model=""   # cc-limit's shared stamp: "<until>\t<how>\t<first-seen>\t<model>"
   [ -f "$ST/claude-limit" ] && IFS=$'\t' read -r lim_till _ _ lim_model < "$ST/claude-limit"
   [[ "${lim_till:-}" =~ ^[0-9]+$ ]] || lim_till=0; }
-rate_ok(){ local l; l=$(awk -F'\t' '$3=="switch"{t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)   # one switch per 10 min, never a flap
+rate_ok(){ local l s; l=$(awk -F'\t' '$3=="switch"{t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)   # one switch per 10 min, never a flap
+  # The override's own `since` counts as a switch, not only the log line: that line is written AFTER every pane has
+  # been retyped, and on 2026-09-01 a restore slipped into that gap and sent 12 sessions straight back into the prompt.
+  s=$(cut -f2 "$OV" 2>/dev/null); { [[ "${s:-}" =~ ^[0-9]+$ ]] && [ "$s" -gt "$l" ]; } && l="$s"
   [ $((now - l)) -ge "${CC_MODEL_MIN_GAP:-600}" ]; }
 sessions(){   # "<pane-id> <window-name>" per live INTERACTIVE session: a pane whose DIRECT child is claude (pane id, so a split
               # window's non-claude active pane is never typed into)
@@ -73,16 +86,145 @@ sessions(){   # "<pane-id> <window-name>" per live INTERACTIVE session: a pane w
     printf '%s %s\n' "$id" "$name"
   done < <(tmux list-panes -s -t "$SESSION" -F '#{pane_id} #{pane_pid} #{window_name}' 2>/dev/null)
 }
-type_into(){   # cc-msg semantics: never type over an open dialog; text and Enter as two calls (Enter is swallowed otherwise)
-  tmux capture-pane -p -t "$1" 2>/dev/null | grep -q 'Enter to confirm' && return 1
-  tmux send-keys -t "$1" -l -- "$2" 2>/dev/null || return 1
-  sleep 0.3; tmux send-keys -t "$1" Enter 2>/dev/null
+type_into(){   # $1 pane id · $2 window name · $3 text. cc-msg IS the box's typist — it refuses a headless pane and its
+               # dialog guard keeps keystrokes off an open prompt (dialog-never-drops owns that), so this does not
+               # reimplement either. It types by WINDOW name, so a split window is typed at its active pane; a claude
+               # pane that is NOT its window's active pane is refused here, lands in model-skipped and is retried on a
+               # later tick — cc-msg would type the /model line into whatever pane IS active and run it as a command.
+               # The direct tmux path below is for the test session only, where cc-msg's contract (session main, a real
+               # interactive claude) cannot hold — the selfcheck and selftest run against `cat` in a scratch server.
+  local id="$1" name="$2" text="$3"
+  if [ "$SESSION" = main ] && [ "$PROC" = claude ] && [ -x "$BIN/cc-msg" ]; then
+    [ "$(tmux display-message -p -t "$id" '#{pane_active}' 2>/dev/null)" = 1 ] || return 1
+    "$BIN/cc-msg" "$name" "$text" >/dev/null 2>&1 || return 1
+  else
+    tmux capture-pane -p -t "$id" 2>/dev/null | grep -q 'Enter to confirm' && return 1
+    tmux send-keys -t "$id" -l -- "$text" 2>/dev/null || return 1
+    sleep 0.3; tmux send-keys -t "$id" Enter 2>/dev/null
+  fi
   # a /model inside a live conversation asks "Switch model? … 1. Yes" — answer it, or the session sits on that dialog and
   # stays on the model that will not answer (2026-08-28: every session did exactly that after the fallback fired)
   sleep "${CC_MODEL_DIALOG_WAIT:-1.5}"
-  if tmux capture-pane -p -S -20 -t "$1" 2>/dev/null | grep -q 'Switch model?'; then
-    tmux send-keys -t "$1" -l -- "1" 2>/dev/null; sleep 0.3; tmux send-keys -t "$1" Enter 2>/dev/null; fi
+  if tmux capture-pane -p -S -20 -t "$id" 2>/dev/null | grep -q 'Switch model?'; then
+    tmux send-keys -t "$id" -l -- "1" 2>/dev/null; sleep 0.3; tmux send-keys -t "$id" Enter 2>/dev/null; fi
   return 0; }
+# ── THE CLI'S OWN LIMIT PROMPT ────────────────────────────────────────────────────────────────────────────────────
+# It is not a log line to be confirmed by a probe: it is the CLI saying, in the pane, that the model the session is on
+# is out and offering to spend usage credits. Reading it is worth care in both directions — miss it and every session
+# sits there delivering nothing (2026-09-01: a pulse tick and two secretary findings), fire on prose and the box moves
+# to the fallback for a day it did not need.
+# THE WORDING IS READ AS A SHAPE, NOT AS A SENTENCE (2026-09-01, the review of #155). This file's own header quotes
+# every trigger phrase; so do the fixtures below, the track brief and half of docs/. A bare sentence anywhere in a pane
+# would mean that a session which cats, greps or diffs any of them moves the whole box to the fallback for a day — and
+# then never comes back, because the same text is what tells the probe it cannot tell. So a match needs an ANCHOR: the
+# dialog's footer ON ITS OWN LINE, or the notice's ● at the START of one, with the wording inside that anchor's own few
+# lines, and the anchor itself in the LIVE screen tail. Prose that quotes the prompt has the words but never the shape.
+# The footer is a LINE OF ITS OWN — decoration ("·", "↵") may follow it, letters may not: that is what tells the
+# dialog apart from any prose, doc bullet or diff hunk that merely quotes it.
+PROMPT_FOOT='^[[:space:]]*([Ee]nter to confirm([^A-Za-z]+[Ee]sc to cancel)?|[Ee]sc to cancel)[^A-Za-z]*$'
+#   "You've reached your Fable 5 limit"                            the dialog's first line
+#   "Fable 5 limit reached · continuing on Fable 5 uses …"         the notice it leaves when nobody answered
+#   "Continuing on Fable 5 uses usage credits — you have CA$0.00"  the line under either
+# The digits-only gap before "limit reached" is what keeps every worker pane out: "Opus 5 … step limit reached" is a
+# turn cap, not a limit, and it is on screen all day.
+PROMPT_RE='reached your (claude-)?(fable|opus|sonnet|haiku) ?[0-9.]* ?limit|(fable|opus|sonnet|haiku) ?[0-9.]* ?limit reached|continuing on (claude-)?(fable|opus|sonnet|haiku)[a-z0-9. ()-]{0,20}uses usage credits'
+pane_text(){   # THE LIVE SCREEN of a pane — never -S scrollback. What the session is sitting on now is the prompt;
+               # what has scrolled off is history, or somebody reading this file in their pane.
+  tmux capture-pane -p -t "${1:-}" 2>/dev/null; }
+prompt_norm(){   # a pane's text → plain ASCII lines, the CLI's two marks spelled out, the blank rest of the screen
+                 # dropped — so that a LINE can be matched as a line (a box border is decoration, not content).
+  sed -e 's/●/@DOT@ /g' -e 's/❯/@SEL@ /g' <<<"${1:-}" | tr -cd '\11\12\40-\176' |
+    awk '{ sub(/[[:space:]]+$/, ""); l[NR]=$0; if ($0 != "") last=NR } END{ for (i = 1; i <= last; i++) print l[i] }'; }
+prompt_fam(){   # $1 = a pane's live screen → the family the CLI says is out, or nothing (exit 1). THE MODEL COMES FROM
+                # THE WORDING, never from the pane at large: the option line names the model being OFFERED ("Switch to
+                # Opus 5 (1M context) and continue"), and taking the last model on screen read the Fable limit as Opus's.
+  local t n a kind lo hi win hit
+  t=$(prompt_norm "${1:-}"); n=$(grep -c '' <<<"$t")
+  while IFS=: read -r a kind; do   # the lowest anchor first: the live one is the one at the bottom of the screen
+    [ -n "${a:-}" ] || continue
+    [ $((n - a)) -le "${CC_MODEL_PROMPT_TAIL:-12}" ] || continue   # scrolled well past: history, or someone's `cat`
+    case "$kind" in
+      foot) lo=$((a - 10)); hi=$a;;   # the box that footer closes: "You've reached your Fable 5 limit … Enter to confirm"
+      *)    lo=$a; hi=$((a + 2));;    # the notice line and its wrap: "● Fable 5 limit reached · continuing on Fable 5 …"
+    esac
+    [ "$lo" -ge 1 ] || lo=1
+    win=$(sed -n "${lo},${hi}p" <<<"$t" | tr -s '[:space:]' ' ')   # the dialog is drawn in a box and wraps: flatten it
+    # THE BAIL IS THIS ANCHOR'S OWN WINDOW, NOT THE WHOLE SCREEN (2026-09-02, the second review of #155): another
+    # dialog owns the pane only if the box THIS footer closes is that dialog. Grepping the screen threw away a real
+    # limit dialog drawn under an assistant line ending "Do you want to run the tests first?" — the 2026-09-01
+    # failure this exists to catch, not a false positive. The marker is option 3 of a tool dialog, which sits inside
+    # the box above its footer and is the one cc-msg's guard keeps when the box outgrows the pane: it is in a
+    # permission dialog's own window and in no prose that merely quotes the limit wording.
+    grep -qiF 'no, and tell claude what to do differently' <<<"$win" && continue   # that box is a permission prompt
+    hit=$(grep -oiE "$PROMPT_RE" <<<"$win" | head -1)
+    [ -n "$hit" ] && { fam "$hit"; return 0; }
+    # the dialog is open and offers to spend credits but named no model: it is about the model this box runs.
+    # ("out of usage credits" is deliberately NOT here — that older wording still goes through the probe below.)
+    { [ "$kind" = foot ] && grep -qi 'uses usage credits' <<<"$win"; } && { fam "$PRIMARY"; return 0; }
+  done < <( { grep -nE "$PROMPT_FOOT" <<<"$t" | sed 's/:.*/:foot/'
+              grep -niE '^[[:space:]]*@DOT@[[:space:]]*(claude-)?(fable|opus|sonnet|haiku) ?[0-9.]* ?limit reached' <<<"$t" | sed 's/:.*/:note/'; } | sort -t: -k1,1nr )
+  return 1; }
+reset_at(){   # $1 = the pane's text → the reset it names, as an epoch. Nothing (exit 1) when it names none — the weekly
+              # prompt usually does not — or when it is not a plausible wait (already past, or more than 8 days out).
+  local t="${1:-}" raw c e
+  raw=$(grep -oiE 'resets?( on| at)?[[:space:]]+[A-Za-z0-9:.,+ -]{2,24}' <<<"$t" | head -1)
+  [ -n "$raw" ] || return 1
+  raw=$(sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]?( [Oo][Nn]| [Aa][Tt])?[[:space:]]*//; s/[[:space:],.]+$//' <<<"$raw")
+  for c in "$raw" "$(cut -d' ' -f1-3 <<<"$raw")" "$(cut -d' ' -f1-2 <<<"$raw")" "$(cut -d' ' -f1 <<<"$raw")"; do
+    [ -n "$c" ] || continue
+    e=$(date -u -d "$c" +%s 2>/dev/null) || continue
+    { [ "$e" -gt "$now" ] && [ $((e - now)) -le 691200 ]; } && { printf '%s\n' "$e"; return 0; }
+  done; return 1; }
+answer_key(){   # $1 = a pane's live screen → the ONE key that answers the prompt, or nothing (exit 1) when no dialog of
+                # OURS is open (its notice is left behind long after). Enter ONLY when the highlighted line is the
+                # switch-and-continue option: the other lines are "Manage usage credits on claude.ai" (a browser, not a
+                # model) and staying on the limited model, which is the one that spends the credits. Anything else, Esc.
+                # THE FOOTER AND THE OPTION LINE HAVE TO BE THE SAME DIALOG (2026-09-01, the review of #155). A tool
+                # permission prompt carries the very same footer, and an Enter into one picks its highlighted "1. Yes" —
+                # the unattended approval cc-msg's dialog guard exists to prevent. So a permission prompt's own words
+                # end this outright, and the footer must sit within a few lines UNDER the option it belongs to: an
+                # option line left in the scrollback is not made ours by a footer further down the screen.
+  local t o rest opt=""
+  t=$(prompt_norm "${1:-}")
+  grep -qiE 'do you want to|no, and tell claude what to do differently|would you like to proceed' <<<"$t" && return 1
+  while IFS=: read -r o rest; do
+    [ -n "${o:-}" ] || continue
+    sed -n "$((o + 1)),$((o + ${CC_MODEL_DIALOG_SPAN:-4}))p" <<<"$t" | grep -qE "$PROMPT_FOOT" || continue
+    [[ "$rest" =~ ^[[:space:]]*(@SEL@|[>])[[:space:]] ]] && { printf 'Enter\n'; return 0; }
+    opt=1
+  done < <(grep -niE 'switch to .*continue' <<<"$t")
+  [ -n "$opt" ] && { printf 'Escape\n'; return 0; }
+  return 1; }
+answer_prompt(){   # $1 = pane id → answer that pane's limit prompt, printing the key sent. THE ONE PLACE THIS COMMAND
+                   # TOUCHES A PANE DIRECTLY: cc-msg types text and refuses a pane with a dialog open — rightly, a stray
+                   # keystroke there is an unattended approval — and it has no key API. One key, and only into a pane
+                   # whose own live screen is the CLI's limit prompt, in the shape answer_key insists on.
+  local k
+  k=$(answer_key "$(pane_text "$1")") || return 1
+  tmux send-keys -t "$1" "$k" 2>/dev/null || return 1
+  sleep "${CC_MODEL_ANSWER_WAIT:-0.5}"   # let the TUI repaint before anything types into the pane again
+  printf '%s\n' "$k"; }
+prompt_panes(){   # every live session showing it: "<pane-id>\t<window>\t<family>\t<reset-epoch|0>"
+  local id name cap f e
+  while read -r id name; do [ -n "${id:-}" ] || continue
+    cap=$(pane_text "$id")
+    f=$(prompt_fam "$cap") || continue
+    e=$(reset_at "$cap") || e=0
+    printf '%s\t%s\t%s\t%s\n' "$id" "$name" "$f" "$e"
+  done < <(sessions); }
+restore_blocked(){   # $1 = prompt_panes output → why a probe that answered still cannot be read as "the limit lifted",
+                     # or nothing at all (exit 1) when it can. A `claude -p` turn answers just as readily on usage credits
+                     # as on the plan and the result JSON does not say which paid, so the evidence has to come from
+                     # elsewhere: while the prompt is on a pane, or cc-limit's stamp still has the primary model limited,
+                     # this cannot tell — and a restore it cannot tell is the 12-pane retune of 2026-09-01.
+  local pp="${1:-}" p w
+  p=$(fam "$PRIMARY"); w=$(awk -F'\t' -v p="$p" '$3==p{print $2; exit}' <<<"$pp")
+  [ -n "$w" ] && { printf 'the %s limit prompt is still on %s:%s\n' "$(label "$PRIMARY")" "$SESSION" "$w"; return 0; }
+  limstamp
+  { [ "$lim_till" -gt "$now" ] && [ "$(fam "${lim_model:-}")" = "$p" ]; } &&
+    { printf "cc-limit's stamp still has %s limited until %sZ\n" "$p" "$(date -u -d "@$lim_till" +%H:%M)"; return 0; }
+  return 1; }
+SWITCH_TILL=0   # set by a caller that knows the deadline the limit itself named (the prompt's reset); do_switch banks it
 do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   local want="$1" why="${2:-}" m wf n=0 id name msg to=0
   wf=$(fam "$want")
@@ -90,9 +232,10 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   if ov; then [ "$model" = "$m" ] && return 0; else [ "$m" = "$PRIMARY" ] && return 0; fi   # idempotent: callers may fire on every limited run
   if [ "$m" = "$PRIMARY" ]; then rm -f "$OV" "$ST/model-skipped"
   else limstamp; [ "$lim_till" -gt "$now" ] && to="$lim_till"
+    [ "${SWITCH_TILL:-0}" -gt "$to" ] && to="$SWITCH_TILL"
     printf '%s\t%s\t%s\t%s\t0\n' "$m" "$now" "$to" "$(tr -d '\t\n' <<<"$why")" > "$OV"; fi
   while read -r id name; do [ -n "${id:-}" ] || continue
-    if type_into "$id" "/model $m"; then n=$((n+1))
+    if type_into "$id" "$name" "/model $m"; then n=$((n+1))
     else printf '%s\t%s\tskip\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$SESSION:$name busy or unreachable" >> "$LOG"
       printf '%s\n' "$id" >> "$ST/model-skipped"; fi   # a pane behind a dialog: retried on later ticks (F3)
   done < <(sessions)
@@ -172,22 +315,45 @@ probe(){   # is the primary model answering again? one cheap turn, no tools.
   return 0; }
 lastprobe(){ cat "$ST/model-probed" 2>/dev/null || echo 0; }   # F2: the pane-detection probe is throttled like the restore probe
 tick(){
-  local id name cap line h m rc nx
+  local id name cap line h m rc nx pp pf pe pw ptill why k
+  # ---- (1)+(2) THE CLI'S OWN LIMIT PROMPT: answered first, and in EVERY state. A session sitting on it delivers
+  # nothing at all — on 2026-09-01 a pulse tick and two secretary findings went nowhere for exactly this — and the
+  # answer is the same whether or not the box has already moved off the primary model.
+  pp=$(prompt_panes); ptill=0
+  while IFS=$'\t' read -r id name pf pe; do [ -n "${id:-}" ] || continue
+    { [[ "${pe:-}" =~ ^[0-9]+$ ]] && [ "$pe" -gt "$ptill" ]; } && ptill="$pe"
+    k=$(answer_prompt "$id") &&
+      printf '%s\t%s\tanswered\t%s\t%s: %s limit prompt — %s\n' "$(date -u +%FT%TZ)" "$now" "$pf" "$SESSION:$name" "$(label "$pf")" "$k" >> "$LOG"
+  done <<<"$pp"
   if ov; then   # ---- the fallback is on: restore once the limit has passed AND the primary model answers again
     if [ -s "$ST/model-skipped" ]; then   # F3: panes that were behind a dialog at switch time get another try
       : > "$ST/model-skipped.n"
       while read -r id; do [ -n "${id:-}" ] || continue
-        sessions | grep -q "^$id " || continue          # gone: nothing to do
-        type_into "$id" "/model $model" && printf '%s\t%s\tretyped\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$model" "$id" >> "$LOG" || printf '%s\n' "$id" >> "$ST/model-skipped.n"
+        name=$(sessions | awk -v i="$id" '$1==i{print $2; exit}'); [ -n "$name" ] || continue   # gone: nothing to do
+        type_into "$id" "$name" "/model $model" && printf '%s\t%s\tretyped\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$model" "$id" >> "$LOG" || printf '%s\n' "$id" >> "$ST/model-skipped.n"
       done < "$ST/model-skipped"; mv "$ST/model-skipped.n" "$ST/model-skipped"; fi
     { [ "$till" -gt 0 ] && [ "$now" -lt "$till" ]; } && return 0
     [ $((now - probed)) -ge "${CC_MODEL_PROBE_EVERY:-900}" ] || return 0
+    # (3) A PROBE CANNOT SEE WHO PAID FOR IT. Before spending anything: if the box cannot tell a lifted limit from one
+    # answered out of usage credits, it neither probes nor restores.
+    if why=$(restore_blocked "$pp"); then
+      printf '%s\t%s\tprobe\t%s\tnot probing — %s\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "$why" >> "$LOG"; return 0; fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$model" "$since" "$till" "$reason" "$now" > "$OV"   # bank the attempt first: a hung probe must not rerun every minute
     probe_why=""; probe; case $? in 1) printf '%s\t%s\tprobe\t%s\tstill limited\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" >> "$LOG"; return 0;;
                       2) printf '%s\t%s\tprobe\t%s\tcould not run — unknown (%s)\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-no json}" >> "$LOG"; return 0;;
                       3) printf '%s\t%s\trefusal\t%s\t%s — staying on %s\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "${probe_why:-refused}" "$(fam "$model")" >> "$LOG"; return 0;; esac
+    # …and after: the prompt can appear on a pane while the probe is running, and that answer is not proof either.
+    if why=$(restore_blocked "$(prompt_panes)"); then
+      printf '%s\t%s\tprobe\t%s\tanswered, but %s — not restoring\n' "$(date -u +%FT%TZ)" "$now" "$PROBEM" "$why" >> "$LOG"; return 0; fi
     rate_ok && do_switch "$PRIMARY" "limit lifted (probe)"; return 0
   fi
+  # ---- (2) the prompt names the primary model: move, with no probe (answering one costs usage credits) and no rate
+  # gate (do_switch is idempotent, and the wording is gone from the pane the moment it is answered).
+  pw=$(awk -F'\t' -v p="$(fam "$PRIMARY")" '$3==p{print $2; exit}' <<<"$pp")
+  if [ -n "$pw" ]; then
+    [ "$ptill" -gt 0 ] || ptill=$((now + ${CC_MODEL_PROMPT_TILL:-86400}))   # it named no reset: a day, not a probe
+    SWITCH_TILL="$ptill"; do_switch "$FALLBACK" "$(label "$PRIMARY") limit prompt in $SESSION:$pw"; SWITCH_TILL=0
+    return 0; fi
   limstamp   # ---- normal: did the primary model just hit a limit?
   if [ "$lim_till" -gt "$now" ] && [ -n "$lim_model" ] && [ "$(fam "$lim_model")" = "$(fam "$PRIMARY")" ]; then
     rate_ok && do_switch "$FALLBACK" "$(fam "$PRIMARY") limit (cc-limit stamp)"; return 0; fi
@@ -221,7 +387,8 @@ selfcheck(){   # fixtures only: no network, no tmux, and none of this box's stat
                # classifier wrong on 41 of 48 real runs while its own selfcheck was green: the stubs carried none of
                # the traps a real result carries. The three that matter are asserted below, so nobody simplifies
                # them away: `subagent_stats.refused`, a "429" inside the uuid, and the haiku side-call.
-  local d n=0 bad=0 got real c1 c2 c3 exp other oldov="$OV" oldchain="$CHAIN"
+  local d n=0 bad=0 got real c1 c2 c3 exp other oldov="$OV" oldchain="$CHAIN" oldst="$ST"
+  local dlg dlg2 dlgwrap notice credits worker quoted perm askfirst pe0 pn pf0
   d=$(mktemp -d) || return 1
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   cl(){ classify_run "$1" "" "${2:-}" | cut -f1; }
@@ -275,6 +442,74 @@ JSON
   t 'no --model given: it names both families'    "$(classify_run "$d/elsewhere.json" "" "" | cut -f2)" "answered as $other, not $(fam "$PRIMARY")"
   t 'no --model given: a run on the primary is ok' "$(cl "$d/ok.json" "")" "$([ "$(fam "$PRIMARY")" = fable ] && echo ok || echo refusal)"
   OV="$oldov"
+  # ── the CLI's own limit prompt, in the pane's own words (2026-09-01) ──────────────────────────────────────────
+  # Captured off the real TUI and off the owner's screenshot, borders and all: the flattening, the anchors and the
+  # gap before "limit reached" are what these cases are for. THE NEGATIVES ARE THE POINT — every trigger phrase is
+  # quoted in this file's own header and in this block, so a session reading it must not move the box (review of #155).
+  self=$(readlink -f "$0")
+  # The leading "|" is stripped back off below, so $dlg is the real dialog byte for byte — but THE FILE never holds a
+  # renderable one. Without it, printing just this block (sed -n, a scrolled pager) puts a live-looking dialog at the
+  # bottom of somebody's pane, and no rule that reads text could tell it from the CLI's own.
+  dlg=$(sed 's/^|//' <<'TXT'
+|╭──────────────────────────────────────────────────╮
+|│ You've reached your Fable 5 limit                │
+|│ for this week. Continuing on Fable 5 uses usage  │
+|│ credits — you have CA$0.00 in credits.           │
+|│                                                  │
+|│ ❯ Switch to Opus 5 (1M context) and continue     │
+|│   Manage usage credits on claude.ai              │
+|│                                                  │
+|│ Enter to confirm · Esc to cancel                 │
+|╰──────────────────────────────────────────────────╯
+TXT
+)
+  dlg2=$(sed 's/❯ Switch/  Switch/; s/│   Manage/│ ❯ Manage/' <<<"$dlg")   # the highlight one line down
+  dlgwrap=$(printf '%s\n' '│ You have reached your Fable 5      │' '│ limit for this week.               │' '│ Enter to confirm · Esc to cancel   │')
+  notice='● Fable 5 limit reached · continuing on Fable 5 uses usage credits, and the prompt to confirm went unanswered — nothing was sent · /model to switch'
+  credits='  Continuing on Fable 5 uses usage credits — you have CA$0.00 in credits.'
+  worker=$(printf '%s\n' '✓ step limit reached (80 steps) — the worker stopped there' '  Switch to Opus 5 (1M context) and continue   ← quoted from the runbook' '● Opus 5 · 43% context left')
+  quoted=$(printf '%s\n' '❯ Switch to Opus 5 (1M context) and continue' '  Enter to confirm · Esc to cancel')
+  perm=$(printf '%s\n' 'Do you want to make this edit to cc-model?' '❯ 1. Yes' '  2. No, and tell Claude what to do differently (esc)' 'Enter to confirm · Esc to cancel')
+  t 'the dialog is a Fable limit, though it names Opus 5 lower down' "$(prompt_fam "$dlg")"     fable
+  t 'the notice it leaves when nobody answered is one too'           "$(prompt_fam "$notice")"  fable
+  t 'so is "continuing on Fable 5 uses usage credits" under the footer' \
+    "$(prompt_fam "$(printf '%s\n%s\n' "$credits" 'Enter to confirm · Esc to cancel')")"        fable
+  t 'and so is the same dialog wrapped across its box'               "$(prompt_fam "$dlgwrap")" fable
+  t 'a worker pane saying "step limit reached" is NOT a limit'       "$(prompt_fam "$worker")"  ""
+  t 'nor is a pane merely showing the option line'                   "$(prompt_fam "$quoted")"  ""
+  t 'nor is the sentence on its own: no dialog, no notice, no move'  "$(prompt_fam "$credits")" ""
+  t 'nor is the prompt as this file documents it'  "$(prompt_fam "$(sed -n '/^# tick:/,/^# Retuning/p' "$self")")" ""
+  t 'nor is the fixture block itself, printed on its own' "$(prompt_fam "$(sed -n '/^  dlg=\$(sed/,/^  perm=/p' "$self")")" ""
+  t 'nor are the fixtures read to the end of the file' "$(prompt_fam "$(sed -n '/^  dlg=\$(sed/,$p' "$self")")" ""
+  t 'nor is the whole of this file, catted into a pane'            "$(prompt_fam "$(cat "$self")")" ""
+  t 'a permission prompt quoting the wording is not a limit' "$(prompt_fam "$(printf '%s\n%s\n' "$credits" "$perm")")" ""
+  askfirst=$(printf '%s\n%s\n' 'I can run the suite first. Do you want to run the tests first?' "$dlg")
+  t 'but a live dialog under an assistant "Do you want to …" line still is' "$(prompt_fam "$askfirst")" fable
+  t 'and a permission box below ours hides only its own anchor' \
+    "$(prompt_fam "$(printf '%s\n%s\n' "$dlg" "$perm")")"                                     fable
+  t 'that pane is still left for a human, though: no key goes into it'      "$(answer_key "$askfirst")" ""
+  t 'an assistant bullet quoting the notice is not one either' \
+    "$(prompt_fam '● The notice reads "Fable 5 limit reached · continuing on Fable 5 uses usage credits" — see #155')" ""
+  t 'the dialog one screen up is history, not a live prompt' \
+    "$(prompt_fam "$(printf '%s\n' "$dlg" 'ok' 'ok' 'ok' 'ok' 'ok' 'ok' 'ok' 'ok' 'ok' 'ok' 'ok' 'ok' 'ok')")" ""
+  t 'the highlighted switch-and-continue option is answered with Enter' "$(answer_key "$dlg")"  Enter
+  t 'any other highlighted line is answered with Esc'                "$(answer_key "$dlg2")"    Escape
+  t 'with no dialog open there is no key to send'                    "$(answer_key "$notice")"  ""
+  t 'and another dialog is not answered either, in either direction' "$(answer_key "$perm")"    ""
+  t 'nor is a permission prompt under our own dialog — that Enter would approve it' \
+    "$(answer_key "$(printf '%s\n%s\n' "$dlg" "$perm")")"                                       ""
+  t 'nor an option line a screenful above the footer that is not its own' \
+    "$(answer_key "$(printf '%s\n' '❯ Switch to Opus 5 (1M context) and continue' '' '' '' '' '' 'Enter to confirm · Esc to cancel')")" ""
+  pe0=$(date -u -d '+3 days' +%s); pn=$(date -u -d "@$pe0" +'%Y-%m-%d %H:%M:%S UTC')
+  t 'a reset the prompt names becomes the until'  "$(reset_at "Your limit resets at $pn.")"     "$pe0"
+  t 'a prompt that names none gets none (24 h)'   "$(reset_at "$dlg")"                          ""
+  ST="$d"   # hermetic: this box's cc-limit stamp is never read
+  pf0=$(printf '%%9\tsess\t%s\t0\n' "$(fam "$PRIMARY")")
+  t 'no restore while the prompt is on a pane'    "$(restore_blocked "$pf0" | grep -c 'limit prompt is still on')" 1
+  t 'nothing on any pane: the probe may decide'   "$(restore_blocked '' >/dev/null; echo $?)"   1
+  printf '%s\tapi\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" > "$ST/claude-limit"
+  t "a live cc-limit stamp cannot tell either"    "$(restore_blocked '' | grep -c 'still has')" 1
+  ST="$oldst"
   c1=$(chain | sed -n 1p); c2=$(chain | sed -n 2p); c3=$(chain | tail -1)
   [ -n "${CC_MODEL_CHAIN:-}" ] || t 'the shipped chain is fable, then opus, then sonnet' "$(chain | tr '\n' ' ')" 'claude-fable-5-1 claude-opus-5 claude-sonnet-5 '
   t 'the chain walks to its next rung'    "$(chain_next "$c1")"          "$c2"

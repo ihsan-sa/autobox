@@ -1089,6 +1089,8 @@ ME "$B/cc-limit" check "$T/fab.json" >/dev/null   # the same limit again
 [ "$(grep -c ' model' "$MH/.cc/notify.log" 2>/dev/null)" = 1 ] && ok "a second hit on the same limit is a no-op (idempotent)" || bad "switch not idempotent"
 mnow=$(date -u +%s); printf 'claude-opus-5\t%s\t%s\ttest\t0\n' "$((mnow-600))" "$((mnow-60))" > "$MH/.cc/state/model-override"
 : > "$MH/.cc/state/model.log"   # forget that switch: the 10-min anti-flap gap is not what this case is about
+rm -f "$MH/.cc/state/claude-limit"   # …and the reset this case is about HAS passed, so its stamp goes with it: a stamp
+                                     # that still names fable is a probe that cannot tell (it would re-switch anyway)
 nl0=$(wc -l < "$MH/.cc/notify.log")
 ME env CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick
 { [ ! -f "$MH/.cc/state/model-override" ] && [ "$(M status)" = fable ]; } && ok "tick restores fable once the reset passed and the probe answered" || bad "override survived a successful probe"
@@ -1146,6 +1148,23 @@ MT send-keys -t _ccmodel:sess -l -- "Switch model? 1. Yes, switch to Opus 5"; sl
 ME env CC_MODEL_DIALOG_WAIT=0.5 "$B/cc-model" switch opus "dialog case" >/dev/null 2>&1
 sleep 1
 MT capture-pane -p -t _ccmodel:sess | tail -n 3 | grep -qx '1' && ok "a Switch-model confirmation is answered, so the switch actually takes" || bad "the switch left the confirmation dialog open"
+rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen" "$MH/.cc/state/claude-limit"; : > "$MH/.cc/state/model.log"
+# THE CLI'S OWN LIMIT PROMPT (2026-09-01): it is not a line to be confirmed by a probe — answering one spends the very
+# usage credits the prompt is offering. It is answered in the pane, and the box moves on the wording alone.
+# The pane gets the dialog in the SHAPE the CLI draws it — the wording alone is deliberately not enough since the
+# review of #155 (this file, cc-model's own header and the brief all quote it), so a one-line fixture proves nothing.
+mline "You have reached your Fable 5 limit for this week."
+mline "Continuing on Fable 5 uses usage credits."
+mline "❯ Switch to Opus 5 (1M context) and continue"
+mline "  Manage usage credits on claude.ai"
+mline "Enter to confirm · Esc to cancel"
+ME env CC_CLAUDE=/nonexistent/claude "$B/cc-model" tick   # a probe here could only fail: the prompt must not need one
+M status | grep -qE '^opus until [0-9]{2}:[0-9]{2}Z$' && ok "the CLI's own limit prompt moves the box with no probe at all" || bad "limit prompt did not switch: $(M status)"
+grep -q 'answered' "$MH/.cc/state/model.log" && ok "and the prompt in that pane is answered, so the session is not left sitting on it" || bad "the limit prompt was left unanswered"
+mnow=$(date -u +%s); printf 'claude-opus-5\t%s\t%s\tprompt\t0\n' "$((mnow-1200))" "$((mnow-60))" > "$MH/.cc/state/model-override"
+: > "$MH/.cc/state/model.log"
+ME env CC_CLAUDE="$T/probeclaude" "$B/cc-model" tick   # …and a probe that ANSWERS is not proof: it may be paying credits
+{ [ "$(M current)" = claude-opus-5 ] && grep -q 'not probing' "$MH/.cc/state/model.log"; } && ok "no restore while that wording is still on a pane (a probe cannot tell who paid)" || bad "restored while the limit prompt was still on the pane: $(M status)"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 
 echo "== ccbox: a new box's ~/.claude gets the login and nothing else =="
