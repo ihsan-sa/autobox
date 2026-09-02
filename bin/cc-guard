@@ -7,6 +7,12 @@
 # Denies (exit 2 + reason) the four owner gates:
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
+# A deny is one of TWO kinds. `deny` = the owner could say yes (merging, pushing, a comment in his name, an
+# email, a post to his Slack): from a member-facing session it also ASKS him, in that member's channel and by
+# DM. `never` = no yes exists for this tier (landing, dispatching a worker, host changes, the box's secrets,
+# writing outside the session's own tree): the member is still told, and the owner is not woken for it.
+# Either gated tier also kills only its own descendants — never a session, a loop runner, or anything it
+# did not start (a member workspace's own workers run at role=member, so `worker` alone would miss them).
 # EVERY gated role, worker included: no container runtime (this user is in group `docker`, which is root-equivalent)
 # and no reading the two files that ARE the box's credentials (~/.claude/.credentials.json, ~/ccbox/env).
 # role=member = every worker gate PLUS: no dispatching workers, no reading the box's other secrets, no re-wiring Slack.
@@ -14,9 +20,199 @@
 # workers and makes tracks INSIDE itself and nowhere else — docs/design-member-workspaces.md.
 # It also gates whichever session is NOT live during an overlapping handoff (cc-handoff), by session id and
 # by $CC_HANDOFF rather than by a marker: the two sessions share one cwd, so the walk below cannot tell them apart.
+#   cc-guard selfcheck     the gates, against fixtures in a HOME of their own — never this box's Slack or owner
+# Env: CC_GUARD_ASKS, CC_GUARD_ASK_TTL (where a member-facing ask is rate-limited, and for how long) ·
+# CC_NOTIFY_LOG_ONLY, CC_NOTIFY_LOG (test hooks: an ask is logged there and nothing is sent) ·
+# CC_GUARD_ROOT_PID (test hook: the session process the worker kill fence measures its subtree from).
 set -uo pipefail
 # No jq = no cwd, so no marker walk either: fail CLOSED on the role we do know from the env (cc sets it for both).
 command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in *worker*|*member*|*handoff*) echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2;; esac; exit 0; }
+# ---- selfcheck -------------------------------------------------------------------------------------------
+# It sits ABOVE the read of stdin because that read is where every other path here begins, and a hook has no
+# other door. Each case builds its own fixture — its own HOME, its own asks dir, its own stub binaries — and
+# asserts BOTH sides: what is refused AND what is still allowed, what pages AND what must not.
+if [ "${1:-}" = selfcheck ]; then
+  # The RUNNER's env decides nothing here: a suite exports CC_NOTIFY_LOG_ONLY (case 2 asserts a REAL page to the
+  # stub) and a worker running the gates exports CC_ROLE, and both reached the child through `env` below.
+  unset CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_ROLE CC_HANDOFF CC_HANDOFF_DIR CC_GUARD_ASKS CC_GUARD_ASK_TTL CC_GUARD_ROOT_PID
+  T=$(mktemp -d); H=$T/home; WT=$H/.cc/worktrees/demo/t1; n=0; f=0; pids=""
+  trap '[ -n "$pids" ] && { kill $pids 2>/dev/null; sleep 0.2; kill -9 $pids 2>/dev/null; }; rm -rf "$T"' EXIT
+  mkdir -p "$H/bin" "$H/.cc" "$H/dev/alice/.cc" "$H/dev/_cctest1/.cc" "$WT/.cc"
+  : > "$H/dev/alice/.cc/member-facing"; : > "$H/dev/_cctest1/.cc/member-facing"; : > "$WT/.cc/track"
+  # The owner's two real doors, stubbed: a case can then say "this was sent" and "nothing was".
+  printf '#!/bin/sh\necho "notify $*" >> "$CALLS"\n' > "$H/bin/cc-notify"
+  printf '#!/bin/sh\necho "slack $*" >> "$CALLS"\n' > "$H/bin/cc-slack"
+  chmod +x "$H/bin/cc-notify" "$H/bin/cc-slack"
+  # ...and a stand-in for a session process: `claude -p` is what the kill fence must never let go, and the
+  # cases below need one they started themselves rather than a real session of this box's to point at.
+  printf '#!/bin/sh\nsleep 45\n' > "$T/claude"; chmod +x "$T/claude"
+  ok(){ n=$((n+1)); if [ "$2" = 0 ]; then echo "  ✓ $1"; else f=$((f+1)); echo "  ✗ $1"; fi; }
+  g(){ local t=$1 i=$2 c=$3; shift 3   # a payload through the gate, in a HOME of its own; rc is the answer
+    printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$t" "$i" "$c" \
+      | env HOME="$H" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$@" "$0" >/dev/null 2>&1; echo $?; }
+
+  # 1. A DENY WITH NO YES IN IT DOES NOT PAGE. The landing tool from a member-facing session: refused, the
+  #    member told in their own channel, and the owner left asleep (00:03Z, the DM that started this).
+  ASKS=$T/asks1; CALLS=$T/calls1; : > "$CALLS"
+  rc=$(g Bash '{"command":"cc-land 7"}' "$H/dev/alice")
+  if [ "$rc" = 2 ] && grep -q '^slack' "$CALLS" && ! grep -q '^notify' "$CALLS"; then r=0; else r=1; fi
+  ok "a member deny of the landing tool refuses, tells the member, and never pages the owner" $r
+
+  # 2. …and one the owner COULD approve pages, exactly once inside the TTL.
+  ASKS=$T/asks2; CALLS=$T/calls2; : > "$CALLS"
+  rc=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice")
+  rc2=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice")
+  if [ "$rc" = 2 ] && [ "$rc2" = 2 ] && [ "$(grep -c '^notify' "$CALLS")" = 1 ]; then r=0; else r=1; fi
+  ok "a member deny of an approvable action pages the owner once, and a retry inside the TTL does not page again" $r
+
+  # 3. A FIXTURE CANNOT PAGE. Same command as case 2 — the one that DOES page — from a _cctest cwd, and under
+  #    CC_NOTIFY_LOG_ONLY: nothing is sent either way, and the ask is written where cc-notify's test hook says.
+  NL=$T/notify3.log; CALLS=$T/calls3-quiet; : > "$CALLS"
+  ASKS=$T/asks3a; rc=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/_cctest1" CC_NOTIFY_LOG="$NL")
+  ASKS=$T/asks3b; rc2=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice" CC_NOTIFY_LOG="$NL" CC_NOTIFY_LOG_ONLY=1)
+  quiet=$([ -s "$CALLS" ] && echo dirty || echo clean)     # the two above may send NOTHING, by either door
+  CALLS=$T/calls3-real; : > "$CALLS"
+  ASKS=$T/asks3c; rc3=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice")
+  if [ "$rc" = 2 ] && [ "$rc2" = 2 ] && [ "$rc3" = 2 ] && [ "$quiet" = clean ] \
+     && [ "$(grep -c '^notify' "$CALLS")" = 1 ] && [ "$(grep -c 'guard-ask' "$NL")" = 2 ]; then r=0; else r=1; fi
+  ok "a _cctest cwd and CC_NOTIFY_LOG_ONLY are logged and never reach cc-notify or cc-slack; the same deny from a real dir does page" $r
+
+  # 4. A WORKER KILLS ONLY ITS OWN. Its child goes; the pid of something it did not start does not (11:15Z:
+  #    a worker pgrep'd the suite's filename, matched its own session and ended its own iteration).
+  ASKS=$T/asks4; CALLS=$T/calls4; : > "$CALLS"
+  sleep 45 >/dev/null 2>&1 & child=$!; pids="$pids $child"
+  own=$(g Bash "{\"command\":\"kill $child\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  out=$(g Bash '{"command":"kill -9 1"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  if [ "$own" = 0 ] && [ "$out" = 2 ] && [ ! -s "$CALLS" ]; then r=0; else r=1; fi
+  ok "a worker kills its own child, is refused a pid outside its subtree, and pages nobody either way" $r
+
+  # 4b. A NEGATIVE PID IS A PROCESS GROUP. `kill -9 -1` parsed as two signals and was waved through, which is
+  #     every process this user owns; a named group is fenced pid by pid like any other target.
+  ASKS=$T/asks4b; CALLS=$T/calls4b; : > "$CALLS"
+  sleep 45 >/dev/null 2>&1 & c2=$!; pids="$pids $c2"
+  all=$(g Bash '{"command":"kill -9 -1"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  grp=$(g Bash "{\"command\":\"kill -TERM -$(ps -o pgid= -p $c2 | tr -d ' ')\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  sig=$(g Bash "{\"command\":\"kill -9 $c2\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  if [ "$all" = 2 ] && [ "$sig" = 0 ] && [ ! -s "$CALLS" ]; then r=0; else r=1; fi
+  ok "a worker is refused \`kill -9 -1\`, keeps its leading signal, and a named group is fenced pid by pid (rc $grp)" $r
+
+  # 5. …and a session process is off limits even INSIDE the subtree: the incident was a worker killing the
+  #    `claude -p` it was running in, which is its own ancestor, but a child one would end the run just as dead.
+  "$T/claude" -p x >/dev/null 2>&1 & held=$!; pids="$pids $held"
+  sleep 0.3
+  rc=$(g Bash "{\"command\":\"kill $held\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  if [ "$rc" = 2 ]; then r=0; else r=1; fi
+  ok "a worker is refused a kill of a claude -p, subtree or not" $r
+
+  # 5b. …and the fence is the MEMBER tier's too, which is where it is needed most: a worker dispatched inside
+  #     a member workspace runs at role=member (track_dir: the repo decides the tier, not the worktree), and
+  #     that is the session running `claude -p` in a loop — the one the 11:15Z incident happened to. Its own
+  #     pair of processes and its own call log, and the refusal must not page either: a kill is not a thing
+  #     the owner could say yes to.
+  ASKS=$T/asks5b; CALLS=$T/calls5b; : > "$CALLS"
+  "$T/claude" -p x >/dev/null 2>&1 & mheld=$!; pids="$pids $mheld"
+  sleep 45 >/dev/null 2>&1 & mchild=$!; pids="$pids $mchild"
+  sleep 0.3
+  rc=$(g Bash "{\"command\":\"kill $mheld\"}" "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$$)
+  out=$(g Bash '{"command":"kill -9 1"}' "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$$)
+  own=$(g Bash "{\"command\":\"kill $mchild\"}" "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$$)
+  if [ "$rc" = 2 ] && [ "$out" = 2 ] && [ "$own" = 0 ] && ! grep -q '^notify' "$CALLS"; then r=0; else r=1; fi
+  ok "the same fence holds at the member tier, where a member workspace's own workers run — and refusing a kill pages nobody" $r
+
+  # 6. A PATTERN IS RESOLVED, NOT GUESSED. One marked process, asked about twice: from a root that did not
+  #    start it the pkill is refused, from the root that did it is allowed. The root is a pid this case picks,
+  #    so the answer comes from the fixture and not from whatever else on the box happens to match.
+  gk=marked$$                                   # minted per run, for the reason case 7 spells out
+  printf '#!/bin/sh\nsleep 45\n' > "$T/$gk"; chmod +x "$T/$gk"
+  sleep 45 >/dev/null 2>&1 & bare=$!; pids="$pids $bare"   # a root that started nothing: the marked process is outside it
+  "$T/$gk" >/dev/null 2>&1 & mark=$!; pids="$pids $mark"  # ...and inside this shell's, the other root below
+  sleep 0.3
+  hit=$(g Bash "{\"command\":\"pkill -f $gk\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare)
+  mine=$(g Bash "{\"command\":\"pkill -f $gk\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  miss=$(g Bash "{\"command\":\"pkill -f $gk-no-such-process-here\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare)
+  if [ "$hit" = 2 ] && [ "$mine" = 0 ] && [ "$miss" = 0 ] && kill -0 "$mark" 2>/dev/null; then r=0; else r=1; fi
+  ok "a worker's pkill -f is refused when it resolves outside its subtree, allowed when it resolves inside it, and allowed when it resolves to nothing" $r
+
+  # 7. HUNT, THEN KILL. `pgrep -f <name> | xargs kill -9` is what the worker actually typed on 11:15Z, and
+  #    it is the shape the target loop cannot see: the kill carries no pid of its own. Its own marked
+  #    process, asked about from both roots, plus a feed that is no pgrep at all. The mark is minted per run
+  #    ($$) because a fixed word here matched the shell that invoked this file — a command line carrying the
+  #    word is exactly how the incident happened, and a case must not be decided by one.
+  hk=hunted$$                                              # a name minted for this run: see below
+  printf '#!/bin/sh\nsleep 45\n' > "$T/$hk"; chmod +x "$T/$hk"
+  sleep 45 >/dev/null 2>&1 & hbare=$!; pids="$pids $hbare"   # a root that started nothing
+  "$T/$hk" >/dev/null 2>&1 & hm=$!; pids="$pids $hm"
+  sleep 0.3
+  ASKS=$T/asks7; CALLS=$T/calls7; : > "$CALLS"
+  hit=$(g Bash "{\"command\":\"pgrep -f $hk | xargs kill -9\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$hbare)
+  mine=$(g Bash "{\"command\":\"pgrep -f $hk | xargs kill -9\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  opt=$(g Bash "{\"command\":\"pgrep -f $hk | xargs -n 1 kill -9\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$hbare)
+  blind=$(g Bash '{"command":"cat pidfile | xargs kill -9"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  sub=$(g Bash "{\"command\":\"kill -9 \$(pgrep -f $hk)\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$hbare)
+  if [ "$hit" = 2 ] && [ "$mine" = 0 ] && [ "$opt" = 2 ] && [ "$blind" = 2 ] && [ "$sub" = 2 ] \
+     && kill -0 "$hm" 2>/dev/null; then r=0; else r=1; fi
+  ok "a worker hunting with pgrep and killing through xargs is fenced on what the pgrep finds — with an option between the two, refused outside its subtree, allowed inside it, and refused when the feed is not a pgrep at all" $r
+
+  # 8. AN OPTION'S VALUE IS NOT THE PATTERN. `pkill --signal TERM <name>` read TERM as the pattern, matched
+  #    nothing and went through — and TERMs every match of the real name, this session included.
+  ASKS=$T/asks8; CALLS=$T/calls8; : > "$CALLS"
+  sk=signalled$$                                           # its own mark and its own pair, as above
+  printf '#!/bin/sh\nsleep 45\n' > "$T/$sk"; chmod +x "$T/$sk"
+  sleep 45 >/dev/null 2>&1 & sbare=$!; pids="$pids $sbare"
+  "$T/$sk" >/dev/null 2>&1 & sm=$!; pids="$pids $sm"
+  sleep 0.3
+  sig=$(g Bash "{\"command\":\"pkill --signal TERM -f $sk\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$sbare)
+  usr=$(g Bash "{\"command\":\"pkill -u $(id -u) -f $sk\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$sbare)
+  own=$(g Bash "{\"command\":\"pkill --signal TERM -f $sk\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  none=$(g Bash "{\"command\":\"pkill --signal TERM -f $sk-no-such-process-here\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$sbare)
+  if [ "$sig" = 2 ] && [ "$usr" = 2 ] && [ "$own" = 0 ] && [ "$none" = 0 ] && kill -0 "$sm" 2>/dev/null; then r=0; else r=1; fi
+  ok "an option's value is never mistaken for the pattern: --signal and -u are consumed, so the name after them is what gets resolved" $r
+
+  # 9. A SELECTOR WITH NO PATTERN IS STILL EVERY PROCESS. `pkill -u $(id -u)` parses to no pattern at all, so
+  #    the branch that resolves patterns found nothing to fence and waved it through — every process this user
+  #    owns, this session's own claude -p and loop runner included, which is `kill -9 -1` spelled a second way
+  #    (review of #181). Now refused, and refused for the attached and long spellings too, which is why this
+  #    fails closed rather than resolving: the matcher cannot be taught every one. Both sides, as ever — the
+  #    same selector carrying a pattern still resolves the pattern, and its own marked process is still there
+  #    afterwards. The root here is the one that DID start the mark, so what refuses is the missing pattern
+  #    and not the subtree test. Mark minted per run ($$) for the reason case 7 spells out.
+  ASKS=$T/asks9; CALLS=$T/calls9; : > "$CALLS"
+  nk=selected$$
+  printf '#!/bin/sh\nsleep 45\n' > "$T/$nk"; chmod +x "$T/$nk"
+  "$T/$nk" >/dev/null 2>&1 & nm=$!; pids="$pids $nm"
+  sleep 0.3
+  uid=$(g Bash "{\"command\":\"pkill -u $(id -u)\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  pgr=$(g Bash '{"command":"pkill -g 1"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)   # group 1: nothing this shell started
+  att=$(g Bash "{\"command\":\"pkill -u$(id -u)\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  kal=$(g Bash "{\"command\":\"killall -u $(id -un)\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  own=$(g Bash "{\"command\":\"pkill -u $(id -u) -f $nk\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  if [ "$uid" = 2 ] && [ "$pgr" = 2 ] && [ "$att" = 2 ] && [ "$kal" = 2 ] && [ "$own" = 0 ] \
+     && kill -0 "$nm" 2>/dev/null; then r=0; else r=1; fi
+  ok "a pkill that selects a set but names no pattern is refused rather than resolved — -u, -g, an attached -u<uid> and killall -u alike — while the same selector carrying a pattern still resolves that pattern" $r
+
+  # 10. …and the selectors that were still resolvable TO GARBAGE. `--older 3600` and `-F <pidfile>` take a
+  #     value, so an argument list that skipped it read the value as the pattern, `pgrep -- 3600` matched
+  #     nothing, and the fence found nothing to refuse — the same hole as `--signal TERM`, one round later.
+  #     Its own mark and its own root, and the third line is the half that must NOT change: a selector
+  #     carrying a real pattern still resolves that pattern.
+  ASKS=$T/asks10; CALLS=$T/calls10; : > "$CALLS"
+  ok10=selectors$$
+  printf '#!/bin/sh\nsleep 45\n' > "$T/$ok10"; chmod +x "$T/$ok10"
+  "$T/$ok10" >/dev/null 2>&1 & om=$!; pids="$pids $om"
+  : > "$T/pidfile10"
+  sleep 0.3
+  old=$(g Bash '{"command":"pkill --older 3600"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  pf=$(g Bash "{\"command\":\"pkill -F $T/pidfile10\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  qv=$(g Bash '{"command":"pkill -q 7"}' "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  keep=$(g Bash "{\"command\":\"pkill --older 3600 -f $ok10\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$)
+  if [ "$old" = 2 ] && [ "$pf" = 2 ] && [ "$qv" = 2 ] && [ "$keep" = 0 ] && kill -0 "$om" 2>/dev/null; then r=0; else r=1; fi
+  ok "an option's value is not a pattern however it is spelled: --older, -F and -q consume theirs and are refused for naming no process, while the same --older carrying a pattern still resolves it" $r
+
+  echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" = 0 ] || exit 1
+  exit 0
+fi
+
 inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""' <<<"$inp"); cwd=$(realpath -m -- "${cwd:-/}" 2>/dev/null || echo "$cwd")
 # A command position: start, after a separator/substitution, or after wrapper words that hide the real command
 # (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
@@ -150,9 +346,30 @@ in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && ca
 # the owner's own channels, which are not member-facing sessions.
 # Bounded three ways: nothing runs unless role=member, one ask per channel+reason per ASK_TTL (a session retrying
 # a blocked command must not spray the channel), and `timeout` on both calls so a slow Slack cannot hang a hook.
+# TWO CLASSES OF DENY, AND ONLY ONE OF THEM IS A QUESTION. 2026-09-02 00:03Z the owner was DM'd at midnight
+# because a member-facing session had been refused the landing tool — a thing no owner would ever approve FOR a
+# member, so the page asked him nothing and could only be read and dismissed. A page is worth waking someone for
+# when the answer could be yes: merging, pushing, a comment in his name, an email, a post to his Slack. Landing,
+# dispatching a worker and host changes are never that session's to run at all, whoever says so — the member is
+# still told in their own channel (a refusal must not be silent, which is the other half of this gate), but the
+# owner is not asked a question that has no yes in it. `deny` pages; `never` does not.
 ASKS="${CC_GUARD_ASKS:-$HOME/.cc/guard-asks}"; ASK_TTL="${CC_GUARD_ASK_TTL:-1800}"
+# A FIXTURE CAN NEVER PAGE. The same rule as cc-handoff's alert(), here for the same reason: the two calls below
+# are the box's real Slack and the owner's real DM, and a suite's payload reaches them through this function like
+# any other. cc-notify honours CC_NOTIFY_LOG_ONLY itself but `cc-slack post` does not, and neither of them knows
+# a _cctest cwd from a real one — so both are decided HERE, before either binary is even looked for.
+test_state(){   # rc 0 = this call came from a fixture: log it, never send it
+  [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && return 0
+  case "/$cwd/" in */_cctest*|*/_selfcheck*) return 0;; esac
+  return 1
+}
 ask_owner(){
-  local why=$1 chan="" key f was now c bin
+  local why=$1 page=${2-1} chan="" key f was now c bin   # ${2-1}, never ${2:-1}: `never` passes an EMPTY page
+  if test_state; then   # one line, in the file cc-notify's own test hook names, and nothing is sent
+    printf 'guard-ask\t%s\t%s\n' "$([ -n "$page" ] && echo page || echo nopage)" "$why" \
+      >> "${CC_NOTIFY_LOG:-$HOME/.cc/notify.log}" 2>/dev/null || true
+    return 0
+  fi
   [ -n "$mdir" ] && chan=${mdir##*/}
   if [ -n "$chan" ] && [ -f "$HOME/.cc/slack/provisioned.json" ]; then   # the dir's name and its channel's can differ
     c=$(jq -r --arg t "$chan" '.[$t].chan // empty' "$HOME/.cc/slack/provisioned.json" 2>/dev/null) || c=""
@@ -170,7 +387,9 @@ ask_owner(){
   bin="$HOME/bin"; [ -x "$bin/cc-slack" ] || bin=$(dirname -- "$0")
   # The member sees it. 🔐 is the box's own "nothing happens until the owner answers" form, and the sweep reads it.
   [ -n "$chan" ] && [ -x "$bin/cc-slack" ] && timeout 20 "$bin/cc-slack" post -c "#$chan" \
-    "$(printf '🔐 I cannot do that part myself: %s.\nI have asked the owner to approve it — nothing more happens here until they do. Anything that needs no approval I am still doing.' "$why")" >/dev/null 2>&1
+    "$(if [ -n "$page" ]; then printf '🔐 I cannot do that part myself: %s.\nI have asked the owner to approve it — nothing more happens here until they do. Anything that needs no approval I am still doing.' "$why"
+       else printf '🔐 I cannot do that: %s.\nThat one is not mine to run and not mine to ask for, so there is nothing pending — tell the owner yourself if it needs doing. Anything else I am still doing.' "$why"; fi)" >/dev/null 2>&1
+  [ -n "$page" ] || return 0                        # "never for this tier": the member is told, the owner is not asked
   bin="$HOME/bin"; [ -x "$bin/cc-notify" ] || bin=$(dirname -- "$0")
   # ...and the owner is told there is something to approve. --owner delivers it (a DM), never back into the channel.
   [ -x "$bin/cc-notify" ] && ( cd "${mdir:-/}" 2>/dev/null || cd /
@@ -178,7 +397,9 @@ ask_owner(){
       "$(printf 'Needs you: a member-facing session was refused — %s%s. I told them it is with you.' "$why" "${chan:+ (#$chan)}")" >/dev/null 2>&1 )
   return 0
 }
-deny(){ [ "$role" = member ] && ask_owner "$1"; echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
+deny(){ [ "$role" = member ] && ask_owner "$1" 1; echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
+# "never for this tier": the owner could not approve it FOR this session even if he were asked, so nothing pages.
+never(){ [ "$role" = member ] && ask_owner "$1" ""; echo "cc-guard: blocked — $1. This is not this session's to run and not the owner's to approve for it — nobody is being asked, so do not wait on an answer." >&2; exit 2; }
 denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
 ws_dispatch_ok(){   # EVERY dispatch in $1 names workspace $2 as its repo — and there is at least one to name.
   # `cc <ws> <track> --go` is a workspace's ONLY dispatch form: it is where the daily cap is charged (cc: member_gate).
@@ -238,34 +459,187 @@ case "$tool" in
     fi
     # 1. merge/deploy
     grep -qE "$AT"'gh +pr +merge' <<<"$cmd" && deny "merging a PR"
-    grep -qE "$AT"'([^ ]*/)?cc-land\b' <<<"$cmd" && deny "landing a change (cc-land merges, installs, switches units on and restarts services in one go)"   # one command for all of it is exactly why it stays the owner's
+    grep -qE "$AT"'([^ ]*/)?cc-land\b' <<<"$cmd" && never "landing a change (cc-land merges, installs, switches units on and restarts services in one go)"   # one command for all of it is exactly why it stays the owner's
     grep -qE 'git +push[^;&|]*( -f|--force|--force-with-lease)' <<<"$cmd" && deny "force push"
     grep -qE 'git +push[^;&|]*\b(main|master)\b' <<<"$cmd" && deny "pushing to the default branch"
     grep -qE 'git +(checkout|switch) +(main|master)\b' <<<"$cmd" && deny "switching to the default branch inside a track"
     grep -qE 'git +(symbolic-ref|update-ref|checkout +-B|switch +-C)' <<<"$cmd" && deny "repointing a ref/HEAD (the checkpoint hook would then commit+push that branch)"
-    grep -qE "$AT"'(vercel|netlify|fly|heroku|kubectl|terraform|ansible|aws|gcloud|az) +(deploy|apply|--prod|up\b)' <<<"$cmd" && deny "deploying"
+    grep -qE "$AT"'(vercel|netlify|fly|heroku|kubectl|terraform|ansible|aws|gcloud|az) +(deploy|apply|--prod|up\b)' <<<"$cmd" && never "deploying"
     # 2. external comms
     grep -qE "$AT"'gh +(issue +(create|comment)|pr +(comment|review|close|reopen)|release +create)' <<<"$cmd" && deny "public GitHub comms"
     grep -qE "$AT"'gh +(repo +(delete|archive)|api)\b' <<<"$cmd" && deny "gh repo delete/archive or a raw gh api call"
     grep -qE "$AT"'(mail|sendmail|msmtp|mutt)\b' <<<"$cmd" && deny "sending email"
     # 3. destructive / infra
-    grep -qE "$AT"'cc +slack +off' <<<"$cmd" && deny "cc slack off (drops the owner's live Slack link)"
+    grep -qE "$AT"'cc +slack +off' <<<"$cmd" && never "cc slack off (drops the owner's live Slack link)"
     grep -qE '(^|[;&|(){}`]|\$\() *[^ ]*cc-slack +(inject|post|post-approval)\b' <<<"$cmd" && deny "posting to the owner's Slack (cc-slack inject/post)"   # any path to the binary
-    grep -qE "$AT"'sudo\b' <<<"$cmd" && deny "sudo / host changes"
-    grep -qE 'rm +(-[a-zA-Z-]+ +)*-[a-zA-Z]*r[a-zA-Z]* +(-[a-zA-Z-]+ +)*(~|[$]HOME|\.\.|/home|/etc|/var|/usr|/)([*/ ]|$)' <<<"$cmd" && deny "recursive delete outside the worktree"
+    grep -qE "$AT"'sudo\b' <<<"$cmd" && never "sudo / host changes"
+    grep -qE 'rm +(-[a-zA-Z-]+ +)*-[a-zA-Z]*r[a-zA-Z]* +(-[a-zA-Z-]+ +)*(~|[$]HOME|\.\.|/home|/etc|/var|/usr|/)([*/ ]|$)' <<<"$cmd" && never "recursive delete outside the worktree"
     # The container runtime is a way AROUND every other line here, for a WORKER as much as for a member: this user
     # is in group `docker`, so one `docker run -v /:/host` reads and writes the whole filesystem as root — the
     # credentials below included — with no escalation at all. So it is denied for every gated role, which subsumes
     # the narrower "destroying docker resources" rule this replaces. The sanctioned sandbox (ccbox) is the owner's.
-    grep -qE "$AT"'([^ ]*/)?(docker|podman|nerdctl)\b' <<<"$cmd" && deny "running a container (this user is in group docker, so a bind-mounted container reads and writes everything as root)"
-    grep -qE "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' <<<"$cmd" && deny "host/network/service changes"
-    grep -qE 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' <<<"$cmd" && deny "destructive git"
+    grep -qE "$AT"'([^ ]*/)?(docker|podman|nerdctl)\b' <<<"$cmd" && never "running a container (this user is in group docker, so a bind-mounted container reads and writes everything as root)"
+    grep -qE "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' <<<"$cmd" && never "host/network/service changes"
+    grep -qE 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' <<<"$cmd" && never "destructive git"
+    # 3b. A WORKER KILLS ONLY WHAT IT STARTED. 2026-09-02 11:15Z a worker went hunting a "stray" suite with
+    #     `pgrep -f <the suite's filename>`, matched its OWN `claude -p` — its task prompt names that file — and
+    #     killed its own iteration mid-run (rc=143, $0 recorded, nothing journalled). A prompt line telling it not
+    #     to did not hold, so the rule is here: at the worker tier a kill lands only on a DESCENDANT of this
+    #     session, and never on a session process or a loop runner whatever the tree says. Its own children — a
+    #     detached suite, a poller — stay killable, which is the whole point of the subtree test rather than a ban.
+    #     A pattern (pkill/killall) is resolved with ONE pgrep and every match must pass the same test; a pattern
+    #     matching nothing is nothing to refuse. Same honest ceiling as rule 5: a pid or pattern held in a shell
+    #     variable cannot be resolved here and passes.
+    #     WORKER *and* MEMBER, because those are not two populations here: a worker dispatched inside a member
+    #     workspace is given role=member by track_dir() (the repo decides the tier, not the worktree), and it is
+    #     the one running `claude -p` in a loop — exactly the session the incident happened to. `role=member` is
+    #     every worker gate PLUS its own, as the header says, so a fence only the worker tier gets is a hole.
+    if { [ "$role" = worker ] || [ "$role" = member ]; } \
+       && { grep -qE "$AT"'([^ ]*/)?(kill|pkill|killall)([[:space:]]|$)' <<<"$cmd" \
+            || grep -qE 'xargs[^;&|]+([^ ]*/)?(kill|pkill|killall)([[:space:]]|$)' <<<"$cmd"; }; then
+      kppid(){ awk '/^PPid:/{print $2; exit}' "/proc/$1/status" 2>/dev/null; }
+      kroot(){   # this session's own process: the nearest `claude` above the hook. $CC_GUARD_ROOT_PID is a test
+        # hook and safe as one — the hook is a child of the claude process, not of the Bash tool, so a command
+        # cannot put it there (the same reason $CC_HANDOFF is trusted above).
+        local p=${CC_GUARD_ROOT_PID:-} n=0
+        if [ -n "$p" ]; then printf '%s' "$p"; return 0; fi
+        p=$PPID
+        while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+          [ "$(cat "/proc/$p/comm" 2>/dev/null)" = claude ] && { printf '%s' "$p"; return 0; }
+          p=$(kppid "$p"); n=$((n+1))
+        done
+        return 1
+      }
+      kdesc(){   # rc 0 = pid $1 is a DESCENDANT of $2 — never $2 itself, never one of $2's ancestors
+        local p=$1 n=0
+        [ "$p" = "$2" ] && return 1
+        while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+          p=$(kppid "$p"); [ "$p" = "$2" ] && return 0; n=$((n+1))
+        done
+        return 1
+      }
+      kheld(){   # rc 0 = pid $1 is a session or the loop runner: off limits inside the subtree as much as outside
+        local c
+        c=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+        case "$c" in *cc-loop*) return 0;; esac
+        case " $c " in *' -p '*|*' --print '*) case "$c" in *claude*) return 0;; esac;; esac
+        return 1
+      }
+      kfence(){   # $1 = a pid the command would signal, $2 = how it was named
+        kheld "$1" && never "killing pid $1 ($2) — that is a session or a loop runner, and a worker that ends one ends itself"
+        kdesc "$1" "$me" || never "killing pid $1 ($2) — it is outside this worker's own process subtree, so it is somebody else's; a worker ends only what it started"
+      }
+      me=$(kroot) || me=""
+      [ -n "$me" ] || never "killing a process — this worker cannot find its own session process, so it cannot tell its children from anybody else's"
+      # WHICH ARGUMENT IS THE PATTERN. pgrep/pkill/killall take a VALUE for -u/-U/-g/-G/-P/-t/-s/-d and
+      # --signal, so "the first bare word" is not it: `pkill --signal TERM claude` read TERM as the pattern,
+      # `pgrep -- TERM` matched nothing, and the command went through — then TERMed every `claude` this user
+      # owns, this worker's own session included (review of #181). The value is consumed; what is left names
+      # the pattern. Only options that genuinely take one are listed: consuming a word that is really the
+      # pattern would turn a refusal into a pass, which is the failure this is fixing.
+      kpat(){   # $@ = the argv after the verb. Prints "<-f seen>\t<pattern>"; rc 1 = nothing nameable
+        local y sk="" full="" pat=""
+        for y in "$@"; do
+          if [ -n "$sk" ]; then sk=""; continue; fi
+          case "$y" in
+            -s|--signal|--session|-u|--uid|-U|--euid|-g|--pgroup|-G|--group|-P|--parent|-t|--terminal|-d|--delimiter|--ns|--nslist) sk=1;;
+            # …and the rest of the ones that take a value. `pkill --older 3600` — a worker's own "clean up
+            # strays" idiom — read 3600 as the pattern, matched nothing, and ran: every process this user
+            # owns over an hour old, which is its own claude -p and its loop runner. Consumed here, those
+            # commands reduce to NO pattern and land in the refusal below, which is where a selector that
+            # names no process belongs (review of #181).
+            --older|-r|--runstates|-F|--pidfile|-q|--queue|--env|--cgroup) sk=1;;
+            -f|--full) full=1;;
+            -*) ;;                                     # a flag, a signal, or --opt=value: none of them a pattern
+            *) [ -n "$pat" ] || pat=$y;;
+          esac
+        done
+        [ -n "$pat" ] || return 1
+        printf '%s\t%s' "$full" "$pat"
+      }
+      kresolve(){   # $1 = a `pgrep …` invocation, $2 = how to name it. Fences everything it would find.
+        local seg=$1 why=$2 spec full pat hits x
+        [[ $seg =~ (^|[^A-Za-z0-9_.-])pgrep[[:space:]]+(.*)$ ]] || return 1
+        local args=${BASH_REMATCH[2]}
+        args=${args%%[\`)]*}                            # a substitution ends at its own paren: `$(pgrep -f x)`
+        local xa; read -r -a xa <<<"$args"
+        spec=$(kpat "${xa[@]}") || return 1
+        full=${spec%%$'\t'*}; pat=${spec#*$'\t'}
+        case "$pat" in *'$'*|*'`'*) return 1;; esac    # named by a variable: unresolvable
+        if [ -n "$full" ]; then hits=$(pgrep -f -- "$pat" 2>/dev/null) || hits=""
+        else hits=$(pgrep -- "$pat" 2>/dev/null) || hits=""; fi
+        for x in $hits; do kfence "$x" "$why"; done     # no match = nothing to refuse
+        return 0
+      }
+      # HUNT, THEN KILL — the incident's own shape, and the one the target loop below cannot see. In
+      # `pgrep -f <suite> | xargs kill -9` the kill carries no target of its own: the pids arrive on its
+      # stdin, so the loop reads `-9` as a signal, finds nothing to fence and lets it through. What it would
+      # kill is whatever the pgrep on the other side of the pipe finds, so THAT is what is resolved and
+      # fenced. A feed this cannot read is refused rather than guessed: a worker that cannot say whose pids
+      # those are has no business signalling them.
+      prev=""
+      while IFS= read -r seg; do
+        if [[ $seg =~ (^|[^A-Za-z0-9_.-])xargs([[:space:]]+-[^[:space:]]+([[:space:]]+[^-][^[:space:]]*)?)*[[:space:]]+([^ ]*/)?(kill|pkill|killall)([[:space:]]|$) ]]; then
+          kresolve "$prev" "the pids a pipeline fed to xargs kill" \
+            || never "killing whatever a pipeline finds (… | xargs kill) — the pids arrive on stdin, so this worker cannot tell its own from anybody else's; the one time it guessed, it ended its own iteration"
+        fi
+        prev=$seg
+      done < <(tr '|' '\n' <<<"$cmd")
+      while IFS= read -r inv; do
+        [[ $inv =~ (^|[^A-Za-z0-9_.-])(kill|pkill|killall)[[:space:]]+(.*)$ ]] || continue
+        v=${BASH_REMATCH[2]}; read -r -a a <<<"${BASH_REMATCH[3]}"; skip=""; pat=""
+        if [ "$v" = kill ]; then
+          first=1                                      # only the FIRST dash-argument can be the signal
+          for x in "${a[@]}"; do
+            if [ -n "$skip" ]; then skip=""; first=""; continue; fi
+            case "$x" in
+              -s|-n|--signal) skip=1; first="";;
+              --) first="";;                             # end of options: what follows is a target, never a signal
+              -[0-9]*|-[A-Za-z]*)
+                # A LATER `-N` IS A PROCESS GROUP, NOT A SIGNAL, and fencing no pid fences nothing: `kill -9 -1`
+                # walked straight through this branch and signals every process this user owns — the worker's own
+                # claude, its loop runner and the shared tmux server (review of #181, a worse 11:15Z).
+                if [ -n "$first" ]; then first=""; continue; fi
+                case "$x" in
+                  -1) never "killing process group -1 — that is every process this user owns, this worker included";;
+                  -[0-9]*) for gp in $(pgrep -g "${x#-}" 2>/dev/null); do kfence "$gp" "kill $x (process group ${x#-})"; done;;
+                esac;;
+              %*) ;;                                     # a job of the tool's own shell
+              '$('*|'`'*)                                # `kill $(pgrep -f <suite>)`: the same hunt, spelled
+                first=""                                 # as a substitution rather than a pipe
+                kresolve "$inv" "the pids a pgrep found for kill" \
+                  || never "killing what a command substitution returns — this worker cannot see whose pids those are";;
+              *[!0-9]*) first="";;                       # a variable or a glob: unresolvable, same ceiling as rule 5
+              *) first=""; kfence "$x" "kill $x";;
+            esac
+          done
+        else
+          # NO PATTERN IS NOT "NOTHING TO REFUSE". A selector says WHICH processes without naming one:
+          # `pkill -u $(id -u)` parses to no pattern at all, so this line used to fall through and let it
+          # signal every process this user owns — the worker's own claude -p, its loop runner and the shared
+          # tmux server. That is `kill -9 -1` spelled a second way, and that one IS refused a branch up
+          # (review of #181). Resolving it instead would mean teaching kpat every spelling procps takes
+          # (-u1000, --uid=1000, --older, whatever lands next); seven holes in four rounds say it cannot be
+          # taught. So a pkill/killall this cannot reduce to a pattern is refused, the way an unreadable
+          # xargs feed is. `killall -l` and `pkill -V` are refused with it: informational, and no rule here
+          # needs them. A selector WITH a pattern is unaffected — the pattern is still what gets resolved.
+          spec=$(kpat "${a[@]}") \
+            || never "$v with a selector but no pattern — -u/-U/-g/-G/-P/-t/-s/--older/-F and the rest name a whole SET of processes and this worker cannot tell whose they are, so it is refused rather than guessed: pkill -u \$(id -u) is every process this user owns, its own claude -p and loop runner included, and pkill --older 3600 is the same set an hour old"
+          fflag=${spec%%$'\t'*}; pat=${spec#*$'\t'}
+          case "$pat" in *'$'*|*'`'*) continue;; esac     # named by a variable: unresolvable
+          if [ "$v" = killall ]; then hits=$(pgrep -x -- "$pat" 2>/dev/null) || hits=""
+          elif [ -n "$fflag" ]; then hits=$(pgrep -f -- "$pat" 2>/dev/null) || hits=""
+          else hits=$(pgrep -- "$pat" 2>/dev/null) || hits=""; fi
+          for x in $hits; do kfence "$x" "$v $pat"; done   # no match = nothing to refuse
+        fi
+      done < <(grep -oE "$AT"'([^ ]*/)?(kill|pkill|killall)[[:space:]]+[^;&|]*' <<<"$cmd")
+    fi
     # The two files that ARE the box's credentials — no role reads them, and the member-only list below adds to this
     # one rather than replacing it. Same honest ceiling as every line here: a blocklist stops accidents and casual
     # prompt-injection, not a redirection or a script written first.
     RD='(cat|tac|less|more|head|tail|nl|cut|grep|egrep|fgrep|rg|sed|awk|xxd|od|base64|strings|sort|uniq|jq|python[0-9.]* +-c|source|\.)'
     grep -qE "$AT$RD"' +[^;&|]*(ccbox/env|\.credentials\.json)($|[^A-Za-z0-9_.-])' <<<"$cmd" \
-      && deny "reading the box's credentials (~/.claude/.credentials.json is the Claude account and its spend, ~/ccbox/env is a GitHub PAT and a deploy token)"
+      && never "reading the box's credentials (~/.claude/.credentials.json is the Claude account and its spend, ~/ccbox/env is a GitHub PAT and a deploy token)"
     # 5. THE WORKTREE IS THE ONLY TREE A TRACK WRITES. ~/dev/<repo> is the checkout the box RUNS and ~/bin symlinks into
     #    it, so a write there is an unreviewed change to a live binary. 2026-09-01: a review agent's `cp x $S/bin/y` landed
     #    in the live checkout's core/bin because $S/bin was a symlink farm into it — so every target is REALPATH'd and judged by
@@ -279,7 +653,7 @@ case "$tool" in
       case "$t" in ''|-*|*['$`*?[']*) return 1;; /*) ;; *) t=$cwd/$t;; esac
       t=$(realpath -m -- "$t" 2>/dev/null) || return 1
       case "$t" in "$HOME"/dev/*|"$HOME"/bin|"$HOME"/bin/*) in_root "$t" && return 1; hit=$t; return 0;; esac; return 1; }
-    wdeny(){ deny "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs and ~/bin symlinks into it — a track writes its worktree, /tmp and its own ~/.cc/state dir, and the rest arrives as a PR"; }
+    wdeny(){ never "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs and ~/bin symlinks into it — a track writes its worktree, /tmp and its own ~/.cc/state dir, and the rest arrives as a PR"; }
     while IFS= read -r t; do wtgt "$t" && wdeny; done < <(grep -oE '(&>>?|[0-9]*>>?[|]?)[[:space:]]*[^[:space:];&|<>()]+' <<<"$cmd" | sed -E 's/^[^[:space:]]*>[|]?[[:space:]]*//')
     while IFS= read -r inv; do
       [[ $inv =~ (^|[^A-Za-z0-9_.-])(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+(.*)$ ]] || continue
@@ -321,33 +695,33 @@ case "$tool" in
       # which the sandbox sets — never a member-facing session: `CC_MEMBER_SANDBOX=1 cc alice todo` from a plain member
       # dir passed every rule here and started a member workspace session ON THE HOST, the one thing the hard rule
       # forbids (review 2, A). The ASSIGNMENT is refused (prefix, env, export); naming the variable in a grep is not.
-      grep -qE '(^|[^A-Za-z0-9_])CC_MEMBER_SANDBOX[+:]?=' <<<"$cmd" && deny "setting CC_MEMBER_SANDBOX — the boundary opens a workspace session from outside; a member-facing session never opens one on the host"
+      grep -qE '(^|[^A-Za-z0-9_])CC_MEMBER_SANDBOX[+:]?=' <<<"$cmd" && never "setting CC_MEMBER_SANDBOX — the boundary opens a workspace session from outside; a member-facing session never opens one on the host"
       if ! ws_dispatch_ok "$cmd" "$mws"; then
-        grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && deny "${mws:+dispatching outside this workspace — }a member-facing session does not dispatch workers (cc --go)${mws:+; inside \`$mws\` it may}"
+        grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && never "${mws:+dispatching outside this workspace — }a member-facing session does not dispatch workers (cc --go)${mws:+; inside \`$mws\` it may}"
       fi
       # cc-loop is the runner UNDERNEATH `cc … --go`, and the day's budget is charged in `cc`, not here: calling it
       # directly spends a workspace's money without ever touching the ledger. So a member never calls it at all.
       if grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd"; then
-        if [ -n "$mws" ]; then deny "dispatching with cc-loop — inside \`$mws\` a worker starts with \`cc $mws <track> --go\`, the one form that charges the daily budget"
-        else deny "a member-facing session does not dispatch workers (cc-loop)"; fi
+        if [ -n "$mws" ]; then never "dispatching with cc-loop — inside \`$mws\` a worker starts with \`cc $mws <track> --go\`, the one form that charges the daily budget"
+        else never "a member-facing session does not dispatch workers (cc-loop)"; fi
       fi
       if [ -n "$mws" ] && ! ws_cc_ok "$cmd" "$mws"; then
-        deny "creating outside \`$mws\` — this workspace makes tracks, boards and sessions under ~/dev/$mws and nowhere else"
+        never "creating outside \`$mws\` — this workspace makes tracks, boards and sessions under ~/dev/$mws and nowhere else"
       fi
-      grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && deny "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
+      grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && never "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
       SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.ssh\b|\.claude/settings\.json)'   # $RD is set above: these three ADD to the credentials no role reads
-      grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && deny "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json)"
-      grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' <<<"$cmd" && deny "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
+      grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && never "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json)"
+      grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' <<<"$cmd" && never "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
       # cc-config is the one sanctioned reader of ~/.cc/config — which makes it the one clean way AROUND the
       # secrets line above for a session that may not see them. Members get neither the read nor the write.
-      grep -qE "$AT"'([^ ]*/)?cc-config\b' <<<"$cmd" && deny "the box's config is not a member's to read or rewrite (cc-config)"
+      grep -qE "$AT"'([^ ]*/)?cc-config\b' <<<"$cmd" && never "the box's config is not a member's to read or rewrite (cc-config)"
     fi
     ;;
   Read|NotebookRead|Grep|Glob)   # gating these files in Bash alone would be theatre if a file-reading TOOL served them
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // ""' <<<"$inp")
     [ -n "$fp" ] && fp=$(realpath -m -- "$fp" 2>/dev/null || echo "$fp")
-    if [ "$role" = member ]; then secret_path "$fp" && deny "reading the box's secrets ($fp)"
-    else secret_all "$fp" && deny "reading the box's credentials ($fp)"; fi ;;
+    if [ "$role" = member ]; then secret_path "$fp" && never "reading the box's secrets ($fp)"
+    else secret_all "$fp" && never "reading the box's credentials ($fp)"; fi ;;
   Edit|Write|MultiEdit|NotebookEdit)
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")
     fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ AND a symlink resolve before the match: ~/bin/x IS ~/dev/<repo>/core/bin/x, and so is a symlink farm in /tmp
@@ -356,11 +730,11 @@ case "$tool" in
       "$HOME"/.cc/state/*)   # track state: this track's own; a member workspace's for the tracks that are its own
         if [ "$role" = member ]; then
           own=""; [ -n "$mws" ] && case "$fp" in "$HOME/.cc/state/$mws"|"$HOME/.cc/state/$mws"/*) own=1;; esac
-          [ -n "$own" ] || deny "writing another session's state ($fp) — a task.md there is work the box would run"
+          [ -n "$own" ] || never "writing another session's state ($fp) — a task.md there is work the box would run"
         elif [ -n "$trepo" ]; then case "$fp" in "$HOME/.cc/state/$trepo/$ttrack"|"$HOME/.cc/state/$trepo/$ttrack"/*) ;;
-          *) deny "writing another track's state ($fp) — this track's is ~/.cc/state/$trepo/$ttrack";; esac
+          *) never "writing another track's state ($fp) — this track's is ~/.cc/state/$trepo/$ttrack";; esac
         fi;;
-      *) deny "editing outside this session's worktree ($fp) — a track writes its worktree, /tmp and its own ~/.cc/state dir";;
+      *) never "editing outside this session's worktree ($fp) — a track writes its worktree, /tmp and its own ~/.cc/state dir";;
     esac; fi ;;
 esac
 exit 0

@@ -16,6 +16,9 @@ nothing to defer on — which is what dissolves the "handoff PENDING, deferred a
   cc-handoff --relay                                      internal: from the UserPromptSubmit hook (cc-scope hook), the
                                                           hook payload on stdin — a prompt typed into the retiring
                                                           predecessor goes to its successor, blocked here with a pointer
+  cc-handoff --brief <target>            ONE packet of everything a successor would otherwise re-read: the
+                                         last journal entry, the unfinished board, what is landing, live
+                                         workers, open PRs, open asks, and who the predecessor is
   cc-handoff --status [<target>] [--json]                 what phase, who is live, how long left
   cc-handoff selfcheck
 
@@ -64,11 +67,13 @@ Env: CC_HANDOFF (the successor's own record id, exported into its process by `cc
 handoff, so `<id>.done` and not the variable is what says one is still open — mid_handoff) · CC_HANDOFF_WINDOW
 (the successor's own tmux window, so it accepts its own startup dialog) ·
 CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT (~/.cc/config) ·
-CC_HANDOFF_DIR, CC_CTX_RECORDS (test hooks: put the record and the ledger somewhere else).
+CC_HANDOFF_DIR, CC_CTX_RECORDS (test hooks: put the record and the ledger somewhere else) ·
+CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log must be before it stops counting as live, 1 h).
 """
 import fcntl, json, os, re, shlex, shutil, subprocess, sys, time, uuid
 
 STATE = os.path.expanduser("~/.cc/state")
+DEV = os.path.expanduser("~/dev")        # where the checkouts are: --brief asks gh inside the target's own
 HANDOFF = os.environ.get("CC_HANDOFF_DIR") or os.path.join(STATE, "handoff")
 RECORDS = os.environ.get("CC_CTX_RECORDS") or os.path.join(STATE, "context")
 BIN = os.path.dirname(os.path.realpath(__file__))
@@ -388,16 +393,20 @@ def alert(msg):
 
 # ---- phases --------------------------------------------------------------------------------------------
 
-BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. Read {journal} first — that file, and \
-what your predecessor tells you, is everything you start from. You are NOT the live session yet: the live one \
-owns this target's channel and may act on the world, and cc-guard refuses merging, pushing, deploying, \
-dispatching workers, `cc done` and outward posts from you until you take over. Read, search, think and ask — \
-and NEVER ask your predecessor to run something you are denied. Your predecessor is still working in this same \
-directory: it is the peer whose tmux id is {tmux} in `ListAgents`, so reach it with `SendMessage` (bidirectional, \
-out of band from the channel) and ask what the journal does not answer; subscribe with notify_when_idle, which \
-is also how you hear if it exits. {flight} When you have the context and NOT BEFORE, run `cc-handoff --ready` — \
-that single call is the commit point: it makes you live and retires your predecessor. If you cannot get there, \
-say so in the journal; the overlap expires on its own and your predecessor simply carries on."""
+BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. Your FIRST tool call is \
+`cc-handoff --brief {target}` — one packet holding the last entry of {journal} and the dated lines after it, \
+the unfinished board, what is landing, the live workers, the open PRs and the open asks. That packet plus what \
+your predecessor tells you is everything you start from; rebuilding it a call at a time is what made a handover \
+cost about two million tokens. You are NOT the live session yet: the live one owns this target's channel and \
+may act on the world, and cc-guard refuses merging, pushing, deploying, dispatching workers, `cc done` and \
+outward posts from you until you take over. Read, search, think and ask — and NEVER ask your predecessor to run \
+something you are denied. Your predecessor is still working in this same directory: it is the peer whose tmux \
+id is {tmux} in `ListAgents`, so reach it with `SendMessage` (bidirectional, out of band from the channel) and \
+ask it ONE batch of questions — everything the packet did not answer, in a single message, because it answers \
+in one turn and each turn of its costs a whole context; subscribe with notify_when_idle, which is also how you \
+hear if it exits. {flight} When you have the context and NOT BEFORE, run `cc-handoff --ready` — that single \
+call is the commit point: it makes you live and retires your predecessor. If you cannot get there, say so in \
+the journal; the overlap expires on its own and your predecessor simply carries on."""
 
 
 def journal_for(target):
@@ -485,8 +494,8 @@ def landed(wid, text):
 
 
 KICK = ("cc-handoff{hid}: you are the SUCCESSOR for {target} — your handoff brief is in your system prompt. "
-        "Start now: read {journal}, ask the predecessor what the journal left out, and run `cc-handoff --ready` "
-        "only once you have the context.")
+        "Start now: run `cc-handoff --brief {target}` first, ask the predecessor ONE batch of questions about "
+        "what the packet did not answer, and run `cc-handoff --ready` only once you have the context.")
 
 
 def kick(target, hid=""):
@@ -1110,14 +1119,214 @@ def status(target=None, as_json=False):
     return 0
 
 
+# ---- the brief -----------------------------------------------------------------------------------------
+# WHY THIS EXISTS. A handover measured on 2026-09-01 cost ~2M input-equivalent tokens: the successor made 71
+# tool calls before `--ready` (6.0M cache reads) and the predecessor answered over 18 turns at a 400k context.
+# Almost none of that was new information — it was the same journal, board, queue and PR list read again, one
+# tool call at a time, by a session with an empty context. So the box assembles the packet ONCE, in the order
+# a successor needs it, and the questions left over are the ones a file genuinely cannot answer.
+# THE JOURNAL IS READ FROM THE END. A track journal is a running file; a planning one runs to hundreds of kB.
+# The successor needs the last entry and the dated lines after it, and reading the rest is the expense this
+# whole command exists to remove — so the file is read backwards, a page at a time, and stops at the entry it
+# was after. TWO SHAPES, because the box writes two: a planning journal marks its handoff entries "journal at
+# N%" and a track's `progress.md` does not (of the 93 here, none does) — so a missing marker is the NORMAL
+# case for a track and must not tip the raw tail into the packet. The marker wins where there is one; where
+# there is none the last dated `## ` heading is the entry, and the packet says which of the two it cut on.
+BRIEF_CAP = 64 * 1024                # the most of a journal --brief will ever read
+JOURNAL_MARK = re.compile(r"^## .*journal at \d+%", re.M)
+JOURNAL_HEAD = re.compile(r"^## ", re.M)         # any dated entry: what a track journal has instead
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+BOARD_ROW = re.compile(r"^  \S+ (\S+) \[([a-z]+)\]")     # "  ▶ <track> [running]  <title>", ANSI stripped
+BOARD_CONT = "      "                                     # its indented task/PR/note lines
+DONE_ROWS = ("merged", "done")
+LANE = re.compile(r"^lane[0-9]+$")                        # the tmux land-lane crutch (retired in #154, not gone)
+PR_IN = re.compile(r"(?<![0-9])([0-9]{1,6})(?![0-9])")
+
+
+def out(argv, timeout=25, cwd=None, fail=""):
+    """A helper's stdout, or `fail`. A brief never fails: a section the box cannot fill says so and the rest
+    is still worth the successor's one call. `fail` is for the sections where EMPTY and BROKEN read the same
+    — no open PRs and a `gh` that would not run both print nothing, and only one of them is good news."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                           cwd=cwd if cwd and os.path.isdir(cwd) else None)
+        # ...and only where one was asked for: the other sections print whatever a helper managed to say,
+        # which is what they did before this argument existed.
+        return fail if (fail and r.returncode != 0) else (r.stdout or "")
+    except Exception:
+        return fail
+
+
+def last_match(pat, text, pos):
+    """The last match of `pat` in `text`, ignoring one at index 0 while bytes remain below it: `^` matches
+    there too, and mid-file that is the middle of a line, not the start of one."""
+    found = None
+    for m in pat.finditer(text):
+        if m.start() == 0 and pos > 0:
+            continue
+        found = m
+    return found
+
+
+def tail_entry(path, cap=BRIEF_CAP):
+    """The last journal entry and everything after it, read BACKWARDS from the end of the file. Returns
+    (text, bytes_read, anchor) — `anchor` names what it cut on, because the two journal shapes cut on
+    different things and the packet says which; `bytes_read` is what the selfcheck pins: never the whole
+    file, and never more than `cap`."""
+    path = os.path.expanduser(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "", 0, "missing file"
+    read = 0
+    buf = b""
+    pos = size
+    text = ""
+    try:
+        with open(path, "rb") as fh:
+            while pos > 0 and read < cap:
+                step = min(8192, pos, cap - read)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + buf
+                read += step
+                text = buf.decode("utf-8", "replace")
+                mark = last_match(JOURNAL_MARK, text, pos)
+                if mark:
+                    return text[mark.start():], read, "last 'journal at N%' entry"
+                # NO EARLY FALLBACK. Two whole unmarked "## " entries in the buffer used to be enough to
+                # stop here — but a planning journal runs marked entry, then two or three unmarked OVERLAP /
+                # FINAL / TAKEOVER entries, so on any page but the last that test fires INSIDE a marked entry
+                # and the packet starts below the very entry the successor is told to read (review of #181).
+                # A track journal has no marker anywhere, and its fallback is the same one, after the loop.
+    except OSError:
+        return "", read, "unreadable file"
+    head = last_match(JOURNAL_HEAD, text, pos)
+    if head:
+        return text[head.start():], read, "last dated entry"
+    return (f"(no dated '## ' entry in the last {read // 1024} kB of {path} — the tail follows)\n"
+            + buf.decode("utf-8", "replace"), read, "raw tail")
+
+
+def board_open(repo):
+    """`cc board show <repo>`, minus the rows that are finished — a successor inherits what is unfinished."""
+    keep, drop = [], False
+    for line in ANSI.sub("", out([os.path.join(BIN, "cc-board"), "show", repo])).splitlines():
+        m = BOARD_ROW.match(line)
+        if m:
+            drop = m.group(2) in DONE_ROWS
+        elif not line.startswith(BOARD_CONT):
+            drop = False                                  # the board's own header line: not a row at all
+        if line.strip() and not drop:
+            keep.append(line)
+    return "\n".join(keep)
+
+
+def lanes():
+    """What is LANDING right now. Two shapes, because the box has both: a `lane<N>` tmux window (the crutch
+    #154 retired — one left running is exactly the thing a successor must be told about) and the queue that
+    replaced it, one job file per PR under ~/.cc/state/land/."""
+    rows = []
+    for line in (tmux("list-windows", "-a", "-F",
+                      "#{window_name}\t#{window_id}\t#{pane_pid}\t#{pane_start_command}") or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 4 and LANE.match(fields[0]):
+            pr = PR_IN.search(fields[3].replace(fields[0], " "))
+            rows.append(f"{fields[0]:<10} window {fields[1]:<6} PR {pr.group(1) if pr else '?':<6} waiter pid {fields[2]}")
+    land = os.path.join(STATE, "land")
+    try:
+        jobs = sorted(f for f in os.listdir(land) if f.endswith(".json"))
+    except OSError:
+        jobs = []
+    for j in jobs:
+        try:
+            with open(os.path.join(land, j)) as fh:
+                r = json.load(fh)
+        except Exception:
+            continue
+        rows.append(f"queue      {r.get('repo', '?')} PR {r.get('pr', '?')}   stage {r.get('stage', '?')}   "
+                    f"attempt {r.get('attempts', 0)}   queued {r.get('queued_at', '?')}")
+    return "\n".join(rows)
+
+
+def live_workers(repo):
+    """One line per track whose loop is still running: the last line of its loop.log, which is where a worker
+    says where it got to."""
+    rows = []
+    base = os.path.join(STATE, repo)
+    try:
+        tracks = sorted(os.listdir(base))
+    except OSError:
+        return ""
+    idle = cfg("CC_BRIEF_WORKER_IDLE", 3600)              # once, not once per track: a repo has scores of them
+    for t in tracks:
+        log = os.path.join(base, t, "loop.log")
+        try:
+            if time.time() - os.path.getmtime(log) > idle:
+                continue                                  # long finished: the board carries those
+            last = ""
+            for last in open(log, errors="replace"):
+                pass
+        except OSError:
+            continue
+        rows.append(f"{t:<24} {last.strip()[:160]}")
+    return "\n".join(rows)
+
+
+def prs(repo):
+    """The TARGET's open PRs. `gh` resolves a repo from its cwd, and --brief is run from wherever the caller
+    happens to be: from another repo's checkout it printed that repo's PRs under this one's heading, and from
+    a dir that is no checkout at all it printed none — which a successor reads as "nothing is open". So it is
+    asked inside the target's own checkout, and a gh that could not answer says so rather than showing empty."""
+    where = os.path.join(DEV, repo)          # DEV is already absolute; the selfcheck points it at its own
+    if not os.path.isdir(os.path.join(where, ".git")):
+        return f"(unavailable: {where} is not a checkout, so gh has no repo to list)"
+    return out(["gh", "pr", "list", "--limit", "40", "--json", "number,headRefName,mergeable", "--template",
+                "{{range .}}{{printf \"%-6v %-38v %v\\n\" .number .headRefName .mergeable}}{{end}}"],
+               cwd=where, fail=f"(unavailable: gh could not list the open PRs of {repo})")
+
+
+def brief(target):
+    """--brief: ONE packet, in the order a successor needs it, so it does not rebuild it a tool call at a
+    time. Read-only and best-effort throughout — this must never be the thing that fails a handoff."""
+    repo = target.partition("/")[0]
+    rec = read(target)
+    journal, jread, janchor = tail_entry(journal_for(target))
+    pre = (rec or {}).get("predecessor") or {}
+    who = [f"target        {target}",
+           f"predecessor   window main:{pre.get('window') or target}   tmux {pre.get('tmux') or win_id(target) or '?'}",
+           f"              session {(pre.get('session_id') or '?')}   (SendMessage/ListAgents match on the tmux id)"]
+    if rec:
+        who.append(f"handoff       id {rec.get('id')}   phase {rec.get('phase')}   live {live_side(rec)}   "
+                   f"{int((rec.get('deadline', 0) - time.time()) / 60)}m left")
+    sections = [
+        (f"journal — the {janchor} and every line after it "
+         f"({jread // 1024 or 1} kB read of {journal_for(target)}, never the whole file)", journal),
+        (f"board — {repo}, unfinished rows only", board_open(repo)),
+        ("land — lanes and the landing queue", lanes()),
+        (f"workers — live loops under {repo}, last line of each", live_workers(repo)),
+        ("open PRs", prs(repo)),
+        ("scope — open asks from the owner", out([os.path.join(BIN, "cc-scope"), "count", repo])),
+        ("who", "\n".join(who)),
+    ]
+    print(f"cc-handoff --brief {target}  ({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})")
+    for title, body in sections:
+        print(f"\n== {title} ==")
+        print(body.rstrip() if body.strip() else "(none)")
+    print(f"\nThat is the whole packet. What is left is what no file holds: ask your predecessor ONE batch of "
+          f"questions about it, and run `cc-handoff --ready` when they are answered.")
+    return 0
+
+
 # ---- selfcheck -----------------------------------------------------------------------------------------
 
 def selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
     nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the harness switch reroutes alert(); these cases assert the REAL path via the stubbed run()
     import tempfile
-    global HANDOFF, RECORDS, STATE, win_id, pane_live, pane_live_id, tmux, run, notify, alert, self_wid, age
+    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, alert, self_wid, age
     real_alert = alert
+    real_out = out
     p = f = 0
 
     def ok(what, cond):
@@ -1161,6 +1370,8 @@ def selfcheck():
                 tmux(*a[:i], _log=False); tmux(*a[i + 1:], _log=False)
                 return ""
             if a[0] == "list-windows":
+                if "pane_start_command" in " ".join(a):   # lanes(): name, id, pane pid, the command it was made with
+                    return "\n".join("\t".join([n, i, "4242", f"cc-land {n[4:]} --wait"]) for n, i in wins.items())
                 if "pane_pid" in " ".join(a):       # orphans(): id, "pid", name
                     return "\n".join(f"{i} {i} {n}" for n, i in wins.items())
                 return "\n".join(wins.values())
@@ -1819,6 +2030,136 @@ def selfcheck():
             fh.write("{not json")
         ok("a corrupt record is not an open overlap", read("r1") is None and read_all() == [])
 
+        # ---- --brief: ONE packet, and the journal read from the END. Its own home, its own state dir, its
+        # own board and PR list: nothing here is this box's, and the case that matters is the one it CANNOT
+        # have read — an entry buried under 140 kB of history it must never touch.
+        home0 = os.environ.get("HOME")
+        dev0 = DEV
+        bh = os.path.join(d, "briefhome")
+        os.environ["HOME"] = bh
+        DEV = os.path.join(bh, "dev")
+        os.makedirs(os.path.join(DEV, "r9", ".git"), exist_ok=True)   # the target's own checkout, for gh
+        jd = os.path.join(bh, ".cc", "state", "r9", "t9")
+        os.makedirs(jd, exist_ok=True)
+        jpath = os.path.join(jd, "progress.md")
+        with open(jpath, "w") as fh:
+            fh.write("## 2026-01-01 00:0xZ — journal at 30% ctx (the OLD one)\nOLD-ENTRY-NEVER-READ\n")
+            fh.write("a line of history\n" * 8000)                    # ~140 kB between the two entries
+            fh.write("## 2026-01-02 00:0xZ — journal at 31% ctx (the LAST one)\nKEPT-ENTRY\n")
+            fh.write("- 01:0xZ: DATED-LINE-AFTER-IT\n")
+        os.makedirs(os.path.join(STATE, "r9", "t9"), exist_ok=True)
+        with open(os.path.join(STATE, "r9", "t9", "loop.log"), "w") as fh:
+            fh.write("older line\n2026-01-02T01:00:00Z iter 2/3 LAST-LOOP-LINE\n")
+        os.makedirs(os.path.join(STATE, "land"), exist_ok=True)
+        with open(os.path.join(STATE, "land", "r9-5.json"), "w") as fh:
+            json.dump({"repo": "r9", "pr": 5, "stage": "gates", "attempts": 1, "queued_at": "2026-01-02T00:00:00Z"}, fh)
+        wins["lane7"] = "@70"                                          # a lane the #154 queue left running
+        now = time.time()
+        write({"id": "b0", "target": "r9/t9", "phase": "overlap", "live": "predecessor",
+               "predecessor": {"session_id": "sid-9", "tmux": "@9", "window": "r9/t9"},
+               "successor": {"session_id": "s9", "tmux": "@10", "window": "r9/t9~next"},
+               "started": now, "deadline": now + 600, "phases": []})
+        calls = []
+        ghcwd = []
+
+        def out(argv, timeout=25, cwd=None, fail=""):                  # the three helpers a brief reads
+            calls.append(list(argv))
+            if argv[0] == "gh":
+                ghcwd.append(cwd)
+            if argv[0].endswith("cc-board"):
+                return ("r9  base:main  /x\n"
+                        "  \u25b6 t9 [running]  AN-OPEN-ROW\n      task: KEEP-ME\n"
+                        "  \u2713 t8 [merged]  A-FINISHED-ROW\n      task: DROP-ME\n")
+            if argv[0] == "gh":
+                return "5      track/t9      MERGEABLE\n"
+            if argv[0].endswith("cc-scope"):
+                return "2\n"
+            return ""
+
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = brief("r9/t9")
+        b = buf.getvalue()
+        text, nread, anchor = tail_entry(jpath)
+        ok("--brief prints every section",
+           rc == 0 and all(h in b for h in ("== journal", "== board", "== land", "== workers",
+                                            "== open PRs", "== scope", "== who")))
+        ok("...the journal section is the LAST 'journal at N%' entry and the dated lines after it",
+           "KEPT-ENTRY" in b and "DATED-LINE-AFTER-IT" in b and "the LAST one" in b
+           and anchor == "last 'journal at N%' entry")
+        ok("...and it never reads past that entry: the one before it is in the file and not in the packet",
+           "OLD-ENTRY-NEVER-READ" not in b and "the OLD one" not in b
+           and nread < os.path.getsize(jpath) and nread <= BRIEF_CAP)
+        ok("...the board is trimmed to the rows that are not finished, notes and all",
+           "AN-OPEN-ROW" in b and "KEEP-ME" in b and "A-FINISHED-ROW" not in b and "DROP-ME" not in b)
+        ok("...a live lane names its window, its PR and its waiter pid, and the queue its job and stage",
+           "lane7" in b and "@70" in b and "PR 7" in b and "4242" in b and "PR 5" in b and "stage gates" in b)
+        ok("...a live worker is one line, the last of its loop.log", "LAST-LOOP-LINE" in b and "older line" not in b)
+        ok("...the open PRs, the ask count and the predecessor's window, tmux id and session are all in it",
+           "track/t9" in b and "MERGEABLE" in b and "\n2\n" in b
+           and "main:r9/t9" in b and "@9" in b and "sid-9" in b and "id b0" in b)
+        ok("...and the helpers are asked once each, for this repo only",
+           [c[-2:] for c in calls if c[0].endswith("cc-board")] == [["show", "r9"]]
+           and [c[-1] for c in calls if c[0].endswith("cc-scope")] == ["r9"])
+
+        # THE OTHER JOURNAL SHAPE, which is the common one: a track's `progress.md` carries no
+        # "journal at N%" line anywhere, so a rule that only knows that marker hands the successor the
+        # banner and 64 kB of raw tail — every track target, every time. It cuts on the last dated entry.
+        tj = os.path.join(jd, "track-shaped.md")
+        with open(tj, "w") as fh:
+            fh.write("## 2026-01-01 iteration 1\nEARLIEST-ENTRY\n")
+            fh.write("a line of history\n" * 8000)                    # ~140 kB, no marker in any of it
+            fh.write("## 2026-01-02 iteration 2\nMIDDLE-ENTRY\n")
+            fh.write("## 2026-01-03 iteration 3\nLAST-TRACK-ENTRY\n- 01:0xZ: AND-THE-LINES-AFTER-IT\n")
+        ttext, tread, tanchor = tail_entry(tj)
+        ok("a journal with no 'journal at N%' line cuts on the last dated entry instead",
+           tanchor == "last dated entry" and ttext.startswith("## 2026-01-03")
+           and "LAST-TRACK-ENTRY" in ttext and "AND-THE-LINES-AFTER-IT" in ttext)
+        ok("...and not on the raw tail: neither the entry before it nor the banner is in the packet",
+           "MIDDLE-ENTRY" not in ttext and "EARLIEST-ENTRY" not in ttext
+           and "the tail follows" not in ttext and tread < os.path.getsize(tj) and tread <= BRIEF_CAP)
+
+        # THE PLANNING SHAPE IS BOTH AT ONCE: a marked entry, then runs of unmarked "## OVERLAP STARTED" /
+        # "FINAL" / "TAKEOVER" entries, pages of them. Stopping at the first page that held two whole unmarked
+        # headings started the packet BELOW the marked entry the successor is told to read (review of #181).
+        pj = os.path.join(jd, "planning-shaped.md")
+        with open(pj, "w") as fh:
+            fh.write("## 2026-01-01 05:00Z - journal at 30% ctx\nOLDER-MARKED-ENTRY\n")
+            fh.write("filler that is never read\n" * 2000)
+            fh.write("## 2026-01-02 05:00Z - journal at 31% ctx\nTHE-MARKED-ENTRY-TO-KEEP\n")
+            for i in range(3):
+                fh.write("## 2026-01-02 0%d:00Z - OVERLAP STARTED\n" % (6 + i))
+                fh.write("an unmarked entry after the marked one\n" * 120)
+            fh.write("## 2026-01-02 09:00Z - TAKEOVER\n- 09:1xZ: THE-LAST-DATED-LINE\n")
+        ptext, pread, panchor = tail_entry(pj)
+        ok("a marked entry buried under pages of unmarked ones is still where the packet starts",
+           panchor == "last 'journal at N%' entry" and "THE-MARKED-ENTRY-TO-KEEP" in ptext
+           and ptext.startswith("## 2026-01-02 05:00Z"))
+        ok("...with every unmarked entry after it kept, and the marked entry before it left out",
+           "OVERLAP STARTED" in ptext and "THE-LAST-DATED-LINE" in ptext
+           and "OLDER-MARKED-ENTRY" not in ptext and pread <= BRIEF_CAP)
+
+
+        # WHERE gh IS ASKED IS PART OF THE ANSWER. It resolves a repo from its cwd, and --brief is run from
+        # wherever the caller stands: from another repo's checkout that printed that repo's PRs under this
+        # one's heading, and from a dir that is no checkout it printed none — read as "nothing is open".
+        ok("gh is asked inside the target's own checkout, not wherever the caller happens to be",
+           ghcwd == [os.path.join(DEV, "r9")])
+        ok("...a target with no checkout to ask in says so, and never shows an empty PR list",
+           prs("r-none").startswith("(unavailable:") and "r-none" in prs("r-none"))
+        ok("...and a helper that could not run says so too, while one that ran is passed through",
+           real_out(["false"], fail="(unavailable: x)") == "(unavailable: x)"
+           and real_out(["printf", "hi"], fail="(unavailable: x)") == "hi"
+           and real_out(["no-such-binary-here"], fail="(unavailable: x)") == "(unavailable: x)")
+        clear("r9/t9")
+        wins.pop("lane7", None)
+        DEV = dev0
+        if home0 is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = home0
+
     if nlo is not None:
         os.environ["CC_NOTIFY_LOG_ONLY"] = nlo
     print(f"cc-handoff selfcheck: {p} passed, {f} failed")
@@ -1906,6 +2247,11 @@ def main(argv):
             return relay(payload if isinstance(payload, dict) else {})
         except Exception:
             return 0
+    if cmd == "--brief":
+        if not target:
+            print("cc-handoff: --brief needs a target (<repo> or <repo>/<track>)", file=sys.stderr)
+            return 1
+        return brief(target)
     if cmd == "--status":
         return status(target, bool(opt.get("json")))
     print(__doc__.strip(), file=sys.stderr)

@@ -566,8 +566,10 @@ nocred alice >/dev/null; nocred alice >/dev/null
 # A REFUSAL IN A MEMBER-FACING CHANNEL IS AN ASK, NOT SILENCE — the member sees it AND the owner is told.
 # Both halves used to end at the deny: the member got nothing, the owner was never told there was anything to
 # approve, and a gate that stops work without producing a visible ask looks exactly like the box ignoring somebody.
+# -u CC_NOTIFY_LOG_ONLY: the guard honours that flag ITSELF now (a fixture can never page), and this block is
+# the one place that must watch the real send path — the stub bots in $GH/bin are what it sends to.
 ask(){ rm -rf "$T/asks"; : > "$T/guard.args"
-       printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$1" "$2" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" ${3:+CC_ROLE=$3} "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+       printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$1" "$2" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" ${3:+CC_ROLE=$3} "$B/cc-guard" >/dev/null 2>&1; echo $?; }
 SEND="cc-slack post --file /tmp/carpet.png"   # the 2026-08-30 incident itself: a member asked twice for images
 [ "$(ask "$SEND" "$mf")" = 2 ] && ok "the member's request is still refused — the gate did not soften" || bad "member deny lost"
 grep -q "^BOT: post -c #member .*posting to the owner" "$T/guard.args" \
@@ -577,7 +579,7 @@ grep -q '🔐' "$T/guard.args" \
 grep -q "^NOTIFY: --owner -p high .*posting to the owner" "$T/guard.args" \
   && ok "...and the OWNER is told there is something to approve (--owner: a DM, never that channel)" || bad "the owner was not told: $(cat "$T/guard.args")"
 : > "$T/guard.args"   # same channel, same reason, straight away: the session retrying must not spray the channel
-printf '{"tool_name":"Bash","tool_input":{"command":"cc-slack post -c x hi"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" "$B/cc-guard" >/dev/null 2>&1
+printf '{"tool_name":"Bash","tool_input":{"command":"cc-slack post -c x hi"},"cwd":"%s"}' "$mf" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" "$B/cc-guard" >/dev/null 2>&1
 [ ! -s "$T/guard.args" ] && ok "one ask per channel+reason per TTL, however often the session retries" || bad "the deny sprayed: $(cat "$T/guard.args")"
 [ "$(ask "$SEND" "$mf")" = 2 ] && [ -s "$T/guard.args" ] && ok "...and a fresh window asks again (the TTL is a delay, not a mute)" || bad "the ask never comes back"
 : > "$T/guard.args"; [ "$(ask "gh pr merge 1" "$wt" worker)" = 2 ] && [ ! -s "$T/guard.args" ] \
@@ -588,9 +590,12 @@ printf '{"tool_name":"Bash","tool_input":{"command":"cc-slack post -c x hi"},"cw
 [ "$(ask "cc-config list" "$mf")" = 2 ] && ok "the box's config is not a member's to read — its one sanctioned reader is denied too" || bad "cc-config list slipped the member gate"
 [ "$(ask "cc-config set SLACK_APP_TOKEN x" "$mf")" = 2 ] && ok "...nor to rewrite" || bad "cc-config set slipped the member gate"
 : > "$T/guard.args"; rm -rf "$T/asks"   # leave the harness state as found: the cases below read these fresh
-printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1
+printf '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 1"},"cwd":"%s"}' "$GH" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1
 { grep -q '^NOTIFY: --owner' "$T/guard.args" && ! grep -q '^BOT:' "$T/guard.args"; } \
   && ok "CC_ROLE=member with no marker: the owner is still told, and nothing is posted to a channel we cannot name" || bad "markerless member ask: $(cat "$T/guard.args")"
+: > "$T/guard.args"; rm -rf "$T/asks"   # …and the deny with no yes in it: refused, said in the channel, owner asleep
+[ "$(ask "cc r t --go x" "$mf")" = 2 ] && grep -q '^BOT: post -c #member' "$T/guard.args" && ! grep -q '^NOTIFY:' "$T/guard.args" \
+  && ok "a member dispatch is refused and the member told, but the owner is not paged — it was never his to approve for them (00:03Z)" || bad "a member dispatch paged the owner: $(cat "$T/guard.args")"
 echo "== overlapping handoff: two sessions, one cwd, exactly one of them live =="
 export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records, never a 2-min grace or a 10-min drain
 ho=$("$B/cc-handoff" selfcheck 2>&1 | tail -1)

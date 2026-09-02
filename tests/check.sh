@@ -26,5 +26,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # phantom rules, never this box's ledger and never a model.
 # cc-time's is the clock rule itself: a known UTC instant rendered in a zone of its own (never this box's), and
 # cc-notify's one Slack-facing stamp driven through in log-only mode with the UTC log line beside it.
-for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend cc-time; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+# cc-guard's runs the gates themselves against fixtures in a HOME of its own, with the owner's two real
+# doors (cc-notify, cc-slack) stubbed: which denies page and which never do, and the worker kill fence.
+for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend cc-time cc-guard; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"
