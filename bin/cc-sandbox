@@ -13,7 +13,10 @@
 #     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner with
 #     `cc-sandbox mint`, kept whole) and
 #     never the owner's, because a member can print whatever is in there: with no credential of its own the workspace does not start · a
-#     ~/.claude.json copy holding only this workspace's projects and only the cc-slack MCP server. The environment is CLEARED and rebuilt
+#     ~/.claude.json copy holding only this workspace's projects, only the cc-slack MCP server, and two first-run flags MINTED for the
+#     workspace (`hasCompletedOnboarding` and `hasTrustDialogAccepted` on its own paths) so the member is not walked through the setup
+#     wizard and asked to sign in on every start. The flags are generated here from no value of his; his file is read for its
+#     `projects` alone, filtered as before, and is never written. The environment is CLEARED and rebuilt
 #     (HOME, PATH, TERM, LANG…, CC_MEMBER_SANDBOX=1, CC_ROLE=member, git identity = the handle). ABSENT: every other ~/dev/*, ~/.cc/config,
 #     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets.
 #   cc-sandbox mint <handle> [--from <file>]   THE WORKSPACE'S OWN CREDENTIAL, the one thing `member` will not start without.
@@ -135,9 +138,10 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
     [ -n "${!v:-}" ] && B+=(--setenv "$v" "${!v}"); done; :; }
 launch_member(){   # $1 handle · $2 track · the rest is the command — the WORKSPACE'S OWN credential, or no launch at all;
                    # a narrower ~/.claude.json
-  local h="$1" tr="$2" dev="$H/dev/$1" cred="$H/.claude/.credentials.json" own="$H/.cc/members/$1/credentials.json" mcp='{}' cj why
+  local h="$1" tr="$2" dev="$H/dev/$1" cred="$H/.claude/.credentials.json" own="$H/.cc/members/$1/credentials.json" mcp='{}' cwd cj why
   build_member "$h" "$tr"; shift 2
   [ -z "$tr" ] || [ -d "$H/.cc/worktrees/$h/$tr" ] || { echo "cc-sandbox: no worktree for $h/$tr" >&2; exit 2; }
+  cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"   # the same cwd build_member chdirs to: the trust key is its git root
   # WHATEVER CREDENTIAL IS INSIDE, THE MEMBER CAN PRINT IT — they drive a session in there. So the owner's NEVER enters the
   # boundary, stripped or not: a workspace runs on a credential minted for it at ~/.cc/members/<h>/credentials.json (host
   # side, never bound — the member sees its CONTENT at ~/.claude/.credentials.json and not the file), and without one it
@@ -150,12 +154,33 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
     echo "cc-sandbox: $h has no credential of its own ($own: $why) — a member workspace never starts on the OWNER's. Mint one: cc-sandbox mint $h — it walks the login and installs what that login produced at $own, mode 600. Nothing starts here until then." >&2
     exit 2
   fi
-  cj=$(jq -c '{claudeAiOauth: .claudeAiOauth}' "$own")   # its own: kept whole, it can refresh itself
+  cj=$(jq -c '{claudeAiOauth: .claudeAiOauth}' "$own")   # its own, kept whole (refresh token included) so it can refresh
+  # in-session. That refresh lands in the tmpfs, not in $own: every start begins from the minted file again. KNOWN GAP —
+  # if the server ever retires a refresh token on use, a workspace stops starting and has to be re-minted.
   [ -f "$H/.cc/slack/enabled" ] && mcp=$(jq -cn --arg c "$H/bin/cc-slack" '{"cc-slack": {type: "stdio", command: $c, args: ["channel"], env: {}}}')
   # fd 3: the ~/.claude.json copy · fd 4: $cj at $cred — that path is the DESTINATION inside; the content is the workspace's own
+  # THE FIRST-RUN FLAGS ARE MINTED HERE, NOT CARRIED ACROSS. The whitelist stays two keys wide, so the copy used to say
+  # "this machine has never run claude": 2.1.258 gates the setup wizard on `!hasCompletedOnboarding` of the GLOBAL config
+  # and the login is a STEP of that wizard, so a member was walked through setup and asked to sign in on every start with
+  # a valid credential already in place. Same for the trust dialog, gated per project on
+  # `projects[<git root of cwd>].hasTrustDialogAccepted`. This copy is rebuilt from scratch each start and nothing written
+  # inside it survives, so both are GENERATED true here — literals in this program, not values read out of his file (the
+  # only thing read out of it is `projects`, filtered as before; nothing here writes it).
+  # Trust: the workspace IS the member's own repo, and the boundary is what makes running its code safe, so his own
+  # answer for that path is not the question being answered and does not carry over either way.
+  # Only paths of this workspace get it ($dev and the cwd — a track worktree is its own git root, and the owner's file
+  # carries no entry for one). lastOnboardingVersion is not set: 2.1.258 only ever writes it, nothing reads it.
+  # HIS projects RIDE A PIPE, NEVER argv, and an unusable source still gets the flags (review-189a): as one argv element
+  # a projects object past MAX_ARG_STRLEN (128 KiB) makes execve fail E2BIG and jq never runs, and an empty ~/.claude.json
+  # makes the inner jq exit 0 with no output — either way fd 3 would write nothing, `--file 3` would make an EMPTY
+  # ~/.claude.json inside, and the wizard would be back with only a stderr line in a pane nobody reads. `input? // {}`
+  # is the fallback: no projects to filter, flags minted all the same.
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
-    3< <(jq --arg d "$dev" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
-           '{projects: ((.projects // {}) | with_entries(select(.key == $d or (.key | startswith($w))))), mcpServers: $m}' "$H/.claude.json" 2>/dev/null || printf '{}') \
+    3< <({ jq -c '.projects // {}' "$H/.claude.json" 2>/dev/null || printf '{}'; } \
+         | jq -n --arg d "$dev" --arg cwd "$cwd" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
+           '{projects: (((input? // {}) | with_entries(select(.key == $d or (.key | startswith($w)))))
+                        | reduce ($d, $cwd) as $k (.; .[$k] = ((.[$k] // {}) + {hasTrustDialogAccepted: true}))),
+             mcpServers: $m, hasCompletedOnboarding: true}') \
     4< <(printf '%s' "$cj"); }
 CLAUDEBIN="${CC_CLAUDE:-$H/.local/bin/claude}"   # the same knob cc and cc-loop use to name claude
 handle_ok(){ [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]]; }   # a workspace's dir name IS its handle and its channel name
@@ -300,6 +325,9 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
     echo board=$(cc-board add '"$h"' t2 t2 "" >/dev/null 2>&1 && cc-board get '"$h"' t2 branch)
     echo mcp=$(jq -r "(.mcpServers | keys | join(\",\")),(.projects | length)" ~/.claude.json | tr "\n" ",")
     echo cjkeys=$(jq -r "keys|join(\",\")" ~/.claude.json)
+    echo projs=$(jq -r ".projects | keys | sort | join(\" \")" ~/.claude.json | sed "s|$HOME/||g")
+    echo onboard=$(jq -r ".hasCompletedOnboarding" ~/.claude.json)
+    echo trust=$(jq -r "[.projects[] | .hasTrustDialogAccepted | tostring] | sort | join(\",\")" ~/.claude.json)
     echo pid1=$(ls /proc | grep -c "^[0-9]" | awk "{print (\$1 < 20) ? \"few\" : \"many\"}"); echo tmp=$(touch /tmp/x && echo ok)' 2>&1)
   mcpw="cc-slack,"; [ -f "$H/.cc/slack/enabled" ] || mcpw=","
   t 'member: another repo is ABSENT' "$(g other)" absent;  t 'member: the control repo path is ABSENT' "$(g ctl)" absent
@@ -323,13 +351,69 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'member: a track worktree gitlink is ro — it cannot become a member git dir' "$(g trackgit)" ro
   t 'member: its commondir is ro — the common dir cannot be re-pointed at member files' "$(g commondir)" ro
   t 'member: a commit works and is the handle'"'"'s' "$(g commit)" "$h";  t 'member: cc-board writes the bind-mounted board' "$(g board)" track/t2
-  t 'member: claude.json copy = its projects, the cc-slack MCP only' "$(g mcp)" "${mcpw}0,"
-  t 'member: that copy holds NOTHING but projects and mcpServers — no oauthAccount, no userID (review-156e)' "$(g cjkeys)" mcpServers,projects;  t 'member: own pid namespace' "$(g pid1)" few;  t 'member: /tmp writable' "$(g tmp)" ok
+  t 'member: claude.json copy = this workspace'"'"'s two project entries, the cc-slack MCP only' "$(g mcp)" "${mcpw}2,"
+  t 'member: that copy holds NOTHING but projects, mcpServers and the minted hasCompletedOnboarding — no oauthAccount, no userID (review-156e)' \
+    "$(g cjkeys)" hasCompletedOnboarding,mcpServers,projects
+  # THE SETUP WIZARD AND ITS LOGIN STEP DO NOT RUN. 2.1.258 gates the wizard on `!hasCompletedOnboarding` and the trust
+  # dialog on `projects[<git root of cwd>].hasTrustDialogAccepted`; the copy is rebuilt every start, so both are minted
+  # here. The only project entries are this workspace's two — the root and the cwd — and both are trusted.
+  t 'member: onboarding is already done — no setup wizard, so no login prompt on a start that has a credential' "$(g onboard)" true
+  t 'member: and the only projects are this workspace'"'"'s own root and cwd, both trusted — no trust dialog either' \
+    "$(g projs)/$(g trust)" ".cc/worktrees/$h/t dev/$h/true,true"
+  t 'member: own pid namespace' "$(g pid1)" few;  t 'member: /tmp writable' "$(g tmp)" ok
   out=$("$SELF" member "$o" -- true 2>&1); t 'member: a repo without the marker is refused' "${out#*: ~/dev/}" "$o is not a member workspace (no .cc/member-workspace)"
   rm -f "$own"
   git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
   rm -rf "${dev:?}" "${H:?}/dev/${o:?}" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$H/.cc/state/$o" "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.lock" "$H/.cc/boards/$o.json" \
          "$H/.cc/members/$h" "$H/.cc/slack/member/$h"; }
+selfcheck_member_whitelist(){   # THE ~/.claude.json COPY IS A PRIVACY BOUNDARY, and the first-run flags in it are MINTED, not carried.
+  # This case needs to plant things in the SOURCE .claude.json, so it builds its own HOME (as selfcheck_mint does) and
+  # never writes the box's. Planted there: an account-shaped mark on every key an owner's file carries account data in,
+  # and another repo's project entry — none may appear inside. Planted alongside: hasCompletedOnboarding FALSE and this
+  # workspace's own trust FALSE — both must read true inside, which only holds if the boundary generated them.
+  local fh h dev out mark probe pad
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxwl-XXXXXX") || return 1; chmod 700 "$fh"
+  h="_ccsbxw$$"; dev="$fh/dev/$h"; mark="ownr-only-$$"   # per run, like every other mark here: a fixed word matches the shell that invoked this
+  mkdir -p "$dev/.cc" "$fh/.claude" "$fh/.local/bin" "$fh/.cc/members/$h" || return 1
+  : > "$dev/.cc/member-workspace"   # claude is only a bind target here, never run: a stub is enough if the box has none
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$dev" init -q -b main >/dev/null 2>&1
+  jq -n --arg m "$mark" --arg d "$dev" '{oauthAccount: {accountUuid: $m, emailAddress: ($m + "@example.invalid")},
+      userID: $m, machineID: $m, theme: $m, hasCompletedOnboarding: false,
+      projects: {($d): {hasTrustDialogAccepted: false}, "/home/someone/other-repo": {lastSessionId: $m}}}' > "$fh/.claude.json"
+  jq -n '{claudeAiOauth: {accessToken: "wl-access", refreshToken: "wl-refresh", expiresAt: 99999999999999}}' > "$fh/.cc/members/$h/credentials.json"
+  probe='
+    echo keys=$(jq -r "keys|join(\",\")" ~/.claude.json)
+    echo mark=$(grep -c '"$mark"' ~/.claude.json)
+    echo onboard=$(jq -r ".hasCompletedOnboarding" ~/.claude.json)
+    echo trust=$(jq -r "[.projects[] | .hasTrustDialogAccepted | tostring] | sort | join(\",\")" ~/.claude.json)
+    echo projs=$(jq -r ".projects | keys | join(\" \")" ~/.claude.json | sed "s|$HOME/||g")'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'whitelist: an oauthAccount, a userID, a machineID and a theme in the source reach the copy as NOTHING — not one byte of the mark' \
+    "$(g mark)/$(g keys)" "0/hasCompletedOnboarding,mcpServers,projects"
+  t 'whitelist: another repo'"'"'s project entry does not cross either' "$(g projs)" "dev/$h"
+  # the source says false for both; true inside is only possible if the boundary minted them for this workspace
+  t 'whitelist: the first-run flags are GENERATED, not carried — false in the source, true inside' "$(g onboard)/$(g trust)" true/true
+  # ── THE SAME SOURCE, TOO BIG TO RIDE IN argv (review-189a). His projects used to be one argv element: past Linux's
+  # 128 KiB MAX_ARG_STRLEN execve fails E2BIG, jq never runs, fd 3 writes nothing and `--file 3` hands the member an
+  # EMPTY ~/.claude.json — the wizard back, silently. A quarter of a megabyte of projects here, and the copy is the
+  # same three keys with the same two trusted entries: size does not decide whether the flags are minted.
+  pad=$(head -c 300 /dev/zero | tr '\0' x)
+  jq -n --arg m "$mark" --arg d "$dev" --arg pad "$pad" '{oauthAccount: {emailAddress: $m}, hasCompletedOnboarding: false,
+      projects: (reduce range(0; 700) as $i ({($d): {hasTrustDialogAccepted: false}};
+                   .["/home/someone/repo-\($i)"] = {lastSessionId: ($m + $pad)}))}' > "$fh/.claude.json"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'whitelist: the fixture for that really is past what argv takes' \
+    "$(awk -v n="$(wc -c < "$fh/.claude.json")" 'BEGIN{print (n > 204800) ? "big" : "too small: " n}')" big
+  t 'whitelist: a source too big for argv still mints the flags and still crosses nothing' \
+    "$(g keys)/$(g onboard)/$(g trust)/$(g projs)/$(g mark)" "hasCompletedOnboarding,mcpServers,projects/true/true/dev/$h/0"
+  # ── and the other end: nothing to read at all. jq exits 0 with no output on an empty file, so the old `--argjson p`
+  # took an empty string and errored; the flags must survive that too.
+  : > "$fh/.claude.json"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'whitelist: an EMPTY ~/.claude.json still mints the flags — no projects to filter, no wizard either' \
+    "$(g keys)/$(g onboard)/$(g trust)/$(g projs)" "hasCompletedOnboarding,mcpServers,projects/true/true/dev/$h"
+  rm -rf "${fh:?}"; }
 selfcheck_mint(){   # MINTING AND CONVERTING, IN A HOME OF THEIR OWN. Everything either command reads or writes hangs off $fh —
   # its own owner credential, its own ~/dev, its own ~/.cc — so the box's real ~/.claude is not something these cases have to
   # avoid touching: it is not reachable from them, and the hash at the end says so out loud.
@@ -474,7 +558,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
   out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
-  selfcheck_member; selfcheck_mint
+  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint
   git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$dev" worktree remove --force "$H/.cc/worktrees/$r/u" >/dev/null 2>&1
   rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")"
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
