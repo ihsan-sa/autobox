@@ -107,3 +107,4 @@ How the conversation itself works — channels, threads, marks, who may do what,
     ccbox experiment                     unrestricted, boxed    box-status       health
     cc slack setup | on | status         Slack ↔ sessions       #<repo> in Slack talk to that session
     cc-scope list myapp                  asks still open        cc-scope unverified myapp  landed, nothing checked
+    cc-spend  |  --by repo|track|model   token spend, biggest first    cc-spend phantoms    spend nobody watches

@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+"""cc-spend — the box's one token ledger: what every claude process spent, and which of them nobody is watching.
+
+WHY. Spend was only ever visible per run (`runs/*.json`) or per session (`/cost`), so a worker left looping in a
+worktree nobody had a window on burned usage invisibly. This reads the one thing that records every call — the
+transcripts under ~/.claude/projects — so it needs no model, no network and no cooperation from what it measures.
+
+THE TICK (`cc-spend tick`, every 5 min from cc-spend.timer). Each transcript is read only from the byte offset the
+last tick left in ~/.cc/state/spend/offsets.json; a file that shrank or whose inode changed is re-read from 0, one
+that vanished is forgotten. Assistant records fold to one row per (session, model, day), appended to
+~/.cc/state/spend/<YYYY-MM-DD>.tsv. Rows are dated by the RECORD's timestamp, not the tick's, so the first tick
+backfills every day this box already has instead of piling months of history onto today.
+
+THE ONE TRAP. A single API response is written as MANY assistant records — one per content block, 15 seen on a
+long turn — and every one carries the FULL usage. Summing records triples the bill. Rows dedupe on requestId, and
+offsets.json remembers the last requestId of the previous read, so a response split across a tick boundary is
+counted once and not twice.
+
+TOKENS ARE THE TRUTH, USD IS AN ESTIMATE — the CLI says so itself. There is ONE rates table (below), fitted
+against every runs/*.json this box has: it reproduces Claude Code's own modelUsage costUSD to the cent.
+
+PHANTOMS. Each tick also snapshots the live `claude` processes to procs.tsv. A phantom is spend nobody is
+watching: a session whose transcript grew this tick with no tmux window on its cwd and no live board row behind
+it, or a process alive over an hour whose transcript has not grown in thirty minutes. A window is ON a cwd when
+its pane sits there or deeper — never a parent, or the `box` window parked at ~/dev would watch the whole box.
+
+  cc-spend                     today, by session, biggest first
+  cc-spend --by repo|track|model|kind [--week]
+  cc-spend --week              the last 7 days
+  cc-spend phantoms            spend with nobody watching it
+  cc-spend tick                what the timer runs
+  cc-spend selfcheck           fixtures in a HOME of its own — no network, never this box's ledger
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+H = os.path.expanduser("~")
+PROJ = os.path.join(H, ".claude", "projects")
+ST = os.path.join(H, ".cc", "state", "spend")
+OFF = os.path.join(ST, "offsets.json")
+PROCS = os.path.join(ST, "procs.tsv")
+WTS = os.path.join(H, ".cc", "worktrees")
+DEV = os.path.join(H, "dev")
+BOARDS = os.path.join(H, ".cc", "boards")
+STATE = os.path.join(H, ".cc", "state")
+
+COLS = ["ts", "session", "cwd", "repo", "track", "kind", "model", "in", "out", "cache_read", "cache_write", "est_usd"]
+PCOLS = ["ts", "pid", "ppid", "etime_s", "cwd", "repo", "track", "kind", "model", "session"]
+
+# ONE rates table, $ per MILLION tokens: (input, output, cache read). Cache WRITES are 1.25x input at the 5-minute
+# TTL and 2x at the 1-hour one, and `usage.cache_creation` says which of the two a write was — so a write is
+# priced, never guessed. Claude Fable 5.1's cache read is 0.025x input rather than the usual 0.1x. These numbers
+# were fitted against every ~/.cc/state/*/*/runs/*.json on this box and reproduce its modelUsage costUSD exactly.
+# A model with no row here is still counted in tokens; its est_usd is 0 and the views say how many rows that was.
+RATES = {
+    "claude-fable-5-1":  (10.0, 50.0, 0.25),
+    "claude-mythos-5-1": (10.0, 50.0, 0.25),
+    "claude-fable-5":    (10.0, 50.0, 1.00),
+    "claude-mythos-5":   (10.0, 50.0, 1.00),
+    "claude-opus-5":     (5.0, 25.0, 0.50),
+    "claude-opus-4-8":   (5.0, 25.0, 0.50),
+    "claude-opus-4-7":   (5.0, 25.0, 0.50),
+    "claude-opus-4-6":   (5.0, 25.0, 0.50),
+    "claude-sonnet-5":   (2.0, 10.0, 0.20),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.30),
+    "claude-haiku-4-5":  (1.0, 5.0, 0.10),
+}
+# Fast mode is the same model at premium prices (Opus only) — `usage.speed` names it, so it is not a guess either.
+FAST = {"claude-opus-5": (10.0, 50.0, 0.50), "claude-opus-4-8": (10.0, 50.0, 0.50)}
+W_5M, W_1H = 1.25, 2.0            # the cache-write multiples on the input rate, by TTL
+
+PHANTOM_PROC_AGE = 3600           # a process older than this…
+PHANTOM_IDLE = 1800               # …whose transcript has not grown in this long is spending on nothing
+# "grew this tick" means bytes arrived AND they are fresh. Without this the FIRST tick — which backfills every day
+# of history on disk — would report every session this box has ever run as an unwatched phantom.
+GREW_WINDOW = 3600
+
+
+# ---------------------------------------------------------------- rates
+
+def rate(model, fast=False):
+    """The row for a model id. `claude-haiku-4-5-20251001` and `claude-opus-5[1m]` are the same families as their
+    bare names — Claude Code writes both spellings — so the match is on the longest prefix, suffix stripped."""
+    m = re.sub(r"\[[^\]]*\]\s*$", "", (model or "").strip())
+    for fam in sorted(RATES, key=len, reverse=True):
+        if m.startswith(fam):
+            return (FAST.get(fam) if fast else None) or RATES[fam]
+    return None
+
+
+def usd(model, u, fast=False):
+    """The estimate for one usage block. Returns None for a model with no rates row, so callers can say so."""
+    r = rate(model, fast)
+    if r is None:
+        return None
+    rin, rout, rread = r
+    cw = int(u.get("cache_creation_input_tokens") or 0)
+    cc = u.get("cache_creation") or {}
+    w1 = int(cc.get("ephemeral_1h_input_tokens") or 0)
+    w5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
+    if w5 + w1 != cw:                      # no split recorded, or a partial one: trust the 1 h count, rest is 5 m
+        w1, w5 = min(w1, cw), max(cw - w1, 0)
+    return (int(u.get("input_tokens") or 0) * rin
+            + int(u.get("output_tokens") or 0) * rout
+            + int(u.get("cache_read_input_tokens") or 0) * rread
+            + w5 * rin * W_5M + w1 * rin * W_1H) / 1e6
+
+
+# ---------------------------------------------------------------- where a cwd belongs
+
+def place(cwd):
+    """(repo, track) for a working directory. ~/.cc/worktrees/<repo>/<track> is a worker; ~/dev/<repo> is that
+    repo's planning session; ~/dev/<handle> carrying .cc/member-workspace is a member's own world. The track
+    column holds the track name, or the word that says which of the other two it is."""
+    cwd = (cwd or "").rstrip("/")
+    for base, kind in ((WTS, "worktree"), (DEV, "dev")):
+        if cwd == base or cwd.startswith(base + "/"):
+            parts = cwd[len(base) + 1:].split("/") if cwd != base else []
+            if not parts or not parts[0]:
+                return "-", "-"
+            if kind == "worktree":
+                return parts[0], (parts[1] if len(parts) > 1 else "-")
+            if os.path.exists(os.path.join(DEV, parts[0], ".cc", "member-workspace")):
+                return parts[0], "member"
+            return parts[0], "session"
+    return "-", "-"
+
+
+def kind_of(rec, cwd):
+    """interactive or headless. `entrypoint` is the record's own answer — 'cli' is a person at a terminal, the
+    SDK spellings are a `claude -p`. Older records carry no entrypoint; there, a worktree means a worker."""
+    ep = rec.get("entrypoint")
+    if ep:
+        return "interactive" if ep == "cli" else "headless"
+    return "headless" if (cwd or "").startswith(WTS + "/") else "interactive"
+
+
+# ---------------------------------------------------------------- state files
+
+def iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def load_offsets():
+    try:
+        with open(OFF) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def cell(v):
+    """A path or a model name with a tab or a newline in it would silently shift every column after it."""
+    return re.sub(r"[\t\r\n]+", " ", str(v))
+
+
+def day_path(day):
+    return os.path.join(ST, f"{day}.tsv")
+
+
+def append_rows(rows):
+    """One open-and-write per day file, and each write is a single append: two ticks that overlap interleave
+    whole rows rather than half a line."""
+    by_day = {}
+    for r in rows:
+        by_day.setdefault(r[0][:10], []).append("\t".join(cell(c) for c in r))
+    os.makedirs(ST, exist_ok=True)
+    for day, lines in by_day.items():
+        p = day_path(day)
+        head = "" if os.path.exists(p) else "#" + "\t".join(COLS) + "\n"
+        with open(p, "a") as f:
+            f.write(head + "\n".join(lines) + "\n")
+
+
+def read_rows(days):
+    for day in days:
+        try:
+            fh = open(day_path(day))
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                p = line.rstrip("\n").split("\t")
+                if len(p) != len(COLS):
+                    continue
+                r = dict(zip(COLS, p))
+                try:                       # a half-written or hand-edited row is skipped, never a crash mid-view
+                    for k in ("in", "out", "cache_read", "cache_write"):
+                        r[k] = int(r[k] or 0)
+                    r["est_usd"] = float(r["est_usd"] or 0)
+                except ValueError:
+                    continue
+                yield r
+
+
+# ---------------------------------------------------------------- the tick
+
+def scan_file(path, prev):
+    """Read one transcript from where the last tick stopped. Returns (rows, newstate) where rows are
+    ((session, model, day) -> totals) and newstate is what to remember about this file."""
+    stt = os.stat(path)
+    start = int(prev.get("off") or 0)
+    if stt.st_ino != prev.get("ino") or stt.st_size < start:
+        start, prev = 0, {}                    # truncated, replaced, or never seen: the offset means nothing
+    state = {"off": start, "ino": stt.st_ino, "rid": prev.get("rid", "")}
+    if stt.st_size <= start:
+        return {}, state
+    with open(path, "rb") as f:
+        f.seek(start)
+        blob = f.read()
+    cut = blob.rfind(b"\n")
+    if cut < 0:                                # a record still being written: leave the whole thing for next tick
+        return {}, state
+    state["off"] = start + cut + 1
+    seen = {state["rid"]} if state["rid"] else set()
+    agg = {}
+    for line in blob[:cut + 1].decode("utf-8", "replace").splitlines():
+        if '"assistant"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message") or {}
+        u = msg.get("usage") or {}
+        rid = rec.get("requestId") or msg.get("id") or ""
+        if rid:
+            state["rid"] = rid                 # remembered even when skipped: it is still the last one read
+            if rid in seen:
+                continue
+            seen.add(rid)
+        model = msg.get("model") or "-"
+        tok = [int(u.get(k) or 0) for k in
+               ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+        if not any(tok):
+            continue
+        ts = parse_ts(rec.get("timestamp")) or datetime.fromtimestamp(stt.st_mtime, timezone.utc)
+        cwd = rec.get("cwd") or "-"
+        sid = rec.get("sessionId") or os.path.basename(path)[:-6]
+        key = (sid, model, iso(ts)[:10])
+        a = agg.setdefault(key, {"ts": ts, "cwd": cwd, "kind": kind_of(rec, cwd), "tok": [0, 0, 0, 0], "usd": 0.0})
+        a["ts"] = max(a["ts"], ts)
+        a["cwd"], a["kind"] = cwd, kind_of(rec, cwd)
+        for i in range(4):
+            a["tok"][i] += tok[i]
+        a["usd"] += usd(model, u, (u.get("speed") == "fast")) or 0.0
+    return agg, state
+
+
+def proc_snapshot():
+    """Every live `claude`, the way cc-reconcile walks /proc: comm, cwd through /proc/<pid>/cwd, and the argv that
+    says headless or interactive. No `ps`, so nothing depends on its output format."""
+    try:
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+    except OSError:
+        return []
+    tck = os.sysconf("SC_CLK_TCK")
+    out = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if open(f"/proc/{pid}/comm").read().strip() != "claude":
+                continue
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            stat = open(f"/proc/{pid}/stat").read()
+            ppid = next(ln.split()[1] for ln in open(f"/proc/{pid}/status") if ln.startswith("PPid:"))
+        except (OSError, StopIteration):
+            continue                           # gone between listdir and here, or not ours to read
+        try:
+            age = int(up - int(stat[stat.rfind(")") + 2:].split()[19]) / tck)
+        except (ValueError, IndexError):
+            age = 0
+        headless = any(a in ("-p", "--print") or a.startswith("--max-budget-usd") for a in argv)
+        model = sid = "-"
+        for i, a in enumerate(argv):
+            if a == "--model" and i + 1 < len(argv):
+                model = argv[i + 1]
+            if a in ("--session-id", "--resume") and i + 1 < len(argv):
+                sid = argv[i + 1]
+        repo, track = place(cwd)
+        out.append({"pid": int(pid), "ppid": int(ppid), "etime_s": max(age, 0), "cwd": cwd, "repo": repo,
+                    "track": track, "kind": "headless" if headless else "interactive", "model": model,
+                    "session": sid})
+    return sorted(out, key=lambda p: -p["etime_s"])
+
+
+def tick():
+    os.makedirs(ST, exist_ok=True)
+    lock = open(os.path.join(ST, ".tick.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("cc-spend: another tick holds the lock — nothing to do")
+        return 0
+    stamp = now()
+    off = load_offsets()
+    files = off.get("files") or {}
+    rows, grew, seen_files = [], {}, set()
+    for path in sorted(glob.glob(os.path.join(PROJ, "*", "*.jsonl"))):
+        seen_files.add(path)
+        try:
+            agg, state = scan_file(path, files.get(path) or {})
+        except OSError:
+            continue                           # deleted or unreadable mid-walk: the next tick picks it up
+        files[path] = state
+        for (sid, model, _day), a in agg.items():
+            i, o, cr, cw = a["tok"]
+            repo, track = place(a["cwd"])
+            rows.append([iso(a["ts"]), sid, a["cwd"], repo, track, a["kind"], model, i, o, cr, cw,
+                         f"{a['usd']:.6f}"])
+            if (stamp - a["ts"]).total_seconds() <= GREW_WINDOW:
+                g = grew.setdefault(sid, {"cwd": a["cwd"], "repo": repo, "track": track, "kind": a["kind"],
+                                          "usd": 0.0, "tok": 0, "ts": iso(a["ts"])})
+                g["usd"] += a["usd"]
+                g["tok"] += i + o + cr + cw
+                g["ts"] = max(g["ts"], iso(a["ts"]))
+    for gone in set(files) - seen_files:       # a transcript that vanished takes its offset with it
+        del files[gone]
+    rows.sort()
+    # Rows first, offsets second: a crash between them re-reads and duplicates a tick's rows, where the other
+    # order would lose them outright. Over-counting once is visible and fixable; a hole in the ledger is not.
+    append_rows(rows)
+    procs = proc_snapshot()
+    save_tsv(PROCS, PCOLS, [[iso(stamp)] + [p[c] for c in PCOLS[1:]] for p in procs])
+    save_json(OFF, {"tick": iso(stamp), "files": files, "grew": grew})
+    print(f"cc-spend tick {iso(stamp)}: {len(rows)} row(s), {len(grew)} session(s) grew, "
+          f"{len(procs)} live claude, ${sum(float(r[-1]) for r in rows):.4f} est")
+    return 0
+
+
+def save_tsv(path, cols, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write("#" + "\t".join(cols) + "\n")
+        for r in rows:
+            f.write("\t".join(cell(c) for c in r) + "\n")
+    os.replace(tmp, path)
+
+
+def read_tsv(path, cols):
+    try:
+        fh = open(path)
+    except OSError:
+        return []
+    out = []
+    with fh:
+        for line in fh:
+            if line.startswith("#") or not line.strip():
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) == len(cols):
+                out.append(dict(zip(cols, p)))
+    return out
+
+
+# ---------------------------------------------------------------- phantoms
+
+def tmux_paths():
+    import subprocess
+    try:
+        o = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_current_path}"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {ln.strip().rstrip("/") for ln in o.stdout.splitlines() if ln.strip()}
+
+
+def loop_tracks():
+    """`repo/track` for every live `cc-loop <repo> <track>` — the one thing still alive while a loop waits out a
+    usage limit, so a board row without it is not being carried by anything."""
+    live = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        for i, a in enumerate(argv):
+            if a and os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] and argv[i + 2]:
+                live.add(f"{argv[i + 1]}/{argv[i + 2]}")
+                break
+    return live
+
+
+def board_states():
+    out = {}
+    for f in glob.glob(os.path.join(BOARDS, "*.json")):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        repo = d.get("repo") or os.path.basename(f)[:-5]
+        for track, t in (d.get("tracks") or {}).items():
+            out[f"{repo}/{track}"] = t.get("status", "")
+    return out
+
+
+def watched(cwd, repo, track, panes, loops, boards):
+    """Is anyone watching this spend? A tmux window on the directory counts, and so does a board row in a live
+    state WITH a loop alive behind it — a row saying `running` with nothing running is exactly the case this
+    command exists to catch.
+
+    A pane watches its own directory and anything it has cd'd DEEPER into, never a parent: this box's `box`
+    window sits permanently at ~/dev (tmux-main.service runs cc-rc from there), so counting an ancestor pane
+    would mark every ~/dev/<repo> and ~/dev/<member>/... session watched and rule 1 would never fire again."""
+    c = (cwd or "").rstrip("/")
+    for p in panes:
+        if c == p or p.startswith(c + "/"):
+            return True
+    key = f"{repo}/{track}"
+    return boards.get(key) in ("running", "review") and key in loops
+
+
+def phantom_rows(grew, procs, panes, loops, boards, last_growth, at):
+    """Pure, so the selfcheck can prove both rules without a tmux server, a board or a live process."""
+    out = []
+    for sid, g in sorted(grew.items(), key=lambda kv: -float(kv[1].get("usd") or 0)):
+        if watched(g.get("cwd"), g.get("repo"), g.get("track"), panes, loops, boards):
+            continue
+        out.append({"why": "unwatched", "what": sid[:8], "cwd": g.get("cwd", "-"),
+                    "repo": g.get("repo", "-"), "track": g.get("track", "-"), "kind": g.get("kind", "-"),
+                    "detail": f"grew this tick, ${float(g.get('usd') or 0):.4f}, nobody watching"})
+    for p in procs:
+        age = int(p.get("etime_s") or 0)
+        if age < PHANTOM_PROC_AGE:
+            continue
+        last = last_growth.get((p.get("cwd") or "").rstrip("/"))
+        idle = (at - last).total_seconds() if last else None
+        if idle is not None and idle < PHANTOM_IDLE:
+            continue
+        say = "no transcript row at all" if idle is None else f"transcript idle {idle / 3600:.1f} h"
+        # An idle process in a window is a session someone left sitting; one with nothing on it is the leak. The
+        # rule catches both — this says which, so the list stays worth reading.
+        who = "in a window" if watched(p.get("cwd"), p.get("repo"), p.get("track"), panes, loops, boards) \
+            else "nobody watching"
+        out.append({"why": "idle", "what": f"pid {p['pid']}", "cwd": p.get("cwd", "-"),
+                    "repo": p.get("repo", "-"), "track": p.get("track", "-"), "kind": p.get("kind", "-"),
+                    "detail": f"alive {age / 3600:.1f} h, {say}, {who}"})
+    return out
+
+
+def phantoms():
+    off = load_offsets()
+    if not off.get("tick"):
+        print("cc-spend: no tick has run yet — `cc-spend tick` or switch cc-spend.timer on")
+        return 1
+    at = now()
+    growth = {}
+    for r in read_rows(days(2)):
+        t = parse_ts(r["ts"])
+        c = r["cwd"].rstrip("/")
+        if t and (c not in growth or t > growth[c]):
+            growth[c] = t
+    rows = phantom_rows(off.get("grew") or {}, read_tsv(PROCS, PCOLS), tmux_paths(), loop_tracks(),
+                        board_states(), growth, at)
+    print(f"phantoms — last tick {off['tick']}")
+    if not rows:
+        print("  none: every session that grew has a window or a live board row, and no process is idling")
+        return 0
+    table([[r["why"], r["what"], f"{r['repo']}/{r['track']}", r["kind"], r["detail"], r["cwd"]] for r in rows],
+          ["why", "what", "repo/track", "kind", "detail", "cwd"])
+    return 0
+
+
+# ---------------------------------------------------------------- views
+
+def days(n, end=None):
+    end = end or now()
+    return [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
+
+
+def hn(n):
+    n = int(n)
+    if abs(n) >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def table(rows, head):
+    """Returns the column widths, so a caller can line a total up under them."""
+    w = [len(h) for h in head]
+    for r in rows:
+        for i, c in enumerate(r):
+            w[i] = max(w[i], len(str(c)))
+    print("  " + "  ".join(h.ljust(w[i]) for i, h in enumerate(head)))
+    for r in rows:
+        print("  " + "  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)))
+    return w
+
+
+def crosscheck(window):
+    """The workers' own results are the second source: each headless run writes total_cost_usd and the session it
+    ran in. The comparison is against THOSE sessions only — most headless spend on this box (gate runs, audits,
+    subagents) never writes a runs/ file, so holding the whole headless column up against them would read as a
+    2x error when it is really the ledger seeing what the runs/ files never did.
+
+    Both sides are WHOLE SESSIONS, which is the only like-for-like there is: total_cost_usd covers a run end to
+    end and cannot be split by day, while the ledger dates each row by the record's own timestamp. Comparing a
+    run that finished today against today's ledger rows alone charged the run's whole life to its last day —
+    that is the $116-vs-$4.78 the first real tick reported. So the window only PICKS the sessions (a run file
+    touched in it); the sum then takes every run those sessions ever wrote, and view() sums the ledger for them
+    over every day on disk."""
+    per = {}                               # session -> [usd end to end, run files, touched the window]
+    for f in sorted(glob.glob(os.path.join(STATE, "*", "*", "runs", "*.json"))):
+        try:
+            d = json.load(open(f))
+            sid = d.get("session_id")
+            if not sid:
+                continue
+            day = datetime.fromtimestamp(os.path.getmtime(f), timezone.utc).strftime("%Y-%m-%d")
+        except (OSError, ValueError, TypeError):
+            continue                       # a run still in flight writes an empty file; skip it, never crash
+        per.setdefault(sid, [0.0, 0, False])
+        per[sid][0] += float(d.get("total_cost_usd") or 0)
+        per[sid][1] += 1
+        per[sid][2] = per[sid][2] or day in window
+    sids = {s for s, v in per.items() if v[2]}
+    tot = sum(per[s][0] for s in sids)
+    n = sum(per[s][1] for s in sids)
+    return tot, n, sids
+
+
+def all_days():
+    """Every day the ledger has on disk, newest first — the span a whole-session sum has to cover."""
+    return sorted((os.path.basename(p)[:-4] for p in glob.glob(os.path.join(ST, "*.tsv"))
+                   if re.fullmatch(r"\d{4}-\d{2}-\d{2}", os.path.basename(p)[:-4])), reverse=True)
+
+
+def view(by, window):
+    rows = list(read_rows(window))
+    span = window[0] if len(window) == 1 else f"{window[-1]}..{window[0]}"
+    if not rows:
+        print(f"cc-spend: nothing recorded for {span}"
+              + ("" if os.path.exists(OFF) else " — no tick has run yet"))
+        return 0
+    groups, unpriced = {}, 0
+    for r in rows:
+        if by == "session":
+            key = r["session"][:8]
+        elif by == "repo":
+            key = r["repo"]
+        elif by == "track":
+            key = f"{r['repo']}/{r['track']}"
+        elif by == "model":
+            key = r["model"]
+        else:
+            key = r["kind"]
+        g = groups.setdefault(key, {"usd": 0.0, "in": 0, "out": 0, "cache_read": 0, "cache_write": 0,
+                                    "where": set(), "models": set()})
+        g["usd"] += r["est_usd"]
+        for k in ("in", "out", "cache_read", "cache_write"):
+            g[k] += r[k]
+        g["where"].add(f"{r['repo']}/{r['track']} {r['kind']}")
+        g["models"].add(r["model"])
+        if rate(r["model"]) is None:
+            unpriced += 1
+    order = sorted(groups.items(), key=lambda kv: -kv[1]["usd"])
+    head = [by, "est $", "in", "out", "cache rd", "cache wr"] + (["where", "model"] if by == "session" else [])
+    out = []
+    for k, g in order:
+        row = [k, f"{g['usd']:.4f}", hn(g["in"]), hn(g["out"]), hn(g["cache_read"]), hn(g["cache_write"])]
+        if by == "session":
+            row += [", ".join(sorted(g["where"]))[:44], ", ".join(sorted(g["models"]))[:36]]
+        out.append(row)
+    print(f"cc-spend {span} — by {by}, {len(rows)} row(s). USD is an ESTIMATE; the token columns are the truth.")
+    w = table(out, head)
+    tot = sum(g["usd"] for g in groups.values())
+    print(f"  {'total'.ljust(w[0])}  {f'{tot:.4f}'.ljust(w[1])}  <- estimate")
+    cc, n, sids = crosscheck(window)
+    if n:
+        # Whole run against whole session: see crosscheck(). Summing only the rows in `rows` would charge a
+        # multi-day run entirely to the day it ended and report a gap that is not there.
+        mine = sum(r["est_usd"] for r in read_rows(all_days()) if r["session"] in sids)
+        print(f"  cross-check: {n} worker run(s) over {len(sids)} session(s) report ${cc:.4f} end to end; this "
+              f"ledger estimates ${mine:.4f} for those sessions across all days (a run cannot be split by day)")
+    if unpriced:
+        print(f"  ({unpriced} row(s) from models with no rates row, counted in tokens and estimated at $0)")
+    return 0
+
+
+# ---------------------------------------------------------------- selfcheck
+
+def selfcheck():
+    """STATIC: fixtures in a HOME of its own — a synthetic transcript, a runs/ json, an offsets file. No network,
+    no model, and it never reads or writes this box's ledger."""
+    import shutil
+    import subprocess
+    import tempfile
+    n = [0]
+
+    def ok(what, cond):
+        print(("  ok   " if cond else "  FAIL ") + what)
+        if not cond:
+            n[0] += 1
+
+    print("cc-spend selfcheck")
+    # ---- the rates table, against the numbers Claude Code itself reports
+    ok("a model id with a date or a [1m] suffix finds its family",
+       rate("claude-haiku-4-5-20251001") == RATES["claude-haiku-4-5"]
+       and rate("claude-opus-5[1m]") == RATES["claude-opus-5"] and rate("no-such-model") is None)
+    ok("fast mode is priced as fast mode, not as the standard model",
+       rate("claude-opus-5", True) == FAST["claude-opus-5"] and rate("claude-sonnet-5", True) == RATES["claude-sonnet-5"])
+    u1h = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+           "cache_creation_input_tokens": 1_000_000,
+           "cache_creation": {"ephemeral_1h_input_tokens": 1_000_000, "ephemeral_5m_input_tokens": 0}}
+    u5m = dict(u1h, cache_creation={"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 1_000_000})
+    ok("a cache write is priced by its TTL — 2x input at 1 h, 1.25x at 5 min",
+       abs(usd("claude-opus-5", u1h) - 10.0) < 1e-9 and abs(usd("claude-opus-5", u5m) - 6.25) < 1e-9)
+    ok("…and a write with no TTL split recorded is priced as the cheaper 5-minute one",
+       abs(usd("claude-opus-5", {"cache_creation_input_tokens": 1_000_000}) - 6.25) < 1e-9)
+    ok("Claude Fable 5.1 reads cache at 0.025x input, not the usual 0.1x",
+       abs(usd("claude-fable-5-1", {"cache_read_input_tokens": 1_000_000}) - 0.25) < 1e-9
+       and abs(usd("claude-fable-5", {"cache_read_input_tokens": 1_000_000}) - 1.0) < 1e-9)
+    ok("an unknown model estimates nothing rather than guessing",
+       usd("gpt-nonesuch", {"output_tokens": 10}) is None)
+
+    th = tempfile.mkdtemp(prefix="ccspend-sc-")
+    try:
+        me = os.path.realpath(__file__)
+
+        def run(*a):
+            return subprocess.run([sys.executable, me, *a], env={**os.environ, "HOME": th},
+                                  capture_output=True, text=True)
+
+        proj = os.path.join(th, ".claude", "projects", "-a-worktree-r-t1")   # the name is Claude Code's, not read here
+        os.makedirs(proj)
+        jl = os.path.join(proj, "s1.jsonl")
+        cwd = os.path.join(th, ".cc", "worktrees", "r", "t1")
+
+        def rec(rid, out_tok, ts="2026-09-01T10:00:00.000Z", model="claude-opus-5", ep="sdk-cli"):
+            return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts, "cwd": cwd,
+                               "sessionId": "s1", "entrypoint": ep,
+                               "message": {"model": model, "id": "m_" + rid,
+                                           "usage": {"input_tokens": 100, "output_tokens": out_tok,
+                                                     "cache_read_input_tokens": 1000,
+                                                     "cache_creation_input_tokens": 0}}}) + "\n"
+
+        # THE trap: one API response, three content blocks, three records, each carrying the full usage.
+        open(jl, "w").write(rec("req_a", 10) + rec("req_a", 10) + rec("req_a", 10) + rec("req_b", 20))
+        r = run("tick")
+        rows = [ln.split("\t") for ln in open(os.path.join(th, ".cc", "state", "spend", "2026-09-01.tsv"))
+                if not ln.startswith("#")]
+        ok("a tick under a fake HOME writes there and never touches the real ledger",
+           r.returncode == 0 and os.path.isdir(os.path.join(th, ".cc", "state", "spend")) and th in r.stdout + str(rows))
+        ok("three records of ONE response are counted once, not three times",
+           len(rows) == 1 and int(rows[0][8]) == 30)
+        ok("the row carries repo, track and kind read off the cwd and the entrypoint",
+           rows[0][3] == "r" and rows[0][4] == "t1" and rows[0][5] == "headless")
+        ok("est_usd is the rates table applied to those tokens",
+           abs(float(rows[0][11]) - usd("claude-opus-5", {"input_tokens": 200, "output_tokens": 30,
+                                                          "cache_read_input_tokens": 2000})) < 1e-9)
+
+        # a second tick with nothing new must add nothing…
+        run("tick")
+        before = open(os.path.join(th, ".cc", "state", "spend", "2026-09-01.tsv")).read()
+        ok("a tick over a file that has not grown appends nothing", before.count("\n") == 2)
+
+        # …and a response whose blocks straddle the boundary must not be counted twice.
+        open(jl, "a").write(rec("req_c", 5))
+        run("tick")
+        open(jl, "a").write(rec("req_c", 5) + rec("req_d", 7))
+        run("tick")
+        rows = [ln.split("\t") for ln in open(os.path.join(th, ".cc", "state", "spend", "2026-09-01.tsv"))
+                if not ln.startswith("#")]
+        ok("a response split across two ticks is counted once (the last requestId is remembered)",
+           sum(int(x[8]) for x in rows) == 30 + 5 + 7)
+
+        # a half-written last line is left alone until it is whole
+        half = '{"type":"assistant","requestId":"req_e"'
+        open(jl, "a").write(half)
+        run("tick")
+        ok("a record still being written is left for the next tick",
+           json.load(open(os.path.join(th, ".cc", "state", "spend", "offsets.json")))["files"][jl]["off"]
+           == os.path.getsize(jl) - len(half))
+
+        # truncation and disappearance both reset
+        open(jl, "w").write(rec("req_f", 3))
+        run("tick")
+        rows = [ln.split("\t") for ln in open(os.path.join(th, ".cc", "state", "spend", "2026-09-01.tsv"))
+                if not ln.startswith("#")]
+        ok("a truncated transcript is re-read from the start rather than skipped",
+           sum(int(x[8]) for x in rows) == 30 + 5 + 7 + 3)
+        os.remove(jl)
+        run("tick")
+        ok("a transcript that vanished takes its offset with it",
+           json.load(open(os.path.join(th, ".cc", "state", "spend", "offsets.json")))["files"] == {})
+
+        # rows land on the day the RECORD happened, not the day the tick ran
+        open(jl, "w").write(rec("req_g", 1, ts="2026-08-30T23:59:00.000Z")
+                            + rec("req_h", 2, ts="2026-08-31T00:01:00.000Z"))
+        run("tick")
+        ok("a row is dated by the record, so the first tick backfills instead of piling history onto today",
+           os.path.exists(os.path.join(th, ".cc", "state", "spend", "2026-08-30.tsv"))
+           and os.path.exists(os.path.join(th, ".cc", "state", "spend", "2026-08-31.tsv")))
+        offs = os.path.join(th, ".cc", "state", "spend", "offsets.json")
+        ok("…and backfilled history is NOT 'grew this tick' — or the first tick calls every session ever a phantom",
+           json.load(open(offs))["grew"] == {})
+        os.remove(jl)
+        run("tick")
+        open(jl, "w").write(rec("req_i", 1, ts=iso(now())))
+        run("tick")
+        ok("a record written just now IS grew-this-tick", list(json.load(open(offs))["grew"]) == ["s1"])
+
+        # the runs/ json cross-check: a worker's own result read back and compared
+        runs = os.path.join(th, ".cc", "state", "r", "t1", "runs")
+        os.makedirs(runs)
+        json.dump({"total_cost_usd": 1.25, "session_id": "s1",
+                   "modelUsage": {"claude-opus-5": {"costUSD": 1.25}}},
+                  open(os.path.join(runs, "x.json"), "w"))
+        out, today_out = run("--week").stdout, run().stdout
+        ok("the cross-check weighs a worker run against the ledger's estimate for THAT session, not the whole "
+           "headless column", "cross-check: 1 worker run(s) over 1 session(s) report $1.2500" in out)
+
+        # LIKE FOR LIKE. total_cost_usd covers a run end to end and cannot be split by day, so the ledger side
+        # has to be the session's whole life too. Weighing a run that finished today against today's rows alone
+        # charged its whole life to its last day — the first real tick read $116 against $4.78 that way. s1 here
+        # has rows on 08-30, 08-31, 09-01 and today, so the two views only agree if the window stopped counting.
+        def xc(s):
+            m = re.search(r"ledger estimates \$([0-9.]+) for those sessions", s)
+            return float(m.group(1)) if m else None
+
+        def shown_total(s):
+            m = re.search(r"total\s+([0-9.]+)\s+<- estimate", s)
+            return float(m.group(1)) if m else None
+
+        ok("…over the session's whole life, so one run reads the same in today's view and in the week's",
+           xc(out) is not None and xc(out) == xc(today_out))
+        ok("…and that is more than the day's own rows, which is the like-for-like the first real tick lacked",
+           shown_total(today_out) is not None and xc(today_out) > shown_total(today_out))
+        ok("every view says the dollars are an estimate", "ESTIMATE" in out and "ESTIMATE" in run().stdout)
+        for by in ("repo", "track", "model", "kind"):
+            got = run("--by", by, "--week")
+            ok(f"--by {by} groups the same rows", got.returncode == 0 and "total" in got.stdout)
+        ok("an unknown --by is a usage error, not a silent empty table", run("--by", "nonesuch").returncode == 2)
+
+        # the two phantom rules, on the pure function — no tmux server, no board, no live process
+        at = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        grew = {"s1": {"cwd": cwd, "repo": "r", "track": "t1", "kind": "headless", "usd": 2.0}}
+        ok("a session that grew with no window and no live board row is a phantom",
+           len(phantom_rows(grew, [], set(), set(), {}, {}, at)) == 1)
+        ok("…a tmux window on its directory clears it",
+           phantom_rows(grew, [], {cwd}, set(), {}, {}, at) == [])
+        # The box's own `box` window sits at ~/dev forever, so an ancestor pane must NOT count as watching —
+        # it did once, and every ~/dev/<repo> session was silently un-phantomable.
+        ok("…but a pane in a PARENT directory does not — the ~/dev window watches ~/dev, not the whole box",
+           len(phantom_rows(grew, [], {os.path.dirname(cwd)}, set(), {}, {}, at)) == 1)
+        ok("…while a pane that has cd'd DEEPER is still the same window, so it clears it",
+           phantom_rows(grew, [], {os.path.join(cwd, "core", "bin")}, set(), {}, {}, at) == [])
+        ok("…and so does a board row running WITH a loop alive behind it",
+           phantom_rows(grew, [], set(), {"r/t1"}, {"r/t1": "running"}, {}, at) == []
+           and len(phantom_rows(grew, [], set(), set(), {"r/t1": "running"}, {}, at)) == 1)
+        ok("a board row that merely SAYS running, with no loop, is exactly what this catches",
+           len(phantom_rows(grew, [], set(), {"r/other"}, {"r/t1": "running"}, {}, at)) == 1)
+        old = [{"pid": 7, "etime_s": 2 * 3600, "cwd": cwd, "repo": "r", "track": "t1", "kind": "headless"}]
+        got = phantom_rows({}, old, {cwd}, set(), {}, {cwd: at - timedelta(minutes=45)}, at)
+        ok("a process alive over an hour whose transcript is idle 30 min is a phantom",
+           len(got) == 1 and got[0]["detail"].endswith("in a window"))
+        ok("…and the row says whether anyone is on it, so a left-open session reads apart from a leak",
+           phantom_rows({}, old, set(), set(), {}, {cwd: at - timedelta(minutes=45)},
+                        at)[0]["detail"].endswith("nobody watching"))
+        ok("…and rule 2 reads the panes the same way — a parent pane is not somebody watching",
+           phantom_rows({}, old, {os.path.dirname(cwd)}, set(), {}, {cwd: at - timedelta(minutes=45)},
+                        at)[0]["detail"].endswith("nobody watching"))
+        ok("…and one whose transcript grew five minutes ago is not",
+           phantom_rows({}, old, {cwd}, set(), {}, {cwd: at - timedelta(minutes=5)}, at) == [])
+        ok("a young process is never a phantom, however quiet",
+           phantom_rows({}, [dict(old[0], etime_s=60)], set(), set(), {}, {}, at) == [])
+        ok("`phantoms` before any tick says so and exits 1 rather than printing an empty all-clear",
+           subprocess.run([sys.executable, me, "phantoms"],
+                          env={**os.environ, "HOME": tempfile.mkdtemp(prefix="ccspend-empty-")},
+                          capture_output=True, text=True).returncode == 1)
+    finally:
+        shutil.rmtree(th, ignore_errors=True)
+
+    print(f"cc-spend selfcheck: {'all passed' if not n[0] else str(n[0]) + ' FAILED'}")
+    return 1 if n[0] else 0
+
+
+# ---------------------------------------------------------------- cli
+
+USAGE = "usage: cc-spend [--by repo|track|model|kind] [--week] | phantoms | tick | selfcheck"
+
+
+def bail():
+    print(USAGE, file=sys.stderr)
+    sys.exit(2)
+
+
+def main(argv):
+    if argv and argv[0] in ("tick", "phantoms", "selfcheck"):
+        if len(argv) > 1:
+            bail()
+        return {"tick": tick, "phantoms": phantoms, "selfcheck": selfcheck}[argv[0]]()
+    by, window = "session", days(1)
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--week":
+            window = days(7)
+        elif a == "--by" and i + 1 < len(argv):
+            by = argv[i + 1]
+            i += 1
+            if by not in ("repo", "track", "model", "kind", "session"):
+                bail()
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            bail()
+        i += 1
+    return view(by, window)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        os._exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
