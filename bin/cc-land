@@ -6,7 +6,10 @@
   cc-land <repo> <pr-number> --re-review          …asking again about a head already reviewed (it costs again)
   cc-land <repo> --track <t> --note "<what>"      work with no PR (a config edit, a host change)
   cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does
-  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min)
+  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). A queued PR
+                                                  SURVIVES a usage-limit review (it waits for the reset) and a red
+                                                  gate (3 tries, 15 min apart): the sweep that keeps a job arms its
+                                                  own next run. A review verdict or an unmergeable PR ends it at once
   cc-land selfcheck                               the decision table; no network, no systemctl
 
 Landing a change used to be nine separate things to remember — gates, merge, the #approvals card, the mark on
@@ -22,10 +25,11 @@ WHAT IT WILL NOT DO, and why each line is here:
     stopping verdicts stop the landing exactly like a red gate, and the findings are posted as ONE PR comment.
     This is a gate and not a session's habit on purpose: a review a session does by hand dies with that session,
     which is how four finished PRs sat unread in one night. `--no-review` is the only way past it, and a 👍 does
-    NOT take that way — the review is the thing that replaces a person reading the diff. It fails CLOSED, so a
-    Claude usage limit ends the job rather than merging unread: on the 👍 path the owner is told the PR is not
-    merged and why, and re-approving after the limit lifts is the whole of the recovery. One verdict per head:
-    a re-run reads the verdict back off its own PR comment instead of buying a second, differing opinion.
+    NOT take that way — the review is the thing that replaces a person reading the diff. It fails CLOSED: a
+    Claude usage limit merges nothing unread — the queued job WAITS for the reset cc-limit names (not_before) and
+    runs itself again then, the attempt uncounted and the owner untroubled, because nothing has been decided about
+    the PR. One verdict per head: a re-run reads the verdict back off its own PR comment instead of buying a
+    second, differing opinion.
   · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
     afterwards — not against the default branch, which does not contain the change, so gating it there would
     be a green light for code nobody ran. A red gate or a conflicting PR stops everything before the merge.
@@ -68,7 +72,8 @@ honest answer and the point: an ask nobody can measure is not an ask that is don
 Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
 cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
-import fcntl, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.parse, urllib.request
+import calendar, fcntl, glob, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+import urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy (like `cc`)
@@ -129,11 +134,15 @@ CARD = "ok_hand"                          # the mark for "landed". The daemon pu
 # board, ledger — is a record of what happened, not the thing that happened: it reports ✗, the sequence carries
 # on, and the run exits 3 so the operator still knows one of them wants a hand.
 FATAL = ("review", "gates", "merge", "install", "units", "restart")
-# …and of those, the ones worth trying AGAIN unattended. A red gate and a refused merge are verdicts: re-running them
-# burns a whole suite to be told the same thing, and they want a person. install/units/restart fail on the STATE of
-# the box — a checkout parked on a feature branch, a unit mid-restart — which the next attempt may well find fixed, and
-# PR #87 sat merged-and-undeployed for exactly the want of that second attempt.
-RETRY = ("install", "units", "restart")
+# …and of those, the ones worth trying AGAIN unattended. A review verdict and a refused merge are decisions: re-running
+# them buys the same answer, and they want a person. install/units/restart fail on the STATE of the box — a checkout
+# parked on a feature branch, a unit mid-restart — which the next attempt may well find fixed, and PR #87 sat
+# merged-and-undeployed for exactly the want of that second attempt. gates is here since 2026-09-01: the suite FLAKES
+# (cc-slack's selfcheck, boarded apart), and a job that ended on a flake is why 39 tmux lanes chained waiter pids into
+# a queue of their own on top of this one. A PR that CONFLICTS fails in that step too and is a decision — run_job ends
+# it at once. A usage limit at the review is neither: the job is DEFERRED to the reset, uncounted (see run_job).
+RETRY = ("gates", "install", "units", "restart")
+RETRY_AFTER = 900                         # …and how long a kept job waits before the queue re-runs itself (see rearm)
 COSMETIC = 3                              # exit code for "the box is right, its bookkeeping is not"
 UNVERIFIED = 4                            # "the box is deployed, and nothing has confirmed the owner can see it"
 
@@ -225,6 +234,42 @@ def unit_policy(name, field):
 
 def stamp():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def epoch_of(s):
+    """A stamp() string back as seconds; 0 when it is not one."""
+    try:
+        return calendar.timegm(time.strptime(s or "", "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return 0
+
+
+LIMIT_UNTIL_RE = re.compile(r"usage limit until (\d\d):(\d\d)Z")
+
+
+def limit_until(text):
+    """The reset cc-limit names — `usage limit until HH:MMZ` — as a stamp() on the END of that UTC minute, or "" when
+    the text names none. cc-limit FLOORS the reset to the minute, so the minute it names is still running until its
+    last second and that second is what a job waits for: compared whole minute to whole minute, 04:00Z read as PAST at
+    04:00:12 and the job was deferred to 04:00 TOMORROW — an approved PR asleep for 24 h, the very bug this queue
+    exists to end (found reviewing PR #154). Only a minute wholly behind us is read as tomorrow's, and seconds-old
+    text is the only text there is here — a stamp that far past is the next occurrence, not a stale one. A limit
+    further off than a day (a weekly one) lands there too: that sweep asks cc-limit again and defers again, so this
+    converges on the real reset without having to know its date."""
+    m = LIMIT_UNTIL_RE.search(text or "")
+    if not m:
+        return ""
+    now = time.time()
+    t = time.gmtime(now)
+    end = calendar.timegm((t.tm_year, t.tm_mon, t.tm_mday, int(m.group(1)), int(m.group(2)), 0, 0, 0, 0)) + 60
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end if end > now else end + 86400))
+
+
+def limited(why):
+    """True when a review stopped on a Claude usage limit — the box's weather, not a verdict on the PR. Matched on the
+    two fixed prefixes review() raises with, never on the words alone: a verdict's prose quotes anything."""
+    return why.startswith("no review: usage limit") or (why.startswith("the reviewer produced nothing")
+                                                        and "usage limit" in why)
 
 
 def write_atomic(path, obj):
@@ -1094,6 +1139,8 @@ def result_of(L, rc, job, tail):
         # landing stops it before the merge. Missing it told the owner "merged, but the deploy stopped at review"
         # about a DO-NOT-LAND — the one sentence they act on, saying the opposite of what happened.
         short = f"{what}: NOT merged ❌ — {L.why[:200] or 'the box could not read it'}"
+        if tries > 1 and L.stopped != "review":
+            short += f" (after {tries} tries)"
     elif L.stopped == "merge":
         short = f"{what}: NOT merged ❌ — {L.why[:200]}"
     else:
@@ -1125,11 +1172,27 @@ def run_job(path, job):
             rc, L.stopped, L.why = 1, "load", f"cannot read PR #{pr} in {L.root}"
     print(buf.getvalue(), end="", flush=True)
     tail = "\n".join(x for x in buf.getvalue().splitlines() if x.strip())
-    if rc == 1 and (L.stopped in RETRY or L.stopped == "load") and job["attempts"] < LAND_TRIES:
-        job["last"] = f"{L.stopped}: {L.why}"[:400]
-        write_atomic(path, job)                # kept, so the next sweep re-drives it — the retry PR #87 never had
+    if rc == 1 and L.stopped == "review" and limited(L.why):
+        # A usage limit is the BOX's state, not a verdict: nothing read the PR, so there is nothing to tell the owner
+        # and nothing to count. The job waits for the reset cc-limit names, and the sweep arms itself for it (rearm).
+        # Until 2026-09-01 this ENDED the job — a second 👍 after the limit was the whole recovery, and 39 tmux lanes
+        # grew a queue of their own to get round it.
+        until = (limit_until(L.why) or limit_until(sh([f"{BIN}/cc-limit", "status"], timeout=60)[1])
+                 or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + RETRY_AFTER)))
+        job.update(attempts=job["attempts"] - 1, stage="deferred", not_before=until, last=f"review: {L.why}"[:400])
+        write_atomic(path, job)
+        return f"[{repo}] {L.what()}: review deferred until {until} — {L.why[:160]}"
+    decided = L.stopped == "gates" and " conflicts with " in L.why    # no flake: nothing but a rebase changes it
+    if rc == 1 and (L.stopped in RETRY or L.stopped == "load") and not decided and job["attempts"] < LAND_TRIES:
+        # Kept, so the next sweep re-drives it — the retry PR #87 never had. A not_before goes with the try: the reset
+        # this job once waited for is spent, and left on it is read as the schedule, arming the re-run 60 s out and
+        # burning all three tries inside two minutes instead of 15 apart. The stage is the step that stopped, too —
+        # this dict was read before the walk and still calls itself "deferred".
+        job["last"], job["stage"] = f"{L.stopped}: {L.why}"[:400], L.stopped
+        job.pop("not_before", None)
+        write_atomic(path, job)
         return (f"[{repo}] {L.what()}: {L.stopped} failed on try {job['attempts']} of {LAND_TRIES} — "
-                f"the next sweep runs it again")
+                f"kept for the next sweep")
     job["state"], job["result"] = "done", result_of(L, rc, job, tail)
     write_atomic(path, job)                    # decided, on disk, before a word of it is said
     finish(path, job)
@@ -1144,6 +1207,9 @@ def run_one(path):
     if job.get("state") == "done":
         finish(path, job)                        # killed between deciding and saying it: say it now, once
         return (job.get("result") or {}).get("short", "")
+    if stamp() < (job.get("not_before") or ""):  # deferred to a usage-limit reset: untouched, uncounted, until then
+        return (f"[{job['repo']}] {'PR #' + str(job['pr']) if job.get('pr') else 'deploy'}: waits until "
+                f"{job['not_before']} ({(job.get('last') or '')[:120]})")
     if job.get("attempts", 0) >= LAND_TRIES:
         finish(path, job)                        # gave up earlier and never got to speak
         return (job.get("result") or {}).get("short", "")
@@ -1211,6 +1277,47 @@ def due_catchup():
     return True
 
 
+def next_wake():
+    """Seconds until the earliest job still on disk wants running — a deferred one a minute past its not_before, a
+    kept one RETRY_AFTER from now, one nobody has tried yet (queued while this sweep held the lock) almost at once —
+    or None with the queue empty. A not_before already behind us is no wait at all: it is a reset that has come, and
+    reading it as a schedule armed a kept job for 60 s and burned its tries in two minutes."""
+    now, waits = time.time(), []
+    for p in glob.glob(f"{LANDQ}/*.json"):
+        j = read_json(p) or {}
+        if not j.get("repo"):
+            continue
+        nb = epoch_of(j.get("not_before", ""))
+        waits.append(nb - now + 60 if nb > now else (RETRY_AFTER if j.get("attempts") else 5))
+    return int(min(waits)) if waits else None
+
+
+def rearm(secs):
+    """The cadence. NOTHING on the box runs `work` on a clock — the starters are a 👍 and `queue` — so a job a sweep
+    kept used to wait for the next unrelated approval; that is how the deploy retries waited too, and why 39 tmux lanes
+    grew a queue of their own on top of this one (2026-09-01). One transient timer, armed by the sweep that kept the
+    job, for exactly when it is wanted: no unit to install or switch on, nothing running while the queue is empty, and
+    a deferred job wakes at its reset instead of being polled at. It dies with a reboot; a 👍 or a typed `work` re-arms
+    it. Two sweeps arming for one job is two cheap sweeps, not two landings — the flock and the job file see to that.
+    Returns one line."""
+    unit = f"cc-land-work-at-{int(time.time()) + secs}-{os.getpid()}"
+    when = f"{secs // 60}m" if secs >= 60 else f"{secs}s"
+    rc, o = sh(["systemd-run", "--user", "--collect", "--quiet", f"--on-active={secs}",
+                "--timer-property=RemainAfterElapse=no", f"--unit={unit}",
+                "--description=cc-land: re-drive a kept job", f"{BIN}/cc-land", "work"], timeout=120)
+    if rc == 0:
+        return f"cc-land: a job was kept — the queue runs itself again in {when}"
+    try:    # no user manager (a container, a cron): a detached sleeper, as start_worker falls back to
+        os.makedirs(LANDQ, exist_ok=True)
+        f = open(f"{LANDQ}/work.log", "a")
+        subprocess.Popen(["sh", "-c", f"sleep {secs}; exec {shlex.quote(BIN + '/cc-land')} work"],
+                         start_new_session=True, stdin=subprocess.DEVNULL, stdout=f, stderr=f)
+        return f"cc-land: a job was kept — the queue runs itself again in {when} (a detached child; no systemd --user)"
+    except Exception as e:
+        return (f"cc-land: a job was kept, but nothing could be armed to re-drive it ({last(o)}; {e}) — "
+                f"`cc-land work` runs it")
+
+
 def cmd_work(argv):
     """Drain the queue, then catch the box up. ONE worker runs at a time — the flock is what makes ‘at most one
     merge’ true no matter how many 👍, timers and reboots ask for one at once; a second worker finds the lock held,
@@ -1237,6 +1344,9 @@ def cmd_work(argv):
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
+    wake = next_wake()
+    if wake is not None:
+        lines.append(rearm(wake))
     for x in lines:
         if x:
             print(x)
@@ -1977,6 +2087,136 @@ def cmd_selfcheck():
               "GitHub feels like it, ungated and undeployed, which is the fallback this replaced",
               not ran("gh pr merge", "--auto") and not ran("git", "pull", "--ff-only")
               and reacted and reacted[-1][1] == "x" and not os.path.exists(job_path("myrepo", 7)))
+        check("...and no re-run is armed for it either: an unmergeable PR wants a person, and the job is gone",
+              not ran("systemd-run", "--on-active="))
+
+        # ---- what a queued PR SURVIVES, and what still ends it (2026-09-01). 39 tmux lanes chained on waiter pids
+        # had re-implemented this queue because `work` ended a job on two transient failures — a usage limit at the
+        # review and a flaked gate — and the lanes' own bug then slept one of them for 24 h.
+        GATE = f"{tempfile.gettempdir()}/cc-land-"      # a gate runs as <tmp>/head/core/tests/check.sh — this prefix
+
+        def landing(**limit):
+            """A 👍 on PR #7: the reviewer says LAND, the box sits on main, and `limit` is what differs this time."""
+            fresh(pr=7)
+            world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+            world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+            world["git rev-parse HEAD"] = (0, "deadbeef\n")
+            world[f"{BIN}/cc-scope list"] = (0, "[]")
+            world.update(limit)
+            quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+
+        def armed():
+            return [next(a for a in c if a.startswith("--on-active=")) for c in ran("systemd-run", "--on-active=")]
+
+        def told():
+            posts = ran_sub("cc-slack", "post", "CAPPR")
+            return " ".join(posts[0]) if posts else ""
+
+        # (1) a usage limit is the box's weather, not a verdict on the PR
+        landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n")})
+        quiet(cmd_work, [])
+        kept = read_json(job_path("myrepo", 7)) or {}
+        nb = epoch_of(kept.get("not_before", ""))
+        check("a review that meets a usage limit KEEPS the job: stage deferred, not_before at the END of the minute "
+              "cc-limit names (UTC — it floors that stamp, so the minute is still running), the attempt uncounted, "
+              "nothing bought, nobody told — the PR was not read, so there is nothing to say yet",
+              kept.get("stage") == "deferred" and kept.get("attempts") == 0 and 0 < nb - time.time() <= 86400
+              and time.gmtime(nb)[3:5] == (4, 1) and not [c for c in calls if c[0] == CLAUDE] and not gh_merges()
+              and not ran_sub("cc-slack", "post") and not ran("cc-notify"))
+        check("...and the sweep that kept it arms its OWN next run — one transient timer, a minute past the reset — "
+              "because nothing on the box runs `work` on a clock, so a kept job used to wait for the next unrelated 👍",
+              len(armed()) == 1 and abs(int(armed()[0].split("=")[1]) - (nb + 60 - time.time())) <= 5)
+        seen = len(ran("gh pr view"))
+        quiet(cmd_work, [])
+        check("...and a sweep before then leaves it alone: not read, not counted, not touched",
+              len(ran("gh pr view")) == seen and read_json(job_path("myrepo", 7)) == kept)
+        kept["not_before"] = "2000-01-01T00:00:00Z"                # the reset has come
+        write_atomic(job_path("myrepo", 7), kept)
+        world[f"{BIN}/cc-limit status"] = (1, "clear\n")
+        quiet(cmd_work, [])
+        check("...and once the limit has lifted the same job is read, gated and merged with nobody re-approving it",
+              len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7))
+              and reacted[-1][1] == "white_check_mark")
+        check("both ways the review reports a limit defer, and a verdict never does — matched on the fixed prefixes "
+              "review() raises with, since a verdict's prose may quote anything",
+              limited("no review: usage limit until 04:00Z (35m left) — the landing waits for the model")
+              and limited("the reviewer produced nothing, rc=1 (a Claude usage limit — `cc-limit status`) — no diff")
+              and not limited("DO-NOT-LAND on PR #7 ($0.42) — the landing stops here.\n1. x:1 — no review: usage limit")
+              and limit_until("nothing here") == "" and abs(epoch_of(stamp()) - time.time()) < 2
+              and epoch_of("not a stamp") == 0)
+        real_time, T = time.time, calendar.timegm((2026, 9, 1, 4, 0, 12, 0, 0, 0))
+        try:                        # the clock, held still: the minute cc-limit named against the second inside it
+            time.time = lambda: T                                  # 04:00:12, and the limit runs to 04:00:59
+            inside = limit_until("no review: usage limit until 04:00Z (1m left)")
+            time.time = lambda: T + 48                             # 04:01:00 — that minute is wholly behind us
+            after = limit_until("no review: usage limit until 04:00Z")
+        finally:
+            time.time = real_time
+        check("a reset inside the minute we are standing in is a wait of SECONDS, never of a day: cc-limit floors its "
+              "stamp to the minute, so at 04:00:12 'until 04:00Z' still lies ahead — compared whole-minute it read as "
+              "past and the job was deferred to 04:00 TOMORROW, an approved PR asleep 24 h (review of PR #154)",
+              inside == "2026-09-01T04:01:00Z" and after == "2026-09-02T04:01:00Z")
+
+        # (2) a red gate is a try, not a verdict
+        real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
+        try:
+            landing(**{GATE: (1, "  ✓ the first\n  ✗ H4: a HUP'd loop must kill its claude\n1 failed\n")})
+            quiet(cmd_work, [])
+            kept = read_json(job_path("myrepo", 7)) or {}
+            check("a red gate is a TRY, not a verdict: the job is kept with the ✗ line and the attempt counted, nothing "
+                  "merged, nobody told yet — the suite flakes (cc-slack's selfcheck, boarded apart), and a job that "
+                  "ENDED on a flake is what the 39 lanes were working around",
+                  kept.get("attempts") == 1 and (kept.get("last") or "").startswith("gates: gate core/tests/check.sh")
+                  and "✗ H4" in kept["last"] and not gh_merges() and not ran_sub("cc-slack", "post")
+                  and not ran("cc-notify") and armed() == [f"--on-active={RETRY_AFTER}"] and RETRY_AFTER == 900)
+            world[GATE] = (0, "  ✓ the first\n  ✓ H4\n0 failed\n")            # the flake passes this time
+            quiet(cmd_work, [])
+            check("...and the next sweep re-drives the same job: gated green, merged, one ✅ — no second 👍",
+                  len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7))
+                  and reacted[-1][1] == "white_check_mark" and len(ran_sub("cc-slack", "post")) == 1)
+            landing(**{GATE: (1, "  ✗ the row was wrong\n1 failed\n")})
+            for _ in range(LAND_TRIES):
+                quiet(cmd_work, [])
+            check("...while one that stays red stops after 3 tries and says NOT merged, once, with the ✗ line — never "
+                  "'the deploy stopped', since nothing merged",
+                  read_json(job_path("myrepo", 7)) is None and not gh_merges()
+                  and len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told()
+                  and "✗ the row was wrong" in told() and "after 3 tries" in told() and "old code" not in told()
+                  and len(ran("cc-notify", "landing stopped")) == 1)
+            landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n"),
+                       GATE: (1, "  ✗ H4: a HUP'd loop must kill its claude\n1 failed\n")})
+            quiet(cmd_work, [])                                  # the limit first: deferred, uncounted, PR unread
+            waited = read_json(job_path("myrepo", 7)) or {}
+            write_atomic(job_path("myrepo", 7), dict(waited, not_before="2000-01-01T00:00:00Z"))   # the reset comes
+            world[f"{BIN}/cc-limit status"] = (1, "clear\n")
+            quiet(cmd_work, [])                                  # ...and THEN the gate flakes
+            kept = read_json(job_path("myrepo", 7)) or {}
+            check("...and a gate that flakes AFTER a usage-limit deferral waits the retry gap, not the reset it has "
+                  "already spent: the old not_before goes with the try, so the re-run is armed 15 min out and the 3 "
+                  "tries stand 15 min apart — left on, it was read as the schedule and burned all three in two minutes",
+                  waited.get("not_before") and kept.get("attempts") == 1 and "not_before" not in kept
+                  and kept.get("stage") == "gates" and len(armed()) == 2
+                  and armed()[1] == f"--on-active={RETRY_AFTER}" and not gh_merges())
+            os.unlink(job_path("myrepo", 7))                     # kept, as it should be: drained by hand for the next
+        finally:
+            os.access = real_access
+            for f in glob.glob(f"{tempfile.gettempdir()}/cc-land-gate-myrepo-*.log"):
+                os.unlink(f)
+
+        # (3) a verdict and an unmergeable PR still end the job at once
+        landing(**{f"{CLAUDE} -p": (0, REVIEWED("LAND-AFTER-FIX", "a.py:9", "the call has no timeout", "name it"))})
+        quiet(cmd_work, [])
+        check("a LAND-AFTER-FIX still ends the job at once — a verdict is a decision about the PR, not the box's "
+              "weather: not kept, not re-armed, not re-bought, said once as NOT merged",
+              not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
+              and len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told() and "LAND-AFTER-FIX" in told()
+              and len([c for c in calls if c[0] == CLAUDE]) == 1)
+        landing(**{"gh pr view": (0, json.dumps(dict(FACTS, mergeable="CONFLICTING")))})
+        quiet(cmd_work, [])
+        check("...and a PR that CONFLICTS with its base fails in the gates step but is no flake: ended at once, "
+              "unarmed, told to rebase",
+              not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
+              and "conflicts with main" in told() and "NOT merged" in told())
 
         fresh(pr=7)
         world["gh pr merge"] = (1, "failed to merge: Merge already in progress")
