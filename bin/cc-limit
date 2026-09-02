@@ -4,15 +4,452 @@
 #   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0, or "clear" + exit 1
 #   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT
 #   cc-limit clear     forget it (every caller does this after a run that reached the API)
+#   cc-limit record [--dry] [<pane|window-id> <window>]   note an INTERACTIVE session the limit interrupted (no
+#                      args = every live session, answering with the best code it found). exit 0 = recorded ·
+#                      2 = the pane IS sitting on the limit but this is not a record (nothing corroborates it yet,
+#                      no reset time yet, or it was nudged inside the half hour) — a caller must not type there
+#                      either · 1 = no limit line at all
+#   cc-limit resume    nudge each recorded session whose reset has passed, ONCE, then forget it
+#   cc-limit selfcheck the record/resume state machine, on stubs
 # Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>\t<model-family>" — shared, so a second
 # loop waits instead of burning its retries; the model is what cc-model needs to know whose limit it was (may be empty
 # when the message names none). No secrets in it. Env: CC_LIMIT_MAX_WAIT (default 21600 = 6 h)
 # · CC_LIMIT_MIN_WAIT (test hook: cap any sleep at N seconds) · CC_LIMIT_STAMP (test hook: put the stamp somewhere
-#   else, so a test limit never makes the box's real loops wait).
+#   else, so a test limit never makes the box's real loops wait) · CC_LIMIT_RECORD · CC_LIMIT_NUDGED · CC_LIMIT_ARM
+#   (test hook: what to arm with — it is called as `<seconds> <unit-name>`; "-" = arm nothing) · CC_LIMIT_NOW
+#   · CC_LIMIT_BIN · CC_TMUX_SESSION.
+#
+# RESUMING AN INTERACTIVE SESSION. A headless worker parks and reruns itself at the reset; an interactive session just
+# prints the limit line and sits at its prompt, and the turn it was in the middle of is lost until a human comes back.
+# So: whoever notices the line (cc-pulse on its rounds, or `check` on the run that hit the same limit) calls `record`,
+# which writes <pane-id, window, reset-epoch> to ~/.cc/state/limit-interrupted and arms a ONE-SHOT systemd-run timer at
+# the reset — no new always-on unit. At the reset `resume` types one line into each recorded session through cc-msg
+# (which owns the dialog guard and the "is anyone there" test) and forgets it. One nudge per record, ever: a session
+# whose pane no longer shows the limit line moved on by itself and is skipped, and a record whose reset has moved out
+# is rescheduled rather than sent early, and a pane nudged in the last half hour is not recorded again — the limit
+# line stays on its screen after it comes back, and a stale line must not buy a second nudge.
+# A pane line alone is not proof — this box's own docs and briefs say "usage limit" too — so a record needs the line
+# AND corroboration: the shared stamp is live, or cc-model itself judged a limit recently — a live
+# ~/.cc/state/model-override, or a switch in ~/.cc/state/model.log inside the last 6 h. Both files are cc-model's;
+# this reads them and writes neither. The hashes in ~/.cc/state/model-seen are NOT corroboration: cc-model banks one
+# for every probe it adjudicated, "was not a live limit" included.
 set -uo pipefail
-BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
-S="${CC_LIMIT_STAMP:-$HOME/.cc/state/claude-limit}"; now=$(date -u +%s); MAX="${CC_LIMIT_MAX_WAIT:-21600}"
+SELF=$(readlink -f "$0")
+BIN="${CC_LIMIT_BIN:-$(dirname "$SELF")}"   # siblings come from the same bin/ as this copy
+S="${CC_LIMIT_STAMP:-$HOME/.cc/state/claude-limit}"; MAX="${CC_LIMIT_MAX_WAIT:-21600}"
+REC="${CC_LIMIT_RECORD:-$HOME/.cc/state/limit-interrupted}"
+NUDGED="${CC_LIMIT_NUDGED:-$HOME/.cc/state/limit-nudged}"; QUIET=1800   # see nudged_recently
+SEEN="${CC_LIMIT_SEEN:-$HOME/.cc/state/limit-seen}"; JUDGE=3600         # see first_seen: how long an uncorroborated line stays "not judged yet"
+now="${CC_LIMIT_NOW:-$(date -u +%s)}"; DRY=""
+# What a session shows when the limit stopped it. Tighter than cc-model's (which only decides which MODEL to use):
+# this one ends in a message typed at a human's session, so prose that merely mentions limits must not match.
+PANE_RE='usage limit reached|out of usage credits|limit will reset|limit reached.*reset'
+TAIL=15   # the pane's LAST 15 visible lines (capture-pane piped through tail). A session STOPPED by the limit
+          # shows that line just above its input box; higher up may be anything — including a file that quotes
+          # the wording. Narrow beats clever: the window is read again at the reset, before anything is typed.
 stamp(){ ends=0; src=""; first=0; mdl=""; [ -f "$S" ] && IFS=$'\t' read -r ends src first mdl < "$S"; [[ "$ends" =~ ^[0-9]+$ ]] || ends=0; [[ "$first" =~ ^[0-9]+$ ]] || first=0; }
+
+parse_reset(){   # a reset time named anywhere in $1 -> $u (epoch; 0 = the message named none) and $how (how it was read)
+  local txt="$1" m c n z tz=UTC
+  local RS='reset[a-z]*[^0-9]{0,8}'   # "resets at ", "reset: ", "resets " — a bare timestamp in a log line must not count
+  z=$(grep -oE '[A-Za-z]+/[A-Za-z_]+' <<<"$txt" | head -1); [ -n "$z" ] && [ -f "/usr/share/zoneinfo/$z" ] && tz="$z"
+  u=0; how=""; rolled=0
+  if m=$(grep -oiE "${RS}[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?" <<<"$txt" | head -1) && [ -n "$m" ]; then
+    u=$(TZ="$tz" date -d "$(grep -oE '[0-9]{4}-.*' <<<"$m")" +%s 2>/dev/null); how=iso
+  elif m=$(grep -oiE 'reset[a-z]* in +[0-9]+ *[a-z]+' <<<"$txt" | head -1) && [ -n "$m" ]; then
+    n=$(grep -oE '[0-9]+' <<<"$m"); case "$(grep -oiE '[a-z]+$' <<<"$m" | tr A-Z a-z)" in
+      h*) u=$((now + n * 3600));; s*) u=$((now + n));; *) u=$((now + n * 60));; esac; how=in
+  elif m=$(grep -oiE "${RS}[0-9]{1,2}(:[0-9]{2})? *(am|pm)?" <<<"$txt" | head -1) && [ -n "$m" ]; then
+    c=$(grep -oiE '[0-9]{1,2}(:[0-9]{2})? *(am|pm)?$' <<<"$m")
+    u=$(TZ="$tz" date -d "$c" +%s 2>/dev/null)                                        # a clock time
+    [ -n "$u" ] && [ "$u" -le "$now" ] && { u=$(TZ="$tz" date -d "tomorrow $c" +%s 2>/dev/null); rolled=1; }   # …already past today = tomorrow
+    how="at"
+  fi
+  [[ "${u:-0}" =~ ^[0-9]+$ ]] || u=0; }
+
+# ---- interactive sessions: record what the limit interrupted, nudge it once when the limit lifts
+corroborated(){   # $1 pane, $2 window (unused — kept for the callers). The stamp is live, or cc-model itself
+                  # JUDGED a limit recently: a live override, or a `switch` in model.log (the only event it writes
+                  # that means "a limit moved this box"). model-seen is NOT proof — cc-model banks that hash for
+                  # every probe that DECIDED, including "was not a live limit" (review of #171).
+  stamp; [ "$ends" -gt "$now" ] && return 0
+  [ -s "$HOME/.cc/state/model-override" ] && return 0
+  awk -F'\t' -v c=$((now - 21600)) '$3=="switch" && ($2+0)>c{f=1} END{exit !f}' \
+    "$HOME/.cc/state/model.log" 2>/dev/null; }
+
+first_seen(){   # $1 pane, $2 the limit line -> the epoch THIS sighting of THAT line was first seen (stamped on first
+                # sight, not in --dry). It bounds the window in which nothing corroborates the line yet: cc-model
+                # needs up to a minute to judge a live limit, not for ever — an old episode's wording, or a pane
+                # merely SHOWING the words, would otherwise keep the pulse away from that session for good
+                # (review-171b).
+                # KEYED ON THE LINE, not the pane alone. A row per pane, kept for ever, expires that pane's window
+                # permanently: a pane that showed the wording on Monday is read as old news when the limit really
+                # stops it on Wednesday, so record answers 1 and the pulse types at a limited session (review of
+                # #171). Ageing the row out instead would re-open the window for a line that never left the screen,
+                # which is the case review-171b closed. The line's own text separates the two: a new limit prints a
+                # new line, and that is a new sighting with its own hour. Rows older than a day are dropped on the
+                # way through, the way note_nudge prunes its own.
+  local k t
+  k="$1:$(printf '%s' "$2" | md5sum | cut -c1-16)"
+  t=$(awk -F'\t' -v k="$k" '$1==k{print $2+0; exit}' "$SEEN" 2>/dev/null)
+  if [ -z "$t" ]; then
+    t=$now
+    [ -n "$DRY" ] || { mkdir -p "$(dirname "$SEEN")"
+      { [ -f "$SEEN" ] && awk -F'\t' -v k="$k" -v c=$((now - 86400)) '$1!=k && ($2+0)>c' "$SEEN"
+        printf '%s\t%s\n' "$k" "$now"; } > "$SEEN.t"; mv "$SEEN.t" "$SEEN"; }
+  fi
+  echo "$t"; }
+nudged_recently(){   # $1 pane. The limit line does not leave the pane when the session comes back, so the SAME stale
+                    # line would be read as a fresh interruption on the next round and buy a second nudge. One nudge
+                    # per pane per half hour, then; a genuine new limit is hours away, far outside this window.
+  local t; t=$(awk -F'\t' -v p="$1" '$1==p{print $2+0; exit}' "$NUDGED" 2>/dev/null)
+  [ "${t:-0}" -gt $((now - QUIET)) ]; }
+
+note_nudge(){   # $1 pane; entries older than a day are dropped on the way through
+  mkdir -p "$(dirname "$NUDGED")"
+  { [ -f "$NUDGED" ] && awk -F'\t' -v p="$1" -v c=$((now - 86400)) '$1!=p && ($2+0)>c' "$NUDGED"
+    printf '%s\t%s\n' "$1" "$now"; } > "$NUDGED.t"; mv "$NUDGED.t" "$NUDGED"; }
+
+arm(){   # one-shot at the earliest reset still on file. NOT a unit that lives on the box: systemd-run makes a transient
+         # timer that fires once and disposes of itself, so a box with nothing recorded runs nothing.
+  local at secs real unit mine u
+  at=$(awk -F'\t' '($3+0)>0 && (m==0 || ($3+0)<m){m=$3+0} END{print m+0}' "$REC" 2>/dev/null)
+  [ "${at:-0}" -gt 0 ] || return 0
+  secs=$((at - now + 15)); [ "$secs" -lt 15 ] && secs=15   # a few seconds past the reset: the limit lifts on their clock
+  unit="cc-limit-resume-$at"   # ONE TRANSIENT UNIT PER RESET TIME — see the sweep below for why the name must differ
+  if [ -n "${CC_LIMIT_ARM:-}" ]; then [ "$CC_LIMIT_ARM" = - ] || "$CC_LIMIT_ARM" "$secs" "$unit" >/dev/null 2>&1; return 0; fi
+  real=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
+  { [ -n "$real" ] && [ "$HOME" != "$real" ]; } && return 0   # a test HOME never arms a timer on the real box
+  command -v systemd-run >/dev/null 2>&1 || return 0
+  # Clear the arming this one supersedes — but NEVER the unit this process is running under. `resume` re-arms
+  # whatever it left on file, and when resume IS the one-shot, stopping its own unit SIGTERMs the whole cgroup,
+  # which is this shell: the systemd-run below would never run and every record still on file would lose its timer
+  # (review of #171). The names cannot collide — an arming is always for a reset in the future, and ours has fired.
+  mine=$(grep -oE 'cc-limit-resume-[0-9]+\.service' /proc/self/cgroup 2>/dev/null | tail -1)
+  for u in $(systemctl --user list-units --all --plain --no-legend 'cc-limit-resume-*' 2>/dev/null | awk '{print $1}'); do
+    case "$u" in "$mine" | "${mine%.service}.timer") continue ;; esac
+    systemctl --user stop "$u" >/dev/null 2>&1; systemctl --user reset-failed "$u" >/dev/null 2>&1
+  done
+  systemd-run --user --quiet --unit="$unit" --on-active="${secs}s" --timer-property=AccuracySec=5 \
+    "$SELF" resume >/dev/null 2>&1 || true; }
+
+record(){   # $1 pane id, or a window id/name to resolve  $2 window name
+            # exit 0 = recorded · 2 = the pane is on the limit, this is not a record · 1 = no limit line there
+  # `u` and `how` are LOCAL because parse_reset writes them as globals: `check` parses its own reset, then calls
+  # scan -> record at the end, and without this line that record's parse_reset overwrites the epoch check is about
+  # to print — "LIMIT 0", and the owner is told the limit resumes at 00:00Z (review of #171).
+  local pane="$1" win="$2" cap line at old p u how rolled from_pane=0
+  # A window id or a window name is accepted and resolved to the PANE id first: the record is keyed on the pane, so
+  # cc-pulse (which holds window ids) and scan (which holds pane ids) write one record for a session, not two — and
+  # two records for one session is two nudges.
+  p=$(tmux display-message -p -t "$pane" '#{pane_id}' 2>/dev/null | head -1); case "$p" in %[0-9]*) pane="$p";; esac
+  cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null | tail -n "$TAIL")   # the LAST lines: -S sets a history start, it does not bound the read
+  line=$(grep -iE "$PANE_RE" <<<"$cap" | tail -1); [ -n "$line" ] || return 1
+  # Past this line the pane IS sitting on the limit, and every "no" below is exit 2, not 1: a caller that read a
+  # plain failure as "nothing wrong here" would type at a limited session, which is what cc-pulse must not do.
+  nudged_recently "$pane" && return 2
+  if ! corroborated "$cap" "$win"; then
+    # Nothing corroborates the line. For its first hour that means "cc-model has not judged it yet" — exit 2, no
+    # tick. After that it is scrollback (an episode hours old, or a pane just showing the words) and the pane is
+    # safe to tick: exit 1. Left open-ended, exit 2 stopped the pulse waking that session for good (review-171b).
+    [ $((now - $(first_seen "$pane" "$line"))) -lt "$JUDGE" ] && return 2
+    return 1
+  fi
+  # A reset the stamp only GUESSED is not a reset. `check` writes src=backoff:N when the message named no time, and
+  # a nudge at that guess reaches a session that is still limited — and spends the one nudge that was owed at the
+  # real time. So a backoff stamp is passed over and the pane's own wording is read instead.
+  stamp; at=0; case "$src" in backoff:*) ;; *) [ "$ends" -gt "$now" ] && at="$ends";; esac
+  if [ "$at" = 0 ]; then
+    parse_reset "$cap"; from_pane=1
+    # A clock time the pane names that is already past is NOT tomorrow's. parse_reset rolls it over because `check`
+    # hands it a fresh message; a screen is of unknown age, and the rollover recorded a session for a day out
+    # (review-171c). So the rollover is never recorded — and a record already on file stays exactly where it is.
+    # …and a pane whose ONLY named reset is already past is safe to type at: exit 1, not 2 — exit 2 kept the pulse away
+    # from that session for hours after its limit had lifted (review-171e). A record already on file stays where it is.
+    [ "${rolled:-0}" = 1 ] && return 1
+    [ "$u" -gt "$now" ] && at="$u"
+  fi
+  [ "$at" -gt "$now" ] || return 2   # limited, but no reset time yet: whoever looks next records it once there is one
+  old=0; [ -f "$REC" ] && old=$(awk -F'\t' -v p="$pane" '$1==p{print $3+0; exit}' "$REC")
+  # A pane re-read never moves a record out: its line is stale text, and "in 30 minutes" is 30 minutes from whenever
+  # it is read — every round pushed the record past its own due time and the nudge was never sent (review-171c).
+  # Only a live stamp, a reset the API itself named, moves an existing record — and never shorter.
+  [ "$from_pane" = 1 ] && [ "${old:-0}" -gt 0 ] && at="$old"
+  [ "${old:-0}" -gt "$at" ] && at="$old"   # one record per pane, and a record is never shortened
+  [ -n "$DRY" ] && { printf 'would record %s (%s) until %sZ\n' "$win" "$pane" "$(date -u -d "@$at" +%H:%M)"; return 0; }
+  mkdir -p "$(dirname "$REC")"
+  { [ -f "$REC" ] && awk -F'\t' -v p="$pane" '$1!=p' "$REC"; printf '%s\t%s\t%s\n' "$pane" "$win" "$at"; } > "$REC.t"
+  mv "$REC.t" "$REC"; arm
+  printf 'recorded %s (%s) until %sZ\n' "$win" "$pane" "$(date -u -d "@$at" +%H:%M)"; }
+
+live_claude(){   # is there an interactive `claude` ANYWHERE under pane pid $1? The DIRECT-child test was wrong here in
+                 # the one case that matters: a `cc-handoff --overlap` successor runs `bash -c '… cc __runnext …'`,
+                 # so its claude is a GRANDCHILD, and calling that session dead is never recording the very session
+                 # this file exists to rescue (review of #171). Same subtree walk cc-msg and cc-pulse make; `-p` is
+                 # excluded because a headless worker parks and reruns itself and has no prompt to type into.
+  local pid
+  for pid in $(ps -eo pid=,ppid=,comm= | awk -v root="${1:-0}" '
+        { kids[$2] = kids[$2] " " $1; name[$1] = $3 }
+        END { q[1] = root; n = 1                                     # breadth-first over the pane subtree
+              for (i = 1; i <= n; i++) { m = split(kids[q[i]], c, " "); for (j = 1; j <= m; j++) q[++n] = c[j] }
+              for (i = 2; i <= n; i++) if (name[q[i]] == "claude") print q[i] }'); do
+    tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qx -e '-p' -e '--print' || return 0
+  done
+  return 1; }
+
+scan(){   # every live INTERACTIVE session under this tmux session
+  local id pp name rc=1 r
+  while read -r id pp name; do
+    [ -n "${pp:-}" ] || continue
+    live_claude "$pp" || continue
+    pgrep -P "$pp" -f cc-loop >/dev/null 2>&1 && continue   # a headless worker's pane: it parks and reruns itself
+    record "$id" "$name"; r=$?
+    case "$r" in 0) rc=0 ;; 2) [ "$rc" = 1 ] && rc=2 ;; esac   # the best of what it found, so the whole-box form
+  done < <(tmux list-panes -s -t "${CC_TMUX_SESSION:-main}" -F '#{pane_id} #{pane_pid} #{window_name}' 2>/dev/null)
+  return "$rc"; }                                             # answers in the same three codes as one pane does
+
+resume(){   # everything due, once each; everything not due, left exactly where it was
+  [ -s "$REC" ] || return 0
+  local pane win at cap keep=""
+  while IFS=$'\t' read -r pane win at; do
+    { [ -n "${pane:-}" ] && [[ "${at:-}" =~ ^[0-9]+$ ]]; } || continue
+    if [ "$at" -gt "$now" ]; then keep+="$pane	$win	$at"$'\n'; continue; fi   # nothing is sent before the reset
+    stamp
+    if [ "$ends" -gt "$now" ]; then keep+="$pane	$win	$ends"$'\n'   # the limit moved out: wait for the new time
+      printf '%s: reset moved to %sZ — not nudged\n' "$win" "$(date -u -d "@$ends" +%H:%M)"; continue; fi
+    cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null | tail -n "$TAIL")   # same bounded read as record()
+    grep -qiE "$PANE_RE" <<<"$cap" || { printf '%s: moved on already — no nudge\n' "$win"; continue; }
+    # Dropped whether or not cc-msg got through. A nudge is worth one try: retrying is how a session behind a dialog
+    # gets typed at over and over, and the pulse still comes round.
+    note_nudge "$pane"   # before the send, and whether or not it lands: one try is one try
+    if "$BIN/cc-msg" "$win" "usage limit lifted at $(date -u -d "@$at" +%H:%M)Z — continue the turn you were on; your journal and board say where you were" </dev/null >/dev/null 2>&1
+    then printf '%s: nudged\n' "$win"; else printf '%s: cc-msg would not type there — dropped, not retried\n' "$win"; fi
+  done < "$REC"
+  if [ -n "$keep" ]; then printf '%s' "$keep" > "$REC"; arm; else rm -f "$REC"; fi; }
+
+selfcheck(){   # stubs only: its own HOME, a stub tmux and cc-msg, and a clock it is handed. No tmux server, no timer,
+               # no session on this box is read or written.
+  local d n=0 bad=0 t0=1000000000 t1 t2 t3 t4 rc h out deep work
+  d=$(mktemp -d) || return 1
+  t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
+  mkdir -p "$d/bin" "$d/.cc/state" "$d/panes"
+  cat > "$d/bin/tmux" <<'EOF'
+#!/usr/bin/env bash
+# selfcheck stub: capture-pane prints $CC_FAKE_PANES/<pane-id>, or nothing when that pane is gone; display-message
+# resolves a window id to a pane id out of $CC_FAKE_PANES/<id>.id, the way tmux does; list-panes reads the fake
+# session out of $CC_FAKE_PANELIST ("<pane-id> <pane-pid> <window>" lines, the format scan asks for).
+set -u; cmd="${1:-}"; shift || true; targ=""
+while [ $# -gt 0 ]; do case "$1" in -t) targ="${2:-}"; shift 2;; *) shift;; esac; done
+case "$cmd" in
+  display-message) cat "$CC_FAKE_PANES/$targ.id" 2>/dev/null;;
+  capture-pane) cat "$CC_FAKE_PANES/$targ" 2>/dev/null;;
+  list-panes) cat "${CC_FAKE_PANELIST:-/dev/null}" 2>/dev/null;;
+esac
+exit 0
+EOF
+  cat > "$d/bin/cc-msg" <<'EOF'
+#!/usr/bin/env bash
+set -u; printf 'msg %s :: %s\n' "${1:-}" "${2:-}" >> "$CC_FAKE_CALLS"
+EOF
+  cat > "$d/bin/arm" <<'EOF'
+#!/usr/bin/env bash
+set -u; printf 'arm %s %s\n' "${1:-}" "${2:-}" >> "$CC_FAKE_CALLS"
+EOF
+  chmod +x "$d/bin/tmux" "$d/bin/cc-msg" "$d/bin/arm"
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
+  : > "$d/calls"
+  # EVERY CC_LIMIT_* path is pinned under $d, not just inherited from HOME: a caller may hold its own in the
+  # environment — selftest.sh exports CC_LIMIT_STAMP so that a test limit never makes a real loop wait — and a
+  # selfcheck that read the caller's stamp would be testing the caller's state instead of its own fixtures.
+  me(){ local at="$1"; shift; HOME="$d" PATH="$d/bin:$PATH" CC_LIMIT_BIN="$d/bin" CC_LIMIT_ARM="$d/bin/arm" \
+    CC_LIMIT_STAMP="$d/.cc/state/claude-limit" CC_LIMIT_RECORD="$d/.cc/state/limit-interrupted" \
+    CC_LIMIT_NUDGED="$d/.cc/state/limit-nudged" CC_LIMIT_SEEN="$d/.cc/state/limit-seen" \
+    CC_FAKE_PANES="$d/panes" CC_FAKE_CALLS="$d/calls" CC_FAKE_PANELIST="$d/panes.list" \
+    CC_LIMIT_NOW="$at" bash "$SELF" "$@"; }
+  calls(){ grep -c "$1" "$d/calls" 2>/dev/null | tr -d '\n'; }
+
+  me "$t0" record @1 alpha >/dev/null 2>&1
+  t 'a limit line ALONE is not recorded (this box says "usage limit" in its own docs)' \
+    "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
+  printf '%s\t%s\t%s\t%s\n' "$((t0 + 1800))" iso "$t0" fable > "$d/.cc/state/claude-limit"
+  out=$(me "$t0" record --dry @1 alpha 2>&1)
+  t '--dry says what it would record and writes nothing' \
+    "$(grep -c would <<<"$out")$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" 1no
+  me "$t0" record @1 alpha >/dev/null 2>&1
+  t 'an interrupted session is recorded as <pane, window, reset>' \
+    "$(cat "$d/.cc/state/limit-interrupted" 2>/dev/null)" "$(printf '@1\talpha\t%s' $((t0 + 1800)))"
+  t 'recording arms ONE one-shot, a few seconds past the reset, in a unit named for that reset' \
+    "$(grep -c "^arm 181[0-9] cc-limit-resume-$((t0 + 1800))\$" "$d/calls")" 1
+  me "$t0" record @1 alpha >/dev/null 2>&1
+  t 'the same pane twice is one record, not two' "$(wc -l < "$d/.cc/state/limit-interrupted")" 1
+
+  me $((t0 + 60)) resume >/dev/null 2>&1
+  t 'NOTHING is sent before the reset, and the record survives' \
+    "$(calls '^msg ')$(wc -l < "$d/.cc/state/limit-interrupted")" 01
+  me $((t0 + 1900)) resume >/dev/null 2>&1
+  t 'at the reset the session is nudged, once, through cc-msg' "$(calls '^msg alpha ')" 1
+  t 'the nudge names the time and points at the journal and the board' \
+    "$(grep -c 'usage limit lifted at .*Z — continue the turn you were on; your journal and board say where you were' "$d/calls")" 1
+  t 'and the record is cleared by the nudge' "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
+  me $((t0 + 1901)) resume >/dev/null 2>&1
+  t 'a second resume nudges nobody: one message per interruption, ever' "$(calls '^msg alpha ')" 1
+  # The pane still shows the line it was stopped by — the nudge does not wipe its screen. Recording that stale line
+  # again is the OTHER way one interruption becomes two nudges, and the live stamp below is there so the quiet
+  # window is the only thing refusing it.
+  printf '%s\t%s\t%s\t%s\n' "$((t0 + 3700))" iso "$t0" fable > "$d/.cc/state/claude-limit"
+  me $((t0 + 1902)) record @1 alpha >/dev/null 2>&1
+  t 'the stale limit line on a pane just nudged is not a second record' \
+    "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
+
+  # cc-model's own VERDICT stands in for the stamp once the stamp has expired: a switch event in model.log.
+  # The banked hash in model-seen does NOT — it is written for every adjudicated probe, "not a live limit" included.
+  t1=$((t0 + 7200))   # the rest of the cases are a later episode: past the quiet window the nudge above opened
+  h=$(printf '%s' "alpha$(grep -iE "$PANE_RE" "$d/panes/@1" | tail -1)" | md5sum | cut -c1-16)
+  printf '%s\n' "$h" > "$d/.cc/state/model-seen"; rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted"
+  me "$t1" record @1 alpha >/dev/null 2>&1
+  t 'the banked probe hash alone corroborates nothing: adjudicated is not limited' \
+    "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t1 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  me "$t1" record @1 alpha >/dev/null 2>&1
+  t 'a switch cc-model judged corroborates it with no live stamp, and the pane names the reset' \
+    "$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" $((t1 + 1800))
+  printf '> \n' > "$d/panes/@1"   # the session came back by itself
+  me $((t1 + 1900)) resume >/dev/null 2>&1
+  t 'a session that moved on is skipped, not nudged, and forgotten' \
+    "$(calls '^msg alpha ')$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" 1no
+  me "$t1" record @9 gone >/dev/null 2>&1
+  t 'a pane that shows no limit at all is not a record' \
+    "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
+
+  # cc-pulse holds WINDOW ids and `scan` holds pane ids: one session must not become two records, which is two nudges.
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/%7"
+  printf '%s\n' '%7' > "$d/panes/@5.id"
+  printf '%s\t%s\t%s\t%s\n' "$((t1 + 1800))" iso "$t1" fable > "$d/.cc/state/claude-limit"
+  me "$t1" record @5 alpha >/dev/null 2>&1; me "$t1" record %7 alpha >/dev/null 2>&1
+  t 'a window id and a pane id for the same session are ONE record' \
+    "$(wc -l < "$d/.cc/state/limit-interrupted")$(cut -f1 "$d/.cc/state/limit-interrupted")" '1%7'
+
+
+  # FINDING 1 (review of #171): two sessions, two resets. The one-shot that fires for the first has to leave a timer
+  # behind for the second — an arming that stopped the unit it was running in would SIGTERM this shell before it got
+  # there, and the second session would wait for a pulse that may never come. Each arming names its own unit.
+  t2=$((t1 + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/claude-limit" "$d/.cc/state/limit-nudged"
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
+  printf 'Claude usage limit reached. Your limit will reset in 60 minutes\n> \n' > "$d/panes/%7"
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t2 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  me "$t2" record @1 alpha >/dev/null 2>&1; me "$t2" record %7 beta >/dev/null 2>&1
+  t 'two interrupted sessions are two records, and the arming is for the EARLIER reset' \
+    "$(wc -l < "$d/.cc/state/limit-interrupted")$(tail -1 "$d/calls" | cut -d' ' -f3)" "2cc-limit-resume-$((t2 + 1800))"
+  : > "$d/calls"
+  me $((t2 + 1815)) resume >/dev/null 2>&1
+  t 'the first reset nudges only the first, and the second is still on file' \
+    "$(calls '^msg alpha ')$(calls '^msg beta ')$(wc -l < "$d/.cc/state/limit-interrupted")" 101
+  t 'and that same run arms a NEW unit for the second — never the one it is running in' \
+    "$(grep -c "^arm [0-9]* cc-limit-resume-$((t2 + 3600))\$" "$d/calls")" 1
+
+  # FINDING 2: `check` writes a 5-minute GUESS into the stamp (src=backoff:N) when the message named no time. A nudge
+  # at a guess reaches a session that is still limited, and spends the one nudge that was owed at the real reset.
+  t3=$((t2 + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"; : > "$d/calls"
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
+  printf '%s\t%s\t%s\t%s\n' "$((t3 + 300))" backoff:5 "$t3" fable > "$d/.cc/state/claude-limit"
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t3 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  me "$t3" record @1 alpha >/dev/null 2>&1
+  t 'a backoff GUESS is not a reset: the time the PANE names is recorded, not the guess' \
+    "$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" $((t3 + 1800))
+
+  # THE EXIT CODE IS A CONTRACT (finding 4): cc-pulse reads it to decide whether that pane may be typed at, so
+  # "limited, and I am not recording it" must not look like "nothing to see here".
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
+  printf 'Claude usage limit reached.\n> \n' > "$d/panes/@3"   # limited, and names no reset at all
+  me "$t3" record @3 gamma >/dev/null 2>&1; rc=$?
+  t 'a guess and a pane with no time = nothing recorded, and exit 2: the pane is still limited' \
+    "$rc$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" 2no
+  me "$t3" record @9 gone >/dev/null 2>&1; rc=$?
+  t 'a pane with no limit line at all is exit 1 — that one IS safe to type at' "$rc" 1
+  rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/model.log" "$d/.cc/state/limit-seen"   # a line first seen NOW
+  me "$t3" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'a limit line nothing corroborates yet is exit 2, not 1: it is still a limited pane' "$rc" 2
+  me "$((t3 + 7200))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'the same line two hours later, still uncorroborated, is exit 1: scrollback, not a limit — that pane may be ticked (review-171b)' "$rc" 1
+  # …and the other half of that rule, which a row kept per PANE would get wrong: two days on, the limit really
+  # stops this session, so the pane shows a NEW line. That is a new sighting with its own hour — reading the old
+  # one as "old news" is how the pulse comes to type at a session the limit has just stopped (review of #171).
+  printf 'Claude usage limit reached. Your limit will reset at 2026-09-04 19:00Z\n> \n' > "$d/panes/@1"
+  me "$((t3 + 172800))" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'a NEW limit line on a pane that showed the wording days ago is exit 2, not 1 — the old sighting is not this one' \
+    "$rc" 2
+  t 'and the day-old row is dropped on the way through, so the file does not grow for ever' \
+    "$(wc -l < "$d/.cc/state/limit-seen")" 1
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t3 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  me "$t3" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'and a pane that becomes a record is exit 0' "$rc$(cut -f3 "$d/.cc/state/limit-interrupted")" "0$((t3 + 1800))"
+  me "$t3" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'a pane already on file is recorded again, not refused — the record is one row, and it stays exit 0' \
+    "$rc$(wc -l < "$d/.cc/state/limit-interrupted")" 01
+
+
+  # FINDING 2 (review of #171, third round): a `cc-handoff --overlap` successor runs `bash -c '… cc __runnext …'`,
+  # so its claude is a GRANDCHILD of the pane — and the direct-child test called that session dead and never
+  # recorded the very session this file exists to rescue. Real processes, because the walk reads /proc: a COPY OF
+  # BASH named claude, since `ps` and the `-p` test both read the name the kernel holds.
+  t4=$((t3 + 7200)); rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"
+  cp "$(readlink -f /bin/bash)" "$d/bin/claude"
+  bash -c "bash -c \"'$d/bin/claude' -c 'sleep 20; true'; true\"; true" </dev/null >/dev/null 2>&1 &
+  deep=$!
+  bash -c "'$d/bin/claude' -p -c 'sleep 20; true'; true" </dev/null >/dev/null 2>&1 &
+  work=$!
+  sleep 0.6                                    # both panes need their children to exist before anything walks them
+  printf '@1 %s alpha\n@2 %s beta\n' "$deep" "$work" > "$d/panes.list"
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
+  printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@2"
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t4 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  me "$t4" record >/dev/null 2>&1
+  t 'a session whose claude is a GRANDCHILD is scanned and recorded, not called dead' \
+    "$(cut -f1,2 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "$(printf '@1\talpha')"
+  t 'and a pane whose only claude is headless is left out — it parks and reruns itself' \
+    "$(grep -c '^@2' "$d/.cc/state/limit-interrupted" 2>/dev/null)" 0
+
+  # FINDING 1: `check` prints LIMIT <epoch> AFTER that scan, and parse_reset writes $u as a global. A record made
+  # for some other pane must not rewrite the reset this run is about to print — "LIMIT 0" is what the owner reads
+  # as "resumes at 00:00Z". The pane says 30 minutes, the message below names no time at all, so the stamp's own
+  # 5-minute backoff is the only right answer to print.
+  rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-seen"
+  printf '{"is_error":true,"result":"API Error 429 too many requests"}\n' > "$d/run.json"
+  out=$(me "$t4" check "$d/run.json" 2>/dev/null)
+  t 'the scan at the end of `check` cannot rewrite the reset check prints' "$out" "LIMIT $((t4 + 300))"
+  t 'and that same run did record the pane, at the time the PANE named, not the backoff guess' \
+    "$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" $((t4 + 1800))
+  kill "$deep" "$work" >/dev/null 2>&1; pkill -f "$d/bin/claude" >/dev/null 2>&1   # $d is a fresh mktemp: matches nothing else
+
+  # FINDING 1 (review-171c): a pane's line is STALE TEXT. Re-reading "in 30 minutes" on every round moved the record
+  # 30 minutes past each read, so the nudge owed at the reset was never sent. A pane re-read never moves a record.
+  t5=$((t4 + 7200)); rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen"; : > "$d/calls"
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((t5 - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  me "$t5" record @1 alpha >/dev/null 2>&1                     # recorded at T for T+1800
+  me "$((t5 + 7200))" record @1 alpha >/dev/null 2>&1; rc=$?   # the same unchanged pane, two hours later
+  t 'a record re-read from the same stale pane two hours on still says its ORIGINAL reset' \
+    "$rc$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "0$((t5 + 1800))"
+  me "$((t5 + 7200))" resume >/dev/null 2>&1
+  t 'and the resume in that same round nudges it — the reset is long past' "$(calls '^msg alpha ')" 1
+  # The absolute form was worse: "reset at 3pm" re-read at 16:00 rolled over to TOMORROW's 3pm in one step. In
+  # `record` a clock time already past is "no reset time yet". Real clock: parse_reset's clock times are today's,
+  # and today's 00:00 is the one clock time that is always already past.
+  nowr=$(date -u +%s); mid=$(date -u -d "00:00" +%s)
+  rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"; : > "$d/calls"
+  printf 'Claude usage limit reached. Your limit will reset at 00:00\n> \n' > "$d/panes/@1"
+  printf '%s\t%s\tswitch\t%s\t%s\n' iso "$((nowr - 60))" claude-opus-5 "1 session(s); test" > "$d/.cc/state/model.log"
+  me "$((mid - 7200))" record @1 alpha >/dev/null 2>&1         # last evening: 00:00 was still ahead
+  t 'a clock time still ahead is recorded for today' "$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "$mid"
+  me "$nowr" record @1 alpha >/dev/null 2>&1; rc=$?
+  t 'the same line once that time has passed is NOT rolled over to tomorrow: exit 1 (safe to tick), record untouched' \
+    "$rc$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" "1$mid"
+  me "$nowr" resume >/dev/null 2>&1
+  t 'and resume nudges it now, not tomorrow' "$(calls '^msg alpha ')" 1
+
+  rm -rf "$d"; printf 'cc-limit selfcheck: %d passed, %d failed\n' $((n - bad)) "$bad"; [ "$bad" = 0 ]; }
+
 case "${1:-}" in
   clear) rm -f "$S"; exit 0 ;;
   status) stamp; [ "$ends" -gt "$now" ] || { echo clear; exit 1; }
@@ -20,8 +457,13 @@ case "${1:-}" in
   wait) stamp; s=$((ends - now)); [ "$s" -le 0 ] && exit 0
     { [ -n "${CC_LIMIT_MIN_WAIT:-}" ] && [ "$s" -gt "$CC_LIMIT_MIN_WAIT" ]; } && s="$CC_LIMIT_MIN_WAIT"
     [ "$s" -gt "$MAX" ] && exit 1; sleep "$s"; exit 0 ;;
+  record) shift; [ "${1:-}" = --dry ] && { DRY=1; shift; }
+    [ -n "${1:-}" ] && { record "$1" "${2:?usage: cc-limit record [--dry] [<pane-id> <window>]}"; exit $?; }
+    scan; exit $? ;;
+  resume) resume; exit 0 ;;
+  selfcheck) selfcheck; exit $? ;;
   check) ;;
-  *) sed -n '2,6p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,11p' "$0" >&2; exit 2 ;;
 esac
 # ---- check: is_error / a run that produced no result (a non-zero rc), AND limit wording somewhere in result or stderr
 j="${2:?usage: cc-limit check <claude-json> [<stderr-file>]}"; res=""
@@ -29,21 +471,7 @@ res=$(jq -r '[.result?, .error?, .subtype?] | map(select(type == "string")) | jo
 { [ "$(jq -r '.is_error // empty' "$j" 2>/dev/null)" = true ] || [ -z "$res" ]; } || exit 1
 txt="$res $(tail -c 4000 "${3:-/dev/null}" 2>/dev/null)"
 grep -qiE 'usage limit|rate limit|rate_limit|429|too many requests|overloaded|resets? (at )?|usage credits|out of credits|insufficient credits' <<<"$txt" || exit 1
-RS='reset[a-z]*[^0-9]{0,8}'   # "resets at ", "reset: ", "resets " — a bare timestamp in a log line must not count as the reset
-tz=UTC; z=$(grep -oE '[A-Za-z]+/[A-Za-z_]+' <<<"$txt" | head -1); [ -n "$z" ] && [ -f "/usr/share/zoneinfo/$z" ] && tz="$z"
-u=0; how=""
-if m=$(grep -oiE "${RS}[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?" <<<"$txt" | head -1) && [ -n "$m" ]; then
-  u=$(TZ="$tz" date -d "$(grep -oE '[0-9]{4}-.*' <<<"$m")" +%s 2>/dev/null); how=iso
-elif m=$(grep -oiE 'reset[a-z]* in +[0-9]+ *[a-z]+' <<<"$txt" | head -1) && [ -n "$m" ]; then
-  n=$(grep -oE '[0-9]+' <<<"$m"); case "$(grep -oiE '[a-z]+$' <<<"$m" | tr A-Z a-z)" in
-    h*) u=$((now + n * 3600));; s*) u=$((now + n));; *) u=$((now + n * 60));; esac; how=in
-elif m=$(grep -oiE "${RS}[0-9]{1,2}(:[0-9]{2})? *(am|pm)?" <<<"$txt" | head -1) && [ -n "$m" ]; then
-  c=$(grep -oiE '[0-9]{1,2}(:[0-9]{2})? *(am|pm)?$' <<<"$m")
-  u=$(TZ="$tz" date -d "$c" +%s 2>/dev/null)                                        # a clock time
-  [ -n "$u" ] && [ "$u" -le "$now" ] && u=$(TZ="$tz" date -d "tomorrow $c" +%s 2>/dev/null)   # …already past today = tomorrow
-  how="at"
-fi
-[[ "${u:-0}" =~ ^[0-9]+$ ]] || u=0
+parse_reset "$txt"
 # whose limit was it? the model family named anywhere in the message or the run's json (modelUsage keys carry it)
 newm=$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku)\b' <<<"$txt $(head -c 2000 "$j")" | head -1 | tr 'A-Z' 'a-z')
 case "$newm" in *fable*) newm=fable;; *opus*) newm=opus;; *sonnet*) newm=sonnet;; *haiku*) newm=haiku;; *) newm="";; esac
@@ -56,4 +484,5 @@ fi
 [ -n "$newm" ] || newm="$mdl"   # same episode, a message that names no model: keep what we already knew
 mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\t%s\n' "$u" "$how" "$first" "$newm" > "$S"
 [ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" limited "$newm" "$newm limit" >/dev/null 2>&1   # a limit on the box's primary model moves every session to the fallback (cc-model decides if it was)
+scan >/dev/null 2>&1   # the same limit is on every session, not just this run: whatever it interrupted is nudged at the reset
 echo "LIMIT $u"

@@ -1100,13 +1100,25 @@ say true "rate limit; reset in 2 minutes"; u=$(L check "$lf"); u=${u#LIMIT }; d=
 { [ "$d" -ge 100 ] && [ "$d" -le 140 ]; } && ok "cc-limit parses a relative reset ('in 2 minutes' -> +${d}s)" || bad "relative reset parsed to +${d}s"
 L status | grep -q 'usage limit until .*Z (.*left)' && ok "cc-limit status reports the live stamp" || bad "cc-limit status while set"
 L clear; [ "$(L status)" = clear ] && [ "$(L status >/dev/null; echo $?)" = 1 ] && ok "cc-limit clear -> status clear (exit 1)" || bad "cc-limit clear"
+# The record/resume state machine — arm, resume, first_seen, nudged_recently and the exit-code contract — is
+# only exercised here. It lives in the selftest and not in check.sh's static list because it forks real
+# processes and sleeps.
+cl=$("$B/cc-limit" selfcheck 2>&1)
+grep -q '0 failed' <<<"$cl" && ok "cc-limit selfcheck: ${cl##*: }" || { bad "cc-limit selfcheck: $cl"; grep '^FAIL' <<<"$cl" | head -5; }
 say true "API Error 429"; b1=$(L check "$lf"); say true "API Error 429"; b2=$(L check "$lf")   # no time in the message: 5 min, then 10
 { [ $(( ${b1#LIMIT } - $(date -u +%s) )) -le 320 ] && [ $(( ${b2#LIMIT } - ${b1#LIMIT } )) -ge 250 ]; } &&
   ok "cc-limit backs off 5 -> 10 min when the message carries no reset time" || bad "backoff: $b1 then $b2"; L clear
 "$B/cc" $REPO w4 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w4$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
 echo "work through a usage limit" > ~/.cc/state/$REPO/w4/task.md; nl0=$(wc -l < "$CC_NOTIFY_LOG" 2>/dev/null || echo 0)
-"$B/cc-limit" clear; CC_CLAUDE="$T/limitclaude" "$B/cc-loop" $REPO w4 --max-iter 2 --quiet >/dev/null 2>&1; rc=$?
+"$B/cc-limit" clear
+# The record path gets its own files and NO timer for this one run. `check` ends in a scan of the live tmux
+# session, and this call is under the REAL HOME with a real stamp: without these four the scan would write the
+# box's own ~/.cc/state/limit-interrupted for any session whose pane carries the wording — a source file quoting
+# it is enough — arm a real one-shot, and type "usage limit lifted" into a live session (review of #171). The
+# stamp itself stays real, because the assertions below read it.
+CC_LIMIT_RECORD="$T/lh/limit-interrupted" CC_LIMIT_NUDGED="$T/lh/limit-nudged" CC_LIMIT_SEEN="$T/lh/limit-seen" \
+  CC_LIMIT_ARM=- CC_CLAUDE="$T/limitclaude" "$B/cc-loop" $REPO w4 --max-iter 2 --quiet >/dev/null 2>&1; rc=$?
 runs=$(ls ~/.cc/state/$REPO/w4/runs/*.json 2>/dev/null | wc -l)
 { [ "$rc" = 0 ] && [ "$runs" = 2 ] && grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w4/progress.md; } &&
   ok "a limited run is retried, not counted: 2 runs, 1 iteration, DONE (exit 0)" || bad "limit loop: rc=$rc runs=$runs"

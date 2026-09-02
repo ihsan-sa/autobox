@@ -39,11 +39,18 @@ the work is:
     worth a turn; the same look two hours later, with nothing changed, is not. Anything due clears the mark.
 Every one of those is one line in the log with its reason, and `cc-pulse --dry-run` prints the same verdicts
 for every target while touching nothing — no tick, no log, no mark.
+The pane it hands to `cc-limit` below is written down by cc-limit, in cc-limit's own file.
 
 NO PILEUPS. A session gets at most one tick per cycle, and none at all while it is mid-handoff (a successor is
 reading the journal — a tick would land on two sessions at once), while its pane is mid-turn (the last tick, or
 whatever the owner asked, is still unanswered) or while a tick from a previous run is younger than the
 gap below. Each of those is one line in the log and nothing else.
+
+A SESSION THE USAGE LIMIT STOPPED is not ticked either — the tick would be answered by the same limit and the
+turn it interrupted would still be lost. The pane is handed to `cc-limit record`, which writes it down and arms
+a one-shot at the reset; cc-limit nudges it back to the turn it was on when the limit lifts. A pane cc-limit has
+seen on the limit but is not recording yet (nothing corroborates it, or no reset time named) is left alone in
+exactly the same way — it is a limited pane either way. See cc-limit.
 
 TWO SWITCHES, because a loop that wakes the whole machine must be stoppable by whoever it wakes:
   CC_PULSE=0 in ~/.cc/config   the drive loop is off — no run does anything, dry or not
@@ -211,6 +218,19 @@ def screen(wid):
 def working(s):
     """Is that pane mid-turn? The same test cc-slack makes."""
     return WORKING_FOOTER in s
+
+
+def limit_state(wid, target, dry):
+    """Is this session sitting on the usage limit? cc-limit owns the whole test — the line, the corroboration that
+    it is a real limit and not prose, and the reset time — and `record` writes <pane, window, reset> down and arms
+    the one-shot that nudges the session when the limit lifts.
+    Its exit code is the answer, and 1 is the ONLY one that means "type here": 0 = recorded, 2 = the limit line is
+    on that pane but cc-limit is not recording it yet (nothing corroborates it, or no reset time has been named).
+    Reading 2 as a plain failure is how a limited session gets ticked, which is what this whole branch prevents.
+    A cc-limit that cannot answer at all reads as 1, deliberately: the drive loop must not stop waking the box
+    because one CLI is unwell, and the worst a tick costs is one line read by a session that is busy."""
+    p = sh(f"{BIN}/cc-limit", "record", *(["--dry"] if dry else []), wid, target, timeout=30)
+    return p.returncode if p is not None else 1
 
 
 def handoff_open(target):
@@ -484,6 +504,17 @@ def pulse(target, r):
     if working(scr):
         r.log(target, "skip", "mid-turn — the last tick is still unanswered")
         return
+    # After the mid-turn test on purpose: a session still working is not one the limit stopped, whatever its
+    # scrollback says.
+    lim = limit_state(w[0], target, r.dry)
+    if lim == 0:
+        r.log(target, "skip", "the usage limit stopped it mid-turn — recorded; cc-limit nudges it back to that "
+                              "turn at the reset, and a tick now would only meet the same limit")
+        return
+    if lim == 2:
+        r.log(target, "skip", "the usage limit line is on its pane and cc-limit is not recording it yet (nothing "
+                              "corroborates it, or no reset time named) — a tick would meet that same limit")
+        return
     age = now() - last_tick(target)
     gap = conf("CC_PULSE_GAP_MIN", GAP_MIN) * 60
     if age < gap:
@@ -553,6 +584,11 @@ def main(argv):
     print(f"cc-pulse {stamp()}{' (dry run)' if dry else ''} — {len(targets)} target(s)")
     for t in targets:
         pulse(t, r)
+    if not dry:
+        # Belt and braces for the resume path. `cc-limit record` arms a one-shot at the reset; if that arming ever
+        # fails, the record sits there and nobody is nudged at all. The sweep does nothing when nothing is due, and
+        # it runs AFTER every tick so no session is sent two lines in one round.
+        sh(f"{BIN}/cc-limit", "resume", timeout=120)
     r.trim()
     tally = " ".join(f"{v} {k}" for k, v in sorted(r.n.items())) or "nothing to do"
     print(f"cc-pulse: {tally}{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
@@ -587,7 +623,7 @@ def selfcheck():
         for d in (BIN, BOARDS, STATE, f"{th}/.cc/slack", f"{DEV}/alpha", f"{DEV}/beta"):
             os.makedirs(d, exist_ok=True)
         for name, body in (("tmux", FAKE_TMUX), ("cc", FAKE_CC), ("cc-msg", FAKE_MSG), ("cc-handoff", FAKE_HANDOFF),
-                           ("cc-scope", FAKE_SCOPE)):
+                           ("cc-limit", FAKE_LIMIT), ("cc-scope", FAKE_SCOPE)):
             open(f"{BIN}/{name}", "w").write(body)
             os.chmod(f"{BIN}/{name}", 0o755)
         # a process whose name really is `claude`, for pgrep -x. A COPY OF BASH, not of sleep: this box's
@@ -597,7 +633,8 @@ def selfcheck():
         tmuxf, calls = f"{th}/tmux.txt", f"{th}/calls.txt"
         os.environ.update(PATH=BIN + os.pathsep + os.environ.get("PATH", ""), CC_FAKE_TMUX=tmuxf,
                           CC_FAKE_CALLS=calls, CC_FAKE_BUSY="", CC_FAKE_DIALOG="", CC_FAKE_HANDOFF="",
-                          CC_FAKE_HANDOFF_BROKEN="", CC_PULSE_GAP_MIN="90", CC_PULSE="",
+                          CC_FAKE_HANDOFF_BROKEN="", CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="",
+                          CC_FAKE_LIMIT_STALE="", CC_PULSE_GAP_MIN="90", CC_PULSE="",
                           # the due-ness knobs are neutral for every case that is not about them: no asks,
                           # a working ledger, the default quiet window. The block at the end sets its own.
                           CC_FAKE_ASKS="0", CC_FAKE_SCOPE_BROKEN="", CC_PULSE_QUIET="6")
@@ -653,7 +690,9 @@ def selfcheck():
 
         # ---- --dry touches nothing at all
         run("--dry")
-        ok("--dry makes no call — no session started, nobody woken", did().strip() == "")
+        ok("--dry starts no session and wakes nobody", "cc " not in did() and "msg " not in did())
+        ok("--dry only reads: its one call, the limit test, is made dry as well",
+           all(ln.startswith("limit record --dry ") for ln in did().splitlines()))
         ok("--dry writes no log, and no goals skeleton either",
            not os.path.exists(LOG) and not os.path.exists(f"{STATE}/alpha/goals.md"))
 
@@ -696,6 +735,35 @@ def selfcheck():
         ok("(3) …and a session mid-turn is skipped too: its last tick is still unanswered",
            "msg beta@scout " not in did() and "mid-turn" in L)
         ok("(3) both skips are one log line each, and nothing else happens", "beta report" not in L)
+
+        # ---- a session the usage limit stopped mid-turn
+        os.environ.update(CC_PULSE_GAP_MIN="0", CC_FAKE_HANDOFF="", CC_FAKE_BUSY="", CC_FAKE_LIMITED="beta")
+        L0 = logged(); run("beta")
+        ok("a session the usage limit stopped is handed to cc-limit, by the pane it is sitting on",
+           "limit record @1 beta" in did())
+        ok("…and is not ticked: the tick would meet the same limit, and cc-limit nudges it at the reset",
+           "msg beta " not in did() and "usage limit stopped it mid-turn" in since(L0))
+        os.environ["CC_FAKE_BUSY"] = "@1"
+        run("beta")
+        ok("a session mid-turn is never called interrupted — the limit test comes after the mid-turn one",
+           "limit record" not in did())
+        # exit 2 = cc-limit saw the limit line and did not record it (nothing corroborates it yet, or no reset time
+        # has been named). The pane is limited either way, so the tick stays away — reading 2 as a plain failure is
+        # what made USAGE.md's "the pulse does not tick a limited pane at all" a lie (review of #171).
+        L1 = logged()
+        os.environ.update(CC_FAKE_BUSY="", CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="beta")
+        run("beta")
+        ok("a pane cc-limit has SEEN on the limit but not yet recorded is not ticked either",
+           "msg beta " not in did() and "not recording it yet" in since(L1))
+        os.environ.update(CC_FAKE_BUSY="", CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="", CC_FAKE_LIMIT_STALE="beta")
+        run("beta")
+        ok("a limit line nothing corroborated for an hour is scrollback: cc-limit answers 1 and the pane ticks "
+           "(review-171b)", "msg beta " in did())
+        os.environ.update(CC_FAKE_BUSY="", CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="", CC_FAKE_LIMIT_STALE="")
+        run("beta")
+        ok("…and with no limit on it that same session ticks as usual", "msg beta " in did())
+        ok("every run ends by sweeping cc-limit's records, in case the one-shot at the reset never armed",
+           did().rstrip().endswith("limit resume"))
 
         # ---- the gap is what stops a second tick, and it is configurable
         os.environ.update(CC_FAKE_HANDOFF="", CC_FAKE_BUSY="")
@@ -894,9 +962,10 @@ def selfcheck():
         with contextlib.redirect_stdout(buf):
             rc = run("--dry-run", "beta")
         ok("--dry-run names who would be woken and what the files say, and writes nothing at all — no tick, no "
-           "log, no mark",
+           "log, no mark, and the one call it does make (the limit test) is made dry too",
            rc == 0 and "would wake" in buf.getvalue() and "1 row queued/blocked (t1)" in buf.getvalue()
-           and did().strip() == "" and since(L0) == "" and not os.path.exists(f"{STATE}/beta/pulse.quiet"))
+           and all(ln.startswith("limit record --dry ") for ln in did().splitlines())
+           and since(L0) == "" and not os.path.exists(f"{STATE}/beta/pulse.quiet"))
 
         # ---- the log is the record, and it is bounded
         os.environ["CC_PULSE_GAP_MIN"] = "90"
@@ -959,6 +1028,20 @@ set -u
 printf 'msg %s :: %s\n' "${1:-}" "${2:-}" >> "$CC_FAKE_CALLS"
 case " ${CC_FAKE_DIALOG:-} " in *" @1 "*) [ "${1:-}" = beta ] && echo queued;; esac
 exit 0
+"""
+
+FAKE_LIMIT = r"""#!/usr/bin/env bash
+# selfcheck stub for `cc-limit record [--dry] <window-id> <target>`, and it answers with the real thing's three
+# codes: 0 when that target is in $CC_FAKE_LIMITED (recorded), 2 when it is in $CC_FAKE_LIMIT_SEEN (the limit line
+# is there, not recorded yet), 1 otherwise — including $CC_FAKE_LIMIT_STALE, a limit line nothing corroborated for
+# an hour, which the real thing reads as scrollback. Records the call, so --dry can be shown to stay dry.
+set -u
+printf 'limit %s\n' "$*" >> "$CC_FAKE_CALLS"
+tgt=""; for a in "$@"; do tgt="$a"; done          # the target is the last argument
+case " ${CC_FAKE_LIMITED:-} " in *" $tgt "*) exit 0;; esac
+case " ${CC_FAKE_LIMIT_SEEN:-} " in *" $tgt "*) exit 2;; esac
+case " ${CC_FAKE_LIMIT_STALE:-} " in *" $tgt "*) exit 1;; esac
+exit 1
 """
 
 FAKE_SCOPE = r"""#!/usr/bin/env bash
