@@ -24,5 +24,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # prompts it may answer, the ones it must never touch, and the spool: no tmux of this box's is read or typed at.
 # cc-spend's ticks a synthetic transcript in a HOME of its own: the rates table, the offset/dedupe rules and both
 # phantom rules, never this box's ledger and never a model.
-for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+# cc-time's is the clock rule itself: a known UTC instant rendered in a zone of its own (never this box's), and
+# cc-notify's one Slack-facing stamp driven through in log-only mode with the UTC log line beside it.
+for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend cc-time; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

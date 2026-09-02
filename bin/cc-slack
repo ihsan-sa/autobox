@@ -63,7 +63,8 @@ A reaction is a verdict, and ANYONE in the channel may give one: a member's :+1:
 Only the owner steers the box: permission answers, `!` commands beyond !help/!status, @alias hand-offs, status marks and
 App Home are owner-only, and a member cannot authorize what the box gates on the owner.
 In-Slack commands (`!help`/`!status` anyone, the rest owner only, any channel or thread): `!help !ping !status !digest !sessions !start !say !threads !box`
-`!restart <box|repo[/track]|slack|tmux>` and `!reboot` (both confirm-gated). A `!command` root is never a tracked thread.
+`!restart <box|repo[/track]|slack|tmux>` and `!reboot` (both confirm-gated), and `!context !cost !compact [target]` — those three relay a real
+slash command into that session's own pane (SLASH_CMDS, idle panes only; nothing else is ever typed there). A `!command` root is never a tracked thread.
 One channel, one voice: while `cc-handoff` has an overlap open on a target, both its sessions are subscribed but only
 the one the record calls live is delivered to (permission answers included), and the muted one's reply/react/file are
 refused. No record, or one that cannot be read, leaves the predecessor in charge.
@@ -93,7 +94,7 @@ app_home_opened bot event and interactivity in core/slack/app-manifest.json (re-
 two it logs one line and gives up until restart.
 Config (~/.cc/config): SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_OWNER_ID SLACK_CHANNEL SLACK_AUTOSTART(=1)
 """
-import collections, contextlib, fcntl, glob, hashlib, io, json, os, re, socket, struct, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
+import calendar, collections, contextlib, fcntl, glob, hashlib, io, json, os, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time, types, urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
 DIR = os.environ.get("CC_SLACK_DIR", f"{HOME}/.cc/slack")
@@ -184,6 +185,57 @@ def last_line(text):
 
 def log(*a):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), *a, file=sys.stderr, flush=True)
+
+
+# A time the OWNER reads is HH:MM in their zone and carries no Z; a time this file LOGS or RECORDS stays UTC and
+# keeps its Z (COMMS.md). cc-time is the one renderer and the only thing that decides the zone — never strftime a
+# Slack-facing stamp here. IMPORTED, not shelled out to: the tab redraws every 5 s with a dozen stamps on it, and
+# the selfcheck below proves that no case reaches another cc-* tool.
+def _load_cctime():
+    import importlib.machinery
+    import importlib.util
+    spec = importlib.util.spec_from_loader("cctime", importlib.machinery.SourceFileLoader("cctime", f"{BIN}/cc-time"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+try:
+    cctime = _load_cctime()
+except Exception:                                  # a bin/ without it: the tab still draws, in this process's zone
+    cctime = None
+
+
+def hhmm_all(whens, day=False):
+    """One HH:MM per WHEN — an epoch, a UTC ISO stamp, or None for now."""
+    if not whens:
+        return []                                  # a caller with an empty list wants no rows, not the time now
+    try:
+        return cctime.slack_all(whens, day)
+    except Exception:
+        pass
+    # No cc-time in this bin/: this process's own zone, and THE STAMP THE CALLER GAVE US. Substituting `now` for a
+    # WHEN we could not read is the one thing this fallback must never do — a card would read "landed ✓ <now>" for
+    # a PR merged hours ago, and the tab would print the current clock as the last boot. Unreadable comes back as
+    # it came in, which is wrong-looking rather than wrong.
+    import datetime as _dt
+    fmt = "%Y-%m-%d %H:%M" if day else "%H:%M"
+    out = []
+    for w in whens:
+        t = w if isinstance(w, (int, float)) or w is None else None
+        if t is None and w is not None:
+            s = str(w).strip()
+            try:
+                t = _dt.datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s).timestamp()
+            except ValueError:
+                out.append(s)
+                continue
+        out.append(time.strftime(fmt, time.localtime(t)))
+    return out
+
+
+def hhmm(when=None, day=False):
+    return hhmm_all([when], day)[0]
 
 
 # ~/.cc/config is read and written by cc-config alone: one parser, one precedence rule (the environment wins),
@@ -292,7 +344,7 @@ def at_token(text, bot_user=None):
 def fold_attachments(text, attachments):
     """A shared/forwarded Slack message puts its content in `attachments[]`, not in `text`: a message whose text is
     only "@<bot>" is NOT empty, and dropping the attachments is how a share reached a session as nothing at all.
-    Each one folds into a bracketed line — "[shared message from #help by ada at 2026-08-30 05:33Z: …]" — capped at
+    Each one folds into a bracketed line — "[shared message from #help by ada at 2026-08-30 14:33: …]" — capped at
     SHARED_MAX chars and SHARED_N attachments so one huge share cannot flood a session. Skipped: an attachment with
     no text/fallback, and Slack's own unfurl of a link the message already carries (decoration, not content) — a
     shared MESSAGE is kept even when its permalink is in the text, because there the unfurl IS the content."""
@@ -310,7 +362,7 @@ def fold_attachments(text, attachments):
         if len(body) > SHARED_MAX:
             body = body[:SHARED_MAX].rstrip() + " …[cut]"
         try:
-            when = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(float(a.get("ts")))) if a.get("ts") else ""
+            when = hhmm(float(a.get("ts")), day=True) if a.get("ts") else ""
         except (TypeError, ValueError):
             when = str(a.get("ts") or "").strip()
         chan, who = str(a.get("channel_name") or "").strip().lstrip("#"), str(a.get("author_name") or a.get("author_subname") or "").strip()
@@ -1324,7 +1376,7 @@ def orch_purpose(brief, by, at=None, link=""):
     """The channel purpose: the brief's first line (≤150 chars) + who spawned it, when, and the thread it came from."""
     first = (brief or "").strip().splitlines()
     head = " ".join(first[0].split())[:150] if first else ""
-    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(at if at is not None else time.time()))
+    when = hhmm(at if at is not None else time.time(), day=True)
     return " · ".join(x for x in (head, f"spawned by {by} {when}" + (f" from {link}" if link else "")) if x)[:250]
 
 
@@ -1563,8 +1615,11 @@ HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and
                                                # tail goes before the ❓ tail, the last thing on the tab to be touched.
                                                # HOME_SLICE: rows one board-view button DMs before it says how many more.
 HOME_LINE, HOME_SHORT, HOME_ASK, HOME_AUDIT, HOME_BTN = 40, 24, 26, 180, 18   # phone widths: a line · a track name · an ask · the audit · a button label
+HOME_SPEND_N, HOME_SPEND_PH = 5, 3             # SPEND band: sessions, then phantoms, before it says how many more. This
+                                               # band is a summary, not a list the owner acts on row by row — `cc-spend`
+                                               # and `cc-spend phantoms` are where the whole thing lives.
 HOME_DEPTH = 4                                 # deepest sub-channel indent the phone column takes; deeper nests flatten to it
-HOME_CUT = ("boot", "handoffs", "audit", "chart", "idle", "sessions", "channels", "backlog", "views")   # …and the order they go in when even
+HOME_CUT = ("boot", "handoffs", "audit", "spend", "chart", "idle", "sessions", "channels", "backlog", "views")   # …and the order they go in when even
                                                # that does not fit (§01d). The chart goes after the grey one-liners and before
                                                # the channels: it is 2 blocks, the most a single cut can free, and the `load`
                                                # line under it carries the same numbers in words. A tab that dropped RUNNING
@@ -1724,20 +1779,26 @@ def home_clip(text, n):
 
 
 def home_until(limit):
-    """`usage limit until 09:00Z (18m left)` → `09:00Z`. Anything we cannot parse passes through as it came."""
-    m = re.search(r"(\d{1,2}:\d{2})Z?", str(limit or ""))
-    return m.group(1) + "Z" if m else " ".join(str(limit or "").split())
+    """`usage limit until 09:00Z (18m left)` → `02:00`, the owner's clock. cc-limit speaks UTC because everything
+    that PARSES that line does (cc-land defers a landing on it); the tab is the one place a person reads it, so the
+    conversion is here and that line is left alone. The UTC date is today's: a reset is inside 24 h, and the only
+    thing the date decides is which side of a DST change the offset comes from. Unparseable passes through."""
+    m = re.search(r"(\d{1,2}):(\d{2})Z?", str(limit or ""))
+    if not m:
+        return " ".join(str(limit or "").split())
+    return hhmm(f"{time.strftime('%Y-%m-%d', time.gmtime())}T{int(m.group(1)):02d}:{m.group(2)}:00Z")
 
 
 def home_boot(line):
-    """The power-events line the glance needs — `last boot 01:41Z (power cut)`. The gap=/cause= tail is for the log."""
-    m = re.search(r"boot=\d{4}-\d\d-\d\dT(\d\d:\d\d)", str(line or ""))
+    """The power-events line the glance needs — `last boot 10:41 (power cut)`, the owner's clock. The gap=/cause=
+    tail is for the log, and so is the UTC stamp with the Z that this reads it out of."""
+    m = re.search(r"boot=(\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?Z?)", str(line or ""))
     c = re.search(r"cause=(\S+)", str(line or ""))
     if not m:
         return " ".join(str(line or "").split())[:HOME_LINE * 2]
     cause = {"power-loss": "power cut", "clean-reboot": "clean reboot"}.get(c.group(1) if c else "",
                                                                            (c.group(1).replace("-", " ") if c else ""))
-    return f"last boot {m.group(1)}Z" + (f" ({cause})" if cause else "")
+    return f"last boot {hhmm(m.group(1))}" + (f" ({cause})" if cause else "")
 
 
 QUICK_LOG = f"{HOME}/.cc/state/quick.log"
@@ -1762,7 +1823,8 @@ def home_quick(hours=24, n=8):
     except Exception:
         return []
     live = sorted(((t, k) for k, t in doing.items() if k not in done), reverse=True)[:n]
-    return [{"when": time.strftime("%H:%M", time.gmtime(t)), "status": "doing", "repo": k[0], "text": k[1]} for t, k in live]
+    return [{"when": w, "status": "doing", "repo": k[0], "text": k[1]}
+            for w, (t, k) in zip(hhmm_all([t for t, _ in live]), live)]
 
 
 def home_marks(marks):
@@ -1885,7 +1947,77 @@ def home_handoffs(day=None):
     if not n:
         return {}
     ts, who = str(last.get("ts") or ""), "/".join(str(x) for x in (last.get("repo"), last.get("track")) if x)
-    return {"today": n, "when": f"{ts[11:16]}Z" if len(ts) > 15 else "", "who": home_repo(who) if who else ""}
+    return {"today": n, "when": hhmm(ts) if len(ts) > 15 else "", "who": home_repo(who) if who else ""}
+
+
+def home_spend(day=None):
+    """What the box SPENT today, off cc-spend's own ledger (owner, thread 1788289898: "the info can go into the
+    home page"). A READ AND A SUM, never a recount: cc-spend prices every row at tick time into
+    ~/.cc/state/spend/<day>.tsv and its tick saves the phantom list beside it, so nothing here re-derives a
+    price, a window or the rule for who is watching what. Empty ledger renders nothing, like every other band.
+
+    ONE DOLLAR NUMBER FOR THE UTC DAY is the headline (codex review, 2026-09-02) — every process, attributed or
+    not. Under it the biggest sessions, the week, an explicit bucket for spend no repo owns (a session outside
+    ~/dev and the worktrees attributes to nothing, and hiding it would make the rows disagree with the
+    headline), and the sessions nobody is watching. USD is an ESTIMATE and the band says so; the tokens are the
+    measured part. `day` picks the LEDGER only: the phantom list is the current one either way, because it is a
+    statement about what is running now and the band is only ever drawn for today."""
+    day = day or time.strftime("%Y-%m-%d", time.gmtime())
+    base = f"{HOME}/.cc/state/spend"
+    try:
+        t0 = calendar.timegm(time.strptime(day, "%Y-%m-%d"))
+    except ValueError:
+        return {}
+    week_days = [time.strftime("%Y-%m-%d", time.gmtime(t0 - i * 86400)) for i in range(7)]
+
+    def ledger(d):
+        try:
+            with open(f"{base}/{d}.tsv") as f:
+                for l in f:
+                    c = l.rstrip("\n").split("\t")
+                    if not l.startswith("#") and len(c) >= 12:
+                        yield c
+        except OSError:
+            return                                   # a day with no spend has no file; that is a 0, not an error
+
+    def money(v):
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0                               # one torn row never hides the rest (cc-spend reads it so too)
+
+    today, unattr, by = 0.0, 0.0, {}
+    for c in ledger(day):
+        usd = money(c[11])
+        today += usd
+        if c[3] in ("-", ""):
+            unattr += usd
+        who = f"{c[3]}/{c[4]}" if c[3] not in ("-", "") else c[1][:8]
+        g = by.setdefault(who, {"who": who, "usd": 0.0, "tok": 0})
+        g["usd"] += usd
+        g["tok"] += sum(int(x) if x.lstrip("-").isdigit() else 0 for x in c[7:11])
+    week = sum(money(c[11]) for d in week_days for c in ledger(d))
+
+    ph = []
+    try:
+        with open(f"{base}/phantoms.tsv") as f:
+            for l in f:
+                c = l.rstrip("\n").split("\t")
+                if not l.startswith("#") and len(c) >= 7:
+                    ph.append(f"{c[1]} {c[3]}/{c[4]} {c[2]} — {c[6]}".replace("@", ""))   # never an @-mention out of a cwd
+    except OSError:
+        pass
+    if not by and not ph:
+        return {}
+    rows = sorted(by.values(), key=lambda g: -g["usd"])
+    return {"today": today, "week": week, "unattributed": unattr,
+            "rows": [dict(r, tok=home_tok(r["tok"])) for r in rows[:HOME_SPEND_N]],
+            "more": max(0, len(rows) - HOME_SPEND_N),
+            "phantoms": ph[:HOME_SPEND_PH], "ph_more": max(0, len(ph) - HOME_SPEND_PH)}
+
+
+def home_tok(n):
+    return f"{n / 1_000_000:.1f}M" if n >= 1_000_000 else (f"{round(n / 1000)}k" if n >= 1000 else str(n))
 
 
 def home_needs(st, names=None):
@@ -2002,7 +2134,9 @@ def home_parts(st):
       6b board views      To do · Running · Done — three buttons that DM one slice of the board each
       6c sessions         long-lived channel sessions (board kind=session) grouped under their repo — never RUNNING
       7 channels          EVERY channel the box knows of, one line each — the busy ones first, then the quiet
-      8-11 load · handoffs · audit · units+boot   grey, one line each, cheapest to skip and first to be cut (HOME_CUT)
+      8 spend             what today cost, one dollar number for the UTC day, where it went, and 👻 the part of it
+                          nobody is watching — read off cc-spend's ledger, never recomputed
+      9-12 load · handoffs · audit · units+boot   grey, one line each, cheapest to skip and first to be cut (HOME_CUT)
 
     THE LISTS ARE WHOLE (owner, 2026-08-30, threads 1788129807 then 1788133685: "also show all channels"). The backlog
     used to stop at 3, NEEDS YOU at 4 and CHANNELS at 6 busy lines plus a count of the quiet — each with a summary the
@@ -2132,7 +2266,24 @@ def home_parts(st):
     #     because neither of them answers "does this need me?".
     p += home_chart_blocks(st.get("chart"))
 
-    # 9-11 — grey, one line each, and the first things to go when the tab will not fit
+    # 9 — SPEND. The headline is ONE dollar number for the UTC day, across every process; the rows under it are
+    #     where it went, and 👻 is the part of it nobody is watching. Below the fold and cuttable: it answers
+    #     "what did today cost", never "does this need me?".
+    sp = st.get("spend") or {}
+    if sp:
+        slines = [f"💵 *${_home_num(sp.get('today')):.2f}* today · ${_home_num(sp.get('week')):.2f} this week _(est)_"]
+        slines += [f"{home_short(r.get('who') or '?')}  ${_home_num(r.get('usd')):.2f} · {r.get('tok') or '0'}"
+                   for r in (sp.get("rows") or ())]
+        if _home_num(sp.get("more")):
+            slines.append(f"_+{int(_home_num(sp.get('more')))} more sessions_")
+        if _home_num(sp.get("unattributed")) > 0:
+            slines.append(f"_unattributed_  ${_home_num(sp.get('unattributed')):.2f}")
+        slines += [f"👻 {home_clip(x, HOME_LINE * 2)}" for x in (sp.get("phantoms") or ())]
+        if _home_num(sp.get("ph_more")):
+            slines.append(f"_+{int(_home_num(sp.get('ph_more')))} more unwatched_")
+        p.append(("spend", _home_sec(home_list(slines, lambda k: f"_+{k} more · `cc-spend`_"))))
+
+    # 10-13 — grey, one line each, and the first things to go when the tab will not fit
     p.append(("load", _home_ctx(st.get("load") or "")))
     hnd, hn = st.get("handoffs") or {}, int(_home_num((st.get("handoffs") or {}).get("today")))
     if hn:                                                   # how often sessions ran out of context today; zero is silent
@@ -2148,8 +2299,10 @@ def home_parts(st):
 
 
 def home_cut(parts, maxblk=HOME_MAXBLK):
-    """Over budget, things go in the owner's order (§01d): the boot line, then the audit, then the CHART, then the
-    channels, then the backlog. What is RUNNING and the NEEDS YOU band are never cut — they are the two questions the tab exists to answer,
+    """Over budget, things go in the owner's order (§01d): the boot line, then the audit, then the SPEND band, then
+    the CHART, then the channels, then the backlog. Spend goes before the picture because a day's total is a summary
+    the owner can ask for (`cc-spend`) while the chart answers what the box is doing right now.
+    What is RUNNING and the NEEDS YOU band are never cut — they are the two questions the tab exists to answer,
     and a tab that drops them to make room for the audit paragraph has failed at its whole job."""
     out = list(parts)
     for tag in HOME_CUT:
@@ -2475,7 +2628,7 @@ def home_tracks(workers, prs, idle=None, loops=None):
                 if last is None or upd > last["at"]:       # newest of them is the quiet tab's one line
                     last = {"at": upd, "name": f"{repo}/{tr}",              # no journal read here: a done/merged track
                             "verb": HOME_STATE.get(home_track_state(status, live), ("", "done"))[1],   # is never `waiting`
-                            "when": f"{upd[11:16]}Z" if len(upd) > 15 else ""}
+                            "when": hhmm(upd) if len(upd) > 15 else ""}
                 continue
             reason = home_reason(repo, tr)                 # read for EVERY track still on the tab, not just the ones the
             state = home_track_state(status, live, bool(reason), sat)   # board calls blocked: the declaration DECIDES (§02)
@@ -2509,7 +2662,7 @@ def home_audit():
         i = next((k for k, l in enumerate(lines) if l.strip().startswith("## verdict")), None)
         v = (next((l.lstrip("-* ").strip() for l in lines[i + 1:i + 6] if l.strip()), "") if i is not None else "")[:900]
         try:
-            at = time.strftime("%H:%MZ", time.gmtime(os.path.getmtime(reps[-1])))
+            at = hhmm(os.path.getmtime(reps[-1]))
         except OSError:
             at = os.path.basename(reps[-1])[:10]
     try:
@@ -3940,6 +4093,12 @@ class Daemon:
         threading.Thread(target=self._safe, args=(self.publish, repo), daemon=True).start()
 
     MEMBER_CMDS = ("help", "status")   # everything else steers the box, and only the owner steers the box
+    # THE WHOLE WHITELIST of slash commands the box will type into a session's pane on a Slack message. Each of
+    # these READS or TIDIES that session and nothing else; every other /command either changes what the session
+    # is (/model, /clear) or does work in it, and those are typed by a person at the keyboard, not by a chat line.
+    # Adding a row means deciding what a message from a phone may do to a running session — the bar is that the
+    # worst case is a session that has to say something again.
+    SLASH_CMDS = ("context", "cost", "compact")
 
     def command(self, text, chat, thread, ts, target, ctype, is_owner=True):
         cmd, _, arg = text[1:].partition(" ")
@@ -3957,6 +4116,7 @@ class Daemon:
                    "`!restart <box|repo[/track]|slack|tmux>` recover a wedged session/daemon (tmux needs `!restart tmux confirm`) · "
                    "`!reboot` reboot the whole box (needs `!reboot confirm`) · "
                    "`!threads` this channel's open threads (❓ needs you · 🔴 with the session · 🟠 handled) · "
+                   "`!context` / `!cost` / `!compact` [target] ask that session's own pane (idle panes only) · "
                    "`!box` box-status. Anything else goes to the session as a message; it replies here in a thread. "
                    "Permission prompts arrive here as `yes <id>` / `no <id>` questions — the owner answers those. "
                    "A session can @-mention anyone in this channel by their handle (it notifies them; it cannot add them here). "
@@ -3994,9 +4154,51 @@ class Daemon:
             return self.cmd_reboot(arg, chat, thread)
         elif cmd == "threads":
             return self.cmd_threads(chat, thread)
+        elif cmd in self.SLASH_CMDS:
+            return self.cmd_slash(cmd, arg, chat, thread, target)
         else:
             out = f"unknown command `!{cmd}` — `!help`"
         self.say(chat, out, thread)
+
+    def cmd_slash(self, cmd, arg, chat, thread, target):
+        """!context|!cost|!compact [target] — type the matching /command into that session's OWN pane and reply
+        with what it drew (owner, 2026-09-01: "a great way of checking the context while also having the
+        calculator tracker thing in the background"). Owner only: SLASH_CMDS is not in MEMBER_CMDS, so a member
+        is refused by `command` before this runs. Only an IDLE pane is typed at — cc-msg --ask refuses one that
+        is mid-turn or holding a dialog, and it never spools, so a command that could not be typed now is not
+        typed by some later drain at a pane nobody is watching."""
+        tgt = (arg or "").split()[0] if (arg or "").strip() else target
+        if not tgt:
+            return self.say(chat, f"`!{cmd}`: no session for this channel — try `!{cmd} <repo>/<track>`", thread)
+        win = window_for(tgt)
+        try:
+            r = subprocess.run([f"{BIN}/cc-msg", "--ask", win, f"/{cmd}"],
+                               capture_output=True, text=True, timeout=60, cwd=HOME)
+        except subprocess.TimeoutExpired:
+            return self.say(chat, f"`/{cmd}` at `{win}` timed out after 60 s", thread)
+        if r.returncode != 0:
+            why = (r.stderr.strip().splitlines() or [f"rc {r.returncode}"])[-1].replace("cc-msg: ", "")
+            return self.say(chat, f"`/{cmd}` not typed at `{win}` — {why}", thread)
+        out = f"`/{cmd}` at `{win}`\n```\n{r.stdout.strip()[:3000]}\n```"
+        if cmd == "context":
+            est = self.ctx_estimate(tgt)
+            if est:
+                out += "\n" + est
+        self.say(chat, out, thread)
+
+    def ctx_estimate(self, target):
+        """cc-context's tracked number for this target, one line, or "" when it has no record of one. The pane's
+        own /context above is the truth; this is what the box THOUGHT, and the owner asked for both in the same
+        reply — the gap between them is the whole reason the tracker is worth showing beside it."""
+        try:
+            r = subprocess.run([f"{BIN}/cc-context", "--all"], capture_output=True, text=True, timeout=30, cwd=HOME)
+        except Exception:
+            return ""
+        for l in r.stdout.splitlines():
+            c = l.split("\t")
+            if len(c) >= 6 and f"{c[0]}/{c[1]}" == target:
+                return f"tracker says {c[2]}% of {c[4]} (window from {c[5]})"
+        return ""
 
     def cmd_reboot(self, arg, chat, thread):
         """!reboot[ confirm] — reboots the whole box; recovers via systemd + BIOS AC-recovery. Wrong/expired confirm re-arms and re-warns."""
@@ -4917,11 +5119,12 @@ class Daemon:
         tracks, last, sessions = cached("tracks", HOME_CACHE,
                                        lambda: home_tracks(home_workers(), self.home_prs, home_idle(), home_loops()))
         # the clock and the box's vitals are read every time (they are file reads); everything that costs a process is cached
-        return {"box": BOX, "now": time.strftime("%H:%MZ", time.gmtime()), "units": cached("units", HOME_CACHE, home_units),
+        return {"box": BOX, "now": hhmm(), "units": cached("units", HOME_CACHE, home_units),
                 "load": home_load(), "limit": cached("limit", HOME_CACHE, limit_now), "channels": chans,
                 "tracks": tracks, "last": last, "waits": waits, "sessions": sessions, "cards": dict(self.home_cards),
                 "quick": cached("quick", HOME_CACHE, home_quick),
                 "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
+                "spend": cached("spend", HOME_CACHE, home_spend),
                 "audit_at": audit_at, "audit": verdict, "boot": boot, "chart": self.chart}
 
     def chart_store_id(self):
@@ -4985,7 +5188,7 @@ class Daemon:
                 return
             if not (self.use_slack and self.cfg.get("SLACK_BOT_TOKEN")):
                 return
-            fid = self.chart_upload(png, f"box vitals {time.strftime('%H:%MZ', time.gmtime(drawn))}")
+            fid = self.chart_upload(png, f"box vitals {hhmm(drawn)}")
             if not fid:
                 return
             was = self.chart.get("file")
@@ -5651,7 +5854,10 @@ def cmd_post(argv):
         # digests, milestones — so it aims at the -updates lane whenever the box is in one, and falls back to today's
         # channel where there is none. `-c` is untouched: a reply goes where the question was asked, never here.
         words = route.strip().lstrip("[").split()
-        if len(words) >= 2 and words[1].lower() in ALERT_KINDS and words[0].lower() in (socket.gethostname().split(".")[0].lower(), "box"):
+        # BOX, not socket.gethostname(): "everything else titles on CC_BOX" (audit 2026-09-01, F6) — cc-notify
+        # builds its title from CC_BOX, so on a box that overrides it this asked the kernel, got a different name
+        # and sent "<box> limit" to a project channel instead of #alerts.
+        if len(words) >= 2 and words[1].lower() in ALERT_KINDS and words[0].lower() in (BOX.lower(), "box"):
             chan = "#" + (cfg.get("SLACK_ALERTS") or ALERTS)   # "<box> boot|limit|audit|review": machinery, never a project thread
             if not mention and words[1].lower() in UPDATE_KINDS and resolve_channel(cfg, updates_name(words[0])):
                 chan = "#" + updates_name(words[0])            # …but a digest is PROGRESS: the box's own updates lane, #alerts only if it has none
@@ -6031,7 +6237,8 @@ def cmd_archive(argv):
     return 0 if ok else 1
 
 
-LANDED_RE = re.compile(r"  ·  (?:landed ✓|closed ✗) \d\d:\d\dZ$")     # a card that no longer reads as pending
+LANDED_RE = re.compile(r"  ·  (?:landed ✓|closed ✗) \d\d:\d\dZ?$")    # a card that no longer reads as pending —
+# the Z is optional so a card edited before the stamps went local is still recognised and not edited a second time
 PENDING_TAIL = re.compile(r"\s+·\s+:\+1:.*$", re.S)                       # "  ·  :+1: from the owner merges (squash)"
 SWEEP_EVERY = 900                                                        # approvals-sweep: one real sweep per 15 min unless --now
 SWEEP_MAX = 40                                                           # …and at most this many edits per run: under Slack's rate limit, over in a minute
@@ -6065,12 +6272,12 @@ def approval_card_ts(cfg, cid, repo, n, limit=200):
 
 
 def iso_hhmm(s):
-    """GitHub's "2026-09-01T04:33:58Z" → "04:33Z"; anything else → now."""
-    return f"{s[11:16]}Z" if isinstance(s, str) and re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d", s) else time.strftime("%H:%MZ", time.gmtime())
+    """GitHub's "2026-09-01T04:33:58Z" → "21:33", the owner's clock; anything else → now."""
+    return hhmm(s if isinstance(s, str) and re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d", s) else None)
 
 
 def land_card(cfg, cid, m, state="MERGED", when=None):
-    """Edit one card so it stops reading as pending — "… · landed ✓ 04:33Z" (or "closed ✗") in place of the ":+1:
+    """Edit one card so it stops reading as pending — "… · landed ✓ 21:33" (the owner's clock) or "closed ✗", in place of the ":+1:
     from the owner merges" tail — and put :ok_hand: on a landed one. #approvals is a queue the owner reads on a phone:
     a card for a PR that is already in must not look like it still wants a 👍 (four of them did, 2026-09-01). The
     "[repo] PR #n:" head stays, so the card is still found and a late 👍 still reaches the landing, which says "already
@@ -6080,7 +6287,7 @@ def land_card(cfg, cid, m, state="MERGED", when=None):
         return False
     tail = "  ·  landed ✓ " if state == "MERGED" else "  ·  closed ✗ "
     api("chat.update", cfg["SLACK_BOT_TOKEN"], channel=cid, ts=ts,
-        text=PENDING_TAIL.sub("", text).rstrip() + tail + (when or time.strftime("%H:%MZ", time.gmtime())))
+        text=PENDING_TAIL.sub("", text).rstrip() + tail + (when or hhmm()))
     if state == "MERGED":
         try:
             api("reactions.add", cfg["SLACK_BOT_TOKEN"], channel=cid, timestamp=ts, name="ok_hand")
@@ -6246,6 +6453,10 @@ def cmd_selfcheck():
     # and a temp one. (The product-side gate is in cc-notify: a synthetic repo name is never pushed, from anywhere.)
     os.environ["CC_NOTIFY_LOG_ONLY"] = "1"
     os.environ["CC_NOTIFY_LOG"] = tempfile.mktemp(prefix="_selfcheck_notify_")
+    # …and the CLOCK, for the same reason: every Slack-facing stamp is rendered in the owner's zone (cc-time), so a
+    # case that asserts one would read differently on every box. Asia/Tokyo is nobody's zone here, has no DST, and
+    # is far enough east that the DAY moves with the hour — a renderer that only stripped the Z fails these.
+    os.environ["CC_TZ"] = "Asia/Tokyo"
     # …and the same for the WORK those cases set off. Every :+1: case runs the real on_approval, and every tick case
     # runs the real loop_tick — so queue_land() shelled to the REAL cc-land and publish_soon() to the real cc-publish.
     # Against a fixture that is only noise; but `nameMM` below is deliberately the first REAL repo in ~/dev
@@ -6739,10 +6950,10 @@ def cmd_selfcheck():
                 globals()["api"], subprocess.run = api3, run3
                 with contextlib.redirect_stdout(io.StringIO()) as o6, contextlib.redirect_stderr(io.StringIO()):
                     rc6 = cmd_post_approval([rname, "7"]); rc6f = cmd_post_approval([rname, "--force", "7"])
-                check("post-approval: a MERGED PR never gets a card, --force or not — the one it has is edited to 'landed ✓ HH:MMZ' "
+                check("post-approval: a MERGED PR never gets a card, --force or not — the one it has is edited to 'landed ✓ HH:MM' "
                       "(GitHub's merge time), marked :ok_hand: once, and its ts is what is printed",
                       rc6 == 0 and rc6f == 0 and not posted and o6.getvalue().split() == ["9.1", "9.1"]
-                      and edits == [("9.1", f"[{rname}] PR #7: t — https://x/7  ·  landed ✓ 04:33Z")] and marks == [("9.1", "ok_hand")])
+                      and edits == [("9.1", f"[{rname}] PR #7: t — https://x/7  ·  landed ✓ 13:33")] and marks == [("9.1", "ok_hand")])
                 hist = [dict(cards[1])]; posted.clear()
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as e7:
                     rc7 = cmd_post_approval([rname, "7"]); rc7l = cmd_post_approval([rname, "--landed", "7"])
@@ -6755,7 +6966,7 @@ def cmd_selfcheck():
                 check("post-approval --landed: on the caller's word (gh may not have caught up) the card is edited and marked, "
                       "nothing is posted, and a second --landed changes nothing",
                       rc8 == 0 and rc8b == 0 and not posted and o8.getvalue().split() == ["9.1", "9.1"] and len(edits) == 1
-                      and re.search(r"  ·  landed ✓ \d\d:\d\dZ$", edits[0][1]) and marks == [("9.1", "ok_hand")])
+                      and re.search(r"  ·  landed ✓ \d\d:\d\d$", edits[0][1]) and marks == [("9.1", "ok_hand")])
                 hist = [dict(c) for c in cards]; edits.clear()
                 def api4(method, token, **kw):
                     if method == "chat.update":
@@ -6780,8 +6991,8 @@ def cmd_selfcheck():
                 check("approvals-sweep: every card of ours that still says 'merges' for a MERGED/CLOSED PR is edited — duplicates too, "
                       "a closed one as 'closed ✗' without the mark; open, foreign, human, already-edited and tail-less cards are "
                       "left; gh is asked once per PR",
-                      rc10 == 0 and [e[0] for e in edits] == ["8.1", "8.2", "8.3"] and edits[0][1].endswith("  ·  landed ✓ 02:00Z")
-                      and edits[2][1].endswith("  ·  closed ✗ 03:00Z") and marks == [("8.1", "ok_hand"), ("8.2", "ok_hand")]
+                      rc10 == 0 and [e[0] for e in edits] == ["8.1", "8.2", "8.3"] and edits[0][1].endswith("  ·  landed ✓ 11:00")
+                      and edits[2][1].endswith("  ·  closed ✗ 12:00") and marks == [("8.1", "ok_hand"), ("8.2", "ok_hand")]
                       and sorted(asked) == ["5", "6", "7"] and "3 cards edited · 2 still pending" in o10.getvalue())
                 edits.clear(); marks.clear(); asked.clear()
                 with contextlib.redirect_stdout(io.StringIO()) as o11, contextlib.redirect_stderr(io.StringIO()):
@@ -7704,23 +7915,31 @@ def cmd_selfcheck():
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None: postedB.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
         host = socket.gethostname().split(".")[0]
+        rbox = BOX; alt = f"{host}-alt"              # CC_BOX set to something that is NOT this host's name: cc-notify
+        globals()["BOX"] = alt                       # titles on it, so --route has to as well or the alert misses #alerts
         with contextlib.redirect_stdout(io.StringIO()):
-            cmd_post(["--route", f"{host} limit", "resumes at 11:40Z"]); cmd_post(["--route", f"{host} audit review", "ok"]); cmd_post(["--route", f"{host}/t1 done", "PR: x"])
-            cmd_post(["--route", f"{host} digest", "3 tracks running"])
+            cmd_post(["--route", f"{alt} limit", "resumes at 11:40"]); cmd_post(["--route", f"{alt} audit review", "ok"]); cmd_post(["--route", f"{alt}/t1 done", "PR: x"])
+            cmd_post(["--route", f"{alt} digest", "3 tracks running"])
+            cmd_post(["--route", f"{host} limit", "a repo that happens to be named after the host"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["BOX"] = rbox
     check("post --route: '<box> limit' goes to #alerts even when the box shares its name with a repo channel; a track's "
-          "automated 'done' and the DIGEST go to the updates lane — #alerts keeps boots, limits, power and audits",
-          postedB == ["C-alerts", "C-alerts", f"C-{host}-{UPDATES}", f"C-{host}-{UPDATES}"])
+          "automated 'done' and the DIGEST go to the updates lane — #alerts keeps boots, limits, power and audits. The "
+          "box is CC_BOX, never the kernel's hostname: the last line is titled with the HOSTNAME on a box whose CC_BOX "
+          "is something else, and it must NOT reach #alerts — that is the case gethostname() cannot pass (audit F6)",
+          postedB == ["C-alerts", "C-alerts", f"C-{alt}-{UPDATES}", f"C-{alt}-{UPDATES}", f"C-{host}-{UPDATES}"])
     postedC = []
     try:                                                     # …and a box with no lane yet: the digest still reaches #alerts
         globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else ("C-alerts" if name == "alerts" else "C-" + name)
         globals()["post"] = lambda cfg, chat, text, thread=None, username=None: postedC.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+        globals()["BOX"] = alt
         with contextlib.redirect_stdout(io.StringIO()):
-            cmd_post(["--route", f"{socket.gethostname().split('.')[0]} digest", "3 tracks running"])
+            cmd_post(["--route", f"{alt} digest", "3 tracks running"])
     finally:
         globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["BOX"] = rbox
     check("post --route: no updates lane on this box → the digest falls back to #alerts, exactly as before the split",
           postedC == ["C-alerts"])
     postedL = []
@@ -7795,6 +8014,69 @@ def cmd_selfcheck():
     finally:
         subprocess.run = real_run19
     check("!digest that overruns its 60 s budget answers with the timeout instead of silence — L19", said19 and "timed out" in said19[-1])
+    # ── !context / !cost / !compact: the box types a READ-ONLY slash command into a session's own pane ──
+    dmS = Daemon(use_slack=False); saidS = []; dmS.say = lambda chat, text, thread=None: saidS.append(text)
+    PANE_S = "> /context\n  ⎿  claude-opus-5 · 137k/1M tokens (14%)"
+    askS = {"rc": 0, "out": PANE_S, "err": ""}
+    runS = []
+    def fake_runS(cmd, **kw):
+        runS.append(list(cmd))
+        if os.path.basename(cmd[0]) == "cc-msg":
+            return type("R", (), {"returncode": askS["rc"], "stdout": askS["out"], "stderr": askS["err"]})()
+        if os.path.basename(cmd[0]) == "cc-context":
+            return type("R", (), {"returncode": 0, "stderr": "",
+                                  "stdout": "demo\tt1\t9\t90000\t1M\tprocess\t2m\t-\t-\n"})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    asked = lambda: [c for c in runS if os.path.basename(c[0]) == "cc-msg"]
+    real_runS = subprocess.run
+    try:
+        subprocess.run = fake_runS
+        dmS.command("!context", "C1", None, "1.1", "demo/t1", "channel")
+        check("!context types /context into that channel's session pane through cc-msg --ask and replies with what "
+              "the pane drew",
+              asked() and asked()[-1][1:] == ["--ask", "demo/t1", "/context"]
+              and saidS and "137k/1M tokens (14%)" in saidS[-1])
+        check("…and carries cc-context's tracked number in the same reply: the pane is the truth, the tracker is "
+              "what the box thought, and the owner asked for both at once",
+              "tracker says 9% of 1M" in saidS[-1])
+        del runS[:]
+        dmS.command("!cost", "C1", None, "1.2", "demo/t1", "channel")
+        dmS.command("!compact", "C1", None, "1.3", "demo/t1", "channel")
+        check("!cost and !compact type their own /command, and nothing else does",
+              [c[3] for c in asked()] == ["/cost", "/compact"])
+        check("…and only !context pairs the tracker line: /cost and /compact are not context readings",
+              "tracker says" not in saidS[-1] and "tracker says" not in saidS[-2])
+        del runS[:]
+        dmS.command("!context demo/t2", "C1", None, "1.4", "demo/t1", "channel")
+        check("an argument names the target, so the owner can ask about a session from any channel",
+              asked() and asked()[-1][2] == "demo/t2")
+        del runS[:]; n_saidS = len(saidS)
+        dmS.command("!model opus", "C1", None, "1.5", "demo/t1", "channel")
+        dmS.command("!clear", "C1", None, "1.6", "demo/t1", "channel")
+        check("THE WHITELIST IS THE WHOLE LIST: /model and /clear change what a session IS, so !model and !clear "
+              "are unknown commands here and NOTHING is typed at the pane",
+              asked() == [] and len(saidS) == n_saidS + 2
+              and all(t.startswith("unknown command") for t in saidS[n_saidS:]))
+        del runS[:]; n_saidS = len(saidS)
+        dmS.command("!context", "C1", None, "1.7", "demo/t1", "channel", is_owner=False)
+        check("a member gets one 'owner only' line and the pane is never touched: !context reads a session the "
+              "member cannot see, and !compact would spend its context",
+              asked() == [] and len(saidS) == n_saidS + 1 and "owner only" in saidS[-1])
+        for st in ("busy", "dialog"):
+            del runS[:]
+            askS.update(rc=1, out="", err=f"cc-msg: main:demo/t1 is {st}\n")
+            dmS.command("!context", "C1", None, "1.8", "demo/t1", "channel")
+            check(f"a pane that is {st} is refused, in one line that says so — cc-msg --ask never spools, so a "
+                  f"/context that could not be typed now is not typed later at a pane nobody is watching",
+                  "not typed" in saidS[-1] and f"is {st}" in saidS[-1] and "```" not in saidS[-1])
+        askS.update(rc=0, out=PANE_S, err="")
+        del runS[:]
+        dmS.command("!context", "C1", None, "1.9", "", "channel")
+        check("a channel with no session of its own asks for a target instead of guessing one",
+              "no session for this channel" in saidS[-1] and asked() == [])
+    finally:
+        subprocess.run = real_runS
+
     dmL21 = Daemon(use_slack=False); dmL21.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
     said21 = []; dmL21.say = lambda chat, text, thread=None: said21.append(text)
     real_fc21 = find_channel
@@ -8524,7 +8806,7 @@ def cmd_selfcheck():
     #    The rest is the engineer's reference output for state (a). `  ↳` is the real payload's indent — Slack
     #    collapses ordinary leading spaces, which is the sub-channel bug this direction also fixes.
     HREF = json.loads(r'''{"type": "home", "blocks": [
-      {"type": "header", "text": {"type": "plain_text", "text": "abox · 07:58Z", "emoji": true}},
+      {"type": "header", "text": {"type": "plain_text", "text": "abox · 07:58", "emoji": true}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "RUNNING 2 · BLOCKED 1 · QUEUED 10"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "🏃 *carpet-rectify* · 1 it · $9.05 · <https://github.com/sandbox/carpet/pull/3|PR #3>\n🏃 *slack-home* · 4 it · $2.40"}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "NEEDS YOU · 3"}]},
@@ -8543,11 +8825,11 @@ def cmd_selfcheck():
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "CHANNELS"}]},
       {"type": "section", "text": {"type": "mrkdwn", "text": "🟢 *#abox* · ❓1 🔴2\n  ↳ 🟡 #abox-carpet · ❓1\n⚪ *#quiet0*\n⚪ *#quiet1*\n⚪ *#quiet2*\n⚪ *#quiet3*\n⚪ *#quiet4*"}},
       {"type": "context", "elements": [{"type": "mrkdwn", "text": "💽 16% of 456G · 🧠 4.3/31G (15%) · 📈 2.60 · 🌡 57°C · ⏱ up 6.2h"}]},
-      {"type": "context", "elements": [{"type": "mrkdwn", "text": "audit 06:00Z — no drift; 2 stale branches on sandbox."}]},
-      {"type": "context", "elements": [{"type": "mrkdwn", "text": "units ok · last boot 01:41Z (power cut)"}]}]}''')
+      {"type": "context", "elements": [{"type": "mrkdwn", "text": "audit 06:00 — no drift; 2 stale branches on sandbox."}]},
+      {"type": "context", "elements": [{"type": "mrkdwn", "text": "units ok · last boot 01:41 (power cut)"}]}]}''')
 
     hqueued = ["sandbox/rug-align", "abox/audit-retry", "abox/notes-index"] + [f"abox/queued{i}" for i in range(7)]
-    hfix = {"box": "abox", "now": "07:58Z",              # (a) BUSY — 2 running · 1 blocked · 2 threads waiting
+    hfix = {"box": "abox", "now": "07:58",              # (a) BUSY — 2 running · 1 blocked · 2 threads waiting
             "units": [("tmux-main", True, ""), ("cc-slackd", True, ""), ("heartbeat", True, ""), ("audit", True, "")],
             "load": "💽 16% of 456G · 🧠 4.3/31G (15%) · 📈 2.60 · 🌡 57°C · ⏱ up 6.2h", "limit": "",
             "waits": [{"ch": "sandbox", "age": 180, "ask": "confirm delete"},      # deliberately out of order: the band ranks them
@@ -8561,8 +8843,8 @@ def cmd_selfcheck():
                        {"state": "blocked", "name": "sandbox/subproj-carpet", "detail": "—", "rank": 1,
                         "reason": "no GH token"}]
                       + [{"state": "queued", "name": n, "detail": "—", "rank": 5} for n in hqueued],
-            "quick": [], "audit_at": "06:00Z", "audit": "no drift; 2 stale branches on sandbox.",
-            "boot": "last boot 01:41Z (power cut)", "last": None}
+            "quick": [], "audit_at": "06:00", "audit": "no drift; 2 stale branches on sandbox.",
+            "boot": "last boot 01:41 (power cut)", "last": None}
     hb = home_blocks(hfix)
     htxt = json.dumps(hb, ensure_ascii=False)
     check("home_blocks (a) BUSY is byte-for-byte the reference output (§05 + the owner's two amendments): 15 blocks — "
@@ -8738,19 +9020,19 @@ def cmd_selfcheck():
           and home_fit("🏃 *a-rather-long-track-name*", ["9 it", "$14.20", "PR #12"]) == "🏃 *a-rather-long-track-name* · 9 it"
           and "  ↳ 🟡 #abox-carpet" in htxt and "    ↳" not in htxt
           and home_names([{"name": "a/x"}, {"name": "b/x"}]) == {"a/x": "a/x", "b/x": "b/x"})
-    hquiet = home_blocks({"box": "abox", "now": "09:12Z", "units": [("tmux-main", True, "")], "load": "📈 0.30",
+    hquiet = home_blocks({"box": "abox", "now": "09:12", "units": [("tmux-main", True, "")], "load": "📈 0.30",
                           "channels": [{"name": "abox", "depth": 0, "session": "⚪ none", "marks": {}}],
                           "tracks": [{"state": "queued", "name": n, "detail": "—", "rank": 5} for n in hqueued + ["abox/one-more"]],
-                          "waits": [], "quick": [], "audit_at": "06:00Z", "audit": "no drift.",
-                          "boot": "last boot 01:41Z (power cut)",
-                          "last": {"name": "abox/slack-home", "verb": "merged", "when": "08:40Z", "at": "x"}})
+                          "waits": [], "quick": [], "audit_at": "06:00", "audit": "no drift.",
+                          "boot": "last boot 01:41 (power cut)",
+                          "last": {"name": "abox/slack-home", "verb": "merged", "when": "08:40", "at": "x"}})
     qtxt = json.dumps(hquiet, ensure_ascii=False)
     check("home_blocks (b) QUIET: 13 blocks — nothing running is a SENTENCE with the last thing that finished, the "
           "needs-you band is ABSENT rather than empty, the CHANNELS band is PRESENT for a channel with nothing "
           "happening in it (owner: \"also show all channels\"), the primary button becomes the next track, and all "
           "eleven queued tracks are printed, not three",
           len(hquiet) == 13 and hquiet[1]["elements"][0]["text"] == "NOTHING RUNNING · QUEUED 11"
-          and hquiet[2]["text"]["text"] == "✅ last: abox/slack-home · merged 08:40Z"
+          and hquiet[2]["text"]["text"] == "✅ last: abox/slack-home · merged 08:40"
           and "NEEDS YOU" not in qtxt and "BACKLOG · 11 · NEXT UP" in qtxt
           and hquiet[8]["elements"][0]["text"] == "CHANNELS" and hquiet[9]["text"]["text"] == "⚪ *#abox*"
           and hquiet[6]["text"]["text"].count("⏳") == 11 and "more on the board" not in qtxt
@@ -8765,12 +9047,12 @@ def cmd_selfcheck():
     check("home_blocks (c) DEGRADED: 14 blocks — the unit that is down and the usage limit sort ABOVE everything the "
           "box is doing, the backlog is HELD (a count, no lines it cannot start), all seven channels are still listed "
           "though not one of them is busy, the roll-call comes back, and the primary button is the restart",
-          len(hdeg) == 14 and hdeg[2]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 09:00Z")
-          and "BACKLOG · 10 · HELD UNTIL 09:00Z" in dtxt and "⏳ sandbox/rug-align" not in dtxt
+          len(hdeg) == 14 and hdeg[2]["text"]["text"].startswith("🔴 *cc-slackd down* · 3 restarts · failed\n⛔ *Usage limit* · no runs until 18:00")
+          and "BACKLOG · 10 · HELD UNTIL 18:00" in dtxt and "⏳ sandbox/rug-align" not in dtxt
           and len(hdeg[10]["text"]["text"].split("\n")) == 7 and "quiet channel" not in dtxt
           and [e["action_id"] for e in hdeg[5]["elements"]] == ["restart_unit", "home_logs", "open_board"]
           and hdeg[5]["elements"][0]["style"] == "danger"
-          and "units: tmux-main ok · audit ok · cc-slackd 🔴 · last boot 01:41Z (power cut)" in dtxt
+          and "units: tmux-main ok · audit ok · cc-slackd 🔴 · last boot 01:41 (power cut)" in dtxt
           and hno_empty_header(hdeg, limited=True) and hbudget(hdeg) and hvocab(hdeg))
     hover = home_blocks(dict(hfix, waits=[{"ch": f"c{i}", "age": 60 * (i + 1), "ask": f"ask {i}"} for i in range(4)],
                              channels=hfix["channels"][:2] + [{"name": f"sub{i}", "depth": 1, "session": "🟢 live", "marks": {"❓": 1}}
@@ -8780,6 +9062,62 @@ def cmd_selfcheck():
                                     + [{"state": "blocked", "name": f"abox/stuck{i}", "detail": "—", "rank": 1, "reason": "no GH token"}
                                        for i in range(2)]
                                     + [{"state": "queued", "name": n, "detail": "—", "rank": 5} for n in hqueued]))
+    # ── the SPEND band: read off cc-spend's ledger, never recomputed ──────────────────────────────────
+    tdS = tempfile.mkdtemp(prefix="cc-home-spend-")
+    real_homeS = HOME
+    try:
+        os.makedirs(f"{tdS}/.cc/state/spend")
+        def wrS(name, body):
+            with open(f"{tdS}/.cc/state/spend/{name}", "w") as fh:
+                fh.write(body)
+        wrS("2026-09-02.tsv",
+            "#ts\tsession\tcwd\trepo\ttrack\tkind\tmodel\tin\tout\tcache_read\tcache_write\test_usd\n"
+            "2026-09-02T01:00:00Z\ts1\t/w/a/t1\tabox\ttrack-a\theadless\tclaude-opus-5\t100\t200\t900000\t100000\t4.000000\n"
+            "2026-09-02T02:00:00Z\ts1\t/w/a/t1\tabox\ttrack-a\theadless\tclaude-opus-5\t0\t0\t0\t0\t0.500000\n"
+            "2026-09-02T03:00:00Z\ts2beefed\t/x\t-\t-\tinteractive\tclaude-opus-5\t10\t10\t1000\t0\t0.250000\n"
+            "torn row with no columns\n")
+        wrS("2026-08-30.tsv",
+            "#ts\tsession\tcwd\trepo\ttrack\tkind\tmodel\tin\tout\tcache_read\tcache_write\test_usd\n"
+            "2026-08-30T01:00:00Z\ts0\t/w/a/t0\tabox\ttrack-a\theadless\tclaude-opus-5\t1\t1\t1\t1\t10.000000\n")
+        wrS("2026-08-26.tsv",                                  # eight days back: outside the week, must not count
+            "#ts\tsession\tcwd\trepo\ttrack\tkind\tmodel\tin\tout\tcache_read\tcache_write\test_usd\n"
+            "2026-08-26T01:00:00Z\tsX\t/w/a/t0\tabox\ttrack-a\theadless\tclaude-opus-5\t1\t1\t1\t1\t99.000000\n")
+        wrS("phantoms.tsv",
+            "#ts\twhy\twhat\trepo\ttrack\tkind\tdetail\tcwd\n"
+            "2026-09-02T03:00:00Z\tunwatched\ts2beefed\t-\t-\tinteractive\tgrew this tick, $0.2500, nobody watching\t/tmp/@nothandle/w\n"
+            "2026-09-02T03:00:00Z\tidle\tpid 7\tabox\ttrack-a\theadless\talive 2.1 h, transcript idle 0.8 h, in a window\t/w/a/t1\n")
+        globals()["HOME"] = tdS
+        spF = home_spend("2026-09-02")
+        globals()["HOME"] = f"{tdS}/never-ticked"    # a box whose cc-spend tick has never run: no ledger, no phantoms
+        spEmpty = home_spend("2026-09-02")
+    finally:
+        globals()["HOME"] = real_homeS
+        shutil.rmtree(tdS, ignore_errors=True)
+    check("home_spend: ONE dollar number for the UTC day across every process, and the week is the 7 days ending "
+          "on it — the row eight days back is outside it, and a torn row is skipped rather than hiding the rest",
+          abs(spF["today"] - 4.75) < 1e-9 and abs(spF["week"] - 14.75) < 1e-9)
+    check("…today by session, biggest first, with the tokens beside the estimate: the two rows of one session are "
+          "one line, and a session outside ~/dev and the worktrees is named by its id because nothing owns it",
+          [(r["who"], round(r["usd"], 2), r["tok"]) for r in spF["rows"]]
+          == [("abox/track-a", 4.5, "1.0M"), ("s2beefed", 0.25, "1k")])
+    check("…and that unowned spend ALSO shows as an explicit unattributed bucket: hiding it would make the rows "
+          "disagree with the headline they add up to",
+          abs(spF["unattributed"] - 0.25) < 1e-9)
+    check("…phantoms come from the list cc-spend's tick already saved, one reason each, and NOTHING in a line "
+          "off a filesystem path can @-mention anyone",
+          len(spF["phantoms"]) == 2 and "nobody watching" in spF["phantoms"][0]
+          and "transcript idle 0.8 h" in spF["phantoms"][1] and "@" not in "".join(spF["phantoms"]))
+    hspend = home_blocks(dict(hfix, spend=spF))
+    stxt = json.dumps(hspend, ensure_ascii=False)
+    check("the SPEND band renders on the busy tab — the headline, where it went, and 👻 the part nobody is "
+          "watching — and the tab still fits the block and character budget with it in",
+          hbudget(hspend) and hno_empty_header(hspend) and hvocab(hspend)
+          and "$4.75* today" in stxt and "$14.75 this week" in stxt
+          and "abox/track-a" in stxt and "unattributed" in stxt and "👻" in stxt)
+    check("an empty ledger renders NO band at all, like every other empty one — a tab that says $0.00 on a box "
+          "whose tick has not run yet is stating something it does not know",
+          not spEmpty and "💵" not in json.dumps(home_blocks(hfix), ensure_ascii=False))
+
     otxt = json.dumps(hover, ensure_ascii=False)
     check("home_blocks (d) OVERFLOW: 13 tracks, 10 channels, 6 asks — RUNNING, NEEDS YOU, BACKLOG and now CHANNELS all "
           "print EVERY row (owner, 2026-08-30: \"always show ALL that are running, all that need me, and all backlog "
@@ -8998,20 +9336,20 @@ def cmd_selfcheck():
     finally:
         globals()["HOME"] = _homeH
         subprocess.run(["rm", "-rf", hh, hh0], check=False)
-    hhb = home_blocks(dict(hfix, handoffs={"today": 3, "when": "21:40Z", "who": "abox/slack-home"}))
+    hhb = home_blocks(dict(hfix, handoffs={"today": 3, "when": "06:40", "who": "abox/slack-home"}))
     check("home_handoffs: today's crossings counted off cc-context's ledger (a torn line is skipped, yesterday's are "
           "not today's, and only the file's TAIL is ever read), rendered as one grey line below the fold — and ZERO renders nothing, like every empty band",
-          hnd_day == {"today": 2, "when": "21:40Z", "who": "abox/slack-home"}
+          hnd_day == {"today": 2, "when": "06:40", "who": "abox/slack-home"}
           and hnd_big == hnd_day                         # a ledger far past the tail budget answers the same
           and hnd_quiet == {} and hnd_none == {}
-          and "3 handoffs today · last 21:40Z abox/slack-home" in json.dumps(hhb, ensure_ascii=False)
+          and "3 handoffs today · last 06:40 abox/slack-home" in json.dumps(hhb, ensure_ascii=False)
           and "1 handoff today" in json.dumps(home_blocks(dict(hfix, handoffs={"today": 1})), ensure_ascii=False)
           and "handoff" not in json.dumps(home_blocks(dict(hfix, handoffs={"today": 0})), ensure_ascii=False)
           and hbudget(hhb) and hno_empty_header(hhb) and len(hhb) == 16)
     hempty = home_blocks({})
-    hwfix = {"box": "abox", "now": "10:15Z", "units": [("tmux-main", True, "")], "load": "📈 0.30",
+    hwfix = {"box": "abox", "now": "10:15", "units": [("tmux-main", True, "")], "load": "📈 0.30",
              "channels": [], "waits": [], "quick": [], "boot": "",
-             "last": {"name": "abox/old", "verb": "merged", "when": "08:40Z", "at": "x"},
+             "last": {"name": "abox/old", "verb": "merged", "when": "08:40", "at": "x"},
              "tracks": [{"state": "waiting", "name": f"lesson/course{n}", "detail": "—", "rank": 1,
                          "reason": "which syllabus should I build from"} for n in (1, 2, 3)]}
     hwait = home_blocks(hwfix)
@@ -9046,12 +9384,12 @@ def cmd_selfcheck():
           and hwmix[1]["elements"][0]["text"] == "NOTHING RUNNING · WAITING ON YOU 6"
           and hwmix[3]["elements"][0]["text"] == "NEEDS YOU · 6"
           and htexts(home_blocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1", "live": True,
-                                                         "ask": ""}])))[1] == "✅ last: abox/old · merged 08:40Z"
+                                                         "ask": ""}])))[1] == "✅ last: abox/old · merged 08:40"
           and "WAITING ON YOU" not in json.dumps(home_blocks(dict(hwsess, sessions=[{"repo": "lesson", "name": "course1",
                                                                                       "live": True, "ask": ""}]))))
     check("home_blocks: …and one waiting track is not the same as one BLOCKED track — the blocked one is off his list "
           "(it stopped, it is not asking) and is never counted as waiting on him",
-          json.dumps(home_blocks({"box": "abox", "now": "10:15Z", "units": [], "load": "", "channels": [],
+          json.dumps(home_blocks({"box": "abox", "now": "10:15", "units": [], "load": "", "channels": [],
                                   "waits": [], "quick": [], "boot": "", "last": None,
                                   "tracks": [{"state": "blocked", "name": "r/t", "detail": "—", "rank": 2,
                                               "reason": ""}]}), ensure_ascii=False).count("WAITING ON YOU") == 0)
@@ -9073,11 +9411,57 @@ def cmd_selfcheck():
                                            "rank": 0} for i in range(90)]))
     check("home_blocks: a 90-track board still publishes one view inside every cap (≤%d blocks, ≤3000 chars a text)"
           % HOME_MAXBLK, hbudget(hbig) and "more running_" in json.dumps(hbig, ensure_ascii=False))
-    check("home_boot / home_until / home_clip: the glance gets the fact, the log keeps the diagnosis",
+    # ── THE CLOCK (owner, 2026-09-01: "why do all time stamps have a Z after them? And why are some still in
+    #    UTC"). Everything the box WRITES INTO SLACK is HH:MM in the owner's zone with no Z; every log, journal,
+    #    board file and record it keeps is UTC and ends in Z. cc-time decides the zone and is the only renderer.
+    #    Pinned to a zone of its own — never this box's — and one far enough east that the DAY moves with it.
+    hI = 1788274921                                  # 2026-09-01 15:02 UTC = 2026-09-02 00:02 in Tokyo
+    check("hhmm: a known UTC instant renders in the CONFIGURED zone, not this box's and not UTC — with the day "
+          "when the caller asks for it, and never a Z",
+          hhmm(hI) == "00:02" and hhmm(hI, day=True) == "2026-09-02 00:02" and hhmm_all([hI, hI + 3600]) == ["00:02", "01:02"]
+          and hhmm_all([]) == [] and "Z" not in hhmm())
+    check("home_boot / home_until: the two lines the glance reads OUT OF a UTC log are converted where they are "
+          "shown — cc-limit and power-events.log still speak UTC, because cc-land parses one of them",
           home_boot("2026-08-30T01:44:42Z boot=2026-08-30T01:41:33Z last_alive=… gap=100362s cause=power-loss (gap = …)")
-          == "last boot 01:41Z (power cut)"
-          and home_until("usage limit until 09:00Z (18m left)") == "09:00Z" and home_until("") == ""
-          and home_clip("a" * 20 + " " + "b" * 200, 180).endswith("…") and len(home_clip("x y z", 180)) == 5)
+          == "last boot 10:41 (power cut)"
+          and home_until("usage limit until 09:00Z (18m left)") == "18:00" and home_until("") == "")
+    check("iso_hhmm: GitHub's merge stamp is the owner's clock too — and it is a DIFFERENT day there, which a "
+          "renderer that only stripped the Z would have got wrong",
+          iso_hhmm("2026-09-01T04:33:58Z") == "13:33" and "Z" not in iso_hhmm("not a stamp"))
+    real_cct = cctime                             # a bin/ without cc-time: the branch the module-level except makes
+    hE = calendar.timegm(time.strptime("2026-09-01T04:33:58Z", "%Y-%m-%dT%H:%M:%SZ"))     # a card's merge time
+    hB = calendar.timegm(time.strptime("2026-08-30T01:41:33Z", "%Y-%m-%dT%H:%M:%SZ"))     # a boot, seconds and all
+    hlt = lambda t: time.strftime("%H:%M", time.localtime(t))                             # …this process's own zone
+    try:
+        globals()["cctime"] = None
+        fb = hhmm_all(["2026-09-01T04:33:58Z", "2026-08-30T01:41Z", hI, "not a stamp"])
+        fb_now, fb_card = hhmm(), iso_hhmm("2026-09-01T04:33:58Z")
+        fb_boot = home_boot("2026-08-30T01:44:42Z boot=2026-08-30T01:41:33Z gap=100362s cause=power-loss")
+    finally:
+        globals()["cctime"] = real_cct
+    check("with no cc-time in bin/ the fallback renders THE STAMP IT WAS GIVEN, in this process's zone, and hands "
+          "back what it cannot read untouched — substituting `now` for it is the whole bug: a card would say "
+          "'landed ✓ <now>' for a PR merged hours ago, and the tab would call the current clock the last boot",
+          fb == [hlt(hE), hlt(hB), hlt(hI), "not a stamp"] and fb_card == hlt(hE)
+          and fb_boot == f"last boot {hlt(hB)} (power cut)" and bool(re.fullmatch(r"\d\d:\d\d", fb_now)))
+    htz = tempfile.mkdtemp(); real_dir_tz = DIR
+    try:                                          # the tab as published, beside the record OF that publish
+        globals()["DIR"] = htz
+        home_dump(hfix)
+        hd = json.load(open(f"{htz}/home.json"))
+    finally:
+        globals()["DIR"] = real_dir_tz
+    check("the tab the owner reads carries no HH:MMZ anywhere — while home.json, the record cc-secretary reads "
+          "it out of, is stamped UTC and still ends in Z",
+          not re.search(r"\d\d:\d\dZ", json.dumps(hd["text"], ensure_ascii=False))
+          and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", hd["at"]))
+    check("an approval card landed before the stamps went local is still recognised as landed, so it is not "
+          "edited a second time — and one landed since is recognised too",
+          bool(LANDED_RE.search("[myrepo] PR #7: gate  ·  landed ✓ 04:33Z"))
+          and bool(LANDED_RE.search("[myrepo] PR #7: gate  ·  landed ✓ 13:33"))
+          and not LANDED_RE.search("[myrepo] PR #7: gate  ·  :+1: from the owner merges (squash)"))
+    check("home_clip: the glance gets the fact, the log keeps the diagnosis",
+          home_clip("a" * 20 + " " + "b" * 200, 180).endswith("…") and len(home_clip("x y z", 180)) == 5)
     # ── the button gate: the Home tab is published PER USER, so a member gets their own copy of these buttons
     dmA = Daemon(use_slack=False); dmA.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-x"}; dmA.use_slack = True
     hacted, hdms = [], []

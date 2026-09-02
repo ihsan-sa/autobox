@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""cc-time — the ONE place a time is rendered for a person to READ.
+
+Everything the box writes INTO SLACK — posts, cards, the Home tab, cc-notify's pushes, the vitals chart — is
+stamped HH:MM in the owner's zone and carries no Z. Everything it LOGS or RECORDS — logs, journals, board files,
+audit reports, the landing queue — stays UTC and keeps its Z: those are read by machines and by whoever is
+reconstructing an incident, and a local zone in them is one more thing to get wrong. The rule is one line in
+COMMS.md, and it exists because every stamp the owner saw was UTC with a Z on it (owner, 2026-09-01).
+
+    cc-time slack [WHEN…]          HH:MM, one line per WHEN (default: now)
+    cc-time slack --date [WHEN…]   "%Y-%m-%d %H:%M" — for text where the day is not obvious from context
+    cc-time zone                   the zone in force
+    cc-time selfcheck
+
+WHEN is a unix epoch (a fraction is allowed and dropped), a UTC ISO stamp — "2026-09-01T04:33:58Z", the shape
+every record on this box writes — or `now`.
+
+IMPORTED, NOT SHELLED OUT TO. The python tools load this file and call slack()/slack_all()/zone() directly:
+
+    import importlib.machinery, importlib.util
+    _s = importlib.util.spec_from_loader("cctime", importlib.machinery.SourceFileLoader("cctime", f"{BIN}/cc-time"))
+    cctime = importlib.util.module_from_spec(_s); _s.loader.exec_module(cctime)
+
+cc-slack redraws the Home tab every 5 s with a dozen stamps on it, and its selfcheck stubs subprocess.run to
+prove no case shells out — a renderer that was a subprocess would be both a cost and a lie there. The shell
+tools use the CLI above.
+
+THE ZONE: CC_TZ when it is set and this box has that zone (the environment first, then ~/.cc/config through
+cc-config — the same precedence every other key has); otherwise TZ; otherwise /etc/localtime, the box's own. A
+CC_TZ naming a zone this box does not have is REFUSED to stderr and the box's own used instead: the alternative
+is a silent UTC, which is the one failure this file exists to end.
+"""
+import datetime as dt
+import os
+import subprocess
+import sys
+import time
+import zoneinfo
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+USAGE = "usage: cc-time slack [--date] [WHEN…] | zone | selfcheck"
+_FILE_TZ = []                       # ~/.cc/config's CC_TZ, read at most once a process: a zone does not move
+
+
+def _configured():
+    """CC_TZ as cc-config would answer it: the environment first, the file second, read once and remembered."""
+    z = os.environ.get("CC_TZ")
+    if z is not None:
+        return z
+    if not _FILE_TZ:
+        try:
+            r = subprocess.run([f"{BIN}/cc-config", "get", "CC_TZ", ""], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=10)
+            _FILE_TZ.append(r.stdout.strip() if r.returncode == 0 else "")
+        except Exception:
+            _FILE_TZ.append("")
+    return _FILE_TZ[0]
+
+
+def zone():
+    """The zone name in force. "" only when nothing on this box names one."""
+    z = _configured()
+    if z:
+        try:
+            zoneinfo.ZoneInfo(z)
+            return z
+        except Exception:
+            print(f"cc-time: no zone called {z} on this box — using its own", file=sys.stderr)
+    if os.environ.get("TZ"):
+        return os.environ["TZ"]
+    link = os.path.realpath("/etc/localtime")
+    return link.split("/zoneinfo/", 1)[1] if "/zoneinfo/" in link else ""
+
+
+def tz():
+    """The zone as a tzinfo. Falls back to this process's own local zone — never to UTC, which is the bug."""
+    name = zone()
+    if name:
+        try:
+            return zoneinfo.ZoneInfo(name)
+        except Exception:
+            pass
+    return dt.datetime.now().astimezone().tzinfo
+
+
+def epoch(when):
+    """WHEN → seconds. None or `now` is now; a UTC ISO stamp and a unix epoch are both accepted."""
+    if when is None or when == "" or when == "now":
+        return time.time()
+    try:
+        return float(when)
+    except (TypeError, ValueError):
+        pass
+    s = str(when).strip()
+    return dt.datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s).timestamp()
+
+
+def slack_all(whens, day=False):
+    """One HH:MM per WHEN, in the owner's zone, never with a Z."""
+    fmt = "%Y-%m-%d %H:%M" if day else "%H:%M"
+    z = tz()
+    return [dt.datetime.fromtimestamp(epoch(w), z).strftime(fmt) for w in whens]
+
+
+def slack(when=None, day=False):
+    return slack_all([when], day)[0]
+
+
+def selfcheck():
+    import re
+    n = f = 0
+
+    def check(name, cond):
+        nonlocal n, f
+        n += 1
+        print(("  ok   " if cond else "  FAIL ") + name)
+        if not cond:
+            f += 1
+
+    # A zone of its own, never this box's: a fixed offset, no DST, and far enough east that the DAY moves too —
+    # a renderer that only pretended to convert would still pass a same-day check.
+    FZ, INSTANT = "Asia/Tokyo", 1788274921          # 2026-09-01 15:02 UTC = 2026-09-02 00:02 in Tokyo
+    was = os.environ.get("CC_TZ")
+    try:
+        os.environ["CC_TZ"] = "UTC"
+        check("a known instant in UTC is its own HH:MM", slack(INSTANT) == "15:02")
+        os.environ["CC_TZ"] = FZ
+        check("…and in the configured zone it is that zone's HH:MM", slack(INSTANT) == "00:02")
+        check("--date carries the zone's DAY, which is not the UTC one", slack(INSTANT, day=True) == "2026-09-02 00:02")
+        check("no rendering carries a Z — that is the whole rule",
+              "Z" not in slack(INSTANT) + slack(INSTANT, day=True) + slack())
+        check("a UTC ISO stamp (what the board, the queue and GitHub write) converts too",
+              slack("2026-09-01T04:33:58Z") == "13:33")
+        check("a fractional epoch renders the same minute", slack(f"{INSTANT}.947") == "00:02")
+        check("several WHENs render one line each, in order, and an empty list renders nothing",
+              slack_all([INSTANT, INSTANT + 3600]) == ["00:02", "01:02"] and slack_all([]) == [])
+        check("zone names what is in force", zone() == FZ)
+        os.environ["CC_TZ"] = "Mars/Olympus"        # date(1) and ZoneInfo would take it and give UTC, unremarked
+        err = io_capture()
+        check("an unknown zone falls back to the box's OWN zone and says so, rather than a silent UTC",
+              slack(INSTANT) == dt.datetime.fromtimestamp(INSTANT).strftime("%H:%M")
+              and "no zone called Mars/Olympus" in err())
+        del os.environ["CC_TZ"]                      # whatever THIS box is set to: the shape is what can be asserted
+        check("with nothing configured there is still a zone, an HH:MM and no Z",
+              bool(zone()) and bool(re.fullmatch(r"\d\d:\d\d", slack(INSTANT))))
+    finally:
+        os.environ.pop("CC_TZ", None) if was is None else os.environ.__setitem__("CC_TZ", was)
+
+    # THE DOOR: cc-notify's one Slack-facing stamp. It has no selfcheck of its own and its push is a real send,
+    # so this drives it in log-only mode and reads back the line it wrote.
+    import tempfile
+    log = tempfile.mktemp(prefix="_selfcheck_cctime_")
+    env = dict(os.environ, CC_TZ=FZ, CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=log)
+    try:
+        subprocess.run([f"{BIN}/cc-notify", "test"], env=env, capture_output=True, timeout=60,
+                       stdin=subprocess.DEVNULL)
+        line = open(log).read().strip()
+    except Exception as e:
+        line = f"(cc-notify did not run: {e})"
+    check("cc-notify's push is stamped HH:MM with no Z and no 'UTC'",
+          bool(re.search(r"\tNotifications work\. \d\d:\d\d$", line)))
+    check("…while the LOG line beside it is still UTC and still ends in Z",
+          bool(re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\t", line)))
+    if os.path.exists(log):
+        os.remove(log)
+    print(f"cc-time selfcheck: {n - f} passed, {f} failed")
+    return 0 if f == 0 else 1
+
+
+def io_capture():
+    """Everything printed to stderr from here on, as a callable. The unknown-zone case is about what gets SAID."""
+    import io
+    buf, real = io.StringIO(), sys.stderr
+    sys.stderr = buf
+
+    def done():
+        sys.stderr = real
+        return buf.getvalue()
+    return done
+
+
+def main(argv):
+    if not argv:
+        print(USAGE, file=sys.stderr)
+        return 2
+    if argv[0] == "zone":
+        print(zone() or time.strftime("%Z"))
+        return 0
+    if argv[0] == "selfcheck":
+        return selfcheck()
+    if argv[0] == "slack":
+        rest = argv[1:]
+        day = bool(rest) and rest[0] == "--date"
+        whens = rest[1:] if day else rest
+        try:
+            for line in slack_all(whens or [None], day):
+                print(line)
+        except (ValueError, OverflowError, OSError) as e:
+            print(f"cc-time: cannot read a time from {whens!r} ({e})", file=sys.stderr)
+            return 2
+        return 0
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

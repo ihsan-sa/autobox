@@ -23,11 +23,14 @@ PHANTOMS. Each tick also snapshots the live `claude` processes to procs.tsv. A p
 watching: a session whose transcript grew this tick with no tmux window on its cwd and no live board row behind
 it, or a process alive over an hour whose transcript has not grown in thirty minutes. A window is ON a cwd when
 its pane sits there or deeper — never a parent, or the `box` window parked at ~/dev would watch the whole box.
+The tick WRITES that list to phantoms.tsv as well as printing it on demand, so a reader (the Slack Home tab) can
+show it without re-deriving the rule from tmux, the boards and the loops — and the answer it shows is the same
+one `cc-spend phantoms` gives, because `grew` only changes at a tick anyway.
 
   cc-spend                     today, by session, biggest first
   cc-spend --by repo|track|model|kind [--week]
   cc-spend --week              the last 7 days
-  cc-spend phantoms            spend with nobody watching it
+  cc-spend phantoms            spend with nobody watching it (the tick also saves it to phantoms.tsv)
   cc-spend tick                what the timer runs
   cc-spend selfcheck           fixtures in a HOME of its own — no network, never this box's ledger
 """
@@ -45,6 +48,7 @@ PROJ = os.path.join(H, ".claude", "projects")
 ST = os.path.join(H, ".cc", "state", "spend")
 OFF = os.path.join(ST, "offsets.json")
 PROCS = os.path.join(ST, "procs.tsv")
+PHANTOMS = os.path.join(ST, "phantoms.tsv")
 WTS = os.path.join(H, ".cc", "worktrees")
 DEV = os.path.join(H, "dev")
 BOARDS = os.path.join(H, ".cc", "boards")
@@ -52,6 +56,7 @@ STATE = os.path.join(H, ".cc", "state")
 
 COLS = ["ts", "session", "cwd", "repo", "track", "kind", "model", "in", "out", "cache_read", "cache_write", "est_usd"]
 PCOLS = ["ts", "pid", "ppid", "etime_s", "cwd", "repo", "track", "kind", "model", "session"]
+PHCOLS = ["ts", "why", "what", "repo", "track", "kind", "detail", "cwd"]
 
 # ONE rates table, $ per MILLION tokens: (input, output, cache read). Cache WRITES are 1.25x input at the 5-minute
 # TTL and 2x at the 1-hour one, and `usage.cache_creation` says which of the two a write was — so a write is
@@ -356,8 +361,12 @@ def tick():
     procs = proc_snapshot()
     save_tsv(PROCS, PCOLS, [[iso(stamp)] + [p[c] for c in PCOLS[1:]] for p in procs])
     save_json(OFF, {"tick": iso(stamp), "files": files, "grew": grew})
+    # …and the phantom list, last: it reads procs.tsv and the rows this tick just appended, so it must run after
+    # both are on disk. A reader of the file gets the same answer `cc-spend phantoms` would give.
+    ph = phantom_now(grew, stamp)
+    save_tsv(PHANTOMS, PHCOLS, [[iso(stamp)] + [r[c] for c in PHCOLS[1:]] for r in ph])
     print(f"cc-spend tick {iso(stamp)}: {len(rows)} row(s), {len(grew)} session(s) grew, "
-          f"{len(procs)} live claude, ${sum(float(r[-1]) for r in rows):.4f} est")
+          f"{len(procs)} live claude, {len(ph)} phantom(s), ${sum(float(r[-1]) for r in rows):.4f} est")
     return 0
 
 
@@ -474,20 +483,25 @@ def phantom_rows(grew, procs, panes, loops, boards, last_growth, at):
     return out
 
 
+def phantom_now(grew, at):
+    """The phantom list as it stands right now. The tick calls it with the `grew` it just built and saves the
+    answer; `cc-spend phantoms` calls it with the `grew` on disk and prints it. One rule, one implementation."""
+    growth = {}
+    for r in read_rows(days(2, at)):
+        t = parse_ts(r["ts"])
+        c = r["cwd"].rstrip("/")
+        if t and (c not in growth or t > growth[c]):
+            growth[c] = t
+    return phantom_rows(grew, read_tsv(PROCS, PCOLS), tmux_paths(), loop_tracks(), board_states(), growth, at)
+
+
 def phantoms():
     off = load_offsets()
     if not off.get("tick"):
         print("cc-spend: no tick has run yet — `cc-spend tick` or switch cc-spend.timer on")
         return 1
     at = now()
-    growth = {}
-    for r in read_rows(days(2)):
-        t = parse_ts(r["ts"])
-        c = r["cwd"].rstrip("/")
-        if t and (c not in growth or t > growth[c]):
-            growth[c] = t
-    rows = phantom_rows(off.get("grew") or {}, read_tsv(PROCS, PCOLS), tmux_paths(), loop_tracks(),
-                        board_states(), growth, at)
+    rows = phantom_now(off.get("grew") or {}, at)
     print(f"phantoms — last tick {off['tick']}")
     if not rows:
         print("  none: every session that grew has a window or a live board row, and no process is idling")
@@ -802,6 +816,34 @@ def selfcheck():
            phantom_rows({}, old, {cwd}, set(), {}, {cwd: at - timedelta(minutes=5)}, at) == [])
         ok("a young process is never a phantom, however quiet",
            phantom_rows({}, [dict(old[0], etime_s=60)], set(), set(), {}, {}, at) == [])
+        # THE TICK SAVES THE LIST — its own fixture HOME, its own transcript, timestamped now so it counts as
+        # grown. Only OUR row is asserted: proc_snapshot walks the real /proc, so this box's own long-lived
+        # sessions legitimately show up beside it in any run.
+        th2 = tempfile.mkdtemp(prefix="ccspend-ph-")
+        try:
+            cwd2 = os.path.join(th2, ".cc", "worktrees", "r", "t9")
+            proj2 = os.path.join(th2, ".claude", "projects", "-p2")
+            os.makedirs(proj2)
+            open(os.path.join(proj2, "s9session.jsonl"), "w").write(json.dumps(
+                {"type": "assistant", "requestId": "req_p", "cwd": cwd2, "sessionId": "s9session",
+                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()), "entrypoint": "sdk-cli",
+                 "message": {"model": "claude-opus-5", "id": "m_p",
+                             "usage": {"input_tokens": 100, "output_tokens": 10,
+                                       "cache_read_input_tokens": 1000,
+                                       "cache_creation_input_tokens": 0}}}) + "\n")
+            env2 = {**os.environ, "HOME": th2}
+            r2 = subprocess.run([sys.executable, me, "tick"], env=env2, capture_output=True, text=True)
+            ph = [ln.rstrip("\n").split("\t") for ln in open(os.path.join(th2, ".cc", "state", "spend", "phantoms.tsv"))
+                  if not ln.startswith("#")]
+            mine = [r for r in ph if r[1] == "unwatched" and r[3] == "r" and r[4] == "t9"]
+            ok("the tick saves the phantom list to phantoms.tsv, so a reader (the Home tab) shows it without "
+               "re-deriving the rule from tmux, the boards and the loops",
+               r2.returncode == 0 and len(mine) == 1 and "nobody watching" in mine[0][6])
+            said2 = subprocess.run([sys.executable, me, "phantoms"], env=env2, capture_output=True, text=True)
+            ok("…and it is the same list `cc-spend phantoms` prints, because `grew` only moves at a tick",
+               said2.returncode == 0 and "s9sessio" in said2.stdout and "unwatched" in said2.stdout)
+        finally:
+            shutil.rmtree(th2, ignore_errors=True)
         ok("`phantoms` before any tick says so and exits 1 rather than printing an empty all-clear",
            subprocess.run([sys.executable, me, "phantoms"],
                           env={**os.environ, "HOME": tempfile.mkdtemp(prefix="ccspend-empty-")},

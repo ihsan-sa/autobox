@@ -4,6 +4,12 @@
   cc-context                       the session running in $PWD (newest transcript for this cwd)
   cc-context <repo> <track>        that track's session (session id from the board)
   cc-context --transcript PATH | --session ID
+  cc-context --true <target>       ask the session ITSELF: types /context into that idle pane and reads its
+                                   number. A busy pane falls back to THAT TARGET'S estimate below (a bare
+                                   `repo/track` is the same pair as the two-word form); a target that names no
+                                   <repo>/<track> is refused rather than answered about the caller's own cwd.
+                                   Everything downstream — the line, --json, --over, the level — then reads THAT
+                                   number, so the handoff thresholds are decided on the pane's own reading
   cc-context --all                 TSV of every recorded session: repo track pct used window src age level pending
   cc-context --record              stdin = a Stop hook payload -> measure, record, and tell the session
   cc-context --thresholds          "<journal> <handoff> <ceiling>" (percentages)
@@ -296,6 +302,51 @@ def measure(path, session_id=None):
     return {"used": used, "window": window, "pct": round(100.0 * used / window, 1),
             "model": model, "window_src": src, "compacted": compacted,
             "transcript": path, "session_id": session_id,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+# ---- the pane's own number ---------------------------------------------------------------------
+# measure() above is an ESTIMATE: it sums the last turn's usage off the transcript and infers the window from
+# whatever evidence it can find. The session itself knows both exactly, and /context prints them — so when the
+# pane is IDLE we can simply ask it (owner, 2026-09-01: "a good way for the system to verify context for the
+# sake of handoffs"). cc-msg --ask owns the keyboard rule: it refuses a busy pane and one holding a dialog, and
+# it never spools, because a /context typed by some later drain answers to nobody.
+
+PANE_TOKENS = re.compile(r"([\d.,]+)\s*([kKmM])?\s*/\s*([\d.,]+)\s*([kKmM])?\s*tokens\s*\((\d+(?:\.\d+)?)\s*%\)")
+
+
+def _tokens(n, suffix):
+    return int(float(n.replace(",", "")) * {"k": 1000, "m": 1_000_000}.get((suffix or "").lower(), 1))
+
+
+def pane_ask(target, cmd="/context"):
+    """What `cmd` draws in that target's pane, or None when the pane would not take it."""
+    try:
+        r = subprocess.run([os.path.join(BIN, "cc-msg"), "--ask", target, cmd],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=90)
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout.strip() else None
+
+
+def pane_measure(target):
+    """{used, window, pct, ...} read off the session's OWN /context, or None when the pane did not answer.
+    The LAST match wins: an older /context can still be scrolled up the pane, and the one just typed is at the
+    bottom. The percentage is the session's own, not one recomputed here — asking it and then not believing it
+    would be the estimate again with extra steps."""
+    out = pane_ask(target)
+    if not out:
+        return None
+    hits = PANE_TOKENS.findall(out)
+    if not hits:
+        return None
+    used_n, used_s, win_n, win_s, pct = hits[-1]
+    used, window = _tokens(used_n, used_s), _tokens(win_n, win_s)
+    if window <= 0:
+        return None
+    return {"used": used, "window": window, "pct": float(pct),
+            "model": None, "window_src": "pane", "compacted": False,
+            "transcript": None, "session_id": None,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
@@ -686,7 +737,7 @@ def line(m):
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
-    as_json = quiet = do_all = do_record = do_handoffs = False
+    as_json = quiet = do_all = do_record = do_handoffs = do_true = False
     over = None
     path = sid = repo = track = None
     args = []
@@ -707,6 +758,8 @@ def main(argv):
             do_record = True
         elif a == "--handoffs":
             do_handoffs = True
+        elif a == "--true":
+            do_true = True
         elif a == "--over":
             over = float(argv.pop(0)) if argv and not argv[0].startswith("-") and argv[0][:1].isdigit() \
                 else "level"                      # bare --over = the handoff line for THAT session's window
@@ -756,18 +809,42 @@ def main(argv):
                   f"\t{'pending' if d.get('pending') else '-'}")
         return 0
 
-    if not path:
-        path, sid = resolve(repo, track, sid)
-    if not path or not os.path.exists(path):
-        if not quiet:
-            what = f"{repo}/{track}" if repo else (sid or os.getcwd())
-            print(f"cc-context: no transcript for {what}", file=sys.stderr)
-        return 2
-    m = measure(path, sid)
+    m = None
+    if do_true:
+        # A TARGET, ALWAYS: --true types at a keyboard, and the one keyboard it must never type at is its own
+        # caller's. `<repo> <track>` and a bare `<target>` (`box`, `repo/track`) are the same tmux window name.
+        target = f"{repo}/{track}" if repo and track else (args[0] if args else None)
+        if not target:
+            print("cc-context: --true needs a target — the tmux window to ask (<repo> <track>, or box)",
+                  file=sys.stderr)
+            return 2
+        m = pane_measure(target)          # None = the pane was busy, in a dialog, or gone: fall back to the estimate
+        if not m and not path and not sid and not (repo and track):
+            # …TO THE TARGET'S OWN ESTIMATE, never the caller's. `--true repo/track` names the session in one
+            # word, so split it back into the pair resolve() wants; with nothing to go on resolve() returns the
+            # newest transcript for THIS process's cwd, which is the session that typed the command — a
+            # different number, a different level, and a different --over answer, reported as if it were the
+            # target's. A target with no slash (`box`) names no board row, so there is nothing to fall back to.
+            if "/" in target:
+                repo, track = target.split("/", 1)
+            else:
+                if not quiet:
+                    print(f"cc-context: {target}'s pane would not answer, and `{target}` is not a <repo>/<track> "
+                          "to estimate from", file=sys.stderr)
+                return 2
     if not m:
-        if not quiet:
-            print(f"cc-context: {path} has no answered turn yet", file=sys.stderr)
-        return 2
+        if not path:
+            path, sid = resolve(repo, track, sid)
+        if not path or not os.path.exists(path):
+            if not quiet:
+                what = f"{repo}/{track}" if repo else (sid or os.getcwd())
+                print(f"cc-context: no transcript for {what}", file=sys.stderr)
+            return 2
+        m = measure(path, sid)
+        if not m:
+            if not quiet:
+                print(f"cc-context: {path} has no answered turn yet", file=sys.stderr)
+            return 2
     if as_json:
         print(json.dumps(m, indent=2))
     elif not quiet:
@@ -1098,6 +1175,84 @@ def selfcheck():
         os.environ.pop("CC_CTX_BOX_MODEL", None)
     else:
         os.environ["CC_CTX_BOX_MODEL"] = box0
+    # ---- --true: the pane's own number, and what happens when the pane will not give it ----------
+    import contextlib, io
+    PANE = """> /context
+  ⎿  claude-opus-5 · 137k/1M tokens (14%)
+     System prompt: 3.1k tokens
+"""
+    real_ask = pane_ask
+    try:
+        globals()["pane_ask"] = lambda target, cmd="/context": PANE
+        tm = pane_measure("demo/t1")
+        ok("--true reads the session's OWN number off an idle pane, window and all",
+           bool(tm) and tm["used"] == 137000 and tm["window"] == 1_000_000
+           and tm["pct"] == 14.0 and tm["window_src"] == "pane")
+        globals()["pane_ask"] = lambda target, cmd="/context": "37k/200k tokens (18%)\n" + PANE
+        tm = pane_measure("demo/t1")
+        ok("…the LAST /context on the pane wins: an older one is still scrolled above the one just typed",
+           bool(tm) and tm["pct"] == 14.0 and tm["window"] == 1_000_000)
+        globals()["pane_ask"] = lambda target, cmd="/context": None
+        ok("a pane that is busy, holding a dialog or gone gives no number at all — cc-msg --ask refused it, "
+           "and a number invented here would be exactly the estimate this flag exists to replace",
+           pane_measure("demo/t1") is None)
+
+        # the fallback and the preference, through the CLI, against one transcript fixture
+        px = tx([asst("claude-opus-5", 100, 0, 359_900)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["--true", "--transcript", px, "demo/t1"])
+        ok("--true against a pane that refused falls back to the transcript estimate, and says the window came "
+           "from the transcript's evidence rather than from the pane",
+           rc == 0 and "window from" in out.getvalue() and "from pane" not in out.getvalue()
+           and "36%" in out.getvalue())
+        globals()["pane_ask"] = lambda target, cmd="/context": PANE
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["--true", "--transcript", px, "demo/t1"])
+        ok("…and when the pane DOES answer, its number is the one reported — 14%, not the transcript's 36%",
+           rc == 0 and "14%" in out.getvalue() and "window from pane" in out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            over_true = main(["--true", "--over", "30", "-q", "--transcript", px, "demo/t1"])
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            over_est = main(["--over", "30", "-q", "--transcript", px])
+        ok("…and THE THRESHOLDS ARE DECIDED ON IT: the same transcript is over the 30% line on the estimate and "
+           "under it on the pane's own reading, so --over answers differently — which is the whole point of "
+           "asking the session instead of guessing at it",
+           over_true == 1 and over_est == 0)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = main(["--true"])
+        ok("--true with no target is an error: it types at a keyboard, and the one keyboard it must never type "
+           "at is its own caller's", rc == 2 and "needs a target" in err.getvalue())
+        # …and the FALLBACK belongs to the target too. No --transcript here: this is the documented bare form,
+        # and resolve() with nothing to go on returns the newest transcript for whatever cwd this process is in.
+        globals()["pane_ask"] = lambda target, cmd="/context": None
+        real_res, seen = resolve, []
+        try:
+            globals()["resolve"] = lambda repo=None, track=None, sid=None, cwd=None: \
+                (seen.append((repo, track, sid)) or (None, None))
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = main(["--true", "demo/t1"])
+            ok("a bare `--true <repo>/<track>` whose pane refuses estimates from THAT TRACK'S transcript — the "
+               "one word is split back into the pair, never left as None for resolve() to answer with the "
+               "CALLER'S cwd, which is a different session's percentage, level and --over answer",
+               seen == [("demo", "t1", None)] and rc == 2 and "no transcript for demo/t1" in err.getvalue())
+            del seen[:]
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = main(["--true", "box"])
+            ok("…and a target that is no <repo>/<track> at all is REFUSED rather than estimated: `box` names no "
+               "board row, so there is nothing of its own to fall back to",
+               seen == [] and rc == 2 and "not a <repo>/<track>" in err.getvalue())
+        finally:
+            globals()["resolve"] = real_res
+        os.remove(px)
+    finally:
+        globals()["pane_ask"] = real_ask
+
     print(f"cc-context selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 

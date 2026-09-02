@@ -5,6 +5,7 @@
 # finding aimed at them was refused and thrown away — nobody was watching, and nothing said so.)
 #   cc-msg <window> "text"      window = tmux window name in session main (e.g. myapp, myapp/step1)
 #   cc-msg --drain [<window>]   deliver what is spooled, in order, while the pane is free (cc-msg.timer, 60 s)
+#   cc-msg --ask <window> /cmd  type a bare /command at a FREE pane and print what it draws (never spooled)
 #   cc-msg selfcheck
 # Prints "queued" (rc 0) when the text went to the spool, nothing when it was typed.
 # The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
@@ -16,6 +17,8 @@ set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")
 STATE="$HOME/.cc/state"
 STAND_MIN="${CC_MSG_STAND_MIN:-10}"          # how long an unknown dialog may stand before the box is told, once
+ASK_SETTLE="${CC_MSG_ASK_SETTLE:-1}"         # --ask: seconds between two reads of the pane while it draws its answer
+ASK_TRIES="${CC_MSG_ASK_TRIES:-6}"           # --ask: how many of those before it prints whatever is there
 KEY_WAIT="${CC_MSG_KEY_WAIT:-0.3}"           # between the text and its Enter (Enter is swallowed otherwise)
 DIALOG_WAIT="${CC_MSG_DIALOG_WAIT:-1.5}"     # after answering a known-safe prompt, before reading the pane again
 MAX_DRAIN="${CC_MSG_MAX_DRAIN:-20}"          # messages per window per drain: a tick must stay cheap
@@ -314,6 +317,45 @@ send(){    # $1 window  $2 text — THE contract: delivered, or queued and repor
   return 0
 }
 
+# ── the read-only probe, and the one slash command a caller may ask a pane ────────────────────────
+# state() PRESSES NOTHING. free_pane() answers a known-safe prompt before it reports, which is right for delivering
+# a message and wrong for a caller that only wants to know: a probe that dismisses the dialog it is reporting on has
+# changed the pane it was asked about. So this reads one capture and says what it saw, and nothing else.
+state(){   # $1 window → free|busy|dialog|no-window|no-session on stdout; rc 0 ONLY for free. ask()'s gate.
+  local id st
+  id=$(win_id "$1"); [ -n "$id" ] || { echo no-window; return 1; }
+  live_claude "$id" || { echo no-session; return 1; }
+  st=$(blocked "$(tmux capture-pane -p -t "$id" 2>/dev/null)")
+  [ -n "$st" ] && { echo "$st"; return 1; }
+  echo free
+}
+
+ask_strip(){   # the pane as a person would quote it: no box-drawing chrome, no blank runs, no shortcut footer
+  printf '%s\n' "$1" | sed 's/[[:space:]]*$//' | grep -e '[A-Za-z0-9]' | grep -v -e '^[?] for shortcuts' | tail -40
+}
+
+# WHICH /commands may be asked is the CALLER'S policy, not this file's: cc-slack keeps the whitelist its
+# Slack path will type (context, cost, compact). What is enforced here is the keyboard rule.
+# --ask IS NOT A MESSAGE, so it is never spooled. A "/context" sitting in a spool is typed by some later drain, at a
+# pane nobody is looking at, and its answer goes nowhere — the caller wants the pane's answer NOW or not at all.
+# It is also why only a BARE /command is accepted: the text goes straight to the keyboard, and a slash command with
+# an argument is how you tell a session to do something, not how you ask it what it knows.
+ask(){   # $1 window  $2 "/<command>" → what the pane drew, on stdout; rc 1 when the pane was not free
+  local id st cap prev="" i=0
+  case "$2" in /[a-z]*) ;; *) echo "cc-msg: --ask takes a bare /command" >&2; return 2;; esac
+  case "${2#/}" in *[!a-z-]*) echo "cc-msg: --ask takes a bare /command, no arguments" >&2; return 2;; esac
+  st=$(state "$1") || { echo "cc-msg: main:$1 is $st" >&2; return 1; }
+  id=$(win_id "$1")
+  type_at "$id" "$2"
+  while [ "$i" -lt "$ASK_TRIES" ]; do                  # settle: read until two reads agree and the turn is over
+    sleep "$ASK_SETTLE"
+    cap=$(tmux capture-pane -p -t "$id" 2>/dev/null)
+    [ "$cap" = "$prev" ] && [ -z "$(blocked "$cap")" ] && break
+    prev=$cap; i=$((i + 1))
+  done
+  ask_strip "$cap"
+}
+
 # ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
 # A whole fake box: its own HOME, a stub tmux whose pane text is a file this test rewrites, a stub ps that says a
 # claude lives under it, and stub cc-slack/cc-notify/cc-config that only record. It runs a COPY of this script
@@ -591,6 +633,43 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; scr "$FREE"; out=$(CC_FAKE_WIN=other "$T/bin/cc-msg" "$W" "nowhere" 2>&1); rc=$?
   k "$(t test "$rc" != 0)" "an unknown window is still an error, not a queue that nothing will ever read"
 
+  # (11) --ask: a bare /command typed at a FREE pane, and the pane's own answer back. Never spooled.
+  local CTX='> /context
+ ⎿  claude-opus-5 · 137k/1M tokens (14%)
+    System prompt: 3.1k tokens
+╭──────────────────────────────────────╮
+│ >                                    │
+╰──────────────────────────────────────╯
+? for shortcuts'
+  reset; scr "$CTX"; out=$(CC_MSG_ASK_SETTLE=0 "$T/bin/cc-msg" --ask "$W" /context); rc=$?
+  k "$(t test "$rc" = 0)" "--ask at a free pane succeeds"
+  k "$(t grep -qF '/context' "$T/keys")" "…types the /command at the keyboard"
+  k "$(t grep -qF '137k/1M tokens (14%)' <<<"$out")" "…and prints the line the pane drew, which is what the caller came for"
+  k "$(nt grep -q '^│ *│$' <<<"$out")" "…with the empty input box stripped: a quote of a pane is not its chrome"
+  k "$(nt grep -qF '? for shortcuts' <<<"$out")" "…and without the shortcut footer"
+  k "$(nt test -f "$SP")" "--ask spools NOTHING: a /context typed by some later drain answers to nobody"
+  reset; scr "$BUSY"; out=$(CC_MSG_ASK_SETTLE=0 "$T/bin/cc-msg" --ask "$W" /context 2>&1); rc=$?
+  k "$(t test "$rc" = 1)" "--ask at a mid-turn pane is refused"
+  k "$(t grep -q busy <<<"$out")" "…saying why"
+  k "$(nt test -s "$T/keys")" "…and types nothing: the keys would land in the running turn"
+  reset; scr "$MODEL"; out=$(CC_MSG_ASK_SETTLE=0 "$T/bin/cc-msg" --ask "$W" /context 2>&1); rc=$?
+  k "$(t test "$rc" = 1)" "--ask at an open dialog is refused"
+  k "$(t grep -q dialog <<<"$out")" "…saying which"
+  k "$(nt test -s "$T/keys")" "…and PRESSES NOTHING at it, not even the known-safe Escape a delivery would: asking a
+       pane a question is not a reason to answer the prompt somebody else is being asked"
+  k "$(nt test -f "$DG")" "…and writes no standing-dialog stamp: only a delivery owns that"
+  reset; scr "$FREE"; out=$(CC_MSG_ASK_SETTLE=0 CC_FAKE_WIN='' "$T/bin/cc-msg" --ask "$W" /context 2>&1); rc=$?
+  k "$(t test "$rc" = 1)" "--ask at a window that is gone is refused"
+  k "$(t grep -q no-window <<<"$out")" "…saying so, rather than typing into whatever window took its place"
+  reset; scr "$FREE"; out=$(CC_MSG_ASK_SETTLE=0 CC_FAKE_PROC=bash "$T/bin/cc-msg" --ask "$W" /context 2>&1); rc=$?
+  k "$(t test "$rc" = 1)" "--ask at a pane with no interactive claude is refused: /context would run as a shell command"
+  k "$(t grep -q no-session <<<"$out")" "…saying which of the two it was"
+  reset; scr "$FREE"; CC_MSG_ASK_SETTLE=0 "$T/bin/cc-msg" --ask "$W" '/compact keep the plan' >/dev/null 2>&1; rc=$?
+  k "$(t test "$rc" = 2)" "--ask refuses a /command with an argument: that is telling a session to do something"
+  reset; scr "$FREE"; CC_MSG_ASK_SETTLE=0 "$T/bin/cc-msg" --ask "$W" 'status please' >/dev/null 2>&1; rc=$?
+  k "$(t test "$rc" = 2)" "--ask refuses text that is not a /command at all"
+  k "$(nt test -s "$T/keys")" "…and neither reaches the keyboard"
+
   echo "cc-msg selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]
 }
@@ -598,7 +677,8 @@ $BUSY"; out=$(msg "hello mid-turn")
 
 case "${1:-}" in
   --drain)    shift; drain "${1:-}";;
+  --ask)      shift; ask "${1:?cc-msg: --ask needs a window}" "${2:?cc-msg: --ask needs a /command}";;
   selfcheck)  selfcheck;;
-  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --drain [<window>] | cc-msg selfcheck' >&2; exit 2;;
+  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --drain [<window>] | cc-msg --ask <window> /cmd | cc-msg selfcheck' >&2; exit 2;;
   *)          w=$1; shift; send "$w" "${*:-$(cat)}";;
 esac
