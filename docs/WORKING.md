@@ -24,9 +24,13 @@ every 2 h and each one works the order above on its own — nothing here waits t
 
 ## dispatch judgement
 - One worker per file, always. Check the board's live tracks before dispatching.
-- A brief is one screen: the goal, the why, the files, the gates, what NOT to touch —
-  and 3-5 testable done-criteria; the PR review verifies against those, briefed with the
-  contract and the diff, never the worker's own journal.
+- A brief is a GOAL, not a plan: what, why, the boundaries, and how done is judged —
+  3-5 testable done-criteria, on one screen. The worker chooses the implementation, the
+  tests and the docs; naming those for it buys a worse answer than it would have found.
+  The PR review verifies against the done-criteria, briefed with the contract and the
+  diff, never the worker's own journal.
+- A LAND-AFTER-FIX is not yours to dispatch: the landing queue sends one fix iteration
+  itself and re-queues the PR when that branch pushes. You hear about the second stop.
 - Small fix with no live collision → short branch by the planning session. More → a worker.
 
 ## model policy

@@ -4,12 +4,16 @@
   cc-land <repo> <pr-number> [<pr-number> …]      the PR path; several PRs deploy once, at the end
   cc-land <repo> <pr-number> --no-review          …without the review gate: land a diff nothing read
   cc-land <repo> <pr-number> --re-review          …asking again about a head already reviewed (it costs again)
+  cc-land <repo> <pr-number> --full-gates         …every gate, instead of the ones the diff has earned
   cc-land <repo> --track <t> --note "<what>"      work with no PR (a config edit, a host change)
   cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does
-  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). A queued PR
-                                                  SURVIVES a usage-limit review (it waits for the reset) and a red
-                                                  gate (3 tries, 15 min apart): the sweep that keeps a job arms its
-                                                  own next run. A review verdict or an unmergeable PR ends it at once
+  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). Every
+                                                  queued job is reviewed and gated AT ONCE; the merges and the deploy
+                                                  stay serial, in queue order. A queued PR SURVIVES a usage-limit
+                                                  review (it waits for the reset) and a red gate (3 tries, 15 min
+                                                  apart): the sweep that keeps a job arms its own next run. A
+                                                  LAND-AFTER-FIX sends ONE fix iteration and waits for that branch to
+                                                  push; a second stop, a DO-NOT-LAND or an unmergeable PR ends it
   cc-land selfcheck                               the decision table; no network, no systemctl
 
 Landing a change used to be nine separate things to remember — gates, merge, the #approvals card, the mark on
@@ -72,7 +76,8 @@ honest answer and the point: an ask nobody can measure is not an ask that is don
 Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
 cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
-import calendar, fcntl, glob, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+import ast, calendar, concurrent.futures, fcntl, glob, json, os, re, shlex, shutil, signal, subprocess, sys
+import tempfile, threading, time
 import urllib.parse, urllib.request
 
 HOME = os.path.expanduser("~")
@@ -80,6 +85,8 @@ BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the sa
 DEV = f"{HOME}/dev"
 BOARDS = f"{HOME}/.cc/boards"
 UNITS = f"{HOME}/.config/systemd/user"
+STATE = f"{HOME}/.cc/state"               # a track's own directory: its brief, its journal, and the review that
+                                          # dispatched it a fix. One constant so the selfcheck can move it (below)
 LANDQ = f"{HOME}/.cc/state/land"          # the landing queue: one job file per PR, plus what each repo has installed
 LAND_TRIES = 3                            # a deploy that keeps failing stops re-driving itself and says so, once
 CATCHUP_EVERY = 900                       # how often the box POLLS origin for a merge nobody here made. The queue is
@@ -90,6 +97,28 @@ CATCHUP_EVERY = 900                       # how often the box POLLS origin for a
 # with none of them lands ungated and says so — this is a general tool, not one tree's own script.
 GATES = ("core/tests/check.sh", "tests/check.sh", "tests/check-extra.sh", "core/tests/selftest.sh", "tests/selftest.sh")
 FAILED_RE = re.compile(r"(\d+) failed")   # a suite ending "0 failed" passed; "1 failed" did not, whatever it exited with
+# …and of those, the END-TO-END ones: ten minutes and 270 cases, the only gate a landing is ever slow for. The
+# cheap ones run on every diff; this one runs when the diff can plausibly break it (see gate_tier). `--full-gates`
+# is the way past the question, and a repo whose only gate IS its suite still runs it — the tier removes gates from
+# a run, it never invents one.
+SUITE = ("core/tests/selftest.sh", "tests/selftest.sh")
+# The three things that make a diff worth the whole suite, and nothing here is a list of THIS tree's files: a
+# general tool cannot know one repo's shared library by name. Paths that gate everything by construction (the
+# tests themselves, what installs them, what configures them, CI), a diff too wide to reason about, and a file
+# the rest of the tree actually depends on — which is COUNTED, not listed (see shared_file).
+SHARED_PATH_RE = re.compile(r"(^|/)(tests?|config|templates|\.github|\.circleci)/"
+                            r"|(^|/)(install\.sh|Makefile|Dockerfile|pyproject\.toml|package\.json|setup\.py|"
+                            r"requirements\.txt|go\.mod|Cargo\.toml)$")
+DOC_RE = re.compile(r"\.(md|markdown|txt|rst|adoc|org)$|(^|/)(docs|doc)/|(^|/)(LICENSE|COPYING|NOTICE)$", re.I)
+COMMENT_RE = re.compile(r"^\s*($|#|//|--[ \t]|\*[ \t/]|\*$|/\*)")   # a line comment in the syntaxes this box writes
+WIDE_FILES = 12                           # past this many files, or this many changed lines, "narrow" is a claim
+WIDE_LINES = 600                          # nobody can check — the suite is cheaper than being wrong about it
+SHARED_REFS = 2                           # other files naming it: fewer than this and it is a leaf, not a library
+GATE_MEMO_TTL = 3600                      # a memo ("these gates passed on this SHA, at this tier") is never trusted
+                                          # for longer than this. The DIRECTORY it lives in is not a constant — see
+                                          # gate_dir(), which reads LANDQ at call time so it follows the selfcheck's
+                                          # scratch queue instead of unlinking the live one.
+PREPARE_AT_ONCE = int(os.environ.get("CC_LAND_PREPARE") or 4)   # reviews and gates in flight at once (test hook)
 # The review gate. ONE generic prompt, shipped beside this script (core/config/), because a reviewer per repo is a
 # reviewer nobody maintains; what a repo wants said about ITSELF goes in its own docs/REVIEW.md, read from the BASE
 # branch, never the PR — a change to the rules is reviewed under the old ones, or a PR could rewrite its own reviewer.
@@ -98,6 +127,14 @@ CLAUDE = os.environ.get("CC_CLAUDE", f"{HOME}/.local/bin/claude")
 REVIEW_PROMPT = "config/review-prompt.md"     # relative to the repo THIS cc-land lives in, not the one being landed
 REVIEW_RULES = "docs/REVIEW.md"               # read from origin/<base> of the repo being landed; absent = no extra rules
 REVIEW_BUDGET = "3"                           # dollars per PR, enforced by the model runner itself
+# …and WHICH model reads it is the same question the gates ask (gate_tier): the review was the expensive half of
+# every landing, bought at the top model whether the diff was a library everything imports or three paragraphs of
+# prose. Prose and comments are not read by a model at all, a narrow code change gets the cheap one, and only a
+# wide diff — or one touching the tests, the install, the config or a file the tree depends on — is worth the
+# worker model. Per million tokens: opus $5 in / $25 out, sonnet $2 / $10 (2026-06), so a `focused` review is
+# roughly a third of what a `full` one costs and a `docs` one is nothing.
+REVIEW_MODEL = os.environ.get("CC_LAND_REVIEW_MODEL") or "claude-opus-5"
+REVIEW_MODEL_SMALL = os.environ.get("CC_LAND_REVIEW_MODEL_SMALL") or "claude-sonnet-5"
 REVIEW_MARK = "cc-land-review"                # the HTML comment that makes re-posting the same review a no-op
 REVIEW_VERDICTS = ("LAND", "LAND-AFTER-FIX", "DO-NOT-LAND")
 # The verdict is a FIELD the runner validates, not a sentence somebody greps for. Free text cannot be parsed
@@ -143,6 +180,20 @@ FATAL = ("review", "gates", "merge", "install", "units", "restart")
 # it at once. A usage limit at the review is neither: the job is DEFERRED to the reset, uncounted (see run_job).
 RETRY = ("gates", "install", "units", "restart")
 RETRY_AFTER = 900                         # …and how long a kept job waits before the queue re-runs itself (see rearm)
+# A LAND-AFTER-FIX is the one stopping verdict that names its own remedy, and dispatching that remedy was a dozen
+# full-context turns of the planning session's every time: read the verdict, write the brief, dispatch, watch for
+# the push, re-queue. The queue does it itself now — ONCE. A second stop on the same PR is a person's problem, and
+# that one word is the difference between a loop that converges and one that spends all night on a PR.
+FIX_MODEL = os.environ.get("CC_LAND_FIX_MODEL") or "claude-opus-5"   # the worker model, not this box's fallback
+FIX_LOOP, FIX_BUDGET = "1", "12"          # ONE repair round, then a person (owner, 2026-09-02) — and it RESUMES.
+                                          # The bound is REAL: dispatch passes --no-extend, so cc-loop's carry-on
+                                          # batches are off and the round is one iteration, $12, full stop.
+                                          # the worker's own session (`--resume-last`) rather than opening a cold
+                                          # one: that session already read this code and paid for reading it, and
+                                          # a fresh context spends the whole round re-deriving it before it can
+                                          # change a line. A track with no session to resume still gets its round.
+FIX_WAIT = 5400                           # how long the fix has to push before the owner is told it did not
+FIX_POLL = 300                            # …and how often the queue asks whether it has
 COSMETIC = 3                              # exit code for "the box is right, its bookkeeping is not"
 UNVERIFIED = 4                            # "the box is deployed, and nothing has confirmed the owner can see it"
 
@@ -173,11 +224,21 @@ def clean_start():
     and selftest's H4 (a HUP'd loop must kill its claude) went red 3/3 in every nohup'd chain of 2026-09-01
     02:54–04:05Z, then green from tmux with nothing else changed. sh(**clean_start()) for every gate."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE" and not k.startswith("CLAUDE_")}
+    default_signals()
+    return {"env": env}
 
-    def dfl():
-        for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
-            signal.signal(s, signal.SIG_DFL)
-    return {"env": env, "preexec_fn": dfl}
+
+def default_signals():
+    """The four dispositions back to default IN THIS PROCESS, so every child inherits them through fork+exec. Not a
+    preexec_fn: that callback runs between fork and exec, and prepare() forks from several threads at once — a
+    sibling holding a runtime lock at that moment wedges the child before exec, Popen never returns, and the queue
+    lock is held for ever (review-176e). signal.signal only works on the main thread, so main() calls this once at
+    startup and the pool's children start from what it set; a call from a worker thread is a no-op."""
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for s in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(s, signal.SIG_DFL)
 
 
 def slack(method, token, **kw):
@@ -342,8 +403,204 @@ def record_applied(repo, sha):
     write_atomic(f"{LANDQ}/{repo}.applied", {"sha": sha, "at": stamp()})
 
 
+_OUT = threading.local()
+_LOCKS, _LOCKS_GUARD = {}, threading.Lock()
+
+
+def git_lock(root):
+    """One lock per repository, for the git commands that go through a file the WHOLE repo shares. `git fetch`
+    writes `.git/FETCH_HEAD` and `git rev-parse FETCH_HEAD` reads it back, so two prepare threads fetching two PRs
+    of the same repo — the ordinary case on this box — can hand one of them the other's head: the review is then
+    bought against the wrong diff and its verdict posted on the wrong PR (the comment is keyed by that SHA, so the
+    serial phase misses it and buys the ~$2 review again). `worktree add`/`remove` share `.git/worktrees` and the
+    ref locks the same way. Held across fetch-and-resolve and across a checkout — seconds — and NEVER across the
+    review or the gates, which are the minutes this phase exists to overlap."""
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(root, threading.RLock())
+
+
+def emit(text):
+    """Everything this tool says about a landing goes through here. It is one function so that the PREPARE phase,
+    which reviews and gates several PRs at the same time, can keep each job's lines together: threads printing as
+    they go produced one interleaved paragraph in which no line said which PR it was about. A thread with no buffer
+    set — every path outside prepare — prints exactly as before, and `run_job`'s redirect_stdout still catches it."""
+    buf = getattr(_OUT, "buf", None)
+    print(text, flush=True) if buf is None else buf.append(text)
+
+
 def out(mark, text):
-    print(f"  {mark} {text}", flush=True)
+    emit(f"  {mark} {text}")
+
+
+class collected:
+    """This thread's lines, kept instead of printed. Thread-local on purpose: contextlib.redirect_stdout rebinds
+    sys.stdout for the whole PROCESS, so using it here would have swallowed the other threads' output too."""
+
+    def __enter__(self):
+        _OUT.buf = []
+        return _OUT.buf
+
+    def __exit__(self, *a):
+        _OUT.buf = None
+
+
+# ── which gates a diff has earned ────────────────────────────────────────────────────────────────────────
+def blob(root, sha, path):
+    """A file's contents at a commit, or None when it is not there (added on one side, deleted on the other)."""
+    rc, o = sh(["git", "show", f"{sha}:{path}"], cwd=root, timeout=60)
+    return o if rc == 0 else None
+
+
+def undoc(tree):
+    """The same AST with every docstring removed, so two trees compare equal when only the prose between them
+    changed. This is what makes "comment-only" EXACT for Python rather than a guess about line prefixes — and the
+    files this box is made of are Python whose docstrings are most of their bulk."""
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and body:
+            first = body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def comment_only(root, a, b, path):
+    """True when this file's change alters no code. Two answers, the exact one first: if BOTH sides parse as Python,
+    their docstring-stripped ASTs are compared and nothing else matters (ast.dump carries no line numbers). Otherwise
+    every added and removed line has to be blank or a line comment. Anything unreadable is False — this decides
+    whether to SKIP the suite, so not knowing must always mean running it. This reads CONTENT and only content, so
+    a change git can see and this cannot — a mode bit, the far half of a rename — is never "a comment"."""
+    old, new = blob(root, a, path), blob(root, b, path)
+    if old is None or new is None:
+        return False              # added or deleted outright: a whole file is never "a comment"
+    if old == new:
+        return False              # identical bytes, and git still calls the file changed: what moved is METADATA —
+                                  # the executable bit, or a rename. `chmod -x` on a worker's launcher breaks every
+                                  # loop on the box and edits not one character, and this said "comment" about it,
+                                  # which meant NOBODY read the diff and the suite never ran (review of PR #176).
+                                  # It has to be here rather than below, too: two equal blobs also have equal ASTs.
+    o1, n1 = old.split("\n", 1)[0], new.split("\n", 1)[0]
+    if o1 != n1 and (o1.startswith("#!") or n1.startswith("#!")):
+        return False              # the interpreter line: invisible to a Python AST and `#…` to the line scan, and
+                                  # `-#!/bin/bash +#!/bin/sh` stops a script working — never prose (review of #176)
+    try:
+        if ast.dump(undoc(ast.parse(old))) == ast.dump(undoc(ast.parse(new))):
+            return True
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        pass                      # not Python, or not parseable at one end: fall through to the line reading
+    rc, d = sh(["git", "diff", "-U0", a, b, "--", path], cwd=root, timeout=60)
+    if rc:
+        return False
+    hunk = False
+    for ln in d.splitlines():
+        if ln.startswith("@@"):   # the +++/--- headers all come BEFORE the first hunk, and a content line of three
+            hunk = True           # dashes would otherwise be read as one of them
+            continue
+        if hunk and ln[:1] in ("+", "-") and not COMMENT_RE.match(ln[1:]):
+            return False
+    return hunk                   # no hunk at all = nothing was read; say no
+
+
+def shared_file(root, sha, path):
+    """Does the rest of the tree depend on this file? COUNTED, not configured: how many other tracked files name it.
+    A general tool cannot be handed one repo's list of shared libraries, and a list is the thing nobody updates —
+    so `core/bin/cc-slack`, which half this box calls, gates fully, and a leaf script nothing references does not.
+    True on any doubt: an unanswerable question means the whole suite, not a narrow run."""
+    name = os.path.basename(path)
+    if len(name) < 3:
+        return True
+    rc, o = sh(["git", "grep", "-l", "-F", "--", name, sha], cwd=root, timeout=120)
+    if rc > 1:                    # 1 = no match at all; anything above = git could not answer
+        return True
+    refs = {ln.split(":", 1)[1] for ln in o.splitlines() if ":" in ln}
+    refs.discard(path)
+    return len(refs) >= SHARED_REFS
+
+
+def churn(root, a, b):
+    """Lines added plus lines removed. WIDE_LINES + 1 when it cannot be read, so unreadable counts as wide."""
+    rc, o = sh(["git", "diff", "--numstat", a, b], cwd=root, timeout=120)
+    if rc:
+        return WIDE_LINES + 1
+    n = 0
+    for ln in o.splitlines():
+        f = ln.split("\t")
+        n += sum(int(x) for x in f[:2] if x.isdigit())    # "-" for a binary file: counted as nothing, and binaries
+    return n                                              # are never doc or comment, so they cannot reach `docs`
+
+
+def gate_tier(root, a, b, changed):
+    """Which gates this diff has earned, as (tier, why) — and `why` is printed, because a gate that quietly ran less
+    than you thought is worse than a slow one. `full` every gate · `docs` and `focused` the cheap static ones only.
+    Every path OUT of here that is not a positive answer returns `full`: this function's job is to find a reason to
+    skip ten minutes of suite, and no reason means no skip."""
+    paths = [p for _, p in changed]
+    if not paths:
+        return "full", "nothing could be read about what this changes"
+    if len(paths) > WIDE_FILES:
+        return "full", f"a wide diff — {len(paths)} files, more than anyone can scope by eye"
+    hit = [p for p in paths if SHARED_PATH_RE.search(p)]
+    if hit:
+        return "full", f"the tests, the install, the config, the templates or CI changed ({', '.join(hit[:3])})"
+    if REVIEW_RULES in paths:
+        # The rules the reviewer itself is handed. They are read from origin/<base> precisely so a PR cannot bring
+        # its own — and a `docs` tier, which now means NOBODY reads the diff, would give away the other half of
+        # that: rewrite the rules in a markdown-only PR, land it unread, and every later PR is judged under them.
+        return "full", f"{REVIEW_RULES} — the rules the reviewer is judged by are never a documentation change"
+    inst = [p for p in paths if os.path.basename(p) in ("CLAUDE.md", "AGENTS.md")
+            or p.startswith(".claude/") or "/.claude/" in p]
+    if inst:
+        # Same hole as REVIEW_RULES, one ring out: these files are loaded into every session on the box, so a
+        # markdown-only PR rewriting them landing with NOBODY reading it steers every session after it.
+        return "full", f"instructions every session loads are never a documentation change ({', '.join(inst[:3])})"
+    n = churn(root, a, b)
+    if n > WIDE_LINES:
+        return "full", f"a wide diff — {n} changed lines across {len(paths)} file(s)"
+    code = [p for p in paths if not DOC_RE.search(p) and not comment_only(root, a, b, p)]
+    if not code:
+        return "docs", f"documentation and comments only — {len(paths)} file(s), no code changed"
+    shared = [p for p in code if shared_file(root, b, p)]
+    if shared:
+        return "full", f"a file the rest of the tree depends on changed ({', '.join(shared[:3])})"
+    return "focused", f"a narrow change nothing else here references ({', '.join(code[:3])})"
+
+
+def gate_dir():
+    """Where the memos live, worked out FROM LANDQ EVERY TIME rather than bound once at import. The selfcheck runs
+    the queue for real against a scratch LANDQ, and a memo dir frozen at import would have it sweeping and unlinking
+    the live `~/.cc/state/land/gates` — a real sweep's memo deleted under it, and this repo's own landing gate red
+    for reasons that have nothing to do with the diff. `myrepo.applied` broke exactly this way once (see cmd_selfcheck),
+    and a derived path is the version of the fix nobody has to remember to extend."""
+    return f"{LANDQ}/gates"
+
+
+def memo_path(repo, pr, sha, tier):
+    return f"{gate_dir()}/{repo}-{pr}-{sha[:12]}-{tier}.json"
+
+
+def gate_memo(repo, pr, sha, tier):
+    """"These gates already passed, on THIS sha, at THIS tier" — the one thing the parallel prepare phase leaves
+    behind for the serial one to spend. Keyed by the commit, so it can never answer for code that has moved, and
+    given a short life besides: a memo older than GATE_MEMO_TTL is ignored and swept."""
+    path = memo_path(repo, pr, sha, tier)
+    j = read_json(path) or {}
+    try:            # SPENT ON READ. A memo hands one sweep's prepare phase to that same sweep's serial one and
+        os.unlink(path)     # nothing further: left lying about, the green it recorded would answer for the NEXT
+    except OSError:         # sweep too, and a kept job would then never re-run the gate it was kept for — which is
+        pass                # the whole of why `gates` is in RETRY (the suite flakes). Caught by selfcheck (2).
+    if not j.get("gates") or time.time() - epoch_of(j.get("at", "")) > GATE_MEMO_TTL:
+        return ""
+    return f"{len(j['gates'])} gate(s) passed on PR #{pr}: {', '.join(j['gates'])}"
+
+
+def sweep_memos():
+    """Spent or stale memos go. Nothing depends on this — a memo is only ever an optimisation — so it never raises."""
+    for p in glob.glob(f"{gate_dir()}/*.json"):
+        try:
+            if time.time() - os.path.getmtime(p) > GATE_MEMO_TTL:
+                os.unlink(p)
+        except OSError:
+            pass
 
 
 def last(text, n=200):
@@ -396,10 +653,16 @@ def name_status(text):
 
 # ── the landing ──────────────────────────────────────────────────────────────────────────────────────────
 class Land:
-    def __init__(self, repo, pr=None, track=None, note="", span=None, review=True, re_review=False):
+    def __init__(self, repo, pr=None, track=None, note="", span=None, review=True, re_review=False, full_gates=False):
         self.repo, self.pr, self.track, self.note = repo, pr, track, note
         self.want_review = review    # --no-review turns the gate off. Default ON everywhere, the 👍 path included
         self.re_review = re_review   # …and --re-review buys a SECOND opinion on a head one was already bought for
+        self.full_gates = full_gates  # --full-gates: never scope the gates to the diff, run every one of them
+        self.fill_memo = False   # prepare() sets it: this Land WRITES a gate memo for the serial phase, and reads none
+        self.verdict = ""        # the review's answer as a FIELD, so the queue can act on LAND-AFTER-FIX without
+        self.findings = ""       # re-reading its own error message — and what the reviewer said, for the fix brief
+        self.by = ""             # which model actually read it, so the PR comment cannot claim a different one
+        self._tier = None        # (head, tier, why): decided ONCE per head and shared by the review and the gates
         self.span = span         # (installed_sha, tip_sha): a deploy with no PR, catching the box up to a merge it missed
         self.job = ""            # the queue file this landing is running out of, if any — the stage is written to it
         self.stopped = ""        # the step that stopped it, so the worker knows whether trying again could differ
@@ -428,14 +691,16 @@ class Land:
         the changed-file list are taken from the merge-base against the LOCAL origin/<base>, and a checkout that
         has not fetched in a day makes that merge-base old — the reviewer is then handed commits that landed last
         week as if this PR added them, and pays for reading them. Sets self.head and returns it."""
-        sh(["git", "fetch", "-q", "origin", self.base()], cwd=self.root, timeout=300)   # stale is not fatal; old is
-        rc, o = sh(["git", "fetch", "-q", "origin", f"pull/{self.pr}/head"], cwd=self.root, timeout=300)
-        if rc:
-            raise Failed(f"cannot fetch PR #{self.pr}: {last(o)}")
-        rc, o = sh(["git", "rev-parse", "FETCH_HEAD"], cwd=self.root)
-        if rc:
-            raise Failed(f"cannot resolve the head of PR #{self.pr}: {last(o)}")
-        self.head = o.strip()
+        with git_lock(self.root):   # FETCH_HEAD is one file per repo: the fetch and the rev-parse that reads it
+                                    # back are one operation, or a sibling thread's PR head is the answer
+            sh(["git", "fetch", "-q", "origin", self.base()], cwd=self.root, timeout=300)   # stale is not fatal
+            rc, o = sh(["git", "fetch", "-q", "origin", f"pull/{self.pr}/head"], cwd=self.root, timeout=300)
+            if rc:
+                raise Failed(f"cannot fetch PR #{self.pr}: {last(o)}")
+            rc, o = sh(["git", "rev-parse", "FETCH_HEAD"], cwd=self.root)
+            if rc:
+                raise Failed(f"cannot resolve the head of PR #{self.pr}: {last(o)}")
+            self.head = o.strip()
         return self.head
 
     def head_checkout(self, fetch=True):
@@ -447,22 +712,26 @@ class Land:
             self.fetch_head()
         tmp = tempfile.mkdtemp(prefix="cc-land-")
         tree = f"{tmp}/head"
-        rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, self.head], cwd=self.root, timeout=300)
+        with git_lock(self.root):    # …and .git/worktrees is shared too. The SHA is explicit here, so this lock
+                                     # is only about the bookkeeping git writes, and it is held for a second
+            rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, self.head], cwd=self.root, timeout=300)
         if rc:
             shutil.rmtree(tmp, ignore_errors=True)
             raise Failed(f"cannot check out PR #{self.pr}: {last(o)}")
         return tmp, tree
 
     def drop_checkout(self, tmp, tree):
-        sh(["git", "worktree", "remove", "--force", tree], cwd=self.root)
+        with git_lock(self.root):
+            sh(["git", "worktree", "remove", "--force", tree], cwd=self.root)
         shutil.rmtree(tmp, ignore_errors=True)
 
     # -- 1. the review -------------------------------------------------------------------------------------
     def review(self):
         """One headless reviewer, before the suites, because a green suite says the code runs and says nothing
         about whether it is the change that was asked for. It reads the diff, the files at the PR's own head, the
-        track's brief and journal, and the repo's own docs/REVIEW.md if it has one — and it has no shell and
-        nothing to write with, so the worst it can do is be wrong out loud in a PR comment."""
+        track's BRIEF — its done-criteria, not its journal — and the repo's own docs/REVIEW.md if it has one, and it
+        has no shell and nothing to write with, so the worst it can do is be wrong out loud in a PR comment. Who
+        reads it, or whether anybody does, is the same tier answer the gates run at: see review_model()."""
         if not self.pr:
             raise Skip("no PR — the review reads a diff, and this path has none")
         if not self.want_review:
@@ -485,6 +754,11 @@ class Land:
             verdict, said = prior
             return self.verdict_result(verdict, said, "reviewed earlier", "at this head",
                                        ", already on the PR (--re-review to ask again)")
+        self.by, tier, why = self.review_model()
+        if not self.by:
+            # The one case where the honest answer is that nothing needs to read it. A verdict about prose is a
+            # verdict about taste, and buying one costs more than the change it is judging.
+            raise Skip(f"no model read this diff — the {tier} tier: {why}")
         stamp = sh([f"{BIN}/cc-limit", "status"], timeout=60)
         if stamp[0] == 0:
             raise Failed(f"no review: {stamp[1].strip()} — the landing waits for the model, or --no-review")
@@ -505,11 +779,13 @@ class Land:
         if not verdict:
             raise Failed(f"the reviewer answered without a verdict ({cost}, {toks}) — nothing read this diff, "
                          f"so nothing merges it. Re-run, or --no-review and read it yourself. Said: {said}")
-        return self.verdict_result(verdict, said, "reviewed", cost, f", {toks}" + self.post_review(verdict, said))
+        return self.verdict_result(verdict, said, f"reviewed by {self.by} at the {tier} tier ({why})",
+                                   cost, f", {toks}" + self.post_review(verdict, said))
 
     def verdict_result(self, verdict, said, verb, cost, posted):
         """One place decides what a verdict MEANS, so the answer read back off the PR and the answer just bought
         stop the landing on exactly the same terms."""
+        self.verdict, self.findings = verdict, said
         if verdict != "LAND":
             raise Failed(f"{verdict} on PR #{self.pr} ({cost}{posted}) — the landing stops here, exactly "
                          f"like a red gate.\n{said}")
@@ -552,15 +828,19 @@ class Land:
         return re.sub(r"@([A-Z_]+)@", lambda m: vals.get(m.group(1), m.group(0)), tpl)
 
     def brief(self):
-        """What the track was asked to do, and how it said it went. Named as paths, not pasted: a journal runs to
-        hundreds of lines and the reviewer decides how much of it it needs."""
+        """What the track was ASKED to do — the contract, and nothing else. Named as a path, not pasted, so the
+        reviewer decides how much of it it needs. The journal used to come with it and no longer does (owner,
+        2026-09-02): it is the worker's own account of its work, it runs to hundreds of lines, and a reviewer that
+        reads it judges the story rather than the diff — the done-criteria and the diff are the two things this
+        gate exists to compare."""
         t = self.find_track()
-        d = f"{HOME}/.cc/state/{self.repo}/{t}" if t else ""
-        have = [f"{d}/{f}" for f in ("task.md", "progress.md") if d and os.path.exists(f"{d}/{f}")]
-        if not have:
+        d = f"{STATE}/{self.repo}/{t}" if t else ""
+        task = f"{d}/task.md" if d and os.path.exists(f"{d}/task.md") else ""
+        if not task:
             return ("No brief was found for this PR — no track on the board carries it, or it has no state "
                     "directory. Judge the change against its PR title and its own commit messages.")
-        return " and ".join(have) + " — the brief this change was written against, and its journal."
+        return (f"{task} — the brief this change was written against; judge the diff against its DONE-criteria. "
+                f"The track's own journal is deliberately not given to you: it is the worker's account of itself.")
 
     def ask_reviewer(self, prompt, tree, tmp):
         """The model call. Everything it can reach is in the one throwaway directory this landing created; the
@@ -570,7 +850,7 @@ class Land:
         It runs in `tmp` and NOT in the checkout: a session's cwd is where its CLAUDE.md is read from, so reviewing
         a PR that adds a root CLAUDE.md would load the diff under review as the reviewer's own instructions. The
         tree is a subdirectory of tmp, so it stays fully readable as what it is — data."""
-        argv = [CLAUDE, "-p", prompt, "--model", "claude-opus-5", "--effort", "high",
+        argv = [CLAUDE, "-p", prompt, "--model", self.by or REVIEW_MODEL, "--effort", "high",
                 "--max-budget-usd", REVIEW_BUDGET, "--max-turns", "40", "--output-format", "json",
                 "--json-schema", REVIEW_SCHEMA,
                 "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands",
@@ -602,7 +882,8 @@ class Land:
         verdict, which is how a reviewer stops being read."""
         if self.prior_review() and not self.re_review:
             return ", comment already on the PR"
-        body = (f"{self.marker(verdict)} -->\n**cc-land review** — `{self.head[:12]}`, model `claude-opus-5`\n\n"
+        body = (f"{self.marker(verdict)} -->\n**cc-land review** — `{self.head[:12]}`, model "
+                f"`{self.by or REVIEW_MODEL}`\n\n"
                 f"**VERDICT: {verdict}**\n\n{said}")
         rc, o = sh(["gh", "pr", "comment", str(self.pr), "--body", body], cwd=self.root, timeout=120)
         return ", commented on the PR" if rc == 0 else f", the comment did not post ({last(o)})"
@@ -618,18 +899,30 @@ class Land:
         if self.pr:
             if self.facts.get("mergeable") == "CONFLICTING":
                 raise Failed(f"PR #{self.pr} conflicts with {self.base()} — rebase it, then land it")
-            tmp, tree = self.head_checkout()
+            self.fetch_head()       # asked BEFORE the checkout now: the tier and the memo are both keyed by the SHA
             if self.reviewed and self.head != self.reviewed:
                 # The review takes minutes and a track's own hook pushes "wip: checkpoint" while it runs. Gating
                 # and merging the NEW head would put code nobody read on the default branch under a comment that
                 # says it was reviewed — so this refuses, and the re-run reviews what is actually there.
-                self.drop_checkout(tmp, tree)
                 raise Failed(f"PR #{self.pr} moved while it was being reviewed: {self.reviewed[:12]} was read, "
                              f"{self.head[:12]} is there now — nothing merges unread. Re-run to review the new head")
+        tier, why = self.tier_for()
+        if self.pr:
+            done = "" if self.fill_memo else gate_memo(self.repo, self.pr, self.head, tier)
+            if done:
+                return f"{done} — the {tier} tier, {why}; run for this sweep by the prepare phase, on {self.head[:12]}"
+            tmp, tree = self.head_checkout(fetch=False)
+        asked = tier          # the memo is filed under the tier the SERIAL phase will ask with, which is what
+                              # tier_for() says — not under the one the fallback below may round up to
         try:
-            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK)]
+            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK) and (tier == "full" or g not in SUITE)]
+            if not found:
+                skipped = [g for g in SUITE if os.access(f"{tree}/{g}", os.X_OK)]
+                if skipped:     # the tier took the only gate there is: run it rather than land ungated
+                    found, tier, why = skipped, "full", "the suite is this repo's only gate, so a tier cannot skip it"
             if not found:
                 raise Skip(f"no gates in {self.repo} ({GATES[0]}, {GATES[2]}, …) — landing ungated")
+            out("·", f"the {tier} tier: {', '.join(found)} — {why}")
             for g in found:
                 rc, o = sh([f"{tree}/{g}"], cwd=tree, timeout=3600, **clean_start())
                 bad = FAILED_RE.search(o)
@@ -641,10 +934,45 @@ class Land:
                         keep = "not saved"
                     raise Failed(f"gate {g} did not pass: {gate_fail(o)}  [full output: {keep}]")
             on = f"PR #{self.pr}" if self.head else f"the {self.base()} checkout"
-            return f"{len(found)} gate(s) passed on {on}: {', '.join(found)}"
+            if self.pr and self.fill_memo:
+                try:    # what the serial phase spends instead of running these again — an optimisation, never a fact
+                    write_atomic(memo_path(self.repo, self.pr, self.head, asked),
+                                 {"at": stamp(), "tier": tier, "why": why, "gates": found})
+                except OSError:
+                    pass
+            return f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): {', '.join(found)}"
         finally:
             if tmp:
                 self.drop_checkout(tmp, tree)
+
+    def tier_for(self):
+        """What this diff has earned, and why, as (tier, why) — read by the REVIEW (which model, or none at all)
+        and by the gates (which of them run). Decided once per head and cached: the two steps must not be able to
+        disagree, and each answer costs a `git grep` per changed file. Only a PR is ever scoped: a no-PR deploy's
+        two ends are not both in the checkout until install() has pulled, so there is nothing here to read yet —
+        and a deploy the box is catching up on is exactly when guessing least belongs."""
+        if self.full_gates:
+            return "full", "--full-gates: every gate, whatever the diff touches"
+        if not self.pr or not self.head:
+            return "full", "a deploy with no PR to scope it against"
+        if self._tier and self._tier[0] == self.head:
+            return self._tier[1:]
+        rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root)
+        if rc:
+            return "full", f"where this left {self.base()} could not be read"
+        tier, why = gate_tier(self.root, o.strip(), self.head, self.changed_files())
+        self._tier = (self.head, tier, why)
+        return tier, why
+
+    def review_model(self):
+        """WHO reads this diff — or nobody — as (model, tier, why). The expensive half of a landing was bought at
+        the top model whether the change was a library everything imports or three paragraphs of prose. The same
+        tier the gates run at decides: `docs` is not read by a model at all (there is nothing here a reviewer
+        could be wrong about that a person reading the PR would not see), `focused` gets the cheap model, and only
+        `full` — wide, or touching the tests, the install, the config or a file the tree depends on — is worth the
+        worker model. Every unreadable answer is already `full`, so this can only ever be cheap on purpose."""
+        tier, why = self.tier_for()
+        return {"docs": None, "focused": REVIEW_MODEL_SMALL}.get(tier, REVIEW_MODEL), tier, why
 
     def changed_files(self):
         """What this landing puts on the default branch. Before the merge that is the PR head against its base;
@@ -947,10 +1275,10 @@ class Land:
     def load(self):
         """What GitHub says about the PR, read once, before anything runs."""
         if self.span:
-            print(f"deploying [{self.repo}] {self.what()} — merged without this box, so it was never installed")
+            emit(f"deploying [{self.repo}] {self.what()} — merged without this box, so it was never installed")
             return True
         if not self.pr:
-            print(f"landing [{self.repo}] {self.track}: {self.note}")
+            emit(f"landing [{self.repo}] {self.track}: {self.note}")
             return True
         rc, o = sh(["gh", "pr", "view", str(self.pr), "--json",
                     "title,url,state,mergeable,headRefName,mergeCommit"], cwd=self.root, timeout=120)
@@ -962,7 +1290,7 @@ class Land:
         except ValueError:
             print(f"cc-land: gh returned no PR #{self.pr}", file=sys.stderr)
             return False
-        print(f"landing [{self.repo}] PR #{self.pr}: {self.facts.get('title', '')}")
+        emit(f"landing [{self.repo}] PR #{self.pr}: {self.facts.get('title', '')}")
         return True
 
     def walk(self, steps):
@@ -1020,14 +1348,14 @@ class Land:
         return rc
 
 
-def run_batch(repo, prs, review=True, re_review=False):
+def run_batch(repo, prs, review=True, re_review=False, full_gates=False):
     """Several PRs, one deploy. Each is gated, merged and recorded on its own; install.sh, daemon-reload, the units
     and the restarts then run ONCE over everything that landed — they do the same thing after the third PR as after
     the first, and doing them per PR is most of what made landing three of them slow. A PR that fails fatally stops
     the batch there, with nothing deployed: the ones before it are merged and can be re-run in one go."""
     lands = []
     for p in prs:
-        L = Land(repo, pr=p, review=review, re_review=re_review)
+        L = Land(repo, pr=p, review=review, re_review=re_review, full_gates=full_gates)
         if not L.load():
             return 1
         if L.walk(L.pr_steps()) == 1:
@@ -1139,6 +1467,12 @@ def result_of(L, rc, job, tail):
         # landing stops it before the merge. Missing it told the owner "merged, but the deploy stopped at review"
         # about a DO-NOT-LAND — the one sentence they act on, saying the opposite of what happened.
         short = f"{what}: NOT merged ❌ — {L.why[:200] or 'the box could not read it'}"
+        fix = job.get("fix") or {}
+        if fix.get("over") == "no push":
+            short += (f" — the fix iteration the queue dispatched to {fix.get('track')} ended without pushing "
+                      f"anything, so nothing was re-read")
+        elif fix:
+            short += f" — and that is AFTER one automatic fix iteration in {fix.get('track')}"
         if tries > 1 and L.stopped != "review":
             short += f" (after {tries} tries)"
     elif L.stopped == "merge":
@@ -1150,6 +1484,132 @@ def result_of(L, rc, job, tail):
         short += f" — queued by {job['by'][:160]}"
     return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short,
             "text": short if rc == 0 else f"{short}\n```\n{tail[-900:]}\n```"}
+
+
+def dispatch_fix(path, job, L):
+    """ONE fix iteration for a LAND-AFTER-FIX, dispatched by the queue itself, and the PR kept on the queue while it
+    runs. The verdict is written where the worker will look for it — `review-<pr>.md` in the track's own state dir,
+    which is the name the planning session had been typing by hand — and the brief is a GOAL: what, why, the
+    boundaries, and how done is judged. What to change, what to test and what to document are the worker's.
+
+    Returns the line for the sweep, or "" to let the ordinary path tell the owner. Every "" here is deliberate: no
+    track carries this PR, no state dir to leave the verdict in, or the dispatch itself refused — three things a
+    person has to know about, and none of them something a second attempt would fix."""
+    track = L.find_track()
+    st = f"{STATE}/{L.repo}/{track}" if track else ""
+    if not track or not os.path.isdir(st):
+        ledger(f"fix-none {L.repo}#{L.pr} verdict={L.verdict} — no track state dir carries this PR")
+        return ""
+    rv = f"{st}/review-{L.pr}.md"
+    try:
+        with open(rv, "w") as f:
+            f.write(f"# cc-land review of PR #{L.pr} — {stamp()}\n\nVERDICT: {L.verdict}\n\n{L.findings}\n")
+    except OSError as e:
+        ledger(f"fix-none {L.repo}#{L.pr} — cannot write {rv}: {e}")
+        return ""
+    go = (f"REPAIR ROUND, dispatched by the landing queue itself — no person is waiting in this loop, and there is "
+          f"exactly ONE of these: what it does not fix goes to a person. This continues your own session, so you "
+          f"already have the change in front of you — do not re-derive it. GOAL: PR #{L.pr} passes the review "
+          f"gate. WHY: the gate answered {L.verdict}, so the change is wanted and is not yet right; its findings "
+          f"are in {rv}. BOUNDARIES: this branch and this PR only — do not open a second PR, do not merge, and do "
+          f"not widen the change beyond what the findings ask for. DONE: every finding in that file is addressed "
+          f"and this repo's own gates are green on the branch. You choose the implementation, the tests and the "
+          f"docs.")
+    rc, o = sh([f"{BIN}/cc", L.repo, track, "--go", go, "--loop", FIX_LOOP, "--resume-last", "--no-extend",
+                "--model", FIX_MODEL, "--budget", FIX_BUDGET], timeout=300)
+    if rc:
+        ledger(f"fix-refused {L.repo}#{L.pr} track={track} rc={rc} {last(o)[:160]}")
+        return ""
+    job["fix"] = {"track": track, "verdict": L.verdict, "head": L.reviewed, "at": stamp(),
+                  "by": f"{FIX_MODEL}, loop {FIX_LOOP}, ${FIX_BUDGET}, resumed",
+                  "deadline": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_WAIT))}
+    # Uncounted, like a usage-limit deferral and for the same reason: the PR was read and answered, and the answer
+    # is being acted on. Burning a landing try on it would leave a fixed PR one flake short of its last attempt.
+    job.update(attempts=job["attempts"] - 1, stage="fixing", last=f"review: {L.verdict}, fixing in {track}"[:400],
+               not_before=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL)))
+    write_atomic(path, job)
+    ledger(f"fix-dispatch {L.repo}#{L.pr} track={track} verdict={L.verdict} model={FIX_MODEL} loop={FIX_LOOP} "
+           f"budget={FIX_BUDGET} head={L.reviewed[:12]} brief={rv}")
+    sh([f"{BIN}/cc-board", "note", L.repo, track,
+        f"cc-land: {L.verdict} on PR #{L.pr} — one fix iteration dispatched automatically ({FIX_MODEL}); the PR "
+        f"re-queues itself when this branch pushes"], timeout=60)
+    return (f"[{L.repo}] PR #{L.pr}: {L.verdict} — one fix iteration dispatched to track {track} on {FIX_MODEL}, "
+            f"and the PR stays queued; it is re-reviewed when that branch pushes")
+
+
+def track_running(repo, track):
+    """Is the track's loop still going? The board word first (cc-loop writes a status on every exit), the live
+    tmux window as the second signal — conservative in OR, because acting on a half-finished branch is the bug
+    (review-176c) and the fix deadline is the backstop against waiting on a corpse."""
+    if not (repo and track):
+        return False
+    rc, o = sh([f"{BIN}/cc-board", "get", repo, track, "status"], timeout=60)
+    if rc == 0 and (o or "").strip() == "running":
+        return True
+    rc, o = sh(["tmux", "list-windows", "-t", "main", "-F", "#{window_id} #{window_name}"], timeout=60)
+    if rc != 0:
+        return False
+    for line in (o or "").splitlines():
+        wid, _, name = line.strip().partition(" ")
+        if name == f"{repo}/{track}":
+            return pane_live(wid)       # the window alone proves nothing: `cc --go` leaves it behind as a bare shell
+    return False
+
+
+def pane_live(wid):
+    """`cc`'s own pane_live test (cc-janitor.pane_bare, negated): the wrapper bash is always the pane command, so a
+    window holding a worker is one whose pane shell HAS A CHILD. A window that is only that shell is what `cc … --go`
+    leaves behind when the loop ends (`exec bash`), and reading it as a running loop kept a fixed PR waiting for ever
+    (review-176d)."""
+    rc, o = sh(["tmux", "list-panes", "-t", wid, "-F", "#{pane_pid}"], timeout=60)
+    pid = ((o or "").splitlines() or [""])[0].strip()
+    if rc != 0 or not pid:
+        return False
+    rc, _ = sh(["pgrep", "-P", pid], timeout=60)
+    return rc == 0
+
+
+def fix_progress(path, job):
+    """A job waiting on the fix iteration it dispatched. A pushed head alone is NOT the round ending — the loop
+    checkpoints and pushes every iteration (review-176c), so the head moving off the reviewed SHA re-queues the
+    PR only once the track has actually stopped; until then the job waits, and prepare() is gated the same way so
+    no review is bought on an intermediate checkpoint. A fix that never pushes is not waited on for ever either:
+    past its deadline the job goes back to the ordinary path, where the verdict already on the PR stops it and
+    the owner is told, once.
+
+    Returns a line to stand down with, or "" to run the job now."""
+    fix = job.get("fix") or {}
+    repo, pr = job.get("repo") or "", job.get("pr")
+    rc, o = sh(["gh", "pr", "view", str(pr), "--json", "headRefOid"], cwd=repo_root(repo), timeout=120)
+    head = ""
+    if rc == 0:
+        try:
+            head = ((json.loads(o) or {}).get("headRefOid") or "").strip()
+        except ValueError:
+            head = ""
+    if head and head != fix.get("head"):
+        late = stamp() >= (fix.get("deadline") or "")     # the deadline bounds EVERY wait here, whatever the track looks like
+        if not late and track_running(repo, fix.get("track") or ""):
+            job["not_before"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL))
+            write_atomic(path, job)
+            return (f"[{repo}] PR #{pr}: the fix round pushed a checkpoint ({head[:12]}) but its track "
+                    f"{fix.get('track')} is still running — waiting for the round to end")
+        job.update(fix=dict(fix, over="pushed", pushed=head), attempts=0, stage="queued")
+        job.pop("not_before", None)          # …and the tries start again: this is a different change now
+        write_atomic(path, job)
+        ledger(f"fix-pushed {repo}#{pr} track={fix.get('track')} {(fix.get('head') or '')[:12]}->{head[:12]}"
+               + (" (past the fix deadline: reviewed as it stands)" if late else ""))
+        return ""
+    if stamp() >= (fix.get("deadline") or ""):
+        job.update(fix=dict(fix, over="no push"), stage="review")
+        job.pop("not_before", None)
+        write_atomic(path, job)
+        ledger(f"fix-silent {repo}#{pr} track={fix.get('track')} — nothing pushed by {fix.get('deadline')}")
+        return ""
+    job["not_before"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL))
+    write_atomic(path, job)
+    return (f"[{repo}] PR #{pr}: waiting on the fix iteration in track {fix.get('track')} — dispatched "
+            f"{fix.get('at')}, nothing pushed yet")
 
 
 def run_job(path, job):
@@ -1182,6 +1642,13 @@ def run_job(path, job):
         job.update(attempts=job["attempts"] - 1, stage="deferred", not_before=until, last=f"review: {L.why}"[:400])
         write_atomic(path, job)
         return f"[{repo}] {L.what()}: review deferred until {until} — {L.why[:160]}"
+    if rc == 1 and L.stopped == "review" and L.verdict == "LAND-AFTER-FIX" and not job.get("fix"):
+        # The one verdict that names its own remedy. NOT for a second one: `job["fix"]` is on the file for good, so
+        # a PR that comes back stopped after its fix round falls straight through to the owner — as does every
+        # DO-NOT-LAND, which says the change should not exist and has no remedy to dispatch.
+        line = dispatch_fix(path, job, L)
+        if line:
+            return line
     decided = L.stopped == "gates" and " conflicts with " in L.why    # no flake: nothing but a rebase changes it
     if rc == 1 and (L.stopped in RETRY or L.stopped == "load") and not decided and job["attempts"] < LAND_TRIES:
         # Kept, so the next sweep re-drives it — the retry PR #87 never had. A not_before goes with the try: the reset
@@ -1207,6 +1674,10 @@ def run_one(path):
     if job.get("state") == "done":
         finish(path, job)                        # killed between deciding and saying it: say it now, once
         return (job.get("result") or {}).get("short", "")
+    if (job.get("fix") or {}).get("over") is None and job.get("fix"):
+        line = fix_progress(path, job)           # a dispatched fix iteration: has it pushed? Asked BEFORE the wait
+        if line:                                 # below, so a sweep any 👍 starts picks the push up at once
+            return line
     if stamp() < (job.get("not_before") or ""):  # deferred to a usage-limit reset: untouched, uncounted, until then
         return (f"[{job['repo']}] {'PR #' + str(job['pr']) if job.get('pr') else 'deploy'}: waits until "
                 f"{job['not_before']} ({(job.get('last') or '')[:120]})")
@@ -1320,6 +1791,65 @@ def rearm(secs):
                 f"`cc-land work` runs it")
 
 
+def preparable(path):
+    """Is this job one the prepare phase should read and gate now? Only a PR job the serial phase is about to reach:
+    a deferred one (a usage-limit reset that has not come) and one out of tries are both about to be left alone or
+    finished, and buying a $2 review for either is the spend this whole phase exists to cut."""
+    j = read_json(path) or {}
+    fix = j.get("fix") or {}
+    if (fix and not fix.get("over") and stamp() < (fix.get("deadline") or "")
+            and track_running(j.get("repo") or "", fix.get("track") or "")):
+        return False                # mid-fix-round: a review bought now would judge an intermediate checkpoint (review-176c)
+    return bool(j.get("repo") and j.get("pr") and j.get("state") != "done"
+                and stamp() >= (j.get("not_before") or "") and j.get("attempts", 0) < LAND_TRIES)
+
+
+def prepare(paths):
+    """The half of a landing that changes NOTHING, for every queued job at once: the review (minutes of `claude -p`)
+    and the gates (in a throwaway worktree). Both already leave their answer somewhere durable — the review as its
+    own PR comment, keyed by head SHA, and the gates as a memo keyed the same way — so this phase only fills those,
+    and the serial phase below then spends them. That is the whole design: prepare can be skipped, killed or crash
+    and the landing is byte for byte what it was before, just slower. Nothing here writes a job file, so no attempt
+    is counted here and #154's crash recovery is untouched.
+
+    WHAT STAYS SERIAL is everything after: merge, install.sh, the units and the restarts, in queue order, exactly as
+    they were. And the suite needs no new lock to stay hermetic — core/tests/selftest.sh takes ~/.cc/selftest.lock
+    itself and WAITS (PR #126), so several jobs' cheap gates overlap while their suites queue one behind another."""
+    jobs = [p for p in paths if preparable(p)]
+    if len(jobs) < 2:
+        return []               # one job is what the serial phase already does, and a pool around it is just risk
+
+    def one(path):
+        with collected() as buf:
+            j = read_json(path) or {}
+            L = Land(j["repo"], pr=j["pr"])
+            L.fill_memo = True
+            try:
+                if L.load():
+                    try:
+                        out("✓", L.review())
+                    except Skip as e:
+                        out("·", str(e))
+                    except Failed as e:
+                        out("✗", f"review: {e}")
+                        return buf          # a stopping verdict: the gates would be ten minutes spent on nothing
+                    try:
+                        out("✓", L.gates())
+                    except Skip as e:
+                        out("·", str(e))
+                    except Failed as e:
+                        out("✗", f"gates: {e}")
+            except Exception as e:          # prepare is an optimisation: it may never be the reason a sweep dies
+                out("✗", f"{e.__class__.__name__}: {e}")
+            return buf
+
+    lines = [f"reading and gating {len(jobs)} queued job(s) at once; the merges stay serial, in queue order:"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(PREPARE_AT_ONCE, len(jobs))) as pool:
+        for path, buf in zip(jobs, list(pool.map(one, jobs))):   # map keeps the order the jobs were given in
+            lines += buf or [f"  · {os.path.basename(path)}: nothing to prepare"]
+    return lines
+
+
 def cmd_work(argv):
     """Drain the queue, then catch the box up. ONE worker runs at a time — the flock is what makes ‘at most one
     merge’ true no matter how many 👍, timers and reboots ask for one at once; a second worker finds the lock held,
@@ -1338,7 +1868,10 @@ def cmd_work(argv):
         return 0
     lines = []
     try:
-        for path in sorted(glob.glob(f"{LANDQ}/*.json")):
+        sweep_memos()
+        paths = sorted(glob.glob(f"{LANDQ}/*.json"))
+        lines += prepare(paths)                  # the reviews and the gates of all of them, at once and changing nothing
+        for path in paths:
             lines.append(run_one(path))          # every sweep: this is what finishes a landing a reboot interrupted
         if "--catch-up" in argv or due_catchup():
             for repo in catchup():
@@ -1414,8 +1947,10 @@ def cmd_selfcheck():
     # Hermetic from the first line: every section below reaches install()/record_applied through the fake world, and
     # the ledger it writes must be a scratch one — a selfcheck once wrote ~/.cc/state/land/myrepo.applied into the LIVE
     # deploy ledger (2026-09-01), after which known_repos() carried a phantom repo on every catch-up tick.
-    _real_landq = LANDQ
-    globals().update(LANDQ=tempfile.mkdtemp(prefix="cc-land-selfcheck-h-"))
+    _real_landq, _real_state = LANDQ, STATE
+    globals().update(LANDQ=tempfile.mkdtemp(prefix="cc-land-selfcheck-h-"),
+                     STATE=tempfile.mkdtemp(prefix="cc-land-selfcheck-s-"))   # …and a fix iteration's brief goes
+                                                                             # to a scratch track dir, not a real one
 
     def check(name, cond):
         print(("  ✓ " if cond else "  ✗ ") + name)
@@ -1426,7 +1961,9 @@ def cmd_selfcheck():
         calls.append(argv)
         cwds.append(cwd)                  # where a command RAN is part of what it does — see the reviewer's cwd
         key = max((k for k in world if " ".join(argv).startswith(k)), key=len, default=None)
-        return world[key] if key else (0, "")
+        v = world[key] if key else (0, "")
+        return v(argv) if callable(v) else v      # a callable answer: state that changes (a posted PR comment), or
+                                                  # a rendezvous that only completes if two calls are in flight
 
     def ran(*words):
         return [c for c in calls if all(w in " ".join(c) for w in words)]
@@ -1554,9 +2091,10 @@ def cmd_selfcheck():
 
     commented = lambda: [c for c in calls if c[:3] == ["gh", "pr", "comment"]]   # NOT ran_sub: `gh pr view
     rc, said = reviewed("LAND")                                  # --json comments` matches 'comment' too
-    check("LAND lets the landing carry on: the gates run on that same head, the merge happens, the box deploys",
-          rc == 0 and ran("gh pr merge") and "landed." in said and "✓ reviewed: LAND on PR #7" in said
-          and len(ran("git fetch", "pull/7/head")) == 2)
+    check("LAND lets the landing carry on: the gates run on that same head, the merge happens, the box deploys — "
+          "and the ✓ line names WHO read the diff and at which tier, exactly as a gate line names its own",
+          rc == 0 and ran("gh pr merge") and "landed." in said and len(ran("git fetch", "pull/7/head")) == 2
+          and re.search(r"✓ reviewed by \S+ at the \w+ tier \(.+\): LAND on PR #7", said))
     check("the review reads the PR's OWN head, never the default branch — a review of main reviews nothing",
           ran("git fetch", "origin", "pull/7/head") and ran("git worktree add", HEAD)
           and [c for c in calls if c[:2] == ["git", "diff"] and HEAD in c])
@@ -1751,6 +2289,168 @@ def cmd_selfcheck():
     L = fresh(pr=7)
     world[f"{BIN}/cc-slack post-approval"] = (3, "no SLACK_BOT_TOKEN")
     check("Slack not set up: the card is skipped and the landing carries on", isinstance(caught(L.card), Skip))
+
+    # 4b. THE GATES ARE SCOPED TO THE CHANGE. Ten minutes of 270-case suite on a diff that moved three paragraphs
+    # is ten minutes nobody gets back, and until now it ran on every landing. Every answer that is not a positive
+    # reason to skip is "full": this decides whether to SKIP a suite, so not knowing has to mean running it.
+    A, B = "aaaaaaa", "bbbbbbb"
+
+    def tier(changed, **w):
+        fresh(pr=7)
+        world["git diff --numstat"] = (0, "3\t2\tx\n")
+        world.update(w)
+        return gate_tier("/tmp/_ccland", A, B, changed)
+
+    t, why = tier([("M", "docs/USAGE.md"), ("M", "README.md")])
+    check("a doc-only diff does not buy the 270-case suite — and the output says which tier ran and why, because a "
+          "gate that quietly ran less than you thought is worse than a slow one",
+          t == "docs" and "no code changed" in why)
+    t, why = tier([("M", REVIEW_RULES), ("M", "docs/USAGE.md")])
+    check("...but the reviewer's OWN rules file is never a documentation change, however markdown it looks: the "
+          "rules are read from origin/<base> so a PR cannot bring its own, and a `docs` tier — which now means "
+          "nobody reads the diff at all — would let one land unread and judge every PR after it",
+          t == "full" and REVIEW_RULES in why)
+    t, why = tier([("M", "core/templates/channel-CLAUDE.md"), ("M", "core/templates/self-review.md")])
+    check("...nor the templates a session or a worker is started from — a channel's CLAUDE.md, the worker's "
+          "self-review checklist: markdown, and loaded into every prompt (review-176e)", t == "full" and "templates" in why)
+    t, why = tier([("M", "CLAUDE.md"), ("M", ".claude/commands/deploy.md")])
+    check("...and neither are the instruction files every session on the box loads — CLAUDE.md, AGENTS.md, "
+          "anything under .claude/: a markdown-only rewrite of them landing unread steers every session after it "
+          "(review of PR #176, round two)",
+          t == "full" and "instructions" in why)
+    PY_OLD = 'def f():\n    """the old prose"""\n    return 1\n'
+    t, why = tier([("M", "core/bin/cc-alpha")],
+                  **{f"git show {A}:core/bin/cc-alpha": (0, PY_OLD),
+                     f"git show {B}:core/bin/cc-alpha": (0, PY_OLD.replace("the old prose", "an entirely new paragraph"))})
+    check("...nor does a comment-only one, and for Python that is EXACT rather than a guess about line prefixes: "
+          "the two sides' docstring-stripped ASTs are compared, and this box is mostly docstring",
+          t == "docs")
+    SH = "#!/bin/sh\n# a note\nrun_it --now\n"
+    t, _ = tier([("M", "bin/x.sh")], **{f"git show {A}:bin/x.sh": (0, SH),
+                                        f"git show {B}:bin/x.sh": (0, SH.replace("a note", "a better note")),
+                                        f"git diff -U0 {A} {B}": (0, "@@ -2 +2 @@\n-# a note\n+# a better note\n")})
+    check("...and where nothing parses as Python the same question is asked of the diff's own lines", t == "docs")
+    PY_SAME = 'def f():\n    """prose"""\n    return 1\n'
+    t, why = tier([("M", "core/bin/cc-alpha")],
+                  **{"git diff --numstat": (0, "0\t0\tcore/bin/cc-alpha\n"),
+                     f"git show {A}:core/bin/cc-alpha": (0, PY_SAME), f"git show {B}:core/bin/cc-alpha": (0, PY_SAME)})
+    check("a change git can see and the CONTENT cannot — `chmod -x` on a worker's launcher: 0/0 in numstat, both "
+          "blobs identical — is CODE. Read as 'a comment' it took the `docs` tier, which is now no reviewer and no "
+          "suite: a change that breaks every loop on the box, landing with nobody having read it (review of PR #176)",
+          t == "focused")
+    t, _ = tier([("M", "bin/x.sh")], **{f"git show {A}:bin/x.sh": (0, SH),
+                                        f"git show {B}:bin/x.sh": (0, SH.replace("#!/bin/sh", "#!/bin/bash")),
+                                        f"git grep -l -F -- x.sh {B}": (1, "")})
+    check("...and so is the shebang, the same class: invisible to a Python AST, `#…` to the line scan, and "
+          "`-#!/bin/sh +#!/bin/bash` stops the script working — never `docs` (review of PR #176, round two)",
+          t == "focused")
+    t, _ = tier([("M", "bin/x.sh")], **{f"git show {A}:bin/x.sh": (0, SH),
+                                        f"git show {B}:bin/x.sh": (0, SH.replace("--now", "--later")),
+                                        f"git diff -U0 {A} {B}": (0, "@@ -3 +3 @@\n-run_it --now\n+run_it --later\n"),
+                                        f"git grep -l -F -- x.sh {B}": (1, "")})
+    check("a real code change is not a comment — and one nothing else in the tree names is `focused`: the static "
+          "gates, without the end-to-end suite behind them", t == "focused")
+    t, why = tier([("M", "core/bin/cc-alpha")],
+                  **{f"git show {A}:core/bin/cc-alpha": (0, "a = 1\n"),
+                     f"git show {B}:core/bin/cc-alpha": (0, "a = 2\n"),
+                     f"git grep -l -F -- cc-alpha {B}": (0, f"{B}:core/bin/cc-beta\n{B}:core/bin/cc-gamma\n")})
+    check("...but a file the rest of the tree DEPENDS on gates fully, and which those are is COUNTED, not listed: a "
+          "general tool cannot be handed one repo's shared libraries, and a list is the thing nobody updates",
+          t == "full" and "depends on" in why)
+    for changed, w, name in (
+            ([("M", "core/tests/selftest.sh")], {}, "the tests themselves"),
+            ([("M", "install.sh")], {}, "what installs it"),
+            ([("M", "config/units.json")], {}, "what configures it"),
+            ([("M", f"docs/{i}.md") for i in range(WIDE_FILES + 1)], {}, "a diff too wide to scope by eye"),
+            ([("M", "docs/a.md")], {"git diff --numstat": (0, f"{WIDE_LINES}\t{WIDE_LINES}\tdocs/a.md\n")},
+             "a diff too long to scope by eye")):
+        check(f"{name} runs every gate there is", tier(changed, **w)[0] == "full")
+    check("a diff nothing could be read about runs every gate: this is the answer that costs ten minutes, and it is "
+          "the one every unreadable question falls back to", tier([])[0] == "full")
+    check("and --full-gates is the way past the whole question, for a person who wants the lot",
+          fresh(pr=7, full_gates=True).tier_for() == ("full", "--full-gates: every gate, whatever the diff touches"))
+
+    real_access = os.access
+    try:    # end to end: the tier really does drop the suite from the gates that RUN, and never the other way about
+        def docs_diff(fill=False, **kw):
+            L = fresh(pr=7, **kw)
+            L.fill_memo = fill               # …as prepare() sets it: this run WRITES the memo the serial half spends
+            world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+            world["git merge-base"] = (0, A + "\n")
+            world["git diff --name-status"] = (0, "M\tdocs/USAGE.md\n")
+            world["git diff --numstat"] = (0, "3\t2\tdocs/USAGE.md\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                return L.gates()
+        os.access = lambda p, m: p.endswith(("core/tests/check.sh", "core/tests/selftest.sh"))
+        said = docs_diff()
+        check("end to end: a docs-tier landing runs the cheap static gate and NOT the ten-minute suite, and says so",
+              "core/tests/check.sh" in said and "selftest" not in said and "docs tier" in said
+              and not [c for c in calls if c[0].endswith("core/tests/selftest.sh")])
+        check("...and --full-gates on the same diff runs both",
+              all(w in docs_diff(full_gates=True) for w in ("selftest", "check.sh", "full tier")))
+        os.access = lambda p, m: p.endswith("core/tests/selftest.sh")
+        check("a repo whose ONLY gate is its suite still runs it: a tier takes gates out of a run, it never leaves "
+              "a landing with none — scoping that lands a diff nobody ran is not scoping, it is skipping",
+              all(w in docs_diff() for w in ("selftest", "only gate")))
+        docs_diff(fill=True)
+        check("...and THAT run's memo is filed under the tier the serial half will ask with — `docs`, what "
+              "tier_for() says — not under the `full` this fallback rounded the RUN up to. Keyed by the rounded "
+              "one it is a memo nobody ever asks for, and the repo whose only gate is a ten-minute suite runs it "
+              "twice on every landing: the exact cost this whole phase exists to cut",
+              os.path.exists(memo_path("myrepo", 7, HEAD, "docs"))
+              and not os.path.exists(memo_path("myrepo", 7, HEAD, "full"))
+              and (read_json(memo_path("myrepo", 7, HEAD, "docs")) or {}).get("gates") == ["core/tests/selftest.sh"])
+        os.unlink(memo_path("myrepo", 7, HEAD, "docs"))
+    finally:
+        os.access = real_access
+
+    # 4c. …and the REVIEW is scoped by that same answer. It is the expensive half of a landing — dollars a run, at
+    # the top model, whether the diff was a library everything imports or three paragraphs of prose (owner,
+    # 2026-09-02: "the PR review seems quite thorough and expensive, maybe it could be cheaper").
+    def review_at(name_status, **w):
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world["git merge-base"] = (0, A + "\n")
+        world["git diff --name-status"] = (0, name_status)
+        world["git diff --numstat"] = (0, "3\t2\tx\n")
+        world.update(w)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            r = caught(L.review)
+        argv = ([c for c in calls if c[0] == CLAUDE] or [[]])[0]
+        return r, (argv[argv.index("--model") + 1] if "--model" in argv else None)
+
+    r, model = review_at("M\tdocs/USAGE.md\n")
+    check("a doc-only diff buys no review at all: there is nothing here a model could be wrong about that a person "
+          "reading the PR would not see — and the landing SAYS nobody read it rather than implying somebody did",
+          model is None and isinstance(r, Skip) and "docs tier" in str(r) and not commented())
+    r, model = review_at("M\tbin/x.sh\n",
+                         **{f"git show {A}:bin/x.sh": (0, SH),
+                            f"git show {HEAD}:bin/x.sh": (0, SH.replace("--now", "--later")),
+                            f"git diff -U0 {A} {HEAD}": (0, "@@ -3 +3 @@\n-run_it --now\n+run_it --later\n"),
+                            f"git grep -l -F -- x.sh {HEAD}": (1, "")})
+    check("a narrow change nothing else references is read by the CHEAP model: one tier answer decides both who "
+          "reads the diff and which gates run, so the two halves can never disagree about how big this change is",
+          model == REVIEW_MODEL_SMALL and "focused tier" in str(r))
+    check("...and the comment names the model that actually read it — a model name written into the script would "
+          "go on saying opus the first time a tier sent the diff somewhere cheaper",
+          commented() and REVIEW_MODEL_SMALL in commented()[0][-1] and REVIEW_MODEL not in commented()[0][-1])
+    r, model = review_at("M\tinstall.sh\n")
+    check("and the worker model is kept for the diffs that earn it: wide, or touching the tests, the install, the "
+          "config or a file the rest of the tree depends on",
+          model == REVIEW_MODEL and "full tier" in str(r) and "install.sh" in str(r))
+
+    # What the reviewer is given to judge against: the CONTRACT. The journal came with it until 2026-09-02 and no
+    # longer does — it is the worker's own account of its work, it runs to hundreds of lines, and a reviewer that
+    # reads it judges the story rather than the diff.
+    tdir = f"{STATE}/myrepo/w1"
+    os.makedirs(tdir, exist_ok=True)
+    open(f"{tdir}/task.md", "w").write("DONE LOOKS LIKE: the thing works\n")
+    open(f"{tdir}/progress.md", "w").write("### iter 1 — I did it all, honest\n")
+    b = fresh(pr=7).brief()
+    check("the reviewer is handed the brief's done-criteria and the diff, and NOT the track's journal: the journal "
+          "is the worker's account of itself, and the contract is what a verdict is supposed to be about",
+          f"{tdir}/task.md" in b and "progress.md" not in b and "DONE-criteria" in b)
+    shutil.rmtree(tdir, ignore_errors=True)     # section 11 asks what happens when this directory does NOT exist
 
     # 5. a unit this change ADDED is switched on; one it merely touched, or one that is off, is not
     L = fresh(pr=7)
@@ -2206,11 +2906,14 @@ def cmd_selfcheck():
                 os.unlink(f)
 
         # (3) a verdict and an unmergeable PR still end the job at once
-        landing(**{f"{CLAUDE} -p": (0, REVIEWED("LAND-AFTER-FIX", "a.py:9", "the call has no timeout", "name it"))})
+        AFTERFIX = {f"{CLAUDE} -p": (0, REVIEWED("LAND-AFTER-FIX", "a.py:9", "the call has no timeout", "name it"))}
+        landing(**AFTERFIX)
         quiet(cmd_work, [])
-        check("a LAND-AFTER-FIX still ends the job at once — a verdict is a decision about the PR, not the box's "
-              "weather: not kept, not re-armed, not re-bought, said once as NOT merged",
+        check("a LAND-AFTER-FIX with nowhere to dispatch a fix to — no track state dir carries this PR — still ends "
+              "the job at once: a verdict is a decision about the PR, not the box's weather, and an automatic fix "
+              "that cannot be written down is one nobody could act on",
               not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
+              and not ran_sub("cc", "myrepo", "w1", "--go")
               and len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told() and "LAND-AFTER-FIX" in told()
               and len([c for c in calls if c[0] == CLAUDE]) == 1)
         landing(**{"gh pr view": (0, json.dumps(dict(FACTS, mergeable="CONFLICTING")))})
@@ -2219,6 +2922,198 @@ def cmd_selfcheck():
               "unarmed, told to rebase",
               not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
               and "conflicts with main" in told() and "NOT merged" in told())
+
+        # (4) …and where there IS a track to fix in, the queue dispatches ONE fix iteration and stays out of the
+        # planning session's way. Every LAND-AFTER-FIX used to cost it a dozen full-context turns — read the verdict,
+        # write the brief, dispatch, watch for the push, re-queue — and every one of those is mechanical.
+        stdir = f"{STATE}/myrepo/w1"
+        os.makedirs(stdir, exist_ok=True)
+        landing(**AFTERFIX)
+        quiet(cmd_work, [])
+        job, went = read_json(job_path("myrepo", 7)) or {}, ran_sub("cc", "myrepo", "w1", "--go")
+        brief = open(f"{stdir}/review-7.md").read() if os.path.exists(f"{stdir}/review-7.md") else ""
+        check("a LAND-AFTER-FIX dispatches ONE fix iteration by itself: the verdict is written to the track's own "
+              "state dir, a worker goes out on the WORKER model, the job stays queued — and nobody is paged, which "
+              "is the whole point of it",
+              len(went) == 1 and FIX_MODEL in " ".join(went[0]) and "--loop" in went[0]
+              and "LAND-AFTER-FIX" in brief and "the call has no timeout" in brief
+              and job.get("stage") == "fixing" and (job.get("fix") or {}).get("track") == "w1"
+              and not ran("cc-notify") and not ran_sub("cc-slack", "post") and not gh_merges())
+        check("...and it RESUMES that worker's own session instead of opening a cold one, so the round starts with "
+              "the change already in front of it rather than re-deriving it — and there is exactly ONE such round",
+              "--resume-last" in went[0] and went[0][went[0].index("--loop") + 1] == FIX_LOOP == "1"
+              and "--no-extend" in went[0]        # the bound is real: cc-loop's carry-on batches are off for the round
+              and "continues your own session" in " ".join(went[0]))
+        check("...the brief it sends is a GOAL — what, why, the boundaries and how done is judged — and never a list "
+              "of edits: what to change, what to test and what to document are the worker's to choose",
+              all(w in " ".join(went[0]) for w in ("GOAL:", "WHY:", "BOUNDARIES:", "DONE:",
+                                                   "You choose the implementation, the tests and the docs")))
+        check("...the attempt is UNCOUNTED, as a usage-limit deferral is: the PR was read and its answer is being "
+              "acted on, and burning a try here leaves a fixed PR one flake short of its last attempt",
+              job.get("attempts") == 0)
+        check("...and the queue log names the dispatch, because an automatic worker nobody can find is one nobody "
+              "can stop", "fix-dispatch myrepo#7" in open(f"{LANDQ}/queue.log").read())
+        check("...and the sweep arms its own next look, so nothing else has to poll on the queue's behalf",
+              len(armed()) == 1 and 60 <= int(armed()[0].split("=")[1]) <= FIX_POLL + 70)
+        calls.clear()
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": "f" * 40}))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")
+        quiet(cmd_work, [])
+        check("a checkpoint push MID-ROUND does not re-queue: the loop pushes every iteration, so a moved head while "
+              "the track still runs is a half-finished branch — the job waits, and prepare() will not buy a review "
+              "of it either (review-176c)",
+              os.path.exists(job_path("myrepo", 7))
+              and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing"
+              and "fix-pushed myrepo#7" not in open(f"{LANDQ}/queue.log").read()
+              and not preparable(job_path("myrepo", 7)))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "review\n")
+        world["tmux list-windows"] = (0, "@9 myrepo/w1\n")
+        world["tmux list-panes -t @9"] = (0, "4242\n")
+        world["pgrep -P 4242"] = (0, "4343\n")
+        n_pushed = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
+        quiet(cmd_work, [])
+        check("...the board word gone but the window still holding a loop (its pane shell has a child): still "
+              "mid-round, still waiting, still not preparable (review-176d)",
+              (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing"
+              and open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed
+              and not preparable(job_path("myrepo", 7)))
+        world["pgrep -P 4242"] = (1, "")
+        quiet(cmd_work, [])
+        check("a push on that branch re-queues the PR once the track has STOPPED: the head off the reviewed SHA plus "
+              "a loop no longer running IS 'the round ended with a pushed head' — and `cc --go` leaves the worker's "
+              "window behind as a bare shell, so a window that merely EXISTS is not a loop (review-176d)",
+              open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed + 1)
+        check("...and the SECOND stop is where the owner finally hears about it — once, saying that a fix round has "
+              "already been spent, and with no second worker dispatched",
+              not os.path.exists(job_path("myrepo", 7)) and not ran_sub("cc", "myrepo", "w1", "--go")
+              and len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told()
+              and "AFTER one automatic fix iteration" in told() and len(ran("cc-notify")) == 1)
+        landing(**{f"{CLAUDE} -p": (0, REVIEWED("DO-NOT-LAND", "a.py:9", "it deletes the queue", "drop it"))})
+        quiet(cmd_work, [])
+        check("a DO-NOT-LAND dispatches nothing and pages at once: it says the change should not exist, so there is "
+              "no remedy to hand a worker — only LAND-AFTER-FIX names its own",
+              not ran_sub("cc", "myrepo", "w1", "--go") and not os.path.exists(job_path("myrepo", 7))
+              and "NOT merged" in told() and len(ran("cc-notify")) == 1)
+        landing(**AFTERFIX)
+        quiet(cmd_work, [])
+        j = read_json(job_path("myrepo", 7))
+        write_atomic(job_path("myrepo", 7), dict(j, fix=dict(j["fix"], deadline="2000-01-01T00:00:00Z")))
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": "e" * 40}))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")
+        n_pushed = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
+        quiet(cmd_work, [])
+        check("...and a moved head is not waited on past the deadline either, however alive the track looks: the "
+              "pushed head is re-queued and read as it stands, so no state waits unboundedly (review-176d)",
+              open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed + 1)
+        landing(**AFTERFIX)
+        quiet(cmd_work, [])
+        j = read_json(job_path("myrepo", 7))
+        write_atomic(job_path("myrepo", 7), dict(j, fix=dict(j["fix"], deadline="2000-01-01T00:00:00Z")))
+        calls.clear()
+        quiet(cmd_work, [])
+        check("...and a fix iteration that never pushes is not waited on for ever: past its deadline the job goes "
+              "back to the ordinary path and the owner is told, once, that nothing was re-read",
+              not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told()
+              and not ran_sub("cc", "myrepo", "w1", "--go"))
+        shutil.rmtree(stdir, ignore_errors=True)
+
+        # (5) SEVERAL jobs are read and gated AT ONCE, and the merges still happen one at a time, in queue order.
+        # A landing was two serial things nobody was waiting on — a review of minutes and a suite of ten — done once
+        # per PR; four approvals were most of an hour of wall clock in which nothing could merge.
+        posted, gate = {}, threading.Barrier(2, timeout=30)
+        seen = []
+
+        def rendezvous(argv):
+            """The proof of concurrency, not a description of it: neither review returns until the OTHER one has
+            started too. Run serially, this cannot complete — the barrier times out and breaks, and the check below
+            fails on exactly that."""
+            seen.append(1)
+            if len(seen) <= 2:
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return (0, REVIEWED("LAND"))
+
+        def remember(argv):     # gh pr comment <pr> --body <body>: the review's own durable record of its verdict
+            posted.setdefault(argv[3], []).append(argv[argv.index("--body") + 1])
+            return (0, "")
+
+        def comments(pr):
+            return lambda a: (0, json.dumps({"comments": [{"body": b} for b in posted.get(pr, [])]}))
+
+        fetches, fetched, overlapped = threading.Barrier(2, timeout=1.5), [], []
+
+        def fetch_pull(argv):
+            """The mirror image of the rendezvous above: this barrier completes ONLY if two threads are inside a
+            fetch of the same checkout at once, which the repo lock must make impossible — so it times out, breaks,
+            and `overlapped` stays empty. Everything after it is broken-barrier, i.e. instant."""
+            fetched.append(argv[-1])
+            try:
+                fetches.wait()
+                overlapped.append(argv[-1])
+            except threading.BrokenBarrierError:
+                pass
+            return (0, "")
+
+        fresh(pr=7)
+        world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
+                      "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
+                      f"{CLAUDE} -p": rendezvous, "gh pr comment": remember, "git fetch -q origin pull": fetch_pull,
+                      "gh pr view 7 --json comments": comments("7"), "gh pr view 8 --json comments": comments("8")})
+        quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
+        quiet(cmd_queue, ["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2", "--no-start"])
+        calls.clear()
+        # The memo is the ONE thing the parallel half hands the serial one, so it is watched being handed over
+        # rather than inspected after the fact: `after_prepare` is the memo dir as it stood the instant prepare()
+        # returned. Read only at the end, it is empty whatever the memo code does — which is exactly how this
+        # assertion passed while nothing ever wrote a memo at all (review of PR #176).
+        real_prepare, after_prepare = prepare, []
+
+        def watched_prepare(paths):
+            lines = real_prepare(paths)
+            after_prepare.extend(sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json")))
+            return lines
+
+        # …and a gate only runs at all if there is one to find: without this patch both jobs Skip on "no gates in
+        # myrepo", no memo is ever written, and every line below is true of a mechanism that does not exist.
+        real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
+        globals()["prepare"] = watched_prepare
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                cmd_work([])
+        finally:
+            os.access, globals()["prepare"] = real_access, real_prepare
+        swept = buf.getvalue()
+        gate_runs = [c for c in calls if os.path.basename(c[0]) == "check.sh"]
+        merged = [c[3] for c in gh_merges()]
+        first_merge = next((i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "merge"]), len(calls))
+        check("the reviews of several queued jobs really do run at the same time — the fake reviewer only answers "
+              "once BOTH are in flight, so a serial sweep cannot get past this line",
+              not gate.broken and len(seen) == 2)
+        check("...and every review and every gate happens before the FIRST merge: that phase split is what keeps "
+              "merge, install, the units and the restarts serial while the slow half overlaps",
+              first_merge > 0 and not [c for c in calls[first_merge:] if c[0] == CLAUDE])
+        check("...the merges themselves are one at a time and in queue order, both of them, and each PR is told "
+              "about once", merged == ["7", "8"] and len(ran_sub("cc-slack", "post")) == 2)
+        check("...and each PR is REVIEWED once, not twice: the prepare phase's verdict is the one the merge reads "
+              "back off the PR, so overlapping the reviews costs no extra model call",
+              len([c for c in calls if c[0] == CLAUDE]) == 2 and len(posted.get("7", [])) == 1
+              and len(posted.get("8", [])) == 1)
+        check("...the prepare phase leaves ONE memo per PR, keyed by that PR's head SHA and by the tier the serial "
+              "half will ask with — the whole of what the parallel work hands over",
+              after_prepare == [f"myrepo-7-{HEAD[:12]}-full.json", f"myrepo-8-{HEAD[:12]}-full.json"])
+        check("...the serial half SPENDS them rather than re-running: it says so on both PRs, and the gate itself "
+              "was executed exactly twice across the whole sweep — once each, where an unread memo is four",
+              swept.count("run for this sweep by the prepare phase") == 2 and len(gate_runs) == 2)
+        check("...and the memo is gone when the sweep is: spent on read, so the green it recorded can never answer "
+              "for the NEXT sweep — the one a kept job is re-gated by (`gates` is in RETRY because the suite flakes)",
+              not glob.glob(f"{gate_dir()}/*.json") and gate_dir() == f"{qdir}/gates")
+        check("...and no two of them are ever inside a fetch of the SAME checkout at once: .git/FETCH_HEAD is one "
+              "file per repo, so interleaved fetches hand a thread its sibling's head SHA — a review bought "
+              "against the wrong diff, and its verdict posted on the wrong PR under a SHA that is not that PR's",
+              fetched and not overlapped and not gate.broken)
 
         fresh(pr=7)
         world["gh pr merge"] = (1, "failed to merge: Merge already in progress")
@@ -2276,7 +3171,8 @@ def cmd_selfcheck():
               "sweep, and one unreachable origin must not sit in front of the landing a 👍 is waiting on",
               due_catchup() and not due_catchup() and CATCHUP_EVERY == 900)
     finally:
-        globals().update(LANDQ=_real_landq, start_worker=real_start, known_repos=real_repos)
+        shutil.rmtree(STATE, ignore_errors=True)
+        globals().update(LANDQ=_real_landq, STATE=_real_state, start_worker=real_start, known_repos=real_repos)
         shutil.rmtree(qdir, ignore_errors=True)
 
     # 12. the seam itself, with the fakes taken back off: the REAL cc-scope, in a real subprocess, on a
@@ -2354,6 +3250,7 @@ def cmd_selfcheck():
 
 
 def main(argv):
+    default_signals()                      # once, on the main thread: every gate and reviewer below inherits it
     if argv and argv[0] == "selfcheck":
         return cmd_selfcheck()
     if argv and argv[0] == "queue":
@@ -2369,7 +3266,8 @@ def main(argv):
         return 2
     review = "--no-review" not in rest      # the ONE way past the review gate, and it has to be typed
     re_review = "--re-review" in rest       # …and the ONE way to buy a second one for a head already reviewed
-    rest = [a for a in rest if a not in ("--no-review", "--re-review")]
+    full_gates = "--full-gates" in rest     # …and the ONE way past the scoping: every gate, whatever the diff is
+    rest = [a for a in rest if a not in ("--no-review", "--re-review", "--full-gates")]
     if not rest:
         print("cc-land: --no-review is not a landing on its own — name the PR too", file=sys.stderr)
         return 2
@@ -2381,7 +3279,7 @@ def main(argv):
         if len(prs) != len(set(prs)):
             print("cc-land: the same PR twice", file=sys.stderr)
             return 2
-        land = Land(repo, pr=prs[0], review=review, re_review=re_review)
+        land = Land(repo, pr=prs[0], review=review, re_review=re_review, full_gates=full_gates)
     else:
         prs, track, note = [], "", ""
         while rest:
@@ -2397,11 +3295,11 @@ def main(argv):
             print('cc-land: work with no PR needs both --track <t> and --note "<what changed>" '
                   "(the note is the evidence the ask ledger closes against)", file=sys.stderr)
             return 2
-        land = Land(repo, track=track, note=note)
+        land = Land(repo, track=track, note=note, full_gates=full_gates)
     if not os.path.isdir(f"{land.root}/.git"):
         print(f"cc-land: {land.root} is not a git repo", file=sys.stderr)
         return 2
-    return run_batch(repo, prs, review, re_review) if len(prs) > 1 else land.run()
+    return run_batch(repo, prs, review, re_review, full_gates) if len(prs) > 1 else land.run()
 
 
 if __name__ == "__main__":

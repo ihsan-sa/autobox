@@ -2,6 +2,11 @@
 # cc-loop — autonomous "ralph loop": run headless Claude on a task, fresh context each iteration, rehydrating
 # from a durable progress journal + git, until the task reports DONE / BLOCKED / stalls / caps are hit.
 #   cc-loop <repo> <track> [--once] [--max-iter N=10] [--budget USD/iter=8] [--turns N=80] [--model M] [--effort E] [--quiet]
+#                          [--resume-last]  iteration 1 continues this track's last claude session instead of a cold
+#                                           one — for a repair round, where the context that found the bug is the
+#                                           expensive part; later iterations are fresh as always
+#                          [--no-extend]    the step limit is FINAL: no carry-on batches at --max-iter, so a caller
+#                                           that promised "one round" (cc-land's fix round) gets exactly that
 # THE STEP LIMIT IS A CHECKPOINT, NOT A VERDICT: reaching --max-iter with work COMMITTED in that iteration buys
 # another N iterations, as often as it keeps committing. There is no spend cap (owner, 2026-08-31: "no spend cap
 # as some just are expensive") — what stops a loop is not being expensive, it is not producing:
@@ -81,6 +86,16 @@ refusal_next(){   # $1 run json · $2 its stderr · $3 the model asked for → "
   nx=$("$BIN/cc-model" next "${3:-}" 2>/dev/null) || nx=""
   [ -n "$nx" ] || { printf '\t%s\n' "$why"; return 2; }
   printf '%s\t%s\n' "$nx" "$why"; return 0; }
+last_session(){   # $1 a track's runs/ directory → the session id of its most recent run that recorded one, or 1.
+                  # Newest FIRST and it keeps looking: an iteration killed mid-flight leaves a json with no
+                  # session_id, and the round after it would then open a cold session having been told to resume.
+  local f s
+  while IFS= read -r f; do
+    s=$(jq -r '.session_id // empty' "$f" 2>/dev/null)
+    [ -n "$s" ] && { printf %s "$s"; return 0; }
+  done < <(find "$1" -maxdepth 1 -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -20 | cut -d' ' -f2-)
+  return 1; }
+
 CHECKLIST="$(dirname "$BIN")/templates/self-review.md"   # the six recurring stops live in ONE place, and this is it
 selfrev_block(){   # $1 the base branch → the self-review paragraph the worker prompt carries, or NOTHING if the
                    # checklist is missing. The worker reads the diff against it before STATUS: DONE, so the review
@@ -120,6 +135,18 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   grep -q "switched to $nxt per the cc-model chain and reran it" "$d/progress.md"; t 'a rerun says it was rerun' "$?" 0
   grep -q "iteration 4 .*it produced work, so it COUNTS" "$d/progress.md"; t 'a kept iteration says the work stands' "$?" 0
   grep -q "iteration 4 .*and reran it" "$d/progress.md"; t 'and never claims it was rerun' "$?" 1
+  # --resume-last: which session a repair round continues, and what it does when there is none to continue.
+  mkdir -p "$d/runs"
+  t 'nothing has run yet: there is no session to resume, and the round is told so rather than resuming a guess' \
+    "$(last_session "$d/runs" || echo NONE)" NONE
+  printf '{"session_id":"old-one"}' > "$d/runs/20260101T000000Z-1.json"
+  printf '{"session_id":"the-one"}' > "$d/runs/20260101T000100Z-2.json"
+  touch -d '2026-01-01 00:00:00' "$d/runs/20260101T000000Z-1.json"; touch -d '2026-01-01 00:01:00' "$d/runs/20260101T000100Z-2.json"
+  t 'the session resumed is the track\047s MOST RECENT one, not the first it finds' "$(last_session "$d/runs")" the-one
+  printf '{"is_error":true}' > "$d/runs/20260101T000200Z-3.json"; touch -d '2026-01-01 00:02:00' "$d/runs/20260101T000200Z-3.json"
+  t 'a run killed before it recorded a session id is skipped, not treated as "no session" — a repair round would \
+otherwise start cold having been told to resume' "$(last_session "$d/runs")" the-one
+  rm -rf "$d/runs"
   refusal_note 5 "$last" "" 'answered as haiku, not fable' stopped >> "$d/progress.md"
   grep -q "iteration 5 .*the loop stopped (exit 10)" "$d/progress.md"; t 'the stop line says it stopped' "$?" 0
   grep -q "iteration 5 .*reran it" "$d/progress.md"; t 'and never claims it reran' "$?" 1
@@ -143,10 +170,11 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
   [ "$bad" = 0 ]; }
 [ "${1:-}" = selfcheck ] && { selfcheck; exit $?; }
 repo="${1:?repo}"; track="${2:?track}"; shift 2
-MAXI=10; BUDGET=8; TURNS=80; MODEL=""; EFFORT=""; QUIET=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
+MAXI=10; BUDGET=8; TURNS=80; MODEL=""; EFFORT=""; QUIET=0; RESUME=0   # an opus-class worker spends ~$2/iteration: a $2 cap truncated real work mid-turn
 while [ $# -gt 0 ]; do case "$1" in
   --once) MAXI=1;; --max-iter) MAXI="$2"; shift;; --budget) BUDGET="$2"; shift;; --turns) TURNS="$2"; shift;;
-  --model) MODEL="$2"; shift;; --effort) EFFORT="$2"; shift;; --quiet) QUIET=1;; *) echo "cc-loop: unknown arg $1" >&2; exit 2;; esac; shift; done
+  --model) MODEL="$2"; shift;; --effort) EFFORT="$2"; shift;; --quiet) QUIET=1;; --resume-last) RESUME=1;; --no-extend) NOEXT=1;;
+  *) echo "cc-loop: unknown arg $1" >&2; exit 2;; esac; shift; done
 [[ "$MAXI" =~ ^[0-9]+$ ]] && [ "$MAXI" -ge 1 ] || { echo "cc-loop: --max-iter must be a positive integer (got '$MAXI')" >&2; exit 2; }
 [[ "$BUDGET" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "cc-loop: --budget must be a plain number in USD (got '$BUDGET')" >&2; exit 2; }   # `1e9` is not $8
 BATCH="$MAXI"; RUNN="${CC_LOOP_RUNAWAY_N:-3}"; RUNX="${CC_LOOP_RUNAWAY_X:-5}"   # one batch of steps; the runaway rule's two dials
@@ -191,6 +219,14 @@ while [ $i -lt "$MAXI" ]; do
   args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP")
   m="$MODEL"; [ -n "$m" ] || m=$("$BIN/cc-model" current 2>/dev/null)   # no explicit --model: follow the box's override (a Fable limit puts everything on Opus)
   [ -n "$m" ] && args+=(--model "$m"); [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")
+  # --resume-last, first iteration only: continue the session this track last ran instead of opening a cold one.
+  # A fix round dispatched by the landing queue is the case it exists for — the worker already read this code and
+  # paid for it, and a fresh context re-derives all of it before it can change one line. Iteration 2 onwards is
+  # deliberately NOT resumed: this loop's own contract is a fresh context per step, and the journal is the handover.
+  if [ "$RESUME" = 1 ] && [ "$i" = 1 ]; then
+    if sid=$(last_session "$ST/runs"); then args+=(--resume "$sid"); log "iter 1 resumes session $sid (--resume-last)"
+    else log "iter 1 was asked to resume, but no run of this track recorded a session id — starting fresh"; fi
+  fi
   log "iter $i/$MAXI start (budget \$$BUDGET, turns $TURNS)"
   out="$ST/runs/$(date -u +%Y%m%dT%H%M%SZ)-$i.json"
   ( cd "$WT" && CC_ROLE=worker exec "$BIN/cc-sandbox" "$repo" "$track" -- timeout 3600 "$CLAUDE" "${args[@]}" > "$out" 2>"$out.err" ) &   # hard 1 h wall-clock per iteration; CC_WORKER_SANDBOX=1 wraps it in bwrap (cc-sandbox), otherwise that line is exec'd untouched
@@ -262,7 +298,8 @@ while [ $i -lt "$MAXI" ]; do
     [ "$barren" -ge "$RUNN" ] && stop 9 "is running away" "$RUNN iterations in a row with nothing to show for the money: $why. That is $i iterations, \$$spent, last commit $nocommit iteration(s) ago. Nothing capped it — the work itself stopped moving. Read $LOG, then re-scope the task or stop the track."
   else barren=0; fi
   # The step limit is a checkpoint, not a verdict: still committing means still working, and nothing caps the spend.
-  if [ $i -ge "$MAXI" ] && [ "$committed" = yes ]; then
+  # Under --no-extend it IS the verdict: a caller that bounded the round (cc-land's fix round) gets its bound.
+  if [ $i -ge "$MAXI" ] && [ "$committed" = yes ] && [ "${NOEXT:-0}" != 1 ]; then
     rounds=$((rounds+1)); MAXI=$((MAXI + BATCH))
     log "step limit reached with work committed — carrying on for $BATCH more (round $rounds, \$$spent)"
     "$BOARD" note "$repo" "$track" "picked itself up at the step limit: $i iterations, \$$spent, still committing" >/dev/null 2>&1; fi
