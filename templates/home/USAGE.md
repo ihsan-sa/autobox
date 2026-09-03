@@ -103,6 +103,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
 - **Live dashboard — tap the bot in the Slack sidebar → *Home*.** Units 🟢/🔴 + disk/load + any usage-limit stamp; one line per channel with its session and open ❓ count; every board track with iteration, cost, PR state and `commit!`/`push!` flags; the newest `cc-audit review` verdict and the last boot. Needs `home_tab_enabled` + the `app_home_opened` bot event — **re-paste `slack/app-manifest.json` (or `cc-slack manifest …`), hit Reinstall, then `systemctl --user restart cc-slackd`**; without them the daemon logs one line and leaves the tab alone.
 - `cc quick doing|done "…"` — log work that has no track; Home lists what is in progress.
 - **24 h of vitals (`cc-vitals`).** `cc-vitals show` draws the last day of CPU, RAM, load, temperature, power and disk as one chart — every series a percentage of its own capacity on a single 0-100 axis, the legend carrying the real numbers. `cc-vitals record` is the recorder behind it (one row a minute: counters by delta, gauges by mean-and-max) and it is installed OFF (`enable: owner` in units.json — `systemctl --user enable --now cc-vitals.timer` switches it on) — a day of history sits in `~/.cc/state/vitals/`. `cc-vitals render` redraws `current.png` (matplotlib, headless Agg) and `current.txt` (block-glyph, always available as the fallback); `--if-stale` keeps it from redrawing a 24 h chart every minute.
+- **Both graphs in a browser (`cc-graphs`).** `cc-graphs serve` puts token spend over time and the same cc-vitals series on `http://127.0.0.1:5190/`, interactive: pick the window, the metric (tokens, output tokens, or the dollar estimate) and what a line is — lane, track, repo, model or kind. Also `cc-graphs stop|status`, `--port`, `--foreground`, and `cc-graphs tokens --by track` for the same series as JSON. It binds loopback and answers GET only, and it never exposes itself: one `tailscale serve` line does that and it is the owner's to run. What a line on the token graph means, and what it leaves out, is the header of `core/bin/cc-graphs`.
 
 ## Check in from Claude.ai / Claude Desktop
 - Through the Slack connector: claude.ai posts as you into your channels, and `!status`/`!digest`/`!threads` are the read API — no extra server on the box.
@@ -116,6 +117,7 @@ How the conversation itself works — channels, threads, marks, who may do what,
     ccbox experiment                     unrestricted, boxed    box-status       health
     cc slack setup | on | status         Slack ↔ sessions       #<repo> in Slack talk to that session
     cc-scope list myapp                  asks still open        cc-scope unverified myapp  landed, nothing checked
+    cc-graphs serve | stop | status      tokens + vitals in a browser, on 127.0.0.1:5190 (loopback)
     cc-spend  |  --by repo|track|model   token spend, biggest first    cc-spend phantoms    spend nobody watches
     cc-econ pr [--week|--all]            what an accepted PR cost: worker + fix rounds + reviews, with stops and churn
     cc-econ by-model --bands             the same PRs by model AND by PR size — the routing question

@@ -1,0 +1,884 @@
+#!/usr/bin/env python3
+"""cc-graphs — the box's two graphs in a browser, on loopback: token spend over time, and cc-vitals.
+
+WHY. Two pictures existed only as still images and text. cc-vitals draws a PNG for the Slack tab and a block
+sparkline for a terminal, and neither can be hovered, filtered or narrowed; the ledger had no time view at all,
+only tables of totals (cc-spend --week is seven days summed, not seven days plotted). A browser gives both a
+time axis you can interrogate, needs nothing installed, and is interactive for free.
+
+ONE SOURCE OF TRUTH PER GRAPH, AND NEITHER IS HERE.
+  /api/vitals   runs `cc-vitals series` and passes its JSON through untouched. Not a second reader of the vitals
+                jsonl: the normalisation, the capacities, the colours and the one 0-100 axis (owner, 2026-08-30)
+                are cc-vitals' and stay cc-vitals'. If it is wrong there it is wrong here, which is the point.
+  /api/tokens   reads the ledger, ~/.cc/state/spend/<day>.tsv, and nothing else. cc-spend writes it; this only
+                buckets it.
+
+WHAT A POINT ON THE TOKEN GRAPH MEANS. The ledger is INCREMENTAL, not one row per day: cc-spend ticks every
+TICK seconds and appends one row per (session, model) whose transcript grew, stamped at the LAST assistant
+record in that chunk. So a row is spend that COMPLETED at its stamp, and a point is the spend the ledger booked
+in that bucket. A chunk is at most one tick wide for a live session, which is why the default bucket is three
+ticks: tick jitter cannot move spend across a bucket edge that matters.
+
+WHY cc-econ's POPULATION TRAP DOES NOT APPLY HERE, and it is worth being explicit. That trap is about summing
+two populations and about billing spend to a PR — the ledger sees every claude process, and a fix round RESUMES
+the worker's session so its cost lands under the earlier iteration's id. This graph does neither. One population
+(the ledger: every claude process with a transcript under ~/.claude/projects), and attribution is to a TIME and
+to the row's own cwd/track/kind/model, all of which cc-spend recorded directly. A resumed session still stamps
+its records at the second they happened, so the time axis is untouched by it; what a resumed session does move
+is the SESSION id a line is grouped under, which is why `by=track` and `by=lane` are the defaults worth reading
+and there is no by=session view.
+
+THE ONE DERIVED FIELD IS `lane`, from cwd and kind, in this order:
+  review   cwd under SCRATCH — the throwaway worktree a landing review runs in. cc-econ's own rule.
+  worker   kind=headless and cwd under ~/.cc/worktrees — a track's loop iteration.
+  session  kind=interactive — a person's or a planning session's transcript.
+  other    everything else: probe and scratch dirs, a headless run outside a worktree, an unknown cwd.
+Measured against 2026-09-02's 937 rows this placed 923 of them and all but $1 of the day.
+
+WHAT IT EXCLUDES, said rather than drawn as zero.
+  · Anything with no Claude Code transcript. The ledger's population is transcripts; an API call made outside a
+    session is not in it and this cannot see it.
+  · THE LEDGER'S DAY-RESOLUTION OPENING, at any bucket under a day. What is detected is a SIGNATURE, not a
+    cause: a finished day holding exactly one row per (session, model) carries no shape within the day, so
+    plotting it at 15-minute resolution would draw a spike that never happened. The usual cause is the ledger's
+    first tick, which backfilled every day already on disk at one row per key.
+    IT IS ONLY EVER A PREFIX. A backfill can only be the run of days that were on disk when the ledger started,
+    so the scan stops at the first day that is not day-resolution. A quiet day LATER in the ledger — every
+    session's transcript happening to grow inside one 5-minute tick — is a quiet day and is drawn, not blanked
+    and then blamed on a backfill that did not touch it. Days in the prefix are dropped from sub-day series and
+    reported in `coarse` with their totals, so the page can say so and offer the daily view, where they are
+    exactly right.
+  · USD is an estimate — cc-spend says so itself, tokens are the truth — so `usd` is a metric you can pick, not
+    the default.
+The last bucket is PARTIAL: it is not over, and the tick that will book its spend may not have run. It is
+returned with partial=true and drawn as such, never as a cliff.
+
+BINDING IS THE BOUNDARY. The server binds 127.0.0.1 and answers GET and HEAD only, from a fixed allowlist of
+asset names — no directory listing, no traversal, no upload, no write path of any kind. Putting it on the
+tailnet is one deliberate command and it is the owner's, not this script's:
+    sudo tailscale serve --bg --https=443 http://127.0.0.1:<port>
+
+  cc-graphs serve [--port N] [--foreground]   start (or restart) the server on 127.0.0.1
+  cc-graphs stop                              stop it
+  cc-graphs status                            running? on what port?
+  cc-graphs tokens [--hours N] [--by lane|track|repo|model|kind] [--bucket SEC]   the series, JSON on stdout.
+                    --bucket is one of 300 (a tick), 900, 3600 or 86400; without it the window picks one. A window
+                    and bucket that would draw more than MAX_BUCKETS points is refused, not truncated.
+  cc-graphs selfcheck                         tests; own fixtures — never this box's ledger and never its recorder
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import zlib
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+H = os.path.expanduser("~")
+LEDGER = os.environ.get("CC_SPEND_DIR") or os.path.join(H, ".cc", "state", "spend")
+WORKTREES = os.environ.get("CC_WORKTREES") or os.path.join(H, ".cc", "worktrees")
+STATE = os.environ.get("CC_GRAPHS_DIR") or os.path.join(H, ".cc", "state", "graphs")
+BIN = os.path.dirname(os.path.realpath(__file__))
+WEB = os.environ.get("CC_GRAPHS_WEB") or os.path.join(os.path.dirname(BIN), "web", "graphs")
+VITALS = os.environ.get("CC_GRAPHS_VITALS") or os.path.join(BIN, "cc-vitals")
+
+BIND = "127.0.0.1"            # NOT configurable, and that is the whole security model: the bind IS the boundary
+PORT = int(os.environ.get("CC_GRAPHS_PORT") or 5190)   # 5180 is the lesson site's; this is the next free one
+TICK = 300                    # cc-spend.timer's period: the widest a live session's ledger chunk can be
+STEPS = (TICK, 900, 3600, 86400)                       # the bucket sizes offered, smallest = one tick
+DAY = 86400
+VITALS_TIMEOUT = 30           # a wedged renderer must never hold an HTTP thread
+MAX_BUCKETS = 2000            # points on one chart before it is a request for a database, not a graph
+MAX_GROUPS = 12               # lines on one chart before the tail folds into `other`; a 13th is unreadable anyway
+SCRATCH = "/tmp/cc-" + "land-"                         # the throwaway worktree a landing review runs in
+COLS = ["ts", "session", "cwd", "repo", "track", "kind", "model", "in", "out", "cache_read", "cache_write", "est_usd"]
+NUM = ("in", "out", "cache_read", "cache_write", "usd")
+BY = ("lane", "track", "repo", "model", "kind")
+ASSETS = {"index.html": "text/html; charset=utf-8", "app.js": "text/javascript; charset=utf-8",
+          "style.css": "text/css; charset=utf-8"}
+
+# The same surface and the same categorical palette cc-vitals uses, in the reference's published order. Slots 1-6
+# are the hues cc-vitals froze for its metrics; this is a different chart on a different page, so it starts at 1
+# again and may use 7 and 8 too. Colour never identifies a line on its own here either: the legend is always on,
+# it carries the number, and each line has its own dash.
+SURFACE = {"mode": "dark", "bg": "#1a1a19", "ink": "#ffffff", "ink2": "#c3c2b7", "grid": "#383835"}
+PALETTE = [("blue", "#3987e5", "solid"), ("orange", "#d95926", "6 2"), ("aqua", "#199e70", "2 2"),
+           ("yellow", "#c98500", "8 3 2 3"), ("magenta", "#d55181", "1 3"), ("green", "#008300", "10 4"),
+           ("violet", "#9085e9", "4 2 1 2"), ("red", "#e66767", "3 3")]
+GREY = ("grey", "#c3c2b7", "1 2")            # `other` is never a hue: it is the leftovers, and it looks like it
+
+LANES = {"review": "landing reviews", "worker": "track workers", "session": "sessions", "other": "other"}
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def parse_ts(s):
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, AttributeError):
+        return None
+
+
+def iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+# ---------------------------------------------------------------- the ledger (population: every claude process)
+
+def ledger_days():
+    """Every day the ledger has on disk, oldest first."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(LEDGER, "*.tsv"))):
+        d = os.path.basename(p)[:-4]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            out.append(d)
+    return out
+
+
+def read_day(day):
+    """Every parsed row of one day file. A torn or hand-edited row is skipped, never a crash mid-report."""
+    rows = []
+    try:
+        f = open(os.path.join(LEDGER, day + ".tsv"))
+    except OSError:
+        return rows
+    with f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) < len(COLS):
+                continue
+            t = parse_ts(p[0])
+            if t is None:
+                continue
+            r = {"t": t, "session": p[1], "cwd": p[2], "repo": p[3] or "-", "track": p[4] or "-",
+                 "kind": p[5] or "-", "model": p[6] or "-"}
+            try:
+                r["in"], r["out"] = int(p[7]), int(p[8])
+                r["cache_read"], r["cache_write"] = int(p[9]), int(p[10])
+                r["usd"] = float(p[11])
+            except ValueError:
+                continue
+            rows.append(r)
+    return rows
+
+
+def lane(row):
+    """The one derived field — see the header. Review is tested FIRST: a review IS headless, in /tmp, and would
+    otherwise fall through to `other`."""
+    cwd = row.get("cwd") or ""
+    if cwd.startswith(SCRATCH):
+        return "review"
+    if row.get("kind") == "headless" and cwd.startswith(WORKTREES + os.sep):
+        return "worker"
+    if row.get("kind") == "interactive":
+        return "session"
+    return "other"
+
+
+def coarse_day(day, rows, upto):
+    """Is this day DAY-RESOLUTION — one ledger row per (session, model), so no shape within the day?
+
+    The SIGNATURE only. `rows == distinct keys` is what a backfilled day looks like, and it is also what a quiet
+    day looks like when every session's transcript grew inside one tick — the two are indistinguishable from one
+    day's file, which is why the caller (coarse_prefix) decides WHICH days it may be believed about.
+
+    A day still in progress is NEVER day-resolution: this morning's file legitimately has one row per session so
+    far, and blanking it would hide today."""
+    if not rows:
+        return False
+    if day >= upto.strftime("%Y-%m-%d"):
+        return False
+    keys = {(r["session"], r["model"]) for r in rows}
+    return len(rows) == len(keys)
+
+
+def coarse_prefix(days, upto):
+    """The day-resolution OPENING of the ledger: days[0] and every day after it that is still day-resolution,
+    stopping at the first that is not.
+
+    The finding this exists for: `rows == distinct keys` alone also matches a genuinely quiet day, and blanking
+    such a day dropped real spend from every sub-day window while the page told the reader a backfill caused it.
+    A backfill cannot do that — it ran once, over the days already on disk, so it can only ever produce an
+    unbroken run from the ledger's first day. After the first normal day, a day-resolution day is a quiet day and
+    is drawn like one."""
+    out = set()
+    for day in days:                      # cheap: a day-resolution day is one row per (session, model)
+        if not coarse_day(day, read_day(day), upto):
+            break
+        out.add(day)
+    return out
+
+
+def auto_step(hours):
+    """The bucket a window gets when none is asked for. Wider windows get wider buckets so the line stays
+    readable; > 7 days is daily, which is also the resolution the backfilled days really have."""
+    if hours <= 6:
+        return TICK
+    if hours <= 48:
+        return 900
+    if hours <= 24 * 7:
+        return 3600
+    return DAY
+
+
+def group_of(row, by):
+    if by == "lane":
+        return row["_lane"]
+    return row.get(by) or "-"
+
+
+def label_of(key, by):
+    if by == "lane":
+        return LANES.get(key, key)
+    return "(none)" if key == "-" else key      # the ledger writes "-" for a column it had no value for
+
+
+def tokens(hours=24, by="lane", step=None, upto=None):
+    """The token series: one bucket per `step` seconds over the last `hours`, grouped by `by`.
+
+    A point is the spend the ledger BOOKED in that bucket — see the header for what that means and what it
+    leaves out. Nothing here attributes spend to a PR, so none of cc-econ's attribution rules are in play."""
+    if by not in BY:
+        raise ValueError("by must be one of " + ", ".join(BY))
+    hours = max(1, min(int(hours), 24 * 90))
+    step = int(step) if step else auto_step(hours)
+    if step not in STEPS:
+        raise ValueError("bucket must be one of " + ", ".join(str(s) for s in STEPS))
+    upto = upto or now()
+    end = int(upto.timestamp())
+    start = end - hours * 3600
+    t0 = (start // step) * step                       # buckets are aligned to the epoch, so a daily one is UTC midnight
+    n = (end - t0) // step + 1
+    if n > MAX_BUCKETS:                               # 90 days at one tick is 26 000 points: a request, not a chart
+        raise ValueError("%d buckets: widen --bucket or shorten --hours (max %d)" % (n, MAX_BUCKETS))
+    sub_day = step < DAY
+
+    coarse, kept = [], []
+    days = ledger_days()
+    prefix = coarse_prefix(days, upto) if sub_day else set()   # only ever a PREFIX — see coarse_prefix
+    # Before the ledger's first day there is no answer, and no answer is not zero. A flat zero line running back
+    # to the start of a 30-day window says the box spent nothing that fortnight; it says nothing of the kind.
+    # A day AFTER that first one with no file IS zero: cc-spend writes a file whenever a transcript grew.
+    start_known = (datetime.strptime(days[0], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) if days else end
+    for day in days:
+        # A day file is read whole — coarseness is a property of the whole day, not of the window's slice of it.
+        d0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if d0.timestamp() > end or (d0 + timedelta(days=1)).timestamp() < t0:
+            continue
+        rows = read_day(day)
+        inwin = [r for r in rows if t0 <= r["t"].timestamp() <= end]
+        if not inwin:
+            continue
+        if day in prefix:
+            tot = {k: sum(r[k] for r in inwin) for k in NUM}
+            tot["rows"] = len(inwin)
+            tot["day"] = day
+            tot["from"] = max(t0, int(d0.timestamp()))
+            tot["to"] = min(end, int((d0 + timedelta(days=1)).timestamp()) - 1)
+            coarse.append(tot)
+            continue
+        kept.extend(inwin)
+
+    # Every step divides 86400 and t0 is epoch-aligned to step, so no bucket straddles UTC midnight: blinding a
+    # coarse day's buckets can never blank a bucket that also holds a resolvable day's rows.
+    # A day this window cannot resolve is drawn as NOTHING, never as zero. Six backfilled days behind one live one
+    # read as "the box spent nothing all week" if their buckets hold 0, and the banner saying otherwise loses to
+    # the flat line every time. A null breaks the line, which is what no-data-at-this-resolution looks like.
+    blind = set()
+    for i in range(n):                                # whole buckets that end before the ledger begins
+        if t0 + (i + 1) * step <= start_known:
+            blind.add(i)
+    for c in coarse:
+        for i in range((c["from"] - t0) // step, (c["to"] - t0) // step + 1):
+            if 0 <= i < n:
+                blind.add(i)
+
+    for r in kept:
+        r["_lane"] = lane(r)
+
+    # Ranked by USD even though tokens is the default metric: a token is not comparable across models (a cheap
+    # model's million is a dear one's thousand), and the fold is asking which lines MATTER. The estimate is the
+    # only cross-model measure the ledger has. It fixes which groups survive, never their colour or their values.
+    order = {}
+    for r in kept:
+        order[group_of(r, by)] = order.get(group_of(r, by), 0.0) + r["usd"]
+    top = [k for k, _ in sorted(order.items(), key=lambda kv: -kv[1])[:MAX_GROUPS]]
+    fold = len(order) > len(top)
+    keep = set(top)
+
+    series = {}
+    for k in top + (["other"] if fold and "other" not in top else []):
+        series[k] = {k2: [0] * n for k2 in NUM}
+    for r in kept:
+        g = group_of(r, by)
+        if g not in keep:
+            g = "other"
+        i = int(r["t"].timestamp() - t0) // step
+        if not 0 <= i < n:
+            continue
+        for k2 in NUM:
+            series[g][k2][i] += r[k2]
+
+    for g in series.values():
+        for arr in g.values():
+            for i in blind:
+                arr[i] = None
+
+    def ssum(a):
+        return sum(v for v in a if v is not None)
+
+    # A slot is a function of the group's NAME alone — crc32 picks it — because the page refreshes every minute
+    # and a line that changes colour under the reader is worse than one whose colour they check against the
+    # legend anyway. Neither the rank nor WHICH groups survived the fold may move it: an index over the surviving
+    # names (what this was) re-coloured every line below a newcomer the moment a 13th track outspent the 12th.
+    # The one thing that still moves a line is a genuine hash COLLISION: two names wanting the same slot, settled
+    # by walking to the next free one in sorted order, so the later name yields. With more groups than colours
+    # the palette fills and the rest take their crc32 slot as-is, sharing a hue — the legend and the per-slot
+    # dash are what tell those apart, here as everywhere else on this chart.
+    slot, taken = {}, set()
+    for k in sorted(k for k in series if k != "other"):
+        i = zlib.crc32(k.encode()) % len(PALETTE)
+        while i in taken and len(taken) < len(PALETTE):
+            i = (i + 1) % len(PALETTE)
+        taken.add(i)
+        slot[k] = i
+    groups = []
+    for k in sorted(series, key=lambda k: -order.get(k, 0.0)):
+        hue, colour, dash = GREY if k == "other" else PALETTE[slot[k] % len(PALETTE)]
+        g = {"key": k, "label": label_of(k, by), "hue": hue, "colour": colour, "dash": dash}
+        g.update({k2: series[k][k2] for k2 in NUM})
+        g["tokens"] = [None if j in blind else sum(series[k][c][j] for c in ("in", "out", "cache_read", "cache_write"))
+                       for j in range(n)]
+        g["total"] = {k2: ssum(series[k][k2]) for k2 in NUM}
+        g["total"]["tokens"] = ssum(g["tokens"])
+        groups.append(g)
+
+    return {
+        "generated": iso(time.time()), "window_h": hours, "by": by, "t0": t0, "step": step, "n": n,
+        "partial": True,                              # the last bucket is not over and its tick may not have run
+        "surface": SURFACE, "groups": groups,
+        "total": {k2: sum(g["total"][k2] for g in groups) for k2 in list(NUM) + ["tokens"]},
+        "rows": len(kept), "folded": fold, "max_groups": MAX_GROUPS, "tick": TICK,
+        "coarse": {"days": coarse, "usd": sum(c["usd"] for c in coarse), "blind": len(blind),
+                   "ledger_from": days[0] if days else None},
+        "means": ("spend the ledger booked in the bucket: cc-spend stamps each chunk at the last assistant "
+                  "record in it, so a point is spend that COMPLETED then"),
+        "excludes": ("anything with no Claude Code transcript; and, below daily buckets, the ledger's opening "
+                     "days that hold one row per session-model and so carry no shape within the day (usually "
+                     "the first tick, which backfilled what was already on disk). Their buckets are null, not "
+                     "zero: the line is BLANK over them, because no-data-at-this-resolution must not look like "
+                     "a quiet week"),
+        "lanes": LANES,
+    }
+
+
+# ---------------------------------------------------------------- vitals (passthrough; cc-vitals owns the truth)
+
+def vitals(hours=24):
+    hours = max(1, min(int(hours), 24 * 3))
+    p = subprocess.run([sys.executable, VITALS, "series", "--hours", str(hours)],
+                       capture_output=True, text=True, timeout=VITALS_TIMEOUT)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or "cc-vitals series failed").strip()[:400])
+    return json.loads(p.stdout)
+
+
+# ---------------------------------------------------------------- the server (GET/HEAD, loopback, allowlist)
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "cc-graphs"
+    sys_version = ""
+
+    def log_request(self, code="-", size="-"):
+        if isinstance(code, int) and 200 <= code < 400:   # a refresh a minute must not grow serve.log forever
+            return
+        self.log_message('"%s" %s', self.requestline, code)
+
+    def log_message(self, fmt, *a):
+        sys.stderr.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), fmt % a))
+
+    def _send(self, code, body, ctype, head=False):
+        body = body if isinstance(body, bytes) else body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def _json(self, code, obj, head=False):
+        self._send(code, json.dumps(obj), "application/json; charset=utf-8", head)
+
+    def do_HEAD(self):
+        self.route(head=True)
+
+    def do_GET(self):
+        self.route(head=False)
+
+    def route(self, head=False):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        one = lambda k, d=None: (q.get(k) or [d])[0]
+        path = u.path
+        try:
+            if path == "/api/tokens":
+                return self._json(200, tokens(hours=int(one("hours", 24)), by=one("by", "lane"),
+                                              step=one("bucket")), head)
+            if path == "/api/vitals":
+                return self._json(200, vitals(hours=int(one("hours", 24))), head)
+            if path.startswith("/api/"):
+                return self._json(404, {"error": "no such endpoint"}, head)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)}, head)
+        except Exception as e:                        # a broken input must not take the server down
+            return self._json(500, {"error": "%s: %s" % (type(e).__name__, e)}, head)
+
+        name = "index.html" if path == "/" else path.lstrip("/")
+        if name not in ASSETS:                        # an exact allowlist: no listing, no traversal, no guessing
+            return self._send(404, "not found\n", "text/plain; charset=utf-8", head)
+        try:
+            with open(os.path.join(WEB, name), "rb") as f:
+                return self._send(200, f.read(), ASSETS[name], head)
+        except OSError:
+            return self._send(500, "asset missing: %s\n" % name, "text/plain; charset=utf-8", head)
+
+    def do_POST(self):                                # there is no write path here, and never should be
+        self._send(405, "read-only\n", "text/plain; charset=utf-8")
+
+    do_PUT = do_DELETE = do_PATCH = do_POST
+
+
+def pidfile():
+    return os.path.join(STATE, "serve.pid")
+
+
+def portfile():
+    return os.path.join(STATE, "serve.port")
+
+
+def running():
+    """The pid of OUR server, or None. The cmdline check is what stops a recycled pid reading as running."""
+    try:
+        with open(pidfile()) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            if b"cc-graphs" not in f.read():
+                return None
+    except OSError:
+        return None
+    return pid
+
+
+def stop(_opt=None, quiet=False):
+    pid = running()
+    if not pid:
+        if not quiet:
+            print("cc-graphs: not running")
+    else:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(40):
+            if not running():
+                break
+            time.sleep(0.1)
+        if running():
+            os.kill(pid, signal.SIGKILL)
+        if not quiet:
+            print("cc-graphs: stopped (pid %d)" % pid)
+    for p in (pidfile(), portfile()):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return 0
+
+
+def status(_opt=None):
+    pid = running()
+    if not pid:
+        print("cc-graphs: not running")
+        return 1
+    try:
+        with open(portfile()) as f:
+            port = f.read().strip()
+    except OSError:
+        port = "?"
+    print("cc-graphs: running (pid %d) on http://%s:%s/" % (pid, BIND, port))
+    return 0
+
+
+def run(port):
+    os.makedirs(STATE, exist_ok=True)
+    srv = ThreadingHTTPServer((BIND, port), Handler)
+    with open(pidfile(), "w") as f:
+        f.write(str(os.getpid()))
+    with open(portfile(), "w") as f:
+        f.write(str(port))
+    sys.stderr.write("cc-graphs: serving http://%s:%d/ (assets %s)\n" % (BIND, port, WEB))
+    try:
+        srv.serve_forever()
+    finally:
+        srv.server_close()
+
+
+def serve(opt):
+    port = int(opt.get("--port") or PORT)
+    stop(quiet=True)                                  # serve is a restart; "not running" is not news to whoever ran it
+    os.makedirs(STATE, exist_ok=True)
+    if "--foreground" in opt:
+        return run(port)
+    log = os.path.join(STATE, "serve.log")
+    with open(log, "ab") as out:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "serve", "--port", str(port), "--foreground"],
+                         stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(50):
+        time.sleep(0.1)
+        if running():
+            break
+    if not running():
+        print("cc-graphs: failed to start — see %s" % log, file=sys.stderr)
+        return 1
+    print("cc-graphs: http://%s:%d/   (loopback only — putting it on the tailnet is yours:\n"
+          "           sudo tailscale serve --bg --https=443 http://%s:%d)" % (BIND, port, BIND, port))
+    return 0
+
+
+def cmd_tokens(opt):
+    print(json.dumps(tokens(hours=int(opt.get("--hours") or 24), by=opt.get("--by") or "lane",
+                            step=opt.get("--bucket")), indent=1))
+    return 0
+
+
+# ---------------------------------------------------------------- selfcheck (own fixtures; no ledger, no network)
+
+def _fixture(tmp, day, rows):
+    """Write one fixture ledger day. Every case builds the state it asserts on; none reads another's."""
+    os.makedirs(tmp, exist_ok=True)
+    with open(os.path.join(tmp, day + ".tsv"), "w") as f:
+        f.write("#" + "\t".join(COLS) + "\n")
+        for r in rows:
+            f.write("\t".join(str(x) for x in r) + "\n")
+
+
+def _row(ts, sess="s1", cwd="/w", repo="r", track="t", kind="headless", model="m",
+         i=1, o=2, cr=3, cw=4, usd=1.0):
+    return [ts, sess, cwd, repo, track, kind, model, i, o, cr, cw, "%.6f" % usd]
+
+
+def selfcheck(_opt=None):
+    global LEDGER, WORKTREES, WEB, VITALS
+    ok, bad = 0, []
+
+    def t(name, cond):
+        nonlocal ok
+        if cond:
+            ok += 1
+        else:
+            bad.append(name)
+
+    keep_l, keep_w, keep_web, keep_v = LEDGER, WORKTREES, WEB, VITALS
+    root = tempfile.mkdtemp(prefix="cc-graphs-selfcheck-")
+    try:
+        WORKTREES = os.path.join(root, "wt")
+        upto = datetime(2026, 5, 4, 12, 0, 0, tzinfo=timezone.utc)
+        today, past = "2026-05-04", "2026-05-03"
+
+        # 1 — lane, all four, and the one that has to be tested first: a review IS headless and IS in /tmp, so
+        #     `review` before `worker`/`other` is the whole rule. Both the kept and the suppressed answer asserted.
+        t("lane review", lane({"cwd": SCRATCH + "ab12/x", "kind": "headless"}) == "review")
+        t("lane review not worker", lane({"cwd": SCRATCH + "ab12/x", "kind": "headless"}) != "worker")
+        t("lane worker", lane({"cwd": WORKTREES + "/repo/track", "kind": "headless"}) == "worker")
+        t("lane session", lane({"cwd": os.path.join(root, "dev"), "kind": "interactive"}) == "session")
+        t("lane other", lane({"cwd": "/tmp/probe-x", "kind": "headless"}) == "other")
+        t("lane worker needs headless", lane({"cwd": WORKTREES + "/r/t", "kind": "interactive"}) == "session")
+        # a cwd that merely STARTS with the worktrees string is not inside it
+        t("lane worktree prefix is not a parent", lane({"cwd": WORKTREES + "-else/x", "kind": "headless"}) == "other")
+
+        # 2 — a row lands in the bucket holding its stamp, and two rows a bucket apart do not merge.
+        LEDGER = os.path.join(root, "l2")
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:10Z", usd=2.0), _row("2026-05-04T11:02:00Z", usd=3.0),
+                                 _row("2026-05-04T11:20:00Z", usd=5.0)])
+        r = tokens(hours=24, by="lane", step=900, upto=upto)
+        g = r["groups"][0]
+        i1 = int(datetime(2026, 5, 4, 11, 0, tzinfo=timezone.utc).timestamp() - r["t0"]) // 900
+        i2 = int(datetime(2026, 5, 4, 11, 15, tzinfo=timezone.utc).timestamp() - r["t0"]) // 900
+        t("bucket sums same window", abs(g["usd"][i1] - 5.0) < 1e-9)
+        t("bucket keeps later row apart", abs(g["usd"][i2] - 5.0) < 1e-9 and i1 != i2)
+        t("bucket total", abs(r["total"]["usd"] - 10.0) < 1e-9)
+        t("tokens is the four counts", g["tokens"][i1] == 2 * (1 + 2 + 3 + 4))
+        t("last bucket flagged partial", r["partial"] is True)
+        t("buckets are epoch-aligned", r["t0"] % 900 == 0)
+
+        # 3 — the window is a filter: a row before t0 is gone, one inside is kept.
+        LEDGER = os.path.join(root, "l3")
+        _fixture(LEDGER, past, [_row("2026-05-03T01:00:00Z", usd=9.0)])
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="a", usd=1.0),
+                                 _row("2026-05-04T11:05:00Z", sess="b", usd=1.0)])
+        r = tokens(hours=6, by="lane", step=900, upto=upto)
+        t("window drops the older row", abs(r["total"]["usd"] - 2.0) < 1e-9)
+        r = tokens(hours=24, by="lane", step=DAY, upto=upto)
+        t("wider window keeps it", abs(r["total"]["usd"] - 11.0) < 1e-9)
+
+        # 4 — a backfilled day (one row per (session, model), and the day is over) is DROPPED below daily buckets
+        #     and INCLUDED at daily ones. Both halves asserted, on state this case built.
+        LEDGER = os.path.join(root, "l4")
+        _fixture(LEDGER, past, [_row("2026-05-03T23:00:00Z", sess="a", usd=4.0),
+                                _row("2026-05-03T23:00:00Z", sess="b", usd=6.0)])
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="c", usd=1.0),
+                                 _row("2026-05-04T11:30:00Z", sess="c", usd=1.0)])
+        r = tokens(hours=24, by="lane", step=900, upto=upto)
+        t("coarse day not drawn", abs(r["total"]["usd"] - 2.0) < 1e-9)
+        t("coarse day reported", [c["day"] for c in r["coarse"]["days"]] == [past]
+          and abs(r["coarse"]["usd"] - 10.0) < 1e-9)
+        # the half that matters: blank over the coarse day, a real 0 where the box simply spent nothing
+        blind_i = int(datetime(2026, 5, 3, 23, 0, tzinfo=timezone.utc).timestamp() - r["t0"]) // 900
+        seen_i = int(datetime(2026, 5, 4, 11, 0, tzinfo=timezone.utc).timestamp() - r["t0"]) // 900
+        quiet_i = int(datetime(2026, 5, 4, 8, 0, tzinfo=timezone.utc).timestamp() - r["t0"]) // 900
+        g0 = r["groups"][0]
+        t("coarse buckets are null, not zero", g0["usd"][blind_i] is None and g0["tokens"][blind_i] is None)
+        t("a drawn bucket is a number", g0["usd"][seen_i] == 1.0)
+        t("a genuinely quiet bucket is zero, not null", g0["usd"][quiet_i] == 0)
+        t("nulls are left out of the total", abs(g0["total"]["usd"] - 2.0) < 1e-9)
+        r = tokens(hours=24, by="lane", step=DAY, upto=upto)
+        t("coarse day drawn at daily", abs(r["total"]["usd"] - 12.0) < 1e-9 and not r["coarse"]["days"])
+
+        # 4b — before the ledger's first day the answer is BLANK; after it, an empty bucket is a real zero.
+        LEDGER = os.path.join(root, "l4b")
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="a", usd=1.0),
+                                 _row("2026-05-04T11:30:00Z", sess="a", usd=1.0)])
+        r = tokens(hours=24, by="lane", step=900, upto=upto)
+        g0 = r["groups"][0]
+        before = int(datetime(2026, 5, 3, 20, 0, tzinfo=timezone.utc).timestamp() - r["t0"]) // 900
+        after = int(datetime(2026, 5, 4, 5, 0, tzinfo=timezone.utc).timestamp() - r["t0"]) // 900
+        t("before the ledger starts is blank", g0["usd"][before] is None)
+        t("a quiet bucket after it is zero", g0["usd"][after] == 0)
+        t("the ledger's first day is reported", r["coarse"]["ledger_from"] == today)
+
+        # 4d — THE PREFIX RULE (review finding, PR #199). `rows == distinct keys` also matches a genuinely quiet
+        #      day, so it may only be believed about the ledger's OPENING run. Both halves on one fixture: the
+        #      opening day is blanked and reported, and a quiet day with the SAME signature AFTER a normal day is
+        #      drawn — which is the spend the old rule dropped while telling the reader a backfill caused it.
+        LEDGER = os.path.join(root, "l4d")
+        _fixture(LEDGER, "2026-05-01", [_row("2026-05-01T13:00:00Z", sess=x, usd=4.0) for x in ("a", "b")])
+        _fixture(LEDGER, "2026-05-02", [_row("2026-05-02T13:00:00Z", sess="c", usd=1.0),
+                                        _row("2026-05-02T13:30:00Z", sess="c", usd=1.0)])
+        _fixture(LEDGER, "2026-05-03", [_row("2026-05-03T13:00:00Z", sess=x, usd=3.0) for x in ("d", "e")])
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="f", usd=5.0)])
+        r = tokens(hours=72, by="lane", step=900, upto=upto)
+        g0 = r["groups"][0]
+        at = lambda dt_: int(dt_.timestamp() - r["t0"]) // 900
+        near = lambda v, x: v is not None and abs(v - x) < 1e-9      # a blanked bucket must FAIL, not raise
+        opening = at(datetime(2026, 5, 1, 13, 0, tzinfo=timezone.utc))
+        normal = at(datetime(2026, 5, 2, 13, 0, tzinfo=timezone.utc))
+        quiet = at(datetime(2026, 5, 3, 13, 0, tzinfo=timezone.utc))
+        t("the opening day is still blanked", g0["usd"][opening] is None)
+        t("only the opening day is reported coarse", [c["day"] for c in r["coarse"]["days"]] == ["2026-05-01"]
+          and abs(r["coarse"]["usd"] - 8.0) < 1e-9)
+        t("the day that breaks the run is drawn", near(g0["usd"][normal], 1.0))
+        t("a quiet day AFTER it is drawn, not blamed on a backfill", near(g0["usd"][quiet], 6.0))
+        t("its spend is in the total", abs(r["total"]["usd"] - 13.0) < 1e-9)
+
+        # 4c — an empty ledger answers, it does not crash: no lines, no totals, nothing claimed.
+        LEDGER = os.path.join(root, "empty")
+        os.makedirs(LEDGER)
+        r = tokens(hours=24, by="lane", step=900, upto=upto)
+        t("empty ledger answers", r["groups"] == [] and r["total"]["usd"] == 0 and r["rows"] == 0)
+        t("empty ledger claims no first day", r["coarse"]["ledger_from"] is None)
+
+        # 5 — today is never coarse: this morning legitimately has one row per session so far.
+        LEDGER = os.path.join(root, "l5")
+        _fixture(LEDGER, today, [_row("2026-05-04T09:00:00Z", sess="a", usd=1.0),
+                                 _row("2026-05-04T10:00:00Z", sess="b", usd=1.0)])
+        r = tokens(hours=24, by="lane", step=900, upto=upto)
+        t("day in progress is drawn", abs(r["total"]["usd"] - 2.0) < 1e-9)
+        t("day in progress is not coarse", not r["coarse"]["days"])
+
+        # 6 — more groups than fit fold into `other`, and folding loses nothing.
+        LEDGER = os.path.join(root, "l6")
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="s%d" % k, track="t%02d" % k, usd=float(k + 1))
+                                 for k in range(MAX_GROUPS + 5)])
+        r = tokens(hours=24, by="track", step=900, upto=upto)
+        want = sum(float(k + 1) for k in range(MAX_GROUPS + 5))
+        t("fold keeps every dollar", abs(r["total"]["usd"] - want) < 1e-6)
+        t("fold caps the lines", len(r["groups"]) <= MAX_GROUPS + 1 and r["folded"])
+        t("fold has an other line", any(g["key"] == "other" for g in r["groups"]))
+        t("biggest track survives folding", any(g["key"] == "t%02d" % (MAX_GROUPS + 4) for g in r["groups"]))
+        # the colour a group gets must not move when the ranking does. Same five groups both times — a set that
+        # folds would change WHICH groups survive, which is a different question from this one.
+        LEDGER = os.path.join(root, "l6b")
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="s%d" % k, track="t%d" % k, usd=float(k + 1))
+                                 for k in range(5)])
+        up = tokens(hours=24, by="track", step=900, upto=upto)
+        _fixture(LEDGER, today, [_row("2026-05-04T11:00:00Z", sess="s%d" % k, track="t%d" % k, usd=float(5 - k))
+                                 for k in range(5)])
+        down = tokens(hours=24, by="track", step=900, upto=upto)
+        c1 = {g["key"]: g["colour"] for g in up["groups"]}
+        t("the ranking really did flip",
+          [g["key"] for g in down["groups"]] == list(reversed([g["key"] for g in up["groups"]])))
+        t("colour follows the name, not the rank", all(c1[g["key"]] == g["colour"] for g in down["groups"]))
+        # 6c — and not the MEMBERSHIP either (review finding, PR #199): an index over the surviving names moved
+        #      every line below a newcomer. These five names hash to five different slots, so what this case
+        #      isolates is membership, not a collision — a collision is settled by walking to the next free slot
+        #      and CAN move the later name, which the comment beside the code says outright.
+        LEDGER = os.path.join(root, "l6c")
+        four = [_row("2026-05-04T11:00:00Z", sess="s%d" % k, track="t%d" % k, usd=float(k)) for k in (1, 2, 3, 4)]
+        _fixture(LEDGER, today, four)
+        before = tokens(hours=24, by="track", step=900, upto=upto)
+        # the newcomer sorts FIRST and outspends them all, which is the shape that shifted an index-based slot
+        _fixture(LEDGER, today, four + [_row("2026-05-04T11:00:00Z", sess="s0", track="t0", usd=99.0)])
+        after = tokens(hours=24, by="track", step=900, upto=upto)
+        cb = {g["key"]: g["colour"] for g in before["groups"]}
+        ca = {g["key"]: g["colour"] for g in after["groups"]}
+        t("the membership really did change", set(ca) - set(cb) == {"t0"} and after["groups"][0]["key"] == "t0")
+        t("a newcomer re-colours nobody", all(ca[k] == cb[k] for k in cb))
+        t("and the survivors still differ from each other", len(set(ca.values())) == len(ca))
+
+        # 7 — a torn row is skipped, not a crash, and the good row beside it still counts.
+        LEDGER = os.path.join(root, "l7")
+        os.makedirs(LEDGER)
+        with open(os.path.join(LEDGER, today + ".tsv"), "w") as f:
+            f.write("#" + "\t".join(COLS) + "\n")
+            f.write("2026-05-04T11:00:00Z\tbroken\n")
+            f.write("\t".join(str(x) for x in _row("2026-05-04T11:00:00Z", usd=7.0)) + "\n")
+            f.write("not-a-stamp\ts\t/w\tr\tt\theadless\tm\t1\t1\t1\t1\t1.0\n")
+        r = tokens(hours=24, by="lane", step=900, upto=upto)
+        t("torn rows skipped, good row kept", abs(r["total"]["usd"] - 7.0) < 1e-9 and r["rows"] == 1)
+
+        # 8 — the bucket a window gets on its own, at both sides of each edge. On an empty ledger of its own:
+        #     these are the window arithmetic and must not read the rows case 7 happened to leave behind.
+        LEDGER = os.path.join(root, "l8")
+        os.makedirs(LEDGER)
+        t("auto 6h", auto_step(6) == TICK and auto_step(7) == 900)
+        t("auto 48h", auto_step(48) == 900 and auto_step(49) == 3600)
+        t("auto 7d", auto_step(24 * 7) == 3600 and auto_step(24 * 7 + 1) == DAY)
+        t("bad bucket refused", _raises(lambda: tokens(hours=24, step=77, upto=upto)))
+        t("too many buckets refused", _raises(lambda: tokens(hours=24 * 90, step=TICK, upto=upto)))
+        t("that same window is fine daily", tokens(hours=24 * 90, step=DAY, upto=upto)["n"] <= MAX_BUCKETS)
+        t("bad group refused", _raises(lambda: tokens(hours=24, by="session", upto=upto)))
+
+        # 9 — the server: loopback, read-only, exact asset allowlist.
+        WEB = os.path.join(root, "web")
+        os.makedirs(WEB)
+        for a in ASSETS:
+            with open(os.path.join(WEB, a), "w") as f:
+                f.write("/*%s*/" % a)
+        with open(os.path.join(root, "secret"), "w") as f:
+            f.write("no")
+        t("bind is loopback", BIND == "127.0.0.1")
+        import threading
+        import urllib.request
+        quiet = Handler.log_message
+        Handler.log_message = lambda *a, **k: None      # the cases are the output; an access log is not
+        srv = ThreadingHTTPServer((BIND, 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = "http://%s:%d" % (BIND, srv.server_port)
+
+        def get(p, method="GET"):
+            rq = urllib.request.Request(base + p, method=method)
+            try:
+                with urllib.request.urlopen(rq, timeout=5) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+        try:
+            t("index served", get("/")[0] == 200 and get("/")[1].startswith(b"/*index.html"))
+            t("asset served", get("/app.js")[0] == 200)
+            t("head has no body", get("/app.js", "HEAD")[1] == b"")
+            t("unknown asset refused", get("/secret")[0] == 404)
+            t("traversal refused", get("/../secret")[0] == 404 and get("/%2e%2e/secret")[0] == 404)
+            t("post refused", get("/", "POST")[0] == 405)
+            t("unknown api is 404 json", get("/api/nope")[0] == 404)
+            t("bad query is 400 not 500", get("/api/tokens?by=nope")[0] == 400)
+            # A fixture of its own, and stamped NOW: the endpoint asks the real clock, not this case's `upto`.
+            # The earlier day of zero-cost rows is there so that "before the ledger begins is blank" cannot blank
+            # the row itself when this runs in the first minute after UTC midnight — the total is 3.5 either way.
+            LEDGER = os.path.join(root, "l9")
+            yday = (now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            _fixture(LEDGER, yday, [_row(yday + "T00:00:0%dZ" % k, i=0, o=0, cr=0, cw=0, usd=0.0) for k in (0, 1)])
+            _fixture(LEDGER, now().strftime("%Y-%m-%d"), [_row(iso(time.time() - 60), usd=3.5)])
+            code, body = get("/api/tokens?hours=24&bucket=900")
+            j = json.loads(body)
+            t("tokens endpoint is the same function, on this case's own ledger",
+              code == 200 and j["step"] == 900 and abs(j["total"]["usd"] - 3.5) < 1e-9)
+
+            # 10 — /api/vitals is a PASSTHROUGH and nothing else: whatever cc-vitals prints comes back unchanged.
+            #      On a stub written here, because this case must never run this box's own recorder. Both sides:
+            #      the object that is passed through, and the cc-vitals that fails — which is an error the page
+            #      can show, not a server that fell over with it.
+            VITALS = os.path.join(root, "stub-vitals.py")
+            spec = {"generated": "2026-05-04T12:00:00Z", "n": 2, "step": 60, "t0": 1,
+                    "series": [{"key": "cpu", "norm": [1.0, None]}]}
+            with open(VITALS, "w") as f:
+                f.write("import sys\nsys.stdout.write(%r)\n" % json.dumps(spec))
+            t("vitals passes cc-vitals through unchanged", vitals(hours=6) == spec)
+            code, body = get("/api/vitals?hours=6")
+            t("vitals endpoint serves that same object", code == 200 and json.loads(body) == spec)
+            with open(VITALS, "w") as f:
+                f.write("import sys\nsys.stderr.write('recorder is off\\n')\nsys.exit(1)\n")
+            code, body = get("/api/vitals?hours=6")
+            t("a failing cc-vitals is an error the page can show",
+              code == 500 and "recorder is off" in json.loads(body)["error"])
+            t("and the server is still up after it", get("/")[0] == 200)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            Handler.log_message = quiet
+    finally:
+        LEDGER, WORKTREES, WEB, VITALS = keep_l, keep_w, keep_web, keep_v
+        shutil.rmtree(root, ignore_errors=True)
+
+    print("cc-graphs selfcheck: %d passed, %d failed" % (ok, len(bad)))
+    for b in bad:
+        print("  FAIL", b)
+    return 1 if bad else 0
+
+
+def _raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------- cli
+
+def flags(argv):
+    opt = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+            opt[a] = argv[i + 1]
+            i += 2
+        else:
+            opt[a] = True
+            i += 1
+    return opt
+
+
+def main(argv):
+    cmds = {"serve": serve, "stop": stop, "status": status, "tokens": cmd_tokens, "selfcheck": selfcheck}
+    cmd = argv[0] if argv else ""
+    if cmd not in cmds or "--help" in argv or "-h" in argv:
+        print(__doc__.strip(), file=sys.stderr if cmd not in cmds else sys.stdout)
+        return 2 if cmd not in cmds else 0
+    return cmds[cmd](flags(argv[1:]))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

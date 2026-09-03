@@ -1615,6 +1615,13 @@ echo "== the worker loop (cc-loop) =="
 lp=$("$B/cc-loop" selfcheck 2>&1); lr=$(grep -o "cc-loop selfcheck: .*" <<<"$lp" | tail -1)   # its own tally line, not the journal fixtures it prints above it
 grep -q "0 failed" <<<"$lr" && ok "$lr" \
   || { bad "cc-loop selfcheck: ${lr:-it printed no tally line}"; grep "^FAIL" <<<"$lp" | head -5; }   # no tally = it died = red, never a silent pass
+echo "== the graphs on loopback (cc-graphs) =="
+# No fixtures to build: `cc-graphs selfcheck` writes its own ledger days under a temp dir, points the lane rule at
+# a worktrees path of its own, and its HTTP cases bind a port the KERNEL picks on 127.0.0.1 and close it again — so
+# this box's ledger is never read and a server already sitting on the real port is never disturbed.
+gp=$("$B/cc-graphs" selfcheck 2>&1); gr=$(grep -o "cc-graphs selfcheck: .*" <<<"$gp" | tail -1)   # its own tally line, never a FAIL line that happens to be last
+grep -q "0 failed" <<<"$gr" && ok "$gr" \
+  || { bad "cc-graphs selfcheck: ${gr:-it printed no tally line}"; grep "FAIL" <<<"$gp" | head -5; }   # no tally = it died = red, never a silent pass
 echo "== the suite's own lock (one run at a time) =="
 # Re-runs THIS FILE, stopping at the lock ($CC_SELFTEST_LOCK_ONLY) — no fixtures, no tmux, no repo, so the suite
 # never runs inside itself. On a lock of its own ($CC_SELFTEST_LOCK): the real one is held by the very run doing
