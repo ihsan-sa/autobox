@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+"""cc-broker — one door for the machine-made events aimed at a session, so six of them cost one wake and not six.
+
+  cc-broker inject [--no-start] [--source S] <target> "text"   submit an event (argv-compatible with the daemon's
+                                                               own `inject`, so it drops in where that is called;
+                                                               a unit names itself with CC_BROKER_SOURCE instead)
+  cc-broker --flush [<target>]                                 deliver what is due (cc-broker.timer, 60 s)
+  cc-broker report [--days N]                                  turns woken vs events submitted — the saving, in turns
+  cc-broker selfcheck
+
+WHY IT EXISTS. A planning session pays a full-context turn for every event that reaches it, and the cost of an
+event is that turn, not the event's own size (per-turn cost is flat with context on Fable 5.1 — cache reads are
+cheap). So the saving here is whole turns removed, and nothing at all for making a turn lighter.
+
+WHERE IT SITS, AND WHY. In front of `cc-slack inject`, which is the daemon's local door. Not inside cc-msg: the
+daemon's deliver() hands a message straight to a subscribed session and never touches cc-msg, and the planning
+session is subscribed — a broker in cc-msg would miss exactly the session this is for. And a message from a
+PERSON arrives at the daemon from Slack, never through `inject`, so it cannot be held here: not by a rule that
+could be got wrong, but because it does not pass through this file.
+Being that door means it is gated like that door: cc-guard refuses `inject` here to a worker or member session
+exactly as it refuses the daemon's own, so this file is a way to spend fewer turns and not a way past a gate.
+The units that route through it are systemd, not sessions, and are not gated at all.
+
+THE THREE CLASSES — the one judgement here, so it is written once.
+  now     the session must choose something. Delivered on arrival, and whatever was pending rides out with it.
+  digest  a machine repeating itself: a finding, a nag, a monitor line. Deduped by (repo, PR, state,
+          decision-needed) and delivered as ONE message once DEBOUNCE is up — at the 60 s tick that notices,
+          so DEBOUNCE plus at most one tick, and no longer.
+  ledger  the machine saying the same thing twice: a group the session was already told about inside REPEAT_S,
+          with no decision in it. Written to the target's events.md — and the unread LINES themselves, not just
+          their count, ride out on the next message of either other class, so nothing waits on a file being read.
+
+WHAT IS ACTUALLY ROUTED HERE: cc-secretary's findings and cc-reconcile's board watchdog, wired by one
+`Environment=` line each in their units — no edit to either file. Nothing else. cc-pulse, cc-limit and cc-model
+are deliberate wakes with a reason, and cc-land's "landing stopped" is decision-class, which is what it would get
+here anyway; holding any of them buys nothing and costs a session the debounce.
+
+NOTHING IS DROPPED, EVER (owner, 2026-09-02: "we dont worry about where we are in the daily limit, ill just tell
+you myself to stop or not"). There is no budget in this file and no rule that declines to act. A held event is
+delivered late, never not at all. If the target does not hear it, the box's own session is offered it; if nobody
+answers at all, the group is retried every 60 s and then said out loud to the owner by escalate().
+"""
+import sys, os, re, json, time, calendar, socket, subprocess, fcntl, contextlib
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+STATE = f"{HOME}/.cc/state"
+BROKER = f"{HOME}/.cc/broker"
+LOG = f"{BROKER}/events.jsonl"
+PENDING = f"{BROKER}/pending.json"
+DEBOUNCE_S = int(os.environ.get("CC_BROKER_DEBOUNCE_S", "720"))   # 12 min, the middle of the brief's 10-15
+INJECT = os.environ.get("CC_BROKER_INJECT") or f"{BIN}/cc-slack"
+# WELL UNDER the 30 s at which cc-secretary and cc-reconcile SIGKILL their inject, and the lock is never held
+# across one of these, so the worst a caller waits for the lock is another caller's read-modify-write.
+SEND_TIMEOUT_S = 10
+LEDGER_TAIL = 10                        # unread ledger lines carried on the next message; the rest are in the file
+ESCALATE_FAILS = int(os.environ.get("CC_BROKER_ESCALATE_FAILS", "3"))   # failed flushes before the owner is paged
+# cc-slack's two words for "a session has it NOW".
+TOOK = ("delivered", "typed")
+# …and its words for "the DAEMON has it, and will hand it over". Not a session's attention yet, but not this
+# file's problem either: the daemon holds a queued message for a live-again session and tells the owner itself if
+# one never comes (cc-slack:163). Treating it as a miss cost the box's planning session a turn per target per
+# tick, which is the exact thing this file exists to save (review of #190, F7).
+HELD = ("queued", "spooled")
+
+# What each source's events are when the text does not say otherwise. Only sources this box actually routes here
+# are listed; anything else is `digest`, because an event we cannot name must still wake someone — just not alone.
+SOURCE_CLASS = {"secretary": "digest", "reconcile": "digest"}
+DEFAULT_CLASS = "digest"
+# A group the session was told about less than this ago, with no decision in it, is the machine saying the same
+# thing twice: it goes to the ledger instead of buying a second wake. Past the hour it digests again — the
+# suppression is bounded, and either way nothing is dropped, because the ledger's count rides on the next message.
+REPEAT_S = int(os.environ.get("CC_BROKER_REPEAT_S", "3600"))
+
+# "owner messages and gate-failures-needing-a-choice immediate" (codex review, 2026-09-02). An owner message never
+# reaches this file — it enters the daemon from Slack, not through `inject` — so what is left to spot here is the
+# second half: a line asking the session to CHOOSE. These are this box's own words for that, lowercased on both sides.
+DECISION_MARKS = ("needs you", "needs the owner", "status: blocked", "landing stopped", "gate failed",
+                  "blocked:", "waiting on you", "approve", "decide")
+
+STATES = ("queued", "running", "waiting", "review", "blocked", "merged", "done")   # cc-board's vocabulary
+
+
+def now_s():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked():
+    """ONE WRITER AT A TIME, held for a whole command. pending.json is read-modify-written by both doors — the 60 s
+    flush and every inject — so without this an event submitted while a flush was in flight is overwritten by that
+    flush's save, i.e. dropped, which is the one thing this file promises never to do. NOTHING IS SENT UNDER IT:
+    it is taken for a read-modify-write and given straight back, so it is never held for as long as the daemon
+    takes to answer (review of #190, F2 — both callers kill their inject at 30 s)."""
+    os.makedirs(BROKER, exist_ok=True)
+    with open(f"{BROKER}/lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def conf(key, default):
+    """Environment, else ~/.cc/config, else the default — the shape every other knob on the box has."""
+    val = os.environ.get(key, "")
+    if not val:
+        try:
+            for ln in open(f"{HOME}/.cc/config"):
+                if ln.strip().startswith(key + "="):
+                    val = ln.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            pass
+    return val or default
+
+
+def box_name():
+    """The box's own planning session — the fallback target, and where an event nobody else heard goes. The same
+    name cc-secretary routes its own fallback to, read the same way, so both land in the same place."""
+    return conf("CC_BOX", socket.gethostname().split(".")[0])
+
+
+def decision_needed(text):
+    t = text.lower()
+    return any(m in t for m in DECISION_MARKS)
+
+
+def classify(source, text):
+    """A line asking for a choice beats the source table, always — the safe direction, since the table's job is
+    only to say what a source's ORDINARY event is."""
+    if decision_needed(text):
+        return "now"
+    return SOURCE_CLASS.get(source, DEFAULT_CLASS)
+
+
+def group_key(source, text, decision):
+    """"(repo, PR, state, decision-needed)" (codex review, 2026-09-02). The repo half is the TARGET, which is
+    already a dimension above this — pending and told are both keyed by it — so what is left for the key is what
+    varies inside one target: the source, EVERY `a/b` token the line carries, the PR, the state word, and whether
+    it asks for a choice. Two nags about the same PR in the same state are one line in the digest; the same PR in
+    a new state is a new one.
+
+    Every such token, not the first: cc-secretary's line is `secretary/<concern>: <repo>/<track> — …`, so taking
+    the first one keyed on the CONCERN and put two findings about two different tracks in one group. Grouping is
+    a wake saved; it is never a message thrown away, so where the key is in doubt it must split, not merge."""
+    pr = (re.search(r"#(\d+)", text) or [None, ""])[1]
+    about = ",".join(dict.fromkeys(re.findall(r"\b[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._~-]*", text, re.I)))
+    state = next((s for s in STATES if re.search(rf"\b{s}\b", text, re.I)), "")
+    return f"{source}|{about}|{pr}|{state}|{int(decision)}"
+
+
+def told_recently(target, key):
+    """Has this group already been on that session's prompt inside REPEAT_S?"""
+    return time.time() - float((load(f"{BROKER}/told.json", {}).get(target) or {}).get(key, 0)) < REPEAT_S
+
+
+def told_now(target, keys):
+    d = load(f"{BROKER}/told.json", {})
+    d.setdefault(target, {}).update({k: time.time() for k in keys})
+    for t in d:                                       # keep the file the size of one window, not of the box's life
+        d[t] = {k: v for k, v in d[t].items() if time.time() - float(v) < REPEAT_S}
+    save(f"{BROKER}/told.json", d)
+
+
+def n_of(group):
+    """Events in a pending group — the sum of its wordings' counts, which is what `submitted` counts one of each."""
+    return sum(group["texts"].values())
+
+
+def ledger_path(target):
+    return f"{STATE}/{target}/events.md"
+
+
+def ledger_unread(target):
+    """The ledger lines written since the last message that told the session about them. Counted by POSITION, not
+    by time: the session opening events.md leaves no trace, so an mtime would never clear — the count at the last
+    delivery does."""
+    n = load(f"{BROKER}/read.json", {}).get(target, 0)
+    try:
+        with open(ledger_path(target)) as f:
+            return [ln.rstrip("\n") for ln in f if ln.startswith("- ")][n:]
+    except OSError:
+        return []
+
+
+def ledger_seen(target, n):
+    """Mark EXACTLY the n lines that went into the message just delivered — not everything in the file now. The
+    body is built in phase A and this runs in phase C, and a ledger line written in between was never carried:
+    counting the file here would mark it told and it would then ride on nothing."""
+    d = load(f"{BROKER}/read.json", {})
+    d[target] = d.get(target, 0) + n
+    save(f"{BROKER}/read.json", d)
+
+
+def ledger_write(target, text):
+    p = ledger_path(target)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "a") as f:
+        f.write(f"- {now_s()} {text}\n")
+
+
+def log_event(**row):
+    os.makedirs(BROKER, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def send(target, text):
+    """Hand it to the daemon. Returns its verdict word. NEVER called under the lock, and the timeout is well
+    under the 30 s at which both callers SIGKILL their inject (cc-secretary:755, cc-reconcile:784)."""
+    try:
+        p = subprocess.run([INJECT, "inject", "--no-start", target, text],
+                           capture_output=True, text=True, timeout=SEND_TIMEOUT_S)
+    except Exception:
+        return "error"
+    return (p.stdout or "").strip().splitlines()[-1].strip() if p.returncode == 0 and p.stdout.strip() else "error"
+
+
+def deliver(target, text):
+    """Send, and only when NOBODY has it — the daemon itself is not answering — tell the box's session instead,
+    the same fallback cc-secretary makes. Returns (somebody-has-it, the verdict that decided it).
+
+    `queued` is somebody having it: the daemon holds it for a session that is not up yet and tells the owner
+    itself if that never happens (cc-slack:163, QUEUE_TTL). Waking the box's planning session about it — one
+    turn per target per tick — spends the very thing this file exists to save (review of #190, F7)."""
+    verdict = send(target, text)
+    if verdict in TOOK or verdict in HELD:
+        return True, verdict
+    box = box_name()
+    if box == target:
+        return False, verdict
+    return send(box, f"{target} did not hear it ({verdict}) — {text}") in TOOK + HELD, verdict
+
+
+def tail(lines, target):
+    """What keeps a ledger-only event from being lost. The unread LINES ride out on the next message of either
+    other class, not just their count: nothing else on the box points a session at events.md, so a count alone
+    leaves the event in a file no turn ever reads (review of #190, F8)."""
+    if not lines:
+        return ""
+    shown = lines[-LEDGER_TAIL:]
+    of = f" (the last {len(shown)})" if len(lines) > len(shown) else ""
+    return (f"\n· {len(lines)} with nothing to decide{of}, and all of them in {ledger_path(target)}:\n"
+            + "\n".join(f"  {ln}" for ln in shown))
+
+
+def render(target, due, t0, led):
+    """One message out of what is due. A `now` group is its OWN line at the top and never a digest bullet —
+    including one that failed and is being retried, which is how a decision-class line stays a decision-class
+    line instead of coming back relabelled as a digest (review of #190, F5)."""
+    nows = [t for g in due.values() if g["cls"] == "now" for t in g["texts"]]
+    digs = [g for g in due.values() if g["cls"] != "now"]
+    bullets = [f"• {t}" + (f" (x{c})" if c > 1 else "") for g in digs for t, c in g["texts"].items()]
+    if nows and bullets:
+        body = "\n".join(nows) + f"\ndigest, held up to {DEBOUNCE_S // 60} min:\n" + "\n".join(bullets)
+    elif nows:
+        body = "\n".join(nows)
+    else:
+        held = int((t0 - min(g["first"] for g in digs)) // 60)
+        body = f"digest ({sum(map(n_of, digs))} events over {held} min):\n" + "\n".join(bullets)
+    return body + tail(led, target)
+
+
+def flush(target=None):
+    """Deliver what is due, one target at a time. Returns the number of messages sent."""
+    with locked():
+        targets = list(load(PENDING, {})) if target is None else [target]
+    return sum(flush_one(t) for t in targets)
+
+
+def flush_one(target):
+    """THREE PHASES, and the middle one is not under the lock. Read-modify-write pending, then send, then
+    read-modify-write pending again with the result — because a lock held across a send is held for as long as
+    the daemon takes, and both callers kill their inject at 30 s: an event submitted during a slow flush would
+    be SIGKILLed while still waiting for the lock, before it was ever written down (review of #190, F2). And
+    this target's outcome is saved before the next one is even tried, so one hung target cannot throw away a
+    whole run's worth of deliveries and re-wake every other session a minute later (F3)."""
+    # PHASE A — locked. What is due, and the exact message for it.
+    with locked():
+        groups = (load(PENDING, {}).get(target) or {})
+        t0 = time.time()
+        # "nothing decision-class is delayed more than the debounce" (brief) — a `now` group is due the moment it
+        # arrives, and it makes every other group for that target due with it: the wake is bought either way, so
+        # what was pending rides out on it rather than buying one of its own.
+        wake = any(g["cls"] == "now" for g in groups.values())
+        due = {k: g for k, g in groups.items() if wake or t0 - g["first"] >= DEBOUNCE_S}
+        if not due:
+            return 0
+        led = ledger_unread(target)       # captured HERE, so phase C marks read exactly what went out
+        body = render(target, due, t0, led)
+        out = {k: dict(g["texts"]) for k, g in due.items()}   # EXACTLY what goes out, so phase C subtracts exactly
+                                                              # that and a wording submitted meanwhile is not lost
+    # PHASE B — unlocked. The only part that talks to the daemon.
+    landed, verdict = deliver(target, body)
+    # PHASE C — locked, and durable before any other target is touched.
+    page = []
+    with locked():
+        pend = load(PENDING, {})
+        groups = pend.get(target) or {}
+        for k, texts in out.items():
+            g = groups.get(k)
+            if not g:
+                continue
+            if landed:
+                for t, c in texts.items():
+                    left = g["texts"].get(t, 0) - c
+                    g["texts"][t] = left
+                    if left <= 0:
+                        g["texts"].pop(t, None)
+                if not g["texts"]:
+                    groups.pop(k, None)
+            else:
+                # NOTHING IS DROPPED. `first` is untouched, so the group stays due and the 60 s tick tries again.
+                g["fails"] = g.get("fails", 0) + 1
+                if g["fails"] >= ESCALATE_FAILS and not g.get("paged"):
+                    g["paged"] = True                        # once per group, not once a minute
+                    page += list(g["texts"])
+        if groups:
+            pend[target] = groups
+        else:
+            pend.pop(target, None)
+        save(PENDING, pend)
+        if landed:
+            told_now(target, out)
+            ledger_seen(target, len(led))
+    log_event(at=now_s(), type="flush", target=target, groups=len(out), verdict=verdict,
+              events=sum(sum(t.values()) for t in out.values()), woke=int(landed))
+    if page:
+        escalate(target, page)
+    return int(landed)
+
+
+def escalate(target, texts):
+    """WHAT NOBODY TOOK STILL REACHES THE OWNER. Routing an event through this file must not cost it the rung it
+    already had: cc-reconcile paged on a refused offer (cc-reconcile:851), and once the broker owns the delivery
+    that page is the broker's to ring. Same rung, same shape — a title starting with the repo name, which
+    cc-notify routes into that repo's lane. Held, retried, and now said out loud; still not dropped."""
+    subprocess.run([f"{BIN}/cc-notify", "-t", f"{target} broker",
+                    f"Nobody has heard this — {ESCALATE_FAILS} tries, no session and no daemon:\n"
+                    + "\n".join(f"• {t}" for t in texts)],
+                   capture_output=True, timeout=30)
+
+
+def submit(target, text, source):
+    """Classify, WRITE IT DOWN, then deliver. In that order: the event is in pending.json before anything is
+    sent, so a caller killed mid-send loses nothing — the flush tick finds it there.
+
+    Prints `delivered`, always: that is the daemon's word for "a session has it", and it is true of everything
+    this file takes — a held event is delivered late, a failed one is retried every 60 s, and one nobody takes
+    at all is escalated by escalate() above rather than being quietly owed."""
+    text = text.strip()
+    dec = decision_needed(text)
+    with locked():
+        cls = classify(source, text)
+        key = group_key(source, text, dec)
+        if cls == "digest" and told_recently(target, key):
+            cls = "ledger"    # …and never a decision: classify() already made that `now`, which this cannot reach
+        log_event(at=now_s(), type="event", target=target, source=source, cls=cls, group=key,
+                  decision=dec, chars=len(text))   # WAKES ARE COUNTED IN ONE PLACE ONLY — the flush row above
+        if cls == "ledger":
+            ledger_write(target, text)
+        else:
+            pend = load(PENDING, {})
+            g = pend.setdefault(target, {}).setdefault(key, {"first": time.time(), "cls": cls, "texts": {}})
+            # EVERY DISTINCT WORDING, counted — not the newest overwriting the rest. A group is a WAKE saved,
+            # never a message thrown away, so a second event that lands in one is another bullet under the same
+            # wake; only a word-for-word repeat becomes an `(xN)`. A long digest is still ONE turn, the unit that costs.
+            g["texts"][text] = g["texts"].get(text, 0) + 1
+            if cls == "now":
+                g["cls"] = "now"                   # a choice landing in a waiting group makes the whole group `now`
+            save(PENDING, pend)
+    if cls == "now":
+        flush_one(target)
+    return "delivered"                     # always: this file has taken it, and it never drops one
+
+
+def report(days=1):
+    """Before and after in TURNS, which is the only unit the saving is in. `submitted` is what the box paid a turn
+    for before this file existed — one event, one wake."""
+    cut = time.time() - days * 86400
+    ev, fl = [], []
+    try:
+        with open(LOG) as f:
+            for ln in f:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                try:
+                    at = calendar.timegm(time.strptime(r.get("at", ""), "%Y-%m-%dT%H:%M:%SZ"))
+                except ValueError:
+                    continue                  # the stamps are UTC, so they are read as UTC — never local
+                if at < cut:
+                    continue
+                (ev if r.get("type") == "event" else fl).append(r)
+    except OSError:
+        pass
+    if not ev:
+        print(f"cc-broker: nothing in the last {days}d ({LOG})")
+        return 0
+    by_src, by_cls = {}, {}
+    for r in ev:
+        by_src[r.get("source", "?")] = by_src.get(r.get("source", "?"), 0) + 1
+        by_cls[r.get("cls", "?")] = by_cls.get(r.get("cls", "?"), 0) + 1
+    woke = sum(r.get("woke", 0) for r in fl)      # ONE place counts a wake: the flush that actually made it
+    # THE COUNTERFACTUAL, and it is a measurement rather than a model: before this file every event was its own
+    # turn, so the turns it removed are the events it took minus the wakes it actually bought. The class counts
+    # below say where that came from — a `ledger` event woke nobody at all, and `digest` events shared their wakes.
+    held = by_cls.get("digest", 0) + by_cls.get("ledger", 0)
+    print(f"cc-broker: last {days}d")
+    print(f"  submitted   {len(ev):>4} events   " + " · ".join(f"{k} {v}" for k, v in sorted(by_src.items())))
+    print(f"  classified  {'':>4}          " + " · ".join(f"{k} {v}" for k, v in sorted(by_cls.items())))
+    print(f"  woke        {woke:>4} turns")
+    print(f"  avoided     {len(ev) - woke:>4} turns    one event was one turn before this; "
+          f"{held} of them were coalescible")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip()); return 0
+    if argv[0] == "selfcheck":
+        return selfcheck()
+    if argv[0] == "report":
+        return report(int(argv[2]) if len(argv) > 2 and argv[1] == "--days" else 1)
+    if argv[0] == "--flush":
+        flush(argv[1] if len(argv) > 1 else None)
+        return 0
+    if argv[0] != "inject":
+        print(__doc__.strip(), file=sys.stderr); return 2
+    # An emitter names itself with --source. CC_BROKER_SOURCE is the same word for one whose argv is not ours to
+    # change: cc-secretary and cc-reconcile each take the door from an env var, so their unit points that var here
+    # and this one says who they are — no edit to either file.
+    rest, source = argv[1:], os.environ.get("CC_BROKER_SOURCE") or "unknown"
+    while rest and rest[0].startswith("--"):
+        if rest[0] == "--source" and len(rest) > 1:
+            source, rest = rest[1], rest[2:]
+        else:
+            rest = rest[1:]                 # --no-start and friends: cc-slack's flags, passed through by shape
+    if len(rest) < 2:
+        print('cc-broker inject [--no-start] [--source S] <target> "text"', file=sys.stderr); return 2
+    print(submit(rest[0], " ".join(rest[1:]), source))
+    return 0
+
+
+def selfcheck():
+    """STATIC: the classifier, the grouping, the debounce and the two promises — nothing is dropped, and a
+    decision is never held. Its own HOME and its own stub for the daemon; no session on this box is written to."""
+    import tempfile, shutil
+    n = 0
+
+    def ok(what, cond):
+        nonlocal n
+        print(("  ok   " if cond else "  FAIL ") + what)
+        if not cond:
+            n += 1
+    print("cc-broker selfcheck")
+    ok("a line asking for a choice is `now` whatever its source says",
+       classify("reconcile", "myrepo/foo STATUS: BLOCKED: which branch?") == "now"
+       and classify("secretary", "[myrepo] PR #9 landing stopped") == "now")
+    ok("…and an ordinary one of the same source is not",
+       classify("secretary", "secretary/idle: myrepo/foo — quiet 2h") == "digest")
+    ok("a source nobody has named still wakes someone, just not alone", classify("newthing", "hello") == "digest")
+    ok("two nags about the same PR in the same state are one group",
+       group_key("secretary", "myrepo/a PR #182 review stalled", False)
+       == group_key("secretary", "myrepo/a PR #182 review again", False))
+    ok("…and the same PR in a new state is a new one",
+       group_key("secretary", "myrepo/a PR #182 review stalled", False)
+       != group_key("secretary", "myrepo/a PR #182 merged", False))
+    ok("…and two findings about two different tracks are never one group, though a secretary line leads with "
+       "the same `secretary/<concern>` for both",
+       group_key("secretary", "secretary/idle: myrepo/alpha — no commits in 3h", False)
+       != group_key("secretary", "secretary/idle: myrepo/beta — no commits in 3h", False))
+
+    th = tempfile.mkdtemp(prefix="ccbroker-sc-")
+    stub, rec, slow = f"{th}/inject-stub", f"{th}/rec", f"{th}/slow"
+
+    def daemon(verdict):    # the stub for the daemon's door. One "CALL <target>" line per call, so a message is
+        with open(stub, "w") as f:                     # counted by the CALLS it cost — its own body is multi-line
+            f.write('#!/usr/bin/env bash\nprintf "CALL %s\\n%s\\n" "$3" "$4" >> "$CC_SC_REC"\n'
+                    'grep -qx "$3" "$CC_SC_SLOW" 2>/dev/null && sleep 30\n' f'echo {verdict}\n')
+        os.chmod(stub, 0o755)
+    daemon("delivered")
+    open(slow, "w").close()
+
+    def env(**extra):
+        return {**os.environ, "HOME": th, "CC_BROKER_INJECT": stub, "CC_SC_REC": rec, "CC_SC_SLOW": slow,
+                "CC_BOX": "abox", "CC_NOTIFY_LOG_ONLY": "1", "CC_NOTIFY_LOG": f"{th}/notify.log", **extra}
+
+    def run(*args, **extra):
+        return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
+                              env=env(**extra), capture_output=True, text=True)
+
+    def said():
+        try:
+            return open(rec).read()
+        except OSError:
+            return ""
+
+    def calls():
+        return said().count("CALL ")            # messages, not lines: one wake is one call
+
+    def pending(tgt):
+        return load(f"{th}/.cc/broker/pending.json", {}).get(tgt) or {}
+    try:
+        # A DECISION IS NEVER HELD. Its own fixture: one event in, and the stub must already have it.
+        v = run("inject", "--no-start", "--source", "secretary", "r1", "[r1] PR #7 landing stopped").stdout.strip()
+        ok("a decision-class event is on the pane before the command returns",
+           v == "delivered" and "landing stopped" in said() and not pending("r1"))
+        os.truncate(rec, 0)
+
+        # DEDUPE AND DEBOUNCE. Its own fixture: the same nag three times, word for word.
+        for _ in range(3):
+            run("inject", "--source", "secretary", "r2", "secretary/stall: r2/t PR #4 review — nobody has looked")
+        ok("three nags about one PR wake nobody yet", said() == "")
+        ok("…and a flush before the debounce is up still wakes nobody",
+           run("--flush").returncode == 0 and said() == "")
+        run("--flush", CC_BROKER_DEBOUNCE_S="0")
+        ok("…and one flush past it delivers them as ONE message that says there were three",
+           calls() == 1 and said().count("secretary/stall") == 1 and "x3" in said() and not pending("r2"))
+        os.truncate(rec, 0)
+
+        # …AND A GROUP NEVER EATS A MESSAGE. Its own fixture: one target, one group (same PR, same state), three
+        # DIFFERENT wordings — one wake is the saving, but all three must be in it.
+        for w in ("disk is at 91%", "disk is at 94%", "disk is at 97%"):
+            run("inject", "--source", "secretary", "r2b", f"secretary/box: r2b/t PR #8 review — {w}")
+        run("--flush", CC_BROKER_DEBOUNCE_S="0")
+        ok("three different wordings in one group still cost ONE wake, and every one of them is in the message",
+           calls() == 1 and all(w in said() for w in ("91%", "94%", "97%")) and "x3" not in said())
+        os.truncate(rec, 0)
+
+        # LEDGER — the machine saying the same thing twice. Its own fixture: told once, then told again.
+        led = f"{th}/.cc/state/r3/events.md"
+        run("inject", "--source", "secretary", "r3", "secretary/idle: r3/t PR #5 review — quiet")
+        run("--flush", CC_BROKER_DEBOUNCE_S="0")
+        ok("the first time a group is delivered it costs a wake, and no ledger line",
+           calls() == 1 and not os.path.exists(led))
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "r3", "secretary/idle: r3/t PR #5 review — STILL QUIET")
+        ok("…and the same group again inside the hour goes to the file and wakes nobody",
+           calls() == 0 and os.path.exists(led) and "STILL QUIET" in open(led).read())
+        run("inject", "--source", "secretary", "r3", "r3/t needs you: pick one")
+        ok("…and the next message that wakes it CARRIES the ledger line itself, not just a count of it — "
+           "nothing else on this box points a session at events.md",
+           "STILL QUIET" in said() and "1 with nothing to decide" in said() and led in said())
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "r3", "secretary/idle: r3/t PR #5 review — quiet again",
+            CC_BROKER_REPEAT_S="0")
+        ok("…and past the window it digests again: the suppression is bounded, never permanent", bool(pending("r3")))
+
+        # THE RIDE-ALONG: a wake the box was buying anyway carries what was pending.
+        run("inject", "--source", "secretary", "r4", "secretary/idle: r4/t — quiet")
+        run("inject", "--source", "secretary", "r4", "r4/t needs you: choose")
+        ok("a pending digest rides out on the next event that wakes the session, not on a wake of its own",
+           calls() == 1 and "needs you" in said() and "secretary/idle" in said())
+        os.truncate(rec, 0)
+
+        # `queued` IS SOMEBODY HAVING IT. The daemon holds it for a session that is not up yet and tells the owner
+        # itself if one never comes, so waking the box about it spends the turn this file exists to save.
+        daemon("queued")
+        run("inject", "--source", "secretary", "r5", "r5/t needs you: pick")
+        ok("a target whose message the daemon queued does NOT also wake the box's own session",
+           calls() == 1 and "CALL abox" not in said() and not pending("r5"))
+        os.truncate(rec, 0)
+
+        # NOTHING IS DROPPED when nobody answers at all — and a `now` line that had to be retried comes back as
+        # the decision it is, never relabelled as a digest.
+        daemon("error")
+        run("inject", "--source", "secretary", "r6", "r6/t needs you: pick")
+        ok("with the daemon down, the target and then the box are both tried, and the text is HELD, not lost",
+           calls() == 2 and "CALL abox" in said() and bool(pending("r6")))
+        os.truncate(rec, 0)
+        daemon("delivered")
+        run("--flush")
+        ok("…and the next tick delivers it as its own decision line — not as a digest of something hours old",
+           calls() == 1 and "r6/t needs you" in said() and "digest" not in said() and not pending("r6"))
+        os.truncate(rec, 0)
+
+        # AND WHAT NOBODY TAKES IS SAID OUT LOUD. Held is not owed: after ESCALATE_FAILS tries the owner is paged
+        # on the rung cc-reconcile used to ring itself, and paged ONCE, not once a minute.
+        daemon("error")
+        run("inject", "--source", "secretary", "r7", "r7/t needs you: land it", CC_BROKER_ESCALATE_FAILS="2")
+        nlog = f"{th}/notify.log"
+        ok("one failed try does not page the owner", not os.path.exists(nlog))
+        run("--flush", CC_BROKER_ESCALATE_FAILS="2")
+        run("--flush", CC_BROKER_ESCALATE_FAILS="2")
+        pages = open(nlog).read().count("r7/t needs you") if os.path.exists(nlog) else 0
+        ok("…and past the second the owner is paged, once — and the text is STILL held for the session too",
+           pages == 1 and bool(pending("r7")))
+
+        # THE LOCK IS NEVER HELD ACROSS A SEND. Its own fixture: a flush whose daemon hangs for 30 s, and an
+        # inject that must not be waiting on it — both callers SIGKILL their inject at 30 s.
+        # THE HANG HAS TO BE INSIDE THE FLUSH BEING TIMED. A decision-class line here flushed INLINE inside the
+        # first inject, emptied pending, and left p8 nothing due: it exited in milliseconds and the timed inject
+        # raced nothing, so the row stayed green with the send put back under the lock — a regression test for
+        # the bug that sank the last round that could not fail (review of #190, F1). So the line is digest-class
+        # (no inline flush), p8 with DEBOUNCE_S=0 is what sends it, and the timing does not start until the stub
+        # has recorded that send — then the row asserts p8 was STILL in it when the second inject came back.
+        daemon("delivered")
+        os.truncate(rec, 0)
+        open(slow, "w").write("r8slow\n")
+        run("inject", "--source", "secretary", "r8slow", "secretary/idle: r8slow/t — quiet")
+        p8 = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--flush", "r8slow"],
+                              env=env(CC_BROKER_DEBOUNCE_S="0"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(200):                     # the stub records the call and THEN sleeps, so this line
+            if "CALL r8slow" in said():          # appearing is phase B being inside the daemon at this moment
+                break
+            time.sleep(0.05)
+        t = time.time()
+        run("inject", "--source", "secretary", "r8", "secretary/idle: r8/t — quiet")
+        waited = time.time() - t
+        hung = p8.poll() is None                 # …and still in it, so the two really did overlap
+        p8.kill(); p8.wait(timeout=10)
+        ok("an inject arriving while a send is hanging is written down at once, not blocked behind it",
+           "CALL r8slow" in said() and hung and waited < 5 and bool(pending("r8")))
+        open(slow, "w").close()                  # what the killed flush never finished is still owed, and the
+        run("--flush", "r8slow", CC_BROKER_DEBOUNCE_S="0")   # next case gets its own state: drain it here
+        os.truncate(rec, 0)
+
+        # …AND ONE HUNG TARGET DOES NOT UNDO EVERY TARGET BEFORE IT. Its own fixture: two targets due, the second
+        # hangs, the run is killed — the first one's delivery must already be durable, or it is delivered again.
+        open(slow, "w").write("r9b\n")
+        run("inject", "--source", "secretary", "r9a", "secretary/idle: r9a/t — quiet")
+        run("inject", "--source", "secretary", "r9b", "secretary/idle: r9b/t — quiet")
+        p9 = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--flush"],
+                              env=env(CC_BROKER_DEBOUNCE_S="0"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2.0)
+        p9.kill(); p9.wait(timeout=10)
+        ok("a target delivered before a later one hung keeps its delivery — it is not re-sent on the next tick",
+           "CALL r9a" in said() and not pending("r9a") and bool(pending("r9b")))
+        open(slow, "w").close()
+        os.truncate(rec, 0)
+
+        # ONE WRITER AT A TIME. Its own fixture: this process takes the lock itself, so the interleaving is
+        # forced rather than raced — the inject must WAIT for it, and then its event must be there.
+        os.makedirs(f"{th}/.cc/broker", exist_ok=True)
+        with open(f"{th}/.cc/broker/lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            p10 = subprocess.Popen([sys.executable, os.path.realpath(__file__), "inject", "--source", "secretary",
+                                    "r10", "secretary/idle: r10/t — quiet"], stdout=subprocess.DEVNULL, env=env())
+            time.sleep(0.7)
+            waited = p10.poll() is None
+            fcntl.flock(lk, fcntl.LOCK_UN)
+        p10.wait(timeout=30)
+        ok("an inject waits for the lock instead of overwriting what a flush is holding — and lands once it has it",
+           waited and bool(pending("r10")))
+
+        # THE DOOR THE UNITS ACTUALLY USE. Its own fixture: cc-secretary and cc-reconcile cannot pass an argument
+        # this file invented, so their units name them with CC_BROKER_SOURCE — the env door is the wiring that
+        # ships, and every case above drives the other one. Same word, same group; and a caller that names itself
+        # nothing must not be filed under whoever ran last.
+        nag = "secretary/idle: r11/t PR #3 review — quiet"
+        run("inject", "--source", "secretary", "r11", nag)
+        by_flag = len(pending("r11"))
+        run("inject", "--no-start", "r11", nag, CC_BROKER_SOURCE="secretary")
+        by_env = len(pending("r11"))
+        run("inject", "--no-start", "r11", nag, CC_BROKER_SOURCE="")
+        unnamed = len(pending("r11"))
+        ok("a unit naming itself with CC_BROKER_SOURCE groups exactly as --source does, and a caller that names "
+           "itself nothing gets its own group instead of joining that one",
+           by_flag == 1 and by_env == 1 and unnamed == 2)
+        os.truncate(rec, 0)
+
+        out = run("report").stdout
+        ok("report counts what was submitted against the wakes it actually bought, in turns",
+           "submitted" in out and "avoided" in out and "turns" in out and "coalescible" in out)
+    finally:
+        shutil.rmtree(th, ignore_errors=True)
+    print(f"cc-broker selfcheck: {n} failed")
+    return 1 if n else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

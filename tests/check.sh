@@ -28,7 +28,9 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # splits that decide every number it prints: worker vs fix round, and which population a dollar belongs to.
 # cc-time's is the clock rule itself: a known UTC instant rendered in a zone of its own (never this box's), and
 # cc-notify's one Slack-facing stamp driven through in log-only mode with the UTC log line beside it.
+# cc-broker's runs the classifier, the grouping and the debounce against a stub for the daemon's door in a HOME
+# of its own: no session on this box is written to, and no message of this box's is read.
 # cc-guard's runs the gates themselves against fixtures in a HOME of its own, with the owner's two real
 # doors (cc-notify, cc-slack) stubbed: which denies page and which never do, and the worker kill fence.
-for c in cc-units cc-settings cc-board cc-config cc-msg cc-spend cc-econ cc-time cc-guard; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"
