@@ -11,6 +11,8 @@
 # kill-server` walked past the universal gate). The haystack now carries each statement AND every suffix of it,
 # plus what an option attaches after an `=` (`--filter=CMD` is run by a shell and is never its own word), so a
 # rule sees the command wherever a wrapper put it — cmdpos(), which is also where that fix's ceiling is.
+# The walk stops only at a head with no option that runs a word ($NOEXEC), and the kill fence reads which
+# options carry a value PER VERB, because `-o` is a flag to pkill and `--older-than TIME` to killall.
 # A deny is one of TWO kinds. `deny` = the owner could say yes (merging, pushing, a comment in his name, an
 # email, a post to his Slack): from a member-facing session it also ASKS him, in that member's channel and by
 # DM. `never` = no yes exists for this tier (landing, dispatching a worker, host changes, the box's secrets,
@@ -223,6 +225,60 @@ if [ "${1:-}" = selfcheck ]; then
      && kill -0 "$om" 2>/dev/null; then r=0; else r=1; fi
   ok "an option's value is not a pattern however it is spelled: --older, its short -O, -F and -q consume theirs and are refused for naming no process, while the same option carrying a pattern still resolves it" $r
 
+  # 10b. …AND WHAT A LETTER MEANS DEPENDS ON THE VERB. One parser serves pgrep, pkill and killall, and they
+  #      disagree about the same short option: `-o` is --oldest (a FLAG) to pkill and --older-than TIME (a
+  #      VALUE) to killall, `-n` is --newest against --ns PID. Read as pkill's, killall's value became the
+  #      pattern — `killall --older-than 1h claude` reduced to pat=1h, `pgrep -x -- 1h` found nothing, the
+  #      fence had nothing to refuse and it went through, killing every claude over an hour old: this
+  #      worker's own claude -p and its loop runner (review of #193). Its own claude stand-in, started here
+  #      rather than borrowed from case 9, so this row cannot pass on a process another case left running.
+  ASKS=$T/asks10b; CALLS=$T/calls10b; : > "$CALLS"; GERR=$T/err10b
+  # …and it carries a mark that is in its COMMAND LINE and not in its name, which is what tells a walk that
+  # kept `-f` from one that ate it: `pgrep -f -- <mark>` finds this process, plain `pgrep -- <mark>` does not.
+  mk=mark10b$$
+  "$T/claude" -p "$mk" >/dev/null 2>&1 & kc=$!; pids="$pids $kc"
+  # …and a second stand-in that is nothing but its own name, for the rows that must stay ALLOWED: it has to
+  # resolve to a process this case started, so "allowed" means the fence ran and judged it, not that the
+  # pattern matched nothing. Its own, not case 10's — a row that reads another case's fixture passes on
+  # whatever that case happened to leave running.
+  own=own10b$$
+  printf '#!/bin/sh\nsleep 45\n' > "$T/$own"; chmod +x "$T/$own"
+  "$T/$own" >/dev/null 2>&1 & ko=$!; pids="$pids $ko"
+  sleep 0.3
+  k(){ : > "$GERR"; g Bash "{\"command\":\"$1\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$; }
+  r=0
+  # The incident itself: the value is consumed, so the NAME behind it is what reaches the fence. What is
+  # asserted is the pattern the refusal NAMES — `(killall claude)`, not `(killall 1h)` — because WHICH pid
+  # it stops at, and so whether the reason reads "session or a loop runner" or "outside this worker's own
+  # process subtree", depends on what else is running on the box; the resolved pattern does not.
+  [ "$(k "killall --older-than 1h claude")" = 2 ] && grep -qF '(killall claude)' "$GERR" \
+    || { r=1; echo "      killall --older-than 1h claude: refused for: $(head -c 60 "$GERR")"; }
+  # …and the same command with nothing left to name: no pattern at all, which is the other refusal.
+  while read -r sel; do
+    [ "$(k "killall $sel")" = 2 ] && grep -qF 'selector but no pattern' "$GERR" \
+      || { r=1; echo "      killall $sel: refused for: $(head -c 60 "$GERR")"; }
+  done <<'K10B'
+--older-than 1h
+-o 1h
+-y 1h
+-n 1234
+-Z ctx
+K10B
+  # THE HALF THAT MUST NOT MOVE, and the reason the verb is passed in rather than the options merged: to
+  # pkill those same letters are flags, so merging would eat the word after them. `pkill -o <pattern>` would
+  # reduce to no pattern and be refused, and worse, `pgrep -o -f <x>` would lose its -f and resolve without
+  # --full — fewer processes found, nothing fenced, a refusal turned into a pass.
+  for flag in -o -n; do
+    { [ "$(k "pkill $flag $own")" = 0 ] && kill -0 "$ko" 2>/dev/null; } \
+      || { r=1; echo "      pkill $flag <own child> was refused: $(head -c 60 "$GERR")"; }
+  done
+  # …and this is that harm, made to show: the mark is findable only with --full, so a walk that ate the `-f`
+  # resolves nothing, fences nothing and lets the kill through. It must stay REFUSED.
+  [ "$(k "pgrep -o -f $mk | xargs kill -9")" = 2 ] \
+    || { r=1; echo "      pgrep -o -f <a claude -p> | xargs kill was allowed through"; }
+  { kill -0 "$kc" 2>/dev/null && kill -0 "$ko" 2>/dev/null; } || { r=1; echo "      a stand-in did not survive the case"; }
+  ok "a short option means what its own verb says: killall's -o/-y/-n/-Z take a value, so the name behind them still reaches the fence, while pkill's -o/-n stay flags and the pattern after them is still resolved" $r
+
   # 11. A WRAPPER WORD IS NOT A WAY PAST A GATE, AND THE ANCHOR IS ONE VARIABLE. `$AT` knew a fixed set of
   #     wrappers, so any word outside it hid the command behind it — and $AT is interpolated into every rule
   #     this file has, so that was ONE hole in all of them and not a hole in two. Measured 2026-09-02:
@@ -255,6 +311,11 @@ tmux, systemd-run|un|shared tmux server|systemd-run --user tmux kill-session
 tmux, an interpreter running its quoted string|un|shared tmux server|bash -c 'timeout 5 tmux kill-server'
 an option that runs its value, spelled as two tokens|un|shared tmux server|man -P 'tmux kill-server' ls
 …and the same option spelled --opt=VALUE|un|shared tmux server|sort --compress-program='tmux kill-server'
+a search tool with an option that runs a word|un|shared tmux server|rg --pre 'tmux kill-server' x
+…the same one, attached|un|shared tmux server|rg --pre='tmux kill-server' x
+…and its two neighbours, one option shape each|wt|landing a change|ag --pager cc-land x
+…attached|wt|landing a change|ack --pager=cc-land x
+a downloader that runs an option's value|wt|landing a change|wget --use-askpass=cc-land http://x
 --opt=VALUE whose value is one bare word|wt|landing a change|sort --compress-program=cc-land
 a key=value carried in an option's own token|un|shared tmux server|git -c core.pager='tmux kill-server' log
 merge|wt|merging a PR|nice -n 5 gh pr merge 3
@@ -370,11 +431,14 @@ X='(^|[;&|(){}`]|[$][(])[ \t]*(((then|else|do|time|env|nohup|xargs|command|sudo)
 # bypass, which is the kill fence's own shape (refuse what you cannot reduce) applied to the anchor.
 # NOEXEC is deliberately short and dull. Anything that can run an argument — a shell, an interpreter, awk, sed
 # (GNU `e`), find (-exec), xargs, ssh, env, systemd-run, tmux, gh, git, cc — is NOT on it and never should be.
-# THREE THAT LOOK DULL AND ARE NOT, removed after review-193b: `split --filter=CMD` and `sort --compress-program=CMD`
-# both hand their argument to sh, and `man -P PAGER` runs the pager. They read files, so they read as text tools —
-# but each has one option that executes, and flush() returns at the first NOEXEC head, so listing them stopped the
-# walk and left everything after them unanchored. The test for this list is not "does it read?" but "is there any
-# option that runs a word?"; when in doubt leave a head OFF, which costs a false positive and never a bypass.
+# SEVEN THAT LOOK DULL AND ARE NOT, and they came off in two rounds because the test was stated before it was
+# applied. After review-193b: `split --filter=CMD` and `sort --compress-program=CMD` both hand their argument to
+# sh, and `man -P PAGER` runs the pager. After the round behind that: `rg --pre CMD` and `--hostname-bin CMD`,
+# `ag --pager CMD`, `ack --pager=CMD` and `wget --use-askpass=CMD`. All seven read files, so all seven read as
+# text tools — but each has one option that executes, and flush() returns at the first NOEXEC head, so listing
+# them stopped the walk and left everything after them unanchored. The test for this list is not "does it read?"
+# but "is there any option that runs a word?"; when in doubt leave a head OFF, which costs a false positive and
+# never a bypass. `grep` and `curl` are the near neighbours that stay: neither has an option that runs a word.
 # The log readers on it earn their place: `last -x reboot shutdown` names two gated words and runs neither,
 # and refusing that is the complaint already on the backlog about a worker blocked for grepping "reboot".
 # IT IS ONE SHELL STRING AND IT HAS NO COMMENTS IN IT. A `#` inside single quotes is a word, not a comment,
@@ -382,12 +446,12 @@ X='(^|[;&|(){}`]|[$][(])[ \t]*(((then|else|do|time|env|nohup|xargs|command|sudo)
 NOEXEC=': [ [[ true false test echo printf cd pwd export unset set local declare readonly read shift return
   break continue wait jobs sleep seq date basename dirname realpath readlink mktemp
   cat tac head tail nl wc uniq cut tr rev fold column comm join paste csplit tee
-  grep egrep fgrep rg ag ack diff cmp jq yq
+  grep egrep fgrep diff cmp jq yq
   ls stat file du df tree touch mkdir rmdir rm cp mv ln install chmod chown chgrp truncate dd
   md5sum sha1sum sha256sum cksum base64 xxd od strings hexdump
   ps pgrep pkill kill killall top free uptime uname hostname whoami id groups tty which type
   last lastb lastlog journalctl dmesg w who users
-  curl wget ping dig host nslookup less more'
+  curl ping dig host nslookup less more'
 # TWO BOUNDS, AND BOTH ARE PER STATEMENT, WHICH IS THE WHOLE POINT OF THEM. The walk is quadratic in the
 # length of a STATEMENT, and a single statement of 3000 words (`for f in <3000 paths>`) cost 27 seconds in a
 # PreToolUse hook — so at most 64 positions and 262144 bytes of expansion FOR EACH STATEMENT, reset in flush().
@@ -778,8 +842,17 @@ case "$tool" in
       # owns, this worker's own session included (review of #181). The value is consumed; what is left names
       # the pattern. Only options that genuinely take one are listed: consuming a word that is really the
       # pattern would turn a refusal into a pass, which is the failure this is fixing.
-      kpat(){   # $@ = the argv after the verb. Prints "<-f seen>\t<pattern>"; rc 1 = nothing nameable
-        local y sk="" full="" pat=""
+      # THE VERB DECIDES WHAT A LETTER MEANS, and reading it wrong is a hole in whichever direction it falls.
+      # This is one parser for pgrep, pkill and killall, and they disagree: `-o` is --oldest (a FLAG) to pkill
+      # and --older-than TIME (a VALUE) to killall, `-n` is --newest to one and --ns PID to the other. Read as
+      # pkill's, killall's value became the pattern — `killall --older-than 1h claude` reduced to pat=1h,
+      # `pgrep -x -- 1h` found nothing, the fence had nothing to refuse, and it killed every claude over an
+      # hour old: this worker's own claude -p and its loop runner, the 11:15Z incident again (review of #193).
+      # Read as killall's it is WORSE than a false positive: `pgrep -o -f <suite> | xargs kill` would eat the
+      # `-f`, resolve the pattern without --full, find fewer processes and let the kill through — a refusal
+      # turned into a pass, which is exactly what the note above warns of. So the verb is passed in.
+      kpat(){   # $1 = the verb, $@ = the argv after it. Prints "<-f seen>\t<pattern>"; rc 1 = nothing nameable
+        local v=$1 y sk="" full="" pat=""; shift
         for y in "$@"; do
           if [ -n "$sk" ]; then sk=""; continue; fi
           case "$y" in
@@ -791,7 +864,11 @@ case "$tool" in
             # names no process belongs (review of #181).
             # `-O` is --older's short spelling and was the one left: `pkill -O 3600 -u 1000` read 3600 as the
             # pattern, so the -u never reached the fence at all — every process of that uid, unfenced.
-            -O|--older|-r|--runstates|-F|--pidfile|-q|--queue|--env|--cgroup) sk=1;;
+            -O|--older|-r|--runstates|-F|--pidfile|-q|--queue|--env|--cgroup|-Z|--context) sk=1;;
+            # …and the ones only killall gives a value to. `-o` and `-n` are FLAGS to pkill (--oldest,
+            # --newest), so they are consumed for that verb alone; `--older-than`/`--younger-than` are
+            # killall's own spellings and `--ns` is a value to both, so it sits in the shared line above.
+            -o|--older-than|-y|--younger-than|-n) case "$v" in killall) sk=1;; esac;;
             -f|--full) full=1;;
             -*) ;;                                     # a flag, a signal, or --opt=value: none of them a pattern
             *) [ -n "$pat" ] || pat=$y;;
@@ -806,7 +883,7 @@ case "$tool" in
         local args=${BASH_REMATCH[2]}
         args=${args%%[\`)]*}                            # a substitution ends at its own paren: `$(pgrep -f x)`
         local xa; read -r -a xa <<<"$args"
-        spec=$(kpat "${xa[@]}") || return 1
+        spec=$(kpat pgrep "${xa[@]}") || return 1
         full=${spec%%$'\t'*}; pat=${spec#*$'\t'}
         case "$pat" in *'$'*|*'`'*) return 1;; esac    # named by a variable: unresolvable
         if [ -n "$full" ]; then hits=$(pgrep -f -- "$pat" 2>/dev/null) || hits=""
@@ -866,7 +943,7 @@ case "$tool" in
           # taught. So a pkill/killall this cannot reduce to a pattern is refused, the way an unreadable
           # xargs feed is. `killall -l` and `pkill -V` are refused with it: informational, and no rule here
           # needs them. A selector WITH a pattern is unaffected — the pattern is still what gets resolved.
-          spec=$(kpat "${a[@]}") \
+          spec=$(kpat "$v" "${a[@]}") \
             || never "$v with a selector but no pattern — -u/-U/-g/-G/-P/-t/-s/--older/-F and the rest name a whole SET of processes and this worker cannot tell whose they are, so it is refused rather than guessed: pkill -u \$(id -u) is every process this user owns, its own claude -p and loop runner included, and pkill --older 3600 is the same set an hour old"
           fflag=${spec%%$'\t'*}; pat=${spec#*$'\t'}
           case "$pat" in *'$'*|*'`'*) continue;; esac     # named by a variable: unresolvable

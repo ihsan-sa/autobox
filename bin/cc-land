@@ -13,7 +13,8 @@
                                                   review (it waits for the reset) and a red gate (3 tries, 15 min
                                                   apart): the sweep that keeps a job arms its own next run. A
                                                   LAND-AFTER-FIX sends ONE fix iteration and waits for that branch to
-                                                  push; a second stop, a DO-NOT-LAND or an unmergeable PR ends it
+                                                  push; a second stop, a DO-NOT-LAND, an unmergeable PR or a
+                                                  review that ran out of its own cap ends it
   cc-land selfcheck                               the decision table; no network, no systemctl
 
 Landing a change used to be nine separate things to remember — gates, merge, the #approvals card, the mark on
@@ -34,7 +35,12 @@ WHAT IT WILL NOT DO, and why each line is here:
     Claude usage limit merges nothing unread — the queued job WAITS for the reset cc-limit names (not_before) and
     runs itself again then, the attempt uncounted and the owner untroubled, because nothing has been decided about
     the PR. One verdict per head: a re-run reads the verdict back off its own PR comment instead of buying a
-    second, differing opinion.
+    second, differing opinion. And a review that runs out of the cap THIS script sets — money or turns,
+    `CC_LAND_REVIEW_BUDGET` and `CC_LAND_REVIEW_TURNS`, both settable without editing this file — is a third
+    outcome rather than a verdict: it read nothing, so it says what it spent and which number to raise, it costs
+    the change neither its routine review nor its repair round, and that head is refused until the cap that
+    STOPPED it is raised — more of the other one buys the identical stop. PR #194 — 575 added lines, $3, 35
+    turns, no diff read — was reported as an ordinary stop, counted as that change's second, and dropped.
   · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
     afterwards — not against the default branch, which does not contain the change, so gating it there would
     be a green light for code nobody ran. A red gate or a conflicting PR stops everything before the merge.
@@ -51,7 +57,8 @@ WHAT IT WILL NOT DO, and why each line is here:
     that the landing STOPS and asks a person, who reads the diff themselves (`--no-review`) or buys another
     review deliberately (`--re-review`). A review a usage limit killed is not a buy — the count goes back, or
     the job deferred for the reset would come back to a head nothing has read and be refused for money it
-    never spent.
+    never spent. Nor is a review its own cap killed: that count goes back too, and the cap that head died at is
+    written down in its place, so the money goes once per change rather than once per re-queue.
   · It only ever switches ON a unit this change ADDED. A unit that is off is usually off for a reason (no
     tokens yet, somebody's call), so it stays off and is named in the output instead of started behind their
     back. Enabling the added ones is the step a worker structurally cannot do: cc-guard denies it systemctl.
@@ -141,7 +148,13 @@ PREPARE_AT_ONCE = int(os.environ.get("CC_LAND_PREPARE") or 4)   # reviews and ga
 CLAUDE = os.environ.get("CC_CLAUDE", f"{HOME}/.local/bin/claude")
 REVIEW_PROMPT = "config/review-prompt.md"     # relative to the repo THIS cc-land lives in, not the one being landed
 REVIEW_RULES = "docs/REVIEW.md"               # read from origin/<base> of the repo being landed; absent = no extra rules
-REVIEW_BUDGET = "3"                           # dollars per PR, enforced by the model runner itself
+# The two caps the runner enforces, and they are one wall in two units: it stops the review when EITHER runs
+# out, and a review stopped either way has read nothing and answered nothing. Both come from the environment
+# because the diff decides which of them binds and no one number is right for every diff — #194 spent $3 at 35
+# of 40 turns, so a money cap raised on its own would have moved that wall four turns and no further. What a
+# stop on one of them MEANS is a third outcome beside a clean review and findings: see exhausted().
+REVIEW_BUDGET = os.environ.get("CC_LAND_REVIEW_BUDGET") or "3"   # dollars per review, enforced by the runner
+REVIEW_TURNS = os.environ.get("CC_LAND_REVIEW_TURNS") or "40"    # …and turns of it, enforced in the same breath
 # …and WHICH model reads it is the same question the gates ask (gate_tier): the review was the expensive half of
 # every landing, bought at the top model whether the diff was a library everything imports or three paragraphs of
 # prose. Prose and comments are not read by a model at all, a narrow code change gets the cheap one, and only a
@@ -360,6 +373,59 @@ def limited(why):
     two fixed prefixes review() raises with, never on the words alone: a verdict's prose quotes anything."""
     return why.startswith("no review: usage limit") or (why.startswith("the reviewer produced nothing")
                                                         and "usage limit" in why)
+
+
+# The two ways the runner stops a review on cc-land's OWN cap rather than on the diff, named as the runner names
+# them: a `subtype` FIELD beside the answer, never the errors[] prose — "Reached maximum budget ($3)" is a sentence
+# this file quotes, so a review OF this file would carry it and be read as having died of it.
+WALL_SUBTYPE = {"error_max_budget_usd": ("the money cap", "CC_LAND_REVIEW_BUDGET"),
+                "error_max_turns": ("the turn cap", "CC_LAND_REVIEW_TURNS")}
+WALL = "the review hit its own cap"       # …and the fixed prefix that says so downstream — see exhausted()
+
+
+def cap_now(var):
+    """What that variable is set to as THIS process reads it. The value a wall was hit at and the value a later run
+    reads are then the same kind of thing and compare directly — which is the whole of wall_stands()."""
+    return REVIEW_BUDGET if var == "CC_LAND_REVIEW_BUDGET" else REVIEW_TURNS
+
+
+def review_caps(subtype=""):
+    """(both caps as one word, for the record and for the message; then the remedy for the one that BOUND — its
+    variable, the value that doubles it, and the other variable as an aside.) "Make the suggested command name the
+    cap that actually bound" (review of #197): a turn stop answered with `CC_LAND_REVIEW_BUDGET=6` buys the
+    identical run and stops at the identical turn having read nothing, for twice the money — the second full spend
+    for nothing that this outcome exists to prevent. Read where it is used and never stored: the caps come from the
+    environment, and an operator raising the right one is the whole of the remedy this outcome offers."""
+    var = (WALL_SUBTYPE.get(subtype) or WALL_SUBTYPE["error_max_budget_usd"])[1]
+    try:
+        more = f"{float(cap_now(var)) * 2:g}"
+    except ValueError:
+        more = "6" if var == "CC_LAND_REVIEW_BUDGET" else "80"
+    other = "CC_LAND_REVIEW_TURNS" if var == "CC_LAND_REVIEW_BUDGET" else "CC_LAND_REVIEW_BUDGET"
+    return f"${REVIEW_BUDGET}/{REVIEW_TURNS}t", var, more, other
+
+
+def wall_stands(wall):
+    """True while the cap that stopped a review at this head has NOT been raised — the one thing that makes the next
+    run certain to stop the same way, and so the only thing worth refusing on. It reads the cap that BOUND and not
+    the pair: raising the OTHER one leaves that wall exactly where it stood while the pair word moves, which is how
+    the pair would have let a turn stop buy the same 40 turns twice (review of #197)."""
+    which = WALL_SUBTYPE.get(wall.get("hit") or "")
+    if not which:
+        return True      # a record that does not name the cap that bound: nothing here says one moved, so it stands
+    now, was = cap_now(which[1]), wall.get("was")
+    try:
+        return float(now) <= float(was)
+    except (TypeError, ValueError):
+        return now == was
+
+
+def exhausted(why):
+    """True when a review stopped on one of those caps — a THIRD outcome, which is the point of it. A clean review
+    says LAND, a review with findings names them, a usage limit is weather that lifts; this one read nothing,
+    answered nothing and spent the whole cap, so it is neither a verdict on the PR nor something a re-run mends.
+    Matched on the fixed prefix, exactly as limited() is and for the same reason: a verdict's prose quotes anything."""
+    return (why or "").startswith(WALL)
 
 
 def write_atomic(path, obj):
@@ -656,12 +722,14 @@ def root_work(repo, pr):
 
 def root_spend(repo, pr, **bump):
     """Count it BEFORE it is spent, and on disk: a review that dies half-way through still cost money, and a counter
-    written afterwards hands every crash a free retry. Returns the record as it now stands."""
+    written afterwards hands every crash a free retry. A value that is not a number is a RECORD and is set rather
+    than added to — `wall=`, the cap a review of this change died on. Returns the record as it now stands."""
     j = root_work(repo, pr)
     j.setdefault("first", stamp())
     j.update(repo=repo, pr=pr, at=stamp())
     for k, n in bump.items():
-        j[k] = (j.get(k) or 0) + n
+        j[k] = (j.get(k) or 0) + n if isinstance(n, int) else n   # a counter adds; a record — the cap a review
+                                                                  # died on — is SET, having nothing to add to
     try:
         os.makedirs(root_dir(), exist_ok=True)
         write_atomic(root_path(repo, pr), j)
@@ -885,6 +953,21 @@ class Land:
                 f"{self.head[:12]} is a head none of them read. A PERSON decides now — read the diff and "
                 f"`cc-land {self.repo} {self.pr} --no-review`, or buy one more with "
                 f"`cc-land {self.repo} {self.pr} --re-review`")
+        # …and whether this exact head has already died on a cap. Once it has, it has cost the whole cap to read
+        # nothing, and the identical run against the cap that stopped it is the one thing certain to do it again —
+        # #194 was queued a second time and would have. So the wall is remembered against the cap that BOUND, and
+        # only raising THAT one re-opens this: more of the other cap buys the same stop for more money (review of
+        # #197). `--re-review` is a person choosing to pay for the same run; anything else is refused right here,
+        # before a cent of it goes.
+        wall = spent.get("wall") or {}
+        if wall.get("head") == self.head and wall_stands(wall) and not self.re_review:
+            name = (WALL_SUBTYPE.get(wall.get("hit") or "") or ("the cap", ""))[0]
+            var, more = review_caps(wall.get("hit") or "")[1:3]
+            raise Failed(f"{WALL}: PR #{self.pr} already spent {wall.get('cost')} at {wall.get('cap')} on "
+                         f"{self.head[:12]} and read nothing — {name} stopped it and has not moved since, so this "
+                         f"run is not bought. Raise the cap that stopped it "
+                         f"(`{var}={more} cc-land {self.repo} {self.pr}`), read the diff yourself (`--no-review`), "
+                         f"or buy that same run over again (`--re-review`).")
         stamp = sh([f"{BIN}/cc-limit", "status"], timeout=60)
         if stamp[0] == 0:
             raise Failed(f"no review: {stamp[1].strip()} — the landing waits for the model, or --no-review")
@@ -910,6 +993,13 @@ class Land:
                 # pre-check above as well, before anything is counted: a blind -1 there gives a second free review.
                 if limited(str(e)):
                     root_spend(self.repo, self.pr, reviews=-1)
+                elif getattr(e, "wall", None):
+                    # A cap stopped this one, so this buy read nothing either, and the change must not be left owing
+                    # a review it never got: the person who then raises the cap would be refused for money that
+                    # bought no verdict, which is how #194 ended with its job dropped. The MONEY is not given back —
+                    # it went — so what goes on the record instead is the wall, and the next attempt at this head is
+                    # refused above rather than spending the cap again to be told the same thing.
+                    root_spend(self.repo, self.pr, reviews=-1, wall=e.wall)
                 raise
         finally:
             self.drop_checkout(tmp, tree)
@@ -989,7 +1079,7 @@ class Land:
         a PR that adds a root CLAUDE.md would load the diff under review as the reviewer's own instructions. The
         tree is a subdirectory of tmp, so it stays fully readable as what it is — data."""
         argv = [CLAUDE, "-p", prompt, "--model", self.by or REVIEW_MODEL, "--effort", "high",
-                "--max-budget-usd", REVIEW_BUDGET, "--max-turns", "40", "--output-format", "json",
+                "--max-budget-usd", REVIEW_BUDGET, "--max-turns", REVIEW_TURNS, "--output-format", "json",
                 "--json-schema", REVIEW_SCHEMA,
                 "--setting-sources", "", "--strict-mcp-config", "--disable-slash-commands",
                 "--add-dir", tmp, "--allowedTools", REVIEW_ALLOW, "--disallowedTools", REVIEW_DENY]
@@ -1003,6 +1093,23 @@ class Land:
         use = j.get("usage") or {}
         toks = sum(v for k, v in use.items() if isinstance(v, int) and k.endswith("tokens"))
         cost, toks = f"${float(cost):.2f}", (f"{toks / 1000:.1f}k tokens" if toks else "tokens not reported")
+        hit = WALL_SUBTYPE.get(j.get("subtype") or "")
+        if hit and not verdict_of(text)[0]:
+            # The RUNNER stopped this, and nothing came back that reads as a verdict: the cap bound, not the diff.
+            # Its own outcome, and it says what it cost, because a stop nobody can price is a stop somebody answers
+            # by raising the number until it goes away. WHICH number is the whole of it: the turn cap is read here
+            # too and not only the money one — #194 stopped on the money at 35 of 40 turns, so the other wall stood
+            # four turns off — and the command offered raises the cap that stopped THIS run, because more of the
+            # other one buys the identical stop for more money (review of #197).
+            cap, var, more, other = review_caps(j.get("subtype") or "")
+            e = Failed(f"{WALL}, not the diff: {cost} and {j.get('num_turns') or '?'} turns on PR #{self.pr} read "
+                       f"nothing and answered nothing — {hit[0]} ({var}) stopped it, so there is no verdict here to "
+                       f"merge on. Give it more (`{var}={more} cc-land {self.repo} {self.pr}`, or {other} for the "
+                       f"cap that did not), or read the diff yourself (`--no-review`). The same run at {cap} buys "
+                       f"the same stop for the same {cost}, so it is not bought again.")
+            e.wall = {"head": self.head, "cap": cap, "cost": cost, "turns": j.get("num_turns") or 0,
+                      "hit": j.get("subtype"), "was": cap_now(var)}
+            raise e
         if not text:
             lim = ""
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -1611,7 +1718,10 @@ def result_of(L, rc, job, tail):
         # deploy stopped at review" about a DO-NOT-LAND — the one sentence they act on, saying the opposite.
         short = f"{what}: NOT merged ❌ — {L.why[:200] or 'the box could not read it'}"
         fix, spent = job.get("fix") or {}, (root_work(L.repo, L.pr) if L.pr else {})
-        if fix.get("over") == "no push":
+        if L.stopped == "review" and exhausted(L.why):
+            pass          # a cap is not a verdict: nothing read this diff, so the fix round that ran before it did
+                          # not fail here, and "and that is AFTER one automatic fix iteration" would say it did
+        elif fix.get("over") == "no push":
             short += (f" — the fix iteration the queue dispatched to {fix.get('track')} ended without pushing "
                       f"anything, so nothing was re-read")
         elif fix:
@@ -2201,6 +2311,13 @@ def cmd_selfcheck():
         return json.dumps({"result": json.dumps(obj), "structured_output": obj, "total_cost_usd": cost,
                            "usage": {"input_tokens": 40000, "output_tokens": 900, "cache_read_input_tokens": 12000}})
 
+    def RANOUT(subtype="error_max_budget_usd", cost=3.0, turns=35):
+        """What the runner hands back when IT stopped the review rather than the model finishing — PR #194's own
+        line out of the queue log: no answer at all, a `subtype` naming which cap ran out, the turns it got, and
+        the money already gone."""
+        return json.dumps({"result": "", "subtype": subtype, "is_error": True, "num_turns": turns,
+                           "errors": [f"Reached maximum budget (${cost:g})"], "total_cost_usd": cost})
+
     LINKED, BODY, BOARD, errs = [[]], [{}], [{}], []   # errs: a case queues Slack errors for the next reactions.add
 
     def fake_slack(method, token, **kw):
@@ -2295,10 +2412,12 @@ def cmd_selfcheck():
           "and the checkout it reads it against — and that directory is then removed, unmerged code and all",
           add.startswith(f"{tempfile.gettempdir()}/cc-land-") and f"{add}/pr-7.diff" in argv[2]
           and f"{add}/head" in argv[2] and ran("git worktree remove", "--force", f"{add}/head"))
-    check("the reviewer is opus at high effort, capped, and cannot reach the shell, the network or a settings "
-          "file — it reads the diff and answers, and that is the whole of what it can do",
+    check("the reviewer is opus at high effort, capped in BOTH money and turns from the environment, and cannot "
+          "reach the shell, the network or a settings file — it reads the diff and answers, and that is the whole "
+          "of what it can do",
           argv[3:7] == ["--model", "claude-opus-5", "--effort", "high"]
           and argv[argv.index("--max-budget-usd") + 1] == REVIEW_BUDGET
+          and argv[argv.index("--max-turns") + 1] == REVIEW_TURNS
           and "Bash" in argv[argv.index("--disallowedTools") + 1]
           and argv[argv.index("--setting-sources") + 1] == ""
           and "--strict-mcp-config" in argv and argv[argv.index("--allowedTools") + 1] == REVIEW_ALLOW)
@@ -2384,6 +2503,141 @@ def cmd_selfcheck():
     check("...and a reviewer that dies any OTHER way is NOT refunded: the model ran, the money went, and a re-run "
           "that buys again is a buy the bound has to see",
           "produced nothing" in str(r) and not limited(str(r)) and root_work("myrepo", 7).get("reviews") == 1)
+    # The caps are read from the environment now — that is this change — so a block asserting the exact strings
+    # the remedy names has to fix them for its own duration. Without this, an operator who has set
+    # CC_LAND_REVIEW_BUDGET turns this suite red: the feature failing its own test (review of #197).
+    _caps_real = (REVIEW_BUDGET, REVIEW_TURNS)
+    globals()["REVIEW_BUDGET"], globals()["REVIEW_TURNS"] = "3", "40"
+    try:
+        # THE THIRD OUTCOME. A review that spends its whole cap and reads nothing is not a verdict on the PR, and it
+        # is not a usage limit either — nothing about the next run of it would be different. PR #194 (575 added lines
+        # over 6 files, 409 s, 35 turns, "Reached maximum budget ($3)", no diff read) was reported as an ordinary stop,
+        # counted as that change's second, and the queue dropped the job for a person to notice.
+        def relanding(**kw):
+            """The same change again on the SAME record — fresh() wipes the tally these cases are about."""
+            L = Land("myrepo", pr=7, **kw)
+            L.facts = dict(FACTS)
+            return L
+
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world[f"{CLAUDE} -p"] = (0, RANOUT())
+        r = caught(L.review)
+        check("a review that runs out of MONEY is its own outcome and is priced: what it spent, how many turns it got, "
+              "which cap stopped it and the variable that raises that cap — and it is neither a verdict nor a usage "
+              "limit, so nothing downstream can read it as one",
+              exhausted(str(r)) and "$3.00" in str(r) and "35 turns" in str(r) and "no verdict" in str(r)
+              and "CC_LAND_REVIEW_BUDGET=6" in str(r) and "CC_LAND_REVIEW_TURNS=" not in str(r)
+              and not limited(str(r)) and not L.verdict)
+        check("...and the review it never got is given back while the WALL is written down in its place: the change is "
+              "not left owing money that bought no verdict — that is what refuses the re-run a person makes after "
+              "raising the cap — and the cap it died at is on the record with the head and the cost",
+              root_work("myrepo", 7).get("reviews") == 0 and not root_work("myrepo", 7).get("repairs")
+              and root_work("myrepo", 7).get("wall") == {"head": HEAD, "cap": review_caps()[0], "cost": "$3.00",
+                                                         "turns": 35, "hit": "error_max_budget_usd",
+                                                         "was": REVIEW_BUDGET})
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world[f"{CLAUDE} -p"] = (0, RANOUT("error_max_turns", cost=1.2, turns=40))
+        r = caught(L.review)
+        check("...and running out of TURNS is the same outcome by the other cap, and the command it hands over "
+              "raises THAT cap and not the money — #194 stopped on the money at 35 of 40 turns, so the two are one "
+              "wall in two units and the remedy has to name the unit that ran out",
+              exhausted(str(r)) and "CC_LAND_REVIEW_TURNS=80" in str(r) and "CC_LAND_REVIEW_BUDGET=" not in str(r)
+              and "$1.20" in str(r) and root_work("myrepo", 7).get("reviews") == 0
+              and root_work("myrepo", 7)["wall"]["hit"] == "error_max_turns")
+        L = fresh(pr=7)                       # this case builds its own wall rather than inherit the one above
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world[f"{CLAUDE} -p"] = (0, RANOUT())
+        caught(L.review)
+        r = caught(relanding().review)
+        check("the same head at the same cap is then refused BEFORE the model is asked: the cap is spent once per "
+              "CHANGE, not once per queue attempt — #194 was queued again an hour later and would have bought the "
+              "identical nothing for the identical $3",
+              exhausted(str(r)) and "already spent $3.00" in str(r) and "read nothing" in str(r)
+              and len([c for c in calls if c[0] == CLAUDE]) == 1)
+        real_budget = REVIEW_BUDGET
+        L = fresh(pr=7)                       # …and its own again: what a RAISED cap does to a wall is this case, so
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")     # the wall it needs is built here, not inherited
+        world[f"{CLAUDE} -p"] = (0, RANOUT())
+        caught(L.review)
+        try:
+            globals()["REVIEW_BUDGET"] = real_budget + "7"       # raised from the environment, this file untouched
+            world[f"{CLAUDE} -p"] = (0, REVIEWED("LAND"))
+            r = caught(relanding().review)
+            raised = [c for c in calls if c[0] == CLAUDE][-1]
+            check("...and raising a cap is what re-opens it: the wall stays written against the cap it HIT, which is "
+                  "what makes a different cap a different question — the run the old one refused is bought at the new "
+                  "number, and nobody edited this file to get a big diff read",
+                  "LAND on PR #7" in str(r) and len([c for c in calls if c[0] == CLAUDE]) == 2
+                  and raised[raised.index("--max-budget-usd") + 1] == REVIEW_BUDGET != real_budget
+                  and root_work("myrepo", 7)["wall"]["cap"] == f"${real_budget}/{REVIEW_TURNS}t")
+        finally:
+            globals()["REVIEW_BUDGET"] = real_budget
+        L = fresh(pr=7)                       # …and its own once more: --re-review is the OTHER way past a wall
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world[f"{CLAUDE} -p"] = (0, RANOUT())
+        caught(L.review)
+        r = caught(relanding(re_review=True).review)
+        asked = [c for c in calls if c[0] == CLAUDE][-1]
+        check("...while --re-review buys it at the SAME cap the run without the flag was just refused at: that flag is "
+              "a person deciding to spend, which this bound has never been in the way of, and they were told the price "
+              "and the answer",
+              exhausted(str(r)) and len([c for c in calls if c[0] == CLAUDE]) == 2
+              and asked[asked.index("--max-budget-usd") + 1] == REVIEW_BUDGET == real_budget)
+
+        L = fresh(pr=7)                       # a TURN wall of this case's own: the money is not what stopped it
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world[f"{CLAUDE} -p"] = (0, RANOUT("error_max_turns", cost=1.2, turns=40))
+        caught(L.review)
+        real_budget, real_turns = REVIEW_BUDGET, REVIEW_TURNS
+        try:
+            globals()["REVIEW_BUDGET"] = "99"     # the operator raises the cap that did NOT stop it
+            r = caught(relanding().review)
+            check("a wall is remembered against the cap that BOUND, so raising the OTHER one does not re-open it: a "
+                  "turn stop answered with more money buys the identical run and stops at the identical turn having "
+                  "read nothing, for more money — and the refusal still points at the cap that did stop it",
+                  exhausted(str(r)) and "CC_LAND_REVIEW_TURNS=80" in str(r) and "the turn cap stopped it" in str(r)
+                  and len([c for c in calls if c[0] == CLAUDE]) == 1)
+        finally:
+            globals()["REVIEW_BUDGET"] = real_budget
+        try:
+            globals()["REVIEW_TURNS"] = "80"      # …and now the one that did, which is what the message asked for
+            world[f"{CLAUDE} -p"] = (0, REVIEWED("LAND"))
+            r = caught(relanding().review)
+            asked = [c for c in calls if c[0] == CLAUDE][-1]
+            check("...while raising the cap that DID stop it re-opens that head at the new number: it is the only "
+                  "change to the environment that makes the next run a different run, which is why it is the one the "
+                  "message names",
+                  "LAND on PR #7" in str(r) and len([c for c in calls if c[0] == CLAUDE]) == 2
+                  and asked[asked.index("--max-turns") + 1] == REVIEW_TURNS != real_turns)
+        finally:
+            globals()["REVIEW_TURNS"] = real_turns
+
+        # …and how that outcome READS to the owner, on #194's exact shape: a cap stop arriving after the change's one
+        # automatic repair round. The clause that names the round belongs to a verdict — nothing read this diff, so
+        # the round did not fail here, and saying it did is what sent #194 to a person as a change twice rejected.
+        class Ended:
+            repo, pr, stopped = "myrepo", 7, "review"
+
+            def __init__(self, why):
+                self.why = why
+
+            def what(self):
+                return "PR #7"
+
+        after = {"attempts": 1, "fix": {"track": "w1", "at": stamp()}}
+        capped = result_of(Ended(f"{WALL}, not the diff: $3.00 and 35 turns on PR #7 read nothing"), 1, after, "")
+        verdicted = result_of(Ended("DO-NOT-LAND on PR #7 ($0.42) — the landing stops here."), 1, after, "")
+        check("a cap stop that arrives AFTER the change's one repair round does not blame that round, while a real "
+              "verdict on the same job still does — one of them read the fix and rejected it, the other never read "
+              "anything, and #194 was reported as the first",
+              "hit its own cap" in capped["short"] and not capped["ok"]
+              and "AFTER one automatic fix iteration" not in capped["short"]
+              and "AFTER one automatic fix iteration" in verdicted["short"])
+    finally:
+        globals()["REVIEW_BUDGET"], globals()["REVIEW_TURNS"] = _caps_real
+
     check("the reviewer prompt ships beside the script, and asks for exactly the fields the schema validates",
           os.access(f"{os.path.dirname(BIN)}/{REVIEW_PROMPT}", os.R_OK) and
           all(v in open(f"{os.path.dirname(BIN)}/{REVIEW_PROMPT}").read()
@@ -3173,6 +3427,25 @@ def cmd_selfcheck():
               "may BUY must never be what strands a PR nothing has read (review of PR #195)",
               len(gh_merges()) == 1 and len(commented()) == 1 and not os.path.exists(job_path("myrepo", 7))
               and reacted[-1][1] == "white_check_mark")
+
+        # (1b) …and a review that ran out of cc-land's OWN cap is neither weather nor a verdict: the limit above
+        # lifts by itself and a cap never does, so waiting for it is waiting for nothing.
+        landing(**{f"{CLAUDE} -p": (0, RANOUT())})
+        quiet(cmd_work, [])
+        check("a review that hits its own cap ENDS the job rather than deferring or retrying it — nothing merges, "
+              "nothing is commented, no fix round goes out and no re-run is armed, because there is no verdict "
+              "here to act on and the same run at the same cap would buy the same nothing",
+              not os.path.exists(job_path("myrepo", 7)) and not gh_merges() and not commented()
+              and not ran_sub("cc", "myrepo", "--go") and not ran("systemd-run", "--on-active=")
+              and reacted[-1][1] == "x")
+        check("...and the owner is told what it COST and which number would change it, once — the ✗ a person can "
+              "act on, rather than a verdict the review never reached",
+              len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told() and "$3.00" in told()
+              and "hit its own cap" in told() and "CC_LAND_REVIEW_BUDGET" in told())
+        check("...and it costs the change neither of the two things it is bounded by: the review it never got is "
+              "given back and the automatic repair round is untouched, so the person who raises the cap is not "
+              "then refused for a budget that bought no verdict (#194's stop consumed both and was dropped)",
+              root_work("myrepo", 7).get("reviews") == 0 and not root_work("myrepo", 7).get("repairs"))
 
         # (2) a red gate is a try, not a verdict
         real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
