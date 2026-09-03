@@ -32,5 +32,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # of its own: no session on this box is written to, and no message of this box's is read.
 # cc-guard's runs the gates themselves against fixtures in a HOME of its own, with the owner's two real
 # doors (cc-notify, cc-slack) stubbed: which denies page and which never do, and the worker kill fence.
-for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+# cc-brief's is fixtures too — briefs it writes itself, a board and a throwaway git repo under a temp dir, and
+# CC_BRIEF_FAKE standing in for the judge at every case, so the fast gate never reaches a model.
+for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

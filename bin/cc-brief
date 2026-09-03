@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""cc-brief — the shape of a brief, checked by the box instead of remembered by the session.
+
+  cc-brief check [FILE|-]        a brief on stdin/FILE -> the lines in it that prescribe HOW; exit 1 = refused
+  cc-brief judge [FILE|-]        a small model reads the same brief -> 0 approved · 1 REJECTED · 2 not judged
+  …either gate, --for <repo>/<track>   names the track in the refusal (display only)
+  cc-brief refresh <repo> <track>   recompute that track's IN FLIGHT block from the board, in its task.md
+  cc-brief selfcheck             fixtures for every signal, both gates, the recorded override and the row that is
+                                 not one, the block rewrite
+
+WHY A CHECK AND NOT A RULE. What a brief may say is written down in two places already, and a session that had
+read both still dispatched a page of prescription; a third copy is the move that has already failed twice. So the
+three doors a brief enters by — `cc <repo> <track> --go "..."`, `cc-board add` and `cc-board set … instructions`
+— ask this instead, the way the Stop hook asks cc-owed. All three, because gating two of them gates none: `set`
+then `--go ""` puts a worker on the brief with no text left for --go to look at. Nothing here is a new copy of the rule: it is the rule's arithmetic.
+
+WHAT IS REFUSED, and the count that decides it. Prose always passes — a message written to a person is most of a
+brief and must dispatch as it stands. Three shapes do not:
+  step-list      >= 3 list items that OPEN ON AN EDIT VERB (add, edit, run, create, change, replace, wire, …).
+                 Numbering is not the signal: briefs list their done-criteria and boundaries numbered, and over 96
+                 real briefs counting a numbered run as a sequence refused 18 of them.
+  command-block  a fenced block holding >= 2 command lines — the exact commands to type, in order
+  command-run    >= 2 bare command lines outside a fence: a whole line that IS a command, backticked or not
+A line naming one command inside a sentence is not a finding; two lines that ARE commands is a script. A line
+showing what a command PRINTED — column-padded, or carrying an arrow — is evidence, and evidence is a what.
+
+THE JUDGE READS THE PROSE, because the arithmetic above cannot. A page of prescription written as paragraphs is
+exactly what got past two written copies of the rule, and whether a line is a fact the engineer needs or a step
+they should have decided is a judgement about prose. So `judge` hands the brief to a small model and prints its
+verdict WITH WHAT TO CUT — a verdict that teaches nothing is one that gets worked around. A cut it did not quote
+verbatim from the brief is dropped. Measured 2026-09-02: $0.0055 and 8-11 s a call, against $2-7 for one worker
+iteration, so the gate costs about a fifth of a percent of the round it protects.
+  0  approved · 1  it READ the brief and rejected it — hard · 2  it could not judge at all, and the brief GOES.
+THE THREE ANSWERS ARE NOT TWO. Fail open on absence, hard on judgement: a box that cannot start work because a
+judge is down is worse than a box that dispatches a wordy brief, and a caller must never read 2 as approval.
+
+FORCE IS FLAG, NEVER SILENCE, AND IT IS RECORDED: `CC_BRIEF_FORCE=1` in front of the dispatch prints the same
+findings, lets it through (exit 0), and appends a JSON line to ~/.cc/state/brief/overrides.jsonl for each gate
+it went past — countable with `wc -l`, so an override is a deliberate act with a record, not a bypass.
+A ROW THE BOX WROTE ITSELF IS NOT ONE OF THOSE. cc-audit's board rows carry a report, not a brief somebody typed:
+`CC_BRIEF_MACHINE=1` skips both gates and writes nothing to the ledger, so the count above stays a count of
+decisions people made — and no judge is paid for a verdict that could not have changed the row either way.
+
+THE BOUNDARIES ARE COMPUTED, NOT TYPED. What a brief needs to say about what is in flight — which files another
+live track is already holding — is a fact the board and git both already have, and typing it means typing what
+was true when it was typed. `refresh` reads the board's live rows (queued/running/waiting/review), asks git which
+files each one's branch has changed against the base, and writes ONE delimited block into the brief:
+
+  <!-- cc-brief:inflight -->
+  IN FLIGHT (from the board, <stamp>) — held by another live track, so check before editing:
+    core/bin/cc-foo — other-track [review]
+  <!-- /cc-brief:inflight -->
+
+Nothing held means no block at all, and an old one is taken out; a board that cannot be READ is not the same
+answer, and leaves whatever the brief has. At most 12 files are listed, then a count and a pointer at the board.
+
+Only that block is ever rewritten: everything a person typed in the brief is left exactly as typed, and a row a
+person marked `kind=session` is not a track holding files, so it is read and skipped rather than reported.
+Env: CC_BOARDS · CC_STATE (both so a test run keeps out of the box's own state) · CC_BRIEF_FORCE · CC_BRIEF_MACHINE ·
+CC_BRIEF_MODEL (default haiku) · CC_BRIEF_TIMEOUT (default 120 s) · CC_CLAUDE · CC_BRIEF_FAKE (tests: the
+judge's answer, or empty for a judge that is not there — no call is made).
+"""
+import json, os, re, subprocess, sys, time
+
+BOARDS = os.environ.get("CC_BOARDS") or os.path.expanduser("~/.cc/boards")
+STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")
+LIVE = ("queued", "running", "waiting", "review")   # a row that is not finished: its branch may be under a hand right now
+MARK_A, MARK_B = "<!-- cc-brief:inflight -->", "<!-- /cc-brief:inflight -->"
+BLOCK_RE = re.compile(re.escape(MARK_A) + r".*?" + re.escape(MARK_B) + r"\n?", re.S)
+MAX_FILES = 12          # a brief carrying a page of paths is the problem this is here to avoid
+MAX_QUOTE = 4           # findings quote the offending lines; enough to recognise them, not the whole brief
+
+# An imperative opener. A bullet of prose starts on a noun or an article ("- the owner caught it"); a step starts
+# on one of these ("- Add a flag to cc-foo"). Kept to verbs that name an EDIT, not verbs of judgement (decide,
+# check, keep) — a brief may legitimately say what to be sure of, it may not say which keys to press.
+IMPERATIVE = r"""add|append|edit|change|create|write|run|call|copy|move|delete|remove|rename|replace|set|make|use|
+    put|open|insert|update|implement|refactor|wire|import|define|extend|rewrite|drop|register|export|install|patch"""
+def _alt(words):
+    """A wrapped word list -> one alternation. Splitting on whitespace alone leaves the wrap's trailing `|`,
+    and the empty alternative it makes matches at position 0 of EVERY line — the check would fire on prose."""
+    return "|".join(w for w in re.split(r"[|\s]+", words) if w)
+IMPERATIVE_RE = re.compile(r"^(?:%s)\b" % _alt(IMPERATIVE), re.I)
+LIST_RE = re.compile(r"^\s{0,6}(?:\d{1,2}[.)]|[-*+•])\s+(.*\S)\s*$")
+FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+# A command word: this box's own tools, and the shell things a prescription reaches for.
+CMD_WORD = r"""cc|git|bash|sh|zsh|python|python3|pip|pip3|npm|npx|node|make|cmake|sudo|systemctl|journalctl|tmux|
+    jq|yq|sed|awk|grep|rg|find|xargs|curl|wget|ssh|scp|rsync|docker|gh|pytest|cargo|go|ls|cat|head|tail|cd|mkdir|
+    rm|cp|mv|chmod|chown|touch|ln|export|source|echo|printf|tee|diff|patch|kill|pkill|pgrep"""
+CMD_RE = re.compile(r"^(?:(?:%s)|cc-[a-z][a-z0-9-]*|\./\S+|\S+\.(?:sh|py))(?:\s+\S+)+$" % _alt(CMD_WORD))
+SENTENCE_END = re.compile(r"[.,;:!?]$|\.\s")   # a command line has no sentence punctuation; an English line does
+# EVIDENCE IS NOT AN INSTRUCTION. Briefs show what a command ALREADY printed, in columns: `git ls-remote …  -> 79fd93b
+# (STALE)`. Both real briefs this check refused across 96 were that shape. A command to type is single-spaced and has
+# no arrow; column padding or an arrow means the line is reporting a result, which is exactly the what a brief is for.
+EVIDENCE = re.compile(r"\S\s{2,}\S|->|=>|⇒")
+
+
+def strip_block(text):
+    """The IN FLIGHT block is this tool's own writing (paths, track names) — never check it as if a person typed it."""
+    return BLOCK_RE.sub("", text)
+
+
+def command_line(line):
+    """Is this whole line a command? Backticks stripped; anything punctuated like English is prose naming a tool."""
+    s = line.strip()
+    if s.startswith("`") and s.endswith("`") and len(s) > 2:
+        s = s[1:-1].strip()
+    elif "`" in s:
+        return False              # a command quoted mid-sentence is prose; only a whole backticked line counts
+    if not s or SENTENCE_END.search(s) or EVIDENCE.search(s):
+        return False
+    return bool(CMD_RE.match(s))
+
+
+def findings(text):
+    """Every way this brief prescribes HOW: (signal, why, the lines), step-list first then the command shapes.
+    The brief's own line — 'a brief carrying step lists or exact commands is refused or flagged at dispatch,
+    with the reason' — is why each finding carries its own lines rather than just a count."""
+    lines = strip_block(text).splitlines()
+    out, fenced, fence_cmds, blocks, steps, cmds, fcmds = [], False, 0, [], [], [], []
+    for line in lines:
+        if FENCE_RE.match(line):
+            if fenced and fence_cmds >= 2:
+                blocks.append(fence_cmds)
+            fenced, fence_cmds = (not fenced), 0
+            continue
+        if fenced:
+            if command_line(line):
+                fence_cmds += 1
+                fcmds.append(line.strip())
+            continue
+        m = LIST_RE.match(line)
+        if m:
+            body = m.group(1)
+            if IMPERATIVE_RE.match(re.sub(r"^[*_`]+", "", body)):
+                steps.append(line.strip())
+        elif command_line(line):
+            cmds.append(line.strip())
+    if fenced and fence_cmds >= 2:      # an unclosed fence still showed its commands
+        blocks.append(fence_cmds)
+
+    # NUMBERING IS NOT THE SIGNAL, the verb is. Briefs enumerate their done-criteria and their boundaries as
+    # numbered lists all the time, and those are what the brief is FOR; measured over 96 real briefs, counting a
+    # numbered run as a sequence refused 18 of them. An item that opens on an edit verb is a step in either list.
+    if len(steps) >= 3:
+        out.append(("step-list", f"{len(steps)} list items that are instructions, not a goal", steps[:MAX_QUOTE]))
+    if blocks:
+        out.append(("command-block", f"{len(blocks)} fenced block(s) of exact commands", fcmds[:MAX_QUOTE]))
+    elif len(cmds) >= 2:   # a fence already said it: one finding for one brief, not the same commands counted twice
+        out.append(("command-run", f"{len(cmds)} lines that are commands to type, in order", cmds[:MAX_QUOTE]))
+    return out
+
+
+def machine():
+    """A row the box wrote for itself is not a brief a person typed: no gate to pass, and no override to record.
+    It takes precedence over CC_BRIEF_FORCE, which is a PERSON deciding to send a refused brief as typed —
+    counting an automatic row as one of those would make `wc -l` on the ledger a number about nobody."""
+    return os.environ.get("CC_BRIEF_MACHINE") == "1"
+
+
+def check(text, for_=""):
+    """Print what prescribes HOW. Returns the exit code: 1 = refused, 0 = clean, or forced and so only flagged."""
+    if machine(): return 0
+    fs = findings(text)
+    forced = os.environ.get("CC_BRIEF_FORCE") == "1"
+    if not fs:
+        return 0
+    who = f" for {for_}" if for_ else ""
+    head = "cc-brief: FLAGGED (CC_BRIEF_FORCE=1)" if forced else "cc-brief: REFUSED"
+    print(f"{head}{who} — this brief says how, not what:", file=sys.stderr)
+    for sig, why, ls in fs:
+        print(f"  {sig}: {why}", file=sys.stderr)
+        for line in ls:
+            print(f"      {line}", file=sys.stderr)
+    if forced:
+        record_override(",".join(sig for sig, _, _ in fs), for_, text)
+        return 0
+    print("  Say the goal, why it matters, the boundaries and what done looks like; the worker designs the rest.\n"
+          "  If it really must carry this, CC_BRIEF_FORCE=1 sends it as typed (that is recorded).", file=sys.stderr)
+    return 1
+
+
+def changed(path, base, branch):
+    """Files that branch has changed against base, per git. A branch that is not there has changed nothing."""
+    for ref in (base, "origin/" + base):
+        try:
+            r = subprocess.run(["git", "-C", path, "diff", "--name-only", f"{ref}...{branch}"],
+                               capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if r.returncode == 0:
+            return [f for f in r.stdout.splitlines() if f.strip()]
+    return []
+
+
+def inflight(repo, exclude=""):
+    """The IN FLIGHT block for repo, excluding one track (its own brief). Computed from the board, every time.
+    Three answers, and they are not the same: the block · "" nothing is held right now · None the board could not
+    be read, so nothing is known — and a caller must not mistake not-knowing for nothing and delete a real block."""
+    try:
+        with open(os.path.join(BOARDS, repo + ".json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    path, base = d.get("path") or "", d.get("default_branch") or "main"
+    held = {}
+    for name, t in sorted((d.get("tracks") or {}).items()):
+        # kind=session is a word a person set: a channel with no task and no PR. Read it, honour it, never a holder.
+        if name == exclude or (t.get("kind") or "track") != "track":
+            continue
+        st = t.get("status") or ""
+        if st not in LIVE:
+            continue
+        for f in changed(path, base, t.get("branch") or f"track/{name}"):
+            held.setdefault(f, []).append(f"{name} [{st}]")
+    if not held:
+        return ""      # nothing is held: a brief carries no line about it, and a block left from before comes out
+    stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime())
+    rows = [f"  {f} — {', '.join(who)}" for f, who in sorted(held.items())[:MAX_FILES]]
+    if len(held) > MAX_FILES:
+        rows.append(f"  …and {len(held) - MAX_FILES} more (cc board show {repo})")
+    body = f"IN FLIGHT (from the board, {stamp}) — held by another live track, so check before editing:\n" + "\n".join(rows)
+    return f"{MARK_A}\n{body}\n{MARK_B}\n"
+
+
+def merge(text, block):
+    """Put block where the last one was, or at the end; "" takes the old one out. ONLY the delimited block moves —
+    every line a person typed is left exactly as typed (self-review 6: a machine does not rewrite a human's word)."""
+    if BLOCK_RE.search(text):
+        out = BLOCK_RE.sub(lambda m: block, text, count=1)
+        if block:
+            return out
+        # Removing it undoes exactly what appending it did — the block and the blank line it was put after — and
+        # nothing else. A blank line a person left three deep in their own brief is theirs, not this tool's to tidy.
+        return (out.rstrip("\n") + "\n") if out.strip() else ""
+    if not block:
+        return text
+    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
+
+
+def refresh(repo, track):
+    p = os.path.join(STATE, repo, track, "task.md")
+    try:
+        with open(p, errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return 0            # no brief yet: nothing to annotate, and never a reason to fail a dispatch
+    block = inflight(repo, exclude=track)
+    if block is None:
+        return 0        # the board could not be read: leave whatever is in the brief alone
+    new = merge(text, block)
+    if new != text:
+        tmp = p + ".brief.tmp"          # atomic, like every other writer of this file
+        with open(tmp, "w") as f:
+            f.write(new)
+        os.replace(tmp, p)
+    return 0
+
+
+# ── the judge ────────────────────────────────────────────────────────────────────────────────────────────────
+# The check above proves the shapes it can prove. It cannot read PROSE, and a page of prescription written as
+# paragraphs is exactly what got past two written copies of the rule. So a small model reads the brief and says
+# approve or reject WITH WHAT TO CUT — a verdict that teaches nothing is a verdict that gets worked around.
+CLAUDE = os.environ.get("CC_CLAUDE") or os.path.expanduser("~/.local/bin/claude")
+OVERRIDES = os.path.join(STATE, "brief", "overrides.jsonl")
+BRIEF_MAX = 20000        # bytes of brief sent to the judge; a brief longer than this is already the problem
+DENY = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,"
+        "Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,"
+        "PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree,Read,Grep,Glob,LS")
+JUDGE_SCHEMA = json.dumps({"type": "object", "required": ["verdict", "why", "cut"], "properties": {
+    "verdict": {"type": "string", "enum": ["approve", "reject"]},
+    "why": {"type": "string"},
+    "cut": {"type": "array", "items": {"type": "string"}}}})
+RUBRIC = """You are judging a work brief that is about to be handed to an autonomous engineer.
+
+A brief may say: the GOAL, WHY it matters, the BOUNDARIES (what is out of scope, what other work is in flight,
+what must not break), and WHAT DONE LOOKS LIKE. It may name a file, a command or a prior incident as a FACT the
+engineer would otherwise have to discover.
+
+A brief may NOT say HOW. Reject a brief that hands over the design: an ordered procedure, the edits to make, the
+functions or flags to add, the structure of the solution, or which tool to reach for when the engineer could pick.
+
+Judge only the prose. Numbered done-criteria and boundaries are not steps. One command named as a fact is not a
+procedure. When it is genuinely borderline, approve — a wordy brief costs less than a dispatch that cannot happen.
+
+Answer: verdict approve|reject; why, ONE sentence; cut, the spans to remove — each a VERBATIM substring of the
+brief, shortest that identifies the prescription. Empty cut when you approve."""
+
+
+def record_override(what, for_, text):
+    """An override is never silent: one JSON line per GATE a forced brief went past (a brief that is both the
+    wrong shape and rejected by the judge records both), countable with `wc -l`."""
+    try:
+        os.makedirs(os.path.dirname(OVERRIDES), exist_ok=True)
+        with open(OVERRIDES, "a") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "what": what,
+                                "for": for_, "head": " ".join(text.split())[:200]}) + "\n")
+    except OSError:
+        pass          # a record that cannot be written is not a reason to change what the gate decided
+
+
+def ask_judge(text):
+    """One model call. Returns (verdict dict, note) — verdict None means IT DID NOT JUDGE and note says why."""
+    fake = os.environ.get("CC_BRIEF_FAKE")
+    if fake is not None:
+        if not fake:
+            return None, "the judge was not available (fake: empty)"
+        try: return json.loads(fake), ""
+        except ValueError: return None, "the judge answered with no verdict (fake)"
+    model = os.environ.get("CC_BRIEF_MODEL") or "haiku"
+    env = dict(os.environ, CC_ROLE="worker", MAX_THINKING_TOKENS="0")
+    try:
+        r = subprocess.run([CLAUDE, "-p", "--model", model, "--tools", "", "--disallowedTools", DENY,
+                            "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands",
+                            "--max-turns", "1", "--no-session-persistence", "--output-format", "json",
+                            "--json-schema", JUDGE_SCHEMA, "--max-budget-usd", "0.10"],
+                           input=RUBRIC + "\n\nBRIEF:\n" + text[:BRIEF_MAX], capture_output=True, text=True,
+                           timeout=int(os.environ.get("CC_BRIEF_TIMEOUT") or 120), env=env,
+                           cwd=os.path.expanduser("~"))
+    except Exception as e:
+        return None, f"the judge could not be run ({e.__class__.__name__})"
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return None, f"the judge returned no JSON (rc={r.returncode})"
+    v = d.get("structured_output")
+    if not isinstance(v, dict):          # a usage limit, a refusal, or prose — cc-limit reads this same JSON
+        return None, f"the judge gave no verdict ({d.get('subtype')})"
+    return v, ""
+
+
+def judge(text, for_=""):
+    """Exit code, and the three answers are DIFFERENT ON PURPOSE — a caller must not read absence as approval:
+       0  the judge read it and approved (or CC_BRIEF_FORCE turned a reject into a flag)
+       1  the judge read it and REJECTED — hard, with what to cut
+       2  the judge did not judge (no binary, timeout, limit, no verdict): DISPATCH PROCEEDS.
+    Fail open on absence, hard on judgement: a box that cannot start work because a judge is down is worse than
+    a box that dispatches a wordy brief."""
+    if machine(): return 0        # no model call either: a verdict that cannot change the outcome is not worth asking for
+    v, note = ask_judge(text)
+    who = f" for {for_}" if for_ else ""
+    if v is None:
+        print(f"cc-brief: the brief was NOT judged{who} — {note}; dispatching anyway.", file=sys.stderr)
+        return 2
+    verdict = str(v.get("verdict") or "")
+    if verdict == "approve":
+        return 0
+    if verdict != "reject":      # neither word: it did not judge. ABSENCE IS NOT APPROVAL, so say so and go.
+        print(f"cc-brief: the brief was NOT judged{who} — the judge answered '{verdict[:40]}'; dispatching anyway.",
+              file=sys.stderr)
+        return 2
+    # VERBATIM ONLY: a span the model did not actually quote is a span it invented, and a made-up cut teaches
+    # the reader the wrong lesson. Whitespace-flattened both sides, because prose wraps.
+    flat = " ".join(text.split())
+    cuts = [c for c in (v.get("cut") or []) if isinstance(c, str) and c.strip()
+            and " ".join(c.split()) in flat][:MAX_QUOTE]
+    forced = os.environ.get("CC_BRIEF_FORCE") == "1"
+    head = "cc-brief: FLAGGED by the judge (CC_BRIEF_FORCE=1)" if forced else "cc-brief: REJECTED by the judge"
+    print(f"{head}{who} — {str(v.get('why') or 'it says how, not what')[:300]}", file=sys.stderr)
+    for c in cuts:
+        print(f"      cut: {' '.join(c.split())[:200]}", file=sys.stderr)
+    if forced:
+        record_override("judge", for_, text)
+        return 0
+    print("  Cut those and dispatch again, or CC_BRIEF_FORCE=1 to send it as typed (that is recorded).", file=sys.stderr)
+    return 1
+
+
+def main(a):
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__.rstrip())
+        return 0
+    cmd = a[0]
+    if cmd in ("check", "judge"):
+        rest, for_, src = a[1:], "", "-"
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--for" and i + 1 < len(rest):
+                for_ = rest[i + 1]; i += 2
+            else:
+                src = rest[i]; i += 1
+        if src == "-":
+            text = sys.stdin.read()
+        else:
+            try:
+                with open(src, errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                print(f"cc-brief check: {e}", file=sys.stderr)
+                return 0        # unreadable is not prescription: never fail a dispatch on this tool's own fault
+        return check(text, for_) if cmd == "check" else judge(text, for_)
+    if cmd == "refresh":
+        if len(a) < 3:
+            print("cc-brief refresh: needs <repo> <track>", file=sys.stderr)
+            return 0
+        return refresh(a[1], a[2])
+    if cmd == "selfcheck":
+        return selfcheck()
+    print(f"cc-brief: unknown command '{cmd}'", file=sys.stderr)
+    return 2
+
+
+def selfcheck():
+    import tempfile
+    global BOARDS, STATE, OVERRIDES
+    # THE LEDGER FIRST, before any case forces anything: OVERRIDES is resolved at import from the box's own state,
+    # and a forced case below would otherwise append a fixture line to the real record of real overrides.
+    OVERRIDES = os.path.join(tempfile.mkdtemp(prefix="cc-brief-sc."), "overrides.jsonl")
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        print(("ok   " if cond else "FAIL ") + name)
+        p, f = p + (1 if cond else 0), f + (0 if cond else 1)
+
+    # ── the check: prose passes, the three shapes do not ──
+    prose = ("GOAL: a brief that prescribes how instead of what cannot be dispatched.\n\n"
+             "WHY: the rule is written in two places and a session that read both still shipped a page of it.\n"
+             "The board and git already know which files another track is holding, so nobody should type them.\n\n"
+             "DONE: a brief carrying step lists is refused at dispatch, with the reason. Run cc board show to see.\n")
+    ok("prose dispatches untouched — the owner's own message is most of a brief", findings(prose) == [])
+    ok("one command named inside a sentence is not a finding",
+       findings("Check with `cc board show <repo>` before you start, then decide for yourself.\n") == [])
+
+    steps = ("Do this:\n"
+             "- Add a --flag to core/bin/cc-foo\n"
+             "- Edit core/bin/cc-bar so it passes the flag through\n"
+             "- Run the suite and make sure it is green\n")
+    sigs = [s for s, _, _ in findings(steps)]
+    ok("three imperative bullets are a step list", sigs == ["step-list"])
+    ok("three bullets of prose are not", findings(
+        "- the owner caught it, not the box\n- the rule is in two places already\n- a third copy fails again\n") == [])
+
+    criteria = ("DONE:\n1. a brief that says how is refused at dispatch, with the reason\n"
+                "2. what is in flight comes from the board, not from somebody typing it\n"
+                "3. the rule is not restated anywhere new\n")
+    ok("a numbered list of done-criteria is what a brief is FOR — it passes", findings(criteria) == [])
+    ok("the same list numbered but opening on edit verbs is a step list",
+       [s for s, _, _ in findings("1. Add the check\n2. Wire it into both doors\n3. Run the suite\n")] == ["step-list"])
+    ok("two imperative items are not yet a step list", findings("- Add the check\n- Wire it in\n") == [])
+    ok("a line of prose with no full stop is still prose, not a command",
+       findings("Then run the suite and see\nand keep going until it is green\n") == [])
+
+    fenced = "Then run:\n```\ngit checkout -b track/foo\nbash core/tests/selftest.sh\n```\n"
+    fs = findings(fenced)
+    ok("a fenced block of two commands is a command block", [s for s, _, _ in fs] == ["command-block"])
+    ok("the block's finding quotes the commands it found",
+       bool(fs) and any("selftest.sh" in line for line in fs[0][2]))
+    ok("a fenced block with one command is not a script",
+       findings("Like this:\n```\ncc board show <repo>\n```\n") == [])
+
+    bare = "First:\ncc board add <repo> foo \"title\"\ncc <repo> foo --go \"go\"\n"
+    ok("two bare command lines are a command run", [s for s, _, _ in findings(bare)] == ["command-run"])
+    ok("one bare command line is not", [s for s, _, _ in findings("First:\ncc board show <repo>\n")] == [])
+    ok("commands shown with what they printed are evidence, not instructions", findings(
+        "What is actually there:\ngit ls-remote origin foo    -> 48fff51   (correct)\n"
+        "gh pr view 9 --json headRefOid   -> 79fd93b   (STALE)\n") == [])
+    ok("…while the same two commands single-spaced, with no result, are a script",
+       [s for s, _, _ in findings("git ls-remote origin foo\ngh pr view 9 --json headRefOid\n")] == ["command-run"])
+
+    # ── refuse vs flag: the force escape prints the SAME findings and lets it through ──
+    import io, contextlib
+    def run_check(text, force, machine_=False):
+        for k in ("CC_BRIEF_FORCE", "CC_BRIEF_MACHINE"):
+            os.environ.pop(k, None)
+        if force:
+            os.environ["CC_BRIEF_FORCE"] = "1"
+        if machine_:
+            os.environ["CC_BRIEF_MACHINE"] = "1"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = check(text, for_="r/t")
+        for k in ("CC_BRIEF_FORCE", "CC_BRIEF_MACHINE"):
+            os.environ.pop(k, None)
+        return rc, err.getvalue()
+
+    rc, err = run_check(steps, force=False)
+    ok("a step list is refused at dispatch (exit 1)", rc == 1)
+    ok("…and the refusal names the signal and quotes the line", "step-list" in err and "cc-foo" in err)
+    ok("…and names the escape", "CC_BRIEF_FORCE=1" in err)
+    rc2, err2 = run_check(steps, force=True)
+    ok("forced, the same brief is FLAGGED and goes through (exit 0)", rc2 == 0 and "FLAGGED" in err2)
+    ok("…and the flag still says what it found — force is never silence", "step-list" in err2)
+    rc3, err3 = run_check(prose, force=False)
+    ok("clean prose prints nothing at all", rc3 == 0 and err3 == "")
+
+    # ── the block: computed from the board, and only the block is ever rewritten ──
+    tmp = tempfile.mkdtemp(prefix="cc-brief.")
+    BOARDS, STATE = os.path.join(tmp, "boards"), os.path.join(tmp, "state")
+    os.makedirs(BOARDS)
+    repo = "selfcheckrepo"
+    src = os.path.join(tmp, "repo")
+    os.makedirs(src)
+
+    def git(*args, **kw):
+        return subprocess.run(["git", "-C", src, *args], capture_output=True, text=True,
+                              env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}, **kw)
+
+    subprocess.run(["git", "init", "-q", "-b", "main", src], capture_output=True)
+    open(os.path.join(src, "held.txt"), "w").write("base\n")
+    open(os.path.join(src, "other.txt"), "w").write("base\n")
+    git("add", "-A"); git("commit", "-qm", "base")
+    for br, fn in (("track/one", "held.txt"), ("track/two", "held.txt"), ("track/gone", "other.txt")):
+        git("checkout", "-q", "-b", br, "main")
+        open(os.path.join(src, fn), "a").write(br + "\n")
+        git("add", "-A"); git("commit", "-qm", br)
+    git("checkout", "-q", "main")
+
+    def board(tracks):
+        with open(os.path.join(BOARDS, repo + ".json"), "w") as fh:
+            json.dump({"repo": repo, "path": src, "default_branch": "main", "tracks": tracks}, fh)
+
+    board({"one": {"status": "review", "branch": "track/one"},
+           "two": {"status": "running", "branch": "track/two"},
+           "gone": {"status": "merged", "branch": "track/gone"}})
+    blk = inflight(repo, exclude="two")
+    ok("a live track's file is reported as held, with who holds it", "held.txt — one [review]" in blk)
+    ok("…and the brief's own track is not reported against itself", "two [running]" not in blk)
+    ok("a merged row holds nothing — its file is absent", "other.txt" not in blk)
+    ok("the block is delimited so only it can ever be rewritten", blk.startswith(MARK_A) and blk.rstrip().endswith(MARK_B))
+
+    board({"one": {"status": "review", "branch": "track/one"},
+           "sess": {"status": "running", "branch": "track/gone", "kind": "session"}})
+    blk2 = inflight(repo, exclude="")
+    ok("a row a person marked kind=session is read and skipped, never reported as a holder",
+       "held.txt" in blk2 and "sess" not in blk2 and "other.txt" not in blk2)
+
+    board({"gone": {"status": "merged", "branch": "track/gone"}})
+    ok("nothing held: no block, so a brief carries no line about nothing", inflight(repo, exclude="") == "")
+    ok("an unreadable board is NOT the same answer as nothing held", inflight("no-such-board") is None)
+
+    # rewrite: the typed brief survives verbatim, the stale block does not
+    board({"one": {"status": "review", "branch": "track/one"}})
+    td = os.path.join(STATE, repo, "mine")
+    os.makedirs(td)
+    typed = "GOAL: a goal a person typed.\n\nBOUNDARIES: nothing here is the machine's to touch.\n"
+    task = os.path.join(td, "task.md")
+    open(task, "w").write(typed + "\n" + MARK_A + "\nIN FLIGHT (from the board, 1999-01-01T00:00Z): stale.txt — ghost [running]\n" + MARK_B + "\n")
+    refresh(repo, "mine")
+    got = open(task).read()
+    ok("refresh replaces the machine's stale block", "stale.txt" not in got and "held.txt" in got)
+    ok("…and every line a person typed is still there, verbatim", typed.strip() in got)
+    ok("…and there is exactly one block afterwards", got.count(MARK_A) == 1 and got.count(MARK_B) == 1)
+    open(task, "w").write(typed)
+    refresh(repo, "mine")
+    ok("a brief with no block gets one appended", MARK_A in open(task).read() and typed.strip() in open(task).read())
+    ok("the block is not checked as if a person typed it",
+       findings(open(task).read()) == [] and "held.txt" in open(task).read())
+    refresh(repo, "absent-track")
+    ok("a track with no brief is not an error", True)
+
+    # the block goes as it came: when the last holder finishes, the brief stops claiming the file is held
+    board({"one": {"status": "merged", "branch": "track/one"}})
+    refresh(repo, "mine")
+    after = open(task).read()
+    ok("the last holder finishing takes the block back out", MARK_A not in after and "held.txt" not in after)
+    ok("…and the typed brief is still whole", typed.strip() in after)
+    # ITS OWN FIXTURE, and a pure one: put the block in and take it out again, and the writer's text — including a
+    # gap they left — must come back byte for byte. The tool tidying a brief it did not write is the thing to catch.
+    theirs = "GOAL: a thing.\n\n\n\nwith a gap the writer left.\n"
+    ok("adding the block and taking it out again returns the typed brief byte for byte",
+       merge(merge(theirs, MARK_A + "\nIN FLIGHT: x\n" + MARK_B + "\n"), "") == theirs)
+
+    open(task, "w").write(typed + "\n" + MARK_A + "\nIN FLIGHT: something\n" + MARK_B + "\n")
+    refresh("no-such-board", "mine")
+    ok("a board that cannot be read leaves the block alone rather than deleting it",
+       MARK_A in open(task).read())
+
+    # ── the judge: it reads prose, and its three answers are different on purpose ──
+    def run_judge(text, fake, force=False, machine_=False):
+        for k in ("CC_BRIEF_FAKE", "CC_BRIEF_FORCE", "CC_BRIEF_MACHINE"):
+            os.environ.pop(k, None)
+        if fake is not None:
+            os.environ["CC_BRIEF_FAKE"] = fake
+        if force:
+            os.environ["CC_BRIEF_FORCE"] = "1"
+        if machine_:
+            os.environ["CC_BRIEF_MACHINE"] = "1"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = judge(text, for_="r/t")
+        for k in ("CC_BRIEF_FAKE", "CC_BRIEF_FORCE", "CC_BRIEF_MACHINE"):
+            os.environ.pop(k, None)
+        return rc, err.getvalue()
+
+    brief = "GOAL: something worth doing.\n\nBuild it by adding a --flag to cc-foo and wiring cc-bar to read it.\n"
+    rc, err = run_judge(brief, '{"verdict":"approve","why":"a goal","cut":[]}')
+    ok("the judge approves a brief and says nothing", rc == 0 and err == "")
+    rc, err = run_judge(brief, '{"verdict":"reject","why":"it hands over the design",'
+                               '"cut":["adding a --flag to cc-foo"]}')
+    ok("a rejected brief is REFUSED (exit 1), not warned about", rc == 1)
+    ok("…and the verdict says WHAT TO CUT, quoted from the brief",
+       "it hands over the design" in err and "cut: adding a --flag to cc-foo" in err)
+    rc, err = run_judge(brief, '{"verdict":"reject","why":"no","cut":["a span the brief never contained"]}')
+    ok("a cut the model did not actually quote is dropped, and the reject stands",
+       rc == 1 and "never contained" not in err)
+    # ABSENCE IS NOT A VERDICT. The judge being down must not stop work; the caller has to be able to tell.
+    rc, err = run_judge(brief, "")
+    ok("a judge that could not run exits 2 — dispatch proceeds", rc == 2 and "dispatching anyway" in err)
+    rc, err = run_judge(brief, "not json at all")
+    ok("…and so does a judge that answered with nothing usable", rc == 2)
+    ok("2 is not 1: absence and rejection are different answers to a caller",
+       run_judge(brief, "")[0] != run_judge(brief, '{"verdict":"reject","why":"x","cut":[]}')[0])
+    # AN OVERRIDE IS RECORDED, both gates
+    open(OVERRIDES, "w").close()
+    rc, err = run_judge(brief, '{"verdict":"reject","why":"it hands over the design","cut":[]}', force=True)
+    ok("forced past the judge, the brief goes through and is FLAGGED", rc == 0 and "FLAGGED" in err)
+    lines = [json.loads(l) for l in open(OVERRIDES) if l.strip()]
+    ok("…and the override is recorded, one countable line, naming the gate and the brief",
+       len(lines) == 1 and lines[0]["what"] == "judge" and lines[0]["for"] == "r/t"
+       and "something worth doing" in lines[0]["head"])
+    open(OVERRIDES, "w").close()
+    run_check(steps, force=True)
+    lines = [json.loads(l) for l in open(OVERRIDES) if l.strip()]
+    ok("…and forcing past the arithmetic gate is recorded too, named by signal",
+       len(lines) == 1 and lines[0]["what"] == "step-list")
+    open(OVERRIDES, "w").close()
+    run_check(steps, force=True); run_judge(steps, '{"verdict":"reject","why":"x","cut":[]}', force=True)
+    lines = [json.loads(l) for l in open(OVERRIDES) if l.strip()]
+    ok("a brief forced past BOTH gates records both, one line each — that is what the count counts",
+       [l["what"] for l in lines] == ["step-list", "judge"])
+    open(OVERRIDES, "w").close()
+    run_judge(brief, '{"verdict":"approve","why":"","cut":[]}')
+    run_check(prose, force=False)
+    ok("an approval records nothing — the ledger counts overrides, not dispatches",
+       [l for l in open(OVERRIDES) if l.strip()] == [])
+    # A MACHINE ROW IS NOT AN OVERRIDE. cc-audit writes its own board rows out of a report it generated; counting
+    # those as deliberate overrides would make `wc -l` on the ledger a number about nobody. Both halves here: the
+    # same text is still refused without the flag, so the case cannot pass by the text being harmless.
+    open(OVERRIDES, "w").close()
+    ok("without the flag that same row is still refused — the flag is doing the work", run_check(steps, force=False)[0] == 1)
+    rc, err = run_check(steps, force=False, machine_=True)
+    ok("CC_BRIEF_MACHINE=1: the arithmetic gate lets a machine's own row past, and says nothing", rc == 0 and err == "")
+    rc, err = run_judge(steps, '{"verdict":"reject","why":"it says how","cut":[]}', machine_=True)
+    ok("…and the judge is never asked — a verdict that could not change the row is not paid for",
+       rc == 0 and err == "")
+    ok("…and neither gate wrote a line: the ledger stays a count of decisions people made",
+       [l for l in open(OVERRIDES) if l.strip()] == [])
+    rc, err = run_judge(brief, '{"verdict":"maybe","why":"x","cut":[]}')
+    ok("a verdict that is neither word is absence, not approval — 2, and it says so",
+       rc == 2 and "NOT judged" in err)
+
+    print(f"\ncc-brief selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

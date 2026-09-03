@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """cc-board — shared per-repo task/status board for orchestrated Claude sessions.
 Board file: ~/.cc/boards/<repo>.json  (sidecar; never in git, so no merge noise).
-Every orchestrated session reads/writes it so sessions know what the others are doing."""
-import sys, os, json, time, fcntl, calendar, errno
+Every orchestrated session reads/writes it so sessions know what the others are doing.
+`add` and `set … instructions` are the doors a brief comes in by: cc-brief refuses one that prescribes the steps
+— by its own arithmetic and by a small model reading the prose, which says what to cut; a judge that cannot answer
+does not stop it. CC_BRIEF_FORCE=1 sends it as typed and records that; CC_BRIEF_MACHINE=1 is for a row the box
+wrote itself and records nothing. What other live tracks are holding is computed in."""
+import sys, os, json, time, fcntl, calendar, errno, re, subprocess
 BOARDS = os.path.expanduser("~/.cc/boards")
 # ONE VOCABULARY with the App Home tab (§02 of the Home handoff: the word is "queued", never "todo"). The board used to
 # write `todo` and the tab only printed "queued" by accident — `todo` is not a state it knows, so it fell through the
@@ -107,10 +111,16 @@ def write_brief(repo, track, text):
     tmp = p + ".tmp"                                  # atomic: a half-written brief is worse than an old one
     with open(tmp, "w") as f: f.write(text if text.endswith("\n") else text + "\n")
     os.replace(tmp, p)
+# cc-brief writes a delimited IN FLIGHT block into task.md and owns it; these are the same two markers. A reader
+# asking for the BRIEF gets what a person typed — `cc done` builds the PR body out of this.
+INFLIGHT_RE = re.compile(re.escape("<!-- cc-brief:inflight -->") + r".*?" + re.escape("<!-- /cc-brief:inflight -->") + r"\n?", re.S)
 def brief(repo, track):
     """The brief, migrating a pre-#94 board copy into the file ONCE, on the first read of it. Never call this while
-    holding Lock(repo): it takes the lock itself, and flock on a second fd of the same file deadlocks its owner."""
-    b = read_brief(repo, track)
+    holding Lock(repo): it takes the lock itself, and flock on a second fd of the same file deadlocks its owner.
+    cc-brief's computed IN FLIGHT block is left out: it is the box's own annotation, recomputed at every dispatch,
+    and it has no business in a PR body or in the text `add` compares against to decide it is a new brief."""
+    b = INFLIGHT_RE.sub("", read_brief(repo, track)).rstrip("\n")
+    b = b + "\n" if b else b
     if b.strip(): return b
     try: legacy = ((_load(repo) or {}).get("tracks") or {}).get(track, {}).get("instructions") or ""
     except Exception: return b     # unlocked and cheap: the common case is nothing to migrate, and pays no lock
@@ -141,6 +151,30 @@ def shown(t, for_=SHOWN_FOR):
     """PURE: is this row on the DEFAULT board view? (cc-board selfcheck pins it.)"""
     return t.get("status") not in FINISHED or age(t.get("updated")) < for_
 
+def _brief_tool(*args, **kw):
+    """cc-brief, from the same bin/ as this copy. It is a gate, never a hazard: anything it cannot do is nothing."""
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-brief")
+    # Longer than cc-brief's own judge timeout (120 s) on purpose: the inner one must fire first, so a slow
+    # judge is reported as "not judged" rather than cut off here with no reason printed.
+    try: return subprocess.run([sys.executable, tool, *args], timeout=180, **kw).returncode
+    except (OSError, subprocess.SubprocessError): return 0
+def check_shape(repo, track, text):
+    """THE SHAPE IS CHECKED AT EVERY DOOR. Three write a brief — `add`, `set … instructions` and `cc … --go` —
+    and all three ask this, so a brief that prescribes the steps is refused HERE, with cc-brief printing what made
+    it one. Gating only some of them gates none: `set` then `--go ""` reaches a worker with no text for --go to
+    check. Not a rule in a prompt: the rule is written down twice already and a session that had read both still
+    typed one.
+    TWO GATES, ANSWERING DIFFERENTLY. `check` is arithmetic over the shapes it can prove. `judge` is a small model
+    reading the prose, and its exit code separates the two things a caller must not confuse: 1 = it read the brief
+    and rejected it (hard, with what to cut), 2 = it could not judge at all, and then the brief goes through.
+    CC_BRIEF_FORCE=1 turns either refusal into a flag, and cc-brief records that it was used."""
+    for gate in ("check", "judge"):
+        if _brief_tool(gate, "-", "--for", f"{repo}/{track}", input=text, text=True) == 1:
+            sys.exit(1)
+def refresh_inflight(repo, track):
+    """…and what OTHER live tracks are holding is computed into the brief from the board, never typed into it."""
+    _brief_tool("refresh", repo, track)
+
 USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"list":1,"boards":1,"selfcheck":1}
 def main(a):
     if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|list [--all]|boards [--all]|rm|tracks|selfcheck} ...")
@@ -160,6 +194,7 @@ def main(a):
         instr = " ".join(a[4:])
         have = brief(repo, track)            # migrate a legacy JSON copy FIRST — the pop below would drop it
         if instr.strip():                    # the brief goes to its one home; the board JSON keeps the title
+            check_shape(repo, track, instr)  # …if it is a brief at all: a step list never reaches the file
             if not have.strip(): write_brief(repo, track, instr)
             elif instr.strip() not in have:   # something is already there: APPEND. Never clobber a brief as a side
                 write_brief(repo, track, have.rstrip("\n") + "\n\n" + instr)   # effect of another command — that
@@ -179,13 +214,15 @@ def main(a):
             d["tracks"][track]=t
             d["log"].append({"ts":now(),"track":track,"msg":f"added: {title}"})
             _save(repo,d)
+        refresh_inflight(repo, track)        # the row exists now, so the block can name every OTHER live track
         print(f"track '{track}' added to {repo}")
     elif cmd == "set":
         repo, track, key, val = a[1], a[2], a[3], a[4]
         if key == "instructions":            # replacing a brief is an EXPLICIT act, and this is the verb for it
             if track not in need(repo)["tracks"]: sys.exit(f"no track '{track}'")
             brief(repo, track)               # migrate first, so the old copy cannot come back over the new one
-            write_brief(repo, track, val); return
+            check_shape(repo, track, val)    # …and it is a door like `add`: `set` then `--go ""` would otherwise
+            write_brief(repo, track, val); return    # dispatch a step list past both gates, --go having no text to check
         with Lock(repo):
             d = need(repo)
             if track not in d["tracks"]: sys.exit(f"no track '{track}'")
@@ -289,13 +326,24 @@ def selfcheck():
     import subprocess, tempfile, shutil
     th = tempfile.mkdtemp(prefix="ccboard-sc-")
     try:
+        # CC_BRIEF_FAKE stands in for the judge `add` now asks: this suite has no API calls, and without it the
+        # only reason no model runs is that $HOME/.local/bin/claude is missing under the fixture HOME — accident,
+        # not assertion. cc-brief's own selfcheck is where the judge's verdicts are pinned.
         def run(*args): return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
-                                              env={**os.environ, "HOME": th}, capture_output=True, text=True)
+                                              env={**os.environ, "HOME": th,
+                                                   "CC_BRIEF_FAKE": '{"verdict":"approve","why":"","cut":[]}'},
+                                              capture_output=True, text=True)
         run("init", "r", "/tmp/r", "main"); run("add", "r", "t1", "T", "THE BRIEF, in full.")
         blob = run("json", "r").stdout
         ok("`add` writes the brief to task.md", open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "THE BRIEF, in full.")
         ok("…and the board JSON keeps no copy of it", "instructions" not in blob and "THE BRIEF" not in blob)
         ok("`get instructions` reads that file", run("get", "r", "t1", "instructions").stdout.strip() == "THE BRIEF, in full.")
+        # Its own fixture: cc-brief's block written into that file by hand, so this stands whether or not a board
+        # anywhere has a live track. `cc done` builds the PR body out of this read.
+        open(f"{th}/.cc/state/r/t1/task.md", "a").write(
+            "\n<!-- cc-brief:inflight -->\nIN FLIGHT: core/bin/cc-foo — other [running]\n<!-- /cc-brief:inflight -->\n")
+        ok("…without the computed IN FLIGHT block: a reader asking for the brief gets what a person typed",
+           run("get", "r", "t1", "instructions").stdout.strip() == "THE BRIEF, in full.")
         run("add", "r", "t1", "T", "a one-line note")
         body = open(f"{th}/.cc/state/r/t1/task.md").read()
         ok("`add` appends to a brief instead of overwriting it (four tracks lost one that way)",
@@ -306,6 +354,13 @@ def selfcheck():
         run("set", "r", "t1", "instructions", "REPLACED")
         ok("`set instructions` is the explicit way to replace it",
            open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "REPLACED")
+        # …and it is a door, so it is gated like `add`: `set` then `cc … --go ""` would otherwise walk a step list
+        # past both gates, --go having no text of its own to check. The brief already there must survive the refusal.
+        r = run("set", "r", "t1", "instructions",
+                "Do this:\n- Add a --flag to cc-foo\n- Edit cc-bar to pass it through\n- Run the suite")
+        ok("`set instructions` refuses a step list too, and the brief that was there is untouched",
+           r.returncode == 1 and "step-list" in r.stderr
+           and open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "REPLACED")
         # migration: a row written before this still carries the brief in the JSON, and is moved once
         d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"]["t2"] = {"title": "T2", "status": "queued",
             "instructions": "AN OLD BRIEF", "updated": now()}

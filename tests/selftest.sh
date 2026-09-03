@@ -258,6 +258,10 @@ lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 10%" <<<"$lsout" && ok "cc ls 
 [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ] && ok "the hook still commits when it is given no payload" || bad "checkpoint broke without a Stop payload"
 
 unset CC_HANDOFF_OVERLAP   # the overlap section below decides for itself, per command
+echo "== cc-brief (the shape of a brief, checked at the door instead of remembered) =="
+brc=$("$B/cc-brief" selfcheck 2>&1)
+grep -q '0 failed' <<<"$brc" && ok "cc-brief selfcheck: ${brc##*: }" || { bad "cc-brief selfcheck: $(tail -1 <<<"$brc")"; grep '^FAIL' <<<"$brc" | head -5; }
+
 echo "== cc-owed (the same hook says what is still owed in Slack) =="
 owc=$("$B/cc-owed" selfcheck 2>&1)
 grep -q '0 failed' <<<"$owc" && ok "cc-owed selfcheck: ${owc##*: }" || bad "cc-owed selfcheck: $owc"
@@ -880,12 +884,18 @@ grep -q 'BRIEF HEAD' ~/.cc/boards/$REPO.json \
 [ "$(head -1 "$tm")" = "Work the board brief in full." ] \
   && ok "#71: the --go note sits ABOVE the brief, so the worker reads it first" || bad "note is not line 1: $(head -1 "$tm")"
 
+# task.md also carries cc-brief's IN FLIGHT block (its own cases are below), and that block is RECOMPUTED at every
+# dispatch with a minute-resolution stamp — so every comparison of one dispatch against another compares what a
+# PERSON typed, never the bytes: otherwise two dispatches either side of a minute boundary red the suite for a
+# change nobody made.
+typed(){ python3 -c 'import re,sys;print(re.sub(r"<!-- cc-brief:inflight -->.*?<!-- /cc-brief:inflight -->","",sys.stdin.read(),flags=re.S).strip())'; }
+
 # Re-dispatch must be idempotent, and `--go ""` must move nothing at all.
-b0=$(cat "$tm"); i0=$("$B/cc-board" get $REPO g1 instructions)
+b0=$(typed < "$tm"); i0=$("$B/cc-board" get $REPO g1 instructions)
 godisp g1 "Work the board brief in full."
-[ "$(cat "$tm")" = "$b0" ] && ok "re-dispatching with the same note stacks nothing up" || bad "the same note was added twice"
+[ "$(typed < "$tm")" = "$b0" ] && ok "re-dispatching with the same note stacks nothing up" || bad "the same note was added twice"
 godisp g1 ""
-{ [ "$(cat "$tm")" = "$b0" ] && [ "$("$B/cc-board" get $REPO g1 instructions)" = "$i0" ]; } \
+{ [ "$(typed < "$tm")" = "$b0" ] && [ "$("$B/cc-board" get $REPO g1 instructions)" = "$i0" ]; } \
   && ok '--go "" re-dispatches and changes neither task.md nor the board' || bad '--go "" moved task.md or the board'
 
 # A board written BEFORE this change still holds the brief in its JSON: the first read moves it, once, and the
@@ -927,7 +937,7 @@ tm3=~/.cc/state/$REPO/g3/task.md
 # No brief anywhere: --go still works, and the note becomes the task on both sides.
 godisp g4 "just do this one thing"
 tm4=~/.cc/state/$REPO/g4/task.md
-[ "$(cat "$tm4" 2>/dev/null)" = "just do this one thing" ] \
+[ "$(typed < "$tm4" 2>/dev/null)" = "just do this one thing" ] \
   && ok "--go on a track with no brief still works (the note becomes the task)" || bad "no-brief task.md: $(cat "$tm4" 2>/dev/null)"
 [ "$("$B/cc-board" get $REPO g4 instructions)" = "just do this one thing" ] \
   && ok "--go on a track with no brief: the note IS the brief, and the board reads it back" || bad "no-brief board: $("$B/cc-board" get $REPO g4 instructions)"
@@ -938,6 +948,56 @@ tm4=~/.cc/state/$REPO/g4/task.md
 "$B/cc-board" set $REPO g4 instructions "an explicitly replaced brief" >/dev/null
 [ "$(cat "$tm4")" = "an explicitly replaced brief" ] \
   && ok "…and 'cc-board set … instructions' is the explicit way to replace one" || bad "set instructions: $(cat "$tm4")"
+
+# THE SHAPE IS CHECKED AT BOTH DOORS a brief comes in by (cc-brief). The rule it enforces is written down twice
+# already and a session that had read both still dispatched a page of steps, so the check is mechanical and lives
+# where the brief is written, not in another prompt. Here: it refuses at each door, and the door writes nothing.
+STEPS=$'Do this:\n- Add a --flag to core/bin/cc-foo\n- Edit core/bin/cc-bar to pass it through\n- Run the suite'
+gs=$("$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1); grc=$?
+{ [ $grc != 0 ] && grep -q 'step-list' <<<"$gs" && [ ! -s ~/.cc/state/$REPO/g10/task.md ]; } \
+  && ok "cc-board add refuses a brief of steps, names the signal, and writes nothing" || bad "add took a step list (rc=$grc): $gs"
+gs=$("$B/cc" $REPO g6 --go "$STEPS" 2>&1); grc=$?
+{ [ $grc != 0 ] && grep -q 'step-list' <<<"$gs" && [ ! -s ~/.cc/state/$REPO/g6/task.md ]; } \
+  && ok "--go refuses the same note before it starts a worker" || bad "--go dispatched a step list (rc=$grc): $gs"
+# CC_STATE points cc-brief's override ledger at this run's temp dir: the ledger is one file for the whole box
+# (no repo in its path), so a forced fixture here would otherwise land in the box's own record of real overrides.
+gs=$(CC_STATE="$T/briefstate" CC_BRIEF_FORCE=1 "$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1)
+{ grep -q 'FLAGGED' <<<"$gs" && grep -q 'cc-foo' ~/.cc/state/$REPO/g10/task.md \
+  && grep -q '"what": "step-list"' "$T/briefstate/brief/overrides.jsonl"; } \
+  && ok "CC_BRIEF_FORCE=1 flags the same brief, lets it through and writes it to the ledger — force is never silence" || bad "force: $gs"
+# …and what another live track is holding is COMPUTED into the brief, never typed. This case builds its own
+# holder: g1 is live on the board and its branch really does change a file, so the block has something to say.
+"$B/cc-board" status $REPO g1 running >/dev/null
+( cd ~/.cc/worktrees/$REPO/g1 && echo held > held-by-g1.txt && git add held-by-g1.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "g1 holds a file" -- held-by-g1.txt ) >/dev/null 2>&1
+godisp g7 "GOAL: something worth doing, said as a goal."
+t7=~/.cc/state/$REPO/g7/task.md
+{ grep -q 'IN FLIGHT' "$t7" && grep -q 'held-by-g1.txt — g1 \[running\]' "$t7"; } \
+  && ok "a dispatched brief carries what the board says is in flight, computed at dispatch, never typed" \
+  || bad "no IN FLIGHT block for g1: $(cat "$t7" 2>/dev/null)"
+# THE SECOND GATE IS A JUDGE, and its two failure answers must not look alike. CC_BRIEF_FAKE stands in for the
+# model here — this suite makes no API calls — so both are exercised for real through the doors themselves.
+PROSE="GOAL: something worth doing, said as a goal and nothing more."
+gs=$(CC_BRIEF_FAKE='{"verdict":"reject","why":"it hands over the design","cut":["said as a goal"]}' \
+     "$B/cc-board" add $REPO g8 "g8" "$PROSE" 2>&1); grc=$?
+{ [ $grc != 0 ] && grep -q 'hands over the design' <<<"$gs" && grep -q 'cut: said as a goal' <<<"$gs" \
+  && [ ! -s ~/.cc/state/$REPO/g8/task.md ]; } \
+  && ok "the judge rejects prose the arithmetic cannot see, says what to cut, and the door writes nothing" \
+  || bad "judge reject at the door (rc=$grc): $gs"
+# Its own track, not g8 again: this case must stand on an empty brief of its own, not on the one above
+# having correctly written nothing.
+gs=$(CC_BRIEF_FAKE= "$B/cc-board" add $REPO g9 "g9" "$PROSE" 2>&1); grc=$?
+{ [ $grc = 0 ] && grep -q 'NOT judged' <<<"$gs" && grep -q 'said as a goal' ~/.cc/state/$REPO/g9/task.md; } \
+  && ok "…while a judge that is not there does NOT stop the brief: it lands, and the door says it was not judged" \
+  || bad "absence blocked the door (rc=$grc): $gs"
+
+# …and it is recomputed, not accumulated: g1 finishes, and the next dispatch stops naming its file. Asserted on
+# g1's own file rather than on the block as a whole — other fixture tracks in this suite are live and hold files too.
+"$B/cc-board" status $REPO g1 merged >/dev/null
+godisp g7 ""
+{ ! grep -q 'held-by-g1.txt' "$t7" && grep -q 'said as a goal' "$t7"; } \
+  && ok "…and a holder that has finished is dropped at the next dispatch, the typed brief untouched" \
+  || bad "a finished holder stayed in the block: $(cat "$t7" 2>/dev/null)"
 
 echo "== a finished track leaves the default board view (a13) =="
 # owner, 2026-08-30: "this should also remove it from the board". Filter at render — no archive file to drift.
