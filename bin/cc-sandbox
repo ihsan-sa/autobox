@@ -40,6 +40,20 @@
 #   ~/.cc/state/<repo>/<track> · ~/.cc/boards · ~/.npm · ~/.cache · /tmp · a private ~/.claude with settings ro, this cwd's
 #   transcripts and the repo's memory rw, nothing else of it · a COPY of ~/.claude.json with every other project's history
 #   and the MCP servers stripped (Slack stops loading: workers do not post).
+# PERMISSIONS (both boundaries, and only where there IS one — with the sandbox off nothing below happens): the session
+#   sees a read-only COPY of ~/.claude/settings.json, his own file plus a baseline appropriate to a sealed session.
+#   The copy is the one thing a launch WRITES outside the binds above: ~/.cc/sandbox/<repo|handle>/<track|_workspace>/
+#   settings.json, rewritten each launch, ro-bound at his path — that dir is under no bind, so its source is not
+#   reachable from inside. It carries his hook registrations and deny rules, so on the HOST it is one of the box's
+#   secrets to a gated session, exactly as ~/.claude/settings.json is (cc-guard: secret_path, and the member rule).
+#   Silent in there: Bash, the file tools, and reading the session's own Slack channel — their effects land on the
+#   binds above and nowhere else. STILL PROMPTS: sudo, and a direct call to one of the network clients (curl, wget,
+#   nc, ssh, scp…), plus WebFetch/WebSearch. WHAT THAT IS AND IS NOT: the ask rules match the COMMAND NAME, so they
+#   catch the obvious way out and nothing else — measured, `sh -c 'curl …'` and `/usr/bin/curl …` are both Bash(*)
+#   and both run silent. sudo has a second wall behind it (cc-guard); egress has none. So egress is not
+#   contained here and this does not claim to contain it: it is contained when stage 1b (ccbox, an allowlist proxy)
+#   exists. His file is read, never written, and never edited by this box — the paragraph at SBX_ALLOW says why each
+#   way round.
 # INSIDE ro: ~/bin and the bin it links into · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
@@ -61,6 +75,93 @@
 set -uo pipefail
 H="$HOME"; SELF=$(readlink -f "$0")
 slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.claude/projects: every / and . becomes -
+# ── THE PERMISSION BASELINE OF A SEALED SESSION ───────────────────────────────────────────────────────────────────
+# A prompt the boundary already answers buys no safety and costs the owner a message. Worse, a stream of harmless ones
+# trains him to approve without reading, so the one that matters gets waved through with the rest (three in seven
+# minutes, 2026-09-02: two to READ the session's own Slack channel, one to chmod and byte-compile a file in its own
+# worktree). So the baseline is a DENY-LIST OF WHAT CROSSES, not an allow-list of blessed commands: the allow-list
+# shape is what produced those prompts, because it can never be complete and a worktree that did not exist yesterday
+# starts it empty. Compound commands are the visible symptom — the harness rates `chmod +x X && python3 -m py_compile
+# X && ./X --check` by its least-approved clause, so the whole line prompts for `./X`.
+# ASK, because it leaves the sealed world and the boundary does not stop it:
+#   the outward network — --unshare-net is all-or-nothing and "none" kills claude, so the net is UNTOUCHED in here
+#   (see NETWORK above) and a client is the ordinary way data gets out. `ask` outranks `allow`, so these prompt even
+#   though ~/.claude/settings.json allows `curl` box-wide: inside the boundary the box is STRICTER than outside it.
+#   ITS CEILING, MEASURED (2026-09-03, these same rules through `claude -p --settings`): they are command-NAME rules
+#   and they cover a direct call, nothing more. `curl -sS https://example.com/` prompted; `sh -c 'curl …'` and
+#   `/usr/bin/curl …` did not — no denial, 559 bytes off the box, twice. `env curl` and three lines of python are the
+#   same shape. That is not a hole this list can close: a name list cannot express "reaches the network", and unlike
+#   sudo there is no second wall behind it. It raises the cost of the obvious path and buys the owner a look at it;
+#   the thing that actually contains egress is stage 1b (ccbox, an allowlist proxy), and until that exists egress is
+#   NOT contained. Say that plainly wherever this is described — a boundary claimed wider than it is, is worse than
+#   a narrow one.
+#   sudo — bwrap here does not --unshare-user, so root inside the namespace is root on the host kernel (modprobe);
+#   a mount namespace is not a privilege boundary and this one was never audited as one. cc-guard refuses it for a
+#   gated role too, and that is not a reason to drop it here: two walls with two owners, each doing its own job. It is
+#   also NOT the `gh` case below — `gh` cannot function in here at all, where this can.
+# NOT asked, deliberately: `git push` and `gh`, which the boundary already broke by leaving the credential outside
+#   (BREAKS INSIDE, BY DESIGN above) — guarding the impossible is the failure mode, not the safe default; and
+#   `npm`/`pip install`, which fetch INWARD into a world that is thrown away.
+# EVERYTHING ELSE IS SILENT because its effects land on the binds above and nowhere else, and because the harness
+# prompt is the third gate on those, not the first: cc-guard is a PreToolUse hook that runs whatever the permission
+# rules say, and it still denies merging, deploying, comms in the owner's name, destructive ops and the box's
+# secrets for CC_ROLE=worker|member. Two walls with two owners — do not widen one to quiet the other.
+# NEVER his file: this is a COPY, built here, read-only INSIDE (a session that could rewrite its own settings.json
+# could unregister cc-guard from it). His hooks, his deny, his ask and his allow come through in his own order with
+# the baseline appended. ~/.claude/settings.json is his and is only ever read.
+# MEASURED, not guessed (2.1.259, 2026-09-02): a rule in a SETTINGS FILE needs its specifier. Bare `Bash` is honoured
+# from `--settings` and silently matches nothing from ~/.claude/settings.json, so the wildcard is spelled out here and
+# the file rules carry the same `//**` his own `Read` rule does. Re-measure before changing a specifier.
+SBX_ALLOW='["Bash(*)","Read(//**)","Edit(//**)","Write(//**)","NotebookEdit(//**)","mcp__cc-slack__history","mcp__cc-slack__thread"]'
+SBX_ASK='["Bash(sudo:*)","Bash(curl:*)","Bash(wget:*)","Bash(nc:*)","Bash(ncat:*)","Bash(netcat:*)","Bash(telnet:*)","Bash(socat:*)","Bash(ssh:*)","Bash(scp:*)","Bash(sftp:*)","WebFetch","WebSearch"]'
+settings_copy(){   # stdout: the settings.json the sealed session sees. Read-only in there; his own file is never written.
+  # rc 1 = NO copy, and the caller then binds his file unchanged and says the baseline is not applied. THE MERGE CAN
+  # FAIL ON A FILE THAT PARSES: `jq -e .` proves his file is JSON, not that this filter can run on it — a hand-edited
+  # `"allow": "Bash(x)"` (a string where a list belongs) parses and then aborts jq mid-stream, because `$a - "Bash(x)"`
+  # is a type error. jq's exit status is the only thing that says so, so it is not discarded: a swallowed failure here
+  # ro-binds an EMPTY settings.json at his path, which is a session with no rules and no cc-guard hook registration,
+  # silently — the one outcome this whole function exists to prevent.
+  local s="$H/.claude/settings.json"
+  # AND HIS FILE IS WHERE THE HOOKS LIVE, so a baseline built without one is a session with permissions and no
+  # cc-guard registered — while SBX_ALLOW opens Bash all the way, which makes it MORE open than no baseline at
+  # all, not less. Absent is therefore refused exactly like a file that will not parse: the caller binds nothing
+  # and the session prompts as an unsandboxed one does (review of #198).
+  if [ ! -f "$s" ]; then
+    echo "cc-sandbox: ~/.claude/settings.json does not exist." >&2
+    return 1; fi
+  if ! jq -e . "$s" >/dev/null 2>&1; then
+    echo "cc-sandbox: ~/.claude/settings.json does not parse." >&2   # the reason; settings_bind prints the consequence
+    return 1; fi
+  jq --argjson a "$SBX_ALLOW" --argjson k "$SBX_ASK" \
+     '. + {permissions: ((.permissions // {}) + {
+            allow: ((.permissions.allow // []) + ($a - (.permissions.allow // []))),
+            ask:   ((.permissions.ask   // []) + ($k - (.permissions.ask   // [])))})}' "$s" \
+    || { echo "cc-sandbox: the sealed-session baseline would not merge into ~/.claude/settings.json — is permissions.allow or permissions.ask something other than a list?" >&2; return 1; }; }
+settings_bind(){   # $1 a host dir NO bind of this boundary reaches → put the copy there and mount it ro at his path
+  # It has to be a REAL FILE ON THE HOST, ro-bound like any other path. Measured 2026-09-02: handed in over an fd
+  # (`--ro-bind-data`, `--file`) the copy is readable inside — jq reads it — and claude applies NONE of it, his own
+  # rules included, so a session got no settings at all. The mount, not the copy, is what makes it read-only, and a
+  # session that could rewrite its own settings.json could unregister cc-guard from it.
+  local d="$1" f
+  if mkdir -p "$d" 2>/dev/null; then
+    f="$d/settings.json"
+    # THREE things have to hold before it is installed, and the middle one is not redundant: settings_copy can fail
+    # (above), and a write that runs out of disk or quota leaves a TRUNCATED file behind with a zero exit status.
+    # Either way the copy is not the file it claims to be, so it is re-read as JSON here and a bad one is never
+    # mounted — the fallback below is strictly better than a session holding an empty settings.json.
+    if ( umask 077; settings_copy > "$f.tmp.$$" ) && jq -e . "$f.tmp.$$" >/dev/null 2>&1 && mv "$f.tmp.$$" "$f"; then
+      B+=(--ro-bind "$f" "$H/.claude/settings.json"); return 0; fi
+    rm -f "$f.tmp.$$"; fi
+  # No usable copy — it could not be built, or could not be written. Bind HIS file unchanged rather than nothing:
+  # the hooks in there are the box's mechanical gates, and a session with no settings at all has no cc-guard either.
+  # A copy an earlier launch left at $f is deliberately left alone: another sealed session may have that very file
+  # mounted right now, and it is not this launch's to delete.
+  if [ -f "$H/.claude/settings.json" ]; then
+    echo "cc-sandbox: no sealed-session settings copy under $d — binding ~/.claude/settings.json unchanged instead. The permission baseline is NOT applied: this session prompts like an unsandboxed one." >&2
+  else
+    echo "cc-sandbox: no ~/.claude/settings.json to build a sealed-session copy from — binding no settings at all. The permission baseline is NOT applied and no hook is registered: this session prompts like an unsandboxed one." >&2
+  fi
+  [ -f "$H/.claude/settings.json" ] && B+=(--ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json"); return 0; }
 build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the rw targets that may not exist yet are created
   local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f
   proj="$H/.claude/projects/$(slug "$wt")"; mem="$H/.claude/projects/$(slug "$dev")/memory"
@@ -71,9 +172,10 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
      --bind "$wt" "$wt" --bind "$dev/.git" "$dev/.git" --ro-bind "$dev/.git/config" "$dev/.git/config"
      --bind "$st" "$st" --bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
      --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin"
-     --ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json" --bind "$proj" "$proj" --bind "$mem" "$mem"
+     --bind "$proj" "$proj" --bind "$mem" "$mem"
      --unsetenv TMUX --unsetenv TMUX_PANE --unsetenv SSH_AUTH_SOCK --unsetenv DOCKER_HOST --unsetenv CLAUDE_CODE_OAUTH_TOKEN --chdir "$wt")
   [ -d "$dev/.git/hooks" ] && B+=(--ro-bind "$dev/.git/hooks" "$dev/.git/hooks")   # the host's checkpoint runs hooks: none of them may be the worker's
+  settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)   # /etc/resolv.conf points here
@@ -132,7 +234,9 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
     [ -f "$dev/.git/worktrees/$tname/commondir" ] && B+=(--ro-bind "$dev/.git/worktrees/$tname/commondir" "$dev/.git/worktrees/$tname/commondir")
     [ -f "$dev/.git/worktrees/$tname/config.worktree" ] && B+=(--ro-bind "$dev/.git/worktrees/$tname/config.worktree" "$dev/.git/worktrees/$tname/config.worktree")
   done
-  [ -f "$H/.claude/settings.json" ] && B+=(--ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json")   # the hooks (cc-guard: depth inside the wall)
+  # His hooks (cc-guard: depth inside the wall) come through this copy unchanged, with the sealed-session permissions
+  # appended. ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside.
+  settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}"
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
   # CC_LOOP_TRIM crosses like the rest: it is set in front of a dispatch on the HOST, and the loop it steers runs in HERE
@@ -378,7 +482,7 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   rm -f "$own"
   git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
   rm -rf "${dev:?}" "${H:?}/dev/${o:?}" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$H/.cc/state/$o" "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.lock" "$H/.cc/boards/$o.json" \
-         "$H/.cc/members/$h" "$H/.cc/slack/member/$h"; }
+         "$H/.cc/members/$h" "$H/.cc/slack/member/$h" "$H/.cc/sandbox/$h"; }
 selfcheck_member_whitelist(){   # THE ~/.claude.json COPY IS A PRIVACY BOUNDARY, and the first-run flags in it are MINTED, not carried.
   # This case needs to plant things in the SOURCE .claude.json, so it builds its own HOME (as selfcheck_mint does) and
   # never writes the box's. Planted there: an account-shaped mark on every key an owner's file carries account data in,
@@ -556,6 +660,89 @@ EOS
   t 'mint/convert: through all of that, the box'"'"'s real ~/.claude/.credentials.json is untouched' "$real1" "$real0"
   git -C "$fh/dev/proj2" worktree remove --force "$fh/wt2" >/dev/null 2>&1
   rm -rf "${fh:?}"; }
+selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of its own: the box's real settings.json is
+  # neither read nor written by anything here, and the last case hashes it to say so. Every case asserts BOTH sides —
+  # what the boundary contains is silent AND what crosses it still asks — because a baseline that only ever says yes
+  # is the wholesale switch this was not allowed to be.
+  local fh h dev out probe real0 real1 w
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxperm-XXXXXX") || return 1; chmod 700 "$fh"
+  real0=$(md5sum "$H/.claude/settings.json" 2>/dev/null | cut -d' ' -f1); real0="${real0:-absent}"
+  h="_ccsbxp$$"; dev="$fh/dev/$h"; w="_ccsbxpw$$"
+  mkdir -p "$dev/.cc" "$fh/.claude" "$fh/.local/bin" "$fh/bin" "$fh/.npm" "$fh/.cache" "$fh/.cc/boards" "$fh/.cc/members/$h" || return 1
+  : > "$dev/.cc/member-workspace"   # claude is only a bind target in these cases, never run
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$dev" init -q -b main >/dev/null 2>&1
+  jq -n '{claudeAiOauth: {accessToken: "perm-access", expiresAt: 99999999999999}}' > "$fh/.cc/members/$h/credentials.json"
+  # HIS FILE, the fixture: a hook (the box's mechanical gates), a deny, an ask and an allow of his own. None of it is
+  # this program's to change, and each is asserted back below in the position he put it in. `Bash(curl *)` is in the
+  # allow list because it is in HIS: the conflict the "inside is stricter" case turns on only exists if the fixture
+  # has the same one, and a fixture that quietly lacks it proves nothing.
+  jq -n '{theme: "ownr-theme",
+          hooks: {PreToolUse: [{matcher: "Bash", hooks: [{type: "command", command: "$HOME/bin/cc-guard"}]}]},
+          permissions: {allow: ["Bash(hisown *)", "Bash(curl *)"], deny: ["Bash(tmux kill-server:*)"], ask: ["Bash(sudo tee *)"]}}' > "$fh/.claude/settings.json"
+  probe='s=$HOME/.claude/settings.json
+    echo silent=$(jq -r "[(.permissions.allow|index(\"Bash(*)\")!=null),(.permissions.allow|index(\"Write(//**)\")!=null),(.permissions.allow|index(\"mcp__cc-slack__history\")!=null),(.permissions.allow|index(\"mcp__cc-slack__thread\")!=null)]|join(\",\")" $s)
+    echo crosses=$(jq -r "[(.permissions.ask|index(\"Bash(curl:*)\")!=null),(.permissions.ask|index(\"Bash(ssh:*)\")!=null),(.permissions.ask|index(\"Bash(sudo:*)\")!=null),(.permissions.ask|index(\"WebFetch\")!=null)]|join(\",\")" $s)
+    echo impossible=$(jq -r "[(.permissions.ask|index(\"Bash(gh:*)\")==null),(.permissions.ask|index(\"Bash(git push:*)\")==null)]|join(\",\")" $s)
+    echo his=$(jq -r "[.permissions.allow[0],.permissions.deny[0],.permissions.ask[0],.theme,.hooks.PreToolUse[0].hooks[0].command]|join(\"|\")" $s)
+    echo keys=$(jq -r "keys|join(\",\")" $s)
+    echo ro=$( (echo x >> $s) 2>/dev/null && echo writable || echo ro)'
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'baseline: inside a member workspace, what the boundary contains is silent — Bash, Write, and reading its own Slack channel' \
+    "$(g silent)" true,true,true,true
+  t 'baseline: …and what leaves the sealed world still asks — the network clients, WebFetch and sudo' \
+    "$(g crosses)" true,true,true,true
+  # `curl` is in HIS allow list box-wide (and in this fixture's, for that reason), so the copy carries it in BOTH
+  # lists at once and only `ask` outranking `allow` decides it. That is the whole "inside is stricter, not looser"
+  # claim, so the case asserts the conflict is really there — allow AND ask — not just that an ask rule was appended.
+  t 'baseline: a command his own allow list permits is in the copy'"'"'s allow AND its ask — inside is stricter, not looser' \
+    "$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'jq -r "[(.permissions.allow|index(\"Bash(curl *)\")!=null),(.permissions.ask|index(\"Bash(curl:*)\")!=null),(.permissions.allow|index(\"Bash(hisown *)\")!=null)]|join(\",\")" $HOME/.claude/settings.json' 2>/dev/null)" true,true,true
+  t 'baseline: nothing already broken by the boundary is asked about — no gh, no git push, because there is no credential in here to push with' \
+    "$(g impossible)" true,true
+  t 'baseline: his hook, his deny, his ask and his allow come through in his own order, and the rest of his file with them' \
+    "$(g his)/$(g keys)" 'Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard/hooks,permissions,theme'
+  # A SESSION THAT COULD REWRITE ITS OWN settings.json COULD UNREGISTER cc-guard FROM IT: the ro comes from the mount.
+  t 'baseline: the copy is read-only inside — no session grants itself permissions or drops the hook gates' "$(g ro)" ro
+  # ── THE WORKER PATH GETS THE SAME COPY, on its own fixture in the same HOME ────────────────────────────────────
+  mkdir -p "$fh/dev/$w" "$fh/.cc/state/$w/t" "$fh/.cc/worktrees/$w" || return 1
+  git -C "$fh/dev/$w" init -q -b main >/dev/null 2>&1 \
+    && git -C "$fh/dev/$w" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init >/dev/null 2>&1 \
+    && git -C "$fh/dev/$w" worktree add -q -b track/t "$fh/.cc/worktrees/$w/t" >/dev/null 2>&1 || return 1
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" "$w" t -- sh -c "$probe" 2>&1)
+  t 'baseline: a track worktree gets the same copy, read-only, with his own rules kept' \
+    "$(g silent)/$(g crosses)/$(g ro)/$(g his)" 'true,true,true,true/true,true,true,true/ro/Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard'
+  # …and with the sandbox OFF there is no boundary, so there is no baseline either: the command runs untouched and
+  # reads whatever settings.json the host session already had.
+  out=$(env HOME="$fh" CC_WORKER_SANDBOX='' "$SELF" "$w" t -- sh -c 'echo off=$(jq -r "(.permissions.allow|index(\"Bash(*)\"))==null" $HOME/.claude/settings.json)' 2>&1)
+  t 'baseline: with the sandbox off nothing is applied — no boundary, no baseline' "$(g off)" true
+  git -C "$fh/dev/$w" worktree remove --force "$fh/.cc/worktrees/$w/t" >/dev/null 2>&1
+  # ── HIS FILE DOES NOT PARSE. Dropping to the baseline alone would silently drop the box's hook gates with it, so
+  #    his file is bound unchanged — the session sees it byte for byte — and the launch says the baseline was not applied.
+  printf 'not json {' > "$fh/.claude/settings.json"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo raw=$(cat $HOME/.claude/settings.json)' 2>&1)
+  t 'baseline: an unparseable settings.json goes through unchanged, and the launch says the baseline is NOT applied' \
+    "$(g raw)/$(grep -c 'does not parse' <<<"$out")/$(grep -c 'NOT applied' <<<"$out")" 'not json {/1/1'
+  # ── HIS FILE PARSES AND THE MERGE STILL CANNOT RUN — `allow` a string where a list belongs is a jq type error
+  #    mid-stream, and a full disk truncates the same way. If that failure is swallowed the session is ro-bound an
+  #    EMPTY settings.json: no permission rules and NO cc-guard hook, with nothing said. So what this case asserts is
+  #    his hook arriving intact, the file still being his own (allow is still the string he wrote), and both lines
+  #    the launch owes him.
+  jq -n '{hooks: {PreToolUse: [{matcher: "Bash", hooks: [{type: "command", command: "$HOME/bin/cc-guard"}]}]},
+          permissions: {allow: "Bash(x)"}}' > "$fh/.claude/settings.json"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo hook=$(jq -r ".hooks.PreToolUse[0].hooks[0].command // \"GONE\"" $HOME/.claude/settings.json)
+    echo allow=$(jq -r ".permissions.allow|type" $HOME/.claude/settings.json)' 2>&1)
+  t 'baseline: a settings.json the baseline cannot merge into keeps his hook and says so — never an empty file bound in its place' \
+    "$(g hook)/$(g allow)/$(grep -c 'would not merge' <<<"$out")/$(grep -c 'NOT applied' <<<"$out")" '$HOME/bin/cc-guard/string/1/1'
+  # ── …and no settings.json of his at all: NOTHING is bound, because his file is where the hooks live and a
+  #    baseline without them would be a session holding Bash(*) with cc-guard unregistered — more open than
+  #    default, in the function written to make it less (review of #198). It says so, and it does not invent one.
+  rm -f "$fh/.claude/settings.json"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
+  t 'baseline: with no settings.json of his at all, NO baseline is installed and the launch says why' \
+    "[$(g keys)]/$(grep -c 'no ~/.claude/settings.json to build' <<<"$out")/$(grep -c 'NOT applied' <<<"$out")" '[]/1/1'
+  real1=$(md5sum "$H/.claude/settings.json" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
+  t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
+  rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
   local r="_ccsbx$$" dev wt st n=0 bad=0 out want
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
@@ -593,9 +780,9 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
   out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
-  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint
+  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline
   git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$dev" worktree remove --force "$H/.cc/worktrees/$r/u" >/dev/null 2>&1
-  rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")"
+  rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.cc/sandbox/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")"
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
 case "${1:-}" in selfcheck) selfcheck; exit $?;;
   mint) shift; mint "$@"; exit $?;;
