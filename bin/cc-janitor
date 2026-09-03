@@ -14,7 +14,7 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
 PER REPO, NEVER ACROSS THEM — rules 1-4. Those entry points take repo names: a tool that deletes has to be
 pointed, and the timer is pointed by a config line the owner writes. Two passes are box-wide because what they
 sweep is pointed by its own name, not by a repo: rule 5 (a container names itself `ccbox-*`) and rule 6 (a
-fixture names itself `_cctest<pid>`). Both run on every invocation, with an empty CC_JANITOR_REPOS too.
+fixture names itself `_cc<suite><pid>`). Both run on every invocation, with an empty CC_JANITOR_REPOS too.
 
 THE ONE RULE ABOVE THE RULES: delete only what is PROVEN dead. Anything uncertain — a PR that closed without
 merging, a branch nobody opened one for, a window with something running in it, a worktree with uncommitted
@@ -34,10 +34,13 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      0 = off)  →  `docker rm`. Never `rmi`: the image stays. Only ccbox's own containers, by name, never a running
      one. A ccbox mounts one project dir and nothing else, so what a run meant to keep is already outside it;
      after a week the stopped container is a leftover, not a result.
-  6. a selftest fixture — board, lock, worktrees, state, ~/dev clone, scratch dir, deploy-ledger marker, context
-     dir, tmux window, handoff-log lines, all named `_cctest<pid>` by core/tests/selftest.sh — whose <pid> is gone
-     → removed. THE PID IS THE WHOLE TEST: alive means the suite is running and everything it made is its. A suite
-     that died before its own trap left a board whose `waiting` row reached the owner's NEEDS YOU list (2026-09-01).
+  6. a test-suite fixture — board, lock, worktrees, state, ~/dev clone, scratch dir, deploy-ledger marker, context
+     dir, tmux window, handoff-log lines, all named `_cc<suite><pid>` by the suite that made them (`_cctest<pid>` is
+     core/tests/selftest.sh, `_ccsbx<pid>` cc-sandbox's selfchecks) — whose <pid> is gone → removed. THE PID IS THE
+     WHOLE TEST: alive means the suite is running and everything it made is its. A suite that died before its own
+     trap left a board whose `waiting` row reached the owner's NEEDS YOU list (2026-09-01), and a leaked `_ccsbx<pid>`
+     that the board watchdog reported as two worktrees of real work (2026-09-02). A name under the prefix carrying no
+     pid is never touched: the pid is the only proof of death this rule accepts.
 
 LIVENESS IS NOT DECIDED HERE. `cc-reconcile` already owns "what is really alive", and two definitions of that
 would drift into a tool that kills working sessions. This reads its snapshot (~/.cc/state/reconcile.json,
@@ -62,7 +65,8 @@ PRMAX = 200           # one `gh pr list` per repo, capped: a timer job must neve
 TERMINAL = ("merged", "done")
 NEXT = "~next"        # cc-handoff's successor window suffix; `~` is not legal in a repo or track name
 CONTAINER_DAYS = 7    # rule 5: a ccbox-* container stopped longer is a leftover; CC_JANITOR_CONTAINER_DAYS overrides, 0 = off
-FIXTURE = "_cctest"   # rule 6: what core/tests/selftest.sh names everything one run makes — `_cctest<pid>`, pid = the suite
+FIXTURE = "_cc"       # rule 6: the prefix every suite's scratch names share, whichever suite made them…
+SUITE = re.compile(r"_cc[a-z]+(\d+)(?:[/~]|$)")   # …and each carries its run's pid: `_cctest<pid>`, `_ccsbx<pid>/t`
 
 
 def now():
@@ -429,30 +433,39 @@ def sweep_containers(r, days):
 
 
 def fixtures():
-    """{pid: [paths]} of every `_cctest<pid>` thing on this box: the board and its lock, worktrees, state, the ~/dev
-    clone, the run's scratch dir, its entry in the deploy ledger, its context dir — the namespace selftest.sh gives
-    one run (RUN=$$) and its own trap removes, when the run lives to reach the trap."""
+    """{pid: [paths]} of every `_cc<suite><pid>` thing on this box: the board and its lock, worktrees, state, the ~/dev
+    clone, the run's scratch dir, its entry in the deploy ledger, its context dir — the namespace a suite gives one run
+    (RUN=$$) and its own trap removes, when the run lives to reach the trap. The glob is the prefix, so it also reaches
+    names with no pid in them (`_cclive.lock`); the pid below is what decides, and those match nothing and are left."""
     found = {}
     for pat in (f"{BOARDS}/{FIXTURE}*", f"{WTS}/{FIXTURE}*", f"{STATE}/{FIXTURE}*", f"{DEV}/{FIXTURE}*",
                 f"{HOME}/.cc/selftest-[0-9]*", f"{STATE}/land/{FIXTURE}*.applied", f"{HOME}/.claude/projects/{FIXTURE}*"):
         for p in glob.glob(pat):
-            m = re.search(r"(?:_cctest|selftest-)(\d+)", os.path.basename(p))
+            m = re.search(r"(?:_cc[a-z]+|selftest-)(\d+)", os.path.basename(p))
             if m:
                 found.setdefault(int(m.group(1)), []).append(p)
     return found
 
 
 def fixture_pid(name):
-    """The suite pid a fixture's name carries (`_cctest<pid>`, `_cctest<pid>/w1`, `_cctest<pid>/hx~next`), or None."""
-    m = re.match(rf"{FIXTURE}(\d+)(?:[/~]|$)", name)
+    """The suite pid a fixture's name STARTS with (`_cctest<pid>`, `_ccsbx<pid>/t`, `_cctest<pid>/hx~next`), or None."""
+    m = SUITE.match(name)
+    return int(m.group(1)) if m else None
+
+
+def line_pid(line):
+    """…and the one a handoff-ledger line carries anywhere in it, or None. Searched rather than sliced at the first
+    `_cc`: the prefix alone is short enough to hit some other word first and lose the fixture that follows it."""
+    m = SUITE.search(line)
     return int(m.group(1)) if m else None
 
 
 def sweep_fixtures(r):
-    """Rule 6, box-wide: what a selftest run left behind. Every fixture the suite makes carries the suite's pid, and a
-    suite that died mid-run (a kill, a usage limit, a reboot) never reached its own trap: a `_cctest<pid>` board whose
+    """Rule 6, box-wide: what a test run left behind. Every fixture a suite makes carries the run's pid, and a suite
+    that died mid-run (a kill, a usage limit, a restart) never reached its own trap: a `_cctest<pid>` board whose
     `waiting` row read like a real ask and reached the owner's NEEDS YOU list, a phantom repo in the deploy ledger on
-    every catch-up tick, lines in the handoff ledger the Home tab tails (2026-09-01). THE PID IS THE WHOLE TEST: alive →
+    every catch-up tick, lines in the handoff ledger the Home tab tails (2026-09-01), a `_ccsbx<pid>` repo whose two
+    worktrees the board watchdog reported as work no board knew (2026-09-02). THE PID IS THE WHOLE TEST: alive →
     the suite is running and everything it made is its (a reused pid keeps a leftover a while longer, which is the cheap
     direction); gone → removed, and the ledger loses its lines. cc-reconcile's 20-min pass calls `--fixtures` for this
     alone; the weekly run does it with the rest."""
@@ -466,7 +479,7 @@ def sweep_fixtures(r):
     except OSError:
         lines = []
     for ln in lines:
-        pid = fixture_pid(ln[ln.find(FIXTURE):]) if FIXTURE in ln else None
+        pid = line_pid(ln)
         if pid is not None:
             found.setdefault(pid, [])
     dead = sorted(pid for pid in found if not os.path.exists(f"/proc/{pid}"))
@@ -480,7 +493,7 @@ def sweep_fixtures(r):
         for wid, name, wpid in wins:
             if wpid == pid:
                 r.act("selftest", "kill window", f"{name} ({wid})", why, ["tmux", "kill-window", "-t", wid])
-    keep = [ln for ln in lines if not (FIXTURE in ln and fixture_pid(ln[ln.find(FIXTURE):]) in dead)]
+    keep = [ln for ln in lines if line_pid(ln) not in dead]
     if len(keep) < len(lines):
         why = f"{len(lines) - len(keep)} lines of selftest runs that are gone"
         if not r.dry:
@@ -866,6 +879,28 @@ def selfcheck():
         ok("…and a second pass finds nothing and says nothing",
            "selftest fixtures" not in subprocess.run([sys.executable, os.path.realpath(__file__), "--fixtures"], env=env,
                                                      capture_output=True, text=True, timeout=60).stdout)
+
+        # …AND THE PREFIX IS THE NAMESPACE, NOT ONE SUITE'S NAME. cc-sandbox's selfchecks name their scratch
+        # `_ccsbx<pid>` — a ~/dev clone and worktrees, no board at all — and a leaked one reached the board watchdog
+        # as two worktrees of work no board knew (2026-09-02). Its own fixtures, and all three answers: the dead
+        # suite's goes, the live suite's stays, and a name under the prefix carrying NO pid is nobody's run to prove
+        # dead, so it is never touched — the pid is the only evidence this rule accepts.
+        for pid in (deadp, livep):
+            for w_ in ("t", "u"):
+                os.makedirs(f"{th}/.cc/worktrees/_ccsbx{pid}/{w_}", exist_ok=True)
+            os.makedirs(f"{th}/dev/_ccsbx{pid}", exist_ok=True)
+        open(f"{th}/.cc/boards/_cclive.lock", "w").close()
+        rs = subprocess.run([sys.executable, os.path.realpath(__file__), "--fixtures"], env=env,
+                            capture_output=True, text=True, timeout=60)
+        ok("a leaked `_ccsbx<pid>` — cc-sandbox's scratch, with no board of its own — is swept on the same rule as "
+           "`_cctest<pid>`, while the live suite's copy and a prefixed name with no pid in it are left alone",
+           rs.returncode == 0 and not os.path.exists(f"{th}/.cc/worktrees/_ccsbx{deadp}")
+           and not os.path.exists(f"{th}/dev/_ccsbx{deadp}")
+           and os.path.isdir(f"{th}/.cc/worktrees/_ccsbx{livep}/u") and os.path.isdir(f"{th}/dev/_ccsbx{livep}")
+           and os.path.exists(f"{th}/.cc/boards/_cclive.lock"))
+        shutil.rmtree(f"{th}/.cc/worktrees/_ccsbx{livep}", ignore_errors=True)
+        shutil.rmtree(f"{th}/dev/_ccsbx{livep}", ignore_errors=True)
+        os.remove(f"{th}/.cc/boards/_cclive.lock")
 
         for proc in (live, bare):                       # the group, so the `sleep` under the live shell goes too
             try:

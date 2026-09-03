@@ -25,13 +25,19 @@ def state(st): return ALIAS.get(st, st)
 # that column). Rows written before this carry no field and read as `track`. `cc <repo> <name> --session` sets it.
 KINDS = ("track", "session")
 def kind(t): return t.get("kind") or "track"
-# A FIXTURE IS NOT A BOARD (owner, 2026-09-01). core/tests/selftest.sh names everything one run makes `_cctest<pid>` —
-# board, lock, worktree, state, tmux windows — and a suite that dies mid-run leaves them behind: one such board's
-# `waiting` row reached the owner's NEEDS YOU list. This is THE place that says what a real board is. A reader of
+# A FIXTURE IS NOT A BOARD (owner, 2026-09-01). A suite names everything one run makes `_cc<suite><pid>` — board, lock,
+# worktree, state, tmux windows — and a suite that dies mid-run leaves them behind: one such board's `waiting` row
+# reached the owner's NEEDS YOU list. core/tests/selftest.sh is `_cctest<pid>`, cc-sandbox's selfchecks `_ccsbx<pid>`,
+# and it was the second of those that the board watchdog reported as two worktrees of real work (2026-09-02) — the
+# prefix is the namespace, not one suite's name. This is THE place that says what a real board is. A reader of
 # ~/.cc/boards either calls `cc-board boards` / `list` (cc-digest, cc ls, cc-audit) or, where it must stay in-process
-# (the Home tab, cc-reconcile, the landing queue), copies this one test and names it. `--all` is how a fixture is seen
-# from outside its run.
-FIXTURE = "_cctest"; _LIN = None
+# (the Home tab, cc-reconcile, the landing queue), copies this one test and names it. Only cc-reconcile's copy carries
+# the prefix so far — the other two still read `_cctest` alone, so a leaked `_ccsbx<pid>` board is a board to them until
+# cc-janitor rule 6 removes it, a tick of the 20-min pass later; widening a paging gate is its own change. `--all` is
+# how a fixture is seen from outside its run.
+FIXTURE = "_cc"                          # every suite's scratch names start here…
+SUITE = re.compile(r"^_cc[a-z]+(\d+)$")  # …and each carries the pid of the run that made it, which is the whole test
+_LIN = None
 def lineage():
     """This process's pid chain to init, from /proc — cached: a tool's ancestry does not move while it runs."""
     global _LIN
@@ -44,10 +50,15 @@ def lineage():
             except (OSError, StopIteration, ValueError): break
     return _LIN
 def real(name):
-    """A `_cctest<pid>` board is a board only INSIDE the run that made it — to a process under <pid>, so the suite's own
-    `cc ls` / `cc digest` see their track — and nowhere else: no timer, Home tab or landing queue descends from a suite."""
+    """A `_cc<suite><pid>` board is a board only INSIDE the run that made it — to a process under <pid>, so the suite's own
+    `cc ls` / `cc digest` see their track — and nowhere else: no timer, Home tab or landing queue descends from a suite.
+    A name under the prefix carrying no pid is nobody's run either, so it is scaffolding too; a real repo that merely
+    CONTAINS the word (myrepo_cctesting) does not start with it and is never touched by this."""
     n = os.path.basename(name).split(".", 1)[0]
-    return not n.startswith(FIXTURE) or (n[len(FIXTURE):].isdigit() and int(n[len(FIXTURE):]) in lineage())
+    if not n.startswith(FIXTURE):
+        return True
+    m = SUITE.match(n)
+    return bool(m) and int(m.group(1)) in lineage()
 def boards(all_=False):
     """Board names in BOARDS, sorted — the real ones, or every one with all_."""
     if not os.path.isdir(BOARDS): return []
@@ -432,6 +443,23 @@ def selfcheck():
         lo, bo = run("list").stdout, run("boards").stdout.split()
         ok("…while the run that made a fixture — any process under its <pid> — sees it as a board without --all",
            f"{own}\tw1\trunning" in lo and "_cctest99999999" not in lo and bo == [own, "r"])
+        os.remove(f"{th}/.cc/boards/_cctest99999999.json"); os.remove(f"{th}/.cc/boards/{own}.json")
+        # THE PREFIX IS THE NAMESPACE, NOT ONE SUITE'S NAME: cc-sandbox's selfchecks name their scratch `_ccsbx<pid>`,
+        # and a leaked one was read as a real repo whose worktrees no board knew (2026-09-02). Its own fixtures, both
+        # sides: the dead suite's board is hidden, this run's is not, and a repo that merely contains the word is real.
+        json.dump({"repo": "_ccsbx99999999", "tracks": {"t": {"status": "running", "title": "leak", "updated": now()}}},
+                  open(f"{th}/.cc/boards/_ccsbx99999999.json", "w"))
+        json.dump({"repo": "myrepo_cctesting", "tracks": {"t": {"status": "running", "title": "real", "updated": now()}}},
+                  open(f"{th}/.cc/boards/myrepo_cctesting.json", "w"))
+        mine = f"_ccsbx{os.getpid()}"
+        json.dump({"repo": mine, "tracks": {"t": {"status": "running", "title": "ours", "updated": now()}}},
+                  open(f"{th}/.cc/boards/{mine}.json", "w"))
+        bs, ba = run("boards").stdout.split(), run("boards", "--all").stdout.split()
+        ok("a leaked `_ccsbx<pid>` board is a fixture on the same rule as `_cctest<pid>` — the suite is gone, so it is "
+           "scaffolding — while this run's own is a board, and a real repo that merely CONTAINS the word always was",
+           bs == [mine, "myrepo_cctesting", "r"] and "_ccsbx99999999" in ba)
+        for b in ("_ccsbx99999999", "myrepo_cctesting", mine):
+            os.remove(f"{th}/.cc/boards/{b}.json")
         # A FAILED RENAME LEAVES THE PREVIOUS BOARD (review-156d). The in-place fallback exists for the bind-mounted board
         # inside a member boundary — rename over a mount point is EBUSY — and for nothing else: a full or read-only disk used
         # to truncate the live board to zero bytes on the way to failing. os.replace is stood in for; the board dir is this

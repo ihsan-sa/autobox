@@ -21,6 +21,17 @@ PR closed without merging, a worktree gone, work that never committed — and is
 This tool only ever writes a track's status (through cc-board, so the lock is respected) and a note saying it
 did. It deletes nothing, opens nothing, merges nothing.
 
+A FINISHED ROW IS NEITHER KIND — it is not drift at all, and that is what kept being missed. `merged` and `done`
+mean the work landed: cc-land deleted the branch on merge, so a gone branch, a gone worktree and a leftover
+`.cc/push.err` are the shape of success, and none of the three is raised about such a row on suspicion alone. It
+went out as "<repo>/land-queue-retry — its branch is not pushed" about a PR that had MERGED, and 88 of that
+board's 98 rows are in that state. A row that is genuinely unpushed and NOT merged still says so.
+
+WHAT A FINISHED ROW IS STILL TOLD — the silence above is for what the box CANNOT TELL, never for what it KNOWS.
+A merged row whose branch really does hold commits origin lacks is still reported, because nothing downstream
+would catch it: committed work is not uncommitted work, so cc-janitor rule 1 reads that worktree as clean and
+removes it, branch and all. Forgiving a fact is how work gets deleted; only the doubt is forgiven (review #203).
+
 WHAT COUNTS AS ALIVE — the one fact a file cannot hold, and the one this leans on hardest before demoting
 anything: a `claude` whose cwd is the track's worktree (the Home tab's rule), a `cc-loop <repo> <track>`
 (alive for hours with no claude under it while it waits out a usage limit), or a live pane in the track's
@@ -429,13 +440,32 @@ def decide(f):
             out.append(("info", None, "could not read its PR state"))
     if st == "review" and not has_pr and f.get("has_remote"):
         out.append(("ask", None, "it is waiting on a PR that was never opened"))
-    if not f["wt_exists"] and st not in TERMINAL + QUEUED:
+    # THE THREE RULES BELOW ARE ABOUT A ROW STILL BEING WORKED ON, so they read the word THIS RUN landed on rather
+    # than the one the board still carries: on the very tick a PR merges, the block above has already said `merged`
+    # while `st` says `review`. No record with a status and the board's own word stands — effective()'s rule.
+    word = next((s for _, s, _ in out if s), "") or st
+    finished = word in TERMINAL     # `merged`/`done`: the work landed, and what is left in the worktree is a leftover
+    if not f["wt_exists"] and not finished and word not in QUEUED:
         out.append(("ask", None, "its worktree is gone"))   # a queued track has never been started: it is SUPPOSED to have no worktree
-    if f.get("commit_err"):
+    # …AND A FINISHED ROW'S BRANCH IS SUPPOSED TO BE GONE. cc-land deletes it on merge, so `origin/<branch>` is
+    # absent, branch_unpushed() can only say "cannot tell", and a `.cc/push.err` nothing ever clears turned that
+    # into "<repo>/land-queue-retry — its branch is not pushed" about PR #154, which HAD merged: the branch is gone
+    # because the merge deleted it, which is success, not a fault (owner, 2026-09-02). 88 of this repo's 98 rows are
+    # `merged`, so it fires on any of them a pass reaches. The worktree rule above always said this; these two did
+    # not. Nothing is hidden by the silence: work a merged worktree still holds uncommitted is cc-janitor rule 1's
+    # to find, and rule 1 REPORTS such a worktree rather than removing it.
+    if f.get("commit_err") and not finished:
         out.append(("ask", None, "its last checkpoint would not commit — that work is only in the worktree"))
-    if f.get("push_err") and f.get("unpushed") is not False:
-        # THE MARKER IS NOT THE ANSWER — see branch_unpushed(). `is not False` on purpose: True is "origin really
-        # does not have it" and None is "could not tell", and only a plain "origin has it" silences the finding.
+    if f.get("push_err") and (f.get("unpushed") is True or (f.get("unpushed") is None and not finished)):
+        # THE MARKER IS NOT THE ANSWER — see branch_unpushed(). True is "origin really does not have it", None is
+        # "could not tell", and a plain "origin has it" always silences the finding.
+        # ONLY THE "COULD NOT TELL" HALF IS FORGIVEN A FINISHED ROW, and the halves are NOT interchangeable here.
+        # None is what the incident produced: the merge deleted the branch, so `origin/<branch>` does not resolve
+        # and there is nothing to compare against. True needs that ref to RESOLVE and HEAD to be unreachable from
+        # it — commits origin really lacks — which a merge cannot cause. Silencing True on a merged row would hide
+        # the one case that loses work: committed-but-unpushed is not `dirty`, so cc-janitor rule 1 reads it as
+        # clean, returns `rm`, and `cc rm` runs `git branch -D track/<x>` 48h later with those commits in it. The
+        # comment above is about UNCOMMITTED work, which rule 1 does report; this is the other half (review #203).
         out.append(("ask", None, "its branch is not pushed"))
     return out
 
@@ -533,11 +563,18 @@ def lineage():
     return _LIN
 
 
+SUITE = re.compile(r"^_cc[a-z]+(\d+)$")      # a suite's scratch namespace: `_cc<suite><pid>`, the pid of the run
 def fixture(repo):
-    """A selftest suite's `_cctest<pid>` repo, seen from outside the run that made it. It is a repo — board AND
-    worktree — only to a process under <pid>; to anyone else it is scaffolding, never a finding. cc-board `real` is
-    the rule, copied here rather than called: one file pass, and the selfcheck's HOME is the environment's."""
-    return repo.startswith("_cctest") and not (repo[7:].isdigit() and int(repo[7:]) in lineage())
+    """A test suite's `_cc<suite><pid>` repo, seen from outside the run that made it — selftest.sh's `_cctest<pid>`,
+    cc-sandbox's `_ccsbx<pid>`. It is a repo — board AND worktree — only to a process under <pid>; to anyone else it
+    is scaffolding, never a finding, and the prefix is the namespace rather than one suite's name because a leaked
+    `_ccsbx<pid>` was reported here as two worktrees of real work with no board entry (2026-09-02). cc-board `real`
+    is the rule, copied here rather than called: one file pass, and the selfcheck's HOME is the environment's. The
+    leftovers themselves are cc-janitor rule 6's, which removes them once the pid is gone."""
+    if not repo.startswith("_cc"):
+        return False
+    m = SUITE.match(repo)
+    return not (m and int(m.group(1)) in lineage())
 
 
 def boards():
@@ -776,7 +813,7 @@ def main(argv):
             subprocess.run([f"{BIN}/cc-handoff", "--sweep"], capture_output=True, timeout=60)
         except Exception:                           # hook, which a session that CRASHED no longer has. cc-handoff
             pass                                    # owns what it sweeps and how — this timer only gives it a turn
-        try:                                        # and a selftest run's `_cctest<pid>` leftovers once that pid is gone:
+        try:                                        # and a test run's `_cc<suite><pid>` leftovers once that pid is gone:
             subprocess.run([f"{BIN}/cc-janitor", "--fixtures"], capture_output=True, timeout=60)
         except Exception:                           # a board with a `waiting` row reached the owner as real (2026-09-01).
             pass                                    # cc-janitor owns the sweep (its weekly run does it too); this is a turn
@@ -951,6 +988,31 @@ def selfcheck():
        not unp(push_err=False, unpushed=True))
     ok("…while a branch the box could not judge (never fetched, detached HEAD) keeps the marker's answer, because "
        "silence about a real unpushed branch is the worse of the two", unp(push_err=True, unpushed=None))
+    # A FINISHED ROW IS JUDGED AS FINISHED: cc-land deletes the branch on merge, so `origin/<branch>` is gone,
+    # branch_unpushed() can only say None, and a push.err nothing clears made "its branch is not pushed" a finding
+    # about a PR that HAD merged. Both halves, each on its own fixture — what is silenced, and what still fires.
+    mrg = dict(status="merged", pr="u", pr_state="MERGED", push_err=True, unpushed=None, commit_err=True)
+    ok("a merged row says nothing about its branch, its worktree or its last checkpoint: the merge deleted the "
+       "branch, which is success", decide(F(**mrg)) == [] and decide(F(**dict(mrg, wt_exists=False))) == [])
+    ok("…and `done` is the other finished word, with no PR to re-read and the same silence",
+       decide(F(status="done", push_err=True, unpushed=None, commit_err=True, wt_exists=False)) == [])
+    ok("…while a branch that is genuinely unpushed on a row nobody merged still says so",
+       any("not pushed" in w for _, _, w in decide(F(status="running", live=True, push_err=True, unpushed=True))))
+    # ONLY THE DOUBT IS FORGIVEN, NOT THE FACT. `unpushed=True` means origin/<branch> RESOLVED and HEAD was not
+    # reachable from it — commits origin really lacks, which a merge cannot produce. Silencing that on a merged row
+    # is how the work dies: it is committed, so not `dirty`, so cc-janitor rule 1 calls the worktree clean and
+    # `cc rm`s it — `git branch -D` with the commits inside (review #203). Its own fixture, both words, both halves.
+    for w_ in ("merged", "done"):
+        ok(f"a `{w_}` row whose branch really does hold commits origin lacks is STILL told, though the same row is "
+           "forgiven a branch the box could not judge — a fact is not a doubt",
+           any("not pushed" in w for _, _, w in decide(F(status=w_, push_err=True, unpushed=True)))
+           and not any("not pushed" in w for _, _, w in decide(F(status=w_, push_err=True, unpushed=None))))
+    ok("…and that holds on the tick the PR merges too, when the row still says `review` and this run says `merged`",
+       any("not pushed" in w for _, _, w in
+           decide(F(status="review", pr="u", pr_state="MERGED", push_err=True, unpushed=True))))
+    ok("…and the tick the PR merges is already finished: that run says `merged` and nothing about the branch",
+       decide(F(status="review", pr="u", pr_state="MERGED", push_err=True, unpushed=None))
+       == [("fix", "merged", "its PR merged")])
     ok("review with no PR and a remote → asks", any("never opened" in w for _, _, w in decide(F(status="review"))))
     ok("review with no PR and no remote is silent", decide(F(status="review", has_remote=False)) == [])
     ok("a quiet track says nothing", decide(F(status="review", pr="u", pr_state="OPEN")) == [])
@@ -1338,6 +1400,20 @@ def selfcheck():
         ok("…while a `_cctest<pid>` board whose <pid> is this pass's own ancestor is the suite's own: reconciled and "
            "snapshotted like any board — the suite's `cc ls` and `cc digest` must see their track",
            any(k.startswith(own) for k in snpF))
+        # …AND THE PREFIX IS THE NAMESPACE, NOT ONE SUITE'S NAME. cc-sandbox's selfchecks lay down `_ccsbx<pid>` — a
+        # ~/dev clone and worktrees, no board of its own at all — and a leaked one was reported here as two worktrees
+        # of work no board knew (2026-09-02). Its own fixtures, both halves in the one pass.
+        for w in ("t", "u"):
+            os.makedirs(f"{th}/.cc/worktrees/_ccsbx99999999/{w}", exist_ok=True)
+        os.makedirs(f"{th}/.cc/worktrees/{repo}/stray", exist_ok=True)
+        rS = subprocess.run([sys.executable, os.path.realpath(__file__), "--no-net", "--grace", "0"],
+                            env=env, capture_output=True, text=True, timeout=120)
+        ok("a leaked `_ccsbx<pid>` is a suite's scratch on the same rule as `_cctest<pid>`, so its worktrees raise "
+           "nothing — while one under a REAL repo with no row on its board is still work the board never heard of",
+           "_ccsbx99999999" not in rS.stdout
+           and f"{repo}/stray" in rS.stdout and "a worktree with no board entry" in rS.stdout)
+        shutil.rmtree(f"{th}/.cc/worktrees/{repo}/stray", ignore_errors=True)
+        shutil.rmtree(f"{th}/.cc/worktrees/_ccsbx99999999", ignore_errors=True)
     print(f"cc-reconcile selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 
