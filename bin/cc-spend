@@ -53,6 +53,8 @@ WTS = os.path.join(H, ".cc", "worktrees")
 DEV = os.path.join(H, "dev")
 BOARDS = os.path.join(H, ".cc", "boards")
 STATE = os.path.join(H, ".cc", "state")
+SCRATCH = "cc-land"        # /tmp/cc-land.<step>.<repo>.<pr>.<random> — the throwaway checkout a review or a gate
+SCRATCH_LANE = "landing"   # round runs in; see place(). The lane an older, unparseable one falls back to.
 
 COLS = ["ts", "session", "cwd", "repo", "track", "kind", "model", "in", "out", "cache_read", "cache_write", "est_usd"]
 PCOLS = ["ts", "pid", "ppid", "etime_s", "cwd", "repo", "track", "kind", "model", "session"]
@@ -122,7 +124,14 @@ def usd(model, u, fast=False):
 def place(cwd):
     """(repo, track) for a working directory. ~/.cc/worktrees/<repo>/<track> is a worker; ~/dev/<repo> is that
     repo's planning session; ~/dev/<handle> carrying .cc/member-workspace is a member's own world. The track
-    column holds the track name, or the word that says which of the other two it is."""
+    column holds the track name, or the word that says which of the other two it is.
+
+    A review or a gate round runs in a scratch checkout instead, `/tmp/cc-land.<step>.<repo>.<pr>.<random>` —
+    the name is cc-land head_checkout()'s side of this, and there is nothing else to read, because the directory
+    is gone by the time a tick sees the transcript. The step is the track: `<repo>/review` is the repo's money.
+    A scratch directory whose name predates that contract, or that a rename breaks, still says LANDING rather
+    than nothing — an unattributable quarter of a day's spend reads as a mistake, an unattributable landing
+    does not."""
     cwd = (cwd or "").rstrip("/")
     for base, kind in ((WTS, "worktree"), (DEV, "dev")):
         if cwd == base or cwd.startswith(base + "/"):
@@ -134,6 +143,10 @@ def place(cwd):
             if os.path.exists(os.path.join(DEV, parts[0], ".cc", "member-workspace")):
                 return parts[0], "member"
             return parts[0], "session"
+    for part in cwd.split("/"):                      # the checkout itself, or a gate running one level down in it
+        if part.startswith(SCRATCH):
+            m = re.fullmatch(rf"{SCRATCH}\.([a-z]+)\.(.+)\.[^.]*\.[^.]*", part)
+            return (m.group(2), m.group(1)) if m else ("-", SCRATCH_LANE)
     return "-", "-"
 
 
@@ -664,6 +677,17 @@ def selfcheck():
        and abs(usd("claude-fable-5", {"cache_read_input_tokens": 1_000_000}) - 1.0) < 1e-9)
     ok("an unknown model estimates nothing rather than guessing",
        usd("gpt-nonesuch", {"output_tokens": 10}) is None)
+
+    # ---- the lane a cwd resolves to. Pure: no HOME fixture, nothing on disk is read.
+    ok("a review or gate round in a landing's scratch checkout is charged to the repo it ran for, not to a dash",
+       place("/tmp/cc-land.review.myrepo.7.ab12cd34") == ("myrepo", "review")
+       and place("/tmp/cc-land.gates.myrepo.7.ab12cd34/head") == ("myrepo", "gates")
+       and place("/tmp/cc-land.review.my.dotted.repo.7.ab12cd34") == ("my.dotted.repo", "review"))
+    ok("…a scratch checkout whose name carries no repo still says it was a landing, rather than nothing",
+       place("/tmp/cc-land-ab12cd34") == ("-", "landing")
+       and place("/tmp/cc-land.review.myrepo") == ("-", "landing"))
+    ok("…and a directory that is neither a worktree nor a scratch checkout is still nobody's lane",
+       place(f"{WTS}/r/t1") == ("r", "t1") and place("/tmp/some-probe") == ("-", "-") and place("") == ("-", "-"))
 
     th = tempfile.mkdtemp(prefix="ccspend-sc-")
     try:

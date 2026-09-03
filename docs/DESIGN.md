@@ -9,6 +9,8 @@ Layered: read **1** to get it; go deeper only if you need to.
 4. **Durable artifacts, ephemeral context.** State lives in files (journal, board, git, PRs), not in a context window. Workers are fresh per iteration; long sessions hand off to a journal and restart clean.
 5. **Human gates are permanent and mechanical.** Merge to default branch, spend, external comms, destructive/host ops are blocked by a hook for autonomous and member-facing sessions, and need the owner.
 
+A two-page illustrated version of this file, for someone meeting the box for the first time, is `docs/autobox-overview.tex` (build it with `pdflatex`, twice).
+
 What a session actually *does* with all this between tasks — pick up work, journal, hand off, close an ask — is `docs/WORKING.md`; this file is why the pieces are shaped the way they are.
 
 ## 2. Architecture (one screen)

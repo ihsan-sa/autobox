@@ -882,14 +882,22 @@ class Land:
             self.head = o.strip()
         return self.head
 
-    def head_checkout(self, fetch=True):
+    def head_checkout(self, step, fetch=True):
         """The PR's OWN head, in a worktree the caller throws away. The review and the gates each take their own
         rather than sharing one: a step that only runs because an earlier step left a directory behind is a step
         that cannot be skipped, and --no-review would then take the gates down with it. Each step FETCHES for
-        itself first — that second answer is how a push during the gates is caught. Returns (tmp, tree)."""
+        itself first — that second answer is how a push during the gates is caught. Returns (tmp, tree).
+
+        `step` is what this checkout is for — "review" or "gates" — and it goes in the directory NAME, with the
+        repo and the PR: `cc-land.<step>.<repo>.<pr>.<random>`. That name is a contract with cc-spend, which
+        records everything spent in here against this cwd and has nothing else to read a lane off. A bare
+        `cc-land-XXXXXXXX` resolved to no repo and no track, which is how $270 of reviews and gate rounds came to
+        sit in a lane called `-`. The name and not a marker file inside the directory, because drop_checkout()
+        removes the directory and the transcript keeps the path."""
         if fetch:
             self.fetch_head()
-        tmp = tempfile.mkdtemp(prefix="cc-land-")
+        tag = re.sub(r"[^A-Za-z0-9_-]+", "-", self.repo or "") or "repo"      # no dots: they separate the fields
+        tmp = tempfile.mkdtemp(prefix=f"cc-land.{step}.{tag}.{self.pr or 'base'}.")
         tree = f"{tmp}/head"
         with git_lock(self.root):    # …and .git/worktrees is shared too. The SHA is explicit here, so this lock
                                      # is only about the bookkeeping git writes, and it is held for a second
@@ -980,7 +988,7 @@ class Land:
         stamp = sh([f"{BIN}/cc-limit", "status"], timeout=60)
         if stamp[0] == 0:
             raise Failed(f"no review: {stamp[1].strip()} — the landing waits for the model, or --no-review")
-        tmp, tree = self.head_checkout(fetch=False)      # fetched above, to answer "have we read this head already"
+        tmp, tree = self.head_checkout("review", fetch=False)   # fetched above, to answer "read this head already?"
         try:
             rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root)
             if rc:
@@ -1163,7 +1171,7 @@ class Land:
             done = "" if self.fill_memo else gate_memo(self.repo, self.pr, self.head, tier)
             if done:
                 return f"{done} — the {tier} tier, {why}; run for this sweep by the prepare phase, on {self.head[:12]}"
-            tmp, tree = self.head_checkout(fetch=False)
+            tmp, tree = self.head_checkout("gates", fetch=False)
         asked = tier          # the memo is filed under the tier the SERIAL phase will ask with, which is what
                               # tier_for() says — not under the one the fallback below may round up to
         try:
@@ -2467,8 +2475,13 @@ def cmd_selfcheck():
     add = argv[argv.index("--add-dir") + 1]
     check("everything the reviewer can reach is the throwaway directory this landing made — the diff it reads "
           "and the checkout it reads it against — and that directory is then removed, unmerged code and all",
-          add.startswith(f"{tempfile.gettempdir()}/cc-land-") and f"{add}/pr-7.diff" in argv[2]
+          add.startswith(f"{tempfile.gettempdir()}/cc-land.") and f"{add}/pr-7.diff" in argv[2]
           and f"{add}/head" in argv[2] and ran("git worktree remove", "--force", f"{add}/head"))
+    lanes = sorted(re.sub(r"\.[^.]+$", "", os.path.basename(os.path.dirname(c[-2])))     # …minus mkdtemp's random
+                   for c in calls if c[:3] == ["git", "worktree", "add"])                # tail
+    check("…and each scratch checkout NAMES the repo and the step it was made for, because its cwd is all cc-spend "
+          "has to read a lane off — a bare cc-land-XXXX put $270 of reviews and gate rounds in a lane called `-`",
+          lanes == ["cc-land.gates.myrepo.7", "cc-land.review.myrepo.7"])
     check("the reviewer is opus at high effort, capped in BOTH money and turns from the environment, and cannot "
           "reach the shell, the network or a settings file — it reads the diff and answers, and that is the whole "
           "of what it can do",
@@ -2753,7 +2766,7 @@ def cmd_selfcheck():
     MOVED = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c"
     L = fresh(pr=7)
     world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
-    world[f"{tempfile.gettempdir()}/cc-land-"] = (0, "  ✓ every one\n0 failed\n")   # …at <tmp>/head/core/tests/…
+    world[f"{tempfile.gettempdir()}/cc-land."] = (0, "  ✓ every one\n0 failed\n")   # …at <tmp>/head/core/tests/…
     real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -2847,7 +2860,7 @@ def cmd_selfcheck():
     L = fresh(pr=7)
     world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
     # a gate runs as <tmp>/head/core/tests/check.sh, so the fixture answers on that prefix, not on a fixed path
-    world[f"{tempfile.gettempdir()}/cc-land-"] = (1, "  ✗ the row was wrong\n1 failed\n")
+    world[f"{tempfile.gettempdir()}/cc-land."] = (1, "  ✗ the row was wrong\n1 failed\n")
     real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -3423,7 +3436,7 @@ def cmd_selfcheck():
         # ---- what a queued PR SURVIVES, and what still ends it (2026-09-01). 39 tmux lanes chained on waiter pids
         # had re-implemented this queue because `work` ended a job on two transient failures — a usage limit at the
         # review and a flaked gate — and the lanes' own bug then slept one of them for 24 h.
-        GATE = f"{tempfile.gettempdir()}/cc-land-"      # a gate runs as <tmp>/head/core/tests/check.sh — this prefix
+        GATE = f"{tempfile.gettempdir()}/cc-land."      # a gate runs as <tmp>/head/core/tests/check.sh — this prefix
 
         def landing(**limit):
             """A 👍 on PR #7: the reviewer says LAND, the box sits on main, and `limit` is what differs this time."""
