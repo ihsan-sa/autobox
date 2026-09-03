@@ -24,8 +24,12 @@
 #     It runs claude in a THROWAWAY HOME so <handle> logs in there, then installs what that login produced at
 #     ~/.cc/members/<handle>/credentials.json, mode 600 — the path and shape the boundary reads. `--from <file>` installs a
 #     credential a login made somewhere else. Nothing is invented, copied or forwarded, and the owner's own token never rides
-#     in on the environment. A credential that turns out to be the OWNER'S — his file, his access or refresh token, or a login
-#     signed in as his account — is INSTALLED, and mint SAYS SO in plain words (owner, 2026-09-02: "These are trusted people
+#     in on the environment. IT INSTALLS, OR IT EXITS NON-ZERO SAYING IT DID NOT. Closing claude instead of quitting it
+#     (/exit) no longer takes mint down between the login and the copy: INT, TERM and HUP are caught and what that login
+#     already wrote is installed anyway. Any end that installs nothing NAMES the throwaway home it left and prints the
+#     `--from` line that finishes from it, so nobody logs in twice; the throwaway home is deleted only once the credential
+#     is installed, or when the login produced none. A credential that turns out to be the OWNER'S — his file, his access
+#     or refresh token, or a login signed in as his account — is INSTALLED, and mint SAYS SO in plain words (owner, 2026-09-02: "These are trusted people
 #     just treat minting my account like any other account"). Inside the boundary a member can print whatever is there, so
 #     that person can use the account anywhere: mint his account only for someone trusted with the account itself.
 #   cc-sandbox convert <repo>   ~/dev/<repo>, an ordinary repo already on this box, BECOMES a member workspace: the two
@@ -316,11 +320,29 @@ owners_own(){   # $1 candidate credentials file · $2 the .claude.json that logi
     [ -n "$a" ] && [ "$a" = "$b" ] && { echo "that login signed in as the owner (same email address)"; return 0; }
   fi
   return 1; }
+mint_usable(){   # $1 a credentials file — THE test of "that login produced something installable", and the only one.
+  # mint asked it with jq and the trap that keeps a scratch asked it with -s, so a truncated or wrong-shaped file was
+  # kept and advertised with a --from line that could not work. Two callers, one answer, or they drift again.
+  [ -s "${1:-}" ] && jq -e '.claudeAiOauth.accessToken' "${1:-}" >/dev/null 2>&1; }
+MINT_SCRATCH=""; MINT_HANDLE=""; MINT_DEST=""   # the login's throwaway HOME while nothing has been installed from it yet
+mint_left_behind(){   # THE END THAT IS NOT AN INSTALL — on EXIT, however mint got there. The first real mint (2026-09-02)
+  # ended here without this: claude was closed rather than quit, mint died with it between the login and the copy, and the
+  # scratch holding a valid credential was left with nobody told which one it was. So when a login is still sitting in there
+  # it is KEPT and NAMED, with the line that finishes from it — the owner has already typed that login once. Only a scratch
+  # whose login produced nothing INSTALLABLE is deleted — an unreadable file is nothing to recover, and naming it would
+  # promise a --from that fails.
+  local s="$MINT_SCRATCH"; MINT_SCRATCH=""
+  [ -n "$s" ] || return 0
+  if mint_usable "$s/.claude/.credentials.json"; then
+    echo "cc-sandbox: NOTHING WAS INSTALLED at $MINT_DEST. The login is still in $s — kept, so nobody has to log in twice." >&2
+    echo "  Finish it: cc-sandbox mint $MINT_HANDLE --from $s/.claude/.credentials.json" >&2
+    echo "  Then delete $s — it holds a working credential." >&2
+  else rm -rf "$s"; fi; }
 mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and nothing else. No credential is invented here and
   # none is forwarded: either claude runs in a throwaway HOME so <handle> logs in there, or --from names the file a login
   # somewhere else produced. Both go through owners_own, which now NAMES the owner's own rather than stopping it. Run inside a member's own boundary this
   # writes into that tmpfs HOME and dies with it — ~/.cc/members is not bound in there.
-  local h="${1:-}" src="" cj="" scratch="" dest own why old=""
+  local h="${1:-}" src="" cj="" scratch="" dest own why old="" closed=0
   [ -n "$h" ] && shift
   while [ $# -gt 0 ]; do case "$1" in
     --from) src="${2:-}"; [ -n "$src" ] || { echo "cc-sandbox: --from needs a file" >&2; return 2; }; shift;;
@@ -331,28 +353,39 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
   if [ -z "$src" ]; then
     [ -x "$CLAUDEBIN" ] || { echo "cc-sandbox: no claude at $CLAUDEBIN — there is nothing to log in with" >&2; return 2; }
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/cc-mint-XXXXXX") || return 2; chmod 700 "$scratch"; mkdir -p "$scratch/.claude"
-    echo "cc-sandbox: logging $h in inside a throwaway HOME ($scratch) — nothing of yours is in there, and it is deleted after."
+    MINT_SCRATCH="$scratch"; MINT_HANDLE="$h"; MINT_DEST="$dest"; trap mint_left_behind EXIT   # from here on, no silent end
+    echo "cc-sandbox: logging $h in inside a throwaway HOME ($scratch) — nothing of yours is in there, and it is deleted once the credential is installed."
     echo "  Sign in AS $h, not as yourself; then quit claude (/exit). Whatever that login wrote is what gets installed."
+    # A CLOSE IS NOT A QUIT. Ctrl-C, a shut window or a killed claude signals the whole foreground group, so the same signal
+    # that ends claude ends mint — on 2026-09-02 that happened after a good login and before the copy, and mint installed
+    # nothing without a word. Catch the three that carry, then install what the login already wrote.
+    trap 'closed=1' INT TERM HUP
     # the owner's token must not ride in on the environment either: with one of these set claude never asks who is logging in
     ( cd "$scratch" && env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u CLAUDE_CODE_API_KEY -u CLAUDE_CONFIG_DIR HOME="$scratch" "$CLAUDEBIN" )
+    trap 'exit 2' INT TERM HUP   # past the login, the same signals end mint — through the EXIT trap, which names the scratch
+    [ "$closed" = 1 ] && echo "cc-sandbox: claude was closed rather than quit (/exit) — carrying on with whatever that login wrote." >&2
     src="$scratch/.claude/.credentials.json"; cj="$scratch/.claude.json"
   else cj="$(dirname "$(dirname "$src")")/.claude.json"   # a login writes .claude.json a level above its .claude/: if it is there, WHO logged in is checkable too
   fi
-  if ! { [ -s "$src" ] && jq -e '.claudeAiOauth.accessToken' "$src" >/dev/null 2>&1; }; then
+  if ! mint_usable "$src"; then
     why=missing; [ -e "$src" ] && why="no .claudeAiOauth.accessToken in it"
     echo "cc-sandbox: that login produced no credential ($src: $why) — nothing was written to $dest." >&2
-    [ -n "$scratch" ] && rm -rf "$scratch"; return 2; fi
+    return 2; fi   # the EXIT trap deletes the scratch: there is no credential in it to leave anyone
   if why=$(owners_own "$src" "$cj"); then
     echo "cc-sandbox: this is the OWNER'S OWN credential — $why. Installing it, because that is what you asked for."
     echo "  Once, so it is never a surprise: $h can print this from inside their workspace and use that account anywhere, not just on this box."; fi
   mkdir -p "$H/.cc/members/$h" && chmod 700 "$H/.cc/members/$h" \
-    || { echo "cc-sandbox: could not make $H/.cc/members/$h — nothing was installed" >&2; [ -n "$scratch" ] && rm -rf "$scratch"; return 2; }
+    || { echo "cc-sandbox: could not make $H/.cc/members/$h — nothing was installed" >&2; return 2; }
   [ -e "$dest" ] && old=" (replacing the one there since $(date -r "$dest" +%F 2>/dev/null))"
   own="$dest.tmp.$$"
   # 0600, and the shape `cc-sandbox member` reads: claudeAiOauth whole, refresh token included — the workspace refreshes itself
   if ! ( umask 077; jq '{claudeAiOauth: .claudeAiOauth}' "$src" > "$own" ) || ! chmod 600 "$own" || ! mv "$own" "$dest"; then
-    rm -f "$own"; echo "cc-sandbox: could not write $dest" >&2; [ -n "$scratch" ] && rm -rf "$scratch"; return 2; fi
-  [ -n "$scratch" ] && rm -rf "$scratch"
+    rm -f "$own"; echo "cc-sandbox: could not write $dest — nothing was installed" >&2; return 2; fi
+  # SAY IT INSTALLED ONLY AFTER READING BACK WHAT LANDED: the message below is the owner's only evidence, and the boundary
+  # reads this exact file next. A dest that does not parse is a mint that installed nothing, and says so, non-zero.
+  if ! jq -e '.claudeAiOauth.accessToken' "$dest" >/dev/null 2>&1; then
+    echo "cc-sandbox: $dest is not a credential the boundary can read — nothing was installed" >&2; return 2; fi
+  if [ -n "$scratch" ]; then rm -rf "$scratch"; MINT_SCRATCH=""; trap - EXIT; fi   # installed: now there is nothing to keep
   echo "cc-sandbox: minted $h's credential at $dest, mode 600$old — that is the one file the boundary reads, and the only credential inside it."
   echo "  Start the workspace: cc $h"; }
 convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, or is refused with the reason. The four that
@@ -534,7 +567,7 @@ selfcheck_member_whitelist(){   # THE ~/.claude.json COPY IS A PRIVACY BOUNDARY,
 selfcheck_mint(){   # MINTING AND CONVERTING, IN A HOME OF THEIR OWN. Everything either command reads or writes hangs off $fh —
   # its own owner credential, its own ~/dev, its own ~/.cc — so the box's real ~/.claude is not something these cases have to
   # avoid touching: it is not reachable from them, and the hash at the end says so out loud.
-  local fh real0 real1 dest d1 out rc r1 r2 sd o1 o2 cb doc
+  local fh real0 real1 dest d1 out rc r1 r2 sd sc x o1 o2 cb doc
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxmint-XXXXXX") || return 1
   real0=$(md5sum "$H/.claude/.credentials.json" 2>/dev/null | cut -d' ' -f1); real0="${real0:-absent}"
   mkdir -p "$fh/.claude" "$fh/dev" "$fh/.local/bin" "$fh/.cc" || return 1
@@ -549,7 +582,21 @@ jq -n --arg a "$LOGIN_ACCESS" --arg r "$LOGIN_REFRESH" '{claudeAiOauth: {accessT
 [ -n "${LOGIN_UUID:-}" ] && jq -n --arg u "$LOGIN_UUID" --arg e "$LOGIN_EMAIL" '{oauthAccount: {accountUuid: $u, emailAddress: $e}}' > "$HOME/.claude.json"
 exit 0
 EOS
-  printf '#!/bin/sh\nexit 0\n' > "$fh/login-empty"; chmod +x "$fh/login" "$fh/login-empty"
+  printf '#!/bin/sh\nexit 0\n' > "$fh/login-empty"
+  # …and a login that leaves a NON-EMPTY file that is not a credential: killed mid-write, or a different auth shape.
+  printf '#!/bin/sh\nmkdir -p "$HOME/.claude"\nprintf %%s "{\\"claudeAiOauth\\": {" > "$HOME/.claude/.credentials.json"\nexit 0\n' > "$fh/login-junk"
+  chmod +x "$fh/login" "$fh/login-empty" "$fh/login-junk"
+  # a login CLOSED rather than quit: it signals its whole process group, the way Ctrl-C or a shut window does. One writes its
+  # credential first, one is closed before signing in at all. The cases that use them run mint under `setsid --wait`, so that
+  # signal reaches mint's process group and stops there instead of arriving in this selfcheck's.
+  cat > "$fh/login-closed" <<'EOS'
+#!/bin/sh
+mkdir -p "$HOME/.claude"
+jq -n --arg a "$LOGIN_ACCESS" --arg r "$LOGIN_REFRESH" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$HOME/.claude/.credentials.json"
+kill -INT 0
+exit 130
+EOS
+  printf '#!/bin/sh\nkill -INT 0\nexit 130\n' > "$fh/login-closed-empty"; chmod +x "$fh/login-closed" "$fh/login-closed-empty"
   # ── convert: an ordinary repo already on the box becomes the same workspace the join flow makes ────────────────────
   mkdir -p "$fh/dev/alice"; echo hi > "$fh/dev/alice/README.md"
   out=$(HOME="$fh" "$SELF" convert alice 2>&1); rc=$?
@@ -648,6 +695,39 @@ EOS
   d1=$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)
   out=$(env HOME="$fh" CC_CLAUDE="$fh/login-empty" "$SELF" mint alice 2>&1); rc=$?
   t 'mint: a login that produced no credential installs nothing' "$rc/$(grep -c 'produced no credential' <<<"$out")/$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)" "2/1/$d1"
+  # ── MINT CANNOT END QUIETLY ────────────────────────────────────────────────────────────────────────────────────────
+  # 2026-09-02, the first real mint: the login worked, claude was CLOSED rather than quit (/exit), the signal that ended it
+  # ended mint too before the copy, and the scratch holding that credential was left behind with nothing said. Three cases,
+  # a workspace of its own each, so none of them reads state another left: closed with a credential (installs), closed
+  # without one (nothing to recover), and an install that cannot happen (the scratch is kept and named).
+  for x in carol dora erin; do mkdir -p "$fh/dev/$x"; HOME="$fh" "$SELF" convert "$x" >/dev/null 2>&1; done
+  out=$(setsid --wait env HOME="$fh" CC_CLAUDE="$fh/login-closed" LOGIN_ACCESS=carol-access LOGIN_REFRESH=carol-refresh "$SELF" mint carol 2>&1); rc=$?
+  sd=$(sed -n 's/.*throwaway HOME (\([^)]*\)).*/\1/p' <<<"$out" | head -1)
+  t 'mint: claude closed rather than quit still installs what that login wrote, says so, and exits 0' \
+    "$rc/$(jq -r '.claudeAiOauth.accessToken' "$fh/.cc/members/carol/credentials.json" 2>/dev/null)/$(grep -c 'closed rather than quit' <<<"$out")/$([ -n "$sd" ] && [ -e "$sd" ] && echo left || echo gone)" 0/carol-access/1/gone
+  out=$(setsid --wait env HOME="$fh" CC_CLAUDE="$fh/login-closed-empty" "$SELF" mint dora 2>&1); rc=$?
+  sd=$(sed -n 's/.*throwaway HOME (\([^)]*\)).*/\1/p' <<<"$out" | head -1)
+  t 'mint: closed BEFORE the login wrote anything installs nothing, exits non-zero, and leaves no scratch — there is none to recover' \
+    "$rc/$(grep -c 'produced no credential' <<<"$out")/$([ -e "$fh/.cc/members/dora/credentials.json" ] && echo file || echo none)/$([ -n "$sd" ] && [ -e "$sd" ] && echo left || echo gone)" 2/1/none/gone
+  : > "$fh/.cc/members/erin"   # a FILE where that workspace's credential directory has to go: the install cannot happen
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=erin-access LOGIN_REFRESH=erin-refresh "$SELF" mint erin 2>&1); rc=$?
+  sc=$(sed -n 's/.*login is still in \([^ ]*\) — kept.*/\1/p' <<<"$out" | head -1)
+  t 'mint: an install that cannot happen exits non-zero, says nothing was installed, and KEEPS the login it already has' \
+    "$rc/$(grep -c 'NOTHING WAS INSTALLED' <<<"$out")/$([ -n "$sc" ] && [ -s "$sc/.claude/.credentials.json" ] && echo kept || echo lost)" 2/1/kept
+  t 'mint: …and names the one command that finishes from there, so nobody logs in twice' \
+    "$(grep -cF "cc-sandbox mint erin --from $sc/.claude/.credentials.json" <<<"$out")" 1
+  rm -f "$fh/.cc/members/erin"
+  out=$(env HOME="$fh" "$SELF" mint erin --from "$sc/.claude/.credentials.json" 2>&1); rc=$?
+  t 'mint: …and that command really does install it, out of the scratch the failed mint named' \
+    "$rc/$(jq -r '.claudeAiOauth.accessToken' "$fh/.cc/members/erin/credentials.json" 2>/dev/null)" 0/erin-access
+  [ -n "$sc" ] && rm -rf "$sc"
+  # A SCRATCH IS ONLY WORTH KEEPING IF WHAT IS IN IT CAN FINISH THE JOB (review of PR #208). The keep-and-name
+  # branch used to ask only whether the file was non-empty, while mint itself asked whether it PARSED — so a login
+  # killed mid-write left a scratch that was kept, named, and advertised with a --from line that fails the same way.
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login-junk" "$SELF" mint erin 2>&1); rc=$?
+  x=$(sed -n 's/.*login is still in \([^ ]*\) — kept.*/\1/p' <<<"$out" | head -1)
+  t 'mint: a login that wrote something unreadable installs nothing, keeps no scratch, and promises no --from' \
+    "$rc/$(grep -c 'produced no credential' <<<"$out")/$(grep -c 'NOTHING WAS INSTALLED' <<<"$out")/${x:-none}" 2/1/0/none
   mkdir -p "$fh/dev/bob"
   out=$(env HOME="$fh" "$SELF" mint bob 2>&1); rc=$?
   t 'mint: a repo that is not a member workspace is refused, and told what makes it one' \
