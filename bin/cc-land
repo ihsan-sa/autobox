@@ -14,7 +14,8 @@
                                                   apart): the sweep that keeps a job arms its own next run. A
                                                   LAND-AFTER-FIX sends ONE fix iteration and waits for that branch to
                                                   push; a second stop, a DO-NOT-LAND, an unmergeable PR or a
-                                                  review that ran out of its own cap ends it
+                                                  review that ran out of its own cap ends it. A PR that merged
+                                                  while its review ran gets no round at all — it is deployed
   cc-land selfcheck                               the decision table; no network, no systemctl
 
 Landing a change used to be nine separate things to remember — gates, merge, the #approvals card, the mark on
@@ -41,6 +42,12 @@ WHAT IT WILL NOT DO, and why each line is here:
     the change neither its routine review nor its repair round, and that head is refused until the cap that
     STOPPED it is raised — more of the other one buys the identical stop. PR #194 — 575 added lines, $3, 35
     turns, no diff read — was reported as an ordinary stop, counted as that change's second, and dropped.
+  · It never spends on a PR that is already in. `gh pr view` is asked ONCE, before anything runs, and the gates
+    after it take up to an hour — so the state that refuses a merged PR is re-read where the money goes: before
+    the review, and again before a repair round is dispatched. PR #193 merged at 23:12Z between its own 22:58
+    review and the round that verdict dispatched at 23:14 — 37 minutes and $7.87 on a fix that could never land,
+    and the branch the merge had deleted pushed back onto origin by the worker. A merge found at either point
+    dispatches nothing; the job goes back on the queue and the next run deploys it.
   · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
     afterwards — not against the default branch, which does not contain the change, so gating it there would
     be a green light for code nobody ran. A red gate or a conflicting PR stops everything before the merge.
@@ -909,7 +916,9 @@ class Land:
             raise Skip("no PR — the review reads a diff, and this path has none")
         if not self.want_review:
             raise Skip("--no-review: nothing read this diff before it merged")
-        if self.facts.get("state") == "MERGED":
+        if self.merged_since():
+            # ASKED AGAIN here, not read off load()'s answer: the gates run before this step and take up to an
+            # hour, and this is where the money goes. A merged PR is refused for nothing either way.
             raise Skip(f"PR #{self.pr} is already merged — the review guards the merge, and it has happened")
         tpl = f"{os.path.dirname(BIN)}/{REVIEW_PROMPT}"
         try:
@@ -1250,6 +1259,24 @@ class Land:
             return rc == 0 and json.loads(o).get("state") == "MERGED"
         except ValueError:
             return False
+
+    def merged_since(self):
+        """Has the PR merged since `load()` read its state? load() asks GitHub ONCE, before anything runs, and the
+        gates after it take up to an hour — so every step that trusts that one read is trusting an answer that old.
+        Asking again is one `gh pr view`, so it is asked exactly where the next thing costs money or dispatches a
+        worker: before the review, and before a repair round. The fresh answer is recorded on self.facts, so the
+        steps after this one read the same world this did instead of the stale one.
+
+        A gh that cannot answer is NOT a merge (merged_now returns False on any doubt): an unreachable remote then
+        leaves the landing exactly where it stood before this existed, rather than suppressing a repair round the
+        PR is owed. Guessing the other way would turn every GitHub hiccup into a change that quietly never gets
+        its fix."""
+        if not self.pr or self.facts.get("state") == "MERGED":
+            return self.facts.get("state") == "MERGED"
+        if not self.merged_now():
+            return False
+        self.facts["state"] = "MERGED"
+        return True
 
     def merge(self):
         """The one place on this box that merges, and it runs AFTER the gates. --subject is the PR title: gh's own
@@ -1865,21 +1892,35 @@ def fix_progress(path, job):
     PR only once the track has actually stopped; until then the job waits, and prepare() is gated the same way so
     no review is bought on an intermediate checkpoint. A fix that never pushes is not waited on for ever either:
     past its deadline the job goes back to the ordinary path, where the verdict already on the PR stops it and
-    the owner is told, once.
+    the owner is told, once. And a PR that MERGES under the round is not waited on at all — the push this would
+    otherwise sit here for is the deleted branch coming back.
 
     Returns a line to stand down with, or "" to run the job now."""
     fix = job.get("fix") or {}
     repo, pr = job.get("repo") or "", job.get("pr")
-    head, branch = "", ""
-    rc, o = sh(["gh", "pr", "view", str(pr), "--json", "headRefOid,headRefName"],
+    head, branch, state = "", "", ""
+    rc, o = sh(["gh", "pr", "view", str(pr), "--json", "headRefOid,headRefName,state"],
                cwd=repo_root(repo), timeout=120)
     if rc == 0:
         try:
             facts = json.loads(o) or {}
             head = (facts.get("headRefOid") or "").strip()
             branch = (facts.get("headRefName") or "").strip()
+            state = (facts.get("state") or "").strip()
         except ValueError:
-            head, branch = "", ""
+            head, branch, state = "", "", ""
+    if state == "MERGED":
+        # "no worker re-creates a branch a merge deleted" — and the push this was waiting for IS that branch coming
+        # back. A round dispatched at an open PR whose merge lands under it has nothing left to fix, so the wait
+        # ends here rather than at the 90-minute deadline: the job goes back to the ordinary path, which reads the
+        # merge and deploys it. Stopping the worker mid-round is not this tool's to do — it can only stop treating
+        # a resurrected branch as the progress it is waiting for, and say so.
+        job.update(fix=dict(fix, over="merged"), attempts=0, stage="queued")
+        job.pop("not_before", None)
+        write_atomic(path, job)
+        ledger(f"fix-merged {repo}#{pr} track={fix.get('track')} — merged while the round ran; not waiting for "
+               f"its push")
+        return ""
     head = remote_head(repo, branch) or head    # the REMOTE's own ref is the head; the PR object is only the fallback
     if head and head != fix.get("head"):
         late = stamp() >= (fix.get("deadline") or "")     # the deadline bounds EVERY wait here, whatever the track looks like
@@ -1943,6 +1984,22 @@ def run_job(path, job):
         # bought another round and another review, and another — seven on PR #171 in one night. The root tally
         # outlives the job, so the second stop falls straight through to the owner however it arrives — as does
         # every DO-NOT-LAND, which says the change should not exist and has no remedy to dispatch.
+        if L.merged_since():
+            # "a fix round is not dispatched at a PR that merged while its review ran". The review refused a merged
+            # PR on the state load() read before the gates; this asks GitHub again, at the line the money leaves.
+            # PR #193 merged at 23:12Z between its 22:58 review and the round dispatched at 23:14 — 37 minutes and
+            # $7.87 on a fix that could never land, and the remote branch the merge had deleted pushed back by the
+            # worker. Merged is not a verdict to act on: the job goes back on the queue instead, and the next run
+            # reads the fresh state, skips the gates, the review and the merge as already-merged, and deploys it.
+            # That is what this job did on its own an hour later — now it does it at once, and buys nothing.
+            job.update(attempts=job["attempts"] - 1,   # uncounted, like the deferral above: nothing was decided
+                       stage="queued", last=f"review: {L.verdict}, but PR #{pr} merged first"[:400])
+            job.pop("not_before", None)
+            write_atomic(path, job)
+            ledger(f"fix-merged {repo}#{pr} verdict={L.verdict} head={(L.reviewed or '')[:12]} — merged while the "
+                   f"review ran; no round dispatched")
+            return (f"[{repo}] PR #{pr}: {L.verdict}, but it merged while the review ran — no fix round "
+                    f"dispatched; the landing runs again to deploy it")
         line = dispatch_fix(path, job, L)
         if line:
             return line
@@ -2459,6 +2516,28 @@ def cmd_selfcheck():
     check("--re-review is the one way to ask again, and it costs again: the model runs and the new answer is "
           "posted rather than hidden under the old comment",
           [c for c in calls if c[0] == CLAUDE] and len(commented()) == 1)
+
+    # A merge that lands during the GATES — the slow half, up to an hour between the one `gh pr view` load() makes
+    # and this step. Read off that one answer, a PR already on the default branch buys a review of itself.
+    def merged_midgates(**world_kw):
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        world[f"{BIN}/cc-scope list"] = (0, "[]")
+        world.update(world_kw)
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()) as e:
+            return L.run(), o.getvalue() + e.getvalue()
+    rc, said = merged_midgates(**{"gh pr view 7 --json state,mergedAt":
+                                  (0, json.dumps({"state": "MERGED", "mergedAt": "2026-09-01T23:12:00Z"}))})
+    check("a PR that merged while the GATES ran buys no review: the state is asked again at the step that spends "
+          "rather than read off the answer load() got before them, and the landing carries on as the "
+          "already-merged one it now is",
+          rc != 1 and not [c for c in calls if c[0] == CLAUDE] and "already merged" in said
+          and not ran("gh pr merge"))
+    rc, said = merged_midgates()
+    check("...and the control on that same fixture — nothing merged under it — is read and paid for as ever: it is "
+          "the merge that stops the review, not the asking",
+          rc == 0 and len([c for c in calls if c[0] == CLAUDE]) == 1 and ran("gh pr merge"))
 
     rc, said = reviewed("DO-NOT-LAND", "a.py:1", "everything", "start again", review=False)
     check("--no-review skips it: no model is asked, nothing is posted, and the landing says nobody read it",
@@ -3595,6 +3674,97 @@ def cmd_selfcheck():
               len(one) == 1 and spent_now.get("repairs") == 1 and not ran_sub("cc", "myrepo", "w1", "--go")
               and not os.path.exists(job_path("myrepo", 7)) and "NOT merged" in told()
               and "AFTER 1 automatic fix iteration on this change" in told() and len(ran("cc-notify")) == 1)
+
+        # (5) …and NONE of that at a PR that merged while its review ran. load() reads the state once, before the
+        # gates, and the gates take up to an hour: PR #193 was OPEN when it was read at 22:58, merged at 23:12, and
+        # the round its verdict dispatched at 23:14 ran 37 minutes, spent $7.87 on a fix that could never land, and
+        # pushed back the branch the merge had deleted. Both halves are asserted on the same fixture — the merged
+        # answer is the ONLY thing that differs between them.
+        def MERGES_MIDWAY(argv):
+            """OPEN while the review is being bought, MERGED once the reviewer has answered — one stub, two
+            answers, because the window the defect lives in is exactly the minutes between those two asks. A stub
+            that said MERGED to both would be caught by the review's own guard and prove nothing about the
+            dispatch two steps later."""
+            gone_in = any(c[0] == CLAUDE for c in calls)
+            return (0, json.dumps({"state": "MERGED" if gone_in else "OPEN",
+                                   "mergedAt": "2026-09-01T23:12:00Z" if gone_in else None}))
+        shutil.rmtree(stdir, ignore_errors=True)      # this case's own state dir: a brief an earlier case wrote
+        os.makedirs(stdir, exist_ok=True)             # would answer "was one written here" for it
+        landing(**dict(AFTERFIX, **{"gh pr view 7 --json state,mergedAt": MERGES_MIDWAY}))
+        quiet(cmd_work, [])
+        gone = read_json(job_path("myrepo", 7)) or {}
+        check("a LAND-AFTER-FIX at a PR that merged while the review ran dispatches NO fix round: the state the "
+              "review refused on was read before the gates, so it is asked again where the money leaves — no "
+              "worker, no brief, no repair counted, and the branch the merge deleted stays deleted",
+              not ran_sub("cc", "myrepo", "w1", "--go") and not os.path.exists(f"{stdir}/review-7.md")
+              and root_work("myrepo", 7).get("repairs", 0) == 0
+              and "fix-merged myrepo#7" in open(f"{LANDQ}/queue.log").read())
+        check("...and the job is KEPT rather than failed, uncounted, with no wait on it: the PR is in, so the work "
+              "left is the deploy, and the sweep arms itself for it in seconds — a counted try would have made "
+              "next_wake read this as a flake and sit on the deploy for the 15-minute retry gap",
+              gone.get("stage") == "queued" and gone.get("attempts") == 0 and "fix" not in gone
+              and "not_before" not in gone and not gh_merges()
+              and armed() and int(armed()[-1].split("=")[1]) <= 60)
+        calls.clear()
+        world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))   # the next sweep reads what happened
+        quiet(cmd_work, [])
+        check("...and that sweep converges instead of looping: the PR now reads MERGED, so the gates, the review "
+              "and the merge are each already done, nothing is bought, and the owner is never told a PR that is in "
+              "did NOT merge — the recovery this job used to reach an hour later, at once",
+              not os.path.exists(job_path("myrepo", 7)) and not gh_merges()
+              and not [c for c in calls if c[0] == CLAUDE] and "NOT merged" not in told())
+        shutil.rmtree(stdir, ignore_errors=True)
+        os.makedirs(stdir, exist_ok=True)
+        landing(**AFTERFIX)                           # the control: the identical run, the PR still OPEN
+        quiet(cmd_work, [])
+        check("...while the same verdict on the same fixture with the PR still OPEN dispatches as it always did — "
+              "what suppressed the round was the merge and nothing else",
+              len(ran_sub("cc", "myrepo", "w1", "--go")) == 1 and os.path.exists(f"{stdir}/review-7.md")
+              and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing")
+
+        # …and a round already in flight when the merge lands. The push this job waits for IS the deleted branch
+        # coming back, so a merge stops the wait rather than being waited out to the 90-minute deadline.
+        calls.clear()
+        world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": HEAD, "headRefName": "track/w1",
+                                                                  "state": "MERGED"}))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")   # the worker is still going
+        n_merged = open(f"{LANDQ}/queue.log").read().count("fix-merged myrepo#7")
+        quiet(cmd_work, [])
+        check("a PR that merges UNDER a dispatched round is not waited on: the head has not moved, the track is "
+              "still running and the deadline is an hour off, and the job still stops waiting — what it was "
+              "waiting for is the worker pushing the branch the merge deleted",
+              open(f"{LANDQ}/queue.log").read().count("fix-merged myrepo#7") == n_merged + 1
+              and not os.path.exists(job_path("myrepo", 7))
+              and not [c for c in calls if c[0] == CLAUDE] and not gh_merges())
+        shutil.rmtree(stdir, ignore_errors=True)
+        os.makedirs(stdir, exist_ok=True)
+        landing(**AFTERFIX)
+        quiet(cmd_work, [])
+        calls.clear()
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": HEAD, "headRefName": "track/w1",
+                                                                  "state": "OPEN"}))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")
+        n_merged = open(f"{LANDQ}/queue.log").read().count("fix-merged myrepo#7")
+        quiet(cmd_work, [])
+        check("...and the control: the same round, the same unmoved head, the PR still OPEN — the job waits on it, "
+              "as it must, and the merged case above is not just 'the wait ended'",
+              open(f"{LANDQ}/queue.log").read().count("fix-merged myrepo#7") == n_merged
+              and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing")
+        os.unlink(job_path("myrepo", 7))              # the control's job: this last case builds its own
+        shutil.rmtree(stdir, ignore_errors=True)
+        os.makedirs(stdir, exist_ok=True)
+        landing(**dict(AFTERFIX, **{"gh pr view 7 --json state,mergedAt":
+                                    (1, "could not resolve host: github.com\n")}))
+        n_merged = open(f"{LANDQ}/queue.log").read().count("fix-merged myrepo#7")
+        quiet(cmd_work, [])
+        check("...and a GitHub that cannot answer is never read AS a merge: the round still goes out. Guessing the "
+              "other way turns every hiccup at the remote into a change that quietly never gets its fix, and the "
+              "landing is left exactly where it stood before this question was asked at all",
+              len(ran_sub("cc", "myrepo", "w1", "--go")) == 1
+              and open(f"{LANDQ}/queue.log").read().count("fix-merged myrepo#7") == n_merged
+              and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing")
+        os.unlink(job_path("myrepo", 7))              # kept, correctly: drained by hand for the cases below
 
         landing(**{f"{CLAUDE} -p": (0, REVIEWED("DO-NOT-LAND", "a.py:9", "it deletes the queue", "drop it"))})
         quiet(cmd_work, [])
