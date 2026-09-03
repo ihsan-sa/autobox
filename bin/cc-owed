@@ -6,7 +6,13 @@
   cc-owed --check                  stdin = a Stop hook payload -> the Stop decision that says it, else nothing
                                    --with '<json>' carries another hook's decision through, ours first
   cc-owed --ledger [--json]        the durable record: one countable line per debt ever said
-  cc-owed selfcheck                fixtures for the scan, the two debts, the cancels and the once-only rule
+  cc-owed --answered               stdin = "<chat> <thread_ts> [<since ISO>]" a line -> ONE JSON object a line,
+                                   in that order: {chat, root, since, n, first, chat_unknown, unseen} — did
+                                   WE say anything in that thread since then, and an n=0 carrying chat_unknown (the
+                                   channel reference did not resolve) or unseen (the span asked about is older than
+                                   the tail of our own log) is "cannot tell", not "nobody answered".
+                                   cc-secretary's asks rubric reads it; see THE ONE THREAD READ below
+  cc-owed selfcheck                fixtures for the scan, the three debts, the cancels and the once-only rule
 
 WHY A HOOK AND NOT A RULE. The owner, 2026-08-31: "you sometimes forget to respond in slack or miss
 messages... not labelling questions. this could be a symptom of a too complex system". The only thing
@@ -14,13 +20,39 @@ tracking what a session still owed was the session, and something that forgets c
 forgot. So the box measures it where it already measures how full a context is — the Stop hook, after
 every turn — and says it once. Not a line in a prompt: more rules are the thing being objected to.
 
-TWO DEBTS, both read off the session's OWN transcript (the Stop payload's `transcript_path` is the handle):
+THREE DEBTS. The first two are read off the session's OWN transcript (the Stop payload's `transcript_path` is
+the handle); the third is read off the board and the outbox:
   a word    someone wrote to this session and the turn is ending with nothing said in that thread. What
             happens today instead: five idle minutes later cc-slack posts a 👍 for it ("handled"), which
             is true and says nothing.
   a label   the newest word in a thread is OUR OWN question, posted without `needs_owner` — so the thread
             is on no list of theirs and nothing else will ever put it there. ❓ is the sender's to declare
             (#36): the box still never infers one from prose, it asks the session that wrote it to decide.
+  an owner  the board has this track at `waiting` — cc-board's word for "a PERSON must answer before this
+            moves", and the only state that reaches the owner's NEEDS YOU list — and no word of ours has
+            reached him in any lane since the row ENTERED that state (the board's log says when, because
+            `updated` moves every time anyone writes a note). The lanes are his own #<repo>, the automated one
+            beside it, the track's own channel, #alerts and #approvals — a card there is a decision put in front
+            of him — and in the four that carry more than this one track a word only counts when it NAMES the
+            track or its PR, else the box's news about everything else would answer for it (`owner_chats`).
+            2026-09-02: a session explained a blocked command in its own window and waited there, and three
+            other rows read as reached off #alerts posts about other repos. The state is READ, never inferred,
+            and that is what keeps it
+            quiet: a session idle at an empty prompt, and one that answered a terminal question in the
+            terminal, are `running`, not `waiting`, so neither can raise it.
+
+THE ONE THREAD READ. `outbox_index()` / `answered()` are the single place that answers "was there a word in
+that thread, and was it ours", from cc-slack's own outbox.log (one line per post and per reaction, written
+before the API call — so no network read, and only words that are OURS). The owner debt asks it backwards
+("did we answer him"); cc-secretary's asks rubric asks it forwards ("was this answered") through `--answered`.
+Built twice they would disagree, and a disagreement between those two IS a false "the owner is waiting" —
+which is the whole of the 2026-09-02 defect: five such findings in ninety minutes, every one answered in its
+thread within two minutes. A REACTION IS A WORD here, because it is one everywhere else in this box: cc-slack
+tells sessions to react instead of replying when yes/no is the whole answer, and the transcript half above has
+always counted one. The box's OWN 👍 for a session that finished silently is not (`react-auto`) — it says
+"handled" and nothing else, and counting it would hide the silence this hook exists to notice. NOTHING IT CANNOT SEE IS REPORTED AS SILENCE — an unresolved channel name, an outbox that
+will not read, a thread it has no line for, a span older than the tail the log is read from: each comes back as
+"cannot tell", which no rule here escalates on.
 
 WHY THE TRANSCRIPT AND NOT A SECOND STORE. Whose turn it is (🔴/🟠) is computed live inside the daemon from
 Slack's own history and never lands in a file — re-deriving it here would mean reading Slack, which is a
@@ -45,9 +77,9 @@ prose — and the per-session record beside it is what makes it once (pruned aft
 
 NEVER BLOCKS A TURN. Every path here exits 0 and swallows its own errors: `--check` is a filter in the
 Stop hook, and `--with` means a fault in this tool cannot cost the session the context hook's message.
-Env: CC_OWED_RECORDS · CC_SLACK_DIR (both so a test run keeps out of the box's own state).
+Env: CC_OWED_RECORDS · CC_SLACK_DIR · CC_OWED_BOARDS (all three so a test run keeps out of the box's own state).
 """
-import calendar, glob, json, os, re, sys, time
+import calendar, glob, json, os, re, subprocess, sys, time
 
 STATE = os.path.expanduser("~/.cc/state")
 RECORDS = os.environ.get("CC_OWED_RECORDS") or os.path.join(STATE, "owed")
@@ -57,6 +89,17 @@ TAIL = 512 * 1024          # many turns of transcript; truncation can only hide 
 PRUNE_AFTER = 7 * 86400
 GRACE = 60                 # cc-slack's DECLARE_GRACE: a declaration covers what its sender posts within a minute of it
 MAX_SAY = 3
+
+BOARDS = os.environ.get("CC_OWED_BOARDS") or os.path.expanduser("~/.cc/boards")
+OUTBOX_TAIL = 2 * 1024 * 1024   # the log is append-only and ~1 MB a day; the tail is every thread of the last days
+SENT = frozenset(("post", "file", "react"))   # outbox kinds that are a WORD OF OURS. `react-auto` is not one:
+# it is the 👍 the box itself puts on a message a session finished silently, which says "handled" and no more.
+ANSWERLESS = frozenset(("eyes", "question", "red_circle", "large_orange_circle", "large_yellow_circle",
+                        "hammer_and_wrench", "checkered_flag"))   # cc-slack's OUR_ANSWER_SKIP by another name:
+# 👀 says only "received", ❓🔴🟠 are the bot's own marks and 🏁 closes a thread. ✅ is NOT here — it says done.
+ANSWERLESS_CHAR = {"👀": "eyes", "❓": "question", "🔴": "red_circle", "🟠": "large_orange_circle",
+                   "🟡": "large_yellow_circle", "🔧": "hammer_and_wrench", "🛠": "hammer_and_wrench",
+                   "🏁": "checkered_flag"}   # THE SAME MARKS, SPELT THE OTHER WAY (cc-slack's own emoji tables)
 
 SENDERS = {"mcp__cc-slack__reply", "mcp__cc-slack__file", "mcp__cc-slack__react"}
 CHAN_RX = re.compile(r'<channel\s+([^>]*?)>\n?(.*?)</channel>', re.S)
@@ -74,8 +117,10 @@ def load_slack(name):
         return {}
 
 
-def tail_lines(path, nbytes):
-    """The last <=nbytes of a file as whole lines (a truncated first line is dropped)."""
+def tail_of(path, nbytes):
+    """(the last <=nbytes of a file as whole lines, whether that was the WHOLE file). A truncated first line is
+    dropped. The second half is the difference between "nothing there" and "cannot see": truncation is silent, so
+    a reader asking about a span older than the tail is not looking at silence, it is looking at what rolled off."""
     with open(path, "rb") as f:
         size = f.seek(0, 2)
         start = max(0, size - nbytes)
@@ -83,7 +128,7 @@ def tail_lines(path, nbytes):
         buf = f.read()
     if start:
         buf = buf.split(b"\n", 1)[1] if b"\n" in buf else b""
-    return [l for l in buf.decode("utf-8", "replace").split("\n") if l.strip()]
+    return [l for l in buf.decode("utf-8", "replace").split("\n") if l.strip()], not start
 
 
 def epoch(iso):
@@ -92,6 +137,140 @@ def epoch(iso):
         return float(calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S")))
     except Exception:
         return 0.0
+
+
+# ---- the one thread read: did WE put a word in there ---------------------------------------------
+# Both halves of the 2026-09-02 defect need the same fact and it is small: for a thread, was there a word,
+# and was it ours. cc-secretary asks it forwards ("was this answered") through `--answered`; the owner debt
+# below asks it backwards ("did we answer him"). One reader, so the two can never disagree — and a
+# disagreement between them is exactly a false "the owner is waiting".
+
+_CHANS = {}        # SLACK_DIR -> its channels.json, read once (a test moves SLACK_DIR, so the dir is the key)
+
+
+def channels():
+    """cc-slack's channels.json, or {} when it is not readable — it is unlinked and rewritten on mkchannel, so
+    "not there" is a normal moment, not a fault. cc-slack is its one writer; this only ever reads it."""
+    if SLACK_DIR not in _CHANS:
+        try:
+            with open(os.path.join(SLACK_DIR, "channels.json")) as f:
+                _CHANS[SLACK_DIR] = json.load(f) or {}
+        except Exception:
+            _CHANS[SLACK_DIR] = {}
+    return _CHANS[SLACK_DIR]
+
+
+def chat_ref(ref):
+    """(the id, whether it RESOLVED). A bare C…/D…/G… id is itself; a name resolves through channels.json.
+    Anything else is unresolved — `dm`, which is cc-scope's own word for an IM and is no channel's name; a
+    channel made since that file was last written; any name at all while it is missing — and it comes back
+    False so the caller can say "I cannot tell" instead of "nobody answered". An unresolved name matches no
+    key, so it reads n=0, and an n=0 that means unknown is the false alarm wearing the true one's clothes."""
+    ref = str(ref or "").strip()
+    if re.fullmatch(r"[CDG][A-Z0-9]{6,}", ref):
+        return ref, True
+    got = channels().get(ref.lstrip("#"))
+    return (str(got), True) if got else (ref, False)
+
+
+def chat_id(ref):
+    """The id alone, for the places that only have to name the channel back to a session."""
+    return chat_ref(ref)[0]
+
+
+def reaction_name(e):
+    """What a reaction is CALLED, whichever way it was spelt. A session may react with the name or with the
+    character, `eyes` or `👀`, and cc-slack forwards whichever it was given and writes that to outbox.log — its
+    own handler tests both spellings for exactly this reason. So one spelling here is a hole with a direction:
+    a 👀 says "received" and nothing else, and read as a word it makes a question nobody answered unflaggable,
+    which is the silence this whole tool exists to notice."""
+    e = str(e or "").strip().strip(":").replace("\ufe0f", "").lower()
+    return ANSWERLESS_CHAR.get(e, e)
+
+
+class Outbox(dict):
+    """The index, plus WHERE IT BEGINS. `begins` is the epoch of the oldest line the read could see when the log
+    was longer than the tail it was read from, and 0.0 when the whole file was read and nothing is hidden. The log
+    rolls and the truncation is silent, so a word that has scrolled out of it reads exactly like a word that was
+    never posted — while the owner debt asks an UNBOUNDED question, "has anything reached him since this row
+    entered waiting". Without this, a row that waited longer than the tail is nagged about a message he already
+    has, which is the false alarm this whole tool exists to stop (review of PR #194)."""
+    begins = 0.0
+
+
+def outbox_index(nbytes=OUTBOX_TAIL):
+    """Every word this box has SENT, indexed by where it landed: {(chat, thread_ts): [(epoch, text)…]} plus
+    {(chat, None): [(epoch, text)…]} for the channel as a whole. The text rides along because a SHARED lane needs
+    it: #alerts carries every repo's news, and telling a word about this track from a word about another one is
+    reading what it says (see `owner_chats`). cc-slack writes one outbox.log line per post and per
+    reaction before it calls the API, so this asks Slack nothing, costs no network read, and sees exactly the
+    words that are OURS. A REACTION COUNTS: on their message it IS the answer — cc-slack tells sessions so, and
+    the transcript half of this tool has always read one that way — so leaving it out would put the two halves
+    in disagreement, which is the false "the owner is waiting" all over again. It is filed under the ts it sits
+    on, which for a thread's own root is that thread. Bookkeeping reactions answer nothing and are skipped.
+    NO FILE means nothing has ever been posted, which is an honest empty. A file that will not READ raises, and
+    every caller here turns that into silence rather than "unanswered" — a failed read must not come back as the
+    false "the owner is waiting" this whole change exists to stop. ONLY THE LAST `nbytes` ARE READ, so a word
+    older than that is gone: `Outbox.begins` dates the oldest line this read saw, and no caller may report an n=0
+    from before it as silence."""
+    idx, first = Outbox(), 0.0
+    try:
+        lines, whole = tail_of(os.path.join(SLACK_DIR, "outbox.log"), nbytes)
+    except FileNotFoundError:
+        return idx
+    for l in lines:
+        f = l.split("\t", 4)
+        if len(f) < 4:
+            continue
+        at = epoch(f[0])
+        if not at:
+            continue
+        first = first or at             # append-only, so the first line it could date is the oldest it can see
+        if f[1] not in SENT:
+            continue                    # `react-auto` is the box's own 👍 for a session that said nothing: it
+                                        # means "handled" and no more, and counting it would hide that silence
+        if f[1] == "react" and reaction_name(f[4] if len(f) > 4 else "") in ANSWERLESS:
+            continue
+        said = f[4] if len(f) > 4 else ""
+        idx.setdefault((f[2], f[3]), []).append((at, said))
+        idx.setdefault((f[2], None), []).append((at, said))
+    if not whole:
+        idx.begins = first or time.time()   # the read started mid-file: everything before this line has rolled
+                                            # off, and a tail it could date no line in answers for nothing at all
+    return idx
+
+
+def answered(chat, root, since=0.0, idx=None, naming=None):
+    """{"n": how many words of ours, "first": the epoch of the earliest, "chat_unknown": the channel reference
+    did not resolve} in that thread at or after `since`. `root=None` asks about the whole channel instead of one
+    thread, and `naming` narrows that to the words that mention one of its strings — a whole channel is only ever
+    a scope for something (see `owner_chats`), never for a question, which has a thread of its own. SECOND
+    RESOLUTION, because that is what outbox.log prints: a word stamped in the same second as the
+    question counts as an answer to it. When the reference did not resolve, the id is not ours to trust, so for a
+    THREAD we look its root up under every chat in the index — a root is a microsecond stamp, so a match is that
+    thread — and either way `chat_unknown` says the n=0 is "cannot tell", not "nobody answered". `unseen` says the
+    same about the other blindness: the index's tail begins after `since`, so part of the span asked about had
+    rolled off the log before it was read. Building the index here can raise OSError (see `outbox_index`); pass one
+    in, or catch it — never report a failed read as 0."""
+    idx = outbox_index() if idx is None else idx
+    cid, known = chat_ref(chat)
+    root = None if root is None else str(root)
+    ats = idx.get((cid, root), [])
+    if not known and root is not None:
+        ats = [a for k, v in idx.items() if k[1] == root for a in v]
+    if naming:
+        # review of PR #194: a bare substring let an unrelated post in a shared lane clear the debt — track
+        # `api` was named by "alpha/rapid-fix done", which contains it inside "rapid". Both ends are bounded, so
+        # a longer row's name cannot pay a shorter one's either (`alpha/t9` does not match `alpha/t9x`).
+        ats = [(a, t) for a, t in ats
+               if any(re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", t, re.I) for w in naming)]
+    ats = sorted(a for a, _ in ats if a >= (since or 0))
+    begins = getattr(idx, "begins", 0.0)      # 0.0: the whole log was read, so it hides nothing from anyone
+    # the tail begins at or after `since`, so a word paying this could have gone out inside the part that rolled
+    # off. The boundary second counts as unseen: the oldest line kept is stamped in it and outbox.log prints
+    # seconds, so the rest of that second is exactly what the read lost.
+    return {"n": len(ats), "first": ats[0] if ats else None, "chat_unknown": not known,
+            "unseen": bool(begins) and begins >= (since or 0)}
 
 
 def text_of(message):
@@ -141,7 +320,7 @@ def scan(path):
     """The NEWEST event in every Slack thread this transcript touches: {(chat, root): event}. An event is either
     a message handed to this session (`in`) or a word of ours (`out`)."""
     st = {}
-    for line in tail_lines(path, TAIL):
+    for line in tail_of(path, TAIL)[0]:
         try:
             d = json.loads(line)
         except Exception:
@@ -197,8 +376,102 @@ def inp_root(inp):
     return inp.get("thread_ts") or inp.get("ts")
 
 
-def debts(path, marks=None, flags=None):
-    """What is owed right now, newest first. A debt is a thread whose newest event leaves the ball here."""
+def board(repo):
+    """That repo's board as cc-board wrote it, or {}. Read only: the board is cc-board's."""
+    try:
+        with open(os.path.join(BOARDS, f"{repo}.json")) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def board_row(b, track):
+    """That track's row, or None."""
+    ts = (b or {}).get("tracks") or {}
+    if isinstance(ts, dict):
+        row = ts.get(track)
+        return row if isinstance(row, dict) else None
+    for row in ts if isinstance(ts, list) else []:
+        if isinstance(row, dict) and row.get("name") == track:
+            return row
+    return None
+
+
+def wait_start(b, track, row):
+    """WHEN this row entered `waiting`, off the board's own log — its last `status -> …` line for the track, when
+    that line is the one that said waiting. NOT `updated`: cc-board bumps that on every note and set, so a note
+    typed after the owner was told would restart the clock and re-fire a debt he has already paid. `updated` is
+    the fallback for a row whose log line has been pruned, or that was set by hand without one."""
+    for e in reversed((b or {}).get("log") or []):
+        if not isinstance(e, dict) or e.get("track") != track:
+            continue
+        msg = str(e.get("msg") or "")
+        if msg.startswith("status -> "):
+            return epoch(e.get("ts") or "") if msg == "status -> waiting" else epoch((row or {}).get("updated") or "")
+    return epoch((row or {}).get("updated") or "")
+
+
+def owner_chats(repo, track, row=None):
+    """Every place a word of ours reaches the owner from this track, each with what a word there has to NAME to
+    be about THIS track. Any of them counts — the debt is that he was told NOTHING, not that a particular rung
+    was used — and #approvals is one of them, because a card there is how this box asks him for a decision he
+    only has to tap (cc-reconcile flips a row to `waiting` and posts one, and nothing else).
+    FOUR OF THE FIVE ARE SHARED: his lane #<repo> and the automated lane beside it carry every track in the repo,
+    #alerts and #approvals carry every repo on the box. A word in one of them that does not name this track is
+    not a word about this track — read channel-wide, all three of ai-ee's waiting rows came back "he was told"
+    on 2026-09-02 because #alerts had 122 posts about other things since they started waiting. Naming is how the
+    box already writes: a track post says `<repo>/<track>`, and a card or any post that links the work carries
+    the PR's own url, which is the row's `pr`. The track's own channel #<repo>--<track> IS the track, so anything
+    in it counts. #<repo> is FIRST: when his own lane does not resolve, `owner_debt` is blind and says nothing."""
+    # `<repo>/<track>`, not the bare track: it is how this box already writes a track post, it is what this
+    # docstring says, and the bare name matched other rows' posts in the shared lanes (review of PR #194).
+    names = [w for w in (f"{repo}/{track}", str((row or {}).get("pr") or "").strip()) if w]
+    return [(f"#{repo}", names), (f"#{repo}-updates", names), (f"#{repo}--{track}", None),
+            ("#alerts", names), ("#approvals", names)]
+
+
+def owner_debt(repo, track, idx=None):
+    """THE THIRD DEBT. The board says this track is `waiting` — cc-board's own word for "a PERSON must answer
+    before this moves", and the only state that reaches the owner's NEEDS YOU list — and nothing of ours has
+    reached him since the row said so. The state is READ, never inferred, which is what keeps it quiet: a
+    session idle at an empty prompt and one that answered a terminal question in the terminal are `running`,
+    not `waiting`, so neither can raise this. It dates from when the row ENTERED waiting (`wait_start`), so the
+    debt is once per wait, not once per turn and not once per note. It says NOTHING when it cannot see the whole
+    span it is asking about: his own lane unnameable, the outbox unreadable, or the log rolled past the moment the
+    row entered waiting."""
+    if not repo or not track:
+        return None
+    b = board(repo)
+    row = board_row(b, track)
+    if not row or row.get("status") != "waiting":
+        return None
+    since = wait_start(b, track, row)
+    try:
+        idx = outbox_index() if idx is None else idx
+    except OSError:
+        return None                                   # the outbox would not read: never claim he was not told
+    lanes = [answered(c, None, since, idx, naming) for c, naming in owner_chats(repo, track, row)]
+    if lanes[0]["chat_unknown"]:
+        return None                                   # his own lane #<repo> does not resolve — we are blind to
+                                                      # the one place he reads, so we cannot say he was not told
+    if any(a["n"] for a in lanes):
+        return None                                   # he was reached, by whichever rung: nothing is owed
+    if lanes[0]["unseen"]:
+        return None                                   # the log's tail begins after this row entered waiting, so
+                                                      # the word that paid it may have scrolled out of the log:
+                                                      # an n=0 over a span the read could not see is not silence.
+                                                      # The tail is days of it, and a wait older than that is not
+                                                      # the case this hook is for (review of PR #194)
+    return {"kind": "owner", "chat": chat_id(f"#{repo}"), "root": "", "chan": f"#{repo}", "who": "you",
+            "text": str(row.get("title") or f"{repo}/{track}"), "at": since, "repo": repo, "track": track,
+            "pr": str(row.get("pr") or "").strip(),      # `told` offers it as the other thing a word can name
+            "key": f"owner:{repo}/{track}:{int(since)}"}
+
+
+def debts(path, marks=None, flags=None, where=None):
+    """What is owed right now, newest first. A debt is a thread whose newest event leaves the ball here — or,
+    when `where` names this session's (repo, track), a board row that says it is waiting on the owner and no
+    word of ours since. Both read the same outbox index, so the two can never disagree about a thread."""
     marks = load_slack("marks.json") if marks is None else marks
     flags = load_slack("flags.json") if flags is None else flags
     out = []
@@ -215,6 +488,9 @@ def debts(path, marks=None, flags=None):
             out.append(dict(e, kind="word", key=f"word:{chat}:{e.get('ts') or root}"))
         elif e.get("reply") and not e["needs"] and question(e["text"]):
             out.append(dict(e, kind="label", key=f"label:{chat}:{root}:{int(when)}"))
+    o = owner_debt(*(where or (None, None)))
+    if o:
+        out.append(o)
     out.sort(key=lambda d: -(d["at"] or 0))
     return out
 
@@ -244,6 +520,16 @@ def told(d):
                 f"\"{excerpt(d['text'])}\". Answer it now — reply(chat_id=\"{d['chat']}\", thread_ts=\"{d['root']}\", "
                 f"ts=\"{d['ts']}\"), or react on that ts when 👍/👎/❌ says all of it. Two words of your own beat the "
                 f"👍 the box posts for a session that finishes silently.")
+    if d["kind"] == "owner":
+        # what it prescribes has to be what `owner_chats` counts, or the session does as it is told and the next
+        # one is told the same thing again about a message he already has: his lanes carry every track in the repo
+        name = f"{d['repo']}/{d['track']}" + (f" or {d['pr']}" if d.get("pr") else "")
+        return (f"HE DOES NOT KNOW — the board has {d['repo']}/{d['track']} at `waiting` since {age(d['at'])} ago, which "
+                f"is its word for \"a person has to answer before this moves\", and nothing of ours has gone to him in "
+                f"{d['chan']} or any other lane since: \"{excerpt(d['text'])}\". Say it where he reads — "
+                f"reply(chat_id=\"{d['chat']}\", needs_owner=true), or a --mention post on {d['chan']} — and NAME the row "
+                f"in it ({name}): {d['chan']} carries every track in the repo, so a word that names none of them is not "
+                f"a word about this one. If you are not actually waiting on him, take the row off `waiting` instead.")
     return (f"UNLABELLED — your last word in {d.get('chan') or d['chat']} ({age(d['at'])} ago) asks them something without "
             f"needs_owner, so the thread is on no list of theirs and nothing else will put it there: "
             f"\"{excerpt(question(d['text']) or d['text'])}\". If you have STOPPED until they answer, say so — "
@@ -311,11 +597,11 @@ def check(payload):
         path = max(hits, key=os.path.getmtime) if hits else ""
     if not path or not os.path.exists(path):
         return None
-    ds = debts(path)
-    if not ds:
-        return None
     cwd = payload.get("cwd") or ""
     repo, track = track_of(cwd)
+    ds = debts(path, where=(repo, track))
+    if not ds:
+        return None
     p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
     rec = {}
     try:
@@ -368,7 +654,7 @@ def resolve(repo=None, track=None, sid=None):
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
-    as_json = do_check = do_ledger = False
+    as_json = do_check = do_ledger = do_answered = False
     path = sid = carried = None
     args = []
     while argv:
@@ -379,6 +665,8 @@ def main(argv):
             do_check = True
         elif a == "--ledger":
             do_ledger = True
+        elif a == "--answered":
+            do_answered = True
         elif a == "--with":
             carried = argv.pop(0) if argv else None
         elif a == "--transcript":
@@ -409,6 +697,22 @@ def main(argv):
             print(out)
         return 0
 
+    if do_answered:
+        try:
+            idx = outbox_index()
+        except OSError:
+            return 0        # say NOTHING rather than "no": a line missing from this reads as unknown, not unanswered
+        for l in sys.stdin.read().splitlines():
+            if not l.strip():
+                continue                  # ONE object per non-blank line, in that order: the caller pairs them up
+            f = l.split("\t") if "\t" in l else l.split()
+            chat, root, since = (f + ["", "", ""])[0], (f + ["", "", ""])[1], (f + ["", "", ""])[2]
+            a = answered(chat, root or None, epoch(since), idx)
+            print(json.dumps({"chat": chat, "root": root, "since": since, "n": a["n"],   # the keys the header lists,
+                              "first": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(a["first"])) if a["first"] else "",
+                              "chat_unknown": a["chat_unknown"], "unseen": a["unseen"]}))  # in the order it lists them
+        return 0
+
     if do_ledger:
         rows = ledger_rows()
         if as_json:
@@ -424,7 +728,8 @@ def main(argv):
     if not path or not os.path.exists(path):
         print("cc-owed: no transcript for that session", file=sys.stderr)
         return 2
-    ds = debts(path)
+    where = (args[0], args[1]) if len(args) > 1 else track_of(os.getcwd())
+    ds = debts(path, where=where)
     if as_json:
         print(json.dumps(ds, indent=2))
     else:
@@ -583,6 +888,250 @@ def selfcheck():
     ok("every debt said is one countable line on the ledger", len(ledger_rows()) == 2)
     ok("the ledger says which debt, and whose session",
        ledger_rows()[0]["kind"] == "word" and ledger_rows()[0]["session_id"] == "sess-1")
+
+    # --- THE ONE THREAD READ, on the real evidence of 2026-09-01: the finding said the owner's 23:56Z question
+    # about developed/backlog items was unanswered and he was waiting. The answer went out 70 s later, in its thread.
+    global BOARDS
+    BOARDS = os.path.join(tmp, "boards")
+    os.makedirs(BOARDS, exist_ok=True)
+    ROOT, C1 = "1788306960.000100", "C0ALPHA111"
+    ASKED = "2026-09-01T23:56:00Z"
+    json.dump({"alpha": C1, "alpha-updates": "C0ALPHA222", "alpha--t9": "C0ALPHAT9R", "alerts": "C0ALERTS11",
+               "approvals": "C0APPROV11"}, open(os.path.join(SLACK_DIR, "channels.json"), "w"))
+    with open(os.path.join(SLACK_DIR, "outbox.log"), "w") as fh:
+        fh.write(f"2026-09-01T23:57:09Z\tpost\t{C1}\t{ROOT}\tat a high level, here is what is developed…\n")
+        fh.write(f"2026-09-02T00:00:11Z\tpost\t{C1}\t{ROOT}\t…and here is the backlog\n")
+        fh.write(f"2026-09-01T23:55:00Z\tpost\t{C1}\t1788306000.111111\ta word in ANOTHER thread, before the ask\n")
+    idx = outbox_index()
+    a = answered("#alpha", ROOT, epoch(ASKED), idx)
+    ok("the 23:56Z question WAS answered: two words of ours in its thread, the first 70 s later",
+       a["n"] == 2 and a["first"] == epoch("2026-09-01T23:57:09Z"))
+    ok("a thread with nothing of ours in it is unanswered — the finding that is real",
+       answered("#alpha", "1788306000.999999", epoch(ASKED), idx)["n"] == 0)
+    ok("a word in another thread of the same channel does not answer this ask",
+       answered("#alpha", ROOT, epoch("2026-09-02T00:01:00Z"), idx)["n"] == 0
+       and answered("#alpha", "1788306000.111111", epoch(ASKED), idx)["n"] == 0)
+    ok("a channel name resolves through cc-slack's channels.json, and an id is itself",
+       chat_ref("#alpha") == (C1, True) and chat_ref(C1) == (C1, True) and chat_id("#alpha") == C1)
+    # PR #194 finding 1: cc-scope writes `slack dm <ts>` for an IM and `dm` is no channel's name, so the old
+    # reader scored every answered DM n=0 — "unanswered", the one state the rubric flags. An unresolved name
+    # now says so, and the thread is still found by its root, which is a microsecond stamp.
+    ok("a name the box cannot resolve says so — and the DM's own thread is still found by its root",
+       chat_ref("dm")[1] is False and chat_ref("dm")[0] == "dm"
+       and answered("dm", ROOT, epoch(ASKED), idx)["n"] == 2
+       and answered("dm", ROOT, epoch(ASKED), idx)["chat_unknown"] is True)
+    ok("…and when the root is nowhere either, it is chat_unknown, never a bare n=0 that reads as 'nobody answered'",
+       answered("dm", "1788306000.999999", epoch(ASKED), idx)["chat_unknown"] is True
+       and answered("#alpha", "1788306000.999999", epoch(ASKED), idx)["chat_unknown"] is False)
+    ok("second resolution, and the same second counts: outbox.log prints seconds",
+       answered("#alpha", ROOT, epoch("2026-09-01T23:57:09Z"), idx)["n"] == 2
+       and answered("#alpha", ROOT, epoch("2026-09-01T23:57:10Z"), idx)["n"] == 1)
+    got = subprocess.run([sys.executable, os.path.realpath(__file__), "--answered"], input=f"#alpha\t{ROOT}\t{ASKED}\n"
+                         f"#alpha\t1788306000.999999\t{ASKED}\n", capture_output=True, text=True,
+                         env=dict(os.environ, CC_SLACK_DIR=SLACK_DIR)).stdout.splitlines()
+    ok("`--answered` says the same to cc-secretary, one JSON object a line, each echoing the query it answers",
+       len(got) == 2 and json.loads(got[0])["n"] == 2 and json.loads(got[0])["first"] == "2026-09-01T23:57:09Z"
+       and json.loads(got[0])["since"] == ASKED and json.loads(got[0])["chat_unknown"] is False
+       and json.loads(got[0])["unseen"] is False
+       and json.loads(got[1])["n"] == 0 and json.loads(got[1])["first"] == "")
+
+    # PR #194 finding 2: a REACTION is the answer whenever yes/no is the whole of it — cc-slack's react tool says
+    # so to sessions, and the transcript half above has always counted one. cc-slack now logs an added reaction to
+    # this same outbox, so both halves see it; its bookkeeping ones (👀 received, the ❓🔴🟠 marks, 🏁) answer nothing.
+    RXA, RXB = "1788306100.100000", "1788306100.200000"
+    with open(os.path.join(SLACK_DIR, "outbox.log"), "a") as fh:
+        fh.write(f"2026-09-01T23:58:00Z\treact\t{C1}\t{RXA}\t+1\n")
+        fh.write(f"2026-09-01T23:58:00Z\treact\t{C1}\t{RXB}\teyes\n")
+        fh.write(f"2026-09-01T23:58:01Z\treact\t{C1}\t{RXB}\tred_circle\n")
+    rx = outbox_index()
+    ok("a 👍 on their message answers it — the same read, so the two halves cannot disagree about a react",
+       answered("#alpha", RXA, epoch(ASKED), rx)["n"] == 1)
+    ok("…and a 👀 or a bot mark answers nothing: that thread is still unanswered",
+       answered("#alpha", RXB, epoch(ASKED), rx)["n"] == 0)
+    with open(os.path.join(SLACK_DIR, "outbox.log"), "a") as fh:
+        fh.write(f"2026-09-01T23:59:00Z\treact-auto\t{C1}\t{RXB}\t+1\n")
+    ok("the box's OWN 👍 for a session that said nothing is not an answer — that is the silence to notice",
+       answered("#alpha", RXB, epoch(ASKED), outbox_index())["n"] == 0)
+    # review of PR #194, finding 1: a session may react with the NAME or with the character, and cc-slack writes
+    # down whichever it was handed — so a 👀 spelt 👀 read as a word, and a question nobody answered became
+    # unflaggable: `answered=yes` on the ask, and the owner debt reading a thread he only ever got a 👀 in as reached.
+    RXC, RXD = "1788306100.300000", "1788306100.400000"
+    with open(os.path.join(SLACK_DIR, "outbox.log"), "a") as fh:
+        fh.write(f"2026-09-01T23:58:02Z\treact\t{C1}\t{RXC}\t👀\n")
+        fh.write(f"2026-09-01T23:58:03Z\treact\t{C1}\t{RXC}\t:eyes:\n")
+        fh.write(f"2026-09-01T23:58:04Z\treact\t{C1}\t{RXC}\t🏁\n")
+        fh.write(f"2026-09-01T23:58:05Z\treact\t{C1}\t{RXD}\t👍\n")
+    rxc = outbox_index()
+    ok("a 👀 spelt as the character, or in colons, is the same 'received' as `eyes` — none of them answers anything",
+       answered("#alpha", RXC, epoch(ASKED), rxc)["n"] == 0)
+    ok("…and a 👍 spelt as the character is still the answer it is: only the marks are dropped, not every character",
+       answered("#alpha", RXD, epoch(ASKED), rxc)["n"] == 1)
+
+    # --- the owner debt: the board's own `waiting`, and whether he was reached since
+    def wrote_board(status, updated, repo="alpha", track="t9", log=None, pr=""):
+        json.dump({"repo": repo, "tracks": {track: {"status": status, "title": "the push refuses",
+                                                    "updated": updated, "pr": pr}}, "log": log or []},
+                  open(os.path.join(BOARDS, f"{repo}.json"), "w"))
+
+    def said(at, chat, text, thread=""):
+        with open(os.path.join(SLACK_DIR, "outbox.log"), "a") as fh:
+            fh.write(f"{at}\tpost\t{chat}\t{thread}\t{text}\n")
+
+    wrote_board("waiting", "2026-09-02T01:00:00Z")
+    d = owner_debt("alpha", "t9")
+    ok("the board says waiting and nothing has gone to him since: that is the debt",
+       d and d["kind"] == "owner" and d["chat"] == C1)
+    ok("it says the row, and how to reach him", "alpha/t9" in told(d) and "needs_owner=true" in told(d))
+    ok("a session idle at an empty prompt raises nothing — its row is running, not waiting",
+       (wrote_board("running", "2026-09-02T01:00:00Z"), owner_debt("alpha", "t9"))[1] is None)
+    ok("a session that answered a terminal question in the terminal raises nothing, for the same reason",
+       (wrote_board("done", "2026-09-02T01:00:00Z"), owner_debt("alpha", "t9"))[1] is None)
+    ok("no board row at all raises nothing",
+       owner_debt("alpha", "nosuchtrack") is None and owner_debt("nosuchrepo", "t9") is None)
+    said("2026-09-02T01:02:00Z", "C0ALPHA222", "alpha/t9 is blocked on you")
+    wrote_board("waiting", "2026-09-02T01:00:00Z")
+    ok("the debt clears when he is reached by ANY rung — the updates lane counts", owner_debt("alpha", "t9") is None)
+    waited = [{"ts": "2026-09-02T01:00:00Z", "track": "t9", "msg": "status -> waiting"}]
+    wrote_board("waiting", "2026-09-02T01:03:00Z",
+                log=[{"ts": "2026-09-02T01:03:00Z", "track": "t9", "msg": "status -> waiting"}])
+    ok("…and a word sent BEFORE it entered waiting does not clear it", owner_debt("alpha", "t9") is not None)
+    # PR #194 finding 3: cc-board bumps `updated` on every note and set, so dating the wait from it re-fired a
+    # debt the session had already paid — told at 01:02, a note at 01:05, and the hook said "HE DOES NOT KNOW".
+    # The wait starts where the board's own log says it started.
+    wrote_board("waiting", "2026-09-02T01:05:00Z",
+                log=waited + [{"ts": "2026-09-02T01:04:00Z", "track": "other", "msg": "status -> waiting"},
+                              {"ts": "2026-09-02T01:05:00Z", "track": "t9", "msg": "a note somebody typed"}])
+    ok("a note after he was told does not re-open the debt: `updated` moves, the wait does not",
+       owner_debt("alpha", "t9") is None)
+    ok("…and another track's log lines are not this one's wait",
+       wait_start(board("alpha"), "t9", board_row(board("alpha"), "t9")) == epoch("2026-09-02T01:00:00Z"))
+    wrote_board("waiting", "2026-09-02T01:06:00Z",
+                log=waited + [{"ts": "2026-09-02T01:04:00Z", "track": "t9", "msg": "status -> running"},
+                              {"ts": "2026-09-02T01:06:00Z", "track": "t9", "msg": "status -> waiting"}])
+    ok("…but going back INTO waiting after he was told is a new wait, and that does raise",
+       owner_debt("alpha", "t9") is not None)
+    # and his own lane has to be nameable: cc-slack unlinks channels.json on mkchannel, and in that window every
+    # ref reads n=0 — calling that "he was never told" is this same false alarm from the other end.
+    os.rename(os.path.join(SLACK_DIR, "channels.json"), os.path.join(SLACK_DIR, "channels.kept"))
+    _CHANS.clear()
+    ok("with channels.json away, no owner debt: we cannot see the lane he reads, so we do not claim he is unread",
+       owner_debt("alpha", "t9") is None)
+    os.rename(os.path.join(SLACK_DIR, "channels.kept"), os.path.join(SLACK_DIR, "channels.json"))
+    _CHANS.clear()
+    ok("…and with it back, the same board raises it again", owner_debt("alpha", "t9") is not None)
+
+    # --- THE LANES, and what a word in one has to say to be about THIS track. The review of PR #194 found this
+    # one omission pointing both ways: #approvals was not a lane at all, so the box's own way of putting a
+    # decision in front of him did not pay the debt (finding 2) — and the lanes that were read were read whole,
+    # so any post about anything paid every waiting track's debt at once (finding 3).
+    PR7 = "https://github.com/o/alpha/pull/7"
+    entered = [{"ts": "2026-09-02T02:00:00Z", "track": "t9", "msg": "status -> waiting"}]
+    wrote_board("waiting", "2026-09-02T02:00:00Z", log=entered, pr=PR7)
+    ok("a fresh wait with nothing said about it since is the debt", owner_debt("alpha", "t9") is not None)
+    said("2026-09-02T02:01:00Z", "C0ALERTS11", "*alpha/t2 done* Track finished after 1 iteration(s)")
+    said("2026-09-02T02:01:30Z", C1, "PR #9 landed — that was the other track")
+    ok("the box's news about OTHER tracks does not pay this one's debt: read whole, #alerts' 122 posts about "
+       "everything else made all three of that day's waiting rows read as reached",
+       owner_debt("alpha", "t9") is not None)
+    said("2026-09-02T02:02:00Z", "C0APPROV11", f"[alpha] PR #7: the push refuses — {PR7}")
+    ok("a card in #approvals IS the decision put in front of him — it names the row's own PR, and that is paid",
+       owner_debt("alpha", "t9") is None)
+    wrote_board("waiting", "2026-09-02T03:00:00Z", pr=PR7,
+                log=[{"ts": "2026-09-02T03:00:00Z", "track": "t9", "msg": "status -> waiting"}])
+    ok("…and the next wait starts unpaid: the card was posted before it", owner_debt("alpha", "t9") is not None)
+    said("2026-09-02T03:01:00Z", "C0ALERTS11", "*alpha/t9* the push still refuses — over to you")
+    ok("a word in a shared lane that NAMES the track pays it, whichever lane it is",
+       owner_debt("alpha", "t9") is None)
+    wrote_board("waiting", "2026-09-02T04:00:00Z", pr=PR7,
+                log=[{"ts": "2026-09-02T04:00:00Z", "track": "t9", "msg": "status -> waiting"}])
+    ok("…and that one is paid too, so the next wait after it starts unpaid again",
+       owner_debt("alpha", "t9") is not None)
+    said("2026-09-02T04:01:00Z", "C0ALPHAT9R", "the push still refuses — over to you")
+    ok("the track's OWN channel needs no naming: everything in #alpha--t9 is about t9",
+       owner_debt("alpha", "t9") is None)
+    # review of PR #194, finding 2: what the debt TELLS the session to do has to be what it counts. #alpha is his
+    # own lane and carries every track in the repo, so a word there that names no row pays nothing — and a session
+    # that did exactly as it was told would be told the same thing again, about a message he already has.
+    wrote_board("waiting", "2026-09-02T05:30:00Z", pr=PR7,
+                log=[{"ts": "2026-09-02T05:30:00Z", "track": "t9", "msg": "status -> waiting"}])
+    d5 = owner_debt("alpha", "t9")
+    said("2026-09-02T05:31:00Z", C1, "the push still refuses — over to you")
+    ok("a word in HIS OWN lane that names no row does not pay it either: #alpha carries every track in the repo",
+       owner_debt("alpha", "t9") is not None)
+    ok("…and the debt says so — it asks for the row's name, or its PR, in the word it prescribes",
+       "alpha/t9" in told(d5) and PR7 in told(d5) and "needs_owner=true" in told(d5))
+    said("2026-09-02T05:32:00Z", C1, "alpha/t9 — the push still refuses, over to you")
+    ok("…and doing what it says pays it: the prescribed word names the row, so the rule counts it",
+       owner_debt("alpha", "t9") is None)
+
+    # review of PR #194, finding 1: the bare track name was matched as a plain substring, so a routine line about
+    # a DIFFERENT row cleared this debt and he was never told. Both ends are bounded now, which also stops a
+    # LONGER row's name paying a shorter one's. Each half asserts the case kept as well as the one suppressed.
+    wrote_board("waiting", "2026-09-02T06:00:00Z", track="api",
+                log=[{"ts": "2026-09-02T06:00:00Z", "track": "api", "msg": "status -> waiting"}])
+    said("2026-09-02T06:01:00Z", "C0ALERTS11", "*alpha/rapid-fix done* Track finished after 1 iteration(s)")
+    ok("a shared-lane post carrying the track name inside another word leaves the debt standing",
+       owner_debt("alpha", "api") is not None)
+    said("2026-09-02T06:02:00Z", "C0ALERTS11", "*alpha/api* the push still refuses — over to you")
+    ok("…while the same lane naming the row itself still pays it", owner_debt("alpha", "api") is None)
+    wrote_board("waiting", "2026-09-02T07:00:00Z", track="t9",
+                log=[{"ts": "2026-09-02T07:00:00Z", "track": "t9", "msg": "status -> waiting"}])
+    said("2026-09-02T07:01:00Z", "C0ALERTS11", "*alpha/t9x done* Track finished after 1 iteration(s)")
+    ok("…and a longer row's name does not pay a shorter one's: alpha/t9 is bounded at its tail too",
+       owner_debt("alpha", "t9") is not None)
+
+    # --- both halves off the ONE read: ONE line pays the session's debt here and answers his question there, so
+    # the two can never disagree about a thread. (The debt is about a track, so the word has to say which one.)
+    wrote_board("waiting", ASKED, track="t8", log=[{"ts": ASKED, "track": "t8", "msg": "status -> waiting"}])
+    ok("with nothing said about t8, the debt stands — an answer in another track's thread is not this one's",
+       owner_debt("alpha", "t8") is not None)
+    said("2026-09-02T05:00:00Z", C1, "alpha/t8 — answered, in the thread he asked it in", thread=ROOT)
+    ok("a question answered in its thread is answered for BOTH halves — no finding for cc-secretary, no debt here",
+       answered("#alpha", ROOT, epoch(ASKED))["n"] == 3 and owner_debt("alpha", "t8") is None)
+    # a read that FAILED must not come back as the alarm. An outbox that will not open (a directory here, so the
+    # test holds whoever runs it) is not "nobody answered": --answered says nothing, and no owner debt is raised.
+    os.rename(os.path.join(SLACK_DIR, "outbox.log"), os.path.join(SLACK_DIR, "outbox.kept"))
+    os.mkdir(os.path.join(SLACK_DIR, "outbox.log"))
+    wrote_board("waiting", "2026-09-02T01:03:00Z")
+    r = subprocess.run([sys.executable, os.path.realpath(__file__), "--answered"], input=f"#alpha\t{ROOT}\t{ASKED}\n",
+                       capture_output=True, text=True, env=dict(os.environ, CC_SLACK_DIR=SLACK_DIR))
+    ok("an outbox that will not read says NOTHING, which cc-secretary reads as unknown — never as unanswered",
+       r.returncode == 0 and r.stdout.strip() == "")
+    ok("…and it raises no owner debt either: a failed read never claims he was not told",
+       owner_debt("alpha", "t9") is None)
+    os.rmdir(os.path.join(SLACK_DIR, "outbox.log"))
+    ok("an outbox that is simply ABSENT is an honest empty, not a failure: the debt stands",
+       owner_debt("alpha", "t9") is not None)
+    os.rename(os.path.join(SLACK_DIR, "outbox.kept"), os.path.join(SLACK_DIR, "outbox.log"))
+
+    # review of PR #194, 3rd pass: `outbox_index` reads the last OUTBOX_TAIL of the log, but the debt above asks an
+    # UNBOUNDED question — has anything reached him since the row entered waiting. Once the log rolls past the word
+    # that paid it, that word is invisible, and the n=0 it leaves behind reads exactly like silence: the hook nags
+    # him about a message he already has. (This change makes the log roll faster — it adds a line per reaction.)
+    PAID = "2026-09-02T08:00:00Z"
+    wrote_board("waiting", PAID, track="t7", pr=PR7, log=[{"ts": PAID, "track": "t7", "msg": "status -> waiting"}])
+    open(os.path.join(SLACK_DIR, "outbox.log"), "w").close()          # this case builds its own log, first line up
+    said("2026-09-02T08:01:00Z", C1, "alpha/t7 — the push refuses, over to you")     # he WAS told, right at the top
+    for i in range(60):
+        said(f"2026-09-02T09:{i:02d}:00Z", "C0ALERTS11", "another repo's news, " + "x" * 200)   # …then 15 kB of log
+    rolled = outbox_index(nbytes=2048)
+    ok("a word that has rolled off the tail of the log is not silence: no debt out of a span the read cannot see",
+       rolled.begins > epoch("2026-09-02T08:01:00Z") and owner_debt("alpha", "t7", rolled) is None)
+    ok("…and `answered` says which it is: the old span is unseen, one inside the tail is not, and a read that took "
+       "the whole file hides nothing from anybody",
+       answered("#alpha", None, epoch(PAID), rolled)["unseen"] is True
+       and answered("#alpha", None, epoch("2026-09-02T10:00:00Z"), rolled)["unseen"] is False
+       and answered("#alpha", None, epoch(PAID), outbox_index())["unseen"] is False)
+    wrote_board("waiting", "2026-09-02T10:00:00Z", track="t7", pr=PR7,
+                log=[{"ts": "2026-09-02T10:00:00Z", "track": "t7", "msg": "status -> waiting"}])
+    ok("…but a wait that began inside what the tail CAN see is still judged: only the rolled-off part is excused",
+       owner_debt("alpha", "t7", rolled) is not None)
+    ok("…and the same log read whole still finds the word that paid the first wait: nothing present is muted",
+       answered("#alpha", None, epoch(PAID), outbox_index(), ["alpha/t7"])["n"] == 1)
+
+    ok("the two debts of before are untouched by any of it",
+       kinds(tx(msg())) == ["word"] and kinds(tx(msg(), rep())) == []
+       and kinds(tx(msg(), rep()), where=("alpha", "nosuchtrack")) == [])
 
     # --- --with: this hook carries the other one's decision, ours first
     ctx = json.dumps({"decision": "block", "reason": "CONTEXT 42%. Journal now."})

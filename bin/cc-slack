@@ -648,7 +648,17 @@ def post(cfg, chat, text, thread=None, username=None):
     return len(chunks(text)), first
 
 
-def react(cfg, chat, ts, name, remove=False):
+def react(cfg, chat, ts, name, remove=False, auto=False, thread=None):
+    """Put our reaction on a message. An added one goes to the outbox exactly as a post does: on someone's own
+    message a reaction IS our answer (see the `react` tool's own description), and cc-owed reads that log to
+    tell an answered thread from an ignored one — a reaction it cannot see reads there as silence. `auto` is
+    the box's OWN 👍 for a session that finished without a word: it is logged apart, because it says "handled"
+    and nothing else, and counting it as an answer would hide the very silence cc-owed exists to notice.
+    It is FILED UNDER `thread`, the thread the message sits in, not under the message: a 👍 on a follow-up
+    inside a thread answers that thread, and filed under the follow-up's own ts nothing looking the thread up
+    would find it. `thread` is the message's own ts when it starts one, so a top-level reaction is unchanged."""
+    if ts and not remove:
+        outbox("react-auto" if auto else "react", chat, thread or ts, name)
     tok = cfg.get("SLACK_BOT_TOKEN")
     if not tok or not ts:
         return
@@ -2987,7 +2997,7 @@ class Daemon:
             return {"ok": True, "text": (f"sent ({n} message(s))" if n else f"logged to {DIR}/outbox.log") + mention_warning(missed)}
         if verb == "react":
             ts, emoji = str(first.get("ts") or ""), str(first.get("emoji") or "eyes")
-            react(self.cfg, chat, ts, emoji)
+            react(self.cfg, chat, ts, emoji, thread=first.get("thread_ts") or None)
             if ts and emoji.strip(":") not in ("eyes", "👀"):
                 react(self.cfg, chat, ts, "eyes", remove=True)
             if emoji.strip(":") in SESSION_MARKS:
@@ -4894,7 +4904,7 @@ class Daemon:
         if self.flags.get(f"{chat}:{root}", 0) >= float(ts):
             return                                        # they closed the thread after that message: nothing left to acknowledge
         log(f"ack: 👍 on {chat}/{ts} — the session finished with nothing to say")
-        react(self.cfg, chat, ts, "+1")
+        react(self.cfg, chat, ts, "+1", auto=True)
         react(self.cfg, chat, ts, "eyes", remove=True)
         self.forget_cached_reply(chat, ts)
         self.mark_dirty({"type": "reaction_added", "item": {"channel": chat, "ts": ts}})
@@ -5528,7 +5538,8 @@ TOOLS = [
          "required": ["path", "chat_id"]}},
     {"name": "react",
      "description": "Add an emoji reaction to a Slack message (name, e.g. white_check_mark, eyes, +1). On one of the OWNER's messages this is your ANSWER when no text is needed — +1 yes, -1 no, white_check_mark done, x can't, thinking_face unclear; the thread counts as handled and its 👀 comes off. eyes only means 'received'. Add 🏁 to a thread's root ONLY when the owner asks you to close it — never on your own judgment (the owner concludes threads).",
-     "inputSchema": {"type": "object", "properties": {"chat_id": {"type": "string"}, "ts": {"type": "string"}, "emoji": {"type": "string"}},
+     "inputSchema": {"type": "object", "properties": {"chat_id": {"type": "string"}, "ts": {"type": "string"}, "emoji": {"type": "string"},
+                                                      "thread_ts": {"type": "string", "description": "the thread the message is in — copy it from the <channel> tag when the message is a reply, so the thread reads as answered"}},
                      "required": ["chat_id", "ts", "emoji"]}},
     {"name": "history",
      "description": "Recent messages in a channel/DM, oldest first, compact 'HH:MM user: text' lines. Pull only what the current "
@@ -5700,7 +5711,7 @@ class Channel:
                         + mention_warning(missed)), False
             if name == "react":
                 chat, ts, emoji = a.get("chat_id", ""), a.get("ts", ""), str(a.get("emoji", "eyes"))
-                react(self.cfg, chat, ts, emoji)
+                react(self.cfg, chat, ts, emoji, thread=a.get("thread_ts") or None)
                 if ts and emoji.strip(":") not in ("eyes", "👀"):
                     react(self.cfg, chat, ts, "eyes", remove=True)   # this reaction IS our answer: the "received" 👀 comes off
                 if emoji.strip(":") in SESSION_MARKS:
@@ -5730,7 +5741,7 @@ class Channel:
         if name == "reply":
             req.update(text=a.get("text", ""), thread_ts=a.get("thread_ts") or None, ts=a.get("ts") or "", needs_owner=bool(a.get("needs_owner")))
         elif name == "react":
-            req.update(ts=a.get("ts", ""), emoji=str(a.get("emoji", "eyes")))
+            req.update(ts=a.get("ts", ""), emoji=str(a.get("emoji", "eyes")), thread_ts=a.get("thread_ts") or None)
         elif name == "file":
             try:
                 req.update(path=check_upload_path(a.get("path", "")), thread_ts=a.get("thread_ts") or None, ts=a.get("ts") or "",
@@ -6592,7 +6603,7 @@ def cmd_selfcheck():
     before_outbox = open(real_outbox_log).read() if os.path.exists(real_outbox_log) else None
     tmp_outbox_log = tempfile.mktemp(prefix="_selfcheck_outbox_")
     real_outbox = outbox                                     # kept for the 0600-permissions check (L22)
-    globals()["outbox"] = lambda kind, chat, thread, text: open(tmp_outbox_log, "a").write(f"{kind}\t{chat}\t{text}\n")
+    globals()["outbox"] = lambda kind, chat, thread, text: open(tmp_outbox_log, "a").write(f"{kind}\t{chat}\t{thread or ''}\t{text}\n")
     real_load_flags, real_save_flags = load_flags, save_flags   # every 🏁 check runs on an empty, unsaved flag file (L23 tests the real pair)
     flag_writes = []
     globals()["load_flags"] = lambda: {}
@@ -6741,7 +6752,7 @@ def cmd_selfcheck():
         EFFECTS.run_impl = lambda cmd, **kw: notes.append(cmd) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         dm.deliver = lambda target, payload, **kw: injected.append((target, payload["content"]))
         marks, real_react_ap = [], react
-        globals()["react"] = lambda cfg, chat, ts, name, remove=False: marks.append((chat, ts, name))
+        globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: marks.append((chat, ts, name))
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 check("reaction: wrong emoji/channel, non-bot author (a member's :+1: on one too), bad text, unknown repo/ts, "
@@ -7378,7 +7389,7 @@ def cmd_selfcheck():
     dmM.say = lambda chat, text, thread=None: saidM.append((chat, text))
     dmM.arm = lambda *a, **k: steer.append("arm"); dmM.owner_spoke = lambda *a, **k: steer.append("owner_spoke")
     _rxM, _slM = globals()["react"], globals()["save_last"]      # a delivered message stamps last_chat: never the live file
-    globals()["react"] = lambda cfg, chat, ts, name, remove=False: rxM.append((chat, ts, name))
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: rxM.append((chat, ts, name))
     globals()["save_last"] = lambda last: None
     msgM = lambda ts, user, text, chan="CM", ctype="channel", **k: dict(
         {"type": "message", "channel": chan, "ts": ts, "user": user, "text": text, "channel_type": ctype}, **k)
@@ -7459,7 +7470,7 @@ def cmd_selfcheck():
     dmS.update_owner = lambda *a, **k: None
     dmS.arm = lambda *a, **k: None; dmS.owner_spoke = lambda *a, **k: None
     _rxS, _slS = globals()["react"], globals()["save_last"]
-    globals()["react"] = lambda cfg, chat, ts, name, remove=False: None
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: None
     globals()["save_last"] = lambda last: None
     msgS = lambda ts, text, **k: dict({"type": "message", "channel": "CS", "ts": ts, "user": "UOWNER",
                                        "text": text, "channel_type": "channel"}, **k)
@@ -7976,7 +7987,7 @@ def cmd_selfcheck():
     said14 = []; dmL14.say = lambda chat, text, thread=None: said14.append(text)
     react14, real_react = [], react
     try:
-        globals()["react"] = lambda cfg, chat, ts, name, remove=False: react14.append(name)
+        globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: react14.append(name)
         dmL14.on_event({"type": "message", "channel": "CZ", "ts": "1.1", "user": "UOWNER", "text": "yes abcde", "channel_type": "channel"})
     finally:
         globals()["react"] = real_react
@@ -7987,7 +7998,7 @@ def cmd_selfcheck():
     got1 = []; dmA1.deliver = lambda target, payload, **k: got1.append(payload) or "delivered"
     dmA1.say = lambda *a, **k: None
     try:
-        globals()["react"] = lambda cfg, chat, ts, name, remove=False: None
+        globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: None
         with offline_slack():
             dmA1.on_event({"type": "message", "channel": "D1", "ts": "2.1", "user": "UOWNER", "channel_type": "im",
                            "text": "yes abcde *Sent using* Claude"})
@@ -8383,6 +8394,28 @@ def cmd_selfcheck():
               len(lines) == 2 and all(l.startswith("file\t") for l in lines) and "render.png" in lines[0]
               and not err_no_tok and "NOT sent" in out_no_tok and "outbox.log" in out_no_tok
               and "do not say the file arrived" in out_no_tok and "NOT sent" in out_local)
+        # -- a reaction is a word, and the box's own 👍 is not: cc-owed reads this log to tell an answered
+        # thread from one nobody spoke in, and it can only do that if the two are written apart (PR #194) --
+        n_rx = len(open(tmp_outbox_log).read().splitlines())
+        react({}, "C1", "1.1", "+1")                       # a session's own: on their message this IS the answer
+        react({}, "C1", "1.1", "+1", auto=True)            # the box's, for a session that finished silently
+        react({}, "C1", "1.1", "eyes", remove=True)        # taking a reaction off is not a word
+        react({}, "C1", "", "+1")                          # no message to put it on: nothing to record
+        check("react: ours is logged as a word and the automatic 👍 apart from it, so a thread that was answered "
+              "reads differently from one the box only marked handled; a removal and a ts-less call write nothing",
+              open(tmp_outbox_log).read().splitlines()[n_rx:] == ["react\tC1\t1.1\t+1", "react-auto\tC1\t1.1\t+1"])
+        # -- and it is filed under the THREAD, not the message: he follows up at 1.7 INSIDE thread 1.1 and the
+        # session answers with a 👍 on 1.7. Filed under 1.7, a look-up of the thread finds nothing and the ask
+        # reads unanswered — the exact false alarm this log exists to stop (review of PR #194, finding 4).
+        n_th = len(open(tmp_outbox_log).read().splitlines())
+        react({}, "C1", "1.7", "+1", thread="1.1")
+        check("a 👍 on a follow-up INSIDE a thread is filed under that thread, so looking the thread up finds it",
+              open(tmp_outbox_log).read().splitlines()[n_th:] == ["react\tC1\t1.1\t+1"])
+        n_th = len(open(tmp_outbox_log).read().splitlines())
+        chR = Channel("myrepo"); chR.cfg = {}
+        chR.call("react", {"chat_id": "C1", "ts": "1.7", "thread_ts": "1.1", "emoji": "+1"})
+        check("…and the react tool carries the thread through: what a session reacts with lands where the ask is",
+              open(tmp_outbox_log).read().splitlines()[n_th:][:1] == ["react\tC1\t1.1\t+1"])
         # -- the happy path, against a mocked api: getUploadURLExternal → the bytes → completeUploadExternal ----
         calls, posted = [], []
         def up_api(method, token, **kw):
@@ -9841,7 +9874,7 @@ def cmd_selfcheck():
     _twBZ, _pwBZ, _rcBZ, _apiBZ = globals()["tmux_window"], globals()["pane_working"], globals()["react"], api
     busyBZ, marksBZ, rmBZ = {"v": True}, [], []
     globals()["tmux_window"] = lambda name: ("@1", "node"); globals()["pane_working"] = lambda wid: busyBZ["v"]
-    globals()["react"] = lambda cfg, chat, ts, name, remove=False: rmBZ.append((name, remove))
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: rmBZ.append((name, remove))
     globals()["api"] = lambda method, token, **kw: {}         # the marks are the subject; the reads they make are not
     dmBZ.session_mark = lambda chat, ts, name, removed=False: marksBZ.append((ts, name, removed)) or True
     dmBZ.set_work = lambda chat, ts, want: rmBZ.append(("hammer_and_wrench", want is None))
@@ -10924,7 +10957,7 @@ def cmd_selfcheck():
     postedMS, reactedMS, ranMS = [], [], []
     real_post_ms, real_react_ms, real_run_ms, real_api_ms = post, react, EFFECTS.run_impl, globals()["api"]
     globals()["post"] = lambda cfg, chat, text, thread=None, username=None: postedMS.append((chat, text, username)) or (1, "5.5")
-    globals()["react"] = lambda cfg, chat, ts, name, remove=False: reactedMS.append((chat, ts, name, remove))
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: reactedMS.append((chat, ts, name, remove, k.get("thread")))
     globals()["api"] = lambda method, token, **kw: {"messages": [], "channel": {"name": "?"}}
     EFFECTS.run_impl = lambda cmd, **kw: ranMS.append(list(cmd)) or types.SimpleNamespace(returncode=0, stdout="worker started", stderr="")
     def ms_req(obj, member="alice", peer=None, hold=None):
@@ -10979,6 +11012,9 @@ def cmd_selfcheck():
         r_dm = ms_req({"reply": "DM1", "text": "hi"}); r_bob = ms_req({"reply": "CBOB", "text": "hi"}); r_my = ms_req({"reply": "CMY", "text": "hi"})
         r_status = ms_req({"status": True}); r_orch = ms_req({"orch": "alice", "alias": "x"}); r_mpost = ms_req({"post": "CAL", "text": "x"}); r_arch = ms_req({"archive": "", "target": "alice"})
         r_react = ms_req({"react": "CAL", "ts": "1.2", "emoji": "white_check_mark"}); r_react_dm = ms_req({"react": "DM1", "ts": "1.2", "emoji": "eyes"})
+        # a 👍 answering a follow-up INSIDE a thread: the boundary has to carry the thread through, or the
+        # answer is filed under the follow-up and the thread it answers still reads as silence (PR #194 review)
+        r_react_th = ms_req({"react": "CAL", "ts": "1.7", "thread_ts": "1.1", "emoji": "+1"})
         r_hist = ms_req({"history": "CAL", "n": 5}); r_hist_bob = ms_req({"history": "CBOB"}); r_thr = ms_req({"thread": "CALT", "ts": "1.0"})
         r_file_out = ms_req({"file": "CAL", "path": "/tmp/x.png"}); r_file_bob = ms_req({"file": "CBOB", "path": f"{DEV}/alice/x.png"})
         # dispatch: `cc <h> <track> --go ""` on the host, this workspace only, options vetted
@@ -11042,12 +11078,13 @@ def cmd_selfcheck():
           "comes off, and needs_owner marks the root ❓ — while a DM, another member's channel, the box's own repo channel and "
           "every owner verb (status, orch, archive, post) are refused",
           [p[0] for p in postedMS[:5]] == ["CAL", "CALT", "CALU", "CALTU", "CAL"] and postedMS[0][2] == display_name("alice")
-          and ("CAL", "1.1", "eyes", True) in reactedMS and ("CAL", "9.9", "question", False) in reactedMS and r_rep_n.get("ok") and r_rep_h.get("ok")
+          and ("CAL", "1.1", "eyes", True, None) in reactedMS and ("CAL", "9.9", "question", False, None) in reactedMS and r_rep_n.get("ok") and r_rep_h.get("ok")
           and all(r.get("ok") is False for r in (r_dm, r_bob, r_my, r_status, r_orch, r_mpost, r_arch))
           and "not one of alice's channels" in r_dm.get("error", "") and "not a member verb" in r_status.get("error", ""))
     check("MEMBER socket: react, history and thread work on its channels and are refused elsewhere; a file is sent only from a "
           "path the host can see (the workspace), never from the boundary's private /tmp",
-          r_react.get("ok") and ("CAL", "1.2", "white_check_mark", False) in reactedMS and r_react_dm.get("ok") is False
+          r_react.get("ok") and ("CAL", "1.2", "white_check_mark", False, None) in reactedMS and r_react_dm.get("ok") is False
+          and r_react_th.get("ok") and ("CAL", "1.7", "+1", False, "1.1") in reactedMS
           and r_hist.get("ok") and r_hist_bob.get("ok") is False and r_thr.get("ok")
           and r_file_out.get("ok") is False and "not visible outside the boundary" in r_file_out.get("error", "") and r_file_bob.get("ok") is False)
     check("MEMBER socket: dispatch runs `cc alice todo --go \"\" --loop 2 --budget 5` on the HOST (where the daily budget is "
@@ -11105,7 +11142,7 @@ def cmd_selfcheck():
     dmF.fetch_files = lambda files, member=None: (fseen.append(member) or   # what the daemon really wrote, out here
                                                   [f"{member_dir(member)}/files/{n}" if member else f"{DIR}/files/{n}" for n in fnames])
     _rxF, _slF = globals()["react"], globals()["save_last"]
-    globals()["react"] = lambda cfg, chat, ts, name, remove=False: None
+    globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: None
     globals()["save_last"] = lambda last: None
     try:
         evF = lambda chan: {"type": "message", "channel": chan, "ts": "f.1", "user": "UMEM", "text": "have a look",
