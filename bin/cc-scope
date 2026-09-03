@@ -345,6 +345,16 @@ NOT_A_PERSON = (
     "<command-name",                # a slash command the session ran — the invocation, not an ask
     "<local-command-stdout",        # ...and its output, handed back as the next turn
 )
+# The same list, for the shapes that carry a generated id in the MIDDLE of the wrapper, where a literal
+# prefix cannot reach. Matched from the start of the prompt, and each pattern spells out enough of the
+# sentence the tool actually writes that a person could not type it by accident: "cc-handoff" on its own
+# would eat "cc-handoff is stuck, please fix it", which is a real ask.
+NOT_A_PERSON_RE = (
+    # `cc-handoff --kick` typing the opening prompt in front of a successor session (cc-handoff's KICK). The
+    # ledger opened a row for it three times — a121, a126, a131 — and each freshly handed-over session spent
+    # one of its first turns declining a row that described its own startup.
+    re.compile(r"cc-handoff(\s+\S+)?: you are the SUCCESSOR for\b"),
+)
 
 
 def not_a_person(text, attrs):
@@ -352,7 +362,9 @@ def not_a_person(text, attrs):
     a Slack message is an owner ask only when a real owner really typed it in a real channel. `inject` is a
     local, unauthenticated door any process on the box may use and it stamps role="owner" chat_id="local",
     which is how the board watchdog's own line became an owner ask (a54)."""
-    if text.lstrip().startswith(NOT_A_PERSON): return True
+    lead = text.lstrip()
+    if lead.startswith(NOT_A_PERSON): return True
+    if any(r.match(lead) for r in NOT_A_PERSON_RE): return True
     if attrs:
         if attrs.get("role") != "owner": return True                        # member, bot, anything but him
         if attrs.get("chat_id") == "local" or attrs.get("channel") == "local": return True   # injected here
@@ -385,7 +397,7 @@ def hook():
         if not text.strip(): return
         if relayed(payload): return                          # the successor's ask now, not this session's
         _, attrs = strip_tag(text)
-        if not_a_person(text, attrs): return                 # machine chatter, not an ask — see NOT_A_PERSON
+        if not_a_person(text, attrs): return                 # machine chatter — see NOT_A_PERSON{,_RE}
         if not attrs:                                        # no channel tag: a prompt typed into the session
             if os.environ.get("CC_ROLE") in ("worker", "member") or worker_cwd(cwd): return
         repo = repo_of(cwd) or os.environ.get("CC_REPO") or "box"
@@ -813,7 +825,22 @@ def selfcheck():
         t("a non-owner Slack message is not an ask, through the hook too",
           skipped('<channel source="cc-slack" chat_id="C9" ts="18.1" user="sam" role="member" '
                   'channel="#help">please fix the printer'))
-        # ...and the two things the filter must never eat.
+        # NOT_A_PERSON_RE: cc-handoff --kick, typing the opening prompt in front of a successor. Verbatim
+        # from cc-handoff's KICK, both ways it renders — `start()` always passes the handoff id, `kick()`
+        # defaults it to empty. Its paired case is the one directly below: the same wrapper WORD, from a
+        # person, still opens a row, which is what stops this from being a "cc-handoff" prefix match.
+        def kick(hid=""):
+            return ("cc-handoff%s: you are the SUCCESSOR for demo — your handoff brief is in your system "
+                    "prompt. Start now: run `cc-handoff --brief demo` first, ask the predecessor ONE batch "
+                    "of questions about what the packet did not answer, and run `cc-handoff --ready` only "
+                    "once you have the context.") % ((" " + hid) if hid else "")
+        t("the prompt that starts a successor session is not an owner ask",
+          skipped(kick("9f2c1a7b04d3")))
+        t("...and the same prompt without a handoff id in it is not either", skipped(kick()))
+        # ...and the three things the filter must never eat.
+        t("an owner ask that merely starts with the word cc-handoff still records",
+          hook_asks("cc-handoff leaves the old window alive after a retire — please fix that before the "
+                    "next one") == 1)
         t("an owner prompt typed in the terminal still records",
           hook_asks("add the skip list to the ask-capture hook") == 1)
         t("an owner Slack message still records",
