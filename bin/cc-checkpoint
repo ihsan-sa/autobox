@@ -10,6 +10,9 @@
 # the primary worktree / default branch (no marker there), so main/planning sessions stay clean.
 # Refuses (and logs to .cc/checkpoint.err) when HEAD is not the track's own branch — a session can rewrite
 # HEAD with git symbolic-ref — or when the staged names look like secrets. Push stderr → .cc/push.err.
+# The push carries whatever credential `cc-gh-token gitargs` gives it for that remote — a GitHub App token for
+# the org this box has an app for, nothing at all for any other remote — so a repo whose only credential is the
+# app pushes unattended. The token is minted for the push and nothing about it is written here.
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 MODE=commit; case "${1:-}" in --push) MODE=push;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
@@ -25,17 +28,22 @@ MODE=commit; case "${1:-}" in --push) MODE=push;; "") ;; *) echo "cc-checkpoint:
 # that branch. That is never overwritten and never swallowed — see lease_refused.
 lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed · 2 the lease was refused
   local branch="$1" lease
+  # The credential. `cc-gh-token gitargs` prints the `git -c …` arguments that authenticate as this box's
+  # GitHub App — and prints NOTHING for a remote the app does not cover, or on a box with no app, so every
+  # other push still uses whatever helper ~/.gitconfig gives it. Without this a member project's push has no
+  # credential at all and stops on "could not read Username", which is how two finished branches sat unpushed.
+  local -a cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$(git remote get-url origin 2>/dev/null)" 2>/dev/null)
   # Plain push FIRST, and force nothing when it works: a fast-forward never needed a lease. It is also how a
   # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
   # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
-  if git push -q -u origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+  if git "${cred[@]}" push -q -u origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
   grep -qE 'non-fast-forward|fetch first' "$root/.cc/push.err.tmp" || { mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
   lease=$(cat "$root/.cc/pushed" 2>/dev/null)
   # Nothing recorded yet (a track older than .cc/pushed): the tracking ref is the best account of the remote we
   # have, and one push from here replaces the guess with the real thing.
   [ -n "$lease" ] || lease=$(git rev-parse -q --verify "refs/remotes/origin/$branch" 2>/dev/null)
   if [ -n "$lease" ]; then
-    if git push -q -u --force-with-lease="refs/heads/$branch:$lease" origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+    if git "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
     mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"
     grep -qE 'stale info|non-fast-forward|fetch first' "$root/.cc/push.err" && return 2
     return 1; fi

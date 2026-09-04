@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# cc-gh-token — a short-lived GitHub App installation token, minted on demand, so a push from a track
+# worktree authenticates without a person present.
+#   cc-gh-token gitargs <remote-url>    the `git -c …` arguments that make git authenticate as the app for
+#                                       that remote, one per line — and NOTHING for any other remote, so
+#                                       every other push keeps whatever helper ~/.gitconfig already gives it
+#   cc-gh-token get|store|erase         git's credential-helper protocol on stdin (what gitargs wires up)
+#   cc-gh-token selfcheck               minting, reuse, expiry, an absent key and the scoping, on fixtures
+#                                       of its own: its own RSA key, its own API on localhost, its own cache
+#
+# THE APP IS CONFIGURATION, NEVER CONTENT. Nothing here names a box, an org, an ID or a key path — those are
+# keys in ~/.cc/config, which is absent inside every sandbox profile (cc-sandbox), read through cc-config,
+# which never sources it. The four that make an app, all required:
+#   CC_GH_APP_ID · CC_GH_APP_INSTALL_ID · CC_GH_APP_KEY (path to the private key) · CC_GH_APP_OWNER (the org
+#   or user the installation covers)
+# and two with defaults: CC_GH_APP_HOST (github.com) · CC_GH_API (the public API).
+# Configure none of them and every subcommand is a no-op: gitargs prints nothing, so a box with no app pushes
+# exactly as it did before.
+#
+# THE TOKEN IS THE SECRET AND IT IS TREATED LIKE ONE. It goes to git's stdin pipe and to ~/.cc/secrets/
+# gh-app-token.json, mode 600 — the directory the private key itself lives in, 700 and bound by no bwrap
+# profile, so neither is readable from inside a worker or member workspace. Nowhere else: not a log, not a
+# board row, not a journal, not Slack. The API error path prints the API's `message` and never the response
+# body. The JWT that buys the token is handed to curl through `-K -`, not argv, so it is not in `ps` either.
+# CC_GH_TOKEN_CACHE moves that file (the selfcheck below, which never touches the real one).
+set -uo pipefail
+umask 077   # the cache below is a credential: never group- or world-readable, not even for an instant
+
+SELF="$(readlink -f "$0")"
+BIN="$(dirname "$SELF")"
+USAGE="usage: cc-gh-token gitargs <remote-url> | get | store | erase | selfcheck"
+MARGIN=300   # seconds of life a cached token must still have to be reused — see cache_read
+
+cfg(){ "$BIN/cc-config" get "$1" "${2:-}"; }
+APP_ID=$(cfg CC_GH_APP_ID)
+INSTALL_ID=$(cfg CC_GH_APP_INSTALL_ID)
+KEY=$(cfg CC_GH_APP_KEY)
+OWNER=$(cfg CC_GH_APP_OWNER)
+HOST=$(cfg CC_GH_APP_HOST github.com)
+API=$(cfg CC_GH_API https://api.github.com)
+CACHE="${CC_GH_TOKEN_CACHE:-$HOME/.cc/secrets/gh-app-token.json}"
+
+configured(){ [ -n "$APP_ID" ] && [ -n "$INSTALL_ID" ] && [ -n "$KEY" ] && [ -n "$OWNER" ]; }
+die(){ echo "cc-gh-token: $1" >&2; exit 1; }
+
+# ── the cache ────────────────────────────────────────────────────────────────────────────────────
+# An installation token lives an hour; minting one costs a signature and a round trip, and a loop pushes
+# after every iteration. So it is cached — in the key's own directory, which is already the box's most
+# guarded one — and re-minted the moment it is near its end. `expires_at` comes back at SECOND resolution
+# ("2026-09-04T02:12:00Z") and is compared as seconds. A token with exactly MARGIN left is treated as
+# expired, not as usable: a push starting now must not be handed a credential that dies mid-transfer.
+cache_read(){   # prints a still-usable token, or nothing (and removes a cache that has expired)
+  local tok exp now
+  [ -f "$CACHE" ] || return 1
+  tok=$(jq -r '.token // empty' "$CACHE" 2>/dev/null)
+  exp=$(jq -r '.expires_at // empty' "$CACHE" 2>/dev/null)
+  [ -n "$tok" ] && [ -n "$exp" ] || { rm -f "$CACHE"; return 1; }
+  exp=$(date -u -d "$exp" +%s 2>/dev/null) || { rm -f "$CACHE"; return 1; }
+  now=$(date -u +%s)
+  [ "$((exp - now))" -gt "$MARGIN" ] || { rm -f "$CACHE"; return 1; }   # gone, or too near gone to use
+  printf '%s' "$tok"
+}
+cache_write(){   # $1 token, $2 expires_at — atomic, so a reader never sees half a credential
+  local d; d=$(dirname "$CACHE"); mkdir -p "$d" 2>/dev/null; chmod 700 "$d" 2>/dev/null
+  jq -n --arg t "$1" --arg e "$2" '{token:$t,expires_at:$e}' > "$CACHE.tmp.$$" || return 1
+  chmod 600 "$CACHE.tmp.$$"; mv -f "$CACHE.tmp.$$" "$CACHE"
+}
+
+# ── minting ──────────────────────────────────────────────────────────────────────────────────────
+b64url(){ openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+jwt(){   # RS256, signed by the app's private key. 9 minutes: GitHub's own ceiling is 10.
+  local hdr pay now body
+  now=$(date -u +%s)
+  hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+  # iat one minute back absorbs the clock skew GitHub rejects a JWT for.
+  pay=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$APP_ID" | b64url)
+  body="$hdr.$pay"
+  printf '%s.%s' "$body" "$(printf '%s' "$body" | openssl dgst -sha256 -sign "$KEY" -binary 2>/dev/null | b64url)"
+}
+mint(){   # prints the token; caches it; every failure is a message on stderr and nothing on stdout
+  local j r tok exp msg
+  [ -r "$KEY" ] || die "the app's private key is not readable at $KEY — nothing can be minted (the owner places it; a sandboxed session cannot and must not)"
+  j=$(jwt); [ -n "${j##*.}" ] || die "signing the JWT failed — is $KEY an RSA private key?"
+  # -K - keeps the JWT out of argv, where `ps` would show it to every process on the box.
+  r=$(curl -sS --max-time 20 -K - <<EOF
+url = "$API/app/installations/$INSTALL_ID/access_tokens"
+request = "POST"
+header = "Authorization: Bearer $j"
+header = "Accept: application/vnd.github+json"
+header = "X-GitHub-Api-Version: 2022-11-28"
+EOF
+  ) || die "the token request did not complete"
+  tok=$(jq -r '.token // empty' <<<"$r" 2>/dev/null)
+  exp=$(jq -r '.expires_at // empty' <<<"$r" 2>/dev/null)
+  # Never the body: a response is not a place to be careless, and the message is the part that helps.
+  [ -n "$tok" ] && [ -n "$exp" ] || { msg=$(jq -r '.message // "no token in the response"' <<<"$r" 2>/dev/null); die "GitHub refused to mint: ${msg:-no token in the response}"; }
+  cache_write "$tok" "$exp" || die "could not write the token cache at $CACHE"
+  printf '%s' "$tok"
+}
+token(){ local t; t=$(cache_read) && [ -n "$t" ] && { printf '%s' "$t"; return 0; }; mint; }
+
+# ── the two doors ────────────────────────────────────────────────────────────────────────────────
+gitargs(){   # $1 remote url. Prints the -c arguments, one per line, ONLY for a remote this app covers.
+  local url="$1" rest owner
+  configured || return 0
+  case "$url" in "https://$HOST/"*) rest=${url#"https://$HOST/"} ;; *) return 0 ;; esac   # ssh and every other host: not ours
+  owner=${rest%%/*}
+  [ "${owner,,}" = "${OWNER,,}" ] || return 0
+  # The empty value first RESETS the helper list: ~/.gitconfig already names a helper for this host (gh's),
+  # it is tried before anything -c appends, and it would answer for the app's org with the wrong account.
+  # git appends the operation itself, so the value ends at the command: it runs `cc-gh-token get`.
+  printf -- '-c\ncredential.helper=\n-c\ncredential.helper=!%q\n' "$SELF"
+}
+helper_get(){   # git's credential protocol: key=value lines in, username/password out
+  local line k v tok host='' proto=''
+  while IFS= read -r line; do
+    [ -z "$line" ] && break
+    k=${line%%=*}; v=${line#*=}
+    case "$k" in host) host=$v ;; protocol) proto=$v ;; esac
+  done
+  configured || die "no GitHub App is configured (CC_GH_APP_ID, CC_GH_APP_INSTALL_ID, CC_GH_APP_KEY, CC_GH_APP_OWNER in ~/.cc/config)"
+  # gitargs only wires this helper up for the app's own host, but a redirect can move the request: check.
+  [ "$proto" = https ] && [ "${host,,}" = "${HOST,,}" ] || die "asked for $proto://$host, which this app does not cover"
+  # Captured first, and nothing printed if it failed: half a credential on stdout is a push that fails
+  # somewhere further away, with a worse message, than the one `token` already put on stderr.
+  tok=$(token) && [ -n "$tok" ] || exit 1
+  printf 'username=x-access-token\npassword=%s\n' "$tok"
+}
+
+selfcheck(){
+  local n=0 f=0 out rc port tok tok2 sig body iss   # pid and T are NOT local: the EXIT trap that stops the
+  # fixture API and removes the temp dir fires in the global scope, after this function's locals are gone. A
+  # local `pid` there reads empty, the server is never killed, and it holds the pipe of whatever captured this
+  # selfcheck's output open FOR EVER — which is check.sh hanging, not a test failing.
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
+  T="$(mktemp -d)"; pid=""; trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$T"' EXIT
+  # Fixture values only — core/ is published and nothing in it may name a box (myrepo, owner@example.com).
+  openssl genrsa -out "$T/key.pem" 2048 2>/dev/null
+  openssl rsa -in "$T/key.pem" -pubout -out "$T/key.pub" 2>/dev/null
+  cat > "$T/api.py" <<'PY'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+T = sys.argv[1]
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        try: n = int(open(T + "/mints").read())
+        except Exception: n = 0
+        n += 1
+        open(T + "/mints", "w").write(str(n))
+        open(T + "/auth", "w").write(self.headers.get("Authorization", ""))
+        open(T + "/path", "w").write(self.path)
+        body = json.dumps({"token": "ghs_fixture%d" % n,
+                           "expires_at": open(T + "/expires").read().strip()}).encode()
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+s = HTTPServer(("127.0.0.1", 0), H)
+open(T + "/port", "w").write(str(s.server_address[1]))
+s.serve_forever()
+PY
+  future(){ date -u -d "+$1" +%FT%TZ; }
+  d64(){ python3 -c 'import base64,sys;s=sys.stdin.read().strip();sys.stdout.buffer.write(base64.urlsafe_b64decode(s+"="*(-len(s)%4)))'; }
+  echo "$(future '60 minutes')" > "$T/expires"; echo 0 > "$T/mints"
+  python3 "$T/api.py" "$T" & pid=$!
+  for _ in $(seq 50); do [ -s "$T/port" ] && break; sleep 0.1; done
+  port=$(cat "$T/port" 2>/dev/null); [ -n "$port" ] || { echo "cc-gh-token selfcheck: the fixture API did not start"; return 1; }
+  cat > "$T/config" <<EOF
+CC_GH_APP_ID=12345
+CC_GH_APP_INSTALL_ID=67890
+CC_GH_APP_KEY=$T/key.pem
+CC_GH_APP_OWNER=myorg
+CC_GH_API=http://127.0.0.1:$port
+EOF
+  # Every case runs the real script with a config, a cache and a mint counter it sets itself.
+  G(){ CC_CONFIG="$T/config" CC_GH_TOKEN_CACHE="$T/cache.json" "$SELF" "$@"; }
+  ask(){ printf 'protocol=https\nhost=github.com\npath=myorg/myrepo.git\n\n' | G get; }
+
+  # ── minting ──
+  rm -f "$T/cache.json"; echo 0 > "$T/mints"
+  out=$(ask); rc=$?
+  k "$(t test $rc = 0)" "a push with no cached token mints one"
+  k "$(t grep -qx 'username=x-access-token' <<<"$out")" "…and answers git with the app's username"
+  tok=$(sed -n 's/^password=//p' <<<"$out")
+  k "$(t test "$tok" = ghs_fixture1)" "…and the token the API returned"
+  k "$(t test "$(cat "$T/mints")" = 1)" "…having asked the API exactly once"
+  k "$(t test "$(cat "$T/path")" = /app/installations/67890/access_tokens)" "the installation id from the config picks the endpoint"
+  # The JWT is the whole authentication: verify the signature, not just that a header was sent.
+  sig=$(sed 's/^Bearer //' "$T/auth"); body=${sig%.*}
+  printf '%s' "${sig##*.}" | d64 > "$T/sig.bin"
+  printf '%s' "$body" | openssl dgst -sha256 -verify "$T/key.pub" -signature "$T/sig.bin" >/dev/null 2>&1
+  k $? "…over a JWT really signed by the app's private key"
+  iss=$(cut -d. -f2 <<<"$sig" | d64 | jq -r '.iss // empty')
+  k "$(t test "$iss" = 12345)" "…and issued by the app id from the config"
+  k "$(t test "$(stat -c %a "$T/cache.json")" = 600)" "the cached token is mode 600"
+
+  # ── reuse: a token with life left is not re-minted ──
+  echo 0 > "$T/mints"
+  jq -n --arg e "$(future '59 minutes')" '{token:"ghs_cached",expires_at:$e}' > "$T/cache.json"
+  out=$(ask)
+  k "$(t grep -qx 'password=ghs_cached' <<<"$out")" "a cached token with life left is handed to git as it is"
+  k "$(t test "$(cat "$T/mints")" = 0)" "…and the API is not asked at all"
+
+  # ── expiry: replaced, on its own, without anyone being asked ──
+  echo 0 > "$T/mints"; echo "$(future '60 minutes')" > "$T/expires"
+  jq -n --arg e "$(date -u -d '-1 minute' +%FT%TZ)" '{token:"ghs_stale",expires_at:$e}' > "$T/cache.json"
+  out=$(ask); tok2=$(sed -n 's/^password=//p' <<<"$out")
+  k "$(t test "$(cat "$T/mints")" = 1)" "an EXPIRED cached token is re-minted, with no prompt and no error"
+  k "$(t test "$tok2" != ghs_stale -a -n "$tok2")" "…and the fresh token, not the stale one, goes to git"
+  k "$(t test "$(jq -r .token "$T/cache.json")" = "$tok2")" "…and replaces it in the cache"
+  # The margin is the case that actually breaks: a token still valid, but not for long enough to push with.
+  echo 0 > "$T/mints"
+  jq -n --arg e "$(future "$MARGIN seconds")" '{token:"ghs_edge",expires_at:$e}' > "$T/cache.json"
+  out=$(ask)
+  k "$(t test "$(cat "$T/mints")" = 1)" "a token with exactly the margin left counts as expired, not as usable"
+  k "$(t test -z "$(grep -x 'password=ghs_edge' <<<"$out")")" "…so git never gets a credential that dies mid-push"
+  echo 0 > "$T/mints"
+  jq -n --arg e "$(future "$((MARGIN + 120)) seconds")" '{token:"ghs_ok",expires_at:$e}' > "$T/cache.json"
+  out=$(ask)
+  k "$(t grep -qx 'password=ghs_ok' <<<"$out")" "…while one comfortably past the margin is still reused"
+  k "$(t test "$(cat "$T/mints")" = 0)" "…without a round trip"
+
+  # ── an absent key ──
+  echo 0 > "$T/mints"; rm -f "$T/cache.json"
+  sed 's#^CC_GH_APP_KEY=.*#CC_GH_APP_KEY='"$T"'/gone.pem#' "$T/config" > "$T/config.nokey"
+  out=$(printf 'protocol=https\nhost=github.com\n\n' | CC_CONFIG="$T/config.nokey" CC_GH_TOKEN_CACHE="$T/cache.json" "$SELF" get 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0)" "an absent private key fails the push instead of hanging on a prompt"
+  k "$(t test -z "$out")" "…printing NO half credential on stdout"
+  k "$(t grep -q "$T/gone.pem" "$T/err")" "…and naming the path it wanted on stderr"
+  k "$(t test "$(cat "$T/mints")" = 0)" "…without reaching the API"
+  k "$(t test ! -e "$T/cache.json")" "…and without leaving a cache file behind"
+
+  # ── scoping: whose remotes this app answers for ──
+  k "$(t test -n "$(G gitargs https://github.com/myorg/myrepo.git)")" "gitargs wires the helper up for a remote in the app's org"
+  k "$(t grep -qx 'credential.helper=' <<<"$(G gitargs https://github.com/myorg/myrepo.git)")" \
+     "…resetting the helper list first, so ~/.gitconfig's own helper cannot answer ahead of it"
+  k "$(t test -z "$(G gitargs https://github.com/someone-else/myrepo.git)")" "another owner on the same host gets nothing"
+  k "$(t test -z "$(G gitargs https://gitlab.example.com/myorg/myrepo.git)")" "another host gets nothing"
+  k "$(t test -z "$(G gitargs git@github.com:myorg/myrepo.git)")" "an ssh remote gets nothing (it has no credential helper to wire)"
+  k "$(t test -z "$(G gitargs '')")" "a repo with no remote gets nothing"
+  k "$(t test -z "$(CC_CONFIG=/dev/null "$SELF" gitargs https://github.com/myorg/myrepo.git)")" \
+     "a box with no app configured gets nothing at all, so its pushes are untouched"
+  out=$(printf 'protocol=https\nhost=github.com\n\n' | CC_CONFIG=/dev/null "$SELF" get 2>&1 >/dev/null)
+  k "$(t grep -q CC_GH_APP_ID <<<"$out")" "…and asking one for a credential says which keys are missing"
+  out=$(printf 'protocol=https\nhost=evil.example.com\n\n' | G get 2>&1 >/dev/null); rc=$?
+  k "$(t test $rc != 0)" "a request redirected to another host is refused, not answered"
+
+  # ── the token lands nowhere durable ──
+  rm -f "$T/cache.json"; echo 0 > "$T/mints"; future '60 minutes' > "$T/expires"
+  tok=$(ask | sed -n 's/^password=//p')
+  k "$(t test "$(grep -rl -F -- "$tok" "$T" 2>/dev/null)" = "$T/cache.json")" \
+     "the minted token is in the mode-600 cache and in NO other file the mint touched — no log, no journal, no board row"
+  echo "cc-gh-token selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+
+case "${1:-}" in
+  gitargs)        shift; [ $# -eq 1 ] || { echo "$USAGE" >&2; exit 2; }; gitargs "$1" ;;
+  get)            helper_get ;;
+  store|erase)    exit 0 ;;   # git's protocol requires both; nothing here stores or forgets on git's say-so
+  selfcheck)      selfcheck ;;
+  *)              echo "$USAGE" >&2; exit 2 ;;
+esac
