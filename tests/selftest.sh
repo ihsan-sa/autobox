@@ -1371,9 +1371,13 @@ ME "$B/cc-limit" check "$T/cred.json" >/dev/null
 { ME "$B/cc-limit" status | grep -q 'usage limit until'; } && ok "cc-limit: an exhausted credit balance is a limit too (backoff, no reset time in the message)" || bad "cc-limit missed the credit wording"
 rm -f "$MH/.cc/state/claude-limit"
 printf '{"is_error":true,"result":"claude-fable-5: You have hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}' > "$T/fab.json"
-ME "$B/cc-limit" check "$T/fab.json" >/dev/null
+ME env CC_LIMIT_OBSERVER=worker-a "$B/cc-limit" check "$T/fab.json" >/dev/null
 [ "$(cut -f4 "$MH/.cc/state/claude-limit")" = fable ] && ok "cc-limit records the limited model (stamp field 4)" || bad "stamp model: $(cut -f4 "$MH/.cc/state/claude-limit" 2>/dev/null)"
-{ [ "$(M status)" = "opus until $(muntil)" ] && [ "$(cut -f3 "$MH/.cc/state/model-override")" -gt "$(date -u +%s)" ]; } && ok "a fable limit puts the box on opus until the reset, dated whenever that reset is not today" || bad "cc-model status after a fable limit: $(M status), want opus until $(muntil)"
+# ONE run's limit is not the box's: on 2026-09-04 one worker's 09:13Z stamp moved every session for six hours while
+# opus went on answering. A second run has to hit the same limit before anything but that run is moved.
+[ "$(M status)" = fable ] && ok "one run's limit leaves every other session on the primary model" || bad "one run's limit moved the box: $(M status)"
+ME env CC_LIMIT_OBSERVER=worker-b "$B/cc-limit" check "$T/fab.json" >/dev/null   # a second worker hits the same limit
+{ [ "$(M status)" = "opus until $(muntil)" ] && [ "$(cut -f3 "$MH/.cc/state/model-override")" -gt "$(date -u +%s)" ]; } && ok "a fable limit two runs hit puts the box on opus until the reset, dated whenever that reset is not today" || bad "cc-model status after a fable limit: $(M status), want opus until $(muntil)"
 [ "$(M current)" = claude-opus-5 ] && ok "cc-model current feeds --model to new sessions and workers" || bad "cc-model current: $(M current)"
 sleep 1
 MT capture-pane -p -t _ccmodel:sess | grep -q '/model claude-opus-5' && ok "switch typed /model into the live interactive session" || bad "nothing typed into the session"

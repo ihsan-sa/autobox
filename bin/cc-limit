@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # cc-limit — LLM-free detection of Claude usage/rate limits, and one shared "wait until it resets" stamp.
 #   cc-limit check <claude-json> [<stderr-file>]   prints "LIMIT <epoch>" + exit 0 when that run hit a limit, else exit 1
-#   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0, or "clear" + exit 1
-#   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT
+#   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0 when the stamp binds THIS caller, else
+#                      "clear" + exit 1 (with a note on stderr when a stamp exists that does not bind it)
+#   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT;
+#                      exit 0 at once when the stamp does not bind this caller — there is nothing to wait for
 #   cc-limit clear     forget it (every caller does this after a run that reached the API)
 #   cc-limit record [--dry] [<pane|window-id> <window>]   note an INTERACTIVE session the limit interrupted (no
 #                      args = every live session, answering with the best code it found). exit 0 = recorded ·
@@ -11,11 +13,13 @@
 #                      either · 1 = no limit line at all
 #   cc-limit resume    nudge each recorded session whose reset has passed, ONCE, then forget it
 #   cc-limit selfcheck the record/resume state machine, on stubs
-# Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>\t<model-family>" — shared, so a second
-# loop waits instead of burning its retries; the model is what cc-model needs to know whose limit it was (may be empty
-# when the message names none). No secrets in it. Env: CC_LIMIT_MAX_WAIT (default 21600 = 6 h)
+# Stamp: ~/.cc/state/claude-limit = "<until-epoch>\t<source>\t<first-seen-epoch>\t<model-family>\t<observers>" — shared,
+# so a second loop waits instead of burning its retries; the model is what cc-model needs to know whose limit it was
+# (may be empty when the message names none); the observers are which RUNS have hit it (see below). No secrets in it.
+# Env: CC_LIMIT_MAX_WAIT (default 21600 = 6 h)
 # · CC_LIMIT_MIN_WAIT (test hook: cap any sleep at N seconds) · CC_LIMIT_STAMP (test hook: put the stamp somewhere
-#   else, so a test limit never makes the box's real loops wait) · CC_LIMIT_RECORD · CC_LIMIT_NUDGED · CC_LIMIT_ARM
+#   else, so a test limit never makes the box's real loops wait) · CC_LIMIT_OBSERVER (test hook: the key that says
+#   which run this is; the run's cwd otherwise) · CC_LIMIT_RECORD · CC_LIMIT_NUDGED · CC_LIMIT_ARM
 #   (test hook: what to arm with — it is called as `<seconds> <unit-name>`; "-" = arm nothing) · CC_LIMIT_NOW
 #   · CC_LIMIT_BIN · CC_TMUX_SESSION.
 #
@@ -28,6 +32,21 @@
 # whose pane no longer shows the limit line moved on by itself and is skipped, and a record whose reset has moved out
 # is rescheduled rather than sent early, and a pane nudged in the last half hour is not recorded again — the limit
 # line stays on its screen after it comes back, and a stale line must not buy a second nudge.
+# ONE RUN'S LIMIT IS NOT THE BOX'S. On 2026-09-04 at 09:13:29Z one headless worker was told "usage limit until
+# 06:00Z" and exited. That stamped the box: `status` read "usage limit until 06:00Z (898m left)" and every session
+# believed it for six hours, while opus went on answering (the spend ledger has successful rows at 14:54, 14:55 and
+# 14:59Z from three different sessions). A person ended it, as they had three times on 09-03. So the stamp now says
+# WHO hit it, and two things read that:
+#   The OBSERVERS. `check` adds the run's own key (an md5 of its cwd — one per worktree, so one per worker) to the
+#   stamp. One observer = the limit binds that run alone: it parks and reruns itself exactly as before, and every
+#   other caller reads `clear`. Two = account-wide, and the box parks exactly as it does today. A real account-wide
+#   limit confirms itself on the very next run that tries, and the one attempt that costs is rejected outright, so
+#   it burns no reset — which is the asymmetry to hold: believing a limit wrongly costs a day of work.
+#   THE ACCOUNT ANSWERING. A limit that two runs hit can still be wrong. cc-spend's ledger records every call this
+#   box makes, so a stamp is dropped outright once TWO different sessions have completed calls (on the limited
+#   model's family, or any family when the stamp names none) more than five minutes (GRACE) past the moment it
+#   was first seen: nothing answers under a real account-wide limit. Dropping it pushes the owner one line, once per episode
+#   — six hours of dead box against a working account must not happen again without somebody being told.
 # A pane line alone is not proof — this box's own docs and briefs say "usage limit" too — so a record needs the line
 # AND corroboration: the shared stamp is live, or cc-model itself judged a limit recently — a live
 # ~/.cc/state/model-override, or a switch in ~/.cc/state/model.log inside the last 6 h. Both files are cc-model's;
@@ -40,6 +59,7 @@ S="${CC_LIMIT_STAMP:-$HOME/.cc/state/claude-limit}"; MAX="${CC_LIMIT_MAX_WAIT:-2
 REC="${CC_LIMIT_RECORD:-$HOME/.cc/state/limit-interrupted}"
 NUDGED="${CC_LIMIT_NUDGED:-$HOME/.cc/state/limit-nudged}"; QUIET=1800   # see nudged_recently
 SEEN="${CC_LIMIT_SEEN:-$HOME/.cc/state/limit-seen}"; JUDGE=3600         # see first_seen: how long an uncorroborated line stays "not judged yet"
+DISB="$S.disbelieved"; GRACE=300   # see answering: how long after a limit was first seen a completed call disproves it
 now="${CC_LIMIT_NOW:-$(date -u +%s)}"; DRY=""
 # What a session shows when the limit stopped it. Tighter than cc-model's (which only decides which MODEL to use):
 # this one ends in a message typed at a human's session, so prose that merely mentions limits must not match.
@@ -47,7 +67,60 @@ PANE_RE='usage limit reached|out of usage credits|limit will reset|limit reached
 TAIL=15   # the pane's LAST 15 visible lines (capture-pane piped through tail). A session STOPPED by the limit
           # shows that line just above its input box; higher up may be anything — including a file that quotes
           # the wording. Narrow beats clever: the window is read again at the reset, before anything is typed.
-stamp(){ ends=0; src=""; first=0; mdl=""; [ -f "$S" ] && IFS=$'\t' read -r ends src first mdl < "$S"; [[ "$ends" =~ ^[0-9]+$ ]] || ends=0; [[ "$first" =~ ^[0-9]+$ ]] || first=0; }
+stamp(){   # the shared stamp's five fields. Split by awk and NOT by `IFS=$'\t' read`: tab is IFS WHITESPACE, so bash
+           # folds "\t\t" into one delimiter — and the stamp of 2026-09-04 named no model, so its empty field 4 slid
+           # the observers into $mdl and the run that hit the limit could not find its own key.
+  ends=0; src=""; first=0; mdl=""; obs=""
+  [ -f "$S" ] && { IFS= read -r ends; IFS= read -r src; IFS= read -r first; IFS= read -r mdl; IFS= read -r obs; } \
+    < <(awk -F'\t' 'NR==1{for (i = 1; i <= 5; i++) print $i}' "$S")
+  [[ "$ends" =~ ^[0-9]+$ ]] || ends=0; [[ "$first" =~ ^[0-9]+$ ]] || first=0; }
+
+# ---- whose limit is it? (see "ONE RUN'S LIMIT IS NOT THE BOX'S" above)
+mykey(){   # which RUN this is. The cwd, because that is one per worktree and so one per worker — the unit the
+           # incident was about ("one headless worker on this repo"). Hashed to keep paths out of a shared file.
+  printf '%s' "${CC_LIMIT_OBSERVER:-$PWD}" | md5sum | cut -c1-8; }
+obs_list(){ tr ',' '\n' <<<"${obs:-}" | grep -x '[0-9a-f]\{8\}'; }   # the stamp's observers, one per line (none = no output)
+nobs(){ obs_list | grep -c . || true; }                              # how many distinct runs have hit it
+add_obs(){   # $1 = a key -> the observer list with $1 on the end, oldest dropped past four
+  { obs_list | grep -vx "$1"; echo "$1"; } | tail -4 | paste -sd, -; }
+
+answering(){   # Is the ACCOUNT answering, this long after the stamp was first seen? Then no limit it names is
+               # account-wide, whoever wrote it. cc-spend's ledger is every call this box completed:
+               # ~/.cc/state/spend/<day>.tsv, "<ts> <session> <cwd> <repo> <track> <kind> <model> …", ts in UTC
+               # ISO seconds — the resolution it is compared at, so a row ON the cutoff second is not past it.
+               # TWO different sessions, not one: a person can go on answering a real limit out of usage credits,
+               # and believing a limit wrongly costs a day of work while disbelieving one wrongly costs a reset.
+  local cutoff day f
+  stamp; [ "$first" -gt 0 ] || return 1
+  cutoff=$(date -u -d "@$((first + GRACE))" +%Y-%m-%dT%H:%M:%SZ)
+  # EVERY calendar day the stamp has lived through, first seen to now: reading only those two days left a limit
+  # first seen late on day 1 with a reset a week out (the weekly one cc-land anticipates) believed on day 3 while
+  # day 2's rows disproved it (review of #215).
+  day=$(date -u -d "$(date -u -d "@$first" +%F)" +%s)   # midnight UTC of the day it was first seen
+  while [ "$day" -le "$now" ]; do
+    f="$HOME/.cc/state/spend/$(date -u -d "@$day" +%F).tsv"; [ -f "$f" ] && cat "$f"
+    day=$((day + 86400))
+  done | awk -F'\t' -v cutoff="$cutoff" -v fam="${mdl:-}" '
+      $1 !~ /^#/ && $1 > cutoff && $7 ~ fam { seen[$2] = 1 }         # fam empty = the stamp named no model = any row
+      END { exit !(length(seen) >= 2) }'; }
+
+disbelieve(){   # drop a stamp the account has plainly outlived, and tell the owner ONCE per episode — the cure for
+                # every one of these has been a person noticing, four times in two days.
+  local was="$first" till="$ends"
+  rm -f "$S"; ends=0
+  [ "$(cat "$DISB" 2>/dev/null)" = "$was" ] && return 0
+  mkdir -p "$(dirname "$DISB")"; printf '%s\n' "$was" > "$DISB"
+  [ -x "$BIN/cc-notify" ] && "$BIN/cc-notify" -t "$(hostname -s) limit" \
+    "A usage limit seen at $(date -u -d "@$was" +%H:%M)Z parked this box until $(date -u -d "@$till" +%H:%M)Z, but the account has gone on answering since. Dropped it; autonomous work carries on." >/dev/null 2>&1
+  return 0; }
+
+believe(){   # exit 0 = the live stamp binds THIS caller, and stamp()'s variables are loaded. The one gate `status`
+             # and `wait` share, so no caller has to know the rule.
+  stamp
+  [ "$ends" -gt "$now" ] || return 1
+  answering && { disbelieve; return 1; }
+  [ "$(nobs)" -ge 2 ] && return 0            # two runs hit it: account-wide, and the box parks as it always has
+  obs_list | grep -qx "$(mykey)"; }          # one run: it binds that run, and nobody else
 
 parse_reset(){   # a reset time named anywhere in $1 -> $u (epoch; 0 = the message named none) and $how (how it was read)
   local txt="$1" m c n z tz=UTC
@@ -229,7 +302,7 @@ resume(){   # everything due, once each; everything not due, left exactly where 
 
 selfcheck(){   # stubs only: its own HOME, a stub tmux and cc-msg, and a clock it is handed. No tmux server, no timer,
                # no session on this box is read or written.
-  local d n=0 bad=0 t0=1000000000 t1 t2 t3 t4 rc h out deep work
+  local d n=0 bad=0 t0=1000000000 t1 t2 t3 t4 rc h out deep work OBS=runA cutoff
   d=$(mktemp -d) || return 1
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   mkdir -p "$d/bin" "$d/.cc/state" "$d/panes"
@@ -255,7 +328,15 @@ EOF
 #!/usr/bin/env bash
 set -u; printf 'arm %s %s\n' "${1:-}" "${2:-}" >> "$CC_FAKE_CALLS"
 EOF
-  chmod +x "$d/bin/tmux" "$d/bin/cc-msg" "$d/bin/arm"
+  cat > "$d/bin/cc-model" <<'EOF'
+#!/usr/bin/env bash
+set -u; printf 'model %s\n' "$*" >> "$CC_FAKE_CALLS"
+EOF
+  cat > "$d/bin/cc-notify" <<'EOF'
+#!/usr/bin/env bash
+set -u; printf 'notify %s\n' "$*" >> "$CC_FAKE_CALLS"
+EOF
+  chmod +x "$d/bin/tmux" "$d/bin/cc-msg" "$d/bin/arm" "$d/bin/cc-model" "$d/bin/cc-notify"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
   : > "$d/calls"
   # EVERY CC_LIMIT_* path is pinned under $d, not just inherited from HOME: a caller may hold its own in the
@@ -265,7 +346,13 @@ EOF
     CC_LIMIT_STAMP="$d/.cc/state/claude-limit" CC_LIMIT_RECORD="$d/.cc/state/limit-interrupted" \
     CC_LIMIT_NUDGED="$d/.cc/state/limit-nudged" CC_LIMIT_SEEN="$d/.cc/state/limit-seen" \
     CC_FAKE_PANES="$d/panes" CC_FAKE_CALLS="$d/calls" CC_FAKE_PANELIST="$d/panes.list" \
+    CC_LIMIT_OBSERVER="$OBS" CC_LIMIT_MIN_WAIT='' CC_LIMIT_MAX_WAIT='' \
     CC_LIMIT_NOW="$at" bash "$SELF" "$@"; }
+  led(){   # one row of cc-spend's ledger — $1 epoch, $2 session, $3 model: "<ts> <session> <cwd> <repo> <track>
+           # <kind> <model> <in> <out> <cache_read> <cache_write> <est_usd>", ts in the UTC ISO seconds it prints
+    mkdir -p "$d/.cc/state/spend"
+    printf '%s\ts%s\t/x\tmyrepo\tt\theadless\t%s\t1\t1\t0\t0\t0.01\n' \
+      "$(date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ)" "$2" "$3" >> "$d/.cc/state/spend/$(date -u -d "@$1" +%F).tsv"; }
   calls(){ grep -c "$1" "$d/calls" 2>/dev/null | tr -d '\n'; }
 
   me "$t0" record @1 alpha >/dev/null 2>&1
@@ -448,13 +535,103 @@ EOF
   me "$nowr" resume >/dev/null 2>&1
   t 'and resume nudges it now, not tomorrow' "$(calls '^msg alpha ')" 1
 
+  # ── ONE RUN'S LIMIT IS NOT THE BOX'S (2026-09-04) ────────────────────────────────────────────────────────────
+  # 09:13:29Z one headless worker was told "usage limit until 06:00Z" and exited 8; every other session read that
+  # stamp and did nothing for six hours while opus went on answering. Own fixture, own state: nothing above leaves
+  # a stamp, a ledger or an observer these cases could lean on.
+  t6=$((t5 + 86400)); rm -rf "$d/.cc/state/spend"
+  rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.disbelieved" "$d/.cc/state/limit-interrupted" \
+    "$d/.cc/state/limit-nudged" "$d/.cc/state/limit-seen" "$d/.cc/state/model.log"
+  : > "$d/panes.list"; : > "$d/calls"
+  printf '{"is_error":true,"result":"claude-fable-5: Claude usage limit reached. Your limit resets at %s"}\n' \
+    "$(date -u -d "@$((t6 + 54000))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/run.json"   # 15 h out, the way that morning read
+  OBS=worker-a; me "$t6" check "$d/run.json" >/dev/null 2>&1
+  t 'the run that hit the limit is written into the stamp as its one observer' \
+    "$(cut -f5 "$d/.cc/state/claude-limit")" "$(printf worker-a | md5sum | cut -c1-8)"
+  out=$(me "$t6" status 2>/dev/null); rc=$?
+  t 'and THAT run is stopped by it, exactly as before' "$rc$(grep -c 'this run only' <<<"$out")" 01
+  t 'and it still refuses to wait out a 15 h limit (CC_LIMIT_MAX_WAIT) — it parks and reruns itself' \
+    "$(me "$t6" wait >/dev/null 2>&1; echo $?)" 1
+  OBS=worker-b; out=$(me "$t6" status 2>&1); rc=$?
+  t 'every OTHER run reads clear: one run hitting a limit stops that run and nothing else' \
+    "$rc$(grep -c '^clear$' <<<"$out")" 11
+  t '…and is told on stderr what it is not being stopped by' \
+    "$(grep -c 'no second run has hit it' <<<"$out")" 1
+  t '…in words cc-land cannot read back as a live limit out of its merged stdout+stderr' \
+    "$(grep -cE 'usage limit until [0-9]{2}:[0-9]{2}Z' <<<"$out")" 0
+  t 'a run the stamp does not bind has nothing to wait for' "$(me "$t6" wait >/dev/null 2>&1; echo $?)" 0
+  t 'and one run does not move the box off its model either' "$(calls '^model ')" 0
+  me $((t6 + 60)) check "$d/run.json" >/dev/null 2>&1   # a SECOND worker hits the same limit
+  t 'two runs on the same limit make it account-wide' \
+    "$(cut -f5 "$d/.cc/state/claude-limit" | tr ',' '\n' | grep -c .)" 2
+  OBS=worker-c; out=$(me $((t6 + 60)) status 2>/dev/null); rc=$?
+  t 'and then every run is parked by it — a real account-wide limit parks the box as it does today' \
+    "$rc$(grep -c 'this run only' <<<"$out")" 00
+  t 'and only then is cc-model told whose limit it was' "$(calls '^model limited fable')" 1
+
+  # THE ACCOUNT ANSWERING. A limit two runs hit can still be wrong: on 09-04 the ledger had successful opus rows at
+  # 14:54, 14:55 and 14:59Z from three different sessions while the box sat parked. Two DIFFERENT sessions, on the
+  # limited model, past the grace — believing a limit wrongly costs a day, disbelieving one wrongly costs a reset.
+  cutoff=$((t6 + 300))   # GRACE past the moment the stamp was first seen
+  led $((cutoff + 60)) 1 claude-fable-5-1
+  t 'ONE session answering is not proof — a person can pay a real limit out in usage credits' \
+    "$(me $((t6 + 7200)) status >/dev/null 2>&1; echo $?)" 0
+  led $((cutoff + 70)) 2 claude-opus-5
+  t 'and two sessions on ANOTHER model do not disprove a limit that named fable' \
+    "$(me $((t6 + 7200)) status >/dev/null 2>&1; echo $?)" 0
+  led "$cutoff" 3 claude-fable-5-1
+  t 'a row ON the cutoff second is not past it: the ledger prints seconds and is compared as seconds' \
+    "$(me $((t6 + 7200)) status >/dev/null 2>&1; echo $?)" 0
+  led $((cutoff + 80)) 3 claude-fable-5-1
+  out=$(me $((t6 + 7200)) status 2>/dev/null); rc=$?
+  t 'TWO sessions answering the limited model past the grace drops the stamp — no six-hour dead box' \
+    "$rc$out$([ -e "$d/.cc/state/claude-limit" ] && echo yes || echo no)" 1clearno
+  t 'and the owner is told, once' "$(calls '^notify ')" 1
+  me $((t6 + 7260)) status >/dev/null 2>&1
+  t 'a second look does not push a second line for the same episode' "$(calls '^notify ')" 1
+  me $((t6 + 7260)) clear
+  t 'clear forgets the episode too, so the next one gets its own line' \
+    "$([ -e "$d/.cc/state/claude-limit.disbelieved" ] && echo yes || echo no)" no
+
+  # A LIMIT THAT SPANS DAYS. answering() read two ledger files — the day the stamp was first seen and today — so a
+  # stamp first seen late on day 1 with a reset a week out, disproved all through day 2, was still believed on day 3
+  # (review of #215). Own fixture: a fresh two-observer stamp, and rows on the MIDDLE day only.
+  rm -rf "$d/.cc/state/spend"; rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.disbelieved"; : > "$d/calls"
+  t7=$(date -u -d "$(date -u -d "@$t6" +%F) 23:00:00" +%s)   # 23:00Z on day 1
+  printf '{"is_error":true,"result":"claude-fable-5: Claude usage limit reached. Your limit resets at %s"}\n' \
+    "$(date -u -d "@$((t7 + 7 * 86400))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/run3.json"   # a week out: the weekly reset
+  OBS=worker-a; me "$t7" check "$d/run3.json" >/dev/null 2>&1
+  OBS=worker-b; me $((t7 + 60)) check "$d/run3.json" >/dev/null 2>&1   # a second run: account-wide, the box parks
+  led $((t7 + 43200)) 5 claude-fable-5-1; led $((t7 + 43260)) 6 claude-fable-5-1   # day 2, 11:00Z: two sessions answer
+  OBS=worker-c; out=$(me $((t7 + 2 * 86400)) status 2>/dev/null); rc=$?   # day 3: no row on day 1, none today
+  t 'a stamp spanning three days is disproved by rows on the MIDDLE day, not only its first day and today' \
+    "$rc$out" 1clear
+
+  # THE STAMP THAT STARTED ALL THIS NAMED NO MODEL, so its field 4 is empty. Its own fixture: a fresh stamp and no
+  # ledger, so nothing here but the split is under test.
+  rm -rf "$d/.cc/state/spend"; rm -f "$d/.cc/state/claude-limit"; OBS=worker-d
+  printf '{"is_error":true,"result":"Claude usage limit reached. Your limit resets at %s"}\n' \
+    "$(date -u -d "@$((t6 + 54000))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/run2.json"
+  me "$t6" check "$d/run2.json" >/dev/null 2>&1
+  t 'a limit naming no model leaves field 4 empty and field 5 still readable' \
+    "$(cut -f4,5 "$d/.cc/state/claude-limit")" "$(printf '\t%s' "$(printf worker-d | md5sum | cut -c1-8)")"
+  t '…and the run that hit it still finds its own key there' \
+    "$(me "$t6" status 2>/dev/null | grep -c 'this run only')" 1
+
   rm -rf "$d"; printf 'cc-limit selfcheck: %d passed, %d failed\n' $((n - bad)) "$bad"; [ "$bad" = 0 ]; }
 
 case "${1:-}" in
-  clear) rm -f "$S"; exit 0 ;;
-  status) stamp; [ "$ends" -gt "$now" ] || { echo clear; exit 1; }
-    printf 'usage limit until %sZ (%dm left)%s\n' "$(date -u -d "@$ends" +%H:%M)" $(( (ends - now + 59) / 60 )) "${mdl:+ [$mdl]}"; exit 0 ;;
-  wait) stamp; s=$((ends - now)); [ "$s" -le 0 ] && exit 0
+  clear) rm -f "$S" "$DISB"; exit 0 ;;
+  status) if ! believe; then echo clear
+      # A stamp that does not bind this caller is still worth SAYING — on stderr, where a person reading `cc-limit
+      # status` sees it and a caller capturing stdout does not have its answer changed. NOT in the words "usage
+      # limit until HH:MMZ": cc-land captures stdout and stderr together and reads that phrase out of the text as a
+      # reset to defer a merge to, so this line would park a queue on the very limit it says does not apply.
+      [ "$ends" -gt "$now" ] && printf 'note: another run hit a limit that resets %sZ; no second run has hit it, so the box is not held by it.\n' "$(date -u -d "@$ends" +%H:%M)" >&2
+      exit 1; fi
+    only=""; [ "$(nobs)" -ge 2 ] || only=" (this run only)"
+    printf 'usage limit until %sZ (%dm left)%s%s\n' "$(date -u -d "@$ends" +%H:%M)" $(( (ends - now + 59) / 60 )) "${mdl:+ [$mdl]}" "$only"; exit 0 ;;
+  wait) believe || exit 0; s=$((ends - now))
     { [ -n "${CC_LIMIT_MIN_WAIT:-}" ] && [ "$s" -gt "$CC_LIMIT_MIN_WAIT" ]; } && s="$CC_LIMIT_MIN_WAIT"
     [ "$s" -gt "$MAX" ] && exit 1; sleep "$s"; exit 0 ;;
   record) shift; [ "${1:-}" = --dry ] && { DRY=1; shift; }
@@ -463,7 +640,7 @@ case "${1:-}" in
   resume) resume; exit 0 ;;
   selfcheck) selfcheck; exit $? ;;
   check) ;;
-  *) sed -n '2,11p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,15p' "$0" >&2; exit 2 ;;
 esac
 # ---- check: is_error / a run that produced no result (a non-zero rc), AND limit wording somewhere in result or stderr
 j="${2:?usage: cc-limit check <claude-json> [<stderr-file>]}"; res=""
@@ -482,7 +659,11 @@ if [ "$u" -le "$now" ]; then   # no time in the message: exponential backoff, re
   u=$((now + b * 60)); how="backoff:$b"
 fi
 [ -n "$newm" ] || newm="$mdl"   # same episode, a message that names no model: keep what we already knew
-mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\t%s\n' "$u" "$how" "$first" "$newm" > "$S"
-[ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" limited "$newm" "$newm limit" >/dev/null 2>&1   # a limit on the box's primary model moves every session to the fallback (cc-model decides if it was)
+[ "$same" = 1 ] || obs=""       # a new episode: the runs on the old stamp saw a different limit and do not vouch for this one
+obs=$(add_obs "$(mykey)")       # THIS run has now hit it — one observer binds this run alone, two make it the box's
+mkdir -p "$(dirname "$S")"; printf '%s\t%s\t%s\t%s\t%s\n' "$u" "$how" "$first" "$newm" "$obs" > "$S"
+# A limit on the box's primary model moves every session to the fallback (cc-model decides if it was) — but only once
+# a SECOND run has hit the same limit. One worker's word moved every session for six hours on 2026-09-04.
+[ "$(nobs)" -ge 2 ] && [ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" limited "$newm" "$newm limit" >/dev/null 2>&1
 scan >/dev/null 2>&1   # the same limit is on every session, not just this run: whatever it interrupted is nudged at the reset
 echo "LIMIT $u"

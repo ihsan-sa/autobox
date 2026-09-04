@@ -13,7 +13,8 @@
 #   cc-model next [<model>]           the model after <model> on that chain (nothing, exit 1, at its end)
 #   cc-model tick                     what cc-model.timer runs every 60 s (see below)
 #   cc-model selfcheck                the classifier and the chain, on fixtures
-# tick: (1) normal — switch when cc-limit's stamp says the primary model is limited, or when a live session's pane
+# tick: (1) normal — switch when cc-limit's stamp says the primary model is limited AND a second run has hit that
+#   same limit (one run's limit is not the box's — see cc-limit), or when a live session's pane
 #   shows a fresh "usage limit" line (each matched line fires once, and a probe has to agree — docs and questions
 #   mention limits too); (1b) THE CLI'S OWN LIMIT PROMPT NEEDS NO PROBE: "You've reached your Fable 5 limit … ❯ Switch
 #   to Opus 5 (1M context) and continue" (a dialog) or "● Fable 5 limit reached · continuing on Fable 5 uses usage
@@ -110,9 +111,17 @@ chain_next(){   # the model AFTER $1 on the chain, by family: "opus", "claude-op
 ov(){ model=""; since=0; till=0; reason=""; probed=0   # loads the override; exit 1 = none (the box is on its primary model)
   [ -f "$OV" ] && IFS=$'\t' read -r model since till reason probed < "$OV"
   [[ "${till:-}" =~ ^[0-9]+$ ]] || till=0; [[ "${probed:-}" =~ ^[0-9]+$ ]] || probed=0; [ -n "$model" ]; }
-limstamp(){ lim_till=0; lim_model=""   # cc-limit's shared stamp: "<until>\t<how>\t<first-seen>\t<model>"
-  [ -f "$ST/claude-limit" ] && IFS=$'\t' read -r lim_till _ _ lim_model < "$ST/claude-limit"
-  [[ "${lim_till:-}" =~ ^[0-9]+$ ]] || lim_till=0; }
+limstamp(){ lim_till=0; lim_model=""; lim_seen=0   # cc-limit's stamp: "<until>\t<how>\t<first-seen>\t<model>\t<observers>"
+  local o=""
+  # Split by awk, not by `IFS=$'\t' read`: tab is IFS whitespace and bash folds "\t\t" into one delimiter, so a
+  # stamp that names no model hands its observers to $lim_model (cc-limit, 2026-09-04).
+  [ -f "$ST/claude-limit" ] && { IFS= read -r lim_till; IFS= read -r lim_model; IFS= read -r o; } \
+    < <(awk -F'\t' 'NR==1{print $1; print $4; print $5}' "$ST/claude-limit")
+  [[ "${lim_till:-}" =~ ^[0-9]+$ ]] || lim_till=0
+  # ONE RUN'S LIMIT IS NOT THE BOX'S (cc-limit, 2026-09-04): the observers are the distinct runs that have hit it,
+  # and cc-limit calls it account-wide at two. Below that this file must not move every session on it — on 09-04
+  # one worker's 09:13Z stamp did, for six hours, while opus went on answering.
+  lim_seen=$(tr ',' '\n' <<<"${o:-}" | grep -cx '[0-9a-f]\{8\}' || true); }
 rate_ok(){ local l s; l=$(awk -F'\t' '$3=="switch"{t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)   # one switch per 10 min, never a flap
   # The override's own `since` counts as a switch, not only the log line: that line is written AFTER every pane has
   # been retyped, and on 2026-09-01 a restore slipped into that gap and sent 12 sessions straight back into the prompt.
@@ -270,6 +279,9 @@ restore_blocked(){   # $1 = prompt_panes output → why a probe that answered st
   local pp="${1:-}" p w
   p=$(fam "$PRIMARY"); w=$(awk -F'\t' -v p="$p" '$3==p{print $2; exit}' <<<"$pp")
   [ -n "$w" ] && { printf 'the %s limit prompt is still on %s:%s\n' "$(label "$PRIMARY")" "$SESSION" "$w"; return 0; }
+  # ANY live stamp, whatever its observer count. One run's limit does not move the box (see limstamp), but this is
+  # not "is the box limited" — it is "can a probe that answered prove the limit lifted", and one run's word is
+  # still a reason it cannot tell. Staying on the fallback costs nothing; restoring early is the 12-pane retune.
   limstamp
   { [ "$lim_till" -gt "$now" ] && [ "$(fam "${lim_model:-}")" = "$p" ]; } &&
     { printf "cc-limit's stamp still has %s limited until %sZ\n" "$p" "$(date -u -d "@$lim_till" +%H:%M)"; return 0; }
@@ -409,8 +421,8 @@ tick(){
     [ "$ptill" -gt 0 ] || ptill=$((now + ${CC_MODEL_PROMPT_TILL:-86400}))   # it named no reset: a day, not a probe
     SWITCH_TILL="$ptill"; do_switch "$FALLBACK" "$(label "$PRIMARY") limit prompt in $SESSION:$pw"; SWITCH_TILL=0
     return 0; fi
-  limstamp   # ---- normal: did the primary model just hit a limit?
-  if [ "$lim_till" -gt "$now" ] && [ -n "$lim_model" ] && [ "$(fam "$lim_model")" = "$(fam "$PRIMARY")" ]; then
+  limstamp   # ---- normal: did the primary model just hit a limit? (and did a SECOND run agree — see limstamp)
+  if [ "$lim_till" -gt "$now" ] && [ "$lim_seen" -ge 2 ] && [ -n "$lim_model" ] && [ "$(fam "$lim_model")" = "$(fam "$PRIMARY")" ]; then
     rate_ok && do_switch "$FALLBACK" "$(fam "$PRIMARY") limit (cc-limit stamp)"; return 0; fi
   # ---- no override is in force, so the box wants PRIMARY: a session on another ID of that same family — the pane on
   # `claude-fable-5` while the box is on `claude-fable-5-1` — is retuned. Nothing here could see that before: to fam()
@@ -603,8 +615,12 @@ TXT
   pf0=$(printf '%%9\tsess\t%s\t0\n' "$(fam "$PRIMARY")")
   t 'no restore while the prompt is on a pane'    "$(restore_blocked "$pf0" | grep -c 'limit prompt is still on')" 1
   t 'nothing on any pane: the probe may decide'   "$(restore_blocked '' >/dev/null; echo $?)"   1
-  printf '%s\tapi\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" > "$ST/claude-limit"
-  t "a live cc-limit stamp cannot tell either"    "$(restore_blocked '' | grep -c 'still has')" 1
+  # The stamp's 5th field is the distinct runs that hit it (cc-limit). A restore is blocked by either count: one
+  # run's word does not limit the box, but it is still a reason a probe cannot prove the limit lifted.
+  printf '%s\tapi\t%s\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" aaaaaaaa > "$ST/claude-limit"
+  t "a live cc-limit stamp cannot tell either"      "$(restore_blocked '' | grep -c 'still has')" 1
+  printf '%s\tapi\t%s\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" aaaaaaaa,bbbbbbbb > "$ST/claude-limit"
+  t "…and a stamp two runs hit tells no differently" "$(restore_blocked '' | grep -c 'still has')" 1
   ST="$oldst"
   # ── the model a session is ON is asked by ID, not by family ──────────────────────────────────────────────────
   # fam() is right for the CHAIN (one rung per family) and wrong for "is this session where the box wants it":

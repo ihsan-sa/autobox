@@ -169,22 +169,31 @@ def idle_for(repo, track, wt):
     return max(0.0, now() - newest) if newest else 0.0  # nothing to read is not evidence of being stuck
 
 
-def limit_active():
-    """A Claude usage limit still standing. cc-limit owns the stamp; a loop waiting one out is not wedged."""
+def limit_stamp():
+    """cc-limit's stamp as (until, observers). "<until>\t<how>\t<first-seen>\t<model>\t<observers>", split on
+    TAB because field 4 may be empty. The observers are the distinct RUNS that hit it, and cc-limit and cc-model
+    call it the box's at two (one run's limit is not the box's, 2026-09-04): below that it holds no track here."""
     try:
-        return float(open(os.environ.get("CC_LIMIT_STAMP") or f"{STATE}/claude-limit").read().split()[0]) > now()
+        f = open(os.environ.get("CC_LIMIT_STAMP") or f"{STATE}/claude-limit").read().split("\n")[0].split("\t")
+        obs = [k for k in (f[4].split(",") if len(f) > 4 else [])
+               if len(k) == 8 and all(c in "0123456789abcdef" for c in k)]
+        return float(f[0]), len(obs)
     except Exception:
-        return False
+        return 0.0, 0
+
+
+def limit_active():
+    """A Claude usage limit standing over the BOX: two runs hit it. cc-limit owns the stamp; a loop waiting one
+    out is not wedged. A stamp one run hit binds that run alone and says nothing about any other track (#215)."""
+    until, n = limit_stamp()
+    return until > now() and n >= 2
 
 
 def limit_until():
-    """When the standing usage limit lifts (epoch), or 0. The snapshot carries the hour so a consumer can say
+    """When the standing box-wide limit lifts (epoch), or 0. The snapshot carries the hour so a consumer can say
     "held until 17:06" without re-reading cc-limit's stamp."""
-    try:
-        t = float(open(os.environ.get("CC_LIMIT_STAMP") or f"{STATE}/claude-limit").read().split()[0])
-        return t if t > now() else 0.0
-    except Exception:
-        return 0.0
+    until, n = limit_stamp()
+    return until if until > now() and n >= 2 else 0.0
 
 
 def runaway(f, seen_before, wedged=WEDGED):
@@ -1148,6 +1157,22 @@ def selfcheck():
        runaway(W(), False) == "")
     ok("wedged for hours and the run before saw it too → ended", "wedged" in runaway(W(), True))
     ok("a loop waiting out a usage limit is waiting, not wedged", runaway(W(limited=True), True) == "")
+    # the stamp reader itself: one run's limit is not the box's (review of #215 — a one-observer stamp silenced
+    # the wedged alarm for every other track and filed them under "clock")
+    import tempfile
+    _keep, _p = os.environ.get("CC_LIMIT_STAMP"), tempfile.mkstemp(suffix=".claude-limit")[1]
+    os.environ["CC_LIMIT_STAMP"] = _p
+    try:
+        _t = int(now()) + 3600
+        open(_p, "w").write(f"{_t}\tusage limit\t{int(now())}\tclaude-fable-5-1\tdeadbeef\n")
+        ok("a stamp ONE run hit leaves the reconciler unlimited: that run's limit is not the box's",
+           not limit_active() and limit_until() == 0.0)
+        open(_p, "w").write(f"{_t}\tusage limit\t{int(now())}\t\tdeadbeef,cafef00d\n")
+        ok("two runs on it make it the box's — with an empty model field, as the 09-04 stamp had",
+           limit_active() and limit_until() == float(_t))
+    finally:
+        os.unlink(_p)
+        os.environ.pop("CC_LIMIT_STAMP", None) if _keep is None else os.environ.update({"CC_LIMIT_STAMP": _keep})
     ok("a loop between iterations, with no worker under it, is not wedged", runaway(W(workers=[]), True) == "")
     ok("an expensive job that keeps moving is never a runaway — there is no spend cap anywhere here",
        runaway(W(idle=30), True) == "")
