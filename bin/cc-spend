@@ -30,9 +30,20 @@ one `cc-spend phantoms` gives, because `grew` only changes at a tick anyway.
   cc-spend                     today, by session, biggest first
   cc-spend --by repo|track|model|kind [--week]
   cc-spend --week              the last 7 days
+  cc-spend today [<repo>]      what AUTONOMOUS work has booked today, per repo; with a repo, that one number
   cc-spend phantoms            spend with nobody watching it (the tick also saves it to phantoms.tsv)
   cc-spend tick                what the timer runs
   cc-spend selfcheck           fixtures in a HOME of its own — no network, never this box's ledger
+
+TODAY, PER REPO (`cc-spend today`). A daily ceiling has one question: what has AUTONOMOUS work — every `claude
+-p`, so worker loops and landing rounds, never a person at a terminal — booked on this repo today. That is a
+read of today's TSV and nothing else; a second collector would be a second truth. Two things any caller must
+know. It counts what was SPENT, where a member workspace's cap (cc: member_gate) PRE-charges what a dispatch
+MAY spend — the two never agree, and only this one lags; both roll at the UTC day. And it is only as current as
+the last tick: when the ledger has stopped moving the number is still printed, but stderr says so and the exit
+status is 1, because a cap that reads a frozen ledger as headroom is the silent failure this exists to prevent.
+The ceiling itself is the owner's number and is not here: this answers the question, for him at a terminal or
+for whatever asks it.
 """
 import fcntl
 import glob
@@ -81,6 +92,9 @@ RATES = {
 # Fast mode is the same model at premium prices (Opus only) — `usage.speed` names it, so it is not a guess either.
 FAST = {"claude-opus-5": (10.0, 50.0, 0.50), "claude-opus-4-8": (10.0, 50.0, 0.50)}
 W_5M, W_1H = 1.25, 2.0            # the cache-write multiples on the input rate, by TTL
+
+TICK_PERIOD = 300                 # cc-spend.timer's period: the ledger cannot be fresher than one tick
+LEDGER_STALE = 2 * TICK_PERIOD    # two periods with no tick is a ledger that has stopped moving, not a quiet box
 
 PHANTOM_PROC_AGE = 3600           # a process older than this…
 PHANTOM_IDLE = 1800               # …whose transcript has not grown in this long is spending on nothing
@@ -642,6 +656,61 @@ def view(by, window):
     return 0
 
 
+def day_totals(day):
+    """{repo: {"auto": usd, "all": usd}} for ONE UTC day, off that day's ledger file alone.
+
+    AUTO is kind == "headless" — a `claude -p` nobody is sitting in front of: worker loops, landing rounds,
+    audits. Interactive rows are a person at a terminal and are counted in `all` only, because an owner asking
+    for something is not what a ceiling on autonomous work is about."""
+    tot = {}
+    for r in read_rows([day]):
+        t = tot.setdefault(r["repo"], {"auto": 0.0, "all": 0.0})
+        t["all"] += r["est_usd"]
+        if r["kind"] == "headless":
+            t["auto"] += r["est_usd"]
+    return tot
+
+
+def ledger_age(at=None):
+    """(last tick, seconds since it), or (None, None) when no tick has ever run. Nothing in the ledger is more
+    current than this, so anything reading a figure off it has to be told."""
+    t = parse_ts((load_offsets() or {}).get("tick"))
+    return (t, ((at or now()) - t).total_seconds()) if t else (None, None)
+
+
+def cmd_today(repo=None):
+    day = days(1)[0]
+    tot = day_totals(day)
+    at, age = ledger_age()
+    stale = age is None or age > LEDGER_STALE
+    if at is None:
+        note = (f"no tick has run yet, so {day} reads as $0 because nothing has been measured — not because "
+                f"nothing was spent (`cc-spend tick`, or switch cc-spend.timer on)")
+    elif stale:
+        note = (f"the ledger has not ticked since {iso(at)} ({int(age // 60)} min ago) — this is what it knew "
+                f"then, not what has been spent since")
+    else:
+        note = f"last tick {iso(at)}"
+    if repo:
+        # ONE number on stdout, so a caller reads it whole: `spent=$(cc-spend today "$repo")`. A repo with no
+        # rows today has spent nothing, which is 0 and not an error. The caveat goes to stderr and the exit
+        # status, so a caller that ignores both still gets a figure and a person still sees why it may be low.
+        print(f"{tot.get(repo, {}).get('auto', 0.0):.4f}")
+        if stale:
+            print(f"cc-spend: {note}", file=sys.stderr)
+        return 1 if stale else 0
+    print(f"cc-spend {day} — what AUTONOMOUS work has booked today; `all` adds the interactive sessions beside "
+          f"it. USD is an ESTIMATE. {note[0].upper() + note[1:]}.")
+    rows = sorted(tot.items(), key=lambda kv: -kv[1]["auto"])
+    if not rows:
+        print("  nothing recorded")
+        return 1 if stale else 0
+    w = table([[k, f"{v['auto']:.4f}", f"{v['all']:.4f}"] for k, v in rows], ["repo", "auto $", "all $"])
+    a, b = sum(v["auto"] for _, v in rows), sum(v["all"] for _, v in rows)
+    print(f"  {'total'.ljust(w[0])}  {f'{a:.4f}'.ljust(w[1])}  {b:.4f}")
+    return 1 if stale else 0
+
+
 # ---------------------------------------------------------------- selfcheck
 
 def selfcheck():
@@ -868,6 +937,55 @@ def selfcheck():
                said2.returncode == 0 and "s9sessio" in said2.stdout and "unwatched" in said2.stdout)
         finally:
             shutil.rmtree(th2, ignore_errors=True)
+        # ---- `today`: the per-repo figure a daily ceiling reads. Its OWN fixture HOME and its own ledger
+        # rows, written here rather than inherited from the tick cases above.
+        th3 = tempfile.mkdtemp(prefix="ccspend-today-")
+        try:
+            st3 = os.path.join(th3, ".cc", "state", "spend")
+            os.makedirs(st3)
+            d_now, d_prev = days(2)
+
+            def led(day, rows):
+                with open(os.path.join(st3, f"{day}.tsv"), "w") as f:
+                    f.write("#" + "\t".join(COLS) + "\n")
+                    for repo, kind, amt in rows:
+                        f.write("\t".join([f"{day}T10:00:00Z", "sX", f"/x/{repo}", repo, "t1", kind,
+                                           "claude-opus-5", "0", "0", "0", "0", f"{amt:.6f}"]) + "\n")
+
+            led(d_now, [("mine", "headless", 3.0), ("mine", "headless", 1.5),
+                        ("mine", "interactive", 40.0), ("other", "headless", 7.0)])
+            led(d_prev, [("mine", "headless", 99.0)])
+            json.dump({"tick": iso(now())}, open(os.path.join(st3, "offsets.json"), "w"))
+
+            def today_run(*a):
+                return subprocess.run([sys.executable, me, "today", *a],
+                                      env={**os.environ, "HOME": th3}, capture_output=True, text=True)
+
+            one = today_run("mine")
+            ok("`today <repo>` is that repo's AUTONOMOUS spend today and nothing else — an interactive session "
+               "at the same repo, another repo's worker and yesterday's rows are all left out",
+               one.returncode == 0 and one.stdout.strip() == "4.5000")
+            whole = today_run()
+            ok("…and the table beside it shows what was left out, so the interactive $40 the ceiling figure "
+               "excludes is still on the page",
+               whole.returncode == 0 and "4.5000" in whole.stdout and "44.5000" in whole.stdout
+               and "7.0000" in whole.stdout and "99" not in whole.stdout)
+            none = today_run("never-heard-of")
+            ok("a repo that has spent nothing today reads as 0, so a caller gets a number rather than an error",
+               none.returncode == 0 and none.stdout.strip() == "0.0000")
+            json.dump({"tick": iso(now() - timedelta(hours=2))}, open(os.path.join(st3, "offsets.json"), "w"))
+            frozen = today_run("mine")
+            ok("a ledger that has stopped ticking still prints the figure, and says in stderr and in its exit "
+               "status that it is what the ledger knew THEN — a cap must not read a frozen number as headroom",
+               frozen.stdout.strip() == "4.5000" and frozen.returncode == 1
+               and "has not ticked since" in frozen.stderr)
+            os.remove(os.path.join(st3, "offsets.json"))
+            never = today_run("mine")
+            ok("…and a box where no tick has ever run reads the same way, never as a silent $0",
+               never.stdout.strip() == "4.5000" and never.returncode == 1
+               and "no tick has run yet" in never.stderr)
+        finally:
+            shutil.rmtree(th3, ignore_errors=True)
         ok("`phantoms` before any tick says so and exits 1 rather than printing an empty all-clear",
            subprocess.run([sys.executable, me, "phantoms"],
                           env={**os.environ, "HOME": tempfile.mkdtemp(prefix="ccspend-empty-")},
@@ -881,7 +999,7 @@ def selfcheck():
 
 # ---------------------------------------------------------------- cli
 
-USAGE = "usage: cc-spend [--by repo|track|model|kind] [--week] | phantoms | tick | selfcheck"
+USAGE = "usage: cc-spend [--by repo|track|model|kind] [--week] | today [<repo>] | phantoms | tick | selfcheck"
 
 
 def bail():
@@ -890,6 +1008,10 @@ def bail():
 
 
 def main(argv):
+    if argv and argv[0] == "today":                      # the only subcommand that takes an argument
+        if len(argv) > 2 or (len(argv) == 2 and argv[1].startswith("-")):
+            bail()
+        return cmd_today(argv[1] if len(argv) == 2 else None)
     if argv and argv[0] in ("tick", "phantoms", "selfcheck"):
         if len(argv) > 1:
             bail()
