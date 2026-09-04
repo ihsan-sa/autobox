@@ -524,6 +524,21 @@ od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t2 2>&1); rd=$?
 { [ "$rd" = 0 ] && ! grep -q 'refusing to run git' <<<"$od" && grep -q 'no remote, so no PR' <<<"$od"; } \
   && ok "...and a track that really hangs off ~/dev/<handle>/.git passes the same check and finishes (no remote → no PR)" || bad "cc done refused a genuine workspace track: rc=$rd $od"
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t2" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t2 >/dev/null 2>&1
+# A PROJECT'S FIRST PUSH MAKES ITS TRACK THE REPOSITORY'S DEFAULT BRANCH (GitHub: the first branch pushed into an empty
+# repository), so `cc done` asked that repository for HEAD, was told the track itself, and tried to open a PR from the
+# branch onto itself — "PR creation failed", the row left in review (measured live 2026-09-04 on a repository the box had
+# just created). The branch is the delivery there, exactly as for a repository with no branch at all.
+git init -q --bare "$T/t3.git"
+git -C "$GH/dev/alice" worktree add -q -b track/t3 "$GH/.cc/worktrees/alice/t3" 2>/dev/null
+mkdir -p "$GH/.cc/worktrees/alice/t3/.cc"; printf 'alice\nt3\n' > "$GH/.cc/worktrees/alice/t3/.cc/track"
+git -C "$GH/.cc/worktrees/alice/t3" remote add t3 "$T/t3.git"
+git -C "$GH/.cc/worktrees/alice/t3" -c user.email=t@t -c user.name=t commit -q --allow-empty -m t3
+git -C "$GH/.cc/worktrees/alice/t3" push -q t3 track/t3 2>/dev/null; git -C "$T/t3.git" symbolic-ref HEAD refs/heads/track/t3
+od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t3 2>&1); rd=$?
+{ [ "$rd" = 0 ] && grep -q 'no other branch there' <<<"$od" && ! grep -q 'PR creation failed' <<<"$od"; } \
+  && ok "cc done on a project whose repository's default branch is the track itself ends clean — the branch is the delivery, not a PR onto itself" \
+  || bad "cc done tried a PR from the track onto itself: rc=$rd $od"
+git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t3" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t3 >/dev/null 2>&1; rm -rf "$T/t3.git"
 o5=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 1e9 2>&1); r5=$?
 o6=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 5.5 2>&1)
 [ "$r5" = 2 ] && grep -q 'budget must be' <<<"$o5" && ! grep -q 'budget must be' <<<"$o6" \
