@@ -44,8 +44,9 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # and for no other workspace's, and that creating one wires it up. No GitHub App of this box's is read,
 # nothing leaves the machine, no repository is created anywhere (the create endpoint is the fixture's too),
 # and its token caches are files under the temp dir, never the real ones.
-# cc-checkpoint's is the rule that decides WHERE a track pushes, over workspaces, projects and repos it builds
-# in a HOME of its own, with a cc-gh-token that records what it was asked to create instead of creating it: no
-# repository of this box's is read and nothing is made anywhere.
+# cc-checkpoint's is the rule that decides WHERE a track pushes, and which repositories a project's branch is
+# taken back out of, over workspaces, projects and bare repos it builds in a HOME and temp dir of its own, with
+# a cc-gh-token that records what it was asked to create instead of creating it: no repository of this box's is
+# read, nothing is created anywhere, and the only branches pushed or deleted are in those fixtures.
 for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

@@ -23,8 +23,19 @@
 # remote named after the track, or `origin` when origin is that repository (a workspace's first project is
 # wired up as origin). Each project has its own repository (owner, 2026-09-03), so a workspace project with no
 # remote at all gets one CREATED for it (cc-gh-token create) and pushed to, which is why work finished inside a
-# workspace no longer sits on a local branch nobody else can see; a creation that could not happen leaves its
-# reason in .cc/create.err. Nothing is created for anything but a member workspace's project.
+# workspace no longer sits on a local branch nobody else can see. Naming a project's repository something else
+# is the owner's to do: bind it by adding a remote NAMED AFTER THE PROJECT, and nothing here reads the
+# repository's own name again.
+# AND NOWHERE ELSE. A workspace project whose repository could not be made has nowhere to push — never the
+# workspace's `origin`, which is another project's repository; the reason is in .cc/create.err and the next
+# turn tries again. After a push succeeds, the branch is REMOVED from any other repository the workspace
+# remotes name, so opening a project's repository shows that project and not its neighbours (owner,
+# 2026-09-04). Only a tip that is an ancestor of what was just pushed is removed; anything else is left and
+# named in .cc/evict.err — never push.err, which means the push failed (review of #217). Nothing is created, and nothing removed, for anything but a member workspace's project.
+# AND IT SAYS WHOSE IT IS: a project's branch is cut from the workspace's default branch, so it arrives
+# carrying the WORKSPACE's README and the project's repository opens on a page about the workspace. While that
+# README still opens with the workspace's own name — nobody having written a word of it for this project — the
+# commit below replaces it with one naming the project. Retitled by anyone, it is never touched again.
 # WHICH workspace and WHICH name that creation uses come from the worktree's own path,
 # $HOME/.cc/worktrees/<repo>/<track>, and never from .cc/track: that file is bound read-WRITE into the member
 # session, so what it says is the member's word, and naming a repository in the owner's org is an org-admin
@@ -83,10 +94,103 @@ pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push ·
       return 0
     fi
     mv -f "$root/.cc/create.err.tmp" "$root/.cc/create.err" 2>/dev/null
+    # Nothing could be created (no app, a name already someone else's, no network) — and for a workspace
+    # project there is NOWHERE ELSE. `origin` is the workspace's FIRST project's repository, so falling back to
+    # it pushes this project into another project's — which is how a project's branch came to be in a sibling
+    # project's repository (measured, 2026-09-04). Nowhere to push is the honest answer: `cc done` ends on it (the
+    # branch is the delivery), the reason is in .cc/create.err, and the next turn tries the creation again.
+    return 1
   fi
-  # Nothing could be created (no app, a name already someone else's, no network), or this is any other track on
-  # the box: origin is where it pushed yesterday, so the work reaches GitHub rather than nowhere.
+  # Any other track on the box: origin is where it pushed yesterday, so the work reaches GitHub rather than nowhere.
   git remote get-url origin >/dev/null 2>&1
+}
+project_readme(){   # cwd = worktree root.  Always 0: this is one file, and never anyone's own words.
+  # "he opened [a project's repository] and found the workspace — its README ('scratch project for trying the
+  # box out'), with no [project] code" (owner, 2026-09-04). A workspace is one git repo and a project is a
+  # BRANCH of it, so a project's branch is cut from the workspace's default branch and carries the workspace's
+  # README into the repository made for that project — whose front page then describes the workspace.
+  # THE HEADING IS THE WHOLE TEST. While README.md still opens with the WORKSPACE's own name, nobody has
+  # written a word of it for this project and it is replaced by one that names the project. Retitle it — the
+  # member, their session, anyone, one word — and nothing here ever touches it again.
+  # The path, never .cc/track, for the reason the header gives: that file is the member's word.
+  path_ids "$root" || return 0
+  [ -f "$HOME/dev/$WSREPO/.cc/member-workspace" ] || return 0
+  git ls-files --error-unmatch README.md >/dev/null 2>&1 || return 0   # inherited from the branch, not a file this turn wrote
+  git diff --quiet HEAD -- README.md 2>/dev/null || return 0            # and untouched this turn: words somebody wrote are theirs (review of #217)
+  # STILL THE FILE THE BRANCH INHERITED: the same blob the workspace's default branch had where this branch was cut
+  # from it. Words committed under the old heading on an earlier turn are theirs too, and "clean against HEAD" says
+  # nothing about those (review of #217). No default branch to ask, no merge-base: leave it.
+  local def mb; for def in main master "$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)"; do
+    [ -n "$def" ] && git rev-parse -q --verify "refs/heads/${def#origin/}" >/dev/null 2>&1 && { def=${def#origin/}; break; }
+    [ -n "$def" ] && git rev-parse -q --verify "refs/remotes/$def" >/dev/null 2>&1 && { def="refs/remotes/$def"; break; }; def=""; done
+  [ -n "$def" ] || return 0
+  mb=$(git merge-base HEAD "$def" 2>/dev/null) || return 0
+  [ "$(git rev-parse -q --verify HEAD:README.md 2>/dev/null)" = "$(git rev-parse -q --verify "$mb:README.md" 2>/dev/null)" ] || return 0
+  [ -f README.md ] && [ "$(head -1 README.md 2>/dev/null)" = "# $WSREPO" ] || return 0
+  printf '# %s\n\nA project of the %s workspace, and the only project in this repository.\nIts work is the `track/%s` branch.\n' "$WSTRACK" "$WSREPO" "$WSTRACK" > README.md
+  return 0
+}
+url_key(){   # one repository, however its url is spelled: case, .git, a trailing /, the scheme, the user, the scp form
+  local u=${1%/}; u=${u%.git}; u=${u,,}
+  u=${u#ssh://}; u=${u#https://}; u=${u#http://}; u=${u#git://}; u=${u#*@}
+  case "$u" in *:*/*) u=${u/:/\/} ;; esac   # git@host:org/repo → host/org/repo
+  printf '%s\n' "$u"; }
+evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree root.  Always 0: this is tidying.
+  # EACH PROJECT'S REPOSITORY HOLDS THAT PROJECT AND NO OTHER. A workspace is one git repo whose projects are
+  # branches, so before this every project's branch reached the workspace's first repository too and the
+  # repositories differed only by branch: opening one project's repository showed a sibling project's work and
+  # none of its own (owner, 2026-09-04, twice). Once a branch is safely in its own repository it is taken out of the
+  # others, so a workspace heals itself with nobody present and stays healed.
+  # BY URL, NEVER BY REMOTE NAME: the owner binds a project to a repository he already has by adding a remote
+  # named after the project, so two remote names are often one repository — and "the other remote" would then
+  # be the project's own, deleted out from under it.
+  # NOTHING IS LOST AND NO HISTORY IS REWRITTEN: the other repository's tip must be an ancestor of what was
+  # just pushed, so every commit it drops is present here and in the project's own repository. A tip that is
+  # not, or one whose object this worktree does not have, is left alone and written to .cc/evict.err — a file of
+  # its own, replaced each run: push.err means the push FAILED, and a note there after a push that succeeded lit
+  # `push!` for ever (review of #217).
+  local branch="$1" own o url sha name
+  [ -n "$workspace" ] || return 0   # only a member workspace's project has sibling projects to contaminate
+  own=$(url_key "$(git remote get-url "$remote" 2>/dev/null)"); [ -n "$own" ] || return 0
+  rm -f "$root/.cc/evict.err.tmp"
+  for o in $(git remote); do
+    url=$(git remote get-url "$o" 2>/dev/null)
+    [ "$(url_key "$url")" != "$own" ] || continue
+    grep -qxF "$url" "$root/.cc/evict.same" 2>/dev/null && continue   # known to be this project's own repository under another spelling: never cycled again
+    local -a c=(); mapfile -t c < <("$BIN/cc-gh-token" gitargs "$url" "$workspace" 2>/dev/null)
+    sha=$(GIT_TERMINAL_PROMPT=0 git "${c[@]}" ls-remote --heads "$o" "refs/heads/$branch" 2>/dev/null | awk 'NR==1{print $1}')
+    [ -n "$sha" ] || continue   # it does not have this branch, or it could not be asked: nothing to remove either way
+    if ! git merge-base --is-ancestor "$sha" "$branch" 2>/dev/null; then
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch at $sha, which is not in this branch — left alone. This project pushes to $remote; move or delete that branch by hand." >> "$root/.cc/evict.err.tmp"
+      continue; fi
+    name=$(url_key "$url"); name=${name##*/}   # the normalised url, so a trailing / does not leave the note naming nothing
+    # A delete the other repository REFUSES — GitHub refuses a repository's default branch, and an empty repository
+    # takes its default from the first branch pushed into it, which can be the sibling's — is the case that leaves
+    # the contamination in place, so it is said, not swallowed (review of #217).
+    if ! err=$(GIT_TERMINAL_PROMPT=0 git "${c[@]}" push -q "$o" --delete "refs/heads/$branch" 2>&1); then
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch — the delete was refused: $(tr '\n' ' ' <<<"$err" | cut -c1-160). Delete or retarget it by hand; a repository's default branch cannot be deleted, so point that repository's default at its own project's branch first." >> "$root/.cc/evict.err.tmp"
+      continue; fi
+    # A URL IS NOT A REPOSITORY'S IDENTITY. The same repository under a spelling url_key cannot unify (ssh and
+    # https, a symlink) has just had its branch deleted out from under it — so ask the project's own remote
+    # whether the branch is still there, and if the answer is that it is gone, put it back and say so (review of
+    # #217). An ask that failed says nothing either way and changes nothing.
+    still=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" ls-remote --heads "$remote" "refs/heads/$branch" 2>/dev/null); src=$?
+    if [ "$src" = 0 ] && [ -z "$still" ]; then
+      git "${cred[@]}" push -q -u "$remote" "$branch" 2>/dev/null
+      printf '%s\n' "$url" >> "$root/.cc/evict.same"   # remembered: deleting and restoring it every turn would close any open PR on the branch (review of #217)
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o is this project's own repository under another spelling — its branch was put back and that remote is skipped from now on. Keep one remote for it." >> "$root/.cc/evict.err.tmp"
+      continue; fi
+    "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $branch removed from ${name:-$o} — this project's work is in its own repository now, not that one" >/dev/null 2>&1
+  done
+  # The two cases that need a person — a branch left in a sibling repository, a duplicate remote — are heard the
+  # way a delete is: on the board, once per change and not every turn (the file carries a timestamp per run, so it
+  # is compared without them). Nothing on the box reads evict.err by itself (review of #217).
+  if [ -s "$root/.cc/evict.err.tmp" ]; then
+    if ! cmp -s <(cut -d' ' -f2- "$root/.cc/evict.err.tmp") <(cut -d' ' -f2- "$root/.cc/evict.err" 2>/dev/null); then
+      "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $(cut -d' ' -f2- "$root/.cc/evict.err.tmp" | paste -sd' ' -)" >/dev/null 2>&1; fi
+    mv -f "$root/.cc/evict.err.tmp" "$root/.cc/evict.err"
+  else rm -f "$root/.cc/evict.err.tmp" "$root/.cc/evict.err"; fi
+  return 0
 }
 lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed · 2 the lease was refused
   local branch="$1" lease
@@ -98,14 +202,14 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   # Plain push FIRST, and force nothing when it works: a fast-forward never needed a lease. It is also how a
   # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
   # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
-  if git "${cred[@]}" push -q -u "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+  if git "${cred[@]}" push -q -u "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; evict_elsewhere "$branch"; return 0; fi
   grep -qE 'non-fast-forward|fetch first' "$root/.cc/push.err.tmp" || { mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
   lease=$(cat "$root/.cc/pushed" 2>/dev/null)
   # Nothing recorded yet (a track older than .cc/pushed): the tracking ref is the best account of the remote we
   # have, and one push from here replaces the guess with the real thing.
   [ -n "$lease" ] || lease=$(git rev-parse -q --verify "refs/remotes/$remote/$branch" 2>/dev/null)
   if [ -n "$lease" ]; then
-    if git "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+    if git "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; evict_elsewhere "$branch"; return 0; fi
     mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"
     grep -qE 'stale info|non-fast-forward|fetch first' "$root/.cc/push.err" && return 2
     return 1; fi
@@ -148,7 +252,9 @@ git remote add "$rn" "https://example.test/org/$3.git" 2>/dev/null
 echo "https://example.test/org/$3"
 SH
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$NOTES"\n' > "$bin/cc-board"
-  chmod +x "$bin/cc-gh-token" "$bin/cc-board"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/cc-config"   # the commit cases below ask it for a git identity; the fixture's gitconfig has one
+  chmod +x "$bin/cc-gh-token" "$bin/cc-board" "$bin/cc-config"
+  printf '[user]\n\tname = t\n\temail = t@t\n' > "$T/gitconfig"
   ws(){ mkdir -p "$HOME/dev/$1/.cc"; : > "$HOME/dev/$1/.cc/member-workspace"; }   # the marker IS the workspace
   mkwt(){   # $1 <repo>/<track> (or an absolute path, for a worktree that is not one of ours), then name/url pairs
     local p="$1"; shift; case "$p" in /*) ;; *) p="$HOME/.cc/worktrees/$p" ;; esac
@@ -198,14 +304,121 @@ SH
   out=$(run "$d"); rc=$?
   eq "a worktree outside ~/.cc/worktrees: nothing is created for it" "$(cat "$CALLS")" ""
   k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "and with no origin it answers that there is nowhere to push" "rc=$rc out='$out'"
-  # A creation that could not happen leaves its reason where the next turn replaces it, and does not invent a
-  # remote: with an origin the work still reaches GitHub, without one there is nowhere to push.
+  # A creation that could not happen leaves its reason where the next turn replaces it, and does NOT fall back
+  # to the workspace's origin: that origin is the first project's repository, and pushing there is exactly the
+  # contamination this file is here to stop (owner, 2026-09-04).
   d=$(mkwt ws2/proj6 origin https://example.test/org/first.git); printf 'ws2\nproj6\n' > "$d/.cc/track"
-  eq "a failed creation falls back to the workspace's origin" "$(run "$d" 1)" origin
+  out=$(run "$d" 1); rc=$?
+  k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "a failed creation does not push into another project's repository" "rc=$rc out='$out'"
   k "$(grep -q 'refused to create proj6' "$d/.cc/create.err" && echo 0 || echo 1)" "and leaves the reason in .cc/create.err" "$(cat "$d/.cc/create.err" 2>/dev/null)"
   d=$(mkwt ws2/proj7); printf 'ws2\nproj7\n' > "$d/.cc/track"
   out=$(run "$d" 1); rc=$?
   k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "a failed creation with no origin: nowhere to push, and it says so" "rc=$rc out='$out'"
+  # ── the branch ends up in the project's repository and is taken out of the other projects' ──────────
+  bare(){ git init -q --bare "$T/$1.git"; printf '%s\n' "$T/$1.git"; }
+  mkproj(){   # $1 <ws>/<track>, then name/url pairs → a worktree on track/<track> carrying one commit of its own
+    local p t; p=$(mkwt "$@"); t=${1#*/}
+    printf '%s\n%s\n' "${1%%/*}" "$t" > "$p/.cc/track"
+    git -C "$p" symbolic-ref HEAD "refs/heads/track/$t"
+    echo "$t" > "$p/work.txt"; git -C "$p" add -A
+    git -C "$p" -c user.name=t -c user.email=t@t commit -q -m "$t"
+    printf '%s\n' "$p"; }
+  has(){ git ls-remote --heads "$1" "refs/heads/$2" 2>/dev/null | grep -q .; }
+  mkproj_main(){   # like mkproj, but the branch is cut from a `main` that already carries the workspace's README — as a workspace's is
+    local p t ws; p=$(mkwt "$@"); t=${1#*/}; ws=${1%%/*}
+    printf '%s\n%s\n' "$ws" "$t" > "$p/.cc/track"
+    git -C "$p" symbolic-ref HEAD refs/heads/main
+    printf '# %s\n\nscratch workspace\n' "$ws" > "$p/README.md"; git -C "$p" add -A
+    git -C "$p" -c user.name=t -c user.email=t@t commit -q -m inherited
+    git -C "$p" checkout -q -b "track/$t"; echo "$t" > "$p/work.txt"; git -C "$p" add -A
+    git -C "$p" -c user.name=t -c user.email=t@t commit -q -m "$t"
+    printf '%s\n' "$p"; }
+  runp(){ : > "$CALLS"; : > "$NOTES"; ( cd "$1" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 ); }
+  ws ws3
+  # A workspace's first repository holding a second project's branch — the shape measured on a real workspace
+  # on 2026-09-04. The branch is pushed to the project's own repository and then removed from that one.
+  oa=$(bare ownA); ta=$(bare otherA)
+  d=$(mkproj ws3/projA origin "$ta" projA "$oa"); git -C "$d" push -q origin track/projA
+  runp "$d"
+  k "$(has "$oa" track/projA && echo 0 || echo 1)" "the branch is in the project's own repository" "not on $oa"
+  k "$(has "$ta" track/projA && echo 1 || echo 0)" "and is taken out of the other project's repository" "still on $ta"
+  k "$(grep -q 'removed from' "$NOTES" && echo 0 || echo 1)" "the board is told what was removed" "$(cat "$NOTES")"
+  # A tip over there that is NOT in this branch is somebody's work: it is left alone and named, never deleted.
+  ob=$(bare ownB); tb=$(bare otherB)
+  d=$(mkproj ws3/projB origin "$tb" projB "$ob")
+  sb=$(mkwt "$T/strayB"); git -C "$sb" symbolic-ref HEAD refs/heads/track/projB
+  echo stray > "$sb/stray.txt"; git -C "$sb" add -A; git -C "$sb" -c user.name=t -c user.email=t@t commit -q -m stray
+  git -C "$sb" push -q "$tb" track/projB
+  runp "$d"
+  k "$(has "$ob" track/projB && echo 0 || echo 1)" "an unrelated tip elsewhere does not stop the push" "not on $ob"
+  k "$(has "$tb" track/projB && echo 0 || echo 1)" "a tip that is not in this branch is left alone" "deleted from $tb"
+  k "$(grep -q 'left alone' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err names the repository that still holds it" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$([ -e "$d/.cc/push.err" ] && echo 1 || echo 0)" "and push.err, which means the push failed, is not written for it" "$(cat "$d/.cc/push.err" 2>/dev/null)"
+  k "$(grep -c 'left alone' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "and the board hears it — the one case that needs a person" "$(cat "$NOTES")"
+  ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )   # the next turn, same shape: the board is not told again
+  k "$(grep -c 'left alone' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "…once, not every turn" "$(cat "$NOTES")"
+  # ONE repository under two remote names — how the owner binds a project to a repository he already had.
+  # Compared by name, "the other remote" is the project's own and the branch is deleted the moment it lands.
+  oc=$(bare ownC)
+  d=$(mkproj ws3/projC origin "$oc/" projC "$oc")
+  runp "$d"
+  k "$(has "$oc" track/projC && echo 0 || echo 1)" "one repository under two remote names is not evicted from itself" "gone from $oc"
+  k "$(grep -q 'removed from' "$NOTES" && echo 1 || echo 0)" "and nothing is reported as removed" "$(cat "$NOTES")"
+  # …and under a spelling url_key CANNOT unify (a symlink here; ssh against https on GitHub): the delete goes
+  # through, the project's own remote is asked, and the branch is put back (review of #217).
+  oc2=$(bare ownC2); ln -s "$oc2" "$T/aliasC2.git"
+  d=$(mkproj ws3/projC2 origin "$T/aliasC2.git" projC2 "$oc2")
+  runp "$d"
+  k "$(has "$oc2" track/projC2 && echo 0 || echo 1)" "a repository deleted from under itself gets its branch put back" "gone from $oc2"
+  k "$(grep -q 'put back' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err names the duplicate remote" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(grep -q 'put back' "$NOTES" && echo 0 || echo 1)" "and so does the board" "$(cat "$NOTES")"
+  ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )   # the next turn: the duplicate is remembered, not cycled
+  k "$(grep -qxF "$T/aliasC2.git" "$d/.cc/evict.same" && echo 0 || echo 1)" "the duplicate remote is remembered in evict.same" "$(cat "$d/.cc/evict.same" 2>/dev/null)"
+  k "$(grep -c 'put back' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "and is not deleted and put back again the turn after" "$(cat "$NOTES")"
+  k "$(has "$oc2" track/projC2 && echo 0 || echo 1)" "and the branch is still in the project's own repository" "gone from $oc2"
+  # A delete the other repository REFUSES (GitHub: its default branch; here receive.denyDeletes) is said, once.
+  oi=$(bare ownI); ti=$(bare otherI); git -C "$ti" config receive.denyDeletes true
+  d=$(mkproj ws3/projI origin "$ti" projI "$oi"); git -C "$d" push -q origin track/projI
+  runp "$d"
+  k "$(has "$ti" track/projI && echo 0 || echo 1)" "a refused delete leaves the branch where it was" "gone from $ti"
+  k "$(grep -q 'refused' "$d/.cc/evict.err" && echo 0 || echo 1)" "and evict.err says the delete was refused" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(grep -c 'refused' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "and the board hears it" "$(cat "$NOTES")"
+  # Not a member workspace: its remotes are its own business and nothing is ever taken out of them.
+  od=$(bare ownD); td=$(bare otherD)
+  d=$(mkproj myrepo2/t2 origin "$od" t2 "$td"); git -C "$d" push -q t2 track/t2
+  runp "$d"
+  k "$(has "$od" track/t2 && echo 0 || echo 1)" "a plain repo still pushes to origin" "not on $od"
+  k "$(has "$td" track/t2 && echo 0 || echo 1)" "and nothing is removed from its other remotes" "deleted from $td"
+  # ── whose README a project's repository opens on ────────────────────────────────────────────────────
+  hook(){ ( cd "$1" && "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 ); }
+  d=$(mkproj_main ws3/projE projE "$(bare ownE)")
+  hook "$d"
+  eq "the README names the project" "$(head -1 "$d/README.md")" "# projE"
+  k "$(grep -q '^# ws3' "$d/README.md" && echo 1 || echo 0)" "and no longer names the workspace" "$(head -1 "$d/README.md")"
+  # A project whose branch was cut with no default branch to compare against is left alone: nothing to prove it is inherited.
+  d=$(mkproj ws3/projE2 projE2 "$(bare ownE2)"); printf '# ws3\n\nscratch workspace\n' > "$d/README.md"
+  git -C "$d" add -A; git -C "$d" -c user.name=t -c user.email=t@t commit -q -m readme
+  hook "$d"
+  eq "with no default branch to compare against, the README is left as it is" "$(head -1 "$d/README.md")" "# ws3"
+  # A word a person set is never rewritten by a machine: the heading is the test, and it is the whole test.
+  d=$(mkproj_main ws3/projF projF "$(bare ownF)"); printf '# odoo inventory\n\nmine, and not a stub\n' > "$d/README.md"
+  hook "$d"
+  eq "a README somebody retitled keeps its heading" "$(head -1 "$d/README.md")" "# odoo inventory"
+  k "$(grep -q 'mine, and not a stub' "$d/README.md" && echo 0 || echo 1)" "and keeps what they wrote under it" "$(cat "$d/README.md")"
+  # Words written THIS turn under the inherited heading are somebody's, uncommitted, and not replaced (review of #217).
+  d=$(mkproj_main ws3/projH projH "$(bare ownH)")
+  printf '\nnotes for this project\n' >> "$d/README.md"
+  hook "$d"
+  eq "a README edited this turn keeps its heading" "$(head -1 "$d/README.md")" "# ws3"
+  k "$(grep -q 'notes for this project' "$d/README.md" && echo 0 || echo 1)" "and what was written under it" "$(cat "$d/README.md")"
+  hook "$d"   # the turn after: those words are committed now, clean against HEAD, and still under the old heading
+  eq "…and the turn after, once those words are committed, still keeps its heading" "$(head -1 "$d/README.md")" "# ws3"
+  k "$(grep -q 'notes for this project' "$d/README.md" && echo 0 || echo 1)" "and still keeps the words" "$(cat "$d/README.md")"
+  # Not a member workspace: its README is nobody's business here, even titled after the repo.
+  d=$(mkproj myrepo3/t3 origin "$(bare ownG)"); printf '# myrepo3\n\nnot a workspace\n' > "$d/README.md"
+  hook "$d"
+  eq "a repo that is not a member workspace keeps its README" "$(head -1 "$d/README.md")" "# myrepo3"
+  k "$(grep -q 'not a workspace' "$d/README.md" && echo 0 || echo 1)" "and all of it" "$(cat "$d/README.md")"
   echo "cc-checkpoint selfcheck: $((n - f))/$n"; [ "$f" = 0 ]
 }
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
@@ -245,6 +458,7 @@ trap relay EXIT
   refuse(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$root/.cc/checkpoint.err"; git reset -q 2>/dev/null; exit 0; }   # unstage too: a refused secret must not sit in the index
   track=$(sed -n 2p "$root/.cc/track"); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
   [ -n "$track" ] && [ "$branch" = "track/$track" ] || refuse "refused: HEAD is '$branch', not 'track/$track' — checkpoint only ever commits the track's own branch"
+  project_readme   # a project's repository describes the project, not the workspace it is a branch of
   git add -A 2>/dev/null || exit 0
   if git diff --cached --quiet 2>/dev/null; then exit 0; fi   # nothing changed
   bad=$(git diff --cached --diff-filter=A --name-only | grep -E "$SECRETS" | head -5 | tr '\n' ' ')   # only NEW files: a repo that already tracks .env.example is not leaking
