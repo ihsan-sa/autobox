@@ -39,7 +39,13 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # cc-brief's is fixtures too — briefs it writes itself, a board and a throwaway git repo under a temp dir, and
 # CC_BRIEF_FAKE standing in for the judge at every case, so the fast gate never reaches a model.
 # cc-gh-token's mints against an API of its own on localhost, signing with an RSA key it generates: minting,
-# reuse, the expiry margin, an absent key and which remotes it answers for. No GitHub App of this box's is
-# read, nothing leaves the machine, and its token cache is a file under the temp dir, never the real one.
-for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-pause; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+# reuse, the expiry margin, an absent key and which remotes it answers for — and, over a ~/dev of member
+# workspaces it builds itself, which repositories a workspace owns, that its token is minted for those alone
+# and for no other workspace's, and that creating one wires it up. No GitHub App of this box's is read,
+# nothing leaves the machine, no repository is created anywhere (the create endpoint is the fixture's too),
+# and its token caches are files under the temp dir, never the real ones.
+# cc-checkpoint's is the rule that decides WHERE a track pushes, over workspaces, projects and repos it builds
+# in a HOME of its own, with a cc-gh-token that records what it was asked to create instead of creating it: no
+# repository of this box's is read and nothing is made anywhere.
+for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

@@ -3,6 +3,10 @@
 #   cc-checkpoint          commit whatever changed and push it (the hook; always exits 0, never blocks a session)
 #   cc-checkpoint --push   push only, and exit non-zero saying why if it cannot — `cc done` calls this, because a
 #                          PR on an un-pushed branch is worse than no PR
+#   cc-checkpoint --remote where the push goes: the remote's name (making the repository if this is a member
+#                          workspace project with none), or nothing and exit 1 if there is nowhere. `cc done`
+#                          asks, so the PR it opens is against the repository the push went to
+#   cc-checkpoint selfcheck  that rule, on fixtures of its own (check.sh runs it)
 # It also records how full the session's context is (cc-context --record) and what it still owes Slack
 # (cc-owed --check), for EVERY session, track or not: the Stop payload's `transcript_path` is the only
 # handle on either, and this hook is where it arrives.
@@ -12,10 +16,23 @@
 # HEAD with git symbolic-ref — or when the staged names look like secrets. Push stderr → .cc/push.err.
 # The push carries whatever credential `cc-gh-token gitargs` gives it for that remote — a GitHub App token for
 # the org this box has an app for, nothing at all for any other remote — so a repo whose only credential is the
-# app pushes unattended. The token is minted for the push and nothing about it is written here.
+# app pushes unattended. The token is minted for the push and nothing about it is written here. For a MEMBER
+# WORKSPACE's track it is minted FOR that workspace, so it opens that workspace's repositories and no other
+# member's (cc-gh-token, docs/design-member-workspaces.md).
+# WHERE IT PUSHES: `origin`, except a member workspace's project, which pushes to its OWN repository — the
+# remote named after the track, or `origin` when origin is that repository (a workspace's first project is
+# wired up as origin). Each project has its own repository (owner, 2026-09-03), so a workspace project with no
+# remote at all gets one CREATED for it (cc-gh-token create) and pushed to, which is why work finished inside a
+# workspace no longer sits on a local branch nobody else can see; a creation that could not happen leaves its
+# reason in .cc/create.err. Nothing is created for anything but a member workspace's project.
+# WHICH workspace and WHICH name that creation uses come from the worktree's own path,
+# $HOME/.cc/worktrees/<repo>/<track>, and never from .cc/track: that file is bound read-WRITE into the member
+# session, so what it says is the member's word, and naming a repository in the owner's org is an org-admin
+# action he reserves to himself (review of #214). A worktree that is not under that path pushes to origin and
+# gets nothing created, whatever .cc/track says.
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
-MODE=commit; case "${1:-}" in --push) MODE=push;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
+MODE=commit; case "${1:-}" in --push) MODE=push;; --remote) MODE=remote;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
 # ── the lease ────────────────────────────────────────────────────────────────────────────────────
 # A track branch has exactly one writer, so a worker that rebased its own branch must still reach the remote. A
 # plain push is rejected non-fast-forward there and the work never becomes a PR: on 2026-08-31 a track finished
@@ -26,24 +43,69 @@ MODE=commit; case "${1:-}" in --push) MODE=push;; "") ;; *) echo "cc-checkpoint:
 # else's commit without a murmur — measured, not assumed. Given an explicit value git compare-and-swaps against
 # what is REALLY on the remote, so a refusal means exactly one thing: something this worktree did not write is on
 # that branch. That is never overwritten and never swallowed — see lease_refused.
+remote=origin   # every track on the box, until pick_remote says otherwise
+workspace=''    # set only for a member workspace's track: the token is then minted for that workspace alone
+WSREPO=''; WSTRACK=''   # this worktree's repo and track AS THE PATH SPELLS THEM — see the header
+path_ids(){   # $1 worktree root → WSREPO/WSTRACK from $HOME/.cc/worktrees/<repo>/<track>.  1 = not one of those
+  local base real rest
+  base=$(readlink -f "$HOME/.cc/worktrees" 2>/dev/null) || return 1   # resolved on both sides: a symlinked HOME still matches
+  real=$(readlink -f "$1" 2>/dev/null) || return 1
+  rest=${real#"$base/"}; [ "$rest" != "$real" ] || return 1
+  case "$rest" in */*/*) return 1 ;; */*) ;; *) return 1 ;; esac   # exactly <repo>/<track>: no deeper, no shallower
+  WSREPO=${rest%%/*}; WSTRACK=${rest#*/}
+  case "$WSREPO$WSTRACK" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "$WSREPO/$WSTRACK" in .*|*/.*) return 1 ;; esac   # no dotted half, so no . and no ..
+  [ -n "$WSREPO" ] && [ -n "$WSTRACK" ]
+}
+pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push · 1 there is not
+  local url
+  # A MEMBER WORKSPACE FIRST, and only then that workspace's own rules: the track-named remote below belongs
+  # to a workspace project, not to every repo on the box, and asking for it first applied it to all of them
+  # (review of #214). The path, never .cc/track — the header says why.
+  if path_ids "$root" && [ -f "$HOME/dev/$WSREPO/.cc/member-workspace" ]; then
+    workspace="$WSREPO"   # so the token is minted for this workspace and opens no other member's repository
+    git remote get-url "$WSTRACK" >/dev/null 2>&1 && { remote="$WSTRACK"; return 0; }   # the project's own repository
+    # A workspace's FIRST repository is wired up as its `origin` (cc-gh-token create), so origin IS this
+    # project's repository when it carries this project's name, and there is nothing to create.
+    case "$(git remote get-url origin 2>/dev/null)" in
+      *"/$WSTRACK"|*"/$WSTRACK.git") remote=origin; return 0 ;;
+    esac
+    # "EACH PROJECT GETS ITS OWN GITHUB REPO" (owner, 2026-09-03) — so a member workspace's project that has
+    # none gets one made for it here, even where the workspace itself has an origin: that origin is the
+    # workspace's first project, not this one.
+    # A reason it could not REPLACES the last one, in a file of its own: this runs every turn until the project
+    # has a repository, so appending would grow for ever on a box with no app — and push.err belongs to the push.
+    if url=$("$BIN/cc-gh-token" create "$WSREPO" "$WSTRACK" 2>"$root/.cc/create.err.tmp"); then
+      rm -f "$root/.cc/create.err.tmp" "$root/.cc/create.err"
+      remote="$WSTRACK"; git remote get-url "$WSTRACK" >/dev/null 2>&1 || remote=origin   # origin: the workspace had no remote at all, so this is its first
+      git remote get-url "$remote" >/dev/null 2>&1 || return 1
+      "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: created $url for this project — pushing there from now on" >/dev/null 2>&1
+      return 0
+    fi
+    mv -f "$root/.cc/create.err.tmp" "$root/.cc/create.err" 2>/dev/null
+  fi
+  # Nothing could be created (no app, a name already someone else's, no network), or this is any other track on
+  # the box: origin is where it pushed yesterday, so the work reaches GitHub rather than nowhere.
+  git remote get-url origin >/dev/null 2>&1
+}
 lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed · 2 the lease was refused
   local branch="$1" lease
   # The credential. `cc-gh-token gitargs` prints the `git -c …` arguments that authenticate as this box's
   # GitHub App — and prints NOTHING for a remote the app does not cover, or on a box with no app, so every
   # other push still uses whatever helper ~/.gitconfig gives it. Without this a member project's push has no
   # credential at all and stops on "could not read Username", which is how two finished branches sat unpushed.
-  local -a cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$(git remote get-url origin 2>/dev/null)" 2>/dev/null)
+  local -a cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$remote" 2>/dev/null)" "$workspace" 2>/dev/null)
   # Plain push FIRST, and force nothing when it works: a fast-forward never needed a lease. It is also how a
   # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
   # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
-  if git "${cred[@]}" push -q -u origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+  if git "${cred[@]}" push -q -u "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
   grep -qE 'non-fast-forward|fetch first' "$root/.cc/push.err.tmp" || { mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
   lease=$(cat "$root/.cc/pushed" 2>/dev/null)
   # Nothing recorded yet (a track older than .cc/pushed): the tracking ref is the best account of the remote we
   # have, and one push from here replaces the guess with the real thing.
-  [ -n "$lease" ] || lease=$(git rev-parse -q --verify "refs/remotes/origin/$branch" 2>/dev/null)
+  [ -n "$lease" ] || lease=$(git rev-parse -q --verify "refs/remotes/$remote/$branch" 2>/dev/null)
   if [ -n "$lease" ]; then
-    if git "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" origin "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
+    if git "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; return 0; fi
     mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"
     grep -qE 'stale info|non-fast-forward|fetch first' "$root/.cc/push.err" && return 2
     return 1; fi
@@ -54,7 +116,7 @@ lease_keep(){ git rev-parse "$1" > "$root/.cc/pushed" 2>/dev/null   # next time'
 lease_refused(){   # a write this worktree did not make, on a single-writer branch: say so three ways, never none
   local branch="$1" repo track st msg
   repo=$(sed -n 1p "$root/.cc/track" 2>/dev/null); track=$(sed -n 2p "$root/.cc/track" 2>/dev/null)
-  msg="push refused: origin/$branch is not what this worktree last pushed, so something else wrote to that branch. The work is committed here and was NOT overwritten. Read 'git fetch origin && git log origin/$branch' before anything else."
+  msg="push refused: $remote/$branch is not what this worktree last pushed, so something else wrote to that branch. The work is committed here and was NOT overwritten. Read 'git fetch $remote && git log $remote/$branch' before anything else."
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$root/.cc/push.err"
   [ -n "$repo" ] && [ -n "$track" ] || return 0
   "$BIN/cc-board" note "$repo" "$track" "$msg" >/dev/null 2>&1
@@ -65,14 +127,100 @@ lease_refused(){   # a write this worktree did not make, on a single-writer bran
   # beats silent once, which is the bug this file exists to close.
   [ "$(grep -v '^[[:space:]]*$' "$st" | tail -1)" = "STATUS: BLOCKED: $msg" ] && return 0
   printf '\n%s cc-checkpoint: %s\nSTATUS: BLOCKED: %s\n' "$(date -u +%FT%TZ)" "$msg" "$msg" >> "$st"; }
-if [ "$MODE" = push ]; then   # push only: no payload to read, no commit, and a real exit code for `cc done`
-  root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "cc-checkpoint --push: not inside a git worktree" >&2; exit 1; }
+selfcheck(){   # the pick_remote rule, on fixtures of its own: a HOME, workspaces and repos it builds here, and
+  # a cc-gh-token that RECORDS what it was asked to create instead of creating anything. No repository of this
+  # box's is read, no token is minted, nothing reaches GitHub and no directory outside the temp dir is written.
+  local n=0 f=0 out rc d bin
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2 — $3"; f=$((f+1)); fi; }
+  eq(){ k "$([ "$2" = "$3" ] && echo 0 || echo 1)" "$1" "got '$2', wanted '$3'"; }
+  T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+  HOME="$T/home"; export HOME GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+  bin="$T/bin"; mkdir -p "$bin" "$HOME/.cc/worktrees" "$HOME/dev"
+  cp "$(readlink -f "$0")" "$bin/cc-checkpoint"   # a COPY: a symlink resolves back to core/bin, and the stubs beside it would never be reached
+  CALLS="$T/calls"; NOTES="$T/notes"; export CALLS NOTES
+  cat > "$bin/cc-gh-token" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CALLS"
+[ "$1" = create ] || exit 0
+[ -z "${CC_FAIL:-}" ] || { echo "GitHub refused to create $3" >&2; exit 1; }
+rn=origin; [ -z "$(git remote 2>/dev/null)" ] || rn="$3"   # cc-gh-token's own rule: a workspace's FIRST repository is its origin
+git remote add "$rn" "https://example.test/org/$3.git" 2>/dev/null
+echo "https://example.test/org/$3"
+SH
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$NOTES"\n' > "$bin/cc-board"
+  chmod +x "$bin/cc-gh-token" "$bin/cc-board"
+  ws(){ mkdir -p "$HOME/dev/$1/.cc"; : > "$HOME/dev/$1/.cc/member-workspace"; }   # the marker IS the workspace
+  mkwt(){   # $1 <repo>/<track> (or an absolute path, for a worktree that is not one of ours), then name/url pairs
+    local p="$1"; shift; case "$p" in /*) ;; *) p="$HOME/.cc/worktrees/$p" ;; esac
+    mkdir -p "$p/.cc"; git init -q "$p" 2>/dev/null
+    while [ "$#" -gt 1 ]; do git -C "$p" remote add "$1" "$2"; shift 2; done
+    printf '%s\n' "$p"; }
+  run(){ : > "$CALLS"; : > "$NOTES"; ( cd "$1" && env CC_FAIL="${2:-}" "$bin/cc-checkpoint" --remote 2>/dev/null ); }
+  ws ws1; ws ws2
+  # NOT a member workspace, and it has a remote named after the track: origin still wins, and nothing is ever
+  # created for it. The kept case and the suppressed one in one fixture (review of #214: this rule ran first
+  # and so applied to every repo on the box).
+  d=$(mkwt myrepo/t1 origin https://example.test/org/myrepo.git t1 https://example.test/org/t1.git)
+  printf 'myrepo\nt1\n' > "$d/.cc/track"
+  eq "plain repo: origin, not the remote named after the track" "$(run "$d")" origin
+  eq "plain repo: nothing is created for it" "$(cat "$CALLS")" ""
+  # A member workspace's project, with its own repository already wired up: that one, not the workspace's origin.
+  d=$(mkwt ws1/proj1 origin https://example.test/org/first.git proj1 https://example.test/org/proj1.git)
+  printf 'ws1\nproj1\n' > "$d/.cc/track"
+  eq "workspace project: its own remote wins over the workspace's origin" "$(run "$d")" proj1
+  eq "workspace project: nothing is created when it has one" "$(cat "$CALLS")" ""
+  # The workspace's FIRST project is wired up as `origin` (cc-gh-token create), so origin IS that project's
+  # repository when it carries the project's name — and nothing is created a second time.
+  d=$(mkwt ws1/proj2 origin https://example.test/org/proj2.git)
+  printf 'ws1\nproj2\n' > "$d/.cc/track"
+  eq "workspace project: origin when origin is this project's repository" "$(run "$d")" origin
+  eq "workspace project: and nothing created for it" "$(cat "$CALLS")" ""
+  # A workspace project with no repository at all: one is made for it, the board hears once, and the push has
+  # somewhere to go. This workspace has no remote either, so its first repository is `origin`.
+  d=$(mkwt ws2/proj3); printf 'ws2\nproj3\n' > "$d/.cc/track"
+  eq "workspace project with no remote: a repository is created for it" "$(run "$d")" origin
+  eq "created for the workspace and project that own it" "$(cat "$CALLS")" "create ws2 proj3"
+  k "$(grep -q 'github: created https://example.test/org/proj3' "$NOTES" && echo 0 || echo 1)" "the board is told which repository was made" "$(cat "$NOTES")"
+  # The same, for a workspace that already has an origin: that origin is its FIRST project, not this one, so
+  # this project still gets its own repository — under its own name.
+  d=$(mkwt ws1/proj4 origin https://example.test/org/first.git); printf 'ws1\nproj4\n' > "$d/.cc/track"
+  eq "second project of a workspace: its own repository, not the workspace's origin" "$(run "$d")" proj4
+  eq "second project: created under the project's name" "$(cat "$CALLS")" "create ws1 proj4"
+  # THE ONE THAT MATTERS. .cc/track is bound read-WRITE into the member session, so it is the member's word;
+  # the worktree's path is not. A .cc/track naming another workspace and a free name must not become an
+  # org-admin call for that name (review of #214).
+  d=$(mkwt ws1/proj5); printf 'ws2\nvictim\n' > "$d/.cc/track"
+  out=$(run "$d")
+  eq "a lying .cc/track creates the path's own project" "$(cat "$CALLS")" "create ws1 proj5"
+  eq "and the lying .cc/track's remote is not what is pushed to" "$out" origin
+  # A worktree that is not under ~/.cc/worktrees cannot be trusted to name anything: origin only, nothing made.
+  d=$(mkwt "$T/loose"); printf 'ws1\nloose\n' > "$d/.cc/track"
+  out=$(run "$d"); rc=$?
+  eq "a worktree outside ~/.cc/worktrees: nothing is created for it" "$(cat "$CALLS")" ""
+  k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "and with no origin it answers that there is nowhere to push" "rc=$rc out='$out'"
+  # A creation that could not happen leaves its reason where the next turn replaces it, and does not invent a
+  # remote: with an origin the work still reaches GitHub, without one there is nowhere to push.
+  d=$(mkwt ws2/proj6 origin https://example.test/org/first.git); printf 'ws2\nproj6\n' > "$d/.cc/track"
+  eq "a failed creation falls back to the workspace's origin" "$(run "$d" 1)" origin
+  k "$(grep -q 'refused to create proj6' "$d/.cc/create.err" && echo 0 || echo 1)" "and leaves the reason in .cc/create.err" "$(cat "$d/.cc/create.err" 2>/dev/null)"
+  d=$(mkwt ws2/proj7); printf 'ws2\nproj7\n' > "$d/.cc/track"
+  out=$(run "$d" 1); rc=$?
+  k "$([ "$rc" = 1 ] && [ -z "$out" ] && echo 0 || echo 1)" "a failed creation with no origin: nowhere to push, and it says so" "rc=$rc out='$out'"
+  echo "cc-checkpoint selfcheck: $((n - f))/$n"; [ "$f" = 0 ]
+}
+[ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
+if [ "$MODE" != commit ]; then   # push only: no payload to read, no commit, and a real exit code for `cc done`
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "cc-checkpoint $MODE: not inside a git worktree" >&2; exit 1; }
   cd "$root" || exit 1
+  # --remote answers WHERE, and makes the workspace project's repository if that is what the answer needs, so
+  # `cc done` asks before the push and opens its PR against the same repository. It writes no branch, so the
+  # HEAD rule below — which guards a push — is not its business.
+  if [ "$MODE" = remote ]; then pick_remote || exit 1; printf '%s\n' "$remote"; exit 0; fi
   track=$(sed -n 2p "$root/.cc/track" 2>/dev/null); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
   # The same rule the hook keeps: only ever the track's own branch. Without it a session that repointed HEAD
   # could have `cc done` push the default branch for it.
   [ -n "$track" ] && [ "$branch" = "track/$track" ] || { echo "cc-checkpoint --push: HEAD is '$branch', not 'track/$track' — refusing to push" >&2; exit 1; }
-  git remote get-url origin >/dev/null 2>&1 || exit 0   # no remote at all is not a failed push
+  pick_remote || exit 0   # nowhere to push, and none to be made: that is not a failed push
   lease_push "$branch"; rc=$?
   [ "$rc" = 2 ] && lease_refused "$branch"
   [ "$rc" = 0 ] || tail -3 "$root/.cc/push.err" >&2
@@ -109,7 +257,7 @@ trap relay EXIT
   e=$("$BIN/cc-config" get CC_GIT_EMAIL); [ -n "$e" ] && ident+=(-c "user.email=$e")
   git "${ident[@]}" commit -q -m "wip: checkpoint $(date -u +%FT%TZ) [$files file(s)] [cc]" 2>/dev/null || exit 0
   rm -f "$root/.cc/checkpoint.err"
-  if git remote get-url origin >/dev/null 2>&1; then   # push failures never block, but they must not be invisible either (cc ls / digest show "push!")
+  if pick_remote; then   # push failures never block, but they must not be invisible either (cc ls / digest show "push!")
     lease_push "$branch"; [ $? = 2 ] && lease_refused "$branch"
   fi
 } >/dev/null 2>&1

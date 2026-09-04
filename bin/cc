@@ -177,7 +177,8 @@ member_gitdir(){   # $1 repo $2 worktree → 0 when a member workspace's track r
   gcd=$(git "${GITNH[@]}" -C "$2" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
   [ "$gcd" = "$main" ] && return 0
   echo "cc: refusing to run git in $2 — its .git resolves to ${gcd:-nothing}, not $main: a member workspace's track hangs off ~/dev/$1/.git or nothing runs in it"; return 1; }
-default_branch(){ git "${GITNH[@]}" -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || echo main; }
+default_branch(){   # a pipeline's status is sed's, so `|| echo main` never fired and an unset origin/HEAD gave "" (review of #214)
+  local b; b=$(git "${GITNH[@]}" -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); [ -n "$b" ] || b=main; echo "$b"; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
 lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
@@ -283,10 +284,14 @@ case "${1:-}" in
     hp=$(git -C "$DEV/$repo" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$DEV/$repo/.git/hooks";; /*) ;; *) hp="$DEV/$repo/$hp";; esac
     HG=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp")
     ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" ) || true
-    if member_workspace "$repo" && ! git -C "$wt" remote get-url origin >/dev/null 2>&1; then   # a workspace lives on the box alone: the branch IS the delivery
+    # WHERE the branch goes is cc-checkpoint's rule and nobody else's: `origin` for the box's own repos, and a
+    # member workspace project's OWN repository (made here if it has none) for a workspace. Asking `origin` the
+    # question instead sent the PR at whichever repository a workspace happened to wire up first (review of #214).
+    rem=$( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --remote 2>/dev/null ) || rem=""
+    if member_workspace "$repo" && [ -z "$rem" ]; then   # a workspace lives on the box alone: the branch IS the delivery
       "$BOARD" status "$repo" "$track" done >/dev/null; "$BOARD" note "$repo" "$track" "cc done: no remote, so no PR — the work is on track/$track in ~/dev/$repo" >/dev/null 2>&1 || true
       echo "done: $repo has no remote, so no PR — track/$track is committed in ~/dev/$repo"; exit 0; fi
-    if git -C "$wt" remote get-url origin >/dev/null 2>&1; then   # a PR on an un-pushed branch is worse than no PR: stop here and say why
+    if [ -n "$rem" ]; then   # a PR on an un-pushed branch is worse than no PR: stop here and say why
       # cc-checkpoint --push owns the push, lease and all — a worker that rebased its own branch would otherwise be
       # rejected non-fast-forward here and finish green with no PR at all (2026-08-31). Exit 2 is the one case the
       # lease refuses: something else wrote to the branch. It has already journalled and told the board; do not
@@ -294,6 +299,31 @@ case "${1:-}" in
       member_gitdir "$repo" "$wt" || exit 1   # the same wall in front of the push (review-156c)
       ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --push ) || { echo "cc: push failed — no PR opened (reason above; also in $wt/.cc/push.err)"; exit 1; }
     fi
+    if member_workspace "$repo" && [ -n "$rem" ]; then
+      # gh resolves a bare `pr create` against `origin`, which for a workspace's SECOND project is another
+      # project's repository — so pin it to the one just pushed to. And a repository that has only ever
+      # received track/<t> has no base branch to open a PR against: there the branch is the delivery, the
+      # same clean ending a workspace had before it had any repository, not a failed PR. Asked with the
+      # workspace's own credential (cc-gh-token gitargs, as the push was), and never at a prompt. Only an ANSWER
+      # of "no such branch" takes that ending: an ask that failed (no network, a refused credential) falls through
+      # to the PR path, which fails out loud and leaves the row in review, rather than closing the track as done
+      # on a note that is not true (review of #214).
+      rurl=$(git -C "$wt" remote get-url "$rem" 2>/dev/null); slug=${rurl%.git}
+      case "$slug" in https://*/*/*) slug=${slug#https://}; slug=${slug#*/} ;; *) slug="" ;; esac
+      cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$rurl" "$repo" 2>/dev/null)
+      # The base is that repository's OWN default branch, asked of it: a workspace's local origin/HEAD is never set
+      # (cc-gh-token create's `git remote add` sets none), so $base could be empty here, and an empty ls-remote
+      # pattern matches nothing — which took this ending against a repository that did have a main (review of
+      # #214). An answered HEAD names the base; an answer with no HEAD is a repository with no branch to open a
+      # PR against.
+      symref=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote --symref "$rem" HEAD 2>/dev/null); lsrc=$?
+      rbase=$(sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p' <<<"$symref" | head -1)
+      if [ "$lsrc" = 0 ] && [ -z "$rbase" ]; then
+        "$BOARD" status "$repo" "$track" done >/dev/null
+        "$BOARD" note "$repo" "$track" "cc done: track/$track is pushed to ${slug:-$rem}, which has no default branch to open a PR against — that branch is the delivery" >/dev/null 2>&1 || true
+        echo "done: track/$track is pushed to ${slug:-$rem} — no default branch there to open a PR against"; exit 0; fi
+      [ -n "$rbase" ] && base="$rbase"
+      [ -n "$slug" ] && export GH_REPO="$slug"; fi
     title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"
     instr=$("$BOARD" get "$repo" "$track" instructions)   # the brief, from its one home: $STBASE/$repo/$track/task.md
     url=$(cd "$wt" && gh pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null)   # `gh pr view` also returns a MERGED PR and would silently reuse it

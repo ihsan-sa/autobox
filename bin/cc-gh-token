@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # cc-gh-token — a short-lived GitHub App installation token, minted on demand, so a push from a track
 # worktree authenticates without a person present.
-#   cc-gh-token gitargs <remote-url>    the `git -c …` arguments that make git authenticate as the app for
-#                                       that remote, one per line — and NOTHING for any other remote, so
-#                                       every other push keeps whatever helper ~/.gitconfig already gives it
-#   cc-gh-token get|store|erase         git's credential-helper protocol on stdin (what gitargs wires up)
-#   cc-gh-token selfcheck               minting, reuse, expiry, an absent key and the scoping, on fixtures
-#                                       of its own: its own RSA key, its own API on localhost, its own cache
+#   cc-gh-token gitargs <remote-url> [<workspace>]   the `git -c …` arguments that make git authenticate as
+#                                       the app for that remote, one per line — and NOTHING for any other
+#                                       remote, so every other push keeps whatever helper ~/.gitconfig gives
+#                                       it. With a workspace: nothing for a repository it does not own either
+#   cc-gh-token repos <workspace>       the repositories that workspace owns, one per line
+#   cc-gh-token create <workspace> <name>   create <name> in the app's org FOR that workspace and wire it as a
+#                                       remote of ~/dev/<workspace>, so its next push has somewhere to go;
+#                                       prints the url. Idempotent, and it refuses a name already someone else's
+#   cc-gh-token [--workspace <w>] get|store|erase   git's credential-helper protocol on stdin (gitargs wires
+#                                       this up, workspace and all)
+#   cc-gh-token selfcheck               minting, reuse, expiry, an absent key, the per-workspace scoping and
+#                                       the creation path, on fixtures of its own: its own RSA key, its own
+#                                       API on localhost, its own ~/dev of workspaces, its own cache
 #
 # THE APP IS CONFIGURATION, NEVER CONTENT. Nothing here names a box, an org, an ID or a key path — those are
 # keys in ~/.cc/config, which is absent inside every sandbox profile (cc-sandbox), read through cc-config,
@@ -14,21 +21,30 @@
 #   CC_GH_APP_ID · CC_GH_APP_INSTALL_ID · CC_GH_APP_KEY (path to the private key) · CC_GH_APP_OWNER (the org
 #   or user the installation covers)
 # and two with defaults: CC_GH_APP_HOST (github.com) · CC_GH_API (the public API).
-# Configure none of them and every subcommand is a no-op: gitargs prints nothing, so a box with no app pushes
-# exactly as it did before.
+# Configure none of them and nothing here reaches GitHub: gitargs prints nothing, so a box with no app pushes
+# exactly as it did before, and asking for a credential or a repository says which keys are missing.
+#
+# A WORKSPACE OPENS ITS OWN REPOSITORIES AND NOBODY ELSE'S. The installation covers the whole org
+# (repository_selection "all", measured), so an unscoped token opens every member workspace's project. A token
+# minted FOR a workspace is therefore asked for with `repositories`: GitHub limits it to that list, and there
+# is NO fallback — a workspace that owns nothing is refused a token rather than handed the org. Ownership is
+# git's own account of it, not a second registry: a workspace owns the repositories its checkout
+# ~/dev/<handle> names as remotes. The host writes those (`create` below); cc-sandbox binds that .git/config
+# READ-ONLY inside the boundary, so a workspace cannot add another's repository to its own list.
 #
 # THE TOKEN IS THE SECRET AND IT IS TREATED LIKE ONE. It goes to git's stdin pipe and to ~/.cc/secrets/
 # gh-app-token.json, mode 600 — the directory the private key itself lives in, 700 and bound by no bwrap
 # profile, so neither is readable from inside a worker or member workspace. Nowhere else: not a log, not a
 # board row, not a journal, not Slack. The API error path prints the API's `message` and never the response
 # body. The JWT that buys the token is handed to curl through `-K -`, not argv, so it is not in `ps` either.
-# CC_GH_TOKEN_CACHE moves that file (the selfcheck below, which never touches the real one).
+# CC_GH_TOKEN_CACHE moves that file — one cache per workspace beside it, so no workspace is ever handed
+# another's token (the selfcheck below, which never touches the real one).
 set -uo pipefail
 umask 077   # the cache below is a credential: never group- or world-readable, not even for an instant
 
 SELF="$(readlink -f "$0")"
 BIN="$(dirname "$SELF")"
-USAGE="usage: cc-gh-token gitargs <remote-url> | get | store | erase | selfcheck"
+USAGE="usage: cc-gh-token gitargs <remote-url> [<workspace>] | repos <workspace> | create <workspace> <name> | [--workspace <w>] get | store | erase | selfcheck"
 MARGIN=300   # seconds of life a cached token must still have to be reused — see cache_read
 
 cfg(){ "$BIN/cc-config" get "$1" "${2:-}"; }
@@ -39,9 +55,47 @@ OWNER=$(cfg CC_GH_APP_OWNER)
 HOST=$(cfg CC_GH_APP_HOST github.com)
 API=$(cfg CC_GH_API https://api.github.com)
 CACHE="${CC_GH_TOKEN_CACHE:-$HOME/.cc/secrets/gh-app-token.json}"
+WS=""             # the workspace this token is FOR: empty is the box itself, and only the box
+SCOPE=()          # the repositories that workspace owns — all a token minted for it may open
+SCOPE_JSON=null   # the same list as the cache records it, so a token minted before a repo existed is re-minted
 
 configured(){ [ -n "$APP_ID" ] && [ -n "$INSTALL_ID" ] && [ -n "$KEY" ] && [ -n "$OWNER" ]; }
 die(){ echo "cc-gh-token: $1" >&2; exit 1; }
+
+# ── whose repository is it ───────────────────────────────────────────────────────────────────────
+# The marker, never the name: ~/dev/<handle>/.cc/member-workspace is what makes a directory a workspace
+# (docs/design-member-workspaces.md), and its remotes are what it owns.
+ws_repos(){   # $1 handle → its repo names under the app's owner, one per line, sorted. 1 = not a workspace,
+              # which is NOT the same answer as a workspace with no repository yet (0, and nothing printed):
+              # git exits non-zero when a repo has no remote at all, and under pipefail that read as "no
+              # workspace" and said so — measured on a real one, 2026-09-04.
+  local d url u cfg
+  case "$1" in ''|.|..|*/*) return 1 ;; esac
+  d="$HOME/dev/$1"
+  [ -f "$d/.cc/member-workspace" ] || return 1
+  cfg=$(git -C "$d" config --get-regexp '^remote\..*\.url$' 2>/dev/null) || cfg=''
+  printf '%s\n' "$cfg" | while read -r _ url; do
+    u=${url%.git}
+    case "${u,,}" in "https://${HOST,,}/${OWNER,,}/"*) ;; *) continue ;; esac   # another host or another owner: not ours to open
+    u=${u##*/}; [ -n "$u" ] && printf '%s\n' "$u"
+  done | sort -u
+}
+ws_owns(){ ws_repos "$1" 2>/dev/null | grep -qixF -- "$2"; }
+ws_owner_of(){   # $1 repo name → the handle of the workspace that owns it, or nothing
+  local d h
+  for d in "$HOME"/dev/*/; do h=${d%/}; h=${h##*/}
+    ws_owns "$h" "$1" && { printf '%s' "$h"; return 0; }
+  done
+  return 1
+}
+scope_init(){   # what a token for WS may open. NEVER the whole org: "the token any workspace gets opens its
+                # own repositories and nobody else's", so no repositories means no token, not a wider one.
+  [ -n "$WS" ] || return 0
+  ws_repos "$WS" >/dev/null || die "$WS is not a member workspace (~/dev/$WS/.cc/member-workspace)"
+  mapfile -t SCOPE < <(ws_repos "$WS")
+  [ "${#SCOPE[@]}" -gt 0 ] || die "workspace $WS owns no repository in $OWNER, and a token for a workspace is never minted for the whole org — 'cc-gh-token create $WS <name>' makes it one"
+  SCOPE_JSON=$(jq -nc --args '$ARGS.positional' "${SCOPE[@]}")
+}
 
 # ── the cache ────────────────────────────────────────────────────────────────────────────────────
 # An installation token lives an hour; minting one costs a signature and a round trip, and a loop pushes
@@ -49,21 +103,26 @@ die(){ echo "cc-gh-token: $1" >&2; exit 1; }
 # guarded one — and re-minted the moment it is near its end. `expires_at` comes back at SECOND resolution
 # ("2026-09-04T02:12:00Z") and is compared as seconds. A token with exactly MARGIN left is treated as
 # expired, not as usable: a push starting now must not be handed a credential that dies mid-transfer.
+cache_file(){ if [ -n "$WS" ]; then printf '%s' "${CACHE%.json}.$WS.json"; else printf '%s' "$CACHE"; fi; }
 cache_read(){   # prints a still-usable token, or nothing (and removes a cache that has expired)
-  local tok exp now
-  [ -f "$CACHE" ] || return 1
-  tok=$(jq -r '.token // empty' "$CACHE" 2>/dev/null)
-  exp=$(jq -r '.expires_at // empty' "$CACHE" 2>/dev/null)
-  [ -n "$tok" ] && [ -n "$exp" ] || { rm -f "$CACHE"; return 1; }
-  exp=$(date -u -d "$exp" +%s 2>/dev/null) || { rm -f "$CACHE"; return 1; }
+  local tok exp now f; f=$(cache_file)
+  [ -f "$f" ] || return 1
+  tok=$(jq -r '.token // empty' "$f" 2>/dev/null)
+  exp=$(jq -r '.expires_at // empty' "$f" 2>/dev/null)
+  [ -n "$tok" ] && [ -n "$exp" ] || { rm -f "$f"; return 1; }
+  exp=$(date -u -d "$exp" +%s 2>/dev/null) || { rm -f "$f"; return 1; }
   now=$(date -u +%s)
-  [ "$((exp - now))" -gt "$MARGIN" ] || { rm -f "$CACHE"; return 1; }   # gone, or too near gone to use
+  [ "$((exp - now))" -gt "$MARGIN" ] || { rm -f "$f"; return 1; }   # gone, or too near gone to use
+  # A token is minted for a LIST of repositories. One created since (cc-gh-token create) is not in it, and a
+  # push there would be refused for the rest of the hour — so a cache whose list is not the workspace's
+  # current one is thrown away, not reused.
+  [ "$(jq -c '.repos // null' "$f" 2>/dev/null)" = "$SCOPE_JSON" ] || { rm -f "$f"; return 1; }
   printf '%s' "$tok"
 }
 cache_write(){   # $1 token, $2 expires_at — atomic, so a reader never sees half a credential
-  local d; d=$(dirname "$CACHE"); mkdir -p "$d" 2>/dev/null; chmod 700 "$d" 2>/dev/null
-  jq -n --arg t "$1" --arg e "$2" '{token:$t,expires_at:$e}' > "$CACHE.tmp.$$" || return 1
-  chmod 600 "$CACHE.tmp.$$"; mv -f "$CACHE.tmp.$$" "$CACHE"
+  local d f; f=$(cache_file); d=$(dirname "$f"); mkdir -p "$d" 2>/dev/null; chmod 700 "$d" 2>/dev/null
+  jq -n --arg t "$1" --arg e "$2" --argjson r "$SCOPE_JSON" '{token:$t,expires_at:$e,repos:$r}' > "$f.tmp.$$" || return 1
+  chmod 600 "$f.tmp.$$"; mv -f "$f.tmp.$$" "$f"
 }
 
 # ── minting ──────────────────────────────────────────────────────────────────────────────────────
@@ -78,15 +137,18 @@ jwt(){   # RS256, signed by the app's private key. 9 minutes: GitHub's own ceili
   printf '%s.%s' "$body" "$(printf '%s' "$body" | openssl dgst -sha256 -sign "$KEY" -binary 2>/dev/null | b64url)"
 }
 mint(){   # prints the token; caches it; every failure is a message on stderr and nothing on stdout
-  local j r tok exp msg
+  local j r tok exp msg; local -a body=()
+  # For a workspace, GitHub itself limits the token to that list — the refusal is the API's, not only ours.
+  [ -n "$WS" ] && body=(--data "$(jq -nc --argjson r "$SCOPE_JSON" '{repositories:$r}')")
   [ -r "$KEY" ] || die "the app's private key is not readable at $KEY — nothing can be minted (the owner places it; a sandboxed session cannot and must not)"
   j=$(jwt); [ -n "${j##*.}" ] || die "signing the JWT failed — is $KEY an RSA private key?"
   # -K - keeps the JWT out of argv, where `ps` would show it to every process on the box.
-  r=$(curl -sS --max-time 20 -K - <<EOF
+  r=$(curl -sS --max-time 20 "${body[@]}" -K - <<EOF
 url = "$API/app/installations/$INSTALL_ID/access_tokens"
 request = "POST"
 header = "Authorization: Bearer $j"
 header = "Accept: application/vnd.github+json"
+header = "Content-Type: application/json"
 header = "X-GitHub-Api-Version: 2022-11-28"
 EOF
   ) || die "the token request did not complete"
@@ -94,37 +156,90 @@ EOF
   exp=$(jq -r '.expires_at // empty' <<<"$r" 2>/dev/null)
   # Never the body: a response is not a place to be careless, and the message is the part that helps.
   [ -n "$tok" ] && [ -n "$exp" ] || { msg=$(jq -r '.message // "no token in the response"' <<<"$r" 2>/dev/null); die "GitHub refused to mint: ${msg:-no token in the response}"; }
-  cache_write "$tok" "$exp" || die "could not write the token cache at $CACHE"
+  cache_write "$tok" "$exp" || die "could not write the token cache at $(cache_file)"
   printf '%s' "$tok"
 }
-token(){ local t; t=$(cache_read) && [ -n "$t" ] && { printf '%s' "$t"; return 0; }; mint; }
+token(){ local t; scope_init; t=$(cache_read) && [ -n "$t" ] && { printf '%s' "$t"; return 0; }; mint; }
 
 # ── the two doors ────────────────────────────────────────────────────────────────────────────────
-gitargs(){   # $1 remote url. Prints the -c arguments, one per line, ONLY for a remote this app covers.
-  local url="$1" rest owner
+gitargs(){   # $1 remote url, $2 the workspace pushing (optional). Prints the -c arguments, one per line,
+             # ONLY for a remote this app covers — and, for a workspace, only for one of its OWN repositories.
+  local url="$1" ws="${2:-}" rest owner repo
   configured || return 0
   case "$url" in "https://$HOST/"*) rest=${url#"https://$HOST/"} ;; *) return 0 ;; esac   # ssh and every other host: not ours
   owner=${rest%%/*}
   [ "${owner,,}" = "${OWNER,,}" ] || return 0
   # The empty value first RESETS the helper list: ~/.gitconfig already names a helper for this host (gh's),
   # it is tried before anything -c appends, and it would answer for the app's org with the wrong account.
-  # git appends the operation itself, so the value ends at the command: it runs `cc-gh-token get`.
+  # git appends the operation itself, so the value ends at the command: it runs `cc-gh-token … get`.
+  if [ -n "$ws" ]; then
+    # "the token any workspace gets opens its own repositories and nobody else's" — so another workspace's
+    # repository gets no credential at all here, and the push stops rather than crossing the boundary.
+    repo=${rest#*/}; repo=${repo%.git}; repo=${repo%%/*}
+    ws_owns "$ws" "$repo" || return 0
+    # useHttpPath makes git send the repository as well as the host, so the helper can check it a second
+    # time where the token is actually handed over.
+    printf -- '-c\ncredential.helper=\n-c\ncredential.helper=!%q --workspace %q\n-c\ncredential.useHttpPath=true\n' "$SELF" "$ws"
+    return 0
+  fi
   printf -- '-c\ncredential.helper=\n-c\ncredential.helper=!%q\n' "$SELF"
 }
 helper_get(){   # git's credential protocol: key=value lines in, username/password out
-  local line k v tok host='' proto=''
+  local line k v tok repo host='' proto='' path=''
   while IFS= read -r line; do
     [ -z "$line" ] && break
     k=${line%%=*}; v=${line#*=}
-    case "$k" in host) host=$v ;; protocol) proto=$v ;; esac
+    case "$k" in host) host=$v ;; protocol) proto=$v ;; path) path=$v ;; esac
   done
   configured || die "no GitHub App is configured (CC_GH_APP_ID, CC_GH_APP_INSTALL_ID, CC_GH_APP_KEY, CC_GH_APP_OWNER in ~/.cc/config)"
   # gitargs only wires this helper up for the app's own host, but a redirect can move the request: check.
   [ "$proto" = https ] && [ "${host,,}" = "${HOST,,}" ] || die "asked for $proto://$host, which this app does not cover"
+  # gitargs refused another workspace's repository already; git sends the path (credential.useHttpPath, set
+  # there), so it is refused again HERE, before anything is minted.
+  if [ -n "$WS" ] && [ -n "$path" ]; then
+    repo=${path%.git}; repo=${repo##*/}
+    ws_owns "$WS" "$repo" || die "$OWNER/$repo is not a repository of workspace $WS"
+  fi
   # Captured first, and nothing printed if it failed: half a credential on stdout is a push that fails
   # somewhere further away, with a worse message, than the one `token` already put on stderr.
   tok=$(token) && [ -n "$tok" ] || exit 1
   printf 'username=x-access-token\npassword=%s\n' "$tok"
+}
+
+# ── creating one ─────────────────────────────────────────────────────────────────────────────────
+# Repository creation is what the app's ORGANIZATION Administration permission is for (granted deliberately,
+# 2026-09-03). It is an ORG action, so it needs an unscoped token: a token scoped to repositories cannot make
+# a repository that does not exist yet.
+create(){   # $1 handle, $2 repo name — a workspace's project ends up with somewhere to push, nobody present
+  local ws="$1" name="$2" d url tok r msg other rn
+  configured || die "no GitHub App is configured (CC_GH_APP_ID, CC_GH_APP_INSTALL_ID, CC_GH_APP_KEY, CC_GH_APP_OWNER in ~/.cc/config)"
+  case "$name" in ''|*[!A-Za-z0-9._-]*) die "'$name' is not a repository name" ;; esac
+  d="$HOME/dev/$ws"
+  [ -f "$d/.cc/member-workspace" ] || die "$ws is not a member workspace (~/dev/$ws/.cc/member-workspace)"
+  url="https://$HOST/$OWNER/$name.git"
+  ws_owns "$ws" "$name" && { printf '%s\n' "$url"; return 0; }   # already its own: nothing is created twice
+  other=$(ws_owner_of "$name") && die "$OWNER/$name is workspace $other's — narrowing what a workspace reaches needs nobody, widening it is the owner's alone"
+  WS=""   # org action: see above
+  tok=$(token) && [ -n "$tok" ] || exit 1
+  r=$(curl -sS --max-time 20 --data "$(jq -nc --arg n "$name" --arg h "$ws" '{name:$n,private:true,description:("the \($h) workspace on this box")}')" -K - <<EOF
+url = "$API/orgs/$OWNER/repos"
+request = "POST"
+header = "Authorization: Bearer $tok"
+header = "Accept: application/vnd.github+json"
+header = "Content-Type: application/json"
+header = "X-GitHub-Api-Version: 2022-11-28"
+EOF
+  ) || die "the create request did not complete"
+  [ "$(jq -r '.name // empty' <<<"$r" 2>/dev/null)" = "$name" ] || {
+    msg=$(jq -r '.errors[0].message // .message // empty' <<<"$r" 2>/dev/null)
+    die "GitHub refused to create $OWNER/$name: ${msg:-no repository in the response}"; }
+  # The remote is what makes it THIS workspace's (ws_repos above). `origin` for a workspace that has no
+  # remote at all — its first repository, and nowhere to push until now — and the repository's own name
+  # otherwise, because each project has its own repository (owner, 2026-09-03) and must not take another
+  # project's remote.
+  rn=origin; [ -z "$(git -C "$d" remote 2>/dev/null)" ] || rn="$name"
+  git -C "$d" remote add "$rn" "$url" 2>/dev/null || die "created $OWNER/$name, but could not add it as the '$rn' remote of $d — add it by hand and nothing is created twice"
+  printf '%s\n' "$url"
 }
 
 selfcheck(){
@@ -144,15 +259,23 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 T = sys.argv[1]
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
-        try: n = int(open(T + "/mints").read())
-        except Exception: n = 0
-        n += 1
-        open(T + "/mints", "w").write(str(n))
-        open(T + "/auth", "w").write(self.headers.get("Authorization", ""))
-        open(T + "/path", "w").write(self.path)
-        body = json.dumps({"token": "ghs_fixture%d" % n,
-                           "expires_at": open(T + "/expires").read().strip()}).encode()
-        self.send_response(201)
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        code = 201
+        if self.path.endswith("/repos"):        # the creation endpoint
+            open(T + "/created", "a").write(self.path + " " + raw.decode() + "\n")
+            body = json.dumps({"name": json.loads(raw or b"{}").get("name", ""),
+                               "clone_url": "http://x/%s" % self.path}).encode()
+        else:                                   # the installation-token endpoint
+            try: n = int(open(T + "/mints").read())
+            except Exception: n = 0
+            n += 1
+            open(T + "/mints", "w").write(str(n))
+            open(T + "/auth", "w").write(self.headers.get("Authorization", ""))
+            open(T + "/path", "w").write(self.path)
+            open(T + "/body", "w").write(raw.decode())   # the `repositories` the token was asked to be limited to
+            body = json.dumps({"token": "ghs_fixture%d" % n,
+                               "expires_at": open(T + "/expires").read().strip()}).encode()
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -176,7 +299,13 @@ CC_GH_APP_OWNER=myorg
 CC_GH_API=http://127.0.0.1:$port
 EOF
   # Every case runs the real script with a config, a cache and a mint counter it sets itself.
-  G(){ CC_CONFIG="$T/config" CC_GH_TOKEN_CACHE="$T/cache.json" "$SELF" "$@"; }
+  # HOME is the fixture's own: ~/dev below is a tree this selfcheck builds, never the box's.
+  G(){ HOME="$T" CC_CONFIG="$T/config" CC_GH_TOKEN_CACHE="$T/cache.json" "$SELF" "$@"; }
+  mkws(){   # $1 handle, then its remotes — a member workspace exactly as the box makes one
+    local d="$T/dev/$1" i=0 u; mkdir -p "$d/.cc" || return 1; : > "$d/.cc/member-workspace"
+    git -C "$d" init -q 2>/dev/null || return 1
+    shift; for u in "$@"; do git -C "$d" remote add "r$i" "$u" || return 1; i=$((i+1)); done
+  }
   ask(){ printf 'protocol=https\nhost=github.com\npath=myorg/myrepo.git\n\n' | G get; }
 
   # ── minting ──
@@ -248,8 +377,78 @@ EOF
   out=$(printf 'protocol=https\nhost=evil.example.com\n\n' | G get 2>&1 >/dev/null); rc=$?
   k "$(t test $rc != 0)" "a request redirected to another host is refused, not answered"
 
+  # ── one workspace's repositories, and nobody else's ──
+  mkws wsa https://github.com/myorg/repo-a.git
+  mkws wsb https://github.com/myorg/repo-b.git https://github.com/someone-else/not-ours.git
+  mkdir -p "$T/dev/plain" && git -C "$T/dev/plain" init -q && git -C "$T/dev/plain" remote add origin https://github.com/myorg/repo-a.git
+  k "$(t test "$(G repos wsa)" = repo-a)" "a workspace owns the repositories its OWN checkout names as remotes"
+  k "$(t test "$(G repos wsb)" = repo-b)" "…and only those in the app's org: another owner's remote is not one of them"
+  out=$(G repos plain 2>/dev/null); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "a directory in ~/dev with no member-workspace marker owns nothing at all"
+  k "$(t test -n "$(G gitargs https://github.com/myorg/repo-a.git wsa)")" "gitargs wires the helper up for a repository the workspace owns"
+  k "$(t grep -q -- '--workspace wsa' <<<"$(G gitargs https://github.com/myorg/repo-a.git wsa)")" "…naming the workspace, so the credential is minted for that one"
+  k "$(t grep -qx 'credential.useHttpPath=true' <<<"$(G gitargs https://github.com/myorg/repo-a.git wsa)")" "…and asking git for the repository too, so the helper can check it again"
+  k "$(t test -z "$(G gitargs https://github.com/myorg/repo-b.git wsa)")" "ANOTHER workspace's repository in the same org gets NOTHING — no credential, so that push cannot happen"
+  k "$(t test -n "$(G gitargs https://github.com/myorg/repo-b.git wsb)")" "…while the workspace it belongs to still gets one"
+
+  # ── the token GitHub mints is limited to that list, not merely the helper's opinion ──
+  rm -f "$T"/cache*.json; echo 0 > "$T/mints"; future '60 minutes' > "$T/expires"; : > "$T/body"
+  askws(){ printf 'protocol=https\nhost=github.com\npath=myorg/%s.git\n\n' "$2" | G --workspace "$1" get; }
+  out=$(askws wsa repo-a)
+  k "$(t grep -q '^password=ghs_fixture' <<<"$out")" "a push from a workspace is handed a token"
+  k "$(t test "$(jq -c .repositories "$T/body")" = '["repo-a"]')" "…and the token was minted for that workspace's repositories alone"
+  k "$(t test -z "$(grep -F repo-b "$T/body")")" "…with no other workspace's repository in the request"
+  out=$(askws wsa repo-b 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "asked at the helper itself for another workspace's repository, it refuses and prints no credential"
+  k "$(t grep -q wsa "$T/err")" "…saying which workspace was asking"
+
+  # ── a workspace that owns nothing is refused, NOT widened to the org ──
+  mkws wsnone; echo 0 > "$T/mints"
+  out=$(G repos wsnone); rc=$?
+  k "$(t test $rc = 0 -a -z "$out")" "a workspace with no repository YET is still a workspace: it lists nothing and says nothing is wrong"
+  out=$(printf 'protocol=https\nhost=github.com\n\n' | G --workspace wsnone get 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "a workspace with no repository of its own is refused a token"
+  k "$(t grep -q 'owns no repository' "$T/err")" "…for that reason, not for looking like no workspace at all"
+  k "$(t test "$(cat "$T/mints")" = 0)" "…and no org-wide token is minted as a fallback: the API is never asked"
+
+  # ── one cache per workspace, and it does not outlive the list it was minted for ──
+  echo 0 > "$T/mints"
+  jq -n --arg e "$(future '59 minutes')" '{token:"ghs_wsb_only",expires_at:$e,repos:["repo-b"]}' > "$T/cache.wsb.json"
+  out=$(askws wsa repo-a)
+  k "$(t test -z "$(grep -F ghs_wsb_only <<<"$out")")" "the token cached for one workspace is never handed to another workspace's push"
+  echo 0 > "$T/mints"; : > "$T/body"
+  jq -n --arg e "$(future '59 minutes')" '{token:"ghs_old_scope",expires_at:$e,repos:["repo-a"]}' > "$T/cache.wsa.json"
+  git -C "$T/dev/wsa" remote add later https://github.com/myorg/repo-a2.git
+  out=$(askws wsa repo-a2)
+  k "$(t test "$(cat "$T/mints")" = 1)" "a repository created since the cached token was minted re-mints it, rather than pushing with a token that cannot open it"
+  k "$(t test "$(jq -c .repositories "$T/body")" = '["repo-a","repo-a2"]')" "…for the workspace's whole list, the new repository included"
+  k "$(t test -z "$(grep -F ghs_old_scope <<<"$out")")" "…and the narrower token is not the one git gets"
+
+  # ── creating a repository for a workspace's project ──
+  : > "$T/created"; rm -f "$T"/cache*.json
+  out=$(G create wsa proj-x); rc=$?
+  k "$(t test $rc = 0 -a "$out" = https://github.com/myorg/proj-x.git)" "create makes the repository and prints the url to push to"
+  k "$(t grep -q '^/orgs/myorg/repos ' "$T/created")" "…in the app's ORG, which is what organization Administration is for"
+  k "$(t test "$(jq -r '.private,.name' <<<"$(cut -d' ' -f2- "$T/created")" | tr '\n' ' ')" = "true proj-x ")" "…private, under the name it was asked for"
+  k "$(t test "$(git -C "$T/dev/wsa" remote get-url proj-x)" = https://github.com/myorg/proj-x.git)" "…as a remote named after itself, so the workspace's other projects keep theirs"
+  k "$(t test "$(G repos wsa | grep -cx proj-x)" = 1)" "…and it is now one of that workspace's own repositories"
+  k "$(t test -n "$(G gitargs https://github.com/myorg/proj-x.git wsa)")" "…so the very next push from that workspace has a credential for it"
+  k "$(t test -z "$(G gitargs https://github.com/myorg/proj-x.git wsb)")" "…and no other workspace does"
+  : > "$T/created"
+  out=$(G create wsa proj-x); rc=$?
+  k "$(t test $rc = 0 -a "$out" = https://github.com/myorg/proj-x.git -a ! -s "$T/created")" "creating the same repository again prints the url and creates nothing"
+  out=$(G create wsb proj-x 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/created")" "another workspace cannot create over a repository that is already someone's"
+  k "$(t grep -q wsa "$T/err")" "…and is told whose it is"
+  out=$(G create wsnone first-proj)
+  k "$(t test "$(git -C "$T/dev/wsnone" remote get-url origin)" = https://github.com/myorg/first-proj.git)" "a workspace with nowhere to push at all gets its first repository as origin"
+  out=$(G create plain nope 2>/dev/null); rc=$?
+  k "$(t test $rc != 0)" "create refuses a directory that is not a member workspace"
+  out=$(CC_CONFIG=/dev/null HOME="$T" "$SELF" create wsa other 2>&1 >/dev/null); rc=$?
+  k "$(t test $rc != 0)" "…and a box with no app configured creates nothing"
+
   # ── the token lands nowhere durable ──
-  rm -f "$T/cache.json"; echo 0 > "$T/mints"; future '60 minutes' > "$T/expires"
+  rm -f "$T"/cache*.json; echo 0 > "$T/mints"; future '60 minutes' > "$T/expires"
   tok=$(ask | sed -n 's/^password=//p')
   k "$(t test "$(grep -rl -F -- "$tok" "$T" 2>/dev/null)" = "$T/cache.json")" \
      "the minted token is in the mode-600 cache and in NO other file the mint touched — no log, no journal, no board row"
@@ -257,8 +456,14 @@ EOF
   [ "$f" -eq 0 ]
 }
 
+# The workspace rides in front of the operation because git appends the operation itself: the helper gitargs
+# wires up is `cc-gh-token --workspace <w>`, and git runs it as `cc-gh-token --workspace <w> get`.
+if [ "${1:-}" = --workspace ]; then WS="${2:-}"; [ -n "$WS" ] || { echo "$USAGE" >&2; exit 2; }; shift 2; fi
 case "${1:-}" in
-  gitargs)        shift; [ $# -eq 1 ] || { echo "$USAGE" >&2; exit 2; }; gitargs "$1" ;;
+  gitargs)        shift; [ $# -ge 1 ] && [ $# -le 2 ] || { echo "$USAGE" >&2; exit 2; }; gitargs "$1" "${2:-}" ;;
+  repos)          shift; [ $# -eq 1 ] || { echo "$USAGE" >&2; exit 2; }
+                  ws_repos "$1" || die "$1 is not a member workspace (~/dev/$1/.cc/member-workspace)" ;;
+  create)         shift; [ $# -eq 2 ] || { echo "$USAGE" >&2; exit 2; }; create "$1" "$2" ;;
   get)            helper_get ;;
   store|erase)    exit 0 ;;   # git's protocol requires both; nothing here stores or forgets on git's say-so
   selfcheck)      selfcheck ;;
