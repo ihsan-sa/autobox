@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# cc-pause — park one project. While a repo is paused, nothing the box does on its own spends a token on it:
+# its headless worker loops are signalled at once (the iteration in flight is aborted), and the timer-driven passes
+# (cc-pulse, cc-reconcile, cc-secretary, cc-broker, cc-publish, cc-janitor), the board watchdog's nags and the
+# cc-land queue all skip it on their next tick. Nothing is lost: worktrees, journals, board rows, open PRs and
+# Slack messages queued for its session are all still there when it is resumed.
+#
+#   cc-pause on <repo> [--by <who>] [--note <text>]   park it; prints what it stopped
+#   cc-pause off <repo>                               unpark it; prints what it started again
+#   cc-pause is <target>                              exit 0 when paused — THE check every spender makes.
+#                                                     Lenient: `myrepo`, `myrepo/track` and `myrepo@alias` all
+#                                                     ask about the project `myrepo`, so no caller re-derives it.
+#   cc-pause status [<repo>]                          one line per paused project, or just this one
+#   cc-pause list                                     paused repo names, one per line (nothing when none are)
+#   cc-pause selfcheck                                pause, resume and the reboot case
+#
+# PER PROJECT, NEVER BOX-WIDE. `on` takes one repo that has a ~/dev/<repo> directory and refuses everything else —
+# `box`, a `repo/track`, a name with a slash in it. Every other project keeps running.
+# THE STATE IS A FILE, $HOME/.cc/state/<repo>/paused, because that is what survives a reboot: the timers all come
+# back on their own and each one asks `cc-pause is <repo>` before it spends. Nothing held in memory would.
+set -uo pipefail
+B="$(dirname "$(readlink -f "$0")")"   # sibling, so a worktree copy tests itself
+STATE="$HOME/.cc/state"; DEV="$HOME/dev"
+
+die(){ echo "cc-pause: $*" >&2; exit 2; }
+now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+flag(){ echo "$STATE/$1/paused"; }
+
+# ONE REPO, AND IT MUST BE A REAL ONE. `box` is the box's own session, not a project — pausing it would be the
+# box-wide stop this command must never be. A `repo/track` names one track of a project; the whole project is the
+# unit here, so it is refused rather than quietly widened to its repo.
+valid_repo(){
+  local r="${1:-}"
+  [ -n "$r" ] || { echo "no repo — cc-pause on <repo>"; return 1; }
+  [ "$r" = box ] && { echo "'box' is the box's own session, not a project — pause is per project, never box-wide"; return 1; }
+  case "$r" in */*) echo "'$r' names a track; pause takes the whole project: cc-pause on ${r%%/*}"; return 1;; esac
+  [[ "$r" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || { echo "'$r' is not a repo name"; return 1; }
+  [ -d "$DEV/$r" ] || { echo "no project '$r' — $DEV/$r does not exist"; return 1; }
+  return 0
+}
+
+# WHAT A PAUSE STOPS, named so `on` can print it and a reader can check the list against the code that honours it.
+# Each of these asks `cc-pause is <repo>` on its own next tick; none of them needs telling.
+SKIPPERS="cc-pulse, cc-reconcile, cc-secretary, cc-broker, cc-publish, cc-janitor, board nags, the landing queue"
+
+# `is` takes a TARGET, not only a repo: cc-broker keys on `repo/track`, cc-pulse on `repo@alias`, and every one
+# of them means the same project. Deriving the repo here is the whole reason there is one command to ask.
+repo_of(){ local t="${1:-}"; t="${t%%/*}"; echo "${t%%@*}"; }
+paused(){ local r; r=$(repo_of "${1:-}"); [ -n "$r" ] && [ -e "$(flag "$r")" ]; }
+
+# A running loop's own command line, so `off` can put back exactly what `on` stopped. The supervisor is the
+# `cc-loop <repo> <track> …` process itself, never the shell that spawned it — re-running the shell's line would
+# re-open a tmux pane nobody asked for.
+loop_pids(){
+  local repo="$1" pid k; local -a fields
+  for pid in $(pgrep -f cc-loop 2>/dev/null); do
+    mapfile -t -d '' fields < "/proc/$pid/cmdline" 2>/dev/null || continue
+    # THE SUPERVISOR, NEVER THE SHELL THAT SPAWNED IT. `cc` starts a worker as `bash -c "… /…/cc-loop <repo> …"`
+    # inside a tmux window, so that shell's argv contains the same text as one single word. Signalling it would
+    # take the window and leave claude re-parented; the loop's own TERM trap is what stands the worker down.
+    for ((k = 0; k < ${#fields[@]} - 1; k++)); do
+      case "${fields[k]}" in */cc-loop|cc-loop)
+        [ "${fields[k+1]}" = "$repo" ] && { echo "$pid"; break; };; esac
+    done
+  done
+}
+loop_argv(){ tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | sed -n '/cc-loop$/,$p'; }
+
+# `on` records each loop's own argv so `off` can put back exactly what it stopped — including after a reboot,
+# where the processes are gone but the file is not. `--max-iter N` on the loop is `--loop N` on `cc`.
+redispatch_cmd(){   # loop argv on stdin, one word per line → the `cc … --go ""` that starts it again
+  awk 'NR==1{next} NR==2{repo=$0; next} NR==3{track=$0; next}
+       {if($0=="--max-iter"){getline v; opt=opt" --loop "v}
+        else if($0=="--budget"||$0=="--model"||$0=="--turns"||$0=="--effort"){k=$0; getline v; opt=opt" "k" "v}}
+       END{printf "%s %s --go \"\"%s\n", repo, track, opt}'
+}
+
+cmd_on(){
+  local repo="" by="" note="" msg
+  while [ $# -gt 0 ]; do case "$1" in
+    --by) by="${2:-}"; shift 2;; --note) note="${2:-}"; shift 2;;
+    -*) die "unknown option $1";; *) [ -n "$repo" ] && die "one repo at a time"; repo="$1"; shift;;
+  esac; done
+  msg=$(valid_repo "$repo") || die "$msg"
+  local f; f=$(flag "$repo"); mkdir -p "$(dirname "$f")"
+  local already=""; paused "$repo" && already=$(jq -r '.at // ""' "$f" 2>/dev/null)
+
+  # STOP THE LOOPS FIRST, then write the flag? No: the flag goes first. A loop signalled before the flag exists
+  # reads "not paused" in its trap and exits as a plain kill, and the next tick of anything could start another.
+  local loops="[]" pid tracks=() argv
+  for pid in $(loop_pids "$repo"); do
+    argv=$(loop_argv "$pid"); [ -n "$argv" ] || continue
+    tracks+=("$(sed -n 3p <<<"$argv")")
+    loops=$(jq --arg c "$(redispatch_cmd <<<"$argv")" '. + [$c]' <<<"$loops")
+  done
+  [ -n "$already" ] && loops=$(jq -s '.[0] + .[1] | unique' <(jq '.loops // []' "$f" 2>/dev/null || echo '[]') <(echo "$loops"))
+  # A SECOND `!pause` MUST NOT FORGET WHAT THE FIRST ONE RECORDED — the stamp and the loops above, and the two
+  # things a PERSON put here: who parked it and why. Neither is re-stated by `!pause` from a channel, so rewriting
+  # them from an empty argument would quietly delete the note the owner left on his own pause.
+  if [ -n "$already" ]; then
+    [ -n "$by" ]   || by=$(jq -r '.by // ""' "$f" 2>/dev/null)
+    [ -n "$note" ] || note=$(jq -r '.note // ""' "$f" 2>/dev/null)
+  fi
+  jq -n --arg at "${already:-$(now)}" --arg by "$by" --arg note "$note" --argjson loops "$loops" \
+     '{at:$at, by:$by, note:$note, loops:$loops}' > "$f" || die "could not write $f"
+
+  for pid in $(loop_pids "$repo"); do kill -TERM "$pid" 2>/dev/null; done   # cc-loop's own trap kills its claude and stands down
+
+  local n=${#tracks[@]}
+  if [ -n "$already" ]; then echo "$repo was already paused (since $already)."
+  else echo "$repo paused.$([ "$n" -gt 0 ] && echo " Stopped $n worker loop$([ "$n" = 1 ] || echo s) (${tracks[*]})." )"; fi
+  echo "Skipping until resume: $SKIPPERS."
+  echo "Nothing lost — \`cc-pause off $repo\` puts it back, worker loops included."
+}
+
+cmd_off(){
+  local repo="${1:-}" msg; msg=$(valid_repo "$repo") || die "$msg"
+  local f; f=$(flag "$repo")
+  paused "$repo" || { echo "$repo is not paused."; return 0; }
+  mapfile -t cmds < <(jq -r '.loops[]? // empty' "$f" 2>/dev/null)
+  local since; since=$(jq -r '.at // ""' "$f" 2>/dev/null)
+  rm -f "$f"   # the flag goes before the re-dispatch: cc-loop's own pre-flight would refuse a worker for a repo still paused
+  local started=0 failed=()
+  for c in "${cmds[@]}"; do
+    [ -n "$c" ] || continue
+    if eval "\"$B/cc\" $c" >/dev/null 2>&1; then started=$((started+1)); else failed+=("cc $c"); fi
+  done
+  echo "$repo resumed${since:+ (paused since $since)}.$([ "$started" -gt 0 ] && echo " Restarted $started worker loop$([ "$started" = 1 ] || echo s).")"
+  echo "The timers pick it up on their next tick."
+  # A 👍 GIVEN WHILE IT WAS PARKED IS STILL ON THE QUEUE, and nothing re-drives it: the queue arms its transient
+  # timer from the jobs it may run, and a paused repo's job is not one of those. So say it, and name the one command
+  # that lands it — resuming a project is not the owner approving a merge and a deploy, and must not perform one.
+  local q; q=$(ls "$HOME/.cc/state/land/$repo-"*.json 2>/dev/null | wc -l)
+  [ "$q" -gt 0 ] && echo "$q landing job(s) waited for this: \`cc-land work\` lands them."
+  [ ${#failed[@]} -gt 0 ] && printf 'could not restart: %s\n' "${failed[@]}" >&2
+  return 0
+}
+
+cmd_status(){
+  local repo="${1:-}" f
+  if [ -n "$repo" ]; then
+    paused "$repo" || { echo "$repo is not paused."; return 1; }
+    f=$(flag "$repo"); jq -r --arg r "$repo" '"\($r) paused since \(.at)" + (if .by != "" then " by \(.by)" else "" end) + (if .note != "" then " — \(.note)" else "" end) + " · \(.loops | length) worker loop(s) to restart"' "$f"
+    return 0
+  fi
+  local any=0
+  for f in "$STATE"/*/paused; do [ -e "$f" ] || continue; any=1; repo=$(basename "$(dirname "$f")"); cmd_status "$repo"; done
+  [ "$any" = 1 ] || echo "nothing is paused"
+}
+
+selfcheck(){   # pause, resume and the restart-from-cold case. Every case builds its own box under its own HOME, so
+               # none of them reads state another one happened to leave behind, and none of them touches this box.
+  local d n=0 bad=0 h fb
+  # THE FIXTURE PROJECTS ARE NAMED PER PROCESS. `on` finds the loops to stop with pgrep over the whole process
+  # table, so a fixture sharing a name with a project this box really has would signal that project's live
+  # worker — check.sh runs this on every commit. The pid suffix is what makes the name this run's alone.
+  local R="myrepo-$$" O="other-$$"
+  d=$(mktemp -d) || return 2
+  t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
+  # A box of its own: two projects, so every case can assert the paused one AND the one that must keep running.
+  box(){ h="$d/$1"; fb="$h/bin"; mkdir -p "$h/dev/$R" "$h/dev/$O" "$h/.cc/state" "$fb"
+    cp "$(readlink -f "$0")" "$fb/cc-pause"; chmod +x "$fb/cc-pause"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/cc.calls"\n' "$h" > "$fb/cc"; chmod +x "$fb/cc"
+    printf '#!/usr/bin/env bash\nsleep 60\n' > "$fb/cc-loop"; chmod +x "$fb/cc-loop"; }
+  P(){ HOME="$h" "$fb/cc-pause" "$@"; }   # a FRESH process every time, reading only what is on disk
+
+  box roundtrip
+  P on $R > "$h/on.out" 2>&1; t "on succeeds" "$?" 0
+  P is $R; t "…and the repo it named reads paused" "$?" 0
+  P is $O;  t "…and the OTHER project does not: per project, never box-wide" "$?" 1
+  grep -q 'cc-pulse' "$h/on.out" && grep -q 'landing queue' "$h/on.out"; t "on says what it stopped" "$?" 0
+  P off $R > /dev/null 2>&1; t "off succeeds" "$?" 0
+  P is $R; t "…and the repo reads unpaused again" "$?" 1
+
+  # THE COLD-START CASE, which is what a restart of the whole box is: every timer comes back on its own, so the
+  # only thing that can still say "paused" is the file. Nothing is running here — the flag is written the way a
+  # pause leaves it, and a brand-new process with no memory of that pause asks the question afterwards.
+  box cold
+  mkdir -p "$h/.cc/state/$R"
+  printf '{"at":"2026-01-01T00:00:00Z","by":"owner","note":"","loops":[]}\n' > "$h/.cc/state/$R/paused"
+  P is $R; t "a pause outlives the box coming back up: a fresh process still reads the flag" "$?" 0
+  P is $O;  t "…and the other project comes back up unpaused" "$?" 1
+  P status $R | grep -q '2026-01-01'; t "status says since when" "$?" 0
+
+  box refuse
+  P on box > /dev/null 2>&1;        t "'box' is refused — it is the box's own session, not a project" "$?" 2
+  P on $R/w1 > /dev/null 2>&1;  t "a repo/track is refused: the whole project is the unit" "$?" 2
+  P on nosuchrepo > /dev/null 2>&1; t "a name with no ~/dev dir is refused" "$?" 2
+  ls "$h/.cc/state"/*/paused > /dev/null 2>&1; t "…and a refusal writes no flag at all" "$?" 2
+  P on $R > /dev/null 2>&1;     t "…while the repo that IS a project pauses" "$?" 0
+
+  box lenient
+  P on $R > /dev/null 2>&1
+  P is $R/w1;     t "is takes a track target: repo/track is that project" "$?" 0
+  P is $R@scout;  t "is takes an orch target: repo@alias is that project too" "$?" 0
+  P is $O/w1;      t "…and a track of another project is not paused" "$?" 1
+  P is $O@scout;   t "…nor an orch of one" "$?" 1
+
+  # A worker loop is the one spender that must be STOPPED, not merely skipped: it is already running. `on` records
+  # its own command line so `off` can put back exactly what it stopped — from cold too, where the process is long
+  # gone and the file is all there is.
+  box loops
+  "$fb/cc-loop" $R w1 --max-iter 3 --budget 8 --model claude-opus-5 & local lp=$!
+  "$fb/cc-loop" $O w9 --max-iter 3 & local op=$!
+  sleep 0.3
+  P on $R > "$h/on.out" 2>&1
+  grep -q 'Stopped 1 worker loop (w1)' "$h/on.out"; t "on names the loop it stopped" "$?" 0
+  sleep 0.3
+  kill -0 "$lp" 2>/dev/null; t "the paused project's loop is signalled" "$?" 1
+  kill -0 "$op" 2>/dev/null; t "…and another project's loop is left running" "$?" 0
+  P off $R > /dev/null 2>&1
+  t "off re-dispatches exactly what on stopped, options and all" \
+    "$(cat "$h/cc.calls" 2>/dev/null)" "$R w1 --go  --loop 3 --budget 8 --model claude-opus-5"
+  kill "$op" 2>/dev/null; wait "$op" 2>/dev/null
+
+  box twice
+  mkdir -p "$h/.cc/state/$R"
+  printf '{"at":"2020-05-05T05:05:05Z","by":"owner","note":"waiting on a key","loops":["$R w1 --go \\"\\""]}\n' > "$h/.cc/state/$R/paused"
+  P on $R > "$h/on2.out" 2>&1
+  grep -q 'already paused' "$h/on2.out"; t "pausing a paused project says so" "$?" 0
+  t "…and keeps the stamp, the loops and the words a PERSON put there — a second !pause must not forget what to
+     restart, nor delete the note the owner left on his own pause" \
+    "$(jq -r '.at + " " + (.loops|length|tostring) + " " + .by + "/" + .note' "$h/.cc/state/$R/paused")" \
+    '2020-05-05T05:05:05Z 1 owner/waiting on a key'
+  P off $O > /dev/null 2>&1; t "off on a project that is not paused is not an error" "$?" 0
+
+  box listing
+  t "list prints nothing when nothing is paused" "$(P list)" ""
+  P status | grep -q 'nothing is paused'; t "…and status says so in words" "$?" 0
+  P on $R > /dev/null 2>&1
+  t "list prints the paused project and only it" "$(P list | tr '\n' ' ')" "$R "
+
+  rm -rf "$d"
+  printf 'cc-pause selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
+  [ "$bad" = 0 ]; }
+case "${1:-}" in
+  on)        shift; cmd_on "$@";;
+  off)       shift; cmd_off "$@";;
+  is)        paused "${2:-}";;   # exit status IS the answer: no output, so a caller can `if cc-pause is "$t"; then`
+  status)    shift; cmd_status "${1:-}";;
+  list)      for f in "$STATE"/*/paused; do [ -e "$f" ] && basename "$(dirname "$f")"; done; true;;
+  selfcheck) selfcheck;;
+  ""|-h|--help) sed -n '2,20p' "$0"; exit 0;;
+  *)         die "unknown command '${1}' — cc-pause on|off|is|status|list|selfcheck";;
+esac

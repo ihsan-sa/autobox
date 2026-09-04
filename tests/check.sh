@@ -32,10 +32,14 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # of its own: no session on this box is written to, and no message of this box's is read.
 # cc-guard's runs the gates themselves against fixtures in a HOME of its own, with the owner's two real
 # doors (cc-notify, cc-slack) stubbed: which denies page and which never do, and the worker kill fence.
+# cc-pause's builds a whole box per case under a HOME of its own — two projects, a stub `cc` and a stub `cc-loop`
+# — over pause, resume and the cold start a reboot is: the flag is a file, so a fresh process with no memory of
+# the pause still reads it. Its fixture projects carry this process's pid in their names, because `on` finds the
+# loops to stop with pgrep over the whole process table and a shared name would signal a real project's worker.
 # cc-brief's is fixtures too — briefs it writes itself, a board and a throwaway git repo under a temp dir, and
 # CC_BRIEF_FAKE standing in for the judge at every case, so the fast gate never reaches a model.
 # cc-gh-token's mints against an API of its own on localhost, signing with an RSA key it generates: minting,
 # reuse, the expiry margin, an absent key and which remotes it answers for. No GitHub App of this box's is
 # read, nothing leaves the machine, and its token cache is a file under the temp dir, never the real one.
-for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-pause; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

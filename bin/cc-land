@@ -26,6 +26,10 @@ that already exists (gh, cc-slack, cc-board, cc-scope, install.sh, systemctl); t
 under `~/.cc/state/land/`, and it owns that because a landing has to survive the process that started it.
 
 WHAT IT WILL NOT DO, and why each line is here:
+  · It touches nothing belonging to a PARKED project (`cc-pause on <repo>`). A 👍 still queues the PR — losing an
+    approval is the one thing a pause must not do — but the review is not bought, the merge and the deploy do not
+    happen, the catch-up poll skips the repo, and the queue arms no timer for it, so a parked job costs nothing at
+    all rather than re-driving itself every few seconds. `cc-pause off <repo>` and `cc-land work` land it unchanged.
   · It never merges a diff nobody read. AFTER the gates — the bullet below — comes a review: one headless
     `claude -p` against the PR's own head, with no shell and nothing to write with, answering LAND /
     LAND-AFTER-FIX / DO-NOT-LAND. The two
@@ -2028,11 +2032,30 @@ def run_job(path, job):
     return job["result"]["short"]
 
 
+def paused(target):
+    """`cc-pause on <repo>` parks a whole project — its repo, its tracks and its orchs — and nothing the box does
+    on its own may spend on it until `cc-pause off`. cc-pause owns that state; asking it is the only reading of it
+    there is. It cannot run (no such sibling on this box, a timeout): behave exactly as this file did before the
+    pause existed — a pause must never be the reason a pass stops working."""
+    try:
+        return subprocess.run([f"{BIN}/cc-pause", "is", str(target)], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
 def run_one(path):
     job = read_json(path)
     if not job or not job.get("repo") or not (job.get("pr") or job.get("span")):
         os.replace(path, path + ".unreadable")   # never guess at a landing: keep the file, merge nothing
         return f"{os.path.basename(path)}: not a job this understands — moved aside, nothing merged"
+    # A PARKED PROJECT LANDS NOTHING. This is the one funnel every job passes through — queued PRs and catch-up
+    # deploys alike — and returning here touches the file not at all: no attempt is counted, no stage is written,
+    # so the job is byte for byte what it was and lands on the first sweep after the resume. Merging or deploying
+    # a project the owner just parked would be the opposite of parking it.
+    if paused(job["repo"]):
+        what = f"PR #{job['pr']}" if job.get("pr") else "deploy"
+        return f"[{job['repo']}] {what}: {job['repo']} is paused — still queued, lands after `cc-pause off {job['repo']}`"
     if job.get("state") == "done":
         finish(path, job)                        # killed between deciding and saying it: say it now, once
         return (job.get("result") or {}).get("short", "")
@@ -2065,6 +2088,9 @@ def catchup():
     repos it queued a deploy for."""
     made = []
     for repo in known_repos():
+        if paused(repo):
+            continue        # parked: do not even queue it. This poll is idempotent — origin is still ahead after the
+                            # resume, so the very same deploy job is written by the first catch-up that follows it.
         root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
         if not os.path.isdir(f"{root}/.git") or os.path.exists(job_path(repo, "deploy")):
             continue
@@ -2122,6 +2148,11 @@ def next_wake():
         j = read_json(p) or {}
         if not j.get("repo"):
             continue
+        if paused(j["repo"]):
+            continue    # A PARKED JOB WANTS RUNNING AT NO TIME AT ALL. Without this line the branch below gives an
+                        # untried job a 5 s wake, and since run_one leaves a paused job untried, the sweep would re-arm
+                        # itself every 5 s for as long as the project stayed parked. With the queue holding nothing but
+                        # paused jobs this returns None, so no timer is armed — `cc-pause off` is what re-drives them.
         nb = epoch_of(j.get("not_before", ""))
         waits.append(nb - now + 60 if nb > now else (RETRY_AFTER if j.get("attempts") else 5))
     return int(min(waits)) if waits else None
@@ -2162,6 +2193,9 @@ def preparable(path):
     if (fix and not fix.get("over") and stamp() < (fix.get("deadline") or "")
             and track_running(j.get("repo") or "", fix.get("track") or "")):
         return False                # mid-fix-round: a review bought now would judge an intermediate checkpoint (review-176c)
+    if paused(j.get("repo") or ""):
+        return False                # parked: the review is the dearest thing this file buys, and the serial phase below
+                                    # will not land the job anyway — so buying one now is spend on a project nobody is on
     return bool(j.get("repo") and j.get("pr") and j.get("state") != "done"
                 and stamp() >= (j.get("not_before") or "") and j.get("attempts", 0) < LAND_TRIES)
 
@@ -2293,6 +2327,12 @@ def cmd_queue(argv):
             return 1
         ledger(f"queued {repo}#{pr} who={who or '-'} chat={chat or '-'} by={by}")
         print(f"[{repo}] PR #{pr} queued — the gates run first, then the merge, then the deploy")
+    # A 👍 ON A PARKED PROJECT IS KEPT, NOT REFUSED. The job file is written above either way, because losing an
+    # approval is the one thing a pause must not do; what is skipped is starting the worker, which would only spend
+    # a sweep discovering the same pause. Exit 0: the 👍 was taken, and nothing is waiting on anybody.
+    if paused(repo):
+        print(f"cc-land: {repo} is paused — nothing lands until `cc-pause off {repo}`, and this job waits for it")
+        return 0
     if not start:
         return 0
     ok, how = start_worker()
@@ -4029,6 +4069,97 @@ def cmd_selfcheck():
         check("that poll asks every repo's remote, so it runs at most every 15 min — the QUEUE is drained on every "
               "sweep, and one unreachable origin must not sit in front of the landing a 👍 is waiting on",
               due_catchup() and not due_catchup() and CATCHUP_EVERY == 900)
+
+        # ---- a PARKED project (`cc-pause on myrepo`). Every door this file has is asked twice about the same
+        # fixture — once parked, once not — because "a parked project spends nothing" is only worth asserting
+        # beside the unparked case that does spend. The gate really shells out to cc-pause, so a stub binary of
+        # its own stands in for it here rather than a patched function: that pins the exit-code contract too.
+        pdir = tempfile.mkdtemp(prefix="cc-land-selfcheck-pause-")
+        nopause = tempfile.mkdtemp(prefix="cc-land-selfcheck-nopause-")   # …and a box with no cc-pause on it at all
+        real_bin = BIN
+        with open(f"{pdir}/cc-pause", "w") as f:   # `is` answers by exit status, and repo/track and repo@alias
+            f.write('#!/usr/bin/env bash\n[ "$1" = is ] || exit 2\n'   # both ask about the project
+                    'grep -qxF "$(echo "$2" | sed "s![/@].*!!")" "$(dirname "$0")/parked" 2>/dev/null\n')
+        os.chmod(f"{pdir}/cc-pause", 0o755)
+
+        def park(*repos):
+            with open(f"{pdir}/parked", "w") as f:
+                f.write("".join(r + "\n" for r in repos))
+
+        globals()["BIN"] = pdir
+        try:
+            fresh(pr=7)
+            park("myrepo")
+            started.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rcQ = cmd_queue(["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+            job = job_path("myrepo", 7)
+            check("a 👍 on a parked project is KEPT, not refused: the job is written, the 👍 is answered 0, and "
+                  "the channel is told which command lands it — no worker is started to discover the pause for "
+                  "itself, and losing an approval is the one thing a pause must not do",
+                  rcQ == 0 and os.path.exists(job) and not started and "cc-pause off myrepo" in buf.getvalue())
+            before = open(job, "rb").read()
+            line = run_one(job)
+            check("...and the sweep lands it not at all: the job file is byte for byte what it was — no attempt "
+                  "counted, no stage written — so it lands unchanged on the first sweep after the resume",
+                  "paused" in line and open(job, "rb").read() == before and not gh_merges())
+            check("...the queue arms no timer for it either: with only parked jobs on disk next_wake is None, "
+                  "where an untried job asks for 5 s — which would re-drive the whole sweep every 5 s for as "
+                  "long as the project stayed parked", next_wake() is None)
+            check("...and the review, the dearest thing this file buys, is not bought: a job whose project is "
+                  "parked is not preparable", not preparable(job))
+            park()                            # `cc-pause off myrepo`, and the SAME job is live again
+            check("resumed, that very same job is preparable again and wanted at once: the pause was what held "
+                  "it, and nothing about the job itself changed", preparable(job) and next_wake() == 5)
+
+            # run_one's own control. Out of tries is its cheapest branch that really acts on the file — it says
+            # the last word and drains the job — so it shows the parked call above returned early, not that the
+            # job was one nothing would have touched anyway.
+            j = read_json(job)
+            j.update(attempts=LAND_TRIES, result={"rc": 1, "short": "[myrepo] PR #7: gave up"})
+            write_atomic(job, j)
+            park("myrepo")
+            check("a parked job that is out of tries is not finished off either: the pause holds the last word "
+                  "back too, so the owner hears it when he is back on the project rather than while it is parked",
+                  "paused" in run_one(job) and os.path.exists(job))
+            park()
+            check("...and resumed, that same job is finished and drained",
+                  quiet(run_one, job) == "[myrepo] PR #7: gave up" and not os.path.exists(job))
+
+            # The catch-up poll, which queues a deploy nobody asked for. A parked project is not even asked.
+            fresh(pr=7)
+            park("myrepo")
+            record_applied("myrepo", "aaaaaaa")
+            world["git rev-parse origin/main"] = (0, "bbbbbbb\n")
+            check("the catch-up poll skips a parked project outright: origin is ahead of what is installed and "
+                  "it queues no deploy at all",
+                  catchup() == [] and not os.path.exists(job_path("myrepo", "deploy")))
+            park()
+            check("...and queues that same deploy the moment it is resumed — the poll only ever asks origin, so "
+                  "skipping it lost nothing",
+                  catchup() == ["myrepo"] and read_json(job_path("myrepo", "deploy"))["span"] == ["aaaaaaa", "bbbbbbb"])
+            os.unlink(job_path("myrepo", "deploy"))
+
+            fresh(pr=7)
+            quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+            park("otherrepo")
+            check("parking one project parks ONLY it: with otherrepo the parked one, myrepo's job is preparable "
+                  "and wanted at once — pause is per project, never box-wide",
+                  preparable(job_path("myrepo", 7)) and next_wake() == 5)
+            park("myrepo")
+            globals()["BIN"] = nopause
+            check("and where cc-pause cannot be asked at all, the queue behaves exactly as it did before pausing "
+                  "existed: a gate that cannot answer must never be the reason a landing stops",
+                  preparable(job_path("myrepo", 7)) and next_wake() == 5)
+            globals()["BIN"] = pdir
+            check("control: with cc-pause back on the box, that same parked job is held again",
+                  not preparable(job_path("myrepo", 7)) and next_wake() is None)
+            os.unlink(job_path("myrepo", 7))
+        finally:
+            globals()["BIN"] = real_bin
+            shutil.rmtree(pdir, ignore_errors=True)
+            shutil.rmtree(nopause, ignore_errors=True)
     finally:
         shutil.rmtree(STATE, ignore_errors=True)
         globals().update(LANDQ=_real_landq, STATE=_real_state, start_worker=real_start, known_repos=real_repos)

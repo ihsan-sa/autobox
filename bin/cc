@@ -19,6 +19,7 @@
 #                             --resume-last: the first iteration continues this track's last session instead of
 #                             a cold one — for a repair round, where re-deriving what it already found is the cost
 #   cc <repo> <track> --say "text"           type text into that track's running interactive session
+#   --go and --say are both REFUSED while the project is parked (`cc-pause on <repo>`, or `!pause` in its channel)
 #   cc <repo> --orch <alias> ["brief"]       peer orchestrator session, its own Slack channel (archived when it exits)
 #   cc handoff <repo> <track> [--over [PCT]]  ask the running session to journal a handoff, then restart it with
 #                             fresh context; --over only if its context REALLY is that full (cc-context; bare = the 40% line)
@@ -180,7 +181,7 @@ default_branch(){ git "${GITNH[@]}" -C "$1" symbolic-ref --quiet --short refs/re
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
 lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,25p' "$0"; }
+usage(){ sed -n '2,26p' "$0"; }
 
 ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
   local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base
@@ -431,13 +432,16 @@ while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; s
 # was made a session by hand (`cc board set <repo> <name> kind session`) opens the same way without the flag.
 [ -n "$SESS" ] && { "$BOARD" set "$repo" "$track" kind session || exit 1; }
 case "$mode" in
-  say) have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
+  say) "$BIN/cc-pause" is "$repo" 2>/dev/null && { echo "cc: $repo is paused — \`cc-pause off $repo\` first"; exit 1; }   # typing at a session is a turn it spends
+       have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
   go)  if inside; then   # INSIDE the boundary: no tmux, no ledger. The brief is written here (this state dir is the workspace's own);
          # the launch is brokered — the daemon runs `cc <h> <track> --go ""` on the host: budget gate, window and boundary included.
          mkdir -p "$st"; write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}"; fi
        if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
        if member_workspace "$repo"; then member_credential "$repo" "$track" || exit 1; fi   # before the cap: nothing is charged for a launch that cannot happen
        member_gate "$repo" || exit 1
+       if "$BIN/cc-pause" is "$repo" 2>/dev/null; then   # the project is parked: `cc-pause off` is the only thing that starts a worker for it
+         echo "cc: $repo is paused — \`cc-pause off $repo\` puts it back, this loop included"; exit 1; fi
        # THE BRIEF HAS ONE HOME: $st/task.md. It used to have two — that file and the board's `instructions` —
        # merged by substring on every dispatch, and that merge destroyed the brief it was dispatched with on FOUR
        # tracks (#71 and #79 each fixed one variant; on 2026-08-31 a 4590-byte brief became one sentence, on both

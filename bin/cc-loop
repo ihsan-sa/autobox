@@ -46,6 +46,7 @@
 # starts the next iteration on a fresh context, which IS the handoff. Nothing refused and nothing was rerouted.
 # Exit: 0 done | 3 waiting on the owner, board `waiting` (notified) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (notified)
 #     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
+#     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
 # Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
@@ -399,6 +400,9 @@ BATCH="$MAXI"; RUNN="${CC_LOOP_RUNAWAY_N:-3}"; RUNX="${CC_LOOP_RUNAWAY_X:-5}"   
 if [ -f "$HOME/dev/$repo/.cc/member-workspace" ] && [ "${CC_MEMBER_SANDBOX:-}" != 1 ]; then   # depth behind the boundary: cc puts a member worker inside cc-sandbox member, so a bare cc-loop here is a loop that escaped it
   echo "cc-loop: $repo is a member workspace — its workers run inside the boundary (member-sandbox) or not at all" >&2; exit 2
 fi
+if "$BIN/cc-pause" is "$repo" 2>/dev/null; then   # the whole project is parked: a worker for it is the first thing that must not start
+  echo "cc-loop: $repo is paused — \`cc-pause off $repo\` starts its workers again" >&2; exit 2
+fi
 ST="$HOME/.cc/state/$repo/$track"; WT="$HOME/.cc/worktrees/$repo/$track"; BOARD="$BIN/cc-board"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 # Host-side git on the worktree (the checkpoint, its push, cc done) runs the MAIN checkout's hooks, never the worktree's: with a
 # relative core.hooksPath (core/.githooks) a hook is a tracked file the worker edits, and this loop would run it with the host's
@@ -415,13 +419,22 @@ child=""
 kill_child(){ [ -n "$child" ] || return 0   # only ever signal a group we own: if the child is not a group leader, kill just it
   if [ "$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ')" = "$child" ]; then kill -TERM -- -"$child" 2>/dev/null; sleep 2; kill -KILL -- -"$child" 2>/dev/null
   else kill -TERM "$child" 2>/dev/null; fi; }
-trap 'kill_child; log "signalled — iteration aborted and its claude killed"; exit 130' HUP INT TERM   # tmux kill-window would otherwise re-parent claude to systemd, still editing this worktree
+trap 'kill_child; parked; log "signalled — iteration aborted and its claude killed"; exit 130' HUP INT TERM   # tmux kill-window would otherwise re-parent claude to systemd, still editing this worktree
 stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}"   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
   # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
   # writes the same word cc-reconcile would 20 min later — otherwise the board says `blocked` while the Home tab, reading
   # the very journal line this exit came from, already says `waiting`, and the tab prints the two of them as drift.
   "$BOARD" status "$repo" "$track" "$st" >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
   log "exit $code: $msg"; "$BIN/cc-notify" -p high -t "$repo/$track $title" "$msg"; exit "$code"; }
+# THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
+# signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any
+# moment. Standing down leaves the board honest (`queued`: there is work here and nobody is on it) and does NOT page:
+# the owner parked this himself, and telling him what he just did is noise. Nothing is lost — the worktree, the
+# journal and the board row are all where they were, and `cc-pause off` re-dispatches this very loop.
+parked(){ "$BIN/cc-pause" is "$repo" 2>/dev/null || return 1
+  "$BOARD" status "$repo" "$track" queued >/dev/null 2>&1
+  "$BOARD" note "$repo" "$track" "loop exit 11: project paused — cc-pause off $repo restarts it" >/dev/null 2>&1
+  log "exit 11: $repo is paused — standing down; nothing more spends here until cc-pause off $repo"; exit 11; }
 base=$(git -C "$HOME/dev/$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); base="${base:-main}"
 SP="You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$base' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal.$(selfrev_block "$base")"
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
@@ -429,6 +442,7 @@ i=0; errs=0; caps=0; spent=0; limited=0   # limited: the owner has already been 
 barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway rule's memory: this track measured against itself
 chainend=0   # the end of the cc-model chain is journalled once per loop, not once per iteration
 while [ $i -lt "$MAXI" ]; do
+  parked   # read before the limit stamp and before anything is charged: a project paused mid-run stops at this line
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
     "$BIN/cc-limit" wait || stop 8 "waiting" "Claude $p — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""; fi
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"

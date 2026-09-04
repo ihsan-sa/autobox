@@ -69,6 +69,8 @@ A reaction is a verdict, and ANYONE in the channel may give one: a member's :+1:
 Only the owner steers the box: permission answers, `!` commands beyond !help/!status, @alias hand-offs, status marks and
 App Home are owner-only, and a member cannot authorize what the box gates on the owner.
 In-Slack commands (`!help`/`!status` anyone, the rest owner only, any channel or thread): `!help !ping !status !digest !sessions !start !say !threads !box`
+`!pause`/`!resume` park this channel's whole project and put it back (`!pause <repo>` names another): while it is parked nothing the box does on its
+own spends on it, and a message sent to it is queued rather than delivered — this channel keeps working throughout. See cc-pause.
 `!restart <box|repo[/track]|slack|tmux>` and `!reboot` (both confirm-gated), and `!context !cost !compact [target]` — those three relay a real
 slash command into that session's own pane (SLASH_CMDS, idle panes only; nothing else is ever typed there). A `!command` root is never a tracked thread.
 One channel, one voice: while `cc-handoff` has an overlap open on a target, both its sessions are subscribed but only
@@ -780,6 +782,19 @@ def pane_idle(wid):
 
 def window_for(target):
     return "box" if target == "box" else target
+
+
+def paused(target):
+    """`cc-pause on <repo>` parks a whole project — its repo, its tracks and its orchs — and nothing the box does
+    on its own may spend on it until `cc-pause off`. cc-pause owns that state; asking it is the only reading of it
+    there is. It cannot run (no such sibling on this box, a timeout): behave exactly as this file did before the
+    pause existed — a pause must never be the reason a pass stops working, least of all the one the owner reaches
+    the box through."""
+    try:
+        return subprocess.run([f"{BIN}/cc-pause", "is", str(target)], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
 
 
 def spooled_already(window, text, since):
@@ -3237,6 +3252,20 @@ class Daemon:
         return [c for c in conns if c is keep or (c.info.get("alias") or None)]
 
     def deliver(self, target, payload, autostart=True, alias=None):
+        # A PARKED PROJECT IS NOT HANDED ANYTHING. Every one of the three doors below spends: a subscriber takes the
+        # message as a turn, type_into_pane types it at a live pane, and autostart starts a whole session. So a
+        # message for a paused target goes straight to the queue, which is durable (save_queues) and exempt from the
+        # TTL sweep while it is parked: the owner can say what he likes to a project he has parked, and the session
+        # reads all of it, in order, on the first hello after `cc-pause off`. The channel itself is untouched —
+        # !status, !threads and !resume are commands, and never reach this method.
+        # …EXCEPT AN ANSWER TO A PERMISSION PROMPT, which is not new work for the session — it is the reply to a
+        # question the session already asked and is blocked on. cc-pause stops worker loops, not live sessions, so a
+        # parked project can still have a session sitting on a modal; queueing the answer would leave it blocked
+        # until `!resume` while the owner is told it arrived (the ✅ below runs on deliver's return regardless).
+        if paused(target) and payload.get("type") != "permission":
+            with self.lock:
+                self.queues[target].append((time.time(), payload, alias)); self.save_queues()
+            return "paused"
         every = payload.get("type") == "permission"   # the prompt can come from any alias — answer them all, one of them is waiting
         with self.lock:
             conns = [c for c in self.subs.get(target, []) if every or (c.info.get("alias") or None) == alias]
@@ -3839,6 +3868,10 @@ class Daemon:
             elif res == "typed":
                 self.say(chat, f"typed into `{target}`'s terminal — that session runs without the channel, so its answer "
                                f"stays there. For a chat session restart it on the box (`cc handoff …`).", thread)
+            elif res == "paused":
+                repo = (target or "").partition("/")[0].partition("@")[0]
+                self.say(chat, f"`{repo}` is paused — nothing there spends until `!resume`. Your message is queued and "
+                               f"the session reads it then; it will not be dropped meanwhile.", thread)
             elif res == "spooled":
                 self.say(chat, f"`{target}` is mid-turn or holding a dialog — queued on the box; it lands the moment the pane "
                                f"is free, and a dialog that stands 10 min is reported to the `box` session.", thread)
@@ -4278,6 +4311,8 @@ class Daemon:
         if cmd == "help":
             out = ("`!ping` alive · `!status` cc ls · `!digest` all tracks · `!sessions` live channel subscribers · "
                    "`!start` start this channel's session · `!say <text>` type into it (no channel needed) · "
+                   "`!pause` park this project — its workers, timers, nags and landings all stop spending · "
+                   "`!resume` put it back (nothing is lost meanwhile; a message sent while parked is queued) · "
                    "`!restart <box|repo[/track]|slack|tmux>` recover a wedged session/daemon (tmux needs `!restart tmux confirm`) · "
                    "`!reboot` reboot the whole box (needs `!reboot confirm`) · "
                    "`!threads` this channel's open threads (❓ needs you · 🔴 with the session · 🟠 handled) · "
@@ -4313,6 +4348,8 @@ class Daemon:
                 wid, _ = tmux_window(window_for(target))
                 out = run(f"{BIN}/cc-msg", window_for(target), arg) if wid else f"no live window for {target}"
                 out = f"typed into `{window_for(target)}`" if out == "(no output)" else out
+        elif cmd in ("pause", "resume"):
+            return self.cmd_pause(cmd, arg, chat, thread, target)
         elif cmd == "restart":
             return self.cmd_restart(arg, chat, thread)
         elif cmd == "reboot":
@@ -4324,6 +4361,60 @@ class Daemon:
         else:
             out = f"unknown command `!{cmd}` — `!help`"
         self.say(chat, out, thread)
+
+    def cmd_pause(self, cmd, arg, chat, thread, target):
+        """!pause / !resume — park this channel's whole project, or put it back. One line from a phone instead of
+        knowing every separate thing that spends on a project and stopping each by hand (owner, 2026-09-03).
+
+        THE CHANNEL IS THE ARGUMENT. `!pause` in #myrepo pauses `myrepo`; a name may be given to park another one
+        from anywhere (`!pause myrepo`), which is how a DM does it. A channel whose target is a track (`myrepo/t1`)
+        still pauses the PROJECT — cc-pause takes whole projects only, so the repo is what is handed to it.
+        Owner only: neither word is in MEMBER_CMDS, so `command` has already refused a member before this runs.
+
+        THIS CHANNEL KEEPS WORKING WHILE PARKED. Nothing here unsubscribes anybody or touches the daemon: `!status`,
+        `!threads` and `!resume` all answer exactly as before, and a message typed at a parked project is queued
+        rather than delivered — readable, and still there when it is resumed."""
+        repo = (arg or "").split()[0] if (arg or "").strip() else (target or "").partition("/")[0].partition("@")[0]
+        if not repo:
+            return self.say(chat, f"`!{cmd}`: no project for this channel — say `!{cmd} <repo>`", thread)
+        try:
+            p = subprocess.run([f"{BIN}/cc-pause", "on" if cmd == "pause" else "off", repo],
+                               capture_output=True, text=True, timeout=120, cwd=HOME)
+        except subprocess.TimeoutExpired:
+            return self.say(chat, f"`cc-pause {'on' if cmd == 'pause' else 'off'} {repo}` timed out after 120 s — "
+                                  f"check it on the box.", thread)
+        out = (p.stdout or "").strip() or (p.stderr or "").strip() or "(no output)"
+        if p.returncode == 0 and cmd != "pause":          # …and hand over what was said to it while it was parked
+            n = self.drain_resumed(repo)
+            if n:
+                out += f"\n{n} message(s) said while it was parked, delivered now, in order."
+        self.say(chat, (out if p.returncode == 0 else f"could not {cmd} `{repo}`: {out}"), thread)
+
+    def drain_resumed(self, repo):
+        """Everything said to a project while it was parked, handed over now that it is not — in the order it
+        arrived. Without this the promise is broken three times over: deliver() tells the owner "queued, the
+        session reads it then", USAGE.md and DESIGN.md say the same, and nothing was ever going to read it —
+        the only drain is at `hello`, which a session that never went away does not send. The message then sat
+        until expire_queues() dropped it and told him to resend something the box had said it was holding.
+        Entries already past QUEUE_TTL are dropped here rather than delivered: that is the sweep's own rule, and
+        a four-hour-old message arriving as if it were new is its own kind of lie. Dropping one still TELLS him, the
+        way the sweep does — silently discarding what the box said it was holding is the very bug above, one step
+        quieter. Returns how many went out."""
+        with self.lock:
+            targets = [t for t in list(self.queues)
+                       if t == repo or t.startswith(f"{repo}/") or t.startswith(f"{repo}@")]
+            taken = [(t, list(self.queues.pop(t, []))) for t in targets]
+            if taken:
+                self.save_queues()
+        sent = 0
+        for t, entries in taken:
+            for when, payload, alias in entries:          # oldest first: the order he said them in
+                if time.time() - when >= QUEUE_TTL:
+                    self.expired(t, payload, "was parked longer than the queue keeps")   # dropping it is the
+                    continue                                                             # sweep's rule; telling him is too
+                self.deliver(t, payload, alias=alias)
+                sent += 1
+        return sent
 
     def cmd_slash(self, cmd, arg, chat, thread, target):
         """!context|!cost|!compact [target] — type the matching /command into that session's OWN pane and reply
@@ -5154,15 +5245,25 @@ class Daemon:
             time.sleep(30)
             self.connected = client.is_connected()
             down_since = self.watchdog(self.connected, down_since, time.time())
-            expired = []
-            with self.lock:
-                for t, q in list(self.queues.items()):
-                    while q and time.time() - q[0][0] > QUEUE_TTL:
-                        expired.append((t, q.popleft()[1]))
-                if expired:
-                    self.save_queues()
-            for t, payload in expired:
+            for t, payload in self.expire_queues():
                 self.expired(t, payload)
+
+    def expire_queues(self):
+        """Drop what has sat in a queue past QUEUE_TTL and return [(target, payload)] for the ones dropped, so the
+        caller can say so. A PARKED PROJECT'S QUEUE IS EXEMPT: the TTL is here for a message nobody ever came for,
+        and a message for a project the owner PARKED is one he knows nobody is coming for yet — a pause that
+        quietly ate it would be a pause that lost something. `cc-pause is` is asked only when something is actually
+        old enough to drop, so an idle box runs no subprocess for this at all."""
+        expired = []
+        with self.lock:
+            for t, q in list(self.queues.items()):
+                if q and time.time() - q[0][0] > QUEUE_TTL and paused(t):
+                    continue
+                while q and time.time() - q[0][0] > QUEUE_TTL:
+                    expired.append((t, q.popleft()[1]))
+            if expired:
+                self.save_queues()
+        return expired
 
     def watchdog(self, connected, down_since, now):
         """Socket-mode health. A daemon whose Slack link never came back is a daemon the owner cannot reach: after 5 min
@@ -5174,15 +5275,17 @@ class Daemon:
             log("slack disconnected for >300 s — exiting so systemd restarts the daemon"); os._exit(1)
         return down_since
 
-    def expired(self, target, payload):
-        """A queued message aged out (its session never came up): say so where the owner asked, instead of dropping it silently."""
+    def expired(self, target, payload, why="never came up"):
+        """A queued message aged out: say so where the owner asked, instead of dropping it silently. `why` names the
+        reason, because there are two and they are not the same thing to read — a session that never came up, and a
+        project parked for longer than the queue keeps (drain_resumed)."""
         meta = payload.get("meta") or {}
         chat = meta.get("chat_id")
         if payload.get("type") != "message" or not chat or chat == "local":
             return
         when = time.strftime("%H:%M", time.localtime(float(meta.get("ts") or time.time())))
         try:
-            self.say(chat, f"⚠️ `{target}` never came up — your {when} message was dropped, resend", meta.get("thread_ts"))
+            self.say(chat, f"⚠️ `{target}` {why} — your {when} message was dropped, resend", meta.get("thread_ts"))
         except Exception as e:
             log(f"expiry notice for {target} failed: {e!r}")
 
@@ -7305,6 +7408,125 @@ def cmd_selfcheck():
     dm6 = Daemon(use_slack=False); dm6.subs["r"] = [cmain, corch]
     dm6.deliver("r", {"type": "message", "content": "hi"}, alias="ai-dev")
     check("deliver: alias filter reaches only the matching conn (main untouched)", sent5 == [("ai-dev", {"type": "message", "content": "hi"})])
+
+    # THE PROJECT PAUSE, on its own fixture: two targets, one parked and one not, and a live subscriber on BOTH —
+    # so the case that is suppressed and the case that is kept are asserted against the same daemon. `paused` is
+    # stubbed rather than a flag written, because what is under test is what THIS file does with the answer.
+    real_paused = paused
+    globals()["paused"] = lambda t: t == "parked"
+    try:
+        dm6b = Daemon(use_slack=False)
+        sent6, cp, cr = [], Conn(None, "parked", {"alias": None}), Conn(None, "running", {"alias": None})
+        cp.send = lambda p: sent6.append(("parked", p)); cr.send = lambda p: sent6.append(("running", p))
+        dm6b.subs["parked"], dm6b.subs["running"] = [cp], [cr]
+        dm6b.typed = []; dm6b.type_into_pane = lambda *a, **k: dm6b.typed.append(a) or "typed"
+        dm6b.started = []; dm6b.autostart = lambda t: dm6b.started.append(t) or "starting"
+        rp = dm6b.deliver("parked", {"type": "message", "content": "while it is parked"})
+        check("deliver: a paused project is not handed the message — no subscriber, no pane, no autostart; it is "
+              "QUEUED, so nothing the owner says while it is parked is lost",
+              rp == "paused" and not sent6 and not dm6b.typed and not dm6b.started
+              and len(dm6b.queues["parked"]) == 1
+              and dm6b.queues["parked"][0][1]["content"] == "while it is parked")
+        # …AND THE ONE THING A PAUSE MUST NOT SWALLOW: the answer to a permission prompt. cc-pause stops worker
+        # loops, not live sessions, so a parked project can still have a session blocked on a modal. Queueing the
+        # answer would leave it blocked until `!resume` while the owner is told it landed — the ✅ that follows
+        # deliver runs on its return either way.
+        sent6.clear()
+        ra = dm6b.deliver("parked", {"type": "permission", "content": "yes kqmtr"})
+        check("deliver: a permission ANSWER still reaches a parked project's session — it is the reply to a question "
+              "that session already asked and is blocked on, not new work; queueing it would block it until resume "
+              "while the owner is shown the tick that says it arrived",
+              ra == "delivered" and sent6 == [("parked", {"type": "permission", "content": "yes kqmtr"})]
+              and len(dm6b.queues["parked"]) == 1)
+        sent6.clear()
+        rr = dm6b.deliver("running", {"type": "message", "content": "business as usual"})
+        check("deliver: …and another project's session is delivered to exactly as before — per project, never box-wide",
+              rr == "delivered" and sent6 == [("running", {"type": "message", "content": "business as usual"})]
+              and not dm6b.queues["running"])
+        # The TTL sweep is what would quietly eat that queued message. QUEUE_TTL is the real one; the entry is
+        # stamped old enough to be dropped, and the parked target's must survive it while the other's does not.
+        dm6b.queues["parked"][0] = (0.0, dm6b.queues["parked"][0][1], None)
+        dm6b.queues["running"].append((0.0, {"type": "message", "content": "nobody came"}, None))
+        expired = dm6b.expire_queues()
+        check("queue TTL: a paused project's queued message does not expire, while an unpaused one's still does — "
+              "the owner parked it, so nobody was coming for it yet",
+              len(dm6b.queues["parked"]) == 1 and not dm6b.queues["running"]
+              and [t for t, _ in expired] == ["running"])
+        # …AND AT RESUME IT IS HANDED OVER, which is the promise deliver() makes to the owner ("queued, the
+        # session reads it then") and USAGE.md and DESIGN.md repeat. The only other drain is at `hello`, and a
+        # session that never went away never sends one — so without this it sat until the sweep dropped it and
+        # told him to resend the thing the box said it was holding (review of #211). Its own fixture: two fresh
+        # entries in the order he said them, and one already past the TTL, which is dropped rather than arriving
+        # four hours late as though it were new.
+        said6 = []
+        dm6b.say = lambda chat, text, thread=None: said6.append(text)
+        dm6b.queues["parked"] = [(time.time(), {"type": "message", "content": "first"}, None),
+                                 (0.0, {"type": "message", "content": "too old",
+                                        "meta": {"chat_id": "C1", "ts": "0", "thread_ts": None}}, None),
+                                 (time.time(), {"type": "message", "content": "second"}, None)]
+        sent6.clear()
+        globals()["paused"] = lambda t: False      # cc-pause off has run by the time the drain does
+        drained = dm6b.drain_resumed("parked")
+        check("resume: what was said while it was parked is delivered when it comes back, oldest first, and the "
+              "queue is emptied — nothing waits for a `hello` that a session which never went away will not send; "
+              "an entry already past the TTL is dropped, not delivered as if it were new",
+              drained == 2 and [c for _, p_ in sent6 for c in [p_["content"]]] == ["first", "second"]
+              and not dm6b.queues.get("parked"))
+        check("resume: …and the one too old to deliver is not discarded in silence — he is told it was dropped, the "
+              "way the sweep tells him, because quietly losing what the box said it was holding is that same bug one "
+              "step quieter",
+              len(said6) == 1 and "dropped" in said6[0] and "parked longer" in said6[0])
+    finally:
+        globals()["paused"] = real_paused
+
+    # `!pause` / `!resume` themselves. Fixture of its own: a stub cc-pause in a BIN of its own, so a selfcheck can
+    # never park a project this box really has, and what it recorded is read back after every call.
+    pbin = tempfile.mkdtemp(prefix="cc-slack-selfcheck-pause-")
+    with open(f"{pbin}/cc-pause", "w") as f:
+        f.write('#!/usr/bin/env bash\nd=$(dirname "$0")\nprintf "%s " "$@" >> "$d/calls"; printf "\\n" >> "$d/calls"\n'
+                '[ -e "$d/fail" ] && { echo "no project \'$2\' — ~/dev/$2 does not exist" >&2; exit 2; }\n'
+                'echo "paused $2 — stopped 1 worker loop (w1), cc-pulse and the landing queue"\n')
+    os.chmod(f"{pbin}/cc-pause", 0o755)
+    open(f"{pbin}/calls", "w").close()
+    real_binP = BIN
+    globals()["BIN"] = pbin
+    dmP, saidP = Daemon(use_slack=False), []
+    dmP.say = lambda chat, text, thread=None: saidP.append(text)
+
+    def pcalls():
+        got = [ln.split() for ln in open(f"{pbin}/calls").read().splitlines()]
+        open(f"{pbin}/calls", "w").close()      # read once and cleared, so no case reads the call an earlier one made
+        return got
+
+    try:
+        dmP.cmd_pause("pause", "", "C1", None, "myrepo")
+        check("!pause: THE CHANNEL IS THE ARGUMENT — `!pause` in a project's channel parks that project, and the "
+              "channel is told what cc-pause itself said it stopped, not a word of this file's own",
+              pcalls() == [["on", "myrepo"]] and "stopped 1 worker loop" in saidP[-1])
+        dmP.cmd_pause("pause", "", "C1", None, "myrepo/t1")
+        check("!pause: a channel whose target is one TRACK still parks the whole project — cc-pause takes projects "
+              "only, so the repo is what it is handed", pcalls() == [["on", "myrepo"]])
+        dmP.cmd_pause("pause", "", "C1", None, "myrepo@scout")
+        check("!pause: an orch channel too — repo@alias is that same project", pcalls() == [["on", "myrepo"]])
+        dmP.cmd_pause("pause", "otherrepo", "C1", None, "myrepo")
+        check("!pause <repo> parks the one it names and not this channel's — that is how a DM parks a project",
+              pcalls() == [["on", "otherrepo"]])
+        dmP.cmd_pause("resume", "", "C1", None, "myrepo")
+        check("!resume puts that same project back", pcalls() == [["off", "myrepo"]])
+        dmP.cmd_pause("pause", "", "C1", None, "")
+        check("!pause in a channel with no project of its own asks for a name instead of guessing at one",
+              not pcalls() and "no project for this channel" in saidP[-1])
+        open(f"{pbin}/fail", "w").close()
+        dmP.cmd_pause("pause", "", "C1", None, "myrepo")
+        check("a refusal from cc-pause is passed on in the channel in its own words — reading silence as a parked "
+              "project is how a project keeps spending after the owner thinks he stopped it",
+              "could not pause" in saidP[-1] and "does not exist" in saidP[-1])
+        check("!pause and !resume steer the box, so a member cannot use either: neither is in MEMBER_CMDS",
+              "pause" not in Daemon.MEMBER_CMDS and "resume" not in Daemon.MEMBER_CMDS)
+    finally:
+        globals()["BIN"] = real_binP
+        shutil.rmtree(pbin, ignore_errors=True)
+
     real_fc = find_channel; globals()["find_channel"] = lambda cfg, name: ("CALIAS", True)
     dm7 = Daemon(use_slack=False); dm7.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
     said7 = []; dm7.say = lambda chat, text, thread=None: said7.append(text)

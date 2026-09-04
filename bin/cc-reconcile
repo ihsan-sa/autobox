@@ -577,6 +577,18 @@ def fixture(repo):
     return not (m and int(m.group(1)) in lineage())
 
 
+def paused(target):
+    """`cc-pause on <repo>` parks a whole project — its repo, its tracks and its orchs — and nothing the box does
+    on its own may spend on it until `cc-pause off`. cc-pause owns that state; asking it is the only reading of it
+    there is. It cannot run (no such sibling on this box, a timeout): behave exactly as this file did before the
+    pause existed — a pause must never be the reason a pass stops working."""
+    try:
+        return subprocess.run([f"{BIN}/cc-pause", "is", str(target)], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
 def boards():
     """Every REAL sidecar board, sorted: (path, board or None if unreadable). A suite that died mid-run left a
     fixture board whose `waiting` row was reconciled, snapshotted and shown to the owner as real (2026-09-01);
@@ -854,7 +866,21 @@ def main(argv):
             except Exception:
                 return False
 
-        keys = {f"{r['repo']}/{r['track']}: {r['why']}": r for r in asks}
+        # A PARKED PROJECT IS NOT NAGGED AND NOT PAGED — not its session, not the owner. `cc-pause on <repo>` stops
+        # what the box does to a project on its own, and every wake and every page this file buys is below this
+        # line; everything ABOVE it — the reconciling itself, the snapshot, `view` — still runs, so a parked
+        # project's board stays as true as any other's. Its nag memos are not carried through the pause either:
+        # every finding here is read off the board, which is still there, so each one is news again at the first
+        # pass after the resume, with its "unlanded for Nh" clock counting from then instead of through the park.
+        parked = {}
+
+        def project_parked(repo):
+            if repo not in parked:
+                parked[repo] = paused(repo)
+            return parked[repo]
+
+        keys = {f"{r['repo']}/{r['track']}: {r['why']}": r
+                for r in asks if not project_parked(r["repo"])}
         fresh = [r for k, r in keys.items() if t0 - float(old.get(k, 0) or 0) >= repeat]
         told = {f"{r['repo']}/{r['track']}: {r['why']}" for r in fresh}
         # PENDING — finished, PR open, unlanded. No `ask` above it and none coming: the board and the box agree.
@@ -866,6 +892,8 @@ def main(argv):
         # again, once.
         keep, busy = {}, None
         for repo, track, f, state, _, _ in snaprows:
+            if project_parked(repo):
+                continue     # parked: no alert, no offer and no memo kept — the row itself is untouched on the board
             k, ak = f"pending {repo}/{track}", f"alerted {repo}/{track}"
             ok_ = f"offered {repo}/{track} {f.get('pr') or ''}".rstrip()   # per PR: a new PR on the track is news again
             if not pending(f, state):
@@ -1359,6 +1387,39 @@ def selfcheck():
         ok("end to end: a PR named by a live cc-land argv is being landed — no nag", offered() == 2)
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: …and one that falls out of a lane unlanded is news again, once", offered() == 3)
+
+        # A PARKED PROJECT IS NOT NAGGED — not its session, not the owner. The REAL cc-pause is asked here, reading
+        # the real flag file in this scratch HOME, so the whole path is pinned rather than a stand-in for it. Its own
+        # fixture: a clean ledger, so nothing but the pause can be the reason the offer does not happen.
+        PAUSED_FLAG = '{"at":"2026-01-01T00:00:00Z","by":"owner","note":"","loops":[]}\n'
+        json.dump({}, open(seenp, "w"))
+        os.makedirs(f"{th}/.cc/state/{repo}", exist_ok=True)
+        open(f"{th}/.cc/state/{repo}/paused", "w").write(PAUSED_FLAG)
+        o0, a1 = offered(), alerted()
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: a parked project's row is neither offered to its session nor paged about — the owner "
+           "parked it himself, so a nag about it is spend he asked the box to stop",
+           offered() == o0 and alerted() == a1)
+        ok("end to end: …and no nag memo is written for it either, so the finding is news again at the resume "
+           "with its `unlanded for Nh` clock counting from then instead of through the park",
+           json.load(open(seenp)) == {})
+        ok("end to end: …while the reconciling itself still runs for it: the row is in the snapshot exactly as "
+           "before, because a pause stops what SPENDS, not what keeps the board true",
+           (snap_().get(f"{repo}/t2") or {}).get("state"))
+        os.remove(f"{th}/.cc/state/{repo}/paused")
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …and that same row, resumed, is offered once — the pause was what silenced it and the "
+           "finding was not lost", offered() == o0 + 1)
+        # per project, never box-wide: park a DIFFERENT project and this one is nagged exactly as before
+        json.dump({}, open(seenp, "w"))
+        os.makedirs(f"{th}/.cc/state/{repo}-other", exist_ok=True)
+        open(f"{th}/.cc/state/{repo}-other/paused", "w").write(PAUSED_FLAG)
+        o1 = offered()
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: parking ANOTHER project does not silence this one — the gate asks about the repo each row "
+           "belongs to, never whether something somewhere is parked", offered() == o1 + 1)
+        shutil.rmtree(f"{th}/.cc/state/{repo}-other")
+        json.dump({}, open(seenp, "w"))
 
         victim = subprocess.Popen(["sleep", "60"], start_new_session=True)   # its own group, so nothing else is in range
         ended = end_it([victim.pid])
