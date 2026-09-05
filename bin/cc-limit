@@ -125,15 +125,50 @@ believe(){   # exit 0 = the live stamp binds THIS caller, and stamp()'s variable
   obs_list | grep -qx "$(mykey)"; }          # one run: it binds that run, and nobody else
 
 parse_reset(){   # a reset time named anywhere in $1 -> $u (epoch; 0 = the message named none) and $how (how it was read)
-  local txt="$1" m c n z tz=UTC
+  local txt="$1" m c d y yn n rest zc tz=UTC
   local RS='reset[a-z]*[^0-9]{0,8}'   # "resets at ", "reset: ", "resets " — a bare timestamp in a log line must not count
-  z=$(grep -oE '[A-Za-z]+/[A-Za-z_]+' <<<"$txt" | head -1); [ -n "$z" ] && [ -f "/usr/share/zoneinfo/$z" ] && tz="$z"
+  local MON='(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?' ORD='(st|nd|rd|th)?'
+  local YR='(19|20)[0-9]{2}' CLK='([0-9]{1,2}(:[0-9]{2})? *(am|pm)|[0-9]{1,2}:[0-9]{2})' DAY
+  DAY="(${MON} +[0-9]{1,2}${ORD}|[0-9]{1,2}${ORD} +${MON})"   # "Sep 7" and "7 Sep": both orderings get written
+  local AHEAD=1209600   # a fortnight. No usage limit on this account has ever run longer than a week.
+  # THE ZONE THE MESSAGE NAMES: the first Area/City that IS a zone, not the first thing in the text with a slash in
+  # it. A limit message carries a URL as well ("…claude.ai/settings/usage?from=cc_cli_limit_message"), and taking
+  # the first match handed "ai/settings" to the zonefile test, missed, and left the clock being read as UTC. Two-
+  # and three-segment names both match whole; a zone buried deeper inside a path is not dug for, because no
+  # message has ever carried one that way.
+  while read -r zc; do
+    [ -f "/usr/share/zoneinfo/$zc" ] && { tz="$zc"; break; }
+  done < <(grep -oE '[A-Za-z][A-Za-z_]*/[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)?' <<<"$txt")
   u=0; how=""; rolled=0
   if m=$(grep -oiE "${RS}[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?" <<<"$txt" | head -1) && [ -n "$m" ]; then
     u=$(TZ="$tz" date -d "$(grep -oE '[0-9]{4}-.*' <<<"$m")" +%s 2>/dev/null); how=iso
   elif m=$(grep -oiE 'reset[a-z]* in +[0-9]+ *[a-z]+' <<<"$txt" | head -1) && [ -n "$m" ]; then
     n=$(grep -oE '[0-9]+' <<<"$m"); case "$(grep -oiE '[a-z]+$' <<<"$m" | tr A-Z a-z)" in
       h*) u=$((now + n * 3600));; s*) u=$((now + n));; *) u=$((now + n * 60));; esac; how=in
+  # A DAY AND A CLOCK, IN EITHER ORDER — "resets Sep 7, 10am (America/Los_Angeles)", "resets at 10am on Sep 7",
+  # "resets 7 Sep, 10am". The clock branch below takes the first number after "reset" for an hour, so it read the
+  # DAY, 7, and parked the box at 07:00 Los Angeles instead of 10:00 — three hours early, on a weekly limit that
+  # stood for days (2026-09-03). The day is cut back out of the match before the clock is looked for, so its
+  # number can never be mistaken for an hour whichever way round the two were written.
+  elif m=$(grep -oiE "reset[a-z]*[^0-9A-Za-z]{0,3}((on +|at +)?${DAY},? *(${YR})?,? *(at +)?${CLK}?|(at +)?${CLK},? +(on +)?${DAY},? *(${YR})?)" <<<"$txt" | head -1) && [ -n "$m" ]; then
+    d=$(grep -oiE "$DAY" <<<"$m" | head -1)
+    rest=${m/"$d"/}                                          # …the day taken back out
+    d=$(sed -E 's/([0-9]+)(st|nd|rd|th)/\1/Ig; s/\.//g' <<<"$d")   # "Sept. 7th" is no date to date(1); "Sept 7" is
+    c=$(grep -oiE "$CLK" <<<"$rest" | head -1)
+    yn=$(TZ="$tz" date -d "@$now" +%Y)                       # the year the BOX is in, so a test clock moves it too
+    y=$(grep -oE "$YR" <<<"$rest" | head -1)
+    u=$(TZ="$tz" date -d "$d ${y:-$yn} ${c:-00:00}" +%s 2>/dev/null)   # no clock named = the start of that day
+    # A day already gone by is next year's — but only when next year's lands inside the fortnight ("resets Jan 2",
+    # read on Dec 31). A year the message names itself is taken as written and never rolled.
+    if [ -z "$y" ] && [ "${u:-0}" -gt 0 ] && [ "$u" -le "$now" ]; then
+      n=$(TZ="$tz" date -d "$d $((yn + 1)) ${c:-00:00}" +%s 2>/dev/null)
+      { [ -n "$n" ] && [ "$n" -gt "$now" ] && [ "$n" -lt $((now + AHEAD)) ]; } && { u="$n"; rolled=1; }
+    fi
+    # …and a day landing further out than that is not a reset at all. "resets Dec 31" read on Jan 3 is this
+    # December, "Sep 7 2077" is fifty years — both misreads, and the caller only ever guards against the past, so
+    # either would park the box for good. u=0 hands it to the backoff, which is the safe read of a garbled day.
+    [ "${u:-0}" -gt $((now + AHEAD)) ] && u=0
+    how='date'
   elif m=$(grep -oiE "${RS}[0-9]{1,2}(:[0-9]{2})? *(am|pm)?" <<<"$txt" | head -1) && [ -n "$m" ]; then
     c=$(grep -oiE '[0-9]{1,2}(:[0-9]{2})? *(am|pm)?$' <<<"$m")
     u=$(TZ="$tz" date -d "$c" +%s 2>/dev/null)                                        # a clock time
@@ -649,6 +684,49 @@ EOF
   rm -f "$d/.cc/state/claude-limit"; : > "$d/calls"; out=$(me "$t6" check "$d/both.json" 2>/dev/null); rc=$?
   t 'a limit hit with no credits left to continue on is still a limit: the limit wording wins' \
     "$rc$out$(calls '^model unavailable')" "0LIMIT $((t6 + 3600))0"
+
+  # A DAY IS NOT AN HOUR, AND THE ZONE IS THE ONE THE MESSAGE NAMES (2026-09-03). The weekly limit read "resets
+  # Sep 7, 10am (America/Los_Angeles)": the clock branch took the 7 out of "Sep 7" for an hour, so the box was
+  # parked to 07:00 Los Angeles — three hours early on a limit with days to run. The URL in the same line is the
+  # second half of it: the zone used to be the FIRST thing in the text with a slash in it, which was "ai/settings",
+  # and the clock was then read as UTC. Fixed clocks throughout, so these hold whatever year the suite runs in.
+  rm -rf "$d/.cc/state/spend"; rm -f "$d/.cc/state/claude-limit.disbelieved"; OBS=worker-f
+  t8=$(date -u -d '2026-09-04 22:53:00' +%s); t9=$(date -u -d '2026-12-31 20:00:00' +%s)
+  rt(){   # $1 the clock, $2 the wording -> "<the epoch check stamped, UTC> <how it read it>". The stamp is dropped
+          # first, so a case that ends in backoff always gets the first step of it and never a doubling of the case
+          # before, and every case reads only its own message.
+    local o; rm -f "$d/.cc/state/claude-limit"
+    printf '{"is_error":true,"result":"Claude usage limit reached · %s"}\n' "$2" > "$d/rt.json"
+    o=$(me "$1" check "$d/rt.json" 2>/dev/null)
+    printf '%s %s' "$(date -u -d "@${o#LIMIT }" +%FT%H:%MZ 2>/dev/null)" "$(cut -f2 "$d/.cc/state/claude-limit" 2>/dev/null)"; }
+  back(){ printf '%s backoff:5' "$(date -u -d "@$(($1 + 300))" +%FT%H:%MZ)"; }   # what a message with no readable time gets
+  t 'a day and a clock are read in the zone the message names: Sep 7 10am Los Angeles = 17:00Z, not 14:00Z' \
+    "$(rt "$t8" 'resets Sep 7, 10am (America/Los_Angeles) · manage usage at claude.ai/settings/usage?from=cc_cli_limit_message')" \
+    '2026-09-07T17:00Z date'
+  t 'the same day and clock naming no zone is UTC, never whatever the host clock is set to' \
+    "$(rt "$t8" 'resets Sep 7, 10am')" '2026-09-07T10:00Z date'
+  # BOTH ORDERINGS GET WRITTEN, and either read as a bare clock lands on today: 10am on the 5th, two days early.
+  t 'the clock written before the day is still the day'"'"'s clock' \
+    "$(rt "$t8" 'resets at 10am on Sep 7 (America/Los_Angeles)')" '2026-09-07T17:00Z date'
+  t 'the day written first, the way most of the world writes it, reads the same' \
+    "$(rt "$t8" 'resets 7 Sep, 10am (America/Los_Angeles)')" '2026-09-07T17:00Z date'
+  t 'a day with no clock on it is the start of that day, and the ordinal and the dot are not part of the date' \
+    "$(rt "$t8" 'resets Sept. 7th (America/Los_Angeles)')" '2026-09-07T07:00Z date'
+  # THE YEAR THE MESSAGE LEAVES OUT. A day already past is next year's when next year's is days out…
+  t 'a day already past is next year'"'"'s when next year'"'"'s is days out' \
+    "$(rt "$t9" 'resets Jan 2, 9am (America/Los_Angeles)')" '2027-01-02T17:00Z date'
+  t '…but not when next year'"'"'s is months out: that is a stale message, and the backoff is the safe read' \
+    "$(rt "$t9" 'resets Mar 4, 9am (America/Los_Angeles)')" "$(back "$t9")"
+  # NOTHING FURTHER OUT THAN A FORTNIGHT IS A RESET. check only ever guards against the past, so either of these
+  # would have written a stamp months or decades out and parked the box for good.
+  t 'a day that lands eleven months out is a misread, not a reset — "resets Dec 31" read on Jan 3' \
+    "$(rt "$(date -u -d '2027-01-03 12:00:00' +%s)" 'resets Dec 31, 10am (America/Los_Angeles)')" \
+    "$(back "$(date -u -d '2027-01-03 12:00:00' +%s)")"
+  t 'and a year the message names itself is bounded the same way' \
+    "$(rt "$t8" 'resets Sep 7 2077, 10am (America/Los_Angeles)')" "$(back "$t8")"
+  t '…while a year it names inside the fortnight is taken as written' \
+    "$(rt "$(date -u -d '2026-12-28 12:00:00' +%s)" 'resets Jan 2 2027, 9am (America/Los_Angeles)')" \
+    '2027-01-02T17:00Z date'
 
   rm -rf "$d"; printf 'cc-limit selfcheck: %d passed, %d failed\n' $((n - bad)) "$bad"; [ "$bad" = 0 ]; }
 

@@ -6,7 +6,7 @@
   …either gate, --for <repo>/<track>   names the track in the refusal (display only)
   cc-brief refresh <repo> <track>   recompute that track's IN FLIGHT block from the board, in its task.md
   cc-brief selfcheck             fixtures for every signal, both gates, the recorded override and the row that is
-                                 not one, the block rewrite
+                                 not one, the unjudged dispatch it records, the block rewrite
 
 WHY A CHECK AND NOT A RULE. What a brief may say is written down in two places already, and a session that had
 read both still dispatched a page of prescription; a third copy is the move that has already failed twice. So the
@@ -33,6 +33,9 @@ iteration, so the gate costs about a fifth of a percent of the round it protects
   0  approved · 1  it READ the brief and rejected it — hard · 2  it could not judge at all, and the brief GOES.
 THE THREE ANSWERS ARE NOT TWO. Fail open on absence, hard on judgement: a box that cannot start work because a
 judge is down is worse than a box that dispatches a wordy brief, and a caller must never read 2 as approval.
+AND 2 IS COUNTED. Failing open silently is how this gate was off for a whole day and still trusted, so every
+unjudged dispatch appends a line to ~/.cc/state/brief/unjudged.jsonl saying which brief went and why the judge
+did not rule — the same `wc -l` the overrides below get, kept in its own file because nobody DECIDED these.
 
 FORCE IS FLAG, NEVER SILENCE, AND IT IS RECORDED: `CC_BRIEF_FORCE=1` in front of the dispatch prints the same
 findings, lets it through (exit 0), and appends a JSON line to ~/.cc/state/brief/overrides.jsonl for each gate
@@ -172,7 +175,7 @@ def check(text, for_=""):
         for line in ls:
             print(f"      {line}", file=sys.stderr)
     if forced:
-        record_override(",".join(sig for sig, _, _ in fs), for_, text)
+        record(OVERRIDES, ",".join(sig for sig, _, _ in fs), for_, text)
         return 0
     print("  Say the goal, why it matters, the boundaries and what done looks like; the worker designs the rest.\n"
           "  If it really must carry this, CC_BRIEF_FORCE=1 sends it as typed (that is recorded).", file=sys.stderr)
@@ -262,6 +265,7 @@ def refresh(repo, track):
 # approve or reject WITH WHAT TO CUT — a verdict that teaches nothing is a verdict that gets worked around.
 CLAUDE = os.environ.get("CC_CLAUDE") or os.path.expanduser("~/.local/bin/claude")
 OVERRIDES = os.path.join(STATE, "brief", "overrides.jsonl")
+UNJUDGED = os.path.join(STATE, "brief", "unjudged.jsonl")   # a SEPARATE file on purpose: see record()
 BRIEF_MAX = 20000        # bytes of brief sent to the judge; a brief longer than this is already the problem
 DENY = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,"
         "Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,"
@@ -286,12 +290,38 @@ Answer: verdict approve|reject; why, ONE sentence; cut, the spans to remove — 
 brief, shortest that identifies the prescription. Empty cut when you approve."""
 
 
-def record_override(what, for_, text):
-    """An override is never silent: one JSON line per GATE a forced brief went past (a brief that is both the
-    wrong shape and rejected by the judge records both), countable with `wc -l`."""
+def fixture(for_=""):
+    """A suite's dispatch is not a dispatch, and nothing it does is counted in the box's own ledgers — the rule
+    cc-guard keeps for paging, kept here for the same reason: the landing of the change that added unjudged.jsonl
+    ran selftest.sh, whose judge is /bin/true, and wrote sixteen fixture rows into the real file (2026-09-04).
+    The suite's repos are named _cctest…, its cwd sits under _cctest or _selfcheck, and it exports
+    CC_NOTIFY_LOG_ONLY for its whole run: any one of those is enough.
+    CC_STATE FIRST, AND IT WINS: a caller that pointed the ledger at a directory of its own is already keeping out
+    of the box's record, and the row it writes there is the one it is asserting on — selftest.sh's forced-brief
+    case redirects exactly so it can read its own override back."""
+    if os.environ.get("CC_STATE"):
+        return False
+    if os.environ.get("CC_NOTIFY_LOG_ONLY"):
+        return True
     try:
-        os.makedirs(os.path.dirname(OVERRIDES), exist_ok=True)
-        with open(OVERRIDES, "a") as f:
+        here = os.getcwd()
+    except OSError:
+        here = ""
+    return any(m in s for m in ("_cctest", "_selfcheck") for s in (for_ or "", here))
+
+
+def record(path, what, for_, text):
+    """A gate that did not hold is never silent: one JSON line, countable with `wc -l` — unless a fixture wrote it.
+    TWO LEDGERS, because they count different things and one number about both is a number about nobody.
+      overrides.jsonl  one line per GATE a FORCED brief went past — a person decided that; a brief that is both
+                       the wrong shape and rejected by the judge records both.
+      unjudged.jsonl   one line per dispatch the judge could not rule on. NOBODY decided that: the gate was off
+                       and the work went anyway, which is the failure a trusted gate must not have silently."""
+    if fixture(for_):
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
             f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "what": what,
                                 "for": for_, "head": " ".join(text.split())[:200]}) + "\n")
     except OSError:
@@ -311,7 +341,10 @@ def ask_judge(text):
     try:
         r = subprocess.run([CLAUDE, "-p", "--model", model, "--tools", "", "--disallowedTools", DENY,
                             "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands",
-                            "--max-turns", "1", "--no-session-persistence", "--output-format", "json",
+                            # 3 turns, not 1: the structured-output round trip is not reliably one turn, and a
+                            # judge that runs out of them answers error_max_turns — which reads here as ABSENCE and
+                            # dispatches. No tools are available, so an extra turn can only finish the answer.
+                            "--max-turns", "3", "--no-session-persistence", "--output-format", "json",
                             "--json-schema", JUDGE_SCHEMA, "--max-budget-usd", "0.10"],
                            input=RUBRIC + "\n\nBRIEF:\n" + text[:BRIEF_MAX], capture_output=True, text=True,
                            timeout=int(os.environ.get("CC_BRIEF_TIMEOUT") or 120), env=env,
@@ -328,6 +361,16 @@ def ask_judge(text):
     return v, ""
 
 
+def unjudged(note, who, for_, text):
+    """Exit 2 — and it leaves a mark. A gate that is off whenever the judge errs is worse than no gate, because
+    this one is trusted; so a dispatch that went unjudged is countable tomorrow instead of one line in a
+    scrollback nobody read (five of them on 2026-09-03, every one dispatched, all of it gone by morning)."""
+    record(UNJUDGED, note, for_, text)
+    print(f"cc-brief: the brief was NOT judged{who} — {note}; dispatching anyway "
+          f"(recorded in {UNJUDGED.replace(os.path.expanduser('~'), '~')}).", file=sys.stderr)
+    return 2
+
+
 def judge(text, for_=""):
     """Exit code, and the three answers are DIFFERENT ON PURPOSE — a caller must not read absence as approval:
        0  the judge read it and approved (or CC_BRIEF_FORCE turned a reject into a flag)
@@ -339,15 +382,12 @@ def judge(text, for_=""):
     v, note = ask_judge(text)
     who = f" for {for_}" if for_ else ""
     if v is None:
-        print(f"cc-brief: the brief was NOT judged{who} — {note}; dispatching anyway.", file=sys.stderr)
-        return 2
+        return unjudged(note, who, for_, text)
     verdict = str(v.get("verdict") or "")
     if verdict == "approve":
         return 0
     if verdict != "reject":      # neither word: it did not judge. ABSENCE IS NOT APPROVAL, so say so and go.
-        print(f"cc-brief: the brief was NOT judged{who} — the judge answered '{verdict[:40]}'; dispatching anyway.",
-              file=sys.stderr)
-        return 2
+        return unjudged(f"the judge answered '{verdict[:40]}'", who, for_, text)
     # VERBATIM ONLY: a span the model did not actually quote is a span it invented, and a made-up cut teaches
     # the reader the wrong lesson. Whitespace-flattened both sides, because prose wraps.
     flat = " ".join(text.split())
@@ -359,7 +399,7 @@ def judge(text, for_=""):
     for c in cuts:
         print(f"      cut: {' '.join(c.split())[:200]}", file=sys.stderr)
     if forced:
-        record_override("judge", for_, text)
+        record(OVERRIDES, "judge", for_, text)
         return 0
     print("  Cut those and dispatch again, or CC_BRIEF_FORCE=1 to send it as typed (that is recorded).", file=sys.stderr)
     return 1
@@ -401,10 +441,12 @@ def main(a):
 
 def selfcheck():
     import tempfile
-    global BOARDS, STATE, OVERRIDES
-    # THE LEDGER FIRST, before any case forces anything: OVERRIDES is resolved at import from the box's own state,
-    # and a forced case below would otherwise append a fixture line to the real record of real overrides.
-    OVERRIDES = os.path.join(tempfile.mkdtemp(prefix="cc-brief-sc."), "overrides.jsonl")
+    global BOARDS, STATE, OVERRIDES, UNJUDGED, CLAUDE
+    # THE LEDGERS FIRST, before any case forces anything or leaves a brief unjudged: both are resolved at import
+    # from the box's own state, and a case below would otherwise append a fixture line to the real record.
+    sc = tempfile.mkdtemp(prefix="cc-brief-sc.")
+    OVERRIDES, UNJUDGED = os.path.join(sc, "overrides.jsonl"), os.path.join(sc, "unjudged.jsonl")
+    os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the ledgers above are scratch: these cases must be able to write them
     p = f = 0
 
     def ok(name, cond):
@@ -639,6 +681,73 @@ def selfcheck():
     rc, err = run_judge(brief, '{"verdict":"maybe","why":"x","cut":[]}')
     ok("a verdict that is neither word is absence, not approval — 2, and it says so",
        rc == 2 and "NOT judged" in err)
+
+    # ── AN UNJUDGED DISPATCH IS WRITTEN DOWN. On 2026-09-03 the judge answered error_max_turns five times and
+    # every one of those briefs dispatched behind a terminal line nobody read; by morning the gate looked fine.
+    def rows(path):
+        return [json.loads(l) for l in open(path) if l.strip()]
+    open(UNJUDGED, "w").close(); open(OVERRIDES, "w").close()
+    rc, err = run_judge(brief, "")
+    ok("a dispatch the judge could not rule on is recorded — one countable line, naming the brief and why",
+       rc == 2 and len(rows(UNJUDGED)) == 1 and "not available" in rows(UNJUDGED)[0]["what"]
+       and rows(UNJUDGED)[0]["for"] == "r/t" and "something worth doing" in rows(UNJUDGED)[0]["head"])
+    ok("…and the terminal line points at the file, so the reader is not left with the scrollback",
+       "unjudged.jsonl" in err)
+    ok("THE TWO LEDGERS ARE NOT ONE: nobody decided this, so it is not counted as somebody's override",
+       rows(OVERRIDES) == [])
+    run_judge(brief, '{"verdict":"maybe","why":"x","cut":[]}')
+    ok("a verdict that is neither word is the same absence, and lands in the same ledger",
+       len(rows(UNJUDGED)) == 2 and "maybe" in rows(UNJUDGED)[1]["what"])
+    open(UNJUDGED, "w").close()
+    run_judge(brief, '{"verdict":"approve","why":"","cut":[]}')
+    run_judge(brief, '{"verdict":"reject","why":"x","cut":[]}')
+    run_judge(steps, '{"verdict":"reject","why":"x","cut":[]}', machine_=True)
+    ok("a judge that RULED writes nothing, either way, and a machine row is never even asked",
+       rows(UNJUDGED) == [])
+    # ── A SUITE'S DISPATCH IS NOT COUNTED. selftest.sh runs every dispatch with a /bin/true judge, which is the
+    # unjudged path exactly, and the landing of this very change wrote sixteen fixture rows into the real ledger.
+    os.environ["CC_NOTIFY_LOG_ONLY"] = "1"
+    run_judge(brief, "")
+    ok("under the suite's own flag (CC_NOTIFY_LOG_ONLY) an unjudged dispatch writes no row", rows(UNJUDGED) == [])
+    os.environ["CC_STATE"] = sc
+    run_judge(brief, "")
+    ok("…but a ledger the caller pointed elsewhere (CC_STATE) is that caller's to write, flag or not",
+       len(rows(UNJUDGED)) == 1)
+    os.environ.pop("CC_STATE", None)
+    open(UNJUDGED, "w").close()
+    os.environ.pop("CC_NOTIFY_LOG_ONLY", None)
+    os.environ["CC_BRIEF_FAKE"] = ""
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = judge(brief, for_="_cctest9/w1")
+    os.environ.pop("CC_BRIEF_FAKE", None)
+    ok("…nor does one for a _cctest repo, whatever the env — and it still dispatches (2)",
+       rc == 2 and rows(UNJUDGED) == [])
+    run_judge(brief, "")
+    ok("…while a real dispatch after them is still counted", len(rows(UNJUDGED)) == 1)
+    open(UNJUDGED, "w").close()
+
+    # ── THE TURN CAP WAS THE OUTAGE. --max-turns 1 is not enough for a structured answer: the judge spends its
+    # turn and returns error_max_turns, which reads here as absence and dispatches. No tools are available, so
+    # an extra turn can only finish the answer (cc-evals settled the same thing at 3). A FAKE claude, no call.
+    argv = os.path.join(sc, "argv")
+    CLAUDE = os.path.join(sc, "claude")
+    open(CLAUDE, "w").write("#!/usr/bin/env python3\nimport json, sys\n"
+                            "open(%r, 'w').write(' '.join(sys.argv[1:]))\nsys.stdin.read()\n"
+                            "print(json.dumps(json.loads(open(%r).read())))\n" % (argv, os.path.join(sc, "answer")))
+    os.chmod(CLAUDE, 0o755)
+    open(os.path.join(sc, "answer"), "w").write(
+        json.dumps({"structured_output": {"verdict": "approve", "why": "", "cut": []}}))
+    rc, err = run_judge(brief, None)
+    ok("the judge is given more than one turn — a schema answer that needs two is not an outage",
+       "--max-turns 3" in open(argv).read() and "--max-turns 1" not in open(argv).read())
+    ok("…and the call still carries its wall: no tools, no settings, a schema and a budget",
+       all(x in open(argv).read() for x in ("--tools", "--strict-mcp-config", "--json-schema", "--max-budget-usd")))
+    ok("a real answer through that path approves and says nothing", rc == 0 and err == "")
+    open(UNJUDGED, "w").close()
+    open(os.path.join(sc, "answer"), "w").write(json.dumps({"subtype": "error_max_turns"}))
+    rc, err = run_judge(brief, None)
+    ok("and if it runs out of turns anyway: 2 — the brief goes, and the ledger says error_max_turns",
+       rc == 2 and len(rows(UNJUDGED)) == 1 and "error_max_turns" in rows(UNJUDGED)[0]["what"])
 
     print(f"\ncc-brief selfcheck: {p} passed, {f} failed")
     return 1 if f else 0

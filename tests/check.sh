@@ -37,7 +37,8 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # the pause still reads it. Its fixture projects carry this process's pid in their names, because `on` finds the
 # loops to stop with pgrep over the whole process table and a shared name would signal a real project's worker.
 # cc-brief's is fixtures too — briefs it writes itself, a board and a throwaway git repo under a temp dir, and
-# CC_BRIEF_FAKE standing in for the judge at every case, so the fast gate never reaches a model.
+# CC_BRIEF_FAKE standing in for the judge's verdict, or a fake `claude` of its own where the CALL is what is
+# being pinned (the turn cap, the wall it carries), so the fast gate never reaches a model.
 # cc-gh-token's mints against an API of its own on localhost, signing with an RSA key it generates: minting,
 # reuse, the expiry margin, an absent key and which remotes it answers for — and, over a ~/dev of member
 # workspaces it builds itself, which repositories a workspace owns, that its token is minted for those alone
