@@ -660,6 +660,32 @@ def selfcheck():
                for x in plain_opens(f"{here}/{n}")]
         ok("no sibling tool opens ~/.cc/boards/<repo>.json itself — each reads through `read` or `cc-board json` (tripwire)", not bad)
         if bad: print("       " + ", ".join(bad))
+        # …AND THAT TRIPWIRE ONLY GUARDS ANYTHING IF IT RUNS. A suite runs a tool's selfcheck when that tool or
+        # something that invokes it changed (tests/green.sh), and the case above guards code that is not this
+        # file's: scoped that way it slept through the change that broke it. green.sh answers `want_selfcheck` for
+        # cc-board whatever changed — pinned here in both halves, the rule and the two gates that ask it, because
+        # the rule on its own is dead the moment a suite goes back to asking `want`.
+        tests = os.path.normpath(f"{here}/../tests")
+        def src(name):
+            try: return open(f"{tests}/{name}").read().split("\n")
+            except OSError: return []
+        sb = f"{th}/scopebin"; os.makedirs(sb, exist_ok=True)
+        for nm in ("cc-board", "cc-leaf"): open(f"{sb}/{nm}", "w").write("#!/bin/sh\n")
+        def asks(fn):   # a diff of one tool that cc-board neither is nor calls
+            r = subprocess.run(["bash", "-c", '. "$1" || exit 1; CC_LAND_CHANGED=core/bin/cc-leaf land_scope "$2"; '
+                                f'{fn} cc-board && echo yes || echo no', "_", f"{tests}/green.sh", sb],
+                               capture_output=True, text=True)
+            return r.stdout.strip()
+        chk_sh, self_sh = src("check.sh"), src("selftest.sh")
+        loop = [l for l in chk_sh if re.match(r'\s*want_selfcheck "\$c"', l)]           # check.sh's selfcheck loop…
+        listed = [l for l in chk_sh if re.match(r'\s*for c in cc-', l) and " cc-board " in l]   # …over a list holding cc-board
+        gate = [l for l in self_sh if re.match(r'\s*want_selfcheck "\$t"', l)]          # selftest.sh's chk()
+        at = self_sh.index("chk cc-board") if "chk cc-board" in self_sh else -1
+        stz = next((self_sh[k] for k in range(at, -1, -1) if re.match(r'(if )?stanza "', self_sh[k])), "") if at >= 0 else ""
+        ok("…and a landing that changes any tool under bin/ runs these cases: green.sh says yes for cc-board "
+           "whatever changed, where the invoke graph alone says no, and both suites gate this selfcheck on that",
+           asks("want_selfcheck") == "yes" and asks("want") == "no"
+           and len(loop) == 1 and len(listed) == 1 and len(gate) == 1 and stz.rstrip().endswith("always"))
         # A FAILED RENAME LEAVES THE PREVIOUS BOARD (review-156d). The in-place fallback exists for the bind-mounted board
         # inside a member boundary — rename over a mount point is EBUSY — and for nothing else: a full or read-only disk used
         # to truncate the live board to zero bytes on the way to failing. os.replace is stood in for; the board dir is this

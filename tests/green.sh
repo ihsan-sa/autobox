@@ -79,3 +79,10 @@ land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH 
   SCOPE=$CC_LAND_CHANGED
 }
 want(){ [ -z "${REACH:-}" ] && return 0; local t; for t; do case "$REACH" in *" $t "*) return 0;; esac; done; return 1; }
+
+# A SELFCHECK THAT READS ITS SIBLINGS runs for a change to any of them, and the graph above cannot say so: it maps
+# who INVOKES whom, and this one invokes nobody. cc-board's has a tripwire over every tool in bin/ — no sibling
+# opens a board file itself — so gating it on the graph guards nothing. On 2026-09-05 a direct read landed in a
+# tool cc-board neither is nor calls, and no landing since ran the case. Any narrowed scope is a set of tools under
+# bin/ (anything else widened it back to everything), so for cc-board this is true whenever it is asked.
+want_selfcheck(){ [ "$1" = cc-board ] || want "$1"; }

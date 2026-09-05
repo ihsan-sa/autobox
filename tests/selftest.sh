@@ -116,7 +116,7 @@ stanza(){   # `stanza "<title>" [always]`: the header, and whether this change r
 chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · line when the change does not reach it. The
          # tally is the tool's own line, found by name, never whatever printed last — no tally = it died = red.
   local t=$1 o r rc keep
-  want "$t" || { echo "  · $t selfcheck: not in this change's reach, not run"; return 0; }
+  want_selfcheck "$t" || { echo "  · $t selfcheck: not in this change's reach, not run"; return 0; }
   o=$("$B/$t" selfcheck 2>&1); rc=$?; r=$(grep -o "$t selfcheck: .*" <<<"$o" | tail -1)
   # ANCHORED: "10 failed" ends in "0 failed", so a bare substring test reads any tally ending in a zero as green —
   # 10, 20, 100 failed cases all landed. The two shapes the tools write are "…: 0 failed" and "…, 0 failed".
@@ -1151,6 +1151,11 @@ godisp g7 ""
   || bad "a finished holder stayed in the block: $(cat "$t7" 2>/dev/null)"
 
 fi
+# ALWAYS, unlike every other `chk`: one of cc-board's cases is a tripwire that reads every tool in bin/ for a board
+# file opened behind the board's back, so it guards code that is not cc-board's. Left in the a13 stanza it was
+# gated on the reach of the board's own callers, and a change to any other tool skipped the case that guards it.
+stanza "cc-board (a tripwire over every tool in bin/, so it runs whatever the change)" always
+chk cc-board
 if stanza "a finished track leaves the default board view (a13)"; then
 # owner, 2026-08-30: "this should also remove it from the board". Filter at render — no archive file to drift.
 # A row stays for cc-board's SHOWN_FOR window after it finishes so the owner sees WHAT landed; then it is history,
@@ -1173,7 +1178,6 @@ BACK
   && ok "a13: the default view SAYS it hid something, so nobody wonders where it went" || bad "a13: the view hid a row silently"
 "$B/cc-board" add $REPO a13live "a13 still running" >/dev/null; "$B/cc-board" show $REPO | grep -q 'a13 still running' \
   && ok "a13: an unfinished track is untouched by the filter" || bad "a13: the filter dropped a live track"
-chk cc-board
 # KIND=SESSION (owner, 2026-09-01): `cc <repo> <name> --session` marks a row a channel-like session — a long-lived
 # session with no task to finish. cc-reconcile leaves its status alone (a track with nobody in its worktree past
 # grace would be reconciled); the rest of the rule is pinned in cc-board's and cc-slack's selfchecks.
