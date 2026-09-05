@@ -41,6 +41,14 @@
 # session, so what it says is the member's word, and naming a repository in the owner's org is an org-admin
 # action he reserves to himself (review of #214). A worktree that is not under that path pushes to origin and
 # gets nothing created, whatever .cc/track says.
+# AND IT OPENS ON THE PROJECT'S BASE, NOT ON THE TRACK. GitHub takes an empty repository's default branch from the
+# FIRST branch pushed into it, and a project's first push is its track — so every repository the box made opened
+# on track/<project>, a clone came up on it, and `cc done` found no base branch there to open a PR against (#218).
+# A repository created HERE is therefore marked (.cc/base-seed) and the next push sends the base branch first, then
+# asks GitHub for it by name (cc-gh-token default) if the default is still something else. The base is the board's
+# (cc-board base), never a track, whoever names it. Only a repository this file made is marked, so one the owner
+# bound by hand is never pushed to or repointed behind his back; and repositories made before this are not touched —
+# `cc-gh-token default <workspace> <project> <base>` fixes one, once.
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 MODE=commit; case "${1:-}" in --push) MODE=push;; --remote) MODE=remote;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
@@ -90,6 +98,7 @@ pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push ·
       rm -f "$root/.cc/create.err.tmp" "$root/.cc/create.err"
       remote="$WSTRACK"; git remote get-url "$WSTRACK" >/dev/null 2>&1 || remote=origin   # origin: the workspace had no remote at all, so this is its first
       git remote get-url "$remote" >/dev/null 2>&1 || return 1
+      : > "$root/.cc/base-seed"   # brand new and empty: the next push sends the base FIRST, so its default is the base and not this track
       "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: created $url for this project — pushing there from now on" >/dev/null 2>&1
       return 0
     fi
@@ -135,6 +144,35 @@ url_key(){   # one repository, however its url is spelled: case, .git, a trailin
   u=${u#ssh://}; u=${u#https://}; u=${u#http://}; u=${u#git://}; u=${u#*@}
   case "$u" in *:*/*) u=${u/:/\/} ;; esac   # git@host:org/repo → host/org/repo
   printf '%s\n' "$u"; }
+base_branch(){   # the project's base branch, cwd = worktree root. The board's, and never a track, whoever names it:
+  # origin/HEAD is only what a REMOTE calls its default, and for a repository the box made that is the first branch
+  # pushed into it. Same rule and same order as cc's default_branch().
+  local b; b=$("$BIN/cc-board" base "$WSREPO" 2>/dev/null)
+  case "$b" in track/*|'') b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##') ;; esac
+  case "$b" in track/*|'') b=main ;; esac
+  printf '%s\n' "$b"; }
+seed_base(){   # cwd = worktree root, $remote and $cred from lease_push.  Always 0: seeding is not the push.
+  # The header's "AND IT OPENS ON THE PROJECT'S BASE": a repository created here is empty, GitHub gives it whichever
+  # branch lands first, and the track landing first is the whole bug. So the base goes first, and if that still did
+  # not make it the default it is asked for by name. Once, at creation — a repository the owner bound himself has no
+  # marker and is never touched. Not reaching the remote at all keeps the marker: the next turn tries again, and the
+  # track push in this one is failing for the same reason anyway.
+  local base def err
+  [ -n "$workspace" ] && [ -f "$root/.cc/base-seed" ] || return 0
+  base=$(base_branch)
+  # A base this checkout does not have cannot be pushed. That used to drop the marker and say nothing at all, so
+  # the repository went on opening on the track and no later turn tried again: the board hears it, once.
+  git rev-parse -q --verify "refs/heads/$base" >/dev/null 2>&1 || {
+    "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: this project's repository was made, but its base branch '$base' is not in this checkout — nothing was seeded, so it opens on whichever branch landed first" >/dev/null 2>&1
+    rm -f "$root/.cc/base-seed"; return 0; }
+  if ! err=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" push -q "$remote" "refs/heads/$base:refs/heads/$base" 2>&1); then
+    grep -qE 'rejected|non-fast-forward|already exists' <<<"$err" || return 0   # could not reach it: try again next turn
+  fi
+  def=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" ls-remote --symref "$remote" HEAD 2>/dev/null | sed -n 's#^ref: refs/heads/\([^[:space:]]*\).*$#\1#p' | head -1)
+  if [ "$def" != "$base" ] && ! "$BIN/cc-gh-token" default "$workspace" "$WSTRACK" "$base" >/dev/null 2>&1; then
+    "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $base is in this project's repository but its default branch is still ${def:-whichever branch arrived first} — 'cc-gh-token default $WSREPO $WSTRACK $base' sets it" >/dev/null 2>&1
+  fi
+  rm -f "$root/.cc/base-seed"; return 0; }
 evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree root.  Always 0: this is tidying.
   # EACH PROJECT'S REPOSITORY HOLDS THAT PROJECT AND NO OTHER. A workspace is one git repo whose projects are
   # branches, so before this every project's branch reached the workspace's first repository too and the
@@ -199,6 +237,7 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   # other push still uses whatever helper ~/.gitconfig gives it. Without this a member project's push has no
   # credential at all and stops on "could not read Username", which is how two finished branches sat unpushed.
   local -a cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$remote" 2>/dev/null)" "$workspace" 2>/dev/null)
+  seed_base   # a repository just made for this project takes its default from the FIRST branch pushed: the base goes ahead of the track
   # Plain push FIRST, and force nothing when it works: a fast-forward never needed a lease. It is also how a
   # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
   # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
@@ -241,17 +280,31 @@ selfcheck(){   # the pick_remote rule, on fixtures of its own: a HOME, workspace
   HOME="$T/home"; export HOME GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
   bin="$T/bin"; mkdir -p "$bin" "$HOME/.cc/worktrees" "$HOME/dev"
   cp "$(readlink -f "$0")" "$bin/cc-checkpoint"   # a COPY: a symlink resolves back to core/bin, and the stubs beside it would never be reached
-  CALLS="$T/calls"; NOTES="$T/notes"; export CALLS NOTES
+  CALLS="$T/calls"; NOTES="$T/notes"; DEFS="$T/defaults"; export CALLS NOTES DEFS
+  # `default` stands in for GitHub the way `create` does, and records into a file of its own so the create cases
+  # above still read a $CALLS with one line in it. BARE, when the case sets it, makes `create` a real bare repo the
+  # seeding below can actually push into.
   cat > "$bin/cc-gh-token" <<'SH'
 #!/usr/bin/env bash
+if [ "$1" = default ]; then printf '%s\n' "$*" >> "$DEFS"
+  [ -z "${CC_NODEFAULT:-}" ] || { echo "GitHub refused" >&2; exit 1; }
+  git -C "$BARE/$3.git" symbolic-ref HEAD "refs/heads/$4" 2>/dev/null; exit 0; fi
 printf '%s\n' "$*" >> "$CALLS"
 [ "$1" = create ] || exit 0
 [ -z "${CC_FAIL:-}" ] || { echo "GitHub refused to create $3" >&2; exit 1; }
+u="https://example.test/org/$3.git"; [ -z "${BARE:-}" ] || { git init -q --bare "$BARE/$3.git"; u="$BARE/$3.git"; }
 rn=origin; [ -z "$(git remote 2>/dev/null)" ] || rn="$3"   # cc-gh-token's own rule: a workspace's FIRST repository is its origin
-git remote add "$rn" "https://example.test/org/$3.git" 2>/dev/null
+git remote add "$rn" "$u" 2>/dev/null
 echo "https://example.test/org/$3"
 SH
-  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$NOTES"\n' > "$bin/cc-board"
+  # `base` is the board answering what the project's base branch is, and the REAL cc-board answers it, on a real
+  # board under this fixture's HOME (`setbase` below writes one). A stub answering it would prove the stub: this
+  # file called `base` for a whole PR before cc-board had the subcommand (review of #230). Every other subcommand
+  # is recorded instead of run — the board-note cases read $NOTES.
+  REALBIN="$BIN"; export REALBIN
+  printf '#!/usr/bin/env bash\n[ "$1" = base ] && exec "$REALBIN/cc-board" "$@"\nprintf "%%s\\n" "$*" >> "$NOTES"\n' > "$bin/cc-board"
+  setbase(){ "$BIN/cc-board" init "$1" "$HOME/dev/$1" "$2" >/dev/null; }   # what the board records as this repo's base
+  nobase(){ rm -f "$HOME/.cc/boards/$1.json"; }                            # …and back to a repo with no board at all
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/cc-config"   # the commit cases below ask it for a git identity; the fixture's gitconfig has one
   chmod +x "$bin/cc-gh-token" "$bin/cc-board" "$bin/cc-config"
   printf '[user]\n\tname = t\n\temail = t@t\n' > "$T/gitconfig"
@@ -389,6 +442,67 @@ SH
   runp "$d"
   k "$(has "$od" track/t2 && echo 0 || echo 1)" "a plain repo still pushes to origin" "not on $od"
   k "$(has "$td" track/t2 && echo 0 || echo 1)" "and nothing is removed from its other remotes" "deleted from $td"
+  # ── which branch the repository the box made opens on ───────────────────────────────────────────────
+  # GitHub gives an empty repository whichever branch lands first as its default, and the track landing first is
+  # the bug: the base goes in ahead of it, and is asked for by name if that still did not settle it. Here `create`
+  # makes a real bare repo under $BARE and `default` moves its HEAD, so GitHub's two halves are both fixtures.
+  export BARE="$T/gh"; mkdir -p "$BARE"
+  ws ws4
+  # ws4 has NO BOARD for these first cases, and a fixture worktree has no origin/HEAD either: that is the state a
+  # workspace is in the moment its first project is created, and the base is main because nothing recorded another.
+  d=$(mkproj_main ws4/projJ)   # no remote at all: one is created for it, and seeded before the track lands
+  : > "$DEFS"; runp "$d"; rJ="$BARE/projJ.git"
+  k "$(has "$rJ" main && echo 0 || echo 1)" "the base is pushed into the repository the box just made" "not on $rJ"
+  k "$(has "$rJ" track/projJ && echo 0 || echo 1)" "…and so is the project's own branch" "not on $rJ"
+  eq "…and that repository's default branch is the base" "$(git -C "$rJ" symbolic-ref HEAD)" refs/heads/main
+  eq "…asked for by name, for this project's own repository" "$(cat "$DEFS")" "default ws4 projJ main"
+  k "$([ -e "$d/.cc/base-seed" ] && echo 1 || echo 0)" "…and the marker is gone: this happens once, at creation" ""
+  : > "$DEFS"; runp "$d"
+  eq "every push after it asks GitHub nothing" "$(cat "$DEFS")" ""
+  # A repository whose default is ALREADY the track — the shape every repository the box made ended up in.
+  rK="$BARE/projK.git"; git init -q --bare "$rK"
+  d=$(mkproj_main ws4/projK projK "$rK"); git -C "$d" push -q projK track/projK
+  git -C "$rK" symbolic-ref HEAD refs/heads/track/projK
+  : > "$DEFS"; : > "$d/.cc/base-seed"; runp "$d"   # created last turn, seeded on this one
+  eq "a repository whose default is the track is moved to the base" "$(git -C "$rK" symbolic-ref HEAD)" refs/heads/main
+  eq "…by name, once the base is really there to point at" "$(cat "$DEFS")" "default ws4 projK main"
+  # THE BOARD says what the base is, and a track is not an answer — the same rule cc cuts a track with.
+  rL="$BARE/projL.git"; git init -q --bare "$rL"
+  d=$(mkproj_main ws4/projL projL "$rL"); git -C "$d" branch trunk main
+  : > "$DEFS"; : > "$d/.cc/base-seed"; setbase ws4 trunk; runp "$d"; nobase ws4
+  k "$(has "$rL" trunk && echo 0 || echo 1)" "the board's base is the branch that is seeded" "not on $rL"
+  eq "…and the one the default is set to" "$(cat "$DEFS")" "default ws4 projL trunk"
+  rM="$BARE/projM.git"; git init -q --bare "$rM"
+  d=$(mkproj_main ws4/projM projM "$rM")
+  : > "$DEFS"; : > "$d/.cc/base-seed"; setbase ws4 track/projM; runp "$d"; nobase ws4
+  eq "a board that answers a track is not believed: the base is main" "$(cat "$DEFS")" "default ws4 projM main"
+  # A base nobody can push because it is not in this checkout. It used to drop the marker and say nothing, so the
+  # repository kept opening on the track and no turn ever tried again — the board hears it once instead.
+  rQ="$BARE/projQ.git"; git init -q --bare "$rQ"
+  d=$(mkproj_main ws4/projQ projQ "$rQ")
+  : > "$DEFS"; : > "$d/.cc/base-seed"; setbase ws4 nosuchbase; runp "$d"; nobase ws4
+  k "$(grep -q "base branch 'nosuchbase' is not in this checkout" "$NOTES" && echo 0 || echo 1)" \
+    "a base that is not in the checkout is said once instead of silently dropped" "$(cat "$NOTES")"
+  eq "…and nothing is asked of GitHub for it" "$(cat "$DEFS")" ""
+  k "$([ -e "$d/.cc/base-seed" ] && echo 1 || echo 0)" "…and it is not retried every turn from then on" ""
+  # A repository the box did NOT make has no marker: nothing is pushed into it and its default is left alone.
+  rN="$BARE/projN.git"; git init -q --bare "$rN"
+  d=$(mkproj_main ws4/projN projN "$rN")
+  : > "$DEFS"; runp "$d"
+  k "$(has "$rN" main && echo 1 || echo 0)" "a repository the owner bound himself gets no base pushed into it" "main is on $rN"
+  eq "…and its default branch is never asked about" "$(cat "$DEFS")" ""
+  # …and where the base push alone settled it (GitHub's own rule), nothing is asked either.
+  rO="$BARE/projO.git"; git init -q --bare "$rO"
+  d=$(mkproj_main ws4/projO projO "$rO"); git -C "$d" push -q projO main; git -C "$rO" symbolic-ref HEAD refs/heads/main
+  : > "$DEFS"; : > "$d/.cc/base-seed"; runp "$d"
+  eq "a repository already opening on the base is not asked to change it" "$(cat "$DEFS")" ""
+  # A default GitHub will not set is a person's job, so it is said once and not tried every turn from then on.
+  rP="$BARE/projP.git"; git init -q --bare "$rP"
+  d=$(mkproj_main ws4/projP projP "$rP")
+  : > "$DEFS"; : > "$d/.cc/base-seed"; export CC_NODEFAULT=1; runp "$d"; unset CC_NODEFAULT
+  k "$(grep -q 'default branch is still' "$NOTES" && echo 0 || echo 1)" "a default GitHub refuses to set reaches the board, with the command that sets it" "$(cat "$NOTES")"
+  k "$([ -e "$d/.cc/base-seed" ] && echo 1 || echo 0)" "…once, not on every push after it" ""
+  unset BARE
   # ── whose README a project's repository opens on ────────────────────────────────────────────────────
   hook(){ ( cd "$1" && "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 ); }
   d=$(mkproj_main ws3/projE projE "$(bare ownE)")

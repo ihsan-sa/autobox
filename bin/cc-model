@@ -4,9 +4,13 @@
 #   cc-model status                   "fable" (normal) | "opus until 11:40Z" | "opus until probe". An until that
 #                                     is not today is dated ("opus until 2026-09-03T12:51Z"): the clock alone made
 #                                     a 24-hour override read as one that lapsed hours ago.
-#   cc-model current                  the override model, or nothing — cc / cc-loop / cc-rc pass it as --model
+#   cc-model current                  the model to dispatch on when it is not the primary: the override, else the next
+#                                     rung when the primary is one this account cannot run, else nothing — cc /
+#                                     cc-loop / cc-rc pass it as --model
 #   cc-model switch <model> [reason]  write (or, for the primary model, clear) the override + retune live sessions
 #   cc-model limited <model> [reason] cc-limit calls this after a limited run: switch only if that WAS the primary
+#   cc-model unavailable <model> [reason]  cc-limit calls this on a run refused for usage credits: that model cannot
+#                                     be run on this account, so it is recorded as such and the box moves off it
 #   cc-model classify <json> [<err>] [<asked>]  what stopped a headless run, as "<class>\t<why>": ok | limit |
 #                                     refusal | error — the caller's reason to WAIT, to MOVE, or to retry
 #   cc-model chain                    the worker fallback chain, one model per line
@@ -44,11 +48,14 @@
 # "refused", or "usage limit" — in its own result is talking about its task, not about being refused.
 # Override: ~/.cc/state/model-override = "<model>\t<since>\t<until-epoch|0>\t<reason>\t<last-probe-epoch>"
 # Log: ~/.cc/state/model.log = "<iso>\t<epoch>\t<event>\t<model>\t<detail>". No secrets in either.
+# Unavailable: ~/.cc/state/model-unavailable = "<family>\t<since>\t<last-seen>\t<reason>" — a model this account cannot
+#   run (usage credits, not a limit — see A MODEL THIS ACCOUNT CANNOT RUN below); a row goes the moment the box is put
+#   back on that model, by a probe that answered as it or by `switch`.
 # Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
 #   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
-ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"
+ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"; UNAV="$ST/model-unavailable"
 PRIMARY="${CC_MODEL_PRIMARY:-claude-fable-5-1[1m]}"; FALLBACK="${CC_MODEL_FALLBACK:-claude-opus-5[1m]}"   # Fable 5.1 (owner, 2026-09-01)
 PROBEM="${CC_MODEL_PROBE:-claude-fable-5-1}"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 SESSION="${CC_TMUX_SESSION:-main}"; PROC="${CC_MODEL_PROC:-claude}"
@@ -93,24 +100,66 @@ untilw(){   # $1 = an epoch → the way a person reads it. HH:MMZ alone lies the
   date -u -d "@$t" +%FT%H:%MZ; }
 label(){ case "$(fam "${1:-}")" in fable) echo "Fable 5.1";; opus) echo "Opus 5";; sonnet) echo "Sonnet 5";; haiku) echo "Haiku";; *) echo "${1:-}";; esac; }
 CHAIN="${CC_MODEL_CHAIN:-claude-fable-5-1 claude-opus-5 claude-sonnet-5}"   # the one copy of the order (see above)
-chain(){   # the canonical chain: ONE RUNG PER FAMILY, first mention wins. A CC_MODEL_CHAIN that names a family twice
-           # would otherwise walk in a circle, and a caller that reruns on each rung would never stop (F7).
+chain_all(){   # the canonical order: ONE RUNG PER FAMILY, first mention wins. A CC_MODEL_CHAIN that names a family twice
+               # would otherwise walk in a circle, and a caller that reruns on each rung would never stop (F7).
   local m f; local -a ms; local -A seen=(); read -r -a ms <<<"$CHAIN"
   for m in "${ms[@]}"; do f=$(fam "$m"); [ -n "$f" ] || continue
     [ -n "${seen[$f]:-}" ] && continue; seen[$f]=1; printf '%s\n' "$m"; done; }
+chain(){   # …minus the rungs this account cannot run: a caller walking it must never be handed one of those
+  local m; while read -r m; do unavail "$(fam "$m")" || printf '%s\n' "$m"; done < <(chain_all); }
 chain_next(){   # the model AFTER $1 on the chain, by family: "opus", "claude-opus-5" and "claude-opus-5[1m]" are one rung.
                 # A trailing [suffix] rides along: falling from fable[1m] to a bare opus silently drops the 1M context
                 # the caller was running with, and the rerun then fails for a reason nobody asked for (F7).
+                # A rung the account cannot run is stepped over — and $1 itself may be one (the primary, most days).
   local src="${1:-}" w sfx m hit=0
   [ -n "$(fam "$src")" ] || src="$PRIMARY"   # named nothing: start from where the box actually is
   w=$(fam "$src"); sfx=$(grep -oE '\[[^][]*\]$' <<<"$src")
   while read -r m; do
-    if [ "$hit" = 1 ]; then case "$m" in *']') printf '%s\n' "$m";; *) printf '%s%s\n' "$m" "$sfx";; esac; return 0; fi
+    if [ "$hit" = 1 ]; then unavail "$(fam "$m")" && continue
+      case "$m" in *']') printf '%s\n' "$m";; *) printf '%s%s\n' "$m" "$sfx";; esac; return 0; fi
     [ "$(fam "$m")" = "$w" ] && hit=1
-  done < <(chain); return 1; }   # off the end of the chain (or a model that was never on it): nothing left to fall back to
+  done < <(chain_all); return 1; }   # off the end of the chain (or a model that was never on it): nothing left to fall back to
+current(){   # what a dispatch passes as --model: the override, else the next rung when the primary is not this account's
+             # to run, else nothing — the box is on its primary
+  if ov; then printf '%s\n' "$model"; elif unavail "$(fam "$PRIMARY")"; then chain_next "$PRIMARY" || true; fi; }
+status_line(){   # "fable" | "opus until 11:40Z" | "opus until probe", and " — fable is not available to this account" when it is
+  local s
+  if ov; then s="$(fam "$model") until $([ "$till" -gt 0 ] && untilw "$till" || echo probe)"
+  elif unavail "$(fam "$PRIMARY")"; then s=$(fam "$(chain_next "$PRIMARY" || echo -)")
+  else s=$(fam "$PRIMARY"); fi
+  unavail "$(fam "$PRIMARY")" && s="$s — $(fam "$PRIMARY") is not available to this account"
+  printf '%s\n' "$s"; }
 ov(){ model=""; since=0; till=0; reason=""; probed=0   # loads the override; exit 1 = none (the box is on its primary model)
   [ -f "$OV" ] && IFS=$'\t' read -r model since till reason probed < "$OV"
   [[ "${till:-}" =~ ^[0-9]+$ ]] || till=0; [[ "${probed:-}" =~ ^[0-9]+$ ]] || probed=0; [ -n "$model" ]; }
+# ── A MODEL THIS ACCOUNT CANNOT RUN ──────────────────────────────────────────────────────────────────────────────
+# "Fable 5.1 requires usage credits" (2026-09-03, the account went Pro) and "You're out of usage credits" (2026-08-28)
+# are not limits: no reset lifts them, and the other models answer. Read as a limit, the first parked the whole box
+# for 14 h. So such a model is RECORDED as unavailable, here, and four things read the record: `chain` and `next`
+# leave that rung out, `current` hands a dispatch the next rung when the primary is the one, `status` says so, and
+# `unavailable` moves the box off it. The record outlives the override: clear the override, or boot fresh, and a
+# dispatch with no --model still aims past it. A probe that answers AS that model, or `switch` back onto it, forgets it.
+unavail(){ [ -n "${1:-}" ] && [ -f "$UNAV" ] && awk -F'\t' -v f="$1" '$1==f{y=1} END{exit !y}' "$UNAV"; }   # $1 family → 0 = recorded
+note_unavailable(){   # $1 family · $2 reason → one row per family: since stays across sightings, last-seen and reason move
+  local f="$1" why since; why=$(tr -d '\t\n' <<<"${2:-}" | head -c 160)
+  since=$(awk -F'\t' -v f="$f" '$1==f{print $2+0; exit}' "$UNAV" 2>/dev/null); [ "${since:-0}" -gt 0 ] || since=""
+  { [ -f "$UNAV" ] && awk -F'\t' -v f="$f" '$1!=f' "$UNAV"; printf '%s\t%s\t%s\t%s\n' "$f" "${since:-$now}" "$now" "$why"; } > "$UNAV.t"
+  mv "$UNAV.t" "$UNAV"
+  [ -n "$since" ] || printf '%s\t%s\tunavailable\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$f" "$why" >> "$LOG"; }   # once per episode, not per probe
+forget_unavailable(){   # $1 family → its row is dropped (nothing to do when it has none)
+  unavail "${1:-}" || return 0
+  awk -F'\t' -v f="$1" '$1!=f' "$UNAV" > "$UNAV.t"; mv "$UNAV.t" "$UNAV"; [ -s "$UNAV" ] || rm -f "$UNAV"
+  printf '%s\t%s\tavailable\t%s\tanswered as itself again\n' "$(date -u +%FT%TZ)" "$now" "$1" >> "$LOG"; }
+unavailable_why(){   # $1 = a classify `why` → 0 when it says the MODEL is not the account's to run (not a reroute, not a
+                     # stopped turn): the wording that wants usage credits, or the API's own not-ours-to-call shapes
+  case "${1:-}" in 'needs usage credits'*|'the model would not answer as itself') return 0;; esac; return 1; }
+mark_unavailable(){   # $1 model · $2 reason → record it, and move the box off it if that is what the box is on
+  local f nx cur; f=$(fam "${1:-}"); [ -n "$f" ] || return 0
+  note_unavailable "$f" "${2:-}"
+  cur="$PRIMARY"; ov && cur="$model"; [ "$(fam "$cur")" = "$f" ] || return 0
+  nx=$(chain_next "$cur") || return 0   # nothing left to move to: recorded, and every caller reads the chain's end
+  SWITCH_FROM=$(label "$cur"); SWITCH_WHAT="is not available to this account${2:+ ($2)}"
+  do_switch "$nx" "$f not available to this account: ${2:-usage credits}"; SWITCH_FROM=""; SWITCH_WHAT=limit; }
 limstamp(){ lim_till=0; lim_model=""; lim_seen=0   # cc-limit's stamp: "<until>\t<how>\t<first-seen>\t<model>\t<observers>"
   local o=""
   # Split by awk, not by `IFS=$'\t' read`: tab is IFS whitespace and bash folds "\t\t" into one delimiter, so a
@@ -287,10 +336,12 @@ restore_blocked(){   # $1 = prompt_panes output → why a probe that answered st
     { printf "cc-limit's stamp still has %s limited until %sZ\n" "$p" "$(date -u -d "@$lim_till" +%H:%M)"; return 0; }
   return 1; }
 SWITCH_TILL=0   # set by a caller that knows the deadline the limit itself named (the prompt's reset); do_switch banks it
+SWITCH_WHAT=limit; SWITCH_FROM=""   # what the owner's line says moved the box, and off which model: a limit on the primary unless told otherwise
 do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   local want="$1" why="${2:-}" m wf n=0 id name msg to=0
   wf=$(fam "$want")
   if [ "$wf" = "$(fam "$PRIMARY")" ]; then m="$PRIMARY"; elif [ "$wf" = "$(fam "$FALLBACK")" ]; then m="$FALLBACK"; else m="$want"; fi
+  [ "$m" = "$PRIMARY" ] && forget_unavailable "$(fam "$PRIMARY")"   # back onto the primary = it answered as itself, or the owner says so
   if ov; then [ "$model" = "$m" ] && return 0; else [ "$m" = "$PRIMARY" ] && return 0; fi   # idempotent: callers may fire on every limited run
   if [ "$m" = "$PRIMARY" ]; then rm -f "$OV" "$ST/model-skipped"
   else limstamp; [ "$lim_till" -gt "$now" ] && to="$lim_till"
@@ -303,8 +354,8 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
   done < <(sessions)
   printf '%s\t%s\tswitch\t%s\t%s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$n session(s); $why" >> "$LOG"
   if [ "$m" = "$PRIMARY" ]; then msg="$(label "$PRIMARY") is back — every session is on it again."
-  elif [ "$to" -gt 0 ]; then msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z."
-  else msg="$(label "$PRIMARY") limit → all sessions on $(label "$m") until it answers again."; fi
+  elif [ "$to" -gt 0 ]; then msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → all sessions on $(label "$m") until $(date -u -d "@$to" +%H:%M)Z."
+  else msg="${SWITCH_FROM:-$(label "$PRIMARY")} $SWITCH_WHAT → all sessions on $(label "$m") until it answers again."; fi
   "$BIN/cc-notify" -t "$(hostname -s) model" "$msg" >/dev/null 2>&1 || true; }
 # ── CLASSIFICATION READS FIELDS, NEVER THE DOCUMENT ──────────────────────────────────────────────────────────────
 # A result JSON is kilobytes of numbers, uuids and the worker's own prose. Grepping it whole is how this classifier
@@ -312,9 +363,15 @@ do_switch(){   # $1 model (a family word like "opus" or a full id) $2 reason
 # the literal `"refused":{…}` sits in `subagent_stats` of EVERY run; and a worker's result text says "refused" or
 # "usage limit" whenever it is describing its own work. So: jq the FIELDS, and read prose only from `.result`, only
 # when the API itself ended the run — never from a capped run, whose `.result` is the worker's last paragraph.
-# The CLI's own wording for a model that will not answer: a usage limit, a rate limit, or an exhausted credit balance
-# ("You're out of usage credits…" — 2026-08-28: this one was read as "could not run" and never switched).
-LIMIT_RE='usage limit|rate limit|rate_limit|too many requests|usage credits|out of credits|insufficient credits'
+# The CLI's own wording for a limit: a usage limit or a rate limit — a WAIT.
+LIMIT_RE='usage limit|rate limit|rate_limit|too many requests'
+# …and for a model this ACCOUNT cannot run: it wants usage credits the account has not got ("You're out of usage
+# credits…", 2026-08-28, read then as "could not run" and never switched; "Fable 5.1 requires usage credits",
+# 2026-09-03, read as a limit and it parked the box for 14 h). Not a limit — no reset lifts it, and the other models
+# answer — so it is a MOVE, and it is read before the status code: the 2026-08-28 message came with a 429 on it.
+# Real limit wording beside it still wins: a limit hit with no credits left to continue on is a limit.
+CREDITS_RE='usage credits|out of credits|insufficient credits'
+credits_said(){ grep -iE "$CREDITS_RE" <<<"${1:-}" | head -1 | sed -E 's/(\. | · ).*//' | tr -d '\t' | head -c 120; }   # the sentence, for the journal
 # every wording that means the id we asked for is not ours to call: unknown, withdrawn, suspended, not permitted.
 # API SHAPES ONLY — never the bare words refused/declined/unavailable, which a worker writes about its own task.
 REFUSE_RE='model_not_found|invalid_model|unknown model|not a valid model|does not have access|no access to|permission_error|model[^"]{0,60}(not available|unavailable|deprecated|suspended|withdrawn|retired)|(unavailable|deprecated|suspended|withdrawn|retired|not available)[^"]{0,30}(to|for) this account'
@@ -341,6 +398,7 @@ classify_run(){   # $1 run json · $2 its stderr · $3 the model that was ASKED 
   err=$(tail -c 4000 "${e:-/dev/null}" 2>/dev/null)   # the CLI's own channel — the worker's prose never lands here
   if [ ! -s "$j" ] || ! jq -e 'type == "object"' "$j" >/dev/null 2>&1; then   # network, bad binary, timeout, an HTML 502
     { grep -qiE "$LIMIT_RE" <<<"$err" || grep -qiE "$LIMIT_RE" "$j" 2>/dev/null; } && { printf 'limit\tsaid so in words\n'; return 0; }
+    grep -qiE "$CREDITS_RE" <<<"$err" && { printf 'refusal\tneeds usage credits: %s\n' "$(credits_said "$err")"; return 0; }
     [ -s "$j" ] && { printf 'error\tno json\n'; return 0; }
     printf 'error\tno output\n'; return 0; fi
   IFS=$'\t' read -r sub stop term astat < <(jq -r '[(.subtype // ""), (.stop_reason // ""), (.terminal_reason // ""), (.api_error_status // "" | tostring)] | @tsv' "$j" 2>/dev/null)
@@ -350,9 +408,12 @@ classify_run(){   # $1 run json · $2 its stderr · $3 the model that was ASKED 
   # Only the first is evidence about the model; 9 of 10 real error_max_turns runs read as a refusal without this line.
   apisays=no; { [ "$failed" = yes ] && [[ "$sub" != error_max_* ]]; } && apisays=yes
   # ── a WAIT: cc-limit owns the clock, this only has to name it ──
-  [ "$astat" = 429 ] && { printf 'limit\tthe API answered 429\n'; return 0; }
   { [ "$apisays" = yes ] && grep -qiE "$LIMIT_RE" <<<"$res"; } && { printf 'limit\tsaid so in words\n'; return 0; }
   grep -qiE "$LIMIT_RE" <<<"$err" && { printf 'limit\tsaid so in words\n'; return 0; }
+  # ── a MOVE, read before the status code: the model wants usage credits this account has not got (see CREDITS_RE) ──
+  { [ "$apisays" = yes ] && grep -qiE "$CREDITS_RE" <<<"$res"; } && { printf 'refusal\tneeds usage credits: %s\n' "$(credits_said "$res")"; return 0; }
+  grep -qiE "$CREDITS_RE" <<<"$err" && { printf 'refusal\tneeds usage credits: %s\n' "$(credits_said "$err")"; return 0; }
+  [ "$astat" = 429 ] && { printf 'limit\tthe API answered 429\n'; return 0; }
   # ── a MOVE: the model would not answer AS ITSELF ──
   [ "$stop" = refusal ] && { printf 'refusal\tthe classifier stopped the turn\n'; return 0; }
   w=$(asked_fam "$want"); sf=$(served_fams "$j" "$failed"); served=$(paste -sd/ - <<<"$sf")
@@ -377,7 +438,8 @@ probe(){   # is the primary model answering again? one cheap turn, no tools.
   timeout 60 "$CLAUDE" -p "reply ok" --model "$PROBEM" --max-turns 1 --setting-sources '' \
       --max-budget-usd "${CC_MODEL_PROBE_BUDGET:-0.50}" --output-format json >"$o" 2>"$o.err"; rc=$?
   cl=$(classify_run "$o" "$o.err" "$PROBEM"); probe_why="${cl#*$'\t'}"; cl="${cl%%$'\t'*}"   # the JSON before the exit code
-  case "$cl" in limit) return 1;; refusal) return 3;; error) return 2;; esac
+  case "$cl" in limit) return 1;; error) return 2;;
+    refusal) unavailable_why "$probe_why" && note_unavailable "$(fam "$PROBEM")" "$probe_why"; return 3;; esac   # the record, refreshed each probe
   [ "$rc" = 0 ] || { probe_why="exit $rc"; return 2; }
   return 0; }
 lastprobe(){ cat "$ST/model-probed" 2>/dev/null || echo 0; }   # F2: the pane-detection probe is throttled like the restore probe
@@ -464,9 +526,10 @@ selfcheck(){   # fixtures only: no network, no tmux, and none of this box's stat
                # classifier wrong on 41 of 48 real runs while its own selfcheck was green: the stubs carried none of
                # the traps a real result carries. The three that matter are asserted below, so nobody simplifies
                # them away: `subagent_stats.refused`, a "429" inside the uuid, and the haiku side-call.
-  local d n=0 bad=0 got real c1 c2 c3 exp other oldov="$OV" oldchain="$CHAIN" oldst="$ST"
+  local d n=0 bad=0 got real c1 c2 c3 exp other oldov="$OV" oldchain="$CHAIN" oldst="$ST" oldunav="$UNAV"
   local dlg dlg2 dlgwrap notice credits worker quoted perm askfirst pe0 pn pf0
   d=$(mktemp -d) || return 1
+  UNAV="$d/model-unavailable"   # hermetic from the first case: a model this box has recorded must not bend the chain here
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   cl(){ classify_run "$1" "" "${2:-}" | cut -f1; }
   real="$d/real.json"; cat > "$real" <<'JSON'
@@ -501,8 +564,12 @@ STUB
 
   b ok      '.'
   b capped  '.subtype="error_max_turns" | .is_error=true | .stop_reason="tool_use" | .terminal_reason="max_turns" | .errors=["Reached maximum number of turns (80)"] | .result="Wrote the gate. The `.env.local` write was refused, and the old model id is deprecated, so I stopped there."'
-  b limit429 '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=429 | .result="You'"'"'re out of usage credits. Switch to another model, or manage usage credits at the settings page, to continue."'
+  b limit429 '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=429 | .result="You'"'"'ve hit your weekly limit · resets Sep 7, 10am (America/Los_Angeles)"'
   b credits '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .result="You'"'"'re out of usage credits. Switch to another model to continue."'
+  # the 2026-08-28 message as the API sent it, 429 and all; and the 2026-09-03 one verbatim, from a Pro account
+  b credits429 '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=429 | .result="You'"'"'re out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue."'
+  b entitled '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .result="Fable 5.1 requires usage credits"'
+  b nocredits '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=429 | .result="Claude usage limit reached · continuing on Fable 5 uses usage credits · resets at 2026-09-07T17:00:00Z"'
   # the shape of every API-ended run on this box (2026-08-28): the primary never answered, so the haiku title call is the ONLY usage
   b overloaded '.is_error=true | .stop_reason="stop_sequence" | .terminal_reason="api_error" | .api_error_status=529 | .result="API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}" | .modelUsage={"claude-haiku-4-5-20251001":{"inputTokens":9}}'
   b stopped '.is_error=true | .subtype="error_during_execution" | .stop_reason="refusal" | .result=""'
@@ -516,7 +583,18 @@ STUB
   t 'a good run is ok'                    "$(cl "$d/ok.json" claude-fable-5)"        ok
   t 'a capped run is an error, not a refusal' "$(cl "$d/capped.json" claude-fable-5)" error
   t 'a 429 from the API is a limit'       "$(cl "$d/limit429.json" claude-fable-5)"  limit
-  t 'out of usage credits is a limit'     "$(cl "$d/credits.json" claude-fable-5)"   limit
+  # USAGE CREDITS ARE NOT A LIMIT: one model this account cannot run, and no reset lifts it — a move, not a wait
+  t 'out of usage credits is not a wait: the box moves'  "$(cl "$d/credits.json" claude-fable-5)"   refusal
+  t '"Fable 5.1 requires usage credits" (2026-09-03) is the same' "$(cl "$d/entitled.json" claude-fable-5-1)" refusal
+  t '...and the why says so, in the API'"'"'s words, for the journal' \
+    "$(classify_run "$d/entitled.json" "" claude-fable-5-1 | cut -f2)" "needs usage credits: Fable 5.1 requires usage credits"
+  t '...and a 429 on the credits message (2026-08-28) does not make it a wait: the words come before the status' \
+    "$(cl "$d/credits429.json" claude-fable-5)" refusal
+  t '...while a limit hit with no credits left to continue on is still a limit' "$(cl "$d/nocredits.json" claude-fable-5)" limit
+  : > "$d/nojson.json"; printf 'Fable 5.1 requires usage credits\n' > "$d/nojson.json.err"
+  t '...and the wording on stderr with no json at all is the same move' "$(classify_run "$d/nojson.json" "$d/nojson.json.err" claude-fable-5-1 | cut -f1)" refusal
+  t 'a why that wants credits is the model being unavailable; a reroute is not' \
+    "$(unavailable_why 'needs usage credits: x' && echo y)$(unavailable_why 'the model would not answer as itself' && echo y)$(unavailable_why 'answered as opus, not fable' && echo y)$(unavailable_why 'the classifier stopped the turn' && echo y)" yy
   t 'a 529 the primary never answered is an error, not a reroute' "$(cl "$d/overloaded.json" claude-fable-5)" error
   t 'and it names the status'             "$(classify_run "$d/overloaded.json" "" claude-fable-5 | cut -f2)" "the API answered 529"
   t 'stop_reason refusal is a refusal'    "$(cl "$d/stopped.json" claude-fable-5)"   refusal
@@ -658,16 +736,53 @@ TXT
   t 'a repeated family is one rung'       "$(chain | wc -l)"             2
   got=$(chain_next "$c2"); t 'so the walk still ends' "$got:$?" ":1"
   CHAIN="$oldchain"
+  # ── A MODEL THIS ACCOUNT CANNOT RUN (2026-09-03): recorded, left out of the chain, and the box moved off it ──────
+  # Own state under $d, no tmux at all (no live session is listed here, let alone typed into), a stub cc-notify.
+  local oldlog="$LOG" oldbin="$BIN" oldproc="$PROC"
+  OV="$d/model-override"; LOG="$d/model.log"; ST="$d"; BIN="$d/bin"; PROC=nonesuch
+  rm -f "$UNAV" "$OV" "$d/claude-limit"; : > "$d/calls"; tmux(){ return 1; }
+  printf '#!/bin/sh\necho "notify $*" >> "%s/calls"\n' "$d" > "$d/bin/cc-notify"; chmod +x "$d/bin/cc-notify"
+  exp=$(chain_next "$PRIMARY"); [ "$(fam "$exp")" = "$(fam "$FALLBACK")" ] && exp="$FALLBACK"   # what do_switch lands on
+  t 'nothing recorded: current names no model, the box is on its primary' "$(current)" ""
+  mark_unavailable "$c3" 'Sonnet 5 requires usage credits'
+  t 'a model the box is not on is recorded, and nothing is switched or said' \
+    "$(unavail "$(fam "$c3")" && echo rec)$([ -e "$OV" ] && echo ov)$(grep -c '^notify' "$d/calls")" rec0
+  t 'the chain a caller walks leaves it out'      "$(chain | tr '\n' ' ')"      "$c1 $c2 "
+  t 'and next steps over it to the chain'"'"'s end' "$(chain_next "$c2"; echo ":$?")" ":1"
+  forget_unavailable "$(fam "$c3")"
+  t 'forgotten, it is a rung again'               "$(chain | wc -l)"            3
+  mark_unavailable "$c1" 'Fable 5.1 requires usage credits'
+  t 'the PRIMARY the account cannot run: the box moves to the next rung, its [1m] context riding along' "$(cut -f1 "$OV")" "$exp"
+  t 'and the owner'"'"'s line says what moved it — not a limit' \
+    "$(grep -c "^notify .*$(label "$PRIMARY") is not available to this account (Fable 5.1 requires usage credits) → all sessions on $(label "$exp") until it answers again" "$d/calls")" 1
+  t 'the override carries the reason'             "$(cut -f4 "$OV")" "$(fam "$c1") not available to this account: Fable 5.1 requires usage credits"
+  t 'current hands a dispatch that rung'          "$(current)"      "$exp"
+  t 'status says which model, and why'            "$(status_line)" "$(fam "$exp") until probe — $(fam "$c1") is not available to this account"
+  t 'the chain starts past it'                    "$(chain | sed -n 1p)" "$c2"
+  t 'and naming no model starts where the box can run' "$(chain_next '')" "$exp"
+  : > "$d/calls"; mark_unavailable "$c1" 'Fable 5.1 requires usage credits'   # the probe sees it again, every 15 min
+  t 'a second sighting is one row, no second switch, no second line' \
+    "$(wc -l < "$UNAV")$(grep -c '^notify' "$d/calls")$(grep -c $'\tunavailable\tfable\t' "$LOG")" 101
+  rm -f "$OV"   # the override cleared by hand, or a fresh box that inherited the record
+  t 'the record alone still steers a dispatch off the primary: an override is a patch, this is the fact' "$(current)" "$exp"
+  t 'and status still says so'                    "$(status_line)" "$(fam "$exp") — $(fam "$c1") is not available to this account"
+  do_switch "$PRIMARY" 'limit lifted (probe)'   # a probe answered AS the primary, or the owner switched back by hand
+  t 'back on the primary, the record goes: the account can run it again' "$(unavail "$(fam "$c1")" && echo rec)$(current)" ""
+  t 'and the log says it came back'               "$(grep -c $'\tavailable\tfable\tanswered as itself again' "$LOG")" 1
+  do_switch "$c2" 'test'; : > "$d/calls"; mark_unavailable "$c2" 'Opus 5 requires usage credits'
+  t 'the override model the box is on can be the one: it moves on down the chain' "$(fam "$(cut -f1 "$OV")")" "$(fam "$c3")"
+  t 'and that line names the model it left'       "$(grep -c "^notify -t $(hostname -s) model $(label "$c2") is not available" "$d/calls")" 1
+  unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"
   rm -rf "$d"
   printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
 case "${1:-}" in
-  status)  if ov; then [ "$till" -gt 0 ] && printf '%s until %s\n' "$(fam "$model")" "$(untilw "$till")" || printf '%s until probe\n' "$(fam "$model")"
-           else fam "$PRIMARY"; fi ;;
-  current) ov && printf '%s\n' "$model" ;;
+  status)  status_line ;;
+  current) current ;;
   switch)  do_switch "${2:?usage: cc-model switch <model> [reason]}" "${3:-}" ;;
   limited) [ "$(fam "${2:?usage: cc-model limited <model> [reason]}")" = "$(fam "$PRIMARY")" ] || exit 0
            rate_ok && do_switch "$FALLBACK" "${3:-$(fam "$2") limit}" ;;
+  unavailable) mark_unavailable "${2:?usage: cc-model unavailable <model> [reason]}" "${3:-}" ;;
   classify) shift; classify_run "${1:?usage: cc-model classify <json> [<err>] [<asked-model>]}" "${2:-}" "${3:-}" ;;
   chain)   chain ;;
   next)    chain_next "${2:-}" || exit 1 ;;

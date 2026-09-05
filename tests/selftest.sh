@@ -1412,8 +1412,17 @@ sleep 1
 [ -z "$(M current)" ] && ok "cc-model current is empty with no override" || bad "cc-model current leaked a model"
 printf '{"is_error":true,"result":"claude-fable-5: You are out of usage credits. Run /usage-credits to keep using Fable 5.","total_cost_usd":0}' > "$T/cred.json"
 ME "$B/cc-limit" check "$T/cred.json" >/dev/null
-{ ME "$B/cc-limit" status | grep -q 'usage limit until'; } && ok "cc-limit: an exhausted credit balance is a limit too (backoff, no reset time in the message)" || bad "cc-limit missed the credit wording"
-rm -f "$MH/.cc/state/claude-limit"
+# USAGE CREDITS ARE NOT A LIMIT (2026-09-04): one model this account cannot run, and no reset lifts that. No stamp —
+# cc-model is told instead, records fable as unavailable, moves the box off it and says so. The record is cleared
+# right after, so the limit cases below start from a box on its primary.
+{ [ ! -e "$MH/.cc/state/claude-limit" ] && grep -q '^fable' "$MH/.cc/state/model-unavailable" 2>/dev/null \
+  && [ "$(M status)" = "opus until probe — fable is not available to this account" ]; } \
+  && ok "cc-limit: an exhausted credit balance is not a limit — no stamp, fable recorded as unavailable, the box moved off it and status says so" \
+  || bad "credits read wrong: stamp=$([ -e "$MH/.cc/state/claude-limit" ] && echo yes || echo no) status=$(M status)"
+rm -f "$MH/.cc/state/claude-limit" "$MH/.cc/state/model-unavailable" "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen"
+: > "$MH/.cc/state/model.log"; : > "$MH/.cc/notify.log"   # …and the move it just made: one switch per 10 min, so a switch row
+                                                          # left here holds every case below on the anti-flap gap, and the
+                                                          # credits line would be counted as the limit's notify
 printf '{"is_error":true,"result":"claude-fable-5: You have hit your usage limit. Your limit resets at 11:40.","total_cost_usd":0}' > "$T/fab.json"
 ME env CC_LIMIT_OBSERVER=worker-a "$B/cc-limit" check "$T/fab.json" >/dev/null
 [ "$(cut -f4 "$MH/.cc/state/claude-limit")" = fable ] && ok "cc-limit records the limited model (stamp field 4)" || bad "stamp model: $(cut -f4 "$MH/.cc/state/claude-limit" 2>/dev/null)"
@@ -1473,8 +1482,8 @@ F
 chmod +x "$T/creditprobe"
 mline "You are out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models."
 ME env CC_MODEL_PROBE_EVERY=0 CC_CLAUDE="$T/creditprobe" "$B/cc-model" tick
-[ "$(M status)" = "opus until probe" ] && ok "\"out of usage credits\" counts as limited (whatever the exit status)" || bad "credit exhaustion not treated as a limit: $(M status)"
-rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen"; : > "$MH/.cc/state/model.log"
+[ "$(M status)" = "opus until probe — fable is not available to this account" ] && ok "\"out of usage credits\" on a pane, confirmed by the probe, is a MOVE: fable recorded as not this account's, the box on opus, and status says which" || bad "credit exhaustion read wrong: $(M status)"
+rm -f "$MH/.cc/state/model-override" "$MH/.cc/state/model-seen" "$MH/.cc/state/model-unavailable"; : > "$MH/.cc/state/model.log"
 # the probe's OWN run failed (its budget cap, its turn cap): unknown — never "the model is limited"
 cat > "$T/budgetprobe" <<'F'
 #!/usr/bin/env bash

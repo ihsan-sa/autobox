@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # cc-limit — LLM-free detection of Claude usage/rate limits, and one shared "wait until it resets" stamp.
 #   cc-limit check <claude-json> [<stderr-file>]   prints "LIMIT <epoch>" + exit 0 when that run hit a limit, else exit 1
+#                      (a run refused for usage credits is exit 1 too: one model this account cannot run is not a
+#                      limit — cc-model is told it is unavailable and moves the box off it; see USAGE CREDITS below)
 #   cc-limit status    "usage limit until HH:MMZ (Nm left)" + exit 0 when the stamp binds THIS caller, else
 #                      "clear" + exit 1 (with a note on stderr when a stamp exists that does not bind it)
 #   cc-limit wait      sleep until the stamp expires (exit 0); exit 1 if the wait would exceed CC_LIMIT_MAX_WAIT;
@@ -618,6 +620,36 @@ EOF
   t '…and the run that hit it still finds its own key there' \
     "$(me "$t6" status 2>/dev/null | grep -c 'this run only')" 1
 
+  # USAGE CREDITS ARE NOT A LIMIT (2026-09-03). Every call to Fable on a Pro account answered "Fable 5.1 requires
+  # usage credits" — one model this account cannot run, for good — and the word "credits" in the limit pattern
+  # wrote a box-wide stamp for it. Own fixture: no stamp, no ledger, and the message verbatim.
+  rm -rf "$d/.cc/state/spend"; rm -f "$d/.cc/state/claude-limit" "$d/.cc/state/claude-limit.disbelieved"; : > "$d/calls"; OBS=worker-e
+  printf '{"is_error":true,"stop_reason":"stop_sequence","terminal_reason":"api_error","result":"Fable 5.1 requires usage credits","modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":9},"claude-fable-5-1":{"inputTokens":2}}}\n' > "$d/credits.json"
+  out=$(me "$t6" check "$d/credits.json" 2>/dev/null); rc=$?
+  t 'a model that needs usage credits is not a limit: check says so (exit 1) and prints no LIMIT' "$rc$out" 1
+  t 'and writes no stamp, so nothing else on the box is held by it' "$([ -e "$d/.cc/state/claude-limit" ] && echo yes || echo no)" no
+  t 'and tells cc-model that model is unavailable, in the words the API used' \
+    "$(grep -c '^model unavailable fable Fable 5.1 requires usage credits$' "$d/calls")" 1
+  # the 2026-08-28 wording came with a 429 on it and named no model in its text: the run's own main model is the one,
+  # never the haiku side-call
+  printf '{"is_error":true,"api_error_status":429,"result":"You'"'"'re out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.","modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":9},"claude-fable-5":{"inputTokens":2}}}\n' > "$d/credits2.json"
+  : > "$d/calls"; me "$t6" check "$d/credits2.json" >/dev/null 2>&1; rc=$?
+  t 'out of usage credits (2026-08-28) is the same: no stamp, and the model is the run'"'"'s own, not the side-call' \
+    "$rc$([ -e "$d/.cc/state/claude-limit" ] && echo yes || echo no)$(grep -c "^model unavailable fable You're out of usage credits$" "$d/calls")" 1no1
+  # …while a real limit whose text names no model is still caught, still shared, and names the right family
+  printf '{"is_error":true,"api_error_status":429,"result":"Claude usage limit reached. Your limit resets at %s","modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":9},"claude-opus-5":{"inputTokens":2}}}\n' \
+    "$(date -u -d "@$((t6 + 1800))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/opuslim.json"
+  : > "$d/calls"; out=$(me "$t6" check "$d/opuslim.json" 2>/dev/null); rc=$?
+  t 'a real limit is still a timed stamp' "$rc$out" "0LIMIT $((t6 + 1800))"
+  t 'and it names the model that hit it, not the CLI'"'"'s haiku side-call (the 09-03 stamp named the wrong family)' \
+    "$(cut -f4 "$d/.cc/state/claude-limit")" opus
+  t 'and cc-model is not told anything is unavailable' "$(calls '^model unavailable')" 0
+  printf '{"is_error":true,"result":"Claude usage limit reached · continuing on Fable 5 uses usage credits · resets at %s"}\n' \
+    "$(date -u -d "@$((t6 + 3600))" +%Y-%m-%dT%H:%M:%SZ)" > "$d/both.json"
+  rm -f "$d/.cc/state/claude-limit"; : > "$d/calls"; out=$(me "$t6" check "$d/both.json" 2>/dev/null); rc=$?
+  t 'a limit hit with no credits left to continue on is still a limit: the limit wording wins' \
+    "$rc$out$(calls '^model unavailable')" "0LIMIT $((t6 + 3600))0"
+
   rm -rf "$d"; printf 'cc-limit selfcheck: %d passed, %d failed\n' $((n - bad)) "$bad"; [ "$bad" = 0 ]; }
 
 case "${1:-}" in
@@ -647,11 +679,27 @@ j="${2:?usage: cc-limit check <claude-json> [<stderr-file>]}"; res=""
 res=$(jq -r '[.result?, .error?, .subtype?] | map(select(type == "string")) | join(" ")' "$j" 2>/dev/null)
 { [ "$(jq -r '.is_error // empty' "$j" 2>/dev/null)" = true ] || [ -z "$res" ]; } || exit 1
 txt="$res $(tail -c 4000 "${3:-/dev/null}" 2>/dev/null)"
-grep -qiE 'usage limit|rate limit|rate_limit|429|too many requests|overloaded|resets? (at )?|usage credits|out of credits|insufficient credits' <<<"$txt" || exit 1
-parse_reset "$txt"
-# whose limit was it? the model family named anywhere in the message or the run's json (modelUsage keys carry it)
-newm=$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku)\b' <<<"$txt $(head -c 2000 "$j")" | head -1 | tr 'A-Z' 'a-z')
+# whose limit was it? the model family the message names, else the run's own main model (the modelUsage keys, minus
+# the haiku side-call the CLI runs for titles: read off the json's first 2000 bytes that call came first, and the
+# stamp of 2026-09-03 named haiku for a limit opus had hit)
+newm=$(grep -oiE 'claude-(fable|opus|sonnet|haiku)[a-z0-9._-]*|\b(fable|opus|sonnet|haiku)\b' <<<"$txt" | head -1 | tr 'A-Z' 'a-z')
+[ -n "$newm" ] || newm=$(jq -r '.modelUsage? // {} | keys[]?' "$j" 2>/dev/null | grep -iE 'fable|opus|sonnet' | head -1 | tr 'A-Z' 'a-z')
 case "$newm" in *fable*) newm=fable;; *opus*) newm=opus;; *sonnet*) newm=sonnet;; *haiku*) newm=haiku;; *) newm="";; esac
+# USAGE CREDITS ARE NOT A LIMIT. "Fable 5.1 requires usage credits" (2026-09-03, the account went Pro) and "You're out
+# of usage credits" (2026-08-28) say one model cannot be run on this account: no reset lifts that, and the other
+# models answer. Read as a limit, the first parked the whole box for 14 h on a model nobody else was using. So: no
+# stamp, cc-model records the model as unavailable and moves the box off it, and the caller reads "not a limit"
+# (exit 1) and walks the chain. Real limit wording beside it still wins: a limit hit with no credits left to
+# continue on is a limit.
+LIMIT_RE='usage limit|rate limit|rate_limit|429|too many requests|overloaded|resets? (at )?'
+CREDITS_RE='usage credits|out of credits|insufficient credits'
+if grep -qiE "$CREDITS_RE" <<<"$txt" && ! grep -qiE "$LIMIT_RE" <<<"$txt"; then
+  why=$(jq -r '.result // "" | tostring' "$j" 2>/dev/null | head -1 | sed -E 's/(\. | · ).*//' | head -c 120)
+  [ -n "$newm" ] && [ -x "$BIN/cc-model" ] && "$BIN/cc-model" unavailable "$newm" "$why" >/dev/null 2>&1
+  exit 1
+fi
+grep -qiE "$LIMIT_RE" <<<"$txt" || exit 1
+parse_reset "$txt"
 stamp; same=0; { [ "$first" -gt 0 ] && [ "$ends" -gt $((now - 900)) ]; } && same=1   # still the same limit episode
 [ "$same" = 1 ] || first=$now
 if [ "$u" -le "$now" ]; then   # no time in the message: exponential backoff, remembered in the stamp (5, 10, 20, 40, 60 min)
