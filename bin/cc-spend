@@ -5,16 +5,21 @@ WHY. Spend was only ever visible per run (`runs/*.json`) or per session (`/cost`
 worktree nobody had a window on burned usage invisibly. This reads the one thing that records every call — the
 transcripts under ~/.claude/projects — so it needs no model, no network and no cooperation from what it measures.
 
-THE TICK (`cc-spend tick`, every 5 min from cc-spend.timer). Each transcript is read only from the byte offset the
-last tick left in ~/.cc/state/spend/offsets.json; a file that shrank or whose inode changed is re-read from 0, one
-that vanished is forgotten. Assistant records fold to one row per (session, model, day), appended to
+THE TICK (`cc-spend tick`, every 5 min from cc-spend.timer). Every *.jsonl under ~/.claude/projects, at any depth
+— a subagent writes its own, one level deeper under <session>/subagents/, carrying the parent's sessionId. Each
+transcript is read only from the byte offset the last tick left in ~/.cc/state/spend/offsets.json, keyed by full
+path; a file that shrank or whose inode changed is re-read from 0, one that vanished is forgotten. Assistant
+records fold to one row per (session, model, day), appended to
 ~/.cc/state/spend/<YYYY-MM-DD>.tsv. Rows are dated by the RECORD's timestamp, not the tick's, so the first tick
 backfills every day this box already has instead of piling months of history onto today.
 
 THE ONE TRAP. A single API response is written as MANY assistant records — one per content block, 15 seen on a
 long turn — and every one carries the FULL usage. Summing records triples the bill. Rows dedupe on requestId, and
 offsets.json remembers the last requestId of the previous read, so a response split across a tick boundary is
-counted once and not twice.
+counted once and not twice. The same guard spans FILES: a tick dedupes (session, requestId) across every
+transcript it reads, and a sidechain record in a parent transcript is dropped only when the persisted registry
+of subagent requestIds (offsets.json's sub_rids) shows a subagent file really carries that same requestId —
+otherwise it is counted, because nothing else ever will be.
 
 TOKENS ARE THE TRUTH, USD IS AN ESTIMATE — the CLI says so itself. There is ONE rates table (below), fitted
 against every runs/*.json this box has: it reproduces Claude Code's own modelUsage costUSD to the cent.
@@ -255,25 +260,42 @@ def read_rows(days):
 
 # ---------------------------------------------------------------- the tick
 
-def scan_file(path, prev):
-    """Read one transcript from where the last tick stopped. Returns (rows, newstate) where rows are
-    ((session, model, day) -> totals) and newstate is what to remember about this file."""
+def is_session_transcript(path):
+    """True for a session's own <project>/<session>.jsonl, false for a subagent's, which sits one level
+    deeper under <session>/subagents/."""
+    return os.path.dirname(os.path.dirname(path)) == PROJ
+
+
+def scan_file(path, prev, seen_rids=None, sub_rids=None):
+    """Read one transcript from where the last tick stopped. Returns (rows, newstate, rids) where rows are
+    ((session, model, day) -> totals), newstate is what to remember about this file, and rids is every
+    (session, requestId) an assistant record in the NEW bytes just read carried — whether or not it was
+    counted — so a caller walking a subagent's own file can fold them into the persisted registry of requestIds
+    a subagent transcript actually holds, incrementally, without ever re-reading a byte twice.
+
+    seen_rids, when given, is the tick's set of (session, requestId): a request written into more than one file
+    of the same session is counted once, whichever file the walk reaches first. sub_rids, given only for a
+    session's own <session>.jsonl, is that persisted registry — {session: {requestId, ...}} — and an isSidechain
+    record is dropped only when its OWN requestId is in its OWN session's set, because that is the one case
+    where a subagent's file really holds the same record. Every other isSidechain record — no subagents/
+    directory at all, or one whose files don't carry this requestId — is counted: dropping it on layout alone,
+    as before, just lost the tokens."""
     stt = os.stat(path)
     start = int(prev.get("off") or 0)
     if stt.st_ino != prev.get("ino") or stt.st_size < start:
         start, prev = 0, {}                    # truncated, replaced, or never seen: the offset means nothing
     state = {"off": start, "ino": stt.st_ino, "rid": prev.get("rid", "")}
     if stt.st_size <= start:
-        return {}, state
+        return {}, state, set()
     with open(path, "rb") as f:
         f.seek(start)
         blob = f.read()
     cut = blob.rfind(b"\n")
     if cut < 0:                                # a record still being written: leave the whole thing for next tick
-        return {}, state
+        return {}, state, set()
     state["off"] = start + cut + 1
     seen = {state["rid"]} if state["rid"] else set()
-    agg = {}
+    agg, rids = {}, set()
     for line in blob[:cut + 1].decode("utf-8", "replace").splitlines():
         if '"assistant"' not in line:
             continue
@@ -286,11 +308,20 @@ def scan_file(path, prev):
         msg = rec.get("message") or {}
         u = msg.get("usage") or {}
         rid = rec.get("requestId") or msg.get("id") or ""
+        sid = rec.get("sessionId") or os.path.basename(path)[:-6]
         if rid:
             state["rid"] = rid                 # remembered even when skipped: it is still the last one read
+            rids.add((sid, rid))
+        if rec.get("isSidechain") and sub_rids is not None and rid in (sub_rids.get(sid) or ()):
+            continue                           # a subagent file really holds this record; count it there instead
+        if rid:
             if rid in seen:
                 continue
             seen.add(rid)
+            if seen_rids is not None:
+                if (sid, rid) in seen_rids:
+                    continue                   # already counted from another file of this same session
+                seen_rids.add((sid, rid))
         model = msg.get("model") or "-"
         tok = [int(u.get(k) or 0) for k in
                ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
@@ -298,7 +329,6 @@ def scan_file(path, prev):
             continue
         ts = parse_ts(rec.get("timestamp")) or datetime.fromtimestamp(stt.st_mtime, timezone.utc)
         cwd = rec.get("cwd") or "-"
-        sid = rec.get("sessionId") or os.path.basename(path)[:-6]
         key = (sid, model, iso(ts)[:10])
         a = agg.setdefault(key, {"ts": ts, "cwd": cwd, "kind": kind_of(rec, cwd), "tok": [0, 0, 0, 0], "usd": 0.0})
         a["ts"] = max(a["ts"], ts)
@@ -306,7 +336,7 @@ def scan_file(path, prev):
         for i in range(4):
             a["tok"][i] += tok[i]
         a["usd"] += usd(model, u, (u.get("speed") == "fast")) or 0.0
-    return agg, state
+    return agg, state, rids
 
 
 def proc_snapshot():
@@ -360,14 +390,39 @@ def tick():
     stamp = now()
     off = load_offsets()
     files = off.get("files") or {}
+    sub_rids = {sid: set(rids) for sid, rids in (off.get("sub_rids") or {}).items()}   # {session: {requestId}}
     rows, grew, seen_files = [], {}, set()
-    for path in sorted(glob.glob(os.path.join(PROJ, "*", "*.jsonl"))):
+    seen_rids = set()                          # (session, requestId) across every file this tick reads
+    # Recursive: a SUBAGENT writes its own transcript one level deeper, <project>/<session>/subagents/*.jsonl.
+    # A one-level glob missed those, and most of a busy hour's spend now runs in subagents.
+    # The two layouts do not overlap on this box, measured 2026-09-04 on Claude Code 2.1.261: of 1219 parent
+    # transcripts under ~/.claude/projects not one holds an isSidechain record, and for the live session
+    # 94a32efb (438 assistant records with usage, all isSidechain false) its 20 subagent files carry 477
+    # distinct requestIds, 0 of them also in the parent. The cross-file requestId set below costs nothing today
+    # and keeps the count right if a version writes the same record in both places — but a parent's own
+    # isSidechain record is real spend the day it has no subagent file to answer for it, so it is dropped only
+    # when sub_rids proves a copy of THAT requestId actually exists, never on layout alone. sub_rids is built
+    # from every subagent file's OWN scan (never a separate whole-file read) and kept in offsets.json, keyed by
+    # session so a prune is one dict delete, so a subagent transcript read in an earlier tick still answers for
+    # a sidechain copy the parent writes later — and subagent files are walked before session transcripts below
+    # so a same-tick pair is caught too. Pruned below once a session's subagents/ files are gone from the walk:
+    # kept forever this would be hundreds of thousands of pairs, most of them sessions long done.
+    paths = sorted(glob.glob(os.path.join(PROJ, "**", "*.jsonl"), recursive=True),
+                   key=lambda p: (is_session_transcript(p), p))
+    live_sub_sessions = set()                  # sessions this walk still finds a subagents/ file under
+    for path in paths:
         seen_files.add(path)
+        is_parent = is_session_transcript(path)
         try:
-            agg, state = scan_file(path, files.get(path) or {})
+            agg, state, rids = scan_file(path, files.get(path) or {}, seen_rids,
+                                         sub_rids=sub_rids if is_parent else None)
         except OSError:
             continue                           # deleted or unreadable mid-walk: the next tick picks it up
         files[path] = state
+        if not is_parent:
+            live_sub_sessions.add(os.path.basename(os.path.dirname(os.path.dirname(path))))
+            for s, r in rids:                  # this subagent file's newly-read requestIds, folded in for the
+                sub_rids.setdefault(s, set()).add(r)  # rest of this tick and every one after
         for (sid, model, _day), a in agg.items():
             i, o, cr, cw = a["tok"]
             repo, track = place(a["cwd"])
@@ -381,13 +436,16 @@ def tick():
                 g["ts"] = max(g["ts"], iso(a["ts"]))
     for gone in set(files) - seen_files:       # a transcript that vanished takes its offset with it
         del files[gone]
+    for done in set(sub_rids) - live_sub_sessions:   # its subagents/ files are gone from this walk too — a
+        del sub_rids[done]                           # prune of the registry, not of anything already counted
     rows.sort()
     # Rows first, offsets second: a crash between them re-reads and duplicates a tick's rows, where the other
     # order would lose them outright. Over-counting once is visible and fixable; a hole in the ledger is not.
     append_rows(rows)
     procs = proc_snapshot()
     save_tsv(PROCS, PCOLS, [[iso(stamp)] + [p[c] for c in PCOLS[1:]] for p in procs])
-    save_json(OFF, {"tick": iso(stamp), "files": files, "grew": grew})
+    save_json(OFF, {"tick": iso(stamp), "files": files, "grew": grew,
+                    "sub_rids": {sid: sorted(rids) for sid, rids in sub_rids.items()}})
     # …and the phantom list, last: it reads procs.tsv and the rows this tick just appended, so it must run after
     # both are on disk. A reader of the file gets the same answer `cc-spend phantoms` would give.
     ph = phantom_now(grew, stamp)
@@ -951,6 +1009,110 @@ def selfcheck():
                said2.returncode == 0 and "s9sessio" in said2.stdout and "unwatched" in said2.stdout)
         finally:
             shutil.rmtree(th2, ignore_errors=True)
+        # A SUBAGENT's transcript sits one level deeper, <project>/<session>/subagents/*.jsonl, and carries the
+        # PARENT's sessionId and a real cwd — so it lands on the parent's session and the parent's lane. The
+        # one-level glob this replaced never saw those files at all.
+        th4 = tempfile.mkdtemp(prefix="ccspend-sub-")
+        try:
+            cwd4 = os.path.join(th4, ".cc", "worktrees", "r", "t4")
+            proj4 = os.path.join(th4, ".claude", "projects", "-p4")
+            sub4 = os.path.join(proj4, "s4", "subagents")
+            os.makedirs(sub4)
+
+            def rec4(rid, out_tok):
+                return json.dumps({"type": "assistant", "requestId": rid, "cwd": cwd4, "sessionId": "s4",
+                                   "timestamp": "2026-09-01T10:00:00.000Z", "entrypoint": "sdk-cli",
+                                   "message": {"model": "claude-opus-5", "id": "m_" + rid,
+                                               "usage": {"input_tokens": 0, "output_tokens": out_tok,
+                                                         "cache_read_input_tokens": 0,
+                                                         "cache_creation_input_tokens": 0}}}) + "\n"
+
+            open(os.path.join(proj4, "s4.jsonl"), "w").write(rec4("req_top", 11))
+            open(os.path.join(sub4, "agent-a1.jsonl"), "w").write(rec4("req_sub", 22))
+            env4 = {**os.environ, "HOME": th4}
+            day4 = os.path.join(th4, ".cc", "state", "spend", "2026-09-01.tsv")
+            r4 = subprocess.run([sys.executable, me, "tick"], env=env4, capture_output=True, text=True)
+            rows4 = [ln.split("\t") for ln in open(day4) if not ln.startswith("#")]
+            ok("a subagent's transcript, one level deeper, is counted — and against the parent's session and lane",
+               r4.returncode == 0 and sum(int(x[8]) for x in rows4) == 33
+               and {(x[1], x[3], x[4]) for x in rows4} == {("s4", "r", "t4")})
+            files4 = json.load(open(os.path.join(th4, ".cc", "state", "spend", "offsets.json")))["files"]
+            subprocess.run([sys.executable, me, "tick"], env=env4, capture_output=True, text=True)
+            ok("…once: offsets are keyed by full path, so neither file is read twice by a glob that now overlaps",
+               len(files4) == 2 and len(open(day4).read().splitlines()) == len(rows4) + 1)
+        finally:
+            shutil.rmtree(th4, ignore_errors=True)
+        # …and the same record reached twice is still counted once — but a record found only in a parent is
+        # never just discarded. s5 has the SAME requestId in its parent and its subagent file (neither marked
+        # isSidechain — the plain cross-file dedupe). s6 has a sidechain record with NO subagents/ directory
+        # at all: nothing else will ever hold it, so it counts. s7 proves the requestId match itself, not a
+        # weaker stand-in for it: its subagent file arrives a TICK BEFORE the parent (so only a persisted
+        # registry, not this tick's own bookkeeping, can catch the duplicate), the two copies carry different
+        # cwd/model (so a coincidence of matching metadata proves nothing), and s7 ALSO has a second sidechain
+        # record no subagent file anywhere carries — proving the drop reads requestIds, not "a subagents/
+        # directory exists for this session".
+        th5 = tempfile.mkdtemp(prefix="ccspend-dup-")
+        try:
+            cwd5 = os.path.join(th5, ".cc", "worktrees", "r", "t5")
+            cwd7sub = os.path.join(th5, ".cc", "worktrees", "r", "t7-sub")
+            proj5 = os.path.join(th5, ".claude", "projects", "-p5")
+            proj6 = os.path.join(th5, ".claude", "projects", "-p6")
+            proj7 = os.path.join(th5, ".claude", "projects", "-p7")
+            os.makedirs(os.path.join(proj5, "s5", "subagents"))
+            os.makedirs(proj6)
+            os.makedirs(os.path.join(proj7, "s7", "subagents"))
+
+            def rec5(sid, rid, out_tok, side=False, cwd=cwd5, model="claude-opus-5"):
+                r = {"type": "assistant", "requestId": rid, "cwd": cwd, "sessionId": sid,
+                     "timestamp": "2026-09-01T10:00:00.000Z", "entrypoint": "sdk-cli",
+                     "message": {"model": model, "id": "m_" + rid,
+                                 "usage": {"input_tokens": 0, "output_tokens": out_tok,
+                                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}
+                if side:
+                    r["isSidechain"] = True
+                return json.dumps(r) + "\n"
+
+            open(os.path.join(proj5, "s5.jsonl"), "w").write(rec5("s5", "req_dup", 11))
+            open(os.path.join(proj5, "s5", "subagents", "agent-b1.jsonl"), "w").write(
+                rec5("s5", "req_dup", 11, side=True))
+            open(os.path.join(proj6, "s6.jsonl"), "w").write(
+                rec5("s6", "req_own", 5) + rec5("s6", "req_side", 100, side=True))
+            # s7's subagent file exists a tick before its parent does — a real timing this box already sees
+            # (subagent writes flush as their turns finish; the parent transcript is written after).
+            open(os.path.join(proj7, "s7", "subagents", "agent-c1.jsonl"), "w").write(
+                rec5("s7", "req_both", 50, cwd=cwd7sub, model="claude-sonnet-5"))
+            env5 = {**os.environ, "HOME": th5}
+            r5 = subprocess.run([sys.executable, me, "tick"], env=env5, capture_output=True, text=True)
+            rows5 = [ln.split("\t") for ln in
+                     open(os.path.join(th5, ".cc", "state", "spend", "2026-09-01.tsv")) if not ln.startswith("#")]
+            out5 = {sid: sum(int(x[8]) for x in rows5 if x[1] == sid) for sid in ("s5", "s6")}
+            ok("one requestId written into both a session's parent and its subagent transcript is counted "
+               "once, not twice", r5.returncode == 0 and out5["s5"] == 11)
+            ok("…and a sidechain record in a parent transcript with no subagents/ directory at all is counted "
+               "— nothing else will ever hold that request", out5["s6"] == 105)
+            # Now s7's parent arrives: req_both (isSidechain, matches the subagent file already on disk from
+            # the tick above) must be dropped; req_only (isSidechain, no subagent file anywhere carries it,
+            # even though s7 has one for a different request) must not be.
+            open(os.path.join(proj7, "s7.jsonl"), "w").write(
+                rec5("s7", "req_own7", 7) + rec5("s7", "req_both", 50, side=True)
+                + rec5("s7", "req_only", 33, side=True))
+            r5b = subprocess.run([sys.executable, me, "tick"], env=env5, capture_output=True, text=True)
+            rows5b = [ln.split("\t") for ln in
+                      open(os.path.join(th5, ".cc", "state", "spend", "2026-09-01.tsv")) if not ln.startswith("#")]
+            out7 = sum(int(x[8]) for x in rows5b if x[1] == "s7")
+            ok("…a sidechain record is dropped only when a subagent file — read in an earlier tick, under a "
+               "different cwd and model — really carries its requestId: 7 + 50 + 33 = 90, not 140 from "
+               "counting req_both twice nor 57 from dropping req_only too on directory presence alone",
+               r5b.returncode == 0 and out7 == 90)
+            # The registry doesn't just grow: a finished session's requestIds leave it once its subagents/
+            # files are gone from the walk, not kept forever against every session this box has ever run.
+            shutil.rmtree(os.path.join(proj7, "s7", "subagents"))
+            r5c = subprocess.run([sys.executable, me, "tick"], env=env5, capture_output=True, text=True)
+            off5 = json.load(open(os.path.join(th5, ".cc", "state", "spend", "offsets.json")))
+            ok("a finished session's requestIds leave the persisted registry once its subagents/ files are "
+               "gone from the walk", r5c.returncode == 0 and "s7" not in (off5.get("sub_rids") or {}))
+        finally:
+            shutil.rmtree(th5, ignore_errors=True)
         # ---- `today`: the per-repo figure a daily ceiling reads. Its OWN fixture HOME and its own ledger
         # rows, written here rather than inherited from the tick cases above.
         th3 = tempfile.mkdtemp(prefix="ccspend-today-")
