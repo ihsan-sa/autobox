@@ -27,12 +27,15 @@ THE RESOLVER IS A READING TOO (2026-09-01). Two GitHub failures that morning ("C
 row also carries one lookup of github.com and slack.com through the SYSTEM resolver — getent, the nsswitch path git
 and curl take — under a hard 2 s timeout, and #alerts hears about a FLIP only: down once, then back once with the
 outage length, never a line a minute while it stays down. Resolver config and the network are never touched here.
+Down waits for the SAME host to miss on a SECOND tick in a row (2026-09-04): one tick over 2 s was alerting nineteen
+times a day, and every one of them was a slow lookup that answered the next minute — the latency tail, not an outage.
 
 THE MAIN CHECKOUT IS A READING TOO (2026-09-01, later that day). ~/bin symlinks into the control repo's main
 checkout, so what is on disk there IS the live cc layer — and at 09:38Z two of its binaries were overwritten with an
 unreviewed PR head and nothing noticed for 2.5 h. So each row also asks git, READ-ONLY, whether that checkout is a
 clean origin/<default> or behind it: tracked files modified, a branch that is not the default, or commits ahead of
-origin all count; an untracked file (a session's .claude/) and being behind (a pull pending) do not. Same flip rule.
+origin all count; an untracked file (a session's .claude/) and being behind (a pull pending) do not. Same flip rule,
+without the second tick: a checkout has no latency tail.
 
 THE RENDERER WAS A SEAM AND NO LONGER IS (checked 2026-09-02). Nothing here could draw a PNG when this was
 written, so render_png() was one function that raised and render_text() — block sparklines, no dependencies —
@@ -71,7 +74,7 @@ KEEP_DAYS = 3        # 24 h of chart from ~290 KB/day of jsonl; a spare day cove
 STALE = 300          # a current.* older than this is not "current" and the tab must say so
 TJMAX = 100.0        # the throttle denominator when a zone declares no usable passive/hot trip
 HOSTS = ("github.com", "slack.com")   # what the box cannot work without: git/gh, and the Slack API
-DNS_TIMEOUT = 2.0    # a lookup slower than this IS the outage, for git and curl alike
+DNS_TIMEOUT = 2.0    # one lookup slower than this is a miss; the same host missing twice running is the outage (dns_flip)
 GETENT = os.environ.get("CC_VITALS_GETENT") or "getent"   # the system resolver; selfcheck points this at a stub
 BIN = os.path.dirname(os.path.realpath(__file__))
 GIT = os.environ.get("CC_VITALS_GIT") or "git"      # selfcheck points this at a stub for the hang case
@@ -293,21 +296,35 @@ def _save(name, state):
 
 def dns_flip(reading, now=None):
     """This tick against the last one ON DISK: the one line #alerts should hear, or None. Down is any host
-    unresolved; back is all of them answering."""
+    unresolved; back is all of them answering. Down is the SAME host missing on two ticks in a row before anyone
+    hears it — one miss is a slow lookup, remembered so the outage is timed from it, not announced; two different
+    hosts missing on adjacent ticks are two slow lookups, and the clock restarts (review of #221)."""
     now = now or time.time()
     prev = _state("dns.json")
     down = sorted(h for h, ms in reading.items() if ms is None)
     since, line = prev.get("since"), None
+    # `told` came with the two-tick rule. State the previous binary wrote has no such key, and that binary announced
+    # on its first tick — so an absent key beside a `since` reads as announced: no duplicate "down", no swallowed "back".
+    told = prev.get("told", bool(since))
+    last = prev.get("hosts") or []   # before it is told: the hosts missing on the LAST tick; after: every host seen out
     if down and not since:
-        state = {"since": now, "hosts": down}
-        line = f"dns down: {', '.join(down)} unresolved ({DNS_TIMEOUT:g} s timeout)"
+        state = {"since": now, "hosts": down, "told": False}                  # first miss: remembered, not yet said
+    elif down and not told:
+        again = sorted(set(last) & set(down))
+        if again:
+            state = {"since": since, "hosts": sorted(set(last) | set(down)), "told": True}   # the same host, twice running
+            line = f"dns down: {', '.join(again)} unresolved ({DNS_TIMEOUT:g} s timeout)"
+        else:
+            state = {"since": now, "hosts": down, "told": False}              # a different host: two slow lookups, not one outage
     elif down:
-        state = dict(prev, hosts=sorted(set(prev.get("hosts") or []) | set(down)))   # still down: say nothing
-    elif since:
+        state = dict(prev, hosts=sorted(set(last) | set(down)), told=True)   # still down: say nothing, remember every host
+    elif told:
         state = {}
-        line = f"dns back after {max(1, round((now - since) / 60))} min ({', '.join(prev.get('hosts') or [])})"
+        line = f"dns back after {max(1, round((now - since) / 60))} min ({', '.join(last)})"
+    elif since:
+        state = {}                                # one miss, then answers: nothing was said, nothing to take back
     else:
-        return None                                              # up, was up: the normal minute
+        return None                               # up, was up: the normal minute
     if state != prev:
         _save("dns.json", state)
     return line
@@ -360,7 +377,7 @@ def wrong(reading):
 
 
 def checkout_flip(reading, now=None):
-    """The resolver's flip rule, on the checkout: one line when it stops being a clean origin/<default>, one when
+    """The resolver's flip rule, on the checkout (minus its second-tick wait): one line when it stops being a clean origin/<default>, one when
     it is again, silence in between — and silence while it cannot be read: an unknown is not a fact, and must
     not close an open fault."""
     if reading is None:
@@ -932,12 +949,14 @@ def selfcheck():
             globals()["GETENT"] = stub('[ "$2" = github.com ] && exit 2; exit 0')
             r = dns()
             check("a failed lookup is None, not a number", r["github.com"] is None and r["slack.com"] is not None)
-            check("the first failed lookup is the DOWN flip, naming the host that failed",
-                  watch({"dns": r}) and len(said) == 1 and "down" in said[0] and "github.com" in said[0]
-                  and "slack.com" not in said[0])
+            check("ONE down tick is a slow lookup, not an outage: remembered on disk, nothing said",
+                  not watch({"dns": r}) and not said and json.loads(_read(f"{tmp}/dns.json")).get("since"))
             globals()["GETENT"] = stub("exit 2")
             r = dns()
-            check("still down, now both hosts: NO repeat — an outage is one line, not one a minute",
+            check("the SAME host missing on the SECOND tick in a row is the DOWN flip, and it names that host only",
+                  watch({"dns": r}) and len(said) == 1 and "down" in said[0]
+                  and "github.com" in said[0] and "slack.com" not in said[0])
+            check("still down: NO repeat — an outage is one line, not one a minute",
                   dns_flip(r, now=time.time() + 60) is None and dns_flip(r, now=time.time() + 120) is None
                   and not watch({"dns": r}) and len(said) == 1)
             globals()["GETENT"] = stub("sleep 5")
@@ -951,6 +970,26 @@ def selfcheck():
                   bool(up) and "back after 4 min" in up and "github.com, slack.com" in up)
             check("...and the state is cleared, so the next blip is a new outage, not a repeat",
                   dns_flip(r) is None and json.loads(_read(f"{tmp}/dns.json")) == {})
+            globals()["GETENT"] = stub('[ "$2" = slack.com ] && exit 2; exit 0')
+            check("a lone slow tick, the kind there were nineteen of a day: still nothing said",
+                  not watch({"dns": dns()}) and len(said) == 1)
+            globals()["GETENT"] = stub("exit 0")
+            check("...and it clears itself quietly: no 'back' for an outage nobody was told about",
+                  not watch({"dns": dns()}) and len(said) == 1
+                  and json.loads(_read(f"{tmp}/dns.json")) == {})
+            # two misses on adjacent ticks, a DIFFERENT host each time, are two slow lookups (review of #221)
+            globals()["GETENT"] = stub('[ "$2" = github.com ] && exit 2; exit 0'); watch({"dns": dns()})
+            globals()["GETENT"] = stub('[ "$2" = slack.com ] && exit 2; exit 0')
+            check("a different host missing on the next tick is not an outage either: nothing said, the clock restarts",
+                  not watch({"dns": dns()}) and len(said) == 1
+                  and json.loads(_read(f"{tmp}/dns.json")).get("hosts") == ["slack.com"])
+            globals()["GETENT"] = stub("exit 0"); watch({"dns": dns()})
+            # state the previous binary wrote mid-outage has no `told`: it HAD announced, so the recovery is still said
+            _save("dns.json", {"since": time.time() - 300, "hosts": ["github.com"]})
+            up = dns_flip(dns())
+            check("state from before this rule (no `told`) reads as announced: the UP flip is still said, once",
+                  bool(up) and "back after 5 min" in up and "github.com" in up
+                  and json.loads(_read(f"{tmp}/dns.json")) == {})
         finally:
             globals()["GETENT"], globals()["alert"] = live_getent, live_alert
         # the door itself: cc-notify told to log and not push, and a _selfcheck marker its own gate stops anyway
