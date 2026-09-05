@@ -5,14 +5,29 @@
 # cc-land queue all skip it on their next tick. Nothing is lost: worktrees, journals, board rows, open PRs and
 # Slack messages queued for its session are all still there when it is resumed.
 #
-#   cc-pause on <repo> [--by <who>] [--note <text>]   park it; prints what it stopped
-#   cc-pause off <repo>                               unpark it; prints what it started again
+#   cc-pause on <repo> [--by <who>] [--note <text>] [--from <chat>]   park it; prints what it stopped
+#   cc-pause off <repo> [--from <chat>]               unpark it; prints what it started again
 #   cc-pause is <target>                              exit 0 when paused — THE check every spender makes.
 #                                                     Lenient: `myrepo`, `myrepo/track` and `myrepo@alias` all
 #                                                     ask about the project `myrepo`, so no caller re-derives it.
 #   cc-pause status [<repo>]                          one line per paused project, or just this one
 #   cc-pause list                                     paused repo names, one per line (nothing when none are)
-#   cc-pause selfcheck                                pause, resume and the reboot case
+#   cc-pause children <repo>                          every project declared under it, one per line
+#   cc-pause selfcheck                                pause, resume, the reboot case and the cascade
+#
+# WHAT IS UNDER IT GOES WITH IT (owner, 2026-09-05, after a parked project's tool repository kept spending).
+# CC_PROJECT_CHILDREN in ~/.cc/config declares which project is under which, and nothing else decides it:
+# whitespace-separated `parent:child` entries, a parent's children optionally one comma-separated list —
+# `big:tool big:docs` or `big:tool,docs`. Pausing a parent pauses each child, and each child's children;
+# resuming it resumes them. NAMES ARE NOT THE RELATION: `big-tool` is a project of its own unless it is
+# declared, which is the whole reason there is a declaration.
+# A CHILD PAUSED ON ITS OWN KEEPS ITS PAUSE when the parent resumes. The flag records `via` — the parent whose
+# pause parked it — and only a pause carrying that name is lifted with that parent's.
+# EVERY CHANNEL THAT WENT QUIET IS TOLD, one line naming the channel whose pause did it: the project's
+# `-updates` lane, its `#<repo>--<track>` channels, its sub-orch channels, and every channel of every child.
+# The one channel skipped is `--from <chat>`, whichever channel the command was typed in — that one already has
+# this command's own answer. `#<repo>` itself hears it too when the command came from anywhere else — a DM or
+# the CLI still needs telling.
 #
 # PER PROJECT, NEVER BOX-WIDE. `on` takes one repo that has a ~/dev/<repo> directory and refuses everything else —
 # `box`, a `repo/track`, a name with a slash in it. Every other project keeps running.
@@ -75,10 +90,114 @@ redispatch_cmd(){   # loop argv on stdin, one word per line → the `cc … --go
        END{printf "%s %s --go \"\"%s\n", repo, track, opt}'
 }
 
+# ---- what is under what, and telling the channels ---------------------------------------------------------
+# THE RELATION IS DECLARED, NEVER INFERRED. One config key, read through cc-config so it is a string and not code.
+children_of(){   # a parent → its declared children, one per line
+  local p="${1:-}" e k v c; local -a ents
+  [ -n "$p" ] || return 0
+  read -r -a ents <<<"$("$B/cc-config" get CC_PROJECT_CHILDREN 2>/dev/null)"
+  for e in ${ents[@]+"${ents[@]}"}; do
+    case "$e" in *:*) ;; *) continue;; esac          # no colon: not a pair, and not this parent's business
+    k="${e%%:*}"; v="${e#*:}"
+    [ "$k" = "$p" ] || continue
+    while IFS= read -r c; do [ -n "$c" ] && echo "$c"; done < <(tr ',' '\n' <<<"$v")
+  done
+}
+
+# A declaration that loops back (`a:b b:a`) or names the same child under two parents must not walk forever.
+SEEN=" "
+first_visit(){ case "$SEEN" in *" $1 "*) return 1;; esac; SEEN="$SEEN$1 "; return 0; }
+
+# Every project under this one, each once. `cc-pause children <repo>` is how another tool asks — cc-slack's
+# resume hands over what was said to each of them while they were parked, and only this file knows who they are.
+descendants(){
+  local c
+  while read -r c; do
+    [ -n "$c" ] || continue
+    first_visit "$c" || continue
+    echo "$c"
+    descendants "$c"
+  done < <(children_of "$1")
+}
+
+# ONE LINE, IN EVERY CHANNEL THAT WENT QUIET. A track's channel, a sub-orch's, and every channel of a project
+# declared under this one never saw the `!pause`; without this the next person to type in one gets silence.
+# cc-slack owns which channels a project has — the naming, the routes and the orch table are all its business.
+# EVERY CALL IS SHORT AND EVERY MISS IS SAID OUT LOUD. cc-slack's `!pause` kills this command at 120 s, so a
+# parent and a child both waiting on Slack could time the whole pause out half-announced; 15 s a call keeps the
+# worst case inside that. And a notice Slack refused is a channel that went quiet with nobody told — reporting
+# the pause as done without saying so is the same silence this whole line exists to prevent.
+announce(){   # $1 project whose channels are told · $2 project whose pause did it · $3 on|off · $4 chat id to skip
+  local repo="$1" origin="$2" verb="$3" skip="${4:-}" cid name text list rc miss=0 tried=0
+  [ -x "$B/cc-slack" ] || return 0
+  if [ "$verb" = on ]; then text="⏸ Paused with #$origin — nothing here spends until #$origin is resumed."
+  else text="▶️ Resumed with #$origin."; fi
+  list=$(timeout 15 "$B/cc-slack" channels --for "$repo" 2>/dev/null); rc=$?
+  [ "$rc" = 1 ] && return 0                          # no Slack configured here: there are no channels to tell
+  [ "$rc" = 0 ] || { echo "  could not ask which channels $repo has (cc-slack exit $rc) — none of them was told."; return 0; }
+  while read -r cid name; do
+    [ -n "$cid" ] || continue
+    # `<id> #<name>` and nothing else is a channel; a Slack channel id here is `[CG]`, same as the rest of the
+    # repo (cc-slack re.fullmatch [CG][A-Z0-9]+) — project channels are private, which is a `G`. A line that is
+    # not even this shape still counts as a miss: it is one more channel this loop could not tell.
+    case "$cid$name" in
+      [CG]*\#*) ;;
+      *) tried=$((tried + 1)); miss=$((miss + 1)); continue;;
+    esac
+    [ "$cid" = "$skip" ] && continue
+    tried=$((tried + 1))
+    timeout 15 "$B/cc-slack" post -c "$cid" "$text" >/dev/null 2>&1 || miss=$((miss + 1))
+  done <<<"$list"
+  [ "$miss" -gt 0 ] && echo "  $miss of $tried channel(s) of $repo were NOT told — Slack did not take the notice."
+  return 0
+}
+
+# The cascade itself. Each child is parked by a FRESH `cc-pause on` carrying `--via <parent>`, so a child gets
+# exactly the pause a person's would be — its worker loops stopped and recorded — and only the walk lives here.
+cascade_on(){   # $1 parent · $2 the project whose pause did it · $3 chat id the command was typed in
+  local parent="$1" origin="$2" from="${3:-}" c msg
+  while read -r c; do
+    [ -n "$c" ] || continue
+    first_visit "$c" || continue
+    if ! msg=$(valid_repo "$c"); then echo "  declared under $parent but not parked: $msg"; continue; fi
+    if paused "$c"; then
+      echo "  $c was already paused — left as it is."
+    elif "$B/cc-pause" on "$c" --via "$parent" >/dev/null 2>&1; then
+      echo "  $c paused too — it is declared under $parent."
+      announce "$c" "$origin" on "$from"   # `!pause` typed in a CHILD's channel: that one has the answer already
+    else
+      echo "  could not pause $c, declared under $parent"
+    fi
+    cascade_on "$c" "$origin" "$from"
+  done < <(children_of "$parent")
+}
+
+cascade_off(){   # $1 parent · $2 the project whose pause did it · $3 chat id the command was typed in
+  local parent="$1" origin="$2" from="${3:-}" c v
+  while read -r c; do
+    [ -n "$c" ] || continue
+    first_visit "$c" || continue
+    if paused "$c"; then
+      v=$(jq -r '.via // ""' "$(flag "$c")" 2>/dev/null)
+      # A CHILD PAUSED ON ITS OWN IS NOT THE PARENT'S TO RESUME, and neither is anything under it: whoever
+      # parked this one meant it, and lifting it here would restart spending he stopped by hand.
+      [ "$v" = "$parent" ] || { echo "  $c stays paused — that pause is its own, not $parent's."; continue; }
+      if "$B/cc-pause" off "$c" --via "$parent" >/dev/null 2>&1; then
+        echo "  $c resumed too."
+        announce "$c" "$origin" off "$from"
+      else
+        echo "  could not resume $c, declared under $parent"
+      fi
+    fi
+    cascade_off "$c" "$origin" "$from"
+  done < <(children_of "$parent")
+}
+
 cmd_on(){
-  local repo="" by="" note="" msg
+  local repo="" by="" note="" via="" from="" msg
   while [ $# -gt 0 ]; do case "$1" in
     --by) by="${2:-}"; shift 2;; --note) note="${2:-}"; shift 2;;
+    --via) via="${2:-}"; shift 2;; --from) from="${2:-}"; shift 2;;
     -*) die "unknown option $1";; *) [ -n "$repo" ] && die "one repo at a time"; repo="$1"; shift;;
   esac; done
   msg=$(valid_repo "$repo") || die "$msg"
@@ -100,9 +219,13 @@ cmd_on(){
   if [ -n "$already" ]; then
     [ -n "$by" ]   || by=$(jq -r '.by // ""' "$f" 2>/dev/null)
     [ -n "$note" ] || note=$(jq -r '.note // ""' "$f" 2>/dev/null)
+    # WHOSE PAUSE THIS IS survives a second `on` in one direction only. A cascade must not overwrite what is
+    # already here — a pause of its own stays its own, so the parent's resume leaves it. A pause named directly
+    # DOES clear it: the person asking for this project by name has made the pause his, not the parent's.
+    [ -n "$via" ] && via=$(jq -r '.via // ""' "$f" 2>/dev/null)
   fi
-  jq -n --arg at "${already:-$(now)}" --arg by "$by" --arg note "$note" --argjson loops "$loops" \
-     '{at:$at, by:$by, note:$note, loops:$loops}' > "$f" || die "could not write $f"
+  jq -n --arg at "${already:-$(now)}" --arg by "$by" --arg note "$note" --arg via "$via" --argjson loops "$loops" \
+     '{at:$at, by:$by, note:$note, via:$via, loops:$loops}' > "$f" || die "could not write $f"
 
   for pid in $(loop_pids "$repo"); do kill -TERM "$pid" 2>/dev/null; done   # cc-loop's own trap kills its claude and stands down
 
@@ -110,22 +233,51 @@ cmd_on(){
   if [ -n "$already" ]; then echo "$repo was already paused (since $already)."
   else echo "$repo paused.$([ "$n" -gt 0 ] && echo " Stopped $n worker loop$([ "$n" = 1 ] || echo s) (${tracks[*]})." )"; fi
   echo "Skipping until resume: $SKIPPERS."
+  # ONLY A PAUSE SOMEBODY ASKED FOR CASCADES. The recursive calls carry --via, so they park their own project
+  # and stop; the walk belongs to the one invocation at the top of it. A SECOND `!pause` on a project that is
+  # already parked tells nobody again — its channels went quiet the first time, and a notice repeated on every
+  # retry is how a useful line becomes one people scroll past. The cascade still runs: a child that is not
+  # parked yet is exactly what a second `!pause` is for.
+  if [ -z "$via" ]; then
+    first_visit "$repo"
+    [ -n "$already" ] || announce "$repo" "$repo" on "$from"
+    cascade_on "$repo" "$repo" "$from"
+  fi
   echo "Nothing lost — \`cc-pause off $repo\` puts it back, worker loops included."
 }
 
 cmd_off(){
-  local repo="${1:-}" msg; msg=$(valid_repo "$repo") || die "$msg"
+  local repo="" via="" from="" msg
+  while [ $# -gt 0 ]; do case "$1" in
+    --via) via="${2:-}"; shift 2;; --from) from="${2:-}"; shift 2;;
+    -*) die "unknown option $1";; *) [ -n "$repo" ] && die "one repo at a time"; repo="$1"; shift;;
+  esac; done
+  msg=$(valid_repo "$repo") || die "$msg"
   local f; f=$(flag "$repo")
-  paused "$repo" || { echo "$repo is not paused."; return 0; }
-  mapfile -t cmds < <(jq -r '.loops[]? // empty' "$f" 2>/dev/null)
-  local since; since=$(jq -r '.at // ""' "$f" 2>/dev/null)
-  rm -f "$f"   # the flag goes before the re-dispatch: cc-loop's own pre-flight would refuse a worker for a repo still paused
-  local started=0 failed=()
-  for c in "${cmds[@]}"; do
-    [ -n "$c" ] || continue
-    if eval "\"$B/cc\" $c" >/dev/null 2>&1; then started=$((started+1)); else failed+=("cc $c"); fi
-  done
-  echo "$repo resumed${since:+ (paused since $since)}.$([ "$started" -gt 0 ] && echo " Restarted $started worker loop$([ "$started" = 1 ] || echo s).")"
+  local was_paused=0 started=0 since="" failed=()
+  if paused "$repo"; then
+    was_paused=1
+    mapfile -t cmds < <(jq -r '.loops[]? // empty' "$f" 2>/dev/null)
+    since=$(jq -r '.at // ""' "$f" 2>/dev/null)
+    rm -f "$f"   # the flag goes before the re-dispatch: cc-loop's own pre-flight would refuse a worker for a repo still paused
+    for c in "${cmds[@]}"; do
+      [ -n "$c" ] || continue
+      if eval "\"$B/cc\" $c" >/dev/null 2>&1; then started=$((started+1)); else failed+=("cc $c"); fi
+    done
+    echo "$repo resumed${since:+ (paused since $since)}.$([ "$started" -gt 0 ] && echo " Restarted $started worker loop$([ "$started" = 1 ] || echo s).")"
+  else
+    echo "$repo is not paused."
+  fi
+  # A HALF-FINISHED RESUME MUST NOT STRAND A CHILD. The parent's flag can be gone — cc-slack's 120s kill landing
+  # after `rm -f "$f"` above, or a child's own `off` failing once — while a child stays parked; a plain early
+  # return here would answer "$repo is not paused" forever and never try the children again. So the cascade
+  # walks even when $repo itself was already resumed, mirroring `cmd_on`, which cascades even when the parent
+  # was already paused (box `notice-again`) — `cascade_off` is what says which children came back.
+  if [ -z "$via" ]; then
+    first_visit "$repo"
+    [ "$was_paused" = 1 ] && announce "$repo" "$repo" off "$from"
+    cascade_off "$repo" "$repo" "$from"
+  fi
   echo "The timers pick it up on their next tick."
   # A 👍 GIVEN WHILE IT WAS PARKED IS STILL ON THE QUEUE, and nothing re-drives it: the queue arms its transient
   # timer from the jobs it may run, and a paused repo's job is not one of those. So say it, and name the one command
@@ -140,7 +292,7 @@ cmd_status(){
   local repo="${1:-}" f
   if [ -n "$repo" ]; then
     paused "$repo" || { echo "$repo is not paused."; return 1; }
-    f=$(flag "$repo"); jq -r --arg r "$repo" '"\($r) paused since \(.at)" + (if .by != "" then " by \(.by)" else "" end) + (if .note != "" then " — \(.note)" else "" end) + " · \(.loops | length) worker loop(s) to restart"' "$f"
+    f=$(flag "$repo"); jq -r --arg r "$repo" '"\($r) paused since \(.at)" + (if (.via // "") != "" then " with \(.via)" else "" end) + (if .by != "" then " by \(.by)" else "" end) + (if .note != "" then " — \(.note)" else "" end) + " · \(.loops | length) worker loop(s) to restart"' "$f"
     return 0
   fi
   local any=0
@@ -154,15 +306,31 @@ selfcheck(){   # pause, resume and the restart-from-cold case. Every case builds
   # THE FIXTURE PROJECTS ARE NAMED PER PROCESS. `on` finds the loops to stop with pgrep over the whole process
   # table, so a fixture sharing a name with a project this box really has would signal that project's live
   # worker — check.sh runs this on every commit. The pid suffix is what makes the name this run's alone.
-  local R="myrepo-$$" O="other-$$"
+  # C is declared UNDER R, G under C, and S is the trap the declaration exists for: its name begins with R's and
+  # it is nobody's child. O is declared nowhere at all.
+  local R="myrepo-$$" O="other-$$" C="tool-$$" G="deep-$$" S="myrepo-$$-skill"
   d=$(mktemp -d) || return 2
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
-  # A box of its own: two projects, so every case can assert the paused one AND the one that must keep running.
-  box(){ h="$d/$1"; fb="$h/bin"; mkdir -p "$h/dev/$R" "$h/dev/$O" "$h/.cc/state" "$fb"
+  # A box of its own: several projects, so every case can assert the paused one AND the ones that must keep running.
+  box(){ h="$d/$1"; fb="$h/bin"; mkdir -p "$h/dev/$R" "$h/dev/$O" "$h/dev/$C" "$h/dev/$G" "$h/dev/$S" "$h/.cc/state" "$fb"
     cp "$(readlink -f "$0")" "$fb/cc-pause"; chmod +x "$fb/cc-pause"
+    cp "$B/cc-config" "$fb/cc-config"                  # the real reader, over a config file of this box's own
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/cc.calls"\n' "$h" > "$fb/cc"; chmod +x "$fb/cc"
-    printf '#!/usr/bin/env bash\nsleep 60\n' > "$fb/cc-loop"; chmod +x "$fb/cc-loop"; }
+    printf '#!/usr/bin/env bash\nsleep 60\n' > "$fb/cc-loop"; chmod +x "$fb/cc-loop"
+    # Slack's door, stubbed: two channels per project, and every post written down instead of sent. No case here
+    # reaches Slack, and none of them may — check.sh runs this on every commit.
+    cat > "$fb/cc-slack" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  channels) [ -e "$h/slack.err" ] && exit 4; echo "C-\$3-main #\$3"; echo "C-\$3-t1 #\$3--t1";;
+  post)     [ -e "$h/slack.down" ] && exit 1; printf '%s %s\n' "\$3" "\${*:4}" >> "$h/slack.posts";;
+esac
+STUB
+    chmod +x "$fb/cc-slack"; : > "$h/slack.posts"; }
   P(){ HOME="$h" "$fb/cc-pause" "$@"; }   # a FRESH process every time, reading only what is on disk
+  decl(){ printf 'CC_PROJECT_CHILDREN=%s\n' "$1" > "$h/.cc/config"; }   # who is under whom, for this box only
+  told(){ cut -d' ' -f1 "$h/slack.posts" 2>/dev/null | LC_ALL=C sort | tr '\n' ' '; }
+  want(){ printf '%s\n' "$@" | LC_ALL=C sort | tr '\n' ' '; }
 
   box roundtrip
   P on $R > "$h/on.out" 2>&1; t "on succeeds" "$?" 0
@@ -230,6 +398,169 @@ selfcheck(){   # pause, resume and the restart-from-cold case. Every case builds
   P on $R > /dev/null 2>&1
   t "list prints the paused project and only it" "$(P list | tr '\n' ' ')" "$R "
 
+  # ---- WHAT IS UNDER IT GOES WITH IT ------------------------------------------------------------------------
+  # The owner parked a workspace and its tool repository kept spending, because a pause was per repo and the box
+  # had no notion of one project being under another (2026-09-05). The relation is CC_PROJECT_CHILDREN and only
+  # that: the look-alike name below is paused by nothing, which is the whole point of declaring it.
+  box cascade
+  decl "$R:$C $C:$G"
+  P on $R > "$h/on.out" 2>&1;  t "the parent still pauses" "$?" 0
+  P is $C; t "…and so does the project declared under it" "$?" 0
+  P is $G; t "…and what is declared under THAT: the cascade goes all the way down" "$?" 0
+  P is $S; t "…while a project whose NAME merely starts with the parent's keeps running — names are not the relation" "$?" 1
+  P is $O; t "…as does a project declared nowhere" "$?" 1
+  grep -q "$C paused too" "$h/on.out"; t "on names what went with it" "$?" 0
+  P status $C | grep -q "with $R"; t "status says whose pause parked it" "$?" 0
+  P off $R > /dev/null 2>&1
+  P is $C; t "resuming the parent resumes the child" "$?" 1
+  P is $G; t "…and the grandchild with it" "$?" 1
+
+  box own-pause
+  decl "$R:$C"
+  P on $C --by owner --note "waiting on a key" > /dev/null 2>&1   # parked on its own, by hand, BEFORE the parent
+  P on $R > /dev/null 2>&1
+  P off $R > "$h/off.out" 2>&1
+  P is $R; t "the parent resumes" "$?" 1
+  P is $C; t "…and a child parked on its own is NOT resumed with it: that pause is not the parent's to lift" "$?" 0
+  grep -q "stays paused" "$h/off.out"; t "…and the resume says which project it left alone" "$?" 0
+  P status $C | grep -q 'waiting on a key'; t "…keeping the words the person who parked it left" "$?" 0
+
+  box promote
+  decl "$R:$C"
+  P on $R > /dev/null 2>&1                        # the cascade parks the child…
+  P on $C > /dev/null 2>&1                        # …and then a PERSON parks it by name: the pause is now its own
+  P off $R > /dev/null 2>&1
+  P is $C; t "a child the cascade parked, then parked again by name, keeps its pause when the parent resumes" "$?" 0
+  P on $C > /dev/null 2>&1; P is $R
+  t "the relation runs one way: pausing the child leaves the parent running" "$?" 1
+
+  # A HALF-FINISHED RESUME must not strand a child. Simulate cc-slack's 120s kill (or a first `off` that failed)
+  # landing right after the parent's own flag is removed but before its cascade ran: the child is still paused.
+  box resume-half-finished
+  decl "$R:$C"
+  P on $R > /dev/null 2>&1                        # cascades: $C paused too, via $R
+  rm -f "$h/.cc/state/$R/paused"                   # …and only this much of a resume happened before it was cut off
+  P off $R > "$h/off.out" 2>&1
+  grep -q "$R is not paused" "$h/off.out"; t "a parent whose own flag is already gone still says so" "$?" 0
+  P is $C; t "…but the child declared under it is resumed anyway, not stranded by the parent's early return" "$?" 1
+  grep -q "$C resumed too" "$h/off.out"; t "…and it says which child came back" "$?" 0
+
+  box loops-and-limits
+  decl "$R:$C $C:$R"                              # a declaration that loops back must not walk forever
+  timeout 30 env HOME="$h" "$fb/cc-pause" on $R > /dev/null 2>&1
+  t "a cycle in the declaration terminates" "$?" 0
+  box loops-and-limits2
+  decl "$R:nosuch-$$"
+  P on $R > "$h/on.out" 2>&1; t "a declared child with no ~/dev directory does not stop the parent's pause" "$?" 0
+  P is $R; t "…the parent is parked all the same" "$?" 0
+  grep -q "nosuch-$$" "$h/on.out"; t "…and the one that could not be parked is named" "$?" 0
+  # cc-slack's reply is stdout, or stderr only when stdout is empty — a miss said only on stderr would never
+  # reach the person who typed !pause. $R is already paused, so this second call runs the cascade only.
+  P on $R > "$h/on-stdout.out" 2>/dev/null
+  grep -q "nosuch-$$" "$h/on-stdout.out"; t "…and it is named on STDOUT, not only stderr, so the reply carries it" "$?" 0
+
+  # EVERY CHANNEL THAT WENT QUIET IS TOLD, and no other: the channel `--from` names, where the command was
+  # typed, already has this command's own answer and is the only one skipped.
+  box notice
+  decl "$R:$C"
+  P on $R --from "C-$R-main" > /dev/null 2>&1
+  t "the notice reaches the parent's track channel and both of the child's, and nothing else" \
+    "$(told)" "$(want "C-$R-t1" "C-$C-main" "C-$C-t1")"
+  t "…one line in each" "$(wc -l < "$h/slack.posts")" "3"
+  grep -q "Paused with #$R" "$h/slack.posts"; t "…saying which channel's pause did it" "$?" 0
+  : > "$h/slack.posts"
+  P off $R --from "C-$R-main" > /dev/null 2>&1
+  t "resume posts the matching line in the same channels" "$(told)" "$(want "C-$R-t1" "C-$C-main" "C-$C-t1")"
+  grep -q "Resumed with #$R" "$h/slack.posts"; t "…and it says the pause was lifted" "$?" 0
+
+  box notice-from
+  decl "$R:$C"
+  P on $R --from "C-$R-t1" > /dev/null 2>&1
+  t "the channel the command was typed in is left alone — it already has this command's own answer — but the
+     project's own main channel is not skipped just for being the origin's: it hears it too" \
+    "$(told)" "$(want "C-$R-main" "C-$C-main" "C-$C-t1")"
+  : > "$h/slack.posts"
+  P off $R --from "C-$R-t1" > /dev/null 2>&1
+  t "…on resume too" "$(told)" "$(want "C-$R-main" "C-$C-main" "C-$C-t1")"
+
+  box notice-from-child
+  decl "$R:$C"
+  P on $R --from "C-$C-main" > /dev/null 2>&1     # `!pause` typed in the CHILD's channel, naming the parent
+  t "a pause typed in a CHILD's channel does not get both the answer and the notice there, but the parent's
+     OWN main channel still hears it — the command did not come from there" \
+    "$(told)" "$(want "C-$R-main" "C-$R-t1" "C-$C-t1")"
+
+  box notice-main-told
+  decl "$R:$C"
+  P on $R > /dev/null 2>&1   # no --from at all: the CLI path, or a DM — nothing types "in" #$R
+  t "with no --from, the project's own main channel hears the pause too" \
+    "$(told)" "$(want "C-$R-main" "C-$R-t1" "C-$C-main" "C-$C-t1")"
+
+  box notice-again
+  decl "$R:$C"
+  P on $R > /dev/null 2>&1
+  : > "$h/slack.posts"
+  P on $R > "$h/on.out" 2>&1
+  t "a second pause on a project already parked tells nobody again — those channels went quiet the first time" \
+    "$(told)" ""
+  grep -q 'already paused' "$h/on.out"; t "…and says so" "$?" 0
+  P off $C --via "$R" > /dev/null 2>&1            # a child that fell out of step: the second pause is for this
+  : > "$h/slack.posts"
+  P on $R > /dev/null 2>&1
+  P is $C; t "…while the cascade still runs: a child not parked yet is what a second pause is for" "$?" 0
+  t "…and that child's channels ARE told" "$(told)" "$(want "C-$C-main" "C-$C-t1")"
+
+  # A NOTICE SLACK REFUSED IS A CHANNEL THAT WENT QUIET WITH NOBODY TOLD. Reporting the pause as done and saying
+  # nothing about that is the same silence the notice exists to break.
+  box notice-fails
+  decl "$R:$C"
+  : > "$h/slack.down"
+  P on $R > "$h/on.out" 2>&1; t "Slack refusing the notice does not fail the pause" "$?" 0
+  P is $R; t "…the project is parked all the same" "$?" 0
+  grep -q 'were NOT told' "$h/on.out"; t "…and the channels nobody could tell are counted and named" "$?" 0
+  box notice-unreachable
+  decl "$R:$C"
+  : > "$h/slack.err"
+  P on $R > "$h/on.out" 2>&1; t "Slack not answering at all does not fail the pause either" "$?" 0
+  grep -q 'could not ask which channels' "$h/on.out"; t "…and that is said too, not swallowed" "$?" 0
+
+  # A SLACK CHANNEL ID IS [CG] HERE TOO, not just C — project channels are private (a `G`), the same shape
+  # cc-slack itself checks (re.fullmatch [CG][A-Z0-9]+). A stub returning G-prefixed ids stands in for one.
+  box notice-private
+  decl "$R:$C"
+  cat > "$fb/cc-slack" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  channels) echo "G-\$3-main #\$3"; echo "G-\$3-t1 #\$3--t1";;
+  post)     printf '%s %s\n' "\$3" "\${*:4}" >> "$h/slack.posts";;
+esac
+STUB
+  chmod +x "$fb/cc-slack"
+  P on $R > /dev/null 2>&1
+  t "a G-prefixed (private) channel id is accepted, not dropped silently" \
+    "$(told)" "$(want "G-$R-main" "G-$R-t1" "G-$C-main" "G-$C-t1")"
+
+  # A LINE THAT IS NOT EVEN THAT SHAPE IS STILL A CHANNEL NOBODY TOLD — it must count as a miss, not vanish.
+  box notice-malformed
+  decl "$R:$C"
+  cat > "$fb/cc-slack" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  channels) echo "C-\$3-main #\$3"; echo "not-a-channel-line"; echo "C-\$3-t1 #\$3--t1";;
+  post)     printf '%s %s\n' "\$3" "\${*:4}" >> "$h/slack.posts";;
+esac
+STUB
+  chmod +x "$fb/cc-slack"
+  P on $R > "$h/on.out" 2>&1
+  grep -q 'were NOT told' "$h/on.out"; t "a line that is not an <id> #<name> pair counts as a miss, not a silent drop" "$?" 0
+
+  box children
+  decl "$R:$C $C:$G"
+  t "children lists every project under one, deepest included" "$(P children $R | tr '\n' ' ')" "$C $G "
+  t "…and nothing for a project with none declared" "$(P children $O)" ""
+  decl "$R:$C $C:$R"
+  t "…and a cycle in the declaration does not make it walk forever" "$(timeout 30 env HOME="$h" "$fb/cc-pause" children $R | tr '\n' ' ')" "$C "
+
   rm -rf "$d"
   printf 'cc-pause selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
@@ -238,8 +569,9 @@ case "${1:-}" in
   off)       shift; cmd_off "$@";;
   is)        paused "${2:-}";;   # exit status IS the answer: no output, so a caller can `if cc-pause is "$t"; then`
   status)    shift; cmd_status "${1:-}";;
+  children)  first_visit "${2:-}"; descendants "${2:-}";;   # every project under this one, each once
   list)      for f in "$STATE"/*/paused; do [ -e "$f" ] && basename "$(dirname "$f")"; done; true;;
   selfcheck) selfcheck;;
-  ""|-h|--help) sed -n '2,20p' "$0"; exit 0;;
-  *)         die "unknown command '${1}' — cc-pause on|off|is|status|list|selfcheck";;
+  ""|-h|--help) sed -n '2,35p' "$0"; exit 0;;
+  *)         die "unknown command '${1}' — cc-pause on|off|is|status|list|children|selfcheck";;
 esac

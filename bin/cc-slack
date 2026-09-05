@@ -22,7 +22,9 @@
   cc-slack history <#chan|C…|D…> [n] | thread <#chan|C…> <ts> [n]   read a channel / a full thread (newest first, cursor-paged)
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>          rewrite / delete one of the BOT's own posts (signed ones too)
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md   pin a message · replace a channel canvas
-  cc-slack status | channels | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>
+  cc-slack status | channels [--for <repo>] | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>
+                                      --for: `C… #name` for every channel of ONE project — its two lanes, its
+                                      #<repo>--<track> channels, its sub-orch channels (cc-pause tells each one)
   cc-slack member add <@user>…        give each a PRIVATE #<handle> (+ -updates) with the owner in it and ~/dev/<handle>
                                       — the same thing a `team_join` does by itself. Idempotent; the owner is exempt.
   cc-slack member instructions <handle>    put the member instructions (how a project channel is made, and by whom)
@@ -70,7 +72,9 @@ Only the owner steers the box: permission answers, `!` commands beyond !help/!st
 App Home are owner-only, and a member cannot authorize what the box gates on the owner.
 In-Slack commands (`!help`/`!status` anyone, the rest owner only, any channel or thread): `!help !ping !status !digest !sessions !start !say !threads !box`
 `!pause`/`!resume` park this channel's whole project and put it back (`!pause <repo>` names another): while it is parked nothing the box does on its
-own spends on it, and a message sent to it is queued rather than delivered — this channel keeps working throughout. See cc-pause.
+own spends on it, and a message sent to it is queued rather than delivered — this channel keeps working throughout. It carries DOWN: every channel
+under this one — its track and sub-orch channels, and every project declared under it in CC_PROJECT_CHILDREN — is parked with it and told so in one
+line. A project parked on its own stays parked when this one resumes. See cc-pause.
 `!restart <box|repo[/track]|slack|tmux>` and `!reboot` (both confirm-gated), and `!context !cost !compact [target]` — those three relay a real
 slash command into that session's own pane (SLASH_CMDS, idle panes only; nothing else is ever typed there). A `!command` root is never a tracked thread.
 One channel, one voice: while `cc-handoff` has an overlap open on a target, both its sessions are subscribed but only
@@ -4662,7 +4666,7 @@ class Daemon:
         if cmd == "help":
             out = ("`!ping` alive · `!status` cc ls · `!digest` all tracks · `!sessions` live channel subscribers · "
                    "`!start` start this channel's session · `!say <text>` type into it (no channel needed) · "
-                   "`!pause` park this project — its workers, timers, nags and landings all stop spending · "
+                   "`!pause` park this project and everything under it — workers, timers, nags and landings all stop spending · "
                    "`!resume` put it back (nothing is lost meanwhile; a message sent while parked is queued) · "
                    "`!restart <box|repo[/track]|slack|tmux>` recover a wedged session/daemon (tmux needs `!restart tmux confirm`) · "
                    "`!reboot` reboot the whole box (needs `!reboot confirm`) · "
@@ -4729,17 +4733,36 @@ class Daemon:
         if not repo:
             return self.say(chat, f"`!{cmd}`: no project for this channel — say `!{cmd} <repo>`", thread)
         try:
-            p = subprocess.run([f"{BIN}/cc-pause", "on" if cmd == "pause" else "off", repo],
+            # --from: this channel already gets cc-pause's own answer below, so it is the one channel the
+            # cascade's notice skips. Every OTHER channel that went quiet with it is told there, by cc-pause.
+            p = subprocess.run([f"{BIN}/cc-pause", "on" if cmd == "pause" else "off", repo, "--from", chat],
                                capture_output=True, text=True, timeout=120, cwd=HOME)
         except subprocess.TimeoutExpired:
             return self.say(chat, f"`cc-pause {'on' if cmd == 'pause' else 'off'} {repo}` timed out after 120 s — "
                                   f"check it on the box.", thread)
         out = (p.stdout or "").strip() or (p.stderr or "").strip() or "(no output)"
         if p.returncode == 0 and cmd != "pause":          # …and hand over what was said to it while it was parked
+            # THE CASCADE RESUMED THE CHILDREN TOO, so their queues are owed the same hand-over. Draining only the
+            # repo named here left every message said to a child sitting until the TTL dropped it and told him to
+            # resend — the exact bug drain_resumed exists to fix, one level down. A child still parked (its pause
+            # was its own) keeps its queue, which is what being parked means.
             n = self.drain_resumed(repo)
+            for child in self.pause_children(repo):
+                if not paused(child):
+                    n += self.drain_resumed(child)
             if n:
                 out += f"\n{n} message(s) said while it was parked, delivered now, in order."
         self.say(chat, (out if p.returncode == 0 else f"could not {cmd} `{repo}`: {out}"), thread)
+
+    def pause_children(self, repo):
+        """Every project declared under this one. cc-pause owns that declaration (CC_PROJECT_CHILDREN) and is the
+        only thing that reads it — asking it is how this file learns which projects a resume just put back."""
+        try:
+            r = subprocess.run([f"{BIN}/cc-pause", "children", repo],
+                               capture_output=True, text=True, timeout=30, cwd=HOME)
+        except Exception:
+            return []
+        return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
 
     def drain_resumed(self, repo):
         """Everything said to a project while it was parked, handed over now that it is not — in the order it
@@ -6356,8 +6379,62 @@ def fmt_subs(subs):
     return ", ".join(f"{t}@{a}" if a else f"{t} [main]" for t, aliases in subs.items() for a in aliases) or "none"
 
 
-def cmd_channels():
+def project_channels(cfg, repo):
+    """Every channel the bot is in that belongs to project <repo> — both its lanes, each `#<repo>--<track>`
+    channel, and each live sub-orch channel of the project — as (id, "#name") pairs. For a caller with something
+    to say in all of them at once: cc-pause's cascade tells each one it has gone quiet.
+
+    THE PREFIX IS NOT THE RELATION. `#<repo>-skill` is another project's channel that happens to begin with these
+    letters, and announcing a pause there would be announcing in a project this pause never touched. A name counts
+    when it IS the repo, when it is the repo's `-updates` twin, or when it splits on its first `--` into this repo
+    and a track; routes.json and the orch table are each read on their own terms, never guessed at."""
+    repo = (repo or "").strip().lower()
+    if not repo:
+        return []
+    routes, orchs = load_routes(), load_orchs()
+    out, cur = [], None
+    while True:
+        r = api("conversations.list", cfg["SLACK_BOT_TOKEN"], types="public_channel,private_channel",
+                exclude_archived="true", limit="200", cursor=cur)
+        for ch in r.get("channels", ()):
+            if not ch.get("is_member"):
+                continue
+            name = (ch.get("name") or "").lower()
+            entry = orchs.get(ch["id"]) or {}
+            target = (entry.get("target") if not entry.get("archived") else None) \
+                or routes.get(ch["id"]) or routes.get("#" + name)
+            if target:
+                mine = target.split("/")[0].split("@")[0].lower() == repo
+            else:
+                base = main_lane(name) or name                      # the -updates lane belongs where its twin does
+                mine = base == repo or ("--" in base and base.split("--", 1)[0] == repo)
+            if mine:
+                out.append((ch["id"], "#" + name))
+        cur = (r.get("response_metadata") or {}).get("next_cursor") or None
+        if not cur:
+            break
+    return sorted(out, key=lambda p: p[1])
+
+
+def cmd_channels(argv=()):
     cfg = load_cfg()
+    argv = list(argv)
+    if "--for" in argv:
+        # STDOUT IS A LIST AND NOTHING ELSE HERE: cc-pause reads it line by line and posts into every id it finds,
+        # so a "no token" line on stdout would become a channel it tried to talk to.
+        i = argv.index("--for")
+        repo = argv[i + 1] if i + 1 < len(argv) else ""
+        if not repo or repo.startswith("-"):
+            print("cc-slack channels --for <repo>", file=sys.stderr); return 2
+        if not cfg.get("SLACK_BOT_TOKEN"):
+            print("no SLACK_BOT_TOKEN", file=sys.stderr); return 1   # 1 is "no Slack here", and only that: cc-pause
+        try:                                                         # stays quiet on it and reports every other exit
+            rows = project_channels(cfg, repo)
+        except Exception as e:
+            print(f"cc-slack channels --for {repo}: {e.__class__.__name__}: {e}", file=sys.stderr); return 4
+        for cid, name in rows:
+            print(f"{cid} {name}")
+        return 0
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("no SLACK_BOT_TOKEN"); return 1
     routes, prov, orchs = load_routes(), load_provisioned(), load_orchs()
@@ -7858,6 +7935,7 @@ def cmd_selfcheck():
     pbin = tempfile.mkdtemp(prefix="cc-slack-selfcheck-pause-")
     with open(f"{pbin}/cc-pause", "w") as f:
         f.write('#!/usr/bin/env bash\nd=$(dirname "$0")\nprintf "%s " "$@" >> "$d/calls"; printf "\\n" >> "$d/calls"\n'
+                '[ "$1" = children ] && { cat "$d/children" 2>/dev/null; exit 0; }\n'
                 '[ -e "$d/fail" ] && { echo "no project \'$2\' — ~/dev/$2 does not exist" >&2; exit 2; }\n'
                 'echo "paused $2 — stopped 1 worker loop (w1), cc-pulse and the landing queue"\n')
     os.chmod(f"{pbin}/cc-pause", 0o755)
@@ -7876,17 +7954,45 @@ def cmd_selfcheck():
         dmP.cmd_pause("pause", "", "C1", None, "myrepo")
         check("!pause: THE CHANNEL IS THE ARGUMENT — `!pause` in a project's channel parks that project, and the "
               "channel is told what cc-pause itself said it stopped, not a word of this file's own",
-              pcalls() == [["on", "myrepo"]] and "stopped 1 worker loop" in saidP[-1])
+              pcalls() == [["on", "myrepo", "--from", "C1"]] and "stopped 1 worker loop" in saidP[-1])
         dmP.cmd_pause("pause", "", "C1", None, "myrepo/t1")
         check("!pause: a channel whose target is one TRACK still parks the whole project — cc-pause takes projects "
-              "only, so the repo is what it is handed", pcalls() == [["on", "myrepo"]])
+              "only, so the repo is what it is handed", pcalls() == [["on", "myrepo", "--from", "C1"]])
         dmP.cmd_pause("pause", "", "C1", None, "myrepo@scout")
-        check("!pause: an orch channel too — repo@alias is that same project", pcalls() == [["on", "myrepo"]])
+        check("!pause: an orch channel too — repo@alias is that same project",
+              pcalls() == [["on", "myrepo", "--from", "C1"]])
+        dmP.cmd_pause("pause", "", "CDM", None, "myrepo")
+        check("!pause hands cc-pause the channel it was typed in: that one channel already gets this answer, so it "
+              "is the only one the cascade's notice skips — every other channel parked with it is told there",
+              pcalls() == [["on", "myrepo", "--from", "CDM"]])
         dmP.cmd_pause("pause", "otherrepo", "C1", None, "myrepo")
         check("!pause <repo> parks the one it names and not this channel's — that is how a DM parks a project",
-              pcalls() == [["on", "otherrepo"]])
+              pcalls() == [["on", "otherrepo", "--from", "C1"]])
         dmP.cmd_pause("resume", "", "C1", None, "myrepo")
-        check("!resume puts that same project back", pcalls() == [["off", "myrepo"]])
+        check("!resume puts that same project back, and asks cc-pause which projects came back with it",
+              pcalls() == [["off", "myrepo", "--from", "C1"], ["children", "myrepo"]])
+        # THE CHILDREN'S QUEUES ARE OWED THE SAME HAND-OVER. `kid` came back with its parent, so what was said to
+        # it while it was parked goes out now; `stubborn` was parked on its own and keeps its queue, which is what
+        # being parked means. Without this, both sat until the TTL dropped them and told him to resend.
+        with open(f"{pbin}/children", "w") as f:
+            f.write("kid\nstubborn\n")
+        dmP.queues = {"kid": [(time.time(), {"type": "msg", "content": "for the kid"}, None)],
+                      "stubborn": [(time.time(), {"type": "msg", "content": "held"}, None)]}
+        dmP.save_queues = lambda: None
+        deliveredP = []
+        dmP.deliver = lambda t, payload, alias=None: deliveredP.append((t, payload["content"]))
+        _pausedP = globals()["paused"]
+        globals()["paused"] = lambda t: str(t) == "stubborn"
+        try:
+            dmP.cmd_pause("resume", "", "C1", None, "myrepo")
+        finally:
+            globals()["paused"] = _pausedP
+        check("!resume drains the queue of every project the cascade put back with it — and leaves the queue of one "
+              "that stayed parked on its own exactly where it is",
+              deliveredP == [("kid", "for the kid")] and "1 message(s) said while it was parked" in saidP[-1]
+              and list(dmP.queues) == ["stubborn"] and pcalls() == [["off", "myrepo", "--from", "C1"],
+                                                                    ["children", "myrepo"]])
+        os.remove(f"{pbin}/children")
         dmP.cmd_pause("pause", "", "C1", None, "")
         check("!pause in a channel with no project of its own asks for a name instead of guessing at one",
               not pcalls() and "no project for this channel" in saidP[-1])
@@ -7900,6 +8006,38 @@ def cmd_selfcheck():
     finally:
         globals()["BIN"] = real_binP
         shutil.rmtree(pbin, ignore_errors=True)
+
+    # WHICH CHANNELS BELONG TO ONE PROJECT — what cc-pause's cascade posts its one-line notice into. The trap this
+    # exists to avoid is the whole reason the relation is declared and never guessed: `#myrepo-skill` is a project
+    # of its own, and a pause of `myrepo` that announced itself there would be talking in a project it never parked.
+    chansPC = {"myrepo": "CM", "myrepo-updates": "CMU", "myrepo--t1": "CMT", "myrepo-skill": "CSK",
+               "myrepo-skill-updates": "CSKU", "myrepo-scout-ab12": "CORCH", "other": "CO", "myreponot": "CMN"}
+    _apiPC, _routesPC, _orchsPC = globals()["api"], globals()["load_routes"], globals()["load_orchs"]
+    _cfgPC = globals()["load_cfg"]
+    try:
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-selfcheck"}   # never this box's own config
+        globals()["api"] = lambda m, tok, **kw: (
+            {"channels": [{"id": c, "name": n, "is_member": n != "myreponot"} for n, c in chansPC.items()]}
+            if m == "conversations.list" else {})
+        globals()["load_routes"] = lambda: {"CO": "myrepo/t2"}          # an explicit route is read on its own terms
+        globals()["load_orchs"] = lambda: {"CORCH": {"target": "myrepo", "alias": "scout"},
+                                           "CGONE": {"target": "myrepo", "alias": "old", "archived": True}}
+        gotPC = project_channels({"SLACK_BOT_TOKEN": "xoxb-selfcheck"}, "myrepo")
+        check("channels --for <repo>: both lanes, each #<repo>--<track>, a routed channel and a live sub-orch — and "
+              "NOT #<repo>-skill, which only begins with those letters and is a project of its own, nor a channel "
+              "the bot is not in",
+              gotPC == [("CM", "#myrepo"), ("CMT", "#myrepo--t1"), ("CORCH", "#myrepo-scout-ab12"),
+                        ("CMU", "#myrepo-updates"), ("CO", "#other")])
+        check("…and asking for that other project gets that project's own channels, never its neighbour's",
+              project_channels({"SLACK_BOT_TOKEN": "x"}, "myrepo-skill")
+              == [("CSK", "#myrepo-skill"), ("CSKU", "#myrepo-skill-updates")])
+        with contextlib.redirect_stderr(io.StringIO()):
+            rcPC = cmd_channels(["--for"])
+        check("channels --for with no repo is a usage error, and an empty name matches nothing rather than everything",
+              rcPC == 2 and project_channels({"SLACK_BOT_TOKEN": "x"}, "") == [])
+    finally:
+        globals()["api"], globals()["load_routes"], globals()["load_orchs"] = _apiPC, _routesPC, _orchsPC
+        globals()["load_cfg"] = _cfgPC
 
     real_fc = find_channel; globals()["find_channel"] = lambda cfg, name: ("CALIAS", True)
     dm7 = Daemon(use_slack=False); dm7.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}
@@ -12594,7 +12732,7 @@ def main(argv):
     elif cmd == "status":
         return cmd_status()
     elif cmd == "channels":
-        return cmd_channels()
+        return cmd_channels(rest)
     elif cmd == "mkchannel":
         return cmd_mkchannel(rest)
     elif cmd == "updates-sweep":
