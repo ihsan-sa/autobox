@@ -3,6 +3,7 @@
 #   cc-publish [--dry-run] [--from <sha>] [--message <text>]   publish, if the public repo is behind
 #   cc-publish status                                          one line: configured? in sync?
 #   cc-publish setup <url> [repo] [prefix]                     write the config keys into ~/.cc/config
+#   cc-publish selfcheck                                       the repo lock, in fixtures of its own
 #
 # WHAT SHIPS is the prefix and nothing else: the whole tree at <prefix> goes, unfiltered. This script never picks
 # paths, never rewrites content, never cherry-picks — the public/private boundary is the directory boundary, drawn
@@ -35,7 +36,7 @@
 #   PUBLISH_DENY     extra ERE that must never appear in it     (this box's user, host and repo names always deny)
 #   PUBLISH_ALLOW    paths inside the prefix the gate skips     (default: LICENSE README.md — they name the public repo)
 set -uo pipefail
-BIN="$(dirname "$(realpath "$0")")"
+SELF="$(realpath "$0")"; BIN="$(dirname "$SELF")"
 STATE="${CC_PUBLISH_STATE:-$HOME/.cc/state}"   # log + lock; tests point it at their own dir so two runs never share a lock
 LOG="$STATE/publish.log"; SEEN="$STATE/publish.notified"   # the abort the owner was last paged about (see die)
 mkdir -p "$STATE"
@@ -51,12 +52,13 @@ DENY_X="$(cfg PUBLISH_DENY)"; ALLOW="$(cfg PUBLISH_ALLOW)"; ALLOW="${ALLOW:-LICE
 mode=publish; dry=0; from=""; msg=""
 while [ $# -gt 0 ]; do case "$1" in
   status)         mode=status; shift ;;
+  selfcheck)      mode=selfcheck; shift ;;
   setup)          mode=setup; shift; break ;;
   -n|--dry-run)   dry=1; shift ;;
   --from)         from="${2:-}"; shift 2 ;;
   -m|--message)   msg="${2:-}"; shift 2 ;;
   -h|--help)      sed -n '2,6p' "$0"; exit 0 ;;
-  *) echo "usage: cc-publish [--dry-run] [--from <sha>] [--message <text>] | status | setup <url> [repo] [prefix]" >&2; exit 2 ;;
+  *) echo "usage: cc-publish [--dry-run] [--from <sha>] [--message <text>] | status | setup <url> [repo] [prefix] | selfcheck" >&2; exit 2 ;;
 esac; done
 
 if [ "$mode" = setup ]; then
@@ -65,6 +67,135 @@ if [ "$mode" = setup ]; then
   [ -n "${2:-}" ] && "$BIN/cc-config" set PUBLISH_REPO "$2"
   [ -n "${3:-}" ] && "$BIN/cc-config" set PUBLISH_PREFIX "$3"
   echo "wrote the publish keys to $("$BIN/cc-config" path) — check with: cc-publish status"; exit 0
+fi
+
+# THE REPO LOCK — cc-land's, not one of our own. A `git fetch` writes `.git/FETCH_HEAD` and the ref it was given,
+# and the ref this one is given (`refs/remotes/origin/<base>`) is the very ref a landing in the same checkout
+# fetches and `git pull`s: on 2026-09-05 01:26Z a landing's install pull died on `incorrect old value provided` —
+# the ref moved under it mid-update — with this timer the other half of the race. cc-land locks its side already,
+# so both fetches below take the SAME file it takes, by the same rule (its `git_lock_path`): `cc-land.lock` in the
+# repo's own .git, which is what every process working on that checkout shares. A linked worktree's `.git` is a
+# FILE pointing into the main one, whose FETCH_HEAD is the shared one, so the lock follows it there; a checkout
+# with no usable .git falls back to one file per checkout under ~/.cc/state — cc-land's state directory, never
+# this tool's $STATE, because the point is that it is the same file. `selfcheck` pins the two against each other.
+# Held across the fetch and nothing else: never the identity gate, the ls-remote or the push. The wait is BOUNDED
+# at CC_PUBLISH_LOCK_WAIT seconds (default 180: a fetch behind a landing's install pull takes seconds). Past that
+# this run logs one line and exits 0 having fetched nothing, and the 15-min timer tries again — a publish is
+# idempotent. Unbounded, a stalled holder would stack one more blocked publisher per tick, and a publish invoked
+# from inside a locked region would deadlock outright. A lock file that cannot even be CREATED is not a publish
+# that refuses: LOCKF stays empty and the fetch runs unlocked, as it always did — which is why it is created
+# where LOCKF is set, not left for flock to die on.
+repo_lock_path() {
+  local root="$1" g d
+  g="$root/.git"
+  if [ -f "$g" ]; then
+    g="$(sed -n 's/^gitdir: *//p' "$g" | head -1)"
+    [ -n "$g" ] || return 1
+    case "$g" in /*) ;; *) g="$root/$g" ;; esac    # git writes it absolute, but it is allowed to be relative
+    g="$(realpath -s -m "$g")"                # -s: normalise the path and resolve no symlinks, like python's abspath
+    [ "$(basename "$(dirname "$g")")" = worktrees ] && g="$(dirname "$(dirname "$g")")"
+  fi
+  if [ -d "$g" ]; then printf '%s\n' "$g/cc-land.lock"; return 0; fi
+  d="$HOME/.cc/state/land/gitlock"
+  mkdir -p "$d" 2>/dev/null || return 1
+  printf '%s/%s.lock\n' "$d" "$(realpath -s -m "$root" | sed -E 's/[^A-Za-z0-9]+/-/g; s/^-//; s/-$//')"
+}
+LOCKF=""                                      # set once $R is known, below; empty = fetch unlocked
+LOCKW="${CC_PUBLISH_LOCK_WAIT:-180}"          # seconds to wait for it before this run gives up (see above)
+git_locked() {
+  [ -n "$LOCKF" ] || { git "$@"; return; }
+  # -o: flock forks and holds the lock in ITSELF, but without -o the fork it execs `git` in keeps a duplicate of
+  # the same fd — un-close-on-exec by design, per flock(1) — so anything git forks (its detached auto-gc,
+  # gc.autoDetach defaults on) inherits it too and can hold the lock open long after this command, and cc-publish,
+  # have returned. -o closes that copy before git ever runs, so git — and anything IT spawns — never has the fd
+  # to inherit; cc-land's own lock never had this hole because ITS fd is opened O_CLOEXEC from the start.
+  # gc.auto=0 on top so the fetch does not spawn gc under the lock at all; the box's ordinary git traffic still
+  # runs it elsewhere.
+  flock -w "$LOCKW" -E 75 -o "$LOCKF" git -c gc.auto=0 "$@"; local rc=$?   # -E: a code no git command exits with,
+  [ "$rc" = 75 ] || return "$rc"                       # so a timeout is never mistaken for the fetch's own failure
+  printf '%s\tLOCK\t%s\n' "$(date -u +%FT%TZ)" "gave up after ${LOCKW}s on $LOCKF — nothing fetched" >> "$LOG"
+  echo "cc-publish: the repo lock was held longer than ${LOCKW}s — nothing published, the next run retries"
+  exit 0
+}
+
+if [ "$mode" = selfcheck ]; then
+  n=0; f=0                                    # T is NOT local: the EXIT trap that removes it fires after this block
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
+  T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+  # THE SAME FILE. cc-land's own git_lock_path is asked for the answer and the two are compared, so a change on
+  # either side that would leave the publisher and the landing locking two different files is a red here.
+  land_lock(){ python3 - "$BIN/cc-land" "$1" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+sp = importlib.util.spec_from_loader("l", SourceFileLoader("l", sys.argv[1]))
+m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+print(m.git_lock_path(sys.argv[2]))
+PY
+  }
+  export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+  git init -q -b main "$T/src"; mkdir -p "$T/src/pfx" "$T/nogit"; echo 0 > "$T/src/pfx/f0"
+  git -C "$T/src" add -A; git -C "$T/src" commit -qm pfx; git -C "$T/src" worktree add -q "$T/wt"
+  k "$(t test "$(repo_lock_path "$T/src")" = "$T/src/.git/cc-land.lock")" "the lock is cc-land.lock in the repo's own .git"
+  k "$(t test "$(repo_lock_path "$T/src")" = "$(land_lock "$T/src")")" "…the same file cc-land locks, by its own git_lock_path"
+  k "$(t test "$(repo_lock_path "$T/wt")" = "$(repo_lock_path "$T/src")")" "a linked worktree locks the MAIN checkout's file — FETCH_HEAD is shared"
+  k "$(t test "$(repo_lock_path "$T/wt")" = "$(land_lock "$T/wt")")" "…and cc-land agrees there too"
+  k "$(t test "$(HOME="$T"; repo_lock_path "$T/nogit")" = "$(HOME="$T" land_lock "$T/nogit")")" "a checkout with no .git falls back to cc-land's own name for it"
+  # THE WAIT. A publish beside a landing: the landing's side of the lock is a plain flock on that file, and the
+  # publish may not fetch until it is dropped. What is asserted is the ORDER, not a clock — a stub `git` first on
+  # PATH stamps every fetch into the file the holder stamps its release into.
+  mkdir -p "$T/stub"
+  { echo '#!/bin/sh'
+    printf 'for a; do [ "$a" = fetch ] && { echo fetch >> "%s/events"; break; }; done\n' "$T"
+    printf 'exec "%s" "$@"\n' "$(command -v git)"; } > "$T/stub/git"
+  chmod +x "$T/stub/git"
+  git init -q --bare "$T/origin.git"; git init -q --bare "$T/pub.git"
+  git -C "$T/src" remote add origin "$T/origin.git"; git -C "$T/src" push -q origin main
+  # Fixture names and contents carry no word this box calls itself, so the identity gate has nothing to catch.
+  W=""                                        # per-case override of the publish's lock wait; empty = its default
+  pub(){ ( cd "$T/src" && PATH="$T/stub:$PATH" HOME="$T" CC_PUBLISH_STATE="$T/state" CC_NOTIFY_LOG="$T/notify.log" \
+           CC_PUBLISH_LOCK_WAIT="$W" \
+           PUBLISH_REMOTE="$T/pub.git" PUBLISH_REPO='' PUBLISH_PREFIX=pfx PUBLISH_BRANCH=main "$SELF" ); }
+  : > "$T/events"; pub >/dev/null 2>&1; rc=$?
+  k "$(t test "$rc" = 0)" "the fixture publishes (its own repos under a temp HOME — nothing of this box's)"
+  k "$(t grep -qx fetch "$T/events")" "…and the fetch it went through was recorded"
+  : > "$T/events"
+  ( flock 9; echo held >> "$T/events"; sleep 3; echo released >> "$T/events" ) 9>"$(repo_lock_path "$T/src")" &
+  hold=$!
+  for _ in $(seq 1 200); do grep -qx held "$T/events" 2>/dev/null && break; sleep 0.05; done
+  pub >/dev/null 2>&1; rc=$?; wait "$hold" 2>/dev/null
+  rel=$(grep -n -m1 -x released "$T/events" | cut -d: -f1); fet=$(grep -n -m1 -x fetch "$T/events" | cut -d: -f1)
+  ord=1; [ -n "$rel" ] && [ -n "$fet" ] && [ "$rel" -lt "$fet" ] && ord=0
+  k "$(t test "$rc" = 0)" "a publish beside a landing waits for the lock, it does not fail"
+  k "$ord" "…and NOTHING was fetched until the landing released it"
+  # THE BOUND. A holder that outlasts the wait must not stack one more blocked publisher per timer tick: this run
+  # gives up — rc 0, nothing fetched, one line in the log — and the next tick tries again.
+  : > "$T/events"; : > "$T/state/publish.log"; W=1
+  ( flock 9; echo held >> "$T/events"; sleep 4 ) 9>"$(repo_lock_path "$T/src")" &
+  hold=$!
+  for _ in $(seq 1 200); do grep -qx held "$T/events" 2>/dev/null && break; sleep 0.05; done
+  pub >/dev/null 2>&1; rc=$?; wait "$hold" 2>/dev/null; W=""
+  nofetch=0; grep -qx fetch "$T/events" && nofetch=1
+  k "$(t test "$rc" = 0)" "a lock held past the bound gives the publish up cleanly, rc 0"
+  k "$nofetch" "…having fetched NOTHING"
+  k "$(t test "$(wc -l < "$T/state/publish.log")" = 1)" "…and saying so in ONE log line"
+  # A DETACHED CHILD. The bug this guards: `flock ... git "$@"` (no -o) hands git a copy of the lock fd, so a
+  # background grandchild git itself spawns — auto-gc chief among them, but the hazard is any of them — inherits
+  # it and keeps the lock held after the fetch, and cc-publish, have returned. Stand in for that with a stub git
+  # that double-forks a detached `sleep` (so it is reparented, not a job of this shell), still doing the real
+  # fetch, then check the lock the instant `pub` returns — not after the child eventually exits.
+  mkdir -p "$T/stub3"
+  { echo '#!/bin/sh'
+    printf 'for a; do [ "$a" = fetch ] && { ( sleep 2 & ) ; break; }; done\n'
+    printf 'exec "%s" "$@"\n' "$(command -v git)"; } > "$T/stub3/git"
+  chmod +x "$T/stub3/git"
+  ( cd "$T/src" && PATH="$T/stub3:$PATH" HOME="$T" CC_PUBLISH_STATE="$T/state" CC_NOTIFY_LOG="$T/notify.log" \
+    PUBLISH_REMOTE="$T/pub.git" PUBLISH_REPO='' PUBLISH_PREFIX=pfx PUBLISH_BRANCH=main "$SELF" ) >/dev/null 2>&1
+  rc=$?
+  k "$(t test "$rc" = 0)" "a publish still succeeds when its fetch backgrounds a detached child"
+  k "$(t flock -n "$(repo_lock_path "$T/src")" true)" "…and the lock is free the instant it returns, not held until that child exits"
+  echo "cc-publish selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]; exit $?
 fi
 
 # A publish that cannot happen is not silent: it reaches the owner (ntfy/Slack) and leaves a line in the log.
@@ -90,6 +221,12 @@ if [ -z "$REMOTE" ]; then
 fi
 if [ -n "$REPO" ]; then R="$HOME/dev/$REPO"; else R="$(git rev-parse --show-toplevel 2>/dev/null)"; fi
 git -C "${R:-/nonexistent}" rev-parse --git-dir >/dev/null 2>&1 || die "no git repo to publish from (PUBLISH_REPO=${REPO:-unset}, cwd=$PWD)"
+# The lock file is CREATED here, not on first use: a checkout we cannot write one for fetches unlocked (LOCKF
+# stays empty) instead of dying inside flock. See THE REPO LOCK above.
+if command -v flock >/dev/null 2>&1; then
+  LOCKF="$(repo_lock_path "$R")" || LOCKF=""
+  [ -n "$LOCKF" ] && touch "$LOCKF" 2>/dev/null || LOCKF=""
+fi
 
 # A PARKED PROJECT DOES NOT PUBLISH. `cc-pause on <repo>` stops everything the box does to that project on its own,
 # and this timer runs every 15 min. `publish` only: `status` is a question and must keep answering it truthfully,
@@ -102,8 +239,9 @@ if [ "$mode" = publish ] && [ "$dry" = 0 ] && [ -x "$BIN/cc-pause" ] \
 fi
 
 SRCBR="$(git -C "$R" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"; SRCBR="${SRCBR#origin/}"
-# Named refs, never FETCH_HEAD: any other session fetching in the same repo would overwrite it under us.
-git -C "$R" fetch -q --no-tags origin "+${SRCBR:=main}:refs/remotes/origin/$SRCBR" || die "cannot fetch origin/$SRCBR in $R"
+# Named refs, never FETCH_HEAD: any other session fetching in the same repo would overwrite it under us. And
+# under the repo lock, because a landing's fetch and its install pull WRITE this very ref.
+git_locked -C "$R" fetch -q --no-tags origin "+${SRCBR:=main}:refs/remotes/origin/$SRCBR" || die "cannot fetch origin/$SRCBR in $R"
 SRC="$(git -C "$R" rev-parse "refs/remotes/origin/$SRCBR")" || die "cannot resolve origin/$SRCBR"
 TREE="$(git -C "$R" rev-parse "$SRC:$PREFIX" 2>/dev/null)" || die "no '$PREFIX/' in $SRCBR at ${SRC:0:8} — nothing to publish"
 
@@ -127,7 +265,8 @@ flock -n 9 || { echo "cc-publish: another publish is running"; exit 0; }
 ls="$(git ls-remote --heads "$REMOTE" "$BRANCH")" || die "cannot reach the public repo ($REMOTE)"
 PARENT=""; PTREE=""
 if [ -n "$ls" ]; then
-  git -C "$R" fetch -q --no-tags "$REMOTE" "+$BRANCH:refs/cc-publish/$BRANCH" || die "cannot fetch $BRANCH from the public repo"
+  # A ref namespace of our own, but every fetch writes the shared FETCH_HEAD, so this one takes the lock too.
+  git_locked -C "$R" fetch -q --no-tags "$REMOTE" "+$BRANCH:refs/cc-publish/$BRANCH" || die "cannot fetch $BRANCH from the public repo"
   PARENT="$(git -C "$R" rev-parse "refs/cc-publish/$BRANCH")"; PTREE="$(git -C "$R" rev-parse "$PARENT^{tree}")"
 fi
 if [ "$mode" = status ]; then

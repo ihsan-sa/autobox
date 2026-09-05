@@ -74,11 +74,15 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # over workspaces, projects and bare repos it builds in a HOME and temp dir of its own, with
 # a cc-gh-token that records what it was asked to create instead of creating it: no repository of this box's is
 # read, nothing is created anywhere, and the only branches pushed or deleted are in those fixtures.
+# cc-publish's is the repo lock and nothing else: in a fixture repo with its own origin and public repo under a
+# temp HOME, that the file it locks is the one cc-land's own git_lock_path names — for a checkout, a linked
+# worktree and a directory with no .git — and that its fetch waits while a landing holds it. Nothing of this
+# box's is fetched and the public repo is never reached: it publishes into a bare repo in the temp dir.
 # …and only the ones a change reaches, when the landing says what changed (CC_LAND_CHANGED — tests/green.sh has
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
 . tests/green.sh; land_scope "$PWD/bin"; skipped=""
-for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause; do
+for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
 [ -z "$skipped" ] || echo "check.sh: not in this change's reach, not run:$skipped"
