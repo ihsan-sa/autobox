@@ -9,6 +9,29 @@ bash -n "${sh[@]}"
 shellcheck -S warning -e SC1090,SC1010 "${sh[@]}"
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py "$@"
 for f in slack/*.json config/claude-settings.json config/units.json config/claude-managed.json; do jq -e . "$f" >/dev/null; done
+# the agent types (templates/home/agents/ -> ~/.claude/agents/). Nothing else reads these files: a frontmatter the
+# harness rejects takes out every spawn of that type at dispatch time, with no earlier signal. install.sh's own case
+# in selftest.sh checks that the installed copies match; this checks the templates are loadable in the first place.
+KNOWN_TOOLS="Bash BashOutput Edit Glob Grep KillShell NotebookEdit Read SlashCommand Task TodoWrite WebFetch WebSearch Write"
+for f in templates/home/agents/*.md; do
+  [ -f "$f" ] || { echo "templates/home/agents/: no agent types — install.sh and docs/WORKING.md expect them"; exit 1; }
+  n="$(basename "$f" .md)"; [ "$(head -1 "$f")" = "---" ] || { echo "$f: no YAML frontmatter"; exit 1; }
+  h="$(sed -n '2,/^---$/p' "$f")"
+  grep -qx "name: $n" <<<"$h" || { echo "$f: frontmatter 'name' must be '$n' (the harness spawns by it)"; exit 1; }
+  grep -q '^description: .' <<<"$h" || { echo "$f: frontmatter needs a 'description' — it is what picks the type"; exit 1; }
+  grep -qE '^model: (opus|sonnet|haiku|inherit)$' <<<"$h" || { echo "$f: frontmatter needs 'model: opus|sonnet|haiku|inherit'"; exit 1; }
+  # `tools` is the type's reach. A name the harness does not know is dropped in silence, so a review type asking for
+  # Grep and getting nothing looks like a quiet agent, not a broken file. No key at all means every tool: fine for a
+  # builder, wrong for a *reviewer, which must not be able to write — so that one states its list, without Write/Edit.
+  t="$(sed -n 's/^tools: *//p' <<<"$h" | tr -d ' ')"
+  for x in ${t//,/ }; do
+    case " $KNOWN_TOOLS " in *" $x "*) ;; *) echo "$f: 'tools' names $x, which is not a tool the harness has"; exit 1;; esac
+  done
+  case "$n" in *reviewer)
+    [ -n "$t" ] || { echo "$f: a review type must list its 'tools' — with no key it gets every tool, Write and Edit included"; exit 1; }
+    case ",$t," in *,Write,*|*,Edit,*) echo "$f: a review type must not list Write or Edit — it reads a diff, it does not fix it"; exit 1;; esac;;
+  esac
+done
 H=$(mktemp -d); ln -s "$PWD/bin" "$H/bin"   # verify the units against THIS tree's bin/, not against what the box happens to have linked
 v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config/systemd-user/*.timer 2>&1 | grep -v '^\s*$' || true); rm -rf "$H"
 [ -z "$v" ] || { echo "$v"; exit 1; }
@@ -61,4 +84,4 @@ for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-ec
 # Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
 # again on the same files the worker already ran it on (tests/green.sh, read by cc-land).
 green_record "$SELF" "$SCOPE"
-echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"
+echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests, agent types)"

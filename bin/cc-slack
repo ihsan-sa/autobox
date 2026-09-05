@@ -780,6 +780,16 @@ def pane_idle(wid):
     return subprocess.run(["pgrep", "-P", pid], capture_output=True).returncode != 0
 
 
+def pane_has_child(pid):
+    """Is anything running in this pane? `cc`'s pane_live(), and the only test that works: the pane command is the
+    WRAPPER SHELL — a session, a worker and a window whose session exited all report `bash` — so what tells them
+    apart is a live child under the pane pid. Unreadable pgrep: nothing is claimed to be running."""
+    try:
+        return subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
 def window_for(target):
     return "box" if target == "box" else target
 
@@ -1732,6 +1742,26 @@ HOME_STALE = ("blocked", "review", "done", "merged")   # board states a live pro
 HOME_RANK = ("running", "waiting", "blocked", "idle", "review", "done", "merged", "queued")   # what the owner must see first, first
 HOME_IDLE = 2 * 3600                           # a live pane nobody has typed at for this long is `idle`, not `running` —
                                                # the same threshold and the same tmux field cc-reconcile decides it with
+HOME_TASKS = os.environ.get("CC_HANDOFF_TASKS") or f"{tempfile.gettempdir()}/claude-{os.getuid()}"
+                                               # where the harness keeps what each session is running: one
+                                               # `<id>.output` per task under `<root>/<project>/<session>/tasks`
+                                               # (the layout was read off this box, 2026-09-04). This file is the only
+                                               # thing in the repo that reads them.
+HOME_AGENT_QUIET = 300                         # a transcript written this recently is live work on its own, and nothing
+                                               # inside it need be read. A longer silence is NOT death: an agent inside
+                                               # ONE long Bash call writes nothing at all while it waits, so past this
+                                               # the file is judged by its last record instead (home_agent_done).
+HOME_AGENT_TAIL = 65536                        # bytes of the END of a transcript read to find that last record — with
+                                               # HOME_AGENT_HEAD, the whole of what this file ever looks at.
+HOME_AGENT_HEAD = 4096                         # bytes of a subagent transcript this file looks at — its first record,
+                                               # which is the prompt. The rest of an agent's transcript is its own.
+HOME_AGENT_LINE = 64                           # …and how much of that prompt a row prints. The one row on the tab that
+                                               # carries a SENTENCE rather than a name, so it is the one that runs past
+                                               # HOME_LINE: at 40 characters four of these agents print the same row
+                                               # ("Fix a review's findings on PR #…"), which is a band that says work
+                                               # is happening without saying which.
+HOME_LANDQ = f"{HOME}/.cc/state/land"          # cc-land's queue: one job file per PR, and the only place a landing in
+                                               # flight is written down. cc-land owns every file in there; this reads.
 HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and CHANNELS print EVERY row (owner,
                                                # 2026-08-30, thread 1788129807: "what happenend to showing all the
                                                # backlog items and all ? items and not defaulting to showing only a
@@ -2272,6 +2302,11 @@ def home_parts(st):
       2 tally + running   RUNNING n · BLOCKED n · QUEUED n, then one dense line per thing actually running. A unit that
                           is down and a Claude usage limit sort ABOVE the running rows: the owner must not have to
                           scroll to learn the box is impaired. Nothing running is a SENTENCE, never a gap.
+      2a sub-orchs · subagents · landings   the other three kinds of work, one short band each — never cut, because
+                          they ARE what is running. RUNNING once meant "a board row with a worker on it", so the tab
+                          read NOTHING RUNNING while nine subagents were building rows, four landings sat in their
+                          gates and two orch sessions were open (owner, 2026-09-04: "split this into a workers
+                          section, suborchs, and subagents to show all the work being done"). The tally counts all four.
       2b idle             tracks alive with nobody at the keyboard for HOME_IDLE — how long, never an iteration count
       3 needs you         threads waiting (age + the ask), PRs owed a 👍, blocked tracks — one notation, ranked, ALL
                           of them. The whole band is absent when nothing needs them; it is never present and empty.
@@ -2306,13 +2341,20 @@ def home_parts(st):
     asking = [x for x in sessions if x.get("ask")]        # a session that declared a question is waiting on him exactly
     blocked = [t for t in tracks if t.get("state") == "blocked"]   # as a `waiting` track is: it counts in the tally and
     queued = [t for t in tracks if t.get("state") == "queued"]     # forbids "the board is clear" (review of #132, 2nd pass)
+    orchs = [x for x in (st.get("suborchs") or ()) if isinstance(x, dict)]     # the other three kinds of work in flight:
+    agents = [x for x in (st.get("subagents") or ()) if isinstance(x, dict)]   # a sub-orch session, a session's subagent,
+    lands = [x for x in (st.get("landings") or ()) if isinstance(x, dict)]     # a PR in cc-land's queue (band 2a)
     limit, until = st.get("limit") or "", home_until(st.get("limit"))
 
     # 1 — the box, and when
     p = [("head", {"type": "header", "text": {"type": "plain_text", "text": f"{box} · {st.get('now', '')}"[:150], "emoji": True}})]
 
     # 2 — the tally, then what is running. Zero counts are omitted, never printed as 0.
-    p.append(("tally", _home_ctx(" · ".join(x for x in ((f"RUNNING {len(run)}" if run else "NOTHING RUNNING"),
+    moving = [l for l in lands if l.get("stage") != "deferred"]   # a deferred job is parked until its reset comes: it
+                                                                  # is on the queue, it is not work in flight
+    work = len(run) + len(orchs) + len(agents) + len(moving)  # ALL FOUR KINDS. A headline that counted only board rows
+                                                              # with a worker said NOTHING RUNNING to a busy box.
+    p.append(("tally", _home_ctx(" · ".join(x for x in ((f"RUNNING {work}" if work else "NOTHING RUNNING"),
                                                         # counted separately and never as RUNNING: they are stopped, and
                                                         # the count is the owner's own backlog, not the box's
                                                         f"WAITING ON YOU {len(waiting) + len(asking)}" if waiting or asking else "",
@@ -2329,10 +2371,32 @@ def home_parts(st):
              for q in quick]                                    # work a session did without a track: running, no board row
     if not rows:                                             # nothing runs AND nothing is wrong: say so in words, never
         last = st.get("last") or {}                          # leave the block the owner looks at first empty
-        rows.append("_nothing is running — what is waiting is below_" if waiting or asking else
+        rows.append("_no worker on a board row_" if orchs or agents or lands else
+                    "_nothing is running — what is waiting is below_" if waiting or asking else
                     (f"✅ last: {last['name']} · {last.get('verb', 'done')} {last.get('when', '')}".rstrip()
                      if last.get("name") else "_the board is clear_"))
     p.append(("tally", _home_sec(home_list(rows, lambda k: f"_+{k} more running_", HOME_MAXTEXT))))
+
+    # 2a — the other three kinds of work, each its own band and each absent when there is none of it. They are not in
+    #      HOME_CUT: this is RUNNING, and RUNNING is never cut. 🤖 a sub-orch session · 🧠 a subagent one session has
+    #      out · 🚚 a PR in cc-land's queue — three marks, one meaning each, like everything else on the tab.
+    if orchs:
+        p += [("suborchs", _home_ctx(f"SUB-ORCHS · {len(orchs)}")),
+              ("suborchs", _home_sec(home_list([f"🤖 {home_tag(o.get('repo'))}*{home_short(o.get('alias'))}*" for o in orchs],
+                                               lambda k: f"_+{k} more sub-orchs_")))]
+    if agents:
+        p += [("subagents", _home_ctx(f"SUBAGENTS · {len(agents)}")),
+              # what it was ASKED, in one line — a count alone tells the owner only that they have to go and look
+              ("subagents", _home_sec(home_list([f"🧠 {home_clip(a.get('task'), HOME_AGENT_LINE) or home_short(a.get('id'))}"
+                                                 for a in agents], lambda k: f"_+{k} more subagents_")))]
+    if lands:
+        p += [("landings", _home_ctx(f"LANDING · {len(lands)}")),
+              # a job with no PR is cc-land's catch-up deploy (`<repo>-deploy.json`, "pr": null) — the one landing
+              # that names no PR, and printing it as `PR #` said nothing at all
+              ("landings", _home_sec(home_list([home_fit(f"🚚 {home_tag(l.get('repo'))}"
+                                                         + (f"*PR #{l.get('pr')}*" if l.get("pr") else "*deploy*"),
+                                                         [l.get("stage")]) for l in lands],
+                                               lambda k: f"_+{k} more landing_")))]
 
     # 2b — IDLE: alive, and nothing happening at it. Its own band and never inside RUNNING, because 🏃 is a claim that
     #      work is in flight and one of these was making it for 1 d 19 h (owner, 2026-09-01). Each row says how long it
@@ -2462,7 +2526,8 @@ def home_cut(parts, maxblk=HOME_MAXBLK):
     the picture because a day's total is a summary the owner can ask for (`cc-spend`) while the chart answers what the
     box is doing right now.
     What is RUNNING and the NEEDS YOU band are never cut — they are the two questions the tab exists to answer,
-    and a tab that drops them to make room for the audit paragraph has failed at its whole job."""
+    and a tab that drops them to make room for the audit paragraph has failed at its whole job. RUNNING is all four
+    kinds (home_parts 2 and 2a), so the sub-orch, subagent and landing bands are not in this list either."""
     out = list(parts)
     for tag in HOME_CUT:
         if len(out) <= maxblk:
@@ -2527,6 +2592,17 @@ def home_windows():
     """{window name: pane command} for tmux session main — one call, reused by every row of the dashboard."""
     try:   # bounded: a wedged tmux must never stall the 30 s loop (nudges, sweeps and the board reconcile share it)
         r = subprocess.run(["tmux", "list-windows", "-t", "main", "-F", "#W\t#{pane_current_command}"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return {}
+    return dict((l.split("\t") + [""])[:2] for l in r.stdout.splitlines() if l) if r.returncode == 0 else {}
+
+
+def home_panes():
+    """{window name: pane pid} for tmux session main — the companion field to home_windows' pane command, and the one
+    that says whether anything is actually running in a window (pane_has_child, home_suborchs)."""
+    try:
+        r = subprocess.run(["tmux", "list-windows", "-t", "main", "-F", "#W\t#{pane_pid}"],
+                           capture_output=True, text=True, timeout=5)
     except Exception:
         return {}
     return dict((l.split("\t") + [""])[:2] for l in r.stdout.splitlines() if l) if r.returncode == 0 else {}
@@ -2756,6 +2832,159 @@ def home_idle():
             continue                                      # no activity stamp is not evidence that nobody is there
         if name and when:
             out[name] = max(0.0, now - when)
+    return out
+
+
+def home_suborchs(panes=None, live=None):
+    """[{"repo", "alias"}] for every sub-orchestrator session. `cc <repo> --orch <alias>` opens tmux window
+    `<repo>@<alias>` in session main, so the window list IS the register — and what tells a session from the window it
+    left behind is A LIVE CHILD UNDER THE PANE (pane_has_child), never the pane command. Every live session on this
+    box reports `bash` there, because that is the wrapper the claude runs under: reading the command is how the first
+    version of this rendered no orch at all."""
+    live = pane_has_child if live is None else live
+    out = []
+    for name, pid in sorted((home_panes() if panes is None else panes).items()):
+        repo, at, alias = str(name).partition("@")
+        if at and repo and alias and pid and live(pid):
+            out.append({"repo": repo, "alias": alias})
+    return out
+
+
+def home_agent_task(path, n=HOME_AGENT_LINE):
+    """The FIRST LINE of what a subagent was asked, and nothing else out of its transcript: the harness writes the task
+    prompt as the first record of the file the `.output` link points at. A bounded read of the head — the rest of an
+    agent's transcript is its own business and never the dashboard's."""
+    try:
+        with open(path, errors="replace") as f:
+            head = f.read(HOME_AGENT_HEAD).split("\n", 1)[0]
+    except OSError:
+        return ""
+    try:
+        c = (json.loads(head).get("message") or {}).get("content")
+    except Exception:                          # the record is longer than the head we read: lift the prompt out of it,
+        m = (re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)', head)                      # …a plain string,
+             or re.search(r'"content"\s*:\s*\[.*?"text"\s*:\s*"((?:[^"\\]|\\.)*)', head, re.S))   # …or the first block
+        raw = re.sub(r"\\+$", "", m.group(1)) if m else ""      # …minus an escape our cut landed in the middle of
+        try:
+            c = json.loads('"%s"' % raw)
+        except Exception:
+            c = raw
+    if isinstance(c, list):                    # content blocks: the text ones are the prompt
+        c = " ".join(str(b.get("text") or "") for b in c if isinstance(b, dict))
+    first = str(c or "").strip().splitlines()
+    return home_clip(first[0], n) if first else ""       # …on a word boundary, like every other clipped row
+
+
+def home_session_live(sid):
+    """Is the session that owns a tasks directory still up? The directory name IS the session id, and every session
+    this box starts carries that id on its own command line — `cc` passes `--session-id` on a first run and `--resume`
+    after, and `cc __runnext` repeats it for a successor — so one pgrep answers it. Anything that is not a plain id is
+    not asked about at all: this pattern goes to pgrep -f."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,}", str(sid or "")):
+        return False
+    try:
+        return subprocess.run(["pgrep", "-f", str(sid)], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+def home_agent_done(path, tail=HOME_AGENT_TAIL):
+    """Has this subagent finished? Its transcript's LAST record says so: an agent's final report is an `assistant`
+    record carrying text and no `tool_use`, so anything else — a tool_use it is still running, or the tool_result it
+    was just handed — is an agent mid-turn. Read from the END of the file and bounded; a tail that catches no whole
+    record, and a file that cannot be read, both answer "not finished", because the costly mistake here is calling a
+    live agent gone."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - tail))
+            chunk = f.read()
+    except OSError:
+        return False
+    lines = [ln for ln in chunk.split(b"\n") if ln.strip()]
+    if not lines or (size > tail and len(lines) < 2):     # the cut landed inside the last record: no answer either way
+        return False
+    try:
+        rec = json.loads(lines[-1].decode("utf-8", "replace"))
+    except Exception:
+        return False                           # a record caught mid-write is not a finished agent
+    if not isinstance(rec, dict) or rec.get("type") != "assistant":
+        return False
+    c = (rec.get("message") or {}).get("content")
+    return not any(isinstance(b, dict) and b.get("type") == "tool_use" for b in (c if isinstance(c, list) else []))
+
+
+def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None):
+    """[{"id", "task"}] — the subagents a session has out RIGHT NOW, busiest first.
+
+    WHAT IS READ: `<root>/<project>/<session>/tasks/<id>.output`, the harness's one file per task. A `.output` that is
+    a SYMLINK points at a subagent's own transcript; a plain file beside it is a background Bash command or a Monitor
+    writing its output, and neither is a subagent. Nothing else in this repo reads these files.
+
+    LIVE is the whole difficulty, because the file OUTLIVES the agent: a finished agent's `.output` sits in the
+    session's tmp directory for as long as that directory does. Two things must hold. (1) The session that owns it is
+    still up (home_session_live). (2) Its transcript was written within `quiet` seconds, OR its last record is not the
+    agent's final report (home_agent_done) — an agent inside ONE long Bash call writes nothing at all while it waits,
+    and reading that one as gone is the expensive mistake.
+    THE FAILURE MODES, both accepted: a session started by hand as a bare `claude`, with no id on its command line,
+    shows none of its agents — the band under-counts rather than invents work; and an agent KILLED mid-turn never
+    writes a final report, so it is counted until the session that owns it ends (as is one that finished within the
+    last `quiet` seconds).
+
+    A session running IN A TRACK WORKTREE is skipped: that is a worker, its board row is already the running section,
+    and counting its agents again would count one piece of work twice."""
+    root, now = root or HOME_TASKS, time.time() if now is None else now
+    live = home_session_live if live is None else live
+    worker = re.sub(r"[^A-Za-z0-9]", "-", f"{HOME}/.cc/worktrees") + "-"   # the harness's project dir is the cwd, flattened
+    out, asked = [], {}
+    for d in sorted(glob.glob(f"{root}/*/*/tasks")):
+        proj, sid = d.split("/")[-3], d.split("/")[-2]
+        if proj.startswith(worker):
+            continue
+        agents = sorted(f for f in glob.glob(f"{d}/*.output") if os.path.islink(f))
+        if not agents:
+            continue                           # ask about the session only once it has an agent file at all: the pgrep
+        if sid not in asked:                   # is per SESSION, never per task
+            asked[sid] = bool(live(sid))
+        if not asked[sid]:
+            continue                           # the session is gone; what it left behind is not work in flight
+        for f in agents:
+            try:
+                m = os.stat(f).st_mtime        # THROUGH the link: the link itself is written once and never again
+            except OSError:
+                continue                       # dangling: a transcript that is gone is nobody's work
+            if now - m >= quiet and home_agent_done(f):
+                continue
+            out.append((m, {"id": os.path.basename(f)[:-len(".output")], "task": home_agent_task(f)}))
+    return [a for _, a in sorted(out, key=lambda x: -x[0])]
+
+
+def home_landings(q=None, is_paused=None):
+    """[{"repo", "pr", "stage"}] — the landings cc-land has in flight. The job FILE is the landing: it outlives the
+    worker that ran it, so a queued PR is landing whether or not a process is up at this instant, and `stage` is where
+    cc-land had got to (queued · gates · review · fixing · deferred). A job with no `pr` is the catch-up deploy job
+    (`<repo>-deploy.json`). Its subdirectories are not jobs, and neither is a file we cannot read — the tab names what
+    is there, and cc-land alone decides any of it.
+
+    A PAUSED PROJECT'S JOBS ARE NOT LANDINGS. `cc-pause on` parks them: cc-land leaves them untried and its next_wake
+    arms no timer for them, so nothing moves until `cc-pause off` — and the tab said RUNNING 1 for as long as that
+    lasted. The same `paused(repo)` check next_wake makes, asked once per repo."""
+    is_paused, seen, out = paused if is_paused is None else is_paused, {}, []
+    for p in sorted(glob.glob(f"{q or HOME_LANDQ}/*.json")):
+        try:
+            j = json.load(open(p))
+        except Exception:
+            continue                           # a job file mid-write is not a landing anyone can name
+        if not (isinstance(j, dict) and j.get("repo")):
+            continue
+        repo = str(j["repo"])
+        if repo not in seen:
+            seen[repo] = bool(is_paused(repo))
+        if seen[repo]:
+            continue
+        out.append({"repo": repo, "pr": str(j.get("pr") or ""), "stage": str(j.get("stage") or "queued")})
     return out
 
 
@@ -5431,6 +5660,9 @@ class Daemon:
                 "load": home_load(), "limit": cached("limit", HOME_CACHE, limit_now), "channels": chans,
                 "tracks": tracks, "last": last, "waits": waits, "sessions": sessions, "cards": dict(self.home_cards),
                 "quick": cached("quick", HOME_CACHE, home_quick),
+                "suborchs": cached("suborchs", HOME_CACHE, home_suborchs),
+                "subagents": cached("subagents", HOME_CACHE, home_subagents),
+                "landings": cached("landings", HOME_CACHE, home_landings),
                 "graphs": cached("graphs", HOME_CACHE, home_graphs),
                 "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
                 "spend": cached("spend", HOME_CACHE, home_spend),
@@ -9499,6 +9731,131 @@ def cmd_selfcheck():
           and "SESSIONS" not in htxt and home_blocks(hfix) == hb       # no sessions, no band; a track-only tab is unchanged
           and HOME_CUT.index("sessions") < HOME_CUT.index("channels")   # …and it is cut before the channels, after the chart
           and "sessions" not in {t for t, _ in home_cut(home_parts(dict(hfix, sessions=[{"repo": "r", "name": "s"}])), 5)})
+    # ── ALL FOUR KINDS OF WORK (owner, 2026-09-04, thread 1788566080: "split this into a workers section, suborchs,
+    #    and subagents to show all the work being done"). The tab said NOTHING RUNNING with nine subagents building
+    #    rows, four landings in their gates and two orch sessions open, because RUNNING meant "a board row with a
+    #    worker on it" and nothing else.
+    hall = dict(hfix, suborchs=[{"repo": "abox", "alias": "helper"}, {"repo": "sandbox", "alias": "rugs"}],
+                subagents=[{"id": "a1f2", "task": "build the four rows for the Home tab"},
+                           {"id": "b9c0", "task": ""}],
+                landings=[{"repo": "abox", "pr": "226", "stage": "gates"},
+                          {"repo": "sandbox", "pr": "7", "stage": "review"}])
+    tall = home_text(home_parts(hall))
+    check("home_parts: the headline counts ALL FOUR kinds of work and each gets its own short band — 2 workers + 2 "
+          "sub-orchs + 2 subagents + 2 landings is RUNNING 8, a sub-orch says whose repo it is, a subagent says what "
+          "it was ASKED (its id only when the prompt is unreadable) and a landing says the PR and the phase",
+          tall["tally"].startswith("RUNNING 8 · BLOCKED 1 · QUEUED 10") and "🏃 *slack-home*" in tall["tally"]
+          and tall["suborchs"] == "SUB-ORCHS · 2\n🤖 [abox] *helper*\n🤖 [sandbox] *rugs*"
+          and tall["subagents"] == "SUBAGENTS · 2\n🧠 build the four rows for the Home tab\n🧠 b9c0"
+          and tall["landings"] == "LANDING · 2\n🚚 [abox] *PR #226* · gates\n🚚 [sandbox] *PR #7* · review"
+          and hbudget(home_blocks(hall)) and hno_empty_header(home_blocks(hall)) and hvocab(home_blocks(hall)))
+    check("home_parts: a kind with nothing in it prints nothing, the three bands are never cut (they ARE what is "
+          "running), and a tab with none of them is byte-for-byte the busy reference",
+          home_blocks(hfix) == hb and not {"suborchs", "subagents", "landings"} & set(HOME_CUT)
+          and not {"suborchs", "subagents", "landings"} & {t for t, _ in home_parts(hfix)}
+          and [t for t, _ in home_cut(home_parts(hall), 13)]      # squeezed to the bands that are never cut:
+              == ["head", "tally", "tally", "suborchs", "suborchs", "subagents", "subagents", "landings",
+                  "landings", "needs", "needs", "actions", "fold"])
+    hnow = home_text(home_parts({"box": "abox", "now": "07:58", "units": [], "load": "", "channels": [], "waits": [],
+                                 "quick": [], "tracks": [], "boot": "", "last": None,
+                                 "landings": [{"repo": "abox", "pr": "226", "stage": "queued"},
+                                              {"repo": "abox", "pr": "", "stage": "queued"},
+                                              {"repo": "sandbox", "pr": "7", "stage": "deferred"}]}))
+    check("home_parts: NOTHING RUNNING is gone the moment any kind has something in it — a landing alone makes the "
+          "headline RUNNING, and the running section says there is no worker rather than \"the board is clear\"; the "
+          "job with no PR is cc-land's catch-up deploy and says `deploy` rather than a `PR #` naming nothing, and a "
+          "DEFERRED job is listed but never counted as running: nothing moves it until its reset comes",
+          hnow["tally"] == "RUNNING 2\n_no worker on a board row_" and "LANDING · 3" in hnow["landings"]
+          and "🚚 [abox] *deploy* · queued" in hnow["landings"] and "PR #*" not in hnow["landings"]
+          and "🚚 [sandbox] *PR #7* · deferred" in hnow["landings"])
+    hsleep = subprocess.Popen(["sleep", "30"])       # a REAL pane test, against the real pgrep: this process now has a
+    try:                                             # live child (a session's pane) and the sleep itself has none (a
+        hbusy, hfree = str(os.getpid()), str(hsleep.pid)      # window whose session exited). Both panes report `bash`.
+        check("home_suborchs: a sub-orch session is the tmux window `<repo>@<alias>` in main, and what tells it from "
+              "the window it left behind is A LIVE CHILD under the pane — never the pane command, which is the wrapper "
+              "shell for a live session and an empty window alike (the first version of this read the command and "
+              "rendered no orch at all)",
+              home_suborchs({"abox@helper": hbusy, "abox@gone": hfree, "abox/track": hbusy, "box": hbusy,
+                             "sandbox@rugs": hbusy, "abox@": hbusy, "abox@nopid": ""})
+              == [{"repo": "abox", "alias": "helper"}, {"repo": "sandbox", "alias": "rugs"}]
+              and pane_has_child(hbusy) and not pane_has_child(hfree) and not pane_has_child("not-a-pid")
+              and home_suborchs({}) == [])
+    finally:
+        hsleep.kill(); hsleep.wait()
+    hagd = tempfile.mkdtemp(prefix="cc-slack-selfcheck-agents-")
+    try:
+        hwslug = re.sub(r"[^A-Za-z0-9]", "-", f"{HOME}/.cc/worktrees") + "-"
+        hprompt = "land the gate then merge " * 400              # one record far past the head this file may read
+        hmid = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}
+        hend = {"type": "assistant", "message": {"content": [{"type": "text", "text": "NEVER READ"}]}}   # a final report
+        hlive = ("s0", "s2")                                     # …and the sessions still up: s3's has gone
+        for proj, sid, tasks in ((f"{hwslug}abox-a-track", "s0", {"w1": (hprompt, hmid, 0)}),
+                                 ("-home-x-dev-abox", "s1", {}),
+                                 ("-home-x-dev-abox", "s3", {"d1": ("a dead session's agent", hmid, 0)}),
+                                 ("-home-x-dev-abox", "s2", {"a1": ("build the rows\nand the tally", hmid, 0),
+                                                             "a2": ("a finished agent, file still there", hend, 4000),
+                                                             "a3": (hprompt, hmid, 4000),   # silent in one long Bash call
+                                                             "a4": ([{"type": "text", "text": "review PR #9"}], hend, 0),
+                                                             "a5": ([{"type": "text", "text": hprompt}], hmid, 0)})):
+            os.makedirs(f"{hagd}/{proj}/{sid}/tasks")
+            for name, (content, last, age) in tasks.items():
+                with open(f"{hagd}/{proj}/{sid}/{name}.jsonl", "w") as fh:
+                    fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n")
+                    fh.write(json.dumps(last) + "\n")
+                os.symlink(f"{hagd}/{proj}/{sid}/{name}.jsonl", f"{hagd}/{proj}/{sid}/tasks/{name}.output")
+                if age:
+                    os.utime(f"{hagd}/{proj}/{sid}/{name}.jsonl", (time.time() - age, time.time() - age))
+        open(f"{hagd}/-home-x-dev-abox/s2/tasks/bg1.output", "w").write("a background shell command's output")
+        os.symlink(f"{hagd}/-home-x-dev-abox/s2/nothing.jsonl", f"{hagd}/-home-x-dev-abox/s2/tasks/gone.output")
+        hag = home_subagents(root=hagd, live=lambda sid: sid in hlive)
+        check("home_subagents: only what is LIVE — a `.output` OUTLIVES its agent, so `a2` (silent, and its last record "
+              "the agent's final report) is finished and gone from the band while `a3` (just as silent, but mid-turn "
+              "inside one long Bash call) is still running; a plain file beside them is a background Bash command or a "
+              "Monitor, a dangling link is nobody's work, a DEAD session shows none of its agents, and a session in a "
+              "TRACK WORKTREE is skipped because its board row already IS the workers section",
+              sorted(a["id"] for a in hag) == ["a1", "a3", "a4", "a5"]
+              and home_agent_done(f"{hagd}/-home-x-dev-abox/s2/tasks/a2.output")
+              and not home_agent_done(f"{hagd}/-home-x-dev-abox/s2/tasks/a3.output")
+              and not home_agent_done(f"{hagd}/no-such-file")
+              and sorted(a["id"] for a in home_subagents(root=hagd, quiet=0, live=lambda sid: sid in hlive))
+                  == ["a1", "a3", "a5"]        # quiet=0: the last record alone decides, and a4 has reported too
+              and home_subagents(root=hagd, live=lambda sid: False) == []
+              and home_subagents(root=f"{hagd}/no-such-root") == []
+              and {a["id"]: a["task"] for a in hag}["a1"] == "build the rows")
+        check("home_agent_task: the FIRST LINE of what the agent was asked and NOTHING else of its transcript — out of "
+              "content blocks as well as a plain string, and out of a record LONGER than the head we may read, in "
+              "either of those two shapes",
+              {a["id"]: a["task"] for a in hag}["a4"] == "review PR #9"
+              and {a["id"]: a["task"] for a in hag}["a3"] == home_clip(hprompt, HOME_AGENT_LINE)
+              and {a["id"]: a["task"] for a in hag}["a5"] == home_clip(hprompt, HOME_AGENT_LINE)
+              and len(home_clip(hprompt, HOME_AGENT_LINE)) <= HOME_AGENT_LINE
+              and "NEVER READ" not in json.dumps(hag) and home_agent_task(f"{hagd}/no-such-file") == "")
+    finally:
+        shutil.rmtree(hagd, ignore_errors=True)
+    hlqd = tempfile.mkdtemp(prefix="cc-slack-selfcheck-land-")
+    try:
+        os.makedirs(f"{hlqd}/root")                                      # cc-land's own subdirectories are not jobs
+        json.dump({"repo": "abox", "pr": 226, "stage": "gates"}, open(f"{hlqd}/abox-226.json", "w"))
+        json.dump({"repo": "abox", "pr": 7}, open(f"{hlqd}/abox-7.json", "w"))
+        json.dump({"repo": "abox", "pr": 9}, open(f"{hlqd}/root/abox-9.json", "w"))
+        json.dump({"repo": "abox", "pr": None, "stage": "queued"}, open(f"{hlqd}/abox-deploy.json", "w"))
+        json.dump({"repo": "parked", "pr": 12, "stage": "queued"}, open(f"{hlqd}/parked-12.json", "w"))
+        open(f"{hlqd}/abox.applied", "w").write('{"sha": "deadbee"}')
+        open(f"{hlqd}/half-written.json", "w").write('{"repo": "abox", "pr": 3, "st')
+        hnopause = lambda repo: False
+        check("home_landings: every PR in cc-land's queue and its phase, off the job FILES that outlive the worker "
+              "that ran them — a stage nobody wrote yet is `queued`, the catch-up deploy job carries no PR, a PAUSED "
+              "project's job is not a landing at all (cc-land will not touch it until `cc-pause off`), and a "
+              "subdirectory, an `.applied` marker and a file caught mid-write are none of them landings",
+              home_landings(hlqd, hnopause) == [{"repo": "abox", "pr": "226", "stage": "gates"},
+                                                {"repo": "abox", "pr": "7", "stage": "queued"},
+                                                {"repo": "abox", "pr": "", "stage": "queued"},
+                                                {"repo": "parked", "pr": "12", "stage": "queued"}]
+              and [l["repo"] for l in home_landings(hlqd, lambda repo: repo == "parked")] == ["abox"] * 3
+              and home_landings(f"{hlqd}/root", hnopause) == [{"repo": "abox", "pr": "9", "stage": "queued"}]
+              and home_landings(f"{hlqd}/no-such-queue", hnopause) == [])
+    finally:
+        shutil.rmtree(hlqd, ignore_errors=True)
     check("home_blocks: the phone line — short names, facts dropped RIGHT TO LEFT (PR, then $, then iterations) so the "
           "leftmost fact survives, and a sub-channel indented with NB-spaces Slack cannot collapse",
           home_short("sandbox/subproj-carpet-rectify") == "subproj-carpet-rectify"

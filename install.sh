@@ -54,6 +54,21 @@ for f in "$R"/templates/home/*.md; do
   sed "s|<box>|$box|g; s|<user>|${USER:-$(id -un)}|g" "$f" > "$d"
   echo "seeded $d from templates/home/ — fill in its <placeholders>"
 done
+# ~/.claude/agents/: the agent types a session spawns (builder, reviewer, security-reviewer). The harness reads this
+# directory, so they have to be real files there and not links into the repo — a link would put the owner's tuning of
+# one straight into a commit. Copies drift, so each one gets a stamp of what was last installed: dest = stamp means
+# nobody has touched it and it follows the template; dest ≠ stamp means the owner edited it, and it is kept and named,
+# never overwritten. Which type is used when is docs/WORKING.md.
+mkdir -p ~/.claude/agents ~/.cc/state/agents-installed
+for f in "$R"/templates/home/agents/*.md; do
+  [ -f "$f" ] || continue
+  n="$(basename "$f")"; d=~/.claude/agents/"$n"; s=~/.cc/state/agents-installed/"$n"
+  if [ -L "$d" ];      then echo "left the symlink at ~/.claude/agents/$n alone — an agent type is a real file here (a cp would write through the link, and a dangling one reads as absent)"
+  elif [ ! -e "$d" ];  then cp "$f" "$d"; cp "$f" "$s"; echo "installed agent $n"
+  elif cmp -s "$f" "$d"; then cp "$f" "$s"                                                    # already the template: keep the stamp honest, say nothing
+  elif cmp -s "$d" "$s"; then cp "$f" "$d"; cp "$f" "$s"; echo "updated agent $n from its template"
+  else echo "kept your edited ~/.claude/agents/$n — the template moved on (diff it against $f)"; fi
+done
 link "$R/ccbox" ~/ccbox
 link "$R/docs/WORKING.md" ~/WORKING.md          # what a session does between tasks — at ~ beside the guides it is read with
 link "$R/config/tmux.conf" ~/.tmux.conf

@@ -1822,6 +1822,19 @@ miss=""; for g in USAGE COMMS RUNBOOK; do [ -f "$IH/$g.md" ] || miss="$miss $g";
 [ -z "$miss" ] && ok "the guides the contract points at exist at ~ (USAGE COMMS RUNBOOK; SLACK folded into COMMS)" || bad "guides missing:$miss"
 [ "$(readlink -f "$IH/WORKING.md")" = "$IR/docs/WORKING.md" ] && ok "~/WORKING.md links to the tree's docs/WORKING.md" || bad "~/WORKING.md not linked"
 [ -f "$IH/.claude/settings.json" ] && env HOME="$IH" CC_SETTINGS_FILE="$IH/.claude/settings.json" "$IR/bin/cc-settings" check >/dev/null 2>&1 && ok "default ~/.claude/settings.json installed and satisfies the managed subset" || bad "settings.json missing or drifted from claude-managed.json"
+# the agent types, at ~/.claude/agents/ where the harness reads them. Copies, so the owner can tune one on the box —
+# which is exactly why they need a stamp: an untouched copy still follows its template, an edited one is never
+# overwritten. Both directions, because either failure is silent (a stale builder, or the owner's tuning gone).
+miss=""; for f in "$IR"/templates/home/agents/*.md; do n=$(basename "$f"); cmp -s "$f" "$IH/.claude/agents/$n" || miss="$miss $n"; done
+[ -z "$miss" ] && ok "every agent type is installed at ~/.claude/agents/ ($(cd "$IR/templates/home/agents" && echo *.md | sed 's/\.md//g'))" || bad "agent types not installed or drifted:$miss"
+echo "# the owner's own tuning" >> "$IH/.claude/agents/builder.md"; printf '\nthe template moved on.\n' >> "$IR/templates/home/agents/reviewer.md"; inst
+grep -q "^# the owner's own tuning$" "$IH/.claude/agents/builder.md" && ok "an agent the owner edited by hand survives the next install" || bad "install.sh overwrote a hand-edited agent"
+cmp -s "$IR/templates/home/agents/reviewer.md" "$IH/.claude/agents/reviewer.md" && ok "…and an untouched one follows its template when the template changes" || bad "a changed agent template never reached ~/.claude/agents"
+# a symlink in that directory is never written through: a dangling one reads as absent to -e, and the cp would have
+# landed on whatever it points at — here a path outside ~/.claude entirely
+mv "$IH/.claude/agents/security-reviewer.md" "$T/moved-agent"; ln -s "$T/gone-agent" "$IH/.claude/agents/security-reviewer.md"; inst
+{ [ ! -e "$T/gone-agent" ] && [ -L "$IH/.claude/agents/security-reviewer.md" ]; } && ok "a symlink at ~/.claude/agents/<type>.md is left alone, not written through" || bad "install.sh wrote through a dangling agent symlink"
+rm -f "$IH/.claude/agents/security-reviewer.md"; mv "$T/moved-agent" "$IH/.claude/agents/security-reviewer.md"
 # the second run is the deploy path (every landing re-runs install.sh): it must change nothing, and an existing
 # ~/CLAUDE.md — here the owner's own — is never rewritten
 echo "# mine" > "$IH/CLAUDE.md"
