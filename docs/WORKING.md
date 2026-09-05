@@ -25,9 +25,48 @@ The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wa
 every 2 h — the tick carries what the files say (red main, open asks, queued rows, rows in flight) so an empty check
 is cheap — and each one works the order above on its own; nothing here waits to be asked.
 
+## taking a board row
+A row runs as a subagent of this session, in the worktree the Agent tool gives it under
+`.claude/worktrees/`, on a `planning/<row>` branch. That is not a `cc` track worktree: the `.cc/track`
+marker cc-checkpoint keys on is written only by `cc <repo> <row>` and `cc <repo> <row> --go`, and both of
+those start a session, so `cc done` cannot finish this work. This session commits, pushes and opens the PR
+itself, with git and `gh`.
+A hand-made `planning/<branch>` gets no automatic repair round: on a LAND-AFTER-FIX the landing queue's fix
+iteration branches a fresh worktree and pushes where the PR is not, so on that path this session resumes the
+builder itself. Keep the prompt minimal — point it at the row's `task.md` and at these working rules, and say
+it stays in the worktree and does not commit. When it returns, a second subagent reads the diff and gives a
+verdict; this session reads the verdict, not the diff.
+
+Leave the row `queued` while a subagent holds it, and record the claim with `cc-board note`. `queued` is the
+only word cc-reconcile leaves alone: a subagent is not a worker, a cc-loop or a track pane, so the row is
+never live to it, and `running` or `waiting` becomes `blocked` once the 10 min grace passes ("no worker, and
+nothing says why"). The cost is that cc-pulse still counts a queued row as work waiting to be picked up — the
+tick reaches this same session, which reads its own note.
+
+Then commit the worktree, push, and open the PR with `gh` — and close the row out in this order, because the
+status word on its own tells nothing downstream anything:
+1. `cc-board set <repo> <row> pr <url>`. `pr` is what cc-reconcile's review watchdog and `cc-land`'s board
+   close key on; without it the row asks the owner "it is waiting on a PR that was never opened" every day.
+   `branch` is only cc-land's fallback when the row has no `pr`, and it would not match here anyway:
+   `cc-board add` fills it with `track/<row>`, not the `planning/<row>` the PR is on.
+2. `cc-board status <repo> <row> review`.
+3. `cc-slack post-approval <repo> <url>` — the #approvals card is what a 👍 is given on, and nothing else
+   posts one.
+
+`cc done <repo> <row>` does those three in one call, but only in a worktree `cc` made — it reads the
+`.cc/track` marker. Landing follows the repo's standing: this session runs `cc-land <repo> <pr>` where the
+owner has granted standing merging, the card otherwise, and cc-land closes the row by the PR URL.
+
+A `cc <repo> <track> --go` worker is still right for a real project, or for a big task split into serial
+pieces: it gets its own gates, journal and PR, and it outlives this session.
+
+Subagents die with the session that spawned them, so a session does not hand off while any are in flight:
+finish them or abandon them first. A retired session is gated as a worker — it can no longer push or land —
+so anything left running is the successor's to pick up, worktrees and landing both.
+
 ## dispatch judgement
-- Planner does it: <=2 files, ~60 lines, the fix already known, nothing live holding those files — short branch, PR like anything else.
-- Subagent: work that is bounded, already scoped, and finishes inside this session's life — a read whose answer compresses (delegate any that would add more than ~10k here), and equally a known fix, in its own worktree, committing and pushing itself. Cheapest model that holds quality; never for grep-shaped exploration. It costs a fraction of a worker: a bounded analysis ran to well under $1 where the same job as a worker is a $2.50-$9 repair round. Two things it cannot do — it dies with this session (a handoff killed one mid-flight on 2026-09-02 and the work was redone), and it inherits this session's reach rather than getting its own gates, journal and PR.
+- Planner does it itself only when spawning costs more than the fix: <=2 files, ~60 lines, the fix already known, nothing live holding those files — short branch, PR like anything else.
+- Subagent: work that is bounded, already scoped, and finishes inside this session's life — a read whose answer compresses (delegate any that would add more than ~10k here), and equally a known fix, in its own worktree, leaving the commit to this session. Cheapest model that holds quality; never for grep-shaped exploration. It costs a fraction of a worker: a bounded analysis ran to well under $1 where the same job as a worker is a $2.50-$9 repair round. Two things it cannot do — it dies with this session (a handoff killed one mid-flight on 2026-09-02 and the work was redone), and it inherits this session's reach rather than getting its own gates, journal and PR.
 - Worker: open design, more files, its own test cycle, unattended running, or a file another track holds. One worker per file: split by file or run in sequence (both research arms: never parallelise writers); check the board's live tracks first.
 - Lump sub-goals into one worker until the diff stops being reviewable in one sitting. Each one folded in saves a spinup, a gate run, a review and a landing.
 - A brief is a goal: what, why, the boundaries, 3-5 testable done-criteria — never the steps. The PR review gets the contract and the diff, never the worker's journal.
