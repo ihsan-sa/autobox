@@ -23,6 +23,13 @@ THREE LINES, EACH A PERCENTAGE OF THE WINDOW WITH A FLOOR UNDER IT (all six in ~
   40%, never under 90k   hand off — due, but only when nothing is in flight
   60%                    ceiling — hand off regardless of what is in flight
                          CC_CONTEXT_{WARN,HANDOFF}_PCT · CC_CONTEXT_{WARN,HANDOFF}_MIN · CC_CONTEXT_CEILING_PCT
+…AND A RETRY LINE EVERY FIVE PERCENT BETWEEN THE HANDOFF LINE AND THE CEILING (45, 50, 55 on the defaults;
+CC_CONTEXT_RETRY_PCT, 0 for none). A handoff can DIE — the one started at 01:35Z on 2026-09-05 sat on a
+permission prompt and was abandoned — and until then the session that had taken it had nothing left before the
+ceiling: `handed_off` made every later turn 'already taken'. Each of these lines is one more crossing, sent
+with --retry, and the ceiling is the last of them so a dead overlap cannot take its teeth with it. Whether a
+crossing MEANS a new attempt is cc-handoff's call (its `retryable`: only an overlap that ended with the
+predecessor still in charge is tried again); a crossing while one is open is only the watchdog, as before.
 On the 1M window the box's sessions run that is 300k / 400k / 600k. They are early on purpose: this is about
 how SHARP a session is, not about running out of room. The evidence says there is no plateau to sit just
 below — Chroma's "Context Rot" finds degradation at every input length it tested, and NoLiMa has 10 of 12
@@ -55,8 +62,8 @@ Because an overlap interrupts nobody there is nothing to defer on, so the "PENDI
 cannot happen while it is on; `in_flight` is kept, demoted to the successor's opening checklist.
 
 THE RECORD. Every crossing appends one JSON line to ~/.cc/state/context/handoffs.jsonl: when, which session,
-repo/track, the percentage and the token count, and which line fired (journal · handoff · ceiling, and the
-`-deferred` forms when something was in flight). Countable with `wc -l`, so a reader never parses prose.
+repo/track, the percentage and the token count, and which line fired (journal · handoff · ceiling, the
+`-deferred` forms when something was in flight, and the `-retry` forms for a second or later attempt). Countable with `wc -l`, so a reader never parses prose.
 
 The message is delivered through the Stop hook's own reply channel: `{"decision":"block","reason":…}` makes
 the session continue and do what the reason says (verified 2026-08-30 — it works headless too), and the
@@ -133,6 +140,21 @@ def thresholds(window=BIG_WINDOW):
     j = max(window * cfg("CC_CONTEXT_WARN_PCT", 30.0) / 100, cfg("CC_CONTEXT_WARN_MIN", 60000))
     h = max(window * cfg("CC_CONTEXT_HANDOFF_PCT", 40.0) / 100, cfg("CC_CONTEXT_HANDOFF_MIN", 90000))
     return j, h, max(window * cfg("CC_CONTEXT_CEILING_PCT", 60.0) / 100, h)
+
+
+def retry_lines(window=BIG_WINDOW):
+    """The retry lines between the handoff line and the ceiling, in TOKENS: one every CC_CONTEXT_RETRY_PCT of
+    the window (5 -> 45, 50, 55 on the defaults). A handoff that died leaves the session with nothing before
+    the ceiling, which is what let one abandoned overlap park a session for the rest of its life. 0 = none."""
+    _, h, c = thresholds(window)
+    step = window * cfg("CC_CONTEXT_RETRY_PCT", 5.0) / 100
+    if step <= 0:
+        return []
+    out, x = [], h + step
+    while x < c and len(out) < 64:
+        out.append(x)
+        x += step
+    return out
 
 
 LEVELS = ["journal", "handoff", "ceiling"]
@@ -536,7 +558,7 @@ def mid_handoff():
                 and os.path.exists(os.path.join(HANDOFF, hid + ".done")))
 
 
-def event(target, m, level, busy="", live=False, taken=False):
+def event(target, m, level, busy="", live=False, taken=False, retry=False):
     """THE ONE CALL OUT. This file measures a context and says which LINE was crossed; cc-handoff owns every
     phase that follows — the deadline of an overlap already open, whether this crossing starts one, whether it
     falls back to the stop-then-restart path, and the sweep for records no session is left to finish. Before
@@ -557,6 +579,8 @@ def event(target, m, level, busy="", live=False, taken=False):
         argv += ["--in-flight", busy]      # what a journal always omits: what is unfinished RIGHT NOW
     if live:
         argv += ["--live"]                 # no live tmux window = a headless worker: its loop is its handoff
+    if retry:
+        argv += ["--retry"]                # a line above the handoff line: the attempt already taken may be dead
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=90)
         return (json.loads(r.stdout or "{}") or {}).get("action") or ""
@@ -652,22 +676,39 @@ def record(payload):
     act = ""
     taken = bool(m["handed_off"]) or bool(payload.get("stop_hook_active"))
     fresh = bool(lvl) and bool(repo) and not taken
-    busy = in_flight(payload, cwd) if (fresh and lvl != "ceiling") else None   # the ceiling goes regardless
+    # A RETRY LINE. Every five percent between the handoff line and the ceiling — and the ceiling itself, last
+    # of them — is one more crossing for a session whose handoff was TAKEN and then died: without it
+    # `handed_off` read as "already taken" for the rest of that session's life, which is how the overlap
+    # started at 01:35Z on 2026-09-05 and later abandoned left the box with nothing to try. What is remembered
+    # is the highest line already crossed IN TOKENS, with the window it was measured against: each line fires
+    # once, a turn between two of them fires nothing, and a WINDOW CORRECTION — 150k read as 75% of an assumed
+    # 200k, then the evidence says 1M — re-keys the lines rather than carrying a stale reading across them,
+    # which would leave the ceiling as the only line again. Whether a crossing MEANS a new attempt is
+    # cc-handoff's call.
+    lines = retry_lines(m["window"]) + [thresholds(m["window"])[2]]
+    crossed = max([x for x in lines if m["used"] >= x], default=0)
+    was_crossed = (was.get("retried") or 0) if was.get("retried_window") == m["window"] else 0
+    m["retried"], m["retried_window"] = max(crossed, was_crossed), m["window"]
+    retry = bool(lvl in ("handoff", "ceiling") and repo and m["handed_off"] and crossed > was_crossed
+                 and not payload.get("stop_hook_active") and not overlap_open(target))
+    busy = in_flight(payload, cwd) if ((fresh or retry) and lvl != "ceiling") else None   # the ceiling goes regardless
     # …and never from a worker either: cc-handoff refuses it a phase (its `worker`), so forking that process
     # every turn, for what is a large share of this box's sessions, only buys a "no". Same cheap half of the
     # rule as mid_handoff above — the authoritative half stays over there.
-    if repo and not mid_handoff() and not worker() and ((fresh and lvl != "journal") or overlap_open(target)):
-        act = event(target, m, lvl or "", busy or "", live, taken)
-    if fresh:
+    if repo and not mid_handoff() and not worker() and ((fresh and lvl != "journal") or retry
+                                                       or overlap_open(target)):
+        act = event(target, m, lvl or "", busy or "", live, taken, retry)
+    if fresh or retry:
+        kind = (lvl + "-retry") if (retry and not fresh) else lvl
         if act == "overlap":                           # a successor is coming up alongside: nothing is restarted
             m["handed_off"] = m["ts"]
             m["told"] = lvl
             m["say"] = told(m, lvl, overlapped=True)
-            ledger(m, lvl)
+            ledger(m, kind)
         elif act == "replace":                         # the old path: it will ask this session to journal and exit
             m["handed_off"] = m["ts"]
-            ledger(m, lvl)
-        elif LEVELS.index(lvl) > LEVELS.index(was.get("told") or LEVELS[0]) or not was.get("told"):
+            ledger(m, kind)
+        elif fresh and (LEVELS.index(lvl) > LEVELS.index(was.get("told") or LEVELS[0]) or not was.get("told")):
             restartable = bool(live) and bool(track)   # only a track has the stop-then-restart path
             m["told"] = lvl                            # said once per line crossed, not once per turn
             m["say"] = told(m, lvl, busy or "", restartable, ending=worker())
@@ -998,15 +1039,18 @@ def selfcheck():
         # decides (that has its own selfcheck, and selftest.sh drives the two together on real windows).
         global have_window, overlap_open, event
         hw0, ev0, oo0 = have_window, event, overlap_open
-        live, events, started, on = [True], [], [], [False]
+        live, events, started, on, tried = [True], [], [], [False], []
         have_window = lambda t: live[0]
 
-        def event(t, m, level, busy="", live_=False, taken=False):   # noqa: F811 — the stub, restored below
-            events.append((t, level, busy, live_, taken))
-            if taken or not level or level == "journal" or not live_ or any(x[0] == t for x in started):
+        def event(t, m, level, busy="", live_=False, taken=False, retry=False):   # noqa: F811 — the stub, restored below
+            events.append((t, level, busy, live_, taken, retry))
+            if not level or level == "journal" or not live_ or any(x[0] == t for x in started):
                 return ""
+            if taken and not (retry and any(x == t for x in tried)):
+                return ""                        # cc-handoff's `retryable`: only an attempt that DIED is remade
             if on[0]:
                 started.append((t, busy))
+                tried.append(t)
                 return "overlap"
             return "replace" if "/" in t and not busy else ""
 
@@ -1126,6 +1170,71 @@ def selfcheck():
         ok("a $CC_HANDOFF we cannot account for still holds — failure falls towards not policing your own",
            len(events) == n and len(started) == ns)
         os.environ.pop("CC_HANDOFF", None)
+
+        # ---- a retry line. An overlap can DIE — the one at 01:35Z on 2026-09-05 sat on a permission prompt
+        # and was abandoned — and `handed_off` then read as "already taken" for the rest of that session's
+        # life: no event, at any percentage, ever again. Every five percent above the handoff line is now one
+        # more crossing, and the ceiling is the last of them.
+        ok("the retry lines sit between the handoff line and the ceiling",
+           retry_lines(BIG_WINDOW) == [450000, 500000, 550000])
+        ok("...on a small window they follow the floors, not the raw percentages",
+           retry_lines(DEFAULT_WINDOW) == [100000.0, 110000.0])
+        os.environ["CC_CONTEXT_RETRY_PCT"] = "0"
+        ok("...and the step turns them off", retry_lines(BIG_WINDOW) == [])
+        os.environ.pop("CC_CONTEXT_RETRY_PCT")
+        started.clear()
+        r = at(420000, "sid-r")                        # 42%: the handoff line, unchanged
+        ok("the first crossing is the 40% one, exactly as before",
+           r["handed_off"] and len(started) == 1 and events[-1][5] is False)
+        n = len(events)
+        r = at(430000, "sid-r")
+        ok("a turn between two lines crosses nothing new", len(events) == n + 1
+           and events[-1][5] is False and len(started) == 1)
+        started.clear()                                # --abandon: the record is gone, the predecessor carries on
+        n = len(events)
+        at(435000, "sid-r")
+        ok("with the overlap gone and no line crossed, nothing goes out at all", len(events) == n)
+        r = at(455000, "sid-r")
+        ok("the 45% line retries: a new overlap, and the session hears about that one too",
+           events[-1][5] is True and len(started) == 1 and "SUCCESSOR" in r["say"])
+        r2 = at(465000, "sid-r")
+        ok("a crossing while an overlap is open starts nothing", len(started) == 1 and not r2.get("say")
+           and events[-1][5] is False)
+        started.clear()
+        r = at(505000, "sid-r")
+        ok("...and 50 does the same again if that attempt dies too",
+           events[-1][5] is True and len(started) == 1 and r["handed_off"])
+        started.clear()
+        r = at(555000, "sid-r")
+        ok("...and 55", events[-1][5] is True and len(started) == 1)
+        started.clear()
+        n, ns = len(events), len(started)
+        at(560000, "sid-r")
+        ok("there is no line between 55% and the ceiling", len(events) == n and len(started) == ns)
+        r = at(605000, "sid-r")
+        ok("the ceiling is the LAST of the lines: a dead overlap does not take its teeth with it",
+           events[-1][1] == "ceiling" and events[-1][5] is True and len(started) == 1)
+        ok("each attempt is its own line on the ledger",
+           len([h for h in handoffs() if h.get("kind") == "handoff-retry"]) == 3
+           and len([h for h in handoffs() if h.get("kind") == "ceiling-retry"]) == 1)
+        started.clear()
+        n = len(events)
+        at(650000, "sid-r")
+        ok("...and it is still crossed only once", len(events) == n)
+        # …and the lines are remembered in TOKENS, not as a count of them: a session measured at 150k while its
+        # window is still ASSUMED 200k is past all three of that window's lines, and reading that back as three
+        # of the 1M window's lines after the correction would put the ceiling back to being the only one left.
+        started.clear()
+        os.environ["CC_CTX_WINDOW"] = str(DEFAULT_WINDOW)
+        r = at(150000, "sid-w")
+        ok("150k against an assumed 200k window is past every line that window has",
+           r["window"] == DEFAULT_WINDOW and r["handed_off"] and len(started) == 1)
+        started.clear()                                # the overlap dies again, and the window is corrected
+        os.environ["CC_CTX_WINDOW"] = str(BIG_WINDOW)
+        r = at(455000, "sid-w")
+        ok("a window CORRECTION re-keys the lines: 45% of the REAL window still retries",
+           r["window"] == BIG_WINDOW and events[-1][5] is True and len(started) == 1)
+        os.environ.pop("CC_CTX_WINDOW")
 
         # ---- a cc-loop ITERATION is headless even though its window is live: the LOOP holds the track's tmux
         # window while the session inside it is `claude -p`. Reading that window as live is what opened an

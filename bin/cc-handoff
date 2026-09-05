@@ -9,6 +9,7 @@ nothing to defer on — which is what dissolves the "handoff PENDING, deferred a
   cc-handoff --abandon <target> [--why "…"]               give up: successor's window goes, record clears
   cc-handoff --due <target> [--over-ceiling]              the deadline: below the ceiling abandon, at/over force
   cc-handoff --event <target> [--level L] [--pct N] [--session ID] [--in-flight "…"] [--live] [--taken]
+                              [--retry]
                                     a context line was crossed (cc-context): decide and take the phase, print it
   cc-handoff --sweep                records no session is left to finish (run from the cc-reconcile timer)
   cc-handoff --kick <target> [<id>]         internal: brief the successor once it is up, and check it landed
@@ -41,6 +42,14 @@ is ONE atomic os.replace() of that record — the single commit point — and ev
 idempotent and retried, never rolled back. Ownership only ever moves forward, on an explicit successful act,
 so every failure lands on "the predecessor is still in charge": a missing, corrupt or unreadable record means
 the predecessor keeps the channel and the successor stays gated.
+
+AN OVERLAP THAT DIED IS TRIED AGAIN, NOT WAITED OUT. Until 2026-09-05 the first attempt was the only one:
+the 40% overlap started at 01:35Z died on a permission prompt and left the predecessor with one already "taken"
+and nothing between it and the 60% ceiling. Now every five-percent line above the handoff line (45, 50, 55 —
+cc-context's CC_CONTEXT_RETRY_PCT) is a crossing that arrives here with --retry, and one is a fresh attempt when
+no overlap is open and the LAST one for this target ended with the predecessor still in charge (`retryable`:
+abandoned, expired, or started and never finished). A cut-over target is never retried — the successor holds the
+window by then, and starting a second overlap would aim at it. Everything else is the 40% path unchanged.
 
 BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 45 min, ~/.cc/config). The watchdog is the
 predecessor's own Stop hook, which already runs every turn — no new timer, no new daemon. At the deadline the
@@ -281,6 +290,35 @@ def ledger(rec, kind, why=""):
     with open(os.path.join(RECORDS, "handoffs.jsonl"), "a") as f:
         f.write(json.dumps(row) + "\n")
     return True
+
+
+def last_overlap(target):
+    """The ledger kinds of the most recent overlap on this target, in order — [] if there never was one. The
+    RECORD is deleted when an overlap ends, so the append-only ledger is the only thing that outlives one."""
+    kinds, hid = {}, None
+    try:
+        with open(os.path.join(RECORDS, "handoffs.jsonl")) as f:
+            for l in f:
+                try:
+                    row = json.loads(l)
+                except Exception:
+                    continue                       # one bad line never hides the rest
+                if row.get("target") != target or not row.get("handoff"):
+                    continue
+                hid = row["handoff"]
+                kinds.setdefault(hid, []).append(row.get("kind"))
+    except OSError:
+        pass
+    return kinds.get(hid, [])
+
+
+def retryable(target):
+    """Did the last overlap on this target end with the PREDECESSOR still in charge? Abandoned, expired, or
+    started and never finished all say yes: the session that crossed the line is still the one to hand off, so
+    the next five-percent line may try again. A cutover says no — the predecessor may outlive it (its drain, or
+    a stay for its subagents) and a second overlap would be started against the SUCCESSOR's window."""
+    kinds = last_overlap(target)
+    return bool(kinds) and not any(k in ("overlap-cutover", "overlap-forced") for k in kinds)
 
 
 # ---- tmux ----------------------------------------------------------------------------------------------
@@ -1093,7 +1131,7 @@ def replace(target, over=None):
     return 0
 
 
-def event(target, level="", pct=None, session="", busy="", live=False, taken=False):
+def event(target, level="", pct=None, session="", busy="", live=False, taken=False, retry=False):
     """--event: the ONE call cc-context makes. It measures and says WHAT was crossed; which phase that means is
     decided here, in the file that owns every phase. Returns the action taken, for the caller's own record:
       ""         nothing — the line was the journal nudge, or a phase is already open, or nothing could start
@@ -1101,6 +1139,9 @@ def event(target, level="", pct=None, session="", busy="", live=False, taken=Fal
       "replace"  the old stop-then-restart path is running, detached
     `taken` = that session has already taken a phase, or a Stop hook is holding it: nothing NEW starts, but the
     level still decides the watchdog below, which is why cc-context sends it either way.
+    `retry` = one of the five-percent lines between the handoff line and the ceiling. It overrides `taken` —
+    and only that — when the last overlap here died with the predecessor still in charge (retryable), so an
+    attempt that failed is tried again at the next line instead of waiting for the ceiling.
     Never from the SUCCESSOR of an OPEN handoff: a session must not police, abandon or restart the handoff it
     is itself the second half of — but only while that handoff is still open (mid_handoff).
     Never for a headless cc-loop iteration either (worker): its loop is its handoff, and there is nothing here
@@ -1110,8 +1151,10 @@ def event(target, level="", pct=None, session="", busy="", live=False, taken=Fal
         return ""
     if read(target):
         due(target, level == "ceiling")     # an overlap is open: its deadline, every turn, from the predecessor
-    if taken or not level or level == "journal" or not live or read(target):
+    if not level or level == "journal" or not live or read(target):
         return ""                           # the journal line is a nudge, not a phase; and one phase at a time
+    if taken and not (retry and retryable(target)):
+        return ""                           # …and a phase already taken is not taken twice, unless it DIED
     if enabled() and start(target, pct, session, busy) == 0:
         return "overlap"                    # nothing has to be idle: starting a second session interrupts nobody
     if "/" in target and not busy:          # the overlap is off or would not open: fail INTO the old path, which
@@ -2147,6 +2190,41 @@ def selfcheck():
         ok("a $CC_HANDOFF that is not a record id holds like an open one — no path is built from it either",
            mid_handoff() and event("e1/t", "handoff", live=True) == "" and read("e1/t") is None)
         os.environ.pop("CC_HANDOFF", None)
+
+        # ---- an overlap that DIED is tried again at the next five-percent line, not waited out to the ceiling.
+        # 2026-09-05: the 40% overlap died on a permission prompt, the predecessor's handoff was already "taken",
+        # and there was nothing between it and 60%.
+        wins["e2/t"] = "@e2"
+        ok("the 40% line still starts the first overlap, exactly as before",
+           event("e2/t", "handoff", 41.0, live=True) == "overlap")
+        abandon("e2/t")
+        ok("an abandoned overlap leaves the predecessor in charge, and the LEDGER is what says so",
+           read("e2/t") is None and retryable("e2/t"))
+        ok("a phase already taken is still not re-taken by an ordinary crossing",
+           event("e2/t", "handoff", 46.0, live=True, taken=True) == "" and read("e2/t") is None)
+        ok("...but the 45% line is a RETRY: it starts a second overlap, the same way 40% started the first",
+           event("e2/t", "handoff", 46.0, live=True, taken=True, retry=True) == "overlap"
+           and read("e2/t") is not None)
+        ok("a retry line while an overlap is OPEN starts nothing — one successor at a time, never a chain",
+           event("e2/t", "handoff", 51.0, live=True, taken=True, retry=True) == ""
+           and read("e2/t")["pct_at_start"] == 46.0)
+        abandon("e2/t")
+        ok("...and the next line does the same again if that attempt dies too",
+           event("e2/t", "handoff", 51.0, live=True, taken=True, retry=True) == "overlap"
+           and read("e2/t")["pct_at_start"] == 51.0)
+        ok("every attempt is its own overlap on the ledger, so a count of them is still a `wc -l`",
+           len([l for l in open(os.path.join(RECORDS, "handoffs.jsonl"))
+                if json.loads(l).get("target") == "e2/t" and json.loads(l).get("kind") == "overlap-started"]) == 3)
+        clear("e2/t")
+        wins.pop("e2/t~next", None)
+        cutover("e3/t")
+        os.environ.pop("CC_HANDOFF", None)
+        clear("e3/t")                              # as retirement leaves it: cut over, no record left
+        ok("a target that CUT OVER is never retried — the successor holds that window now, and a second "
+           "overlap would be started against IT",
+           last_overlap("e3/t") and not retryable("e3/t")     # it HAD one: "no rows" says no too, and differently
+           and event("e3/t", "handoff", 46.0, live=True, taken=True, retry=True) == "")
+        ok("...and a target that never had an overlap at all is not 'retryable' either", not retryable("e4/t"))
         os.environ["CC_HANDOFF_OVERLAP"] = "0"
 
         # ---- --sweep: what no session is left to finish. It only ever UN-GATES, so a wrong "gone" is the
@@ -2430,7 +2508,7 @@ def main(argv):
                 i += 1
             else:
                 opt["over"] = "any"
-        elif a in ("--forced", "--over-ceiling", "--json", "--live", "--taken"):
+        elif a in ("--forced", "--over-ceiling", "--json", "--live", "--taken", "--retry"):
             opt[a.lstrip("-").replace("-", "_")] = True
         elif a.startswith("--"):
             print(f"cc-handoff: unknown option {a}", file=sys.stderr)
@@ -2473,7 +2551,8 @@ def main(argv):
         import contextlib
         with contextlib.redirect_stdout(sys.stderr):   # stdout is the answer; a phase's own words are not
             act = event(target, opt.get("level", ""), pct, opt.get("session", ""),
-                        opt.get("in_flight", ""), bool(opt.get("live")), bool(opt.get("taken")))
+                        opt.get("in_flight", ""), bool(opt.get("live")), bool(opt.get("taken")),
+                        bool(opt.get("retry")))
         print(json.dumps({"action": act}))
         return 0
     if cmd == "--abandon":
