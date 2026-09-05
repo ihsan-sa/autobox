@@ -12,7 +12,7 @@ nothing to defer on — which is what dissolves the "handoff PENDING, deferred a
                                     a context line was crossed (cc-context): decide and take the phase, print it
   cc-handoff --sweep                records no session is left to finish (run from the cc-reconcile timer)
   cc-handoff --kick <target> [<id>]         internal: brief the successor once it is up, and check it landed
-  cc-handoff --retire <target>                            internal: DRAIN the predecessor, then end its window
+  cc-handoff --retire <target>              internal: wait out the predecessor's subagents, DRAIN it, end it
   cc-handoff --relay                                      internal: from the UserPromptSubmit hook (cc-scope hook), the
                                                           hook payload on stdin — a prompt typed into the retiring
                                                           predecessor goes to its successor, blocked here with a pointer
@@ -63,6 +63,19 @@ pointer, so nothing typed is lost (2026-09-01 02:2xZ: the owner's question, type
 was). At drain end input is refused with the pointer and the window is KILLED — the drain expires into a kill,
 never into "it keeps its window". A `~next` or `~old` window left with no record is reported by --sweep.
 
+THE PREDECESSOR STAYS FOR ITS SUBAGENTS. Hand off a session whose subagents are still running and their reports
+have nowhere to land: at cutover it is gone, and each one arrives in a window nobody reads (owner, 2026-09-04).
+So the cutover itself is unchanged — the successor is live for the channel from the same instant — but a
+predecessor with live subagents is told to STAY: watch them through, hand each report to the successor
+(`cc-msg <target>`, or SendMessage), and take the final handoff message only when the last one is in. Its
+retirement waits for that, and the journal says both that it is staying and what ended the stay. Live is read
+off the harness's own per-session task files — <tmp>/claude-<uid>/<project>/<session id>/tasks, one
+`<id>.output` per task, a symlink for a subagent and a plain file for a background command. Nothing in them
+says "finished", so silence is the signal: a transcript untouched for CC_HANDOFF_AGENT_IDLE counts as done. No
+session id on the record, no such files, none running — all three read as "no subagents", and the retirement is
+exactly the one above. The stay is bounded by CC_HANDOFF_AGENT_MAX and expires into that same drain-then-kill;
+a stay is never a session that keeps its window.
+
 EVERY PROMPT THIS FILE TYPES INTO A SESSION LEADS WITH `[cc-handoff]` (MACHINE). A prompt a tool types reaches
 UserPromptSubmit looking like a user turn, and the ask ledger opened a row for four of them — the successor's
 opening prompt (a121, a126, a131) and the retiring session's stop message (a132) — each costing that session a
@@ -74,10 +87,12 @@ Env: CC_HANDOFF (the successor's own record id, exported into its process by `cc
 handoff, so `<id>.done` and not the variable is what says one is still open — mid_handoff) · CC_HANDOFF_WINDOW
 (the successor's own tmux window, so it accepts its own startup dialog) ·
 CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT (~/.cc/config) ·
-CC_HANDOFF_DIR, CC_CTX_RECORDS (test hooks: put the record and the ledger somewhere else) ·
+CC_HANDOFF_AGENT_IDLE (a subagent's transcript may be silent this long and still count as running, 30 min),
+CC_HANDOFF_AGENT_MAX (the cap on a stay, 1 h) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS (test hooks:
+put the record, the ledger and the harness's task files somewhere else) ·
 CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log must be before it stops counting as live, 1 h).
 """
-import fcntl, json, os, re, shlex, shutil, subprocess, sys, time, uuid
+import fcntl, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time, uuid
 
 STATE = os.path.expanduser("~/.cc/state")
 DEV = os.path.expanduser("~/dev")        # where the checkouts are: --brief asks gh inside the target's own
@@ -399,6 +414,40 @@ def alert(msg):
     run([os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts", msg])
 
 
+# ---- the predecessor's subagents -----------------------------------------------------------------------
+
+def tasks_dirs(sid):
+    """Where the harness keeps what session `sid` is running: <tmp>/claude-<uid>/<project>/<session id>/tasks,
+    one `<id>.output` per task. The project part is that session's own directory, so it is globbed and never
+    guessed. CC_HANDOFF_TASKS replaces the root — for a fixture, and for a harness that moves it."""
+    root = os.environ.get("CC_HANDOFF_TASKS") or os.path.join(tempfile.gettempdir(), "claude-%d" % os.getuid())
+    return glob.glob(os.path.join(root, "*", sid, "tasks")) if sid else []
+
+
+def subagents(sid, idle=None):
+    """Session `sid`'s subagents that still look ALIVE, the busiest first. A `<id>.output` that is a SYMLINK is
+    a subagent — it points at the transcript that agent is writing; a plain file beside it is a background shell
+    command, whose output nobody has to hand on. Nothing in those files says "finished", so silence is the
+    signal: a transcript untouched for CC_HANDOFF_AGENT_IDLE counts as done. The default is 30 min because an
+    agent blocked inside a SINGLE Bash call — a gate run, a long build — writes nothing at all while it waits,
+    and a live one read as finished is the expensive mistake here. Unknown session id, no such files, a harness
+    that stops keeping them: [], and every caller then does what it did before this existed."""
+    if idle is None:
+        idle = cfg("CC_HANDOFF_AGENT_IDLE", 1800)
+    now, live = time.time(), []
+    for d in tasks_dirs(sid):
+        for f in glob.glob(os.path.join(d, "*.output")):
+            if not os.path.islink(f):
+                continue
+            try:
+                m = os.stat(f).st_mtime            # THROUGH the link: the link itself is written once and never again
+            except OSError:
+                continue                           # dangling: a transcript that is gone is nobody's report
+            if now - m < idle:
+                live.append((m, os.path.basename(f)[:-len(".output")]))
+    return [n for _, n in sorted(live, reverse=True)]
+
+
 # ---- phases --------------------------------------------------------------------------------------------
 
 BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. Your FIRST tool call is \
@@ -655,19 +704,30 @@ def ready(target=None, forced=False):
     if forced and not pane_live(rec["successor"]["window"]):
         print(f"cc-handoff: {target} has no live successor to force onto", file=sys.stderr)
         return 2
+    # Is the predecessor being told to STAY for its subagents? Decided HERE, once, and carried down with the
+    # commit write, because --retire runs in another process and a retried --ready must not take a second
+    # answer — nor write a second journal line, nor send a second STAY_MSG (`first` below).
+    pre = (rec.get("predecessor") or {}).get("tmux") or ""
+    first = rec.get("held") is None
+    if first:
+        rec["held"] = subagents((rec.get("predecessor") or {}).get("session_id") or "") if pane_live_id(pre) else []
+    held = rec.get("held") or []
     rec["live"] = "successor"                      # ---- THE COMMIT POINT ----
     rec["phase"] = "cutover"
     rec["cutover"] = time.time()
-    alert(f"🔁 {target}: handover — the successor is live; the predecessor is retiring")
+    staying = f"the predecessor is staying for {len(held)} subagent(s)" if held else "the predecessor is retiring"
+    alert(f"🔁 {target}: handover — the successor is live; {staying}")
     ledger(rec, "overlap-forced" if forced else "overlap-cutover")
     write(rec)
-    derive(rec)
-    print(f"cc-handoff: {target} — the successor is live; the predecessor is journalling, then retiring")
+    derive(rec, first)
+    print(f"cc-handoff: {target} — the successor is live; " + (f"{staying}, then retires" if held
+          else "the predecessor is journalling, then retiring"))
     return 0
 
 
-def derive(rec):
-    """Everything after the commit point: idempotent, retried, never rolled back. A failure here leaves the
+def derive(rec, first=False):
+    """Everything after the commit point: idempotent, retried, never rolled back. `first` says this call is the
+    one that took the cutover — a retry re-derives the cosmetics but never re-announces a stay. A failure here leaves the
     record right about WHO IS LIVE and wrong only about cosmetics, and a later turn re-derives the same state."""
     target = rec["target"]
     repo, _, track = target.partition("/")
@@ -709,8 +769,17 @@ def derive(rec):
     if (rec["predecessor"].get("window"), rec["successor"].get("window"), rec["successor"].get("tmux")) != (old, target, suc):
         rec["predecessor"]["window"], rec["successor"]["window"], rec["successor"]["tmux"] = old, target, suc
         write(rec)
-    if pane_live_id(pre):
-        run([os.path.join(BIN, "cc-msg"), old, RETIRE_MSG.format(target=target, old=old)])
+    # THE PREDECESSOR STAYS FOR ITS SUBAGENTS (owner, 2026-09-04) — ready() decided it and the record carries
+    # the answer. Said once: a retried --ready re-derives everything here, and a session told to stay is not
+    # told twice, nor sent the retirement line it is not on yet.
+    held = rec.get("held") or []
+    if held and first:
+        journal(target, f"handoff: the successor is live and owns {target}; this session stays for the "
+                        f"{len(held)} subagent(s) still running ({', '.join(held[:6])}), relays each report to "
+                        f"it, and retires when the last one is in.")
+    if pane_live_id(pre) and (first or not held):
+        run([os.path.join(BIN, "cc-msg"), old, STAY_MSG.format(target=target, old=old, n=len(held)) if held
+             else RETIRE_MSG.format(target=target, old=old)])
     run([os.path.realpath(__file__), "--retire", target], wait=False)
 
 
@@ -719,6 +788,14 @@ RETIRE_MSG = (MACHINE + " Handoff complete: your successor is live and owns this
               "is next (ordered), gotchas — and stop. You are no longer the live session: merging, pushing, "
               "dispatching and posting outward are refused from here on, anything typed here is relayed to your "
               "successor, and this window ends by itself once you are idle.")
+STAY_MSG = (MACHINE + " Handoff cut over: your successor is live and owns this target now — it holds window "
+            "{target}, you are {old}, and you are NOT finished. {n} of your subagents are still running and "
+            "their reports have nowhere else to land, so STAY: watch them through, and hand each report on to "
+            "your successor as it comes in — `cc-msg {target} '<the report, in a line or two>'`, or SendMessage "
+            "if you hold it as a peer — because it is the one who will act on it. Start nothing new: merging, "
+            "pushing, dispatching and posting outward are refused from here on, and anything typed here is "
+            "relayed to {target}. When the last one is in you get the final handoff message; then journal and "
+            "stop. This window ends by itself once your subagents are done.")
 RELAY_PREFIX = "[relayed from the retiring session] "
 # What reaches UserPromptSubmit as a "user" turn but was written by the harness or a peer — cc-scope's
 # NOT_A_PERSON less MACHINE, which is this file's own tag and is guarded beside this list; kept in step by hand. Relayed, the successor's own cross-session message came back typed into it, and the
@@ -797,6 +874,50 @@ def refuse_kill(rec, wid):
     return ""
 
 
+def stay(rec, pre):
+    """The predecessor was told to STAY: hold its window — no drain, no kill — while any of its subagents is
+    still running, then send it the FINAL handoff message and hand back a drain clock starting NOW, so its last
+    journal entry is written after the last report and not before it. Bounded by CC_HANDOFF_AGENT_MAX: a stay
+    expires into the same drain-then-kill as everything else here, never into "it keeps its window". It also
+    ends the moment that session is gone — there is then nobody left to relay a report."""
+    target = rec["target"]
+    sid = (rec.get("predecessor") or {}).get("session_id") or ""
+    idle, cap, t0 = cfg("CC_HANDOFF_AGENT_IDLE", 1800), cfg("CC_HANDOFF_AGENT_MAX", 3600), time.time()
+    left = rec.get("held") or []
+    while pane_live_id(pre):
+        left = subagents(sid, idle)
+        if not left or time.time() >= t0 + cap:
+            break
+        time.sleep(15)
+    mins = int((time.time() - t0) / 60)
+    if not pane_live_id(pre):
+        why = f"its session ended first, {mins} min in"
+    elif left:
+        why = f"the wait ran out after {mins} min with {len(left)} still running ({', '.join(left[:6])})"
+    else:
+        why = f"its last subagent finished after {mins} min"
+    journal(target, f"handoff: the predecessor stayed for its subagents — {why}; it takes the final handoff "
+                    f"message now and retires.")
+    logd(f"{target}: the stay for the predecessor's subagents is over — {why}")
+    now = time.time()
+    fresh = read(target)                           # never re-create a record cleared under us: only stamp a live one
+    if fresh and live_side(fresh) == "successor":
+        fresh["held"] = []                         # decided and over — not absent, which a retried --ready would re-decide
+        fresh["drain_from"] = now
+        write(fresh)
+    old = (rec.get("predecessor") or {}).get("window") or (target + OLD)
+    if pane_live_id(pre):
+        run([os.path.join(BIN, "cc-msg"), old, RETIRE_MSG.format(target=target, old=old)])
+    return now
+
+
+def drain_start(rec, amax):
+    """When the predecessor's drain clock starts: at cutover — except that a predecessor told to STAY for its
+    subagents keeps its window past the drain, so until the stay ends (drain_from) --sweep must wait out the
+    stay's own cap as well. Without this the sweep ends the session that was told to stay, twelve minutes in."""
+    return rec.get("drain_from") or (rec.get("cutover") or 0) + (amax if rec.get("held") else 0)
+
+
 def retire(target):
     """--retire, detached by derive(): DRAIN the predecessor, then END it — every time, not only when a human
     happened to be watching. The old wait-it-out never completed on its own (a session cannot exit itself; on
@@ -804,7 +925,8 @@ def retire(target):
     replaced it lost what was typed in its last minute (2026-09-01 02:2xZ). So the window lives on — renamed
     `<target>~old` at cutover — for CC_HANDOFF_DRAIN, or until it is idle with nothing typed, never less than
     CC_HANDOFF_RETIRE_GRACE (the turn in flight, the journal flushed), while --relay carries anything typed into
-    it to the successor. Then the record says `retired` (--relay refuses from here) and the window is killed.
+    it to the successor. A predecessor staying for its subagents waits them out before any of that begins.
+    Then the record says `retired` (--relay refuses from here) and the window is killed.
     Kills ONLY the window the record names as the predecessor, ONLY once the record says the successor is live,
     and never the caller's own — see refuse_kill(). No record, or no cutover: nothing is killed at all."""
     rec = read(target)
@@ -812,7 +934,9 @@ def retire(target):
         return 0                                   # missing, corrupt, or before cutover: kill NOTHING
     pre = (rec.get("predecessor") or {}).get("tmux") or ""
     grace, drain = cfg("CC_HANDOFF_RETIRE_GRACE", 120), cfg("CC_HANDOFF_DRAIN", 600)
-    t0 = rec.get("cutover") or time.time()
+    # A predecessor holding live subagents was told to stay: it is waited out FIRST, and the final handoff
+    # message it gets at the end of that is what starts the drain — see stay().
+    t0 = stay(rec, pre) if rec.get("held") else (rec.get("cutover") or time.time())
     quiet = 0
     while pane_live_id(pre):                       # a session that exited leaves a bare shell: nothing left to drain
         now = time.time()
@@ -1031,15 +1155,17 @@ def sweep():
       an overlap that never reached --ready is past its deadline -> it expires QUIETLY. The predecessor never
         stopped working and was never told anything, so there is nothing to tell it now; --due, which the
         predecessor's own hook runs, gets first refusal (hence the extra grace) and tells the owner when it acts.
-      a cut-over predecessor STILL ALIVE past drain+grace -> ended here, then finalized. The --retire that should
-        have ended it died, or refused because a --forced cutover runs it from the predecessor's own pane
+      a cut-over predecessor STILL ALIVE past drain+grace -> ended here, then finalized (one told to STAY for
+        its subagents is past nothing until that stay ends or its cap runs out: drain_start). The --retire that
+        should have ended it died, or refused because a --forced cutover runs it from the predecessor's own pane
         (refuse_kill); left alone it is `~old` forever at phase retired — prompts refused, not relayed — and its
         successor can never hand off (mid_handoff). Same fence as --retire; the sweep has no pane of its own.
     A sweep only ever un-gates, so a WRONG 'gone' is the expensive direction: if tmux cannot be read at all —
     no server, no session main — every window looks gone, so nothing is swept."""
     if tmux("list-windows", "-t", SESSION, "-F", "#{window_id}") is None:
         return 0
-    grace, drain, now = cfg("CC_HANDOFF_RETIRE_GRACE", 120), cfg("CC_HANDOFF_DRAIN", 600), time.time()
+    grace, drain = cfg("CC_HANDOFF_RETIRE_GRACE", 120), cfg("CC_HANDOFF_DRAIN", 600)
+    amax, now = cfg("CC_HANDOFF_AGENT_MAX", 3600), time.time()
     for rec in read_all():
         target = rec["target"]
         if not TARGET_RE.match(target):
@@ -1058,7 +1184,7 @@ def sweep():
                 write(rec)
             elif now - gone >= cfg("CC_HANDOFF_GONE_CONFIRM", 300):
                 finalize(rec, "the predecessor's session is gone (two sweeps apart)")
-        elif live_side(rec) == "successor" and now - (rec.get("cutover") or 0) > drain + grace:
+        elif live_side(rec) == "successor" and now - drain_start(rec, amax) > drain + grace:
             rec = read(target)                     # the DECIDING read, as below
             if not rec or live_side(rec) != "successor":
                 continue
@@ -1123,8 +1249,10 @@ def status(target=None, as_json=False):
     for r in recs:
         left = int((r.get("deadline", 0) - now) / 60)
         alive = "alive" if pane_live(r["successor"]["window"]) else "gone"
+        held = r.get("held") or []
         print(f"{r['target']:<24} {r.get('phase', '?'):<9} live={live_side(r):<11} "
-              f"{left:>4}m left   successor main:{r['successor']['window']} ({alive})   id {r['id']}")
+              f"{left:>4}m left   successor main:{r['successor']['window']} ({alive})   id {r['id']}"
+              + (f"   staying for {len(held)} subagent(s)" if held else ""))
     return 0
 
 
@@ -1868,6 +1996,92 @@ def selfcheck():
         t0 = clk[0]
         ok("the older TUI's empty box (`>` and a placeholder) reads as idle too",
            retire("r12") == 0 and 120 <= clk[0] - t0 < 600)
+
+        # ---- THE PREDECESSOR STAYS FOR ITS SUBAGENTS: the successor is live for the channel from cutover, the
+        # old session keeps running to hand each report on, and its retirement waits for the last one.
+        env3 = {k: os.environ.get(k) for k in ("CC_HANDOFF_TASKS", "CC_HANDOFF_AGENT_IDLE", "CC_HANDOFF_AGENT_MAX")}
+        troot = os.path.join(d, "tasks-root")
+        tasks = os.path.join(troot, "project", "sid-sub", "tasks")
+        os.makedirs(tasks)
+        os.environ["CC_HANDOFF_TASKS"] = troot
+        os.environ["CC_HANDOFF_AGENT_IDLE"] = "600"
+        for name, quiet in (("a-live", 0), ("a-quiet", -4000)):
+            t = os.path.join(d, name + ".jsonl")
+            open(t, "w").close()
+            os.utime(t, (clk[0] + quiet, clk[0] + quiet))   # mtimes on the FAKE clock these cases run on
+            os.symlink(t, os.path.join(tasks, name + ".output"))
+        open(os.path.join(tasks, "b-background.output"), "w").close()   # a background command, not a subagent
+        os.symlink(os.path.join(d, "no-such.jsonl"), os.path.join(tasks, "a-gone.output"))
+        ok("a subagent is a task file that is a live SYMLINK — a background command, a dangling link and a "
+           "transcript gone quiet are not", subagents("sid-sub") == ["a-live"])
+        ok("an unknown session id, or one with no task files, reads as no subagents — and the handoff is then "
+           "exactly the one it was before", subagents("") == [] and subagents("sid-none") == [])
+
+        def cutover_sub(t):
+            """cutover(), for a predecessor whose session id is the one the fixture's subagents belong to"""
+            wins[t] = "@" + t
+            start(t)
+            rr = read(t); rr["predecessor"]["session_id"] = "sid-sub"; write(rr)
+            os.environ["CC_HANDOFF"] = rr["id"]
+            ready(t)
+            os.environ.pop("CC_HANDOFF", None)
+            return read(t)
+
+        said = lambda w: [a for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg") and a[1] == w]
+        r = cutover_sub("r20")
+        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
+        jp20 = os.path.expanduser("~/.cc/state/r20/planning-handoff.md")
+        ok("AT CUTOVER the successor is live exactly as ever — the channel never waits for a subagent",
+           live_side(r) == "successor" and wins.get("r20") == suc and wins.get("r20~old") == pre)
+        ok("...but a predecessor with one still running is told to STAY and hand each report on, not that it "
+           "is retiring", said("r20~old") and said("r20~old")[-1][2].startswith(MACHINE)
+           and "STAY" in said("r20~old")[-1][2] and "subagents are still running" in said("r20~old")[-1][2]
+           and "retiring" not in said("r20~old")[-1][2])
+        ok("...the record names what holds it, so --retire acts on that one answer from its own process",
+           read("r20").get("held") == ["a-live"])
+        ok("...and the journal says the successor is live and this session is staying",
+           "stays for the 1 subagent" in open(jp20).read())
+        ok("...and the #alerts line says it is staying, not that it is retiring",
+           any(a[:4] == [os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts"] and "staying for 1 subagent" in a[4]
+               for a in msgs if isinstance(a, list) and len(a) > 4))
+        n20 = len(said("r20~old"))
+        ok("a retried --ready re-derives, but says nothing twice: no second STAY message, no second journal line",
+           ready("r20") == 0 and len(said("r20~old")) == n20
+           and open(jp20).read().count("this session stays for the") == 1)
+        panes[pre] = IDLE                               # idle from the first read: only the stay holds it now
+        t0, n20 = clk[0], len(said("r20~old"))
+        ok("RETIREMENT WAITS: while a subagent is alive the predecessor keeps its window, and it ends only "
+           "once the last one is done", retire("r20") == 0 and 600 <= clk[0] - t0 < 600 + 600 + 60
+           and pre not in wins.values() and wins.get("r20") == suc and read("r20") is None)
+        ok("...the final handoff message comes at the END of the stay, not at cutover",
+           len(said("r20~old")) == n20 + 1 and "retiring" in said("r20~old")[-1][2])
+        ok("...and the journal says what ended it", "last subagent finished" in open(jp20).read())
+
+        os.environ["CC_HANDOFF_AGENT_IDLE"] = "100000"  # nothing in the fixture ever goes quiet now
+        os.environ["CC_HANDOFF_AGENT_MAX"] = "300"
+        r = cutover_sub("r21")
+        pre = r["predecessor"]["tmux"]
+        jp21 = os.path.expanduser("~/.cc/state/r21/planning-handoff.md")
+        panes[pre] = IDLE
+        t0 = clk[0]
+        ok("a stay is BOUNDED: a subagent that never finishes does not keep the window forever",
+           retire("r21") == 0 and 300 <= clk[0] - t0 < 300 + 600 + 60 and pre not in wins.values()
+           and read("r21") is None)
+        ok("...and the journal says the wait ran out, not that the work finished",
+           "the wait ran out" in open(jp21).read())
+        r = cutover_sub("r22")
+        pre = r["predecessor"]["tmux"]
+        dead.add("r22~old")                             # /exit was typed: nobody is left to hand a report to
+        t0 = clk[0]
+        ok("a stay ends the moment that session is gone — a report has nowhere to go either way",
+           retire("r22") == 0 and clk[0] - t0 < 300 and read("r22") is None)
+        ok("the sweep's clock waits a stay out too: cutover plus the stay's cap, then the stay's own end",
+           drain_start({"cutover": 1000, "held": ["a"]}, 3600) == 4600
+           and drain_start({"cutover": 1000}, 3600) == 1000
+           and drain_start({"cutover": 1000, "held": ["a"], "drain_from": 5000}, 3600) == 5000)
+        for k, v in env3.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
         time.time, time.sleep = real_t, real_s
         os.environ["CC_HANDOFF_RETIRE_GRACE"] = "0"
         os.environ["CC_HANDOFF_DRAIN"] = "0"
@@ -1974,6 +2188,14 @@ def selfcheck():
            "no `~old` at phase retired forever, and its successor can hand off in its turn",
            sweep() == 0 and read("s5") is None and pre not in wins.values() and wins.get("s5") == suc
            and os.path.exists(done_path(r["id"])))
+        r = cutover("s6")
+        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
+        rr = read("s6"); rr["cutover"] = time.time() - 601; rr["held"] = ["a-live"]; write(rr)
+        ok("a predecessor STAYING for its subagents is not swept away mid-stay — it is past nothing yet",
+           sweep() == 0 and read("s6") is not None and pre in wins.values())
+        rr = read("s6"); rr.pop("held"); rr["drain_from"] = time.time() - 601; write(rr)
+        ok("...and once the stay is over it drains and is ended like any other",
+           sweep() == 0 and read("s6") is None and pre not in wins.values() and wins.get("s6") == suc)
         os.environ["CC_HANDOFF_DRAIN"] = "0"
 
         os.environ.pop("CC_HANDOFF", None)

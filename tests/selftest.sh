@@ -700,6 +700,31 @@ printf '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 1"},"cwd":"%s"}
 : > "$T/guard.args"; rm -rf "$T/asks"   # …and the deny with no yes in it: refused, said in the channel, owner asleep
 [ "$(ask "cc r t --go x" "$mf")" = 2 ] && grep -q '^BOT: post -c #member' "$T/guard.args" && ! grep -q '^NOTIFY:' "$T/guard.args" \
   && ok "a member dispatch is refused and the member told, but the owner is not paged — it was never his to approve for them (00:03Z)" || bad "a member dispatch paged the owner: $(cat "$T/guard.args")"
+echo "== every interactive session starts in auto mode =="
+# The owner had to press shift+tab in each one he opened (2026-09-04). Auto mode is a HARNESS flag, so it belongs on
+# the argv of every launcher that opens a session — a --go worker already carries it from cc-loop. It is the
+# permission prompt and nothing else: cc-guard is a hook and still denies what it denies, in any mode.
+# A copy of cc with a recording claude beside it: the assertion is the argv the launcher actually built.
+AM="$T/am"; mkdir -p "$AM" "$GH/dev/other" "$GH/.cc/worktrees/other/w"
+cp "$B/cc" "$AM/cc"; for h in "$B"/cc-*; do ln -sf "$h" "$AM/$(basename "$h")"; done   # cc resolves every helper through its own BIN
+rm -f "$AM/cc-sandbox"   # …and only the sandbox is the stub, so the member launcher's inner argv is visible (a copy, never a write through a symlink)
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$T/am.argv" > "$AM/cc-sandbox"; chmod +x "$AM/cc-sandbox"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' "$T/am.argv" > "$T/am-claude"; chmod +x "$T/am-claude"
+am(){ env HOME="$GH" PATH="$B:$PATH" CC_CLAUDE="$T/am-claude" "$AM/cc" "$@" </dev/null >/dev/null 2>&1; }   # </dev/null: every stanza ends in `exec bash`
+amiss=""
+: > "$T/am.argv"; am __runmain other;             grep -q -- '--permission-mode auto' "$T/am.argv" || amiss="$amiss __runmain"
+: > "$T/am.argv"; am __run other w;               grep -q -- '--permission-mode auto' "$T/am.argv" || amiss="$amiss __run"
+: > "$T/am.argv"; am __runorch other a1;          grep -q -- '--permission-mode auto' "$T/am.argv" || amiss="$amiss __runorch"
+: > "$T/am.argv"; am __runplain other;            grep -q -- '--permission-mode auto' "$T/am.argv" || amiss="$amiss __runplain"
+: > "$T/am.argv"; am __runnext other/w hid1 sid1; grep -q -- '--permission-mode auto' "$T/am.argv" || amiss="$amiss __runnext"
+: > "$T/am.argv"; am __runmember other "";        grep -qE -- '^member other .*-- .*--permission-mode auto' "$T/am.argv" || amiss="$amiss __runmember"
+[ -z "$amiss" ] && ok "cc opens every session in auto mode — planning, track, orch, plain, handoff successor, and the member one inside the boundary" \
+  || bad "these launchers still start in manual mode:$amiss"
+# The box's own always-on Remote-Control session is the seventh and cannot be run from here (it waits for the
+# internet and never returns), so its launch line is read instead.
+grep -q -- '"\$CLAUDE" --permission-mode auto --remote-control' "$B/cc-rc" \
+  && ok "…and so does the box's own boot session (cc-rc)" || bad "cc-rc still starts in manual mode"
+rm -rf "$AM" "$GH/.cc/worktrees/other" "$GH/.cc/state/other"; rm -f "$GH/.cc/boards/other".*   # leave the stub HOME as this stanza found it
 echo "== overlapping handoff: two sessions, one cwd, exactly one of them live =="
 export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records, never a 2-min grace or a 10-min drain
 ho=$("$B/cc-handoff" selfcheck 2>&1 | tail -1)

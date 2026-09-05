@@ -46,6 +46,9 @@ DEV="$HOME/dev"; SESSION=main; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"; W
 SLACKON="$HOME/.cc/slack/enabled"   # `cc slack on` creates it: sessions load the Slack channel server (bin/cc-slack)
 chan_args(){ [ -f "$SLACKON" ] || return 0; printf '%s\n' --dangerously-load-development-channels "server:cc-slack"; }   # the server itself is registered in user scope by `cc slack on`; it finds its target from the cwd
 model_args(){ local m; m=$("$BIN/cc-model" current 2>/dev/null) && [ -n "$m" ] && printf '%s\n%s\n' --model "$m"; return 0; }   # while the box's primary model is limited, new sessions start on the fallback
+AUTO=(--permission-mode auto)   # every interactive session starts in auto mode, so nobody has to press shift+tab in a fresh one (owner, 2026-09-04).
+                                # It is the harness's permission prompt and nothing else: cc-guard still runs as a hook and denies what it denies.
+                                # A --go worker gets the same mode from cc-loop's own argv.
 worker_model(){ "$BIN/cc-loop" worker-model "${1:-}"; }   # what a --go worker will run on; cc-loop owns that order (--model, then the override, then CC_WORKER_MODEL) and this only names it
 chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slack" accept-dialog "$1" >/dev/null 2>&1 & ); }; return 0; }   # auto-accepts the dev-channels dialog in that tmux window
 sp_track(){ local repo="$1" track="$2" base="$3" st="$STBASE/$1/$2"
@@ -407,7 +410,7 @@ case "${1:-}" in
     else [ -n "$sid" ] || { sid=$(cat /proc/sys/kernel/random/uuid); "$BOARD" set "$repo" "$track" session_id "$sid"; }
          args+=(--session-id "$sid"); "$BOARD" set "$repo" "$track" started true; fi
     "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
-    "$CLAUDE" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    "$CLAUDE" "${AUTO[@]}" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmember)  # internal: a MEMBER WORKSPACE session — the host side. Board and dialog bookkeeping here; claude inside cc-sandbox member.
     repo="$2"; track="${3:-}"; force_cont="${4:-}"; export CC_ROLE=member; args=()
     if [ -n "$track" ]; then wt="$WTBASE/$repo/$track"; cd "$wt" || exit 1; win="$repo/$track"; sp="$(sp_track "$repo" "$track" "$(default_branch "$DEV/$repo")") $MEMBER_SP $MEMBER_WS_SP"
@@ -420,7 +423,7 @@ case "${1:-}" in
       "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
     else cd "$DEV/$repo" || exit 1; win="$repo"; sp="$(sp_main "$repo" "$(default_branch "$DEV/$repo")") $MEMBER_SP $MEMBER_WS_SP"; fi
     args+=(--append-system-prompt "$sp"); mapfile -t CH < <(chan_args "$win"); args+=("${CH[@]}"); chan_accept "$win"; mapfile -t MO < <(model_args); args+=("${MO[@]}")   # no --remote-control: a member session is not on the owner's phone
-    "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runnext)  # internal: the SUCCESSOR of an overlapping handoff (cc-handoff --overlap started this window)
     target="$2"; hid="$3"; sid="$4"; repo="${target%%/*}"; track=""; [ "$target" != "$repo" ] && track="${target#*/}"
     if [ -n "$track" ]; then wt="$WTBASE/$repo/$track"; else wt="$DEV/$repo"; fi
@@ -435,27 +438,27 @@ case "${1:-}" in
     # The successor's window is "$target~next", not "$target": accepting in the latter pressed keys at the
     # PREDECESSOR (harmless — it is long past its dialog) and left this session parked on its own.
     mapfile -t CH < <(chan_args "$target"); mapfile -t MO < <(model_args); chan_accept "${CC_HANDOFF_WINDOW:-$target}"
-    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}"
+    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}"
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmain)  # internal: planning session in the primary worktree
     repo="$2"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp=$(sp_main "$repo" "$base")
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
     member_facing "$DEV/$repo" && { export CC_ROLE=member; sp="$sp $MEMBER_SP"; }   # convenience only — the marker is what cc-guard actually reads
-    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
     repo="$2"; alias="$3"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp="You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d, and every thread in your OWN channel (#<parent>-$alias-<id>, created for you — no @ needed there; your replies land wherever the message came from). Dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR); an orch you spawn with 'cc $repo --orch <alias> \"<brief>\"' gets its own channel under yours. Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'."
     export CC_SLACK_ALIAS="$alias"
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo@$alias"
-    "$CLAUDE" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}"
+    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}"
     [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$alias" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runplain)  # internal: plain session in a folder that is not a git repo
     repo="$2"; cont="${3:-}"; cd "$DEV/$repo" || exit 1
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
     MF=(); member_facing "$DEV/$repo" && { export CC_ROLE=member; MF=(--append-system-prompt "$MEMBER_SP"); }   # a member-facing folder need not be a git repo
-    "$CLAUDE" ${cont:+--continue} --remote-control "$repo" "${CH[@]}" "${MO[@]}" "${MF[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
+    "$CLAUDE" "${AUTO[@]}" ${cont:+--continue} --remote-control "$repo" "${CH[@]}" "${MO[@]}" "${MF[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
 esac
 
 # ---- cc [-c] <repo> [track] [--go|--say ...] ----
