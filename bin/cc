@@ -28,7 +28,8 @@
 #   cc resume                 menu of every session (mains + tracks) -> pick to reattach/resume
 #   cc ls | cc digest         live windows + board status | full digest (cc digest --notify pushes it)
 #   cc quick [doing|done] "…"  log a small task done without a track (Slack Home shows the last 24 h)
-#   cc done <repo> <track>    push + open a PR into the default branch (nothing auto-merges)
+#   cc done <repo> <track>    push + open a PR into the base branch (nothing auto-merges); on a kind=session row it
+#                             pushes and stops there — a living project has no PR and is never done
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
 #   cc board <args>           shared board (cc board show <repo>; --all also shows finished tracks)
 #                             cc -c <repo> [track]  force --continue
@@ -177,8 +178,15 @@ member_gitdir(){   # $1 repo $2 worktree → 0 when a member workspace's track r
   gcd=$(git "${GITNH[@]}" -C "$2" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
   [ "$gcd" = "$main" ] && return 0
   echo "cc: refusing to run git in $2 — its .git resolves to ${gcd:-nothing}, not $main: a member workspace's track hangs off ~/dev/$1/.git or nothing runs in it"; return 1; }
-default_branch(){   # a pipeline's status is sed's, so `|| echo main` never fired and an unset origin/HEAD gave "" (review of #214)
-  local b; b=$(git "${GITNH[@]}" -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); [ -n "$b" ] || b=main; echo "$b"; }
+default_branch(){   # $1 = ~/dev/<repo>. THE BOARD'S BASE IS THE PROJECT'S: cc-land already lands against it, so it is what
+  # a track is cut from too. origin/HEAD is only what a remote calls its default, and for a repository the box made that
+  # is the FIRST branch pushed into it — a track. Cut from one of those, a new track in a workspace carried another
+  # project's whole tree into a fresh repository (2026-09-04). A track is nobody's base, whoever names it.
+  # (a pipeline's status is sed's, so `|| echo main` never fired and an unset origin/HEAD gave "" — review of #214)
+  local b; b=$("$BOARD" base "$(basename "$1")" 2>/dev/null)
+  case "$b" in track/*|"") b=$(git "${GITNH[@]}" -C "$1" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##');; esac
+  case "$b" in track/*|"") b=main;; esac
+  echo "$b"; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
 lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
@@ -278,6 +286,7 @@ case "${1:-}" in
     mkdir -p "$wt/.cc"; exec 9>"$wt/.cc/done.lock"
     flock -w "${CC_DONE_LOCK_WAIT:-600}" 9 || { echo "cc: another 'cc done $repo $track' is still running — nothing opened"; exit 1; }   # CC_DONE_LOCK_WAIT: test hook
     base=$(default_branch "$DEV/$repo"); branch="track/$track"
+    rowkind=$("$BOARD" get "$repo" "$track" kind 2>/dev/null)   # a session row is a living project, not a task — see below
     member_gitdir "$repo" "$wt" || exit 1   # BEFORE any git runs in the worktree: a redirected .git is refused, not run (review-156c)
     # the MAIN checkout's hooks, never the worktree's: a member could otherwise plant a git dir whose hooks this
     # host-side commit would run as the owner (review-156b) — same pin cc-loop applies to its own git calls
@@ -288,7 +297,7 @@ case "${1:-}" in
     # member workspace project's OWN repository (made here if it has none) for a workspace. Asking `origin` the
     # question instead sent the PR at whichever repository a workspace happened to wire up first (review of #214).
     rem=$( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --remote 2>/dev/null ) || rem=""
-    if member_workspace "$repo" && [ -z "$rem" ]; then   # a workspace lives on the box alone: the branch IS the delivery
+    if member_workspace "$repo" && [ -z "$rem" ] && [ "$rowkind" != session ]; then   # a workspace lives on the box alone: the branch IS the delivery
       "$BOARD" status "$repo" "$track" done >/dev/null; "$BOARD" note "$repo" "$track" "cc done: no remote, so no PR — the work is on track/$track in ~/dev/$repo" >/dev/null 2>&1 || true
       echo "done: $repo has no remote, so no PR — track/$track is committed in ~/dev/$repo"; exit 0; fi
     if [ -n "$rem" ]; then   # a PR on an un-pushed branch is worse than no PR: stop here and say why
@@ -299,6 +308,13 @@ case "${1:-}" in
       member_gitdir "$repo" "$wt" || exit 1   # the same wall in front of the push (review-156c)
       ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --push ) || { echo "cc: push failed — no PR opened (reason above; also in $wt/.cc/push.err)"; exit 1; }
     fi
+    if [ "$rowkind" = session ]; then
+      # A SESSION ROW IS A LIVING PROJECT, and alive is its normal state (cc-board's KINDS): no PR, never done. Run
+      # against one, this settled the delivery and then ended the row — a member project in daily use was marked
+      # finished by a `cc done` typed at it (2026-09-04). It still delivers; it just does not close.
+      where="committed in ~/dev/$repo"; [ -n "$rem" ] && where="pushed to $rem"
+      "$BOARD" note "$repo" "$track" "cc done: track/$track $where — a session row is a living project, so its status is untouched" >/dev/null 2>&1 || true
+      echo "delivered: track/$track $where. $repo/$track is a session row (a living project, not a task) — no PR, and its status is unchanged."; exit 0; fi
     if member_workspace "$repo" && [ -n "$rem" ]; then
       # gh resolves a bare `pr create` against `origin`, which for a workspace's SECOND project is another
       # project's repository — so pin it to the one just pushed to. And a repository that has only ever

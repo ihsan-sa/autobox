@@ -131,6 +131,17 @@ if [ "$etc" = 1 ]; then
   fi
   echo "/etc configs installed (sshd -t passed)"
 fi
+# git rerere, for every clone on the box. A track branch is a chain of wip checkpoints, so rebasing one onto a moved
+# base replays EVERY checkpoint through the same conflicting lines: #194 wanted the same two lines resolved seven
+# times and was merged instead, to resolve them once. rerere records the first resolution and replays it for the rest
+# of that rebase. It does NOT help across two SEPARATE merges of a moved base — the sides differ each time and rerere
+# matches on their content. Global and not per-repo, because the box rebases in every clone under ~/dev and in their
+# worktrees, and the next clone would be missed; global git config is otherwise none of this installer's business, so
+# it writes ONLY when the owner has said nothing — an explicit true or false is his answer and stands.
+# rerere.autoUpdate is deliberately left off: a replayed resolution is still staged by hand, because one recorded
+# wrong replays silently. Inspect it with `git rerere status` / `git rerere diff`, drop one with
+# `git rerere forget <path>`, drop all with `rm -r "$(git rev-parse --git-path rr-cache)"`.
+[ -n "$(git config --global --get rerere.enabled 2>/dev/null)" ] || git config --global rerere.enabled true || true   # a git that cannot write must not cost the links above
 [ -n "$O" ] && git -C "$O" rev-parse --git-dir >/dev/null 2>&1 &&
   git -C "$O" config core.hooksPath "$(realpath --relative-to="$O" "$R/.githooks")" ||   # pre-commit = core/tests/check.sh on the default branch
   git -C "$R" config core.hooksPath .githooks 2>/dev/null || true                        # a bare autobox clone: hook the repo itself

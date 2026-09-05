@@ -136,6 +136,18 @@ cd ~ && "$B/cc" $REPO >/dev/null 2>&1; sleep 1; tmux list-windows -t main -F '#W
 [ -d ~/.cc/worktrees/$REPO/w1/.cc ] && [ "$(git -C ~/.cc/worktrees/$REPO/w1 symbolic-ref --short HEAD)" = track/w1 ] && ok "worktree on track/w1 with marker" || bad "worktree/branch"
 grep -qxF '.cc/' "$(git -C ~/dev/$REPO rev-parse --path-format=absolute --git-common-dir)/info/exclude" && ok ".cc/ git-excluded" || bad ".cc/ exclusion"
 [ "$("$B/cc-board" get $REPO w1 status)" = running ] && ok "board tracks status" || bad "board status"
+# A TRACK IS CUT FROM THE PROJECT'S BASE, NOT FROM WHATEVER THE REMOTE CALLS ITS DEFAULT. GitHub makes the first branch
+# pushed into a new repository its default, so a workspace's origin/HEAD came to name another project's TRACK, and the
+# next track was cut from that — carrying a whole other project's tree into a fresh repository (2026-09-04). The board
+# records the base and cc-land already lands against it; creation asks the same place.
+( cd ~/dev/$REPO && git checkout -q -b other && echo carpet > carpet.txt && git add -A && git commit -qm "another project's tree" \
+  && git push -q origin other:track/other && git checkout -q main && git branch -q -D other ) >/dev/null 2>&1
+git -C ~/dev/$REPO fetch -q origin; git -C ~/dev/$REPO symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/track/other
+"$B/cc" $REPO w9 >/dev/null 2>&1; sleep 1
+{ [ ! -e ~/.cc/worktrees/$REPO/w9/carpet.txt ] && git -C ~/.cc/worktrees/$REPO/w9 merge-base --is-ancestor origin/main HEAD; } \
+  && ok "a new track is cut from the board's base even when origin/HEAD names a track branch" \
+  || bad "track w9 was cut from origin/HEAD: another project's tree came with it"
+git -C ~/dev/$REPO symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
 echo "== checkpoint hook =="
 echo hi > ~/.cc/worktrees/$REPO/w1/a.txt; ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
 git -C "$T/remote.git" branch | grep -q track/w1 && ok "checkpoint committed + pushed track branch" || bad "checkpoint push"
@@ -539,6 +551,23 @@ od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t3 2>&1); rd=$?
   && ok "cc done on a project whose repository's default branch is the track itself ends clean — the branch is the delivery, not a PR onto itself" \
   || bad "cc done tried a PR from the track onto itself: rc=$rd $od"
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t3" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t3 >/dev/null 2>&1; rm -rf "$T/t3.git"
+# A KIND=SESSION ROW IS A LIVING PROJECT, NOT A TASK: alive is its normal state, so `cc done` delivers and stops there.
+# Run against a member project in daily use it pushed and then ended the row as finished (2026-09-04). The two endings
+# above are a kind=track row's and are unchanged.
+git init -q --bare "$T/t4.git"
+git -C "$GH/dev/alice" worktree add -q -b track/t4 "$GH/.cc/worktrees/alice/t4" 2>/dev/null
+mkdir -p "$GH/.cc/worktrees/alice/t4/.cc"; printf 'alice\nt4\n' > "$GH/.cc/worktrees/alice/t4/.cc/track"
+git -C "$GH/.cc/worktrees/alice/t4" remote add t4 "$T/t4.git"
+git -C "$GH/.cc/worktrees/alice/t4" -c user.email=t@t -c user.name=t commit -q --allow-empty -m t4
+env HOME="$GH" "$B/cc-board" init alice "$GH/dev/alice" main >/dev/null
+env HOME="$GH" "$B/cc-board" add alice t4 "a living project" >/dev/null
+env HOME="$GH" "$B/cc-board" set alice t4 kind session; env HOME="$GH" "$B/cc-board" status alice t4 running >/dev/null
+od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t4 2>&1); rd=$?
+st=$(env HOME="$GH" "$B/cc-board" get alice t4 status)
+{ [ "$rd" = 0 ] && [ "$st" = running ] && git -C "$T/t4.git" rev-parse -q --verify track/t4 >/dev/null; } \
+  && ok "cc done on a kind=session row pushes the delivery and leaves the row alive — a living project is never 'done'" \
+  || bad "cc done ended a session row: rc=$rd status=$st $od"
+git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t4" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t4 >/dev/null 2>&1; rm -rf "$T/t4.git"
 o5=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 1e9 2>&1); r5=$?
 o6=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 5.5 2>&1)
 [ "$r5" = 2 ] && grep -q 'budget must be' <<<"$o5" && ! grep -q 'budget must be' <<<"$o6" \
@@ -1648,7 +1677,7 @@ echo "== install.sh on a blank HOME (the bare-clone bootstrap) =="
 # and stays behind. The fixtures ($T) go with the run's EXIT trap.
 IR="$T/autobox"; IH="$T/blank"; mkdir -p "$IR" "$IH"
 tar -C "$B/.." --exclude=./ccbox/env --exclude=__pycache__ -cf - . | tar -C "$IR" -xf -
-inst(){ ( cd "$IH" && env HOME="$IH" USER=tester CC_BOX=testbox GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$T/install.log" 2>&1; }
+inst(){ ( cd "$IH" && env HOME="$IH" XDG_CONFIG_HOME="$IH/.config" USER=tester CC_BOX=testbox GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$T/install.log" 2>&1; }   # XDG too: the installer writes global git config, and a fixture reads nobody's but its own
 inst && ok "install.sh runs clean on a blank HOME (--no-services)" || bad "install.sh failed on a blank HOME: $(tail -3 "$T/install.log" | tr '\n' ' ')"
 [ "$(readlink -f "$IH/bin/cc")" = "$IR/bin/cc" ] && [ "$(readlink -f "$IH/bin/cc-pulse")" = "$IR/bin/cc-pulse" ] && ok "bin/* linked into ~/bin from the installed tree" || bad "~/bin links missing or pointing elsewhere"
 # the prune is scoped to what this tree linked: a stale link of its own (target left the tree) goes, a dangling
@@ -1672,6 +1701,13 @@ s1=$(snap); inst; s2=$(snap)
 [ "$s1" = "$s2" ] && ok "a second install.sh run changes nothing (idempotent — the deploy path)" || bad "the second install.sh run changed the HOME"
 [ "$(cat "$IH/CLAUDE.md")" = "# mine" ] && ok "an existing ~/CLAUDE.md is never rewritten" || bad "install.sh overwrote ~/CLAUDE.md"
 [ "$(grep -c 'autobox PATH' "$IH/.bashrc")" = 1 ] && ok "~/.bashrc gets the PATH block once" || bad "PATH block appended more than once"
+# git rerere, on for the box: a track branch is a chain of checkpoints, so one rebase replays the same conflict through
+# every one of them (#194 wanted the same two lines resolved seven times). Global, because it must hold in every clone
+# under ~/dev and in their worktrees — and only where the owner has said nothing.
+gcg(){ env HOME="$IH" XDG_CONFIG_HOME="$IH/.config" git config --global "$@"; }
+[ "$(gcg --get rerere.enabled)" = true ] && ok "install.sh switches git rerere on for the box — a conflict resolved once in a rebase is not resolved by hand again" || bad "rerere not enabled: '$(gcg --get rerere.enabled)'"
+gcg rerere.enabled false; inst
+[ "$(gcg --get rerere.enabled)" = false ] && ok "…and never over the owner's own answer: an explicit false stands" || bad "install.sh overwrote the owner's rerere setting"
 echo "== ask ledger (cc-scope) =="
 # The ledger has no fixtures to build: its selfcheck works in a temp dir of its own and removes it on the way out.
 sc=$("$B/cc-scope" selfcheck 2>&1)
