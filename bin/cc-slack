@@ -1117,6 +1117,20 @@ def workspace_of(target):
     return h if h and os.path.isfile(f"{DEV}/{h}/{MEMBER_MARKER}") else None
 
 
+def member_minted(handle):
+    """Has this workspace a credential of its own yet? The same file, in the same shape, that `cc` reads before it opens
+    any window (member_credential) and that `cc-sandbox member` will not start without. Nothing here starts a session —
+    this only says whether asking for one can lead anywhere."""
+    try:
+        with open(f"{HOME}/.cc/members/{handle}/credentials.json") as f:
+            return bool((json.load(f).get("claudeAiOauth") or {}).get("accessToken"))
+    except Exception:
+        return False
+
+
+MINT_LINE = "mint incomplete — on the box: `cc-sandbox mint {h}`"   # the same words `cc` posts once in #<h>
+
+
 def member_authority(target, uid):
     """"instructions" when `uid` is the member whose workspace `target` is: in their OWN channel their word is an
     instruction, everywhere else a member is still weighed and not obeyed. Empty for anyone else, the owner included
@@ -3341,6 +3355,12 @@ class Daemon:
     def autostart(self, target):
         """No subscriber: start the session (or explain why one can't take the message). Returns a state string."""
         win = window_for(target)   # a member workspace target starts like any other: cc itself puts it inside the boundary (cc-sandbox member)
+        # …EXCEPT AN UNMINTED ONE, WHICH IS NOT "STARTING" (owner, 2026-09-04). No credential, no session, and no
+        # waiting makes one appear, so the state says what it is and the caller answers the member in their own
+        # thread. `cc` is still asked for the session below: it owns the two things only it can say — the one line
+        # #<h> gets (a stamp beside the credential) and the owner's daily page — and it opens nothing.
+        ws = workspace_of(target)
+        state = "no-credential" if ws and not member_minted(ws) else "starting"
         wid, cmd = tmux_window(win)
         if wid and not pane_idle(wid):
             if accept_prompts(wid):                     # stuck on a startup dialog: press it through and let it subscribe
@@ -3349,7 +3369,7 @@ class Daemon:
         if track_missing(target) and not workspace_of(target):   # a member's project has a board row and no worktree yet: cc makes it, inside its own workspace
             return "no-track"                           # #repo--typo: `cc repo typo` would create the track — never from Slack
         if time.time() - self.starting.get(target, 0) < 90:
-            return "starting"
+            return state
         self.starting[target] = time.time()
         if wid:                                         # idle leftover shell (claude exited) → drop it, cc recreates
             tmux("kill-window", "-t", wid)
@@ -3372,7 +3392,7 @@ class Daemon:
             if proc.poll() not in (None, 0):            # cc died instantly (bad target, missing worktree): say so in the log
                 log(f"autostart {target}: cc exited rc={proc.returncode} {(proc.stderr.read() or b'')[:200]!r}")
         log(f"autostart {target}")
-        return "starting"
+        return state
 
     # -- Slack side --------------------------------------------------------------------
     def chan_name(self, chat):
@@ -3851,6 +3871,12 @@ class Daemon:
                 self.told[(target, res)] = now
                 self.say(chat, f"`{target}` is running a headless worker, which cannot chat — the `{repo}` session is "
                                f"answering here instead.", thread)
+            return
+        if res == "no-credential":
+            # EVERY message, not once every two minutes: this is the answer to the thing they just asked, in their own
+            # thread, and it stays true until the owner mints. The CHANNEL hears it once — that half is `cc`'s stamp —
+            # so saying it here as well is the difference between a member who is answered and one talking to a wall.
+            self.say(chat, MINT_LINE.format(h=workspace_of(target) or target), thread)
             return
         if now - self.told.get((target, res), 0) > 120:
             self.told[(target, res)] = now
@@ -6990,11 +7016,13 @@ def cmd_selfcheck():
             dm.cmd_restart("box", "C1", None)
             check("restart: box kills its window then autostarts",
                   tcalls and tcalls[-1][:2] == ("kill-window", "-t") and acalls == ["box"] and "restarting `box`" in said3[-1])
-            _homeW = globals()["HOME"]                  # these cases need a track worktree to exist and one to be
-            with tempfile.TemporaryDirectory() as hw:   # missing; both go in a scratch HOME, because writing into the
-                try:                                    # live ~/.cc/worktrees is the same sin as picking a real repo —
-                    globals()["HOME"] = hw              # and on a bare clone that tree is not there to write into
-                    os.makedirs(f"{hw}/.cc/worktrees/{name}/t1")
+            _homeW, _devW = globals()["HOME"], globals()["DEV"]   # these cases need a track worktree to exist and one
+            with tempfile.TemporaryDirectory() as hw:   # to be missing, and a member workspace that is not minted yet;
+                try:                                    # all of it goes in a scratch HOME and a scratch DEV, because
+                    globals()["HOME"] = hw              # writing into the live ~/.cc/worktrees or ~/dev is the same sin
+                    globals()["DEV"] = f"{hw}/dev"      # as picking a real repo — and on a bare clone neither tree is
+                    os.makedirs(f"{hw}/.cc/worktrees/{name}/t1")   # there to write into anyway
+                    os.makedirs(f"{hw}/dev/{name}")   # …and the fixture repo these targets name has to be in THIS ~/dev
                     dm.cmd_restart(f"{name}/t1", "C1", None)
                     check("restart: repo/track target also kill-window+autostart", acalls[-1] == f"{name}/t1")
                     n_acalls = len(acalls)
@@ -7003,8 +7031,26 @@ def cmd_selfcheck():
                           len(acalls) == n_acalls and "no worktree" in said3[-1])
                     check("autostart: a missing track worktree returns no-track instead of running `cc repo track` (L15)",
                           Daemon.autostart(dm, f"{name}/typo") == "no-track")
+                    # AN UNMINTED MEMBER WORKSPACE IS NOT "⏳ starting" (owner, 2026-09-04). There is no session to
+                    # start and no wait that makes one, so the state says so and the caller answers the member in
+                    # their own thread. `cc` is still asked: it owns the one line #<h> gets and the owner's daily page.
+                    os.makedirs(f"{DEV}/mintless/.cc", exist_ok=True)
+                    open(f"{DEV}/mintless/{MEMBER_MARKER}", "w").close()
+                    _popW = EFFECTS.popen_impl
+                    EFFECTS.popen_impl = lambda cmd, **k: scalls.append(cmd) or type("P", (), {"poll": lambda s: 0})()
+                    st_nc = Daemon.autostart(dm, "mintless"); asked_cc = scalls[-1]
+                    os.makedirs(f"{hw}/.cc/members/mintless", exist_ok=True)
+                    with open(f"{hw}/.cc/members/mintless/credentials.json", "w") as fmc:
+                        json.dump({"claudeAiOauth": {"accessToken": "selfcheck"}}, fmc)
+                    dm.starting.pop("mintless", None)
+                    st_m = Daemon.autostart(dm, "mintless")
+                    EFFECTS.popen_impl = _popW
+                    check("autostart: a member workspace with no credential yet is 'no-credential', never 'starting' — "
+                          "`cc` is still asked (it tells #<h> once what to mint and pages the owner), and the same "
+                          "target starts like any other the moment the credential is there",
+                          st_nc == "no-credential" and asked_cc == [f"{BIN}/cc", "mintless"] and st_m == "starting")
                 finally:
-                    globals()["HOME"] = _homeW
+                    globals()["HOME"], globals()["DEV"] = _homeW, _devW
             dm.cmd_restart("slack", "C1", None)
             check("restart: slack replies first, then restarts cc-slackd detached",
                   said3[-1].startswith("restarting the Slack daemon") and scalls[-1] == ["systemctl", "--user", "restart", "cc-slackd"])
@@ -11082,6 +11128,16 @@ def cmd_selfcheck():
         owner_in_all = all("UOWNER" in fkm.invites.get(n, []) for n in fkm.created)   # every channel the box made, whoever it was for
         member_in_all = (all("UALICE" in fkm.invites.get(n, []) for n in fkm.created if n.startswith("alice-b"))
                          and "UERIN01" in fkm.invites.get("erin", []))
+        # BEFORE THE MINT: the workspace has no credential, autostart says so, and the member is answered in their own
+        # thread — every message. The CHANNEL is told once, by `cc`; this half is what stops a member talking to a wall.
+        dmw.autostart = lambda t: "no-credential"
+        n_said = len(saidw)
+        dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.4", "user": "UALICE",
+                      "text": "hello?", "channel_type": "channel"})
+        dmw.on_event({"type": "message", "channel": cid_a, "ts": "2.5", "user": "UALICE",
+                      "text": "still nothing?", "channel_type": "channel"})
+        unminted_said = [t for t in saidw[n_said:] if t == "mint incomplete — on the box: `cc-sandbox mint alice-b`"]
+        unminted_starting = [t for t in saidw[n_said:] if "starting" in t]
     finally:
         globals()["api"], EFFECTS.run_impl = _apim, _runm
         globals()["load_routes"], globals()["load_cfg"] = _routesm, _cfgm
@@ -11110,6 +11166,10 @@ def cmd_selfcheck():
                                                                        # henry, ivy pairs
     check("a plain message in a member's channel reaches its SESSION — queued for alice-b with authority=instructions and "
           "autostart asked (cc puts that session inside the boundary); the daemon no longer answers it itself", no_session and started)
+    check("a message that arrives before the workspace is minted is answered IN ITS OWN THREAD, every time, with the "
+          "one command that fixes it — never '⏳ starting', which is not what is happening, and never once every two "
+          "minutes, which leaves the next member talking to a wall",
+          len(unminted_said) == 2 and not unminted_starting)
     check("the workspace's identity is WHERE it is, not what is written in it: the marker's body says so, and `.cc/` "
           "is excluded before the first commit — a committed marker would ride into every worktree as an editable "
           "file claiming a handle",

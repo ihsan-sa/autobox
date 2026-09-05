@@ -62,15 +62,31 @@ member_credential(){   # $1 handle · $2 track ("" = the main session) — THE H
   # member` refuses without one), but that refusal landed in a tmux pane nobody reads: a member's message autostarted a
   # window that died with the reason in it,
   # the board row said running, and neither the member nor the owner heard a thing (review-156d). So the same file is checked
-  # HERE, before any window or board write: without it #<h> gets one line (the member sees why there is no answer), the owner
+  # HERE, before any window or board write: without it #<h> gets the command that fixes it, the owner
   # is paged once a day (a stamp beside the file; released when the page failed, so the next attempt retries), and nothing
   # opens. Returns 1 = do not start.
-  local h="$1" tr="${2:-}" own="$HOME/.cc/members/$1/credentials.json" stamp="$HOME/.cc/members/$1/credential-asked" what day
+  # THE CHANNEL IS TOLD ONCE, NOT EVERY TIME (owner, 2026-09-04). This runs on every start attempt and the drive loop
+  # makes one every 2 h, so #<h> carried the same line for a day. A second stamp — credential-told, beside
+  # credential-asked — says the channel already has the command, and is written only when the post really went out: a
+  # line nobody heard is not "told". `cc-sandbox mint` clears both stamps and posts that the workspace is ready. A
+  # member who MESSAGES before the mint is answered every time, in their own thread — that is cc-slack's half
+  # (autostart's "no-credential"), and the words are the same ones.
+  local h="$1" tr="${2:-}" own="$HOME/.cc/members/$1/credentials.json" stamp="$HOME/.cc/members/$1/credential-asked" told="$HOME/.cc/members/$1/credential-told" what day
   [ -s "$own" ] && jq -e '.claudeAiOauth.accessToken' "$own" >/dev/null 2>&1 && return 0
   what="\`$h\`"; [ -n "$tr" ] && what="\`$h/$tr\`"
-  echo "cc: $h has no credential of its own ($own) — nothing starts until one is minted (cc-sandbox mint $h); #$h was told, the owner is paged (once a day)."
-  "$BIN/cc-slack" post -c "#$h" "$what has no session yet: this workspace needs a credential minted by the owner before it can answer. He has been asked." >/dev/null 2>&1 || true
+  echo "cc: $h has no credential of its own ($own) — nothing starts until one is minted (cc-sandbox mint $h); #$h is told once, the owner is paged (once a day)."
   day=$(date -u +%F); mkdir -p "$(dirname "$stamp")"
+  # THE CHANNEL IS RESOLVED BEFORE THE STAMP IS CLAIMED. `cc-slack post` falls back to #alerts (then SLACK_CHANNEL)
+  # when #<h> does not resolve, and still exits 0 — stamping on that exit code files the line in the owner's alert
+  # lane and calls the member's channel told, permanently. So: no #<h>, no post and no stamp; the owner's daily page
+  # is the escalation, and the attempt after the channel exists says it there. --major because the main lane is where
+  # a member reads: without it this is routine text, and post() files it in the #<h>-updates twin every workspace has.
+  # The claim is atomic (noclobber = O_EXCL) and released when the post fails, so two starts racing — the drive loop
+  # and a message arriving together — say it once between them, and a failure is retried rather than inherited.
+  if grep -q "^#${h}[[:space:]]" <<<"$("$BIN/cc-slack" channels 2>/dev/null)" \
+     && ( set -o noclobber; date -u +%FT%TZ > "$told" ) 2>/dev/null; then
+    "$BIN/cc-slack" post -c "#$h" --major "mint incomplete — on the box: \`cc-sandbox mint $h\`" >/dev/null 2>&1 || rm -f "$told"
+  fi
   if [ "$(cat "$stamp" 2>/dev/null)" != "$day" ]; then
     "$BIN/cc-notify" -t "$h" --owner -- "$what needs a credential minted: a message in #$h tried to start its session and there is none at $own. Mint one on the box: \`cc-sandbox mint $h\` walks that person's login in a throwaway HOME and installs what it produced. The next message starts the session. If you mint your OWN account it installs that too and says so — whoever uses that workspace can then use the account anywhere." >/dev/null 2>&1 && echo "$day" > "$stamp"
   fi

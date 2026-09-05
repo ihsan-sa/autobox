@@ -584,7 +584,9 @@ rm -f "$GH/.cc/state/member-spend.json"
 NB="$T/nb"; mkdir -p "$NB" "$GH/dev/alice/.cc"; : > "$GH/dev/alice/.cc/member-facing"; cp "$B/cc" "$NB/cc"
 for h in "$B"/cc-*; do ln -sf "$h" "$NB/$(basename "$h")"; done   # cc resolves EVERY helper through its own BIN
 rm -f "$NB/cc-slack"   # …and only the Slack one is the stub (a copy, not a symlink: readlink -f would escape)
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"; exit "${CAP_SLACK_RC:-0}"\n' "$T/cap.args" > "$NB/cc-slack"
+# `channels` is a real branch, not a recording: cc resolves #<h> through it before it stamps a channel as told, so the
+# stub has to answer like the CLI does — a listing with #alice in it, or (NC_NO_CHAN=1) one without.
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nif [ "$1" = channels ]; then [ -n "${NC_NO_CHAN:-}" ] || printf "#alice        C0ALICE1 -> alice\\n"; exit 0; fi\nexit "${CAP_SLACK_RC:-0}"\n' "$T/cap.args" > "$NB/cc-slack"
 chmod +x "$NB/cc-slack"; : > "$T/cap.args"
 # THE CAP IS CHARGED ON THE HOST, so this fixture is the HOST path — the stub tmux, not CC_MEMBER_SANDBOX=1. That
 # variable used to be the flag that got a workspace past the old sandbox_gate; it now means "inside the boundary",
@@ -621,21 +623,41 @@ rm -f "$GH/.cc/state/member-spend.json"
 # credential, but it refused INSIDE the tmux window cc had already opened: a member's message autostarted a pane that died
 # with the reason in it, the board row said running, and neither the member nor the owner heard a thing. cc now checks the
 # file on the host before any window or board write — the session, the track session and a --go alike — and says so where
-# it counts: one line in #<h> each time, the owner paged ONCE (a day-stamp beside the file), nothing opened, nothing charged.
+# it counts: ONE line in #<h> with the command that fixes it, the owner paged ONCE (a day-stamp beside the file), nothing
+# opened, nothing charged. Once, not each time (owner, 2026-09-04): the drive loop runs exactly this — `cc <repo>` — every
+# 2 h, and a workspace waiting to be minted carried the same line in its channel for a day. A second stamp
+# (credential-told) is what makes the channel line once; the owner's page is unchanged.
 # Same stub HOME and stub bots as the cap: the page is asserted on cc-notify's argv and never sent.
 rm -f "$NB/cc-notify"; printf '#!/usr/bin/env bash\nprintf "NOTIFY: %%s\\n" "$*" >> "%s"\n' "$T/cap.args" > "$NB/cc-notify"; chmod +x "$NB/cc-notify"
-nocred(){ ( env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_CLAUDE=/bin/true "$NB/cc" "$@" 2>&1 ); }
-rm -f "$GH/.cc/members/alice/credentials.json" "$GH/.cc/members/alice/credential-asked"; : > "$T/cap.args"; : > "$T/tmux.log"
+# NC_SLACK_RC, not CAP_SLACK_RC: a `VAR=1 cap` above leaves that one set in this shell, and a stub post that "failed"
+# would then never stamp anything. This block says for itself whether the channel heard the line.
+nocred(){ ( env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_CLAUDE=/bin/true CAP_SLACK_RC="${NC_SLACK_RC:-0}" "$NB/cc" "$@" 2>&1 ); }
+rm -f "$GH/.cc/members/alice/credentials.json" "$GH/.cc/members/alice/credential-asked" "$GH/.cc/members/alice/credential-told"; : > "$T/cap.args"; : > "$T/tmux.log"
 env HOME="$GH" "$B/cc-board" status alice todo queued >/dev/null 2>&1
 n1=$(nocred alice); rn1=$?; n2=$(nocred alice todo); rn2=$?; n3=$(nocred alice todo --go x); rn3=$?
 { [ "$rn1" = 1 ] && [ "$rn2" = 1 ] && [ "$rn3" = 1 ] && grep -q 'no credential of its own' <<<"$n1$n2$n3" \
   && ! grep -q 'new-window' "$T/tmux.log" && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] \
-  && [ "$(grep -c -- '^post -c #alice .*needs a credential minted' "$T/cap.args")" = 3 ] \
+  && [ "$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")" = 1 ] \
   && [ "$(grep -c -- '^NOTIFY: -t alice --owner -- .*needs a credential minted' "$T/cap.args")" = 1 ] \
+  && [ -s "$GH/.cc/members/alice/credential-told" ] \
   && [ "$(cat "$GH/.cc/members/alice/credential-asked")" = "$(date -u +%F)" ] && [ ! -f "$GH/.cc/state/member-spend.json" ] \
   && grep -q 'cc-sandbox mint alice' <<<"$n1" && grep -q 'cc-sandbox mint alice' "$T/cap.args"; } \
-  && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice hears why each time, the owner is paged once with the command that mints one, the row never says running and nothing is charged" \
-  || bad "a workspace without a credential still died in a pane (rc=$rn1/$rn2/$rn3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $n1"
+  && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice is told ONCE what to mint however often the box tries — three attempts, one line — the owner is paged once, the row never says running and nothing is charged" \
+  || bad "a workspace without a credential still died in a pane, or said it more than once (rc=$rn1/$rn2/$rn3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $n1"
+: > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-told"   # a line nobody heard leaves no stamp: the next attempt says it again
+NC_SLACK_RC=1 nocred alice >/dev/null; NC_SLACK_RC=1 nocred alice >/dev/null; p1=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")
+NC_SLACK_RC=0 nocred alice >/dev/null; p2=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")
+[ "$p1" = 2 ] && [ "$p2" = 3 ] && [ -s "$GH/.cc/members/alice/credential-told" ] \
+  && ok "…and the once is a line somebody HEARD: a post that failed leaves no stamp and is tried again, and the attempt that lands is the one that stops the rest" \
+  || bad "the channel line's stamp does not follow the post (failed=$p1, then=$p2, stamp=$(cat "$GH/.cc/members/alice/credential-told" 2>/dev/null))"
+# …and "the post went out" is not "#alice heard it": with no such channel `cc-slack post` files the line in #alerts and
+# still exits 0, so the stamp would call a member's channel told by a line that never reached it, for good.
+: > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-told"
+NC_NO_CHAN=1 nocred alice >/dev/null; q1=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")
+NC_NO_CHAN= nocred alice >/dev/null; q2=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")   # cleared, not omitted: an assignment prefixing a FUNCTION call stays set afterwards (see NC_SLACK_RC above)
+[ "$q1" = 0 ] && [ "$q2" = 1 ] && [ -s "$GH/.cc/members/alice/credential-told" ] \
+  && ok "…and with no #alice to post in, nothing is posted and nothing is stamped — the owner's page is the escalation, and the first attempt after that channel exists is the one that tells it" \
+  || bad "the told-stamp was claimed without a channel to say it in (no-channel posts=$q1, then=$q2, stamp=$(cat "$GH/.cc/members/alice/credential-told" 2>/dev/null))"
 : > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-asked"   # a page nobody heard releases the stamp: the next attempt pages again
 printf '#!/usr/bin/env bash\nprintf "NOTIFY: %%s\\n" "$*" >> "%s"; exit 1\n' "$T/cap.args" > "$NB/cc-notify"
 nocred alice >/dev/null; nocred alice >/dev/null

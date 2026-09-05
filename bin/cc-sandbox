@@ -24,7 +24,8 @@
 #     It runs claude in a THROWAWAY HOME so <handle> logs in there, then installs what that login produced at
 #     ~/.cc/members/<handle>/credentials.json, mode 600 — the path and shape the boundary reads. `--from <file>` installs a
 #     credential a login made somewhere else. Nothing is invented, copied or forwarded, and the owner's own token never rides
-#     in on the environment. IT INSTALLS, OR IT EXITS NON-ZERO SAYING IT DID NOT. Closing claude instead of quitting it
+#     in on the environment. IT INSTALLS, OR IT EXITS NON-ZERO SAYING IT DID NOT — and an install that ends a wall
+#     #<handle> was told about posts one line there saying it is ready. Closing claude instead of quitting it
 #     (/exit) no longer takes mint down between the login and the copy: INT, TERM and HUP are caught and what that login
 #     already wrote is installed anyway. Any end that installs nothing NAMES the throwaway home it left and prints the
 #     `--from` line that finishes from it, so nobody logs in twice; the throwaway home is deleted only once the credential
@@ -342,7 +343,7 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
   # none is forwarded: either claude runs in a throwaway HOME so <handle> logs in there, or --from names the file a login
   # somewhere else produced. Both go through owners_own, which now NAMES the owner's own rather than stopping it. Run inside a member's own boundary this
   # writes into that tmpfs HOME and dies with it — ~/.cc/members is not bound in there.
-  local h="${1:-}" src="" cj="" scratch="" dest own why old="" closed=0
+  local h="${1:-}" src="" cj="" scratch="" dest own why old="" closed=0 told=0
   [ -n "$h" ] && shift
   while [ $# -gt 0 ]; do case "$1" in
     --from) src="${2:-}"; [ -n "$src" ] || { echo "cc-sandbox: --from needs a file" >&2; return 2; }; shift;;
@@ -386,6 +387,16 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
   if ! jq -e '.claudeAiOauth.accessToken' "$dest" >/dev/null 2>&1; then
     echo "cc-sandbox: $dest is not a credential the boundary can read — nothing was installed" >&2; return 2; fi
   if [ -n "$scratch" ]; then rm -rf "$scratch"; MINT_SCRATCH=""; trap - EXIT; fi   # installed: now there is nothing to keep
+  # THE CHANNEL THAT WAS TOLD THE WALL IS TOLD IT IS GONE (owner, 2026-09-04). While there was no credential #<h> got
+  # the mint command once, from `cc` (member_credential), and the credential-told stamp records that. The wall ends
+  # HERE, so the good news goes out here — but ONLY where the bad news went: a credential ROTATED on a workspace that
+  # is already answering never had a wall, and "ready" in that channel is a line about nothing. Both stamps go either
+  # way, so a workspace that loses its credential later gets a fresh line and a fresh page, not an inherited silence.
+  # --major: this line is routine text, and without it post() files it in the #<h>-updates twin, not the channel the
+  # member is waiting in.
+  [ -e "$H/.cc/members/$h/credential-told" ] && told=1
+  rm -f "$H/.cc/members/$h/credential-told" "$H/.cc/members/$h/credential-asked"
+  [ "$told" = 1 ] && { "$(dirname "$SELF")/cc-slack" post -c "#$h" --major "\`$h\` is ready — message this channel and it answers." >/dev/null 2>&1 || true; }
   echo "cc-sandbox: minted $h's credential at $dest, mode 600$old — that is the one file the boundary reads, and the only credential inside it."
   echo "  Start the workspace: cc $h"; }
 convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, or is refused with the reason. The four that
@@ -576,7 +587,7 @@ selfcheck_member_whitelist(){   # THE ~/.claude.json COPY IS A PRIVACY BOUNDARY,
 selfcheck_mint(){   # MINTING AND CONVERTING, IN A HOME OF THEIR OWN. Everything either command reads or writes hangs off $fh —
   # its own owner credential, its own ~/dev, its own ~/.cc — so the box's real ~/.claude is not something these cases have to
   # avoid touching: it is not reachable from them, and the hash at the end says so out loud.
-  local fh real0 real1 dest d1 out rc r1 r2 sd sc x o1 o2 cb doc
+  local fh real0 real1 dest d1 out rc r1 r2 sd sc x o1 o2 cb doc orig="$SELF"
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxmint-XXXXXX") || return 1
   real0=$(md5sum "$H/.claude/.credentials.json" 2>/dev/null | cut -d' ' -f1); real0="${real0:-absent}"
   mkdir -p "$fh/.claude" "$fh/dev" "$fh/.local/bin" "$fh/.cc" || return 1
@@ -606,6 +617,15 @@ kill -INT 0
 exit 130
 EOS
   printf '#!/bin/sh\nkill -INT 0\nexit 130\n' > "$fh/login-closed-empty"; chmod +x "$fh/login-closed" "$fh/login-closed-empty"
+  # EVERY CASE BELOW RUNS A COPY OF THIS SCRIPT, with a cc-slack of its own beside it. An install posts one line to
+  # #<handle>, and a selfcheck must never be what posts it. These commands find their siblings next to THEMSELVES, so
+  # a copy in $fh/bin finds this one: it records a `post` and forwards everything else (convert's `member
+  # instructions` is a real call on a fixture README). `local SELF` keeps the swap inside this function.
+  mkdir -p "$fh/bin" && cp "$orig" "$fh/bin/cc-sandbox" && chmod +x "$fh/bin/cc-sandbox" || return 1
+  ln -sf "$(dirname "$orig")/cc-board" "$fh/bin/cc-board"
+  printf '#!/bin/sh\n[ "$1" = post ] && { printf "%%s\\n" "$*" >> "%s/slack.args"; exit 0; }\nexec %s/cc-slack "$@"\n' \
+    "$fh" "$(dirname "$orig")" > "$fh/bin/cc-slack"; chmod +x "$fh/bin/cc-slack"
+  local SELF="$fh/bin/cc-sandbox"
   # ── convert: an ordinary repo already on the box becomes the same workspace the join flow makes ────────────────────
   mkdir -p "$fh/dev/alice"; echo hi > "$fh/dev/alice/README.md"
   out=$(HOME="$fh" "$SELF" convert alice 2>&1); rc=$?
@@ -679,6 +699,24 @@ EOS
   t 'mint: and nothing of that login but claudeAiOauth' "$(jq -r 'keys|join(",")' "$dest" 2>/dev/null)" claudeAiOauth
   sd=$(sed -n 's/.*throwaway HOME (\([^)]*\)).*/\1/p' <<<"$out" | head -1)
   t 'mint: the throwaway HOME it logged in with is named, and is gone afterwards' "${sd:+named}/$([ -n "$sd" ] && [ -e "$sd" ] && echo left || echo gone)" named/gone
+  # ── AN INSTALL ENDS THE WALL OUT LOUD (owner, 2026-09-04) ──────────────────────────────────────────────────────────
+  # While there is no credential, `cc` tells #<handle> ONCE what to mint and stamps that it did (credential-told, beside
+  # credential-asked). The install is the end of that, so it says so in the same channel and drops both stamps: a
+  # workspace that loses its credential later has to be able to say it again instead of inheriting the silence.
+  : > "$fh/.cc/members/alice/credential-told"; : > "$fh/.cc/members/alice/credential-asked"; rm -f "$fh/slack.args"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=alice-access LOGIN_REFRESH=alice-refresh "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: an install posts ONE ready line to #<handle> — --major, or post() files it in the -updates twin — and clears both stamps of the wall it just ended' \
+    "$rc/$(grep -c -- '^post -c #alice --major .* is ready' "$fh/slack.args" 2>/dev/null)/$([ -e "$fh/.cc/members/alice/credential-told" ] && echo told)$([ -e "$fh/.cc/members/alice/credential-asked" ] && echo asked)" 0/1/
+  : > "$fh/.cc/members/alice/credential-told"; rm -f "$fh/slack.args"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login-empty" "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: …and a mint that installed nothing says nothing there and leaves the stamp — that wall is still up' \
+    "$rc/$([ -s "$fh/slack.args" ] && echo posted || echo silent)/$([ -e "$fh/.cc/members/alice/credential-told" ] && echo told)" 2/silent/told
+  rm -f "$fh/slack.args" "$fh/.cc/members/alice/credential-told"
+  out=$(env HOME="$fh" CC_CLAUDE="$fh/login" LOGIN_ACCESS=alice-access LOGIN_REFRESH=alice-refresh "$SELF" mint alice 2>&1); rc=$?
+  t 'mint: a credential ROTATED on a workspace that was never walled says nothing in its channel — "ready" belongs to '\
+'the channel that heard the wall, and #<handle> was never told there was one' \
+    "$rc/$([ -s "$fh/slack.args" ] && echo posted || echo silent)" 0/silent
+  rm -f "$fh/slack.args"
   d1=$(md5sum "$dest" 2>/dev/null | cut -d' ' -f1)
   # THE OWNER'S OWN CREDENTIAL: INSTALLED, AND NAMED. This refused until 2026-09-02, when the owner settled it — "These are
   # trusted people just treat minting my account like any other account". So each case below now asserts the opposite of what
