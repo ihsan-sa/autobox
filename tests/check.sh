@@ -2,7 +2,7 @@
 # tests/check.sh — static checks over core/. bin/ and config/ are LIVE via symlinks: run before committing on
 # the default branch (the pre-commit hook does). Extra python files to compile can be passed as arguments
 # (a private overlay adds its own that way).
-set -e; cd "$(dirname "$0")/.."
+set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$0")/.."   # $0 is resolved BEFORE the cd moves out from under it
 sh=(); py=()
 for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
 bash -n "${sh[@]}"
@@ -51,5 +51,14 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # over workspaces, projects and bare repos it builds in a HOME and temp dir of its own, with
 # a cc-gh-token that records what it was asked to create instead of creating it: no repository of this box's is
 # read, nothing is created anywhere, and the only branches pushed or deleted are in those fixtures.
-for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause; do o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+# …and only the ones a change reaches, when the landing says what changed (CC_LAND_CHANGED — tests/green.sh has
+# the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
+. tests/green.sh; land_scope "$PWD/bin"; skipped=""
+for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause; do
+  want "$c" || { skipped="$skipped $c"; continue; }
+  o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+[ -z "$skipped" ] || echo "check.sh: not in this change's reach, not run:$skipped"
+# Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
+# again on the same files the worker already ran it on (tests/green.sh, read by cc-land).
+green_record "$SELF" "$SCOPE"
 echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests)"

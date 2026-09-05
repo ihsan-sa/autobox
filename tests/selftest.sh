@@ -2,9 +2,10 @@
 # selftest.sh — end-to-end test of the cc layer against a throwaway local repo (bare "remote"). No API calls:
 export CC_NOTIFY_LOG_ONLY=1   # never push to the owner from tests
 export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage limit resets' is capped at 1 s
-# claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside another copy of itself in another
-# worktree: every run is namespaced (see $RUN below), the two runs take turns (see the lock below) and each
-# cleans up after itself.  Usage: tests/selftest.sh
+# claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside other copies of itself from other
+# worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait (see the slots below)
+# and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
+# the paths a PR changed, in which case only what that change reaches runs (see "WHAT RUNS" below).
 # Exercises the bin/ THIS file ships with (a track worktree tests its own copy, not the ~/bin symlinks).
 set -uo pipefail
 exec </dev/null; unset CC_ROLE CC_HANDOFF CLAUDECODE "${!CLAUDE_@}"   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
@@ -17,37 +18,40 @@ exec </dev/null; unset CC_ROLE CC_HANDOFF CLAUDECODE "${!CLAUDE_@}"   # never in
 # started on 2026-09-01 (02:54–04:05Z) — the same class: a suite carrying them asserts against whoever runs it.
 B="$(cd "$(dirname "$0")/../bin" && pwd)"
 SELF="$(readlink -f "$0")"
-# ── one run at a time ────────────────────────────────────────────────────────────────────────────────────────
-# $RUN namespaces everything this suite OWNS; it cannot namespace what the box only has one of. Overlapping runs
-# QUEUE here rather than race — wait, never fail: the second run is not wrong, it is early. A false red is worse
-# than a slow one (it can false-open the main-gate row), and on 2026-08-31/09-01 overlap cost three land cycles:
-# red runs that were green alone.
-#
-# MEASURED 2026-09-02, because this lock is expensive — a landing gates several queued PRs at once and every one of
-# those gate runs queues HERE, so a four-deep queue is ~20 min of wall clock per lane, on every repair round. Four
-# copies of this suite, from four separate trees, each given a lock of its own: 441 s for the slowest of the four
-# against 426 s for one alone. The box has the CPU; the lock costs the queue and buys back one thing:
-#   cc-reconcile's selfcheck runs its end-to-end block under a HOME of its own, but under a repo name that is a
-#   CONSTANT (`selfcheckrepo`, PR 9), and one of its fixtures is a real 60 s `cc-land selfcheckrepo 9` process.
-#   cc-reconcile reads the BOX-WIDE process table to see who is already landing what, so a second run sees the
-#   first run's lander and suppresses the offer it is asserting. 1 red in 6 concurrent runs; 3/3 green in sequence
-#   and 3/3 green under six CPU burners with no overlap — interference, not slowness.
-# The three reasons this lock was written for have all gone: the model dialog has its own tmux server (MT below),
-# the ~/.claude.json rewrite takes a lock and filters to $REPO, and nothing here writes any other global path.
-# Pin that fixture's repo name per process and the lock has nothing left to hold. That one line is in cc-reconcile,
-# which PR #190 has open, so it was not made here — until it is, this lock stays.
-LOCKF="${CC_SELFTEST_LOCK:-$HOME/.cc/selftest.lock}"; mkdir -p "$(dirname "$LOCKF")"
+# ── how many at once ─────────────────────────────────────────────────────────────────────────────────────────
+# $RUN namespaces everything this suite OWNS. Until 2026-09-04 a box-wide lock ran suites one at a time as well,
+# and every landing's suite queued behind every other landing's: eight to ten minutes each, ten deep on 09-04, and
+# PR #227's landing spent its whole gate hour waiting and never ran a case. The lock was written for three things
+# that had all gone — the model dialog has its own tmux server (MT below), the ~/.claude.json rewrite takes a lock
+# and filters to $REPO, nothing here writes any other global path — and stayed for a fourth: cc-reconcile's
+# selfcheck started a real `cc-land selfcheckrepo 9` under a CONSTANT name and read the box-wide process table, so
+# a second run saw the first one's lander (1 red in 6 concurrent runs, 09-02). That fixture carries its pid now,
+# and nothing is left for a lock to hold.
+# What stays is a CAP, not a queue: CC_SELFTEST_SLOTS runs at once — four measured on 09-02, 441 s for the slowest
+# of four against 426 s alone — and the next one waits, says whose slots it is waiting on, and says so again every
+# minute, because a wait that is silent reads as a hang to whatever is timing the gate (a landing counts silence,
+# not wall clock: see cc-land's gates).
+LOCKF="${CC_SELFTEST_LOCK:-$HOME/.cc/selftest.lock}"; SLOTS=${CC_SELFTEST_SLOTS:-4}; mkdir -p "$(dirname "$LOCKF")"
+slot(){ [ "$1" = 1 ] && echo "$LOCKF" || echo "$LOCKF.$1"; }   # slot 1 is the file the lock always was; the rest sit beside it
 if [ -z "${CC_SELFTEST_HELD:-}" ]; then
-  exec {LK}>>"$LOCKF"   # >> and never >: a waiter that truncated the file would wipe the pid it is about to read
-  if ! flock -n $LK; then
-    # Whoever holds it wrote their pid a hair after taking it, so what the file says for that hair is the pid the
-    # PREVIOUS run left. Read until the name is of something actually alive, then say it, once, and queue.
-    h=$(head -1 "$LOCKF" 2>/dev/null)
-    for _ in $(seq 1 40); do { [ -n "$h" ] && kill -0 "$h"; } 2>/dev/null && break; sleep 0.05; h=$(head -1 "$LOCKF" 2>/dev/null); done
-    echo "== waiting: $LOCKF is held by pid ${h:-?} =="
-    flock $LK   # wait, never fail: the second run is not wrong, it is early
-  fi
-  : >"$LOCKF"; echo $$ >&$LK   # ours, and named for whoever queues next
+  waited=0
+  while :; do
+    for i in $(seq 1 "$SLOTS"); do
+      exec {LK}>>"$(slot "$i")"   # >> and never >: a waiter that truncated the file would wipe the pid it is about to read
+      flock -n $LK && break 2
+      exec {LK}>&-
+    done
+    if [ $((waited % 60)) = 0 ]; then
+      # Whoever holds a slot wrote their pid a hair after taking it, so what a file says for that hair is the pid
+      # the PREVIOUS run left. Read until every name is of something actually alive, then say them, and wait.
+      h=""; for _ in $(seq 1 40); do
+        h=$(for i in $(seq 1 "$SLOTS"); do head -1 "$(slot "$i")" 2>/dev/null; done | tr '\n' ' '); h=${h% }; live=1
+        for q in $h; do kill -0 "$q" 2>/dev/null || live=; done; [ -n "$h" ] && [ -n "$live" ] && break; sleep 0.05; done
+      echo "== waiting: $LOCKF is held by pid ${h:-?} ($((waited / 60)) min) =="
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  : >"$(slot "$i")"; echo $$ >&$LK   # ours, and named for whoever waits next
   # Hold it HERE, and run the suite as a child with the fd shut ({LK}>&-). An flock lives until every copy of its
   # fd is closed, and a fd the suite held would be inherited by everything it spawns: one orphan it failed to reap
   # (case H4 below is exactly that) used to pin this lock long after its run was gone, leaving the next run queued
@@ -72,6 +76,59 @@ if [ -n "${CC_SELFTEST_LOCK_ONLY:-}" ]; then   # the case below re-runs this fil
   exit 0
 fi
 pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+1)); echo "  ✗ $1"; }
+# A RED stanza NAMES ITS CASES. `cc-scope selfcheck: 69 passed, 1 failed` was the whole record of the red gate that
+# stopped PR #211's landing on 2026-09-04: the case names were captured and thrown away, and finding out what broke
+# cost a baseline against main, a worktree at the PR head and a full re-run of the suite. Every stanza that runs
+# another tool's selfcheck reports its red through here, so they all say the same thing — the tally, then the cases,
+# in the two shapes the tools write them. Capped: one broken selfcheck must not bury the rest of the run. Never
+# called on green, so a green run reads exactly as it did.
+RED_CASES=5
+red(){ bad "$1"; grep -E '✗|✘|FAIL|Traceback' <<<"${2:-}" | head -n "$RED_CASES"; return 0; }
+. "$(dirname "$SELF")/green.sh"   # what a green run leaves for the landing to spend, and how far a change reaches
+# WHAT RUNS. Every stanza, unless the landing said what the change touched (CC_LAND_CHANGED; tests/green.sh has the
+# rule for how far that reaches — the changed tools and the tools that invoke them). Then a stanza runs only if it
+# drives a tool the change reaches, read off its own lines — `$B/cc-foo`, `chk cc-foo`, `$B/cc <sub>` for a
+# cc-<sub> that exists, and `$B/cc … --go` for the loop it starts — so nothing here is a list somebody keeps; and a
+# tool's own selfcheck (`chk`) only if that
+# tool is reached. The stanzas that build the fixtures the rest stand on say so (`stanza … always`), and a skipped
+# stanza leaves nothing a later one needs. Measured 2026-09-04: the whole suite is 524 s; what a one-tool change
+# runs is that tool's cases and the ones sharing a fixture with it.
+land_scope "$B"
+declare -A STANZA_TOOLS   # title -> the tools its lines drive, scanned once from this file
+while IFS=$'\t' read -r title tools; do STANZA_TOOLS[$title]=$tools; done < <(awk -v have=" $(ls "$B" | tr '\n' ' ')" '
+  function found(m) { if (index(" " tools " ", " " m " ") == 0) tools = tools " " m }
+  /^(if )?stanza "/ { if (title != "") print title "\t" tools
+                      title = $0; sub(/^(if )?stanza "/, "", title); sub(/".*$/, "", title); tools = "" }
+  { line = $0
+    if (match(line, /(^|[ ;{(])chk +cc-[a-z0-9-]+/)) { m = substr(line, RSTART, RLENGTH); sub(/^.*chk +/, "", m); found(m) }
+    while (match(line, /\$B\/(cc-[a-z0-9-]+|ccbox|box-status|cc")/)) {
+      m = substr(line, RSTART + 3, RLENGTH - 3); rest = substr(line, RSTART + RLENGTH)
+      if (m == "cc\"") { m = "cc"; if (match(rest, /^ +[a-z-]+/)) { sub_ = substr(rest, RSTART, RLENGTH); gsub(/ /, "", sub_)
+                                                                     if (index(have, " cc-" sub_ " ")) found("cc-" sub_) }
+                          if (rest ~ /--go/) found("cc-loop"); if (rest ~ /--say/) found("cc-msg") }   # what `cc … --go` and `--say` start
+      found(m); line = rest } }
+  END { if (title != "") print title "\t" tools }' "$SELF")
+stanza(){   # `stanza "<title>" [always]`: the header, and whether this change reaches anything the stanza drives
+  echo "== $1 =="
+  { [ -z "$REACH" ] || [ "${2:-}" = always ]; } && return 0
+  local t; for t in ${STANZA_TOOLS[$1]:-}; do want "$t" && return 0; done
+  echo "  · not in this change's reach (${STANZA_TOOLS[$1]:-nothing it drives}): not run"; return 1; }
+chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · line when the change does not reach it. The
+         # tally is the tool's own line, found by name, never whatever printed last — no tally = it died = red.
+  local t=$1 o r rc keep
+  want "$t" || { echo "  · $t selfcheck: not in this change's reach, not run"; return 0; }
+  o=$("$B/$t" selfcheck 2>&1); rc=$?; r=$(grep -o "$t selfcheck: .*" <<<"$o" | tail -1)
+  # ANCHORED: "10 failed" ends in "0 failed", so a bare substring test reads any tally ending in a zero as green —
+  # 10, 20, 100 failed cases all landed. The two shapes the tools write are "…: 0 failed" and "…, 0 failed".
+  grep -qE '(: |, )0 failed' <<<"$r" && { ok "$r"; return 0; }
+  [ -n "$r" ] && { red "$t selfcheck: $r" "$o"; return 0; }
+  # NO TALLY is not a failed case — the selfcheck never reached its last line: killed, or never started. PR #235's
+  # gate said "it printed no tally line" and not one thing more, and the same suite was green in ten re-runs after
+  # it, so there was nothing left to read. Say the exit status (128+n is a signal) and keep every byte it did say.
+  keep=/tmp/$t-selfcheck-$RUN.log; printf '%s\n' "$o" > "$keep" 2>/dev/null || keep=nowhere
+  bad "$t selfcheck: no tally line — exit $rc, $(printf %s "$o" | wc -c) bytes, kept in $keep"
+  [ -n "$o" ] && tail -3 <<<"$o" | sed 's/^/      /'
+  return 0; }
 # Every run owns a namespace ($RUN): repo name, fixture dir, notify log, usage-limit stamp, tmux windows and
 # processes all carry it. Two selftests (two worktrees, one box) must never read, write or kill each other's things
 # — a global `pkill` here once failed 4 tests in a run that was, on its own, green.
@@ -130,7 +187,7 @@ echo "- work after the limit lifted" >> "\$st/progress.md"; echo "STATUS: DONE" 
 printf '{"is_error":false,"num_turns":1,"total_cost_usd":0.01,"session_id":"x","result":"ok"}'
 F
 chmod +x "$T/fakeclaude" "$T/cappedclaude" "$T/sleepclaude" "$T/limitclaude"
-echo "== cc main + track creation =="
+stanza "cc main + track creation" always
 cd ~ && "$B/cc" $REPO >/dev/null 2>&1; sleep 1; tmux list-windows -t main -F '#W' | grep -qx "$REPO" && ok "main window created" || bad "main window"
 "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 [ -d ~/.cc/worktrees/$REPO/w1/.cc ] && [ "$(git -C ~/.cc/worktrees/$REPO/w1 symbolic-ref --short HEAD)" = track/w1 ] && ok "worktree on track/w1 with marker" || bad "worktree/branch"
@@ -148,7 +205,7 @@ git -C ~/dev/$REPO fetch -q origin; git -C ~/dev/$REPO symbolic-ref refs/remotes
   && ok "a new track is cut from the board's base even when origin/HEAD names a track branch" \
   || bad "track w9 was cut from origin/HEAD: another project's tree came with it"
 git -C ~/dev/$REPO symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
-echo "== checkpoint hook =="
+stanza "checkpoint hook" always
 echo hi > ~/.cc/worktrees/$REPO/w1/a.txt; ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
 git -C "$T/remote.git" branch | grep -q track/w1 && ok "checkpoint committed + pushed track branch" || bad "checkpoint push"
 echo junk > ~/dev/$REPO/junk.txt; ( cd ~/dev/$REPO && "$B/cc-checkpoint" ); git -C ~/dev/$REPO status --short | grep -q junk && ok "checkpoint no-op on primary worktree" || bad "primary worktree touched!"
@@ -196,15 +253,15 @@ mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/nu
 [ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
-echo "== cc-context (the real number, and what refuses to run without it) =="
-ctx=$("$B/cc-context" selfcheck 2>&1)
-grep -q '0 failed' <<<"$ctx" && ok "cc-context selfcheck: ${ctx##*: }" || bad "cc-context selfcheck: $ctx"
-sbx=$("$B/cc-sandbox" selfcheck 2>&1 | tail -1)   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
-grep -q '0 failed' <<<"$sbx" && ok "cc-sandbox selfcheck: ${sbx##*: }" || bad "cc-sandbox selfcheck: $sbx"
+# w1's session and its transcript, and the Stop payload that names them: cc-context's cases and cc-owed's both stand on these
 export CC_CTX_RECORDS="$T/ctx" CC_CTX_BOX_MODEL=   # records under $T, and this box's own model never sizes a fixture
 PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1
 sid=$("$B/cc-board" get $REPO w1 session_id)
 printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":19000,"output_tokens":5}}}\n' > "$PD/$sid.jsonl"
+pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
+if stanza "cc-context (the real number, and what refuses to run without it)"; then
+chk cc-context
+chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
 "$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1)"
 out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
 { [ $rc = 0 ] && grep -q 'under 90%' <<<"$out" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
@@ -220,7 +277,6 @@ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid" "$PD/$sid.
 [ -s "$T/ctx/$sid.json" ] && grep -q '"pct": 10' "$T/ctx/$sid.json" && ok "the Stop hook records the measurement it was handed" || bad "no record from the Stop hook"
 grep -q 'decision' "$T/ctx/$sid.json" && bad "a session under the line was told something" || ok "under the journal line the session is left alone"
 # over the line: the hook answers on stdout with the Stop decision that makes the session journal (once)
-pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
 rm -f "$T/ctx/$sid.json"
 # the fixture is 20k of a 200k window, so the floors (60k/90k) are lowered out of the way for these cases.
 # CC_HANDOFF_OVERLAP=0 is PINNED, like the overlap section below pins it per command. These four cases assert
@@ -270,13 +326,13 @@ lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 10%" <<<"$lsout" && ok "cc ls 
 [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ] && ok "the hook still commits when it is given no payload" || bad "checkpoint broke without a Stop payload"
 
 unset CC_HANDOFF_OVERLAP   # the overlap section below decides for itself, per command
-echo "== cc-brief (the shape of a brief, checked at the door instead of remembered) =="
-brc=$("$B/cc-brief" selfcheck 2>&1)
-grep -q '0 failed' <<<"$brc" && ok "cc-brief selfcheck: ${brc##*: }" || { bad "cc-brief selfcheck: $(tail -1 <<<"$brc")"; grep '^FAIL' <<<"$brc" | head -5; }
+fi
+if stanza "cc-brief (the shape of a brief, checked at the door instead of remembered)"; then
+chk cc-brief
 
-echo "== cc-owed (the same hook says what is still owed in Slack) =="
-owc=$("$B/cc-owed" selfcheck 2>&1)
-grep -q '0 failed' <<<"$owc" && ok "cc-owed selfcheck: ${owc##*: }" || bad "cc-owed selfcheck: $owc"
+fi
+if stanza "cc-owed (the same hook says what is still owed in Slack)"; then
+chk cc-owed
 OWD="$T/owed"; SLD="$T/slackdir"; mkdir -p "$SLD"     # records and cc-slack's marks both under $T: never the box's own
 CH=C0TEST0001; RT=1700000000.000100
 hook(){ pay "${2:-}" | ( cd ~/.cc/worktrees/$REPO/w1 && env CC_OWED_RECORDS="$OWD" CC_SLACK_DIR="$SLD" ${1:+env $1} "$B/cc-checkpoint" ); }
@@ -309,7 +365,8 @@ EOF
   && ok "every debt said is one countable line on the ledger" || bad "ledger: $(env CC_OWED_RECORDS="$OWD" "$B/cc-owed" --ledger)"
 unset CC_CTX_BOX_MODEL
 
-echo "== guard =="
+fi
+if stanza "guard"; then
 g(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?; }
 [ "$(g Bash '{"command":"gh pr merge 1"}' "$wt")" = 2 ] && ok "guard blocks merge in a track (by cwd marker)" || bad "guard merge"
 printf '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 1"},"cwd":"%s"}' "$HOME" | "$B/cc-guard" >/dev/null 2>&1; [ $? = 0 ] && ok "guard ignores non-worker cwd" || bad "guard scope"
@@ -725,10 +782,10 @@ amiss=""
 grep -q -- '"\$CLAUDE" --permission-mode auto --remote-control' "$B/cc-rc" \
   && ok "…and so does the box's own boot session (cc-rc)" || bad "cc-rc still starts in manual mode"
 rm -rf "$AM" "$GH/.cc/worktrees/other" "$GH/.cc/state/other"; rm -f "$GH/.cc/boards/other".*   # leave the stub HOME as this stanza found it
-echo "== overlapping handoff: two sessions, one cwd, exactly one of them live =="
+fi
 export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records, never a 2-min grace or a 10-min drain
-ho=$("$B/cc-handoff" selfcheck 2>&1 | tail -1)
-grep -q '0 failed' <<<"$ho" && ok "cc-handoff selfcheck: ${ho##*: }" || bad "cc-handoff selfcheck: $ho"
+if stanza "overlapping handoff: two sessions, one cwd, exactly one of them live"; then
+chk cc-handoff
 st=$("$B/cc" handoff --status 2>&1); grep -q "no overlapping handoff is open" <<<"$st" && ok "cc handoff --status delegates by target" || bad "cc handoff --status: [$st]"
 out=$(CC_HANDOFF_OVERLAP=0 "$B/cc" handoff --overlap "$REPO" 2>&1); rc=$?
 { [ $rc != 0 ] && grep -q "CC_HANDOFF_OVERLAP" <<<"$out"; } && ok "the overlap path is off until it is turned on (the old handoff is untouched)" || bad "overlap not gated by config: $out"
@@ -832,7 +889,8 @@ for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO" '$
 grep -q 'cc-handoff", "--sweep"' "$B/cc-reconcile" && [ ! -e "$(dirname "$B")/config/systemd-user/cc-handoff.timer" ]   && ok "the sweep rides the existing cc-reconcile timer — no new unit" || bad "the sweep is not wired through cc-reconcile"
 unset CC_HANDOFF_DIR CC_HANDOFF_RETIRE_GRACE CC_HANDOFF_DRAIN
 
-echo "== cc-notify: an escalation reaches the OWNER, not the channel it came from =="
+fi
+if stanza "cc-notify: an escalation reaches the OWNER, not the channel it came from"; then
 # own HOME (the box's real config and owner id stay out of this) + a stub bot: the args cc-notify hands cc-slack ARE the routing
 NH="$T/nh"; mkdir -p "$NH/bin" "$NH/.cc" "$T/chan/.cc" "$T/plain"; : > "$T/chan/.cc/member-facing"
 cat > "$NH/bin/cc-slack" <<F
@@ -902,7 +960,8 @@ M -t "alice help" "nobody is listening"; mrc=$?
 [ "$mrc" != 0 ] \
   && ok "…and when the link does not take it, cc-notify FAILS — exiting 0 having reached nobody is what a blocked member cannot afford" \
   || bad "an escalation that reached nobody still exited 0"
-echo "== --say / --go / cc-loop =="
+fi
+if stanza "--say / --go / cc-loop"; then
 "$B/cc" $REPO w1 --say hello >/dev/null 2>&1 && bad "--say should fail with no live session" || ok "--say refuses when no session"
 tmux new-window -d -t main -n "$REPO/m7" "sleep 30"; sleep 1   # M7: a headless worker's pane is a shell — typed text would run as a command
 "$B/cc-msg" "$REPO/m7" "hello" >"$T/m7.out" 2>&1; [ $? != 0 ] && grep -q 'task.md' "$T/m7.out" && ok "cc-msg refuses a window with no interactive claude" || bad "cc-msg typed into a headless pane"
@@ -946,7 +1005,8 @@ for _ in $(seq 1 30); do tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep
 tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && ok "owner notified on DONE (log backend)" || bad "notify"
 st=$("$B/cc-board" get $REPO w1 status); [ "$st" = review ] && ok "board -> review after done (PR skipped: no gh remote)" || bad "board status after done: $st"
 
-echo "== --go is a covering note, never a replacement for the brief (#71) =="
+fi
+if stanza "--go is a covering note, never a replacement for the brief (#71)"; then
 # #71 stopped `--go "text"` overwriting task.md — but it then synced the BOARD from that file, so a brief that
 # lived ONLY on the board (`cc board add`, the route sp_main tells every planning session to use) was still
 # destroyed on both sides. That is how the same bug reached a fourth track on 2026-08-31: a 4590-byte brief
@@ -1090,7 +1150,8 @@ godisp g7 ""
   && ok "…and a holder that has finished is dropped at the next dispatch, the typed brief untouched" \
   || bad "a finished holder stayed in the block: $(cat "$t7" 2>/dev/null)"
 
-echo "== a finished track leaves the default board view (a13) =="
+fi
+if stanza "a finished track leaves the default board view (a13)"; then
 # owner, 2026-08-30: "this should also remove it from the board". Filter at render — no archive file to drift.
 # A row stays for cc-board's SHOWN_FOR window after it finishes so the owner sees WHAT landed; then it is history,
 # and `--all` still prints it. Backdating `updated` is how the window is crossed without waiting two hours.
@@ -1110,10 +1171,9 @@ BACK
   && ok "a13: --all still prints it — the history is filtered, never deleted" || bad "a13: --all lost it"
 "$B/cc-board" show $REPO | grep -q 'finished' \
   && ok "a13: the default view SAYS it hid something, so nobody wonders where it went" || bad "a13: the view hid a row silently"
-"$B/cc-board" show $REPO | grep -q 'g1' \
+"$B/cc-board" add $REPO a13live "a13 still running" >/dev/null; "$B/cc-board" show $REPO | grep -q 'a13 still running' \
   && ok "a13: an unfinished track is untouched by the filter" || bad "a13: the filter dropped a live track"
-o=$("$B/cc-board" selfcheck 2>&1); grep -q ': 0 failed' <<<"$o" \
-  && ok "cc-board selfcheck: 0 failed" || { bad "cc-board selfcheck"; echo "$o" | grep FAIL | head -5; }
+chk cc-board
 # KIND=SESSION (owner, 2026-09-01): `cc <repo> <name> --session` marks a row a channel-like session — a long-lived
 # session with no task to finish. cc-reconcile leaves its status alone (a track with nobody in its worktree past
 # grace would be reconciled); the rest of the rule is pinned in cc-board's and cc-slack's selfchecks.
@@ -1199,7 +1259,8 @@ kill -HUP $lp 2>/dev/null; gone=no
 for _ in $(seq 1 5); do sleep 1; pgrep -f "$T/sleepclaude" >/dev/null || { gone=yes; break; }; done
 [ "$gone" = yes ] && ok "…and from a launcher that ignores HUP (setsid nohup out of a session shell): the loop resets its signals at launch, so the kill still takes its claude" || { bad "HUP-ignoring launcher: the loop kept SIG_IGN and its claude survived (relaunch orphans)"; pkill -f "$T/sleepclaude"; kill -TERM $lp 2>/dev/null; }
 wait $lp 2>/dev/null; "$B/cc" rm $REPO w3 >/dev/null 2>&1
-echo "== the step limit carries on, and a runaway does not (cc-loop) =="
+fi
+if stanza "the step limit carries on, and a runaway does not (cc-loop)"; then
 # Every stub here is the same shape: it decides per iteration whether to COMMIT (a file in the worktree),
 # whether to JOURNAL, and what it cost. That pair is the whole runaway rule, and the money is never the reason.
 mkclaude(){ cat > "$T/$1" <<F
@@ -1329,7 +1390,8 @@ gnone=$(god env); gon=$(god env CC_LOOP_TRIM=1); goff=$(god env CC_LOOP_TRIM=0)
   || bad "CC_LOOP_TRIM does not cross the tmux window: unset='$(head -c 90 <<<"$gnone")' on='$(head -c 90 <<<"$gon")' off='$(head -c 90 <<<"$goff")'"
 for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
-echo "== usage limits (cc-limit + cc-loop) =="
+fi
+if stanza "usage limits (cc-limit + cc-loop)"; then
 L(){ HOME="$T/lh" CC_LIMIT_STAMP="$T/lh/claude-limit" "$B/cc-limit" "$@"; }; mkdir -p "$T/lh"; lf="$T/lim.json"; miss=""   # own HOME: the table never touches the box's real stamp
 say(){ printf '{"is_error":%s,"result":"%s","total_cost_usd":0}' "$1" "$2" > "$lf"; }
 while IFS='|' read -r want iserr text; do [ -z "$want" ] && continue
@@ -1353,8 +1415,7 @@ L clear; [ "$(L status)" = clear ] && [ "$(L status >/dev/null; echo $?)" = 1 ] 
 # The record/resume state machine — arm, resume, first_seen, nudged_recently and the exit-code contract — is
 # only exercised here. It lives in the selftest and not in check.sh's static list because it forks real
 # processes and sleeps.
-cl=$("$B/cc-limit" selfcheck 2>&1)
-grep -q '0 failed' <<<"$cl" && ok "cc-limit selfcheck: ${cl##*: }" || { bad "cc-limit selfcheck: $cl"; grep '^FAIL' <<<"$cl" | head -5; }
+chk cc-limit
 say true "API Error 429"; b1=$(L check "$lf"); say true "API Error 429"; b2=$(L check "$lf")   # no time in the message: 5 min, then 10
 { [ $(( ${b1#LIMIT } - $(date -u +%s) )) -le 320 ] && [ $(( ${b2#LIMIT } - ${b1#LIMIT } )) -ge 250 ]; } &&
   ok "cc-limit backs off 5 -> 10 min when the message carries no reset time" || bad "backoff: $b1 then $b2"; L clear
@@ -1378,13 +1439,18 @@ n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "$(hostname) limi
 [ "$n" = 1 ] && ok "owner told exactly once per limit episode (title '$(hostname) limit' -> #alerts)" || bad "limit notify count: $n"
 [ "$("$B/cc-limit" status)" = clear ] && ok "the stamp is cleared by the run that got through" || bad "stamp left behind"
 "$B/cc" rm $REPO w4 >/dev/null 2>&1
-echo "== resume/digest/rm =="
-grep -q "$REPO" <<<"$("$B/cc" digest)" && ok "digest lists the track" || bad "digest"
+fi
+if stanza "resume/digest/rm"; then
+# gh stubbed: the digest asks GitHub about every PR on every board of the box, and each fixture PR here is a URL
+# that answers nothing — 70 s of timeouts for one grep (measured 09-04: 92 s with gh, 22 s without)
+mkdir -p "$T/nogh"; printf '#!/bin/sh\nexit 1\n' > "$T/nogh/gh"; chmod +x "$T/nogh/gh"
+grep -q "$REPO" <<<"$(PATH="$T/nogh:$PATH" "$B/cc" digest)" && ok "digest lists the track" || bad "digest"
 "$B/cc" rm $REPO w1 >/dev/null 2>&1; [ ! -d ~/.cc/worktrees/$REPO/w1 ] && ok "rm removed worktree" || bad "rm"
 "$B/cc" rm $REPO w2 >/dev/null 2>&1
-echo "== cc-slack (local router + channel server; no Slack, no API) =="
+fi
+if stanza "cc-slack (local router + channel server; no Slack, no API)"; then
 "$B/cc-slack" selfcheck > "$T/slack-selfcheck.out" 2>&1 && ok "cc-slack selfcheck: $(tail -1 "$T/slack-selfcheck.out")" \
-  || { bad "cc-slack selfcheck: $(tail -1 "$T/slack-selfcheck.out")"; grep '✗' "$T/slack-selfcheck.out" | head -5; tail -5 "$T/slack-selfcheck.out"; }   # name the case: this went red 4× in gates on 09-01 as a bare ✗
+  || red "cc-slack selfcheck: $(tail -1 "$T/slack-selfcheck.out")" "$(cat "$T/slack-selfcheck.out")"   # name the case: this went red 4× in gates on 09-01 as a bare ✗
 export CC_SLACK_DIR="$T/slack"; mkdir -p "$CC_SLACK_DIR"
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"chat_id":"local","text":"pong"}}}' | timeout 10 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch.out"
 grep -q '"claude/channel"' "$T/ch.out" && grep -q '"name": "reply"' "$T/ch.out" && ok "channel server: claude/channel capability + reply tool" || bad "channel handshake"
@@ -1436,7 +1502,8 @@ grep -q 'not that session' <<<"$hp" && [ -z "$hq" ] && grep -q 'not a socket ver
 pg=$(ps -o pgid= -p "$SD" 2>/dev/null | tr -d ' ')   # OUR daemon, by recorded pid and its group — a bare pattern would kill another run's
 if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$SD" 2>/dev/null; fi
 for _ in 1 2 3 4 5; do kill -0 "$SD" 2>/dev/null || break; sleep 0.4; done; unset CC_SLACK_DIR
-echo "== model fallback (cc-model + cc-limit) =="
+fi
+if stanza "model fallback (cc-model + cc-limit)"; then
 # own HOME and own tmux server (TMUX unset, TMUX_TMPDIR into $T): the live sessions' models are never touched
 MH="$T/mh"; mkdir -p "$MH/.cc/state" "$T/fb"; printf '#!/usr/bin/env bash\ncat\n' > "$T/fb/cc-loop"; chmod +x "$T/fb/cc-loop"
 cat > "$T/probeclaude" <<'F'
@@ -1586,7 +1653,8 @@ ME env CC_MODEL_PRIMARY='claude-fable-5-1[1m]' CC_MODEL_DIALOG_WAIT=0.2 CC_MODEL
 { [ "$(mtyped)" -gt "$mt1" ] && [ "$(mretunes)" = 2 ]; } && ok "…and it is that row that silences it: with the gap at 0 the same pane is retuned again, so the row the pass writes and the throttle that reads it cannot drift apart unnoticed" || bad "gap=0 did not retune again: typed=$(mtyped) was $mt1, rows=$(mretunes)"
 for id in $(MT list-windows -t _ccmodel -F '#{window_id}' 2>/dev/null); do MT kill-window -t "$id"; done   # last window gone = that scratch server is gone
 
-echo "== ccbox: a new box's ~/.claude gets the login and nothing else =="
+fi
+if stanza "ccbox: a new box's ~/.claude gets the login and nothing else"; then
 # The seed runs in a throwaway container (no docker here), so the snippet itself runs on stub files: the newest
 # credentials win, .claude.json keeps oauthAccount only (never project history), nothing to copy writes nothing.
 S=$T/seed; mkdir -p "$S/src/ccbox-claude" "$S/src/ccbox-claude-old" "$S/dst"
@@ -1606,7 +1674,8 @@ rm -f "$S/dst"/.claude.json "$S/dst"/.credentials.json; echo '{"theme":"dark"}' 
 rm -f "$S/dst"/.credentials.json "$S"/src/*/.credentials.json; sh -c "$snip"; rc=$?
 [ "$rc" = 0 ] && [ -z "$(ls -A "$S/dst")" ] && ok "nothing to copy → nothing written, exit 0" || bad "seed with no source: rc=$rc $(ls -A "$S/dst")"
 
-echo "== ccbox: a headless --cmd, and the seed helper's image (docker stubbed) =="
+fi
+if stanza "ccbox: a headless --cmd, and the seed helper's image (docker stubbed)"; then
 # A docker stub records every call and plays a box whose project image exists, whose ~/.claude volume does not and
 # whose command prints a line and exits 3 — the two things review-139 caught: the seed copy must run in the BASE
 # image (every box's login is mounted into it, and a project image comes from a Dockerfile its own agent can write),
@@ -1632,34 +1701,36 @@ seed=$(grep '^run --rm ' "$X/calls"); start=$(grep '^run -d ' "$X/calls")
 grep -q ' ccbox:latest -c ' <<<"$seed" && ! grep -q 'ccbox-proj:latest' <<<"$seed" && grep -q ' ccbox-proj:latest$' <<<"$start" && grep -q 'CCBOX_TTY=0' <<<"$start" \
   && ok "the seed copy runs in the base image while the box runs its project image; CCBOX_TTY=0 passed in" || bad "seed: $seed / start: $start"
 
-echo "== cc-trust prune (recorded trust vs real dirs) =="
+fi
+if stanza "cc-trust prune (recorded trust vs real dirs)"; then
 TH=$T/trusthome; mkdir -p "$TH/real-dir"
 printf '{"projects":{"%s":{"hasTrustDialogAccepted":true},"/gone/nowhere-%s":{"hasTrustDialogAccepted":true}}}' "$TH/real-dir" "$$" > "$TH/.claude.json"
 HOME=$TH "$B/cc-trust" prune >/dev/null
 jq -e --arg d "$TH/real-dir" '.projects[$d]' "$TH/.claude.json" >/dev/null && [ "$(jq '.projects | length' "$TH/.claude.json")" = 1 ] \
   && ok "prune drops the gone dir and keeps the living one" || bad "prune: $(cat "$TH/.claude.json")"
 
-echo "== cc-reconcile (board vs reality: decision table + one end-to-end apply, no network) =="
-rec=$("$B/cc-reconcile" selfcheck 2>&1)
-grep -q '0 failed' <<<"$rec" && ok "cc-reconcile selfcheck: ${rec##*: }" || bad "cc-reconcile selfcheck: $rec"
+fi
+if stanza "cc-reconcile (board vs reality: decision table + one end-to-end apply, no network)"; then
+chk cc-reconcile
 
-echo "== cc-janitor (the daily sweep: decision table + one end-to-end pass over a fake box) =="
+fi
+if stanza "cc-janitor (the daily sweep: decision table + one end-to-end pass over a fake box)"; then
 # Its own HOME, board, origin and stub tmux/gh — nothing here can reach this box's tmux server or GitHub.
-jan=$("$B/cc-janitor" selfcheck 2>&1)
-grep -q '0 failed' <<<"$jan" && ok "cc-janitor selfcheck: ${jan##*: }" || bad "cc-janitor selfcheck: $jan"
+chk cc-janitor
 
-echo "== cc-pulse (the drive loop: whole-machine enumeration, start, tick, and the three reasons not to) =="
+fi
+if stanza "cc-pulse (the drive loop: whole-machine enumeration, start, tick, and the three reasons not to)"; then
 # Its own HOME with two boards and one orch, and stub tmux/cc/cc-msg/cc-handoff — it starts no session
 # on this box and types into none of the live ones.
-pul=$("$B/cc-pulse" selfcheck 2>&1)
-grep -q '0 failed' <<<"$pul" && ok "cc-pulse selfcheck: ${pul##*: }" || bad "cc-pulse selfcheck: $pul"
+chk cc-pulse
 
-echo "== cc-secretary (the judgment layer: fixtures, a fake model, the whole escalation ladder, no network) =="
+fi
+if stanza "cc-secretary (the judgment layer: fixtures, a fake model, the whole escalation ladder, no network)"; then
 # Its own HOME, stub tmux/ps/claude/cc-slack/cc-notify — it reads no pane and reaches no session on this box.
-secr=$("$B/cc-secretary" selfcheck 2>&1)
-grep -q '0 failed' <<<"$secr" && ok "cc-secretary selfcheck: ${secr##*: }" || bad "cc-secretary selfcheck: $secr"
+chk cc-secretary
 
-echo "== what the snapshot's four readers do with it (waiting vs the clock, and without it) =="
+fi
+if stanza "what the snapshot's four readers do with it (waiting vs the clock, and without it)"; then
 # cc-reconcile's own selfcheck covers PRODUCING the snapshot; this covers the two things that only break in the
 # readers. Its own HOME, because ~/.cc/state/reconcile.json is a fixed path and this box's live one must not move.
 SH=$T/snaphome; mkdir -p "$SH/.cc/state" "$SH/dev/sr"
@@ -1697,7 +1768,8 @@ grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$lss")" && grep -q 
 grep -q '⛔ stopped' <<<"$(grep s_stop <<<"$dgs")" && ! grep -q 'needs you' <<<"$(grep s_stop <<<"$dgs")" && ok "snapshot: a track that merely stopped reads as stopped, not as a question" || bad "a stopped track was filed as needing him"
 rm -rf "$SH"
 
-echo "== cc-publish: core/ publishes itself =="
+fi
+if stanza "cc-publish: core/ publishes itself"; then
 PUB="$T/mirror.git"; git init -q --bare "$PUB"
 cd ~/dev/$REPO || exit 1
 pub(){ env CC_PUBLISH_STATE="$T" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE="$PUB" PUBLISH_REPO=$REPO PUBLISH_PREFIX=core PUBLISH_BRANCH=main PUBLISH_ALLOW=LICENSE "$B/cc-publish"; }
@@ -1727,7 +1799,8 @@ pub >/dev/null 2>&1
 [ "$(git -C "$PUB" rev-parse main)" = "$was" ] && ok "only origin's default branch is published — local, unpushed work is not" || bad "unpushed work reached the public repo"
 git reset -q --hard origin/main
 env CC_PUBLISH_STATE="$T" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE= PUBLISH_REPO=$REPO "$B/cc-publish" status 2>&1 | grep -q "publish: off" && ok "no PUBLISH_REMOTE: publishing is simply off (a bare clone never publishes)" || bad "unconfigured publish is not off"
-echo "== install.sh on a blank HOME (the bare-clone bootstrap) =="
+fi
+if stanza "install.sh on a blank HOME (the bare-clone bootstrap)" always; then   # always: it drives install.sh through $IR/… , never $B/cc-foo, so the scan can never see what it reaches
 # THIS tree, copied as a bare autobox clone (a dir not named core/ has no overlay), installed into an empty HOME with
 # --no-services: nothing enabled or started, no privileges, nothing of this box's touched. ccbox/env is a token file
 # and stays behind. The fixtures ($T) go with the run's EXIT trap.
@@ -1764,36 +1837,158 @@ gcg(){ env HOME="$IH" XDG_CONFIG_HOME="$IH/.config" git config --global "$@"; }
 [ "$(gcg --get rerere.enabled)" = true ] && ok "install.sh switches git rerere on for the box — a conflict resolved once in a rebase is not resolved by hand again" || bad "rerere not enabled: '$(gcg --get rerere.enabled)'"
 gcg rerere.enabled false; inst
 [ "$(gcg --get rerere.enabled)" = false ] && ok "…and never over the owner's own answer: an explicit false stands" || bad "install.sh overwrote the owner's rerere setting"
-echo "== ask ledger (cc-scope) =="
+fi
+if stanza "ask ledger (cc-scope)"; then
 # The ledger has no fixtures to build: its selfcheck works in a temp dir of its own and removes it on the way out.
-sc=$("$B/cc-scope" selfcheck 2>&1)
-grep -q "0 failed" <<<"$sc" && ok "cc-scope selfcheck: $(tail -1 <<<"$sc")" || bad "cc-scope selfcheck: $(tail -1 <<<"$sc")"
-echo "== landing (cc-land) =="
+chk cc-scope
+fi
+if stanza "landing (cc-land)"; then
 # Its decision table only: the real thing merges, installs and starts services, so every call it would make to
 # the world is stood in for. Nothing here reaches git, Slack, systemd or the board.
-sc=$("$B/cc-land" selfcheck 2>&1)
-grep -q "cc-land selfcheck: 0 failed" <<<"$sc" && ok "$(tail -1 <<<"$sc")" || bad "$(tail -1 <<<"$sc")"
-echo "== cc-audit: the second opinion on what to delete (codex) =="
+chk cc-land
+fi
+if stanza "cc-audit: the second opinion on what to delete (codex)"; then
 # No fixtures: `cc-audit selfcheck` stubs codex logged-out/answering/crashing/silent in a temp dir of its own and
 # removes it. It exits before checks() runs, so calling it from here does NOT recurse back into this file.
-sc=$("$B/cc-audit" selfcheck 2>&1)
-grep -q "0 failed" <<<"$sc" && ok "cc-audit selfcheck: $(tail -1 <<<"$sc")" || bad "cc-audit selfcheck: $(tail -1 <<<"$sc")"
-echo "== the worker loop (cc-loop) =="
+chk cc-audit
+fi
+if stanza "the worker loop (cc-loop)"; then
 # No fixtures: `cc-loop selfcheck` builds its own temp dir — stub cc-models, a scratch cc-config, journal fixtures —
 # and removes it. It exits at the dispatch line before any loop machinery, so calling it from here starts no worker,
 # no tmux window and no `claude -p`. Without this line the loop's cases ran nowhere: a regression that put workers
 # back on the box default instead of the worker model would have landed green.
-lp=$("$B/cc-loop" selfcheck 2>&1); lr=$(grep -o "cc-loop selfcheck: .*" <<<"$lp" | tail -1)   # its own tally line, not the journal fixtures it prints above it
-grep -q "0 failed" <<<"$lr" && ok "$lr" \
-  || { bad "cc-loop selfcheck: ${lr:-it printed no tally line}"; grep "^FAIL" <<<"$lp" | head -5; }   # no tally = it died = red, never a silent pass
-echo "== the graphs on loopback (cc-graphs) =="
+chk cc-loop   # its own tally line, not the journal fixtures it prints above it
+fi
+if stanza "the graphs on loopback (cc-graphs)"; then
 # No fixtures to build: `cc-graphs selfcheck` writes its own ledger days under a temp dir, points the lane rule at
 # a worktrees path of its own, and its HTTP cases bind a port the KERNEL picks on 127.0.0.1 and close it again — so
 # this box's ledger is never read and a server already sitting on the real port is never disturbed.
-gp=$("$B/cc-graphs" selfcheck 2>&1); gr=$(grep -o "cc-graphs selfcheck: .*" <<<"$gp" | tail -1)   # its own tally line, never a FAIL line that happens to be last
-grep -q "0 failed" <<<"$gr" && ok "$gr" \
-  || { bad "cc-graphs selfcheck: ${gr:-it printed no tally line}"; grep "FAIL" <<<"$gp" | head -5; }   # no tally = it died = red, never a silent pass
-echo "== the suite's own lock (one run at a time) =="
+chk cc-graphs   # its own tally line, never a FAIL line that happens to be last
+fi
+stanza "the suite's own reporting, and what a green run leaves behind" always
+# A red stanza names its cases. The tally alone was the whole record of the gate that stopped PR #211 on 09-04.
+r=$(red "cc-fake selfcheck: 8 passed, 2 failed" "$(printf 'ok   the one that passed\nFAIL the row it wrote was the wrong row\n  ✗ and the other shape\n')")
+{ grep -q '8 passed, 2 failed' <<<"$r" && grep -q 'the row it wrote was the wrong row' <<<"$r" \
+  && grep -q 'and the other shape' <<<"$r" && ! grep -q 'the one that passed' <<<"$r"; } \
+  && ok "a red stanza prints the tally AND the cases that failed, in both shapes the tools write them" \
+  || bad "a red stanza named no case: $(tr '\n' ' ' <<<"$r")"
+r=$(red "cc-fake selfcheck: 0 passed, 40 failed" "$(seq 1 40 | sed 's/^/FAIL case /')")
+[ "$(wc -l <<<"$r")" = $((RED_CASES + 1)) ] \
+  && ok "...capped at $RED_CASES cases, so one broken selfcheck cannot bury the rest of the run" \
+  || bad "the cap let $(wc -l <<<"$r") lines through"
+# The green record: the CONTENT this passed on, which is what a landing spends instead of running it again. Keyed
+# by the tree the working copy WOULD COMMIT, because the worker runs the suite and the hook commits after it.
+GR="$T/green"; GD="$T/greenrepo"; mkdir -p "$GD/tests"
+( cd "$GD" && git init -q && git config user.email t@t && git config user.name t && echo one > a.txt && git add -A && git commit -qm init ) >/dev/null 2>&1
+echo two > "$GD/a.txt"; echo new > "$GD/b.txt"; : > "$GD/tests/check.sh"   # edited, plus a file not yet added
+( cd / && CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )           # …and from anywhere: cwd is not the key
+rec=$(cat "$GR"/check.sh-*.json 2>/dev/null)
+want=$( cd "$GD" && git add -A && git commit -qm work >/dev/null 2>&1 && git rev-parse "HEAD^{tree}" )
+{ grep -q "\"tree\": \"$want\"" <<<"$rec" && grep -q '"suite": "tests/check.sh"' <<<"$rec"; } \
+  && ok "a green run records the content it ran on — the tree the commit after it carries — and names the suite as the landing names it" \
+  || bad "the green record does not name that content: [$rec] wanted tree $want"
+echo three > "$GD/a.txt"; ( cd / && CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )
+[ "$(grep -ho '"tree": "[0-9a-f]*"' "$GR"/check.sh-*.json | sort -u | wc -l)" = 2 ] \
+  && ok "...and an edit after the run is a different tree: that record cannot answer for it, so the suite runs again" \
+  || bad "an edited tree recorded the same content: $(ls "$GR")"
+( cd / && CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" "core/bin/x core/bin/y" )
+grep -q '"scope": "core/bin/x core/bin/y"' "$GR"/check.sh-*.json && grep -q '"scope": ""' <<<"$rec" \
+  && ok "...and a record says the SCOPE it ran at — the paths it was narrowed to, or nothing when everything ran — so a narrowed run can never answer for a full one" \
+  || bad "the scope is not on the record: $(cat "$GR"/check.sh-*.json | tr '\n' ' ')"
+# …and in a LINKED WORKTREE, which is where a worker actually runs it (and where the landing runs it too): its own
+# HEAD and its own index, neither of which this may disturb.
+( cd "$GD" && git worktree add -q "$GD/wt" -b track/w1 ) >/dev/null 2>&1
+mkdir -p "$GD/wt/tests"; : > "$GD/wt/tests/check.sh"; echo four > "$GD/wt/a.txt"
+dirt=$(git -C "$GD/wt" status --porcelain)
+( cd / && CC_GREEN_DIR="$GR" green_record "$GD/wt/tests/check.sh" )
+still=$(git -C "$GD/wt" status --porcelain)
+wt=$( cd "$GD/wt" && git add -A && git commit -qm w >/dev/null 2>&1 && git rev-parse "HEAD^{tree}" )
+{ grep -q "\"tree\": \"$wt\"" "$GR/check.sh-${wt:0:12}.json" 2>/dev/null && [ "$still" = "$dirt" ]; } \
+  && ok "...in a track's own worktree too — where the worker runs it — and nothing of that worktree's own index moved" \
+  || bad "no record for the worktree's content ($wt), or its index moved: [$dirt] -> [$still]"
+
+# THE REACH OF A CHANGE (tests/green.sh, land_scope): what the landing's CC_LAND_CHANGED turns into here. Its own
+# bin/ of four stubs: a leaf, a caller that runs it, a talker that only names it in a comment, and cc, which runs both.
+SB="$T/scopebin"; mkdir -p "$SB"
+printf '#!/bin/sh\n"$BIN/cc-leaf" x\n' > "$SB/cc-caller"; printf '#!/bin/sh\n' > "$SB/cc-leaf"
+printf '#!/bin/sh\n# cc-leaf is mentioned here and never run\n' > "$SB/cc-talker"; printf '#!/bin/sh\n"$BIN/cc-leaf"; "$BIN/cc-caller"\n' > "$SB/cc"
+reach(){ ( CC_LAND_CHANGED="$1" land_scope "$SB"; printf '%s|%s' "$REACH" "$SCOPE" ); }
+[ "$(reach core/bin/cc-leaf)" = " cc-caller cc-leaf |core/bin/cc-leaf" ] \
+  && ok "a changed tool reaches itself and the tools that INVOKE it — not one that only mentions it, and never cc, the door to everything" \
+  || bad "reach of cc-leaf: [$(reach core/bin/cc-leaf)]"
+[ "$(reach 'core/bin/cc-caller core/tests/x.sh')" = "|" ] && [ "$(reach core/bin/cc)" = "|" ] && [ "$(reach core/bin/cc-gone)" = "|" ] \
+  && ok "a path that is not a tool, a tool too short to grep for, and a tool that is gone each reach everything" \
+  || bad "widening: [$(reach 'core/bin/cc-caller core/tests/x.sh')] [$(reach core/bin/cc)] [$(reach core/bin/cc-gone)]"
+# …and the reach is TRANSITIVE, and it reads python's own way of naming a sibling. cc-context, cc-handoff and
+# cc-graphs run every tool they drive through os.path.join(BIN, "cc-foo"), which no $BIN/ pattern matches, and one
+# hop stopped at the direct caller: a PR to cc-msg alone skipped every stanza that drives it through cc-handoff.
+SB2="$T/scopebin2"; mkdir -p "$SB2"
+printf '#!/bin/sh\n' > "$SB2/cc-deep"
+printf '#!/usr/bin/env python3\nsubprocess.run([os.path.join(BIN, "cc-deep"), "x"])\n' > "$SB2/cc-mid"
+printf '#!/bin/sh\n"$BIN/cc-mid"\n' > "$SB2/cc-far"
+printf '#!/bin/sh\n# cc-deep is only named here\n' > "$SB2/cc-idle"
+r2(){ ( CC_LAND_CHANGED="$1" land_scope "$SB2"; printf '%s' "$REACH" ); }
+[ "$(r2 core/bin/cc-deep)" = " cc-deep cc-far cc-mid " ] \
+  && ok "the reach is transitive and reads os.path.join(BIN, \"cc-foo\") too: the caller and the caller's caller, never a file that only names it" \
+  || bad "transitive reach: [$(r2 core/bin/cc-deep)]"
+# …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. cc-land sorts the paths in python's byte
+# order and spends a green record only on a scope equal to that; sorting them again here runs in the box's locale,
+# where GNU sort ignores the `-` on its first pass and hands `core/bin/cc-graphs core/bin/ccbox` back swapped —
+# after which no scoped run's record is ever spendable and the suite runs twice on every landing of that shape.
+SB3="$T/scopebin3"; GR3="$T/green3"; mkdir -p "$SB3"
+printf '#!/bin/sh\n' > "$SB3/cc-graphs"; printf '#!/bin/sh\n' > "$SB3/ccbox"
+U8=$(locale -a 2>/dev/null | grep -ix 'en_US.utf-\?8' | head -1); U8=${U8:-C.UTF-8}
+told="core/bin/cc-graphs core/bin/ccbox"   # exactly as cc-land writes it: " ".join(sorted(paths))
+got=$( export LC_ALL=$U8 LANG=$U8; CC_LAND_CHANGED="$told" land_scope "$SB3"; printf '%s' "$SCOPE" )
+CC_GREEN_DIR="$GR3" green_record "$GD/tests/check.sh" "$got"
+spendable(){ CC_GREEN_DIR="$GR3" python3 - "$B/cc-land" "$1" <<'PY'
+import glob, importlib.machinery as M, importlib.util as U, json, os, sys
+sp = U.spec_from_file_location("l", sys.argv[1], loader=M.SourceFileLoader("l", sys.argv[1]))
+mod = U.module_from_spec(sp); sp.loader.exec_module(mod)
+rec = json.load(open(glob.glob(f"{os.environ['CC_GREEN_DIR']}/check.sh-*.json")[0]))
+print("spent" if mod.green_run(rec["tree"], "tests/check.sh", sys.argv[2]) else "runs again")
+PY
+}
+{ [ "$got" = "$told" ] && [ "$(spendable "$told")" = spent ] && [ "$(spendable 'core/bin/ccbox core/bin/cc-graphs')" = "runs again" ]; } \
+  && ok "the scope is handed back as the landing wrote it, not re-sorted: under $U8, a diff of core/bin/cc-graphs + core/bin/ccbox leaves a record cc-land actually spends" \
+  || bad "scope round-trip under $U8: got [$got] wanted [$told], cc-land says [$(spendable "$told")]"
+( REACH=" cc-leaf "; want cc-leaf && ! want cc-talker && REACH="" && want cc-talker ) \
+  && ok "want: a reached tool, not an unreached one, and everything when nothing was narrowed" || bad "want"
+( REACH=" cc-other "; STANZA_TOOLS[fake]="cc-leaf"; r1=$(stanza fake); a=$?; STANZA_TOOLS[fake]="cc-leaf cc-other"; stanza fake >/dev/null; b=$?
+  r3=$(stanza fake always); c=$?; [ $a = 1 ] && grep -q 'not in this change' <<<"$r1" && [ $b = 0 ] && [ $c = 0 ] && ! grep -q 'not run' <<<"$r3" ) \
+  && ok "a stanza runs when the change reaches something it drives, or when it is marked always; otherwise it says so and is skipped" \
+  || bad "stanza gating"
+{ [ "${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]#* }" != "${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]}" ] \
+  && case " ${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]} " in *" cc-limit "*" cc-loop "*|*" cc-loop "*" cc-limit "*) true;; *) false;; esac \
+  && case " ${STANZA_TOOLS[resume/digest/rm]} " in *" cc-digest "*) true;; *) false;; esac \
+  && case " ${STANZA_TOOLS[cc-reconcile (board vs reality: decision table + one end-to-end apply, no network)]} " in *" cc-reconcile "*) true;; *) false;; esac; } \
+  && ok "the scan reads each stanza's tools off its own lines: \$B/cc-foo, chk cc-foo, and \$B/cc <sub> as the cc-<sub> it dispatches to" \
+  || bad "the scan: limits=[${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]}] resume=[${STANZA_TOOLS[resume/digest/rm]}]"
+( REACH=" cc-other "; o=$(chk cc-leaf); [ $? = 0 ] && grep -q 'not in this' <<<"$o" ) \
+  && ok "chk: a selfcheck the change does not reach is a · line, not a run and not a red" || bad "chk gating"
+# …and chk reads the TALLY anchored. "10 failed" ends in "0 failed": on a substring test every red run whose
+# failure count ends in a zero was reported green, its own tally line printed beside the tick (reviewer, PR #235).
+CB="$T/chkbin"; mkdir -p "$CB"
+printf '#!/bin/sh\necho "cc-ten selfcheck: 3 passed, 10 failed"; echo "FAIL the tenth"; exit 1\n' > "$CB/cc-ten"
+printf '#!/bin/sh\necho "cc-zero selfcheck: 4 passed, 0 failed"\n' > "$CB/cc-zero"
+printf '#!/bin/sh\necho "cc-one selfcheck: 0 failed"\n' > "$CB/cc-one"
+chmod +x "$CB"/cc-ten "$CB"/cc-zero "$CB"/cc-one
+r=$( B=$CB; REACH=""; chk cc-ten; chk cc-zero; chk cc-one )
+{ grep -q '✗ .*cc-ten selfcheck: 3 passed, 10 failed' <<<"$r" && grep -q 'FAIL the tenth' <<<"$r" \
+  && grep -q '✓ cc-zero selfcheck: 4 passed, 0 failed' <<<"$r" && grep -q '✓ cc-one selfcheck: 0 failed' <<<"$r"; } \
+  && ok "chk reads the tally anchored: 10 failed is RED, and both shapes a tool writes a real zero in are green" \
+  || bad "chk tally: $(tr '\n' ' ' <<<"$r")"
+# …and a selfcheck that never reaches its tally must not be reported as a shrug. PR #235's gate said only "it
+# printed no tally line": no exit status, no output, nothing to chase, and the case was green in every re-run.
+printf '#!/bin/sh\necho "cc-mute: half a run"; kill -9 $$\n' > "$CB/cc-mute"; chmod +x "$CB/cc-mute"
+r=$( B=$CB; REACH=""; chk cc-mute )
+{ grep -q '✗ cc-mute selfcheck: no tally line — exit 137' <<<"$r" && grep -q 'half a run' <<<"$r" \
+  && grep -q "kept in /tmp/cc-mute-selfcheck-$RUN.log" <<<"$r" && [ -s "/tmp/cc-mute-selfcheck-$RUN.log" ]; } \
+  && ok "...and one that dies before its tally says so with the exit status that killed it, its last lines, and the whole output on disk — never a bare 'no tally line' nobody can chase" \
+  || bad "chk no-tally: $(tr '\n' ' ' <<<"$r")"
+rm -f "/tmp/cc-mute-selfcheck-$RUN.log"
+
+stanza "the suite's own slots (a cap, not a queue)" always
 # Re-runs THIS FILE, stopping at the lock ($CC_SELFTEST_LOCK_ONLY) — no fixtures, no tmux, no repo, so the suite
 # never runs inside itself. On a lock of its own ($CC_SELFTEST_LOCK): the real one is held by the very run doing
 # the testing, and opening it a second time from here would deadlock this run against nobody but itself. Nothing
@@ -1803,10 +1998,10 @@ L="$T/lock"
 ( exec 8>>"$L"; flock 8; : >"$L"; echo $BASHPID >&8; for _ in $(seq 1 600); do [ -e "$L.go" ] && break; sleep 0.1; done ) &
 hp=$!; KIDS="$KIDS $hp"
 for _ in $(seq 1 100); do [ -s "$L" ] && break; sleep 0.1; done   # the stand-in holder has it, and has named itself
-env CC_SELFTEST_LOCK="$L" CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_LOCK_ORPHAN=1 "$SELF" >"$T/lock.out" 2>&1 & cp=$!; KIDS="$KIDS $cp"
+env CC_SELFTEST_LOCK="$L" CC_SELFTEST_SLOTS=1 CC_SELFTEST_LOCK_ONLY=1 CC_SELFTEST_LOCK_ORPHAN=1 "$SELF" >"$T/lock.out" 2>&1 & cp=$!; KIDS="$KIDS $cp"
 for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lock.out" 2>/dev/null && break; sleep 0.1; done
-{ grep -q "is held by pid $hp ==" "$T/lock.out" && kill -0 $cp 2>/dev/null; } \
-  && ok "a second run names the pid holding the lock — and is still sitting on it, not failing past it" \
+{ grep -q "is held by pid $hp (" "$T/lock.out" && kill -0 $cp 2>/dev/null; } \
+  && ok "with one slot, a second run names the pid holding it — and is still sitting on it, not failing past it" \
   || bad "the second run did not queue: $(tr '\n' ' ' <"$T/lock.out")"
 touch "$L.go"; wait $cp; lrc=$?
 cpid=$(sed -n 's/^== lock taken by pid \([0-9]*\) ==$/\1/p' "$T/lock.out")
@@ -1821,7 +2016,26 @@ orp=$(sed -n 's/^== orphan \([0-9]*\) ==$/\1/p' "$T/lock.out")
   && ok "a child that outlives a run does not outlive its lock — nobody queues behind a ghost" \
   || bad "the lock outlived the run (orphan=[$orp] holder=[$(fuser "$L" 2>&1 | tr -s " ")])"
 kill "$orp" 2>/dev/null
+# …and with TWO slots, two runs are in at once and a third waits on both of them — the whole of what the cap is
+# for: landings' suites side by side, each on fixtures it owns. Same stand-in holders, same lock-only runs.
+L2="$T/lock2"
+( exec 8>>"$L2"; flock 8; : >"$L2"; echo $BASHPID >&8; for _ in $(seq 1 600); do [ -e "$L2.go" ] && break; sleep 0.1; done ) & h1=$!; KIDS="$KIDS $h1"
+for _ in $(seq 1 100); do [ -s "$L2" ] && break; sleep 0.1; done
+two=$(env CC_SELFTEST_LOCK="$L2" CC_SELFTEST_SLOTS=2 CC_SELFTEST_LOCK_ONLY=1 "$SELF" 2>&1)
+{ ! grep -q '^== waiting' <<<"$two" && grep -q '^== lock taken' <<<"$two" && [ -s "$L2.2" ]; } \
+  && ok "with two slots, a second run takes the free one at once — no waiting, its pid in the second file" \
+  || bad "the second run did not take the free slot: $(tr '\n' ' ' <<<"$two")"
+( exec 8>>"$L2.2"; flock 8; : >"$L2.2"; echo $BASHPID >&8; for _ in $(seq 1 600); do [ -e "$L2.go" ] && break; sleep 0.1; done ) & h2=$!; KIDS="$KIDS $h2"
+for _ in $(seq 1 100); do [ "$(head -1 "$L2.2" 2>/dev/null)" = "$h2" ] && break; sleep 0.1; done
+env CC_SELFTEST_LOCK="$L2" CC_SELFTEST_SLOTS=2 CC_SELFTEST_LOCK_ONLY=1 "$SELF" >"$T/lock2.out" 2>&1 & c3=$!; KIDS="$KIDS $c3"
+for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lock2.out" 2>/dev/null && break; sleep 0.1; done
+{ grep -q "is held by pid $h1 $h2 (" "$T/lock2.out" && kill -0 $c3 2>/dev/null; } \
+  && ok "...and a third, with both slots held, waits and names both holders" \
+  || bad "the third run did not wait on both: $(tr '\n' ' ' <"$T/lock2.out")"
+touch "$L2.go"; wait $c3; l2rc=$?
+[ $l2rc = 0 ] && ok "...and runs the moment one of them frees" || bad "the waiter never got a slot: rc=$l2rc"
 cd ~ || exit 1
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
-echo "== result: $pass passed, $fail failed =="; [ $fail = 0 ]
+echo "== result: $pass passed, $fail failed${SCOPE:+ (scoped to: $SCOPE)} =="; [ $fail = 0 ] || exit 1
+green_record "$SELF" "$SCOPE"   # green: say what content this passed on, and at what scope, so the landing does not run it again (tests/green.sh)

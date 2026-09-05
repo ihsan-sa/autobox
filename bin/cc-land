@@ -8,7 +8,8 @@
   cc-land <repo> --track <t> --note "<what>"      work with no PR (a config edit, a host change)
   cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does
   cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). Every
-                                                  queued job is gated and then reviewed AT ONCE; the merges and the deploy
+                                                  queued job is gated and reviewed AT ONCE — side by side where their files
+                                                  do not overlap, one after another where they do; the merges and the deploy
                                                   stay serial, in queue order. A queued PR SURVIVES a usage-limit
                                                   review (it waits for the reset) and a red gate (3 tries, 15 min
                                                   apart): the sweep that keeps a job arms its own next run. A
@@ -30,9 +31,12 @@ WHAT IT WILL NOT DO, and why each line is here:
     approval is the one thing a pause must not do — but the review is not bought, the merge and the deploy do not
     happen, the catch-up poll skips the repo, and the queue arms no timer for it, so a parked job costs nothing at
     all rather than re-driving itself every few seconds. `cc-pause off <repo>` and `cc-land work` land it unchanged.
-  · It never merges a diff nobody read. AFTER the gates — the bullet below — comes a review: one headless
-    `claude -p` against the PR's own head, with no shell and nothing to write with, answering LAND /
-    LAND-AFTER-FIX / DO-NOT-LAND. The two
+  · It never merges a diff nobody read — when the diff is worth a paid read: the repo's own CONTROL LAYER
+    (core/tests/control-layer — what runs unattended, or touches secrets, GitHub, the sandbox, the model or the
+    landing), a wide diff, the tests, the install, the config, the reviewer's rules. A change outside that lands on
+    the gates it reaches and the planning session's own read (owner, 2026-09-04). The review, run BESIDE the suite
+    once the cheap gates are green: one headless `claude -p` against the PR's own head, with no shell and nothing
+    to write with, answering LAND / LAND-AFTER-FIX / DO-NOT-LAND. The two
     stopping verdicts stop the landing exactly like a red gate, and the findings are posted as ONE PR comment.
     This is a gate and not a session's habit on purpose: a review a session does by hand dies with that session,
     which is how four finished PRs sat unread in one night. `--no-review` is the only way past it, and a 👍 does
@@ -55,10 +59,14 @@ WHAT IT WILL NOT DO, and why each line is here:
   · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
     afterwards — not against the default branch, which does not contain the change, so gating it there would
     be a green light for code nobody ran. A red gate or a conflicting PR stops everything before the merge.
-    They run FIRST, before a token is spent. A suite is free and repeatable; a review is minutes of a paid
-    model. Reviewing first optimises wall clock on the PR a reviewer stops early, and is backwards for usage:
-    every repair pushed a new SHA and bought a fresh review of code the suite would have rejected anyway. A red
-    gate rejects a head having bought nothing (docs/architecture-usage-efficiency-audit-2026-09-02.md, P0).
+    The cheap ones run FIRST and alone, before a token is spent; the suite runs beside the paid review, because
+    serial they were the whole of a landing's wall clock (owner, 2026-09-04), and it is handed the paths the diff
+    changed so a suite that knows its own shape runs only what those reach. A red cheap gate rejects a head having
+    bought nothing; a read that ran beside a red suite is still COUNTED, because it was still paid for — refunded,
+    it would let one worker buy a paid read on every red head it pushes (usage audit 2026-09-02, P0). And a gate is
+    timed on its SILENCE, not the clock: PR #227's landing spent its gate hour waiting for the suite's lock and timed
+    out with an empty log — a suite that is waiting says so every minute, and one that says nothing for an hour
+    is dead.
   · It never buys a second ROUTINE review for one change. A review is bought for the CHANGE — the PR — and not
     for the SHA: a repair pushes a new head and a re-queue writes a new job file, so counting per job bounded
     nothing. That is how PR #171 bought seven reviews for one change on the night of 2026-09-01 and #156 six,
@@ -109,7 +117,7 @@ honest answer and the point: an ask nobody can measure is not an ask that is don
 Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
 cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
-import ast, calendar, concurrent.futures, fcntl, glob, json, os, re, shlex, shutil, signal, subprocess, sys
+import ast, calendar, fcntl, fnmatch, glob, json, os, re, select, shlex, shutil, signal, subprocess, sys
 import tempfile, threading, time
 import urllib.parse, urllib.request
 
@@ -130,28 +138,40 @@ CATCHUP_EVERY = 900                       # how often the box POLLS origin for a
 # with none of them lands ungated and says so — this is a general tool, not one tree's own script.
 GATES = ("core/tests/check.sh", "tests/check.sh", "tests/check-extra.sh", "core/tests/selftest.sh", "tests/selftest.sh")
 FAILED_RE = re.compile(r"(\d+) failed")   # a suite ending "0 failed" passed; "1 failed" did not, whatever it exited with
-# …and of those, the END-TO-END ones: ten minutes and 270 cases, the only gate a landing is ever slow for. The
-# cheap ones run on every diff; this one runs when the diff can plausibly break it (see gate_tier). `--full-gates`
-# is the way past the question, and a repo whose only gate IS its suite still runs it — the tier removes gates from
-# a run, it never invents one.
+# …and of those, the END-TO-END ones: the only gate a landing is ever slow for. The cheap ones run on every diff and
+# run FIRST, alone; the suite runs on every code diff, handed the paths the diff changed (CC_LAND_CHANGED) so that a
+# suite which knows its own shape runs only what those reach, and it runs BESIDE the paid review rather than before
+# it (see gates). `--full-gates` is the way past all of that, and a repo whose only gate IS its suite still runs it —
+# the tier removes gates from a run, it never invents one.
 SUITE = ("core/tests/selftest.sh", "tests/selftest.sh")
-# The three things that make a diff worth the whole suite, and nothing here is a list of THIS tree's files: a
-# general tool cannot know one repo's shared library by name. Paths that gate everything by construction (the
-# tests themselves, what installs them, what configures them, CI), a diff too wide to reason about, and a file
-# the rest of the tree actually depends on — which is COUNTED, not listed (see shared_file).
-SHARED_PATH_RE = re.compile(r"(^|/)(tests?|config|templates|\.github|\.circleci)/"
+# What makes a diff worth every gate AND a paid read — and nothing here is a list of THIS tree's files: a general
+# tool cannot know one repo's control layer by name. Paths that gate everything by construction (the tests, what
+# installs them, what configures them, CI), a diff too wide to reason about, and the repo's own CONTROL LAYER —
+# what runs unattended, or touches secrets, GitHub, pushes, permissions, the sandbox, the model switch, alerting,
+# or the landing itself (owner, 2026-09-04) — which the repo declares, one path or glob per line, in this file:
+CONTROL_LIST = ("core/tests/control-layer", "tests/control-layer")
+# Read from the BASE side of the diff like REVIEW_RULES, so a PR cannot take itself out of the layer. A repo that
+# ships no list has not said, and every code change of its is read. What is NOT on the list — prose, wording, a
+# report or display tool, a tool's own selfcheck — lands on the gates it reaches and the planning session's own
+# read of the diff, with no paid review.
+SHARED_PATH_RE = re.compile(r"(^|/)(tests?|config|templates|\.github|\.githooks|\.circleci)/"
                             r"|(^|/)(install\.sh|Makefile|Dockerfile|pyproject\.toml|package\.json|setup\.py|"
                             r"requirements\.txt|go\.mod|Cargo\.toml)$")
 DOC_RE = re.compile(r"\.(md|markdown|txt|rst|adoc|org)$|(^|/)(docs|doc)/|(^|/)(LICENSE|COPYING|NOTICE)$", re.I)
 COMMENT_RE = re.compile(r"^\s*($|#|//|--[ \t]|\*[ \t/]|\*$|/\*)")   # a line comment in the syntaxes this box writes
 WIDE_FILES = 12                           # past this many files, or this many changed lines, "narrow" is a claim
 WIDE_LINES = 600                          # nobody can check — the suite is cheaper than being wrong about it
-SHARED_REFS = 2                           # other files naming it: fewer than this and it is a leaf, not a library
 GATE_MEMO_TTL = 3600                      # a memo ("these gates passed on this SHA, at this tier") is never trusted
                                           # for longer than this. The DIRECTORY it lives in is not a constant — see
                                           # gate_dir(), which reads LANDQ at call time so it follows the selfcheck's
                                           # scratch queue instead of unlinking the live one.
+GREEN_TTL = 6 * 3600                      # …and how long a SUITE's own record of what it passed on is spent instead
+                                          # of running it again (green_run). The key there is content, which cannot
+                                          # go stale; the box around it can, so the record is good for hours, not days.
 PREPARE_AT_ONCE = int(os.environ.get("CC_LAND_PREPARE") or 4)   # reviews and gates in flight at once (test hook)
+GATE_IDLE = 3600                          # a gate that has said NOTHING for this long is dead, and is killed. Silence, not
+                                          # wall clock: a suite waiting for one of its slots says so every minute, and
+                                          # PR #227's landing counted that wait as the run — timed out, empty log (09-04)
 # The review gate. ONE generic prompt, shipped beside this script (core/config/), because a reviewer per repo is a
 # reviewer nobody maintains; what a repo wants said about ITSELF goes in its own docs/REVIEW.md, read from the BASE
 # branch, never the PR — a change to the rules is reviewed under the old ones, or a PR could rewrite its own reviewer.
@@ -166,14 +186,12 @@ REVIEW_RULES = "docs/REVIEW.md"               # read from origin/<base> of the r
 # stop on one of them MEANS is a third outcome beside a clean review and findings: see exhausted().
 REVIEW_BUDGET = os.environ.get("CC_LAND_REVIEW_BUDGET") or "3"   # dollars per review, enforced by the runner
 REVIEW_TURNS = os.environ.get("CC_LAND_REVIEW_TURNS") or "40"    # …and turns of it, enforced in the same breath
-# …and WHICH model reads it is the same question the gates ask (gate_tier): the review was the expensive half of
-# every landing, bought at the top model whether the diff was a library everything imports or three paragraphs of
-# prose. Prose and comments are not read by a model at all, a narrow code change gets the cheap one, and only a
-# wide diff — or one touching the tests, the install, the config or a file the tree depends on — is worth the
-# worker model. Per million tokens: opus $5 in / $25 out, sonnet $2 / $10 (2026-06), so a `focused` review is
-# roughly a third of what a `full` one costs and a `docs` one is nothing.
+# …and WHETHER a model reads it is the same question the gates ask (gate_tier): the review was the expensive half of
+# every landing, bought at the top model whether the diff was the landing itself or three paragraphs of prose. Only
+# the `full` tier is read — the control layer, a wide diff, the tests, the install, the config, the reviewer's own
+# rules — and by the worker model. Prose, and a narrow change outside that layer, are read by nobody paid: the gates
+# they reach, and the planning session's own eyes (owner, 2026-09-04).
 REVIEW_MODEL = os.environ.get("CC_LAND_REVIEW_MODEL") or "claude-opus-5"
-REVIEW_MODEL_SMALL = os.environ.get("CC_LAND_REVIEW_MODEL_SMALL") or "claude-sonnet-5"
 REVIEW_MARK = "cc-land-review"                # the HTML comment that makes re-posting the same review a no-op
 REVIEW_VERDICTS = ("LAND", "LAND-AFTER-FIX", "DO-NOT-LAND")
 # The verdict is a FIELD the runner validates, not a sentence somebody greps for. Free text cannot be parsed
@@ -267,6 +285,60 @@ def sh(argv, cwd=None, timeout=300, **kw):
         return r.returncode, r.stdout + r.stderr
     except Exception as e:
         return 127, f"{e.__class__.__name__}: {e}"
+
+
+def kill_group(p):
+    """Everything the gate started, not just the gate. A suite that execs its real run, a `make` that forked its
+    compilers, anything backgrounded — killing the leader alone leaves them holding the fixtures and the lock slot
+    the landing has already moved on from. The group is this child's own (start_new_session), so nothing of this
+    process's is ever in it."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        p.kill()
+
+
+def run_gate(argv, cwd, log, env):
+    """One gate, its output streamed to `log` AS IT RUNS — so a suite queued for one of its slots is readable
+    saying so, and a gate that is killed leaves what it said rather than an empty file — and killed only for
+    SILENCE: GATE_IDLE seconds without a byte. Returns (rc, output) like sh(). PR #227's landing (2026-09-04) sat
+    an hour behind the suite lock under a wall-clock timeout and died with nothing in its log.
+
+    The gate gets a PROCESS GROUP of its own (start_new_session) and the kill takes the whole group. Killing the
+    pid alone kills the launcher and nothing it started: the suite execs its real run as a child with the lock fd
+    shut, so `p.kill()` reaped the shell holding the slot and left the run itself alive — on live fixtures, its
+    slot already handed to somebody else."""
+    out_, f = [], None
+    try:
+        f = open(log, "w")
+    except OSError:
+        pass
+    try:
+        p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+    except Exception as e:
+        return 127, f"{e.__class__.__name__}: {e}"
+    try:
+        while True:
+            if not select.select([p.stdout], [], [], GATE_IDLE)[0]:
+                kill_group(p)
+                p.wait()
+                line = f"\ncc-land: {os.path.basename(argv[0])} said nothing for {GATE_IDLE:g} s — killed as dead\n"
+                out_.append(line.encode())
+                if f:
+                    f.write(line)
+                return 124, b"".join(out_).decode("utf-8", "replace")
+            chunk = os.read(p.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out_.append(chunk)
+            if f:
+                f.write(chunk.decode("utf-8", "replace"))
+                f.flush()
+        return p.wait(), b"".join(out_).decode("utf-8", "replace")
+    finally:
+        if f:
+            f.close()
 
 
 def clean_start():
@@ -524,16 +596,90 @@ _OUT = threading.local()
 _LOCKS, _LOCKS_GUARD = {}, threading.Lock()
 
 
-def git_lock(root):
+def git_lock_path(root):
+    """The file the repo lock is taken on. Inside the repo's own `.git`, because that is what every process
+    working on this checkout shares — and a linked worktree's `.git` is a FILE pointing into the main one, whose
+    FETCH_HEAD is the shared one, so the lock follows it there. A path git cannot be found under falls back to a
+    name under STATE derived from it, which is still exactly one file per checkout."""
+    g = os.path.join(root, ".git")
+    if os.path.isfile(g):
+        try:
+            line = open(g).read().strip()
+        except OSError:
+            line = ""
+        if line.startswith("gitdir:"):
+            g = os.path.abspath(os.path.join(root, line.split(":", 1)[1].strip()))
+            if os.path.basename(os.path.dirname(g)) == "worktrees":
+                g = os.path.dirname(os.path.dirname(g))
+    if os.path.isdir(g):
+        return os.path.join(g, "cc-land.lock")
+    d = f"{STATE}/land/gitlock"
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return ""
+    return f"{d}/{re.sub(r'[^A-Za-z0-9]+', '-', os.path.abspath(root)).strip('-')}.lock"
+
+
+class git_lock:
     """One lock per repository, for the git commands that go through a file the WHOLE repo shares. `git fetch`
-    writes `.git/FETCH_HEAD` and `git rev-parse FETCH_HEAD` reads it back, so two prepare threads fetching two PRs
-    of the same repo — the ordinary case on this box — can hand one of them the other's head: the review is then
-    bought against the wrong diff and its verdict posted on the wrong PR (the comment is keyed by that SHA, so the
-    serial phase misses it and buys the ~$2 review again). `worktree add`/`remove` share `.git/worktrees` and the
-    ref locks the same way. Held across fetch-and-resolve and across a checkout — seconds — and NEVER across the
-    review or the gates, which are the minutes this phase exists to overlap."""
-    with _LOCKS_GUARD:
-        return _LOCKS.setdefault(root, threading.RLock())
+    writes `.git/FETCH_HEAD` and `git rev-parse FETCH_HEAD` reads it back, so two landings fetching two PRs of the
+    same repo — the ordinary case on this box — can hand one of them the other's head: the review is then bought
+    against the wrong diff and its verdict posted on the wrong PR (the comment is keyed by that SHA, so the serial
+    phase misses it and buys the ~$2 review again). `worktree add`/`remove` share `.git/worktrees` and the ref
+    locks the same way, and so does the deploy's `git pull` — a pull is a fetch, and it writes the very ref
+    (`refs/remotes/origin/<base>`) another landing's fetch is writing. EVERY git call in cc-land that fetches or
+    moves a ref in a shared checkout takes this: fetch-and-resolve, the worktree add/remove, the install pull, the
+    catch-up poll. Held across that one call — seconds — and NEVER across the review or the gates, which are the
+    minutes this phase exists to overlap.
+
+    Across PROCESSES, not only threads. A `threading.RLock` is invisible to a second cc-land, and side-by-side
+    landings are the norm now: at 2026-09-05 00:21Z two of them started in the same second, PR #233's gated PR
+    #229's head for an hour and then stopped on 'moved while it was being gated', with the green record for that
+    head written under the wrong PR. So an `flock` on a file in the repo's own .git holds the same window, and the
+    in-process RLock stays for the threads (it is taken first, and it is reentrant where the flock is not — the
+    depth count below is what keeps a nested `with` from deadlocking this process against itself).
+
+    A lock that cannot be taken at all — an unwritable .git, a filesystem with no locking — is not a landing that
+    refuses: the flock is skipped and the threads of this process are serialised as before."""
+
+    def __init__(self, root):
+        self.path = git_lock_path(root)
+        with _LOCKS_GUARD:
+            self.st = _LOCKS.setdefault(self.path or root,
+                                        {"rl": threading.RLock(), "fd": None, "depth": 0})
+
+    def __enter__(self):
+        self.st["rl"].acquire()
+        try:
+            if self.st["depth"] == 0 and self.path:
+                fd = None
+                try:
+                    fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    if fd is not None:
+                        os.close(fd)
+                    fd = None
+                self.st["fd"] = fd
+            self.st["depth"] += 1
+        except BaseException:
+            self.st["rl"].release()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.st["depth"] -= 1
+            if self.st["depth"] == 0 and self.st["fd"] is not None:
+                fd, self.st["fd"] = self.st["fd"], None
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        finally:
+            self.st["rl"].release()
+        return False
 
 
 def emit(text):
@@ -551,10 +697,14 @@ def out(mark, text):
 
 class collected:
     """This thread's lines, kept instead of printed. Thread-local on purpose: contextlib.redirect_stdout rebinds
-    sys.stdout for the whole PROCESS, so using it here would have swallowed the other threads' output too."""
+    sys.stdout for the whole PROCESS, so using it here would have swallowed the other threads' output too. Given a
+    list, it goes on filling that one — a job's lines stay together across the threads that produce them."""
+
+    def __init__(self, buf=None):
+        self.buf = buf
 
     def __enter__(self):
-        _OUT.buf = []
+        _OUT.buf = self.buf if self.buf is not None else []
         return _OUT.buf
 
     def __exit__(self, *a):
@@ -618,20 +768,22 @@ def comment_only(root, a, b, path):
     return hunk                   # no hunk at all = nothing was read; say no
 
 
-def shared_file(root, sha, path):
-    """Does the rest of the tree depend on this file? COUNTED, not configured: how many other tracked files name it.
-    A general tool cannot be handed one repo's list of shared libraries, and a list is the thing nobody updates —
-    so `core/bin/cc-slack`, which half this box calls, gates fully, and a leaf script nothing references does not.
-    True on any doubt: an unanswerable question means the whole suite, not a narrow run."""
-    name = os.path.basename(path)
-    if len(name) < 3:
-        return True
-    rc, o = sh(["git", "grep", "-l", "-F", "--", name, sha], cwd=root, timeout=120)
-    if rc > 1:                    # 1 = no match at all; anything above = git could not answer
-        return True
-    refs = {ln.split(":", 1)[1] for ln in o.splitlines() if ":" in ln}
-    refs.discard(path)
-    return len(refs) >= SHARED_REFS
+def control_paths(root, a, paths):
+    """The changed paths the repo's own list (CONTROL_LIST) calls its control layer, as (paths, declared) — every one
+    of them, and declared=False, when the repo ships no list: a repo that has not said which of its files run
+    unattended gets every code change read. The list is read at the BASE side of the diff (`a`, the merge-base):
+    the one a PR brings with it is the one thing it must not be judged by. One path or glob per line; `#` comments."""
+    for lst in CONTROL_LIST:
+        text = blob(root, a, lst)
+        if text is not None:
+            # Patterns are relative to the tree the list describes — `bin/cc-guard`, whether that tree is the
+            # repo (autobox: tests/control-layer) or core/ inside it (this box: core/tests/control-layer) — so
+            # the one file serves both. A path outside that tree is not in its layer.
+            pre = lst[:-len("tests/control-layer")]
+            pats = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+            return [p for p in paths if p.startswith(pre)
+                    and any(p[len(pre):] == g or fnmatch.fnmatchcase(p[len(pre):], g) for g in pats)], True
+    return list(paths), False
 
 
 def churn(root, a, b):
@@ -648,9 +800,10 @@ def churn(root, a, b):
 
 def gate_tier(root, a, b, changed):
     """Which gates this diff has earned, as (tier, why) — and `why` is printed, because a gate that quietly ran less
-    than you thought is worse than a slow one. `full` every gate · `docs` and `focused` the cheap static ones only.
-    Every path OUT of here that is not a positive answer returns `full`: this function's job is to find a reason to
-    skip ten minutes of suite, and no reason means no skip."""
+    than you thought is worse than a slow one. `full` every gate and the paid review · `focused` the gates, scoped
+    to what the change reaches, and nobody paid to read it · `docs` the cheap static ones only. Every path OUT of
+    here that is not a positive answer returns `full`: this function's job is to find a reason to skip a paid read,
+    and no reason means no skip."""
     paths = [p for _, p in changed]
     if not paths:
         return "full", "nothing could be read about what this changes"
@@ -676,10 +829,13 @@ def gate_tier(root, a, b, changed):
     code = [p for p in paths if not DOC_RE.search(p) and not comment_only(root, a, b, p)]
     if not code:
         return "docs", f"documentation and comments only — {len(paths)} file(s), no code changed"
-    shared = [p for p in code if shared_file(root, b, p)]
-    if shared:
-        return "full", f"a file the rest of the tree depends on changed ({', '.join(shared[:3])})"
-    return "focused", f"a narrow change nothing else here references ({', '.join(code[:3])})"
+    ctl, declared = control_paths(root, a, code)
+    if ctl and not declared:
+        return "full", f"no control-layer list on the base ({CONTROL_LIST[-1]}), so every code change is read ({', '.join(ctl[:3])})"
+    if ctl:
+        return "full", (f"the control layer changed ({', '.join(ctl[:3])}) — what runs unattended, or touches secrets, "
+                        f"GitHub, the sandbox, the model or the landing")
+    return "focused", f"a narrow change outside the control layer ({', '.join(code[:3])}): the gates it reaches, and nobody paid to read it"
 
 
 def gate_dir():
@@ -710,14 +866,46 @@ def gate_memo(repo, pr, sha, tier):
     return f"{len(j['gates'])} gate(s) passed on PR #{pr}: {', '.join(j['gates'])}"
 
 
+def green_dir():
+    """Where a suite that has just passed leaves its own record of what it passed on — tests/green.sh writes them,
+    nothing here does. Derived from LANDQ at call time exactly as gate_dir() is, and for the same reason;
+    CC_GREEN_DIR is how a test points both ends of this at a scratch directory."""
+    return os.environ.get("CC_GREEN_DIR") or f"{LANDQ}/green"
+
+
+def green_run(content, gate, scope=""):
+    """Has this gate already passed on THIS content? The worker runs the suites before it opens its PR and the
+    landing ran them again on the same code, with nothing reading the second result differently from the first
+    (measured on PR #211, 2026-09-04). What a suite records is the git TREE it ran on, not a commit — the worker
+    runs it and the Stop hook commits after it, so the sha it ran at is never the sha the PR carries — which makes
+    a head that moved, an edit after the run and a rebase onto a moved base each a different tree, and each runs
+    the gate. Never spent on read, unlike the sweep's own memo: content cannot go stale, so a re-run of a landing
+    spends the same record. Only the clock retires it, in case the box changed under it. And the SCOPE: a record of
+    a run the suite narrowed to some paths (told what the diff changed) answers only a run narrowed to the same —
+    an unscoped record, the whole suite, answers for any part of itself."""
+    if not content:
+        return False
+    j = read_json(f"{green_dir()}/{os.path.basename(gate)}-{content[:12]}.json") or {}
+    return (j.get("tree") == content and j.get("suite") == gate and (j.get("scope") or "") in ("", scope)
+            and time.time() - epoch_of(j.get("at", "")) <= GREEN_TTL)
+
+
+def tree_id(root):
+    """What a checkout HOLDS, as git names it: the key a green record is filed under."""
+    rc, o = sh(["git", "rev-parse", "HEAD^{tree}"], cwd=root)
+    return "" if rc else o.strip()
+
+
 def sweep_memos():
-    """Spent or stale memos go. Nothing depends on this — a memo is only ever an optimisation — so it never raises."""
-    for p in glob.glob(f"{gate_dir()}/*.json"):
-        try:
-            if time.time() - os.path.getmtime(p) > GATE_MEMO_TTL:
-                os.unlink(p)
-        except OSError:
-            pass
+    """Spent or stale memos go, and the green records whose hours are up with them. Nothing depends on this — both
+    are only ever an optimisation — so it never raises."""
+    for pattern, ttl in ((f"{gate_dir()}/*.json", GATE_MEMO_TTL), (f"{green_dir()}/*.json", GREEN_TTL)):
+        for p in glob.glob(pattern):
+            try:
+                if time.time() - os.path.getmtime(p) > ttl:
+                    os.unlink(p)
+            except OSError:
+                pass
 
 
 def root_dir():
@@ -851,6 +1039,10 @@ class Land:
         self.head = ""           # the PR head as a SHA — never "FETCH_HEAD", which the pull below overwrites
         self.gated = ""          # …the SHA the gates ran on: what the review after them, and the merge, are pinned to
         self.reviewed = ""       # …and the SHA the review actually read, for the fix round's "has it pushed yet"
+        self._review = None      # the review running BESIDE the suite (a thread) and what it decided: see gates()
+        self._read = None
+        self.bought = False      # …and whether that read actually spent a buy: given back only by a usage limit or
+                                 # a cap, which read nothing. A red suite does not give it back — the read happened
         self.restarted = []
         self.unverified = []     # ledger rows this landing could not confirm: named, and left open
 
@@ -876,6 +1068,14 @@ class Land:
         already fixed, the queue buys a repair round with nothing left to repair, and it repeats. A disagreement
         between the two refs is said out loud and written to the ledger; repairing GitHub's ref is not this box's
         job. Sets self.head and returns it."""
+        self.head = self.resolve_head()
+        return self.head
+
+    def resolve_head(self):
+        """The same question, answered WITHOUT touching self.head. The review runs on a THREAD beside the suite and
+        asks it again there (a push during the gates must not be merged); writing self.head from that thread moved
+        a value the landing that owns it was about to file its green gate memo under, so the memo said "these gates
+        passed" for a SHA the gates never ran on. Only the thread that owns the landing writes self.head."""
         branch = (self.facts.get("headRefName") or "").strip()
         pull = f"refs/pull/{self.pr}/head"
         shas = remote_shas(self.repo, f"refs/heads/{branch}" if branch else "", pull)
@@ -894,8 +1094,7 @@ class Land:
             rc, o = sh(["git", "rev-parse", "FETCH_HEAD"], cwd=self.root)
             if rc:
                 raise Failed(f"cannot resolve the head of PR #{self.pr}: {last(o)}")
-            self.head = o.strip()
-        return self.head
+        return o.strip()
 
     def head_checkout(self, step, fetch=True):
         """The PR's OWN head, in a worktree the caller throws away. The review and the gates each take their own
@@ -929,9 +1128,50 @@ class Land:
 
     # -- 1. the review -------------------------------------------------------------------------------------
     def review(self):
-        """One headless reviewer, AFTER the suites, because a green suite says the code runs and says nothing about
-        whether it is the change that was asked for — and because a head the suites reject must cost nothing. It
-        reads the diff, the files at the PR's own head, the
+        """The review step. The read itself usually happens BESIDE the suite — gates() starts it on a thread once
+        the cheap gates are green — and this step collects what it decided; a landing whose suite did not run (a
+        memo spent it, a tier dropped it, a record answered for it) makes the read here instead. Either way the
+        answer is judged on the same terms (verdict_result), and a push while both ran is caught here: what was
+        gated and read is not what is there, so nothing merges."""
+        if self._review is None:
+            return self.review_now()
+        said = self.review_aside()
+        self.fetch_head()
+        if self.gated and self.head != self.gated:
+            raise Failed(f"PR #{self.pr} moved while it was being gated and read: {self.gated[:12]} was gated, "
+                         f"{self.head[:12]} is there now — nothing merges ungated. Re-run to gate the new head")
+        return said + " — read while the suite ran"
+
+    def read_alongside(self):
+        """Start the read on a thread, to run while the suite does: the two were serial and nobody was waiting on
+        either — minutes of suite and then minutes of read, per PR (owner, 2026-09-04). The thread's lines go where
+        the caller's do, so prepare() still keeps a job's lines together. What it decides is collected by review(),
+        and by a red suite too (gates), so a verdict already paid for is never lost."""
+        if self._review is not None or not self.pr or not self.want_review:
+            return
+        buf = getattr(_OUT, "buf", None)
+
+        def go():
+            _OUT.buf = buf
+            try:
+                self._read = ("ok", self.review_now())
+            except BaseException as e:
+                self._read = ("err", e)
+        self._review = threading.Thread(target=go, name=f"review-{self.repo}-{self.pr}", daemon=True)
+        self._review.start()
+
+    def review_aside(self):
+        """What the thread decided, once it has: its line, or the Skip/Failed it raised, raised again here."""
+        t, self._review = self._review, None
+        t.join()
+        kind, v = self._read
+        if kind == "err":
+            raise v
+        return v
+
+    def review_now(self):
+        """One headless reviewer. A green suite says the code runs and says nothing about whether it is the change
+        that was asked for. It reads the diff, the files at the PR's own head, the
         track's BRIEF — its done-criteria, not its journal — and the repo's own docs/REVIEW.md if it has one, and it
         has no shell and nothing to write with, so the worst it can do is be wrong out loud in a PR comment. Who
         reads it, or whether anybody does, is the same tier answer the gates run at: see review_model()."""
@@ -949,14 +1189,20 @@ class Land:
         except OSError as e:
             raise Failed(f"the reviewer prompt is missing ({e}) — install.sh did not link this checkout, or "
                          f"land with --no-review and read the diff yourself")
-        self.fetch_head()
-        if self.gated and self.head != self.gated:
+        # A LOCAL, never self.head: this runs on the review thread while the landing that owns it is finishing the
+        # suite and about to file a memo under self.head. Writing the new SHA there made that memo a green record
+        # for a tree nothing gated — and the serial phase, fetching the same new head, spent it, skipped every gate
+        # and merged with --match-head-commit (review-235).
+        now = self.resolve_head()
+        if self.gated and now != self.gated:
             # The gates take up to an hour and a track's own hook pushes "wip: checkpoint" while they run. Reviewing
             # and then merging the NEW head would put ungated code on the default branch under a green gate line
             # about something else — so this refuses, and the re-run gates what is actually there. (The same check
             # stood in gates() while the review ran first; it moved with the order, it did not go.)
             raise Failed(f"PR #{self.pr} moved while it was being gated: {self.gated[:12]} was gated, "
-                         f"{self.head[:12]} is there now — nothing merges ungated. Re-run to gate the new head")
+                         f"{now[:12]} is there now — nothing merges ungated. Re-run to gate the new head")
+        if not self.gated:
+            self.head = now     # nothing has been gated yet, so no thread exists: this IS the owning thread
         self.reviewed = self.head        # the SHA a dispatched fix round is waiting to see move off
         prior = self.prior_review()
         if prior and not self.re_review:
@@ -1014,7 +1260,8 @@ class Land:
             dpath = f"{tmp}/pr-{self.pr}.diff"
             open(dpath, "w").write(diff or "")
             root_spend(self.repo, self.pr, reviews=1)   # counted BEFORE the money goes, so a reviewer that dies
-            try:                                                                    # half-way through is still a buy
+            self.bought = True                                                      # half-way through is still a buy
+            try:
                 answer, cost, toks = self.ask_reviewer(self.review_prompt(tpl, tree, dpath), tree, tmp)
             except Failed as e:
                 # …with the one exception the queue already treats as weather rather than a verdict: a usage limit
@@ -1025,6 +1272,7 @@ class Land:
                 # pre-check above as well, before anything is counted: a blind -1 there gives a second free review.
                 if limited(str(e)):
                     root_spend(self.repo, self.pr, reviews=-1)
+                    self.bought = False
                 elif getattr(e, "wall", None):
                     # A cap stopped this one, so this buy read nothing either, and the change must not be left owing
                     # a review it never got: the person who then raises the cap would be refused for money that
@@ -1032,6 +1280,7 @@ class Land:
                     # it went — so what goes on the record instead is the wall, and the next attempt at this head is
                     # refused above rather than spending the cap again to be told the same thing.
                     root_spend(self.repo, self.pr, reviews=-1, wall=e.wall)
+                    self.bought = False
                 raise
         finally:
             self.drop_checkout(tmp, tree)
@@ -1171,8 +1420,13 @@ class Land:
         branch whatever they say — and running them anyway cost a three-PR landing five minutes of suite it could
         not act on. The no-PR path still gates: there the checkout IS what is about to be deployed.
 
-        And before the REVIEW, not after it: these cost nothing to run and the review costs minutes of a paid model,
-        so a head the suite rejects must never have bought one (see pr_steps)."""
+        The cheap gates first and ALONE: a head they reject buys nothing. Then the suite and the paid review
+        TOGETHER — each is minutes, and serial they were the whole of a landing's wall clock (owner, 2026-09-04).
+        A red suite still stops the landing before the merge; the read that ran beside it is collected rather than
+        abandoned (its verdict is on the PR for the retry to read back) and its buy STANDS — the read was paid for,
+        and giving it back would let N red heads buy N paid reads with the tally reading 0 throughout. The suite is
+        handed what the diff changed (gate_scope) and every gate is timed on its silence, streamed to a log
+        (run_gate)."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
         tree, tmp = self.root, None
@@ -1190,7 +1444,7 @@ class Land:
         asked = tier          # the memo is filed under the tier the SERIAL phase will ask with, which is what
                               # tier_for() says — not under the one the fallback below may round up to
         try:
-            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK) and (tier == "full" or g not in SUITE)]
+            found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK) and (tier != "docs" or g not in SUITE)]
             if not found:
                 skipped = [g for g in SUITE if os.access(f"{tree}/{g}", os.X_OK)]
                 if skipped:     # the tier took the only gate there is: run it rather than land ungated
@@ -1198,27 +1452,74 @@ class Land:
             if not found:
                 raise Skip(f"no gates in {self.repo} ({GATES[0]}, {GATES[2]}, …) — landing ungated")
             out("·", f"the {tier} tier: {', '.join(found)} — {why}")
-            for g in found:
-                rc, o = sh([f"{tree}/{g}"], cwd=tree, timeout=3600, **clean_start())
+            content, reused = tree_id(tree), []   # …and of those, the ones this exact content has already passed
+            scope = self.gate_scope()             # what the diff changed, for a suite that runs only what that reaches
+
+            def run(g):
+                if green_run(content, g, scope):
+                    reused.append(g)
+                    out("·", f"{g}: already green on this content ({content[:12]}) — the run that made it left the "
+                             f"record, so this landing does not buy the same answer twice")
+                    return
+                start = clean_start()
+                start["env"].pop("CC_LAND_CHANGED", None)   # never an inherited scope: a landing run from inside a
+                if scope:                                    # scoped suite would hand its gates that suite's paths
+                    start["env"]["CC_LAND_CHANGED"] = scope
+                keep = f"{tempfile.gettempdir()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
+                rc, o = run_gate([f"{tree}/{g}"], tree, keep, start["env"])
                 bad = FAILED_RE.search(o)
                 if rc or (bad and bad.group(1) != "0"):
-                    keep = f"{tempfile.gettempdir()}/cc-land-gate-{self.repo}-{self.pr or 'base'}.log"
-                    try:
-                        open(keep, "w").write(o or "")
-                    except OSError:
-                        keep = "not saved"
                     raise Failed(f"gate {g} did not pass: {gate_fail(o)}  [full output: {keep}]")
+
+            quick, slow = [g for g in found if g not in SUITE], [g for g in found if g in SUITE]
+            for g in quick:
+                run(g)
+            if any(not green_run(content, g, scope) for g in slow):
+                self.read_alongside()
+            try:
+                for g in slow:
+                    run(g)
+            except Failed:
+                if self._review is not None:
+                    try:
+                        self.review_aside()
+                    except (Skip, Failed):
+                        pass
+                    if self.bought:
+                        # NOT given back. The money went, and a refund here would unbound the bound the header
+                        # promises: a worker pushing red head after red head buys a paid read every time while
+                        # `reviews` reads 0 for ever — the amplification the 2026-09-02 audit's P0 exists to stop.
+                        # What the retry gets instead is the verdict, already on the PR and read back for free.
+                        out("·", "the review that ran beside the suite is COUNTED against this change — the read "
+                                 "was paid for — and its verdict is on the PR for the retry to read back")
+                raise
             on = f"PR #{self.pr}" if self.head else f"the {self.base()} checkout"
             if self.pr and self.fill_memo:
                 try:    # what the serial phase spends instead of running these again — an optimisation, never a fact
-                    write_atomic(memo_path(self.repo, self.pr, self.head, asked),
+                    write_atomic(memo_path(self.repo, self.pr, self.gated or self.head, asked),   # the SHA the
+                                 # gates RAN on, never whatever self.head says by now: a memo under any other one
+                                 # is a green record for a tree nothing gated, and the serial phase spends it
                                  {"at": stamp(), "tier": tier, "why": why, "gates": found})
                 except OSError:
                     pass
-            return f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): {', '.join(found)}"
+            again = f" — {len(reused)} of them already green on {content[:12]}, not run again" if reused else ""
+            beside = " — the review ran beside the suite" if self._review is not None else ""
+            return f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): {', '.join(found)}{again}{beside}"
         finally:
             if tmp:
                 self.drop_checkout(tmp, tree)
+
+    def gate_scope(self):
+        """The paths this diff changes, sorted and space-separated as git names them: what a suite that knows its
+        own shape is handed (CC_LAND_CHANGED — core/tests/green.sh has the rule for how far that reaches) and the
+        key a green record carries beside its tree. Empty means everything: --full-gates, a deploy with no PR, a
+        diff nothing could be read about, or one too wide to be worth narrowing."""
+        if self.full_gates or not self.pr or not self.head:
+            return ""
+        paths = sorted({p for _, p in self.changed_files()})
+        if not paths or len(paths) > WIDE_FILES:
+            return ""
+        return " ".join(paths)
 
     def tier_for(self):
         """What this diff has earned, and why, as (tier, why) — read by the REVIEW (which model, or none at all)
@@ -1240,14 +1541,14 @@ class Land:
         return tier, why
 
     def review_model(self):
-        """WHO reads this diff — or nobody — as (model, tier, why). The expensive half of a landing was bought at
-        the top model whether the change was a library everything imports or three paragraphs of prose. The same
-        tier the gates run at decides: `docs` is not read by a model at all (there is nothing here a reviewer
-        could be wrong about that a person reading the PR would not see), `focused` gets the cheap model, and only
-        `full` — wide, or touching the tests, the install, the config or a file the tree depends on — is worth the
-        worker model. Every unreadable answer is already `full`, so this can only ever be cheap on purpose."""
+        """WHO reads this diff — or nobody — as (model, tier, why). Only the `full` tier is read, by the worker
+        model: the control layer, a wide diff, the tests, the install, the config, the reviewer's own rules. `docs`
+        and `focused` are read by nobody paid — there is nothing in prose a reviewer could be wrong about that a
+        person reading the PR would not see, and a narrow change outside the control layer is the planning
+        session's own read (owner, 2026-09-04). Every unreadable answer is already `full`, so this can only ever be
+        cheap on purpose."""
         tier, why = self.tier_for()
-        return {"docs": None, "focused": REVIEW_MODEL_SMALL}.get(tier, REVIEW_MODEL), tier, why
+        return (REVIEW_MODEL if tier == "full" else None), tier, why
 
     def changed_files(self):
         """What this landing puts on the default branch. Before the merge that is the PR head against its base;
@@ -1422,7 +1723,13 @@ class Land:
         cur = o.strip()
         if rc or cur != self.base():
             raise Failed(f"{self.root} is on '{cur}', not '{self.base()}' — land from the default-branch checkout")
-        rc, o = sh(["git", "pull", "--ff-only", "-q"], cwd=self.root, timeout=300)
+        with git_lock(self.root):   # a pull is a fetch: it UPDATES refs/remotes/origin/<base>, the same ref a
+                                    # sibling landing's fetch is writing. On 2026-09-05 01:26Z PR #230 merged and
+                                    # then died here on `error: fetching ref refs/remotes/origin/main failed:
+                                    # incorrect old value provided` — the ref moved under it mid-update — leaving
+                                    # the box on the old code with the PR already merged. Held across this one
+                                    # call, like every other fetch.
+            rc, o = sh(["git", "pull", "--ff-only", "-q"], cwd=self.root, timeout=300)
         if rc:
             raise Failed(f"git pull --ff-only in {self.root}: {last(o)}")
         # What is INSTALLED, written down: the next sweep compares origin against this, which is how a merge made in
@@ -1554,12 +1861,12 @@ class Land:
 
     # -- the sequence, in two halves ------------------------------------------------------------------------
     def pr_steps(self):
-        """About THIS change: gate it, read it, merge it, and record that it landed. The GATES come first and the
-        review after them. Reviewing first optimises WALL CLOCK — a change nobody should merge is found out about in
-        two minutes rather than sixty — and is backwards for USAGE, which is what a landing is actually short of: a
-        head the suite rejects had bought a review of code that could never merge, and every repair pushed a new SHA
-        and bought another (audit 2026-09-02, P0). The suites are deterministic and free; they go first, and the
-        wall clock they cost on a DO-NOT-LAND is the price of the tokens they save on every red one."""
+        """About THIS change: gate it, read it, merge it, and record that it landed. The gates step runs the cheap
+        gates first and alone, then the suite with the paid read BESIDE it; the review step collects that read.
+        Reviewing before any gate optimised wall clock and was backwards for usage — a head the suite rejects had
+        bought a review of code that could never merge, and every repair pushed a new SHA and bought another (audit
+        2026-09-02, P0) — so nothing is bought before the cheap gates are green, and a buy made beside a red suite
+        still counts, because it was still paid for."""
         return [("gates", self.gates), ("review", self.review), ("merge", self.merge), ("card", self.card),
                 ("board", self.close_board), ("ledger", self.close_ledger)]
 
@@ -2105,9 +2412,12 @@ def catchup():
         root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
         if not os.path.isdir(f"{root}/.git") or os.path.exists(job_path(repo, "deploy")):
             continue
-        if sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=60)[0]:
-            continue                                     # no remote, no network: nothing to compare against
-        rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
+        with git_lock(root):    # the fetch WRITES refs/remotes/origin/<base> and the rev-parse reads it back: the
+                                # same shared-ref window prepare() takes this lock for, and the same one install()
+                                # hit as a mid-fetch ref error
+            if sh(["git", "fetch", "-q", "origin", base], cwd=root, timeout=60)[0]:
+                continue                                 # no remote, no network: nothing to compare against
+            rc, o = sh(["git", "rev-parse", f"origin/{base}"], cwd=root)
         if rc:
             continue
         tip, have = o.strip(), applied_sha(repo)
@@ -2213,48 +2523,108 @@ def preparable(path):
 
 def prepare(paths):
     """The half of a landing that changes NOTHING, for every queued job at once: the gates (in a throwaway worktree)
-    and then the review (minutes of `claude -p`). Both already leave their answer somewhere durable — the gates as a
-    memo keyed by head SHA, and the review as its own PR comment keyed the same way — so this phase only fills those,
-    and the serial phase below then spends them. That is the whole design: prepare can be skipped, killed or crash
-    and the landing is byte for byte what it was before, just slower. Nothing here writes a job file, so no attempt
-    is counted here and #154's crash recovery is untouched.
+    and the review (minutes of `claude -p`, run beside the suite). Both already leave their answer somewhere durable —
+    the gates as a memo keyed by head SHA, and the review as its own PR comment keyed the same way — so this phase
+    only fills those, and the serial phase below then spends them. That is the whole design: prepare can be skipped,
+    killed or crash and the landing is byte for byte what it was before, just slower. Nothing here writes a job
+    file, so no attempt is counted here and #154's crash recovery is untouched.
+
+    ORDERED BY WHAT THEY TOUCH (owner, 2026-09-04). Jobs whose changed files overlap are gated one after another, in
+    queue order; jobs on disjoint files run side by side, up to PREPARE_AT_ONCE; a job overlapping one of the
+    running ones waits for that one alone. What a job touches is read first, in order, before any gate runs — one
+    `gh pr view` and a fetch each — and a job it cannot be read for is taken to touch everything, so it runs alone,
+    in its turn. The suite itself no longer holds a box-wide lock (its fixtures are isolated per run and it caps
+    itself), so nothing here waits on another job's suite except by this rule.
 
     WHAT STAYS SERIAL is everything after: merge, install.sh, the units and the restarts, in queue order, exactly as
-    they were. And the suite needs no new lock to stay hermetic — core/tests/selftest.sh takes ~/.cc/selftest.lock
-    itself and WAITS (PR #126), so several jobs' cheap gates overlap while their suites queue one behind another."""
+    they were."""
     jobs = [p for p in paths if preparable(p)]
     if len(jobs) < 2:
         return []               # one job is what the serial phase already does, and a pool around it is just risk
+    lands, files, bufs = {}, {}, {}
+    for path in jobs:
+        j = read_json(path) or {}
+        L = Land(j["repo"], pr=j["pr"])
+        L.fill_memo = True
+        lands[path], files[path] = L, None
+        with collected() as buf:
+            bufs[path] = buf
+            try:
+                if L.load() and L.fetch_head():
+                    files[path] = {p for _, p in L.changed_files()}
+            except Exception as e:      # unreadable: it touches everything, and says so
+                out("✗", f"{e.__class__.__name__}: {e}")
 
     def one(path):
-        with collected() as buf:
-            j = read_json(path) or {}
-            L = Land(j["repo"], pr=j["pr"])
-            L.fill_memo = True
+        L = lands[path]
+        with collected(bufs[path]):
             try:
-                if L.load():
-                    try:
-                        out("✓", L.gates())
-                    except Skip as e:
-                        out("·", str(e))
-                    except Failed as e:
-                        out("✗", f"gates: {e}")
-                        return buf          # a red gate: a review bought now reads a head that cannot merge, and
+                if not L.facts:
+                    return                  # load() already said why
+                try:
+                    out("✓", L.gates())
+                except Skip as e:
+                    out("·", str(e))
+                except Failed as e:
+                    out("✗", f"gates: {e}")
+                    return                  # a red gate: a review bought now reads a head that cannot merge, and
                                             # the serial phase will stop at the same gate without it
-                    try:
-                        out("✓", L.review())
-                    except Skip as e:
-                        out("·", str(e))
-                    except Failed as e:
-                        out("✗", f"review: {e}")
+                try:
+                    out("✓", L.review())
+                except Skip as e:
+                    out("·", str(e))
+                except Failed as e:
+                    out("✗", f"review: {e}")
             except Exception as e:          # prepare is an optimisation: it may never be the reason a sweep dies
                 out("✗", f"{e.__class__.__name__}: {e}")
-            return buf
 
-    lines = [f"gating and reading {len(jobs)} queued job(s) at once; the merges stay serial, in queue order:"]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(PREPARE_AT_ONCE, len(jobs))) as pool:
-        for path, buf in zip(jobs, list(pool.map(one, jobs))):   # map keeps the order the jobs were given in
-            lines += buf or [f"  · {os.path.basename(path)}: nothing to prepare"]
+    done, running, cv = set(), set(), threading.Condition()
+
+    def touches(a, b):
+        return files[a] is None or files[b] is None or bool(files[a] & files[b])
+
+    def clear(path):        # every earlier job that shares a file with it is finished, and nothing running shares one
+        for q in jobs:
+            if q == path:
+                break
+            if q not in done and touches(q, path):
+                return False
+        return not any(touches(r, path) for r in running)
+
+    def take():
+        with cv:
+            while True:
+                left = [q for q in jobs if q not in done and q not in running]
+                if not left:
+                    return None
+                for q in left:
+                    if clear(q):
+                        running.add(q)
+                        return q
+                cv.wait()
+
+    def worker():
+        while True:
+            q = take()
+            if q is None:
+                return
+            try:
+                one(q)
+            finally:
+                with cv:
+                    running.discard(q)
+                    done.add(q)
+                    cv.notify_all()
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(PREPARE_AT_ONCE, len(jobs)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    lines = [f"gating and reading {len(jobs)} queued job(s) — side by side where their files do not overlap, one "
+             f"after another where they do; the merges stay serial, in queue order:"]
+    for path in jobs:
+        lines += bufs[path] or [f"  · {os.path.basename(path)}: nothing to prepare"]
     return lines
 
 
@@ -2366,15 +2736,28 @@ def cmd_selfcheck():
     globals().update(LANDQ=tempfile.mkdtemp(prefix="cc-land-selfcheck-h-"),
                      STATE=tempfile.mkdtemp(prefix="cc-land-selfcheck-s-"))   # …and a fix iteration's brief goes
                                                                              # to a scratch track dir, not a real one
+    # A TEMP ROOT OF ITS OWN, because the fixtures below stand in for a gate by its PATH: a checkout is
+    # `<tmpdir>/cc-land.gates.<repo>.<pr>.<rand>/head`, and the fake world answers anything whose argv starts with
+    # `<tmpdir>/cc-land.`. Run this selfcheck FROM a real landing's gate — which is exactly where the suite runs it
+    # — and $BIN is under that same prefix, so every `sh([f"{BIN}/cc-slack", …])` was answered by the gate stub:
+    # PR #235's gate died on `re.search(…).group(1)` of a cc-slack argv (2026-09-04). Moving the fixtures' tmpdir
+    # under one of our own makes that collision impossible rather than one more pattern to keep in step.
+    _real_tmp, tempfile.tempdir = tempfile.tempdir, tempfile.mkdtemp(prefix="cc-land-selfcheck-t-")
+    _tmproot = tempfile.tempdir
 
     def check(name, cond):
         print(("  ✓ " if cond else "  ✗ ") + name)
         if not cond:
             fails.append(name)
 
+    envs, _cl = [], threading.Lock()      # …and the env it was given (the suite's scope), under a lock: two
+                                          # threads append at once now that the review runs beside the suite
+
     def fake_sh(argv, cwd=None, timeout=300, **kw):
-        calls.append(argv)
-        cwds.append(cwd)                  # where a command RAN is part of what it does — see the reviewer's cwd
+        with _cl:
+            calls.append(argv)
+            cwds.append(cwd)              # where a command RAN is part of what it does — see the reviewer's cwd
+            envs.append(kw.get("env") or {})
         key = max((k for k in world if " ".join(argv).startswith(k)), key=len, default=None)
         v = world[key] if key else (0, "")
         return v(argv) if callable(v) else v      # a callable answer: state that changes (a posted PR comment), or
@@ -2418,6 +2801,54 @@ def cmd_selfcheck():
     check("a gate starts clean: no CLAUDE* from the session, SIGHUP back to default (nohup'd chains, H4 red 3/3 "
           "on 2026-09-01)", rc == 0 and "CLAUDE" not in clean and hup_ign(clean) == 0)
 
+    # A gate's output is streamed to its log as it runs, and it is killed for SILENCE, never for the clock: a suite
+    # waiting for one of its slots says so every minute, and PR #227's landing counted that wait as the run — timed
+    # out at 3600 s with an empty log, merged nothing (2026-09-04). Real subprocesses, like the probe above.
+    probe = tempfile.mkdtemp(prefix="cc-land-selfcheck-gate-")
+    with open(f"{probe}/slow.sh", "w") as f:
+        f.write("#!/usr/bin/env bash\necho '== waiting: held by pid 1 (0 min) =='\nsleep 0.6\n"
+                "echo '== waiting: held by pid 1 (1 min) =='\nsleep 0.6\necho '== result: 1 passed, 0 failed =='\n")
+    os.chmod(f"{probe}/slow.sh", 0o755)
+    real_idle = GATE_IDLE
+    try:
+        globals()["GATE_IDLE"] = 5
+        rc, o = run_gate([f"{probe}/slow.sh"], probe, f"{probe}/log", dict(os.environ))
+        check("a gate that keeps talking is never killed for taking long: three lines over 1.2 s under a 5 s silence "
+              "limit, green, and the log on disk holds every line it said",
+              rc == 0 and "0 failed" in o and open(f"{probe}/log").read() == o)
+        globals()["GATE_IDLE"] = 0.3
+        t0 = time.time()
+        rc, o = run_gate([f"{probe}/slow.sh"], probe, f"{probe}/log", dict(os.environ))
+        check("...and one that goes SILENT past the limit is killed and says so — with what it had said still in the "
+              "log, never an empty one",
+              rc != 0 and "said nothing for" in o and "held by pid 1 (0 min)" in open(f"{probe}/log").read()
+              and time.time() - t0 < 3)
+        # …and the kill takes EVERYTHING the gate started. The suite holds its slot in a launcher shell and execs
+        # its real run as a child with the lock fd shut: killing the pid alone reaped the launcher and left the run
+        # itself going, on live fixtures, with its slot already handed to the next landing.
+        with open(f"{probe}/group.sh", "w") as f:
+            f.write("#!/usr/bin/env bash\necho 'starting'\n"
+                    "( exec sleep 30 ) >/dev/null 2>&1 &\necho $! > child.pid\nsleep 30\n")
+        os.chmod(f"{probe}/group.sh", 0o755)
+        rc, o = run_gate([f"{probe}/group.sh"], probe, f"{probe}/glog", dict(os.environ))
+        kid = int(open(f"{probe}/child.pid").read().strip())
+        end, gone = time.time() + 5, False
+        while time.time() < end:
+            try:
+                os.kill(kid, 0)
+            except OSError:
+                gone = True
+                break
+            time.sleep(0.05)
+        if not gone:
+            os.kill(kid, signal.SIGKILL)
+        check("a gate that goes silent takes its CHILDREN with it: the group is killed, not the leader — a suite "
+              "that execs its real run under a launcher shell used to survive its own gate and keep going on live "
+              "fixtures", rc == 124 and gone)
+    finally:
+        globals()["GATE_IDLE"] = real_idle
+        shutil.rmtree(probe, ignore_errors=True)
+
     def REVIEWED(verdict, where="", what="", fix="", cost=0.42):
         """What `claude -p --output-format json --json-schema …` hands back — the fake model, standing in for the
         whole call. `structured_output` is the schema-validated object; `result` is its text twin, and the two are
@@ -2442,15 +2873,17 @@ def cmd_selfcheck():
         reacted.append((method, kw.get("name"), kw.get("timestamp")))
         return {"ok": True}
 
-    REAL = {k: globals()[k] for k in ("sh", "bot_token", "slack", "linked_units", "read_unit", "board", "repo_root")}
-    globals().update(sh=fake_sh, bot_token=lambda: "xoxb-selfcheck", slack=fake_slack,
+    REAL = {k: globals()[k] for k in ("sh", "run_gate", "bot_token", "slack", "linked_units", "read_unit", "board",
+                                      "repo_root")}
+    globals().update(sh=fake_sh, run_gate=lambda argv, cwd, log, env: fake_sh(argv, cwd=cwd, env=env, log=log),
+                     bot_token=lambda: "xoxb-selfcheck", slack=fake_slack,
                      linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
                      board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland")
     FACTS = {"title": "a change", "state": "OPEN", "mergeable": "MERGEABLE",
              "headRefName": "track/w1", "mergeCommit": None}
 
     def fresh(**kw):
-        calls.clear(); cwds.clear(); reacted.clear(); world.clear(); errs.clear()
+        calls.clear(); cwds.clear(); envs.clear(); reacted.clear(); world.clear(); errs.clear()
         shutil.rmtree(root_dir(), ignore_errors=True)   # a change's review/repair tally OUTLIVES its job file, which
                                                         # is the point of it — so a case that wants a spent one builds
                                                         # it, and no case inherits the one before it left behind
@@ -2476,6 +2909,132 @@ def cmd_selfcheck():
             return fn()
         except Exception as e:
             return e
+
+    # 0. THE REPO LOCK IS CROSS-PROCESS. `.git/FETCH_HEAD` is one file for the whole checkout, and two landing
+    # PROCESSES cannot see each other's threading lock: on 2026-09-05 00:21Z PR #233 and PR #229 started in the
+    # same second, #233 gated #229's head for an hour and stopped on "moved while it was being gated", with the
+    # green record for that head written under the wrong PR. Two real forks here, each resolving its own PR
+    # against a REAL FETCH_HEAD file, with the fixture's fetch pausing long enough that an unlocked pair would
+    # certainly overtake each other. Done before anything in this selfcheck has started a thread: fork must not
+    # inherit a lock another thread is holding.
+    lrepo = tempfile.mkdtemp(prefix="cc-land-selfcheck-lock-")
+    os.makedirs(f"{lrepo}/.git")
+    LHEADS = {"11": "1" * 40, "12": "2" * 40}
+
+    LOCK_PAUSE = 0.4
+
+    def lock_fetch(argv):
+        """`git fetch` as it really behaves: it WRITES .git/FETCH_HEAD, for the whole repo — and the rev-parse that
+        reads it back is a SECOND command, so the pause here is the window an unlocked sibling overtakes it in. The
+        instant it starts is stamped, and that instant is already inside the lock."""
+        m = re.search(r"pull/(\d+)/head", " ".join(argv))
+        if m:
+            at = time.time()
+            with open(f"{lrepo}/.git/FETCH_HEAD", "w") as fh:
+                fh.write(LHEADS[m.group(1)] + "\n")
+            with open(f"{lrepo}/{m.group(1)}.at", "w") as fh:
+                fh.write(f"{at:.4f}")
+            time.sleep(LOCK_PAUSE)
+        return (0, "")
+
+    def reap(pid):
+        wait_to = time.time() + 30      # a wedged lock is a RED here, never a suite that hangs on waitpid
+        while time.time() < wait_to:
+            if os.waitpid(pid, os.WNOHANG) != (0, 0):
+                return
+            time.sleep(0.02)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+
+    def resolve_child(pr, out):
+        sys.stdout.flush()      # …before the fork, so the child cannot inherit a buffer it might flush a copy of
+        pid = os.fork()
+        if pid:
+            return pid
+        code = 1
+        try:
+            L = Land("myrepo", pr=pr)
+            L.root = lrepo
+            L.facts = dict(FACTS, headRefName="")
+            head = L.fetch_head()
+            with open(out, "w") as fh:
+                fh.write(f"{head} {open(f'{lrepo}/{pr}.at').read()}")
+            code = 0
+        except BaseException:
+            pass
+        finally:
+            os._exit(code)
+
+    fresh(pr=11)
+    world.update({"git ls-remote": (0, ""), "git fetch -q origin": lock_fetch,
+                  "git rev-parse FETCH_HEAD": lambda a: (0, open(f"{lrepo}/.git/FETCH_HEAD").read())})
+    kids = [resolve_child(pr, f"{lrepo}/{pr}.out") for pr in ("11", "12")]
+    got = {}
+    for pr, pid in zip(("11", "12"), kids):
+        reap(pid)
+        try:
+            got[pr] = open(f"{lrepo}/{pr}.out").read().split()
+        except OSError:
+            got[pr] = []
+    ok_heads = all(len(got[pr]) == 2 and got[pr][0] == LHEADS[pr] for pr in got)
+    at = sorted(float(v[1]) for v in got.values() if len(v) == 2)
+    check("two landing PROCESSES resolving two PRs of the same repo in the same second each get their OWN head: "
+          "the repo lock is an flock in the repo's .git, not a lock inside one process (PR #233 gated PR #229's "
+          "head for an hour, 2026-09-05)", ok_heads and len({v[0] for v in got.values() if len(v) == 2}) == 2)
+    check("...because one WAITED for the other: their fetch-and-resolve windows are the fixture's whole pause "
+          "apart, where two unlocked processes start theirs in the same millisecond",
+          len(at) == 2 and at[1] - at[0] >= LOCK_PAUSE * 0.8)
+    held = os.open(f"{lrepo}/.git/cc-land.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        free = True
+    except OSError:
+        free = False
+    finally:
+        os.close(held)
+    nested = False
+    with git_lock(lrepo):
+        with git_lock(lrepo):     # …and it is reentrant in one thread: an flock is not, so a nested `with` on a
+            nested = True         # bare one would wedge this process against itself for ever
+    check("...and the lock is let go the moment the resolve is done — never held across a gate or a review, which "
+          "are the minutes this phase exists to overlap — and a nested take does not deadlock", free and nested)
+
+    # …AND THE DEPLOY'S PULL IS INSIDE IT TOO. `git pull` is a fetch: it writes refs/remotes/origin/<base>, the very
+    # ref a sibling landing's fetch is writing. At 2026-09-05 01:26Z PR #230 merged and then died in install() on
+    # `git pull --ff-only in ~/dev/<repo>: error: fetching ref refs/remotes/origin/main failed: incorrect old value
+    # provided` — the worst place to stop, with the PR merged and the box still on the old code. Two forks again,
+    # each pulling the same checkout, with the fixture's pull holding the window open.
+    def lock_pull(argv):
+        with open(f"{lrepo}/pull.{os.getpid()}.at", "w") as fh:
+            fh.write(f"{time.time():.4f}")
+        time.sleep(LOCK_PAUSE)
+        return (0, "")
+
+    world.update({"git pull --ff-only": lock_pull, "git rev-parse --abbrev-ref HEAD": (0, "main\n")})
+
+    def pull_child():
+        sys.stdout.flush()
+        pid = os.fork()
+        if pid:
+            return pid
+        try:
+            L = Land("myrepo", pr=7)
+            L.root = lrepo
+            L.facts = dict(FACTS)
+            L.install()             # no install.sh in the fixture, so it Skips right after the pull — which is all
+        except BaseException:       # this case is about
+            pass
+        finally:
+            os._exit(0)
+
+    for pid in [pull_child(), pull_child()]:
+        reap(pid)
+    pulls = sorted(float(open(p).read()) for p in glob.glob(f"{lrepo}/pull.*.at"))
+    check("...and the DEPLOY's pull takes the same lock: two processes pulling one checkout do it one after the "
+          "other, never both mid-fetch of refs/remotes/origin/main (PR #230 merged and then failed to install on "
+          "'incorrect old value provided', 2026-09-05)",
+          len(pulls) == 2 and pulls[1] - pulls[0] >= LOCK_PAUSE * 0.8)
+    shutil.rmtree(lrepo, ignore_errors=True)
 
     # 1. the review gate: the step that reads the diff, and the two verdicts that stop a landing dead
     HEAD = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
@@ -3040,15 +3599,46 @@ def cmd_selfcheck():
                                         f"git show {B}:bin/x.sh": (0, SH.replace("--now", "--later")),
                                         f"git diff -U0 {A} {B}": (0, "@@ -3 +3 @@\n-run_it --now\n+run_it --later\n"),
                                         f"git grep -l -F -- x.sh {B}": (1, "")})
-    check("a real code change is not a comment — and one nothing else in the tree names is `focused`: the static "
-          "gates, without the end-to-end suite behind them", t == "focused")
+    check("a real code change is not a comment — and one outside the control layer is `focused`: the gates, the "
+          "suite scoped to what the change reaches, and nobody paid to read it", t == "focused")
+    # THE CONTROL LAYER (owner, 2026-09-04): the repo's own list, read from the base side of the diff. Its fixture:
+    # a list naming two tools and a glob, and a code change either side of it.
+    CTL = "# what runs unattended, or touches secrets, GitHub, the sandbox, the model, the landing\n" \
+          "bin/cc-guard\nbin/cc-land\nbin/cc-l*\n"      # relative to core/, the tree core/tests/control-layer describes
+    code_at = lambda f: {f"git show {A}:{f}": (0, "a = 1\n"), f"git show {B}:{f}": (0, "a = 2\n")}
+    lst = {f"git show {A}:{CONTROL_LIST[0]}": (0, CTL)}
+    t, why = tier([("M", "core/bin/cc-alpha")], **dict(lst, **code_at("core/bin/cc-alpha")))
+    check("a narrow code change OUTSIDE the repo's control layer is `focused`: the gates it reaches and no paid review "
+          "— that other files name it is no longer a reason to buy one (owner, 2026-09-04)",
+          t == "focused" and "outside the control layer" in why)
+    t, why = tier([("M", "core/bin/cc-guard")], **dict(lst, **code_at("core/bin/cc-guard")))
+    check("...and one INSIDE it — what runs unattended, or touches secrets, GitHub, the sandbox, the model or the "
+          "landing — is `full`: every gate, and the paid read", t == "full" and "control layer changed" in why
+          and "cc-guard" in why)
+    t, why = tier([("M", "core/bin/cc-limit")], **dict(lst, **code_at("core/bin/cc-limit")))
+    check("...the list takes globs (bin/cc-l* names cc-limit)", t == "full" and "cc-limit" in why)
+    t, why = tier([("M", "core/.githooks/pre-commit")], **dict(lst, **code_at("core/.githooks/pre-commit")))
+    check("...and the HOOK directory is a shared path in its own right, ahead of any list: the commit gate runs "
+          "unattended on every commit and decides what a commit is allowed to be at all",
+          t == "full" and ".githooks/pre-commit" in why)
+    fresh(pr=7)
+    world[f"git show {A}:{CONTROL_LIST[0]}"] = (0, CTL + ".githooks/*\nbin/cc-spend\n")
+    inlayer, declared = control_paths("/tmp/_ccland", A,
+                                      ["core/.githooks/pre-commit", "core/bin/cc-spend", "core/docs/x.md"])
+    check("...a DIRECTORY glob in the list matches the same way a name does, under the core/ prefix the list "
+          "describes, and a path outside the layer stays outside it",
+          declared and inlayer == ["core/.githooks/pre-commit", "core/bin/cc-spend"])
+    t, why = tier([("M", "core/bin/cc-guard"), ("M", CONTROL_LIST[0])],
+                  **dict(lst, **code_at("core/bin/cc-guard"), **{f"git show {B}:{CONTROL_LIST[0]}": (0, "# nothing\n"),
+                                                                 f"git show {A}:{CONTROL_LIST[0]}": (0, CTL)}))
+    check("...and it is read at the BASE side of the diff: a PR that takes itself off the list is judged by the list "
+          "before it — the tests dir it lives in gates fully anyway, and the control reason is named too",
+          t == "full" and ("control layer" in why or "tests" in why))
     t, why = tier([("M", "core/bin/cc-alpha")],
-                  **{f"git show {A}:core/bin/cc-alpha": (0, "a = 1\n"),
-                     f"git show {B}:core/bin/cc-alpha": (0, "a = 2\n"),
-                     f"git grep -l -F -- cc-alpha {B}": (0, f"{B}:core/bin/cc-beta\n{B}:core/bin/cc-gamma\n")})
-    check("...but a file the rest of the tree DEPENDS on gates fully, and which those are is COUNTED, not listed: a "
-          "general tool cannot be handed one repo's shared libraries, and a list is the thing nobody updates",
-          t == "full" and "depends on" in why)
+                  **dict(code_at("core/bin/cc-alpha"), **{f"git show {A}:{c}": (128, "fatal: no such path")
+                                                            for c in CONTROL_LIST}))
+    check("a repo that ships no list has not said which of its files run unattended, so every code change of its is "
+          "read — and the reason names the file it could have shipped", t == "full" and "no control-layer list" in why)
     for changed, w, name in (
             ([("M", "core/tests/selftest.sh")], {}, "the tests themselves"),
             ([("M", "install.sh")], {}, "what installs it"),
@@ -3063,6 +3653,7 @@ def cmd_selfcheck():
           fresh(pr=7, full_gates=True).tier_for() == ("full", "--full-gates: every gate, whatever the diff touches"))
 
     real_access = os.access
+    TREE = "7" * 40                          # the content the fixture checkout holds, as git names it
     try:    # end to end: the tier really does drop the suite from the gates that RUN, and never the other way about
         def docs_diff(fill=False, **kw):
             L = fresh(pr=7, **kw)
@@ -3071,8 +3662,12 @@ def cmd_selfcheck():
             world["git merge-base"] = (0, A + "\n")
             world["git diff --name-status"] = (0, "M\tdocs/USAGE.md\n")
             world["git diff --numstat"] = (0, "3\t2\tdocs/USAGE.md\n")
+            world["git rev-parse HEAD^{tree}"] = (0, TREE + "\n")   # what the checkout HOLDS: the green record's key
             with contextlib.redirect_stdout(io.StringIO()):
-                return L.gates()
+                said = L.gates()
+                if L._review is not None:    # the read the suite started beside it is collected, never left running
+                    caught(L.review_aside)   # into the next case (its stray reviewer once paired with a barrier there)
+            return said
         os.access = lambda p, m: p.endswith(("core/tests/check.sh", "core/tests/selftest.sh"))
         said = docs_diff()
         check("end to end: a docs-tier landing runs the cheap static gate and NOT the ten-minute suite, and says so",
@@ -3093,6 +3688,186 @@ def cmd_selfcheck():
               and not os.path.exists(memo_path("myrepo", 7, HEAD, "full"))
               and (read_json(memo_path("myrepo", 7, HEAD, "docs")) or {}).get("gates") == ["core/tests/selftest.sh"])
         os.unlink(memo_path("myrepo", 7, HEAD, "docs"))
+
+        # …and a gate this exact CONTENT has already passed is not bought a second time. The worker runs the
+        # suites before it opens its PR and this ran them again on the same code — ten minutes a landing, and
+        # nothing read the second answer differently from the first (PR #211, 2026-09-04). What is spent is the
+        # record the SUITE left, keyed by the tree it ran on, never a sentence in a journal.
+        green = f"{green_dir()}/selftest.sh-{TREE[:12]}.json"
+        write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "at": stamp()})
+        said = docs_diff(full_gates=True)
+        check("a head whose exact content already has a green run of the suite does not pay for a second one — and "
+              "the gate still counts as passed, because it did",
+              "already green" in said and "1 gate(s) passed" in said
+              and not [c for c in calls if c[0].endswith("core/tests/selftest.sh")])
+        write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "at": "2020-01-01T00:00:00Z"})
+        check("...but not on a record the box has since had hours to change under: that one runs the suite",
+              "already green" not in docs_diff(full_gates=True)
+              and [c for c in calls if c[0].endswith("core/tests/selftest.sh")])
+        write_atomic(green, {"suite": "core/tests/check.sh", "tree": TREE, "at": stamp()})
+        check("...nor on a record of a DIFFERENT suite that happens to share the content", "already green"
+              not in docs_diff(full_gates=True))
+        os.unlink(green)
+        check("a head nothing has run the suite on still runs it — the second run is dropped, never the first",
+              "already green" not in docs_diff(full_gates=True)
+              and [c for c in calls if c[0].endswith("core/tests/selftest.sh")])
+    finally:
+        os.access = real_access
+
+    # 4d. THE READ RUNS BESIDE THE SUITE (owner, 2026-09-04): serial they were the whole of a landing's wall clock.
+    # The proof is a rendezvous, as in the prepare cases below: the fake suite and the fake reviewer each answer
+    # only once the other is in flight, so a serial landing cannot get past it.
+    events, evlock = [], threading.Lock()
+
+    def ev(*e):
+        with evlock:
+            events.append(e)
+
+    def both(suite, reviewer, changed="M\tinstall.sh\n", land=None, fill_memo=False, **w):
+        L = fresh(pr=7, **(land or {}))
+        L.fill_memo = fill_memo         # …the prepare phase's landing: it files a memo the serial one spends
+        world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git merge-base": (0, A + "\n"),
+                      "git diff --name-status": (0, changed), "git diff --numstat": (0, "3\t2\tx\n"),
+                      "git rev-parse HEAD^{tree}": (0, TREE + "\n"),
+                      f"{tempfile.gettempdir()}/cc-land.": suite, f"{CLAUDE} -p": reviewer})
+        world.update(w)
+        events.clear()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            g = caught(L.gates)
+            r = caught(L.review) if not isinstance(g, Failed) else None
+        return L, g, r
+
+    def gate_answer(argv):          # what a gate says, by name: the suite's answer is whatever the case set
+        name = os.path.basename(argv[0])
+        ev("gate", name)
+        return suite_says(argv) if name == "selftest.sh" else (0, "check.sh: OK\n")
+
+    def reviewer_says(argv):
+        ev("review", "asked")
+        try:
+            meet.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return (0, REVIEWED("LAND"))
+
+    idx = lambda *e: events.index(e) if e in events else -1
+    real_access = os.access
+    os.access = lambda p, m: p.endswith(("core/tests/check.sh", "core/tests/selftest.sh"))
+    try:
+        meet = threading.Barrier(2, timeout=10)
+
+        def suite_says(argv):
+            try:
+                meet.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return (0, "  ✓ all\n== result: 5 passed, 0 failed ==\n")
+        L, g, r = both(gate_answer, reviewer_says)
+        check("the read runs BESIDE the suite: the fake suite and the fake reviewer each answer only once the other "
+              "is in flight, and the landing lands — gates green, LAND, read while the suite ran, one model call",
+              not meet.broken and isinstance(g, str) and "ran beside the suite" in g and isinstance(r, str)
+              and "LAND on PR #7" in r and "read while the suite ran" in r
+              and len([c for c in calls if c[0] == CLAUDE]) == 1)
+        check("...and the cheap gate went first and ALONE: check.sh had answered before the reviewer was asked",
+              0 <= idx("gate", "check.sh") < idx("review", "asked"))
+        L, g, r = both(lambda a: (1, "shellcheck: SC2086\n") if a[0].endswith("check.sh") else (0, "0 failed\n"),
+                       reviewer_says)
+        check("a red CHEAP gate stops the landing before a token is spent: no reviewer was asked, and the ✗ names "
+              "the gate", isinstance(g, Failed) and "check.sh" in str(g) and not [c for c in calls if c[0] == CLAUDE])
+        meet = threading.Barrier(2, timeout=10)
+
+        def suite_says(argv):
+            try:
+                meet.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return (1, "  ✗ the row was wrong\n== result: 4 passed, 1 failed ==\n")
+        L, g, r = both(gate_answer, reviewer_says)
+        check("a red SUITE still stops the landing before the merge — and the read that ran beside it is collected, "
+              "not abandoned: its verdict went on the PR, so a retry of this head reads it back for free",
+              isinstance(g, Failed) and "selftest.sh" in str(g) and "the row was wrong" in str(g) and not meet.broken
+              and len(commented()) == 1 and not ran("gh pr merge"))
+        check("...and its buy STANDS: a read that was paid for is counted whatever the suite then said, so a worker "
+              "pushing red head after red head cannot buy a paid read each with the tally still reading 0",
+              root_work("myrepo", 7).get("reviews") == 1)
+        meet = threading.Barrier(2, timeout=10)
+
+        def suite_says(argv):
+            try:
+                meet.wait()             # the reviewer has fetched and is reading: now somebody pushes
+            except threading.BrokenBarrierError:
+                pass
+            world["git rev-parse FETCH_HEAD"] = (0, MOVED + "\n")
+            return (0, "== result: 5 passed, 0 failed ==\n")
+        L, g, r = both(gate_answer, reviewer_says)
+        check("a push while the suite and the read ran stops the landing: what was gated and read is named, what "
+              "is there now is named, and nothing merges ungated",
+              isinstance(g, str) and isinstance(r, Failed) and HEAD[:12] in str(r) and MOVED[:12] in str(r)
+              and "moved" in str(r) and not ran("gh pr merge"))
+        # …and the memo the PREPARE phase leaves is keyed to the SHA the gates RAN on. The push lands between the
+        # cheap gate and the suite; the review thread resolves the new head and used to write it to self.head, so
+        # the memo went in under a SHA nothing was gated at — and the serial phase, fetching that same new head,
+        # found the memo, skipped every gate, bought a fresh review and merged it with --match-head-commit
+        # (review-235). The thread keeps its answer in a local now, and the memo is filed under self.gated.
+        for p in glob.glob(f"{gate_dir()}/*.json"):
+            os.unlink(p)
+        # The push lands the moment the CHEAP gate is done, before the read is even started, and the suite does
+        # not finish until the read has seen it — so the read's answer is always in before the memo is filed, and
+        # this case cannot pass by winning a race. (A push timed against the suite instead is a coin toss: the
+        # read either resolves before it and lands, or after it and refuses, and only the second shape proves
+        # anything. That flake is what made the gate red on 2026-09-04 while the same case was green here.)
+        pushed = threading.Event()
+
+        def moved(argv):
+            pushed.set()            # …the read has just resolved the new head
+            return (0, MOVED + "\n")
+
+        def gate_pushes(argv):
+            if os.path.basename(argv[0]) == "check.sh":
+                world["git rev-parse FETCH_HEAD"] = moved
+                return (0, "check.sh: OK\n")
+            pushed.wait(10)
+            time.sleep(0.05)        # …and is a frame or two past it, wherever it puts the answer
+            return (0, "== result: 5 passed, 0 failed ==\n")
+        L, g, r = both(gate_pushes, reviewer_says, fill_memo=True)
+        memos = sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json"))
+        check("a push between the cheap gate and the suite leaves NO memo for the new head: what the prepare phase "
+              "files is keyed to the SHA the gates ran on, and the read beside the suite never moves it",
+              isinstance(g, str) and L.gated == HEAD and L.head == HEAD
+              and memos == [f"myrepo-7-{HEAD[:12]}-full.json"])
+        check("...so the serial phase has nothing to spend for that new head and GATES it, where a memo filed under "
+              "it would have skipped every gate and merged with --match-head-commit",
+              not gate_memo("myrepo", 7, MOVED, "full") and isinstance(r, Failed) and "moved" in str(r)
+              and MOVED[:12] in str(r))
+        for p in glob.glob(f"{gate_dir()}/*.json"):
+            os.unlink(p)
+        # …and the suite is told what the diff changed, so one that knows its own shape runs only what that reaches
+        # (core/tests/selftest.sh does; core/tests/green.sh has the rule) — and a green record answers only for
+        # its own scope.
+        suite_says = lambda argv: (0, "== result: 5 passed, 0 failed ==\n")
+        graphs = {f"git show {A}:core/bin/cc-graphs": (0, "a = 1\n"), f"git show {HEAD}:core/bin/cc-graphs": (0, "a = 2\n")}
+        told = lambda: [e.get("CC_LAND_CHANGED") for c, e in zip(calls, envs) if c[0].endswith("selftest.sh")]
+        L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\nM\tcore/bin/cc-graphs\n", **graphs)
+        check("the suite is handed the paths the diff changed — CC_LAND_CHANGED, sorted, as git names them — so a "
+              "suite that knows its own shape runs only what those reach", told() == ["core/bin/cc-graphs install.sh"])
+        L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\nM\tcore/bin/cc-graphs\n",
+                       land={"full_gates": True}, **graphs)
+        check("...and --full-gates hands it nothing, which is everything", told() == [None])
+        green = f"{green_dir()}/selftest.sh-{TREE[:12]}.json"
+        write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "core/bin/cc-other", "at": stamp()})
+        L, g, r = both(gate_answer, reviewer_says, changed="M\tcore/bin/cc-graphs\n", **graphs)
+        check("a green record of a run NARROWED to other paths does not answer for this one: a scoped run stands in "
+              "only for the same scope", isinstance(g, str) and "already green" not in g and told() == ["core/bin/cc-graphs"])
+        write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "core/bin/cc-graphs", "at": stamp()})
+        L, g, r = both(gate_answer, reviewer_says, changed="M\tcore/bin/cc-graphs\n", **graphs)
+        same = isinstance(g, str) and "already green" in g and not told()
+        write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "scope": "", "at": stamp()})
+        L, g, r = both(gate_answer, reviewer_says, changed="M\tcore/bin/cc-graphs\n", **graphs)
+        check("...one narrowed to the SAME paths does, and so does an unscoped one — a whole run answers for any "
+              "part of itself", same and isinstance(g, str) and "already green" in g and not told())
+        check("...and a focused landing whose suite is spent by a record buys no read either way: nobody paid reads "
+              "a change outside the control layer", isinstance(r, Skip) and "focused tier" in str(r))
+        os.unlink(green)
     finally:
         os.access = real_access
 
@@ -3120,12 +3895,16 @@ def cmd_selfcheck():
                             f"git show {HEAD}:bin/x.sh": (0, SH.replace("--now", "--later")),
                             f"git diff -U0 {A} {HEAD}": (0, "@@ -3 +3 @@\n-run_it --now\n+run_it --later\n"),
                             f"git grep -l -F -- x.sh {HEAD}": (1, "")})
-    check("a narrow change nothing else references is read by the CHEAP model: one tier answer decides both who "
-          "reads the diff and which gates run, so the two halves can never disagree about how big this change is",
-          model == REVIEW_MODEL_SMALL and "focused tier" in str(r))
-    check("...and the comment names the model that actually read it — a model name written into the script would "
-          "go on saying opus the first time a tier sent the diff somewhere cheaper",
-          commented() and REVIEW_MODEL_SMALL in commented()[0][-1] and REVIEW_MODEL not in commented()[0][-1])
+    check("a narrow change outside the control layer is read by nobody paid — the gates it reaches, and the "
+          "planning session's own eyes — and the landing SAYS so, naming the tier (owner, 2026-09-04)",
+          model is None and isinstance(r, Skip) and "focused tier" in str(r) and not commented())
+    r, model = review_at("M\tcore/bin/cc-guard\n",
+                         **{f"git show {A}:{CONTROL_LIST[0]}": (0, "bin/cc-guard\n"),
+                            f"git show {A}:core/bin/cc-guard": (0, "a = 1\n"),
+                            f"git show {HEAD}:core/bin/cc-guard": (0, "a = 2\n")})
+    check("...and one inside the control layer is read by the worker model, and the comment names the model that "
+          "read it", model == REVIEW_MODEL and "full tier" in str(r) and "control layer" in str(r)
+          and commented() and REVIEW_MODEL in commented()[0][-1])
     r, model = review_at("M\tinstall.sh\n")
     check("and the worker model is kept for the diffs that earn it: wide, or touching the tests, the install, the "
           "config or a file the rest of the tree depends on",
@@ -3269,9 +4048,9 @@ def cmd_selfcheck():
                                                 "settings edit outside the repo"))
 
     # 9. the sequence itself, and what each step's failure means
-    check("the steps are the remembered ones, in that order — the deterministic GATES first so a head they reject "
-          "buys nothing, the paid review after them, and the check that says it reached the owner LAST, after "
-          "install.sh and the restart, because before those the box still runs the old code",
+    check("the steps are the remembered ones, in that order — the GATES first (the cheap ones alone, the suite with "
+          "the paid read beside it), the review step collecting that read, and the check that says it reached the "
+          "owner LAST, after install.sh and the restart, because before those the box still runs the old code",
           [n for n, _ in Land("myrepo", pr=1).steps()] ==
           ["gates", "review", "merge", "card", "board", "ledger", "install", "units", "restart", "verify"])
     check("the fatal steps are exactly the ones that leave the box wrong; card, board, ledger and the delivery "
@@ -4025,6 +4804,86 @@ def cmd_selfcheck():
               "against the wrong diff, and its verdict posted on the wrong PR under a SHA that is not that PR's",
               fetched and not overlapped and not gate.broken)
 
+        # (6) ORDERED BY WHAT THEY TOUCH (owner, 2026-09-04): jobs whose files overlap go one after another in
+        # queue order, jobs on disjoint files side by side, and a job overlapping one of two running ones waits for
+        # that one alone. changed_files() is asked in queue order, once per job up front and once more per job in
+        # the serial phase, so the answers cycle.
+        def overlap_run(prs, files_by_pr, gate_says):
+            fresh(pr=7)
+            answers = [files_by_pr[pr] for pr in prs]
+            turn = [0]
+
+            def by_turn(argv):
+                turn[0] += 1
+                return (0, answers[(turn[0] - 1) % len(answers)])
+            world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
+                          "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
+                          "gh pr comment": remember, "git merge-base": (0, A + "\n"),
+                          "git diff --numstat": (0, "3\t2\tx\n"), "git diff --name-status": by_turn,
+                          f"{tempfile.gettempdir()}/cc-land.": gate_says})
+            for pr in prs:
+                world[f"gh pr view {pr} --json comments"] = comments(str(pr))
+                quiet(cmd_queue, ["myrepo", str(pr), "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
+            calls.clear()
+            events.clear()
+            real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    cmd_work([])
+            finally:
+                os.access = real_access
+
+        def pr_of(argv):
+            """Which PR's gate this is, off the checkout it runs in — read from the WHOLE argv, and never .group()
+            on a miss: a fake that is handed something it does not recognise says so, it does not raise inside a
+            worker thread where the traceback is the only thing anyone gets (PR #235's gate, 2026-09-04)."""
+            m = re.search(r"cc-land\.gates\.myrepo\.(\d+)\.", " ".join(argv))
+            return m.group(1) if m else ""
+        order = lambda *e: events.index(e) if e in events else 99
+        pair = threading.Barrier(2, timeout=30)
+
+        def gate3(argv):
+            pr = pr_of(argv)
+            if not pr:
+                return (0, "check.sh: OK\n")   # not a gate of ours: answered, never recorded as one
+            ev("start", pr)
+            if pr in ("7", "8"):
+                try:
+                    pair.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            if pr == "8":                       # 8 holds until 9 has started: 9 waited for 7 alone, not for 8
+                for _ in range(100):
+                    if ("start", "9") in events:
+                        break
+                    time.sleep(0.1)
+            ev("end", pr)
+            return (0, "check.sh: OK\n")
+        overlap_run([7, 8, 9], {7: "M\tinstall.sh\n", 8: "M\tcore/bin/cc-x\n", 9: "M\tinstall.sh\n"}, gate3)
+        check("two queued PRs on DISJOINT files are gated side by side: each one's fake gate answers only once the "
+              "other's is in flight", not pair.broken and order("start", "7") < order("end", "8")
+              and order("start", "8") < order("end", "7"))
+        check("...a third PR sharing a file with the first waits for THAT one alone: it starts after 7 ends and "
+              "while 8 is still running", order("end", "7") < order("start", "9") < order("end", "8"))
+        check("...and the merges are still one at a time, in queue order", [c[3] for c in gh_merges()] == ["7", "8", "9"])
+        same = threading.Barrier(2, timeout=1.5)
+
+        def gate2(argv):
+            pr = pr_of(argv)
+            if not pr:
+                return (0, "check.sh: OK\n")
+            ev("start", pr)
+            try:
+                same.wait()
+            except threading.BrokenBarrierError:
+                pass
+            ev("end", pr)
+            return (0, "check.sh: OK\n")
+        overlap_run([7, 9], {7: "M\tinstall.sh\n", 9: "M\tinstall.sh\n"}, gate2)
+        check("two queued PRs on the SAME file are gated one after another, in queue order: a barrier that needs "
+              "both in flight breaks, and 9's gate starts only after 7's has ended",
+              same.broken and order("end", "7") < order("start", "9"))
+
         fresh(pr=7)
         world["gh pr merge"] = (1, "failed to merge: Merge already in progress")
         world["gh pr view"] = (0, json.dumps(dict(FACTS, state="MERGED")))
@@ -4257,6 +5116,8 @@ def cmd_selfcheck():
         globals().update(BOARDS=_fb, LANDQ=_fl)
         shutil.rmtree(fxd, ignore_errors=True)
 
+    tempfile.tempdir = _real_tmp
+    shutil.rmtree(_tmproot, ignore_errors=True)   # …and everything the fixtures made under it goes with it
     print(f"cc-land selfcheck: {len(fails)} failed")
     return 1 if fails else 0
 
