@@ -453,13 +453,27 @@ def loop_tracks():
     return live
 
 
+def board_read(path):
+    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
+    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
+    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    if not hasattr(board_read, "mod"):
+        import importlib.machinery, importlib.util
+        s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
+        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
+    return board_read.mod.read(path)
+
+
 def board_states():
     out = {}
     for f in glob.glob(os.path.join(BOARDS, "*.json")):
         try:
-            d = json.load(open(f))
-        except (OSError, ValueError):
+            d = board_read(f)
+        except Exception:
             continue
+        if d is None:   # nothing at the end of it: a dangling link, or a board removed between the glob and this read.
+            continue    # `.get` on that killed every 5-minute run of this tool with an AttributeError (review of #224)
         repo = d.get("repo") or os.path.basename(f)[:-5]
         for track, t in (d.get("tracks") or {}).items():
             out[f"{repo}/{track}"] = t.get("status", "")
@@ -993,6 +1007,36 @@ def selfcheck():
     finally:
         shutil.rmtree(th, ignore_errors=True)
 
+    # A PIPE PLANTED WHERE A BOARD SHOULD BE (review of #224): board_states reads through cc-board's opener, so it is skipped
+    # and the 5-minute timer is never hung by a member
+    def bounded(fn, secs=10):   # a read that hangs on the pipe (a plain open would, for good) fails THIS case, not the suite
+        import threading
+        box = []
+        def go():
+            try: box.append(fn())
+            except Exception as e: box.append(e)
+        t = threading.Thread(target=go, daemon=True); t.start(); t.join(secs)
+        return box[0] if box else "hung"
+    global BOARDS
+    _b, BOARDS = BOARDS, tempfile.mkdtemp(prefix="cc-spend-pipe-")
+    _mb = None
+    try:
+        os.mkfifo(os.path.join(BOARDS, "pipe.json"))
+        json.dump({"repo": "real", "tracks": {"t": {"status": "running"}}}, open(os.path.join(BOARDS, "real.json"), "w"))
+        # …AND A LINK WITH NOTHING AT THE END OF IT reads as None, not as a board: a member workspace whose board file is
+        # gone while ~/.cc/boards/<h>.json still links to it, or a board unlinked between the glob above and this read.
+        # `.get` on that None — it sits outside the try — took every 5-minute run of this tool down with an AttributeError
+        # (review of #224). cc-board only follows such a link to ~/.cc/members/<h>/board/<h>.json, so its own BOARDS has to
+        # point at this fixture for the rule to read here rather than at the box's real one.
+        board_read(os.path.join(BOARDS, "real.json"))                 # loads the module, so .mod is there to point
+        _mb, board_read.mod.BOARDS = board_read.mod.BOARDS, BOARDS
+        os.symlink(os.path.join(BOARDS, os.pardir, "members", "gone", "board", "gone.json"), os.path.join(BOARDS, "gone.json"))
+        ok("a pipe planted where a board should be, and a link with no board at the end of it, are both skipped — no hang, "
+           "no crash — and the real board beside them is read",
+           bounded(board_states) == {"real/t": "running"})
+    finally:
+        if _mb is not None: board_read.mod.BOARDS = _mb
+        shutil.rmtree(BOARDS, ignore_errors=True); BOARDS = _b
     print(f"cc-spend selfcheck: {'all passed' if not n[0] else str(n[0]) + ' FAILED'}")
     return 1 if n[0] else 0
 

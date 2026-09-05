@@ -67,6 +67,18 @@ import json, os, re, subprocess, sys, time
 
 BOARDS = os.environ.get("CC_BOARDS") or os.path.expanduser("~/.cc/boards")
 STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")
+
+
+def board_read(path):
+    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
+    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
+    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    if not hasattr(board_read, "mod"):
+        import importlib.machinery, importlib.util
+        s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
+        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
+    return board_read.mod.read(path)
 LIVE = ("queued", "running", "waiting", "review")   # a row that is not finished: its branch may be under a hand right now
 MARK_A, MARK_B = "<!-- cc-brief:inflight -->", "<!-- /cc-brief:inflight -->"
 BLOCK_RE = re.compile(re.escape(MARK_A) + r".*?" + re.escape(MARK_B) + r"\n?", re.S)
@@ -200,9 +212,10 @@ def inflight(repo, exclude=""):
     Three answers, and they are not the same: the block · "" nothing is held right now · None the board could not
     be read, so nothing is known — and a caller must not mistake not-knowing for nothing and delete a real block."""
     try:
-        with open(os.path.join(BOARDS, repo + ".json")) as f:
-            d = json.load(f)
-    except (OSError, ValueError):
+        d = board_read(os.path.join(BOARDS, repo + ".json"))
+    except Exception:
+        return None
+    if d is None:
         return None
     path, base = d.get("path") or "", d.get("default_branch") or "main"
     held = {}
@@ -529,6 +542,17 @@ def selfcheck():
     tmp = tempfile.mkdtemp(prefix="cc-brief.")
     BOARDS, STATE = os.path.join(tmp, "boards"), os.path.join(tmp, "state")
     os.makedirs(BOARDS)
+    def bounded(fn, secs=10):   # a read that hangs on the pipe (a plain open would, for good) fails THIS case, not the suite
+        import threading
+        box = []
+        def go():
+            try: box.append(fn())
+            except Exception as e: box.append(e)
+        t = threading.Thread(target=go, daemon=True); t.start(); t.join(secs)
+        return box[0] if box else "hung"
+    os.mkfifo(os.path.join(BOARDS, "pipe.json"))   # A PIPE PLANTED WHERE A BOARD SHOULD BE (review of #224): the read is cc-board's opener now, so it is no board, never a hang
+    ok("a pipe planted where a board should be is 'nothing is known', not a hang", bounded(lambda: inflight("pipe")) is None)
+    os.remove(os.path.join(BOARDS, "pipe.json"))
     repo = "selfcheckrepo"
     src = os.path.join(tmp, "repo")
     os.makedirs(src)

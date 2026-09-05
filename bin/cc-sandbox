@@ -6,12 +6,14 @@
 #   cc-sandbox member <handle> [<track>] -- <cmd...>   A MEMBER WORKSPACE'S BOUNDARY (docs/design-member-workspaces.md): ALWAYS bwrap,
 #     no opt-in. Inside: ~/dev/<handle> rw (the whole workspace, its .git included — it is the member's own repo — but .git/config
 #     and .git/hooks ro: the host runs git in there and must not run what a member wrote) · ~/.cc/worktrees/<handle>
-#     and ~/.cc/state/<handle> rw (every track of the workspace, no other repo's) · the workspace's board FILE (~/.cc/boards/<handle>.json)
+#     and ~/.cc/state/<handle> rw (every track of the workspace, no other repo's) · the workspace's board, in a DIRECTORY of its
+#     own (~/.cc/members/<handle>/board/, seen AS ~/.cc/boards; ~/.cc/boards/<handle>.json is a link into it — board_dir says why)
 #     · ~/.cc/slack/member/<handle>/ seen AS ~/.cc/slack: the daemon's member-scoped socket, an `enabled` flag and the attachment cache —
 #     the bot token, the owner-level socket and every other channel stay outside · a private ~/.claude/projects, ~/.npm and ~/.cache under
 #     ~/.cc/members/<handle>/ · the control plane's core/bin bound ro AS ~/bin, so ~/dev/<control repo> does not exist inside · ONE credential
 #     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner with
-#     `cc-sandbox mint`, kept whole) and
+#     `cc-sandbox mint`, kept whole, BOUND rw at that path so the refresh a session makes inside is what the next launch
+#     starts from; its host path is not inside) and
 #     whichever account the owner minted for it, his own included: a member can print whatever is in there, so that is his call to
 #     make per workspace. With no credential of its own the workspace does not start · a
 #     ~/.claude.json copy holding only this workspace's projects, only the cc-slack MCP server, and two first-run flags MINTED for the
@@ -42,9 +44,13 @@
 # INSIDE rw: the track worktree · the parent repo's .git (the worktree's .git is a pointer into it), with .git/config and
 #   .git/hooks held ro — the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks (cc-loop), and a
 #   worker must not re-point its hooksPath or its remotes, nor write a hook the host would run ·
-#   ~/.cc/state/<repo>/<track> · ~/.cc/boards · ~/.npm · ~/.cache · /tmp · a private ~/.claude with settings ro, this cwd's
+#   ~/.cc/state/<repo>/<track> · ~/.npm · ~/.cache · /tmp · a private ~/.claude with settings ro, this cwd's
 #   transcripts and the repo's memory rw, nothing else of it · a COPY of ~/.claude.json with every other project's history
 #   and the MCP servers stripped (Slack stops loading: workers do not post).
+# INSIDE ro: ~/.cc/boards, and each ~/.cc/members/*/board under it (a member's board is a link into one — board_dir). A worker
+#   READS every board and writes none: cc-loop makes this track's board writes out here, around the sandbox. It was rw, and
+#   that let a worker plant a link at ~/.cc/boards/<repo>.json for the host to save through — cc-board's _target refuses
+#   that link now as well, two walls, but the bind is the one that stops it being written in the first place.
 # PERMISSIONS (both boundaries, and only where there IS one — with the sandbox off nothing below happens): the session
 #   sees a read-only COPY of ~/.claude/settings.json, his own file plus a baseline appropriate to a sealed session.
 #   The copy is the one thing a launch WRITES outside the binds above: ~/.cc/sandbox/<repo|handle>/<track|_workspace>/
@@ -175,11 +181,12 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
      --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
      --bind "$wt" "$wt" --bind "$dev/.git" "$dev/.git" --ro-bind "$dev/.git/config" "$dev/.git/config"
-     --bind "$st" "$st" --bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
+     --bind "$st" "$st" --ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
      --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin"
      --bind "$proj" "$proj" --bind "$mem" "$mem"
      --unsetenv TMUX --unsetenv TMUX_PANE --unsetenv SSH_AUTH_SOCK --unsetenv DOCKER_HOST --unsetenv CLAUDE_CODE_OAUTH_TOKEN --chdir "$wt")
   [ -d "$dev/.git/hooks" ] && B+=(--ro-bind "$dev/.git/hooks" "$dev/.git/hooks")   # the host's checkpoint runs hooks: none of them may be the worker's
+  for f in "$H"/.cc/members/*/board; do [ -d "$f" ] && B+=(--ro-bind "$f" "$f"); done   # ~/.cc/boards/<h>.json is a link in here (board_dir): ro, it resolves, and a worker writes no member's board
   settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
@@ -199,19 +206,36 @@ launch(){   # $1 repo · $2 track · the rest is the command
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
+board_dir(){   # $1 handle — THE BOARD IS ONE FILE ON BOTH SIDES. ~/.cc/boards/<h>.json and .lock become links into
+  # ~/.cc/members/<h>/board/, and build_member binds THAT DIRECTORY as the session's ~/.cc/boards. The file itself used to be
+  # bound, and a file bind pins an inode: cc-board saves by renaming a new file over the old one, so every host save swapped
+  # the board out from under the mount and a workspace read a track as running for half an hour after the host had marked it
+  # done (2026-09-04). A directory bind sees new entries. Every host reader keeps its path through the link, and cc-board
+  # resolves the link before it renames (_save), so the link is never replaced by a plain file. The lock goes first, as a
+  # HARD link — same inode, so a holder on either path holds the same lock — and the board moves under that lock. A session
+  # launched before this still holds a file bind and cc-board's in-place fallback; it converges on its next launch.
+  local h="$1" bd="$H/.cc/members/$1/board" f src
+  for f in "$h.lock" "$h.json"; do
+    src="$H/.cc/boards/$f"; [ -L "$src" ] && continue
+    ( if [ "$f" = "$h.json" ]; then exec 9>>"$H/.cc/boards/$h.lock"; flock 9; fi
+      [ -L "$src" ] && exit 0   # another launch moved it while this one waited for the lock
+      { ln -f "$src" "$bd/$f" 2>/dev/null || cp -p "$src" "$bd/$f"; } || exit 0
+      ln -sfn "$bd/$f" "$src.ln.$$" && mv -Tf "$src.ln.$$" "$src" ) || :
+  done; :; }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
   local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"
-  mkdir -p "$m/claude/projects" "$m/npm" "$m/cache" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$sl/files" "$H/.cc/boards"; : >> "$sl/enabled"
-  [ -f "$H/.cc/boards/$h.json" ] || "$H/bin/cc-board" init "$h" "$dev" main >/dev/null 2>&1 || : > "$H/.cc/boards/$h.json"
-  : >> "$H/.cc/boards/$h.lock"
   cb=$(dirname "$SELF")   # the bin THIS copy lives in (~/bin is symlinks into the control repo's core/bin; a track worktree tests its own), bound AS ~/bin
+  mkdir -p "$m/claude/projects" "$m/npm" "$m/cache" "$m/board" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$sl/files" "$H/.cc/boards"; : >> "$sl/enabled"
+  [ -f "$H/.cc/boards/$h.json" ] || "$cb/cc-board" init "$h" "$dev" main >/dev/null 2>&1 || : > "$H/.cc/boards/$h.json"
+  : >> "$H/.cc/boards/$h.lock"
+  board_dir "$h"
   B=(--die-with-parent --unshare-pid --clearenv
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
      --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
      --bind "$dev" "$dev" --bind "$H/.cc/worktrees/$h" "$H/.cc/worktrees/$h" --bind "$H/.cc/state/$h" "$H/.cc/state/$h"
-     --bind "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.json" --bind "$H/.cc/boards/$h.lock" "$H/.cc/boards/$h.lock"
+     --bind "$m/board" "$H/.cc/boards"
      --bind "$sl" "$H/.cc/slack" --bind "$m/claude/projects" "$H/.claude/projects" --bind "$m/npm" "$H/.npm" --bind "$m/cache" "$H/.cache"
      --ro-bind "$cb" "$H/bin" --ro-bind "$H/.local/bin/claude" "$H/.local/bin/claude"
      --setenv HOME "$H" --setenv PATH "$H/bin:$H/.local/bin:/usr/local/bin:/usr/bin:/bin" --setenv CC_MEMBER_SANDBOX 1 --setenv CC_ROLE member
@@ -251,13 +275,13 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
     [ -n "${!v:-}" ] && B+=(--setenv "$v" "${!v}"); done; :; }
 launch_member(){   # $1 handle · $2 track · the rest is the command — the WORKSPACE'S OWN credential, or no launch at all;
                    # a narrower ~/.claude.json
-  local h="$1" tr="$2" dev="$H/dev/$1" cred="$H/.claude/.credentials.json" own="$H/.cc/members/$1/credentials.json" mcp='{}' cwd cj why
+  local h="$1" tr="$2" dev="$H/dev/$1" cred="$H/.claude/.credentials.json" own="$H/.cc/members/$1/credentials.json" mcp='{}' cwd why
   build_member "$h" "$tr"; shift 2
   [ -z "$tr" ] || [ -d "$H/.cc/worktrees/$h/$tr" ] || { echo "cc-sandbox: no worktree for $h/$tr" >&2; exit 2; }
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"   # the same cwd build_member chdirs to: the trust key is its git root
   # WHATEVER CREDENTIAL IS INSIDE, THE MEMBER CAN PRINT IT — they drive a session in there. A workspace runs on the credential
-  # MINTED FOR IT at ~/.cc/members/<h>/credentials.json (host side, never bound — the member sees its CONTENT at
-  # ~/.claude/.credentials.json and not the file), and without one it does not start. What it must never be again is the
+  # MINTED FOR IT at ~/.cc/members/<h>/credentials.json (bound rw at ~/.claude/.credentials.json — the member sees the file
+  # at claude's path and never its host path), and without one it does not start. What it must never be again is the
   # owner's by FALLBACK: that is what it was until review-156c, announced on every launch, and since every workspace shipped
   # without one, every member session would have held the box's token from day one. His own account may be minted here
   # deliberately (owner, 2026-09-02) and mint says so when it is; what stays refused is starting on his because none was set.
@@ -269,11 +293,15 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
     echo "cc-sandbox: $h has no credential of its own ($own: $why) — a workspace never falls back to anyone else's. Mint one: cc-sandbox mint $h — it walks the login and installs what that login produced at $own, mode 600. Nothing starts here until then." >&2
     exit 2
   fi
-  cj=$(jq -c '{claudeAiOauth: .claudeAiOauth}' "$own")   # its own, kept whole (refresh token included) so it can refresh
-  # in-session. That refresh lands in the tmpfs, not in $own: every start begins from the minted file again. KNOWN GAP —
-  # if the server ever retires a refresh token on use, a workspace stops starting and has to be re-minted.
+  # THE FILE ITSELF, bound rw at claude's path — not a copy of its content. A copy landed in the tmpfs, so the refresh a
+  # session made inside was lost at exit and every start began from the minted token again; once the server had rotated
+  # the refresh token the minted one no longer refreshed, and the workspace came up 'Not logged in' (2026-09-04, 43 h past
+  # expiry) until the owner re-minted it. Measured on 2.1.261: claude writes the credential IN PLACE (O_TRUNC|O_NOFOLLOW,
+  # no rename), so a file bind takes the write — and it refuses a symlink there, so a link would not have done. The mode is
+  # the file's own (mint installs 600).
+  B+=(--bind "$own" "$cred")
   [ -f "$H/.cc/slack/enabled" ] && mcp=$(jq -cn --arg c "$H/bin/cc-slack" '{"cc-slack": {type: "stdio", command: $c, args: ["channel"], env: {}}}')
-  # fd 3: the ~/.claude.json copy · fd 4: $cj at $cred — that path is the DESTINATION inside; the content is the workspace's own
+  # fd 3: the ~/.claude.json copy (the credential is the bind above, not a copy)
   # THE FIRST-RUN FLAGS ARE MINTED HERE, NOT CARRIED ACROSS. The whitelist stays two keys wide, so the copy used to say
   # "this machine has never run claude": 2.1.258 gates the setup wizard on `!hasCompletedOnboarding` of the GLOBAL config
   # and the login is a STEP of that wizard, so a member was walked through setup and asked to sign in on every start with
@@ -290,13 +318,12 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # makes the inner jq exit 0 with no output — either way fd 3 would write nothing, `--file 3` would make an EMPTY
   # ~/.claude.json inside, and the wizard would be back with only a stderr line in a pane nobody reads. `input? // {}`
   # is the fallback: no projects to filter, flags minted all the same.
-  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
+  exec bwrap "${B[@]}" --file 3 "$H/.claude.json" -- "$@" \
     3< <({ jq -c '.projects // {}' "$H/.claude.json" 2>/dev/null || printf '{}'; } \
          | jq -n --arg d "$dev" --arg cwd "$cwd" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
            '{projects: (((input? // {}) | with_entries(select(.key == $d or (.key | startswith($w)))))
                         | reduce ($d, $cwd) as $k (.; .[$k] = ((.[$k] // {}) + {hasTrustDialogAccepted: true}))),
-             mcpServers: $m, hasCompletedOnboarding: true}') \
-    4< <(printf '%s' "$cj"); }
+             mcpServers: $m, hasCompletedOnboarding: true}'); }
 CLAUDEBIN="${CC_CLAUDE:-$H/.local/bin/claude}"   # the same knob cc and cc-loop use to name claude
 handle_ok(){ [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]]; }   # a workspace's dir name IS its handle and its channel name
 owners_own(){   # $1 candidate credentials file · $2 the .claude.json that login wrote ("" = none) → prints WHY, exit 0, when it is the OWNER'S
@@ -448,7 +475,8 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
   echo "Next: cc-sandbox mint $r — it starts on nothing else. Its Slack channel pair and members.json record are the daemon's: cc-slack member add <@user>."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
-  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1
+  cb=$(dirname "$SELF")   # the host side of every board case below: THIS tree's cc-board, which resolves a linked board before it renames
   dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
   : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
   git -C "$dev" init -q -b main && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init || return 1
@@ -469,7 +497,7 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'member: a credential file without an access token is no credential — still no start' "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'has no .claudeAiOauth.accessToken' <<<"$out")" 2/0/1
   # THE WORLD INSIDE, on a credential of its own (the fixture this needs, built here). Only booleans come back out — never a token.
   mine="mbr-only-access-$$"; miner="mbr-only-refresh-$$"
-  jq -n --arg a "$mine" --arg r "$miner" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$own" || return 1
+  { jq -n --arg a "$mine" --arg r "$miner" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$own" && chmod 600 "$own"; } || return 1   # 600, as mint installs it
   out=$(TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak SLACK_BOT_TOKEN=leak CC_LOOP_TRIM=trim-77 "$SELF" member "$h" t -- sh -c '
     e(){ [ -e "$1" ] && echo present || echo absent; }
     echo other=$(e ~/dev/'"$o"'); echo ctl=$(e '"$ctl"'); echo devls=$(ls -A ~/dev | tr "\n" " "); echo ccls=$(ls -A ~/.cc | sort | tr "\n" " ")
@@ -531,6 +559,26 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'member: and the only projects are this workspace'"'"'s own root and cwd, both trusted — no trust dialog either' \
     "$(g projs)/$(g trust)" ".cc/worktrees/$h/t dev/$h/true,true"
   t 'member: own pid namespace' "$(g pid1)" few;  t 'member: /tmp writable' "$(g tmp)" ok
+  # ── THE BOARD IS ONE FILE, BOTH WAYS. The row the world above added inside is on the HOST's board; a host write made
+  #    while a session runs is read inside on its next command (a file bind never showed it — the host renames a new file
+  #    over the board and the mount kept the old inode, 2026-09-04); and through it all the host path stays a link.
+  t 'board: a row added inside is the host'"'"'s row' "$("$cb/cc-board" get "$h" t2 branch 2>/dev/null)" track/t2
+  ( sleep 0.7; "$cb/cc-board" status "$h" t2 running >/dev/null 2>&1 ) &
+  out=$("$SELF" member "$h" t -- sh -c 'i=0; s=; while [ $i -lt 60 ]; do s=$(cc-board get '"$h"' t2 status 2>/dev/null); [ "$s" = running ] && break; i=$((i+1)); sleep 0.25; done; echo seen=$s' 2>&1); wait
+  t 'board: a host write made while the session runs is read inside on its next command' "$(g seen)" running
+  t 'board: ~/.cc/boards/<h>.json and .lock are links into ~/.cc/members/<h>/board/, and still links after that host save' \
+    "$([ -L "$H/.cc/boards/$h.lock" ] && readlink "$H/.cc/boards/$h.json")" "$H/.cc/members/$h/board/$h.json"
+  # ── THE REFRESH REACHES THE HOST COPY, AND NOTHING ELSE. A session writes its credential the way claude does (in place,
+  #    no rename); the file minted for the workspace holds it, the next launch starts from it, and the box's own
+  #    ~/.claude/.credentials.json is byte for byte what it was.
+  real0=$(md5sum "$c" 2>/dev/null | cut -d' ' -f1); real0="${real0:-absent}"
+  out=$("$SELF" member "$h" t -- sh -c 'jq -c ".claudeAiOauth.accessToken = \"refreshed-'"$$"'\"" ~/.claude/.credentials.json > /tmp/c && cat /tmp/c > ~/.claude/.credentials.json && echo wrote=$(stat -c %a ~/.claude/.credentials.json)' 2>&1)
+  t 'credential: a session writes its credential in place, mode kept' "$(g wrote)" 600
+  t 'credential: the refresh is in the workspace'"'"'s own file on the host, still 600' "$(jq -r .claudeAiOauth.accessToken "$own" 2>/dev/null)/$(stat -c %a "$own" 2>/dev/null)" "refreshed-$$/600"
+  out=$("$SELF" member "$h" t -- sh -c 'echo next=$(jq -r .claudeAiOauth.accessToken ~/.claude/.credentials.json)' 2>&1)
+  t 'credential: …and the next launch starts from it, with no person' "$(g next)" "refreshed-$$"
+  real1=$(md5sum "$c" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
+  t 'credential: the box'"'"'s own ~/.claude/.credentials.json is untouched by all of that' "$real1" "$real0"
   out=$("$SELF" member "$o" -- true 2>&1); t 'member: a repo without the marker is refused' "${out#*: ~/dev/}" "$o is not a member workspace (no .cc/member-workspace)"
   rm -f "$own" "$kf"
   git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
@@ -871,7 +919,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
   rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
-  local r="_ccsbx$$" dev wt st n=0 bad=0 out want
+  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out want
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   g(){ sed -n "s/^$1=//p" <<<"$out" | head -1; }
@@ -880,6 +928,10 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   git -C "$dev" init -q -b main && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init || return 1
   git -C "$dev" worktree add -q -b track/t "$wt" && git -C "$dev" worktree add -q -b track/u "$H/.cc/worktrees/$r/u" || return 1
   mkdir -p "$wt/.cc"; : > "$wt/.cc/track"
+  # a MEMBER's board beside it, as board_dir leaves one: the file and lock in ~/.cc/members/<h>/board/, ~/.cc/boards/<h>.json and .lock links to them
+  mkdir -p "$H/.cc/members/$mb/board" && printf '{"repo":"%s","tracks":{"t":{"status":"running","title":"m"}}}\n' "$mb" > "$H/.cc/members/$mb/board/$mb.json" \
+    && : > "$H/.cc/members/$mb/board/$mb.lock" && ln -sfn "$H/.cc/members/$mb/board/$mb.json" "$H/.cc/boards/$mb.json" \
+    && ln -sfn "$H/.cc/members/$mb/board/$mb.lock" "$H/.cc/boards/$mb.lock" || return 1
   # ON: what the world inside contains — every line a fact a reviewer of the bind list would ask about
   out=$(CC_WORKER_SANDBOX=1 TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak "$SELF" "$r" t -- sh -c '
     e(){ [ -e "$1" ] && echo present || echo absent; }
@@ -892,7 +944,9 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     echo gitconfig=$(git config user.name z 2>/dev/null && echo writable || echo ro); echo bin=$(touch ~/bin/x 2>/dev/null && echo writable || echo ro)
     echo tracks=$(ls ~/.cc/worktrees/'"$r"' | tr "\n" " "); echo states=$(ls ~/.cc/state/'"$r"' | tr "\n" " "); echo dev=$(ls -A ~/dev/'"$r"' | tr "\n" " ")
     echo tok=${CLAUDE_CODE_OAUTH_TOKEN:+set}; echo cj=$(jq -r "(.projects|length),(.mcpServers|length)" ~/.claude.json | tr "\n" ","); echo cjkeys=$(jq -r "keys|join(\",\")" ~/.claude.json); echo settings=$(touch ~/.claude/settings.json 2>/dev/null && echo writable || echo ro)
-    echo tmp=$(touch /tmp/x && echo ok); echo runuser=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)' 2>&1)
+    echo tmp=$(touch /tmp/x && echo ok); echo runuser=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)
+    echo mboard=$(~/bin/cc-board get '"$mb"' t status 2>/dev/null); echo mwrite=$(~/bin/cc-board status '"$mb"' t done >/dev/null 2>&1 && echo wrote || echo refused)
+    echo plant=$(ln -sfn ~/.claude/settings.json ~/.cc/boards/planted.json 2>/dev/null && echo planted || echo ro)' 2>&1)
   want='[false,false,0]'; jq -e '.claudeAiOauth.accessToken' "$H/.claude/.credentials.json" >/dev/null 2>&1 && want='[true,false,1]'   # the real file has one → the copy has it, no refresh token, nothing else
   t 'credentials: a stripped copy, mode 600' "$(g cred)" "${want}600";  t 'config/gh absent' "$(g gh)" absent;  t 'ccbox absent' "$(g ccbox)" absent;  t '.git/hooks is ro' "$(g hooks)" ro
   t 'cc/config absent' "$(g ccconfig)" absent;  t 'ssh absent' "$(g ssh)" absent;  t 'the container socket absent' "$(g sock)" absentabsent
@@ -903,13 +957,21 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   t 'no token in the environment' "$(g tok)" "";  t 'claude.json copy: no other projects, no MCP' "$(g cj)" '0,0,'
   t 'claude.json copy: only projects and mcpServers, nothing of the account' "$(g cjkeys)" mcpServers,projects
   t 'settings.json is ro' "$(g settings)" ro;  t '/tmp is writable' "$(g tmp)" ok;  t 'the host /run/user (its sockets) is not there' "$(g runuser)" 0
+  # a member's board is a link into ~/.cc/members/<h>/board/ (board_dir); ~/.cc/boards alone left it dangling and every member track gone from cc-board inside (review of #224)
+  t 'a member'"'"'s board — a link out of ~/.cc/boards — is read inside' "$(g mboard)" running
+  t '…and cannot be written from inside: the write is refused and the host file is as it was' "$(g mwrite)/$(jq -r .tracks.t.status "$H/.cc/members/$mb/board/$mb.json")" refused/running
+  # ~/.cc/boards ITSELF is ro (it was rw): a link planted there is one the HOST saves through, and that renamed a board over
+  # the owner's settings.json. cc-board refuses the link too; this is the bind that stops it being written at all.
+  t 'nothing can be planted in ~/.cc/boards: the directory is ro, so a link there for the host to save through cannot be made' \
+    "$(g plant)/$([ -e "$H/.cc/boards/planted.json" ] && echo left || echo none)" ro/none
   # OFF: nothing changes — argv byte for byte, the environment untouched
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
   out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
   selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline
   git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$dev" worktree remove --force "$H/.cc/worktrees/$r/u" >/dev/null 2>&1
-  rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.cc/sandbox/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")"
+  rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.cc/sandbox/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")" \
+         "$H/.cc/members/$mb" "$H/.cc/boards/$mb.json" "$H/.cc/boards/$mb.lock"
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
 case "${1:-}" in selfcheck) selfcheck; exit $?;;
   mint) shift; mint "$@"; exit $?;;

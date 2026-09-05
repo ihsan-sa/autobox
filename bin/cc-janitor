@@ -145,9 +145,21 @@ def container_verdict(f):
 
 
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
+def board_read(path):
+    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
+    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
+    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    if not hasattr(board_read, "mod"):
+        import importlib.machinery, importlib.util
+        s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
+        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
+    return board_read.mod.read(path)
+
+
 def board(repo):
     try:
-        return json.load(open(f"{BOARDS}/{repo}.json"))
+        return board_read(f"{BOARDS}/{repo}.json")
     except Exception:
         return None
 
@@ -710,12 +722,27 @@ def selfcheck():
         open(f"{wts}/dirtyone/scratch.txt", "w").write("not committed\n")
         # backdate every merged track past the 48 h line except `young`, by rewriting the log the board keeps
         bj = f"{th}/.cc/boards/{repo}.json"
-        d = json.load(open(bj))
+        d = board_read(bj)
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5 * 86400))
         for e in d["log"]:
             if e.get("track") in ("gone", "dirtyone") and str(e.get("msg", "")).startswith("status -> "):
                 e["ts"] = old
         json.dump(d, open(bj, "w"), indent=2)
+        # A PIPE PLANTED WHERE A BOARD SHOULD BE (review of #224): the read is cc-board's opener now, so it is no board, never a hang
+        def bounded(fn, secs=10):   # a read that hangs on the pipe (a plain open would, for good) fails THIS case, not the suite
+            import threading
+            box = []
+            def go():
+                try: box.append(fn())
+                except Exception as e: box.append(e)
+            t = threading.Thread(target=go, daemon=True); t.start(); t.join(secs)
+            return box[0] if box else "hung"
+        global BOARDS
+        _b, BOARDS = BOARDS, f"{th}/.cc/boards"
+        os.mkfifo(f"{BOARDS}/pipe.json")
+        ok("a pipe planted where a board should be reads as no board, not a hang, and the real one still reads",
+           bounded(lambda: board("pipe")) is None and board(repo) is not None)
+        os.remove(f"{BOARDS}/pipe.json"); BOARDS = _b
 
         # two panes: one with a child (live) and one without (bare) — the same fact `cc` reads off a real pane
         # Groups of their own, with no handle on this process's stdout: a stray `sleep` holding the pipe open
@@ -760,12 +787,12 @@ def selfcheck():
                                   env=dict(env, **extra), capture_output=True, text=True, timeout=300)
 
         # --dry first, against the very same fixture the real run then gets
-        before = (sorted(json.load(open(bj))["tracks"]), sorted(wins()),
+        before = (sorted(board_read(bj)["tracks"]), sorted(wins()),
                   sh("git", "-C", dev, "ls-remote", "--heads", "origin").stdout)
         rd = run("--dry")
         ok("--dry says what it would do", "would rm" in rd.stdout and "would delete" in rd.stdout)
         ok("--DRY CHANGES NOTHING — board, windows and origin are all exactly as they were",
-           (sorted(json.load(open(bj))["tracks"]), sorted(wins()),
+           (sorted(board_read(bj)["tracks"]), sorted(wins()),
             sh("git", "-C", dev, "ls-remote", "--heads", "origin").stdout) == before)
         ok("--dry writes no log either, nor anyone else's file — it refreshes no snapshot to get its answer",
            not os.path.exists(f"{th}/.cc/state/janitor.log") and not os.path.exists(f"{th}/.cc/state/reconcile.json"))
@@ -784,10 +811,10 @@ def selfcheck():
         rn = subprocess.run([sys.executable, os.path.realpath(__file__), repo],
                             env=dict(env, CC_JANITOR_NO_SNAP="1"), capture_output=True, text=True, timeout=300)
         ok("no liveness snapshot: the deletion rules HOLD — report-only, nothing removed",
-           "gone" in json.load(open(bj))["tracks"] and "held: no fresh liveness snapshot" in rn.stdout)
+           "gone" in board_read(bj)["tracks"] and "held: no fresh liveness snapshot" in rn.stdout)
 
         r1 = run()
-        b2 = json.load(open(bj))["tracks"]
+        b2 = board_read(bj)["tracks"]
         ok("end to end: the track merged 5 days ago is gone — worktree, branch, board row and all",
            "gone" not in b2 and not os.path.isdir(f"{wts}/gone"))
         ok("end to end: UNCOMMITTED WORK SURVIVES the sweep", "dirtyone" in b2 and os.path.exists(f"{wts}/dirtyone/scratch.txt"))

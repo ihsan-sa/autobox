@@ -6,7 +6,7 @@ Every orchestrated session reads/writes it so sessions know what the others are 
 — by its own arithmetic and by a small model reading the prose, which says what to cut; a judge that cannot answer
 does not stop it. CC_BRIEF_FORCE=1 sends it as typed and records that; CC_BRIEF_MACHINE=1 is for a row the box
 wrote itself and records nothing. What other live tracks are holding is computed in."""
-import sys, os, json, time, fcntl, calendar, errno, re, subprocess
+import sys, os, json, time, fcntl, calendar, errno, re, subprocess, stat, tempfile, glob
 BOARDS = os.path.expanduser("~/.cc/boards")
 # ONE VOCABULARY with the App Home tab (§02 of the Home handoff: the word is "queued", never "todo"). The board used to
 # write `todo` and the tab only printed "queued" by accident — `todo` is not a state it knows, so it fell through the
@@ -69,13 +69,57 @@ def clean(s):
     return s.encode("utf-8", "replace").decode("utf-8")
 def now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 def bpath(repo): return os.path.join(BOARDS, repo + ".json")
-def _load(repo):
-    p = bpath(repo)
-    if not os.path.exists(p): return None
-    with open(p) as f: return json.load(f)
-# A rename that may fall back to writing in place — for ONE reason. Inside a member boundary the board FILE is bind-mounted
-# (cc-sandbox member) and nothing can be renamed over a mount point: rename(2) says EBUSY (measured; EXDEV/EINVAL/EPERM are
-# the other spellings a mount can give). A full disk, an I/O error or a read-only filesystem are NOT that: the first version
+# THE HOST NEVER FOLLOWS A LINK A MEMBER COULD HAVE PLANTED (review of #224). A member workspace's board lives in
+# ~/.cc/members/<h>/board/, a directory the MEMBER writes (cc-sandbox binds it as the session's ~/.cc/boards), and the
+# host's ~/.cc/boards/<h>.json and .lock are links into it. Inside, `rm <h>.json; ln -s ~/.claude/settings.json <h>.json`
+# was enough: the host's next save resolved the whole chain and renamed the board over any file the owner can write,
+# and the lock, opened "w", truncated one. A WORKER can plant the same link one level out — ~/.cc/boards itself is bound
+# rw in that sandbox. So the host's OWN entry is read as one link, and only to the board dir of the workspace whose name
+# it carries (_target); what it names is opened O_NOFOLLOW — a link there is refused, not resolved — with O_NONBLOCK, so a FIFO planted there cannot
+# hang the host, and the fd must be a regular file. The temp file is mkstemp's (O_CREAT|O_EXCL, a name nobody could
+# have planted). A refusal leaves the previous board intact and exits with one line naming the path.
+class Refused(Exception): pass
+def _target(p):
+    """The host's own entry may be ONE link (cc-sandbox board_dir): what it names, never what THAT names — and only the one
+    place board_dir ever puts one, ~/.cc/members/<h>/board/<same name>. WHERE it pointed was not checked, and ~/.cc/boards is
+    bind-mounted RW inside a WORKER too (cc-sandbox build), so from in there `rm <repo>.json; ln -s ~/.claude/settings.json
+    <repo>.json` was enough: the host's next save renamed a board over the owner's settings, and the lock's open truncated
+    whatever it named. Any other target is refused, which leaves the board and the file it aimed at exactly as they were."""
+    if not os.path.islink(p): return p
+    t = os.readlink(p)
+    t = os.path.normpath(t if os.path.isabs(t) else os.path.join(os.path.dirname(p), t))
+    b = os.path.basename(p)   # <h>.json / <h>.lock → ~/.cc/members/<h>/board/<h>.json, and nothing else
+    want = os.path.normpath(os.path.join(BOARDS, os.pardir, "members", b.rsplit(".", 1)[0], "board", b))
+    if t != want: raise Refused(f"cc-board: {p} is a link to {t}, not to {want} — refused")
+    return t
+def _open(t, flags, mode=0o644):
+    """os.open that refuses a link, a pipe, a directory or anything but a regular file with ONE name at t; the caller
+    closes the fd. One name: link(2) across two binds is EXDEV today, so a hard link at the name is belt and braces —
+    it would put the in-place fallback's O_TRUNC on whatever inode the member linked there."""
+    try: fd = os.open(t, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, mode)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENXIO, errno.EISDIR, errno.ENOTDIR):
+            raise Refused(f"cc-board: {t} is a link, a pipe or a directory, not a board file — refused")
+        raise
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        os.close(fd); raise Refused(f"cc-board: {t} is not a regular file with one name — refused")
+    return fd
+def read(path):
+    """A board file read the way the host must read one (above): None when there is nothing there, Refused for anything
+    planted. EVERY HOST READER COMES THROUGH HERE — cc-janitor, cc-pulse, cc-land, cc-owed, cc-brief, cc-reconcile,
+    cc-secretary and cc-slack import this file (the way cc-time is imported) and call read(); cc-audit runs `cc-board
+    json`. A plain open of ~/.cc/boards/<h>.json followed whatever the member planted, and a pipe there hung the
+    timer-driven ones for good. The selfcheck's tripwire says no sibling opens a board itself."""
+    try: fd = _open(_target(path), os.O_RDONLY)
+    except FileNotFoundError: return None
+    with os.fdopen(fd) as f: return json.load(f)
+def _load(repo): return read(bpath(repo))
+# A rename that may fall back to writing in place — for ONE reason. Inside a member boundary the board FILE used to be
+# bind-mounted (cc-sandbox member, until 2026-09-04: it is the board's DIRECTORY now, and the rename works in there — a file
+# bind pinned the old inode, so every host rename left the session a stale board), and nothing can be renamed over a mount
+# point: rename(2) says EBUSY (measured; EXDEV/EINVAL/EPERM are the other spellings a mount can give). A session launched
+# before that change still holds the file bind, so the fallback stays. A full disk, an I/O error or a read-only filesystem are NOT that: the first version
 # caught every OSError and `open(path, "w")` then truncated the live board to nothing before its write failed again — one
 # `cc-board note` on a full disk emptied a repo's board (review-156d). So the errno must be the mount's, the text is in
 # memory before the target is opened, and everything else re-raises with the previous board intact.
@@ -83,23 +127,40 @@ MOUNT_ERRNOS = (errno.EBUSY, errno.EXDEV, errno.EINVAL, errno.EPERM)
 def _save(repo, d):
     os.makedirs(BOARDS, exist_ok=True)
     d["updated"] = now()
-    p, tmp = bpath(repo), bpath(repo) + ".tmp"
-    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    p = _target(bpath(repo))   # a member workspace's board: the file the host's link names, in ~/.cc/members/<h>/board/ — the
+    try: st = os.lstat(p)      # rename lands on that name, never on the link. A link or a pipe AT that name is the member's: refused
+    except FileNotFoundError: st = None   # a first save; the rename creates it
+    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_nlink > 1):
+        raise Refused(f"cc-board: {p} is a link, not a file, or a file with two names — refused, board unchanged")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=repo + ".json.", suffix=".tmp")   # O_EXCL, a fresh name: nothing planted is opened
+    os.fchmod(fd, 0o644)
+    with os.fdopen(fd, "w") as f: json.dump(d, f, indent=2)
     try:
         os.replace(tmp, p)               # atomic: the inode is swapped, a reader sees the old board or the new one
-    except OSError as e:
+    except OSError as e:                 # (a link swapped in at p after the lstat is REPLACED by the rename, never written through)
         if e.errno not in MOUNT_ERRNOS:
             try: os.unlink(tmp)          # the .tmp is garbage (and on a full disk, the space it took)
             except OSError: pass
             raise
         with open(tmp) as f: text = f.read()
-        with open(p, "w") as f: f.write(text)   # in place, under the same lock every writer holds
+        with os.fdopen(_open(p, os.O_WRONLY | os.O_TRUNC), "w") as f: f.write(text)   # in place, under the same lock every writer holds
         os.unlink(tmp)
+LOCK_WAIT = 30   # seconds a writer waits for the lock. A member's lock file is in its own directory, so a member session
+                 # can hold it as long as it likes: the host takes it non-blocking and gives up in one line, never for good.
+                 # No writer holds it longer than a load and a save (`add` runs the judge BEFORE taking it).
 class Lock:
     def __init__(self, repo):
-        os.makedirs(BOARDS, exist_ok=True)
-        self.f = open(os.path.join(BOARDS, repo + ".lock"), "w")
-    def __enter__(self): fcntl.flock(self.f, fcntl.LOCK_EX); return self
+        os.makedirs(BOARDS, exist_ok=True)   # not "w": nothing is truncated, and a link or a pipe where the lock should be is refused
+        self.p = _target(os.path.join(BOARDS, repo + ".lock"))
+        self.f = os.fdopen(_open(self.p, os.O_WRONLY | os.O_CREAT), "w")
+    def __enter__(self):
+        end = time.monotonic() + LOCK_WAIT
+        while True:
+            try: fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    self.f.close(); raise Refused(f"cc-board: {self.p} is held by another process — gave up after {LOCK_WAIT} s")
+                time.sleep(0.1)
     def __exit__(self,*a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
 def need(repo):
     d = _load(repo)
@@ -346,10 +407,21 @@ def selfcheck():
         # CC_BRIEF_FAKE stands in for the judge `add` now asks: this suite has no API calls, and without it the
         # only reason no model runs is that $HOME/.local/bin/claude is missing under the fixture HOME — accident,
         # not assertion. cc-brief's own selfcheck is where the judge's verdicts are pinned.
-        def run(*args): return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
-                                              env={**os.environ, "HOME": th,
-                                                   "CC_BRIEF_FAKE": '{"verdict":"approve","why":"","cut":[]}'},
-                                              capture_output=True, text=True)
+        def run(*args):
+            try: return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
+                                       env={**os.environ, "HOME": th, "CC_BRIEF_FAKE": '{"verdict":"approve","why":"","cut":[]}'},
+                                       capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired as e:   # a hang is ONE failed case, not a suite that never ends
+                out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+                return subprocess.CompletedProcess(e.cmd, 124, out, f"cc-board selfcheck: `{' '.join(args)}` hung for 60 s")
+        def bounded(fn, secs=10):   # an in-process call that hangs (a blocking flock, a plain open of a pipe) fails THIS case, not the suite
+            import threading
+            box = []
+            def go():
+                try: box.append(fn())
+                except Exception as e: box.append(e)
+            t = threading.Thread(target=go, daemon=True); t.start(); t.join(secs)
+            return box[0] if box else "hung"
         run("init", "r", "/tmp/r", "main"); run("add", "r", "t1", "T", "THE BRIEF, in full.")
         blob = run("json", "r").stdout
         ok("`add` writes the brief to task.md", open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "THE BRIEF, in full.")
@@ -477,14 +549,135 @@ def selfcheck():
            bs == [mine, "myrepo_cctesting", "r"] and "_ccsbx99999999" in ba)
         for b in ("_ccsbx99999999", "myrepo_cctesting", mine):
             os.remove(f"{th}/.cc/boards/{b}.json")
+        # A MEMBER WORKSPACE'S BOARD IS A LINK: cc-sandbox keeps the file in ~/.cc/members/<h>/board/ and binds that directory
+        # as the session's ~/.cc/boards, leaving ~/.cc/boards/<h>.json a symlink so every host path still works. A rename onto
+        # the link's own path would replace the LINK with a plain file, and the two sides would hold two boards again.
+        os.makedirs(f"{th}/.cc/members/lk/board"); os.symlink(f"{th}/.cc/members/lk/board/lk.json", f"{th}/.cc/boards/lk.json")
+        run("init", "lk", "/tmp/lk", "main"); run("add", "lk", "t1", "T")
+        ok("a save through a linked board lands in the file the link names, and the link is still a link",
+           os.path.islink(f"{th}/.cc/boards/lk.json") and "t1" in json.load(open(f"{th}/.cc/members/lk/board/lk.json"))["tracks"]
+           and "lk" in run("boards").stdout.split() and not os.path.exists(f"{th}/.cc/boards/lk.json.tmp"))
+        # …AND THE HOST NEVER FOLLOWS A LINK PLANTED IN THAT DIRECTORY (review of #224): the member writes it, so a link
+        # in place of the board, a link at the .tmp name, or a link or a pipe in place of the lock is the member's — and
+        # each used to be followed: a save renamed the board over any owner-writable file, the lock's open truncated one.
+        # Every case: refused (or simply unused), the victim byte for byte, the previous board intact, no hang.
+        victim = f"{th}/victim"; open(victim, "w").write("SECRET\n")
+        mb = f"{th}/.cc/members/lk/board"
+        os.replace(f"{mb}/lk.json", f"{mb}/lk.real"); os.symlink(victim, f"{mb}/lk.json")
+        r1, r2, r3 = run("status", "lk", "t1", "running"), run("get", "lk", "t1", "status"), run("list")
+        ok("a link planted where the member's board file was is refused by the host's save and its read — exit 1, one line, the victim untouched",
+           r1.returncode == 1 and "refused" in r1.stderr and r2.returncode == 1 and "refused" in r2.stderr
+           and open(victim).read() == "SECRET\n" and os.readlink(f"{mb}/lk.json") == victim)
+        ok("…and `list` skips that board and still lists the others", "r\t" in r3.stdout and "lk.json: unreadable" in r3.stderr)
+        os.remove(f"{mb}/lk.json"); os.mkfifo(f"{mb}/lk.json")
+        r1, r2 = run("status", "lk", "t1", "running"), run("get", "lk", "t1", "status")
+        ok("a pipe planted there is refused the same way, and neither the save nor the read hangs on it",
+           r1.returncode == 1 and "refused" in r1.stderr and r2.returncode == 1 and "refused" in r2.stderr)
+        os.remove(f"{mb}/lk.json"); os.replace(f"{mb}/lk.real", f"{mb}/lk.json")
+        os.symlink(victim, f"{mb}/lk.json.tmp")
+        r1 = run("status", "lk", "t1", "running")
+        unused = os.path.islink(f"{mb}/lk.json.tmp") and os.readlink(f"{mb}/lk.json.tmp") == victim   # gone = a save renamed it onto the board
+        ok("a link planted at the .tmp name is never what the save writes: the save lands, the victim untouched, the link unused",
+           r1.returncode == 0 and json.load(open(f"{mb}/lk.json"))["tracks"]["t1"]["status"] == "running"
+           and open(victim).read() == "SECRET\n" and unused)
+        if os.path.lexists(f"{mb}/lk.json.tmp"): os.remove(f"{mb}/lk.json.tmp")
+        os.remove(f"{th}/.cc/boards/lk.lock"); os.symlink(f"{mb}/lk.lock", f"{th}/.cc/boards/lk.lock")   # as board_dir leaves it
+        os.symlink(victim, f"{mb}/lk.lock")
+        r1 = run("status", "lk", "t1", "queued")
+        os.remove(f"{mb}/lk.lock"); os.mkfifo(f"{mb}/lk.lock")
+        r2 = run("status", "lk", "t1", "queued")
+        ok("a link, then a pipe, in place of the lock is refused — the victim is not truncated, the host does not hang, the board is as it was",
+           r1.returncode == 1 and "refused" in r1.stderr and r2.returncode == 1 and "refused" in r2.stderr
+           and open(victim).read() == "SECRET\n" and json.load(open(f"{mb}/lk.json"))["tracks"]["t1"]["status"] == "running")
+        os.remove(f"{mb}/lk.lock"); open(f"{mb}/lk.lock", "w").close()
+        ok("…and with a plain file back at the lock the save goes through the host's link as before",
+           run("status", "lk", "t1", "queued").returncode == 0 and json.load(open(f"{mb}/lk.json"))["tracks"]["t1"]["status"] == "queued")
+        # …AND THE SAME AT THE HOST'S OWN ENTRY, which is where a WORKER can plant one: ~/.cc/boards is bind-mounted rw
+        # inside that sandbox too. `rm r.json; ln -s <the owner's file> r.json` and the host's next save renames a board
+        # over it. A link there is followed only to ~/.cc/members/<h>/board/<h>.json, what board_dir makes, and to nothing else.
+        for name, why in (("r.json", "board"), ("r.lock", "lock")):
+            keep = f"{th}/.cc/boards/{name}.keep"
+            if os.path.lexists(f"{th}/.cc/boards/{name}"): os.replace(f"{th}/.cc/boards/{name}", keep)
+            os.symlink(victim, f"{th}/.cc/boards/{name}")
+            r1, r2 = run("status", "r", "t1", "running"), run("get", "r", "t1", "status")
+            os.remove(f"{th}/.cc/boards/{name}")
+            if os.path.lexists(keep): os.replace(keep, f"{th}/.cc/boards/{name}")
+            ok(f"a link planted at the host's own {why} entry — what a sandboxed worker can write — is refused before "
+               f"anything opens it, and the file it aimed at is byte for byte what it was",
+               r1.returncode == 1 and "refused" in r1.stderr and "Traceback" not in r1.stderr
+               and (why == "lock" or (r2.returncode == 1 and "refused" in r2.stderr))
+               and open(victim).read() == "SECRET\n")
+        ok("…and the board that link stood in front of is untouched and still saves",
+           run("status", "r", "t1", "queued").returncode == 0
+           and json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["t1"]["status"] == "queued")
+        # BELT AND BRACES (the second pass of that review): a board file has ONE name — link(2) across two binds is EXDEV
+        # today — and a DIRECTORY made at the lock's name or the board's is one line, not a traceback.
+        os.link(f"{mb}/lk.json", f"{mb}/lk.two")
+        r1, r2 = run("status", "lk", "t1", "running"), run("get", "lk", "t1", "status")
+        os.remove(f"{mb}/lk.two")
+        ok("a board file with a second name (a hard link) is refused, save and read alike",
+           r1.returncode == 1 and "refused" in r1.stderr and r2.returncode == 1 and "refused" in r2.stderr)
+        os.remove(f"{mb}/lk.lock"); os.mkdir(f"{mb}/lk.lock")
+        r1 = run("status", "lk", "t1", "running")
+        os.rmdir(f"{mb}/lk.lock"); open(f"{mb}/lk.lock", "w").close()
+        os.replace(f"{mb}/lk.json", f"{mb}/lk.real"); os.mkdir(f"{mb}/lk.json")
+        r2, r3 = run("status", "lk", "t1", "running"), run("get", "lk", "t1", "status")
+        os.rmdir(f"{mb}/lk.json"); os.replace(f"{mb}/lk.real", f"{mb}/lk.json")
+        ok("a directory made at the lock's name, or at the board's, is refused in one line — no traceback",
+           all(r.returncode == 1 and "refused" in r.stderr and "Traceback" not in r.stderr for r in (r1, r2, r3)))
+        # NO SIBLING OPENS A BOARD ITSELF: the host readers import `read` (the way cc-time is imported), cc-audit runs
+        # `cc-board json`. A tripwire, not a proof, in two passes per function: every name bound to a board path (BOARDS,
+        # bpath(), a string under .cc/boards — by `x = …`, `for x in …`, `with … as x`) is collected, and a line that reads
+        # (open, json.load, read_text/read_bytes, shutil.copy*, a cat/cp/jq call) with such a name as an argument, or with
+        # the path spelled out, is flagged. A line that writes ("w") is a suite laying a fixture in its own directory. A
+        # shell file gets the one-line rule: cat/cp/jq with the board path in the same command.
+        here = os.path.dirname(os.path.realpath(__file__))
+        MARK = re.compile(r'\bBOARDS\b|\.cc/boards|\bbpath\(')
+        VERB = re.compile(r'\b(open|load|loads|read_text|read_bytes|copy|copy2|copyfile|cat|cp|jq)\b')
+        def plain_opens(path):
+            out, bound = [], {}
+            lines = open(path, errors="replace").read().split("\n")
+            py = lines[0].startswith("#!") and "python" in lines[0]
+            for i, line in enumerate(lines, 1):
+                code = line.split("#")[0].rstrip()
+                if not code.strip(): continue
+                indent = len(code) - len(code.lstrip())
+                if re.match(r'\s*def\s', code): bound = {k: v for k, v in bound.items() if v <= indent}   # a new function: its predecessor's names are gone
+                write = '"w"' in code or "'w'" in code
+                marked = bool(MARK.search(code))
+                if not py:
+                    if not write and re.search(r'\b(cat|cp|jq)\b[^|;&]*(\.cc/boards|\bBOARDS\b)', code): out.append(f"{os.path.basename(path)}:{i}")
+                    continue
+                if marked and not write:   # pass one: a name bound to a board path
+                    m = (re.match(r'\s*for\s+(\w+)\s+in\b', code) or re.match(r'\s*with\b.*\bas\s+(\w+)\s*:', code)
+                         or re.match(r'\s*([\w\s,]+?)\s*=[^=]', code))
+                    for nm in (m.group(1).split(",") if m else []): bound[nm.strip()] = indent
+                if write or not VERB.search(code): continue
+                if marked or any(re.search(r'[(,\[]\s*' + re.escape(nm) + r'\s*[,)\]]', code) for nm in bound if nm):   # pass two
+                    out.append(f"{os.path.basename(path)}:{i}")
+            return out
+        bad = [x for n in sorted(os.listdir(here)) if n.startswith("cc") and n != "cc-board" and os.path.isfile(f"{here}/{n}")
+               for x in plain_opens(f"{here}/{n}")]
+        ok("no sibling tool opens ~/.cc/boards/<repo>.json itself — each reads through `read` or `cc-board json` (tripwire)", not bad)
+        if bad: print("       " + ", ".join(bad))
         # A FAILED RENAME LEAVES THE PREVIOUS BOARD (review-156d). The in-place fallback exists for the bind-mounted board
         # inside a member boundary — rename over a mount point is EBUSY — and for nothing else: a full or read-only disk used
         # to truncate the live board to zero bytes on the way to failing. os.replace is stood in for; the board dir is this
         # run's own; _save is called in-process, the way every writer calls it.
-        global BOARDS
-        real_boards, real_replace = BOARDS, os.replace
+        global BOARDS, LOCK_WAIT
+        real_boards, real_replace, real_wait = BOARDS, os.replace, LOCK_WAIT
         BOARDS = f"{th}/.cc/boards"
         try:
+            # A LOCK HELD FROM INSIDE IS A MEMBER-CONTROLLED HANG: the lock file is in the member's directory. The host
+            # takes it non-blocking, waits LOCK_WAIT, then refuses in one line — it never sits on a member's flock for good.
+            LOCK_WAIT = 0.5
+            holder = open(f"{mb}/lk.lock", "w"); fcntl.flock(holder, fcntl.LOCK_EX)
+            def take():
+                with Lock("lk"): return "taken"
+            t0 = time.monotonic(); got = bounded(take, 5)   # a lock that blocks (the old LOCK_EX) sits here: the guard fails the case, the suite goes on
+            waited = time.monotonic() - t0; holder.close()
+            ok("a board lock somebody else holds is waited for, briefly, then refused in one line — not a hang — and taken once it is free",
+               isinstance(got, Refused) and 0.4 < waited < 5 and bounded(take, 5) == "taken")
             before = open(f"{th}/.cc/boards/r.json").read()
             def failing(code):
                 def rep(a, b): raise OSError(code, os.strerror(code))
@@ -494,18 +687,19 @@ def selfcheck():
                 try: _save("r", {"repo": "r", "tracks": {}}); raised = False
                 except OSError as e: raised = e.errno == code
                 ok(f"a rename that fails with {errno.errorcode[code]} (full or read-only target) re-raises and leaves the previous board intact",
-                   raised and open(f"{th}/.cc/boards/r.json").read() == before and not os.path.exists(f"{th}/.cc/boards/r.json.tmp"))
+                   raised and open(f"{th}/.cc/boards/r.json").read() == before and not glob.glob(f"{th}/.cc/boards/r.json.*tmp"))
             os.replace = failing(errno.EBUSY)
             _save("r", {"repo": "r", "tracks": {"z": {"status": "queued", "title": "in place"}}})
             ok("…while the mount point's EBUSY writes in place, whole, and clears the .tmp",
                json.load(open(f"{th}/.cc/boards/r.json"))["tracks"] == {"z": {"status": "queued", "title": "in place"}}
-               and not os.path.exists(f"{th}/.cc/boards/r.json.tmp"))
+               and not glob.glob(f"{th}/.cc/boards/r.json.*tmp"))
         finally:
-            BOARDS, os.replace = real_boards, real_replace
+            BOARDS, os.replace, LOCK_WAIT = real_boards, real_replace, real_wait
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-board selfcheck: {n} failed")
     return 1 if n else 0
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try: main(sys.argv[1:])
+    except Refused as e: sys.exit(str(e))   # a planted link or pipe where a board file should be: one line, exit 1, board unchanged

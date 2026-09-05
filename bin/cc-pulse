@@ -277,12 +277,24 @@ def last_tick(target):
 
 
 # ── is anything due? ─────────────────────────────────────────────────────────────────────────────────────────
+def board_read(path):
+    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
+    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
+    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    if not hasattr(board_read, "mod"):
+        import importlib.machinery, importlib.util
+        s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
+        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
+    return board_read.mod.read(path)
+
+
 def board_rows(repo):
     """The repo's board rows, {name: row}. No board — or one half-written under us — is no rows, and no rows is
     not a channel repo: a repo whose board is empty is still driven, it just has nothing in the tick."""
     try:
-        rows = json.load(open(f"{BOARDS}/{repo}.json")).get("tracks")
-    except (OSError, ValueError, AttributeError):
+        rows = (board_read(f"{BOARDS}/{repo}.json") or {}).get("tracks")
+    except Exception:
         return {}
     return {k: v for k, v in rows.items() if isinstance(v, dict)} if isinstance(rows, dict) else {}
 
@@ -681,6 +693,18 @@ def selfcheck():
         # queued row, so every case below is decided by the rule it is about and not by due-ness.
         board("alpha", {"t1": {"status": "queued"}})
         board("beta", {"t1": {"status": "queued"}})
+        def bounded(fn, secs=10):   # a read that hangs on the pipe (a plain open would, for good) fails THIS case, not the suite
+            import threading
+            box = []
+            def go():
+                try: box.append(fn())
+                except Exception as e: box.append(e)
+            t = threading.Thread(target=go, daemon=True); t.start(); t.join(secs)
+            return box[0] if box else "hung"
+        os.mkfifo(f"{BOARDS}/pipe.json")   # A PIPE PLANTED WHERE A BOARD SHOULD BE (review of #224): the read is cc-board's opener now, so it is no board, never a hang
+        ok("a pipe planted where a board should be is no rows to the tick, not a hang, and a real board still reads",
+           bounded(lambda: board_rows("pipe")) == {} and board_rows("alpha") != {})
+        os.remove(f"{BOARDS}/pipe.json")
         json.dump({"C1": {"target": "beta", "alias": "scout", "archived": False},
                    "C2": {"target": "beta", "alias": "old", "archived": True}}, open(ORCHS, "w"))
         open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n@3\talpha/aworker\t{dead.pid}\n")

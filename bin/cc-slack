@@ -2007,10 +2007,24 @@ def home_boards():
         if n.startswith("_cctest") and not (n[7:].isdigit() and int(n[7:]) in lineage()):
             continue
         try:
-            out.append((fn, json.load(open(fn))))
+            d = board_read(fn)
         except Exception:
             continue
+        if d is not None:
+            out.append((fn, d))
     return out
+
+
+def board_read(path):
+    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
+    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
+    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    if not hasattr(board_read, "mod"):
+        import importlib.machinery, importlib.util
+        s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
+        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
+    return board_read.mod.read(path)
 
 
 def home_board_rows():
@@ -11663,6 +11677,16 @@ def cmd_selfcheck():
         own = f"_cctest{os.getpid()}"                    # …and INSIDE its run (our own pid: the suite reading its board) it is one
         json.dump({"repo": own, "tracks": {}}, open(f"{hr}/.cc/boards/{own}.json", "w"))
         fown = [os.path.basename(fn) for fn, _ in home_boards()]
+        def bounded(fn, secs=10):   # a read that hangs on the pipe (a plain open would, for good) fails THIS case, not the suite
+            import threading
+            box = []
+            def go():
+                try: box.append(fn())
+                except Exception as e: box.append(e)
+            t = threading.Thread(target=go, daemon=True); t.start(); t.join(secs)
+            return box[0] if box else "hung"
+        os.mkfifo(f"{hr}/.cc/boards/pipe.json")   # A PIPE PLANTED WHERE A BOARD SHOULD BE (review of #224): the read is cc-board's opener now, so it is no board, never a hang
+        fpipe = bounded(lambda: [os.path.basename(fn) for fn, _ in home_boards()])
     finally:
         globals()["HOME"] = _homeR
         subprocess.run(["rm", "-rf", hr], check=False)
@@ -11674,6 +11698,9 @@ def cmd_selfcheck():
     check("home_boards: a `_cctest<pid>` board IS a board to a process under <pid> — the same rule as cc-board `real`, so "
           "a suite reading its own board sees it while this daemon, never under a suite, does not",
           fown == [f"{own}.json", "abox.json"])
+    check("home_boards: a pipe planted where a board should be is skipped, not a hang — every tab input reads boards through "
+          "cc-board's opener, so a member cannot stop this daemon by planting one",
+          fpipe == [f"{own}.json", "abox.json"])
     print(f"selfcheck: {len(fails)} failed")
     return 1 if fails else 0
 
