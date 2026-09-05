@@ -15,8 +15,9 @@
 # options carry a value PER VERB, because `-o` is a flag to pkill and `--older-than TIME` to killall.
 # A deny is one of TWO kinds. `deny` = the owner could say yes (merging, pushing, a comment in his name, an
 # email, a post to his Slack): from a member-facing session it also ASKS him, in that member's channel and by
-# DM. `never` = no yes exists for this tier (landing, dispatching a worker, host changes, the box's secrets,
-# writing outside the session's own tree): the member is still told, and the owner is not woken for it.
+# DM. `never` = no yes exists for this tier (landing, dispatching a worker, host changes, the box's secrets): the
+# member is still told, and the owner is not woken for it. Writing outside the session's own tree is `never` too,
+# but QUIET: the session aimed that write itself and reads the reason on stderr; the channel hears nothing of it.
 # Either gated tier also kills only its own descendants — never a session, a loop runner, or anything it
 # did not start (a member workspace's own workers run at role=member, so `worker` alone would miss them).
 # EVERY gated role, worker included: no container runtime (this user is in group `docker`, which is root-equivalent)
@@ -42,7 +43,12 @@ if [ "${1:-}" = selfcheck ]; then
   # stub) and a worker running the gates exports CC_ROLE, and both reached the child through `env` below.
   unset CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_ROLE CC_HANDOFF CC_HANDOFF_DIR CC_GUARD_ASKS CC_GUARD_ASK_TTL CC_GUARD_ROOT_PID
   T=$(mktemp -d); H=$T/home; WT=$H/.cc/worktrees/demo/t1; n=0; f=0; pids=""
-  trap '[ -n "$pids" ] && { kill $pids 2>/dev/null; sleep 0.2; kill -9 $pids 2>/dev/null; }; rm -rf "$T"' EXIT
+  # A SECOND FIXTURE HOME, AND THE POINT OF IT IS THAT IT IS NOT UNDER /tmp: the write-path rules wave /tmp
+  # through as scratch, so a fixture there cannot test them at all — every path in $T is already allowed.
+  # $HOME, because it is the one dir outside /tmp that exists in every place this runs; it goes with $T below.
+  # Empty = case 12 FAILS rather than testing nothing: a fixture under /tmp would go green having gated nothing.
+  T2=$(mktemp -d "$HOME/.cc-guard-selfcheck.XXXXXX" 2>/dev/null) || T2=""
+  trap '[ -n "$pids" ] && { kill $pids 2>/dev/null; sleep 0.2; kill -9 $pids 2>/dev/null; }; rm -rf "$T" ${T2:+"$T2"}' EXIT
   mkdir -p "$H/bin" "$H/.cc" "$H/dev/alice/.cc" "$H/dev/_cctest1/.cc" "$WT/.cc"
   : > "$H/dev/alice/.cc/member-facing"; : > "$H/dev/_cctest1/.cc/member-facing"; : > "$WT/.cc/track"
   # The owner's two real doors, stubbed: a case can then say "this was sent" and "nothing was".
@@ -61,7 +67,7 @@ if [ "${1:-}" = selfcheck ]; then
     # rc 99 is neither 0 nor 2, so it fails whichever side the case is asserting.
     jq -e . >/dev/null 2>&1 <<<"$pl" || { echo 99; return; }
     printf '%s' "$pl" \
-      | env HOME="$H" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$@" "$0" >/dev/null 2>"${GERR:-/dev/null}"; echo $?; }
+      | env HOME="${GH:-$H}" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$@" "$0" >/dev/null 2>"${GERR:-/dev/null}"; echo $?; }
 
   # 1. A DENY WITH NO YES IN IT DOES NOT PAGE. The landing tool from a member-facing session: refused, the
   #    member told in their own channel, and the owner left asleep (00:03Z, the DM that started this).
@@ -419,6 +425,47 @@ W11B
   if [ "$mbash" = 2 ] && [ "$obash" = 2 ] && [ "$mread" = 2 ] && [ "$morig" = 2 ] && [ "$wcopy" = 0 ] && [ "$worig" = 0 ]; then r=0; else r=1; fi
   ok "the sealed-session settings copy under ~/.cc/sandbox is the same secret as ~/.claude/settings.json — refused to a member through Bash and the file tools alike, and left at the tier of its own source for a worker, which is not refused either one" $r
 
+  # 12. A SESSION'S OWN NOTES ARE NOT SOMEBODY ELSE'S TREE. Claude saves them under ~/.claude/projects/<slug of
+  #     the project root>/memory and both sandboxes bind that dir rw, but the write-path rule refused every one
+  #     of them — and from a member-facing session each refusal went out as a 🔐 line: three files in one call,
+  #     six posts in a member's channel (2026-09-04). Own notes are written, another project's are still refused,
+  #     and none of that reaches the channel because the member asked for none of it. What the member DID ask for
+  #     still does — the last two assertions, which are the half of this that must not move.
+  ASKS=$T/asks12; CALLS=$T/calls12; : > "$CALLS"
+  if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: these rules wave /tmp through, so nothing here would be gated"
+  else
+    H2=$T2/home; WT2=$H2/.cc/worktrees/demo/t1   # $GH hands g this home; $H is under /tmp and every path in it is scratch
+    mkdir -p "$H2/bin" "$H2/dev/alice/.cc" "$WT2/.cc"; : > "$H2/dev/alice/.cc/member-facing"; : > "$WT2/.cc/track"
+    cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H2/bin/"
+    amem=$H2/.claude/projects/$(printf '%s' "$H2/dev/alice" | tr '/.' '--')/memory
+    wmem=$H2/.claude/projects/$(printf '%s' "$H2/dev/demo" | tr '/.' '--')/memory
+    mown=$(GH=$H2 g Write "{\"file_path\":\"$amem/MEMORY.md\"}" "$H2/dev/alice")
+    mother=$(GH=$H2 g Write "{\"file_path\":\"$H2/.claude/projects/-home-someone-else/memory/MEMORY.md\"}" "$H2/dev/alice")
+    mout=$(GH=$H2 g Edit "{\"file_path\":\"$H2/dev/alice-other/x.md\"}" "$H2/dev/alice")
+    wown=$(GH=$H2 g Write "{\"file_path\":\"$wmem/MEMORY.md\"}" "$WT2" CC_ROLE=worker)
+    quiet12=$([ -s "$CALLS" ] && echo dirty || echo clean)   # not one of the four may say anything in a channel
+    rc=$(GH=$H2 g Bash '{"command":"cc-land 7"}' "$H2/dev/alice")
+    if [ "$mown" = 0 ] && [ "$mother" = 2 ] && [ "$mout" = 2 ] && [ "$wown" = 0 ] \
+       && [ "$quiet12" = clean ] && [ "$rc" = 2 ] && [ "$(grep -c '^slack' "$CALLS")" = 1 ]; then r=0; else r=1; fi
+  fi
+  ok "a member and a worker write their own auto-memory notes, are still refused another project's notes and anything else outside their tree, and none of those refusals reaches the member's channel — while what the member asked for still does" $r
+
+  # 13. THE SAME REFUSAL ABOUT A DIFFERENT PATH IS ONE ASK. The channel note was keyed on the whole reason and
+  #     every reason names what it refused, so a session working through a list asked once per file.
+  ASKS=$T/asks13; CALLS=$T/calls13; : > "$CALLS"
+  s1=$(g Read "{\"file_path\":\"$H/.cc/config\"}" "$H/dev/alice")
+  s2=$(g Read "{\"file_path\":\"$H/.ssh/id_ed25519\"}" "$H/dev/alice")
+  if [ "$s1" = 2 ] && [ "$s2" = 2 ] && [ "$(grep -c '^slack' "$CALLS")" = 1 ]; then r=0; else r=1; fi
+  ok "two paths refused by the same rule ask the member's channel once, not once each" $r
+
+  # 14. DIFFERENT REFUSALS ARE DIFFERENT ASKS, parentheses or not: only a PATH in parentheses leaves the key. Landing
+  #     and dispatching both carry a parenthetical, and neither is a path.
+  ASKS=$T/asks14; CALLS=$T/calls14; : > "$CALLS"
+  s1=$(g Bash '{"command":"cc-land 7"}' "$H/dev/alice")
+  s2=$(g Bash '{"command":"cc alice t9 --go"}' "$H/dev/alice")
+  if [ "$s1" = 2 ] && [ "$s2" = 2 ] && [ "$(grep -c '^slack' "$CALLS")" = 2 ]; then r=0; else r=1; fi
+  ok "two different refusals, each with a parenthetical, are two asks — only a path in parentheses leaves the key" $r
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -673,7 +720,9 @@ in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && ca
 # when the answer could be yes: merging, pushing, a comment in his name, an email, a post to his Slack. Landing,
 # dispatching a worker and host changes are never that session's to run at all, whoever says so — the member is
 # still told in their own channel (a refusal must not be silent, which is the other half of this gate), but the
-# owner is not asked a question that has no yes in it. `deny` pages; `never` does not.
+# owner is not asked a question that has no yes in it. `deny` pages; `never` does not — and `never` with a second
+# arg posts nothing at all: a write the session aimed outside its own tree is its own to fix from the stderr line,
+# not news for the channel (three note files, six 🔐 lines, 2026-09-04).
 ASKS="${CC_GUARD_ASKS:-$HOME/.cc/guard-asks}"; ASK_TTL="${CC_GUARD_ASK_TTL:-1800}"
 # A FIXTURE CAN NEVER PAGE. The same rule as cc-handoff's alert(), here for the same reason: the two calls below
 # are the box's real Slack and the owner's real DM, and a suite's payload reaches them through this function like
@@ -696,7 +745,11 @@ ask_owner(){
     c=$(jq -r --arg t "$chan" '.[$t].chan // empty' "$HOME/.cc/slack/provisioned.json" 2>/dev/null) || c=""
     [ -n "$c" ] && chan=$c
   fi
-  now=$(date +%s); key=$(printf '%s\n%s' "${chan:-nochan}" "$why" | cksum | tr -cd '0-9')
+  # THE KEY DROPS A PATH IN PARENTHESES — only that. Every write-path reason names what it refused as "(/…)" or
+  # "(~/…)", so keying on the whole reason made one rule a new ask per file, and a session working through a list
+  # asked once each (2026-09-04). Any other parenthetical is part of the reason: "does not dispatch workers
+  # (cc --go)" and "(cc-loop)" are two refusals, not one (review of #222). The stderr line keeps the path.
+  now=$(date +%s); key=$(printf '%s\n%s' "${chan:-nochan}" "$(sed -E 's# \([~/][^)]*\)##g' <<<"$why")" | cksum | tr -cd '0-9')
   mkdir -p "$ASKS" 2>/dev/null || return 0
   f="$ASKS/$key"
   if [ -f "$f" ]; then
@@ -720,7 +773,10 @@ ask_owner(){
 }
 deny(){ [ "$role" = member ] && ask_owner "$1" 1; echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
 # "never for this tier": the owner could not approve it FOR this session even if he were asked, so nothing pages.
-never(){ [ "$role" = member ] && ask_owner "$1" ""; echo "cc-guard: blocked — $1. This is not this session's to run and not the owner's to approve for it — nobody is being asked, so do not wait on an answer." >&2; exit 2; }
+# A SECOND ARG = the channel is not told. The member asked for an outcome, not for a path: a refusal the session
+# brought on itself by choosing where to write is its own to fix from the stderr line, and three note files
+# refused in one call put six 🔐 lines in a member's channel (2026-09-04). What the member asked for still posts.
+never(){ [ "$role" = member ] && [ -z "${2-}" ] && ask_owner "$1" ""; echo "cc-guard: blocked — $1. This is not this session's to run and not the owner's to approve for it — nobody is being asked, so do not wait on an answer." >&2; exit 2; }
 denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
 ws_dispatch_ok(){   # EVERY dispatch in $1 names workspace $2 as its repo — and there is at least one to name.
   # `cc <ws> <track> --go` is a workspace's ONLY dispatch form: it is where the daily cap is charged (cc: member_gate).
@@ -1076,14 +1132,23 @@ case "$tool" in
     fp=$(realpath -m -- "${fp:-/}" 2>/dev/null || echo "$fp")   # ../ AND a symlink resolve before the match: ~/bin/x IS ~/dev/<repo>/core/bin/x, and so is a symlink farm in /tmp
     if ! in_root "$fp"; then case "$fp" in    # inside the worktree (rule 5: the marker root, not the cwd) / the member's own dir: fine
       /tmp/*) ;;                                   # scratch: fine
+      "$HOME"/.claude/projects/*/memory/*)   # its own notes: claude saves them there, and both sandboxes bind that dir rw
+        # So the write was always meant to land and only this rule said no — a member-facing session was refused
+        # every note it tried to save (2026-09-04). The dir is named for the project ROOT, not the cwd, so it is
+        # matched against this session's own roots: another project's notes are still somebody else's.
+        m=${fp#"$HOME"/.claude/projects/}; m=${m%%/*}; mine=""
+        for d in "$root" "$mdir" "${trepo:+$HOME/dev/$trepo}"; do
+          [ -n "$d" ] && [ "$m" = "$(printf '%s' "$d" | tr '/.' '--')" ] && mine=1
+        done
+        [ -n "$mine" ] || never "writing another project's notes ($fp) — this session's are under ~/.claude/projects/<its own project dir>/memory" quiet;;
       "$HOME"/.cc/state/*)   # track state: this track's own; a member workspace's for the tracks that are its own
         if [ "$role" = member ]; then
           own=""; [ -n "$mws" ] && case "$fp" in "$HOME/.cc/state/$mws"|"$HOME/.cc/state/$mws"/*) own=1;; esac
-          [ -n "$own" ] || never "writing another session's state ($fp) — a task.md there is work the box would run"
+          [ -n "$own" ] || never "writing another session's state ($fp) — a task.md there is work the box would run" quiet
         elif [ -n "$trepo" ]; then case "$fp" in "$HOME/.cc/state/$trepo/$ttrack"|"$HOME/.cc/state/$trepo/$ttrack"/*) ;;
-          *) never "writing another track's state ($fp) — this track's is ~/.cc/state/$trepo/$ttrack";; esac
+          *) never "writing another track's state ($fp) — this track's is ~/.cc/state/$trepo/$ttrack" quiet;; esac
         fi;;
-      *) never "editing outside this session's worktree ($fp) — a track writes its worktree, /tmp and its own ~/.cc/state dir";;
+      *) never "editing outside this session's worktree ($fp) — a track writes its worktree, /tmp and its own ~/.cc/state dir" quiet;;
     esac; fi ;;
 esac
 exit 0
