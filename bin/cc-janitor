@@ -42,6 +42,22 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      that the board watchdog reported as two worktrees of real work (2026-09-02). A name under the prefix carrying no
      pid is never touched: the pid is the only proof of death this rule accepts.
 
+NOTHING IS TAKEN OUT FROM UNDER SOMETHING STILL USING IT. Before any rule removes a directory, two generic
+tests can hold it, and a held directory is REPORTED — "spared", and what holds it — never removed:
+  · a live process whose working directory is inside it (`/proc/<pid>/cwd`, every pid this user can read: a cwd
+    is a cwd, and this knows nothing about what the process is doing there or what project it belongs to);
+  · a record pointing into it, in a file THE BOX HAS REGISTERED: CC_JANITOR_HOLDS in ~/.cc/config is whitespace-
+    separated globs of JSON files, and every absolute path anywhere inside one holds the directory it names.
+    This file registers none and never learns what a record is for — a box that serves something out of a
+    worktree registers its own. A record nobody has rewritten for 48 h — the same window a terminal track gets
+    — is a leftover like everything else here and holds nothing, so a writer that died cannot pin a worktree
+    for ever; what is genuinely still running has a process, and the first test has it.
+A hold is on the RUN, not on the one path: rule 6 leaves that suite's board row, state, clone and window
+alone too, because a live process with its bookkeeping deleted is the same accident in a smaller shape. A spare
+is a standing state, so it is on stdout every pass but in the log once a day.
+2026-09-05: a sweep took a worktree a dev server was serving out of. The server ran on with a deleted working
+directory and rebuilt its cache inside the pruned path, which the board watchdog then read as work no board knew.
+
 LIVENESS IS NOT DECIDED HERE. `cc-reconcile` already owns "what is really alive", and two definitions of that
 would drift into a tool that kills working sessions. This reads its snapshot (~/.cc/state/reconcile.json,
 refreshed first when stale) and treats `live` as final. The snapshot only covers tracks the board knows, so a
@@ -59,6 +75,7 @@ HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy: a worktree tests itself
 BOARDS, WTS, STATE, DEV = f"{HOME}/.cc/boards", f"{HOME}/.cc/worktrees", f"{HOME}/.cc/state", f"{HOME}/dev"
 LOG, SNAP = f"{STATE}/janitor.log", f"{STATE}/reconcile.json"
+SPARES = f"{STATE}/janitor-spares.json"   # {target: when its spare was last logged} — a standing spare, once a day
 STALE = 48 * 3600     # a terminal track younger than this is still being looked at — the owner reads a board, not a graveyard
 SNAP_MAX = 3600       # cc-reconcile runs every 20 min; older than this is not evidence, so we ask it for a fresh one
 PRMAX = 200           # one `gh pr list` per repo, capped: a timer job must never stall on the network
@@ -211,6 +228,80 @@ def dirty(wt):
     return p.returncode != 0 or bool(p.stdout.strip())
 
 
+def inside(d, p):
+    """`p` is `d` itself or something under it. Both are absolute and already normalised."""
+    d = d.rstrip("/")
+    return p == d or p.startswith(d + "/")
+
+
+def live_cwds():
+    """[(pid, cwd)] for every process on this box whose working directory can be read. /proc is the whole test.
+    A link that will not read — the process exited between the glob and the readlink, or it is another user's —
+    is skipped: it is not evidence either way, and this box's own work all runs as one user."""
+    out = []
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            out.append((os.path.basename(d), os.path.realpath(os.readlink(f"{d}/cwd"))))
+        except OSError:
+            continue
+    return out
+
+
+def pcomm(pid):
+    """The process's own name, for the report: `pid 3117 (node)` says more than a number does."""
+    try:
+        return open(f"/proc/{pid}/comm").read().strip() or "?"
+    except OSError:
+        return "?"
+
+
+def jstrings(v):
+    """Every string in a JSON value, however deep: a record's shape is the box's business, not this file's."""
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from jstrings(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from jstrings(x)
+
+
+def record_paths():
+    """[(target, record)] — every directory a REGISTERED record points at. CC_JANITOR_HOLDS is whitespace-
+    separated globs of JSON files; every absolute path inside one is a pointer. A record older than STALE is
+    not evidence any more, and one that is not JSON holds nothing: a hold is something a box says now."""
+    out = []
+    for pat in setting("CC_JANITOR_HOLDS").split():
+        for rec in sorted(glob.glob(os.path.expanduser(pat))):
+            try:
+                if now() - os.stat(rec).st_mtime > STALE:
+                    continue
+                d = json.load(open(rec))
+            except Exception:
+                continue
+            out += [(os.path.realpath(v), rec) for v in jstrings(d) if v.startswith("/")]
+    return out
+
+
+class Holds:
+    """What is still using a directory — the process table and the box's registered records, read once per run
+    (see the header). `on(path)` is why that path must not be removed, [] when nothing holds it."""
+
+    def __init__(self):
+        self.cwds = live_cwds()
+        self.records = record_paths()
+
+    def on(self, path):
+        d = os.path.realpath(path)
+        pids = [pid for pid, c in self.cwds if inside(d, c)]
+        why = [f"pid {pid} ({pcomm(pid)}) is working in it" for pid in pids[:2]]
+        if len(pids) > 2:               # a dev server is a dozen processes; the report names two and counts
+            why.append(f"+{len(pids) - 2} more are working in it")
+        why += [f"{rec} points into it" for tgt, rec in self.records if inside(d, tgt)]
+        return list(dict.fromkeys(why))
+
+
 def windows():
     """[(id, name)] in tmux session `main` — addressed by id, because a name with a `/` in it breaks `-t`."""
     try:
@@ -313,6 +404,7 @@ class Run:
 
     def __init__(self, dry=False):
         self.dry, self.did, self.said = dry, [], []
+        self.holds = Holds()            # one reading of /proc and of the registered records, for the whole pass
 
     def log(self, repo, verb, target, why):
         line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {repo} {verb} {target} — {why}"
@@ -349,8 +441,34 @@ class Run:
         return False
 
     def report(self, repo, target, why):
+        """A spare is a standing state, not an event: it is on stdout every pass, and in the log once a day.
+        cc-reconcile calls `--fixtures` every 20 minutes, and one held directory would otherwise write 72
+        identical lines a day into a log somebody reads to find out what happened."""
         self.said.append((target, why))
+        if why.startswith("spared") and not self.dry and not self.spare_due(target):
+            print(f"  report {target} — {why}")
+            return
         self.log(repo, "report", target, why)
+
+    def spare_due(self, target):
+        """True when this target's spare has not been logged for a day — and records that it now has. A target
+        nobody has spared for a week is forgotten, so the file stays the size of what is actually held."""
+        try:
+            seen = json.load(open(SPARES))
+        except Exception:
+            seen = {}
+        if now() - float(seen.get(target, 0) or 0) < 86400:
+            return False
+        seen[target] = now()
+        seen = {k: v for k, v in seen.items() if now() - float(v or 0) < 7 * 86400}
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(f"{SPARES}.tmp", "w") as f:
+                json.dump(seen, f)
+            os.replace(f"{SPARES}.tmp", SPARES)
+        except OSError:
+            pass                                        # a note nobody could write must not stop the sweep
+        return True
 
 
 def paused(target):
@@ -397,6 +515,10 @@ def sweep(repo, r, net=True, stale=STALE):
             wid = next((w for w, n in windows() if n == f"{repo}/{track}"), "")
             if wid and not pane_bare(wid):
                 verdict, why = "report", "would rm — held: its window is running something"
+        if verdict == "rm":
+            spared = r.holds.on(wt)     # `cc rm` takes the worktree with the row: not while somebody is in it
+            if spared:
+                verdict, why = "report", f"spared {wt}: " + "; ".join(spared)
         if verdict == "rm":
             r.act(repo, "rm", f"{repo}/{track}", why, [f"{BIN}/cc", "rm", repo, track])
         elif verdict == "report":
@@ -516,14 +638,27 @@ def sweep_fixtures(r):
     if not dead:
         return
     print(f"cc-janitor selftest fixtures{' (dry run)' if r.dry else ''}")
+    swept = []
     for pid in dead:
         why = f"left by selftest run {pid}, which is gone"
+        # The pid says WHOSE a fixture is, not whether anything is still in it. One held path holds the whole
+        # run: taking the board row, the state dir and the clone out from under a live process is the same
+        # accident as taking its worktree, and killing its window would kill what this just spared.
+        spared = {}
+        for p in sorted(found[pid]):
+            for s in r.holds.on(p):
+                spared.setdefault(s, p)
+        if spared:
+            r.report("selftest", f"selftest run {pid}",
+                     "spared " + ", ".join(sorted(set(spared.values()))) + ": " + "; ".join(spared))
+            continue
+        swept.append(pid)
         for p in sorted(found[pid]):
             r.act("selftest", "rm", p, why, ["rm", "-rf", "--", p])
         for wid, name, wpid in wins:
             if wpid == pid:
                 r.act("selftest", "kill window", f"{name} ({wid})", why, ["tmux", "kill-window", "-t", wid])
-    keep = [ln for ln in lines if line_pid(ln) not in dead]
+    keep = [ln for ln in lines if line_pid(ln) not in swept]
     if len(keep) < len(lines):
         why = f"{len(lines) - len(keep)} lines of selftest runs that are gone"
         if not r.dry:
@@ -682,6 +817,11 @@ def selfcheck():
     ok("docker's FinishedAt reads, nanoseconds and all — and nonsense reads as None, never as 0",
        stopped_at("2026-08-30T01:44:43.257081924Z") == epoch("2026-08-30T01:44:43Z") and stopped_at("not-a-time") is None)
 
+    # the hold — what counts as being inside the directory a rule is about to remove
+    ok("a directory is held by its own path and by anything under it, and by nothing beside it",
+       inside("/a/b", "/a/b") and inside("/a/b", "/a/b/c/d") and inside("/a/b/", "/a/b/c")
+       and not inside("/a/b", "/a/bb") and not inside("/a/b", "/a") and not inside("/a/b", "/x/a/b"))
+
     # end to end: a fake box of its own — board, worktrees, origin, tmux and gh all stubbed
     with tempfile.TemporaryDirectory() as th:
         repo = "sampleproj"
@@ -690,6 +830,7 @@ def selfcheck():
         os.makedirs(f"{th}/.cc/state", exist_ok=True)
         env = dict(os.environ, HOME=th, PATH=f"{fake}:{os.environ.get('PATH', '')}",
                    CC_FAKE_TMUX=f"{th}/tmux.txt", CC_FAKE_GH=f"{th}/gh.json", CC_FAKE_DOCKER=f"{th}/docker.txt",
+                   CC_JANITOR_HOLDS="~/.cc/state/records/*.json",
                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
         for name, body in (("tmux", FAKE_TMUX), ("gh", FAKE_GH), ("docker", FAKE_DOCKER)):
             open(f"{fake}/{name}", "w").write(body)
@@ -713,7 +854,8 @@ def selfcheck():
             return subprocess.run([f"{BIN}/cc-board", *a], env=env, capture_output=True, text=True, timeout=60)
 
         cb("init", repo, dev, "main")
-        for track, st in (("gone", "merged"), ("dirtyone", "merged"), ("young", "merged"), ("busy", "running")):
+        for track, st in (("gone", "merged"), ("dirtyone", "merged"), ("young", "merged"), ("busy", "running"),
+                          ("served", "merged"), ("listed", "merged"), ("staleref", "merged")):
             cb("add", repo, track, track, "")
             cb("status", repo, track, st)
             os.makedirs(f"{wts}/{track}", exist_ok=True)
@@ -725,7 +867,8 @@ def selfcheck():
         d = board_read(bj)
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5 * 86400))
         for e in d["log"]:
-            if e.get("track") in ("gone", "dirtyone") and str(e.get("msg", "")).startswith("status -> "):
+            if e.get("track") in ("gone", "dirtyone", "served", "listed", "staleref") \
+                    and str(e.get("msg", "")).startswith("status -> "):
                 e["ts"] = old
         json.dump(d, open(bj, "w"), indent=2)
         # A PIPE PLANTED WHERE A BOARD SHOULD BE (review of #224): the read is cc-board's opener now, so it is no board, never a hang
@@ -744,15 +887,25 @@ def selfcheck():
            bounded(lambda: board("pipe")) is None and board(repo) is not None)
         os.remove(f"{BOARDS}/pipe.json"); BOARDS = _b
 
+        # what a box registers as "something of mine is in there": JSON with a path in it. One fresh, one
+        # nobody has rewritten in days (which is not evidence), one that is not JSON at all (which is none either)
+        recs = f"{th}/.cc/state/records"
+        os.makedirs(recs, exist_ok=True)
+        json.dump({"name": "one", "dir": f"{wts}/listed", "port": 1}, open(f"{recs}/one.json", "w"))
+        json.dump({"name": "old", "dir": f"{wts}/staleref"}, open(f"{recs}/old.json", "w"))
+        os.utime(f"{recs}/old.json", (now() - 5 * 86400,) * 2)
+        open(f"{recs}/broken.json", "w").write("{not json")
+
         # two panes: one with a child (live) and one without (bare) — the same fact `cc` reads off a real pane
         # Groups of their own, with no handle on this process's stdout: a stray `sleep` holding the pipe open
         # keeps a `… | tail` waiting for it, which is two silent minutes at the end of the suite.
-        def fixture(*cmd):
+        def fixture(*cmd, **kw):
             return subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
 
         live = fixture("bash", "-c", "sleep 120; true")  # `; true`, or bash execs sleep in its own place and has no child
         bare = fixture("sleep", "120")
+        served = fixture("sleep", "300", cwd=f"{wts}/served")   # …and one standing in a worktree, as a dev server does
         time.sleep(0.4)                                 # the live pane's shell needs its child to exist first
         tmuxf = f"{th}/tmux.txt"
 
@@ -795,7 +948,8 @@ def selfcheck():
            (sorted(board_read(bj)["tracks"]), sorted(wins()),
             sh("git", "-C", dev, "ls-remote", "--heads", "origin").stdout) == before)
         ok("--dry writes no log either, nor anyone else's file — it refreshes no snapshot to get its answer",
-           not os.path.exists(f"{th}/.cc/state/janitor.log") and not os.path.exists(f"{th}/.cc/state/reconcile.json"))
+           not os.path.exists(f"{th}/.cc/state/janitor.log") and not os.path.exists(f"{th}/.cc/state/reconcile.json")
+           and not os.path.exists(f"{th}/.cc/state/janitor-spares.json"))
         ok("…and says so, rather than let a preview look surer about what is alive than the real pass is",
            "snapshot is stale" in rd.stdout)
         ok("--dry previews the container sweep too, and removes none",
@@ -821,6 +975,14 @@ def selfcheck():
         ok("end to end: …and is reported so somebody deals with it", "uncommitted" in r1.stdout)
         ok("end to end: a track merged minutes ago is still there", "young" in b2)
         ok("end to end: rule 4 — the running track is untouched", "busy" in b2)
+        ok("end to end: A WORKTREE A LIVE PROCESS IS WORKING IN SURVIVES — and the sweep says it spared it, and what held it",
+           "served" in b2 and os.path.isdir(f"{wts}/served")
+           and f"spared {wts}/served" in r1.stdout and "is working in it" in r1.stdout)
+        ok("end to end: …and so does one a registered record points into, named by the record that holds it",
+           "listed" in b2 and os.path.isdir(f"{wts}/listed") and f"{recs}/one.json points into it" in r1.stdout)
+        ok("end to end: …but a record nobody has rewritten in days holds nothing, and one that is not JSON is not an "
+           "obstacle either — a worktree with neither goes, exactly as before",
+           "staleref" not in b2 and not os.path.isdir(f"{wts}/staleref"))
         remote = sh("git", "-C", dev, "ls-remote", "--heads", "origin").stdout
         ok("end to end: the merged PR's branch is gone from origin", "refs/heads/track/gone" not in remote)
         ok("end to end: the open PR's branch is still there, and reported",
@@ -854,6 +1016,19 @@ def selfcheck():
            r2.returncode == 0 and "rm sampleproj" not in r2.stdout and "rm container" not in r2.stdout)
         ok("end to end: …and it did not come back for the branch it already deleted",
            "delete origin/track/gone" not in r2.stdout)
+
+        setwins()
+        r3 = subprocess.run([sys.executable, os.path.realpath(__file__), repo],
+                            env={k: v for k, v in env.items() if k != "CC_JANITOR_HOLDS"},
+                            capture_output=True, text=True, timeout=300)
+        b3 = json.load(open(bj))["tracks"]
+        ok("end to end: THE HOLD IS THE REGISTRATION — with the record no longer registered its worktree goes on the "
+           "next pass, while the one with a live process in it is spared again",
+           "listed" not in b3 and not os.path.isdir(f"{wts}/listed")
+           and "served" in b3 and f"spared {wts}/served" in r3.stdout)
+        ok("end to end: …and three passes over the same held worktree put ONE line in the log — a spare is a "
+           "standing state, and the log is what happened",
+           open(f"{th}/.cc/state/janitor.log").read().count(f"spared {wts}/served") == 1)
 
         # a repo with NO origin at all. It is reported — unless it is a member workspace, which has none by design
         # (docs/design-member-workspaces.md) and was reported for it on every Sunday run.
@@ -943,11 +1118,41 @@ def selfcheck():
            and not os.path.exists(f"{th}/dev/_ccsbx{deadp}")
            and os.path.isdir(f"{th}/.cc/worktrees/_ccsbx{livep}/u") and os.path.isdir(f"{th}/dev/_ccsbx{livep}")
            and os.path.exists(f"{th}/.cc/boards/_cclive.lock"))
+        # …AND THE PID SAYS WHOSE A FIXTURE IS, NOT WHETHER SOMETHING IS STANDING IN IT — and a hold is on the
+        # RUN, not on the one path it landed on. A suite that is gone left all of this and a process is working
+        # in one of its worktrees: not one path goes, nor its window, nor its ledger line. Sparing the worktree
+        # while the board row, the state dir and the clone went would leave a live process with its bookkeeping
+        # deleted, which is the accident this hold exists to stop, and killing the window would kill what the
+        # same pass just spared. 99999998 is above any pid this kernel hands out, so it never lives.
+        heldp, hfx = 99999998, "_cctest99999998"
+        for d_ in (f"{th}/.cc/worktrees/{hfx}/w1", f"{th}/.cc/state/{hfx}/w1", f"{th}/dev/{hfx}",
+                   f"{th}/.cc/selftest-{heldp}"):
+            os.makedirs(d_, exist_ok=True)
+        cb("init", hfx, f"{th}/dev/{hfx}", "main")
+        open(f"{th}/.cc/state/land/{hfx}.applied", "w").write("{}\n")
+        open(f"{th}/tmux.txt", "a").write(f"@98\t{hfx}/w1\t1\n")
+        open(f"{th}/.cc/state/context/handoff.log", "a").write(f"cc-handoff: {hfx}/hx — held\n")
+        sitter = fixture("sleep", "120", cwd=f"{th}/.cc/worktrees/{hfx}/w1")
+        rh = subprocess.run([sys.executable, os.path.realpath(__file__), "--fixtures"], env=env,
+                            capture_output=True, text=True, timeout=60)
+        ok("A DEAD SUITE'S RUN IS SPARED WHOLE while a process is working in one of its worktrees — board, lock, "
+           "state, clone, scratch dir, ledger entry, tmux window and handoff line all stay — and the pass names it",
+           len(left(heldp)) == 7 and f"{hfx}/w1" in open(f"{th}/tmux.txt").read()
+           and f"{hfx}/hx" in open(f"{th}/.cc/state/context/handoff.log").read()
+           and f"pid {sitter.pid}" in rh.stdout and f"spared {th}/.cc/worktrees/{hfx}" in rh.stdout)
+        os.killpg(os.getpgid(sitter.pid), signal.SIGKILL)
+        sitter.wait(timeout=10)
+        rh2 = subprocess.run([sys.executable, os.path.realpath(__file__), "--fixtures"], env=env,
+                             capture_output=True, text=True, timeout=60)
+        ok("…and the whole run goes on the first pass after that process does, window and ledger line with it",
+           rh2.returncode == 0 and left(heldp) == [] and f"{hfx}/w1" not in open(f"{th}/tmux.txt").read()
+           and f"{hfx}/hx" not in open(f"{th}/.cc/state/context/handoff.log").read())
+
         shutil.rmtree(f"{th}/.cc/worktrees/_ccsbx{livep}", ignore_errors=True)
         shutil.rmtree(f"{th}/dev/_ccsbx{livep}", ignore_errors=True)
         os.remove(f"{th}/.cc/boards/_cclive.lock")
 
-        for proc in (live, bare):                       # the group, so the `sleep` under the live shell goes too
+        for proc in (live, bare, served):               # the group, so the `sleep` under the live shell goes too
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except OSError:
