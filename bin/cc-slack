@@ -1754,12 +1754,18 @@ HOME_AGENT_QUIET = 300                         # a transcript written this recen
 HOME_AGENT_TAIL = 65536                        # bytes of the END of a transcript read to find that last record — with
                                                # HOME_AGENT_HEAD, the whole of what this file ever looks at.
 HOME_AGENT_HEAD = 4096                         # bytes of a subagent transcript this file looks at — its first record,
-                                               # which is the prompt. The rest of an agent's transcript is its own.
-HOME_AGENT_LINE = 64                           # …and how much of that prompt a row prints. The one row on the tab that
-                                               # carries a SENTENCE rather than a name, so it is the one that runs past
-                                               # HOME_LINE: at 40 characters four of these agents print the same row
-                                               # ("Fix a review's findings on PR #…"), which is a band that says work
-                                               # is happening without saying which.
+                                               # which is the prompt. The rest of an agent's transcript is its own, and
+                                               # this is only the FALLBACK name: what a row prints comes off the
+                                               # session's launch record (home_agent_names) when there is one.
+HOME_AGENT_SPAWN = 8 * 1024 * 1024             # bytes of the END of a SESSION's own transcript read for those launch
+                                               # records. A session that has run for days writes tens of megabytes;
+                                               # a spawn older than this tail belongs to an agent long gone, and one
+                                               # we miss falls back to the prompt rather than printing nothing.
+HOME_AGENT_LINE = 64                           # …and how much of that name a row prints. The one row on the tab that
+                                               # can carry a SENTENCE rather than a name, so it is the one that runs
+                                               # past HOME_LINE: at 40 characters four agents falling back to the
+                                               # prompt print the same row ("You are a builder for the …"), which is a
+                                               # band that says work is happening without saying which.
 HOME_LANDQ = f"{HOME}/.cc/state/land"          # cc-land's queue: one job file per PR, and the only place a landing in
                                                # flight is written down. cc-land owns every file in there; this reads.
 HOME_LIST, HOME_SLICE = 2400, 12               # RUNNING, BACKLOG, NEEDS YOU and CHANNELS print EVERY row (owner,
@@ -2386,9 +2392,13 @@ def home_parts(st):
                                                lambda k: f"_+{k} more sub-orchs_")))]
     if agents:
         p += [("subagents", _home_ctx(f"SUBAGENTS · {len(agents)}")),
-              # what it was ASKED, in one line — a count alone tells the owner only that they have to go and look
-              ("subagents", _home_sec(home_list([f"🧠 {home_clip(a.get('task'), HOME_AGENT_LINE) or home_short(a.get('id'))}"
-                                                 for a in agents], lambda k: f"_+{k} more subagents_")))]
+              # the NAME its parent gave it, then the PR or row its prompt names. A count alone tells the owner only
+              # that they have to go and look, and the prompt's opening words told him no more than that: four rows
+              # read "You are a builder for the …" (owner, 2026-09-05, thread 1788579638)
+              ("subagents", _home_sec(home_list(
+                  [home_fit(f"🧠 {home_clip(a.get('task'), HOME_AGENT_LINE) or home_short(a.get('id'))}",
+                            [a.get("mark")], HOME_AGENT_LINE) for a in agents],
+                  lambda k: f"_+{k} more subagents_")))]
     if lands:
         p += [("landings", _home_ctx(f"LANDING · {len(lands)}")),
               # a job with no PR is cc-land's catch-up deploy (`<repo>-deploy.json`, "pr": null) — the one landing
@@ -2875,6 +2885,73 @@ def home_agent_task(path, n=HOME_AGENT_LINE):
     return home_clip(first[0], n) if first else ""       # …on a word boundary, like every other clipped row
 
 
+def home_session_file(link, sid):
+    """A session's OWN transcript, from one of its subagents' `.output` links. A subagent's transcript is written
+    somewhere inside the session's directory (`…/<project>/<session>/subagents/agent-<id>.jsonl` here), and the
+    session's transcript is that directory with `.jsonl` after it. Walk up to the directory NAMED for the session
+    rather than counting levels, so nesting the agents one deeper still resolves."""
+    d = os.path.dirname(os.path.realpath(link))
+    for _ in range(4):
+        if os.path.basename(d) == str(sid):
+            return d + ".jsonl"
+        d, up = os.path.dirname(d), d
+        if d == up:
+            break
+    return ""
+
+
+def home_agent_names(path, cap=HOME_AGENT_SPAWN):
+    """{agent id: (what the session CALLED it, what it asked it)} — read off the SESSION's transcript, not the
+    agents'. A session records every agent it spawns as one launch record carrying the agent's id, the 3-5 word
+    `description` its parent wrote beside the prompt ("Fix PR 243 review findings"), and the prompt itself.
+
+    THIS IS WHERE THE NAME IS. An agent's own transcript opens with the prompt and nothing else, so a band built off
+    that printed four rows all reading "You are a builder for the …" — work happening, and no way to tell whose
+    (owner, 2026-09-05, thread 1788579638). The description is written once, at spawn, and is never anywhere else.
+
+    Only the last `cap` bytes are read and only lines carrying an id are parsed: these transcripts run to tens of
+    megabytes, and an agent this misses falls back to its prompt rather than to nothing."""
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - cap))
+            if size > cap:
+                f.readline()                   # the seek landed mid-record: that record is in the part we dropped
+            for raw in f:
+                if b'"agentId"' not in raw:
+                    continue
+                try:
+                    r = (json.loads(raw.decode("utf-8", "replace")) or {}).get("toolUseResult")
+                except Exception:
+                    continue                   # a record caught mid-write names nobody
+                if isinstance(r, dict) and r.get("agentId"):
+                    out[str(r["agentId"])] = (str(r.get("description") or ""), str(r.get("prompt") or ""))
+    except OSError:
+        pass                                   # no transcript (a session started outside this harness): no names
+    return out
+
+
+def home_agent_mark(prompt, said, n=HOME_SHORT):
+    """The PR or board row a subagent's prompt names — `#243`, or `landing-is-fast` — and "" when `said`, the name
+    the row already prints, says it. Half the names carry their own work ("Merge main into PR 247") and repeating it
+    costs the width the ones that don't ("Review the publish-fetch lock diff") need. When neither is said the PR
+    wins: it is shorter, and it is the thing the owner opens.
+
+    `PR #n`, not any `#n`: a brief quotes the commit it branched from (`557a204 (#241)`) as often as it names its
+    own PR, and a row that points at the wrong PR is worse than one that points at none."""
+    prompt, said = str(prompt or ""), str(said or "")
+    pr = re.search(r"\bPRs?\s+#?(\d{1,6})\b", prompt, re.I)
+    row = (re.search(r"\.cc/state/[^/\s]+/([A-Za-z0-9][\w.-]*)/", prompt)
+           or re.search(r"\b(?:planning|track)/([A-Za-z0-9][\w.-]*)", prompt))
+    if row and re.search(r"\b%s\b" % re.escape(row.group(1)), said, re.I):
+        return ""                              # the name IS the row; the PR its brief happens to quote is not its own
+    if pr and re.search(r"\b%s\b" % pr.group(1), said):
+        return ""
+    return f"#{pr.group(1)}" if pr else home_short(row.group(1), n) if row else ""
+
+
 def home_session_live(sid):
     """Is the session that owns a tasks directory still up? The directory name IS the session id, and every session
     this box starts carries that id on its own command line — `cc` passes `--session-id` on a first run and `--resume`
@@ -2917,7 +2994,8 @@ def home_agent_done(path, tail=HOME_AGENT_TAIL):
 
 
 def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None):
-    """[{"id", "task"}] — the subagents a session has out RIGHT NOW, busiest first.
+    """[{"id", "task", "mark"}] — the subagents a session has out RIGHT NOW, busiest first, each under the name its
+    parent gave it (home_agent_names) and the PR or board row its prompt names (home_agent_mark).
 
     WHAT IS READ: `<root>/<project>/<session>/tasks/<id>.output`, the harness's one file per task. A `.output` that is
     a SYMLINK points at a subagent's own transcript; a plain file beside it is a background Bash command or a Monitor
@@ -2950,6 +3028,7 @@ def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None):
             asked[sid] = bool(live(sid))
         if not asked[sid]:
             continue                           # the session is gone; what it left behind is not work in flight
+        named = home_agent_names(home_session_file(agents[0], sid))    # one pass over the session's transcript, not one per agent
         for f in agents:
             try:
                 m = os.stat(f).st_mtime        # THROUGH the link: the link itself is written once and never again
@@ -2957,7 +3036,10 @@ def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None):
                 continue                       # dangling: a transcript that is gone is nobody's work
             if now - m >= quiet and home_agent_done(f):
                 continue
-            out.append((m, {"id": os.path.basename(f)[:-len(".output")], "task": home_agent_task(f)}))
+            aid = os.path.basename(f)[:-len(".output")]
+            desc, prompt = named.get(aid, ("", ""))
+            task = home_clip(desc, HOME_AGENT_LINE) or home_agent_task(f)     # its name, or the prompt when it has none
+            out.append((m, {"id": aid, "task": task, "mark": home_agent_mark(prompt or task, task)}))
     return [a for _, a in sorted(out, key=lambda x: -x[0])]
 
 
@@ -9736,17 +9818,17 @@ def cmd_selfcheck():
     #    rows, four landings in their gates and two orch sessions open, because RUNNING meant "a board row with a
     #    worker on it" and nothing else.
     hall = dict(hfix, suborchs=[{"repo": "abox", "alias": "helper"}, {"repo": "sandbox", "alias": "rugs"}],
-                subagents=[{"id": "a1f2", "task": "build the four rows for the Home tab"},
+                subagents=[{"id": "a1f2", "task": "Build the four Home rows", "mark": "#226"},
                            {"id": "b9c0", "task": ""}],
                 landings=[{"repo": "abox", "pr": "226", "stage": "gates"},
                           {"repo": "sandbox", "pr": "7", "stage": "review"}])
     tall = home_text(home_parts(hall))
     check("home_parts: the headline counts ALL FOUR kinds of work and each gets its own short band — 2 workers + 2 "
           "sub-orchs + 2 subagents + 2 landings is RUNNING 8, a sub-orch says whose repo it is, a subagent says what "
-          "it was ASKED (its id only when the prompt is unreadable) and a landing says the PR and the phase",
+          "it is CALLED and what it works on (its id only when it has neither) and a landing says the PR and the phase",
           tall["tally"].startswith("RUNNING 8 · BLOCKED 1 · QUEUED 10") and "🏃 *slack-home*" in tall["tally"]
           and tall["suborchs"] == "SUB-ORCHS · 2\n🤖 [abox] *helper*\n🤖 [sandbox] *rugs*"
-          and tall["subagents"] == "SUBAGENTS · 2\n🧠 build the four rows for the Home tab\n🧠 b9c0"
+          and tall["subagents"] == "SUBAGENTS · 2\n🧠 Build the four Home rows · #226\n🧠 b9c0"
           and tall["landings"] == "LANDING · 2\n🚚 [abox] *PR #226* · gates\n🚚 [sandbox] *PR #7* · review"
           and hbudget(home_blocks(hall)) and hno_empty_header(home_blocks(hall)) and hvocab(home_blocks(hall)))
     check("home_parts: a kind with nothing in it prints nothing, the three bands are never cut (they ARE what is "
@@ -9796,38 +9878,80 @@ def cmd_selfcheck():
                                                              "a2": ("a finished agent, file still there", hend, 4000),
                                                              "a3": (hprompt, hmid, 4000),   # silent in one long Bash call
                                                              "a4": ([{"type": "text", "text": "review PR #9"}], hend, 0),
-                                                             "a5": ([{"type": "text", "text": hprompt}], hmid, 0)})):
+                                                             "a5": ([{"type": "text", "text": hprompt}], hmid, 0),
+                                                             "a6": (hprompt, hmid, 0),      # …the two the session NAMED
+                                                             "a7": (hprompt, hmid, 0)})):
             os.makedirs(f"{hagd}/{proj}/{sid}/tasks")
-            for name, (content, last, age) in tasks.items():
-                with open(f"{hagd}/{proj}/{sid}/{name}.jsonl", "w") as fh:
+            os.makedirs(f"{hagd}/{proj}/{sid}/subagents")     # the real layout: an agent's transcript lives under the
+            for name, (content, last, age) in tasks.items():  # session's own directory, `<session>.jsonl` beside it
+                jl = f"{hagd}/{proj}/{sid}/subagents/agent-{name}.jsonl"
+                with open(jl, "w") as fh:
                     fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n")
                     fh.write(json.dumps(last) + "\n")
-                os.symlink(f"{hagd}/{proj}/{sid}/{name}.jsonl", f"{hagd}/{proj}/{sid}/tasks/{name}.output")
+                os.symlink(jl, f"{hagd}/{proj}/{sid}/tasks/{name}.output")
                 if age:
-                    os.utime(f"{hagd}/{proj}/{sid}/{name}.jsonl", (time.time() - age, time.time() - age))
+                    os.utime(jl, (time.time() - age, time.time() - age))
         open(f"{hagd}/-home-x-dev-abox/s2/tasks/bg1.output", "w").write("a background shell command's output")
         os.symlink(f"{hagd}/-home-x-dev-abox/s2/nothing.jsonl", f"{hagd}/-home-x-dev-abox/s2/tasks/gone.output")
+        hspawn = [("a2", "Land the gate", "PR #7 of abox"),              # finished: named here, gone from the band
+                  ("a1", "Fix PR 243 review findings",                   # the name says the PR: the row must not repeat it
+                   "PR #243 of abox (branch planning/member-refusal-is-a-query). Work only inside the worktree."),
+                  ("a6", "Land the publish-fetch lock",                  # the name says neither: the row carries the branch
+                   "Worktree on branch planning/publish-fetch-takes-the-repo-lock, HEAD 38afb89. " + hprompt),
+                  ("a7", "Read the row brief",                           # `(#241)` is the commit it branched FROM, not a PR
+                   "Row brief: ~/.cc/state/abox/home-rows-have-names/task.md, at main 557a204 (#241).")]
+        hsess = f"{hagd}/-home-x-dev-abox/s2.jsonl"
+        with open(hsess, "w") as fh:
+            for aid, desc, prompt in hspawn:
+                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "spawn it"}}) + "\n")
+                fh.write(json.dumps({"type": "user", "toolUseResult": {                    # …the launch record itself
+                    "isAsync": True, "status": "async_launched", "agentId": aid,
+                    "description": desc, "prompt": prompt}}) + "\n")
+            fh.write('{"type": "user", "toolUseResult": {"agentId": "a9", broken\n')       # caught mid-write: names nobody
         hag = home_subagents(root=hagd, live=lambda sid: sid in hlive)
+        hname = {a["id"]: (a["task"], a["mark"]) for a in hag}
+        htail = home_agent_names(hsess, cap=os.path.getsize(hsess) - len(hprompt))
         check("home_subagents: only what is LIVE — a `.output` OUTLIVES its agent, so `a2` (silent, and its last record "
               "the agent's final report) is finished and gone from the band while `a3` (just as silent, but mid-turn "
               "inside one long Bash call) is still running; a plain file beside them is a background Bash command or a "
               "Monitor, a dangling link is nobody's work, a DEAD session shows none of its agents, and a session in a "
               "TRACK WORKTREE is skipped because its board row already IS the workers section",
-              sorted(a["id"] for a in hag) == ["a1", "a3", "a4", "a5"]
+              sorted(a["id"] for a in hag) == ["a1", "a3", "a4", "a5", "a6", "a7"]
               and home_agent_done(f"{hagd}/-home-x-dev-abox/s2/tasks/a2.output")
               and not home_agent_done(f"{hagd}/-home-x-dev-abox/s2/tasks/a3.output")
               and not home_agent_done(f"{hagd}/no-such-file")
               and sorted(a["id"] for a in home_subagents(root=hagd, quiet=0, live=lambda sid: sid in hlive))
-                  == ["a1", "a3", "a5"]        # quiet=0: the last record alone decides, and a4 has reported too
+                  == ["a1", "a3", "a5", "a6", "a7"]   # quiet=0: the last record alone decides, and a4 has reported too
               and home_subagents(root=hagd, live=lambda sid: False) == []
-              and home_subagents(root=f"{hagd}/no-such-root") == []
-              and {a["id"]: a["task"] for a in hag}["a1"] == "build the rows")
-        check("home_agent_task: the FIRST LINE of what the agent was asked and NOTHING else of its transcript — out of "
-              "content blocks as well as a plain string, and out of a record LONGER than the head we may read, in "
-              "either of those two shapes",
-              {a["id"]: a["task"] for a in hag}["a4"] == "review PR #9"
-              and {a["id"]: a["task"] for a in hag}["a3"] == home_clip(hprompt, HOME_AGENT_LINE)
-              and {a["id"]: a["task"] for a in hag}["a5"] == home_clip(hprompt, HOME_AGENT_LINE)
+              and home_subagents(root=f"{hagd}/no-such-root") == [])
+        check("home_agent_names: a row is the 3-5 word name the SESSION gave the agent, off the launch record in the "
+              "session's own transcript — `a1` is `Fix PR 243 review findings`, not the prompt's opening words, which "
+              "for four builders in a row said only `You are a builder for the …` (owner, 2026-09-05)",
+              hname["a1"][0] == "Fix PR 243 review findings" and hname["a6"][0] == "Land the publish-fetch lock"
+              and home_session_file(f"{hagd}/-home-x-dev-abox/s2/tasks/a1.output", "s2") == hsess
+              and home_session_file(f"{hagd}/-home-x-dev-abox/s2/tasks/a1.output", "nope") == ""
+              and sorted(home_agent_names(hsess)) == ["a1", "a2", "a6", "a7"]      # the half-written record names nobody
+              and sorted(htail) == ["a7"]                # …and past the tail we read, a spawn is simply not there
+              and home_agent_names(f"{hagd}/no-such-file") == {})
+        check("home_agent_mark: the row adds the PR or board row the PROMPT names, and only when the name has not "
+              "said it already — `a1` names its own PR, `a6` says neither so it carries its branch, and `a7`'s "
+              "`(#241)` is the commit it branched from, so the row it points at is the one in its brief",
+              [hname[k][1] for k in ("a1", "a4", "a6", "a7")]
+              == ["", "", home_short("publish-fetch-takes-the-repo-lock"), "home-rows-have-names"]
+              and home_agent_mark("PR #12 of abox", "Fix the gate") == "#12"
+              and home_agent_mark("branch planning/x, PR #12", "Fix the gate") == "#12"      # the PR wins over the row
+              and home_agent_mark("at main 557a204 (#241)", "Fix the gate") == ""
+              # a builder's brief quotes the PR the work it extends landed in: the name already says the ROW, and
+              # printing that PR beside it sent the owner to somebody else's diff
+              and home_agent_mark("~/.cc/state/abox/tripwire-red/task.md — the band landed in PR #237",
+                                  "Build tripwire-red") == ""
+              and home_agent_mark("", "") == "")
+        check("home_agent_task: an agent the session never named falls back to the FIRST LINE of what it was asked "
+              "and NOTHING else of its transcript — out of content blocks as well as a plain string, and out of a "
+              "record LONGER than the head we may read, in either of those two shapes",
+              hname["a4"][0] == "review PR #9" and hname["a1"][0] != "build the rows"
+              and hname["a3"][0] == home_clip(hprompt, HOME_AGENT_LINE)
+              and hname["a5"][0] == home_clip(hprompt, HOME_AGENT_LINE)
               and len(home_clip(hprompt, HOME_AGENT_LINE)) <= HOME_AGENT_LINE
               and "NEVER READ" not in json.dumps(hag) and home_agent_task(f"{hagd}/no-such-file") == "")
     finally:
