@@ -2,7 +2,9 @@
 # cc-msg — the ONE deliverer of a message into a running interactive Claude session (tmux window), as if you
 # were at the keyboard.  A message handed to it is NEVER DROPPED: it is typed, or it is spooled and typed by
 # the next drain.  (2026-09-01: 12 panes sat on a model-limit prompt, and every pulse tick and secretary
-# finding aimed at them was refused and thrown away — nobody was watching, and nothing said so.)
+# finding aimed at them was refused and thrown away — nobody was watching, and nothing said so.)  …or the pane
+# it was typed at never moved, which means nothing under it is reading the keyboard: the message is kept, and a
+# TRACK window is killed and reopened with `cc <repo> <track>`, which resumes its transcript (2026-09-04).
 #   cc-msg <window> "text"      window = tmux window name in session main (e.g. myapp, myapp/step1)
 #   cc-msg --drain [<window>]   deliver what is spooled, in order, while the pane is free (cc-msg.timer, 60 s)
 #   cc-msg --ask <window> /cmd  type a bare /command at a FREE pane and print what it draws (never spooled)
@@ -26,6 +28,10 @@ DEDUP_S="${CC_MSG_DEDUP_S:-120}"             # a caller repeating ITS OWN line i
                                              # not sending twice; past it, the same words are a second message
 REPORT_TRIES="${CC_MSG_REPORT_TRIES:-3}"     # injects of one standing-dialog (or orphan) report that nobody heard
                                              # before it stops: each is a NEW message in the told session's queue
+HUNG_WAIT="${CC_MSG_HUNG_WAIT:-1}"           # a pane that has not moved YET: seconds between the re-reads that decide
+HUNG_TRIES="${CC_MSG_HUNG_TRIES:-3}"         # it never will — a live pane costs one read, only a wedged one waits
+HUNG_COOLDOWN="${CC_MSG_HUNG_COOLDOWN:-30}"  # min before one window is restarted again: a session that comes back
+                                             # wedged is not a thing to keep killing
 
 # THE DIALOG GUARD. A modal is waiting for a keypress, so the text — or the Enter after it, or a digit inside it —
 # ANSWERS it, and a tool-permission prompt answered by a script is an unattended approval of exactly what the owner
@@ -96,14 +102,20 @@ win_id(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null |
 # `bash -c '… cc __runnext …'`, so that session's claude is a GRANDCHILD — the direct-child test called it dead
 # and this script refused to type at a perfectly live session, every time, for as long as it lived.
 # `claude -p` is still refused: a headless worker prints and exits, and there is no prompt for the text to land in.
-live_claude(){   # $1 = window id
-  local pp pids pid
+claude_pids(){   # $1 = window id → every `claude` under that pane. Also WHICH session is behind a screen: a pid
+                 # that has changed is a different one, however alike the two panes read.
+  local pp
   pp=$(tmux list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -1)
-  pids=$(ps -eo pid=,ppid=,comm= | awk -v root="${pp:-0}" '
+  ps -eo pid=,ppid=,comm= | awk -v root="${pp:-0}" '
     { kids[$2] = kids[$2] " " $1; name[$1] = $3 }
     END { q[1] = root; n = 1                                   # breadth-first over the pane subtree
           for (i = 1; i <= n; i++) { m = split(kids[q[i]], c, " "); for (j = 1; j <= m; j++) q[++n] = c[j] }
-          for (i = 2; i <= n; i++) if (name[q[i]] == "claude") print q[i] }')
+          for (i = 2; i <= n; i++) if (name[q[i]] == "claude") print q[i] }'
+}
+
+live_claude(){   # $1 = window id
+  local pids pid
+  pids=$(claude_pids "$1")
   for pid in $pids; do
     [ -r "/proc/$pid/cmdline" ] || return 0                  # gone or not ours to read: treat it as the live one
     tr '\0' '\n' < "/proc/$pid/cmdline" | grep -qx -e '-p' -e '--print' || return 0
@@ -125,6 +137,10 @@ type_at(){ local text; text=$(printf '%s' "$2" | tr '\n' ' ')
 # through cc-notify: the drain used to stop at it, every tick, for ever, and nothing said so (review-157e).
 # inbox.dialog beside it is the standing-dialog stamp: "<first-seen epoch>\t<reported 0|1>\t<report attempts>\t<line>"
 # — the attempt count is why a report that reached nobody is retried (REPORT_TRIES times) but paged only once.
+# inbox.hung is the same idea for a pane that stopped taking keys: "<restarted epoch>\t<said 0|1>\t<pid>\t<screen>"
+# — the epoch holds HUNG_COOLDOWN over the next restart of that window, and the pid and the hashed screen are the
+# pane it froze on: while the same process still reads the same way the drain types nothing at it, and the first
+# read that differs (or the file's own age passing HUNG_COOLDOWN) drops the stamp.
 sdir(){ printf '%s/%s' "$STATE" "$1"; }
 lock(){ mkdir -p "$(sdir "$1")"; printf '%s/.inbox.lock' "$(sdir "$1")"; }
 
@@ -247,9 +263,115 @@ orphan_seen(){   # $1 window — its spool has NO window to drain into (a handof
   return 0
 }
 
+# ── the pane that stopped taking keys ────────────────────────────────────────────────────────────────────────
+# A FREE PANE THAT DOES NOT MOVE WHEN TYPED AT NEVER GOT THE MESSAGE. 2026-09-04: a session's claude was alive in
+# its window and its terminal had stopped reading the keyboard — a person's command sat in the input box and Enter
+# did nothing. Nothing here could tell, because a pane like that reads FREE (no working footer, no dialog), so every
+# message aimed at it was typed, popped off the spool and lost — the one thing "never dropped" is supposed to make
+# impossible. The test is the keystroke ITSELF: what is typed appears in the input box as it is typed, so a pane
+# byte-identical after a whole message AND its Enter took neither. Only a free pane is ever tested — free_pane() has
+# already refused mid-turn panes, dialog panes and panes in copy mode — so a session that is merely thinking is
+# never called stuck, and nothing is killed out from under a person's question or their scrollback.
+# A RESTART, NOT A REPORT — AND ONLY OF A TRACK WINDOW: `cc <repo> <track>` resumes that track's transcript, so the
+# window is killed and reopened with it while the message stays at the head of the spool, to go in at the session
+# that comes back on the next drain. `cc <repo>` resumes NOTHING: a planning window reopened that way returns as an
+# empty conversation, with everything the wedged one was holding gone and no journal written (which is why `cc
+# handoff` has the session write one first). So THREE cases are said once instead, and their mail waits: a planning
+# window; a window cc does not reopen by that name (an orch `repo@alias`, an overlap `track~next`, a name with no
+# repo under ~/dev — `box` is one); and a window that wedges again inside HUNG_COOLDOWN, which is a session that is
+# not coming back this way. And the restart itself can fail two ways, which are not the same page: a kill that does
+# not land (the window is still there, go look at it) and a kill that lands with no window back (it is gone, and
+# reopening it is now a command someone runs by hand).
+# SAID ONCE IS NOT SAID FOR EVER, AND IS NOT TYPED AT FOR EVER EITHER: the stamp keeps the frozen screen and the
+# pid under it, and while that process still reads that way the drain types nothing there — a whole message a
+# minute at a tty that is not reading is a hundred copies of it submitted as turns if that tty ever flushes. The
+# first read that differs — a keypress, a new claude in the pane — drops the stamp the way dialog_gone() drops a
+# dialog's: the spool drains normally, and the next wedge is a new one, said again.
+# AND A STAMP EXPIRES. A pane can come back reading WITHOUT redrawing (the same idle prompt), and a window someone
+# restarts by hand comes up on a screen that may be byte-identical, so a stamp trusted for ever is a spool nobody
+# delivers and nobody is told about — the failure this whole section exists to end. It holds for HUNG_COOLDOWN and
+# no longer: after that the pane is typed at again and re-judged. Still wedged is still worth saying, half an hour
+# on, to whoever has not fixed it.
+moved(){   # $1 window id  $2 the pane as it was before the keystrokes → 0 as soon as it differs
+  local i=0
+  while :; do
+    [ "$(tmux capture-pane -p -t "$1" 2>/dev/null)" = "$2" ] || return 0
+    i=$((i + 1)); [ "$i" -lt "$HUNG_TRIES" ] || return 1
+    sleep "$HUNG_WAIT"
+  done
+}
+
+reopenable(){ case "$1" in */*) ;; *) return 1;; esac                       # `<repo>` alone is a PLANNING window,
+              case "$1" in /*|*/|*/*/*|*[!a-zA-Z0-9._/-]*) return 1;; esac   # and `cc <repo>` starts a NEW
+              [ -d "$HOME/dev/${1%%/*}" ]; }                                 # conversation — `demo/` is that name
+                                                                             # with a slash on it, and no track
+scr_hash(){ tmux capture-pane -p -t "$1" 2>/dev/null | cksum | cut -d' ' -f1; }   # a pane, in one number
+
+hung_seen(){   # $1 window  $2 window id → 0 when the window was restarted (either way the caller keeps the message)
+  local f now last told repo track n why ptr
+  # Copy mode is not tested here: it is tested in free_pane(), before a key is sent. Asking after type_at() reads
+  # the wrong answer — Enter is copy-selection-and-cancel in both of tmux's default copy-mode tables, so the pane a
+  # person was scrolling has already left the mode, and this would call it stuck and kill it under them.
+  f="$(sdir "$1")/inbox.hung"; now=$(date +%s); last=0; told=0
+  [ -f "$f" ] && IFS=$'\t' read -r last told _ < "$f"
+  case "$last" in ''|*[!0-9]*) last=0;; esac
+  [ "${told:-0}" = 1 ] || told=0
+  n=$(spool_n "$1"); repo=${1%%/*}; track=${1#"$repo"}; track=${track#/}
+  ptr=" (tmux select-window -t main:$1)"          # only ever pointed at a window that is still there
+  if [ $((now - last)) -lt $((HUNG_COOLDOWN * 60)) ]; then why="it was restarted $(((now - last) / 60)) min ago and has stopped again"
+  elif [ "${1#*/}" = "$1" ] && [ -d "$HOME/dev/$1" ]; then why="it is $repo's planning window, and 'cc $repo' opens a NEW conversation rather than resuming this one — its context would be thrown away to deliver a message"
+  elif ! reopenable "$1"; then why="'cc $repo $track' is not what opens a window named '$1'"
+  elif ! tmux kill-window -t "$2" 2>/dev/null; then why="the window would not die, so nothing was reopened — it is still there"
+  else
+    # THE KILL AND THE REOPEN ARE TWO STEPS, AND THE SECOND IS JUDGED BY WHAT EXISTS, NOT BY AN EXIT STATUS. Once
+    # the kill lands the session is gone whatever happens next, so a page saying "not restarted, go look at the
+    # window" would point at a window that is not there. And cc's rc is not the answer either: it can fail with the
+    # window up (its last act is attach_main) or succeed with nothing opened. The test is the window, by name.
+    # `</dev/null` because cc reads `[ -t 0 ]`: with a terminal on fd 0 it select-windows and `exec tmux attach`,
+    # which seizes the caller's terminal — mid-drain, under the inbox lock — whatever stdout and stderr do.
+    "$BIN/cc" "$repo" ${track:+"$track"} </dev/null >/dev/null 2>&1 || :
+    if [ -n "$(win_id "$1")" ]; then
+      printf '%s\t0\n' "$now" > "$f"
+      "$BIN/cc-notify" -t "[$1] stopped taking keys — restarted" \
+        "a whole message and its Enter left the pane unchanged, so nothing under it was reading the keyboard. The window was killed and reopened with 'cc $repo $track', which resumes the transcript; the $n queued message(s) go in at the next drain." >/dev/null 2>&1
+      return 0
+    fi
+    why="the window was killed, and 'cc $repo $track' did not bring it back — there is no window '$1' now. Run that command by hand"
+    ptr=""
+  fi
+  [ "$told" = 1 ] && return 1
+  printf '%s\t1\t%s\t%s\n' "$last" "$(claude_pids "$2" | head -1)" "$(scr_hash "$2")" > "$f"   # …and WHO froze,
+                                                                        # on WHAT, so the drain can stop typing at it
+  "$BIN/cc-notify" -p high -t "[$1] stopped taking keys" \
+    "a whole message and its Enter left the pane unchanged and it was not restarted: $why. $n message(s) are queued behind it$ptr." >/dev/null 2>&1
+  return 1
+}
+
+hung_frozen(){   # $1 window  $2 window id → 0 while a stamp stands over the SAME process reading the SAME way, and
+                 # only for as long as HUNG_COOLDOWN. Anything else — a new claude in the pane, a screen that moved,
+                 # a stamp gone stale — drops it the way dialog_gone() drops a dialog's, and the pane is typed at
+                 # again: being skipped is a claim about a pane NOW, and it is only ever worth what its last read is.
+  local f pid was age
+  f="$(sdir "$1")/inbox.hung"; [ -f "$f" ] || return 1
+  IFS=$'\t' read -r _ _ pid was < "$f"
+  [ -n "${was:-}" ] || return 1                    # a restart stamp carries the cooldown only: nothing to skip
+  age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))   # written once, when it was said: its own age
+  if [ -n "${pid:-}" ] && [ "$age" -lt $((HUNG_COOLDOWN * 60)) ] &&
+     [ "$pid" = "$(claude_pids "$2" | head -1)" ] && [ "$was" = "$(scr_hash "$2")" ]; then return 0; fi
+  rm -f "$f"; return 1
+}
+
 # ── delivery ─────────────────────────────────────────────────────────────────────────────────────────────────
+in_copy_mode(){ [ "$(tmux display-message -p -t "$1" '#{pane_in_mode}' 2>/dev/null)" = 1 ]; }   # somebody is scrolling
+
 free_pane(){  # $1 window  $2 window id → 0 when the pane will take keys now; answers a known-safe prompt first
   local scr key st
+  # COPY MODE SWALLOWS KEYS, and it is somebody scrolling, not a fault. It is tested FIRST, before any key at all:
+  # Enter is copy-selection-and-cancel in both of tmux's default copy-mode tables, so a message typed here is eaten
+  # AND drops the person out of their scrollback, and the grid capture-pane reads never moved — which is the wedge
+  # test's answer for a stuck pane, so the session would then be killed and reopened under them. The message waits
+  # for them to press q, and the next drain delivers it.
+  in_copy_mode "$2" && return 1
   scr=$(tmux capture-pane -p -t "$2" 2>/dev/null)
   st=$(blocked "$scr")
   if [ "$st" = dialog ]; then                  # ONLY a pane a dialog is actually holding is ever pressed: the same
@@ -269,12 +391,13 @@ free_pane(){  # $1 window  $2 window id → 0 when the pane will take keys now; 
 spool_pop(){ tail -n +2 "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }   # the head line is gone; under the lock
 
 drain_window(){   # $1 window — deliver the spool in order while the pane stays free; keeps what it cannot deliver
-  local sp id n=0 line text
+  local sp id n=0 line text was
   sp="$(sdir "$1")/inbox.spool"; [ -s "$sp" ] || return 0
   id=$(win_id "$1"); [ -n "$id" ] || { orphan_seen "$1"; return 0; }   # gone or not up yet: the spool waits, but not silently forever
   live_claude "$id" || return 0
   ( flock -w 10 9 || exit 1
     while [ "$n" -lt "$MAX_DRAIN" ] && [ -s "$sp" ]; do
+      hung_frozen "$1" "$id" && break     # a pane already known to take no keys, and still frozen: not one more key
       free_pane "$1" "$id" || break
       line=$(head -1 "$sp")
       # A LINE THAT IS NOT A MESSAGE IS DROPPED, NOT WAITED ON. Stopping at it (the rule until review-157e) left it
@@ -286,7 +409,24 @@ drain_window(){   # $1 window — deliver the spool in order while the pane stay
           "not a message (no .text to type), so the drain discarded it rather than stop the queue at it: ${line:0:200}" >/dev/null 2>&1
         n=$((n + 1)); continue
       fi
+      # AN EMPTY LINE TYPES NOTHING, AND NOTHING IS NOT A WEDGE. `send-keys -l -- ""` puts no character on the pane
+      # and Enter on an empty input box submits nothing, so a perfectly healthy session is byte-identical after it
+      # — which is exactly the wedge test's answer for a dead one, and the healthy window would be killed and
+      # reopened, every tick, for ever. Whitespace-only is the same message once the newlines are flattened to
+      # spaces. There is nothing here to deliver, so it is dropped and said, like any other line the drain cannot
+      # type. (Reachable: `cc-msg <win> ""` under the timer, and an attachment-only Slack message.)
+      case "$text" in
+        *[![:space:]]*) ;;
+        *) spool_pop "$sp"
+           "$BIN/cc-notify" -t "[$1] a spool line was dropped" \
+             "nothing to type (its text is empty), so the drain discarded it rather than judge a pane it never touched: ${line:0:200}" >/dev/null 2>&1
+           n=$((n + 1)); continue;;
+      esac
+      # A MESSAGE TYPED AT A PANE THAT DOES NOT MOVE WAS NOT TAKEN: keep it at the head, restart the session, and
+      # let the drain after the restart deliver it.
+      was=$(tmux capture-pane -p -t "$id" 2>/dev/null)
       type_at "$id" "$text"
+      if [ -n "$was" ] && ! moved "$id" "$was"; then hung_seen "$1" "$id"; break; fi
       spool_pop "$sp"
       n=$((n + 1)); sleep "$KEY_WAIT"
     done
@@ -389,24 +529,33 @@ TRAP='Do you want to run this command?
   Esc to cancel'
 
 selfcheck(){
-  local n=0 f=0 W='demo/t1' out rc
+  local n=0 f=0 W='demo/t1' out rc hs ht
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT      # T is deliberately NOT local: the EXIT trap runs after this frame
   mkdir -p "$T/bin"
   cat > "$T/bin/tmux" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
-  list-windows) [ -n "${CC_FAKE_WIN:-}" ] && printf '@1 %s\n' "$CC_FAKE_WIN";;
+  list-windows) [ -n "${CC_FAKE_WIN:-}" ] && [ ! -f "$CC_FAKE_GONE" ] && printf '@1 %s\n' "$CC_FAKE_WIN";;
   list-panes)   echo 991234;;
   capture-pane) cat "$CC_FAKE_SCREEN" 2>/dev/null;;
+  display-message) if [ -s "$CC_FAKE_MODE_F" ]; then cat "$CC_FAKE_MODE_F"; else printf '%s\n' "${CC_FAKE_MODE:-0}"; fi;;
   send-keys)    shift; printf '%s\n' "$*" >> "$CC_FAKE_KEYS"
-                case "$*" in *Escape*) [ -n "${CC_FAKE_ESC_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac;;
+                # `?*`: an EMPTY literal send types nothing, so real tmux puts no character on the pane either
+                case "$*" in *' -l -- '?*) [ -z "${CC_FAKE_HUNG:-}" ] && printf '%s\n' "${*#* -l -- }" >> "$CC_FAKE_SCREEN";; esac
+                case "$*" in *Escape*) [ -n "${CC_FAKE_ESC_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac
+                # Enter is copy-selection-and-cancel in both default copy-mode tables: the mode is OVER once a
+                # message has been typed, so anything that asks after the keys is asking too late.
+                case "$*" in *Enter*) [ "${CC_FAKE_MODE:-0}" = 1 ] && printf '0\n' > "$CC_FAKE_MODE_F";; esac;;
+  kill-window)  printf 'kill-window %s\n' "$*" >> "$CC_FAKE_CALLS"
+                [ -n "${CC_FAKE_KILL_FAILS:-}" ] && exit 1                 # a kill that does not land
+                : > "$CC_FAKE_GONE";;                                      # …and one that does: the window is GONE
 esac
 exit 0
 STUB
   cat > "$T/bin/ps" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
-  *-eo*) printf '991234 1 bash\n991235 991234 %s\n' "${CC_FAKE_PROC:-claude}";;   # a claude under the pane
+  *-eo*) printf '991234 1 bash\n%s 991234 %s\n' "${CC_FAKE_PID:-991235}" "${CC_FAKE_PROC:-claude}";;   # a claude under the pane
   *)     echo cc-test;;                                                           # ps -o comm= -p $PPID
 esac
 STUB
@@ -415,6 +564,13 @@ STUB
 printf 'inject %s\n' "$*" >> "$CC_FAKE_CALLS"
 printf '%s\n' "${CC_FAKE_INJECT:-delivered}"     # the verdict the real one prints: delivered · typed · queued · …
 exit "${CC_FAKE_INJECT_RC:-0}"
+STUB
+  cat > "$T/bin/cc" <<'STUB'
+#!/usr/bin/env bash
+printf 'cc %s\n' "$*" >> "$CC_FAKE_CALLS"
+[ -t 0 ] && printf 'cc-saw-a-tty\n' >> "$CC_FAKE_CALLS"        # the real cc would select-window and `tmux attach` here
+[ -n "${CC_FAKE_CC_NOREOPEN:-}" ] || rm -f "$CC_FAKE_GONE"     # the window is back before cc returns…
+exit "${CC_FAKE_CC_RC:-0}"                                     # …whatever it returns
 STUB
   cat > "$T/bin/cc-notify" <<'STUB'
 #!/usr/bin/env bash
@@ -428,13 +584,14 @@ STUB
   cp "$(readlink -f "${BASH_SOURCE[0]}")" "$T/bin/cc-msg"; chmod +x "$T"/bin/*
   export PATH="$T/bin:$PATH" HOME="$T" CC_FAKE_SCREEN="$T/screen" CC_FAKE_KEYS="$T/keys" \
          CC_FAKE_CALLS="$T/calls" CC_FAKE_WIN="$W" CC_FAKE_ESC_CLEARS=1 CC_FAKE_PROC=claude CC_FAKE_PAGES=0 \
+         CC_FAKE_GONE="$T/gone" CC_FAKE_MODE_F="$T/mode" \
          CC_MSG_KEY_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck
   local SP="$T/.cc/state/$W/inbox.spool" DG="$T/.cc/state/$W/inbox.dialog"
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
   scr(){ printf '%s\n' "$1" > "$T/screen"; }
-  reset(){ : > "$T/keys"; : > "$T/calls"; rm -rf "$T/.cc/state"; }
+  reset(){ : > "$T/keys"; : > "$T/calls"; rm -rf "$T/.cc/state"; rm -f "$T/gone" "$T/mode"; }
   msg(){ "$T/bin/cc-msg" "$W" "$1"; }
   keys(){ cat "$T/keys"; }
   calls(){ cat "$T/calls"; }
@@ -536,6 +693,129 @@ $BUSY"; out=$(msg "hello mid-turn")
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
   k "$(t grep -qF 'after null' "$T/keys")" "a line with no .text is dropped the same way and the one behind it delivered"
   k "$(nt grep -q -- '-l -- null$' "$T/keys")" "…and the word 'null' is not what gets typed at the session"
+
+  # (7c) THE PANE THAT STOPPED TAKING KEYS (2026-09-04). A live pane echoes what is typed at it; one whose claude
+  # has stopped reading the keyboard is byte-identical after a whole message AND its Enter — and until now that
+  # message was popped off the spool and lost at a pane that reads perfectly free. It is kept, and the session is
+  # killed and reopened through cc, which resumes its transcript.
+  mkdir -p "$T/dev/demo"                                  # the repo the window name has to name for cc to reopen it
+  reset; scr "$FREE"; out=$(CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 msg "wedged")
+  k "$(t grep -qF 'wedged' "$T/keys")" "a pane that ignores keys is still typed at: that keystroke IS the test"
+  k "$(t test "$out" = queued)" "…and the caller is told queued — nothing reports a message the pane never took as sent"
+  k "$(t test "$(wc -l < "$SP")" = 1)" "…the message stays at the head of the spool"
+  k "$(t grep -q '^kill-window' "$T/calls")" "…the window is killed"
+  k "$(t grep -qx 'cc demo t1' "$T/calls")" "…and reopened with 'cc <repo> <track>', which resumes the transcript"
+  scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
+  k "$(t test "$(grep -c -e ' wedged$' "$T/keys")" = 2)" "the session that came back is typed what was pending"
+  k "$(nt test -f "$SP")" "…and the spool is empty: nothing was lost by the restart"
+
+  # …and the reopen NEVER inherits the caller's terminal. `cc` reads `[ -t 0 ]`: given one it select-windows and
+  # `exec tmux attach`, which draws on fd 0 whatever stdout and stderr are pointed at — so a person running
+  # `cc-msg demo/t1 "hi"` from ssh had their terminal seized, mid-drain, while cc-msg held the inbox lock.
+  reset; scr "$FREE"
+  script -qec "env CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 '$T/bin/cc-msg' '$W' 'from a terminal'" /dev/null >/dev/null 2>&1
+  k "$(t grep -q '^cc ' "$T/calls")" "called from a real terminal the wedged window is still restarted"
+  k "$(nt grep -q cc-saw-a-tty "$T/calls")" "…but cc is handed no tty: it would attach tmux over the caller's screen and block there holding the lock"
+
+  # …and THE WEDGE TEST IS ONLY EVER ASKED OF KEYSTROKES. An empty message types none: `send-keys -l -- ""` puts no
+  # character on the pane and Enter on an empty input box submits nothing, so a perfectly healthy session is
+  # byte-identical after it — the test's answer for a dead one — and the window would be killed and reopened, and
+  # then again every tick as the line sat at the spool head. `cc-msg <win> ""` under the timer (its `$(cat)` reads
+  # /dev/null there) and an attachment-only Slack message both arrive here.
+  reset; scr "$FREE"; out=$(CC_MSG_HUNG_WAIT=0 msg "" </dev/null)
+  k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "an empty message at a healthy pane: the window is neither killed nor reopened"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…the line is dropped and said once, like any other the drain cannot type"
+  k "$(nt test -f "$SP")" "…and nothing is left at the spool head to kill it again on the next tick"
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 msg "$(printf ' \n ')" >/dev/null
+  k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "…and whitespace only is the same message: flattened it is still nothing typed"
+
+  # THE KILL AND THE REOPEN ARE TWO STEPS. A kill that lands and a cc that then fails leaves NO window: the page
+  # must not say the window is there and point at it (it was doing both), and the pointer must be gone with it.
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_CC_RC=1 CC_FAKE_CC_NOREOPEN=1 msg "killed, not reopened" >/dev/null
+  k "$(t grep -q '^kill-window' "$T/calls")" "a kill that lands and a cc that does not reopen: the window is gone"
+  k "$(t grep -qF 'did not bring it back' "$T/calls")" "…and the page says which step failed, and to run cc by hand"
+  k "$(nt grep -q 'select-window' "$T/calls")" "…and points at no window: sending somebody to main:$W is sending them to nothing"
+  k "$(nt grep -qF 'keys — restarted' "$T/calls")" "…and it is not reported as a restart"
+  k "$(t test "$(wc -l < "$SP")" = 1)" "…and the message still waits"
+
+  # …and the other way round: cc's rc is attach_main's, so a non-zero exit with the window back is a RESTART.
+  # Paging "not restarted" there also skipped the cooldown stamp, so the next tick would kill the new session too.
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_CC_RC=1 msg "cc exited 1" >/dev/null
+  k "$(t grep -qF 'keys — restarted' "$T/calls")" "cc exiting non-zero with the window back is a restart: what exists is the test, not the exit status"
+  k "$(nt grep -qF 'was not restarted' "$T/calls")" "…so nothing pages that it was not restarted"
+  IFS=$'\t' read -r hs ht _ < "$T/.cc/state/$W/inbox.hung"
+  k "$(t test "${ht:-1}" = 0)" "…and what it writes is a restart stamp, not a said-once one"
+  k "$(t test "${hs:-0}" -gt 0)" "…carrying the moment of the restart: the cooldown starts now, so the session that came back is not killed again a minute later"
+
+  # A KILL THAT DOES NOT LAND is the opposite page: nothing was reopened, and the window IS still there to look at.
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_KILL_FAILS=1 msg "unkillable" >/dev/null
+  k "$(nt grep -q '^cc ' "$T/calls")" "a kill that fails is not followed by a reopen"
+  k "$(t grep -qF 'still there' "$T/calls")" "…the page says the window would not die"
+  k "$(t grep -q "select-window -t main:$W" "$T/calls")" "…and points at it, because it is still there"
+
+  # …and a session that comes back wedged is not killed on a loop: said once, and its mail waits.
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 msg "wedged twice" >/dev/null
+  : > "$T/calls"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 "$T/bin/cc-msg" --drain "$W"
+  k "$(nt grep -q '^cc ' "$T/calls")" "wedged again inside the cooldown: not restarted a second time"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…it is said once instead"
+  k "$(t test "$(wc -l < "$SP")" = 1)" "…and the message still waits, rather than being typed at nobody"
+  : > "$T/calls"; : > "$T/keys"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 "$T/bin/cc-msg" --drain "$W"
+  k "$(nt grep -q '^notify' "$T/calls")" "…once: the tick after that says nothing"
+  k "$(nt grep -q . "$T/keys")" "…and types nothing at it while its screen is the frozen one: not one key a minute, for ever"
+  scr '> somebody pressed a key'; "$T/bin/cc-msg" --drain "$W"
+  k "$(t grep -qF 'wedged twice' "$T/keys")" "a screen that has moved is a pane reading again: the stamp is dropped and the mail goes in"
+  k "$(nt test -f "$T/.cc/state/$W/inbox.hung")" "…the stamp is gone, the way a dialog's is when the pane comes free"
+  k "$(nt test -f "$SP")" "…and nothing was left in the spool by the wedge"
+
+  # …and a pane in tmux COPY MODE swallows keys the same way: that is a person scrolling, not a stuck session. The
+  # mode is read BEFORE a key is sent, because the message's own Enter ends it (copy-selection-and-cancel): asked
+  # afterwards tmux says 0, the grid never moved, and the window would be killed out from under them — which is the
+  # one reading of this test that must never happen. The stub ends the mode on Enter, the way tmux does.
+  reset; scr "$FREE"; out=$(CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_MODE=1 msg "while scrolling")
+  k "$(nt grep -q . "$T/keys")" "a pane in copy mode is not typed at at all: Enter there is copy-selection-and-cancel, so the message would be eaten and their scrollback closed"
+  k "$(nt grep -q -e '^kill-window' -e '^cc ' -e '^notify' "$T/calls")" "…and it is neither restarted nor reported: somebody is reading it"
+  k "$(t test "$out" = queued)" "…and the caller is told queued, not that it was delivered"
+  k "$(t test "$(wc -l < "$SP")" = 1)" "…and its message waits for them to leave copy mode, rather than being typed into it"
+
+  # A PLANNING WINDOW (named `<repo>`, no track) IS NEVER KILLED HERE: `cc demo` starts a NEW conversation — the
+  # transcript this one wedged holding would be gone, unjournalled, to deliver a message that can simply wait.
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN=demo "$T/bin/cc-msg" demo "hi planning" >/dev/null
+  k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "a wedged planning window is neither killed nor reopened: 'cc demo' would not resume it"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…it is said once instead"
+  k "$(t grep -q 'NEW conversation' "$T/calls")" "…with that as the reason"
+  k "$(t test "$(wc -l < "$T/.cc/state/demo/inbox.spool")" = 1)" "…and its message waits for whoever unsticks it"
+
+  # …and neither is a name that only LOOKS like a track: `demo/` has an empty one, so it too would be reopened
+  # with `cc demo` — the planning session's new conversation, by another route.
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='demo/' "$T/bin/cc-msg" 'demo/' "hi slash" >/dev/null
+  k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "a window named 'demo/' is not killed either: an empty track is not a track"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…it is said once, like any other name cc will not reopen"
+
+  # A WINDOW cc DOES NOT OPEN BY THAT NAME is never killed — an orch is its own tool's, and `cc orch@a` would open
+  # something else. Same for an overlap window and for a name with no repo under ~/dev (`box` is one).
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@a' "$T/bin/cc-msg" 'orch@a' "hi orch" >/dev/null
+  k "$(nt grep -q -e '^kill-window' -e '^cc ' "$T/calls")" "an orch window (repo@alias) that stops taking keys is not killed"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…it is said once, with the reason"
+  k "$(t test "$(wc -l < "$T/.cc/state/orch@a/inbox.spool")" = 1)" "…and its message waits in its own spool"
+  : > "$T/calls"; : > "$T/keys"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@a' "$T/bin/cc-msg" --drain 'orch@a'
+  k "$(nt grep -q . "$T/keys")" "…and a window nothing will ever reopen is not typed at every tick for ever either"
+  scr '> somebody pressed a key'; CC_FAKE_WIN='orch@a' "$T/bin/cc-msg" --drain 'orch@a'
+  k "$(t grep -qF 'hi orch' "$T/keys")" "whoever unsticks it moves the screen: the stamp is dropped and the mail goes in"
+  : > "$T/calls"; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@a' "$T/bin/cc-msg" 'orch@a' "hi again" >/dev/null
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…and the NEXT time it wedges is said too: a stamp that never cleared silenced it for ever"
+
+  # A STAMP IS A CLAIM ABOUT ONE PANE, NOW. A session can come back reading without redrawing a thing, and a window
+  # restarted by hand comes up on a screen that may match the frozen one to the byte — trusted for ever, either one
+  # is a spool nobody delivers and nobody is told about, which is the failure this whole section exists to end.
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@b' "$T/bin/cc-msg" 'orch@b' "hi b" >/dev/null
+  : > "$T/keys"; CC_FAKE_WIN='orch@b' CC_FAKE_PID=991999 "$T/bin/cc-msg" --drain 'orch@b'
+  k "$(t grep -qF 'hi b' "$T/keys")" "another claude in the pane drops the stamp: the screen can match to the byte, the session is not the same one"
+  k "$(nt test -f "$T/.cc/state/orch@b/inbox.spool")" "…and the mail it was holding goes in"
+  reset; scr "$FREE"; CC_MSG_HUNG_WAIT=0 CC_FAKE_HUNG=1 CC_FAKE_WIN='orch@c' "$T/bin/cc-msg" 'orch@c' "hi c" >/dev/null
+  touch -d '90 minutes ago' "$T/.cc/state/orch@c/inbox.hung"
+  : > "$T/keys"; CC_FAKE_WIN='orch@c' "$T/bin/cc-msg" --drain 'orch@c'
+  k "$(t grep -qF 'hi c' "$T/keys")" "a stamp past HUNG_COOLDOWN is re-tested, not trusted: a pane that came back quietly still gets its mail"
+  k "$(nt test -f "$T/.cc/state/orch@c/inbox.spool")" "…and the spool it was sitting on is emptied"
 
   # (8) --drain with no window sweeps every spool under ~/.cc/state
   reset; scr "$PERM"; msg "sweep me" >/dev/null; scr "$FREE"; "$T/bin/cc-msg" --drain

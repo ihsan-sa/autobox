@@ -1643,7 +1643,7 @@ echo "== cc-reconcile (board vs reality: decision table + one end-to-end apply, 
 rec=$("$B/cc-reconcile" selfcheck 2>&1)
 grep -q '0 failed' <<<"$rec" && ok "cc-reconcile selfcheck: ${rec##*: }" || bad "cc-reconcile selfcheck: $rec"
 
-echo "== cc-janitor (the weekly sweep: decision table + one end-to-end pass over a fake box) =="
+echo "== cc-janitor (the daily sweep: decision table + one end-to-end pass over a fake box) =="
 # Its own HOME, board, origin and stub tmux/gh — nothing here can reach this box's tmux server or GitHub.
 jan=$("$B/cc-janitor" selfcheck 2>&1)
 grep -q '0 failed' <<<"$jan" && ok "cc-janitor selfcheck: ${jan##*: }" || bad "cc-janitor selfcheck: $jan"
