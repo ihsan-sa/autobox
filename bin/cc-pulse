@@ -34,9 +34,17 @@ the work is:
   · every other target is woken, and the tick CARRIES WHAT THE FILES SAY — the `main-gate` row, `cc-scope count
     <repo>`, the rows queued or blocked, and the rows still in flight (a PR in `review` above all) — so a
     session with nothing to do costs one cheap turn instead of re-deriving all of it.
-  · a tick that carried NOTHING leaves ~/.cc/state/<target>/pulse.quiet behind, and the next pulse inside
-    CC_PULSE_QUIET (default 6 h) skips that target unless something is due by then. The first quiet look is
-    worth a turn; the same look two hours later, with nothing changed, is not. Anything due clears the mark.
+  · THE SAME LOOK IS NOT SENT TWICE. Every tick writes what it carried to ~/.cc/state/<target>/pulse.look, and
+    a tick whose look is identical to that one is not sent inside CC_PULSE_QUIET (default 24 h): it goes to the
+    target's events file instead (`cc-broker ledger --once`), which wakes nobody and rides out on the next
+    message the session does get. A look that CHANGED — a row moved, an ask opened, main went red — wakes at
+    once, exactly as it always did; only the repeat is held. The back-off is taken in pulse(), below the
+    liveness and limit tests: a target whose session DIED is started whatever the mark says, a handoff clears
+    it, and a session the limit stopped is still handed to `cc-limit record` before anything is held.
+    Measured 2026-09-05: a planning session with one PR parked in `review` for two days paid a full-context
+    wake every 2 h to answer "unchanged, no action" — 12 turns and $51 in one day, $126 across the box, for
+    338 output tokens. This takes those twelve down to one, which is about $4.30, not nothing: the last of it
+    is the idle CONTEXT itself, 200-400k re-written for one wake, and shedding that is cc-handoff's job.
 Every one of those is one line in the log with its reason, and `cc-pulse --dry-run` prints the same verdicts
 for every target while touching nothing — no tick, no log, no mark.
 The pane it hands to `cc-limit` below is written down by cc-limit, in cc-limit's own file.
@@ -80,7 +88,10 @@ ORCHS = f"{HOME}/.cc/slack/orchs.json"          # {"<chat>": {target, alias, par
 LOG = f"{STATE}/pulse.log"
 LOG_MAX = 4000                                  # a 2 h timer over a dozen targets fills this in about a month
 GAP_MIN = 90                                    # minutes; see THE GAP above before changing it
-QUIET_H = 6                                     # hours a session woken with NOTHING DUE is left alone (CC_PULSE_QUIET)
+QUIET_H = 24                                    # hours a session already told THIS EXACT LOOK is left alone
+                                                # (CC_PULSE_QUIET; 0 turns the back-off off entirely). It was 6,
+                                                # and it applied only to a look with nothing in it at all — so a
+                                                # board that never moved bought a full-context turn every 2 h.
 MAIN_GATE = "main-gate"                         # cc-audit's one row for "main's own suite is red"
 SESSION_ROW = "session"                         # cc-board's kind for a long-lived channel session: never track work
 DONE_ROW = ("merged", "done")                   # a row in one of these is history, not work
@@ -315,40 +326,61 @@ def open_asks(repo):
         return -1
 
 
-def quiet_stamp(target):
-    """When this target was last woken with nothing due — the file the pulse leaves behind to say so. 0 = the
-    last wake had something in it (or there has been none), and the quiet window does not apply."""
+def last_look(target):
+    """(what the last tick carried, when it carried it) — the mark the pulse leaves behind so it can tell a look
+    it has already sent from a new one. ("", 0) = there has been no tick, and nothing is held against it."""
+    f = f"{STATE}/{target}/pulse.look"
     try:
-        return os.path.getmtime(f"{STATE}/{target}/pulse.quiet")
+        return open(f).read().strip(), os.path.getmtime(f)
     except OSError:
-        return 0.0
+        return "", 0.0
 
 
-def set_quiet(target, on):
-    """Leave that mark, or clear it the moment a wake carries something. Never on a dry run — see Run.dry."""
-    f = f"{STATE}/{target}/pulse.quiet"
+def set_look(target, look):
+    """Write down what this tick carried, and when. Never on a dry run — see Run.dry."""
+    f = f"{STATE}/{target}/pulse.look"
     try:
-        if on:
-            os.makedirs(os.path.dirname(f), exist_ok=True)
-            with open(f, "w") as fh:
-                fh.write(f"{stamp()}  woken with nothing due; the next pulse inside the quiet window skips\n")
-        elif os.path.exists(f):
-            os.remove(f)
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w") as fh:
+            fh.write(look + "\n")
     except OSError:
         pass                                        # a mark nobody can write costs one extra wake, nothing more
 
 
+def clear_look(target):
+    """Forget what the last tick carried. A session that is being STARTED, or one being handed over, has heard
+    none of it — the mark is a record of what somebody was told, and there is no longer anybody it is true of."""
+    try:
+        os.remove(f"{STATE}/{target}/pulse.look")
+    except OSError:
+        pass
+
+
+def ledger(target, note):
+    """Say it where it wakes nobody. cc-broker owns the events file and the promise that its unread lines ride
+    out on the next message the session does get, so the suppressed tick is recorded and never dropped."""
+    sh(f"{BIN}/cc-broker", "ledger", "--once", target, f"pulse: {note}", timeout=30)
+
+
 def due(target):
-    """(wake?, why, what the files say, was-anything-due) — the whole decision, off files, before any session is
-    looked at. It is NOT a judgement about the work: a quiet board still gets its tick, because a session that
-    only ever runs when a row is queued never lifts its head to the goals, and that lifting is the drive loop."""
+    """(wake?, why, what the files say, was-anything-due, the look, held-as-a-repeat?) — the whole decision, off
+    files, before any session is looked at. It is NOT a judgement about the work: a quiet board still gets its
+    tick, because a session that only ever runs when a row is queued never lifts its head to the goals, and that
+    lifting is the drive loop. What it IS a judgement about is whether the tick would say anything the session
+    does not already have — see THE SAME LOOK at the bottom.
+
+    `held` is that last one and ONLY that one: a back-off from repeating ourselves to a session that heard us
+    the first time. It assumes there is such a session, which is why pulse() takes it below the liveness test
+    and not here — a target whose session died must still be started, and a 24 h mark must not be what stops
+    that. Every other False is a target this loop has no business waking at all, live or dead."""
     repo = target.split("@")[0]                     # an orch is due for whatever its repo is due for
     rows = board_rows(repo)
 
     # A CHANNEL/COURSE REPO IS NEVER PULSED. Its rows are `session` — a long-lived session in a channel, with no
     # brief, no PR and no done. There is no track work to drive, and the people in the channel are its loop.
     if rows and all(kind(r) == SESSION_ROW for r in rows.values()):
-        return False, "every board row is kind=session — a channel repo's sessions are driven by their channel", "", False
+        return (False, "every board row is kind=session — a channel repo's sessions are driven by their channel",
+                "", False, "", False)
 
     gate = rows.get(MAIN_GATE)
     red = gate is not None and gate.get("status") not in DONE_ROW
@@ -364,6 +396,10 @@ def due(target):
     board = [(k, r.get("status") or "queued")       # cc-board's own default for a row written without one
              for k, r in rows.items() if kind(r) != SESSION_ROW]
     ready = sorted(k for k, st in board if st in BOARD_DUE)
+    # …and the same rows WITH the word each is wearing, for the look below. The note prints them bare to stay
+    # one line, and bare is not enough to compare on: `queued` → `blocked` is a row that stopped, and reading
+    # that as unchanged would hold the wake that says so.
+    ready_st = sorted(f"{k} {st}" for k, st in board if st in BOARD_DUE)
     aloft = sorted(f"{k} {st}" for k, st in board if st not in BOARD_DUE and st not in DONE_ROW)
     note = " · ".join(filter(None, [
         "main-gate row RED" if red else "",
@@ -373,16 +409,39 @@ def due(target):
         f"{len(aloft)} row{'' if len(aloft) == 1 else 's'} in flight ({', '.join(aloft[:3])})" if aloft else "",
     ])) or "no red main, no open ask, no row queued or in flight — goals are the work"
     anything = bool(red or asks != 0 or ready or aloft)  # a ledger that could not answer counts as something too
-    if anything:
-        return True, note, note, True
 
-    # NOTHING DUE IS STILL A TICK — once. The stamp below is what stops it repeating every 2 h: the session
-    # looked, found nothing, and nothing has changed since, so the next look is worth the same nothing.
-    q, window = quiet_stamp(target), conf("CC_PULSE_QUIET", QUIET_H) * 3600
-    if q and now() - q < window:
-        return False, (f"woken with nothing due {int((now() - q) // 60)}m ago and still nothing due — the next "
-                       f"look is {int(window // 3600)}h after that one"), note, False
-    return True, "nothing due — the drive tick: the session looks up at its goals", note, False
+    # THE SAME LOOK IS NOT NEWS, and a wake that carries nothing new costs exactly what one that does costs: a
+    # full-context turn, 200-400k of cache re-written because the last tick's copy expired an hour before this
+    # one. Measured 2026-09-05: about $4.30 a tick, twelve of them in a day nobody worked, and one that cost
+    # $12.92 on its own because its second turn missed the cache too — all of it to answer "Unchanged. No
+    # action." about a PR that had been sitting in `review` for two days.
+    #   The look is the FULL state; `note` is the sentence the session reads. They differ on purpose — the note
+    # truncates to three row names and drops their statuses so the tick stays one line, so two boards differing
+    # only in the fourth row, or in one row's word, share a note. Deduping on the note would hide a real change;
+    # deduping on this cannot.
+    #   #173's finding is not undone by any of it. A row in flight still never sends the session to its goals
+    # tick, and the FIRST tick that carries one still goes out at once. Only the repeat is held, and held is not
+    # dropped: pulse() writes it to the target's events file, where cc-broker carries it out on the next message
+    # the session gets for a real reason.
+    look = f"red={int(red)} asks={asks} ready={','.join(ready_st)} aloft={','.join(aloft)}"
+    seen, when = last_look(target)
+    window = conf("CC_PULSE_QUIET", QUIET_H) * 3600
+    same = bool(window and seen == look and when and now() - when < window)
+    ago = f"{int((now() - when) // 60)}m ago" if when else "already"
+
+    if anything:
+        if same:
+            return (False, f"the tick {ago} carried this same look and nothing has changed since — it goes to "
+                           f"the target's events file, which wakes nobody", note, True, look, True)
+        return True, note, note, True, look, False
+
+    # NOTHING DUE IS STILL A TICK — once. It is the one repeat that keeps its turn, because it asks for work off
+    # the goals file rather than restating a status, and the session does something different with it each time.
+    # The mark is what stops it being every 2 h.
+    if same:
+        return (False, f"woken with nothing due {ago} and still nothing due — the next look is "
+                       f"{int(window // 3600)}h after that one", note, False, look, True)
+    return True, "nothing due — the drive tick: the session looks up at its goals", note, False, look, False
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -470,10 +529,14 @@ def pulse(target, r):
 
     # THE CHEAPEST GATE RUNS FIRST. Everything below this line costs a tmux capture, a walk of the process table
     # or, at the end, a whole turn of somebody's context; this costs a few stat()s and one `cc-scope count`.
-    wake, why_due, note, anything = due(target)
-    if not wake:
+    wake, why_due, note, anything, look, held = due(target)
+    if not wake and not held:
         r.log(target, "skip", why_due)
         return
+    # A HELD TICK IS NOT DECIDED YET. The back-off says "this session already heard this", so it is taken below,
+    # once a live session is actually there to have heard it and the limit test has had its say. Taken here it
+    # would swallow the START branch — a target whose planning session died, with a PR parked in `review`, would
+    # go unstarted for the whole 24 h — and the limit branch with it, which is worse: see the note down there.
 
     # THE HANDOFF CHECK COMES AHEAD OF THE WINDOW being looked at at all. It used to run only once the
     # window was found live, and that order is a trap: a target mid-overlap whose predecessor claude has already
@@ -483,11 +546,17 @@ def pulse(target, r):
     # halfway through the journal is expired and killed.
     h = handoff_open(target)
     if h:
+        # …and the mark goes with it. The successor reading the journal is a session that has heard none of our
+        # ticks, and a back-off left standing would mute it for up to a day over what its predecessor was told.
+        if not r.dry:
+            clear_look(target)
         r.log(target, "skip", "mid-handoff — a successor is taking over; neither a tick nor a start belongs here")
         return
 
     w = windows().get(target)
     if w is None or not live_claude(w[1]):
+        if not r.dry:
+            clear_look(target)              # nobody is there to have heard the last tick; whatever starts is new
         if h is None:
             # Asymmetric on purpose. A tick sent while cc-handoff is unwell costs one line read by a session
             # that may be busy; a START costs a whole second session on a repo that may be mid-handoff. Only
@@ -546,6 +615,22 @@ def pulse(target, r):
         r.log(target, "skip", "the usage limit line is on its pane and cc-limit is not recording it yet (nothing "
                               "corroborates it, or no reset time named) — a tick would meet that same limit")
         return
+
+    # THE BACK-OFF, now that there is a live session it can be true of, and BELOW the limit test on purpose.
+    # `limit_state()` above is the only thing on the box that hands an interactive session to `cc-limit record`,
+    # which is what arms the one-shot that nudges it back to its interrupted turn at the reset. Held above that
+    # call, a session the limit stopped mid-turn changes nothing on the board, so its look never changes, so
+    # every pulse for the whole quiet window returned here and cc-limit was never told — the turn was lost for
+    # a day and then for good, once cc-limit's corroboration had expired (review of #246).
+    # A HELD TICK IS STILL RECORDED — but only one with something in it, since the goals tick's "nothing at
+    # all" is nothing to write down. A held target that is also mid-turn or limited is logged as that instead,
+    # and its line is written by the next pulse: the look that held it has not changed either.
+    if held:
+        if not r.dry and look and anything:
+            ledger(target, note)
+        r.log(target, "skip", why_due)
+        return
+
     age = now() - last_tick(target)
     gap = conf("CC_PULSE_GAP_MIN", GAP_MIN) * 60
     if age < gap:
@@ -556,10 +641,10 @@ def pulse(target, r):
         return
     p = sh(f"{BIN}/cc-msg", target, (TICK if anything else TICK_GOALS).format(t=target, s=note), timeout=60)
     if p is not None and p.returncode == 0:
-        # THE MARK IS THE WHOLE BACK-OFF. A tick that carried nothing leaves it, so the next run inside the
-        # window knows this session has already looked; a tick that carried something clears it, so the next
-        # quiet one is a fresh look and not the tail of an old window.
-        set_quiet(target, not anything)
+        # THE MARK IS THE WHOLE BACK-OFF, and it is written by EVERY tick, not just an empty one: it is what the
+        # next run compares against to know whether it would be saying anything new. A look that has changed
+        # never matches it and wakes at once.
+        set_look(target, look)
         if (p.stdout or "").strip() == "queued":            # a dialog is up, or the pane went busy under us
             r.log(target, "tick", "queued — cc-msg holds it until the pane is free, and reports a dialog that stands")
         else:
@@ -654,7 +739,8 @@ def selfcheck():
         for d in (BIN, BOARDS, STATE, f"{th}/.cc/slack", f"{DEV}/alpha", f"{DEV}/beta"):
             os.makedirs(d, exist_ok=True)
         for name, body in (("tmux", FAKE_TMUX), ("cc", FAKE_CC), ("cc-msg", FAKE_MSG), ("cc-handoff", FAKE_HANDOFF),
-                           ("cc-limit", FAKE_LIMIT), ("cc-scope", FAKE_SCOPE), ("cc-pause", FAKE_PAUSE)):
+                           ("cc-limit", FAKE_LIMIT), ("cc-scope", FAKE_SCOPE), ("cc-pause", FAKE_PAUSE),
+                           ("cc-broker", FAKE_BROKER)):
             open(f"{BIN}/{name}", "w").write(body)
             os.chmod(f"{BIN}/{name}", 0o755)
         # a process whose name really is `claude`, for pgrep -x. A COPY OF BASH, not of sleep: this box's
@@ -666,9 +752,11 @@ def selfcheck():
                           CC_FAKE_CALLS=calls, CC_FAKE_BUSY="", CC_FAKE_DIALOG="", CC_FAKE_HANDOFF="",
                           CC_FAKE_HANDOFF_BROKEN="", CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="",
                           CC_FAKE_LIMIT_STALE="", CC_PULSE_GAP_MIN="90", CC_PULSE="",
-                          # the due-ness knobs are neutral for every case that is not about them: no asks,
-                          # a working ledger, the default quiet window. The block at the end sets its own.
-                          CC_FAKE_ASKS="0", CC_FAKE_SCOPE_BROKEN="", CC_PULSE_QUIET="6", CC_FAKE_PAUSED="")
+                          # the due-ness knobs are neutral for every case that is not about them: no asks, a
+                          # working ledger, and the back-off OFF (CC_PULSE_QUIET=0) so a case that runs the same
+                          # board twice is decided by the rule it is about and not by the same-look mark. The
+                          # block at the end turns it on and is the only place that tests it.
+                          CC_FAKE_ASKS="0", CC_FAKE_SCOPE_BROKEN="", CC_PULSE_QUIET="0", CC_FAKE_PAUSED="")
 
         def fixture(*cmd):                          # own group, no handle on our stdout (a stray child holds a pipe open)
             return subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
@@ -927,11 +1015,11 @@ def selfcheck():
         open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
 
         def decide(tracks, asks="0"):
-            """One due-ness case: that board, that many open asks, one run on beta, no quiet mark left over."""
+            """One due-ness case: that board, that many open asks, one run on beta, no same-look mark left over."""
             board("beta", tracks)
             os.environ["CC_FAKE_ASKS"] = asks
-            if os.path.exists(f"{STATE}/beta/pulse.quiet"):
-                os.remove(f"{STATE}/beta/pulse.quiet")
+            if os.path.exists(f"{STATE}/beta/pulse.look"):
+                os.remove(f"{STATE}/beta/pulse.look")
             was = logged()
             run("beta")
             return did(), since(was)
@@ -963,11 +1051,6 @@ def selfcheck():
         d, L = decide({"t1": {"status": "review"}})
         ok("a PR waiting to land is not a quiet board: the tick carries it and does NOT send the session to goals",
            "msg beta " in d and "1 row in flight (t1 review)" in d and "goals tick" not in d)
-        ok("…and it leaves no quiet mark, so the next pulse two hours later nudges it again",
-           not os.path.exists(f"{STATE}/beta/pulse.quiet"))
-        L0 = logged(); run("beta")
-        ok("…which it does — an unlanded PR is nudged every cycle, never backed off",
-           "msg beta " in did() and "still nothing due" not in since(L0))
 
         os.environ["CC_FAKE_SCOPE_BROKEN"] = "1"
         d, L = decide({"t1": {"status": "merged"}})
@@ -985,37 +1068,108 @@ def selfcheck():
         d, L = decide({"s1": {"status": "running", "kind": "session"}, "t1": {"status": "running"}})
         ok("one track row among them and it is an ordinary repo again", "msg beta " in d)
 
-        # ---- the quiet mark: the first look with nothing due is worth a turn, the next one inside the window is not
+        # ---- THE SAME LOOK: the first time a look is sent it is worth a turn; the same one two hours later is
+        # not. Measured 2026-09-05 — a session with one PR parked in `review` paid a full-context wake every 2 h
+        # to answer "unchanged, no action": 12 turns and $51 in a day it did no work.
         os.environ["CC_PULSE_QUIET"] = "6"
-        d, L = decide({"t1": {"status": "merged"}})
-        ok("a tick that carried nothing leaves the quiet mark behind", os.path.exists(f"{STATE}/beta/pulse.quiet"))
+        d, L = decide({"t1": {"status": "review"}})
+        ok("every tick writes down the look it carried, not just an empty one",
+           "msg beta " in d and os.path.exists(f"{STATE}/beta/pulse.look"))
         L0 = logged(); run("beta")
-        ok("…and the next pulse inside the window skips that session, with the reason in the log",
-           "msg beta " not in did() and "still nothing due" in since(L0))
+        ok("…and the next pulse with that same look does not wake the session at all, with the reason in the log",
+           "msg beta " not in did() and "same look" in since(L0))
+        ok("…and the held tick is WRITTEN DOWN, once, where it wakes nobody — cc-broker carries it out on the "
+           "next message the session gets for a real reason",
+           "broker ledger --once beta pulse: 1 row in flight (t1 review)" in did())
 
-        board("beta", {"t1": {"status": "queued"}})
+        os.truncate(calls, 0); run("--dry-run", "beta")
+        ok("…and a HELD tick on a dry run writes nothing at all — no ledger line, the same as no tick",
+           "broker " not in did())
+
+        # THE BACK-OFF MUST NOT SWALLOW THE LIMIT TEST. `limit_state()` is the only caller of `cc-limit record`
+        # for an interactive session, and a limited session's board does not move, so its look never changes:
+        # held above that call, the one-shot that resumes its interrupted turn would never be armed and the turn
+        # would be lost for the whole window and then for good (review of #246).
+        os.environ["CC_FAKE_LIMITED"] = "beta"
+        L0 = logged(); os.truncate(calls, 0); run("beta")
+        ok("a HELD session the usage limit stopped is STILL handed to cc-limit, so its resume one-shot is armed",
+           "limit record @1 beta" in did())
+        ok("…and it is logged as limited, not as a repeat, and no ledger line is written for it",
+           "msg beta " not in did() and "broker " not in did()
+           and "usage limit stopped it mid-turn" in since(L0))
+        os.environ["CC_FAKE_LIMITED"] = ""
+
+        board("beta", {"t1": {"status": "review"}, "t2": {"status": "queued"}})
         L0 = logged(); run("beta")
-        ok("something due breaks the window at once — the mark is a back-off from nothing, not a mute",
-           "msg beta " in did() and "1 row queued/blocked" in did())
-        ok("…and a wake that carried something clears the mark, so the next quiet look is a fresh one",
-           not os.path.exists(f"{STATE}/beta/pulse.quiet"))
+        ok("a look that CHANGED breaks the window at once — the mark holds a repeat, it does not mute a session",
+           "msg beta " in did() and "1 row queued/blocked (t2)" in did())
 
-        decide({"t1": {"status": "merged"}})                    # quiet again: mark back
+        # A ROW'S WORD IS PART OF THE LOOK. The note prints queued/blocked rows bare, so `queued` → `blocked`
+        # shares a note with what came before it — and that is a row that STOPPED.
+        decide({"t1": {"status": "queued"}}); os.truncate(calls, 0)
+        board("beta", {"t1": {"status": "blocked"}})
+        run("beta")
+        ok("a queued row that went blocked is a change, not a repeat — the note reads the same and the mark "
+           "must not", "msg beta " in did())
+
+        # THE BACK-OFF IS A BACK-OFF FROM REPEATING OURSELVES, so it needs somebody who heard us the first time.
+        decide({"t1": {"status": "review"}})                    # a live beta, ticked: the mark is set
+        open(tmuxf, "w").write("")                              # …and now its session is gone
+        os.truncate(calls, 0); L0 = logged(); run("beta")
+        ok("a target whose session DIED is started even though the mark says it heard this — the back-off must "
+           "never be what leaves a repo with an open PR unstarted for a day",
+           "cc beta" in did() and "start" in since(L0))
+        ok("…and starting one clears the mark, because the session that heard the last tick is not there any "
+           "more", not os.path.exists(f"{STATE}/beta/pulse.look"))
+
+        decide({"t1": {"status": "review"}})
+        os.environ["CC_FAKE_HANDOFF"] = "beta"
+        os.truncate(calls, 0); run("beta")
+        ok("…and a successor mid-handoff is not muted by what its predecessor was told: the mark goes with the "
+           "handoff", "msg beta " not in did() and not os.path.exists(f"{STATE}/beta/pulse.look"))
+        os.environ["CC_FAKE_HANDOFF"] = ""
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
+
+        d, L = decide({"s1": {"status": "running", "kind": "session"}})
+        ok("a channel repo is not held, it is never pulsed — and nothing is written to an events file it has no "
+           "use for", "msg beta " not in d and "broker " not in d and "kind=session" in L)
+
+        # The note truncates to three row names so the tick stays one line; the mark must not, or a board whose
+        # fourth row moved would read as unchanged and the session would never hear about it.
+        board("beta", {"t1": {"status": "review"}, "t2": {"status": "review"},
+                       "t3": {"status": "review"}, "t4": {"status": "review"}})
+        run("beta"); os.truncate(calls, 0)
+        board("beta", {"t1": {"status": "review"}, "t2": {"status": "review"},
+                       "t3": {"status": "review"}, "t4": {"status": "running"}})
+        run("beta")
+        ok("a row that moved BEYOND the three the tick names still counts as a change — the mark is the whole "
+           "board state, never the sentence the session reads", "msg beta " in did())
+
+        decide({"t1": {"status": "review"}})                    # a fresh mark, then age it past the window
         t = now() - 7 * 3600
-        os.utime(f"{STATE}/beta/pulse.quiet", (t, t))
-        run("beta")
-        ok("past CC_PULSE_QUIET the session gets its look again — 6 h, not silence", "msg beta " in did())
+        os.utime(f"{STATE}/beta/pulse.look", (t, t))
+        os.truncate(calls, 0); run("beta")
+        ok("past CC_PULSE_QUIET the session gets that look again — a back-off, not silence", "msg beta " in did())
 
-        decide({"t1": {"status": "merged"}})
+        d, L = decide({"t1": {"status": "merged"}})
+        ok("nothing at all on the files is the GOALS tick, and it backs off the same way",
+           "msg beta " in d and "goals tick" in d)
+        L0 = logged(); run("beta")
+        ok("…and the second one inside the window is skipped, and writes NO ledger line — an empty look is "
+           "nothing to record", "msg beta " not in did() and "still nothing due" in since(L0)
+           and "broker " not in did())
+
+        decide({"t1": {"status": "review"}})
         os.environ["CC_PULSE_QUIET"] = "0"
-        run("beta")
-        ok("CC_PULSE_QUIET=0 turns the window off: every pulse looks, the way it did before this", "msg beta " in did())
+        os.truncate(calls, 0); run("beta")
+        ok("CC_PULSE_QUIET=0 turns the back-off off entirely: every pulse looks, the way it did before this",
+           "msg beta " in did())
         os.environ["CC_PULSE_QUIET"] = "6"
 
         # ---- --dry-run: the whole verdict, in writing, having touched nothing
         board("beta", {"t1": {"status": "queued"}})
-        if os.path.exists(f"{STATE}/beta/pulse.quiet"):
-            os.remove(f"{STATE}/beta/pulse.quiet")
+        if os.path.exists(f"{STATE}/beta/pulse.look"):
+            os.remove(f"{STATE}/beta/pulse.look")
         L0 = logged()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1024,7 +1178,7 @@ def selfcheck():
            "log, no mark, and the one call it does make (the limit test) is made dry too",
            rc == 0 and "would wake" in buf.getvalue() and "1 row queued/blocked (t1)" in buf.getvalue()
            and all(ln.startswith("limit record --dry ") for ln in did().splitlines())
-           and since(L0) == "" and not os.path.exists(f"{STATE}/beta/pulse.quiet"))
+           and since(L0) == "" and not os.path.exists(f"{STATE}/beta/pulse.look"))
 
         # ---- the log is the record, and it is bounded
         os.environ["CC_PULSE_GAP_MIN"] = "90"
@@ -1109,6 +1263,14 @@ FAKE_SCOPE = r"""#!/usr/bin/env bash
 set -u
 [ -n "${CC_FAKE_SCOPE_BROKEN:-}" ] && exit 2
 printf '%s\n' "${CC_FAKE_ASKS:-0}"
+"""
+
+FAKE_BROKER = r"""#!/usr/bin/env bash
+# selfcheck stub for `cc-broker ledger --once <target> "text"`: records the call the way the real door would be
+# called, so a held tick can be shown to be WRITTEN DOWN and not merely dropped. The real one owns events.md.
+set -u
+printf 'broker %s\n' "$*" >> "$CC_FAKE_CALLS"
+echo ledger
 """
 
 FAKE_PAUSE = r"""#!/usr/bin/env bash

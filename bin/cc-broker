@@ -4,6 +4,8 @@
   cc-broker inject [--no-start] [--source S] <target> "text"   submit an event (argv-compatible with the daemon's
                                                                own `inject`, so it drops in where that is called;
                                                                a unit names itself with CC_BROKER_SOURCE instead)
+  cc-broker ledger [--once] <target> "text"                    record it and wake NOBODY; `--once` skips a line
+                                                               already sitting unread in the file (see THE LEDGER DOOR)
   cc-broker --flush [<target>]                                 deliver what is due (cc-broker.timer, 60 s)
   cc-broker report [--days N]                                  turns woken vs events submitted — the saving, in turns
   cc-broker selfcheck
@@ -17,8 +19,10 @@ daemon's deliver() hands a message straight to a subscribed session and never to
 session is subscribed — a broker in cc-msg would miss exactly the session this is for. And a message from a
 PERSON arrives at the daemon from Slack, never through `inject`, so it cannot be held here: not by a rule that
 could be got wrong, but because it does not pass through this file.
-Being that door means it is gated like that door: cc-guard refuses `inject` here to a worker or member session
-exactly as it refuses the daemon's own, so this file is a way to spend fewer turns and not a way past a gate.
+Being that door means it is gated like that door: cc-guard refuses `inject` AND `ledger` here to a worker or
+member session exactly as it refuses the daemon's own — `ledger` skips the wake, not the delivery, so a rule
+naming only `inject` was a second front door onto the same prompt (review of #246). So this file is a way to
+spend fewer turns and not a way past a gate.
 The units that route through it are systemd, not sessions, and are not gated at all.
 
 THE THREE CLASSES — the one judgement here, so it is written once.
@@ -30,10 +34,19 @@ THE THREE CLASSES — the one judgement here, so it is written once.
           with no decision in it. Written to the target's events.md — and the unread LINES themselves, not just
           their count, ride out on the next message of either other class, so nothing waits on a file being read.
 
-WHAT IS ACTUALLY ROUTED HERE: cc-secretary's findings and cc-reconcile's board watchdog, wired by one
-`Environment=` line each in their units — no edit to either file. Nothing else. cc-pulse, cc-limit and cc-model
-are deliberate wakes with a reason, and cc-land's "landing stopped" is decision-class, which is what it would get
-here anyway; holding any of them buys nothing and costs a session the debounce.
+THE LEDGER DOOR. `cc-broker ledger` is the third class on its own, for a caller that has ALREADY decided its
+line is a repeat and wants no wake and no debounce for it — it writes events.md and returns. Its one user is
+cc-pulse, which knows better than this file whether a tick carries anything the session has not been told: the
+board state it would send is in front of it, and the same state twice is not news. `--once` is for exactly that
+shape — the suppressed tick comes round again every couple of hours for as long as nothing changes, and the
+record is worth one line, not twelve that the session pays to read. It tests the whole UNREAD tail, not the
+last line, so an event from another source landing in between does not buy the repeat a second row. Nothing is
+lost either way: tail() carries the unread lines out on the next message of either other class.
+
+WHAT IS ACTUALLY ROUTED THROUGH `inject`: cc-secretary's findings and cc-reconcile's board watchdog, wired by
+one `Environment=` line each in their units — no edit to either file. Nothing else. cc-pulse, cc-limit and
+cc-model are deliberate wakes with a reason, and cc-land's "landing stopped" is decision-class, which is what it
+would get here anyway; holding any of them buys nothing and costs a session the debounce.
 
 NOTHING IS DROPPED, EVER (owner, 2026-09-02: "we dont worry about where we are in the daily limit, ill just tell
 you myself to stop or not"). There is no budget in this file and no rule that declines to act. A held event is
@@ -213,6 +226,14 @@ def ledger_write(target, text):
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "a") as f:
         f.write(f"- {now_s()} {text}\n")
+
+
+def ledger_pending(target, text):
+    """Is this line already sitting UNREAD in the ledger? `ledger --once`'s whole test. Anywhere in the unread
+    tail, not just at the end: another source's event landing in between must not buy the same repeat a second
+    row. Read is the right boundary — once the lines have ridden out to the session, an identical one after
+    that is a fresh occasion and worth its own row."""
+    return any(ln.endswith(f" {text}") for ln in ledger_unread(target))
 
 
 def log_event(**row):
@@ -459,6 +480,21 @@ def main(argv):
     if argv[0] == "--flush":
         flush(argv[1] if len(argv) > 1 else None)
         return 0
+    if argv[0] == "ledger":
+        rest, once = argv[1:], False
+        while rest and rest[0].startswith("--"):
+            once = once or rest[0] == "--once"
+            rest = rest[1:]
+        if len(rest) < 2:
+            print('cc-broker ledger [--once] <target> "text"', file=sys.stderr); return 2
+        target, text = rest[0], " ".join(rest[1:]).strip()
+        with locked():                       # same lock as submit(): ledger_write appends, tail() reads by position
+            if once and ledger_pending(target, text):
+                print("ledger (already)"); return 0
+            ledger_write(target, text)
+            log_event(at=now_s(), type="event", target=target, source="ledger", cls="ledger",
+                      group="direct", decision=False, chars=len(text))
+        print("ledger"); return 0
     if argv[0] != "inject":
         print(__doc__.strip(), file=sys.stderr); return 2
     # An emitter names itself with --source. CC_BROKER_SOURCE is the same word for one whose argv is not ours to
@@ -580,6 +616,31 @@ def selfcheck():
         run("inject", "--source", "secretary", "r3", "secretary/idle: r3/t PR #5 review — quiet again",
             CC_BROKER_REPEAT_S="0")
         ok("…and past the window it digests again: the suppression is bounded, never permanent", bool(pending("r3")))
+
+        # THE LEDGER DOOR — a caller that has already decided its line is a repeat. cc-pulse's suppressed tick.
+        os.truncate(rec, 0)
+        run("ledger", "r7", "pulse: 1 row in flight (t review) — unchanged")
+        l7 = f"{th}/.cc/state/r7/events.md"
+        ok("`ledger` records the line and wakes nobody at all — no debounce, no pending group",
+           calls() == 0 and os.path.exists(l7) and "1 row in flight" in open(l7).read() and not pending("r7"))
+        run("ledger", "--once", "r7", "pulse: 1 row in flight (t review) — unchanged")
+        ok("…and `--once` writes nothing when that exact line is already sitting unread in the file — the same suppressed "
+           "tick every 2 h is worth one line, not twelve the session pays to read",
+           len([x for x in open(l7) if x.startswith("- ")]) == 1)
+        run("ledger", "--once", "r7", "pulse: 2 rows in flight (t review, u running)")
+        ok("…and a line that says something different is written, `--once` or not",
+           len([x for x in open(l7) if x.startswith("- ")]) == 2)
+        run("ledger", "--once", "r7", "pulse: 1 row in flight (t review) — unchanged")
+        ok("…and `--once` tests the whole UNREAD tail, not the last line: an event from somewhere else landing "
+           "in between must not buy the same repeat a second row",
+           len([x for x in open(l7) if x.startswith("- ")]) == 2)
+        run("inject", "--source", "secretary", "r7", "r7/t needs you: pick one")
+        ok("…and both ledger lines ride out on the next message that wakes the session — a suppressed tick is "
+           "recorded, never dropped",
+           "1 row in flight" in said() and "2 rows in flight" in said() and "2 with nothing to decide" in said())
+        os.truncate(rec, 0)
+        ok("`ledger` with no text is a usage error, never an empty line in somebody's events file",
+           run("ledger", "r7").returncode == 2)
 
         # THE RIDE-ALONG: a wake the box was buying anyway carries what was pending.
         run("inject", "--source", "secretary", "r4", "secretary/idle: r4/t — quiet")
