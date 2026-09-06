@@ -125,5 +125,6 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-scope list myapp                  asks still open        cc-scope unverified myapp  landed, nothing checked
     cc-graphs serve | stop | status      tokens + vitals in a browser, on 127.0.0.1:5190 (loopback)
     cc-spend  |  --by repo|track|model   token spend, biggest first    cc-spend phantoms    spend nobody watches
+    cc-spend cache [--days N]            cache-read tokens per session per day, biggest first
     cc-econ pr [--week|--all]            what an accepted PR cost: worker + fix rounds + reviews, with stops and churn
     cc-econ by-model --bands             the same PRs by model AND by PR size — the routing question

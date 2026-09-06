@@ -36,6 +36,7 @@ one `cc-spend phantoms` gives, because `grew` only changes at a tick anyway.
   cc-spend --by repo|track|model|kind [--week]
   cc-spend --week              the last 7 days
   cc-spend today [<repo>]      what AUTONOMOUS work has booked today, per repo; with a repo, that one number
+  cc-spend cache [--days N]    cache-read tokens per session per day, biggest first (default 7 days)
   cc-spend phantoms            spend with nobody watching it (the tick also saves it to phantoms.tsv)
   cc-spend tick                what the timer runs
   cc-spend selfcheck           fixtures in a HOME of its own — no network, never this box's ledger
@@ -67,6 +68,7 @@ PROCS = os.path.join(ST, "procs.tsv")
 PHANTOMS = os.path.join(ST, "phantoms.tsv")
 WTS = os.path.join(H, ".cc", "worktrees")
 DEV = os.path.join(H, "dev")
+STEWARD = os.path.join(H, ".cc", "steward")
 BOARDS = os.path.join(H, ".cc", "boards")
 STATE = os.path.join(H, ".cc", "state")
 SCRATCH = "cc-land"        # /tmp/cc-land.<step>.<repo>.<pr>.<random> — the throwaway checkout a review or a gate
@@ -142,8 +144,10 @@ def usd(model, u, fast=False):
 
 def place(cwd):
     """(repo, track) for a working directory. ~/.cc/worktrees/<repo>/<track> is a worker; ~/dev/<repo> is that
-    repo's planning session; ~/dev/<handle> carrying .cc/member-workspace is a member's own world. The track
-    column holds the track name, or the word that says which of the other two it is.
+    repo's planning session; ~/dev/<handle> carrying .cc/member-workspace is a member's own world; ~/.cc/steward/
+    <repo> is a headless steward run, called by nobody's window. The track column holds the track name, or the
+    word that says which of the others it is — `session`, `member`, `steward` — so `--by track` shows a repo's
+    steward runs as their own line beside its planning session, once such runs exist.
 
     A review or a gate round runs in a scratch checkout instead, `/tmp/cc-land.<step>.<repo>.<pr>.<random>` —
     the name is cc-land head_checkout()'s side of this, and there is nothing else to read, because the directory
@@ -152,13 +156,15 @@ def place(cwd):
     than nothing — an unattributable quarter of a day's spend reads as a mistake, an unattributable landing
     does not."""
     cwd = (cwd or "").rstrip("/")
-    for base, kind in ((WTS, "worktree"), (DEV, "dev")):
+    for base, kind in ((WTS, "worktree"), (DEV, "dev"), (STEWARD, "steward")):
         if cwd == base or cwd.startswith(base + "/"):
             parts = cwd[len(base) + 1:].split("/") if cwd != base else []
             if not parts or not parts[0]:
                 return "-", "-"
             if kind == "worktree":
                 return parts[0], (parts[1] if len(parts) > 1 else "-")
+            if kind == "steward":
+                return parts[0], "steward"
             if os.path.exists(os.path.join(DEV, parts[0], ".cc", "member-workspace")):
                 return parts[0], "member"
             return parts[0], "session"
@@ -728,6 +734,46 @@ def view(by, window):
     return 0
 
 
+def cmd_cache(n):
+    """`cc-spend cache [--days N]` — cache-read tokens per (session, day), biggest first, off the same TSVs
+    every other view reads. This is the number a steward is judged by: not a fresh collector, the ledger's own
+    cache_read column, which `--by session` already carries but only a day at a time."""
+    window = days(n)
+    rows = list(read_rows(window))
+    span = window[0] if len(window) == 1 else f"{window[-1]}..{window[0]}"
+    if not rows:
+        print(f"cc-spend: nothing recorded for {span}"
+              + ("" if os.path.exists(OFF) else " — no tick has run yet"))
+        return 0
+    groups = {}
+    for r in rows:
+        key = (r["session"][:8], r["ts"][:10])
+        g = groups.setdefault(key, {"usd": 0.0, "in": 0, "out": 0, "cache_read": 0, "cache_write": 0})
+        g["usd"] += r["est_usd"]
+        for k in ("in", "out", "cache_read", "cache_write"):
+            g[k] += r[k]
+    order = sorted(groups.items(), key=lambda kv: -kv[1]["cache_read"])
+    head = ["session", "day", "cache rd", "cache wr", "in", "out", "est $", "rd/out"]
+    out = []
+    for (sid, day), g in order:
+        ratio = f"{g['cache_read'] / g['out']:.1f}" if g["out"] else "-"
+        out.append([sid, day, hn(g["cache_read"]), hn(g["cache_write"]), hn(g["in"]), hn(g["out"]),
+                    f"{g['usd']:.4f}", ratio])
+    print(f"cc-spend cache {span} — {len(rows)} row(s), by session/day, cache read biggest first. "
+          f"USD is an ESTIMATE.")
+    w = table(out, head)
+    tcr = sum(g["cache_read"] for g in groups.values())
+    tcw = sum(g["cache_write"] for g in groups.values())
+    tin = sum(g["in"] for g in groups.values())
+    tout = sum(g["out"] for g in groups.values())
+    tusd = sum(g["usd"] for g in groups.values())
+    tratio = f"{tcr / tout:.1f}" if tout else "-"
+    print("  " + "  ".join([
+        "total".ljust(w[0]), "".ljust(w[1]), hn(tcr).ljust(w[2]), hn(tcw).ljust(w[3]),
+        hn(tin).ljust(w[4]), hn(tout).ljust(w[5]), f"{tusd:.4f}".ljust(w[6]), tratio.ljust(w[7])]))
+    return 0
+
+
 def day_totals(day):
     """{repo: {"auto": usd, "all": usd}} for ONE UTC day, off that day's ledger file alone.
 
@@ -829,6 +875,11 @@ def selfcheck():
        and place("/tmp/cc-land.review.myrepo") == ("-", "landing"))
     ok("…and a directory that is neither a worktree nor a scratch checkout is still nobody's lane",
        place(f"{WTS}/r/t1") == ("r", "t1") and place("/tmp/some-probe") == ("-", "-") and place("") == ("-", "-"))
+    ok("a steward run's cwd is its own track word, beside session and member",
+       place(os.path.join(STEWARD, "myrepo")) == ("myrepo", "steward")
+       and place(os.path.join(STEWARD, "myrepo", "sub")) == ("myrepo", "steward"))
+    ok("…while a plain dev checkout with no steward base and no member marker still reads as a session",
+       place(os.path.join(DEV, "no-such-repo-for-selfcheck-xyz")) == ("no-such-repo-for-selfcheck-xyz", "session"))
 
     th = tempfile.mkdtemp(prefix="ccspend-sc-")
     try:
@@ -1162,6 +1213,87 @@ def selfcheck():
                and "no tick has run yet" in never.stderr)
         finally:
             shutil.rmtree(th3, ignore_errors=True)
+        # ---- `cache`: cache-read tokens per (session, day), off a hand-written ledger — two sessions, two
+        # days, several models folded into one row each, no tick involved.
+        th6 = tempfile.mkdtemp(prefix="ccspend-cache-")
+        try:
+            st6 = os.path.join(th6, ".cc", "state", "spend")
+            os.makedirs(st6)
+            d1, d0 = days(2)                   # d1 = today, d0 = yesterday
+
+            def led6(day, rows):
+                with open(os.path.join(st6, f"{day}.tsv"), "w") as f:
+                    f.write("#" + "\t".join(COLS) + "\n")
+                    for sid, cr, cw, i, o, amt in rows:
+                        f.write("\t".join([f"{day}T10:00:00Z", sid, "/x/whatever", "repo", "t1", "headless",
+                                           "claude-opus-5", str(i), str(o), str(cr), str(cw), f"{amt:.6f}"]) + "\n")
+
+            # sessionA has two rows on d0 (two models, same session/day) that must fold into one line, not two.
+            led6(d1, [("sessionA1", 4000, 0, 100, 10, 0.5), ("sessionB1", 1000, 0, 100, 10, 0.2)])
+            led6(d0, [("sessionA1", 1000, 0, 100, 10, 0.1), ("sessionA1", 500, 0, 50, 5, 0.05),
+                      ("sessionB1", 2000, 0, 200, 20, 0.3)])
+
+            def cache_run(*a):
+                return subprocess.run([sys.executable, me, "cache", *a],
+                                      env={**os.environ, "HOME": th6}, capture_output=True, text=True)
+
+            two = cache_run("--days", "2")
+            s2 = two.stdout
+            i4, i2k, i15, i1k = s2.find("4.0k"), s2.find("2.0k"), s2.find("1.5k"), s2.find("1.0k")
+            total2 = next(ln for ln in s2.splitlines() if ln.strip().startswith("total"))
+            ok("the cache report sums cache-read tokens per (session, day) across models, biggest first, with "
+               "a total line",
+               two.returncode == 0 and i4 >= 0 and i4 < i2k < i15 < i1k and "8.5k" in total2)
+            ok("…and a session is kept apart by day, not folded across days into one row",
+               "5.5k" not in s2)
+            one = cache_run("--days", "1")
+            total1 = next(ln for ln in one.stdout.splitlines() if ln.strip().startswith("total"))
+            ok("`--days` bounds the window — `--days 1` counts only the most recent day",
+               one.returncode == 0 and "5.0k" in total1
+               and "2.0k" not in one.stdout and "1.5k" not in one.stdout)
+            default = cache_run()
+            total_def = next(ln for ln in default.stdout.splitlines() if ln.strip().startswith("total"))
+            ok("…and the default window (7 days) is not silently narrowed to the one day above",
+               default.returncode == 0 and "8.5k" in total_def)
+            ok("a bad --days value is a usage error, not a silent default",
+               cache_run("--days", "0").returncode == 2 and cache_run("--days", "nope").returncode == 2)
+        finally:
+            shutil.rmtree(th6, ignore_errors=True)
+        # ---- a steward run's transcript lands on its own `<repo>/steward` line in `--by track`, apart from a
+        # planning session's `<repo>/session` line — the place() case above, end to end through a real tick.
+        th7 = tempfile.mkdtemp(prefix="ccspend-stew-")
+        try:
+            cwd_st = os.path.join(th7, ".cc", "steward", "myrepo")
+            cwd_sess = os.path.join(th7, "dev", "myrepo")
+            proj_st = os.path.join(th7, ".claude", "projects", "-stew-proj")
+            proj_sess = os.path.join(th7, ".claude", "projects", "-sess-proj")
+            os.makedirs(proj_st)
+            os.makedirs(proj_sess)
+
+            # dated today, not on a fixed day: the assertions below read the row back through the
+            # 7-day `--week` window, which a hardcoded date walks out of a few days after it is written.
+            ts7 = datetime.now(timezone.utc).strftime("%Y-%m-%dT10:00:00.000Z")
+
+            def rec7(rid, sid, cwdv):
+                return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts7,
+                                   "cwd": cwdv, "sessionId": sid, "entrypoint": "sdk-cli",
+                                   "message": {"model": "claude-opus-5", "id": "m_" + rid,
+                                               "usage": {"input_tokens": 100, "output_tokens": 10,
+                                                         "cache_read_input_tokens": 1000,
+                                                         "cache_creation_input_tokens": 0}}}) + "\n"
+
+            open(os.path.join(proj_st, "sstewa1.jsonl"), "w").write(rec7("req_stew", "sstewa1", cwd_st))
+            open(os.path.join(proj_sess, "ssessi1.jsonl"), "w").write(rec7("req_sess", "ssessi1", cwd_sess))
+            env7 = {**os.environ, "HOME": th7}
+            subprocess.run([sys.executable, me, "tick"], env=env7, capture_output=True, text=True)
+            by_track = subprocess.run([sys.executable, me, "--by", "track", "--week"], env=env7,
+                                      capture_output=True, text=True)
+            ok("a steward-placed transcript lands on its own `myrepo/steward` line",
+               by_track.returncode == 0 and "myrepo/steward" in by_track.stdout)
+            ok("…while a session one still lands on `myrepo/session`, and the two are not folded into one row",
+               "myrepo/session" in by_track.stdout and by_track.stdout.count("myrepo/") == 2)
+        finally:
+            shutil.rmtree(th7, ignore_errors=True)
         ok("`phantoms` before any tick says so and exits 1 rather than printing an empty all-clear",
            subprocess.run([sys.executable, me, "phantoms"],
                           env={**os.environ, "HOME": tempfile.mkdtemp(prefix="ccspend-empty-")},
@@ -1205,7 +1337,8 @@ def selfcheck():
 
 # ---------------------------------------------------------------- cli
 
-USAGE = "usage: cc-spend [--by repo|track|model|kind] [--week] | today [<repo>] | phantoms | tick | selfcheck"
+USAGE = ("usage: cc-spend [--by repo|track|model|kind] [--week] | today [<repo>] | cache [--days N] "
+         "| phantoms | tick | selfcheck")
 
 
 def bail():
@@ -1218,6 +1351,19 @@ def main(argv):
         if len(argv) > 2 or (len(argv) == 2 and argv[1].startswith("-")):
             bail()
         return cmd_today(argv[1] if len(argv) == 2 else None)
+    if argv and argv[0] == "cache":
+        rest = argv[1:]
+        n = 7
+        if rest:
+            if len(rest) != 2 or rest[0] != "--days":
+                bail()
+            try:
+                n = int(rest[1])
+            except ValueError:
+                bail()
+            if n < 1:
+                bail()
+        return cmd_cache(n)
     if argv and argv[0] in ("tick", "phantoms", "selfcheck"):
         if len(argv) > 1:
             bail()
