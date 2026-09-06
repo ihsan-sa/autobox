@@ -7,7 +7,7 @@ sh=(); py=()
 for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
 bash -n "${sh[@]}"
 shellcheck -S warning -e SC1090,SC1010 "${sh[@]}"
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py "$@"
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py tests/member_v2.py tests/member_broker.py "$@"
 for f in slack/*.json config/claude-settings.json config/units.json config/claude-managed.json; do jq -e . "$f" >/dev/null; done
 # the agent types (templates/home/agents/ -> ~/.claude/agents/). Nothing else reads these files: a frontmatter the
 # harness rejects takes out every spawn of that type at dispatch time, with no earlier signal. install.sh's own case
@@ -78,15 +78,29 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # temp HOME, that the file it locks is the one cc-land's own git_lock_path names — for a checkout, a linked
 # worktree and a directory with no .git — and that its fetch waits while a landing holds it. Nothing of this
 # box's is fetched and the public repo is never reached: it publishes into a bare repo in the temp dir.
+# cc-fence's is the only one that runs its cases against the KERNEL: private fixtures, and every forbidden
+# operation run three times — unfenced (so a case that stopped testing anything is caught), fenced outside the
+# task tree, fenced inside it. Nothing of this box's is written. cc-member-v2 applies the fence, behind
+# CC_MEMBER_V2=1, off by default and selected by no live session — its own cases run under cc-sandbox's. On a
+# kernel that cannot carry the profile it exits 77 and this loop reports it as skipped, not passed.
+# cc-voice's builds a box of its own — a fake venv whose python prints a transcript, a fake `claude`, a fake
+# recording — over the two halves of a memo: no weights are downloaded, no model is called, no ~/.cc is read.
+# cc-task's is the claim rule itself, in a HOME, state dir, board and git repo of its own: that one task id
+# survives a release, a change of executor and a new owner, that two processes racing for a row leave one winner,
+# and that a claim is never taken while its owner is alive. No board of this box's is read and no runtime is run.
 # …and only the ones a change reaches, when the landing says what changed (CC_LAND_CHANGED — tests/green.sh has
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
 . tests/green.sh; land_scope "$PWD/bin"; skipped=""
-for c in cc-units cc-settings cc-board cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish; do
+for c in cc-units cc-settings cc-board cc-task cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
-  o=$("bin/$c" selfcheck 2>&1) || { echo "$o"; exit 1; }; done
+  rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
+  # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.
+  # Its line is printed and stays visible — that is not a pass. Any other tool exiting 77, and cc-fence exiting
+  # 77 for any other reason (it refuses to report a skip when the kernel HAS Landlock and declined), fails here.
+  [ "$rc" = 0 ] || { echo "$o"; { [ "$rc" = 77 ] && [ "$c" = cc-fence ]; } || exit 1; }; done
 [ -z "$skipped" ] || echo "check.sh: not in this change's reach, not run:$skipped"
 # Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
 # again on the same files the worker already ran it on (tests/green.sh, read by cc-land).
 green_record "$SELF" "$SCOPE"
-echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 1 + $#)) python, json, units, manifests, agent types)"
+echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 3 + $#)) python, json, units, manifests, agent types)"

@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""cc-task — durable identity and exclusive claims for a board row's canonical track.
+
+A row outlives whoever works it: a subagent now, a worker after it, a repair round later. The task id here is
+that row's one acceptance contract, so a retry keeps it and a second writer cannot start beside the first.
+`cc claim` and `cc <repo> <row> --go` both come through here, and nothing else writes the record.
+
+This is coordination data and nothing else. Which repository a track belongs to, which credential it may use
+and what a member session may do all keep coming from the path rules — no field written here grants anything.
+
+  cc-task show <repo> <row>                              print the record
+  cc-task check <repo> <row> [--executor subagent|worker]  would this owner be refused? writes nothing
+  cc-task claim <repo> <row> --executor subagent|worker  claim a track `cc claim` has already prepared
+  cc-task renew <repo> <row> <claim-id> <generation>     stamp this owner's claim as still active
+  cc-task release <repo> <row> <claim-id> <generation> --reason <text>   end it after stopping work
+  cc-task receipt <repo> <row>                           print completion evidence and pending work
+  cc-task reserve-repair <repo> <row> --generation N --branch BRANCH --pr URL --head SHA
+                                                         reserve once; JSON launch=false means do not launch again
+  cc-task artifact <repo> <row> --generation N [--committed-sha SHA] [--pushed-sha SHA]
+  cc-task error <repo> <row> --generation N <stage> [message]   omit message to clear that error
+  cc-task pr <repo> <row> --generation N <url> [--card]    record a PR and the projections it needs
+  cc-task project <repo> <row> --generation N board|card [--chat CHAT --ts TS]   acknowledge a projection
+  cc-task delivered <repo> <row> --generation N          a delivery with no PR: the board says done, the task stays open
+  cc-task close <repo> <row> --generation N done|merged   record closure and its board projection
+  cc-task selfcheck                                      fixtures only
+
+WHO THE OWNER IS is read off the running process: its pid and start time, the boot it started in, the tmux
+window around it, and an agent id when the runtime hands one out. Never a session id somebody typed — a claim
+that can be typed is a claim anyone can take.
+
+WHEN A CLAIM STOPS HOLDING. There is no timer and no takeover by waiting. A claim ends when its owner releases
+it, or when that owner's process is provably gone: a different boot, or a pid whose start time no longer
+matches. Then the next claim supersedes it — same task, next generation, and the old token is dead. A claim
+whose owner is still alive is never taken; if one is stuck, a person removes the record.
+
+A WORKER'S CLAIM IS A DISPATCH RESERVATION. `cc … --go` runs as whoever dispatched, not as the loop it launches,
+so it releases the claim once the window is up and the worker's presence goes back to being its window and its
+loop. A subagent's claim stands until `cc done` ends it, because a subagent has no window to stand for it.
+
+AND A WORKER DISPATCH TAKES OVER FROM A SUBAGENT. When a subagent never reached `cc done` — it was interrupted,
+or its session died mid-row — its claim would otherwise stand for as long as that session lived, and the one
+repair the design gives the lander is exactly a worker dispatch onto the row a subagent built. So a `worker`
+claim supersedes a live `subagent` one, with a new generation on the same task. Nothing supersedes a live
+`worker` claim, and a `subagent` claim never supersedes anything live: a second subagent is told to wait.
+
+THE PATH IS THE KEY. A record found at a row's own state dir is that row's, whatever name is written inside it:
+`cc rename` moves the whole state dir, and a record that refused to answer to its new name would kill every claim
+on a renamed project. The task id, the claim and the executions carry through the rename untouched.
+
+Runtime binding, execution boundaries and presence come later. Until a runtime hands out
+an agent id, two subagents of one session read as one owner.
+
+Completion records pr={url}, card={chat,ts} and closed={status,at}. The pending map holds board={pr?,status}
+and card={url} until acknowledged. artifact.errors holds unresolved {stage,message,at} entries. A receipt
+flattens the artifact SHAs and PR URL; it reports errors separately from pending projections. No receipt
+field authorizes a service call. `cc rm` retires the record beside the repo's other receipts.
+
+CLOSING IS FOR WORK THAT REALLY ENDED, because a closed record refuses every later claim. A merge is that; a
+delivery with no PR is not — a workspace project whose branch IS the delivery says `done` on the board and is
+dispatched again the next week. `delivered` is that ending: the same board projection, no closure.
+"""
+import argparse, fcntl, json, os, re, stat, subprocess, sys, tempfile, time, uuid
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+SCHEMA = 1
+
+def stamp(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def paths(repo, row):
+    if not all(NAME.fullmatch(n) for n in (repo, row)):
+        raise ValueError("invalid repo/row name")
+    return Path.home() / ".cc/state" / repo / row, Path.home() / ".cc/worktrees" / repo / row
+
+def regular(path, flags):
+    """os.open that refuses a link, a pipe, a directory or a second name at that path — the state dir is a
+    directory other sessions write, so what is opened there is checked the way cc-board checks a board."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        os.close(fd); raise ValueError(f"{path}: expected a regular file with one name")
+    return fd
+
+class Lock:
+    """The row lock. Every read-modify-write of delivery.json happens inside one, so two claims arriving at once
+    are two writers in a queue rather than one lost record."""
+    def __init__(self, state): self.path = state / "delivery.lock"
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = regular(self.path, os.O_RDWR | os.O_CREAT)
+        end = time.monotonic() + 30
+        while True:
+            try: fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    os.close(self.fd); raise ValueError("row lock is held by another process")
+                time.sleep(0.05)
+    def __exit__(self, *args): os.close(self.fd)
+
+def read(state):
+    try: fd = regular(state / "delivery.json", os.O_RDONLY)
+    except FileNotFoundError: return None
+    with os.fdopen(fd) as f: return json.load(f)
+
+def save(state, record):
+    """Atomic: a half-written record is worse than an old one, and a reader takes no lock."""
+    fd, tmp = tempfile.mkstemp(dir=state, prefix="delivery.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(record, f, indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, state / "delivery.json")
+        d = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(d)
+        finally: os.close(d)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+# ---- who is asking -------------------------------------------------------------------------------------------
+def process(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return {"pid": int(pid), "ppid": int(fields[1]), "start_ticks": int(fields[19])}
+
+def boot_id(): return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+def window():
+    """The tmux window this process sits in, when there is one. Evidence, not identity: tmux being slow or gone
+    must not turn one owner into two, so a window that cannot be read is simply absent."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane: return None
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{window_id}:#{pid}"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode or not re.fullmatch(r"@\d+:\d+", r.stdout.strip()): return None
+        wid, server = r.stdout.strip().split(":")
+        return {"id": wid, "server": process(int(server))}
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError): return None
+
+def owner():
+    """Runtime evidence, walked out of /proc. `cc` is skipped: it is the front door and it exits at once, so a
+    claim recorded against it would be dead the moment it was written. Inside a Claude Code or codex session the
+    runtime process is the owner; anywhere else it is whoever invoked this."""
+    chain, seen, pid = [], set(), os.getppid()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            p = process(pid)
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+        except (OSError, ValueError, IndexError): break
+        p["command"] = Path(argv[0]).name if argv[0] else ""
+        p["cc"] = any(os.path.realpath(x) == str(BIN / "cc") for x in argv[:2] if x)
+        chain.append(p); pid = p["ppid"]
+    candidates = [p for p in chain if not p["cc"]]
+    if not candidates: raise ValueError("cannot identify the calling process")
+    runtime = os.environ.get("CLAUDECODE") or os.environ.get("CODEX_THREAD_ID")
+    caller = next((p for p in candidates if runtime and p["command"] in ("claude", "codex")), candidates[0])
+    return {"process": {k: caller[k] for k in ("pid", "start_ticks")}, "boot_id": boot_id(),
+            "agent_id": os.environ.get("CLAUDE_CODE_AGENT_ID"), "window": window(),
+            "ancestry": [{k: v for k, v in p.items() if k != "cc"} for p in chain],
+            "session": os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID"),
+            "parent_session": None, "transcript": None}
+
+IDENTITY = ("process", "boot_id", "agent_id")   # the window and the session ids are evidence, not identity
+
+def same_owner(a, b): return all((a or {}).get(k) == (b or {}).get(k) for k in IDENTITY)
+
+def alive(who):
+    """Is this owner's process still running? Hard evidence only — same boot, same pid, same start time. A pid
+    the kernel has handed to somebody else reads as gone, never as this owner."""
+    p = (who or {}).get("process") or {}
+    if (who or {}).get("boot_id") != boot_id(): return False
+    try: return process(p["pid"])["start_ticks"] == p["start_ticks"]
+    except (OSError, ValueError, IndexError, KeyError, TypeError): return False
+
+# ---- the record ----------------------------------------------------------------------------------------------
+def takeover(held, who, executor):
+    """Is this owner allowed past the claim already there? A claim that has ended, is this owner's own, or whose
+    owner is provably gone holds nothing. The one live claim that can be taken is a SUBAGENT's, and only by a
+    worker dispatch — the repair round the design gives cc-land is exactly that, onto the canonical worktree the
+    subagent built, and a subagent that never reached `cc done` must not be able to block it for the life of its
+    session. Nothing takes a live worker's, and a subagent takes nothing that is live."""
+    if not held or held.get("ended_at"): return True
+    if same_owner(held.get("owner"), who) or not alive(held.get("owner")): return True
+    return executor == "worker" and held.get("executor") == "subagent"
+
+def check(record, repo, row, wt, who, executor=None):
+    """Raises when this owner may not write the row. A claim held by a LIVE other owner is the only refusal, and
+    `takeover` says which of those may be taken anyway. No executor named is the strict reading: nothing is taken."""
+    if record is None: return
+    if record.get("schema") != SCHEMA:
+        raise ValueError(f"delivery.json is schema {record.get('schema')!r}, and this cc-task writes {SCHEMA}")
+    uuid.UUID(str(record.get("task_id")))
+    if record.get("closed"): raise ValueError("task is closed; a new task must not inherit its record")
+    c = record.get("claim")
+    if not takeover(c, who, executor):
+        raise ValueError(f"{repo}/{row} is claimed by a live owner (generation {c['generation']}, "
+                         f"{c['executor']}, since {c['started_at']}) — it releases it, or a person removes "
+                         f"{Path.home() / '.cc/state' / repo / row / 'delivery.json'}")
+
+def rekey(record, repo, row, wt):
+    """THE PATH IS THE KEY, and the name in the record is a copy of it. `cc rename` moves ~/.cc/state/<old> to
+    ~/.cc/state/<new> wholesale, so the record under the new row still says the old project — and refusing that
+    would kill every claim on a renamed project until somebody deleted the file by hand (review of #279). The
+    record found at a row's own path IS that row's, exactly as cc-checkpoint and cc-guard read the repository off
+    the worktree's path and never off the marker. What a rename does not change is the task: the id, the claim
+    and the executions carry through. Returns True when something was re-keyed."""
+    want = {"repo": repo, "row": row, "branch": f"track/{row}", "worktree": str(wt)}
+    if all(record.get(k) == v for k, v in want.items()): return False
+    record.update(want); record["rekeyed"] = stamp()
+    return True
+
+def prepared(repo, row, wt):
+    """The canonical worktree has to be there, on this row's branch, in this repository — `cc claim` makes it.
+    A git failure therefore stamps no claim, and a claim never names a tree somebody else prepared."""
+    kind = subprocess.run([str(BIN / "cc-board"), "get", repo, row, "kind"],
+                          capture_output=True, text=True, timeout=30)
+    if kind.stdout.strip() == "session": raise ValueError("a session row has no task to claim")
+    def git(path, *args):
+        r = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(path), *args],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode: raise ValueError(f"{path} is not a git worktree — {repo}/{row} has no canonical track "
+                                          f"prepared, and nothing is claimed until `cc` makes one")
+        return r.stdout.strip()
+    main = Path.home() / "dev" / repo
+    if (git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir") !=
+            git(main, "rev-parse", "--path-format=absolute", "--git-common-dir") or
+            git(wt, "symbolic-ref", "--short", "HEAD") != f"track/{row}" or
+            Path(git(wt, "rev-parse", "--show-toplevel")).resolve() != wt.resolve()):
+        raise ValueError(f"{wt} has the wrong repository or branch for {repo}/{row}")
+
+def write_marker(wt, repo, row, task_id):
+    """The `.cc/track` marker, with the task id on its third line. IT IS WRITTEN HERE AND NOT BY A SHELL REDIRECT,
+    because <worktree>/.cc is bound READ-WRITE into that track's worker sandbox and into a member workspace —
+    cc-checkpoint's header already calls that file "the member's word". A `>` into it is a write through whatever
+    name is there: a link planted at the marker, or at a temp name beside it, would have the next dispatch (the
+    lander's repair round needs no person) truncate any file the owner can write. So: a link at `.cc`, or at the
+    marker itself, is refused outright; the temp file is mkstemp's, a name nobody could have planted; and
+    rename(2) replaces the final component rather than following it. Nothing reads authority off this file."""
+    d = wt / ".cc"; marker = d / "track"
+    if d.is_symlink(): raise ValueError(f"{d} is a link, not this worktree's own directory — refused")
+    d.mkdir(parents=True, exist_ok=True)
+    if marker.is_symlink(): raise ValueError(f"{marker} is a link, not a marker this box wrote — refused")
+    text = f"{repo}\n{row}\n{task_id}\n"
+    try:
+        if marker.read_text() == text: return   # already says this: leave the file, and its mtime, alone
+    except OSError: pass
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="track.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f: f.write(text)
+        os.chmod(tmp, 0o644); os.replace(tmp, marker)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def new_record(repo, row, wt):
+    return {"schema": SCHEMA, "task_id": str(uuid.uuid4()), "repo": repo, "row": row, "branch": f"track/{row}",
+            "worktree": str(wt), "created": stamp(), "claim": None, "executions": [],
+            "artifact": {"committed_sha": None, "pushed_sha": None, "errors": []},
+            "pr": None, "card": None, "closed": None}
+
+def do_claim(d, who, executor, phase="build"):
+    """0 = already this owner's, nothing to write. 1 = a new generation was taken."""
+    c = d.get("claim")
+    if phase == "build" and c and not c.get("ended_at") and same_owner(c.get("owner"), who) and c.get("executor") == executor:
+        return 0
+    if c and not c.get("ended_at") and d["executions"]:   # superseded: the old token can no longer do anything
+        why = ("same owner, new executor" if same_owner(c.get("owner"), who)
+               else "a worker took over from a subagent" if alive(c.get("owner")) else "owner gone")
+        d["executions"][-1]["outcome"] = f"superseded ({why})"
+    c = {"claim_id": str(uuid.uuid4()), "generation": c["generation"] + 1 if c else 1, "executor": executor,
+         "phase": "starting" if phase == "build" else phase, "owner": who, "started_at": stamp(), "activity_at": stamp(),
+         "ended_at": None, "reason": None}
+    d["claim"] = c
+    d["executions"].append({"execution_id": str(uuid.uuid4()), "task_id": d["task_id"], "claim_id": c["claim_id"],
+                            "generation": c["generation"], "phase": phase, "source_transcript": None,
+                            "request_start": None, "request_end": None, "outcome": None})
+    return 1
+
+def reserve_repair(d, a, wt, who):
+    """The row lock covers identity, replay and reservation. A lost launch response never frees this execution.
+    cc --go is a child of this same dispatcher; its ordinary worker claim reuses this owner's reservation.
+    The key is PR plus reviewed head, independent of the dispatcher's lifetime or the current generation."""
+    if d is None or d.get("schema") != SCHEMA: raise ValueError("repair needs a current task record")
+    if (d.get("repo"), d.get("row"), d.get("branch"), (d.get("pr") or {}).get("url")) != (
+            a.repo, a.row, a.branch, a.pr) or d.get("closed"):
+        raise ValueError("repair identity does not match the open task")
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", a.head): raise ValueError("repair needs a full head SHA")
+    if a.branch != f"track/{a.row}": raise ValueError("repair needs the canonical branch")
+    prepared(a.repo, a.row, wt)
+    for e in d["executions"]:
+        r = e.get("repair") or {}
+        if e["phase"] == "repair" and (r.get("pr_url"), r.get("head")) == (a.pr, a.head):
+            return dict(e, launch=False)
+    if a.generation != (d.get("claim") or {}).get("generation"):
+        raise ValueError("repair generation does not match the claim")
+    check(d, a.repo, a.row, wt, who, "worker")
+    resume = d["claim"]["executor"] == "worker"
+    do_claim(d, who, "worker", "repair")
+    e = d["executions"][-1]
+    e["repair"] = {"pr_url": a.pr, "head": a.head, "resume": resume, "at": stamp()}
+    return dict(e, launch=True)
+
+def receipt(d):
+    a = d["artifact"]
+    return {"task_id": d["task_id"], "committed_sha": a["committed_sha"], "pushed_sha": a["pushed_sha"],
+            "pr_url": (d["pr"] or {}).get("url"), "card": d["card"], "closed": d["closed"],
+            "errors": a["errors"], "pending": d.get("pending", {})}
+
+def complete(d, a):
+    """Evidence only. Host completion can report a delivery without taking the builder's claim.
+    Its generation must still match. Pending writes are saved before calling either projection's service.
+    Errors describe unresolved failures; clearing one stage preserves errors at every other stage."""
+    if d is None or d.get("schema") != SCHEMA: raise ValueError("completion needs a current task record")
+    if a.generation != (d.get("claim") or {}).get("generation"):
+        raise ValueError("completion generation does not match the claim")
+    artifact = d["artifact"]; pending = d.setdefault("pending", {})
+    if d["closed"] and a.cmd not in ("project", "error"):
+        raise ValueError("task is closed; only pending projections may be acknowledged")
+    if a.cmd == "artifact":
+        for key in ("committed_sha", "pushed_sha"):
+            sha = getattr(a, key)
+            if sha is not None:
+                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha): raise ValueError("expected a full Git SHA")
+                artifact[key] = sha
+        if a.pushed_sha and artifact["committed_sha"] != a.pushed_sha:
+            raise ValueError("pushed SHA must be the committed SHA")
+    elif a.cmd == "error":
+        artifact["errors"] = [e for e in artifact["errors"] if e["stage"] != a.stage]
+        if a.message: artifact["errors"].append({"stage": a.stage, "message": a.message, "at": stamp()})
+    elif a.cmd == "pr":
+        if not artifact["pushed_sha"] or artifact["pushed_sha"] != artifact["committed_sha"]:
+            raise ValueError("a PR needs the committed head pushed")
+        if not re.fullmatch(r"https://[^/\s]+/[^/\s]+/[^/\s]+/pull/[0-9]+", a.url):
+            raise ValueError("expected a PR URL")
+        if d["pr"] != {"url": a.url}:
+            d["pr"] = {"url": a.url}; d["card"] = None
+        pending["board"] = {"pr": a.url, "status": "review"}
+        if a.card and not d["card"]: pending["card"] = {"url": a.url}
+    elif a.cmd == "project":
+        if a.projection not in pending: raise ValueError("projection is not pending")
+        if a.projection == "card":
+            if not a.chat or not re.fullmatch(r"\S+", a.chat) or not re.fullmatch(r"[0-9]+\.[0-9]+", a.ts or ""):
+                raise ValueError("card needs chat and timestamp")
+            d["card"] = {"chat": a.chat, "ts": a.ts}
+        pending.pop(a.projection)
+        artifact["errors"] = [e for e in artifact["errors"] if e["stage"] != a.projection]
+    elif a.cmd == "delivered":   # the board hears the same word `close done` would project; the record stays claimable
+        if not artifact["committed_sha"]: raise ValueError("a delivery needs a commit")
+        pending["board"] = {"status": "done"}
+    elif a.cmd == "close":
+        if not artifact["committed_sha"] or (a.status == "merged" and not d["pr"]):
+            raise ValueError("closure needs a commit, and merged needs a PR")
+        d["closed"] = {"status": a.status, "at": stamp()}
+        c = d.get("claim")
+        if c and not c.get("ended_at"):
+            c.update(ended_at=stamp(), phase="closed", reason=a.status)
+            if d["executions"]: d["executions"][-1]["outcome"] = f"closed: {a.status}"
+        pending["board"] = {"status": a.status}
+        if d["pr"]: pending["board"]["pr"] = d["pr"]["url"]
+        pending.pop("card", None)   # an already merged head needs no approval card
+        artifact["errors"] = [e for e in artifact["errors"] if e["stage"] != "card"]
+
+def main(argv):
+    if argv == ["selfcheck"]: return selfcheck()
+    p = argparse.ArgumentParser(prog="cc-task", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    completion = ("artifact", "error", "pr", "project", "delivered", "close")
+    for cmd in ("show", "receipt", "check", "claim", "renew", "release", "reserve-repair", *completion):
+        s = sub.add_parser(cmd); s.add_argument("repo"); s.add_argument("row")
+        if cmd in completion: s.add_argument("--generation", type=int, required=True)
+        if cmd == "reserve-repair":
+            s.add_argument("--generation", type=int, required=True)
+            for opt in ("branch", "pr", "head"): s.add_argument(f"--{opt}", required=True)
+        if cmd == "artifact": s.add_argument("--committed-sha"); s.add_argument("--pushed-sha")
+        if cmd == "error": s.add_argument("stage"); s.add_argument("message", nargs="?", default="")
+        if cmd == "pr": s.add_argument("url"); s.add_argument("--card", action="store_true")
+        if cmd == "project":
+            s.add_argument("projection", choices=("board", "card")); s.add_argument("--chat"); s.add_argument("--ts")
+        if cmd == "close": s.add_argument("status", choices=("done", "merged"))
+        if cmd in ("claim", "check"):
+            s.add_argument("--executor", choices=("subagent", "worker"), required=(cmd == "claim"))
+        if cmd in ("renew", "release"):
+            s.add_argument("claim_id"); s.add_argument("generation", type=int)
+        if cmd == "release": s.add_argument("--reason", required=True)
+    a = p.parse_args(argv); state, wt = paths(a.repo, a.row)
+    if a.cmd in ("show", "receipt"):
+        d = read(state)
+        if d is None: raise ValueError(f"no task record for {a.repo}/{a.row}")
+        print(json.dumps(receipt(d) if a.cmd == "receipt" else d, indent=2)); return 0
+    if a.cmd in completion:
+        if not state.is_dir(): raise ValueError("no task record")
+        with Lock(state):
+            d = read(state); complete(d, a); save(state, d)
+        print(json.dumps(receipt(d), indent=2)); return 0
+    who = owner()
+    if a.cmd == "reserve-repair":
+        if not state.is_dir(): raise ValueError("no task record")
+        with Lock(state):
+            d = read(state); reservation = reserve_repair(d, a, wt, who)
+            if reservation["launch"]: save(state, d)
+        print(json.dumps(reservation, indent=2)); return 0
+    ex = getattr(a, "executor", None)
+    if a.cmd == "check":   # a question, asked without the lock: it creates no state dir for a row that has none,
+        check(read(state), a.repo, a.row, wt, who, ex); return 0   # and only `claim` is ever the atomic answer
+    with Lock(state):
+        d = read(state)
+        check(d, a.repo, a.row, wt, who, ex)
+        moved = d is not None and rekey(d, a.repo, a.row, wt)
+        if a.cmd == "claim":
+            prepared(a.repo, a.row, wt)
+            if d is None: d = new_record(a.repo, a.row, wt)
+            took = do_claim(d, who, a.executor)
+            write_marker(wt, a.repo, a.row, d["task_id"])   # refused here = nothing claimed: the record is unwritten
+            if took or moved: save(state, d)
+        else:
+            c = (d or {}).get("claim") or {}
+            if (a.claim_id, a.generation) != (c.get("claim_id"), c.get("generation")) \
+                    or not same_owner(c.get("owner"), who) or c.get("ended_at"):
+                raise ValueError("claim token, generation or owner does not match a live claim")
+            if a.cmd == "renew": c["activity_at"] = stamp()
+            else:
+                if not a.reason.strip(): raise ValueError("release needs a reason")
+                c.update(ended_at=stamp(), reason=a.reason, phase="released")
+                if d["executions"]: d["executions"][-1]["outcome"] = f"released: {a.reason}"
+            save(state, d)
+    print(json.dumps(d, indent=2)); return 0
+
+def selfcheck():
+    """Every fixture owns its HOME, its state, its board and its git remote. No service and no runtime is called."""
+    n = 0
+    def ok(what, cond):
+        nonlocal n
+        print(("  ok   " if cond else "  FAIL ") + what)
+        if not cond: n += 1
+    print("cc-task selfcheck")
+    with tempfile.TemporaryDirectory(prefix="cctask-sc-") as th:
+        env = {"HOME": th, "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"}
+        def run(*args):
+            return subprocess.run([sys.executable, __file__, *args], env=env, capture_output=True,
+                                  text=True, timeout=60)
+        def git(*args): subprocess.run(["git", *args], env=env, check=True, capture_output=True)
+        root = Path(th); dev = root / "dev/r"; dev.mkdir(parents=True)
+        git("init", "-q", "-b", "main", str(dev))
+        git("-C", str(dev), "-c", "user.name=T", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base")
+        wt = root / ".cc/worktrees/r/t"; wt.parent.mkdir(parents=True)
+        git("-C", str(dev), "worktree", "add", "-q", "-b", "track/t", str(wt))
+        record = root / ".cc/state/r/t/delivery.json"
+        args = ("claim", "r", "t", "--executor", "subagent")
+
+        first = run(*args); d = json.loads(first.stdout or "{}"); before = record.read_bytes()
+        ok("claim writes the record and one reservation; the same owner claiming again changes not one byte",
+           first.returncode == 0 and run(*args).returncode == 0 and record.read_bytes() == before
+           and d["schema"] == SCHEMA and d["claim"]["generation"] == 1 and d["claim"]["phase"] == "starting"
+           and len(d["executions"]) == 1 and d["closed"] is None and d["artifact"]["errors"] == [])
+        marker = wt / ".cc/track"; decoy = root / "decoy"; decoy.write_text("do not touch\n")
+        ok("claiming writes the marker: the repo, the row and the task id, as a plain file",
+           marker.read_text() == f"r\nt\n{d['task_id']}\n" and not marker.is_symlink())
+        marker.unlink(); marker.symlink_to(decoy)
+        planted = run(*args)
+        ok("a link planted at .cc/track is refused, the file it named is untouched, and nothing is claimed",
+           planted.returncode != 0 and decoy.read_text() == "do not touch\n" and marker.is_symlink()
+           and record.read_bytes() == before)
+        marker.unlink()
+        os.rename(wt / ".cc", wt / ".cc-real"); os.symlink(str(root), str(wt / ".cc"))
+        planted_dir = run(*args)
+        ok("…and so is a link planted at .cc itself — the marker is never written through somebody else's name",
+           planted_dir.returncode != 0 and record.read_bytes() == before
+           and not (root / "track").exists())
+        os.remove(wt / ".cc"); os.rename(wt / ".cc-real", wt / ".cc")
+        ok("…while the claim that follows writes the marker again, in its own directory",
+           run(*args).returncode == 0 and marker.read_text() == f"r\nt\n{d['task_id']}\n"
+           and not marker.is_symlink() and record.read_bytes() == before)
+
+        ok("no identity can be typed in, and asking `check` writes nothing — not even a state dir for a fresh row",
+           run(*args, "--session-id", "typed").returncode != 0 and run("check", "r", "t").returncode == 0
+           and run("check", "r", "t").stdout == "" and record.read_bytes() == before
+           and run("check", "r", "fresh").returncode == 0 and not (record.parent.parent / "fresh").exists())
+
+        c = d["claim"]; token = ("r", "t", c["claim_id"], str(c["generation"]))
+        ok("renew stamps activity for the owner's own token; a wrong generation is refused",
+           run("renew", *token).returncode == 0 and run("renew", *token[:-1], "2").returncode != 0
+           and json.loads(record.read_text())["claim"]["activity_at"] >= c["activity_at"])
+        ok("release ends the claim explicitly, and an ended claim can neither renew nor release again",
+           run("release", *token, "--reason", "stopped").returncode == 0
+           and json.loads(record.read_text())["claim"]["ended_at"]
+           and run("renew", *token).returncode != 0
+           and run("release", *token, "--reason", "late").returncode != 0)
+
+        after = json.loads(record.read_text()); before = record.read_bytes()
+        second = json.loads(run(*args).stdout)
+        ok("a claim after a release keeps the task and advances the generation; the released token stays dead",
+           second["task_id"] == d["task_id"] and second["claim"]["generation"] == 2
+           and second["executions"][0]["execution_id"] == d["executions"][0]["execution_id"]
+           and len(second["executions"]) == 2 and after["claim"]["claim_id"] != second["claim"]["claim_id"]
+           and run("renew", *token).returncode != 0)
+
+        before = record.read_bytes()
+        third = json.loads(run("claim", "r", "t", "--executor", "worker").stdout)
+        ok("the same owner may change executor — one task, next generation, and the old execution says so",
+           third["task_id"] == d["task_id"] and third["claim"]["generation"] == 3
+           and third["claim"]["executor"] == "worker" and len(third["executions"]) == 3
+           and "superseded" in third["executions"][1]["outcome"]
+           and record.read_bytes() != before)
+
+        ok("show prints the record; a row without one, and an unusable name, create nothing",
+           json.loads(run("show", "r", "t").stdout) == third and run("show", "r", "missing").returncode != 0
+           and run("claim", "r", "../escape", "--executor", "worker").returncode != 0
+           and not (record.parent.parent / "missing").exists())
+
+        before = record.read_bytes()
+        git("-C", str(wt), "checkout", "-q", "--detach")
+        ok("a worktree on the wrong HEAD, and a row with no worktree at all, claim nothing and stamp nothing",
+           run(*args).returncode != 0 and record.read_bytes() == before
+           and run("claim", "r", "missing", "--executor", "worker").returncode != 0
+           and not (record.parent.parent / "missing/delivery.json").exists())
+        git("-C", str(wt), "checkout", "-q", "track/t")
+
+        board = subprocess.run([str(BIN / "cc-board"), "init", "r", str(dev), "main"], env=env,
+                               capture_output=True, text=True, timeout=30)
+        for cmd in (("add", "r", "s1", "a session", ""), ("set", "r", "s1", "kind", "session")):
+            subprocess.run([str(BIN / "cc-board"), *cmd], env=env, capture_output=True, timeout=30)
+        ok("a session row has no task to claim, while an ordinary row on the same board still does",
+           board.returncode == 0 and run("claim", "r", "s1", "--executor", "subagent").returncode != 0
+           and not (record.parent.parent / "s1/delivery.json").exists()
+           and run("claim", "r", "t", "--executor", "worker").returncode == 0)
+
+        # TWO LONG-LIVED OWNERS AT ONE BARRIER. Each waits for the gate, claims, records its status and then stays
+        # alive until the gate is removed — so the winner's claim can be tested while its owner is still running,
+        # which is the whole of the rule. Sharing this process as a parent does not make them one owner.
+        record.unlink()
+        # A separate owner: it waits for the gate, claims, optionally hands the claim straight back, writes its
+        # status and then stays alive until the gate is removed. Being started by this process does not make it
+        # this process.
+        helper = root / "owner.py"
+        helper.write_text(
+            "import json,pathlib,subprocess,sys,time\n"
+            "gate,out,mode,ex,py,tool,repo,row = sys.argv[1:9]\n"
+            "g=pathlib.Path(gate)\n"
+            "while not g.exists(): time.sleep(.01)\n"
+            "r=subprocess.run([py,tool,'claim',repo,row,'--executor',ex],capture_output=True,text=True)\n"
+            "if mode=='release' and r.returncode==0:\n"
+            "    c=json.loads(r.stdout)['claim']\n"
+            "    subprocess.run([py,tool,'release',repo,row,c['claim_id'],str(c['generation']),\n"
+            "                    '--reason','handed back'],capture_output=True)\n"
+            "pathlib.Path(out).write_text(str(r.returncode))\n"
+            "while g.exists(): time.sleep(.01)\n")
+        def owners(mode, n, gate, ex="subagent"):
+            for stale in root.glob("rc*"): stale.unlink()
+            ps = [subprocess.Popen([sys.executable, str(helper), str(gate), f"{root}/rc{i}", mode, ex,
+                                    sys.executable, __file__, "r", "t"], env=env) for i in range(n)]
+            gate.touch()
+            for _ in range(6000):
+                if all((root / f"rc{i}").exists() for i in range(n)): break
+                time.sleep(0.01)
+            return ps, sorted((root / f"rc{i}").read_text() for i in range(n))
+        gate = root / "gate"
+        ps, rcs = owners("hold", 2, gate)
+        raced = json.loads(record.read_text()); held = record.read_bytes()
+        ok("two owners claiming at once leave one winner, and a third owner is refused while it is alive",
+           rcs == ["0", "1"] and len(raced["executions"]) == 1 and raced["claim"]["generation"] == 1
+           and run(*args).returncode != 0 and run("check", "r", "t").returncode != 0
+           and record.read_bytes() == held)
+        gate.unlink()
+        for p in ps: p.wait(timeout=60)
+        old = raced["claim"]
+        taken = run(*args)
+        ok("once that owner's process is gone the row is claimable again — same task, next generation, old token dead",
+           taken.returncode == 0 and json.loads(taken.stdout)["task_id"] == raced["task_id"]
+           and json.loads(taken.stdout)["claim"]["generation"] == 2
+           and "superseded (owner gone)" == json.loads(taken.stdout)["executions"][0]["outcome"]
+           and run("renew", "r", "t", old["claim_id"], str(old["generation"])).returncode != 0)
+
+        # A CLAIM ITS OWNER HANDED BACK DOES NOT HOLD THE ROW, however alive that owner still is. `cc … --go`
+        # releases at launch — the dispatcher is not the worker — so cc-land's repair round and a re-dispatch
+        # from another window have to get through (review of #279).
+        record.unlink()
+        gate2 = root / "gate2"; held_ps, rcs2 = owners("release", 1, gate2)
+        released = json.loads(record.read_text())
+        after = run("claim", "r", "t", "--executor", "worker")
+        ok("a claim handed back does not hold the row, even while the owner that took it is still running",
+           rcs2 == ["0"] and released["claim"]["ended_at"] and after.returncode == 0
+           and json.loads(after.stdout)["task_id"] == released["task_id"]
+           and json.loads(after.stdout)["claim"]["generation"] == 2
+           and json.loads(after.stdout)["executions"][0]["outcome"] == "released: handed back"
+           and run("check", "r", "t").returncode == 0)
+        gate2.unlink()
+        for p in held_ps: p.wait(timeout=60)
+
+        # A WORKER DISPATCH TAKES OVER FROM A SUBAGENT, and only from a subagent. A subagent that never reached
+        # `cc done` would otherwise hold the row for the life of its session, and the one automatic repair the
+        # design gives cc-land is exactly a worker onto the row a subagent built (review of #279).
+        record.unlink()
+        gate3 = root / "gate3"; sub_ps, _ = owners("hold", 1, gate3)
+        held = json.loads(record.read_text()); bytes3 = record.read_bytes()
+        second = run("claim", "r", "t", "--executor", "subagent")
+        over = run("claim", "r", "t", "--executor", "worker")
+        got = json.loads(over.stdout or "{}")
+        ok("a worker dispatch takes over a live subagent claim; a second subagent, on the same live claim, waits",
+           second.returncode != 0 and over.returncode == 0 and got["task_id"] == held["task_id"]
+           and got["claim"]["generation"] == 2 and got["claim"]["executor"] == "worker"
+           and got["executions"][0]["outcome"] == "superseded (a worker took over from a subagent)"
+           and run("renew", "r", "t", held["claim"]["claim_id"], "1").returncode != 0
+           and bytes3 != record.read_bytes())
+        gate3.unlink()
+        for p in sub_ps: p.wait(timeout=60)
+
+        record.unlink()
+        gate4 = root / "gate4"; wrk_ps, _ = owners("hold", 1, gate4, ex="worker")
+        bytes4 = record.read_bytes()
+        ok("nothing takes a live WORKER's claim — not another worker, not a subagent, and check says so too",
+           run("claim", "r", "t", "--executor", "worker").returncode != 0
+           and run("claim", "r", "t", "--executor", "subagent").returncode != 0
+           and run("check", "r", "t", "--executor", "worker").returncode != 0
+           and record.read_bytes() == bytes4)
+        gate4.unlink()
+        for p in wrk_ps: p.wait(timeout=60)
+
+        # THE PATH IS THE KEY. `cc rename` moves the whole state dir, so a record arrives under a row whose name
+        # it has never heard of; refusing it killed every claim on a renamed project. The task is what carries.
+        moved = json.loads(record.read_text())
+        git("-C", str(dev), "worktree", "add", "-q", "-b", "track/t2", str(root / ".cc/worktrees/r/t2"))
+        os.makedirs(root / ".cc/state/r/t2", exist_ok=True)
+        os.replace(record, root / ".cc/state/r/t2/delivery.json")
+        rekeyed = run("claim", "r", "t2", "--executor", "worker")
+        got = json.loads(rekeyed.stdout or "{}")
+        ok("a record that moved with its state dir answers to the row it is found under, task and history intact",
+           rekeyed.returncode == 0 and got["task_id"] == moved["task_id"] and got["row"] == "t2"
+           and got["branch"] == "track/t2" and got["worktree"].endswith("/.cc/worktrees/r/t2")
+           and got["rekeyed"] and got["created"] == moved["created"]
+           and [e["execution_id"] for e in got["executions"][:len(moved["executions"])]]
+               == [e["execution_id"] for e in moved["executions"]])
+        # Completion uses the same row lock and keeps the claim and execution identities intact.
+        record2 = root / ".cc/state/r/t2/delivery.json"; generation = str(got["claim"]["generation"])
+        def finish(cmd, *args, gen=generation): return run(cmd, "r", "t2", "--generation", gen, *args)
+        sha, other = "a" * 40, "b" * 40
+        written = finish("artifact", "--committed-sha", sha)
+        before = record2.read_bytes()
+        ok("C1: committed evidence is durable; malformed and uncommitted pushed SHAs leave it untouched",
+           written.returncode == 0 and json.loads(written.stdout)["committed_sha"] == sha
+           and finish("artifact", "--pushed-sha", other).returncode != 0
+           and finish("artifact", "--committed-sha", "short").returncode != 0 and record2.read_bytes() == before
+           and finish("pr", "https://example.test/o/r/pull/1").returncode != 0
+           and finish("close", "merged").returncode != 0)
+        ok("C2: only the current generation can complete; completion never creates a legacy row's record",
+           finish("artifact", "--pushed-sha", sha).returncode == 0
+           and finish("error", "pr", "stale", gen=str(int(generation) - 1)).returncode != 0
+           and run("artifact", "r", "absent", "--generation", "1", "--committed-sha", sha).returncode != 0
+           and not (root / ".cc/state/r/absent").exists())
+        before = record2.read_bytes()
+        with Lock(record2.parent):
+            p1 = subprocess.Popen([sys.executable, __file__, "error", "r", "t2", "--generation", generation,
+                                   "board", "offline"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(.15)
+            held = p1.poll() is None and record2.read_bytes() == before
+        p1.communicate(timeout=60)
+        finish("error", "card", "offline"); finish("error", "board")
+        ok("C3: completion waits on the existing lock; clearing board's error preserves card's error",
+           held and p1.returncode == 0
+           and [e["stage"] for e in json.loads(record2.read_text())["artifact"]["errors"]] == ["card"])
+        finish("pr", "https://example.test/o/r/pull/1", "--card")
+        pending = json.loads(run("receipt", "r", "t2").stdout)
+        before = record2.read_bytes()
+        ok("C4: PR and both pending projections can be read by a later caller; bad coordinates acknowledge nothing",
+           pending["pr_url"] == "https://example.test/o/r/pull/1" and set(pending["pending"]) == {"board", "card"}
+           and finish("project", "card", "--chat", "fixture", "--ts", "bad").returncode != 0
+           and record2.read_bytes() == before)
+        finish("project", "board"); finish("project", "card", "--chat", "fixture", "--ts", "1.2")
+        finish("pr", "https://example.test/o/r/pull/1", "--card")
+        settled = json.loads(run("receipt", "r", "t2").stdout)
+        ok("C5: acknowledgement clears its error atomically; retry keeps the card and cannot acknowledge it twice",
+           settled["card"] == {"chat": "fixture", "ts": "1.2"} and set(settled["pending"]) == {"board"}
+           and finish("project", "card", "--chat", "fixture", "--ts", "1.3").returncode != 0
+           and json.loads(record2.read_text())["executions"] == got["executions"]
+           and settled["errors"] == [])
+        ok("C5b: a delivery with no PR projects done and leaves the task claimable — C6 is its control, where a "
+           "merge closes the record and the next claim is refused",
+           finish("delivered").returncode == 0
+           and json.loads(run("receipt", "r", "t2").stdout)["pending"]["board"] == {"status": "done"}
+           and json.loads(record2.read_text())["closed"] is None
+           and run("check", "r", "t2", "--executor", "worker").returncode == 0)
+        finish("close", "merged"); closed = json.loads(run("receipt", "r", "t2").stdout)
+        ok("C6: closed receipts still accept pending board acknowledgements; claims and artifact rewrites are refused",
+           closed["closed"]["status"] == "merged" and closed["pending"]["board"]["status"] == "merged"
+           and finish("project", "board").returncode == 0 and finish("artifact", "--committed-sha", other).returncode != 0
+           and run("claim", "r", "t2", "--executor", "worker").returncode != 0
+           and json.loads(run("receipt", "r", "t2").stdout)["pending"] == {})
+
+        # R1-R4 use the real command, row lock and canonical Git tree. No worker or runtime is launched.
+        repair_base = json.loads(record2.read_text()); repair_base["closed"] = None
+        repair_base["claim"]["executor"] = "subagent"
+        record2.write_text(json.dumps(repair_base))
+        reserve = ("reserve-repair", "r", "t2", "--generation", generation, "--branch", "track/t2",
+                   "--pr", repair_base["pr"]["url"], "--head", sha)
+        before = record2.read_bytes()
+        with Lock(record2.parent):
+            racers = [subprocess.Popen([sys.executable, __file__, *reserve], env=env, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True) for _ in range(2)]
+            time.sleep(.15)
+            held = all(p.poll() is None for p in racers) and record2.read_bytes() == before
+        answers = [json.loads(p.communicate(timeout=60)[0]) for p in racers]
+        reserved = json.loads(record2.read_text()); before = record2.read_bytes()
+        ok("R1: repair waits for the row lock; two dispatches get one execution and only one launch permission",
+           held and all(p.returncode == 0 for p in racers) and sorted(a["launch"] for a in answers) == [False, True]
+           and answers[0]["execution_id"] == answers[1]["execution_id"]
+           and reserved["claim"]["phase"] == "repair" and reserved["executions"][-1]["phase"] == "repair"
+           and not answers[0]["repair"]["resume"] and len(reserved["executions"]) == len(repair_base["executions"]) + 1)
+        claimed = run("claim", "r", "t2", "--executor", "worker")
+        c = reserved["claim"]
+        ok("R2: the dispatcher's worker claim reuses the repair; no extra build execution or new generation",
+           claimed.returncode == 0 and record2.read_bytes() == before
+           and run("renew", "r", "t2", repair_base["claim"]["claim_id"], generation).returncode != 0)
+        run("release", "r", "t2", c["claim_id"], str(c["generation"]), "--reason", "worker launched")
+        before = record2.read_bytes(); replay = run(*reserve)
+        ok("R2 control: after release, an old dispatch still gets the same reservation with launch=false",
+           replay.returncode == 0 and not json.loads(replay.stdout)["launch"]
+           and json.loads(replay.stdout)["execution_id"] == answers[0]["execution_id"] and record2.read_bytes() == before)
+        dead = json.loads(record2.read_text()); dead["claim"]["owner"]["boot_id"] = "previous-boot"
+        dead["claim"]["ended_at"] = None; record2.write_text(json.dumps(dead)); before = record2.read_bytes()
+        replay = run(*reserve)
+        ok("R2 restart control: an ambiguous dispatch whose owner died keeps its reservation too",
+           replay.returncode == 0 and not json.loads(replay.stdout)["launch"] and record2.read_bytes() == before)
+        for field, value in (("repo", "other"), ("branch", "track/other"), ("pr", {"url": "https://example.test/o/r/pull/2"}),
+                             ("closed", {"status": "merged"})):
+            wrong = dict(repair_base, **{field: value}); record2.write_text(json.dumps(wrong)); before = record2.read_bytes()
+            refused = run(*reserve)
+            ok(f"R3: repair with mismatched {field} is a request that must be refused; R1 is its control",
+               refused.returncode != 0 and record2.read_bytes() == before)
+        record2.write_text(json.dumps(repair_base)); before = record2.read_bytes()
+        ok("R3 generation/head controls: stale generation, short SHA and absent task reserve nothing",
+           run(*reserve, "--generation", "0").returncode != 0 and run(*reserve, "--head", "short").returncode != 0
+           and run("reserve-repair", "r", "absent", *reserve[3:]).returncode != 0 and record2.read_bytes() == before)
+        git("-C", str(root / ".cc/worktrees/r/t2"), "checkout", "-q", "--detach")
+        ok("R3 worktree control: a matching record with the actual tree on the wrong HEAD reserves nothing",
+           run(*reserve).returncode != 0 and record2.read_bytes() == before)
+        git("-C", str(root / ".cc/worktrees/r/t2"), "checkout", "-q", "track/t2")
+        repair_base["claim"]["executor"] = "worker"; record2.write_text(json.dumps(repair_base))
+        worker = json.loads(run(*reserve).stdout)
+        changed = json.loads(run(*reserve, "--generation", str(worker["generation"]), "--head", other).stdout)
+        ok("R4: a worker repair resumes; a different head is a different execution, while the old head stays spent",
+           worker["repair"]["resume"] and worker["launch"] and changed["launch"]
+           and changed["execution_id"] != worker["execution_id"]
+           and not json.loads(run(*reserve).stdout)["launch"])
+
+        bad_schema = json.loads(record2.read_text()); bad_schema["schema"] = 99
+        (root / ".cc/state/r/t2/delivery.json").write_text(json.dumps(bad_schema))
+        ok("…while a record this cc-task did not write is refused, not adopted",
+           run("claim", "r", "t2", "--executor", "worker").returncode != 0
+           and run("check", "r", "t2").returncode != 0
+           and json.loads((root / ".cc/state/r/t2/delivery.json").read_text())["schema"] == 99)
+
+        me = {"process": {k: process(os.getpid())[k] for k in ("pid", "start_ticks")},
+              "boot_id": boot_id(), "agent_id": None}
+        reused = json.loads(json.dumps(me)); reused["process"]["start_ticks"] += 1
+        ok("a reused pid, another boot and a sibling agent are each a different owner, and none of them is alive",
+           same_owner(me, me) and alive(me) and not same_owner(me, reused) and not alive(reused)
+           and not same_owner(me, {**me, "boot_id": "another-boot"})
+           and not alive({**me, "boot_id": "another-boot"})
+           and not same_owner(me, {**me, "agent_id": "sibling"}))
+    print(f"cc-task selfcheck: {n} failed"); return 1 if n else 0
+
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as e:
+        sys.exit(f"cc-task: {e}")

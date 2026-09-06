@@ -1,0 +1,1304 @@
+#!/usr/bin/env python3
+"""cc-rename — rename a project on this box, everywhere the box keys by its name.
+
+  cc rename <old> <new> [-n|--dry-run] [--stop]
+
+A project's name is a key in a dozen places, and a rename that reaches eleven of them leaves the
+twelfth answering about a project that no longer exists. These all move in one pass:
+
+  ~/dev/<name>                the checkout, and the two absolute paths git keeps for each linked
+                              worktree, and each worktree's .cc/track marker
+  ~/.cc/worktrees/<name>      every track's worktree
+  ~/.cc/state/<name>          tracks, journals, goals, events — and ~/.cc/state/<name>@<alias>,
+                              which is an orchestrator's state and belongs to the same project
+  ~/.cc/boards/<name>.json    the board, and the repo and paths written inside it
+  ~/.cc/scope/<name>.json     the ask ledger, and the repo written inside it
+  Slack                       #<name>, #<name>-updates, every #<name>--<track> and every sub-orch
+                              channel, RENAMED IN PLACE so their history stays; routes.json and the
+                              orch table follow, and the name->id cache is dropped
+  tmux                        the windows named <name>, <name>/<track> and <name>@<alias>
+  ~/.cc/config                the keys that name projects
+  records                     the landing jobs, the broker's tables (keyed by target, so the project's
+                              own and each track's), the reconcile snapshot, the handoff records — the
+                              live one and its brief move to the new slug, and every one of them says
+                              the new target — the harness transcript directories (keyed by the
+                              checkout's path, so --resume survives the restart) and cc-spend's read
+                              offsets into them, so a moved transcript is not read again from byte 0
+                              and its spend counted a second time
+
+WHAT IT DELIBERATELY LEAVES ALONE, because a rename that also edited these would be doing something
+nobody asked for:
+
+  the GitHub remote      `git remote -v` says afterwards exactly what it said before. This is the
+                         box's name for the project. A repository is renamed on GitHub by a person.
+  prose                  briefs, journals, goals, CLAUDE.md and the like still say the old name
+                         wherever a person wrote it. Those are somebody's words, not a key.
+  history                the spend day files, ~/.cc/notify.log and ~/.cc/state/quick.log keep the
+                         name each row was written under, because that is the name it happened
+                         under. Only what the box reads to answer about the project NOW moves.
+
+  -n, --dry-run   print every path, channel, window and row it would change, and change nothing. A
+                  live project still gets its whole list, with a note that a real run would refuse.
+  --stop          stop this project's live sessions and workers first, and start them again after,
+                  under the new name. Without it a live one REFUSES: moving the directory a session
+                  is working in leaves it writing into a path that is no longer there.
+
+It refuses BEFORE anything moves — when <old> names no project here; when <new> already names
+something on this box, or any channel the rename would take is already in Slack (#<new>, its
+-updates lane, a track's); when <old> is a member workspace, whose name is also the member's handle
+and keys their credential, their sandbox and their own board; and when it is itself running in one
+of the project's own tmux windows, because --stop would then kill it before anything had moved.
+"""
+import sys, os, re, json, glob, time, fcntl, shutil, contextlib, subprocess, urllib.parse, urllib.request
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")   # `cc`'s own valid_name, so a rename cannot mint a name `cc` would then refuse
+SELF = os.path.realpath(__file__)
+BIN = os.path.dirname(SELF)          # helpers come from the same bin/ as this copy, like `cc` and cc-slack
+
+
+def home():
+    """Read at call time, never cached: the selfcheck runs whole fixture boxes under HOMEs of their own,
+    and every path below — including the ones a subprocess derives — has to follow it."""
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def dev():        return f"{home()}/dev"
+def state():      return f"{home()}/.cc/state"
+def worktrees():  return f"{home()}/.cc/worktrees"
+def boards():     return f"{home()}/.cc/boards"
+def slack_dir():  return os.environ.get("CC_SLACK_DIR") or f"{home()}/.cc/slack"
+
+
+# ---------------------------------------------------------------------------- Slack, through one door
+def slack_api(method, token, **params):
+    """The Slack Web API, form-encoded. Raises RuntimeError on !ok, the way cc-slack's own call does."""
+    data = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
+    req = urllib.request.Request(f"https://slack.com/api/{method}", data=data,
+                                 headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        out = json.loads(r.read().decode())
+    if not out.get("ok"):
+        raise RuntimeError(f"{method}: {out.get('error')}")
+    return out
+
+
+API = slack_api   # EVERY Slack call in this file goes through `api()` below, so a test swaps this one name
+DENIED = []       # …and a swap that denies RECORDS what it refused: an exception alone is swallowed by the
+                  # `except Exception` around each channel, and the record is what makes a run end red.
+
+
+def api(method, token, **params):
+    return API(method, token, **params)
+
+
+def deny_slack(method, token, **params):
+    DENIED.append(method)
+    raise RuntimeError(f"Slack API not declared for this case — {method}")
+
+
+def bot_token():
+    """The bot token, from the one reader of ~/.cc/config. Empty when Slack is not set up here — a box
+    without Slack renames everything else and says so, rather than failing on a call it cannot make."""
+    try:
+        out = subprocess.run([f"{BIN}/cc-config", "get", "SLACK_BOT_TOKEN"], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+    return out
+
+
+CHAN_MAX = 80   # Slack's own limit on a channel name (cc-slack: CHAN_MAX)
+
+
+def slug(name):
+    """A project name as Slack spells it: lower case, anything outside [a-z0-9-] folded to a dash.
+    The same folding cc-slack's chan_target does, so the names built here are the names it resolves."""
+    return re.sub(r"[^a-z0-9-]+", "-", (name or "").lower()).strip("-")
+
+
+def list_channels(tok):
+    """[(id, name)] for every unarchived channel the bot can see, paged the way cc-slack pages it."""
+    out, cur = [], ""
+    while True:
+        r = api("conversations.list", tok, types="public_channel,private_channel",
+                exclude_archived="true", limit="200", cursor=cur or None)
+        for c in r.get("channels") or []:
+            out.append((c["id"], c["name"]))
+        cur = (r.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cur:
+            return out
+
+
+def project_channels(old, orchs, seen):
+    """[(id, old_name)] — the channels that belong to project <old>, and NOT the ones that merely begin
+    with its letters. `#<old>-skill` is a project of its own (cc-slack's own selfcheck pins that trap),
+    so the four rules here are exact: the name itself, its `-updates` lane, `#<old>--<track>` for any
+    track, and every sub-orch channel — those by the orch table's `target`, which is what actually says
+    whose they are, never by reading their names."""
+    want, pre = slug(old), slug(old) + "--"
+    hit = []
+    for cid, name in seen:
+        o = orchs.get(cid) or {}
+        theirs = (o.get("target") or "").split("/")[0] == old and not o.get("archived")
+        if name == want or name == f"{want}-updates" or name.startswith(pre) or theirs:
+            hit.append((cid, name))
+    return hit
+
+
+def renamed_channel(name, old, new):
+    """`<old>…` -> `<new>…`, the tail kept whole — a track's `--<track>`, a lane's `-updates`, a
+    sub-orch's `-<alias>-<id>`. A name that does not start with the old slug is left alone."""
+    o, n = slug(old), slug(new)
+    return n + name[len(o):] if name == o or name.startswith(o + "-") else name
+
+
+# ---------------------------------------------------------------------------- the plan
+GROUPS = ["stop", "paths", "git", "board", "scope", "slack", "tmux", "config", "records", "restart"]
+
+
+class Step:
+    """One change, with the line the dry run prints for it and the thunk that performs it. A step that
+    has nothing to do is never built, so the dry run lists exactly what will change and nothing else."""
+
+    def __init__(self, group, line, do):
+        self.group, self.line, self.do = group, line, do
+
+
+def mv(src, dst):
+    """Rename inside one filesystem, copy across two. Never over something that is already there — the
+    caller has refused an occupied <new> long before this, and a silent overwrite here would be data gone."""
+    if os.path.exists(dst):
+        raise RuntimeError(f"{dst} already exists")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.rename(src, dst)
+    except OSError:
+        shutil.move(src, dst)
+
+
+def edit_json(path, fn):
+    """Read, transform, write back through a temp file in the same directory. A file that is missing or
+    unparseable is left alone: these are caches and records the box rebuilds, and none of them is worth
+    failing a rename that has already moved the directories."""
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception:
+        return
+    out = fn(d)
+    if out is None:
+        return
+    tmp = f"{path}.cc-rename"
+    with open(tmp, "w") as f:
+        json.dump(out, f)
+    os.replace(tmp, path)
+
+
+def write_text(path, text):
+    tmp = f"{path}.cc-rename"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def retarget(value, old, new):
+    """A target string — `<repo>` or `<repo>/<track>` — with its repo half renamed. Anything else is
+    returned unchanged: `<old>-skill` is a different project, and `otherrepo/<old>` is not this one."""
+    if value == old:
+        return new
+    if value.startswith(old + "/"):
+        return new + value[len(old):]
+    return value
+
+
+def tracks_of(old):
+    """The track names this project has — from its worktrees, which is where a track's directory is."""
+    d = f"{worktrees()}/{old}"
+    return sorted(n for n in os.listdir(d)) if os.path.isdir(d) else []
+
+
+def orch_states(old):
+    """`~/.cc/state/<old>@<alias>` for each orchestrator of this project. An orch's state dir is the
+    project's, under another name, and a rename that left it behind would strand it."""
+    d, pre = state(), old + "@"
+    if not os.path.isdir(d):
+        return []
+    return sorted(n for n in os.listdir(d) if n.startswith(pre))
+
+
+def plan_paths(old, new):
+    """The directories and files whose NAME is the project's. Everything else in the plan is a pointer
+    into one of these, so these move first and the pointers are rewritten behind them."""
+    out = []
+    for src, dst, what in (
+            (f"{dev()}/{old}", f"{dev()}/{new}", "the checkout"),
+            (f"{worktrees()}/{old}", f"{worktrees()}/{new}", "every track's worktree"),
+            (f"{state()}/{old}", f"{state()}/{new}", "tracks, journals, goals, events"),
+            (f"{boards()}/{old}.json", f"{boards()}/{new}.json", "the board"),
+            (f"{boards()}/{old}.lock", f"{boards()}/{new}.lock", "the board's lock"),
+            (f"{home()}/.cc/scope/{old}.json", f"{home()}/.cc/scope/{new}.json", "the ask ledger"),
+            (f"{home()}/.cc/scope/{old}.lock", f"{home()}/.cc/scope/{new}.lock", "the ask ledger's lock")):
+        if os.path.lexists(src):
+            out.append(Step("paths", f"{src} -> {dst}  ({what})", lambda s=src, d=dst: mv(s, d)))
+    for name in orch_states(old):
+        src, dst = f"{state()}/{name}", f"{state()}/{new}@{name.split('@', 1)[1]}"
+        out.append(Step("paths", f"{src} -> {dst}  (an orchestrator's state)", lambda s=src, d=dst: mv(s, d)))
+    return out
+
+
+def plan_git(old, new, tracks):
+    """Git records a linked worktree as a PAIR of absolute paths — the worktree's `.git` file points at
+    the repository's admin dir, and that admin dir's `gitdir` file points back — and moving either end
+    breaks both. This is what `git worktree repair` writes, written directly so the repair does not
+    depend on git being runnable in the middle of a half-moved tree."""
+    out = []
+    for t in tracks:
+        was, wt = f"{worktrees()}/{old}/{t}", f"{worktrees()}/{new}/{t}"
+        admin = f"{dev()}/{new}/.git/worktrees/{t}"
+        # Each of these is planned only where the file it rewrites is really there NOW, under the old
+        # name: a directory somebody made by hand is not a linked worktree and has neither.
+        if os.path.isfile(f"{was}/.git"):
+            out.append(Step("git", f"{wt}/.git -> gitdir: {admin}",
+                            lambda w=wt, a=admin: write_text(f"{w}/.git", f"gitdir: {a}\n")))
+        if os.path.isfile(f"{dev()}/{old}/.git/worktrees/{t}/gitdir"):
+            out.append(Step("git", f"{admin}/gitdir -> {wt}/.git",
+                            lambda w=wt, a=admin: write_text(f"{a}/gitdir", f"{w}/.git\n")))
+        # `.cc/track` is how a worktree says which repo and track it is (cc writes it at creation, and
+        # cc-guard reads it off the cwd); its first line is the repo name. A THIRD LINE, when there is one, is
+        # the row's task id (cc-task) and belongs to the task, not to the project's name — so it is carried over
+        # rather than dropped. The record itself needs nothing: it moves with the state dir and cc-task re-keys
+        # it off the path it is found at.
+        if os.path.isfile(f"{was}/.cc/track"):
+            try: lines = open(f"{was}/.cc/track", errors="replace").read().splitlines()
+            except OSError: lines = []
+            tail = f"{lines[2]}\n" if len(lines) > 2 and lines[2].strip() else ""
+            out.append(Step("git", f"{wt}/.cc/track -> {new}/{t}" + (" (task id kept)" if tail else ""),
+                            lambda w=wt, k=t, x=tail: write_text(f"{w}/.cc/track", f"{new}\n{k}\n{x}")))
+    return out
+
+
+@contextlib.contextmanager
+def flocked(path):
+    """Hold a lock file the way its owner holds it — the board's `<repo>.lock`, the config's
+    `config.lock` — so a rename is never the writer that loses somebody else's update."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+
+
+def plan_board(old, new):
+    """The board's document says its own repo and the paths it was written for, beside the rows. The
+    FILE has moved by the time this runs, so it is the new one that is edited, under the new lock."""
+    src = f"{boards()}/{old}.json"
+    if not os.path.lexists(src):
+        return []
+
+    def do():
+        with flocked(f"{boards()}/{new}.lock"):
+            edit_json(f"{boards()}/{new}.json", lambda d: fix_board(d, old, new))
+    return [Step("board", f"{boards()}/{new}.json: repo, path and every row's worktree -> {new}", do)]
+
+
+def fix_board(d, old, new):
+    if not isinstance(d, dict):
+        return None
+    if d.get("repo") == old:
+        d["repo"] = new
+    if d.get("path") == f"{dev()}/{old}":
+        d["path"] = f"{dev()}/{new}"
+    for row in (d.get("tracks") or {}).values():
+        w = isinstance(row, dict) and row.get("worktree") or ""
+        if w.startswith(f"{worktrees()}/{old}/"):
+            row["worktree"] = f"{worktrees()}/{new}/" + w[len(f"{worktrees()}/{old}/"):]
+    return d
+
+
+def plan_scope(old, new):
+    """cc-scope's ask ledger carries the repo inside as well as in its filename."""
+    src = f"{home()}/.cc/scope/{old}.json"
+    if not os.path.lexists(src):
+        return []
+    dst = f"{home()}/.cc/scope/{new}.json"
+
+    def do():
+        with flocked(f"{home()}/.cc/scope/{new}.lock"):
+            edit_json(dst, lambda d: {**d, "repo": new} if isinstance(d, dict) and d.get("repo") == old else None)
+    return [Step("scope", f"{dst}: repo -> {new}", do)]
+
+
+# ~/.cc/config keys that hold project NAMES. Named rather than pattern-matched: every one of these is
+# core's own key, with a shape core defines, and a rename that went looking for the old name in every
+# value would eventually find it in a token, a topic or a path that is not a project at all.
+CONFIG_NAMES = ("PUBLISH_REPO",)                              # one project name
+CONFIG_LISTS = ("CC_JANITOR_REPOS", "CC_SELF_LAND_REPOS")     # whitespace-separated project names
+CONFIG_PAIRS = ("CC_PROJECT_CHILDREN",)                       # whitespace-separated parent:child[,child]
+
+
+def cfg_get(key):
+    try:
+        r = subprocess.run([f"{BIN}/cc-config", "get", key], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        return ""
+    return r.stdout.strip()
+
+
+def cfg_renamed(key, value, old, new):
+    """The value this key should hold after the rename, or the same value when the project is not in it."""
+    if key in CONFIG_NAMES:
+        return new if value == old else value
+    if key in CONFIG_LISTS:
+        return " ".join(new if w == old else w for w in value.split())
+    out = []
+    for entry in value.split():                       # CONFIG_PAIRS: parent:child[,child]
+        parent, _, kids = entry.partition(":")
+        parent = new if parent == old else parent
+        kids = ",".join(new if k == old else k for k in kids.split(",") if k)
+        out.append(f"{parent}:{kids}" if kids else parent)
+    return " ".join(out)
+
+
+def plan_config(old, new):
+    out = []
+    for key in CONFIG_NAMES + CONFIG_LISTS + CONFIG_PAIRS:
+        was = cfg_get(key)
+        now = cfg_renamed(key, was, old, new)
+        if was and now != was:
+            out.append(Step("config", f"{key}: {was} -> {now}",
+                            lambda k=key, v=now: subprocess.run([f"{BIN}/cc-config", "set", k, v],
+                                                                stdin=subprocess.DEVNULL, timeout=10)))
+    return out
+
+
+def proj_slug(path):
+    """The harness's directory name for a working directory: every character outside [A-Za-z0-9] a dash.
+    `~/.claude/projects/<slug>` holds that directory's transcripts, and `--resume` looks for a session
+    under the slug of the cwd it is started in — so a checkout that moves without its transcripts comes
+    back as a session with no memory."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def plan_records(old, new, tracks):
+    """The records the box reads to answer about this project NOW. Append-only history is not here: the
+    spend day files, ~/.cc/notify.log and ~/.cc/state/quick.log keep the name each row happened under."""
+    out, land = [], f"{state()}/land"
+    src = f"{land}/{old}.applied"
+    if os.path.lexists(src):
+        out.append(Step("records", f"{src} -> {land}/{new}.applied",
+                        lambda s=src, d=f"{land}/{new}.applied": mv(s, d)))
+    # A landing job is `<repo>-<pr>.json`, and the <pr> half is digits: an exact shape, so a project
+    # whose name merely begins with this one's keeps its own jobs.
+    job = re.compile(r"^%s-\d+\.json$" % re.escape(old))
+    for ldir in (land, f"{land}/root"):
+        for name in sorted(os.listdir(ldir)) if os.path.isdir(ldir) else []:
+            if not job.match(name):
+                continue
+            s, t = f"{ldir}/{name}", f"{ldir}/{new}-{name[len(old) + 1:]}"
+            out.append(Step("records", f"{s} -> {t}  (a landing job)",
+                            lambda s=s, t=t: (mv(s, t), edit_json(t, lambda j: {**j, "repo": new}
+                                                                  if isinstance(j, dict) and j.get("repo") == old else None))))
+    broker = f"{home()}/.cc/broker"
+    for name in ("pending.json", "told.json", "read.json"):
+        f = f"{broker}/{name}"
+        if os.path.lexists(f):
+            # Keyed by TARGET — `<repo>` for a planning session and `<repo>/<track>` for a track —
+            # so every key is retargeted, not just the bare repo one. The dedup fingerprints INSIDE a
+            # table are left as they are: they are hashes of a line's text, not keys anything looks a
+            # project up by, and a stale one costs at most one line said twice.
+            out.append(Step("records", f"{f}: the {old} and {old}/<track> tables -> {new}",
+                            lambda f=f: edit_json(f, lambda d: {retarget(k, old, new): v for k, v in d.items()}
+                                                  if isinstance(d, dict)
+                                                  and any(retarget(k, old, new) != k for k in d) else None)))
+    snap = f"{state()}/reconcile.json"
+    if os.path.lexists(snap):
+        out.append(Step("records", f"{snap}: the {old}/<track> rows -> {new}/<track>",
+                        lambda: edit_json(snap, lambda d: fix_snapshot(d, old, new))))
+    ho = f"{state()}/handoff"
+    for name in sorted(os.listdir(ho)) if os.path.isdir(ho) else []:
+        f = f"{ho}/{name}"
+        if name.endswith(".done"):
+            out.append(Step("records", f"{f}: target -> {new}",
+                            lambda f=f: edit_json(f, lambda d: {**d, "target": retarget(d["target"], old, new)}
+                                                  if isinstance(d, dict) and retarget(d.get("target") or "", old, new) != d.get("target") else None)))
+        # A live record and a brief are both filed under their TARGET, with `/` spelled `--`
+        # (cc-handoff: slug()) — so `<old>.json`, `<old>--<track>.json` and the same two for .brief,
+        # and never `<old>-skill.json`, which is another project's.
+        elif name.endswith((".json", ".brief")) and (name.startswith(f"{old}.") or name.startswith(f"{old}--")):
+            t = f"{ho}/{new}{name[len(old):]}"
+            what = "the live handoff record, and the target inside it" if name.endswith(".json") else "a handoff brief"
+            out.append(Step("records", f"{f} -> {t}  ({what})",
+                            lambda s=f, t=t: (mv(s, t), edit_json(t, lambda d: {**d, "target": retarget(d["target"], old, new)}
+                                              if isinstance(d, dict) and d.get("target") else None))))
+    # The transcripts, and the trust entry, for the checkout and for every worktree that moves with it.
+    moved = []
+    for was, now in [(f"{dev()}/{old}", f"{dev()}/{new}")] + \
+                    [(f"{worktrees()}/{old}/{t}", f"{worktrees()}/{new}/{t}") for t in tracks]:
+        s, t = f"{home()}/.claude/projects/{proj_slug(was)}", f"{home()}/.claude/projects/{proj_slug(now)}"
+        if os.path.isdir(s):
+            out.append(Step("records", f"{s} -> {t}  (its transcripts, so --resume still finds them)",
+                            lambda s=s, t=t: mv(s, t)))
+            moved.append((s, t))
+        out.append(Step("records", f"trusted workspace {was} -> {now}", lambda a=was, b=now: retrust(a, b)))
+    off = f"{state()}/spend/offsets.json"
+    if moved and os.path.lexists(off):
+        out.append(Step("records", f"{off}: the read offsets of the {len(moved)} transcript director"
+                                   f"{'y' if len(moved) == 1 else 'ies'} that move",
+                        lambda: edit_json(off, lambda d: fix_offsets(d, moved))))
+    return out
+
+
+def fix_offsets(d, moved):
+    """cc-spend reads each transcript only from the byte it stopped at last tick, and its offsets are
+    keyed by the file's FULL PATH. A transcript directory that moves without them is read again from
+    byte 0, and the project's whole spend history is counted a SECOND time (review, PR #273).
+
+    `grew` is left as it is on purpose: cc-spend rebuilds it wholesale every tick, so the cwd and repo
+    in it are last tick's answer and are replaced before anything reads them again."""
+    files = isinstance(d, dict) and d.get("files")
+    if not isinstance(files, dict):
+        return None
+    out, hit = {}, False
+    for path, v in files.items():
+        for was, now in moved:
+            if path.startswith(was + os.sep):
+                path, hit = now + path[len(was):], True
+                break
+        out[path] = v
+    if not hit:
+        return None
+    d["files"] = out
+    return d
+
+
+def fix_snapshot(d, old, new):
+    tr = isinstance(d, dict) and d.get("tracks")
+    if not isinstance(tr, dict):
+        return None
+    d["tracks"] = {retarget(k, old, new): v for k, v in tr.items()}
+    return d
+
+
+def retrust(was, now):
+    """~/.claude.json is the harness's file and live sessions rewrite it, so cc-trust — its one locked,
+    idempotent writer — moves the entry rather than this doing it behind their backs."""
+    subprocess.run([f"{BIN}/cc-trust", now], stdin=subprocess.DEVNULL, timeout=30)
+    subprocess.run([f"{BIN}/cc-trust", "rm", was], stdin=subprocess.DEVNULL, timeout=30)
+
+
+# ---------------------------------------------------------------------------- Slack and tmux
+def plan_slack(old, new, notes):
+    """The channels are renamed IN PLACE — `conversations.rename`, not a new channel and an archive —
+    so every message, thread and canvas in them stays where it is."""
+    tok = bot_token()
+    if not tok:
+        notes.append("Slack: no SLACK_BOT_TOKEN in ~/.cc/config — no channel, route or orch row to change.")
+        return []
+    sdir = slack_dir()
+    orchs = read_json(f"{sdir}/orchs.json", {})
+    try:
+        seen = list_channels(tok)
+    except Exception as e:
+        notes.append(f"Slack: could not list the channels ({e}) — none of them is renamed.")
+        return []
+    # EVERY NAME THIS WOULD TAKE MUST BE FREE, not just #<new>. `conversations.rename` answers
+    # name_taken, and finding that out halfway through leaves the project's channels split across two
+    # names — some still #<old>…, the rest already #<new>… — which is worse than never starting.
+    taken = {n for _, n in seen}
+    if slug(new) in taken:
+        raise Refuse(f"#{slug(new)} already exists in Slack")
+    chans = project_channels(old, orchs, seen)
+    out, renames = [], []
+    for cid, name in chans:
+        want = renamed_channel(name, old, new)
+        if want == name:
+            continue
+        if want in taken:
+            raise Refuse(f"#{want} already exists in Slack — renaming #{name} onto it would leave "
+                         f"{old}'s channels split across two names")
+        if len(want) > CHAN_MAX:
+            raise Refuse(f"#{want} would be {len(want)} characters — Slack allows {CHAN_MAX}")
+        renames.append((cid, name, want))
+        out.append(Step("slack", f"#{name} -> #{want}  (renamed in place: its history stays)",
+                        lambda c=cid, w=want: api("conversations.rename", tok, channel=c, name=w)))
+    if os.path.lexists(f"{sdir}/routes.json"):
+        out.append(Step("slack", f"{sdir}/routes.json: the routes that point at {old}",
+                        lambda: edit_json(f"{sdir}/routes.json", lambda d: fix_routes(d, old, new, renames))))
+    if orchs:
+        out.append(Step("slack", f"{sdir}/orchs.json: the sub-orch rows of {old}",
+                        lambda: edit_json(f"{sdir}/orchs.json", lambda d: fix_orchs(d, old, new))))
+    # The name->id cache is dropped rather than rewritten, the way cc-slack drops it when it makes a
+    # channel: it is a cache with an hour's life, and the old names in it resolve for that whole hour.
+    cache = f"{sdir}/channels.json"
+    if os.path.lexists(cache):
+        out.append(Step("slack", f"{cache} dropped (the name->id cache still holds the old names)",
+                        lambda: os.path.exists(cache) and os.unlink(cache)))
+    return out
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def fix_routes(d, old, new, renames):
+    """A route is `<chat id or #name>: <target>`. Both halves can name this project: the value always,
+    and the key when the route was written against a channel NAME that has just been renamed."""
+    if not isinstance(d, dict):
+        return None
+    was_named = {f"#{name}": f"#{want}" for _, name, want in renames}
+    return {was_named.get(k, k): (retarget(v, old, new) if isinstance(v, str) else v) for k, v in d.items()}
+
+
+def fix_orchs(d, old, new):
+    """Each sub-orch row says whose it is (`target`) and what its channel is called (`name`)."""
+    if not isinstance(d, dict):
+        return None
+    for row in d.values():
+        if not isinstance(row, dict):
+            continue
+        if retarget(row.get("target") or "", old, new) != row.get("target"):
+            row["target"] = retarget(row["target"], old, new)
+            row["name"] = renamed_channel(row.get("name") or "", old, new)
+    return d
+
+
+def tmux_windows():
+    """[(id, name)] for every window on the box. Addressed by id from here on: a window name with a `/`
+    or a `.` in it cannot be used as a tmux target, which is why `cc` looks ids up too."""
+    try:
+        r = subprocess.run(["tmux", "list-windows", "-a", "-F", "#{window_id}\t#{window_name}"],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+    except Exception:
+        return []
+    return [tuple(l.split("\t", 1)) for l in r.stdout.splitlines() if "\t" in l]
+
+
+def project_windows(old):
+    """The windows that are this project's: its planning session `<old>`, its tracks `<old>/<track>`
+    and its orchestrators `<old>@<alias>` — and not `<old>-skill`, which is another project's."""
+    return [(wid, n) for wid, n in tmux_windows()
+            if n == old or n.startswith(old + "/") or n.startswith(old + "@")]
+
+
+def own_window():
+    """The tmux window this rename is running in, or None when it is not in tmux at all. `cc rename`
+    typed in one of the project's OWN windows would otherwise put that window in the stop list and kill
+    its own process before anything had moved (review, PR #273)."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+    except Exception:
+        return None
+    for line in r.stdout.splitlines():
+        got, _, wid = line.partition("\t")
+        if got == pane:
+            return wid
+    return None
+
+
+def plan_tmux(old, new):
+    out = []
+    for wid, name in project_windows(old):
+        want = new + name[len(old):]
+        # Looked up again BY NAME when the step runs, not by the id read here: `--stop` kills this
+        # project's live windows first, and a rename aimed at an id that is gone would be an error
+        # printed for a window that was meant to disappear.
+        out.append(Step("tmux", f"window {name} -> {want}", lambda n=name, w=want: rename_window(n, w)))
+    return out
+
+
+def rename_window(name, want):
+    for wid, n in tmux_windows():
+        if n == name:
+            subprocess.run(["tmux", "rename-window", "-t", wid, want], stdin=subprocess.DEVNULL, timeout=20)
+            return
+
+
+# ---------------------------------------------------------------------------- what is running
+class Refuse(Exception):
+    """Something that must stop the rename BEFORE anything has moved. Printed as one line, exit 1."""
+
+
+def pane_running(wid):
+    """Something is running in that window — the same test `cc` makes (pane_live): the pane's own shell
+    is always there, so what says a session or worker is alive is that the pane's process has a child."""
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-t", wid, "-F", "#{pane_pid}"],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+    except Exception:
+        return False
+    for pid in r.stdout.split():
+        if subprocess.run(["pgrep", "-P", pid], capture_output=True, stdin=subprocess.DEVNULL).returncode == 0:
+            return True
+    return False
+
+
+def own_ancestry():
+    """This process, and every process it descends from, as a set of pid strings. `cc rename` is very
+    often typed INSIDE the project — the tool then stands in a doomed directory, and so does the shell
+    that launched it and that shell's pane. Counting those as holders made `--stop` kill the sessions
+    and then refuse to move anything, which is the worst of both (review, PR #273)."""
+    out, pid = set(), os.getpid()
+    while pid > 1 and str(pid) not in out:
+        out.add(str(pid))
+        try:                              # /proc/<pid>/stat: after the comm field in brackets come
+            with open(f"/proc/{pid}/stat") as f:      # state then ppid, so ppid is field [1]
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except Exception:
+            break
+    return out
+
+
+def cwd_holders(old):
+    """[(pid, cwd)] for every OTHER process standing in a directory this rename is about to move. This
+    is the signal that matters most: a `mv` under a live process leaves it writing into a path that is
+    gone. This rename's own line is excluded — it is not something a stop could ever clear."""
+    roots = (f"{dev()}/{old}", f"{worktrees()}/{old}")
+    mine, out = own_ancestry(), []
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = os.path.basename(d)
+        if pid in mine:
+            continue
+        try:
+            cwd = os.path.realpath(os.readlink(f"{d}/cwd"))
+        except OSError:
+            continue
+        if any(cwd == r or cwd.startswith(r + os.sep) for r in roots):
+            out.append((pid, cwd))
+    return out
+
+
+def snapshot_live(old):
+    """The tracks cc-reconcile says are live. It already owns "what is really alive" on this box, so
+    this asks it rather than deciding again — refreshing the snapshot first when it has gone stale."""
+    snap = f"{state()}/reconcile.json"
+    try:
+        stale = os.stat(snap).st_mtime < time.time() - 90
+    except OSError:
+        stale = True
+    if stale:
+        try:
+            subprocess.run([f"{BIN}/cc-reconcile", "snapshot"], capture_output=True,
+                           stdin=subprocess.DEVNULL, timeout=180)
+        except Exception:
+            pass
+    tracks = (read_json(snap, {}) or {}).get("tracks") or {}
+    return sorted(k for k, v in tracks.items()
+                  if isinstance(v, dict) and v.get("live") and k.split("/")[0] == old)
+
+
+def workers_of(old):
+    """The tracks with a `cc-loop <old> <track>` running — cc-reconcile's own signal for a worker, read
+    the same way. What separates a worker from a session decides how each is started again afterwards."""
+    out = set()
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            with open(f"{d}/cmdline", "rb") as f:
+                argv = f.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        for i, a in enumerate(argv):
+            if a and os.path.basename(a) == "cc-loop" and len(argv) > i + 2 and argv[i + 1] == old and argv[i + 2]:
+                out.add(argv[i + 2])
+    return out
+
+
+HOLD_WAIT = 20   # seconds a stop waits for the panes it killed to let go of the directories
+
+
+def plan_sessions(old, new, stop, dry, notes):
+    """"It refuses while a session or worker of the project is live unless told to stop them", and
+    "live sessions and workers are stopped first and restarted after under the new name" (the brief).
+
+    Live means any of the three things this box already uses to mean it: a window of this project with
+    something running in it, a process standing in one of the directories about to move, and what
+    cc-reconcile's snapshot says about its tracks. Any one of them refuses without --stop.
+
+    …EXCEPT under `--dry-run`, which "lists every path, channel and window it would change and changes
+    nothing" (the brief again). A dry run that refused would print no list at all, and a live project is
+    exactly when somebody wants to read one first — so the liveness is a NOTE there, not a refusal."""
+    windows = project_windows(old)
+    running = [(wid, name) for wid, name in windows if pane_running(wid)]
+    holders = cwd_holders(old)
+    tracks = snapshot_live(old)
+    if not (running or holders or tracks):
+        return []
+    # A rename cannot stop and restart ITSELF. Its own window is always "running" — this process is the
+    # pane's child — so with --stop it would be killed before a single path had moved, and with nothing
+    # moved and nothing restarted there would be no second half to blame. Refuse, and say where to go.
+    mine = own_window()
+    here = [n for wid, n in running if wid == mine]
+    if here:
+        said = (f"this rename is running in {here[0]}, one of {old}'s own windows — stopping it would "
+                "kill this process before anything moved. Run it from another window: the box's own "
+                "session, or any shell outside the project.")
+        if not dry:
+            raise Refuse(said)
+        notes.append("a real run REFUSES as things stand: " + said)
+        return []
+    if not stop:
+        what = [f"the window {n}" for _, n in running] + \
+               [f"pid {p} standing in {c}" for p, c in holders] + \
+               [f"{t} (cc-reconcile says it is live)" for t in tracks]
+        said = (f"{old} is live — {', '.join(what)}. Stop it first, or rename with --stop, which "
+                "stops these and starts them again under the new name.")
+        if not dry:
+            raise Refuse(said)
+        notes.append("a real run REFUSES as things stand: " + said)
+        return []
+    workers = workers_of(old)
+    said = ", ".join(n for _, n in running) or "nothing in a window of its own"
+    out = [Step("stop", f"stop {said}, and wait for the directories to be let go",
+                lambda: stop_windows(old, running))]
+    for _, name in running:
+        out.append(Step("restart", restart_line(old, new, name, workers),
+                        lambda n=name: subprocess.run(restart_argv(old, new, n, workers),
+                                                      stdin=subprocess.DEVNULL, timeout=180)))
+    return out
+
+
+def stop_windows(old, running):
+    for wid, _ in running:
+        subprocess.run(["tmux", "kill-window", "-t", wid], capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=20)
+    # A killed pane's children take a moment to go, and until they do their cwd is still inside the
+    # directory about to move. Wait for that, then refuse rather than move it out from under anything
+    # that is left: this is the first thing the rename does, so nothing has moved yet.
+    for _ in range(HOLD_WAIT * 4):
+        left = cwd_holders(old)
+        if not left:
+            return
+        time.sleep(0.25)
+    left = cwd_holders(old)
+    raise Refuse("stopped this project's sessions, and " +
+                 ", ".join(f"pid {p} is still standing in {c}" for p, c in left) +
+                 " — nothing was moved.")
+
+
+def restart_argv(old, new, name, workers):
+    """The same session, started again under the new name. A worker is re-dispatched with `--go ""`,
+    which is how `cc` re-runs the brief already in its task.md rather than writing a new one over it."""
+    if name == old:
+        return [f"{BIN}/cc", new]
+    if name.startswith(old + "@"):
+        return [f"{BIN}/cc", new, "--orch", name[len(old) + 1:]]
+    track = name[len(old) + 1:]
+    return [f"{BIN}/cc", new, track, "--go", ""] if track in workers else [f"{BIN}/cc", new, track]
+
+
+def restart_line(old, new, name, workers):
+    argv = ["cc"] + restart_argv(old, new, name, workers)[1:]
+    return f"{name} starts again as `{' '.join(a if a else chr(34) * 2 for a in argv)}`"
+
+
+# ---------------------------------------------------------------------------- the command
+def is_project(name):
+    return any(os.path.lexists(p) for p in (f"{dev()}/{name}", f"{state()}/{name}",
+                                            f"{worktrees()}/{name}", f"{boards()}/{name}.json"))
+
+
+def taken_by(name):
+    """What on this box already answers to <new>, or None. "Renaming A to B while B exists refuses"
+    (the brief) — and refusing on the FIRST thing found is enough: the rename never starts."""
+    for p, what in ((f"{dev()}/{name}", "a checkout"), (f"{state()}/{name}", "a state directory"),
+                    (f"{worktrees()}/{name}", "worktrees"), (f"{boards()}/{name}.json", "a board"),
+                    (f"{home()}/.cc/scope/{name}.json", "an ask ledger")):
+        if os.path.lexists(p):
+            return f"{what} at {p}"
+    return None
+
+
+def build_plan(old, new, stop, dry, notes):
+    """Every change, in the order it is applied. Built whole before anything runs, so `--dry-run` is
+    the same list the real thing would work through and not a second description of it."""
+    tracks = tracks_of(old)
+    steps = (plan_sessions(old, new, stop, dry, notes) + plan_paths(old, new) + plan_git(old, new, tracks)
+             + plan_board(old, new) + plan_scope(old, new) + plan_slack(old, new, notes)
+             + plan_tmux(old, new) + plan_config(old, new) + plan_records(old, new, tracks))
+    return sorted(steps, key=lambda s: GROUPS.index(s.group))
+
+
+def rename(old, new, dry, stop):
+    for n in (old, new):
+        if not NAME_RE.match(n or ""):
+            raise Refuse(f"'{n}' is not a project name (allowed: {NAME_RE.pattern})")
+    if old == new:
+        raise Refuse(f"'{old}' is already its name")
+    if not is_project(old):
+        raise Refuse(f"no project '{old}' on this box — nothing at {dev()}/{old}, and no state, "
+                     "worktrees or board under that name either")
+    # A MEMBER WORKSPACE IS NOT RENAMED HERE. Its name is also a handle: it keys the credential, the
+    # sandbox binds, the member's own board and its Slack member table, and half of those live behind
+    # a boundary this must not reach into. Refused whole rather than renamed in part.
+    if os.path.lexists(f"{dev()}/{old}/.cc/member-workspace"):
+        raise Refuse(f"'{old}' is a member workspace — its name is also the member's handle, which "
+                     "keys their credential, sandbox and board. Renaming that is not this command's.")
+    was = taken_by(new)
+    if was:
+        raise Refuse(f"'{new}' is taken on this box — {was}")
+
+    notes = []
+    plan = build_plan(old, new, stop, dry, notes)
+    print(f"cc-rename: {old} -> {new}" + ("  (dry run)" if dry else ""))
+    group = None
+    bad = 0
+    for s in plan:
+        if s.group != group:
+            group = s.group
+            print(f"== {group} ==")
+        if dry:
+            print(f"  · {s.line}")
+            continue
+        try:
+            s.do()
+            print(f"  ✓ {s.line}")
+        except Refuse:
+            raise
+        except Exception as e:
+            bad += 1
+            print(f"  ✗ {s.line}: {e}")
+    for n in notes:
+        print(f"  note: {n}")
+    if dry:
+        print(f"dry run: {len(plan)} change(s), none of them made.")
+        return 0
+    if bad:
+        print(f"cc-rename: {len(plan) - bad} done, {bad} failed — the failures are listed above.")
+        return 1
+    print(f"cc-rename: {old} is now {new} ({len(plan)} change(s)). The GitHub remote is untouched.")
+    return 0
+
+
+def main(argv):
+    args, dry, stop = [], False, False
+    for a in argv:
+        if a in ("-n", "--dry-run"):
+            dry = True
+        elif a == "--stop":
+            stop = True
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a.startswith("-"):
+            print(f"cc-rename: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            args.append(a)
+    if len(args) == 1 and args[0] == "selfcheck":
+        return selfcheck()
+    if len(args) != 2:
+        print("usage: cc rename <old> <new> [-n|--dry-run] [--stop]", file=sys.stderr)
+        return 2
+    try:
+        return rename(args[0], args[1], dry, stop)
+    except Refuse as e:
+        print(f"cc-rename: {e}", file=sys.stderr)
+        return 1
+
+
+
+# ---------------------------------------------------------------------------- selfcheck
+def selfcheck():
+    """Every case builds a WHOLE fixture box of its own — its own HOME, its own bin/, its own git
+    repository and worktree, its own Slack — so none of them reads state another one left behind, and
+    none of them touches this box. Nothing here reaches Slack: `API` is the deny that records, and a
+    case that wants an answer installs its own and puts the deny back."""
+    import tempfile
+    n = [0]
+    fails = []
+
+    def t(name, got, want):
+        n[0] += 1
+        if got == want:
+            return
+        fails.append(name)
+        print(f"FAIL {name}: got {got!r}, want {want!r}")
+
+    real_home, real_bin, real_path, real_api = os.environ.get("HOME"), BIN, os.environ["PATH"], API
+    real_pane = os.environ.get("TMUX_PANE")
+    root = tempfile.mkdtemp(prefix="cc-rename-selfcheck-")
+    # The fixture project carries this process's pid: `cwd_holders` reads the real /proc, and two
+    # suites running at once must never see each other's fixture as their own project.
+    OLD, NEW = f"myrepo-{os.getpid()}", f"newrepo-{os.getpid()}"
+
+    def box(label):
+        """A whole box: a git repository with one linked worktree, a state dir, a board, an ask ledger,
+        a config, a Slack directory and a bin/ of stubs. Returns its HOME, already installed."""
+        h = f"{root}/{label}"
+        fb = f"{h}/bin"
+        os.makedirs(fb)
+        os.environ["HOME"] = h
+        globals()["BIN"] = fb
+        os.environ["PATH"] = fb + os.pathsep + real_path
+        for tool in ("cc-config", "cc-board", "cc-trust"):     # the real readers, over this box's own files
+            shutil.copy(f"{real_bin}/{tool}", f"{fb}/{tool}")
+        for tool, body in (("cc-reconcile", 'exit 0\n'),       # never a real reconcile pass
+                           ("cc-loop", 'sleep 60\n'),           # a case runs this one to BE a worker
+                           ("cc", 'IFS="|"; printf "%s\\n" "$*" >> "$HOME/cc.calls"\n')):
+            open(f"{fb}/{tool}", "w").write("#!/bin/sh\n" + body)
+            os.chmod(f"{fb}/{tool}", 0o755)
+        # tmux and pgrep, stubbed: no window of this box is listed, renamed or killed.
+        open(f"{fb}/tmux", "w").write(
+            '#!/bin/sh\ncase "$1" in\n'
+            '  list-windows) cat "$HOME/tmux.windows" 2>/dev/null;;\n'
+            '  list-panes) case "$2" in\n'
+            '                -a) cat "$HOME/tmux.allpanes" 2>/dev/null;;\n'    # pane -> window, for own_window
+            '                 *) cat "$HOME/tmux.panes" 2>/dev/null;;\n'       # what is running in one window
+            '              esac;;\n'
+            '  rename-window) printf "rename %s %s\\n" "$3" "$4" >> "$HOME/tmux.calls";;\n'
+            '  kill-window) printf "kill %s\\n" "$3" >> "$HOME/tmux.calls"; : > "$HOME/tmux.panes";;\n'
+            'esac\nexit 0\n')
+        open(f"{fb}/pgrep", "w").write('#!/bin/sh\n[ -s "$HOME/tmux.panes" ]\n')
+        for tool in ("tmux", "pgrep"):
+            os.chmod(f"{fb}/{tool}", 0o755)
+        # Four windows: this project's planning session and its track, a project whose name merely
+        # begins with this one's, and a stranger. `tmux.panes` empty means nothing is running in any
+        # of them, so the box is not live until a case says it is.
+        open(f"{h}/tmux.windows", "w").write(
+            f"@1\t{OLD}\n@2\t{OLD}/t1\n@3\t{OLD}-skill\n@4\tother\n@5\t{OLD}/t2\n")
+        open(f"{h}/tmux.panes", "w").write("")
+        # …and which window each pane is in, so a case can say which one this rename is running in.
+        open(f"{h}/tmux.allpanes", "w").write("%1\t@1\n%2\t@2\n%3\t@3\n%4\t@4\n%5\t@5\n")
+        os.environ.pop("TMUX_PANE", None)   # the suite itself runs in tmux; a case says where it is, or nowhere
+        os.makedirs(f"{h}/.cc/slack")
+        os.makedirs(f"{h}/.cc/scope")
+        os.makedirs(f"{state()}/{OLD}/t1")
+        os.makedirs(boards())
+        git(f"{h}/dev/{OLD}", "init", "-q", make=True)
+        git(f"{h}/dev/{OLD}", "commit", "-q", "--allow-empty", "-m", "root")
+        for tr in ("t1", "t2"):
+            git(f"{h}/dev/{OLD}", "worktree", "add", "-q", f"{worktrees()}/{OLD}/{tr}", "-b", f"track/{tr}")
+            os.makedirs(f"{worktrees()}/{OLD}/{tr}/.cc")
+            # t1 carries a task id on the marker's third line (cc-task), t2 the two-line marker cc has always
+            # written: a rename must keep the first and leave the second exactly two lines.
+            tail = "b1f0c4e2-0000-4000-8000-00000000t1ab\n" if tr == "t1" else ""
+            open(f"{worktrees()}/{OLD}/{tr}/.cc/track", "w").write(f"{OLD}\n{tr}\n{tail}")
+            os.makedirs(f"{state()}/{OLD}/{tr}", exist_ok=True)
+        open(f"{state()}/{OLD}/goals.md", "w").write("# standing goals\n")
+        open(f"{state()}/{OLD}/t1/progress.md", "w").write("the journal\n")
+        open(f"{boards()}/{OLD}.json", "w").write(json.dumps(
+            {"repo": OLD, "path": f"{h}/dev/{OLD}", "default_branch": "main", "created": "2026-01-01T00:00:00Z",
+             "tracks": {tr: {"title": "a track", "status": "running", "branch": f"track/{tr}",
+                             "worktree": f"{worktrees()}/{OLD}/{tr}"} for tr in ("t1", "t2")}, "log": []}))
+        open(f"{h}/.cc/scope/{OLD}.json", "w").write(json.dumps({"repo": OLD, "asks": []}))
+        open(f"{slack_dir()}/routes.json", "w").write(json.dumps({f"#{OLD}-threads": OLD, "C9": f"{OLD}/t1"}))
+        open(f"{slack_dir()}/channels.json", "w").write(json.dumps({OLD: "CM", "_t": 0}))
+        # The harness's transcript directories, and cc-spend's read offsets — keyed by each transcript's
+        # FULL PATH, which is inside one of them, plus one belonging to a directory that does not move.
+        os.makedirs(f"{h}/.claude/projects")
+        offs = {"/elsewhere/a-project/s.jsonl": {"off": 7, "ino": 2, "rid": "req_y"}}
+        for d in (f"{h}/dev/{OLD}", f"{worktrees()}/{OLD}/t1"):
+            pd = f"{h}/.claude/projects/{proj_slug(d)}"
+            os.makedirs(pd)
+            open(f"{pd}/s.jsonl", "w").write("{}\n")
+            offs[f"{pd}/s.jsonl"] = {"off": 4242, "ino": 1, "rid": "req_x"}
+        os.makedirs(f"{state()}/spend")
+        open(f"{state()}/spend/offsets.json", "w").write(json.dumps(
+            {"tick": "2026-01-01T00:00:00Z", "files": offs, "grew": {}, "sub_rids": {}}))
+        # The broker's three tables and the handoff records — both keyed by TARGET, `<repo>` or
+        # `<repo>/<track>`, and both carrying a project that merely begins with this one's letters.
+        os.makedirs(f"{h}/.cc/broker")
+        for tbl, val in (("pending.json", {}), ("told.json", {}), ("read.json", 0)):
+            open(f"{h}/.cc/broker/{tbl}", "w").write(json.dumps(
+                {OLD: val, f"{OLD}/t1": val, f"{OLD}-skill": val, "other": val}))
+        os.makedirs(f"{state()}/handoff")
+        for nm, rec in ((f"{OLD}.json", {"id": "h1", "target": OLD}),
+                        (f"{OLD}--t1.json", {"id": "h2", "target": f"{OLD}/t1"}),
+                        (f"{OLD}-skill.json", {"id": "h3", "target": f"{OLD}-skill"}),
+                        ("abc123.done", {"id": "abc123", "target": f"{OLD}/t2"})):
+            open(f"{state()}/handoff/{nm}", "w").write(json.dumps(rec))
+        open(f"{state()}/handoff/{OLD}--t1.brief", "w").write("what the successor is to pick up\n")
+        open(f"{h}/.cc/config", "w").write(
+            f"SLACK_BOT_TOKEN=xoxb-selfcheck\nCC_JANITOR_REPOS={OLD} other\n"
+            f"CC_SELF_LAND_REPOS=other {OLD}\nCC_PROJECT_CHILDREN={OLD}:tool\nPUBLISH_REPO={OLD}\n")
+        return h
+
+    def git(d, *args, make=False):
+        if make:
+            os.makedirs(d, exist_ok=True)
+        subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=cc", "-c",
+                        "user.email=cc@example.invalid", "-c", "init.defaultBranch=main", "-C", d] + list(args),
+                       capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+
+    # The channels this fixture's workspace has. `<OLD>-skill` is a project of its own and must come
+    # through a rename of <OLD> untouched — cc-slack's own selfcheck pins that same trap.
+    def chans(h):
+        return [("CM", OLD), ("CMU", f"{OLD}-updates"), ("CMT", f"{OLD}--t1"),
+                ("CSK", f"{OLD}-skill"), ("CO", "other")]
+
+    def slack(h, calls):
+        """An API that answers a list and writes down every rename, and refuses anything else."""
+        def fake(method, token, **kw):
+            if method == "conversations.list":
+                return {"channels": [{"id": c, "name": nm} for c, nm in chans(h)]}
+            if method == "conversations.rename":
+                calls.append((kw["channel"], kw["name"]))
+                return {"ok": True}
+            return deny_slack(method, token, **kw)
+        return fake
+
+    def run(*argv):
+        """The command, as `cc rename` runs it, with its output captured so the tally stays readable."""
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = main(list(argv))
+        return rc, buf.getvalue()
+
+    def board_of(repo):
+        r = subprocess.run([f"{BIN}/cc-board", "json", repo], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
+
+    def cfg(h, key):
+        r = subprocess.run([f"{BIN}/cc-config", "get", key], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        return r.stdout.strip()
+
+    try:
+        globals()["API"] = deny_slack
+        # ------------------------------------------------------------------ end to end
+        h = box("roundtrip")
+        calls = []
+        globals()["API"] = slack(h, calls)
+        rc, out = run(OLD, NEW)
+        t("a whole project renames, and says so", rc, 0)
+        t("…the checkout moves", (os.path.isdir(f"{h}/dev/{NEW}"), os.path.exists(f"{h}/dev/{OLD}")), (True, False))
+        t("…the worktree moves", os.path.isdir(f"{worktrees()}/{NEW}/t1"), True)
+        t("…and git still owns it there: the worktree's .git and the repository's gitdir both moved",
+          subprocess.run(["git", "-C", f"{worktrees()}/{NEW}/t1", "status", "--porcelain"],
+                         capture_output=True, stdin=subprocess.DEVNULL, timeout=60).returncode, 0)
+        t("…the worktree says which project it is, and keeps the task id a claim put on its third line",
+          open(f"{worktrees()}/{NEW}/t1/.cc/track").read(),
+          f"{NEW}\nt1\nb1f0c4e2-0000-4000-8000-00000000t1ab\n")
+        t("…while a marker that never had one still has exactly two lines",
+          open(f"{worktrees()}/{NEW}/t2/.cc/track").read(), f"{NEW}\nt2\n")
+        t("…the state dir moves, journals and all", open(f"{state()}/{NEW}/t1/progress.md").read(), "the journal\n")
+        b = board_of(NEW)
+        t("…and the board's own reader finds it under the new name, with the paths inside it moved too",
+          (b.get("repo"), b.get("path"), sorted(r["worktree"] for r in (b.get("tracks") or {}).values())),
+          (NEW, f"{h}/dev/{NEW}", [f"{worktrees()}/{NEW}/t1", f"{worktrees()}/{NEW}/t2"]))
+        t("…the ask ledger moves, and says the new repo", read_json(f"{h}/.cc/scope/{NEW}.json", {}).get("repo"), NEW)
+        t("…every config key that names projects follows, and the others in the list are left alone",
+          (cfg(h, "CC_JANITOR_REPOS"), cfg(h, "CC_SELF_LAND_REPOS"), cfg(h, "CC_PROJECT_CHILDREN"), cfg(h, "PUBLISH_REPO")),
+          (f"{NEW} other", f"other {NEW}", f"{NEW}:tool", NEW))
+        t("…the project's three channels are renamed IN PLACE — and not #<old>-skill, which is a "
+          "project of its own, nor a stranger's channel",
+          sorted(calls), sorted([("CM", NEW), ("CMU", f"{NEW}-updates"), ("CMT", f"{NEW}--t1")]))
+        t("…a route to a channel this rename did NOT rename still points at the project, under its new name",
+          read_json(f"{slack_dir()}/routes.json", {}), {f"#{OLD}-threads": NEW, "C9": f"{NEW}/t1"})
+        t("…the name->id cache is dropped, so the old names stop resolving",
+          os.path.exists(f"{slack_dir()}/channels.json"), False)
+        t("…and this project's windows are renamed, the other two left where they are",
+          sorted(open(f"{h}/tmux.calls").read().split("\n")[:-1]),
+          sorted([f"rename @1 {NEW}", f"rename @2 {NEW}/t1", f"rename @5 {NEW}/t2"]))
+        t("…the broker's tables follow by TARGET — the planning session's key AND each track's — and a "
+          "project whose name merely begins with this one's keeps its own",
+          [sorted(read_json(f"{h}/.cc/broker/{n}", {})) for n in ("pending.json", "told.json", "read.json")],
+          [sorted([NEW, f"{NEW}/t1", f"{OLD}-skill", "other"])] * 3)
+        t("…the LIVE handoff record moves to its new slug and says the new target, for the project and "
+          "for a track, and the retired one is retargeted where it lies",
+          (read_json(f"{state()}/handoff/{NEW}.json", {}).get("target"),
+           read_json(f"{state()}/handoff/{NEW}--t1.json", {}).get("target"),
+           os.path.exists(f"{state()}/handoff/{OLD}.json"),
+           os.path.exists(f"{state()}/handoff/{NEW}--t1.brief"),
+           read_json(f"{state()}/handoff/abc123.done", {}).get("target")),
+          (NEW, f"{NEW}/t1", False, True, f"{NEW}/t2"))
+        t("…and the handoff record of a project that only begins with this one's letters is untouched",
+          read_json(f"{state()}/handoff/{OLD}-skill.json", {}).get("target"), f"{OLD}-skill")
+        t("…cc-spend's read offsets follow the transcripts, so the next tick reads on from where it "
+          "stopped instead of re-reading the whole project and counting its spend twice",
+          {k: v["off"] for k, v in read_json(f"{state()}/spend/offsets.json", {})["files"].items()},
+          {f"{h}/.claude/projects/{proj_slug(f'{h}/dev/{NEW}')}/s.jsonl": 4242,
+           f"{h}/.claude/projects/{proj_slug(f'{worktrees()}/{NEW}/t1')}/s.jsonl": 4242,
+           "/elsewhere/a-project/s.jsonl": 7})
+        t("…and it reaches Slack for exactly what it declared", DENIED, [])
+
+        # ------------------------------------------------------------------ the dry run changes nothing
+        h = box("dryrun")
+        calls = []
+        globals()["API"] = slack(h, calls)
+        rc, out = run(OLD, NEW, "--dry-run")
+        t("a dry run succeeds", rc, 0)
+        t("…and says what it would do, naming the checkout, a channel and a window",
+          (f"{h}/dev/{NEW}" in out, f"#{OLD}-updates -> #{NEW}-updates" in out, f"window {OLD}/t1" in out),
+          (True, True, True))
+        t("…and CHANGES NOTHING: not a path, not a channel, not a window, not a config key",
+          (os.path.isdir(f"{h}/dev/{OLD}"), os.path.exists(f"{h}/dev/{NEW}"), calls,
+           os.path.exists(f"{h}/tmux.calls"), cfg(h, "PUBLISH_REPO"),
+           os.path.exists(f"{slack_dir()}/channels.json"), board_of(OLD).get("repo")),
+          (True, False, [], False, OLD, True, OLD))
+
+        # ------------------------------------------------------------------ …and a live one still gets its list
+        h = box("dryrun-live")
+        calls = []
+        globals()["API"] = slack(h, calls)
+        open(f"{h}/tmux.panes", "w").write("4242\n")     # a session is running in this project's windows
+        rc, out = run(OLD, NEW, "-n")
+        t("a dry run of a LIVE project still succeeds", rc, 0)
+        t("…and still lists the whole plan — the checkout, a channel and a window — rather than "
+          "printing a refusal and nothing else, which is the one time somebody most wants to read it",
+          (f"{h}/dev/{NEW}" in out, f"#{OLD}-updates -> #{NEW}-updates" in out, f"window {OLD}/t1" in out),
+          (True, True, True))
+        t("…while saying plainly that a real run refuses as things stand, and naming --stop",
+          ("a real run REFUSES" in out, "--stop" in out), (True, True))
+        t("…and it still changed nothing", (os.path.isdir(f"{h}/dev/{OLD}"), calls,
+                                            os.path.exists(f"{h}/tmux.calls")), (True, [], False))
+        rc, out = run(OLD, NEW, "-n", "--stop")
+        t("…and with --stop the same dry run adds the stop and the restarts it WOULD do, still doing none",
+          (rc, "stop " in out, f"{OLD}/t1 starts again as" in out, os.path.exists(f"{h}/tmux.calls")),
+          (0, True, True, False))
+
+        # ------------------------------------------------------------------ typed from inside the project
+        h = box("from-inside")
+        globals()["API"] = slack(h, calls := [])
+        here = os.getcwd()
+        os.chdir(f"{h}/dev/{OLD}")     # `cc rename` is very often typed in the project it renames
+        # A stranger standing in the SAME directory, to pin that only this rename's own line is excused.
+        other = subprocess.Popen(["sleep", "60"], cwd=f"{h}/dev/{OLD}", stdin=subprocess.DEVNULL)
+        try:
+            t("standing in the project itself, it sees the stranger and not its own process",
+              sorted(p for p, _ in cwd_holders(OLD)), [str(other.pid)])
+            other.kill()
+            other.wait()
+            for _ in range(80):                      # the stranger's own exit is not instant
+                if not cwd_holders(OLD):
+                    break
+                time.sleep(0.05)
+            rc, out = run(OLD, NEW)
+        finally:
+            other.kill()
+            other.wait()
+            os.chdir(here)
+        t("a rename TYPED INSIDE the project is not held up by its own process standing there", rc, 0)
+        t("…and it moved everything, rather than stopping the sessions and then refusing",
+          (os.path.isdir(f"{h}/dev/{NEW}"), os.path.exists(f"{h}/dev/{OLD}")), (True, False))
+
+        # ------------------------------------------------------------------ a live project refuses
+        h = box("live")
+        globals()["API"] = slack(h, [])
+        held = subprocess.Popen(["sleep", "60"], cwd=f"{h}/dev/{OLD}", stdin=subprocess.DEVNULL)
+        try:
+            rc, out = run(OLD, NEW)
+            t("a process standing in the project's own directory is live: refused without --stop", rc, 1)
+            t("…and the refusal names it and the flag that would stop it",
+              (f"pid {held.pid}" in out, "--stop" in out), (True, True))
+            t("…and refusing moved nothing", os.path.exists(f"{h}/dev/{NEW}"), False)
+        finally:
+            held.kill()
+            held.wait()
+
+        # ------------------------------------------------------------------ …and --stop stops it and starts it again
+        h = box("stop")
+        globals()["API"] = slack(h, [])
+        open(f"{h}/tmux.panes", "w").write("4242\n")     # something is running in this project's windows
+        # …and t1's is a WORKER: a real `cc-loop <old> t1`, which is the signal cc-reconcile reads to
+        # tell a worker from a session. Its cwd is outside the project, so it holds nothing that moves.
+        worker = subprocess.Popen([f"{h}/bin/cc-loop", OLD, "t1"], cwd=root, stdin=subprocess.DEVNULL)
+        try:
+            rc, out = run(OLD, NEW)
+            t("a session live in its window refuses too, without the flag", rc, 1)
+            t("…and nothing was stopped by a refusal", os.path.exists(f"{h}/tmux.calls"), False)
+            rc, out = run(OLD, NEW, "--stop")
+            t("…with --stop it goes through", rc, 0)
+            t("…having killed this project's live windows and no others",
+              sorted(l for l in open(f"{h}/tmux.calls").read().split("\n") if l.startswith("kill")),
+              ["kill @1", "kill @2", "kill @5"])
+            t("…and started each again as what it WAS: the track with a cc-loop on it as a worker, "
+              "re-dispatched onto the brief already in its task.md, the other two as plain sessions",
+              sorted(open(f"{h}/cc.calls").read().split("\n")[:-1]),
+              sorted([NEW, f"{NEW}|t1|--go|", f"{NEW}|t2"]))
+        finally:
+            worker.kill()
+            worker.wait()
+
+        # ------------------------------------------------------------------ the name must be free
+        h = box("taken")
+        globals()["API"] = slack(h, [])
+        os.makedirs(f"{h}/dev/{NEW}")
+        rc, out = run(OLD, NEW)
+        t("renaming onto a name this box already has is refused", (rc, "taken" in out), (1, True))
+        t("…and the project it would have overwritten is untouched", os.path.isdir(f"{h}/dev/{OLD}"), True)
+
+        h = box("taken-in-slack")
+        globals()["API"] = lambda m, tok, **kw: (
+            {"channels": [{"id": c, "name": nm} for c, nm in chans(h)] + [{"id": "CX", "name": NEW}]}
+            if m == "conversations.list" else deny_slack(m, tok, **kw))
+        rc, out = run(OLD, NEW)
+        t("…and so is a name only SLACK already has: renaming half the channels and failing on the "
+          "rest is the state this refusal exists to avoid", (rc, f"#{NEW} already exists" in out), (1, True))
+        t("…nothing moved for that one either", os.path.exists(f"{h}/dev/{NEW}"), False)
+
+        # ------------------------------------------------------------------ a lane of the new name is taken
+        h = box("lane-taken")
+        globals()["API"] = lambda m, tok, **kw: (
+            {"channels": [{"id": c, "name": nm} for c, nm in chans(h)] + [{"id": "CX", "name": f"{NEW}-updates"}]}
+            if m == "conversations.list" else deny_slack(m, tok, **kw))
+        rc, out = run(OLD, NEW)
+        t("a name whose -updates LANE is already taken in Slack is refused, even though #<new> itself "
+          "is free — the half-renamed project is the state this refusal exists to avoid",
+          (rc, f"#{NEW}-updates already exists" in out), (1, True))
+        t("…and nothing moved for it", os.path.exists(f"{h}/dev/{NEW}"), False)
+
+        h = box("track-lane-taken")
+        globals()["API"] = lambda m, tok, **kw: (
+            {"channels": [{"id": c, "name": nm} for c, nm in chans(h)] + [{"id": "CX", "name": f"{NEW}--t1"}]}
+            if m == "conversations.list" else deny_slack(m, tok, **kw))
+        rc, out = run(OLD, NEW)
+        t("…and so is one whose TRACK channel is taken", (rc, f"#{NEW}--t1 already exists" in out), (1, True))
+
+        # ------------------------------------------------------------------ it will not kill its own window
+        h = box("own-window")
+        globals()["API"] = slack(h, calls := [])
+        open(f"{h}/tmux.panes", "w").write("4242\n")     # every window of this project has something in it
+        os.environ["TMUX_PANE"] = "%2"                   # …and this rename is running in @2, which is OLD/t1
+        rc, out = run(OLD, NEW, "--stop")
+        t("a rename running in one of the project's OWN windows refuses, --stop or not: stopping it "
+          "would kill this very process before a single path had moved", rc, 1)
+        t("…and it says which window it is in and where to run it instead",
+          (f"{OLD}/t1, one of {OLD}'s own windows" in out, "another window" in out), (True, True))
+        t("…and it killed nothing and moved nothing",
+          (os.path.exists(f"{h}/tmux.calls"), os.path.exists(f"{h}/dev/{NEW}")), (False, False))
+        os.environ["TMUX_PANE"] = "%4"                   # @4 is a stranger's window, not this project's
+        rc, out = run(OLD, NEW, "--stop")
+        t("…while from a window that is NOT this project's it goes through and stops the project's own",
+          (rc, sorted(l for l in open(f"{h}/tmux.calls").read().split("\n") if l.startswith("kill"))),
+          (0, ["kill @1", "kill @2", "kill @5"]))
+        os.environ.pop("TMUX_PANE", None)
+
+        # ------------------------------------------------------------------ the rest of the door
+        h = box("refuse")
+        globals()["API"] = deny_slack
+        t("a project that is not there is refused", run("nosuch", NEW)[0], 1)
+        t("renaming a name to itself is refused", run(OLD, OLD)[0], 1)
+        t("a name with a slash in it is refused before anything is read", run(OLD, "a/b")[0], 1)
+        t("one argument is a usage error, not a rename", run(OLD)[0], 2)
+        t("…and none of those reached Slack", DENIED, [])
+    finally:
+        globals()["API"] = real_api
+        globals()["BIN"] = real_bin
+        os.environ["PATH"] = real_path
+        os.environ.pop("TMUX_PANE", None)
+        if real_pane is not None:
+            os.environ["TMUX_PANE"] = real_pane
+        if real_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = real_home
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"cc-rename selfcheck: {n[0] - len(fails)} passed, {len(fails)} failed")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

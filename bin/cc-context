@@ -79,6 +79,13 @@ dumps its stdin). The whole payload is: session_id, transcript_path, cwd, prompt
 hook_event_name, stop_hook_active, last_assistant_message, background_tasks, session_crons. No token counts,
 no percentage. What it does give is `transcript_path`, and the transcript holds the truth.
 
+THE STATUS LINE CAN (2026-09-05). Claude Code's own `statusLine` command (cc-statusline) runs after most
+turns with the harness's OWN context/cost figures on stdin — no re-deriving them off a transcript — and
+writes them to ~/.cc/state/statusline/<session-id>.json. `statusline_measure()` below reads that file and is
+tried FIRST, everywhere this file measures a session: fresh (STATUSLINE_MAX_AGE seconds) and present beats
+the transcript estimate, which takes over exactly as before when it is stale or missing. window_src reads
+"statusline" when it was, so the answer never hides which one it is — same rule as "pane" for --true below.
+
 USED = the last assistant entry's `message.usage`: input_tokens + cache_creation + cache_read. That IS the
 prompt the model just saw, cache or not. If a `compact_boundary` follows it (Claude compacted after the last
 answer) its `compactMetadata.postTokens` is the number instead — the old figure describes a context that no
@@ -100,13 +107,16 @@ Then evidence overrides all of it: used above the window means the window is big
 
 Records: ~/.cc/state/context/<session-id>.json (the Stop hook writes one per turn; pruned after 7 days),
 plus the append-only handoffs.jsonl above, which is never pruned.
-Env: CC_CTX_WINDOW · CC_CTX_BOX_MODEL · CC_CTX_RECORDS (a test run keeps its records out of the box's).
+Env: CC_CTX_WINDOW · CC_CTX_BOX_MODEL · CC_CTX_RECORDS (a test run keeps its records out of the box's) ·
+CC_STATUSLINE_DIR (where cc-statusline's per-session files are read from).
 """
 import glob, json, os, re, subprocess, sys, time
 
 STATE = os.path.expanduser("~/.cc/state")
 RECORDS = os.environ.get("CC_CTX_RECORDS") or os.path.join(STATE, "context")
 HANDOFF = os.environ.get("CC_HANDOFF_DIR") or os.path.join(STATE, "handoff")
+STATUSLINE_DIR = os.environ.get("CC_STATUSLINE_DIR") or os.path.join(STATE, "statusline")
+STATUSLINE_MAX_AGE = 120   # seconds: fresher is trusted as this turn's; older is a session that has moved on
 PROJECTS = os.path.expanduser("~/.claude/projects")
 BIN = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_WINDOW = 200_000
@@ -372,6 +382,38 @@ def pane_measure(target):
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+# ---- the status line's own number --------------------------------------------------------------
+# cc-statusline (Claude Code's own statusLine command) writes ~/.cc/state/statusline/<session-id>.json every
+# turn from the harness's OWN figures. Preferred over measure()'s transcript estimate whenever it exists and
+# is fresh enough to describe the CURRENT turn — trusting the file's own "pct", exactly as pane_measure()
+# trusts the pane's: asking for the real number and then recomputing it here would be the estimate again with
+# extra steps.
+
+def statusline_measure(sid):
+    """{used, window, pct, model, window_src: "statusline", ...} from that session's own status-line file, or
+    None when there is no session id, no file, the file is stale, or it holds nothing usable yet (a session
+    barely started writes used/window/pct as null)."""
+    if not sid:
+        return None
+    path = os.path.join(STATUSLINE_DIR, sid + ".json")
+    try:
+        mtime = os.path.getmtime(path)
+        with open(path) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    if time.time() - mtime > STATUSLINE_MAX_AGE:
+        return None
+    used, window, pct = d.get("used"), d.get("window"), d.get("pct")
+    if not isinstance(used, (int, float)) or not isinstance(window, (int, float)) or window <= 0 \
+            or not isinstance(pct, (int, float)):
+        return None
+    return {"used": int(used), "window": int(window), "pct": float(pct),
+            "model": d.get("model"), "window_src": "statusline", "compacted": False,
+            "transcript": None, "session_id": sid,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
 # ---- finding a session's transcript ------------------------------------------------------------
 
 def transcript_for_session(sid):
@@ -632,6 +674,28 @@ def told(m, lvl, deferred="", restartable=True, overlapped=False, ending=False):
     return s + " This session is being handed off now."
 
 
+def session_name(repo, track):
+    """What a person calls this session: its tmux window (`<repo>`, `<repo>@<alias>`, `<repo>/<track>`),
+    read through the pane the Stop hook runs in. A headless worker's window is its track's, which is right. With
+    no pane, the parts that are known: repo@alias for an orch, repo/track for a track, the repo for a planning
+    session. Never raises and never blocks: a name is a label, not a measurement."""
+    pane = os.environ.get("TMUX_PANE") or ""
+    if pane:
+        try:
+            r = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#W"], capture_output=True,
+                               text=True, timeout=2)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    alias = os.environ.get("CC_SLACK_ALIAS") or ""
+    if repo and alias:
+        return f"{repo}@{alias}"
+    if repo and track:
+        return f"{repo}/{track}"
+    return repo or ""
+
+
 def record(payload):
     """Called by the Stop hook. Never raises: a measurement must not be able to break a session."""
     sid = payload.get("session_id") or ""
@@ -641,14 +705,15 @@ def record(payload):
         path = transcript_for_session(sid) if sid else None
     if not path or not os.path.exists(path):
         return None
-    m = measure(path, sid)
+    m = statusline_measure(sid) or measure(path, sid)
     if not m:
         return None
     root = git(cwd, "rev-parse", "--show-toplevel") if cwd else ""
     repo, track = track_of(root or cwd or "")
     if not repo and cwd and os.path.dirname(os.path.realpath(cwd)) == os.path.expanduser("~/dev"):
         repo = os.path.basename(os.path.realpath(cwd))   # a planning session: ~/dev/<repo>, no track marker
-    m.update({"cwd": cwd, "repo": repo, "track": track, "level": level_of(m["used"], m["window"])})
+    m.update({"cwd": cwd, "repo": repo, "track": track, "level": level_of(m["used"], m["window"]),
+              "name": session_name(repo, track)})
     os.makedirs(RECORDS, exist_ok=True)
     p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
     was = {}
@@ -883,7 +948,7 @@ def main(argv):
                 what = f"{repo}/{track}" if repo else (sid or os.getcwd())
                 print(f"cc-context: no transcript for {what}", file=sys.stderr)
             return 2
-        m = measure(path, sid)
+        m = statusline_measure(sid) or measure(path, sid)
         if not m:
             if not quiet:
                 print(f"cc-context: {path} has no answered turn yet", file=sys.stderr)
@@ -1023,6 +1088,24 @@ def selfcheck():
         ok("--all lists both records", len(rs) == 2)
         best = newest_per_track(rs)
         ok("repo/track comes off the .cc/track marker", ("repo1", "track1") in best)
+
+        # the session's NAME: its tmux window when the hook runs in one; otherwise the parts that are known
+        envN = {k: os.environ.pop(k, None) for k in ("TMUX_PANE", "CC_SLACK_ALIAS")}
+        try:
+            wt = os.path.join(d, "wt")
+            r2 = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
+            ok("with no pane a track session is named repo/track", bool(r2) and r2.get("name") == "repo1/track1")
+            os.environ["CC_SLACK_ALIAS"] = "dash"
+            r3 = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
+            ok("an orch with no pane is named repo@alias", bool(r3) and r3.get("name") == "repo1@dash")
+            os.environ["TMUX_PANE"] = "%999999"           # a pane tmux does not know: the name falls back, nothing raises
+            r4 = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
+            ok("a pane tmux cannot name falls back to the parts, never raises", bool(r4) and r4.get("name") == "repo1@dash")
+        finally:
+            for k, v in envN.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
 
         # the three lines: a percentage each, with a floor under the first two
         ok("30/40/60 of the 1M window", thresholds(BIG_WINDOW) == (300000.0, 400000.0, 600000.0))
@@ -1273,6 +1356,43 @@ def selfcheck():
         on[0] = False
         os.remove(os.path.join(wt, "dirty.txt"))
         have_window, event, overlap_open = hw0, ev0, oo0
+
+        # ---- the status line's own number: preferred when fresh, ignored when stale, absent or incomplete ----
+        global STATUSLINE_DIR
+        sl_keep, STATUSLINE_DIR = STATUSLINE_DIR, os.path.join(d, "statusline")
+        os.makedirs(STATUSLINE_DIR, exist_ok=True)
+        tpath = tx([asst("claude-sonnet-5", 10, 100, 200)])          # a transcript reading nowhere near 40%
+        base = measure(tpath, "sid-sl")
+        ok("sanity: the transcript alone reads nowhere near the statusline fixture below", base["pct"] < 5)
+        sl_file = os.path.join(STATUSLINE_DIR, "sid-sl.json")
+        with open(sl_file, "w") as fh:
+            json.dump({"used": 400000, "window": 1000000, "pct": 40.0, "model": "claude-opus-5", "raw": {}}, fh)
+        m = statusline_measure("sid-sl") or measure(tpath, "sid-sl")
+        ok("a fresh statusline file is preferred over the transcript estimate",
+           m["used"] == 400000 and m["window"] == 1000000 and m["pct"] == 40.0)
+        ok("...and the source says so, same rule as the pane's own number for --true",
+           m["window_src"] == "statusline")
+
+        # the two calls above build statusline_measure(sid) or measure(...) themselves — that expression is
+        # this test's, not the tool's. record() is the Stop hook's real call site: prove IT prefers the file.
+        r = record({"session_id": "sid-sl", "transcript_path": tpath, "cwd": d})
+        ok("record() — the real call site, not this test's own expression — takes the statusline path",
+           r and r["window_src"] == "statusline" and r["used"] == 400000)
+
+        old = time.time() - STATUSLINE_MAX_AGE - 5
+        os.utime(sl_file, (old, old))
+        m = statusline_measure("sid-sl") or measure(tpath, "sid-sl")
+        ok("a stale statusline file is ignored — the transcript estimate takes over, exactly as before",
+           m["window_src"] != "statusline" and m["pct"] < 5)
+
+        m = statusline_measure("sid-none") or measure(tpath, "sid-none")
+        ok("no statusline file at all also falls back to the transcript estimate", m["window_src"] != "statusline")
+
+        with open(os.path.join(STATUSLINE_DIR, "sid-partial.json"), "w") as fh:
+            json.dump({"used": None, "window": None, "pct": None, "model": "claude-opus-5", "raw": {}}, fh)
+        ok("a file that is there but has nothing usable yet (a session barely started) is not preferred either",
+           statusline_measure("sid-partial") is None)
+        STATUSLINE_DIR = sl_keep
 
         RECORDS, HANDOFF, STATE = keep, keeph, keeps
 

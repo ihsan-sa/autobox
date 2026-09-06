@@ -1,0 +1,566 @@
+#!/usr/bin/python3 -IS
+# cc-fence — restrict a command after the launcher has finished building its namespace.
+# The kernel checks the actual operation, including interpreter and copied-binary writes.
+#   cc-fence run [--rw <path>]... [--ro <path>]... [--require-abi <n>] [--] <command...>
+#   cc-fence probe        one line: ABI, known supported rights, and this profile's minimum
+#   cc-fence selfcheck    private fixtures and unfenced controls; exit 77 means skipped
+# Requires ABI 6: write/create/remove, REFER, TRUNCATE, IOCTL_DEV, signal and abstract
+# socket scopes. Reads and execution remain available everywhere the namespace exposes.
+# --ro asserts an existing area outside every --rw tree; overlaps (in either direction)
+# are refused because Landlock allow rules are additive. A path may name a file, a directory
+# or a device; a symbolic link is refused, since what it points at is not the launcher's choice.
+# The launcher must supply trusted paths in a completed, isolated namespace, with no
+# hostile setup processes, dropped capabilities and nested user namespaces disabled.
+# It must use pipes or /dev/null for stdio: inherited files, sockets and TTYs are refused.
+# PATH decides nothing here: the interpreter is absolute in the shebang (not `env`, which resolves
+# it through the caller's PATH), and the command must be an absolute path or it is refused.
+# Landlock cannot revoke open descriptors, stop every metadata change or enforce egress.
+# Read-only mounts and absent host paths are still required. One launcher uses it: cc-member-v2,
+# behind CC_MEMBER_V2=1, which is off by default and selected by no live session.
+# ABI definitions: https://www.kernel.org/doc/html/latest/userspace-api/landlock.html
+import ctypes as C
+import errno
+import os
+import stat
+import struct
+import sys
+
+MIN_ABI = 6
+AT_FDCWD = -100
+RESOLVE_NO_MAGICLINKS = 0x02
+RESOLVE_NO_SYMLINKS = 0x04
+FS_NAMES = "EXECUTE WRITE_FILE READ_FILE READ_DIR REMOVE_DIR REMOVE_FILE MAKE_CHAR MAKE_DIR MAKE_REG MAKE_SOCK MAKE_FIFO MAKE_BLOCK MAKE_SYM REFER TRUNCATE IOCTL_DEV".split()
+FS_ABIS = [1] * 13 + [2, 3, 5]
+WRITE = ((1 << 16) - 1) & ~((1 << 0) | (1 << 2) | (1 << 3))
+FILE_WRITE = (1 << 1) | (1 << 14) | (1 << 15)
+SCOPE = 3                         # ABSTRACT_UNIX_SOCKET | SIGNAL (ABI 6)
+LIBC = C.CDLL(None, use_errno=True)
+LIBC.syscall.restype = C.c_long
+USAGE = "usage: cc-fence run [--rw <path>]... [--ro <path>]... [--require-abi <n>] [--] <command...> | probe | selfcheck"
+
+
+class Refused(Exception):
+    pass
+
+
+class Ruleset(C.Structure):
+    _fields_ = [("handled_access_fs", C.c_uint64), ("handled_access_net", C.c_uint64),
+                ("scoped", C.c_uint64)]
+
+
+class OpenHow(C.Structure):
+    _fields_ = [("flags", C.c_uint64), ("mode", C.c_uint64), ("resolve", C.c_uint64)]
+
+
+def open_real(path):
+    # O_NOFOLLOW guards the last component only, and not even that against a spelling: "link/",
+    # "link/." and "link/x" all resolve THROUGH the link. openat2 with RESOLVE_NO_SYMLINKS refuses
+    # a link at any component, magic links included, so no spelling reaches an object the launcher
+    # did not name. O_PATH needs no read permission, and the rule attaches to this fd, not the name.
+    how = OpenHow(os.O_PATH | os.O_CLOEXEC, 0, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)
+    try:
+        fd = syscall(437, "openat2", C.c_int(AT_FDCWD), os.fsencode(os.fspath(path)),
+                     C.byref(how), C.c_size_t(C.sizeof(how)))
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise Refused(f"rule path {path!r} resolves through a symbolic link; pass the object itself")
+        raise
+    # …and the object opened must be the one the argv names. A grant nobody can read off the
+    # launcher's own arguments is a grant nobody can review.
+    real = os.readlink(f"/proc/self/fd/{fd}")
+    if real != os.path.normpath(os.path.abspath(os.fspath(path))):
+        os.close(fd)
+        raise Refused(f"rule path {path!r} is not {real!r}; pass a canonical absolute path")
+    return fd, real
+
+
+def path_rule(rights, fd):
+    # struct landlock_path_beneath_attr is packed: a 8-byte access mask then a 4-byte fd,
+    # no tail padding. "=" is native order, standard size, no alignment — the same layout
+    # ctypes' _pack_ gives, without the deprecation warning it prints from Python 3.14 on.
+    return C.create_string_buffer(struct.pack("=Qi", rights, fd), 12)
+
+
+def syscall(number, name, *args):
+    # These syscall numbers are shared by the supported 64-bit Linux architectures.
+    # Never guess on another architecture (notably x32 and the MIPS ABI families).
+    if sys.platform != "linux" or os.uname().machine not in ("x86_64", "aarch64", "riscv64") or C.sizeof(C.c_void_p) != 8:
+        raise Refused("unsupported syscall architecture")
+    result = LIBC.syscall(C.c_long(number), *args)
+    if result < 0:
+        code = C.get_errno()
+        raise OSError(code, f"{name}: {os.strerror(code)} ({errno.errorcode.get(code, code)})")
+    return result
+
+
+def abi_version():
+    return syscall(444, "landlock_create_ruleset VERSION", C.c_void_p(), C.c_size_t(0), C.c_uint(1))
+
+
+def require_abi(minimum=MIN_ABI):
+    abi = abi_version()
+    minimum = max(MIN_ABI, minimum)  # the caller can only tighten the requirement
+    if abi < minimum:
+        missing = [n for n, v in zip(FS_NAMES, FS_ABIS) if v > abi]
+        if abi < 6:
+            missing += ["SCOPE_SIGNAL", "SCOPE_ABSTRACT_UNIX_SOCKET"]
+        raise Refused(f"Landlock ABI {abi}; require ABI {minimum}; missing {','.join(missing) or 'requested ABI'}")
+    return abi
+
+
+def unsupported(reason):
+    # WHICH REFUSAL IS "this kernel cannot carry the profile" — the only one a test run may skip on.
+    # An ABI too low, or Landlock absent. NOT EPERM/EACCES/E2BIG from restrict_self or add_rule: the
+    # kernel had Landlock and declined to apply it, and a fence that applied nothing must never
+    # report green. Dropping no_new_privs used to land in here and skip every case (review, 09-06).
+    return ("require ABI" in reason or
+            ("landlock_" in reason and any(f"({e})" in reason for e in ("ENOSYS", "EOPNOTSUPP"))))
+
+
+def probe():
+    abi = abi_version()
+    rights = [n for n, v in zip(FS_NAMES, FS_ABIS) if v <= abi]
+    if abi >= 4:
+        rights += ["BIND_TCP", "CONNECT_TCP"]
+    if abi >= 6:
+        rights += ["SCOPE_SIGNAL", "SCOPE_ABSTRACT_UNIX_SOCKET"]
+    print(f"cc-fence: Landlock ABI {abi}; known rights={','.join(rights)}; required ABI={MIN_ABI}")
+
+
+def close_setup_fds():
+    # Do not use RLIMIT_NOFILE: an inherited fd can be above a subsequently lowered limit.
+    syscall(436, "close_range", C.c_uint(3), C.c_uint(0xffffffff), C.c_uint(0))
+
+
+def prepare_process():
+    close_setup_fds()
+    for fd in range(3):
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                continue
+            raise
+        if not (stat.S_ISFIFO(info.st_mode) or
+                (stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(1, 3))):
+            raise Refused(f"stdio fd {fd} must be a pipe or /dev/null (open files, sockets and TTYs retain authority)")
+    if LIBC.prctl(38, 1, 0, 0, 0):  # PR_SET_NO_NEW_PRIVS
+        code = C.get_errno()
+        raise OSError(code, f"no_new_privs: {os.strerror(code)}")
+    os.setsid()                    # failure, including being a process-group leader, refuses exec
+
+
+def apply_rules(rw, ro):
+    # Open once, inspect the object, add its fd, and close it before exec. This is not
+    # the host launcher's mount-source resolver: these paths are already inside bwrap.
+    opened = []
+    ruleset = -1
+    try:
+        for kind, paths in (("rw", rw), ("ro", ro)):
+            for path in paths:
+                fd, real = open_real(path)
+                opened.append((kind, fd, real))
+                mode = os.fstat(fd).st_mode
+                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)):
+                    raise Refused(f"unsupported rule path {path!r}")
+        for kind, fd, path in opened:
+            if kind != "ro":
+                continue
+            for other, writable, target in opened:
+                if other == "rw" and (os.path.commonpath((path, target)) in (path, target) or
+                                      os.path.samestat(os.fstat(fd), os.fstat(writable))):
+                    raise Refused(f"overlapping --ro {path!r} and --rw {target!r}; use separate writable trees")
+        attr = Ruleset(WRITE, 0, SCOPE)
+        ruleset = syscall(444, "landlock_create_ruleset", C.byref(attr), C.c_size_t(C.sizeof(attr)), C.c_uint(0))
+        for kind, fd, _ in opened:
+            if kind == "rw":
+                rights = WRITE if stat.S_ISDIR(os.fstat(fd).st_mode) else FILE_WRITE
+                syscall(445, "landlock_add_rule", C.c_int(ruleset), C.c_int(1),
+                        path_rule(rights, fd), C.c_uint(0))
+        syscall(446, "landlock_restrict_self", C.c_int(ruleset), C.c_uint(0))
+    finally:
+        if ruleset >= 0:
+            os.close(ruleset)
+        for _, fd, _ in opened:
+            os.close(fd)
+
+
+def run(args):
+    rw, ro, minimum = [], [], MIN_ABI
+    while args:
+        option = args[0]
+        if option == "--":
+            args = args[1:]
+            break
+        if not option.startswith("--"):
+            break
+        if option not in ("--rw", "--ro", "--require-abi") or len(args) < 2:
+            raise Refused(USAGE)
+        value, args = args[1], args[2:]
+        if option == "--require-abi":
+            if not value.isascii() or not value.isdecimal() or int(value) < 1:
+                raise Refused("--require-abi needs a positive integer")
+            minimum = max(minimum, int(value))
+        else:
+            (rw if option == "--rw" else ro).append(value)
+    if not args:
+        raise Refused(USAGE)
+    if not args[0].startswith("/"):
+        # execvp would search the caller's PATH, so a planted name would BE what the fence protects.
+        raise Refused(f"command {args[0]!r} must be an absolute path; a bare name resolves through PATH")
+    prepare_process()
+    require_abi(minimum)
+    apply_rules(rw, ro)
+    os.execv(args[0], args)
+
+
+def selfcheck():
+    import fcntl
+    import pathlib
+    import pty
+    import shutil
+    import socket
+    import subprocess as sp
+    import tempfile
+
+    passed = failed = skipped = 0
+    self = os.path.realpath(__file__)
+    python = [sys.executable, "-I", "-S", "-c"]
+    prefix = "import os, sys, errno, ctypes, signal, socket, subprocess, fcntl, termios\n"
+
+    def check(ok, name, detail=""):
+        nonlocal passed, failed
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        print(f"  {'ok  ' if ok else 'FAIL'} {name}" + (f": {detail.strip()}" if not ok else ""))
+
+    def call(command, **kwargs):
+        options = dict(stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.PIPE, text=True, timeout=10)
+        options.update(kwargs)
+        return sp.run([str(x) for x in command], **options)
+
+    def tally():
+        print(f"cc-fence selfcheck: {passed} passed, {failed} failed, {skipped} skipped")
+        return 1 if failed else (77 if skipped else 0)
+
+    with tempfile.TemporaryDirectory(prefix="cc-fence-") as temp:
+        temp = os.path.realpath(temp)   # rule paths must be canonical; a symlinked TMPDIR is not the test
+        root = pathlib.Path(temp)
+        inside, outside = root / "task", root / "outside"
+        inside.mkdir()
+        outside.mkdir()
+        fence = [self, "run", "--rw", inside, "--ro", outside, "--"]
+        # The exact same attack runs three times: unfenced outside, fenced outside,
+        # fenced task-local. Check effects too, so an unrelated error is never a denial.
+        def pair(name, code, verify, setup=lambda p: None, command=None):
+            for label, base, fenced in (("control", outside, False), ("refused", outside, True),
+                                        ("allowed", inside, True)):
+                path = base / (name.replace(" ", "-") + "-" + label)
+                path.mkdir()
+                setup(path)
+                payload = (command(path) if command else python + [prefix + code, path])
+                result = call((fence if fenced else []) + payload)
+                blocked = label == "refused"
+                # Python reports a precise errno; shell/copied utilities get an effect
+                # check plus their failure status. No arbitrary failure is accepted.
+                status = (result.returncode != 0 if command else result.returncode == 13) if blocked else result.returncode == 0
+                check(status and verify(path, blocked), f"{name}: {label}", result.stderr)
+
+        # A Python attack only exits 13 for the expected kernel denials.
+        def attack(body):
+            return "p = sys.argv[1]\ntry:\n" + "\n".join("    " + ln for ln in body.splitlines()) + \
+                "\nexcept OSError as e:\n    if e.errno not in (errno.EACCES, errno.EPERM, errno.EXDEV): raise\n    sys.exit(13)\n"
+
+        readiness = call(fence + ["/bin/true"])
+        if readiness.returncode:
+            reason = readiness.stderr.strip()
+            if unsupported(reason):
+                # No attack was run: do not print a passed tally for an unavailable fence.
+                skipped = 1
+                print(f"  SKIP all enforcement cases and their controls: {reason}")
+            else:
+                check(False, "fence setup", reason)
+            return tally()
+
+        def seeded(p):
+            (p / "file").write_text("sentinel")
+
+        def contents(p, blocked):
+            return (p / "file").read_text() == ("sentinel" if blocked else "changed")
+
+        pair("Python write", attack("with open(p + '/file', 'w') as f: f.write('changed')"), contents, seeded)
+        pair("shell write", "", contents, seeded,
+             lambda p: ["/bin/sh", "-c", "printf changed > \"$1/file\"", "sh", p])
+        copied = inside / "copied-cp"
+        shutil.copy2(shutil.which("cp"), copied)
+        source = root / "source"
+        source.write_text("changed")
+        pair("copied executable", "", contents, seeded, lambda p: [copied, source, p / "file"])
+        for name, body in (("truncate", "os.truncate(p + '/file', 0)"),
+                           ("readonly O_TRUNC", "os.close(os.open(p + '/file', os.O_RDONLY | os.O_TRUNC))"),
+                           ("descriptor truncate", "fd = os.open(p + '/file', os.O_RDONLY)\nos.ftruncate(fd, 0)")):
+            # ftruncate on O_RDONLY is invalid independently of Landlock. Use a write
+            # descriptor for this case, so both the vulnerable and permitted calls work.
+            if name == "descriptor truncate":
+                body = body.replace("os.O_RDONLY", "os.O_WRONLY")
+            pair(name, attack(body), lambda p, b: (p / "file").read_text() == ("sentinel" if b else ""), seeded)
+        pair("create", attack("with open(p + '/new', 'w') as f: f.write('new')"),
+             lambda p, b: not (p / "new").exists() if b else (p / "new").read_text() == "new")
+        pair("remove", attack("os.unlink(p + '/file')"), lambda p, b: (p / "file").exists() == b, seeded)
+        pair("mkdir", attack("os.mkdir(p + '/new')"), lambda p, b: (p / "new").is_dir() != b)
+
+        # Destination is outside for the attack, another task directory for its twin.
+        def moving(p):
+            source = inside / "moving"
+            source.write_text("sentinel")
+        def moved(p, b):
+            return ((inside / "moving").exists() and not (p / "new").exists()) if b else \
+                   (not (inside / "moving").exists() and (p / "new").read_text() == "sentinel")
+        move = f"os.rename({str(inside / 'moving')!r}, p + '/new')"
+        pair("rename", attack(move), moved, moving)
+        move2 = f"libc = ctypes.CDLL(None, use_errno=True)\nr = libc.renameat2(-100, {os.fsencode(inside / 'moving')!r}, -100, os.fsencode(p + '/new'), 1)\nif r: raise OSError(ctypes.get_errno(), 'renameat2')"
+        pair("renameat2", attack(move2), moved, moving)
+        # Cross-directory, so REFER decides it: refused outside, granted inside task data.
+        def linkable(p):
+            (p / "src").write_text("sentinel")
+            (p / "sub").mkdir()
+        pair("hardlink", attack("os.link(p + '/src', p + '/sub/new')"),
+             lambda p, b: not (p / "sub" / "new").exists() if b else
+             os.path.samefile(p / "src", p / "sub" / "new"), linkable)
+        # The more dangerous link goes INTO task data, giving an outside inode writes.
+        for name, base in (("control", outside), ("refused", outside), ("allowed", inside)):
+            src, dst = base / ("link-" + name), inside / ("linked-" + name)
+            src.write_text("sentinel")
+            result = call(([] if name == "control" else fence) + python +
+                          [prefix + attack(f"os.link({str(src)!r}, {str(dst)!r})\nwith open({str(dst)!r}, 'w') as f: f.write('changed')"), root])
+            blocked = name == "refused"
+            check(result.returncode == (13 if blocked else 0) and src.read_text() == ("sentinel" if blocked else "changed")
+                  and dst.exists() != blocked, f"hardlink into task: {name}", result.stderr)
+        # A symlink ancestor inside task data must not lend its access to the target.
+        for name, base in (("control", outside), ("refused", outside), ("allowed", inside)):
+            target = base / ("target-" + name)
+            target.mkdir()
+            seeded(target)
+            link = inside / ("symlink-" + name)
+            link.symlink_to(target, target_is_directory=True)
+            result = call(([] if name == "control" else fence) + python +
+                          [prefix + attack("with open(p + '/file', 'w') as f: f.write('changed')"), link])
+            check(result.returncode == (13 if name == "refused" else 0) and contents(target, name == "refused"),
+                  f"symlink ancestor: {name}", result.stderr)
+
+        # A single file grant does not grant its parent or sibling; reads stay available.
+        leaf = outside / "credential"
+        leaf.write_text("sentinel")
+        sibling = outside / "sibling"
+        sibling.write_text("sentinel")
+        leaf_fence = [self, "run", "--rw", leaf, "--"]
+        for name, path, guarded in (("control", sibling, False), ("refused", sibling, True), ("allowed", leaf, True)):
+            path.write_text("sentinel")
+            result = call((leaf_fence if guarded else []) + python +
+                          [prefix + attack("with open(p, 'w') as f: f.write('changed')"), path])
+            check(result.returncode == (13 if name == "refused" else 0) and path.read_text() ==
+                  ("sentinel" if name == "refused" else "changed"), f"file grant: {name}", result.stderr)
+        result = call(fence + python + [f"assert open({str(sibling)!r}).read() == 'sentinel'; print('readable')"])
+        check(result.returncode == 0 and result.stdout == "readable\n", "read outside the fence", result.stderr)
+
+        # Raw Landlock deliberately keeps an old writer. Production run closes it.
+        # The module is loaded before applying policy, only in this private subprocess.
+        load = f"import runpy; m = runpy.run_path({self!r})\n"
+        raw = "m['LIBC'].prctl(38, 1, 0, 0, 0)\nm['require_abi']()\nm['apply_rules']([sys.argv[2]], [])\n"
+        for name, guarded, preopened, base in (("control", False, True, outside),
+                                               ("old writer survives Landlock", True, True, outside),
+                                               ("new writer refused", True, False, outside),
+                                               ("new task writer allowed", True, False, inside)):
+            path = base / "descriptor"
+            path.write_text("sentinel")
+            opening = "fd = os.open(sys.argv[1], os.O_WRONLY)\n"
+            code = prefix + load + (opening if preopened else "") + (raw if guarded else "")
+            code += attack(("" if preopened else opening) + "os.write(fd, b'changed!')\nos.ftruncate(fd, 7)")
+            result = call(python + [code, path, inside])
+            blocked = guarded and not preopened and base == outside
+            check(result.returncode == (13 if blocked else 0) and path.read_text() ==
+                  ("sentinel" if blocked else "changed"), f"descriptor semantics: {name}", result.stderr)
+        inherited = outside / "inherited"
+        inherited.write_text("sentinel")
+        with inherited.open("r+b") as stream:
+            high = fcntl.fcntl(stream.fileno(), fcntl.F_DUPFD, 200)
+            try:
+                for name, guarded in (("control", False), ("refused", True)):
+                    inherited.write_text("sentinel")
+                    code = prefix + f"\ntry: os.write({high}, b'changed!')\nexcept OSError as e:\n    assert e.errno == errno.EBADF\n    sys.exit(13)\n"
+                    result = call((fence if guarded else []) + python + [code], pass_fds=(high,))
+                    check(result.returncode == (13 if guarded else 0) and inherited.read_text() ==
+                          ("sentinel" if guarded else "changed!"), f"setup descriptor cleanup: {name}", result.stderr)
+            finally:
+                os.close(high)
+        result = call(fence + python + ["import os; os.write(1, b'pipe works\\n')"])
+        check(result.returncode == 0 and result.stdout == "pipe works\n", "setup descriptor cleanup: allowed stdout pipe", result.stderr)
+        for name, guarded in (("control", False), ("refused", True)):
+            with inherited.open("wb") as stream:
+                result = call((fence if guarded else []) + python + ["print('leaked')"], stdout=stream)
+            check((result.returncode == 2 and "stdio fd 1" in result.stderr and inherited.read_bytes() == b"") if guarded else
+                  (result.returncode == 0 and inherited.read_text() == "leaked\n"), f"file stdio: {name}", result.stderr)
+
+        # Only fixture children receive a real signal. kill(0) alone would not prove it.
+        sleeper = prefix + "signal.signal(signal.SIGUSR1, lambda *_: sys.exit(0))\nprint('ready', flush=True)\nsignal.pause()"
+        for name, guarded, local in (("control", False, False), ("refused", True, False), ("allowed", True, True)):
+            if local:
+                code = prefix + f"p = subprocess.Popen({python + [sleeper]!r}, stdout=subprocess.PIPE, text=True)\nassert p.stdout.readline() == 'ready\\n'\nos.kill(p.pid, signal.SIGUSR1)\nassert p.wait(timeout=3) == 0"
+                result = call(fence + python + [code])
+                check(result.returncode == 0, "signal scope: allowed descendant", result.stderr)
+            else:
+                with sp.Popen(python + [sleeper], stdout=sp.PIPE, text=True) as victim:
+                    try:
+                        assert victim.stdout.readline() == "ready\n"
+                        result = call((fence if guarded else []) + python + [prefix + attack(f"os.kill({victim.pid}, signal.SIGUSR1)"), root])
+                        effect = victim.poll() is None if guarded else victim.wait(timeout=3) == 0
+                        check(result.returncode == (13 if guarded else 0) and effect, f"signal scope: {name}", result.stderr)
+                    finally:
+                        if victim.poll() is None:
+                            victim.kill()
+                        victim.wait()
+        # Abstract sockets are fixture-only, with names unique to this private directory.
+        for name, guarded, local in (("control", False, False), ("refused", True, False), ("allowed", True, True)):
+            address = "\0" + temp + name
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as server:
+                if not local:
+                    server.bind(address)
+                code = prefix
+                if local:
+                    code += f"s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); s.bind({address!r})\n"
+                code += attack(f"c = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\nc.sendto(b'probe', {address!r})")
+                if local:
+                    code += "assert s.recv(16) == b'probe'\n"
+                result = call((fence if guarded else []) + python + [code, root])
+                server.setblocking(False)
+                try:
+                    received = server.recv(16)
+                except OSError as exc:
+                    if exc.errno != errno.EAGAIN:
+                        raise
+                    received = None
+                check(result.returncode == (13 if guarded and not local else 0) and
+                      (local or received == (None if guarded else b"probe")), f"abstract socket scope: {name}", result.stderr)
+
+        # Benign terminal ioctl, on a private PTY: exercises the same device right as
+        # terminal injection without injecting input into anybody's terminal.
+        master, slave = pty.openpty()
+        try:
+            device = os.ttyname(slave)
+            for name, options in (("control", []), ("refused", [self, "run", "--rw", inside, "--"]),
+                                  ("allowed", [self, "run", "--rw", device, "--"])):
+                code = prefix + attack("fd = os.open(p, os.O_RDONLY | os.O_NOCTTY)\nfcntl.ioctl(fd, termios.TIOCGWINSZ, b'\\0' * 8)")
+                result = call(options + python + [code, device])
+                check(result.returncode == (13 if name == "refused" else 0), f"device ioctl: {name}", result.stderr)
+            result = call(fence + ["/bin/true"], stdin=slave)
+            check(result.returncode == 2 and "stdio fd 0" in result.stderr, "inherited TTY refused", result.stderr)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+        abi = abi_version()
+        for minimum in (abi + 1, MIN_ABI, 1):
+            result = call([self, "run", "--require-abi", str(minimum), "--"] + python + ["print('executed')"])
+            check((result.returncode == 2 and not result.stdout and f"require ABI {abi + 1}" in result.stderr and
+                   len(result.stderr.splitlines()) == 1) if minimum > abi else
+                  (result.returncode == 0 and result.stdout == "executed\n"), f"required ABI {minimum}", result.stderr)
+        for rw, ro in ((inside, inside), (root, outside), (inside, root)):
+            result = call([self, "run", "--rw", rw, "--ro", ro, "--"] + python + ["print('executed')"])
+            check(result.returncode == 2 and not result.stdout and "overlapping" in result.stderr,
+                  f"overlapping policy refused: {rw.name}/{ro.name}", result.stderr)
+        # A rule path is the launcher's word about what the task owns. A link is somebody else's word.
+        link_target = outside / "rule-target"
+        link_target.mkdir()
+        rule_link = root / "rule-link"
+        rule_link.symlink_to(link_target, target_is_directory=True)
+        for name, rule, refused in (("a symlink is refused", rule_link, True), ("its target is not", link_target, False)):
+            result = call([self, "run", "--rw", rule, "--"] + python + ["print('executed')"])
+            check((result.returncode == 2 and not result.stdout and "symbolic link" in result.stderr) if refused
+                  else (result.returncode == 0 and result.stdout == "executed\n"), f"rule path: {name}", result.stderr)
+        # A LINK IS NOT A GRANT, IN ANY SPELLING. O_NOFOLLOW guarded only the bare name: "link/",
+        # "link/." and an intermediate "link/x" all reached the target. Each spelling is run three
+        # ways — unfenced (the write lands, so the case is testing something), through the spelling
+        # (must refuse before executing anything), and against the object's own path (must work).
+        owned = outside / "spelling"
+        owned.mkdir()
+        (owned / "file").write_text("sentinel")
+        (owned / "x").mkdir()
+        (owned / "x" / "file").write_text("sentinel")
+        planted_link = inside / "spelling-link"
+        planted_link.symlink_to(owned, target_is_directory=True)
+        write = attack("with open(p + '/file', 'w') as f: f.write('changed')")
+        for label, spelling, target in (("bare link", str(planted_link), owned),
+                                        ("trailing slash", str(planted_link) + "/", owned),
+                                        ("trailing dot", str(planted_link) + "/.", owned),
+                                        ("intermediate component", str(planted_link / "x"), owned / "x")):
+            (target / "file").write_text("sentinel")
+            result = call(python + [prefix + write, target])
+            check(result.returncode == 0 and (target / "file").read_text() == "changed",
+                  f"rule spelling: {label}: control", result.stderr)
+            (target / "file").write_text("sentinel")
+            result = call([self, "run", "--rw", spelling, "--"] + python + [prefix + write, target])
+            check(result.returncode == 2 and "symbolic link" in result.stderr and
+                  (target / "file").read_text() == "sentinel", f"rule spelling: {label}: refused", result.stderr)
+            result = call([self, "run", "--rw", str(target), "--"] + python + [prefix + write, target])
+            check(result.returncode == 0 and (target / "file").read_text() == "changed",
+                  f"rule spelling: {label}: allowed on the real path", result.stderr)
+
+        # A FENCE THAT APPLIES NOTHING MUST NOT REPORT GREEN. Landlock without no_new_privs is EPERM:
+        # the kernel HAS it and declined, which is a failure, not an unsupported kernel to skip on.
+        code = prefix + load + "m['require_abi']()\nm['apply_rules']([sys.argv[1]], [])\nprint('executed')\n"
+        result = call(python + [code, str(inside)])
+        check(result.returncode != 0 and not result.stdout and "EPERM" in result.stderr,
+              "restrict_self without no_new_privs: refused, nothing executed", result.stderr)
+        for reason, skip in (("Landlock ABI 3; require ABI 6; missing REFER,TRUNCATE", True),
+                             ("landlock_create_ruleset VERSION: Function not implemented (ENOSYS)", True),
+                             ("landlock_restrict_self: Operation not permitted (EPERM)", False),
+                             ("landlock_add_rule: Permission denied (EACCES)", False),
+                             ("landlock_create_ruleset: Argument list too long (E2BIG)", False)):
+            check(unsupported(reason) is skip, f"skip vs failure: {reason.split(':')[0]}")
+
+        # PATH BELONGS TO WHOEVER CALLED. A planted name must reach neither the interpreter that IS
+        # the fence nor the program it execs.
+        planted = root / "planted"
+        planted.mkdir()
+        for name in ("python3", "payload"):
+            tool = planted / name
+            tool.write_text(f"#!/bin/sh\necho planted-{name}\n")
+            tool.chmod(0o755)
+        env = dict(os.environ, PATH=f"{planted}:{os.environ.get('PATH', '')}")
+        result = call([self, "probe"], env=env)
+        check(result.returncode == 0 and result.stdout.startswith("cc-fence: Landlock ABI ") and
+              "planted" not in result.stdout, "PATH: a planted python3 is not the fence", result.stderr)
+        for label, command, expected in (("control", ["/bin/sh", "-c", 'exec "$1"', "sh", "payload"], "planted-payload\n"),
+                                         ("refused", None, ""), ("allowed", None, "planted-payload\n")):
+            if command is None:
+                command = fence + ["payload" if label == "refused" else str(planted / "payload")]
+            result = call(command, env=env)
+            check((result.returncode == 2 and not result.stdout and "absolute path" in result.stderr)
+                  if label == "refused" else (result.returncode == 0 and result.stdout == expected),
+                  f"PATH: a planted command name: {label}", result.stderr)
+
+        result = call(fence + python + ["import ctypes, os; assert ctypes.CDLL(None).prctl(39, 0, 0, 0, 0) == 1; assert os.getsid(0) == os.getpid(); print('restricted')"])
+        check(result.returncode == 0 and result.stdout == "restricted\n", "no_new_privs and new session", result.stderr)
+    return tally()
+
+
+def main():
+    try:
+        if sys.argv[1:] == ["probe"]:
+            probe()
+        elif sys.argv[1:] == ["selfcheck"]:
+            return selfcheck()
+        elif sys.argv[1:2] == ["run"]:
+            run(sys.argv[2:])
+        else:
+            raise Refused(USAGE)
+        return 0
+    except (Refused, OSError, ValueError) as exc:
+        print("cc-fence: refused: " + " ".join(str(exc).splitlines()), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

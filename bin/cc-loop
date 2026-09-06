@@ -47,6 +47,7 @@
 # Exit: 0 done | 3 waiting on the owner, board `waiting` (notified) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (notified)
 #     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
+#     | 12 completion has no usable receipt, board `blocked` (notified); delivery is unconfirmed
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
 # Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
@@ -239,6 +240,16 @@ round_end(){   # $1 did the last iteration commit? · $2 the track's PR, if it h
   [ "${1:-no}" = yes ] || { printf 'paused|blocked\n'; return 0; }
   [ -n "${2:-}" ] && printf 'over|review\n' || printf 'over|blocked\n'; }
 
+delivery_end(){   # $1 host receipt → outcome. A real PR survives a failed board/card projection.
+  jq -er '
+    if type != "object" or (.task_id | type) != "string" or (.errors | type) != "array" then "unknown"
+    elif (.pr_url // "") != "" then
+      if (.pending | length) > 0 then "pending" else "delivered" end
+    elif any(.errors[]; .stage == "commit" or .stage == "push" or .stage == "pr") then "failed"
+    elif (.committed_sha // "") == "" then "unknown"
+    elif (.pending | length) > 0 then "pending"
+    elif (.errors | length) > 0 then "unknown" else "delivered" end' <<<"${1:-}" 2>/dev/null || echo unknown; }
+
 worker_base(){   # $1 repo → the branch a worker is told never to touch and reviews its own diff against. The BOARD's
   # base, and never a track: origin/HEAD is only what a REMOTE calls its default, and for a repository the box made
   # that is the first branch pushed into it, a track. Cut from one of those, a new track carried another project's
@@ -401,6 +412,26 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
     "$(round_end no 'https://x/pr/1')" 'paused|blocked'
   grep -qF 'round_end "${committed:-no}"' "$0"
   t 'and the loop body really asks it rather than deciding the same thing twice' "$?" 0
+  # D1-D4: the receipt decides. Exit status and human output carry no delivery evidence.
+  rec='{"task_id":"fixture","committed_sha":"abc","pr_url":"https://x/pr/1","errors":[],"pending":{}}'
+  t 'D1: a real PR is delivered' "$(delivery_end "$rec")" delivered
+  for projection in board card; do
+    pending=$(jq --arg p "$projection" '.pending[$p]={} | .errors=[{stage:$p,message:"offline"}]' <<<"$rec")
+    t "D1 control: pending $projection over that PR is a note, never the no-PR failure" "$(delivery_end "$pending")" pending
+  done
+  for stage in commit push pr; do
+    failed=$(jq --arg s "$stage" '.pr_url=null | .errors=[{stage:$s,message:"failed"}]' <<<"$rec")
+    t "D2: no PR with a $stage error keeps exit 4" "$(delivery_end "$failed")" failed
+    t "D2 control: a PR with that $stage error is still delivery" \
+      "$(delivery_end "$(jq '.pr_url="https://x/pr/1"' <<<"$failed")")" delivered
+  done
+  t 'D3: a non-PR delivery is still allowed' "$(delivery_end "$(jq '.pr_url=null' <<<"$rec")")" delivered
+  t 'D3 pending control: a non-PR delivery can also owe a board projection' \
+    "$(delivery_end "$(jq '.pr_url=null | .pending.board={} | .errors=[{stage:"board"}]' <<<"$rec")")" pending
+  t 'D3 control: no PR and no commit is unconfirmed, exit 12' \
+    "$(delivery_end "$(jq '.pr_url=null | .committed_sha=null' <<<"$rec")")" unknown
+  t 'D4: human output cannot stand in for a receipt; D1 is its control' "$(delivery_end 'PR: https://x/pr/1')" unknown
+  t 'D4 control: an empty response is also unconfirmed' "$(delivery_end '')" unknown
   sed 's/^/  journal fixture | /' "$d/progress.md"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -503,12 +534,58 @@ while [ $i -lt "$MAXI" ]; do
   newprog=$(this_iteration "$SNAP" "$ST/progress.md")   # only THIS iteration's lines count, by position — see the function (a re-dispatched track must not "finish" on an old STATUS line, and must not MISS a new one that reads the same)
   if grep -qE '^STATUS: DONE' <<<"$newprog"; then
     "$BOARD" note "$repo" "$track" "loop: DONE after $i iteration(s), \$$spent" >/dev/null 2>&1
-    log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?   # captured, never `| tail -1`: the pipe dropped the status
-    printf '%s\n' "$dout" >> "$LOG"; dlast=$(printf '%s\n' "$dout" | grep -v '^[[:space:]]*$' | tail -1); printf '%s\n' "$dlast" >&2
-    # DONE is the worker's word; done is `cc done`'s. A push a DNS blip killed, a lease refused: the loop used to notify DONE with
-    # `PR: ` empty and exit 0, and the board went green over work no PR carried (monthly audit 2026-09-01 F3; 05:07Z janitor-containers).
-    [ "$drc" = 0 ] || stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed (rc $drc): ${dlast:-no output}. Fix the cause, then: cc done $repo $track"
-    "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $("$BOARD" get "$repo" "$track" pr)"; exit 0; fi
+    # A ROW WITH A TASK RECORD GOES THROUGH THE ONE HOST COMMAND. `cc-land queue --task` completes the task and,
+    # where the standing grant holds, puts the PR on the same numeric queue a 👍 uses; the loop decides from the
+    # RECEIPT it prints, never from an exit code — a board or card projection that could not be written used to
+    # turn a real PR into "finished, but opened no PR". The branch below is the legacy one, for a row that has no
+    # record; milestone 7 removes it with the rest.
+    if [ -e "$ST/delivery.json" ] || [ -L "$ST/delivery.json" ]; then
+      log "DONE"
+      rec=$(env "${HG[@]}" "${CC_LAND:-$BIN/cc-land}" queue --task "$repo" "$track" 2>>"$LOG")   # CC_LAND: test hook
+      printf '%s\n' "$rec" >> "$LOG"
+      case "$(delivery_end "$rec")" in
+        failed) why=$(jq -r '[.errors[] | select(.stage == "commit" or .stage == "push" or .stage == "pr") | .message] | join("; ")' <<<"$rec")
+          stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed: $why. Fix the cause, then: cc done $repo $track";;
+        unknown) stop 12 "delivery unconfirmed" "completion returned no usable receipt; inspect $LOG, then: cc-land queue --task $repo $track";;
+        pending) note="delivery projection pending: $(jq -r '.pending | keys | join(", ")' <<<"$rec"); retry: cc-land queue --task $repo $track"
+          log "$note"; "$BOARD" note "$repo" "$track" "$note" >/dev/null 2>&1;;   # the PR is real: a note, not a page
+      esac
+      "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $(jq -r '.pr_url // ""' <<<"$rec"). $(jq -r '.landing.message // ""' <<<"$rec")"
+      exit 0
+    else
+      log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?   # captured, never `| tail -1`: the pipe dropped the status
+      printf '%s\n' "$dout" >> "$LOG"; dlast=$(printf '%s\n' "$dout" | grep -v '^[[:space:]]*$' | tail -1); printf '%s\n' "$dlast" >&2
+      # DONE is the worker's word; done is `cc done`'s. A push a DNS blip killed, a lease refused: the loop used to notify DONE with
+      # `PR: ` empty and exit 0, and the board went green over work no PR carried (monthly audit 2026-09-01 F3; 05:07Z janitor-containers).
+      [ "$drc" = 0 ] || stop 4 "finished, but opened no PR" "the worker wrote STATUS: DONE, but cc done failed (rc $drc): ${dlast:-no output}. Fix the cause, then: cc done $repo $track"
+      # THE STANDING GRANT (`cc lands`, CC_SELF_LAND_REPOS in ~/.cc/config): a project that holds it does not wait for a
+      # 👍 on a PR the gates and the reviewer are about to judge anyway. THE QUEUEING IS HERE AND NOT IN `cc done`,
+      # deliberately: `cc done` is one of the few commands a worker or a member-facing session is told to run, and a
+      # queue behind it would be the merge cc-guard denies those tiers, wearing another name — and no environment
+      # variable tells the tiers apart (an interactive track session exports no CC_ROLE, a worker can unset it). The
+      # discriminator is the PROCESS: this loop runs on the host and no session can spell it. That is why the arm
+      # above hands the queueing to cc-land too, rather than letting `cc done` do it. Everything past the queue
+      # is cc-land's, unchanged — the gates against the PR's own head, the review, the merge, the deploy, and a landing
+      # that stops still reaches a person. The card `cc done` just posted is handed over with it, so a landing that
+      # stops marks and answers THAT card rather than leaving one that still reads as pending in #approvals.
+      landed=""
+      if "$BIN/cc" lands "$repo" >/dev/null 2>&1; then
+        lpr=$("$BOARD" get "$repo" "$track" pr 2>/dev/null); lpr=${lpr##*/}
+        read -r lchat lts <<<"$(printf '%s\n' "$dout" | sed -n 's/^card: //p' | tail -1)"
+        lq=(); [ -n "${lchat:-}" ] && [ -n "${lts:-}" ] && lq=(--chat "$lchat" --ts "$lts")
+        case "$lpr" in
+          ''|*[!0-9]*) log "grant: $repo lands its own PRs, but this track has no PR number to queue (board pr='$lpr')" ;;
+          *) if lo=$("${CC_LAND:-$BIN/cc-land}" queue "$repo" "$lpr" --who "cc done" ${lq[@]+"${lq[@]}"} 2>&1); then   # CC_LAND: test hook
+               log "grant: PR #$lpr queued to land — ${lo//$'\n'/ }"; landed=" Landing queued (no 👍 needed)."
+             else                                    # queueing is not merging: nothing has happened, and the card is
+               log "grant: PR #$lpr would not queue — ${lo//$'\n'/ }"   # still there for a 👍. Said in the one notice
+               landed=" The landing would not queue, so nothing is merging — 👍 the card."
+             fi ;;
+        esac
+      fi
+      "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $("$BOARD" get "$repo" "$track" pr)$landed"; exit 0
+    fi
+  fi
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
     stop 3 "needs you" "$q  (answer: append it to $ST/task.md, drop the STATUS line from $ST/progress.md, then: cc $repo $track --go \"\")" waiting; fi
   if ctx_stopped "$newprog"; then

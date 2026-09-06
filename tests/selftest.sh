@@ -205,6 +205,138 @@ git -C ~/dev/$REPO fetch -q origin; git -C ~/dev/$REPO symbolic-ref refs/remotes
   && ok "a new track is cut from the board's base even when origin/HEAD names a track branch" \
   || bad "track w9 was cut from origin/HEAD: another project's tree came with it"
 git -C ~/dev/$REPO symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+if stanza "cc claim: the canonical track prepared and claimed, with nothing launched"; then
+# ONE DELIVERY PATH, milestone 1. A subagent gets the worktree and branch a worker gets — same place, same
+# branch — without a window or a model being started for it, and from then on the row carries one durable task
+# id (bin/cc-task). What the id is FOR is later milestones; that it survives a second claim and a change of
+# executor is what this pins. cc-task's own selfcheck owns the claim rules; these are the door `cc` puts on them.
+chk cc-task
+mkdir -p ~/.cc/state/$REPO/c1; printf 'Do the c1 thing.\n' > ~/.cc/state/$REPO/c1/task.md
+# A tmux of this case's own, so the presence mark is the same two values wherever the suite runs — `agent me` is
+# the session's WINDOW, and a landing runs this from systemd, where there is none. The box's tmux is not touched.
+mkdir -p "$T/tmuxstub"; printf '#!/bin/sh\n[ "$1" = display-message ] && { echo "@99:4242"; exit 0; }\nexit 1\n' > "$T/tmuxstub/tmux"; chmod +x "$T/tmuxstub/tmux"
+rec=$(env PATH="$T/tmuxstub:$PATH" TMUX_PANE=%1 "$B/cc" claim $REPO c1 --executor subagent 2>"$T/c1.err"); crc=$?
+tid=$(jq -r .task_id <<<"$rec" 2>/dev/null)
+{ [ "$crc" = 0 ] && [ "$(git -C ~/.cc/worktrees/$REPO/c1 symbolic-ref --short HEAD 2>/dev/null)" = track/c1 ] \
+  && [ "$(sed -n 3p ~/.cc/worktrees/$REPO/c1/.cc/track)" = "$tid" ] \
+  && [ "$(sed -n 1,2p ~/.cc/worktrees/$REPO/c1/.cc/track | tr '\n' ' ')" = "$REPO c1 " ] \
+  && [ "$("$B/cc-board" get $REPO c1 status)" = running ] \
+  && [ -z "$(wins "$REPO/c1")" ] && [ ! -f ~/.cc/state/$REPO/c1/loop.log ] \
+  && [ "$("$B/cc-board" get $REPO c1 agent)" = "@99:4242" ]; } \
+  && ok "cc claim prepares the canonical worktree, stamps the task on the marker and marks the session as present — no window, no worker, no model" \
+  || bad "cc claim: rc=$crc tid=$tid branch=$(git -C ~/.cc/worktrees/$REPO/c1 symbolic-ref --short HEAD 2>/dev/null) $(cat "$T/c1.err")"
+bshow=$("$B/cc-board" show $REPO 2>/dev/null)   # captured, never piped into grep -q: the SIGPIPE would be this line's own failure
+{ [ "$(jq -r .task_id <<<"$("$B/cc" claim $REPO c1 --executor subagent 2>/dev/null)")" = "$tid" ] \
+  && [ "$(jq -r .task_id < ~/.cc/state/$REPO/c1/delivery.json)" = "$tid" ] \
+  && [ "$(jq -r .worktree <<<"$("$B/cc-task" show $REPO c1)")" = "$HOME/.cc/worktrees/$REPO/c1" ] \
+  && grep -q "delivery: $tid  subagent" <<<"$bshow"; } \
+  && ok "claiming it again is the same task, and the board row shows that identity" \
+  || bad "a second claim did not keep the task: $("$B/cc-task" show $REPO c1 2>&1 | head -5 | tr '\n' ' ')"
+# …and --go is the other executor of the same task, not a second one — and its claim is a DISPATCH reservation,
+# handed back once the window is up: cc-task records the owner off the running process, which for a --go is
+# whoever dispatched and never the loop, so a claim left standing would refuse cc-land's repair round and the
+# documented BLOCKED recovery from any other window (review of #279). The mark goes too: a worker is a process
+# the box can see, and a stale one would hide a worker that died.
+"$B/cc" $REPO c1 --go "" >/dev/null 2>&1
+d1=~/.cc/state/$REPO/c1/delivery.json
+{ [ "$(jq -r .task_id < "$d1")" = "$tid" ] && [ "$(jq -r .claim.executor < "$d1")" = worker ] \
+  && [ "$(sed -n 3p ~/.cc/worktrees/$REPO/c1/.cc/track)" = "$tid" ] \
+  && [ "$(jq -r .claim.reason < "$d1")" = "worker launched" ] && [ "$(jq -r .claim.ended_at < "$d1")" != null ] \
+  && [ "$(jq -r '.executions[-1].outcome' < "$d1")" = "released: worker launched" ] \
+  && [ -z "$("$B/cc-board" get $REPO c1 agent)" ] && "$B/cc-task" check $REPO c1; } \
+  && ok "--go claims the same task as a worker, then hands the reservation back at launch — the row is dispatchable again" \
+  || bad "--go did not claim and release: $(tr -d '\n' < "$d1" | head -c 200)"
+for id in $(wins "$REPO/c1"); do tmux kill-window -t "$id"; done
+# A SECOND OWNER. A subagent has no window and no loop, so while its process really is on the row no other
+# SUBAGENT takes it — but a worker dispatch does, because that is the repair round the design gives cc-land, onto
+# the very worktree the subagent built, and a subagent that never reached `cc done` must not block it for the
+# life of its session (review of #279). A live WORKER's claim is taken by nothing.
+mkdir -p ~/.cc/state/$REPO/c5; printf 'Do the c5 thing.\n' > ~/.cc/state/$REPO/c5/task.md
+hold(){ ( "$B/cc" claim $REPO c5 --executor "$1" >/dev/null 2>&1; while [ ! -f "$T/c5.stop" ]; do sleep 0.2; done ) & }
+d5=~/.cc/state/$REPO/c5/delivery.json
+rm -f "$T/c5.stop"; hold subagent; holder=$!; KIDS="$KIDS $holder"
+for _ in $(seq 1 100); do [ -f "$d5" ] && break; sleep 0.1; done
+c5tid=$(jq -r .task_id < "$d5" 2>/dev/null)
+"$B/cc" claim $REPO c5 --executor subagent >"$T/c5.out" 2>&1; h1=$?
+{ [ "$h1" != 0 ] && grep -q 'live owner' "$T/c5.out" \
+  && [ "$(jq -r .claim.generation < "$d5")" = 1 ]; } \
+  && ok "a second subagent waits on a row a live subagent is on — the claim is not taken and nothing is written" \
+  || bad "a second subagent took a live claim: rc=$h1 $(cat "$T/c5.out")"
+"$B/cc" $REPO c5 --go "" >"$T/c5go.out" 2>&1; h2=$?
+{ [ "$h2" = 0 ] && [ "$(jq -r .task_id < "$d5")" = "$c5tid" ] \
+  && [ "$(jq -r .claim.generation < "$d5")" = 2 ] \
+  && [ "$(jq -r '.executions[0].outcome' < "$d5")" = "superseded (a worker took over from a subagent)" ]; } \
+  && ok "…while a worker dispatch takes that same row over — one task, a new generation, and the record says why" \
+  || bad "a repair dispatch was refused a row a subagent still holds: rc=$h2 $(cat "$T/c5go.out")"
+for id in $(wins "$REPO/c5"); do tmux kill-window -t "$id"; done
+touch "$T/c5.stop"; wait $holder 2>/dev/null; KIDS="${KIDS% $holder}"
+rm -f "$T/c5.stop" "$d5"; hold worker; holder=$!; KIDS="$KIDS $holder"
+for _ in $(seq 1 100); do [ -f "$d5" ] && break; sleep 0.1; done
+"$B/cc" claim $REPO c5 --executor subagent >"$T/c5w1.out" 2>&1; h3=$?
+"$B/cc" $REPO c5 --go "" >"$T/c5w2.out" 2>&1; h4=$?
+{ [ "$h3" != 0 ] && [ "$h4" != 0 ] && [ -z "$(wins "$REPO/c5")" ] \
+  && [ "$(jq -r .claim.generation < "$d5")" = 1 ] && [ "$(jq -r .claim.executor < "$d5")" = worker ]; } \
+  && ok "…and a live WORKER's claim is taken by nothing — not a subagent, not another dispatch" \
+  || bad "a live worker claim was taken: claim rc=$h3 go rc=$h4 $(cat "$T/c5w1.out" "$T/c5w2.out")"
+touch "$T/c5.stop"; wait $holder 2>/dev/null; KIDS="${KIDS% $holder}"
+# DELIVERY IS WHAT ENDS A SUBAGENT'S CLAIM. `cc done` is the end of its turn on the row, so the row is free for
+# the lander and for the next dispatcher — from any process, not only the one that claimed. Completion now
+# needs an actual PR and card response; the missing-response control lives beside P7 below.
+mkdir -p "$T/ghc" "$T/ccslack"
+printf '#!/bin/sh\ncase "$*" in *"pr create"*) echo https://github.com/fixture/repo/pull/1;; esac\nexit 0\n' > "$T/ghc/gh"
+printf '#!/bin/sh\necho "fixture 1.2"\nexit 0\n' > "$T/ccslack/cc-slack"; chmod +x "$T/ghc/gh" "$T/ccslack/cc-slack"
+mkdir -p ~/.cc/state/$REPO/c6; printf 'Do the c6 thing.\n' > ~/.cc/state/$REPO/c6/task.md
+"$B/cc" claim $REPO c6 --executor subagent >/dev/null 2>&1
+c6tid=$(jq -r .task_id < ~/.cc/state/$REPO/c6/delivery.json 2>/dev/null); d6=~/.cc/state/$REPO/c6/delivery.json
+echo "the subagent's work" > ~/.cc/worktrees/$REPO/c6/c6.txt
+env PATH="$T/ghc:$PATH" CC_SLACK="$T/ccslack/cc-slack" "$B/cc" done $REPO c6 >"$T/c6done.out" 2>&1
+{ [ "$("$B/cc-board" get $REPO c6 status)" = review ] && [ "$(jq -r .claim.ended_at < "$d6")" != null ] \
+  && [ "$(jq -r .claim.reason < "$d6")" = delivered ] \
+  && [ "$(jq -r '.executions[-1].outcome' < "$d6")" = "released: delivered" ]; } \
+  && ok "cc done ends the claim the delivered work was done under — the row is in review and nobody still holds it" \
+  || bad "cc done left the row claimed: $(tr -d '\n' < "$d6" | head -c 200) :: $(cat "$T/c6done.out")"
+( "$B/cc" $REPO c6 --go "" >"$T/c6go.out" 2>&1; echo $? > "$T/c6go.rc" )   # a subshell of its own: a different owner
+{ [ "$(cat "$T/c6go.rc")" = 0 ] && [ "$(jq -r .task_id < "$d6")" = "$c6tid" ] \
+  && [ "$(jq -r .claim.generation < "$d6")" = 2 ]; } \
+  && ok "…so another process dispatches it afterwards — the repair round the lander runs — on the same task" \
+  || bad "a delivered row would not dispatch: rc=$(cat "$T/c6go.rc") $(cat "$T/c6go.out")"
+for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
+# NOTHING THE HOST OPENS IN A TRACK'S OWN DIRECTORIES IS WRITTEN THROUGH A PLANTED NAME. $wt/.cc and $st are
+# bound read-write into that track's worker sandbox and into a member workspace, so a link left at a name the
+# DISPATCH path opens would have the next `--go` — cc-land's repair round, which needs no person — truncate any
+# file the owner can write. The marker is cc-task's business and has its own cases; these are cc's two locks.
+decoy="$T/decoy"; echo "do not touch" > "$decoy"
+ln -sf "$decoy" ~/.cc/worktrees/$REPO/c1/.cc/done.lock
+env PATH="$T/ghc:$PATH" CC_SLACK="$T/ccslack/cc-slack" "$B/cc" done $REPO c1 >"$T/lk1.out" 2>&1; k1=$?
+rm -f ~/.cc/worktrees/$REPO/c1/.cc/done.lock
+ln -sf "$decoy" ~/.cc/state/$REPO/c1/.lock
+"$B/cc" $REPO c1 --go "" >"$T/lk2.out" 2>&1; k2=$?
+rm -f ~/.cc/state/$REPO/c1/.lock
+{ [ "$k1" != 0 ] && [ "$k2" != 0 ] && grep -q 'symlink' "$T/lk1.out" && grep -q 'symlink' "$T/lk2.out" \
+  && [ "$(cat "$decoy")" = "do not touch" ] && [ -z "$(wins "$REPO/c1")" ]; } \
+  && ok "a link planted at a track's done.lock or its state lock is refused — the file it named is untouched" \
+  || bad "cc wrote through a planted lock: done rc=$k1 go rc=$k2 decoy='$(cat "$decoy")' $(cat "$T/lk1.out" "$T/lk2.out")"
+{ env PATH="$T/ghc:$PATH" CC_SLACK="$T/ccslack/cc-slack" "$B/cc" done $REPO c1 >"$T/lk3.out" 2>&1 \
+  && [ ! -L ~/.cc/worktrees/$REPO/c1/.cc/done.lock ]; } \
+  && ok "…and with plain files back at those names the same command runs as before" \
+  || bad "the link check refuses an honest lock too: $(cat "$T/lk3.out")"
+# THE THREE THAT MUST STAMP NOTHING. A row with no brief (task.md is the brief's one home, and a claim may not
+# quietly become a re-brief), a session row (a channel has no task to finish), and a repository that is not there.
+"$B/cc-board" add $REPO c2 "no brief yet" >/dev/null 2>&1
+"$B/cc" claim $REPO c2 --executor worker >"$T/c2.out" 2>&1; c2rc=$?
+{ [ "$c2rc" != 0 ] && grep -q 'task.md' "$T/c2.out" && [ ! -f ~/.cc/state/$REPO/c2/delivery.json ]; } \
+  && ok "a row with no brief claims nothing, and the refusal names task.md" || bad "claimed an unbriefed row: rc=$c2rc $(cat "$T/c2.out")"
+mkdir -p ~/.cc/state/$REPO/c3; printf 'a channel, not a task\n' > ~/.cc/state/$REPO/c3/task.md
+"$B/cc-board" add $REPO c3 "a session" >/dev/null 2>&1; "$B/cc-board" set $REPO c3 kind session >/dev/null 2>&1
+"$B/cc" claim $REPO c3 --executor subagent >"$T/c3.out" 2>&1; c3rc=$?
+{ [ "$c3rc" != 0 ] && [ ! -f ~/.cc/state/$REPO/c3/delivery.json ] \
+  && [ "$("$B/cc-board" get $REPO c3 kind)" = session ]; } \
+  && ok "a session row has no task to claim, and is still a session afterwards" || bad "claimed a session row: rc=$c3rc $(cat "$T/c3.out")"
+"$B/cc" claim ${REPO}x c4 --executor worker >"$T/c4.out" 2>&1; c4rc=$?
+{ [ "$c4rc" != 0 ] && [ ! -e ~/.cc/state/${REPO}x ] && [ ! -e ~/.cc/worktrees/${REPO}x ]; } \
+  && ok "a repository that is not there prepares nothing and stamps no claim" || bad "claimed a track in a repo that does not exist: rc=$c4rc $(cat "$T/c4.out")"
+rm -rf ~/.cc/state/${REPO}x ~/.cc/worktrees/${REPO}x ~/.cc/boards/${REPO}x.json ~/.cc/boards/${REPO}x.lock
+fi
 stanza "checkpoint hook" always
 echo hi > ~/.cc/worktrees/$REPO/w1/a.txt; ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
 git -C "$T/remote.git" branch | grep -q track/w1 && ok "checkpoint committed + pushed track branch" || bad "checkpoint push"
@@ -261,6 +393,7 @@ printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_t
 pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
 if stanza "cc-context (the real number, and what refuses to run without it)"; then
 chk cc-context
+chk cc-statusline   # the harness's own per-turn file cc-context prefers over its transcript estimate
 chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
 "$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1)"
 out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
@@ -560,8 +693,11 @@ mkdir -p "$T/stub" "$GH/dev/other"; printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "
 sout(){ env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_CLAUDE=/bin/true "$@" >/dev/null 2>&1; }
 ( cd "$GH/dev/alice" && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init ) 2>/dev/null   # a track needs git; the guard cases above are done with this dir
 mkdir -p "$GH/.cc/members/alice"; echo '{"claudeAiOauth": {"accessToken": "not-a-token"}}' > "$GH/.cc/members/alice/credentials.json"   # the workspace's OWN credential (a fake: cc checks the shape, never uses it) — without one cc opens nothing, see the review-156d case below
-: > "$T/tmux.log"; sout "$B/cc" alice; sout "$B/cc" other; sout "$B/cc" alice todo --go 'do a thing'
-grep -q '__runmember alice' "$T/tmux.log" && grep -q 'cc-sandbox member alice todo -- cc-loop' "$T/tmux.log" \
+# The --go half runs on `t9` and not on `todo`: `todo` above is a plain directory with a lying marker in it, made
+# to test exactly that, and a dispatch now claims the row first — which refuses a name that is not really a
+# worktree on this row's branch (bin/cc-task). A member workspace's own track is what this case is about.
+: > "$T/tmux.log"; sout "$B/cc" alice; sout "$B/cc" other; sout "$B/cc" alice t9 --go 'do a thing'
+grep -q '__runmember alice' "$T/tmux.log" && grep -q 'cc-sandbox member alice t9 -- cc-loop' "$T/tmux.log" \
   && ! grep -q 'runmember other' "$T/tmux.log" && ! grep -q 'cc-sandbox member other' "$T/tmux.log" \
   && ok "...and the window cc opens for a member target IS the boundary: the session runs \`cc __runmember\` (which execs cc-sandbox member) and a --go loop runs \`cc-sandbox member <handle> <track> -- cc-loop\`, one wall not two, while an ordinary repo gets neither" \
   || bad "member launch is not inside the boundary: $(tr '\n' '|' < "$T/tmux.log")"
@@ -724,39 +860,44 @@ nocred alice >/dev/null; nocred alice >/dev/null
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
-# A REFUSAL IN A MEMBER-FACING CHANNEL IS AN ASK, NOT SILENCE — the member sees it AND the owner is told.
-# Both halves used to end at the deny: the member got nothing, the owner was never told there was anything to
-# approve, and a gate that stops work without producing a visible ask looks exactly like the box ignoring somebody.
-# -u CC_NOTIFY_LOG_ONLY: the guard honours that flag ITSELF now (a fixture can never page), and this block is
-# the one place that must watch the real send path — the stub bots in $GH/bin are what it sends to.
-ask(){ rm -rf "$T/asks"; : > "$T/guard.args"
-       printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$1" "$2" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" ${3:+CC_ROLE=$3} "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+# A REFUSAL IN A MEMBER-FACING CHANNEL IS A QUERY TO THE BOX, NOT A LINE IN THE MEMBER'S CHANNEL (owner 2026-09-04,
+# #243). The member session gets its stderr line; ONE JSON line lands in the workspace's queries.spool with the
+# right class (page = the owner could say yes, nopage = no yes exists); NOTHING is posted to the member's channel
+# and the owner is not paged — cc-msg drains that spool to the box's queries session. The stub bots in $GH/bin are
+# still watched: a member refusal must now reach neither of them.
+QSP="$GH/.cc/state/member/queries.spool"   # the dir's name is the workspace's: $mf is $T/member
+ask(){ rm -rf "$T/asks"; : > "$T/guard.args"; : > "$T/guard.err"
+       printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$1" "$2" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" ${3:+CC_ROLE=$3} "$B/cc-guard" >/dev/null 2>"$T/guard.err"; echo $?; }
 SEND="cc-slack post --file /tmp/carpet.png"   # the 2026-08-30 incident itself: a member asked twice for images
+rm -f "$QSP"
 [ "$(ask "$SEND" "$mf")" = 2 ] && ok "the member's request is still refused — the gate did not soften" || bad "member deny lost"
-grep -q "^BOT: post -c #member .*posting to the owner" "$T/guard.args" \
-  && ok "...and the MEMBER sees why, in their own channel (the dir's name is the channel's)" || bad "nothing reached the member: $(cat "$T/guard.args")"
-grep -q '🔐' "$T/guard.args" \
-  && ok "...as the box's own 🔐 form, which the daemon's sweep marks ❓ needs-you on the owner's tab" || bad "no 🔐 in the channel post"
-grep -q "^NOTIFY: --owner -p high .*posting to the owner" "$T/guard.args" \
-  && ok "...and the OWNER is told there is something to approve (--owner: a DM, never that channel)" || bad "the owner was not told: $(cat "$T/guard.args")"
-: > "$T/guard.args"   # same channel, same reason, straight away: the session retrying must not spray the channel
+grep -q '^cc-guard: blocked — posting to the owner' "$T/guard.err" \
+  && ok "...and the MEMBER session still gets its stderr line, saying why" || bad "nothing reached the member: $(cat "$T/guard.err")"
+[ "$(wc -l < "$QSP" 2>/dev/null)" = 1 ] && jq -e 'select(.workspace == "member" and .class == "page" and (.reason | test("posting to the owner")) and (.command | test("carpet")))' "$QSP" >/dev/null 2>&1 \
+  && ok "...and ONE query lands in the workspace's queries.spool — page class (the owner could say yes), naming the workspace, the command and the reason" || bad "no query recorded: $(cat "$QSP" 2>/dev/null)"
+[ ! -s "$T/guard.args" ] \
+  && ok "...and NOTHING is posted to the member's channel and the owner is not paged: the box's queries session answers it" || bad "a member refusal still reached Slack: $(cat "$T/guard.args")"
+# same workspace, same reason, straight away: the session retrying must not fill the spool
 printf '{"tool_name":"Bash","tool_input":{"command":"cc-slack post -c x hi"},"cwd":"%s"}' "$mf" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" "$B/cc-guard" >/dev/null 2>&1
-[ ! -s "$T/guard.args" ] && ok "one ask per channel+reason per TTL, however often the session retries" || bad "the deny sprayed: $(cat "$T/guard.args")"
-[ "$(ask "$SEND" "$mf")" = 2 ] && [ -s "$T/guard.args" ] && ok "...and a fresh window asks again (the TTL is a delay, not a mute)" || bad "the ask never comes back"
-: > "$T/guard.args"; [ "$(ask "gh pr merge 1" "$wt" worker)" = 2 ] && [ ! -s "$T/guard.args" ] \
-  && ok "a WORKER deny is untouched: it has a board, a journal and STATUS: BLOCKED, and posts nothing" || bad "a track deny posted to Slack: $(cat "$T/guard.args")"
+[ ! -s "$T/guard.args" ] && [ "$(wc -l < "$QSP")" = 1 ] && ok "one query per workspace+reason per TTL, however often the session retries" || bad "the deny sprayed: $(cat "$T/guard.args") $(cat "$QSP")"
+[ "$(ask "$SEND" "$mf")" = 2 ] && [ "$(wc -l < "$QSP")" = 2 ] && ok "...and a fresh window records again (the TTL is a delay, not a mute)" || bad "the ask never comes back"
+: > "$T/guard.args"; rm -f "$QSP"; [ "$(ask "gh pr merge 1" "$wt" worker)" = 2 ] && [ ! -s "$T/guard.args" ] && [ ! -e "$QSP" ] \
+  && ok "a WORKER deny is untouched: it has a board, a journal and STATUS: BLOCKED, and posts nothing, records nothing" || bad "a track deny posted or recorded: $(cat "$T/guard.args")"
 : > "$T/guard.args"; [ "$(ask "gh pr merge 1" "$GH")" = 0 ] && [ ! -s "$T/guard.args" ] \
   && ok "the owner's own sessions are unaffected — not gated, and nothing posted anywhere" || bad "an ungated cwd posted: $(cat "$T/guard.args")"
 : > "$T/guard.args"; rm -rf "$T/asks"
 [ "$(ask "cc-config list" "$mf")" = 2 ] && ok "the box's config is not a member's to read — its one sanctioned reader is denied too" || bad "cc-config list slipped the member gate"
 [ "$(ask "cc-config set SLACK_APP_TOKEN x" "$mf")" = 2 ] && ok "...nor to rewrite" || bad "cc-config set slipped the member gate"
-: > "$T/guard.args"; rm -rf "$T/asks"   # leave the harness state as found: the cases below read these fresh
-printf '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 1"},"cwd":"%s"}' "$GH" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1
-{ grep -q '^NOTIFY: --owner' "$T/guard.args" && ! grep -q '^BOT:' "$T/guard.args"; } \
-  && ok "CC_ROLE=member with no marker: the owner is still told, and nothing is posted to a channel we cannot name" || bad "markerless member ask: $(cat "$T/guard.args")"
-: > "$T/guard.args"; rm -rf "$T/asks"   # …and the deny with no yes in it: refused, said in the channel, owner asleep
-[ "$(ask "cc r t --go x" "$mf")" = 2 ] && grep -q '^BOT: post -c #member' "$T/guard.args" && ! grep -q '^NOTIFY:' "$T/guard.args" \
-  && ok "a member dispatch is refused and the member told, but the owner is not paged — it was never his to approve for them (00:03Z)" || bad "a member dispatch paged the owner: $(cat "$T/guard.args")"
+: > "$T/guard.args"; rm -rf "$T/asks"; find "$GH/.cc/state" -name queries.spool -delete 2>/dev/null   # leave the harness state as found
+printf '{"tool_name":"Bash","tool_input":{"command":"gh pr merge 1"},"cwd":"%s"}' "$GH" | env -u CC_NOTIFY_LOG_ONLY HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; rcm=$?
+NQS="$GH/.cc/state/_nomarker/queries.spool"
+[ "$rcm" = 2 ] && [ ! -s "$T/guard.args" ] && [ "$(wc -l < "$NQS" 2>/dev/null)" = 1 ] \
+  && jq -e 'select(.workspace == "_nomarker" and .class == "page")' "$NQS" >/dev/null 2>&1 \
+  && ok "CC_ROLE=member with no marker: still refused, nothing posted or paged by the guard — and with no workspace to name, the query is filed under the reserved _nomarker key the host drains" || bad "markerless member ask: rc $rcm $(cat "$T/guard.args") $(cat "$NQS" 2>/dev/null)"
+rm -f "$NQS"
+: > "$T/guard.args"; rm -rf "$T/asks"; rm -f "$QSP"   # …and the deny with no yes in it: refused, recorded as nopage, owner asleep
+[ "$(ask "cc r t --go x" "$mf")" = 2 ] && [ ! -s "$T/guard.args" ] && jq -e 'select(.class == "nopage")' "$QSP" >/dev/null 2>&1 \
+  && ok "a member dispatch is refused and recorded as a nopage query — nothing in the channel, and the owner is not paged: it was never his to approve for them (00:03Z)" || bad "a member dispatch paged or posted: $(cat "$T/guard.args") $(cat "$QSP" 2>/dev/null)"
 echo "== every interactive session starts in auto mode =="
 # The owner had to press shift+tab in each one he opened (2026-09-04). Auto mode is a HARNESS flag, so it belongs on
 # the argv of every launcher that opens a session — a --go worker already carries it from cc-loop. It is the
@@ -813,7 +954,13 @@ miss=""; for c in "gh pr merge 1" "git push origin HEAD" "cc r t --go x" "cc don
 [ "$(h "gh pr merge 1" "" sid-pre)" = 0 ] && ok "the LIVE predecessor is gated by none of it" || bad "predecessor gated while live"
 pp=$(tmux list-panes -t "$(jq -r .predecessor.tmux "$T/handoff/$REPO--hx.json")" -F '#{pane_id}' 2>/dev/null | head -1)
 [ "$(TMUX_PANE=$pp h "gh pr merge 1" "" "")" = 0 ] && ok "...nor by its pane while it is live" || bad "predecessor gated by pane while live (pane $pp)"
-CC_HANDOFF="$hid" "$B/cc-handoff" --ready "$REPO/hx" >/dev/null 2>&1
+# THIS cutover drains at the real length, not the stanza's 1 s. --ready detaches a --retire, and at a 1 s drain
+# that retirement finished HALF A SECOND later, mid-block: it kills the predecessor's window (so the pane case
+# below has no pane left to be gated by) and writes <id>.done (which is precisely what un-gates the successor
+# the corrupt-record case asserts is gated). Red on the full tier from 2026-09-06, those two cases and no
+# others. This predecessor is ended by the kill-window below instead, never by a clock — and the hz block that
+# follows, which is the one testing the retirement itself, keeps the 1 s.
+CC_HANDOFF="$hid" CC_HANDOFF_RETIRE_GRACE=120 CC_HANDOFF_DRAIN=600 "$B/cc-handoff" --ready "$REPO/hx" >/dev/null 2>&1
 [ "$(jq -r .live "$T/handoff/$REPO--hx.json" 2>/dev/null)" = successor ] && ok "one atomic replace moves ownership — the successor is live" || bad "cutover did not move the record"
 { [ "$(h "gh pr merge 1" "" sid-pre)" = 2 ] && [ "$(h "git push origin HEAD" "" sid-pre)" = 2 ]; } && ok "SYMMETRY: after cutover the retired PREDECESSOR is the gated one (no stale-branch push)" || bad "predecessor not gated after cutover"
 [ "$(TMUX_PANE=$pp h "gh pr merge 1" "" "")" = 2 ] && ok "...by its PANE too: a planning predecessor's session_id is empty on the record, and the drain is 10 min" || bad "predecessor with no session_id not gated by pane (pane $pp)"
@@ -1001,9 +1148,25 @@ grep -q 'STATUS: DONE' ~/.cc/state/$REPO/w1/progress.md 2>/dev/null && ok "loop 
 [ "$(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)" = 2 ] && ok "loop stopped after DONE (2 iterations, not 3)" || bad "loop iteration count: $(ls ~/.cc/state/$REPO/w1/runs/*.json 2>/dev/null | wc -l)"
 rlog=$(git -C "$T/remote.git" log --oneline track/w1 2>/dev/null)   # capture, don't pipe: grep -q exits on the first match, git log takes SIGPIPE and pipefail calls the whole line a failure once the branch has more than a handful of commits
 grep -q 'wip: checkpoint' <<<"$rlog" && ok "loop iterations were checkpointed + pushed" || bad "loop checkpoint — remote track/w1: $(head -3 <<<"$rlog" | tr '\n' ' ') | push.err: $(tr '\n' ' ' < ~/.cc/worktrees/$REPO/w1/.cc/push.err 2>/dev/null)"
-for _ in $(seq 1 30); do tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && break; sleep 1; done   # cc-loop writes it from its tmux window, a beat after DONE
-tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 done" && ok "owner notified on DONE (log backend)" || bad "notify"
-st=$("$B/cc-board" get $REPO w1 status); [ "$st" = review ] && ok "board -> review after done (PR skipped: no gh remote)" || bad "board status after done: $st"
+# `cc --go` CLAIMS the row, so this is a MANAGED task, and nothing behind this fixture's remote is GitHub: the PR
+# lookup cannot answer. A lookup that failed is not evidence that no PR exists, so completion stops there — the
+# false success this used to take (`PR creation failed`, exit 0, row left in `review`) is what M2 deletes.
+for _ in $(seq 1 30); do tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 finished, but opened no PR" && break; sleep 1; done   # cc-loop writes it from its tmux window, a beat after DONE
+tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "$REPO/w1 finished, but opened no PR" \
+  && ok "the owner is told a managed track opened no PR — not a DONE notice over an empty PR line (log backend)" \
+  || bad "notify: $(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | tr '\n' ' ')"
+st=$("$B/cc-board" get $REPO w1 status); [ "$st" = blocked ] && ok "…and the row says blocked, not review: a PR nobody opened does not put work up for review" || bad "board status after done: $st"
+grep -q 'open PR lookup failed' ~/.cc/state/$REPO/w1/loop.log && ok "…and the reason the loop carries is the one that stopped it, not a later summary line" || bad "loop note: $(tail -2 ~/.cc/state/$REPO/w1/loop.log | tr '\n' ' ')"
+# …and the same command is safe to run again. Both real doors stay shut: the gh stub answers for GitHub, CC_SLACK
+# for #approvals — a fixture PR must never reach either.
+mkdir -p "$T/ghw1"
+printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/91";; esac\nexit 0\n' > "$T/ghw1/gh"
+printf '#!/bin/sh\ncase "$1" in post-approval) echo "W1CARD 1788000000.000200";; esac\nexit 0\n' > "$T/ghw1/slack"; chmod +x "$T/ghw1/gh" "$T/ghw1/slack"
+w1out=$(env SLACK_BOT_TOKEN= CC_SLACK="$T/ghw1/slack" PATH="$T/ghw1:$PATH" "$B/cc" done $REPO w1 --json 2>"$T/w1.err"); w1rc=$?
+{ [ "$w1rc" = 0 ] && [ "$("$B/cc-board" get $REPO w1 status)" = review ] \
+  && jq -e '.pr_url == "https://github.com/x/y/pull/91" and .committed_sha == .pushed_sha and .pending == {} and .errors == [] and .card.chat == "W1CARD"' <<<"$w1out" >/dev/null; } \
+  && ok "…and cc done is safe to run again: once GitHub answers, the retry opens the PR, settles both projections and moves the row to review" \
+  || bad "w1 retry: rc=$w1rc receipt=$w1out err=$(tail -2 "$T/w1.err" | tr '\n' ' ')"
 
 fi
 if stanza "--go is a covering note, never a replacement for the brief (#71)"; then
@@ -1016,7 +1179,10 @@ if stanza "--go is a covering note, never a replacement for the brief (#71)"; th
 # the copies boards written before this still hold.
 godisp(){ "$B/cc" $REPO "$1" --go "$2" >/dev/null 2>&1; sleep 1
   for id in $(wins "$REPO/$1"); do tmux kill-window -t "$id"; done
-  for _ in 1 2 3 4 5; do [ -z "$(wins "$REPO/$1")" ] && break; sleep 1; done; }
+  # The window is gone from tmux's list well before cc-loop's own TERM trap (kill_child; parked; log) finishes writing
+  # the board — waiting on the window let that straggler land after the next step planted its own board state (#71
+  # migration cases going red on main, 2026-09-05). Wait on the loop PROCESS itself, matched by its own argv, bounded.
+  for _ in $(seq 1 30); do pgrep -f "cc-loop $REPO $1 " >/dev/null || break; sleep 0.5; done; }
 BRIEF=$(printf 'BRIEF HEAD: the carefully written plan.\n%s\nBRIEF TAIL: the last item.' "$(for i in $(seq 1 60); do echo "brief detail line $i"; done)")
 
 # THE #71 REGRESSION CASE: the brief is on the board and task.md does not exist yet — the exact live shape.
@@ -1236,6 +1402,263 @@ PATH="$T/ghbin:$PATH" "$B/cc" done $REPO w5 > "$T/done7.out" 2>&1; rc7=$?
   && ok "cc done: a foreign write on the branch opens no PR, overwrites nothing, and says why (P7)" \
   || bad "cc done over a foreign write: rc=$rc7 creates=$(wc -l < "$T/gh.create") $(cat "$T/done7.out")"
 rm -rf "$T/foreign5"
+# M2 completion fixtures begin. This block owns its HOME, board, state, remotes and every service stub.
+(
+pass=0; fail=0
+export HOME="$T/done-home" D="$T/done-fixture" REALBIN="$B"
+mkdir -p "$HOME/dev/r" "$D/bin"
+export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST CC_GIT_NAME CC_GIT_EMAIL CC_SELF_LAND_REPOS
+export GH_REPO=wrong/repository CC_SLACK="$D/bin/cc-slack"
+export CC_BRIEF_FAKE='{"verdict":"approve"}' CC_CLAUDE=/bin/true
+printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"
+cp "$B/cc" "$B/cc-task" "$D/bin/"; cp "$B/cc-checkpoint" "$D/bin/checkpoint-real"
+cat > "$D/bin/cc-checkpoint" <<'SH'
+#!/bin/bash
+[ "${1:-}" = --commit ] && [ -e "$D/zero" ] && exit 0
+[ "${1:-}" = --push ] && [ -e "$D/push-zero" ] && exit 0
+exec "$D/bin/checkpoint-real" "$@"
+SH
+cat > "$D/bin/cc-board" <<'SH'
+#!/bin/bash
+echo "$*" >> "$D/board.calls"
+case "$(cat "$D/board.fail" 2>/dev/null):$*" in all:*|pr:set*pr*|status:status*) exit 1;; esac
+exec "$REALBIN/cc-board" "$@"
+SH
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+echo "$*" >> "$D/gh.calls"
+[ "${GH_REPO:-}" = "$(cat "$D/gh-repo" 2>/dev/null || echo "$D/remote.git")" ] || [ -e "$D/legacy" ] || exit 9
+case "$*" in
+  *"pr list"*"--state open"*) [ ! -e "$D/open.fail" ] || exit 1; cat "$D/open" 2>/dev/null; exit 0;;
+  *"pr list"*"--state merged"*)
+    [ ! -e "$D/merged.fail" ] || exit 1
+    [ -s "$D/merged.oid" ] && grep -qF "$(cat "$D/merged.oid")" <<<"$*" && cat "$D/url"; exit 0;;
+  *"pr create"*)
+    echo create >> "$D/creates"; printf '%s\n' "$@" > "$D/create.args"
+    [ ! -e "$D/empty" ] || exit 0
+    [ ! -e "$D/url-error" ] || { cat "$D/url" >&2; exit 1; }
+    cp "$D/url" "$D/open"
+    [ ! -e "$D/lost" ] || exit 1
+    cat "$D/url";;
+esac
+SH
+cat > "$D/bin/git" <<'SH'
+#!/bin/bash
+case "$*" in *'remote get-url --push origin') [ ! -e "$D/public-url" ] || { cat "$D/public-url"; exit 0; };; esac
+exec /usr/bin/git "$@"
+SH
+cat > "$D/bin/cc-slack" <<'SH'
+#!/bin/bash
+[ "$1" = post-approval ] || exit 0
+echo card >> "$D/cards"
+[ ! -e "$D/card.fail" ] || exit 1
+[ ! -e "$D/card.empty" ] || exit 0
+echo 'fixture 123.456'
+SH
+for tool in cc-config cc-scope cc-trust cc-gh-token; do printf '#!/bin/sh\nexit 0\n' > "$D/bin/$tool"; done
+printf '#!/bin/sh\nexit 1\n' > "$D/bin/tmux"; chmod +x "$D/bin/"*
+git init -q -b main "$HOME/dev/r"; git init -q --bare "$D/remote.git"
+printf '/.cc/\n' > "$HOME/dev/r/.gitignore"
+git -C "$HOME/dev/r" add -A; git -C "$HOME/dev/r" commit -qm base
+git -C "$HOME/dev/r" remote add origin "$D/remote.git"; git -C "$HOME/dev/r" push -q origin main
+git -C "$D/remote.git" symbolic-ref HEAD refs/heads/main
+"$B/cc-board" init r "$HOME/dev/r" main >/dev/null
+newdone(){
+  row=$1; wt="$HOME/.cc/worktrees/r/$row"; st="$HOME/.cc/state/r/$row"
+  mkdir -p "$(dirname "$wt")" "$st"
+  git -C "$HOME/dev/r" worktree add -q -b "track/$row" "$wt"
+  "$B/cc-board" add r "$row" "$row title" 'the acceptance brief' >/dev/null
+  "$D/bin/cc-task" claim r "$row" --executor subagent >/dev/null
+  printf 'Brief from task.md\n<!-- cc-brief:inflight -->\nprivate inflight\n<!-- /cc-brief:inflight -->\nAcceptance stays.\n' > "$st/task.md"
+  echo work > "$wt/work.txt"
+  rm -f "$D/"*.fail "$D/zero" "$D/push-zero" "$D/lost" "$D/empty" "$D/card.empty" "$D/legacy" "$D/open" "$D/merged.oid" "$D/url-error" "$D/public-url" "$D/gh-repo"
+  : > "$D/creates"; : > "$D/cards"; : > "$D/gh.calls"; : > "$D/board.calls"
+  echo https://github.com/fixture/repo/pull/42 > "$D/url"
+}
+rundone(){ "$D/bin/cc" done r "$row" --json > "$D/out" 2> "$D/err"; rc=$?; }
+hasreceipt(){ jq -e "$1" "$D/out" >/dev/null 2>&1; }
+newdone dirty; touch "$D/zero"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && [ -n "$(git -C "$wt" status --porcelain)" ] \
+  && hasreceipt '.committed_sha == null and .errors[0].stage == "commit"'; } \
+  && ok "P10: a checkpoint returning zero with uncommitted work opens no PR" || bad "P10: $(cat "$D/out" "$D/err")"
+rm "$D/zero"; rundone; first=$(git -C "$wt" rev-parse HEAD)
+{ [ "$rc" = 0 ] && hasreceipt '.committed_sha == .pushed_sha and .pr_url != null and .pending == {}' \
+  && grep -qx "PR: $(cat "$D/url")" "$D/err" && grep -qx 'card: fixture 123.456' "$D/err"; } \
+  && ok "P10 control: real completion returns SHAs and preserves the human PR/card lines" || bad "P10 control: $(cat "$D/out" "$D/err")"
+rundone
+{ [ "$rc" = 0 ] && [ "$(git -C "$wt" rev-parse HEAD)" = "$first" ] && [ "$(wc -l < "$D/creates")" = 1 ] \
+  && [ "$(wc -l < "$D/cards")" = 1 ]; } && ok "P11: a clean retry makes no new commit, PR or card" || bad "P11: $(cat "$D/out" "$D/err")"
+newdone secret; echo fixture > "$wt/.env"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/gh.calls" ] && git -C "$wt" diff --cached --quiet; } \
+  && ok "P12: a secret refusal never reaches PR lookup" || bad "P12: $(cat "$D/out" "$D/err")"
+rm "$wt/.env"; printf '#!/bin/sh\nexit 1\n' > "$HOME/dev/r/.git/hooks/pre-commit"; chmod +x "$HOME/dev/r/.git/hooks/pre-commit"
+rundone; rm "$HOME/dev/r/.git/hooks/pre-commit"
+{ [ "$rc" != 0 ] && [ ! -s "$D/gh.calls" ]; } && ok "P12 control: a failed commit also opens nothing" || bad "P12 control: $(cat "$D/out" "$D/err")"
+rundone
+[ "$rc" = 0 ] && ok "P12 recovery: removing the refusal delivers the same work" || bad "P12 recovery: $(cat "$D/out" "$D/err")"
+newdone offtrack; git -C "$wt" checkout -q -b track/elsewhere; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/gh.calls" ] && hasreceipt '.committed_sha == null'; } \
+  && ok "P12 branch control: a different HEAD cannot complete the task" || bad "P12 branch control: $(cat "$D/out" "$D/err")"
+newdone push; printf '#!/bin/sh\nexit 1\n' > "$D/remote.git/hooks/pre-receive"; chmod +x "$D/remote.git/hooks/pre-receive"
+rundone; rm "$D/remote.git/hooks/pre-receive"
+{ [ "$rc" != 0 ] && [ ! -s "$D/gh.calls" ] && hasreceipt '.committed_sha != null and .pushed_sha == null'; } \
+  && ok "P13: failed push keeps the commit receipt and prevents PR lookup/create" || bad "P13: $(cat "$D/out" "$D/err")"
+touch "$D/push-zero"; rundone; rm "$D/push-zero"
+{ [ "$rc" != 0 ] && [ ! -s "$D/gh.calls" ]; } && ok "P13 control: push exit zero without the remote head is still incomplete" || bad "P13 control: $(cat "$D/out" "$D/err")"
+rundone
+[ "$rc" = 0 ] && ok "P13 recovery: the next push reaches the fixture remote and opens one PR" || bad "P13 recovery: $(cat "$D/out" "$D/err")"
+newdone lookup; touch "$D/open.fail"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && hasreceipt '.pushed_sha != null and .errors[0].stage == "pr"'; } \
+  && ok "P14: failed open lookup is not evidence of no PR" || bad "P14: $(cat "$D/out" "$D/err")"
+rm "$D/open.fail"; touch "$D/merged.fail"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ]; } && ok "P14 control: failed merged lookup also cannot create" || bad "P14 control: $(cat "$D/out" "$D/err")"
+rm "$D/merged.fail"; touch "$D/lost"; rundone
+{ [ "$rc" != 0 ] && [ "$(wc -l < "$D/creates")" = 1 ] && hasreceipt '.pr_url == null and .errors[0].stage == "pr"'; } \
+  && ok "P15: losing the create response leaves a failed receipt, with no review projection" || bad "P15: $(cat "$D/out" "$D/err")"
+rundone
+{ [ "$rc" = 0 ] && [ "$(wc -l < "$D/creates")" = 1 ] && hasreceipt '.pr_url != null and .errors == []'; } \
+  && ok "P15 control: retry finds that PR by pushed repository and head, despite a wrong caller GH_REPO" || bad "P15 control: $(cat "$D/out" "$D/err")"
+newdone urlerror; touch "$D/url-error"; rundone
+{ [ "$rc" != 0 ] && hasreceipt '.pr_url == null' && [ ! -s "$D/cards" ]; } \
+  && ok "P15 error control: a URL in failed create output is not a PR receipt" || bad "P15 error control: $(cat "$D/out" "$D/err")"
+newdone projections; echo all > "$D/board.fail"; touch "$D/card.fail"; rundone; first=$(git -C "$wt" rev-parse HEAD)
+{ [ "$rc" != 0 ] && hasreceipt '.pr_url != null and .committed_sha == .pushed_sha and (.pending | keys) == ["board","card"]' \
+  && ! grep -q 'get r projections instructions' "$D/board.calls" && grep -qx 'Brief from task.md' "$D/create.args" \
+  && grep -qx 'Acceptance stays.' "$D/create.args" && ! grep -q 'private inflight' "$D/create.args" \
+  && [ "$(jq -r .claim.reason "$st/delivery.json")" = delivered ]; } \
+  && ok "P16: board/card outages retain pending projections and release the builder; task.md supplies the stripped brief" || bad "P16: $(cat "$D/out" "$D/err")"
+echo status > "$D/board.fail"; rundone
+{ [ "$rc" != 0 ] && hasreceipt '.pending.board.status == "review" and .pending.card.url != null'; } \
+  && ok "P16 control: a successful board PR write does not hide a failed status write, and a board this box could not write is a non-zero completion" || bad "P16 control: $(cat "$D/out" "$D/err")"
+rm "$D/board.fail" "$D/card.fail"; touch "$D/card.empty"; rundone
+{ [ "$rc" = 0 ] && hasreceipt '.pending.board == null and .pending.card != null and .card == null' \
+  && grep -q 'still pending' "$D/err"; } \
+  && ok "P17: a card that answers without coordinates stays pending and says so — Slack being out does not turn a real PR into a failed delivery (the control is P16's board, which does)" || bad "P17: $(cat "$D/out" "$D/err")"
+rm "$D/card.empty"; rundone
+{ [ "$rc" = 0 ] && hasreceipt '.pending == {} and .errors == [] and .card == {"chat":"fixture","ts":"123.456"}' \
+  && [ "$(git -C "$wt" rev-parse HEAD)" = "$first" ] && [ "$(wc -l < "$D/creates")" = 1 ]; } \
+  && ok "P17 control: the next caller settles both projections without another commit or PR" || bad "P17 control: $(cat "$D/out" "$D/err")"
+newdone merged; (cd "$wt" && "$D/bin/cc-checkpoint" --commit)
+git -C "$wt" rev-parse HEAD > "$D/merged.oid"; echo all > "$D/board.fail"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ] && [ ! -s "$D/cards" ] \
+  && hasreceipt '.closed.status == "merged" and .pending.board.status == "merged"'; } \
+  && ok "P18: a merged head opens no duplicate PR/card and durably queues its failed closure projection" || bad "P18: $(cat "$D/out" "$D/err")"
+rm "$D/board.fail"; : > "$D/gh.calls"; rundone
+{ [ "$rc" = 0 ] && [ ! -s "$D/gh.calls" ] && hasreceipt '.closed.status == "merged" and .pending == {}'; } \
+  && ok "P18 recovery: a closed receipt retries the board without another GitHub call" || bad "P18 recovery: $(cat "$D/out" "$D/err")"
+"$D/bin/cc" claim r "$row" --executor worker > "$D/claim1" 2>&1; c1=$?
+{ [ "$c1" != 0 ] && grep -q closed "$D/claim1" && [ "$(jq -r .closed.status < "$st/delivery.json")" = merged ]; } \
+  && ok "P18 claim control: a merge really is the end — the next dispatch's claim on that row is refused (the control for P21 dispatch, where a delivery with no PR is not)" \
+  || bad "P18 claim control: rc=$c1 $(cat "$D/claim1")"
+echo later > "$wt/later.txt"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/gh.calls" ] && hasreceipt '.closed.status == "merged" and .errors[0].stage == "commit"'; } \
+  && ok "P18 closure control: later edits cannot inherit a closed delivery" || bad "P18 closure control: $(cat "$D/out" "$D/err")"
+rm "$wt/later.txt"; rundone
+cp "$st/delivery.json" "$D/retained"; tid=$(jq -r .task_id "$st/delivery.json"); "$D/bin/cc" rm r "$row" >/dev/null 2>&1
+{ [ ! -d "$wt" ] && [ ! -d "$st" ] && cmp -s "$HOME/.cc/state/r/.receipts/$row.$tid.json" "$D/retained"; } \
+  && ok "P19: removing a managed row retires its receipt instead of deleting the only task-to-PR mapping" \
+  || bad "P19: $(ls -R "$HOME/.cc/state/r" 2>&1 | tr '\n' ' ')"
+newdone "$row"   # …and the name it freed takes a NEW task, rather than inheriting a closed one nothing can claim
+{ [ "$(jq -r .task_id "$st/delivery.json")" != "$tid" ] && [ -f "$HOME/.cc/state/r/.receipts/$row.$tid.json" ]; } \
+  && ok "P19 reuse control: a rebuilt row of the same name gets its own task, and the retired receipt is still there" \
+  || bad "P19 reuse control: $(jq -r .task_id "$st/delivery.json" 2>&1)"
+"$D/bin/cc" rm r "$row" >/dev/null 2>&1
+newdone different; git -C "$wt" rev-parse HEAD > "$D/merged.oid"; rundone
+{ [ "$rc" = 0 ] && [ "$(wc -l < "$D/creates")" = 1 ] && hasreceipt '.closed == null'; } \
+  && ok "P18 control: a different merged head does not suppress new work" || bad "P18 control: $(cat "$D/out" "$D/err")"
+newdone legacy; rm "$st/delivery.json"; touch "$D/legacy" "$D/empty"
+"$D/bin/cc" done r "$row" > "$D/legacy.out" 2>&1; rc=$?
+printf 'PR creation failed (no remote? try: cd %s && gh pr create --base main)\n' "$wt" > "$D/expected"
+{ [ "$rc" = 0 ] && cmp -s "$D/legacy.out" "$D/expected" && [ ! -e "$st/delivery.json" ] \
+  && [ "$("$B/cc-board" get r "$row" status)" = review ]; } \
+  && ok "P20: a legacy row retains its exact output, exit and board behavior on empty create response" || bad "P20: $(cat "$D/legacy.out")"
+"$D/bin/cc" done r "$row" --json > "$D/jout" 2> "$D/jerr"; jrc=$?
+{ [ "$jrc" != 0 ] && [ ! -s "$D/jout" ] && grep -q 'needs a task record' "$D/jerr"; } \
+  && ok "P20 json control: --json is refused on a legacy row rather than printing a receipt nothing wrote" || bad "P20 json control: rc=$jrc $(cat "$D/jerr")"
+"$D/bin/cc" rm r "$row" >/dev/null 2>&1
+[ ! -e "$st" ] && ok "P19 control: legacy removal still removes state" || bad "P19 control: legacy state retained"
+newdone empty; touch "$D/empty"; rundone
+{ [ "$rc" != 0 ] && hasreceipt '.pr_url == null and .errors[0].stage == "pr"' \
+  && [ "$("$B/cc-board" get r "$row" status)" != review ]; } \
+  && ok "P20 control: the same empty response on a managed row fails and never projects review" || bad "P20 control: $(cat "$D/out" "$D/err")"
+newdone brief; rm "$st/task.md"; rundone
+{ [ "$rc" != 0 ] && [ ! -s "$D/creates" ]; } && ok "P16 brief control: a missing task.md is not replaced by a board read" || bad "P16 brief control: $(cat "$D/out" "$D/err")"
+for spelling in https ssh; do
+  newdone "$spelling"
+  public=https://github.com/fixture/repo.git; [ "$spelling" = https ] || public=git@github.com:fixture/repo.git
+  # Git still goes to our bare repo. Only get-url presents the spelling a hosted remote would return.
+  git -C "$wt" config --add "url.$D/remote.git.insteadOf" "$public"
+  echo "$public" > "$D/public-url"; echo github.com/fixture/repo > "$D/gh-repo"; rundone
+  { [ "$rc" = 0 ] && hasreceipt '.pr_url != null and .committed_sha == .pushed_sha'; } \
+    && ok "P22 $spelling: PR lookup pins the push repository in gh format, ignoring caller GH_REPO" || bad "P22 $spelling: $(cat "$D/out" "$D/err")"
+done
+newdone local; git -C "$HOME/dev/r" remote remove origin; mkdir -p "$HOME/dev/r/.cc"; touch "$HOME/dev/r/.cc/member-workspace"
+echo all > "$D/board.fail"; rundone
+{ [ "$rc" != 0 ] && hasreceipt '.closed == null and .pushed_sha == null and .pending.board.status == "done"' \
+  && [ ! -s "$D/gh.calls" ] && [ ! -s "$D/cards" ]; } \
+  && ok "P21: the existing local workspace exception records done and a pending board write" || bad "P21: $(cat "$D/out" "$D/err")"
+rm "$D/board.fail"; rundone
+{ [ "$rc" = 0 ] && hasreceipt '.closed == null and .pending == {}'; } \
+  && ok "P21 control: retry settles the non-PR delivery without inventing a pushed SHA" || bad "P21 control: $(cat "$D/out" "$D/err")"
+# …and the row stays DISPATCHABLE. A workspace project's branch delivery is its ordinary ending, not the end of the
+# task: closing it left the next `--go` refused, with nowhere to go but `cc rm`, which deletes the very branch that
+# ending called the delivery. This is the claim `--go` takes for itself — no tmux, no model.
+tid2=$(jq -r .task_id < "$st/delivery.json")
+"$D/bin/cc" claim r "$row" --executor worker > "$D/claim2" 2>&1; c2=$?
+{ [ "$c2" = 0 ] && [ "$(jq -r .claim.generation < "$st/delivery.json")" -gt 1 ] \
+  && [ "$(jq -r .task_id < "$D/claim2")" = "$tid2" ]; } \
+  && ok "P21 dispatch: a delivery with no PR leaves the row claimable, so the next dispatch runs — on the next generation of the same task" \
+  || bad "P21 dispatch: rc=$c2 $(cat "$D/claim2")"
+printf '%s %s\n' "$pass" "$fail" > "$D/counts"
+)
+read -r m2pass m2fail < "$T/done-fixture/counts"; pass=$((pass+m2pass)); fail=$((fail+m2fail))
+# M2 completion fixtures end.
+# P8: THE STANDING GRANT, and where it may NOT be spent. A project named in CC_SELF_LAND_REPOS (~/.cc/config) does not
+# wait for a 👍 — but `cc done` never queues the landing itself, however granted the repo is: a worker and a
+# member-facing session are both told to run that command, and a queue behind it would be the merge cc-guard denies
+# them wearing another name. The queue is cc-loop's (P9 below), and all `cc done` does is say who lands this one and
+# hand over the card. `SLACK_BOT_TOKEN=` pins the real door: this is the first cc done case whose gh stub returns a
+# URL, so it is the first that could reach #approvals with a fixture PR.
+mkdir -p "$T/ghbin8"
+printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"
+printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "[x] PR #77 queued"\n' "$T" > "$T/landstub"
+chmod +x "$T/ghbin8/gh" "$T/landstub"; : > "$T/land.calls"
+"$B/cc" $REPO w18 >/dev/null 2>&1; sleep 1
+for id in $(wins "$REPO/w18"); do tmux kill-window -t "$id"; done
+echo "the grant" > ~/.cc/worktrees/$REPO/w18/g.txt
+done8(){ env SLACK_BOT_TOKEN= CC_LAND="$T/landstub" PATH="$T/ghbin8:$PATH" "$@" "$B/cc" done $REPO w18 2>&1; }
+o8a=$(done8)
+{ [ ! -s "$T/land.calls" ] && grep -q 'land it with:  cc-land' <<<"$o8a"; } \
+  && ok "cc done: a repo the grant does not name waits for a 👍, and it says how to land it (P8a)" \
+  || bad "cc done on an ungranted repo: $(cat "$T/land.calls") $o8a"
+o8b=$(done8 CC_SELF_LAND_REPOS="other $REPO")
+{ [ ! -s "$T/land.calls" ] && grep -q "lands its own PRs" <<<"$o8b" && grep -q "the loop queues PR #77" <<<"$o8b"; } \
+  && ok "cc done: even for a repo the grant DOES name, cc done queues nothing — it names the loop as what lands it, so the one command a worker is told to run is not a way round the merge gate (P8b)" \
+  || bad "cc done queued a landing itself: $(cat "$T/land.calls") $o8b"
+mkdir -p ~/dev/$REPO/.cc; touch ~/dev/$REPO/.cc/member-facing
+o8c=$(done8 CC_SELF_LAND_REPOS="$REPO"); rm -f ~/dev/$REPO/.cc/member-facing
+{ [ ! -s "$T/land.calls" ] && grep -q 'member-facing' <<<"$o8c" && grep -q 'waits for a 👍' <<<"$o8c"; } \
+  && ok "cc done: a MEMBER-FACING repo in the list is refused out loud — a grant that silently does nothing is worse than one that is refused (P8c)" \
+  || bad "cc done on a member-facing repo in the list: $(cat "$T/land.calls") $o8c"
+# P8d: the rest of the table, `self_lands` lifted out of `cc` and run over a ~/dev of its own — NOT through `cc done`:
+# marking this suite's fixture a member WORKSPACE would send cc-checkpoint down pick_remote's workspace path, where a
+# project with no repository has one CREATED for it against this box's real GitHub App. A fixture must never reach
+# that. 1 = no grant · 0 = granted · 2 = named, but member-facing or a workspace.
+mkdir -p "$T/dev8/ws/.cc" "$T/dev8/mf/.cc" "$T/dev8/proj"
+touch "$T/dev8/ws/.cc/member-workspace" "$T/dev8/mf/.cc/member-facing"
+sl8(){ ( export DEV="$T/dev8" BIN="$B" CC_SELF_LAND_REPOS="$1"
+         eval "$(sed -n '/^member_facing()/p;/^member_workspace()/p;/^self_lands(){/,/^}/p' "$B/cc")"
+         self_lands "$2" ); echo $?; }
+{ [ "$(sl8 'a b' proj)" = 1 ] && [ "$(sl8 '' proj)" = 1 ] && [ "$(sl8 'a proj b' proj)" = 0 ] \
+  && [ "$(sl8 ws ws)" = 2 ] && [ "$(sl8 mf mf)" = 2 ] && [ "$(sl8 a ws)" = 1 ]; } \
+  && ok "cc self_lands: only a repo the list NAMES holds the grant (an empty list grants nothing), and a member workspace or member-facing repo that is named gets a word of its own — the host half that would land for it does not exist yet (P8d)" \
+  || bad "self_lands table: unlisted=$(sl8 'a b' proj) empty=$(sl8 '' proj) listed=$(sl8 'a proj b' proj) ws=$(sl8 ws ws) mf=$(sl8 mf mf) ws-unlisted=$(sl8 a ws)"
+r8u=$(CC_SELF_LAND_REPOS= "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
+r8g=$(CC_SELF_LAND_REPOS="$REPO" "$B/cc" lands $REPO >/dev/null 2>&1; echo $?)
+{ [ "$r8u" = 1 ] && [ "$r8g" = 0 ]; } \
+  && ok "cc lands <repo> is the grant test and only the test: it answers with its exit code, queues nothing and writes nothing, which is why cc-loop may ask it (P8e)" \
+  || bad "cc lands: ungranted=$r8u granted=$r8g"
 # M6: is_error=true with subtype error_max_* and real output is a CAP, not a failure — the loop must keep going
 "$B/cc" $REPO w2 >/dev/null 2>&1; sleep 1
 for id in $(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | grep " $REPO/w2$" | cut -d' ' -f1); do tmux kill-window -t "$id"; done
@@ -1364,6 +1787,176 @@ rm -f "$T/remote.git/hooks/pre-receive"
   && ! tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 done" && tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -q "w15 finished, but opened no PR"; } \
   && ok "STATUS: DONE over a dead push is not done: cc done's failure reaches the loop — exit 4, board blocked with the reason, no DONE notice (audit F3)" \
   || bad "a dead push finished green: rc=$rc status=$("$B/cc-board" get $REPO w15 status) notes=$("$B/cc-board" get $REPO w15 notes | tail -c 200)"
+# P9: THE GRANT IS SPENT BY THE LOOP, and by nothing a session can type. A track on a repo named in
+# CC_SELF_LAND_REPOS that finishes DONE has its landing queued right here, once `cc done` has returned a PR — and
+# with the coordinates of the card `cc done` just posted, so a landing that STOPS marks and answers that card instead
+# of leaving one that still reads as pending in #approvals. Both real doors are stubbed: CC_LAND, because a real
+# `queue` writes into this box's own landing queue and starts a worker that gates, MERGES and deploys; CC_SLACK,
+# because a real post-approval puts a fixture PR in the owner's #approvals.
+mktrack w19 "finish, and land itself"
+mkclaude landclaude w19 'echo "work $n" > "land-$n.txt"; echo "- step $n" >> "$st/progress.md"; echo "STATUS: DONE" >> "$st/progress.md"'
+# Its own copies of the two P8 stubs: a scoped run may skip the stanza that made them, and a case that borrows
+# another stanza's fixture is red for a reason that has nothing to do with what it tests.
+mkdir -p "$T/ghbin8"
+printf '#!/usr/bin/env bash\ncase "$*" in *"pr create"*) echo "https://github.com/x/y/pull/77";; esac\nexit 0\n' > "$T/ghbin8/gh"
+printf '#!/bin/sh\necho "$*" >> "%s/land.calls"\necho "[x] PR #77 queued"\n' "$T" > "$T/landstub"
+printf '#!/bin/sh\ncase "$1" in post-approval) echo "CAPPR 1788000000.000100";; esac\nexit 0\n' > "$T/slackstub"; chmod +x "$T/ghbin8/gh" "$T/landstub" "$T/slackstub"
+: > "$T/land.calls"
+CC_SELF_LAND_REPOS=$REPO CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
+  "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1; rc=$?
+{ [ "$rc" = 0 ] && grep -qx "queue $REPO 77 --who cc done --chat CAPPR --ts 1788000000.000100" "$T/land.calls"; } \
+  && ok "cc-loop spends the grant: a DONE track on a granted repo has its PR queued by the LOOP — on the host, in a process no session can spell — carrying the #approvals card cc done just posted, so a stopped landing answers that card (P9)" \
+  || bad "the loop did not queue with the card: rc=$rc calls=[$(cat "$T/land.calls")]"
+: > "$T/land.calls"
+CC_LAND="$T/landstub" CC_SLACK="$T/slackstub" CC_CLAUDE="$T/landclaude" PATH="$T/ghbin8:$PATH" \
+  "$B/cc-loop" $REPO w19 --max-iter 1 --quiet >/dev/null 2>&1
+[ ! -s "$T/land.calls" ] \
+  && ok "…and a repo with no grant is left exactly as it was: the loop queues nothing and the PR waits for a 👍 (P9b)" \
+  || bad "the loop queued a landing for an ungranted repo: $(cat "$T/land.calls")"
+# P9c-P9j: managed host delivery. Own HOME, board, state and Git remote; systemd-run only records a start.
+(
+pass=0; fail=0
+export HOME="$T/delivery-home" D="$T/delivery-fixture" REALBIN="$B"
+mkdir -p "$HOME/dev/r" "$D/bin"
+export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
+export CC_CONFIG="$D/config" CC_SELF_LAND_REPOS=r CC_SLACK="$D/bin/cc-slack" CC_CLAUDE="$D/bin/claude"
+export CC_BRIEF_FAKE='{"verdict":"approve"}'
+unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST GH_REPO TMUX TMUX_PANE CC_MEMBER_SANDBOX CC_WORKER_SANDBOX
+printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/config"
+cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"
+cat > "$D/bin/cc-board" <<'SH'
+#!/bin/bash
+case "$*" in 'status r row review') [ ! -e "$D/board.fail" ] || exit 1;; esac
+exec "$REALBIN/cc-board" "$@"
+SH
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+echo "$*" >> "$D/gh.calls"
+case "$*" in
+  *'pr list'*'--state open'*) cat "$D/open" 2>/dev/null; exit 0;;
+  *'pr list'*) exit 0;;
+  *'pr create'*) echo create >> "$D/creates"; echo https://github.com/fixture/repo/pull/77 | tee "$D/open";;
+esac
+SH
+cat > "$D/bin/cc-slack" <<'SH'
+#!/bin/bash
+[ "$1" = post-approval ] || exit 0
+[ ! -e "$D/card.fail" ] || exit 1
+echo 'fixture 123.456'
+SH
+cat > "$D/bin/claude" <<'SH'
+#!/bin/bash
+echo work >> work.txt
+echo 'STATUS: DONE' >> "$HOME/.cc/state/r/row/progress.md"
+echo '{"is_error":false,"num_turns":1,"total_cost_usd":0,"result":"done"}'
+SH
+cat > "$D/bin/host-queue" <<'SH'
+#!/bin/bash
+echo "$*" >> "$D/host.calls"
+exec "$D/bin/cc-land" "$@"
+SH
+printf '#!/bin/sh\necho "$*" >> "$D/starts"\nexit 0\n' > "$D/bin/systemd-run"
+printf '#!/bin/sh\necho "$*" >> "$D/notices"\n' > "$D/bin/cc-notify"
+printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$D/bin/cc-sandbox"
+for tool in cc-pause tmux; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
+for tool in cc-model cc-limit cc-scope cc-trust cc-gh-token; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
+chmod +x "$D/bin/"*
+export CC_LAND="$D/bin/host-queue"
+git init -q -b main "$HOME/dev/r"; git init -q --bare "$D/remote.git"
+echo '/.cc/' > "$HOME/dev/r/.gitignore"
+git -C "$HOME/dev/r" add -A; git -C "$HOME/dev/r" commit -qm base
+git -C "$HOME/dev/r" remote add origin "$D/remote.git"; git -C "$HOME/dev/r" push -q origin main
+git -C "$D/remote.git" symbolic-ref HEAD refs/heads/main
+"$B/cc-board" init r "$HOME/dev/r" main >/dev/null
+"$B/cc-board" add r row 'delivery fixture' 'Finish the change.' >/dev/null
+wt="$HOME/.cc/worktrees/r/row"; st="$HOME/.cc/state/r/row"; q="$HOME/.cc/state/land/r-77.json"
+mkdir -p "$(dirname "$wt")"; git -C "$HOME/dev/r" worktree add -q -b track/row "$wt"
+"$D/bin/cc-task" claim r row --executor subagent >/dev/null
+echo work > "$wt/work.txt"
+"$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; first_rc=$?
+first_job=$(cat "$q" 2>/dev/null)
+"$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; loop_rc=$?
+{ [ "$first_rc" = 0 ] && [ "$loop_rc" = 0 ] && [ "$(cat "$q")" = "$first_job" ] \
+  && [ "$(wc -l < "$D/creates")" = 1 ] && grep -qx 'queue --task r row' "$D/host.calls" \
+  && jq -e '.chat == "fixture" and .ts == "123.456"' "$q" >/dev/null \
+  && jq -e '.landing.status == "queued"' "$D/receipt" >/dev/null; } \
+  && ok "P9c: planner and loop reach one queue job and one PR with the receipt's approval card" \
+  || bad "P9c: first=$first_rc loop=$loop_rc $(cat "$D/err" "$D/loop.out")"
+rm -f "$q"; : > "$D/starts"
+CC_SELF_LAND_REPOS= "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
+{ [ "$rc" = 0 ] && [ ! -e "$q" ] && [ ! -s "$D/starts" ] && jq -e '.landing.status == "approval" and .card.chat == "fixture"' "$D/receipt" >/dev/null; } \
+  && ok "P9d: no grant keeps the PR and card but queues nothing; P9c is its control" || bad "P9d: $(cat "$D/receipt" "$D/err")"
+mkdir -p "$HOME/dev/r/.cc"; touch "$HOME/dev/r/.cc/member-facing"
+"$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
+{ [ "$rc" = 2 ] && [ ! -e "$q" ] && [ ! -s "$D/starts" ] && grep -q 'member-facing' "$D/err"; } \
+  && ok "P9e: a granted member-facing task is a request that must be refused by path rules; P9c is its control" || bad "P9e: rc=$rc $(cat "$D/err")"
+rm "$HOME/dev/r/.cc/member-facing"
+for projection in board card; do
+  # The same PR, with its announcement pending. A board/card outage is never the missing-PR page.
+  jq --arg p "$projection" '.pending[$p] = (if $p == "board" then {pr:.pr.url,status:"review"} else {url:.pr.url} end) | if $p == "card" then .card=null else . end' \
+    "$st/delivery.json" > "$D/record"; mv "$D/record" "$st/delivery.json"
+  touch "$D/$projection.fail"; : > "$D/notices"
+  "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
+  { [ "$rc" = 0 ] && [ -e "$q" ] && ! grep -q 'finished, but opened no PR' "$D/notices" \
+    && grep -q "delivery projection pending: $projection" "$st/loop.log" \
+    && [ "$("$B/cc-board" get r row status)" != blocked ]; } \
+    && ok "P9f $projection: pending projection over a real PR logs a note, queues, and never blocks or pages" || bad "P9f $projection: rc=$rc $(cat "$D/loop.out")"
+  rm "$D/$projection.fail"
+  "$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"
+  jq -e '.pending == {} and .errors == []' "$D/receipt" >/dev/null \
+    && ok "P9f $projection control: retry settles the same delivery without a new PR" || bad "P9f retry: $(cat "$D/receipt")"
+done
+rm "$q"; mv "$st/delivery.json" "$D/saved-record"
+"$D/bin/cc-land" queue --task r row > "$D/receipt" 2> "$D/err"; rc=$?
+{ [ "$rc" != 0 ] && [ ! -e "$q" ] && grep -q 'needs a task record' "$D/err"; } \
+  && ok "P9g: queue --task refuses a legacy row out loud; P9c is its control" || bad "P9g: rc=$rc $(cat "$D/err")"
+mv "$D/saved-record" "$st/delivery.json"
+# Remove prior PR evidence: this is a new task whose first push fails, the control to P9f.
+jq '.pr=null | .card=null' "$st/delivery.json" > "$D/record"; mv "$D/record" "$st/delivery.json"
+printf '#!/bin/sh\necho "fixture push refused" >&2\nexit 1\n' > "$D/remote.git/hooks/pre-receive"; chmod +x "$D/remote.git/hooks/pre-receive"
+: > "$D/notices"; : > "$D/gh.calls"
+"$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
+{ [ "$rc" = 4 ] && [ ! -e "$q" ] && [ "$("$B/cc-board" get r row status)" = blocked ] \
+  && grep -q 'finished, but opened no PR' "$D/notices" && grep -q 'push failed' "$st/loop.log" && [ ! -s "$D/gh.calls" ]; } \
+  && ok "P9h: no PR after a failed push keeps exit 4, blocked and the existing page; P9f is its control" || bad "P9h: rc=$rc $(cat "$D/loop.out")"
+rm "$D/remote.git/hooks/pre-receive"; : > "$D/notices"
+CC_LAND=/bin/true "$D/bin/cc-loop" r row --max-iter 1 --quiet > "$D/loop.out" 2>&1; rc=$?
+{ [ "$rc" = 12 ] && [ "$("$B/cc-board" get r row status)" = blocked ] && grep -q 'delivery unconfirmed' "$D/notices" \
+  && ! grep -q 'finished, but opened no PR' "$D/notices"; } \
+  && ok "P9i: an empty host response uses exit 12 and says delivery is unconfirmed; P9c's receipt is its control" || bad "P9i: rc=$rc $(cat "$D/loop.out")"
+# The real cc --go must adopt the lander's reservation through its shell subprocesses. The window is a stub.
+cat > "$D/bin/tmux" <<'SH'
+#!/bin/bash
+case "$1" in new-window) jq -e '.claim.phase == "repair"' "$HOME/.cc/state/r/row/delivery.json" > "$D/phase-at-launch";; esac
+exit 0
+SH
+printf '#!/bin/sh\nexit 1\n' > "$D/bin/pgrep"; chmod +x "$D/bin/pgrep"
+python3 - <<'PY' > "$D/repair.out" 2>&1
+import json, os, pathlib, subprocess
+root = pathlib.Path.home(); bins = pathlib.Path(os.environ['D']) / 'bin'
+record = root / '.cc/state/r/row/delivery.json'
+d = json.loads(record.read_text()); d['pr'] = {'url': 'https://github.com/fixture/repo/pull/77'}
+record.write_text(json.dumps(d))
+def run(*argv):
+    return subprocess.run(list(map(str, argv)), capture_output=True, text=True, check=True)
+head = run('git', '-C', root / '.cc/worktrees/r/row', 'rev-parse', 'HEAD').stdout.strip()
+args = (bins / 'cc-task', 'reserve-repair', 'r', 'row', '--generation', str(d['claim']['generation']),
+        '--branch', 'track/row', '--pr', d['pr']['url'], '--head', head)
+reservation = json.loads(run(*args).stdout)
+run(bins / 'cc', 'r', 'row', '--go', '', '--loop', '1', '--no-extend')
+after = json.loads(record.read_text()); replay = json.loads(run(*args).stdout)
+assert reservation['launch'] and not replay['launch']
+assert after['claim']['generation'] == reservation['generation'] and after['claim']['ended_at']
+assert len(after['executions']) == len(d['executions']) + 1
+assert after['executions'][-1]['execution_id'] == reservation['execution_id'] == replay['execution_id']
+assert after['executions'][-1]['phase'] == 'repair'
+PY
+rc=$?
+{ [ "$rc" = 0 ] && grep -qx true "$D/phase-at-launch"; } \
+  && ok "P9j: cc --go adopts and releases the reserved repair without a build execution; replay grants no launch" || bad "P9j: $(cat "$D/repair.out")"
+printf '%s %s\n' "$pass" "$fail" > "$D/counts"
+)
+read -r m3pass m3fail < "$T/delivery-fixture/counts"; pass=$((pass+m3pass)); fail=$((fail+m3fail))
 # 10: the context trim (CC_LOOP_TRIM) reaches the worker's own environment when it is on, and OFF IS THE DEFAULT —
 # off is the run this loop has always done, with no context edit in the request at all. It ships off so a week of
 # shadow measurement (`cc-loop context-report`) can decide it on dollars per accepted PR, not on tokens per turn.
@@ -1392,7 +1985,7 @@ gnone=$(god env); gon=$(god env CC_LOOP_TRIM=1); goff=$(god env CC_LOOP_TRIM=0)
 { ! grep -q CC_LOOP_TRIM <<<"$gnone" && grep -q 'CC_LOOP_TRIM=1 ' <<<"$gon" && grep -q 'CC_LOOP_TRIM=0 ' <<<"$goff"; } \
   && ok "the trim knob survives \`cc --go\`: set in front of one dispatch it reaches the loop's own window — 0 as loudly as 1, so a box whose config says 1 can still run one track untrimmed — and nothing is carried when it is unset" \
   || bad "CC_LOOP_TRIM does not cross the tmux window: unset='$(head -c 90 <<<"$gnone")' on='$(head -c 90 <<<"$gon")' off='$(head -c 90 <<<"$goff")'"
-for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
+for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
 fi
 if stanza "usage limits (cc-limit + cc-loop)"; then
@@ -1443,6 +2036,58 @@ n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "$(hostname) limi
 [ "$n" = 1 ] && ok "owner told exactly once per limit episode (title '$(hostname) limit' -> #alerts)" || bad "limit notify count: $n"
 [ "$("$B/cc-limit" status)" = clear ] && ok "the stamp is cleared by the run that got through" || bad "stamp left behind"
 "$B/cc" rm $REPO w4 >/dev/null 2>&1
+fi
+if stanza "one limit episode, end to end (cc-limit writes the record and the episode down; cc-model, cc-pulse and cc-reconcile read them)"; then
+# The seam no selfcheck can reach. `cc-limit resume` writes ~/.cc/state/limit-resumed
+# ("<started>\t<reset>\t<resumed>") and both cc-pulse and cc-reconcile read field 1 — the episode's START — to
+# decide that a subagent's mark predates the limit that killed it. One bash writer, two python readers, each green
+# against its own literal: move field 1 and all three stay green while every mark goes warm again, which is the six
+# hours of rows nobody was doing that this ended.
+EH=$T/ehome; mkdir -p "$EH/.cc/state"; ereset=$(( $(date -u +%s) - 300 ))   # an episode whose reset has passed
+estart=$(( ereset - 7200 ))                                                # …and which began two hours before that
+# A pane id no tmux has: `resume` captures it, gets nothing, and says so — no pane on this box is read or typed
+# at, no timer is armed (CC_LIMIT_ARM=-), and the episode is published anyway, which is the rule ("a pane that
+# moved on by itself still lost its subagents"). Five fields since the review of #264 — see cc-limit record().
+printf '%%99999\t%s/e2e\t%s\t%s\tindep\n' "$REPO" "$ereset" "$estart" > "$EH/.cc/state/limit-interrupted"
+HOME=$EH CC_LIMIT_STAMP="$EH/.cc/state/claude-limit" CC_LIMIT_RECORD="$EH/.cc/state/limit-interrupted" \
+  CC_LIMIT_NUDGED="$EH/.cc/state/limit-nudged" CC_LIMIT_RESUMED="$EH/.cc/state/limit-resumed" \
+  CC_LIMIT_ARM=- "$B/cc-limit" resume >/dev/null 2>&1
+[ "$(cut -f1,2 "$EH/.cc/state/limit-resumed" 2>/dev/null)" = "$(printf '%s\t%s' "$estart" "$ereset")" ] \
+  && ok "cc-limit resume publishes the episode's START and its reset, and drops the record it finished with" \
+  || bad "limit-resumed fields 1,2: [$(cat "$EH/.cc/state/limit-resumed" 2>/dev/null)] want $estart/$ereset"
+erd(){   # what one reader's own limit_started() makes of the file on disk — its code, not a copy of its rule
+  HOME=$EH CC_LIMIT_RESUMED="$EH/.cc/state/limit-resumed" python3 - "$1" <<'PY' || echo "exit $?"
+import importlib.machinery, importlib.util, sys
+s = importlib.util.spec_from_loader("r", importlib.machinery.SourceFileLoader("r", sys.argv[1]))
+m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(int(m.limit_started()))
+PY
+}
+ereads(){ emiss=""; local et eg; for et in "$B/cc-pulse" "$B/cc-reconcile"; do
+  eg=$(erd "$et"); [ "$eg" = "$1" ] || emiss="$emiss [$(basename "$et"): $eg, want $1]"; done; }
+ereads "$estart"
+[ -z "$emiss" ] && ok "…and both readers read that same file as that same START — a mark older than it is cold" \
+  || bad "a reader disagrees with the writer:$emiss"
+# The suppressed case, so the two above cannot pass by echoing field 1 back: an episode whose RESET is still ahead
+# has not ended, its subagents are not dead yet, and both readers must decide nothing off it.
+printf '%s\t%s\t%s\n' "$estart" "$(( $(date -u +%s) + 3600 ))" "$(date -u +%s)" > "$EH/.cc/state/limit-resumed"
+ereads 0
+[ -z "$emiss" ] && ok "…and an episode whose reset has NOT passed decides nothing in either of them" \
+  || bad "a reader acted on a limit that is still standing:$emiss"
+# The record has a second reader: cc-model, which counts a row tagged `indep` as the second run that hit the limit
+# and moves every session to the fallback on it (review of #264). Same seam, same risk — cc-limit writes the tag,
+# cc-model tests for it — so its own function is lifted out of the file and run over a record in that format. An
+# empty extraction (the function reshaped past the range below) is not a command, so the case goes red, not quiet.
+sed -n '/^lim_interrupted(){/,/limit-interrupted" 2>\/dev\/null; }$/p' "$B/cc-model" > "$EH/limfn.sh"
+elim(){ ( now=$(date -u +%s); ST="$EH/.cc/state"; . "$EH/limfn.sh" && lim_interrupted ) ; echo $?; }
+eahead=$(( $(date -u +%s) + 3600 ))
+printf '%%99999\t%s/e2e\t%s\t%s\tindep\n' "$REPO" "$eahead" "$estart" > "$EH/.cc/state/limit-interrupted"
+[ "$(elim)" = 0 ] && ok "…and cc-model reads the same record: a row cc-limit tagged indep is the second run that hit the limit" \
+  || bad "cc-model did not read the indep tag cc-limit writes"
+printf '%%99999\t%s/e2e\t%s\t%s\tworking\n' "$REPO" "$eahead" "$estart" > "$EH/.cc/state/limit-interrupted"
+[ "$(elim)" = 1 ] && ok "…and an untagged row is no witness at all: it is the stamp agreeing with itself, which is the 09-04 regression" \
+  || bad "cc-model counted a record that is not an independent sighting"
+rm -rf "$EH"
 fi
 if stanza "resume/digest/rm"; then
 # gh stubbed: the digest asks GitHub about every PR on every board of the box, and each fixture PR here is a URL
@@ -1723,6 +2368,28 @@ if stanza "cc-janitor (the daily sweep: decision table + one end-to-end pass ove
 chk cc-janitor
 
 fi
+if stanza "cc-rename (a project's name, everywhere the box keys by it)"; then
+# Every case there builds a whole HOME of its own — a git repository with two linked worktrees, a board, a state
+# dir, an ask ledger, a config, a Slack directory and stub tmux/pgrep/cc — so it moves no path of this box's,
+# renames no channel of its Slack and kills no window of its tmux server.
+chk cc-rename
+# ...and `cc rename` is the way in — the dispatch line itself, run with no names at all, so what answers is
+# cc-rename's own usage and nothing on this box is looked at, let alone moved.
+rno=$("$B/cc" rename 2>&1); rc=$?
+{ [ "$rc" = 2 ] && grep -q 'cc rename <old> <new>' <<<"$rno"; } \
+  && ok "cc rename dispatches to cc-rename" || bad "cc rename: rc=$rc, said: $rno"
+rnh=$("$B/cc" -h 2>/dev/null)   # captured, not piped: `grep -q` closing the pipe early makes usage()'s own sed print
+grep -q '^#   cc rename <old> <new>' <<<"$rnh" \
+  && ok "...and cc -h lists it (the usage() range covers the whole header)" || bad "cc -h does not list cc rename"
+
+fi
+if stanza "cc-started (a launched session is confirmed to be running, or the owner hears)"; then
+# Its own HOME, a stub tmux whose pane text is a file, and stub cc-slack/cc-msg/cc-notify — it reads no pane of
+# this box's and pages nobody. The three startup shapes the owner has seen (a popup, a first message that never
+# landed, a login screen) are each driven end to end there.
+chk cc-started
+
+fi
 if stanza "cc-pulse (the drive loop: whole-machine enumeration, start, tick, and the three reasons not to)"; then
 # Its own HOME with two boards and one orch, and stub tmux/cc/cc-msg/cc-handoff — it starts no session
 # on this box and types into none of the live ones.
@@ -1948,6 +2615,20 @@ r2(){ ( CC_LAND_CHANGED="$1" land_scope "$SB2"; printf '%s' "$REACH" ); }
 [ "$(r2 core/bin/cc-deep)" = " cc-deep cc-far cc-mid " ] \
   && ok "the reach is transitive and reads os.path.join(BIN, \"cc-foo\") too: the caller and the caller's caller, never a file that only names it" \
   || bad "transitive reach: [$(r2 core/bin/cc-deep)]"
+# …and the ONE EDGE THE GREP CANNOT SEE: the member launcher runs cc-fence at its path INSIDE bwrap
+# ("$HOME/bin/cc-fence"), which no `$BIN/`-shaped pattern matches, and its cases live under cc-sandbox's
+# selfcheck rather than its own. green.sh names the four tools outright; without it a change to cc-member-v2
+# alone left the fence's gate and the canary out of the landing's reach.
+SB4="$T/scopebin4"; mkdir -p "$SB4"
+for f in cc-member-v2 cc-member-broker cc-fence cc-sandbox cc-leaf; do printf '#!/bin/sh\n' > "$SB4/$f"; done
+r4(){ ( CC_LAND_CHANGED="$1" land_scope "$SB4"; printf '%s' "$REACH" ); }
+{ [ "$(r4 core/bin/cc-member-v2)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-fence)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-member-broker)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-sandbox)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-leaf)" = " cc-leaf " ]; } \
+  && ok "each of the four member tools reaches all four; the independent leaf reaches only itself" \
+  || bad "member-launcher reach: [$(r4 core/bin/cc-member-v2)] [$(r4 core/bin/cc-fence)] [$(r4 core/bin/cc-leaf)]"
 # …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. cc-land sorts the paths in python's byte
 # order and spends a green record only on a scope equal to that; sorting them again here runs in the box's locale,
 # where GNU sort ignores the `-` on its first pass and hands `core/bin/cc-graphs core/bin/ccbox` back swapped —

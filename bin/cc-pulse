@@ -27,13 +27,20 @@ judges. It dispatches nothing, spends nothing, and writes no state but its own l
 quiet mark below, and, once, a goals skeleton for a target that has none, so the tick never points at an empty
 file.
 
-DUE-NESS IS READ OFF FILES — no tmux, no session, no judgement — and it decides who is worth waking, not what
-the work is:
+DUE-NESS IS READ OFF FILES — no session, no judgement — and it decides who is worth waking, not what the work
+is (the one exception is a row carrying an `agent` mark, below, which costs one tmux listing):
   · a repo whose board rows are ALL kind=session is NEVER pulsed. A channel/course session has no track work,
     no brief and no done; the people in its channel are its loop.
   · every other target is woken, and the tick CARRIES WHAT THE FILES SAY — the `main-gate` row, `cc-scope count
     <repo>`, the rows queued or blocked, and the rows still in flight (a PR in `review` above all) — so a
     session with nothing to do costs one cheap turn instead of re-deriving all of it.
+  · a row a LIVE session is doing in its own subagents is in flight, not work waiting to be picked up. It has
+    no worker and no worktree anyone holds, so `queued` was offered for dispatch on every tick; the session
+    marks it (`cc board set <repo> <track> agent me`) and the mark holds while that tmux window holds a
+    session and the mark is still warm — CC_AGENT_MARK_HOURS, 6 h, refreshed by marking again. A mark made
+    before the START of a usage limit that has since lifted is cold whatever its age: the subagent holding it
+    died on the 429 (~/.cc/state/limit-resumed, written by `cc-limit resume`), so that row is offered again at
+    once. A mark made after it is warm on its own age — the box works on the fallback for the rest of an episode.
   · THE SAME LOOK IS NOT SENT TWICE. Every tick writes what it carried to ~/.cc/state/<target>/pulse.look, and
     a tick whose look is identical to that one is not sent inside CC_PULSE_QUIET (default 24 h): it goes to the
     target's events file instead (`cc-broker ledger --once`), which wakes nobody and rides out on the next
@@ -138,6 +145,23 @@ def epoch(s):
         return 0.0
 
 
+def limit_started():
+    """When the last usage-limit episode cc-limit resumed from BEGAN (epoch), or 0. Written by `cc-limit resume`,
+    "<started>\t<reset>\t<resumed>" — see WHAT ELSE THE LIMIT KILLED there. A mark older than that start was made
+    before the 429, and the subagent holding it died on it. The START and not the reset: the box does not stop for
+    the episode, cc-model moves every session to the fallback about a minute in, so a mark made after that is a
+    subagent that is alive and working (review of #264). Field 2 is the reset, and an episode whose reset has not
+    passed is ignored — only one that is over says anything about who survived it."""
+    try:
+        f = open(os.environ.get("CC_LIMIT_RESUMED") or f"{STATE}/limit-resumed").read().split("\n")[0].split("\t")
+        if len(f) != 3:
+            return 0.0          # not the three fields cc-limit writes: say nothing rather than read field 1 as a start
+        at, until = float(f[0]), float(f[1])
+        return at if 0 < at and 0 < until <= now() else 0.0
+    except Exception:
+        return 0.0
+
+
 def conf(key, default):
     """A number from the environment, else ~/.cc/config, else the default. Same shape as every other knob."""
     val = os.environ.get(key, "")
@@ -180,6 +204,44 @@ def windows():
             if len(f) >= 3 and f[1]:
                 out[f[1]] = (f[0], f[2])
     return out
+
+
+def agent_held(rows, repo):
+    """The rows of `repo` a LIVE planning session has marked as its own subagent's work. Since 2026-09-04 that is
+    how a backlog row is normally done: nothing on the box holds its worktree, so a row sitting in `queued` is
+    offered for dispatch on every tick — offering work somebody is already doing. The session writes its own tmux
+    window onto the row (`cc board set <repo> <track> agent me`, cc-board agent_id) and the mark holds on the same
+    two tests cc-reconcile makes: an interactive `claude` is in that window (live_claude — a pane left with a
+    `tail -f` in it is not a session), and the window is named for the row's own repo, since a session speaks for
+    its repo and no other and this board is a file every session can write.
+    A COLD MARK HOLDS NOTHING EITHER, on the same bounds cc-reconcile uses: a session that marked a row and then
+    moved on without clearing it would otherwise keep the row out of every tick for as long as its window lived,
+    and nothing here can see whether its subagent is still running. Marking again refreshes the time. A mark made
+    before the START of a usage limit that has since lifted is cold at any age — see below.
+    LAZY ON PURPOSE: a board with no marked row costs neither a tmux nor a ps. A tmux that cannot answer holds
+    NOTHING — the row goes back to being offered, which is what this file did before the mark existed."""
+    # …AND A USAGE LIMIT MAKES A MARK COLD BEFORE ITS TIME. On 2026-09-05 a limit at 09:05Z killed a session's
+    # subagents mid-row; their marks stayed warm until 15:05Z, so rows nobody was doing were held out of every
+    # tick for nearly four hours after the limit lifted at 11:10Z. limit_started() is when that episode BEGAN —
+    # the 429 that killed them — and not when it reset: the box goes on working on the fallback in between, so a
+    # mark made after the start is a live subagent's (review of #264). It can only ever move the bound later, and
+    # a mark made after the box came back is warm on its own age, as it always was. A mark made AT the start
+    # second is cold, the same way one exactly CC_AGENT_MARK_HOURS old is (`>`, not `>=`): that second is the one
+    # the limit was first seen in. cc-reconcile's mark_why() decides that second the same way.
+    cold = max(now() - float(os.environ.get("CC_AGENT_MARK_HOURS") or 6) * 3600, limit_started())
+    marks = {k: (r.get("agent") or "").strip() for k, r in rows.items()
+             if (r.get("agent") or "").strip() and epoch(r.get("agent_at")) > cold}
+    if not marks:
+        return set()
+    p = sh("tmux", "list-windows", "-t", "main", "-F", "#{window_id}:#{pid}\t#{window_name}\t#{pane_pid}", timeout=20)
+    wins = {}
+    if p is not None and p.returncode == 0:
+        for ln in p.stdout.splitlines():
+            f = ln.split("\t")
+            if len(f) >= 3 and f[0].strip() and f[1] == repo:
+                wins[f[0].strip()] = f[2].strip()
+    alive = {w for w in set(marks.values()) if w in wins and live_claude(wins[w])}
+    return {k for k, w in marks.items() if w in alive}
 
 
 def live_claude(pane_pid):
@@ -393,14 +455,20 @@ def due(target):
     # CC_PULSE_QUIET, so an unlanded PR lost its nudge for 6 h and the session was steered into new goal work
     # instead of landing it. Anything that is neither history nor queued counts as in flight, so a status word
     # cc-board grows later rounds UP to a wake rather than silently reading as nothing due.
+    # …AND A ROW A LIVE SESSION IS DOING IN ITS OWN SUBAGENTS IS IN FLIGHT, whatever word it carries. Nothing on
+    # the box holds its worktree, so `queued` reads as work waiting to be picked up and every tick offered it for
+    # a second dispatch. agent_held() is the whole test, and it fails back to today's answer: a mark whose window
+    # is gone counts for nothing and the row is offered again.
+    held = agent_held({k: r for k, r in rows.items() if kind(r) != SESSION_ROW}, repo)
     board = [(k, r.get("status") or "queued")       # cc-board's own default for a row written without one
              for k, r in rows.items() if kind(r) != SESSION_ROW]
-    ready = sorted(k for k, st in board if st in BOARD_DUE)
+    ready = sorted(k for k, st in board if st in BOARD_DUE and k not in held)
     # …and the same rows WITH the word each is wearing, for the look below. The note prints them bare to stay
     # one line, and bare is not enough to compare on: `queued` → `blocked` is a row that stopped, and reading
     # that as unchanged would hold the wake that says so.
-    ready_st = sorted(f"{k} {st}" for k, st in board if st in BOARD_DUE)
-    aloft = sorted(f"{k} {st}" for k, st in board if st not in BOARD_DUE and st not in DONE_ROW)
+    ready_st = sorted(f"{k} {st}" for k, st in board if st in BOARD_DUE and k not in held)
+    aloft = sorted(f"{k} {st}" + (" (a subagent has it)" if k in held else "")
+                   for k, st in board if k not in ready and st not in DONE_ROW)
     note = " · ".join(filter(None, [
         "main-gate row RED" if red else "",
         (f"{asks} owner ask{'' if asks == 1 else 's'} open" if asks > 0 else
@@ -756,7 +824,10 @@ def selfcheck():
                           # working ledger, and the back-off OFF (CC_PULSE_QUIET=0) so a case that runs the same
                           # board twice is decided by the rule it is about and not by the same-look mark. The
                           # block at the end turns it on and is the only place that tests it.
-                          CC_FAKE_ASKS="0", CC_FAKE_SCOPE_BROKEN="", CC_PULSE_QUIET="0", CC_FAKE_PAUSED="")
+                          CC_FAKE_ASKS="0", CC_FAKE_SCOPE_BROKEN="", CC_PULSE_QUIET="0", CC_FAKE_PAUSED="",
+                          # …and cc-limit's resumed-episode file under $th, not the box's: a real limit that
+                          # lifted this morning must not decide whether a mark in a fixture below is cold.
+                          CC_LIMIT_RESUMED=f"{th}/limit-resumed")
 
         def fixture(*cmd):                          # own group, no handle on our stdout (a stray child holds a pipe open)
             return subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
@@ -1046,6 +1117,86 @@ def selfcheck():
         ok("…and the rows that are queued or blocked, by name", "2 rows queued/blocked (t1, t2)" in d)
         ok("…and the rows already in flight, with the status each is in", "1 row in flight (t3 running)" in d)
 
+        # A ROW A LIVE SESSION IS DOING IN ITS OWN SUBAGENTS is work in flight, not work waiting to be picked up.
+        # Nothing on the box holds its worktree — no worker, no cc-loop, no window of its own — so `queued` read
+        # as free and every tick offered it for a second dispatch (owner, 2026-09-04: backlog rows run as the
+        # planning session's subagents). The mark is that session's own tmux window, and it is worth exactly what
+        # that window is worth: every case below is one way for it to be worth nothing.
+        FRESH = stamp()
+        d, L = decide({"t1": {"status": "queued", "agent": "@1:777", "agent_at": FRESH}, "t2": {"status": "queued"}})
+        ok("a queued row a LIVE session marked as its subagent's work is not offered as queued — and the "
+           "unmarked one beside it still is",
+           "1 row queued/blocked (t2)" in d and "1 row in flight (t1 queued (a subagent has it))" in d)
+        d, L = decide({"t1": {"status": "queued", "agent": "@9:777", "agent_at": FRESH}})
+        ok("…a mark whose window is gone is worth nothing: the row is offered again, exactly as before this",
+           "1 row queued/blocked (t1)" in d)
+        d, L = decide({"t1": {"status": "queued", "agent": "@1:778", "agent_at": FRESH}})
+        ok("…so is one carrying another tmux server's number — window ids restart at @0 when the server does, "
+           "and a mark left by a session that died in a reboot must not match whatever is @1 now",
+           "1 row queued/blocked (t1)" in d)
+        # …and the rest of the rule, on agent_held itself. Two windows of one name would confuse `windows()`,
+        # which is a different question from this one, so these drive the test rather than a whole run.
+        ok("agent_held reads a live mark, and only for the repo whose window it is: A SESSION SPEAKS FOR ITS "
+           "OWN REPO — this board is one file every session can write, and a mark from outside must not hold "
+           "a row of it open", agent_held({"t1": {"agent": "@1:777", "agent_at": FRESH}}, "beta") == {"t1"}
+           and agent_held({"t1": {"agent": "@1:777", "agent_at": FRESH}}, "alpha") == set())
+        open(tmuxf, "w").write(f"@1\tbeta\t{dead.pid}\n")
+        ok("…and a window whose session has exited holds nothing: `cc` leaves the window behind (exec bash), "
+           "so the mark says a SESSION is in it, never that the window exists",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": FRESH}}, "beta") == set())
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
+        body = open(f"{BIN}/tmux").read()
+        open(f"{BIN}/tmux", "w").write("#!/usr/bin/env bash\nexit 1\n")
+        ok("…and a tmux that will not answer holds NOTHING: the row goes back to being offered, which is what "
+           "this file did before the mark existed — a listing that failed must never park work silently",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": FRESH}}, "beta") == set())
+        open(f"{BIN}/tmux", "w").write(body)
+        ok("…while a board with no mark on it asks tmux nothing at all",
+           agent_held({"t1": {"status": "queued"}}, "beta") == set())
+        # ALIVE IS NOT WORKING, the same rule cc-reconcile makes: a session marks a row, its subagent dies or it
+        # moves on without clearing the mark, and the window lives on — the row would sit in flight for ever,
+        # offered to nobody, with nothing on the box able to see that no work is happening on it.
+        ok("A COLD MARK HOLDS NOTHING: one made 7 h ago on a window whose session is still very much alive is "
+           "past the bound, so the row is offered again",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 7 * 3600)}}, "beta") == set())
+        ok("…and one made a minute ago on the same window still holds it — the bound expires a mark, it does "
+           "not abolish it, and a session still on the row refreshes the time by marking again",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 60)}}, "beta") == {"t1"})
+        ok("…and a mark with no time on it at all holds nothing, which is every mark written before this: "
+           "unreadable is 'long ago' here as everywhere else in this file",
+           agent_held({"t1": {"agent": "@1:777"}}, "beta") == set())
+
+        # …AND A USAGE LIMIT ENDS A MARK BEFORE ITS TIME (2026-09-05): the limit killed the subagents mid-row and
+        # their marks stayed warm for hours after it lifted, so rows nobody was doing were offered to nobody.
+        # Own fixture: the file is written here and removed again, so every case above and below reads no episode.
+        # "<started>\t<reset>\t<resumed>": an episode that BEGAN an hour ago and reset ten minutes ago.
+        rezf = os.environ["CC_LIMIT_RESUMED"]
+        open(rezf, "w").write(f"{int(now() - 3600)}\t{int(now() - 600)}\t{int(now() - 590)}\n")
+        ok("a mark made BEFORE a limit that has since lifted is cold at any age — the subagent holding it died "
+           "on the 429 — so the row is offered again instead of sitting in flight until the 6 h bound",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 5400)}}, "beta") == set())
+        # THE BAR IS THE START, NOT THE RESET (review of #264). cc-model moves the box to the fallback about a
+        # minute into an episode and it goes on working, so a mark made between the start and the reset is a
+        # subagent that is alive: judging by the reset offered a row that was in flight.
+        ok("…while a mark made DURING the episode, after the box switched to the fallback, holds its row: the "
+           "box did not stop, and that subagent is still working",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 1800)}}, "beta") == {"t1"})
+        ok("…and one made after the box came back holds it on its own age, exactly as before: the episode moves "
+           "the bound, it does not abolish the mark",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 300)}}, "beta") == {"t1"})
+        open(rezf, "w").write(f"{int(now() - 3600)}\t{int(now() + 3600)}\t{int(now())}\n")   # reset an hour out
+        ok("…and an episode whose reset has NOT passed decides nothing: while the limit stands, the subagents "
+           "that are out are not dead yet and their rows are still theirs",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 5400)}}, "beta") == {"t1"})
+        open(rezf, "w").write(f"{int(now() - 3600)}\t{int(now() - 600)}\n")   # two fields: not what cc-limit writes
+        ok("…and a file that is not the three fields cc-limit writes says nothing at all, rather than reading "
+           "some other field as the start",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 5400)}}, "beta") == {"t1"})
+        os.unlink(rezf)
+        ok("…and with no episode on file the age bound is the whole rule, which is what this file did before",
+           agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 5400)}}, "beta") == {"t1"}
+           and agent_held({"t1": {"agent": "@1:777", "agent_at": stamp(now() - 7 * 3600)}}, "beta") == set())
+
         # A ROW IN `review` IS A PR NOBODY HAS LANDED. Read as nothing-due it cost the worst wake of the lot:
         # the session was told "goals are the work" and then muted for 6 h with its own PR still open.
         d, L = decide({"t1": {"status": "review"}})
@@ -1210,6 +1361,7 @@ case "$cmd" in
     while IFS=$'\t' read -r id name pid; do
       [ -n "${id:-}" ] || continue
       s="$fmt"; s="${s//\#\{window_id\}/$id}"; s="${s//\#\{window_name\}/$name}"; s="${s//\#\{pane_pid\}/$pid}"
+      s="${s//\#\{pid\}/${CC_FAKE_TMUX_SRV:-777}}"      # the tmux SERVER's pid: half of an `agent` mark
       printf '%s\n' "$s"
     done < "$F";;
   capture-pane)

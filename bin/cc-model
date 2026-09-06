@@ -18,8 +18,10 @@
 #   cc-model tick                     what cc-model.timer runs every 60 s (see below)
 #   cc-model selfcheck                the classifier and the chain, on fixtures
 # tick: (1) normal — switch when cc-limit's stamp says the primary model is limited AND a second run has hit that
-#   same limit (one run's limit is not the box's — see cc-limit), or when a live session's pane
-#   shows a fresh "usage limit" line (each matched line fires once, and a probe has to agree — docs and questions
+#   same limit (one run's limit is not the box's — see cc-limit; a session cc-limit recorded as INDEPENDENTLY
+#   interrupted — `indep`, its limit line first seen inside this episode — counts as that second run, and a stamp
+#   naming no model is read as the primary's — see stamp_says_switch), or
+#   when a live session's pane shows a fresh "usage limit" line (each matched line fires once, and a probe has to agree — docs and questions
 #   mention limits too); (1b) THE CLI'S OWN LIMIT PROMPT NEEDS NO PROBE: "You've reached your Fable 5 limit … ❯ Switch
 #   to Opus 5 (1M context) and continue" (a dialog) or "● Fable 5 limit reached · continuing on Fable 5 uses usage
 #   credits …" (its notice) IS a limit of the model it names — the dialog is answered (Enter when the highlighted line
@@ -171,6 +173,33 @@ limstamp(){ lim_till=0; lim_model=""; lim_seen=0   # cc-limit's stamp: "<until>\
   # and cc-limit calls it account-wide at two. Below that this file must not move every session on it — on 09-04
   # one worker's 09:13Z stamp did, for six hours, while opus went on answering.
   lim_seen=$(tr ',' '\n' <<<"${o:-}" | grep -cx '[0-9a-f]\{8\}' || true); }
+lim_interrupted(){   # is a live INTERACTIVE session on file as INDEPENDENTLY stopped by a limit that has not reset yet?
+                     # ~/.cc/state/limit-interrupted is cc-limit's "<pane>\t<window>\t<reset>\t<started>\t<tags>", and a
+                     # row goes in only for a pane whose limit line was CORROBORATED and named a reset — and cc-limit's
+                     # scan leaves out headless panes (they park and rerun themselves), so a row is a run of its own.
+  # …BUT ONLY A ROW TAGGED `indep`. record() corroborates a pane's line with the very stamp this function is about to
+  # believe, so without that tag a one-observer stamp plus any pane still showing the MORNING's limit wording would be
+  # two witnesses that are really one, and every session would move to the fallback for six hours with no probe — the
+  # 2026-09-04 regression the two-observer rule exists to stop (review of #264). cc-limit tags `indep` only when that
+  # pane's own limit LINE was first seen inside the current episode, which is a sighting the stamp did not supply.
+  awk -F'\t' -v n="$now" '($3+0) > n && $5 ~ /(^|,)indep(,|$)/ {f=1} END{exit !f}' \
+    "$ST/limit-interrupted" 2>/dev/null; }
+stamp_says_switch(){   # exit 0 = cc-limit's stamp is reason enough to move every session to the fallback NOW.
+  # "the switch follows the recorded limit within a minute, not a pane scan" (2026-09-05). That morning the stamp was
+  # written at 09:08Z naming a reset of 11:10Z, and the box did not move until 10:55Z — 1h47m late, off the pane scan
+  # below and a probe it paid for, on evidence the stamp already held. Two gates kept it waiting:
+  #   A SECOND RUN. The two-observer rule stands — one worker's word moved every session for six hours on 09-04 —
+  #   but a session cc-limit has recorded as INDEPENDENTLY interrupted (`indep`: its limit line was first seen inside
+  #   this episode, not left over from the morning — see lim_interrupted) IS a second run that hit the same limit, and
+  #   a better witness than the pane loop below, which reads that same screen an hour later and buys a probe to agree.
+  #   A STAMP THAT NAMES NO MODEL. Field 4 is empty when neither the message nor the run's json named one (cc-limit
+  #   keeps its own case for exactly that stamp), and `-n "$lim_model"` then refused it for ever. The box dispatches on
+  #   the primary, so a limit with no model on it is the primary's — which is how the pane loop reads a pane that
+  #   names none, one screen further down this file.
+  limstamp
+  [ "$lim_till" -gt "$now" ] || return 1
+  { [ "$lim_seen" -ge 2 ] || lim_interrupted; } || return 1
+  [ "$(fam "${lim_model:-$PRIMARY}")" = "$(fam "$PRIMARY")" ]; }
 rate_ok(){ local l s; l=$(awk -F'\t' '$3=="switch"{t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)   # one switch per 10 min, never a flap
   # The override's own `since` counts as a switch, not only the log line: that line is written AFTER every pane has
   # been retyped, and on 2026-09-01 a restore slipped into that gap and sent 12 sessions straight back into the prompt.
@@ -483,8 +512,9 @@ tick(){
     [ "$ptill" -gt 0 ] || ptill=$((now + ${CC_MODEL_PROMPT_TILL:-86400}))   # it named no reset: a day, not a probe
     SWITCH_TILL="$ptill"; do_switch "$FALLBACK" "$(label "$PRIMARY") limit prompt in $SESSION:$pw"; SWITCH_TILL=0
     return 0; fi
-  limstamp   # ---- normal: did the primary model just hit a limit? (and did a SECOND run agree — see limstamp)
-  if [ "$lim_till" -gt "$now" ] && [ "$lim_seen" -ge 2 ] && [ -n "$lim_model" ] && [ "$(fam "$lim_model")" = "$(fam "$PRIMARY")" ]; then
+  # ---- normal: did the primary model just hit a limit, on evidence the box is already holding? The pane scan below
+  # is the slow path and the paid one; this one costs nothing and fires in the tick after the stamp (stamp_says_switch).
+  if stamp_says_switch; then
     rate_ok && do_switch "$FALLBACK" "$(fam "$PRIMARY") limit (cc-limit stamp)"; return 0; fi
   # ---- no override is in force, so the box wants PRIMARY: a session on another ID of that same family — the pane on
   # `claude-fable-5` while the box is on `claude-fable-5-1` — is retuned. Nothing here could see that before: to fam()
@@ -699,6 +729,33 @@ TXT
   t "a live cc-limit stamp cannot tell either"      "$(restore_blocked '' | grep -c 'still has')" 1
   printf '%s\tapi\t%s\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" aaaaaaaa,bbbbbbbb > "$ST/claude-limit"
   t "…and a stamp two runs hit tells no differently" "$(restore_blocked '' | grep -c 'still has')" 1
+
+  # ── THE SWITCH FOLLOWS THE RECORDED LIMIT, NOT A PANE SCAN (2026-09-05) ──────────────────────────────────────
+  # Stamped 09:08Z for a reset of 11:10Z; the box moved at 10:55Z off a pane line and a paid probe. Each case
+  # writes its own stamp and its own record — the case that switches and the case that must not, both asserted.
+  sw(){ stamp_says_switch; echo $?; }
+  rm -f "$ST/limit-interrupted"
+  printf '%s\tapi\t%s\t%s\t%s\n' "$((now + 3600))" "$now" "$(fam "$PRIMARY")" aaaaaaaa > "$ST/claude-limit"
+  t 'one run on the stamp and nothing else is still not the box'"'"'s limit — 09-04 stands' "$(sw)" 1
+  printf '%%9\tplanner\t%s\t%s\tindep\n' "$((now + 3600))" "$now" > "$ST/limit-interrupted"
+  t 'a session cc-limit recorded as INDEPENDENTLY interrupted is that second run: the switch fires on the stamp, unpaid' "$(sw)" 0
+  # Review of #264: without the tag, record() corroborating a pane off this very stamp made one witness look like
+  # two — a worker's one-observer stamp plus any pane still showing the morning's wording, and every session moved
+  # to the fallback for six hours with no probe. That is the 09-04 regression, so the untagged record is asserted too.
+  printf '%%9\tplanner\t%s\t%s\tworking\n' "$((now + 3600))" "$now" > "$ST/limit-interrupted"
+  t 'a record that is NOT an independent sighting is no witness at all: it is the stamp agreeing with itself' "$(sw)" 1
+  printf '%%9\tplanner\t%s\n' "$((now + 3600))" > "$ST/limit-interrupted"
+  t '…nor is a three-field record written before that tag existed' "$(sw)" 1
+  printf '%%9\tplanner\t%s\t%s\tindep\n' "$((now - 60))" "$((now - 7200))" > "$ST/limit-interrupted"
+  t 'a record whose reset has already passed is no witness — that session is going again' "$(sw)" 1
+  rm -f "$ST/limit-interrupted"
+  printf '%s\tapi\t%s\t\t%s\n' "$((now + 3600))" "$now" aaaaaaaa,bbbbbbbb > "$ST/claude-limit"
+  t 'a stamp naming NO model is the primary'"'"'s: the box dispatches on the primary' "$(sw)" 0
+  printf '%s\tapi\t%s\t%s\t%s\n' "$((now + 3600))" "$now" sonnet aaaaaaaa,bbbbbbbb > "$ST/claude-limit"
+  t 'a stamp naming another family moves nothing: it is not what the box is running' "$(sw)" 1
+  printf '%s\tapi\t%s\t%s\t%s\n' "$((now - 60))" "$now" "$(fam "$PRIMARY")" aaaaaaaa,bbbbbbbb > "$ST/claude-limit"
+  t 'and a stamp whose own reset has passed moves nothing either' "$(sw)" 1
+  rm -f "$ST/claude-limit" "$ST/limit-interrupted"
   ST="$oldst"
   # ── the model a session is ON is asked by ID, not by family ──────────────────────────────────────────────────
   # fam() is right for the CHAIN (one rung per family) and wrong for "is this session where the box wants it":

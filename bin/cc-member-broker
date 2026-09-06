@@ -1,0 +1,381 @@
+#!/usr/bin/python3 -IS
+# Milestone 3: one host process and endpoint per session; fixture operations, no delivery.
+# usage: cc-member-broker serve <task> <generation> | selfcheck
+# serve is a private launcher interface: stdout readiness, stdin host child PID, then EOF to stop.
+# V and HOME are host-selected as in cc-member-v2. No V descriptor is retained between requests.
+# The kernel identifies the caller: SO_PEERPIDFD holds a descriptor on the process that connected,
+# and its PID/mount namespaces must be the ones registered for this session. Same UID alone does not
+# identify a session. Residue: where that socket option is missing only the SO_PEERCRED pid is left,
+# and a pid that exits between the connect and the readlink can be reused.
+# One broker owns an endpoint at a time, and a connect to the socket is what says so. A generation
+# killed before it could tidy up leaves a socket nothing listens on; the next launch of that
+# generation removes it, binds, and removes the directory when it exits.
+# Wire: one JSON object line (4096 bytes including LF), then submit's declared bytes (0..1 MiB),
+# then write EOF. All reception shares a 2 second deadline. Each connection gets one response.
+# {"task":"task","generation":1,"submit":3}\nabc ; status:true; board:running|blocked|done;
+# dispatch:continue|review. These are the only fields/values. No text is interpreted as instructions.
+# Status reads return the latest 32 events; the full log stays on the host. Retired sessions can read.
+import array
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import select
+import socket
+import stat
+import struct
+import subprocess as sp
+import sys
+import time
+import uuid
+
+BIN = Path(__file__).resolve().parent
+USAGE = "usage: cc-member-broker serve <task> <generation> | selfcheck"
+HEADER, PAYLOAD, DEADLINE, RECENT = 4096, 1048576, 2.0, 32
+PEERPIDFD = 77   # SO_PEERPIDFD; python does not name it yet. An absent option selects the residue above.
+QUEUE_WAIT = 1.0   # the bound on the queries lock, which cc-msg holds across a post and an inject
+OPS = {"submit", "status", "board", "dispatch"}
+# Shared wording for future CLI/hook adapters. Quiet entries never enter the query queue.
+REFUSALS = {
+    "deny": ("page", "cc-guard: blocked — {reason}. A query about this has gone to the box; it will approve it or take it onward. Do anything that needs no approval and say what you are waiting on."),
+    "deny_owner": (None, "cc-guard: blocked — {reason} (needs the owner; ask via cc-notify or note it on the board)"),
+    "never": ("nopage", "cc-guard: blocked — {reason}. This is not this session's to run; the box has been told, so nothing here waits on it. Do the rest."),
+    "quiet": (None, "cc-guard: blocked — {reason}. This is not this session's to run and not the owner's to approve for it — nobody is being asked, so do not wait on an answer."),
+    "denyh": (None, "cc-guard: blocked — {reason}. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied."),
+}
+
+
+class Refused(ValueError):
+    def __init__(self, reason, kind="quiet"):
+        super().__init__(reason)
+        self.kind = kind
+
+
+def require(ok, reason, kind="quiet"):
+    if not ok:
+        raise Refused(reason, kind)
+
+
+def namespaces(pid):
+    return [os.readlink(f"/proc/{pid}/ns/{name}") for name in ("pid", "mnt")]
+
+
+def peer_of(c):
+    # FROM THE KERNEL, NEVER FROM WHAT THEY SENT. SO_PEERPIDFD gives a descriptor on the process that
+    # connected: while it is open that pid names that process and nothing else, so the namespaces read
+    # under it are the caller's own. Without the option there is only the connect-time pid, and the
+    # header says what that leaves. Both paths compare against the registration; the pidfd decides
+    # which process the comparison is about, not what counts as a match.
+    pid, uid, _ = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    require(uid == os.getuid(), "caller is not this user")
+    try:
+        fd = c.getsockopt(socket.SOL_SOCKET, PEERPIDFD)
+    except OSError:
+        return "peercred", namespaces(pid)
+    try:
+        # A caller already gone reads as "Pid: -1" here, and is refused rather than looked up by pid.
+        pinned = [int(row.split()[1]) for row in Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines()
+                  if row.startswith("Pid:")]
+        require(pinned == [pid], "caller left before its identity was read")
+        return "pidfd", namespaces(pid)
+    finally:
+        os.close(fd)
+
+
+def encoded(value):
+    return (json.dumps(value, separators=(",", ":")) + "\n").encode()
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, "duplicate request field")
+        result[key] = value
+    return result
+
+
+def receive(c):
+    until = time.monotonic() + DEADLINE
+    def chunk(size):
+        left = until - time.monotonic()
+        require(left > 0, "request deadline exceeded")
+        c.settimeout(left)
+        data, ancillary, flags, _ = c.recvmsg(size, socket.CMSG_SPACE(253 * 4), socket.MSG_CMSG_CLOEXEC)
+        for level, kind, raw in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                fds = array.array("i")
+                fds.frombytes(raw[:len(raw) - len(raw) % fds.itemsize])
+                for fd in fds:
+                    os.close(fd)
+        require(not ancillary and not flags & socket.MSG_CTRUNC, "request descriptors are not permitted")
+        return data
+    data = b""
+    while b"\n" not in data:
+        part = chunk(HEADER + 1 - len(data))
+        require(part, "request needs a JSON line")
+        data += part
+        require(len(data.split(b"\n", 1)[0]) < HEADER, "request header exceeds 4096 bytes")
+    header, body = data.split(b"\n", 1)
+    try:
+        request = json.loads(header, object_pairs_hook=unique)
+    except (UnicodeError, ValueError, RecursionError):
+        raise Refused("request needs a valid JSON object") from None
+    require(type(request) is dict, "request must be an object")
+    verbs = OPS & request.keys()
+    require(len(verbs) == 1, "exactly one operation is required")
+    op = next(iter(verbs))
+    require(set(request) == {"task", "generation", op}, "unknown or missing request fields")
+    require(type(request["task"]) is str and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", request["task"]), "invalid task ID")
+    require(type(request["generation"]) is int and 0 < request["generation"] < 2**63, "invalid generation")
+    value = request[op]
+    valid = (type(value) is int and 0 <= value <= PAYLOAD) if op == "submit" else (
+        value is True if op == "status" else type(value) is str and value in
+        ({"running", "blocked", "done"} if op == "board" else {"continue", "review"}))
+    require(valid, "operation value is not permitted")
+    size = value if op == "submit" else 0
+    while True:
+        require(len(body) <= size, "unexpected request bytes")
+        part = chunk(min(65536, size + 1 - len(body)))
+        if not part:
+            break
+        body += part
+    require(len(body) == size, "incomplete submission")
+    return request, op, body
+
+
+class Broker:
+    def __init__(self, task, generation):
+        require(os.environ.get("CC_MEMBER_SANDBOX") != "1", "serve is a host operation")
+        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", task), "invalid task ID")
+        require(type(generation) is int and 0 < generation < 2**63, "invalid generation")
+        # Reuse the host record validator and inventory, closing every setup descriptor immediately.
+        m = runpy.run_path(str(BIN / "cc-member-v2"))
+        launch = m["Launcher"]()
+        try:
+            self.registration = launch.record(task)
+            require(self.registration["generation"] == generation, "generation changed before launch")
+            self.v, self.home = launch.v, launch.home
+        finally:
+            for fd in launch.fds:
+                os.close(fd)
+        self.task, self.generation = task, generation
+        self.state = self.v / "state" / task
+        self.endpoint = self.v / "endpoints" / f"{task}-{generation}"
+        self.view = self.v / "control" / f"{task}-{generation}" / "view"
+        self.peer = None
+
+    @contextmanager
+    def locked(self):
+        fd = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+    def recent(self):
+        path = self.state / "status.jsonl"
+        if not path.exists():
+            return []
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            stream.seek(max(0, size - 65536))
+            if size > 65536:
+                stream.readline()
+            return [json.loads(line) for line in stream.read().splitlines()][-RECENT:]
+
+    def queue(self, kind, reason):
+        category = REFUSALS[kind][0]
+        if category is None:
+            return
+        # Catalogue rows 8/9: host-created files only. No member text, path or identity is read.
+        qdir = self.home / ".cc/queries"
+        qdir.mkdir(parents=True, exist_ok=True)
+        with (qdir / ".lock").open("a") as lock:
+            # BOUNDED, AND OUTSIDE THE TASK LOCK. cc-msg holds this one across a Slack post and a tmux
+            # inject for a whole drain tick, so an untimed wait here used to stop the endpoint answering
+            # and hold V/state/<task> against every later request and against a host launch. On a timeout
+            # the refusal is already in the host status log; nothing is deduplicated until a line is
+            # written, so the next refusal of the same reason tries the queue again.
+            until = time.monotonic() + QUEUE_WAIT
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= until:
+                        return
+                    time.sleep(0.02)
+            dest = qdir / "member" / self.registration["workspace"]
+            dest.mkdir(parents=True, exist_ok=True)
+            dedup = dest / "last.json"
+            seen = json.loads(dedup.read_text()) if dedup.exists() else {}
+            now = time.time()
+            seen = {k: t for k, t in seen.items() if now - t < 1800}
+            if reason in seen:
+                return
+            line = encoded(dict(at=now, workspace=self.registration["workspace"],
+                                **{"class": category}, reason=reason, command="member request"))
+            with (dest / "queries.spool").open("ab") as stream:
+                if stream.tell() + len(line) > PAYLOAD:
+                    return  # the refusal remains in the full status log
+                stream.write(line)
+            seen[reason] = now
+            dedup.write_bytes(encoded(seen))
+
+    def handle(self, c):
+        op, body, error, identity = None, b"", None, None
+        try:
+            identity, ns = peer_of(c)
+            require(ns == self.peer, "caller is outside the registered session")
+            request, op, body = receive(c)
+            require(request["task"] == self.task, "request names another task", "never")
+            require(request["generation"] == self.generation, "request names another generation", "never")
+        except (OSError, ValueError) as exc:
+            error = exc if isinstance(exc, Refused) else Refused(
+                "request deadline exceeded" if isinstance(exc, TimeoutError) else "caller or request unavailable")
+        with self.locked():
+            result = {}
+            if error is None:
+                try:
+                    fresh = json.loads((self.v / "registry" / f"{self.task}.json").read_text())
+                    require(type(fresh) is dict and set(fresh) == set(self.registration)
+                            and type(fresh["generation"]) is int and 0 < fresh["generation"] < 2**63,
+                            "invalid current registry record")
+                    require(all(fresh[k] == v for k, v in self.registration.items() if k != "generation"),
+                            "task binding changed", "never")
+                    require(op == "status" or fresh["generation"] == self.generation,
+                            "retired generation cannot mutate", "never")
+                    if op == "submit":
+                        transfer = uuid.uuid4().hex
+                        dest = self.v / "transfers" / transfer
+                        dest.mkdir(parents=True, mode=0o700)
+                        with (dest / "bytes").open("xb") as stream:
+                            stream.write(body)
+                        result = dict(transfer=transfer, bytes=len(body))
+                    elif op in ("board", "dispatch"):
+                        result = dict(workspace=self.registration["workspace"], value=request[op])
+                except (OSError, ValueError) as exc:
+                    error = exc if isinstance(exc, Refused) else Refused("host operation unavailable", "deny")
+            rows = self.recent()
+            event = dict(at=time.time(), seq=rows[-1]["seq"] + 1 if rows else 1, task=self.task,
+                         generation=self.generation, operation=op, identity=identity,
+                         ok=error is None, **result)
+            if error is not None:
+                event.update(reason=str(error), refusal=error.kind,
+                             error=REFUSALS[error.kind][1].format(reason=error))
+            with (self.state / "status.jsonl").open("ab") as stream:
+                stream.write(encoded(event))
+            rows = (rows + [event])[-RECENT:]
+            tmp = self.view / f"status.next.{os.getpid()}"
+            tmp.write_bytes(encoded(rows))
+            tmp.replace(self.view / "status.json")
+        if error is not None:
+            try:
+                self.queue(error.kind, str(error))   # the task lock is released first: see queue()
+            except (OSError, ValueError):
+                pass   # the record is the status log above; a queue this endpoint cannot write is not fatal
+        response = dict(event, records=rows) if error is None and op == "status" else event
+        try:
+            c.settimeout(DEADLINE)
+            c.sendall(encoded(response))
+        except OSError:
+            pass  # receipt is retained even if the caller stops reading
+
+    @contextmanager
+    def opening(self):
+        # Two launches of one generation do not decide the endpoint between them: this serialises the
+        # check and the bind below, and the removal at exit. It is held across neither the handshake
+        # nor a request, so a serving broker keeps no descriptor on V.
+        self.endpoint.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.endpoint, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                require(False, "another launch of this generation holds the endpoint")
+            yield
+        finally:
+            os.close(fd)
+
+    def listening(self, path):
+        # OWNERSHIP IS PROVED, NOT READ OFF THE NAME BEING THERE. A broker killed outright leaves its
+        # socket behind with nothing listening on it; a live one answers a connect even while it is
+        # busy, because the kernel queues that. Taking existence for ownership stranded the generation
+        # — bind refuses for good and it never launches again — and taking absence for it would take a
+        # live session's endpoint away. The connection this opens is refused and recorded like any
+        # other from outside the session.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(DEADLINE)
+            try:
+                probe.connect(str(path))
+            except (ConnectionRefusedError, FileNotFoundError):
+                return False
+        return True
+
+    def retire(self):
+        try:
+            with self.opening():
+                (self.endpoint / "sock").unlink(missing_ok=True)
+                self.endpoint.rmdir()
+        except (OSError, ValueError):
+            pass   # a launch holds it, or it holds something else: the next launch takes it under the lock
+
+    def serve(self):
+        require(stat.S_ISFIFO(os.fstat(0).st_mode), "registration requires a host pipe")
+        path = self.endpoint / "sock"
+        bound = False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            try:
+                with self.opening():
+                    try:
+                        left = os.lstat(path).st_mode
+                    except FileNotFoundError:
+                        left = 0
+                    if left:
+                        require(stat.S_ISSOCK(left), "the endpoint path is not a socket")
+                        require(not self.listening(path), "another broker owns this endpoint")
+                        path.unlink()   # a generation killed before its exit could remove it
+                    srv.bind(str(path))
+                    os.chmod(path, 0o600)
+                    srv.listen(16)
+                    bound = True
+                print("endpoint", flush=True)
+                require(select.select([0], [], [], 10)[0], "registration deadline exceeded")
+                line = os.read(0, 64)
+                require(re.fullmatch(rb"[0-9]{1,20}\n", line), "invalid launch PID")
+                self.peer = namespaces(int(line))
+                require(all(a != b for a, b in zip(self.peer, namespaces("self"))), "session namespaces must be separate")
+                with self.locked():
+                    (self.state / f"session-{self.generation}.json").write_bytes(encoded(
+                        dict(task=self.task, generation=self.generation, namespaces=self.peer)))
+                print("registered", flush=True)
+                while True:
+                    ready, _, _ = select.select([0, srv], [], [])
+                    if 0 in ready:
+                        break
+                    c, _ = srv.accept()
+                    with c:
+                        self.handle(c)
+            finally:
+                if bound:
+                    self.retire()
+
+
+def main():
+    try:
+        if sys.argv[1:] == ["selfcheck"]:
+            return runpy.run_path(str(BIN.parent / "tests/member_broker.py"))["selfcheck"](sys.modules[__name__])
+        require(len(sys.argv) == 4 and sys.argv[1] == "serve", USAGE)
+        Broker(sys.argv[2], int(sys.argv[3])).serve()
+        return 0
+    except (OSError, ValueError, sp.CalledProcessError) as exc:
+        print(f"cc-member-broker: refused: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

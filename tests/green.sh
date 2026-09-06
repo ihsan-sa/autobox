@@ -61,6 +61,10 @@ land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH 
   # `${BIN}/cc-foo` in shell and python strings, `$B/cc-foo` in the suites, and python's
   # `os.path.join(BIN, "cc-foo")` — cc-context, cc-handoff and cc-graphs call every one of their siblings that way.
   queue=$tools
+  # The member launcher calls its fence at the path inside bwrap, which the host
+  # invocation grep cannot see. Its cases live under cc-sandbox's canary gate.
+  case " $tools " in *" cc-fence "*|*" cc-member-v2 "*|*" cc-member-broker "*|*" cc-sandbox "*)
+    tools="$tools cc-fence cc-member-v2 cc-member-broker cc-sandbox"; queue=$tools;; esac
   while [ -n "$queue" ]; do
     nxt=""
     for t in $queue; do

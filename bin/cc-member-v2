@@ -1,0 +1,438 @@
+#!/usr/bin/python3 -IS
+# Milestone 2. Host-only provisioning and launch; no delivery or live cutover.
+# usage: cc-member-v2 provision <task> | run <workspace> <task> -- /absolute/command [args...] | selfcheck
+# Registry and bare repositories are installed by the host. Requests select IDs, never paths.
+# CC_MEMBER_V2_ROOT overrides ~/.cc/member-v2 for isolated fixtures. The registry record, the
+# mount table and the namespace inventory this owes are milestone 2 of
+# docs/design-member-git-boundary-2026-09-06.md; the cases are tests/member_v2.py, run by
+# `cc-sandbox selfcheck`. Nothing live selects this yet: `cc` and `cc-sandbox` reach it only
+# under CC_MEMBER_V2=1, and the fence refuses a TTY, so it takes pipes or /dev/null on stdio.
+import ctypes as C
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import select
+import stat
+import subprocess as sp
+import sys
+
+BIN = Path(__file__).resolve().parent
+USAGE = "usage: cc-member-v2 provision <task> | run <workspace> <task> -- /absolute/command [args...] | selfcheck"
+LIBC = C.CDLL(None, use_errno=True)
+LIBC.syscall.restype = C.c_long
+PARTS = ("repo", "state", "claude", "npm", "cache")
+ETC = ("passwd", "group", "nsswitch.conf", "hosts", "resolv.conf", "localtime", "ssl/certs", "alternatives")
+
+
+def require(ok, reason):
+    if not ok:
+        raise ValueError(reason)
+
+
+def within(path, parent):
+    return path == parent or parent in path.parents
+
+
+def granted(parts):
+    # The task a source under V belongs to, or None if no member session may hold it. THE SAME
+    # ALLOW-LIST record() BUILDS, by shape: this walk meets other tasks' live sessions, which do hold
+    # their own leaves, and must not refuse the box because one is running. Everything else under V —
+    # the registry that decides a task's authority, the host locks and status, a data or control
+    # directory rather than its leaf — belongs in no namespace but this one.
+    def task(name):
+        return name if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name) else None
+
+    def session(name):
+        head, dash, generation = name.rpartition("-")
+        return task(head) if dash and generation.isdecimal() and not generation.startswith("0") else None
+    if len(parts) == 3 and parts[0] == "data" and parts[2] in PARTS:
+        return task(parts[1])
+    if len(parts) == 3 and parts[0] == "state" and parts[2] == "seed.bundle":
+        return task(parts[1])
+    if len(parts) == 3 and parts[0] == "control" and parts[2] in ("settings.json", "view"):
+        return session(parts[1])
+    if len(parts) == 2 and parts[0] == "endpoints":
+        return session(parts[1])
+    return None
+
+
+class How(C.Structure):
+    _fields_ = [("flags", C.c_uint64), ("mode", C.c_uint64), ("resolve", C.c_uint64)]
+
+
+def opened(root, path, flags=os.O_PATH, directory=False):
+    # BENEATH | NO_SYMLINKS | NO_MAGICLINKS. Every mount uses this very fd.
+    require(os.uname().machine in ("x86_64", "aarch64", "riscv64") and C.sizeof(C.c_void_p) == 8,
+            "unsupported openat2 architecture")
+    how = How(flags | os.O_CLOEXEC, 0, 0x08 | 0x04 | 0x02)
+    fd = LIBC.syscall(C.c_long(437), C.c_int(root), os.fsencode(path), C.byref(how), C.sizeof(how))
+    if fd < 0:
+        raise OSError(C.get_errno(), f"openat2 refused {path}")
+    mode = os.fstat(fd).st_mode
+    if not (stat.S_ISDIR(mode) if directory else stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+        os.close(fd)
+        raise ValueError(f"unsupported source {path}")
+    return fd
+
+
+def inventory(v):
+    # WHAT IS INSPECTED: every same-UID process whose mount namespace is not this one AND whose root
+    # mount is a tmpfs — the shape every sandbox on this box has, because bwrap always builds its root
+    # that way. That covers the box because the only two other shapes need no inspection or cannot be
+    # made here: a process in the HOST namespace sees V exactly as this launcher does, and a member
+    # cannot unshare a namespace of its own: this profile passes --disable-userns and
+    # --assert-userns-disabled, and a LEGACY member sandbox (which passes neither) is stopped by the
+    # kernel's apparmor_restrict_unprivileged_userns=1 — clear that sysctl and a legacy member could pivot
+    # to a non-tmpfs root and leave this walk. The residue is a same-UID mount namespace made OUTSIDE
+    # that sandboxing (an operator's `unshare -m`) whose root is not a tmpfs: it is skipped, and it is
+    # not a member's to make. Modes and ownership establish neither trust nor isolation. An unreadable inventory fails.
+    def mounts(pid):
+        rows = []
+        for line in Path(f"/proc/{pid}/mountinfo").read_text().splitlines():
+            fields = line.split()
+            unescape = lambda s: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), s)
+            rows.append((fields[2], Path(unescape(fields[3])), Path(unescape(fields[4])), fields[fields.index("-") + 1]))
+        return rows
+    own = os.readlink("/proc/self/ns/mnt")
+    ancestors = {(s.st_dev, s.st_ino) for p in (v, *v.parents) for s in (p.stat(),)}
+    vdev = v.stat().st_dev
+    dev, root, at, _ = max((m for m in mounts("self") if within(v, m[2])), key=lambda m: len(str(m[2])))
+    backing = root / v.relative_to(at)
+    for p in Path("/proc").iterdir():
+        if not p.name.isdecimal():
+            continue
+        try:
+            if p.stat().st_uid != os.getuid():
+                continue
+            rows = mounts(p.name)
+            if not any(at == Path("/") and fs == "tmpfs" for _, _, at, fs in rows):
+                continue
+            if os.readlink(p / "ns/mnt") == own:
+                continue
+            # ANYWHERE UNDER V, not only V and above. A namespace binding V/registry, V/state/<task>
+            # or a task's data directory holds the records the broker re-reads under its lock, and
+            # that used to pass here because its source is BELOW V. The same-filesystem test stays:
+            # across filesystems the same spelling names a different object (see the descriptor note
+            # below). Residue: a namespace presenting exactly one task's permitted leaves is that
+            # task's session as far as this walk can tell — a per-task binding is established at
+            # launch, under the lock, not by reading another namespace's mount table.
+            exposed = set()
+            for d, src, _, _ in rows:
+                if d != dev or not (within(backing, src) or within(src, backing)):
+                    continue
+                exposed.add(granted(src.relative_to(backing).parts)
+                            if src != backing and within(src, backing) else None)
+            require(None not in exposed, f"live namespace {p.name} exposes V; stop it before provisioning")
+            require(len(exposed) <= 1,
+                    f"live namespace {p.name} exposes storage of more than one task; stop it before provisioning")
+            entries = list((p / "fd").iterdir())
+        except OSError:
+            # /proc GOES WITH THE PROCESS, and this walk is over a whole box. A pid that exits under
+            # it answers ENOENT, ESRCH or, once it is a zombie, EINVAL — measured on a busy box, where
+            # `mountinfo` of an exiting process refused every launch. A process that is gone is not
+            # evidence, and the link below says which it is: exit drops the namespace, so a zombie has
+            # no ns/mnt to read. One that is still live and will not be read IS evidence, and an
+            # unreadable inventory fails rather than guesses. A refusal is a ValueError, not caught here.
+            try:
+                os.readlink(p / "ns/mnt")
+            except OSError:
+                continue
+            raise ValueError(f"live namespace {p.name} cannot be inspected") from None
+        for fd in entries:
+            try:
+                target = Path(os.readlink(fd).removesuffix(" (deleted)"))
+                if not target.is_absolute():
+                    continue
+                st = fd.stat()
+            except OSError:
+                continue   # one descriptor closed under the walk; every other one is still counted
+            # TWO TESTS, AND THE SECOND IS ONLY MEANINGFUL ON V'S OWN FILESYSTEM. The inode pair is
+            # namespace-independent and catches a descriptor on V or on any parent of it, which is the
+            # real exposure. The path is TEXT READ FROM THE OTHER NAMESPACE, where the same spelling
+            # names a different object: a sandbox's private tmpfs root is "/", and every parent of V
+            # spells one, so `exec 3< /` in any live sandbox used to refuse every provision and launch
+            # and name an innocent session — a member could do it in one line, and could also mkdir V's
+            # own spelling inside its tmpfs HOME. Comparing text across filesystems answers nothing, so
+            # it is asked only of a descriptor that is on V's filesystem, where the spelling is V's own.
+            same_fs = st.st_dev == vdev
+            require((st.st_dev, st.st_ino) not in ancestors
+                    and not (same_fs and (within(v, target) or within(target, v))),
+                    f"live namespace {p.name} has a descriptor reaching V")
+
+
+class Launcher:
+    def __init__(self):
+        self.home = Path(os.environ["HOME"])
+        self.v = Path(os.environ.get("CC_MEMBER_V2_ROOT", self.home / ".cc/member-v2"))
+        require(self.home.is_absolute() and self.v.is_absolute(), "HOME and V must be absolute")
+        require(str(self.v) == os.path.normpath(self.v), "V must be canonical")
+        require(os.environ.get("CC_MEMBER_SANDBOX") != "1", "provision and launch are host operations")
+        # Conservative coverage of EVERY legacy rw group, including worker caches.
+        legacy = [self.home / p for p in ("dev", ".cc/worktrees", ".cc/state", ".cc/members",
+                  ".cc/slack", ".cc/boards", ".claude", ".npm", ".cache")]
+        require(not any(within(self.v, p) or within(p, self.v) for p in legacy),
+                "V has a member-writable parent or contains legacy writable storage")
+        self.allowed = set()   # the exact sources under V this task may mount; record() fills it
+        self.root = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.fds = [self.root]
+        self.mount_fds = []
+        # This also refuses a symlink at any ancestor of HOME or V.
+        self.pin(self.home, directory=True)
+        self.vfd = self.pin(self.v, directory=True)
+        inventory(self.v)
+
+    def pin(self, path, flags=os.O_PATH, directory=False):
+        path = Path(path)
+        fd = opened(self.root, str(path).lstrip("/"), flags, directory)
+        self.fds.append(fd)
+        return fd
+
+    def record(self, task, workspace=None):
+        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", task), "invalid task ID")
+        fd = opened(self.vfd, f"registry/{task}.json", os.O_RDONLY)
+        with os.fdopen(fd) as stream:
+            r = json.load(stream)
+        require(set(r) == {"workspace", "project", "remote", "branch", "base", "generation"}, "invalid registry fields")
+        for key in ("workspace", "project"):
+            require(isinstance(r[key], str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", r[key]), f"invalid {key}")
+        require(workspace is None or workspace == r["workspace"], "task is not registered to this workspace")
+        require(type(r["generation"]) is int and r["generation"] > 0, "invalid session generation")
+        require(isinstance(r["remote"], str) and r["remote"] and "\n" not in r["remote"], "invalid permitted remote")
+        require(isinstance(r["base"], str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", r["base"]), "base must be a full object ID")
+        require(isinstance(r["branch"], str) and r["branch"].startswith("refs/heads/"), "destination must be a branch ref")
+        self.git(["check-ref-format", r["branch"]])
+        self.task, self.r = task, r
+        self.data = self.v / "data" / task
+        self.control = self.v / "control" / f"{task}-{r['generation']}"
+        self.endpoint = self.v / "endpoints" / f"{task}-{r['generation']}"
+        # AN ALLOW-LIST, NOT A DENY-LIST. Naming what may NOT be mounted left registry/, control/ and
+        # state/<task>/ reachable as sources, so a later milestone could mount the record that decides
+        # this task's authority, or another session's generated settings, by writing one line. These
+        # are every source under V this launcher mounts; anything else under V is refused here.
+        self.allowed = {*(self.data / part for part in PARTS), self.control / "settings.json",
+                        self.control / "view", self.endpoint, self.v / "state" / task / "seed.bundle"}
+        # Serializes host setup and broker operations. Never inspect member Git on a resumed task.
+        (self.v / "state" / task).mkdir(parents=True, exist_ok=True)
+        lock = opened(self.vfd, f"state/{task}", os.O_RDONLY, True)
+        self.lock = lock
+        self.fds.append(lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return r
+
+    def git(self, args, **options):
+        env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+        return sp.run(["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+                      env=env, cwd="/", check=True, stderr=sp.PIPE, **options)
+
+    def settings(self):
+        self.control.mkdir(parents=True, exist_ok=True)
+        self.endpoint.mkdir(parents=True, exist_ok=True)
+        # Only trusted control directories are written by the host. A fresh inode keeps
+        # an older session's real settings file intact while a new launch is generated.
+        result = sp.run([str(BIN / "cc-sandbox"), "__settings-copy"], check=True, stdout=sp.PIPE)
+        json.loads(result.stdout)
+        # Its own name per process: `x` refuses an existing file, and a run killed between the
+        # create and the rename would otherwise leave one that blocks every later launch.
+        tmp = self.control / f"settings.next.{os.getpid()}"
+        try:
+            with tmp.open("xb") as stream:
+                stream.write(result.stdout)
+            tmp.replace(self.control / "settings.json")
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        view = self.control / "view"
+        (view / "template").mkdir(parents=True, exist_ok=True)
+        (view / "task.json").write_text(json.dumps(dict(self.r, task=self.task)) + "\n")
+        # A read-only fixture projection; authoritative board mutations arrive in M6.
+        (view / "board.json").write_text(json.dumps({"workspace": self.r["workspace"], "task": self.task}) + "\n")
+        (self.control / "claude.json").write_text(json.dumps({"hasCompletedOnboarding": True,
+            "projects": {"/work": {"hasTrustDialogAccepted": True}}, "mcpServers": {}}))
+
+    def mount(self, source, target, writable=False):
+        source = Path(source)
+        # No source exposes V or a parent of ANY task's writable storage, even RO.
+        leaves = [self.data / p for p in PARTS]
+        require(not within(self.v, source) and not any(p != source and within(p, source) for p in leaves),
+                "mount would expose a member-writable parent")
+        require(not within(source, self.v) or source in self.allowed,
+                "mount source under V is not one of this task's permitted mounts")
+        if within(source, self.v):
+            fd = opened(self.vfd, str(source.relative_to(self.v)))
+            self.fds.append(fd)
+        else:
+            fd = self.pin(source)
+        self.b += ["--bind-fd" if writable else "--ro-bind-fd", str(fd), str(target)]
+        self.mount_fds.append(fd)
+        return fd
+
+    def build(self, seed=False):
+        h = self.home
+        self.b = ["/usr/bin/bwrap", "--die-with-parent", "--unshare-user", "--unshare-pid",
+                  "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled",
+                  "--cap-drop", "ALL", "--clearenv"]
+        # cc-fence supplies no_new_privs and setsid after bwrap (two setsid calls would fail).
+        self.mount("/usr", "/usr")
+        for name in ("bin", "sbin", "lib", "lib64"):
+            self.b += ["--symlink", "usr/" + name, "/" + name]
+        self.b += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", str(h)]
+        for name in ETC:
+            # These are host-selected runtime aliases, not names read from member data.
+            # Resolve installed /etc aliases, then open without links and mount that fd.
+            self.mount(Path("/etc", name).resolve(strict=True), Path("/etc", name))
+        for name, target in zip(PARTS, ("/work", "/local", h / ".claude", h / ".npm", h / ".cache")):
+            self.mount(self.data / name, target, True)
+        self.mount(BIN, h / "bin")
+        self.mount((h / ".local/bin/claude").resolve(strict=True), h / ".local/bin/claude")
+        self.mount(self.control / "settings.json", h / ".claude/settings.json")
+        self.mount(self.control / "view", "/run/cc/view")
+        self.mount(self.endpoint, "/run/cc/broker")
+        fd = self.pin(self.control / "claude.json", os.O_RDONLY)
+        self.mount_fds.append(fd)
+        self.b += ["--file", str(fd), str(h / ".claude.json")]
+        if not seed:
+            cred = h / ".cc/members" / self.r["workspace"] / "credentials.json"
+            fd = self.pin(cred, os.O_RDONLY)
+            with os.fdopen(os.dup(fd)) as stream:
+                require(bool(json.load(stream).get("claudeAiOauth", {}).get("accessToken")), "mint a workspace credential first")
+            # Reuse the inspected credential descriptor, never reopen its name.
+            self.b += ["--bind-fd", str(fd), str(h / ".claude/.credentials.json")]
+            self.mount_fds.append(fd)
+        else:
+            self.mount(self.v / "state" / self.task / "seed.bundle", "/run/cc/seed.bundle")
+        env = {"HOME": str(h), "PATH": f"{h}/bin:{h}/.local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
+               "CC_MEMBER_SANDBOX": "1", "CC_ROLE": "member", "CC_TASK_ID": self.task,
+               "CC_WORKSPACE": self.r["workspace"], "CC_SESSION_GENERATION": str(self.r["generation"]),
+               "GIT_AUTHOR_NAME": self.r["workspace"], "GIT_AUTHOR_EMAIL": self.r["workspace"],
+               "GIT_COMMITTER_NAME": self.r["workspace"], "GIT_COMMITTER_EMAIL": self.r["workspace"]}
+        for k, v in env.items():
+            self.b += ["--setenv", k, v]
+        self.b += ["--chdir", "/work", "--", str(h / "bin/cc-fence"), "run"]
+        writable = ["/work", "/local", str(h / ".claude"), str(h / ".npm"), str(h / ".cache")]
+        if not seed:
+            writable.append(str(h / ".claude/.credentials.json"))
+        for path in [*writable, str(h), "/tmp", "/dev/null"]:
+            self.b += ["--rw", path]
+        # HOME includes task Claude/caches and the credential; RO mounts carry metadata
+        # protection for settings/tools. /run/cc/view is outside every granted tree.
+        # Measured: pathname socket connect works through both the RO mount and this rule.
+        self.b += ["--ro", "/run/cc/view", "--ro", "/run/cc/broker", "--"]
+
+    def execute(self, command, own_stdio=False):
+        require(command and command[0].startswith("/"), "command must be absolute")
+        io = {}
+        if own_stdio:
+            # Provisioning is a HOST command, and an operator types it at a terminal. The fence refuses a
+            # TTY on any of fd 0-2, so the seed step is handed stdio of its own and what the operator is
+            # attached to decides nothing. Its output comes back on the failure, not into their terminal.
+            io = dict(stdin=sp.DEVNULL, stdout=sp.PIPE, stderr=sp.PIPE)
+        else:
+            for fd in range(3):
+                s = os.fstat(fd)
+                require(stat.S_ISFIFO(s.st_mode) or (stat.S_ISCHR(s.st_mode) and s.st_rdev == os.makedev(1, 3)),
+                        "v2 requires pipes or /dev/null on stdio; interactive TTY launch is not supported yet")
+        # pass_fds exposes only setup sources to bwrap. The fence closes every fd >=3.
+        if own_stdio:
+            return sp.run(self.b + command, pass_fds=self.mount_fds, **io)
+        broker = sp.Popen([str(BIN / "cc-member-broker"), "serve", self.task, str(self.r["generation"])],
+                          stdin=sp.PIPE, stdout=sp.PIPE)
+        child = None
+        info_r, info_w = os.pipe()
+        block_r, block_w = os.pipe()
+        def expect(word):
+            require(select.select([broker.stdout], [], [], 10)[0]
+                    and broker.stdout.readline() == word + b"\n", "broker launch handshake failed")
+        try:
+            expect(b"endpoint")
+            argv = [self.b[0], "--info-fd", str(info_w), "--block-fd", str(block_r), *self.b[1:], *command]
+            child = sp.Popen(argv, pass_fds=(*self.mount_fds, info_w, block_r))
+            os.close(info_w); info_w = -1
+            raw = b""
+            while True:
+                require(select.select([info_r], [], [], 10)[0], "namespace registration timed out")
+                part = os.read(info_r, 4096)
+                if not part:
+                    break
+                raw += part
+                require(len(raw) <= 4096, "namespace registration exceeds limit")
+            info = json.loads(raw)
+            # bwrap reports its child in the host PID namespace. The child cannot execute
+            # any member command until the broker has registered both namespace identities.
+            broker.stdin.write(f"{info['child-pid']}\n".encode()); broker.stdin.flush()
+            expect(b"registered")
+            os.write(block_w, b"1")
+            return sp.CompletedProcess(argv, child.wait())
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill(); child.wait()
+            for fd in (info_r, info_w, block_r, block_w):
+                if fd >= 0:
+                    os.close(fd)
+            broker.stdin.close()
+            try:
+                broker.wait(timeout=5)
+            except sp.TimeoutExpired:
+                broker.kill(); broker.wait()
+            broker.stdout.close()
+
+    def provision(self):
+        self.data.mkdir(parents=True)  # exclusive; incomplete attempts are retained for inspection
+        for name in PARTS:
+            (self.data / name).mkdir()
+        self.settings()
+        bare = opened(self.vfd, f"repos/{self.r['project']}.git", directory=True)
+        self.fds.append(bare)
+        g = [f"--git-dir=/proc/self/fd/{bare}"]
+        opts = {"pass_fds": (bare,), "stdout": sp.PIPE}
+        require(self.git(g + ["rev-parse", "--is-bare-repository"], **opts).stdout == b"true\n", "host repository must be bare")
+        require(self.git(g + ["config", "--get", "remote.origin.url"], **opts).stdout.decode().strip() == self.r["remote"],
+                "bare repository remote differs from registry")
+        require(self.git(g + ["rev-parse", "--verify", self.r["base"] + "^{commit}"], **opts).stdout.decode().strip() == self.r["base"],
+                "task base must name a commit")
+        # A retained host ref names exactly the authorized base and its ancestry.
+        ref = f"refs/member-seed/{self.task}"
+        self.git(g + ["update-ref", ref, self.r["base"], "0" * len(self.r["base"])], pass_fds=(bare,))
+        self.git(g + ["bundle", "create", str(self.v / "state" / self.task / "seed.bundle"), ref], pass_fds=(bare,))
+        self.build(seed=True)
+        seeded = self.execute(["/usr/bin/sh", "-ec", '''
+git init -q --template=/run/cc/view/template --object-format="$3" -b "$1"
+git config user.name "$CC_WORKSPACE"; git config user.email "$CC_WORKSPACE"
+git fetch -q /run/cc/seed.bundle "$2"
+git reset -q --hard FETCH_HEAD
+''', "seed", self.r["branch"][11:], ref, "sha256" if len(self.r["base"]) == 64 else "sha1"], True)
+        require(seeded.returncode == 0, "contained bundle seeding failed; incomplete task retained: "
+                + seeded.stderr.decode(errors="replace").strip())
+        (self.v / "state" / self.task / "ready.json").write_text(json.dumps(self.r))
+
+
+def main():
+    try:
+        args = sys.argv[1:]
+        if args == ["selfcheck"]:
+            import runpy
+            return runpy.run_path(str(BIN.parent / "tests/member_v2.py"))["selfcheck"](sys.modules[__name__])
+        require((len(args) == 2 and args[0] == "provision") or
+                (len(args) >= 5 and args[0] == "run" and args[3] == "--"), USAGE)
+        launch = Launcher()
+        launch.record(args[1] if args[0] == "provision" else args[2], None if args[0] == "provision" else args[1])
+        if args[0] == "provision":
+            launch.provision()
+            print(f"cc-member-v2: provisioned {launch.task}")
+            return 0
+        with os.fdopen(opened(launch.vfd, f"state/{launch.task}/ready.json", os.O_RDONLY)) as stream:
+            ready = json.load(stream)
+        require(all(ready[k] == launch.r[k] for k in ready if k != "generation"), "task binding changed; provision a new task")
+        launch.settings()
+        launch.build()
+        fcntl.flock(launch.lock, fcntl.LOCK_UN)
+        return launch.execute(args[4:]).returncode
+    except (OSError, ValueError, sp.CalledProcessError) as exc:
+        print(f"cc-member-v2: refused: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""cc-statusline — Claude Code's own statusLine command, for every session this box starts.
+
+Wired as `statusLine` in claude-settings.json. Claude Code runs it after most turns — a new assistant
+message, /compact, an effort or vim-mode change (see code.claude.com/docs/en/statusline) — with the
+harness's OWN JSON on stdin: exact context-window figures, cost, the model, the session id. That is the
+number cc-context otherwise has to re-derive by tailing a transcript (core/bin/cc-context — "WINDOW is the
+part worth being honest about"), and it was wrong once. This writes it straight into one small per-session
+file cc-context prefers over its own estimate, and prints the one short line the status bar shows.
+
+  <harness JSON on stdin> -> ~/.cc/state/statusline/<session_id>.json, then one line on stdout
+
+The file carries the fields cc-context reads — used, window, pct, model — at the top, and the WHOLE payload
+verbatim under "raw" beside them: cost, rate limits, prompt cache, lines changed, whatever else the current
+schema carries. Nothing here decides what matters later — the spend site and the Home tab read "raw" for
+that, without a second change to this script. One file per session, overwritten every turn: the latest is
+the only row worth reading.
+
+A member session runs under cc-sandbox with its own $HOME, so ~/.cc/state here is THAT session's own state —
+never mixed into the box's.
+
+Never raises: a status line that crashes leaves the bar blank, not the session.
+Env: CC_STATUSLINE_DIR (default ~/.cc/state/statusline).
+"""
+import json, os, re, sys, time
+
+SID_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")   # no leading dot, no "/" — an id this is not is not a key
+
+STATE = os.path.expanduser("~/.cc/state")
+DIR = os.environ.get("CC_STATUSLINE_DIR") or os.path.join(STATE, "statusline")
+
+
+def human(n):
+    if not isinstance(n, (int, float)):
+        return "?"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M".replace(".0M", "M")
+    if n >= 1000:
+        return f"{round(n/1000)}k"
+    return str(int(n))
+
+
+def extract(d):
+    """The harness's payload -> (session_id, record, one-line string). record is what gets written to disk.
+    Tolerant of every field the schema documents as absent or null (no context_window yet, no cost, no
+    rate_limits, …) — a session barely started must still get a line and a file, not an exception."""
+    if not isinstance(d, dict):
+        d = {}
+    sid = d.get("session_id")
+    model = d.get("model") if isinstance(d.get("model"), dict) else {}
+    model_id = model.get("id")
+    model_name = model.get("display_name") or model_id
+    cw = d.get("context_window") if isinstance(d.get("context_window"), dict) else {}
+    used, window, pct = cw.get("total_input_tokens"), cw.get("context_window_size"), cw.get("used_percentage")
+    if pct is None and isinstance(used, (int, float)) and isinstance(window, (int, float)) and window:
+        pct = round(100.0 * used / window, 1)          # used_percentage is null early in a session; derive it
+    record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "session_id": sid,
+              "pct": pct, "used": used, "window": window, "model": model_id, "raw": d}
+
+    bits = [model_name or "?", f"{pct:.0f}% ctx" if isinstance(pct, (int, float)) else "ctx ?"]
+    if isinstance(used, (int, float)) and isinstance(window, (int, float)):
+        bits[1] += f" ({human(used)}/{human(window)})"
+    cost = (d.get("cost") if isinstance(d.get("cost"), dict) else {}).get("total_cost_usd")
+    if isinstance(cost, (int, float)):
+        bits.append(f"${cost:.2f}")
+    return sid, record, "  ".join(bits)
+
+
+def write(sid, record):
+    if not sid or not SID_RE.match(sid):
+        return   # no key to write it under (falsy), or one shaped to escape DIR (absolute, "../…") — either
+                 # way the printed line still goes out; nothing here trusts session_id as a plain filename
+    os.makedirs(DIR, exist_ok=True)
+    p = os.path.join(DIR, sid + ".json")
+    tmp = f"{p}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(record, f)
+    os.replace(tmp, p)
+
+
+def main(argv):
+    if argv[:1] == ["selfcheck"]:
+        return selfcheck()
+    try:
+        d = json.load(sys.stdin)
+    except Exception:
+        d = {}
+    try:
+        sid, record, out = extract(d)
+        write(sid, record)
+    except Exception:
+        out = "?"
+    print(out)
+    return 0
+
+
+def selfcheck():
+    import tempfile
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+        else:
+            f += 1
+            print(f"  FAIL {name}")
+
+    sid, record, out = extract({
+        "session_id": "sid-1", "model": {"id": "claude-opus-5", "display_name": "Opus"},
+        "context_window": {"total_input_tokens": 15500, "context_window_size": 200000, "used_percentage": 8},
+        "cost": {"total_cost_usd": 1.23, "total_duration_ms": 45000},
+        "rate_limits": {"five_hour": {"used_percentage": 12}},
+    })
+    ok("the fields cc-context reads are pulled out", record["used"] == 15500 and record["window"] == 200000
+       and record["pct"] == 8 and record["model"] == "claude-opus-5")
+    ok("the whole payload survives verbatim under raw, for a later reader (spend site, Home tab)",
+       record["raw"]["rate_limits"]["five_hour"]["used_percentage"] == 12
+       and record["raw"]["cost"]["total_duration_ms"] == 45000)
+    ok("the printed line is one line, short, and names the model, percentage and cost",
+       "\n" not in out and "Opus" in out and "8% ctx" in out and "$1.23" in out)
+
+    # used_percentage is null early in a session (docs: "may be null early in the session") — derive it
+    _, record2, _ = extract({"session_id": "sid-2", "model": {"id": "claude-sonnet-5"},
+                              "context_window": {"total_input_tokens": 10000, "context_window_size": 200000,
+                                                  "used_percentage": None}})
+    ok("a null used_percentage is derived from the raw token counts", record2["pct"] == 5.0)
+
+    # nothing usable yet: no context_window key at all (before the first API call)
+    _, record3, out3 = extract({"session_id": "sid-3", "model": {"id": "claude-opus-5", "display_name": "Opus"}})
+    ok("no context_window at all still writes a record and prints a line, not a crash",
+       record3["used"] is None and record3["pct"] is None and "ctx ?" in out3)
+
+    with tempfile.TemporaryDirectory() as d:
+        global DIR
+        keep, DIR = DIR, d
+        write(sid, record)
+        fp = os.path.join(d, "sid-1.json")
+        ok("the file lands under DIR, keyed by session id", os.path.exists(fp))
+        with open(fp) as fh:
+            on_disk = json.load(fh)
+        ok("what is on disk is exactly what extract() returned", on_disk == record)
+        write(None, {"x": 1})
+        ok("no session id -> nothing written (there is no key to write it under)",
+           sorted(os.listdir(d)) == ["sid-1.json"])
+
+        # session_id is untrusted input, joined straight into a path: an absolute or ../ id must never escape DIR
+        outside = os.path.join(os.path.dirname(d), "escaped.json")
+        write("/etc/passwd", {"x": 1})
+        ok("an absolute session id is rejected, not joined onto DIR", sorted(os.listdir(d)) == ["sid-1.json"])
+        write("../escaped", {"x": 1})
+        ok("a ../ session id is rejected — nothing is written outside DIR", not os.path.exists(outside)
+           and sorted(os.listdir(d)) == ["sid-1.json"])
+        write("sid.2_ok-3", record)
+        ok("an ordinary id with dots, underscores and dashes is still written normally",
+           os.path.exists(os.path.join(d, "sid.2_ok-3.json")))
+        write(".hidden", {"x": 1})
+        ok("a leading dot is rejected too", not os.path.exists(os.path.join(d, ".hidden.json")))
+        DIR = keep
+
+    import contextlib, io
+    real_stdin = sys.stdin
+    try:
+        sys.stdin = io.StringIO("not json")
+        out_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf):
+            rc = main([])
+        ok("garbage stdin is never fatal — the status bar must not go blank because of this script",
+           rc == 0 and out_buf.getvalue().strip() != "")
+    finally:
+        sys.stdin = real_stdin
+
+    print(f"cc-statusline selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)

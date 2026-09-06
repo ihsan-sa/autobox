@@ -38,6 +38,16 @@ anything: a `claude` whose cwd is the track's worktree (the Home tab's rule), a 
 tmux window. Any of the three and the track is alive, whatever the board says. Missing that would turn
 this into a tool that stops work instead of describing it — hence also --grace, below.
 
+…AND A SUBAGENT IS NONE OF THE THREE. Since 2026-09-04 a backlog row is normally worked by a planning session's
+own subagents: no worker, no cc-loop, no window of the track's own, so all three tests above see an empty
+worktree and the row was on the owner's NEEDS YOU list ten minutes later. The session says so on the row —
+`cc board set <repo> <track> agent me` writes its own tmux window there — and that mark counts as alive on two
+tests and no fewer: an interactive `claude` is under that window (a pane left with a `tail -f` in it is not a
+session), and the window is named for the row's own repo (a session speaks for its repo and no other). It claims
+nothing else: the moment the session is gone the row is unattended again and is reported like any other, and a
+mark made before the START of a usage limit that has since lifted is cold at any age — the subagent holding it died
+on the 429 (see mark_why). cc-pulse reads the same mark on the same bounds and stops offering the row.
+
 ALIVE IS NOT WORKING, though, and that is the third word. A live pane with nobody typing at it for 2 h is `idle`,
 not `running`: a track sat under 🏃 for 1 d 19 h because a session was parked at its prompt long after its headless
 loop had been aborted (owner, 2026-09-01). A worker or a `cc-loop` alive means work in flight whatever the keyboard
@@ -90,6 +100,7 @@ REPEAT = 86400     # a finding that persists is worth one push a day, not one ev
 PRMAX = 40         # PR lookups per run — a timer job must never stall on the network
 WEDGED = 3 * 3600  # a worker alive with nothing moved for this long: cc-loop caps one iteration at 1 h and logs both ends
 IDLE = 2 * 3600    # a live pane with nobody typing at it for this long: open is not working (owner, 2026-09-01)
+AGENT_MARK = 6 * 3600   # …and the same rule for an `agent` mark: it holds a row for this long, then goes cold
 WEDGE_SEEN = 5400  # …and only if the previous run saw it too, which on a 20-min timer is one strike, then another
 PENDING = 14400    # finished with an open PR for this long and nobody landing it: the session was told 12 times already
 TERMINAL = ("merged", "done")
@@ -110,15 +121,56 @@ def epoch(ts):
         return 0.0
 
 
+def mark_why(t, wins, repo, t0, mark, started=0.0):
+    """The `agent` mark, weighed: (does it hold, and if not, what to say). A mark is a SESSION'S WINDOW and the
+    time it was made, and either half can be worth nothing — the window can be gone or belong to another repo,
+    and the mark itself goes cold.
+
+    ALIVE IS NOT WORKING, which is this file's oldest lesson (owner, 2026-09-01, after a session sat open and
+    idle for 1 d 19 h). A window merely existing held a row open for as long as the session lived: mark a row,
+    let the subagent die or simply move on without clearing it, and the row read `running` for ever — no grace
+    rule, no missing-worktree ask, and cc-pulse never offering it again. idle_session() cannot reach it either,
+    because a marked row has no window of its own to be idle. So the mark expires. A session still on the row
+    says so by marking again, which costs it one command; one that moved on says nothing, and the row comes
+    back (review of #242).
+
+    A USAGE LIMIT ENDS A MARK BEFORE ITS TIME, on the bound cc-pulse's agent_held() uses too. On 2026-09-05 a
+    limit at 09:05Z killed a planning session's subagents mid-row; their marks stayed warm until 15:05Z, four
+    hours after the limit lifted. `started` is when the last episode cc-limit came back from BEGAN, and a mark
+    that old was made before the 429 that killed the subagent holding it. The START and not the reset: the box
+    does not stop for the episode — cc-model moves every session to the fallback about a minute in — so a mark
+    made after that is a subagent that is alive and working (review of #264). A mark AT the start second is cold
+    too, the same way a mark exactly `mark` old is: that second is the one the limit was first seen in."""
+    ag = (t.get("agent") or "").strip()
+    if not ag or wins.get(ag) != repo:
+        return False, ""                # no mark, or one that was never this repo's to make: see facts()
+    at = epoch(t.get("agent_at"))
+    if not at:
+        return False, "marked by a live session, but the mark carries no time"   # written before cc-board stamped it
+    if t0 - at >= mark:
+        return False, f"marked by a live session {(t0 - at) / 3600:.0f} h ago, mark expired"
+    if started and at <= started:
+        return False, ("marked before the usage limit that began at "
+                       + time.strftime("%H:%MZ", time.gmtime(started)) + " — that subagent died with it")
+    return True, ""
+
+
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
 def procs():
-    """One pass over /proc → (live tracks, {ppids}, {track: [worker pids]}, {track: [loop pids]}). Two signals,
-    one walk: a `claude` sitting in a track worktree (the same rule the Home tab uses) and a `cc-loop <repo>
-    <track>`, which is the only thing alive while a loop waits out a usage limit. The ppid set is what makes a
-    tmux pane 'live' below. A WORKER is a headless claude — the budget flag is on the command line of every one
-    of those and of no interactive session, which is exactly how `cc … --go` tells them apart."""
+    """One pass over /proc → (live tracks, {ppids}, {pids holding a session}, {track: [worker pids]},
+    {track: [loop pids]}). Two signals, one walk: a `claude` sitting in a track worktree (the same rule the Home
+    tab uses) and a `cc-loop <repo> <track>`, which is the only thing alive while a loop waits out a usage limit.
+    The ppid set is what makes a tmux pane 'live' below. A WORKER is a headless claude — the budget flag is on the
+    command line of every one of those and of no interactive session, which is exactly how `cc … --go` tells them
+    apart.
+
+    THE THIRD SET IS EVERY PID WITH AN INTERACTIVE `claude` UNDER IT, ancestors and all, and it is a stricter
+    question than "does this pane have a child": a window somebody left a `tail -f` or an `htop` in after the
+    session exited has a child for ever, and an `agent` mark on such a window would keep a row alive for ever with
+    it. cc-pulse asks the same question of a pane (live_claude) before it types into one; this is that rule, taken
+    off the walk this already pays for."""
     live, ppids, root = set(), set(), WTS + os.sep
-    workers, loops = {}, {}
+    workers, loops, parent, inter, sessions = {}, {}, {}, set(), set()
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -127,6 +179,7 @@ def procs():
                 for ln in f:
                     if ln.startswith("PPid:"):
                         ppids.add(ln.split()[1])
+                        parent[pid] = ln.split()[1]
                         break
             argv = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace").split("\0")
             comm = open(f"/proc/{pid}/comm").read().strip()
@@ -138,6 +191,8 @@ def procs():
                 loops.setdefault(f"{argv[i + 1]}/{argv[i + 2]}", []).append(int(pid))
                 break
         if comm == "claude":
+            if not any(a in ("-p", "--print") for a in argv):
+                inter.add(pid)                          # an INTERACTIVE claude: a prompt somebody could type at
             try:
                 cwd = os.readlink(f"/proc/{pid}/cwd")
             except OSError:
@@ -147,7 +202,13 @@ def procs():
                 live.add(key)
                 if any(a.startswith("--max-budget-usd") for a in argv):
                     workers.setdefault(key, []).append(int(pid))
-    return live, ppids, workers, loops
+    for pid in inter:                                   # …and everything ABOVE one is holding that session, up to
+        up, seen = pid, set()                           # init. A second pass, because `parent` is only whole now.
+        while up and up not in seen and up != "1":
+            seen.add(up)
+            sessions.add(up)
+            up = parent.get(up, "")
+    return live, ppids, sessions, workers, loops
 
 
 def idle_for(repo, track, wt):
@@ -187,6 +248,22 @@ def limit_active():
     out is not wedged. A stamp one run hit binds that run alone and says nothing about any other track (#215)."""
     until, n = limit_stamp()
     return until > now() and n >= 2
+
+
+def limit_started():
+    """When the last usage-limit episode cc-limit resumed from BEGAN (epoch), or 0. `cc-limit resume` writes it —
+    "<started>\t<reset>\t<resumed>", see WHAT ELSE THE LIMIT KILLED there. The START, not the reset: the box goes
+    on working on the fallback for the rest of an episode, so only a mark older than the 429 itself belongs to a
+    subagent that died (review of #264). Field 2 is the reset, and one still ahead says nothing — only an episode
+    that is over tells you who did not survive it."""
+    try:
+        f = open(os.environ.get("CC_LIMIT_RESUMED") or f"{STATE}/limit-resumed").read().split("\n")[0].split("\t")
+        if len(f) != 3:
+            return 0.0          # not the three fields cc-limit writes: say nothing rather than read field 1 as a start
+        at, until = float(f[0]), float(f[1])
+        return at if 0 < at and 0 < until <= now() else 0.0
+    except Exception:
+        return 0.0
 
 
 def limit_until():
@@ -232,24 +309,32 @@ def waits_for(f):
     return ("", "")
 
 
-def tmux_live(ppids):
-    """(tracks whose tmux window still has something running in it, {track: seconds since that window last moved}).
-    `cc` leaves a dead window behind an exited session (`exec bash`), so a window alone proves nothing: the pane's
-    shell must have a child, exactly as `cc` decides it (pane_live).
+def panes(lines, ppids, sessions=(), t0=None):
+    """Pure — the whole reading of a `tmux list-panes` listing, so the selfcheck can drive it with no tmux server:
+    (tracks whose window has something running in it, {track: seconds since that window last moved},
+    {mark: window name} for every window a SESSION is in). A window alone proves nothing — `cc` leaves a dead one
+    behind an exited session (`exec bash`) — so a track's window must have a child in its pane, exactly as `cc`
+    decides it (pane_live).
 
-    THE IDLE CLOCK IS `#{window_activity}`, the same field cc-secretary reads for the same question, taken off the
-    listing this already pays for. An open session is not a working one: the owner watched a track sit in RUNNING
-    for 1 d 19 h because a `claude` was at its prompt with nobody typing at it (2026-09-01). See idle_session()."""
-    try:
-        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{window_name}\t#{pane_pid}\t#{window_activity}"],
-                             capture_output=True, text=True, timeout=10)
-    except Exception:
-        return set(), {}
-    live, idle, t0 = set(), {}, now()
-    for ln in out.stdout.splitlines():
+    THE IDLE CLOCK IS `#{window_activity}`, the same field cc-secretary reads for the same question. An open
+    session is not a working one: the owner watched a track sit in RUNNING for 1 d 19 h because a `claude` was at
+    its prompt with nobody typing at it (2026-09-01). See idle_session().
+
+    THE THIRD MAP IS STRICTER THAN THE FIRST, and it is not just the track windows. It is what an `agent` mark may
+    name (cc-board `agent_id`), and a mark is a claim that a SESSION is there — so a pane with any child at all is
+    not enough: a window somebody left a `tail -f` in after the session exited has one for ever, and the row would
+    never be reported again. procs() answers the real question, an interactive `claude` under that pane, which is
+    also what cc-pulse asks (live_claude) before it types into one. The NAME comes back with it because a session
+    may only speak for its own repo — see facts()."""
+    live, idle, wins, t0 = set(), {}, {}, t0 if t0 is not None else now()
+    for ln in lines:
         f = ln.split("\t")
-        if len(f) < 2 or f[0].count("/") != 1 or f[1].strip() not in ppids:
-            continue
+        if len(f) < 2 or f[1].strip() not in ppids:
+            continue                                    # nothing running in that pane: the window is a leftover
+        if len(f) > 3 and f[3].strip() and f[1].strip() in sessions:
+            wins[f[3].strip()] = f[0]                   # "<window id>:<tmux server pid>" — cc-board writes both
+        if f[0].count("/") != 1:
+            continue                                    # a TRACK window is `<repo>/<track>`; a session's is not
         live.add(f[0])
         try:                                            # a window with no activity stamp is not evidence of idleness
             act = float(f[2]) if len(f) > 2 and f[2].strip() else 0.0
@@ -258,7 +343,18 @@ def tmux_live(ppids):
         if act:
             was = max(0.0, t0 - act)                    # a window last moved when its BUSIEST pane did
             idle[f[0]] = min(idle[f[0]], was) if f[0] in idle else was
-    return live, idle
+    return live, idle, wins
+
+
+def tmux_live(ppids, sessions=()):
+    """panes() over the real listing; nothing at all when there is no tmux server to ask."""
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                              "#{window_name}\t#{pane_pid}\t#{window_activity}\t#{window_id}:#{pid}"],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return set(), {}, {}
+    return panes(out.stdout.splitlines(), ppids, sessions)
 
 
 def journal(repo, track):
@@ -377,7 +473,16 @@ def decide(f):
 
     Returns [(kind, status|None, why)]:  fix = decidable, applied silently · ask = needs a person, applied
     when it also has one right status and always reported · info = could not tell, only printed."""
-    st, live, pr, has_pr = f["status"], f["live"], f.get("pr_state") or "", bool(f.get("pr"))
+    st, pr, has_pr = f["status"], f.get("pr_state") or "", bool(f.get("pr"))
+    # A SUBAGENT IS NOBODY TO /proc. Since 2026-09-04 the box's default execution model is a planning session doing
+    # a board row's work in its own subagents: no worker, no cc-loop, no window of the track's own, so every test
+    # this tool makes saw an empty worktree and, ten minutes past the grace, said "no worker, and nothing says why"
+    # on the owner's NEEDS YOU list. `agent` is the row field that session sets (`cc board set <repo> <track> agent
+    # me`, cc-board agent_id) and facts() has already asked whether the window it names still holds a session and
+    # whether the mark is still warm — see mark_why(). It is the SESSION being alive that the mark claims, and
+    # nothing more: the moment that window is gone, or the mark goes cold, the row is reconciled exactly as any
+    # other unattended row is, and a cold mark says so in the reason rather than as "nothing says why".
+    live = f["live"] or bool(f.get("agent_live"))
     jk = (f.get("journal") or (None, ""))[0]
     who, wwhy = waits_for(f)      # waits_for owns the question itself: this only needs to know DONE from not-DONE
     if (f.get("kind") or "track") == "session":
@@ -409,7 +514,8 @@ def decide(f):
         out.append(("held", None, "waiting on the clock, not on you: " + wwhy))   # never an `ask`: there is nothing to answer
         settled = True
     elif live and st in QUEUED + ("blocked", "waiting"):
-        out.append(("fix", "running", "a worker is in its worktree"))
+        out.append(("fix", "running", "a worker is in its worktree" if f["live"]
+                    else "a live session is doing it in a subagent"))
         settled = True
     elif not live and st in ("running", "waiting") and f["age"] >= f.get("grace", GRACE):
         settled = True                                  # nobody is working on it: the board's own word for that is decided here, once
@@ -437,7 +543,8 @@ def decide(f):
         elif pr == "OPEN":
             out.append(("fix", "review", "its PR is open"))
         else:
-            out.append(("ask", "blocked", "no worker, and nothing says why (killed, or the box restarted)"))
+            out.append(("ask", "blocked", f.get("agent_stale")
+                        or "no worker, and nothing says why (killed, or the box restarted)"))
     if not settled:                                     # the PR is the harder fact: it outranks any status but a live process
         if pr == "MERGED" and st != "merged":
             out.append(("fix", "merged", "its PR merged"))
@@ -466,8 +573,17 @@ def decide(f):
     # (facts()) and so goes quiet with it. That is acceptable for these rows and no others: the open or merged PR
     # is the evidence the branch reached origin, and `cc rm` refuses a worktree that still holds uncommitted work.
     landed_elsewhere = st == "review" and has_pr and pr in ("OPEN", "MERGED")
-    if not f["wt_exists"] and not finished and word not in QUEUED and not landed_elsewhere:
+    if not f["wt_exists"] and not finished and word not in QUEUED and not f.get("agent") and not landed_elsewhere:
         out.append(("ask", None, "its worktree is gone"))   # a queued track has never been started: it is SUPPOSED to have no worktree
+    # …AND NEITHER HAS A ROW A SESSION IS WORKING IN ITS SUBAGENTS: nothing dispatches such a row, so `ensure_track`
+    # never made it a worktree. The mark flips a `queued` one to `running` above, so `word` leaves QUEUED and this
+    # rule fired on it — every marked row traded one NEEDS YOU line for another, printed and paged on each
+    # 20-minute run, which is the opposite of what the mark is for (review of #242).
+    # IT IS THE MARK THAT SILENCES THIS, NOT A LIVE ONE. A cold mark is still a row nothing ever dispatched, and the
+    # `running` word the mark gave it while it was warm stays on the board after it goes cold: guarding on
+    # `agent_live` meant a row marked while `queued` was reported "marked … 6 h ago, mark expired" AND "its worktree
+    # is gone" on the same run — a second NEEDS YOU line this rule invented for a row that had none before the mark
+    # existed (review of #242, round 2). The cold half is already said once, by the grace rule above.
     # …AND A FINISHED ROW'S BRANCH IS SUPPOSED TO BE GONE. cc-land deletes it on merge, so `origin/<branch>` is
     # absent, branch_unpushed() can only say "cannot tell", and a `.cc/push.err` nothing ever clears turned that
     # into "<repo>/land-queue-retry — its branch is not pushed" about PR #154, which HAD merged: the branch is gone
@@ -562,7 +678,9 @@ def snapshot(rows, limit=0.0):
     the board rather than going blind."""
     return {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "epoch": int(now()),
             "limit_until": int(limit or 0),
-            "tracks": {f"{repo}/{track}": {"state": state, "board": f["status"], "live": bool(f["live"]),
+            "tracks": {f"{repo}/{track}": {"state": state, "board": f["status"],
+                                           # a subagent is alive too — the mark's window is what says so
+                                           "live": bool(f["live"] or f.get("agent_live")),
                                            "waiting_on": who, "why": why,
                                            # seconds since the track's pane last moved: what tells `idle` from `running`
                                            "idle_for": int(f.get("pane_idle") or 0)}
@@ -638,12 +756,13 @@ def board_read(path):
     return board_read.mod.read(path)
 
 
-def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
+def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT_MARK):
     """Every board track, with what the box says about it. Yields (repo, track, board_track, facts)."""
-    live, ppids, workers, loops = procs()
-    tlive, pane_idle = tmux_live(ppids)
+    live, ppids, sessions, workers, loops = procs()
+    tlive, pane_idle, wins = tmux_live(ppids, sessions)
     live |= tlive
     seen, limited = ledger(f"{STATE}/wedged.json"), limit_active()
+    started = limit_started()   # read once: every row's mark is weighed against the same episode
     prs, remotes, t0 = 0, {}, now()
     for fn, d in boards():
         if d is None:
@@ -661,7 +780,13 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED):
             if repo not in remotes:
                 remotes[repo] = has_remote(repo)
             key = f"{repo}/{track}"
+            # cc-board's mark: the window of the session doing this row in a subagent. A SESSION SPEAKS FOR ITS
+            # OWN REPO AND NO OTHER — `cc` names a planning window for its repo, and without that test any window
+            # on the box could hold any repo's row open, which is exactly the reach a shared board must not give.
+            ag = (t.get("agent") or "").strip()
+            ag_live, ag_stale = mark_why(t, wins, repo, t0, mark, started)
             f = {
+                "agent": ag, "agent_live": ag_live, "agent_stale": ag_stale,
                 "repo": repo, "track": track, "status": st, "pr": pr, "kind": t.get("kind") or "track",   # decide() narrows by kind
                 "pr_state": pr_state(repo, pr, net) if ask_pr else ("?" if want_pr and net else None),
                 "live": f"{repo}/{track}" in live, "wt_exists": os.path.isdir(wt),
@@ -774,6 +899,7 @@ def main(argv):
         argv = argv[1:] + ["--no-net"]              # a snapshot is a local read: it must never stall on GitHub
     repos, apply_, notify, as_json, quiet, net, grace, repeat = [], False, False, False, False, True, GRACE, REPEAT
     no_stop, wedged = False, int(os.environ.get("CC_RECONCILE_WEDGED") or WEDGED)   # env: tests do not wait three hours
+    mark = float(os.environ.get("CC_AGENT_MARK_HOURS") or AGENT_MARK / 3600) * 3600
     pend_after = int(os.environ.get("CC_PENDING_ALERT") or PENDING)
     while argv:
         a = argv.pop(0)
@@ -808,7 +934,7 @@ def main(argv):
             print(f"cc-reconcile: no board for '{r}'", file=sys.stderr)
             return 2
     recs, tracks, wedging, snaprows = [], 0, {}, []
-    for repo, track, t, f in facts(repos, net, grace, no_stop, wedged):
+    for repo, track, t, f in facts(repos, net, grace, no_stop, wedged, mark):
         tracks += 1
         if f.get("wedged_now"):
             wedging[f"{repo}/{track}"] = now()          # one strike; the next run 20 min from now decides
@@ -987,6 +1113,10 @@ def selfcheck():
     """The decision table, then one end-to-end run against a throwaway HOME. No network, no Slack, no board
     but its own. Usage: cc-reconcile selfcheck"""
     import tempfile
+    global BOARDS                          # declared once, up top: a later read of it must not predate this
+    # cc-limit's resumed-episode file is pinned somewhere that does not exist, for the whole run: a real limit
+    # that lifted this morning would otherwise decide whether a mark in a fixture below is cold.
+    os.environ["CC_LIMIT_RESUMED"] = os.path.join(tempfile.gettempdir(), "cc-reconcile-selfcheck-no-episode")
     p = f = 0
 
     def ok(name, cond):
@@ -1001,7 +1131,8 @@ def selfcheck():
         d = {"status": "running", "pr": "", "pr_state": None, "live": False, "wt_exists": True,
              "age": 10 ** 6, "grace": GRACE, "journal": (None, ""), "loop_end": "",
              "commit_err": False, "push_err": False, "unpushed": True, "has_remote": True,
-             "limited": False, "loops": [], "workers": [], "pane_idle": 0.0}
+             "limited": False, "loops": [], "workers": [], "pane_idle": 0.0,
+             "agent": "", "agent_live": False, "agent_stale": ""}
         d.update(kw)
         return d
 
@@ -1138,6 +1269,142 @@ def selfcheck():
        snapshot([("r", "t", F(status="running", live=True), "waiting", "person", "which syllabus?")])
        ["tracks"]["r/t"] == {"state": "waiting", "board": "running", "live": True,
                              "waiting_on": "person", "why": "which syllabus?", "idle_for": 0})
+
+    # A SUBAGENT IS NOBODY TO /proc (owner, 2026-09-04: backlog rows run as a planning session's subagents). No
+    # worker, no loop, no window of the track's own — so the row went to NEEDS YOU as "nothing says why" ten
+    # minutes past the grace, and finding 4 of the review on #231 named the same gap.
+    ok("a running row a LIVE session marked as its subagent's work is left alone past the grace, and raises "
+       "no ask — the mark is the only thing on the box that says anybody is on it",
+       decide(F(status="running", agent="@3:900", agent_live=True, age=10 ** 6)) == []
+       and eff(status="running", agent="@3:900", agent_live=True) == "running")
+    ok("…and the moment that session's window is gone the mark counts for nothing: the same row is reported "
+       "abandoned, exactly as it was before any of this",
+       decide(F(status="running", agent="@3:900", agent_live=False))[0][:2] == ("ask", "blocked"))
+    ok("a marked row that is still `queued` or `blocked` is running, and says WHOSE — never 'a worker is in "
+       "its worktree', which is the one thing that is not true of it",
+       decide(F(status="queued", agent="@3:900", agent_live=True))[0] == ("fix", "running", "a live session is doing it in a subagent")
+       and decide(F(status="blocked", agent="@3:900", agent_live=True))[0][:2] == ("fix", "running")
+       and decide(F(status="queued", live=True))[0][2] == "a worker is in its worktree")
+    ok("…AND IT HAS NO WORKTREE: nothing dispatched it, so there is none to be gone, and the mark has to silence "
+       "that rule too — otherwise the row it just made quiet goes back to NEEDS YOU on the same run",
+       decide(F(status="queued", agent="@3:900", agent_live=True, wt_exists=False))
+       == [("fix", "running", "a live session is doing it in a subagent")]
+       and decide(F(status="running", agent="@3:900", agent_live=True, wt_exists=False)) == [])
+    ok("A COLD MARK IS REPORTED WITH ITS AGE, not as 'nothing says why': the row IS unattended, and the one "
+       "thing worth saying about it is that a session took it 9 h ago and never came back",
+       decide(F(status="running", agent="@3:900", agent_stale="marked by a live session 9 h ago, mark expired"))
+       == [("ask", "blocked", "marked by a live session 9 h ago, mark expired")])
+    ok("…AND IT SAYS IT ONCE. A row marked while `queued` was flipped to `running` by the mark, and that word "
+       "outlives the mark: with the worktree rule guarded on a LIVE mark, the same row drew 'mark expired' AND "
+       "'its worktree is gone' 6 h later — a second NEEDS YOU line for a row that had none before it was marked",
+       decide(F(status="running", agent="@3:900", agent_live=False, wt_exists=False,
+                agent_stale="marked by a live session 6 h ago, mark expired"))
+       == [("ask", "blocked", "marked by a live session 6 h ago, mark expired")])
+    # …and the weighing itself, which is what makes a mark cold. ALIVE IS NOT WORKING (owner, 2026-09-01): before
+    # this, a marked row whose subagent died read `running` for as long as the session's window lived — the grace
+    # rule, the worktree ask and cc-pulse's ready list all silent, and idle_session() unable to reach it, because
+    # a marked row has no window of its own to be idle.
+    W, T0 = {"@3:900": "r"}, 1000 * 3600
+    def stamp(secs_ago): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 - secs_ago))
+    ok("a mark made a minute ago holds the row, and one made past the bound does not — with its age in the "
+       "reason, so the run says what happened rather than 'nothing says why'",
+       mark_why({"agent": "@3:900", "agent_at": stamp(60)}, W, "r", T0, AGENT_MARK) == (True, "")
+       and mark_why({"agent": "@3:900", "agent_at": stamp(9 * 3600)}, W, "r", T0, AGENT_MARK)
+       == (False, "marked by a live session 9 h ago, mark expired"))
+    ok("…and a mark with no time on it holds nothing, which is every mark written before this: unreadable is "
+       "'long ago' here as everywhere else, and the row comes back rather than sitting in flight for ever",
+       mark_why({"agent": "@3:900"}, W, "r", T0, AGENT_MARK)[0] is False
+       and mark_why({"agent": "@3:900"}, W, "r", T0, AGENT_MARK)[1] == "marked by a live session, but the mark carries no time")
+    # …AND A USAGE LIMIT ENDS A MARK BEFORE ITS TIME (2026-09-05): the limit killed the subagents mid-row and
+    # their marks read warm for four hours after it lifted. Own fixture: `started` is passed in, so nothing on
+    # the box and no case above decides these.
+    _rz = T0 - 3600.0       # an episode that BEGAN an hour before this run
+    ok("a mark made before a limit that has since lifted is cold whatever its age, and the reason names the "
+       "hour so the row says what happened to it",
+       mark_why({"agent": "@3:900", "agent_at": stamp(5400)}, W, "r", T0, AGENT_MARK, _rz)
+       == (False, "marked before the usage limit that began at "
+                  + time.strftime("%H:%MZ", time.gmtime(_rz)) + " — that subagent died with it"))
+    # THE BAR IS THE START, NOT THE RESET (review of #264): cc-model puts the box on the fallback about a minute
+    # into an episode and it goes on working, so a mark made after that is a subagent that is alive.
+    ok("…while a mark made DURING the episode, once the box was on the fallback, holds its row: the box did not "
+       "stop for the limit, and that subagent is still working",
+       mark_why({"agent": "@3:900", "agent_at": stamp(1800)}, W, "r", T0, AGENT_MARK, _rz) == (True, ""))
+    ok("…and one made at the START second does not: that is the second the limit was first seen in",
+       mark_why({"agent": "@3:900", "agent_at": stamp(3600)}, W, "r", T0, AGENT_MARK, _rz)[0] is False)
+    ok("…and with no episode passed in, the age bound is the whole rule, which is what this file did before",
+       mark_why({"agent": "@3:900", "agent_at": stamp(5400)}, W, "r", T0, AGENT_MARK) == (True, ""))
+    ok("…while a window that is gone, or is another repo's, is refused BEFORE the clock: there is no live "
+       "session to name in the reason, and the row is reported exactly as any unattended row is",
+       mark_why({"agent": "@9:900", "agent_at": stamp(60)}, W, "r", T0, AGENT_MARK) == (False, "")
+       and mark_why({"agent": "@3:900", "agent_at": stamp(60)}, W, "other", T0, AGENT_MARK) == (False, ""))
+    ok("the mark claims a session is alive and nothing else: a declared question still outranks it, and a "
+       "merged row is still merged", decide(F(status="running", agent_live=True, journal=("BLOCKED", "q?")))[0][:2] == ("ask", "waiting")
+       and decide(F(status="merged", agent_live=True, pr="u", pr_state="MERGED")) == [])
+    ok("the snapshot counts a subagent as alive, so `cc ls` and the Home tab say the same thing this run did",
+       snapshot([("r", "t", F(status="running", agent="@3:900", agent_live=True), "running", "", "")])
+       ["tracks"]["r/t"]["live"] is True)
+    # …and the mark itself: the pane listing is read in one pure pass, so the rule can be driven with no server.
+    # 100 is a planning window with a session in it · 101 a track window with one · 104 a window with something
+    # running but NO session (the `tail -f` somebody left) · 999 a pane whose shell has no child at all.
+    P = ["proj\t100\t0\t@1:900", "proj/t1\t101\t0\t@2:900", "proj/t2\t999\t0\t@3:900",
+         "proj\t102\t0\t", "other\t104\t0\t@4:900"]
+    _live, _idle, _wins = panes(P, {"100", "101", "102", "104"}, {"100", "101"})
+    ok("a window an `agent` mark can name is any window a SESSION is in — a planning session's is named for its "
+       "repo alone, so the TRACK filter must not decide this, and the name comes back to be checked against it",
+       _wins == {"@1:900": "proj", "@2:900": "proj/t1"} and _live == {"proj/t1"})
+    ok("A CHILD IN THE PANE IS NOT A SESSION: a window left with a `tail -f` or an `htop` in it after the session "
+       "exited has one for ever, and a mark on it would keep a row alive for ever — it is live for the TRACK "
+       "rule and unusable as a mark, which is the difference the two tests exist for",
+       "@4:900" not in _wins and panes(P, {"104"}, {"104"})[2] == {"@4:900": "other"})
+    ok("…and a pane whose shell has no child is a leftover window, in neither: `cc` leaves one behind an exited "
+       "session (exec bash)", "@3:900" not in _wins and "proj/t2" not in _live)
+    ok("the mark carries the tmux SERVER too, because window ids restart at @0 when the server does — a mark "
+       "left by a session that died in a reboot must not match whatever window is @1 now",
+       "@1:900" in _wins and "@1:901" not in _wins)
+    # THROUGH facts(), off a board FILE, so the field name itself is under test and not just decide()'s reading
+    # of a fact handed to it. procs() and tmux_live() are stood in for; everything between them is the real path.
+    with tempfile.TemporaryDirectory() as tb:
+        _B, _W, _pr, _tl = BOARDS, WTS, procs, tmux_live
+        globals().update(BOARDS=tb, WTS=tb,
+                         procs=lambda: (set(), set(), {"7"}, {}, {}),
+                         tmux_live=lambda ppids, sessions=(): (
+                             set(), {}, {"@5:900": "agentrepo", "@6:900": "otherrepo"}))
+        try:
+            # WTS. t1 AND t4 GET NO WORKTREE ON PURPOSE: nothing dispatches a row a session works in its
+            # subagents, so that is the shape the real row has, warm mark (t1) or cold (t4), and a fixture that
+            # made one for them is what hid the missing-worktree finding through two rounds of #242's review.
+            # t2 and t3 are unmarked rows that really were dispatched, and keep theirs.
+            for tr in ("t2", "t3"):
+                os.makedirs(f"{tb}/agentrepo/{tr}")
+            _fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+            json.dump({"repo": "agentrepo", "tracks": {
+                "t1": {"status": "running", "agent": "@5:900", "agent_at": _fresh, "updated": "2020-01-01T00:00:00Z"},
+                "t2": {"status": "running", "agent": "@6:900", "agent_at": _fresh, "updated": "2020-01-01T00:00:00Z"},
+                "t3": {"status": "running", "updated": "2020-01-01T00:00:00Z"},
+                "t4": {"status": "running", "agent": "@5:900", "agent_at": "2020-01-01T00:00:00Z",
+                       "updated": "2020-01-01T00:00:00Z"}}},
+                open(f"{tb}/agentrepo.json", "w"))
+            got = {tr: fa for _, tr, _, fa in facts(["agentrepo"], net=False)}
+        finally:
+            globals().update(BOARDS=_B, WTS=_W, procs=_pr, tmux_live=_tl)
+        ok("facts() reads the mark off the board file and calls the row alive, worktree or none — the whole "
+           "path, so the field name is under test too and no fixture stands in for the missing worktree",
+           got["t1"]["agent"] == "@5:900" and got["t1"]["agent_live"] is True
+           and got["t1"]["wt_exists"] is False and decide(got["t1"]) == [])
+        ok("A SESSION SPEAKS FOR ITS OWN REPO: a mark naming a window that belongs to another repo holds nothing "
+           "open — the board is one file every session can write, and this is the reach it must not give",
+           got["t2"]["agent_live"] is False and decide(got["t2"])[0][:2] == ("ask", "blocked"))
+        ok("…and an unmarked row is untouched by any of it",
+           got["t3"]["agent"] == "" and got["t3"]["agent_live"] is False
+           and decide(got["t3"])[0][:2] == ("ask", "blocked"))
+        ok("A MARK GOES COLD, and facts() carries the age off the board file to say so — t4's session is the "
+           "same live one holding t1 open, and the only difference between the two rows is the clock. ONE "
+           "record, not two: the row still has no worktree, and a cold mark must not turn that into a second "
+           "finding the row never drew before it was marked",
+           got["t4"]["agent_live"] is False and got["t4"]["wt_exists"] is False
+           and len(decide(got["t4"])) == 1
+           and decide(got["t4"])[0][:2] == ("ask", "blocked")
+           and decide(got["t4"])[0][2].endswith("h ago, mark expired"))
 
     # IDLE — a session open at its prompt is not a session working (owner, 2026-09-01)
     ok("a live pane idle 3 h is `idle`, not running: nothing is happening at it",
@@ -1549,7 +1816,6 @@ def selfcheck():
             except Exception as e: box.append(e)
         t = threading.Thread(target=go, daemon=True); t.start(); t.join(secs)
         return box[0] if box else "hung"
-    global BOARDS
     _b, BOARDS = BOARDS, tempfile.mkdtemp(prefix="cc-reconcile-pipe-")
     try:
         os.mkfifo(f"{BOARDS}/pipe.json")

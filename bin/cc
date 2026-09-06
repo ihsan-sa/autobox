@@ -4,6 +4,7 @@
 #   cc                        attach tmux "main"
 #   cc <repo>                 MAIN/planning session for ~/dev/<repo> (primary worktree, default branch)
 #   cc <repo> <track>         TRACK session: own worktree + branch track/<track>, own context (created on first use)
+#   cc claim <repo> <row> --executor subagent|worker   prepare the track and claim it, without starting a session
 #   cc <repo> <track> --session   …as a long-lived SESSION (board kind=session): a channel, not a task — never reconciled,
 #                             never "done", never RUNNING on the Home tab (e.g. a course-builder's per-course sessions)
 #   cc <repo> <track> --go "instruction" [--loop N] [--budget USD] [--model M]
@@ -28,9 +29,19 @@
 #   cc resume                 menu of every session (mains + tracks) -> pick to reattach/resume
 #   cc ls | cc digest         live windows + board status | full digest (cc digest --notify pushes it)
 #   cc quick [doing|done] "…"  log a small task done without a track (Slack Home shows the last 24 h)
-#   cc done <repo> <track>    push + open a PR into the base branch (nothing auto-merges); on a kind=session row it
-#                             pushes and stops there — a living project has no PR and is never done
+#   cc done <repo> <track>    push + open a PR into the base branch, and post its #approvals card (printing the
+#                             card's `card: <channel> <ts>`); on a kind=session row it pushes and stops there —
+#                             a living project has no PR and is never done. Nothing here merges: for a repo named
+#                             in CC_SELF_LAND_REPOS (~/.cc/config) it is cc-loop that queues the landing
+#   cc done <repo> <track> --json   task receipt on stdout, human lines on stderr. Safe to run again: it retries
+#                             whatever projection is still pending. Nonzero when the delivery or the board write
+#                             did not land — an approval card Slack could not take is pending, not a failure
+#   cc lands <repo>           does that repo hold the standing grant? 0 yes · 1 no · 2 named but member-facing
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
+#   cc rename <old> <new>     rename a project everywhere the box keys by its name: ~/dev, worktrees, state, board,
+#                             ask ledger, its Slack channels (renamed in place, so their history stays), routes, tmux
+#                             windows, config keys and records. GitHub is untouched, and so is prose a person wrote.
+#                             -n first to see the whole list; --stop to stop its live sessions and start them again after
 #   cc board <args>           shared board (cc board show <repo>; --all also shows finished tracks)
 #                             cc -c <repo> [track]  force --continue
 #   cc slack on|off|status|setup|channels|mkchannel <repo>|archive <#chan>|manifest   Slack ↔ sessions (cc-slack): #<repo> reaches that repo's session
@@ -51,14 +62,48 @@ AUTO=(--permission-mode auto)   # every interactive session starts in auto mode,
                                 # A --go worker gets the same mode from cc-loop's own argv.
 worker_model(){ "$BIN/cc-loop" worker-model "${1:-}"; }   # what a --go worker will run on; cc-loop owns that order (--model, then the override, then CC_WORKER_MODEL) and this only names it
 chan_accept(){ [ -f "$SLACKON" ] && { export CC_SLACK_CHANNEL=1; ( "$BIN/cc-slack" accept-dialog "$1" >/dev/null 2>&1 & ); }; return 0; }   # auto-accepts the dev-channels dialog in that tmux window
+start_check(){ ( "$BIN/cc-started" "$@" >/dev/null 2>&1 & ); return 0; }   # …and reads the pane back a minute later: a popup is
+                                # pressed through, a first message that never landed is drained in, a login screen reaches the owner (cc-started).
+                                # Every session this box opens comes up through one of the __run* branches below, so this is the one place it is asked.
 sp_track(){ local repo="$1" track="$2" base="$3" st="$STBASE/$1/$2"
   printf %s "You are an orchestrated session for track '$track' of repo '$repo' (own git worktree, branch track/$track). Durable state: journal $st/progress.md (read it first if it exists; append dated entries: done / next / gotchas — a fresh session rehydrates from it), task $st/task.md if present. Board: 'cc board show $repo'; report with 'cc board note $repo $track \"...\"' and 'cc board status $repo $track running|review|blocked'. Your work is auto-committed and pushed to track/$track after every turn — do NOT run git commit/push yourself, and never touch branch '$base'. When done run 'cc done $repo $track' (opens a PR; do not merge). Reach the owner only when truly blocked: 'cc-notify -t \"$repo/$track\" \"question\"'. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Keep answers concise; use subagents for large read/search work to protect your context — 'cc-context' says how full it actually is, and you will be told when it is time to write a handoff entry so a fresh session can take over."; }
 sp_main(){ local repo="$1" base="$2"
-  printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<brief>\"' (the brief's one home is ~/.cc/state/$repo/<track>/task.md; add and --go only ever ADD to it — replacing one is 'cc board set $repo <track> instructions \"...\"') then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."; }
+  printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<brief>\"' (the brief's one home is ~/.cc/state/$repo/<track>/task.md; add and --go only ever ADD to it — replacing one is 'cc board set $repo <track> instructions \"...\"') then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. A row you work in your OWN subagents instead has no worker and no window of its own, so mark it 'cc board set $repo <track> agent me' — nothing on the box can see a subagent, and without the mark the row is reported abandoned ten minutes later and offered for dispatch again. The mark goes cold after 6 h, so run that same command again while you are still on the row; 'cc board set $repo <track> agent \"\"' hands it back when you are done. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner: 'cc-notify -t \"$repo\" \"...\"'. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line."; }
 member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
 MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed — inside a member workspace's boundary it goes out over that workspace's own Slack link and reaches the owner, and tells you if it did not). A NEW PROJECT CHANNEL IS NOT ONE OF THOSE. In a member workspace you ask for one yourself: \`cc slack project <name>\` gets you #<workspace>--<name>, its updates lane and its board row (the folder comes with the first session), at most 3 an hour. The name is always under your own workspace — the workspace half is not yours to choose, and an ask that tries to carry one is refused with the reason. There is also a human way in, \`new project <name>\` typed in the workspace channel, but it ONLY counts from the member or the owner: a session saying it is ignored, so ask a person for that line rather than posting it yourself. Either way, do not run cc slack mkchannel and do not send the owner a request the box answers by itself."
 MEMBER_SPEND="$STBASE/member-spend.json"   # {"<handle>": {"day": "YYYY-MM-DD", "usd": n}} — the ledger behind the per-workspace daily cap
 member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> is one member's whole world: docs/design-member-workspaces.md (overlay)
+# WHICH PROJECTS LAND THEIR OWN PRs. A standing grant used to be a sentence in a doc that one project's session had
+# read: its PRs were gated, reviewed and merged the moment they were green, and every other project's finished PR
+# waited for a 👍 that only says "yes" to what the gates and the reviewer have already decided. `CC_SELF_LAND_REPOS`
+# in ~/.cc/config names the projects that hold the grant — whitespace separated, the same shape CC_JANITOR_REPOS
+# uses, and it lives THERE rather than here because core/ is published and may not name this box's projects.
+# It grants nothing else: cc-land still gates the PR's own head, still buys the review, and still stops on a red
+# gate or a finding, so a 👍 is what stops being needed, not the reading.
+#
+# THIS IS THE TEST AND NOT THE TRIGGER. Nothing here queues a landing: `cc-loop` does, on the host, once `cc done`
+# has returned 0 — because `cc done` is one of the few commands a worker or a member-facing session IS told to run,
+# and a queue behind it would be the merge cc-guard denies those tiers, under another name. No env var can tell
+# those tiers apart reliably (an interactive track session exports no CC_ROLE; a worker can unset it), so the
+# discriminator is not a variable at all: it is which PROCESS does the queueing. `cc lands <repo>` is this test,
+# exposed so the loop can ask it, and it merely answers.
+#
+# A MEMBER WORKSPACE — and any member-facing repo — IS MEANT TO HOLD IT TOO (owner, 2026-09-05) and cannot yet:
+# exit 2, said out loud rather than dropped, because a grant that silently does nothing is worse than one that is
+# refused. Three host-side pieces are missing, and each is its own change: the gates run the head's own
+# `tests/check.sh` and `tests/selftest.sh` on the HOST as the owner, which there is member-authored code outside
+# the sandbox that exists to contain it; `gh` is called bare, so a PR in the workspace's own repository needs
+# GH_REPO and a token minted for that workspace (cc-gh-token), the way cc-checkpoint already pushes on its behalf;
+# and the deploy half (install.sh, units, restarts) must never run for a repository that is not the box's.
+self_lands(){
+  local r
+  for r in $("$BIN/cc-config" get CC_SELF_LAND_REPOS 2>/dev/null); do
+    [ "$r" = "$1" ] || continue
+    { member_workspace "$1" || member_facing "$DEV/$1"; } && return 2
+    return 0
+  done
+  return 1
+}
 inside(){ [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; }   # set by `cc-sandbox member`, never by hand: this process runs INSIDE a workspace's boundary
 member_credential(){   # $1 handle · $2 track ("" = the main session) — THE HOST'S HALF OF THE CREDENTIAL WALL. A workspace
   # runs only on a credential minted for it at ~/.cc/members/<h>/credentials.json (`cc-sandbox mint <h>` makes one, `cc-sandbox
@@ -207,9 +252,118 @@ default_branch(){   # $1 = ~/dev/<repo>. THE BOARD'S BASE IS THE PROJECT'S: cc-l
   case "$b" in track/*|"") b=main;; esac
   echo "$b"; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]] || { echo "cc: invalid repo/track name '$1' (allowed: ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\$) — no /, no . or .., no leading -"; exit 1; }; }
-lock(){ mkdir -p "$(dirname "$1")"; exec 9>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
+nolink(){   # A TRACK'S STATE DIR AND ITS WORKTREE'S .cc ARE BOUND READ-WRITE into that track's worker sandbox and
+  # into a member workspace, so every name the HOST opens under them is a name somebody in there can replace with a
+  # link to any file the owner can write. Refuse the link instead of writing through it — and the openers below use
+  # `>>`, so even a link that appears after this test is asked truncates nothing. cc-task's regular() and
+  # write_marker() are the same wall in python; cc-board's _open() is it for a board.
+  local p; for p; do [ -L "$p" ] && { echo "cc: $p is a symlink — refused (nothing here writes through a planted name)"; return 1; }; done; return 0; }
+lock(){ mkdir -p "$(dirname "$1")"; nolink "$1" || exit 1; exec 9>>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,26p' "$0"; }
+usage(){ sed -n '2,50p' "$0"; }   # the whole header block, down to the `cc rc` line — bump it when a line is added
+
+# THE CLAIM. A row has one writer at a time, and which one is not a matter of who typed first: cc-task records the
+# owner off the running process and refuses a second live one (bin/cc-task says how it decides). Two steps, and
+# both are here rather than in cc-task because only `cc` knows when the track is ready: `cc-task check` asks the
+# question before anything is written — a refusal costs no brief, no killed window, no worker — and `cc-task claim`
+# takes it once the worktree exists. Between them another owner can only ever get in FIRST, and then the claim
+# below refuses too. The task UUID goes on the marker's third line as a lookup hint; nothing reads authority off it.
+claim_check(){ "$BIN/cc-task" check "$repo" "$track" --executor "$1" || exit 1; }   # $1 = subagent|worker
+claim_track(){   # $1 = subagent|worker
+  local record
+  # cc-task writes the marker as part of claiming — atomically, and refusing a link at a name the worktree's own
+  # session could have planted (write_marker there says why a shell redirect into $wt/.cc is not safe).
+  record=$("$BIN/cc-task" claim "$repo" "$track" --executor "$1") || exit 1
+  "$BOARD" status "$repo" "$track" running >/dev/null || exit 1   # a claimed row is never left queued
+  # PRESENCE, WHICH THE CLAIM IS NOT — until cc-reconcile reads the record (milestone 5) the row still has to
+  # say who is on it in the one language reconcile speaks. A SUBAGENT is no process the box can see, so the
+  # session's own window stands for it, exactly as `cc board set … agent me` has always done; without it the row
+  # is called abandoned ten minutes in and lands on the owner's NEEDS YOU list. Best effort: outside tmux there
+  # is no window to name, and a claim must not fail for want of a mark. A WORKER is a process the box CAN see,
+  # so any mark is cleared — a stale one would hide a worker that died.
+  if [ "$1" = subagent ]; then "$BOARD" set "$repo" "$track" agent me >/dev/null 2>&1 || true
+  else "$BOARD" set "$repo" "$track" agent "" >/dev/null 2>&1 || true; fi
+  TASK_RECORD="$record"
+}
+claim_end(){   # $1 = why this claim is over. A CLAIM IS A RESERVATION, AND SOMETHING HAS TO END IT (review of
+  # #279): cc-task records the owner off the RUNNING process, so a claim nobody hands back holds the row for as
+  # long as that process lives, and every later dispatcher — cc-land's repair round, the documented BLOCKED
+  # recovery — is refused. Only the owner can end its own claim, so this is best effort by design: a claim that
+  # belongs to somebody else stays theirs, and cc-task decides when a stale one may be taken over.
+  local rec cid gen
+  rec="${TASK_RECORD:-}"; [ -n "$rec" ] || rec=$("$BIN/cc-task" show "$repo" "$track" 2>/dev/null) || return 0
+  cid=$(jq -er '.claim.claim_id // empty' <<<"$rec" 2>/dev/null) || return 0
+  gen=$(jq -er '.claim.generation // empty' <<<"$rec" 2>/dev/null) || return 0
+  [ -n "$cid" ] && [ -n "$gen" ] || return 0
+  "$BIN/cc-task" release "$repo" "$track" "$cid" "$gen" --reason "$1" >/dev/null 2>&1 || true
+}
+claim_delivered(){   # …and for a SUBAGENT the thing that ends it is delivery: it has no window and no loop, so
+  # `cc done` is where its turn on the row finishes. Only once the delivery really settled — a push that failed
+  # opened nothing, the work is still the claimer's, and the claim stands so a repair does not land on top of it.
+  case "$("$BOARD" get "$repo" "$track" status 2>/dev/null)" in review|merged|done) claim_end delivered ;; esac
+}
+
+done_write(){ "$BIN/cc-task" "$1" "$repo" "$track" --generation "$done_generation" "${@:2}" >/dev/null || exit 1; }
+done_fail(){ done_write error "$1" "$2"; echo "cc: $2"; exit 1; }
+done_project(){
+  local rec status pr chat ts extra
+  rec=$("$BIN/cc-task" receipt "$repo" "$track") || exit 1
+  if jq -e '.pending.board' <<<"$rec" >/dev/null; then
+    status=$(jq -r '.pending.board.status' <<<"$rec"); pr=$(jq -r '.pending.board.pr // empty' <<<"$rec")
+    if { [ -z "$pr" ] || "$BOARD" set "$repo" "$track" pr "$pr" >/dev/null; } \
+       && "$BOARD" status "$repo" "$track" "$status" >/dev/null; then
+      done_write project board
+    else done_write error board "board projection failed"; fi
+  fi
+  if jq -e '.pending.card' <<<"$rec" >/dev/null; then
+    pr=$(jq -r '.pending.card.url' <<<"$rec")
+    card=$("${CC_SLACK:-$BIN/cc-slack}" post-approval --print-chat "$repo" "$pr" 2>/dev/null); crc=$?
+    read -r chat ts extra <<<"$card"
+    if [ "$crc" = 0 ] && [ -n "$chat" ] && [[ "$ts" =~ ^[0-9]+\.[0-9]+$ ]] && [ -z "$extra" ]; then
+      done_write project card --chat "$chat" --ts "$ts"
+    else done_write error card "approval card pending (post-approval exit $crc)"; fi
+  fi
+  card=$("$BIN/cc-task" receipt "$repo" "$track" | jq -r 'if .card then .card.chat + " " + .card.ts else "" end')
+}
+done_board(){   # Persist the desired result before either service is asked to project it.
+  if [ "$done_managed" = 1 ]; then
+    if [ -n "${2:-}" ]; then
+      local flags=(); { [ -f "$SLACKON" ] || [ -n "${CC_SLACK:-}" ]; } && flags=(--card)
+      done_write pr "$2" "${flags[@]}"; done_write error pr
+    fi
+    if [ "$1" = done ]; then done_write error push; done_write error pr; fi
+    # ONLY A MERGE CLOSES THE TASK. A closed record refuses every later claim, and the two `done` endings below
+    # are a workspace project's ordinary delivery — its branch IS the delivery, and the next `--go` on that row
+    # is normal work, not a new project. Closing them made the row un-dispatchable, recoverable only by `cc rm`,
+    # which deletes the very branch the ending had just called the delivery (review of #280).
+    case "$1" in merged) done_write close merged ;; done) done_write delivered ;; esac
+    done_ready=1
+    done_project
+  else
+    [ -z "${2:-}" ] || "$BOARD" set "$repo" "$track" pr "$2"
+    "$BOARD" status "$repo" "$track" "$1" >/dev/null
+  fi
+}
+done_result(){
+  local rc=$? rec
+  trap - EXIT
+  if [ "$done_managed" = 1 ]; then
+    rec=$("$BIN/cc-task" receipt "$repo" "$track") || exit 1
+    # A failed projection does not leave a builder holding its claim for another model turn.
+    [ "$done_ready" = 0 ] || claim_end delivered
+    if jq -e '(.pending | length) > 0' <<<"$rec" >/dev/null; then
+      # WHICH PENDING PROJECTION IS A FAILURE. The board is this box's own record of the row and cc-loop reads it
+      # to queue the landing, so a row that does not yet say what happened is something a person has to clear.
+      # Slack is outside: an outage there leaves the approval card pending on the record — the PR is real and the
+      # commits stand — and turning that into a stopped loop over a green track is what rule 5 is against.
+      # Anything that failed EARLIER (commit, push, PR) has already said so and exited non-zero on its own.
+      echo "cc: a projection is still pending — safe to run again: cc done $repo $track"
+      jq -e '.pending.board' <<<"$rec" >/dev/null && rc=1
+    fi
+    [ "$done_json" = 0 ] || printf '%s\n' "$rec" >&7
+  else claim_delivered; fi
+  exit "$rc"
+}
 
 ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry if missing
   local repo="$1" track="$2" wt="$WTBASE/$1/$2" branch="track/$2" gcd base
@@ -242,6 +396,21 @@ case "${1:-}" in
   "") ensure_main; attach_main; exit 0 ;;
   -h|--help) usage; exit 0 ;;
   board) shift; exec "$BOARD" "$@" ;;
+  claim)   # prepare the canonical track and claim it — no tmux window, no model, no worker. What a subagent
+    # gets before it starts, and what `--go` does for itself below. The brief is NOT written here: task.md is its
+    # one home and `cc board add`/`set` is how it gets there, so a claim can never quietly become a re-brief.
+    [ "$#" = 5 ] && [ "$4" = --executor ] && [[ "$5" =~ ^(subagent|worker)$ ]] || {
+      echo 'cc claim <repo> <row> --executor subagent|worker'; exit 2; }
+    repo="$2"; track="$3"; executor="$5"
+    valid_name "$repo"; valid_name "$track"   # the exact spelling, before any state or worktree is written
+    wt="$WTBASE/$repo/$track"; st="$STBASE/$repo/$track"
+    [ "$("$BOARD" get "$repo" "$track" kind 2>/dev/null)" != session ] || { echo "cc: a session row has no task to claim"; exit 1; }
+    claim_check "$executor"
+    ensure_track "$repo" "$track"
+    "$BOARD" get "$repo" "$track" instructions >/dev/null 2>&1   # migrates a pre-#94 board copy into the file, once
+    [ -s "$st/task.md" ] || { echo "cc: $st/task.md is empty or missing — put the brief there first (cc board add $repo $track \"<title>\" \"<brief>\")"; exit 1; }
+    claim_track "$executor"
+    printf '%s\n' "$TASK_RECORD"; exit 0 ;;
   slack)  # cc slack on|off|status|setup|channels|mkchannel|manifest|project — Slack ↔ sessions through Claude Code channels (bin/cc-slack, unit cc-slackd)
     case "${2:-status}" in
       on)  mkdir -p ~/.cc/slack; [ -x ~/.cc/slack/venv/bin/python ] || { python3 -m venv ~/.cc/slack/venv && ~/.cc/slack/venv/bin/pip install -q -r "$ROOT/slack/requirements.txt"; }
@@ -297,13 +466,32 @@ case "${1:-}" in
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { echo "no such option"; exit 1; }
     IFS='|' read -r kind a2 a3 <<<"${SEL[$n]}"
     if [ "$kind" = main ]; then ensure_main; tmux select-window -t "$(win_id "$a2")"; attach_main; else exec "$SELF" "$a2" "$a3"; fi; exit 0 ;;
+  lands)
+    # `cc lands <repo>` — the grant TEST, and only the test (self_lands, above): 0 it holds the standing grant · 1 it
+    # does not · 2 it is named but member-facing, which nothing here can land for yet. cc-loop asks it before queueing;
+    # this command queues nothing, merges nothing and writes nothing, so it is safe from any tier that can run `cc`.
+    repo="${2:?repo}"; valid_name "$repo"; self_lands "$repo"; exit $? ;;
   done)
+    done_json=0; done_args=()
+    for arg in "${@:2}"; do case "$arg" in --json) done_json=1 ;; *) done_args+=("$arg") ;; esac; done
+    set -- done "${done_args[@]}"
     repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"
+    done_managed=0; done_ready=0
+    if [ -e "$STBASE/$repo/$track/delivery.json" ] || [ -L "$STBASE/$repo/$track/delivery.json" ]; then
+      done_managed=1
+    fi
+    exec 7>&1
+    [ "$done_json" = 0 ] || { [ "$done_managed" = 1 ] || { echo "cc: --json needs a task record" >&2; exit 1; }; exec 1>&2; }
+    [ "$done_managed" = 0 ] || trap done_result EXIT
     wt="$WTBASE/$repo/$track"; [ -d "$wt" ] || { echo "no worktree for $repo/$track"; exit 1; }
     # Two callers reach this for one track — the loop when the worker writes STATUS: DONE, a session when it finishes by
     # hand — and each used to open its own PR (#24/#25, #29/#30, same head SHA). One at a time, then reuse what is there.
-    mkdir -p "$wt/.cc"; exec 9>"$wt/.cc/done.lock"
+    nolink "$wt/.cc" "$wt/.cc/done.lock" || exit 1; mkdir -p "$wt/.cc"; exec 9>>"$wt/.cc/done.lock"
     flock -w "${CC_DONE_LOCK_WAIT:-600}" 9 || { echo "cc: another 'cc done $repo $track' is still running — nothing opened"; exit 1; }   # CC_DONE_LOCK_WAIT: test hook
+    if [ "$done_managed" = 1 ]; then
+      TASK_RECORD=$("$BIN/cc-task" show "$repo" "$track") || exit 1
+      done_generation=$(jq -er '.claim.generation' <<<"$TASK_RECORD") || exit 1
+    else trap claim_delivered EXIT; fi
     base=$(default_branch "$DEV/$repo"); branch="track/$track"
     rowkind=$("$BOARD" get "$repo" "$track" kind 2>/dev/null)   # a session row is a living project, not a task — see below
     member_gitdir "$repo" "$wt" || exit 1   # BEFORE any git runs in the worktree: a redirected .git is refused, not run (review-156c)
@@ -311,13 +499,29 @@ case "${1:-}" in
     # host-side commit would run as the owner (review-156b) — same pin cc-loop applies to its own git calls
     hp=$(git -C "$DEV/$repo" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$DEV/$repo/.git/hooks";; /*) ;; *) hp="$DEV/$repo/$hp";; esac
     HG=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp")
-    ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" ) || true
+    if [ "$done_managed" = 1 ]; then
+      if jq -e '.closed' <<<"$TASK_RECORD" >/dev/null; then
+        dirty=$(git -C "$wt" status --porcelain --untracked-files=all) || done_fail commit "cannot inspect closed worktree"
+        [ -z "$dirty" ] && [ "$(git -C "$wt" rev-parse HEAD)" = "$(jq -r '.artifact.committed_sha' <<<"$TASK_RECORD")" ] \
+          || done_fail commit "task is closed; new work needs a new task"
+        done_write error commit
+        done_project; echo "closed: $repo/$track (receipt retained)"; exit 0
+      fi
+      ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --commit ) \
+        || done_fail commit "checkpoint failed — no PR opened (see $wt/.cc/checkpoint.err)"
+      dirty=$(git -C "$wt" status --porcelain --untracked-files=all) \
+        || done_fail commit "cannot inspect worktree — no PR opened"
+      [ -z "$dirty" ] && [ "$(git -C "$wt" symbolic-ref --short HEAD)" = "$branch" ] \
+        || done_fail commit "checkpoint left changes uncommitted or HEAD off track — no PR opened"
+      tip=$(git -C "$wt" rev-parse HEAD) || done_fail commit "no committed head"
+      done_write artifact --committed-sha "$tip"; done_write error commit
+    else ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" ) || true; fi
     # WHERE the branch goes is cc-checkpoint's rule and nobody else's: `origin` for the box's own repos, and a
     # member workspace project's OWN repository (made here if it has none) for a workspace. Asking `origin` the
     # question instead sent the PR at whichever repository a workspace happened to wire up first (review of #214).
     rem=$( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --remote 2>/dev/null ) || rem=""
     if member_workspace "$repo" && [ -z "$rem" ] && [ "$rowkind" != session ]; then   # a workspace lives on the box alone: the branch IS the delivery
-      "$BOARD" status "$repo" "$track" done >/dev/null; "$BOARD" note "$repo" "$track" "cc done: no remote, so no PR — the work is on track/$track in ~/dev/$repo" >/dev/null 2>&1 || true
+      done_board done; "$BOARD" note "$repo" "$track" "cc done: no remote, so no PR — the work is on track/$track in ~/dev/$repo" >/dev/null 2>&1 || true
       echo "done: $repo has no remote, so no PR — track/$track is committed in ~/dev/$repo"; exit 0; fi
     if [ -n "$rem" ]; then   # a PR on an un-pushed branch is worse than no PR: stop here and say why
       # cc-checkpoint --push owns the push, lease and all — a worker that rebased its own branch would otherwise be
@@ -325,7 +529,25 @@ case "${1:-}" in
       # lease refuses: something else wrote to the branch. It has already journalled and told the board; do not
       # open a PR over the top of it.
       member_gitdir "$repo" "$wt" || exit 1   # the same wall in front of the push (review-156c)
-      ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --push ) || { echo "cc: push failed — no PR opened (reason above; also in $wt/.cc/push.err)"; exit 1; }
+      ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --push ) || {
+        [ "$done_managed" = 0 ] || done_write error push "push failed — no PR opened"
+        echo "cc: push failed — no PR opened (reason above; also in $wt/.cc/push.err)"; exit 1; }
+    fi
+    if [ "$done_managed" = 1 ]; then
+      [ -n "$rem" ] || done_fail push "no remote — no PR opened"
+      rurl=$(git -C "$wt" remote get-url --push "$rem") || done_fail push "cannot resolve push remote"
+      cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$rurl" "$repo" 2>/dev/null)
+      remote_tip=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote "$rurl" "refs/heads/$branch") \
+        || done_fail push "cannot verify pushed head"
+      tip=$(git -C "$wt" rev-parse HEAD)   # workspace base seeding may have added a commit during push
+      [ "${remote_tip%%$'\t'*}" = "$tip" ] || done_fail push "remote does not hold the committed head"
+      done_write artifact --committed-sha "$tip" --pushed-sha "$tip"; done_write error push
+      slug="$rurl"
+      case "$slug" in
+        https://*|http://*|ssh://*) slug=${slug#*://}; slug=${slug#*@}; slug=${slug%.git} ;;
+        *@*:*) slug=${slug#*@}; slug=${slug/:/\/}; slug=${slug%.git} ;;
+      esac
+      export GH_REPO="$slug"   # gh wants [HOST/]OWNER/REPO; every retry follows the push remote
     fi
     if [ "$rowkind" = session ]; then
       # A SESSION ROW IS A LIVING PROJECT, and alive is its normal state (cc-board's KINDS): no PR, never done. Run
@@ -343,7 +565,7 @@ case "${1:-}" in
       # of "no such branch" takes that ending: an ask that failed (no network, a refused credential) falls through
       # to the PR path, which fails out loud and leaves the row in review, rather than closing the track as done
       # on a note that is not true (review of #214).
-      rurl=$(git -C "$wt" remote get-url "$rem" 2>/dev/null); slug=${rurl%.git}
+      [ "$done_managed" = 1 ] || rurl=$(git -C "$wt" remote get-url "$rem" 2>/dev/null); slug=${rurl%.git}
       case "$slug" in https://*/*/*) slug=${slug#https://}; slug=${slug#*/} ;; *) slug="" ;; esac
       cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$rurl" "$repo" 2>/dev/null)
       # The base is that repository's OWN default branch, asked of it: a workspace's local origin/HEAD is never set
@@ -351,35 +573,71 @@ case "${1:-}" in
       # pattern matches nothing — which took this ending against a repository that did have a main (review of
       # #214). An answered HEAD names the base; an answer with no HEAD is a repository with no branch to open a
       # PR against.
-      symref=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote --symref "$rem" HEAD 2>/dev/null); lsrc=$?
+      query_remote="$rem"; [ "$done_managed" = 0 ] || query_remote="$rurl"
+      symref=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote --symref "$query_remote" HEAD 2>/dev/null); lsrc=$?
+      [ "$done_managed" = 0 ] || [ "$lsrc" = 0 ] || done_fail pr "remote base lookup failed — no PR created"
       rbase=$(sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p' <<<"$symref" | head -1)
       # …and a repository whose default branch IS this track has nothing to open a PR against either: GitHub makes
       # the first branch pushed into an empty repository its default, and a project's first push is its track
       # (measured live 2026-09-04: "PR creation failed", the row left in review, on a repository the box had just made).
       if [ "$lsrc" = 0 ] && { [ -z "$rbase" ] || [ "$rbase" = "$branch" ]; }; then
-        "$BOARD" status "$repo" "$track" done >/dev/null
+        done_board done
         "$BOARD" note "$repo" "$track" "cc done: track/$track is pushed to ${slug:-$rem}, which has no other branch to open a PR against — that branch is the delivery" >/dev/null 2>&1 || true
         echo "done: track/$track is pushed to ${slug:-$rem} — no other branch there to open a PR against"; exit 0; fi
       [ -n "$rbase" ] && base="$rbase"
-      [ -n "$slug" ] && export GH_REPO="$slug"; fi
+      [ "$done_managed" = 1 ] || { [ -n "$slug" ] && export GH_REPO="$slug"; }; fi
     title=$("$BOARD" get "$repo" "$track" title); [ -z "$title" ] && title="$track"
-    instr=$("$BOARD" get "$repo" "$track" instructions)   # the brief, from its one home: $STBASE/$repo/$track/task.md
+    if [ "$done_managed" = 1 ]; then
+      # THE BRIEF COMES FROM ITS ONE HOME, not through the board: a board that cannot be read must not cost a
+      # PR its body. cc-brief's computed IN FLIGHT block is left out, the same two markers cc-board's brief()
+      # strips — it is the box's own annotation and has no business in a PR.
+      [ -f "$STBASE/$repo/$track/task.md" ] || done_fail pr "no brief at $STBASE/$repo/$track/task.md — no PR opened"
+      instr=$(python3 - "$STBASE/$repo/$track/task.md" 2>/dev/null <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+print(re.sub(r"<!-- cc-brief:inflight -->.*?<!-- /cc-brief:inflight -->\n?", "", text, flags=re.S).rstrip("\n"))
+PY
+      ) || done_fail pr "cannot read the brief at $STBASE/$repo/$track/task.md — no PR opened"
+    else instr=$("$BOARD" get "$repo" "$track" instructions); fi
     url=$(cd "$wt" && gh pr list --head "$branch" --state open --json url -q '.[0].url' 2>/dev/null)   # `gh pr view` also returns a MERGED PR and would silently reuse it
+    lrc=$?; [ "$done_managed" = 0 ] || [ "$lrc" = 0 ] || done_fail pr "open PR lookup failed — no PR created"
     if [ -z "$url" ]; then   # no OPEN PR is not the same as no PR: a squash-merge deletes the branch, so the late caller
       tip=$(git -C "$wt" rev-parse "$branch" 2>/dev/null)   # saw nothing open and opened a duplicate of commits already merged
       merged=$(cd "$wt" && gh pr list --head "$branch" --state merged --limit 20 --json url,headRefOid -q "[.[]|select(.headRefOid==\"$tip\")][0].url" 2>/dev/null)
+      lrc=$?; [ "$done_managed" = 0 ] || [ "$lrc" = 0 ] || done_fail pr "merged PR lookup failed — no PR created"
       if [ -n "$merged" ]; then   # same tip, already merged: nothing to review — no second PR and no second approval card
-        "$BOARD" set "$repo" "$track" pr "$merged"; "$BOARD" status "$repo" "$track" merged >/dev/null
+        done_board merged "$merged"
         "$BOARD" note "$repo" "$track" "cc done: $branch was already merged as $merged (no new commits) — no duplicate PR" >/dev/null 2>&1 || true
         echo "already merged: $merged (no commits on $branch beyond it)"
         [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$track" >/dev/null 2>&1
         exit 0
       fi
+      if [ "$done_managed" = 1 ]; then done_write error pr "PR create response pending; retry lookup by repository and head"; fi
       url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$(printf '%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$track" "$repo" "$track")" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
+      crc=$?; [ "$done_managed" = 0 ] || { [ "$crc" = 0 ] && [ -n "$url" ]; } || done_fail pr "PR creation failed or response lost — retry cc done"
     fi
     "$BIN/cc-scope" check "$repo" --track "$track" 2>/dev/null   # 'done' measured against what was asked: the unsettled asks this track was meant to close, printed where the session still sees them. Never fatal — a ledger does not get to block a PR
-    if [ -n "$url" ]; then "$BOARD" set "$repo" "$track" pr "$url"; "$BOARD" status "$repo" "$track" review >/dev/null; echo "PR: $url"; echo "land it with:  cc-land $repo ${url##*/}   (gates, merge, card, board, ledger, install, units, restarts — or just 👍 the card to merge)"; [ -f "$SLACKON" ] && "$BIN/cc-slack" post-approval "$repo" "$url" >/dev/null 2>&1 || true; else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi
-    [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$track" >/dev/null 2>&1   # if that name was an orch with its own channel, it is done: archive it
+    if [ -n "$url" ]; then
+      done_board review "$url"; echo "PR: $url"
+      # The card goes up whichever way this project lands: a project that merges its own PRs still says so in
+      # #approvals, and cc-land edits that same card to `landed ✓` — so the card is posted BEFORE anything queues.
+      # ITS COORDINATES ARE PRINTED (`card: <channel> <ts>`, from post-approval --print-chat) because the queue is
+      # cc-loop's and it needs somewhere to answer: given them, a landing that STOPS marks that very card ✗ and
+      # replies under it, instead of leaving a pending-looking card in #approvals and saying so somewhere else.
+      if [ "$done_managed" = 0 ]; then
+      card=""   # CC_SLACK: test hook, and the reason it also opens the guard below — a suite must be able to drive
+      if [ -f "$SLACKON" ] || [ -n "${CC_SLACK:-}" ]; then   # this line without a Slack token or a card in a real channel
+        card=$("${CC_SLACK:-$BIN/cc-slack}" post-approval --print-chat "$repo" "$url" 2>/dev/null) || card=""; fi
+      fi
+      case "$card" in *[!\ ]\ *[!\ ]*) echo "card: $card" ;; esac
+      prn=${url##*/}; self_lands "$repo"; sl=$?
+      case "$sl" in
+        0)  echo "$repo lands its own PRs (CC_SELF_LAND_REPOS): the loop queues PR #$prn — nothing here does, and nothing waits on a 👍. Started by hand? cc-land queue $repo $prn" ;;
+        2)  echo "cc: $repo is named in CC_SELF_LAND_REPOS but is member-facing — nothing here can land for it yet (self_lands says what is missing). PR #$prn waits for a 👍." ;;
+        *)  echo "land it with:  cc-land $repo $prn   (gates, merge, card, board, ledger, install, units, restarts — or just 👍 the card to merge)" ;;
+      esac
+    else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi
+    [ -f "$SLACKON" ] && "${CC_SLACK:-$BIN/cc-slack}" archive --orch "$repo" "$track" >/dev/null 2>&1   # if that name was an orch with its own channel, it is done: archive it
     exit 0 ;;
   rm)
     repo="${2:?repo}"; track="${3:?track}"; valid_name "$repo"; valid_name "$track"; wt="$WTBASE/$repo/$track"
@@ -389,8 +647,19 @@ case "${1:-}" in
     git -C "$DEV/$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$real"
     git "${GITNH[@]}" -C "$DEV/$repo" worktree prune 2>/dev/null; git -C "$DEV/$repo" branch -D "track/$track" >/dev/null 2>&1 || true
     "$BIN/cc-trust" rm "$wt" >/dev/null 2>&1 || true
-    rm -rf "${STBASE:?}/${repo:?}/${track:?}"; rmdir "$WTBASE/$repo" "$STBASE/$repo" 2>/dev/null   # leave no empty per-repo shells behind
+    # A TASK'S RECEIPT OUTLIVES ITS ROW. Removing the worktree and the board row must not delete the only
+    # task-to-PR mapping the costing has, so the record is retired beside the repo's others rather than kept
+    # where it is: left in place it would also be the closed task a rebuilt row of the same name cannot claim,
+    # and `cc rm` would quietly retire the NAME. Everything else about rm is unchanged.
+    rec="$STBASE/$repo/$track/delivery.json"
+    if [ -f "$rec" ] && [ ! -L "$rec" ]; then
+      tid=$(jq -r '.task_id // empty' "$rec" 2>/dev/null); [ -n "$tid" ] || tid=$(date -u +%Y%m%dT%H%M%SZ)
+      mkdir -p "$STBASE/$repo/.receipts" && mv -f "$rec" "$STBASE/$repo/.receipts/$track.$tid.json"
+    fi
+    rm -rf "${STBASE:?}/${repo:?}/${track:?}"
+    rmdir "$WTBASE/$repo" "$STBASE/$repo" 2>/dev/null   # leave no empty per-repo shells behind (never .receipts)
     "$BOARD" rm "$repo" "$track" >/dev/null 2>&1; echo "removed $repo/$track (remote branch, if pushed, left intact)"; exit 0 ;;
+  rename) shift; exec "$BIN/cc-rename" "$@" ;;   # cc rename <old> <new> [-n] [--stop] — one tool owns the dozen places a project's name is a key
   handoff)   # ONE OWNER: every phase of a handoff lives in cc-handoff (review rec #8), including the
     # stop-then-restart sequence that used to be spelled out right here. `cc handoff` is the spelling, not the
     # implementation — so the overlap, the deadline, the old path and the sweep are all read in one file.
@@ -401,7 +670,7 @@ case "${1:-}" in
     repo="$2"; track="$3"; force_cont="${4:-}"; wt="$WTBASE/$repo/$track"; st="$STBASE/$repo/$track"; cd "$wt" || exit 1
     sid=$("$BOARD" get "$repo" "$track" session_id); started=$("$BOARD" get "$repo" "$track" started); base=$(default_branch "$DEV/$repo")
     sp=$(sp_track "$repo" "$track" "$base")
-    args=(--append-system-prompt "$sp" --remote-control "$repo/$track"); mapfile -t CH < <(chan_args "$repo/$track"); args+=("${CH[@]}"); chan_accept "$repo/$track"
+    args=(--append-system-prompt "$sp" --remote-control "$repo/$track"); mapfile -t CH < <(chan_args "$repo/$track"); args+=("${CH[@]}"); chan_accept "$repo/$track"; start_check "$repo/$track"
     mapfile -t MO < <(model_args); args+=("${MO[@]}")
     # a session id whose transcript is gone (crash before the first write, or the 30-day prune) makes --resume fail forever: mint a fresh one instead
     [ "$started" = True ] && ! compgen -G "$HOME/.claude/projects/*/$sid.jsonl" >/dev/null 2>&1 && { sid=""; "$BOARD" note "$repo" "$track" "session transcript missing — new session id" >/dev/null 2>&1; }
@@ -412,6 +681,10 @@ case "${1:-}" in
     "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
     "$CLAUDE" "${AUTO[@]}" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmember)  # internal: a MEMBER WORKSPACE session — the host side. Board and dialog bookkeeping here; claude inside cc-sandbox member.
+    if [ "${CC_MEMBER_V2:-}" = 1 ]; then
+      # Branch before cd, Git, board writes, and legacy session bookkeeping.
+      exec "$BIN/cc-sandbox" member "$2" "${3:-$2}" -- "$CLAUDE" "${AUTO[@]}"
+    fi
     repo="$2"; track="${3:-}"; force_cont="${4:-}"; export CC_ROLE=member; args=()
     if [ -n "$track" ]; then wt="$WTBASE/$repo/$track"; cd "$wt" || exit 1; win="$repo/$track"; sp="$(sp_track "$repo" "$track" "$(default_branch "$DEV/$repo")") $MEMBER_SP $MEMBER_WS_SP"
       sid=$("$BOARD" get "$repo" "$track" session_id); started=$("$BOARD" get "$repo" "$track" started)
@@ -422,7 +695,7 @@ case "${1:-}" in
            args+=(--session-id "$sid"); "$BOARD" set "$repo" "$track" started true; fi
       "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
     else cd "$DEV/$repo" || exit 1; win="$repo"; sp="$(sp_main "$repo" "$(default_branch "$DEV/$repo")") $MEMBER_SP $MEMBER_WS_SP"; fi
-    args+=(--append-system-prompt "$sp"); mapfile -t CH < <(chan_args "$win"); args+=("${CH[@]}"); chan_accept "$win"; mapfile -t MO < <(model_args); args+=("${MO[@]}")   # no --remote-control: a member session is not on the owner's phone
+    args+=(--append-system-prompt "$sp"); mapfile -t CH < <(chan_args "$win"); args+=("${CH[@]}"); chan_accept "$win"; start_check "$win"; mapfile -t MO < <(model_args); args+=("${MO[@]}")   # no --remote-control: a member session is not on the owner's phone
     "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runnext)  # internal: the SUCCESSOR of an overlapping handoff (cc-handoff --overlap started this window)
     target="$2"; hid="$3"; sid="$4"; repo="${target%%/*}"; track=""; [ "$target" != "$repo" ] && track="${target#*/}"
@@ -438,25 +711,26 @@ case "${1:-}" in
     # The successor's window is "$target~next", not "$target": accepting in the latter pressed keys at the
     # PREDECESSOR (harmless — it is long past its dialog) and left this session parked on its own.
     mapfile -t CH < <(chan_args "$target"); mapfile -t MO < <(model_args); chan_accept "${CC_HANDOFF_WINDOW:-$target}"
+    start_check "${CC_HANDOFF_WINDOW:-$target}" --quiet   # --quiet: cc-handoff's kick is already waiting this window out and alerts on it
     "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$target" --session-id "$sid" "${CH[@]}" "${MO[@]}"
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runmain)  # internal: planning session in the primary worktree
     repo="$2"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp=$(sp_main "$repo" "$base")
-    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"; start_check "$repo"
     member_facing "$DEV/$repo" && { export CC_ROLE=member; sp="$sp $MEMBER_SP"; }   # convenience only — the marker is what cc-guard actually reads
     "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
     repo="$2"; alias="$3"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp="You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d, and every thread in your OWN channel (#<parent>-$alias-<id>, created for you — no @ needed there; your replies land wherever the message came from). Dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR); an orch you spawn with 'cc $repo --orch <alias> \"<brief>\"' gets its own channel under yours. Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'."
     export CC_SLACK_ALIAS="$alias"
-    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo@$alias"
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo@$alias"; start_check "$repo@$alias"
     "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}"
     [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$alias" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runplain)  # internal: plain session in a folder that is not a git repo
     repo="$2"; cont="${3:-}"; cd "$DEV/$repo" || exit 1
-    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"
+    mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo"; start_check "$repo"
     MF=(); member_facing "$DEV/$repo" && { export CC_ROLE=member; MF=(--append-system-prompt "$MEMBER_SP"); }   # a member-facing folder need not be a git repo
     "$CLAUDE" "${AUTO[@]}" ${cont:+--continue} --remote-control "$repo" "${CH[@]}" "${MO[@]}" "${MF[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
 esac
@@ -495,6 +769,10 @@ fi
 ensure_track "$repo" "$track"; win="$repo/$track"; wt="$WTBASE/$repo/$track"; st="$STBASE/$repo/$track"
 mode=""; text=""; LOOPN=1; XTRA=(); SESS=""
 while [ $# -gt 0 ]; do case "$1" in --go|--say) mode="${1#--}"; text="${2:-}"; shift;; --loop) LOOPN="$2"; shift;; --budget|--model|--effort|--turns) XTRA+=("$1" "$2"); shift;; --resume-last|--no-extend) XTRA+=("$1");; --session) SESS=1;; *) echo "cc: unknown option $1"; exit 1;; esac; shift; done
+CLAIM=""   # a headless worker is one of the two executors, so it claims the row the same way
+if [ "$mode" = go ] && [ -z "$SESS" ] && ! inside && [ "$("$BOARD" get "$repo" "$track" kind 2>/dev/null)" != session ]; then
+  CLAIM=1; claim_check worker   # asked BEFORE the brief is written and the live window is killed; taken below, once
+fi
 # --session marks the row's KIND (cc-board KINDS): a channel-like session with no task to finish — cc-reconcile leaves
 # its status alone and the Home tab groups it under its repo instead of counting it as running. Idempotent; a row that
 # was made a session by hand (`cc board set <repo> <name> kind session`) opens the same way without the flag.
@@ -518,6 +796,7 @@ case "$mode" in
        # reads it first. Replacing a brief stays an explicit act (`cc board set … instructions`), never a side
        # effect of dispatching. Regression tests: "the #71 case" in selftest.sh, and `cc-board selfcheck`.
        write_brief || exit 1
+       [ -n "$CLAIM" ] && claim_track worker   # the claim exists before the worker can write a line
        for pid in $(pgrep -f -- '--max-budget-usd' 2>/dev/null); do   # a previous loop killed by hand can leave claude re-parented to systemd, still writing this worktree
          [ "$(readlink -f /proc/$pid/cwd 2>/dev/null)" = "$(readlink -f "$wt")" ] || continue
          echo "cc: killing orphaned worker pid $pid in $wt" | tee -a "$st/loop.log"
@@ -536,6 +815,7 @@ case "$mode" in
        else
          tmux new-window -d -t "$SESSION" -n "$win" -c "$wt" "$(printf '%sCC_CLAUDE=%q %q %q %q --max-iter %q%s; echo; echo %q; exec bash' "$pre" "$CLAUDE" "$BIN/cc-loop" "$repo" "$track" "$LOOPN" "$xq" '[worker finished — shell stays]')"
        fi
+       [ -n "$CLAIM" ] && claim_end "worker launched"   # the window is up: the loop owns the row from here, not this process
        wm=""; k=0; while [ "$k" -lt "${#XTRA[@]}" ]; do [ "${XTRA[$k]}" = --model ] && wm="${XTRA[$((k+1))]:-}"; k=$((k+1)); done
        unlock; echo "worker started on $(worker_model "$wm") in tmux main:$win — watch: cc $repo $track ; log: $st/loop.log"; exit 0 ;;
 esac

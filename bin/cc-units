@@ -6,21 +6,74 @@
 #   cc-units link                      the unit filenames to symlink (all of them)
 #   cc-units enable                    unit<TAB>start, for the rows the installer switches on
 #   cc-units check                     is-enabled/is-active/list-timers vs the manifest; one line, exit 1 on a fault
-#   cc-units restart-for <path…>       unit<TAB>restart|rearm|owner for the units a change touches
+#   cc-units restart-for [--root <dir>] <path…>
+#                                      unit<TAB>restart|rearm|owner|none for the units a change touches
 #   cc-units policy <unit> <field>     one cell, for anything that wants a single answer
 #   cc-units selfcheck                 the manifest's own invariants, against no live systemd at all
 # `restart-for` is the answer to "a .timer edit is invisible to an ExecStart-basename test": a changed OnCalendar
 # needs the timer RESTARTED and re-armed, and `daemon-reload` alone leaves it with `Trigger: n/a` — no next run.
+# It is also the answer to a unit whose code is a DIRECTORY: its row's `paths` say which files are its, because an
+# ExecStart-basename test sees one entry point and misses the package behind it (a merged dashboard sat on the
+# previous version's process for want of that, 2026-09-06). A path is relative to the tree that declares it, and
+# --root says which tree is being landed — so another repo's `dashboard/` is not this box's.
 set -uo pipefail
 R="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 M="${CC_UNITS_MANIFEST:-$R/config/units.json}"
 UD="${CC_UNITS_DIR:-$R/config/systemd-user}"
-USAGE="usage: cc-units list|link|enable|check|restart-for <path…>|policy <unit> <field>|selfcheck"
+# A box may keep this tree as `core/` inside a private repo — the overlay — with user units of its own. install.sh
+# links those by glob and the owner switches them on, but a landing still has to know which of them a change
+# touched, so the overlay declares them in its own config/units.json, read HERE and nowhere else. Setting
+# CC_UNITS_OVERLAY to the empty string turns that off (the selfcheck's fixtures run against no overlay at all).
+OVD=""; [ "$(basename "$R")" = core ] && OVD="$(cd "$R/.." && pwd)"
+OV="${CC_UNITS_OVERLAY-$OVD}"
+USAGE="usage: cc-units list|link|enable|check|restart-for [--root <dir>] <path…>|policy <unit> <field>|selfcheck"
 command -v jq >/dev/null 2>&1 || { echo "cc-units: jq is missing" >&2; exit 2; }
 [ -f "$M" ] || { echo "cc-units: no manifest at $M" >&2; exit 2; }
 
 rows(){ jq -r '.units[] | [.unit, .enable, .start, .health, .restart] | @tsv' "$M"; }
 cell(){ jq -r --arg u "$1" --arg f "$2" '.units[] | select(.unit==$u) | .[$f] // ""' "$M"; }
+CT="$(cd "$(dirname "$M")/.." && pwd)"   # the tree $M describes — its rows' paths are relative to this
+ROOT="${OV:-$CT}"                        # …and so is a changed path handed to restart-for, unless --root says otherwise
+
+# every manifest a landing reads: tree<TAB>manifest<TAB>unit-dir. The core one, and the overlay's own where a box
+# keeps one. Only these two — a manifest is a tree's declaration about its own units, never another tree's.
+manifests(){
+  printf '%s\t%s\t%s\n' "$CT" "$M" "$UD"
+  [ -n "$OV" ] && [ -f "$OV/config/units.json" ] && [ "$OV/config/units.json" != "$M" ] &&
+    printf '%s\t%s\t%s\n' "$OV" "$OV/config/units.json" "$OV/config/systemd-user"
+  return 0
+}
+
+# …and every one of them must PARSE before a landing believes an empty answer. jq writes its complaint to stderr
+# and carries on, so a manifest with a typo in it reads as "this tree declares no unit at all" — which is the
+# silent guess this whole field exists to stop. Non-zero here, and one line saying which file.
+lint_manifests(){
+  local t m d bad=0
+  while IFS=$'\t' read -r t m d; do
+    jq -e . "$m" >/dev/null 2>&1 || { echo "cc-units: $m is not valid json — nothing can be told what to restart" >&2; bad=1; }
+  done < <(manifests)
+  return "$bad"
+}
+
+# unit<TAB>restart<TAB>unit-dir<TAB>declared paths, for the manifests INSIDE the tree being landed. Each declared
+# path comes out already prefixed with where its own tree sits in that repo — "core/" for a core tree inside an
+# overlay, nothing for the overlay itself — so one declared path reads the same in a bare clone and in an overlay.
+# The prefix is glued on in jq rather than sent as a field of its own: tab is IFS whitespace, so an empty field
+# would collapse into the next one and every path would arrive as the prefix.
+prows(){
+  local t m d p
+  while IFS=$'\t' read -r t m d; do
+    case "$t" in
+      "$ROOT")   p="" ;;
+      "$ROOT"/*) p="${t#"$ROOT"/}/" ;;
+      *)         continue ;;   # a manifest outside this repo declares nothing about this repo's files
+    esac
+    # `?` for a row that names no restart policy: it is not `none`, so the selfcheck's vocabulary case says so
+    jq -r --arg d "$d" --arg p "$p" \
+       '.units[] | [.unit, (.restart // "?"), $d, ((.paths // []) | map($p + .) | join(" "))] | @tsv' "$m"
+  done < <(manifests)
+  return 0
+}
 sc(){ systemctl --user "$@" 2>&1; }   # never fails the caller: an is-* answer is the value, not the exit code
 
 # ---- check: what the audit asks. Every `required` row must be enabled and healthy; an `owner` row is checked
@@ -56,31 +109,44 @@ check(){
   echo "user units — all $n enabled, active and armed as config/units.json declares"
 }
 
-# ---- restart-for: the landing's policy. A unit is touched when the change edits ITS OWN unit file, or any file
-# its Exec* lines run. `restart` and `rearm` are done by the landing; `owner` is recorded and left alone.
+# ---- restart-for: the landing's policy. A unit is touched when the change edits ITS OWN unit file, any file its
+# Exec* lines run, or anything under a path its row declares. `restart` and `rearm` are done by the landing;
+# `owner` is recorded and left alone; `none` is SAID rather than filtered out, because the landing runs a name test
+# of its own and a policy it never hears cannot stop it — a boot oneshot with RemainAfterExit=yes reads active, and
+# restarting it re-does the whole boot job.
 restart_for(){
-  local u en st he re f b changed=" " ln tok hit
-  for f in "$@"; do changed="$changed$(basename -- "$f") "; done
-  while IFS=$'\t' read -r u en st he re; do
-    [ -n "$u" ] && [ "$re" != none ] || continue
+  local u re d pa f b names=" " changed=" " ln tok hit
+  lint_manifests || return 2      # an unreadable manifest is an ANSWER the caller must not get: exit non-zero
+  for f in "$@"; do names="$names$(basename -- "$f") "; changed="$changed$f "; done
+  while IFS=$'\t' read -r u re d pa; do
+    [ -n "$u" ] || continue
     hit=0
-    case "$changed" in *" $u "*) hit=1 ;; esac                       # the unit file itself moved (a .timer schedule change)
-    if [ "$hit" = 0 ] && [ -f "$UD/$u" ]; then
+    case "$names" in *" $u "*) hit=1 ;; esac                         # the unit file itself moved (a .timer schedule change)
+    if [ "$hit" = 0 ] && [ -n "$pa" ]; then                          # a path the row declares: the unit IS that directory
+      for tok in $pa; do
+        tok="${tok%/}"
+        case "$changed" in *" $tok "*|*" $tok"/*) hit=1 ;; esac      # the file itself, or anything under it
+      done
+    fi
+    if [ "$hit" = 0 ] && [ -f "$d/$u" ]; then
       while IFS= read -r ln; do
-        for tok in $ln; do case "$tok" in */*) b=$(basename -- "$tok"); case "$changed" in *" $b "*) hit=1 ;; esac ;; esac; done
-      done < <(sed -n 's/^Exec[A-Za-z]*=//p' "$UD/$u")
+        for tok in $ln; do case "$tok" in */*) b=$(basename -- "$tok"); case "$names" in *" $b "*) hit=1 ;; esac ;; esac; done
+      done < <(sed -n 's/^Exec[A-Za-z]*=//p' "$d/$u")
     fi
     [ "$hit" = 1 ] && printf '%s\t%s\n' "$u" "$re"
-  done < <(rows)
+  done < <(prows)
   return 0   # the loop's status is the last row's `&&`, so a final unmatched row would report failure: no match is not an error
 }
 
 selfcheck(){
-  local n=0 f=0 u en st he re out
+  local n=0 f=0 u en st he re out d pa tok T
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a check that PRINTS (jq -e) must not leak into the verdict
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }  # …and one that must NOT hold
   k "$(t jq -e . "$M")" "manifest is valid json"
+  # …and so is every manifest a landing reads, the overlay's own included — nothing else lints that one on a
+  # bare box, and unreadable it would declare no unit at all without saying so
+  k "$(t lint_manifests)" "every manifest a landing reads is valid json"
   k "$(t test "$(rows | wc -l)" -gt 0)" "manifest has rows"
   # every declared unit exists, and every unit file is declared: adding a file without a row must FAIL, loudly
   out=""; while IFS=$'\t' read -r u _; do [ -f "$UD/$u" ] || out="$out $u"; done < <(rows)
@@ -114,10 +180,62 @@ selfcheck(){
   out=$(restart_for core/bin/cc-rc)
   k "$(t grep -qx 'tmux-main.service	owner' <<<"$out")" "the shared tmux server is reported as the owner's action, never restarted"
   out=$(restart_for core/bin/cc-digest)
-  k "$(t test -z "$out")" "a timer-driven oneshot's script needs no restart — its next firing picks it up"
+  k "$(t grep -qx 'cc-digest.service	none' <<<"$out")" "a timer-driven oneshot's script comes back as none, said out loud rather than omitted — silence is what lets the caller's own name test restart it anyway"
   # a caller gates on this: "nothing to restart" must exit 0, or every landing that touches no unit reads as failed
-  "$0" restart-for core/bin/cc-digest >/dev/null 2>&1; k $? "…and exits 0 saying so"
+  out=$(restart_for core/docs/DESIGN.md)
+  k "$(t test -z "$out")" "a change no row and no ExecStart names comes back empty"
+  "$0" restart-for core/docs/DESIGN.md >/dev/null 2>&1; k $? "…and exits 0 saying so"
   "$0" restart-for core/config/systemd-user/cc-digest.timer >/dev/null 2>&1; k $? "restart-for exits 0 when it does match"
+
+  # ---- a unit whose code is a DIRECTORY, in a fixture tree shaped like a box: a core tree inside an overlay, each
+  # with its own manifest. This is the case that went wrong on 2026-09-06 — a merged change moved a server's modules
+  # and web assets, its ExecStart file did not move, and the deploy left the old process serving the new version.
+  T=$(mktemp -d)
+  mkdir -p "$T/core/config/systemd-user" "$T/config/systemd-user" "$T/elsewhere"
+  cat > "$T/core/config/units.json" <<'J'
+{ "units": [ { "unit": "tool.service", "enable": "required", "start": "now", "health": "active", "restart": "restart" } ] }
+J
+  cat > "$T/config/units.json" <<'J'
+{ "units": [ { "unit": "dash.service",  "restart": "restart", "paths": ["dashboard", "bin-private/dashsrc"] },
+             { "unit": "quiet.service", "restart": "restart", "paths": ["quiet"] } ] }
+J
+  printf '[Service]\nExecStart=%%h/bin/tool run\n' > "$T/core/config/systemd-user/tool.service"
+  # its ExecStart names NOTHING the cases below change: every hit on this unit is a declared path's doing
+  printf '[Service]\nExecStart=%%h/bin/dashd --foreground\n' > "$T/config/systemd-user/dash.service"
+  rf(){ CC_UNITS_MANIFEST="$T/core/config/units.json" CC_UNITS_DIR="$T/core/config/systemd-user" \
+        CC_UNITS_OVERLAY="$T" "$0" restart-for "$@"; }
+  out=$(rf dashboard/server.py dashboard/web/app.js docs/note.md)
+  k "$(t grep -qx 'dash.service	restart' <<<"$out")" "a change under a unit's declared directory restarts it, with its ExecStart file untouched"
+  k "$(nt grep -q 'quiet.service' <<<"$out")" "…and a unit whose declared paths did not change is left alone"
+  out=$(rf bin-private/dashsrc)
+  k "$(t grep -qx 'dash.service	restart' <<<"$out")" "a declared path that is a FILE counts too, not only a directory"
+  out=$(rf docs/note.md README.md dashboardish.md)
+  k "$(t test -z "$out")" "a change outside every declared path restarts nothing — and a declared path matches at a / , not as a string prefix"
+  out=$(rf core/bin/tool)
+  k "$(t grep -qx 'tool.service	restart' <<<"$out")" "the core tree's own rows still answer for the file their ExecStart runs, from inside an overlay"
+  out=$(rf --root "$T/elsewhere" dashboard/server.py core/bin/tool)
+  k "$(t test -z "$out")" "…and landing ANOTHER repo restarts none of them: a path is declared relative to the tree that declares it"
+  # a manifest with a typo in it must not read as "this tree declares nothing": jq complains on stderr and keeps
+  # going, and an empty answer that exits 0 is what a landing believes
+  printf '{ this is not valid json\n' > "$T/config/units.json"
+  out=$(rf dashboard/server.py 2>&1); re=$?
+  k "$(t test "$re" -ne 0)" "an unreadable overlay manifest exits non-zero — an empty answer here is a landing's silent guess"
+  k "$(t grep -q 'not valid json' <<<"$out")" "…and says which file, on stderr"
+  rm -rf "$T"; unset -f rf
+
+  # the rows a landing reads — the overlay's included — must name a policy it knows, and declare plain relative paths
+  out=""; while IFS=$'\t' read -r u re d pa; do
+    case "$re" in restart|rearm|owner|none) ;; *) out="$out $u:restart=$re";; esac
+    for tok in $pa; do case "$tok" in /*|*..*|*'*'*|*'?'*) out="$out $u:paths=$tok";; esac; done
+  done < <(prows)
+  k "$(t test -z "$out")" "every row a landing reads names a restart policy, over plain relative paths —${out:- all do}"
+  # …and on a box that keeps an overlay, a unit file of its own with no row has no restart policy at all, which is
+  # exactly how a landing leaves a merged change on the old process.
+  if [ -n "$OV" ] && [ -f "$OV/config/units.json" ]; then
+    out=""; for u in "$OV"/config/systemd-user/*; do [ -f "$u" ] || continue
+      jq -r '.units[].unit' "$OV/config/units.json" | grep -qxF "$(basename "$u")" || out="$out $(basename "$u")"; done
+    k "$(t test -z "$out")" "every overlay unit file has a row in the overlay manifest —${out:- none missing}"
+  fi
   # an unlinked unit is a fault even for a `timer` row, which every other test skips
   out=$(CC_UNITS_LINKDIR="$UD/no-such-link-dir" check 2>&1)   # a path that cannot exist: no temp dir to leak
   k "$(t grep -q 'cc-digest.service=unlinked' <<<"$out")" "an unlinked timer-driven .service is reported, not skipped"
@@ -144,7 +262,13 @@ case "${1:-}" in
   link)        rows | cut -f1 ;;
   enable)      rows | awk -F'\t' '$2=="required"{print $1"\t"$3}' ;;
   check)       check ;;
-  restart-for) shift; [ $# -gt 0 ] || { echo "$USAGE" >&2; exit 2; }; restart_for "$@" ;;
+  restart-for) shift
+               if [ "${1:-}" = --root ]; then     # the tree being landed: a path is declared relative to it
+                 [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }
+                 ROOT="$(cd "$2" 2>/dev/null && pwd)" || { echo "cc-units: no such --root: $2" >&2; exit 2; }
+                 shift 2
+               fi
+               [ $# -gt 0 ] || { echo "$USAGE" >&2; exit 2; }; restart_for "$@" ;;
   policy)      [ $# -eq 3 ] || { echo "$USAGE" >&2; exit 2; }; cell "$2" "$3" ;;
   selfcheck)   selfcheck ;;
   *)           echo "$USAGE" >&2; exit 2 ;;

@@ -37,9 +37,12 @@ norm(){ local c=$1; c=${c//\$\{HOME\}/$HOME}; c=${c//\$HOME/$HOME}; case $c in \
         printf '%s' "$c" | tr -s ' \t' ' ' | sed 's/^ *//; s/ *$//'; }
 want_hooks(){ jq -r '.hooks[] | [.event, (.matcher // ""), .command, (.why // "")] | join("\u001f")' "$M"; }
 want_deny(){ jq -r '.deny[]' "$M"; }
+want_statusline(){ jq -r '.statusLine.command // empty' "$M"; }         # one line, or none: a scalar, not an array
+want_statusline_why(){ jq -r '.statusLine.why // empty' "$M"; }
 live_hooks(){ jq -r '(.hooks // {}) | to_entries[] as $e | $e.value[]? | (.matcher // "") as $m
                      | (.hooks // [])[] | select(.type == "command") | [$e.key, $m, .command] | join("\u001f")' "$S" 2>/dev/null; }
 live_deny(){ jq -r '(.permissions.deny // [])[]' "$S" 2>/dev/null; }
+live_statusline(){ jq -r '.statusLine.command // empty' "$S" 2>/dev/null; }
 
 # add_hook <file> <event> <matcher> <command> — the ONE mutation this command can make, on stdout. It only ever
 # assigns under `.hooks`: no path in it names `.permissions`, and apply proves that against its own output too.
@@ -50,13 +53,19 @@ add_hook(){ jq --arg ev "$2" --arg m "$3" --arg c "$4" '
       else .hooks[$ev] += [ (if $m == "" then {hooks:[{type:"command", command:$c}]}
                                          else {matcher:$m, hooks:[{type:"command", command:$c}]} end) ] end
   ' "$1"; }
+# set_statusline <file> <command> — the OTHER mutation apply() can make. Runs only when scan() found
+# .statusLine absent: an owner's own different command is never overwritten — scan() reports it as SL_CUSTOM
+# instead of MISSING, so this never runs against one.
+set_statusline(){ jq --arg c "$2" '.statusLine = {type:"command", command:$c}' "$1"; }
 
-# scan sets MISSING (one row per unapplied entry: "hook<US>event<US>matcher<US>command<US>why", or
-# "deny<US>rule", or "absent<US>path") and UNRELATED (lines outside the subset — context, never a fault).
-MISSING=""; UNRELATED=0
+# scan sets MISSING (one row per unapplied entry: "hook<US>event<US>matcher<US>command<US>why",
+# "deny<US>rule", "statusline<US>command<US>why", or "absent<US>path"), UNRELATED (lines outside the
+# subset — context, never a fault), and SL_CUSTOM (the owner's own statusLine command, when it differs
+# from the manifest's — satisfied, never flagged as drift, never written over).
+MISSING=""; UNRELATED=0; SL_CUSTOM=""
 scan(){
-  MISSING=""; UNRELATED=0
-  local ev m cmd why rule found lev lm lcmd live ld n
+  MISSING=""; UNRELATED=0; SL_CUSTOM=""
+  local ev m cmd why rule found lev lm lcmd live ld n sl_want sl_live
   [ -f "$S" ] || { MISSING="absent$US$S"; return; }
   live=$(live_hooks)
   while IFS=$US read -r ev m cmd why; do
@@ -72,6 +81,12 @@ scan(){
     [ -n "$rule" ] || continue
     grep -qxF "$rule" <<<"$ld" || MISSING+="deny$US$rule"$'\n'
   done < <(want_deny)
+  sl_want=$(want_statusline)
+  if [ -n "$sl_want" ]; then
+    sl_live=$(live_statusline)
+    if [ -z "$sl_live" ]; then MISSING+="statusline$US$sl_want$US$(want_statusline_why)"$'\n'
+    elif [ "$(norm "$sl_live")" != "$(norm "$sl_want")" ]; then SL_CUSTOM=$sl_live; fi
+  fi
   n=$(diff <(jq -S . "$DEF" 2>/dev/null) <(jq -S . "$S" 2>/dev/null) 2>/dev/null | grep -c '^[<>]')
   UNRELATED=${n:-0}
 }
@@ -79,19 +94,19 @@ miss_of(){ grep "^$1$US" <<<"$MISSING"; }   # never matches when MISSING is empt
 
 # one line the owner can act on, and an exit code the caller can gate on
 check(){
-  local kind a hooks="" denies=""
+  local kind a hooks="" denies="" sl=""
   scan
   if miss_of absent >/dev/null; then echo "settings — $S does not exist (run install.sh once)"; return 1; fi
   while IFS=$US read -r kind a _; do
-    case "$kind" in hook) hooks="$hooks $a" ;; deny) denies="$denies $a" ;; esac
+    case "$kind" in hook) hooks="$hooks $a" ;; deny) denies="$denies $a" ;; statusline) sl=1 ;; esac
   done <<<"$MISSING"
-  if [ -z "$hooks$denies" ]; then
-    echo "settings — all $( { want_hooks; want_deny; } | grep -c .) managed entries applied ($UNRELATED unrelated line(s) differ, not managed)"
+  if [ -z "$hooks$denies$sl" ]; then
+    echo "settings — all $( { want_hooks; want_deny; want_statusline; } | grep -c .) managed entries applied ($UNRELATED unrelated line(s) differ, not managed)"
     return 0
   fi
-  printf 'settings — UNAPPLIED:%s%s — cc-settings show, then %s\n' \
-    "${hooks:+ hook$hooks}" "${denies:+ deny$denies}" \
-    "$([ -n "$hooks" ] && echo 'cc-settings apply (owner, at a terminal)' || echo 'add the deny rule(s) by hand')"
+  printf 'settings — UNAPPLIED:%s%s%s — cc-settings show, then %s\n' \
+    "${hooks:+ hook$hooks}" "${denies:+ deny$denies}" "${sl:+ statusLine}" \
+    "$([ -n "$hooks$sl" ] && echo 'cc-settings apply (owner, at a terminal)' || echo 'add the deny rule(s) by hand')"
   return 1
 }
 
@@ -111,6 +126,16 @@ show(){
       printf '  MISSING  deny %s\n           add it by hand — cc-settings never writes `permissions`\n' "$rule"
     else printf '  ok       deny %s\n' "$rule"; fi
   done < <(want_deny)
+  local sl_want sl_why
+  sl_want=$(want_statusline)
+  if [ -n "$sl_want" ]; then
+    if grep -qF "statusline$US$sl_want" <<<"$MISSING"; then
+      sl_why=$(want_statusline_why)
+      printf '  MISSING  statusLine %s\n           why: %s\n' "$(norm "$sl_want")" "$sl_why"
+    elif [ -n "$SL_CUSTOM" ]; then
+      printf '  kept     statusLine %s  (your own — cc-settings never overwrites a statusLine you set)\n' "$(norm "$SL_CUSTOM")"
+    else printf '  ok       statusLine %s\n' "$(norm "$sl_want")"; fi
+  fi
   printf '\n%s line(s) outside the managed subset differ from %s — not managed, not drift.\n' "$UNRELATED" "${DEF#"$R"/}"
   [ -z "$MISSING" ]
 }
@@ -121,7 +146,7 @@ refuse(){ echo "cc-settings apply: $1" >&2
           echo "  Type \`cc-settings apply\` yourself in a shell on the box. \`cc-settings show\` says what is missing." >&2
           exit 3; }
 apply(){
-  local d ev m cmd tmp bak orig_perm new_perm ans n=0
+  local d ev m cmd tmp bak orig_perm new_perm ans n=0 sl_cmd
   [ -z "${CLAUDECODE:-}${CLAUDE_CODE_SESSION_ID:-}${CLAUDE_CODE_ENTRYPOINT:-}" ] || refuse "refusing — this is running inside a Claude Code session"
   [ -z "${CC_ROLE:-}" ] || refuse "refusing — CC_ROLE=${CC_ROLE} (a worker or member session)"
   { [ -t 0 ] && [ -t 1 ]; } || refuse "refusing — no terminal (this is only ever typed by hand)"
@@ -129,13 +154,22 @@ apply(){
   [ -f "$S" ] || { echo "cc-settings: no $S — run install.sh once first" >&2; exit 2; }
 
   scan
-  if ! miss_of hook >/dev/null; then
-    echo "cc-settings: every managed hook is already applied — nothing to write."
-    miss_of deny >/dev/null && { echo; show; }
+  if ! miss_of hook >/dev/null && ! miss_of statusline >/dev/null; then
+    echo "cc-settings: every managed hook and the statusLine are already applied — nothing to write."
+    { miss_of deny >/dev/null || [ -n "$SL_CUSTOM" ]; } && { echo; show; }
     exit 0
   fi
-  echo "About to add these hook registrations to $S:"
-  while IFS=$US read -r _ ev m cmd _; do printf '  %-16s %s%s\n' "$ev" "$(norm "$cmd")" "${m:+   (matcher: $m)}"; done < <(miss_of hook)
+  if miss_of hook >/dev/null; then
+    echo "About to add these hook registrations to $S:"
+    while IFS=$US read -r _ ev m cmd _; do printf '  %-16s %s%s\n' "$ev" "$(norm "$cmd")" "${m:+   (matcher: $m)}"; done < <(miss_of hook)
+  fi
+  if miss_of statusline >/dev/null; then
+    echo "About to set the statusLine command in $S:"
+    while IFS=$US read -r _ cmd _; do printf '  %s\n' "$(norm "$cmd")"; done < <(miss_of statusline)
+  fi
+  if [ -n "$SL_CUSTOM" ]; then
+    echo "Your own statusLine command is kept as it is, not overwritten: $(norm "$SL_CUSTOM")"
+  fi
   if miss_of deny >/dev/null; then
     echo "Also missing, and NOT written by this command — paste these in yourself:"
     miss_of deny | cut -d"$US" -f2 | sed 's/^/  /'
@@ -154,23 +188,30 @@ apply(){
     else rm -f "$tmp" "$tmp.j"; echo "cc-settings: jq failed on $ev — nothing changed ($bak holds the backup)" >&2; exit 1; fi
     n=$((n+1))
   done < <(miss_of hook)
+  if miss_of statusline >/dev/null; then
+    sl_cmd=$(miss_of statusline | cut -d"$US" -f2)
+    if set_statusline "$tmp" "$sl_cmd" > "$tmp.j"
+    then mv -f "$tmp.j" "$tmp"; n=$((n+1))
+    else rm -f "$tmp" "$tmp.j"; echo "cc-settings: jq failed on statusLine — nothing changed ($bak holds the backup)" >&2; exit 1; fi
+  fi
 
   jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "cc-settings: the result is not valid json — nothing changed" >&2; exit 1; }
   new_perm=$(jq -S -c '.permissions // null' "$tmp")   # the promise, checked rather than asserted
   [ "$new_perm" = "$orig_perm" ] || { rm -f "$tmp"; echo "cc-settings: that rewrite would have changed \`permissions\` — refused, nothing changed" >&2; exit 1; }
   mv -f "$tmp" "$S" || { echo "cc-settings: could not replace $S — $bak holds the backup" >&2; exit 1; }
-  echo "applied $n hook registration(s). Backup: $bak"
+  echo "applied $n managed entrie(s). Backup: $bak"
   echo "Claude Code reads settings at session start: restart any session that has to be gated by them."
 }
 
 selfcheck(){
-  local d n=0 f=0 S M DEF out rc
+  local d n=0 f=0 S M DEF out rc sl_cmd
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-settings-sc.XXXXXX") || return 1   # S/M/DEF are local: every case runs against fixtures
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a case that PRINTS (jq -e) must not leak into the verdict
   M="$R/config/claude-managed.json"; DEF="$R/config/claude-settings.json"
   k "$(t jq -e . "$M")" "the managed manifest is valid json"
   k "$(t test "$(jq '.hooks | length' "$M")" -eq 3)" "the manifest names three hook registrations"
+  k "$(t test -n "$(jq -r '.statusLine.command // empty' "$M")")" "the manifest names a statusLine command"
   # the shipped default must satisfy the subset itself, or a fresh box installs a file that is already wrong
   S="$DEF"; scan
   k "$(t test -z "$MISSING")" "config/claude-settings.json satisfies its own managed subset${MISSING:+ — missing: $(tr '\n' ' ' <<<"$MISSING")}"
@@ -204,6 +245,20 @@ selfcheck(){
   k "$(t test -z "$MISSING")" "a user's own extra hook alongside a managed one is preserved, not drift"
   # a settings file that does not exist at all is its own answer, not a crash
   S="$d/nope.json"; scan; k "$(t grep -q '^absent' <<<"$MISSING")" "an absent settings file is reported as absent"
+  # statusLine: absent -> reported by name and unapplied; a DIFFERENT command is the owner's own — satisfied,
+  # never drift, never something apply would touch.
+  jq 'del(.statusLine)' "$DEF" > "$d/no-statusline.json"; S="$d/no-statusline.json"
+  scan; k "$(t grep -q "^statusline$US" <<<"$MISSING")" "a missing statusLine is detected"
+  out=$(check); rc=$?
+  k "$(t grep -q 'statusLine' <<<"$out")" "…and check names it: ${out}"
+  k "$(t test "$rc" -ne 0)" "…and check exits non-zero for a missing statusLine"
+  jq '.statusLine.command = "$HOME/bin/my-own-statusline"' "$DEF" > "$d/custom-sl.json"; S="$d/custom-sl.json"
+  scan
+  k "$(t test -z "$MISSING")" "an owner's own different statusLine command is satisfied, not drift"
+  k "$(t test "$SL_CUSTOM" = '$HOME/bin/my-own-statusline')" "…and scan() names what it is, for show()/apply() to report"
+  out=$(check)
+  k "$(t grep -qv UNAPPLIED <<<"$out")" "…and check never calls a custom statusLine unapplied: $out"
+  k "$(t test -z "$(miss_of statusline)")" "…so apply's own guard (miss_of statusline) never fires for it"
   # the three walls on apply, each proved on its own
   out=$(CLAUDECODE=1 "$0" apply 2>&1); k "$(t grep -q 'inside a Claude Code session' <<<"$out")" "apply refuses inside a Claude Code session"
   out=$(env -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT CC_ROLE=worker "$0" apply 2>&1)
@@ -225,12 +280,23 @@ selfcheck(){
   k "$(t grep -q "$HOME/bin/mine" "$d/applied.json")" "…and the user's own extra hook survives"
   S="$d/applied.json"; scan
   k "$(t test -z "$MISSING")" "…and the file it wrote now satisfies the managed subset"
-  k "$(t test "$(jq '[.. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 4)" \
+  # scoped to .hooks: a top-level key can carry the same {type:"command", command:…} shape (statusLine does)
+  # without being a hook registration at all, and counting the whole file would count that key too.
+  k "$(t test "$(jq '[.hooks | .. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 4)" \
      "…with exactly one registration added, not a duplicate of the three that were there"
   # a second run is a no-op: apply must never stack the same registration twice
   add_hook "$d/applied.json" UserPromptSubmit "" '$HOME/bin/cc-scope hook' > "$d/twice.json"
   S="$d/twice.json"; scan
   k "$(t test -z "$MISSING")" "applying twice still satisfies the subset (scan matches on content, not count)"
+  # set_statusline is the OTHER mutation apply() can make: it sets a missing statusLine and touches nothing else
+  jq 'del(.statusLine)' "$d/live.json" > "$d/sl-live.json"; S="$d/sl-live.json"; scan
+  sl_cmd=$(miss_of statusline | cut -d"$US" -f2)
+  set_statusline "$d/sl-live.json" "$sl_cmd" > "$d/sl-applied.json"
+  k "$(t jq -e . "$d/sl-applied.json")" "set_statusline produces valid json"
+  S="$d/sl-applied.json"; scan
+  k "$(t test -z "$(miss_of statusline)")" "…and the file it wrote now satisfies the statusLine entry"
+  k "$(t diff <(jq -S 'del(.statusLine)' "$d/sl-live.json") <(jq -S 'del(.statusLine)' "$d/sl-applied.json"))" \
+     "…and every other key — hooks included — is untouched"
   # the guard rail that catches a future edit to add_hook: apply re-reads permissions before it swaps the file
   out=$(sed -n '/^apply(){/,/^}$/p' "$(readlink -f "$0")")
   k "$(t grep -q 'new_perm=\$(jq -S -c' <<<"$out")" "apply re-reads \`permissions\` from its own output"

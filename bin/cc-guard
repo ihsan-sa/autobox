@@ -13,11 +13,12 @@
 # rule sees the command wherever a wrapper put it — cmdpos(), which is also where that fix's ceiling is.
 # The walk stops only at a head with no option that runs a word ($NOEXEC), and the kill fence reads which
 # options carry a value PER VERB, because `-o` is a flag to pkill and `--older-than TIME` to killall.
-# A deny is one of TWO kinds. `deny` = the owner could say yes (merging, pushing, a comment in his name, an
-# email, a post to his Slack): from a member-facing session it also ASKS him, in that member's channel and by
-# DM. `never` = no yes exists for this tier (landing, dispatching a worker, host changes, the box's secrets): the
-# member is still told, and the owner is not woken for it. Writing outside the session's own tree is `never` too,
-# but QUIET: the session aimed that write itself and reads the reason on stderr; the channel hears nothing of it.
+# A deny is one of TWO kinds. `deny` = the owner could say yes (merging, pushing, a comment in his name, an email,
+# a post to his Slack); `never` = no yes exists for this tier (landing, dispatching a worker, host changes, the
+# box's secrets). From a MEMBER-FACING session either RECORDS A QUERY the box's queries session drains and answers
+# (record_query below, class page for a deny and nopage for a never) — nothing in the member's own channel, no page
+# to the owner (owner, 2026-09-04). Writing outside the session's own tree is `never` too, but QUIET: the session
+# aimed that write itself and reads the reason on stderr; not even a query is recorded for it.
 # Either gated tier also kills only its own descendants — never a session, a loop runner, or anything it
 # did not start (a member workspace's own workers run at role=member, so `worker` alone would miss them).
 # EVERY gated role, worker included: no container runtime (this user is in group `docker`, which is root-equivalent)
@@ -27,9 +28,8 @@
 # workers and makes tracks INSIDE itself and nowhere else — docs/design-member-workspaces.md.
 # It also gates whichever session is NOT live during an overlapping handoff (cc-handoff), by session id and
 # by $CC_HANDOFF rather than by a marker: the two sessions share one cwd, so the walk below cannot tell them apart.
-#   cc-guard selfcheck     the gates, against fixtures in a HOME of their own — never this box's Slack or owner
-# Env: CC_GUARD_ASKS, CC_GUARD_ASK_TTL (where a member-facing ask is rate-limited, and for how long) ·
-# CC_NOTIFY_LOG_ONLY, CC_NOTIFY_LOG (test hooks: an ask is logged there and nothing is sent) ·
+#   cc-guard selfcheck     the gates, against fixtures in a HOME of their own — never this box's state or sessions
+# Env: CC_GUARD_ASKS, CC_GUARD_ASK_TTL (where a member-facing query is de-duplicated, and for how long) ·
 # CC_GUARD_ROOT_PID (test hook: the session process the worker kill fence measures its subtree from).
 set -uo pipefail
 # No jq = no cwd, so no marker walk either: fail CLOSED on the role we do know from the env (cc sets it for both).
@@ -39,8 +39,8 @@ command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in
 # other door. Each case builds its own fixture — its own HOME, its own asks dir, its own stub binaries — and
 # asserts BOTH sides: what is refused AND what is still allowed, what pages AND what must not.
 if [ "${1:-}" = selfcheck ]; then
-  # The RUNNER's env decides nothing here: a suite exports CC_NOTIFY_LOG_ONLY (case 2 asserts a REAL page to the
-  # stub) and a worker running the gates exports CC_ROLE, and both reached the child through `env` below.
+  # The RUNNER's env decides nothing here: a worker running the gates exports CC_ROLE, and a member session its
+  # CC_GUARD_ASKS — each case sets what it needs and reaches the child through `env` below.
   unset CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_ROLE CC_HANDOFF CC_HANDOFF_DIR CC_GUARD_ASKS CC_GUARD_ASK_TTL CC_GUARD_ROOT_PID
   T=$(mktemp -d); H=$T/home; WT=$H/.cc/worktrees/demo/t1; n=0; f=0; pids=""
   # A SECOND FIXTURE HOME, AND THE POINT OF IT IS THAT IT IS NOT UNDER /tmp: the write-path rules wave /tmp
@@ -69,31 +69,31 @@ if [ "${1:-}" = selfcheck ]; then
     printf '%s' "$pl" \
       | env HOME="${GH:-$H}" CALLS="$CALLS" CC_GUARD_ASKS="$ASKS" "$@" "$0" >/dev/null 2>"${GERR:-/dev/null}"; echo $?; }
 
-  # 1. A DENY WITH NO YES IN IT DOES NOT PAGE. The landing tool from a member-facing session: refused, the
-  #    member told in their own channel, and the owner left asleep (00:03Z, the DM that started this).
-  ASKS=$T/asks1; CALLS=$T/calls1; : > "$CALLS"
+  # 1. A MEMBER REFUSAL IS A QUERY, NOT A LINE IN THE MEMBER'S CHANNEL. The landing tool from a member-facing
+  #    session: refused, a query RECORDED for the box's queries session, and NOTHING in the member's own channel
+  #    and NOTHING paged to the owner (owner, 2026-09-04). cc-land has no yes for a member, so class=nopage.
+  ASKS=$T/asks1; CALLS=$T/calls1; : > "$CALLS"; QS=$H/.cc/state/alice/queries.spool; rm -f "$QS"
   rc=$(g Bash '{"command":"cc-land 7"}' "$H/dev/alice")
-  if [ "$rc" = 2 ] && grep -q '^slack' "$CALLS" && ! grep -q '^notify' "$CALLS"; then r=0; else r=1; fi
-  ok "a member deny of the landing tool refuses, tells the member, and never pages the owner" $r
+  if [ "$rc" = 2 ] && [ ! -s "$CALLS" ] && [ "$(wc -l < "$QS" 2>/dev/null)" = 1 ] \
+     && jq -e 'select(.class=="nopage" and .workspace=="alice" and (.command|test("cc-land")))' "$QS" >/dev/null 2>&1; then r=0; else r=1; fi
+  ok "a member refusal records a query for the box and says nothing in the member's channel or to the owner" $r
 
-  # 2. …and one the owner COULD approve pages, exactly once inside the TTL.
-  ASKS=$T/asks2; CALLS=$T/calls2; : > "$CALLS"
+  # 2. …AND AN APPROVABLE ONE IS RECORDED ONCE. gh pr merge could be yes, so class=page — but a member retrying the
+  #    same blocked command must not fill the spool: one query per workspace+reason inside the TTL.
+  ASKS=$T/asks2; CALLS=$T/calls2; : > "$CALLS"; QS=$H/.cc/state/alice/queries.spool; rm -f "$QS"
   rc=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice")
   rc2=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice")
-  if [ "$rc" = 2 ] && [ "$rc2" = 2 ] && [ "$(grep -c '^notify' "$CALLS")" = 1 ]; then r=0; else r=1; fi
-  ok "a member deny of an approvable action pages the owner once, and a retry inside the TTL does not page again" $r
+  if [ "$rc" = 2 ] && [ "$rc2" = 2 ] && [ ! -s "$CALLS" ] && [ "$(wc -l < "$QS")" = 1 ] \
+     && jq -e 'select(.class=="page")' "$QS" >/dev/null 2>&1; then r=0; else r=1; fi
+  ok "an approvable member refusal is recorded as one page-class query, and a retry inside the TTL does not record it again" $r
 
-  # 3. A FIXTURE CANNOT PAGE. Same command as case 2 — the one that DOES page — from a _cctest cwd, and under
-  #    CC_NOTIFY_LOG_ONLY: nothing is sent either way, and the ask is written where cc-notify's test hook says.
-  NL=$T/notify3.log; CALLS=$T/calls3-quiet; : > "$CALLS"
-  ASKS=$T/asks3a; rc=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/_cctest1" CC_NOTIFY_LOG="$NL")
-  ASKS=$T/asks3b; rc2=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice" CC_NOTIFY_LOG="$NL" CC_NOTIFY_LOG_ONLY=1)
-  quiet=$([ -s "$CALLS" ] && echo dirty || echo clean)     # the two above may send NOTHING, by either door
-  CALLS=$T/calls3-real; : > "$CALLS"
-  ASKS=$T/asks3c; rc3=$(g Bash '{"command":"gh pr merge 1"}' "$H/dev/alice")
-  if [ "$rc" = 2 ] && [ "$rc2" = 2 ] && [ "$rc3" = 2 ] && [ "$quiet" = clean ] \
-     && [ "$(grep -c '^notify' "$CALLS")" = 1 ] && [ "$(grep -c 'guard-ask' "$NL")" = 2 ]; then r=0; else r=1; fi
-  ok "a _cctest cwd and CC_NOTIFY_LOG_ONLY are logged and never reach cc-notify or cc-slack; the same deny from a real dir does page" $r
+  # 3. THE QUERY NAMES THE WORKSPACE, THE COMMAND AND THE REASON — the three things the queries session reads to
+  #    approve or answer it, since a member sandbox cannot reach the owner itself and the host drains this spool.
+  ASKS=$T/asks3; CALLS=$T/calls3; : > "$CALLS"; QS=$H/.cc/state/alice/queries.spool; rm -f "$QS"
+  rc=$(g Bash '{"command":"gh pr merge 42"}' "$H/dev/alice")
+  named=$(jq -er 'select(.workspace=="alice" and (.reason|test("merging")) and (.command|test("gh pr merge 42")))|"y"' "$QS" 2>/dev/null)
+  if [ "$rc" = 2 ] && [ "$named" = y ] && [ ! -s "$CALLS" ]; then r=0; else r=1; fi
+  ok "the recorded query names the workspace, the command and the reason the queries session needs to act on it" $r
 
   # 4. A WORKER KILLS ONLY ITS OWN. Its child goes; the pid of something it did not start does not (11:15Z:
   #    a worker pgrep'd the suite's filename, matched its own session and ended its own iteration).
@@ -294,7 +294,7 @@ K10B
   #     wrapper $AT never knew, and each must be REFUSED. Its own fixture: its own asks dir, its own call log,
   #     and the handoff row its own empty record dir. The tiers: un = no role and no marker at all, which is
   #     what makes the tmux rows the universal gate rather than a worker one.
-  ASKS=$T/asks11; CALLS=$T/calls11; : > "$CALLS"; NL11=$T/notify11.log; mkdir -p "$T/hd11"; GERR=$T/err11
+  ASKS=$T/asks11; CALLS=$T/calls11; : > "$CALLS"; mkdir -p "$T/hd11"; GERR=$T/err11
   r=0
   # Each row asserts the REASON as well as rc 2, because rc 2 alone would stay green if some neighbouring rule
   # happened to refuse the row — and the claim here is that the wrapped command reached ITS OWN rule.
@@ -304,7 +304,7 @@ K10B
     case "$tier" in
       un) got=$(g Bash "{\"command\":\"$what\"}" "$T");;
       hg) got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$ CC_HANDOFF=h11 CC_HANDOFF_DIR="$T/hd11");;
-      mb) got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/_cctest1" CC_ROLE=member CC_GUARD_ROOT_PID=$$ CC_NOTIFY_LOG="$NL11");;
+      mb) got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/_cctest1" CC_ROLE=member CC_GUARD_ROOT_PID=$$);;
       *)  got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$);;
     esac
     { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
@@ -436,42 +436,741 @@ W11B
   #     the project root>/memory and both sandboxes bind that dir rw, but the write-path rule refused every one
   #     of them — and from a member-facing session each refusal went out as a 🔐 line: three files in one call,
   #     six posts in a member's channel (2026-09-04). Own notes are written, another project's are still refused,
-  #     and none of that reaches the channel because the member asked for none of it. What the member DID ask for
-  #     still does — the last two assertions, which are the half of this that must not move.
+  #     and a write outside the tree records NO query (it is the session's own to fix). What the member DID ask for
+  #     still records one — the last assertions, which are the half of this that must not move.
   ASKS=$T/asks12; CALLS=$T/calls12; : > "$CALLS"
   if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: these rules wave /tmp through, so nothing here would be gated"
   else
     H2=$T2/home; WT2=$H2/.cc/worktrees/demo/t1   # $GH hands g this home; $H is under /tmp and every path in it is scratch
     mkdir -p "$H2/bin" "$H2/dev/alice/.cc" "$WT2/.cc"; : > "$H2/dev/alice/.cc/member-facing"; : > "$WT2/.cc/track"
-    cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H2/bin/"
+    cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H2/bin/"; QS2=$H2/.cc/state/alice/queries.spool; rm -f "$QS2"
     amem=$H2/.claude/projects/$(printf '%s' "$H2/dev/alice" | tr '/.' '--')/memory
     wmem=$H2/.claude/projects/$(printf '%s' "$H2/dev/demo" | tr '/.' '--')/memory
     mown=$(GH=$H2 g Write "{\"file_path\":\"$amem/MEMORY.md\"}" "$H2/dev/alice")
     mother=$(GH=$H2 g Write "{\"file_path\":\"$H2/.claude/projects/-home-someone-else/memory/MEMORY.md\"}" "$H2/dev/alice")
     mout=$(GH=$H2 g Edit "{\"file_path\":\"$H2/dev/alice-other/x.md\"}" "$H2/dev/alice")
     wown=$(GH=$H2 g Write "{\"file_path\":\"$wmem/MEMORY.md\"}" "$WT2" CC_ROLE=worker)
-    quiet12=$([ -s "$CALLS" ] && echo dirty || echo clean)   # not one of the four may say anything in a channel
+    quietq=$([ -s "$QS2" ] && echo dirty || echo clean)   # the two refused writes above must record NO query
     rc=$(GH=$H2 g Bash '{"command":"cc-land 7"}' "$H2/dev/alice")
     if [ "$mown" = 0 ] && [ "$mother" = 2 ] && [ "$mout" = 2 ] && [ "$wown" = 0 ] \
-       && [ "$quiet12" = clean ] && [ "$rc" = 2 ] && [ "$(grep -c '^slack' "$CALLS")" = 1 ]; then r=0; else r=1; fi
+       && [ ! -s "$CALLS" ] && [ "$quietq" = clean ] && [ "$rc" = 2 ] && [ "$(wc -l < "$QS2")" = 1 ]; then r=0; else r=1; fi
   fi
-  ok "a member and a worker write their own auto-memory notes, are still refused another project's notes and anything else outside their tree, and none of those refusals reaches the member's channel — while what the member asked for still does" $r
+  ok "a member and a worker write their own auto-memory notes, are still refused another project's notes and anything else outside their tree, none of those refusals records a query — while what the member asked for still does" $r
 
-  # 13. THE SAME REFUSAL ABOUT A DIFFERENT PATH IS ONE ASK. The channel note was keyed on the whole reason and
-  #     every reason names what it refused, so a session working through a list asked once per file.
-  ASKS=$T/asks13; CALLS=$T/calls13; : > "$CALLS"
+  # 13. THE SAME REFUSAL ABOUT A DIFFERENT PATH IS ONE QUERY. Every reason names what it refused, so keying on the
+  #     whole reason made a session working through a list record a query per file; the path is dropped from the key.
+  ASKS=$T/asks13; CALLS=$T/calls13; : > "$CALLS"; QS=$H/.cc/state/alice/queries.spool; rm -f "$QS"
   s1=$(g Read "{\"file_path\":\"$H/.cc/config\"}" "$H/dev/alice")
   s2=$(g Read "{\"file_path\":\"$H/.ssh/id_ed25519\"}" "$H/dev/alice")
-  if [ "$s1" = 2 ] && [ "$s2" = 2 ] && [ "$(grep -c '^slack' "$CALLS")" = 1 ]; then r=0; else r=1; fi
-  ok "two paths refused by the same rule ask the member's channel once, not once each" $r
+  if [ "$s1" = 2 ] && [ "$s2" = 2 ] && [ "$(wc -l < "$QS")" = 1 ]; then r=0; else r=1; fi
+  ok "two paths refused by the same rule record one query, not one each" $r
 
-  # 14. DIFFERENT REFUSALS ARE DIFFERENT ASKS, parentheses or not: only a PATH in parentheses leaves the key. Landing
-  #     and dispatching both carry a parenthetical, and neither is a path.
-  ASKS=$T/asks14; CALLS=$T/calls14; : > "$CALLS"
+  # 14. DIFFERENT REFUSALS ARE DIFFERENT QUERIES, parentheses or not: only a PATH in parentheses leaves the key.
+  #     Landing and dispatching both carry a parenthetical, and neither is a path.
+  ASKS=$T/asks14; CALLS=$T/calls14; : > "$CALLS"; QS=$H/.cc/state/alice/queries.spool; rm -f "$QS"
   s1=$(g Bash '{"command":"cc-land 7"}' "$H/dev/alice")
   s2=$(g Bash '{"command":"cc alice t9 --go"}' "$H/dev/alice")
-  if [ "$s1" = 2 ] && [ "$s2" = 2 ] && [ "$(grep -c '^slack' "$CALLS")" = 2 ]; then r=0; else r=1; fi
-  ok "two different refusals, each with a parenthetical, are two asks — only a path in parentheses leaves the key" $r
+  if [ "$s1" = 2 ] && [ "$s2" = 2 ] && [ "$(wc -l < "$QS")" = 2 ]; then r=0; else r=1; fi
+  ok "two different refusals, each with a parenthetical, are two queries — only a path in parentheses leaves the key" $r
+
+  # 15. A REPO NAMED IN PROSE IS NOT A REPO CREATED. 2026-09-04 a member workspace session was refused "creating
+  #     outside <its workspace>" for a heredoc/echo whose body only DESCRIBED a new repo — two blocked calls before
+  #     it gave up and switched tools. A note or a plan may name another repo, a ';' or a substitution in it and all:
+  #     inert inside quotes, exactly as a real shell reads them. What is still refused is a REAL dispatch or create
+  #     of another repo, and the workspace's own dispatch still runs — the fence itself does not move.
+  ASKS=$T/asks15; CALLS=$T/calls15; : > "$CALLS"
+  mkdir -p "$H/dev/ws1/.cc" "$H/.cc/state/ws1"; : > "$H/dev/ws1/.cc/member-facing"; : > "$H/dev/ws1/.cc/member-workspace"
+  p1=$(g Bash '{"command":"cat > plan.md <<EOF\nnew repo other; run cc other t1 --go and cc board add other x\nEOF"}' "$H/dev/ws1" CC_ROLE=member)
+  p2=$(g Bash "{\"command\":\"echo 'step one; then cc other t1 --go' >> plan.md\"}" "$H/dev/ws1" CC_ROLE=member)
+  d1=$(g Bash '{"command":"cc other t1 --go"}' "$H/dev/ws1" CC_ROLE=member)
+  d2=$(g Bash '{"command":"cc board add other t1"}' "$H/dev/ws1" CC_ROLE=member)
+  own=$(g Bash '{"command":"cc ws1 t1 --go"}' "$H/dev/ws1" CC_ROLE=member)
+  if [ "$p1" = 0 ] && [ "$p2" = 0 ] && [ "$d1" = 2 ] && [ "$d2" = 2 ] && [ "$own" = 0 ]; then r=0; else r=1; fi
+  ok "a member workspace passes a heredoc or echo that only NAMES another repo (a ';' inside quotes is prose), still refuses a real dispatch or create of one, and still runs its own" $r
+
+  # 16. A PATH NAMED IN PROSE IS NOT A PATH WRITTEN. The same fix, for the write fence: a worker's note may DESCRIBE
+  #     a copy or a redirect into the box's live tree — the ';' and the '>' inside the quotes cannot split or
+  #     redirect anything — while a REAL copy or redirect into ~/bin is still refused.
+  ASKS=$T/asks16; CALLS=$T/calls16; : > "$CALLS"
+  q1=$(g Bash "{\"command\":\"echo 'plan: cp a ~/bin/b; then echo x > ~/bin/c' >> notes.md\"}" "$WT" CC_ROLE=worker)
+  q2=$(g Bash '{"command":"cat > notes.md <<EOF\ndo not cp into ~/bin or redirect > ~/bin\nEOF"}' "$WT" CC_ROLE=worker)
+  w1=$(g Bash '{"command":"cp /tmp/x ~/bin/b"}' "$WT" CC_ROLE=worker)
+  w2=$(g Bash '{"command":"echo x > ~/bin/c"}' "$WT" CC_ROLE=worker)
+  if [ "$q1" = 0 ] && [ "$q2" = 0 ] && [ "$w1" = 2 ] && [ "$w2" = 2 ]; then r=0; else r=1; fi
+  ok "a worker passes a note that only NAMES a write into the live tree (a ';' or '>' inside quotes is prose), and still refuses a real copy or redirect into ~/bin" $r
+
+  # 17. …AND PROSE-BLANKING NEVER HIDES A REAL COMMAND (reviews of #243). Every way early cuts of flatln
+  #     let one through, each REFUSED again and by its own rule: an interpreter string whose second statement is the
+  #     command (only the raw line puts it in command position — the quote-blind rescan emits suffixes alone); an
+  #     escaped or shell-spliced apostrophe, which opened a quote the shell never opened and blanked the real
+  #     separator or redirect behind it; and an unbalanced ) — a case pattern is the ordinary one — which ended the
+  #     substitution early and dropped the real command behind it back into blanked prose (landing review of #243).
+  #     Each row is JSON-escaped: \\' reaches the guard as \' and \" as ".
+  ASKS=$T/asks17; CALLS=$T/calls17; : > "$CALLS"; GERR=$T/err17
+  mkdir -p "$H/dev/ws1/.cc" "$H/.cc/state/ws1"; : > "$H/dev/ws1/.cc/member-facing"; : > "$H/dev/ws1/.cc/member-workspace"
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W17'
+an interpreter string with a second statement|dispatching outside|bash -c \"x; cc other t1 --go\"
+an escaped quote before a real separator|dispatching outside|echo \\' ; cc other t1 --go
+a shell-spliced apostrophe before a real separator|dispatching outside|echo 'don'\\''t'; cc other t1 --go
+an escaped quote before a real redirect|writing into the box's live tree|echo \\' > ~/bin/pwn
+a substitution inside double quotes, with a second statement|dispatching outside|echo \"$(true; cc other t1 --go)\"
+a substitution inside double quotes, with a redirect|writing into the box's live tree|echo \"$(date > ~/bin/pwn)\"
+an escaped double quote that must not close the string|dispatching outside|git commit -m \"a\\\"b\" ; cc other t1 --go \\\"
+a case pattern's ) does not end the substitution|dispatching outside|echo \"$(case a in a) cc other t1 --go;; esac)\"
+…nor does it put the rest of the substitution back in prose|dispatching outside|echo \"$(case a in a) x;; esac; cc other t1 --go)\"
+…and the same shape does not hide a write either|writing into the box's live tree|echo \"$(case a in a) cp x ~/bin/y;; esac)\"
+a nested substitution and $(( )) arithmetic are inside that same tail|dispatching outside|echo \"$(echo $(( 1 )) ; cc other t1 --go)\"
+W17
+  ok "blanking metacharacters inside quotes never hides a real command: an interpreter's second statement, a separator or redirect behind an escaped or spliced apostrophe, and a command behind a case pattern's unbalanced ) are each still refused by their own rule" $r
+
+  # 18. A HUGE REFUSED COMMAND LEAVES A BOUNDED RECORD. cc-msg discards a whole queries.spool over 1 MB as a plant
+  #     and pages the owner about it, so one refused command carrying a big heredoc body used to take every query
+  #     queued in that file down with it, unread (landing review of #243). The record is cut, and says it was cut.
+  ASKS=$T/asks18; CALLS=$T/calls18; : > "$CALLS"; QS=$H/.cc/state/alice/queries.spool; rm -f "$QS"
+  # built INSIDE jq: a body this big as one argv word is near MAX_ARG_STRLEN, a limit of exec and not of this rule
+  bigin=$(jq -cn '{command: ("cat > plan.md <<EOF\n" + ("x" * 100000) + "\nEOF\ngh pr merge 1")}')
+  rc=$(g Bash "$bigin" "$H/dev/alice")
+  if [ "$rc" = 2 ] && [ "$(wc -l < "$QS" 2>/dev/null)" = 1 ] && [ "$(wc -c < "$QS")" -lt 6000 ] \
+     && jq -e 'select((.command|startswith("cat > plan.md")) and (.command|endswith("…(cut)")))' "$QS" >/dev/null 2>&1; then r=0; else r=1; fi
+  ok "a refusal carrying a 100 KB heredoc body records ONE bounded query that says it was cut, so the spool never grows past what cc-msg will read" $r
+
+  # 19. A SESSION GATED BY $CC_ROLE ALONE STILL PRODUCES A QUERY. With no marker there is no workspace to name, and
+  #     record_query returned before writing anything: the refusal reached nobody but the session's own stderr, which
+  #     is the one thing this file says must not happen (landing review of #243). It spools under the reserved
+  #     "_nomarker" key instead — an ordinary query to the host, so it is said in the queries channel and delivered
+  #     like any other (cc-msg's selfcheck asserts that half). Still nothing from the guard itself: no post, no page.
+  ASKS=$T/asks19; CALLS=$T/calls19; : > "$CALLS"; QSN=$H/.cc/state/_nomarker/queries.spool; rm -f "$QSN"
+  rc=$(g Bash '{"command":"gh pr merge 1"}' "$H" CC_ROLE=member)
+  if [ "$rc" = 2 ] && [ ! -s "$CALLS" ] && [ "$(wc -l < "$QSN" 2>/dev/null)" = 1 ] \
+     && jq -e 'select(.workspace=="_nomarker" and .class=="page" and (.command|test("gh pr merge")))' "$QSN" >/dev/null 2>&1; then r=0; else r=1; fi
+  ok "a member gated by \$CC_ROLE alone, with no marker to name a workspace, still records its refusal — under the reserved key the host drains" $r
+
+  # 20. A BACKSLASH IN FRONT OF A NAME IS NOT A DIFFERENT COMMAND. `\cc other t1 --go` runs cc — the shell drops
+  #     the backslash and only skips alias lookup — but every rule reads a NAME at ^, so one character in front of
+  #     it (or inside it: `c\c`) turned the whole gate list off, cc-land, gh pr merge and docker included
+  #     (adversarial review of #243). The same escape hid an interpreter's argument: `awk "BEGIN{system(\"…\")}"`
+  #     passed where the single-quoted spelling was refused. Rows are JSON-escaped: \\ reaches the guard as \.
+  ASKS=$T/asks20; CALLS=$T/calls20; : > "$CALLS"; GERR=$T/err20
+  mkdir -p "$H/dev/ws1/.cc" "$H/.cc/state/ws1"; : > "$H/dev/ws1/.cc/member-facing"; : > "$H/dev/ws1/.cc/member-workspace"
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W20'
+a dispatch behind a backslash|dispatching outside|\\cc other t1 --go
+landing behind a backslash|landing a change|\\cc-land 7
+the loop runner behind a backslash|dispatching with cc-loop|\\cc-loop ws1 t1
+a merge behind a backslash|merging a PR|\\gh pr merge 1
+a container behind a backslash|running a container|\\docker run -v /:/host alpine
+a backslash INSIDE the name|dispatching outside|c\\c other t1 --go
+an interpreter's DOUBLE-quoted argument|dispatching outside|awk \"BEGIN{system(\\\"cc other t1 --go\\\")}\"
+…and its single-quoted spelling, which already was|dispatching outside|awk 'BEGIN{system(\"cc other t1 --go\")}'
+W20
+  ok "a backslash-escaped command name reaches the same rule the bare one does — in front of it or inside it — and an interpreter's double-quoted argument is read like its single-quoted spelling" $r
+
+  # 21. A RELATIVE TARGET LANDS WHERE THE LINE HAS GOT TO. Every write target was resolved against the payload's
+  #     cwd, so a `cd` earlier on the same line moved the write and the fence never saw it: `cd ~/dev/other &&
+  #     echo pwn > f` and `cd ~/bin && cp /dev/null pwn` both passed (adversarial review of #243). The cd is
+  #     tracked along the line; one that cannot be resolved makes a later relative target a refusal, not a guess.
+  #     The half that must not move is the last row: inside its own tree a member still writes what it likes.
+  ASKS=$T/asks21; CALLS=$T/calls21; : > "$CALLS"; GERR=$T/err21
+  r=0
+  : > "$GERR"; c1=$(g Bash "{\"command\":\"cd $H/dev/other && echo pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+  { [ "$c1" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+    || { r=1; echo "      a redirect after a cd into another repo: rc $c1, refused for: $(head -c 70 "$GERR")"; }
+  : > "$GERR"; c2=$(g Bash "{\"command\":\"cd $H/bin && cp /dev/null pwn\"}" "$H/dev/ws1" CC_ROLE=member)
+  { [ "$c2" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+    || { r=1; echo "      a cp after a cd into ~/bin: rc $c2, refused for: $(head -c 70 "$GERR")"; }
+  : > "$GERR"; c3=$(g Bash '{"command":"cd $D && echo x > f"}' "$H/dev/ws1" CC_ROLE=member)
+  { [ "$c3" = 2 ] && grep -qF "cannot resolve" "$GERR"; } \
+    || { r=1; echo "      a redirect after a cd this cannot resolve: rc $c3, refused for: $(head -c 70 "$GERR")"; }
+  c4=$(g Bash '{"command":"cd sub && echo x > f"}' "$H/dev/ws1" CC_ROLE=member)
+  [ "$c4" = 0 ] || { r=1; echo "      a cd and a write INSIDE its own tree was refused (rc $c4)"; }
+  #     A DESTINATION THAT IS A SUBSTITUTION IS c3 ALL OVER AGAIN, and it was the one spelling that passed: the
+  #     piece `cd $(` emptied the base correctly and then opened a subshell entry on the SAME piece, so the `)`
+  #     closing the substitution handed the pre-cd base back and the write was judged in the session's own tree
+  #     (8th adversarial review of #243). The `$( )` and backtick spellings must land where `cd $D` does.
+  : > "$GERR"; c5=$(g Bash "{\"command\":\"cd \$(echo $H/dev/other) && echo pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+  { [ "$c5" = 2 ] && grep -qF "cannot resolve" "$GERR"; } \
+    || { r=1; echo "      a redirect after a cd into a substitution: rc $c5, refused for: $(head -c 70 "$GERR")"; }
+  : > "$GERR"; c6=$(g Bash "{\"command\":\"cd \`echo $H/dev/other\` && echo pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+  { [ "$c6" = 2 ] && grep -qF "cannot resolve" "$GERR"; } \
+    || { r=1; echo "      the backtick spelling of that cd: rc $c6, refused for: $(head -c 70 "$GERR")"; }
+  ok "a write is judged where a \`cd\` on the same line puts it — into another repo or ~/bin it is refused, after a cd this cannot resolve it is refused too (a variable and a substitution alike), and inside the session's own tree it still runs" $r
+
+  # 21b. A STATEMENT IS WALKED ONCE. cmdpos marked BOTH whole-line prints, so a line that ends inside a quote or
+  #      carries a string-runner word (sed, env, sh, the everyday ones) was walked as a statement twice and the
+  #      same RELATIVE cd moved the base twice — to a dir the shell never stands in. From a subdir of its own
+  #      tree, an sh -c string holding `cd ../.. && sed -i s/x/y/ f` really writes ~/dev/f and PASSED, while
+  #      `cd .. && sed -i s/x/y/ f` writes inside the tree and was refused (paid review of #243). Cases 21, 24
+  #      and 28 all use ABSOLUTE cd targets, which a double application leaves where they were, so none of them
+  #      could see it. The cwd is a subdir here, which is what makes `cd ..` an ordinary move inside the tree.
+  #      THE TWO `bash -c` ROWS ARE WHY THE MARK CANNOT SIMPLY COME OFF THE RAW PRINT, the shorter fix the
+  #      review proposed: `bash -c "echo x; cd ..; …"` neuters its own `;` under the quote-aware reading and the
+  #      `echo` in front of the cd is no wrapper, so WCDRE never matches there — the RAW reading is the only one
+  #      that sees this cd at all, and unmarked it moves nothing, which let the `cd ../..` spelling write ~/dev/f.
+  #      THE LAST TWO ROWS ARE THE REWIND'S OWN FOOTGUN: `''` and `""` flatten to nothing, so a ONE-character
+  #      rewind marker is a line cmdpos already prints for them — read as a rewind it undid the cd on the line
+  #      BEFORE and the write went into the other repo, which HEAD refused. The marker is two marks for this.
+  ASKS=$T/asks21b; CALLS=$T/calls21b; : > "$CALLS"; GERR=$T/err21b
+  r=0
+  while IFS='%' read -r want fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/alice/sub" CC_ROLE=member)
+    [ "$got" = "$want" ] || { r=1; echo "      $fam: rc $got, wanted $want ($(head -c 70 "$GERR"))"; }
+    { [ "$want" = 0 ] || grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: refused for the wrong reason: $(head -c 70 "$GERR")"; }
+  done <<'W21B'
+0%a relative cd back up into the tree, with a sed after it%cd .. && sed -i s/x/y/ f
+2%…and one level further, which lands in ~/dev%cd ../.. && sed -i s/x/y/ f
+0%an interpreter string that cds back up into the tree%sh -c 'cd .. && sed -i s/x/y/ f'
+2%…and one that cds out of it%sh -c 'cd ../.. && sed -i s/x/y/ f'
+2%…and the redirect spelling of that escape%sh -c 'cd ../.. && echo pwn > f'
+0%a line that ends inside a quote, cd back up into the tree%cd .. && echo \"note\nspanning\" > f
+2%…and the same shape one level further%cd ../.. && echo \"note\nspanning\" > f
+0%a cd only the RAW reading sees, back up into the tree%bash -c \"echo x; cd ..; sed -i s/x/y/ f\"
+2%…and the same one level further%bash -c \"echo x; cd ../..; sed -i s/x/y/ f\"
+2%a line that flattens to nothing between a cd and the write%cd ~/dev/_cctest1\n''\necho pwn > f
+2%…and its double-quoted spelling%cd ~/dev/_cctest1\n\"\"\necho pwn > f
+W21B
+  ok "a relative \`cd\` moves the base once, however the line is spelled: inside the tree the write after it still runs, and the level that leaves the tree is refused — in an interpreter string and across a quote that spans two lines alike" $r
+
+  # 22. …AND THE VERBATIM TAIL ENDS WHERE THE SUBSTITUTION DOES. Everything after the first $( ) was emitted
+  #     verbatim to the end of the LINE (the fix for case 17), so quoted prose behind any substitution was read as
+  #     shell again and refused — case 16's own note with a `$(date)` in front of it (adversarial review of #243).
+  #     The tail now ends at the substitution's close, and a `)` that closes a `case` PATTERN is not that close;
+  #     one that never closes stays verbatim to the end of the line, which is the fail-closed half.
+  ASKS=$T/asks22; CALLS=$T/calls22; : > "$CALLS"; GERR=$T/err22
+  r=0
+  while IFS='%' read -r want fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    [ "$got" = "$want" ] || { r=1; echo "      $fam: rc $got, wanted $want ($(head -c 70 "$GERR"))"; }
+  done <<'W22'
+0%a commit message behind a closed substitution is prose%echo \"$(date)\" && git commit -m \"step; cc other t1 --go was blocked\"
+0%…and case 16's own note, with a $( ) in front of it%echo \"$(date)\" >> n.md; echo 'writes to > ~/bin/x'
+2%a case pattern's ) does not close the substitution%echo \"$(case a in a) cc other t1 --go;; esac)\"
+2%…nor does an unbalanced ( after the substitution reopen it%echo \"$(case a in a) cc other t1 --go;; esac) (\"
+2%…and the rest of the substitution is not prose either%echo \"$(case a in a) x;; esac; cc other t1 --go)\"
+0%an ordinary substitution%echo \"$(date)\"
+0%…and one with a pipe and a glob in it%cat \"$(ls *.md | head -1)\"
+W22
+  ok "the verbatim tail ends where the substitution closes: prose behind a closed one is prose again, while a case pattern's ) leaves it open and everything still inside is read as shell" $r
+
+  # 22b. …AND A COMMAND NAME QUOTED INSIDE ONE STILL REACHES ^. flatln emitted the substitution body verbatim, the
+  #      quote chars and backslashes included, so a name quoted inside a $( ) or `` that sits in double quotes never
+  #      landed at ^: `echo "$( "docker" run …)"` flattened with the quotes on and $AT could not cross them — the
+  #      whole gate list was off for a payload anyone can type (paid review of #243). The quotes drop and \ reduces
+  #      the way they do outside a substitution, so the container, landing, merge, sudo, dispatch and tmux gates fire.
+  ASKS=$T/asks22b; CALLS=$T/calls22b; : > "$CALLS"; GERR=$T/err22b
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W22B'
+a container quoted in a substitution|running a container|echo \"$( \"docker\" run -v /:/host alpine)\"
+…its single-quoted spelling|running a container|echo \"$( 'docker' run -v /:/host alpine)\"
+…and the backtick substitution's|running a container|echo \"`\"docker\" run -v /:/host alpine`\"
+landing quoted in a substitution|landing a change|echo \"$( \"cc-land\" 7)\"
+a merge quoted in a substitution|merging a PR|echo \"$( \"gh\" pr merge 7)\"
+sudo quoted in a substitution|sudo / host changes|echo \"$( \"sudo\" id)\"
+a dispatch quoted in a substitution|dispatching outside|echo \"$( \"cc\" other t1 --go)\"
+…and behind a doubled backslash inside it|dispatching outside|echo \"$( \\\\cc other t1 --go)\"
+…and in ANSI-C hex inside a substitution|dispatching outside|echo \"$( $'\\x63c' other t1 --go)\"
+…its backtick spelling|dispatching outside|echo \"`$'\\x63c' other t1 --go`\"
+a container in ANSI-C hex inside a substitution|running a container|echo \"$( $'\\x64ocker' run -v /:/host alpine)\"
+the tmux gate quoted in a substitution|shared tmux server|echo \"$( \"tmux\" kill-server)\"
+W22B
+  ok "a command name quoted inside a substitution reaches ^ like a bare one: the container, landing, merge, sudo, dispatch and tmux gates each fire on the \$( ) and backtick shapes, single- and double-quoted, behind a doubled backslash and in ANSI-C (\$'…') quoting" $r
+
+  # 23. `cd -` IS A DESTINATION, NOT AN OPTION. It goes to $OLDPWD, `~-` names the same dir, and pushd's `+N`/`-N`
+  #     name a slot of the stack — all four were skipped as options, so `cd -` read as a bare `cd`, moved the base
+  #     to $HOME and let the write through while the real shell was back in the repo it came from (2nd adversarial
+  #     review of #243). None can be resolved here, so the base is emptied and a relative write after one is refused.
+  ASKS=$T/asks23; CALLS=$T/calls23; : > "$CALLS"; GERR=$T/err23
+  r=0
+  for wsp in "cd -" "cd ~-" "pushd +1" "pushd -1"; do
+    : > "$GERR"; got=$(g Bash "{\"command\":\"cd $H/dev/other; cd /tmp; $wsp; echo pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "cannot resolve" "$GERR"; } \
+      || { r=1; echo "      \`$wsp\` was not read as a destination: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done
+  ok "\`cd -\`, \`cd ~-\` and pushd's \`+N\`/\`-N\` are destinations this cannot resolve, not options to skip past — a relative write after one is refused rather than resolved against \$HOME" $r
+
+  # 24. A NEWLINE IS NOT A `cd` BACK. The base was reset on every line while the shell's cwd is not, so a cd on
+  #     line 1 and a relative write on line 2 resolved against the payload's own cwd and passed — in all three
+  #     spellings (2nd adversarial review of #243). The base is per PAYLOAD: a cd on line 1 governs line 2.
+  ASKS=$T/asks24; CALLS=$T/calls24; : > "$CALLS"; GERR=$T/err24
+  r=0; i=0
+  for wpl in "cd $H/dev/other &&"'\n'"echo pwn > f" \
+             "cd $H/dev/other;"'\n'"echo pwn > f" \
+             "cd $H/dev/other "'\\\n'"&& echo pwn > f"; do
+    i=$((i+1)); : > "$GERR"
+    got=$(g Bash "{\"command\":\"$wpl\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      a cd on line 1 and a write on line 2, form $i: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done
+  ok "a \`cd\` on one line still governs the next: the &&, ; and backslash-continuation spellings of a write into another repo are all refused" $r
+
+  # 25. popd GOES BACK WHERE pushd CAME FROM. It was not tracked at all, so it left the base at the dir the last
+  #     pushd moved to and `pushd ~/dev/other; pushd /tmp; popd; echo pwn > f` passed (2nd adversarial review of
+  #     #243). The stack is tracked; popped off an empty one it is unresolvable, and inside its own tree it still runs.
+  ASKS=$T/asks25; CALLS=$T/calls25; : > "$CALLS"; GERR=$T/err25
+  r=0
+  : > "$GERR"; p1=$(g Bash "{\"command\":\"pushd $H/dev/other; pushd /tmp; popd; echo pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+  { [ "$p1" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+    || { r=1; echo "      a write after a popd back into another repo: rc $p1, refused for: $(head -c 70 "$GERR")"; }
+  : > "$GERR"; p2=$(g Bash '{"command":"pushd /tmp; popd; popd; echo pwn > f"}' "$H/dev/ws1" CC_ROLE=member)
+  { [ "$p2" = 2 ] && grep -qF "cannot resolve" "$GERR"; } \
+    || { r=1; echo "      a write after a popd off an empty stack: rc $p2, refused for: $(head -c 70 "$GERR")"; }
+  p3=$(g Bash '{"command":"pushd sub >/dev/null; make; popd >/dev/null; echo x > f"}' "$H/dev/ws1" CC_ROLE=member)
+  [ "$p3" = 0 ] || { r=1; echo "      a pushd/popd pair and a write INSIDE its own tree was refused (rc $p3)"; }
+  ok "popd is tracked against pushd's own stack — a write after it is judged where it lands, off an empty stack it is refused, and a pushd/popd pair inside the session's own tree still runs" $r
+
+  # 26. A DOUBLED BACKSLASH IN "" IS ONE BACKSLASH, AND ONE BACKSLASH IS NOT PART OF A NAME. `bash -c "\\cc …"`
+  #     hands bash the string \cc, which it runs as cc — but both characters were kept, so unesc left `\cc` at ^
+  #     and every rule reads a NAME there: the whole gate list was off again (2nd adversarial review of #243).
+  #     Rows are JSON-escaped: \\\\ reaches the guard as \\ and \" as ".
+  ASKS=$T/asks26; CALLS=$T/calls26; : > "$CALLS"; GERR=$T/err26
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W26'
+a dispatch in an interpreter string|dispatching outside|bash -c \"\\\\cc other t1 --go\"
+…with a statement of its own in front of it|dispatching outside|bash -c \"\\\\echo hi; \\\\cc other t1 --go\"
+…and the same string through eval|dispatching outside|eval \"\\\\cc other t1 --go\"
+a merge behind a doubled backslash|merging a PR|\\\\gh pr merge 1
+landing behind a doubled backslash|landing a change|\\\\cc-land 7
+a container behind a doubled backslash|running a container|\\\\docker run -v /:/host alpine
+W26
+  ok "a doubled backslash is reduced the way a shell reduces it, so \`bash -c \"\\\\cc …\"\`, \`eval\`, \`\\\\gh pr merge\`, \`\\\\cc-land\` and \`\\\\docker\` each reach their own rule" $r
+
+  # 27. …AND NONE OF THAT REFUSES ORDINARY WORK. The controls for cases 23-26: a cd into a subdir, a cd into a
+  #     substitution, a top-level `case`, two substitutions in one echo, a heredoc that only NAMES a dispatch,
+  #     and find's escaped `;` — every one of them a shape the fixes above could have caught by accident.
+  ASKS=$T/asks27; CALLS=$T/calls27; : > "$CALLS"; GERR=$T/err27
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    [ "$got" = 0 ] || { r=1; echo "      $fam: rc $got ($(head -c 70 "$GERR"))"; }
+  done <<'W27'
+a cd into a subdir and a build%cd sub && make
+a cd into a substitution%cd \"$(git rev-parse --show-toplevel)\" && ls
+a top-level case statement%case \"$x\" in a) echo ok;; esac
+two substitutions in one echo%echo \"$(date) $(whoami)\"
+a heredoc whose body only names a dispatch%cat <<EOF\nplan: cc other t1 --go\nEOF
+find's escaped semicolon%find . -name x -exec rm {} \\;
+an -exec that copies inside the session's own tree%find . -name x -exec cp {} sub/ \\;
+a commit message that names popd, and a write after it%git commit -m 'popd broke the build'\necho x > notes.md
+a dollar-quoted string in an argument%echo $'hi' > notes.md
+a printf whose argument only spells a dispatch%printf '\\x63c other t1 --go' > notes.md
+prose carrying the character the walk marks with%echo 'the \u0001 mark' > notes.md
+a commit message carrying a substitution%git commit -m 'ran $(date) before the cd'
+a cp with two sources into a subdir of its own tree%cp a b sub/
+a cp whose destination is built by a substitution%cp a $(pwd)/b
+a loop copying inside its own tree%for f in a b; do cp $f sub/$f; done
+a cd through a braced parameter%cd ${HOME}/dev/ws1/sub && echo x > f
+a quoted heredoc delimiter, body naming a dispatch%cat > note.md <<'EOF'\n$(cc other t1 --go)\nEOF
+a bare heredoc whose body is only prose%cat > note.md <<EOF\nplan: cc other t1 --go, then cd ~/dev/other\nEOF
+an awk program in braces, with a redirect%awk '{ print $1 }' in.txt > b.txt
+find -exec with a + terminator%find . -name '*.md' -exec sed -i s/a/b/ {} +
+a loop with a braced body copying inside the tree%for f in a b; do { cp $f sub/$f; }; done
+a commit message that only spells a heredoc%git commit -m 'the << EOF form'
+a glob inside the session's own tree%cp /dev/null sub/x?
+a benign interpreter cd, then a write inside the tree%sh -c 'cd /tmp' && echo x > notes.md
+a cp whose source is a substitution, inside the tree%cd sub && cp $(echo a) b
+a harmless echo with a substitution in it, redirected inside the tree%cd sub && echo $(date) > notes.md
+a cd whose redirection substitution writes inside the tree%cd sub > $(cp /dev/null note.md)
+…and the cd it belongs to still governs the write after it%cd sub > $(echo /tmp/log) && echo x > f
+a substitution that is not a cd destination, then a write inside the tree%echo $(pwd) && echo x > notes.md
+W27
+  ok "the cd, popd and backslash fixes leave ordinary work alone: a cd into a subdir or a substitution, a top-level case, two substitutions in one echo, a heredoc naming a dispatch, find's escaped ; and its -exec inside the tree, a message naming popd, a dollar-quoted argument, a printf that only spells a dispatch, prose carrying the mark character and a two-source cp inside the tree, a substitution building a cp destination, a loop copying inside the tree, a braced parameter in a cd both heredoc delimiters, a braced awk program, find's + terminator, a braced loop body, a message spelling a heredoc and a glob inside the tree all still run" $r
+
+  # 28. A WRAPPER WORD IN FRONT OF A `cd` STILL MOVES THE SHELL. The prefix took `(`, `{` and VAR= and nothing
+  #     else, so `command cd ~/dev/other && echo pwn > f` and the `builtin` spelling were never tracked and the
+  #     write after them resolved against the session's own cwd (3rd adversarial review of #243). The prefix is
+  #     $AT's wrapper list plus `builtin`; `sh -c "cd …; write"` moves the shell that does the writing.
+  ASKS=$T/asks28; CALLS=$T/calls28; : > "$CALLS"; GERR=$T/err28
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W28
+command%command cd $H/dev/other && echo pwn > f
+builtin%builtin cd $H/dev/other && echo pwn > f
+an interpreter that is handed the cd and the write%sh -c 'cd $H/dev/other && echo pwn > f'
+W28
+  ok "a \`cd\` behind \`command\`, \`builtin\` or an interpreter string moves the base like a bare one: the write after it is judged where the shell really is" $r
+
+  # 29. A SUFFIX IS ARGUMENT TEXT, NOT A STATEMENT. The walk emits every suffix of a statement on a line of its
+  #     own, and the cd walk read those as statements: `git commit -m "cd /tmp"` cancelled a real cd into another
+  #     repo and let the write through, and `git commit -m "popd broke the build"` emptied the base and refused an
+  #     ordinary write (3rd adversarial review of #243). Only the marked statement lines move the base now.
+  ASKS=$T/asks29; CALLS=$T/calls29; : > "$CALLS"; GERR=$T/err29
+  r=0
+  : > "$GERR"; q1=$(g Bash "{\"command\":\"cd $H/dev/other"'\n'"git commit -m 'cd /tmp'"'\n'"echo pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+  { [ "$q1" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+    || { r=1; echo "      a quoted cd did not cancel the real one: rc $q1, refused for: $(head -c 70 "$GERR")"; }
+  : > "$GERR"; q2=$(g Bash "{\"command\":\"git commit -m 'popd broke the build'"'\n'"echo x > notes.md\"}" "$H/dev/ws1" CC_ROLE=member)
+  [ "$q2" = 0 ] || { r=1; echo "      a message naming popd refused the write after it: rc $q2 ($(head -c 70 "$GERR"))"; }
+  ok "a cd or a popd inside an argument is prose the shell never runs: it neither cancels a real cd on the line before nor empties the base under an ordinary write" $r
+
+  # 30. `popd -n` TAKES A DIRECTORY OFF THE STACK AND LEAVES THE SHELL WHERE IT IS. bash suppresses the cd, so
+  #     `pushd ~/dev/other; popd -n; echo pwn > f` writes in the other repo — read as a popd back, it passed
+  #     (3rd adversarial review of #243). The header note said -n was unresolvable; now the code agrees with it.
+  ASKS=$T/asks30; CALLS=$T/calls30; : > "$CALLS"; GERR=$T/err30
+  r=0
+  for wpn in "pushd $H/dev/other; popd -n; echo pwn > f" "pushd $H/dev/other"'\n'"popd -n"'\n'"echo pwn > f"; do
+    : > "$GERR"; got=$(g Bash "{\"command\":\"$wpn\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      a write after \`popd -n\`: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done
+  ok "\`popd -n\` pops the stack without moving the shell, so a write after it is still judged in the dir the pushd went to" $r
+
+  # 31. `{}` GLUED IS THE PLACEHOLDER find PASSES, NOT A COMMAND GROUP. Splitting the statement on it truncated
+  #     it before the target, so `find . -name x -exec cp {} ~/bin/cc-guard \;` put a bare `cp` at ^ with nothing
+  #     to judge and overwrote a live binary (3rd adversarial review of #243). -exec is an $AT wrapper as well.
+  ASKS=$T/asks31; CALLS=$T/calls31; : > "$CALLS"; GERR=$T/err31
+  r=0
+  for wex in "-exec cp {} $H/bin/cc-guard \\\\;" "-execdir cp {} $H/dev/other/f \\\\;"; do
+    : > "$GERR"; got=$(g Bash "{\"command\":\"find . -name x $wex\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      a cp through find's $wex: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done
+  ok "find's \`{}\` no longer ends the statement, so a cp through \`-exec\` or \`-execdir\` is judged on where it lands — ~/bin or another repo" $r
+
+  # 32. A DOLLAR-QUOTE IS RESOLVED BEFORE A NAME IS READ. ANSI-C quoting ($ + a single-quoted body) hides a
+  #     command name from every rule, all of which read a NAME at ^: the hex and octal spellings of cc, gh,
+  #     cc-land and docker each ran (3rd adversarial review of #243). Rows are JSON-escaped: \\\\x is \\x.
+  ASKS=$T/asks32; CALLS=$T/calls32; : > "$CALLS"; GERR=$T/err32
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W32'
+a dispatch spelled in hex|dispatching outside|$'\\x63c' other t1 --go
+…in \u, which is the same escape four digits wide|dispatching outside|$'\\u0063c' other t1 --go
+…and in \U, eight digits wide|dispatching outside|$'\\U00000063c' other t1 --go
+…and in octal, through an interpreter|dispatching outside|bash -c $'\\143c other t1 --go'
+a merge behind a dollar-quote|merging a PR|$'\\x67h' pr merge 1
+landing behind a dollar-quote|landing a change|$'\\x63c-land' 7
+a container behind a dollar-quote|running a container|$'\\x64ocker' run -v /:/host alpine
+W32
+  ok "ANSI-C quoting is resolved the way the shell resolves it, so the \\x, \\u, \\U and octal spellings of a dispatch, a merge, a land and a container each reach their own rule" $r
+
+  # 33. THE MARK IS THE WALK'S, NEVER THE COMMAND'S. cmdpos marks a statement line with a \001 so the cd walk can
+  #     tell a statement from an argument (case 29) — and the command text is the member's to write, so a mark
+  #     inside a commit message put a marked line in the haystack and a quoted cd cancelled a real one again.
+  #     Three spellings reach the same character: raw, \x01 and \cA (4th adversarial review of #243). It comes
+  #     off the text at the head of hay, before any walk sees it, and ansic never emits one.
+  ASKS=$T/asks33; CALLS=$T/calls33; : > "$CALLS"; GERR=$T/err33
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W33
+a raw mark in an argument%cd $H/dev/other\ngit commit -m '\u0001cd $H/dev/ws1'\necho pwn > f
+the mark spelled in ANSI-C hex%cd $H/dev/other\ngit commit -m \$'\\\\x01cd $H/dev/ws1'\necho pwn > f
+…and as a control character%cd $H/dev/other\ngit commit -m \$'\\\\cAcd $H/dev/ws1'\necho pwn > f
+W33
+  ok "the character the walk marks statement lines with is stripped from the command text first, in every spelling that reaches it, so a member cannot mark an argument as a statement" $r
+
+  # 34. AN OPTION WORD AND A COMPOUND KEYWORD ARE WRAPPERS TOO. `command -p cd ~/dev/other`, `time -p cd …`, and
+  #     the `if`, `while`, `until` and `!` spellings all move the shell, and the prefix knew none of them, so the
+  #     write after each resolved against the session's own tree (4th adversarial review of #243).
+  ASKS=$T/asks34; CALLS=$T/calls34; : > "$CALLS"; GERR=$T/err34
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W34
+an option between the wrapper and the cd%command -p cd $H/dev/other && echo pwn > f
+…and after time%time -p cd $H/dev/other && echo pwn > f
+if%if cd $H/dev/other; then echo pwn > f; fi
+while%while cd $H/dev/other; do echo pwn > f; done
+until%until cd $H/dev/other; do echo pwn > f; done
+a negated cd%! cd $H/dev/other; echo pwn > f
+W34
+  ok "an option word between a wrapper and a \`cd\`, and the if/while/until/! spellings of one, each move the base like a bare cd does" $r
+
+  # 35. A SUBSTITUTION IS A SHELL OF ITS OWN. `echo \$(cd ~/dev/other && echo pwn > f)`, the backtick spelling and
+  #     `cat <(cd …; echo pwn > f)` were read as one statement whose first word is `echo`, so the cd inside was
+  #     never tracked (4th adversarial review of #243). The interior opens a statement, the way `(` already did.
+  #     THE LAST THREE ROWS ARE THE OTHER HALF: WHERE THAT INTERIOR STANDS. A redirection is expanded before the
+  #     command it belongs to runs, so `cd sub > $(cp /dev/null ../other/f)` runs the cp in the dir the line
+  #     started in — the walk judged it in `sub` and the write into another repo passed (8th adversarial review
+  #     of #243). The interior gets the base the piece started with; the `)` still hands back the cd's own base,
+  #     which the third row holds by writing ~/bin only after the substitution has closed.
+  ASKS=$T/asks35; CALLS=$T/calls35; : > "$CALLS"; GERR=$T/err35
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W35
+a command substitution%echo \$(cd $H/dev/other && echo pwn > f)
+the backtick spelling%echo \`cd $H/dev/other && echo pwn > f\`
+a process substitution%cat <(cd $H/dev/other; echo pwn > f)
+a substitution in a cd's own redirection, expanded before it moves%cd sub > \$(cp /dev/null ../other/f)
+the backtick spelling of that redirection%cd sub > \`cp /dev/null ../other/f\`
+…and after the ) the cd's own base governs again%cd $H/bin > \$(echo /tmp/log) && cp /dev/null cc-guard
+W35
+  ok "a cd inside a substitution moves the writes inside it: the \$( ), backtick and <( ) spellings are each walked as a statement of their own" $r
+
+  # 36. THE DESTINATION IS NOT ALWAYS THE LAST WORD. Only the last bare word was judged, so any trailing word
+  #     moved the target out of sight: a redirection after it, or an interpreter that takes the real arguments
+  #     after the script (`sh -c 'cp \$1 ~/bin/cc-guard' _ a`) — both overwrote a live binary (4th adversarial
+  #     review of #243). Every bare word after the first is a destination now.
+  ASKS=$T/asks36; CALLS=$T/calls36; : > "$CALLS"; GERR=$T/err36
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W36
+a redirection after the destination%cp a $H/bin/cc-guard 2>/dev/null
+…and after an mv into another repo%mv a $H/dev/other/f 2>&1
+an interpreter whose arguments follow the script%sh -c 'cp \$1 $H/bin/cc-guard' _ a
+…the same, through find -exec%find . -name x -exec sh -c 'cp \$1 $H/bin/cc-guard' _ {} \\\\;
+W36
+  ok "every bare word after the first is judged as a destination, so a trailing redirection or an interpreter that takes its arguments after the script cannot move a cp or mv out of sight" $r
+
+  # 37. AN UNQUOTED HEREDOC DELIMITER EXPANDS THE BODY, AND AN EXPANSION IS A COMMAND. Bodies are dropped so that
+  #     a brief or a note that only NAMES a command is not refused (case 16) — but `cat > note.md <<EOF` over
+  #     `$(cc other t1 --go)` really dispatches, and the same body could read the credentials, merge a PR or copy
+  #     over a live binary (5th adversarial review of #243). The delimiter decides: quoted, the whole body is
+  #     literal and still goes; bare, the lines carrying a substitution or a parameter stay.
+  ASKS=$T/asks37; CALLS=$T/calls37; : > "$CALLS"; GERR=$T/err37
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W37'
+a dispatch in the body|dispatching outside|cat > note.md <<EOF\n$(cc other t1 --go)\nEOF
+the box's credentials|reading the box's credentials|cat > note.md <<EOF\n$(cat ~/ccbox/env)\nEOF
+a merge|merging a PR|cat > note.md <<EOF\n$(gh pr merge 1)\nEOF
+a copy over a live binary, through a backtick|writing into the box's live tree|cat > note.md <<EOF\n`cp /dev/null ~/bin/cc-guard`\nEOF
+W37
+  ok "a heredoc body whose delimiter is bare keeps the lines the shell would EXPAND — a dispatch, the credentials, a merge and a backtick copy each reach their own rule — while a quoted delimiter drops the lot (case 27)" $r
+
+  # 38. sprintf("%c") TRUNCATES WHAT IT CANNOT HOLD, so the surrogate range re-spelled the two characters ansic
+  #     must never emit: \ud801 came back as the statement mark and \ud80a as a newline, which put case 33 back
+  #     (5th adversarial review of #243). A NEWLINE OR CR SPELLED DIRECTLY did the same: `$'\n'` / `$'\x0a'` /
+  #     `$'\012'` / `$'\cJ'` (all v=10) split a marked statement line so the `; cd …` half landed UNMARKED and
+  #     its cd was never walked, and the write past it passed (7th adversarial review of #243). Only printable
+  #     ASCII that is not a newline or CR comes out now; anything else is a placeholder.
+  ASKS=$T/asks38; CALLS=$T/calls38; : > "$CALLS"; GERR=$T/err38
+  r=0
+  for wsg in ud801 ud80a; do
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"cd $H/dev/other\ngit commit -m \$'\\\\$wsg cd $H/dev/ws1'\necho pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      \\$wsg was emitted as a character of its own: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done
+  for wsn in '\\n' '\\x0a' '\\012' '\\cJ'; do   # a newline spelled four ways: ansic must place a `?`, not split the line
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"echo \$'$wsn'; cd $H/dev/other\necho pwn > f\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      \$'$wsn' split the statement: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done
+  ok "a value ansic cannot hold in one ASCII character becomes a placeholder, and a newline or CR spelled directly (\\n, \\x0a, \\012, \\cJ) is a placeholder too, so neither the surrogate range nor a direct spelling can re-spell the statement mark or split a marked statement line" $r
+
+  # 39. ANY TOKEN IN FRONT OF A `cd` HID IT, because a piece was cut only at `;&|` and a substitution opener, and
+  #     a leading `(`/`{` was allowed only at the very start of one. A case pattern, a function body in either
+  #     spelling, a braced group after `time` or inside a loop, and a leading redirection all move the real shell
+  #     and none was tracked (5th adversarial review of #243). A brace with a space beside it, a closing paren
+  #     and a redirection are read for what they are.
+  ASKS=$T/asks39; CALLS=$T/calls39; : > "$CALLS"; GERR=$T/err39
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W39
+a case pattern%case \$x in *) cd $H/bin;; esac; cp /dev/null cc-guard
+a function body%f() { cd $H/bin; }; f; cp /dev/null cc-guard
+…in the function keyword spelling%function f { cd $H/bin; }; f; cp /dev/null cc-guard
+a braced group after time%time { cd $H/dev/other; }; echo pwn > f
+a leading redirection%>/dev/null cd $H/dev/other; echo pwn > f
+a braced group inside a loop%while :; do { cd $H/dev/other; break; }; done; echo pwn > f
+W39
+  ok "a case pattern, a function body in either spelling, a braced group after time or inside a loop and a leading redirection each leave the cd where the walk can see it" $r
+
+  # 40. A `<<` INSIDE QUOTES OR BEHIND A `#` OPENS NOTHING. The heredoc pre-pass was quote- and comment-blind, so
+  #     `echo '<< EOF'` opened a body bash never opens and every line down to the next EOF left the haystack —
+  #     the tmux fence, the gate list and the write fence with it, for a payload anybody can type (6th
+  #     adversarial review of #243). The opener is now the first `<<` the shell itself would read.
+  ASKS=$T/asks40; CALLS=$T/calls40; : > "$CALLS"; GERR=$T/err40
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W40'
+a quoted << in front of a dispatch|dispatching outside|echo '<< EOF'\ncc other t1 --go\nEOF
+a << behind a comment, in front of a merge|merging a PR|echo hi  # << EOF\ngh pr merge 1\nEOF
+a quoted << in a commit message, in front of a copy|writing into the box's live tree|git commit -m \"see << EOF\"\ncp /dev/null ~/bin/cc-guard\nEOF
+W40
+  ok "a \`<<\` inside quotes or behind a comment opens no heredoc, so the lines after it are still the commands they are — a dispatch, a merge and a copy over a live binary are each still refused" $r
+
+  # 41. A BACKSLASH AT THE END OF A BODY LINE JOINS THE NEXT ONE. A substitution spread over two lines was
+  #     tested a line at a time and neither half carried the whole of it, so `$(cp /dev/null \` over
+  #     `~/bin/cc-guard)` in a bare heredoc truncated a live binary (6th adversarial review of #243). And a
+  #     backslash on the LAST body line joins the delimiter line, so the delimiter branch threw the pending
+  #     substitution away untested — a live binary again (7th adversarial review of #243); it is flushed first.
+  ASKS=$T/asks41; CALLS=$T/calls41; : > "$CALLS"; GERR=$T/err41
+  r=0
+  while IFS='|' read -r fam why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<'W41'
+a copy over a live binary, split across two lines|writing into the box's live tree|cat > n.md <<EOF\n$(cp /dev/null \\\n~/bin/cc-guard)\nEOF
+a dispatch split the same way|dispatching outside|cat > n.md <<EOF\n$(cc other \\\nt1 --go)\nEOF
+a copy whose continuation is the last body line before the delimiter|writing into the box's live tree|cat > n.md <<EOF\n$(cp /dev/null ~/bin/cc-guard) \\\nEOF
+W41
+  ok "a body line continued with a backslash is joined the way the shell joins it, so a substitution spread over two lines is still read as the one command it is" $r
+
+  # 42. TWO REDIRECTIONS THE PREFIX DID NOT KNOW. `2>&1 cd ~/dev/other` is cut in half by the `&` the pieces are
+  #     split on, leaving `1 cd …`, and `{fd}>/dev/null cd …` is a named descriptor the redirection alternative
+  #     never covered — both moved the shell untracked (6th adversarial review of #243).
+  ASKS=$T/asks42; CALLS=$T/calls42; : > "$CALLS"; GERR=$T/err42
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W42
+a descriptor duplication%2>&1 cd $H/dev/other; echo pwn > f
+a descriptor closed%2>&- cd $H/dev/other; echo pwn > f
+a named descriptor%{fd}>/dev/null cd $H/dev/other; echo pwn > f
+W42
+  ok "\`2>&1\`, \`2>&-\` and \`{fd}>file\` in front of a cd are read as the redirections they are, so the write after each is judged where the shell really is" $r
+
+  # 43. A GLOB IS NOT AN UNRESOLVABLE NAME — it is a name with a tail this cannot see, and its literal PREFIX
+  #     says where the write lands. Waved through for carrying a `?`, `cp /dev/null ~/bin/cc-guar?` truncated a
+  #     live binary (6th adversarial review of #243). The prefix is judged; a glob inside the tree still runs.
+  ASKS=$T/asks43; CALLS=$T/calls43; : > "$CALLS"; GERR=$T/err43
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W43
+a cp onto a one-character glob%cp /dev/null $H/bin/cc-guar?
+a cp onto a star%cp /dev/null $H/bin/cc-guard*
+a redirect onto a glob%echo x > $H/bin/cc-guar?
+a glob after a cd into another repo%cd $H/dev/other && echo x > f?
+W43
+  ok "a write target carrying a glob is judged on its literal prefix, so a glob that lands in ~/bin or another repo is refused while one inside the session's own tree still runs (case 27)" $r
+
+  # 44. A SUBSHELL'S cd DOES NOT LEAVE THE SUBSHELL. A benign `(cd /tmp)` — and its `sh -c 'cd /tmp'` spelling —
+  #     between a real cd into another repo and a relative write carried /tmp out of the subshell and MASKED the
+  #     real cd, so the write resolved against /tmp and passed while the shell wrote the other repo (7th
+  #     adversarial review of #243). The base is given back at the subshell's close; case 28's write, inside the
+  #     same subshell, still refuses. Controls: a real cd AFTER the subshell still governs the write.
+  #     THE LAST TWO ROWS ARE THE SAME MASKING ON ONE LINE, which the give-back missed for a whole round because
+  #     it was deferred to the end of the source LINE: `cd ~/bin && sh -c 'cd /tmp' && cp /dev/null cc-guard`
+  #     left the base at /tmp when the cp was scanned and passed, truncating a live binary (8th adversarial
+  #     review of #243). The child shell ends with its own PIECE, so the base goes back there.
+  ASKS=$T/asks44; CALLS=$T/calls44; : > "$CALLS"; GERR=$T/err44
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W44
+a bare subshell cd masking a real one%cd $H/dev/other\n(cd /tmp)\necho pwn > f
+an interpreter-string cd masking a real one%cd $H/dev/other\nsh -c 'cd /tmp'\necho pwn > f
+a real cd after the subshell still governs the write%(cd /tmp)\ncd $H/dev/other\necho pwn > f
+a real cd after an interpreter cd still governs the write%sh -c 'cd /tmp' && cd $H/dev/other\necho pwn > f
+an interpreter cd masking a real one on ONE line%cd $H/dev/other && sh -c 'cd /tmp' && echo pwn > f
+…and the ~/bin spelling, which truncates a live binary%cd $H/bin && sh -c 'cd /tmp' && cp /dev/null cc-guard
+W44
+  ok "a benign \`(cd /tmp)\` or \`sh -c 'cd /tmp'\` gives its base back at the subshell's close, so a relative write is judged where the real shell stands — before it (masked) and after it (a real cd) alike, on one line as on three" $r
+
+  # 45. A STATEMENT IS ONE STRING FOR THE WRITE FENCE. The cd walk cuts a line at every `$(`, backtick and `)` so
+  #     it can track a subshell's base, and the fence read those pieces — so a destination sitting after a
+  #     substitution was orphaned from its verb: `cd sub && cp $(echo /dev/null) ~/bin/cc-guard` left
+  #     ` ~/bin/cc-guard` as a piece with no cp and no redirection in it, nothing was judged, and the shell
+  #     truncated a live binary (9th adversarial review of #243). Without the `cd` the same line took the
+  #     whole-command path and was refused, so the word `cd` anywhere turned the fence off for this shape. The
+  #     statement is now put back together with each substitution reduced to a `$`, and the interior is still
+  #     walked as the statement it is — the fourth row is the write INSIDE the substitution, the fifth is a
+  #     redirection after one, and the last is a substitution nested in a substitution. Controls are in case 27.
+  #     THE LAST TWO ROWS ARE THE SAME ORPHANING BY THE OTHER SPLIT: the `|` of a `>|` is not a pipe, but the
+  #     pieces are cut at `;&|`, so `cp /dev/null >| ~/bin/cc-guard` left its target on a piece with no verb.
+  ASKS=$T/asks45; CALLS=$T/calls45; : > "$CALLS"; GERR=$T/err45
+  r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    got=$(g Bash "{\"command\":\"$what\"}" "$H/dev/ws1" CC_ROLE=member)
+    { [ "$got" = 2 ] && grep -qF "writing into the box's live tree" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W45
+a destination after a substitution%cd sub && cp \$(echo /dev/null) $H/bin/cc-guard
+the backtick spelling of it%cd sub && cp \`echo /dev/null\` $H/bin/cc-guard
+a substitution in the middle of the arguments%cd sub && cp /dev/null \$(echo x) $H/bin/cc-guard
+the destination inside the substitution%cd sub && echo \$(cp /dev/null $H/bin/cc-guard)
+a redirection whose target follows a substitution%cd sub && echo \$(date) > $H/bin/cc-guard
+a tee whose file follows a substitution%cd sub && tee \$(echo -a) $H/bin/cc-guard
+a substitution nested in a substitution%cd sub && cp \$(echo \$(echo /dev/null)) $H/bin/cc-guard
+a noclobber-override redirection, whose | the split read as a pipe%cd sub && cp /dev/null >| $H/bin/cc-guard
+…and its glued spelling%cd sub && cp /dev/null >|$H/bin/cc-guard
+W45
+  ok "a write is judged over the whole statement, not the pieces the cd walk cuts it into: a destination after a substitution — in the middle, nested, redirected or inside the substitution itself — reaches the fence like a bare one" $r
 
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
@@ -479,13 +1178,17 @@ W11B
 fi
 
 inp=$(cat); tool=$(jq -r '.tool_name // ""' <<<"$inp"); cwd=$(jq -r '.cwd // ""' <<<"$inp"); cwd=$(realpath -m -- "${cwd:-/}" 2>/dev/null || echo "$cwd")
+qcmd=$(jq -r '.tool_input.command // .tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")   # what a member refusal records as "the command"
 # A command position: start, after a separator/substitution, or after wrapper words that hide the real command
 # (then/xargs/env/nohup/bash -c/VAR=…). Quotes are stripped from the haystack first, so "gh pr merge" is seen too.
 # THIS LIST IS NO LONGER WHAT CLOSES THE RULES — cmdpos() below is. Every word it does not know used to hide
 # what followed it, in all 24 rules that interpolate $AT: `timeout 5 pkill -f claude` and `setsid tmux
 # kill-server` went straight through, the universal tmux gate included. It stays because it is what matches the
 # line AS TYPED, and every rule below still expects it; cmdpos() puts the real command at ^ as well.
-AT='(^|[;&|(){}`]|\$\() *(((then|else|elif|do|time|env|nohup|xargs|command|eval|exec|sudo|bash|sh|-c)|[A-Za-z_][A-Za-z0-9_]*=[^ ]*) +)*'
+# find's `-exec`, `-execdir`, `-ok` and `-okdir` ARE wrapper words — the words after one are a command find runs,
+# and `find . -name x -exec cp {} ~/bin/cc-guard \;` overwrote a live binary with none of them here (3rd
+# adversarial review of #243). The longer spelling comes first: the match is the longest one that fits.
+AT='(^|[;&|(){}`]|\$\() *(((then|else|elif|do|time|env|nohup|xargs|command|eval|exec|sudo|bash|sh|-c|-execdir|-exec|-okdir|-ok)|[A-Za-z_][A-Za-z0-9_]*=[^ ]*) +)*'
 # A HEREDOC BODY IS DATA, NOT A COMMAND. The rules grep raw text, so a brief, a journal entry or a commit
 # message that merely NAMES a forbidden command was refused for containing it — writing the brief for this fix
 # was itself blocked that way. So heredoc bodies are dropped before matching. Quoted strings are NOT dropped:
@@ -565,62 +1268,280 @@ Q='(^|[^A-Za-z0-9_.-])(bash|sh|zsh|ksh|dash|python[0-9.]*|perl|ruby|node|php|awk
 cmdpos(){   # every position in $1 a command could START at, one per line, original text first
   awk -v NE="$NOEXEC" -v Q="$Q" '
     BEGIN { m = split(NE, a, /[ \t\n]+/); for (i = 1; i <= m; i++) if (a[i] != "") noexec[a[i]] = 1
-            SQ = sprintf("%c", 39) }                    # the two bounds are per statement: see flush()
-    function strip(s) { gsub("[\"" SQ "]", "", s); return s }
-    function flush(t, nt,   i, j, h, v, out, tail, budget) {   # every suffix of one statement, quotes off on the way out
+            SQ = sprintf("%c", 39); MK = sprintf("%c", 1)     # the two bounds are per statement: see flush()
+            for (i = 1; i < 128; i++) ORD[sprintf("%c", i)] = i }   # …and ansic needs a code back from a char
+    # A BACKSLASH IS NOT PART OF A COMMAND NAME. `\cc other --go` runs cc — the shell drops the backslash and
+    # only skips alias lookup — and `awk "BEGIN{system(\"cmd\")}"` hands awk the same string the single-quoted
+    # spelling does. Neither matched a rule, because every rule reads a NAME at ^ (adversarial review of #243).
+    # So the escape comes off before matching, here and in flatln. (No literal apostrophe in here: see below.)
+    # A DOUBLED backslash is ONE backslash, which by the line above is still not part of a name: `bash -c
+    # "\\echo hi; \\cc other t1 --go"` left `\cc` behind the real separator here (2nd adversarial review), so
+    # `\\` reduces the whole way. flatln does the same, in double quotes and bare alike.
+    # A DOLLAR-QUOTE IS ANSI-C QUOTING, AND THE SHELL RESOLVES IT BEFORE IT READS A NAME. Spelled $ + SQ + body
+    # + SQ, `\x63c other t1 --go` dispatches, `\x67h pr merge 1` merges, `\x63c-land 7` lands and `\x64ocker
+    # run -v /:/host alpine` opens the host — none of them reached a rule, because every rule reads a NAME at ^
+    # and what stood there was $ backslash x63c (3rd adversarial review of #243). So the escapes are resolved
+    # here and in flatln, the same way a doubled backslash is: \xHH, \NNN, \n, \t, \r, and a doubled backslash
+    # (reduced the whole way — a backslash is not part of a name); anything else is the character itself, the
+    # escaped quotes included. A dollar-quote that never closes on the line is left exactly as it was typed.
+    # (No literal apostrophe in any of this: the whole awk is one bash single-quoted string, and SQ is the char.)
+    function ansend(s, i,   n, c) {   # the SQ that closes a dollar-quote whose body starts at i; 0 = never closes
+      n = length(s)
+      for (; i <= n; i++) { c = substr(s, i, 1)
+        if (c == "\\") { i++; continue }
+        if (c == SQ) return i }
+      return 0
+    }
+    function ansnum(h, base,   i, v) { v = 0
+      for (i = 1; i <= length(h); i++) v = v * base + index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+      return v }
+    # \u AND \U ARE THE SAME ESCAPE IN LONGER HEX, AND \cX IS A CONTROL CHARACTER: `\u0063c other t1 --go`
+    # dispatched with none of them read (4th adversarial review of #243). \cX also SPELLS the statement mark,
+    # which is why nothing here may emit one — the mark is the walk, never the command (see hay).
+    function ansic(s,   i, n, c, d, h, v, out) {
+      out = ""; n = length(s)
+      for (i = 1; i <= n; i++) { c = substr(s, i, 1)
+        if (c != "\\") { out = out c; continue }
+        d = substr(s, ++i, 1); h = ""; v = -1
+        if (d == "x" || d == "u" || d == "U") { v = (d == "x" ? 2 : (d == "u" ? 4 : 8))
+                        while (length(h) < v && substr(s, i + 1, 1) ~ /^[0-9A-Fa-f]$/) h = h substr(s, ++i, 1)
+                        if (h == "") { out = out d; continue }
+                        v = ansnum(h, 16) }
+        else if (d ~ /^[0-7]$/) { h = d
+                        while (length(h) < 3 && substr(s, i + 1, 1) ~ /^[0-7]$/) h = h substr(s, ++i, 1)
+                        v = ansnum(h, 8) }
+        else if (d == "c") { d = substr(s, ++i, 1)           # ctrl-X: the letter with bit 7 cleared
+                        if (d == "") continue
+                        v = ORD[toupper(d)] % 32 }
+        else if (d == "n") v = 10
+        else if (d == "t") v = 9
+        else if (d == "r") v = 13
+        else if (d == "\\") continue
+        else { out = out d; continue }
+        # ONLY A PRINTABLE ASCII CHARACTER COMES BACK OUT. sprintf("%c") TRUNCATES a value it cannot hold, so the
+        # surrogate range re-spelled the two characters this must never emit: \ud801 came back as byte 0x01, the
+        # statement mark, and \ud80a as a newline (5th adversarial review of #243). A NEWLINE OR CR SPELLED
+        # DIRECTLY does the same: \n, \x0a, \012 and \cJ (all v=10) split a marked statement line, so the half
+        # after it lands UNMARKED and its cd is never walked — a write past it passed (7th adversarial review of
+        # #243). So 10 and 13 are excluded like the mark: anything outside 2..127, or a newline/CR, is a
+        # placeholder — a `?`, which is no part of a name and makes a path carrying it unresolvable. (No literal
+        # apostrophe in this note: the whole awk is one bash single-quoted string, and one would close it.)
+        if (v > 1 && v < 128 && v != 10 && v != 13) out = out sprintf("%c", v)
+        else if (v >= 0) out = out "?" }                     # \0 names nothing; \1 is the mark, \n/\r split a statement; the rest is a ?
+      return out
+    }
+    function unesc(s,   i, n, c, j, out) {
+      out = ""; n = length(s)
+      for (i = 1; i <= n; i++) { c = substr(s, i, 1)
+        if (c == "$" && substr(s, i + 1, 1) == SQ) {         # a dollar-quote: resolved before a rule reads it
+          j = ansend(s, i + 2)
+          if (j) { out = out ansic(substr(s, i + 2, j - i - 2)); i = j; continue } }
+        if (c == "\\") {
+          if (substr(s, i + 1, 1) == "\\") { i++; continue }
+          out = out substr(s, i + 1, 1); i++; continue }
+        out = out c }
+      return out
+    }
+    function strip(s) { s = unesc(s); gsub("[\"" SQ "]", "", s); return s }
+    # A METACHARACTER INSIDE QUOTES IS PROSE, NOT A SEPARATOR — it is inert in a real shell too, so a note or a
+    # commit message that reads `step one; cc foo --go` or `writes to > ~/bin/x` must not read as a second command
+    # or a redirect (2026-09-04: an odoo session was refused for a repo its heredoc/echo only DESCRIBED). flatln
+    # drops the quote chars like strip, but blanks the metacharacters between them first. The one thing it must NOT
+    # blank is a substitution that still RUNS: `"$(cmd)"` and a backtick in DOUBLE quotes execute, so those are kept
+    # and still reach the rules — only single quotes, where every one of them is literal, blank the lot. `(){}` are
+    # kept in "" as well, because telling a literal `(` from the `(` of `$(` needs lookback this does not do, and a
+    # false refusal is the safe way to be wrong. Used only where the quotes are BALANCED (the raw line and the
+    # quote-aware flush); the quote-blind interpreter walk keeps strip, so a quoted string an interpreter runs is
+    # still read as a command. (No literal apostrophe here: this whole awk is one bash single-quoted string — SQ is.)
+    # TWO THINGS A DOUBLE-QUOTED STRING STILL RUNS (landing review of #243): a substitution — from $( or an unescaped
+    # backtick the shell EXECUTES the interior, so a separator or redirect there is real — and a backslash, which
+    # escapes the next character, so \" does not close the string. scan() reads both the same way.
+    # A SUBSTITUTION IS VERBATIM UNTIL IT CLOSES. Blanking must not resume inside $( ) — the shell EXECUTES that
+    # text, so a separator or a redirect in there is real — but running the verbatim tail to the end of the LINE
+    # refused every quoted prose behind a substitution: `echo "$(date)" && git commit -m "step; <a gated command>
+    # was blocked"` (adversarial review of #243). So the tail ends where the substitution itself closes, and
+    # finding that close is why plain paren counting is not enough: a `)` inside $( ) need not be a close — a
+    # `case` pattern is the ordinary one — so while a `case … in` is open and no `esac` has closed it, a `)`
+    # closes that pattern and not the substitution. Quotes in there hold their parens too, and one that never
+    # closes on the line stays verbatim to the end: fail closed, which is what the whole-line tail did for every
+    # line. $(( )) arithmetic and a nested $( ) need no case of their own: their parens count like any other.
+    function flatln(s,   i, n, c, q, j, out, insub, dep, co, cw, cq) {
+      q = ""; out = ""; n = length(s); insub = 0; dep = 0; co = 0; cw = ""; cq = ""
+      for (i = 1; i <= n; i++) { c = substr(s, i, 1)
+        if (insub) {                                              # inside a substitution: a separator or redirect in
+          # …AND THE SHELL STILL PARSES THE INTERIOR. It once emitted every char verbatim, so a command name quoted
+          # inside $( ) or `` never landed at ^: `echo "$( "docker" run …)"` flattened with the quotes still on and
+          # $AT could not cross them, reopening the whole gate list (paid review of #243). The quote chars drop and
+          # \ reduces the way they do outside a substitution; only the metacharacters, which RUN here, stay verbatim.
+          if (insub == 2) {                                        # here IS real and kept — the tail runs to ITS close
+            if (c == "$" && substr(s, i+1, 1) == SQ) {             # a dollar-quote (ANSI-C) inside a backtick substitution: resolve it so a name spelled that way still anchors
+              j = ansend(s, i + 2)
+              if (j) { out = out ansic(substr(s, i + 2, j - i - 2)); i = j; continue } }
+            if (c == "\\") { out = out substr(s, i+1, 1); i++; continue }
+            if (c == "`") { out = out c; insub = 0; continue }     # a backtick closes on the next backtick
+            if (c == "\"" || c == SQ) continue                     # a quote drops the way strip drops it
+            out = out c; continue }
+          if (cq != "") { if (cq == "\"" && c == "\\") { out = out substr(s, i+1, 1); i++; continue }
+                          if (c == cq) { cq = ""; continue }        # the closing quote drops; a paren in there is no close
+                          out = out c; continue }
+          if (c == "$" && substr(s, i+1, 1) == SQ) {                # a dollar-quote (ANSI-C) inside the substitution: resolve it so a name spelled that way still anchors
+            j = ansend(s, i + 2)
+            if (j) { out = out ansic(substr(s, i + 2, j - i - 2)); i = j; continue } }
+          if (c == "\\" && substr(s, i+1, 1) == "\\") { i++; continue }   # \\ is one backslash, and no part of a name
+          if (c == "\\") { out = out substr(s, i+1, 1); i++; continue }   # \X is X
+          if (c == "\"" || c == SQ) { cq = c; continue }            # the opening quote drops
+          if (c ~ /[A-Za-z]/) { out = out c; cw = cw c; continue }   # …the word just ended: was it case or esac?
+          if (cw == "case") co++; else if (cw == "esac" && co > 0) co--
+          cw = ""
+          if (c == "(") dep++
+          else if (c == ")" && co == 0) { dep--; if (dep <= 0) { insub = 0; dep = 0 } }
+          out = out c; continue }
+        if (q != "") {
+          if (q == "\"" && c == "\\" && substr(s, i+1, 1) == "\\") { i++; continue }   # see the \\ note below
+          if (q == "\"" && c == "\\") { out = out substr(s, i, 2); i++; continue }   # an escape: \" does not close
+          if (c == q) { q = ""; continue }                          # the closing quote: dropped, as strip drops it
+          if (q == "\"" && c == "`") { insub = 2; out = out c; continue }
+          if (q == "\"" && c == "$" && substr(s, i+1, 1) == "(") {   # a substitution: it RUNS, so it is verbatim
+            insub = 1; dep = 1; co = 0; cw = ""; cq = ""; out = out "$("; i++; continue }
+          if (index(";&|<>", c) > 0) c = " "                        # a separator/redirect: literal in either quote
+          else if (q == SQ && index("(){}`$", c) > 0) c = " "       # single quotes make these literal too; double may run them
+          out = out c; continue }
+        # A DOUBLED BACKSLASH IS ONE BACKSLASH, AND A BACKSLASH IS NOT PART OF A NAME. `"\\cc"` is the string
+        # \cc, which is what `bash -c` then RUNS as cc — keeping both characters left `\cc` at ^ and every rule
+        # reads a NAME there, so `bash -c "\\cc other t1 --go"`, `eval "\\cc-land 7"` and `\\docker run …` all
+        # walked past the gate list (2nd adversarial review of #243). Both characters go, in "" and bare alike.
+        if (c == "$" && substr(s, i+1, 1) == SQ) {                  # a dollar-quote: ANSI-C, see ansic above
+          j = ansend(s, i + 2)
+          if (j) { out = out ansic(substr(s, i + 2, j - i - 2)); i = j; continue } }
+        if (c == "\\" && substr(s, i+1, 1) == "\\") { i++; continue }
+        if (c == "\\") { out = out substr(s, i+1, 1); i++; continue }   # \cc IS cc — and an escaped quote still opens nothing
+        if (c == "\"" || c == SQ) { q = c; continue }               # the opening quote: dropped
+        out = out c }
+      return out
+    }
+    function flush(t, nt, qa,   i, j, h, v, out, tail, budget) {   # every suffix of one statement, quotes off on the way out
       budget = 262144                                   # PER STATEMENT. As a per-command budget, one long
       for (i = 1; i <= nt && i <= 64 && budget > 0; i++) {  # statement switched the walk off for every later one
         h = strip(t[i]); sub(/^.*\//, "", h)            # /usr/bin/timeout is timeout
         if (h in noexec) return                         # it cannot run t[i+1]: nothing after this is a command
         tail = ""; for (j = i + 1; j <= nt; j++) tail = tail " " t[j]
         if (i < nt) { out = substr(tail, 2); budget -= length(out) + 1
-          print strip(out) }                            # …but a word this does not know might, so walk past it
+          print (qa ? flatln(out) : strip(out)) }       # …but a word this does not know might, so walk past it
         v = strip(t[i])                                 # "an --opt=VALUE whose value is a command has to reach
         if (match(v, /=/) && RSTART < length(v)) {      #  command position the same way an --opt VALUE one does"
           out = substr(v, RSTART + 1) tail; budget -= length(out) + 1
-          print strip(out) }                            # (review-193b) — the value is not its own token, so the
+          print strip(out) }                            # strip, NOT flatln: `--filter=CMD` hands CMD to a shell, so
       }                                                 # loop above never reaches it: split it off at the first =
     }
     function scan(line, qa,   i, n, c, q, cur, nt, t) {   # returns non-empty if the line ended inside a quote
       q = ""; cur = ""; nt = 0; n = length(line)
       for (i = 1; i <= n; i++) { c = substr(line, i, 1)
-        if (q != "") { cur = cur c; if (c == q) q = ""; continue }
+        if (q != "") { if (q == "\"" && c == "\\") { cur = cur substr(line, i, 2); i++; continue }   # \" does not close
+                       cur = cur c; if (c == q) q = ""; continue }
         if (c == "\\") { cur = cur substr(line, i, 2); i++; continue }   # \| is an escaped char, not a pipe
         if (qa && (c == "\"" || c == SQ)) { q = c; cur = cur c; continue }
         if (c == " " || c == "\t") { if (cur != "") { t[++nt] = cur; cur = "" }; continue }
         if (c == "$" && substr(line, i+1, 1) == "(") { if (cur != "") t[++nt] = cur
-          flush(t, nt); delete t; nt = 0; cur = ""; i++; continue }
+          flush(t, nt, qa); delete t; nt = 0; cur = ""; i++; continue }
+        # `{}` GLUED IS THE PLACEHOLDER find PASSES, NEVER A COMMAND GROUP — a group needs a space after the
+        # brace, and splitting on it truncated the statement before its target: `find -exec cp {} ~/bin/cc-guard`
+        # put a bare `cp` at ^ with nothing after it, so the write fence had no target to judge and it overwrote a
+        # live binary (3rd adversarial review of #243). Only the adjacent pair is a word; `{ cd x; …` still splits.
+        if (c == "{" && substr(line, i+1, 1) == "}") { cur = cur "{}"; i++; continue }
         if (index(";&|(){}`", c) > 0) { if (cur != "") t[++nt] = cur
-          flush(t, nt); delete t; nt = 0; cur = ""; continue }
+          flush(t, nt, qa); delete t; nt = 0; cur = ""; continue }
         cur = cur c }
       if (cur != "") t[++nt] = cur
-      flush(t, nt)
+      flush(t, nt, qa)
       return q
     }
-    { print strip($0)                                   # the line as typed: no rule loses what it matched before
-      if (scan($0, 1) != "" || $0 ~ Q) scan($0, 0) }' <<<"$1"
+    # A STATEMENT LINE IS MARKED, A SUFFIX IS NOT. The first whole-line print below is the command AS THE SHELL
+    # RUNS IT; every other line the walk emits is a SUFFIX, which is argument text — `git commit -m "cd /tmp"`
+    # emits `cd /tmp` on a line of its own. Read as a statement that moved the shell, so a real `cd ~/dev/other`
+    # on the line before could be cancelled by a quoted one and the write after it went through, and a message
+    # naming `popd` emptied the base and refused an ordinary write (3rd adversarial review of #243). Only the
+    # cd/pushd/popd walk cares which is which, so the mark is a \001 the caller strips off for every other rule.
+    { print MK flatln($0)                               # the line as typed, but a metachar inside quotes is inert
+      # …AND THE RAW LINE TOO whenever the quote-blind rescan runs. The rescan only emits SUFFIXES, so the raw
+      # print is the one line that puts the SECOND statement of an interpreter string in command position:
+      # `bash -c "x; cc other t1 --go"` was refused by strip($0) and passed flatln($0) alone (security review).
+      # …SO ONE SOURCE LINE IS WALKED AS A STATEMENT TWICE, AND A RELATIVE cd MOVED THE BASE TWICE — to a dir the
+      # shell never stands in. From ~/dev/<h>/sub, an sh -c string holding `cd ../.. && sed -i s/x/y/ f` really
+      # writes ~/dev/f and PASSED on a base gone a level too far, while `cd .. && sed -i s/x/y/ f` writes the dir
+      # the member owns and was refused (paid review of #243). An absolute cd is idempotent under a double
+      # application, which is why every case so far missed it. Neither print can just drop the mark: the quote-
+      # aware one is what keeps a quoted `cd` in a commit message from cancelling a real one (case 29), and the
+      # raw one is the only reading that sees the cd in `bash -c "echo x; cd ~/dev/other; write"`, where the
+      # quote-blind statement is the one the shell really runs. So the RAW line is announced as a re-reading of
+      # the SAME source line — a line that is the mark and nothing else — and the walk rewinds the base to where
+      # the line started before it walks it again, keeping whichever reading moved. THE REWIND IS TWO MARKS
+      # because ONE is a line cmdpos already prints: an empty pair of quotes flattens to nothing, so the mark
+      # in front of it stands alone, and read as a rewind it undid the cd on the line BEFORE — a source line of
+      # a cd into another repo, then that empty pair, then a write, went through (first cut of this same fix).
+      # A statement line is a mark and its text, so it can never spell two. NOTE no apostrophe survives in here:
+      # this comment sits inside the single-quoted awk program, and one closed it (this fix, again).
+      if (scan($0, 1) != "" || $0 ~ Q) { print MK MK; print MK strip($0); scan($0, 0) } }' <<<"$1"
 }
 hay(){   # the text the rules match: heredoc bodies out, quotes stripped, every command position at ^
   local c=$1
+  # THE MARK IS THE WALK'S, NEVER THE COMMAND'S. cmdpos marks a statement line with a \001, and the command text
+  # is a member's to write: `git commit -m "<0x01>cd ~/dev/ws1"` put a marked line in the haystack, so a quoted cd
+  # was read as a statement again and cancelled a real one (4th adversarial review of #243). It comes off the text
+  # before the walk ever sees it — here, once, so no path into cmdpos can carry one; ansic never emits one either.
+  c=${c//$'\001'/}
   case "$c" in *'<<'*) c=$(awk -v X="$X" '
+      BEGIN { SQ = sprintf("%c", 39) }
       { L[NR] = $0 }
-      END { b = 0
+      # A `<<` INSIDE QUOTES OR BEHIND A `#` OPENS NOTHING. This pre-pass was quote- and comment-blind, so
+      # `echo \047<< EOF\047` opened a heredoc bash never opens and every line down to the next EOF left the
+      # haystack — with it the tmux fence, the gate list and the write fence, all of them, for a payload
+      # anybody can write (6th adversarial review of #243). A quoted `<<` is text and a `#` at the start of a
+      # word ends the line, so the walk below finds the first `<<` the SHELL would read, or none at all.
+      function hdpos(s,   i, n, c, q) {
+        n = length(s)
+        for (i = 1; i <= n; i++) { c = substr(s, i, 1)
+          if (q != "") { if (q == "\"" && c == "\\") i++; else if (c == q) q = ""; continue }
+          if (c == "\\") { i++; continue }
+          if (c == "\"" || c == SQ) { q = c; continue }
+          if (c == "#" && (i == 1 || substr(s, i - 1, 1) ~ /[ \t;&|(]/)) return 0   # a comment: nothing after it runs
+          if (c == "<" && substr(s, i + 1, 1) == "<") return i }
+        return 0
+      }
+      # AN UNQUOTED DELIMITER EXPANDS THE BODY, AND AN EXPANSION IS A COMMAND. `cat > note.md <<EOF` over
+      # `$(cc other t1 --go)` really dispatches, and the same body could read the credentials, merge a PR or
+      # copy over a live binary through a backtick — every one of them was dropped as prose (5th adversarial
+      # review of #243). `<<QUOTED` and `<<-\047EOF\047` are literal and still go. So the delimiter says which:
+      # bare, the body lines carrying a substitution or a parameter stay in the haystack, and the rest of the
+      # body — the prose this whole drop exists for — still goes.
+      # …AND A BACKSLASH AT THE END OF A BODY LINE JOINS THE NEXT ONE, so a substitution spread over two lines
+      # was tested one line at a time and neither half carried the whole of it: `$(cp /dev/null \\` over
+      # `~/bin/cc-guard)` truncated a live binary (6th adversarial review of #243). The lines are joined the
+      # way the shell joins them, and the join is what gets tested.
+      END { b = 0; bq = 0; hb = ""
         for (i = 1; i <= NR; i++) {
-          if (b) { if (L[i] ~ t) b = 0; continue }
+          if (b) { if (L[i] ~ t) { if (hb ~ /[$][({]|`/) print hb; b = 0; hb = ""; continue }   # a body line held open by a trailing backslash JOINS this delimiter line: its pending substitution stays in the haystack, untested it truncated a live binary (7th adversarial review of #243)
+                   if (bq) continue
+                   hb = hb L[i]
+                   if (hb ~ /\\$/) { sub(/\\$/, "", hb); continue }   # continued: the next line is the same line
+                   if (hb ~ /[$][({]|`/) print hb
+                   hb = ""; continue }
           print L[i]                                        # the line that OPENS a heredoc is still a command
-          n = index(L[i], "<<"); if (n == 0) continue
+          n = hdpos(L[i]); if (n == 0) continue
           head = substr(L[i], 1, n - 1); rest = substr(L[i], n + 2)
           if (index(rest, "<<") > 0) continue               # two on one line: too clever to reason about
           if (!match(rest, "^-?[ \t]*[\"\047]?[A-Za-z_][A-Za-z0-9_]*")) continue   # `<<<` and shifts are not heredocs
-          w = substr(rest, RSTART, RLENGTH); sub("^-?[ \t]*[\"\047]?", "", w)
+          w = substr(rest, RSTART, RLENGTH)
+          bq = (w ~ "^-?[ \t]*[\"\047]")                    # a quoted delimiter: the body is literal, all of it
+          sub("^-?[ \t]*[\"\047]?", "", w)
           if (head ~ X) continue                            # the body would be RUN: it stays in the haystack
           t = "^[ \t]*" w "[ \t]*$"
-          for (j = i + 1; j <= NR; j++) if (L[j] ~ t) { b = 1; break }
+          for (j = i + 1; j <= NR; j++) if (L[j] ~ t) { b = 1; hb = ""; break }
         } }' <<<"$c");; esac
   cmdpos "$c"          # …which strips the quotes itself: it needs them to tell an argument from a command
 }
 if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones and their subagents included): nothing may kill the shared tmux server
-  u=$(hay "$(jq -r '.tool_input.command // ""' <<<"$inp")")
+  uk=$(hay "$(jq -r '.tool_input.command // ""' <<<"$inp")")   # …with the statement lines marked: see cmdpos
+  u=${uk//$'\001'/}   # every rule but the cd walk reads a NAME at ^, so the mark comes off here, not in a second pass
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
@@ -710,80 +1631,70 @@ fi
 case "$role" in worker|member) ;; *) exit 0;; esac
 [ -n "$root" ] || root=$cwd   # nothing to anchor on (an env-only role, a handoff-gated session): the cwd, as before
 in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && case "$1" in "$mdir"|"$mdir"/*) return 0;; esac; return 1; }
-# A REFUSAL IN A MEMBER-FACING CHANNEL IS AN ASK, NOT A DEAD END. This is the only place that knows a member's
-# request was stopped, and until now both halves ended here: the member saw nothing (one asked twice for images
-# this gate refused) and the owner was never told there was anything to approve. A gate that stops work without
-# producing a visible ask is indistinguishable from the box ignoring somebody. So a member-facing deny now emits
-# BOTH, mechanically, instead of relying on the session to remember to: a 🔐 line in the member's own channel
-# (the box's sweep marks a 🔐 message ❓ = needs you, so it also lands on the owner's tab) and a cc-notify
-# escalation, which from a member-facing dir is delivered to the owner rather than routed back into that channel.
-# WORKER AND HANDOFF DENIALS ARE UNTOUCHED — they have a board, a journal and a STATUS: BLOCKED line — and so are
-# the owner's own channels, which are not member-facing sessions.
-# Bounded three ways: nothing runs unless role=member, one ask per channel+reason per ASK_TTL (a session retrying
-# a blocked command must not spray the channel), and `timeout` on both calls so a slow Slack cannot hang a hook.
-# TWO CLASSES OF DENY, AND ONLY ONE OF THEM IS A QUESTION. 2026-09-02 00:03Z the owner was DM'd at midnight
-# because a member-facing session had been refused the landing tool — a thing no owner would ever approve FOR a
-# member, so the page asked him nothing and could only be read and dismissed. A page is worth waking someone for
-# when the answer could be yes: merging, pushing, a comment in his name, an email, a post to his Slack. Landing,
-# dispatching a worker and host changes are never that session's to run at all, whoever says so — the member is
-# still told in their own channel (a refusal must not be silent, which is the other half of this gate), but the
-# owner is not asked a question that has no yes in it. `deny` pages; `never` does not — and `never` with a second
-# arg posts nothing at all: a write the session aimed outside its own tree is its own to fix from the stderr line,
-# not news for the channel (three note files, six 🔐 lines, 2026-09-04).
+# A MEMBER REFUSAL IS A QUERY TO THE BOX, NOT A LINE IN THE MEMBER'S CHANNEL. Until now a member-facing deny put a
+# 🔐 line in the member's own channel (which the members read) and DM'd the owner. The owner's call (2026-09-04): a
+# member session "should have enough permissions to do stuff. These errors should just be routed to you instead" —
+# to the box's queries session, in a queries channel (owner + box only), which approves it, answers it, or turns it
+# into a board row / message for the planning session; the owner hears only what that session cannot settle.
+# So a member refusal RECORDS a query and does nothing else here: nothing in the member's channel, no page to the
+# owner. The record is a line in ~/.cc/state/<workspace>/queries.spool — a member sandbox has no tmux and no owner
+# socket, but it CAN write its own state dir (the sandbox binds it rw), and the host drains that spool (cc-msg
+# --drain): one line into the queries channel, and the query delivered to the queries session — the planning
+# session when no queries session is up. core/ never names the channel or the session: those are cc-config keys the
+# box sets, so nothing here is this box's identity. WORKER AND HANDOFF DENIALS ARE UNTOUCHED — they have a board, a
+# journal and a STATUS: BLOCKED line — and so are the owner's own channels. The member session still gets its stderr.
+# TWO CLASSES, KEPT IN THE RECORD. `deny` = the owner could say yes (merging, pushing, a comment in his name): class
+# "page". `never` = no yes exists for this tier (landing, dispatching, host changes): class "nopage" — the queries
+# session still sees it (a guard rule that should have allowed it is a patch for the planning session, not an
+# approval) but knows not to ask for a yes that cannot exist. `never` with a SECOND arg records NOTHING: a write the
+# session aimed outside its own tree is its own to fix from the stderr line, not a question for anyone (2026-09-04).
+# Bounded: nothing runs unless role=member, and one query per workspace+reason per ASK_TTL, so a session retrying a
+# blocked command does not fill the spool. A path in the reason is dropped from that key (a list of files refused by
+# one rule is one query); the record keeps the reason and the command, each cut to 2 KB.
 ASKS="${CC_GUARD_ASKS:-$HOME/.cc/guard-asks}"; ASK_TTL="${CC_GUARD_ASK_TTL:-1800}"
-# A FIXTURE CAN NEVER PAGE. The same rule as cc-handoff's alert(), here for the same reason: the two calls below
-# are the box's real Slack and the owner's real DM, and a suite's payload reaches them through this function like
-# any other. cc-notify honours CC_NOTIFY_LOG_ONLY itself but `cc-slack post` does not, and neither of them knows
-# a _cctest cwd from a real one — so both are decided HERE, before either binary is even looked for.
-test_state(){   # rc 0 = this call came from a fixture: log it, never send it
-  [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && return 0
-  case "/$cwd/" in */_cctest*|*/_selfcheck*) return 0;; esac
-  return 1
-}
-ask_owner(){
-  local why=$1 page=${2-1} chan="" key f was now c bin   # ${2-1}, never ${2:-1}: `never` passes an EMPTY page
-  if test_state; then   # one line, in the file cc-notify's own test hook names, and nothing is sent
-    printf 'guard-ask\t%s\t%s\n' "$([ -n "$page" ] && echo page || echo nopage)" "$why" \
-      >> "${CC_NOTIFY_LOG:-$HOME/.cc/notify.log}" 2>/dev/null || true
-    return 0
-  fi
-  [ -n "$mdir" ] && chan=${mdir##*/}
-  if [ -n "$chan" ] && [ -f "$HOME/.cc/slack/provisioned.json" ]; then   # the dir's name and its channel's can differ
-    c=$(jq -r --arg t "$chan" '.[$t].chan // empty' "$HOME/.cc/slack/provisioned.json" 2>/dev/null) || c=""
-    [ -n "$c" ] && chan=$c
-  fi
-  # THE KEY DROPS A PATH IN PARENTHESES — only that. Every write-path reason names what it refused as "(/…)" or
-  # "(~/…)", so keying on the whole reason made one rule a new ask per file, and a session working through a list
-  # asked once each (2026-09-04). Any other parenthetical is part of the reason: "does not dispatch workers
-  # (cc --go)" and "(cc-loop)" are two refusals, not one (review of #222). The stderr line keeps the path.
-  now=$(date +%s); key=$(printf '%s\n%s' "${chan:-nochan}" "$(sed -E 's# \([~/][^)]*\)##g' <<<"$why")" | cksum | tr -cd '0-9')
+record_query(){   # $1 = reason (why); $2 nonempty = class "page" (owner could approve), empty = "nopage"
+  local why=$1 page=${2-1} qkey key was now sp lock rec class qc wr   # ${2-1}, never ${2:-1}: `never` passes an EMPTY page
+  # A SESSION GATED BY $CC_ROLE ALONE HAS NO WORKSPACE TO NAME, AND ITS REFUSAL IS STILL A QUERY. Returning here
+  # left it with no record, no channel line and no page — the refusal reached nobody but the session's own stderr,
+  # which is the one thing this file says must not happen (landing review of #243). So it spools under a RESERVED
+  # workspace name instead: the host drains "_nomarker" like any other, the queries session sees it said in the
+  # channel (or the owner is paged, on a box with no channel set), and the name itself says why it has no handle.
+  qkey=${mws:-${mdir##*/}}; [ -n "$qkey" ] || qkey=_nomarker
+  class=$([ -n "$page" ] && echo page || echo nopage)
+  # ONE QUERY PER WORKSPACE+REASON PER TTL. The key drops a path in parentheses only — "(/…)"/"(~/…)" — so a rule
+  # refusing a list of files is one query; "(cc --go)" and "(cc-loop)" stay two. The record itself keeps the path.
+  now=$(date +%s); key=$(printf '%s\n%s' "$qkey" "$(sed -E 's# \([~/][^)]*\)##g' <<<"$why")" | cksum | tr -cd '0-9')
   mkdir -p "$ASKS" 2>/dev/null || return 0
-  f="$ASKS/$key"
-  if [ -f "$f" ]; then
-    was=$(cat "$f" 2>/dev/null) || was=0
-    case "$was" in ''|*[!0-9]*) was=0;; esac
-    [ $((now - was)) -lt "$ASK_TTL" ] && return 0    # already asked, and the owner has not had time to answer
-  fi
-  printf '%s\n' "$now" > "$f"
-  bin="$HOME/bin"; [ -x "$bin/cc-slack" ] || bin=$(dirname -- "$0")
-  # The member sees it. 🔐 is the box's own "nothing happens until the owner answers" form, and the sweep reads it.
-  [ -n "$chan" ] && [ -x "$bin/cc-slack" ] && timeout 20 "$bin/cc-slack" post -c "#$chan" \
-    "$(if [ -n "$page" ]; then printf '🔐 I cannot do that part myself: %s.\nI have asked the owner to approve it — nothing more happens here until they do. Anything that needs no approval I am still doing.' "$why"
-       else printf '🔐 I cannot do that: %s.\nThat one is not mine to run and not mine to ask for, so there is nothing pending — tell the owner yourself if it needs doing. Anything else I am still doing.' "$why"; fi)" >/dev/null 2>&1
-  [ -n "$page" ] || return 0                        # "never for this tier": the member is told, the owner is not asked
-  bin="$HOME/bin"; [ -x "$bin/cc-notify" ] || bin=$(dirname -- "$0")
-  # ...and the owner is told there is something to approve. --owner delivers it (a DM), never back into the channel.
-  [ -x "$bin/cc-notify" ] && ( cd "${mdir:-/}" 2>/dev/null || cd /
-    timeout 25 "$bin/cc-notify" --owner -p high \
-      "$(printf 'Needs you: a member-facing session was refused — %s%s. I told them it is with you.' "$why" "${chan:+ (#$chan)}")" >/dev/null 2>&1 )
+  if [ -f "$ASKS/$key" ]; then was=$(cat "$ASKS/$key" 2>/dev/null) || was=0; case "$was" in ''|*[!0-9]*) was=0;; esac
+    [ $((now - was)) -lt "$ASK_TTL" ] && return 0; fi   # already recorded, and the box has not had time to answer
+  printf '%s\n' "$now" > "$ASKS/$key"
+  sp="$HOME/.cc/state/$qkey/queries.spool"; mkdir -p "$(dirname "$sp")" 2>/dev/null || return 0
+  # CUT BEFORE THE LINE IS BUILT. cc-msg discards a whole queries.spool over 1 MB as a plant and pages the owner
+  # about it, so one refused command with a big heredoc body would take every query queued in that file down with
+  # it (landing review of #243). cc-msg already cuts to 200/300 when it reads, so nothing downstream changes; the
+  # marker is there so the queries session knows it is not looking at the whole command.
+  qc=$qcmd; wr=$why
+  [ "${#qc}" -gt 2000 ] && qc="${qc:0:2000} …(cut)"
+  [ "${#wr}" -gt 2000 ] && wr="${wr:0:2000} …(cut)"
+  rec=$(jq -cn --arg at "$(date -u +%FT%TZ)" --arg ws "$qkey" --arg class "$class" --arg reason "$wr" --arg cmd "$qc" \
+        '{at:$at,workspace:$ws,class:$class,reason:$reason,command:$cmd}' 2>/dev/null) || return 0
+  lock="$HOME/.cc/state/$qkey/.queries.lock"
+  ( flock -w 5 9 || exit 0; printf '%s\n' "$rec" >> "$sp" ) 9>"$lock" 2>/dev/null || true
   return 0
 }
-deny(){ [ "$role" = member ] && ask_owner "$1" 1; echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; exit 2; }
-# "never for this tier": the owner could not approve it FOR this session even if he were asked, so nothing pages.
-# A SECOND ARG = the channel is not told. The member asked for an outcome, not for a path: a refusal the session
-# brought on itself by choosing where to write is its own to fix from the stderr line, and three note files
-# refused in one call put six 🔐 lines in a member's channel (2026-09-04). What the member asked for still posts.
-never(){ [ "$role" = member ] && [ -z "${2-}" ] && ask_owner "$1" ""; echo "cc-guard: blocked — $1. This is not this session's to run and not the owner's to approve for it — nobody is being asked, so do not wait on an answer." >&2; exit 2; }
+deny(){
+  if [ "$role" = member ]; then record_query "$1" 1
+    echo "cc-guard: blocked — $1. A query about this has gone to the box; it will approve it or take it onward. Do anything that needs no approval and say what you are waiting on." >&2
+  else echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; fi
+  exit 2; }
+# "never for this tier": no yes exists FOR this session, so the query is nopage — the queries session is still told.
+# A SECOND ARG = record nothing: a write the session aimed outside its own tree is its own to fix from the stderr
+# line, not a question for anyone, and three note files refused in one call put six lines in a channel (2026-09-04).
+never(){
+  if [ "$role" = member ] && [ -z "${2-}" ]; then record_query "$1" ""
+    echo "cc-guard: blocked — $1. This is not this session's to run; the box has been told, so nothing here waits on it. Do the rest." >&2
+  else echo "cc-guard: blocked — $1. This is not this session's to run and not the owner's to approve for it — nobody is being asked, so do not wait on an answer." >&2; fi
+  exit 2; }
 denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
 ws_dispatch_ok(){   # EVERY dispatch in $1 names workspace $2 as its repo — and there is at least one to name.
   # `cc <ws> <track> --go` is a workspace's ONLY dispatch form: it is where the daily cap is charged (cc: member_gate).
@@ -1062,41 +1973,248 @@ case "$tool" in
     #    where it LANDS, never by how it was spelled. Verbs with a destination: redirections; cp/mv/ln/install/rsync (the
     #    last arg, or -t); tee and sed -i (every file); dd of=; and git -C <there> with a verb that writes. A variable or
     #    a glob in the target cannot be resolved and passes: the same honest ceiling as every other line here.
-    hit=""
-    wtgt(){ local t=$1   # rc 0 = $1 lands in ~/dev/* or ~/bin, outside this session's own tree; $hit says where
+    #    A RELATIVE TARGET LANDS WHERE THE LINE HAS GOT TO, NOT WHERE THE PAYLOAD STARTED: `cd ~/dev/other && echo
+    #    pwn > f` resolved f against the cwd, found it inside this session's own tree and passed (adversarial
+    #    review of #243). So $wbase carries the cd along the line, and a cd this cannot resolve (a variable) makes
+    #    every relative target after it a refusal — the same "refuse what you cannot reduce" as the kill fence.
+    hit=""; wbase=$cwd
+    wtgt(){ local t=${1%\`}   # rc 0 = $1 lands in ~/dev/* or ~/bin, outside this session's own tree; $hit says where
+      # A GLOB IS NOT AN UNRESOLVABLE NAME. It is a name with a tail this cannot see, and the head of it says
+      # where the write LANDS: `cp /dev/null ~/bin/cc-guar?` truncated a live binary while this waved it
+      # through for carrying a `?` (6th adversarial review of #243). The literal prefix is judged; `~/bin/x?`
+      # is refused and `sub/x?` still runs. A `$` or a backtick stays unresolvable — a variable names anywhere.
+      # The backtick that CLOSED a substitution is the last character of the last word in it, so `cp /dev/null
+      # ~/bin/cc-guard` inside one handed this a target with a backtick on the end, and a name carrying one is
+      # called unresolvable and waved through (5th adversarial review of #243). It is a boundary, not a name.
       # shellcheck disable=SC2088  # a literal ~ in a case pattern is the point: it is being expanded by hand
       case "$t" in '~') t=$HOME;; '~/'*) t=$HOME/${t#\~/};; '$HOME'|'${HOME}') t=$HOME;; '$HOME/'*) t=$HOME/${t#\$HOME/};; '${HOME}/'*) t=$HOME/${t#\$\{HOME\}/};; esac
-      case "$t" in ''|-*|*['$`*?[']*) return 1;; /*) ;; *) t=$cwd/$t;; esac
+      case "$t" in *['*?[']*) t=${t%%[*?[]*};; esac       # …so the glob is cut off and its prefix judged
+      case "$t" in ''|-*|*['$`']*) return 1;; /*) ;;
+        *) [ -n "$wbase" ] || never "writing to a relative path after a \`cd\` this cannot resolve — where it would land is unknown, so it is refused rather than guessed"
+           t=$wbase/$t;; esac
       t=$(realpath -m -- "$t" 2>/dev/null) || return 1
       case "$t" in "$HOME"/dev/*|"$HOME"/bin|"$HOME"/bin/*) in_root "$t" && return 1; hit=$t; return 0;; esac; return 1; }
     wdeny(){ never "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs and ~/bin symlinks into it — a track writes its worktree, /tmp and its own ~/.cc/state dir, and the rest arrives as a PR"; }
-    while IFS= read -r t; do wtgt "$t" && wdeny; done < <(grep -oE '(&>>?|[0-9]*>>?[|]?)[[:space:]]*[^[:space:];&|<>()]+' <<<"$cmd" | sed -E 's/^[^[:space:]]*>[|]?[[:space:]]*//')
-    while IFS= read -r inv; do
-      [[ $inv =~ (^|[^A-Za-z0-9_.-])(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+(.*)$ ]] || continue
-      v=${BASH_REMATCH[2]}; read -r -a a <<<"${BASH_REMATCH[3]}"; dst=""; last=""; skip=""; files=(); n=0; ef=""
-      case "$v" in
-        cp|mv|ln|install|rsync) for x in "${a[@]}"; do
-            if [ -n "$skip" ]; then dst=$x; skip=""; continue; fi
-            case "$x" in -t|--target-directory) skip=1;; --target-directory=*) dst=${x#*=};; -*) ;; *) last=$x;; esac; done
-          files=("${dst:-$last}");;
-        tee) for x in "${a[@]}"; do case "$x" in -*) ;; *) files+=("$x");; esac; done;;
-        sed) case " ${a[*]} " in *" -i"*|*" --in-place"*) ;; *) continue;; esac   # without -i sed writes nothing
-          for x in "${a[@]}"; do case "$x" in -e|-f|--expression|--file) ef=1;; esac; done
-          for x in "${a[@]}"; do   # the script is the first bare arg unless -e/-f carried it; the rest are files
-            if [ -n "$skip" ]; then skip=""; continue; fi
-            case "$x" in -e|-f|--expression|--file) skip=1;; -*) ;; *) n=$((n+1)); { [ -n "$ef" ] || [ "$n" -gt 1 ]; } && files+=("$x");; esac; done;;
-        dd) for x in "${a[@]}"; do case "$x" in of=*) files+=("${x#of=}");; esac; done;;
-      esac
-      for x in "${files[@]}"; do wtgt "$x" && wdeny; done
-    done < <(grep -oE "$AT"'([^ ]*/)?(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+[^;&|]*' <<<"$cmd")
-    while IFS= read -r inv; do   # git -C ~/dev/<repo> checkout|apply|stash|… rewrites that tree as surely as cp does
-      [[ $inv =~ (^|[^A-Za-z0-9_.-])git[[:space:]]+(.*)$ ]] || continue; read -r -a a <<<"${BASH_REMATCH[2]}"; skip=""; dirs=(); verb=""
-      for x in "${a[@]}"; do
-        if [ -n "$skip" ]; then [ "$skip" = d ] && dirs+=("$x"); skip=""; continue; fi
-        case "$x" in -C) skip=d;; -c|--git-dir|--work-tree) skip=x;; -*) ;; *) verb=$x; break;; esac; done
-      case "$verb" in add|am|apply|checkout|cherry-pick|clean|commit|merge|mv|pull|rebase|reset|restore|revert|rm|stash|switch|worktree|submodule|update-ref|symbolic-ref)
-        for x in "${dirs[@]}"; do wtgt "$x" && wdeny; done;; esac
-    done < <(grep -oE "$AT"'([^ ]*/)?git[[:space:]]+-C[[:space:]]+[^;&|]*' <<<"$cmd")
+    wcd(){   # where a `cd`/`pushd` leaves the rest of the line; rc 1 = it cannot be resolved, so $wbase is emptied
+      local t=$1
+      # shellcheck disable=SC2088  # the same hand-expansion as wtgt: a literal ~ is what a command line carries
+      case "$t" in '~') t=$HOME;; '~/'*) t=$HOME/${t#\~/};; '$HOME'|'${HOME}') t=$HOME;; '$HOME/'*) t=$HOME/${t#\$HOME/};; '${HOME}/'*) t=$HOME/${t#\$\{HOME\}/};; esac
+      case "$t" in '') t=$HOME;; '~-'|+[0-9]*|-*|*['$`*?[']*) return 1;; /*) ;; *) [ -n "$wbase" ] || return 1; t=$wbase/$t;; esac
+      realpath -m -- "$t" 2>/dev/null || return 1; }
+    wscan(){   # the three write shapes over one piece of the haystack, every relative target against $wbase
+      local txt=$1 t inv v x dst skip ef n verb; local -a a files dirs
+      while IFS= read -r t; do wtgt "$t" && wdeny; done < <(grep -oE '(&>>?|[0-9]*>>?[|]?)[[:space:]]*[^[:space:];&|<>()]+' <<<"$txt" | sed -E 's/^[^[:space:]]*>[|]?[[:space:]]*//')
+      while IFS= read -r inv; do
+        [[ $inv =~ (^|[^A-Za-z0-9_.-])(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+(.*)$ ]] || continue
+        v=${BASH_REMATCH[2]}; read -r -a a <<<"${BASH_REMATCH[3]}"; dst=""; skip=""; files=(); n=0; ef=""
+        case "$v" in
+          # THE DESTINATION IS NOT ALWAYS THE LAST WORD. Reading only the last one, any trailing word moved the
+          # target out of sight: `cp a ~/bin/cc-guard 2>/dev/null` judged `2>/dev/null`, and `sh -c 'cp $1
+          # ~/bin/cc-guard' _ a` judged `a` — both overwrote a live binary (4th adversarial review of #243). So
+          # EVERY bare word after the first is judged. Only the first is a source and safe to skip; a `-t` names
+          # the destination outright and the bare words are then all sources. The cost is a false refusal on
+          # `cp a ~/dev/other/b sub/`, where a middle SOURCE is judged as a target: over-strict, the safe way.
+          cp|mv|ln|install|rsync) for x in "${a[@]}"; do
+              if [ -n "$skip" ]; then dst=$x; skip=""; continue; fi
+              case "$x" in -t|--target-directory) skip=1;; --target-directory=*) dst=${x#*=};;
+                -*) ;; *) n=$((n+1)); [ "$n" -gt 1 ] && files+=("$x");; esac; done
+            [ -z "$dst" ] || files=("$dst");;
+          tee) for x in "${a[@]}"; do case "$x" in -*) ;; *) files+=("$x");; esac; done;;
+          sed) case " ${a[*]} " in *" -i"*|*" --in-place"*) ;; *) continue;; esac   # without -i sed writes nothing
+            for x in "${a[@]}"; do case "$x" in -e|-f|--expression|--file) ef=1;; esac; done
+            for x in "${a[@]}"; do   # the script is the first bare arg unless -e/-f carried it; the rest are files
+              if [ -n "$skip" ]; then skip=""; continue; fi
+              case "$x" in -e|-f|--expression|--file) skip=1;; -*) ;; *) n=$((n+1)); { [ -n "$ef" ] || [ "$n" -gt 1 ]; } && files+=("$x");; esac; done;;
+          dd) for x in "${a[@]}"; do case "$x" in of=*) files+=("${x#of=}");; esac; done;;
+        esac
+        for x in "${files[@]}"; do wtgt "$x" && wdeny; done
+      done < <(grep -oE "$AT"'([^ ]*/)?(cp|mv|ln|install|rsync|tee|sed|dd)[[:space:]]+[^;&|]*' <<<"$txt")
+      while IFS= read -r inv; do   # git -C ~/dev/<repo> checkout|apply|stash|… rewrites that tree as surely as cp does
+        [[ $inv =~ (^|[^A-Za-z0-9_.-])git[[:space:]]+(.*)$ ]] || continue; read -r -a a <<<"${BASH_REMATCH[2]}"; skip=""; dirs=(); verb=""
+        for x in "${a[@]}"; do
+          if [ -n "$skip" ]; then [ "$skip" = d ] && dirs+=("$x"); skip=""; continue; fi
+          case "$x" in -C) skip=d;; -c|--git-dir|--work-tree) skip=x;; -*) ;; *) verb=$x; break;; esac; done
+        case "$verb" in add|am|apply|checkout|cherry-pick|clean|commit|merge|mv|pull|rebase|reset|restore|revert|rm|stash|switch|worktree|submodule|update-ref|symbolic-ref)
+          for x in "${dirs[@]}"; do wtgt "$x" && wdeny; done;; esac
+      done < <(grep -oE "$AT"'([^ ]*/)?git[[:space:]]+-C[[:space:]]+[^;&|]*' <<<"$txt")
+    }
+    # No cd anywhere in the command = the haystack is one pass, exactly as before. With one, each LINE is walked
+    # statement by statement instead, so a target is judged against the dir the cd before it moved to. A cd inside
+    # a subshell moves $wbase for the rest of the line as well: over-strict, and never the other way round.
+    # $wbase IS PER PAYLOAD, NOT PER LINE. A newline is not a cd back: `cd ~/dev/other &&` + newline + `echo pwn > f`
+    # (and the `;` and backslash-continuation spellings) resolved f against the payload's own cwd and passed, because
+    # the walk reset the base on every line (2nd adversarial review of #243). A cd on line 1 governs line 2.
+    # $wstack IS pushd's DIRECTORY STACK, so popd goes back where pushd came from — untracked, popd left the base
+    # at the pushd'd dir and `pushd ~/dev/other; pushd /tmp; popd; echo pwn > f` passed. An empty stack and a slot
+    # (`popd +1`) are unresolvable: the base is emptied and a later relative write is refused.
+    # ONLY A STATEMENT LINE MOVES THE SHELL. The haystack carries the walk's SUFFIXES too, and a suffix is argument
+    # text: `git commit -m "cd /tmp"` puts `cd /tmp` on a line of its own, which cancelled a real cd into another
+    # repo and let the write after it through, while `git commit -m "popd broke the build"` emptied the base and
+    # refused an ordinary write (3rd adversarial review of #243). cmdpos marks the statement lines with a \001;
+    # everything else is walked for WRITES, which is what a wrapper's suffix is there for, and never for a cd.
+    # THE PREFIX IS $AT's WRAPPER LIST, plus `builtin`: `command cd ~/dev/other && echo pwn > f` and the `builtin`
+    # spelling both move the shell and neither was tracked, because the prefix took only `(`, `{` and VAR= (same
+    # review). `bash -c "cd ~/dev/other; …"` moves the shell it starts, which is the one that does the writing.
+    # TWO KNOWN COSTS, DOCUMENTED RATHER THAN FIXED: `cd "$VAR" && <relative write>` is refused by design — the cd
+    # cannot be resolved, so where the write lands is unknown, and with the base per payload that now holds for a
+    # write on a LATER line too — and `git commit -m x\;\ cc-land\ 7` is refused because unesc splits on the escaped
+    # space. Both are over-strict, which is the safe way to be wrong.
+    # …AND SO ARE THE COMPOUND KEYWORDS AND AN OPTION WORD. `if cd ~/dev/other; then <write>; fi`, the `while`,
+    # `until` and `!` spellings, and an option between a wrapper and the cd (`command -p cd`, `time -p cd`) all
+    # moved the shell with none of them tracked (4th adversarial review of #243). An option is any -word here:
+    # a fixed list of them is the wrapper list again, one round later.
+    # …AND A REDIRECTION IS ONE TOO. `>/dev/null cd ~/dev/other; echo pwn > f` moves the shell and the prefix
+    # stopped at the `>` (5th adversarial review of #243). The alternative carries its target, spelled glued or
+    # spaced, and is written with character classes alone so the group numbers below do not shift.
+    # `{fd}>file` IS A REDIRECTION TOO, and `2>&1` is one the `&` split cuts in half — `{fd}>/dev/null cd
+    # ~/dev/other` and `2>&1 cd ~/dev/other` both moved the shell untracked, the second leaving the piece
+    # `1 cd …` behind (6th adversarial review of #243). The named-descriptor form is spelled out, and a piece
+    # that starts with what the split left of a `N>&M` — bare digits, or the `-` of `2>&-` — is stepped over.
+    WCDW='(then|else|elif|do|if|while|until|!|time|env|nohup|xargs|command|builtin|eval|exec|sudo|bash|sh|[0-9]*[<>][<>]?[|&]?[[:space:]]*[^[:space:]]*|\{[A-Za-z_][A-Za-z0-9_]*\}[<>][<>]?[|&]?[[:space:]]*[^[:space:]]*|[0-9-]+|-[A-Za-z][A-Za-z-]*|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)'
+    WCDRE="^[[:space:]]*[({]?[[:space:]]*(${WCDW}[[:space:]]+)*(cd|pushd|popd)([[:space:]]+(.*))?\$"
+    WISH='(^|[[:space:]])(bash|sh)([[:space:]]|$)'   # a cd behind one of these runs in a CHILD shell, not this one
+    wspush(){ wsB+=("$wbase"); wsN+=("${#wstack[@]}"); wsS+=("$(printf '%s\n' ${wstack[@]+"${wstack[@]}"})"); }
+    wspop(){ local k=$(( ${#wsB[@]} - 1 )); [ "$k" -ge 0 ] || return   # give the base back to the enclosing shell
+             wbase=${wsB[k]}; if [ "${wsN[k]}" -eq 0 ]; then wstack=(); else mapfile -t wstack <<<"${wsS[k]}"; fi
+             unset "wsB[$k]" "wsN[$k]" "wsS[$k]"; }
+    wigive(){ [ -n "$wihave" ] || return   # the interpreter's child shell has ended: the real shell never moved
+              wbase=$wisave; if [ "${wisN:-0}" -eq 0 ]; then wstack=(); else mapfile -t wstack <<<"$wisS"; fi; wihave=""; }
+    # A STATEMENT IS ONE STRING FOR THE WRITE FENCE, WHATEVER IT HAS A SUBSTITUTION IN THE MIDDLE OF. $wacc builds
+    # it back up across the pieces the split made; $wsb is the base it STARTED with, which is where its
+    # redirections and arguments are expanded (see the cd/redirection note below). The pair is stacked the way
+    # $wbase is: a substitution's interior is a statement of its own, and the enclosing one resumes after the `)`.
+    wapush(){ waccS+=("$wacc"); wsbS+=("$wsb"); wacc=""; }
+    wapop(){ local k=$(( ${#waccS[@]} - 1 )); [ "$k" -ge 0 ] || return
+             wacc=${waccS[k]}; wsb=${wsbS[k]}; unset "waccS[$k]" "wsbS[$k]"; }
+    wsflush(){ [ -n "$wacc" ] || return   # the statement is complete: judge it whole, where it began
+               local sv=$wbase; wbase=$wsb; wscan "$wacc"; wbase=$sv; wacc=""; }
+    if grep -qE '(^|[^A-Za-z0-9_.-])(cd|pushd|popd)([[:space:]]|$)' <<<"$cmd"; then
+      wstack=(); wpre=$cwd; wsnap=(); wfstack=(); wflat=$cwd; wraw=""
+      while IFS= read -r wln; do
+        # A DOUBLED MARK IS A REWIND, NOT A STATEMENT: cmdpos prints one in front of the RAW reading of a line it
+        # has already emitted quote-aware, so the two readings are not two statements the shell ran one after
+        # the other. Without it the same RELATIVE cd moved the base twice (see cmdpos, and case 21b). The base
+        # and the pushd stack go back to where the line started; whichever reading MOVES them is the one kept.
+        wsl=""
+        case "$wln" in
+          $'\001\001') wraw=1; wflat=$wbase; wfstack=("${wstack[@]}"); wbase=$wpre; wstack=("${wsnap[@]}"); continue;;
+          $'\001'*) wsl=1; wln=${wln#$'\001'}                     # a statement, not a suffix: see above
+            [ -n "$wraw" ] || { wpre=$wbase; wsnap=("${wstack[@]}"); };;
+        esac
+        # A SUBSTITUTION IS A SHELL OF ITS OWN, AND ITS cd MOVES THE WRITES INSIDE IT. `echo $(cd ~/dev/other &&
+        # echo pwn > f)`, the backtick spelling and `cat <(cd …; echo pwn > f)` were one statement whose first
+        # word was `echo`, so the cd was never tracked and the write resolved against the session's own tree
+        # (4th adversarial review of #243). The opener stays on the OUTER statement — `cd $(…)` must still read
+        # as a destination this cannot resolve — and the interior starts a statement, the way `(` already does.
+        # A BRACE, A CLOSING PAREN AND A FUNCTION BODY END A STATEMENT AS SURELY AS A `;` DOES, and any token in
+        # front of the cd that is not a wrapper hid it: `case $x in *) cd ~/bin;; esac`, `f() { cd ~/bin; }`, its
+        # `function f { … }` spelling, `time { cd …; }` and `while :; do { cd …; break; }; done` each moved the
+        # real shell untracked (5th adversarial review of #243). A `{` counts only when a space follows it and a
+        # `}` only when one precedes it — that is what makes a command GROUP, and it leaves `${VAR}`, `{}` and a
+        # brace expansion alone, which the cd walk must still read whole.
+        wsub=${wln//'$('/$'$\n'}; wsub=${wsub//'<('/$'<\n'}; wsub=${wsub//'>('/$'>\n'}; wsub=${wsub//'`'/$'`\n'}
+        wsub=${wsub//')'/$')\n'}; wsub=${wsub//'{ '/$'{\n'}; wsub=${wsub//' }'/$' }\n'}
+        # THE `|` IN `>|` IS NOT A PIPE, and the split cut the redirection in half so its target landed on a
+        # piece with no verb: `cd sub && cp /dev/null >| ~/bin/cc-guard` truncated a live binary while the same
+        # line without the cd was refused — the `>|` half of the same orphaning as the substitutions above
+        # (9th adversarial review of #243, found probing it). noclobber-override is a `>`, so it is spelled one.
+        wsub=${wsub//'>|'/'>'}
+        # A SUBSHELL'S cd MOVES THE WRITES INSIDE IT AND NOTHING AFTER. `( … )`, `$( … )`, `<( )`, `>( )`, a
+        # backtick and an interpreter string (`sh -c '…'`) each start a shell of their own, so `cd ~/dev/other`
+        # then `(cd /tmp)` then `echo pwn > f` wrote the real repo while a benign subshell's /tmp carried out of
+        # it and masked the real cd — the write passed (7th adversarial review of #243). The base is saved at
+        # each opener and given back at the close, so the moved base applies only inside: case 28 still refuses,
+        # its write is inside the same subshell. The paren/backtick stack is per pass (an unclosed opener leaks
+        # over-strict, as before); the interpreter give-back is per PIECE below.
+        # A SUBSTITUTION OPENER AND A SUBSHELL OPENER ARE NOT ONE ENTRY. The split leaves `$(`, `<(`, `>(` and a
+        # backtick at the END of their piece, so the text in front of them is the OUTER shell's, while a bare `(`
+        # comes FIRST and the text after it is the inner shell's. Sharing one flag pushed both before the piece
+        # was read, so `cd $(echo ~/dev/other) && echo pwn > f` emptied the base on the piece `cd $` — correctly,
+        # a destination this cannot resolve — and the `)` that closed the substitution then handed the PRE-cd
+        # base back, and the write passed (8th adversarial review of #243). A `(` still pushes first; a
+        # substitution opener pushes after the cd, so what its `)` pops is the base the cd left.
+        # …AND ITS INTERIOR RUNS BEFORE THAT cd. A REDIRECTION IS EXPANDED FIRST: `cd sub > $(cp /dev/null
+        # ../other/f)` runs the cp in the dir the line started in, not in `sub`, so judging the interior against
+        # the moved base let a write into another repo through (8th adversarial review of #243, same round). The
+        # interior is handed the base the PIECE started with; only what the `)` pops is the base the cd left.
+        # THE SPLIT IS THE cd WALK'S, AND THE WRITE FENCE MUST NOT SEE IT. Scanning each piece on its own orphaned
+        # a destination from its verb whenever a substitution stood between them: `cd sub && cp $(echo /dev/null)
+        # ~/bin/cc-guard` left ` ~/bin/cc-guard` as a piece with no cp and no redirection in it, so the fence had
+        # nothing to judge and a live binary was truncated — while the same line WITHOUT a cd took the whole-line
+        # path below and was refused, so any command carrying the word `cd` turned the fence off for this shape
+        # (9th adversarial review of #243). The statement is put back together in $wacc with each substitution
+        # reduced to a bare `$`, which is a placeholder no path can be resolved through (`cp a $(pwd)/b` stays
+        # the unresolvable target it always was), and the interior is walked as the statement it is, as before.
+        # A piece ENDS ITS STATEMENT unless it ends at a substitution boundary — that is what $wsubo and $wclose
+        # already say, so no new marker is needed and none can be forged into the command text.
+        wsB=(); wsN=(); wsS=(); wbt=0; wihave=""; wacc=""; wsb=$wbase; waccS=(); wsbS=()
+        while IFS= read -r wst; do
+          [ -n "$wst" ] || continue
+          wopen=""; wclose=""; wsubo=""
+          case "$wst" in *'`') if [ "$wbt" = 0 ]; then wsubo=1; wbt=1; else wclose=1; wbt=0; fi;; esac
+          case "$wst" in *'$'|*'<'|*'>') wsubo=1;; esac        # the split left $( , <( or >( — the interior is its own shell
+          [[ $wst =~ ^[[:space:]]*\( ]] && wopen=1             # a bare ( subshell: this piece's text is INSIDE it
+          case "$wst" in *')') wclose=1;; esac                # …closed by the ) the split left on the piece
+          [ -n "$wopen" ] && { wspush; wapush; }             # a `(` opens before the piece's text: that text is inside it
+          wbpre=$wbase; wspre=("${wstack[@]}")               # where this piece STARTED: what a substitution in it inherits
+          # The backtick that CLOSED the substitution is the last character of the statement, and it rode along
+          # into the target: `> f` + backtick read as a write to a name with a backtick in it, which wtgt calls
+          # unresolvable and waves through. It is a boundary, not part of a name, so it comes off the text the
+          # write fence reads — and stays on the text WCDRE reads, where `cd` + backtick must stay unresolvable.
+          # The `)` that closed one is the same kind of boundary, and now that the statement is read whole it
+          # would land in the MIDDLE of it, so it comes off too.
+          wtx=${wst%\`}; wtx=${wtx%)}
+          [ -n "$wsubo" ] && { case "$wtx" in *['$<>']) wtx=${wtx%?};; esac; wtx=$wtx'$'; }
+          [ -n "$wacc" ] || wsb=$wbase                       # …the base the statement is expanded in
+          wacc=$wacc$wtx
+          if [ -n "$wsl" ] && [[ $wst =~ $WCDRE ]]; then
+            wv=${BASH_REMATCH[3]}; wargs=${BASH_REMATCH[5]:-}; wpfx=${wst%"${BASH_REMATCH[3]}${BASH_REMATCH[4]}"}   # the wrappers in front of the verb
+            if [[ $wpfx =~ $WISH ]]; then [ -n "$wihave" ] || { wisave=$wbase; wisN=${#wstack[@]}; wisS=$(printf '%s\n' ${wstack[@]+"${wstack[@]}"}); wihave=1; }   # a child-shell cd: remember the base to give back
+            else wihave=""; fi                                # a real cd is where the shell now stands: it cancels the give-back
+            read -r -a wa <<<"$wargs"; wt=""; wun=""; wn=""
+            for x in "${wa[@]}"; do case "$x" in
+                # `-` is $OLDPWD and `~-` is the same dir; `+N`/`-N` are slots of a stack this only half sees.
+                # All were skipped as OPTIONS, so `cd -` read as `cd` and moved the base to $HOME while the real
+                # shell went back to the repo it came from: the write after it passed (2nd adversarial review).
+                -|'~-'|+[0-9]*|-[0-9]*) wun=1; break;;
+                -n) wn=1;;                    # popd's "stack only": the one option that is not just noise here
+                -*|'>'*|'<'*|[0-9]*'>'*) ;;   # an option or a redirection (`popd >/dev/null`): not a destination
+                *) wt=$x; break;; esac; done
+            case "$wv" in
+              # `popd -n` TAKES A DIRECTORY OFF THE STACK AND LEAVES THE SHELL WHERE IT IS — bash suppresses the
+              # cd — so `pushd ~/dev/other; popd -n; echo pwn > f` was read as a popd BACK and the write went
+              # through while the shell stood in the other repo (3rd adversarial review of #243).
+              popd) if [ -n "$wn" ]; then [ ${#wstack[@]} -eq 0 ] || unset 'wstack[-1]'
+                    elif [ -n "$wun" ] || [ -n "$wt" ] || [ ${#wstack[@]} -eq 0 ]; then wbase=""
+                    else wbase=${wstack[-1]}; unset 'wstack[-1]'; fi;;
+              pushd) wstack+=("$wbase")   # …even when the new dir is unresolvable: the STACK still grew
+                    if [ -n "$wun" ] || [ -z "$wt" ]; then wbase=""   # `pushd` alone swaps a top this cannot see
+                    else wbase=$(wcd "$wt") || wbase=""; fi;;
+              *) if [ -n "$wun" ]; then wbase=""; else wbase=$(wcd "$wt") || wbase=""; fi;;
+            esac
+          fi
+          # THE GIVE-BACK IS THE PIECE'S, NOT THE LINE'S. Deferred to the end of the source line, a benign
+          # interpreter cd masked a real one for every statement after it on that line: `cd ~/bin && sh -c 'cd
+          # /tmp' && cp /dev/null cc-guard` left the base at /tmp when the cp was scanned, so the target resolved
+          # to /tmp/cc-guard and passed while the shell truncated the live binary (8th adversarial review of
+          # #243). The child shell ends with its own piece, so the base goes back there. The RAW re-reading keeps
+          # the end-of-pass give-back: strip() takes the interpreter string's quotes off, so the statements
+          # inside it become pieces of the same line and the child shell has not ended — case 28 refuses there.
+          [ -z "$wraw" ] && wigive
+          if [ -n "$wsubo" ]; then wapush   # …after the cd (the opener is at the END of the piece), and the interior runs before it
+            wspush; wbase=$wbpre; wstack=("${wspre[@]}")
+          elif [ -n "$wclose" ]; then wsflush; wapop; wspop   # the interior statement ends at its `)`; the enclosing one resumes
+          else wsflush; fi                                   # a ; & | { } or the end of the line ends the statement
+        done <<<"${wsub//[;&|]/$'\n'}"
+        wsflush; while [ ${#waccS[@]} -gt 0 ]; do wapop; wsflush; done   # …and so does the line, however unbalanced it was
+        wigive   # the raw re-reading's pieces have ended: give the interpreter's base back
+        if [ -n "$wraw" ]; then   # the re-reading is done: it moved nothing, so the quote-aware reading stands
+          [ "$wbase" = "$wpre" ] && [ "${wstack[*]}" = "${wsnap[*]}" ] && { wbase=$wflat; wstack=("${wfstack[@]}"); }
+          wraw=""
+        fi
+      done <<<"$uk"
+      wbase=$cwd
+    else wscan "$cmd"; fi
     # 4. member-facing only: a member must not be able to make the box SPEND or LEAK. Be honest about the ceiling —
     #    a Bash blocklist is not a sandbox: it stops accidents and casual prompt-injection, not a determined attacker
     #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays

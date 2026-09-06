@@ -11,11 +11,12 @@ them, or do them. Work that serves no named goal is noise, however clever.
 ## the loop, when nothing is queued
 1. What's red? — audit checks, failed units, blocked/waiting board rows, open ledger rows.
 2. What did the owner ask for that is not yet delivered? — the ledger, not memory.
-3. What's the next recommendation from the last architecture review not yet landed?
-4. Nothing? A review is due: spawn one (cc-audit review) on whatever broke most recently.
+3. Nothing? Then nothing: one journal line, and wait for the next event. A review runs when an incident
+   or the owner asks for one, and what it finds waits as a candidate until a person promotes it — a session
+   never turns a review's recommendations into work on its own (astra review 2026-09-06: six reviews in six
+   days became work while total spend stayed flat).
 
 Red beats new. Delivery beats development. Small-and-shippable beats big-and-half-done.
-The sweep spans both scales: the narrow red item and the meta-level shape of the system alike.
 
 Scripts hold the invariants (reconcile, audit, janitor); the secretary (`cc-secretary`) judges the raw evidence and
 records every finding in its own ledger. It interrupts you only when a person, an approval or a choice the files
@@ -34,8 +35,10 @@ itself, with git and `gh`.
 A hand-made `planning/<branch>` gets no automatic repair round: on a LAND-AFTER-FIX the landing queue's fix
 iteration branches a fresh worktree and pushes where the PR is not, so on that path this session resumes the
 builder itself. Keep the prompt minimal — point it at the row's `task.md` and at these working rules, and say
-it stays in the worktree and does not commit. When it returns, a second subagent reads the diff and gives a
-verdict; this session reads the verdict, not the diff.
+it stays in the worktree and does not commit. When it returns, this session commits and lands it, and the landing's review is the verdict. A
+reviewer subagent reads the diff first only where the landing will not review that head — a paused repo, a
+`--no-review` landing — and a security-reviewer where a gate or a member boundary changes; never as a second
+opinion on a diff the lander is about to read (astra review 2026-09-06, cut 3).
 
 Leave the row `queued` while a subagent holds it, and record the claim with `cc-board note`. `queued` is the
 only word cc-reconcile leaves alone: a subagent is not a worker, a cc-loop or a track pane, so the row is
@@ -57,17 +60,20 @@ status word on its own tells nothing downstream anything:
 `.cc/track` marker. Landing follows the repo's standing: this session runs `cc-land <repo> <pr>` where the
 owner has granted standing merging, the card otherwise, and cc-land closes the row by the PR URL.
 
-A `cc <repo> <track> --go` worker is still right for a real project, or for a big task split into serial
-pieces: it gets its own gates, journal and PR, and it outlives this session.
+A project with more than one milestone that the owner steers in its own channel gets a peer orchestrator
+instead of a worker — `cc <repo> --orch <alias> "<purpose>"`, handed the row's state (mechanics in
+`~/USAGE.md`'s `--orch` line). A `cc <repo> <track> --go` worker is right for a bounded build that ends
+with a PR, or a big task split into serial pieces: it gets its own gates, journal and PR, but its channel
+ends with it.
 
 Subagents die with the session that spawned them, so a session does not hand off while any are in flight:
 finish them or abandon them first. A retired session is gated as a worker — it can no longer push or land —
 so anything left running is the successor's to pick up, worktrees and landing both.
 
 ## dispatch judgement
-- Planner does it itself only when spawning costs more than the fix: <=2 files, ~60 lines, the fix already known, nothing live holding those files — short branch, PR like anything else.
+- Planner does it itself only when the edit is already known and needs no test cycle: a line of wording, a config value, a one-hunk fix that check.sh alone covers, <=2 files, nothing live holding those files — short branch, PR like anything else. Anything that needs a selfcheck run, a new case or a negative control goes to a builder.
 - Subagent: work that is bounded, already scoped, and finishes inside this session's life — a read whose answer compresses (delegate any that would add more than ~10k here), and equally a known fix, in its own worktree, leaving the commit to this session. Cheapest model that holds quality; never for grep-shaped exploration. It costs a fraction of a worker: a bounded analysis ran to well under $1 where the same job as a worker is a $2.50-$9 repair round. Two things it cannot do — it dies with this session (a handoff killed one mid-flight on 2026-09-02 and the work was redone), and it inherits this session's reach rather than getting its own gates, journal and PR.
-- Subagent types live in `~/.claude/agents/`, installed from `templates/home/agents/`. **builder** makes the change in its own worktree. **reviewer** reads a diff against its brief before it lands, and returns LAND/FIX/DO-NOT-LAND. **security-reviewer** does the same on anything touching a gate, a member-writable path, git plumbing or a tmux pane. The working rules are in the type, so a spawn prompt carries only the row and the worktree — and the ledger shows what each type costs. A fix pass resumes the same builder, never a fresh one. Tune one on this box and the installer keeps your copy; change it for every box in the template.
+- Subagent types live in `~/.claude/agents/`, installed from `templates/home/agents/`. **builder** makes the change in its own worktree — on Sonnet when it fits one file and a dozen lines, on Opus when it spans tools, touches a gate or a sandbox boundary, or needs its failure path reasoned through (owner, 2026-09-05). **reviewer** reads a diff against its brief and returns LAND/FIX/DO-NOT-LAND — only where the landing will not review that head. **security-reviewer** does the same on anything touching a gate, a member-writable path, git plumbing or a tmux pane. The working rules are in the type, so a spawn prompt carries only the row and the worktree — and the ledger shows what each type costs. A fix pass resumes the same builder, never a fresh one. Tune one on this box and the installer keeps your copy; change it for every box in the template.
 - Worker: open design, more files, its own test cycle, unattended running, or a file another track holds. One worker per file: split by file or run in sequence (both research arms: never parallelise writers); check the board's live tracks first.
 - Lump sub-goals into one worker until the diff stops being reviewable in one sitting. Each one folded in saves a spinup, a gate run, a review and a landing.
 - A brief is a goal: what, why, the boundaries, 3-5 testable done-criteria — never the steps. The PR review gets the contract and the diff, never the worker's journal.
@@ -84,6 +90,7 @@ Planning sessions and orchs run the strongest available model (cc-model's primar
 worker runs on CC_WORKER_MODEL (claude-opus-5) unless the dispatcher passes `--model` for that one
 task — a limit override outranks both. The order lives in cc-loop's `worker_model`; the names live in
 cc-model and nowhere else — when models change, change cc-model.
+- A subagent runs on its type's `model` line (builder and security-reviewer: opus; reviewer: sonnet) unless the spawner passes `model` on the Agent call, which outranks the type; that is how a tiny builder gets Sonnet. Verified on this box 2026-09-05: a builder spawned with model sonnet records claude-sonnet-5 in its transcript.
 - Effort is the cheap dial: high by default, down for routine turns, up for the hardest.
 - On each model upgrade, try deleting one harness crutch — and read the new model's own prompting guide first: a new model's regressions cost more than its crutches.
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # cc-checkpoint — auto-commit+push a track worktree. Wired as a Claude Stop hook (runs after each turn).
 #   cc-checkpoint          commit whatever changed and push it (the hook; always exits 0, never blocks a session)
+#   cc-checkpoint --commit commit only; exit 1 on refusal, failed commit or remaining changes (used by cc done)
 #   cc-checkpoint --push   push only, and exit non-zero saying why if it cannot — `cc done` calls this, because a
 #                          PR on an un-pushed branch is worse than no PR
 #   cc-checkpoint --remote where the push goes: the remote's name (making the repository if this is a member
@@ -49,9 +50,13 @@
 # (cc-board base), never a track, whoever names it. Only a repository this file made is marked, so one the owner
 # bound by hand is never pushed to or repointed behind his back; and repositories made before this are not touched —
 # `cc-gh-token default <workspace> <project> <base>` fixes one, once.
+# AND THAT BASE CARRIES THE PROJECT'S OWN README, because the retitle below runs on the track alone: without it
+# the front page of a project's repository is the workspace's until the project's first PR merges. Not on the
+# workspace's FIRST project, whose repository is the workspace's own `origin` — seed_head says why.
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
-MODE=commit; case "${1:-}" in --push) MODE=push;; --remote) MODE=remote;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
+MODE=commit; STRICT=0
+case "${1:-}" in --commit) STRICT=1;; --push) MODE=push;; --remote) MODE=remote;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
 # ── the lease ────────────────────────────────────────────────────────────────────────────────────
 # A track branch has exactly one writer, so a worker that rebased its own branch must still reach the remote. A
 # plain push is rejected non-fast-forward there and the work never becomes a PR: on 2026-08-31 a track finished
@@ -113,6 +118,16 @@ pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push ·
   # Any other track on the box: origin is where it pushed yesterday, so the work reaches GitHub rather than nowhere.
   git remote get-url origin >/dev/null 2>&1
 }
+readme_text(){   # the front page a project's repository opens on, for the project named in $1. ONE copy of the
+  # words, because two branches carry this file: the project's track (project_readme) and the base branch pushed
+  # into the repository made for it (seed_head). Different words there and the project's first PR is a conflict in
+  # the one file nobody wrote.
+  printf '# %s\n\nA project of the %s workspace, and the only project in this repository.\nIts work is the `track/%s` branch.\n' "$1" "$WSREPO" "$1"; }
+readme_is_stub(){   # 0 = the README on stdin is one THIS FILE wrote, whoever it names.  The WHOLE file is compared
+  # against the template rebuilt from its own heading, so one word changed anywhere makes it somebody's words again.
+  local t h; t=$(cat); h=$(printf '%s\n' "$t" | head -1)
+  case "$h" in '# '?*) h=${h#\# } ;; *) return 1 ;; esac
+  [ "$t" = "$(readme_text "$h")" ]; }
 project_readme(){   # cwd = worktree root.  Always 0: this is one file, and never anyone's own words.
   # "he opened [a project's repository] and found the workspace — its README ('scratch project for trying the
   # box out'), with no [project] code" (owner, 2026-09-04). A workspace is one git repo and a project is a
@@ -126,6 +141,12 @@ project_readme(){   # cwd = worktree root.  Always 0: this is one file, and neve
   [ -f "$HOME/dev/$WSREPO/.cc/member-workspace" ] || return 0
   git ls-files --error-unmatch README.md >/dev/null 2>&1 || return 0   # inherited from the branch, not a file this turn wrote
   git diff --quiet HEAD -- README.md 2>/dev/null || return 0            # and untouched this turn: words somebody wrote are theirs (review of #217)
+  # A STUB THIS FILE WROTE is nobody's words whichever project it names, so where it came from is not asked. A
+  # track cut from a sibling project's repository inherits that sibling's stub — the base branch there carries one
+  # now (seed_head) — and the workspace's own name is no longer in the heading for the test below to catch.
+  if [ -f README.md ] && readme_is_stub < README.md; then
+    [ "$(head -1 README.md)" = "# $WSTRACK" ] || readme_text "$WSTRACK" > README.md
+    return 0; fi
   # STILL THE FILE THE BRANCH INHERITED: the same blob the workspace's default branch had where this branch was cut
   # from it. Words committed under the old heading on an earlier turn are theirs too, and "clean against HEAD" says
   # nothing about those (review of #217). No default branch to ask, no merge-base: leave it.
@@ -136,7 +157,7 @@ project_readme(){   # cwd = worktree root.  Always 0: this is one file, and neve
   mb=$(git merge-base HEAD "$def" 2>/dev/null) || return 0
   [ "$(git rev-parse -q --verify HEAD:README.md 2>/dev/null)" = "$(git rev-parse -q --verify "$mb:README.md" 2>/dev/null)" ] || return 0
   [ -f README.md ] && [ "$(head -1 README.md 2>/dev/null)" = "# $WSREPO" ] || return 0
-  printf '# %s\n\nA project of the %s workspace, and the only project in this repository.\nIts work is the `track/%s` branch.\n' "$WSTRACK" "$WSREPO" "$WSTRACK" > README.md
+  readme_text "$WSTRACK" > README.md
   return 0
 }
 url_key(){   # one repository, however its url is spelled: case, .git, a trailing /, the scheme, the user, the scp form
@@ -151,21 +172,90 @@ base_branch(){   # the project's base branch, cwd = worktree root. The board's, 
   case "$b" in track/*|'') b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##') ;; esac
   case "$b" in track/*|'') b=main ;; esac
   printf '%s\n' "$b"; }
+ident_args(){   # the `git -c` arguments a commit made by this file is authored with: CC_GIT_NAME/CC_GIT_EMAIL from
+  # ~/.cc/config (read, not sourced — that file holds tokens), and git's own config where they are unset.
+  local n e
+  n=$("$BIN/cc-config" get CC_GIT_NAME);  [ -n "$n" ] && printf -- '-c\nuser.name=%s\n' "$n"
+  e=$("$BIN/cc-config" get CC_GIT_EMAIL); [ -n "$e" ] && printf -- '-c\nuser.email=%s\n' "$e"
+  return 0; }
+seed_head(){   # $1 = the base branch's tip → the commit the new repository's base branch is created at.
+  # AND IT OPENS ON THE PROJECT'S README, NOT THE WORKSPACE'S. The base is the WORKSPACE's branch and carries the
+  # workspace's README; the retitle (project_readme) only ever runs on the track. So the repository made for a
+  # project opened on a page about the workspace and stayed there until the project's first PR merged — which for a
+  # living project may be never. The base is therefore pushed with the project's README already on it: one commit,
+  # built with plumbing, and REFS/HEADS/<BASE> NEVER MOVES — that is one branch shared by every project in the
+  # workspace, and a commit on it here would follow the next project into its repository.
+  # THE COMMIT IT IS SEEDED WITH IS ON THE TRACK. A commit only the base has changes README.md against the merge
+  # base, so the moment the session writes its own README the project's FIRST PR conflicts in the one file nobody
+  # wrote, which is what this seeding was added to prevent (review of #238). So it is merged into the track
+  # before it is pushed, and the base is then an ANCESTOR of the branch whose PR merges into it. The merge keeps
+  # the track's tree to the letter: both sides carry the same README blob and the seed touches nothing else, so
+  # no file on the branch moves and nothing is rewritten. If it cannot be put there, the base goes unseeded.
+  # ONLY A STUB THIS FILE WROTE. A README somebody wrote is theirs, and copying it onto a branch they did not write
+  # is not this file's to do; their words reach the base the ordinary way, when the project's first PR merges.
+  # NOT WHEN THIS REPOSITORY IS THE WORKSPACE'S OWN ORIGIN. A workspace with no remote of its own has its FIRST
+  # project's repository wired up as `origin` (cc-gh-token create), and that base branch is then the one
+  # ~/dev/<workspace> itself sits on, pushes and pulls. A commit there the workspace does not have turns its
+  # `git push origin <base>` into a non-fast-forward rejection, and the pull that clears it retitles the WORKSPACE's
+  # README with a project's — words written for the member, which nothing here would put back. So that one
+  # repository opens on the workspace until the project's first PR merges. Every later project of the workspace has
+  # a repository of its own and is seeded.
+  local tip="$1" want tree new idx prev head branch merged; local -a ident=()
+  [ "$(url_key "$(git remote get-url "$remote" 2>/dev/null)")" = "$(url_key "$(git remote get-url origin 2>/dev/null)")" ] \
+    && { printf '%s\n' "$tip"; return 0; }
+  # NOT WHEN THE BASE HAS MOVED ON SINCE THE TRACK WAS CUT. The seed goes onto the track as a merge carrying the
+  # TRACK's tree — "take this side entire" — which is exact while the track holds everything refs/heads/<base>
+  # holds, and a silent revert of everything the base gained after the cut when it does not: that branch is shared
+  # by the whole workspace and moves without this track, so a later commit on it would be merged away here and
+  # then leave the new repository's base the moment the project's first PR landed (review of #238). Merging it in
+  # for real is this file resolving somebody's branch for them, which it does not do. So that base goes unseeded:
+  # the repository opens on the workspace's README until the first PR merges — where it was before any of this.
+  git merge-base --is-ancestor "$tip" HEAD 2>/dev/null || { printf '%s\n' "$tip"; return 0; }
+  want=$(git rev-parse -q --verify HEAD:README.md 2>/dev/null)
+  [ -n "$want" ] && [ "$want" != "$(git rev-parse -q --verify "$tip:README.md" 2>/dev/null)" ] || { printf '%s\n' "$tip"; return 0; }
+  git cat-file -p "$want" 2>/dev/null | readme_is_stub || { printf '%s\n' "$tip"; return 0; }
+  # A push that never reached the remote keeps the marker and comes back next turn, so the commit already merged
+  # into the track is reused: rebuilt from scratch it is a new sha, and a repository unreachable for a week would
+  # collect one merge a turn. Reused only while it is still that commit — on the track, on this base tip, this README.
+  prev=$(cat "$root/.cc/base-seed" 2>/dev/null)
+  if [ -n "$prev" ] && [ "$(git rev-parse -q --verify "$prev^" 2>/dev/null)" = "$tip" ] \
+     && [ "$(git rev-parse -q --verify "$prev:README.md" 2>/dev/null)" = "$want" ] \
+     && git merge-base --is-ancestor "$prev" HEAD 2>/dev/null; then printf '%s\n' "$prev"; return 0; fi
+  idx="$root/.cc/seed.idx"; rm -f "$idx"
+  GIT_INDEX_FILE="$idx" git read-tree "$tip" 2>/dev/null \
+    && GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "100644,$want,README.md" 2>/dev/null \
+    && tree=$(GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null)
+  rm -f "$idx"
+  mapfile -t ident < <(ident_args)
+  # No identity anywhere, no tree: push the base as it is. A front page one turn late beats a repository with none.
+  [ -n "${tree:-}" ] && new=$(git "${ident[@]}" commit-tree "$tree" -p "$tip" -m "README: this repository is the $WSTRACK project" 2>/dev/null)
+  [ -n "${new:-}" ] || { printf '%s\n' "$tip"; return 0; }
+  # …and onto the track, as a merge carrying the track's own tree. HEAD is the track's branch here — the push path
+  # and the hook both refuse to go on when it is not — and the ref only ever moves forward: HEAD is the first parent.
+  branch=$(git symbolic-ref -q --short HEAD 2>/dev/null); head=$(git rev-parse -q --verify HEAD 2>/dev/null)
+  [ -n "$branch" ] && [ -n "$head" ] \
+    && merged=$(git "${ident[@]}" commit-tree "$(git rev-parse -q --verify "$head^{tree}")" -p "$head" -p "$new" \
+        -m "merge the base branch this project's repository was seeded with" 2>/dev/null) \
+    && git update-ref -m 'cc-checkpoint: the base this repository is seeded with' "refs/heads/$branch" "$merged" "$head" 2>/dev/null \
+    || { printf '%s\n' "$tip"; return 0; }   # not on the track, so not pushed as the base: a front page is not worth a conflict
+  printf '%s\n' "$new" > "$root/.cc/base-seed"   # …and it is this commit again next turn if the push does not land
+  printf '%s\n' "$new"; }
 seed_base(){   # cwd = worktree root, $remote and $cred from lease_push.  Always 0: seeding is not the push.
   # The header's "AND IT OPENS ON THE PROJECT'S BASE": a repository created here is empty, GitHub gives it whichever
   # branch lands first, and the track landing first is the whole bug. So the base goes first, and if that still did
   # not make it the default it is asked for by name. Once, at creation — a repository the owner bound himself has no
   # marker and is never touched. Not reaching the remote at all keeps the marker: the next turn tries again, and the
   # track push in this one is failing for the same reason anyway.
-  local base def err
+  local base def err tip send
   [ -n "$workspace" ] && [ -f "$root/.cc/base-seed" ] || return 0
   base=$(base_branch)
   # A base this checkout does not have cannot be pushed. That used to drop the marker and say nothing at all, so
   # the repository went on opening on the track and no later turn tried again: the board hears it, once.
-  git rev-parse -q --verify "refs/heads/$base" >/dev/null 2>&1 || {
+  tip=$(git rev-parse -q --verify "refs/heads/$base" 2>/dev/null) || {
     "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: this project's repository was made, but its base branch '$base' is not in this checkout — nothing was seeded, so it opens on whichever branch landed first" >/dev/null 2>&1
     rm -f "$root/.cc/base-seed"; return 0; }
-  if ! err=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" push -q "$remote" "refs/heads/$base:refs/heads/$base" 2>&1); then
+  send=$(seed_head "$tip"); [ -n "$send" ] || send="$tip"   # an EMPTY source in a refspec DELETES the branch: never that
+  if ! err=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" push -q "$remote" "$send:refs/heads/$base" 2>&1); then
     grep -qE 'rejected|non-fast-forward|already exists' <<<"$err" || return 0   # could not reach it: try again next turn
   fi
   def=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" ls-remote --symref "$remote" HEAD 2>/dev/null | sed -n 's#^ref: refs/heads/\([^[:space:]]*\).*$#\1#p' | head -1)
@@ -533,6 +623,153 @@ SH
   hook "$d"
   eq "a repo that is not a member workspace keeps its README" "$(head -1 "$d/README.md")" "# myrepo3"
   k "$(grep -q 'not a workspace' "$d/README.md" && echo 0 || echo 1)" "and all of it" "$(cat "$d/README.md")"
+  # ── …and the base of the repository the box made opens on that same README ──────────────────────────
+  # The base is the WORKSPACE's branch and carries the workspace's README, so a project's repository opened on a
+  # page about the workspace even once its default branch was the base — until the project's first PR merged.
+  stub(){ printf '# %s\n\nA project of the %s workspace, and the only project in this repository.\nIts work is the `track/%s` branch.\n' "$2" "$1" "$2"; }
+  save(){ git -C "$1" add -A; git -C "$1" -c user.name=t -c user.email=t@t commit -q -m "${2:-x}"; }
+  export BARE="$T/gh2"; mkdir -p "$BARE"
+  ws ws5; wsO=$(bare ws5own)   # ws5 HAS a remote of its own, so each project's repository is its own, not `origin`
+  d=$(mkproj_main ws5/projQ origin "$wsO"); mQ=$(git -C "$d" rev-parse main)
+  hook "$d"; rQ="$BARE/projQ.git"
+  eq "the base pushed into the new repository names the project" "$(git -C "$rQ" show main:README.md 2>/dev/null | head -1)" "# projQ"
+  eq "…the same file the project's own branch carries, so its first PR has nothing to merge there" \
+     "$(git -C "$rQ" rev-parse main:README.md 2>/dev/null)" "$(git -C "$d" rev-parse HEAD:README.md)"
+  eq "…one commit on top of the base, not a rewrite of it" "$(git -C "$rQ" rev-parse main^ 2>/dev/null)" "$mQ"
+  eq "…and that commit is the README and nothing else" "$(git -C "$rQ" diff --name-only main^ main 2>/dev/null)" README.md
+  eq "…and the workspace's own branch here never moved: every project in it is cut from that one" "$(git -C "$d" rev-parse main)" "$mQ"
+  # THE WORKSPACE'S FIRST PROJECT. Its repository is wired up as the workspace's own `origin`, so that base branch
+  # is the one ~/dev/<workspace> sits on: a commit there rejects the workspace's push and its pull retitles the
+  # WORKSPACE's README. The base still goes first and the default is still set — only the README is not touched.
+  ws ws6
+  d=$(mkproj_main ws6/projU); mU=$(git -C "$d" rev-parse main); hook "$d"; rU="$BARE/projU.git"
+  eq "the workspace's own origin gets the base exactly as the workspace has it" "$(git -C "$rU" rev-parse main 2>/dev/null)" "$mU"
+  eq "…so a member's workspace README is never traded for a project's" "$(git -C "$rU" show main:README.md 2>/dev/null | head -1)" "# ws6"
+  eq "…and that repository still opens on the base" "$(git -C "$rU" symbolic-ref HEAD 2>/dev/null)" refs/heads/main
+  eq "…while the project's own branch is retitled as ever" "$(head -1 "$d/README.md")" "# projU"
+  # Somebody's own words are not put on a branch they did not write; they reach the base when their PR merges.
+  d=$(mkproj_main ws5/projT origin "$wsO"); printf '# my thing\n\nmine\n' > "$d/README.md"; save "$d" mine
+  echo t > "$d/more.txt"   # the turn that makes the repository is a later one: their README is committed already
+  hook "$d"
+  eq "a README somebody wrote is not pushed onto the base" "$(git -C "$BARE/projT.git" show main:README.md 2>/dev/null | head -1)" "# ws5"
+  # A base already carrying this project's README, and a project with no README at all: nothing is added either way.
+  mkbase(){   # $1 <ws>/<track>, $2 a command run on `main` before the track is cut from it
+    local p t; p=$(mkwt "${1}" origin "$wsO"); t=${1#*/}
+    printf '%s\n%s\n' "${1%%/*}" "$t" > "$p/.cc/track"
+    git -C "$p" symbolic-ref HEAD refs/heads/main; ( cd "$p" && eval "$2" )
+    echo base > "$p/base.txt"; save "$p" base
+    git -C "$p" checkout -q -b "track/$t"; echo "$t" > "$p/work.txt"
+    printf '%s\n' "$p"; }
+  d=$(mkbase ws5/projZ 'stub ws5 projZ > README.md'); mZ=$(git -C "$d" rev-parse main); hook "$d"
+  eq "a base whose README is already the project's is pushed unchanged" "$(git -C "$BARE/projZ.git" rev-parse main 2>/dev/null)" "$mZ"
+  d=$(mkbase ws5/projY ':'); mY=$(git -C "$d" rev-parse main); hook "$d"
+  eq "a project with no README anywhere leaves the base exactly as it is" "$(git -C "$BARE/projY.git" rev-parse main 2>/dev/null)" "$mY"
+  k "$([ -e "$d/README.md" ] && echo 1 || echo 0)" "…and is not given one" ""
+  # The sibling this seeding makes: a track cut from that base inherits ANOTHER project's stub, whose heading is no
+  # longer the workspace's name for the test above to catch. Still nobody's words, so still replaced.
+  d=$(mkproj_main ws5/projR projR "$(bare ownR)"); stub ws5 projQ > "$d/README.md"; save "$d" sibling
+  hook "$d"
+  eq "a track that inherited a sibling project's stub gets its own" "$(head -1 "$d/README.md")" "# projR"
+  k "$(grep -q 'track/projR' "$d/README.md" && echo 0 || echo 1)" "…naming its own branch" "$(cat "$d/README.md")"
+  # …and the steady state after that: the stub already names this project, so no turn ever rewrites or commits it.
+  d=$(mkproj_main ws5/projV projV "$(bare ownV)"); stub ws5 projV > "$d/README.md"; save "$d" own
+  hV=$(git -C "$d" rev-parse HEAD); hook "$d"
+  eq "a stub already naming this project keeps its heading" "$(head -1 "$d/README.md")" "# projV"
+  eq "…and is not rewritten, so the turn commits nothing" "$(git -C "$d" rev-parse HEAD)" "$hV"
+  # One line added to it and the whole file is theirs, heading and all.
+  d=$(mkproj_main ws5/projS projS "$(bare ownS)"); { stub ws5 projQ; echo mine; } > "$d/README.md"; save "$d" theirs
+  hook "$d"
+  eq "a stub somebody added a line to is theirs" "$(head -1 "$d/README.md")" "# projQ"
+  k "$(grep -q '^mine$' "$d/README.md" && echo 0 || echo 1)" "…and keeps the line" "$(cat "$d/README.md")"
+  # No '# ' heading to rebuild the template from: not a stub, and not this file's to touch.
+  d=$(mkproj_main ws5/projX projX "$(bare ownX)"); printf 'no heading here\n' > "$d/README.md"; save "$d" plain
+  hook "$d"
+  eq "a README with no heading is left alone" "$(cat "$d/README.md")" "no heading here"
+  # ── …and the project's FIRST PR merges into the base it was seeded with ─────────────────────────────
+  # The seed is a change to README.md that only the base has, so as soon as the session writes its own README
+  # both sides have touched that file against the merge base and the first PR conflicts in it, which is the very
+  # thing the seeding is for (review of #238). It goes on the track, so the base is an ancestor of the branch.
+  merges(){   # $1 a bare repo, $2 a branch in it → 0 when that branch merges into its base with no conflict; PRC = the clone
+    PRC=$(mktemp -d "$T/pr.XXXXXX")
+    { git clone -q "$1" "$PRC" >/dev/null 2>&1 && git -C "$PRC" checkout -q main 2>/dev/null; } || return 1
+    git -C "$PRC" -c user.name=t -c user.email=t@t merge -q --no-edit "origin/$2" >/dev/null 2>&1; }
+  d=$(mkproj_main ws5/projW origin "$wsO"); hook "$d"; rW="$BARE/projW.git"; bW=$(git -C "$rW" rev-parse main)
+  k "$(git -C "$d" merge-base --is-ancestor "$bW" track/projW 2>/dev/null && echo 0 || echo 1)" \
+    "the commit the base is seeded with is on the project's own branch" "$bW is not in track/projW"
+  eq "…carried there by a merge that changes no file on that branch" \
+     "$(git -C "$d" rev-parse 'HEAD^{tree}')" "$(git -C "$d" rev-parse 'HEAD^1^{tree}')"
+  printf '# projW\n\nwhat this project is, in my own words\n' > "$d/README.md"; hook "$d"   # a later turn: the session writes the README
+  merges "$rW" track/projW; rc=$?
+  k "$([ "$rc" = 0 ] && echo 0 || echo 1)" "and the project's first PR merges into that base with no conflict" "git merge exited $rc"
+  eq "…leaving the base on the words the session wrote" "$(sed -n 3p "$PRC/README.md" 2>/dev/null)" "what this project is, in my own words"
+  # THE CONTROL, built by hand and never through this file: a README commit the base has and the branch does not.
+  # The same clone and the same merge, and it conflicts — which is what the case above is worth.
+  rB="$BARE/projB2.git"; git init -q --bare "$rB"
+  d=$(mkproj_main ws5/projB2 projB2 "$rB"); git -C "$d" push -q projB2 main "track/projB2"
+  sc=$(mktemp -d "$T/seed.XXXXXX"); git clone -q "$rB" "$sc" >/dev/null 2>&1; git -C "$sc" checkout -q main
+  stub ws5 projB2 > "$sc/README.md"; save "$sc" seed; git -C "$sc" push -q origin main
+  printf '# projB2\n\nmy own words\n' > "$d/README.md"; save "$d" mine; git -C "$d" push -q projB2 "track/projB2"
+  merges "$rB" track/projB2; rc=$?
+  k "$([ "$rc" = 0 ] && echo 1 || echo 0)" "a seed commit the branch does not have is the conflict this must never make" "it merged clean"
+  # A seed whose push never reached the remote keeps the marker, and next turn is the SAME commit: rebuilt it
+  # would be a new sha, and a repository unreachable for a week would collect one merge a turn.
+  rW3="$BARE/projW3.git"; git init -q --bare "$rW3"
+  d=$(mkproj_main ws5/projW3 projW3 "$rW3"); hook "$d"   # the stub README is committed on the track, nothing is seeded
+  git -C "$d" remote set-url projW3 "$T/gone.git"; : > "$d/.cc/base-seed"; runp "$d"; h1=$(git -C "$d" rev-parse HEAD)
+  k "$([ -s "$d/.cc/base-seed" ] && echo 0 || echo 1)" "a seed that could not be pushed is kept for the next turn" "$(cat "$d/.cc/base-seed" 2>/dev/null)"
+  git -C "$d" remote set-url projW3 "$rW3"; runp "$d"
+  eq "…and that turn reuses it instead of merging another" "$(git -C "$d" rev-parse HEAD)" "$h1"
+  eq "…so the base is pushed at the commit the track already carries" "$(git -C "$rW3" rev-parse main 2>/dev/null)" "$(git -C "$d" rev-parse 'HEAD^2')"
+  # THE BASE MOVED ON after the track was cut — the workspace's branch is shared, and a sibling's PR lands on it.
+  # The seed merge takes the track's tree entire, so seeding here would record that later commit as reverted and
+  # it would leave the new repository's base as soon as the project's first PR merged (review round 2 of #238).
+  d=$(mkproj_main ws5/projV2 origin "$wsO")
+  git -C "$d" checkout -q main; echo plan > "$d/plan.md"; save "$d" plan; mV2=$(git -C "$d" rev-parse main)
+  git -C "$d" checkout -q track/projV2
+  hook "$d"; rV2="$BARE/projV2.git"
+  eq "a base that moved on since the track was cut is pushed unseeded" "$(git -C "$rV2" rev-parse main 2>/dev/null)" "$mV2"
+  k "$([ -n "$(git -C "$d" rev-parse -q --verify 'HEAD^2' 2>/dev/null)" ] && echo 1 || echo 0)" \
+    "…so no merge that would take what it gained back off it is put on the track" "$(git -C "$d" log --oneline -1 'HEAD^2' 2>/dev/null)"
+  merges "$rV2" track/projV2; rc=$?
+  k "$([ "$rc" = 0 ] && echo 0 || echo 1)" "…and the project's first PR still merges into that base" "git merge exited $rc"
+  k "$([ -e "$PRC/plan.md" ] && echo 0 || echo 1)" "…leaving on it what it gained after the cut" "plan.md is gone from the base"
+  unset BARE
+  # Reliable completion: the Stop hook's zero is not a receipt. All pushes below use this fixture's bare repo.
+  d=$(mkproj_main receipt/task origin "$(bare receipt)"); echo '/.cc/' >> "$d/.git/info/exclude"
+  strict(){ ( cd "$1" && "$bin/cc-checkpoint" --commit </dev/null >/dev/null 2>&1 ); }
+  before=$(git -C "$d" rev-parse HEAD); echo changed >> "$d/work.txt"
+  strict "$d"; rc=$?; tip=$(git -C "$d" rev-parse HEAD)
+  k "$([ "$rc" = 0 ] && [ "$tip" != "$before" ] && ! has "$T/receipt.git" track/task && echo 0 || echo 1)" \
+    "C1: strict completion commits but does not push" "rc=$rc before=$before tip=$tip"
+  strict "$d"; rc=$?
+  k "$([ "$rc" = 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$tip" ] && echo 0 || echo 1)" \
+    "C1 control: a clean retry succeeds without another commit" "rc=$rc"
+  echo fixture > "$d/.env"; hook "$d"; hookrc=$?; strict "$d"; rc=$?
+  k "$([ "$hookrc" = 0 ] && [ "$rc" != 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$tip" ] \
+    && [ -n "$(git -C "$d" status --porcelain)" ] && git -C "$d" diff --cached --quiet && echo 0 || echo 1)" \
+    "C2: a secret refusal stays zero for the hook, fails completion, and leaves no secret staged" "rc=$rc hook=$hookrc"
+  rm "$d/.env"; echo later >> "$d/work.txt"
+  printf '#!/bin/sh\nexit 1\n' > "$d/.git/hooks/pre-commit"; chmod +x "$d/.git/hooks/pre-commit"
+  strict "$d"; rc=$?
+  k "$([ "$rc" != 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$tip" ] && echo 0 || echo 1)" \
+    "C3: a failed git commit cannot finish" "rc=$rc"
+  rm "$d/.git/hooks/pre-commit"; : > "$d/.git/index.lock"; strict "$d"; rc=$?; rm "$d/.git/index.lock"
+  k "$([ "$rc" != 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$tip" ] && echo 0 || echo 1)" \
+    "C3 control: a failed git add also cannot finish" "rc=$rc"
+  strict "$d"; rc=$?
+  k "$([ "$rc" = 0 ] && [ "$(git -C "$d" rev-parse HEAD)" != "$tip" ] && echo 0 || echo 1)" \
+    "C3 recovery: removing the failure commits the same work" "rc=$rc"
+  git -C "$d" checkout -q main; before=$(git -C "$d" rev-parse HEAD); echo offtrack > "$d/stray.txt"
+  strict "$d"; rc=$?
+  k "$([ "$rc" != 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$before" ] && echo 0 || echo 1)" \
+    "C4: strict completion refuses the default branch" "rc=$rc"
+  git -C "$d" checkout -q -b track/impostor; printf 'receipt\nimpostor\n' > "$d/.cc/track"
+  strict "$d"; rc=$?
+  k "$([ "$rc" != 0 ] && [ "$(git -C "$d" rev-parse HEAD)" = "$before" ] && echo 0 || echo 1)" \
+    "C4 control: a matching lying marker cannot make the wrong branch canonical" "rc=$rc"
+  d=$(mkproj "$T/outside" origin "$(bare outside)"); strict "$d"; rc=$?
+  k "$([ "$rc" != 0 ] && ! has "$T/outside.git" "track/$T/outside" && echo 0 || echo 1)" \
+    "C5: an outside worktree gains no strict completion or push" "rc=$rc"
   echo "cc-checkpoint selfcheck: $((n - f))/$n"; [ "$f" = 0 ]
 }
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
@@ -559,32 +796,42 @@ fi
 # the commit below, so the work is safely on the branch before the session is asked to journal it.
 # cc-owed asks the same payload what is still owed in Slack and carries the context line through (--with),
 # so the two hooks are one decision, owed first. If it fails or times out, ${owe:-$say} keeps the other.
-[ -t 0 ] || payload=$(timeout 5 cat)
+[ "$STRICT" = 1 ] || [ -t 0 ] || payload=$(timeout 5 cat)
 [ -n "${payload:-}" ] && say=$(printf '%s' "$payload" | timeout 20 "$BIN/cc-context" --record 2>/dev/null)
 [ -n "${payload:-}" ] && { owe=$(printf '%s' "$payload" | timeout 15 "$BIN/cc-owed" --check --with "${say:-}" 2>/dev/null); say=${owe:-$say}; }
 exec 8>&1   # the hook's real stdout: every exit below is inside a block that discards stdout, the relay is not
 relay(){ [ -n "${say:-}" ] && printf '%s\n' "$say" >&8; return 0; }
 trap relay EXIT
+commit_end(){   # The hook stays nonblocking. Completion requires observable, clean committed work.
+  [ "$STRICT" = 1 ] || exit 0
+  local dirty
+  dirty=$(git status --porcelain --untracked-files=all) || exit 1
+  [ -z "$dirty" ] && git rev-parse --verify HEAD >/dev/null || exit 1
+  exit 0
+}
 {
-  root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
-  [ -f "$root/.cc/track" ] || exit 0
-  cd "$root" || exit 0
-  refuse(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$root/.cc/checkpoint.err"; git reset -q 2>/dev/null; exit 0; }   # unstage too: a refused secret must not sit in the index
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || exit "$STRICT"
+  [ -f "$root/.cc/track" ] || exit "$STRICT"
+  cd "$root" || exit "$STRICT"
+  refuse(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$root/.cc/checkpoint.err"; git reset -q 2>/dev/null; exit "$STRICT"; }   # unstage too: a refused secret must not sit in the index
   track=$(sed -n 2p "$root/.cc/track"); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
   [ -n "$track" ] && [ "$branch" = "track/$track" ] || refuse "refused: HEAD is '$branch', not 'track/$track' — checkpoint only ever commits the track's own branch"
+  if [ "$STRICT" = 1 ]; then
+    path_ids "$root" && [ "$branch" = "track/$WSTRACK" ] || refuse "refused: completion needs the canonical track"
+  fi
   project_readme   # a project's repository describes the project, not the workspace it is a branch of
-  git add -A 2>/dev/null || exit 0
-  if git diff --cached --quiet 2>/dev/null; then exit 0; fi   # nothing changed
+  git add -A 2>/dev/null || { [ "$STRICT" = 0 ] && exit 0; refuse "failed: git add"; }
+  if git diff --cached --quiet 2>/dev/null; then commit_end; fi   # nothing changed
   bad=$(git diff --cached --diff-filter=A --name-only | grep -E "$SECRETS" | head -5 | tr '\n' ' ')   # only NEW files: a repo that already tracks .env.example is not leaking
   [ -z "$bad" ] || refuse "refused: staged files look like secrets: $bad (remove or ignore them, then the next turn commits)"
   files=$(git diff --cached --name-only | wc -l | tr -d ' ')
   # Commit identity: git's own config normally, overridden by CC_GIT_NAME/CC_GIT_EMAIL in ~/.cc/config
   # (read, not sourced — that file holds tokens and none of them belong in this git's environment).
-  ident=()
-  n=$("$BIN/cc-config" get CC_GIT_NAME);  [ -n "$n" ] && ident+=(-c "user.name=$n")
-  e=$("$BIN/cc-config" get CC_GIT_EMAIL); [ -n "$e" ] && ident+=(-c "user.email=$e")
-  git "${ident[@]}" commit -q -m "wip: checkpoint $(date -u +%FT%TZ) [$files file(s)] [cc]" 2>/dev/null || exit 0
+  mapfile -t ident < <(ident_args)
+  git "${ident[@]}" commit -q -m "wip: checkpoint $(date -u +%FT%TZ) [$files file(s)] [cc]" 2>/dev/null \
+    || { [ "$STRICT" = 0 ] && exit 0; refuse "failed: git commit"; }
   rm -f "$root/.cc/checkpoint.err"
+  [ "$STRICT" = 0 ] || commit_end
   if pick_remote; then   # push failures never block, but they must not be invisible either (cc ls / digest show "push!")
     lease_push "$branch"; [ $? = 2 ] && lease_refused "$branch"
   fi

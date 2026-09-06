@@ -25,6 +25,39 @@ def state(st): return ALIAS.get(st, st)
 # that column). Rows written before this carry no field and read as `track`. `cc <repo> <name> --session` sets it.
 KINDS = ("track", "session")
 def kind(t): return t.get("kind") or "track"
+# WHO IS ON A ROW, when nothing on the box is (owner, 2026-09-04: backlog rows run as a planning session's own
+# subagents). Such a row has no worker process, no cc-loop and no tmux window of its own, so cc-reconcile saw an
+# empty worktree and called it abandoned ten minutes later, and cc-pulse offered it for dispatch on every tick.
+# `agent` is the row field that session sets — `cc board set <repo> <track> agent me` — and it is the SESSION's
+# window, not the subagent's: a subagent is not a process anything here can see, but the session running it is.
+# The mark counts while that window holds a session AND while it is still warm: `set … agent me` stamps
+# `agent_at` beside it, and cc-reconcile and cc-pulse both stop counting a mark older than CC_AGENT_MARK_HOURS
+# (6 h). A session still on the row marks again, which refreshes the time; one that moved on without clearing the
+# mark no longer holds the row for as long as its window happens to live (review of #242). After either the row
+# is unattended again and is reported like any other. `agent ''` clears both fields by hand.
+def agent_id(val):
+    """`me` = the window THIS process is in, as "<window id>:<tmux server pid>". The server pid is half the mark
+    because window ids restart at @0 when the server does: without it a mark left by a session that died in a
+    reboot matches whatever window is @3 now, and the row would never be reported again.
+
+    THE ONLY TWO VALUES ARE `me` AND EMPTY, and a typed one is refused rather than stored. Every session on the
+    box writes this one file, a member-facing one included: a hand-written id naming somebody else's live window
+    would hold a row open silently — no worker, nothing to see, and no ask ever raised. A mark can only ever be
+    made BY the session it names."""
+    if val == "": return val
+    if val != "me": sys.exit("cc-board set … agent: the only values are `me` and '' (a mark is made by the "
+                             "session it names, never typed)")
+    pane = os.environ.get("TMUX_PANE") or ""
+    if not pane: sys.exit("cc-board set … agent me: not inside tmux ($TMUX_PANE is empty)")
+    try:
+        p = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{window_id}:#{pid}"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        sys.exit(f"cc-board set … agent me: tmux would not answer ({e})")
+    out = (p.stdout or "").strip()
+    if p.returncode or not re.fullmatch(r"@\d+:\d+", out):
+        sys.exit(f"cc-board set … agent me: tmux would not name this window ({out or 'no answer'})")
+    return out
 # A FIXTURE IS NOT A BOARD (owner, 2026-09-01). A suite names everything one run makes `_cc<suite><pid>` — board, lock,
 # worktree, state, tmux windows — and a suite that dies mid-run leaves them behind: one such board's `waiting` row
 # reached the owner's NEEDS YOU list. core/tests/selftest.sh is `_cctest<pid>`, cc-sandbox's selfchecks `_ccsbx<pid>`,
@@ -223,6 +256,29 @@ def shown(t, for_=SHOWN_FOR):
     """PURE: is this row on the DEFAULT board view? (cc-board selfcheck pins it.)"""
     return t.get("status") not in FINISHED or age(t.get("updated")) < for_
 
+def delivery(repo, track):
+    """One line for a row that cc-task has given a durable identity (bin/cc-task): the task UUID, which executor
+    holds it, its phase and how long the claim has stood. The record at the ROW'S OWN path is what is shown — a
+    record naming another row, or one that will not parse, shows nothing, and every other row prints as it always
+    did. Read through `read` for the same reason a board is: what sits in a state dir is somebody's file, so a
+    link, a pipe or a directory at that name is refused rather than followed."""
+    if not all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", n) for n in (repo, track)): return ""
+    try:
+        # THE SHAPE IS CHECKED, NOT THE EXCEPTION. That state dir is bound read-write into the track's worker
+        # sandbox and into a member workspace, so what is in it is somebody's file: valid JSON that is a string,
+        # a number, or an object whose `claim` is a string all reach `.get` and would take the whole board down
+        # with a traceback — every row, not just the bad one. Anything not shaped like a record shows nothing.
+        d = read(os.path.join(STATE, repo, track, "delivery.json"))
+        if not isinstance(d, dict) or (d.get("schema"), d.get("repo"), d.get("row")) != (1, repo, track): return ""
+        c = d["claim"] if isinstance(d.get("claim"), dict) else {}
+        seconds = age(c.get("started_at"))
+        elapsed = f"{int(seconds)}s" if seconds != float("inf") else "unknown"
+        # An ENDED claim says why it ended rather than what it was last doing: a worker's claim is handed back the
+        # moment its window is up, and "released" alone would read as if the row had been dropped.
+        phase = f"ended ({c.get('reason') or 'no reason'})" if c.get("ended_at") else (c.get("phase") or "?")
+        return f"      delivery: {d['task_id']}  {c.get('executor') or '?'}  {phase}  claim age {elapsed}"
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, Refused): return ""
+
 def _brief_tool(*args, **kw):
     """cc-brief, from the same bin/ as this copy. It is a gate, never a hazard: anything it cannot do is nothing."""
     tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-brief")
@@ -295,13 +351,25 @@ def main(a):
             brief(repo, track)               # migrate first, so the old copy cannot come back over the new one
             check_shape(repo, track, val)    # …and it is a door like `add`: `set` then `--go ""` would otherwise
             write_brief(repo, track, val); return    # dispatch a step list past both gates, --go having no text to check
-        with Lock(repo):
+        if key == "agent_at":
+            # THE CLOCK ON A MARK IS NOT A FIELD ANYONE SETS. It is written only as a side effect of `set agent
+            # me` / `agent ''` below, and for the same reason a mark can only be made by the session it names:
+            # every session writes this one file, a member-facing one included, and a hand-set time would refresh
+            # a stale mark for ever — holding a row out of the reconciler and out of cc-pulse with nothing on the
+            # box doing it, which is the failure the expiry exists to end (review of #242).
+            sys.exit("cc-board set … agent_at: not settable — the time is stamped by `set … agent me`, which is "
+                     "also how a session still on a row refreshes it")
+        if key == "agent": val = agent_id(val)       # `me` becomes this session's window — asked BEFORE the lock,
+        with Lock(repo):                             # because it shells out to tmux and the board is one file
             d = need(repo)
             if track not in d["tracks"]: sys.exit(f"no track '{track}'")
             if key=="started": val = val.lower() in ("1","true","yes")
             if key=="status": val = state(val)   # `cc-board set … status todo` speaks the same word as `cc-board status`
             if key=="title": val = clean(val)
             if key=="kind" and val not in KINDS: sys.exit(f"kind must be one of {list(KINDS)}")
+            # WHEN the mark was made, beside it. `updated` cannot answer this — every other `set` moves it too —
+            # and the readers need the age to expire a mark whose session moved on (see the note on agent_id).
+            if key=="agent": d["tracks"][track]["agent_at"] = now() if val else ""
             d["tracks"][track][key]=val; d["tracks"][track]["updated"]=now()
             _save(repo,d)
     elif cmd == "get":
@@ -369,6 +437,8 @@ def main(a):
         for tr,t in rows:
             if kind(t) == "session": print(f"  ↳ \033[1m{tr}\033[0m [session]  {t.get('title','')}")
             else: print(f"  {ico.get(t.get('status'),'?')} \033[1m{tr}\033[0m [{t.get('status')}]  {t.get('title','')}")
+            detail = delivery(repo, tr) if kind(t) != "session" else ""
+            if detail: print(detail)
             b = brief(repo, tr).strip()   # a legacy row migrates on this read, like every other read of the brief
             if b: print(f"      task: {b[:200]}")
             if t.get("pr"): print(f"      PR: {t['pr']}")
@@ -516,6 +586,103 @@ def selfcheck():
         ok("`show` prints a session row after the tracks, indented, with no status icon; a track row as before",
            "  ↳ \033[1msess9\033[0m [session]  a course session" in sh and "  · \033[1mt1\033[0m [queued]" in sh
            and sh.index("[queued]") < sh.index("[session]"))
+        # THE TASK IDENTITY ON THE ROW (bin/cc-task). It is read off the row's own state dir at render time, so
+        # there is nothing on the board to get out of step with it — and a row without a record is byte-identical
+        # to what it printed before this existed, which is what "preserve legacy rows" has to mean.
+        def lay(row, rec):
+            os.makedirs(f"{th}/.cc/state/r/{row}", exist_ok=True)
+            with open(f"{th}/.cc/state/r/{row}/delivery.json", "w") as fh: fh.write(rec)
+        task = {"schema": 1, "repo": "r", "row": "t1", "task_id": "00000000-0000-4000-8000-000000000001",
+                "claim": {"executor": "subagent", "phase": "starting", "started_at": now()}}
+        dp = f"{th}/.cc/state/r/t1/delivery.json"
+        before, tsv = run("show", "r").stdout, run("list").stdout
+        lay("t1", json.dumps(task)); projected = run("show", "r").stdout
+        detail = next((l for l in projected.splitlines(True) if "delivery:" in l), "")
+        ok("`show` projects the task UUID, executor, phase and claim age; every other byte, and the TSV, are unchanged",
+           task["task_id"] in detail and "subagent  starting  claim age " in detail
+           and re.search(r"claim age \d+s", detail) is not None
+           and projected.replace(detail, "", 1) == before and run("list").stdout == tsv)
+        task["claim"].update(executor="worker", phase="released", started_at="2000-01-01T00:00:00Z")
+        lay("t1", json.dumps(task)); changed = run("show", "r").stdout
+        ok("the line follows the durable record, an old claim included — no board field caches any of it",
+           "worker  released  claim age " in changed and "claim age 0s" not in changed
+           and "subagent  starting" not in changed)
+        task["claim"].update(phase="released", ended_at=now(), reason="worker launched")
+        lay("t1", json.dumps(task)); ended = run("show", "r").stdout
+        ok("a claim that has ended says why, not what it was last doing — a worker's is handed back at launch",
+           "worker  ended (worker launched)  claim age " in ended and "  released  " not in ended)
+        task["claim"].pop("ended_at"); task["claim"].pop("reason")
+        task["row"] = "sibling"; lay("t1", json.dumps(task))
+        ok("a record naming another row is not this row's, and shows nothing", run("show", "r").stdout == before)
+        junk = ('{', '"held"', '17', 'null', '[{"schema": 1}]', '{"schema": 1, "repo": "r", "row": "t1"}')
+        for j in junk: lay("t1", j)
+        outs = [(lay("t1", j), run("show", "r"))[1] for j in junk]
+        ok("nothing shaped like a record shows one — unparseable, a bare scalar, a list, no task id — and the "
+           "board is whole either way (that dir is bound rw into a worker sandbox and a member workspace)",
+           all(o.stdout == before and "Traceback" not in o.stderr for o in outs))
+        lay("t1", '{"schema": 1, "repo": "r", "row": "t1", "task_id": "x", "claim": "held"}')
+        broken = run("show", "r")
+        ok("…and a record whose claim is a string still prints its row, with the claim unknown rather than a traceback",
+           "Traceback" not in broken.stderr and broken.returncode == 0
+           and "delivery: x  ?  ?  claim age unknown" in broken.stdout
+           and broken.stdout.replace("      delivery: x  ?  ?  claim age unknown\n", "", 1) == before)
+        os.remove(dp); task["row"] = "sess9"; lay("sess9", json.dumps(task))
+        ok("a row with no record, and a session row with a task-shaped file beside it, print exactly as before",
+           run("show", "r").stdout == before and run("list").stdout == tsv)
+        os.remove(f"{th}/.cc/state/r/sess9/delivery.json")
+        # AGENT: who is on a row when nothing on the box is. `me` stamps the session's OWN tmux window, because a
+        # subagent is not a process cc-reconcile or cc-pulse can see, and the session running it is (owner, 2026-09-04).
+        stub = f"{th}/stub"; os.makedirs(stub, exist_ok=True)
+        def tmux_stub(body):
+            open(f"{stub}/tmux", "w").write("#!/bin/sh\n" + body + "\n"); os.chmod(f"{stub}/tmux", 0o755)
+        def runt(*args, pane="%9"):
+            return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
+                                  env={**os.environ, "HOME": th, "TMUX_PANE": pane,
+                                       "PATH": stub + os.pathsep + os.environ.get("PATH", "")},
+                                  capture_output=True, text=True)
+        tmux_stub('echo "@7:4242"')
+        runt("set", "r", "t1", "agent", "me")
+        ok("`set … agent me` stores this session's window AND the tmux server that numbered it — window ids "
+           "restart at @0 when the server does, and a mark left across a reboot must match nothing",
+           run("get", "r", "t1", "agent").stdout.strip() == "@7:4242")
+        r = runt("set", "r", "t1", "agent", "me", pane="")
+        ok("…outside tmux it refuses rather than storing a mark that means nothing, and the old one stands",
+           r.returncode != 0 and run("get", "r", "t1", "agent").stdout.strip() == "@7:4242")
+        tmux_stub("exit 1")
+        r = runt("set", "r", "t1", "agent", "me")
+        ok("…and a tmux that will not name the window is a refusal too, never a blank mark",
+           r.returncode != 0 and run("get", "r", "t1", "agent").stdout.strip() == "@7:4242")
+        tmux_stub('echo "@7:4242"')
+        r = runt("set", "r", "t1", "agent", "@1:2")
+        ok("A MARK IS MADE BY THE SESSION IT NAMES, never typed: every session writes this one file, so a "
+           "hand-written id naming somebody else's live window would hold a row open with nothing to see",
+           r.returncode != 0 and run("get", "r", "t1", "agent").stdout.strip() == "@7:4242")
+        at1 = run("get", "r", "t1", "agent_at").stdout.strip()
+        ok("a mark carries WHEN it was made, because a mark that never expires holds a row open for as long as "
+           "the session's window lives — and `updated` cannot say, every other `set` moves it too",
+           re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", at1) is not None)
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        d["tracks"]["t1"]["agent_at"] = "2020-01-01T00:00:00Z"
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        runt("set", "r", "t1", "agent", "me")
+        ok("…and marking again refreshes it: that is how a session still on the row says so, and the one command "
+           "it costs is the whole price of the mark expiring at all",
+           run("get", "r", "t1", "agent_at").stdout.strip() >= at1)
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        d["tracks"]["t1"]["agent_at"] = "2020-01-01T00:00:00Z"
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        r = run("set", "r", "t1", "agent_at", "2099-01-01T00:00:00Z")
+        ok("THE CLOCK IS NOT A FIELD ANYONE SETS: setting it by hand is refused and the cold mark stays cold — "
+           "otherwise any writer of this file could refresh a stale mark for ever, or stamp a time onto a row "
+           "with no mark at all",
+           r.returncode != 0 and run("get", "r", "t1", "agent_at").stdout.strip() == "2020-01-01T00:00:00Z"
+           and run("set", "r", "t2", "agent_at", "2099-01-01T00:00:00Z").returncode != 0
+           and run("get", "r", "t2", "agent_at").stdout.strip() == "")
+        runt("set", "r", "t1", "agent", "me")
+        run("set", "r", "t1", "agent", "")
+        ok("`agent ''` hands the row back, time and all",
+           run("get", "r", "t1", "agent").stdout.strip() == ""
+           and run("get", "r", "t1", "agent_at").stdout.strip() == "")
         # A FIXTURE IS NOT A BOARD: a `_cctest<pid>` board with a waiting row beside the real one is in neither `list`
         # nor `boards` unless `--all` asks — the one rule every reader of ~/.cc/boards calls or names
         json.dump({"repo": "_cctest99999999", "tracks": {"w1": {"status": "waiting", "title": "push refused", "updated": now()}}},

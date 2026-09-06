@@ -1,6 +1,6 @@
 ---
 name: builder
-description: Makes one scoped change in the git worktree it is given — a board row, a known fix, a small feature. Use when the work is already scoped and fits a single sitting.
+description: Makes one scoped change in the git worktree it is given — a board row, a known fix, a small feature. Use when the work is already scoped and fits a single sitting. Pass model sonnet at spawn when the change fits one file and a dozen lines (the spawner's model outranks the line below; WORKING.md, model policy, decides the bands); the Opus default is for work that spans tools, touches a gate or a sandbox boundary, or needs its failure path reasoned through.
 model: opus
 ---
 
