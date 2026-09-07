@@ -44,10 +44,24 @@ FIELDS = ("agent", "agent_at", "branch", "created", "instructions", "kind", "not
 # (6 h). A session still on the row marks again, which refreshes the time; one that moved on without clearing the
 # mark no longer holds the row for as long as its window happens to live (review of #242). After either the row
 # is unattended again and is reported like any other. `agent ''` clears both fields by hand. A mark is MADE by
-# the session it names and by nothing else; the one thing that may move an existing one is `handover` below —
-# which moves the name and NOT the clock, so a mark that had already expired stays expired — and that is the
-# whole of the exception.
-def agent_id(val):
+# the session it names and by nothing else, and only from a window a reader counts (agent_id); the one thing that
+# may move an existing one is `handover` below — which moves the name and NOT the clock, so a mark that had
+# already expired stays expired — and that is the whole of the exception.
+# WHAT A READER COUNTS is one thing, and a mark that misses it is worse than no mark at all. Both readers ask
+# the same of a mark's window: cc-pulse's agent_held lists `-t main` and keeps a mark only where
+# `#{window_name}` is the row's own repo, and cc-reconcile's mark_why keeps one only where its wins[] entry —
+# the window's name again — is that repo. A window named anything else is read by NEITHER, so a claim made from
+# one records an owner nobody recognises: the row reads unowned, the watchdog calls it abandoned ten minutes
+# later, and cc-pulse offers it for dispatch while the subagent is still writing it. The claim does the exact
+# opposite of what it was for. Three live windows are named something else — `<repo>~old`, a session cc-handoff
+# has retired and whose subagents are still running (found building #318, 2026-09-07); `<repo>@<alias>`, an
+# orch; `<repo>/<track>`, a track session — so this is not only the retiring session's problem.
+SESSION = "main"   # the tmux session cc puts every window in, and the only one cc-pulse lists
+# LITERAL ON PURPOSE, never $CC_TMUX_SESSION. cc-limit, cc-started and cc-model read that override, so changing
+# this to match them looks like tidying — but the two READERS, cc-pulse and cc-reconcile, hardcode `main`. This
+# constant has to be whatever THEY ask for, not whatever cc launched into: an override honoured only here would
+# let a mark through that neither reader counts, which is the hole below, reopened from the other side.
+def agent_id(val, repo):
     """`me` = the window THIS process is in, as "<window id>:<tmux server pid>". The server pid is half the mark
     because window ids restart at @0 when the server does: without it a mark left by a session that died in a
     reboot matches whatever window is @3 now, and the row would never be reported again.
@@ -55,21 +69,38 @@ def agent_id(val):
     THE ONLY TWO VALUES ARE `me` AND EMPTY, and a typed one is refused rather than stored. Every session on the
     box writes this one file, a member-facing one included: a hand-written id naming somebody else's live window
     would hold a row open silently — no worker, nothing to see, and no ask ever raised. A mark can only ever be
-    made BY the session it names."""
+    made BY the session it names.
+
+    …AND ONLY FROM A WINDOW A READER COUNTS: in tmux session `main`, named for `repo`. This adds no way to write
+    a mark — `me` is still the only value and it is still this process's own window — it refuses one that would
+    be written into the dark. The refusal comes BEFORE the lock, so the row keeps whatever it already had; a
+    session that wants the row anyway asks from a window that is read, and `agent ''` still hands a row back
+    from anywhere."""
     if val == "": return val
     if val != "me": sys.exit("cc-board set … agent: the only values are `me` and '' (a mark is made by the "
                              "session it names, never typed)")
     pane = os.environ.get("TMUX_PANE") or ""
     if not pane: sys.exit("cc-board set … agent me: not inside tmux ($TMUX_PANE is empty)")
     try:
-        p = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{window_id}:#{pid}"],
+        p = subprocess.run(["tmux", "display-message", "-p", "-t", pane,
+                            "#{window_id}:#{pid}\t#{session_name}\t#{window_name}"],
                            capture_output=True, text=True, timeout=10)
     except Exception as e:
         sys.exit(f"cc-board set … agent me: tmux would not answer ({e})")
-    out = (p.stdout or "").strip()
-    if p.returncode or not re.fullmatch(r"@\d+:\d+", out):
+    # NEWLINES ONLY, never a bare .strip(): a window name may legally end in a space, and a reader compares
+    # the name tmux prints. Trimming it here would pass a name no reader matches — the very hole below.
+    out = (p.stdout or "").strip("\n")
+    f = out.split("\t")
+    if p.returncode or len(f) != 3 or not re.fullmatch(r"@\d+:\d+", f[0]):
         sys.exit(f"cc-board set … agent me: tmux would not name this window ({out or 'no answer'})")
-    return out
+    # "a claim made from a window no reader counts is refused … the row is left exactly as it was" — a
+    # reader counts a window when it is in `main` AND named for the repo, so refuse when either fails.
+    if f[1] != SESSION or f[2] != repo:
+        sys.exit(f"cc-board set … agent me: refused — this window is '{f[2]}' in tmux session '{f[1]}', and a "
+                 f"mark is only read off a window named '{repo}' in '{SESSION}'. cc-reconcile and cc-pulse would "
+                 f"both ignore one made here, so the row would read as unowned and be offered for dispatch while "
+                 f"you are still on it. Row unchanged — mark it from the '{repo}' window.")
+    return f[0]
 # A FIXTURE IS NOT A BOARD (owner, 2026-09-01). A suite names everything one run makes `_cc<suite><pid>` — board, lock,
 # worktree, state, tmux windows — and a suite that dies mid-run leaves them behind: one such board's `waiting` row
 # reached the owner's NEEDS YOU list. core/tests/selftest.sh is `_cctest<pid>`, cc-sandbox's selfchecks `_ccsbx<pid>`,
@@ -373,8 +404,8 @@ def main(a):
                      "also how a session still on a row refreshes it")
         if key not in FIELDS:
             sys.exit(f"cc-board set: '{key}' is not a field this board knows — known fields: {', '.join(FIELDS)}")
-        if key == "agent": val = agent_id(val)       # `me` becomes this session's window — asked BEFORE the lock,
-        with Lock(repo):                             # because it shells out to tmux and the board is one file
+        if key == "agent": val = agent_id(val, repo)  # `me` becomes this session's window — asked BEFORE the lock,
+        with Lock(repo):                              # because it shells out to tmux and the board is one file
             d = need(repo)
             if track not in d["tracks"]: sys.exit(f"no track '{track}'")
             if key=="started": val = val.lower() in ("1","true","yes")
@@ -703,7 +734,9 @@ def selfcheck():
                                   env={**os.environ, "HOME": th, "TMUX_PANE": pane,
                                        "PATH": stub + os.pathsep + os.environ.get("PATH", "")},
                                   capture_output=True, text=True)
-        tmux_stub('echo "@7:4242"')
+        # the three fields agent_id asks for: the mark, and the two things a reader tests the window on
+        def win_stub(sess, name, mark="@7:4242"): tmux_stub(f'printf "{mark}\\t{sess}\\t{name}\\n"')
+        win_stub("main", "r")
         runt("set", "r", "t1", "agent", "me")
         ok("`set … agent me` stores this session's window AND the tmux server that numbered it — window ids "
            "restart at @0 when the server does, and a mark left across a reboot must match nothing",
@@ -715,7 +748,7 @@ def selfcheck():
         r = runt("set", "r", "t1", "agent", "me")
         ok("…and a tmux that will not name the window is a refusal too, never a blank mark",
            r.returncode != 0 and run("get", "r", "t1", "agent").stdout.strip() == "@7:4242")
-        tmux_stub('echo "@7:4242"')
+        win_stub("main", "r")
         r = runt("set", "r", "t1", "agent", "@1:2")
         ok("A MARK IS MADE BY THE SESSION IT NAMES, never typed: every session writes this one file, so a "
            "hand-written id naming somebody else's live window would hold a row open with nothing to see",
@@ -746,6 +779,41 @@ def selfcheck():
         ok("`agent ''` hands the row back, time and all",
            run("get", "r", "t1", "agent").stdout.strip() == ""
            and run("get", "r", "t1", "agent_at").stdout.strip() == "")
+        # A MARK FROM A WINDOW NO READER COUNTS IS REFUSED (2026-09-07). Both readers keep a mark only where its
+        # window is in tmux session `main` and named for the ROW'S OWN REPO — cc-pulse's agent_held lists `-t
+        # main` and matches `#{window_name}` against the repo, cc-reconcile's mark_why matches the same name. A
+        # claim from any other window therefore records an owner nobody recognises: the row reads unowned, the
+        # watchdog calls it abandoned and it is offered for dispatch while the subagent is still writing it, so
+        # the claim RELEASES the row instead of holding it. Its own row, marked by a window it does not use.
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        d["tracks"]["u1"] = {"title": "u1", "status": "running", "agent": "@5:900", "kind": "track",
+                             "agent_at": "2020-01-01T00:00:00Z", "updated": "2020-01-01T00:00:00Z"}
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        u1 = lambda k="agent": json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["u1"].get(k, "")
+        for sess, name, why in (("main", "r~old", "a session cc-handoff retired, subagents still running"),
+                                ("main", "r@x1", "an orch"),
+                                ("main", "r/t1", "a track session"),
+                                ("main", "other", "a session speaking for another repo"),
+                                ("work", "r", "the right name outside the tmux session cc-pulse lists")):
+            win_stub(sess, name)
+            rf = runt("set", "r", "u1", "agent", "me")
+            ok(f"a mark from {why} — window '{name}' in '{sess}' — is refused, the reason names both what this "
+               "window is and what a read one would be, and the row keeps the mark and the clock it already "
+               "had: a claim must never be the thing that releases a row",
+               rf.returncode != 0 and f"'{name}' in tmux session '{sess}'" in rf.stderr
+               and "named 'r' in 'main'" in rf.stderr
+               and u1() == "@5:900" and u1("agent_at") == "2020-01-01T00:00:00Z"
+               and u1("updated") == "2020-01-01T00:00:00Z")
+        win_stub("main", "r")
+        rf = runt("set", "r", "u1", "agent", "me")
+        ok("…and from the window a reader DOES count the same command claims exactly as it always did — this "
+           "refuses a bad mark, it does not add a way to write one",
+           rf.returncode == 0 and u1() == "@7:4242" and u1("agent_at") > "2020-01-01T00:00:00Z")
+        win_stub("main", "r~old")
+        rf = runt("set", "r", "u1", "agent", "")
+        ok("…while HANDING A ROW BACK is not a claim and still works from any window at all: the refusal is "
+           "about writing an owner nobody reads, never about a session letting go of a row",
+           rf.returncode == 0 and u1() == "" and u1("agent_at") == "")
         # HANDOVER: the one way a mark moves to a window other than the one that made it. cc-handoff calls it at a
         # cutover, because the retiring session's subagents keep running and report into its successor — without it
         # the watchdog called five such rows abandoned ten minutes later and put them back in the pool (2026-09-07).
