@@ -1,0 +1,1171 @@
+#!/usr/bin/env python3
+"""cc-sense — the box's own records and screens read against what is actually there, and only what does not add up.
+
+  cc-sense              the pass. Prints ONLY what contradicts itself; nothing wrong, nothing printed
+  cc-sense --all        every finding, not just the first few
+  cc-sense --json       the findings as JSON (always all of them)
+  cc-sense --tick       the rider's form: run, write the findings file, log one line, print nothing
+  cc-sense selfcheck    fixtures in a HOME, a tree and a tmux of its own — no board, config, pane or repo of this box's
+
+SILENCE IS THE NORMAL OUTPUT, and that is the whole design constraint. The box already has watchers that report
+what is happening (cc-reconcile the board, cc-audit the gates, cc-secretary a model's read of the panes); another
+one that lists twenty things an hour is a digest nobody opens, and the reader then misses the one that mattered.
+So this reports ONE CLASS: SOMETHING THE BOX BELIEVES IS IN HAND, AND NOTHING IS ACTUALLY HOLDING IT. Nothing here
+is a lint, a policy or an opinion, and no model is asked anything — a finding is two of the box's own facts
+disagreeing, settled by a file read or a string match.
+
+WHY THAT CLASS. Every one of these went unnoticed until a person stumbled into it, because nothing FAILED. A
+protection list that matched zero files, so a guard spared nothing while reporting success. An ask pointing at a
+verification script deleted five days earlier. Documents describing tools the box no longer had. A routing entry
+aimed at a project that had moved. A message typed into a session's prompt box and never submitted. An orch whose
+parent project had no live session to answer it. Each looked green because the thing doing the looking never
+resolved the name, or never asked whether anyone was on the other end.
+
+IT HAS NO UNIT, AND THAT IS THE ARRANGEMENT. A watcher with its own timer is a fourth loop running beside
+cc-reconcile, cc-audit and cc-secretary for somebody to read; this rides cc-reconcile's turn instead, from an
+ExecStart in that unit, exactly as cc-handoff's --sweep already does one layer up. Two selfcheck cases hold both
+halves — no `cc-sense.*` unit exists, and an existing one names it — the way selftest.sh:1040 holds the sweep's.
+The owner's switch is therefore a config key and not an `enable: owner` row: `--tick` does nothing at all until
+`CC_SENSE=on` is in ~/.cc/config, because cc-reconcile's timer is enabled on every box and a recurring pass over
+the whole box, its panes included, is the owner's call. A plain `cc-sense` typed by a person is never gated.
+
+READ-ONLY, AND IT PAGES NOBODY. It opens files, globs paths, runs one grep, lists tmux windows and reads panes and
+`ps`. It repairs nothing (a tool that edits config or docs on its own is a different and far more dangerous thing),
+it types at nothing, it starts nothing, it reaches no network and it calls no model. `--tick` writes exactly two
+files, both under CC_SENSE_STATE. Whether a finding ever reaches a person is the owner's call and is deliberately
+not wired here.
+
+THE SIX CHECKS. Each was measured against this box before it was written, and each was silent on it — a check that
+fires on a healthy box is not restraint, it is noise with a rationale.
+
+  selector  a config value that names paths, and NONE of them resolve. A list that selects nothing is the exact
+            shape of the guard that protected nothing: the key is set, so every reader believes it is configured.
+            An unset key is not a finding — off is a choice somebody made. Neither is a value with one live entry
+            and three dead ones: something still matches, and guessing which entries were meant is not this
+            tool's business. A SLASH IS NOT A PATH, either: see entries().
+  unread    a config key that is set and that NO code anywhere reads. This is what a rename leaves behind: the
+            owner's value stays in the file, every reader has moved to the new name, and the setting silently
+            does nothing for ever. Only keys with a value are asked about; the search covers this tree and the
+            projects beside it, because a key set here is often read by one of them.
+  command   a living document that tells you to run a `cc-…` this box does not have. RECORDS ARE NOT LIVING
+            DOCUMENTS and this is the difference the check turns on: an audit or an incident note dated in its
+            filename or its opening lines is a record OF A MOMENT, and naming a tool that has since gone is
+            correct there. Measured on this box: over the whole tree the rule leaves the historical docs alone
+            and reads the ones that claim to describe the box now.
+  route     a routing entry aimed at a project that has no board. A channel or an orch pointing at a name that
+            is not a project is mail with no address. A TARGET IS NOT ALWAYS A BARE PROJECT NAME, and reading it
+            as one is how this check first fired on a healthy box: the project is the part before the `/`, and
+            `box` is the box itself.
+  orch      an orch whose channel NOBODY CAN ANSWER. This is the one place liveness is a fair question, and the
+            reasons are two other files': an orch's pane is never typed into (cc-slack:3857-3858) and the drive
+            loop never restarts one (cc-pulse:635-641), so nothing brings it back and its messages queue under
+            an alias no other session drains. A project whose directory has moved keeps its board, so every
+            records-only check above still says the name is fine. THREE THINGS ARE NOT THIS. A project merely
+            not running: a message starts one. A live parent session: an `@main` there reaches somebody, and
+            its window carries the whole target, so a `<repo>/<track>` orch's parent is the window `alpha/fix`.
+            And an orch that has just exited, which is every orch eventually — `archived` only goes true when
+            cc-slack's janitor sets it, so this waits out cc-slack's own clock and reports only the channel
+            that outlived it.
+  unsent    a message typed into a session's prompt box and never sent. The input-box grammar is cc-handoff's,
+            copied with a case that fails when the original moves on, plus the one shape cc-handoff has no reason
+            to know: the words the TUI itself draws in an EMPTY box. A turn in flight, a modal and a person still
+            typing are each excluded too. See check_unsent for why no other reader of a pane answers this.
+
+WHAT IT IS NOT ASKED TO SEE, on purpose. Whether a row's work is progressing (cc-reconcile), whether a session is
+stuck or holding a dialog (cc-secretary, cc-msg), whether the gates are red (cc-audit), whether a unit is enabled
+(cc-units), whether a document's PROSE still matches behaviour — that last one is a model's job and a model is
+what this is trying not to be.
+
+Env: CC_SENSE (`on` before `--tick` does anything) · CC_SENSE_ROOT (the tree to read; default the tree this script
+is in — and its parent when that tree is `core/` inside an overlay) · CC_SENSE_DEV (where the projects that read
+the config live; default $HOME/dev) · CC_SENSE_CONFIG (the config file; default $HOME/.cc/config) · CC_SENSE_STATE
+(default $HOME/.cc/state/sense) · CC_SENSE_TMUX (the tmux binary; a suite points it at a stub) · CC_SENSE_DWELL
+(seconds a box must sit untouched before its text is unsent; default 600) · CC_SENSE_SHOW (how many findings a
+plain run prints before it says how many more; default 5).
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+SHOW = int(os.environ.get("CC_SENSE_SHOW") or 5)
+GLOBC = set("*?[")
+# What a value must begin with before it is read as a path. A relative name with no `./` is not admitted:
+# `Europe/London` and a `<repo>/<track>` target are both legal relative paths and neither is one.
+ANCHOR = ("/", "~", "./", "../")
+# Directories a search never descends. Two reasons in one list: vendored trees are somebody else's code, and a
+# worktree is a second copy of the tree we are already reading — it can only ever add matches we have, slowly.
+SKIP_DIRS = {".git", "node_modules", "worktrees", ".venv", "venv", "__pycache__", "dist", "build",
+             ".next", ".cache", ".mypy_cache", ".pytest_cache", "vendor"}
+DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+CMD = re.compile(r"\bcc-[a-z0-9]+(?:-[a-z0-9]+)*")
+SPAN = re.compile(r"`([^`\n]*)`")
+KEYLINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+UNIT = re.compile(r"\.(service|timer|socket|path)$")
+HEAD = 400          # how much of a document is read to decide whether it is a record of a moment
+FIXTURE = "_cc"     # a suite names everything one run makes `_cc<suite><pid>`; none of it is a real record
+QUOTE = 60          # how much of an unsent message is quoted back; the point is recognising it, not reading it
+
+# ── THE INPUT BOX, COPIED FROM cc-handoff:523-527 AND NOT IMPORTED ───────────────────────────────────────────
+# Copied the way cc-steward copies cc-broker's DECISION_MARKS (cc-steward:92-97): a `cc-*` tool stands on its own,
+# and a selfcheck case below reads cc-handoff and fails when the grammar there has moved on — so the two readers of
+# "what is in the box" cannot drift apart in silence. Every one of these was learnt from a real pane: the `❯` the
+# TUI draws since 2.1, the non-breaking space an empty box is padded with, and the words each TUI writes into an
+# empty box — the older one's placeholder, and the current one's, which is this file's own and held to nothing.
+PROMPT_LINE = re.compile(r"^[^\w>❯]*[>❯](.*)$")
+DIALOG_MARKS = ("Do you want to", "No, and tell Claude", "Esc to cancel", "Enter to confirm",
+                "Would you like to proceed?")
+WORKING = "esc to interrupt"          # the footer for the whole of a turn
+PLACEHOLDER = 'Try "'                 # an older TUI's empty box
+# …and the CURRENT TUI's, which is not cc-handoff's and is held to nothing: it draws this in the box itself when
+# it has no completion to offer, so the box is empty and the words in it are its own. Found on a healthy box by
+# this very check (2026-09-07): a session idling at an empty box was named every turn, for as long as it idled,
+# over text no person typed — the exact wolf-crying a pass that only speaks up when something is wrong cannot
+# afford. Matched WHOLE, not as a prefix, so a message that merely opens with it is still somebody's message.
+SUGGESTION = "<no suggestion>"
+DWELL = 600         # how long text must sit in a box before it is a finding, in seconds. NOT a tuning knob: below
+                    # it, a person part-way through a sentence is a finding, and a check that fires on somebody
+                    # typing is the noise this file exists to avoid. Ten minutes of an untouched box is a stall.
+
+# cc-slack's OWN clock for a dead orch, copied and held to it by a selfcheck case the way the input box above is
+# held to cc-handoff's. An orch that simply exits leaves `archived` false in orchs.json until cc-slack's janitor
+# archives it — so an orch check that only asks "gone and not archived" names the ORDINARY END of an orch's life,
+# every turn, for a day, about a state cc-slack heals by itself. One sweep of grace on top of the idle window,
+# because at the boundary itself the janitor has not had its turn yet.
+ORCH_IDLE = 24 * 3600     # cc-slack ORCH_IDLE: how long gone before the janitor archives the channel
+ORCH_SWEEP = 900          # cc-slack sweep_cycle: how often the janitor gets to look
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ── the six checks: pure, so the selfcheck drives every branch with no box around it ─────────────────────────
+
+def config_pairs(text):
+    """The KEY=value lines of a shell-style config, in order. Comments, blanks and anything that is not an
+    assignment are not settings and are dropped here rather than being reasoned about four times below."""
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = KEYLINE.match(s)
+        if not m:
+            continue
+        v = m.group(2).strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out.append((m.group(1), v))
+    return out
+
+
+def entries(value):
+    """A config value split into the paths it names, or [] when it does not name paths at all.
+
+    ALL OR NOTHING, deliberately. A value has to be path-shaped THROUGHOUT to be read as a path list: a list of
+    repo names, an email list, a number and a URL are all things a reader would otherwise have to guess about,
+    and a check that guesses is the noise this file exists to avoid.
+
+    A SLASH IS NOT A PATH. Reading one as a path is how this check fired on a healthy box: a zone name, a
+    `<repo>/<track>` target and a `host:owner/repo` remote all carry a slash and none of them is on disk, so the
+    check said "there is nothing there" about a key that was working perfectly, once an hour, for ever. A path
+    ANCHORS — `/`, `~` or a `./` this run can resolve — and a value that does not anchor is not asked about."""
+    if not value or "://" in value:
+        return []
+    parts = [p for p in re.split(r"[\s,]+", value) if p]
+    for p in parts:
+        if not p.startswith(ANCHOR):
+            return []
+    return parts
+
+
+def check_selector(pairs, count):
+    """`count(pattern) -> how many paths it resolves to`. A finding is a whole list resolving to nothing."""
+    out = []
+    for key, val in pairs:
+        es = entries(val)
+        if not es:
+            continue
+        if sum(count(e) for e in es):
+            continue
+        if len(es) == 1:
+            why = f"`{key}` points at `{es[0]}`, and there is nothing there"
+        else:
+            why = f"`{key}` names {len(es)} paths and not one of them is there: `{es[0]}` …"
+        out.append(("selector", key, why + " — whatever reads it is working from an empty list."))
+    return out
+
+
+def check_unread(pairs, seen):
+    """`seen` = every identifier some file on the box actually mentions. A key with a value that nobody reads
+    is a setting the owner believes is in force. Empty keys are skipped: an unset key does nothing by design."""
+    return [("unread", key,
+             f"`{key}` is set in the config and no code on the box reads that name — a rename leaves this behind, "
+             f"and the value goes on doing nothing.")
+            for key, val in pairs if val and key not in seen]
+
+
+def config_findings(pairs, seen, count):
+    """Both config checks, composed — ONE FINDING PER KEY. A key nobody reads whose path is also gone is one
+    problem, and the deeper half is that nothing reads it: saying "whatever reads it is working from an empty
+    list" about a key with no reader at all is worse than saying nothing. So `unread` is decided first and
+    `selector` is not asked about those keys. `seen` is None when the search could not be made, and then the
+    unread question is not asked at all."""
+    unread = check_unread(pairs, seen) if seen is not None else []
+    dead = {s for _c, s, _w in unread}
+    return check_selector([(k, v) for k, v in pairs if k not in dead], count) + unread
+
+
+def is_record(name, head):
+    """Is this document a record of a moment rather than a description of the box now? A date in the filename
+    or in its opening lines says so, and naming a since-retired tool is CORRECT in one."""
+    return bool(DATE.search(name) or DATE.search(head))
+
+
+def check_command(docs, known):
+    """`docs` = {path: text} of the living documents; `known` = the command names this box has. Only names
+    inside a code span count: prose says `cc-land-fixes` about a branch, a code span is an instruction to run."""
+    hits = {}
+    for path, text in sorted(docs.items()):
+        for span in SPAN.findall(text):
+            for tok in CMD.findall(span):
+                if tok not in known:
+                    hits.setdefault(tok, []).append(path)
+    out = []
+    for tok, where in sorted(hits.items()):
+        more = f" (and {len(where) - 1} other document{'s' if len(where) > 2 else ''})" if len(where) > 1 else ""
+        out.append(("command", tok, f"`{where[0]}`{more} tells you to run `{tok}`, and this box has no such command."))
+    return out
+
+
+def project_of(target):
+    """The project a routing target names, or "" when it names no project at all.
+
+    A TARGET IS NOT A PROJECT NAME. cc-slack's valid_target (cc-slack:902-907) accepts three shapes — `<repo>`,
+    `<repo>/<track>`, and the literal `box` — and orchs.json and routes.json hold all three: cc-rename's own
+    fixture writes `{"C9": "<repo>/t1"}` and cc-sandbox reads a target with `split("/")[0]`. Only the repo half
+    is ever a project with a board, and `box` is this machine, which has no board and never will."""
+    return "" if target == "box" else target.split("/")[0]
+
+
+def check_route(boards, orchs, routes):
+    """A channel or an orch aimed at a project that has no board. `boards` is the set of project names, and a
+    target is resolved to its project first — asking the board about the whole `<repo>/<track>` string reported
+    a live channel as dead mail on a healthy box."""
+    out = []
+    live = {}
+    for entry in (orchs or {}).values():
+        if entry.get("archived"):
+            continue
+        target, alias = str(entry.get("target") or ""), str(entry.get("alias") or "")
+        if not target:
+            continue
+        live[f"{target}@{alias}"] = entry
+        project = project_of(target)
+        if project and project not in boards:
+            out.append(("route", entry.get("name") or f"{target}@{alias}",
+                        f"the orch `{entry.get('name') or alias}` reports to `{target}`, and no project called "
+                        f"`{project}` has a board."))
+    for chan, target in sorted((routes or {}).items()):
+        target = str(target or "")
+        project = project_of(target)
+        if not target or not project or target in live or project in boards:
+            continue
+        out.append(("route", chan,
+                    f"`{chan}` routes to `{target}`, and there is no project or orch called `{project}`."))
+    return out
+
+
+def dur(secs):
+    """A stretch of time the way somebody says it out loud."""
+    m = int(secs // 60)
+    return f"{m} min" if m < 90 else f"{m // 60} h" if m < 2880 else f"{m // 1440} days"
+
+
+def box_text(pane):
+    """What is SITTING in that pane's input box: the bottom-most prompt line's content (a taken turn's echo sits
+    above it), "" for an empty box, and None when there is no box on the screen at all — a bare shell, or a pane
+    that has drawn nothing yet. cc-handoff's box_holds() reads the same line for its own typed string."""
+    last = None
+    for ln in pane.splitlines():
+        m = PROMPT_LINE.match(ln)
+        if m:
+            last = m.group(1)
+    if last is None:
+        return None
+    last = last.replace("\u00a0", " ").strip()
+    return "" if last.startswith(PLACEHOLDER) or last == SUGGESTION else last
+
+
+def check_unsent(panes, dwell=DWELL):
+    """A message typed at a session and never sent. `panes` = [(window, pane text, seconds since it last changed)].
+
+    THIS IS THE OVERSIGHT THE PASS WAS ASKED FOR, and it is the one no other reader of a pane answers: cc-handoff
+    knows the grammar but only ever asks whether ITS OWN string is still in the box, and it runs inside a cutover,
+    on no timer; cc-msg and cc-slack read a pane to decide whether a key is safe to send, not whether one is owed;
+    cc-secretary's rubric tells its model in the same breath not to flag a session idle at a prompt, and its own
+    state word for a box with a sentence in it and a box with nothing in it is the same word, `idle`. So the pane
+    goes past every one of them and the text sits there.
+
+    THREE GUARDS, and each is a way this would otherwise fire on a working session. A turn in flight owns the
+    screen, so the working footer is not asked about. A modal takes the keys, so a dialog is not this — it is
+    cc-msg's, and the box behind it is not reachable anyway. And a person mid-sentence is not a stall, so nothing
+    is a finding until the window has not changed for `dwell`; typing echoes, so an untouched box is a real one."""
+    out = []
+    for name, pane, quiet in sorted(panes):
+        if not pane.strip() or WORKING in pane or any(d in pane for d in DIALOG_MARKS):
+            continue
+        text = box_text(pane)
+        if not text or quiet < dwell:
+            continue
+        out.append(("unsent", name,
+                    f"`{name}` has a message typed into its prompt box and never sent: \u201c{text[:QUOTE]}\u201d has "
+                    f"been sitting there {dur(quiet)}, and nothing is going to take it."))
+    return out
+
+
+def gone_since(entry, t0):
+    """How long cc-slack has believed this orch dead, by cc-slack's own clock. `seen` is stamped ONLY while the
+    orch is UP — subscribed on that alias, or holding a window whose pane is not a bare shell (cc-slack:4085-4089)
+    — and an incoming message never touches it, so it freezes at the moment the orch went and is exactly the age
+    the janitor archives on. The fallback chain is the janitor's own (`seen or created or now`, cc-slack:4090): an
+    entry carrying neither stamp reads as new and stays silent, because a gap in the records is not evidence that
+    anything is wrong, and a value that is not a number is the same kind of gap."""
+    try:
+        return t0 - float(entry.get("seen") or entry.get("created") or t0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def check_orch(boards, orchs, live):
+    """An orch whose channel nobody can answer. `live(window)` = is an interactive session in that window now.
+    Whether a message could START one is deliberately not asked at all, and the second paragraph is why.
+
+    LIVENESS IS NOT A FAIR QUESTION ABOUT A PROJECT, AND IS THE ONLY QUESTION ABOUT AN ORCH. A message for a plain
+    `<repo>` whose session is not running starts one (cc-slack's autostart), so "not running" says nothing. An orch
+    is the exception, deliberately, in two places at once: cc-slack refuses to type into a pane for an alias
+    (cc-slack:3857-3858) and the drive loop never restarts an orch, because a fresh one would mint a new channel
+    every two hours (cc-pulse:635-641). Nothing brings a dead orch back on its own.
+
+    STARTING THE PARENT DRAINS NOTHING, so `~/dev/<repo>` being there is no reason to stay quiet. cc-slack files an
+    orch's message under the pair (target, alias) and hands a queued entry only to a connection carrying THAT alias
+    — "each entry waits for ITS alias (main's backlog is not an orch's)" at cc-slack:3712-3718, the same filter
+    delivery itself uses at cc-slack:3826, and the pane door is shut for an alias besides. autostart runs
+    `cc <repo>`, which subscribes as main and so takes none of it. An orch whose window is gone while its project
+    sits right there is therefore the quiet failure, not the healthy case: every message to that channel queues
+    behind an alias nothing is ever going to carry.
+
+    THE PARENT BEING LIVE IS STILL SILENCE, on a narrower ground than “it falls back on it”: an `@main` in an orch's
+    own channel routes to the parent session (cc-slack:4147-4148), so while that session runs the channel does have
+    somebody who answers when addressed by name. AND THE PARENT'S WINDOW IS NAMED AFTER THE WHOLE TARGET, not the
+    project: an orch reporting to `alpha/fix` has its parent in the window `alpha/fix` and there is no window called
+    `alpha` at all (cc-slack's window_for at :867 returns the target unchanged, and valid_target at :906 makes
+    `<repo>/<track>` orchs a supported shape). Asking about the PROJECT instead read a running parent as
+    unanswerable — and it is not the weaker question but a different one: for a plain `<repo>` target the two are
+    the same window, and for a track target a live `alpha` is not the parent of an `alpha/fix` channel and must not
+    silence it. So the target is asked, and the project only names the board. An orch whose project has no board at
+    all is the route check's finding and not this one's, so a moved orch is named once.
+
+    AN ORCH THAT SIMPLY EXITED IS NOT A FINDING YET. `archived` stays false until cc-slack's janitor sets it, so
+    "gone and not archived" is the ordinary end of every orch's life for the day that clock runs, and reporting it
+    would mean naming a healthy box's normal state every twenty minutes about something cc-slack is already about
+    to clean up. So the question this actually asks is the narrow one: has cc-slack's OWN clock run out and the
+    channel still not been archived — i.e. is the arrangement that closes these down not closing this one down."""
+    out = []
+    t0 = time.time()
+    for entry in (orchs or {}).values():
+        if entry.get("archived"):
+            continue
+        target, alias = str(entry.get("target") or ""), str(entry.get("alias") or "")
+        project = project_of(target)
+        if not target or not alias or not project or project not in boards:
+            continue
+        # "a moved orch whose parent project had no live session to answer it" — the parent is the window named
+        # after the WHOLE target, so `alpha/fix` and not `alpha`; the project above only found the board.
+        if live(f"{target}@{alias}") or live(target):
+            continue
+        # …and it has to have been gone longer than cc-slack's own archive clock, or this names the ordinary end
+        # of every orch's life for the day that clock runs. Skip while the janitor still has its turn to come.
+        if gone_since(entry, t0) <= ORCH_IDLE + ORCH_SWEEP:
+            continue
+        out.append(("orch", entry.get("name") or f"{target}@{alias}",
+                    f"the orch `{entry.get('name') or alias}` has been gone {dur(gone_since(entry, t0))} and "
+                    f"nothing restarts one, and its channel was never archived — messages there queue under "
+                    f"`@{alias}`, which only that session drains, so they reach nobody."))
+    return out
+
+
+# ── reading the box ──────────────────────────────────────────────────────────────────────────────────────────
+
+def roots():
+    """The tree(s) this box's own documents and code live in. A box may keep the generic tree as `core/` inside
+    a private overlay, and the overlay's docs and bin are as much this box's records as core's are."""
+    env = os.environ.get("CC_SENSE_ROOT")
+    if env:
+        return [os.path.abspath(env)]
+    r = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    return [os.path.dirname(r), r] if os.path.basename(r) == "core" else [r]
+
+
+def walk_files(root, want):
+    """Every file under `root` that `want(name)` accepts, with SKIP_DIRS pruned."""
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in SKIP_DIRS and not d.startswith(FIXTURE)]
+        for f in fn:
+            if want(f):
+                yield os.path.join(dp, f)
+
+
+def read_docs(trees):
+    """The living documents of these trees: {display path: text}, records dropped. Unreadable files are not
+    findings — a document this cannot open is one it has learnt nothing about."""
+    docs = {}
+    base = trees[0]                  # the OUTERMOST tree names every document, so `core/` inside an overlay reads
+    for root in trees:               # as `core/docs/…` — and the two walks over the same file land on one key
+        if not os.path.isdir(root):
+            continue
+        for p in walk_files(root, lambda f: f.endswith(".md")):
+            try:
+                with open(p, errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if is_record(os.path.basename(p), text[:HEAD]):
+                continue
+            docs[os.path.relpath(p, base)] = text
+    return docs
+
+
+def known_commands(trees):
+    """Every `cc-…` this box can run or start: the executables in each tree's bin dirs, and the unit names —
+    a unit is a real target somebody is told to enable, and it has no file in bin/."""
+    known = set()
+    for root in trees:
+        for d in ("bin", "bin-private"):
+            p = os.path.join(root, d)
+            if os.path.isdir(p):
+                known |= {f for f in os.listdir(p) if f.startswith("cc-")}
+        p = os.path.join(root, "config", "systemd-user")
+        if os.path.isdir(p):
+            known |= {UNIT.sub("", f) for f in os.listdir(p) if f.startswith("cc-")}
+    return known
+
+
+def mentioned(keys, trees, dev):
+    """Which of `keys` appear anywhere in the code beside us — one grep over the trees and the projects. Returns
+    None when the search could not be made: A CHECK THAT COULD NOT MEASURE MUST NOT REPORT. Saying "nothing reads
+    this key" because grep was missing or the walk timed out is exactly the false green this file is against."""
+    places = [t for t in trees if os.path.isdir(t)]
+    if os.path.isdir(dev):
+        places.append(dev)
+    if not places or not keys:
+        return None
+    args = ["grep", "-rhoF", "--binary-files=without-match"]
+    args += [f"--exclude-dir={d}" for d in sorted(SKIP_DIRS)]
+    for k in sorted(keys):
+        args += ["-e", k]
+    args += ["--"] + places      # NEVER omit these: `grep -r` with no operand searches the CALLER'S directory,
+    try:                         # which answered "something reads it" out of whatever tree the run happened in
+        p = subprocess.run(args, capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode > 1:                       # 0 = matches, 1 = none, anything else = it did not do the search
+        return None
+    return set(p.stdout.split())
+
+
+def boards_of(home):
+    """The project names this box has boards for. A suite's fixture board is not a project (cc-board's rule)."""
+    d = os.path.join(home, ".cc", "boards")
+    return {os.path.basename(p)[:-5] for p in glob.glob(os.path.join(d, "*.json"))
+            if not os.path.basename(p).startswith(FIXTURE)}
+
+
+def load(path):
+    """A JSON file, or None. A box without Slack has no routing tables, and that is not a contradiction."""
+    try:
+        with open(path) as fh:
+            v = json.load(fh)
+        return v if isinstance(v, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def count_paths(entry):
+    e = os.path.expanduser(entry)
+    if GLOBC & set(entry):
+        try:
+            return len(glob.glob(e))
+        except (OSError, ValueError):
+            return 1                            # an unglobbable pattern is not evidence that nothing matches
+    return 1 if os.path.exists(e) else 0
+
+
+def tmux(*args):
+    """One tmux command, or None when tmux could not be asked. CC_SENSE_TMUX names the binary so a suite drives
+    this over a stub and NEVER over the panes of the box it is running on."""
+    try:
+        p = subprocess.run([os.environ.get("CC_SENSE_TMUX") or "tmux", *args],
+                           capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def sessions():
+    """Every window of the shared `main` server with an interactive session in it, as
+    [(window name, pane text, seconds since that window last changed)] — or None when tmux could not be asked,
+    which is A CHECK THAT COULD NOT MEASURE and reports nothing rather than calling every session gone."""
+    out = tmux("list-windows", "-t", "main", "-F",
+               "#{window_id}\t#{window_name}\t#{pane_pid}\t#{window_activity}")
+    if out is None:
+        return None
+    kids, comm = proc_tree()
+    found, t0 = [], time.time()
+    for ln in out.splitlines():
+        f = ln.split("\t")
+        if len(f) != 4 or f[1].startswith(FIXTURE):
+            continue
+        if not interactive(f[2], kids, comm):
+            continue
+        pane = tmux("capture-pane", "-p", "-t", f[0])
+        if pane is None:
+            continue
+        try:
+            quiet = max(0.0, t0 - float(f[3]))
+        except ValueError:
+            continue                    # no activity stamp is no dwell, and dwell is what keeps a typist quiet
+        found.append((f[1], pane, quiet))
+    return found
+
+
+def proc_tree():
+    """(pid -> child pids, pid -> command name) for the whole box. `comm` and never the argv: a `claude` carries
+    its entire prompt there, and this file has no business holding one."""
+    kids, comm = {}, {}
+    try:
+        p = subprocess.run(["ps", "-eo", "pid=,ppid=,comm="], capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return kids, comm
+    if p.returncode != 0:
+        return kids, comm
+    for ln in p.stdout.splitlines():
+        f = ln.split(None, 2)
+        if len(f) == 3:
+            kids.setdefault(f[1], []).append(f[0])
+            comm[f[0]] = f[2].strip()
+    return kids, comm
+
+
+def interactive(pane_pid, kids, comm):
+    """Is there an interactive `claude` ANYWHERE under that pane's shell? cc-pulse's question and its reasons
+    (cc-pulse:247-254): a handoff successor runs `bash -c '… cc __runnext …'`, so its claude is a grandchild and
+    the direct-child test calls a live session dead — and a headless `claude -p` has no box to type into."""
+    seen, stack = set(), list(kids.get(str(pane_pid), []))
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if comm.get(pid) == "claude" and not headless(pid):
+            return True
+        stack.extend(kids.get(pid, []))
+    return False
+
+
+def headless(pid):
+    """A `claude -p` prints and exits (cc-pulse:276-283). Read from /proc, so no argv is ever put in a variable."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read().split(b"\0")
+    except OSError:
+        return False
+    return b"-p" in argv or b"--print" in argv
+
+
+def switched_on(pairs):
+    """Is the rider allowed to run at all? `CC_SENSE=on` in the config, and OFF is the shipped state.
+
+    THE SWITCH IS A CONFIG KEY BECAUSE THERE IS NO UNIT TO SWITCH. This has no timer of its own on purpose (see
+    the header), so it rides one that every box enables — and a recurring pass over the whole box, its panes
+    included, is the owner's call and not the installer's. That is the same call the `enable: owner` row of a unit
+    would have carried, kept in the one place left to keep it. A plain `cc-sense` typed by a person is never
+    gated: reading the box by hand is the whole point of the command."""
+    return dict(pairs).get("CC_SENSE", "").strip().lower() in ("1", "on", "yes", "true")
+
+
+def config(path):
+    """The config's KEY=value pairs. A box with no config file is not a contradiction; it is a box with no keys."""
+    try:
+        with open(path, errors="replace") as fh:
+            return config_pairs(fh.read())
+    except OSError:
+        return []
+
+
+def look():
+    """The whole pass: every check, over this box. Returns the findings, most certain first."""
+    home = os.path.expanduser("~")
+    trees = roots()
+    cfg = os.environ.get("CC_SENSE_CONFIG") or os.path.join(home, ".cc", "config")
+    dev = os.environ.get("CC_SENSE_DEV") or os.path.join(home, "dev")
+    pairs = config(cfg)
+    out = config_findings(pairs, mentioned({k for k, v in pairs if v}, trees, dev), count_paths)
+    out += check_command(read_docs(trees), known_commands(trees))
+    slack = os.path.join(home, ".cc", "slack")
+    boards, orchs = boards_of(home), load(os.path.join(slack, "orchs.json"))
+    out += check_route(boards, orchs, load(os.path.join(slack, "routes.json")))
+    # The two the panes and the process table answer. Both are asked ONCE — one `tmux list-windows`, one `ps` —
+    # and both go quiet rather than guess when tmux could not be asked at all.
+    panes = sessions()
+    if panes is not None:
+        alive = {name for name, _p, _q in panes}
+        out += check_orch(boards, orchs, alive.__contains__)
+        out += check_unsent(panes, float(os.environ.get("CC_SENSE_DWELL") or DWELL))
+    return out
+
+
+# ── the mouth ────────────────────────────────────────────────────────────────────────────────────────────────
+
+def report(found, show):
+    """One line each, the way a colleague points at one thing. Capped, because a wall of them is the failure
+    mode this whole file is arranged against — the rest are one command away."""
+    for _check, _subject, why in found[:show]:
+        print(why)
+    if len(found) > show:
+        print(f"({len(found) - show} more — cc-sense --all)")
+
+
+def tick(found, state):
+    """Write what stands, and one log line. The file is REPLACED every run: a finding that cleared is gone from
+    it, so a reader never has to work out which half of the file is still true."""
+    try:
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "findings.json"), "w") as fh:
+            json.dump({"at": now(), "findings": [{"check": c, "subject": s, "why": w} for c, s, w in found]},
+                      fh, indent=1)
+        with open(os.path.join(state, "sense.log"), "a") as fh:
+            fh.write(f"{now()} {len(found)} finding(s)"
+                     + ("".join(f" {c}:{s}" for c, s, _w in found) if found else "") + "\n")
+    except OSError as e:
+        print(f"cc-sense: could not write {state}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv):
+    if argv and argv[0] == "selfcheck":
+        return selfcheck()
+    show, as_json, quiet = SHOW, False, False
+    for a in argv:
+        if a == "--all":
+            show = 10 ** 6
+        elif a == "--json":
+            as_json = True
+        elif a == "--tick":
+            quiet = True
+        else:
+            print(__doc__.strip().splitlines()[0], file=sys.stderr)
+            print("usage: cc-sense [--all] [--json] [--tick] | cc-sense selfcheck", file=sys.stderr)
+            return 2
+    if quiet and not switched_on(config(os.environ.get("CC_SENSE_CONFIG")
+                                       or os.path.join(os.path.expanduser("~"), ".cc", "config"))):
+        return 0                     # the rider is off: nothing read, nothing written, and the host timer is green
+    found = look()
+    rc = 0
+    if quiet:
+        rc = tick(found, os.environ.get("CC_SENSE_STATE")
+                  or os.path.join(os.path.expanduser("~"), ".cc", "state", "sense"))
+    elif as_json:
+        json.dump([{"check": c, "subject": s, "why": w} for c, s, w in found], sys.stdout, indent=1)
+        print()
+    else:
+        report(found, show)
+    return rc          # a finding is this tool working, never a failed run: the timer's unit must stay green
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+
+def handoff_grammar():
+    """cc-handoff's input-box grammar, read out of its source. THE COPY ABOVE IS HELD TO THIS. cc-handoff owns the
+    box — it types into one and waits for the turn to take it — and this file only reads it; a copy that drifted
+    would go on matching nothing and report that every session is fine, which is the exact false green the whole
+    file is against. cc-steward holds its copy of cc-broker's decision words the same way (cc-steward:92-97).
+    Returns None when the sibling cannot be read, so the case FAILS rather than passing on a comparison it could
+    not make."""
+    import ast
+    src = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-handoff")
+    try:
+        with open(src, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    want = {}
+    for node in ast.parse(text).body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.targets[0], ast.Name):
+            continue
+        name = node.targets[0].id
+        try:
+            if name == "PROMPT_LINE" and isinstance(node.value, ast.Call) and node.value.args:
+                want[name] = ast.literal_eval(node.value.args[0])
+            elif name in ("DIALOG_MARKS", "WORKING"):
+                want[name] = ast.literal_eval(node.value)
+        except ValueError:
+            return None
+    return (want.get("PROMPT_LINE"), want.get("DIALOG_MARKS"), want.get("WORKING"),
+            PLACEHOLDER if PLACEHOLDER in text else "")
+
+
+def slack_clock():
+    """cc-slack's archive clock, read out of its source. ORCH_IDLE ABOVE IS HELD TO THIS, the way the input box is
+    held to cc-handoff's. cc-slack decides when a dead orch's channel is archived and this file only waits for that
+    to have happened; a copy that drifted low would go back to naming every orch that ever exited, and one that
+    drifted high would sit on a channel that really was stranded. Returns None when the sibling cannot be read, so
+    the case FAILS rather than passing on a comparison it could not make.
+
+    ONLY THE IDLE WINDOW IS READ BACK. The janitor's cadence is `n % 30` of a 30 s tick (cc-slack:5889), two
+    numbers that mean 15 min only when multiplied, so ORCH_SWEEP is a grace figure and not a copy — being a
+    little generous with it costs one silent turn, and that is the direction this file errs in anyway."""
+    src = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-slack")
+    try:
+        with open(src, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = re.search(r"^ORCH_IDLE\s*=\s*(\d+)\s*\*\s*(\d+)\b", text, re.M)
+    return int(m.group(1)) * int(m.group(2)) if m else None
+
+
+def selfcheck():
+    """Every check driven BOTH WAYS — a fixture where it fires and a fixture where it stays silent — plus one
+    end-to-end run in a HOME and a tree of its own. No board, no config, no document and no project of this
+    box's is read, and nothing outside the temp dir is written. Usage: cc-sense selfcheck"""
+    import shutil
+    import tempfile
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        if cond:
+            p += 1
+        else:
+            f += 1
+            print(f"  ✗ {name}")
+
+    def subjects(found):
+        return [s for _c, s, _w in found]
+
+    # ── selector ────────────────────────────────────────────────────────────────────────────────────────────
+    have = {"/there", "/also"}
+    cnt = lambda e: (3 if e == "/glob/*" else 0) if GLOBC & set(e) else (1 if e in have else 0)
+    ok("selector: a key whose only path is gone fires",
+       subjects(check_selector([("K", "/gone")], cnt)) == ["K"])
+    ok("selector: a key whose path is there is silent",
+       check_selector([("K", "/there")], cnt) == [])
+    ok("selector: a list where nothing resolves fires, and says how many it named",
+       [(s, "names 2 paths" in w) for _c, s, w in check_selector([("K", "/gone /missing")], cnt)] == [("K", True)])
+    ok("selector: a list where ONE entry resolves is silent — something still matches, and guessing which "
+       "entry was meant is not this tool's business",
+       check_selector([("K", "/gone /there")], cnt) == [])
+    ok("selector: a glob that matches something is silent, one that matches nothing fires",
+       check_selector([("A", "/glob/*")], cnt) == [] and subjects(check_selector([("B", "/no/*")], cnt)) == ["B"])
+    ok("selector: an unset key is never a finding — off is a choice somebody made",
+       check_selector([("K", "")], cnt) == [])
+    ok("selector: a value that is not path-shaped throughout is not read as paths (repo lists, emails, numbers, "
+       "flags, URLs)",
+       check_selector([("A", "repo1, repo2"), ("B", "a@b.com, c@d.com"), ("C", "5201"),
+                       ("D", "--no-net /gone"), ("E", "https://example.invalid/x")], cnt) == [])
+    ok("selector: A SLASH IS NOT A PATH — a zone name, a `<repo>/<track>` target and a `host:owner/repo` remote "
+       "all carry one and none is on disk, and reading them as paths fired this check on a healthy box on every run",
+       check_selector([("CC_TZ", "Europe/London"), ("T", "repo/track"),
+                       ("R", "git@example.invalid:owner/repo.git")], lambda e: 0) == [])
+    ok("selector: a value that ANCHORS is still read as a path — `/`, `~` and `./` each, so the fix that silenced "
+       "the slash did not silence the check itself",
+       subjects(check_selector([("A", "/gone"), ("B", "~/gone"), ("C", "./gone")], lambda e: 0)) == ["A", "B", "C"])
+    ok("selector: the entry it quotes is the first one it was given, verbatim",
+       check_selector([("K", "~/nope/*.json")], lambda e: 0)[0][2].count("`~/nope/*.json`") == 1)
+
+    # ── unread ──────────────────────────────────────────────────────────────────────────────────────────────
+    ok("unread: a set key nobody mentions fires",
+       subjects(check_unread([("OLD_NAME", "x")], {"NEW_NAME"})) == ["OLD_NAME"])
+    ok("unread: a set key something reads is silent",
+       check_unread([("NEW_NAME", "x")], {"NEW_NAME"}) == [])
+    ok("unread: an EMPTY key nobody reads is silent — it is doing nothing either way",
+       check_unread([("OLD_NAME", "")], {"NEW_NAME"}) == [])
+    ok("unread: the check is skipped entirely when the search could not be made, rather than reporting every "
+       "key as unread — that false green is the shape this whole tool is against",
+       mentioned({"K"}, ["/no/such/tree/at/all"], "/no/such/dev") is None)
+    C = tempfile.mkdtemp(prefix="cc-sense-cwd-")
+    try:
+        os.makedirs(f"{C}/here")
+        os.makedirs(f"{C}/there")
+        with open(f"{C}/here/reader", "w") as fh:
+            fh.write("KEY_ONLY_HERE\n")
+        cwd0 = os.getcwd()
+        os.chdir(f"{C}/here")
+        try:
+            ok("unread: the search reads the places it was GIVEN and never the caller's directory — `grep -r` "
+               "with no path operand falls back to `.`, which answered 'something reads this key' out of "
+               "whatever tree the run happened to start in",
+               mentioned({"KEY_ONLY_HERE"}, [f"{C}/there"], f"{C}/nodev") == set())
+        finally:
+            os.chdir(cwd0)
+    finally:
+        shutil.rmtree(C, ignore_errors=True)
+
+    # ── the two config checks composed: one finding per key ─────────────────────────────────────────────────
+    ok("config: a key NOTHING reads whose path is also gone is ONE finding, the deeper one — telling somebody "
+       "'whatever reads it is working from an empty list' about a key with no reader at all is worse than silence",
+       [(c, s) for c, s, _w in config_findings([("K", "/gone")], set(), cnt)] == [("unread", "K")])
+    ok("config: a key something DOES read, whose path is gone, is the selector finding",
+       [(c, s) for c, s, _w in config_findings([("K", "/gone")], {"K"}, cnt)] == [("selector", "K")])
+    ok("config: when the search could not be made, the unread question is not asked and the selector one still is",
+       [(c, s) for c, s, _w in config_findings([("K", "/gone")], None, cnt)] == [("selector", "K")])
+
+    # ── command ─────────────────────────────────────────────────────────────────────────────────────────────
+    known = {"cc-land", "cc-slackd"}
+    ok("command: a living doc telling you to run a command the box lacks fires",
+       subjects(check_command({"d.md": "run `cc-gone hello`"}, known)) == ["cc-gone"])
+    ok("command: a command the box has is silent",
+       check_command({"d.md": "run `cc-land queue`"}, known) == [])
+    ok("command: a unit name counts as a command the box has — it is a real thing to enable, with no file in bin/",
+       check_command({"d.md": "`cc-slackd` runs the daemon"}, known) == [])
+    ok("command: the name has to be in a code span — prose naming a branch or a track is not an instruction",
+       check_command({"d.md": "the cc-land-fixes track landed"}, known) == [])
+    ok("command: one finding per missing command, naming a document and counting the rest",
+       [(s, "(and 2 other documents)" in w) for _c, s, w in
+        check_command({"a.md": "`cc-gone`", "b.md": "`cc-gone`", "c.md": "`cc-gone`"}, known)]
+       == [("cc-gone", True)])
+    ok("record: a document dated in its filename is a record of a moment, not a description of the box now",
+       is_record("2026-08-27-audit.md", "# Audit") and not is_record("DESIGN.md", "# Design\n\nLayered:"))
+    ok("record: …and so is one dated in its opening lines, which is how a running audit log reads",
+       is_record("AUDIT.md", "# Audit (2026-08-26, after the autonomous build)\n"))
+    N = tempfile.mkdtemp(prefix="cc-sense-nested-")
+    try:
+        os.makedirs(f"{N}/core/docs")
+        os.makedirs(f"{N}/docs")
+        os.makedirs(f"{N}/.claude/worktrees/copy/docs")
+        for at, t in ((f"{N}/core/docs/DESIGN.md", "# Design\n"), (f"{N}/docs/BOX.md", "# Box\n"),
+                      (f"{N}/.claude/worktrees/copy/docs/DESIGN.md", "# Design\n")):
+            with open(at, "w") as fh:
+                fh.write(t)
+        ok("docs: a tree kept as `core/` inside an overlay is named from the OUTERMOST tree, so the file the two "
+           "walks both reach lands on one name (`core/docs/DESIGN.md`) instead of appearing twice",
+           sorted(read_docs([N, f"{N}/core"])) == ["core/docs/DESIGN.md", "docs/BOX.md"])
+    finally:
+        shutil.rmtree(N, ignore_errors=True)
+
+    # ── route ───────────────────────────────────────────────────────────────────────────────────────────────
+    boards = {"alpha", "beta"}
+    orchs = {"C1": {"target": "alpha", "alias": "site", "name": "alpha-site-x1"},
+             "C2": {"target": "gone", "alias": "old", "name": "gone-old-x2"},
+             "C3": {"target": "vanished", "alias": "a", "name": "arch", "archived": True}}
+    ok("route: an orch reporting to a project with no board fires",
+       subjects(check_route(boards, orchs, {})) == ["gone-old-x2"])
+    ok("route: an orch whose project has a board is silent, and an ARCHIVED one is never asked about",
+       subjects(check_route(boards, {"C1": orchs["C1"], "C3": orchs["C3"]}, {})) == [])
+    ok("route: a channel routed to a name that is neither a project nor an orch fires",
+       subjects(check_route(boards, orchs, {"#x": "nowhere"})) == ["gone-old-x2", "#x"])
+    ok("route: a channel routed to a project, or to a live orch's own address, is silent",
+       check_route(boards, {"C1": orchs["C1"]}, {"#a": "beta", "#b": "alpha@site"}) == [])
+    ok("route: no routing tables at all is silent — a box without Slack is not a contradiction",
+       check_route(boards, None, None) == [])
+    # …and the three shapes a target comes in. Read whole, `<repo>/<track>` and `box` are both dead mail on a
+    # healthy box, which is a check firing on a working thing — the worst thing this tool can do.
+    ok("route: a `<repo>/<track>` target is resolved to its project, so a live project's track is silent",
+       check_route(boards, {"C4": {"target": "alpha/fix", "alias": "t", "name": "alpha-fix"}},
+                   {"#beta--t1": "beta/t1"}) == [])
+    ok("route: a `<repo>/<track>` whose REPO has no board still fires — resolving the name is not excusing it",
+       subjects(check_route(boards, {"C5": {"target": "gone/fix", "alias": "t", "name": "gone-fix"}},
+                            {"#g": "gone/t1"})) == ["gone-fix", "#g"])
+    ok("route: the literal target `box` is this machine, which has no board and never will — never a finding",
+       check_route(boards, {"C6": {"target": "box", "alias": "b", "name": "box-b"}}, {"#box": "box"}) == [])
+
+    # ── unsent: a message typed at a session and never sent ─────────────────────────────────────────────────
+    def pane(box, foot="  ? for shortcuts"):
+        return f"a line of output\n──────────\n❯ {box}\n──────────\n{foot}\n"
+
+    ok("unsent: text sitting in an idle box past the dwell fires, and quotes what was typed",
+       [(s, "can you rebase" in w) for _c, s, w in
+        check_unsent([("alpha", pane("can you rebase that"), 3600)], 600)] == [("alpha", True)])
+    ok("unsent: an EMPTY box is silent — that is every idle session on the box",
+       check_unsent([("alpha", pane(""), 3600)], 600) == [])
+    ok("unsent: a box still being typed in is silent — the dwell is what separates a person mid-sentence from a "
+       "message nothing is going to take",
+       check_unsent([("alpha", pane("half a question typed and not yet sen"), 30)], 600) == [])
+    ok("unsent: a session MID-TURN is silent even with the box full — the turn owns the screen and will take it",
+       check_unsent([("alpha", pane("queued up behind the turn", "  esc to interrupt"), 3600)], 600) == [])
+    ok("unsent: a pane holding a DIALOG is silent — the keys go into the modal, and the modal is cc-msg's",
+       check_unsent([("alpha", pane("typed", "Do you want to proceed?"), 3600)], 600) == []
+       and check_unsent([("alpha", pane("typed", "Would you like to proceed?"), 3600)], 600) == [])
+    ok("unsent: a bare shell and a pane that has drawn nothing are both silent — no box, nothing to be unsent in",
+       check_unsent([("sh", "user@host:~$ ls\ncore  docs\n", 3600), ("blank", "   \n\n", 3600)], 600) == [])
+    ok("unsent: the three shapes an EMPTY box really has — the non-breaking space the TUI pads it with, the older "
+       "placeholder, and the current one's `<no suggestion>` — are all empty, not text somebody typed",
+       box_text("❯ \u00a0") == "" and box_text('❯ Try "how does this work?"') == ""
+       and box_text("❯ \u00a0<no suggestion>") == ""
+       and box_text("❯ real text") == "real text" and box_text("no box here") is None)
+    ok("unsent: a session idling at `<no suggestion>` is silent, and this is the whole check being worth reading — "
+       "the TUI writes those words in an EMPTY box when it has nothing to offer, and naming them would report a "
+       "session that is simply waiting, every turn, for as long as it waits. Found live on this box by this check "
+       "(2026-09-07). Matched whole, so a message that merely opens with the words is still a message",
+       check_unsent([("alpha", pane("\u00a0<no suggestion>"), 3600)], 600) == []
+       and [s for _c, s, _w in check_unsent([("alpha", pane("<no suggestion> is what it gave me"), 3600)], 600)]
+       == ["alpha"])
+    ok("unsent: the box is the BOTTOM-MOST prompt line — a taken turn's echo sits above it and is not unsent",
+       box_text("❯ what I asked before\n  …the answer…\n❯ \u00a0") == "")
+    ok("unsent: the grammar is cc-handoff's, letter for letter — it owns the input box, this only reads it, and a "
+       "copy that drifted would quietly stop seeing the thing it was written for",
+       handoff_grammar() == (PROMPT_LINE.pattern, DIALOG_MARKS, WORKING, PLACEHOLDER))
+
+    # ── orch: a channel nobody can answer ───────────────────────────────────────────────────────────────────
+    ob = {"alpha", "beta"}
+    # cc-slack has had its turn to archive this one and has not, which is the whole question the check asks.
+    dead = time.time() - ORCH_IDLE - ORCH_SWEEP - 60
+    gone = {"C1": {"target": "alpha", "alias": "site", "name": "alpha-site-x1", "created": 100, "seen": dead}}
+    trk = {"C3": {"target": "alpha/fix", "alias": "t", "name": "alpha-fix", "created": 100, "seen": dead}}
+    no = lambda _w: False
+    ok("orch: an orch GONE past cc-slack's own archive clock, whose project has a board, fires — the channel is "
+       "live, somebody is writing into it, and no session will ever read it",
+       subjects(check_orch(ob, gone, no)) == ["alpha-site-x1"])
+    ok("orch: the orch's OWN window being live is silence — it answers for itself",
+       check_orch(ob, gone, lambda w: w == "alpha@site") == [])
+    ok("orch: the parent's session being live is silence — an `@main` in the orch's own channel routes to it "
+       "(cc-slack:4147-4148), so somebody there answers when addressed by name",
+       check_orch(ob, gone, lambda w: w == "alpha") == [])
+    ok("orch: an ARCHIVED orch is never asked about",
+       check_orch(ob, {"C9": dict(gone["C1"], archived=True)}, no) == [])
+    ok("orch: an orch whose project has NO BOARD is the route check's finding and not this one's, so a project "
+       "that moved is named once and not twice",
+       check_orch(ob, {"C2": {"target": "vanished", "alias": "a", "name": "vanished-a", "seen": dead}}, no) == []
+       and subjects(check_route(ob, {"C2": {"target": "vanished", "alias": "a", "name": "vanished-a"}}, {}))
+       == ["vanished-a"])
+
+    # ── a RUNNING PARENT is not a stranded channel, whatever the target's shape ──────────────────────
+    ok("orch: a `<repo>/<track>` orch is resolved to its project, which is what autostart and the board both use",
+       subjects(check_orch(ob, trk, no)) == ["alpha-fix"])
+    ok("orch: …and the live parent of a `<repo>/<track>` orch is the window named after the WHOLE target — there "
+       "is no window called `alpha` for that session to be in, so asking only about the project reported a "
+       "running parent as unanswerable",
+       check_orch(ob, trk, lambda w: w == "alpha/fix") == []
+       and subjects(check_orch(ob, trk, lambda w: w == "alpha")) == ["alpha-fix"])
+
+    # ── an orch that simply ENDED is the ordinary case, and the ordinary case must be silent ─────────
+    ok("orch: an orch that JUST EXITED is silent — `archived` goes true only when cc-slack's janitor sets it, so "
+       "every orch that ever finished looks exactly like this for a day, and naming it every turn would be this "
+       "pass crying wolf about a state cc-slack is already closing",
+       check_orch(ob, {"C4": dict(gone["C1"], seen=time.time() - 60)}, no) == []
+       and check_orch(ob, {"C5": dict(gone["C1"], seen=time.time() - ORCH_IDLE + 60)}, no) == [])
+    ok("orch: an entry with NO stamps at all, or a stamp that is not a number, is read as new and stays silent — "
+       "the fallback is the janitor's own (`seen or created or now`), because a gap in the records is not "
+       "evidence that anything is wrong; `created` alone still answers when it is old enough",
+       check_orch(ob, {"C6": {"target": "alpha", "alias": "site", "name": "n"}}, no) == []
+       and check_orch(ob, {"C7": dict(gone["C1"], seen="whenever")}, no) == []
+       and subjects(check_orch(ob, {"C8": {"target": "alpha", "alias": "site", "name": "n", "created": dead}}, no))
+       == ["n"])
+    ok("orch: the archive clock is cc-slack's, read back out of its source — cc-slack owns when a dead orch's "
+       "channel is archived and this only waits for it, so a copy that drifted would send this pass back to "
+       "reporting the normal end of every orch's life",
+       slack_clock() == ORCH_IDLE)
+
+    # ── the owner's switch, which stands in for the unit this deliberately does not have ─────────────────────
+    ok("switch: `CC_SENSE` off, absent or empty means the rider does nothing; on, 1, yes and true mean it runs",
+       [switched_on([("CC_SENSE", v)]) for v in ("on", "1", "yes", "true", "off", "", "no")]
+       == [True, True, True, True, False, False, False] and switched_on([]) is False)
+
+    # ── the config parser, which every config check stands on ───────────────────────────────────────────────
+    ok("config: comments, blanks, `export` and quoted values are read the way the shell reads them",
+       config_pairs('# c\n\nexport A=1\nB="two"\nC=\nnot a setting\n') == [("A", "1"), ("B", "two"), ("C", "")])
+
+    # ── it has NO UNIT, and that is the arrangement, not an omission ────────────────────────────────────────
+    # selftest.sh:1040 holds cc-handoff's --sweep to the same two facts, and for the same reason: the wiring alone
+    # would still be true the day somebody adds a timer beside it, so the absence is asserted as hard as the call.
+    U = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "systemd-user")
+    units = sorted(os.listdir(U)) if os.path.isdir(U) else []
+    ride = [u for u in units if "cc-sense --tick" in open(os.path.join(U, u), errors="replace").read()]
+    ok("unit: this pass has NO timer and NO service of its own — a watcher beside cc-reconcile, cc-audit and "
+       "cc-secretary is a fourth thing to read, which is the one thing it was asked not to be",
+       units and not any(u.startswith("cc-sense.") for u in units))
+    ok("unit: …and an EXISTING unit gives it its turn, so 'no unit' does not quietly mean 'never runs'",
+       ride == ["cc-reconcile.service"])
+
+    # ── end to end, in a HOME and a tree of its own ─────────────────────────────────────────────────────────
+    T = tempfile.mkdtemp(prefix="cc-sense-selfcheck-")
+    env0 = {k: os.environ.get(k) for k in
+            ("CC_SENSE_ROOT", "CC_SENSE_DEV", "CC_SENSE_CONFIG", "CC_SENSE_STATE", "CC_SENSE_TMUX", "HOME",
+             "CC_FAKE_WINS", "CC_FAKE_PANE")}
+    try:
+        tree, home = os.path.join(T, "tree"), os.path.join(T, "home")
+        for d in (f"{tree}/bin", f"{tree}/docs", f"{tree}/config/systemd-user",
+                  f"{home}/.cc/boards", f"{home}/.cc/slack", f"{T}/dev", f"{T}/dev/alpha"):
+            os.makedirs(d, exist_ok=True)
+        # THE PANES ARE A STUB AND NEVER THIS BOX'S. `main` is a real tmux server on any box a session runs on, so
+        # a suite that shelled out to the real binary would read the owner's own screens — and this file quotes
+        # what it finds. It answers BOTH commands the pass issues, off two files the cases below write: with
+        # neither set it lists no window and hands back no pane, which is a box with nothing typed at it.
+        fake = f"{T}/tmux"
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\ncase \"$1\" in\n"
+                     "  list-windows) cat \"${CC_FAKE_WINS:-/dev/null}\";;\n"
+                     "  capture-pane) cat \"${CC_FAKE_PANE:-/dev/null}\";;\nesac\nexit 0\n")
+        os.chmod(fake, 0o755)
+        open(f"{tree}/bin/cc-land", "w").close()
+        open(f"{tree}/config/systemd-user/cc-slackd.service", "w").close()
+        json.dump({"repo": "alpha", "tracks": {}}, open(f"{home}/.cc/boards/alpha.json", "w"))
+        json.dump({"repo": "x", "tracks": {}}, open(f"{home}/.cc/boards/_cctest99.json", "w"))
+        # THE HEALTHY BOX'S ORCH IS AN ARCHIVED ONE, and has to be: the stub above lists no window, so no orch can
+        # be live here, and an orch that is live in the records with no window is exactly the finding this check
+        # now makes. An orch that finished is the normal end state and the honest "nothing wrong" record.
+        json.dump({"C1": {"target": "alpha", "alias": "site", "name": "alpha-site-x1",
+                          "created": 100, "seen": 100, "archived": True}},
+                  open(f"{home}/.cc/slack/orchs.json", "w"))
+        json.dump({"#alpha": "alpha"}, open(f"{home}/.cc/slack/routes.json", "w"))
+        with open(f"{tree}/docs/DESIGN.md", "w") as fh:
+            fh.write("# Design\n\nRun `cc-land queue` and `cc-slackd`.\n")
+        with open(f"{tree}/docs/2026-01-01-audit.md", "w") as fh:
+            fh.write("# Audit\n\nBack then we ran `cc-retired now`.\n")
+        cfgp = os.path.join(T, "config")
+        with open(cfgp, "w") as fh:
+            fh.write(f"GOOD_PATH={tree}/bin/cc-land\nEMPTY=\nNAMES=alpha, beta\n")
+        with open(f"{T}/dev/reader.sh", "w") as fh:
+            fh.write("echo $GOOD_PATH $NAMES $HOLDS\n")   # a project beside the tree is a reader too
+        os.environ.update({"CC_SENSE_ROOT": tree, "CC_SENSE_DEV": f"{T}/dev", "CC_SENSE_CONFIG": cfgp,
+                           "CC_SENSE_STATE": f"{T}/state", "CC_SENSE_TMUX": fake, "HOME": home})
+        ok("end to end: a healthy box says NOTHING — silence is the normal output", look() == [])
+
+        # …now break one thing of each kind in that same box, and only those four come back.
+        with open(cfgp, "w") as fh:
+            fh.write(f"GOOD_PATH={tree}/bin/cc-land\nHOLDS={tree}/nothing/*.json\nSTALE_KEY=on\nNAMES=alpha, beta\n")
+        with open(f"{tree}/docs/DESIGN.md", "a") as fh:
+            fh.write("\nAlso `cc-gone --now`.\n")
+        # The stamps a real entry always carries (cc-slack:4040), with `seen` far enough back that cc-slack's
+        # own janitor has had its turn at this channel and left it — which is the state the orch check asks about.
+        json.dump({"C2": {"target": "moved", "alias": "old", "name": "moved-old-x2",
+                          "created": 100, "seen": time.time() - ORCH_IDLE - ORCH_SWEEP - 60}},
+                  open(f"{home}/.cc/slack/orchs.json", "w"))
+        json.dump({"#alpha": "alpha", "#dead": "nowhere"}, open(f"{home}/.cc/slack/routes.json", "w"))
+        found = look()
+        ok("end to end: one broken thing of each kind, and exactly those four come back, in order",
+           [(c, s) for c, s, _w in found]
+           == [("selector", "HOLDS"), ("unread", "STALE_KEY"), ("command", "cc-gone"),
+               ("route", "moved-old-x2"), ("route", "#dead")])
+        ok("end to end: the dated audit beside the design doc is still not read for commands",
+           not any(s == "cc-retired" for _c, s, _w in found))
+        ok("end to end: `--tick` writes the findings and the log, prints nothing, and exits 0",
+           tick(found, f"{T}/state") == 0
+           and len(json.load(open(f"{T}/state/findings.json"))["findings"]) == 5
+           and "5 finding(s)" in open(f"{T}/state/sense.log").read())
+        ok("end to end: a run that finds nothing REPLACES the file rather than leaving yesterday's standing",
+           tick([], f"{T}/state") == 0
+           and json.load(open(f"{T}/state/findings.json"))["findings"] == [])
+        ok("end to end: a fixture board is not a project, so a route to it is still dead mail",
+           subjects(check_route(boards_of(home), None, {"#f": "_cctest99"})) == ["#f"])
+
+        # ── THE MOVED ORCH, on the same box: the oversight this pass was asked for. Give `moved` the board it
+        # would really still have, and the route check goes quiet — a records-only read says the parent is fine.
+        json.dump({"repo": "moved", "tracks": {}}, open(f"{home}/.cc/boards/moved.json", "w"))
+        ok("end to end: a MOVED ORCH whose parent still has a board file — silent to every check that reads "
+           "records alone — is named: its channel is live and no session can be started to read it. The board "
+           "is what the route check reads, so putting it back is exactly what used to buy silence",
+           [c for c, s, _w in look() if s == "moved-old-x2"] == ["orch"])
+        os.makedirs(f"{T}/dev/moved")
+        ok("…and putting the project back where a session COULD be started does not buy silence: cc-slack files "
+           "that channel's mail under (target, alias) and drains it only to a conn carrying that alias, so the "
+           "`cc moved` a message would start subscribes as main and reads none of it. Window gone with the "
+           "directory present is the quiet failure, and this is it end to end",
+           [(c, s) for c, s, _w in look() if c == "orch"] == [("orch", "moved-old-x2")])
+
+        # ── the panes, wired end to end and never this box's ────────────────────────────────────────────────
+        ok("end to end: tmux is read through CC_SENSE_TMUX, so a suite drives the pane checks over a stub and "
+           "never over the screens of the box it is running on",
+           sessions() == [])
+        os.environ["CC_SENSE_TMUX"] = f"{T}/nosuchtmux"
+        ok("end to end: a box where tmux cannot be asked reports NOTHING from the panes rather than calling "
+           "every session gone — a check that could not measure must not report",
+           sessions() is None and [c for c, _s, _w in look() if c in ("unsent", "orch")] == [])
+        os.environ["CC_SENSE_TMUX"] = fake
+
+        # ── THE UNSENT MESSAGE, END TO END: the second of the two oversights the brief names ────────────────
+        # sessions() does not stop at the pane text. It asks the PROCESS TABLE whether an interactive `claude`
+        # sits under that pane, and takes the dwell from tmux's own `#{window_activity}`; handing check_unsent a
+        # ready-made tuple drives none of that, so the oversight would be asserted rather than found. This gives
+        # it the real shape: a real process the real `ps` reports, a window list naming it, and a pane.
+        # `comm` is the name the kernel takes from the file that was exec'd, and `comm` is all proc_tree ever
+        # reads, so anything reached through a link called `claude` is an interactive session as far as
+        # interactive() can tell. THE LINK POINTS AT THIS INTERPRETER because it is the one binary that is
+        # certainly on the box — cc-sense is running under it. `sleep` was the obvious choice and is the wrong
+        # one: where coreutils is the multicall build, it dispatches on argv[0] and a copy named anything else
+        # exits 1 on the spot. The `kid.poll() is None` in each case below is what caught that, and stays.
+        claude = os.path.join(T, "claude")
+        os.symlink(os.path.realpath(sys.executable), claude)
+        kid = subprocess.Popen([claude, "-c", "import time; time.sleep(30)"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(200):        # Popen returns at the fork; `comm` only becomes `claude` after the exec
+                try:
+                    if open(f"/proc/{kid.pid}/comm").read().strip() == "claude":
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.01)
+            wins, screen = f"{T}/wins", f"{T}/pane"
+            with open(screen, "w") as fh:
+                fh.write(pane("can you rebase that"))
+            os.environ.update({"CC_FAKE_WINS": wins, "CC_FAKE_PANE": screen})
+
+            def quiet_for(secs):        # the window list tmux itself prints, with the stamp moved back
+                with open(wins, "w") as fh:
+                    fh.write(f"@1\tsandbox\t{os.getpid()}\t{int(time.time() - secs)}\n")
+
+            quiet_for(3600)
+            live = sessions()
+            ok("end to end: a window with an interactive `claude` under it in the real process table is read — "
+               "its name, its pane and the dwell off tmux's own activity stamp. None of interactive(), "
+               "proc_tree(), headless() or that arithmetic ran until something drove this path",
+               kid.poll() is None and live is not None
+               and [(n, "can you rebase" in txt, 3500 < q < 3700) for n, txt, q in live]
+               == [("sandbox", True, True)])
+            ok("end to end: …and the whole pass names it: a message typed at a session and never sent, found on "
+               "a fixture of the box rather than asserted about a tuple",
+               [(c, s) for c, s, _w in look() if c == "unsent"] == [("unsent", "sandbox")])
+            quiet_for(30)
+            ok("end to end: the SAME box a moment earlier is silent — somebody part-way through a sentence is "
+               "not a finding, and the only thing that separates the two is the stamp tmux printed",
+               kid.poll() is None and [c for c, _s, _w in look() if c == "unsent"] == [])
+        finally:
+            kid.kill()
+            kid.wait()
+        os.environ.pop("CC_FAKE_WINS", None)
+        os.environ.pop("CC_FAKE_PANE", None)
+
+        # ── the owner's switch ──────────────────────────────────────────────────────────────────────────────
+        os.environ["CC_SENSE_STATE"] = f"{T}/off"
+        ok("end to end: `--tick` with the switch off writes NOTHING — the pass is installed off, the way the "
+           "unit it does not have would have been, and the host timer stays green",
+           main(["--tick"]) == 0 and not os.path.exists(f"{T}/off"))
+        with open(cfgp, "a") as fh:
+            fh.write("CC_SENSE=on\n")
+        ok("…and with it on the same command writes the findings file, so the switch is a switch",
+           main(["--tick"]) == 0 and os.path.exists(f"{T}/off/findings.json"))
+    finally:
+        for k, v in env0.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(T, ignore_errors=True)
+
+    print(f"cc-sense selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

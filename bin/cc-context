@@ -3,14 +3,20 @@
 
   cc-context                       the session running in $PWD (newest transcript for this cwd)
   cc-context <repo> <track>        that track's session (session id from the board)
+  cc-context <address>             one session by its ADDRESS — `<repo>` a session a person steers,
+                                   `<repo>@<alias>` an orchestrator, `<repo>/<track>` a track. An orch owns no
+                                   board row and shares its checkout with the session a person steers, so it is
+                                   found through the record it last wrote, never through that directory
   cc-context --transcript PATH | --session ID
   cc-context --true <target>       ask the session ITSELF: types /context into that idle pane and reads its
                                    number. A busy pane falls back to THAT TARGET'S estimate below (a bare
-                                   `repo/track` is the same pair as the two-word form); a target that names no
-                                   <repo>/<track> is refused rather than answered about the caller's own cwd.
+                                   `repo/track` is the same pair as the two-word form); a target with nothing
+                                   of its own to fall back to is refused, never answered about the caller's cwd.
                                    Everything downstream — the line, --json, --over, the level — then reads THAT
                                    number, so the handoff thresholds are decided on the pane's own reading
-  cc-context --all                 TSV of every recorded session: repo track pct used window src age level pending
+  cc-context --all                 TSV of every recorded session: session track pct used window src age level
+                                   pending. Column one is the session, not the repo — `<repo>` and
+                                   `<repo>@<alias>` are two live sessions in one checkout
   cc-context --record              stdin = a Stop hook payload -> measure, record, and tell the session
   cc-context --thresholds          "<journal> <handoff> <ceiling>" (percentages)
   cc-context --handoffs [--json]   the durable handoff record: one countable line per crossing
@@ -436,6 +442,17 @@ def board_get(repo, track, field):
         return ""
 
 
+def session_at(target):
+    """The newest RECORD written under this address -> its session id, or None. The only way to ask about a
+    session that owns no board row and does not own its working directory alone: an orchestrator shares
+    ~/dev/<repo> with the planning session, so "the newest transcript in that directory" answers for whichever
+    of the two stopped last — which is the misreading this address exists to end."""
+    for d in records():
+        if (d.get("target") or "") == target and d.get("session_id"):
+            return d["session_id"]
+    return None
+
+
 def resolve(repo=None, track=None, sid=None, cwd=None):
     """-> (transcript_path, session_id) or (None, None)."""
     if sid:
@@ -535,8 +552,9 @@ def handoffs():
 
 def have_window(target):
     """Is there a live tmux window for this target? A headless worker has none — its loop is its handoff.
-    By TARGET (`<repo>` or `<repo>/<track>`), not by repo+track: a planning session has a window too, and used
-    to be told "there is no interactive session to restart here", which was simply untrue of it."""
+    By TARGET (`<repo>`, `<repo>@<alias>` or `<repo>/<track>`), not by repo+track: a planning session has a
+    window too, and used to be told "there is no interactive session to restart here", which was simply untrue
+    of it. The window name IS the address, so an orchestrator answers here on its own name and not the repo's."""
     try:
         r = subprocess.run(["tmux", "list-windows", "-t", "main", "-F", "#W"],
                            capture_output=True, text=True, timeout=10)
@@ -630,16 +648,25 @@ def event(target, m, level, busy="", live=False, taken=False, retry=False):
         return ""
 
 
+def journal_parts(m):
+    """The path segments of the journal this session hands off through — ONE PER ADDRESS, and cc-handoff's
+    journal_for() names the same file for the same address. An orchestrator and the session a person steers
+    share a repo and a checkout, so under one `planning-handoff.md` each would have read the other's handoff
+    entry as the account of its own work."""
+    if m.get("track"):
+        return [str(m["repo"]), str(m["track"]), "progress.md"]
+    alias = (m.get("target") or "").partition("@")[2]
+    return [str(m["repo"]), f"{alias or 'planning'}-handoff.md"]
+
+
 def journal_of(m):
-    return (f"~/.cc/state/{m['repo']}/{m['track']}/progress.md" if m.get("track")
-            else f"~/.cc/state/{m['repo']}/planning-handoff.md")
+    return "~/.cc/state/" + "/".join(journal_parts(m))
 
 
 def journal_path(m):
     """The same file journal_of() NAMES, as a path something can open. Built from STATE so a selfcheck writes
     its fixtures into a temp dir and never into the box's real journals."""
-    return (os.path.join(STATE, m["repo"], m["track"], "progress.md") if m.get("track")
-            else os.path.join(STATE, m["repo"], "planning-handoff.md"))
+    return os.path.join(STATE, *journal_parts(m))
 
 
 def told(m, lvl, deferred="", restartable=True, overlapped=False, ending=False):
@@ -677,8 +704,12 @@ def told(m, lvl, deferred="", restartable=True, overlapped=False, ending=False):
 def session_name(repo, track):
     """What a person calls this session: its tmux window (`<repo>`, `<repo>@<alias>`, `<repo>/<track>`),
     read through the pane the Stop hook runs in. A headless worker's window is its track's, which is right. With
-    no pane, the parts that are known: repo@alias for an orch, repo/track for a track, the repo for a planning
-    session. Never raises and never blocks: a name is a label, not a measurement."""
+    no pane, the parts that are known: repo/track for a track, repo@alias for an orch, the repo for a session a
+    person steers. Never raises and never blocks: a name is a label, not a measurement.
+    THE TRACK IS ASKED FIRST, and that is not a detail. $CC_SLACK_ALIAS is the ORCHESTRATOR's, and it leaks
+    into everything that orch launches — the same leak that turns a sibling's selfcheck red from an orch shell.
+    A track has its own worktree, its own window and its own row: read alias-first, a track spawned under an
+    orch answered to the orch's name, and the two are different things."""
     pane = os.environ.get("TMUX_PANE") or ""
     if pane:
         try:
@@ -689,11 +720,43 @@ def session_name(repo, track):
         except (OSError, subprocess.SubprocessError):
             pass
     alias = os.environ.get("CC_SLACK_ALIAS") or ""
-    if repo and alias:
-        return f"{repo}@{alias}"
     if repo and track:
         return f"{repo}/{track}"
+    if repo and alias:
+        return f"{repo}@{alias}"
     return repo or ""
+
+
+# The address grammar, spelled the same way cc-handoff spells it (cc-handoff.TARGET_RE) — copied rather than
+# imported, because these two files call each other through argv and neither may fail to load with the other.
+# A selfcheck case here holds the copy to the original so the two cannot drift.
+ADDRESS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(@[a-z0-9-]{2,20}|/[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$")
+SUFFIXES = ("~next", "~old")            # the two sides of a handoff in flight; both measure AS their target
+
+
+def address(repo, track):
+    """THE ONE KEY A SESSION IS RECORDED UNDER: its tmux window name in `main`, which is exactly what
+    cc-handoff takes as a target and what the Slack layer routes on.
+    NO TWO LIVE SESSIONS MAY SHARE ONE. A planning session and an orchestrator run in the SAME worktree, with
+    the same repo and no track between them, so under the bare repo name they were one key: two live sessions,
+    two very different percentages, and whichever wrote last was read as both (2026-09-07, in front of the
+    owner). The alias is what separates them and it is in the window name, which is why the name is the key.
+    A track keeps `<repo>/<track>` whoever spawned it. The two sides of a handoff in flight deliberately DO
+    share a key — one address, one session live at a time — so the suffix comes off."""
+    name = session_name(repo, track)
+    for suf in SUFFIXES:
+        if name.endswith(suf):
+            name = name[:-len(suf)]
+    fallback = f"{repo}/{track}" if (repo and track) else (repo or "")
+    if track:
+        return fallback                 # a track is its worktree's, never its spawner's
+    if not repo:
+        return name if ADDRESS_RE.match(name or "") else ""
+    # A window renamed by hand, or one whose name is not about this session's repo at all, decides nothing:
+    # the record must stay findable under the repo the session is actually in.
+    if name == repo or (name.startswith(repo + "@") and ADDRESS_RE.match(name)):
+        return name
+    return fallback
 
 
 def record(payload):
@@ -713,7 +776,7 @@ def record(payload):
     if not repo and cwd and os.path.dirname(os.path.realpath(cwd)) == os.path.expanduser("~/dev"):
         repo = os.path.basename(os.path.realpath(cwd))   # a planning session: ~/dev/<repo>, no track marker
     m.update({"cwd": cwd, "repo": repo, "track": track, "level": level_of(m["used"], m["window"]),
-              "name": session_name(repo, track)})
+              "name": session_name(repo, track), "target": address(repo, track)})
     os.makedirs(RECORDS, exist_ok=True)
     p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
     was = {}
@@ -727,7 +790,9 @@ def record(payload):
     lvl = m["level"]
     # Only a session with a journal to write is ever interrupted — an owner's conversation is not.
     # never twice: once a handoff is taken, this session is being replaced and has nothing left to be told
-    target = f"{repo}/{track}" if track else repo
+    # THE ADDRESS, not the bare repo: `<repo>` and `<repo>@<alias>` are two live sessions in one worktree, and
+    # under one key each was told about the other's crossing and gated by the other's overlap.
+    target = m["target"]
     # no window = a headless worker: its loop is its handoff. So is a cc-loop ITERATION that happens to have
     # one — the loop occupies the track's window while the session inside it is headless (worker).
     live = bool(repo) and have_window(target) and not worker()
@@ -885,6 +950,22 @@ def main(argv):
             args.append(a)
     if len(args) >= 2:
         repo, track = args[0], args[1]
+    elif len(args) == 1 and not do_true and ADDRESS_RE.match(args[0]):
+        # ONE ADDRESS. `<repo>/<track>` is the pair spelled in one word; `<repo>@<alias>` names an orchestrator,
+        # which has no board row and no worktree of its own, so it is found through the record it last wrote.
+        a0 = args[0]
+        if "/" in a0:
+            repo, track = a0.split("/", 1)
+        else:
+            sid = session_at(a0)
+            # No record means we cannot say whose session this is — refuse. Falling through would call
+            # resolve(None, None, None), which answers about the CALLER's own cwd and labels it with the
+            # address that was asked for: one session read as another, which is what this whole change exists
+            # to end. The --true path below already refuses here; this keeps the two consistent.
+            if not sid:
+                print(f"cc-context: no session has recorded under {a0} — it has not stopped a turn yet, "
+                      f"or that is not a live address (cc-handoff --status {a0})", file=sys.stderr)
+                return 2
 
     if do_record:
         try:
@@ -902,7 +983,8 @@ def main(argv):
             print(json.dumps(hs, indent=2))
             return 0
         for h in hs:
-            print(f"{h.get('ts')}\t{h.get('kind')}\t{(h.get('repo') or '-')}/{(h.get('track') or '-')}"
+            who = h.get("target") or f"{h.get('repo') or '-'}/{h.get('track') or '-'}"
+            print(f"{h.get('ts')}\t{h.get('kind')}\t{who}"
                   f"\t{h.get('pct')}\t{h.get('used')}\t{h.get('window')}\t{h.get('session_id') or '-'}")
         return 0
 
@@ -912,7 +994,14 @@ def main(argv):
             print(json.dumps(rs, indent=2))
             return 0
         for d in rs:
-            print(f"{d.get('repo') or '-'}\t{d.get('track') or '-'}\t{d['pct']:.0f}\t{d['used']}"
+            # COLUMN ONE IS THE SESSION, not the repo: `<repo>` for one a person steers and `<repo>@<alias>`
+            # for an orchestrator, so the two that share a worktree are two rows a reader can tell apart.
+            # The track stays in column two and the count is unchanged — the callers that read this by
+            # position (`cc ls`, the Slack tracker line) key on the first two columns and neither moves.
+            who = d.get("target") or d.get("repo") or "-"
+            if d.get("track") and who.endswith("/" + d["track"]):
+                who = who[:-(len(d["track"]) + 1)]
+            print(f"{who or '-'}\t{d.get('track') or '-'}\t{d['pct']:.0f}\t{d['used']}"
                   f"\t{d['window']}\t{d['window_src']}\t{d['age']}\t{d.get('level') or '-'}"
                   f"\t{'pending' if d.get('pending') else '-'}")
         return 0
@@ -935,10 +1024,12 @@ def main(argv):
             # target's. A target with no slash (`box`) names no board row, so there is nothing to fall back to.
             if "/" in target:
                 repo, track = target.split("/", 1)
+            elif session_at(target):
+                sid = session_at(target)      # an orchestrator: no board row, but a record of its own
             else:
                 if not quiet:
-                    print(f"cc-context: {target}'s pane would not answer, and `{target}` is not a <repo>/<track> "
-                          "to estimate from", file=sys.stderr)
+                    print(f"cc-context: {target}'s pane would not answer, and nothing has recorded under "
+                          f"`{target}` to estimate from", file=sys.stderr)
                 return 2
     if not m:
         if not path:
@@ -967,7 +1058,7 @@ def main(argv):
 # ---- selfcheck ---------------------------------------------------------------------------------
 
 def selfcheck():
-    import tempfile
+    import contextlib, io, tempfile
     p = f = 0
 
     def ok(name, cond):
@@ -1089,23 +1180,85 @@ def selfcheck():
         best = newest_per_track(rs)
         ok("repo/track comes off the .cc/track marker", ("repo1", "track1") in best)
 
-        # the session's NAME: its tmux window when the hook runs in one; otherwise the parts that are known
-        envN = {k: os.environ.pop(k, None) for k in ("TMUX_PANE", "CC_SLACK_ALIAS")}
+        # the session's NAME and its ADDRESS: the tmux window when the hook runs in one; otherwise the parts
+        # that are known. EVERY KIND THE BOX STARTS gets an address here, and no two of them share one.
+        envN = {k: os.environ.pop(k, None) for k in ("TMUX_PANE", "CC_SLACK_ALIAS", "HOME")}
         try:
+            home = os.path.realpath(d)                    # a fake ~/dev: a session a person steers, and an orch
+            os.environ["HOME"] = home                     # beside it, are both `~/dev/<repo>` with no track marker
+            os.makedirs(os.path.join(home, "dev", "repo2"), exist_ok=True)
+            plan = os.path.join(home, "dev", "repo2")
             wt = os.path.join(d, "wt")
             r2 = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
-            ok("with no pane a track session is named repo/track", bool(r2) and r2.get("name") == "repo1/track1")
+            ok("with no pane a track session is named repo/track",
+               bool(r2) and r2.get("name") == "repo1/track1" and r2.get("target") == "repo1/track1")
+            rp = record({"session_id": "sid-p", "transcript_path": t, "cwd": plan})
+            ok("a session a person steers is addressed by its repo alone",
+               bool(rp) and rp.get("target") == "repo2" and not rp.get("track"))
             os.environ["CC_SLACK_ALIAS"] = "dash"
-            r3 = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
-            ok("an orch with no pane is named repo@alias", bool(r3) and r3.get("name") == "repo1@dash")
+            r3 = record({"session_id": "sid-o", "transcript_path": t, "cwd": plan})
+            ok("an orch with no pane is named AND addressed repo@alias — the alias is the only thing between it "
+               "and the session a person steers in the same worktree, so without it they were one key",
+               bool(r3) and r3.get("name") == "repo2@dash" and r3.get("target") == "repo2@dash")
+            ok("…so the two live sessions sharing that worktree are two addresses, not one",
+               rp.get("target") != r3.get("target"))
+            r3b = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
+            ok("$CC_SLACK_ALIAS leaks into everything an orch launches, and it does NOT rename the TRACKS it "
+               "launches: a track is addressed by its own worktree, whoever spawned it",
+               bool(r3b) and r3b.get("name") == "repo1/track1" and r3b.get("target") == "repo1/track1")
             os.environ["TMUX_PANE"] = "%999999"           # a pane tmux does not know: the name falls back, nothing raises
-            r4 = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
-            ok("a pane tmux cannot name falls back to the parts, never raises", bool(r4) and r4.get("name") == "repo1@dash")
+            r4 = record({"session_id": "sid-o", "transcript_path": t, "cwd": plan})
+            ok("a pane tmux cannot name falls back to the parts, never raises",
+               bool(r4) and r4.get("name") == "repo2@dash" and r4.get("target") == "repo2@dash")
         finally:
             for k, v in envN.items():
                 os.environ.pop(k, None)
                 if v is not None:
                     os.environ[k] = v
+
+        # THE GRAMMAR IS HELD TO CC-HANDOFF'S OWN. The two files call each other through argv and neither may
+        # fail to load with the other, so the shapes are spelled twice; asked of the sibling itself, over the
+        # names that matter, they must agree exactly. An address this file mints and that one refuses is a
+        # session that measures fine and can never be handed off — which is the whole of this row.
+        shapes = ["r1", "r1@dash", "r1/t1", "r1@d", "r1@DASH", "r1/t1/x", "../etc", "r1@dash/t1", "r1~next", "r1@"]
+        henv = dict(os.environ, CC_HANDOFF_DIR=os.path.join(d, "nohandoff"), CC_CTX_RECORDS=RECORDS)
+        agree = []
+        for n in shapes:
+            try:
+                r = subprocess.run([os.path.join(BIN, "cc-handoff"), "--status", n], capture_output=True,
+                                   text=True, env=henv, timeout=30)
+                theirs = "is not a target" not in (r.stdout + r.stderr)
+            except Exception:
+                theirs = None
+            agree.append((n, theirs, bool(ADDRESS_RE.match(n))))
+        ok("every address this file mints is one cc-handoff takes, and every shape it refuses is refused here "
+           "too — asked of cc-handoff itself, not of a copy of its regex",
+           all(t == m for _, t, m in agree) and [n for n, t, _ in agree if t] == ["r1", "r1@dash", "r1/t1"])
+
+        # --all: ONE ROW PER LIVE SESSION, and a reader can tell two in one worktree apart
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(["--all"])
+        rows = [l.split("\t") for l in buf.getvalue().splitlines() if l.strip()]
+        who = [r[0] for r in rows]
+        ok("--all keeps its nine columns, so the callers that read it by position are untouched",
+           bool(rows) and all(len(r) == 9 for r in rows))
+        ok("--all gives the orch and the session a person steers beside it two different first columns — one "
+           "bare key for both is how one's percentage was read as the other's",
+           "repo2" in who and "repo2@dash" in who)
+        ok("a track keeps the repo in column one and its own name in column two",
+           any(r[0] == "repo1" and r[1] == "track1" for r in rows))
+        ok("no two rows share an address", len(who) == len(set(f"{r[0]}\t{r[1]}" for r in rows)))
+
+        # …and one can be ASKED for by that address, which is the other half of telling them apart
+        ok("an orch's own session is found through the record it wrote, not through the worktree it shares",
+           session_at("repo2@dash") == "sid-o" and session_at("repo2") == "sid-p")
+        ok("…and it hands off through a journal of its own — one file for both would have handed each the "
+           "other's handoff entry as the account of its own work",
+           journal_of({"repo": "repo2", "target": "repo2@dash"}) == "~/.cc/state/repo2/dash-handoff.md"
+           and journal_of({"repo": "repo2", "target": "repo2"}) == "~/.cc/state/repo2/planning-handoff.md"
+           and journal_of({"repo": "repo2", "track": "t1", "target": "repo2/t1"})
+           == "~/.cc/state/repo2/t1/progress.md")
 
         # the three lines: a percentage each, with a floor under the first two
         ok("30/40/60 of the 1M window", thresholds(BIG_WINDOW) == (300000.0, 400000.0, 600000.0))
@@ -1475,9 +1628,9 @@ def selfcheck():
             err = io.StringIO()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 rc = main(["--true", "box"])
-            ok("…and a target that is no <repo>/<track> at all is REFUSED rather than estimated: `box` names no "
-               "board row, so there is nothing of its own to fall back to",
-               seen == [] and rc == 2 and "not a <repo>/<track>" in err.getvalue())
+            ok("…and a target with nothing of its own to fall back to is REFUSED rather than estimated: `box` "
+               "names no board row and has recorded nothing, so the caller's own cwd is not its answer",
+               seen == [] and rc == 2 and "nothing has recorded under `box`" in err.getvalue())
         finally:
             globals()["resolve"] = real_res
         os.remove(px)

@@ -29,8 +29,20 @@ survivor's un-gate depend on a marker nobody swept. Now `cc-context` MEASURES an
 decision, both paths and the sweep live here. `cc handoff <repo> <track>` delegates to --replace, and the overlap
 still fails INTO it.
 
-TARGET is `<repo>` (a planning session) or `<repo>/<track>` — the same address the Slack layer routes on, and
-also the tmux window name in session `main`. The successor's window is `<target>~next` until cutover.
+TARGET IS THE SESSION'S OWN TMUX WINDOW NAME in session `main`, which is also the address the Slack layer
+routes on. There are three shapes and every session this box starts wears one of them:
+  `<repo>`            a session a PERSON steers in the primary worktree — planning, plain, member workspace
+  `<repo>@<alias>`    an ORCHESTRATOR, and a sub-orch alongside it: same repo, same worktree, its own session
+  `<repo>/<track>`    a TRACK, interactive or headless, in its own worktree
+Only the third has a stop-then-restart path (a track can be killed and relaunched from its board row); the
+first two are handed off by the overlap or not at all, which is exactly why the overlap has to reach them.
+A HEADLESS RUN wears the track's address and takes no phase at any of them — a loop iteration and a steward's
+one-shot both end their turn, and the next run reads the journal on a fresh context. That IS their handoff and
+it costs no second session (`worker`, and the paragraph below).
+`parts` splits an address and `kind` names it — nothing here splits a target by hand. Until 2026-09-07 the
+grammar had no room for `@`, so an orchestrator's real address was refused as "not a target": no orch had ever
+been handed off, one sat past the ceiling with no successor and nothing able to start one, and its readings
+shared a key with the planning session in the same repo. The successor's window is `<target>~next` until cutover.
 
 ONLY AN INTERACTIVE SESSION IS HANDED OFF. A headless cc-loop iteration (CC_ROLE=worker) takes no phase at all:
 it journals, ends its turn, and the loop starts the next iteration on a fresh context reading that journal —
@@ -118,7 +130,9 @@ SESSION = "main"
 NEXT = "~next"                     # the successor's window suffix; `~` is not legal in a repo/track name
 OLD = "~old"                       # ...and the predecessor's, from cutover to the end of its drain
 DEFAULT_MAX = 45 * 60
-TARGET_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$")
+NAME = r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}"
+ALIAS = r"[a-z0-9-]{2,20}"         # `cc <repo> --orch <alias>` accepts exactly this, so this accepts exactly it
+TARGET_RE = re.compile(rf"^{NAME}(@{ALIAS}|/{NAME})?$")   # the three shapes above, and nothing else
 MACHINE = "[cc-handoff]"           # every prompt this file types into a session leads with it — see the header
 
 
@@ -144,9 +158,39 @@ def enabled():
     return cfg("CC_HANDOFF_OVERLAP", 0) >= 1
 
 
+# ---- the address -----------------------------------------------------------------------------------------
+# ONE PLACE SPLITS AN ADDRESS. Every phase below used to do `target.partition("/")` and call the left half the
+# repo, which is true of two shapes out of three: for `<repo>@<alias>` it made the repo the whole `repo@alias`
+# string, and the brief packet, the ledger row and the journal path all went looking for a repo of that name.
+
+def parts(target):
+    """(repo, alias, track) for an address. Permissive on purpose — TARGET_RE is the gate, and a parser that
+    also survives a shape the gate rejects is one that cannot mangle it into a wrong repo name."""
+    head, _, track = (target or "").partition("/")
+    repo, _, alias = head.partition("@")
+    return repo, alias, track
+
+
+def kind(target):
+    """Which kind of session this address names. `session` is one a PERSON steers — planning, plain, a member
+    workspace: the primary worktree, no alias. `orch` is an orchestrator or a sub-orch beside it, same worktree
+    and a name of its own. `track` is a track in its own worktree, interactive or headless. A track under an
+    orch is still a track: it has its own worktree and its own window, and the two must never be confused."""
+    repo, alias, track = parts(target)
+    if track:
+        return "track"
+    return "orch" if alias else "session"
+
+
+ARTICLE = {"session": "a session a person steers", "orch": "an orchestrator", "track": "a track"}
+SHAPES = "<repo>, <repo>@<alias> or <repo>/<track>"
+
+
 # ---- the record ----------------------------------------------------------------------------------------
 
 def slug(target):
+    """One flat filename per address. `@` needs no escaping and cannot collide with the `--` a track uses, so
+    `r1@a`, `r1/a` and `r1--a` stay three different records."""
     return target.replace("/", "--")
 
 
@@ -287,9 +331,9 @@ def ledger(rec, kind, why=""):
         return False
     rec["phases"].append(kind)
     os.makedirs(RECORDS, exist_ok=True)
-    repo, _, track = rec["target"].partition("/")
+    repo, alias, track = parts(rec["target"])
     row = {"ts": time.time(), "kind": kind, "handoff": rec["id"], "target": rec["target"],
-           "repo": repo, "track": track or None, "pct": rec.get("pct_at_start"),
+           "repo": repo, "alias": alias or None, "track": track or None, "pct": rec.get("pct_at_start"),
            "session_id": (rec.get(live_side(rec)) or {}).get("session_id")}
     if why:
         row["why"] = why
@@ -397,14 +441,34 @@ def orphans():
     nothing driven from a record will ever finish them. [(name, window id, age in s)], oldest first."""
     out = []
     for l in (tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{pane_pid} #W") or "").splitlines():
-        parts = l.split(" ", 2)
-        if len(parts) < 3:
+        col = l.split(" ", 2)                      # not `parts` — that is the address splitter, module-level
+        if len(col) < 3:
             continue
-        wid, pid, name = parts
+        wid, pid, name = col
         for suf in (NEXT, OLD):
             if name.endswith(suf) and TARGET_RE.match(name[:-len(suf)]) and not read(name[:-len(suf)]):
                 out.append((name, wid, age(pid)))
     return sorted(out, key=lambda x: -x[2])
+
+
+def unaddressable():
+    """Live windows in session `main` running a SESSION whose name this file cannot take as an address.
+    Every kind the box starts wears one of the three shapes in the header, so this list is normally empty —
+    it is a tripwire, not a queue. A kind that stops being recognised, by a new launcher or by a rename, is a
+    session that can never be handed off and can never be told apart from its neighbours in the measurement;
+    until 2026-09-07 that was quietly true of every orchestrator on every box. [(name, window id, age in s)]."""
+    out = []
+    for l in (tmux("list-windows", "-t", SESSION, "-F", "#{window_id} #{pane_pid} #W") or "").splitlines():
+        col = l.split(" ", 2)
+        if len(col) < 3:
+            continue
+        wid, pid, name = col
+        if name.endswith(NEXT) or name.endswith(OLD):
+            continue                               # a side of a handoff in flight: `orphans` owns those
+        if TARGET_RE.match(name) or not pane_live_id(wid):
+            continue                               # …and a window with no session in it is not a session
+        out.append((name, wid, age(pid)))
+    return out
 
 
 def self_wid():
@@ -511,8 +575,13 @@ the journal; the overlap expires on its own and your predecessor simply carries 
 
 
 def journal_for(target):
-    repo, _, track = target.partition("/")
-    return f"~/.cc/state/{repo}/{track}/progress.md" if track else f"~/.cc/state/{repo}/planning-handoff.md"
+    """The journal a successor reads first — one per ADDRESS, never one per repo. An orchestrator gets its own
+    file beside the planning session's: the two run in the same worktree, and a shared journal would hand each
+    the other's handoff entry."""
+    repo, alias, track = parts(target)
+    if track:
+        return f"~/.cc/state/{repo}/{track}/progress.md"
+    return f"~/.cc/state/{repo}/{alias or 'planning'}-handoff.md"
 
 
 def logd(msg):
@@ -667,7 +736,7 @@ def start(target, pct=None, session_id="", flight=""):
     """--overlap: the successor comes up beside the predecessor, muted and gated, with the same working
     directory. Refused while a record for this target is open — one successor at a time, never a chain."""
     if not TARGET_RE.match(target):
-        print(f"cc-handoff: '{target}' is not a target (<repo> or <repo>/<track>)", file=sys.stderr)
+        print(f"cc-handoff: '{target}' is not a target ({SHAPES})", file=sys.stderr)
         return 1
     if worker():
         print("cc-handoff: a worker iteration is not handed off — it journals, ends its turn, and its loop "
@@ -788,7 +857,7 @@ def carry_marks(target, pre, suc):
     and not a prefix). And a row a real worker is in is that worker's — asked the way the watchdog asks it, a
     live pane in the track's own window `<repo>/<track>` — so this changes nothing about work it is not retiring.
     Everything else fails closed: no window id either side, no answer from tmux, no board, and nothing moves."""
-    repo = target.partition("/")[0]
+    repo = parts(target)[0]
     if not pre or not suc or pre == suc:
         return []
     # The successor's mark, in the shape cc-board's `agent me` writes — so what lands on the row is exactly
@@ -818,7 +887,7 @@ def derive(rec, first=False):
     one that took the cutover — a retry re-derives the cosmetics but never re-announces a stay. A failure here leaves the
     record right about WHO IS LIVE and wrong only about cosmetics, and a later turn re-derives the same state."""
     target = rec["target"]
-    repo, _, track = target.partition("/")
+    repo, _, track = parts(target)
     sid = (rec.get("successor") or {}).get("session_id")
     if track and sid:
         board = os.path.join(BIN, "cc-board")
@@ -1102,13 +1171,13 @@ def due(target, over_ceiling=False):
         return abandon(target, "the successor did not become ready inside the overlap window")
     if pane_live(rec["successor"]["window"]):
         return ready(target, forced=True)          # it has the journal, which is all a fresh session ever got
-    _, _, track = target.partition("/")
+    _, _, track = parts(target)
     abandon(target, "at the context ceiling with no live successor")
     if track:                                      # fall back INTO the old path: stop, journal, restart fresh
         run([os.path.realpath(__file__), "--replace", target], wait=False)
     else:
         notify(target, f"{target} is at its context ceiling and the overlapping handoff did not take. "
-                       f"There is no stop-then-restart path for a planning session — it needs a hand.")
+                       f"There is no stop-then-restart path for {ARTICLE[kind(target)]} — it needs a hand.")
     return 0
 
 
@@ -1123,10 +1192,11 @@ def replace(target, over=None):
     to read. Every refusal leaves the session running and says why: a restart that loses a context nobody
     journalled is worse than no restart.
     A handoff costs the session its working memory, so --over decides on the MEASURED number, never a hunch."""
-    repo, _, track = target.partition("/")
+    repo, _, track = parts(target)
     if not track:
-        print(f"cc-handoff: {target} is a planning session — there is no stop-then-restart path for one",
-              file=sys.stderr)
+        print(f"cc-handoff: {target} is {ARTICLE[kind(target)]} — there is no stop-then-restart path for one "
+              f"(only a track can be killed and relaunched from its board row). It is handed off by the "
+              f"overlap: cc-handoff --overlap {target}", file=sys.stderr)
         return 1
     if not win_id(target):
         print(f"cc-handoff: no live window {target}")
@@ -1216,8 +1286,8 @@ def event(target, level="", pct=None, session="", busy="", live=False, taken=Fal
         return ""                           # …and a phase already taken is not taken twice, unless it DIED
     if enabled() and start(target, pct, session, busy) == 0:
         return "overlap"                    # nothing has to be idle: starting a second session interrupts nobody
-    if "/" in target and not busy:          # the overlap is off or would not open: fail INTO the old path, which
-        run([os.path.realpath(__file__), "--replace", target], wait=False)   # DOES have to wait for idle
+    if kind(target) == "track" and not busy:   # the overlap is off or would not open: fail INTO the old path,
+        run([os.path.realpath(__file__), "--replace", target], wait=False)   # which DOES have to wait for idle
         return "replace"
     return ""
 
@@ -1241,7 +1311,7 @@ def finalize(rec, why):
     write(rec)
     mark_done(rec)
     clear(target)
-    repo, _, track = target.partition("/")
+    repo, _, track = parts(target)
     if track:
         run([os.path.join(BIN, "cc-board"), "note", repo, track, f"handoff: swept — {why}"])
     print(f"cc-handoff: {target} — {why}; the record is finalized and nothing is gated by it")
@@ -1324,6 +1394,17 @@ def sweep():
                 f"brief it by hand or `tmux kill-window -t {wid}`")
         alert("⚠️ " + line)
         print("cc-handoff: " + line)
+    # AND A KIND THAT STOPPED BEING RECOGNISED. Reported the same way and on the same timer: a live session
+    # whose window name is not one of the three shapes can never be handed off, and the only reason nobody
+    # noticed that of every orchestrator for weeks is that nothing was watching for it.
+    for name, wid, secs in unaddressable():
+        if secs < cfg("CC_HANDOFF_OVERLAP_MAX", DEFAULT_MAX) or wid in told:
+            continue
+        told[wid] = now
+        line = (f"main:{name} is a live session this handoff cannot address ({SHAPES}) — it can never be "
+                f"handed off, and its context shares a key with its neighbours. Teach `parts`/`kind` its shape.")
+        alert("⚠️ " + line)
+        print("cc-handoff: " + line)
     try:
         os.makedirs(HANDOFF, exist_ok=True)
         with open(told_p + ".tmp", "w") as f:
@@ -1341,10 +1422,17 @@ def status(target=None, as_json=False):
         return 0 if recs else 1
     orph = [] if target else orphans()
     if not recs:
-        print("no overlapping handoff is open" + (f" for {target}" if target else ""))
+        # NAME THE KIND. Asked about one address, the answer says which session that is — the whole point of
+        # an address is that `<repo>` and `<repo>@<alias>` are two live sessions in one worktree, and a reader
+        # who cannot tell them apart reads one's number for the other's (which is how this row started).
+        print("no overlapping handoff is open"
+              + (f" for {target} ({ARTICLE[kind(target)]}, window main:{target})" if target else ""))
     for name, wid, secs in orph:
         print(f"{name:<24} orphan    no record — window {wid} up {secs / 3600:.1f} h: brief it by hand, "
               f"or tmux kill-window -t {wid}")
+    for name, wid, secs in ([] if target else unaddressable()):
+        print(f"{name:<24} UNADDRESSABLE  a live session this handoff cannot take as an address ({SHAPES}) — "
+              f"it can never be handed off")
     if not recs:
         return 1
     now = time.time()
@@ -1528,7 +1616,7 @@ def prs(repo):
 def brief(target):
     """--brief: ONE packet, in the order a successor needs it, so it does not rebuild it a tool call at a
     time. Read-only and best-effort throughout — this must never be the thing that fails a handoff."""
-    repo = target.partition("/")[0]
+    repo = parts(target)[0]
     rec = read(target)
     journal, jread, janchor = tail_entry(journal_for(target))
     pre = (rec or {}).get("predecessor") or {}
@@ -1883,6 +1971,81 @@ def selfcheck():
             return json.loads(buf.getvalue()) if buf.getvalue().strip() else None
 
         relays = lambda: [a for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg") and a[2].startswith(RELAY_PREFIX)]
+
+        # ---- EVERY KIND OF SESSION THIS BOX STARTS, ALL THE WAY THROUGH -----------------------------------
+        # Until 2026-09-07 the grammar had room for two shapes out of three, so an ORCHESTRATOR asked about
+        # itself came back "is not a target": no orch had ever been handed off, one sat past the context
+        # ceiling with no successor and nothing on the box able to start one, and a person had to restart it by
+        # hand. A case that only asserts an address is ACCEPTED proves nothing about a handoff completing, so
+        # each kind here is driven the whole way — started, cut over, its names moved, retired.
+        os.environ.pop("CC_HANDOFF", None)
+        for addr, what in (("k1", "session"), ("k1@dash", "orch"), ("k1/t1", "track")):
+            ok(f"{addr} is an address, and it is {ARTICLE[what]}",
+               bool(TARGET_RE.match(addr)) and kind(addr) == what)
+            r = cutover(addr)
+            os.environ.pop("CC_HANDOFF", None)
+            ok(f"{ARTICLE[what]}: the overlap starts and the record names one live side",
+               bool(r) and r["target"] == addr and live_side(r) in ("predecessor", "successor")
+               and r["predecessor"]["window"] == addr + OLD)
+            ok(f"{ARTICLE[what]}: it reaches CUTOVER — the successor is live, once, on one record",
+               r["phase"] == "cutover" and live_side(r) == "successor"
+               and [l for l in open(os.path.join(RECORDS, "handoffs.jsonl"))
+                    if json.loads(l)["target"] == addr and json.loads(l)["kind"] == "overlap-cutover"])
+            ok(f"{ARTICLE[what]}: the names moved, so an owner attaching lands on the live session",
+               wins.get(addr) == r["successor"]["tmux"] and addr + OLD in wins and addr + NEXT not in wins)
+            ok(f"{ARTICLE[what]}: the ledger row keeps the repo whole and the address whole",
+               [json.loads(l) for l in open(os.path.join(RECORDS, "handoffs.jsonl"))
+                if json.loads(l)["target"] == addr][-1]["repo"] == "k1")
+            ok(f"{ARTICLE[what]}: it retires, and the predecessor's window goes with it",
+               retire(addr) == 0 and addr + OLD not in wins and wins.get(addr) == r["successor"]["tmux"])
+
+        # TWO LIVE SESSIONS IN ONE WORKTREE ARE TWO HANDOFFS. `k1` and `k1@dash` share a repo, a checkout and a
+        # Slack channel; only the alias tells them apart. Under one key an overlap open on either would refuse
+        # the other, both would journal into the same file, and the ledger could not say which was handed off.
+        ok("a session a person steers and an orchestrator beside it are separate records",
+           path("k1") != path("k1@dash") and slug("k1@dash") == "k1@dash")
+        ok("...and separate journals: a shared one hands each the other's handoff entry",
+           journal_for("k1") != journal_for("k1@dash") != journal_for("k1/t1"))
+        wins["k2"], wins["k2@dash"] = "@k2", "@k2d"
+        ok("...and an overlap open on one does not refuse the other",
+           start("k2") == 0 and read("k2") and start("k2@dash") == 0 and read("k2@dash")
+           and read("k2")["id"] != read("k2@dash")["id"])
+        abandon("k2"); abandon("k2@dash")
+
+        # ONLY A TRACK HAS THE STOP-THEN-RESTART PATH, and the refusal has to say which kind it is talking to:
+        # "there is no path for a planning session" was printed at orchestrators too, which is how the one that
+        # needed a hand looked like a session that had already been considered.
+        wins["k3"], wins["k3@dash"] = "@k3", "@k3d"
+        errs = {}
+        for addr in ("k3", "k3@dash"):
+            import contextlib as _c, io as _io
+            e = _io.StringIO()
+            with _c.redirect_stderr(e), _c.redirect_stdout(_io.StringIO()):
+                errs[addr] = (replace(addr), e.getvalue())
+        ok("--replace refuses a session a person steers, and calls it that",
+           errs["k3"][0] == 1 and "a session a person steers" in errs["k3"][1])
+        ok("--replace refuses an ORCHESTRATOR, and calls it that — not a planning session",
+           errs["k3@dash"][0] == 1 and "an orchestrator" in errs["k3@dash"][1]
+           and "planning session" not in errs["k3@dash"][1])
+
+        os.environ["CC_ROLE"] = "worker"
+        ok("a HEADLESS run takes no phase at any address — a loop iteration and a steward's one-shot both "
+           "journal, end the turn, and let the next run start on a fresh context reading it",
+           all(start(a) == 1 and read(a) is None for a in ("k1", "k1@dash", "k1/t1")))
+        os.environ.pop("CC_ROLE", None)
+
+        # THE TRIPWIRE. A kind that stops being recognised — a new launcher, a window renamed by hand — is a
+        # session that can never be handed off and whose context shares a key with its neighbours. Nothing
+        # watched for that, which is the only reason it was true of every orchestrator for weeks.
+        ok("with every live window an address, nothing is reported as unaddressable",
+           [n for n, _, _ in unaddressable()] == [])
+        wins["not an address!"] = "@bad"
+        ok("a live session whose window name is no address at all is REPORTED, by name",
+           [n for n, _, _ in unaddressable()] == ["not an address!"])
+        wins["k5" + NEXT] = "@k5n"
+        ok("...and a side of a handoff in flight is not one of those — `orphans` owns those",
+           [n for n, _, _ in unaddressable()] == ["not an address!"])
+        del wins["not an address!"], wins["k5" + NEXT]
 
         os.environ.pop("CC_HANDOFF", None)
         wins["r2"] = "@r2"
@@ -2649,7 +2812,7 @@ def main(argv):
         i += 1
     target = pos[0] if pos else None
     if target and not TARGET_RE.match(target):
-        print(f"cc-handoff: '{target}' is not a target (<repo> or <repo>/<track>)", file=sys.stderr)
+        print(f"cc-handoff: '{target}' is not a target ({SHAPES})", file=sys.stderr)
         return 1
     if cmd == "--overlap":
         if not target:
@@ -2700,7 +2863,7 @@ def main(argv):
             return 0
     if cmd == "--brief":
         if not target:
-            print("cc-handoff: --brief needs a target (<repo> or <repo>/<track>)", file=sys.stderr)
+            print(f"cc-handoff: --brief needs a target ({SHAPES})", file=sys.stderr)
             return 1
         return brief(target)
     if cmd == "--status":

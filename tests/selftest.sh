@@ -2207,7 +2207,22 @@ MT new-session -d -s _ccmodel -n sess 'bash -c "cat; true"'
 MT new-window -d -t _ccmodel -n wkr "bash -c '$T/fb/cc-loop; true'"   # a worker pane: cc-loop is its child and claude a grandchild
 sleep 1
 [ "$(M status)" = fable ] && ok "cc-model status: fable while nothing is limited" || bad "cc-model status: $(M status)"
-[ -z "$(M current)" ] && ok "cc-model current is empty with no override" || bad "cc-model current leaked a model"
+[ "$(M current)" = 'claude-fable-5[1m]' ] && ok "cc-model current names the box's primary with no override" || bad "cc-model current: $(M current)"
+[ -z "$(M forced)" ] && ok "cc-model forced is empty with no override — the old 'current' meaning, moved not dropped" || bad "cc-model forced leaked a model"
+# A DISAGREEMENT BETWEEN WHAT THE BOX DISPATCHES AND WHAT IS RUNNING IS SAID OUT LOUD (2026-09-07): about 31 windows
+# were on the harness default and nothing anywhere reported one, because the only pass that looks at a live session's
+# model retunes same-family only. tick reads cc-statusline's own per-session record — never a pane, which may merely
+# NAME a model — and writes one row: moving a running session stays the retune pass's job, and this must not do it.
+mkdir -p "$MH/.cc/state/statusline"
+printf '{"session_id":"agrees","model":"claude-fable-5[1m]","raw":{}}' > "$MH/.cc/state/statusline/agrees.json"
+printf '{"session_id":"astray","model":"claude-opus-5","raw":{}}'      > "$MH/.cc/state/statusline/astray.json"
+ME "$B/cc-model" tick
+{ [ "$(grep -c $'\tmismatch\t' "$MH/.cc/state/model.log")" = 1 ] \
+  && grep -q $'\tmismatch\tclaude-opus-5\tastray — this box dispatches claude-fable-5\[1m\]' "$MH/.cc/state/model.log" \
+  && [ "$(M status)" = "fable — 1 session on another model" ] && [ ! -f "$MH/.cc/state/model-override" ]; } \
+  && ok "cc-model tick reports the one session running something other than the model the box dispatches — named in the log, counted in status, and nothing switched or typed" \
+  || bad "mismatch unreported: rows=$(grep -c $'\tmismatch\t' "$MH/.cc/state/model.log") status=$(M status)"
+rm -rf "$MH/.cc/state/statusline"; : > "$MH/.cc/state/model.log"   # the cases below assert a bare `fable` status
 printf '{"is_error":true,"result":"claude-fable-5: You are out of usage credits. Run /usage-credits to keep using Fable 5.","total_cost_usd":0}' > "$T/cred.json"
 ME "$B/cc-limit" check "$T/cred.json" >/dev/null
 # USAGE CREDITS ARE NOT A LIMIT (2026-09-04): one model this account cannot run, and no reset lifts that. No stamp —

@@ -25,7 +25,9 @@
 #   cc handoff <repo> <track> [--over [PCT]]  ask the running session to journal a handoff, then restart it with
 #                             fresh context; --over only if its context REALLY is that full (cc-context; bare = the 40% line)
 #   cc handoff --overlap|--ready|--abandon|--status <target>   OVERLAPPING handoff (cc-handoff): the successor
-#                             starts alongside, then retires its predecessor; target = <repo> or <repo>/<track>
+#                             starts alongside, then retires its predecessor. TARGET IS THE SESSION'S OWN WINDOW NAME,
+#                             so every kind goes down this path: <repo> one a person steers, <repo>@<alias> an
+#                             orchestrator, <repo>/<track> a track (addr_parts splits it, sp_for boots it as itself)
 #   cc resume                 menu of every session (mains + tracks) -> pick to reattach/resume
 #   cc ls | cc digest         live windows + board status | full digest (cc digest --notify pushes it)
 #   cc quick [doing|done] "…"  log a small task done without a track (Slack Home shows the last 24 h)
@@ -84,6 +86,26 @@ sp_main(){ local repo="$1" base="$2"
 sp_orch(){ local repo="$1" alias="$2" base="$3"   # a function, like the other two, so `cc selfcheck` can read the prompt an orch is actually given
   printf %s "You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d, and every thread in your OWN channel (#<parent>-$alias-<id>, created for you — no @ needed there; your replies land wherever the message came from). Dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR); an orch you spawn with 'cc $repo --orch <alias> \"<brief>\"' gets its own channel under yours. Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'. $(dispatch_sp)"; }
 member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
+# THE ADDRESS. Every session this script starts wears a tmux window name of one of three shapes, and that name is
+# also what cc-handoff takes as a target (its TARGET_RE/parts()) and what the Slack layer routes on:
+#   <repo>            a session a PERSON steers — planning (__runmain), plain (__runplain), a member workspace
+#   <repo>@<alias>    an ORCHESTRATOR, and a sub-orch beside it (__runorch): same repo, same worktree, own session
+#   <repo>/<track>    a TRACK in its own worktree (__run), interactive or headless
+# Split in ONE place, and print the parts so `cc selfcheck` can hold this to the names the branches below build.
+# `${a%%/*}` alone called an orchestrator's repo `<repo>@<alias>`: its successor cd'd into a directory that does
+# not exist and the window died on its first breath, which is why no orch had ever been handed off.
+addr_parts(){ local a="$1" head repo alias track
+  head="${a%%/*}"; track=""; [ "$a" != "$head" ] && track="${a#*/}"
+  repo="${head%%@*}"; alias=""; [ "$head" != "$repo" ] && alias="${head#*@}"
+  printf '%s\t%s\t%s\n' "$repo" "$alias" "$track"; }
+# WHICH PROMPT A SESSION AT THIS ADDRESS GETS. __runnext boots a successor for ANY of the three kinds from the
+# address alone, so the choice is made once, here, where `cc selfcheck` can read it. A kind that stops being
+# recognised falls to sp_main and comes up believing it is the planning session — the one answer wrong for
+# every other kind, and a silent one: the window looks right and the session is somebody else.
+sp_for(){ local repo="$1" alias="$2" track="$3" base="$4"
+  if   [ -n "$track" ]; then sp_track "$repo" "$track" "$base"
+  elif [ -n "$alias" ]; then sp_orch  "$repo" "$alias" "$base"
+  else                       sp_main  "$repo" "$base"; fi; }
 MEMBER_SP="This session is MEMBER-FACING (the repo carries .cc/member-facing): anybody in its Slack channel can talk to it, so cc-guard denies the owner gates DETERMINISTICALLY — merging/deploying, host, service and destructive changes, external comms, dispatching workers, reading the box's secrets, re-wiring Slack, and edits outside this directory. Do not try to work around a denial: say plainly that it needs the owner and escalate with cc-notify (which stays allowed — inside a member workspace's boundary it goes out over that workspace's own Slack link and reaches the owner, and tells you if it did not). A NEW PROJECT CHANNEL IS NOT ONE OF THOSE. In a member workspace you ask for one yourself: \`cc slack project <name>\` gets you #<workspace>--<name>, its updates lane and its board row (the folder comes with the first session), at most 3 an hour. The name is always under your own workspace — the workspace half is not yours to choose, and an ask that tries to carry one is refused with the reason. There is also a human way in, \`new project <name>\` typed in the workspace channel, but it ONLY counts from the member or the owner: a session saying it is ignored, so ask a person for that line rather than posting it yourself. Either way, do not run cc slack mkchannel and do not send the owner a request the box answers by itself."
 MEMBER_SPEND="$STBASE/member-spend.json"   # {"<handle>": {"day": "YYYY-MM-DD", "usd": n}} — the ledger behind the per-workspace daily cap
 member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> is one member's whole world: docs/design-member-workspaces.md (overlay)
@@ -407,11 +429,13 @@ ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry
   [ -n "$("$BOARD" get "$repo" "$track" session_id)" ] || "$BOARD" set "$repo" "$track" session_id "$(cat /proc/sys/kernel/random/uuid)"
 }
 
-# `cc selfcheck` — the prompts this script hands out, and nothing else. Pure text: no tmux, no board, no worktree,
-# no git, no session started, nothing under ~/.cc read or written. What it is for: the shared dispatch text has to
-# reach EVERY session kind, and a variant that quietly stops carrying it is invisible until an orch spends a whole
-# worker on a ten-line change. Each "carries it" case has a control built with the text taken away, so a case that
-# stopped discriminating is caught here rather than trusted.
+# `cc selfcheck` — the prompts this script hands out and the addresses it names its sessions by, and nothing else.
+# Pure text: no tmux, no board, no worktree, no git, no session started, nothing under ~/.cc read or written. What
+# it is for: the shared dispatch text has to reach EVERY session kind, and a variant that quietly stops carrying it
+# is invisible until an orch spends a whole worker on a ten-line change; and every kind has to keep an address
+# `addr_parts` splits and `sp_for` boots as itself, or that kind can never be handed off. Each case has a control —
+# the text taken away, the splitter it replaced, the three prompts held apart — so a case that stopped
+# discriminating is caught here rather than trusted.
 selfcheck(){
   local n=0 bad=0 rc D S trk mn orch none_t none_m none_o w line dup=0
   t(){ n=$((n+1)); [ "$2" = 0 ] && return 0; bad=$((bad+1)); printf 'FAIL %s\n' "$1"; }
@@ -442,12 +466,33 @@ selfcheck(){
   case "$trk"  in *"cc done r t"*) t "" 0;; *) t "the track prompt lost 'cc done', which is the track's alone" 1;; esac
   case "$mn"   in *"agent me"*)    t "" 0;; *) t "the planning prompt lost the agent mark, which is the planner's alone" 1;; esac
   case "$orch" in *"you may merge"*) t "" 0;; *) t "the orch prompt lost merging, which is the orch's alone" 1;; esac
+  # EVERY KIND THIS SCRIPT STARTS HAS AN ADDRESS, AND __runnext BOOTS A SUCCESSOR FROM THAT NAME ALONE. The three
+  # window names the branches build are `$repo`, `$repo@$alias` and `$repo/$track`, so the split and the prompt
+  # choice are held to them here. Until 2026-09-07 `${target%%/*}` called an orchestrator's repo `<repo>@<alias>`:
+  # its successor cd'd into a directory that does not exist, the window died at once, and no orch was ever handed off.
+  splits(){ [ "$(addr_parts "$1")" = "$(printf '%s\t%s\t%s' "$2" "$3" "$4")" ]; }
+  splits r1 r1 "" "";      t "a session a person steers splits to its repo alone" $?
+  splits r1@dash r1 dash ""; t "an orchestrator's address keeps the repo whole and names the alias" $?
+  splits r1/t1 r1 "" t1;   t "a track splits to its repo and its track" $?
+  # THE CONTROL, and it is the regression itself: the splitter this replaced gets exactly one of those wrong. If
+  # this ever passes, `addr_parts` has stopped being needed or has stopped being different, and the cases above
+  # are guarding nothing.
+  w="r1@dash"; rc=0; [ "${w%%/*}" = r1 ] && rc=1
+  t "control: the one-line splitter this replaced still reads that orch's repo as 'r1@dash'" "$rc"
+  # …AND EACH KIND IS BOOTED AS ITSELF. A kind that stops being recognised falls through to the planning prompt,
+  # which is wrong for every other kind and silent about it — the window looks right and the session is somebody else.
+  rc=0; [ "$(sp_for r "" ""  main)" = "$mn"   ] || rc=1; t "__runnext boots a session a person steers on the planning prompt" "$rc"
+  rc=0; [ "$(sp_for r a  ""  main)" = "$orch" ] || rc=1; t "…an ORCHESTRATOR's successor on the orch prompt, not the planning one" "$rc"
+  rc=0; [ "$(sp_for r "" t   main)" = "$trk"  ] || rc=1; t "…and a track's on the track prompt" "$rc"
+  rc=0; { [ "$mn" = "$orch" ] || [ "$mn" = "$trk" ] || [ "$orch" = "$trk" ]; } && rc=1
+  t "control: those three prompts are three different texts, so the cases above tell the kinds apart" "$rc"
   printf 'cc selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]
 }
 
 case "${1:-}" in __run|__runmain|__runplain|__runorch|__runnext)   # depth: a workspace session starts through __runmember → cc-sandbox member, never bare
-  r="${2%%/*}"; member_workspace "$r" && ! inside && { echo "cc: ~/dev/$r is a member workspace — its sessions run only inside the boundary (cc $r ...), never bare on the host. Refused."; exit 1; };; esac
+  IFS=$'\t' read -r r _ _ < <(addr_parts "${2:-}")   # `${2%%/*}` left an orch successor's repo as `<repo>@<alias>`, a name no
+  member_workspace "$r" && ! inside && { echo "cc: ~/dev/$r is a member workspace — its sessions run only inside the boundary (cc $r ...), never bare on the host. Refused."; exit 1; };; esac   # workspace has, so this guard read no marker and failed OPEN on the one shape it could not parse
 case "${1:-}" in
   "") ensure_main; attach_main; exit 0 ;;
   -h|--help) usage; exit 0 ;;
@@ -755,13 +800,16 @@ PY
     args+=(--append-system-prompt "$sp"); mapfile -t CH < <(chan_args "$win"); args+=("${CH[@]}"); chan_accept "$win"; start_check "$win"; mapfile -t MO < <(model_args); args+=("${MO[@]}")   # no --remote-control: a member session is not on the owner's phone
     "$BIN/cc-sandbox" member "$repo" "$track" -- "$CLAUDE" "${AUTO[@]}" "${args[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runnext)  # internal: the SUCCESSOR of an overlapping handoff (cc-handoff --overlap started this window)
-    target="$2"; hid="$3"; sid="$4"; repo="${target%%/*}"; track=""; [ "$target" != "$repo" ] && track="${target#*/}"
-    if [ -n "$track" ]; then wt="$WTBASE/$repo/$track"; else wt="$DEV/$repo"; fi
+    target="$2"; hid="$3"; sid="$4"; IFS=$'\t' read -r repo alias track < <(addr_parts "$target")
+    if [ -n "$track" ]; then wt="$WTBASE/$repo/$track"; else wt="$DEV/$repo"; fi   # an orch shares the primary worktree
     cd "$wt" || exit 1; base=$(default_branch "$DEV/$repo")
     # Per-process, and that is the whole point: the two sessions share this cwd, so a marker file would gate
     # BOTH. cc-guard reads this and refuses the world-gates until the record says this session is live.
     export CC_HANDOFF="$hid"
-    if [ -n "$track" ]; then sp=$(sp_track "$repo" "$track" "$base"); else sp=$(sp_main "$repo" "$base"); fi
+    # THE SUCCESSOR OF A KIND BOOTS THE WAY A FRESH SESSION OF THAT KIND BOOTS — same prompt builder, same env,
+    # or it comes up believing it is something else. An orchestrator handed the planning prompt would think it
+    # was the planning session, and without $CC_SLACK_ALIAS its replies would leave its own channel (__runorch).
+    sp=$(sp_for "$repo" "$alias" "$track" "$base"); [ -n "$alias" ] && export CC_SLACK_ALIAS="$alias"
     b="${CC_HANDOFF_DIR:-$HOME/.cc/state/handoff}/${target//\//--}.brief"   # cc-handoff wrote the opening brief there
     [ -f "$b" ] && sp="$sp $(cat "$b")"
     member_facing "$wt" && { export CC_ROLE=member; sp="$sp $MEMBER_SP"; }

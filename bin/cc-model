@@ -3,10 +3,19 @@
 # moves to the fallback model, and back when the limit lifts. LLM-free except one tiny probe.
 #   cc-model status                   "fable" (normal) | "opus until 11:40Z" | "opus until probe". An until that
 #                                     is not today is dated ("opus until 2026-09-03T12:51Z"): the clock alone made
-#                                     a 24-hour override read as one that lapsed hours ago.
-#   cc-model current                  the model to dispatch on when it is not the primary: the override, else the next
-#                                     rung when the primary is one this account cannot run, else nothing — cc /
-#                                     cc-loop / cc-rc pass it as --model
+#                                     a 24-hour override read as one that lapsed hours ago. A trailing "— 2 sessions
+#                                     on another model" counts the live sessions NOT on the model `current` names,
+#                                     read the same way tick (4) reads them.
+#   cc-model current                  the model to dispatch on, ALWAYS: the override, else the next rung when the
+#                                     primary is one this account cannot run, else the primary itself — cc and cc-rc
+#                                     pass it as --model, so a session starts on the model the box names instead of
+#                                     inheriting the harness default. Until 2026-09-07 it answered only while the box
+#                                     was OFF its primary, so in the normal state nothing named a model and every
+#                                     session silently inherited that default (31 live windows had).
+#   cc-model forced                   only the model the box was MOVED to — the override, else the next rung when the
+#                                     primary is not this account's to run — and nothing while it is on its primary.
+#                                     This is what `current` used to answer. cc-loop asks THIS one: a worker given no
+#                                     --model must land on CC_WORKER_MODEL, not on the interactive primary.
 #   cc-model switch <model> [reason]  write (or, for the primary model, clear) the override + retune live sessions
 #   cc-model limited <model> [reason] cc-limit calls this after a limited run: switch only if that WAS the primary
 #   cc-model unavailable <model> [reason]  cc-limit calls this on a run refused for usage credits: that model cannot
@@ -36,7 +45,13 @@
 #   Same family only (another family is the chain's, an override's or the owner's), read from the CLI's own "Set model
 #   to …" line and never from the pane at large, and at most once per pane per CC_MODEL_RETUNE_GAP;
 #   (3) never two switches within 10 min — and the override's `since` counts as a switch, not only the log line: that
-#   line is written after the retune, and on 2026-09-01 a restore slipped into the gap and undid the switch mid-typing.
+#   line is written after the retune, and on 2026-09-01 a restore slipped into the gap and undid the switch mid-typing;
+#   (4) IN EVERY STATE, SAID OUT LOUD AND NEVER ACTED ON: a live session running a model `current` does not name —
+#   another family, or the old id of the primary's — gets one `mismatch` row in the log (at most one per session per
+#   CC_MODEL_MISMATCH_GAP) and is counted in `status`. (2b) is the only pass that MOVES a session and it is same-family
+#   by design, so before this every session on another family was invisible: 31 windows sat on the harness default on
+#   2026-09-07 and nothing anywhere said so. This one types nothing — a session on another family is an override's,
+#   the chain's or the owner's doing, and reporting it is the whole job.
 # Retuning a session = typing "/model <model>" into its pane THROUGH cc-msg (the one pane deliverer, with the dialog
 #   guard); the answers to the CLI's own prompts (Enter/Esc, "1" to "Switch model?") are single keys. Effort is not touched.
 # THE WORKER FALLBACK CHAIN LIVES HERE AND NOWHERE ELSE: fable -> opus -> sonnet. cc-loop asks `cc-model next`
@@ -54,7 +69,9 @@
 #   run (usage credits, not a limit — see A MODEL THIS ACCOUNT CANNOT RUN below); a row goes the moment the box is put
 #   back on that model, by a probe that answered as it or by `switch`.
 # Env: CC_MODEL_PRIMARY · CC_MODEL_FALLBACK · CC_MODEL_PROBE (the id the probe asks for) · CC_CLAUDE
-#   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
+#   · CC_MODEL_PROBE_EVERY (900) · CC_MODEL_MIN_GAP (600) · CC_MODEL_RETUNE_GAP (600) · CC_MODEL_CHAIN
+#   · CC_MODEL_MISMATCH_GAP (3600) · CC_MODEL_STATUSLINE_FRESH (120) · CC_STATUSLINE_DIR (cc-statusline's per-session
+#   records, the same ones cc-context reads) · test hooks: CC_TMUX_SESSION, CC_MODEL_PROC.
 set -uo pipefail
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 ST="$HOME/.cc/state"; OV="$ST/model-override"; LOG="$ST/model.log"; SEEN="$ST/model-seen"; UNAV="$ST/model-unavailable"
@@ -94,6 +111,41 @@ retuned_recently(){   # $1 = pane id → 0 when this pane was retuned inside the
   local id="${1:-}" t
   t=$(awk -F'\t' -v i="($id)" '$3=="retune" && index($5, i){t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)
   [ "$((now - t))" -lt "${CC_MODEL_RETUNE_GAP:-600}" ]; }
+sldir(){ printf '%s\n' "${CC_STATUSLINE_DIR:-$ST/statusline}"; }   # cc-statusline's per-session records — cc-context's env name
+mismatches(){   # every LIVE session running a model `current` does not name: "<session-id>\t<the model it is on>".
+                # REPORT ONLY. Nothing here types into a pane: retune_to is the one pass that moves a session and it is
+                # same-family on purpose, so "what is configured" and "what is running" could disagree in silence — 31
+                # windows on the harness default on 2026-09-07, and the box said nothing until the owner asked.
+                # EVIDENCE IS cc-statusline's OWN RECORD, which is the harness's word for what that session is running.
+                # A pane's text is not: a doc, or this file in a pager, has a model id on its screen and is not running it.
+                # FRESH ONLY. The record is rewritten every turn, so one no older than CC_MODEL_STATUSLINE_FRESH
+                # (120 s — cc-context's STATUSLINE_MAX_AGE, and two ticks, so no turn falls between passes) belongs to a
+                # session that answered just now. An older one has gone quiet or gone away, and reporting a model nobody
+                # is running is worse than saying nothing. A headless worker is never here: `claude -p` draws no status
+                # line and writes no record, and it is meant to be on CC_WORKER_MODEL, not on what the sessions run.
+  local want sid m cut ts f
+  want=$(current); [ -n "$want" ] || return 0   # nothing is named, so nothing can disagree with it
+  want="${want%%\[*}"; cut=$((now - ${CC_MODEL_STATUSLINE_FRESH:-120}))
+  while read -r ts f; do   # one stat for the whole directory: nothing prunes it, and most of it is months of stale ids
+    { [[ "${ts:-}" =~ ^[0-9]+$ ]] && [ "$ts" -ge "$cut" ]; } || continue
+    m=$(jq -r '.model // empty' "$f" 2>/dev/null); [ -n "$m" ] || continue
+    [ "${m%%\[*}" = "$want" ] && continue   # the [1m] suffix is a context knob, not a model (idname) — not a disagreement
+    sid=$(basename "$f" .json)
+    printf '%s\t%s\n' "$(tr -d '\t\n' <<<"$sid")" "$(tr -d '\t\n' <<<"$m")"
+  done < <(stat -c '%Y %n' "$(sldir)"/*.json 2>/dev/null); }
+reported_recently(){   # $1 = session id → 0 when a mismatch row for it was written inside CC_MODEL_MISMATCH_GAP (1 h).
+                       # A disagreement lasts as long as the session does; a row a minute would bury every other verb
+                       # in a log a person reads.
+  local sid="${1:-}" t
+  t=$(awk -F'\t' -v s="$sid" '$3=="mismatch" && index($5, s){t=$2} END{print t+0}' "$LOG" 2>/dev/null || echo 0)
+  [ "$((now - t))" -lt "${CC_MODEL_MISMATCH_GAP:-3600}" ]; }
+report_mismatches(){   # one log row per disagreeing session. The <model> field is the one it is REALLY on — the news —
+                       # and the detail names the one a dispatch would have given it.
+  local sid m want; want=$(current)
+  while IFS=$'\t' read -r sid m; do [ -n "${sid:-}" ] || continue
+    reported_recently "$sid" && continue
+    printf '%s\t%s\tmismatch\t%s\t%s — this box dispatches %s\n' "$(date -u +%FT%TZ)" "$now" "$m" "$sid" "$want" >> "$LOG"
+  done < <(mismatches); }
 untilw(){   # $1 = an epoch → the way a person reads it. HH:MMZ alone lies the moment the until is not today: a 24-hour
             # override read at 16:04Z as "until 12:51Z" looks like it lapsed three hours ago, and a handoff journal
             # recorded exactly that (2026-09-02). Past today, the date comes with it.
@@ -121,15 +173,27 @@ chain_next(){   # the model AFTER $1 on the chain, by family: "opus", "claude-op
       case "$m" in *']') printf '%s\n' "$m";; *) printf '%s%s\n' "$m" "$sfx";; esac; return 0; fi
     [ "$(fam "$m")" = "$w" ] && hit=1
   done < <(chain_all); return 1; }   # off the end of the chain (or a model that was never on it): nothing left to fall back to
-current(){   # what a dispatch passes as --model: the override, else the next rung when the primary is not this account's
-             # to run, else nothing — the box is on its primary
+forced(){   # the model the box was MOVED to: the override, else the next rung when the primary is not this account's to
+            # run, else NOTHING — the box is on its primary and nothing is forcing it off. `current` was this until
+            # 2026-09-07; cc-loop still wants this question, because a worker dispatched with no --model runs on
+            # CC_WORKER_MODEL and not on whatever the interactive sessions run on.
   if ov; then printf '%s\n' "$model"; elif unavail "$(fam "$PRIMARY")"; then chain_next "$PRIMARY" || true; fi; }
+current(){   # what a dispatch passes as --model, in EVERY state: what forced() says, else the primary itself. A launcher
+             # asks one question — "which model do I start this session on" — and it must always get an answer, or the
+             # session comes up on the harness default and what the box says it is running is not what it is running.
+             # The one empty answer left is the primary being unavailable with nothing after it on the chain: there is
+             # no model to name then, and naming the one the account cannot run would be worse than saying nothing.
+  local m; m=$(forced); [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
+  unavail "$(fam "$PRIMARY")" && return 0   # …and the chain has nothing after it: no model to name, so name none
+  printf '%s\n' "$PRIMARY"; }
 status_line(){   # "fable" | "opus until 11:40Z" | "opus until probe", and " — fable is not available to this account" when it is
-  local s
+  local s mm
   if ov; then s="$(fam "$model") until $([ "$till" -gt 0 ] && untilw "$till" || echo probe)"
   elif unavail "$(fam "$PRIMARY")"; then s=$(fam "$(chain_next "$PRIMARY" || echo -)")
   else s=$(fam "$PRIMARY"); fi
   unavail "$(fam "$PRIMARY")" && s="$s — $(fam "$PRIMARY") is not available to this account"
+  mm=$(mismatches | wc -l)   # …and what is RUNNING, when it is not what the line above says the box dispatches
+  [ "$mm" -gt 0 ] && s="$s — $mm session$([ "$mm" = 1 ] || echo s) on another model"
   printf '%s\n' "$s"; }
 ov(){ model=""; since=0; till=0; reason=""; probed=0   # loads the override; exit 1 = none (the box is on its primary model)
   [ -f "$OV" ] && IFS=$'\t' read -r model since till reason probed < "$OV"
@@ -483,6 +547,9 @@ tick(){
     k=$(answer_prompt "$id") &&
       printf '%s\t%s\tanswered\t%s\t%s: %s limit prompt — %s\n' "$(date -u +%FT%TZ)" "$now" "$pf" "$SESSION:$name" "$(label "$pf")" "$k" >> "$LOG"
   done <<<"$pp"
+  # ---- (4) IN EVERY STATE, AND BEFORE ANY BRANCH BELOW CAN RETURN: say which live sessions are not on the model a
+  # dispatch would name. Report only — the retune pass further down is the one that types, and it is same-family.
+  report_mismatches
   if ov; then   # ---- the fallback is on: restore once the limit has passed AND the primary model answers again
     if [ -s "$ST/model-skipped" ]; then   # F3: panes that were behind a dialog at switch time get another try
       : > "$ST/model-skipped.n"
@@ -560,6 +627,8 @@ selfcheck(){   # fixtures only: no network, no tmux, and none of this box's stat
   local dlg dlg2 dlgwrap notice credits worker quoted perm askfirst pe0 pn pf0
   d=$(mktemp -d) || return 1
   UNAV="$d/model-unavailable"   # hermetic from the first case: a model this box has recorded must not bend the chain here
+  local oldsl="${CC_STATUSLINE_DIR:-}"
+  CC_STATUSLINE_DIR="$d/statusline"; mkdir -p "$CC_STATUSLINE_DIR"   # …and this box's LIVE sessions are not this test's
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   cl(){ classify_run "$1" "" "${2:-}" | cut -f1; }
   real="$d/real.json"; cat > "$real" <<'JSON'
@@ -795,12 +864,31 @@ TXT
   CHAIN="$oldchain"
   # ── A MODEL THIS ACCOUNT CANNOT RUN (2026-09-03): recorded, left out of the chain, and the box moved off it ──────
   # Own state under $d, no tmux at all (no live session is listed here, let alone typed into), a stub cc-notify.
-  local oldlog="$LOG" oldbin="$BIN" oldproc="$PROC"
+  local oldlog="$LOG" oldbin="$BIN" oldproc="$PROC" oldchain2=""
   OV="$d/model-override"; LOG="$d/model.log"; ST="$d"; BIN="$d/bin"; PROC=nonesuch
   rm -f "$UNAV" "$OV" "$d/claude-limit"; : > "$d/calls"; tmux(){ return 1; }
   printf '#!/bin/sh\necho "notify $*" >> "%s/calls"\n' "$d" > "$d/bin/cc-notify"; chmod +x "$d/bin/cc-notify"
   exp=$(chain_next "$PRIMARY"); [ "$(fam "$exp")" = "$(fam "$FALLBACK")" ] && exp="$FALLBACK"   # what do_switch lands on
-  t 'nothing recorded: current names no model, the box is on its primary' "$(current)" ""
+  # ── WHAT A LAUNCH RESOLVES TO (2026-09-07) ──────────────────────────────────────────────────────────────────────
+  # cc and cc-rc build the same one thing out of this file: `m=$(cc-model current); [ -n "$m" ] && --model "$m"`.
+  # So `current` answering nothing is a session launched naming no model at all, which leaves the harness to pick
+  # one — and that was the NORMAL state, not the exceptional one. Both states are asserted here on purpose: the
+  # bug lived in the first, so a case that only covered the fallback state passed all along and proved nothing.
+  launch_args(){ local m; m=$(current); [ -n "$m" ] && printf -- '--model %s' "$m"; return 0; }
+  rm -f "$OV"
+  t 'on its primary, a launch names that primary'          "$(launch_args)" "--model $PRIMARY"
+  t '…and nothing is forcing the box off it, so a worker keeps its own default' "$(forced)" ""
+  do_switch "$FALLBACK" 'a limit moved the box'
+  t 'moved off it, a launch names what it was moved to'    "$(launch_args)" "--model $FALLBACK"
+  t '…and that is what is forcing it, so a worker moves too' "$(forced)"    "$FALLBACK"
+  do_switch "$PRIMARY" 'the limit lifted'
+  t 'and back: the launch names the primary again, not nothing' "$(launch_args)" "--model $PRIMARY"
+  oldchain2="$CHAIN"; CHAIN="$PRIMARY"; note_unavailable "$(fam "$PRIMARY")" 'test'
+  t 'the one answer that is still empty: the account cannot run the primary and the chain ends there' \
+    "$(launch_args)" ""
+  forget_unavailable "$(fam "$PRIMARY")"; CHAIN="$oldchain2"; unset -f launch_args
+  rm -f "$OV"; : > "$LOG"; : > "$d/calls"
+  t 'nothing recorded: nothing is forcing the box off its primary' "$(forced)" ""
   mark_unavailable "$c3" 'Sonnet 5 requires usage credits'
   t 'a model the box is not on is recorded, and nothing is switched or said' \
     "$(unavail "$(fam "$c3")" && echo rec)$([ -e "$OV" ] && echo ov)$(grep -c '^notify' "$d/calls")" rec0
@@ -824,18 +912,54 @@ TXT
   t 'the record alone still steers a dispatch off the primary: an override is a patch, this is the fact' "$(current)" "$exp"
   t 'and status still says so'                    "$(status_line)" "$(fam "$exp") — $(fam "$c1") is not available to this account"
   do_switch "$PRIMARY" 'limit lifted (probe)'   # a probe answered AS the primary, or the owner switched back by hand
-  t 'back on the primary, the record goes: the account can run it again' "$(unavail "$(fam "$c1")" && echo rec)$(current)" ""
+  t 'back on the primary, the record goes and a dispatch aims at it again' "$(unavail "$(fam "$c1")" && echo rec)$(current)" "$PRIMARY"
   t 'and the log says it came back'               "$(grep -c $'\tavailable\tfable\tanswered as itself again' "$LOG")" 1
   do_switch "$c2" 'test'; : > "$d/calls"; mark_unavailable "$c2" 'Opus 5 requires usage credits'
   t 'the override model the box is on can be the one: it moves on down the chain' "$(fam "$(cut -f1 "$OV")")" "$(fam "$c3")"
   t 'and that line names the model it left'       "$(grep -c "^notify -t $(hostname -s) model $(label "$c2") is not available" "$d/calls")" 1
+
+  # ── A DISAGREEMENT BETWEEN WHAT IS CONFIGURED AND WHAT IS RUNNING IS SAID, NEVER ACTED ON ────────────────────
+  # retune_to above is same-family by design, so a session on ANOTHER family was invisible to everything here: on
+  # 2026-09-07 about 31 windows were on the harness default and the box reported none of them. Each case below
+  # builds its own record and asserts both the session that is reported and the one that must not be.
+  rm -f "$OV" "$UNAV" "$CC_STATUSLINE_DIR"/*.json; : > "$LOG"   # the plain state: the box is on its primary
+  slrec(){ printf '{"ts":"x","session_id":"%s","model":"%s","raw":{}}' "$1" "$2" > "$CC_STATUSLINE_DIR/$1.json"
+           touch -d "@$((now - $3))" "$CC_STATUSLINE_DIR/$1.json"; }   # $1 id · $2 model · $3 age in seconds
+  local slold; slold="${PRIMARY%%\[*}"; case "$slold" in *-1) slold="${slold%-1}";; *) slold="$slold-1";; esac
+  slrec agrees "$PRIMARY" 10
+  slrec at-200k "${PRIMARY%%\[*}" 10
+  slrec old-id "$slold" 10
+  slrec elsewhere "$(chain_next "$PRIMARY")" 10
+  slrec quiet "$(chain_next "$PRIMARY")" 900
+  t 'the sessions NOT on the model the box dispatches, and only those' \
+    "$(mismatches | cut -f1 | sort | tr '\n' ' ')" "elsewhere old-id "
+  t '...a record too old to be a live turn is not reported: nobody may be running it any more' \
+    "$(mismatches | grep -c '^quiet')" 0
+  t '...the [1m] suffix is a context knob, not a model (idname), so it is no disagreement' \
+    "$(mismatches | grep -c '^at-200k')" 0
+  t '...but the OLD ID of the primary'"'"'s own family is one, and it is the $140 kind' \
+    "$(mismatches | grep -c "^old-id	$slold\$")" 1
+  t 'status says how many, beside the model the box dispatches'  "$(status_line)" "$(fam "$PRIMARY") — 2 sessions on another model"
+  report_mismatches
+  t 'the log row names the model it is REALLY on, and the one it should have had' \
+    "$(awk -F'\t' '$3=="mismatch" && $5 ~ /^elsewhere/{print $4, $5}' "$LOG")" "$(chain_next "$PRIMARY") elsewhere — this box dispatches $PRIMARY"
+  report_mismatches
+  t '...a disagreement that persists is not re-reported every tick' "$(grep -c $'\tmismatch\t' "$LOG")" 2
+  t '...and it is REPORTED, not acted on: no switch, no override, nothing but the rows' \
+    "$(awk -F'\t' '$3!="mismatch"' "$LOG" | wc -l)$([ -e "$OV" ] && echo ov)" 0
+  slrec elsewhere "$PRIMARY" 10; slrec old-id "$PRIMARY" 10   # back on the primary by themselves, or the owner moved them
+  t 'and when they agree again, status is quiet about it' "$(status_line)" "$(fam "$PRIMARY")"
+  unset -f slrec
+  rm -f "$CC_STATUSLINE_DIR"/*.json
   unset -f tmux; OV="$oldov"; LOG="$oldlog"; ST="$oldst"; BIN="$oldbin"; PROC="$oldproc"; UNAV="$oldunav"
+  if [ -n "$oldsl" ]; then CC_STATUSLINE_DIR="$oldsl"; else unset CC_STATUSLINE_DIR; fi
   rm -rf "$d"
   printf 'cc-model selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
 case "${1:-}" in
   status)  status_line ;;
   current) current ;;
+  forced)  forced ;;
   switch)  do_switch "${2:?usage: cc-model switch <model> [reason]}" "${3:-}" ;;
   limited) [ "$(fam "${2:?usage: cc-model limited <model> [reason]}")" = "$(fam "$PRIMARY")" ] || exit 0
            rate_ok && do_switch "$FALLBACK" "${3:-$(fam "$2") limit}" ;;
@@ -845,6 +969,6 @@ case "${1:-}" in
   next)    chain_next "${2:-}" || exit 1 ;;
   tick)    tick ;;
   selfcheck) selfcheck || exit 1 ;;
-  *) sed -n '2,14p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,21p' "$0" >&2; exit 2 ;;
 esac
 exit 0
