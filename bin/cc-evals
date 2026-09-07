@@ -99,6 +99,21 @@ run_probe(){   # run_probe <case-file> <tree> -> rc from the probe; sets PROBE_O
 # `CC_EVALS_MODEL=claude-sonnet-5 cc-evals run --set capability` puts the same questions to the other model.
 # Env: CC_EVALS_MODEL · CC_EVALS_BUDGET (dollars per question, default 0.50) · CC_EVALS_THINK (MAX_THINKING_TOKENS;
 # unset = the CLI's own default) · CC_EVALS_CLAUDE (which binary — the selfcheck points it at a fake and spends 0).
+#
+# THE WALL. `--tools ""` is what actually leaves this call with nothing, and until 2026-09-06 it was the whole of
+# it — one flag, and what a flag's default does after a harness release is not ours to promise. The two layers
+# below are the same ones cc-brief and cc-secretary carry: the escape hatches named (a probe once reached the shell
+# through `Monitor`, not `Bash`), then the secret stores denied by path. This call is the least exposed of the seven
+# — its prompt is a case file's own fixtures and a template read out of an already-landed commit, and a hostile
+# case file has a shell before it ever reaches here — so this is depth, not a hole being closed. SECRET_PATHS is a
+# COPY of cc-audit's; the selfcheck reads that file and goes red when an entry there is missing here.
+SECRET_PATHS=".cc/config .cc/secrets/** .cc/members/** ccbox/env .ssh/** .claude/.credentials.json .claude.json .config/gh/**"
+DENY="Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree,Read,Grep,Glob,LS"
+# `set -f` is load-bearing, not tidiness: $SECRET_PATHS is word-split on purpose, and four of its entries are
+# globs. cc-evals is normally started from $HOME, where `.cc/members/**` EXPANDS (no globstar, so `**` is `*`)
+# to the member directories that exist at that instant — and the rule then names the directory, leaving the
+# credentials.json inside it undenied. Glob off, the words reach --disallowedTools as written.
+set -f; for _s in $SECRET_PATHS; do DENY="$DENY,Read(/$HOME/$_s),Grep(/$HOME/$_s)"; done; set +f; unset _s
 cmd_ask(){   # ask [--budget N] [--schema <json>] < prompt -> the answer on stdout; rc 2 = no answer
   local model=${CC_EVALS_MODEL:-claude-opus-5} budget=${CC_EVALS_BUDGET:-0.50} schema="" prompt j rc out cl wd
   while [ $# -gt 0 ]; do case $1 in
@@ -109,8 +124,11 @@ cmd_ask(){   # ask [--budget N] [--schema <json>] < prompt -> the answer on stdo
   # --max-turns 3, not 1: the structured-output round trip is not always one turn — Opus with thinking on came back
   # error_max_turns at 1 on questions Sonnet answered first time. There are no tools here, so a further turn can only
   # finish the answer, and what actually bounds a question is the budget cap.
+  # $DENY as well as `--tools ""`: the .ask shim puts the REAL home back for this process (run_probe:68), so
+  # the credentials and the keys are on the other side of one flag otherwise.
   local args=(-p --model "$model" --max-budget-usd "$budget" --max-turns 3 --output-format json
-              --tools "" --setting-sources "" --strict-mcp-config --disable-slash-commands --no-session-persistence)
+              --tools "" --setting-sources "" --strict-mcp-config --disable-slash-commands --no-session-persistence
+              --disallowedTools "$DENY")
   [ -z "$schema" ] || args+=(--json-schema "$schema")
   j=$(mktemp) || return 2; local e; e=$(mktemp) || return 2
   # cwd is a scratch dir OUTSIDE the real home on purpose: a session reads CLAUDE.md from its cwd and upwards, and
@@ -392,19 +410,46 @@ selfcheck(){
 #!/bin/sh
 cat >/dev/null
 echo call >> "$FAKE_CALLS"
+printf '%s\n' "$*" > "$FAKE_ARGV"
 printf '%s\n' "$FAKE_JSON"
 FAKE
   chmod +x "$d/fakeclaude"
   local OK='{"is_error":false,"result":"FAKE-ANSWER","total_cost_usd":0.011}'
   A(){ env CC_EVALS_HOME="$d/state" CC_EVALS_CASES="$d/cases" CC_EVALS_REFS="$d/state/refs" \
-        CC_EVALS_CLAUDE="$d/fakeclaude" FAKE_CALLS="$d/calls" FAKE_JSON="$1" CC_EVALS_METRICS="$d/metrics" \
-        "$RB/cc-evals" "${@:2}" 2>&1; }
+        CC_EVALS_CLAUDE="$d/fakeclaude" FAKE_CALLS="$d/calls" FAKE_ARGV="$d/argv" FAKE_JSON="$1" \
+        CC_EVALS_METRICS="$d/metrics" "$RB/cc-evals" "${@:2}" 2>&1; }
   absent(){ if grep -q "$1" <<<"$2"; then echo 1; else echo 0; fi; }
-  : > "$d/calls"; : > "$d/metrics"
+  : > "$d/calls"; : > "$d/metrics"; : > "$d/argv"
   out=$(A "$OK" ask <<<'a question'); k $? "ask hands back the model's answer"
   k "$(t test "$out" = FAKE-ANSWER)" "…and only the answer"
   k "$(t grep -q 'cost=0.011' "$d/metrics")" "…with the spend appended to the probe's metrics, not left to the case"
   k "$(t test "$(wc -l < "$d/calls")" = 1)" "…asked once"
+  # THE WALL, ON THE ARGV THAT WAS ACTUALLY SENT — a list that is right in the file and never reaches the call is
+  # the same hole. Until 2026-09-06 this call passed no --disallowedTools at all, so `--tools ""` was the whole of
+  # it, and the .ask shim hands the process the REAL home.
+  k "$(t sh -c 'for f in --tools --setting-sources --strict-mcp-config --disallowedTools; do
+                  grep -qF -- "$f" "$1" || exit 1; done' sh "$d/argv")" \
+    "the call carries its whole wall: no tools, no settings file, no MCP server, and the escape hatches named — \`Bash\` alone is not enough, a probe once reached the shell through \`Monitor\`"
+  # THE DRIFT CASE. cc-audit's SECRET_PATHS is the canonical list and is READ from that file, never spelled out
+  # again here: hand-copying it is what left .cc/secrets out of three files and .cc/members out of six. MISSING,
+  # never DIFFERENT — this call may deny more than cc-audit does and may never deny less. A cc-audit that cannot
+  # be read or parsed leaves $cp empty and the case goes RED, because a drift case that has stopped checking must
+  # not report green. The real cc-audit, beside the real cc-evals: $RB is a fixture copy with no siblings.
+  local cp bad s; cp=$(sed -n 's/^SECRET_PATHS="\(.*\)"$/\1/p' "$R/bin/cc-audit" 2>/dev/null)   # $R, not $0: cwd may have moved
+  bad=""; set -f; for s in $cp; do   # set -f: the case reads the same globs the call does, and must not expand them either
+    grep -qF -- "Read(/$HOME/$s)" "$d/argv" && grep -qF -- "Grep(/$HOME/$s)" "$d/argv" || bad="$bad $s"
+  done; set +f
+  k "$(t test -n "$cp" -a -z "$bad")" \
+    "…and every secret store cc-audit denies is denied here too, by path, to Read and to Grep alike${bad:+ — missing:$bad}"
+  k "$(t sh -c '! grep -qF -- "Read(/$1/.cc/state)" "$2"' sh "$HOME" "$d/argv")" \
+    "…and those paths and no others — a case that could not tell a missing one apart proves nothing"
+  # …AND THE LIST SURVIVES THE CWD. The case above runs where nothing matches, so it passed while the loop was
+  # glob-expanding: found in review of #294. Run it where `.cc/members/*` DOES match and the difference shows.
+  mkdir -p "$d/glob/.cc/members/alice" "$d/glob/.cc/secrets"; : > "$d/glob/.cc/secrets/app.pem"
+  : > "$d/argv"; (cd "$d/glob" && A "$OK" ask <<<'q' >/dev/null 2>&1)
+  k "$(t sh -c 'grep -qF -- "Read(/$1/.cc/members/**)" "$2" && ! grep -qF -- "Read(/$1/.cc/members/alice)" "$2"' \
+        sh "$HOME" "$d/argv")" \
+    "…and it is the list, not whatever the working directory held: started beside a real \`.cc/members/alice\`, the rule still reads \`.cc/members/**\` and never the directory it would have expanded to"
   : > "$d/calls"
   out=$(A '{"is_error":false,"result":"prose","structured_output":{"verdict":"LAND"},"total_cost_usd":0}' ask <<<'q')
   k "$(t test "$out" = '{"verdict":"LAND"}')" "a schema answer comes back as the structure, not the prose beside it"

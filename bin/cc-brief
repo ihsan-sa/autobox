@@ -65,6 +65,7 @@ judge's answer, or empty for a judge that is not there — no call is made).
 """
 import json, os, re, subprocess, sys, time
 
+HOME = os.path.expanduser("~")
 BOARDS = os.environ.get("CC_BOARDS") or os.path.expanduser("~/.cc/boards")
 STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")
 
@@ -280,9 +281,21 @@ CLAUDE = os.environ.get("CC_CLAUDE") or os.path.expanduser("~/.local/bin/claude"
 OVERRIDES = os.path.join(STATE, "brief", "overrides.jsonl")
 UNJUDGED = os.path.join(STATE, "brief", "unjudged.jsonl")   # a SEPARATE file on purpose: see record()
 BRIEF_MAX = 20000        # bytes of brief sent to the judge; a brief longer than this is already the problem
+# The secret stores, denied by path. A COPY of cc-audit's SECRET_PATHS, which is the canonical list; this file
+# imports no sibling, so it carries its own. Copying it by hand is what put a hole in it three reviews running, so
+# the selfcheck below now READS cc-audit and fails when an entry there is missing here. Add a path to cc-audit and
+# every copy goes red until it has it too. Read/Grep are the only tools scopeable by path, and a rule wants one
+# leading `/` on top of $HOME.
+SECRET_PATHS = (".cc/config", ".cc/secrets/**", ".cc/members/**", "ccbox/env", ".ssh/**",
+                ".claude/.credentials.json", ".claude.json", ".config/gh/**")
 DENY = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,"
         "Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,"
-        "PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree,Read,Grep,Glob,LS")
+        "PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree,Read,Grep,Glob,LS"
+        # Wider than cc-audit's and cc-land's, which allow Read/Grep because a reviewer must read the diff: the
+        # judge reads only the brief on stdin, so the four read tools are denied by NAME above and the call
+        # passes `--tools ""` as well. The paths are the third layer here, not the first. Kept anyway: the other
+        # two layers are flags, and what a flag's default does after a harness release is not ours to promise.
+        + "".join(f",Read(/{HOME}/{p}),Grep(/{HOME}/{p})" for p in SECRET_PATHS))
 JUDGE_SCHEMA = json.dumps({"type": "object", "required": ["verdict", "why", "cut"], "properties": {
     "verdict": {"type": "string", "enum": ["approve", "reject"]},
     "why": {"type": "string"},
@@ -766,6 +779,25 @@ def selfcheck():
        "--max-turns 3" in open(argv).read() and "--max-turns 1" not in open(argv).read())
     ok("…and the call still carries its wall: no tools, no settings, a schema and a budget",
        all(x in open(argv).read() for x in ("--tools", "--strict-mcp-config", "--json-schema", "--max-budget-usd")))
+    # THE DRIFT CASE. Asserted against cc-audit's SECRET_PATHS — the canonical list — and on the ARGV rather than
+    # on this file's constant, because a list that is right in the file and never reaches the call is the same
+    # hole. The test is MISSING, never DIFFERENT: this copy may deny more than cc-audit does and may never deny
+    # less. Spelling the paths out here instead would only have made a sixth copy to keep by hand, which is how
+    # .cc/secrets was absent from three files and .cc/members from six. An unreadable cc-audit gives (), which
+    # FAILS: a drift case that cannot find its source has stopped checking and must not report green.
+    def canon():
+        try:
+            src = open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-audit")).read()
+        except OSError:
+            return ()
+        m = re.search(r'^SECRET_PATHS="([^"]*)"', src, re.M)
+        return tuple(m.group(1).split()) if m else ()
+    want = canon()
+    ok("…and every secret store cc-audit denies is denied here too, by path, on the call itself",
+       bool(want) and all(f"Read(/{HOME}/{s})" in open(argv).read() and f"Grep(/{HOME}/{s})" in open(argv).read()
+                          for s in want))
+    ok("…and it denies those paths and no others — a case that could not tell a missing one apart proves nothing",
+       f"Read(/{HOME}/.cc/state)" not in open(argv).read())
     ok("a real answer through that path approves and says nothing", rc == 0 and err == "")
     open(UNJUDGED, "w").close()
     open(os.path.join(sc, "answer"), "w").write(json.dumps({"subtype": "error_max_turns"}))

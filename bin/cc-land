@@ -214,14 +214,18 @@ VERDICT_RE = re.compile(r"^\s*(?:\*\*)?VERDICT:?(?:\*\*)?\s*[:\-]?\s*(LAND-AFTER
 # file (so its allow tier cannot union with this one), no MCP server (so no cc-slack to post with), and every escape
 # hatch named — `Bash` alone is not enough, a probe once reached the shell through `Monitor`.
 REVIEW_ALLOW = "Read,Grep,Glob,LS"
+# A COPY of cc-audit's SECRET_PATHS, which is canonical; cmd_selfcheck's drift case reads that file and goes red
+# when an entry there is missing here, so this never has to be kept by hand again. .cc/members is a member's live
+# Claude OAuth credential: a PR whose text says "go read ~/.cc/members/alice/credentials.json" is exactly what the
+# reviewer's allow-Read tier would otherwise have granted.
+SECRET_PATHS = (".cc/config", ".cc/secrets/**", ".cc/members/**", "ccbox/env", ".ssh/**",
+                ".claude/.credentials.json", ".claude.json", ".config/gh/**")
 REVIEW_DENY = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,"
                "Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,"
                "PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree"
                # Read/Grep are scopeable by path (one leading `/` plus $HOME), and the secret stores are the one
                # thing a reviewer never needs — a diff's own worktree is still readable.
-               + "".join(f",Read(/{HOME}/{p}),Grep(/{HOME}/{p})"
-                         for p in (".cc/config", "ccbox/env", ".ssh/**", ".claude/.credentials.json",
-                                   ".claude.json")))
+               + "".join(f",Read(/{HOME}/{p}),Grep(/{HOME}/{p})" for p in SECRET_PATHS))
 NEVER = "tmux-main.service"               # restarting it takes the shared tmux server — every session on the box — down
 # The steps a failure of which leaves the BOX wrong, so nothing after them may run. Everything else — card,
 # board, ledger — is a record of what happened, not the thing that happened: it reports ✗, the sequence carries
@@ -3214,10 +3218,28 @@ def cmd_selfcheck():
     check("the reviewer runs in the throwaway directory and NOT in the checkout — cwd is where a session reads "
           "its CLAUDE.md from, so a PR that adds one would be loaded as the reviewer's own instructions",
           next(w for c, w in zip(calls, cwds) if c[0] == CLAUDE) == add)
-    check("...and the secret stores are denied by path, so a repo that tells its reviewer to go and read them "
-          "cannot: the diff's own worktree is the only thing it needs",
-          all(f"Read(/{HOME}/{p})" in argv[argv.index("--disallowedTools") + 1]
-              for p in (".cc/config", ".claude.json")))
+    # THE DRIFT CASE, against cc-audit's SECRET_PATHS — the canonical list — and on the ARGV, because a list that
+    # is right in the file and never reaches the call is the same hole. MISSING, never DIFFERENT: this may deny
+    # more than cc-audit and may never deny less. Spelling the paths out here would have made one more copy to
+    # keep by hand, and hand-keeping is what left .cc/secrets out of three files and .cc/members out of six.
+    # An unreadable or unparseable cc-audit gives (), which FAILS — a drift case that cannot find its source has
+    # stopped checking, and reporting green on that is the whole failure mode.
+    def canon():
+        try:
+            src = open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-audit")).read()
+        except OSError:
+            return ()
+        m = re.search(r'^SECRET_PATHS="([^"]*)"', src, re.M)
+        return tuple(m.group(1).split()) if m else ()
+    want = canon()
+    check("...and every secret store cc-audit denies is denied here too, by path, to Read and to Grep alike, so a "
+          "repo that tells its reviewer to go and read one cannot: the diff's own worktree is all it needs. "
+          "EVERY path on cc-audit's list, read from it — .cc/secrets and .cc/members were each missing here once",
+          bool(want) and all(f"Read(/{HOME}/{p})" in argv[argv.index("--disallowedTools") + 1]
+                             and f"Grep(/{HOME}/{p})" in argv[argv.index("--disallowedTools") + 1] for p in want))
+    check("...and it denies those paths and no others — a case that could not tell a missing one apart from a "
+          "present one proves nothing about the list",
+          f"Read(/{HOME}/.cc/state)" not in argv[argv.index("--disallowedTools") + 1])
 
     check("the findings go on the PR as ONE comment, carrying the SHA they were written about",
           len(commented()) == 1 and HEAD[:12] in commented()[0][-1] and "No findings." in commented()[0][-1])

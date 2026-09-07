@@ -368,7 +368,11 @@ collect_patterns(){   # what the Slack failure-pattern pass reads. Claude's evid
     "(cc-slack thread <chan> <ts>) could not be collected: per-thread latency is a known gap here. Judge an" \
     "unanswered thread from the transcript order instead, and say when you are unsure." > "$EV/10-gaps.txt"
 }
-scrub(){ sed -ri 's/xox[bapesr]-[A-Za-z0-9-]{6,}/[redacted-token]/g' "$EV"/* 2>/dev/null; }   # no secret ever reaches the LLM's evidence
+# No secret ever reaches the LLM's evidence — and the evidence is Slack history, notify.log and track journals,
+# any of which can carry a token somebody echoed. The shapes are a COPY of cc-secretary's SECRET, which is
+# canonical; the selfcheck reads that file and goes red on a shape it redacts and this does not. It matched xox-
+# alone, so a `ghs_` installation token — the one cc-gh-token mints every hour — went through.
+scrub(){ sed -ri 's/xox[abpesr]-[A-Za-z0-9-]{6,}|gh[posru]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,}/[redacted-token]/g' "$EV"/* 2>/dev/null; }
 
 # ---- the LLM passes: no Bash, no writes, evidence-only ----
 AREAS=(core slack ccbox boot)
@@ -391,9 +395,15 @@ esac; }
 # read ~/.cc/config gets "Permission to read … has been denied" from Read AND from Grep.
 ALLOW="Read,Grep,Glob,LS"
 DENY="Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree"
-for s in "/$HOME/.cc/config" "/$HOME/.ssh/**" "/$HOME/.claude/.credentials.json" "/$HOME/.claude.json"; do
-  DENY="$DENY,Read($s),Grep($s)"   # secrets: reachable by Read otherwise, and the audit never needs them
-done
+# THE CANONICAL LIST. cc-brief, cc-land, cc-secretary, cc-steward, cc-evals and cc-voice each keep a copy, because
+# each of those files stands alone and imports no sibling — and a hand-copied list is how this one lost .cc/secrets
+# in three files and .cc/members in six, each found by a person in a separate paid review. It is not hand-kept any
+# more: every copy's selfcheck READS THIS LINE and fails when an entry here is missing there, so a path added here
+# and nowhere else is a red gate. Keep the assignment on one line and quoted — that is what those cases parse.
+SECRET_PATHS=".cc/config .cc/secrets/** .cc/members/** ccbox/env .ssh/** .claude/.credentials.json .claude.json .config/gh/**"
+set -f; for s in $SECRET_PATHS; do   # set -f: four entries are globs, and this loop word-splits on purpose. Nothing
+  DENY="$DENY,Read(/$HOME/$s),Grep(/$HOME/$s)"   # matches from $R, so this file was safe by accident; cc-evals was not.
+done; set +f
 LLM_COST=0
 POSTPONED=""
 dur(){ local s=${1:-0}; if [ "$s" -lt 90 ]; then printf '%ss' "$s"; else printf '%sm %ss' $((s/60)) $((s%60)); fi; }   # how long it ran, in the report: the only cost signal this mode has
@@ -764,6 +774,73 @@ S
   SCOPE=slack
   sck "$(tf grep -qF 'SCOPE `slack` AND NOTHING ELSE' <<<"$(arch_prompt none)")" "arch --scope: the prompt says which scope it is running"
 
+
+  # 7b. THE WALL AROUND THE LLM PASSES — the deny list and the scrub. Both were short here: ~/.cc/secrets (this
+  # box's GitHub App key and the ghs_ installation tokens cc-gh-token caches beside it) and ~/.cc/members (a
+  # member's live Claude OAuth credential, mode 600, minted by `cc-sandbox mint`) were on no deny list, and scrub
+  # matched Slack tokens only. Asserted here so a path or a token shape going missing is a red gate.
+  # THIS FILE HOLDS THE CANONICAL PATH LIST, so its own case SPELLS THE PATHS OUT: a case that asserted
+  # $SECRET_PATHS against the list that built it would go green when somebody empties the list, which is the bug
+  # it is here for. The copies do the opposite — they read this file. Both halves are needed: this anchors the
+  # content, theirs anchor the spread.
+  local s
+  for s in '.cc/config' '.cc/secrets/**' '.cc/members/**' 'ccbox/env' '.ssh/**' '.claude/.credentials.json' '.claude.json' '.config/gh/**'; do
+    sck "$(tf grep -qF -- "Read(/$HOME/$s)" <<<"$DENY")" "deny: Read(/\$HOME/$s) — the LLM passes allow Read, so a path off this list is readable"
+    sck "$(tf grep -qF -- "Grep(/$HOME/$s)" <<<"$DENY")" "deny: …and Grep(/\$HOME/$s) — denied to one tool and not the other is not denied"
+  done
+  sck "$(ntf grep -qF -- "Read(/$HOME/.cc/state)" <<<"$DENY")" "deny: the evidence dir under ~/.cc/state is still readable — this is a list of paths, not a blanket"
+
+  local T36 sd; T36=a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1; sd="$d/scrub"; mkdir -p "$sd"; EV="$sd"
+  { echo "slack xoxb-123456-abcdef"; echo "installation ghs_$T36"; echo "classic ghp_$T36"
+    echo "fine-grained github_pat_$T36"; echo "anthropic sk-ant-api03-$T36"; echo "not a token ghx_$T36"; } > "$sd/01-ev.txt"
+  scrub
+  sck "$(ntf grep -q 'xoxb-123456' "$sd/01-ev.txt")" "scrub: a Slack token never reaches the evidence the model reads"
+  sck "$(ntf grep -q "ghs_$T36" "$sd/01-ev.txt")" "scrub: nor a ghs_ installation token — the shape this box mints hourly, and the one the pattern missed"
+  sck "$(ntf grep -q "ghp_$T36" "$sd/01-ev.txt")" "scrub: nor a ghp_ personal token"
+  sck "$(ntf grep -q "github_pat_$T36" "$sd/01-ev.txt")" "scrub: nor a fine-grained github_pat_"
+  sck "$(ntf grep -q "sk-ant-api03-$T36" "$sd/01-ev.txt")" "scrub: nor an Anthropic key"
+  sck "$(tf grep -q "ghx_$T36" "$sd/01-ev.txt")" "scrub: …while ghx_ is left alone — the pattern is the token prefixes, not everything starting \`gh\`"
+  sck "$(tf grep -q 'redacted-token' "$sd/01-ev.txt")" "scrub: and what it took out says so, rather than vanishing"
+
+  # …AND THE SHAPES ABOVE ARE A COPY. cc-secretary's SECRET is the canonical set — that file reads a tmux pane, the
+  # widest untrusted surface on the box — and this pattern is that one character for character. So the case READS
+  # cc-secretary and asks only whether everything it redacts is redacted here too: this may be stricter and can
+  # never be looser. Judged by WHAT IT MATCHES and not by how it is spelled, so `{20,}` beside `{22,}` is not
+  # called drift. A cc-secretary it cannot read, or an alternative the sampler cannot build, writes a line scrub
+  # leaves alone and the case goes RED — a drift case that has stopped checking must not report green.
+  local sib; sib="$R/bin/cc-secretary"   # off $R, not $0: the cd on line 46 has happened, so a relative $0 no longer resolves
+  python3 - "$sib" > "$sd/02-shapes.txt" 2>/dev/null <<'PY' || echo 'SAMPLER-FAILED' > "$sd/02-shapes.txt"
+import ast, re, sys      # the strings worth trying against each alternative of cc-secretary's SECRET.
+def sample(alt):         # Same sampler as cc-steward's: a short class is EXPANDED, one string per member,
+    outs, i = [""], 0    # because the prefix alphabets (xox[abpesr], gh[posru]_) are where these drift.
+    while i < len(alt):
+        if alt[i] == "[":
+            j = alt.find("]", i + 2)
+            if j < 0 or alt[i + 1] == "^": return []
+            body, i = alt[i + 1:j], j + 1
+            chs = list(body) if len(body) <= 8 and "-" not in body else [body[0]]
+        elif alt[i] in "()|.*+?{\\": return []
+        else: chs, i = [alt[i]], i + 1
+        q = re.match(r"\{(\d+),?\d*\}", alt[i:])
+        n = int(q.group(1)) if q else 1
+        i += q.end() if q else 0
+        outs = [o + c * n for o in outs for c in chs]
+    return outs
+pat = ""
+for node in ast.walk(ast.parse(open(sys.argv[1]).read())):
+    if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "SECRET":
+        pat = node.value.args[0].value
+alts = [a for a in str(pat).split("|") if a]
+if not alts:
+    sys.exit(1)
+for a in alts:
+    ss = sample(a)
+    if not ss or not all(re.fullmatch(a, s) for s in ss): sys.exit(1)
+    for s in ss: print(s)
+PY
+  scrub
+  sck "$(tf sh -c 'test -s "$1" && ! grep -qv "^\[redacted-token\]$" "$1"' sh "$sd/02-shapes.txt")" \
+    "scrub: every token shape cc-secretary redacts is redacted here too — this pattern is that file's, copied, and a shape added there and not here reaches the model whole"
 
   # 8. THE MAIN-GATE ROW. Driven through the REAL cc-board — a stub would only prove this function talks to a stub —
   # against a throwaway $HOME, so every write lands in $d and the box's own board is never touched. `local HOME` is
