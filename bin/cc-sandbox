@@ -49,7 +49,9 @@
 #     #alerts, an -updates lane, a name in routes.json). Then `mint`; the Slack channel pair stays the daemon's.
 # INSIDE rw: the track worktree · the parent repo's .git (the worktree's .git is a pointer into it), with .git/config and
 #   .git/hooks held ro — the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks (cc-loop), and a
-#   worker must not re-point its hooksPath or its remotes, nor write a hook the host would run ·
+#   worker must not re-point its hooksPath or its remotes, nor write a hook the host would run. Those two, and every other
+#   source in a tree this list hands the worker rw, are bound BY DESCRIPTOR and not by name (see `pin`, and the paragraph
+#   in `build`): `.git` is the worker's to write, so `config` and `hooks` are names inside it ·
 #   ~/.cc/state/<repo>/<track> · ~/.npm · ~/.cache · /tmp · a private ~/.claude with settings ro, this cwd's
 #   transcripts and the repo's memory rw, nothing else of it · a COPY of ~/.claude.json with every other project's history
 #   and the MCP servers stripped (Slack stops loading: workers do not post).
@@ -185,13 +187,39 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   mkdir -p "$proj" "$mem" "$H/.npm" "$H/.cache" "$H/.cc/boards" "$st"
   B=(--die-with-parent --unshare-pid
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
-     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
-     --bind "$wt" "$wt" --bind "$dev/.git" "$dev/.git" --ro-bind "$dev/.git/config" "$dev/.git/config"
-     --bind "$st" "$st" --ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
+     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H")
+  # THE WORKER'S SOURCES ARE DESCRIPTORS TOO — the same wall as the member boundary's, not a second one (see `pin`).
+  # Six sit in a tree this list hands the worker READ-WRITE. The parent `.git` is rw by design (BREAKS INSIDE, above),
+  # so `config` and `hooks` — the two held READ-ONLY precisely because the host's own checkpoint runs git in that repo —
+  # are names inside a directory the worker writes; the worktree, the track state and the two claude dirs are rw as well.
+  # Named, each is resolved a second time by mount(2): what a worker leaves at one of those names is what the NEXT launch
+  # mounts, and what a process racing this one puts there is what THIS launch mounts.
+  # MEASURED BEFORE IT WAS CHANGED, because a wall nobody can climb is not worth the code. Today a live worker cannot
+  # swap any of these itself, and not one of the reasons is a decision made here: bwrap binds each source ONTO ITS OWN
+  # NAME, so the name is a MOUNTPOINT inside and renaming it is EBUSY (`mv .git/config .git/cfgx` → Device or resource
+  # busy); a symlink left at one of them kills the launch, because this bwrap version will not resolve a bind DEST
+  # through a link; and `unshare -Urm`, which would drop the mount and free the name, is Operation not permitted in
+  # here. Bind a source anywhere but its own name, or leave a name absent at launch, and all three stop applying —
+  # `[ -d "$dev/.git/hooks" ] &&` was the second of those and is gone below. The pin is the decision, stated once.
+  # ORDER IS MOUNT ORDER: $H is a tmpfs above, so every path under it is pinned after that line, `.git` before what
+  # sits in it.
+  pinq --bind "$wt"
+  pinq --bind "$dev/.git"
+  pinq --ro-bind "$dev/.git/config"
+  # …and hooks is MADE here rather than tested for, so the pin is unconditional. `[ -d ] &&` was a name test that
+  # skipped quietly: a repo without the directory left the name free for a worker to take, and the next launch bound
+  # whatever it found there — or, the link spelling, refused to start with a bwrap message naming neither cause nor cure.
+  mkdir -p "$dev/.git/hooks" 2>/dev/null   # the host's checkpoint runs hooks: none of them may be the worker's
+  pinq --ro-bind "$dev/.git/hooks"
+  pinq --bind "$st"; pinq --bind "$proj"; pinq --bind "$mem"
+  B+=(--ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
      --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin"
-     --bind "$proj" "$proj" --bind "$mem" "$mem"
-     --unsetenv TMUX --unsetenv TMUX_PANE --unsetenv SSH_AUTH_SOCK --unsetenv DOCKER_HOST --unsetenv CLAUDE_CODE_OAUTH_TOKEN --chdir "$wt")
-  [ -d "$dev/.git/hooks" ] && B+=(--ro-bind "$dev/.git/hooks" "$dev/.git/hooks")   # the host's checkpoint runs hooks: none of them may be the worker's
+     --unsetenv TMUX --unsetenv TMUX_PANE --unsetenv SSH_AUTH_SOCK --unsetenv DOCKER_HOST --unsetenv CLAUDE_CODE_OAUTH_TOKEN
+     --unsetenv CC_SANDBOX_TEST_DELAY --chdir "$wt")
+  # STILL BOUND BY NAME, and why: every source below, and settings_bind's copy, is host-owned with a PARENT no sandbox on
+  # this box can reach, so there is no name here for a walled-off session to redefine. ~/.cc/members/<h>/board is the
+  # near miss — a member writes its CONTENTS (it is their ~/.cc/boards) but never sees the directory above it, so the
+  # name is the host's. Refusing every worker launch because one member's board directory looks odd is the worse trade.
   for f in "$H"/.cc/members/*/board; do [ -d "$f" ] && B+=(--ro-bind "$f" "$f"); done   # ~/.cc/boards/<h>.json is a link in here (board_dir): ro, it resolves, and a worker writes no member's board
   settings_bind "$H/.cc/sandbox/$1/$2"   # ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
@@ -200,8 +228,10 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
 launch(){   # $1 repo · $2 track · the rest is the command
   local wt="$H/.cc/worktrees/$1/$2" cred="$H/.claude/.credentials.json" tok="" exp left
-  build "$1" "$2"; shift 2
+  # AHEAD OF build, not after it: build pins the worktree now, and a track that was never created is a plain mistake
+  # that deserves its own sentence rather than pin's "that is not the path it should be".
   [ -d "$wt" ] || { echo "cc-sandbox: no worktree $wt" >&2; exit 2; }
+  build "$1" "$2"; shift 2
   tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred" 2>/dev/null) || tok=""
   if [ -z "$tok" ]; then echo "cc-sandbox: no access token in $cred — claude inside will not authenticate" >&2
   else exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred" 2>/dev/null); left=$(( ${exp:-0} / 1000 - $(date +%s) ))
@@ -209,6 +239,10 @@ launch(){   # $1 repo · $2 track · the rest is the command
   # fd 3: the ~/.claude.json copy — BUILT FROM A WHITELIST (projects, mcpServers), never the file minus a mask: Claude Code keeps
   #       oauthAccount (the owner's email) and userID at the top level, and a mask copied them inside (review-156e)
   #       fd 4: the credentials copy — claudeAiOauth minus its refresh token, nothing else of the file
+  # THE WINDOW BETWEEN THE PINS AND THE MOUNT, WIDENED ON DEMAND — the same knob launch_member uses, for the same reason:
+  # a race case that has to hit a microsecond is a case that passes by luck, and one that passes by luck cannot go red.
+  # A NUMBER, never a command, and only ever set on the host — build --unsetenv's it, so nothing inside carries it on.
+  case "${CC_SANDBOX_TEST_DELAY:-}" in ''|*[!0-9.]*) ;; *) sleep "$CC_SANDBOX_TEST_DELAY";; esac
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
@@ -229,10 +263,11 @@ board_dir(){   # $1 handle — THE BOARD IS ONE FILE ON BOTH SIDES. ~/.cc/boards
       ln -sfn "$bd/$f" "$src.ln.$$" && mv -Tf "$src.ln.$$" "$src" ) || :
   done; :; }
 pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen inside, default $2] → an fd-pinned bind, or 1
-  # A BIND SOURCE IS NOT A NAME. bwrap resolves its sources at mount time, in the host's namespace, and the git paths
-  # below sit in trees the member holds read-write — so a name there is a promise a member can break, three ways, all
-  # three measured on this box: plant a symlink at it and the mount follows; rename a parent so it resolves somewhere
-  # else; or, from a SECOND live session of the same handle, swap it between the host's check and bwrap's mount. A
+  # A BIND SOURCE IS NOT A NAME. bwrap resolves its sources at mount time, in the host's namespace, and BOTH boundaries
+  # hand their session trees that hold some of those sources read-write (build_member: the workspace and its git dir;
+  # build: the worktree and the parent `.git`) — so a name there is a promise the walled-off side can break, three ways,
+  # all three measured on this box: plant a symlink at it and the mount follows; rename a parent so it resolves somewhere
+  # else; or, from a SECOND live session, swap it between the host's check and bwrap's mount. A
   # launch lock does not close the third — the attacker is a session that is already running — and a fourth name check
   # would not either, because whatever is checked gets resolved again by mount(2). So the host OPENS the object here,
   # confirms the descriptor is still the path it asked for, and hands bwrap /proc/self/fd/<n>: no name is resolved a
@@ -254,7 +289,7 @@ pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen ins
   { exec {fd}<"$p"; } 2>/dev/null || return 1
   [ "$(readlink "/proc/self/fd/$fd" 2>/dev/null)" = "$p" ] || { exec {fd}<&-; return 1; }
   B+=("${flag}-fd" "$fd" "$tgt"); return 0; }
-pinq(){ pin "$@" || { echo "cc-sandbox: $2 is not the path it should be — a link, a rename, or a swap by another session of this workspace. Nothing was bound and nothing started; put the real path back." >&2; exit 2; }; }
+pinq(){ pin "$@" || { echo "cc-sandbox: $2 is not the path it should be — a link, a rename, or a swap by another live session. Nothing was bound and nothing started; put the real path back." >&2; exit 2; }; }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
   local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
@@ -1071,7 +1106,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
   rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
-  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out want
+  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out want rc c
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   g(){ sed -n "s/^$1=//p" <<<"$out" | head -1; }
@@ -1098,7 +1133,8 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     echo tok=${CLAUDE_CODE_OAUTH_TOKEN:+set}; echo cj=$(jq -r "(.projects|length),(.mcpServers|length)" ~/.claude.json | tr "\n" ","); echo cjkeys=$(jq -r "keys|join(\",\")" ~/.claude.json); echo settings=$(touch ~/.claude/settings.json 2>/dev/null && echo writable || echo ro)
     echo tmp=$(touch /tmp/x && echo ok); echo runuser=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)
     echo mboard=$(~/bin/cc-board get '"$mb"' t status 2>/dev/null); echo mwrite=$(~/bin/cc-board status '"$mb"' t done >/dev/null 2>&1 && echo wrote || echo refused)
-    echo plant=$(ln -sfn ~/.claude/settings.json ~/.cc/boards/planted.json 2>/dev/null && echo planted || echo ro)' 2>&1)
+    echo plant=$(ln -sfn ~/.claude/settings.json ~/.cc/boards/planted.json 2>/dev/null && echo planted || echo ro)
+    echo leakfds=$(ls -l /proc/self/fd 2>/dev/null | sed -n "s|.* -> ||p" | grep -c "^$HOME/")' 2>&1)
   want='[false,false,0]'; jq -e '.claudeAiOauth.accessToken' "$H/.claude/.credentials.json" >/dev/null 2>&1 && want='[true,false,1]'   # the real file has one → the copy has it, no refresh token, nothing else
   t 'credentials: a stripped copy, mode 600' "$(g cred)" "${want}600";  t 'config/gh absent' "$(g gh)" absent;  t 'ccbox absent' "$(g ccbox)" absent;  t '.git/hooks is ro' "$(g hooks)" ro
   t 'cc/config absent' "$(g ccconfig)" absent;  t 'ssh absent' "$(g ssh)" absent;  t 'the container socket absent' "$(g sock)" absentabsent
@@ -1116,6 +1152,39 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # the owner's settings.json. cc-board refuses the link too; this is the bind that stops it being written at all.
   t 'nothing can be planted in ~/.cc/boards: the directory is ro, so a link there for the host to save through cannot be made' \
     "$(g plant)/$([ -e "$H/.cc/boards/planted.json" ] && echo left || echo none)" ro/none
+  t 'not one of the pinned descriptors reaches the session — an inherited directory fd walks out of the namespace' "$(g leakfds)" 0
+  # ── A BIND SOURCE IS NOT A NAME, ON THIS SIDE TOO (build, and `pin`) ────────────────────────────────────────────
+  # The parent `.git` is the worker's to write, so `config` and `hooks` — the two the host holds READ-ONLY because its
+  # own checkpoint runs git in that repo — are names inside a directory the worker writes. Each shape below is driven,
+  # not argued, and each was measured against the same file with only the pins turned back into names: the link ones
+  # gave a bwrap message naming neither cause nor cure, and the race handed the session the racer's directory.
+  mkdir -p "$dev/decoydir"; : > "$dev/decoyfile"   # a link is only worth testing where it RESOLVES: pin's liveness test follows one
+  for c in .git/config .git/hooks; do
+    mv "$dev/$c" "$dev/$c.real"
+    case "$c" in */config) ln -sfn "$dev/decoyfile" "$dev/$c";; *) ln -sfn "$dev/decoydir" "$dev/$c";; esac
+    out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+    t "a link planted at $c stops the launch, and binds nothing" \
+      "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'is not the path it should be' <<<"$out")" 2/0/1
+    rm -f "$dev/$c"; mv "$dev/$c.real" "$dev/$c"
+  done
+  # …and the wall is there even when git's own directory is not: `[ -d ] &&` skipped the bind quietly, which left the
+  # name free for the worker to take and the NEXT launch mounting whatever it found. It is made now, so the pin is
+  # unconditional. `mkdir -p` inside is the test: on a name-bound build it succeeds and the touch after it writes.
+  mv "$dev/.git/hooks" "$dev/.git/hooks.gone"
+  out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo hooks=$(mkdir -p ~/dev/'"$r"'/.git/hooks 2>/dev/null; touch ~/dev/'"$r"'/.git/hooks/x 2>/dev/null && echo writable || echo ro)' 2>&1)
+  t 'a repo with no .git/hooks gets the ro wall all the same — the name is never left free' "$(g hooks)" ro
+  rm -rf "$dev/.git/hooks"; mv "$dev/.git/hooks.gone" "$dev/.git/hooks"
+  # THE SWAP, DRIVEN. A second process — here the test, on a real box the host's own git or a sibling track, both of
+  # which reach these names — renames the source aside and puts its own directory at that name inside the window
+  # CC_SANDBOX_TEST_DELAY opens between the pins and the mount. A rename is the shape that decides it: a link only kills
+  # the launch (above), while a rename leaves the destination valid and the source pointing at the racer's directory.
+  for c in "the track worktree:$wt" "the parent .git/hooks:$dev/.git/hooks"; do
+    ( sleep 0.4; mv "${c#*:}" "${c#*:}.real" 2>/dev/null && mkdir -p "${c#*:}" && : > "${c#*:}/decoy-swapped"
+      sleep 1.4; rm -rf "${c#*:}"; mv "${c#*:}.real" "${c#*:}" 2>/dev/null ) &
+    out=$(CC_SANDBOX_TEST_DELAY=1 CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo RAN=yes; ls -A '"${c#*:}"' 2>/dev/null' 2>&1); wait
+    t "a process swapping ${c%%:*} DURING the launch never reaches the mount — the descriptor was already the real one" \
+      "$(g RAN)/$(grep -c decoy-swapped <<<"$out")" yes/0
+  done
   # OFF: nothing changes — argv byte for byte, the environment untouched
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
