@@ -1,0 +1,499 @@
+#!/usr/bin/python3 -IS
+# Milestone 4: offline checks, object-only installation and one expected-old ref update.
+# usage: cc-member-import import <task> <transfer> | selfcheck
+# Incomplete work areas are retained. No live launcher selects this command.
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import runpy
+import select
+import stat
+import struct
+import subprocess as sp
+import sys
+import time
+import uuid
+import zlib
+
+BIN = Path(__file__).resolve().parent
+USAGE = "usage: cc-member-import import <task> <transfer> | selfcheck"
+PAYLOAD, OUTPUT, OBJECTS, EXPANDED = 1048576, 1048576, 10000, 64 * 1048576
+WALL, MEMORY, FILE_SIZE, ENTRIES, PATH_SIZE = 20.0, 256 * 1048576, 72 * 1048576, 100000, 4096
+# One `cat-file` pass reads BATCH object IDs; RECORD is the per-object header and trailing newline the
+# batch output adds on top of the object itself. KINDS is every kind `cat-file --batch-check` may name.
+BATCH, RECORD, KINDS = 2048, 128, (b"blob", b"tree", b"commit", b"tag")
+ENV = dict(PATH="/usr/bin:/bin", HOME="/nonexistent", LANG="C", GIT_CONFIG_NOSYSTEM="1",
+           GIT_CONFIG_GLOBAL="/dev/null", GIT_TERMINAL_PROMPT="0", GIT_EXEC_PATH="/nonexistent",
+           GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1")
+GIT = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+       "-c", "protocol.allow=never", "-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true"]
+# The checking process handles the member's bytes, so it picks neither the refusal class nor its words.
+# Its stdout may only select one of these; the host writes the reason that reaches the log and the queue.
+CHECKED = {"quiet": "the submission failed an offline check",
+           "never": "newly added name matches staged-name policy"}
+UNKNOWN = "the checking process reported an unrecognised refusal"
+
+
+class Refused(ValueError):
+    def __init__(self, reason, kind="quiet"):
+        super().__init__(reason)
+        self.kind = kind
+
+
+def require(ok, reason, kind="quiet"):
+    if not ok:
+        raise Refused(reason, kind)
+
+
+def bounded(argv, *, data=b"", env=ENV, pass_fds=(), seconds=WALL):
+    # Drain both pipes together, and feed stdin from the SAME loop, before waiting. Neither a full pipe nor a
+    # silent child escapes the bound — and a caller may hand over more than one pipe buffer (a `cat-file` list
+    # of object IDs) without the two sides blocking on each other. Writes are one PIPE_BUF at a time, which is
+    # exactly what select() reporting the pipe writable promises will go through.
+    with sp.Popen([str(a) for a in argv], stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE,
+                  cwd="/", env=env, pass_fds=pass_fds) as child:
+        until, result = time.monotonic() + seconds, {child.stdout: b"", child.stderr: b""}
+        try:
+            # An offset over one view of the data, never a fresh tail slice: a caller hands this 64 MiB of
+            # object body, and re-slicing what is left on every write made that quadratic and hit the deadline.
+            pending, view, sent = list(result), memoryview(data), 0
+            if sent == len(view):
+                child.stdin.close()
+            while pending or sent < len(view):
+                left = until - time.monotonic()
+                require(left > 0, "process deadline exceeded")
+                more = [child.stdin] if sent < len(view) else []
+                ready, sending = select.select(pending, more, [], left)[:2]
+                require(ready or sending, "process deadline exceeded")
+                for stream in sending:
+                    try:
+                        sent += os.write(stream.fileno(), view[sent:sent + select.PIPE_BUF])
+                    except BrokenPipeError:
+                        sent = len(view)   # the child stopped reading; its exit status carries the answer
+                    if sent == len(view):
+                        stream.close()
+                for stream in ready:
+                    part = os.read(stream.fileno(), 65536)
+                    result[stream] += part
+                    require(sum(map(len, result.values())) <= OUTPUT, "process output exceeds limit")
+                    if not part:
+                        pending.remove(stream)
+            child.wait(timeout=max(0.001, until - time.monotonic()))
+            require(child.returncode == 0, "contained or trusted command failed")
+            return result[child.stdout], result[child.stderr]
+        finally:
+            if child.poll() is None:
+                child.kill(); child.wait()
+
+
+def git(gitdir, *args, **options):
+    return bounded(GIT + [f"--git-dir={gitdir}", *args], **options)
+
+
+def pack_limits(raw, width):
+    require(raw[:4] == b"PACK" and len(raw) >= 12 + width, "invalid pack header")
+    version, count = struct.unpack(">II", raw[4:12])
+    require(version in (2, 3) and 0 < count <= OBJECTS, "pack object count exceeds limit")
+    at, expanded = 12, 0
+    for _ in range(count):
+        c = raw[at]; at += 1
+        kind, size, shift = (c >> 4) & 7, c & 15, 4
+        while c & 128:
+            require(shift <= 63, "invalid pack object size")
+            c = raw[at]; at += 1; size |= (c & 127) << shift; shift += 7
+        require(kind in (1, 2, 3, 4, 6, 7) and size <= EXPANDED, "invalid pack object or size")
+        if kind == 6:
+            c = raw[at]; at += 1
+            while c & 128:
+                c = raw[at]; at += 1
+        elif kind == 7:
+            at += width
+        inflater = zlib.decompressobj()
+        body = inflater.decompress(raw[at:], size + 1)
+        require(inflater.eof and len(body) == size, "invalid compressed object")
+        at = len(raw) - len(inflater.unused_data)
+        resolved = size
+        if kind in (6, 7):
+            pos = 0
+            for _ in range(2):
+                resolved, shift = 0, 0
+                while True:
+                    require(shift <= 63, "invalid delta size")
+                    c = body[pos]; pos += 1; resolved |= (c & 127) << shift; shift += 7
+                    if not c & 128:
+                        break
+                require(resolved <= EXPANDED, "delta expanded size exceeds limit")
+        expanded += max(size, resolved)
+        require(expanded <= EXPANDED, "expanded object bytes exceed limit")
+    require(at + width == len(raw), "pack trailing or incomplete bytes")
+
+
+def worker(meta):
+    # Only this entry runs behind bwrap and cc-fence. All paths here are fixed namespace paths.
+    resource.setrlimit(resource.RLIMIT_AS, (MEMORY, MEMORY))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (FILE_SIZE, FILE_SIZE))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    scratch, repo = Path("/scratch"), "/scratch/repo.git"
+    fmt, base = meta["format"], meta["base"]
+    width = len(base) // 2
+    if meta["phase"] == "stage":
+        (scratch / "pack").mkdir()
+        target = scratch / "pack" / ("pack-" + "0" * len(base))
+        with open("/input", "rb") as source, target.with_suffix(".pack").open("xb") as dest:
+            while part := source.read(65536):
+                dest.write(part)
+        git("/nonexistent", "index-pack", "--strict", "--threads=1", f"--object-format={fmt}",
+            "-o", str(target.with_suffix(".idx")), str(target.with_suffix(".pack")))
+        print(json.dumps({"tip": meta["tip"]}), flush=True)
+        return
+    with open("/input", "rb") as stream:
+        raw = stream.read(PAYLOAD + 1)
+    require(len(raw) <= PAYLOAD, "submission exceeds byte limit")
+    header, raw = raw.split(b"\n\n", 1)
+    rows = header.split(b"\n")
+    signature = rows.pop(0)
+    require(signature in (b"# v2 git bundle", b"# v3 git bundle"), "invalid bundle signature")
+    capabilities = [r for r in rows if r.startswith(b"@")]
+    require(not capabilities or signature == b"# v3 git bundle", "v2 capabilities refused")
+    require(capabilities in ([], [b"@object-format=" + fmt.encode()]), "bundle capabilities or format refused")
+    require(fmt == "sha1" or capabilities == [b"@object-format=sha256"], "bundle object format differs")
+    rows = [r for r in rows if not r.startswith(b"@")]
+    require(not any(r.startswith(b"-") for r in rows), "bundle prerequisites are not permitted")
+    require(len(rows) == 1, "bundle must advertise exactly one ref")
+    tip, name = rows[0].split(b" ", 1)
+    require(re.fullmatch(b"[0-9a-f]{" + str(len(base)).encode() + b"}", tip), "invalid bundle tip format")
+    tip = tip.decode()
+    git("/nonexistent", "check-ref-format", name.decode())  # advertised spelling has no other use
+    pack_limits(raw, width)
+    git(repo, "init", "-q", "--bare", "--template=", f"--object-format={fmt}")
+    incoming = Path(repo) / "objects/pack/incoming.pack"
+    incoming.write_bytes(raw)
+    # Index directly: no fetch, remote, checkout, attribute, filter or submodule operation.
+    git(repo, "index-pack", "--strict", "--threads=1", str(incoming))
+    git(repo, "update-ref", "refs/heads/accepted", tip, "0" * len(base))
+    git(repo, "symbolic-ref", "HEAD", "refs/heads/accepted")
+    require(git(repo, "fsck", "--strict", "--full", "--no-reflogs") == (b"", b""), "strict fsck is not clean")
+    require(not any(p.name in ("shallow", "alternates", "http-alternates") or p.suffix == ".promisor"
+                    for p in Path(repo).rglob("*")), "incomplete repository refused")
+    require(git(repo, "cat-file", "-t", tip)[0] == b"commit\n", "tip must be a commit")
+    git(repo, "merge-base", "--is-ancestor", base, tip)
+    ids = git(repo, "rev-list", "--objects", "--no-object-names", "--missing=error", tip)[0].splitlines()
+    require(len(ids) <= OBJECTS, "reachable object count exceeds limit")
+    # ONE `cat-file` PASS PER BLOCK, not two or three execs per object. This namespace has no /etc/ld.so.cache,
+    # so every exec re-searches the library path: a tip of a few thousand small objects — a few hundred KiB
+    # packed, well inside OBJECTS and PAYLOAD — spent the whole contained deadline starting git and came back
+    # refused for TIME with the submission blameless. Blocks keep each capture inside OUTPUT.
+    # The output is still the member's bytes: a record that is not the ID asked for, followed by the kind and
+    # size this pass already recorded for it, refuses. Nothing here indexes into it before it has been checked.
+    sizes, kinds, total = {}, {}, 0
+    for at in range(0, len(ids), BATCH):
+        block = ids[at:at + BATCH]
+        records = git(repo, "cat-file", "--batch-check", data=b"\n".join(block) + b"\n")[0].split(b"\n")
+        require(len(records) == len(block) + 1 and records[-1] == b"", "object catalogue is incomplete")
+        for oid, row in zip(block, records):
+            parts = row.split(b" ")
+            require(len(parts) == 3 and parts[0] == oid and parts[1] in KINDS
+                    and re.fullmatch(b"0|[1-9][0-9]{0,11}", parts[2]), "object catalogue record refused")
+            kinds[oid], sizes[oid] = parts[1], int(parts[2])
+            total += sizes[oid]
+            require(total <= EXPANDED, "reachable expanded bytes exceed limit")
+    trees, roots, entries, walked, at = {}, [], 0, [o for o in ids if kinds[o] in (b"tree", b"commit")], 0
+    while at < len(walked):
+        block, budget = [], 0
+        while at < len(walked) and len(block) < BATCH:
+            cost = sizes[walked[at]] + RECORD
+            if block and budget + cost > OUTPUT // 2:
+                break
+            budget += cost; block.append(walked[at]); at += 1
+        out, cut = git(repo, "cat-file", "--batch", data=b"\n".join(block) + b"\n")[0], 0
+        for oid in block:
+            head = out.find(b"\n", cut)
+            require(head >= 0 and out[cut:head].split(b" ") == [oid, kinds[oid], str(sizes[oid]).encode()],
+                    "object stream record refused")
+            body, cut = out[head + 1:head + 1 + sizes[oid]], head + 2 + sizes[oid]
+            require(cut <= len(out) and out[cut - 1] == 10, "object stream record refused")
+            if kinds[oid] == b"commit":
+                roots.append(body.splitlines()[0].removeprefix(b"tree ").decode())
+                continue
+            names, children = set(), []
+            while body:
+                mode, rest = body.split(b" ", 1); name, rest = rest.split(b"\0", 1)
+                child, body = rest[:width].hex(), rest[width:]
+                # Strict fsck also applies Git's platform name normalization, including .git aliases.
+                require(mode in (b"40000", b"100644", b"100755", b"120000", b"160000"), "tree mode refused")
+                require(name not in (b"", b".", b"..") and b"/" not in name and name not in names,
+                        "tree name refused")
+                names.add(name); entries += 1
+                require(entries <= ENTRIES and len(name) <= PATH_SIZE, "tree entry limit exceeded")
+                children.append((len(name), child if mode == b"40000" else None))
+            trees[oid.decode()] = children
+        require(cut == len(out), "object stream has trailing bytes")
+    pending, depths, visits = [(oid, 0) for oid in roots], {}, 0
+    while pending:
+        oid, depth = pending.pop()
+        if depths.get(oid, -1) >= depth:
+            continue
+        depths[oid] = depth
+        for length, child in trees[oid]:
+            visits += 1
+            require(visits <= ENTRIES and depth + length <= PATH_SIZE, "tree path limit exceeded")
+            if child is not None:
+                pending.append((child, depth + length + 1))
+    added = git(repo, "diff-tree", "-r", "--no-renames", "--no-ext-diff", "--no-textconv", "--diff-filter=A",
+                "--name-only", "-z", base, tip)[0].split(b"\0")
+    require(not any(re.search(meta["secrets"].encode(), name) for name in added if name),
+            "newly added name matches staged-name policy", "never")
+    # No delta reuse; the second indexer receives one complete pack containing only reachable objects.
+    packed = git(repo, "pack-objects", "--revs", "--threads=1", "--window=0", "--no-reuse-delta",
+                 str(scratch / "accepted"), data=(tip + "\n").encode())[0].strip().decode()
+    (scratch / ("accepted-" + packed + ".pack")).rename(scratch / "accepted.pack")
+    print(json.dumps({"tip": tip, "objects": len(ids), "expanded": total, "entries": entries}), flush=True)
+
+
+def entry(meta):
+    try:
+        worker(meta)
+    except Refused as exc:
+        print(json.dumps(dict(refused=str(exc), kind=exc.kind)), flush=True)
+    except (OSError, ValueError, KeyError, IndexError, zlib.error, sp.SubprocessError):
+        print(json.dumps(dict(refused="bundle validation failed", kind="quiet")), flush=True)
+
+
+class Importer:
+    def __init__(self, task, transfer):
+        require(os.environ.get("CC_MEMBER_SANDBOX") != "1", "import is a host operation")
+        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", task), "invalid task ID")
+        require(re.fullmatch(r"[0-9a-f]{32}", transfer), "invalid transfer ID")
+        self.m = runpy.run_path(str(BIN / "cc-member-v2"))
+        self.broker = runpy.run_path(str(BIN / "cc-member-broker"))
+        self.launch = self.m["Launcher"]()
+        # record() checks a ref spelling without discovering a repository in the working directory.
+        self.launch.git = lambda args: git("/nonexistent", *args)
+        self.task, self.transfer, self.fds = task, transfer, []
+
+    def pin(self, path, flags=os.O_RDONLY, directory=False):
+        fd = self.m["opened"](self.launch.vfd, path, flags, directory)
+        self.fds.append(fd)
+        return fd
+
+    def read(self, path):
+        with os.fdopen(self.pin(path)) as source:
+            self.fds.remove(source.fileno())
+            raw = source.read(OUTPUT + 1)
+        require(len(raw) <= OUTPUT, "host record exceeds limit")
+        return json.loads(raw)
+
+    def create(self, parent, name, data, append=False):
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC |
+                     (os.O_APPEND if append else os.O_EXCL), 0o600, dir_fd=parent)
+        with os.fdopen(fd, "wb") as stream:
+            require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "host output must be regular")
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+
+    def contained(self, source, scratch, meta):
+        fds, b = [], ["/usr/bin/bwrap", "--die-with-parent", "--unshare-user", "--unshare-pid",
+                     "--unshare-ipc", "--unshare-uts", "--unshare-net", "--disable-userns",
+                     "--assert-userns-disabled", "--cap-drop", "ALL", "--clearenv"]
+        def mount(fd, target, rw=False):
+            fds.append(fd); b.extend(["--bind-fd" if rw else "--ro-bind-fd", str(fd), target])
+        def installed(path, target):
+            mount(self.launch.pin(Path(path).resolve(strict=True)), target)
+        installed("/usr", "/usr")
+        for name in ("bin", "sbin", "lib", "lib64"):
+            b += ["--symlink", "usr/" + name, "/" + name]
+        b += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/nonexistent"]
+        for name in self.m["ETC"]:
+            installed(Path("/etc", name), "/etc/" + name)
+        installed(BIN / "cc-fence", "/fence")
+        installed(Path(__file__), "/runner.py")
+        mount(source, "/input"); mount(scratch, "/scratch", True)
+        for key, value in ENV.items():
+            b += ["--setenv", key, value]
+        b += ["--chdir", "/", "--", "/fence", "run", "--rw", "/scratch", "--rw", "/dev/null", "--",
+              "/usr/bin/python3", "-IS", "-c",
+              "import json,runpy,sys; runpy.run_path('/runner.py')['entry'](json.load(sys.stdin))"]
+        out, err = bounded(b, pass_fds=fds, data=json.dumps(meta).encode())
+        require(not err, "checking process produced diagnostics")
+        answer = json.loads(out)
+        require(isinstance(answer, dict), "checking process produced no record")
+        if "refused" in answer:
+            kind = answer.get("kind")
+            require(kind in CHECKED, UNKNOWN)   # quiet, and the status log still gets the event
+            raise Refused(CHECKED[kind], kind)
+        tip = answer.get("tip")
+        require(isinstance(tip, str) and re.fullmatch(r"[0-9a-f]{" + str(len(self.r["base"])) + "}", tip),
+                "invalid checked tip")
+        # The record the host keeps is BUILT HERE, key by key, the same way the refusal path above takes only a
+        # class name out of CHECKED. run() splats it into the status event, so a process the member's bytes have
+        # shaped would otherwise pick the event's fields and their text: a key of its own choosing collides with
+        # one of run()'s and kills the importer after promote() has already moved the ref, and a key that does not
+        # collide writes its wording into status.jsonl, into the broker's projection and onto stdout.
+        record = {"tip": tip}
+        for key, cap in (("objects", OBJECTS), ("expanded", EXPANDED), ("entries", ENTRIES)):
+            value = answer.get(key)
+            if type(value) is int and 0 <= value <= cap:   # not bool, not a string that formats like one
+                record[key] = value
+        return record
+
+    def recent(self):
+        try:
+            fd = self.pin(f"state/{self.task}/status.jsonl")
+        except FileNotFoundError:
+            return []
+        with os.fdopen(fd, "rb") as stream:
+            self.fds.remove(fd)
+            size = stream.seek(0, 2); stream.seek(max(0, size - 65536))
+            if size > 65536:
+                stream.readline()
+            return [json.loads(line) for line in stream.read().splitlines()]
+
+    def promote(self, checked, stage, bare):
+        tip, base = checked["tip"], self.r["base"]
+        ref, gitdir = f"refs/member/{self.task}", f"/proc/self/fd/{bare}"
+        try:
+            accepted = self.read(f"state/{self.task}/accepted.json")
+            require(all(accepted["binding"][k] == v for k, v in self.r.items() if k != "generation"),
+                    "accepted task binding changed", "never")
+            require(accepted["transfer"] != self.transfer, "transfer already accepted")
+            expected = accepted["tip"]
+            require(re.fullmatch(r"[0-9a-f]{" + str(len(base)) + "}", expected), "invalid accepted record")
+        except FileNotFoundError:
+            expected = "0" * len(base)
+        packdir = self.pin(f"repos/{self.r['project']}.git/objects/pack", os.O_RDONLY, True)
+        opts = dict(pass_fds=(bare,))
+        require(git(gitdir, "rev-parse", "--is-bare-repository", **opts)[0] == b"true\n", "host repository must be bare")
+        require(git(gitdir, "rev-parse", "--show-object-format", **opts)[0].strip().decode() ==
+                ("sha1" if len(base) == 40 else "sha256"), "host object format differs")
+        receipt = dict(binding=self.r, tip=tip, transfer=self.transfer)
+        next_name = "accepted.next." + uuid.uuid4().hex
+        self.create(self.launch.lock, next_name, self.broker["encoded"](receipt))
+        try:
+            # The alternate contains only the second process's pack and index, never quarantine administration.
+            # Prepare locks the ref with the expected old value BEFORE installation (catalogue row 25).
+            env = dict(ENV, GIT_ALTERNATE_OBJECT_DIRECTORIES=f"/proc/self/fd/{stage}")
+            with sp.Popen(GIT + [f"--git-dir={gitdir}", "update-ref", "--stdin"], env=env, cwd="/",
+                          pass_fds=(bare, stage), stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE, bufsize=0) as tx:
+                def step(command, answer):
+                    tx.stdin.write(command.encode()); tx.stdin.flush()
+                    require(select.select([tx.stdout], [], [], WALL)[0]
+                            and tx.stdout.readline(256) == answer, "ref compare-and-swap refused", "never")
+                installed = None   # the member's pack is in the host repository and no ref names it yet
+                try:
+                    step(f"start\nupdate {ref} {tip} {expected}\nprepare\n", b"start: ok\n")
+                    require(select.select([tx.stdout], [], [], WALL)[0]
+                            and tx.stdout.readline(256) == b"prepare: ok\n", "ref compare-and-swap refused", "never")
+                    installed = "pack-" + (uuid.uuid4().hex * 2)[:len(base)]
+                    for suffix in ("pack", "idx"):
+                        fd = self.m["opened"](stage, f"pack/pack-{'0' * len(base)}.{suffix}", os.O_RDONLY)
+                        with os.fdopen(fd, "rb") as source:
+                            require(os.fstat(source.fileno()).st_size <= FILE_SIZE, "staged file exceeds limit")
+                            self.create(packdir, installed + "." + suffix, source.read(FILE_SIZE + 1))
+                    os.fsync(packdir)
+                    git(gitdir, "rev-list", "--objects", "--no-object-names", "--missing=error", tip, **opts)
+                    step("commit\n", b"commit: ok\n")
+                    installed = None   # the ref names these objects now, so they stay
+                    tx.stdin.close(); require(tx.wait(timeout=WALL) == 0, "ref transaction failed")
+                finally:
+                    if tx.poll() is None:
+                        try:
+                            tx.stdin.write(b"abort\n"); tx.stdin.close(); tx.wait(timeout=WALL)
+                        except (OSError, ValueError, sp.TimeoutExpired):
+                            tx.kill(); tx.wait()
+                    if installed:
+                        # A refusal keeps none of the member's objects: the abort undoes the install too.
+                        for suffix in ("pack", "idx"):
+                            try:
+                                os.unlink(f"{installed}.{suffix}", dir_fd=packdir)
+                            except OSError:
+                                pass
+                        os.fsync(packdir)
+            os.rename(next_name, "accepted.json", src_dir_fd=self.launch.lock, dst_dir_fd=self.launch.lock)
+            next_name = None   # the rename retired this name; the accepted record is the host's to keep
+            os.fsync(self.launch.lock)
+        finally:
+            if next_name:
+                # A refusal keeps no unretired receipt either.
+                try:
+                    os.unlink(next_name, dir_fd=self.launch.lock)
+                except OSError:
+                    pass
+
+    def run(self):
+        error, checked = None, {}
+        try:
+            self.r = self.launch.record(self.task)
+            require(self.read(f"registry/{self.task}.json") == self.r, "registry changed while taking task lock", "never")
+            rows = self.recent()
+            try:
+                # A completed broker receipt binds the transfer to this task and generation.
+                source = self.pin(f"transfers/{self.transfer}/bytes")
+                require(stat.S_ISREG(os.fstat(source).st_mode), "submission must be a regular file")
+                size = os.fstat(source).st_size
+                require(size <= PAYLOAD, "submission exceeds byte limit")
+                # Search the retained log, with bounded lines, rather than just the status projection.
+                log = self.pin(f"state/{self.task}/status.jsonl")
+                found = False
+                with os.fdopen(log, "rb") as stream:
+                    self.fds.remove(log)
+                    while line := stream.readline(OUTPUT + 1):
+                        require(len(line) <= OUTPUT, "status line exceeds limit")
+                        row = json.loads(line)
+                        if row.get("operation") == "submit" and row.get("ok") and row.get("transfer") == self.transfer:
+                            found = row.get("generation") == self.r["generation"] and row.get("bytes") == size
+                require(found, "transfer has no current task receipt", "never")
+                parent = self.pin(f"transfers/{self.transfer}", os.O_RDONLY, True)
+                scratch = []
+                for phase in ("check", "stage"):
+                    name = phase + "-" + uuid.uuid4().hex
+                    os.mkdir(name, 0o700, dir_fd=parent)
+                    scratch.append(self.pin(f"transfers/{self.transfer}/{name}", os.O_RDONLY, True))
+                policy = re.findall(r"^SECRETS='([^'\n]+)'$", (BIN / "cc-checkpoint").read_text(), re.M)
+                require(len(policy) == 1, "host staged-name policy unavailable", "deny")
+                meta = dict(phase="check", format="sha1" if len(self.r["base"]) == 40 else "sha256",
+                            base=self.r["base"], secrets=policy[0])
+                checked = self.contained(source, scratch[0], meta)
+                pack = self.m["opened"](scratch[0], "accepted.pack", os.O_RDONLY)
+                self.fds.append(pack)
+                self.contained(pack, scratch[1], dict(meta, phase="stage", tip=checked["tip"]))
+                bare = self.pin(f"repos/{self.r['project']}.git", os.O_RDONLY, True)
+                self.promote(checked, scratch[1], bare)
+            except (OSError, ValueError, KeyError, sp.SubprocessError) as exc:
+                error = exc if isinstance(exc, Refused) else Refused("import unavailable", "deny")
+            event = dict(at=time.time(), seq=rows[-1]["seq"] + 1 if rows else 1, task=self.task,
+                         generation=self.r["generation"], operation="import", identity="host", ok=error is None,
+                         transfer=self.transfer, **(checked if error is None else {}))
+            if error:
+                event.update(reason=str(error), refusal=error.kind,
+                             error=self.broker["REFUSALS"][error.kind][1].format(reason=error))
+            self.create(self.launch.lock, "status.jsonl", self.broker["encoded"](event), append=True)
+        finally:
+            for fd in self.fds + self.launch.fds:
+                os.close(fd)
+        if error:
+            q = object.__new__(self.broker["Broker"])
+            q.home, q.registration = self.launch.home, self.r
+            try:
+                q.queue(error.kind, str(error))  # outside the task lock, with the broker's bounds and wording
+            except (OSError, ValueError):
+                pass
+            raise error
+        return event
+
+
+def main():
+    try:
+        if sys.argv[1:] == ["selfcheck"]:
+            return runpy.run_path(str(BIN.parent / "tests/member_import.py"))["selfcheck"](sys.modules[__name__])
+        require(len(sys.argv) == 4 and sys.argv[1] == "import", USAGE)
+        print(json.dumps(Importer(sys.argv[2], sys.argv[3]).run()))
+        return 0
+    except (OSError, ValueError, KeyError, sp.SubprocessError) as exc:
+        print(f"cc-member-import: refused: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

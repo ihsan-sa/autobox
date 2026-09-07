@@ -57,18 +57,22 @@ land_scope(){   # $1 = this tree's bin/. Sets SCOPE ("" = everything) and REACH 
   done
   # …and TRANSITIVELY: a caller's caller drives the changed tool just as surely, so this walks out from the changed
   # tools until nothing new appears. Stopping at one hop left a change to cc-msg out of the reach of every stanza
-  # that drives it through cc-handoff. The three shapes a tool is invoked by on this box: `$BIN/cc-foo` and
-  # `${BIN}/cc-foo` in shell and python strings, `$B/cc-foo` in the suites, and python's
-  # `os.path.join(BIN, "cc-foo")` — cc-context, cc-handoff and cc-graphs call every one of their siblings that way.
+  # that drives it through cc-handoff. The four shapes a tool is named by on this box: `$BIN/cc-foo` and
+  # `${BIN}/cc-foo` in shell and python strings, `$B/cc-foo` in the suites, python's
+  # `os.path.join(BIN, "cc-foo")` — cc-context, cc-handoff and cc-graphs call every one of their siblings that way
+  # — and pathlib's `BIN / "cc-foo"`, which cc-native, cc-task and the member tools use. That last one was missing
+  # and hid every edge spelled with it: cc-member-import READS cc-checkpoint's staged-name policy out of its
+  # source, and a change to cc-checkpoint alone never ran the selfcheck that catches a rename of it. A source read
+  # is a harder dependency than a call, and it is spelled the same way, so the same grep answers for both.
   queue=$tools
   # The member launcher calls its fence at the path inside bwrap, which the host
   # invocation grep cannot see. Its cases live under cc-sandbox's canary gate.
-  case " $tools " in *" cc-fence "*|*" cc-member-v2 "*|*" cc-member-broker "*|*" cc-sandbox "*)
-    tools="$tools cc-fence cc-member-v2 cc-member-broker cc-sandbox"; queue=$tools;; esac
+  case " $tools " in *" cc-fence "*|*" cc-member-v2 "*|*" cc-member-broker "*|*" cc-member-import "*|*" cc-sandbox "*)
+    tools="$tools cc-fence cc-member-v2 cc-member-broker cc-member-import cc-sandbox"; queue=$tools;; esac
   while [ -n "$queue" ]; do
     nxt=""
     for t in $queue; do
-      for p in $(grep -l -E -- "BIN\}?/$t([^A-Za-z0-9_-]|$)|\\\$B/$t([^A-Za-z0-9_-]|$)|join\([A-Za-z_][A-Za-z0-9_]*, *[\"']${t}[\"']" "$b"/* 2>/dev/null); do
+      for p in $(grep -l -E -- "BIN\}?/$t([^A-Za-z0-9_-]|$)|\\\$B/$t([^A-Za-z0-9_-]|$)|join\([A-Za-z_][A-Za-z0-9_]*, *[\"']${t}[\"']|BIN */ *[\"']${t}[\"']" "$b"/* 2>/dev/null); do
         p=${p##*/}
         case " $tools $nxt " in *" $p "*) ;; *) [ "$p" = cc ] || nxt="$nxt $p";; esac
       done

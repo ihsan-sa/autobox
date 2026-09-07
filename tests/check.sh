@@ -7,7 +7,7 @@ sh=(); py=()
 for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
 bash -n "${sh[@]}"
 shellcheck -S warning -e SC1090,SC1010 "${sh[@]}"
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py tests/member_v2.py tests/member_broker.py "$@"
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py tests/member_v2.py tests/member_broker.py tests/member_import.py "$@"
 for f in slack/*.json config/claude-settings.json config/units.json config/claude-managed.json; do jq -e . "$f" >/dev/null; done
 # the agent types (templates/home/agents/ -> ~/.claude/agents/). Nothing else reads these files: a frontmatter the
 # harness rejects takes out every spawn of that type at dispatch time, with no earlier signal. install.sh's own case
@@ -98,7 +98,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
 . tests/green.sh; land_scope "$PWD/bin"; skipped=""
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.
@@ -109,4 +109,4 @@ for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-
 # Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
 # again on the same files the worker already ran it on (tests/green.sh, read by cc-land).
 green_record "$SELF" "$SCOPE"
-echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 3 + $#)) python, json, units, manifests, agent types)"
+echo "check.sh: OK (${#sh[@]} shell, $((${#py[@]} + 4 + $#)) python, json, units, manifests, agent types)"

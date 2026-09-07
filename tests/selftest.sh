@@ -2614,31 +2614,40 @@ reach(){ ( CC_LAND_CHANGED="$1" land_scope "$SB"; printf '%s|%s' "$REACH" "$SCOP
 [ "$(reach 'core/bin/cc-caller core/tests/x.sh')" = "|" ] && [ "$(reach core/bin/cc)" = "|" ] && [ "$(reach core/bin/cc-gone)" = "|" ] \
   && ok "a path that is not a tool, a tool too short to grep for, and a tool that is gone each reach everything" \
   || bad "widening: [$(reach 'core/bin/cc-caller core/tests/x.sh')] [$(reach core/bin/cc)] [$(reach core/bin/cc-gone)]"
-# …and the reach is TRANSITIVE, and it reads python's own way of naming a sibling. cc-context, cc-handoff and
+# …and the reach is TRANSITIVE, and it reads python's own two ways of naming a sibling. cc-context, cc-handoff and
 # cc-graphs run every tool they drive through os.path.join(BIN, "cc-foo"), which no $BIN/ pattern matches, and one
 # hop stopped at the direct caller: a PR to cc-msg alone skipped every stanza that drives it through cc-handoff.
+# cc-native, cc-task and the member tools spell it `BIN / "cc-foo"` instead, which matched nothing either.
 SB2="$T/scopebin2"; mkdir -p "$SB2"
 printf '#!/bin/sh\n' > "$SB2/cc-deep"
 printf '#!/usr/bin/env python3\nsubprocess.run([os.path.join(BIN, "cc-deep"), "x"])\n' > "$SB2/cc-mid"
 printf '#!/bin/sh\n"$BIN/cc-mid"\n' > "$SB2/cc-far"
+printf '#!/usr/bin/env python3\npolicy = (BIN / "cc-deep").read_text()\n' > "$SB2/cc-pathlib"
 printf '#!/bin/sh\n# cc-deep is only named here\n' > "$SB2/cc-idle"
 r2(){ ( CC_LAND_CHANGED="$1" land_scope "$SB2"; printf '%s' "$REACH" ); }
-[ "$(r2 core/bin/cc-deep)" = " cc-deep cc-far cc-mid " ] \
-  && ok "the reach is transitive and reads os.path.join(BIN, \"cc-foo\") too: the caller and the caller's caller, never a file that only names it" \
+[ "$(r2 core/bin/cc-deep)" = " cc-deep cc-far cc-mid cc-pathlib " ] \
+  && ok "the reach is transitive and reads both python spellings — os.path.join(BIN, \"cc-foo\") and BIN / \"cc-foo\" — the caller and the caller's caller, never a file that only names it" \
   || bad "transitive reach: [$(r2 core/bin/cc-deep)]"
+# …and that second spelling is how a tool READS a sibling's source, which is a harder dependency than a call and
+# was invisible: cc-member-import takes the host staged-name policy out of cc-checkpoint, so a rename of SECRETS
+# there makes every member import refuse — and no landing of cc-checkpoint alone ran the case that catches it.
+edge=$( CC_LAND_CHANGED="core/bin/cc-checkpoint" land_scope "$B"; printf '%s' "$REACH" )
+case "$edge" in *" cc-member-import "*) ok "a change to cc-checkpoint alone reaches cc-member-import, which reads its staged-name policy";;
+  *) bad "cc-checkpoint does not reach cc-member-import: [$edge]";; esac
 # …and the ONE EDGE THE GREP CANNOT SEE: the member launcher runs cc-fence at its path INSIDE bwrap
 # ("$HOME/bin/cc-fence"), which no `$BIN/`-shaped pattern matches, and its cases live under cc-sandbox's
-# selfcheck rather than its own. green.sh names the four tools outright; without it a change to cc-member-v2
+# selfcheck rather than its own. green.sh names the five tools outright; without it a change to cc-member-v2
 # alone left the fence's gate and the canary out of the landing's reach.
 SB4="$T/scopebin4"; mkdir -p "$SB4"
-for f in cc-member-v2 cc-member-broker cc-fence cc-sandbox cc-leaf; do printf '#!/bin/sh\n' > "$SB4/$f"; done
+for f in cc-member-v2 cc-member-broker cc-member-import cc-fence cc-sandbox cc-leaf; do printf '#!/bin/sh\n' > "$SB4/$f"; done
 r4(){ ( CC_LAND_CHANGED="$1" land_scope "$SB4"; printf '%s' "$REACH" ); }
-{ [ "$(r4 core/bin/cc-member-v2)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
-  && [ "$(r4 core/bin/cc-fence)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
-  && [ "$(r4 core/bin/cc-member-broker)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
-  && [ "$(r4 core/bin/cc-sandbox)" = " cc-fence cc-member-broker cc-member-v2 cc-sandbox " ] \
+{ [ "$(r4 core/bin/cc-member-v2)" = " cc-fence cc-member-broker cc-member-import cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-fence)" = " cc-fence cc-member-broker cc-member-import cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-member-broker)" = " cc-fence cc-member-broker cc-member-import cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-member-import)" = " cc-fence cc-member-broker cc-member-import cc-member-v2 cc-sandbox " ] \
+  && [ "$(r4 core/bin/cc-sandbox)" = " cc-fence cc-member-broker cc-member-import cc-member-v2 cc-sandbox " ] \
   && [ "$(r4 core/bin/cc-leaf)" = " cc-leaf " ]; } \
-  && ok "each of the four member tools reaches all four; the independent leaf reaches only itself" \
+  && ok "each of the five member tools reaches all five; the independent leaf reaches only itself" \
   || bad "member-launcher reach: [$(r4 core/bin/cc-member-v2)] [$(r4 core/bin/cc-fence)] [$(r4 core/bin/cc-leaf)]"
 # …and the SCOPE it hands back is the LANDING'S OWN STRING, byte for byte. cc-land sorts the paths in python's byte
 # order and spends a green record only on a scope equal to that; sorting them again here runs in the box's locale,
