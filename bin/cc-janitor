@@ -12,9 +12,10 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
     also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
 
 PER REPO, NEVER ACROSS THEM — rules 1-4. Those entry points take repo names: a tool that deletes has to be
-pointed, and the timer is pointed by a config line the owner writes. Two passes are box-wide because what they
-sweep is pointed by its own name, not by a repo: rule 5 (a container names itself `ccbox-*`) and rule 6 (a
-fixture names itself `_cc<suite><pid>`). Both run on every invocation, with an empty CC_JANITOR_REPOS too.
+pointed, and the timer is pointed by a config line the owner writes. Three passes are box-wide because what
+they sweep points at itself rather than at a repo: rule 5 (a container names itself `ccbox-*`), rule 6 (a
+fixture names itself `_cc<suite><pid>`) and rule 7 (a process says where it is working and what that costs).
+All three run on every invocation, with an empty CC_JANITOR_REPOS too.
 
 THE ONE RULE ABOVE THE RULES: delete only what is PROVEN dead. Anything uncertain — a PR that closed without
 merging, a branch nobody opened one for, a window with something running in it, a worktree with uncommitted
@@ -41,6 +42,18 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      trap left a board whose `waiting` row reached the owner's NEEDS YOU list (2026-09-01), and a leaked `_ccsbx<pid>`
      that the board watchdog reported as two worktrees of real work (2026-09-02). A name under the prefix carrying no
      pid is never touched: the pid is the only proof of death this rule accepts.
+  7. a process working in a SCRATCH WORKSPACE — one directory below the box's temp root (TMPDIR, else /tmp),
+     which is scratch by construction: a run made it, and nothing anybody means to keep lives there — for longer
+     than CC_JANITOR_ORPHAN_HOURS (default 4, 0 = off), when the run that made it is gone AND it is still
+     burning CPU  →  ended, TERM and then KILL, each one named. THE SESSION IS THE RUN: a process's session
+     leader is the shell its run started in, so a leader that no longer exists is a run that no longer exists —
+     whoever adopted the orphan afterwards (init, or a subreaper), and whatever the process happens to be
+     called. Nothing here knows what a dev server is named. Two orphans are reported and left running instead:
+     one in a workspace a REGISTERED RECORD points into, and one that is IDLE — a preview somebody is still
+     reading sits on a port at no cost to anyone, while the class that cost a day of load was five dev servers
+     holding half a core each with their test long gone and nothing on the box noticing (2026-09-06). Under
+     CC_JANITOR_ORPHAN_CPU (default 0.10 of a core, averaged over the process's whole life) nothing is proven
+     but a leftover nobody is paying for, and that is a finding, not a kill.
 
 NOTHING IS TAKEN OUT FROM UNDER SOMETHING STILL USING IT. Before any rule removes a directory, two generic
 tests can hold it, and a held directory is REPORTED — "spared", and what holds it — never removed:
@@ -52,6 +65,9 @@ tests can hold it, and a held directory is REPORTED — "spared", and what holds
     worktree registers its own. A record nobody has rewritten for 48 h — the same window a terminal track gets
     — is a leftover like everything else here and holds nothing, so a writer that died cannot pin a worktree
     for ever; what is genuinely still running has a process, and the first test has it.
+Rule 7 is the one place the first test cannot be the evidence: the processes working in that directory are
+exactly what it is judging, so there a registered record is the hold, and everything else it spares it spares
+on what the processes themselves say — a live session, or an idle one.
 A hold is on the RUN, not on the one path: rule 6 leaves that suite's board row, state, clone and window
 alone too, because a live process with its bookkeeping deleted is the same accident in a smaller shape. A spare
 is a standing state, so it is on stdout every pass but in the log once a day.
@@ -69,7 +85,7 @@ is the whole test.
 Every action goes to ~/.cc/state/janitor.log. `--dry` prints what it would do and writes nothing at all.
 Exit: 0 done (with or without findings) · 2 usage.
 """
-import calendar, glob, json, os, re, shutil, signal, subprocess, sys, time
+import calendar, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy: a worktree tests itself
@@ -84,6 +100,14 @@ NEXT = "~next"        # cc-handoff's successor window suffix; `~` is not legal i
 CONTAINER_DAYS = 7    # rule 5: a ccbox-* container stopped longer is a leftover; CC_JANITOR_CONTAINER_DAYS overrides, 0 = off
 FIXTURE = "_cc"       # rule 6: the prefix every suite's scratch names share, whichever suite made them…
 SUITE = re.compile(r"_cc[a-z]+(\d+)(?:[/~]|$)")   # …and each carries its run's pid: `_cctest<pid>`, `_ccsbx<pid>/t`
+ORPHAN_HOURS = 4      # rule 7: a process in a scratch workspace younger than this is somebody's run in progress
+ORPHAN_CPU = 0.10     # …and one under this share of a core, over its whole life, is a leftover costing nothing
+GRACE = 5             # …seconds between the TERM that asks it to stop and the KILL that does not ask
+HZ = 100              # clock ticks per second, for /proc/<pid>/stat — the real one below, this if it cannot be had
+try:
+    HZ = os.sysconf("SC_CLK_TCK") or HZ
+except (ValueError, OSError):
+    pass
 
 
 def now():
@@ -159,6 +183,25 @@ def container_verdict(f):
     if f["age"] < f.get("days", CONTAINER_DAYS) * 86400:
         return ("keep", "")
     return ("rm", f"a ccbox container stopped for {dur(f['age'])}")
+
+
+def orphan_verdict(f):
+    """Rule 7. f: {ws, age, cpu, run, held, hours, share} → (end|report|keep, why). The verdict is on the WORKSPACE,
+    one for everything working in it: those processes are one run, and ending half of a run is how a sweep leaves a
+    mess behind it. `age` is the oldest holder's, `cpu` the biggest share of a core any of them has held since it
+    started, `run` names a holder's session leader that is still alive (the run is still going), `held` the
+    registered records pointing in. Age first: a workspace an hour old is a run in progress, not a finding."""
+    if f["age"] < f.get("hours", ORPHAN_HOURS) * 3600:
+        return ("keep", "")
+    if f["held"]:
+        return ("report", f"spared {f['ws']}: " + "; ".join(f["held"]))
+    if f["run"]:
+        return ("report", f"spared {f['ws']}: the run that made it is still alive — {f['run']}")
+    if f["cpu"] < f.get("share", ORPHAN_CPU):
+        return ("report", f"spared {f['ws']}: its run is gone, but it is idle ({f['cpu'] * 100:.0f}% of a core) "
+                          f"and costs nobody anything — end it by hand if it is finished with")
+    return ("end", f"working in {f['ws']} for {dur(f['age'])} at {f['cpu'] * 100:.0f}% of a core, "
+                   "and the run that made it is gone")
 
 
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -255,6 +298,98 @@ def pcomm(pid):
         return "?"
 
 
+def boot():
+    """When this kernel booted, so a process's start time in clock ticks becomes a wall clock one. 0 when /proc/stat
+    will not say, and then nothing has a readable age — which rule 7 treats as no evidence, not as "old"."""
+    if not hasattr(boot, "t"):
+        boot.t = 0.0
+        try:
+            boot.t = next(float(ln.split()[1]) for ln in open("/proc/stat") if ln.startswith("btime "))
+        except Exception:
+            boot.t = 0.0
+    return boot.t
+
+
+def proc_stat(pid):
+    """(ppid, session, started, cpu_seconds) from /proc/<pid>/stat, or None when it cannot be read. The comm field
+    is parenthesised and holds whatever the process is called — spaces and brackets included — so the fields are
+    counted from the LAST ')', never split off the front. `session` is the pid of the process's session leader:
+    the shell its run started in, alive or gone. A kernel that will not say when it booted leaves every start time
+    unreadable rather than wrong — an age counted from the epoch would make everything on the box look ancient."""
+    try:
+        if not boot():
+            return None
+        f = open(f"/proc/{pid}/stat").read().rpartition(")")[2].split()
+        started = boot() + int(f[19]) / HZ                  # field 22, ticks since boot
+        return (int(f[1]), int(f[3]), started, (int(f[11]) + int(f[12])) / HZ)   # ppid, session, start, utime+stime
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def ours(pid):
+    """This user's own process. Another user's is nothing this sweep may end, and on a box that runs as one user
+    there is nothing of ours behind that line anyway."""
+    try:
+        return os.stat(f"/proc/{pid}").st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def own_chain():
+    """This process and every process above it, up to init. Rule 7 never looks at one of these, wherever it is
+    working: a sweep that could end its own shell, its session or the thing that started it is not a sweep."""
+    out, pid = {1}, os.getpid()
+    while pid > 1 and pid not in out:
+        out.add(pid)
+        st = proc_stat(pid)
+        pid = st[0] if st else 0
+    return out
+
+
+def scratch(cwd, tmp):
+    """The scratch workspace `cwd` is working in: the ONE directory below the box's temp root. The root itself is
+    not a workspace — a process sitting in /tmp made nothing — and a path outside it is not one at all."""
+    tmp = os.path.realpath(tmp).rstrip("/")
+    if not inside(tmp, cwd) or cwd.rstrip("/") == tmp:
+        return None
+    return f"{tmp}/{cwd[len(tmp) + 1:].split('/')[0]}"
+
+
+def end_proc(pid, ws, grace=GRACE):
+    """Ask, then insist: SIGTERM, and SIGKILL whatever is still running when the grace is up. Returns '' when the
+    process is gone and why not otherwise. Already gone counts as gone — this pass's job, done by somebody else —
+    and so does a zombie: it is not running, and reading it is its parent's business, not this sweep's.
+
+    The working directory is read ONE more time first. Between the pass reading /proc and this signal the process
+    can have exited and its pid number been handed to something else, and a pid that has moved on is a stranger:
+    this is the only rule here that ends a thing it cannot get back, so it looks again rather than trusting a
+    reading it took a moment ago."""
+    try:
+        if not inside(ws, os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))):
+            return f"it is working somewhere else now, not in {ws} — nothing was sent"
+    except OSError:
+        return ""                                   # gone between the reading and here: nothing left to end
+
+    def gone():
+        try:
+            return open(f"/proc/{pid}/stat").read().rpartition(")")[2].split()[0] == "Z"
+        except (OSError, IndexError):
+            return True
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2)):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return ""
+        except OSError as e:
+            return str(e)
+        end = now() + wait
+        while now() < end:
+            if gone():
+                return ""
+            time.sleep(0.1)
+    return "" if gone() else "it did not end"
+
+
 def jstrings(v):
     """Every string in a JSON value, however deep: a record's shape is the box's business, not this file's."""
     if isinstance(v, str):
@@ -292,13 +427,19 @@ class Holds:
         self.cwds = live_cwds()
         self.records = record_paths()
 
+    def records_on(self, path):
+        """…the registered records alone. Rule 7's candidates ARE the processes working in the directory, so the
+        process test cannot be its evidence there; a record still is."""
+        d = os.path.realpath(path)
+        return [f"{rec} points into it" for tgt, rec in self.records if inside(d, tgt)]
+
     def on(self, path):
         d = os.path.realpath(path)
         pids = [pid for pid, c in self.cwds if inside(d, c)]
         why = [f"pid {pid} ({pcomm(pid)}) is working in it" for pid in pids[:2]]
         if len(pids) > 2:               # a dev server is a dozen processes; the report names two and counts
             why.append(f"+{len(pids) - 2} more are working in it")
-        why += [f"{rec} points into it" for tgt, rec in self.records if inside(d, tgt)]
+        why += self.records_on(path)
         return list(dict.fromkeys(why))
 
 
@@ -439,6 +580,18 @@ class Run:
             (err if p is None else f"exit {p.returncode}")
         self.report(repo, target, f"{verb} failed: {err}")
         return False
+
+    def act_here(self, repo, verb, target, why, fn):
+        """`act`, for the one thing this file does itself rather than by running a command: rule 7's signal. `fn`
+        returns '' when it worked and why not otherwise, and a failure is reported exactly like a command's."""
+        if not self.dry:
+            err = fn()
+            if err:
+                self.report(repo, target, f"{verb} failed: {err}")
+                return False
+        self.log(repo, verb, target, why)
+        self.did.append(target)
+        return True
 
     def report(self, repo, target, why):
         """A spare is a standing state, not an event: it is on stdout every pass, and in the log once a day.
@@ -584,6 +737,52 @@ def sweep_containers(r, days):
             r.report("ccbox", f"container {name}", why)
 
 
+def sweep_orphans(r, hours, share=ORPHAN_CPU):
+    """Rule 7, once per run and box-wide: what a run left running in a scratch directory after the run itself
+    went. The unit is the workspace — every process working in one belongs to the same run, so they get one
+    verdict and, when it is `end`, they all go: the server, and the workers it had spawned. This process and its
+    own ancestors are not holders (a sweep must not read itself as somebody still working here, nor end its own
+    shell), and neither is another user's process, which this may not touch and does not own.
+
+    Nothing is removed from disk. /tmp has a cleaner of its own and a directory costs nothing; what cost the box
+    a day was the processes, and those are all this ends."""
+    if hours <= 0:
+        return
+    tmp = os.path.realpath(tempfile.gettempdir())
+    mine = own_chain()
+    holders = {}
+    for pid, cwd in r.holds.cwds:
+        ws = scratch(cwd, tmp)
+        pid = int(pid) if str(pid).isdigit() else 0
+        if ws is None or pid in mine or not ours(pid):
+            continue
+        st = proc_stat(pid)
+        if st is None or st[2] <= 0:                    # no readable start time is no evidence of age, so no candidate
+            continue
+        holders.setdefault(ws, []).append((pid, st))
+    hits = []
+    for ws in sorted(holders):
+        pids = holders[ws]
+        ages = [max(1.0, now() - st[2]) for _, st in pids]
+        # A session leader that still exists is a run still going — whoever adopted these processes when their
+        # parent died. One that made its own session (`setsid`, a service) is its own leader, so it is never an orphan.
+        run = next((f"pid {st[1]} ({pcomm(st[1])})" for _, st in pids if os.path.exists(f"/proc/{st[1]}")), "")
+        f = {"ws": ws, "age": max(ages), "cpu": max(st[3] / a for (_, st), a in zip(pids, ages)),
+             "run": run, "held": r.holds.records_on(ws), "hours": hours, "share": share}
+        verdict, why = orphan_verdict(f)
+        if verdict != "keep":
+            hits.append((ws, pids, verdict, why))
+    if not hits:
+        return
+    print(f"cc-janitor scratch workspaces{' (dry run)' if r.dry else ''}")
+    for ws, pids, verdict, why in hits:
+        if verdict == "report":
+            r.report("scratch", ws, why)
+            continue
+        for pid, _ in sorted(pids):
+            r.act_here("scratch", "end", f"pid {pid} ({pcomm(pid)})", why, lambda p=pid, w=ws: end_proc(p, w))
+
+
 def fixtures():
     """{pid: [paths]} of every `_cc<suite><pid>` thing on this box: the board and its lock, worktrees, state, the ~/dev
     clone, the run's scratch dir, its entry in the deploy ledger, its context dir — the namespace a suite gives one run
@@ -701,6 +900,28 @@ def container_days():
         return CONTAINER_DAYS
 
 
+def orphan_hours():
+    """Rule 7's threshold in hours: CC_JANITOR_ORPHAN_HOURS, default 4. 0 turns rule 7 off, and so does the key set
+    but empty. A fraction is a fraction of an hour — which is how the selfcheck drives the rule against a process it
+    started a moment ago. A value that is not a number is the default: a typo must not end everything in /tmp."""
+    v = setting("CC_JANITOR_ORPHAN_HOURS", str(ORPHAN_HOURS)).strip()
+    if not v:
+        return 0.0
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        return float(ORPHAN_HOURS)
+
+
+def orphan_cpu():
+    """…and the share of a core below which rule 7 reports an orphan instead of ending it: CC_JANITOR_ORPHAN_CPU,
+    default 0.10. Unreadable or unset is the default — never 0, which would end every idle leftover on the box."""
+    try:
+        return max(0.0, float(setting("CC_JANITOR_ORPHAN_CPU", str(ORPHAN_CPU)).strip()))
+    except ValueError:
+        return ORPHAN_CPU
+
+
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
@@ -724,6 +945,7 @@ def main(argv):
                 return 2
             sweep(repo, r, net)
         sweep_containers(r, container_days())
+        sweep_orphans(r, orphan_hours(), orphan_cpu())
     sweep_fixtures(r)
     print(f"cc-janitor: {len(r.did)} swept, {len(r.said)} reported"
           f"{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
@@ -734,8 +956,8 @@ def main(argv):
 def selfcheck():
     """The decision table, then one end-to-end sweep of a fake box: its own HOME, its own board, its own
     worktrees, a bare repo standing in for origin, and stub `tmux`/`gh` on PATH. Nothing here touches this
-    box's tmux server, its boards or GitHub, and every fixture name is a placeholder."""
-    import tempfile
+    box's tmux server, its boards or GitHub, its temp root or anything running in it, and every fixture name is a
+    placeholder."""
     p = f = 0
 
     def ok(name, cond):
@@ -817,6 +1039,33 @@ def selfcheck():
     ok("docker's FinishedAt reads, nanoseconds and all — and nonsense reads as None, never as 0",
        stopped_at("2026-08-30T01:44:43.257081924Z") == epoch("2026-08-30T01:44:43Z") and stopped_at("not-a-time") is None)
 
+    # rule 7 — a process still working in a scratch workspace after the run that made it has gone
+    def O(**kw):
+        d = {"ws": "/tmp/ws", "age": 10 * 3600, "cpu": 0.5, "run": "", "held": [], "hours": 4, "share": 0.10}
+        d.update(kw)
+        return d
+
+    ok("a process burning a core in a scratch workspace whose run is gone is ended", orphan_verdict(O())[0] == "end")
+    ok("…and the pass says where it was working and what it was costing",
+       "/tmp/ws" in orphan_verdict(O())[1] and "50% of a core" in orphan_verdict(O())[1])
+    ok("one an hour old is a run in progress, left alone and unremarked", orphan_verdict(O(age=3600)) == ("keep", ""))
+    ok("…and the hours are the configured ones", orphan_verdict(O(age=3600, hours=0.5))[0] == "end")
+    ok("A RUN STILL GOING SURVIVES: a session leader that is still there is reported, never ended",
+       orphan_verdict(O(run="pid 42 (bash)"))[0] == "report" and "still alive" in orphan_verdict(O(run="pid 42 (bash)"))[1])
+    ok("AN IDLE ORPHAN SURVIVES — a preview sitting on a port costs nobody anything, so it is a finding, not a kill",
+       orphan_verdict(O(cpu=0.001))[0] == "report" and "idle" in orphan_verdict(O(cpu=0.001))[1])
+    ok("…and that share is the configured one too", orphan_verdict(O(cpu=0.05, share=0.01))[0] == "end")
+    ok("A WORKSPACE A REGISTERED RECORD POINTS INTO SURVIVES, however hard it is running, and the record is named",
+       orphan_verdict(O(held=["/x/rec.json points into it"], cpu=9.0))[0] == "report"
+       and "/x/rec.json" in orphan_verdict(O(held=["/x/rec.json points into it"]))[1])
+    ok("a scratch workspace is the ONE directory below the temp root — not the root, and nothing outside it",
+       scratch("/tmp/ws/a/b", "/tmp") == "/tmp/ws" and scratch("/tmp/ws", "/tmp") == "/tmp/ws"
+       and scratch("/tmp", "/tmp") is None and scratch("/home/x", "/tmp") is None and scratch("/tmpx/y", "/tmp") is None)
+    ok("a process's own /proc row reads: its session, when it started, and the CPU it has burned since",
+       (lambda s: bool(s) and s[1] > 0 and 0 <= now() - s[2] < 10 * 365 * 86400 and s[3] >= 0)(proc_stat(os.getpid())))
+    ok("…and THIS process and everything above it is never a candidate, wherever it happens to be working",
+       os.getpid() in own_chain() and 1 in own_chain() and proc_stat(-1) is None)
+
     # the hold — what counts as being inside the directory a rule is about to remove
     ok("a directory is held by its own path and by anything under it, and by nothing beside it",
        inside("/a/b", "/a/b") and inside("/a/b", "/a/b/c/d") and inside("/a/b/", "/a/b/c")
@@ -828,7 +1077,9 @@ def selfcheck():
         fake, dev, wts = f"{th}/fakebin", f"{th}/dev/{repo}", f"{th}/.cc/worktrees/{repo}"
         os.makedirs(fake)
         os.makedirs(f"{th}/.cc/state", exist_ok=True)
-        env = dict(os.environ, HOME=th, PATH=f"{fake}:{os.environ.get('PATH', '')}",
+        os.makedirs(f"{th}/tmp", exist_ok=True)
+        ftmp = os.path.realpath(f"{th}/tmp")    # rule 7's temp root, for EVERY run below: no pass here sees the real one
+        env = dict(os.environ, HOME=th, TMPDIR=ftmp, PATH=f"{fake}:{os.environ.get('PATH', '')}",
                    CC_FAKE_TMUX=f"{th}/tmux.txt", CC_FAKE_GH=f"{th}/gh.json", CC_FAKE_DOCKER=f"{th}/docker.txt",
                    CC_JANITOR_HOLDS="~/.cc/state/records/*.json",
                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
@@ -1151,6 +1402,68 @@ def selfcheck():
         shutil.rmtree(f"{th}/.cc/worktrees/_ccsbx{livep}", ignore_errors=True)
         shutil.rmtree(f"{th}/dev/_ccsbx{livep}", ignore_errors=True)
         os.remove(f"{th}/.cc/boards/_cclive.lock")
+
+        # RULE 7: what a run left running in a scratch workspace after the run itself went. Four of them under this
+        # test's own temp root, and the four answers: an orphan burning CPU, a run still going, an orphan a registered
+        # record points into, and an idle one. The thresholds are a fraction of an hour and a hundredth of a core,
+        # which is the same rule read against processes a second old.
+        def orphan(ws, burn=False):
+            """A run whose session is gone: a leader of its own that starts the work and exits — exactly what a suite
+            leaves behind when it dies before its teardown. The work stays, its session leader does not. `nice`, so
+            the one case that has to burn a core does not take one from the work running beside this suite."""
+            os.makedirs(ws, exist_ok=True)
+            job = "nice -n 19 bash -c 'while :; do :; done'" if burn else "sleep 300"
+            subprocess.run(["bash", "-c", f"{job} & exit 0"], cwd=ws, start_new_session=True, timeout=60,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        wsgone, wslive, wsrec, wsidle = (f"{ftmp}/gone", f"{ftmp}/live", f"{ftmp}/rec", f"{ftmp}/idle")
+        orphan(wsgone, burn=True)
+        orphan(wsrec, burn=True)
+        orphan(wsidle)
+        os.makedirs(wslive, exist_ok=True)
+        runner = fixture("bash", "-c", "sleep 300", cwd=wslive)     # its own session, and it stays: a run still going
+        json.dump({"name": "served", "dir": wsrec, "port": 2}, open(f"{recs}/served.json", "w"))
+        time.sleep(0.7)                                 # …which is older than the fraction of an hour below
+
+        def holding(ws):
+            return sorted(int(pid) for pid, c in live_cwds() if inside(os.path.realpath(ws), c))
+
+        orph = dict(CC_JANITOR_ORPHAN_HOURS="0.0001", CC_JANITOR_ORPHAN_CPU="0.01")
+        was = {w: holding(w) for w in (wsgone, wslive, wsrec, wsidle)}
+        ro = run("--dry", **orph)
+        ok("rule 7: --dry names the process it would end, and where it is working",
+           f"would end pid {was[wsgone][0]}" in ro.stdout and wsgone in ro.stdout)
+        ok("rule 7: --DRY ENDS NOTHING — every one of them is still running",
+           {w: holding(w) for w in (wsgone, wslive, wsrec, wsidle)} == was and all(was.values()))
+        r7 = run(**orph)
+        ok("rule 7: an orphan burning a core in a scratch workspace is ended, and each process it ended is named",
+           holding(wsgone) == [] and f"end pid {was[wsgone][0]}" in r7.stdout and wsgone in r7.stdout)
+        ok("rule 7: A RUN STILL GOING SURVIVES — its session leader is alive, and the pass says which",
+           holding(wslive) == was[wslive] and f"spared {wslive}" in r7.stdout and "still alive" in r7.stdout)
+        ok("rule 7: AN ORPHAN A REGISTERED RECORD POINTS INTO SURVIVES, however hard it is running, named by the record",
+           holding(wsrec) == was[wsrec] and f"{recs}/served.json points into it" in r7.stdout)
+        ok("rule 7: AN IDLE ORPHAN SURVIVES and is reported — a preview sitting on a port costs nobody anything",
+           holding(wsidle) == was[wsidle] and f"spared {wsidle}" in r7.stdout and "idle" in r7.stdout)
+        ok("rule 7: the end is in the log too, with where it was working and what it was costing",
+           f"end pid {was[wsgone][0]}" in open(f"{th}/.cc/state/janitor.log").read())
+        ok("rule 7: …and 0 hours turns the rule off — the same box, the same orphans, and not a word about them",
+           "scratch workspace" in run("--dry", **orph).stdout
+           and "scratch workspace" not in run("--dry", CC_JANITOR_ORPHAN_HOURS="0").stdout)
+        stray = fixture("sleep", "120", cwd=wsidle)
+        time.sleep(0.3)
+        ok("rule 7: the kill reads the working directory ONE more time first — a pid that has moved on since the "
+           "pass read it, or been handed to something else, is not the one this ends",
+           end_proc(stray.pid, f"{ftmp}/somewhere-else").startswith("it is working somewhere else")
+           and os.path.exists(f"/proc/{stray.pid}")
+           and end_proc(stray.pid, wsidle) == "" and stray.wait(timeout=10) == -signal.SIGTERM)
+
+        for w in (wsgone, wslive, wsrec, wsidle):       # whatever the pass spared is this suite's to clean up
+            for pid in holding(w):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        runner.wait(timeout=10)
 
         for proc in (live, bare, served):               # the group, so the `sleep` under the live shell goes too
             try:
