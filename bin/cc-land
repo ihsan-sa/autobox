@@ -1864,16 +1864,22 @@ class Land:
         rows = [a for a in asks if a.get("status") in ("open", "claimed", "merged")]
         if not rows:
             raise Skip(f"no ask on track {t} waiting to be delivered")
-        good, red, bare = [], [], []
+        # rc 3 is cc-scope's "the check COULD NOT RUN" — the command was not there to answer. It is NOT rc 1,
+        # and lumping the two here is how ask a69 read as a failed boundary check for five days: a script that
+        # went with its track's state dir, reported on the landing card as CHECK FAILED. Still unverified, still
+        # open, but nothing was measured and the card must not say otherwise.
+        good, red, bare, silent = [], [], [], []
         for a in rows:
             rc = sh([f"{BIN}/cc-scope", "deliver", self.repo, a["id"]], timeout=900)[0]
-            (good if rc == 0 else bare if rc == 2 else red).append(a["id"])
-        self.unverified = red + bare
+            (good if rc == 0 else bare if rc == 2 else silent if rc == 3 else red).append(a["id"])
+        self.unverified = red + bare + silent
         if not self.unverified:
             return f"delivered — every check ran here and passed: {', '.join(good)}"
         bits = ([f"delivered: {', '.join(good)}"] if good else [])
         if red:
             bits.append(f"CHECK FAILED, still open: {', '.join(red)}")
+        if silent:
+            bits.append(f"COULD NOT RUN, never measured (not a red check): {', '.join(silent)}")
         if bare:
             bits.append(f"names no check, UNVERIFIED and still open: {', '.join(bare)}")
         raise Failed("; ".join(bits) + f" — `cc-scope show {self.repo} <id>` for what happened, "
@@ -4124,6 +4130,17 @@ def cmd_selfcheck():
     e = caught(L.verify_delivery)
     check("a row with no check is reported UNVERIFIED and stays open — an honest 'nobody looked' is the product",
           isinstance(e, Failed) and "UNVERIFIED" in str(e) and L.unverified == ["a31"])
+
+    # A check that COULD NOT RUN is not a check that failed. a69's script went with its track's state dir and
+    # this card called it CHECK FAILED for five days, which is the whole reason cc-scope grew rc 3.
+    L = fresh(pr=7)
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a69", "status": "merged"}]))
+    world[f"{BIN}/cc-scope deliver"] = (3, "could not run")
+    e = caught(L.verify_delivery)
+    check("a check that could not run is reported as never measured, NOT as a failed check — still open, still "
+          "unverified, but the card does not accuse it",
+          isinstance(e, Failed) and "COULD NOT RUN" in str(e) and "CHECK FAILED" not in str(e)
+          and "a69" in str(e) and L.unverified == ["a69"])
 
     # …and a check that passes is the only thing that delivers
     L = fresh(pr=7)

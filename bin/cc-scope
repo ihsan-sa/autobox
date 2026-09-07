@@ -30,11 +30,19 @@ legitimate answer — but it must say why, in its own words, and the reason stay
 `--why` is therefore required. An omission leaves an open item; a decision leaves a reason; the two can never
 be mistaken for each other, which is the whole point of writing the asks down.
 
+A CHECK THAT CANNOT RUN IS NOT A CHECK THAT FAILED. Ask a69's check was a script in its track's state dir;
+the track finished, the janitor took the dir, and for five days the row read "merged, NOT delivered — its
+check has not passed" while nothing about the ask had changed and nobody had measured anything. Both states
+are rc≠0 and they mean opposite things, so they are now told apart: rc 126/127 is "no answer", it exits 3,
+it says so on every line you read, and it never overwrites a check that once passed. The other half is that
+a check should outlive its track — `check-cmd --script` copies the script in beside the ledger, and a check
+that runs a script out of a directory which dies with its track is refused.
+
   cc-scope add <repo> "<ask>" [--src REF] [--track T] [--done-when "..."] [--check "<cmd>"] [--who W] [--at ISO]
   cc-scope list [<repo>] [--all] [--status S] [--track T] [--json]   unsettled asks (all repos if none named)
   cc-scope show <repo> <id>                                          one ask in full: parts, repeats, notes
   cc-scope claim <repo> <id> [--track T]                             a session/track has taken it on
-  cc-scope check-cmd <repo> <id> "<command>"                         the row's own verification; exit 0 = true
+  cc-scope check-cmd <repo> <id> "<command>" | --script <file>       the row's own verification; exit 0 = true
   cc-scope merged <repo> <id> --evidence "<PR or commit>"            it landed. NOT delivered — still work
   cc-scope deliver <repo> <id>                                       RUNS the check; exit 0 → delivered
   cc-scope verify <repo> <id> [--evidence "…"]                       a PERSON measured it against the ask
@@ -47,9 +55,10 @@ be mistaken for each other, which is the whole point of writing the asks down.
   cc-scope digest [<repo>] · count [<repo>] · import <repo> <file> · selfcheck
   cc-scope hook                                                      UserPromptSubmit hook (always 0; speaks only for cc-handoff --relay)
 
-Exit, for the commands a caller acts on: 0 did it · 1 the check ran and FAILED · 2 the row names no check.
+Exit, for the commands a caller acts on: 0 did it · 1 the check ran and FAILED · 2 the row names no check ·
+3 the check COULD NOT RUN, so nothing was measured either way.
 """
-import sys, os, re, json, time, fcntl, hashlib, calendar, subprocess
+import sys, os, re, json, time, fcntl, hashlib, calendar, shutil, subprocess
 
 HOME = os.path.expanduser("~")
 SCOPE = os.environ.get("CC_SCOPE_DIR", os.path.join(HOME, ".cc", "scope"))
@@ -64,6 +73,17 @@ EXAMPLES = "systemctl --user is-active <unit> · test bin/x -nt <the merge> · a
 CHECK_TIMEOUT = 300  # a verification is meant to be CHEAP: one grep, one systemctl is-active, one curl
 MAXTEXT = 800          # a whole essay is not an ask; the source ref is how you read the rest
 SEEN_KEEP = 400        # lines of seen.log kept — enough to catch a miss the same day
+# bash's own two codes for "there was nothing to run": 127 not found, 126 found but not executable. A check
+# that comes back either of these did not answer the question — see CANNOT RUN in the header.
+CANNOT_RUN = (126, 127)
+CHECK_TIMED_OUT = 124  # timeout(1)'s code. A check that HUNG did run, and it is a real failure, not silence.
+CHECKS = "checks"      # ~/.cc/scope/checks/ — where a check script lives so it outlives the track that wrote it
+# A path that dies with the track that made it: a track's own state dir (~/.cc/state/<repo>/<track>/…), a
+# worktree, /tmp. Matched only where the command RUNS the thing, so `test ! -d ~/.cc/state/x/y` — a check
+# that the janitor cleaned up — is still allowed.
+_HOMEISH = r"(?:~|\$HOME|\$\{HOME\}|/home/[^/\s]+|%s)" % re.escape(HOME)
+DOOMED = re.compile(r"(?:(?:^|[;&|(])|(?<![\w./-])(?:bash|sh|source|\.)(?=[ \t]))[ \t]*"
+                    r"(" + _HOMEISH + r"/\.cc/(?:state/[^/\s]+/[^/\s]+|worktrees)/\S+|/tmp/\S+)")
 
 
 def now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -192,6 +212,46 @@ def has_check(a): return bool((a.get("check") or "").strip())
 def passed(a): return (a.get("checked") or {}).get("rc") == 0
 
 
+def cannot_run(a):
+    """The check did not answer, because it was not there to be asked. Everything above this line saw one
+    rc≠0 and called it "the check has not passed", which is how a69 read as a red boundary check for five
+    days after its script went with its track's state dir. No answer is not the same as the answer no."""
+    return (a.get("checked") or {}).get("rc") in CANNOT_RUN
+
+
+def check_dir():
+    d = os.path.join(SCOPE, CHECKS)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def refuse_doomed(repo, aid, c):
+    """A check is read months after it is written, long after the track that wrote it was cleaned up. This
+    refusal used to live inside the check-cmd branch alone, which left `add --check` as a documented door to
+    exactly the row it exists to prevent (review of #297)."""
+    m = DOOMED.search(c or "")
+    if m:
+        sys.exit("cc-scope: that check RUNS a script out of %s, which does not outlive the track that "
+                 "made it.\n  A track's state dir, its worktree and /tmp are all temporary by design, "
+                 "and when one goes\n  the row reads as a failing check when in fact nothing has been "
+                 "measured (a69, 2026-09-02 to 09-07).\n  Keep the script beside the ledger instead:\n"
+                 "    cc-scope check-cmd %s %s --script %s" % (m.group(1), repo, aid, m.group(1)))
+
+
+def install_script(repo, aid, src):
+    """Copy a check script in beside the LEDGER. A track's state dir and its worktree are both temporary by
+    design — the janitor takes them when the track is done — so a check that lives in one is a check with an
+    expiry date on it. This is the durable place: the ledger's own dir, keyed by repo and ask."""
+    src = os.path.expanduser(src)
+    if not os.path.isfile(src):
+        sys.exit("cc-scope: --script %s is not a file. Point it at the script as it is now: check-cmd copies "
+                 "it in, so the original may be in a track dir that later goes away." % src)
+    dst = os.path.join(check_dir(), "%s.%s.sh" % (repo, aid))
+    shutil.copyfile(src, dst)
+    os.chmod(dst, 0o755)
+    return dst
+
+
 def settled(a):
     """Off the queue. `delivered` counts only if a check ACTUALLY PASSED. Every row this code delivers has
     one by construction — but rows written before it exists sit in `delivered` on sentences like "merged as
@@ -206,7 +266,9 @@ def settled(a):
 def run_check(repo, a):
     """(rc, output). The EXIT CODE is the whole answer — a check prints for the human reading the failure,
     and decides nothing by what it prints. Anything that goes wrong running it is a failure, not a pass:
-    the one direction this must never err in is towards 'delivered'."""
+    the one direction this must never err in is towards 'delivered'. Failure is not one thing, though:
+    126/127 mean the command was never there to answer (CANNOT_RUN), and a hang means it ran and would not
+    finish, so a timeout comes back as its own code rather than borrowing the one for 'not found'."""
     env = dict(os.environ)
     # A check names the box's own tools the way a person would at a prompt (`cc-limit selfcheck`), so they have to
     # BE on PATH when it runs. The landing queue's worker has a PATH without the user's bin dir, and three checks
@@ -219,6 +281,8 @@ def run_check(repo, a):
         r = subprocess.run(["bash", "-c", a["check"]], cwd=repo_dir(repo), capture_output=True, text=True,
                            timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
         return r.returncode, r.stdout + r.stderr
+    except subprocess.TimeoutExpired:
+        return CHECK_TIMED_OUT, "the check did not finish inside %ds" % CHECK_TIMEOUT
     except Exception as e:
         return 127, "%s: %s" % (e.__class__.__name__, e)
 
@@ -254,8 +318,10 @@ def line(repo, a, many=False):
     # A merged row is the one the ledger used to call done. It says so on the line you actually read, because
     # "has home been updated yet?" is the question this is here to answer without anyone having to go and look.
     if a["status"] == "merged":
-        why = "\n       ⚠ merged, NOT delivered — %s" % ("its check has not passed: %s" % a["check"] if has_check(a)
-                                                         else "it names no check, so nothing has observed it")
+        why = "\n       ⚠ merged, NOT delivered — %s" % (
+            "its check CANNOT RUN, so nothing has been measured either way — not a red check: %s" % a["check"]
+            if cannot_run(a) else "its check has not passed: %s" % a["check"] if has_check(a)
+            else "it names no check, so nothing has observed it")
     elif a["status"] == "delivered" and not passed(a):
         why = "\n       ⚠ NOT delivered — closed on a sentence before a check was required, so it is back on the queue"
     return "%s %s%-4s %s%s%s%s" % (MARK.get(a["status"], "?"), head, a["id"], a["text"][:96], tail, flag, why)
@@ -432,9 +498,13 @@ def main(argv):
 
     if cmd == "add":
         repo, text = args[0], args[1]
+        # ONE read of --check, reused: opt() DELETES the option and its value out of args, so asking twice
+        # hands the second caller "" and the row silently stores no check at all (review of #297).
+        chk = opt(args, "--check")
+        refuse_doomed(repo, "<new>", chk)   # the same door as check-cmd, and it was open here
         aid, rep = add(repo, text, who=opt(args, "--who", "owner"), src=opt(args, "--src"),
                        track=opt(args, "--track"), done_when=opt(args, "--done-when"),
-                       check=opt(args, "--check"), at=opt(args, "--at"))
+                       check=chk, at=opt(args, "--at"))
         print("%s %s%s" % (repo, aid, " (asked again)" if rep else ""))
 
     elif cmd == "capture":
@@ -458,6 +528,16 @@ def main(argv):
         if a.get("track"):     print("  track   %s" % a["track"])
         if a.get("done_when"): print("  done when %s" % a["done_when"])
         if a.get("reason"):    print("  declined because %s" % a["reason"])
+        if has_check(a):
+            # The check and what it last DID, on the same two lines: the notes below carry every run, and
+            # "has this been measured at all?" should not need reading them in order.
+            c = a.get("checked") or {}
+            print("  check   %s" % a["check"])
+            print("          %s" % ("never run" if not c else
+                                    "passed %s" % c["ts"] if c.get("rc") == 0 else
+                                    "COULD NOT RUN %s (rc %d) — nothing measured" % (c["ts"], c["rc"])
+                                    if c.get("rc") in CANNOT_RUN else
+                                    "ran and FAILED %s (rc %d)" % (c["ts"], c["rc"])))
         print("  %s" % a["text"])
         for p in a.get("parts", []): print("    – %s" % p)
         for s in a.get("seen", []): print("  again   %s %s" % (s["ts"], s.get("src", "") or "-"))
@@ -465,8 +545,15 @@ def main(argv):
         for n in a["notes"]: print("  note    %s %s" % (n["ts"], n["msg"]))
 
     elif cmd == "check-cmd":
-        repo, aid, c = args[0], args[1], args[2].strip()
-        if not c: sys.exit("cc-scope: check-cmd needs a command — one that exits 0 only when the ask is TRUE")
+        script = opt(args, "--script")
+        repo, aid = args[0], args[1]
+        get(repo, aid)     # before anything is copied anywhere
+        if script:
+            c = "bash %s" % install_script(repo, aid, script)
+        else:
+            c = (args[2] if len(args) > 2 else "").strip()
+            if not c: sys.exit("cc-scope: check-cmd needs a command — one that exits 0 only when the ask is TRUE")
+            refuse_doomed(repo, aid, c)
         edit(repo, aid, lambda a: a.update(check=c, checked={}))
         print("%s %s check: %s" % (repo, aid, c))
 
@@ -489,14 +576,32 @@ def main(argv):
             return 2
         rc, o = run_check(repo, a)
         tail = " ".join((o or "").split())[-300:]
+        silent = rc in CANNOT_RUN     # no answer, which is not the answer no
         def upd(x):
-            x["checked"] = {"ts": now(), "cmd": x["check"], "rc": rc, "out": tail}
+            rec = {"ts": now(), "cmd": x["check"], "rc": rc, "out": tail}
             if rc == 0:
+                x["checked"] = rec
                 x["status"], x["closed"] = "delivered", now()
                 x["evidence"] = ((ev + " \u00b7 ") if ev else "") + "check passed: " + x["check"]
+            elif silent:
+                x["notes"].append({"ts": now(), "msg": "check COULD NOT RUN (rc %d) %s \u2014 %s"
+                                                      % (rc, x["check"], tail[:160])})
+                # A check that was never asked must not erase the answer of one that was: overwriting a green
+                # record with rc=127 would drag a delivered row back onto the queue because a FILE went away.
+                if not passed(x): x["checked"] = rec
             else:
+                x["checked"] = rec
                 x["notes"].append({"ts": now(), "msg": "check FAILED (rc %d) %s \u2014 %s" % (rc, x["check"], tail[:160])})
         edit(repo, aid, upd)
+        if silent:
+            print("cc-scope: %s %s \u2014 its check COULD NOT RUN (rc %d). This is NOT a failed check: nothing was\n"
+                  "  measured, so the ask has not been answered either way%s.\n  %s\n  %s\n"
+                  "  Give it a command that is there, or keep the script beside the ledger where it outlives\n"
+                  "  the track that wrote it:  cc-scope check-cmd %s %s --script <file>"
+                  % (repo, aid, rc, " and the row stays '%s' on the run that did pass" % a["status"]
+                     if passed(a) else "", a["check"], tail[:200] or "(no output)", repo, aid),
+                  file=sys.stderr)
+            return 3
         if rc:
             print("cc-scope: %s %s is NOT delivered — its check failed (rc %d), so it stays '%s' and stays open.\n"
                   "  %s\n  %s" % (repo, aid, rc, a["status"], a["check"], tail[:200] or "(no output)"),
@@ -553,7 +658,10 @@ def main(argv):
         for r, a in rows:
             if a["status"] == "merged":
                 why = ("STILL OPEN, names no check — cc-scope check-cmd %s %s '<cmd>'" % (r, a["id"])
-                       if not has_check(a) else "STILL OPEN, its check has not passed: %s" % a["check"])
+                       if not has_check(a) else
+                       "STILL OPEN and NEVER MEASURED — its check CANNOT RUN, which is not a red check: %s"
+                       % a["check"] if cannot_run(a) else
+                       "STILL OPEN, its check has not passed: %s" % a["check"])
             elif a["status"] == "delivered":   # written before a check was required — a sentence, not a measurement
                 why = "STILL OPEN, closed on a sentence: %s" % (a.get("evidence") or "no evidence")
             else:   # verified: a person's own word, which is allowed and is not the same as measured
@@ -789,6 +897,76 @@ def selfcheck():
         add(R, "always run the gates before a PR", track="gates")
         t("check --track only measures that track's asks", quiet(["check", R, "--track", "nope"]) == 0)
         t("check --track sees its own", quiet(["check", R, "--track", "gates"]) == 1)
+
+        # ---- A CHECK THAT CANNOT RUN IS NOT A CHECK THAT FAILED -----------------------------------------
+        # a69's boundary check was a script in its track's state dir. The track finished, the dir went with
+        # it, and the row read "merged, NOT delivered — its check has not passed" for five days while nobody
+        # had measured anything at all. The two cases below are that pair; they must never read alike again.
+        aC, _ = add(R, "prove the workspace boundary holds from inside")
+        quiet(["merged", R, aC, "--evidence", "PR #156"])
+        quiet(["check-cmd", R, aC, "exit 3"])
+        t("a check that RAN and said no is a FAILURE: exit 1, written on the row as one",
+          quiet(["deliver", R, aC]) == 1 and get(R, aC)["checked"]["rc"] == 3
+          and any("check FAILED" in n["msg"] for n in get(R, aC)["notes"]))
+        t("...and the line you read says the check has not passed",
+          "its check has not passed" in run_capture(["list", R]))
+        gone = os.path.join(HOME, ".cc", "scope", CHECKS, "_selfcheck-no-such-check.sh")
+        quiet(["check-cmd", R, aC, "bash %s" % gone])
+        t("a check that CANNOT RUN is a different answer: exit 3, not the 1 a real failure gets",
+          quiet(["deliver", R, aC]) == 3 and get(R, aC)["checked"]["rc"] in CANNOT_RUN)
+        t("...and the row says no answer, not failure",
+          any("COULD NOT RUN" in n["msg"] for n in get(R, aC)["notes"])
+          and not any("check FAILED (rc 127" in n["msg"] for n in get(R, aC)["notes"]))
+        t("...and so does every line a person reads: list, unverified, show",
+          "CANNOT RUN" in run_capture(["list", R])
+          and "NEVER MEASURED" in run_capture(["unverified", R])
+          and "COULD NOT RUN" in run_capture(["show", R, aC]))
+        t("...and no answer still never delivers a row",
+          get(R, aC)["status"] == "merged" and quiet(["check", R]) == 1)
+
+        # The other half: a check must outlive the track that wrote it, and a check that goes missing must
+        # not drag a row that already PASSED back onto the queue — that is this bug pointing the other way.
+        src = os.path.join(SCOPE, "_a-track", "boundary-check.sh")
+        os.makedirs(os.path.dirname(src), exist_ok=True)
+        with open(src, "w") as fh: fh.write("exit 0\n")
+        aD, _ = add(R, "prove the tab renders the block")
+        quiet(["merged", R, aD, "--evidence", "PR #200"])
+        quiet(["check-cmd", R, aD, "--script", src])
+        kept = get(R, aD)["check"].split()[1]
+        t("--script keeps the script beside the LEDGER, not in the track that wrote it",
+          os.path.dirname(kept) == check_dir() and os.path.isfile(kept))
+        t("and a row delivers from there", quiet(["deliver", R, aD]) == 0)
+        shutil.rmtree(os.path.dirname(src))          # the track ends and the janitor takes its dir
+        t("...and the check still runs after the track's own directory is gone",
+          quiet(["deliver", R, aD]) == 0 and get(R, aD)["status"] == "delivered")
+        os.remove(kept)                              # and now the check itself is unreachable
+        t("a check that has gone missing does NOT un-deliver a row that already passed",
+          quiet(["deliver", R, aD]) == 3 and get(R, aD)["status"] == "delivered" and passed(get(R, aD)))
+
+        aE, _ = add(R, "prove the member boundary")
+        doomed_cmd = "bash %s/.cc/state/%s/some-track/boundary-check.sh" % (HOME, R)
+        try:
+            quiet(["check-cmd", R, aE, doomed_cmd]); bad("a check run out of a track's state dir is refused")
+        except SystemExit as e:
+            t("a check run out of a track's state dir is refused, and says where to put it instead",
+              "--script" in str(e))
+        t("...but the SAME path merely looked at is not refused — 'the janitor took it' is a real check",
+          quiet(["check-cmd", R, aE, "test ! -f %s/.cc/state/%s/some-track/boundary-check.sh" % (HOME, R)]) == 0)
+        t("...and running a script that merely takes a temp path as an argument is not refused either",
+          quiet(["check-cmd", R, aE, "bash install.sh /tmp/out.log"]) == 0)
+        # …and `add --check` is the SAME door: it was open while check-cmd's was shut, which is a documented
+        # way to write exactly the row this refusal exists to prevent (review of #297).
+        try:
+            quiet(["add", R, "another ask", "--check", doomed_cmd]); bad("add --check is refused too")
+        except SystemExit as e:
+            t("a doomed check given at `add --check` is refused the same way check-cmd's is", "--script" in str(e))
+        # ASSERT THE CHECK LANDED, not that the call returned an int — the first spelling of this case was
+        # `isinstance(quiet([...]), int)`, which quiet() satisfies unconditionally, and it is why a bug that
+        # dropped --check on the floor shipped green (review of #297).
+        fine = "test -f /etc/hostname"
+        newid = run_capture(["add", R, "an ask with a fine check", "--check", fine]).split()[1]
+        t("...and an ordinary check at `add --check` is still what ends up ON the row",
+          get(R, newid).get("check") == fine)
 
         aid, _ = capture(R, '<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.2" '
                             'user="ada.byron" role="owner" channel="#demo">\nplease put the open asks on Home',
