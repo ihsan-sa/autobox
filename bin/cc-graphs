@@ -53,6 +53,19 @@ WHAT IT EXCLUDES, said rather than drawn as zero.
 The last bucket is PARTIAL: it is not over, and the tick that will book its spend may not have run. It is
 returned with partial=true and drawn as such, never as a cliff.
 
+THE /USAGE-STYLE NUMBER, opt-in as --raw / ?raw=1 (owner, 2026-09-07: he read 8B here and ~16B from /usage and
+asked whether most was untracked — nothing is untracked). cc-spend's ledger dedupes on requestId because Claude
+Code logs one API response as SEVERAL assistant records (one per content block), each carrying that response's
+FULL usage; summing every record the naive way counts a response several times. /usage does exactly that naive
+sum, so it reads roughly 2x the ledger's own count on identical files — not a second population, the SAME
+transcripts, just not deduped. `raw_tokens()` reproduces that naive sum directly from PROJ (~/.claude/projects,
+the files cc-spend also reads) for the same [start, end] the request already computed, with no dedup of any
+kind — not even cc-spend's own cross-file subagent handling, because /usage does not do that either. It is
+opt-in and OFF by default: it re-reads the matching transcripts on every call (a few hundred ms to ~3 s on this
+box's own history), so a caller that does not need it should not ask for it. It never changes total.tokens or
+any group: it is an ADDITIONAL `raw` object, present only when asked for, so the box's own count stays the
+headline everywhere it already was.
+
 BINDING IS THE BOUNDARY. The server binds 127.0.0.1 and answers GET and HEAD only, from a fixed allowlist of
 asset names — no directory listing, no traversal, no upload, no write path of any kind. Putting it on the
 tailnet is one deliberate command and it is the owner's, not this script's:
@@ -61,9 +74,11 @@ tailnet is one deliberate command and it is the owner's, not this script's:
   cc-graphs serve [--port N] [--foreground]   start (or restart) the server on 127.0.0.1
   cc-graphs stop                              stop it
   cc-graphs status                            running? on what port?
-  cc-graphs tokens [--hours N] [--by lane|track|repo|model|kind] [--bucket SEC]   the series, JSON on stdout.
-                    --bucket is one of 300 (a tick), 900, 3600 or 86400; without it the window picks one. A window
-                    and bucket that would draw more than MAX_BUCKETS points is refused, not truncated.
+  cc-graphs tokens [--hours N] [--by lane|track|repo|model|kind] [--bucket SEC] [--raw]   the series, JSON on
+                    stdout. --bucket is one of 300 (a tick), 900, 3600 or 86400; without it the window picks one.
+                    A window and bucket that would draw more than MAX_BUCKETS points is refused, not truncated.
+                    --raw adds the /usage-style undeduped total for the same window — see THE /USAGE-STYLE
+                    NUMBER below for what it is and why it runs high. Off by default: it re-reads transcripts.
   cc-graphs selfcheck                         tests; own fixtures — never this box's ledger and never its recorder
 """
 import glob
@@ -83,6 +98,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 H = os.path.expanduser("~")
 LEDGER = os.environ.get("CC_SPEND_DIR") or os.path.join(H, ".cc", "state", "spend")
+PROJ = os.environ.get("CC_GRAPHS_PROJ") or os.path.join(H, ".claude", "projects")  # same transcripts cc-spend
+                                                                                    # reads; --raw only, own copy
 WORKTREES = os.environ.get("CC_WORKTREES") or os.path.join(H, ".cc", "worktrees")
 STATE = os.environ.get("CC_GRAPHS_DIR") or os.path.join(H, ".cc", "state", "graphs")
 BIN = os.path.dirname(os.path.realpath(__file__))
@@ -132,6 +149,15 @@ def parse_ts(s):
 
 def iso(epoch):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def parse_transcript_ts(s):
+    """A transcript record's own timestamp, e.g. "2026-09-05T17:13:13.078Z" — fractional seconds, unlike the
+    ledger's own (parse_ts above), which cc-spend writes without them."""
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (ValueError, AttributeError):
+        return None
 
 
 # ---------------------------------------------------------------- the ledger (population: every claude process)
@@ -246,11 +272,51 @@ def label_of(key, by):
     return "(none)" if key == "-" else key      # the ledger writes "-" for a column it had no value for
 
 
-def tokens(hours=24, by="lane", step=None, upto=None):
+def raw_tokens(start, end):
+    """The /usage-style total over [start, end] — see THE /USAGE-STYLE NUMBER in the header. Every assistant
+    record's usage in PROJ, summed with NO dedup of any kind: not by requestId, not across files. That naive sum
+    is exactly what runs ~2x the ledger's own count, and reproducing that (not a cleaner number) is the point.
+
+    A file's own last-modified time can only be AFTER every record it holds, so a file untouched since before
+    `start` cannot hold a record inside the window — skipped without opening it. This is an optimisation, not a
+    second filter: every record actually read is still checked against [start, end] by its own timestamp."""
+    tot = [0, 0, 0, 0]
+    for path in glob.glob(os.path.join(PROJ, "**", "*.jsonl"), recursive=True):
+        try:
+            if os.stat(path).st_mtime < start:
+                continue
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        for line in data.splitlines():
+            if b'"assistant"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("type") != "assistant":
+                continue
+            ts = parse_transcript_ts(rec.get("timestamp"))
+            if ts is None or not (start <= ts.timestamp() <= end):
+                continue
+            u = (rec.get("message") or {}).get("usage") or {}
+            for i, k in enumerate(("input_tokens", "output_tokens", "cache_read_input_tokens",
+                                    "cache_creation_input_tokens")):
+                tot[i] += int(u.get(k) or 0)
+    return {"in": tot[0], "out": tot[1], "cache_read": tot[2], "cache_write": tot[3], "tokens": sum(tot)}
+
+
+def tokens(hours=24, by="lane", step=None, upto=None, raw=False):
     """The token series: one bucket per `step` seconds over the last `hours`, grouped by `by`.
 
     A point is the spend the ledger BOOKED in that bucket — see the header for what that means and what it
-    leaves out. Nothing here attributes spend to a PR, so none of cc-econ's attribution rules are in play."""
+    leaves out. Nothing here attributes spend to a PR, so none of cc-econ's attribution rules are in play.
+
+    raw=True adds an extra `raw` total for the same [start, end] — the /usage-style undeduped count, see THE
+    /USAGE-STYLE NUMBER in the header. It costs a fresh read of matching transcripts and changes nothing else
+    this function returns, so it defaults off."""
     if by not in BY:
         raise ValueError("by must be one of " + ", ".join(BY))
     hours = max(1, min(int(hours), 24 * 90))
@@ -366,7 +432,7 @@ def tokens(hours=24, by="lane", step=None, upto=None):
         g["total"]["tokens"] = ssum(g["tokens"])
         groups.append(g)
 
-    return {
+    out = {
         "generated": iso(time.time()), "window_h": hours, "by": by, "t0": t0, "step": step, "n": n,
         "partial": True,                              # the last bucket is not over and its tick may not have run
         "surface": SURFACE, "groups": groups,
@@ -383,6 +449,16 @@ def tokens(hours=24, by="lane", step=None, upto=None):
                      "a quiet week"),
         "lanes": LANES,
     }
+    # raw is ADDITIVE and opt-in — see raw_tokens() and THE /USAGE-STYLE NUMBER in the header. total.tokens
+    # above, the box's own count, is untouched either way and stays the headline.
+    if raw:
+        out["raw"] = raw_tokens(start, end)
+        out["raw_note"] = ("the /usage-style count: every assistant record's usage over the same window, summed "
+                            "with no dedup by requestId. Claude Code logs one API response as several records "
+                            "(one per content block) and each carries the FULL usage, so this runs roughly 2x "
+                            "total.tokens — the box's own count, each response counted once. Same transcripts, "
+                            "same window, not a second population; the gap is expected, not untracked spend.")
+    return out
 
 
 # ---------------------------------------------------------------- vitals (passthrough; cc-vitals owns the truth)
@@ -437,7 +513,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/tokens":
                 return self._json(200, tokens(hours=int(one("hours", 24)), by=one("by", "lane"),
-                                              step=one("bucket")), head)
+                                              step=one("bucket"),
+                                              raw=one("raw", "0") in ("1", "true", "yes")), head)
             if path == "/api/vitals":
                 return self._json(200, vitals(hours=int(one("hours", 24))), head)
             if path.startswith("/api/"):
@@ -561,7 +638,7 @@ def serve(opt):
 
 def cmd_tokens(opt):
     print(json.dumps(tokens(hours=int(opt.get("--hours") or 24), by=opt.get("--by") or "lane",
-                            step=opt.get("--bucket")), indent=1))
+                            step=opt.get("--bucket"), raw="--raw" in opt), indent=1))
     return 0
 
 
@@ -582,7 +659,7 @@ def _row(ts, sess="s1", cwd="/w", repo="r", track="t", kind="headless", model="m
 
 
 def selfcheck(_opt=None):
-    global LEDGER, WORKTREES, WEB, VITALS
+    global LEDGER, WORKTREES, WEB, VITALS, PROJ
     ok, bad = 0, []
 
     def t(name, cond):
@@ -592,7 +669,7 @@ def selfcheck(_opt=None):
         else:
             bad.append(name)
 
-    keep_l, keep_w, keep_web, keep_v = LEDGER, WORKTREES, WEB, VITALS
+    keep_l, keep_w, keep_web, keep_v, keep_p = LEDGER, WORKTREES, WEB, VITALS, PROJ
     root = tempfile.mkdtemp(prefix="cc-graphs-selfcheck-")
     try:
         WORKTREES = os.path.join(root, "wt")
@@ -778,6 +855,51 @@ def selfcheck(_opt=None):
         t("that same window is fine daily", tokens(hours=24 * 90, step=DAY, upto=upto)["n"] <= MAX_BUCKETS)
         t("bad group refused", _raises(lambda: tokens(hours=24, by="session", upto=upto)))
 
+        # 8b — the /usage-style raw total (--raw / raw=True): every assistant record's usage, no dedup at all —
+        #      not even cc-spend's requestId one — reproducing the naive sum /usage does. Off by default and
+        #      strictly additive: it must never move total.tokens or any group.
+        PROJ = os.path.join(root, "proj")
+        os.makedirs(os.path.join(PROJ, "p1"))
+
+        def _tline(rid, ts, i=0, o=0, cr=0, cw=0):
+            return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts, "sessionId": "s1",
+                                "message": {"usage": {"input_tokens": i, "output_tokens": o,
+                                                       "cache_read_input_tokens": cr,
+                                                       "cache_creation_input_tokens": cw}}})
+
+        raw_now = now()
+        in_win = (raw_now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        out_win = (raw_now - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        with open(os.path.join(PROJ, "p1", "s1.jsonl"), "w") as f:
+            f.write(_tline("req1", in_win, i=10, o=1, cr=2, cw=3) + "\n")   # one response, logged 3 times over —
+            f.write(_tline("req1", in_win, i=10, o=1, cr=2, cw=3) + "\n")   # cc-spend dedupes these to ONE;
+            f.write(_tline("req1", in_win, i=10, o=1, cr=2, cw=3) + "\n")   # raw does not
+            f.write(_tline("req2", in_win, i=5, o=0, cr=0, cw=0) + "\n")    # a second, distinct response
+            f.write(_tline("req3", out_win, i=999, o=0, cr=0, cw=0) + "\n")  # outside the window — its own
+                                                                              # record says so, not its file's
+
+        r_no_raw = tokens(hours=24, by="lane", step=900, upto=raw_now)
+        t("raw is opt-in: absent unless asked for", "raw" not in r_no_raw)
+
+        r_raw = tokens(hours=24, by="lane", step=900, upto=raw_now, raw=True)
+        t("raw sums every record with no dedup: req1's three copies all count", r_raw["raw"]["in"] == 10 * 3 + 5)
+        t("a record's own timestamp outside the window is excluded even though its file is fresh",
+          r_raw["raw"]["in"] != 10 * 3 + 5 + 999)
+        t("raw tokens is the four counts summed", r_raw["raw"]["tokens"] ==
+          r_raw["raw"]["in"] + r_raw["raw"]["out"] + r_raw["raw"]["cache_read"] + r_raw["raw"]["cache_write"])
+        t("raw never moves the box's own count", r_raw["total"] == r_no_raw["total"]
+          and r_raw["groups"] == r_no_raw["groups"])
+
+        # a file whose last write predates the window cannot hold a record inside it, whatever the record itself
+        # claims — skipped without being opened at all.
+        old = os.path.join(PROJ, "p1", "old.jsonl")
+        with open(old, "w") as f:
+            f.write(_tline("req9", in_win, i=12345) + "\n")
+        stale = raw_now.timestamp() - 999999
+        os.utime(old, (stale, stale))
+        r_raw2 = tokens(hours=24, by="lane", step=900, upto=raw_now, raw=True)
+        t("a file untouched since before the window is skipped, not read", r_raw2["raw"]["in"] == r_raw["raw"]["in"])
+
         # 9 — the server: loopback, read-only, exact asset allowlist.
         WEB = os.path.join(root, "web")
         os.makedirs(WEB)
@@ -822,6 +944,11 @@ def selfcheck(_opt=None):
             j = json.loads(body)
             t("tokens endpoint is the same function, on this case's own ledger",
               code == 200 and j["step"] == 900 and abs(j["total"]["usd"] - 3.5) < 1e-9)
+            code, body = get("/api/tokens?hours=24&bucket=900")
+            t("raw absent by default over the wire too", "raw" not in json.loads(body))
+            # PROJ is still case 8b's fixture — this only proves the query param reaches the same raw_tokens()
+            code, body = get("/api/tokens?hours=24&bucket=900&raw=1")
+            t("?raw=1 turns it on over the wire", json.loads(body)["raw"]["in"] == 10 * 3 + 5)
 
             # 10 — /api/vitals is a PASSTHROUGH and nothing else: whatever cc-vitals prints comes back unchanged.
             #      On a stub written here, because this case must never run this box's own recorder. Both sides:
@@ -846,7 +973,7 @@ def selfcheck(_opt=None):
             srv.server_close()
             Handler.log_message = quiet
     finally:
-        LEDGER, WORKTREES, WEB, VITALS = keep_l, keep_w, keep_web, keep_v
+        LEDGER, WORKTREES, WEB, VITALS, PROJ = keep_l, keep_w, keep_web, keep_v, keep_p
         shutil.rmtree(root, ignore_errors=True)
 
     print("cc-graphs selfcheck: %d passed, %d failed" % (ok, len(bad)))

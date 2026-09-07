@@ -245,8 +245,10 @@ function tokensRender() {
     TOK.hidden = new Set(series.filter(s => s.hidden).map(s => s.key));
     tokensRender();
   });
-  document.getElementById('tokens-now').textContent =
-    fmtNum(d.total.tokens) + ' tokens · ' + fmtUsd(d.total.usd) + ' est · ' + d.rows.toLocaleString() + ' ledger rows';
+  let now = fmtNum(d.total.tokens) + ' tokens (this box\'s count) · ' + fmtUsd(d.total.usd) + ' est · ' +
+    d.rows.toLocaleString() + ' ledger rows';
+  if (d.raw) now += ' · ' + fmtNum(d.raw.tokens) + ' /usage-style';
+  document.getElementById('tokens-now').textContent = now;
 
   const bucket = d.step >= 86400 ? (d.step / 86400) + ' day' : d.step >= 3600 ? (d.step / 3600) + ' h' : (d.step / 60) + ' min';
   const foot = document.getElementById('tokens-foot');
@@ -254,6 +256,14 @@ function tokensRender() {
   const p1 = el('p');
   p1.innerHTML = '<b>' + mlabel + '</b>, ' + bucket + ' buckets, grouped by <b>' + d.by + '</b>. A point is ' + d.means + '.';
   foot.appendChild(p1);
+  if (d.raw) {
+    // Which one a reader's own /usage will agree with, stated plainly: this box's count, once a response;
+    // /usage's, once a transcript record — and there are several records per response.
+    foot.appendChild(el('p', 'note',
+      fmtNum(d.total.tokens) + ' is this box\'s count (each API response once) · ' + fmtNum(d.raw.tokens) +
+      ' is what /usage would show for the same window (every transcript record once, so a response counted ' +
+      'several times). ' + d.raw_note));
+  }
   if (d.coarse.days.length) {
     const days = d.coarse.days.map(c => c.day);
     const which = days.length > 3 ? days[0] + ' … ' + days[days.length - 1] : days.join(', ');
@@ -357,7 +367,10 @@ function fail(id, e) {
 
 async function loadTokens() {
   try {
-    TOK.data = await get('/api/tokens?hours=' + TOK.hours + '&by=' + TOK.by);
+    // raw=1: the box's own count (total.tokens, unchanged) plus the /usage-style undeduped total for the same
+    // window — see cc-graphs' raw_tokens() for what it is and why it runs ~2x high. This is the one place that
+    // asks for it; a second view of the same window would just redo the same re-read.
+    TOK.data = await get('/api/tokens?hours=' + TOK.hours + '&by=' + TOK.by + '&raw=1');
     tokensRender();
   } catch (e) { fail('tokens', e); }
 }
