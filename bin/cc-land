@@ -987,6 +987,42 @@ def gate_fail(text):
     return " · ".join(hits[:3])[:400] or last(text)
 
 
+def stale_note(root, base_ref, base, head, mine=()):
+    """Why a red gate may be the CALENDAR rather than a bug, as a sentence to hang off the failure — or "" when
+    there is nothing to say. On a box that lands ten times in a day every branch is behind by the time the queue
+    reaches it, so the gate a stale head fails is usually running an OLD copy of code the base has since fixed:
+    PR #305 failed one unnamed case, was rebased with nothing else changed, and went green (2026-09-07). Several
+    turns went into hunting a bug that did not exist, twice.
+
+    Two facts, both cheap and both read ONLY once a gate has already gone red: how many commits the base has that
+    this head does not, and which files those commits moved that this head does NOT itself change — the ones a
+    rebase brings in whole. Naming them is what makes the note worth reading: they are the code the gate ran an
+    old copy of. Files the head changes too are left out, because there its own version is the point.
+
+    Silence is the only honest answer when git cannot say (no merge-base, an unfetched base, a count that will not
+    parse): a landing that guessed "stale" over a real failure would send the next person the other way."""
+    rc, o = sh(["git", "rev-list", "--count", f"{head}..{base_ref}"], cwd=root)
+    try:
+        n = int(o.strip()) if not rc else 0
+    except ValueError:
+        n = 0
+    if n <= 0:
+        return ""
+    behind = f"{n} commit{'' if n == 1 else 's'} behind {base}"
+    rc, o = sh(["git", "merge-base", base_ref, head], cwd=root)
+    fork = o.strip() if not rc else ""
+    moved = []
+    if fork:
+        rc, o = sh(["git", "diff", "--name-only", fork, base_ref], cwd=root)
+        if not rc:
+            own = set(mine)
+            moved = [l.strip() for l in (o or "").splitlines() if l.strip() and l.strip() not in own]
+    missing = ("without " + ", ".join(moved[:3]) + (f" and {len(moved) - 3} more" if len(moved) > 3 else "")
+               if moved else "")
+    return (f" — and this branch is {behind}" + (f", {missing}" if missing else "")
+            + f": rebase it onto {base} and run again before hunting for a bug that may already be fixed")
+
+
 def verdict_of(answer):
     """The reviewer's answer, read as a decision. The schema path is the real one: `verdict` is a validated enum
     field, so the numbered findings underneath — which, reviewing anything that reviews, quote all three verdicts —
@@ -1475,7 +1511,8 @@ class Land:
                 rc, o = run_gate([f"{tree}/{g}"], tree, keep, start["env"])
                 bad = FAILED_RE.search(o)
                 if rc or (bad and bad.group(1) != "0"):
-                    raise Failed(f"gate {g} did not pass: {gate_fail(o)}  [full output: {keep}]")
+                    raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
+                                 f"  [full output: {keep}]")
 
             quick, slow = [g for g in found if g not in SUITE], [g for g in found if g in SUITE]
             for g in quick:
@@ -1514,6 +1551,16 @@ class Land:
         finally:
             if tmp:
                 self.drop_checkout(tmp, tree)
+
+    def behind_base(self):
+        """How far this head is behind what it will land on, said out loud on a RED gate and nowhere else
+        (stale_note). It changes nothing the landing does — the branch is nobody's to rewrite from here, and a
+        rebase this file performed unasked would be a worse problem than the bug hunt it saves. A no-PR deploy has
+        no branch to be behind: the checkout IS the base."""
+        if not self.pr or not self.head:
+            return ""
+        return stale_note(self.root, f"origin/{self.base()}", self.base(), self.head,
+                          [p for _, p in self.changed_files()])
 
     def gate_scope(self):
         """The paths this diff changes, sorted and space-separated as git names them: what a suite that knows its
@@ -2974,6 +3021,56 @@ def cmd_selfcheck():
         globals()["GATE_IDLE"] = real_idle
         shutil.rmtree(probe, ignore_errors=True)
 
+    # A red gate on a branch that is simply OLD. On a real repo, with real git plumbing — the whole question is
+    # what `merge-base`, `rev-list` and `diff` say about two lines of history, and a fake world answering them
+    # would be asserting the fixture. `sh` is still the real one here, as for the probes above.
+    srepo = tempfile.mkdtemp(prefix="cc-land-selfcheck-stale-")
+    genv = dict(os.environ, GIT_AUTHOR_NAME="selfcheck", GIT_AUTHOR_EMAIL="selfcheck@example.invalid",
+                GIT_COMMITTER_NAME="selfcheck", GIT_COMMITTER_EMAIL="selfcheck@example.invalid",
+                GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+
+    def sgit(*a):
+        rc, o = sh(["git"] + list(a), cwd=srepo, env=genv, timeout=60)
+        return o.strip() if rc == 0 else ""
+
+    def scommit(path, text, msg):
+        os.makedirs(os.path.dirname(f"{srepo}/{path}") or srepo, exist_ok=True)
+        open(f"{srepo}/{path}", "w").write(text)
+        sgit("add", "-A")
+        sgit("commit", "-q", "--no-gpg-sign", "-m", msg)
+        return sgit("rev-parse", "HEAD")
+
+    sgit("init", "-q")
+    sgit("symbolic-ref", "HEAD", "refs/heads/main")  # named before the first commit: init -b is not everywhere
+    scommit("core/bin/tool", "v1\n", "base")
+    sgit("checkout", "-q", "-b", "old-branch")
+    old_head = scommit("core/bin/other", "the branch's own file\n", "the branch's change")
+    sgit("checkout", "-q", "main")
+    scommit("core/bin/tool", "v2\n", "a landing")
+    scommit("core/bin/other", "main moved this too\n", "another landing")
+    main_at = scommit("core/tests/check.sh", "a third\n", "a third landing")
+    sgit("update-ref", "refs/remotes/origin/main", main_at)      # what a fetch of the base leaves behind
+    sgit("checkout", "-q", "old-branch")
+    stale = stale_note(srepo, "origin/main", "main", old_head, ["core/bin/other"])
+    check("a red gate on a branch written against an OLDER base says so: three commits behind, naming the files "
+          "the base moved that a rebase would bring in whole — PR #305 failed one unnamed case, was rebased with "
+          "nothing else changed, and went green (2026-09-07)",
+          "3 commits behind main" in stale and "core/bin/tool" in stale and "core/tests/check.sh" in stale
+          and "rebase" in stale)
+    check("...and it leaves out the files the branch changes ITSELF: those are not code it is running an old copy "
+          "of, they are the change — listing them would send the reader to their own diff",
+          "core/bin/other" not in stale)
+    sgit("checkout", "-q", "-b", "todays-branch", "main")
+    up_to_date = scommit("core/bin/fresh", "written against today's main\n", "a change on top of main")
+    check("CONTROL: a branch level with its base gets NO such line, so a gate that is genuinely red still reads "
+          "as red rather than as a rebase somebody has yet to do",
+          sgit("rev-parse", "origin/main") == main_at and stale_note(srepo, "origin/main", "main", up_to_date,
+                                                                    ["core/bin/fresh"]) == "")
+    check("...and a base git cannot answer for at all is silence, never a guess: a landing that cried 'stale' "
+          "over a real failure would send the next person exactly the wrong way",
+          stale_note(srepo, "origin/no-such-base", "no-such-base", old_head, []) == "")
+    shutil.rmtree(srepo, ignore_errors=True)
+
     def REVIEWED(verdict, where="", what="", fix="", cost=0.42):
         """What `claude -p --output-format json --json-schema …` hands back — the fake model, standing in for the
         whole call. `structured_output` is the schema-validated object; `result` is its text twin, and the two are
@@ -3605,24 +3702,49 @@ def cmd_selfcheck():
     # …and it stops before a token is bought. The gates run FIRST now, so a head the suite refuses is rejected
     # having cost nothing: reviewing first optimised wall clock and paid a model to read code that could not merge
     # (docs/architecture-usage-efficiency-audit-2026-09-02.md, P0). A real gate script, red, on its own fixture.
-    L = fresh(pr=7)
-    world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
-    # a gate runs as <tmp>/head/core/tests/check.sh, so the fixture answers on that prefix, not on a fixed path
-    world[f"{tempfile.gettempdir()}/cc-land."] = (1, "  ✗ the row was wrong\n1 failed\n")
-    real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
-    try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            rc = L.run()
-    finally:
-        os.access = real_access
-        for f in glob.glob(f"{tempfile.gettempdir()}/cc-land-gate-myrepo-*.log"):
-            with contextlib.suppress(OSError):
-                os.unlink(f)
+    def red_gate(**extra):
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        # a gate runs as <tmp>/head/core/tests/check.sh, so the fixture answers on that prefix, not a fixed path
+        world[f"{tempfile.gettempdir()}/cc-land."] = (1, "  ✗ the row was wrong\n1 failed\n")
+        world.update(extra)
+        real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = L.run()
+        finally:
+            os.access = real_access
+            for f in glob.glob(f"{tempfile.gettempdir()}/cc-land-gate-myrepo-*.log"):
+                with contextlib.suppress(OSError):
+                    os.unlink(f)
+        return L, rc
+
+    L, rc = red_gate(**{"git rev-list --count": (0, "0\n")})
     check("a red gate rejects the head with ZERO model spend: no reviewer was asked about code the suite has "
           "already refused, and nothing was counted against the change for it",
           rc == 1 and L.stopped == "gates" and "the row was wrong" in L.why
           and not [c for c in calls if c[0] == CLAUDE]
           and not ran("gh pr merge") and not root_work("myrepo", 7).get("reviews"))
+    check("CONTROL, all the way through a run: that head is level with its base, so the landing says the failing "
+          "case and nothing else — a red branch written against today's main reads as red",
+          "behind main" not in L.why and "rebase" not in L.why)
+
+    # …and the same red gate on a head written against an OLDER main names that, in the line the queue card and
+    # the ledger carry — the failing case FIRST, the calendar after it. Four landings behind, one unnamed case,
+    # several turns of bug hunt, and a rebase that changed nothing else went green (PR #305, PR #303, 2026-09-07).
+    L, rc = red_gate(**{"git rev-list --count": (0, "4\n"), "git merge-base": (0, "b" * 40 + "\n"),
+                        "git diff --name-only": (0, "core/bin/cc-land\ncore/tests/check.sh\n")})
+    check("a red gate on a branch four landings behind its base says so IN THE FAILURE, naming the files it does "
+          "not have, so the first move is a rebase and not a hunt for a bug that main has already fixed",
+          rc == 1 and L.stopped == "gates" and "4 commits behind main" in L.why
+          and "core/bin/cc-land" in L.why and "rebase it onto main" in L.why)
+    check("...and the gate's own failing case still comes FIRST: the branch being old is an explanation offered "
+          "under the failure, never a replacement for it — the landing stops either way, and nothing merged",
+          "the row was wrong" in L.why and "behind main" in L.why
+          and L.why.index("the row was wrong") < L.why.index("behind main") and not ran("gh pr merge"))
+    check("...and the landing rebases NOTHING to say it: no checkout, no rebase, no push — the branch belongs to "
+          "whoever wrote it",
+          not ran_sub("git", "rebase") and not ran_sub("git", "push"))
 
     # …and a gate's verdict is its own tally, not just its exit code (a suite can exit 0 and say "1 failed")
     L = fresh(track="w1", note="a config edit")

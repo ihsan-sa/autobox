@@ -213,10 +213,26 @@ def passed(a): return (a.get("checked") or {}).get("rc") == 0
 
 
 def cannot_run(a):
-    """The check did not answer, because it was not there to be asked. Everything above this line saw one
-    rc≠0 and called it "the check has not passed", which is how a69 read as a red boundary check for five
-    days after its script went with its track's state dir. No answer is not the same as the answer no."""
+    """The check did not answer. Everything above this line saw one rc≠0 and called it "the check has not
+    passed", which is how a69 read as a red boundary check for five days after its script went with its
+    track's state dir. No answer is not the same as the answer no — but "no answer" has more than one cause
+    (see shell_could_not_exec below), and this only tells CANNOT_RUN apart from a real failure, not one
+    CANNOT_RUN cause from another."""
     return (a.get("checked") or {}).get("rc") in CANNOT_RUN
+
+
+# bash's OWN diagnostic when it never found anything to run: always starts the line "bash: " and ends in one
+# of its three fixed reasons. A check can return the SAME rc on purpose, though — a69's rebuilt boundary check
+# exits 126 itself to say some of what it would measure never started (2026-09-07, no member/credential words
+# here on purpose: this file must not learn what any one check means). The interpreter ran that check fine, so
+# this text never appears in its output, and telling the reader to "give it a command that is there" would be
+# advice for a problem it does not have. Generic and mechanical: it reads bash's own wording, not the check's.
+_SHELL_EXEC_FAILURE = re.compile(r"^bash: .*(?:No such file or directory|Permission denied|command not found)",
+                                 re.M)
+
+
+def shell_could_not_exec(output):
+    return bool(_SHELL_EXEC_FAILURE.search(output or ""))
 
 
 def check_dir():
@@ -594,12 +610,21 @@ def main(argv):
                 x["notes"].append({"ts": now(), "msg": "check FAILED (rc %d) %s \u2014 %s" % (rc, x["check"], tail[:160])})
         edit(repo, aid, upd)
         if silent:
+            if shell_could_not_exec(o):
+                # bash itself never found anything to run — the vanished-script cause #297 was written for.
+                fix = ("  Give it a command that is there, or keep the script beside the ledger where it "
+                       "outlives\n  the track that wrote it:  cc-scope check-cmd %s %s --script <file>"
+                       % (repo, aid))
+            else:
+                # The interpreter ran the check fine; the check chose this rc itself to say it could not
+                # measure something. That is not a missing command, so this must not send the reader to fix
+                # a path that was never broken — the reason is whatever it printed above, on the check.
+                fix = ("  That is not a missing command \u2014 read what it printed above for the reason, and "
+                       "rerun\n  once it changes:  cc-scope deliver %s %s" % (repo, aid))
             print("cc-scope: %s %s \u2014 its check COULD NOT RUN (rc %d). This is NOT a failed check: nothing was\n"
-                  "  measured, so the ask has not been answered either way%s.\n  %s\n  %s\n"
-                  "  Give it a command that is there, or keep the script beside the ledger where it outlives\n"
-                  "  the track that wrote it:  cc-scope check-cmd %s %s --script <file>"
+                  "  measured, so the ask has not been answered either way%s.\n  %s\n  %s\n%s"
                   % (repo, aid, rc, " and the row stays '%s' on the run that did pass" % a["status"]
-                     if passed(a) else "", a["check"], tail[:200] or "(no output)", repo, aid),
+                     if passed(a) else "", a["check"], tail[:200] or "(no output)", fix),
                   file=sys.stderr)
             return 3
         if rc:
@@ -924,6 +949,24 @@ def selfcheck():
         t("...and no answer still never delivers a row",
           get(R, aC)["status"] == "merged" and quiet(["check", R]) == 1)
 
+        # ---- THE ADVICE MUST FIT THE REASON, NOT JUST THE CODE -------------------------------------------
+        # CANNOT_RUN has two real causes and #297 only wrote advice for one: `gone` above is a script that
+        # truly vanished, and pointing the reader at "give it a command that is there" is correct for it. But
+        # a check can run PERFECTLY and choose rc 126/127 itself to say it could not measure something (the
+        # rebuilt member boundary check, 2026-09-07) — the interpreter never failed to find it, so telling the
+        # reader their command is missing sends them to fix a path that was never broken.
+        rc, out = run_capture_err(["deliver", R, aC])   # aC's check is still `bash <gone>` from just above
+        t("the vanished-script cause still gets told to give it a command that is there",
+          rc == 3 and "give it a command that is there" in out.lower())
+        quiet(["check-cmd", R, aC, "echo could not start 2 of 5, nothing failed >&2; exit 126"])
+        rc2, out2 = run_capture_err(["deliver", R, aC])
+        t("a check that RAN and chose CANNOT_RUN itself is still read as no answer, not a failure",
+          rc2 == 3 and get(R, aC)["checked"]["rc"] == 126)
+        t("...but it is NOT told its command is missing — that diagnosis does not fit what happened",
+          "give it a command" not in out2.lower())
+        t("...it is pointed at the check's own output and at re-running the SAME check",
+          "read what it printed" in out2.lower() and "cc-scope deliver %s %s" % (R, aC) in out2)
+
         # The other half: a check must outlive the track that wrote it, and a check that goes missing must
         # not drag a row that already PASSED back onto the queue — that is this bug pointing the other way.
         src = os.path.join(SCOPE, "_a-track", "boundary-check.sh")
@@ -1081,6 +1124,15 @@ def run_capture(argv):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf): main(argv)
     return buf.getvalue()
+
+
+def run_capture_err(argv):
+    """(exit code, stdout+stderr) — `deliver`'s CANNOT_RUN advice is written to stderr, and telling one cause
+    of it from another means asserting on the words, not just on the row's state afterwards."""
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf): rc = main(argv) or 0
+    return rc, buf.getvalue()
 
 
 def hook_asks(text):
