@@ -276,6 +276,25 @@ def selfcheck(m):
                   and event["operation"] == "import" and event["refusal"] == "quiet"
                   and event["reason"] == m.UNKNOWN,
                   "an unrecognised class is logged as a quiet refusal; control imports", reason + detail)
+            # …and a class need not even be hashable: `kind in CHECKED` hashes it, so a checking process
+            # handing back a list for `kind` must be refused before that hash, not raise TypeError past
+            # run() and main() (importing() below would let an unguarded TypeError straight through too).
+            m.__file__ = doctored("def entry(meta):\n", "def entry(meta):\n    return print(json.dumps("
+                                  "dict(refused=%r, kind=[])), flush=True)\n" % poison)
+            transfer = submit("unhashable-class", good); before = snapshot()
+            try:
+                refused, reason = importing("unhashable-class", transfer)
+            except TypeError as exc:
+                refused, reason = "crashed", str(exc)
+            unchanged = snapshot() == before
+            log = v / "state/unhashable-class/status.jsonl"
+            event = json.loads(log.read_text().splitlines()[-1]) if log.exists() else {}
+            m.__file__ = runner
+            control, detail = importing("unhashable-class", submit("unhashable-class", good))
+            check(refused is None and unchanged and control is not None and event.get("refusal") == "quiet"
+                  and event.get("reason") == m.UNKNOWN,
+                  "an unhashable class (a list) is logged as a quiet refusal; control imports",
+                  str(reason) + detail)
             # …and the SUCCESS path had the same hole: it splatted the checking process's whole object into the
             # host's status event. An unknown key wrote the member's own wording into status.jsonl, the broker's
             # projection and stdout; a wrongly typed count went with it.
