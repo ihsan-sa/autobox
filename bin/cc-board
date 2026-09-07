@@ -43,7 +43,10 @@ FIELDS = ("agent", "agent_at", "branch", "created", "instructions", "kind", "not
 # `agent_at` beside it, and cc-reconcile and cc-pulse both stop counting a mark older than CC_AGENT_MARK_HOURS
 # (6 h). A session still on the row marks again, which refreshes the time; one that moved on without clearing the
 # mark no longer holds the row for as long as its window happens to live (review of #242). After either the row
-# is unattended again and is reported like any other. `agent ''` clears both fields by hand.
+# is unattended again and is reported like any other. `agent ''` clears both fields by hand. A mark is MADE by
+# the session it names and by nothing else; the one thing that may move an existing one is `handover` below —
+# which moves the name and NOT the clock, so a mark that had already expired stays expired — and that is the
+# whole of the exception.
 def agent_id(val):
     """`me` = the window THIS process is in, as "<window id>:<tmux server pid>". The server pid is half the mark
     because window ids restart at @0 when the server does: without it a mark left by a session that died in a
@@ -312,9 +315,9 @@ def refresh_inflight(repo, track):
     """…and what OTHER live tracks are holding is computed into the brief from the board, never typed into it."""
     _brief_tool("refresh", repo, track)
 
-USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"base":2,"list":1,"boards":1,"selfcheck":1}
+USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"base":2,"list":1,"boards":1,"selfcheck":1,"handover":5}
 def main(a):
-    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|base|list [--all]|boards [--all]|rm|tracks|selfcheck} ...")
+    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|base|list [--all]|boards [--all]|rm|tracks|handover|selfcheck} ...")
     cmd = a[0]
     sys.stdout.reconfigure(errors="replace")   # a bad title already on disk prints as '?', never as a traceback
     if cmd in USAGE and len(a) < USAGE[cmd]:   # a short call must say so, not traceback
@@ -383,6 +386,44 @@ def main(a):
             if key=="agent": d["tracks"][track]["agent_at"] = now() if val else ""
             d["tracks"][track][key]=val; d["tracks"][track]["updated"]=now()
             _save(repo,d)
+    elif cmd == "handover":
+        # A MARK MOVES WHEN THE SESSION HOLDING IT IS RETIRED — the one exception to `agent_id`'s rule that a mark
+        # is made by the session it names. A handoff renames the retiring session's window, and every mark it made
+        # stops counting in that instant while its subagents are still running and still reporting to the successor
+        # (cc-handoff, carry_marks): five rows were called abandoned and blocked ten minutes after a cutover, then
+        # offered for dispatch a second time (2026-09-07). The successor takes those reports, so it holds the rows.
+        #
+        # WHY THIS IS NOT THE HOLE `agent me` REFUSES. That refusal exists because a typed mark naming somebody
+        # else's live window would hold an UNOWNED row open in silence. This never claims a row: it rewrites only
+        # rows that already carry `<from>` — rows already held out of the reconciler by that mark — and it must be
+        # told each track by name, so it can never sweep a board. Aim it at a window that is not there and the row
+        # is RELEASED, not held (a reader wants the mark's window to still be a session on this repo), so the
+        # dangerous direction is the one it cannot go.
+        repo, frm, to, names = a[1], a[2], a[3], a[4:]
+        for m in (frm, to):
+            if not re.fullmatch(r"@\d+:\d+", m):
+                sys.exit(f"cc-board handover: '{m}' is not a mark (<window id>:<tmux server pid>)")
+        if frm == to: sys.exit("cc-board handover: from and to name the same window")
+        moved = []
+        with Lock(repo):
+            d = need(repo)
+            for track in names:
+                t = d["tracks"].get(track)
+                # EXACTLY EQUAL, never a prefix: `@1:900` is not `@12:900`, and a prefix match here would hand one
+                # session's live row to another in silence — worse than the bug this verb exists for.
+                if t is None or (t.get("agent") or "").strip() != frm: continue
+                # THE CLOCK IS CARRIED, NOT RESTARTED. `agent_at` is the age both readers expire a mark on
+                # (cc-reconcile mark_why, cc-pulse agent_held), so a fresh stamp here would make a mark they had
+                # both already given up on warm again: a row marked at 02:00 whose subagent died, cold by 09:00
+                # and already `blocked`, would read `running` for six more hours with nothing on the box doing
+                # it — 'loosening it would hide a real abandonment'. The successor inherits the hold that was
+                # actually left, and refreshes it the ordinary way (`set … agent me`) because the row names its
+                # own window now. The usage-limit half of mark_why is keyed on this stamp for the same reason.
+                t["agent"], t["updated"] = to, now()
+                d["log"].append({"ts": now(), "track": track, "msg": f"agent {frm} -> {to} (handoff)"})
+                moved.append(track)
+            if moved: _save(repo, d)
+        print("\n".join(moved))
     elif cmd == "get":
         repo, track, key = a[1], a[2], a[3]
         if key == "instructions": print(brief(repo, track), end=""); return
@@ -705,6 +746,40 @@ def selfcheck():
         ok("`agent ''` hands the row back, time and all",
            run("get", "r", "t1", "agent").stdout.strip() == ""
            and run("get", "r", "t1", "agent_at").stdout.strip() == "")
+        # HANDOVER: the one way a mark moves to a window other than the one that made it. cc-handoff calls it at a
+        # cutover, because the retiring session's subagents keep running and report into its successor — without it
+        # the watchdog called five such rows abandoned ten minutes later and put them back in the pool (2026-09-07).
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        for row, ag in (("h1", "@3:900"), ("h2", "@3:900"), ("h3", "@30:900"), ("h4", "")):
+            d["tracks"][row] = {"title": row, "status": "running", "agent": ag, "kind": "track",
+                                "agent_at": "2020-01-01T00:00:00Z", "updated": "2020-01-01T00:00:00Z"}
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        fld = lambda row, k: json.load(open(f"{th}/.cc/boards/r.json"))["tracks"][row].get(k, "")
+        mv = run("handover", "r", "@3:900", "@7:900", "h1", "h3", "h4", "nosuch")
+        ok("`handover` moves the rows it is named that carry exactly that mark, and prints what moved",
+           mv.returncode == 0 and mv.stdout == "h1\n" and fld("h1", "agent") == "@7:900"
+           and fld("h1", "updated") > "2020-01-01T00:00:00Z")
+        ok("…carrying the mark's CLOCK rather than restarting it: a mark both readers had already expired stays "
+           "expired, or a cutover would revive a row whose subagent died hours ago and hold it six hours more",
+           fld("h1", "agent_at") == "2020-01-01T00:00:00Z")
+        ok("…and only those: a row carrying the same mark that was not named is left where it was",
+           fld("h2", "agent") == "@3:900")
+        ok("…never on a prefix of the window id: `@3:900` is not `@30:900`, and that match would hand one "
+           "session's live row to another in silence", fld("h3", "agent") == "@30:900")
+        ok("…and it never CLAIMS a row — an unmarked row named on the line stays unmarked, which is why this is "
+           "not the hole `set … agent` refuses: nothing is held that was not held already",
+           fld("h4", "agent") == "")
+        bad = run("handover", "r", "@3:900", "@7", "h2")
+        same = run("handover", "r", "@7:900", "@7:900", "h1")
+        ok("…a destination that is not a mark, and a move onto the same window, are refused and write nothing",
+           bad.returncode != 0 and same.returncode != 0 and fld("h2", "agent") == "@3:900"
+           and fld("h1", "agent") == "@7:900")
+        typed = run("set", "r", "h2", "agent", "@7:900")
+        ok("…and `set … agent` still takes only `me` and '': the exception is this verb, not the field",
+           typed.returncode != 0 and fld("h2", "agent") == "@3:900")
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        for row in ("h1", "h2", "h3", "h4"): d["tracks"].pop(row)
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
         # A FIXTURE IS NOT A BOARD: a `_cctest<pid>` board with a waiting row beside the real one is in neither `list`
         # nor `boards` unless `--all` asks — the one rule every reader of ~/.cc/boards calls or names
         json.dump({"repo": "_cctest99999999", "tracks": {"w1": {"status": "waiting", "title": "push refused", "updated": now()}}},

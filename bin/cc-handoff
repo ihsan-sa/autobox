@@ -85,6 +85,12 @@ session id on the record, no such files, none running — all three read as "no 
 exactly the one above. The stay is bounded by CC_HANDOFF_AGENT_MAX and expires into that same drain-then-kill;
 a stay is never a session that keeps its window.
 
+AND ITS BOARD ROWS COME WITH IT. A row worked in a subagent has no worker and no window of its own: it is held
+only by the `agent` mark naming that session's window, and a reader stops counting that mark the moment the
+window is no longer a session named for the repo — which the cutover rename does. So the marks are handed to
+the successor with the name (carry_marks), because that is where those subagents' reports now land. A mark that
+is not exactly the predecessor's, and a row a real worker is in, are never touched.
+
 EVERY PROMPT THIS FILE TYPES INTO A SESSION LEADS WITH `[cc-handoff]` (MACHINE). A prompt a tool types reaches
 UserPromptSubmit looking like a user turn, and the ask ledger opened a row for four of them — the successor's
 opening prompt (a121, a126, a131) and the retiring session's stop message (a132) — each costing that session a
@@ -763,6 +769,48 @@ def ready(target=None, forced=False):
     return 0
 
 
+def carry_marks(target, pre, suc):
+    """THE ROWS THE PREDECESSOR WAS WORKING IN ITS OWN SUBAGENTS COME WITH THE HANDOFF (2026-09-07). Such a row
+    has no worker, no cc-loop and no window of its own, so the only thing on the box saying anybody owns it is
+    the `agent` mark that session stamped on it — its own window, `<window id>:<tmux server pid>` (cc-board
+    agent_id) — and a reader counts that mark only while the window it names is a session named for the repo.
+    Cutover renames the predecessor to <target>~old, so every mark it made stops counting in the same instant,
+    while its subagents are DELIBERATELY still running (THE PREDECESSOR STAYS FOR ITS SUBAGENTS, above) and
+    reporting into the successor. Ten minutes later the watchdog called five such rows abandoned and blocked
+    them, and a blocked row is offered for dispatch again — the setup for two workers on one file. So the marks
+    move where the work reports: the successor owns the channel, takes those reports and finishes those rows.
+
+    Derived, so it sits after the commit point with the rest, and idempotent by construction — a second run finds
+    no row carrying the predecessor's mark. Returns the tracks that moved.
+
+    THE TWO ROWS IT MUST NEVER TOUCH. A mark that is not EXACTLY the predecessor's belongs to a third session and
+    is none of this handoff's business (`@1:900` is not `@12:900`, which is why cc-board matches the whole mark
+    and not a prefix). And a row a real worker is in is that worker's — asked the way the watchdog asks it, a
+    live pane in the track's own window `<repo>/<track>` — so this changes nothing about work it is not retiring.
+    Everything else fails closed: no window id either side, no answer from tmux, no board, and nothing moves."""
+    repo = target.partition("/")[0]
+    if not pre or not suc or pre == suc:
+        return []
+    # The successor's mark, from the same tmux question cc-board's `agent me` asks — so what lands on the row is
+    # exactly what that session would have stamped itself. The server pid is the same for both windows (one
+    # server; a different one means both sessions are already gone), so it also gives the predecessor's mark.
+    got = (tmux("display-message", "-p", "-t", suc, "#{window_id}:#{pid}") or "").strip()
+    wid, _, spid = got.partition(":")
+    if wid != suc or not spid.isdigit():
+        return []
+    frm, to = f"{pre}:{spid}", got
+    board = os.path.join(BIN, "cc-board")
+    try:
+        rows = (json.loads(out([board, "json", repo], fail="") or "{}") or {}).get("tracks") or {}
+    except Exception:
+        return []
+    mine = [t for t in sorted(rows) if (rows[t].get("agent") or "").strip() == frm
+            and not pane_live(f"{repo}/{t}")]
+    if not mine:
+        return []
+    return (out([board, "handover", repo, frm, to, *mine], fail="") or "").split()
+
+
 def derive(rec, first=False):
     """Everything after the commit point: idempotent, retried, never rolled back. `first` says this call is the
     one that took the cutover — a retry re-derives the cosmetics but never re-announces a stay. A failure here leaves the
@@ -807,6 +855,13 @@ def derive(rec, first=False):
     if (rec["predecessor"].get("window"), rec["successor"].get("window"), rec["successor"].get("tmux")) != (old, target, suc):
         rec["predecessor"]["window"], rec["successor"]["window"], rec["successor"]["tmux"] = old, target, suc
         write(rec)
+    # …and the board rows the predecessor was holding in its own subagents move with the name — see carry_marks().
+    # After the rename, because that is the moment the marks stop counting, and a retried derive() moves none.
+    moved = carry_marks(target, pre, suc)
+    if moved:
+        journal(target, f"handoff: {len(moved)} board row(s) the retiring session held in a subagent are the "
+                        f"successor's now ({', '.join(moved[:6])}) — the watchdog would have called them "
+                        f"abandoned ten minutes after cutover.")
     # THE PREDECESSOR STAYS FOR ITS SUBAGENTS (owner, 2026-09-04) — ready() decided it and the record carries
     # the answer. Said once: a retried --ready re-derives everything here, and a session told to stay is not
     # told twice, nor sent the retirement line it is not on yet.
@@ -833,7 +888,9 @@ STAY_MSG = (MACHINE + " Handoff cut over: your successor is live and owns this t
             "if you hold it as a peer — because it is the one who will act on it. Start nothing new: merging, "
             "pushing, dispatching and posting outward are refused from here on, and anything typed here is "
             "relayed to {target}. When the last one is in you get the final handoff message; then journal and "
-            "stop. This window ends by itself once your subagents are done.")
+            "stop. This window ends by itself once your subagents are done. The board rows those subagents are "
+            "on are marked to {target} now — leave them alone: `cc board set … agent me` from here would mark "
+            "them to a window nothing reads, which is the same as releasing them.")
 RELAY_PREFIX = "[relayed from the retiring session] "
 # What reaches UserPromptSubmit as a "user" turn but was written by the harness or a peer — cc-scope's
 # NOT_A_PERSON less MACHINE, which is this file's own tag and is guarded beside this list; kept in step by hand. Relayed, the successor's own cross-session message came back typed into it, and the
@@ -1561,6 +1618,9 @@ def selfcheck():
                 return "\n".join(wins.values())
             if a[0] == "capture-pane":
                 return shown(a[-1])
+            if a[0] == "display-message":       # `-t <window id> "#{window_id}:#{pid}"`: the mark cc-board would
+                return f"{a[a.index('-t') + 1]}:900"   # stamp for that window. 900 stands in for the server pid,
+                                                       # which is one number for every window on the server.
             if a[0] == "new-window":
                 wins[a[a.index("-n") + 1]] = "@%d" % (len(wins) + 1)
             elif a[0] == "kill-window":
@@ -1897,6 +1957,69 @@ def selfcheck():
             fh.write('{"text":"retire msg"}\n')
         ok("...and retirement leaves no ~old junk: mail addressed to the dead window dies with it",
            retire("r9") == 0 and not os.path.exists(os.path.join(STATE, "r9~old")))
+
+        # ---- THE ROWS IT WAS WORKING IN ITS OWN SUBAGENTS COME WITH IT. The cutover rename ends every `agent`
+        # mark the predecessor made, while those subagents are still running and still reporting into the
+        # successor: ten minutes later the watchdog called five such rows abandoned and blocked them, and a
+        # blocked row is offered for dispatch again (2026-09-07, twice in one hour). carry_marks() hands them
+        # over — and the two rows it must leave alone are the ones these cases are really about.
+        boardf, hcalls = {}, []
+
+        def out(argv, timeout=25, cwd=None, fail=""):
+            if argv[0].endswith("cc-board") and argv[1] == "json":
+                return json.dumps(boardf.get(argv[2]) or {"tracks": {}})
+            if argv[0].endswith("cc-board") and argv[1] == "handover":
+                hcalls.append(list(argv[2:]))          # cc-board owns the write and its own exact-match rule
+                repo, frm, to, names = argv[2], argv[3], argv[4], argv[5:]
+                mv = [t for t in names if (boardf[repo]["tracks"][t].get("agent") or "") == frm]
+                for t in mv:
+                    boardf[repo]["tracks"][t]["agent"] = to
+                return "\n".join(mv)
+            return real_out(argv, timeout=timeout, cwd=cwd, fail=fail)
+
+        home0 = os.environ.get("HOME")
+        os.environ["HOME"] = os.path.join(d, "fakehome")   # journal() writes under ~, and never the real one
+        try:
+            boardf["r15"] = {"tracks": {
+                "sub":    {"status": "running", "agent": "@r15:900"},    # the predecessor's own subagent
+                "worked": {"status": "running", "agent": "@r15:900"},    # …and a real worker is in this one
+                "third":  {"status": "running", "agent": "@r150:900"},   # another session, one digit along
+                "free":   {"status": "queued"},                          # nobody's
+            }}
+            wins["r15/worked"] = "@w15"                 # the track's own window, live: how the watchdog reads a worker
+            r = cutover("r15")
+            suc15 = r["successor"]["tmux"] + ":900"
+            ok("a row the retiring session held in a subagent is the SUCCESSOR's after cutover — five such rows "
+               "were blocked as abandoned ten minutes after one (2026-09-07)",
+               hcalls == [["r15", "@r15:900", suc15, "sub"]]
+               and boardf["r15"]["tracks"]["sub"]["agent"] == suc15)
+            # …and these three are asked of what carry_marks NAMED, not only of what came back: a row it should
+            # never have offered is a bug here even when cc-board's own exact match happens to spare it.
+            named = [t for c in hcalls for t in c[3:]]
+            ok("...a row marked by a THIRD session is never even offered, and a prefix would have offered it "
+               "(`@r15` is the head of `@r150`): the whole mark is compared, never the window id alone",
+               "third" not in named and boardf["r15"]["tracks"]["third"]["agent"] == "@r150:900")
+            ok("...nor is a row a real worker is in — that work is not this handoff's to move",
+               "worked" not in named and boardf["r15"]["tracks"]["worked"]["agent"] == "@r15:900")
+            ok("...and a row nobody marked is not claimed: nothing is held that was not held before",
+               "free" not in named and not boardf["r15"]["tracks"]["free"].get("agent"))
+            jp15 = os.path.expanduser(journal_for("r15"))   # a regression is ONE red case, never a suite that dies
+            jrn = open(jp15).read() if os.path.exists(jp15) else ""
+            ok("...the journal says which rows moved, so the successor can see it did", "sub" in jrn
+               and "successor's now" in jrn)
+            derive(read("r15"))
+            ok("...and a retried derive() moves nothing: the marks are the successor's already",
+               len(hcalls) == 1)
+        finally:
+            out = real_out
+            clear("r15")
+            for w in ("r15/worked", "r15~old", "r15"):   # the window count is what the stub numbers new ids from
+                wins.pop(w, None)
+            os.environ.pop("CC_HANDOFF", None)
+            if home0 is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home0
 
         r = cutover("r4")
         me[0] = r["predecessor"]["tmux"]                # --retire called from the very window it would kill
