@@ -44,7 +44,16 @@
 # AN ITERATION THAT ENDED ITSELF IS NOT CLASSIFIED AT ALL (ctx_stopped). A worker is never handed off: at its context
 # threshold cc-context tells it to journal and end its turn, and marks the journal — this loop reads that mark and
 # starts the next iteration on a fresh context, which IS the handoff. Nothing refused and nothing was rerouted.
-# Exit: 0 done | 3 waiting on the owner, board `waiting` (notified) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (notified)
+# A STOP GOES TO THE SESSION THAT DISPATCHED THE TRACK, and to the owner only as an ambient line. Every stop below
+# is a technical question — a cap, a runaway, a `cc done` that failed, a worker asking something — and the planning
+# session is the one that can answer it. Until 2026-09-07 stop() paged the owner at high priority and told that
+# session nothing: an install question a planner would have settled in a minute crossed three shifts on a phone, and
+# was false to begin with (comms audit). So stop() hands cc-broker one line for `<repo>`'s session — which classifies
+# it, waking that session NOW for a line asking it to choose and digesting the rest — and the owner's `#<repo>-updates`
+# line drops to low priority. cc-broker owns the escalation from there: nothing it takes is dropped, and it tells the
+# owner itself if no session ever takes it. A broker that is DOWN loses nothing either: the board write and the updates
+# line happen either way, and the line comes back at high priority, because a stop nobody hears is worse than a ping.
+# Exit: 0 done | 3 stopped on a question, board `waiting` (the session hears it) | 4 the worker said DONE but `cc done` failed: no PR, board `blocked` (the session hears it)
 #     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
 #     | 12 completion has no usable receipt, board `blocked` (notified); delivery is unconfirmed
@@ -259,6 +268,23 @@ worker_base(){   # $1 repo → the branch a worker is told never to touch and re
   case "$b" in track/*|'') b=main ;; esac
   printf '%s\n' "$b"; }
 
+row_title(){ "$BOARD" get "$repo" "$track" title 2>/dev/null | grep . || printf '%s\n' "$track"; }   # what the row is ABOUT; its name when the board has no title for it
+planner_line(){ printf 'loop: %s/%s %s — %s\n' "$repo" "$track" "$1" "$(printf '%s' "$2" | tr '\n' ' ')"; }   # $1 title · $2 message -> the ONE line the session gets
+# WHO THIS TRACK ANSWERS TO. `<repo>` is the session that dispatched it — the same target cc-reconcile's board
+# watchdog and cc-secretary's findings use, so the planner's events all arrive by one door.
+tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation from here, 1 nobody does
+  case "$repo" in _cc*) return 1;; esac   # a suite's scratch namespace (`_cc<suite><pid>`, cc-board `real`) has no session, and a
+                                          # fixture must not reach the box's own broker state — the reason cc-notify refuses to push one
+  # INSIDE A MEMBER WORKSPACE'S BOUNDARY (cc-sandbox member) none of this exists: no broker state, and the only door
+  # out is the workspace's own socket, which cc-notify already takes (`cc-slack escalate`). A broker that answered
+  # `delivered` on a daemon that never heard it would swallow that tier's one escalation, so it is not asked at all.
+  [ "${CC_MEMBER_SANDBOX:-}" = 1 ] && return 1
+  [ -x "$BIN/cc-broker" ] || return 1     # no broker on this copy: the owner is the fallback, exactly as before
+  # 30 s is what cc-secretary and cc-reconcile allow their own inject. Being killed past it loses nothing: cc-broker
+  # writes the event down BEFORE it sends anything, so its own 60 s flush delivers what this gave up waiting for.
+  # The cost of the timeout is therefore a duplicate — a page AND a late wake — and never a dropped stop.
+  timeout 30 "$BIN/cc-broker" inject --no-start --source loop "$repo" "$1" >/dev/null 2>&1; }
+stop_prio(){ [ "$1" = yes ] && echo low || echo high; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
 selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the model it moves to, what it does with
                # an iteration that was rerouted but still worked (F4), and the line it journals.
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
@@ -432,6 +458,63 @@ instead, or cc-reconcile files "waiting on a PR that was never opened" against i
     "$(delivery_end "$(jq '.pr_url=null | .committed_sha=null' <<<"$rec")")" unknown
   t 'D4: human output cannot stand in for a receipt; D1 is its control' "$(delivery_end 'PR: https://x/pr/1')" unknown
   t 'D4 control: an empty response is also unconfirmed' "$(delivery_end '')" unknown
+  # ── WHO HEARS A STOP. The broker is a recorder here: what is under test is the line the loop hands it, the target
+  # it hands it to, and what the loop does with the answer — the daemon behind it is cc-broker's own selfcheck's.
+  local bd brec bl marks realbin="$BIN"
+  marks=$(sed -n '/^DECISION_MARKS = (/,/)/p' "$BIN/cc-broker" | grep -o '"[^"]*"' | tr -d '"')
+  t 'cc-broker still names the words that make an event wake a session NOW rather than ride a digest' \
+    "$([ -n "$marks" ] && echo named)" named
+  decides(){ local l m; l=$(tr 'A-Z' 'a-z' <<<"$1")   # cc-broker's classify(), asked the way it asks itself, against ITS list
+    while IFS= read -r m; do [ -n "$m" ] && case "$l" in *"$m"*) return 0;; esac; done <<<"$marks"; return 1; }
+  bd="$d/bkr"; brec="$d/bkr.rec"; mkdir -p "$bd" "$d/bkr-no"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$brec" > "$bd/cc-broker"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexit 1\n' "$brec" > "$d/bkr-no/cc-broker"
+  chmod +x "$bd/cc-broker" "$d/bkr-no/cc-broker"
+  local repo=demo track=t7
+  bl=$(planner_line 'needs you' 'STATUS: BLOCKED: which package?
+(answer: append it to task.md)')
+  t 'whatever the journal did, the session gets ONE line' "$(printf '%s\n' "$bl" | wc -l)" 1
+  grep -q '^loop: demo/t7 needs you — STATUS: BLOCKED: which package? (answer' <<<"$bl"
+  t "…carrying the worker's own question, not a pointer to a file the session would have to open" "$?" 0
+  decides "$bl"
+  t 'a worker that stopped to ASK carries a word cc-broker calls a decision, so that session is woken now' "$?" 0
+  decides "$(planner_line 'hit its cap' 'Two capped iterations with no commits or journal change ($4.10). Raise --budget/--turns or split the task; log: /x/loop.log')"
+  t '…and a stop with no question in it carries none of them, so it rides the next digest instead of buying a wake' "$?" 1
+  BIN="$bd"
+  tell_planner "$bl"; t 'the broker takes the stop' "$?" 0
+  t "…addressed to the session that dispatched this track, and named as the loop" \
+    "$(cat "$brec")" "inject --no-start --source loop demo $bl"
+  : > "$brec"
+  ( repo=_cctest99999; tell_planner "$bl" ); t "a suite's \`_cc<suite><pid>\` scratch repo has no session to wake" "$?" 1
+  t "…and a fixture's stops never reach the box's own broker state" "$(wc -c < "$brec")" 0
+  ( CC_MEMBER_SANDBOX=1 tell_planner "$bl" )
+  t 'inside a member boundary the broker is not asked at all — cc-notify owns that tier\047s one door out, and a \
+"delivered" nobody heard would swallow the escalation' "$?" 1
+  t '…and it really was not asked' "$(wc -c < "$brec")" 0
+  BIN="$d/bkr-no"; tell_planner "$bl"
+  t 'a broker that would not take it has NOT got it, so the owner is still the fallback' "$?" 1
+  rm -f "$d/bkr-no/cc-broker"; : > "$brec"; tell_planner "$bl"
+  t 'and a copy with no broker beside it does not pretend either' "$?" 1
+  t '…having called nothing at all' "$(wc -c < "$brec")" 0
+  BIN="$realbin"
+  t 'a stop a session has is ambient for the owner: an updates line, no push' "$(stop_prio yes)" low
+  t '…and one NOBODY has is his, because there is no one else left' "$(stop_prio no)" high
+  grep -qF 'tell_planner "$(planner_line "$title" "$msg")"' "$0"
+  t 'and stop() really tells the session, rather than this being two files agreeing on paper' "$?" 0
+  grep -qF -- '-p "$(stop_prio "$heard")"' "$0"; t "…and routes the owner's own line by the answer it got" "$?" 0
+  t 'the board is written BEFORE the broker is asked and the updates line goes out AFTER it — so a broker that is \
+down still leaves the board write and the updates line, which is the half of this that must never be lost' \
+    "$(sed -n '/^stop(){/,/exit "\$code"; }/p' "$0" | grep -oE 'BOARD" status|tell_planner|cc-notify' | tr '\n' ' ')" \
+    'BOARD" status tell_planner cc-notify '
+  # ── the done line says WHAT finished, not how many turns it took ──
+  HOME="$d/bh" "$BIN/cc-board" init titled /tmp/titled main >/dev/null
+  HOME="$d/bh" "$BIN/cc-board" add titled t1 "worker stop reaches the planner" >/dev/null
+  t 'the done line names the row' \
+    "$(repo=titled track=t1 BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" "worker stop reaches the planner"
+  t '…and a track the board has no row for says its own name rather than nothing at all' \
+    "$(repo=titled track=nosuch BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" nosuch
+  t 'neither done line spends the reader on an iteration count and a dollar figure' \
+    "$(grep -c '"\$repo/\$track done" "\$(row_title)\. PR:' "$0")" 2
   sed 's/^/  journal fixture | /' "$d/progress.md"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -471,12 +554,17 @@ kill_child(){ [ -n "$child" ] || return 0   # only ever signal a group we own: i
   if [ "$(ps -o pgid= -p "$child" 2>/dev/null | tr -d ' ')" = "$child" ]; then kill -TERM -- -"$child" 2>/dev/null; sleep 2; kill -KILL -- -"$child" 2>/dev/null
   else kill -TERM "$child" 2>/dev/null; fi; }
 trap 'kill_child; parked; log "signalled — iteration aborted and its claude killed"; exit 130' HUP INT TERM   # tmux kill-window would otherwise re-parent claude to systemd, still editing this worktree
-stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}"   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
+stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" heard=no whose=""   # every non-zero exit leaves the board honest: a track nobody is working on is not "running"
   # …and `waiting` when it stopped to ASK, which is not the same thing as stopping. The loop is the first to know, so it
   # writes the same word cc-reconcile would 20 min later — otherwise the board says `blocked` while the Home tab, reading
   # the very journal line this exit came from, already says `waiting`, and the tab prints the two of them as drift.
   "$BOARD" status "$repo" "$track" "$st" >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
-  log "exit $code: $msg"; "$BIN/cc-notify" -p high -t "$repo/$track $title" "$msg"; exit "$code"; }
+  log "exit $code: $msg"
+  # THE BOARD IS WRITTEN FIRST AND THE UPDATES LINE GOES OUT LAST, whatever the broker does in between: a stop that
+  # reached nobody is worse than the ping this replaces, so neither of those two depends on it.
+  tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose="  ($repo's session has this one.)"; }
+  log "the stop went to $repo's session: $heard"
+  "$BIN/cc-notify" -p "$(stop_prio "$heard")" -t "$repo/$track $title" "$msg$whose"; exit "$code"; }
 # THE PROJECT PAUSE. `cc-pause on <repo>` parks a whole project; what it does to a loop that is ALREADY RUNNING is
 # signal it, so this is read from the TERM trap and again at the top of every iteration — the flag can appear at any
 # moment. Standing down leaves the board honest (`queued`: there is work here and nobody is on it) and does NOT page:
@@ -550,7 +638,10 @@ while [ $i -lt "$MAXI" ]; do
         pending) note="delivery projection pending: $(jq -r '.pending | keys | join(", ")' <<<"$rec"); retry: cc-land queue --task $repo $track"
           log "$note"; "$BOARD" note "$repo" "$track" "$note" >/dev/null 2>&1;;   # the PR is real: a note, not a page
       esac
-      "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $(jq -r '.pr_url // ""' <<<"$rec"). $(jq -r '.landing.message // ""' <<<"$rec")"
+      # WHAT FINISHED, not how many turns it took to finish it: the iteration count and the dollar figure are the
+      # loop's own bookkeeping and are in the board note and the log above. A person reading #<repo>-updates wants
+      # the row (comms audit 2026-09-07).
+      "$BIN/cc-notify" -t "$repo/$track done" "$(row_title). PR: $(jq -r '.pr_url // ""' <<<"$rec"). $(jq -r '.landing.message // ""' <<<"$rec")"
       exit 0
     else
       log "DONE"; dout=$(env "${HG[@]}" "$BIN/cc" done "$repo" "$track" 2>&1); drc=$?   # captured, never `| tail -1`: the pipe dropped the status
@@ -583,7 +674,7 @@ while [ $i -lt "$MAXI" ]; do
              fi ;;
         esac
       fi
-      "$BIN/cc-notify" -t "$repo/$track done" "Track finished after $i iteration(s) (\$$spent). PR: $("$BOARD" get "$repo" "$track" pr)$landed"; exit 0
+      "$BIN/cc-notify" -t "$repo/$track done" "$(row_title). PR: $("$BOARD" get "$repo" "$track" pr)$landed"; exit 0
     fi
   fi
   if q=$(grep -E '^STATUS: BLOCKED' <<<"$newprog" | tail -1) && [ -n "$q" ]; then
