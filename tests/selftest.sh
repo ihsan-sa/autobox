@@ -337,6 +337,10 @@ mkdir -p ~/.cc/state/$REPO/c3; printf 'a channel, not a task\n' > ~/.cc/state/$R
   && ok "a repository that is not there prepares nothing and stamps no claim" || bad "claimed a track in a repo that does not exist: rc=$c4rc $(cat "$T/c4.out")"
 rm -rf ~/.cc/state/${REPO}x ~/.cc/worktrees/${REPO}x ~/.cc/boards/${REPO}x.json ~/.cc/boards/${REPO}x.lock
 fi
+if stanza "cc-native: opt-in dispatch, bootstrap and end"; then
+# M4-1: N1-N14 live inside the hook, with each refusal's control and a HOME/board/remote of their own.
+chk cc-native
+fi
 stanza "checkpoint hook" always
 echo hi > ~/.cc/worktrees/$REPO/w1/a.txt; ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
 git -C "$T/remote.git" branch | grep -q track/w1 && ok "checkpoint committed + pushed track branch" || bad "checkpoint push"
@@ -619,8 +623,8 @@ miss=""; for probe in "Write|{\"file_path\":\"$GH/dev/other/x.md\"}" "Bash|{\"co
 # MATCHER names — and Read|NotebookRead|Grep|Glob had a deny branch for days that no call ever reached, because the
 # matcher stopped at NotebookEdit (audit 2026-09-01 F1). So: every tool cc-guard has a case branch for must be in the
 # matcher, in BOTH files that carry it (the managed manifest the drift check reads, the default install.sh copies).
-C="$B/../config"; mm=$(jq -r '.hooks[] | select(.event=="PreToolUse") | .matcher' "$C/claude-managed.json")
-ms=$(jq -r '.hooks.PreToolUse[] | select(any(.hooks[]; .command|test("cc-guard"))) | .matcher' "$C/claude-settings.json")
+C="$B/../config"; mm=$(jq -r '.hooks[] | select(.event=="PreToolUse" and .command=="$HOME/bin/cc-guard") | .matcher' "$C/claude-managed.json")
+ms=$(jq -r '.hooks.PreToolUse[] | select(any(.hooks[]; .command=="$HOME/bin/cc-guard")) | .matcher' "$C/claude-settings.json")
 gt=$(grep -oE '^  [A-Za-z|]+\)' "$B/cc-guard" | tr -d ' )' | tr '|' '\n' | sort -u)   # the guard's own case labels
 miss=""; for tool in $gt; do for f in managed:"$mm" settings:"$ms"; do
   tr '|' '\n' <<<"${f#*:}" | grep -qx "$tool" || miss="$miss ${f%%:*}:$tool"; done; done
@@ -2493,6 +2497,13 @@ miss=""; for g in USAGE COMMS RUNBOOK; do [ -f "$IH/$g.md" ] || miss="$miss $g";
 [ -z "$miss" ] && ok "the guides the contract points at exist at ~ (USAGE COMMS RUNBOOK; SLACK folded into COMMS)" || bad "guides missing:$miss"
 [ "$(readlink -f "$IH/WORKING.md")" = "$IR/docs/WORKING.md" ] && ok "~/WORKING.md links to the tree's docs/WORKING.md" || bad "~/WORKING.md not linked"
 [ -f "$IH/.claude/settings.json" ] && env HOME="$IH" CC_SETTINGS_FILE="$IH/.claude/settings.json" "$IR/bin/cc-settings" check >/dev/null 2>&1 && ok "default ~/.claude/settings.json installed and satisfies the managed subset" || bad "settings.json missing or drifted from claude-managed.json"
+# M4-2: the installed native hooks reach both dispatch/bootstrap and end. Missing registrations are the control.
+jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-native")) | del(.hooks.SubagentStop)' \
+  "$IH/.claude/settings.json" > "$T/unapplied-native.json"
+out=$(env HOME="$IH" CC_SETTINGS_FILE="$T/unapplied-native.json" "$IR/bin/cc-settings" check); rc=$?
+[ "$rc" != 0 ] && grep -q 'UNAPPLIED: hook PreToolUse SubagentStop' <<<"$out" \
+  && ok "M4-2: the installed subset passes; missing native hooks are reported UNAPPLIED without apply" \
+  || bad "M4-2: native registration control: $out"
 # the agent types, at ~/.claude/agents/ where the harness reads them. Copies, so the owner can tune one on the box —
 # which is exactly why they need a stamp: an untouched copy still follows its template, an edited one is never
 # overwritten. Both directions, because either failure is silent (a stale builder, or the owner's tuning gone).

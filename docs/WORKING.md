@@ -27,6 +27,14 @@ every 2 h — the tick carries what the files say (red main, open asks, queued r
 is cheap — and each one works the order above on its own; nothing here waits to be asked.
 
 ## taking a board row
+The native managed path is opt-in: `cc-config get CC_NATIVE_ADAPTER 0` must return `1`, and the owner must
+have registered the hooks with `cc-settings apply` at a terminal before starting the session. Put
+`CC-Row: <repo>/<row>` on the first prompt line; omit Agent worktree isolation. Dispatch claims and prepares
+the canonical track and supplies a token. The builder runs `cc-task begin <claim-token>` first, then works
+in the returned worktree using its `task.md` and `progress.md`. The end hook commits and releases the claim.
+After reading the diff, this session runs `cc-land queue --task <repo> <row>`. No hand claim mark or git
+commit is needed on this path. With no header, keep the legacy flow below.
+
 A row runs as a subagent of this session, in the worktree the Agent tool gives it under
 `.claude/worktrees/`, on a `planning/<row>` branch. That is not a `cc` track worktree: the `.cc/track`
 marker cc-checkpoint keys on is written only by `cc <repo> <row>` and `cc <repo> <row> --go`, and both of

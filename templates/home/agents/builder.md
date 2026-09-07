@@ -6,6 +6,11 @@ model: opus
 
 You make one scoped change in the worktree you were given, and nothing else.
 
+With the opt-in native adapter, a `CC-Row:` header means `cc-task begin <claim-token>` is your first tool
+action, using the token supplied by dispatch. It returns the canonical worktree, `task.md` and `progress.md`.
+That worktree is already prepared. Work there; the end hook commits, and the planning session reviews and
+delivers it. Without that header, the legacy worktree and the no-commit rule below stay in effect.
+
 - Edit only inside that worktree. Nothing outside it is yours: no other checkout, no `~/.cc`, no service, no config, no file in the home directory.
 - Do not commit, push, merge or post anywhere. The session that spawned you lands the work.
 - The generic tree (`core/`, published as its own public repo) must never name this box — its user, its host, its control repo. Box facts belong in the private overlay outside `core/`.

@@ -204,17 +204,33 @@ apply(){
 }
 
 selfcheck(){
-  local d n=0 f=0 S M DEF out rc sl_cmd
+  local d n=0 f=0 S M DEF CL out rc sl_cmd
   d=$(mktemp -d "${TMPDIR:-/tmp}/cc-settings-sc.XXXXXX") || return 1   # S/M/DEF are local: every case runs against fixtures
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a case that PRINTS (jq -e) must not leak into the verdict
   M="$R/config/claude-managed.json"; DEF="$R/config/claude-settings.json"
   k "$(t jq -e . "$M")" "the managed manifest is valid json"
-  k "$(t test "$(jq '.hooks | length' "$M")" -eq 3)" "the manifest names three hook registrations"
+  k "$(t test "$(jq '.hooks | length' "$M")" -eq 5)" "the manifest names five hook registrations"
   k "$(t test -n "$(jq -r '.statusLine.command // empty' "$M")")" "the manifest names a statusLine command"
   # the shipped default must satisfy the subset itself, or a fresh box installs a file that is already wrong
   S="$DEF"; scan
   k "$(t test -z "$MISSING")" "config/claude-settings.json satisfies its own managed subset${MISSING:+ — missing: $(tr '\n' ' ' <<<"$MISSING")}"
+  jq '(.hooks.PreToolUse[] | .hooks) |= map(select(.command != "$HOME/bin/cc-native"))
+      | del(.hooks.SubagentStop)' "$DEF" > "$d/no-native.json"; S="$d/no-native.json"
+  out=$(check); rc=$?
+  k "$(t test "$rc" -ne 0)" "native registrations missing is a request that must be refused by check; the shipped subset is its control"
+  k "$(t grep -q 'UNAPPLIED: hook PreToolUse SubagentStop' <<<"$out")" "check names both unapplied native hooks without applying them"
+  # Every command in the manifest runs unattended, on tool calls nobody watches, so a change to one must buy the
+  # paid read at the landing (tests/control-layer, cc-land's gate tier). cc-native was added to the manifest
+  # without it and would have landed on the cheap gates alone.
+  CL="$R/tests/control-layer"
+  ctl_miss(){ local c m=""
+    for c in $(jq -r '.hooks[].command' "$M" | awk '{print $1}' | sed 's|^\$HOME/||' | sort -u); do
+      grep -qxF "$c" "$CL" || m="$m $c"; done; printf '%s' "$m"; }
+  k "$(t test -z "$(ctl_miss)")" "every managed hook command is on tests/control-layer$(ctl_miss | sed 's/^ / — missing: /')"
+  grep -vxF 'bin/cc-native' "$CL" > "$d/thin-control-layer"; CL="$d/thin-control-layer"
+  k "$(t grep -q 'bin/cc-native' <<<"$(ctl_miss)")" "…and a hook missing from that list is named; the shipped list is its control"
+  CL="$R/tests/control-layer"
   # THE PROVEN CASE: canonical in config/, absent from the live file. It must be NAMED, not counted.
   jq 'del(.hooks.UserPromptSubmit)' "$DEF" > "$d/no-scope.json"; S="$d/no-scope.json"
   scan; k "$(t grep -q "^hook${US}UserPromptSubmit" <<<"$MISSING")" "a missing UserPromptSubmit hook is detected"
@@ -282,8 +298,8 @@ selfcheck(){
   k "$(t test -z "$MISSING")" "…and the file it wrote now satisfies the managed subset"
   # scoped to .hooks: a top-level key can carry the same {type:"command", command:…} shape (statusLine does)
   # without being a hook registration at all, and counting the whole file would count that key too.
-  k "$(t test "$(jq '[.hooks | .. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 4)" \
-     "…with exactly one registration added, not a duplicate of the three that were there"
+  k "$(t test "$(jq '[.hooks | .. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 6)" \
+     "…with exactly one registration added, not a duplicate of the five that were there"
   # a second run is a no-op: apply must never stack the same registration twice
   add_hook "$d/applied.json" UserPromptSubmit "" '$HOME/bin/cc-scope hook' > "$d/twice.json"
   S="$d/twice.json"; scan

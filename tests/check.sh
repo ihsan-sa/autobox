@@ -88,11 +88,13 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # cc-task's is the claim rule itself, in a HOME, state dir, board and git repo of its own: that one task id
 # survives a release, a change of executor and a new owner, that two processes racing for a row leave one winner,
 # and that a claim is never taken while its owner is alive. No board of this box's is read and no runtime is run.
+# cc-native's drives dispatch, bootstrap and end payloads concurrently in its own HOME, board and local Git
+# remotes, with off and refusal controls. No live runtime or service is used and no settings are applied.
 # …and only the ones a change reaches, when the landing says what changed (CC_LAND_CHANGED — tests/green.sh has
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
 . tests/green.sh; land_scope "$PWD/bin"; skipped=""
-for c in cc-units cc-settings cc-board cc-task cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.

@@ -11,6 +11,7 @@ and what a member session may do all keep coming from the path rules — no fiel
   cc-task show <repo> <row>                              print the record
   cc-task check <repo> <row> [--executor subagent|worker]  would this owner be refused? writes nothing
   cc-task claim <repo> <row> --executor subagent|worker  claim a track `cc claim` has already prepared
+  cc-task begin <claim-token>                            read the native bootstrap after its tool hook binds it
   cc-task renew <repo> <row> <claim-id> <generation>     stamp this owner's claim as still active
   cc-task release <repo> <row> <claim-id> <generation> --reason <text>   end it after stopping work
   cc-task receipt <repo> <row>                           print completion evidence and pending work
@@ -47,8 +48,9 @@ THE PATH IS THE KEY. A record found at a row's own state dir is that row's, what
 `cc rename` moves the whole state dir, and a record that refused to answer to its new name would kill every claim
 on a renamed project. The task id, the claim and the executions carry through the rename untouched.
 
-Runtime binding, execution boundaries and presence come later. Until a runtime hands out
-an agent id, two subagents of one session read as one owner.
+Native dispatch binds through cc-native's PreToolUse payload, never an environment agent id. Once bound,
+only its SubagentStop ends that claim; the parent no longer satisfies same_owner. Legacy claims still end
+at cc done. Presence and costing come later. CC_NATIVE_ADAPTER defaults off, including `begin`.
 
 Completion records pr={url}, card={chat,ts} and closed={status,at}. The pending map holds board={pr?,status}
 and card={url} until acknowledged. artifact.errors holds unresolved {stage,message,at} entries. A receipt
@@ -59,7 +61,7 @@ CLOSING IS FOR WORK THAT REALLY ENDED, because a closed record refuses every lat
 delivery with no PR is not — a workspace project whose branch IS the delivery says `done` on the board and is
 dispatched again the next week. `delivered` is that ending: the same board projection, no closure.
 """
-import argparse, fcntl, json, os, re, stat, subprocess, sys, tempfile, time, uuid
+import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
@@ -85,11 +87,11 @@ def regular(path, flags):
 class Lock:
     """The row lock. Every read-modify-write of delivery.json happens inside one, so two claims arriving at once
     are two writers in a queue rather than one lost record."""
-    def __init__(self, state): self.path = state / "delivery.lock"
+    def __init__(self, state, timeout=30): self.path = state / "delivery.lock"; self.timeout = timeout
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fd = regular(self.path, os.O_RDWR | os.O_CREAT)
-        end = time.monotonic() + 30
+        end = time.monotonic() + self.timeout
         while True:
             try: fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
             except BlockingIOError:
@@ -148,14 +150,14 @@ def owner():
             argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
         except (OSError, ValueError, IndexError): break
         p["command"] = Path(argv[0]).name if argv[0] else ""
-        p["cc"] = any(os.path.realpath(x) == str(BIN / "cc") for x in argv[:2] if x)
+        p["cc"] = any(os.path.realpath(x) in (str(BIN / "cc"), str(BIN / "cc-native")) for x in argv[:2] if x)
         chain.append(p); pid = p["ppid"]
     candidates = [p for p in chain if not p["cc"]]
     if not candidates: raise ValueError("cannot identify the calling process")
     runtime = os.environ.get("CLAUDECODE") or os.environ.get("CODEX_THREAD_ID")
     caller = next((p for p in candidates if runtime and p["command"] in ("claude", "codex")), candidates[0])
     return {"process": {k: caller[k] for k in ("pid", "start_ticks")}, "boot_id": boot_id(),
-            "agent_id": os.environ.get("CLAUDE_CODE_AGENT_ID"), "window": window(),
+            "agent_id": None, "window": window(),
             "ancestry": [{k: v for k, v in p.items() if k != "cc"} for p in chain],
             "session": os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID"),
             "parent_session": None, "transcript": None}
@@ -305,6 +307,111 @@ def receipt(d):
             "pr_url": (d["pr"] or {}).get("url"), "card": d["card"], "closed": d["closed"],
             "errors": a["errors"], "pending": d.get("pending", {})}
 
+# Native lifecycle helpers are called by cc-native with the payload it read on stdin. There is no CLI that
+# accepts a typed agent id. The shared native lock serializes dispatch and binding across rows; the row lock
+# also excludes worker takeover throughout a checkpoint. No index or token file is a second record writer.
+def native_enabled():
+    return shutil.which("jq") is not None and subprocess.run(
+        [str(BIN / "cc-config"), "get", "CC_NATIVE_ADAPTER", "0"], capture_output=True,
+        text=True, timeout=1).stdout.strip() == "1"
+
+def native_records():
+    for path in (Path.home() / ".cc/state").glob("*/*/delivery.json"):
+        try:
+            paths(path.parent.parent.name, path.parent.name)
+            d = read(path.parent)
+            if d["schema"] == SCHEMA and isinstance(d.get("claim"), dict): yield path.parent, d
+        except (OSError, ValueError, KeyError, TypeError): continue
+
+def native_find(token=None, payload=None):
+    if token:
+        parts = token.split("/")
+        if len(parts) != 3: raise ValueError("token has no live native claim")
+        state, _ = paths(*parts[:2])
+        try: d = read(state)
+        except ValueError as e: raise OSError("unreadable native record") from e
+        if d is None or (d.get("claim") or {}).get("claim_id") != parts[2]:
+            raise ValueError("token has no live native claim")
+        return state, d
+    found = [(s, d) for s, d in native_records() if
+             d["claim"].get("owner", {}).get("agent_id") == payload.get("agent_id") and
+             d["claim"].get("native", {}).get("session_id") == payload.get("session_id")]
+    if len(found) != 1: raise ValueError("native dispatch is absent or ambiguous")
+    return found[0]
+
+def native_token(state, c): return f"{state.parent.name}/{state.name}/{c['claim_id']}"
+
+def native_live(d):
+    c = d["claim"]
+    if d.get("closed") or c.get("ended_at") or c.get("executor") != "subagent" or not c.get("native") \
+            or not alive(c.get("owner")):
+        raise ValueError("token has no live native claim")
+    return c
+
+def native_parent(c, payload):
+    who = owner()
+    if not same_owner(c["owner"], dict(who, agent_id=c["owner"].get("agent_id"))) or \
+            c["native"]["session_id"] != payload.get("session_id"):
+        raise ValueError("native dispatch belongs to another parent")
+
+def native_bind(state, token, payload):
+    with Lock(state, timeout=1):
+        d = read(state); c = native_live(d); native_parent(c, payload)
+        agent, event = payload.get("agent_id"), payload.get("tool_use_id")
+        if not agent or not event or native_token(state, c) != token:
+            raise ValueError("bootstrap needs its runtime agent and live token")
+        bound = c["owner"].get("agent_id")
+        if bound and (bound != agent or c["native"].get("begin_event") != event):
+            raise ValueError("claim token was already used by a bootstrap")
+        for other, record in native_records():
+            held = record["claim"]
+            if other != state and held.get("owner", {}).get("agent_id") == agent and \
+                    held.get("native", {}).get("session_id") == payload["session_id"]:
+                raise ValueError("agent is already bound to another row")
+        if bound: return   # repeated delivery of this exact hook event writes nothing
+        c["owner"].update(agent_id=agent, parent_session=payload["session_id"],
+                          session=payload["session_id"], transcript=payload.get("transcript_path"))
+        c["native"]["begin_event"] = event
+        c.update(phase="live", activity_at=stamp(), live=True)
+        d["executions"][-1].update(source_transcript=payload.get("transcript_path"), request_start=event)
+        save(state, d)
+
+def native_begin(token):
+    if not native_enabled(): return 0
+    state, _ = native_find(token=token)
+    with Lock(state):
+        d = read(state); c = native_live(d)
+        native_parent(c, {"session_id": c["native"]["session_id"]})
+        if native_token(state, c) != token or not c["owner"].get("agent_id") or c["native"].get("begun"):
+            raise ValueError("begin needs an unused bootstrap bound by its tool hook")
+        c["native"]["begun"] = True; save(state, d)
+        _, wt = paths(state.parent.name, state.name)
+    print(json.dumps({"worktree": str(wt), "task_id": d["task_id"],
+                      "task.md": str(state / "task.md"), "progress.md": str(state / "progress.md")}))
+    return 0
+
+def native_end(state, payload, checkpoint):
+    with Lock(state, timeout=1):
+        d = read(state); c = native_live(d); native_parent(c, payload)
+        if not payload.get("agent_id") or c["owner"].get("agent_id") != payload["agent_id"]:
+            raise ValueError("end needs the bound runtime agent")
+        repo, row = state.parent.name, state.name; _, wt = paths(repo, row)
+        try:
+            prepared(repo, row, wt)
+            sha = checkpoint(wt)
+            # The cc-task artifact/error handlers, under the SAME row lock as the commit. A worker cannot
+            # supersede this generation between choosing the tree, committing it and recording its SHA.
+            complete(d, argparse.Namespace(cmd="artifact", generation=c["generation"],
+                                           committed_sha=sha, pushed_sha=None))
+            error = ""
+        except (OSError, ValueError, subprocess.SubprocessError) as e: error = str(e)
+        complete(d, argparse.Namespace(cmd="error", generation=c["generation"], stage="native-checkpoint", message=error))
+        c.update(ended_at=stamp(), activity_at=stamp(), live=False,
+                 phase="blocked" if error else "ready", reason="checkpoint failed" if error else "subagent returned")
+        d["executions"][-1].update(outcome=c["reason"], request_end=stamp(),
+                                   source_transcript=payload.get("agent_transcript_path"))
+        save(state, d)
+
 def complete(d, a):
     """Evidence only. Host completion can report a delivery without taking the builder's claim.
     Its generation must still match. Pending writes are saved before calling either projection's service.
@@ -361,6 +468,10 @@ def complete(d, a):
 
 def main(argv):
     if argv == ["selfcheck"]: return selfcheck()
+    if argv[:1] == ["begin"]:
+        if not native_enabled(): return 0
+        if len(argv) != 2: raise ValueError("usage: cc-task begin <claim-token>")
+        return native_begin(argv[1])
     p = argparse.ArgumentParser(prog="cc-task", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -740,6 +851,45 @@ def selfcheck():
            worker["repair"]["resume"] and worker["launch"] and changed["launch"]
            and changed["execution_id"] != worker["execution_id"]
            and not json.loads(run(*reserve).stdout)["launch"])
+
+        # B1-B5: the runtime payload is the only agent identity. The helper is a hook stand-in, kept in
+        # this fixture; no CLI accepts an agent id. Both children have this selfcheck as their parent.
+        env["CC_NATIVE_ADAPTER"] = "1"
+        for row in ("n1", "n2"):
+            tree = root / f".cc/worktrees/r/{row}"
+            git("-C", str(dev), "worktree", "add", "-q", "-b", f"track/{row}", str(tree))
+            d = json.loads(run("claim", "r", row, "--executor", "subagent").stdout)
+            d["claim"]["native"] = {"session_id": "parent", "dispatch_event": row}
+            (root / f".cc/state/r/{row}/delivery.json").write_text(json.dumps(d))
+        def native_record(row): return root / f".cc/state/r/{row}/delivery.json"
+        tokens = {row: native_token(native_record(row).parent, json.loads(native_record(row).read_text())["claim"]) for row in ("n1", "n2")}
+        helper = "import json,runpy,sys; from pathlib import Path; t=runpy.run_path(sys.argv[1]); " \
+                 "t['native_bind'](Path(sys.argv[2]),sys.argv[3],json.loads(sys.argv[4]))"
+        def bind(row, agent, event="first", parent="parent"):
+            payload = {"agent_id": agent, "tool_use_id": event, "session_id": parent, "transcript_path": "fixture.jsonl"}
+            return subprocess.run([sys.executable, "-c", helper, __file__, str(native_record(row).parent),
+                                   tokens[row], json.dumps(payload)], env=env, capture_output=True, text=True)
+        before = native_record("n1").read_bytes()
+        ok("B1: begin with no binding is a request that must be refused; B2 is its control",
+           run("begin", tokens["n1"]).returncode != 0 and native_record("n1").read_bytes() == before)
+        ok("B2: runtime binding changes the owner; its control is that the parent can no longer release",
+           bind("n1", "child-a").returncode == 0
+           and json.loads(native_record("n1").read_text())["claim"]["owner"]["agent_id"] == "child-a"
+           and run("release", "r", "n1", tokens["n1"].split("/")[-1], "1", "--reason", "parent returned").returncode != 0)
+        before = native_record("n2").read_bytes()
+        ok("B3: an agent already bound to another row is a request that must be refused; a different child is its control",
+           bind("n2", "child-a").returncode != 0 and native_record("n2").read_bytes() == before
+           and bind("n2", "child-b").returncode == 0)
+        before = native_record("n1").read_bytes()
+        ok("B4: swapped agent, wrong parent and second use are requests that must be refused; exact replay is their control",
+           bind("n1", "child-b").returncode != 0 and bind("n1", "child-a", parent="other").returncode != 0
+           and bind("n1", "child-a", event="second").returncode != 0 and bind("n1", "child-a").returncode == 0
+           and native_record("n1").read_bytes() == before)
+        worker = run("claim", "r", "n1", "--executor", "worker"); before = native_record("n1").read_bytes()
+        ok("B5: a worker still supersedes a bound subagent; that old token's bootstrap is a request that must be refused",
+           worker.returncode == 0 and json.loads(worker.stdout)["claim"]["generation"] == 2
+           and bind("n1", "child-a").returncode != 0 and run("begin", tokens["n1"]).returncode != 0
+           and native_record("n1").read_bytes() == before)
 
         bad_schema = json.loads(record2.read_text()); bad_schema["schema"] = 99
         (root / ".cc/state/r/t2/delivery.json").write_text(json.dumps(bad_schema))

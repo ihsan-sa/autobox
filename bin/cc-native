@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""cc-native — opt-in native runtime hook; no service, queue or delivery authority.
+  cc-native < payload.json    PreToolUse: Agent|Task dispatch, Bash bootstrap; SubagentStop: checkpoint/end
+  cc-native selfcheck         payload fixtures in their own HOME, state, board and Git remotes
+  cc-config get CC_NATIVE_ADAPTER 0   only 1 enables the hook and cc-task begin
+
+Verified against Claude Code 2.1.263: Agent (formerly Task), base session_id/transcript_path/cwd and
+subagent-only agent_id; PreToolUse consumes updatedInput alongside allow. SubagentStart has no prompt.
+The dispatch's tool_use_id identifies a replay; the bootstrap's own agent_id identifies the child.
+SubagentStop carries agent_id and agent_transcript_path. There is no CLAUDE_CODE_AGENT_ID environment key.
+Dispatch has a 15 s runtime budget: lock waiting and Git preparation share an 11 s deadline.
+JSON decisions use exit 0, including deny: exit 2 would make the runtime use stderr instead of the JSON.
+An unrelated or unreadable input decides nothing. No header leaves the legacy Agent input byte-identical.
+"""
+import json, os, re, runpy, shlex, shutil, signal, subprocess, sys, tempfile, time
+from pathlib import Path
+from types import SimpleNamespace
+
+BIN = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
+task = None
+ROW = re.compile(r"CC-Row: ([A-Za-z0-9_][A-Za-z0-9._-]{0,63})/([A-Za-z0-9_][A-Za-z0-9._-]{0,63})")
+
+def enabled():
+    """The flag, and it is read before cc-task is loaded. Registered, this hook runs on every Bash and Agent
+    call of every session on the box, and with the adapter off that config read is the whole of the work it
+    should do — loading cc-task first cost more than the answer. cc-task holds the same rule for `begin`."""
+    return shutil.which("jq") is not None and subprocess.run(
+        [str(BIN / "cc-config"), "get", "CC_NATIVE_ADAPTER", "0"], capture_output=True,
+        text=True, timeout=1).stdout.strip() == "1"
+
+def load():
+    global task
+    if task is None: task = SimpleNamespace(**runpy.run_path(str(BIN / "cc-task")))
+
+def call(argv, cwd=None, timeout=10):
+    # A timeout kills the claim's whole process group, including a stalled fetch. No child may later claim
+    # after its hook has returned a refusal. All output stays private until the hook chooses its JSON.
+    p = subprocess.Popen([str(a) for a in argv], cwd=cwd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try: out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL); p.communicate()
+        raise ValueError("cc-native: claim/checkpoint deadline expired")
+    if p.returncode: raise ValueError((out + err).strip() or "cc-native: command failed")
+    return out
+
+def decision(kind, reason=None, updated=None):
+    answer = {"hookEventName": "PreToolUse", "permissionDecision": kind}
+    if reason: answer["permissionDecisionReason"] = reason
+    if updated is not None: answer["updatedInput"] = updated
+    print(json.dumps({"hookSpecificOutput": answer}))
+
+def handoff(d, tool_input, state):
+    _, wt = task.paths(state.parent.name, state.name)
+    updated = dict(tool_input); updated.pop("isolation", None)
+    updated["prompt"] += (f"\n\nManaged track: {wt}\nTask id: {d['task_id']}\n"
+                          f"First tool action: cc-task begin {task.native_token(state, d['claim'])}\n"
+                          "Use the returned task.md and progress.md. Work only in that canonical worktree; "
+                          "use absolute paths or cd there for shell commands. The worktree is already prepared. "
+                          "The end hook commits. Do not commit, push, open a PR or queue delivery.\n")
+    return updated
+
+def dispatch(payload, tool_input, match):
+    repo, row = match.groups(); state, _ = task.paths(repo, row)
+    deadline = time.monotonic() + 11
+    # An unreadable record is outside this hook's remit, including before taking the native lock.
+    task.read(state)
+    with task.Lock(Path.home() / ".cc/native", timeout=10):
+        for other, d in task.native_records():
+            c = d["claim"]; native = c.get("native", {})
+            if native.get("session_id") == payload["session_id"] and native.get("dispatch_event") == payload["tool_use_id"]:
+                if other != state: raise ValueError("cc-native: dispatch event already names another row")
+                task.native_live(d); task.native_parent(c, payload)
+                return handoff(d, tool_input, state)
+        d = task.read(state); c = (d or {}).get("claim") or {}
+        if c.get("native") and not c.get("ended_at") and task.alive(c.get("owner")):
+            raise ValueError("cc-native: row is already reserved by another dispatch")
+        d = json.loads(call([BIN / "cc", "claim", repo, row, "--executor", "subagent"],
+                            timeout=max(.01, min(10, deadline - time.monotonic()))))
+        with task.Lock(state, timeout=1):
+            current = task.read(state); c = current["claim"]
+            if c["claim_id"] != d["claim"]["claim_id"] or c.get("ended_at"):
+                raise ValueError("cc-native: claim changed during dispatch")
+            c["native"] = {"session_id": payload["session_id"], "dispatch_event": payload["tool_use_id"]}
+            c["owner"].update(session=payload["session_id"], transcript=payload["transcript_path"])
+            task.save(state, current)
+        return handoff(current, tool_input, state)
+
+def checkpoint(wt):
+    call([BIN / "cc-checkpoint", "--commit"], cwd=wt, timeout=40)
+    return call(["git", "-C", wt, "rev-parse", "HEAD"]).strip()
+
+def hook(payload):
+    if not isinstance(payload, dict): return
+    if not all(isinstance(payload.get(k), str) and payload[k] for k in ("session_id", "transcript_path", "cwd")): return
+    event = payload.get("hook_event_name"); tool_input = payload.get("tool_input") or {}
+    if event == "SubagentStop":
+        if not payload.get("agent_id"): return
+        state, d = task.native_find(payload=payload)
+        if d["claim"].get("ended_at"): return
+        task.native_end(state, payload, checkpoint); return
+    if event != "PreToolUse" or not isinstance(tool_input, dict) or not payload.get("tool_use_id"): return
+    tool = payload.get("tool_name")
+    if tool in ("Agent", "Task"):
+        prompt = tool_input.get("prompt")
+        if not isinstance(prompt, str): return
+        match = ROW.fullmatch(prompt.split("\n", 1)[0])
+        if not match: return
+        # cc's refusal is passed through verbatim. An unreadable record yields no decision.
+        state, _ = task.paths(*match.groups())
+        try: task.read(state)
+        except (OSError, ValueError, TypeError): return
+        try: updated = dispatch(payload, tool_input, match)
+        except json.JSONDecodeError: return
+        except ValueError as e: decision("deny", str(e)); return
+        decision("allow", updated=updated)
+    elif tool == "Bash":
+        # Exactly the bootstrap command. Shell wrappers, substitutions and compound commands are not parsed
+        # into a new authority; the injected first action needs none of them. All other Bash stays untouched.
+        words = shlex.split(tool_input.get("command", ""))
+        if len(words) != 3 or words[:2] != ["cc-task", "begin"]: return
+        try:
+            state, _ = task.native_find(token=words[2])
+            with task.Lock(Path.home() / ".cc/native", timeout=1): task.native_bind(state, words[2], payload)
+        except ValueError as e: decision("deny", str(e)); return
+        # Leave permission to cc-guard and the runtime. Binding alone does not allow a Bash command.
+
+def selfcheck():
+    from concurrent.futures import ThreadPoolExecutor
+    n = failed = 0
+    def ok(label, cond):
+        nonlocal n, failed
+        n += 1; failed += not cond
+        print(("  ok   " if cond else "  FAIL ") + label)
+    with tempfile.TemporaryDirectory(prefix="ccnative-sc-") as th:
+        root = Path(th); home = root / "home"; binpath = home / "bin"; binpath.mkdir(parents=True)
+        env = {"HOME": str(home), "PATH": f"{binpath}:/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1",
+               "CC_CONFIG": str(root / "config"), "CC_NATIVE_ADAPTER": "1"}
+        for tool in ("cc-native", "cc-task", "cc", "cc-board", "cc-checkpoint", "cc-config"):
+            shutil.copy2(BIN / tool, binpath / tool)
+        # These fixture doors record any accidental live operation. Git uses only our own bare remote.
+        for tool in ("tmux", "systemctl", "systemd-run", "gh", "cc-land", "cc-slack", "cc-notify", "claude"):
+            p = binpath / tool
+            p.write_text(f'#!/bin/sh\necho "{tool} $*" >> "{root}/services"\nexit 1\n'); p.chmod(0o755)
+        (binpath / "cc-trust").write_text("#!/bin/sh\nexit 0\n"); (binpath / "cc-trust").chmod(0o755)
+        def run(*args, input=None, extra=None):
+            return subprocess.run([str(x) for x in args], input=input, capture_output=True, text=True,
+                                  env={**env, **(extra or {})}, cwd=home, timeout=60)
+        def git(*args):
+            r = run("git", *args)
+            if r.returncode: raise ValueError(r.stderr)
+            return r.stdout.strip()
+        dev = home / "dev/r"; dev.mkdir(parents=True)
+        git("config", "--global", "user.name", "fixture"); git("config", "--global", "user.email", "fixture@example.test")
+        git("init", "-q", "-b", "main", dev); (dev / "base").write_text("base\n")
+        git("-C", dev, "add", "."); git("-C", dev, "commit", "-qm", "base")
+        remote = root / "remote.git"; git("init", "--bare", "-q", remote)
+        git("-C", dev, "remote", "add", "origin", remote); git("-C", dev, "push", "-q", "origin", "main")
+        run(binpath / "cc-board", "init", "r", dev, "main")
+        for row in ("a", "b", "c", "bad"):
+            run(binpath / "cc-board", "add", "r", row, row, "A fixture brief with acceptance criteria.")
+        base = {"session_id": "parent", "transcript_path": str(root / "parent.jsonl"), "cwd": str(dev)}
+        def spawn(row, tool="Agent"):
+            return dict(base, hook_event_name="PreToolUse", tool_name=tool, tool_use_id=f"dispatch-{row}",
+                        tool_input={"prompt": f"CC-Row: r/{row}\nBuild the row.", "description": "fixture change",
+                                    "subagent_type": "builder", "isolation": "worktree"})
+        def boot(token, agent, event=None):
+            return dict(base, hook_event_name="PreToolUse", tool_name="Bash", agent_id=agent,
+                        tool_use_id=event or f"begin-{agent}", tool_input={"command": f"cc-task begin {token}"})
+        def end(agent):
+            return dict(base, hook_event_name="SubagentStop", agent_id=agent, agent_type="builder",
+                        agent_transcript_path=str(root / f"{agent}.jsonl"), stop_hook_active=False)
+        def g(payload, flag="1", extra=None):
+            return run(binpath / "cc-native", input=json.dumps(payload),
+                       extra={"CC_NATIVE_ADAPTER": flag, **(extra or {})})
+        def answer(r): return json.loads(r.stdout or "{}").get("hookSpecificOutput", {})
+        def record(row): return home / f".cc/state/r/{row}/delivery.json"
+        def load(row): return json.loads(record(row).read_text())
+        def wt(row): return home / f".cc/worktrees/r/{row}"
+        def snap(): return {str(p): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+        before = snap(); off = g(spawn("a"), "0")
+        ok("N1: off dispatch decides and writes nothing; N2 is its control", off.returncode == 0 and not off.stdout and snap() == before)
+        default = run(binpath / "cc-native", input=json.dumps(spawn("a")), extra={"CC_NATIVE_ADAPTER": ""})
+        env.pop("CC_NATIVE_ADAPTER"); absent = run(binpath / "cc-native", input=json.dumps(spawn("a")))
+        env["CC_NATIVE_ADAPTER"] = "1"
+        ok("N1 default control: an absent or empty flag is off", not default.stdout and not absent.stdout and snap() == before)
+        # Two payloads of one parent wait at the same lock, then claim separate rows. They are real hook
+        # processes, not function calls, and the parent stays alive through both bootstraps and both ends.
+        lockdir = home / ".cc/native"
+        with task.Lock(lockdir):
+            ps = [subprocess.Popen([str(binpath / "cc-native")], env=env, cwd=home, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+            for p, row in zip(ps, ("a", "b")): p.stdin.write(json.dumps(spawn(row, "Task" if row == "b" else "Agent"))); p.stdin.close(); p.stdin = None
+            time.sleep(.15); held = all(p.poll() is None for p in ps)
+        outputs = [json.loads(p.communicate(timeout=30)[0])["hookSpecificOutput"] for p in ps]
+        if any(a["permissionDecision"] != "allow" for a in outputs): raise ValueError(f"fixture dispatch: {outputs}")
+        tokens = [task.native_token(record(row).parent, load(row)["claim"]) for row in ("a", "b")]
+        ok("N2: concurrent Agent and Task dispatches prepare distinct canonical trees and tokens", held and all(p.returncode == 0 for p in ps)
+           and all(a["permissionDecision"] == "allow" and "isolation" not in a["updatedInput"] for a in outputs)
+           and len(set(tokens)) == 2 and all(str(wt(row)) in a["updatedInput"]["prompt"] and load(row)["task_id"] in a["updatedInput"]["prompt"]
+               and git("-C", wt(row), "branch", "--show-current") == f"track/{row}" for row, a in zip(("a", "b"), outputs)))
+        before = record("a").read_bytes(); replay = g(spawn("a"))
+        refused = g(dict(spawn("a"), tool_use_id="another-dispatch"))
+        ok("N3: replay keeps the same token; another dispatch of that row is a request that must be refused; N2 is its control",
+           answer(replay) == outputs[0] and answer(refused).get("permissionDecision") == "deny" and record("a").read_bytes() == before)
+        unbound = run(binpath / "cc-task", "begin", tokens[0])
+        before = snap(); g(boot(tokens[0], "child-a"), "0"); g(end("child-a"), "0")
+        offbegin = run(binpath / "cc-task", "begin", tokens[0], extra={"CC_NATIVE_ADAPTER": "0"})
+        ok("N4: begin with no binding is a request that must be refused; off bootstrap/end/begin write nothing; N5 is its control",
+           unbound.returncode != 0 and offbegin.returncode == 0 and not offbegin.stdout and snap() == before)
+        with ThreadPoolExecutor(2) as pool:
+            bindings = list(pool.map(g, [boot(token, agent) for token, agent in zip(tokens, ("child-a", "child-b"))]))
+        begins = [run(binpath / "cc-task", "begin", token) for token in tokens]
+        ok("N5: both children of one parent bind their own row and begin returns its worktree, brief and journal",
+           all(r.returncode == 0 and not r.stdout for r in bindings) and all(r.returncode == 0 for r in begins)
+           and all(json.loads(r.stdout)["worktree"] == str(wt(row)) and json.loads(r.stdout)["task.md"] == str(record(row).parent / "task.md")
+                   and json.loads(r.stdout)["progress.md"] == str(record(row).parent / "progress.md")
+                   and load(row)["claim"]["owner"]["agent_id"] == agent for row, agent, r in zip(("a", "b"), ("child-a", "child-b"), begins)))
+        before = snap()
+        for label, payload in (("sibling token", boot(tokens[1], "child-a")),
+                               ("second use", boot(tokens[0], "child-a", "second-begin")),
+                               ("missing agent", {k: v for k, v in boot(tokens[0], "child-a").items() if k != "agent_id"}),
+                               ("wrong parent", dict(boot(tokens[0], "child-a"), session_id="other")),
+                               ("no live claim", boot("absent-token", "child-c"))):
+            refused = g(payload); off = g(payload, "0")
+            ok(f"N6 {label}: a request that must be refused; N5 is its control; off decides nothing",
+               answer(refused).get("permissionDecision") == "deny" and not off.stdout and off.returncode == 0 and snap() == before)
+        ok("N6 replay control: the same bootstrap hook is idempotent; a second begin command cannot consume it again",
+           not g(boot(tokens[0], "child-a")).stdout and run(binpath / "cc-task", "begin", tokens[0]).returncode != 0 and snap() == before)
+        for row in ("a", "b"): (wt(row) / "change").write_text(f"{row}\n")
+        (dev / "planner-only").write_text("leave dirty\n"); before = snap()
+        unknown = g(end("unknown")); g(end("unknown"), "0")
+        for agent in ("child-a", "child-b"): g(end(agent), "0")
+        ok("N7: unknown and off ends commit nothing; N8 is their control", not unknown.stdout and unknown.returncode == 0 and snap() == before)
+        with ThreadPoolExecutor(2) as pool: list(pool.map(g, [end(agent) for agent in ("child-a", "child-b")]))
+        ok("N8: both ends commit their bound tree, record the SHA and release ready while the parent stays dirty",
+           all(load(row)["artifact"]["committed_sha"] == git("-C", wt(row), "rev-parse", "HEAD")
+               and not git("-C", wt(row), "status", "--porcelain") and load(row)["claim"]["ended_at"]
+               and load(row)["claim"]["phase"] == "ready" and load(row)["claim"]["live"] is False for row in ("a", "b"))
+           and "planner-only" in git("-C", dev, "status", "--porcelain") and git("--git-dir", remote, "for-each-ref", "--format=%(refname)") == "refs/heads/main")
+        before = snap(); g(end("child-a"))
+        ok("N8 replay control: a repeated end changes no byte", snap() == before)
+        for mode in ("secret", "wrong-head", "default", "lying-path", "commit-failure", "worker-takeover"):
+            row = "c"; g(dict(spawn(row), tool_use_id=mode)); token = task.native_token(record(row).parent, load(row)["claim"])
+            agent = f"child-{mode}"; g(boot(token, agent)); run(binpath / "cc-task", "begin", token)
+            original = git("-C", wt(row), "rev-parse", "HEAD"); change = wt(row) / (".env" if mode == "secret" else "change")
+            change.write_text(f"{mode}\n")
+            hookfile = dev / ".git/hooks/pre-commit"
+            if mode == "wrong-head": git("-C", wt(row), "checkout", "-q", "--detach")
+            if mode == "default": git("-C", wt(row), "symbolic-ref", "HEAD", "refs/heads/main")
+            if mode == "lying-path":
+                d = load(row); d["worktree"] = str(dev); record(row).write_text(json.dumps(d))
+            if mode == "commit-failure": hookfile.write_text("#!/bin/sh\nexit 1\n"); hookfile.chmod(0o755)
+            if mode == "worker-takeover": run(binpath / "cc-task", "claim", "r", row, "--executor", "worker")
+            g(end(agent)); d = load(row)
+            if mode == "lying-path":
+                ok("N9 lying record control: end derives the tree from its state path; the planner stays dirty",
+                   git("-C", wt(row), "rev-parse", "HEAD") != original and (dev / "planner-only").exists())
+            else:
+                ok(f"N9 {mode}: a request that must be refused; N8 is its control",
+                   git("-C", wt(row), "rev-parse", "HEAD") == original and change.exists()
+                   and (d["claim"]["executor"] == "worker" if mode == "worker-takeover" else
+                        d["claim"]["phase"] == "blocked" and bool(d["artifact"]["errors"])))
+            if hookfile.exists(): hookfile.unlink()
+            if mode in ("wrong-head", "default"): git("-C", wt(row), "symbolic-ref", "HEAD", "refs/heads/track/c")
+            change.unlink()
+        before = snap()
+        noheader = dict(spawn("legacy"), tool_input={"prompt": "Build the legacy row.", "isolation": "worktree"})
+        for payload in (noheader, dict(spawn("a"), tool_name="Read"), dict(base, hook_event_name="SubagentStart", agent_id="child")):
+            r = g(payload); ok("N10: an unowned payload decides nothing; N2 is its control", r.returncode == 0 and not r.stdout and snap() == before)
+        # A legacy Agent stand-in owns its .claude tree. The unchanged call reaches it; the builder leaves
+        # dirty work, and only the fixture planning session commits and records its PR request.
+        legacy = dev / ".claude/worktrees/agent-legacy"
+        git("-C", dev, "worktree", "add", "-q", "-b", "planning/legacy", legacy)
+        (legacy / "legacy-change").write_text("legacy\n"); old = git("-C", legacy, "rev-parse", "HEAD")
+        g(end("legacy")); dirty = git("-C", legacy, "status", "--porcelain")
+        git("-C", legacy, "add", "."); git("-C", legacy, "commit", "-qm", "session commits legacy")
+        (root / "legacy-pr-request").write_text("session: open PR for planning/legacy\n")
+        ok("N11: no-header legacy keeps its Agent tree and planning branch; only the session commits and requests its PR",
+           dirty and old != git("-C", legacy, "rev-parse", "HEAD") and not record("legacy").exists()
+           and git("-C", legacy, "branch", "--show-current") == "planning/legacy")
+        record("bad").write_text("unreadable JSON"); before = snap(); r = g(spawn("bad"))
+        nojq = root / "no-jq"; nojq.mkdir(); (nojq / "python3").symlink_to(sys.executable)
+        missing = g(spawn("a"), extra={"PATH": str(nojq)})
+        malformed = run(binpath / "cc-native", input="not json")
+        unreadable = g(boot("r/bad/token", "child-bad"))
+        ok("N12: unreadable record, malformed payload and no jq decide and write nothing; N2 is their control",
+           all(r.returncode == 0 and not r.stdout for r in (r, missing, malformed, unreadable)) and snap() == before)
+        # A claim refusal from cc is its own reason, not an adapter paraphrase.
+        payload = spawn("missing"); payload["tool_input"]["prompt"] = "CC-Row: absent/missing\nBuild."
+        r = g(payload); direct = run(binpath / "cc", "claim", "absent", "missing", "--executor", "subagent")
+        ok("N13: cc's refused claim is a request that must be refused with its own message; N2 is its control",
+           answer(r).get("permissionDecision") == "deny" and answer(r)["permissionDecisionReason"] == (direct.stdout + direct.stderr).strip())
+        calls = (root / "services").read_text() if (root / "services").exists() else ""
+        ok("N14: no service, PR, queue or push was called by any managed hook; N8 records only local commits",
+           not calls.strip())
+    # The tally shape selftest.sh's chk() anchors on ("…: 0 failed" / "…, 0 failed", selftest.sh:121-123):
+    # anything else is read as no tally at all, which is how it says a selfcheck died.
+    print(f"cc-native selfcheck: {n - failed} passed, {failed} failed"); return 1 if failed else 0
+
+def main():
+    if sys.argv[1:] == ["selfcheck"]: load(); return selfcheck()
+    try:
+        if not enabled(): return 0
+        load(); hook(json.load(sys.stdin))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError): pass
+    return 0
+
+if __name__ == "__main__": sys.exit(main())
