@@ -2113,7 +2113,7 @@ if stanza "cc-slack (local router + channel server; no Slack, no API)"; then
 "$B/cc-slack" selfcheck > "$T/slack-selfcheck.out" 2>&1 && ok "cc-slack selfcheck: $(tail -1 "$T/slack-selfcheck.out")" \
   || red "cc-slack selfcheck: $(tail -1 "$T/slack-selfcheck.out")" "$(cat "$T/slack-selfcheck.out")"   # name the case: this went red 4× in gates on 09-01 as a bare ✗
 export CC_SLACK_DIR="$T/slack"; mkdir -p "$CC_SLACK_DIR"
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"chat_id":"local","text":"pong"}}}' | timeout 10 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch.out"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"chat_id":"local","text":"pong"}}}' | timeout 60 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch.out"
 grep -q '"claude/channel"' "$T/ch.out" && grep -q '"name": "reply"' "$T/ch.out" && ok "channel server: claude/channel capability + reply tool" || bad "channel handshake"
 # the session prompt the host actually receives must say who may speak and what a member may not authorize
 grep -q 'role=' "$T/ch.out" && grep -q 'role=\\"member\\"' "$T/ch.out" && grep -q 'CANNOT' "$T/ch.out" \
@@ -2121,45 +2121,68 @@ grep -q 'role=' "$T/ch.out" && grep -q 'role=\\"member\\"' "$T/ch.out" && grep -
 grep -q $'\tpost\tlocal\t' "$CC_SLACK_DIR/outbox.log" 2>/dev/null && ok "reply without a token → outbox log" || bad "outbox"
 # sending a FILE from a session: the tool exists, refuses a path outside its roots, and never claims a send it did not make
 FSEND=$(mktemp /tmp/ccsel-XXXXXX.png); printf 'PNGDATA' > "$FSEND"
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"/etc/hostname\",\"chat_id\":\"local\"}}}" "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"$FSEND\",\"chat_id\":\"local\",\"thread_ts\":\"1.1\",\"text\":\"the render\"}}}" | timeout 10 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch3.out"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"/etc/hostname\",\"chat_id\":\"local\"}}}" "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"file\",\"arguments\":{\"path\":\"$FSEND\",\"chat_id\":\"local\",\"thread_ts\":\"1.1\",\"text\":\"the render\"}}}" | timeout 60 "$B/cc-slack" channel $REPO 2>/dev/null > "$T/ch3.out"
 grep -q '"name": "file"' "$T/ch3.out" && grep -q 'outside the folders a session may send from' "$T/ch3.out" \
   && grep -q '"isError": true' "$T/ch3.out" && ok "channel server: the file tool refuses a path outside the session's roots" || bad "file tool bounds"
 grep -q 'NOT sent' "$T/ch3.out" && grep -q $'\tfile\tlocal\t' "$CC_SLACK_DIR/outbox.log" \
   && ok "file to chat_id local → outbox line, and the tool says it was NOT sent" || bad "file outbox honesty"
 rm -f "$FSEND"
 ln -sf "$B/cc-slack" "$T/ccslackd"   # a per-run name in the daemon's argv: ours is identifiable, and no other run's pattern kill can match it
-setsid nohup "$T/ccslackd" daemon --no-slack >"$T/slackd.log" 2>&1 & SD=$!; KIDS="$KIDS $SD"; sleep 1
+setsid nohup "$T/ccslackd" daemon --no-slack >"$T/slackd.log" 2>&1 & SD=$!; KIDS="$KIDS $SD"
+# EVERY WAIT BELOW IS ON A SIGNAL, NOT A CLOCK (2026-09-07). The box runs four to eleven suites at once because
+# landings gate in parallel by design, and `sleep 3` for a subscriber that links two seconds after the handshake had
+# almost no margin idle and none loaded. One miss took four cases with it: the injected message came back queued, the
+# two cases after it read an output file nothing had been written to, and the socket case's own hello drained the
+# backlog it asserts comes back silent. `cc-slack status` already answers all three things those sleeps were guessing
+# at - is the daemon up, who is subscribed, what is still queued - so ask it. Their argument is SECONDS of wall
+# clock, not a count of looks, because a hung daemon makes each look cost its own socket timeout and the cap has to
+# hold anyway: a landing reads a long silence as a hang. On an idle box each returns on its first look.
+# SLACK_BOT_TOKEN= because cmd_status calls find_channel() whenever the config carries a token, and CC_SLACK_DIR
+# redirects the socket and state dir but NOT the config — so on this box each look would fire a cursor-paged
+# conversations.list at the live app, from a stanza headed "no Slack, no API". cc-config lets a variable that is
+# set-but-empty beat the file, so the lookup is skipped and daemon/subscribed/queued still print unchanged.
+sst(){ SLACK_BOT_TOKEN= "$B/cc-slack" status 2>/dev/null || :; }
+swait(){ local pat=$2 end=$(( $(date +%s) + $1 )); while [ "$(date +%s)" -lt "$end" ]; do sst | grep -q "$pat" && return 0; sleep 0.5; done; return 1; }
+swait 60 '^daemon: up' || bad "cc-slack daemon never came up: $(tail -2 "$T/slackd.log")"
 [ "$("$B/cc-slack" inject --no-start $REPO queued-msg)" = queued ] && ok "inject with no subscriber → queued" || bad "queue"
 # the channel server links to the daemon only after the host's notifications/initialized (+2 s) — feed a real MCP handshake, then hold the pipe open
-rm -f "$T/fifo"; mkfifo "$T/fifo"; ( exec 3>"$T/fifo"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3; sleep 8; exec 3>&- ) & KIDS="$KIDS $!"
-( cd ~/dev/$REPO && CC_SLACK_CHANNEL=1 "$B/cc-slack" channel $REPO ) < "$T/fifo" > "$T/ch2.out" 2>/dev/null & KIDS="$KIDS $!"; sleep 3   # from the session's OWN cwd: the daemon serves a hello only to the session it claims to be (member-sandbox)
+rm -f "$T/fifo" "$T/fifo.done"; mkfifo "$T/fifo"; ( exec 3>"$T/fifo"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3; for _ in $(seq 1 400); do [ -e "$T/fifo.done" ] && break; sleep 0.5; done; exec 3>&- ) & KIDS="$KIDS $!"
+( cd ~/dev/$REPO && CC_SLACK_CHANNEL=1 "$B/cc-slack" channel $REPO ) < "$T/fifo" > "$T/ch2.out" 2>/dev/null & KIDS="$KIDS $!"   # from the session's OWN cwd: the daemon serves a hello only to the session it claims to be (member-sandbox)
+swait 60 "subscribed sessions:.*$REPO \[main\]" || bad "the channel server never subscribed: $(sst | tail -1)"
 [ "$("$B/cc-slack" inject --no-start $REPO live-msg)" = delivered ] && ok "inject with a subscriber → delivered" || bad "deliver"
-sleep 5; grep -q queued-msg "$T/ch2.out" && grep -q live-msg "$T/ch2.out" && grep -q 'notifications/claude/channel' "$T/ch2.out" && ok "backlog flushed on subscribe + live event as notifications/claude/channel" || bad "channel notifications"
+for _ in $(seq 1 120); do grep -q queued-msg "$T/ch2.out" && grep -q live-msg "$T/ch2.out" && break; sleep 0.5; done
+grep -q queued-msg "$T/ch2.out" && grep -q live-msg "$T/ch2.out" && grep -q 'notifications/claude/channel' "$T/ch2.out" && ok "backlog flushed on subscribe + live event as notifications/claude/channel" || bad "channel notifications"
 grep -q '"role": "owner"' "$T/ch2.out" && ok "delivered meta carries role (a local inject is owner-level)" || bad "role in delivered meta"
 # THE SOCKET IS NOT A HOLE THROUGH cc-guard (member-sandbox, audit row slack-socket). One mechanism, shared with the
 # member proxy: SO_PEERCRED must be this user, a `hello` is served only to a process whose cwd IS the target it claims
 # (so no local process can subscribe as another session and take its messages), and the owner-level {"post"} verb —
 # which posted anywhere as the bot for anyone on the box — is gone from the socket altogether.
+# Its fixture is a DRAINED queue: the `hello` from the session's own cwd below is SERVED, so a message still queued
+# for this target would be handed to it as backlog and the case would read that as the peer check failing. Wait for
+# the daemon to say the queue is empty, so nothing here turns on how fast the delivery above happened to be.
+swait 30 'queued: none' || bad "the daemon queue never drained: $(sst | tail -1)"
 cat > "$T/sockask.py" <<'EOS'
 import json, os, socket, sys
 s = socket.socket(socket.AF_UNIX); s.connect(os.environ["CC_SLACK_DIR"] + "/sock")
-s.sendall((sys.argv[1] + "\n").encode()); s.shutdown(socket.SHUT_WR); s.settimeout(4)
-try:                              # a hello that is SERVED says nothing back: it is a subscriber now, and stays one
+s.sendall((sys.argv[1] + "\n").encode()); s.shutdown(socket.SHUT_WR); s.settimeout(10)
+try:  # a hello that is SERVED says nothing back: it is a subscriber now, and stays one. The waits here cap a HANG;
+      # they are not how long an answer may take, so they are long enough that a loaded box cannot empty one of them.
     sys.stdout.write(s.makefile("rb").readline().decode())
 except Exception:
     pass
 EOS
-hp=$(cd "$T" && timeout 5 python3 "$T/sockask.py" "{\"hello\": \"$REPO\", \"pid\": 1}")
-hq=$(cd ~/dev/$REPO && timeout 5 python3 "$T/sockask.py" "{\"hello\": \"$REPO\", \"pid\": 1}")
-pp=$(timeout 5 python3 "$T/sockask.py" '{"post": "C1", "text": "as the bot"}')
+hp=$(cd "$T" && timeout 30 python3 "$T/sockask.py" "{\"hello\": \"$REPO\", \"pid\": 1}")
+hq=$(cd ~/dev/$REPO && timeout 30 python3 "$T/sockask.py" "{\"hello\": \"$REPO\", \"pid\": 1}")
+pp=$(timeout 30 python3 "$T/sockask.py" '{"post": "C1", "text": "as the bot"}')
 grep -q 'not that session' <<<"$hp" && [ -z "$hq" ] && grep -q 'not a socket verb' <<<"$pp" \
   && ok "the daemon socket refuses a hello from a process that is not that session (cwd check on SO_PEERCRED's pid) and serves one from the session's own cwd, and the owner-level post verb is gone" \
   || bad "socket peer check (foreign hello: ${hp:0:60} | own cwd: ${hq:0:60} | post: ${pp:0:60})"
 "$B/cc-slack" 2>&1 | grep -q -- 'PRIVATE unless --public' && "$B/cc-slack" 2>&1 | grep -q 'ANYONE who can post in a routed channel is heard' \
   && ok "help: channels are private by default; anyone in a routed channel is heard" || bad "cc-slack help policy"
 "$B/cc-slack" 2>&1 | grep -q 'EVERY channel the bot is in answers' \
-  && "$B/cc-slack" status 2>/dev/null | grep -q 'policy: every channel the bot is in answers' \
+  && SLACK_BOT_TOKEN= "$B/cc-slack" status 2>/dev/null | grep -q 'policy: every channel the bot is in answers' \
   && ok "help + status state the policy: every channel answers, DMs are the owner's, #approvals/#alerts are not sessions" || bad "cc-slack channel-is-a-session policy"
+: > "$T/fifo.done"   # the channel server's stdin may close now: every case that needed it subscribed is done
 pg=$(ps -o pgid= -p "$SD" 2>/dev/null | tr -d ' ')   # OUR daemon, by recorded pid and its group — a bare pattern would kill another run's
 if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$SD" 2>/dev/null; fi
 for _ in 1 2 3 4 5; do kill -0 "$SD" 2>/dev/null || break; sleep 0.4; done; unset CC_SLACK_DIR
