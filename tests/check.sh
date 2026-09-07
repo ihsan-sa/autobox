@@ -85,6 +85,10 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # kernel that cannot carry the profile it exits 77 and this loop reports it as skipped, not passed.
 # cc-voice's builds a box of its own — a fake venv whose python prints a transcript, a fake `claude`, a fake
 # recording — over the two halves of a memo: no weights are downloaded, no model is called, no ~/.cc is read.
+# cc-steward's is fixtures too — two events cc-broker would deliver, a stub model answering with a fixture verdict
+# and a stub for every `cc-*` a chain calls — over the one thing it promises: one event in, ONE command out, and a
+# line that needs a person refused before any model is asked. No model is called, nothing is sent, and no chain
+# leaves its temp dir.
 # cc-task's is the claim rule itself, in a HOME, state dir, board and git repo of its own: that one task id
 # survives a release, a change of executor and a new owner, that two processes racing for a row leave one winner,
 # and that a claim is never taken while its owner is alive. No board of this box's is read and no runtime is run.
@@ -94,7 +98,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
 . tests/green.sh; land_scope "$PWD/bin"; skipped=""
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.
