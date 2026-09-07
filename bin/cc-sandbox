@@ -6,8 +6,12 @@
 #   CC_MEMBER_V2=1 cc-sandbox member <workspace> <task> -- /absolute/command [args...]
 #     Opt-in task launcher; provision with cc-member-v2 first. Pipes or /dev/null only.
 #   cc-sandbox member <handle> [<track>] -- <cmd...>   A MEMBER WORKSPACE'S BOUNDARY (docs/design-member-workspaces.md): ALWAYS bwrap,
-#     no opt-in. Inside: ~/dev/<handle> rw (the whole workspace, its .git included — it is the member's own repo — but .git/config
-#     and .git/hooks ro: the host runs git in there and must not run what a member wrote) · ~/.cc/worktrees/<handle>
+#     no opt-in. Inside: ~/dev/<handle> rw (the whole workspace, its .git included — it is the member's own repo — but .git/config,
+#     .git/hooks and every config.worktree ro: the host runs git in there and must not run what a member wrote. NONE of those
+#     binds names its source — see `pin`: the host opens each one and hands bwrap a descriptor, because a name in a tree the
+#     member writes can be turned into a link, moved out from under the mount, or swapped by a second live session of the same
+#     handle between the check and the mount. `.git` and `.git/worktrees` are bound onto themselves as well, which makes them
+#     MOUNTPOINTS the session cannot rename) · ~/.cc/worktrees/<handle>
 #     and ~/.cc/state/<handle> rw (every track of the workspace, no other repo's) · the workspace's board, in a DIRECTORY of its
 #     own (~/.cc/members/<handle>/board/, seen AS ~/.cc/boards; ~/.cc/boards/<handle>.json is a link into it — board_dir says why)
 #     · ~/.cc/slack/member/<handle>/ seen AS ~/.cc/slack: the daemon's member-scoped socket, an `enabled` flag and the attachment cache —
@@ -224,47 +228,119 @@ board_dir(){   # $1 handle — THE BOARD IS ONE FILE ON BOTH SIDES. ~/.cc/boards
       { ln -f "$src" "$bd/$f" 2>/dev/null || cp -p "$src" "$bd/$f"; } || exit 0
       ln -sfn "$bd/$f" "$src.ln.$$" && mv -Tf "$src.ln.$$" "$src" ) || :
   done; :; }
+pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen inside, default $2] → an fd-pinned bind, or 1
+  # A BIND SOURCE IS NOT A NAME. bwrap resolves its sources at mount time, in the host's namespace, and the git paths
+  # below sit in trees the member holds read-write — so a name there is a promise a member can break, three ways, all
+  # three measured on this box: plant a symlink at it and the mount follows; rename a parent so it resolves somewhere
+  # else; or, from a SECOND live session of the same handle, swap it between the host's check and bwrap's mount. A
+  # launch lock does not close the third — the attacker is a session that is already running — and a fourth name check
+  # would not either, because whatever is checked gets resolved again by mount(2). So the host OPENS the object here,
+  # confirms the descriptor is still the path it asked for, and hands bwrap /proc/self/fd/<n>: no name is resolved a
+  # second time, and a symlink anywhere in the path shows up as a descriptor whose readlink is the target, not the path.
+  # Refusing beats binding the wrong thing, so a mismatch returns 1 and the caller stops the launch.
+  # THE DESCRIPTOR GOES TO BWRAP AS A DESCRIPTOR (--bind-fd/--ro-bind-fd), not as /proc/self/fd/<n>. Both mount the same
+  # pinned inode, but bwrap CLOSES an fd it was handed this way and does not close one it merely read a path through:
+  # measured, the /proc form left every one of these open in the member's own process, and `openat(dirfd, "../..")` on an
+  # inherited directory fd walks the HOST tree — from the fd for ~/.cc/worktrees/<h> a session listed ~/.cc itself, which
+  # this boundary exists to keep out. A wall that opens a door behind it is not a wall.
+  # `exec {fd}<` and nothing else: an `exec` carrying a redirection with no command applies it to THIS SHELL for good,
+  # so the quieting has to be a group around it (`exec {fd}<"$p" 2>/dev/null` sent every later launch message, the
+  # settings-baseline warnings included, to /dev/null — caught by the baseline cases, which is what they are for).
+  # The open is plain O_RDONLY, so a FIFO parked at one of these names would block it: [ -f ]/[ -d ] first keeps a
+  # member from hanging their own launch. That test is for liveness only — the security decision is the readlink below,
+  # which is made on the descriptor and cannot be raced, and never on a path that gets resolved a second time.
+  local flag="$1" p="$2" tgt="${3:-$2}" fd
+  [ -f "$p" ] || [ -d "$p" ] || return 1
+  { exec {fd}<"$p"; } 2>/dev/null || return 1
+  [ "$(readlink "/proc/self/fd/$fd" 2>/dev/null)" = "$p" ] || { exec {fd}<&-; return 1; }
+  B+=("${flag}-fd" "$fd" "$tgt"); return 0; }
+pinq(){ pin "$@" || { echo "cc-sandbox: $2 is not the path it should be — a link, a rename, or a swap by another session of this workspace. Nothing was bound and nothing started; put the real path back." >&2; exit 2; }; }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
-  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname
+  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"
   cb=$(dirname "$SELF")   # the bin THIS copy lives in (~/bin is symlinks into the control repo's core/bin; a track worktree tests its own), bound AS ~/bin
-  mkdir -p "$m/claude/projects" "$m/npm" "$m/cache" "$m/board" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$sl/files" "$H/.cc/boards"; : >> "$sl/enabled"
+  gw="$H/.cc/sandbox/$h/gitwall"   # THE HOST'S OWN COPIES, in a dir under no bind below: the source of a wall is never a path the walled-off session can reach
+  mkdir -p "$m/claude/projects" "$m/npm" "$m/cache" "$m/board" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$sl/files" "$H/.cc/boards" "$gw"; : >> "$sl/enabled"
+  : > "$gw/config.worktree"
   [ -f "$H/.cc/boards/$h.json" ] || "$cb/cc-board" init "$h" "$dev" main >/dev/null 2>&1 || : > "$H/.cc/boards/$h.json"
   : >> "$H/.cc/boards/$h.lock"
   board_dir "$h"
   B=(--die-with-parent --unshare-pid --clearenv
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
-     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
-     --bind "$dev" "$dev" --bind "$H/.cc/worktrees/$h" "$H/.cc/worktrees/$h" --bind "$H/.cc/state/$h" "$H/.cc/state/$h"
+     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H")
+  # THE WORKSPACE IS THE MEMBER'S; ITS GIT DIRECTORY IS NOT. The HOST runs git in this very repo — `cc <h> <track>`
+  # fetches and adds a worktree here — so a hook the member drops in, a core.hooksPath they point at their own tree, or
+  # an `ext::sh -c …` remote would execute as the OWNER outside the boundary, where ~/.ssh, ~/.cc/config and the
+  # container socket are. Every source below is pinned by descriptor (pin), and the ORDER is the mount order: the
+  # workspace, then .git, then what sits in it. Binding `.git` ITSELF is not a duplicate of the workspace bind — it
+  # makes `.git` a MOUNTPOINT in the session's own namespace, and a mountpoint cannot be renamed or unlinked from the
+  # namespace it is mounted in. Without it, measured: a session runs `mv ~/dev/<h>/.git .gitx && mkdir .git`, walks the
+  # ro binds of config and hooks away with the old directory, and the host's next `git -C ~/dev/<h>` reads a git dir the
+  # member wrote. A mount does NOT pin the name for anyone else — another namespace renames it freely, also measured —
+  # but every member session of this workspace goes through here, so the name is pinned wherever a member has a shell.
+  # NOTHING IS REPAIRED THROUGH A NAME THAT IS ALREADY WRONG, which is why `git init` comes after the pin and not before
+  # it: with `.git` a link to another repo, an init run first would have made ITS git dir, out here, as the owner.
+  pinq --bind "$dev"
+  if ! pin --bind "$dev/.git"; then
+    { [ -e "$dev/.git" ] || [ -L "$dev/.git" ]; } && pinq --bind "$dev/.git"   # something IS there and it is not this workspace's git dir: refuse, never repair
+    git -C "$dev" init -q >/dev/null 2>&1   # nothing there at all: the repo must exist OUT here first, or there is nothing to hold read-only
+    pinq --bind "$dev/.git"
+  fi
+  [ -f "$dev/.git/config" ] || git -C "$dev" init -q >/dev/null 2>&1   # a git dir that is this workspace's, but half made
+  mkdir -p "$dev/.git/hooks" 2>/dev/null
+  pinq --ro-bind "$dev/.git/config"
+  pinq --ro-bind "$dev/.git/hooks"
+  # A CONFIG FILE THE MEMBER WROTE AND THE HOST READ. git reads exactly two repo-level config files: the common dir's
+  # `config`, held ro above, and `$GIT_DIR/config.worktree`, which it reads when extensions.worktreeConfig is on. The
+  # admin dirs must stay writable — a member's own commit writes its index and HEAD in there, which is why they cannot
+  # be held whole (the selfcheck's commit case proves it) — so config.worktree is a name a member can CREATE, in the
+  # workspace's own git dir and in every track's. A bind made only where the file already existed was one they stepped
+  # around by creating it. So the host binds ITS OWN empty file at every one of those names, present or not, from $gw
+  # where no session reaches. Nothing in core turns the extension on and the config that would is ro above; if it is
+  # ever on, the file is live and its content is not the host's, so the launch refuses rather than guess.
+  # --type=bool, not a string compare: `--get` hands back the RAW text, and git honours 1/yes/on/TRUE as true, so
+  # comparing against the literal "true" left the extension LIVE for every other spelling git accepts (review of #298).
+  [ "$(git config --file "$dev/.git/config" --type=bool --get extensions.worktreeConfig 2>/dev/null)" = true ] && {
+    echo "cc-sandbox: ~/dev/$h/.git/config turns extensions.worktreeConfig on — every config.worktree in there goes live and this boundary does not own their content. Turn it off, or take this to the owner." >&2; exit 2; }
+  pinq --ro-bind "$gw/config.worktree" "$dev/.git/config.worktree"
+  mkdir -p "$dev/.git/worktrees" 2>/dev/null   # made here so the pin below is unconditional: a workspace with no track yet would otherwise leave the name free for a session to take
+  pinq --bind "$dev/.git/worktrees"
+  # THE ONE BIND WHOSE DESTINATION IS A MEMBER'S NAME. Everywhere else pin() checks the SOURCE, which is the whole
+  # point of this file; here the source is the host's own $gw and the DEST is `<admin dir>/config.worktree`, under a
+  # directory name a member creates. The glob's trailing `/` matches a symlink-to-directory and `[ -d ]` follows it,
+  # so `ln -s <somewhere the owner can write> .git/worktrees/x` aimed the dest through the link (review of #298).
+  # A symlinked admin dir is not a real one — git never makes it — so refuse the launch rather than skip it quietly.
+  # The glob loses its trailing `/` and the link test comes BEFORE the -d one, both for the same reason: `*/` matches
+  # only directories and -d follows a link, so a DANGLING link was neither iterated nor tested — and that is the
+  # easier plant of the two, since the target need not exist yet.
+  # This is the one name test left in here, and it is check-then-use: a live session can still swap the name between
+  # this line and the mount. What it cannot do is turn that into a wrong mount — measured on bwrap 0.11.1, a bind DEST
+  # is not resolved through a symlink at all, so losing the race costs the launch, not the boundary. Both walls stand
+  # or neither is enough; do not drop this one on the strength of the other.
+  for gd in "$dev"/.git/worktrees/*; do
+    [ -e "$gd" ] || [ -L "$gd" ] || continue   # an empty worktrees dir leaves the pattern itself in $gd
+    [ -L "$gd" ] && { echo "cc-sandbox: ~/dev/$h/.git/worktrees/$(basename "$gd") is a symlink, not an administration directory — git does not make one, so something put it there. Remove it, or take this to the owner." >&2; exit 2; }
+    [ -d "$gd" ] || continue
+    pinq --ro-bind "$gw/config.worktree" "$gd/config.worktree"; done
+  # …and the per-track gitlinks (review-156b): the worktree tree is rw, so its `.git` FILE could otherwise be replaced
+  # with a member git dir whose hooks the host's checkpoint would run as the owner. The REDIRECT files are the repo's,
+  # not the member's — the gitlink and the admin dir's `commondir` (re-pointing it swaps in a member-owned common dir,
+  # config and hooks included). The host-side checkpoint pins core.hooksPath on top (core/bin/cc).
+  pinq --bind "$H/.cc/worktrees/$h"
+  for twt in "$H/.cc/worktrees/$h"/*/; do
+    [ -f "${twt}.git" ] || continue
+    tname=$(basename "$twt")
+    pinq --ro-bind "${twt}.git"
+    [ -f "$dev/.git/worktrees/$tname/commondir" ] && pinq --ro-bind "$dev/.git/worktrees/$tname/commondir"
+  done
+  B+=(--bind "$H/.cc/state/$h" "$H/.cc/state/$h"
      --bind "$m/board" "$H/.cc/boards"
      --bind "$sl" "$H/.cc/slack" --bind "$m/claude/projects" "$H/.claude/projects" --bind "$m/npm" "$H/.npm" --bind "$m/cache" "$H/.cache"
      --ro-bind "$cb" "$H/bin" --ro-bind "$H/.local/bin/claude" "$H/.local/bin/claude"
      --setenv HOME "$H" --setenv PATH "$H/bin:$H/.local/bin:/usr/local/bin:/usr/bin:/bin" --setenv CC_MEMBER_SANDBOX 1 --setenv CC_ROLE member
      --setenv GIT_AUTHOR_NAME "$h" --setenv GIT_AUTHOR_EMAIL "$h@member.$(hostname -s)" --setenv GIT_COMMITTER_NAME "$h" --setenv GIT_COMMITTER_EMAIL "$h@member.$(hostname -s)"
      --chdir "$cwd")
-  # THE WORKSPACE IS THE MEMBER'S; ITS .git/config AND .git/hooks ARE NOT. The HOST runs git in this very repo — `cc
-  # <h> <track>` fetches and adds a worktree here — so a hook the member drops in, a core.hooksPath they point at their
-  # own tree, or an `ext::sh -c …` remote would execute as the OWNER outside the boundary, where ~/.ssh, ~/.cc/config
-  # and the container socket are. Same guard build() gives a worker, and cc's host-side git pins core.hooksPath as well.
-  [ -f "$dev/.git/config" ] || git -C "$dev" init -q >/dev/null 2>&1   # the repo must exist OUT here first, or there is nothing to hold read-only
-  mkdir -p "$dev/.git/hooks" 2>/dev/null
-  [ -f "$dev/.git/config" ] && B+=(--ro-bind "$dev/.git/config" "$dev/.git/config")
-  [ -d "$dev/.git/hooks" ] && B+=(--ro-bind "$dev/.git/hooks" "$dev/.git/hooks")
-  # …and the per-track gitlinks (review-156b): the worktree tree is rw, so its `.git` FILE could otherwise be
-  # replaced with a member git dir whose hooks the host's checkpoint would run as the owner. The REDIRECT files are
-  # the repo's, not the member's — the gitlink, the admin dir's `commondir` (re-pointing it swaps in a member-owned
-  # common dir, config and hooks included) and `config.worktree` where it exists. The admin dir itself stays rw:
-  # the member's own commits write their index and HEAD there, which is why it cannot be held whole (the selfcheck's
-  # commit case proves it). config.worktree only binds when extensions.worktreeConfig is on, and $dev/.git/config is
-  # ro above; the host-side checkpoint pins core.hooksPath on top (core/bin/cc).
-  for twt in "$H/.cc/worktrees/$h"/*/; do
-    [ -f "${twt}.git" ] || continue
-    tname=$(basename "$twt")
-    B+=(--ro-bind "${twt}.git" "${twt}.git")
-    [ -f "$dev/.git/worktrees/$tname/commondir" ] && B+=(--ro-bind "$dev/.git/worktrees/$tname/commondir" "$dev/.git/worktrees/$tname/commondir")
-    [ -f "$dev/.git/worktrees/$tname/config.worktree" ] && B+=(--ro-bind "$dev/.git/worktrees/$tname/config.worktree" "$dev/.git/worktrees/$tname/config.worktree")
-  done
   # His hooks (cc-guard: depth inside the wall) come through this copy unchanged, with the sealed-session permissions
   # appended. ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside.
   settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}"
@@ -320,6 +396,11 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # makes the inner jq exit 0 with no output — either way fd 3 would write nothing, `--file 3` would make an EMPTY
   # ~/.claude.json inside, and the wizard would be back with only a stderr line in a pane nobody reads. `input? // {}`
   # is the fallback: no projects to filter, flags minted all the same.
+  # THE WINDOW BETWEEN THE PINS AND THE MOUNT, ON PURPOSE. build_member opened every member-side source above; bwrap
+  # mounts them below. A racing session of the same handle gets whatever time passes in between, and the selfcheck has
+  # to be able to lose that race on demand instead of hoping to hit a microsecond — so it widens the window with this.
+  # A NUMBER, never a command, and only ever set on the host: the environment inside is cleared, so no session sets it.
+  case "${CC_SANDBOX_TEST_DELAY:-}" in ''|*[!0-9.]*) ;; *) sleep "$CC_SANDBOX_TEST_DELAY";; esac
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" -- "$@" \
     3< <({ jq -c '.projects // {}' "$H/.claude.json" 2>/dev/null || printf '{}'; } \
          | jq -n --arg d "$dev" --arg cwd "$cwd" --arg w "$H/.cc/worktrees/$h/" --argjson m "$mcp" \
@@ -581,6 +662,75 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'credential: …and the next launch starts from it, with no person' "$(g next)" "refreshed-$$"
   real1=$(md5sum "$c" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
   t 'credential: the box'"'"'s own ~/.claude/.credentials.json is untouched by all of that' "$real1" "$real0"
+  # ── THE GIT DIR IS THE HOST'S, THREE WAYS. Every source of a member-side bind is opened here and handed to bwrap as a
+  #    descriptor (pin), so there is no name left for a member to redirect; `.git` and `.git/worktrees` are bound onto
+  #    themselves, which makes them mountpoints their own session cannot rename. One case per class that got here.
+  # (1) A CONFIG FILE THE MEMBER WROTE AND THE HOST READ: config.worktree, in the workspace's git dir and in the track's.
+  out=$("$SELF" member "$h" t -- sh -c '
+    echo root=$( (echo "[core]" > ~/dev/'"$h"'/.git/config.worktree) 2>/dev/null && echo writable || echo ro)
+    echo track=$( (echo "[core]" > ~/dev/'"$h"'/.git/worktrees/t/config.worktree) 2>/dev/null && echo writable || echo ro)
+    echo mvgit=$( (mv ~/dev/'"$h"'/.git ~/dev/'"$h"'/.gitx) 2>/dev/null && echo moved || echo pinned)
+    echo mvwt=$( (mv ~/dev/'"$h"'/.git/worktrees ~/dev/'"$h"'/.git/wtx) 2>/dev/null && echo moved || echo pinned)
+    echo mkwt=$(mkdir -p ~/dev/'"$h"'/.git/worktrees/made-inside 2>/dev/null && echo ok || echo no)
+    echo leakfds=$(ls -l /proc/self/fd 2>/dev/null | sed -n "s|.* -> ||p" | grep -c "^$HOME/")' 2>&1)
+  t 'gitwall: config.worktree is the host'"'"'s empty file, in the workspace git dir and in the track'"'"'s — a member creating one does not make it theirs' "$(g root)/$(g track)" ro/ro
+  # (2) A NAME MOVED SO THE HOST FOLLOWS IT SOMEWHERE ELSE — the worst form, because `mv .git .gitx && mkdir .git` walks
+  #     the ro binds away with the old directory and leaves the HOST's next `git -C ~/dev/<h>` reading a member git dir.
+  t 'gitwall: .git and .git/worktrees are mountpoints — the session cannot rename the git dir out from under the host' "$(g mvgit)/$(g mvwt)" pinned/pinned
+  t 'gitwall: …and a track admin dir can still be made in there, so a member'"'"'s own worktree still works' "$(g mkwt)" ok
+  # THE DESCRIPTORS DO NOT SURVIVE THE LAUNCH. bwrap closes what --bind-fd/--ro-bind-fd consume; handed the same objects
+  # as /proc/self/fd/<n> paths it closes nothing, and `openat(dirfd, "../..")` on an inherited directory fd walks the
+  # HOST tree the namespace is there to hide — from the one for ~/.cc/worktrees/<h>, ~/.cc itself.
+  t 'gitwall: not one of the pinned descriptors reaches the session — an inherited directory fd walks out of the namespace' "$(g leakfds)" 0
+  t 'gitwall: the host still has its git dir, and neither config.worktree holds anything' \
+    "$([ -d "$dev/.git" ] && echo dir)/$(cat "$dev/.git/config.worktree" 2>/dev/null)$(cat "$dev/.git/worktrees/t/config.worktree" 2>/dev/null)" 'dir/'
+  rmdir "$dev/.git/worktrees/made-inside" 2>/dev/null
+  for c in .git .git/config .git/hooks; do
+    mv "$dev/$c" "$dev/$c.real" || return 1
+    case "$c" in .git/config) ln -sfn "$H/dev/$o/secret" "$dev/$c";; *) ln -sfn "$H/dev/$o" "$dev/$c";; esac
+    out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+    t "gitwall: a link planted at $c stops the launch, and binds nothing" \
+      "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'is not the path it should be' <<<"$out")" 2/0/1
+    rm -f "$dev/$c"; mv "$dev/$c.real" "$dev/$c"
+  done
+  t 'gitwall: …and a refused launch left the other repo alone — no git dir was made in it through the link' \
+    "$([ -e "$H/dev/$o/.git" ] && echo made || echo untouched)" untouched
+  # THE ONE BIND WHOSE DESTINATION IS A MEMBER'S NAME (review of #298). The source of the config.worktree walls is the
+  # host's own file; the DEST is `<admin dir>/config.worktree`, and the admin dir is a name a member creates. A link
+  # there aims the destination somewhere the owner can write. Both spellings are refused, the dangling one included:
+  # -d follows a link, so testing it first would have skipped exactly the plant that is easiest to make.
+  mkdir -p "$H/dev/$o/plantdir"
+  for pl in "$H/dev/$o/plantdir" "$H/dev/$o/plantdir/not-there-yet"; do
+    ln -sfn "$pl" "$dev/.git/worktrees/planted"
+    out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+    t "gitwall: a symlink where a track's administration directory goes stops the launch (${pl##*/})" \
+      "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'is a symlink, not an administration directory' <<<"$out")" 2/0/1
+    rm -f "$dev/.git/worktrees/planted"
+  done
+  t 'gitwall: …and nothing of the host'"'"'s was written through the link' "$(ls -A "$H/dev/$o/plantdir" | wc -l)" 0
+  # AND THE EXTENSION IS A BOOLEAN, NOT THE WORD "true": git honours 1/yes/on/TRUE for it, so a string compare against
+  # "true" left every other spelling live, and every config.worktree in the workspace with it (review of #298).
+  git config --file "$dev/.git/config" extensions.worktreeConfig on
+  out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'gitwall: extensions.worktreeConfig spelled `on` is the extension turned on — the launch refuses, as it does for `true`' \
+    "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'turns extensions.worktreeConfig on' <<<"$out")" 2/0/1
+  git config --file "$dev/.git/config" extensions.worktreeConfig off
+  out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1)
+  t 'gitwall: …and a spelling that means false is not refused — the case above is the extension, not the key' "$(grep -c STARTED <<<"$out")" 1
+  git config --file "$dev/.git/config" --unset extensions.worktreeConfig
+  # (3) THE SWAP, DRIVEN — not a comment claiming the window is shut. A second process of this workspace renames the
+  #     track worktree aside and puts its own directory, with its own gitlink, at that name, inside the window
+  #     CC_SANDBOX_TEST_DELAY opens between the pins and the mount. A launch lock would not help: on a real box that
+  #     process is another LIVE SESSION of the same handle, not a racing launch. A rename is the shape that decides it —
+  #     measured, this bwrap follows a symlink in a bind SOURCE but refuses to create a bind DEST through one, so a
+  #     link swap only kills the launch, while a rename leaves the destination valid and the source pointing at the
+  #     member's own file. Named, the session gets that file; pinned, it gets the gitlink the host opened.
+  ( sleep 0.4; mv "$H/.cc/worktrees/$h/t" "$H/.cc/worktrees/$h/t.real" 2>/dev/null \
+      && mkdir -p "$H/.cc/worktrees/$h/t" && printf 'gitdir: /tmp/decoy-git\n' > "$H/.cc/worktrees/$h/t/.git"
+    sleep 1.4; rm -rf "$H/.cc/worktrees/$h/t"; mv "$H/.cc/worktrees/$h/t.real" "$H/.cc/worktrees/$h/t" 2>/dev/null ) &
+  out=$(CC_SANDBOX_TEST_DELAY=1 "$SELF" member "$h" t -- sh -c 'echo RAN=yes; echo gitlink=$(cat ~/.cc/worktrees/'"$h"'/t/.git 2>/dev/null)' 2>&1); wait
+  t 'gitwall: a second session swapping a track name DURING the launch never reaches the mount — the descriptor was already the real gitlink' \
+    "$(g RAN)/$(grep -c decoy-git <<<"$out")" yes/0
   out=$("$SELF" member "$o" -- true 2>&1); t 'member: a repo without the marker is refused' "${out#*: ~/dev/}" "$o is not a member workspace (no .cc/member-workspace)"
   rm -f "$own" "$kf"
   git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
