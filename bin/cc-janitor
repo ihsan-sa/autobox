@@ -12,10 +12,11 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
     also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
 
 PER REPO, NEVER ACROSS THEM — rules 1-4. Those entry points take repo names: a tool that deletes has to be
-pointed, and the timer is pointed by a config line the owner writes. Three passes are box-wide because what
+pointed, and the timer is pointed by a config line the owner writes. Four passes are box-wide because what
 they sweep points at itself rather than at a repo: rule 5 (a container names itself `ccbox-*`), rule 6 (a
-fixture names itself `_cc<suite><pid>`) and rule 7 (a process says where it is working and what that costs).
-All three run on every invocation, with an empty CC_JANITOR_REPOS too.
+fixture names itself `_cc<suite><pid>`), rule 7 (a process says where it is working and what that costs) and
+rule 8 (the temp root is scratch by construction). All four run on every invocation, with an empty
+CC_JANITOR_REPOS too.
 
 THE ONE RULE ABOVE THE RULES: delete only what is PROVEN dead. Anything uncertain — a PR that closed without
 merging, a branch nobody opened one for, a window with something running in it, a worktree with uncommitted
@@ -54,6 +55,17 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      holding half a core each with their test long gone and nothing on the box noticing (2026-09-06). Under
      CC_JANITOR_ORPHAN_CPU (default 0.10 of a core, averaged over the process's whole life) nothing is proven
      but a leftover nobody is paying for, and that is a finding, not a kill.
+  8. what those runs LEFT ON DISK — one entry below the temp root, a file or a directory and everything in it,
+     that this user owns and NOTHING HAS WRITTEN TO for CC_JANITOR_SCRATCH_DAYS days (default 7, 0 = off)  →
+     removed. Rule 7 ends the processes; this is the half that fills a disk. A box running work all day leaves
+     tens of thousands of these, nothing else on it removes them, and the first anyone hears of it is something
+     failing for want of space. The age is the NEWEST mtime anywhere in the tree, never the top directory's: a
+     directory nobody has added a name to for a month can hold a file written a minute ago. Two shapes are not
+     leftovers and are never candidates — something this user does not own, and a tree holding anything that is
+     not a plain file or directory: a socket, a fifo, a device, another filesystem mounted there. Those are
+     doors onto something running, or somewhere else entirely, and a temp root is full of them; the socket
+     every terminal session reaches its multiplexer through sits in a directory whose own clock stopped the day
+     it was made.
 
 NOTHING IS TAKEN OUT FROM UNDER SOMETHING STILL USING IT. Before any rule removes a directory, two generic
 tests can hold it, and a held directory is REPORTED — "spared", and what holds it — never removed:
@@ -65,6 +77,9 @@ tests can hold it, and a held directory is REPORTED — "spared", and what holds
     worktree registers its own. A record nobody has rewritten for 48 h — the same window a terminal track gets
     — is a leftover like everything else here and holds nothing, so a writer that died cannot pin a worktree
     for ever; what is genuinely still running has a process, and the first test has it.
+Rule 8 removes files rather than ending anything, so it takes the whole test AGAIN on each thing it is about to
+remove: what it deletes on is a reading taken then, not one taken at the top of a pass that has been walking a
+temp root since — the same second look rule 7 takes at a working directory before it signals.
 Rule 7 is the one place the first test cannot be the evidence: the processes working in that directory are
 exactly what it is judging, so there a registered record is the hold, and everything else it spares it spares
 on what the processes themselves say — a live session, or an idle one.
@@ -85,7 +100,7 @@ is the whole test.
 Every action goes to ~/.cc/state/janitor.log. `--dry` prints what it would do and writes nothing at all.
 Exit: 0 done (with or without findings) · 2 usage.
 """
-import calendar, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time
+import calendar, glob, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy: a worktree tests itself
@@ -103,6 +118,7 @@ SUITE = re.compile(r"_cc[a-z]+(\d+)(?:[/~]|$)")   # …and each carries its run'
 ORPHAN_HOURS = 4      # rule 7: a process in a scratch workspace younger than this is somebody's run in progress
 ORPHAN_CPU = 0.10     # …and one under this share of a core, over its whole life, is a leftover costing nothing
 GRACE = 5             # …seconds between the TERM that asks it to stop and the KILL that does not ask
+SCRATCH_DAYS = 7      # rule 8: a scratch entry nothing has written to for longer is a leftover; 0 = off
 HZ = 100              # clock ticks per second, for /proc/<pid>/stat — the real one below, this if it cannot be had
 try:
     HZ = os.sysconf("SC_CLK_TCK") or HZ
@@ -202,6 +218,21 @@ def orphan_verdict(f):
                           f"and costs nobody anything — end it by hand if it is finished with")
     return ("end", f"working in {f['ws']} for {dur(f['age'])} at {f['cpu'] * 100:.0f}% of a core, "
                    "and the run that made it is gone")
+
+
+def leftover_verdict(f):
+    """Rule 8. f: {path, ours, plain, age, held, days} → (rm|report|keep, why). `age` is the seconds since
+    anything anywhere in it was last written, `plain` False when it holds something that is not a plain file or
+    directory, `held` the reasons it must stay. Ours and plain first, and both silently: another user's file is
+    not this box's to judge and a socket is a door onto something running, so neither is a finding — a temp root
+    holds dozens of each, and a daily report listing them all is a report nobody reads."""
+    if not f["ours"] or not f["plain"]:
+        return ("keep", "")
+    if f["age"] < f.get("days", SCRATCH_DAYS) * 86400:
+        return ("keep", "")
+    if f["held"]:
+        return ("report", f"spared {f['path']}: " + "; ".join(f["held"]))
+    return ("rm", f"nothing has written in it for {dur(f['age'])}")
 
 
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -355,6 +386,57 @@ def scratch(cwd, tmp):
     return f"{tmp}/{cwd[len(tmp) + 1:].split('/')[0]}"
 
 
+def scratch_scan(path, dev):
+    """One entry below the temp root, measured: {newest, bytes, plain, ours}, or None when it is not a tree this
+    sweep judges at all. `newest` is the last mtime ANYWHERE inside it, `bytes` what it is holding, `plain` False
+    when anything in it is not a plain file or directory — a socket, a fifo, a device, or a name on another
+    filesystem, which is a mount rather than something a run wrote. A symlink at the top is not a tree either:
+    following one would take this sweep out of the temp root entirely."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or st.st_dev != dev:
+        return None
+    f = {"newest": st.st_mtime, "bytes": st.st_size, "plain": True, "ours": st.st_uid == os.getuid()}
+    if stat.S_ISREG(st.st_mode):
+        return f
+    if not stat.S_ISDIR(st.st_mode):
+        return dict(f, plain=False)
+    for root, dirs, files in os.walk(path, onerror=lambda e: None):     # never follows a link out of the tree
+        for name in dirs + files:
+            try:
+                t = os.lstat(os.path.join(root, name))
+            except OSError:
+                continue                                    # gone while this was reading is not a shape
+            if t.st_dev != dev or not (stat.S_ISREG(t.st_mode) or stat.S_ISDIR(t.st_mode) or stat.S_ISLNK(t.st_mode)):
+                return dict(f, plain=False)
+            f["newest"] = max(f["newest"], t.st_mtime)
+            f["bytes"] += t.st_size
+    return f
+
+
+def remove_path(p):
+    """One leftover off disk: a file, or a directory and everything under it. '' when it is gone, why not
+    otherwise. `rmtree` refuses a symlink and never follows one, which is the whole of what could reach outside."""
+    try:
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p)
+        else:
+            os.remove(p)
+        return ""
+    except OSError as e:
+        return str(e)
+
+
+def size(n):
+    """Bytes for a person to read: a sweep's report is how much room it actually made."""
+    for unit, div in (("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)):
+        if n >= div:
+            return f"{n / div:.1f} {unit}"
+    return f"{int(n)} B"
+
+
 def end_proc(pid, ws, grace=GRACE):
     """Ask, then insist: SIGTERM, and SIGKILL whatever is still running when the grace is up. Returns '' when the
     process is gone and why not otherwise. Already gone counts as gone — this pass's job, done by somebody else —
@@ -433,14 +515,35 @@ class Holds:
         d = os.path.realpath(path)
         return [f"{rec} points into it" for tgt, rec in self.records if inside(d, tgt)]
 
+    @staticmethod
+    def why(pids, records):
+        """The reasons, worded the same wherever they are read: two processes and a count of the rest — a dev
+        server is a dozen processes — then the records, which come already worded."""
+        why = [f"pid {pid} ({pcomm(pid)}) is working in it" for pid in pids[:2]]
+        if len(pids) > 2:
+            why.append(f"+{len(pids) - 2} more are working in it")
+        return list(dict.fromkeys(why + list(records)))
+
     def on(self, path):
         d = os.path.realpath(path)
-        pids = [pid for pid, c in self.cwds if inside(d, c)]
-        why = [f"pid {pid} ({pcomm(pid)}) is working in it" for pid in pids[:2]]
-        if len(pids) > 2:               # a dev server is a dozen processes; the report names two and counts
-            why.append(f"+{len(pids) - 2} more are working in it")
-        why += self.records_on(path)
-        return list(dict.fromkeys(why))
+        return self.why([pid for pid, c in self.cwds if inside(d, c)], self.records_on(path))
+
+    def under(self, tmp):
+        """{scratch workspace: why} for everything held inside the temp root, in ONE walk of the readings. Rule 8
+        looks at every name in that root, and asking each of them about every process would be the slow half of
+        the day's sweep; a working directory or a record path below the root already names the one workspace it
+        holds (rule 7's `scratch`), so one pass over the readings answers for all of them."""
+        pids, recs = {}, {}
+        for pid, cwd in self.cwds:
+            ws = scratch(cwd, tmp)
+            if ws:
+                pids.setdefault(ws, []).append(pid)
+        for tgt, rec in self.records:
+            ws = scratch(tgt, tmp)
+            if ws:
+                recs.setdefault(ws, []).append(f"{rec} points into it")
+        return {ws: self.why(pids.get(ws, []), dict.fromkeys(recs.get(ws, [])))
+                for ws in set(pids) | set(recs)}
 
 
 def windows():
@@ -744,8 +847,8 @@ def sweep_orphans(r, hours, share=ORPHAN_CPU):
     own ancestors are not holders (a sweep must not read itself as somebody still working here, nor end its own
     shell), and neither is another user's process, which this may not touch and does not own.
 
-    Nothing is removed from disk. /tmp has a cleaner of its own and a directory costs nothing; what cost the box
-    a day was the processes, and those are all this ends."""
+    Nothing is removed from disk here: rule 8 is the pass that clears what the runs left behind, and this one
+    ends only what is still running."""
     if hours <= 0:
         return
     tmp = os.path.realpath(tempfile.gettempdir())
@@ -781,6 +884,86 @@ def sweep_orphans(r, hours, share=ORPHAN_CPU):
             continue
         for pid, _ in sorted(pids):
             r.act_here("scratch", "end", f"pid {pid} ({pcomm(pid)})", why, lambda p=pid, w=ws: end_proc(p, w))
+
+
+def sweep_leftovers(r, days):
+    """Rule 8, once per run and box-wide: what finished runs LEFT ON DISK in the temp root. Every entry in it is
+    measured — the last time anything in it was written, what it is holding, and its shape — and one this user
+    owns, that is a plain tree, that nothing has written to for `days`, and that neither hold test holds, is
+    removed whole. The root itself is never a candidate: the unit is what a run made in it, exactly as rule 7
+    reads it.
+
+    A busy box leaves tens of thousands of these, so what a person reads is one line — how many, how much room
+    they were holding, and the largest of them. The spares are named one by one: that is the half worth reading,
+    and the half this rule is judged on."""
+    if days <= 0:
+        return
+    tmp = os.path.realpath(tempfile.gettempdir())
+    try:
+        dev = os.lstat(tmp).st_dev
+        names = sorted(os.listdir(tmp))
+    except OSError as e:
+        r.report("scratch", tmp, f"the temp root could not be read: {e} — nothing was removed")
+        return
+    # The pass's own reading, taken before it started walking. CC_JANITOR_SCRATCH_BLIND drops it — tests: the
+    # second look below has to be reachable as the only thing standing between the sweep and what is in use.
+    held = {} if os.environ.get("CC_JANITOR_SCRATCH_BLIND") else r.holds.under(tmp)
+    take, spared = [], []
+    for name in names:
+        p = f"{tmp}/{name}"
+        f = scratch_scan(p, dev)
+        if f is None:
+            continue
+        f.update(path=p, days=days, age=max(0.0, now() - f["newest"]), held=held.get(p, []))
+        verdict, why = leftover_verdict(f)
+        if verdict == "rm":
+            take.append((p, f["bytes"]))
+        elif verdict == "report":
+            spared.append((p, why))
+    if not take and not spared:
+        return
+    print(f"cc-janitor scratch leftovers{' (dry run)' if r.dry else ''}")
+    for p, why in spared:
+        r.report("scratch", p, why)
+    if not take:
+        return
+
+    def summary(rows, freed):
+        big = max(rows, key=lambda t: t[1])
+        return (f"{size(freed)}, nothing written in them for {dur(days * 86400)} or more"
+                f" · largest {big[0]} ({size(big[1])})")
+
+    if r.dry:
+        r.log("scratch", "rm", f"{len(take)} leftovers under {tmp}", summary(take, sum(b for _, b in take)))
+        r.did += [p for p, _ in take]
+        return
+    # Look again, on readings taken NOW: this pass has been walking a temp root since it read /proc, and what it
+    # removes it cannot get back. A candidate something has written to since, or that something is now working
+    # in, fails its own rule the second time and stays — with the reason, whichever of the two it is.
+    again = Holds().under(tmp)
+    gone, freed, failed = [], 0, []
+    for p, b in take:
+        f = scratch_scan(p, dev)
+        if f is None:
+            continue                                    # gone already: this pass's job, done by somebody else
+        f.update(path=p, days=days, age=max(0.0, now() - f["newest"]), held=again.get(p, []))
+        verdict, why = leftover_verdict(f)
+        if verdict != "rm":
+            r.report("scratch", p, why or f"spared {p}: it changed while this pass was reading the temp root")
+            continue
+        err = remove_path(p)
+        if err:
+            failed.append((p, err))
+            continue
+        gone.append((p, b))
+        freed += b
+        r.did.append(p)
+    for p, err in failed[:3]:
+        r.report("scratch", p, f"rm failed: {err}")
+    if len(failed) > 3:
+        r.report("scratch", tmp, f"+{len(failed) - 3} more leftovers could not be removed")
+    if gone:
+        r.log("scratch", "rm", f"{len(gone)} leftovers under {tmp}", summary(gone, freed))
 
 
 def fixtures():
@@ -922,6 +1105,20 @@ def orphan_cpu():
         return ORPHAN_CPU
 
 
+def scratch_days():
+    """Rule 8's threshold in days: CC_JANITOR_SCRATCH_DAYS, default 7. 0 turns the rule off, and so does the key
+    set but empty. A fraction is a fraction of a day — which is how the selfcheck drives the rule against a
+    directory it made a moment ago. A value that is not a number is the default: a typo must not take everything
+    written in the temp root today."""
+    v = setting("CC_JANITOR_SCRATCH_DAYS", str(SCRATCH_DAYS)).strip()
+    if not v:
+        return 0.0
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        return float(SCRATCH_DAYS)
+
+
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
@@ -946,6 +1143,7 @@ def main(argv):
             sweep(repo, r, net)
         sweep_containers(r, container_days())
         sweep_orphans(r, orphan_hours(), orphan_cpu())
+        sweep_leftovers(r, scratch_days())
     sweep_fixtures(r)
     print(f"cc-janitor: {len(r.did)} swept, {len(r.said)} reported"
           f"{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
@@ -1065,6 +1263,29 @@ def selfcheck():
        (lambda s: bool(s) and s[1] > 0 and 0 <= now() - s[2] < 10 * 365 * 86400 and s[3] >= 0)(proc_stat(os.getpid())))
     ok("…and THIS process and everything above it is never a candidate, wherever it happens to be working",
        os.getpid() in own_chain() and 1 in own_chain() and proc_stat(-1) is None)
+
+    # rule 8 — what a finished run left on disk in the temp root
+    def L(**kw):
+        d = {"path": "/tmp/ws", "ours": True, "plain": True, "age": 30 * 86400, "held": [], "days": 7}
+        d.update(kw)
+        return d
+
+    ok("a scratch entry nothing has written in for weeks is removed", leftover_verdict(L())[0] == "rm")
+    ok("…one written in yesterday is left alone, and unremarked", leftover_verdict(L(age=86400)) == ("keep", ""))
+    ok("…and the days are the configured ones", leftover_verdict(L(age=86400, days=0.5))[0] == "rm")
+    ok("A DIRECTORY SOMETHING IS WORKING IN SURVIVES, however long its own clock has stood still, and what held "
+       "it is named", leftover_verdict(L(held=["pid 42 (node) is working in it"]))[0] == "report"
+       and "pid 42 (node)" in leftover_verdict(L(held=["pid 42 (node) is working in it"]))[1])
+    ok("…and so does one a REGISTERED RECORD points into",
+       leftover_verdict(L(held=["/x/rec.json points into it"]))[0] == "report"
+       and "/x/rec.json" in leftover_verdict(L(held=["/x/rec.json points into it"]))[1])
+    ok("ANOTHER USER'S FILE IS NOT THIS SWEEP'S TO TAKE, at any age",
+       leftover_verdict(L(ours=False)) == ("keep", "") and leftover_verdict(L(ours=False, age=10 ** 9)) == ("keep", ""))
+    ok("A DOOR IS NOT A LEFTOVER: a tree holding a socket, a fifo, a device or a mount is never a candidate, "
+       "whatever its age", leftover_verdict(L(plain=False)) == ("keep", "")
+       and leftover_verdict(L(plain=False, age=10 ** 9)) == ("keep", ""))
+    ok("what a sweep freed is said in units a person reads",
+       size(512) == "512 B" and size(5 << 20) == "5.0 MB" and size(3 << 30) == "3.0 GB")
 
     # the hold — what counts as being inside the directory a rule is about to remove
     ok("a directory is held by its own path and by anything under it, and by nothing beside it",
@@ -1464,6 +1685,103 @@ def selfcheck():
                 except OSError:
                     pass
         runner.wait(timeout=10)
+
+        # RULE 8: what those runs left ON DISK. Six things under this test's own temp root, and every answer the
+        # rule has — a leftover tree from a finished run, a leftover file, a tree whose own clock is a month old
+        # but whose contents are not, one a live process is working in, one a registered record points into, and
+        # a directory holding a socket: the shape a terminal multiplexer leaves in a temp root the day it starts
+        # and never touches again, which an age test on its own would take out from under every session on the box.
+        import socket
+        left, leftfile, touched = f"{ftmp}/left", f"{ftmp}/leftfile", f"{ftmp}/touched"
+        serving, declared, door = f"{ftmp}/serving", f"{ftmp}/declared", f"{ftmp}/door"
+        names8 = ("declared", "door", "left", "leftfile", "link", "serving", "touched")
+        for d_ in (f"{left}/deep", touched, serving, declared, door):
+            os.makedirs(d_, exist_ok=True)
+        open(f"{left}/deep/big.bin", "w").write("x" * 4096)
+        os.symlink(dev, f"{ftmp}/link")                 # …pointing out of the temp root altogether
+        os.symlink(f"{dev}/README", f"{left}/deep/out")  # …and one inside a tree that is about to go
+        open(leftfile, "w").write("y" * 1024)
+        open(f"{serving}/cache.txt", "w").write("a server's own scratch\n")
+        open(f"{declared}/build.txt", "w").write("a build somebody declared\n")
+        open(f"{touched}/fresh.txt", "w").write("written just now\n")   # …the one write that keeps `touched`
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(f"{door}/socket")
+        month = now() - 30 * 86400
+        for p_ in (left, f"{left}/deep", f"{left}/deep/big.bin", leftfile, touched, serving, f"{serving}/cache.txt",
+                   declared, f"{declared}/build.txt", door, f"{door}/socket"):
+            os.utime(p_, (month, month))                # …the directory last, so its own clock reads a month
+        for l_ in (f"{ftmp}/link", f"{left}/deep/out"):     # …the links by their own clocks, never their targets
+            os.utime(l_, (month, month), follow_symlinks=False)
+        sitter8 = fixture("sleep", "300", cwd=serving)
+        json.dump({"name": "build", "dir": declared}, open(f"{recs}/build.json", "w"))
+        time.sleep(0.4)
+
+        def eight():
+            return sorted(n for n in names8 if os.path.lexists(f"{ftmp}/{n}"))
+
+        ok("the holds answer a whole temp root in one walk of the readings — a working directory below it names "
+           "the one entry it holds, and nothing beside it",
+           (lambda h: f"pid {sitter8.pid}" in " ".join(h.get(serving, [])) and door not in h)(Holds().under(ftmp)))
+        ok("a scratch entry is measured whole: the newest mtime anywhere in it, what it holds, and its shape — "
+           "and a socket inside is what makes a tree no candidate",
+           scratch_scan(left, os.lstat(ftmp).st_dev)["bytes"] >= 4096
+           and now() - scratch_scan(touched, os.lstat(ftmp).st_dev)["newest"] < 600
+           and now() - os.lstat(touched).st_mtime > 20 * 86400
+           and scratch_scan(door, os.lstat(ftmp).st_dev)["plain"] is False
+           and scratch_scan(left, os.lstat(ftmp).st_dev)["plain"] is True)
+        r8 = run("--dry")
+        ok("rule 8: --dry says how much it would clear and what the largest of it is",
+           f"would rm 2 leftovers under {ftmp}" in r8.stdout and f"largest {left}" in r8.stdout)
+        ok("rule 8: --DRY TOUCHES NOTHING — all six are still there, contents and all",
+           eight() == sorted(names8) and os.path.exists(f"{left}/deep/big.bin"))
+        r8b = run()
+        ok("rule 8: a leftover from a finished run is cleared — the whole tree, and the file beside it",
+           not os.path.exists(left) and not os.path.exists(leftfile) and f"rm 2 leftovers under {ftmp}" in r8b.stdout)
+        ok("rule 8: A TREE SOMETHING WROTE IN MINUTES AGO SURVIVES, however old the directory's own clock is",
+           os.path.isdir(touched) and os.path.exists(f"{touched}/fresh.txt"))
+        ok("rule 8: A DIRECTORY A LIVE PROCESS IS WORKING IN SURVIVES, and the pass says it spared it and names "
+           "what held it", os.path.exists(f"{serving}/cache.txt")
+           and f"spared {serving}" in r8b.stdout and f"pid {sitter8.pid}" in r8b.stdout)
+        ok("rule 8: …and so does one a registered record points into, named by the record that holds it",
+           os.path.exists(f"{declared}/build.txt") and f"{recs}/build.json points into it" in r8b.stdout)
+        ok("rule 8: A SOCKET DIRECTORY SURVIVES — nothing has touched it for a month and it is still a door",
+           os.path.exists(f"{door}/socket"))
+        ok("rule 8: what it cleared is in the log, with the room it made",
+           f"rm 2 leftovers under {ftmp}" in open(f"{th}/.cc/state/janitor.log").read())
+        ok("rule 8: …and 0 days turns the rule off — the same temp root, and not a word about it",
+           "scratch leftovers" in run("--dry").stdout
+           and "scratch leftovers" not in run("--dry", CC_JANITOR_SCRATCH_DAYS="0").stdout
+           and "scratch leftovers" not in run("--dry", CC_JANITOR_SCRATCH_DAYS="").stdout)
+        ok("rule 8: …and a value that is not a number is the DEFAULT — neither off, which would let a temp root "
+           "fill again quietly, nor a sweep of everything written today",
+           f"leftovers under {ftmp}" in run("--dry", CC_JANITOR_SCRATCH_DAYS="0.000001").stdout
+           and f"leftovers under {ftmp}" not in run("--dry", CC_JANITOR_SCRATCH_DAYS="nonsense").stdout
+           and f"spared {serving}" in run("--dry", CC_JANITOR_SCRATCH_DAYS="nonsense").stdout)
+        # …AND WITH THE AGE LINE AT ZERO THE HOLD IS ALL THAT IS LEFT. Every entry in the root is a candidate
+        # now, so what comes through this comes through on what is using it and on nothing else.
+        rz = run(CC_JANITOR_SCRATCH_DAYS="0.000001")
+        ok("rule 8: with the age line at zero the young tree goes — being young was the only thing keeping it",
+           not os.path.exists(touched))
+        ok("rule 8: …and THE HELD ONES AND THE DOOR ARE STILL THERE, on the hold and the shape alone",
+           os.path.exists(f"{serving}/cache.txt") and os.path.exists(f"{declared}/build.txt")
+           and os.path.exists(f"{door}/socket")
+           and f"spared {serving}" in rz.stdout and f"spared {declared}" in rz.stdout)
+        ok("rule 8: A SYMLINK IS NOT A TREE: one in the temp root is never a candidate at any age, and what a "
+           "tree that WAS swept pointed at is still where it was",
+           os.path.islink(f"{ftmp}/link") and os.path.isdir(dev) and os.path.exists(f"{dev}/README"))
+        # THE READING IT DELETES ON IS TAKEN AT THE MOMENT IT DELETES. A pass that read /proc before it walked a
+        # temp root holds a minutes-old picture by the time it removes anything, and a process that started in
+        # the meantime would not be in it. Here the first reading is dropped altogether, so the hold that spares
+        # these two is the one taken at the removal itself.
+        rb = run(CC_JANITOR_SCRATCH_DAYS="0.000001", CC_JANITOR_SCRATCH_BLIND="1")
+        ok("rule 8: THE SECOND LOOK IS WHAT IT DELETES ON — with the pass's own reading dropped, the directory a "
+           "live process is working in and the one a record points into both still survive, and are named",
+           os.path.exists(f"{serving}/cache.txt") and os.path.exists(f"{declared}/build.txt")
+           and f"spared {serving}" in rb.stdout and f"spared {declared}" in rb.stdout
+           and f"pid {sitter8.pid}" in rb.stdout and f"{recs}/build.json points into it" in rb.stdout)
+        sock.close()
+        os.killpg(os.getpgid(sitter8.pid), signal.SIGKILL)
+        sitter8.wait(timeout=10)
 
         for proc in (live, bare, served):               # the group, so the `sleep` under the live shell goes too
             try:

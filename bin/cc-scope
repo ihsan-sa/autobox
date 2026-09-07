@@ -377,6 +377,19 @@ def log_seen(repo, decision, text, src):
 # with its <channel …> tag intact and `capture` takes the rest from there — no hook inside cc-slack. If a
 # delivery ever bypasses that turn, one line in cc-slack's deliver() closes the gap and nothing else changes:
 #   subprocess.run([f"{BIN}/cc-scope", "capture", repo, "--src", f"slack {chan} {thread_ts}"], input=text, text=True)
+# A REACTION CARRIES NO WORDS OF HIS. cc-slack hands a session a 👍 on one of ITS OWN messages as a message
+# of its own — `👍 on your 13:26 reply: "…"`, tagged kind="reaction" — and everything after the colon is our
+# reply quoted back, up to sixty characters of it. The classifier read those sixty characters as the owner's
+# and opened a row: one on our own "Fix on its way", two more on our own "rather than". All three were
+# read and declined by hand, and while they sat there they counted toward the open-ask number the pulse
+# reports. Most 👍 miss the cues and are skipped as no-directive, which is why this looked intermittent —
+# it was never the reaction, it was whichever of our sentences the excerpt happened to cut. So it is decided
+# on the tag, which is the fact, and never on the shape of the quote: approving what was already said is the
+# whole of a reaction, and a 👎 or a removal says just as little that belongs in a ledger of requests. It is
+# still logged, because it IS the owner speaking and `missed` is where a wrong call gets found.
+REACTION = "reaction"
+
+
 def capture(repo, text, who="owner", src=""):
     body, attrs = strip_tag(text)
     if attrs:
@@ -385,6 +398,8 @@ def capture(repo, text, who="owner", src=""):
         who = attrs.get("user") or who
         if not src and attrs.get("channel"):
             src = "slack %s %s" % (attrs["channel"], attrs.get("thread_ts") or attrs.get("ts") or "")
+        if attrs.get("kind") == REACTION:
+            log_seen(repo, "skip:reaction", body, src); return None, False    # our own reply, quoted back
     if not is_ask(body):
         log_seen(repo, "skip:no-directive", body, src); return None, False
     aid, repeated = add(repo, body, who=who, src=src.strip())
@@ -1020,6 +1035,46 @@ def selfcheck():
           capture(R, '<channel source="cc-slack" role="member" channel="#help" user="sam">fix the printer')[0] is None)
         t("a skipped message is still logged, so a miss can be found",
           "skip:not-owner" in open(os.path.join(SCOPE, SEEN)).read())
+
+        # ---- A REACTION IS NOT AN ASK -----------------------------------------------------------------
+        # The three that were really in a repo's ledger here, verbatim. Every cue word in them
+        # is OURS — cc-slack quotes sixty characters of the message that was reacted to — and each one was
+        # read and declined by hand. `is_ask(said)` is the half that matters: it holds each fixture to
+        # carrying a directive, so these cases fail if they ever stop testing what they were written for.
+        def reacted(said, kind="reaction"):
+            return ('<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.3" user="ada.byron" '
+                    '%srole="owner" channel="#demo">\n%s' % ('kind="%s" ' % kind if kind else "", said))
+        thumbs = {
+            "our own 'Fix on its way'":
+                '👍 on your 23:19 reply: "Agreed, that is the prompt\'s first line. Fix on its way: eac"',
+            "our own 'rather than' in a name we proposed":
+                '👍 on your 13:26 reply: "#demo-ask — it says what you do there rather than what answ"',
+            "our own 'rather than' in a promise we made":
+                '👍 on your 16:29 reply: "Will do — I\'ll lift it myself at cutover rather than asking "',
+        }
+        for whose, said in thumbs.items():
+            t("a reaction is not an ask when the cue inside it is %s" % whose,
+              is_ask(said) and capture(R, reacted(said))[0] is None)
+        t("...and a 👎, or one taken off again, says just as little that belongs in a ledger of requests",
+          capture(R, reacted('👎 on your 09:02 reply: "hold the deploy rather than landing it now"'))[0] is None
+          and capture(R, reacted('👍 taken off your 09:02 reply: "hold the deploy rather than landing '
+                                 'it now"'))[0] is None)
+        t("...decided on the tag and never on the shape of the quote: the same words untagged still open a row",
+          capture(R, reacted('👍 on your 11:00 reply: "we should rename it rather than minting a new one"',
+                             kind=""))[0] is not None)
+        t("...and the skip is logged like any other, so a wrong call is still findable",
+          "skip:reaction" in open(os.path.join(SCOPE, SEEN)).read())
+        # The three real ones were declined by hand. `add` puts a DECLINED row back on the queue when
+        # the same text arrives again, so a reaction landing twice must not walk that path.
+        already = thumbs["our own 'Fix on its way'"]
+        aRx, _ = add(R, already)                      # the row exactly as the old capture path opened it
+        quiet(["decline", R, aRx, "--why", "a 👍 on my own reply, captured as an ask"])
+        t("a reaction already declined by hand is not re-opened when the same one arrives again",
+          capture(R, reacted(already))[0] is None and get(R, aRx)["status"] == "declined")
+        t("...and it is skipped through the hook too, while a real ask in that thread still records",
+          hook_asks(reacted(thumbs["our own 'rather than' in a promise we made"])) == 0
+          and hook_asks('<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.4" user="ada.byron" '
+                        'role="owner" channel="#demo">rename the channel rather than minting a second one') == 1)
 
         t("the hook is silent on a worker's own task prompt", capture_worker_silent())
 
