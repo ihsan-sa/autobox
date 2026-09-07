@@ -135,6 +135,7 @@ ALERTS = "alerts"                                              # #alerts is not 
 ALERT_KINDS = ("boot", "limit", "audit", "review", "digest", "alerts", "cc-rc", "heartbeat", "power")   # "<box> <kind>" notify titles → #alerts even when the box shares its name with a repo
 UPDATES = "updates"                                            # #<repo>-updates: every project channel's second lane, for what is automated or long
 UPDATE_KINDS = ("digest",)                                     # …the "<box> <kind>" titles that are PROGRESS, not an alert: they leave #alerts for #<box>-updates
+NOTICE_WINDOW = 900                                            # how long the same join/leave line is not repeated: a reconnect flap is minutes wide, not seconds
 NUDGE_PREFIXES = ("❓ still waiting", "⏳ no answer", "🔴 still open")   # our own nudge posts (v1's too): never an answer
 VOICE_PREFIX = "🎙️ transcript"                                  # our own transcript of a memo: their message, not our answer to it
 VOICE_MARK = "voice"                                           # marks key on OUR transcript post — "<chat>:<our ts>:voice:<memo ts>":
@@ -3955,15 +3956,29 @@ class Daemon:
         return self.names[chat]
 
     def chan_notice(self, target, text):
-        """Best-effort join/leave post to the channel mapped to target by the default #repo[--track] naming (routes.json overrides not consulted)."""
+        """Best-effort join/leave post for target, into its -updates lane (default #repo[--track] naming; routes.json
+        overrides not consulted).
+
+        A JOIN LINE IS NOT NEWS FOR THE OWNER (owner, 2026-09-07: "a bunch of not useful things, but then i miss the
+        important threads"). It is the most routine post the box makes and there were 19 of them in his own lane in
+        one day — but cmd_post's routine→updates gate is on the COMMAND, and the daemon's own posts never go through
+        it, so the split the owner asked for stopped at this method. It is applied here too. And the window is not
+        60 s: a socket-mode reconnect storm is minutes wide, not seconds, so the same line inside NOTICE_WINDOW is
+        dropped rather than repeated."""
         if not self.cfg.get("SLACK_BOT_TOKEN"):
             return
         now = time.time()
-        if now - self.noticed.get((target, text), 0) < 60:
+        if now - self.noticed.get((target, text), 0) < NOTICE_WINDOW:
             return   # a socket-mode reconnect re-runs hello/bye: don't spam the channel with the same join/left line
+        self.noticed = {k: t for k, t in self.noticed.items() if now - t < NOTICE_WINDOW}   # a day of reconnects is not a leak
         self.noticed[(target, text)] = now
+        name = target.replace("/", "--")
         try:
-            cid, member = find_channel(self.cfg, target.replace("/", "--"))
+            cid, member = find_channel(self.cfg, name)
+            if lane_split(name):
+                ucid, umember = find_channel(self.cfg, updates_name(name))
+                if ucid and umember:
+                    cid, member = ucid, umember    # the ambient lane, rung 5 — his own channel keeps no join/leave line
         except Exception:
             return
         if member:
@@ -4966,8 +4981,9 @@ class Daemon:
 
     def land_blocked(self, repo, n, reason, post_text):
         """A 👍 that could not even be queued must not die in #approvals — no session routes there, so the thread reply
-        reaches nobody. Push it to the owner (ntfy + #<repo>, via cc-notify's own routing) and hand it to the repo's
-        planning session on the normal inject path; with no session live, deliver() queues it and autostarts one."""
+        reaches nobody. Hand it to cc-notify, which files it in the repo's -updates lane — kind `update`, rung 5, and
+        NO push: the PR is what needs the owner, and that is a card he taps. Then hand it to the repo's planning
+        session on the normal inject path; with no session live, deliver() queues it and autostarts one."""
         url = re.search(r"https?://\S+", post_text)
         try:
             EFFECTS.run([f"{BIN}/cc-notify", "-p", "high", "-t", f"[{repo}] PR #{n} was NOT merged",
@@ -9455,15 +9471,23 @@ def cmd_selfcheck():
         subprocess.run = real_runS
 
     dmL21 = Daemon(use_slack=False); dmL21.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
-    said21 = []; dmL21.say = lambda chat, text, thread=None: said21.append(text)
+    said21 = []; dmL21.say = lambda chat, text, thread=None: said21.append((chat, text))
     real_fc21 = find_channel
     try:
-        globals()["find_channel"] = lambda cfg, name: ("CALIAS", True)
+        globals()["find_channel"] = lambda cfg, name: ("CUPD", True) if name.endswith("-" + UPDATES) else ("CMAIN", True)
         dmL21.chan_notice("r", "🤖 @ai-dev joined")
-        dmL21.chan_notice("r", "🤖 @ai-dev joined")          # a socket-mode reconnect, seconds later
+        dmL21.chan_notice("r", "🤖 @ai-dev joined")          # a socket-mode reconnect, minutes later
+        dmL21.noticed[("r", "🤖 @ai-dev joined")] = time.time() - NOTICE_WINDOW - 1   # …and one past the window
+        dmL21.chan_notice("r", "🤖 @ai-dev joined")
+        globals()["find_channel"] = lambda cfg, name: (None, False) if name.endswith("-" + UPDATES) else ("CMAIN", True)
+        dmL21.chan_notice("r", "🤖 @ai-dev left.")           # a target with no -updates twin
     finally:
         globals()["find_channel"] = real_fc21
-    check("chan_notice: the same join/left line is not repeated within 60 s (reconnect storms) — L21", len(said21) == 1)
+    check("chan_notice: a join/leave line lands in the -updates lane — the owner's own channel carries none of them, "
+          "and cmd_post's routine gate never saw these because the daemon posts them itself — L21",
+          [c for c, _ in said21] == ["CUPD", "CUPD", "CMAIN"])
+    check("chan_notice: the same line is not repeated inside NOTICE_WINDOW, which is minutes — a reconnect flap is "
+          "not a 60 s storm — and one past the window is said again — L21", len(said21) == 3 and NOTICE_WINDOW >= 600)
     dmL22 = Daemon(use_slack=False); dmL22.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}; dmL22.last_chat["r"] = ("C1", None)
     said22 = []; dmL22.say = lambda chat, text, thread=None: said22.append(text)
     dmL22.relay_permission("r", {"tool_name": "Bash", "request_id": "abcde", "description": "curl",

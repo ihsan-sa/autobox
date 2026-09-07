@@ -95,7 +95,7 @@ Shallow first. Each section: the 2–3 things you actually type. Why it is shape
 - **`cc-settings apply` is yours alone** — at a terminal, not in a session, not in a track worktree. It backs up, adds only missing *hooks*, never touches `permissions`, and prints missing deny rules for you to paste.
 
 ## Notifications
-- Sessions and loops call `cc-notify "…"` when they finish or need you → **Slack** (webhook in `~/.cc/config`) and **ntfy** push (subscribe the phone to the topic from `cc-notify setup`). Daily digest at 13:00 UTC. Log: `~/.cc/notify.log`.
+- Sessions and loops call `cc-notify "…"` when they finish or need you → **Slack**, routed by what happened: a decision or an escalation @-mentions you, `#alerts` gets the notable, the rest goes to that repo's `-updates` lane. Your phone only rings (**ntfy**, topic from `cc-notify setup`) for a decision, an escalation or `cc-notify test` — and as the last door, when the box has no Slack or Slack refused the message. Daily digest at 13:00 UTC. Log: `~/.cc/notify.log`.
 - That key, and every other one, lives in `~/.cc/config`, and `cc-config get|set|unset|list` is the only way in or out of it: the environment wins over the file, writes are locked, and nothing anywhere *sources* it — a value is a string, never code.
 - Every boot posts one message (`cc-boot-notify`): time up, whether the last boot ended cleanly or by power loss, and seconds dark. `cc-heartbeat` keeps a 10 s fsync'd stamp; events accumulate in `~/.cc/state/power-events.log` (`cause=clean-reboot` or `cause=power-loss`).
 

@@ -112,7 +112,7 @@ tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 fail
   && ! tally_ok x "x selfcheck: 28/28" && ! tally_ok x "x selfcheck: all passed" \
   && ! tally_ok x "x selfcheck: 4 passed, 10 failed" && ! tally_ok x "ran 12 cases, none failed" \
   || { echo "check.sh: the tally-shape rule no longer tells a readable tally from an unreadable one"; exit 1; }
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.
@@ -126,6 +126,45 @@ for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-
     echo "  want: \"$c selfcheck: <n> passed, 0 failed\" or \"$c selfcheck: 0 failed\""
     exit 1; }; done
 [ -z "$skipped" ] || echo "check.sh: not in this change's reach, not run:$skipped"
+# THE DOC THAT TELLS THE OWNER WHEN HIS PHONE RINGS MUST NAME EVERY ROW THAT RINGS IT. USAGE.md went on promising a
+# push for every cc-notify call long after the table stopped giving one (found by review, 2026-09-07): that file is
+# what he reads to know what reaching him costs, and a promise the code does not keep is worse than no promise. So
+# the phone=yes rows are read out of the table itself and each has to appear in the text — add a ringing row, or take
+# the sentence away, and this is red until the two agree. A row name is matched with its dashes as spaces, so the row
+# `notify-test` is satisfied by the command the owner actually types, `cc-notify test`.
+rings=$(sed -n '/^declare -A RUNGS=(/,/^)/p' bin/cc-notify | sed -n 's/^ *\[\([a-z-]*\)\]="[145] yes .*/\1/p')
+[ -n "$rings" ] || { echo "check.sh: no phone=yes row in cc-notify's table — this rule would pass by reading nothing"; exit 1; }
+for r in $rings; do
+  grep -qF "${r//-/ }" templates/home/USAGE.md || {
+    echo "check.sh: cc-notify rings the owner's phone for '$r', and templates/home/USAGE.md never says so."
+    echo "  That line is how he knows what reaches him. Name the row there, or stop ringing for it."; exit 1; }; done
+# …AND THE OTHER HALF: no template may say the box rings his phone for something the table keeps quiet. Four
+# documents have now promised a push the code stopped giving — USAGE, DESIGN, cc-slack's docstring, COMMS — each
+# found one review at a time. So every line in these files that claims the phone must name a row that actually
+# rings it. "from your phone" is the owner USING his phone, not the box reaching it, and is not a claim.
+for d in templates/home/USAGE.md templates/home/COMMS.md templates/home/RUNBOOK.md; do
+  [ -f "$d" ] || continue
+  while IFS= read -r ln; do
+    for r in $rings; do case "$ln" in *"${r//-/ }"*) continue 2;; esac; done
+    echo "check.sh: $d says the box reaches his phone, on a line naming none of the rows that ring it ($(echo $rings | tr '\n' ' ')):"
+    echo "  ${ln:0:160}"
+    echo "  Either name the row, or stop claiming the phone — this promise has now been wrong in four documents."
+    exit 1
+  done < <(grep -niE 'your phone' "$d" | grep -viE 'from your phone')
+done
+
+# AND THE PROMPT MUST TEACH A COMMAND THAT ACTUALLY REACHES HIM. Every track and planning session is told in its
+# system prompt how to reach the owner when it is truly blocked. When the table moved the rung-1 door to
+# --decision/--owner, that one sentence was not moved with it, so the box's main blocked-escalation path went
+# ambient and stayed ambient through two reviews. The prompt is a caller like any other, so it is checked like one:
+# the form it teaches has to be a form the table rings for.
+while IFS= read -r ln; do
+  case "$ln" in *"cc-notify --decision"*|*"cc-notify --owner"*) ;;
+    *) echo "check.sh: bin/cc tells a session to reach the owner with a cc-notify the table routes AMBIENT:"
+       echo "  ${ln:0:200}"
+       echo "  Rung 1 is --decision (or --owner). A plain cc-notify is rung 5: no phone, no @-mention."; exit 1;; esac
+done < <(grep -n 'Reach the owner' bin/cc)
+
 # Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
 # again on the same files the worker already ran it on (tests/green.sh, read by cc-land).
 green_record "$SELF" "$SCOPE"

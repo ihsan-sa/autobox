@@ -1,23 +1,63 @@
 #!/usr/bin/env bash
-# cc-notify — reach the owner. Always logs to ~/.cc/notify.log; pushes via ntfy and/or Slack when configured.
-#   cc-notify [-t title] [-p low|default|high|urgent] [--owner] [--decision] "message"   (or message on stdin)
+# cc-notify — reach the owner. Always logs to ~/.cc/notify.log; pushes via ntfy and/or Slack when the KIND says so.
+#   cc-notify [-t title] [--kind <kind>] [--owner] [--decision] [-p …] "message"   (or message on stdin)
+#   cc-notify report [today|yesterday|YYYY-MM-DD]   how much was sent to the owner that day, at which rungs
 #   cc-notify setup        create the ntfy topic + show the phone subscription steps
 #   cc-notify test         send a test push
+#   cc-notify selfcheck    unit checks (own HOME, own log, no network beyond a closed local port)
 # Exit: 0 if at least one configured channel took the message (or none is configured — the log is the channel),
 #   1 only if every configured channel failed, so callers (cc-boot-notify) can retry on status instead of on text.
-# THE NOTIFICATION LADDER (owner, 2026-09-01) — route by what it COSTS the owner to read, cheapest rung that does the
-#   job. This script owns rungs 1, 4 and 5; the other three belong to tools that already exist.
-#     1 @-mention in the main channel = "you, now"        --decision   (blocked decision · approval-class action
-#       waiting · an incident touching money, access or anything outward). RARE: a mention that could have waited is a bug.
-#     2 needs_owner = "you, next time you open Slack"     the session's own `reply` tool (NEEDS YOU list), not this script
-#     3 #approvals card = "one tap when convenient"       cc-slack post-approval
-#     4 #alerts = notable, nothing to do                  the default, for a "<box> boot|limit|power|audit" title
-#     5 #<repo>-updates = ambient, zero attention debt    the default, for a title starting with a repo name
-#     6 anything that can wait for the digest, waits      cc-digest --notify (it posts on rung 5)
-#   The litmus is in ~/COMMS.md: needs a decision → mention · needs a tap → approvals · notable only → alerts · else updates.
+#
+# THE TABLE — ONE PLACE DECIDES HOW LOUDLY A THING REACHES THE OWNER (owner, 2026-09-07: "i get pinged on things
+# that don't really matter … but then i miss the important threads"). 51 phone pushes in 24 h, about 5 of which
+# warranted him. The push channel was INVERTED: this script pushed to ntfy on every call that had a topic, above all
+# routing, and the rung only changed the Priority header — so rung 5 always rang and rungs 2 and 3 never did. So the
+# caller now says only WHAT happened — its `--kind`, or the second word of its title — and this table says how loud
+# that is. Same shape as cc-steward's CHAINS: a whitelist a person can read, and anything not in it is ambient.
+#   RUNG   is ~/COMMS.md's ladder, and it decides the destination:
+#          1 = the main channel with a real @-mention, or the owner's DM ("you, now")
+#          4 = #alerts ("notable, nothing to do")            5 = the #<repo>-updates lane ("ambient")
+#          (rungs 2, 3 and 6 belong to tools of their own: the session's `reply`, an approvals card, the digest.)
+#   PHONE  is the ntfy push, and what rings it is --decision, a member escalation, and `cc-notify test` itself. What
+#          every other rung means is that it can wait for him to open Slack — SO LONG AS THERE IS A SLACK: on a box
+#          with none configured the push is the only door and carries every rung, at the table's prio (see "WHICH
+#          DOORS ARE OPEN" below). A track that finished (24 of those 51), a
+#          landing that stopped (11), a publish that is blocked (6), the secretary, the digest: none of them ring.
+#          A worker's "needs you" does not either — the board row goes `waiting`, which IS his NEEDS YOU list.
+#   WINDOW is the dedup, in seconds. 0 = never deduped (each one is its own event).
+#   PRIO   is the ntfy priority and the 🚨 on the Slack post. The caller's -p is accepted and no longer obeyed:
+#          a siren the reader learns to ignore is worse than no siren.
+declare -A RUNGS=(
+  #             rung phone window prio     raised by
+  [decision]="1 yes 1800  high"    # --decision: a blocked decision, an approval-class action, an incident touching money/access/outward
+  [escalation]="1 yes 0   high"    # --owner, or a member-facing session: the owner's DM (his channel is where the members are).
+                                   #   No window — a person typed it, and a member who has to ask twice must be able to
+  [notify-test]="1 yes 0  high"    # `cc-notify test`: the one call whose whole job is to prove the push works, so it is
+                                   #   never deduped — someone runs it twice while getting the phone subscribed, and a
+                                   #   second one that pushes nothing and exits 0 says the opposite of what it checked.
+                                   #   NAMED so no title can reach it: kind_of reads a title's SECOND WORD, and a row
+                                   #   called `test` would put "<repo>/<track> test suite red" on his phone at rung 1
+  [cc-rc]="4 no 900       high"    # cc-rc: the box's own services did not come back
+  [limit]="4 no 3600      default" # a Claude usage limit. Notable; the loop resumes itself
+  [boot]="4 no 0          default" # cc-boot-notify. NO WINDOW: a boot message differs from the last one only in
+                                   #   digits — times, seconds dark, the SSD count — and the key strips digits, so a
+                                   #   600 s window made a power-flap reboot loop, the very thing it exists to
+                                   #   report, one event. cc-boot-notify then stamps boot-announced for a notice
+                                   #   nobody got. Each boot is its own event, as `done` and `digest` are
+  [power]="4 no 600       default" # cc-vitals: a power event
+  [alerts]="4 no 900      default" # cc-vitals: a watchdog flip (DNS away/back)
+  [heartbeat]="4 no 3600  default"
+  [audit]="4 no 3600      default" # cc-audit's nightly report is filed, not acted on
+  [review]="4 no 3600     default"
+  [secretary]="5 no 14400 low"     # it already paces itself at one page per 4 h window; this matches it, without the siren
+  [digest]="5 no 0        low"     # the 11:00 digest: it IS rung 6, and it posts itself into the box's updates lane
+  [board]="5 no 3600      low"     # cc-reconcile's board findings
+  [done]="5 no 0          low"     # a track finished. Its PR is what needs him, and that is a card he taps
+  [update]="5 no 900      low"     # ANYTHING NOT NAMED ABOVE — a landing that stopped, a publish that is blocked, a
+                                   #   round that is over, a worker that needs him. Ambient, and a new caller starts here
+)
 # Config: ~/.cc/config  (NTFY_TOPIC=..., NTFY_SERVER=https://ntfy.sh, SLACK_WEBHOOK=https://hooks.slack.com/...;
-#   with SLACK_BOT_TOKEN set (cc slack setup) the bot posts instead — into #<repo>-updates when the title starts with a
-#   repo name (#<repo> itself with --decision), else #alerts, else SLACK_CHANNEL)
+#   with SLACK_BOT_TOKEN set (cc slack setup) the bot posts instead)
 # ESCALATION — with --owner, or from a member-facing session (cc-guard's `.cc/member-facing` marker, walked up from the
 #   cwd): the bot DMs the OWNER instead of routing by title. Such a session's own channel is where the members are, so an
 #   escalation routed there reaches everyone except the one person it is for. Unpaired owner: #alerts, never that channel.
@@ -25,27 +65,335 @@
 # NEVER PUSHED: anything naming a synthetic test repo (_cctest…, _selfcheck…) is logged and stops there.
 # INSIDE A MEMBER BOUNDARY (CC_MEMBER_SANDBOX=1): none of the config below exists there, so the message goes out over the
 #   workspace's own socket instead (`cc-slack escalate`) and the daemon delivers it to the owner. A failure exits 1.
+#   The table is not applied in there — the daemon re-enters THIS script with --owner on the outside, where it is.
 # Env: CC_NOTIFY_LOG_ONLY (log, never push) · CC_NOTIFY_LOG (test hook: write the log somewhere else, so a run counts
-#   its own lines instead of the owner's).
+#   its own lines instead of the owner's; the dedup state lives beside it, so a run dedups against itself alone).
 set -uo pipefail
 BIN="$(dirname "$(realpath "$0")")"
 LOG="${CC_NOTIFY_LOG:-$HOME/.cc/notify.log}"; mkdir -p "$HOME/.cc" "$(dirname "$LOG")"   # CC_NOTIFY_LOG: tests give each run its own log instead of counting lines in the owner's
+SEEN="$(dirname "$LOG")/notify-seen"          # one file per dedup key, its mtime = when that event last went out
 # Every key through cc-config: one precedence rule (the environment wins), and the file is READ, never sourced —
 # it holds the box's Slack tokens, and `. ~/.cc/config` handed every one of them to the curl and cc-slack below.
 cfg(){ "$BIN/cc-config" get "$1"; }
+
+# THE ONE PLACE A TITLE BECOMES A KIND. A caller's own `--kind` wins; otherwise the second word of the title — the
+# "<box> boot" / "<repo> board" / "<repo>/<track> done" shape every caller already writes — is looked up in the
+# table above. Nothing else is guessed: an unrecognised event is ambient, and a caller that wants more says so.
+kind_of(){
+  local k=$1 t=$2 w
+  # `*` AND `@` NEVER BECOME A KIND. As an array subscript each is the whole-array expansion — `${RUNGS[*]}` is
+  # every row of the table concatenated — and a lookup that took that branch would hand `read` the first row bash
+  # hashed rather than the row asked for, which can be `1 yes … high`: a push and an @-mention of the owner, bought
+  # by a title whose second word is a star. MEASURED, 2026-09-07, bash 5.3.9: that expansion needs a LITERAL `*`
+  # in the source, and a subscript that merely expands to one is an ordinary missing key here, so the lookups below
+  # are already safe on this shell. They are not safe BY CONSTRUCTION, and this tree is published and runs on bash
+  # versions this box does not have. Two lines make it impossible rather than merely improbable; the selfcheck
+  # below asserts the property (an unknown second word is ambient) rather than this shell's version of the bug.
+  case "$k" in '*'|'@') k="";; esac
+  if [ -n "$k" ]; then [ -n "${RUNGS[$k]+x}" ] && { printf '%s' "$k"; return; }; fi
+  w=$(printf '%s\n' "$t" | awk '{print tolower($2)}')
+  case "$w" in '*'|'@') w="";; esac
+  [ -n "$w" ] && [ -n "${RUNGS[$w]+x}" ] && { printf '%s' "$w"; return; }
+  printf 'update'
+}
+
+# WHAT THE EVENT IS ABOUT: the repo the title leads with (its track too, when the title is "<repo>/<track> …"), plus
+# the PR number if it names one. Half of the dedup key — so "[r] PR #7 merged" and "[r] PR #8 merged" are two events,
+# while two runs of the same stuck publish are one.
+scope_of(){
+  local t pr
+  t=$(printf '%s' "$1" | tr -d '[]')
+  pr=$(printf '%s\n' "$t" | grep -oE '#[0-9]+' | head -1)
+  printf '%s%s' "$(printf '%s\n' "$t" | awk '{print tolower($1)}')" "$pr"
+}
+
+# how much was sent to the owner on one day, and at which rungs — the question the log exists to answer.
+report(){
+  local day=${1:-yesterday}
+  case "$day" in today) day=$(date -u +%F);; yesterday) day=$(date -u -d yesterday +%F);; esac
+  [ -s "$LOG" ] || { echo "$day — nothing in $LOG"; return 0; }
+  awk -F'\t' -v d="$day" '
+    index($1, d) != 1 { next }
+    { rung="?"; kind="?"; send="?"
+      if (match($NF, /rung=[^ ]+/))  rung = substr($NF, RSTART+5,  RLENGTH-5)
+      if (match($NF, /kind=[^ ]+/))  kind = substr($NF, RSTART+5,  RLENGTH-5)
+      if (match($NF, /send=[^ ]+/))  send = substr($NF, RSTART+5,  RLENGTH-5)
+      total++
+      # a line older than this table went out too — it just never said at which rung: rung "?", not "not sent"
+      # send is now the DOORS THAT TOOK IT — ntfy, slack, ntfy+slack, ntfy-fallback, socket — so this matches a
+      # door rather than a fixed list of labels; "?" is a line older than this table: it went out, unsaid how.
+      if (send ~ /ntfy|slack|socket/ || send == "?") { sent++; byrung[rung]++; kinds[rung " " kind]++ }
+      else notsent[send]++
+      if (send ~ /ntfy/) phone++ }
+    END {
+      printf "%s — %d notice(s) logged, %d sent to the owner, %d rang his phone\n", d, total+0, sent+0, phone+0
+      n = split("1 4 5 ?", order, " ")
+      for (i = 1; i <= n; i++) { r = order[i]; if (!(r in byrung)) continue
+        line = ""; for (k in kinds) { split(k, p, " "); if (p[1] == r) line = line (line ? " · " : "") p[2] " " kinds[k] }
+        printf "  rung %-2s %4d   %s\n", r, byrung[r], (r == "?" ? "logged before this table existed" : line) }
+      for (s in notsent) printf "  %-9s %4d   not sent\n", s, notsent[s] }' "$LOG"
+}
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────
+# Its own HOME, its own log and its own dedup state under a temp dir: no channel of this box's is posted to and
+# nothing of the owner's is read. THE NTFY SERVER IS A REAL ONE, on 127.0.0.1 and a port the kernel picks, which
+# records every request and answers 200 — so "did the phone ring" is answered by a request that arrived, and "which
+# door took it" by a push that really succeeded, which is what the log is now written from. `deadntfy` points the
+# same config at a port nothing listens on when a FAILING push is the thing under test. The assertion is the wire,
+# never a flag we set ourselves, and nothing leaves this machine.
+selfcheck(){
+  local n=0 f=0 rc=0 T NH log out
+  T=$(mktemp -d); NH="$T/h"; log="$NH/.cc/notify.log"; mkdir -p "$NH/bin" "$NH/.cc"
+  # the cc-slack this fixture hands cc-notify: `slackstub 0` takes the message, `slackstub 1` refuses it the way an
+  # expired token or a channel that is gone does. A channel that FAILS is half of what this script promises.
+  slackstub(){ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\nexit %s\n' "$T/slack.args" "$1" > "$NH/bin/cc-slack"
+               chmod +x "$NH/bin/cc-slack"; }
+  slackstub 0
+  # THE NTFY THE FIXTURE PUSHES TO: 200 to anything, and one line per request so a case can assert the push arrived
+  # AND at which priority. Ephemeral port, localhost only, killed at the end of this function.
+  python3 - "$T" <<'PY' >/dev/null 2>&1 &
+import http.server, socketserver, sys, os
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        with open(os.path.join(d, "ntfy.reqs"), "a") as fh:
+            fh.write("%s\tPriority=%s\tTitle=%s\t%s\n" % (self.path, self.headers.get("Priority"),
+                     self.headers.get("Title"), body.decode("utf-8", "replace").replace("\n", " ")))
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", 0), H) as srv:
+    with open(os.path.join(d, "ntfy.port"), "w") as fh: fh.write(str(srv.server_address[1]))
+    srv.serve_forever()
+PY
+  local ntfypid=$!
+  for _ in $(seq 1 100); do [ -s "$T/ntfy.port" ] && break; sleep 0.1; done
+  [ -s "$T/ntfy.port" ] || { echo "cc-notify selfcheck: the local ntfy listener never bound — cannot test the wire"; return 1; }
+  # `cfg <ntfy-server> <slack yes|no>` — the two axes every case below turns: is there a phone, is there a Slack.
+  cfg_(){ { echo CC_BOX=abox; echo NTFY_TOPIC=t; echo "NTFY_SERVER=$1"
+            [ "$2" = yes ] && { echo SLACK_BOT_TOKEN=xoxb-test; echo SLACK_OWNER_ID=UOWNER; }; } > "$NH/.cc/config"; }
+  local LIVE DEAD; LIVE="http://127.0.0.1:$(cat "$T/ntfy.port")"; DEAD="http://127.0.0.1:1"
+  cfg_ "$LIVE" yes
+  pushed(){ test -s "$T/ntfy.reqs"; }               # a request really reached the listener
+  prio_(){ head -1 "$T/ntfy.reqs" | cut -f2 | cut -d= -f2; }   # the listener writes <path>TAB Priority=…TAB Title=…
+  # -u for every config key: the environment WINS over the file (cc-config's one rule), so a key exported by
+  # whatever session runs this would beat the fixture's own config.
+  N(){ : > "$T/slack.args"; : > "$T/err"; : > "$T/ntfy.reqs"
+       ( cd "$T" && env -u CC_NOTIFY_LOG_ONLY -u CC_MEMBER_SANDBOX -u CC_ROLE -u SLACK_BOT_TOKEN -u SLACK_OWNER_ID \
+             -u SLACK_WEBHOOK -u SLACK_ALERTS -u NTFY_TOPIC -u NTFY_SERVER -u CC_BOX \
+             HOME="$NH" CC_NOTIFY_LOG="$log" "$BIN/cc-notify" "$@" >/dev/null 2>"$T/err" ); }
+  k(){ n=$((n + 1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else f=$((f + 1)); echo "  FAIL $2"; fi; }
+  yes_(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
+  no_(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
+  last(){ tail -1 "$log"; }
+  args(){ cat "$T/slack.args"; }
+
+  # THE TABLE ITSELF. A row a person edited into four-and-a-half columns would otherwise be read as a rung of
+  # whatever `read` happened to put there, silently, for every event of that kind.
+  local bad="" kk rr pp ww qq extra
+  for kk in "${!RUNGS[@]}"; do
+    read -r rr pp ww qq extra <<<"${RUNGS[$kk]}"
+    case "$rr" in 1|4|5) ;; *) bad="$bad $kk:rung";; esac
+    case "$pp" in yes|no) ;; *) bad="$bad $kk:phone";; esac
+    case "$ww" in ''|*[!0-9]*) bad="$bad $kk:window";; esac
+    case "$qq" in low|default|high|urgent) ;; *) bad="$bad $kk:prio";; esac
+    [ -z "$extra" ] || bad="$bad $kk:extra"
+    [ "$pp" = no ] || [ "$rr" = 1 ] || bad="$bad $kk:rings-below-rung-1"
+  done
+  k "$(yes_ test -z "$bad")" "every row is rung(1|4|5) phone(yes|no) window(int) prio, and only rung 1 rings the phone —$bad"
+
+  N -t "demorepo board" "a row is stale"
+  k "$(yes_ grep -q 'rung=5 kind=board send=slack$' <<<"$(last)")" "an ambient event is rung 5 and the log says so"
+  k "$(no_ pushed)" "…and it never reaches the phone: no request arrived at the ntfy the fixture is really running"
+  k "$(yes_ grep -q -- '--route demorepo board' <<<"$(args)")" "…and it still routes by title, into that repo's -updates lane"
+
+  N -t "demorepo board" "a row is stale"
+  k "$(yes_ grep -q 'send=dedup$' <<<"$(last)")" "a repeat inside the kind's window is logged and NOT sent a second time"
+  k "$(yes_ test ! -s "$T/slack.args")" "…and nothing at all went to Slack the second time"
+  N -t "demorepo board" "a different row is stale"
+  k "$(yes_ test -s "$T/slack.args")" "…while a different message of the same kind is its own event and goes out"
+
+  # THE KEY IS THE EVENT, NOT THE WORDS. A caller whose reason quotes a line number signs itself differently every
+  # run and defeats any hash of its message — 6 pages in a day for one cosmetic cause. Numbers come out of the key.
+  N -t "[demorepo] publish blocked" "identity gate: 12:the commit message names this box"
+  k "$(yes_ test -s "$T/slack.args")" "the first run of a stuck cause goes out"
+  N -t "[demorepo] publish blocked" "identity gate: 47:the commit message names this box"
+  k "$(yes_ grep -q 'send=dedup$' <<<"$(last)")" "…and the same cause quoting a line number that has SHIFTED is the same event, not a new one"
+  # …but a number that IS the event lives in the scope, and two of those are two events.
+  N -t "[demorepo] PR #7 merged" "landing stopped"
+  N -t "[demorepo] PR #8 merged" "landing stopped"
+  k "$(yes_ test -s "$T/slack.args")" "a different PR is a different event: the scope carries the number the prose drops"
+
+  N --decision -t "demorepo blocked" "which database do I restore?"
+  k "$(yes_ grep -q 'rung=1 kind=decision send=ntfy+slack$' <<<"$(last)")" "--decision is rung 1 and the log says the phone was rung"
+  k "$(yes_ pushed)" "…and the push really arrived on the wire, not just claimed"
+  k "$(yes_ test "$(prio_)" = high)" "…at the prio the TABLE gives a decision, which is what the phone reads as a buzz"
+  k "$(yes_ grep -q -- '--mention' <<<"$(args)")" "…and it @-mentions the owner in the main channel"
+  N --decision -t "demorepo blocked" "which database do I restore?"
+  k "$(yes_ grep -q 'send=dedup$' <<<"$(last)")" "…and asking him the SAME question again inside the window does not ring him twice"
+  N --decision -t "demorepo blocked" "should I drop the old branches?"
+  k "$(yes_ test -s "$T/slack.args")" "…while a different question is a different decision and does reach him"
+
+  # THE SYSTEM PROMPT IS A CALLER TOO, AND IT IS THE ONE THAT MATTERS MOST. Every track and planning session is
+  # TOLD, in the prompt bin/cc builds for it, the one command to run when it is truly blocked. When the table moved
+  # the rung-1 door to --decision, that sentence was left behind, so the box's whole blocked-escalation path — a
+  # worker with nobody else to ask — filed itself in an updates lane. Two reviews found it, one at a time, and the
+  # second time it had already been fixed once and lost again. So the command is TAKEN OUT OF sp_track/sp_main and
+  # run here: retyped into this file it would stay green for ever after the next person edits the prompt, which is
+  # exactly the regression. It runs on the change that breaks it, too: `cc` is two characters, which tests/green.sh
+  # treats as too short to build a caller graph from, so a change to bin/cc widens the scope back to everything and
+  # every selfcheck runs — this one with it.
+  local spsrc cmd fn got spok=1; local -a argv
+  spsrc=$(awk '/^sp_(track|main)\(\)/{p=1} p{print} p && /; [}]$/{p=0}' "$BIN/cc" 2>/dev/null)
+  # Bounded before anything is evaluated: if the two definitions ever stop ending in "; }" the awk above runs to the
+  # end of bin/cc, and evaluating THAT would run the front door of the box instead of defining two functions.
+  [ -n "$spsrc" ] && grep -q '^sp_main()' <<<"$spsrc" && [ "$(grep -c . <<<"$spsrc")" -le 12 ] && spok=0
+  k "$spok" "bin/cc's two prompt builders are read out of bin/cc, whole and alone — nothing below is a copy of their words"
+  for fn in sp_track sp_main; do
+    cmd=""
+    # shellcheck disable=SC2034  # STBASE is not unused: sp_track reads it, and shellcheck cannot see into the eval
+    [ "$spok" = 0 ] && cmd=$( ( STBASE=/state; eval "$spsrc"
+        case "$fn" in sp_track) sp_track demorepo atrack main;; *) sp_main demorepo main;; esac ) \
+      | grep -oE "'cc-notify [^']+'" | head -1 | tr -d "'" )
+    k "$(yes_ test -n "$cmd")" "$fn hands a blocked session one quoted cc-notify command to reach the owner with"
+    # No command found is not a pass: the two cases below then run the ambient form and go red, rather than
+    # asserting nothing at all.
+    [ -n "$cmd" ] || cmd='cc-notify -t "demorepo blocked" "the prompt named no command"'
+    # xargs, not eval: the prompt's own quoting is honoured and NOTHING in it is expanded or globbed a second time
+    # — printf has already done that once, and a test that re-expands its input is a test that can run it.
+    mapfile -t argv < <(printf '%s\n' "${cmd#cc-notify }" | xargs -n1 printf '%s\n')
+    N "${argv[@]}"
+    got=$(grep -oE 'rung=[0-9?]+ kind=[a-z-]+' <<<"$(last)")   # say which rung it DID get: rung=5 kind=update is the regression, by name
+    k "$(yes_ grep -q 'rung=1 ' <<<"$(last)")" "…and run exactly as $fn writes it, that command is RUNG 1 — $cmd → ${got:-nothing logged}"
+    k "$(yes_ pushed)" "…and the push really arrives, so a session told to escalate is not filing an ambient note"
+  done
+
+  N --owner "the disk is filling up"
+  k "$(yes_ grep -q 'rung=1 kind=escalation send=ntfy+slack$' <<<"$(last)")" "an escalation is rung 1 and rings the phone"
+  k "$(yes_ grep -q -- '-c UOWNER' <<<"$(args)")" "…as a DM, never the channel it came from"
+  N --owner "the disk is filling up"
+  k "$(yes_ test -s "$T/slack.args")" "…and it has NO window: a person who has to ask twice must be able to"
+
+  N -p high -t "abox limit" "Claude usage limit until 12:00Z"
+  k "$(yes_ grep -q -- '-c #alerts' <<<"$(args)")" "the TABLE picks #alerts for rung 4 — not the title's second word, and not the caller"
+  k "$(no_ grep -q 'rotating_light' <<<"$(args)")" "…and the caller's -p high buys no siren: the kind decides the urgency"
+  k "$(no_ pushed)" "…and rung 4 does not ring the phone either"
+
+  N -p high -t "abox secretary" "3 findings are standing"
+  k "$(yes_ grep -q 'rung=5 kind=secretary' <<<"$(last)")" "the secretary is ambient — it was a siren in the ambient lane, which is the worst of both"
+  k "$(yes_ grep -q -- '--route' <<<"$(args)")" "…so it goes to the updates lane by route, not to #alerts"
+
+  # A TITLE CANNOT BUY A RUNG. Whatever a caller interpolates into a title, a second word the table does not name
+  # is ambient — `*` and `@` included, the two that are special as array subscripts (see kind_of). These assert the
+  # property, so they hold on any shell; breaking kind_of's fallthrough turns them red.
+  N -t "demorepo * failed" "a star stands where a kind would"
+  k "$(yes_ grep -q 'rung=5 kind=update' <<<"$(last)")" "a title whose second word is * is ambient, like any word the table does not name"
+  k "$(no_ grep -q 'ntfy push failed' "$T/err")" "…so it never reaches his phone"
+  k "$(no_ grep -q -- '--mention' <<<"$(args)")" "…and never @-mentions him"
+  N -t "demorepo @ failed" "an at-sign stands where a kind would"
+  k "$(yes_ grep -q 'rung=5 kind=update' <<<"$(last)")" "…and so is one whose second word is @, the other subscript that is special"
+  k "$(no_ grep -qE 'integer expression|not found' "$T/err")" "…with no integer-expression error from a window the table never set"
+
+  N -t "demorepo test suite red" "3 cases"
+  k "$(yes_ grep -q 'rung=5 kind=update' <<<"$(last)")" "…and a title whose second word happens to be the word test stays ambient: only the subcommand reaches that row"
+  N -t "demorepo whatever happened here" "x"
+  k "$(yes_ grep -q 'rung=5 kind=update' <<<"$(last)")" "an event kind nothing in the table names is ambient, never loud"
+  N -t "demorepo board" -- --kind decision
+  k "$(yes_ grep -q 'kind=board' <<<"$(last)")" "after --, a message that looks like --kind is the MESSAGE: a relayed line cannot buy a rung"
+
+  N -t "[_cctest9] PR #7 merged" "cc-land: not a git repo"
+  k "$(yes_ grep -q 'send=test$' <<<"$(last)")" "synthetic test state is logged as such and pushed nowhere"
+  k "$(yes_ test ! -s "$T/slack.args")" "…with nothing handed to Slack"
+
+  # A SEND THAT FAILED IS NOT A SEND. The dedup stamp went down before any channel was tried, so a failure was
+  # recorded as delivered and the caller's retry — cc-boot-notify's, 10 s later — hit the dedup branch, exited 0 and
+  # marked the notice posted. The retry has to REALLY re-send, so the channel here really fails first.
+  cfg_ "$DEAD" yes; slackstub 1                      # every door shut: Slack refuses and the phone does not answer
+  N -t "demorepo stalled" "the channel is down"; rc=$?
+  k "$(yes_ test "$rc" = 1)" "every configured channel refusing the message exits 1, so the caller knows to retry"
+  N -t "demorepo stalled" "the channel is down"; rc=$?
+  k "$(yes_ grep -q 'send=none$' <<<"$(last)")" "…and the retry is not held by the dedup: a send that failed left no stamp behind — and the log says none, not a door"
+  k "$(yes_ test -s "$T/slack.args")" "…it is handed to the channel a second time, which is the whole point of exiting 1"
+  slackstub 0
+  N -t "demorepo stalled" "the channel is down"; rc=$?
+  k "$(yes_ test "$rc" = 0)" "…and once the channel is back the retry gets through"
+  N -t "demorepo stalled" "the channel is down"
+  k "$(yes_ grep -q 'send=dedup$' <<<"$(last)")" "…and only THAT one arms the window: the stamp follows delivery, not the attempt"
+  cfg_ "$LIVE" yes
+
+  # `cc-notify test` IS the proof that the push works (README, RUNBOOK, docs/AUDIT.md all send a person here), and
+  # someone runs it twice while getting the phone subscribed. Its message differs only in a clock, whose digits this
+  # file strips out of the key on purpose — so borrowing another kind's window made the second run a silent no-op.
+  N test
+  k "$(yes_ grep -q 'rung=1 kind=notify-test send=ntfy+slack$' <<<"$(last)")" "cc-notify test is its own kind, rung 1, and really goes to the phone"
+  N test
+  k "$(yes_ grep -q 'send=ntfy+slack$' <<<"$(last)")" "…and a second test minutes later pushes AGAIN: the call whose job is to prove the push works is never deduped"
+  k "$(yes_ test -s "$T/slack.args")" "…the second one really reached a channel, rather than logging send=dedup and exiting 0"
+
+  # A BOX WITH NO SLACK AT ALL. README:53 is `cc-notify setup && cc-notify test` — a topic and nothing else — and
+  # there the push is the only door there is. Gating it on rung 1 alone made boot, limit, cc-rc, audit and power
+  # reach NOBODY on such a box, silently, at exit 0.
+  cfg_ "$LIVE" no
+  N -t "abox boot" "up at 12:00"
+  k "$(yes_ grep -q 'rung=4 kind=boot send=ntfy$' <<<"$(last)")" "with no Slack configured anywhere, a rung 4 notice goes out over ntfy — the only door the box has"
+  k "$(yes_ pushed)" "…and the push really arrived, which is why the log is allowed to say ntfy"
+  k "$(yes_ test ! -s "$T/slack.args")" "…without inventing a Slack channel to send it to"
+  N -t "abox secretary" "a page is waiting to be read"
+  k "$(yes_ grep -q 'rung=5 kind=secretary send=ntfy$' <<<"$(last)")" "…and so does an ambient one, rather than being dropped"
+  k "$(yes_ test "$(prio_)" = low)" "…at the table's own prio: ntfy reads low as no sound and no vibration, which is what keeps it quiet"
+  cfg_ "$LIVE" yes
+  N -t "abox boot" "up at 13:00"
+  k "$(no_ pushed)" "…while the same rung 4 notice on a box that HAS Slack stays off the phone, which is what this table was for"
+
+  # TWO BOOTS ARE TWO EVENTS. A boot message differs from the last one only in digits — the time, the seconds dark,
+  # the SSD counter, "Boots today: N" — and the key strips digits on purpose, so any window at all made a power-flap
+  # reboot loop, the exact thing this message exists to report, into one notice; cc-boot-notify then stamps
+  # boot-announced for a notice nobody received.
+  N -t "abox boot" "Up at 04:00 UTC. 12s dark. Sudden-power-loss count: 4. Boots today: 2."
+  k "$(no_ grep -q 'send=dedup$' <<<"$(last)")" "a boot notice goes out"
+  N -t "abox boot" "Up at 04:09 UTC. 31s dark. Sudden-power-loss count: 5. Boots today: 3."
+  k "$(no_ grep -q 'send=dedup$' <<<"$(last)")" "…and the next boot nine minutes later is its OWN event: a reboot loop is reported every time, not once"
+
+  # CONFIGURED IS NOT WORKING. A token that is set but dead — revoked, or the bot dropped from the channel — is not
+  # a channel, and the box's own rung 4 news (cc-rc, power, limit) would sit in the log and nowhere else, unnoticed:
+  # cc-rc, cc-vitals and cc-limit all discard this script's exit status. The phone is the last door.
+  slackstub 1
+  N -t "abox cc-rc" "services did not come back"; rc=$?
+  k "$(yes_ pushed)" "when the only Slack channel REFUSES a rung 4 notice, the push fires as the last door and really arrives"
+  k "$(yes_ grep -q 'rung=4 kind=cc-rc send=ntfy-fallback$' <<<"$(last)")" "…and THE LOG SAYS SO — the door it actually went through, not the one it was routed to"
+  k "$(yes_ test "$rc" = 0)" "…and it exits 0, because a door did take it"
+  slackstub 0
+  N -t "abox cc-rc" "services did not come back at all"
+  k "$(no_ pushed)" "…while a rung 4 notice Slack ACCEPTS still stays off his phone: the fallback is a failure path, not a second channel"
+  k "$(yes_ grep -q 'send=slack$' <<<"$(last)")" "…and that one logs the door it really used too"
+
+  out=$( cd "$T" && env -u CC_NOTIFY_LOG_ONLY -u CC_BOX HOME="$NH" CC_NOTIFY_LOG="$log" "$BIN/cc-notify" report today 2>&1 )
+  k "$(yes_ grep -qE 'rung 1 +[0-9]' <<<"$out")" "report says how much was sent that day, broken out by rung"
+  k "$(yes_ grep -q 'rang his phone' <<<"$out")" "…and how much of it rang his phone"
+
+  kill -TERM "$ntfypid" 2>/dev/null; wait "$ntfypid" 2>/dev/null   # the fixture's own ntfy goes with it
+  rm -rf "$T"
+  echo "cc-notify selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+
+BOX="$(cfg CC_BOX)"; BOX="${BOX:-$(hostname -s)}"   # this box's name (override with CC_BOX in ~/.cc/config): default title + ntfy topic prefix
+title="$BOX"; prio="default"; decision=0; want=""
+case "${1:-}" in
+  setup)
+    NTFY_TOPIC="$(cfg NTFY_TOPIC)"
+    if [ -z "$NTFY_TOPIC" ]; then NTFY_TOPIC="$BOX-$(tr -dc a-z0-9 </dev/urandom | head -c 12)"; "$BIN/cc-config" set NTFY_TOPIC "$NTFY_TOPIC"; fi
+    echo "ntfy topic: $NTFY_TOPIC"; echo "Phone: install the 'ntfy' app (iOS/Android) -> Subscribe to topic -> enter: $NTFY_TOPIC"
+    echo "Then run: cc-notify test"; exit 0 ;;
+  test) exec "$0" -t "$BOX test" --kind notify-test "Notifications work. $("$BIN/cc-time" slack)" ;;
+  report) shift; report "${1:-}"; exit 0 ;;
+  selfcheck) selfcheck; exit $?;;
+esac
 NTFY_TOPIC="$(cfg NTFY_TOPIC)"; NTFY_SERVER="$(cfg NTFY_SERVER)"; NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
 SLACK_WEBHOOK="$(cfg SLACK_WEBHOOK)"; SLACK_BOT_TOKEN="$(cfg SLACK_BOT_TOKEN)"
 SLACK_OWNER_ID="$(cfg SLACK_OWNER_ID)"; SLACK_ALERTS="$(cfg SLACK_ALERTS)"
 CC_NOTIFY_LOG_ONLY="$(cfg CC_NOTIFY_LOG_ONLY)"
-BOX="$(cfg CC_BOX)"; BOX="${BOX:-$(hostname -s)}"   # this box's name (override with CC_BOX in ~/.cc/config): default title + ntfy topic prefix
-title="$BOX"; prio="default"; decision=0
-case "${1:-}" in
-  setup)
-    if [ -z "$NTFY_TOPIC" ]; then NTFY_TOPIC="$BOX-$(tr -dc a-z0-9 </dev/urandom | head -c 12)"; "$BIN/cc-config" set NTFY_TOPIC "$NTFY_TOPIC"; fi
-    echo "ntfy topic: $NTFY_TOPIC"; echo "Phone: install the 'ntfy' app (iOS/Android) -> Subscribe to topic -> enter: $NTFY_TOPIC"
-    echo "Then run: cc-notify test"; exit 0 ;;
-  test) exec "$0" -t "$BOX test" "Notifications work. $("$BIN/cc-time" slack)" ;;
-esac
 # Is this an escalation? Same walk as cc-guard: the marker is the truth, CC_ROLE only a convenience. `from` is the
 # session dir's name — its Slack channel's name too — and it makes a better default title than the box's.
 owner=0; from=""; [ "${CC_ROLE:-}" = member ] && owner=1
@@ -53,55 +401,126 @@ d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
   [ -f "$d/.cc/member-facing" ] && { owner=1; from=${d##*/}; break; }; d=${d%/*}; done
 [ -n "$from" ] && title="$from escalation"
 while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
+  --kind) want="$2"; shift 2;;
   --decision) decision=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
-printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$title" "$(printf '%s' "$msg" | tr '\n' ' ')" >> "$LOG"
-# THROWAWAY TEST STATE MUST NEVER PAGE THE OWNER. Selfchecks and selftests work on synthetic repos named
-# _cctest…/_selfcheck…, and their failures are REAL calls to this script from cc-slack, cc-land, cc-handoff and
-# cc-reconcile: four days of "[_cctest…] PR #7 merged, deploy stopped :rotating_light:" in #alerts, at high
-# priority, produced by nothing more than running the gates. Stubbing each call site was tried and every new
-# case inherits none of it — and cc-slack's land runs on a background thread, so the stub is already back by the
-# time the call happens. The gate therefore lives HERE, at the one door every outward notification goes through,
-# and it keys on the NAME so it holds for a caller nobody thought to configure. Anchored on a non-alphanumeric
-# so a real repo that merely contains the word (myrepo_cctesting) still pages. The line is still logged: the
-# trail is what a test asserts on, and it is the only thing that was ever wanted from a fixture.
+
+# THE TABLE DECIDES, and it decides before anything is written down: the log records the rung, so the log can answer
+# "how much reached him yesterday, and how loudly" (cc-notify report).
+[ "$decision" = 1 ] && want=decision
+[ "$owner" = 1 ] && want=escalation
+kind=$(kind_of "$want" "$title")
+cprio="$prio"                                        # what the CALLER asked for: relayed out of a member boundary, obeyed nowhere else
+read -r rung phone window prio <<<"${RUNGS[$kind]}"   # …and here the table overwrites it
+# THE DEDUP KEY is the KIND, what it is ABOUT, and what it says with the numbers taken out. The numbers are the
+# point: a caller whose message changes every run defeats a plain hash on purpose, and that is how one cosmetic
+# publish failure signed itself differently 6 times in a day (its reason quotes `grep -in`, whose line numbers shift
+# as the file grows) and how a dialog standing at a pane says a new minute count every tick. Stripping them keys on
+# the event instead of on the clock, here at the door, so no caller has to be taught to sign itself — and a caller
+# whose numbers ARE the event says so in its scope (a PR number) rather than in its prose.
+# cksum's "<crc> <len>" is enough to key a file name on.
+key="$(printf '%s\t%s\t%s' "$kind" "$(scope_of "$title")" "$(printf '%s' "$msg" | tr -d '0-9')" | cksum | tr ' ' '-')"
+# THE LOG IS WRITTEN FROM WHAT HAPPENED, NOT FROM WHAT WAS PLANNED. This block used to decide a `send` label from
+# the CONFIG, write the line, and only then try to deliver — so a Slack post that failed and a phone fallback that
+# succeeded both logged `send=slack`, and `cc-notify report` told the owner 0 pushes on the day his phone was the
+# only thing that rang. Three rounds of review found three different bugs in that gap. There is no gap now: `took`
+# collects the doors that ACTUALLY took the message and `record` is the one writer, called once per path with what
+# `took` collected. Nothing writes the log ahead of the outcome, so the log cannot disagree with it.
+record(){ printf '%s\t%s\t%s\trung=%s kind=%s send=%s\n' "$(date -u +%FT%TZ)" "$title" \
+    "$(printf '%s' "$msg" | tr '\n\t' '  ')" "$rung" "$kind" "$1" >> "$LOG"; }
+went=""; took(){ went="${went:+$went+}$1"; }   # the doors the message really went through, in the order it took them
+stop=""
 case " $title $msg " in
-  *[!A-Za-z0-9]_cctest*|*[!A-Za-z0-9]_selfcheck*)
-    echo "cc-notify: synthetic test state, logged and not pushed ($title)" >&2; exit 0;;
+  # THROWAWAY TEST STATE MUST NEVER PAGE THE OWNER. Selfchecks and selftests work on synthetic repos named
+  # _cctest…/_selfcheck…, and their failures are REAL calls to this script from cc-slack, cc-land, cc-handoff and
+  # cc-reconcile: four days of "[_cctest…] PR #7 merged, deploy stopped :rotating_light:" in #alerts, at high
+  # priority, produced by nothing more than running the gates. Stubbing each call site was tried and every new
+  # case inherits none of it — and cc-slack's land runs on a background thread, so the stub is already back by the
+  # time the call happens. The gate therefore lives HERE, at the one door every outward notification goes through,
+  # and it keys on the NAME so it holds for a caller nobody thought to configure. Anchored on a non-alphanumeric
+  # so a real repo that merely contains the word (myrepo_cctesting) still pages. The line is still logged: the
+  # trail is what a test asserts on, and it is the only thing that was ever wanted from a fixture.
+  *[!A-Za-z0-9]_cctest*|*[!A-Za-z0-9]_selfcheck*) stop="test";;
 esac
-[ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && exit 0   # tests set this: log, never push
+[ -z "$stop" ] && [ -n "${CC_NOTIFY_LOG_ONLY:-}" ] && stop="log-only"   # tests set this: log, never push
+case "$stop" in
+  test)     record test;     echo "cc-notify: synthetic test state, logged and not pushed ($title)" >&2; exit 0;;
+  log-only) record log-only; exit 0;;
+esac
+# A SEND THAT FAILED IS NOT A SEND. This stamp used to be written HERE, before any channel had been tried, so a
+# failure was recorded as delivered: cc-boot-notify's first try fails and exits 1, its retry 10 s later lands in the
+# dedup branch and exits 0, the caller writes ~/.cc/state/boot-announced, and the boot notice reached nobody and is
+# never retried again. So it is called below instead, once a channel has taken the message — or once it is certain
+# there was no channel to take it, which is the other way this exits 0.
+stamp(){ mkdir -p "$SEEN" 2>/dev/null && : > "$SEEN/$key"
+         find "$SEEN" -type f -mmin +1440 -delete 2>/dev/null; }   # a key nothing has repeated in a day is not holding anything back
 # INSIDE A MEMBER WORKSPACE'S BOUNDARY (cc-sandbox member) there is no ~/.cc/config and no token: every rung below is
 # unconfigured, `tried` stays 0 and this would exit 0 having reached NOBODY — a blocked member told its escalation
-# worked. The one door out is the workspace's own socket; the daemon holds the token and delivers to the owner.
+# worked. The one door out is the workspace's own socket; the daemon holds the token and delivers to the owner. The
+# priority relayed is the CALLER's: the table lives outside the boundary, and the daemon applies it on the way out.
 if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
-  printf '%s' "$msg" | "$HOME/bin/cc-slack" escalate -t "$title" -p "$prio" && exit 0
-  echo "cc-notify: the workspace's Slack link did not take this — it is in $LOG and nowhere else" >&2; exit 1
+  if printf '%s' "$msg" | "$HOME/bin/cc-slack" escalate -t "$title" -p "$cprio"; then
+    took socket; record "$went"; stamp; exit 0; fi
+  record none; echo "cc-notify: the workspace's Slack link did not take this — it is in $LOG and nowhere else" >&2; exit 1
 fi
+# THE DEDUP, and it sits BELOW the sandbox on purpose: the table is not applied inside a member boundary, so an
+# escalation in there is never held back by a window this side of it.
+if [ "$window" -gt 0 ] && [ -f "$SEEN/$key" ]; then
+  now=$(date +%s); was=$(stat -c %Y "$SEEN/$key" 2>/dev/null || echo 0)
+  if [ $((now - was)) -lt "$window" ]; then
+    record dedup; echo "cc-notify: the same $kind was sent less than ${window}s ago — logged, not sent again" >&2; exit 0
+  fi
+fi
+# WHICH DOORS ARE OPEN. The table says whether this rings the phone; the config says which doors exist at all. A box
+# set up the way the README says (`cc-notify setup && cc-notify test`) has a topic and NO Slack, and there the push is
+# the ONLY door: gating it on rung 1 alone drops boot, limit, cc-rc, audit and power on the floor — that is silence,
+# not restraint, and "it can wait for him to open Slack" means nothing on a box with no Slack. So when no Slack channel
+# is configured the push carries every rung, and the table's PRIO is what keeps it quiet: ntfy reads `low` as no sound
+# and no vibration and `default` without the long buzz that `high` gets, which is the ladder the phone already speaks.
+to_slack=0; { [ -n "${SLACK_BOT_TOKEN:-}" ] || [ -n "${SLACK_WEBHOOK:-}" ]; } && to_slack=1
+to_ntfy=0;  [ -n "${NTFY_TOPIC:-}" ] && { [ "$phone" = yes ] || [ "$to_slack" = 0 ]; } && to_ntfy=1
 # post <url> <curl args...> — url via -K (kept out of argv/ps), body via stdin (a message starting with @ is text, not a filename)
 post() { local u=$1; shift; curl -sS --fail --max-time 10 --data-binary @- -K <(printf 'url = "%s"\n' "$u") "$@" >/dev/null 2>&1; }
-tried=0; ok=0
-if [ -n "${NTFY_TOPIC:-}" ]; then
-  tried=$((tried + 1))
+tried=0
+# THE PHONE RINGS FOR RUNG 1 — and for everything, on a box whose only door it is (see "WHICH DOORS ARE OPEN" above).
+# Until 2026-09-07 this block sat ABOVE all routing and fired on every call that had a topic configured, so the ladder
+# — which only ever existed on the Slack side — never reached the push at all.
+push_ntfy(){ tried=$((tried + 1))   # $1 names the door for the log: the push proper, or the fallback below
   if printf '%s' "$msg" | post "$NTFY_SERVER/$NTFY_TOPIC" -H "Title: $title" -H "Priority: $prio" -H "Tags: robot"
-    then ok=$((ok + 1)); else echo "cc-notify: ntfy push failed (logged)" >&2; fi
-fi
-if [ -n "${SLACK_BOT_TOKEN:-}" ] || [ -n "${SLACK_WEBHOOK:-}" ]; then   # one channel: the bot, else the webhook
+    then took "$1"; else echo "cc-notify: ntfy push failed (logged)" >&2; fi; }
+[ "$to_ntfy" = 1 ] && push_ntfy ntfy
+if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
   tried=$((tried + 1)); bang=$( { [ "$prio" = high ] || [ "$prio" = urgent ]; } && echo ' :rotating_light:')
-  # an escalation is DELIVERED, not routed: the owner's DM — unpaired, #alerts (cc-slack falls that back to SLACK_CHANNEL)
+  # THE RUNG IS THE DESTINATION. An escalation is DELIVERED, not routed: the owner's DM — unpaired, #alerts (cc-slack
+  # falls that back to SLACK_CHANNEL). Rung 4 names #alerts here rather than hoping the title's second word happens to
+  # be in cc-slack's ALERT_KINDS — that mismatch is what put the secretary's siren in the ambient lane. Rung 5 keeps
+  # --route: cc-slack already turns a title into that repo's -updates lane, which is what ambient means.
   if [ "$owner" = 1 ]; then dest=(-c "${SLACK_OWNER_ID:-#${SLACK_ALERTS:-alerts}}")   # a DM already IS rung 1
-  else dest=(--route "$title"); [ "$decision" = 1 ] && dest+=(--mention); fi   # --decision: the main channel, @-mentioned
+  elif [ "$rung" = 4 ]; then dest=(-c "#${SLACK_ALERTS:-alerts}")
+  else dest=(--route "$title"); [ "$rung" = 1 ] && dest+=(--mention); fi   # rung 1: the main channel, @-mentioned
   if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post "${dest[@]}" "$(printf '*%s*%s\n%s' "$title" "$bang" "$msg")" >/dev/null 2>&1; then
-    ok=$((ok + 1))   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)
+    took slack   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)
   elif [ -n "${SLACK_WEBHOOK:-}" ] &&
        jq -cn --arg t "$title" --arg m "$msg" --arg b "$bang" \
          'def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
           {text: ("*" + ($t|esc) + "*" + $b + "\n" + ($m|esc))}' |
        post "$SLACK_WEBHOOK" -H 'Content-Type: application/json'; then
-    ok=$((ok + 1))
+    took slack
   else
     echo "cc-notify: slack post failed (logged)" >&2
   fi
 fi
-[ "$tried" -eq 0 ] && exit 0                 # nothing configured: the log is the only channel, that is not a failure
-[ "$ok" -gt 0 ] || exit 1                    # every configured channel failed — the caller may retry
-exit 0
+# THE PUSH IS THE LAST DOOR. Deciding the fallback on whether Slack is CONFIGURED is not the same as deciding it on
+# whether Slack WORKED: a revoked token, or the bot removed from the channel, leaves to_slack=1, to_ntfy=0 and ok=0,
+# and a rung 4 notice about the box's own services would sit in the log and nowhere else — while cc-rc, cc-vitals and
+# cc-limit all discard this script's exit status, so nothing downstream would notice either. Before this table that
+# call always pushed. So when every door that was tried has failed and the phone is still there, ring it, at the
+# table's prio. (to_ntfy=0 with a topic set means to_slack was 1: the push was held back FOR Slack, and Slack is gone.)
+if [ -z "$went" ] && [ "$to_ntfy" = 0 ] && [ -n "${NTFY_TOPIC:-}" ]; then
+  echo "cc-notify: no Slack channel took this — falling back to the phone" >&2; push_ntfy ntfy-fallback
+fi
+# ONE LINE, WRITTEN LAST, SAYING WHICH DOORS TOOK IT — `ntfy`, `slack`, `ntfy+slack`, `ntfy-fallback`, or `none`.
+record "${went:-none}"
+[ -n "$went" ] && { stamp; exit 0; }         # at least one door took it
+[ "$tried" -eq 0 ] && { stamp; exit 0; }     # nothing configured: the log is the only channel, that is not a failure
+exit 1                                       # every configured channel failed — no stamp, so the caller's retry re-sends

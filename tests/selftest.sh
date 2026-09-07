@@ -1111,6 +1111,12 @@ M -t "alice help" "nobody is listening"; mrc=$?
 [ "$mrc" != 0 ] \
   && ok "…and when the link does not take it, cc-notify FAILS — exiting 0 having reached nobody is what a blocked member cannot afford" \
   || bad "an escalation that reached nobody still exited 0"
+# THE RUNG IS THE TABLE'S, NOT THE CALLER'S — the table itself, the dedup key and which kinds ring his phone, in a
+# HOME, a log, a dedup dir and an ntfy of its own: nothing of this box's is read and nothing leaves the machine.
+# cc-notify is on tests/check.sh's selfcheck list as well, and runs there too, the same way cc-task, cc-native,
+# cc-brief and cc-handoff do — both gates are scoped to the change, so this costs a second on a cc-notify change
+# and nothing at all on any other.
+chk cc-notify
 fi
 if stanza "--say / --go / cc-loop"; then
 "$B/cc" $REPO w1 --say hello >/dev/null 2>&1 && bad "--say should fail with no live session" || ok "--say refuses when no session"
