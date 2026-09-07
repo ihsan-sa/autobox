@@ -1,47 +1,286 @@
 #!/usr/bin/env bash
-# cc-digest — one-screen status of all orchestrated work (boards, tracks, PRs). `--notify` pushes it to the owner.
+# cc-digest — the daily project report: what shipped, what is moving, what waits on the owner, what stopped, and
+# what it cost. A bare run prints it (that is what `!digest` shows); `--notify` posts it, once a day.
+#
+# WHY IT IS NOT A LIST OF ROWS (comms audit, 2026-09-07). It used to print every board row with its PR state and
+# its dollars: 23,000 characters in six chunks, most of them rows that merged days ago and had not moved since,
+# and about 80% of everything the owner was sent in a day. He stopped reading it, and so missed the two lines in
+# it that were his. This answers five questions and says nothing else — what shipped, what is moving, what waits
+# on you, what stopped, what it cost. A row that merged and went quiet answers none of them and does not appear.
+# The corollary is the rule to keep when editing: a new line here has to be worth displacing one of those.
 set -uo pipefail
-B="$(dirname "$(readlink -f "$0")")"; BOARD="$B/cc-board"; out=""   # sibling, so a worktree copy tests itself
-add(){ out+="$1"$'\n'; }
-mapfile -t rows < <("$BOARD" list 2>/dev/null)
-# THE SNAPSHOT IS THE DECIDER (cc-reconcile, review rec #7): effective state, and who each track waits on. The board
-# holds one word; this holds the thing one word cannot — whether a stopped track is waiting on a PERSON or on the
-# CLOCK. Stale or missing, we fall back to the board rather than going blind: a digest is never worth a stall.
-declare -A EFF WHO WHY   # `cc-reconcile view`: one row per track — repo/track, state, waiting_on, why; none when the snapshot is missing or stale
-while IFS=$'\t' read -r k es ew ey; do [ -n "${k:-}" ] && { EFF["$k"]=$es; WHO["$k"]=$ew; WHY["$k"]=$ey; }
-done < <("$B/cc-reconcile" view 2>/dev/null)
-declare -A CTX; while IFS=$'\t' read -r cr ct cp _ _ _ ca cl cpend; do   # a context is news once it is due a journal; below that it changes nothing. cc-context names the line — it knows each session's own window and floors
-  [ -n "${cr:-}" ] && [ "$cr" != - ] && [ -z "${CTX[$cr/$ct]:-}" ] && [ "${ca:-0}" -lt 86400 ] || continue
-  case "$cl" in journal) CTX["$cr/$ct"]=" 🧠 ctx $cp% — journal";; handoff) CTX["$cr/$ct"]=" 🧠 ctx $cp% — hand off";; ceiling) CTX["$cr/$ct"]=" 🧠 ctx $cp% — hand off NOW";; esac
-  [ "$cpend" = pending ] && [ -n "${CTX[$cr/$ct]:-}" ] && CTX["$cr/$ct"]="${CTX[$cr/$ct]} (pending)"
-done < <("$B/cc-context" --all 2>/dev/null)
-if [ ${#rows[@]} -eq 0 ]; then add "no tracks"; else
-  for r in "${rows[@]}"; do repo=$(cut -f1 <<<"$r"); tr=$(cut -f2 <<<"$r"); st=$(cut -f3 <<<"$r"); ti=$(cut -f4 <<<"$r")
-    pr=$("$BOARD" get "$repo" "$tr" pr 2>/dev/null); prs=""
-    [ -n "$pr" ] && prs=" PR:$(gh pr view "$pr" --json state,reviewDecision -q '.state + (if .reviewDecision != "" then "/"+.reviewDecision else "" end)' 2>/dev/null || echo '?')"
-    last=$("$BOARD" json "$repo" 2>/dev/null | jq -r --arg t "$tr" '.tracks[$t].notes[-1].msg // ""' | tr '\n' ' ' | cut -c1-110)
-    cost=$(cat ~/.cc/state/"$repo"/"$tr"/runs/*.json 2>/dev/null | jq -s 'map(.total_cost_usd // 0) | add // 0' 2>/dev/null); cs=""; [ -n "$cost" ] && [ "$cost" != 0 ] && cs=$(printf ' $%.2f' "$cost")
-    ps=""; [ -f ~/.cc/worktrees/"$repo"/"$tr"/.cc/checkpoint.err ] && ps=" commit!"; [ -f ~/.cc/worktrees/"$repo"/"$tr"/.cc/push.err ] && ps="$ps push!"   # the checkpoint hook refused / could not push
-    st="${EFF[$repo/$tr]:-$st}"   # what cc-reconcile decided, not the word a worker last wrote between turns
-    # phone-first: one bullet per track, and ONLY a question a person must answer is marked "needs you". A track held
-    # by a usage limit is waiting on the clock and starts again by itself; a track that merely stopped is not asking.
-    why=$(printf '%s' "${WHY[$repo/$tr]:-}" | tr '\n' ' ' | cut -c1-60)
-    flag=""; case "$st" in
-      waiting) flag=" ❓ needs you${why:+: $why}";;   # a stale snapshot leaves no question: still say he is needed, just without one
-      blocked) [ "${WHO[$repo/$tr]:-}" != clock ] && flag=" ⛔ stopped";;
-      review) [ -n "$pr" ] && flag=" ❓ PR to review";;
-    esac
-    # the clock gets its row whatever word the track wears — a loop that hit the limit mid-run still says `running`
-    [ "${WHO[$repo/$tr]:-}" = clock ] && flag=" ⏳ held by the usage limit"
-    title=""; [ "$ti" != "$tr" ] && title=" — ${ti:0:60}"
-    add "• *$repo/$tr* $st$flag$title$prs$cs$ps${CTX[$repo/$tr]:-}"; [ -n "$last" ] && add "    ↳ $last"; done; fi
-asks=$("$B/cc-scope" digest 2>/dev/null); [ -n "$asks" ] && add "$asks"   # what the OWNER asked for and has not had closed — the board only knows what the box took on
-lim=$("$B/cc-limit" status 2>/dev/null) && add "• ⏳ Claude $lim"   # nothing while it is clear
-live=$(tmux list-windows -t main -F '#W' 2>/dev/null | grep -v '^box$' | tr '\n' ' ')   # box = the always-on boot session, not project work
-add "• live: ${live:-none}"
-printf '%s' "$out"
-# --notify goes out as "<box> digest", which cc-slack routes to the box's UPDATES lane (#<box>-updates) and falls back
-# to #alerts where a box has none: a digest is progress, not an alert, and progress belongs in the second lane now
-# (owner, 2026-09-01). Nothing here picks a channel — one resolver in cc-slack owns that for every automated post.
-[ "${1:-}" = "--notify" ] && "$HOME/bin/cc-notify" -t "${CC_BOX:-$(hostname -s)} digest" "$out"
+B="$(dirname "$(readlink -f "$0")")"   # sibling, so a copy in a fixture's own bin tests itself against that bin
+case "${1:-}" in ""|--notify|selfcheck) ;; *) echo "usage: cc-digest [--notify] | selfcheck" >&2; exit 2;; esac
+
+OUT=""
+add(){ OUT+="$1"$'\n'; }
+join_c(){ local s="" x; for x in "$@"; do s+="${s:+, }$x"; done; printf '%s' "$s"; }
+plural(){ printf '%s %s%s' "$1" "$2" "$([ "$1" = 1 ] || echo s)"; }
+trim(){   # $1 down to $2 characters, cut at a word boundary: a question that stops mid-word reads as a bug, and
+          # the one thing in here he has to act on is the one thing that must not look like one.
+  local s=$1
+  [ "${#s}" -le "$2" ] && { printf '%s' "$s"; return 0; }
+  s=${s:0:$2}; printf '%s…' "${s% *}"
+}
+
+few(){   # stdin, one title per line → "a; b; c; and 4 more" naming at most $1. A title is capped so that one long
+         # row cannot push the whole report past the 3,500 characters `!digest` is able to show.
+  local max=$1 n=0 shown=0 t s=""
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue; n=$((n + 1))
+    if [ "$shown" -lt "$max" ]; then s+="${s:+; }$(trim "$t" 110)"; shown=$((shown + 1)); fi
+  done
+  [ "$n" -gt "$shown" ] && s+="; and $((n - shown)) more"
+  printf '%s.' "$s"
+}
+
+groups(){   # one bullet per project, the busiest first, naming at most $1 of them and $2 titles each. $3 is the
+            # NAME of an associative array of newline-separated titles: a report groups by project, and bash has
+            # no other way to hand one over. A project past the cap is counted, never dropped — a silent omission
+            # is how the old digest's reader stopped believing its numbers.
+  local -n src=$3
+  local maxg=$1 maxt=$2 g=0 rp c
+  while read -r c rp; do
+    g=$((g + 1))
+    if [ "$g" -gt "$maxg" ]; then printf '• and %s more elsewhere.\n' "$(( ${#src[@]} - maxg ))"; break; fi
+    if [ "$c" = 1 ]; then printf '• %s: %s\n' "$rp" "$(few "$maxt" <<<"${src[$rp]}")"
+    else printf '• %s, %s: %s\n' "$rp" "$c" "$(few "$maxt" <<<"${src[$rp]}")"; fi
+  done < <(for rp in "${!src[@]}"; do printf '%s %s\n' "$(grep -c . <<<"${src[$rp]}")" "$rp"; done | sort -k1,1nr -k2,2)
+}
+
+spend_clause(){   # USD is an estimate and cc-spend says so, so the number is rounded to the dollar: what it is for
+                  # is the shape of the day. Unreadable, it is dropped rather than printed as a guess about a guess.
+  local a b
+  read -r a b < <("$B/cc-spend" today 2>/dev/null | awk '$1 == "total" { print $2, $3 }')
+  [ -n "${a:-}" ] || return 0
+  printf ' $%.0f spent' "$a"
+  [ -n "${b:-}" ] && printf ', $%.0f with your own sessions' "$b"
+  printf '.'
+}
+
+report(){
+  # "Since yesterday" is the gap between two daily runs. The compare is lexical, not arithmetic: every stamp the
+  # board writes is %FT%TZ, so one cutoff string costs one fork instead of one fork per row.
+  local window="${CC_DIGEST_WINDOW:-86400}" cut
+  cut=$(date -u -d "@$(( $(date -u +%s) - window ))" +%FT%TZ)
+
+  # THE SNAPSHOT IS THE DECIDER (cc-reconcile). The board holds one word; this holds what one word cannot — whether
+  # a stopped track waits on a PERSON or on the CLOCK, and what the question is. Stale or missing, we keep the
+  # board's own word rather than going blind: a report is never worth a stall.
+  local -A EFF WHO WHY
+  local k es ew ey
+  while IFS=$'\t' read -r k es ew ey; do
+    [ -n "${k:-}" ] && { EFF["$k"]=$es; WHO["$k"]=$ew; WHY["$k"]=$ey; }
+  done < <("$B/cc-reconcile" view 2>/dev/null)
+
+  local -A SHIP MOVE
+  local need="" stop="" review="" held="" bd rp tr kd st ti sl up nt key why
+  local n_ship=0 n_move=0 n_need=0 n_stop=0 n_held=0 n_q=0 n_park=0 n_sess=0
+  while IFS= read -r bd; do
+    [ -n "$bd" ] || continue
+    # `cc-board json`, never the file: no sibling opens ~/.cc/boards/<repo>.json itself (cc-board's own tripwire).
+    while IFS=$'\x1f' read -r rp tr kd st ti sl up nt; do
+      [ -n "${tr:-}" ] || continue
+      key="$rp/$tr"; ti="${sl:-$ti}"   # a row nobody titled falls back to its own name; say it as words, not a slug
+      # A session row is what it IS, not what it says, so the snapshot never renames one. Every other row takes
+      # the snapshot's word over the one a worker last wrote between turns.
+      if [ "$kd" = session ]; then st=session; else st="${EFF[$key]:-$st}"; fi
+      why="${WHY[$key]:-}"
+      # The clock is neither a person nor a fault: a track the usage limit holds starts again by itself, so it is
+      # never on his list and never counted as broken. It IS still named, on one line for the whole box: the
+      # standing rule is that nothing is held for the limit without his say-so, and he cannot hold that rule if he
+      # cannot see what is being held. A first draft of this dropped the row entirely and he lost sight of it.
+      if [ "${WHO[$key]:-}" = clock ]; then held+="$ti"$'\n'; n_held=$((n_held + 1)); continue; fi
+      case "$st" in
+        merged|done)
+          # THE WHOLE POINT OF THIS TOOL IS THIS LINE. A row that landed inside the window shipped; one that landed
+          # before it is quiet, and quiet is not news. Everything the old digest printed and nobody read lived here.
+          [[ -n "$up" && "$up" > "$cut" ]] && { SHIP["$rp"]+="$ti"$'\n'; n_ship=$((n_ship + 1)); } ;;
+        running)  MOVE["$rp"]+="$ti"$'\n'; n_move=$((n_move + 1)) ;;
+        review)   review+="$ti"$'\n'; n_move=$((n_move + 1)) ;;
+        waiting)  need+="$rp"$'\x1f'"${why:-$ti}"$'\n'; n_need=$((n_need + 1)) ;;
+        blocked)  stop+="$rp"$'\x1f'"$ti"$'\x1f'"$nt"$'\n'; n_stop=$((n_stop + 1)) ;;
+        queued)   n_q=$((n_q + 1)) ;;
+        session)  n_sess=$((n_sess + 1)) ;;
+        *)        n_park=$((n_park + 1)) ;;   # parked, and any word a later cc-board adds: shelved, not broken
+      esac
+      # A worker whose commits are refused, or that cannot push, is losing work in silence. That is breakage while
+      # the row still says `running`, so it is said here instead of waiting for somebody to read the worktree.
+      if [ -f "$HOME/.cc/worktrees/$rp/$tr/.cc/checkpoint.err" ] || [ -f "$HOME/.cc/worktrees/$rp/$tr/.cc/push.err" ]; then
+        stop+="$rp"$'\x1f'"$ti"$'\x1f'"the work it is doing is not being saved"$'\n'; n_stop=$((n_stop + 1))
+      fi
+    # UNIT SEPARATOR, NOT TAB. A tab is IFS whitespace, so bash collapses a run of them and an EMPTY field slides
+    # every later one up a place: a blocked row with no `updated` stamp read its own last note as its timestamp and
+    # lost the one sentence saying what broke. \x1f is not whitespace, so an empty field stays an empty field.
+    done < <("$B/cc-board" json "$bd" 2>/dev/null | jq -j --arg b "$bd" '
+      (.repo // $b) as $r | (.tracks // {}) | to_entries[] |
+      [$r, .key, (.value.kind // "track"), (.value.status // "?"), (.value.title // .key),
+       ((.value.title // .key) as $t | if ($t | test(" ")) then "" else ($t | gsub("[-_]"; " ")) end),
+       (.value.updated // ""), (((.value.notes // []) | last | .msg) // "")]
+      | map(tostring | gsub("[\n\r\u001f]"; " ")) | join("\u001f"), "\n"')
+  done < <("$B/cc-board" boards 2>/dev/null)
+
+  # THE FIRST LINE IS THE WHOLE REPORT. He reads it on a phone and must be able to stop there and still be right;
+  # the sections under it only say which pieces of work each of those numbers is.
+  local -a head=()
+  [ "$n_ship" -gt 0 ] && head+=("$n_ship shipped")
+  [ "$n_move" -gt 0 ] && head+=("$n_move moving")
+  [ "$n_need" -gt 0 ] && head+=("$n_need waiting on you")
+  [ "$n_stop" -gt 0 ] && head+=("$n_stop stopped")
+  [ "$n_held" -gt 0 ] && head+=("$n_held held")
+  local summary="nothing moved"; [ ${#head[@]} -gt 0 ] && summary=$(join_c "${head[@]}")
+  add "*$BOX* today: $summary.$(spend_clause)"
+  local lim=""; lim=$("$B/cc-limit" status 2>/dev/null) || lim=""
+  if [ -n "$held" ]; then add "⏳ Held by the usage limit: $(few 4 <<<"$held")${lim:+ Claude $lim.}"
+  elif [ -n "$lim" ]; then add "⏳ Claude $lim."; fi
+
+  # WAITING ON YOU LEADS, AND IS NEVER TRIMMED. The rest of this is news; this is the part he has to act on, and a
+  # question held back to save a line is a day of somebody's work stalled to save a line.
+  local ask; ask=$("$B/cc-scope" digest 2>/dev/null)   # cc-scope owns the wording of what he asked for and has not had closed
+  if [ -n "$need" ] || [ -n "$ask" ]; then
+    add ""; add "*Waiting on you*"
+    while IFS=$'\x1f' read -r rp why; do [ -n "${rp:-}" ] && add "• $rp: $(trim "$why" 240)"; done <<<"$need"
+    [ -n "$ask" ] && add "$ask"
+  fi
+  if [ -n "$stop" ]; then
+    add ""; add "*Stopped*"
+    local shown=0
+    while IFS=$'\x1f' read -r rp ti nt; do
+      [ -n "${rp:-}" ] || continue; shown=$((shown + 1))
+      [ "$shown" -gt 3 ] && { add "• and $((n_stop - 3)) more."; break; }
+      add "• $rp, $(trim "$ti" 55)${nt:+: $(trim "$nt" 110)}"
+    done <<<"$stop"
+  fi
+  [ "$n_ship" -gt 0 ] && { add ""; add "*Shipped*"; add "$(groups 4 3 SHIP)"; }
+  if [ "$n_move" -gt 0 ]; then
+    add ""; add "*Moving*"
+    [ ${#MOVE[@]} -gt 0 ] && add "$(groups 4 3 MOVE)"
+    [ -n "$review" ] && add "• in review: $(few 3 <<<"$review")"
+  fi
+  local -a rest=()
+  [ "$n_q" -gt 0 ] && rest+=("$n_q queued")
+  [ "$n_park" -gt 0 ] && rest+=("$n_park parked")
+  [ "$n_sess" -gt 0 ] && rest+=("$(plural "$n_sess" session) open")
+  [ ${#rest[@]} -gt 0 ] && { add ""; add "$(join_c "${rest[@]}")."; }
+  printf '%s' "$OUT"
+}
+
+# ---------------------------------------------------------------------------- selfcheck
+selfcheck(){
+  local p=0 f=0 out fresh stale
+  d=$(mktemp -d); trap 'rm -rf "$d"' EXIT   # not `local`: the trap fires after this function has returned
+  # A whole box of its own: a bin of stubs with a COPY of this script beside them, so `readlink -f $0` resolves
+  # into the fixture's bin and every sibling it reaches is the fixture's. No board, ledger, worktree or Slack of
+  # this box's is read, and the notify path writes a file the case greps instead of a message anybody gets.
+  mkdir -p "$d/bin" "$d/home/.cc" "$d/boards"
+  cp "$B/cc-digest" "$d/bin/cc-digest"
+  cat > "$d/bin/cc-board" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = boards ] && { ls "$CCD/boards" | sed 's/\.json$//'; exit 0; }
+[ "$1" = json ] && { cat "$CCD/boards/$2.json"; exit 0; }
+exit 1
+EOF
+  printf '#!/usr/bin/env bash\ncat "$CCD/reconcile" 2>/dev/null\n'                > "$d/bin/cc-reconcile"
+  printf '#!/usr/bin/env bash\ncat "$CCD/scope" 2>/dev/null\n'                    > "$d/bin/cc-scope"
+  printf '#!/usr/bin/env bash\ncat "$CCD/spend" 2>/dev/null\n'                    > "$d/bin/cc-spend"
+  printf '#!/usr/bin/env bash\ncat "$CCD/limit" 2>/dev/null; [ -s "$CCD/limit" ]\n' > "$d/bin/cc-limit"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "$CCD/posted"\n'            > "$d/bin/cc-slack"
+  printf '#!/usr/bin/env bash\n: > "$CCD/notified"\n'                             > "$d/bin/cc-notify"
+  printf '#!/usr/bin/env bash\necho fixturebox\n'                                 > "$d/bin/cc-config"
+  chmod +x "$d/bin"/*
+  export CCD="$d" HOME="$d/home"
+  run(){ "$d/bin/cc-digest" "$@" 2>/dev/null; }
+  k(){ local m=$1; shift; if "$@" >/dev/null 2>&1; then p=$((p + 1)); else f=$((f + 1)); echo "  FAIL: $m"; fi; }
+  has(){ grep -qF -- "$2" <<<"$1"; }
+  hasnt(){ ! grep -qF -- "$2" <<<"$1"; }
+  line(){ grep -qxF -- "$2" <<<"$1"; }
+  nomatch(){ ! grep -qE -- "$2" <<<"$1"; }
+
+  # One board with one row per state, so every branch of the bucketing is driven by the same fixture.
+  fresh=$(date -u -d '-1 hour' +%FT%TZ); stale=$(date -u -d '-9 days' +%FT%TZ)
+  jq -n --arg fresh "$fresh" --arg stale "$stale" '{repo:"proj", tracks:{
+    just:   {status:"merged",  title:"the invoice page adds tax",    updated:$fresh},
+    older:  {status:"merged",  title:"a quiet thing from last week", updated:$stale},
+    hushed: {status:"done",    title:"another quiet thing",          updated:$stale},
+    now:    {status:"running", title:"search over the archive"},
+    pr:     {status:"review",  title:"the login page remembers you"},
+    ask:    {status:"waiting", title:"the importer"},
+    dead:   {status:"blocked", title:"the nightly export",
+             notes:[{ts:"x", msg:"the exporter ran out of disk and gave up"}]},
+    later:  {status:"queued",  title:"a thing nobody started"},
+    shelf:  {status:"parked",  title:"a thing set aside"},
+    chat:   {kind:"session",   status:"running", title:"a course session"}}}' > "$d/boards/proj.json"
+  printf 'proj/ask\twaiting\tperson\tdo you want the importer to skip a bad row or stop?\n' > "$d/reconcile"
+  printf '• 7 asks of yours still open\n' > "$d/scope"
+  printf '  repo   auto $  all $\n  proj   12.75   40.25\n  total  12.75   40.25\n' > "$d/spend"
+  : > "$d/limit"
+  out=$(run)
+
+  k "a row that merged inside the window is what shipped, named by its title" has "$out" "the invoice page adds tax"
+  # THE ONE THAT MATTERS: these two rows are the 80% of the old digest that nobody read.
+  k "a row that merged and went quiet is not in the report at all"     hasnt "$out" "quiet thing"
+  k "a stale merged row is not counted as shipped either"              has "$out" "1 shipped"
+  k "what waits on him leads the sections, and carries the question itself" \
+    has "$out" "• proj: do you want the importer to skip a bad row or stop?"
+  k "his open asks are counted beside it"                              has "$out" "7 asks of yours still open"
+  k "a stopped row says what broke"                                    has "$out" "ran out of disk"
+  k "a running row is what is moving"                                  has "$out" "search over the archive"
+  k "a row in review is moving too, said once for the whole box"       has "$out" "in review: the login page remembers you."
+  k "queued, parked and session rows are a count in the tail, not lines of their own" \
+    line "$out" "1 queued, 1 parked, 1 session open."
+  k "the first line is the whole report: the counts, then the day's cost" \
+    line "$out" "*fixturebox* today: 1 shipped, 2 moving, 1 waiting on you, 1 stopped. \$13 spent, \$40 with your own sessions."
+  k "no PR state, path or per-row dollar figure hangs off any line" \
+    nomatch "$out" "PR:|/home/|[$][0-9]+[.][0-9][0-9]"
+  k "the report fits the 30 lines the board is worth"      test "$(wc -l <<<"$out")" -le 30
+  k "…and the 3,500 characters !digest is able to show"    test "${#out}" -lt 3500
+
+  # A track the usage limit is holding waits on the CLOCK. It starts again by itself, so it is not stopped, it is
+  # not his to unblock, and it is said once for the box rather than once per track.
+  printf 'proj/now\tblocked\tclock\t\nproj/pr\tblocked\tclock\t\n' > "$d/reconcile"; out=$(run)
+  k "work the usage limit is holding is named, once, at the top" \
+    line "$out" "⏳ Held by the usage limit: search over the archive; the login page remembers you."
+  k "…and counted as held, which is neither moving nor stopped"       has "$out" "1 waiting on you, 1 stopped, 2 held."
+  # CUT THE SECTIONS OUT AND SEARCH THOSE. grep is line-based, so the first draft of this case — one regex spanning
+  # a header and a later bullet — could not match whatever the report said, and passed for a report of any shape.
+  k "…and is on no list of his to answer and nobody's to fix" \
+    nomatch "$(sed -n '/^\*Waiting on you\*/,/^$/p;/^\*Stopped\*/,/^$/p' <<<"$out")" "search over the archive"
+
+  # A worker whose commits are refused is losing work even while its row still says `running`.
+  printf '' > "$d/reconcile"
+  mkdir -p "$HOME/.cc/worktrees/proj/now/.cc"; : > "$HOME/.cc/worktrees/proj/now/.cc/push.err"
+  k "a worker that cannot save its work is stopped, whatever its row says" \
+    has "$(run)" "the work it is doing is not being saved"
+  rm -rf "$HOME/.cc/worktrees"
+
+  # The snapshot is an optimisation, never a dependency.
+  printf 'not a snapshot at all\n' > "$d/reconcile"
+  k "no usable snapshot means the board's own word, not an empty report" has "$(run)" "1 shipped"
+
+  # The box is quiet: one honest line beats a message with nothing in it and a message not sent at all.
+  echo '{"repo":"proj","tracks":{}}' > "$d/boards/proj.json"; printf '' > "$d/scope"; out=$(run)
+  k "a quiet box gets one honest line"                     has "$out" "nothing moved"
+  k "…and nothing else"                                    test "$(grep -c . <<<"$out")" -le 2
+
+  # THE LANE. A report is what the owner asked to read, so it goes to the main channel under its own --major.
+  # cc-notify would route it by title into the updates lane — the lane it was drowning, and does not read.
+  run --notify >/dev/null
+  k "--notify posts into the box's own main lane as a major update" \
+    grep -qF -- "post --major -c #fixturebox" "$d/posted"
+  k "--notify never goes through cc-notify"                test ! -e "$d/notified"
+  k "an argument this tool does not know is a usage error" \
+    test "$("$d/bin/cc-digest" --nope >/dev/null 2>&1; echo $?)" = 2
+
+  echo "cc-digest selfcheck: $p passed, $f failed"; [ "$f" = 0 ]
+}
+
+BOX="$("$B/cc-config" get CC_BOX 2>/dev/null)"; BOX="${BOX:-${CC_BOX:-$(hostname -s)}}"
+[ "${1:-}" = selfcheck ] && { selfcheck; exit $?; }
+text=$(report)
+printf '%s\n' "$text"
+# THE MAIN LANE, DELIBERATELY (comms audit, 2026-09-07). cc-notify routes a title ending in "digest" to the box's
+# updates lane, which is where this became 80% of a day's noise in a channel he does not read. A report he asked
+# for is a major update, and `--major` is the caller's own word for the one thing that holds a post in the main
+# channel. Nothing else here picks a channel: the box's own name is the whole routing decision.
+[ "${1:-}" = "--notify" ] && "$B/cc-slack" post --major -c "#$BOX" "$text"
 exit 0

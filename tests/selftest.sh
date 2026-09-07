@@ -2418,8 +2418,8 @@ lsn=$(HOME=$SH "$B/cc" ls 2>&1); lsrc=$?
 [ $lsrc = 0 ] && grep -q 's_ask' <<<"$lsn" && ok "no snapshot: \`cc ls\` still prints every track (a missing key must not kill the listing)" || bad "cc ls without a snapshot: rc=$lsrc"
 grep -q '❓' <<<"$lsn" && ok "no snapshot: a waiting track is still marked, with no question to show" || bad "cc ls dropped the waiting mark"
 dgn=$(HOME=$SH "$B/cc-digest" 2>/dev/null)
-dga=$(grep s_ask <<<"$dgn")
-grep -q '❓ needs you' <<<"$dga" && ! grep -q 'needs you:' <<<"$dga" && ok "no snapshot: the digest still says he is needed, with no colon trailing a question it does not have" || bad "digest fallback wording: $dga"
+dga=$(sed -n '/^\*Waiting on you\*/,/^$/p' <<<"$dgn")   # the digest marks him needed by the SECTION a row is filed under
+grep -q 'title s_ask' <<<"$dga" && ! grep -qE ': *$' <<<"$dga" && ok "no snapshot: the digest still says he is needed, with no colon trailing a question it does not have" || bad "digest fallback wording: $dga"
 # an EMPTY or non-JSON snapshot must read as stale, not kill the reader: jq on empty input exits 0 with no
 # output at all, and `$(( now - ))` is a bash abort — this guard exists precisely for the file the writer got wrong.
 : > "$SH/.cc/state/reconcile.json"
@@ -2438,9 +2438,9 @@ cat > "$SH/.cc/state/reconcile.json" <<JSON
 JSON
 lss=$(HOME=$SH "$B/cc" ls 2>&1); dgs=$(HOME=$SH "$B/cc-digest" 2>/dev/null)
 grep -q 'which syllabus?' <<<"$lss" && grep -q 'which syllabus?' <<<"$dgs" && ok "snapshot: \`cc ls\` and the digest print the same question, from the one file" || bad "the question did not reach both readers"
-grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$lss")" && grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$dgs")" && ok "snapshot: a loop held by the limit says so in both — whatever word it wears (\`running\` here, not \`blocked\`)" || bad "clock row invisible while the board says running"
-! grep -q 'needs you' <<<"$(grep s_clock <<<"$dgs")" && ok "snapshot: the clock is NOT on his list — there is nothing for him to answer" || bad "a usage limit was reported as needing the owner"
-grep -q '⛔ stopped' <<<"$(grep s_stop <<<"$dgs")" && ! grep -q 'needs you' <<<"$(grep s_stop <<<"$dgs")" && ok "snapshot: a track that merely stopped reads as stopped, not as a question" || bad "a stopped track was filed as needing him"
+grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$lss")" && grep -q '^⏳ Held by the usage limit:.*title s_clock' <<<"$dgs" && ! grep -q 'title s_clock' <<<"$(sed -n '/^\*Waiting on you\*/,/^$/p;/^\*Stopped\*/,/^$/p' <<<"$dgs")" && ok "snapshot: a loop held by the limit says so in both — whatever word it wears (\`running\` here, not \`blocked\`) — and the digest NAMES it without filing it as his" || bad "clock row invisible while the board says running"
+dgh=$(head -1 <<<"$dgs"); grep -q '1 waiting on you' <<<"$dgh" && grep -q '1 held' <<<"$dgh" && ok "snapshot: the clock is counted as held, NOT as one more thing waiting on him — the tally he reads first" || bad "a usage limit was reported as needing the owner: $dgh"
+grep -q 'title s_stop' <<<"$(sed -n '/^\*Stopped\*/,/^$/p' <<<"$dgs")" && ! grep -q 'title s_stop' <<<"$(sed -n '/^\*Waiting on you\*/,/^$/p' <<<"$dgs")" && ok "snapshot: a track that merely stopped reads as stopped, not as a question" || bad "a stopped track was filed as needing him"
 rm -rf "$SH"
 
 fi

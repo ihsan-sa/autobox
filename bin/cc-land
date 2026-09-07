@@ -1234,7 +1234,7 @@ class Land:
             raise Failed(
                 f"the review budget for this change is spent: PR #{self.pr} has already bought "
                 f"{spent.get('reviews', 0)} review(s) and {spent.get('repairs', 0)} repair round(s), and "
-                f"{self.head[:12]} is a head none of them read. A PERSON decides now — read the diff and "
+                f"{self.head[:12]} is a head none of them read. The planning session decides now — read the diff and "
                 f"`cc-land {self.repo} {self.pr} --no-review`, or buy one more with "
                 f"`cc-land {self.repo} {self.pr} --re-review`")
         # …and whether this exact head has already died on a cap. Once it has, it has cost the whole cap to read
@@ -2043,17 +2043,20 @@ def start_worker():
 
 
 def say_result(job, r):
-    """The one thing the owner sees. It goes back to the thread the 👍 was given in — and a landing that did NOT land
-    also goes to them and to the repo's own session, because nobody reads #approvals and a stopped deploy leaves the
-    box running the old code. No reaction goes on that card either: the text already says landed ✅ or NOT merged ❌
-    (result_of), so a reaction in #approvals stays a person's mark alone, never the box's."""
+    """The reply thread — the 👍 this job started with — always gets the full text; it already asked. A landing
+    that did NOT land also wakes the repo's own planning session, whose call the stop now is (autonomy is the
+    norm; the review-budget wall is its own to spend, never a thing to ask the owner), and gets one ambient line
+    in #<repo>-updates — no push. A stopped landing used to page a phone for a decision the session already makes
+    on its own: 11 of the last 51 pushes were exactly that (comms audit, 2026-09-07). No reaction goes on the
+    approval card either: the text already says landed ✅ or NOT merged ❌ (result_of), so a reaction in
+    #approvals stays a person's mark alone, never the box's."""
     chat, ts, repo, pr = job.get("chat") or "", job.get("ts") or "", job.get("repo") or "", job.get("pr")
     if chat:
         sh([f"{BIN}/cc-slack", "post", "-c", chat] + (["--thread", ts] if ts else []) + [r.get("text", "")], timeout=180)
     if r.get("ok"):
         return
     title = f"[{repo}] " + (f"PR #{pr} " if pr else "") + "landing stopped"
-    sh([f"{BIN}/cc-notify", "-p", "high", "-t", title, r.get("short", "")[:300]], timeout=60)
+    sh([f"{BIN}/cc-slack", "post", "--route", title, r.get("short", "")[:300]], timeout=60)
     again = f"cc-land queue {repo} {pr}" if pr else "cc-land work"
     sh([f"{BIN}/cc-slack", "inject", repo,
         f"{r.get('text', '')}\nNothing re-drives this now — fix it, then `{again}`: every step already done is a "
@@ -3557,9 +3560,11 @@ def cmd_selfcheck():
           "judgement twice, which is what turned one change into seven paid rounds",
           "LAND on PR #7" in str(first) and len(bought) == 1
           and isinstance(again_r, Failed) and not bought2 and "budget for this change is spent" in str(again_r))
-    check("...and it says what a person does about it: how many reviews and repair rounds this change has had, "
-          "the head none of them read, and the two commands that end it — read it yourself, or buy one more",
-          "1 review(s)" in str(again_r) and "0 repair round(s)" in str(again_r) and NEXT[:12] in str(again_r)
+    check("...and it says who decides now — the planning session, never 'a person' the message pages a phone for "
+          "(the review-budget wall is its own to spend) — with how many reviews and repair rounds this change has "
+          "had, the head none of them read, and the two commands that end it: read it yourself, or buy one more",
+          "The planning session decides now" in str(again_r) and "A PERSON decides" not in str(again_r)
+          and "1 review(s)" in str(again_r) and "0 repair round(s)" in str(again_r) and NEXT[:12] in str(again_r)
           and "--no-review" in str(again_r) and "--re-review" in str(again_r))
     check("...and the tally is the CHANGE's, not the job's: one review counted, and the refusal counted nothing "
           "(a head that was never read cost nothing to refuse)",
@@ -4470,9 +4475,10 @@ def cmd_selfcheck():
         quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
         for _ in range(LAND_TRIES):
             quiet(cmd_work, [])
-        paged = ran("cc-notify", "landing stopped")
-        check("a PR the box cannot read is NOT merged, said once — and the sentence names what queued it, which is "
-              "the one line that would have said 'a selfcheck' on 2026-08-31 instead of six alarms",
+        paged = ran_sub("cc-slack", "post", "--route")
+        check("a PR the box cannot read is NOT merged, said once, ambient in #myrepo-updates — and the sentence "
+              "names what queued it, which is the one line that would have said 'a selfcheck' on 2026-08-31 "
+              "instead of six alarms",
               len(paged) == 1 and not gh_merges() and "NOT merged" in paged[0][-1]
               and f"queued by pid {os.getppid()} `" in paged[0][-1] and not os.path.exists(job_path("myrepo", 7)))
 
@@ -4489,10 +4495,12 @@ def cmd_selfcheck():
               and not ran_sub("cc-slack", "post"))
         quiet(cmd_work, [])
         quiet(cmd_work, [])
-        check("...and it gives up after 3 tries rather than retrying for ever — and the owner hears about it "
-              "exactly once, in the thread and on their phone, with no reaction from the bot",
-              read_json(job_path("myrepo", 7)) is None and len(ran_sub("cc-slack", "post")) == 1
-              and len(ran("cc-notify", "landing stopped")) == 1 and not reacted)
+        check("...and it gives up after 3 tries rather than retrying for ever — the thread hears once, the repo's "
+              "own planning session wakes to it, one ambient line lands in #myrepo-updates, no reaction from the "
+              "bot and no push to a phone",
+              read_json(job_path("myrepo", 7)) is None and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
+              and len(ran_sub("cc-slack", "post", "--route")) == 1
+              and len(ran_sub("cc-slack", "inject")) == 1 and not ran("cc-notify") and not reacted)
 
         fresh(pr=7)
         world["gh pr merge"] = (1, "GraphQL: Pull request is not mergeable (mergePullRequest); try --auto")
@@ -4605,9 +4613,9 @@ def cmd_selfcheck():
               not os.path.exists(job_path("myrepo", 7)) and not gh_merges() and not commented()
               and not ran_sub("cc", "myrepo", "--go") and not ran("systemd-run", "--on-active=")
               and not reacted)
-        check("...and the owner is told what it COST and which number would change it, once — the ✗ a person can "
+        check("...and the thread is told what it COST and which number would change it, once — the ✗ a person can "
               "act on, rather than a verdict the review never reached",
-              len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told() and "$3.00" in told()
+              len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told() and "$3.00" in told()
               and "hit its own cap" in told() and "CC_LAND_REVIEW_BUDGET" in told())
         check("...and it costs the change neither of the two things it is bounded by: the review it never got is "
               "given back and the automatic repair round is untouched, so the person who raises the cap is not "
@@ -4636,11 +4644,11 @@ def cmd_selfcheck():
             for _ in range(LAND_TRIES):
                 quiet(cmd_work, [])
             check("...while one that stays red stops after 3 tries and says NOT merged, once, with the ✗ line — never "
-                  "'the deploy stopped', since nothing merged",
+                  "'the deploy stopped', since nothing merged; the update lane hears it too, no push",
                   read_json(job_path("myrepo", 7)) is None and not gh_merges()
-                  and len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told()
+                  and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told()
                   and "✗ the row was wrong" in told() and "after 3 tries" in told() and "old code" not in told()
-                  and len(ran("cc-notify", "landing stopped")) == 1)
+                  and len(ran_sub("cc-slack", "post", "--route")) == 1 and not ran("cc-notify"))
             landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n"),
                        GATE: (0, "  ✓ the first\n  ✓ H4\n0 failed\n")})
             quiet(cmd_work, [])                # gated green, and THEN the limit: deferred, uncounted, PR unread —
@@ -4671,7 +4679,7 @@ def cmd_selfcheck():
               "that cannot be written down is one nobody could act on",
               not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
               and not ran_sub("cc", "myrepo", "w1", "--go")
-              and len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told() and "LAND-AFTER-FIX" in told()
+              and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told() and "LAND-AFTER-FIX" in told()
               and len([c for c in calls if c[0] == CLAUDE]) == 1)
         landing(**{"gh pr view": (0, json.dumps(dict(FACTS, mergeable="CONFLICTING")))})
         quiet(cmd_work, [])
@@ -4821,11 +4829,13 @@ def cmd_selfcheck():
               "a loop no longer running IS 'the round ended with a pushed head' — and `cc --go` leaves the worker's "
               "window behind as a bare shell, so a window that merely EXISTS is not a loop (review-176d)",
               open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed + 1)
-        check("...and the SECOND stop is where the owner finally hears about it — once, saying that a fix round has "
-              "already been spent, and with no second worker dispatched",
+        check("...and the SECOND stop is where the planning session finally hears about it — once in the thread, "
+              "once ambient in #myrepo-updates, no push — saying that a fix round has already been spent, and "
+              "with no second worker dispatched",
               not os.path.exists(job_path("myrepo", 7)) and not ran_sub("cc", "myrepo", "w1", "--go")
-              and len(ran_sub("cc-slack", "post")) == 1 and "NOT merged" in told()
-              and "AFTER one automatic fix iteration" in told() and len(ran("cc-notify")) == 1)
+              and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told()
+              and "AFTER one automatic fix iteration" in told()
+              and len(ran_sub("cc-slack", "post", "--route")) == 1 and not ran("cc-notify"))
         # …and the same bound across a RE-QUEUE, which is the one that never held. A 👍 after a stopped landing
         # writes a NEW job file that knows nothing of the round already spent, and `job["fix"]` bounded only the file
         # it was written on — so PR #171 came back seven times in one night, buying a round and a review each time.
@@ -4838,12 +4848,14 @@ def cmd_selfcheck():
         calls.clear()
         quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "2.2"])      # …and the owner 👍s it again
         quiet(cmd_work, [])
-        check("a SECOND model stop on one change goes to a PERSON even when it arrives on a new job: the re-queue "
-              "starts a fresh job file, but the repair round is counted against the CHANGE, so nothing is "
-              "dispatched and the owner is told once — the loop that bought seven rounds for one change is closed",
+        check("a SECOND model stop on one change wakes the planning session even when it arrives on a new job: the "
+              "re-queue starts a fresh job file, but the repair round is counted against the CHANGE, so nothing is "
+              "dispatched and the session is told once, no push — the loop that bought seven rounds for one "
+              "change is closed",
               len(one) == 1 and spent_now.get("repairs") == 1 and not ran_sub("cc", "myrepo", "w1", "--go")
               and not os.path.exists(job_path("myrepo", 7)) and "NOT merged" in told()
-              and "AFTER 1 automatic fix iteration on this change" in told() and len(ran("cc-notify")) == 1)
+              and "AFTER 1 automatic fix iteration on this change" in told()
+              and len(ran_sub("cc-slack", "post", "--route")) == 1 and not ran("cc-notify"))
 
         # (5) …and NONE of that at a PR that merged while its review ran. load() reads the state once, before the
         # gates, and the gates take up to an hour: PR #193 was OPEN when it was read at 22:58, merged at 23:12, and
@@ -4952,10 +4964,11 @@ def cmd_selfcheck():
 
         landing(**{f"{CLAUDE} -p": (0, REVIEWED("DO-NOT-LAND", "a.py:9", "it deletes the queue", "drop it"))})
         quiet(cmd_work, [])
-        check("a DO-NOT-LAND dispatches nothing and pages at once: it says the change should not exist, so there is "
-              "no remedy to hand a worker — only LAND-AFTER-FIX names its own",
+        check("a DO-NOT-LAND dispatches nothing and stops at once, no push: it says the change should not exist, "
+              "so there is no remedy to hand a worker — only LAND-AFTER-FIX names its own",
               not ran_sub("cc", "myrepo", "w1", "--go") and not os.path.exists(job_path("myrepo", 7))
-              and "NOT merged" in told() and len(ran("cc-notify")) == 1)
+              and "NOT merged" in told() and len(ran_sub("cc-slack", "post", "--route")) == 1
+              and not ran("cc-notify"))
         landing(**AFTERFIX)
         quiet(cmd_work, [])
         j = read_json(job_path("myrepo", 7))
