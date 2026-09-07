@@ -245,6 +245,18 @@ def grants(repo):
     return f"the standing landing grant could not be read (rc={rc})"
 
 
+def known_repo(repo):
+    """The one thing `card` still needs before it may put a repo in front of the owner. bind() already
+    confirmed the string sits verbatim in the event and matches NAME's shape — neither says the repo is real,
+    because the event is the output of untrusted processes and a name planted in it costs nothing to invent.
+    `cc lands` asks a different question (grant or no grant), and gating `card` on THAT would delete the only
+    escalation route a person has for a repo with no grant (BOUNDARIES) — so this is the narrower test `card`
+    alone needs: does the box even run this repo. Returns "" if `~/dev/<repo>` exists, else the reason it does
+    not; `os.path.isdir` never raises, so an unreadable path is simply not a directory — a refusal, never a
+    pass."""
+    return "" if os.path.isdir(f"{HOME}/dev/{repo}") else "the box has no such repo checked out"
+
+
 def slug(repo):
     """`gh` wants OWNER/REPO and the steward has no checkout, so the slug is read off the project's push remote —
     best effort, and an empty answer just means `gh` is on its own to work it out."""
@@ -391,6 +403,13 @@ def act(chain, args, dry):
         why = grants(args["repo"])
         if why:
             return False, f"`land` {args['repo']}: {why}"
+    if chain == "card":
+        # THE ONE THING `card` STILL NEEDS. It merges nothing and queues nothing, but it does put a repo name in
+        # front of the owner, and bind() only proved the model did not invent that string — not that it names a
+        # project this box runs. Before the --dry-run branch on purpose, same as `land`.
+        why = known_repo(args["repo"])
+        if why:
+            return False, f"`card` {args['repo']}: {why}"
     cmd = command(chain, args)
     if dry:
         return True, "would run " + shlex.join(cmd)
@@ -517,6 +536,11 @@ FIND = ("digest (1 event over 13 min):\n"
 NAG = ("digest (1 event over 12 min):\n"
        "• board watchdog: alpha/t2: finished, PR open, not landed — review and land it "
        "(https://github.com/anowner/alpha/pull/34)")
+# A repo this box does not run — the shape the `card` finding is about: an event can name anything matching
+# NAME["repo"], and nothing before known_repo() asks whether the name is a real project.
+GHOST = ("digest (1 event over 12 min):\n"
+         "• board watchdog: ghost/t2: finished, PR open, not landed — review and land it "
+         "(https://github.com/anowner/ghost/pull/34)")
 
 
 def selfcheck():
@@ -652,6 +676,9 @@ def selfcheck():
     for name, body in STUBS.items():
         open(f"{sbin}/{name}", "w").write(body)
         os.chmod(f"{sbin}/{name}", 0o755)
+    # `alpha` IS A REPO THE BOX HAS, for every other case here — `card` now asks, so the fixture must answer.
+    # `ghost` deliberately is not: no directory for it exists under this HOME at all.
+    os.makedirs(f"{th}/dev/alpha", exist_ok=True)
 
     def env(**extra):
         return {**os.environ, "HOME": th, "CC_STEWARD_BIN": sbin, "CC_CLAUDE": f"{sbin}/claude",
@@ -757,6 +784,25 @@ def selfcheck():
         r = run("run", "alpha", event=NAG, **fake(chain="card", repo="alpha", pr="34", why="no card"))
         ok("the card alone is one `cc-slack post-approval`",
            r.returncode == 0 and said() == "cc-slack post-approval alpha 34\n")
+
+        # THE CARD IS THE ESCALATION PATH FOR A REPO WITH NO GRANT — so it is not gated on `cc lands` (that would
+        # delete the only route a person has). What IS gated is whether the repo is real at all: a `card` naming a
+        # repo the box does not run is refused, its reason said, and nothing is posted.
+        r = run("run", "alpha", event=GHOST, **fake(chain="card", repo="ghost", pr="34", why="no card"))
+        ok("a card for a repo the box has no checkout of is refused with its reason, not posted",
+           r.returncode == 0 and "cc-slack" not in said() and "no such repo checked out" in said()
+           and "cc-broker inject --source steward alpha" in said())
+        # …AND THE NEGATIVE CONTROL FOR IT: the same event and PR, for the repo this box does have, posts exactly
+        # as before — so the new check refuses `ghost` for being unknown and NOT for anything else about the event.
+        r = run("run", "alpha", event=GHOST.replace("ghost", "alpha"),
+                **fake(chain="card", repo="alpha", pr="34", why="no card"))
+        ok("…while the identical shape for a repo the box does run still posts the card",
+           r.returncode == 0 and said() == "cc-slack post-approval alpha 34\n")
+        r = run("run", "--dry-run", "alpha", event=GHOST, **fake(chain="card", repo="ghost", pr="34", why="…"))
+        ok("…and a dry run over the same unknown repo prints the refusal, never the post it would not have made",
+           r.returncode == 0 and "cc-slack" not in said() and "would escalate" in r.stdout
+           and "no such repo checked out" in r.stdout)
+
         r = run("run", "alpha", event=NAG, **fake(chain="task", repo="alpha", row="t2", why="a returned build"))
         ok("a returned build is one `cc-land queue --task`",
            r.returncode == 0 and said() == "cc-land queue --task alpha t2\n")
