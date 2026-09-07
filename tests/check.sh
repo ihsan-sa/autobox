@@ -112,7 +112,7 @@ tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 fail
   && ! tally_ok x "x selfcheck: 28/28" && ! tally_ok x "x selfcheck: all passed" \
   && ! tally_ok x "x selfcheck: 4 passed, 10 failed" && ! tally_ok x "ran 12 cases, none failed" \
   || { echo "check.sh: the tally-shape rule no longer tells a readable tally from an unreadable one"; exit 1; }
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.

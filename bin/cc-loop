@@ -216,6 +216,12 @@ context_report(){   # `cc-loop context-report <session.jsonl>…` — one line p
   done; return $rc; }
 
 CHECKLIST="$(dirname "$BIN")/templates/self-review.md"   # the six recurring stops live in ONE place, and this is it
+DISPATCH="$(dirname "$BIN")/config/dispatch-prompt.md"   # subagent vs worker vs orch, and the model bands — written ONCE, in core/, for every session kind
+dispatch_block(){   # → that shared text with a leading space, or NOTHING if the file is missing, like selfrev_block.
+                    # The session a `--go` dispatch actually launches is THIS one, and its prompt is built here rather
+                    # than in `cc`, so without this line the worker was the one session kind the shared text missed.
+                    # Inlined for selfrev_block's reason too: a sandboxed worker has core/bin bound and not core/config.
+  local d; d=$(cat "$DISPATCH" 2>/dev/null); [ -n "$d" ] || return 0; printf ' %s' "$d"; }
 selfrev_block(){   # $1 the base branch → the self-review paragraph the worker prompt carries, or NOTHING if the
                    # checklist is missing. The worker reads the diff against it before STATUS: DONE, so the review
                    # stops fewer PRs for what the worker could have seen itself. It is inlined rather than linked
@@ -224,6 +230,9 @@ selfrev_block(){   # $1 the base branch → the self-review paragraph the worker
   [ -r "$CHECKLIST" ] || return 0
   printf " Before you append 'STATUS: DONE', re-read \`git diff origin/%s\` against the LANDING SELF-REVIEW below and fix what it finds — it is templates/self-review.md, so an entry that is wrong is fixed THERE, not in this copy.\n\n%s\n" \
     "$1" "$(cat "$CHECKLIST")"; }
+sp_worker(){   # $1 the base branch → the whole system prompt a headless worker is given. A function, like the
+               # three in `cc`, so `cc-loop selfcheck` can read the prompt a worker really gets, not a copy of it.
+  printf %s "You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$1' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal.$(dispatch_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -290,7 +299,7 @@ selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
                # `subagent_stats.refused` block, and a successful worker whose own prose says "refused". The full
                # sanitized real result lives in cc-model's selfcheck — this file only has to test the loop's reaction.
-  local d n=0 bad=0 out rc head nxt last wm
+  local d n=0 bad=0 out rc head nxt last wm dtext wsp gone
   head=$("$BIN/cc-model" chain | sed -n 1p); nxt=$("$BIN/cc-model" chain | sed -n 2p); last=$("$BIN/cc-model" chain | tail -1)
   [ -n "$head" ] && [ -n "$nxt" ] || { echo "cc-loop selfcheck: cc-model chain is shorter than two models" >&2; return 1; }
   d=$(mktemp -d) || return 1
@@ -515,6 +524,22 @@ down still leaves the board write and the updates line, which is the half of thi
     "$(repo=titled track=nosuch BOARD="$BIN/cc-board" HOME="$d/bh"; row_title)" nosuch
   t 'neither done line spends the reader on an iteration count and a dollar figure' \
     "$(grep -c '"\$repo/\$track done" "\$(row_title)\. PR:' "$0")" 2
+  # ── THE SHARED DISPATCH TEXT REACHES THE WORKER ── `cc <repo> <track> --go` launches THIS loop's session, and its
+  # prompt is built above, not in `cc`, so `cc selfcheck` (which covers the planning, orch and interactive-track
+  # variants) cannot see this one. Both halves are asserted: the prompt carries the text, and with the file gone the
+  # same test fails — a test that passes either way is matching on nothing.
+  dtext=$(cat "$DISPATCH")
+  carries(){ case "$1" in *"$dtext"*) echo yes;; *) echo no;; esac; }
+  wsp=$(repo=r track=t ST="$d/st"; sp_worker main)
+  t 'the worker prompt carries the shared dispatch text' "$(carries "$wsp")" yes
+  gone=$(repo=r track=t ST="$d/st" DISPATCH="$d/absent/dispatch-prompt.md"; sp_worker main)
+  t 'control: with the shared text gone, the worker prompt fails that same test' "$(carries "$gone")" no
+  t '…and the prompt is still built, so a missing file costs the dispatch half and never a worker' \
+    "$([ -n "$gone" ] && echo built || echo empty)" built
+  # ONE PLACE, NOT FOUR. Four prompt variants, one file: paste it in here and every case above still passes while
+  # the next edit to it updates one copy of two. No literal from the file is written below — it is its own pattern.
+  t '…and it is said once: no line of it is pasted into this script' \
+    "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$dtext"; echo "$dup")" no
   sed 's/^/  journal fixture | /' "$d/progress.md"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -575,7 +600,7 @@ parked(){ "$BIN/cc-pause" is "$repo" 2>/dev/null || return 1
   "$BOARD" note "$repo" "$track" "loop exit 11: project paused — cc-pause off $repo restarts it" >/dev/null 2>&1
   log "exit 11: $repo is paused — standing down; nothing more spends here until cc-pause off $repo"; exit 11; }
 base=$(worker_base "$repo")
-SP="You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$base' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal.$(selfrev_block "$base")"
+SP=$(sp_worker "$base")
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
 i=0; errs=0; caps=0; spent=0; limited=0   # limited: the owner has already been told about THIS limit episode
 barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the runaway rule's memory: this track measured against itself
