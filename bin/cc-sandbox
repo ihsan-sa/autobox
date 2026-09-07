@@ -47,11 +47,19 @@
 #     and it prints what it changed, including a README it could not write. Refused, with the reason: the box's own
 #     control repo, a repo with git worktrees or live tracks, and a handle the box already answers to (#box, #approvals,
 #     #alerts, an -updates lane, a name in routes.json). Then `mint`; the Slack channel pair stays the daemon's.
-# INSIDE rw: the track worktree · the parent repo's .git (the worktree's .git is a pointer into it), with .git/config and
-#   .git/hooks held ro — the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks (cc-loop), and a
-#   worker must not re-point its hooksPath or its remotes, nor write a hook the host would run. Those two, and every other
-#   source in a tree this list hands the worker rw, are bound BY DESCRIPTOR and not by name (see `pin`, and the paragraph
-#   in `build`): `.git` is the worker's to write, so `config` and `hooks` are names inside it ·
+# INSIDE rw: the track worktree · FOUR PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
+#   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects, this track's own
+#   .git/worktrees/<n>, and refs/heads/track plus logs/refs/heads/track — the fixed directory `cc` puts every track
+#   branch in, never a name read from inside (`build` says why a directory and not the ref file, and why a tmpfs and
+#   not a read-only bind). So the worker commits on its own branch and the checkpoint pushes it, while
+#   refs/heads/main, HEAD, the tags, the remotes, packed-refs, config, config.worktree, hooks and every OTHER track's
+#   git dir are read-only — as are the two files that say where THIS worktree's git dir and common dir are, the
+#   worktree's own .git and .git/worktrees/<n>/commondir, so the host's git can never be sent to a directory a worker
+#   wrote. A name the real .git does not have is the worker's own and reaches the host nowhere —
+#   the checkpoint that commits and pushes runs OUTSIDE with the MAIN checkout's hooks
+#   (cc-loop), and a worker must not re-point its hooksPath or its remotes, nor write a hook the host would run. Every
+#   source in a tree this list hands the worker rw is bound BY DESCRIPTOR and not by name (see `pin`, and the paragraph
+#   in `build`) ·
 #   ~/.cc/state/<repo>/<track> · ~/.npm · ~/.cache · /tmp · a private ~/.claude with settings ro, this cwd's
 #   transcripts and the repo's memory rw, nothing else of it · a COPY of ~/.claude.json with every other project's history
 #   and the MCP servers stripped (Slack stops loading: workers do not post).
@@ -86,9 +94,13 @@
 # NETWORK: untouched (--unshare-net is all-or-nothing, and "none" kills claude). Own pid namespace; same process group and
 #   --die-with-parent, so cc-loop's kill of the group and the `timeout` inside both end everything.
 # BREAKS INSIDE, BY DESIGN: git push and gh (no credential — cc-loop pushes and opens the PR from outside), cc-notify (no
-#   ~/.cc/config — `STATUS: BLOCKED` in the journal is the escalation), cc --go (no tmux). Missing a path? Add ONE bind line
-#   here, reviewable — never a wider one. Known cost: the parent .git is rw, so a worker CAN move refs of the main checkout;
-#   that is the worktree model, unchanged from before, and the reason stage 2 is a container. And a relative core.hooksPath
+#   ~/.cc/config — `STATUS: BLOCKED` in the journal is the escalation), cc --go (no tmux). And, since the ref store went
+#   read-only: `git tag` and `git stash`, neither of which a worker is launched to do. Commit, rebase, amend, reset,
+#   checkout and the checkpoint's own commit on its own branch all work, measured end to end. Missing a path? Add ONE bind line
+#   here, reviewable — never a wider one. Known cost, what is LEFT of it: the ref store is ro apart from the namespace the
+#   track's own branch sits in, so a worker can still move a SIBLING track's branch there, and .git/objects is rw so it
+#   can delete objects — the box's own work in progress, no longer its history. Both want a ref store the host
+#   reconciles, which is cc-loop's side of the line. And a relative core.hooksPath
 #   (this repo's core/.githooks) names tracked files the worker edits: cc-loop's host-side git runs the main checkout's copy
 #   instead, but `cc done` typed by hand on that worktree still merges with the worktree's — review the branch first.
 set -uo pipefail
@@ -181,19 +193,44 @@ settings_bind(){   # $1 a host dir NO bind of this boundary reaches → put the 
     echo "cc-sandbox: no ~/.claude/settings.json to build a sealed-session copy from — binding no settings at all. The permission baseline is NOT applied and no hook is registered: this session prompts like an unsandboxed one." >&2
   fi
   [ -f "$H/.claude/settings.json" ] && B+=(--ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json"); return 0; }
+track_gitdir(){   # $1 the parent repo · $2 the track worktree → $1/.git/worktrees/<n>, THE ONE BOTH SIDES AGREE ON, or 1
+  # The worktree's `.git` is a gitlink FILE in a tree the worker writes, so its text is not on its own a reason to bind
+  # anything rw. It is read here for the NAME only, and the name is then required to be a plain entry under the host's
+  # own $1/.git/worktrees/ whose `gitdir` file points back at this worktree. `<track>` is not reliably that name: git
+  # appends a digit when the basename is already taken, so a track re-created after a stale entry gets <track>1.
+  local gd rest; gd=$(sed -n '1s/^gitdir: //p' "$2/.git" 2>/dev/null) || return 1
+  rest=${gd#"$1/.git/worktrees/"}; [ -n "$rest" ] && [ "$rest" != "$gd" ] || return 1
+  case "$rest" in */*|.|..) return 1;; esac
+  [ -d "$gd" ] && [ "$(cat "$gd/gitdir" 2>/dev/null)" = "$2/.git" ] || return 1
+  printf '%s' "$gd"; }
+NSD=refs/heads/track   # THE ONE REF DIRECTORY A WORKER MAY WRITE. A CONSTANT, chosen here and read from nothing inside:
+# `cc` puts every track branch in it (branch=track/<track>), so no worker needs another one and none may name one. It is
+# a DIRECTORY bind, so a slashed track name (track/a/b) is covered by the same mount and needs no second decision.
+branch_warn(){   # $1 the track's own git dir → nothing bound and nothing decided; one line on stderr if a commit will fail
+  # $1/HEAD IS INSIDE THE WORKER'S RW WORLD, so its text is the worker's own and must never choose a mount. It did once,
+  # and that reopened the whole hole: measured on the version this replaced, one launch wrote `ref: refs/heads/main/x`
+  # into its own HEAD, and the NEXT launch read `refs/heads/main` out of it and bound the host's refs/heads/main — a
+  # FILE, which is the shape a live repo's own branch has — read-write, after which the worker overwrote main with any
+  # sha it liked. So the text is only ever a MESSAGE now. Two shapes are fine and silent: HEAD detached (a rebase in
+  # progress, finishing onto track/<t>) and a branch already under $NSD.
+  local ref; ref=$(sed -n '1s/^ref: //p' "$1/HEAD" 2>/dev/null)
+  case "$ref" in ""|"$NSD"/?*) return 0;; esac
+  echo "cc-sandbox: this worktree is on '${ref#refs/heads/}', a branch outside $NSD — the ref store is read-only inside, so a commit on it will fail. Track branches are track/<track>." >&2; }
 build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the rw targets that may not exist yet are created
-  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f
+  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f gd
   proj="$H/.claude/projects/$(slug "$wt")"; mem="$H/.claude/projects/$(slug "$dev")/memory"
   mkdir -p "$proj" "$mem" "$H/.npm" "$H/.cache" "$H/.cc/boards" "$st"
   B=(--die-with-parent --unshare-pid
      --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
      --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H")
   # THE WORKER'S SOURCES ARE DESCRIPTORS TOO — the same wall as the member boundary's, not a second one (see `pin`).
-  # Six sit in a tree this list hands the worker READ-WRITE. The parent `.git` is rw by design (BREAKS INSIDE, above),
-  # so `config` and `hooks` — the two held READ-ONLY precisely because the host's own checkpoint runs git in that repo —
-  # are names inside a directory the worker writes; the worktree, the track state and the two claude dirs are rw as well.
-  # Named, each is resolved a second time by mount(2): what a worker leaves at one of those names is what the NEXT launch
-  # mounts, and what a process racing this one puts there is what THIS launch mounts.
+  # The parent `.git` is NOT rw any more: it is a tmpfs holding mountpoints of the real one (below), so `config` and
+  # `hooks` are names in a directory no worker can write and neither is the reason for the pin. What this list still
+  # hands a worker READ-WRITE is the worktree, `.git/objects`, this track's own admin dir, the two $NSD directories, the
+  # track state and the two claude dirs — and the pin is for the sources that sit INSIDE those: the worktree's `.git`
+  # and the admin dir's `commondir`, both pinned ro a few lines down, plus the rw sources themselves against a sibling
+  # session. Named, each is resolved a second time by mount(2): what a worker leaves at one of those names is what the
+  # NEXT launch mounts, and what a process racing this one puts there is what THIS launch mounts.
   # MEASURED BEFORE IT WAS CHANGED, because a wall nobody can climb is not worth the code. Today a live worker cannot
   # swap any of these itself, and not one of the reasons is a decision made here: bwrap binds each source ONTO ITS OWN
   # NAME, so the name is a MOUNTPOINT inside and renaming it is EBUSY (`mv .git/config .git/cfgx` → Device or resource
@@ -204,13 +241,57 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # ORDER IS MOUNT ORDER: $H is a tmpfs above, so every path under it is pinned after that line, `.git` before what
   # sits in it.
   pinq --bind "$wt"
-  pinq --bind "$dev/.git"
-  pinq --ro-bind "$dev/.git/config"
-  # …and hooks is MADE here rather than tested for, so the pin is unconditional. `[ -d ] &&` was a name test that
+  # THE PARENT .git IS THE HOST'S, AND THE WORKER WRITES FOUR PLACES IN IT. It used to be bound rw whole, which handed
+  # every worker the box's entire ref store; measured on this file before the change, one `sh -c` inside moved
+  # refs/heads/main, deleted a sibling track's branch, repointed the main checkout's HEAD, truncated packed-refs and
+  # left `core.hooksPath = /tmp/evil` in the host's .git/config.worktree for its own git to run. None of that is work a
+  # worker is launched to do. So the worker's `.git` is A TMPFS OF ITS OWN holding nothing but mountpoints of the real
+  # one, and only these four are mounted rw, in mount order:
+  #   objects/           the objects it commits (the Stop hook commits INSIDE the boundary; cc-loop pushes outside)
+  #   worktrees/<n>/     ITS OWN per-worktree git dir — HEAD, index, logs/HEAD, a rebase in progress. Every OTHER
+  #                      track's is ro now, and was not.
+  #   refs/heads/track/ and logs/refs/heads/track/  the DIRECTORY track branches live in, not the ref file: the files
+  #                      backend creates `<branch>.lock` beside the ref and renames it over, and a rename onto a bound
+  #                      FILE is EBUSY, so a bind of the ref itself would break every commit. The directory is the
+  #                      CONSTANT $NSD and refs/heads/main is not in it. It is not derived from the worktree's HEAD or
+  #                      from anything else the worker writes — see branch_warn for what happened when it was.
+  # WHY A TMPFS AND NOT A READ-ONLY BIND OF .git, WHICH IS WHAT THIS WAS FIRST: `git commit` clears MERGE_HEAD and
+  # CHERRY_PICK_HEAD, and the files backend takes $GIT_COMMON_DIR/packed-refs.lock for that DELETE. With the directory
+  # itself ro it could not, said `error: Unable to create …/packed-refs.lock: Read-only file system`, and left
+  # CHERRY_PICK_HEAD behind — after which `git commit --amend` refused with "You are in the middle of a cherry-pick"
+  # (measured, on a rebase-then-commit-then-amend the box does every day). A lock file needs a writable DIRECTORY, and
+  # this gives it one that is the worker's own: a name the real `.git` does not already have is the worker's to create
+  # and NOTHING the host reads, so the wall is deny-by-default — only what is bound below exists in there at all.
+  # WHAT IT STILL LEAVES, plainly and measured: inside that ONE namespace a worker can move a sibling track's branch and
+  # make or delete a loose ref (a sibling still in packed-refs it can move by shadowing, but not delete — that would
+  # rewrite packed-refs, which is ro); and objects/ is rw, so it can delete objects. Both are the box's work in
+  # progress, not its history: refs/heads/main, HEAD, the tags, the remotes, packed-refs, config, config.worktree,
+  # hooks, every branch outside the namespace and every other track's git dir are out of reach, and the selfcheck
+  # drives each one. Closing the last two wants a ref store the host reconciles — cc-loop's side of the line, not this
+  # file's.
+  B+=(--tmpfs "$dev/.git")
+  # …and hooks is MADE here rather than tested for, so its bind is unconditional. `[ -d ] &&` was a name test that
   # skipped quietly: a repo without the directory left the name free for a worker to take, and the next launch bound
   # whatever it found there — or, the link spelling, refused to start with a bwrap message naming neither cause nor cure.
-  mkdir -p "$dev/.git/hooks" 2>/dev/null   # the host's checkpoint runs hooks: none of them may be the worker's
-  pinq --ro-bind "$dev/.git/hooks"
+  # …and so are the two rw ref directories, for the same reason and BEFORE the enumeration below, so that `refs` and
+  # `logs` are always among the names it walls off and the rw binds land ON TOP of a ro mount rather than beside a gap.
+  mkdir -p "$dev/.git/hooks" "$dev/.git/$NSD" "$dev/.git/logs/$NSD" 2>/dev/null   # the host's checkpoint runs hooks: none of them may be the worker's
+  for f in "$dev"/.git/* "$dev"/.git/.[!.]*; do   # every entry the real .git HAS, ro; the three rw ones are mounted over it below
+    [ -e "$f" ] || continue                        # config, hooks, HEAD, packed-refs, index, info, refs, logs, worktrees…
+    case "${f##*/}" in objects) pinq --bind "$f";; *) pinq --ro-bind "$f";; esac; done
+  gd=$(track_gitdir "$dev" "$wt") || { echo "cc-sandbox: $wt is not a linked worktree of $dev/.git — its .git and the git dir it names do not agree. Nothing was bound and nothing started." >&2; exit 2; }
+  pinq --bind "$gd"
+  # …AND THE TWO REDIRECT FILES OUT OF IT, ro. $gd is rw — the worker's own HEAD, index and rebase state live in it —
+  # and the worktree is rw too, so both of the files that tell git where this worktree's git dir and common dir ARE sit
+  # in a tree the worker writes. Left rw they hand back everything the tmpfs above took: `printf /tmp/evil >
+  # .git/worktrees/<n>/commondir` (or `gitdir: /tmp/evil` into the worktree's own `.git`) re-points the host's next
+  # `git -C "$wt" …` — `cc done`'s, running as the owner — at a common dir the worker wrote, config, hooks and
+  # core.fsmonitor included. The member boundary pins exactly these two for exactly this reason (build_member,
+  # review-156b). Unconditional: git writes both when it creates a linked worktree, so an absent one is a name free for
+  # a worker to take and the launch should refuse rather than bind whatever is there next time.
+  pinq --ro-bind "$wt/.git"; pinq --ro-bind "$gd/commondir"
+  pinq --bind "$dev/.git/$NSD"; pinq --bind "$dev/.git/logs/$NSD"   # a constant, not a name anything inside supplies
+  branch_warn "$gd"   # AFTER the binds and changing none of them: a diagnostic, never an input
   pinq --bind "$st"; pinq --bind "$proj"; pinq --bind "$mem"
   B+=(--ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
      --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin"
@@ -265,7 +346,8 @@ board_dir(){   # $1 handle — THE BOARD IS ONE FILE ON BOTH SIDES. ~/.cc/boards
 pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen inside, default $2] → an fd-pinned bind, or 1
   # A BIND SOURCE IS NOT A NAME. bwrap resolves its sources at mount time, in the host's namespace, and BOTH boundaries
   # hand their session trees that hold some of those sources read-write (build_member: the workspace and its git dir;
-  # build: the worktree and the parent `.git`) — so a name there is a promise the walled-off side can break, three ways,
+  # build: the worktree and this track's own admin dir, which is where the two redirect files live — the parent `.git`
+  # itself is no longer rw) — so a name there is a promise the walled-off side can break, three ways,
   # all three measured on this box: plant a symlink at it and the mount follows; rename a parent so it resolves somewhere
   # else; or, from a SECOND live session, swap it between the host's check and bwrap's mount. A
   # launch lock does not close the third — the attacker is a session that is already running — and a fourth name check
@@ -1106,7 +1188,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
   rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
-  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out want rc c
+  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out want rc c m0 t0 hd
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   g(){ sed -n "s/^$1=//p" <<<"$out" | head -1; }
@@ -1115,6 +1197,16 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   git -C "$dev" init -q -b main && git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init || return 1
   git -C "$dev" worktree add -q -b track/t "$wt" && git -C "$dev" worktree add -q -b track/u "$H/.cc/worktrees/$r/u" || return 1
   mkdir -p "$wt/.cc"; : > "$wt/.cc/track"
+  # Two delete targets nothing else in here touches, so each reads its own effect: one OUTSIDE the worker's branch
+  # namespace, which must survive, and one inside it, which does not — that is the limit, measured below and not claimed.
+  git -C "$dev" branch other >/dev/null 2>&1 && git -C "$dev" branch track/x >/dev/null 2>&1 || return 1
+  printf '[core]\n\thooksPath = /host/own\n' > "$dev/.git/config.worktree"   # a repo that HAS one, so the ro bind over it is the thing being driven
+  # main moves on AFTER the tracks are cut, so the rebase the worker does inside has real work to replay — which is what
+  # sets CHERRY_PICK_HEAD, and clearing that is what needs a writable .git directory (build).
+  git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m 'main moves on' || return 1
+  m0=$(git -C "$dev" rev-parse main); t0=$(git -C "$dev" rev-parse track/t)   # where main and the track's own branch stand before a worker runs
+  git -C "$dev" pack-refs --all   # a real repo's refs are PACKED: it puts a packed-refs file under the ro bind, and leaves
+  # refs/heads/main with no loose file at all — so `no loose ref can be planted` below is the shadowing attack, not a rewrite
   # a MEMBER's board beside it, as board_dir leaves one: the file and lock in ~/.cc/members/<h>/board/, ~/.cc/boards/<h>.json and .lock links to them
   mkdir -p "$H/.cc/members/$mb/board" && printf '{"repo":"%s","tracks":{"t":{"status":"running","title":"m"}}}\n' "$mb" > "$H/.cc/members/$mb/board/$mb.json" \
     && : > "$H/.cc/members/$mb/board/$mb.lock" && ln -sfn "$H/.cc/members/$mb/board/$mb.json" "$H/.cc/boards/$mb.json" \
@@ -1127,7 +1219,38 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     echo ssh=$(e ~/.ssh); echo sock=$(e /var/run/docker.sock)$(e /run/docker.sock); echo tmux=${TMUX:-unset}
     echo dockergrp=$(id -Gn | tr " " "\n" | grep -c "^docker$"); echo pid1=$(ls /proc | grep -c "^[0-9]" | awk "{print (\$1 < 20) ? \"few\" : \"many\"}")
     echo cwd=$PWD; echo status=$(git status --short >/dev/null 2>&1 && echo ok || echo broken); echo common=$(git rev-parse --git-common-dir)
-    echo x > f && git add f && git -c user.name=t -c user.email=t@t commit -qm c >/dev/null 2>&1 && echo commit=ok || echo commit=broken
+    echo x > f && git add f >/dev/null 2>&1
+    cerr=$( (git -c user.name=t -c user.email=t@t commit -qm c >/dev/null) 2>&1 ); crc=$?
+    echo commit=$([ "$crc" = 0 ] && echo ok || echo broken); echo cerrlines=$(printf "%s" "$cerr" | grep -c .)
+    # THE SEQUENCE THE BOX RUNS EVERY DAY: rebase onto the base, commit, amend. The commit after a rebase is the one that
+    # clears CHERRY_PICK_HEAD, and a .git it cannot take a lock in leaves that behind and breaks the amend.
+    echo rebase=$( (git -c user.name=t -c user.email=t@t rebase main) >/dev/null 2>&1 && echo ok || echo broken)
+    echo y > f3; git add f3 >/dev/null 2>&1
+    echo commit2=$( (git -c user.name=t -c user.email=t@t commit -qm c2) >/dev/null 2>&1 && echo ok || echo broken)
+    echo cph=$([ -e "$(git rev-parse --git-path CHERRY_PICK_HEAD)" ] && echo left || echo cleared)
+    echo amend=$( (git -c user.name=t -c user.email=t@t commit -q --amend -m c3) >/dev/null 2>&1 && echo ok || echo broken)
+    mine=$(git rev-parse HEAD); echo mine=$mine; p=~/dev/'"$r"'; d=$p/.git   # THE REF STORE, from inside, AFTER real work
+    echo tagref=$( (git -C $p tag sbxtag) 2>/dev/null && echo made || echo refused)
+    echo movemain=$( (git -C $p update-ref refs/heads/main "$mine") 2>/dev/null && echo moved || echo refused)
+    echo rawmain=$( (printf "%s\n" "$mine" > $d/refs/heads/main) 2>/dev/null && echo wrote || echo refused)
+    echo newref=$( (printf "%s\n" "$mine" > $d/refs/heads/planted) 2>/dev/null && echo wrote || echo refused)
+    echo delother=$( (git -C $p update-ref -d refs/heads/other) 2>/dev/null && echo deleted || echo refused)
+    echo mainhead=$( (printf "ref: refs/heads/track/u\n" > $d/HEAD) 2>/dev/null && echo wrote || echo refused)
+    echo packed=$( (printf "" > $d/packed-refs) 2>/dev/null && echo wrote || echo refused)
+    echo cfgwt=$( (printf "[core]\n\thooksPath = /tmp/evil\n" > $d/config.worktree) 2>/dev/null && echo wrote || echo refused)
+    echo otherwt=$( (printf "ref: refs/heads/main\n" > $d/worktrees/u/HEAD) 2>/dev/null && echo wrote || echo refused)
+    echo sibling=$( (git -C $p update-ref refs/heads/track/u "$mine") 2>/dev/null && echo moved || echo refused)
+    echo packedx=$( (git -C $p update-ref -d refs/heads/track/x) 2>/dev/null && echo deleted || echo refused)   # PACKED: deleting it needs packed-refs, which is ro
+    echo newns=$( (git -C $p update-ref refs/heads/track/planted "$mine") 2>/dev/null && echo made || echo refused)
+    echo delns=$( (git -C $p update-ref -d refs/heads/track/planted) 2>/dev/null && echo deleted || echo refused)   # …a loose one it made itself does go
+    # THE TWO REDIRECT FILES: where the host'"'"'s own git is TOLD this worktree'"'"'s git dir and common dir are. Both sit in a
+    # tree the worker writes, and both still resolve for the worker'"'"'s own git — so each is read here as well as written.
+    # `resolves` FIRST, because with the pins gone the writes below make every later git call in this cwd resolve into
+    # /tmp/evil; the assertion out there restores both files so no case after this one inherits a poisoned fixture.
+    echo resolves=$(git rev-parse --absolute-git-dir)/$(git rev-parse --git-common-dir)
+    echo gitlink=$( (printf "gitdir: /tmp/evil\n" > $PWD/.git) 2>/dev/null && echo wrote || echo refused)
+    echo commondir=$( (printf "/tmp/evil\n" > $d/worktrees/t/commondir) 2>/dev/null && echo wrote || echo refused)
+    echo newname=$( (printf x > $d/shallow) 2>/dev/null && echo wrote || echo refused)   # LAST: a bogus shallow file breaks every git call after it
     echo gitconfig=$(git config user.name z 2>/dev/null && echo writable || echo ro); echo bin=$(touch ~/bin/x 2>/dev/null && echo writable || echo ro)
     echo tracks=$(ls ~/.cc/worktrees/'"$r"' | tr "\n" " "); echo states=$(ls ~/.cc/state/'"$r"' | tr "\n" " "); echo dev=$(ls -A ~/dev/'"$r"' | tr "\n" " ")
     echo tok=${CLAUDE_CODE_OAUTH_TOKEN:+set}; echo cj=$(jq -r "(.projects|length),(.mcpServers|length)" ~/.claude.json | tr "\n" ","); echo cjkeys=$(jq -r "keys|join(\",\")" ~/.claude.json); echo settings=$(touch ~/.claude/settings.json 2>/dev/null && echo writable || echo ro)
@@ -1141,6 +1264,67 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   t 'TMUX unset' "$(g tmux)" unset;  t 'not in the docker group' "$(g dockergrp)" 0;  t 'own pid namespace' "$(g pid1)" few
   t 'cwd is the worktree' "$(g cwd)" "$wt";  t 'git status works' "$(g status)" ok;  t 'the parent .git resolves' "$(g common)" "$dev/.git"
   t 'a commit works' "$(g commit)" ok;  t '.git/config is ro' "$(g gitconfig)" ro;  t 'bin is ro' "$(g bin)" ro
+  # ── THE PARENT REF STORE IS THE HOST'S (build) ──────────────────────────────────────────────────────────────────
+  # Measured against this same file with `.git` bound rw, as it was: every line below came back moved/wrote/deleted and
+  # the host's main really moved, refs/heads/track/u was really gone, and .git/config.worktree really carried a
+  # core.hooksPath for the host's own git to run. Turn the ro-bind back into --bind and they go red again.
+  t 'refs/heads/main cannot be moved from inside — not through git, and not by writing the ref' "$(g movemain)/$(g rawmain)" refused/refused
+  t '…and the host'"'"'s main is where it was, not on the commit the worker just made' \
+    "$(git -C "$dev" rev-parse main)/$([ "$(git -C "$dev" rev-parse main)" = "$(g mine)" ] && echo same || echo differs)" "$m0/differs"
+  t 'no loose ref can be planted in refs/heads either — a name there shadows the packed ref of the same branch' "$(g newref)" refused
+  t 'a branch outside the worker'"'"'s own namespace cannot be deleted' \
+    "$(g delother)/$(git -C "$dev" rev-parse -q --verify refs/heads/other >/dev/null && echo alive || echo gone)" refused/alive
+  t 'the main checkout'"'"'s HEAD cannot be repointed' "$(g mainhead)/$(cat "$dev/.git/HEAD")" 'refused/ref: refs/heads/main'
+  t 'packed-refs cannot be rewritten' "$(g packed)" refused
+  t 'no tag can be created or moved in the parent ref store' "$(g tagref)" refused
+  # THE HALF THAT KEEPS THE WORK WORKING, and the reason .git is a tmpfs rather than a ro bind. With it ro, `git commit`
+  # could not take $GIT_COMMON_DIR/packed-refs.lock to clear CHERRY_PICK_HEAD: it printed `error: Unable to create
+  # …/packed-refs.lock: Read-only file system`, left the pseudo-ref behind, and the NEXT `git commit --amend` refused
+  # with "You are in the middle of a cherry-pick". Measured on git 2.53. Turn the tmpfs back into a ro bind of .git and
+  # all four fields below go red.
+  t 'a commit says nothing on stderr — the .git a worker writes is its own, so the lock it takes to clear a pseudo-ref succeeds' \
+    "$(g cerrlines)" 0
+  t 'rebase onto the base, commit, amend — the sequence the box runs every day, with no CHERRY_PICK_HEAD left behind' \
+    "$(g rebase)/$(g commit2)/$(g cph)/$(g amend)" ok/ok/cleared/ok
+  # DENY BY DEFAULT, which is what the tmpfs buys: only what `build` binds exists in there. A name the real .git does
+  # not have is the worker's to create and is nothing the host will ever read — `shallow` would make the host repo
+  # look shallow if it landed there, and it does not land there.
+  t 'a name the real .git does not have is the worker'"'"'s own and reaches the host nowhere' \
+    "$(g newname)/$([ -e "$dev/.git/shallow" ] && echo left || echo none)" wrote/none
+  t '.git/config.worktree cannot be written — a core.hooksPath there is a hook the HOST'"'"'s git runs' \
+    "$(g cfgwt)/$(sed -n 2p "$dev/.git/config.worktree")" 'refused/	hooksPath = /host/own'
+  t 'another track'"'"'s per-worktree git dir is ro — its HEAD and index are not this worker'"'"'s' "$(g otherwt)" refused
+  # THE REDIRECT ROUND THE WHOLE TMPFS. The worktree tree and this track's admin dir are rw, so the two files that say
+  # WHERE the git dir and the common dir are sit in what the worker writes — and the host runs `git -C "$wt" …` out
+  # there as the owner (cc-loop's checkpoint, `cc done`). Left rw, `gitdir: /tmp/evil` or a rewritten `commondir`
+  # points that git at a directory the worker made, whose config and hooks it also made, and every wall above is moot.
+  # Measured with the two ro pins removed: both came back `wrote`, and the host's git then resolved into /tmp/evil.
+  # Read against the fixture's own paths, so it fails if the pin binds the right file at the wrong place.
+  t 'the worktree gitlink and the admin dir'"'"'s commondir are ro — the HOST'"'"'s git cannot be re-pointed at a directory the worker wrote' \
+    "$(g gitlink)/$(g commondir)/$(cat "$wt/.git")/$(cat "$dev/.git/worktrees/t/commondir")" \
+    "refused/refused/gitdir: $dev/.git/worktrees/t/../.."
+  t '…and they still do their job for the worker'"'"'s own git, which is why they are pinned ro rather than absent' \
+    "$(g resolves)" "$dev/.git/worktrees/t/$dev/.git"
+  # …and PUT THEM BACK, after the two cases above have read them and before anything else runs. With the pins in place
+  # this rewrites what is already there; with them removed it is what keeps the removal proof pointing at these two
+  # cases instead of every later one that shares this scratch repo (measured: 7 red, of which 5 were the poisoned
+  # gitlink, not the guard).
+  printf 'gitdir: %s\n' "$dev/.git/worktrees/t" > "$wt/.git"; printf '../..\n' > "$dev/.git/worktrees/t/commondir"
+  # THE WORK STILL LANDS, which is the half that matters more: the commit made inside moved the HOST's track/t, so the
+  # checkpoint outside has something to push. A wall that costs the worker its branch is worse than the hole.
+  # `mine` alone would be green with no commit at all — HEAD and track/t agree either way — so the branch is also read
+  # against where IT started, t0, not against main. Drop the rw bind of the ref directory and this goes red on that field.
+  t 'the commit the worker made inside is on the host'"'"'s own track/t with a reflog entry, and the branch really advanced' \
+    "$(git -C "$dev" rev-parse refs/heads/track/t)/$(git -C "$dev" reflog show track/t --format=%H 2>/dev/null | head -1)/$([ "$(git -C "$dev" rev-parse refs/heads/track/t)" = "$t0" ] && echo stuck || echo advanced)" \
+    "$(g mine)/$(g mine)/advanced"
+  # THE LIMIT OF THIS WALL, MEASURED RATHER THAN CLAIMED: the branch ref directory is the smallest writable unit the
+  # files backend allows (a bind of the ref FILE makes the rename onto it EBUSY and breaks every commit), so inside
+  # its own namespace — refs/heads/track — a worker can still move a sibling track's branch. Closing that wants a ref
+  # store the host reconciles, which is cc-loop's side of the line. This case says so out loud.
+  t 'still reachable, and this says so: inside its own refs/heads/track namespace a worker moves a sibling, and makes and deletes a loose ref' \
+    "$(g sibling)/$(git -C "$dev" rev-parse refs/heads/track/u)/$(g newns)/$(g delns)" "moved/$(g mine)/made/deleted"
+  t '…but a PACKED sibling it cannot delete, because that would rewrite packed-refs' \
+    "$(g packedx)/$(git -C "$dev" rev-parse -q --verify refs/heads/track/x >/dev/null && echo alive || echo gone)" refused/alive
   t 'only this track is there' "$(g tracks)" t;  t 'only this track state' "$(g states)" t;  t 'the rest of the repo is gone' "$(g dev)" .git
   t 'no token in the environment' "$(g tok)" "";  t 'claude.json copy: no other projects, no MCP' "$(g cj)" '0,0,'
   t 'claude.json copy: only projects and mcpServers, nothing of the account' "$(g cjkeys)" mcpServers,projects
@@ -1154,8 +1338,11 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     "$(g plant)/$([ -e "$H/.cc/boards/planted.json" ] && echo left || echo none)" ro/none
   t 'not one of the pinned descriptors reaches the session — an inherited directory fd walks out of the namespace' "$(g leakfds)" 0
   # ── A BIND SOURCE IS NOT A NAME, ON THIS SIDE TOO (build, and `pin`) ────────────────────────────────────────────
-  # The parent `.git` is the worker's to write, so `config` and `hooks` — the two the host holds READ-ONLY because its
-  # own checkpoint runs git in that repo — are names inside a directory the worker writes. Each shape below is driven,
+  # The parent `.git` is a tmpfs holding mountpoints of the real one, so `config` and `hooks` are names in a directory
+  # no worker can write, and that is NOT what the pin is for. The pin is for the sources that sit in trees the worker
+  # or a sibling session DOES write — the worktree, `.git/objects`, this track's admin dir and the two $NSD
+  # directories. `config` and `hooks` are what these tests plant at because the host holds the two of them READ-ONLY
+  # for its own checkpoint, and the shapes they prove hold for every pinned source. Each shape below is driven,
   # not argued, and each was measured against the same file with only the pins turned back into names: the link ones
   # gave a bwrap message naming neither cause nor cure, and the race handed the session the racer's directory.
   mkdir -p "$dev/decoydir"; : > "$dev/decoyfile"   # a link is only worth testing where it RESOLVES: pin's liveness test follows one
@@ -1174,6 +1361,41 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo hooks=$(mkdir -p ~/dev/'"$r"'/.git/hooks 2>/dev/null; touch ~/dev/'"$r"'/.git/hooks/x 2>/dev/null && echo writable || echo ro)' 2>&1)
   t 'a repo with no .git/hooks gets the ro wall all the same — the name is never left free' "$(g hooks)" ro
   rm -rf "$dev/.git/hooks"; mv "$dev/.git/hooks.gone" "$dev/.git/hooks"
+  # ── WHAT IS BOUND RW IN .git IS NOT TAKEN FROM A FILE THE WORKER WRITES (track_gitdir, branch_warn) ──────────────
+  # The worktree's `.git` gitlink names the per-worktree git dir this launch binds rw, and it lives in a tree the worker
+  # writes. So the name is checked against the host's own side — the dir it names must be a plain entry under
+  # $dev/.git/worktrees whose `gitdir` file points back at this worktree. Aimed at a SIBLING track's dir it is not, and
+  # the launch stops rather than handing this worker that track's HEAD and index.
+  cp "$wt/.git" "$wt/.git.real"; printf 'gitdir: %s\n' "$dev/.git/worktrees/u" > "$wt/.git"
+  out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'a gitlink aimed at another track'"'"'s git dir stops the launch, and binds nothing' \
+    "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'is not a linked worktree' <<<"$out")" 2/0/1
+  mv "$wt/.git.real" "$wt/.git"
+  # …AND THE BRANCH IN ITS HEAD IS NOT A NAME EITHER, which is the same lesson learned the expensive way. The worktree's
+  # own HEAD is rw by design — the worker rebases and checks out with it — so `ref: refs/heads/main/x` is one printf
+  # away, and a build that read the ref DIRECTORY out of it bound the host's refs/heads/main on the NEXT launch and
+  # handed the whole hole back. Two launches below, the shape a cc-loop iteration actually has: one poisons the HEAD,
+  # the next tries to spend it. Both ref shapes are driven, because they fail differently — a LOOSE main is a file to
+  # bind rw, a PACKED one is a name mkdir would plant a directory at in the host's own ref store.
+  hd="$dev/.git/worktrees/t/HEAD"; cp "$hd" "$hd.real"
+  printf '%s\n' "$m0" > "$dev/.git/refs/heads/main"   # loose, as a live repo's own branch is between packs
+  printf 'ref: refs/heads/main/x\n' > "$hd"           # …and this is what one iteration can leave for the next
+  out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'd=~/dev/'"$r"'/.git
+    echo hijack=$( (printf "%s\n" 0000000000000000000000000000000000000001 > $d/refs/heads/main) 2>/dev/null && echo wrote || echo refused)
+    echo hijacklog=$( (printf x > $d/logs/refs/heads/main) 2>/dev/null && echo wrote || echo refused)' 2>&1)
+  t 'the rw ref directory is a constant: a HEAD rewritten to refs/heads/main/x buys the next launch nothing, and the host'"'"'s loose main is untouched' \
+    "$(g hijack)/$(g hijacklog)/$(cat "$dev/.git/refs/heads/main")" "refused/refused/$m0"
+  rm -f "$dev/.git/refs/heads/main"   # …and the packed shape, where the same name is free for a mkdir to take
+  out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo plant=$( (printf "%s\n" 0000000000000000000000000000000000000001 > ~/dev/'"$r"'/.git/refs/heads/main) 2>/dev/null && echo wrote || echo refused)' 2>&1)
+  t '…and nothing is MADE in the host'"'"'s ref store on that say-so either: no refs/heads/main directory, and main still resolves where it did' \
+    "$(g plant)/$([ -e "$dev/.git/refs/heads/main" ] && echo planted || echo none)/$(git -C "$dev" rev-parse main)" "refused/none/$m0"
+  mv "$hd.real" "$hd"
+  # A branch outside that one directory is therefore ro, whatever it is called: the launch SAYS which branch that costs
+  # rather than leaving a commit to fail with nothing to read, and says it AFTER the binds, changing none of them.
+  git -C "$dev" worktree add -q -b flat "$H/.cc/worktrees/$r/v" >/dev/null 2>&1
+  out=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" v -- sh -c 'echo commit=$(echo y > g && git add g && git -c user.name=t -c user.email=t@t commit -qm c >/dev/null 2>&1 && echo ok || echo broken)' 2>&1)
+  t 'a worktree on a branch outside refs/heads/track is told so, and the ref store stays ro for it' \
+    "$(grep -c 'outside refs/heads/track' <<<"$out")/$(g commit)/$(git -C "$dev" rev-parse main)" "1/broken/$m0"
   # THE SWAP, DRIVEN. A second process — here the test, on a real box the host's own git or a sibling track, both of
   # which reach these names — renames the source aside and puts its own directory at that name inside the window
   # CC_SANDBOX_TEST_DELAY opens between the pins and the mount. A rename is the shape that decides it: a link only kills
@@ -1193,8 +1415,9 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
-  git -C "$dev" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$dev" worktree remove --force "$H/.cc/worktrees/$r/u" >/dev/null 2>&1
-  rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.cc/sandbox/$r" "$H/.claude/projects/$(slug "$wt")" "$H/.claude/projects/$(slug "$dev")" \
+  for c in "$wt" "$H/.cc/worktrees/$r/u" "$H/.cc/worktrees/$r/v"; do git -C "$dev" worktree remove --force "$c" >/dev/null 2>&1; done
+  rm -rf "$dev" "$H/.cc/worktrees/$r" "$H/.cc/state/$r" "$H/.cc/sandbox/$r" "$H/.claude/projects/$(slug "$wt")" \
+         "$H/.claude/projects/$(slug "$H/.cc/worktrees/$r/v")" "$H/.claude/projects/$(slug "$dev")" \
          "$H/.cc/members/$mb" "$H/.cc/boards/$mb.json" "$H/.cc/boards/$mb.lock"
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
 case "${1:-}" in selfcheck) selfcheck; exit $?;;
