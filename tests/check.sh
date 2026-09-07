@@ -98,13 +98,33 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
 . tests/green.sh; land_scope "$PWD/bin"; skipped=""
+# THE TALLY SHAPE, read exactly the way selftest.sh's chk() reads it: the tool's OWN line, found by name, with the
+# count anchored so that "10 failed" is never mistaken for a zero. A selfcheck that ends in any other shape —
+# "28/28", "all passed" — is green here and unreadable there, and chk() reports an unreadable tally the way it
+# reports a selfcheck that DIED. That is how a cc-native with 28 of 28 cases passing came back as a red selftest
+# (2026-09-07): a one-line formatting mistake, found by reading the log and then chk() itself. This loop already
+# has the output in hand, so it is the place that can say which tool and which shape. Fix the tool, not chk().
+tally_line(){ grep -o "$1 selfcheck: .*" <<<"$2" | tail -1; }
+tally_ok(){ grep -qE '(: |, )0 failed' <<<"$(tally_line "$1" "$2")"; }
+# CONTROL: the two greps above are a copy of chk()'s, and a copy that stopped discriminating would pass every tool
+# in silence. These are the shapes that matter, including the two that have actually been written by mistake.
+tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 failed" \
+  && ! tally_ok x "x selfcheck: 28/28" && ! tally_ok x "x selfcheck: all passed" \
+  && ! tally_ok x "x selfcheck: 4 passed, 10 failed" && ! tally_ok x "ran 12 cases, none failed" \
+  || { echo "check.sh: the tally-shape rule no longer tells a readable tally from an unreadable one"; exit 1; }
 for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.
   # Its line is printed and stays visible — that is not a pass. Any other tool exiting 77, and cc-fence exiting
   # 77 for any other reason (it refuses to report a skip when the kernel HAS Landlock and declined), fails here.
-  [ "$rc" = 0 ] || { echo "$o"; { [ "$rc" = 77 ] && [ "$c" = cc-fence ]; } || exit 1; }; done
+  [ "$rc" = 0 ] || { echo "$o"; { [ "$rc" = 77 ] && [ "$c" = cc-fence ]; } || exit 1; }
+  tally_ok "$c" "$o" || { g=$(tally_line "$c" "$o")
+    echo "$c: its cases passed, but its tally line is a shape selftest.sh's chk() cannot read, so the suite will"
+    echo "  call this tool dead when it is green. Fix the tool's last line — chk() is right, see its comment."
+    echo "  got:  ${g:-<no \"$c selfcheck: …\" line at all>}"
+    echo "  want: \"$c selfcheck: <n> passed, 0 failed\" or \"$c selfcheck: 0 failed\""
+    exit 1; }; done
 [ -z "$skipped" ] || echo "check.sh: not in this change's reach, not run:$skipped"
 # Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
 # again on the same files the worker already ran it on (tests/green.sh, read by cc-land).
