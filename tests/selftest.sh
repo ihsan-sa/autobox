@@ -216,7 +216,7 @@ mkdir -p ~/.cc/state/$REPO/c1; printf 'Do the c1 thing.\n' > ~/.cc/state/$REPO/c
 # the session's WINDOW, and a landing runs this from systemd, where there is none. The box's tmux is not touched.
 # It answers with the window a READER counts (cc-board agent_id): the mark, tmux session `main`, and a window
 # named for this repo. Anything else and cc-board refuses the mark, which is the point of that refusal.
-mkdir -p "$T/tmuxstub"; printf '#!/bin/sh\n[ "$1" = display-message ] && { printf "@99:4242\\tmain\\t'"$REPO"'\\n"; exit 0; }\nexit 1\n' > "$T/tmuxstub/tmux"; chmod +x "$T/tmuxstub/tmux"
+mkdir -p "$T/tmuxstub"; printf '#!/bin/sh\n[ "$1" = display-message ] && { printf "@99:4242\\tmain\\t'"$REPO"'\\n"; exit 0; }\n[ "$1" = list-windows ] && { printf "@4\\n@99\\n"; exit 0; }\nexit 1\n' > "$T/tmuxstub/tmux"; chmod +x "$T/tmuxstub/tmux"
 rec=$(env PATH="$T/tmuxstub:$PATH" TMUX_PANE=%1 "$B/cc" claim $REPO c1 --executor subagent 2>"$T/c1.err"); crc=$?
 tid=$(jq -r .task_id <<<"$rec" 2>/dev/null)
 { [ "$crc" = 0 ] && [ "$(git -C ~/.cc/worktrees/$REPO/c1 symbolic-ref --short HEAD 2>/dev/null)" = track/c1 ] \

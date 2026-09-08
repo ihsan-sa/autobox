@@ -95,8 +95,20 @@ def agent_id(val, repo):
         sys.exit(f"cc-board set … agent me: tmux would not name this window ({out or 'no answer'})")
     # "a claim made from a window no reader counts is refused … the row is left exactly as it was" — a
     # reader counts a window when it is in `main` AND named for the repo, so refuse when either fails.
-    if f[1] != SESSION or f[2] != repo:
-        sys.exit(f"cc-board set … agent me: refused — this window is '{f[2]}' in tmux session '{f[1]}', and a "
+    # ASK THE QUESTION THE READERS ASK — `tmux list-windows -t main` — NEVER the pane's `#{session_name}`.
+    # Sessions grouped onto main (`tmux new-session -t main`) share its
+    # windows, and tmux answers a pane's session_name with one of the group, not necessarily `main`. That
+    # name refused a live planning session's own claim on 2026-09-07 while cc-pulse and cc-reconcile listed
+    # the very same window under `main` and would have counted its mark.
+    try:
+        q = subprocess.run(["tmux", "list-windows", "-t", SESSION, "-F", "#{window_id}"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        sys.exit(f"cc-board set … agent me: tmux would not list '{SESSION}' ({e})")
+    counted = q.returncode == 0 and f[0].split(":")[0] in (q.stdout or "").split()
+    if not counted or f[2] != repo:
+        sys.exit(f"cc-board set … agent me: refused — this window is '{f[2]}' in tmux session '{f[1]}'"
+                 + ("" if counted else f", which '{SESSION}' does not list") + ", and a "
                  f"mark is only read off a window named '{repo}' in '{SESSION}'. cc-reconcile and cc-pulse would "
                  f"both ignore one made here, so the row would read as unowned and be offered for dispatch while "
                  f"you are still on it. Row unchanged — mark it from the '{repo}' window.")
@@ -735,7 +747,13 @@ def selfcheck():
                                        "PATH": stub + os.pathsep + os.environ.get("PATH", "")},
                                   capture_output=True, text=True)
         # the three fields agent_id asks for: the mark, and the two things a reader tests the window on
-        def win_stub(sess, name, mark="@7:4242"): tmux_stub(f'printf "{mark}\\t{sess}\\t{name}\\n"')
+        # THE STUB ANSWERS BOTH QUESTIONS agent_id ASKS, because the second one is the whole check: the pane's
+        # own line, and `list-windows -t main`, which is what cc-pulse and cc-reconcile ask. `listed=False` is a
+        # window that session does not have.
+        def win_stub(sess, name, mark="@7:4242", listed=True):
+            wid = mark.split(":")[0]
+            tmux_stub(f'[ "$1" = list-windows ] && {{ printf "@4\\n{wid if listed else "@6"}\\n"; exit 0; }}\n'
+                      f'printf "{mark}\\t{sess}\\t{name}\\n"')
         win_stub("main", "r")
         runt("set", "r", "t1", "agent", "me")
         ok("`set … agent me` stores this session's window AND the tmux server that numbered it — window ids "
@@ -795,7 +813,7 @@ def selfcheck():
                                 ("main", "r/t1", "a track session"),
                                 ("main", "other", "a session speaking for another repo"),
                                 ("work", "r", "the right name outside the tmux session cc-pulse lists")):
-            win_stub(sess, name)
+            win_stub(sess, name, listed=(sess != "work"))
             rf = runt("set", "r", "u1", "agent", "me")
             ok(f"a mark from {why} — window '{name}' in '{sess}' — is refused, the reason names both what this "
                "window is and what a read one would be, and the row keeps the mark and the clock it already "
@@ -804,6 +822,20 @@ def selfcheck():
                and "named 'r' in 'main'" in rf.stderr
                and u1() == "@5:900" and u1("agent_at") == "2020-01-01T00:00:00Z"
                and u1("updated") == "2020-01-01T00:00:00Z")
+        # A SESSION GROUPED ONTO `main` IS ON `main`. `tmux new-session -t main` shares main's windows, and tmux
+        # answers a pane's #{session_name} with whichever session of the group it resolves — `main-13`, say.
+        # Testing that NAME refused a live planning session's claim on its own row (2026-09-07) while both
+        # readers, which ask `list-windows -t main`, listed the very same window and
+        # would have counted the mark. The window a reader counts is the window `main` lists, so ask that.
+        win_stub("main-13", "r")
+        rf = runt("set", "r", "u1", "agent", "me")
+        ok("a session grouped onto `main` — tmux answers 'main-13' for its pane — marks its own row, because "
+           "the readers list that window under `main` and would count it",
+           rf.returncode == 0 and u1() == "@7:4242")
+        run("set", "r", "u1", "agent", "@5:900")
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        d["tracks"]["u1"]["agent"] = "@5:900"; d["tracks"]["u1"]["agent_at"] = "2020-01-01T00:00:00Z"
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
         win_stub("main", "r")
         rf = runt("set", "r", "u1", "agent", "me")
         ok("…and from the window a reader DOES count the same command claims exactly as it always did — this "
