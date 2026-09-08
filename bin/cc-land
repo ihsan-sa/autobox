@@ -15,12 +15,16 @@
                                                   refused — push the fix, or land with --re-review
   cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does.
                                                   A job a landing has already refused for a reason a re-queue
-                                                  cannot mend is refused HERE, in a second, and exits non-zero
+                                                  cannot mend is refused HERE, in a second, and exits non-zero.
+                                                  A job that IS queued is told where it stands — its place in the
+                                                  queue, and whether the sweep just started takes it or a sweep
+                                                  already running means it waits for the next one
   cc-land queue --task <repo> <row>               complete a task; JSON receipt on stdout, queue only with a grant
   cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). Every
                                                   queued job is gated and reviewed AT ONCE — side by side where their files
                                                   do not overlap, one after another where they do; the merges and the deploy
-                                                  stay serial, in queue order. A PR is MERGED as soon as its own
+                                                  stay serial, in the order the jobs were QUEUED — oldest first,
+                                                  across repos, never one repo at a time. A PR is MERGED as soon as its own
                                                   gates and review are done rather than when the whole batch is;
                                                   the deploy half waits for every gate still running, because
                                                   install.sh and the restarts are the box itself. A queued PR SURVIVES a usage-limit
@@ -2911,6 +2915,67 @@ def rearm(secs):
                 f"`cc-land work` runs it")
 
 
+def queue_order(paths):
+    """The queue in the order it was ASKED FOR — oldest `queued_at` first, ACROSS repos.
+
+    `sorted(glob(...))` sorts the file NAME, `<repo>-<pr>.json`, so it is repo-name order: every job of repo `a`
+    ran before every job of repo `z` however long `z` had waited, and inside one repo PR #10 ran before PR #9
+    because "10" < "9" as text. On 2026-09-08 the queue held three jobs of one repo, #353 (queued 08:10Z), #358 (08:01Z) and #362
+    (07:47Z); by name that is 353, 358, 362 — the exact reverse of the order they were handed over, the job that
+    had waited longest served last. The serial half merges in this order, and prepare() picks its first
+    PREPARE_AT_ONCE from the front of it, so this is also which jobs get a gate slot when the queue is longer
+    than the pool.
+
+    A job with no readable `queued_at` sorts AFTER everything stamped, by its path: it is a half-written or
+    hand-made file that run_one moves aside, so it must neither jump the line nor raise here. Ties fall back to
+    the path too, so one sweep's order is another's."""
+    def key(p):
+        at = epoch_of((read_json(p) or {}).get("queued_at", ""))
+        return (0, at, p) if at else (1, 0, p)
+    return sorted(paths, key=key)
+
+
+def sweep_running():
+    """The sweep holding the queue right now, as its `since` stamp — or "" when none is.
+
+    Read from a marker cmd_work writes under the flock, and NEVER by probing the flock itself: a worker takes it
+    with LOCK_EX|LOCK_NB and, on failure, stands down for good — it does not retry and it arms no re-run. A
+    probe from here that won the lock for a millisecond would therefore make a real worker exit without draining
+    the queue, and the job would sit until the next 👍. The marker cannot do that to anybody.
+
+    A sweep the machine killed leaves its marker behind, so the pid is checked: gone means no sweep is running."""
+    j = read_json(f"{LANDQ}/.running") or {}
+    pid, since = j.get("pid"), j.get("since") or ""
+    if not isinstance(pid, int) or pid <= 0 or not since:
+        return ""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return ""       # ProcessLookupError, or a pid reused by another user: either way ours is not running
+    return since
+
+
+def queue_place(path, running):
+    """Where this job stands, and WHICH sweep reaches it — the two things "queued" does not say, and the two a
+    caller waiting on a landing actually asks. One line, or "" if the job is not on the queue.
+
+    THE SWEEP IS THE HALF THAT SURPRISES. cmd_work fixes its list of jobs ONCE, under the flock, so a job queued
+    while a sweep is already running is not in that sweep's paths and is not touched by it: it waits for the NEXT
+    sweep, which the running one arms about 5 s after it ends (next_wake, rearm). "worker started" alone read as
+    "it is landing now" when the truth was "after everything the running sweep is already gating" — up to the
+    hour those gates take. `running` is sweep_running() read BEFORE start_worker, so a sweep this very call
+    starts is not mistaken for one that was already in flight."""
+    order = queue_order(glob.glob(f"{LANDQ}/*.json"))
+    try:
+        n = order.index(path) + 1
+    except ValueError:
+        return ""
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return (f"{n}{suffix} of {len(order)} on the queue, oldest first"
+            + (f"; a sweep has been running since {running} and fixed its list of jobs before this one was "
+               f"written, so the NEXT sweep takes it — armed when the running one ends" if running else ""))
+
+
 def preparable(path):
     """Is this job one the prepare phase should read and gate now? Only a PR job the serial phase is about to reach:
     a deferred one (a usage-limit reset that has not come) and one out of tries are both about to be left alone or
@@ -3097,11 +3162,20 @@ def cmd_work(argv):
     except OSError:
         print("cc-land: another worker holds the queue — it lands what is in it, so this one stands down")
         return 0
+    # WHILE THIS SWEEP HOLDS THE QUEUE, SAY SO ON DISK — so that a caller asking where its job stands does not
+    # have to probe the flock to find out, which would make a real worker stand down (sweep_running). The stamp
+    # is the line the list below is fixed on: a job queued after it waits for the next sweep, and that is what
+    # whoever queued it is told.
+    running_at = f"{LANDQ}/.running"
+    try:
+        write_atomic(running_at, {"pid": os.getpid(), "since": stamp()})
+    except OSError:
+        pass                                     # the marker answers a question; it never stops a landing
     lines = []
     try:
         sweep_memos()
         sweep_roots()
-        paths = sorted(glob.glob(f"{LANDQ}/*.json"))
+        paths = queue_order(glob.glob(f"{LANDQ}/*.json"))
         pool = prepare(paths)                    # the reviews and the gates of all of them, at once and changing nothing
         lines += pool.header
         globals()["_PREPARING"] = pool           # …and what each job's deploy half waits on (Land.settle)
@@ -3116,6 +3190,10 @@ def cmd_work(argv):
             for repo in catchup():
                 lines.append(run_one(job_path(repo, "deploy")))
     finally:
+        try:
+            os.unlink(running_at)                # this sweep is over before the lock it held is
+        except OSError:
+            pass
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
     wake = next_wake()
@@ -3229,13 +3307,19 @@ def cmd_queue(argv):
             return 1
         ledger(f"queued {repo}#{pr} who={who or '-'} chat={chat or '-'} by={by}")
         print(f"[{repo}] PR #{pr} queued — the gates run first, then the merge, then the deploy")
+    # WHERE IT STANDS AND WHICH SWEEP TAKES IT (queue_place). Read the running sweep HERE, before start_worker
+    # below, or the sweep this very call starts is reported as one that was already in flight.
+    running = sweep_running()
     # A 👍 ON A PARKED PROJECT IS KEPT, NOT REFUSED. The job file is written above either way, because losing an
     # approval is the one thing a pause must not do; what is skipped is starting the worker, which would only spend
     # a sweep discovering the same pause. Exit 0: the 👍 was taken, and nothing is waiting on anybody.
     if paused(repo):
         print(f"cc-land: {repo} is paused — nothing lands until `cc-pause off {repo}`, and this job waits for it")
         return 0
+    place = queue_place(path, running)
     if not start:
+        if place:
+            print(f"cc-land: {place}. Nothing was started — `cc-land work` is the sweep it waits for")
         return 0
     ok, how = start_worker()
     if not ok:
@@ -3243,6 +3327,9 @@ def cmd_queue(argv):
               file=sys.stderr)
         return 1
     print(f"cc-land: worker started ({how})")
+    if place:
+        print(f"cc-land: {place}"
+              + ("" if running else " — the sweep just started is the one that takes it"))
     return 0
 
 
@@ -5393,6 +5480,97 @@ def cmd_selfcheck():
         check("a second worker finds the lock held and stands down without touching the queue — the one holding "
               "it reaches the same jobs, so a race ends in one merge, not two",
               rcW == 0 and not gh_merges() and os.path.exists(job_path("myrepo", 7)))
+
+        # ---- ORDER. The queue runs in the order it was ASKED FOR, across repos — not the order of the file
+        # NAMES, which is what `sorted(glob(...))` gave. On 2026-09-08 the live queue held three jobs of one repo, #353 (queued
+        # 08:10Z), #358 (08:01Z) and #362 (07:47Z): by name that is 353, 358, 362, the exact reverse of the order
+        # they arrived, with the job that had waited longest served last. Its own fixture queue, built here.
+        odir = tempfile.mkdtemp(prefix="cc-land-selfcheck-o-")
+        globals()["LANDQ"] = odir
+        try:
+            fresh(pr=7)
+            for repo, pr, at in (("zulu", 9, "2026-09-08T07:47:08Z"), ("alpha", 10, "2026-09-08T08:01:45Z"),
+                                 ("alpha", 9, "2026-09-08T08:10:10Z")):
+                write_atomic(job_path(repo, pr), {"repo": repo, "pr": pr, "queued_at": at, "state": "done",
+                                                  "chat": f"C-{repo}-{pr}", "posted": False,
+                                                  "result": {"ok": True, "rc": 0, "text": f"[{repo}] PR #{pr}: landed ✅"}})
+            names = [os.path.basename(p) for p in queue_order(glob.glob(f"{odir}/*.json"))]
+            check("the queue runs oldest-QUEUED first and across repos: zulu#9 waited longest so it goes first, "
+                  "and alpha#10 (queued before alpha#9) goes before it — where the file names alone put every "
+                  "alpha in front of any zulu, and #10 in front of #9 because '10' sorts before '9'",
+                  names == ["zulu-9.json", "alpha-10.json", "alpha-9.json"]
+                  and sorted(names) == ["alpha-10.json", "alpha-9.json", "zulu-9.json"])
+            quiet(cmd_work, [])
+            spoke = [c[3] for c in calls if os.path.basename(c[0]) == "cc-slack" and c[1] == "post" and c[2] == "-c"]
+            check("...and that is the order the SWEEP itself drains them in, not just the sort: each job is "
+                  "reached, finished and answered in the order it was queued",
+                  spoke == ["C-zulu-9", "C-alpha-10", "C-alpha-9"]
+                  and not glob.glob(f"{odir}/*.json"))
+            write_atomic(f"{odir}/alpha-1.json", {"repo": "alpha", "pr": 1})    # half a job: no queued_at
+            write_atomic(job_path("zulu", 9), {"repo": "zulu", "pr": 9, "queued_at": "2026-09-08T07:47:08Z"})
+            names = [os.path.basename(p) for p in queue_order(glob.glob(f"{odir}/*.json"))]
+            check("a job with no queued_at cannot jump the line — it sorts AFTER everything stamped, because "
+                  "run_one only moves such a file aside, and by name alone it would have gone first and put "
+                  "itself in front of a real landing",
+                  names == ["zulu-9.json", "alpha-1.json"])
+
+            # ---- WHICH SWEEP TAKES IT. cmd_work fixes its list of jobs once, under the flock, so a job queued
+            # while a sweep is already running is not in that sweep's paths at all: it waits for the next one.
+            # "worker started" alone read as "it is landing now" when the truth was "after everything the running
+            # sweep is already gating" — up to the hour those gates take.
+            for p in glob.glob(f"{odir}/*.json"):
+                os.unlink(p)
+            fresh(pr=7)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                cmd_queue(["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+            check("a queued job is told where it stands and which sweep takes it: nothing else is on the queue "
+                  "and no sweep was running, so it is 1st of 1 and the sweep this call just started is its own",
+                  "1st of 1 on the queue, oldest first" in out.getvalue()
+                  and "the sweep just started is the one that takes it" in out.getvalue()
+                  and "the NEXT sweep takes it" not in out.getvalue())
+            write_atomic(f"{odir}/.running", {"pid": os.getpid(), "since": "2026-09-08T08:11:00Z"})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                cmd_queue(["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2"])
+            check("...and with a sweep already running it is told the NEXT sweep takes it, and when that sweep "
+                  "started — the running one fixed its list of jobs before this file existed, so saying 'worker "
+                  "started' and nothing else would have promised a landing that sweep will not do",
+                  "2nd of 2 on the queue, oldest first" in out.getvalue()
+                  and "running since 2026-09-08T08:11:00Z" in out.getvalue()
+                  and "the NEXT sweep takes it" in out.getvalue()
+                  and "the sweep just started is the one that takes it" not in out.getvalue())
+            gone = 2 ** 31 - 1                                  # …and a marker a KILLED sweep left behind
+            try:
+                gone = int(open("/proc/sys/kernel/pid_max").read())   # pids run 1..pid_max-1, so this is nobody
+            except (OSError, ValueError):
+                pass
+            write_atomic(f"{odir}/.running", {"pid": gone, "since": "2026-09-08T08:11:00Z"})
+            os.unlink(job_path("myrepo", 8))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                cmd_queue(["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2"])
+            check("a marker a killed sweep left behind is not a running sweep: the pid is checked, so the job is "
+                  "told the truth — the sweep just started is its own — rather than waiting for one that ended",
+                  "the sweep just started is the one that takes it" in out.getvalue()
+                  and "the NEXT sweep takes it" not in out.getvalue())
+            os.unlink(job_path("myrepo", 8))
+            os.unlink(f"{odir}/.running")
+            seen, real_memos = [], sweep_memos
+            globals()["sweep_memos"] = lambda: seen.append(sweep_running())   # a seam INSIDE the held queue
+            try:
+                quiet(cmd_work, [])
+            finally:
+                globals()["sweep_memos"] = real_memos
+            check("...and a sweep says on disk that it is running, for exactly as long as it holds the queue: a "
+                  "👍 arriving mid-sweep is answered from that, never by probing the flock — a probe that won "
+                  "the lock for a millisecond would make a real worker stand down and drain nothing — and the "
+                  "marker is gone when the sweep is, or every later job would wait for a sweep that finished",
+                  len(seen) == 1 and seen[0] and not os.path.exists(f"{odir}/.running")
+                  and not glob.glob(f"{odir}/*.unreadable"))
+        finally:
+            globals()["LANDQ"] = qdir
+            shutil.rmtree(odir, ignore_errors=True)
 
         # ---- killed at each stage, resumed. The question "did the merge happen" is never guessed at.
         fresh(pr=7)
