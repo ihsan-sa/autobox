@@ -246,6 +246,16 @@ member_gate(){   # $1 repo — a member workspace dispatches only within MEMBER_
   exec 8>&-
   return 0
 }
+# THE BRIEF'S HOME IS MEMBER-WRITABLE, and `>` FOLLOWS A LINK. ~/.cc/state/<repo> is bound read-WRITE into a member's
+# boundary (cc-sandbox), so the track directory under it — and the files in it — are theirs to replace with one, while
+# `cc <handle> <track> [--go …]` runs out HERE, as the owner: a link left at <handle>, at <handle>/<track> or at
+# <track>/task.md.tmp turned an operator's dispatch into a write wherever it pointed (security review of #225).
+# cc-checkpoint's journal_blocked walls the same class for the journal and this is that pattern, in the same order —
+# the first check comes BEFORE the mkdir, which would otherwise make a directory through the link.
+state_dir_ok(){   # $1 repo · $2 track → 0 when ~/.cc/state/<repo>/<track> is really itself, with no link on the way
+  { [ ! -L "$STBASE/$1" ] && mkdir -p "$STBASE/$1/$2" 2>/dev/null \
+    && [ "$(readlink -f "$STBASE/$1/$2")" = "$(readlink -f "$STBASE")/$1/$2" ]; } && return 0
+  echo "cc: refusing $1/$2's state dir — ~/.cc/state/$1/$2 is a symlink, sits behind one, or could not be made"; return 1; }
 write_brief(){   # $st/task.md from $text — THE BRIEF HAS ONE HOME (see the --go case for the history)
   # THE SHAPE IS CHECKED AT THE DOOR, not remembered by whoever is dispatching (cc-brief): a note that prescribes
   # the steps is refused here, with the lines that made it one, before anything is written. CC_BRIEF_FORCE=1 turns
@@ -260,15 +270,23 @@ write_brief(){   # $st/task.md from $text — THE BRIEF HAS ONE HOME (see the --
     printf '%s\n' "$text" | "$BIN/cc-brief" check - --for "$repo/$track" || return 1
     printf '%s\n' "$text" | "$BIN/cc-brief" judge - --for "$repo/$track"; [ $? = 1 ] && return 1
   fi
-  mkdir -p "$st"
+  state_dir_ok "$repo" "$track" || return 1   # …and the directory it goes in is this track's own: the two walls above
   "$BOARD" get "$repo" "$track" instructions >/dev/null 2>&1   # migrates a pre-#94 board copy into the file, once
   if [ -n "$text" ]; then
+    # The last two walls are the file's: task.md is READ back into the write below, so a link there hands an
+    # owner-only file to whoever can read the brief; and task.md.tmp is what `>` opened. Both are checked, and the
+    # write itself is opened O_NOFOLLOW (dd), so a link raced in after the checks is refused by the KERNEL. `mv` is
+    # rename(2): it replaces a link left at task.md rather than writing through it, so it needs no wall of its own.
+    if [ -L "$st/task.md" ] || [ -L "$st/task.md.tmp" ]; then
+      echo "cc: refusing $repo/$track's brief — $st/task.md or its .tmp is a symlink"; return 1; fi
     t0=$(printf '%s' "$text"); n=$(printf '%s' "$t0" | wc -c)   # both sides trailing-newline-stripped by $( )
     if [ "$(head -c "$n" "$st/task.md" 2>/dev/null)" != "$t0" ]; then   # not already on top (a re-dispatch
       { printf '%s\n' "$text"                                          # repeating its note): don't stack it up.
-        if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } > "$st/task.md.tmp"   # this only ever looks
-      mv "$st/task.md.tmp" "$st/task.md"                                # at the head, which this same code
-    fi                                                                  # wrote — never at the brief below it
+        if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } \
+        | dd oflag=nofollow "of=$st/task.md.tmp" status=none 2>/dev/null \
+        || { echo "cc: could not write $st/task.md.tmp — $repo/$track's brief is unchanged"; return 1; }
+      mv "$st/task.md.tmp" "$st/task.md"                                # this only ever looks at the head, which
+    fi                                                                  # this same code wrote — never at the brief below it
   else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi
   "$BIN/cc-brief" refresh "$repo" "$track" 2>/dev/null   # …and the IN FLIGHT block is recomputed at every dispatch,
   return 0; }                                            # including a bare --go "" — that is when it must be true
@@ -284,12 +302,10 @@ GITNH=(-c core.hooksPath=/dev/null)
 member_gitdir(){   # $1 repo $2 worktree → 0 when a member workspace's track really hangs off ~/dev/<handle>/.git (an ordinary repo always passes)
   # The gitlink and the admin dir behind it are written from INSIDE the boundary (`cc <h> <t> --go` runs ensure_track in there), so `.git`
   # can name a member git dir whose config carries core.fsmonitor or an ext:: remote — code the host-side `cc done` would run as the
-  # owner, hooksPath pin or not (review-156c). Nothing but this rev-parse touches the worktree until its common dir is the workspace's own.
-  member_workspace "$1" || return 0
-  local main gcd; main=$(git "${GITNH[@]}" -C "$DEV/$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$DEV/$1/.git")
-  gcd=$(git "${GITNH[@]}" -C "$2" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-  [ "$gcd" = "$main" ] && return 0
-  echo "cc: refusing to run git in $2 — its .git resolves to ${gcd:-nothing}, not $main: a member workspace's track hangs off ~/dev/$1/.git or nothing runs in it"; return 1; }
+  # owner, hooksPath pin or not (review-156c). Nothing but that rev-parse touches the worktree until its common dir is the workspace's own.
+  # cc-checkpoint owns the check, because its --sweep timer needs the same wall and two copies of a rule this load-bearing drift (review of #225).
+  local why; why=$("$BIN/cc-checkpoint" gitdir "$1" "$2" 2>/dev/null) && return 0
+  echo "cc: $why"; return 1; }
 default_branch(){   # $1 = ~/dev/<repo>. THE BOARD'S BASE IS THE PROJECT'S: cc-land already lands against it, so it is what
   # a track is cut from too. origin/HEAD is only what a remote calls its default, and for a repository the box made that
   # is the FIRST branch pushed into it — a track. Cut from one of those, a new track in a workspace carried another
@@ -434,7 +450,7 @@ ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry
     mkdir -p "$wt/.cc"; printf '%s\n%s\n' "$repo" "$track" > "$wt/.cc/track"
     "$BIN/cc-trust" "$wt" >/dev/null 2>&1 || true
   fi
-  mkdir -p "$STBASE/$repo/$track"
+  state_dir_ok "$repo" "$track" || exit 1   # the same walls write_brief uses: this is the mkdir they are checked before
   "$BOARD" json "$repo" >/dev/null 2>&1 || "$BOARD" init "$repo" "$DEV/$repo" "$(default_branch "$DEV/$repo")" >/dev/null
   [ -n "$("$BOARD" get "$repo" "$track" branch 2>/dev/null)" ] || "$BOARD" add "$repo" "$track" "$track" "" >/dev/null
   "$BOARD" set "$repo" "$track" worktree "$wt"
@@ -582,7 +598,15 @@ case "${1:-}" in
       while IFS=$'\t' read -r k es ew ey; do [ -n "${k:-}" ] && { EFF["$k"]=$es; WHO["$k"]=$ew; WHY["$k"]=$ey; }
       done < <("$BIN/cc-reconcile" view 2>/dev/null)
       while IFS=$'\t' read -r r t s ti; do [ -z "$r" ] && continue; p=""   # the checkpoint hook fails quietly by design; these two files are how you hear about it
-        [ -f "$WTBASE/$r/$t/.cc/checkpoint.err" ] && p="  commit!"; [ -f "$WTBASE/$r/$t/.cc/push.err" ] && p="$p  push!"
+        # …AND FOR A MEMBER WORKSPACE `push!` IS THE HOST'S ALONE, WHILE `commit!` IS EITHER SIDE'S. One rule, stated
+        # once in cc-reconcile's host_marker/commit_marker and followed here, in cc-digest, in cc-slack's Home tab and
+        # in cc-reconcile: a host-side cc-checkpoint run in a member's tree keeps its state under ~/.cc/push-state, so
+        # the member's credential-less push.err — rewritten every turn, cleared by nothing on the host — is not read
+        # (it lit `push!` for ever on a branch the sweep had pushed, round 10 of #225), but a refused commit is real
+        # wherever it happened: the host's `cc done` writes one (round 11) and the member's own hook writes the other,
+        # and reading only the host's hid a member's refusal from every reader (round 12). Existence only, no content.
+        wd="$WTBASE/$r/$t/.cc"; md="$wd"; member_workspace "$r" && md="$HOME/.cc/push-state/$r/$t"
+        { [ -f "$md/checkpoint.err" ] || [ -f "$wd/checkpoint.err" ]; } && p="  commit!"; [ -f "$md/push.err" ] && p="$p  push!"
         s="${EFF[$r/$t]:-$s}"; w="${WHY[$r/$t]:-}"; w="${w:0:50}"   # :- matters: with a stale snapshot every key here is unset, and `set -u` would kill the whole listing
         case "$s" in waiting) p="  ❓ ${w:-waiting on you}$p";; esac
         [ "${WHO[$r/$t]:-}" = clock ] && p="  ⏳ held by the usage limit$p"   # whatever word it wears: a loop sitting out the limit is not working
@@ -614,10 +638,32 @@ case "${1:-}" in
     [ "$done_json" = 0 ] || { [ "$done_managed" = 1 ] || { echo "cc: --json needs a task record" >&2; exit 1; }; exec 1>&2; }
     [ "$done_managed" = 0 ] || trap done_result EXIT
     wt="$WTBASE/$repo/$track"; [ -d "$wt" ] || { echo "no worktree for $repo/$track"; exit 1; }
+    # WHERE THIS RUN'S OWN STATE GOES, and for a member workspace it is not the member's tree. Everything written
+    # from here is written as the OWNER through a shell redirection, which follows a symlink — the lock below, and
+    # push.err/pushed/create.err/evict.err from the cc-checkpoint calls further down — while
+    # ~/.cc/worktrees/<handle> is bound read-WRITE in the member's live boundary: a link left at one of those names
+    # has the host truncate whatever it points at. ~/.cc/push-state is under no bind, and --sweep hands
+    # cc-checkpoint that same directory (security review of #225). Every other repo on the box is the box's own
+    # tree and keeps its state where it always did.
+    # …AND ONLY WHEN THIS `cc` IS THE HOST'S COPY. For a member workspace the normal `cc done` runs INSIDE the
+    # boundary — cc-loop is launched under `cc-sandbox member` and calls it from there — where $HOME is a tmpfs with
+    # no push-state bind at all: the redirect made $sd a per-sandbox scratch directory, so done.lock stopped
+    # serialising against the host's own `cc done` and against the sweep, the checkpoint.err and push.err that run
+    # wrote died with the sandbox and lit `commit!`/`push!` in no reader (the round 11-12 bug, back again for a
+    # member --go worker), and "also in $perr" named a path that no longer exists (review round 13). In there the
+    # worktree's own .cc is the member's own tree and this process is the member: it is theirs to write, as before.
+    hostsd=0; member_workspace "$repo" && ! inside && hostsd=1
+    sd="$wt/.cc"; [ "$hostsd" = 1 ] && sd="$HOME/.cc/push-state/$repo/$track"
+    nolink "$sd" || exit 1   # …and main's wall goes BEFORE the mkdir, which would otherwise make $sd through a link
+    mkdir -p "$sd" || { echo "cc: cannot make $sd — nothing opened"; exit 1; }
     # Two callers reach this for one track — the loop when the worker writes STATUS: DONE, a session when it finishes by
     # hand — and each used to open its own PR (#24/#25, #29/#30, same head SHA). One at a time, then reuse what is there.
-    nolink "$wt/.cc" "$wt/.cc/done.lock" || exit 1; mkdir -p "$wt/.cc"; exec 9>>"$wt/.cc/done.lock"
-    flock -w "${CC_DONE_LOCK_WAIT:-600}" 9 || { echo "cc: another 'cc done $repo $track' is still running — nothing opened"; exit 1; }   # CC_DONE_LOCK_WAIT: test hook
+    nolink "$sd/done.lock" || exit 1; exec 9>>"$sd/done.lock"   # `>>` and the link check are main's: nothing is written through this fd, it exists only to be flocked
+    # …AND A THIRD, for a member workspace: the 5-minute push sweep takes this same lock around its own `--push`,
+    # because both write $sd/push.err.tmp and $sd/pushed and a tick landing inside this run deleted the file this
+    # run's push was about to read (review round 11 of #225). It takes the lock without waiting and skips the track,
+    # so it is only ever the holder here for the length of one push — named below rather than blamed on a `cc done`.
+    flock -w "${CC_DONE_LOCK_WAIT:-600}" 9 || { echo "cc: another 'cc done $repo $track' — or the push sweep — is still running for this track; nothing opened"; exit 1; }   # CC_DONE_LOCK_WAIT: test hook
     if [ "$done_managed" = 1 ]; then
       TASK_RECORD=$("$BIN/cc-task" show "$repo" "$track") || exit 1
       done_generation=$(jq -er '.claim.generation' <<<"$TASK_RECORD") || exit 1
@@ -629,6 +675,22 @@ case "${1:-}" in
     # host-side commit would run as the owner (review-156b) — same pin cc-loop applies to its own git calls
     hp=$(git -C "$DEV/$repo" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$DEV/$repo/.git/hooks";; /*) ;; *) hp="$DEV/$repo/$hp";; esac
     HG=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp")
+    # …and EVERY cc-checkpoint call below is told about it, not just --push. The plain call commits and then pushes
+    # too, so it writes push.err.tmp and pushed; --remote creates the project's repository, so it writes create.err
+    # and base-seed. Only --push carried the state dir, and the plain call three lines above it went on writing
+    # inside ~/.cc/worktrees/<handle>/<track>/.cc — the write this closes (review of #225).
+    psd=(); perr="$sd/push.err"
+    # THE HOST'S LEASE IS NEVER DERIVED FROM A MEMBER FILE. An earlier cut of this copied <wt>/.cc/pushed (a file
+    # cc-sandbox binds read-WRITE into the member's boundary) into $sd/pushed, which lease_push then hands to
+    # --force-with-lease verbatim — so a member who wrote the sha currently on track/<project> made `cc done`
+    # force-push over a commit this worktree never wrote (round 9 of #225). There is no safe migration: the fix is
+    # to keep no member content at all. A track whose host lease predates the state move simply has none here, and
+    # cc-checkpoint's rc=3 ("no host lease to reconcile") surfaces below as a named, non-forcing refusal — the same
+    # quiet path the sweep takes. NO PUSH LIFTS IT: a diverged branch never fast-forwards, so this run and every
+    # sweep tick after it answer rc=3 for ever, and telling the operator to wait for one was a circle the sweep
+    # pointed at us and we pointed back (review round 10 of #225). The one exit is `cc-checkpoint adopt`, where a
+    # person reads what the remote holds and records it; that is what the line below names, and what the sweep names.
+    [ "$hostsd" = 1 ] && psd=("CC_CHECKPOINT_STATE_DIR=$sd")   # the same one decision as $sd above: never in-boundary
     if [ "$done_managed" = 1 ]; then
       if jq -e '.closed' <<<"$TASK_RECORD" >/dev/null; then
         dirty=$(git -C "$wt" status --porcelain --untracked-files=all) || done_fail commit "cannot inspect closed worktree"
@@ -637,19 +699,19 @@ case "${1:-}" in
         done_write error commit
         done_project; echo "closed: $repo/$track (receipt retained)"; exit 0
       fi
-      ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --commit ) \
-        || done_fail commit "checkpoint failed — no PR opened (see $wt/.cc/checkpoint.err)"
+      ( cd "$wt" && env CC_ROLE=worker "${psd[@]}" "${HG[@]}" "$BIN/cc-checkpoint" --commit ) \
+        || done_fail commit "checkpoint failed — no PR opened (see $sd/checkpoint.err)"
       dirty=$(git -C "$wt" status --porcelain --untracked-files=all) \
         || done_fail commit "cannot inspect worktree — no PR opened"
       [ -z "$dirty" ] && [ "$(git -C "$wt" symbolic-ref --short HEAD)" = "$branch" ] \
         || done_fail commit "checkpoint left changes uncommitted or HEAD off track — no PR opened"
       tip=$(git -C "$wt" rev-parse HEAD) || done_fail commit "no committed head"
       done_write artifact --committed-sha "$tip"; done_write error commit
-    else ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" ) || true; fi
+    else ( cd "$wt" && env CC_ROLE=worker "${psd[@]}" "${HG[@]}" "$BIN/cc-checkpoint" ) || true; fi
     # WHERE the branch goes is cc-checkpoint's rule and nobody else's: `origin` for the box's own repos, and a
     # member workspace project's OWN repository (made here if it has none) for a workspace. Asking `origin` the
     # question instead sent the PR at whichever repository a workspace happened to wire up first (review of #214).
-    rem=$( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --remote 2>/dev/null ) || rem=""
+    rem=$( cd "$wt" && env CC_ROLE=worker "${psd[@]}" "${HG[@]}" "$BIN/cc-checkpoint" --remote 2>/dev/null ) || rem=""
     if member_workspace "$repo" && [ -z "$rem" ] && [ "$rowkind" != session ]; then   # a workspace lives on the box alone: the branch IS the delivery
       done_board done; "$BOARD" note "$repo" "$track" "cc done: no remote, so no PR — the work is on track/$track in ~/dev/$repo" >/dev/null 2>&1 || true
       echo "done: $repo has no remote, so no PR — track/$track is committed in ~/dev/$repo"; exit 0; fi
@@ -659,9 +721,17 @@ case "${1:-}" in
       # lease refuses: something else wrote to the branch. It has already journalled and told the board; do not
       # open a PR over the top of it.
       member_gitdir "$repo" "$wt" || exit 1   # the same wall in front of the push (review-156c)
-      ( cd "$wt" && env CC_ROLE=worker "${HG[@]}" "$BIN/cc-checkpoint" --push ) || {
+      ( cd "$wt" && env CC_ROLE=worker "${psd[@]}" "${HG[@]}" "$BIN/cc-checkpoint" --push ); prc=$?
+      # rc 3 is not a failure and not a foreign write: this member track's lease predates the move to ~/.cc/push-state,
+      # so the host has none of its own to reconcile a diverged branch against — and it will not read the member's old
+      # one (a forged value would force over another writer, round 9 of #225). Nothing is pushed and nothing is
+      # overwritten; the branch waits for its next real host push to record a lease. Named, so it is not a scare.
+      [ "$prc" = 3 ] && {
+        [ "$done_managed" = 0 ] || done_write error push "no host lease to reconcile — nothing pushed, no PR opened"
+        echo "cc: not pushed — track/$track diverged from its remote and the host holds no lease saying what it last put there, so nothing was forced and nothing overwritten. One way on: 'cc-checkpoint adopt $repo $track' says what the remote holds and records it once you have read that commit, then run 'cc done $repo $track' again. No PR opened."; exit 1; }
+      [ "$prc" = 0 ] || {
         [ "$done_managed" = 0 ] || done_write error push "push failed — no PR opened"
-        echo "cc: push failed — no PR opened (reason above; also in $wt/.cc/push.err)"; exit 1; }
+        echo "cc: push failed — no PR opened (reason above; also in $perr)"; exit 1; }
     fi
     if [ "$done_managed" = 1 ]; then
       [ -n "$rem" ] || done_fail push "no remote — no PR opened"
@@ -918,7 +988,7 @@ case "$mode" in
        have_window "$win" && pane_live "$win" || { echo "cc: no running session in $win (open it with: cc $repo $track)"; exit 1; }; exec "$BIN/cc-msg" "$win" "$text" ;;
   go)  if inside; then   # INSIDE the boundary: no tmux, no ledger. The brief is written here (this state dir is the workspace's own);
          # the launch is brokered — the daemon runs `cc <h> <track> --go ""` on the host: budget gate, window and boundary included.
-         mkdir -p "$st"; write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}"; fi
+         write_brief || exit 1; exec "$BIN/cc-slack" dispatch "$repo/$track" --loop "$LOOPN" "${XTRA[@]}"; fi
        if have_window "$win" && pane_live "$win"; then echo "cc: $win already has a live session — use --say to instruct it, or cc rm/handoff first"; exit 1; fi
        if member_workspace "$repo"; then member_credential "$repo" "$track" || exit 1; fi   # before the cap: nothing is charged for a launch that cannot happen
        member_gate "$repo" || exit 1

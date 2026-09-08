@@ -425,6 +425,52 @@ def alert(msg):
         pass
 
 
+def host_marker(repo, track, name, home=None):
+    """Where the HOST's <name> marker for this track is — where the host WRITES, and the only place `push!` is read.
+    ONE RULE, and every reader follows it: `cc ls`, `cc digest`, the Slack Home tab and this tool. `commit!` reads
+    this AND the member's own copy — see commit_marker.
+
+    For a MEMBER WORKSPACE it is ~/.cc/push-state/<repo>/<track>/<name> and never <wt>/.cc/<name>. Every host-side
+    cc-checkpoint run in a member's tree writes its state there (CC_CHECKPOINT_STATE_DIR, set by `cc done` and by
+    the 5-minute sweep), because ~/.cc/worktrees/<repo> is bound read-WRITE in the member's live boundary and a link
+    raced in at one of those names would be written through as the owner. So the files of those names inside the
+    worktree are the MEMBER's, written and cleared by their own in-boundary hook and by nothing on the host.
+    Read as the host's, they broke both ways: the member's push.err — their hook has no credential by design, that
+    is why the host pushes for them, so it is rewritten every turn and never cleared — lit `push!` for ever and made
+    this tool ask "its branch is not pushed" every 20 minutes about a branch the sweep had pushed (review round 10
+    of #225); and once the host's own commit refusal moved to ~/.cc/push-state, a `cc done` that refused to commit a
+    staged secret lit `commit!` nowhere at all (round 11). Every other repo on the box keeps its markers in the
+    worktree, where the hook that writes them clears them."""
+    h = home or HOME
+    if os.path.exists(f"{h}/dev/{repo}/.cc/member-workspace"):
+        return f"{h}/.cc/push-state/{repo}/{track}/{name}"
+    return f"{h}/.cc/worktrees/{repo}/{track}/.cc/{name}"
+
+
+def push_marker(repo, track, home=None):
+    """The failed-push marker — the `push!` in cc ls / cc digest and push_err below. See host_marker."""
+    return host_marker(repo, track, "push.err", home)
+
+
+def commit_marker(repo, track, home=None):
+    """The refused-checkpoint marker — the `commit!` in cc ls / cc digest and commit_err below. TWO PLACES, EITHER
+    LIGHTS IT, and every reader does the same OR: the host's (host_marker) and, in a member workspace, the file the
+    member's OWN in-boundary Stop hook writes at <wt>/.cc/checkpoint.err (cc-checkpoint's refuse()).
+
+    Both halves refuse a commit and each can only write where it runs. Reading only the host's made a member's own
+    refusal invisible everywhere — a session that stages .env.local is refused, nothing is committed, and cc ls, cc
+    digest, the Home tab and this tool all said nothing, while the 5-minute sweep skipped the track because a refusal
+    moves no HEAD (review round 12 of #225). push.err stays host-only: the member's is credential-less by design, so
+    it is rewritten every turn and nothing clears it, and reading it nagged for ever about a pushed branch (round 10).
+
+    The member's file is theirs, so only its EXISTENCE is read — never its content, anywhere a host reader would
+    print or trust it. Returns whichever path exists, the host's first, and the host's when neither does."""
+    h = home or HOME
+    host = host_marker(repo, track, "checkpoint.err", h)
+    member = f"{h}/.cc/worktrees/{repo}/{track}/.cc/checkpoint.err"    # == host outside a member workspace
+    return next((p for p in (host, member) if os.path.exists(p)), host)
+
+
 def branch_unpushed(wt):
     """Does this worktree really hold commits origin does not have? True yes · False no · None cannot tell.
 
@@ -828,9 +874,9 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
                 "live": f"{repo}/{track}" in live, "wt_exists": os.path.isdir(wt),
                 "age": max(0.0, t0 - epoch(t.get("updated") or t.get("created"))), "grace": grace,
                 "journal": journal(repo, track), "loop_end": loop_end(repo, track),
-                "commit_err": os.path.exists(f"{wt}/.cc/checkpoint.err"),
-                "push_err": os.path.exists(f"{wt}/.cc/push.err"), "has_remote": remotes[repo],
-                "unpushed": branch_unpushed(wt) if os.path.exists(f"{wt}/.cc/push.err") else False,
+                "commit_err": os.path.exists(commit_marker(repo, track)),
+                "push_err": os.path.exists(push_marker(repo, track)), "has_remote": remotes[repo],
+                "unpushed": branch_unpushed(wt) if os.path.exists(push_marker(repo, track)) else False,
                 "workers": workers.get(key, []), "loops": loops.get(key, []), "limited": limited,
                 "orphans": workers.get(key, []) if not loops.get(key) else [],
                 "idle": idle_for(repo, track, wt) if workers.get(key) else 0.0,
@@ -1232,6 +1278,48 @@ def selfcheck():
        not unp(push_err=False, unpushed=True))
     ok("…while a branch the box could not judge (never fetched, detached HEAD) keeps the marker's answer, because "
        "silence about a real unpushed branch is the worse of the two", unp(push_err=True, unpushed=None))
+    # …AND WHOSE MARKER IT IS. For a member workspace the file in the worktree is the MEMBER's: their Stop hook has no
+    # credential by design, so it writes push.err every turn, and the host writes its own state outside that tree, so
+    # nothing clears it either side. Read here it made "its branch is not pushed" a finding every 20 min about a
+    # branch the 5-minute sweep had pushed — and `branch_unpushed` cannot judge those branches (they push to a remote
+    # named after the project, so `refs/remotes/origin/<branch>` never resolves and the answer is None, which keeps
+    # the marker's word). The host's own marker is under ~/.cc/push-state (review of #225).
+    with tempfile.TemporaryDirectory() as tm:
+        os.makedirs(f"{tm}/dev/ws/.cc"); open(f"{tm}/dev/ws/.cc/member-workspace", "w").close()
+        ok("a member workspace's failed-push marker is the HOST's own, under ~/.cc/push-state — the file in the "
+           "worktree is the member's, and nothing on the host writes or clears it",
+           push_marker("ws", "t", tm) == f"{tm}/.cc/push-state/ws/t/push.err")
+        ok("…while every other repo keeps it in the worktree, where the hook that writes it clears it",
+           push_marker("plain", "t", tm) == f"{tm}/.cc/worktrees/plain/t/.cc/push.err")
+        # …BUT THE REFUSED CHECKPOINT IS EITHER SIDE'S, because both sides refuse. `cc done` runs cc-checkpoint's
+        # commit mode with the state dir, so the host's refusal is ~/.cc/push-state/<repo>/<track>/checkpoint.err —
+        # read only in the worktree it lit `commit!` nowhere, and a `cc done` that refused to commit a staged secret
+        # opened the PR with nothing said (round 11). The member's in-boundary Stop hook writes <wt>/.cc/checkpoint.err
+        # and can write nowhere else — read only in push-state, a member session that stages .env.local is refused and
+        # NOTHING says so anywhere, while the sweep skips the track because a refusal moves no HEAD (round 12).
+        wtd, psd = f"{tm}/.cc/worktrees/ws/t/.cc", f"{tm}/.cc/push-state/ws/t"
+        os.makedirs(wtd); os.makedirs(psd)
+        def cm():   # the path AND whether it lit, read together: a path captured alone is falsified by the next rm
+            p = commit_marker("ws", "t", tm)
+            return p, os.path.exists(p)
+        cm_none = cm()
+        open(f"{wtd}/checkpoint.err", "w").close(); open(f"{wtd}/push.err", "w").close()   # the member's own two
+        cm_member, pm_member = cm(), push_marker("ws", "t", tm)
+        open(f"{psd}/checkpoint.err", "w").close()
+        cm_both = cm()
+        os.unlink(f"{wtd}/checkpoint.err")
+        cm_host = cm()
+        ok("a member workspace's `commit!` is lit by EITHER refusal — the host's under ~/.cc/push-state (what `cc "
+           "done` writes) or the member's own in-boundary <wt>/.cc/checkpoint.err, the only place their hook can "
+           "write; with neither there is nothing to light and the host's path is what a writer gets",
+           cm_none == (f"{psd}/checkpoint.err", False) and cm_member == (f"{wtd}/checkpoint.err", True)
+           and cm_both == (f"{psd}/checkpoint.err", True) and cm_host == (f"{psd}/checkpoint.err", True))
+        ok("…while the failed push stays the HOST's alone, with the member's own push.err sitting right there and "
+           "lighting nothing: theirs is credential-less by design, so it is rewritten every turn and cleared by "
+           "nothing on the host, and reading it nagged for ever about a branch the sweep had pushed",
+           pm_member == f"{psd}/push.err" and not os.path.exists(pm_member))
+        ok("…and every other repo has one place for both, the worktree, where the hook that writes them clears them",
+           commit_marker("plain", "t", tm) == f"{tm}/.cc/worktrees/plain/t/.cc/checkpoint.err")
     # A FINISHED ROW IS JUDGED AS FINISHED: cc-land deletes the branch on merge, so `origin/<branch>` is gone,
     # branch_unpushed() can only say None, and a push.err nothing clears made "its branch is not pushed" a finding
     # about a PR that HAD merged. Both halves, each on its own fixture — what is silenced, and what still fires.

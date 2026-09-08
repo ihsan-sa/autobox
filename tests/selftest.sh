@@ -824,6 +824,120 @@ st=$(env HOME="$GH" "$B/cc-board" get alice t4 status)
   && ok "cc done on a kind=session row pushes the delivery and leaves the row alive — a living project is never 'done'" \
   || bad "cc done ended a session row: rc=$rd status=$st $od"
 git -C "$GH/dev/alice" worktree remove --force "$GH/.cc/worktrees/alice/t4" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t4 >/dev/null 2>&1; rm -rf "$T/t4.git"
+printf '[user]\n\tname = t\n\temail = t@t\n' > "$GH/.gitconfig"   # the two cases below need the host-side checkpoint to actually COMMIT, which needs an identity under this fixture's HOME
+# NOTHING `cc done` RUNS WRITES INSIDE A MEMBER'S TREE. cc-checkpoint's commit mode ends in the same push --push does,
+# so the plain call `cc done` makes first writes .cc/pushed and .cc/push.err.tmp too — and only the --push call three
+# lines later was told to keep that state out of the tree. ~/.cc/worktrees/<handle> is bound read-WRITE in the
+# member's live boundary, so on a dirty worktree a link left at one of those names had the host truncate whatever it
+# pointed at, as the owner (review of #225). kind=session so the run ends at the delivery, with no PR to open.
+git init -q --bare "$T/t6.git"
+git -C "$GH/dev/alice" worktree add -q -b track/t6 "$GH/.cc/worktrees/alice/t6" 2>/dev/null
+w6="$GH/.cc/worktrees/alice/t6"; mkdir -p "$w6/.cc"; printf 'alice\nt6\n' > "$w6/.cc/track"
+git -C "$w6" remote add t6 "$T/t6.git"
+git -C "$w6" -c user.email=t@t -c user.name=t commit -q --allow-empty -m t6
+echo "not yours" > "$T/victim6"; ln -sf "$T/victim6" "$w6/.cc/pushed"
+echo dirty > "$w6/work.txt"   # a dirty worktree is what makes the plain checkpoint commit, and then push
+env HOME="$GH" "$B/cc-board" add alice t6 "a living project" >/dev/null; env HOME="$GH" "$B/cc-board" set alice t6 kind session
+od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t6 2>&1); rd=$?
+{ [ "$(cat "$T/victim6")" = "not yours" ] && [ "$(cat "$GH/.cc/push-state/alice/t6/pushed" 2>/dev/null)" = "$(git -C "$w6" rev-parse HEAD)" ]; } \
+  && ok "cc done writes none of the checkpoint's state in a member's tree: a link left at .cc/pushed is not written through, and the lease is the host's own" \
+  || bad "cc done wrote through a link in the member's tree: victim='$(cat "$T/victim6")' rc=$rd $od"
+git -C "$GH/dev/alice" worktree remove --force "$w6" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t6 >/dev/null 2>&1; rm -rf "$T/t6.git"
+# …AND INSIDE THE BOUNDARY IT KEEPS THAT STATE IN THE WORKTREE, because in there is nowhere else. For a member
+# workspace the NORMAL 'cc done' runs inside it — cc-loop is launched under `cc-sandbox member` and calls it from
+# there — where $HOME is a tmpfs with no ~/.cc/push-state bind at all. Redirected there anyway: done.lock stopped
+# serialising that run against the host's own 'cc done' and against the 5-minute sweep, and the checkpoint.err and
+# push.err it wrote died with the sandbox, so a member --go worker whose commit was refused for a staged secret lit
+# `commit!` in no reader — the round 11-12 bug, back again (review round 13 of #225). In there the tree is the
+# member's own and this process IS the member, so <wt>/.cc is exactly right and is where it wrote before this PR.
+git init -q --bare "$T/t9.git"
+git -C "$GH/dev/alice" worktree add -q -b track/t9 "$GH/.cc/worktrees/alice/t9" 2>/dev/null
+w9="$GH/.cc/worktrees/alice/t9"; mkdir -p "$w9/.cc"; printf 'alice\nt9\n' > "$w9/.cc/track"
+git -C "$w9" remote add t9 "$T/t9.git"
+git -C "$w9" -c user.email=t@t -c user.name=t commit -q --allow-empty -m t9
+echo dirty > "$w9/work.txt"   # the same shape as t6: a dirty worktree is what makes the plain checkpoint commit, and then push
+env HOME="$GH" "$B/cc-board" add alice t9 "a living project" >/dev/null; env HOME="$GH" "$B/cc-board" set alice t9 kind session
+od=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 PATH="$B:$PATH" "$B/cc" done alice t9 2>&1); rd=$?
+{ [ "$rd" = 0 ] && [ "$(cat "$w9/.cc/pushed" 2>/dev/null)" = "$(git -C "$w9" rev-parse HEAD)" ] && [ ! -e "$GH/.cc/push-state/alice/t9" ]; } \
+  && ok "...while the same run INSIDE the boundary keeps it in the worktree — there is no ~/.cc/push-state in there, so a redirect would lock nothing and write the markers into a tmpfs that dies with the sandbox" \
+  || bad "an in-boundary cc done put its state outside the worktree: rc=$rd $od"
+git -C "$GH/dev/alice" worktree remove --force "$w9" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t9 >/dev/null 2>&1; rm -rf "$T/t9.git" "$GH/.cc/push-state/alice/t9"
+# …AND A MEMBER-WRITABLE <wt>/.cc/pushed IS NEVER THE HOST'S LEASE (round 9 of #225). An earlier cut copied its
+# CONTENTS into ~/.cc/push-state and handed them to --force-with-lease, so a member who wrote the sha currently on
+# the remote made cc done force-push over a commit this worktree never wrote. The migration is gone: a track whose
+# host lease predates the move has none here, cc done refuses WITHOUT forcing (a named line, not "push refused"),
+# and the remote is left exactly as it is. Its next real host push records the lease and it is ordinary again.
+git init -q --bare "$T/t7.git"
+git -C "$GH/dev/alice" worktree add -q -b track/t7 "$GH/.cc/worktrees/alice/t7" 2>/dev/null
+w7="$GH/.cc/worktrees/alice/t7"; mkdir -p "$w7/.cc"; printf 'alice\nt7\n' > "$w7/.cc/track"
+git -C "$w7" remote add t7 "$T/t7.git"
+git -C "$w7" -c user.email=t@t -c user.name=t commit -q --allow-empty -m a7
+git -C "$w7" push -q t7 track/t7; a7=$(git -C "$w7" rev-parse HEAD)   # the commit on the remote now
+printf '%s\n' "$a7" > "$w7/.cc/pushed"   # THE FORGERY: the member writes the remote's current sha into the old lease location
+git -C "$w7" -c user.email=t@t -c user.name=t commit -q --amend --allow-empty -m "a7 rebased"   # local diverges; a force would discard a7
+env HOME="$GH" "$B/cc-board" add alice t7 "a living project" >/dev/null; env HOME="$GH" "$B/cc-board" set alice t7 kind session
+od=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t7 2>&1); rd=$?
+{ [ "$(git -C "$T/t7.git" rev-parse track/t7)" = "$a7" ] && [ "$rd" != 0 ] && ! grep -qE 'push refused|something else wrote' <<<"$od"; } \
+  && ok "cc done never force-pushes from a member-written .cc/pushed — a forged lease is not trusted, the remote stands, and it says so by name" \
+  || bad "cc done forced from a member file or mis-reported: remote=$(git -C "$T/t7.git" rev-parse track/t7) a7=$a7 rc=$rd $od"
+# …AND THAT REFUSAL IS NOT A DEAD END. It used to point at a push that can never happen: the sweep said a session's
+# `cc done` would push it, `cc done` said the next checkpoint push would record the lease, and a diverged branch never
+# fast-forwards — so a pre-#225 track was unlandable by any automated path and both messages promised otherwise
+# (review round 10 of #225). One exit, named in both: `cc-checkpoint adopt`, where a PERSON reads the commit the
+# remote holds and records it — checked against the remote at that instant, never read out of the member's tree.
+grep -qF "cc-checkpoint adopt alice t7" <<<"$od" \
+  && ok "...and it names the one way out of rc=3, not a push that can never happen" \
+  || bad "cc done's rc=3 line names no exit, or a circular one: $od"
+ad=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc-checkpoint" adopt alice t7 2>&1); ra=$?
+{ [ "$ra" = 1 ] && grep -qF "$a7" <<<"$ad" && [ ! -e "$GH/.cc/push-state/alice/t7/pushed" ]; } \
+  && ok "cc-checkpoint adopt says what the remote holds and, until a person answers with it, records nothing" \
+  || bad "adopt's reading step recorded a lease or said nothing: rc=$ra $ad"
+ad=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc-checkpoint" adopt alice t7 "$a7" 2>&1); ra=$?
+od2=$(env HOME="$GH" PATH="$B:$PATH" "$B/cc" done alice t7 2>&1); rd2=$?
+{ [ "$ra" = 0 ] && [ "$rd2" = 0 ] && [ "$(git -C "$T/t7.git" rev-parse track/t7)" = "$(git -C "$w7" rev-parse HEAD)" ]; } \
+  && ok "...and the sha the operator read is the exit: cc done then pushes the rebased branch, with no member file trusted" \
+  || bad "adopt did not unblock cc done: adopt rc=$ra $ad / done rc=$rd2 $od2"
+git -C "$GH/dev/alice" worktree remove --force "$w7" >/dev/null 2>&1; git -C "$GH/dev/alice" branch -q -D track/t7 >/dev/null 2>&1; rm -rf "$T/t7.git"
+# A MEMBER PROJECT'S `push!` IS THE HOST'S ALONE; ITS `commit!` IS EITHER SIDE'S — one rule, and every reader follows
+# it (cc-reconcile's host_marker/commit_marker states it). A host-side cc-checkpoint run in a member's tree keeps its
+# state under ~/.cc/push-state/<handle>/<project>, so the push.err in the worktree is theirs: their Stop hook has no
+# credential by design — the host pushes for it — so that file is rewritten every turn and nothing on the host clears
+# it, which lit `push!` for ever on a branch the sweep had pushed (round 10 of #225). A REFUSED COMMIT IS REAL WHEREVER
+# IT HAPPENED: `cc done`'s host-side call writes one under push-state (it lit nowhere at all, round 11) and the member's
+# own in-boundary hook writes <wt>/.cc/checkpoint.err and can write nowhere else — reading only the host's left a member
+# who staged a secret refused, uncommitted and unmentioned in every reader, with the sweep skipping the track because a
+# refusal moves no HEAD (round 12). Their file's existence lights the row; none of its content is read.
+mkdir -p "$GH/.cc/worktrees/alice/t8/.cc"; printf 'alice\nt8\n' > "$GH/.cc/worktrees/alice/t8/.cc/track"
+env HOME="$GH" "$B/cc-board" add alice t8 "a project of alice's" >/dev/null
+mrow(){ local t=$1; shift   # the one t8 row out of cc ls ("alice   t8 ")
+  env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" "$B/$t" "$@" 2>/dev/null | grep -E 'alice[/ ] *t8[ *]'; }
+# THE TWO READERS SAY IT DIFFERENTLY AND READ THE SAME TWO FILES. `cc ls` marks the row `commit!`/`push!`; the daily
+# report names no row at all (#303) and counts the project as stopped — "the work it is doing is not being saved".
+# So the digest is read by its OWN count of stopped work, which is what this rule can move there, and never by a
+# marker it no longer prints. dgm keeps the whole report, for the leak check: no reader renders a member's bytes.
+dgm=""; dgstop(){ dgm=$(env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" "$B/cc-digest" 2>/dev/null)
+  local n; n=$(head -1 <<<"$dgm" | grep -oE '[0-9]+ stopped'); printf '%s' "${n%% *}"; }
+q0=$(dgstop)   # the fixture's own stopped count, before any marker of t8's exists
+touch "$GH/.cc/worktrees/alice/t8/.cc/push.err"   # the member's own, which nothing on the host writes or clears
+lsm=$(mrow cc ls); qa=$(dgstop)
+{ [ -n "$lsm" ] && ! grep -qE 'push!' <<<"$lsm" && [ "$qa" = "$q0" ]; } \
+  && ok "a member's credential-less push.err lights nothing in either reader — their hook cannot push by design, so that file is theirs and the host's readers do not read it as a failed push" \
+  || bad "a member's own push.err lit the host's readers: ls='$lsm' stopped=$qa was=$q0"
+printf 'staged .env.local — refused\n' > "$GH/.cc/worktrees/alice/t8/.cc/checkpoint.err"   # …and their own refusal, in the only place their hook can write it
+lsm=$(mrow cc ls); qb=$(dgstop)
+{ ! grep -qE 'push!' <<<"$lsm" && grep -q 'commit!' <<<"$lsm" && [ "$qb" = "$(( q0 + 1 ))" ] \
+  && ! grep -q 'env.local' <<<"$lsm" && ! grep -q 'env.local' <<<"$dgm"; } \
+  && ok "…while a member's own refused checkpoint is visible in cc ls and counted as stopped work in the digest — their in-boundary hook writes it and nothing else can — and neither reader renders a byte of what the member wrote" \
+  || bad "the member's own refusal is invisible, or their push.err/content leaked: ls='$lsm' stopped=$qb was=$q0 digest='$dgm'"
+rm -f "$GH/.cc/worktrees/alice/t8/.cc/checkpoint.err"
+mkdir -p "$GH/.cc/push-state/alice/t8"   # the HOST's own failed push and refused commit, under no bind
+touch "$GH/.cc/push-state/alice/t8/push.err" "$GH/.cc/push-state/alice/t8/checkpoint.err"
+lsm=$(mrow cc ls); qc=$(dgstop)
+{ grep -q 'push!' <<<"$lsm" && grep -q 'commit!' <<<"$lsm" && [ "$qc" = "$(( q0 + 1 ))" ]; } \
+  && ok "...while the host's own markers light push! and commit! on their own, and the digest counts the project stopped, in either reader" \
+  || bad "the host's markers are invisible: ls='$lsm' stopped=$qc was=$q0"
+rm -rf "$GH/.cc/worktrees/alice/t8" "$GH/.cc/push-state/alice/t8"
+rm -f "$GH/.gitconfig"   # back to the fixture the rest of this stanza was written against
 o5=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 1e9 2>&1); r5=$?
 o6=$(env HOME="$GH" CC_MEMBER_SANDBOX=1 "$B/cc-loop" alice todo --budget 5.5 2>&1)
 [ "$r5" = 2 ] && grep -q 'budget must be' <<<"$o5" && ! grep -q 'budget must be' <<<"$o6" \
@@ -1334,6 +1448,35 @@ tm4=~/.cc/state/$REPO/g4/task.md
 "$B/cc-board" set $REPO g4 instructions "an explicitly replaced brief" >/dev/null
 [ "$(cat "$tm4")" = "an explicitly replaced brief" ] \
   && ok "…and 'cc-board set … instructions' is the explicit way to replace one" || bad "set instructions: $(cat "$tm4")"
+
+# …AND NONE OF THAT IS WRITTEN THROUGH A LINK. ~/.cc/state/<repo> is bound read-WRITE into a member's boundary
+# (cc-sandbox), so the track directory under it is theirs to replace with one — while `cc <h> <t> --go` runs out
+# here, as the owner, and `>` follows a link: a dispatch an operator typed became a write wherever it pointed
+# (security review of #225; cc-checkpoint's journal_blocked walls the same class for the journal).
+mkdir -p "$T/decoyB"
+rm -rf ~/.cc/state/$REPO/gL; ln -s "$T/decoyB" ~/.cc/state/$REPO/gL
+gl=$("$B/cc" $REPO gL --go "a note that must not leave the state dir" 2>&1); grc=$?
+{ [ $grc != 0 ] && grep -q 'symlink' <<<"$gl" && [ -z "$(ls -A "$T/decoyB")" ]; } \
+  && ok "a link left at the track's state dir is refused in one line, and the brief goes nowhere near it" \
+  || bad "a dispatch wrote through a linked state dir (rc=$grc): $gl | $(ls -A "$T/decoyB")"
+mv ~/.cc/state/$REPO "$T/statedir"; ln -s "$T/decoyB" ~/.cc/state/$REPO   # …the same bind lets them swap the REPO directory
+gl=$("$B/cc" $REPO gM --go "nor this one" 2>&1); grc=$?
+{ [ $grc != 0 ] && [ -z "$(ls -A "$T/decoyB")" ]; } \
+  && ok "…nor a link at the repo's own state dir, checked BEFORE the mkdir that would otherwise make a directory through it" \
+  || bad "a dispatch made the track dir through a linked repo dir (rc=$grc): $gl | $(ls -A "$T/decoyB")"
+rm -f ~/.cc/state/$REPO; mv "$T/statedir" ~/.cc/state/$REPO; rm -f ~/.cc/state/$REPO/gL
+godisp gL "a plain note in a plain state dir"
+[ "$(typed < ~/.cc/state/$REPO/gL/task.md 2>/dev/null)" = "a plain note in a plain state dir" ] \
+  && ok "…while a plain track still gets its task.md, which is the whole point of writing it" \
+  || bad "the wall stopped an ordinary dispatch: $(cat ~/.cc/state/$REPO/gL/task.md 2>/dev/null)"
+# The LOCK beside it is the same member-writable path, and `>` both follows a link and TRUNCATES: a link left at
+# .lock had an operator's dispatch empty whatever it pointed at, as the owner.
+printf 'not yours\n' > "$T/victimL"; mkdir -p ~/.cc/state/$REPO/gK; ln -sf "$T/victimL" ~/.cc/state/$REPO/gK/.lock
+gl=$("$B/cc" $REPO gK --go "a note whose dispatch must stop at the lock" 2>&1); grc=$?
+{ [ $grc != 0 ] && grep -q 'symlink' <<<"$gl" && [ "$(cat "$T/victimL")" = "not yours" ]; } \
+  && ok "…and a link left at the track's .lock is refused as well, so nothing is emptied through it and no worker starts" \
+  || bad "a dispatch opened a linked lock (rc=$grc): $gl | victim=[$(cat "$T/victimL")]"
+rm -f ~/.cc/state/$REPO/gK/.lock
 
 # THE SHAPE IS CHECKED AT BOTH DOORS a brief comes in by (cc-brief). The rule it enforces is written down twice
 # already and a session that had read both still dispatched a page of steps, so the check is mechanical and lives

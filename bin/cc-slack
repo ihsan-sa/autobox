@@ -3444,6 +3444,16 @@ def home_tracks(workers, prs, idle=None, loops=None):
                 except Exception:
                     pass                                  # a run file still being written is not an error
             wt, pr, status = f"{HOME}/.cc/worktrees/{repo}/{tr}/.cc", str(t.get("pr") or ""), t.get("status", "?")
+            # WHERE THIS ROW'S `commit!`/`push!` COME FROM. One rule, stated in cc-reconcile's host_marker and
+            # commit_marker and followed by every reader: for a member workspace `push!` is the HOST's alone, under
+            # ~/.cc/push-state, because a host-side cc-checkpoint run keeps its state out of a tree bound read-write
+            # in the member's boundary, and the member's own push.err is credential-less by design — rewritten every
+            # turn, cleared by nothing on the host — which showed `push!` on this row for ever (round 10 of #225).
+            # `commit!` is EITHER side's: the host's `cc done` writes one (round 11) and the member's in-boundary
+            # hook writes the other, and reading only the host's hid a member's own refusal here (round 12). Their
+            # file's EXISTENCE lights the row and nothing of its content is ever rendered.
+            mdir = (f"{HOME}/.cc/push-state/{repo}/{tr}"
+                    if os.path.exists(f"{HOME}/dev/{repo}/.cc/member-workspace") else wt)
             num = pr.rstrip("/").rsplit("/", 1)[-1]        # the board stores a number or the full PR url
             key, live = f"{repo}/{tr}", f"{repo}/{tr}" in workers
             looping = key in loops
@@ -3463,8 +3473,9 @@ def home_tracks(workers, prs, idle=None, loops=None):
             prst = str(prs.get((repo, pr), "") if pr else "").upper()
             bits = ["board stale" if (home_track_stale(status, live) or (state == "blocked" and not reason)) else "",
                     # …and says so, instead of silently picking one — the journal contradicting the board counts too
-                    "commit!" if os.path.exists(f"{wt}/checkpoint.err") else "",
-                    "push!" if os.path.exists(f"{wt}/push.err") else "",
+                    # mdir/wt: whose markers these are, above — commit! from either, push! from the host's alone
+                    "commit!" if os.path.exists(f"{mdir}/checkpoint.err") or os.path.exists(f"{wt}/checkpoint.err") else "",
+                    "push!" if os.path.exists(f"{mdir}/push.err") else "",
                     f"idle {home_age(sat)}" if state == "idle" else "",
                     # the count is a CLAIM THAT ITERATIONS ARE HAPPENING, so only a live loop may make it: the run files
                     # outlive the loop and kept saying `1 it` two days after it was aborted (owner, 2026-09-01)
@@ -10987,6 +10998,27 @@ def cmd_selfcheck():
         hlanding = howed()
         os.unlink(f"{hr}/.cc/state/land/abox-9.json")
         hstopped = howed()
+        # …and A MEMBER PROJECT'S ROW READS `push!` FROM THE HOST ALONE, `commit!` FROM EITHER SIDE — the one rule
+        # cc-reconcile's host_marker/commit_marker states and every reader follows. A host-side cc-checkpoint run
+        # keeps its state out of ~/.cc/worktrees/<repo>, which is bound read-write in the member's boundary, so the
+        # push.err in there is the member's own: credential-less by design, rewritten every turn, cleared by nothing
+        # on the host, it showed `push!` on this row for ever (round 10 of #225). A refused commit is real wherever
+        # it happened — the host's `cc done` writes one (round 11), the member's in-boundary hook the other, and
+        # reading only the host's hid a member's own refusal from this row (round 12).
+        os.makedirs(f"{hr}/dev/ws/.cc"); open(f"{hr}/dev/ws/.cc/member-workspace", "w").close()
+        os.makedirs(f"{hr}/.cc/worktrees/ws/t/.cc")
+        json.dump({"repo": "ws", "tracks": {"t": {"status": "running", "updated": "2026-08-30T21:00:00Z"}}},
+                  open(f"{hr}/.cc/boards/ws.json", "w"))
+        hdet = lambda: next(r["detail"] for r in home_tracks(set(), {})[0] if r["name"] == "ws/t")
+        for nm in ("checkpoint.err", "push.err"):
+            open(f"{hr}/.cc/worktrees/ws/t/.cc/{nm}", "w").close()
+        hmember = hdet()
+        os.makedirs(f"{hr}/.cc/push-state/ws/t")
+        for nm in ("checkpoint.err", "push.err"):
+            open(f"{hr}/.cc/push-state/ws/t/{nm}", "w").close()
+        hhost = hdet()
+        os.unlink(f"{hr}/.cc/worktrees/ws/t/.cc/checkpoint.err")   # …and the host's own alone still lights it
+        hhostonly = hdet()
     finally:
         globals()["HOME"] = _homeR
         subprocess.run(["rm", "-rf", hr], check=False)
@@ -10998,6 +11030,13 @@ def cmd_selfcheck():
           "project that queues its own landing (`cc done`, CC_SELF_LAND_REPOS) does not also ask the owner for the "
           "reaction that grant retired; and a landing that ENDS takes its job file with it, so the row comes back",
           (hopen, hlanding, hstopped) == (True, False, True))
+    check("home_tracks: a member project's `push!` is the HOST's marker alone, under ~/.cc/push-state — the push.err "
+          "in their worktree is theirs, written credential-less every turn and cleared by nothing on the host, so it "
+          "never lights this row; but `commit!` lights from EITHER side, because a member session refused its own "
+          "commit inside the boundary and only their hook can say so (rounds 10-12 of #225)",
+          "push!" not in hmember and "commit!" in hmember
+          and "commit!" in hhost and "push!" in hhost
+          and "commit!" in hhostonly and "push!" in hhostonly)
     check("home_reason: a block CLEARS ITSELF, and STOPPED IS NOT ASKING — the journal's newest STATUS line outranks "
           "the board, so a worker that ran on to STATUS: DONE stops asking; and a track that never wrote a STATUS line "
           "was stopped by the loop's step limit, not by a question, so it does not claim the owner is being asked",

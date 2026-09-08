@@ -7,6 +7,24 @@
 #   cc-checkpoint --remote where the push goes: the remote's name (making the repository if this is a member
 #                          workspace project with none), or nothing and exit 1 if there is nowhere. `cc done`
 #                          asks, so the PR it opens is against the repository the push went to
+#   cc-checkpoint --sweep  the HOST's push for the sessions a person drives: every member workspace track whose HEAD is
+#                          not what it last pushed gets `--push` run from its worktree, with that workspace's own
+#                          credential. cc-checkpoint.timer runs it every 5 min (config/units.json): inside a workspace's
+#                          boundary the Stop hook commits but cannot push — the credential is host-only by design
+#                          (cc-sandbox) — and only a worker's loop (cc-loop) pushed from out here, so two commits an
+#                          interactive member session made sat on the box until a person pushed by hand (2026-09-04).
+#                          It pushes and NOTHING ELSE: a worktree whose .git is not the workspace's own is refused
+#                          before any git runs in it, so is one whose .cc state files are symlinks the host would
+#                          write through; and no repository is created from the timer, no default branch moved and
+#                          no branch deleted from anywhere (review of #225)
+#   cc-checkpoint adopt <handle> <track> [<sha>]   the ONE way out of --push's rc=3 (no host lease). With no sha it
+#                          says what the remote holds and what this worktree holds, so a PERSON can read that commit;
+#                          given the sha they read, and only while the remote still answers with it, it records the
+#                          host's lease and the next push reconciles the branch. It pushes nothing itself and reads
+#                          nothing out of the member's tree
+#   cc-checkpoint gitdir <handle> <worktree>   0 when that worktree really hangs off ~/dev/<handle>/.git, else 1 and
+#                          the reason. The wall `cc done` puts in front of its own git (core/bin/cc), asked here so
+#                          both callers keep one rule and one message (review-156c)
 #   cc-checkpoint selfcheck  that rule, on fixtures of its own (check.sh runs it)
 # It also records how full the session's context is (cc-context --record) and what it still owes Slack
 # (cc-owed --check), for EVERY session, track or not: the Stop payload's `transcript_path` is the only
@@ -64,7 +82,7 @@
 SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 MODE=commit; STRICT=0
-case "${1:-}" in --commit) STRICT=1;; --push) MODE=push;; --remote) MODE=remote;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
+case "${1:-}" in --commit) STRICT=1;; --push) MODE=push;; --remote) MODE=remote;; --sweep) MODE=sweep;; gitdir) MODE=gitdir;; adopt) MODE=adopt;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
 # ── no push waits for a person ───────────────────────────────────────────────────────────────────
 PUSH_TIMEOUT=${CC_PUSH_TIMEOUT:-120}   # seconds. A track's push is seconds of work, so this is a wall, not a budget.
 git_unattended(){   # git that can ask nobody anything and cannot run past the bound. Exit codes are git's, plus
@@ -93,6 +111,23 @@ bound_hit(){   # $1 a git_unattended exit code, $2 the file its stderr went to. 
 # else's commit without a murmur — measured, not assumed. Given an explicit value git compare-and-swaps against
 # what is REALLY on the remote, so a refusal means exactly one thing: something this worktree did not write is on
 # that branch. That is never overwritten and never swallowed — see lease_refused.
+# WHERE THIS FILE KEEPS ITS STATE — $ST, and EVERY name it writes: pushed, adopted, push.err, push.err.tmp,
+# checkpoint.err, create.err, create.err.tmp, base-seed, evict.err, evict.err.tmp, evict.same. All of them are written with shell
+# redirections, and a redirection FOLLOWS A SYMLINK — while ~/.cc/worktrees/<h> stays bound read-WRITE in the
+# member's live boundary, so a session looping `ln -sf ~/.ssh/authorized_keys .cc/push.err.tmp` wins the window
+# between any check and the write on one of the 288 daily ticks and has the host truncate that file as the owner
+# (security review of #225). A pre-check cannot close that, so a host-side caller hands this a directory of its own
+# under ~/.cc/push-state, which is under no bind: nothing inside the member's tree is written to at all. BOTH host
+# callers do it, for every mode — --sweep, and `cc done` for the plain commit (which pushes too), --remote and
+# --push alike (review of #225). Unset — the member's own Stop hook — it is the worktree's own .cc, where the only
+# writer is the session that owns the tree. Only .cc/track is ever READ out of the worktree, and never trusted.
+# …SO THAT IS ALSO WHERE `push!` IS READ FROM. push.err on a member workspace's row is this file's write under
+# ~/.cc/push-state and never the one in the member's tree: theirs has no credential by design, so it is rewritten
+# every turn and cleared by nothing on the host. `commit!` (checkpoint.err) is read from EITHER place, because both
+# sides refuse and each can only write where it runs — the refusal the member's own hook makes here is the only
+# record that it happened, and it moves no HEAD for the sweep to notice. cc-reconcile's host_marker/commit_marker
+# states the rule and `cc ls`, cc-digest, cc-reconcile and the Home tab follow it. Existence only, never content.
+ST=''   # set once $root is known: ${CC_CHECKPOINT_STATE_DIR:-$root/.cc}
 remote=origin   # every track on the box, until pick_remote says otherwise
 workspace=''    # set only for a member workspace's track: the token is then minted for that workspace alone
 WSREPO=''; WSTRACK=''   # this worktree's repo and track AS THE PATH SPELLS THEM — see the header
@@ -107,6 +142,32 @@ path_ids(){   # $1 worktree root → WSREPO/WSTRACK from $HOME/.cc/worktrees/<re
   case "$WSREPO/$WSTRACK" in .*|*/.*) return 1 ;; esac   # no dotted half, so no . and no ..
   [ -n "$WSREPO" ] && [ -n "$WSTRACK" ]
 }
+spend_seed(){   # remove $ST/base-seed — but only while $ST is still the directory it was checked as
+  # `rm -f "$ST/base-seed"` resolves $ST AT REMOVAL TIME. With no state dir given, $ST is the worktree's own .cc
+  # and a member's session is live beside this: swap .cc for a link to any directory the owner can write and the
+  # host unlinks a file called base-seed in there (security review of #225). A marker that is not spent costs a
+  # repeated base push, which is cheap; unlinking somebody else's file is not.
+  [ -L "$ST" ] || rm -f "$ST/base-seed"; return 0; }
+member_tree(){   # $1 path → 0 when it sits inside a member workspace's checkout (~/dev/<handle>, marker and all)
+  local real base h
+  real=$(readlink -f "$1" 2>/dev/null) || return 1
+  base=$(readlink -f "$HOME/dev" 2>/dev/null) || return 1
+  case "$real" in "$base"/*) h=${real#"$base"/}; h=${h%%/*} ;; *) return 1 ;; esac
+  [ -n "$h" ] && [ -f "$HOME/dev/$h/.cc/member-workspace" ]; }
+member_gitdir(){   # $1 handle · $2 worktree → 0 when that track really hangs off ~/dev/<handle>/.git · 1 and the reason on stdout
+  # THE ONE COPY OF THIS RULE. `cc done` asks for it too (core/bin/cc: member_gitdir → `cc-checkpoint gitdir`), so the
+  # host has one wall and one message in front of every git it runs in a member's tree.
+  # A workspace track's gitlink and the admin dir behind it are written from INSIDE the boundary, so `.git` can name a
+  # git dir of the MEMBER's, whose config carries core.fsmonitor or an `ext::sh -c …` remote — code host-side git runs
+  # as the owner, hooksPath pin or not (review-156c). Nothing but this rev-parse touches the worktree until its common
+  # dir is the workspace's own; once it is, the config the remotes come from is ~/dev/<handle>/.git/config, which
+  # cc-sandbox holds read-only inside the boundary, so what it says is the host's word and not the member's.
+  local main gcd nh=(-c core.hooksPath=/dev/null)
+  [ -f "$HOME/dev/$1/.cc/member-workspace" ] || return 0   # an ordinary repo on the box always passes
+  main=$(git "${nh[@]}" -C "$HOME/dev/$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$HOME/dev/$1/.git")
+  gcd=$(git "${nh[@]}" -C "$2" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  [ "$gcd" = "$main" ] && return 0
+  echo "refusing to run git in $2 — its .git resolves to ${gcd:-nothing}, not $main: a member workspace's track hangs off ~/dev/$1/.git or nothing runs in it"; return 1; }
 pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push · 1 there is not
   local url
   # A MEMBER WORKSPACE FIRST, and only then that workspace's own rules: the track-named remote below belongs
@@ -125,15 +186,20 @@ pick_remote(){   # cwd = worktree root ($root).  0 there is somewhere to push ·
     # workspace's first project, not this one.
     # A reason it could not REPLACES the last one, in a file of its own: this runs every turn until the project
     # has a repository, so appending would grow for ever on a box with no app — and push.err belongs to the push.
-    if url=$("$BIN/cc-gh-token" create "$WSREPO" "$WSTRACK" 2>"$root/.cc/create.err.tmp"); then
-      rm -f "$root/.cc/create.err.tmp" "$root/.cc/create.err"
+    # …BUT NEVER FROM A TIMER. `--sweep` sets CC_CHECKPOINT_NO_CREATE, because unattended this line would put a
+    # private repository in the owner's org every five minutes, under a name the MEMBER chose — and naming a
+    # repository in his org is an org-admin action he reserves to himself (review of #214, header above; review of
+    # #225). A project with none is left for `cc done` or the next owner-present run, which still makes it.
+    [ -z "${CC_CHECKPOINT_NO_CREATE:-}" ] || return 1
+    if url=$("$BIN/cc-gh-token" create "$WSREPO" "$WSTRACK" 2>"$ST/create.err.tmp"); then
+      rm -f "$ST/create.err.tmp" "$ST/create.err"
       remote="$WSTRACK"; git remote get-url "$WSTRACK" >/dev/null 2>&1 || remote=origin   # origin: the workspace had no remote at all, so this is its first
       git remote get-url "$remote" >/dev/null 2>&1 || return 1
-      : > "$root/.cc/base-seed"   # brand new and empty: the next push sends the base FIRST, so its default is the base and not this track
+      : > "$ST/base-seed"   # brand new and empty: the next push sends the base FIRST, so its default is the base and not this track
       "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: created $url for this project — pushing there from now on" >/dev/null 2>&1
       return 0
     fi
-    mv -f "$root/.cc/create.err.tmp" "$root/.cc/create.err" 2>/dev/null
+    mv -f "$ST/create.err.tmp" "$ST/create.err" 2>/dev/null
     # Nothing could be created (no app, a name already someone else's, no network) — and for a workspace
     # project there is NOWHERE ELSE. `origin` is the workspace's FIRST project's repository, so falling back to
     # it pushes this project into another project's — which is how a project's branch came to be in a sibling
@@ -243,11 +309,11 @@ seed_head(){   # $1 = the base branch's tip → the commit the new repository's 
   # A push that never reached the remote keeps the marker and comes back next turn, so the commit already merged
   # into the track is reused: rebuilt from scratch it is a new sha, and a repository unreachable for a week would
   # collect one merge a turn. Reused only while it is still that commit — on the track, on this base tip, this README.
-  prev=$(cat "$root/.cc/base-seed" 2>/dev/null)
+  prev=$(cat "$ST/base-seed" 2>/dev/null)
   if [ -n "$prev" ] && [ "$(git rev-parse -q --verify "$prev^" 2>/dev/null)" = "$tip" ] \
      && [ "$(git rev-parse -q --verify "$prev:README.md" 2>/dev/null)" = "$want" ] \
      && git merge-base --is-ancestor "$prev" HEAD 2>/dev/null; then printf '%s\n' "$prev"; return 0; fi
-  idx="$root/.cc/seed.idx"; rm -f "$idx"
+  idx="$ST/seed.idx"; rm -f "$idx"
   GIT_INDEX_FILE="$idx" git read-tree "$tip" 2>/dev/null \
     && GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "100644,$want,README.md" 2>/dev/null \
     && tree=$(GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null)
@@ -264,7 +330,7 @@ seed_head(){   # $1 = the base branch's tip → the commit the new repository's 
         -m "merge the base branch this project's repository was seeded with" 2>/dev/null) \
     && git update-ref -m 'cc-checkpoint: the base this repository is seeded with' "refs/heads/$branch" "$merged" "$head" 2>/dev/null \
     || { printf '%s\n' "$tip"; return 0; }   # not on the track, so not pushed as the base: a front page is not worth a conflict
-  printf '%s\n' "$new" > "$root/.cc/base-seed"   # …and it is this commit again next turn if the push does not land
+  printf '%s\n' "$new" > "$ST/base-seed"   # …and it is this commit again next turn if the push does not land
   printf '%s\n' "$new"; }
 seed_base(){   # cwd = worktree root, $remote and $cred from lease_push.  Always 0: seeding is not the push.
   # The header's "AND IT OPENS ON THE PROJECT'S BASE": a repository created here is empty, GitHub gives it whichever
@@ -273,22 +339,29 @@ seed_base(){   # cwd = worktree root, $remote and $cred from lease_push.  Always
   # marker and is never touched. Not reaching the remote at all keeps the marker: the next turn tries again, and the
   # track push in this one is failing for the same reason anyway.
   local base def err tip send
-  [ -n "$workspace" ] && [ -f "$root/.cc/base-seed" ] || return 0
+  [ -n "$workspace" ] && [ -f "$ST/base-seed" ] || return 0
   base=$(base_branch)
   # A base this checkout does not have cannot be pushed. That used to drop the marker and say nothing at all, so
   # the repository went on opening on the track and no later turn tried again: the board hears it, once.
   tip=$(git rev-parse -q --verify "refs/heads/$base" 2>/dev/null) || {
     "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: this project's repository was made, but its base branch '$base' is not in this checkout — nothing was seeded, so it opens on whichever branch landed first" >/dev/null 2>&1
-    rm -f "$root/.cc/base-seed"; return 0; }
+    spend_seed; return 0; }
   send=$(seed_head "$tip"); [ -n "$send" ] || send="$tip"   # an EMPTY source in a refspec DELETES the branch: never that
   if ! err=$(git_unattended "${cred[@]}" push -q "$remote" "$send:refs/heads/$base" 2>&1); then
     grep -qE 'rejected|non-fast-forward|already exists' <<<"$err" || return 0   # could not reach it: try again next turn
   fi
+  # …BUT THE DEFAULT BRANCH IS NEVER MOVED FROM A TIMER, the same flag `--sweep` sets for pick_remote:
+  # `cc-gh-token default` is an org-admin action and the sweep pushes and NOTHING ELSE (header above). The base
+  # push above is a PLAIN push and happens from a timer too — a repository that was created for a project whose
+  # push never reached it is still empty, and letting the track land there first is bug #218 all over again, with
+  # nobody present to notice. The marker is KEPT here, so the next owner-present run still asks GitHub by name
+  # (review of #225).
+  [ -z "${CC_CHECKPOINT_NO_CREATE:-}" ] || return 0
   def=$(git_unattended "${cred[@]}" ls-remote --symref "$remote" HEAD 2>/dev/null | sed -n 's#^ref: refs/heads/\([^[:space:]]*\).*$#\1#p' | head -1)
   if [ "$def" != "$base" ] && ! "$BIN/cc-gh-token" default "$workspace" "$WSTRACK" "$base" >/dev/null 2>&1; then
     "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $base is in this project's repository but its default branch is still ${def:-whichever branch arrived first} — 'cc-gh-token default $WSREPO $WSTRACK $base' sets it" >/dev/null 2>&1
   fi
-  rm -f "$root/.cc/base-seed"; return 0; }
+  spend_seed; return 0; }
 evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree root.  Always 0: this is tidying.
   # EACH PROJECT'S REPOSITORY HOLDS THAT PROJECT AND NO OTHER. A workspace is one git repo whose projects are
   # branches, so before this every project's branch reached the workspace's first repository too and the
@@ -303,26 +376,36 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
   # not, or one whose object this worktree does not have, is left alone and written to .cc/evict.err — a file of
   # its own, replaced each run: push.err means the push FAILED, and a note there after a push that succeeded lit
   # `push!` for ever (review of #217).
-  local branch="$1" own o url sha name
+  local branch="$1" had_lease="${2:-}" own o url sha name
+  # …BUT NOT FROM A TIMER. This ends in `git push --delete` against another repository, and the sweep pushes and
+  # NOTHING ELSE (header above): a branch removed unattended every five minutes is the one destructive remote
+  # action nobody is present for. A workspace still heals itself on the next `cc done` or owner-present turn,
+  # which is when a person is there to read the board note (review of #225).
+  [ -z "${CC_CHECKPOINT_NO_CREATE:-}" ] || return 0
   [ -n "$workspace" ] || return 0   # only a member workspace's project has sibling projects to contaminate
+  # …AND ONLY ONCE THE HOST HAS MANAGED THIS TRACK BEFORE. With no host lease at the start of this run the track's
+  # evict.same (the self-alias memory) may be orphaned in <wt>/.cc, which the host will not read — so deleting here
+  # would re-run the delete+repush over a self-alias and close its open PR, the #217 hole (round 9 of #225). The
+  # first push records the lease and heals nothing; the next owner-present run, holding a lease of its own, does.
+  [ -n "$had_lease" ] || return 0
   own=$(url_key "$(git remote get-url "$remote" 2>/dev/null)"); [ -n "$own" ] || return 0
-  rm -f "$root/.cc/evict.err.tmp"
+  rm -f "$ST/evict.err.tmp"
   for o in $(git remote); do
     url=$(git remote get-url "$o" 2>/dev/null)
     [ "$(url_key "$url")" != "$own" ] || continue
-    grep -qxF "$url" "$root/.cc/evict.same" 2>/dev/null && continue   # known to be this project's own repository under another spelling: never cycled again
+    grep -qxF "$url" "$ST/evict.same" 2>/dev/null && continue   # known to be this project's own repository under another spelling: never cycled again
     local -a c=(); mapfile -t c < <("$BIN/cc-gh-token" gitargs "$url" "$workspace" 2>/dev/null)
     sha=$(git_unattended "${c[@]}" ls-remote --heads "$o" "refs/heads/$branch" 2>/dev/null | awk 'NR==1{print $1}')
     [ -n "$sha" ] || continue   # it does not have this branch, or it could not be asked: nothing to remove either way
     if ! git merge-base --is-ancestor "$sha" "$branch" 2>/dev/null; then
-      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch at $sha, which is not in this branch — left alone. This project pushes to $remote; move or delete that branch by hand." >> "$root/.cc/evict.err.tmp"
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch at $sha, which is not in this branch — left alone. This project pushes to $remote; move or delete that branch by hand." >> "$ST/evict.err.tmp"
       continue; fi
     name=$(url_key "$url"); name=${name##*/}   # the normalised url, so a trailing / does not leave the note naming nothing
     # A delete the other repository REFUSES — GitHub refuses a repository's default branch, and an empty repository
     # takes its default from the first branch pushed into it, which can be the sibling's — is the case that leaves
     # the contamination in place, so it is said, not swallowed (review of #217).
     if ! err=$(git_unattended "${c[@]}" push -q "$o" --delete "refs/heads/$branch" 2>&1); then
-      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch — the delete was refused: $(tr '\n' ' ' <<<"$err" | cut -c1-160). Delete or retarget it by hand; a repository's default branch cannot be deleted, so point that repository's default at its own project's branch first." >> "$root/.cc/evict.err.tmp"
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch — the delete was refused: $(tr '\n' ' ' <<<"$err" | cut -c1-160). Delete or retarget it by hand; a repository's default branch cannot be deleted, so point that repository's default at its own project's branch first." >> "$ST/evict.err.tmp"
       continue; fi
     # A URL IS NOT A REPOSITORY'S IDENTITY. The same repository under a spelling url_key cannot unify (ssh and
     # https, a symlink) has just had its branch deleted out from under it — so ask the project's own remote
@@ -331,65 +414,185 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
     still=$(git_unattended "${cred[@]}" ls-remote --heads "$remote" "refs/heads/$branch" 2>/dev/null); src=$?
     if [ "$src" = 0 ] && [ -z "$still" ]; then
       git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>/dev/null
-      printf '%s\n' "$url" >> "$root/.cc/evict.same"   # remembered: deleting and restoring it every turn would close any open PR on the branch (review of #217)
-      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o is this project's own repository under another spelling — its branch was put back and that remote is skipped from now on. Keep one remote for it." >> "$root/.cc/evict.err.tmp"
+      printf '%s\n' "$url" >> "$ST/evict.same"   # remembered: deleting and restoring it every turn would close any open PR on the branch (review of #217)
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$o is this project's own repository under another spelling — its branch was put back and that remote is skipped from now on. Keep one remote for it." >> "$ST/evict.err.tmp"
       continue; fi
     "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $branch removed from ${name:-$o} — this project's work is in its own repository now, not that one" >/dev/null 2>&1
   done
   # The two cases that need a person — a branch left in a sibling repository, a duplicate remote — are heard the
   # way a delete is: on the board, once per change and not every turn (the file carries a timestamp per run, so it
   # is compared without them). Nothing on the box reads evict.err by itself (review of #217).
-  if [ -s "$root/.cc/evict.err.tmp" ]; then
-    if ! cmp -s <(cut -d' ' -f2- "$root/.cc/evict.err.tmp") <(cut -d' ' -f2- "$root/.cc/evict.err" 2>/dev/null); then
-      "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $(cut -d' ' -f2- "$root/.cc/evict.err.tmp" | paste -sd' ' -)" >/dev/null 2>&1; fi
-    mv -f "$root/.cc/evict.err.tmp" "$root/.cc/evict.err"
-  else rm -f "$root/.cc/evict.err.tmp" "$root/.cc/evict.err"; fi
+  if [ -s "$ST/evict.err.tmp" ]; then
+    if ! cmp -s <(cut -d' ' -f2- "$ST/evict.err.tmp") <(cut -d' ' -f2- "$ST/evict.err" 2>/dev/null); then
+      "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $(cut -d' ' -f2- "$ST/evict.err.tmp" | paste -sd' ' -)" >/dev/null 2>&1; fi
+    mv -f "$ST/evict.err.tmp" "$ST/evict.err"
+  else rm -f "$ST/evict.err.tmp" "$ST/evict.err"; fi
   return 0
 }
-lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed · 2 the lease was refused
-  local branch="$1" lease prc
+lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed · 2 the lease was refused · 3 no host lease
+  local branch="$1" lease prc had_lease=
+  # POSITIVE HOST STATE, captured before the push writes any. A member workspace track that predates the move to
+  # ~/.cc/push-state has no host lease of its own here (its old state is orphaned in <wt>/.cc, which the host will
+  # not read), and neither does one nothing has pushed yet. evict_elsewhere — the one destructive remote action in
+  # this file — must fire only when the host has managed this track before, never on that absence: on a pre-move
+  # track its evict.same is orphaned too, so re-running the self-alias delete+repush would close an open PR, the
+  # very #217 hole (round 9 of #225). So the FIRST push records the lease and evicts nothing; eviction waits for a
+  # run where the host already held one.
+  # …AND NEVER ONE `adopt` READ OFF THE REMOTE. That lease is a person's reading of another commit, not a record of a
+  # push this host made, so the track's evict.same is still orphaned in <wt>/.cc and eviction would re-run the
+  # self-alias delete+repush and close an open PR. The push that spends an adopted lease clears the flag (lease_keep),
+  # so the one after it evicts like any other.
+  [ -e "$ST/pushed" ] && [ ! -e "$ST/adopted" ] && had_lease=1
   # The credential. `cc-gh-token gitargs` prints the `git -c …` arguments that authenticate as this box's
   # GitHub App — and prints NOTHING for a remote the app does not cover, or on a box with no app, so every
   # other push still uses whatever helper ~/.gitconfig gives it. Without this a member project's push has no
   # credential at all and stops on "could not read Username", which is how two finished branches sat unpushed.
+  # AND NEVER UNSCOPED IN A MEMBER'S TREE. `gitargs <url> ''` mints the app's whole-org credential; the workspace
+  # name that narrows it to that member's repositories comes from path_ids, and a worktree that is NOT at
+  # ~/.cc/worktrees/<repo>/<track> — a real worktree a member made inside their own checkout — has none (security
+  # review of #225). Inside a member workspace with no scope, nothing is minted and nothing is pushed.
+  if [ -z "$workspace" ] && member_tree "$root"; then
+    printf '%s %s\n' "$(date -u +%FT%TZ)" "refused: $root is inside a member workspace but is not one of its tracks (~/.cc/worktrees/<workspace>/<project>), so there is no workspace to mint a credential for — refusing to push with an unscoped one" >> "$ST/push.err"
+    return 1; fi
   local -a cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$remote" 2>/dev/null)" "$workspace" 2>/dev/null)
   seed_base   # a repository just made for this project takes its default from the FIRST branch pushed: the base goes ahead of the track
   # Plain push FIRST, and force nothing when it works: a fast-forward never needed a lease. It is also how a
   # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
   # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
-  git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; prc=$?
-  [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch"; return 0; }
-  bound_hit "$prc" "$root/.cc/push.err.tmp"   # killed at the bound: git said nothing, so the reason is written here
-  grep -qE 'non-fast-forward|fetch first' "$root/.cc/push.err.tmp" || { mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
-  lease=$(cat "$root/.cc/pushed" 2>/dev/null)
+  git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
+  [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
+  bound_hit "$prc" "$ST/push.err.tmp"   # killed at the bound: git said nothing, so the reason is written here
+  grep -qE 'non-fast-forward|fetch first' "$ST/push.err.tmp" || { mv "$ST/push.err.tmp" "$ST/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
+  lease=$(cat "$ST/pushed" 2>/dev/null)
   # Nothing recorded yet (a track older than .cc/pushed): the tracking ref is the best account of the remote we
   # have, and one push from here replaces the guess with the real thing.
-  [ -n "$lease" ] || lease=$(git rev-parse -q --verify "refs/remotes/$remote/$branch" 2>/dev/null)
+  # NOT FOR A MEMBER WORKSPACE'S PROJECT. That ref lives in ~/dev/<handle>/.git, which the member writes (cc-sandbox
+  # binds .git read-write, config and hooks aside), and any fetch refreshes it to whatever is really on the remote —
+  # so leasing against it turns "something else wrote to this branch, a person must look" into a host force-push
+  # over that writer's commit, which is the one thing the lease exists to prevent. Removing the worktree drops the
+  # recorded lease with it, so this is reachable by hand (security review of #225). With no lease of our own the
+  # push is not forced.
+  [ -n "$lease" ] || [ -n "$workspace" ] || lease=$(git rev-parse -q --verify "refs/remotes/$remote/$branch" 2>/dev/null)
   if [ -n "$lease" ]; then
-    git_unattended "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; prc=$?
-    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch"; return 0; }
-    bound_hit "$prc" "$root/.cc/push.err.tmp"
-    mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"
-    grep -qE 'stale info|non-fast-forward|fetch first' "$root/.cc/push.err" && return 2
+    git_unattended "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
+    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
+    bound_hit "$prc" "$ST/push.err.tmp"
+    mv "$ST/push.err.tmp" "$ST/push.err"
+    grep -qE 'stale info|non-fast-forward|fetch first' "$ST/push.err" && return 2
     return 1; fi
-  mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 2   # diverged with nothing to lease against: assume the worst, out loud
+  mv "$ST/push.err.tmp" "$ST/push.err"
+  # DIVERGED WITH NO LEASE OF OUR OWN. For the box's own repos the tracking-ref fallback above always gave us one, so
+  # this is a member workspace whose ~/.cc/push-state lease is empty. Two shapes reach here and they must part ways:
+  #  - A track that predates #225 kept its lease in <wt>/.cc/pushed. Its ~/.cc/push-state is empty on the first tick,
+  #    so a since-rebased branch lands here — and calling it "something else wrote" wrongly writes STATUS: BLOCKED and
+  #    stops the interactive track this exists to serve (review round 8 of #225). Its own pre-#225 footprint, the
+  #    plain file at <wt>/.cc/pushed, is what tells it apart: return 3, reported quietly by both callers. Neither of
+  #    them can push it — the branch will never fast-forward and there is nothing safe to lease against — so rc=3 has
+  #    ONE exit and it is not another push: `cc-checkpoint adopt <handle> <track>`, where a person reads what the
+  #    remote holds and records it. Both messages name it.
+  #  - A track nothing has ever pushed, with a real other writer's commit on the remote: no such footprint. return 2,
+  #    refused out loud, the same as the box's own repos' "diverged, nothing to lease".
+  # ONLY THE FILE'S EXISTENCE is read here, NEVER its contents — a forged value must never become a force-with-lease
+  # target (review round 8 of #225). Forging its mere presence only downgrades a member's own track from loud to
+  # quiet; nothing is pushed either way, so no other writer is overwritten.
+  [ -n "$workspace" ] && [ -f "$root/.cc/pushed" ] && [ ! -L "$root/.cc/pushed" ] && return 3
+  return 2
 }
-lease_keep(){ git rev-parse "$1" > "$root/.cc/pushed" 2>/dev/null   # next time's lease: what the remote holds, because we just put it there
-  rm -f "$root/.cc/push.err" "$root/.cc/push.err.tmp"; }
+lease_keep(){ git rev-parse "$1" > "$ST/pushed" 2>/dev/null   # next time's lease: what the remote holds, because we just put it there
+  rm -f "$ST/push.err" "$ST/push.err.tmp" "$ST/adopted"; }   # …and this lease IS one of ours now, adopted or not
 lease_refused(){   # a write this worktree did not make, on a single-writer branch: say so three ways, never none
-  local branch="$1" repo track st msg
-  repo=$(sed -n 1p "$root/.cc/track" 2>/dev/null); track=$(sed -n 2p "$root/.cc/track" 2>/dev/null)
+  local branch="$1" repo track msg f
+  # WHOSE track this is comes from the PATH, never .cc/track — the header's rule, and it matters most here: the
+  # sweep runs --push as the owner every five minutes, and the board note and the journal below land under
+  # whatever name is picked. A member writing another workspace's name into line 1 of that read-write file would
+  # put this warning on THAT workspace's board and its Slack lane, and create a directory under ~/.cc/state for
+  # it (review of #225). Only a worktree that is not under ~/.cc/worktrees — nothing a member session is bound
+  # into — is taken at .cc/track's word, and then only for a name with nothing but a name in it.
+  if path_ids "$root"; then repo="$WSREPO"; track="$WSTRACK"
+  else repo=$(sed -n 1p "$root/.cc/track" 2>/dev/null); track=$(sed -n 2p "$root/.cc/track" 2>/dev/null)
+    # A NAME AND NOTHING ELSE: no slash and no leading dot, which would walk out of ~/.cc/state, and no leading
+    # dash, which reaches `cc-board note` as an option word and not as a repo. push.err below is owed either way.
+    for f in "$repo" "$track"; do case "$f" in ''|-*|.*|*[!A-Za-z0-9._-]*) repo=''; track=''; break ;; esac; done; fi
   msg="push refused: $remote/$branch is not what this worktree last pushed, so something else wrote to that branch. The work is committed here and was NOT overwritten. Read 'git fetch $remote && git log $remote/$branch' before anything else."
-  printf '%s %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$root/.cc/push.err"
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$ST/push.err"
   [ -n "$repo" ] && [ -n "$track" ] || return 0
   "$BIN/cc-board" note "$repo" "$track" "$msg" >/dev/null 2>&1
-  st="$HOME/.cc/state/$repo/$track/progress.md"; mkdir -p "$(dirname "$st")" 2>/dev/null || return 0   # a track whose journal has not been started yet is still owed the warning
+  journal_blocked "$repo" "$track" "$msg"; }
+journal_blocked(){   # $1 repo · $2 track · $3 the message — the STATUS: BLOCKED line, into a journal ITS READER CAN WRITE
+  # ~/.cc/state/<repo> is bound read-WRITE into a worker's sandbox and into a member's whole boundary (cc-sandbox), so
+  # progress.md and the directory holding it are theirs to replace with a link — and `>>` FOLLOWS ONE. The 5-minute
+  # sweep runs this as the owner with nobody present, so that was an unattended write-as-owner primitive: link
+  # progress.md at ~/.bashrc, take the worktree away so the sweep prunes the host lease, put a diverged branch back
+  # with no <wt>/.cc/pushed, and the next tick's refused lease writes two of our lines into the owner's shell profile
+  # (security review of #225). Moving the file is not open to us — this journal is the member's own and cc-loop reads
+  # it from inside — so the write is walled instead, three ways, and nothing is read or written unless all hold:
+  #   · ~/.cc/state/<repo> is not a link (checked before the mkdir, which would otherwise make a directory through one)
+  #   · <repo>/<track> still resolves to itself under ~/.cc/state, so a linked track directory is out
+  #   · progress.md is not a link — and the append itself is opened O_NOFOLLOW (dd), so a link raced in after these
+  #     checks is refused by the KERNEL and not by a test that has already run.
+  # Refusing costs the third of three warnings: push.err and the board note are written above and stand either way.
+  local jd jf
+  [ ! -L "$HOME/.cc/state/$1" ] || return 0
+  jd="$HOME/.cc/state/$1/$2"; jf="$jd/progress.md"
+  mkdir -p "$jd" 2>/dev/null || return 0   # a track whose journal has not been started yet is still owed the warning
+  [ "$(readlink -f "$jd" 2>/dev/null)" = "$(readlink -f "$HOME/.cc/state" 2>/dev/null)/$1/$2" ] || return 0
+  [ ! -L "$jf" ] || return 0
   # cc-loop greps ^STATUS: BLOCKED out of the journal after every iteration and stops the track there (board
   # `waiting`, owner told once) — that is the whole point of writing it. Only skipped when the journal ALREADY
   # ends with this, so a hook firing every turn cannot spam it; anything else and it is said again. Loud twice
   # beats silent once, which is the bug this file exists to close.
-  [ "$(grep -v '^[[:space:]]*$' "$st" | tail -1)" = "STATUS: BLOCKED: $msg" ] && return 0
-  printf '\n%s cc-checkpoint: %s\nSTATUS: BLOCKED: %s\n' "$(date -u +%FT%TZ)" "$msg" "$msg" >> "$st"; }
+  [ "$(grep -v '^[[:space:]]*$' "$jf" 2>/dev/null | tail -1)" = "STATUS: BLOCKED: $3" ] && return 0
+  printf '\n%s cc-checkpoint: %s\nSTATUS: BLOCKED: %s\n' "$(date -u +%FT%TZ)" "$3" "$3" \
+    | dd oflag=append,nofollow conv=notrunc "of=$jf" status=none 2>/dev/null; return 0; }
+adopt(){   # $1 handle · $2 track · $3 (optional) the sha the operator has read on the remote.  0 recorded · 1 not
+  # THE ONE WAY OUT OF rc=3. A member workspace track whose lease predates ~/.cc/push-state has none the host wrote,
+  # so a branch rebased since then can neither fast-forward nor be leased, and every automatic path stops: the old
+  # lease sits in <wt>/.cc/pushed, which cc-sandbox binds read-WRITE into the member's boundary, and a forged value
+  # handed to --force-with-lease force-pushes over whoever really wrote that branch (round 9 of #225). No push can
+  # get out of that, so the exit is a PERSON — they read the commit the remote holds, and if it is this track's own
+  # work they say so here. Without a sha this only reports, so reading costs nothing.
+  # NOTHING OF THE MEMBER'S IS READ, AND NOTHING IS PUSHED. The sha is the operator's word AND has to be what the
+  # remote answers at this instant, asked with the workspace's own credential behind the same wall every other
+  # host-side git in a member's tree goes through. Recording is all this does: the next push — `cc done`, or the
+  # sweep within five minutes — is what reconciles the branch, with the whole lease path in front of it.
+  local h="${1:-}" t="${2:-}" want="${3:-}" wt sd why branch tip head f
+  for f in "$h" "$t"; do case "$f" in ''|-*|.*|*[!A-Za-z0-9._-]*) echo "cc-checkpoint adopt: <handle> and <track> are plain names" >&2; return 1 ;; esac; done
+  wt="$HOME/.cc/worktrees/$h/$t"; sd="$HOME/.cc/push-state/$h/$t"; branch="track/$t"
+  [ -f "$HOME/dev/$h/.cc/member-workspace" ] || { echo "cc-checkpoint adopt: ~/dev/$h is not a member workspace — every other track leases against its tracking ref and never reaches rc=3" >&2; return 1; }
+  # the sweep's own two walls, in the same order: the directory must BE the track it names (a symlink there resolves
+  # outside ~/.cc/worktrees and every identity after it falls back to the member's word), and its .git must be the
+  # workspace's own before a single git runs in it (review-156c).
+  { [ ! -L "$wt" ] && [ "$(readlink -f "$wt" 2>/dev/null)" = "$(readlink -f "$HOME/.cc/worktrees/$h" 2>/dev/null)/$t" ]; } \
+    || { echo "cc-checkpoint adopt: $wt is not the directory it names — a track is a real worktree at ~/.cc/worktrees/$h/$t or nothing of ours runs in it" >&2; return 1; }
+  [ -f "$wt/.cc/track" ] || { echo "cc-checkpoint adopt: no track worktree at $wt" >&2; return 1; }
+  why=$(member_gitdir "$h" "$wt") || { echo "cc-checkpoint adopt: $why" >&2; return 1; }
+  # the MAIN checkout's hooks, never the worktree's — the pin cc, cc-loop and the sweep put on every host-side git in
+  # a member's tree. Nothing below runs one, and this way nothing added below can either.
+  local hp; hp=$(git -C "$HOME/dev/$h" config --type=path --get core.hooksPath 2>/dev/null)
+  case "$hp" in "") hp="$HOME/dev/$h/.git/hooks";; /*) ;; *) hp="$HOME/dev/$h/$hp";; esac
+  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$hp"
+  root="$wt"; cd "$root" || return 1
+  ST="$sd"; mkdir -p "$ST" 2>/dev/null || { echo "cc-checkpoint adopt: cannot make $ST" >&2; return 1; }
+  export CC_CHECKPOINT_NO_CREATE=1   # asking what a remote holds is not creating one: a project with no repository has no tip to adopt
+  pick_remote || { echo "cc-checkpoint adopt: $h/$t has no repository yet, so there is nothing on a remote to reconcile against — 'cc done $h $t' makes one" >&2; return 1; }
+  local -a cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$(git remote get-url "$remote" 2>/dev/null)" "$workspace" 2>/dev/null)
+  tip=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" ls-remote --heads "$remote" "refs/heads/$branch" 2>/dev/null | awk 'NR==1{print $1}')
+  [ -n "$tip" ] || { echo "cc-checkpoint adopt: $remote does not have $branch, or could not be asked — nothing recorded" >&2; return 1; }
+  head=$(git rev-parse -q --verify HEAD 2>/dev/null)
+  if [ -z "$want" ]; then   # the reading step, and it records nothing: rc=1 says exactly that
+    printf '%s\n' \
+      "$h/$t: $remote holds $branch at $tip; this worktree is at ${head:-nothing}." \
+      "Read that commit before anything else:  git -C $wt fetch $remote && git -C $wt log $tip" \
+      "If it is this track's own work, record it — the next push reconciles the branch against it:" \
+      "  cc-checkpoint adopt $h $t $tip" \
+      "If it is somebody else's, nothing here overwrites it: merge or rebase onto it in the worktree instead."
+    return 1; fi
+  [ "$want" = "$tip" ] || { echo "cc-checkpoint adopt: $remote holds $branch at $tip, not $want — nothing recorded" >&2; return 1; }
+  printf '%s\n' "$tip" > "$ST/pushed"
+  : > "$ST/adopted"   # a lease READ OFF THE REMOTE and not one a push of ours recorded — see lease_push: the push that spends it evicts nothing
+  rm -f "$HOME/.cc/sweep/$h/$t"   # …and the sweep must try this head again: rc=3 retired it, and a marker nobody clears is another dead end
+  echo "adopted: $h/$t leases against $tip. The next push reconciles $branch against it — 'cc done $h $t', or the sweep within five minutes."
+  return 0; }
 selfcheck(){   # the pick_remote rule, on fixtures of its own: a HOME, workspaces and repos it builds here, and
   # a cc-gh-token that RECORDS what it was asked to create instead of creating anything. No repository of this
   # box's is read, no token is minted, nothing reaches GitHub and no directory outside the temp dir is written.
@@ -400,7 +603,7 @@ selfcheck(){   # the pick_remote rule, on fixtures of its own: a HOME, workspace
   HOME="$T/home"; export HOME GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
   bin="$T/bin"; mkdir -p "$bin" "$HOME/.cc/worktrees" "$HOME/dev"
   cp "$(readlink -f "$0")" "$bin/cc-checkpoint"   # a COPY: a symlink resolves back to core/bin, and the stubs beside it would never be reached
-  CALLS="$T/calls"; NOTES="$T/notes"; DEFS="$T/defaults"; export CALLS NOTES DEFS
+  CALLS="$T/calls"; NOTES="$T/notes"; DEFS="$T/defaults"; RACE="$T/race"; export CALLS NOTES DEFS RACE
   # `default` stands in for GitHub the way `create` does, and records into a file of its own so the create cases
   # above still read a $CALLS with one line in it. BARE, when the case sets it, makes `create` a real bare repo the
   # seeding below can actually push into.
@@ -410,6 +613,16 @@ if [ "$1" = default ]; then printf '%s\n' "$*" >> "$DEFS"
   [ -z "${CC_NODEFAULT:-}" ] || { echo "GitHub refused" >&2; exit 1; }
   git -C "$BARE/$3.git" symbolic-ref HEAD "refs/heads/$4" 2>/dev/null; exit 0; fi
 printf '%s\n' "$*" >> "$CALLS"
+# $RACE = "<remote url> <worktree>": the member's live session committing WHILE the host pushes. gitargs is asked for
+# the credential inside lease_push, after the sweep read HEAD and before the push goes out, so a commit made here
+# lands in exactly that window — and only for the project whose url is named, since a sweep asks for many.
+if [ "$1" = gitargs ] && [ -s "${RACE:-/dev/null}" ]; then
+  read -r ru rw < "$RACE"
+  if [ "$2" = "$ru" ]; then : > "$RACE"
+    echo race >> "$rw/work.txt"; git -C "$rw" add -A >/dev/null 2>&1
+    git -C "$rw" -c user.name=t -c user.email=t@t commit -q -m "a commit made while the host was pushing" >/dev/null 2>&1
+  fi
+fi
 [ "$1" = create ] || exit 0
 [ -z "${CC_FAIL:-}" ] || { echo "GitHub refused to create $3" >&2; exit 1; }
 u="https://example.test/org/$3.git"; [ -z "${BARE:-}" ] || { git init -q --bare "$BARE/$3.git"; u="$BARE/$3.git"; }
@@ -506,7 +719,10 @@ SH
     git -C "$p" checkout -q -b "track/$t"; echo "$t" > "$p/work.txt"; git -C "$p" add -A
     git -C "$p" -c user.name=t -c user.email=t@t commit -q -m "$t"
     printf '%s\n' "$p"; }
-  runp(){ : > "$CALLS"; : > "$NOTES"; ( cd "$1" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 ); }
+  # runp = a push from an ESTABLISHED track: the host already holds a lease for it (evict_elsewhere fires only then;
+  # a track with no host lease is the pre-move / never-pushed case, tested on its own below). The lease value does
+  # not matter here — every push in this section is a fast-forward, so it is never consulted — only that it exists.
+  runp(){ : > "$CALLS"; : > "$NOTES"; git -C "$1" rev-parse HEAD > "$1/.cc/pushed" 2>/dev/null; ( cd "$1" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 ); }
   ws ws3
   # A workspace's first repository holding a second project's branch — the shape measured on a real workspace
   # on 2026-09-04. The branch is pushed to the project's own repository and then removed from that one.
@@ -562,6 +778,21 @@ SH
   runp "$d"
   k "$(has "$od" track/t2 && echo 0 || echo 1)" "a plain repo still pushes to origin" "not on $od"
   k "$(has "$td" track/t2 && echo 0 || echo 1)" "and nothing is removed from its other remotes" "deleted from $td"
+  # NO HOST LEASE, NO EVICTION (round 9 of #225). A track whose host lease predates the move to ~/.cc/push-state has
+  # its evict.same orphaned in <wt>/.cc, which the host will not read; re-running the self-alias delete+repush would
+  # close its open PR (the #217 hole). So the destructive path fires only on positive host state — a lease of our
+  # own — never on its absence. Same self-alias shape as projC2, but with NO host lease: nothing is deleted, nothing
+  # is put back, and the branch still reaches the project's own repository.
+  oe1=$(bare ownE1); ln -s "$oe1" "$T/aliasE1.git"
+  d=$(mkproj ws3/projE1 origin "$T/aliasE1.git" projE1 "$oe1")
+  : > "$CALLS"; : > "$NOTES"; rm -f "$d/.cc/pushed"   # the absence case: the host holds no lease of its own for this track
+  ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  k "$(has "$oe1" track/projE1 && echo 0 || echo 1)" "no host lease: the branch still reaches the project's own repository" "not on $oe1"
+  k "$([ -e "$d/.cc/evict.err" ] && echo 1 || echo 0)" "…and no eviction is attempted at all — no delete, no put-back" "$(cat "$d/.cc/evict.err" 2>/dev/null)"
+  k "$(grep -q 'put back' "$NOTES" && echo 1 || echo 0)" "…so no delete+repush cycle can close an open PR" "$(cat "$NOTES")"
+  # …and the very next run, now holding a lease of its own, heals the workspace as before.
+  : > "$NOTES"; ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  k "$(grep -q 'put back' "$NOTES" && echo 0 || echo 1)" "…and once a host lease is on record the self-alias is handled normally" "$(cat "$NOTES")"
   # ── no push waits for a person ──────────────────────────────────────────────────────────────────────
   # The 2026-09-07 hang: a member track with no credential sat 6h38m inside git-remote-https on a username
   # prompt, on a stdin no unattended run can answer. Both halves of the rule are checked, each on its own
@@ -730,22 +961,22 @@ SH
   k "$([ -e "$d/README.md" ] && echo 1 || echo 0)" "…and is not given one" ""
   # The sibling this seeding makes: a track cut from that base inherits ANOTHER project's stub, whose heading is no
   # longer the workspace's name for the test above to catch. Still nobody's words, so still replaced.
-  d=$(mkproj_main ws5/projR projR "$(bare ownR)"); stub ws5 projQ > "$d/README.md"; save "$d" sibling
+  d=$(mkproj_main ws5/projR projR "$(bare ownRb)"); stub ws5 projQ > "$d/README.md"; save "$d" sibling
   hook "$d"
   eq "a track that inherited a sibling project's stub gets its own" "$(head -1 "$d/README.md")" "# projR"
   k "$(grep -q 'track/projR' "$d/README.md" && echo 0 || echo 1)" "…naming its own branch" "$(cat "$d/README.md")"
   # …and the steady state after that: the stub already names this project, so no turn ever rewrites or commits it.
-  d=$(mkproj_main ws5/projV projV "$(bare ownV)"); stub ws5 projV > "$d/README.md"; save "$d" own
+  d=$(mkproj_main ws5/projV projV "$(bare ownVb)"); stub ws5 projV > "$d/README.md"; save "$d" own
   hV=$(git -C "$d" rev-parse HEAD); hook "$d"
   eq "a stub already naming this project keeps its heading" "$(head -1 "$d/README.md")" "# projV"
   eq "…and is not rewritten, so the turn commits nothing" "$(git -C "$d" rev-parse HEAD)" "$hV"
   # One line added to it and the whole file is theirs, heading and all.
-  d=$(mkproj_main ws5/projS projS "$(bare ownS)"); { stub ws5 projQ; echo mine; } > "$d/README.md"; save "$d" theirs
+  d=$(mkproj_main ws5/projS projS "$(bare ownSb)"); { stub ws5 projQ; echo mine; } > "$d/README.md"; save "$d" theirs
   hook "$d"
   eq "a stub somebody added a line to is theirs" "$(head -1 "$d/README.md")" "# projQ"
   k "$(grep -q '^mine$' "$d/README.md" && echo 0 || echo 1)" "…and keeps the line" "$(cat "$d/README.md")"
   # No '# ' heading to rebuild the template from: not a stub, and not this file's to touch.
-  d=$(mkproj_main ws5/projX projX "$(bare ownX)"); printf 'no heading here\n' > "$d/README.md"; save "$d" plain
+  d=$(mkproj_main ws5/projX projX "$(bare ownXb)"); printf 'no heading here\n' > "$d/README.md"; save "$d" plain
   hook "$d"
   eq "a README with no heading is left alone" "$(cat "$d/README.md")" "no heading here"
   # ── …and the project's FIRST PR merges into the base it was seeded with ─────────────────────────────
@@ -833,15 +1064,475 @@ SH
   d=$(mkproj "$T/outside" origin "$(bare outside)"); strict "$d"; rc=$?
   k "$([ "$rc" != 0 ] && ! has "$T/outside.git" "track/$T/outside" && echo 0 || echo 1)" \
     "C5: an outside worktree gains no strict completion or push" "rc=$rc"
+  # ── the sweep: what an interactive member session committed reaches its repository with nobody present ──────
+  # A HOME of its own: the workspaces above hold projects wired to example.test, and a sweep over them would go
+  # looking for it. $bin, the stubs in it and the fixture gitconfig are absolute, so they carry over.
+  HOME="$T/home2"; mkdir -p "$HOME/.cc/worktrees" "$HOME/dev"
+  # …and REAL worktrees here, not repos of their own: the sweep runs git in a member's tree only where that tree
+  # hangs off ~/dev/<handle>/.git, so a fixture built any other way would be refused before it proved anything.
+  mkws(){ ws "$1"; git init -q "$HOME/dev/$1"; git -C "$HOME/dev/$1" symbolic-ref HEAD refs/heads/main
+    mkdir -p "$HOME/dev/$1/.git/info"; echo '.cc/' > "$HOME/dev/$1/.git/info/exclude"   # what ensure_track writes
+    printf '# %s\n' "$1" > "$HOME/dev/$1/README.md"; git -C "$HOME/dev/$1" add README.md
+    git -C "$HOME/dev/$1" -c user.name=t -c user.email=t@t commit -q -m init; }
+  mkwork(){   # $1 <ws>/<track>, then name/url pairs → a real worktree of ~/dev/<ws> on track/<track>, one commit of its own
+    local w=${1%%/*} t=${1#*/} p="$HOME/.cc/worktrees/$1"
+    git -C "$HOME/dev/$w" worktree add -q -b "track/$t" "$p"; shift
+    while [ "$#" -gt 1 ]; do git -C "$p" remote add "$1" "$2"; shift 2; done
+    mkdir -p "$p/.cc"; printf '%s\n%s\n' "$w" "$t" > "$p/.cc/track"
+    echo "$t" > "$p/work.txt"; git -C "$p" add -A; git -C "$p" -c user.name=t -c user.email=t@t commit -q -m "$t"
+    printf '%s\n' "$p"; }
+  mkws ws5
+  osw=$(bare ownS); d=$(mkwork ws5/projS projS "$osw")
+  osn=$(bare ownN); mkproj plain5/t5 origin "$osn" >/dev/null                                   # not a workspace: the sweep is not for it
+  osh=$(bare ownH2); dh=$(mkwork ws5/projH2 projH2 "$osh"); git -C "$dh" checkout -q --detach   # HEAD off its branch: --push's own rule, so skipped
+  dn=$(mkwork ws5/projNR)                                                                       # a project with no remote at all
+  # A GIT DIR OF THE MEMBER'S. ~/.cc/worktrees/<h> is read-write inside the boundary, so this is a directory a member
+  # can leave there: .cc/track, and a `.git` naming a git dir whose config they wrote — an `ext::sh -c …` remote named
+  # after the track, which is exactly the remote pick_remote would choose, and a core.fsmonitor beside it. Unattended
+  # every five minutes, that is the owner's shell (review of #225).
+  printf '#!/bin/sh\ntouch %s/PWNED\n' "$T" > "$T/pwn"; chmod +x "$T/pwn"   # a file, not an inline sh -c: git splits an ext:: command on spaces
+  git init -q "$T/memberdir"; git -C "$T/memberdir" symbolic-ref HEAD refs/heads/track/evil
+  git -C "$T/memberdir" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  git -C "$T/memberdir" remote add evil "ext::$T/pwn %S"
+  git -C "$T/memberdir" config protocol.ext.allow always   # a config the member wrote, so the transport git blocks by default is on
+  git -C "$T/memberdir" config core.fsmonitor "$T/pwn"   # the payload goes in LAST: set earlier, the commit above would fire it
+  ev="$HOME/.cc/worktrees/ws5/evil"; mkdir -p "$ev/.cc"; printf 'ws5\nevil\n' > "$ev/.cc/track"
+  printf 'gitdir: %s\n' "$T/memberdir/.git" > "$ev/.git"
+  : > "$CALLS"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$osw" track/projS && echo 0 || echo 1)" "sweep: a member project's commit is pushed to its repository" "$sw"
+  eq "sweep: and the lease is recorded — in the host's own directory, under no bind" "$(cat "$HOME/.cc/push-state/ws5/projS/pushed" 2>/dev/null)" "$(git -C "$d" rev-parse HEAD)"
+  # AND NOTHING IS WRITTEN INSIDE THE MEMBER'S TREE. A pre-check cannot make a redirection into ~/.cc/worktrees/<h>
+  # safe — the member's session is live and can put a link at the name after the check (security review of #225) —
+  # so the push writes none of these there, whatever is or is not at those names when it runs.
+  left=; for sfile in pushed push.err push.err.tmp; do if [ -e "$d/.cc/$sfile" ]; then left="$left $sfile"; fi; done   # NOT `f`: that is this selfcheck's own failure count
+  eq "…and the member's tree is written to not at all: no pushed, no push.err, no push.err.tmp" "$left" ""
+  k "$(grep -qx "gitargs $osw ws5" "$CALLS" && echo 0 || echo 1)" "sweep: with the credential minted for that workspace and no other" "$(cat "$CALLS")"
+  k "$(grep -q 'ws5/projS: pushed' <<<"$sw" && echo 0 || echo 1)" "sweep: and says so" "$sw"
+  k "$(has "$osn" track/t5 && echo 1 || echo 0)" "sweep: a track that is not a member workspace's is left to its own hook" "pushed to $osn"
+  k "$(has "$osh" track/projH2 && echo 1 || echo 0)" "sweep: a worktree whose HEAD is off its branch is skipped, not forced" "pushed to $osh"
+  # THE WALL (review of #225). No git of ours goes anywhere near that git dir, so neither payload ever runs.
+  k "$([ -e "$T/PWNED" ] && echo 1 || echo 0)" "sweep: an ext:: remote in a git dir the member wrote is never run" "$T/PWNED exists"
+  k "$(grep -q 'ext::' "$CALLS" && echo 1 || echo 0)" "sweep: and no credential is even minted for a url out of that config" "$(cat "$CALLS")"
+  k "$([ -e "$ev/.cc/pushed" ] && echo 1 || echo 0)" "sweep: a worktree whose .git is not the workspace's own is skipped, never pushed" "it pushed"
+  k "$(grep -q 'ws5/evil: refusing to run git' <<<"$sw" && echo 0 || echo 1)" "sweep: and the skip is named, with the worktree" "$sw"
+  # NOTHING IS CREATED FROM A TIMER: a project with no repository waits for `cc done`, and is not named again every tick.
+  k "$(grep -q '^create' "$CALLS" && echo 1 || echo 0)" "sweep: a project with no remote gets no repository created" "$(cat "$CALLS")"
+  k "$(grep -q 'ws5/projNR: no repository recorded' <<<"$sw" && echo 0 || echo 1)" "sweep: and it says the project is waiting for one" "$sw"
+  k "$({ [ -e "$dn/.cc/create.err" ] || [ -e "$HOME/.cc/push-state/ws5/projNR/create.err" ]; } && echo 1 || echo 0)" "sweep: and no creation was even attempted for it" "$(cat "$dn/.cc/create.err" "$HOME/.cc/push-state/ws5/projNR/create.err" 2>/dev/null)"
+  : > "$CALLS"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: nothing ahead — nothing pushed, no token asked for, and neither skip said twice" "$(cat "$CALLS")/$sw" "/"
+  echo more > "$d/work.txt"; git -C "$d" add -A; git -C "$d" -c user.name=t -c user.email=t@t commit -q -m more
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: the next commit goes on the next tick" "$(git ls-remote --heads "$osw" refs/heads/track/projS | cut -c1-40)" "$(git -C "$d" rev-parse HEAD)"
+  # A REFUSED LEASE IS SAID ONCE PER COMMIT, not every five minutes: --push writes push.err and posts a board note
+  # every time it runs, and out here there is nobody to stop it doing that 288 times a day (review of #225).
+  osr=$(bare ownR); dr=$(mkwork ws5/projR projR "$osr")
+  sr=$(mkwt "$T/strayR"); git -C "$sr" symbolic-ref HEAD refs/heads/track/projR
+  echo stray > "$sr/stray.txt"; git -C "$sr" add -A; git -C "$sr" -c user.name=t -c user.email=t@t commit -q -m stray
+  git -C "$sr" push -q "$osr" track/projR   # a write this worktree did not make: its push is refused, and the lease with it
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projR: push refused' <<<"$sw" && echo 0 || echo 1)" "sweep: a branch something else wrote to is refused, not forced, and the refusal is said" "$sw"
+  eq "…and the board hears it once" "$(grep -c 'push refused' "$NOTES")" 1
+  pe=$(wc -l < "$HOME/.cc/push-state/ws5/projR/push.err")   # the host's copy: the member's tree is not written to at all
+  : > "$CALLS"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: the tick after does not try that same head again — nothing said, no token minted" "$(cat "$CALLS")/$sw" "/"
+  eq "…so the board is not told a second time" "$(grep -c 'push refused' "$NOTES")" 1
+  eq "…and push.err does not grow a line every five minutes" "$(wc -l < "$HOME/.cc/push-state/ws5/projR/push.err")" "$pe"
+  echo again > "$dr/work.txt"; git -C "$dr" add -A; git -C "$dr" -c user.name=t -c user.email=t@t commit -q -m again
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projR: push refused' <<<"$sw" && echo 0 || echo 1)" "sweep: a new commit is tried, and refused again out loud" "$sw"
+  eq "…and the board hears that commit's refusal too" "$(grep -c 'push refused' "$NOTES")" 2
+  # AND THE REFUSAL SAYS WHOSE TRACK IT IS FROM THE PATH. .cc/track is bound read-WRITE into the member session,
+  # so its first line is the member's word: naming another workspace there would put this note on THAT workspace's
+  # board and its Slack lane, and make a directory under ~/.cc/state for it — from a timer, nobody present
+  # (review of #225). Line 2 is left alone here because a lie in it stops --push before any of this.
+  osx=$(bare ownX); dx=$(mkwork ws5/projX projX "$osx")
+  printf 'victimws\nprojX\n' > "$dx/.cc/track"
+  sx=$(mkwt "$T/strayX"); git -C "$sx" symbolic-ref HEAD refs/heads/track/projX
+  echo stray > "$sx/stray.txt"; git -C "$sx" add -A; git -C "$sx" -c user.name=t -c user.email=t@t commit -q -m stray
+  git -C "$sx" push -q "$osx" track/projX
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projX: push refused' <<<"$sw" && echo 0 || echo 1)" "sweep: a branch something else wrote to is refused whatever .cc/track says" "$sw"
+  k "$(grep -q '^note ws5 projX push refused' "$NOTES" && echo 0 || echo 1)" "sweep: and the refusal is filed under the track the PATH names" "$(cat "$NOTES")"
+  k "$(grep -q victimws "$NOTES" && echo 1 || echo 0)" "…so a lying .cc/track puts nothing on another workspace's board" "$(cat "$NOTES")"
+  k "$([ -e "$HOME/.cc/state/victimws" ] && echo 1 || echo 0)" "…and no journal is created under the name it claimed" "$HOME/.cc/state/victimws was created"
+  k "$(grep -q '^STATUS: BLOCKED' "$HOME/.cc/state/ws5/projX/progress.md" 2>/dev/null && echo 0 || echo 1)" "…the track's own journal getting the blocked line instead" "$(cat "$HOME/.cc/state/ws5/projX/progress.md" 2>/dev/null)"
+  # …AND THAT JOURNAL IS NEVER WRITTEN THROUGH A LINK. ~/.cc/state/<h> is bound read-WRITE into the member's boundary
+  # (cc-sandbox), so progress.md and the directory over it are theirs to replace with one — and `>>` follows a link.
+  # This runs as the owner from a timer with nobody present, so it was an unattended write-as-owner primitive: link
+  # progress.md at ~/.bashrc, arrange a refused lease, and two of our lines land in the owner's shell profile
+  # (security review of #225, round 13). Both shapes, each on its own commit so the marker does not skip the tick.
+  bump(){ echo "$1" > "$dx/work.txt"; git -C "$dx" add -A; git -C "$dx" -c user.name=t -c user.email=t@t commit -q -m "$1"; }
+  echo "not yours" > "$T/victimJ"
+  rm -f "$HOME/.cc/state/ws5/projX/progress.md"; ln -sf "$T/victimJ" "$HOME/.cc/state/ws5/projX/progress.md"
+  bump j1; : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projX: push refused' <<<"$sw" && echo 0 || echo 1)" "sweep: the refusal is still said out loud with the journal out of reach" "$sw"
+  eq "…and NOTHING went through a link left at progress.md — the one write that stayed in a member-writable path" "$(cat "$T/victimJ")" "not yours"
+  k "$(grep -q '^note ws5 projX push refused' "$NOTES" && echo 0 || echo 1)" "…the board note being written all the same: refusing costs the third warning, not the first two" "$(cat "$NOTES")"
+  mkdir -p "$T/decoyJ"
+  rm -rf "$HOME/.cc/state/ws5/projX"; ln -s "$T/decoyJ" "$HOME/.cc/state/ws5/projX"   # …the same bind lets them swap the DIRECTORY
+  bump j2; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$([ -e "$T/decoyJ/progress.md" ] && echo 1 || echo 0)" "…nor into a track directory that is a link, where O_NOFOLLOW on the file alone would not have helped" "$(ls "$T/decoyJ")"
+  rm -f "$HOME/.cc/state/ws5/projX"
+  mv "$HOME/.cc/state/ws5" "$T/ws5state"; ln -s "$T/decoyJ" "$HOME/.cc/state/ws5"   # …nor the WORKSPACE directory, checked BEFORE the mkdir that would otherwise make one through it
+  bump j3; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$([ -e "$T/decoyJ/projX" ] && echo 1 || echo 0)" "…nor into a linked workspace directory, and no directory is made through one either" "$(ls "$T/decoyJ")"
+  rm -f "$HOME/.cc/state/ws5"; mv "$T/ws5state" "$HOME/.cc/state/ws5"; mkdir -p "$HOME/.cc/state/ws5/projX"
+  bump j4; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q '^STATUS: BLOCKED' "$HOME/.cc/state/ws5/projX/progress.md" 2>/dev/null && echo 0 || echo 1)" "…while a plain journal in a plain directory still gets the line, which is the whole point of writing it" "$(cat "$HOME/.cc/state/ws5/projX/progress.md" 2>/dev/null)"
+  # A SYMLINKED ENTRY. The sweep's glob matches a link to a directory, and the member may write in
+  # ~/.cc/worktrees/<h>: this one points at a REAL worktree of their workspace inside their own checkout, so the
+  # .git wall passes and .cc is plain — and every identity downstream would come off the .cc/track in it, which is
+  # theirs to write (security review of #225).
+  ose=$(bare ownE)
+  git -C "$HOME/dev/ws5" worktree add -q -b track/evilL "$HOME/dev/ws5/evilwt"
+  git -C "$HOME/dev/ws5/evilwt" remote add origin "$ose"   # the remote pick_remote falls back to once path_ids has failed
+  mkdir -p "$HOME/dev/ws5/evilwt/.cc"; printf 'victimws\nevilL\n' > "$HOME/dev/ws5/evilwt/.cc/track"
+  echo evil > "$HOME/dev/ws5/evilwt/work.txt"; git -C "$HOME/dev/ws5/evilwt" add -A
+  git -C "$HOME/dev/ws5/evilwt" -c user.name=t -c user.email=t@t commit -q -m evil
+  ln -s "$HOME/dev/ws5/evilwt" "$HOME/.cc/worktrees/ws5/evilL"
+  : > "$CALLS"; : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/evilL: refusing to push from' <<<"$sw" && echo 0 || echo 1)" "sweep: an entry that is a symlink, not the track's own directory, is skipped" "$sw"
+  k "$(has "$ose" track/evilL && echo 1 || echo 0)" "…so nothing is pushed out of it" "pushed to $ose"
+  eq "…and no credential is minted for it" "$(grep -c gitargs "$CALLS")" 0
+  k "$(grep -q victimws "$NOTES" && echo 1 || echo 0)" "…no board of another workspace's is written to" "$(cat "$NOTES")"
+  eq "…the only note being the skip, against the entry's own name" "$(cut -d' ' -f1-3 "$NOTES")" "note ws5 evilL"
+  k "$([ -e "$HOME/.cc/state/victimws" ] && echo 1 || echo 0)" "…and nothing is created under ~/.cc/state in the name it claims" "$HOME/.cc/state/victimws was created"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q evilL <<<"$sw" && echo 1 || echo 0)" "…said once, not every five minutes" "$sw"
+  # …and the same tree reached directly: a --push from inside a member workspace that is not one of its tracks has
+  # no workspace to scope the credential to, so it mints none.
+  : > "$CALLS"; out=$(cd "$HOME/dev/ws5/evilwt" && CC_CHECKPOINT_NO_CREATE=1 "$bin/cc-checkpoint" --push 2>&1); rc=$?
+  k "$([ "$rc" != 0 ] && echo 0 || echo 1)" "push: a member workspace's tree that is not one of its tracks is refused" "rc=$rc out='$out'"
+  eq "…with no credential minted for it" "$(grep -c gitargs "$CALLS")" 0
+  k "$(grep -q 'refusing to push with an unscoped one' "$HOME/dev/ws5/evilwt/.cc/push.err" 2>/dev/null && echo 0 || echo 1)" "…and the reason is left in the worktree" "$(cat "$HOME/dev/ws5/evilwt/.cc/push.err" 2>/dev/null)"
+  rm -f "$HOME/.cc/worktrees/ws5/evilL"   # out of the way of the cases below, which sweep this workspace again
+  # AND THE TIMER SEEDS THE BASE, BUT MOVES NO DEFAULT BRANCH. A repository created for a project whose push never
+  # reached it is still empty, so the track landing there first from a timer is bug #218 again: the base is a plain
+  # push and goes ahead of it here too. `cc-gh-token default` is the org-admin half, and that waits — which is why
+  # the marker is kept for the next owner-present run (review of #225).
+  osb=$(bare ownB2); mkwork ws5/projB2 projB2 "$osb" >/dev/null
+  mkdir -p "$HOME/.cc/push-state/ws5/projB2"; : > "$HOME/.cc/push-state/ws5/projB2/base-seed"   # written where pick_remote writes it: the host's directory, not the member's tree
+  : > "$DEFS"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projB2: pushed' <<<"$sw" && echo 0 || echo 1)" "sweep: a project carrying a base-seed marker still has its commit pushed" "$sw"
+  k "$(has "$osb" main && echo 0 || echo 1)" "sweep: and the base goes in ahead of the track, so the repository does not open on it" "main is not on $osb"
+  eq "…while no default branch is moved for it from a timer" "$(cat "$DEFS")" ""
+  k "$([ -e "$HOME/.cc/push-state/ws5/projB2/base-seed" ] && echo 0 || echo 1)" "…the marker being kept for the owner-present run that asks GitHub by name" "it was spent from the timer"
+  # AND IT DELETES NOTHING FROM ANY REPOSITORY. evict_elsewhere runs `git push --delete` against the workspace's other
+  # remotes once a push lands: a destructive remote action, and the sweep pushes and NOTHING ELSE. A branch left in a
+  # sibling project's repository waits for `cc done` or the next owner-present turn (review of #225).
+  osv=$(bare ownV); otv=$(bare otherV); dv=$(mkwork ws5/projV sibling "$otv" projV "$osv")
+  git -C "$dv" push -q sibling track/projV
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$osv" track/projV && echo 0 || echo 1)" "sweep: a project's commit reaches its own repository" "$sw"
+  k "$(has "$otv" track/projV && echo 0 || echo 1)" "sweep: and no branch is deleted from the workspace's other repositories" "gone from $otv"
+  k "$({ [ -e "$dv/.cc/evict.err" ] || [ -e "$HOME/.cc/push-state/ws5/projV/evict.err" ]; } && echo 1 || echo 0)" "sweep: nor is an eviction so much as attempted from a timer" "$(cat "$dv/.cc/evict.err" "$HOME/.cc/push-state/ws5/projV/evict.err" 2>/dev/null)"
+  # A LINK PLANTED AT A STATE FILE. --push writes .cc/push.err.tmp as the OWNER, and ~/.cc/worktrees/<h> is bound
+  # read-write into the member's boundary at this same path: a link there aims that write at any file the owner can
+  # write, every five minutes with nobody present (review of #225).
+  osl=$(bare ownL2); dl=$(mkwork ws5/projL2 projL2 "$osl")
+  echo "not yours" > "$T/victim"; ln -sf "$T/victim" "$dl/.cc/push.err.tmp"
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: a link planted at a state file is not written through" "$(cat "$T/victim")" "not yours"
+  k "$(has "$osl" track/projL2 && echo 1 || echo 0)" "sweep: and that worktree is not pushed from at all" "pushed to $osl"
+  k "$(grep -q 'ws5/projL2: refusing to push from' <<<"$sw" && echo 0 || echo 1)" "sweep: the skip is named, with the worktree" "$sw"
+  eq "…and the board hears it once" "$(grep -c 'refusing to push from' "$NOTES")" 1
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q projL2 <<<"$sw" && echo 1 || echo 0)" "sweep: and it is not said again every five minutes" "$sw"
+  eq "…nor is the board told twice" "$(grep -c 'refusing to push from' "$NOTES")" 1
+  # A PUSH THAT FAILED FOR A REASON THAT MAY PASS IS TRIED AGAIN. The marker used to keep this head whatever went
+  # wrong, so one DNS blip, 5xx or unmintable credential left a member's commit on the box until they made another
+  # one — the bug this file exists to close (security review of #225). Here the remote is not there, and then it is.
+  ost=$(bare ownT); dt=$(mkwork ws5/projT projT "$T/gone.git")
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projT: push failed' <<<"$sw" && echo 0 || echo 1)" "sweep: a push that failed for a reason that may pass is said" "$sw"
+  eq "…and the board hears the reason once" "$(grep -c projT "$NOTES")" 1
+  : > "$NOTES"; : > "$CALLS"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q "gitargs $T/gone.git ws5" "$CALLS" && echo 0 || echo 1)" "sweep: and the next tick tries that same commit again" "$(cat "$CALLS")"
+  eq "…without telling the board a second time" "$(grep -c projT "$NOTES")" 0
+  git -C "$dt" remote set-url projT "$ost"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$ost" track/projT && echo 0 || echo 1)" "sweep: so when the reason passes the commit goes, with no new commit needed to prompt it" "$sw"
+  # A LINK AT EVERY NAME THE PUSH ONCE WROTE, AND THE PUSH RUNS ANYWAY. The member's session is live while the host
+  # pushes, so a link can be put at any of these AFTER a check has passed — which is why the state now lives in a
+  # directory of the host's, under no bind, and there is nothing aimed at those names to follow (security review of
+  # #225). This is --push under exactly the environment --sweep gives it.
+  osp=$(bare ownP); dp=$(mkwork ws5/projP projP "$osp")
+  echo "not yours" > "$T/victimP"; echo "nor this" > "$T/victimP2"
+  ln -sf "$T/victimP" "$dp/.cc/push.err.tmp"; ln -sf "$T/victimP" "$dp/.cc/push.err"; ln -sf "$T/victimP2" "$dp/.cc/pushed"
+  sdp="$HOME/.cc/push-state/ws5/projP"; mkdir -p "$sdp"
+  out=$(cd "$dp" && env CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "CC_CHECKPOINT_STATE_DIR=$sdp" "$bin/cc-checkpoint" --push 2>&1); rc=$?
+  eq "push: a link raced in at push.err.tmp is not written through" "$(cat "$T/victimP")" "not yours"
+  eq "…nor one at pushed" "$(cat "$T/victimP2")" "nor this"
+  k "$([ "$rc" = 0 ] && has "$osp" track/projP && echo 0 || echo 1)" "…while the commit still reaches the repository" "rc=$rc out='$out'"
+  eq "…its lease recorded where the member cannot reach it" "$(cat "$sdp/pushed" 2>/dev/null)" "$(git -C "$dp" rev-parse HEAD)"
+  rm -f "$dp/.cc/push.err.tmp" "$dp/.cc/push.err" "$dp/.cc/pushed"
+  # AND THE PLAIN CHECKPOINT — the mode `cc done` runs before it asks where to push — COMMITS AND PUSHES, so it
+  # writes pushed and push.err.tmp too, and checkpoint.err when it refuses. Only --push was ever handed the state
+  # dir, so on a dirty worktree the host went on writing inside ~/.cc/worktrees/<h>/<t>/.cc and a link left at one
+  # of those names was written through as the owner (review of #225). Same links, same live member, commit mode.
+  osc=$(bare ownW); dc=$(mkwork ws5/projW projW "$osc")
+  echo "not yours" > "$T/victimW"; echo "nor this" > "$T/victimW2"
+  ln -sf "$T/victimW" "$dc/.cc/pushed"; ln -sf "$T/victimW" "$dc/.cc/push.err.tmp"; ln -sf "$T/victimW2" "$dc/.cc/checkpoint.err"
+  echo dirty > "$dc/dirty.txt"   # what makes the plain checkpoint commit, and then push
+  sdc="$HOME/.cc/push-state/ws5/projW"; mkdir -p "$sdc"
+  ( cd "$dc" && env CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "CC_CHECKPOINT_STATE_DIR=$sdc" "$bin/cc-checkpoint" ) </dev/null >/dev/null 2>&1
+  eq "commit: a link at pushed is not written through by the checkpoint's own push" "$(cat "$T/victimW")" "not yours"
+  k "$(has "$osc" track/projW && echo 0 || echo 1)" "…while the commit still reaches the repository" "nothing on $osc"
+  eq "…its lease recorded in the host's own directory" "$(cat "$sdc/pushed" 2>/dev/null)" "$(git -C "$dc" rev-parse HEAD)"
+  git -C "$dc" checkout -q --detach; echo more > "$dc/dirty.txt"   # HEAD off the track's branch: the checkpoint refuses
+  ( cd "$dc" && env CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "CC_CHECKPOINT_STATE_DIR=$sdc" "$bin/cc-checkpoint" ) </dev/null >/dev/null 2>&1
+  eq "…and its refusal is not appended through a link at checkpoint.err either" "$(cat "$T/victimW2")" "nor this"
+  k "$(grep -q 'refused: HEAD is' "$sdc/checkpoint.err" 2>/dev/null && echo 0 || echo 1)" "…it goes where the caller asked, so the host can still read it" "$(cat "$sdc/checkpoint.err" 2>/dev/null)"
+  # A PUSH THAT LANDS UNLINKS NOTHING IN THE MEMBER'S TREE. It used to take their .cc/push.err away so `cc ls`
+  # stopped showing `push!` — but `rm` resolves .cc at removal time and the member's session is live, so a link
+  # swapped in during the push has the host unlink a file of that name wherever it points (security review of
+  # #225). The marker is theirs; cc-reconcile, which checks the branch and not the file, is what clears it.
+  osu=$(bare ownU); du=$(mkwork ws5/projU projU "$osu")
+  echo "the member's own" > "$du/.cc/push.err"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$osu" track/projU && echo 0 || echo 1)" "sweep: a project with a push.err of the member's own is still pushed" "$sw"
+  eq "…and nothing in their tree is unlinked for it" "$(cat "$du/.cc/push.err" 2>/dev/null)" "the member's own"
+  # A TICK NEVER LANDS INSIDE AN IN-FLIGHT `cc done` ON THE SAME TRACK. Both write the same ~/.cc/push-state files;
+  # `cc done` holds $sd/done.lock across its checkpoint, push and PR, and a tick pushing underneath it had lease_keep
+  # unlink the push.err.tmp `cc done`'s own rejected push was about to read — so `cc done` reported "push failed — no
+  # PR opened" for a branch that WAS pushed (review round 11 of #225). The tick steps aside, says so, retires nothing.
+  oso=$(bare ownO); mkwork ws5/projO projO "$oso" >/dev/null
+  sdo="$HOME/.cc/push-state/ws5/projO"; mkdir -p "$sdo"
+  { flock -n 9 || echo "the fixture could not take the lock"   # stands in for the `cc done` holding this track
+    swo=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1); } 9>"$sdo/done.lock"
+  k "$(grep -q "ws5/projO: skipped this tick" <<<"$swo" && echo 0 || echo 1)" "sweep: a track a 'cc done' is holding is stepped aside from, and said" "$swo"
+  k "$(has "$oso" track/projO && echo 1 || echo 0)" "…and nothing of it is pushed from under that run" "it pushed to $oso while the lock was held"
+  k "$([ -e "$HOME/.cc/sweep/ws5/projO" ] && echo 1 || echo 0)" "…and no marker retires the commit" "$(cat "$HOME/.cc/sweep/ws5/projO" 2>/dev/null)"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(has "$oso" track/projO && echo 0 || echo 1)" "…so the very next tick, with the lock free, pushes it" "$sw"
+  # A COMMIT THAT LANDS WHILE THE PUSH RUNS IS STILL A PUSH. The tick reads HEAD, then the member's live session
+  # commits again before the push goes out, so what the push put on the branch is not the head this tick read. Judged
+  # against that head the run fell through rc=0 to the last branch and told the member's board "no repository recorded
+  # for this project" about a project that has one and had just been pushed to (review round 11 of #225). The outcome
+  # is read off the lease the push RECORDED. (The stub commits when lease_push asks it for this url's credential.)
+  osr=$(bare ownRace); dr=$(mkwork ws5/projRace projRace "$osr")
+  : > "$NOTES"; printf '%s %s\n' "$osr" "$dr" > "$RACE"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projRace: pushed' <<<"$sw" && echo 0 || echo 1)" "sweep: a commit landing while the push runs is still reported as pushed" "$sw"
+  k "$(grep -q 'ws5/projRace: no repository recorded' <<<"$sw" && echo 1 || echo 0)" "…never as a project with no repository" "$sw"
+  eq "…and its board is told nothing" "$(grep -c projRace "$NOTES")" 0
+  eq "…the lease being what the push actually put there" "$(cat "$HOME/.cc/push-state/ws5/projRace/pushed" 2>/dev/null)" "$(git -C "$dr" rev-parse HEAD)"
+  # AND A DIVERGED BRANCH IS NEVER FORCED WITH A LEASE TAKEN FROM refs/remotes. That ref lives in the member's own
+  # ~/dev/<handle>/.git and any fetch refreshes it to whatever is really on the remote, so leasing against it
+  # force-pushes over the other writer instead of refusing — and the recorded lease goes whenever the worktree does
+  # (security review of #225). Here the other writer is on the remote, the ref has been fetched, and there is no
+  # lease of ours.
+  osz=$(bare ownZ); dz=$(mkwork ws5/projZ projZ "$osz")
+  git -C "$dz" push -q projZ track/projZ
+  sz=$(mkwt "$T/strayZ"); git -C "$sz" symbolic-ref HEAD refs/heads/track/projZ
+  echo stray > "$sz/stray.txt"; git -C "$sz" add -A; git -C "$sz" -c user.name=t -c user.email=t@t commit -q -m stray
+  git -C "$sz" push -q --force "$osz" track/projZ; zs=$(git -C "$sz" rev-parse HEAD)
+  git -C "$dz" fetch -q projZ   # what refreshes the tracking ref to the other writer's commit
+  echo more > "$dz/work.txt"; git -C "$dz" add -A; git -C "$dz" -c user.name=t -c user.email=t@t commit -q -m more
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: a diverged branch with no lease of ours is not forced over the other writer" "$(git ls-remote --heads "$osz" refs/heads/track/projZ | cut -c1-40)" "$zs"
+  k "$(grep -q 'ws5/projZ: push refused' <<<"$sw" && echo 0 || echo 1)" "…it is refused, and said" "$sw"
+  eq "…and the board hears it" "$(grep -c 'push refused' "$NOTES")" 1
+  # A TRACK FROM BEFORE #225, REBASED, IS NOT FALSELY BLOCKED BY THE SWEEP. Its lease lived at <wt>/.cc/pushed; the
+  # new ~/.cc/push-state is empty on the first tick and the sweep will not read the member file for a lease — so a
+  # since-rebased branch takes the plain push's non-fast-forward with nothing to lease against. That used to be
+  # called "something else wrote" and stopped the track (review round 8 of #225). Now the sweep sees it is a pre-#225
+  # track (the plain <wt>/.cc/pushed footprint), pushes nothing, writes NO STATUS: BLOCKED and NO board note, and
+  # leaves it for `cc done`. Nothing is forced: the remote keeps what the host last put there.
+  osm=$(bare ownM); dm=$(mkwork ws5/projM projM "$osm")
+  git -C "$dm" push -q projM track/projM; ma=$(git -C "$dm" rev-parse HEAD)
+  git -C "$dm" rev-parse HEAD > "$dm/.cc/pushed"   # the pre-#225 lease, in the OLD location the sweep will not read
+  git -C "$dm" -c user.name=t -c user.email=t@t commit -q --amend --allow-empty -m "projM rebased"   # a head the remote tip is no ancestor of
+  : > "$NOTES"; sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: a pre-#225 rebased track is not forced — the remote keeps the host's last push" "$(git ls-remote --heads "$osm" refs/heads/track/projM | cut -c1-40)" "$ma"
+  k "$(grep -q 'ws5/projM: not pushed' <<<"$sw" && echo 0 || echo 1)" "sweep: it is reported quietly, not as a foreign write" "$sw"
+  k "$(grep -qF "cc-checkpoint adopt ws5 projM" <<<"$sw" && echo 0 || echo 1)" "…and it names the ONE way out, not a push that can never happen" "$sw"
+  k "$(grep -q 'ws5/projM: push refused' <<<"$sw" && echo 1 || echo 0)" "…never 'push refused'" "$sw"
+  k "$(grep -q 'something else wrote' "$NOTES" && echo 1 || echo 0)" "…and no board note claims another writer" "$(cat "$NOTES")"
+  k "$(grep -q '^STATUS: BLOCKED' "$HOME/.cc/state/ws5/projM/progress.md" 2>/dev/null && echo 1 || echo 0)" "…and NO false STATUS: BLOCKED is written to its journal" "$(cat "$HOME/.cc/state/ws5/projM/progress.md" 2>/dev/null)"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  k "$(grep -q 'ws5/projM' <<<"$sw" && echo 1 || echo 0)" "sweep: and it is not said again every five minutes for the same commit" "$sw"
+  # …AND THAT WAY OUT IS REAL. rc=3 used to be a circle — the sweep said `cc done` would push it and `cc done` said
+  # the next push would record the lease, while a diverged branch can never fast-forward, so the track was unlandable
+  # by any automated path (review round 10 of #225). `adopt` is the exit and the only one: it reports without
+  # recording, refuses a sha the remote does not answer with, and on the one the operator read it writes the host's
+  # lease — after which the ordinary sweep reconciles the branch. Nothing is read out of <wt>/.cc anywhere in it.
+  sdm="$HOME/.cc/push-state/ws5/projM"
+  am=$(cd / && "$bin/cc-checkpoint" adopt ws5 projM 2>&1); arc=$?
+  k "$([ "$arc" = 1 ] && grep -qF "$ma" <<<"$am" && echo 0 || echo 1)" "adopt: with no sha it says what the remote holds" "rc=$arc $am"
+  k "$([ ! -e "$sdm/pushed" ] && echo 0 || echo 1)" "…and records nothing: reading costs nothing" "$(cat "$sdm/pushed" 2>/dev/null)"
+  am=$(cd / && "$bin/cc-checkpoint" adopt ws5 projM 0000000000000000000000000000000000000000 2>&1); arc=$?
+  k "$([ "$arc" = 1 ] && [ ! -e "$sdm/pushed" ] && echo 0 || echo 1)" "adopt: a sha the remote does not answer with records nothing" "rc=$arc $am"
+  am=$(cd / && "$bin/cc-checkpoint" adopt ws5 projM "$ma" 2>&1); arc=$?
+  eq "adopt: the sha the operator read becomes the HOST's lease" "$(cat "$sdm/pushed" 2>/dev/null)" "$ma"
+  k "$([ "$arc" = 0 ] && echo 0 || echo 1)" "…and it says the next push reconciles the branch" "rc=$arc $am"
+  sw=$(cd / && "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "…which the very next sweep tick does: the member's commit is on the repository" "$(git ls-remote --heads "$osm" refs/heads/track/projM | cut -c1-40)" "$(git -C "$dm" rev-parse HEAD)"
+  k "$([ ! -e "$sdm/adopted" ] && echo 0 || echo 1)" "…and the adopted flag is spent, so the push after it evicts like any other" "$(ls "$sdm")"
+  # A FORGED <wt>/.cc/pushed IS NEVER A FORCE-WITH-LEASE TARGET (round 9 of #225). The migration that copied its
+  # CONTENTS into the host lease is gone, so a member who writes the sha currently on the remote into it can no
+  # longer make the host force-push over that commit. Here another writer holds the remote at $fga; the member
+  # forges the file to exactly that sha and rebases; --push, run as `cc done` runs it (state under ~/.cc/push-state,
+  # none of its own recorded), refuses with rc=3 and forces nothing.
+  osfg=$(bare ownFg); dfg=$(mkwork ws5/projFg projFg "$osfg")
+  git -C "$dfg" push -q projFg track/projFg
+  sfg=$(mkwt "$T/strayFg"); git -C "$sfg" symbolic-ref HEAD refs/heads/track/projFg
+  echo other > "$sfg/o.txt"; git -C "$sfg" add -A; git -C "$sfg" -c user.name=t -c user.email=t@t commit -q -m other
+  git -C "$sfg" push -q --force "$osfg" track/projFg; fga=$(git -C "$sfg" rev-parse HEAD)   # the other writer's commit, now on the remote
+  git -C "$dfg" -c user.name=t -c user.email=t@t commit -q --amend --allow-empty -m "projFg rebased"   # local diverges from the remote
+  printf '%s\n' "$fga" > "$dfg/.cc/pushed"   # THE FORGERY: the member writes the remote's current sha, hoping cc done leases against it
+  sdfg="$HOME/.cc/push-state/ws5/projFg"; mkdir -p "$sdfg"; rm -f "$sdfg/pushed"   # the host holds no lease of its own
+  out=$(cd "$dfg" && env CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "CC_CHECKPOINT_STATE_DIR=$sdfg" "$bin/cc-checkpoint" --push 2>&1); rc=$?
+  eq "a forged <wt>/.cc/pushed does not become a force target — the other writer's commit stands" "$(git ls-remote --heads "$osfg" refs/heads/track/projFg | cut -c1-40)" "$fga"
+  k "$([ "$rc" = 3 ] && echo 0 || echo 1)" "…and --push returns rc=3 (no host lease to reconcile), never forcing" "rc=$rc out='$out'"
+  # The contrast that shows why the migration had to go: hand --push that very sha as the HOST's own lease (what the
+  # deleted seed did) and it DOES force over the other writer — so keeping any member file out of $sd/pushed is the fix.
+  printf '%s\n' "$fga" > "$sdfg/pushed"
+  ( cd "$dfg" && env CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "CC_CHECKPOINT_STATE_DIR=$sdfg" "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  eq "…proof that sha is a real force target: given as a HOST lease it overwrites the other writer" "$(git ls-remote --heads "$osfg" refs/heads/track/projFg | cut -c1-40)" "$(git -C "$dfg" rev-parse HEAD)"
+  # …and the same wall, asked directly: what `cc done` calls before any git of its own (review-156c).
+  gd=$(cd / && "$bin/cc-checkpoint" gitdir ws5 "$d"); grc=$?
+  k "$([ "$grc" = 0 ] && [ -z "$gd" ] && echo 0 || echo 1)" "gitdir: a track that really hangs off ~/dev/<handle>/.git passes, silently" "rc=$grc out='$gd'"
+  gd=$(cd / && "$bin/cc-checkpoint" gitdir ws5 "$ev"); grc=$?
+  k "$([ "$grc" = 1 ] && grep -q "^refusing to run git in $ev " <<<"$gd" && echo 0 || echo 1)" "gitdir: a redirected .git is refused, and the reason names the worktree" "rc=$grc out='$gd'"
+  gd=$(cd / && "$bin/cc-checkpoint" gitdir plain5 "$T/loose"); grc=$?
+  k "$([ "$grc" = 0 ] && echo 0 || echo 1)" "gitdir: a repo that is not a member workspace is nobody's business here" "rc=$grc out='$gd'"
   echo "cc-checkpoint selfcheck: $((n - f)) passed, $f failed"; [ "$f" = 0 ]
 }
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
+[ "$MODE" = gitdir ] && { member_gitdir "${2:?cc-checkpoint gitdir: handle}" "${3:?cc-checkpoint gitdir: worktree}"; exit $?; }
+[ "$MODE" = adopt ] && { adopt "${2:-}" "${3:-}" "${4:-}"; exit $?; }
+if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes for itself, and the box's own repos push from their own hook
+  # SAID ONCE, NOT EVERY FIVE MINUTES, and never inside the member's own tree: ~/.cc/worktrees/<h> and ~/.cc/state/<h>
+  # are both bound read-write into the boundary (cc-sandbox), so a marker kept there is the member's to forge or
+  # delete — and `.cc` in a worktree they invented could be a symlink at anything the owner can write. ~/.cc/sweep is
+  # under no bind at all. The board hears it too where the track has a row; the timer's journal always does.
+  # The marker carries the HEAD it is about and the outcome at it: one state is said once per commit, and a new
+  # commit or a different outcome is said again. A push that lands takes it away.
+  mark(){ mkdir -p "$HOME/.cc/sweep/$1" 2>/dev/null && printf '%s\n' "${head:-} $3" > "$HOME/.cc/sweep/$1/$2" 2>/dev/null; return 0; }
+  said_once(){   # $1 handle · $2 track · $3 message
+    [ "$(cat "$HOME/.cc/sweep/$1/$2" 2>/dev/null)" = "${head:-} $3" ] && return 0
+    mark "$1" "$2" "$3"
+    echo "$1/$2: $3"; "$BIN/cc-board" note "$1" "$2" "$3" >/dev/null 2>&1; return 0; }
+  safe_state(){   # $1 worktree → 0 when the .cc names a push once wrote are plain files of its own
+    # NOT WHAT MAKES THE WRITE SAFE — that is CC_CHECKPOINT_STATE_DIR below, which puts every write the push makes
+    # outside every bind the member has. This is the cheap sanity refusal in front of it: a track carrying a link at
+    # one of these names is one somebody is playing with, and it is skipped and named rather than pushed from. A
+    # dangling link is caught FIRST: -e is false through one.
+    local wt="$1" f
+    [ -d "$wt/.cc" ] && [ ! -L "$wt/.cc" ] || { echo "$wt/.cc is not a directory of its own"; return 1; }
+    for f in pushed adopted push.err push.err.tmp create.err create.err.tmp evict.err evict.err.tmp evict.same base-seed; do
+      [ ! -L "$wt/.cc/$f" ] || { echo "$wt/.cc/$f is a symlink"; return 1; }
+      [ ! -e "$wt/.cc/$f" ] || [ -f "$wt/.cc/$f" ] || { echo "$wt/.cc/$f is not a plain file"; return 1; }
+    done
+    return 0; }
+  for mk in "$HOME"/dev/*/.cc/member-workspace; do
+    [ -f "$mk" ] || continue
+    h=${mk%/.cc/member-workspace}; h=${h##*/}
+    # the MAIN checkout's hooks, never the worktree's — the pin cc-loop and cc put on every host-side git in a member's tree
+    hp=$(git -C "$HOME/dev/$h" config --type=path --get core.hooksPath 2>/dev/null); case "$hp" in "") hp="$HOME/dev/$h/.git/hooks";; /*) ;; *) hp="$HOME/dev/$h/$hp";; esac
+    for m in "$HOME/.cc/sweep/$h"/*; do [ -e "$m" ] || continue; [ -d "$HOME/.cc/worktrees/$h/${m##*/}" ] || rm -f "$m"; done   # a track that was removed and made again must be able to say the same thing again
+    for m in "$HOME/.cc/push-state/$h"/*; do [ -e "$m" ] || continue; [ -d "$HOME/.cc/worktrees/$h/${m##*/}" ] || rm -rf "$m"; done   # …and its lease goes with it, so a new worktree at that path leases against the remote and not against what the old one pushed
+    for wt in "$HOME/.cc/worktrees/$h"/*/; do
+      wt=${wt%/}; t=${wt##*/}; [ -f "$wt/.cc/track" ] || continue
+      # THE WALL FIRST, before any other git touches this tree — the same one `cc done` puts in front of its own
+      # (review-156c). ~/.cc/worktrees/<h> is read-write inside the boundary, so a member can leave a directory there
+      # carrying .cc/track and a git dir of their own whose config names an `ext::sh -c …` remote or core.fsmonitor:
+      # the push below would run it as the owner, and this runs every five minutes with nobody present (review of
+      # #225). Past this line the remotes come from ~/dev/<h>/.git/config, which is read-only in there.
+      head=   # nothing has been read out of that tree yet: the wall's refusal is keyed on no head, so a tree that is fixed says the next thing
+      # AND ONLY A DIRECTORY THAT IS REALLY ONE OF OURS. The `*/` glob matches a SYMLINK to a directory too, and
+      # ~/.cc/worktrees/<h> is read-write inside the boundary: `ln -s ~/dev/<h>/evilwt evil` names a real worktree of
+      # the workspace, so the wall and safe_state below both pass, while path_ids resolves outside ~/.cc/worktrees and
+      # every identity after it falls back to the member's own .cc/track — another workspace's board, a directory
+      # under ~/.cc/state in its name, and an unscoped credential (security review of #225).
+      if [ -L "$wt" ] || [ "$(readlink -f "$wt")" != "$(readlink -f "$HOME/.cc/worktrees/$h")/$t" ]; then
+        said_once "$h" "$t" "refusing to push from $wt — it is not the directory it names: a track is a real worktree at ~/.cc/worktrees/$h/$t or nothing of ours runs in it"; continue; fi
+      if ! why=$(member_gitdir "$h" "$wt"); then said_once "$h" "$t" "$why"; continue; fi
+      # AND NOTHING IS WRITTEN INSIDE THE MEMBER'S TREE AT ALL. The push's own state — push.err, push.err.tmp,
+      # pushed — goes to a directory of ours under ~/.cc/push-state, which is under no bind, so a link raced into
+      # ~/.cc/worktrees/<h>/<t>/.cc between a check and the write has nothing aimed at it (security review of #225).
+      # The refusal below is the sanity check in front of that, said once on no head the way the wall's is.
+      # NOTHING IS REMOVED IN THERE EITHER: `rm` resolves .cc at removal time, so a link swapped in during the push
+      # would have the host unlink a file of that name wherever it points.
+      # SO ONE RULE, FOR EVERY MARKER AND EVERY READER: a member workspace's host-side markers live in
+      # ~/.cc/push-state/<h>/<t> — push.err behind `push!` and checkpoint.err behind `commit!` — and the files of
+      # those names in the member's tree are the MEMBER'S, read by nobody on the host. `cc ls`, cc-digest,
+      # cc-reconcile and the Slack Home tab all follow it (cc-reconcile's host_marker states it once). Inside the
+      # boundary the Stop hook has no credential by design, so its own push.err is written every turn and no
+      # successful push of theirs ever clears it — read as the host's marker it lit `push!` for ever and had
+      # cc-reconcile ask "its branch is not pushed" every 20 minutes about a branch this timer had pushed (review
+      # round 10 of #225); and the host's own commit refusal, now written under $ST like everything else it writes,
+      # lit nothing anywhere while the readers still looked in the tree (review round 11).
+      if ! why=$(safe_state "$wt"); then said_once "$h" "$t" "refusing to push from $wt — $why: a track keeps those names as plain files of its own or nothing is pushed from it"; continue; fi
+      sd="$HOME/.cc/push-state/$h/$t"; mkdir -p "$sd" 2>/dev/null || continue
+      head=$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null) || continue
+      [ "$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)" = "track/$t" ] || continue   # --push's own rule; its refusal is the hook's to record, not a line here every 5 min
+      was=$(cat "$sd/pushed" 2>/dev/null); [ "$was" = "$head" ] && continue   # what it last pushed IS its head: nothing to do, and no token minted
+      # AND A REFUSED LEASE IS NOT TRIED AGAIN FOR THE SAME COMMIT. --push says one three ways every time it runs, so
+      # a branch something else wrote to would say it 288 times a day with nobody present, and no retry is going to
+      # change that until a person looks. The marker goes down before the push carrying this head; a push that lands
+      # takes it away. ONLY a refused lease keeps it: a push that failed for a reason that may pass — DNS, a 5xx, a
+      # credential that could not be minted — clears the head below, because one blip must not leave a member's
+      # commit sitting on the box for ever, which is the bug this file exists to close (security review of #225).
+      [ "$(cut -d' ' -f1 "$HOME/.cc/sweep/$h/$t" 2>/dev/null)" = "$head" ] && continue
+      prev=$(cat "$HOME/.cc/sweep/$h/$t" 2>/dev/null)   # what was said last time: the mark below overwrites it, and a retry still must not repeat itself
+      # AND NEVER UNDERNEATH AN IN-FLIGHT `cc done` ON THE SAME TRACK. `cc done` holds $sd/done.lock across its
+      # checkpoint, its push and its PR (core/bin/cc), and both write the same $sd/push.err.tmp and $sd/pushed: a tick
+      # landing inside one had lease_keep unlink the push.err.tmp `cc done`'s own rejected push was about to read, so
+      # `cc done` said "push failed — no PR opened" about a branch that WAS pushed (review round 11 of #225). Taken
+      # without waiting, and taken BEFORE the marker goes down: a track a person is finishing right now is left to
+      # them, nothing is retired for this head, and the next tick picks it up.
+      exec 7>"$sd/done.lock" || continue
+      if ! flock -n 7; then exec 7>&-
+        echo "$h/$t: skipped this tick — a 'cc done' is running for this track and holds its state; the next tick picks it up"; continue; fi
+      mark "$h" "$t" ''
+      # PUSH ONLY: CC_CHECKPOINT_NO_CREATE stops pick_remote short of `cc-gh-token create` and seed_base short of
+      # `cc-gh-token default`, so a timer neither makes a repository in the owner's org under a name a member
+      # chose nor moves one's default branch (review of #225).
+      # …and 7>&- so the lock does NOT ride into the child and everything it spawns: an flock lives until every copy
+      # of its fd is closed, so one process that outlived this tick would hold a track's done.lock indefinitely.
+      out=$(cd "$wt" && env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath "GIT_CONFIG_VALUE_0=$hp" CC_ROLE=worker CC_CHECKPOINT_NO_CREATE=1 "CC_CHECKPOINT_STATE_DIR=$sd" "$BIN/cc-checkpoint" --push 2>&1 7>&-); rc=$?
+      # WHAT THE PUSH DID, NOT WHAT HEAD SAID BEFORE IT. lease_keep records the sha it put on the branch, so the lease
+      # MOVING is the push landing — and it is the only account of it that holds when the member's live session commits
+      # again between the head read above and the push going out. Compared against $head instead, that run fell through
+      # rc=0 to the else below and told the member's board "no repository recorded for this project" about a project
+      # that has one and had just been pushed to (review round 11 of #225).
+      now=$(cat "$sd/pushed" 2>/dev/null)
+      if [ -n "$now" ] && [ "$now" != "$was" ]; then echo "$h/$t: pushed ${now:0:7}"; rm -f "$HOME/.cc/sweep/$h/$t"
+      elif [ "$rc" = 3 ]; then
+        # DIVERGED WITH NO HOST LEASE. The push was NOT forced and nothing was overwritten. A track from before #225
+        # kept its lease in <wt>/.cc/pushed, which this timer will not read; the sweep cannot tell that from a real
+        # foreign write, so it never force-pushes and never writes STATUS: BLOCKED here — that false BLOCKED stopped
+        # the very interactive tracks this exists to serve (review round 8 of #225). NO LATER PUSH GETS IT OUT
+        # EITHER: the branch cannot fast-forward and there is nothing safe to lease against, so `cc done` answers
+        # rc=3 too and pointing at it would be a circle (review round 10 of #225). The one exit is a person reading
+        # what the remote holds — `cc-checkpoint adopt` — and that is what this says, and what `cc done` says.
+        # Said once per commit to the timer's own journal (echo), never the project's board: a benign rebase must not
+        # nag it. The marker is already this head (mark '' above), so the next tick skips it until a new commit lands.
+        echo "$h/$t: not pushed — this branch has moved on from the remote and no lease of the host's says what it last put there, so nothing was forced and nothing overwritten. One way on: 'cc-checkpoint adopt $h $t' says what the remote holds, and records it once you have read that commit; the next tick then pushes."
+      elif [ "$rc" = 2 ]; then msg="push refused — $(tail -1 <<<"$out" | cut -c1-160)"
+        mark "$h" "$t" "$msg"; echo "$h/$t: $msg"   # a person has to look at this one: said for this commit, and not again until there is another
+      elif [ "$rc" != 0 ]; then msg="push failed — $(tail -1 <<<"$out" | cut -c1-160)"
+        head=; printf '%s\n' "$prev" > "$HOME/.cc/sweep/$h/$t" 2>/dev/null   # back to what it said before the push, which is what said_once compares against
+        said_once "$h" "$t" "$msg"   # no head in the marker, so the next tick tries this same commit again; the board hears the reason once
+      else said_once "$h" "$t" "no repository recorded for this project, and the timer makes none — 'cc done' or the owner does that"; fi
+      exec 7>&-   # the track is done with for this tick: a `cc done` typed a moment later waits on nothing
+    done
+  done
+  exit 0
+fi
 if [ "$MODE" != commit ]; then   # push only: no payload to read, no commit, and a real exit code for `cc done`
   root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "cc-checkpoint $MODE: not inside a git worktree" >&2; exit 1; }
   cd "$root" || exit 1
   # --remote answers WHERE, and makes the workspace project's repository if that is what the answer needs, so
   # `cc done` asks before the push and opens its PR against the same repository. It writes no branch, so the
   # HEAD rule below — which guards a push — is not its business.
+  ST=${CC_CHECKPOINT_STATE_DIR:-$root/.cc}
+  # …and never back into the worktree if that directory cannot be made: falling back would put the writes exactly
+  # where the caller asked for them not to be (security review of #225). rc=1 — the sweep tries again next tick.
+  mkdir -p "$ST" 2>/dev/null || { echo "cc-checkpoint $MODE: cannot make the state directory $ST — refusing to push rather than write the push's state inside the worktree" >&2; exit 1; }
   if [ "$MODE" = remote ]; then pick_remote || exit 1; printf '%s\n' "$remote"; exit 0; fi
   track=$(sed -n 2p "$root/.cc/track" 2>/dev/null); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
   # The same rule the hook keeps: only ever the track's own branch. Without it a session that repointed HEAD
@@ -850,7 +1541,7 @@ if [ "$MODE" != commit ]; then   # push only: no payload to read, no commit, and
   pick_remote || exit 0   # nowhere to push, and none to be made: that is not a failed push
   lease_push "$branch"; rc=$?
   [ "$rc" = 2 ] && lease_refused "$branch"
-  [ "$rc" = 0 ] || tail -3 "$root/.cc/push.err" >&2
+  [ "$rc" = 0 ] || tail -3 "$ST/push.err" >&2
   exit "$rc"
 fi
 # The hook's JSON payload (verified fields: session_id, transcript_path, cwd, stop_hook_active, …) — read
@@ -876,7 +1567,17 @@ commit_end(){   # The hook stays nonblocking. Completion requires observable, cl
   root=$(git rev-parse --show-toplevel 2>/dev/null) || exit "$STRICT"
   [ -f "$root/.cc/track" ] || exit "$STRICT"
   cd "$root" || exit "$STRICT"
-  refuse(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$root/.cc/checkpoint.err"; git reset -q 2>/dev/null; exit "$STRICT"; }   # unstage too: a refused secret must not sit in the index
+  # THE COMMIT PUSHES TOO, so it keeps its state where the caller says, exactly as --push does: `cc done` on a
+  # member workspace hands both calls the same directory under ~/.cc/push-state, and nothing this hook writes
+  # lands inside ~/.cc/worktrees/<handle>/<track>/.cc, which is bound read-write in the member's live boundary
+  # (review of #225). Unset — the member's own Stop hook — it is the worktree's .cc, whose only writer owns the
+  # tree. And never back into the worktree if that directory cannot be made — falling back would put the writes
+  # exactly where the caller asked for them not to be — so nothing at all is done this turn and the next one
+  # tries again (the same rule --push keeps; the hook's own exit stays 0, and a `--commit` completion fails, because
+  # a completion whose receipt could not be written is not one).
+  ST=${CC_CHECKPOINT_STATE_DIR:-$root/.cc}
+  mkdir -p "$ST" 2>/dev/null; [ -d "$ST" ] || exit "$STRICT"
+  refuse(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$ST/checkpoint.err"; git reset -q 2>/dev/null; exit "$STRICT"; }   # unstage too: a refused secret must not sit in the index
   track=$(sed -n 2p "$root/.cc/track"); branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo HEAD)
   [ -n "$track" ] && [ "$branch" = "track/$track" ] || refuse "refused: HEAD is '$branch', not 'track/$track' — checkpoint only ever commits the track's own branch"
   if [ "$STRICT" = 1 ]; then
@@ -893,7 +1594,7 @@ commit_end(){   # The hook stays nonblocking. Completion requires observable, cl
   mapfile -t ident < <(ident_args)
   git "${ident[@]}" commit -q -m "wip: checkpoint $(date -u +%FT%TZ) [$files file(s)] [cc]" 2>/dev/null \
     || { [ "$STRICT" = 0 ] && exit 0; refuse "failed: git commit"; }
-  rm -f "$root/.cc/checkpoint.err"
+  rm -f "$ST/checkpoint.err"
   [ "$STRICT" = 0 ] || commit_end
   if pick_remote; then   # push failures never block, but they must not be invisible either (cc ls / digest show "push!")
     lease_push "$branch"; [ $? = 2 ] && lease_refused "$branch"
