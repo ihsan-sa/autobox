@@ -614,8 +614,22 @@ def run(port):
         srv.server_close()
 
 
+def serve_port(opt):
+    """The port a `serve` comes up on: what was asked for, else the port the running server is already on, else
+    the default. `serve` IS a restart, and a landing that brings this back after changing it must not move the
+    page — a restart that answers on another port has not restarted anything the owner had open."""
+    if opt.get("--port"):
+        return int(opt["--port"])
+    if running():
+        try:
+            return int(open(portfile()).read().strip())
+        except (OSError, ValueError):
+            pass
+    return PORT
+
+
 def serve(opt):
-    port = int(opt.get("--port") or PORT)
+    port = serve_port(opt)
     stop(quiet=True)                                  # serve is a restart; "not running" is not news to whoever ran it
     os.makedirs(STATE, exist_ok=True)
     if "--foreground" in opt:
@@ -659,7 +673,7 @@ def _row(ts, sess="s1", cwd="/w", repo="r", track="t", kind="headless", model="m
 
 
 def selfcheck(_opt=None):
-    global LEDGER, WORKTREES, WEB, VITALS, PROJ
+    global LEDGER, WORKTREES, WEB, VITALS, PROJ, STATE
     ok, bad = 0, []
 
     def t(name, cond):
@@ -669,7 +683,7 @@ def selfcheck(_opt=None):
         else:
             bad.append(name)
 
-    keep_l, keep_w, keep_web, keep_v, keep_p = LEDGER, WORKTREES, WEB, VITALS, PROJ
+    keep_l, keep_w, keep_web, keep_v, keep_p, keep_s = LEDGER, WORKTREES, WEB, VITALS, PROJ, STATE
     root = tempfile.mkdtemp(prefix="cc-graphs-selfcheck-")
     try:
         WORKTREES = os.path.join(root, "wt")
@@ -900,6 +914,21 @@ def selfcheck(_opt=None):
         r_raw2 = tokens(hours=24, by="lane", step=900, upto=raw_now, raw=True)
         t("a file untouched since before the window is skipped, not read", r_raw2["raw"]["in"] == r_raw["raw"]["in"])
 
+        # 8b — a restart comes back on the port it was already serving. `serve` IS a restart, and a landing that
+        #      brings this server back after changing it must not move the page the owner has open.
+        STATE = os.path.join(root, "state")
+        os.makedirs(STATE)
+        t("serve_port: nothing running, the default", serve_port({}) == PORT)
+        with open(pidfile(), "w") as f:
+            f.write(str(os.getpid()))               # this process's own cmdline names cc-graphs, so running() sees it
+        with open(portfile(), "w") as f:
+            f.write("5199")
+        t("serve_port: a running server keeps the port it is on", serve_port({}) == 5199 != PORT)
+        t("serve_port: --port still wins over it", serve_port({"--port": "5201"}) == 5201)
+        with open(portfile(), "w") as f:
+            f.write("not a number")
+        t("serve_port: an unreadable port file falls back, it does not crash the restart", serve_port({}) == PORT)
+
         # 9 — the server: loopback, read-only, exact asset allowlist.
         WEB = os.path.join(root, "web")
         os.makedirs(WEB)
@@ -973,7 +1002,7 @@ def selfcheck(_opt=None):
             srv.server_close()
             Handler.log_message = quiet
     finally:
-        LEDGER, WORKTREES, WEB, VITALS, PROJ = keep_l, keep_w, keep_web, keep_v, keep_p
+        LEDGER, WORKTREES, WEB, VITALS, PROJ, STATE = keep_l, keep_w, keep_web, keep_v, keep_p, keep_s
         shutil.rmtree(root, ignore_errors=True)
 
     print("cc-graphs selfcheck: %d passed, %d failed" % (ok, len(bad)))

@@ -8,6 +8,8 @@
 #   cc-units check                     is-enabled/is-active/list-timers vs the manifest; one line, exit 1 on a fault
 #   cc-units restart-for [--root <dir>] <path…>
 #                                      unit<TAB>restart|rearm|owner|none for the units a change touches
+#   cc-units daemons-for [--root <dir>] <path…>
+#                                      daemon<TAB>restart<TAB>runs, for the LONG-LIVED PROCESSES no unit owns
 #   cc-units policy <unit> <field>     one cell, for anything that wants a single answer
 #   cc-units selfcheck                 the manifest's own invariants, against no live systemd at all
 # `restart-for` is the answer to "a .timer edit is invisible to an ExecStart-basename test": a changed OnCalendar
@@ -26,7 +28,7 @@ UD="${CC_UNITS_DIR:-$R/config/systemd-user}"
 # CC_UNITS_OVERLAY to the empty string turns that off (the selfcheck's fixtures run against no overlay at all).
 OVD=""; [ "$(basename "$R")" = core ] && OVD="$(cd "$R/.." && pwd)"
 OV="${CC_UNITS_OVERLAY-$OVD}"
-USAGE="usage: cc-units list|link|enable|check|restart-for [--root <dir>] <path…>|policy <unit> <field>|selfcheck"
+USAGE="usage: cc-units list|link|enable|check|restart-for|daemons-for [--root <dir>] <path…>|policy <unit> <field>|selfcheck"
 command -v jq >/dev/null 2>&1 || { echo "cc-units: jq is missing" >&2; exit 2; }
 [ -f "$M" ] || { echo "cc-units: no manifest at $M" >&2; exit 2; }
 
@@ -74,6 +76,35 @@ prows(){
   done < <(manifests)
   return 0
 }
+
+# The same rows for the `daemons` array: a long-lived process this tree starts OUTSIDE systemd. systemctl knows
+# nothing about one, so a landing that restarted every unit it touched can still leave one serving the pre-merge
+# code and report success (PR #295 did exactly that, 2026-09-07). A row names the file the process RUNS, the
+# paths that make it out of date, and the argv that brings it back — all relative to the declaring tree and
+# prefixed here exactly as prows does, so `runs` reads the same in a bare clone and inside an overlay.
+#   daemon<TAB>runs<TAB>restart<TAB>paths
+# `restart` is `owner`, `none`, or the argv joined by spaces with its FIRST token prefixed: that one is a path in
+# this tree, the rest are literal arguments.
+dprows(){
+  local t m d p
+  while IFS=$'\t' read -r t m d; do
+    case "$t" in
+      "$ROOT")   p="" ;;
+      "$ROOT"/*) p="${t#"$ROOT"/}/" ;;
+      *)         continue ;;
+    esac
+    jq -r --arg p "$p" '
+      (.daemons // [])[] | . as $r |
+      [ ($r.daemon // "?"),
+        ($p + ($r.runs // "?")),
+        ( if ($r.restart | type) == "array" and (($r.restart | length) > 0)
+          then ([$p + $r.restart[0]] + $r.restart[1:] | join(" "))
+          else ($r.restart // "?") end ),
+        ( ($r.paths // [($r.runs // "?")]) | map($p + .) | join(" ") ) ] | @tsv' "$m"
+  done < <(manifests)
+  return 0
+}
+
 sc(){ systemctl --user "$@" 2>&1; }   # never fails the caller: an is-* answer is the value, not the exit code
 
 # ---- check: what the audit asks. Every `required` row must be enabled and healthy; an `owner` row is checked
@@ -138,8 +169,27 @@ restart_for(){
   return 0   # the loop's status is the last row's `&&`, so a final unmatched row would report failure: no match is not an error
 }
 
+# ---- daemons-for: the same question for a process no unit owns. A row is hit by the paths it declares and by
+# nothing else — there is no unit file whose ExecStart could answer. Finding the running process is the caller's;
+# this says which daemon a changed path belongs to, and what brings it back.
+daemons_for(){
+  local dn runs re pa f tok changed=" " hit
+  lint_manifests || return 2      # same rule as restart_for: an unreadable manifest is not an empty answer
+  for f in "$@"; do changed="$changed$f "; done
+  while IFS=$'\t' read -r dn runs re pa; do
+    [ -n "$dn" ] || continue
+    hit=0
+    for tok in $pa; do
+      tok="${tok%/}"
+      case "$changed" in *" $tok "*|*" $tok"/*) hit=1 ;; esac    # the file itself, or anything under it
+    done
+    [ "$hit" = 1 ] && printf '%s\t%s\t%s\n' "$dn" "$re" "$runs"
+  done < <(dprows)
+  return 0   # no match is not an error, exactly as restart_for
+}
+
 selfcheck(){
-  local n=0 f=0 u en st he re out d pa tok T
+  local n=0 f=0 u en st he re out d pa tok T dn runs
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a check that PRINTS (jq -e) must not leak into the verdict
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }  # …and one that must NOT hold
@@ -193,11 +243,14 @@ selfcheck(){
   T=$(mktemp -d)
   mkdir -p "$T/core/config/systemd-user" "$T/config/systemd-user" "$T/elsewhere"
   cat > "$T/core/config/units.json" <<'J'
-{ "units": [ { "unit": "tool.service", "enable": "required", "start": "now", "health": "active", "restart": "restart" } ] }
+{ "units": [ { "unit": "tool.service", "enable": "required", "start": "now", "health": "active", "restart": "restart" } ],
+  "daemons": [ { "daemon": "graphs", "runs": "bin/graphs", "paths": ["bin/graphs", "web/graphs"],
+                 "restart": ["bin/graphs", "serve"] } ] }
 J
   cat > "$T/config/units.json" <<'J'
 { "units": [ { "unit": "dash.service",  "restart": "restart", "paths": ["dashboard", "bin-private/dashsrc"] },
-             { "unit": "quiet.service", "restart": "restart", "paths": ["quiet"] } ] }
+             { "unit": "quiet.service", "restart": "restart", "paths": ["quiet"] } ],
+  "daemons": [ { "daemon": "site", "runs": "bin-private/site", "restart": "owner" } ] }
 J
   printf '[Service]\nExecStart=%%h/bin/tool run\n' > "$T/core/config/systemd-user/tool.service"
   # its ExecStart names NOTHING the cases below change: every hit on this unit is a declared path's doing
@@ -215,13 +268,32 @@ J
   k "$(t grep -qx 'tool.service	restart' <<<"$out")" "the core tree's own rows still answer for the file their ExecStart runs, from inside an overlay"
   out=$(rf --root "$T/elsewhere" dashboard/server.py core/bin/tool)
   k "$(t test -z "$out")" "…and landing ANOTHER repo restarts none of them: a path is declared relative to the tree that declares it"
+  # ---- and the same questions for a process NO unit owns. systemctl knows nothing about one, so every case
+  # above is blind to it: on 2026-09-07 a landing restarted each unit it touched, reported "deployed", and the
+  # graphs server went on answering from the pre-merge code because a shell had started it.
+  df(){ CC_UNITS_MANIFEST="$T/core/config/units.json" CC_UNITS_DIR="$T/core/config/systemd-user" \
+        CC_UNITS_OVERLAY="$T" "$0" daemons-for "$@"; }
+  out=$(df core/bin/graphs)
+  k "$(t grep -qx 'graphs	core/bin/graphs serve	core/bin/graphs' <<<"$out")" "a daemon row answers with the argv that brings it back and the file it runs, each prefixed by the tree that declares it"
+  out=$(df core/web/graphs/app.js)
+  k "$(t grep -q '^graphs	' <<<"$out")" "…and a change to the ASSETS it serves hits it too, though the file it runs never moved — the shape that left a merged server on old code"
+  out=$(df core/docs/note.md graphsish.md)
+  k "$(t test -z "$out")" "a change outside every declared path names no daemon"
+  df core/docs/note.md >/dev/null 2>&1; k $? "…and exits 0 saying so"
+  out=$(df bin-private/site)
+  k "$(t grep -qx 'site	owner	bin-private/site' <<<"$out")" "an overlay's own daemon is read, its paths default to the file it runs, and restart=owner comes back as that word — the landing names it instead of restarting it"
+  out=$(df --root "$T/elsewhere" core/bin/graphs bin-private/site)
+  k "$(t test -z "$out")" "…and landing ANOTHER repo declares none of them"
+
   # a manifest with a typo in it must not read as "this tree declares nothing": jq complains on stderr and keeps
   # going, and an empty answer that exits 0 is what a landing believes
   printf '{ this is not valid json\n' > "$T/config/units.json"
   out=$(rf dashboard/server.py 2>&1); re=$?
   k "$(t test "$re" -ne 0)" "an unreadable overlay manifest exits non-zero — an empty answer here is a landing's silent guess"
   k "$(t grep -q 'not valid json' <<<"$out")" "…and says which file, on stderr"
-  rm -rf "$T"; unset -f rf
+  out=$(df core/bin/graphs 2>&1); re=$?
+  k "$(t test "$re" -ne 0)" "…and daemons-for refuses it the same way: a daemon a landing cannot be told about is one it leaves on the old code"
+  rm -rf "$T"; unset -f rf df
 
   # the rows a landing reads — the overlay's included — must name a policy it knows, and declare plain relative paths
   out=""; while IFS=$'\t' read -r u re d pa; do
@@ -236,6 +308,22 @@ J
       jq -r '.units[].unit' "$OV/config/units.json" | grep -qxF "$(basename "$u")" || out="$out $(basename "$u")"; done
     k "$(t test -z "$out")" "every overlay unit file has a row in the overlay manifest —${out:- none missing}"
   fi
+  # the daemon rows a landing reads: each names a file to RUN — that is how the process is recognised — a restart
+  # policy it knows, and plain relative paths. `restart` is an argv joined by spaces here, so a token with a space
+  # in it would silently become two arguments.
+  out=""; while IFS=$'\t' read -r dn runs re pa; do
+    [ -n "$dn" ] || continue
+    case "$dn" in '?') out="$out ?:daemon";; esac
+    case "$runs" in ''|*'?') out="$out $dn:runs=$runs";; /*|*..*) out="$out $dn:runs=$runs";; esac
+    case "$re" in owner|none) ;; '?'|'') out="$out $dn:restart=$re";; /*|*..*) out="$out $dn:restart=$re";; esac
+    for tok in $pa; do case "$tok" in /*|*..*|*'*'*|*'?'*) out="$out $dn:paths=$tok";; esac; done
+  done < <(dprows)
+  k "$(t test -z "$out")" "every daemon row a landing reads names a file to run, a restart it knows and plain relative paths —${out:- all do}"
+  # the row the whole field exists for: nothing in systemd owns the graphs server, so without a row here a landing
+  # that changes it restarts every unit, says "deployed", and leaves the old process answering (2026-09-07)
+  k "$(t test -n "$(jq -r '.daemons[]? | select(.daemon=="cc-graphs") | .runs' "$M")")" \
+    "the graphs server is declared a daemon — no unit owns it, and a landing has to be told that"
+
   # an unlinked unit is a fault even for a `timer` row, which every other test skips
   out=$(CC_UNITS_LINKDIR="$UD/no-such-link-dir" check 2>&1)   # a path that cannot exist: no temp dir to leak
   k "$(t grep -q 'cc-digest.service=unlinked' <<<"$out")" "an unlinked timer-driven .service is reported, not skipped"
@@ -269,6 +357,13 @@ case "${1:-}" in
                  shift 2
                fi
                [ $# -gt 0 ] || { echo "$USAGE" >&2; exit 2; }; restart_for "$@" ;;
+  daemons-for) shift
+               if [ "${1:-}" = --root ]; then
+                 [ $# -ge 2 ] || { echo "$USAGE" >&2; exit 2; }
+                 ROOT="$(cd "$2" 2>/dev/null && pwd)" || { echo "cc-units: no such --root: $2" >&2; exit 2; }
+                 shift 2
+               fi
+               [ $# -gt 0 ] || { echo "$USAGE" >&2; exit 2; }; daemons_for "$@" ;;
   policy)      [ $# -eq 3 ] || { echo "$USAGE" >&2; exit 2; }; cell "$2" "$3" ;;
   selfcheck)   selfcheck ;;
   *)           echo "$USAGE" >&2; exit 2 ;;

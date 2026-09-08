@@ -116,6 +116,12 @@ WHAT IT WILL NOT DO, and why each line is here:
     back. Enabling the added ones is the step a worker structurally cannot do: cc-guard denies it systemctl.
   · It never restarts the unit that owns the shared tmux server. That would take every session on the box
     down, this one included; if the change moved what that unit runs, it says so and leaves it to a person.
+  · A process systemd does not own was the blind spot in all of that. PR #295 changed a file, every unit that
+    mattered came back, the landing said "deployed", and a server a shell had started went on answering from
+    the pre-merge code (2026-09-07). A `daemons` row in config/units.json names what brings such a process
+    back, and the restart is PROVED by the new pid rather than by the command's exit code; anything else
+    running a file the change touched is NAMED on the card and left running. "Deployed" means the running
+    thing changed, or it says by name which part of it did not.
 
 THE ONLY THING ON THIS BOX THAT MERGES. A 👍 in #approvals used to squash-merge inside the Slack daemon and call this
 afterwards — so every step below ran against a PR that was already in, the gates reported "gates guard the merge, and
@@ -278,7 +284,7 @@ NEVER = "tmux-main.service"               # restarting it takes the shared tmux 
 # The steps a failure of which leaves the BOX wrong, so nothing after them may run. Everything else — card,
 # board, ledger — is a record of what happened, not the thing that happened: it reports ✗, the sequence carries
 # on, and the run exits 3 so the operator still knows one of them wants a hand.
-FATAL = ("review", "gates", "merge", "install", "units", "restart")
+FATAL = ("review", "gates", "merge", "install", "units", "restart", "daemons")
 # …and of those, the ones worth trying AGAIN unattended. A review verdict and a refused merge are decisions: re-running
 # them buys the same answer, and they want a person. install/units/restart fail on the STATE of the box — a checkout
 # parked on a feature branch, a unit mid-restart — which the next attempt may well find fixed, and PR #87 sat
@@ -286,7 +292,7 @@ FATAL = ("review", "gates", "merge", "install", "units", "restart")
 # (cc-slack's selfcheck, boarded apart), and a job that ended on a flake is why 39 tmux lanes chained waiter pids into
 # a queue of their own on top of this one. A PR that CONFLICTS fails in that step too and is a decision — run_job ends
 # it at once. A usage limit at the review is neither: the job is DEFERRED to the reset, uncounted (see run_job).
-RETRY = ("gates", "install", "units", "restart")
+RETRY = ("gates", "install", "units", "restart", "daemons")
 RETRY_AFTER = 900                         # …and how long a kept job waits before the queue re-runs itself (see rearm)
 # A LAND-AFTER-FIX is the one stopping verdict that names its own remedy, and dispatching that remedy was a dozen
 # full-context turns of the planning session's every time: read the verdict, write the brief, dispatch, watch for
@@ -457,6 +463,110 @@ def read_unit(name):
         return ""
 
 
+def live_processes():
+    """(pid, argv, unit, exe) for every process this user owns: what it was started as, the systemd user unit that
+    owns it — "" for one nothing does, which is the whole point of reading this at all — and what the KERNEL says
+    it is executing. Straight from /proc and never raising: a pid that exits mid-scan is simply not in the answer,
+    and a system with no /proc gives an empty list rather than a red deploy.
+
+    `exe` is read here and not left to the caller because argv and exe have to be read of the SAME pid in the same
+    pass: between two passes a pid is reused and the pair would describe two different processes."""
+    me, found = os.getuid(), []
+    try:
+        pids = [n for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return found
+    for n in pids:
+        try:
+            if os.stat(f"/proc/{n}").st_uid != me:
+                continue
+            argv = [a for a in open(f"/proc/{n}/cmdline", "rb").read().decode("utf-8", "replace").split("\0") if a]
+            cg = open(f"/proc/{n}/cgroup").read()
+            exe = os.readlink(f"/proc/{n}/exe")
+        except OSError:
+            continue
+        if not argv:
+            continue                                   # a kernel thread has no command line
+        # The cgroup LEAF names the unit a process belongs to. A `.scope` is a login session or a terminal —
+        # it owns nothing and restarts nothing, and is exactly where a server started by hand ends up.
+        unit = next((leaf for ln in cg.splitlines() for leaf in [ln.rsplit("/", 1)[-1]]
+                     if leaf.endswith(".service")), "")
+        # A binary replaced under a running process reads back as "<path> (deleted)". Kept as it is rather than
+        # resolved away: it matches nothing, which is the right answer — that process is on code no longer here.
+        found.append((int(n), argv, unit, exe if exe.endswith(" (deleted)") else os.path.realpath(exe)))
+    return found
+
+
+def own_ancestry():
+    """This process and every parent of it. cc-land is itself a file in the repo it lands, and so is the loop
+    that started it: without this, a landing that changes cc-land reports cc-land as a server left on old code."""
+    seen, pid = set(), os.getpid()
+    while pid and pid not in seen:
+        seen.add(pid)
+        try:
+            m = re.search(r"^PPid:\s*(\d+)", open(f"/proc/{pid}/status").read(), re.M)
+        except OSError:
+            break
+        pid = int(m.group(1)) if m else 0
+    return seen
+
+
+INTERP = {}
+
+
+def interpreter_of(prog):
+    """The binary the kernel ends up executing for `prog`: `prog` itself if it is a compiled program, else the
+    interpreter its own `#!` line names — `/usr/bin/env foo` resolved through PATH, which is what the kernel's
+    exec of `env` does next. "" when the file has no `#!` and is not what got executed.
+
+    Cached by path: it is asked once per candidate process, and the answer is a file no landing moves."""
+    if prog in INTERP:
+        return INTERP[prog]
+    ans = ""
+    try:
+        head = open(prog, "rb").read(256)
+    except OSError:
+        head = b""
+    if head.startswith(b"#!"):
+        tok = head.split(b"\n", 1)[0][2:].decode("utf-8", "replace").strip().split()
+        if tok:
+            ans = shutil.which(tok[1]) or "" if os.path.basename(tok[0]) == "env" and len(tok) > 1 else tok[0]
+    INTERP[prog] = os.path.realpath(ans) if ans else ""
+    return INTERP[prog]
+
+
+def repo_program(argv, root, exe):
+    """The file inside `root` a process is RUNNING, relative to it, or "". Only argv[0] and argv[1] — the program
+    and, when argv[0] is an interpreter, its script. Never deeper: a repo file further along an argv is an
+    ARGUMENT, not a program, and counting it would name a `grep` over the diff, or a session carrying a path in
+    its prompt, as a server left on old code. The cost of that line is the other spelling of an interpreter —
+    `env python3 <script>` puts the script at argv[2] — which is missed rather than guessed at.
+
+    AND ARGV IS NOT PROOF, which is why `exe` is required beside it. `/proc/<pid>/cmdline` is the process's own
+    memory: `bash -c 'exec -a <root>/core/bin/cc-graphs sleep 999'` presents as the daemon at no privilege at all.
+    A decoy that did would break this step in both directions — alive across a genuine restart it sits in `was`
+    and in `now`, so the new pid reads as "the running thing did not change" and burns the retries; appearing in
+    place of a daemon that did NOT come back it reads as a new pid, which is the false success this step exists to
+    stop. `exe` is the target of `/proc/<pid>/exe`, written by the KERNEL at exec: a process cannot move it
+    without exec'ing that very file, so it is the one part of a process's self-description that is not the
+    process's to choose. A compiled program must therefore BE the file; a script must be running under the
+    interpreter its own `#!` line declares.
+
+    What that still does not catch is a process of that same interpreter which rewrites its own cmdline (a python3
+    that imports setproctitle). Closing that would need the daemon to prove its identity rather than the landing
+    to infer it, and this step is a warning and a restart proof, not a security boundary. The other cost is a
+    daemon whose entry file carries no `#!` and is started through an interpreter named on the command line
+    (`node app.js`): its exe is the interpreter and the file declares none, so it is missed rather than guessed
+    at — the same rule as `env python3 <script>` above, and a `#!` line on the entry file ends it."""
+    for tok in argv[:2]:
+        if "/" not in tok:
+            continue
+        p = os.path.realpath(tok)
+        if p.startswith(root + "/") and os.path.isfile(p) and exe and exe in (p, interpreter_of(p)):
+            return p[len(root) + 1:]
+    return ""
+
+
 def unit_policy(name, field):
     """One cell of config/units.json, via cc-units — the manifest that says whose call a unit is."""
     rc, o = sh([f"{BIN}/cc-units", "policy", name, field], timeout=30)
@@ -480,6 +590,23 @@ def units_for_paths(root, files):
         cell = ln.split("\t")
         if len(cell) == 2 and cell[0]:
             out[cell[0]] = cell[1]
+    return out
+
+
+def daemons_for(root, files):
+    """{daemon: (restart, runs)} for the long-lived processes config/units.json says these changed files belong
+    to — the ones no systemd unit owns, which every question above this is blind to. Same reader, same rule and
+    same failure as units_for_paths: a manifest that will not parse is an ERROR, not an empty answer."""
+    if not files:
+        return {}
+    rc, o = sh([f"{BIN}/cc-units", "daemons-for", "--root", root] + files, timeout=120)
+    if rc:
+        raise Failed(f"cc-units daemons-for: {last(o)}")
+    out = {}
+    for ln in o.splitlines():
+        cell = ln.split("\t")
+        if len(cell) == 3 and cell[0]:
+            out[cell[0]] = (cell[1], cell[2])
     return out
 
 
@@ -1230,6 +1357,8 @@ class Land:
         self.bought = False      # …and whether that read actually spent a buy: given back only by a usage limit or
                                  # a cap, which read nothing. A red suite does not give it back — the read happened
         self.restarted = []
+        self.stale = []          # what is still running the old code because nothing here could restart it —
+                                 # named in the deploy's line AND on the card, never silently called deployed
         self.unverified = []     # ledger rows this landing could not confirm: named, and left open
 
     def base(self):
@@ -2161,7 +2290,84 @@ class Land:
             raise Skip("nothing running uses the files this change touched" + tail)
         return f"restarted: {', '.join(self.restarted)}{tail}"
 
-    # -- 10. delivery: the ask's own check, run last of all ---------------------------------------------------
+    # -- 10. what systemd does NOT own: a server somebody started from a shell -----------------------------
+    def daemons(self):
+        """Every step above answers for units. A long-lived process started outside systemd is invisible to all
+        of them, and on 2026-09-07 that was the whole failure: PR #295 changed cc-graphs, the units that mattered
+        were restarted, the landing said "deployed", and 127.0.0.1 went on answering from the pre-merge Python
+        until somebody checked by hand.
+
+        Two answers here, and only two. A process a units.json `daemons` row DECLARES comes back through that
+        row's own command — the tool's restart, which stops the pid in its own pidfile, never one this guessed at
+        — and is then PROVED: it must reappear under a NEW pid, or this step is red. "The restart command ran" is
+        not "the running thing changed", and asserting the first is the shape that has fooled this box before.
+        Anything else running a file this change touched is NAMED, here and on the card, and left exactly where
+        it is. A stale server said out loud is worth more than one restarted on a guess.
+
+        Which process IS the daemon is decided by repo_program, and never by its command line alone: a cmdline is
+        the process's own memory, so a decoy could otherwise fail a real restart or stand in for one that failed."""
+        files = [p for st, p in self.changed_files() if st != "D"]
+        if not files:
+            raise Skip("no file list for this landing — nothing to look for")
+        root = os.path.realpath(self.root)
+        rows = daemons_for(self.root, files)
+        mine = own_ancestry()
+
+        def bare():
+            """Every process no unit owns, with the file of this repo it is running. Re-read each time: proving a
+            restart means looking again, not trusting the list from before it."""
+            return [(pid, repo_program(argv, root, exe)) for pid, argv, unit, exe in live_processes()
+                    if not unit and pid not in mine]
+
+        pids = lambda s: ", ".join(str(p) for p in sorted(s))
+        started, notes = [], []
+        claimed = {runs for _, runs in rows.values()}   # by the file, not by the pid: a daemon that came back on a
+                                                        # NEW pid is accounted for, and naming that new process as
+                                                        # stale would report the restart this step just proved
+        for name in sorted(rows):
+            policy, runs = rows[name]
+            was = {pid for pid, rel in bare() if rel == runs}
+            if not was:
+                notes.append(f"{name} is not running here")
+                continue
+            if policy == "none":
+                notes.append(f"{name} picks this up on its next start (units.json restart=none)")
+                continue
+            if policy == "owner":
+                self.stale.append(f"{name} (pid {pids(was)})")
+                notes.append(f"{name} is the owner's to restart (units.json restart=owner)")
+                continue
+            argv = [f"{root}/{policy.split()[0]}"] + policy.split()[1:]
+            rc, o = sh(argv, cwd=root, timeout=180)
+            if rc:
+                raise Failed(f"{policy}: {last(o)}")
+            now = {pid for pid, rel in bare() if rel == runs}
+            if not now or (now & was):
+                raise Failed(f"`{policy}` ran, but {name} is still "
+                             f"{'pid ' + pids(now & was) if now & was else 'not running'} — the running thing did "
+                             f"not change, so the box is on the old code whatever this step printed")
+            started.append(f"{name} (pid {pids(now)})")
+        others = {}
+        for pid, rel in bare():
+            if rel in set(files) and rel not in claimed:
+                others.setdefault(rel, []).append(pid)
+        # One entry per PROGRAM, not per pid: a per-session process has a dozen of them, and a card carrying a
+        # dozen pids is a warning nobody finishes reading. The pids are still there while they are few enough
+        # to act on.
+        for rel in sorted(others):
+            self.stale.append(f"{rel} (pid {pids(others[rel])})" if len(others[rel]) < 4
+                              else f"{rel} ({len(others[rel])} processes)")
+        if not started and not self.stale:
+            raise Skip("nothing outside systemd runs the files this change touched"
+                       + ("; " + "; ".join(notes) if notes else ""))
+        bits = []
+        if started:
+            bits.append("restarted, and back on a new pid: " + ", ".join(started))
+        if self.stale:
+            bits.append("NOT restarted, still on the old code: " + ", ".join(self.stale))
+        return "; ".join(bits + notes)
+
+    # -- 11. delivery: the ask's own check, run last of all ---------------------------------------------------
     def verify_delivery(self):
         """Merged is not delivered. Each ledger row this landing touched names its own verification — a command
         whose EXIT CODE decides — and `cc-scope deliver` runs it: 0 the row is delivered, anything else and the
@@ -2243,7 +2449,7 @@ class Land:
         run them once at the end instead of once per PR. `settle` is first and belongs to all of them: everything
         below this line changes the box, so none of it may run while another queued job is still being gated."""
         return [("settle", self.settle), ("install", self.install), ("units", self.enable_units),
-                ("restart", self.restart), ("verify", self.verify_delivery)]
+                ("restart", self.restart), ("daemons", self.daemons), ("verify", self.verify_delivery)]
 
     def steps(self):
         return self.pr_steps() + self.deploy_steps()
@@ -2323,6 +2529,11 @@ class Land:
                   f"command to retry just those: everything else is a no-op the second time.")
         elif rc == 0:
             print("landed.")
+        if self.stale:
+            print(f"NOT restarted, still on the old code: {', '.join(self.stale)}. Nothing here owns "
+                  f"{'them' if len(self.stale) > 1 else 'it'} — a systemd unit, or a `daemons` row in "
+                  f"config/units.json, is what would let a landing bring "
+                  f"{'them' if len(self.stale) > 1 else 'it'} back.")
         return rc
 
 
@@ -2462,6 +2673,12 @@ def result_of(L, rc, job, tail):
     else:
         short = (f"{what}: merged, but the deploy stopped at {L.stopped} ❌ after {tries} tries — the box is still "
                  f"running the old code.")
+    # "deployed" is a claim about what is RUNNING, so anything this landing could not restart goes in the same
+    # sentence as the ✅ — not a line further down the tail nobody reads on a phone.
+    if L.stale and rc in (0, COSMETIC, UNVERIFIED):
+        short += (f" ⚠️ {', '.join(L.stale)} still "
+                  f"{'run' if len(L.stale) > 1 else 'runs'} the old code — nothing here could restart "
+                  f"{'them' if len(L.stale) > 1 else 'it'}.")
     if L.stopped == "load" and job.get("by"):     # a phantom PR: the culprit is the caller, so say who that was
         short += f" — queued by {job['by'][:160]}"
     return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short,
@@ -3662,13 +3879,14 @@ def cmd_selfcheck():
         return json.dumps({"result": "", "subtype": subtype, "is_error": True, "num_turns": turns,
                            "errors": [f"Reached maximum budget (${cost:g})"], "total_cost_usd": cost})
 
-    LINKED, BODY, BOARD = [[]], [{}], [{}]
+    LINKED, BODY, BOARD, PROCS, MINE = [[]], [{}], [{}], [[]], [set()]
 
     REAL = {k: globals()[k] for k in ("sh", "run_gate", "linked_units", "read_unit", "board",
-                                      "repo_root")}
+                                      "repo_root", "live_processes", "own_ancestry")}
     globals().update(sh=fake_sh, run_gate=lambda argv, cwd, log, env: fake_sh(argv, cwd=cwd, env=env, log=log),
                      linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
-                     board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland")
+                     board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland",
+                     live_processes=lambda: list(PROCS[0]), own_ancestry=lambda: set(MINE[0]))
     FACTS = {"title": "a change", "state": "OPEN", "mergeable": "MERGEABLE",
              "headRefName": "track/w1", "mergeCommit": None}
 
@@ -3677,6 +3895,7 @@ def cmd_selfcheck():
         shutil.rmtree(root_dir(), ignore_errors=True)   # a change's review/repair tally OUTLIVES its job file, which
                                                         # is the point of it — so a case that wants a spent one builds
                                                         # it, and no case inherits the one before it left behind
+        PROCS[0], MINE[0] = [], set()
         LINKED[0] = ["cc-new.service", "cc-slackd.service", NEVER]
         BODY[0] = {"cc-new.service": "[Service]\nExecStart=%h/bin/cc-new\n[Install]\nWantedBy=default.target\n",
                    "cc-new.timer": "[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n",
@@ -4324,7 +4543,7 @@ def cmd_selfcheck():
         # automatic repair round. The clause that names the round belongs to a verdict — nothing read this diff, so
         # the round did not fail here, and saying it did is what sent #194 to a person as a change twice rejected.
         class Ended:
-            repo, pr, stopped = "myrepo", 7, "review"
+            repo, pr, stopped, stale = "myrepo", 7, "review", ()
 
             def __init__(self, why):
                 self.why = why
@@ -5197,6 +5416,173 @@ def cmd_selfcheck():
           "read as 'this change touched no unit', it must stop the deploy and name the file",
           isinstance(r, Failed) and "not valid json" in str(r) and not ran("restart", "dash.service"))
 
+    # 7b. …and what NO unit owns. PR #295 changed cc-graphs, every unit that mattered WAS restarted, the landing
+    # said "deployed", and the bare `cc-graphs serve` process went on answering from the pre-merge Python until
+    # somebody looked by hand (2026-09-07). The fixtures are real files on disk: the step decides what a process
+    # is running by resolving its own argv against the tree being landed, so a made-up path would prove nothing.
+    droot = os.path.realpath(tempfile.mkdtemp(prefix="cc-land-selfcheck-daemon-"))
+    os.makedirs(f"{droot}/core/bin")
+    os.makedirs(f"{droot}/core/web/graphs")
+    open(f"{droot}/core/web/graphs/app.js", "w").close()
+    with open(f"{droot}/core/bin/cc-graphs", "w") as _fh:
+        _fh.write("#!/usr/bin/env python3\n")   # a REAL #! line: the step reads it to learn which exe is the daemon's
+    GPROG, GCMD = f"{droot}/core/bin/cc-graphs", "cc-graphs\tcore/bin/cc-graphs serve\tcore/bin/cc-graphs\n"
+    PY3 = interpreter_of(GPROG)                  # what the kernel would end up running for that #! line
+    NOTPY = os.path.realpath(shutil.which("sleep") or "/bin/sleep")   # …and a binary that plainly is not it
+
+    def proc(pid, *argv, unit="", exe=None):
+        """`exe` is what /proc/<pid>/exe would say — the kernel's word, not the process's. It defaults to the
+        python3 every fixture's argv already names, which is the ordinary shape: a script under the interpreter
+        its own #! line declares. A case planting a DECOY passes its own, because that is the whole difference."""
+        return (pid, list(argv), unit, PY3 if exe is None else exe)
+
+    def said(D):
+        """What the step SAID, or "" when it did not get that far. A case that asserts on this goes red for a
+        step that raised as well as for one that answered wrongly — assert through a bare call and a broken
+        step aborts the whole selfcheck instead, which is a crash, not a case."""
+        r = caught(D.daemons)
+        return r if isinstance(r, str) else ""
+
+    def with_daemon(answer, procs, changed=(("M", "core/bin/cc-graphs"),)):
+        D = fresh(pr=7)
+        D.root = droot                                  # a real tree: repo_program resolves argv against it
+        D.changed = list(changed)
+        world[f"{BIN}/cc-units daemons-for"] = answer
+        PROCS[0] = list(procs)
+        return D
+
+    def comes_back(new, also=()):
+        """A restart command that actually replaces the process, which is the only thing that makes a deploy
+        true. Registered as the fake world's answer, so the step sees the new pid only by looking again. `also`
+        is what is still there afterwards — a decoy outlives a restart it was never part of."""
+        def go(_argv):
+            PROCS[0] = [proc(new, "/usr/bin/python3", GPROG, "serve")] + list(also)
+            return (0, "")
+        return go
+
+    L = with_daemon((0, ""), [proc(4242, "/usr/bin/python3", GPROG, "serve", "--port", "5190")])
+    msg = said(L)
+    check("a server no unit owns, running a file this change touched, is NAMED by the deploy and left running — "
+          "#295's process answered on the old code while the landing reported success",
+          L.stale == ["core/bin/cc-graphs (pid 4242)"] and "core/bin/cc-graphs (pid 4242)" in msg)
+    check("…and the owner reads it in the SAME sentence as the ✅, not in a tail below it — 'deployed' is a claim "
+          "about what is RUNNING",
+          all(s in result_of(L, 0, {"attempts": 1}, "")["short"]
+              for s in ("landed ✅", "core/bin/cc-graphs (pid 4242)", "old code")))
+    L = with_daemon((0, ""), [proc(4260 + i, "/usr/bin/python3", GPROG, "serve") for i in range(5)])
+    check("many processes of ONE program are one entry with the count, not a dozen pids: a card nobody finishes "
+          "reading is a warning that does not warn",
+          "core/bin/cc-graphs (5 processes)" in said(L) and L.stale == ["core/bin/cc-graphs (5 processes)"])
+    L = with_daemon((0, ""), [proc(4243, "/usr/bin/python3", GPROG, "serve", unit="cc-graphs.service")])
+    check("a process a UNIT owns is the restart step's business, not this one's: it is not named a second time",
+          isinstance(caught(L.daemons), Skip) and not L.stale)
+    L = with_daemon((0, ""), [proc(4244, "/usr/bin/python3", GPROG, "serve")])
+    MINE[0] = {4244}
+    check("the landing's own process tree is never named — cc-land is itself a file in the repo it lands",
+          isinstance(caught(L.daemons), Skip) and not L.stale)
+    L = with_daemon((0, ""), [proc(4245, "/usr/bin/grep", "-n", "serve", GPROG, exe=NOTPY)])
+    check("a repo file handed to another tool as an ARGUMENT is not a process running it: the program is "
+          "argv[0] or argv[1] and no further, or a grep over the diff is named as a server left on old code",
+          isinstance(caught(L.daemons), Skip) and not L.stale)
+    # A COMMAND LINE IS THE PROCESS'S OWN MEMORY. `exec -a <path>/cc-graphs sleep 999` names any process the
+    # daemon at no privilege at all, so every answer below is cross-checked against /proc/<pid>/exe, which the
+    # kernel writes at exec and which a process cannot move without exec'ing that very file.
+    L = with_daemon((0, ""), [proc(4252, GPROG, "999", exe=NOTPY)])
+    check("a process that merely CALLS itself the daemon is not NAMED as a stale server: its argv says the file "
+          "this change touched, the kernel says it is executing something else, and the kernel is the one that "
+          "was not asked — a forgeable warning is one anybody can put on the owner's card",
+          isinstance(caught(L.daemons), Skip) and not L.stale)
+
+    L = with_daemon((0, GCMD), [proc(4246, "/usr/bin/python3", GPROG, "serve")])
+    world[f"{droot}/core/bin/cc-graphs serve"] = comes_back(4247)
+    msg = said(L)
+    check("a declared daemon comes back through its OWN restart command — the tool's, which stops the pid in its "
+          "own pidfile — and the deploy proves it by the new pid, not by what the command printed",
+          ran(f"{droot}/core/bin/cc-graphs", "serve") and "pid 4247" in msg and not L.stale)
+    L = with_daemon((0, GCMD), [proc(4246, "/usr/bin/python3", GPROG, "serve")])
+    r = caught(L.daemons)          # no world answer: the command exits 0 and changes nothing, which is exactly
+                                   # what a restart that reloaded no code looks like from the outside
+    check("…and one that exits 0 while the same pid keeps running is a RED deploy: the assertion is the running "
+          "process, never the message",
+          isinstance(r, Failed) and "did not change" in str(r))
+    L = with_daemon((0, GCMD), [proc(4246, "/usr/bin/python3", GPROG, "serve"),
+                                proc(4253, GPROG, "999", exe=NOTPY)])
+    world[f"{droot}/core/bin/cc-graphs serve"] = comes_back(4247, also=[proc(4253, GPROG, "999", exe=NOTPY)])
+    msg = said(L)
+    check("…and a decoy alive on BOTH sides of a real restart does not turn it red: taken for the daemon it would "
+          "sit in `was` and in `now`, so a restart that worked would read as 'the running thing did not change' "
+          "and burn all three tries on a change that was already deployed",
+          "pid 4247" in msg and "4253" not in msg and not L.stale)
+    L = with_daemon((0, GCMD), [proc(4246, "/usr/bin/python3", GPROG, "serve")])
+
+    def only_decoy(_argv):
+        PROCS[0] = [proc(4254, GPROG, "999", exe=NOTPY)]     # the daemon is gone; something wearing its argv is not
+        return (0, "")
+
+    world[f"{droot}/core/bin/cc-graphs serve"] = only_decoy
+    r = caught(L.daemons)
+    check("…and a decoy standing where a daemon failed to come back is still a RED deploy — a new pid wearing the "
+          "right argv is exactly the false 'deployed' this step exists to stop, and the exe the kernel recorded is "
+          "the part of it nobody can write",
+          isinstance(r, Failed) and "not running" in str(r))
+    L = with_daemon((0, GCMD), [proc(4248, "/usr/bin/python3", GPROG, "serve")],
+                    changed=(("M", "core/web/graphs/app.js"),))
+    world[f"{droot}/core/bin/cc-graphs serve"] = comes_back(4249)
+    check("a daemon whose ASSETS moved is restarted too, though the file it runs never changed — the row's "
+          "declared paths answer where a program name cannot",
+          "pid 4249" in said(L) and not L.stale)
+    L = with_daemon((0, GCMD), [])
+    check("a declared daemon that is not running is left alone: nothing to restart is not a failure",
+          isinstance(caught(L.daemons), Skip) and not ran(f"{droot}/core/bin/cc-graphs", "serve"))
+    L = with_daemon((0, "cc-graphs\towner\tcore/bin/cc-graphs\n"),
+                    [proc(4250, "/usr/bin/python3", GPROG, "serve")])
+    msg = said(L)
+    check("a daemon the manifest marks the owner's is named and never restarted from here",
+          not ran(f"{droot}/core/bin/cc-graphs", "serve") and L.stale == ["cc-graphs (pid 4250)"] and "owner" in msg)
+    L = with_daemon((2, "cc-units: /r/config/units.json is not valid json — nothing can be told what to restart\n"),
+                    [proc(4251, "/usr/bin/python3", GPROG, "serve")])
+    check("a manifest the landing cannot read is a red deploy here too — an empty answer from a file nothing "
+          "could parse must never read as 'this box runs no daemon at all'",
+          isinstance(caught(L.daemons), Failed) and not ran(f"{droot}/core/bin/cc-graphs", "serve"))
+    # …and the /proc read itself, against a REAL process. Every case above stands on a fake process list, so
+    # none of them touches the part that has to be right on the box: reading a live command line back and
+    # recognising the file it runs.
+    preal = os.path.realpath(tempfile.mkdtemp(prefix="cc-land-selfcheck-proc-"))
+    os.makedirs(f"{preal}/bin")
+    with open(f"{preal}/bin/served", "w") as f:
+        f.write("#!/usr/bin/env bash\nsleep 30\n")
+    os.chmod(f"{preal}/bin/served", 0o755)
+    kid = subprocess.Popen([f"{preal}/bin/served"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # …and beside it the attack itself, run for real: `exec -a` hands `sleep` the daemon's own path as its argv[0]
+    # at no privilege at all. Nothing here is faked — same kernel, same /proc, a genuinely forged command line.
+    decoy = subprocess.Popen(["bash", "-c", f"exec -a {preal}/bin/served sleep 30"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        seen = {}
+        for _ in range(250):     # both have to have finished exec'ing, or the case proves nothing about either
+            seen = {pid: (argv, exe) for pid, argv, _u, exe in REAL["live_processes"]()}
+            if os.path.basename(seen.get(decoy.pid, ([], ""))[1]) == "sleep" and kid.pid in seen:
+                break
+            time.sleep(0.02)
+        k_argv, k_exe = seen.get(kid.pid, ([], ""))
+        d_argv, d_exe = seen.get(decoy.pid, ([], ""))
+        check("live_processes reads a real running process back off /proc, and repo_program recognises the file "
+              "of this tree that it is running — the fake list every case above uses never exercises either",
+              kid.pid in seen and repo_program(k_argv, preal, k_exe) == "bin/served")
+        check("…and a REAL `exec -a` decoy beside it, whose argv[0] is that very file, is not accepted as it: the "
+              "command line is the process's own memory and /proc/<pid>/exe is the kernel's, so the daemon is "
+              "recognised by the interpreter its #! line declares and this one is executing sleep",
+              d_argv[:1] == [f"{preal}/bin/served"] and os.path.basename(d_exe) == "sleep"
+              and repo_program(d_argv, preal, d_exe) == "")
+        check("…and own_ancestry holds this very process, which is what keeps a landing from naming itself",
+              os.getpid() in REAL["own_ancestry"]())
+    finally:
+        for _k in (kid, decoy):
+            _k.kill()
+            _k.wait()
+    shutil.rmtree(preal, ignore_errors=True)
+    shutil.rmtree(droot, ignore_errors=True)
+
     # 8. the no-PR path — the one that left a track open for half an hour
     L = fresh(track="w1", note="settings edit outside the repo")
     world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a24", "status": "open"}]))
@@ -5214,7 +5600,8 @@ def cmd_selfcheck():
           "everything after it changes the box, and the check that says it reached the owner LAST, after install.sh "
           "and the restart, because before those the box still runs the old code",
           [n for n, _ in Land("myrepo", pr=1).steps()] ==
-          ["gates", "review", "merge", "card", "board", "ledger", "settle", "install", "units", "restart", "verify"])
+          ["gates", "review", "merge", "card", "board", "ledger", "settle", "install", "units", "restart",
+           "daemons", "verify"])
     check("the fatal steps are exactly the ones that leave the box wrong; card, board, ledger and the delivery "
           "check are not among them — nothing follows the check, and a landing it cannot confirm is still landed. "
           "Nor is `settle`, which only ever waits: a wait is not a verdict, and one that failed would stop a "
@@ -5818,6 +6205,20 @@ def cmd_selfcheck():
             os.access = real_access
             for f in glob.glob(f"{tempfile.gettempdir()}/cc-land-gate-myrepo-*.log"):
                 os.unlink(f)
+
+        # …and the same for the step BELOW the restarts. A deploy that could not be told what runs outside
+        # systemd has not finished: the PR is in and the box may still be on the old code, which is exactly the
+        # state a second unattended attempt is for.
+        landing(**{"git merge-base": (0, "b\n"), "git diff --name-status": (0, "M\tcore/bin/cc-graphs\n"),
+                   f"{BIN}/cc-units daemons-for": (2, "cc-units: no manifest at /nope\n")})
+        quiet(cmd_work, [])
+        kept = read_json(job_path("myrepo", 7)) or {}
+        check("a deploy stopped at the daemons step is KEPT and re-driven rather than ended — merged with the box "
+              "possibly on old code is worth another try, exactly as the units and the restarts are",
+              kept.get("attempts") == 1 and kept.get("stage") == "daemons"
+              and (kept.get("last") or "").startswith("daemons:") and len(gh_merges()) == 1
+              and armed() == [f"--on-active={RETRY_AFTER}"])
+        os.unlink(job_path("myrepo", 7))
 
         # (3) a verdict and an unmergeable PR still end the job at once
         AFTERFIX = {f"{CLAUDE} -p": (0, REVIEWED("LAND-AFTER-FIX", "a.py:9", "the call has no timeout", "name it"))}
