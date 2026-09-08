@@ -59,6 +59,21 @@ NOTHING IT WRITES FOLLOWS A SYMLINK. Every artifact, cursor and ledger line is o
 O_EXCL under a temp name, then renamed into place), because a planted link at any of those paths would otherwise
 make this file write where somebody else chose (security review of #361).
 
+THE FIGURES ARE COUNTED AT BUILD TIME, NEVER WRITTEN INTO THE SOURCE. The last page — what the box costs and
+what a landing takes — is not in the .tex and cannot be. A figure pasted into a source is right on the day it
+lands and is then rebuilt, unchanged and believed, on every revision after it; that is exactly how the money
+page of 2026-09-06 went stale and then went missing. So this file writes `arch-figures.tex` into the build
+directory out of `cc-spend --json` and the landing queue log, moments before pdflatex reads it, and the source
+does no more than `\InputIfFileExists` it — which also means a source built by hand, without this file, still
+builds and simply says the figures were not counted.
+  EACH FIGURE NAMES ITS OWN PERIOD, IN THE WORDS OF THE TOOL THAT COUNTED IT. cc-spend says which day boundary
+  and which zone it bucketed in and this file repeats that instead of deciding it; the landing figures are
+  bounded by the queue log's own first and last stamp. A number from one tool under a label from another is
+  the bug the box has already shipped (a "PDT day" that was not one, 2026-09-08), and it is only ever caught
+  by someone who happens to look.
+  AND AN EMPTY LEDGER SAYS SO. A ledger with no rows in it produces a sentence saying there is nothing to
+  show, never a table of zeros — a zero is a measurement, and a missing ledger is not one.
+
 AND IT IS VERIFIED BEFORE IT IS SENT. Plain pdflatex and the psnfss fonts, twice for the TikZ positions, with no
 shell escape AND `openin_any=p openout_any=p`: the source arrives by a landing and is built, never trusted — a
 `\input` of an absolute path would otherwise pull a file of this box's into a document that is about to be
@@ -66,7 +81,7 @@ uploaded, which no `-no-shell-escape` stops. Then `pdfinfo` for pages and `pdffo
 fonts are not in it renders as somebody else's guess on a phone. A build or a check that fails posts NOTHING and
 leaves the cursor where it was, so the next turn tries again.
 """
-import sys, os, re, json, time, shutil, subprocess, tempfile, fcntl
+import sys, os, re, json, time, math, shutil, calendar, subprocess, tempfile, fcntl
 
 HOME = os.path.expanduser("~")
 BIN = os.environ.get("CC_ARCH_BIN") or os.path.dirname(os.path.realpath(__file__))
@@ -88,7 +103,9 @@ GIT_TIMEOUT = 120
 TEX_TIMEOUT = 90       # one pdflatex pass over a TikZ document; measured at ~1.5 s, so this is a hang's bound
 POST_TIMEOUT = 180     # an upload, the same bound cc-land allows its own Slack calls
 MSG_CAP = 300          # what one declaration may contribute to the message; the document says the rest
-# TEX_TIMEOUT * 2 + POST_TIMEOUT is this file's worst case, and cc-publish's `timeout` around it is set from that.
+# TEX_TIMEOUT * 2 + POST_TIMEOUT + FIG_TIMEOUT is this file's worst case, and cc-publish's `timeout` around
+# it is set from that — its selfcheck reads these three names out of this file and fails if the turn it
+# gives ever stops covering their sum.
 
 
 class Stop(Exception):
@@ -255,13 +272,364 @@ def verify(pdf):
     return f"pdffonts could not read it: {last(o)}" if rc != 0 else unembedded(o)
 
 
+# ── the figures, counted when the document is built ──────────────────────────────────────────────────────
+# Everything down to `build` writes ONE file — `arch-figures.tex`, into the build directory, moments before
+# pdflatex reads it — out of the two ledgers this box already keeps. The source `\input`s it and carries none
+# of it. See the header of this file for why a figure may not be written into the source.
+LAND_LOG = f"{HOME}/.cc/state/land/queue.log"   # cc-land's own line per landing event, kept after the job drains
+FIG_BASE = "arch-figures"      # the file the source \input's; a build with no ledgers simply leaves it out
+FIG_TIMEOUT = 45               # the WHOLE figures step, and the number the caller's turn is sized against
+GIT_FIG_TIMEOUT = 10           # of that, what one `git log` over the window may take
+SPEND_TIMEOUT = FIG_TIMEOUT - GIT_FIG_TIMEOUT
+DAYS = 7                       # the window cc-spend's `by_day` covers, and the one the merges are counted over
+TS_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+DAY_RE = re.compile(r"^\d{4}-\d\d-\d\d$")
+# `<verb> <repo>#<n> …` — the shape cc-land appends. The verb and the key are all that is read; the rest of the
+# line is a sentence written for a person and nothing here decides anything by it, except `rc=0` on a `done`.
+LAND_EVENT = re.compile(r"^(?P<verb>[a-z][a-z-]{0,23}) (?P<key>[A-Za-z0-9._-]{1,64}#\d{1,7})(?:\s+(?P<rest>.*))?$")
+VERDICT_RE = re.compile(r"^([A-Z][A-Z-]{1,23})\b")
+
+
+def esc(s):
+    """Anything out of a ledger, on its way into a document. Every figure here is a number this file formatted,
+    but the words around them — a zone name, a branch — come from outside, and a stray backslash or `$` in one
+    of those is a build that fails at the least and a control sequence at the worst."""
+    s = str(s)
+    for a, b in (("\\", "\\textbackslash "), ("{", "\\{"), ("}", "\\}"), ("&", "\\&"), ("%", "\\%"),
+                 ("$", "\\$"), ("#", "\\#"), ("_", "\\_"), ("~", "\\textasciitilde "),
+                 ("^", "\\textasciicircum ")):
+        s = s.replace(a, b)
+    return " ".join(s.split())
+
+
+def sh_json(argv, timeout):
+    """A tool's JSON, off its STDOUT alone — a warning on stderr must not make an answer unreadable."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"{e.__class__.__name__}: {e}"
+    if p.returncode != 0:
+        return None, last(p.stderr or p.stdout, 120) or f"it exited {p.returncode}"
+    try:
+        return json.loads(p.stdout), ""
+    except ValueError:
+        return None, "its answer was not JSON"
+
+
+def usd(x):
+    """The way the owner reads a dollar figure: cents only while there are few enough of them to matter."""
+    x = float(x or 0)
+    return "\\$" + (f"{x:,.2f}" if x < 10 else f"{int(x + 0.5):,d}")
+
+
+def dur(sec):
+    h = float(sec) / 3600.0
+    if h < 1:
+        return f"{int(float(sec) / 60 + 0.5)} min"
+    return f"{h:.1f} h" if h < 10 else f"{int(h + 0.5)} h"
+
+
+def share(a, b):
+    return f"{int(100.0 * float(a) / float(b) + 0.5)}\\%" if b else "---"
+
+
+def nice(top):
+    """A round number at or above the tallest bar, so the axis reads without a legend for itself."""
+    if top <= 0:
+        return 1.0
+    e = 10.0 ** math.floor(math.log10(top))
+    for m in (1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10):
+        if m * e >= top:
+            return m * e
+    return 10 * e
+
+
+def pctile(xs, p):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    return xs[min(len(xs) - 1, max(0, int(round(p / 100.0 * (len(xs) - 1)))))]
+
+
+def when(ts):
+    """A UTC stamp out of a log, as seconds. Never the local clock: the log is UTC and a DST day would move it."""
+    try:
+        return calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def local(ts):
+    """A UTC stamp from a tool, in the zone the owner reads. The INSTANT is the tool's; only the way it is
+    written is ours — a day boundary is never converted like this, because that would move the figure under
+    its label."""
+    t = when(ts)
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(t)) if t is not None else str(ts)
+
+
+def spent():
+    """What cc-spend counted, AND ITS OWN WORDS for which day boundary and zone it counted over. This file does
+    not read the spend ledger itself: two tools counting the same dollars off the same files is how one question
+    gets two answers, and a figure whose number and label come from different places is the bug the box has
+    already shipped once."""
+    d, why = sh_json([f"{BIN}/cc-spend", "--json"], SPEND_TIMEOUT)
+    if d is None:
+        return {"why": f"cc-spend could not be asked ({why})"}
+    by = {str(k): (v or {}) for k, v in (d.get("by_day") or {}).items() if DAY_RE.match(str(k))}
+    days = sorted(by)[-DAYS:]
+    today, week = d.get("today") or {}, d.get("week") or {}
+    rows = int(week.get("rows") or 0) + int(today.get("rows") or 0)
+    return {"why": "", "tz": str(d.get("tz") or ""), "boundary": str(d.get("day_boundary") or ""),
+            "stale": bool(d.get("stale")), "tick": str(d.get("last_tick") or ""),
+            "today": today, "week": week, "days": days, "by_day": by, "empty": rows == 0}
+
+
+def landings(path=None):
+    """The landing queue's own log — the one record of a landing that outlives it. One line per event, stamped
+    UTC by cc-land, kept after the job file is drained."""
+    out = {"why": "", "empty": True, "first": "", "last": "", "keys": 0, "landed": 0, "unlanded": 0, "pending": 0,
+           "attempts": 0, "turned": 0, "waits": [], "tries": {}, "verdicts": {}}
+    ev = {}
+    try:
+        with open(path or LAND_LOG, errors="replace") as f:
+            for ln in f:
+                ts, _, rest = ln.rstrip("\n").partition("\t")
+                if not TS_RE.match(ts):
+                    continue
+                m = LAND_EVENT.match(rest.strip())
+                if not m:
+                    continue
+                out["first"] = out["first"] or ts
+                out["last"] = ts
+                ev.setdefault(m.group("key"), []).append((ts, m.group("verb"), (m.group("rest") or "").strip()))
+    except OSError:
+        out["why"] = "there is no landing queue log on this box"
+        return out
+    if not ev:
+        return out
+    out["empty"], out["keys"] = False, len(ev)
+    for rows in ev.values():
+        rows.sort()
+        queued = [t for t, v, _ in rows if v in ("queued", "again")]
+        done = [(t, r) for t, v, r in rows if v == "done"]
+        won = [t for t, r in done if r.startswith("rc=0")]
+        out["attempts"] += len(done)
+        out["turned"] += sum(1 for t, r in done if not r.startswith("rc=0"))
+        for t, v, r in rows:
+            if v == "recorded":
+                w = VERDICT_RE.match(r)
+                if w:
+                    out["verdicts"][w.group(1)] = out["verdicts"].get(w.group(1), 0) + 1
+        if won:
+            out["landed"] += 1
+            a, b = (when(queued[0]) if queued else None), when(won[0])
+            if a is not None and b is not None and b >= a:
+                out["waits"].append(b - a)
+            n = len([t for t in queued if t <= won[0]]) or 1
+            k = "1" if n == 1 else ("2" if n == 2 else "3+")
+            out["tries"][k] = out["tries"].get(k, 0) + 1
+        elif done:
+            out["unlanded"] += 1
+    # Every key not yet counted has rows but no `done` — still queued, or a recorded verdict still building.
+    # The remainder, not a bucket of its own, so it can never drift from the total: it IS keys minus the other two.
+    out["pending"] = out["keys"] - out["landed"] - out["unlanded"]
+    return out
+
+
+def merged(root, ref, days):
+    """How many PRs landed on the default branch on each of those days — the squash commits themselves, dated
+    by the box's own local day, which is the boundary cc-spend's days use too. `git log` and nothing else: no
+    network, and a merge that arrived some other way counts the same as one this box made."""
+    if not days:
+        return {}
+    rc, o = sh(["git", "-C", root, "log", "-n", "4000", f"--since={days[0]} 00:00:00",
+                "--date=format-local:%Y-%m-%d", f"--format={REC}%cd{FLD}%s", ref], timeout=GIT_FIG_TIMEOUT)
+    if rc != 0:
+        return {}
+    per = {d: 0 for d in days}
+    for r in o.split(REC):
+        day, _, subj = r.partition(FLD)
+        day = day.strip()
+        if day in per and PRNUM.search(subj.splitlines()[0] if subj else ""):
+            per[day] += 1
+    return per
+
+
+def barchart(days, series, fmt, width=7.4, height=2.4, x0=1.0):
+    """A small bar chart, every coordinate computed here. The source carries the colours and the type; this
+    carries the numbers, because a chart drawn in the source is a chart that has to be redrawn by hand."""
+    top = nice(max([v for _, _, vs in series for v in vs] + [0]))
+    slot = width / max(1, len(days))
+    bw = min(0.30, slot * 0.62 / max(1, len(series)))
+    p = ["\\begin{tikzpicture}[x=1cm,y=1cm]"]
+    for f in (0.0, 0.5, 1.0):
+        y = height * f
+        p.append(f"\\draw[draw=line!{'100' if f == 0 else '40'}] ({x0:.2f},{y:.2f}) -- ({x0 + width:.2f},{y:.2f});")
+        p.append(f"\\node[font=\\sffamily\\tiny,color=muted,anchor=east] at ({x0 - 0.08:.2f},{y:.2f}) "
+                 f"{{{fmt(top * f)}}};")
+    for i, d in enumerate(days):
+        c = x0 + slot * (i + 0.5)
+        for j, (_, colour, vs) in enumerate(series):
+            v = vs[i] if i < len(vs) else 0
+            h = height * min(1.0, float(v) / top) if top else 0.0
+            left = c + (j - len(series) / 2.0) * bw
+            if h > 0.004:
+                p.append(f"\\draw[fill={colour},draw={colour}] ({left:.2f},0) rectangle "
+                         f"({left + bw:.2f},{h:.3f});")
+        p.append(f"\\node[font=\\sffamily\\tiny,color=muted] at ({c:.2f},-0.23) {{{esc(str(d)[-2:])}}};")
+    for j, (name, colour, _) in enumerate(series):
+        lx = x0 + j * 2.1
+        p.append(f"\\draw[fill={colour},draw={colour}] ({lx:.2f},{height + 0.30:.2f}) rectangle "
+                 f"({lx + 0.18:.2f},{height + 0.45:.2f});")
+        p.append(f"\\node[font=\\sffamily\\tiny,color=muted,anchor=west] at ({lx + 0.25:.2f},"
+                 f"{height + 0.375:.2f}) {{{esc(name)}}};")
+    p.append("\\end{tikzpicture}")
+    return "\n".join(p)
+
+
+def fig_head(title, source):
+    return (f"{{\\sffamily\\bfseries\\footnotesize\\color{{accent}} {title}}}\\\\[0.1em]\n"
+            f"{{\\sffamily\\scriptsize\\color{{muted}} {source}}}\n\n\\vspace{{0.4em}}\n")
+
+
+def money_block(sp):
+    """A Money. Every period named the way cc-spend names it, never the way this file would guess."""
+    if sp.get("why"):
+        return fig_head("What it cost", "cc-spend") + \
+            f"{{\\small {esc(sp['why'])} --- so there are no money figures on this page.}}\n"
+    zone = esc(sp["tz"] or "the box's own zone")
+    boundary = "box-local days" if sp["boundary"] == "local" else "UTC days"
+    src = f"cc-spend, {boundary} ({zone})"
+    if sp["empty"]:
+        return fig_head("What it cost", src) + \
+            ("{\\small The spend ledger has no rows in the seven days it covers, so there is nothing to show "
+             "--- not a row of zeros.}\n")
+    days, by = sp["days"], sp["by_day"]
+    t, w = sp["today"], sp["week"]
+    tday = esc(days[-1]) if days else ""
+    win = f"{esc(days[0])} to {esc(days[-1])}" if days else "the week"
+    auto = [float((by.get(d) or {}).get("auto_usd") or 0) for d in days]
+    rest = [max(0.0, float((by.get(d) or {}).get("usd") or 0) - a) for d, a in zip(days, auto)]
+    out = [fig_head("What it cost", src),
+           "\\begin{minipage}[t]{7.9cm}\\vspace{0pt}\n{\\sffamily\\scriptsize\n"
+           "\\begin{tabular}{@{}l r r r@{}}\n\\toprule\nperiod & total & headless & share \\\\\n\\midrule\n"
+           f"today, {tday} & {usd(t.get('usd'))} & {usd(t.get('auto_usd'))} & "
+           f"{share(t.get('auto_usd') or 0, t.get('usd') or 0)} \\\\\n"
+           f"the 7 days, {win} & {usd(w.get('usd'))} & {usd(w.get('auto_usd'))} & "
+           f"{share(w.get('auto_usd') or 0, w.get('usd') or 0)} \\\\\n"
+           "\\bottomrule\n\\end{tabular}}\n\n\\vspace{0.45em}\n"
+           "{\\footnotesize Headless is every \\cmd{claude -p} --- worker loops and landing rounds, the work "
+           "nobody is sitting in front of. The rest is a session with a person in it. Tokens are the truth; "
+           "the dollars are the ledger's own estimate."
+           + (f" cc-spend last counted at {esc(local(sp['tick']))}" if sp["tick"] else "")
+           + (", and it calls that stale." if sp["stale"] else ".") + "}\n\\end{minipage}\n\\hfill\n",
+           "\\begin{minipage}[t]{8.6cm}\\vspace{0pt}\n{\\sffamily\\scriptsize\\color{muted} Per day, USD}\n\n"
+           "\\vspace{0.2em}\n"
+           + barchart(days, [("headless", "accent", auto), ("sessions", "amber", rest)],
+                      lambda v: f"{int(v + 0.5):,d}")
+           + "\n\\end{minipage}\n"]
+    return "".join(out)
+
+
+def time_block(ld, per_day, days):
+    """B Time. The landing log's own first and last stamp bound every figure in it, so the period is the log's
+    and not a window this file chose."""
+    src = ("the landing queue log, UTC" + (f", {esc(ld['first'][:10])} to {esc(ld['last'][:10])}"
+                                           if ld["first"] else ""))
+    if ld.get("why") or ld["empty"]:
+        return fig_head("What it took", "the landing queue log") + (
+            f"{{\\small {esc(ld.get('why') or 'no landing has been recorded yet')} --- so there are no "
+            "landing figures on this page.}\n")
+    med, p75, worst = pctile(ld["waits"], 50), pctile(ld["waits"], 75), (max(ld["waits"]) if ld["waits"] else None)
+    tries = " \\, · \\, ".join(f"{k}: {v}" for k, v in sorted(ld["tries"].items()) if v)
+    verds = " \\, · \\, ".join(f"{esc(k)} {v}" for k, v in sorted(ld["verdicts"].items(), key=lambda x: -x[1])[:4])
+    rows = [("landings on record", f"{ld['keys']:,d}"),
+            ("of them merged", f"{ld['landed']:,d}"),
+            ("turned back and not since merged", f"{ld['unlanded']:,d}"),
+            ("still queued or in progress", f"{ld['pending']:,d}"),
+            ("attempts, and gates that said no", f"{ld['attempts']:,d} \\, / \\, {ld['turned']:,d}")]
+    if ld["waits"]:
+        rows += [("queued to merged, median", dur(med)),
+                 ("\\quad p75 \\, · \\, longest", f"{dur(p75)} \\, · \\, {dur(worst)}")]
+    if tries:
+        rows.append(("times queued before it merged", tries))
+    tab = "".join(f"{a} & {b} \\\\\n" for a, b in rows)
+    out = [fig_head("What it took", src),
+           "\\begin{minipage}[t]{7.9cm}\\vspace{0pt}\n{\\sffamily\\scriptsize\n"
+           "\\begin{tabular}{@{}l r@{}}\n\\toprule\n"
+           + tab + "\\bottomrule\n\\end{tabular}}\n\n\\vspace{0.45em}\n"
+           "{\\footnotesize The clock starts when the landing was QUEUED, so none of this counts the build "
+           "before it, and a landing queued twice is counted from the first time. Every repo this box lands "
+           "for is in the figure."
+           + (f" Verdicts recorded over the same window: {verds}." if verds else "")
+           + "}\n\\end{minipage}\n\\hfill\n"]
+    if per_day and days:
+        out.append("\\begin{minipage}[t]{8.6cm}\\vspace{0pt}\n{\\sffamily\\scriptsize\\color{muted} Merges on "
+                   "the default branch, per day}\n\n\\vspace{0.2em}\n"
+                   + barchart(days, [("merged", "accent", [per_day.get(d, 0) for d in days])],
+                              lambda v: f"{int(v + 0.5):,d}")
+                   + "\n\n\\vspace{0.3em}\n{\\footnotesize Squash commits carrying a PR number, by the same "
+                     "local day the spend is bucketed by --- \\cmd{git log} on this checkout, no network.}"
+                     "\n\\end{minipage}\n")
+    return "".join(out)
+
+
+def caveats():
+    """What the figures do not say. It belongs beside them and nowhere else: a reader who takes a number for
+    more than it measures is worse off than one who never saw it."""
+    return ("{\\sffamily\\bfseries\\footnotesize\\color{accent} What these do not say}\n\n\\vspace{0.25em}\n"
+            "{\\footnotesize\\begin{tabular}{@{}p{7.9cm}p{8.6cm}@{}}\n"
+            "The money is the WHOLE box, not one repo --- every session and every headless run on it. &\n"
+            "The clock on a landing starts when it was queued, so the building and reviewing before that is "
+            "counted nowhere here. \\\\[0.35em]\n"
+            "Dollars are the ledger's estimate from the token counts; the tokens are the measurement. &\n"
+            "A merge that arrived some other way --- the web, another machine --- is in the merges, and in "
+            "none of the landing figures. \\\\\n\\end{tabular}}\n")
+
+
+def figures_tex(root, ref):
+    """The whole page, as one file for the source to \\input. It never raises: a ledger that cannot be read is
+    a paragraph saying so, because a document the owner does not get teaches him nothing."""
+    sp = spent()
+    ld = landings()
+    days = sp.get("days") or []
+    try:
+        per_day = merged(root, ref, days)
+    except Exception:
+        per_day = {}
+    built = time.strftime("%Y-%m-%d %H:%M %Z")
+    return ("% Written by cc-arch when this PDF was built. It lives for one build and is in no repository:\n"
+            "% every figure below was counted at that moment, out of the ledgers, not out of the source.\n"
+            "\\begingroup\\raggedright\n"
+            "{\\sffamily\\bfseries\\Large Where the cost goes}\\quad\n"
+            f"{{\\sffamily\\color{{muted}}\\small counted when this PDF was built, {esc(built)}}}\\\\[0.3em]\n"
+            "{\\color{line}\\rule{\\linewidth}{1pt}}\n\\endgroup\n\n\\vspace{0.9em}\n"
+            + money_block(sp)
+            + "\n\\vfill\n\n"
+            + time_block(ld, per_day, days)
+            + "\n\\vfill\n\n" + caveats()
+            + "\n\\vspace{0.8em}\n{\\scriptsize\\color{muted} Each figure above names the period it covers in "
+              "the words "
+              "of the tool that counted it --- \\cmd{cc-spend -{}-json} for the money, the landing queue log and "
+              "\\cmd{git log} for the rest. Nothing here is stored: the next build counts again.\\par}\n")
+
+
 def build(root, ref):
     """Build it, check it, and put the dated PDF where it can be sent from. Not in the repo: the document is the
     source, and a dated file in git is the very drift this exists to end."""
-    rel, tex = source_at(root, ref)
+    rel, src = source_at(root, ref)
     base = os.path.basename(rel)[:-4] if rel.endswith(".tex") else os.path.basename(rel)
     with tempfile.TemporaryDirectory(prefix="cc-arch.") as d:
-        write_new(f"{d}/{base}.tex", tex)
+        write_new(f"{d}/{base}.tex", src)
+        # THE FIGURES, COUNTED NOW. Beside the source and inside the build directory, so paranoid mode lets the
+        # source read it and nothing else. Never fatal: a ledger that cannot be answered for is a paragraph in
+        # the document saying so, and a document the owner does not get teaches him nothing.
+        try:
+            write_new(f"{d}/{FIG_BASE}.tex", figures_tex(root, ref))
+        except Exception as e:                                  # noqa: BLE001 — a figure never costs the document
+            write_new(f"{d}/{FIG_BASE}.tex",
+                      "{\\small The figures could not be counted for this build "
+                      f"({esc(f'{e.__class__.__name__}: {e}')}), so this page is empty rather than wrong.}}\n")
         for _ in range(2):   # twice: TikZ places nodes from the previous pass's positions
             # `openin_any=p openout_any=p` is the half `-no-shell-escape` does not cover: paranoid mode refuses
             # TeX's own file reads and writes outside the build directory, so a landed `\input{/…}` of one of
@@ -410,6 +778,37 @@ printf 'cc-slack %s\\n' "$*" >> "$CC_SC_REC"
 # pdflatex, pdfinfo and pdffonts. The real source gets its own case below.
 TINY = ("\\documentclass[10pt,a4paper]{article}\n\\usepackage[T1]{fontenc}\n\\usepackage{charter}\n"
         "\\pagestyle{empty}\n\\begin{document}\nThe shape of it.\n\\end{document}\n")
+# A `cc-spend` that answers with whatever fixture the case put in $CC_SC_SPEND, and refuses when there is none —
+# which is also what a box without the tool looks like from here.
+SPEND_STUB = """#!/usr/bin/env bash
+[ -n "${CC_SC_SPEND:-}" ] && [ -f "$CC_SC_SPEND" ] || { echo "no ledger here" >&2; exit 1; }
+cat "$CC_SC_SPEND"
+"""
+# The same one-page document, plus the line the real source carries. Its preamble IS the contract between the
+# source and the page written at build time: xcolor with these names, tikz, booktabs and \cmd. A page that grows
+# a dependency the source does not load fails here, in a fraction of a second, and not on an upload.
+TINY_FIG = ("\\documentclass[10pt,a4paper]{article}\n\\usepackage[T1]{fontenc}\n\\usepackage{charter}\n"
+            "\\usepackage[a4paper,margin=1.8cm]{geometry}\n\\usepackage{xcolor}\n\\usepackage{tikz}\n"
+            "\\usepackage{booktabs}\n"
+            "\\definecolor{accent}{HTML}{1F5673}\\definecolor{muted}{HTML}{5B6770}\n"
+            "\\definecolor{line}{HTML}{9AA6AE}\\definecolor{paper}{HTML}{EDF2F5}\n"
+            "\\definecolor{amber}{HTML}{F6E2C0}\\definecolor{amberln}{HTML}{B07C2A}\n"
+            "\\newcommand{\\cmd}[1]{{\\small\\ttfamily #1}}\n\\pagestyle{empty}\n"
+            "\\setlength{\\parindent}{0pt}\n\\begin{document}\nThe shape of it.\n\\newpage\n"
+            "\\InputIfFileExists{arch-figures}{}{THE FIGURES WERE NOT COUNTED}\n\\end{document}\n")
+# Two ledgers of landings, so the same source can be built over each: three PRs, one gate that said no and one
+# verdict, and the whole thing bounded by its own first and last stamp.
+LOG_A = ("2026-09-01T00:00:00Z\tqueued myrepo#1 who=- chat=-\n"
+         "2026-09-01T01:00:00Z\tdone myrepo#1 rc=0 landed\n"
+         "2026-09-01T02:00:00Z\tqueued myrepo#2 who=-\n"
+         "2026-09-01T03:00:00Z\tdone myrepo#2 rc=1 a gate said no\n"
+         "2026-09-01T04:00:00Z\tagain myrepo#2 by=pid 1\n"
+         "2026-09-01T06:00:00Z\tdone myrepo#2 rc=0 landed\n"
+         "2026-09-02T00:00:00Z\tqueued myrepo#3 who=-\n"
+         "2026-09-02T00:30:00Z\trecorded myrepo#3 LAND by=x\n"
+         "2026-09-02T01:00:00Z\tdone myrepo#3 rc=1 a gate said no\n")
+LOG_B = ("2026-08-10T00:00:00Z\tqueued myrepo#9 who=-\n"
+         "2026-08-11T03:00:00Z\tdone myrepo#9 rc=0 landed\n")
 
 
 def selfcheck():
@@ -462,6 +861,31 @@ def selfcheck():
            open(f"{th}/w/victim").read() == "untouched\n" and not os.path.islink(f"{th}/w/pdf")
            and open(f"{th}/w/pdf").read() == "the real thing\n" and appended and os.path.islink(f"{th}/w/led"))
 
+        # A KEY WITH NO `done` LINE YET is neither landed nor turned back — still queued, or a recorded verdict
+        # still building. It must not vanish between the buckets: the three sub-rows have to sum to every key.
+        write_new(f"{th}/w/land.log",
+                  "2026-09-03T00:00:00Z\tqueued myrepo#20 who=-\n"
+                  "2026-09-03T01:00:00Z\tdone myrepo#20 rc=0 landed\n"
+                  "2026-09-03T02:00:00Z\tqueued myrepo#21 who=-\n"
+                  "2026-09-03T03:00:00Z\tdone myrepo#21 rc=1 a gate said no\n"
+                  "2026-09-03T04:00:00Z\tqueued myrepo#22 who=-\n"
+                  "2026-09-04T00:00:00Z\trecorded myrepo#23 LAND by=x\n")
+        ld = landings(f"{th}/w/land.log")
+        tab = time_block(ld, {}, [])
+        ok("a key that is only queued, or only carries a recorded verdict, and never reaches a `done` line, is "
+           "not landed and not turned back — it is still on its way, and the three buckets add up to every key "
+           "on record, with the row that says so in the table",
+           ld["keys"] == 4 and ld["landed"] == 1 and ld["unlanded"] == 1 and ld["pending"] == 2
+           and ld["landed"] + ld["unlanded"] + ld["pending"] == ld["keys"]
+           and "still queued or in progress & 2 \\\\" in tab)
+
+        write_new(f"{th}/w/land-empty.log", "not a landing log line\nnor is this one, either\n")
+        ok("a queue log that EXISTS but has not one line this file can read is an empty ledger, same as one "
+           "with no rows at all — never the missing-file failure, which is a different thing to tell the owner",
+           landings(f"{th}/w/land-empty.log")["why"] == "" and landings(f"{th}/w/land-empty.log")["empty"]
+           and landings(f"{th}/w/land-empty.log")["keys"] == 0
+           and landings(f"{th}/w/no-such-file.log")["why"] != "")
+
         if not shutil.which("pdflatex"):
             print("  ·    pdflatex is not installed here, so every case that builds a document is skipped "
                   "(install texlive-latex-recommended and texlive-pictures to run them)")
@@ -496,7 +920,8 @@ def selfcheck():
 
         def cmdline(*argv, **envx):
             env = dict(env0, HOME=th, CC_ARCH_BIN=sbin, PATH=f"{sbin}:{env0.get('PATH', '')}", CC_SC_REC=rec)
-            for k in ("CC_NOTIFY_LOG_ONLY", "CC_ARCH_SOURCE", "CC_SC_SLACK_DOWN", "CC_SC_SLACK_HANG"):
+            for k in ("CC_NOTIFY_LOG_ONLY", "CC_ARCH_SOURCE", "CC_SC_SLACK_DOWN", "CC_SC_SLACK_HANG",
+                      "CC_SC_SPEND"):
                 env.pop(k, None)
             env.update({k: v for k, v in envx.items() if v is not None})
             return [sys.executable, os.path.realpath(__file__)] + list(argv), env
@@ -656,6 +1081,73 @@ def selfcheck():
            r.returncode == 0 and open(f"{th}/outside").read() == "untouched\n"
            and not os.path.islink(target) and "--file" in said())
 
+        # THE FIGURES, COUNTED AT BUILD TIME. The claim is that the page is made from the ledgers at the moment
+        # of the build, so the case is the one a pasted figure could never pass: ONE source ref, built twice over
+        # two different ledgers, and the two documents must say different things.
+        if not shutil.which("pdftotext"):
+            print("  ·    pdftotext is not installed here, so the figures page's own cases are skipped "
+                  "(install poppler-utils to run them)")
+        else:
+            open(f"{sbin}/cc-spend", "w").write(SPEND_STUB)
+            os.chmod(f"{sbin}/cc-spend", 0o755)
+            os.makedirs(f"{th}/.cc/state/land", exist_ok=True)
+            sh(git + ["-C", root, "checkout", "-q", "-B", "figures"])
+            open(f"{root}/core/docs/autobox-overview.tex", "w").write(TINY_FIG)
+            sh(git + ["-C", root, "add", "-A"])
+            sh(git + ["-C", root, "commit", "-q", "-m", "a source that inputs the figures page"])
+            fref = sh(["git", "-C", root, "rev-parse", "HEAD"])[1].strip()
+            dayl = [time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * i)) for i in range(6, -1, -1)]
+
+            def spend_fixture(today, week, rows=5):
+                return {"tz": "Test/Zone_One", "day_boundary": "local", "stale": False,
+                        "last_tick": "2026-09-08T00:00:00Z",
+                        "today": {"usd": today[0], "auto_usd": today[1], "rows": rows},
+                        "week": {"usd": week[0], "auto_usd": week[1], "rows": rows},
+                        "by_day": {d: {"usd": 10.0 * (i + 1), "auto_usd": 4.0 * (i + 1), "rows": rows}
+                                   for i, d in enumerate(dayl)}}
+
+            def ledgers(spend, log):
+                write_new(f"{th}/spend.json", json.dumps(spend))
+                if log is None:
+                    try:
+                        os.unlink(f"{th}/.cc/state/land/queue.log")
+                    except OSError:
+                        pass
+                else:
+                    write_new(f"{th}/.cc/state/land/queue.log", log)
+
+            def page():
+                """The document, as words. A line break inside a figure would make a substring test lie, so the
+                text is squashed to single spaces and TeX's own hyphenation is undone first."""
+                r = run("build", root, fref, CC_SC_SPEND=f"{th}/spend.json")
+                out = r.stdout.strip()
+                if r.returncode != 0 or not out.endswith(".pdf") or not os.path.exists(out):
+                    return f"THE BUILD FAILED: {last(r.stderr, 200)}"
+                return " ".join(sh(["pdftotext", out, "-"], timeout=60)[1].replace("-\n", "").split())
+
+            ledgers(spend_fixture((1234.56, 234.56), (8765.43, 4321.0)), LOG_A)
+            t1 = page()
+            ok("the figures page is written from the ledgers at build time: the money as cc-spend counted it, "
+               "under the day boundary and zone cc-spend itself named, and the landings bounded by the queue "
+               "log's own first and last stamp",
+               "$1,235" in t1 and "$8,765" in t1 and "Test/Zone_One" in t1
+               and f"{dayl[0]} to {dayl[-1]}" in t1 and "2026-09-01 to 2026-09-02" in t1 and "1.0 h" in t1)
+            ledgers(spend_fixture((2222.0, 1111.0), (3333.0, 1500.0)), LOG_B)
+            t2 = page()
+            ok("…and the SAME source built again over a different ledger says something different — which is the "
+               "whole of it: a figure written into the source could not do that, and would be rebuilt unchanged "
+               "and believed on every revision after the day it was true",
+               "$2,222" in t2 and "$3,333" in t2 and "2026-08-10 to 2026-08-11" in t2
+               and "$1,235" not in t2 and "2026-09-01 to 2026-09-02" not in t2)
+            ledgers({"tz": "Test/Zone_One", "day_boundary": "local", "stale": False, "last_tick": "",
+                     "today": {"usd": 0, "auto_usd": 0, "rows": 0}, "week": {"usd": 0, "auto_usd": 0, "rows": 0},
+                     "by_day": {d: {"usd": 0, "auto_usd": 0, "rows": 0} for d in dayl}}, None)
+            t3 = page()
+            ok("an empty ledger yields a page that SAYS there is nothing to show — not a table of zeros: a zero "
+               "is a measurement and a ledger with nothing in it is not one",
+               "has no rows" in t3 and "no landing queue log" in t3 and "$" not in t3
+               and "THE FIGURES WERE NOT COUNTED" not in t3)
+
         # THE REAL DOCUMENT. Its source is the deliverable, so a source that stopped building fails HERE and not
         # on the morning the box has something to say. Built through the tool's own door in the fixture HOME —
         # nothing of this box's state is written, and the copy under test is the one committed in this tree.
@@ -668,6 +1160,9 @@ def selfcheck():
             ref = sh(["git", "-C", root, "rev-parse", "HEAD"])[1].strip()
             r = run("build", root, ref)
             out = r.stdout.strip()
+            ok("…and it still \\input's the page that is counted at build time, so the figures cannot go "
+               "missing from it the way they did once, unnoticed, in a source rewrite",
+               "InputIfFileExists{arch-figures}" in open(real).read())
             ok("THE OVERVIEW ITSELF builds with plain pdflatex and psnfss fonts, in paranoid file mode, and "
                "passes the check that gates the send — the document is what this tool exists to deliver"
                + (f" ({last(r.stderr, 160)})" if r.returncode else ""),
