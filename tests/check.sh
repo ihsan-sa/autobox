@@ -138,6 +138,12 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # and never a real suite: a green run, then one tracked file edited after it, and the record must stop answering.
 # It also reads cc-land's GATES tuple out of that source, because a gate list it has fallen behind on is a worker
 # told it is green on a gate the landing is still going to run.
+# cc-evals', cc-model's and cc-vitals' are the three no suite in this tree had ever named, found by the discovery
+# below rather than by anyone remembering them: cc-evals runs fixture cases in a temp dir with CC_EVALS_CLAUDE
+# pointed at a fake binary, so it spends nothing and reaches no model; cc-model drives its classifier and its chain
+# over stub transcripts of its own, with no network and no tmux; cc-vitals stubs the system resolver and git and
+# writes nothing outside its own temp dir. Their cases were in the repository and run by nobody until this loop
+# stopped asking a list.
 # …and only the ones a change reaches, when the landing says what changed (CC_LAND_CHANGED — tests/green.sh has
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
@@ -156,25 +162,167 @@ tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 fail
   && ! tally_ok x "x selfcheck: 28/28" && ! tally_ok x "x selfcheck: all passed" \
   && ! tally_ok x "x selfcheck: 4 passed, 10 failed" && ! tally_ok x "ran 12 cases, none failed" \
   || { echo "check.sh: the tally-shape rule no longer tells a readable tally from an unreadable one"; exit 1; }
-# RUN THEM AT ONCE, JUDGE THEM IN ORDER. Every selfcheck above is hermetic by construction — its own HOME, its own
+# RUN THEM AT ONCE, JUDGE THEM IN ORDER. Every selfcheck here is hermetic by construction — its own HOME, its own
 # temp dir, its own fixtures, reading nothing of this box's (that is what the paragraphs above each promise) — so
 # nothing makes them a queue except that they were written as one. Serially they were the largest block in this
-# gate: 26 tools, one core, on a gate that runs for every PR. They are started $JOBS at a time and each
-# one's output is kept whole in a file of its own; the verdict loop below then reads them back IN THE LIST'S
-# ORDER, so what this prints, and which tool it stops on, is exactly what it printed and stopped on serially.
+# gate: every tool that ships one, on one core, on a gate that runs for every PR. They are started $JOBS at a time and each
+# one's output is kept whole in a file of its own; the verdict loop below then reads them back IN THE ORDER THEY
+# WERE STARTED, so what this prints, and which tool it stops on, is exactly what it printed and stopped on serially.
 # Nothing is judged in the background: a case's rc and output are only read here, by the same three rules.
-# THE LIST STAYS ONE LITERAL `for c in cc-…` LINE, and the gate on it stays one `want_selfcheck "$c"`: cc-board's
-# own selfcheck reads this file and pins both, because the rule that its tripwire runs for a change to ANY tool is
-# dead the moment this loop goes back to asking `want`. Lifting the list into a variable is what broke it here.
+#
+# WHICH TOOLS THOSE ARE IS ASKED OF THE TREE, NOT OF A LIST. A line of names kept by hand was wrong in two
+# directions at once. Three branches in one day each wanted to edit it, and one line makes every collision a
+# whole-line conflict; worse, while it was held, cc-sense's 36 cases and cc's 14 sat in the repository run by
+# nobody, and cc-evals, cc-model and cc-vitals had never been named by a suite here at all. A tool's selfcheck now
+# runs because the tool exists. A tool that ships none is not a failure and is named below so its absence stays
+# visible; a selfcheck that exists and nothing runs cannot happen, which is why this reads bin/ instead of a list.
+ships_selfcheck(){   # bin/<tool> -> 0 when that file implements `<tool> selfcheck`
+  # The tally line it has to print (the shape judged below), or `selfcheck` as an arm of its own dispatch, in the
+  # shapes this tree writes it: a shell case arm, a shell test, python's argv compare, a dict key, argparse, a
+  # cmd_selfcheck. A false positive here is LOUD — the run fails on `bin/<tool> selfcheck` — and never silent,
+  # which is the direction a discovery has to err in, and a shape none of these catch is caught below instead.
+  grep -qF "${1##*/} selfcheck:" "$1" ||
+    grep -qE 'selfcheck\)|"selfcheck":|== *\[?"selfcheck"\]?|add_parser\("selfcheck"|def cmd_selfcheck|= *"?selfcheck"?( *\]|$)' "$1"; }
+runs_selfcheck(){   # <file> <tool> -> 0 when <file> already runs `<tool> selfcheck`
+  # Some selfchecks have a home of their own and must not run twice: a stanza in tests/selftest.sh that builds
+  # fixtures first (cc-pulse's, and cc-scope's in the ask-ledger stanza), or another tool's selfcheck driving it
+  # (cc-sandbox runs cc-member-v2's inside its own canary gate). Both are read out of the file that runs them, in
+  # the two shapes they are written in: the suite's `chk`/`prefetch` lines, and a `<path>/<tool> selfcheck` call.
+  grep -qE "/$2[\"'] +selfcheck([^A-Za-z0-9_-]|\$)|^(chk|prefetch)( +[A-Za-z0-9_-]+)* +$2( |\$)" "$1"; }
+discover_selfchecks(){   # <bin dir> <suite> <tools that run here whatever else runs them>
+  # -> FOUND (ships one) · HERE (this gate runs it) · ELSEWHERE (the tool, or tool(runner) when the runner is not
+  # the suite) · NOSC (ships none). ONE HOP FROM THE SUITE AND NO FURTHER: a chain of tools allowed to claim each
+  # other could claim its way out of running at all — two tools each naming the other would leave both unrun and
+  # this loop none the wiser — so a claim has to reach the suite, which is the root nothing claims.
+  local b=$1 s=$2 always=${3//$'\n'/ } f t x by suite=""   # the always set is written one name per line; match on words
+  FOUND=""; HERE=""; ELSEWHERE=""; NOSC=""
+  for f in "$b"/*; do [ -f "$f" ] || continue
+    if ships_selfcheck "$f"; then FOUND="$FOUND ${f##*/}"; else NOSC="$NOSC ${f##*/}"; fi; done
+  for t in $FOUND; do if [ -f "$s" ] && runs_selfcheck "$s" "$t"; then suite="$suite $t"; fi; done
+  for t in $FOUND; do
+    case " $always " in *" $t "*) HERE="$HERE $t"; continue;; esac
+    by=""
+    case " $suite " in *" $t "*) by=${s##*/};; *)
+      for x in $suite; do if [ -f "$b/$x" ] && runs_selfcheck "$b/$x" "$t"; then by=$x; break; fi; done;; esac
+    if   [ -z "$by" ];               then HERE="$HERE $t"
+    elif [ "$by" = "${s##*/}" ];     then ELSEWHERE="$ELSEWHERE $t"
+    else                                  ELSEWHERE="$ELSEWHERE $t($by)"; fi
+  done; }
+# AND THE FALSE NEGATIVE THIS CANNOT AFFORD. A tool whose dispatch is written in a shape ships_selfcheck() does not
+# know lands in NOSC and is reported as shipping none — the silent skip this whole block exists to end, wearing the
+# words of a clean answer. So every file called NOSC is read once more for the word at all: a tool that never says
+# "selfcheck" ships none, and one that says it where the rules above see no dispatch stops this gate until a person
+# has looked. That is #310's rule — what cannot be measured stays red, it never becomes a quiet skip.
+nosc_says_selfcheck(){   # <bin dir> <the NOSC set> -> 1, and the reason, on the first file that says it with no dispatch
+  local b=$1 t
+  for t in $2; do grep -qi selfcheck "$b/$t" || continue
+    echo "check.sh: $b/$t says 'selfcheck', but the discovery above sees no way to dispatch one, so nothing would"
+    echo "  ever run it. Teach ships_selfcheck() that dispatch shape, or take the word out of the file."
+    return 1; done; return 0; }
+# CONTROL: a discovery that stopped discriminating would run nothing and report that in the same calm sentence, so
+# both halves are proven on fixtures of their own before either is believed — the QUIET half as much as the loud
+# one, because a rule that answered yes to everything would be obeyed by deleting it. These also pin what the
+# rules do not see: `selfcheck` in prose is not a dispatch, and a tool merely NAMED beside the word is not run.
+mkdir -p "$GD/sc" "$GD/disc/bin"
+sc(){ local w=$1 s; printf '%s\n' "$3" > "$GD/sc/$2"
+  if ships_selfcheck "$GD/sc/$2"; then s=yes; else s=no; fi
+  [ "$s" = "$w" ] || { echo "check.sh: 'ships a selfcheck' reads $2 as $s, not $w: $3"; exit 1; }; }
+sc yes cc-tally   'echo "cc-tally selfcheck: 3 passed, 0 failed"'
+sc yes cc-arm     'case "$1" in selfcheck) run;; esac'
+sc yes cc-test    '[ "$1" = selfcheck ] && run'
+sc yes cc-argv    'if sys.argv[1:] == ["selfcheck"]: sys.exit(selfcheck())'
+sc yes cc-table   '          "selfcheck": lambda o: selfcheck()}'
+sc no  cc-prose   '# some other tool selfcheck is talked about here, and nothing dispatches on the word'
+sc no  cc-quiet   'echo hello'
+rs(){ local w=$1 s; printf '%s\n' "$4" > "$GD/sc/r.$2"
+  if runs_selfcheck "$GD/sc/r.$2" "$3"; then s=yes; else s=no; fi
+  [ "$s" = "$w" ] || { echo "check.sh: 'already run elsewhere' reads $2 as $s, not $w: $4"; exit 1; }; }
+rs yes chk        cc-pulse     'chk cc-pulse'
+rs yes chk-note   cc-loop      'chk cc-loop   # its own tally line, not the journal fixtures it prints above it'
+rs yes prefetched cc-pulse     'prefetch cc-reconcile cc-janitor cc-pulse cc-secretary'
+rs yes invoked    cc-slack     '"$B/cc-slack" selfcheck > "$T/slack-selfcheck.out" 2>&1 && ok "…"'
+rs yes by-a-tool  cc-member-v2 '  "$BIN/cc-member-v2" selfcheck; t "v2 cases" "$?" 0'
+rs no  prefix     cc-member    'chk cc-member-broker'
+rs no  named-only cc-pulse     '# cc-pulse selfcheck is described here and run nowhere'
+rs no  another    cc-pulse     'chk cc-pause'
+# …AND THE TWO TOGETHER, on a bin/ and a suite of its own, because what this gate runs is their COMPOSITION and
+# neither half on its own says it: a tool nothing runs is run HERE — the failure this whole block exists to stop —
+# one the suite runs is left to the suite, one another tool drives is left to that tool and named for it, a tool
+# with no selfcheck is reported and not run, and the always-here names run here even though the suite runs them too
+# — passed the way the real call passes them, one per line, because a set that only worked as one word would break
+# on the first name added under the next.
+d(){ printf '%s\n' "$2" > "$GD/disc/$1"; }
+d bin/cc-orphan 'case "$1" in selfcheck) :;; esac'
+d bin/cc-suited 'case "$1" in selfcheck) :;; esac'
+d bin/cc-driver 'case "$1" in selfcheck) "$BIN/cc-driven" selfcheck;; esac'
+d bin/cc-driven 'case "$1" in selfcheck) :;; esac'
+d bin/cc-nosc   'echo this tool has no cases of its own'
+d bin/cc-always 'case "$1" in selfcheck) :;; esac'
+d bin/cc-both   'case "$1" in selfcheck) :;; esac'
+d bin/cc-prosaic 'echo "to check this one, run cc-orphan selfcheck by hand"'   # says the word, dispatches nothing
+d suite         $'chk cc-suited\nchk cc-driver\nchk cc-always\nchk cc-both'
+discover_selfchecks "$GD/disc/bin" "$GD/disc/suite" $'\ncc-always\ncc-both\n'
+[ "$FOUND" = " cc-always cc-both cc-driven cc-driver cc-orphan cc-suited" ] && [ "$NOSC" = " cc-nosc cc-prosaic" ] \
+  && [ "$HERE" = " cc-always cc-both cc-orphan" ] && [ "$ELSEWHERE" = " cc-driven(cc-driver) cc-driver cc-suited" ] \
+  || { echo "check.sh: the selfcheck discovery no longer splits a fixture bin/ the way it says it does:"
+       echo "  found:$FOUND / here:$HERE / elsewhere:$ELSEWHERE / no selfcheck:$NOSC"; exit 1; }
+# …AND THE TRIPWIRE ON THAT SAME FIXTURE, END TO END. No real tool takes this branch today, so nothing else here
+# would notice it break — a mistyped variable or a grep that stopped matching would sit quiet until the day a tool
+# needed it, which is the day it must not be quiet. cc-prosaic is the shape it hunts: the word with no dispatch,
+# carried through discover_selfchecks into NOSC and fed to the same function the real tree is judged by. Both
+# answers are pinned, because one that always refused would be obeyed by deleting it.
+if o=$(nosc_says_selfcheck "$GD/disc/bin" "$NOSC"); then trc=0; else trc=$?; fi
+{ [ "$trc" = 1 ] && grep -q "cc-prosaic says 'selfcheck'" <<<"$o"; } \
+  || { echo "check.sh: a NOSC tool that says 'selfcheck' with no dispatch no longer stops this gate (rc=$trc):"
+       echo "  ${o:-<it said nothing>}"; exit 1; }
+nosc_says_selfcheck "$GD/disc/bin" cc-nosc \
+  || { echo "check.sh: the NOSC tripwire now fires on a tool that never says 'selfcheck' — it would refuse every"
+       echo "  clean tree, and the way to make this gate green again would be to delete the rule."; exit 1; }
+# THE FEW THIS GATE RUNS ANYWAY, ONE NAME PER LINE. Each is a tool tests/selftest.sh runs too, and this gate runs
+# it regardless, because check.sh is what a COMMIT has to pass and the suite is not: cc-board because its tripwire
+# reads every other tool under bin/, and the other five because the suite's own stanzas say they run here "too"
+# (selftest.sh, cc-notify's stanza). Leaving them to the suite would have quietly taken five selfchecks off the
+# pre-commit gate to fix a conflict that was never theirs.
+# THIS IS NOT THE LIST THIS BLOCK REPLACED AND CANNOT DECAY INTO IT. Every name here is already running somewhere;
+# a tool missing from here is a selfcheck the suite still runs, once, while a tool missing from the OLD list was a
+# selfcheck nobody ran at all. Being wrong here costs a duplicate run, which is the only direction this file is
+# allowed to be wrong in. One name per line, so two branches adding different ones do not touch the same line.
+also_here='
+cc-board
+cc-brief
+cc-native
+cc-notify
+cc-task
+cc-watch
+'
+discover_selfchecks bin tests/selftest.sh "$also_here"
+nosc_says_selfcheck bin "$NOSC" || exit 1
+others=""; for t in $HERE; do [ "$t" = cc-board ] || others="$others $t"; done
 SCD=$GD   # the dir and its trap are set at the top; a second EXIT trap here would have replaced the first
 running=0; ran=""
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-watch cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc-green cc-arch cc; do
+# cc-board is named here for a reason that is not the list's: the loop must stay one literal `for c in cc-…` line
+# holding ` cc-board `, gated by one `want_selfcheck "$c"`, because cc-board's own selfcheck reads this file and
+# pins both shapes — the rule that its tripwire runs for a change to ANY tool is dead the moment this loop goes
+# back to asking `want`. $others is everything else the discovery put HERE, so a tool added tomorrow is run
+# tomorrow by nobody's memory, and the one name in the source is a shape cc-board pins, not a roster to keep.
+for c in cc-board $others; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   ran="$ran $c"
   { rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &
   running=$((running + 1))
   [ "$running" -lt "$JOBS" ] || { wait -n 2>/dev/null || wait; running=$((running - 1)); }
 done
+# WHAT THE DISCOVERY DECIDED, SAID OUT LOUD AND BEFORE THE VERDICTS, so a run that goes red still shows what it
+# chose to run. The old list was silent about everything it left out, which is how cc-evals', cc-model's and
+# cc-vitals' cases lived in the repository with no suite here ever running them. Every set is NAMED and not just
+# counted — what ran here, what another runner owns, what ships nothing, what this change did not reach — because
+# a count cannot tell you which tool went missing and the name can.
+n_of(){ set -- $1; echo $#; }   # counted inside a function, so this gate's own "$@" (extra python files) is untouched
+echo "check.sh: selfchecks: $(n_of "$FOUND") of $(n_of "$FOUND$NOSC") tools under bin/ ship one — $(n_of "$ran") ran here, $(n_of "$ELSEWHERE") run elsewhere, $(n_of "$skipped") out of this change's reach"
+echo "  here:$ran"
+echo "  elsewhere, not twice (tests/selftest.sh, or the tool named):$ELSEWHERE"
+echo "  ships none — not a failure, named so an absent selfcheck is visible:$NOSC"
+[ -z "$skipped" ] || echo "  not in this change's reach, not run:$skipped"
 wait
 # THE VERDICT LOOP WALKS WHAT WAS STARTED, not what happens to have left a file behind. A job killed before it
 # could write its rc leaves nothing, and a loop reading the directory would have counted that silence as a tool
@@ -194,7 +342,6 @@ for c in $ran; do
     echo "  got:  ${g:-<no \"$c selfcheck: …\" line at all>}"
     echo "  want: \"$c selfcheck: <n> passed, 0 failed\" or \"$c selfcheck: 0 failed\""
     exit 1; }; done
-[ -z "$skipped" ] || echo "check.sh: not in this change's reach, not run:$skipped"
 # THE DOC THAT TELLS THE OWNER WHEN HIS PHONE RINGS MUST NAME EVERY ROW THAT RINGS IT. USAGE.md went on promising a
 # push for every cc-notify call long after the table stopped giving one (found by review, 2026-09-07): that file is
 # what he reads to know what reaching him costs, and a promise the code does not keep is worse than no promise. So

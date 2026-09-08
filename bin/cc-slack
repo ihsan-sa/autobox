@@ -176,6 +176,8 @@ CANVASES = "canvases.json"                                     # {"<chat>": {can
 FLAGS = "flags.json"                                           # {"<chat>:<root_ts>": <flag_ts>}: WHEN the owner 🏁'd a thread (a newer message re-opens it)
 STALE_AFTER = 48 * 3600                                        # a thread quiet this long leaves the buckets (and loses its mark)
 STALL_AFTER = 30 * 60                                          # the owner's last word unanswered this long = a stalled session
+RETRY_GRACE = 30 * 60                                          # …and after the box has re-handed that thread to the session,
+                                                               # this much more silence before the owner hears about it at all
 DECLARE_GRACE = 60                                             # a needs_owner declaration covers everything the sender posts in the
                                                                # same breath: a chunked reply is several messages, and Slack stamps
                                                                # them with ITS clock, not ours. Our own next word a minute later is
@@ -3540,6 +3542,8 @@ class Daemon:
         self.reply_cache = {}                               # (chat, root_ts) -> (latest_reply, last msg): a thread whose
         self.nudged = {}                                    # latest_reply has not moved needs no second replies read
                                                             # (chat, root_ts) already nudged -> ts of the message it nudged about
+        self.retried = {}                                   # (chat, root_ts) -> (when, what it found): a stalled thread this pass
+                                                            # re-handed to its session, before anyone pages the owner about it
         self.board = {}                                     # chat -> {"dirty_at": float|None}; dirty tracker for reconcile_reactions
         self.status_cache = {}                              # (chat, root_ts) -> the CONVERSATION mark we believe is on that root (None = clean)
         self.work_cache = {}                                # (chat, root_ts) -> the WORK mark (🔧/✅) we believe is there
@@ -5663,10 +5667,65 @@ class Daemon:
                + (["*done* ✅"] + fin if fin else []))
         self.say(chat, "\n".join(out) or "no open threads in the last 48h", thread)
 
+    def stall_state(self, chat, target, root):
+        """WHAT THE BOX CAN SEE about the session that owes this thread an answer, in one phrase written for the owner:
+        what was found, not which call found it. LLM-free, from the two facts session_gone and busy_cycle already read —
+        the socket (is it on the channel?) and the pane (is it mid-turn?) — plus last_chat, which says whether the turn
+        it is in the middle of belongs to some other thread. This goes into the nudge, so a thread that does reach him
+        arrives with the diagnosis already done."""
+        alias = self.chan_alias(chat)
+        with self.lock:
+            subbed = any((c.info.get("alias") or None) == alias for c in self.subs.get(target, ()))
+        wid, _ = tmux_window(f"{target}@{alias}" if alias else window_for(target))
+        if wid and pane_working(wid):
+            where = self.last_chat.get(target)
+            elsewhere = bool(where) and (where[0], where[1]) != (chat, root)
+            return "the session was alive and mid-turn " + ("in another thread" if elsewhere else "on this one")
+        if subbed:
+            return "the session was on the channel and idle"
+        return "the session was running without the channel" if wid else "nothing was running for it"
+
+    def retry_delivery(self, chat, root, last):
+        """RE-HAND A STALLED THREAD TO ITS SESSION, which is the box's own recovery for the box's own problem: the
+        owner spoke, 30 minutes passed and nothing came back. Before 2026-09-07 that posted `!restart` straight at
+        him — his diagnosis to make and his recovery to run — and it fired while the session was alive and answering
+        in another thread. So the message goes down the same door the first delivery used (deliver: subscriber, then
+        the pane, then the queue), and only silence AFTER that is worth his attention.
+
+        autostart=False on purpose: a session that is really gone reads 🟠, never ❓, so nothing here should start one —
+        a nudge cycle must not spend a whole session. Returns the phrase for the nudge if one is ever due, or None
+        when there is no session this channel could even be waiting on (no route: nothing to try, nothing to page)."""
+        target = self.route(chat, "im" if str(chat).startswith("D") else None)
+        if not target:
+            return None
+        found = self.stall_state(chat, target, root)
+        meta = {"chat_id": chat, "thread_ts": root, "ts": last.get("ts") or root, "role": "owner",
+                "user": self.user_name(last.get("user")), "target": target,
+                "channel": "dm" if str(chat).startswith("D") else "#" + (self.chan_name(chat) or str(chat))}
+        note = (f"🔁 this thread has gone {self.ago(last['ts'])} with no answer, so it is being handed to you again "
+                f"before the owner is told anything. Answer it in the thread, or say there why you cannot:\n"
+                + " ".join((last.get("text") or "").split()))
+        res = self.deliver(target, {"type": "message", "content": note, "meta": meta},
+                           autostart=False, alias=self.chan_alias(chat))
+        at = time.strftime("%H:%M", time.localtime())   # his clock, the box's timezone — a nudge is read on a phone
+        return f"{found}; " + {"delivered": f"re-delivered at {at}", "typed": f"typed at its pane at {at}",
+                               "spooled": f"left at its pane at {at}", "queued": f"queued at {at}, nothing took it",
+                               "paused": "the project is parked, so it only went to the queue"}.get(
+                                   res, f"it could not be handed over at all ({res})")
+
     def nudge_cycle(self):
         """Every 15 min (V4): a thread that has needed the owner for >30 min gets ONE nudge carrying the actual ask —
-        never repeated this daemon's lifetime, ≤3 per cycle. Reuses reconcile's fresh bucket snapshot when it has one."""
-        sent = 0
+        never repeated this daemon's lifetime, ≤3 per cycle. Reuses reconcile's fresh bucket snapshot when it has one.
+
+        A STALLED SESSION IS THE BOX'S PROBLEM FIRST (owner, 2026-09-07). Where the thread is waiting on HIM the nudge
+        goes out as it always has. Where it is waiting on a SESSION, the first pass re-hands the thread to that session
+        (retry_delivery) and says nothing to him; he hears about it only if RETRY_GRACE more minutes pass with still no
+        answer, and then the line says what was tried and what it found. A session that answers in between takes the
+        thread out of ❓ on its own, so the recovered case needs no bookkeeping here — it simply never posts.
+        Retries are capped tighter than nudges (2): each one can spend up to 90 s in cc-msg at the pane."""
+        sent = tries = 0
+        now = time.time()
+        self.retried = {k: v for k, v in self.retried.items() if now - v[0] < STALE_AFTER}   # threads leave the buckets at 48 h
         for chat in {c for c, _ in list(self.last_chat.values())} | set(self.board):
             if sent >= 3:
                 break
@@ -5683,10 +5742,20 @@ class Daemon:
                         ask = " ".join((last.get("text") or "").split())[:80]
                         line = f"❓ still waiting for you ({self.ago(last['ts'])}): {ask}"
                     else:
-                        line = (f"⏳ no answer for {self.ago(last['ts'])} — `!restart {self.route(chat, 'channel')}` "
-                                f"if the session is wedged")
+                        tried = self.retried.get(key)
+                        if tried is None:
+                            if tries >= 2:
+                                continue
+                            found = self.retry_delivery(chat, root["ts"], last)
+                            if found is None:
+                                continue                   # no session maps to this channel: nobody is stalled, nobody is paged
+                            self.retried[key] = (time.time(), found); tries += 1
+                            continue                       # …and he hears nothing unless the silence outlasts RETRY_GRACE
+                        if time.time() - tried[0] < RETRY_GRACE:
+                            continue
+                        line = f"⏳ no answer for {self.ago(last['ts'])} — {tried[1]}; still nothing."
                     self.say(chat, line, root["ts"])
-                    self.nudged[key] = float(last["ts"]); sent += 1
+                    self.nudged[key] = float(last["ts"]); self.retried.pop(key, None); sent += 1
             except Exception as e:
                 if any(g in str(e) for g in self.GONE):
                     self.forget_chat(chat, str(e)); continue
@@ -8701,17 +8770,73 @@ def cmd_selfcheck():
     nudge_api = lambda method, token, **kw: {"messages": roots8.get(kw.get("channel"), [])} if method == "conversations.history" else {"messages": replies8.get(kw.get("ts"), [])}
     dm8 = Daemon(use_slack=False); dm8.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm8.bot_user = "UBOT"
     dm8.route = lambda chat, ctype: "r"; dm8.last_chat["r"] = ("C1", None)
+    dm8.session_gone = lambda chat: False              # the premise of every case below: there IS a session, and it is not answering
     said8 = []; dm8.say = lambda chat, text, thread=None: said8.append((chat, thread, text))
+    deliv8 = []
+    dm8.deliver = lambda target, payload, **kw: (deliv8.append((target, payload["content"], payload["meta"], kw)), "delivered")[1]
+    dm8.stall_state = lambda chat, target, root: "the session was alive and mid-turn in another thread"
     try:
         globals()["api"] = nudge_api
         dm8.nudge_cycle()
-        check("nudge: a 40-min stall is nudged once, naming `!restart <target>` (a 5-min wait, an answered thread and 🏁 are not) — V4",
-              len(said8) == 1 and said8[0][:2] == ("C1", "2000.1") and "no answer for 40m" in said8[0][2] and "!restart r" in said8[0][2])
+        check("nudge: a 40-min stall is HANDED BACK TO ITS SESSION first and the owner hears nothing — the box tries "
+              "its own recovery for its own problem before it pages him (2026-09-07). A 5-min wait, an answered "
+              "thread and a 🏁 are still no case at all",
+              said8 == [] and len(deliv8) == 1 and deliv8[0][0] == "r" and "waiting" in deliv8[0][1]
+              and deliv8[0][2]["thread_ts"] == "2000.1" and deliv8[0][3].get("autostart") is False)
+        dm8.nudge_cycle()
+        check("nudge: the thread is re-handed ONCE and the grace runs from that try, not from every cycle",
+              said8 == [] and len(deliv8) == 1)
+        k8 = ("C1", "2000.1")
+        dm8.retried[k8] = (dm8.retried[k8][0] - RETRY_GRACE - 60, dm8.retried[k8][1])   # …and now the grace has run out
+        dm8.nudge_cycle()
+        check("nudge: tried and still stuck — ONE page, ageing from the owner's own message, saying what was tried "
+              "and what it found, and handing him no `!restart` to run",
+              len(said8) == 1 and said8[0][:2] == ("C1", "2000.1") and "no answer for 40m" in said8[0][2]
+              and "mid-turn in another thread" in said8[0][2] and "!restart" not in said8[0][2] and len(deliv8) == 1)
         said8.clear()
         dm8.nudge_cycle()
         check("nudge: same thread is never repeated within the daemon's lifetime", said8 == [])
     finally:
         globals()["api"] = real_api
+    # tried and RECOVERED: the session answered after the re-delivery, so the thread is out of ❓ and nothing reaches him
+    dm8r = Daemon(use_slack=False); dm8r.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm8r.bot_user = "UBOT"
+    dm8r.route = lambda chat, ctype: "r"; dm8r.last_chat["r"] = ("C2", None); dm8r.session_gone = lambda chat: False
+    rootsR = {"C2": [{"ts": "2200.1", "reply_count": 1, "text": "the ask"}]}
+    repliesR = {"2200.1": [{"ts": str(now3 - 2 * 60), "user": "UBOT", "text": "sorry — here it is"}]}
+    with_latest(rootsR["C2"], repliesR)
+    saidR, delivR = [], []
+    dm8r.say = lambda chat, text, thread=None: saidR.append(text)
+    dm8r.deliver = lambda target, payload, **kw: (delivR.append(target), "delivered")[1]
+    dm8r.retried[("C2", "2200.1")] = (now3 - RETRY_GRACE - 60, "the session was on the channel and idle")
+    try:
+        globals()["api"] = lambda method, token, **kw: ({"messages": rootsR.get(kw.get("channel"), [])}
+                                                        if method == "conversations.history"
+                                                        else {"messages": repliesR.get(kw.get("ts"), [])})
+        dm8r.nudge_cycle()
+    finally:
+        globals()["api"] = real_api
+    check("nudge: tried and recovered — an answer inside the grace takes the thread out of ❓, so the page that was "
+          "due never comes and nothing is re-delivered either",
+          saidR == [] and delivR == [])
+    dm8s = Daemon(use_slack=False); dm8s.bot_user = "UBOT"; dm8s.last_chat["r"] = ("C1", "9.9")
+    _twS, _pwS = tmux_window, pane_working
+    try:
+        globals()["tmux_window"] = lambda name: ("@7", "bash"); globals()["pane_working"] = lambda wid: True
+        s_other, s_here = dm8s.stall_state("C1", "r", "2000.1"), dm8s.stall_state("C1", "r", "9.9")
+        globals()["pane_working"] = lambda wid: False
+        s_deaf = dm8s.stall_state("C1", "r", "9.9")                     # a pane, no subscriber: it lost the channel
+        globals()["tmux_window"] = lambda name: (None, None)
+        s_gone = dm8s.stall_state("C1", "r", "9.9")
+        dm8s.subs["r"].append(types.SimpleNamespace(info={}))
+        globals()["tmux_window"] = lambda name: ("@7", "bash")
+        s_idle = dm8s.stall_state("C1", "r", "9.9")
+    finally:
+        globals()["tmux_window"], globals()["pane_working"] = _twS, _pwS
+    check("stall_state: what the owner is told is the pane and the socket, not a guess — mid-turn in another thread, "
+          "mid-turn on this one, running without the channel, on the channel and idle, or gone",
+          s_other == "the session was alive and mid-turn in another thread" and s_here.endswith("on this one")
+          and s_deaf == "the session was running without the channel" and s_idle.endswith("on the channel and idle")
+          and s_gone == "nothing was running for it")
     ask_root = [{"ts": "2100.1", "reply_count": 1, "latest_reply": str(now3 - 45 * 60), "user": "UOWNER", "text": "the task"}]
     ask_last = [{"ts": str(now3 - 45 * 60), "bot_id": "B01", "text": "half done — which env var should I use?"}]
     dm8b = Daemon(use_slack=False); dm8b.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm8b.bot_user = "UBOT"
@@ -8727,6 +8852,7 @@ def cmd_selfcheck():
           len(said8b) == 1 and said8b[0][:2] == ("C8", "2100.1")
           and said8b[0][2].startswith("❓ still waiting for you (45m):") and "which env var" in said8b[0][2])
     dm9 = Daemon(use_slack=False); dm9.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}; dm9.bot_user = "UBOT"; dm9.route = lambda chat, ctype: "r"
+    dm9.session_gone = lambda chat: False
     for i in range(4):
         dm9.last_chat[f"t{i}"] = (f"D{i}", None)
     roots9 = {f"D{i}": [{"ts": f"300{i}.1", "reply_count": 1, "text": f"red {i}"}] for i in range(4)}
@@ -8734,8 +8860,17 @@ def cmd_selfcheck():
     [with_latest(v, replies9) for v in roots9.values()]
     cap_api = lambda method, token, **kw: {"messages": roots9.get(kw.get("channel"), [])} if method == "conversations.history" else {"messages": replies9.get(kw.get("ts"), [])}
     said9 = []; dm9.say = lambda chat, text, thread=None: said9.append(chat)
+    deliv9 = []
+    dm9.deliver = lambda target, payload, **kw: (deliv9.append(target), "delivered")[1]
+    dm9.stall_state = lambda chat, target, root: "the session was on the channel and idle"
     try:
         globals()["api"] = cap_api
+        dm9.nudge_cycle()
+        check("nudge: the re-delivery is capped TIGHTER than the nudge (2 a cycle) — one of them can sit 90 s at a "
+              "pane, and this runs on the daemon's own timer",
+              said9 == [] and len(deliv9) == 2)
+        for i in range(4):                                   # …and now every one of them is out of grace and due
+            dm9.retried[(f"D{i}", f"300{i}.1")] = (now3 - RETRY_GRACE - 60, "the session was on the channel and idle")
         dm9.nudge_cycle()
         check("nudge: capped at 3 per cycle across all channels", len(said9) == 3)
     finally:
@@ -10108,6 +10243,7 @@ def cmd_selfcheck():
         dmNV.route = lambda chat, ctype=None: "myrepo"; dmNV.last_chat["myrepo"] = ("CV", None)
         saidNV = []; dmNV.say = lambda chat, text, thread=None: saidNV.append(text)
         _apiNV = globals()["api"]
+        dmNV.retried[("CV", "3000.1")] = (nowVM - RETRY_GRACE - 60, "the session was on the channel and idle")
         try:
             globals()["api"] = (lambda method, token, **kw:
                                 {"messages": rootsVM.get(kw.get("channel"), [])} if method == "conversations.history"
@@ -10115,9 +10251,10 @@ def cmd_selfcheck():
             dmNV.nudge_cycle()
         finally:
             globals()["api"] = _apiNV
-        check("a memo left unanswered for 40 min is nudged as the SESSION's silence (`!restart myrepo`) — never as "
-              "'still waiting for you', which would be the box asking the owner to answer their own memo",
-              len(saidNV) == 1 and saidNV[0].startswith("⏳ no answer") and "`!restart myrepo`" in saidNV[0]
+        check("a memo left unanswered for 40 min is nudged as the SESSION's silence (what the box tried, and what it "
+              "found) — never as 'still waiting for you', which would be the box asking the owner to answer their "
+              "own memo",
+              len(saidNV) == 1 and saidNV[0].startswith("⏳ no answer") and "on the channel and idle" in saidNV[0]
               and "still waiting" not in saidNV[0] and SPOKEN not in saidNV[0])
         capVM = voice_post("a" * (CHUNK * 2), "b" * (CHUNK * 2))
         check("the post under their recording is ONE message however long the memo and however long the condensing "
@@ -10497,6 +10634,7 @@ def cmd_selfcheck():
           and [m for m, _, _ in b_unflag] == ["❓"])
     said_n = []; dmV3.say = lambda chat, text, thread=None: said_n.append(text)
     dmV3.last_chat["r"] = ("CF", None)
+    dmV3.retried[("CF", "9200.1")] = (nowF - RETRY_GRACE - 60, "nothing was running for it")   # already tried and out of grace
     dmV3.flags["CF:9200.1"] = nowF
     try:
         globals()["api"] = f_api
@@ -10675,6 +10813,7 @@ def cmd_selfcheck():
     saidA = []; dmA.say = lambda chat, text, thread=None: saidA.append(text)
     dmA.route = lambda chat, ctype=None: "r"; dmA.last_chat["r"] = ("CA2", None)
     dmA.snap["CA2"] = (time.time(), dmA.bucket_threads("CA2", roots=rootsA))
+    dmA.retried[("CA2", rootsA[1]["ts"])] = (nowA2 - RETRY_GRACE - 60, "nothing was running for it")
     dmA.nudge_cycle()
     check("nudge: a message we answered with a reaction is 🟠 and never nudged; the one beside it, still unanswered "
           "after 40 min, is (addendum 2)",
