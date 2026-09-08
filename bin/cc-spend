@@ -1522,17 +1522,37 @@ def selfcheck():
         try:
             cwd_st = os.path.join(th7, ".cc", "steward", "myrepo")
             cwd_sess = os.path.join(th7, "dev", "myrepo")
+            cwd_ctl = os.path.join(th7, "dev", "otherdayrepo")
             proj_st = os.path.join(th7, ".claude", "projects", "-stew-proj")
             proj_sess = os.path.join(th7, ".claude", "projects", "-sess-proj")
+            proj_ctl = os.path.join(th7, ".claude", "projects", "-ctl-proj")
             os.makedirs(proj_st)
             os.makedirs(proj_sess)
+            os.makedirs(proj_ctl)
 
-            # dated today, not on a fixed day: the assertions below read the row back through the
-            # 7-day `--week` window, which a hardcoded date walks out of a few days after it is written.
-            ts7 = datetime.now(timezone.utc).strftime("%Y-%m-%dT10:00:00.000Z")
+            # The child is put in a zone whose date is DELIBERATELY not UTC's, so the skew that took this case
+            # red (21:53 PDT, 2026-09-08: the row landed on a local day the view does not cover) is reproduced
+            # at whatever hour the suite runs at, not only when this box is in that evening itself. UTC-10
+            # before 10:00Z puts the child on the previous local date, UTC+13 from 11:00Z on the next one; both
+            # are fixed offsets, so no DST hour is ambiguous or skipped. Stamping the rows the way this fixture
+            # used to — UTC's date at 10:00Z — then puts them off the child's today and turns the two
+            # assertions below red, which is what makes them a check. (Not in the 10:00Z hour: there the old
+            # stamp's own hour is the hour the run is in, and no zone separates the two dates.)
+            t0 = now()                                   # ONE clock read: the zone, the stamps and the control
+            west = t0.hour < 10                          # day cannot then be picked off opposite sides of 10:00Z
+            tz7 = "Etc/GMT+10" if west else "Etc/GMT-13"
+            lday = t0.astimezone(ZoneInfo(tz7)).date()   # the day the child is in, which the view will read
+            # Stamped NOW, so the two rows are in the child's local today whatever day that is, and read back
+            # through the DEFAULT view, which is that one local date — `--week` was seven of them and hid the
+            # skew. The control is stamped on `lday` read as a UTC day, half a day past whichever edge the
+            # offset crosses: its LOCAL date is a day off today, so the view must not show it, while its UTC
+            # day is `lday` itself — inside ledger_days(), so the file really is opened and only the local-date
+            # filter keeps the row out. Bucket the view on the UTC day, or drop that filter, and it shows up.
+            ts7 = iso(t0)
+            ts_ctl = f"{lday}T00:30:00Z" if west else f"{lday}T23:30:00Z"
 
-            def rec7(rid, sid, cwdv):
-                return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts7,
+            def rec7(rid, sid, cwdv, ts=None):
+                return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts or ts7,
                                    "cwd": cwdv, "sessionId": sid, "entrypoint": "sdk-cli",
                                    "message": {"model": "claude-opus-5", "id": "m_" + rid,
                                                "usage": {"input_tokens": 100, "output_tokens": 10,
@@ -1541,14 +1561,20 @@ def selfcheck():
 
             open(os.path.join(proj_st, "sstewa1.jsonl"), "w").write(rec7("req_stew", "sstewa1", cwd_st))
             open(os.path.join(proj_sess, "ssessi1.jsonl"), "w").write(rec7("req_sess", "ssessi1", cwd_sess))
-            env7 = {**os.environ, "HOME": th7}
+            open(os.path.join(proj_ctl, "sctlrw1.jsonl"), "w").write(
+                rec7("req_ctl", "sctlrw1", cwd_ctl, ts_ctl))
+            env7 = {**os.environ, "HOME": th7, "TZ": tz7}
             subprocess.run([sys.executable, me, "tick"], env=env7, capture_output=True, text=True)
-            by_track = subprocess.run([sys.executable, me, "--by", "track", "--week"], env=env7,
+            by_track = subprocess.run([sys.executable, me, "--by", "track"], env=env7,
                                       capture_output=True, text=True)
             ok("a steward-placed transcript lands on its own `myrepo/steward` line",
                by_track.returncode == 0 and "myrepo/steward" in by_track.stdout)
             ok("…while a session one still lands on `myrepo/session`, and the two are not folded into one row",
                "myrepo/session" in by_track.stdout and by_track.stdout.count("myrepo/") == 2)
+            ok("…and the day they are read back on is the CHILD's own, not UTC's: a control row sitting in a "
+               "ledger file this view does open, a local day off the child's today, stays out of the table — "
+               "bucket on the UTC day instead, or drop the local-date filter, and it is the row that shows",
+               "otherdayrepo" not in by_track.stdout)
         finally:
             shutil.rmtree(th7, ignore_errors=True)
         ok("`phantoms` before any tick says so and exits 1 rather than printing an empty all-clear",
