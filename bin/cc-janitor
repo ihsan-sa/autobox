@@ -1909,57 +1909,106 @@ def selfcheck():
             the one case that has to burn a core does not take one from the work running beside this suite."""
             os.makedirs(ws, exist_ok=True)
             job = "nice -n 19 bash -c 'while :; do :; done'" if burn else "sleep 300"
-            subprocess.run(["bash", "-c", f"{job} & exit 0"], cwd=ws, start_new_session=True, timeout=60,
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # …AND IT HANDS BACK THE PID, because the teardown below cannot find it any other way once this temp
+            # root is gone: `holding()` reads each process's cwd, and a removed directory reads as "<path> (deleted)"
+            # and matches nothing. Two spared burners outlived their suite by 7.6 hours that way, one core each
+            # (found 2026-09-07). The sweep is what the rule is tested on; the pid is what cleans up after it.
+            # the job's OWN output goes to /dev/null inside the shell: leave it on the pipe and capture_output
+            # waits for a process that never exits
+            p = subprocess.run(["bash", "-c", f"{job} >/dev/null 2>&1 & echo $!; exit 0"], cwd=ws,
+                               start_new_session=True, timeout=60, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True)
+            try:                                        # nothing to hand back when the fork did not take: bash
+                pid = int((p.stdout or "").strip())     # leaves $! unset and prints an empty line, and 0 is no
+            except ValueError:                          # pid — os.kill(0, …) signals this suite's own group
+                return None
+            return pid if pid > 0 else None
 
         wsgone, wslive, wsrec, wsidle = (f"{ftmp}/gone", f"{ftmp}/live", f"{ftmp}/rec", f"{ftmp}/idle")
-        orphan(wsgone, burn=True)
-        orphan(wsrec, burn=True)
-        orphan(wsidle)
-        os.makedirs(wslive, exist_ok=True)
-        runner = fixture("bash", "-c", "sleep 300", cwd=wslive)     # its own session, and it stays: a run still going
-        json.dump({"name": "served", "dir": wsrec, "port": 2}, open(f"{recs}/served.json", "w"))
-        time.sleep(0.7)                                 # …which is older than the fraction of an hour below
 
         def holding(ws):
             return sorted(int(pid) for pid, c in live_cwds() if inside(os.path.realpath(ws), c))
 
-        orph = dict(CC_JANITOR_ORPHAN_HOURS="0.0001", CC_JANITOR_ORPHAN_CPU="0.01")
-        was = {w: holding(w) for w in (wsgone, wslive, wsrec, wsidle)}
-        ro = run("--dry", **orph)
-        ok("rule 7: --dry names the process it would end, and where it is working",
-           f"would end pid {was[wsgone][0]}" in ro.stdout and wsgone in ro.stdout)
-        ok("rule 7: --DRY ENDS NOTHING — every one of them is still running",
-           {w: holding(w) for w in (wsgone, wslive, wsrec, wsidle)} == was and all(was.values()))
-        r7 = run(**orph)
-        ok("rule 7: an orphan burning a core in a scratch workspace is ended, and each process it ended is named",
-           holding(wsgone) == [] and f"end pid {was[wsgone][0]}" in r7.stdout and wsgone in r7.stdout)
-        ok("rule 7: A RUN STILL GOING SURVIVES — its session leader is alive, and the pass says which",
-           holding(wslive) == was[wslive] and f"spared {wslive}" in r7.stdout and "still alive" in r7.stdout)
-        ok("rule 7: AN ORPHAN A REGISTERED RECORD POINTS INTO SURVIVES, however hard it is running, named by the record",
-           holding(wsrec) == was[wsrec] and f"{recs}/served.json points into it" in r7.stdout)
-        ok("rule 7: AN IDLE ORPHAN SURVIVES and is reported — a preview sitting on a port costs nobody anything",
-           holding(wsidle) == was[wsidle] and f"spared {wsidle}" in r7.stdout and "idle" in r7.stdout)
-        ok("rule 7: the end is in the log too, with where it was working and what it was costing",
-           f"end pid {was[wsgone][0]}" in open(f"{th}/.cc/state/janitor.log").read())
-        ok("rule 7: …and 0 hours turns the rule off — the same box, the same orphans, and not a word about them",
-           "scratch workspace" in run("--dry", **orph).stdout
-           and "scratch workspace" not in run("--dry", CC_JANITOR_ORPHAN_HOURS="0").stdout)
-        stray = fixture("sleep", "120", cwd=wsidle)
-        time.sleep(0.3)
-        ok("rule 7: the kill reads the working directory ONE more time first — a pid that has moved on since the "
-           "pass read it, or been handed to something else, is not the one this ends",
-           end_proc(stray.pid, f"{ftmp}/somewhere-else").startswith("it is working somewhere else")
-           and os.path.exists(f"/proc/{stray.pid}")
-           and end_proc(stray.pid, wsidle) == "" and stray.wait(timeout=10) == -signal.SIGTERM)
+        def end_stray(pid, ws):
+            """The teardown's own kill, and it keeps end_proc()'s rule: the working directory is read ONE more time
+            and still has to name `ws`. A pid that has exited is a stranger by the time its number comes round
+            again, and this suite records pids of processes it knows the pass may already have ended. The link is
+            read RAW rather than resolved — a removed workspace reads back with a trailing " (deleted)", which is
+            the one case the recorded pid exists for. True when the signal was sent."""
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd") if pid else ""
+            except OSError:
+                return False                            # gone and reaped between the record and here: nothing to end
+            cwd = cwd[: -len(" (deleted)")] if cwd.endswith(" (deleted)") else cwd
+            if not cwd or not inside(os.path.realpath(ws), cwd):
+                return False
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                return False
+            return True
 
-        for w in (wsgone, wslive, wsrec, wsidle):       # whatever the pass spared is this suite's to clean up
-            for pid in holding(w):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-        runner.wait(timeout=10)
+        # The fixtures live in a try: the temp root only vanishes under live burners when this block RAISES, and
+        # the teardown that ends them by pid is worth nothing on any path that skips it.
+        strays, runner = {}, None                       # ws → the pid orphan() started in it, for that teardown
+        try:
+            for w_, burn_ in ((wsgone, True), (wsrec, True), (wsidle, False)):
+                strays[w_] = orphan(w_, burn=burn_)
+            os.makedirs(wslive, exist_ok=True)
+            runner = fixture("bash", "-c", "sleep 300", cwd=wslive)  # its own session, and it stays: a run still going
+            json.dump({"name": "served", "dir": wsrec, "port": 2}, open(f"{recs}/served.json", "w"))
+            time.sleep(0.7)                             # …which is older than the fraction of an hour below
+            orph = dict(CC_JANITOR_ORPHAN_HOURS="0.0001", CC_JANITOR_ORPHAN_CPU="0.01")
+            was = {w: holding(w) for w in (wsgone, wslive, wsrec, wsidle)}
+            ro = run("--dry", **orph)
+            ok("rule 7: --dry names the process it would end, and where it is working",
+               f"would end pid {was[wsgone][0]}" in ro.stdout and wsgone in ro.stdout)
+            ok("rule 7: --DRY ENDS NOTHING — every one of them is still running",
+               {w: holding(w) for w in (wsgone, wslive, wsrec, wsidle)} == was and all(was.values()))
+            r7 = run(**orph)
+            ok("rule 7: an orphan burning a core in a scratch workspace is ended, and each process it ended is named",
+               holding(wsgone) == [] and f"end pid {was[wsgone][0]}" in r7.stdout and wsgone in r7.stdout)
+            ok("rule 7: A RUN STILL GOING SURVIVES — its session leader is alive, and the pass says which",
+               holding(wslive) == was[wslive] and f"spared {wslive}" in r7.stdout and "still alive" in r7.stdout)
+            ok("rule 7: AN ORPHAN A REGISTERED RECORD POINTS INTO SURVIVES, however hard it runs, named by the record",
+               holding(wsrec) == was[wsrec] and f"{recs}/served.json points into it" in r7.stdout)
+            ok("rule 7: AN IDLE ORPHAN SURVIVES and is reported — a preview sitting on a port costs nobody anything",
+               holding(wsidle) == was[wsidle] and f"spared {wsidle}" in r7.stdout and "idle" in r7.stdout)
+            ok("rule 7: the end is in the log too, with where it was working and what it was costing",
+               f"end pid {was[wsgone][0]}" in open(f"{th}/.cc/state/janitor.log").read())
+            ok("rule 7: …and 0 hours turns the rule off — the same box, the same orphans, and not a word about them",
+               "scratch workspace" in run("--dry", **orph).stdout
+               and "scratch workspace" not in run("--dry", CC_JANITOR_ORPHAN_HOURS="0").stdout)
+            stray = fixture("sleep", "120", cwd=wsidle)
+            time.sleep(0.3)
+            ok("rule 7: the kill reads the working directory ONE more time first — a pid that has moved on since "
+               "the pass read it, or been handed to something else, is not the one this ends",
+               end_proc(stray.pid, f"{ftmp}/somewhere-else").startswith("it is working somewhere else")
+               and os.path.exists(f"/proc/{stray.pid}")
+               and end_proc(stray.pid, wsidle) == "" and stray.wait(timeout=10) == -signal.SIGTERM)
+
+            # …and THE TEARDOWN's kill keeps that same rule, against the two cases the cwd sweep gets wrong.
+            wsdel = f"{ftmp}/deleted"
+            strays[wsdel] = orphan(wsdel)
+            time.sleep(0.3)
+            shutil.rmtree(wsdel, ignore_errors=True)
+            goner = fixture("true")                     # …a pid this suite recorded that has since exited, and reaped
+            goner.wait(timeout=10)
+            ok("rule 7: THE TEARDOWN ENDS ONE WHOSE WORKSPACE IS GONE — a removed directory reads back as "
+               "'<path> (deleted)' and the cwd sweep loses it, which is how burners outlived this suite",
+               holding(wsdel) == [] and end_stray(strays[wsdel], wsdel) is True)
+            ok("rule 7: …AND IT NEVER SIGNALS A STALE PID: one it recorded that has since exited is skipped, and "
+               "so is a live one working somewhere else — a number that came round again takes no stranger with it",
+               end_stray(goner.pid, wsidle) is False
+               and end_stray(runner.pid, wsgone) is False and runner.poll() is None)
+        finally:
+            # whatever the pass spared is this suite's to clean up, and BY PID first: see orphan() for why the cwd
+            # sweep alone loses one whose workspace has already gone.
+            for w_, pid_ in list(strays.items()) + [(w, pid_) for w in (wsgone, wslive, wsrec, wsidle)
+                                                    for pid_ in holding(w)]:
+                end_stray(pid_, w_)
+            if runner is not None:
+                runner.wait(timeout=10)
 
         # RULE 8: what those runs left ON DISK. Six things under this test's own temp root, and every answer the
         # rule has — a leftover tree from a finished run, a leftover file, a tree whose own clock is a month old

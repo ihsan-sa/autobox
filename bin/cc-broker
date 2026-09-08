@@ -6,7 +6,10 @@
                                                                a unit names itself with CC_BROKER_SOURCE instead)
   cc-broker ledger [--once] <target> "text"                    record it and wake NOBODY; `--once` skips a line
                                                                already sitting unread in the file (see THE LEDGER DOOR)
-  cc-broker --flush [<target>]                                 deliver what is due (cc-broker.timer, 60 s)
+  cc-broker --flush [<target>]                                 deliver what is due (cc-broker.timer, 60 s) — to the
+                                                               session, or to that session's steward (WHO GETS IT)
+  cc-broker --pulse [<target>]                                 the steward's own tick (cc-broker-pulse.timer):
+                                                               hand it what the ledger recorded and nobody read
   cc-broker report [--days N]                                  turns woken vs events submitted — the saving, in turns
   cc-broker selfcheck
 
@@ -48,12 +51,55 @@ one `Environment=` line each in their units — no edit to either file. Nothing 
 cc-model are deliberate wakes with a reason, and cc-land's "landing stopped" is decision-class, which is what it
 would get here anyway; holding any of them buys nothing and costs a session the debounce.
 
+WHO GETS IT — the second judgement, and the reason this file is the steward's caller rather than a session being
+one. Every group is addressed in submit() to exactly one of two: the SESSION, or that session's STEWARD, which is
+`cc-steward run <target>` — a headless one-event run on a small model, no tmux window and no journal to rehydrate.
+A steward is per planning session, one each, and its escalations come back to the session it belongs to (owner,
+2026-09-07: "all planning sessions should have one"); the target is that name throughout, so nothing here is a
+singleton. The addressing is CC_STEWARD_SOURCES, this box's own list of sources (whitespace separated, the shape
+`CC_SELF_LAND_REPOS` has), and it is EMPTY BY DEFAULT: unset, every event goes exactly where it went before this
+paragraph existed. `CC_STEWARD=0` kills it outright the way `CC_PULSE=0` does.
+
+  A `now` group is NEVER the steward's. classify() makes any line asking for a choice `now` whatever its source
+  says, so a decision cannot reach a small model by being filed under a stewarded source.
+  A steward run that does not exit 0 is NOT handled: the group stays pending exactly as a refused delivery does,
+  AND it is re-addressed to the session, which can decide — a steward that cannot run must never hold an event,
+  and retrying the same small model on the thing that just beat it buys nothing.
+  A steward delivery does not mark the ledger read, so those lines still ride out to the session on its next real
+  message. That one line is the whole double-handling fence for the ledger.
+  A steward run is not a wake: `report` counts it in its own column, which is where the saving shows up.
+  `steward` is never its own addressee, and a `steward` event is never suppressed into the ledger. That source
+  is what a steward hands back with, so both of those would end with a person never seeing what it gave up on.
+  A steward run happens ONLY in the timer's own process. A call can take 20 min and both callers SIGKILL their
+  `inject` at 30 s, so submit()'s immediate flush sends the session's part and leaves the steward's for the next
+  60 s tick — otherwise the decision goes out, the process dies mid-call, and the session is woken with the same
+  line again a minute later (review of #343).
+  A group being run is CLAIMED, under the lock, before the run starts. Phase B is unlocked on purpose, and a
+  steward escalating re-enters this file by design, so without the claim a second flush finds the same group
+  still pending and buys a second model call and a second run of whatever chain it names. The claim expires by
+  itself after STEWARD_TIMEOUT_S, because the process that would clear it is the one that can be killed.
+
+AND IT WAKES ON A CLOCK TOO, NOT ONLY ON AN EVENT (owner, 2026-09-07: "that should have a pulse to check
+regularly"). `--pulse` is that tick, and what it hands the steward is the one thing on this box that nobody
+reads: THE LEDGER. A ledger line is written when a group repeats — it wakes no session by design, and it rides
+out only on that target's next real message, so a target that goes quiet leaves its lines sitting in a file no
+turn ever opens. On a clock the steward reads them instead. It invents no work and starts no watcher of its own:
+every line it is handed is an event this file already wrote down. It is NOT cc-pulse: that is the drive loop and
+it wakes a SESSION so one decides whether there is work, on its own timer and with its own switches. This wakes a
+steward, over lines that are already written down, and it never wakes a session at all.
+
+  Silence is the normal output. Nothing unread is nothing sent, nothing run and nothing spent.
+  The steward keeps its OWN cursor, so the same lines are never handed to it twice, and the session's cursor is
+  untouched — those lines are still owed to the session and still ride out on its next real message.
+  A pulse that the steward does not handle does not move its cursor: the next tick offers the same lines again.
+  A paused project gets no pulse, like every other timer-driven spender.
+
 NOTHING IS DROPPED, EVER (owner, 2026-09-02: "we dont worry about where we are in the daily limit, ill just tell
 you myself to stop or not"). There is no budget in this file and no rule that declines to act. A held event is
 delivered late, never not at all. If the target does not hear it, the box's own session is offered it; if nobody
 answers at all, the group is retried every 60 s and then said out loud to the owner by escalate().
 """
-import sys, os, re, json, time, calendar, socket, subprocess, fcntl, contextlib
+import sys, os, re, json, time, calendar, glob, socket, subprocess, fcntl, contextlib
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))
@@ -80,6 +126,21 @@ HELD = ("queued", "spooled")
 # are listed; anything else is `digest`, because an event we cannot name must still wake someone — just not alone.
 SOURCE_CLASS = {"secretary": "digest", "reconcile": "digest"}
 DEFAULT_CLASS = "digest"
+# The steward's door, and the stub the selfcheck puts in front of it — the shape INJECT already has.
+STEWARD = os.environ.get("CC_BROKER_STEWARD") or f"{BIN}/cc-steward"
+# LONG ON PURPOSE, and it is cc-steward's own worst case rather than a number picked here: its `task` chain is a
+# commit, a push and a PR before anything is queued, and it allows itself 900 s for that (cc-steward:63-67).
+# Killing the steward mid-chain leaves that half done, which is worse than a slow tick — and a tick that overruns
+# costs a late delivery, never a lost one, because phase C writes each target's outcome before the next is tried.
+# AND IT IS THE ONLY BOUND: both broker units carry TimeoutStartSec=infinity, because a run loops over every
+# pending target while this cap is per target, so any number there is a whole-run budget that two slow targets
+# clear — systemd killing a chain mid-commit, which is the thing this number exists to prevent.
+STEWARD_TIMEOUT_S = int(os.environ.get("CC_BROKER_STEWARD_TIMEOUT_S", "1200"))
+PULSE = f"{BROKER}/pulse.json"          # the steward's own read cursor per target, and when it last had a tick
+# THE RULE, and the timer is only the opportunity to apply it — the shape DEBOUNCE_S already has against the 60 s
+# flush. cc-broker-pulse.timer comes round every 30 min; a target that had a tick inside this window is skipped,
+# so the interval is one number in one place and a missed run costs a late tick rather than a lost one.
+PULSE_S = int(os.environ.get("CC_STEWARD_PULSE_S", "7200"))            # 2 h
 # A group the session was told about less than this ago, with no decision in it, is the machine saying the same
 # thing twice: it goes to the ledger instead of buying a second wake. Past the hour it digests again — the
 # suppression is bounded, and either way nothing is dropped, because the ledger's count rides on the next message.
@@ -162,6 +223,50 @@ def classify(source, text):
     return SOURCE_CLASS.get(source, DEFAULT_CLASS)
 
 
+def steward_sources():
+    """This box's list, not core's — a source list is the box's own, so it lives in ~/.cc/config beside
+    CC_SELF_LAND_REPOS and CC_JANITOR_REPOS and is read the same way. Empty is the default and means the steward
+    is off entirely: unset, every event goes exactly where it went before the steward existed."""
+    if conf("CC_STEWARD", "1") == "0":            # the outright kill, the way CC_PULSE=0 is (cc-pulse:69-72)
+        return set()
+    return set(conf("CC_STEWARD_SOURCES", "").split())
+
+
+def addressee(source, cls):
+    """Who this group is for: `session` or `steward`. ONE list decides it, so there is nothing here for a second
+    list to disagree with — the design sketched a SOURCE_WHO table beside this and it would have said the same
+    thing twice, with the config already having to be right for either to fire.
+
+    A `now` group is never the steward's, and that is the safe direction rather than a rule to get right:
+    classify() has already made any line asking for a choice `now` whatever its source says, so filing a source
+    here can never route a decision to a small model.
+
+    AND `steward` IS NEVER ITS OWN ADDRESSEE. The steward escalates through this same door, as `--source steward`
+    (cc-steward:448), and escalating is what it does with everything it may not handle. A config that named
+    `steward` in the list — by a typo, or by reading the key as "who this is for" — would hand every one of those
+    back to the thing that just gave up on it, round and round, and the event would never reach the person it was
+    escalated to. It is one word here and it cannot be got wrong from the outside."""
+    return "steward" if cls != "now" and source != "steward" and source in steward_sources() else "session"
+
+
+def who_of(group):
+    """A pending group written before this file addressed anything has no `who`, and it is the session's — which
+    is what it would have got then. Never guess it back from the key: phase C REWRITES this field when a steward
+    run fails, and re-deriving it would send the group straight back to the steward that just failed it."""
+    return group.get("who") or "session"
+
+
+def in_flight(group, t0):
+    """Is a steward run already holding this group? Only a steward group can be: a session send is bounded by
+    SEND_TIMEOUT_S and finishes long inside the 60 s tick, and re-addressing a group to the session is exactly
+    what phase C does to release it.
+
+    The claim expires on its own after STEWARD_TIMEOUT_S rather than being cleaned up by anyone, because the
+    process that would do the cleaning is the one that can be killed. Held state that only a live process can
+    release is how a group gets stuck for good; this way the worst case is one late tick."""
+    return who_of(group) == "steward" and t0 - float(group.get("run_at") or 0) < STEWARD_TIMEOUT_S
+
+
 def group_key(source, text, decision):
     """"(repo, PR, state, decision-needed)" (codex review, 2026-09-02). The repo half is the TARGET, which is
     already a dimension above this — pending and told are both keyed by it — so what is left for the key is what
@@ -200,16 +305,23 @@ def ledger_path(target):
     return f"{STATE}/{target}/events.md"
 
 
-def ledger_unread(target):
-    """The ledger lines written since the last message that told the session about them. Counted by POSITION, not
-    by time: the session opening events.md leaves no trace, so an mtime would never clear — the count at the last
-    delivery does."""
-    n = load(f"{BROKER}/read.json", {}).get(target, 0)
+def ledger_lines(target):
+    """Every line in that target's ledger, in order. TWO cursors count into this list and neither is the file's
+    length: the session's (read.json, moved by a delivery) and the steward's (pulse.json, moved by a pulse it
+    handled). They are deliberately independent — the steward reading a line does not discharge the session's
+    claim on it."""
     try:
         with open(ledger_path(target)) as f:
-            return [ln.rstrip("\n") for ln in f if ln.startswith("- ")][n:]
+            return [ln.rstrip("\n") for ln in f if ln.startswith("- ")]
     except OSError:
         return []
+
+
+def ledger_unread(target):
+    """The ledger lines written since the last message that told the SESSION about them. Counted by POSITION, not
+    by time: the session opening events.md leaves no trace, so an mtime would never clear — the count at the last
+    delivery does."""
+    return ledger_lines(target)[load(f"{BROKER}/read.json", {}).get(target, 0):]
 
 
 def ledger_seen(target, n):
@@ -269,15 +381,39 @@ def deliver(target, text):
     return send(box, f"{target} did not hear it ({verdict}) — {text}") in TOOK + HELD, verdict
 
 
+def handled(target, body):
+    """THE STEWARD'S DOOR — one routine group, one cheap run, and no planning turn at all. `cc-steward run
+    <target>` with the body on stdin, and its EXIT is the verdict, which is the contract that file states in its
+    own last line: 0 the event is handled (a chain ran, or the escalation was taken), non-zero it is NOT.
+    Returns (handled, the word the log keeps), the shape deliver() returns.
+
+    Not installed, a crash, a timeout: all of them are non-zero and none of them is handled. The group stays
+    pending and phase C re-addresses it to the session — a steward that cannot run must never hold an event."""
+    try:
+        p = subprocess.run([STEWARD, "run", str(target)], input=body, capture_output=True, text=True,
+                           timeout=STEWARD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return False, "steward-timeout"
+    except Exception:
+        return False, "steward-error"
+    return p.returncode == 0, "steward" if p.returncode == 0 else f"steward-{p.returncode}"
+
+
 def tail(lines, target):
     """What keeps a ledger-only event from being lost. The unread LINES ride out on the next message of either
     other class, not just their count: nothing else on the box points a session at events.md, so a count alone
-    leaves the event in a file no turn ever reads (review of #190, F8)."""
+    leaves the event in a file no turn ever reads (review of #190, F8).
+
+    AND NOT A WORD OF DECISION_MARKS IN IT. render() carries this tail into the STEWARD's part too, and cc-steward
+    matches that list as bare substrings before it spends (cc-steward:199-204): the phrase this line used to carry
+    named the list, so it was refused unread and escalated back as `needs you` — which this file classifies `now`
+    and flushes inline, so the routine event the steward exists to absorb bought the planning turn anyway (review
+    of #343, F2). The selfcheck reads the list off cc-steward itself and fails on any word of it."""
     if not lines:
         return ""
     shown = lines[-LEDGER_TAIL:]
     of = f" (the last {len(shown)})" if len(lines) > len(shown) else ""
-    return (f"\n· {len(lines)} with nothing to decide{of}, and all of them in {ledger_path(target)}:\n"
+    return (f"\n· {len(lines)} with nothing in them to answer{of}, and all of them in {ledger_path(target)}:\n"
             + "\n".join(f"  {ln}" for ln in shown))
 
 
@@ -299,7 +435,8 @@ def render(target, due, t0, led):
 
 
 def flush(target=None):
-    """Deliver what is due, one target at a time. Returns the number of messages sent."""
+    """Deliver what is due, one target at a time. Returns the number of messages sent — a target can cost two,
+    one to its session and one to that session's steward, never the same group to both."""
     with locked():
         targets = list(load(PENDING, {})) if target is None else [target]
     return sum(flush_one(t) for t in targets)
@@ -317,13 +454,25 @@ def paused(target):
         return False
 
 
-def flush_one(target):
+def flush_one(target, inline=False):
     """THREE PHASES, and the middle one is not under the lock. Read-modify-write pending, then send, then
     read-modify-write pending again with the result — because a lock held across a send is held for as long as
     the daemon takes, and both callers kill their inject at 30 s: an event submitted during a slow flush would
     be SIGKILLed while still waiting for the lock, before it was ever written down (review of #190, F2). And
     this target's outcome is saved before the next one is even tried, so one hung target cannot throw away a
-    whole run's worth of deliveries and re-wake every other session a minute later (F3)."""
+    whole run's worth of deliveries and re-wake every other session a minute later (F3).
+
+    Phase A also SPLITS what is due by addressee (WHO GETS IT, above), so phase B is at most two sends: one to
+    the session and one to that session's steward. Never the same group to both.
+
+    `inline=True` IS SUBMIT()'S PATH AND SENDS ONLY THE SESSION PART. A session send is bounded by
+    SEND_TIMEOUT_S (10 s); a steward run is bounded by STEWARD_TIMEOUT_S (1200 s), and submit() runs inside the
+    caller's `cc-broker inject` process, which cc-secretary and cc-reconcile SIGKILL at 30 s. Calling the
+    steward there would deliver the decision, block, and be killed before phase C — leaving the group pending
+    and waking the session again with the same line on the next tick (review of #343, F2). So a steward group
+    waits for the timer's `--flush`, whose process is systemd's and is not on anybody's 30 s budget. It costs
+    that group at most one 60 s tick, and the decision that triggered this call goes out immediately either
+    way."""
     # A PAUSED PROJECT BUYS NO WAKE. This is the single choke point both callers pass through — the 60 s timer
     # flush and submit()'s immediate decision-class path — and returning here leaves the group PENDING, which is
     # this file's whole promise: nothing is dropped, ever. The events ride out on the first flush after the resume.
@@ -331,57 +480,158 @@ def flush_one(target):
         return 0
     # PHASE A — locked. What is due, and the exact message for it.
     with locked():
-        groups = (load(PENDING, {}).get(target) or {})
+        pend = load(PENDING, {})
+        groups = (pend.get(target) or {})
         t0 = time.time()
         # "nothing decision-class is delayed more than the debounce" (brief) — a `now` group is due the moment it
-        # arrives, and it makes every other group for that target due with it: the wake is bought either way, so
-        # what was pending rides out on it rather than buying one of its own.
+        # arrives, and it makes every other SESSION group for that target due with it: that wake is bought either
+        # way, so what was pending for the session rides out on it rather than buying one of its own. NOT the
+        # steward's groups. The ride-along is free only for what rides on the wake being bought, and pulling a
+        # steward group forward buys a run of its own — the debounce spent rather than saved.
         wake = any(g["cls"] == "now" for g in groups.values())
-        due = {k: g for k, g in groups.items() if wake or t0 - g["first"] >= DEBOUNCE_S}
+        due = {k: g for k, g in groups.items()
+               if not in_flight(g, t0) and ((wake and who_of(g) == "session") or t0 - g["first"] >= DEBOUNCE_S)}
         if not due:
             return 0
         led = ledger_unread(target)       # captured HERE, so phase C marks read exactly what went out
-        body = render(target, due, t0, led)
-        out = {k: dict(g["texts"]) for k, g in due.items()}   # EXACTLY what goes out, so phase C subtracts exactly
-                                                              # that and a wording submitted meanwhile is not lost
-    # PHASE B — unlocked. The only part that talks to the daemon.
-    landed, verdict = deliver(target, body)
+        # ADDRESSED TO EXACTLY ONE OF THE TWO, which is the first of the design's three double-handling fences:
+        # a group is in one of these parts or the other, never in both, so no event is ever worked twice.
+        parts = {}
+        for w in ("session", "steward"):
+            if w == "steward" and inline:
+                continue                   # submit()'s path: the session's part only. See the docstring.
+            d = {k: g for k, g in due.items() if who_of(g) == w}
+            if d:                          # EXACTLY what goes out, so phase C subtracts exactly that and a
+                                           # wording submitted meanwhile is not lost
+                parts[w] = (render(target, d, t0, led), {k: dict(g["texts"]) for k, g in d.items()})
+                if w == "steward":
+                    # CLAIMED HERE, UNDER THE LOCK AND BEFORE THE RUN — the same shape pulse.json's `at` has, and
+                    # what makes the split above hold across PROCESSES rather than only within one. The split
+                    # puts a group in one part or the other, but nothing stopped a SECOND flush entering while
+                    # this one waits unlocked in phase B and finding the group still pending and still past its
+                    # debounce, which is the same event worked twice. Re-entry is not theoretical:
+                    # a steward escalates by injecting `needs you` (cc-steward:442), which classifies `now` and
+                    # flushes inline — so without this the same event bought a second model call and a second
+                    # run of whatever chain it named (review of #343, F1). The claim EXPIRES after
+                    # STEWARD_TIMEOUT_S, so a run killed between here and phase C costs a late tick, not a lost
+                    # group; phase C clears it on any run that got that far.
+                    for g in d.values():
+                        g["run_at"] = t0
+                    save(PENDING, pend)    # durable before the lock is released, or the claim is not a claim
+    # PHASE B — unlocked. The only part that talks to the daemon or spends on a model.
+    got = {w: (handled(target, body) if w == "steward" else deliver(target, body))
+           for w, (body, _) in parts.items()}
     # PHASE C — locked, and durable before any other target is touched.
     page = []
     with locked():
         pend = load(PENDING, {})
         groups = pend.get(target) or {}
-        for k, texts in out.items():
-            g = groups.get(k)
-            if not g:
-                continue
+        for w, (_, out) in parts.items():
+            landed, _verdict = got[w]
+            for k, texts in out.items():
+                g = groups.get(k)
+                if not g:
+                    continue
+                g.pop("run_at", None)      # THE CLAIM IS RELEASED BY THE RUN THAT MADE IT, whatever the verdict:
+                                           # a group that survives this phase is due again on the next tick, and
+                                           # only a run killed before here waits the claim out.
+                if landed:
+                    for t, c in texts.items():
+                        left = g["texts"].get(t, 0) - c
+                        g["texts"][t] = left
+                        if left <= 0:
+                            g["texts"].pop(t, None)
+                    if not g["texts"]:
+                        groups.pop(k, None)
+                else:
+                    # NOTHING IS DROPPED. `first` is untouched, so the group stays due and the 60 s tick tries again.
+                    # AND A STEWARD IS NOT RETRIED: one failure re-addresses the group to the session, which can
+                    # decide. Running the same small model again on the thing that just beat it buys nothing, and
+                    # a steward that cannot run must never hold an event (cc-steward's own last line).
+                    if w == "steward":
+                        g["who"] = "session"
+                    g["fails"] = g.get("fails", 0) + 1
+                    if g["fails"] >= ESCALATE_FAILS and not g.get("paged"):
+                        g["paged"] = True                    # once per group, not once a minute
+                        page += list(g["texts"])
             if landed:
-                for t, c in texts.items():
-                    left = g["texts"].get(t, 0) - c
-                    g["texts"][t] = left
-                    if left <= 0:
-                        g["texts"].pop(t, None)
-                if not g["texts"]:
-                    groups.pop(k, None)
-            else:
-                # NOTHING IS DROPPED. `first` is untouched, so the group stays due and the 60 s tick tries again.
-                g["fails"] = g.get("fails", 0) + 1
-                if g["fails"] >= ESCALATE_FAILS and not g.get("paged"):
-                    g["paged"] = True                        # once per group, not once a minute
-                    page += list(g["texts"])
+                told_now(target, out)
         if groups:
             pend[target] = groups
         else:
             pend.pop(target, None)
         save(PENDING, pend)
-        if landed:
-            told_now(target, out)
+        # ONLY A SESSION DELIVERY MARKS THE LEDGER READ, and that one line is the whole double-handling fence for
+        # the ledger: the steward is handed the unread tail as context, so a run past a group's own text still
+        # sees what the session was told, but the lines themselves stay owed and ride out to the session on its
+        # next real message. A steward acts; it is not the reader those lines were written for.
+        if got.get("session", (False,))[0]:
             ledger_seen(target, len(led))
-    log_event(at=now_s(), type="flush", target=target, groups=len(out), verdict=verdict,
-              events=sum(sum(t.values()) for t in out.values()), woke=int(landed))
+    for w, (_, out) in parts.items():
+        landed, verdict = got[w]
+        # ONE PLACE COUNTS A WAKE, and a steward run is not one — that is where the saving shows up in `report`.
+        log_event(at=now_s(), type="flush", target=target, to=w, groups=len(out), verdict=verdict,
+                  events=sum(sum(t.values()) for t in out.values()),
+                  woke=int(landed and w == "session"), stewarded=int(landed and w == "steward"))
     if page:
         escalate(target, page)
-    return int(landed)
+    return sum(int(landed) for landed, _ in got.values())
+
+
+def pulse(target=None):
+    """THE STEWARD'S OWN TICK. Returns the number of targets it handled something for.
+
+    With no target: every target that has a ledger at all. That is the whole set — a ledger file exists only
+    where this file wrote one — and it costs a glob rather than a decision about who is a session."""
+    if target is not None:
+        return pulse_one(target)
+    return sum(pulse_one(os.path.basename(os.path.dirname(p)))
+               for p in sorted(glob.glob(f"{STATE}/*/events.md")))
+
+
+def pulse_one(target):
+    """One target's tick. SILENCE IS THE NORMAL OUTPUT: no steward configured, a paused project, a tick inside
+    the window, or nothing in the ledger the steward has not already read — each of those is nothing sent,
+    nothing run and nothing spent.
+
+    The cursor moves only on a run the steward HANDLED, so a tick it could not take comes round again. And it is
+    the steward's own cursor: read.json is untouched here, so every line handed over is still owed to the
+    session and still rides out on its next real message."""
+    if not steward_sources() or paused(target):
+        return 0
+    with locked():
+        d = load(PULSE, {})
+        st = d.get(target) or {}
+        if time.time() - float(st.get("at") or 0) < PULSE_S:
+            return 0
+        seen = int(st.get("read") or 0)
+        lines = ledger_lines(target)[seen:]
+        if not lines:
+            return 0                      # and NOT claimed: a target with nothing to say has not had a tick, so
+                                          # a line written a minute from now does not wait out the window
+        shown = lines[-LEDGER_TAIL:]
+        of = f" (the last {len(shown)})" if len(lines) > len(shown) else ""
+        # THE SAME FENCE tail() carries, and for the same reason: no word of cc-steward's DECISION_MARKS in
+        # framing of ours, or the tick is refused unread and escalated back as a `needs you` this file then wakes
+        # the session with — every tick that had anything to hand over, which is the tick's whole point (#343, F1).
+        body = (f"pulse: {len(lines)} recorded with nothing in them to answer and nobody has read them{of}, "
+                f"and all of them are in {ledger_path(target)}:\n" + "\n".join(f"  {ln}" for ln in shown))
+        # CLAIMED HERE, BEFORE THE RUN AND UNDER THE LOCK, not after it. The window is the only thing keeping two
+        # ticks off the same lines, and claiming it afterwards leaves a second caller — a `--pulse` typed by hand
+        # while the timer's run is in flight — passing the same test and paying for the same lines again. It is
+        # also what stops a steward that keeps failing being called about them every half hour.
+        d.setdefault(target, {})["at"] = time.time()
+        save(PULSE, d)
+    # UNLOCKED, like every other send in this file: the lock is never held for as long as a model takes.
+    took, verdict = handled(target, body)
+    if took:                              # the cursor moves ONLY on a run the steward took; a refused tick comes
+        with locked():                    # round again once the window is up, with the same lines
+            d = load(PULSE, {})
+            d.setdefault(target, {})["read"] = seen + len(lines)
+            save(PULSE, d)
+    log_event(at=now_s(), type="pulse", target=target, to="steward", lines=len(lines), verdict=verdict,
+              woke=0, stewarded=int(took))
+    return int(took)
 
 
 def escalate(target, texts):
@@ -407,15 +657,22 @@ def submit(target, text, source):
     with locked():
         cls = classify(source, text)
         key = group_key(source, text, dec)
-        if cls == "digest" and told_recently(target, key):
-            cls = "ledger"    # …and never a decision: classify() already made that `now`, which this cannot reach
+        # …and never a decision: classify() already made that `now`, which this cannot reach.
+        # AND NEVER AN ESCALATION EITHER. `steward` is the source a steward uses to hand back what it may not
+        # handle (cc-steward:448), and that is the one line on this box whose whole point is that a PERSON sees
+        # it. The ledger is the one place with no reader, so an escalation suppressed into it is an escalation
+        # swallowed — and it is also the only way a line the steward wrote could come back to the steward, on
+        # the pulse. It repeats because the steward gave up twice, which is more news than once, not less.
+        if cls == "digest" and source != "steward" and told_recently(target, key):
+            cls = "ledger"
         log_event(at=now_s(), type="event", target=target, source=source, cls=cls, group=key,
                   decision=dec, chars=len(text))   # WAKES ARE COUNTED IN ONE PLACE ONLY — the flush row above
         if cls == "ledger":
             ledger_write(target, text)
         else:
             pend = load(PENDING, {})
-            g = pend.setdefault(target, {}).setdefault(key, {"first": time.time(), "cls": cls, "texts": {}})
+            g = pend.setdefault(target, {}).setdefault(
+                key, {"first": time.time(), "cls": cls, "texts": {}, "who": addressee(source, cls)})
             # EVERY DISTINCT WORDING, counted — not the newest overwriting the rest. A group is a WAKE saved,
             # never a message thrown away, so a second event that lands in one is another bullet under the same
             # wake; only a word-for-word repeat becomes an `(xN)`. A long digest is still ONE turn, the unit that costs.
@@ -424,8 +681,8 @@ def submit(target, text, source):
                 g["cls"] = "now"                   # a choice landing in a waiting group makes the whole group `now`
             save(PENDING, pend)
     if cls == "now":
-        flush_one(target)
-    return "delivered"                     # always: this file has taken it, and it never drops one
+        flush_one(target, inline=True)     # the session's part only — this is somebody's 30 s inject, not a timer
+    return "delivered"                   # always: this file has taken it, and it never drops one
 
 
 def report(days=1):
@@ -446,7 +703,9 @@ def report(days=1):
                     continue                  # the stamps are UTC, so they are read as UTC — never local
                 if at < cut:
                     continue
-                (ev if r.get("type") == "event" else fl).append(r)
+                (ev if r.get("type") == "event" else fl).append(r)   # `flush` and `pulse` rows both land in fl:
+                                                                     # each is a delivery, and each carries the
+                                                                     # woke/stewarded pair the totals below read
     except OSError:
         pass
     if not ev:
@@ -457,6 +716,9 @@ def report(days=1):
         by_src[r.get("source", "?")] = by_src.get(r.get("source", "?"), 0) + 1
         by_cls[r.get("cls", "?")] = by_cls.get(r.get("cls", "?"), 0) + 1
     woke = sum(r.get("woke", 0) for r in fl)      # ONE place counts a wake: the flush that actually made it
+    stew = sum(r.get("stewarded", 0) for r in fl)  # …and a steward run is not one. Rows from before the steward
+                                                   # had a door carry no `stewarded` key and count as 0, which is
+                                                   # what they were: every delivery then was a session's.
     # THE COUNTERFACTUAL, and it is a measurement rather than a model: before this file every event was its own
     # turn, so the turns it removed are the events it took minus the wakes it actually bought. The class counts
     # below say where that came from — a `ledger` event woke nobody at all, and `digest` events shared their wakes.
@@ -465,6 +727,7 @@ def report(days=1):
     print(f"  submitted   {len(ev):>4} events   " + " · ".join(f"{k} {v}" for k, v in sorted(by_src.items())))
     print(f"  classified  {'':>4}          " + " · ".join(f"{k} {v}" for k, v in sorted(by_cls.items())))
     print(f"  woke        {woke:>4} turns")
+    print(f"  stewarded   {stew:>4} runs     handled without a planning turn at all")
     print(f"  avoided     {len(ev) - woke:>4} turns    one event was one turn before this; "
           f"{held} of them were coalescible")
     return 0
@@ -479,6 +742,9 @@ def main(argv):
         return report(int(argv[2]) if len(argv) > 2 and argv[1] == "--days" else 1)
     if argv[0] == "--flush":
         flush(argv[1] if len(argv) > 1 else None)
+        return 0
+    if argv[0] == "--pulse":
+        pulse(argv[1] if len(argv) > 1 else None)
         return 0
     if argv[0] == "ledger":
         rest, once = argv[1:], False
@@ -515,7 +781,7 @@ def main(argv):
 def selfcheck():
     """STATIC: the classifier, the grouping, the debounce and the two promises — nothing is dropped, and a
     decision is never held. Its own HOME and its own stub for the daemon; no session on this box is written to."""
-    import tempfile, shutil
+    import tempfile, shutil, ast
     n = 0
 
     def ok(what, cond):
@@ -543,6 +809,7 @@ def selfcheck():
 
     th = tempfile.mkdtemp(prefix="ccbroker-sc-")
     stub, rec, slow = f"{th}/inject-stub", f"{th}/rec", f"{th}/slow"
+    sbin = f"{th}/steward-stub"
 
     def daemon(verdict):    # the stub for the daemon's door. One "CALL <target>" line per call, so a message is
         with open(stub, "w") as f:                     # counted by the CALLS it cost — its own body is multi-line
@@ -550,10 +817,25 @@ def selfcheck():
                     'grep -qx "$3" "$CC_SC_SLOW" 2>/dev/null && sleep 30\n' f'echo {verdict}\n')
         os.chmod(stub, 0o755)
     daemon("delivered")
+
+    def steward(code):  # the stub for the steward's door. One "STEWARD <target>" line and then the whole body it
+        with open(sbin, "w") as f:                # was handed on stdin, so a case can assert what it was given —
+            f.write('#!/usr/bin/env bash\n'      # and it EXITS with the verdict under test, which is the contract
+                    'printf "STEWARD %s\\n" "$2" >> "$CC_SC_REC"\n'
+                    'cat >> "$CC_SC_REC"; printf "\\n" >> "$CC_SC_REC"\n' f'exit {code}\n')
+        os.chmod(sbin, 0o755)
+    steward(0)
     open(slow, "w").close()
 
     def env(**extra):
+        # CC_STEWARD_SOURCES is pinned EMPTY here, not merely left unset: conf() reads the environment first, and
+        # a box that has the steward switched on in its own shell would otherwise route this suite's fixtures
+        # through it. Every case that wants the steward asks for it by name.
         return {**os.environ, "HOME": th, "CC_BROKER_INJECT": stub, "CC_SC_REC": rec, "CC_SC_SLOW": slow,
+                "CC_BROKER_STEWARD": sbin, "CC_STEWARD_SOURCES": "", "CC_STEWARD": "1",
+                # what the re-entrant steward stub needs to call this file back the way cc-steward's escalation
+                # does — a stub cannot find it by name, because the suite's HOME has no bin/
+                "CC_SC_PY": sys.executable, "CC_SC_BROKER": os.path.realpath(__file__),
                 "CC_BOX": "abox", "CC_NOTIFY_LOG_ONLY": "1", "CC_NOTIFY_LOG": f"{th}/notify.log", **extra}
 
     def run(*args, **extra):
@@ -568,6 +850,9 @@ def selfcheck():
 
     def calls():
         return said().count("CALL ")            # messages, not lines: one wake is one call
+
+    def runs():
+        return said().count("STEWARD ")         # …and one steward run is one of these, which is not a wake
 
     def pending(tgt):
         return load(f"{th}/.cc/broker/pending.json", {}).get(tgt) or {}
@@ -611,7 +896,7 @@ def selfcheck():
         run("inject", "--source", "secretary", "r3", "r3/t needs you: pick one")
         ok("…and the next message that wakes it CARRIES the ledger line itself, not just a count of it — "
            "nothing else on this box points a session at events.md",
-           "STILL QUIET" in said() and "1 with nothing to decide" in said() and led in said())
+           "STILL QUIET" in said() and "1 with nothing in them to answer" in said() and led in said())
         os.truncate(rec, 0)
         run("inject", "--source", "secretary", "r3", "secretary/idle: r3/t PR #5 review — quiet again",
             CC_BROKER_REPEAT_S="0")
@@ -637,7 +922,8 @@ def selfcheck():
         run("inject", "--source", "secretary", "r7", "r7/t needs you: pick one")
         ok("…and both ledger lines ride out on the next message that wakes the session — a suppressed tick is "
            "recorded, never dropped",
-           "1 row in flight" in said() and "2 rows in flight" in said() and "2 with nothing to decide" in said())
+           "1 row in flight" in said() and "2 rows in flight" in said()
+           and "2 with nothing in them to answer" in said())
         os.truncate(rec, 0)
         ok("`ledger` with no text is a usage error, never an empty line in somebody's events file",
            run("ledger", "r7").returncode == 2)
@@ -755,9 +1041,308 @@ def selfcheck():
            by_flag == 1 and by_env == 1 and unnamed == 2)
         os.truncate(rec, 0)
 
+        # ── WHO GETS IT ────────────────────────────────────────────────────────────────────────────────────
+        # THE TABLE IS EMPTY BY DEFAULT, and that emptiness is the switch. Its own fixture, and both halves of
+        # the answer: the session got the digest, and the steward was not called at all.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s0", "secretary/idle: s0/t PR #1 review — quiet")
+        run("--flush", "s0", CC_BROKER_DEBOUNCE_S="0")
+        ok("with no CC_STEWARD_SOURCES the digest goes where it went before the steward had a door",
+           calls() == 1 and runs() == 0 and "CALL s0" in said() and not pending("s0"))
+
+        # A ROUTINE EVENT IS HANDLED WITHOUT WAKING A PLANNING SESSION — the row's whole point, in one case.
+        # The source is named at INJECT time only: the addressing is written onto the group there, so the flush
+        # that acts on it needs no config of its own and cannot change its mind halfway.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s1", "secretary/idle: s1/t PR #2 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        run("--flush", "s1", CC_BROKER_DEBOUNCE_S="0")
+        ok("a digest from a stewarded source is handed to the steward, body and all, and costs the session no turn",
+           runs() == 1 and calls() == 0 and "STEWARD s1" in said() and "s1/t PR #2" in said()
+           and not pending("s1"))
+
+        # …AND A DECISION NEVER IS, however its source is filed. Its own fixture, both halves.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s2", "s2/t needs you: pick a branch",
+            CC_STEWARD_SOURCES="secretary")
+        ok("a line asking for a choice still goes to the session, though its source is a stewarded one",
+           calls() == 1 and runs() == 0 and "needs you" in said() and not pending("s2"))
+
+        # THE LEDGER FENCE. Its own fixture, three steps: handled once, repeated into the ledger, then a second
+        # group handled — and the unread line must be CARRIED to the steward and STILL owed to the session.
+        l3 = f"{th}/.cc/state/s3/events.md"
+        run("inject", "--source", "secretary", "s3", "secretary/idle: s3/t PR #3 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        run("--flush", "s3", CC_BROKER_DEBOUNCE_S="0")
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s3", "secretary/idle: s3/t PR #3 review — STILL QUIET",
+            CC_STEWARD_SOURCES="secretary")
+        ok("a group the steward already handled, come round again inside the hour, goes to the ledger and wakes "
+           "and runs nobody — the steward is told about a repeat exactly as little as the session is",
+           calls() == 0 and runs() == 0 and os.path.exists(l3) and "STILL QUIET" in open(l3).read())
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s3", "secretary/idle: s3/u PR #4 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        run("--flush", "s3", CC_BROKER_DEBOUNCE_S="0")
+        carried = runs() == 1 and "STILL QUIET" in said()
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s3", "s3/u needs you: pick", CC_STEWARD_SOURCES="secretary")
+        ok("…and a steward run carries the unread ledger line without marking it read, so the session is still "
+           "told it on its next real message — the steward acts, it is not that line's reader",
+           carried and "STILL QUIET" in said() and "1 with nothing in them to answer" in said())
+
+        # A STEWARD THAT CANNOT RUN MUST NEVER HOLD AN EVENT. Its own fixture: the stub exits non-zero.
+        steward(1)
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s4", "secretary/idle: s4/t PR #5 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        run("--flush", "s4", CC_BROKER_DEBOUNCE_S="0")
+        ok("a steward run that exits non-zero leaves the event pending, exactly as a refused delivery does",
+           runs() == 1 and calls() == 0 and bool(pending("s4")))
+        os.truncate(rec, 0)
+        run("--flush", "s4", CC_BROKER_DEBOUNCE_S="0")
+        ok("…and the next tick takes it to the session, which can decide — never back to the steward that just "
+           "failed it, listed source or not",
+           calls() == 1 and runs() == 0 and "CALL s4" in said() and not pending("s4"))
+        steward(0)
+
+        # …AND A BOX WITH NO STEWARD INSTALLED IS THE SAME ANSWER, not a swallowed event. Its own fixture.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s4b", "secretary/idle: s4b/t PR #6 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        run("--flush", "s4b", CC_BROKER_DEBOUNCE_S="0", CC_BROKER_STEWARD=f"{th}/no-such-steward")
+        held4b = bool(pending("s4b")) and calls() == 0
+        run("--flush", "s4b", CC_BROKER_DEBOUNCE_S="0")
+        ok("a steward that is not on the box at all holds nothing either: the event waits, then it is the "
+           "session's", held4b and calls() == 1 and "CALL s4b" in said() and not pending("s4b"))
+
+        # THE OWNER'S SWITCH, and it is off in one word rather than by emptying a list.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s5", "secretary/idle: s5/t PR #7 review — quiet",
+            CC_STEWARD_SOURCES="secretary", CC_STEWARD="0")
+        run("--flush", "s5", CC_BROKER_DEBOUNCE_S="0")
+        ok("CC_STEWARD=0 switches it off outright — a listed source goes to the session like everything else",
+           calls() == 1 and runs() == 0 and "CALL s5" in said())
+        os.truncate(rec, 0)
+
+        # AN ESCALATION NEVER GOES BACK TO WHAT ESCALATED IT. Its own fixture: the steward's own source word,
+        # named in the list the way a typo would name it, and a line with no decision word in it at all.
+        os.truncate(rec, 0)
+        run("inject", "--source", "steward", "s6", "steward/s6: a finding it may not touch, for you",
+            CC_STEWARD_SOURCES="secretary steward")
+        run("--flush", "s6", CC_BROKER_DEBOUNCE_S="0")
+        ok("an event the steward escalated reaches the session even with `steward` itself in the list — it is "
+           "never handed back to the thing that just gave up on it",
+           calls() == 1 and runs() == 0 and "CALL s6" in said() and not pending("s6"))
+
+        # …AND AN ESCALATION IS NEVER SUPPRESSED INTO THE LEDGER, which is the one place with no reader. Its own
+        # fixture: the same escalation twice inside the window, and the second must still reach the session.
+        os.truncate(rec, 0)
+        esc = "steward/s7: a finding it may not touch, for you"
+        run("inject", "--source", "steward", "s7", esc, CC_STEWARD_SOURCES="secretary")
+        run("--flush", "s7", CC_BROKER_DEBOUNCE_S="0")
+        first = calls() == 1
+        os.truncate(rec, 0)
+        run("inject", "--source", "steward", "s7", esc, CC_STEWARD_SOURCES="secretary")
+        run("--flush", "s7", CC_BROKER_DEBOUNCE_S="0")
+        ok("the same escalation again inside the window still reaches the session — a steward that gave up "
+           "twice is more news than one that gave up once, and the ledger has no reader",
+           first and calls() == 1 and esc in said()
+           and not os.path.exists(f"{th}/.cc/state/s7/events.md"))
+
+        # ── NO EVENT IS WORKED TWICE, and phase B is unlocked, so the claim is what says so ────────────────
+        # THE RE-ENTRY IS REAL, not hypothetical: cc-steward escalates by injecting `needs you`, which
+        # classifies `now` and flushes inline while the outer run is still waiting in phase B. This stub is that
+        # steward — it re-enters `--flush` once, on whichever target the case names.
+        reent = f"{th}/steward-reenter"
+        with open(reent, "w") as f:
+            f.write('#!/usr/bin/env bash\n'
+                    'printf "STEWARD %s\\n" "$2" >> "$CC_SC_REC"\n'
+                    'cat > /dev/null\n'
+                    'if [ ! -e "$CC_SC_ONCE" ]; then : > "$CC_SC_ONCE"; '
+                    '"$CC_SC_PY" "$CC_SC_BROKER" --flush "$CC_SC_NEST"; fi\nexit 0\n')
+        os.chmod(reent, 0o755)
+        for t in ("s8", "s8b", "s9"):
+            run("inject", "--source", "secretary", t, f"secretary/idle: {t}/t PR #8 review — quiet",
+                CC_STEWARD_SOURCES="secretary")
+        os.truncate(rec, 0)
+        run("--flush", "s8", CC_BROKER_DEBOUNCE_S="0", CC_BROKER_STEWARD=reent,
+            CC_SC_ONCE=f"{th}/once-a", CC_SC_NEST="s8")
+        ok("a flush that re-enters while a steward run is in flight does not run the SAME event a second time — "
+           "the group is claimed under the lock in phase A, so the nested flush skips it",
+           runs() == 1 and calls() == 0 and not pending("s8"))
+
+        # THE TWIN, and it is the same stub re-entering the same way: what the claim suppresses above is a group
+        # in flight, not nesting itself. A group nobody is holding still runs.
+        os.truncate(rec, 0)
+        run("--flush", "s8b", CC_BROKER_DEBOUNCE_S="0", CC_BROKER_STEWARD=reent,
+            CC_SC_ONCE=f"{th}/once-b", CC_SC_NEST="s9")
+        ok("…and a group no run is holding is worked normally by that same nested flush — one target's claim "
+           "never becomes a stall for another's",
+           runs() == 2 and not pending("s8b") and not pending("s9"))
+
+        # A CLAIM THAT OUTLIVES ITS RUN IS A GROUP LOST, so it expires on its own clock rather than on somebody
+        # clearing it. Its own fixture: a group left claimed by a run that never came back.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s10", "secretary/idle: s10/t PR #9 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        pj = f"{th}/.cc/broker/pending.json"
+
+        def claim(age):     # the state a run killed between phase A and phase C leaves behind
+            pd = load(pj, {})
+            for g in pd["s10"].values():
+                g["run_at"] = time.time() - age
+            save(pj, pd)
+        claim(0)
+        run("--flush", "s10", CC_BROKER_DEBOUNCE_S="0")
+        held10 = runs() == 0 and calls() == 0 and bool(pending("s10"))
+        claim(STEWARD_TIMEOUT_S + 1)
+        run("--flush", "s10", CC_BROKER_DEBOUNCE_S="0")
+        ok("a claim left behind by a killed run holds the group for STEWARD_TIMEOUT_S and no longer — it is a "
+           "late tick, never a group nobody may touch again",
+           held10 and runs() == 1 and not pending("s10"))
+
+        # SUBMIT()'S FLUSH IS SOMEBODY'S 30 s INJECT, and a steward call can take 1200 s. Its own fixture: a
+        # steward group already past its debounce, and then a decision arriving for the same target.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "s11", "secretary/idle: s11/t PR #10 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        run("inject", "--source", "secretary", "s11", "[s11] PR #10 landing stopped",
+            CC_STEWARD_SOURCES="secretary", CC_BROKER_DEBOUNCE_S="0")
+        ok("a decision arriving mid-debounce delivers the session's part and calls no steward inside the "
+           "caller's inject — the caller kills it at 30 s, and a group killed before phase C wakes twice",
+           calls() == 1 and runs() == 0 and "landing stopped" in said() and bool(pending("s11")))
+
+        # …AND THE STEWARD'S PART IS NOT LOST BY WAITING: the timer's own run, which nobody kills at 30 s, takes it.
+        os.truncate(rec, 0)
+        run("--flush", "s11", CC_BROKER_DEBOUNCE_S="0")
+        ok("…and the timer's flush picks that same group up on its next tick, so the wait costs one tick and "
+           "nothing else", runs() == 1 and calls() == 0 and not pending("s11"))
+
+        # THE UNITS ARE THIS FILE'S OWN, and a whole-run timeout on either is a per-target cap contradicted.
+        ud = f"{os.path.dirname(os.path.dirname(os.path.realpath(__file__)))}/config/systemd-user"
+        tos = [ln.split("=", 1)[1].strip()
+               for u in ("cc-broker.service", "cc-broker-pulse.service")
+               for ln in open(f"{ud}/{u}") if ln.startswith("TimeoutStartSec=")]
+        ok("neither unit carries a whole-run timeout: a run loops over every pending target and the only cap in "
+           "here is per target, so a number there is systemd killing a chain mid-commit",
+           tos == ["infinity", "infinity"])
+
+        # ── THE PULSE: the steward wakes on a clock too, not only on an event ──────────────────────────────
+        # SILENCE IS THE NORMAL OUTPUT. Its own fixture: a target with nothing recorded at all.
+        os.truncate(rec, 0)
+        ok("a tick over a target with nothing in its ledger runs nobody and wakes nobody",
+           run("--pulse", "p0", CC_STEWARD_SOURCES="secretary").returncode == 0
+           and runs() == 0 and calls() == 0)
+
+        # THE LEDGER IS READ BY SOMEBODY AT LAST. Its own fixture: two lines that woke nobody when they were
+        # written, and a target nothing else in this suite touches.
+        run("ledger", "p1", "pulse: r/t review — unchanged")
+        run("ledger", "p1", "pulse: r/u running — unchanged")
+        os.truncate(rec, 0)
+        run("--pulse", "p1", CC_STEWARD_SOURCES="secretary")
+        ok("a tick hands the steward the ledger lines nobody has read, and costs the session no turn",
+           runs() == 1 and calls() == 0 and "STEWARD p1" in said()
+           and "r/t review" in said() and "r/u running" in said())
+
+        # …AND THE SESSION IS STILL OWED THEM. The two cursors are independent, and this is the case that says so.
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "p1", "p1/t needs you: pick")
+        ok("…and the session is still told those same lines on its next real message — the steward reading one "
+           "does not discharge the session's claim on it",
+           calls() == 1 and "r/t review" in said() and "2 with nothing in them to answer" in said())
+
+        # …AND NEVER THE SAME LINE TWICE, because the steward's own cursor moved.
+        os.truncate(rec, 0)
+        run("--pulse", "p1", CC_STEWARD_SOURCES="secretary", CC_STEWARD_PULSE_S="0")
+        ok("…and a tick past the window hands over nothing, because the steward has read to the end",
+           runs() == 0 and calls() == 0)
+
+        # THE WINDOW IS THE RULE AND THE TIMER IS ONLY THE OPPORTUNITY. Its own fixture: one new line, two ticks.
+        run("ledger", "p1", "pulse: r/v review — unchanged")
+        os.truncate(rec, 0)
+        run("--pulse", "p1", CC_STEWARD_SOURCES="secretary")
+        inside = runs() == 0
+        run("--pulse", "p1", CC_STEWARD_SOURCES="secretary", CC_STEWARD_PULSE_S="0")
+        ok("a target that had a tick inside the window is skipped however much its ledger has grown, and past "
+           "the window it gets one — carrying only the line it has not read",
+           inside and runs() == 1 and "r/v review" in said() and "r/t review" not in said())
+
+        # A TICK THE STEWARD DOES NOT TAKE COMES ROUND AGAIN. Its own fixture, its own target.
+        steward(1)
+        run("ledger", "p2", "pulse: q/t review — unchanged")
+        os.truncate(rec, 0)
+        run("--pulse", "p2", CC_STEWARD_SOURCES="secretary")
+        refused = runs() == 1
+        steward(0)
+        os.truncate(rec, 0)
+        run("--pulse", "p2", CC_STEWARD_SOURCES="secretary", CC_STEWARD_PULSE_S="0")
+        ok("a tick the steward could not take does not move its cursor: the same line is offered again",
+           refused and runs() == 1 and "q/t review" in said())
+
+        # THE SWITCH COVERS THE TICK TOO, and a tick that is off never falls back to waking the session.
+        run("ledger", "p3", "pulse: z/t review — unchanged")
+        os.truncate(rec, 0)
+        run("--pulse", "p3", CC_STEWARD_SOURCES="secretary", CC_STEWARD="0")
+        off = runs() == 0 and calls() == 0
+        run("--pulse", "p3")
+        none = runs() == 0 and calls() == 0
+        # …AND THE LINE IS STILL THERE TO BE HANDED OVER, so what the two runs above prove is the switch and not
+        # an empty fixture: the same target, the same line, one key changed.
+        run("--pulse", "p3", CC_STEWARD_SOURCES="secretary")
+        ok("with CC_STEWARD=0, or with no source stewarded at all, a tick does nothing — never a session wake, "
+           "which is the cost the whole tick exists to avoid; with the list set, that same line goes over",
+           off and none and runs() == 1 and "z/t review" in said() and calls() == 0)
+
+        # THE FORM THE TIMER ACTUALLY RUNS: no target at all. Its own fixture, and TWO targets of its own, so
+        # what it proves is the sweep and not whatever an earlier case happened to leave lying about.
+        run("ledger", "p4", "pulse: y/t review — unchanged")
+        run("ledger", "p5", "pulse: y/u running — unchanged")
+        os.truncate(rec, 0)
+        run("--pulse", CC_STEWARD_SOURCES="secretary", CC_STEWARD_PULSE_S="0")
+        ok("`--pulse` with no target ticks every target that has a ledger — the form the timer runs, and it "
+           "reaches targets no event of their own has come in for",
+           "STEWARD p4" in said() and "STEWARD p5" in said() and calls() == 0)
+        # NOTHING THIS FILE WRITES MAY READ AS A DECISION — and it is checked against cc-steward's OWN list, read
+        # off cc-steward with ast the way cc-steward reads this file's, and matched the way refuse() matches it
+        # (cc-steward:199-204): bare substrings of the lowercased body, so `decide` hits "nothing to decide" and
+        # `approve` hits "approval". That is the whole fence, and it runs BEFORE any spend: a word of that list in
+        # framing of ours is refused unread and escalated back as `steward: needs you`, which classify() calls
+        # `now` and submit() flushes inline — the planning turn the steward exists to save, bought by the two
+        # bodies that exist to save it (review of #343, F1 and F2). Both are driven here, end to end and not by
+        # calling render(): the TICK's body, and the FLUSH's with an unread ledger line riding on its tail. An
+        # unreadable cc-steward leaves marks empty and FAILS the case — a drift case that cannot find its source
+        # has stopped checking.
+        marks = ()
+        try:
+            for node in ast.walk(ast.parse(open(f"{os.path.dirname(os.path.realpath(__file__))}/cc-steward").read())):
+                if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "DECISION_MARKS":
+                    marks = ast.literal_eval(node.value)
+        except Exception:
+            marks = ()
+        run("ledger", "p6", "pulse: w/t review — unchanged")
+        os.truncate(rec, 0)
+        run("--pulse", "p6", CC_STEWARD_SOURCES="secretary")
+        ticked = said()
+        os.truncate(rec, 0)
+        run("inject", "--source", "secretary", "p6", "secretary/idle: p6/t PR #8 review — quiet",
+            CC_STEWARD_SOURCES="secretary")
+        run("--flush", "p6", CC_BROKER_DEBOUNCE_S="0")
+        flushed = said()
+        ok("neither body the steward is handed carries a word of the list it refuses on — the tick's, and the "
+           "flush's with an unread ledger line on its tail; either would be escalated back unread and wake the "
+           "session this file just spared",
+           bool(marks) and "w/t review" in ticked and "w/t review" in flushed
+           and not any(m in ticked.lower() or m in flushed.lower() for m in marks)
+           and not decision_needed(ticked) and not decision_needed(flushed))
+        os.truncate(rec, 0)
+
         out = run("report").stdout
-        ok("report counts what was submitted against the wakes it actually bought, in turns",
-           "submitted" in out and "avoided" in out and "turns" in out and "coalescible" in out)
+        stewarded = int((re.search(r"stewarded\s+(\d+)", out) or [0, 0])[1])
+        ok("report counts what was submitted against the wakes it actually bought, in turns — and counts the "
+           "steward's runs in a column of their own, because a run that woke nobody is the saving itself",
+           "submitted" in out and "avoided" in out and "turns" in out and "coalescible" in out
+           and stewarded >= 3)
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-broker selfcheck: {n} failed")
