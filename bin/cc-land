@@ -9,7 +9,10 @@
   cc-land record <repo> <pr> <verdict> --by <who> [--head <sha>] [--findings <text>|-]
                                                   write down a review that already happened, against the change the
                                                   PR is at now (--head: the SHA you read, refused if it has moved).
-                                                  The landing that finds it buys no review of its own
+                                                  The landing that finds it buys no review of its own. A STRICTER
+                                                  verdict can always be written over one that stands (LAND →
+                                                  LAND-AFTER-FIX → DO-NOT-LAND), and supersedes it; a LOOSER one is
+                                                  refused — push the fix, or land with --re-review
   cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does.
                                                   A job a landing has already refused for a reason a re-queue
                                                   cannot mend is refused HERE, in a second, and exits non-zero
@@ -1665,15 +1668,27 @@ class Land:
                          f"Re-run, or --no-review and read it yourself. Said: {last(o)}")
         return text, cost, toks
 
-    def post_review(self, verdict, said, by=""):
+    def post_review(self, verdict, said, by="", supersedes=""):
         """ONE comment per change, ever. The marker carries what it was written about, so re-running the same landing
         adds nothing and a diff that actually moved gets its own review — the alternative is a PR whose thread is
-        four copies of one verdict, which is how a reviewer stops being read."""
-        if self.prior_review() and not self.re_review:
-            return ", comment already on the PR"
+        four copies of one verdict, which is how a reviewer stops being read.
+
+        `supersedes` is the one exception, and it is `record` deliberately writing a STRICTER verdict over a looser
+        one that stands: the landing reads the last marker for a change, so this is how a stop reaches it at all.
+        The caller names the verdict it read, and it is checked again HERE against the thread — between that read
+        and this write another record can land, and a stop written over a LAND that is no longer there would be
+        written over whatever replaced it, unread."""
+        stands = self.prior_review()
+        if stands and not self.re_review:
+            if not supersedes:
+                return ", comment already on the PR"
+            if stands[0] != supersedes:
+                return (f", the verdict on the PR moved to {stands[0]} while this was being written — "
+                        f"it was recorded over {supersedes}")
         who = by or self.by or REVIEW_MODEL
+        over = f"\n\nThis supersedes the **{supersedes}** recorded earlier for this change." if supersedes else ""
         body = (f"{self.marker(verdict, who)}\n**cc-land review** — `{self.head[:12]}`, read by `{who}`\n\n"
-                f"**VERDICT: {verdict}**\n\n{said}")
+                f"**VERDICT: {verdict}**{over}\n\n{said}")
         rc, o = sh(["gh", "pr", "comment", str(self.pr), "--body", body], cwd=self.root, timeout=120)
         return ", commented on the PR" if rc == 0 else f", the comment did not post ({last(o)})"
 
@@ -3241,6 +3256,14 @@ def cmd_record(argv):
     is the recorded verdict (boundary, 2026-09-05), and the landing that finds it buys nothing. Where a paid read is
     still wanted, it happens BEFORE the landing and is recorded here too — never inside the slot.
 
+    A verdict that already stands for this change can always be made STRICTER — LAND → LAND-AFTER-FIX →
+    DO-NOT-LAND. The stricter record is posted, it says what it superseded, and the landing reads it because the
+    LAST marker for a change wins (prior_review). It can never be made LOOSER: a LAND over a standing stop is
+    refused with the remedy it always had (push the fix, or land with --re-review). The direction is the whole
+    rule — nothing written here can quietly widen what merges, and anything can stop it. This is not a nicety: a
+    LAND recorded before a security read found six issues could not be corrected, the stop lived only in the
+    session that reached it, and a lander went for the merge on the stale pass.
+
     What it will not do:
       · It does not review anything. It writes down an answer somebody else reached, and the `by` field says who, so
         a verdict with nobody's name on it cannot be recorded at all.
@@ -3313,20 +3336,25 @@ def cmd_record(argv):
               f"read, so it is a pass for a diff nobody is landing. Review the head that is there", file=sys.stderr)
         return 1
     # A record already standing for THIS change is not quietly overwritten, and not quietly kept either. Same
-    # verdict: nothing to do, say so. Different verdict: refuse and name what stands — a landing reads the LAST
-    # matching comment, so a silent second record would change what merges without anybody deciding it did. To
-    # change the answer, change the diff (which is a new change and a new record) or land with --re-review.
-    stands = L.prior_review()
+    # verdict: nothing to do, say so. A STRICTER one supersedes it — the landing reads the last matching comment,
+    # so this is the only way a stop found after a pass ever reaches the lander, and a read that ends worse than
+    # the one before it is exactly the read this box must not lose. A LOOSER one is refused and names what stands:
+    # that WOULD quietly widen what merges. To reverse a stop, change the diff (a new change, a new record) or
+    # land with --re-review, which is a person asking.
+    stands, supersedes = L.prior_review(), ""
     if stands:
         was, _said, who = stands
         if was == verdict:
             print(f"[{repo}] PR #{pr}: {verdict} is already recorded for this change by {who or 'this box'} — "
                   f"nothing to do")
             return 0
-        print(f"cc-land: PR #{pr} already carries {was} for this change (by {who or 'this box'}); recording "
-              f"{verdict} over it would change what merges. Push the fix, or land with --re-review", file=sys.stderr)
-        return 1
-    posted = L.post_review(verdict, findings or "No findings.", by=by)
+        if REVIEW_VERDICTS.index(verdict) < REVIEW_VERDICTS.index(was):
+            print(f"cc-land: PR #{pr} already carries {was} for this change (by {who or 'this box'}); recording "
+                  f"{verdict} over it would change what merges. Push the fix, or land with --re-review",
+                  file=sys.stderr)
+            return 1
+        supersedes = was
+    posted = L.post_review(verdict, findings or "No findings.", by=by, supersedes=supersedes)
     if posted != ", commented on the PR":
         # post_review is the only writer, and it has two ways of not writing: the comment failed, or a record
         # appeared between the read above and this line. Either way nothing is on the PR, and "recorded" for a
@@ -3336,9 +3364,11 @@ def cmd_record(argv):
         return 1
     key, mb = L.change_key()
     ledger(f"recorded {repo}#{pr} {verdict} by={re.sub(r'[^A-Za-z0-9._@-]+', '-', by)} "
-           f"head={L.head[:12]} change={key[:12] or '-'} base={mb[:12] or '-'}")
-    print(f"[{repo}] PR #{pr}: {verdict} recorded by {by} for {L.head[:12]}{posted} — "
-          f"the landing reads this instead of buying a review")
+           f"head={L.head[:12]} change={key[:12] or '-'} base={mb[:12] or '-'}"
+           f"{f' over={supersedes}' if supersedes else ''}")
+    print(f"[{repo}] PR #{pr}: {verdict} recorded by {by} for {L.head[:12]}{posted}"
+          + (f" — it supersedes the {supersedes} that stood for this change, and the landing reads this one"
+             if supersedes else " — the landing reads this instead of buying a review"))
     return 0
 
 
@@ -3946,10 +3976,52 @@ def cmd_selfcheck():
     rc, said = record(["myrepo", "7", "LAND", "--by", "someone else"])
     check("...and recording the same verdict twice writes nothing further: one change, one comment, whoever asks",
           rc == 0 and len(wrote) == 1 and "already recorded" in said)
+    # …and the DIRECTION, which is the whole of what a second record may do. Up the ladder — LAND →
+    # LAND-AFTER-FIX → DO-NOT-LAND — is always writable, because a read that ends worse than the one before it is
+    # the one answer this box must never be unable to write down: a LAND recorded before a security read found
+    # six issues had no way to be corrected, and a lander went for the merge on the stale pass. Down it is not,
+    # because that widens what merges with nobody deciding it did. One thread, one change, every rung in turn.
+    rc, said = record(["myrepo", "7", "LAND-AFTER-FIX", "--by", "security reviewer"])
+    check("a STRICTER verdict is recorded over one that stands: the marker goes on the PR and the line says what "
+          "it superseded, so a read that came out worse than the last one can be written where a lander looks",
+          rc == 0 and len(wrote) == 2 and "verdict=LAND-AFTER-FIX" in wrote[1] and f"change={KEY}" in wrote[1]
+          and "supersedes the LAND" in said)
+    r = caught(pr7().review)
+    check("...and the landing reads THAT one and stops: the last marker this box wrote for the change wins, which "
+          "is what makes a later stop reach the merge at all",
+          "LAND-AFTER-FIX on PR #7" in str(r) and "stops here" in str(r)
+          and not [c for c in calls if c[0] == CLAUDE])
+    rc, said = record(["myrepo", "7", "DO-NOT-LAND", "--by", "security reviewer"])
+    check("...and the top rung over the middle one the same way — the ladder is walked, not jumped",
+          rc == 0 and len(wrote) == 3 and "verdict=DO-NOT-LAND" in wrote[2]
+          and "supersedes the LAND-AFTER-FIX" in said)
+    r = caught(pr7().review)
+    check("...and the landing now stops on the DO-NOT-LAND, having bought nothing to be told so",
+          "DO-NOT-LAND on PR #7" in str(r) and not [c for c in calls if c[0] == CLAUDE])
+    rc, said = record(["myrepo", "7", "LAND", "--by", "someone else"])
+    check("a LOOSER verdict over a standing stop is refused and names what stands — THE mutation: a pass written "
+          "over a DO-NOT-LAND is a merge nobody decided on, and the remedy is the diff or --re-review",
+          rc == 1 and len(wrote) == 3 and "already carries DO-NOT-LAND" in said
+          and "Push the fix, or land with --re-review" in said)
+    rc, said = record(["myrepo", "7", "LAND-AFTER-FIX", "--by", "someone else"])
+    check("...and the middle rung under it is just as refused: 'looser' is the whole test, not 'a LAND'",
+          rc == 1 and len(wrote) == 3 and "already carries DO-NOT-LAND" in said)
     rc, said = record(["myrepo", "7", "DO-NOT-LAND", "--by", "someone else"])
-    check("...while recording a DIFFERENT verdict over one that stands is refused and says what stands — a second "
-          "record would silently change what merges, and the landing reads the last one",
-          rc == 1 and len(wrote) == 1 and "already carries LAND" in said)
+    check("...while the SAME verdict again is still the no-op it always was: one change, one comment per answer, "
+          "whoever asks and however often",
+          rc == 0 and len(wrote) == 3 and "already recorded" in said)
+    # …and the race that shape opens: `record` reads the thread, decides the new verdict is stricter, and only
+    # THEN writes. Another record can land in between, and a stop written over a LAND that is no longer the
+    # standing answer would be written over whatever replaced it, unread. So post_review reads again and refuses.
+    before, seen = len(wrote), []
+    rc, said = record(["myrepo", "7", "DO-NOT-LAND", "--by", "security reviewer"], world_after={
+        "gh pr view 7 --json comments": lambda a: (seen.append(1), (0, json.dumps(
+            {"comments": [{"body": b, "viewerDidAuthor": True}
+                          for b in (wrote[:1] if len(seen) == 1 else wrote[:2])]})))[1]})
+    check("a record that lands BETWEEN this one's read and its write stops it: the supersede names the verdict it "
+          "was written over, the thread is read again before the comment goes, and a stop over a LAND that has "
+          "since become something else is refused rather than posted at the answer it never saw",
+          rc == 1 and len(wrote) == before and len(seen) == 2 and "moved to LAND-AFTER-FIX" in said)
     # The three refusals below stand on their own: each counts the thread from where IT found it, so a case that
     # is moved or dropped cannot make the next one pass for the wrong reason.
     before = len(wrote)
