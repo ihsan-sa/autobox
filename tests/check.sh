@@ -108,6 +108,16 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # temp HOME, that the file it locks is the one cc-land's own git_lock_path names — for a checkout, a linked
 # worktree and a directory with no .git — and that its fetch waits while a landing holds it. Nothing of this
 # box's is fetched and the public repo is never reached: it publishes into a bare repo in the temp dir.
+# …and that it gives cc-arch its turn after a push and not otherwise, against a stub that records its argv, and
+# that the turn it allows covers cc-arch's own worst case and sits inside this unit's — both read out of the
+# files rather than written down twice.
+# cc-arch's own is fixtures too — its own HOME with its own repos and remotes under it and a stub `cc-slack` that
+# records instead of uploading — over the one promise: a landing posts the rebuilt overview only where the commit
+# that landed DECLARED itself an architecture revision, including the landing that rewrote the source and said
+# nothing. It runs the real pdflatex, on a one-page document of its own and once on the overview source in this
+# tree, which is how a document that stopped building fails here rather than on the morning the box has something
+# to say; those cases are SKIPPED with a line, never failed, where pdflatex is not installed. Nothing leaves the
+# machine, nothing outside its temp HOME is written, and a link planted where it writes is a case of its own.
 # cc-fence's is the only one that runs its cases against the KERNEL: private fixtures, and every forbidden
 # operation run three times — unfenced (so a case that stopped testing anything is caught), fenced outside the
 # task tree, fenced inside it. Nothing of this box's is written. cc-member-v2 applies the fence, behind
@@ -158,7 +168,7 @@ tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 fail
 # dead the moment this loop goes back to asking `want`. Lifting the list into a variable is what broke it here.
 SCD=$GD   # the dir and its trap are set at the top; a second EXIT trap here would have replaced the first
 running=0; ran=""
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-watch cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc-green cc; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-watch cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc-green cc-arch cc; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   ran="$ran $c"
   { rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &

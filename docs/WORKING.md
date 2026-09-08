@@ -73,6 +73,13 @@ status word on its own tells nothing downstream anything:
 3. `cc-slack post-approval <repo> <url>` — the #approvals card is what a 👍 is given on, and nothing else
    posts one.
 
+If the change alters the shape of the box rather than one tool's behaviour, put one more line in a **commit
+message** on the branch — in the commit BODY, never the subject line, at the start of a line of its own: `ARCHITECTURE: <one line — what is different now>`. The squash
+carries every commit message onto the default branch, and `cc-arch` reads it from there — not from the PR body,
+which can be rewritten after the merge. Without that line nothing is posted, and nothing infers it from a diff.
+The post rides `cc-publish`, so it goes out after the next landing that touches `core/`: a revision that changed
+only the private overlay waits for one, or `cc-arch landed <repo>` sends it now.
+
 `cc done <repo> <row>` does those three in one call, but only in a worktree `cc` made — it reads the
 `.cc/track` marker. Landing follows the repo's standing: this session runs `cc-land <repo> <pr>` where the
 owner has granted standing merging, the card otherwise, and cc-land closes the row by the PR URL.

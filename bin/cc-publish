@@ -51,6 +51,12 @@ PUSH_TIMEOUT=${CC_PUSH_TIMEOUT:-120}   # seconds, per command that reaches the r
 UNATTENDED=(timeout -k 5 "$PUSH_TIMEOUT" env -u GIT_ASKPASS -u SSH_ASKPASS GIT_TERMINAL_PROMPT=0
             SSH_ASKPASS_REQUIRE=never GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes")
 SELF="$(realpath "$0")"; BIN="$(dirname "$SELF")"
+# THE OVERVIEW GETS ITS TURN HERE, and this is the only line about it: everything that decides whether anything
+# happens is cc-arch's. A push is the box's one unattended "the shared code moved" moment — it runs on a timer
+# with nobody watching and it notices a merge whoever made it — so the document that describes the system can
+# follow the system without a unit, a session or a step inside a landing. It is given the checkout, never a
+# verdict; it posts only for a landing that DECLARED itself an architecture revision and is silent otherwise.
+ARCH="${CC_PUBLISH_ARCH:-$BIN/cc-arch}"   # CC_PUBLISH_ARCH: test hook
 STATE="${CC_PUBLISH_STATE:-$HOME/.cc/state}"   # log + lock; tests point it at their own dir so two runs never share a lock
 LOG="$STATE/publish.log"; SEEN="$STATE/publish.notified"   # the abort the owner was last paged about (see die)
 mkdir -p "$STATE"
@@ -167,12 +173,36 @@ PY
   git -C "$T/src" remote add origin "$T/origin.git"; git -C "$T/src" push -q origin main
   # Fixture names and contents carry no word this box calls itself, so the identity gate has nothing to catch.
   W=""                                        # per-case override of the publish's lock wait; empty = its default
+  # THE OVERVIEW'S TURN, stood in for: cc-arch records the argv it was given and exits with $ARCHRC, so this
+  # asserts WHEN it is asked and what happens when it fails, and never builds a document or reaches a channel.
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/arch.rec"\nexit "${ARCHRC:-0}"\n' "$T" > "$T/arch"; chmod +x "$T/arch"
+  : > "$T/arch.rec"
   pub(){ ( cd "$T/src" && PATH="$T/stub:$PATH" HOME="$T" CC_PUBLISH_STATE="$T/state" CC_NOTIFY_LOG="$T/notify.log" \
-           CC_PUBLISH_LOCK_WAIT="$W" \
+           CC_PUBLISH_LOCK_WAIT="$W" CC_PUBLISH_ARCH="$T/arch" \
            PUBLISH_REMOTE="$T/pub.git" PUBLISH_REPO='' PUBLISH_PREFIX=pfx PUBLISH_BRANCH=main "$SELF" ); }
   : > "$T/events"; pub >/dev/null 2>&1; rc=$?
   k "$(t test "$rc" = 0)" "the fixture publishes (its own repos under a temp HOME — nothing of this box's)"
   k "$(t grep -qx fetch "$T/events")" "…and the fetch it went through was recorded"
+  k "$(t grep -qx "landed $T/src" "$T/arch.rec")" "…and the overview was given its turn, over the checkout that moved"
+  : > "$T/arch.rec"; pub >/dev/null 2>&1
+  k "$(t test ! -s "$T/arch.rec")" "a publish with nothing to push gives it no turn — the document follows a merge, not a clock"
+  # A DOCUMENT THAT WOULD NOT BUILD MUST NOT MAKE THE MIRROR LOOK BROKEN: the push already happened.
+  echo 1 > "$T/src/pfx/f1"; git -C "$T/src" add -A; git -C "$T/src" commit -qm more; git -C "$T/src" push -q origin main
+  : > "$T/arch.rec"; export ARCHRC=1; pub >/dev/null 2>&1; rc=$?; unset ARCHRC
+  k "$(t test "$rc" = 0)" "an overview that could not be rebuilt does not colour the publish that already pushed"
+  k "$(t test -s "$T/arch.rec")" "…and it was asked all the same"
+  # THE BOUND, PINNED TO WHAT IT IS BOUNDING. cc-arch's worst case is two pdflatex passes plus one upload, and a
+  # kill inside that window is what "post once" was written for. Read both numbers out of the two files rather
+  # than trusting a round number, and the unit's own allowance out of its unit file, so neither can drift.
+  arch_worst(){ sed -n 's/^\(TEX_TIMEOUT\|POST_TIMEOUT\) *= *\([0-9]*\).*/\1 \2/p' "$BIN/cc-arch" |
+    awk '{v[$1]=$2} END{print (v["TEX_TIMEOUT"]*2)+v["POST_TIMEOUT"]}'; }
+  hookb=$(sed -n 's/.*timeout \([0-9]*\) "\$ARCH".*/\1/p' "$SELF" | head -1)
+  unitb=$(sed -n 's/^TimeoutStartSec=\([0-9]*\).*/\1/p' "$BIN/../config/systemd-user/cc-publish.service" 2>/dev/null | head -1)
+  w=$(arch_worst)
+  k "$(t test -n "$hookb" -a -n "$w" -a "$hookb" -ge "$w")" \
+    "the turn cc-arch is given covers its own worst case — two pdflatex passes and an upload (${hookb}s vs ${w}s)"
+  k "$(t test -n "$unitb" -a "$unitb" -ge "$hookb")" \
+    "…and this unit allows the whole run more than that turn alone, so systemd cannot kill a publish mid-upload (${unitb}s)"
   : > "$T/events"
   ( flock 9; echo held >> "$T/events"; sleep 3; echo released >> "$T/events" ) 9>"$(repo_lock_path "$T/src")" &
   hold=$!
@@ -204,6 +234,7 @@ PY
     printf 'exec "%s" "$@"\n' "$(command -v git)"; } > "$T/stub3/git"
   chmod +x "$T/stub3/git"
   ( cd "$T/src" && PATH="$T/stub3:$PATH" HOME="$T" CC_PUBLISH_STATE="$T/state" CC_NOTIFY_LOG="$T/notify.log" \
+    CC_PUBLISH_ARCH="$T/arch" \
     PUBLISH_REMOTE="$T/pub.git" PUBLISH_REPO='' PUBLISH_PREFIX=pfx PUBLISH_BRANCH=main "$SELF" ) >/dev/null 2>&1
   rc=$?
   k "$(t test "$rc" = 0)" "a publish still succeeds when its fetch backgrounds a detached child"
@@ -319,4 +350,12 @@ fi
 "${UNATTENDED[@]}" git -C "$R" -c core.askPass= push --quiet "$REMOTE" "$COMMIT:refs/heads/$BRANCH" || die "push to the public repo failed (it may have moved, or there is no credential for it — re-run)"
 printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "${SRC:0:12}" "${COMMIT:0:12}" "$BRANCH" >> "$LOG"
 rm -f "$SEEN"
+# The publish is done and recorded above; nothing below may change that. cc-arch keeps its own cursor and its own
+# ledger, so a turn it cannot finish costs nothing but a retry on the next tick, and its failure is not this
+# unit's — a document that would not build must never make the mirror look broken. THE BOUND IS ARITHMETIC, not a
+# round number: cc-arch's worst case is two pdflatex passes plus one upload (TEX_TIMEOUT * 2 + POST_TIMEOUT), and
+# a kill inside it used to be a second copy of the document in the channel. The selfcheck reads both files and
+# fails if this number ever drops below that sum, or rises above what the unit allows the whole run.
+# CC_PUBLISH_ARCH='' switches the whole thing off.
+[ -x "$ARCH" ] && { timeout 420 "$ARCH" landed "$R" || echo "cc-publish: cc-arch did not finish — the publish stands" >&2; }
 echo "cc-publish: published $PREFIX/ at ${SRC:0:8} as ${COMMIT:0:8} on $BRANCH"

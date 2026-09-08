@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+r"""cc-arch — the architecture overview PDF follows the architecture, without anybody asking for it.
+
+  cc-arch landed <repo|path>        what landed since last time; if one of those landings DECLARED itself an
+                                    architecture revision, rebuild the overview and post it into #<repo>.
+                                    Silence — no build, no message, no file — for everything else.
+  cc-arch build <repo|path> [<ref>] rebuild from the living source at <ref> (default: the default branch as this
+                                    checkout last saw it), verify it, print the path. Posts nothing.
+  cc-arch marked <repo|path> <ref>  does the commit at <ref> declare an architecture revision? prints it, exit 0/1
+  cc-arch selfcheck                 fixtures of its own: its own HOME, its own repos, a stub `cc-slack`
+
+WHY IT EXISTS. The overview is the one document the owner reads to know what the box IS. Until this file, it was
+rebuilt only when he asked, so the document and the system drifted apart between askings — and a stale picture of
+a machine that runs itself is worse than none, because it is believed. The document now follows the code: the
+source is in the repo beside the code it describes, and a landing that changes the shape of the box rebuilds it
+and puts the PDF in the channel.
+
+WHAT COUNTS IS DECLARED, NEVER INFERRED. Most landings are not architecture revisions, and a PDF after every
+merge is noise that gets muted. So the change SAYS SO, in a commit message on its branch, on a line of its own
+starting in the first column:
+
+    ARCHITECTURE: <one line — what about the shape of the box is different now>
+
+and nothing else here decides. No diff is read, no path is special, no model is asked. A PR that rewrites this
+very source and says nothing posts nothing; that is the intended answer, not a gap.
+
+WHY THE COMMIT MESSAGE AND NOT THE PR BODY. cc-land squash-merges, so every commit message on the branch is
+carried into the squash commit on the default branch — and that commit is then IMMUTABLE and local. A PR body is
+neither: it is fetched over the network, `gh pr edit` is not a gated command, and it can be rewritten AFTER the
+merge, which would let whoever merged last choose the sentence this box says out loud in the owner's channel
+(security review of #361). Reading it out of the landed commit closes that outright: what is posted is what was
+reviewed, and this file needs no network at all. The declaration is still SANITIZED before it is said — see
+`clean` — because "written by one of ours" is not the same as "safe to repeat verbatim".
+
+WHERE IT IS CALLED FROM, AND WHY NOT FROM THE LANDING. cc-publish gives it a turn after it has pushed — that is
+this box's one unattended "the shared code moved" moment, it already runs on a timer with nobody watching, and it
+needs no unit of its own. It is deliberately NOT the landing: a landing is a long chain of steps that must not
+grow a document build in the middle of it, and a merge that arrives some other way — the web, another machine —
+must reach the channel just the same. Nothing here runs in a session's turn.
+  The one thing that arrangement cannot see is a revision that changes NOTHING inside the published prefix: no
+  publish, so no turn, so no document — it waits for the next landing that does touch it. That is a narrow miss
+  and not a hidden one: the prefix is the generic system and the source of this document is inside it, so a shape
+  change that misses it is one box's private overlay. `cc-arch landed <repo>` by hand covers that case.
+
+THE CURSOR, AND WHY IT NEVER BACKFILLS. Each repo has one: the commit this file has already looked at. A first
+run writes the current head and posts nothing at all, because the history behind it was landed by people who
+never knew this file existed, and answering for it would mean a flood on the day it is installed. From then on
+the range is exactly what landed since.
+
+POST ONCE, KEYED ON THE COMMIT. The ledger records the landed SHA, not the PR number and not the cursor: a
+cursor wound back re-reads the same commits and sends nothing, because those SHAs are already in it. The intent
+is written down BEFORE the upload, so a process killed between the two leaves a record and the next turn does not
+send the document a second time; an upload that comes back FAILED is written down as failed and is still owed, so
+a channel that was down for a minute does not cost the owner the document. The ledger and the cursor are the two
+things anybody wanting a second copy would delete, so cc-guard fences this directory against a gated session's
+shell the way it fences ~/bin.
+
+NOTHING IT WRITES FOLLOWS A SYMLINK. Every artifact, cursor and ledger line is opened O_NOFOLLOW (a new file
+O_EXCL under a temp name, then renamed into place), because a planted link at any of those paths would otherwise
+make this file write where somebody else chose (security review of #361).
+
+AND IT IS VERIFIED BEFORE IT IS SENT. Plain pdflatex and the psnfss fonts, twice for the TikZ positions, with no
+shell escape AND `openin_any=p openout_any=p`: the source arrives by a landing and is built, never trusted — a
+`\input` of an absolute path would otherwise pull a file of this box's into a document that is about to be
+uploaded, which no `-no-shell-escape` stops. Then `pdfinfo` for pages and `pdffonts` for embedding — a PDF whose
+fonts are not in it renders as somebody else's guess on a phone. A build or a check that fails posts NOTHING and
+leaves the cursor where it was, so the next turn tries again.
+"""
+import sys, os, re, json, time, shutil, subprocess, tempfile, fcntl
+
+HOME = os.path.expanduser("~")
+BIN = os.environ.get("CC_ARCH_BIN") or os.path.dirname(os.path.realpath(__file__))
+STATE = f"{HOME}/.cc/state/arch"
+# The declaration, in the first column of a line of its own: the squash commit keeps a branch commit's body lines
+# exactly there, and requiring column 0 keeps the word inside a sentence — or an indented quotation of this very
+# paragraph — from being read as somebody asking for a document.
+MARK = re.compile(r"^ARCHITECTURE:[ \t]*(\S.*?)[ \t]*$", re.M)
+# How a squash lands with its PR: GitHub appends `(#n)` to the subject, and cc-land squash-merges everything.
+# Only ever used to SAY which PR it was; nothing is decided by it.
+PRNUM = re.compile(r"\(#([0-9]{1,7})\)\s*$")
+REC, FLD = "\x1e", "\x1f"      # separators for `git log --format`: a commit body carries newlines, tabs and pipes
+# The living source, in the two shapes the tree has: the control repo carries the generic half under `core/`, the
+# published repo IS that half. Overridable for a box whose overview lives somewhere else.
+SRC_RELS = tuple(x for x in (os.environ.get("CC_ARCH_SOURCE"),) if x) or \
+           ("core/docs/autobox-overview.tex", "docs/autobox-overview.tex")
+REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+GIT_TIMEOUT = 120
+TEX_TIMEOUT = 90       # one pdflatex pass over a TikZ document; measured at ~1.5 s, so this is a hang's bound
+POST_TIMEOUT = 180     # an upload, the same bound cc-land allows its own Slack calls
+MSG_CAP = 300          # what one declaration may contribute to the message; the document says the rest
+# TEX_TIMEOUT * 2 + POST_TIMEOUT is this file's worst case, and cc-publish's `timeout` around it is set from that.
+
+
+class Stop(Exception):
+    """Something outside this file could not answer. Nothing is posted and the cursor does not move."""
+
+
+def sh(argv, cwd=None, timeout=GIT_TIMEOUT, env=None):
+    try:
+        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                           env=None if env is None else dict(os.environ, **env))
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, f"{e.__class__.__name__}: {e}"
+
+
+def last(o, n=200):
+    return " ".join((o or "").split())[-n:]
+
+
+def write_new(path, data, mode=0o644):
+    """Replace `path` without ever writing THROUGH it. A new file under a temp name — O_EXCL so a link planted at
+    that name fails, O_NOFOLLOW so one planted at the path itself does — then renamed over the destination, which
+    replaces a symlink rather than following it. ~/.cc/state is not a private directory by construction, so this
+    is the shape every write here takes."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb" if isinstance(data, (bytes, bytearray)) else "w") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def append_new(path, text, mode=0o644):
+    """The same promise for a file that is APPENDED to rather than replaced — the ledger, and the suites' notify
+    log. O_NOFOLLOW on the path itself: a link there is a refusal, never a write somewhere else."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "a") as f:
+        f.write(text)
+
+
+def clean(s):
+    """What the box says out loud, out of text somebody else wrote. A declaration is a sentence from a commit
+    message: it is repeated in the owner's channel, so it may not carry a mention that pings a room, a link
+    somebody follows, or markup that makes it look like the box's own words. One line, plain, capped."""
+    s = re.sub(r"<[^>]*>", " ", str(s))                        # Slack's own <@U…>, <!channel>, <http…|text>
+    s = re.sub(r"(?:https?|mailto|file|ftp)://\S+|www\.\S+", "[link]", s, flags=re.I)
+    s = re.sub(r"[@#]([A-Za-z0-9._-])", r"\1", s)              # @here, @channel, @someone, #a-channel
+    s = re.sub(r"[`*_~|>]", "", s)                             # mrkdwn emphasis, code, quoting
+    return " ".join(s.split())[:MSG_CAP]
+
+
+def resolve(name):
+    """A repo NAME lives under ~/dev; anything with a slash in it is the checkout itself, which is how cc-publish
+    names the tree it just published. Either way the channel is the directory's own name."""
+    root = name if "/" in name else f"{HOME}/dev/{name}"
+    root = os.path.realpath(root)
+    return root, os.path.basename(root)
+
+
+def head_of(root):
+    """The default branch as this checkout last saw it. NEVER a fetch of our own: a fetch writes FETCH_HEAD and
+    the very ref a landing in the same checkout is pulling, and this runs beside one (cc-publish fetches under
+    cc-land's lock; we read what it left)."""
+    rc, o = sh(["git", "-C", root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    br = o.strip().split("/")[-1] if rc == 0 and o.strip() else "main"
+    rc, o = sh(["git", "-C", root, "rev-parse", f"refs/remotes/origin/{br}"])
+    if rc != 0:
+        raise Stop(f"no refs/remotes/origin/{br} in {root} — nothing to follow")
+    return o.strip()
+
+
+def known(root, sha):
+    return sh(["git", "-C", root, "cat-file", "-e", f"{sha}^{{commit}}"])[0] == 0
+
+
+def state_paths(repo):
+    if not REPO_RE.match(repo):
+        raise Stop(f"'{repo}' is not a name a state file can be keyed by")
+    os.makedirs(STATE, exist_ok=True)
+    return f"{STATE}/{repo}.cursor", f"{STATE}/{repo}.posted", f"{STATE}/{repo}.lock"
+
+
+def read_cursor(path):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return ""
+
+
+def sent_shas(path):
+    """The SHAs this file has already answered for. A line whose outcome is `failed` is one the upload came back
+    and SAID it had not sent, so that commit is still owed; anything else — sent, or an intent whose outcome was
+    never written because the process died — is done, and is never sent again."""
+    state = {}
+    try:
+        for ln in open(path):
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if r.get("sha"):
+                state[r["sha"]] = r.get("to")
+    except OSError:
+        pass
+    return {s for s, to in state.items() if to != "failed"}
+
+
+def declared(message):
+    """The declaration as the landed commit carries it, or "" — the whole decision, offline, in one line."""
+    m = MARK.search(message or "")
+    return clean(m.group(1)) if m else ""
+
+
+def marked(root, ref):
+    rc, o = sh(["git", "-C", root, "log", "-1", "--format=%B", ref])
+    if rc != 0:
+        raise Stop(f"no commit {ref} in {root}: {last(o)}")
+    return declared(o)
+
+
+def source_at(root, ref):
+    """The source AS IT LANDED, out of the ref — not the working copy, which may be behind what was published."""
+    for rel in SRC_RELS:
+        rc, o = sh(["git", "-C", root, "show", f"{ref}:{rel}"])
+        if rc == 0 and o.strip():
+            return rel, o
+    raise Stop(f"no overview source at {ref[:8]} (looked for {', '.join(SRC_RELS)})")
+
+
+def unembedded(table):
+    """`pdffonts` output -> why it is not sendable, or "". Its columns are fixed-width and a name can be long
+    enough to be one of them, so the `emb` answer is read at the offset the HEADER gives it and any row that does
+    not answer yes or no there is a failure, not a pass: the whole point is that nothing unchecked reaches a
+    phone, and a font the reader's device has to guess at is exactly what a phone gets wrong."""
+    lines = [ln for ln in table.splitlines() if ln.strip()]
+    if len(lines) < 3 or "emb" not in lines[0]:
+        return "it uses no fonts at all — nothing was rendered"
+    col = lines[0].index("emb")
+    bad = [ln[:col].strip() or "?" for ln in lines[2:] if ln[col:col + 3].strip() != "yes"]
+    return f"these fonts are not embedded in it: {', '.join(bad[:5])}" if bad else ""
+
+
+def verify(pdf):
+    """Two questions, both about the file that would be sent: does it have pages, and are its fonts IN it."""
+    rc, o = sh(["pdfinfo", pdf], timeout=60)
+    if rc != 0:
+        return f"pdfinfo could not read it: {last(o)}"
+    m = re.search(r"^Pages:\s+(\d+)", o, re.M)
+    if not m or int(m.group(1)) < 1:
+        return "it has no pages"
+    rc, o = sh(["pdffonts", pdf], timeout=60)
+    return f"pdffonts could not read it: {last(o)}" if rc != 0 else unembedded(o)
+
+
+def build(root, ref):
+    """Build it, check it, and put the dated PDF where it can be sent from. Not in the repo: the document is the
+    source, and a dated file in git is the very drift this exists to end."""
+    rel, tex = source_at(root, ref)
+    base = os.path.basename(rel)[:-4] if rel.endswith(".tex") else os.path.basename(rel)
+    with tempfile.TemporaryDirectory(prefix="cc-arch.") as d:
+        write_new(f"{d}/{base}.tex", tex)
+        for _ in range(2):   # twice: TikZ places nodes from the previous pass's positions
+            # `openin_any=p openout_any=p` is the half `-no-shell-escape` does not cover: paranoid mode refuses
+            # TeX's own file reads and writes outside the build directory, so a landed `\input{/…}` of one of
+            # this box's files is a build failure and never a paragraph in a document about to be uploaded.
+            rc, o = sh(["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "-no-shell-escape",
+                        f"{base}.tex"], cwd=d, timeout=TEX_TIMEOUT,
+                       env={"openin_any": "p", "openout_any": "p"})
+            if rc != 0:
+                raise Stop(f"pdflatex failed on {rel} at {ref[:8]}: {last(o, 300)}")
+        pdf = f"{d}/{base}.pdf"
+        if not os.path.exists(pdf):
+            raise Stop(f"pdflatex left no PDF for {rel} at {ref[:8]}")
+        why = verify(pdf)
+        if why:
+            raise Stop(f"the PDF built from {rel} at {ref[:8]} was not sent — {why}")
+        out = f"{STATE}/{base}-{time.strftime('%Y-%m-%d')}.pdf"   # the owner's own clock, like every stamp he reads
+        write_new(out, open(pdf, "rb").read())
+        return out
+
+
+def post(repo, pdf, text):
+    """Into the project's own channel, as a FILE: a link to a path on this box is not something a phone opens.
+    CC_NOTIFY_LOG_ONLY is the suites' switch and is honoured here as well as in cc-notify — a test that reached
+    this far must still not put a document in a real channel."""
+    if os.environ.get("CC_NOTIFY_LOG_ONLY"):
+        log = os.environ.get("CC_NOTIFY_LOG") or f"{HOME}/.cc/notify.log"
+        append_new(log, f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\tarch\t#{repo}\t{pdf}\t{text}\n")
+        return "log-only"
+    rc, o = sh([f"{BIN}/cc-slack", "post", "--file", pdf, "--to", f"#{repo}",
+                "--title", os.path.basename(pdf), "-m", text], timeout=POST_TIMEOUT)
+    if rc != 0:
+        raise Stop(f"the overview did not reach #{repo}: {last(o)}")
+    return "sent"
+
+
+def message(marks):
+    """Plain, one sentence, and the declarations themselves — sanitized where they were read."""
+    return f"The architecture changed, so here is the overview again — {'; '.join(w for _, _, w in marks)}"[:1200]
+
+
+def ledger_write(path, repo, marks, to, pdf):
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    append_new(path, "".join(json.dumps({"at": at, "repo": repo, "sha": sha, "pr": pr, "why": why,
+                                         "pdf": pdf, "to": to}) + "\n" for sha, pr, why in marks))
+
+
+def landed(name):
+    root, repo = resolve(name)
+    if sh(["git", "-C", root, "rev-parse", "--git-dir"])[0] != 0:
+        print(f"cc-arch: {root} is not a checkout — nothing to follow")
+        return 0
+    cursor, ledger, lock = state_paths(repo)
+    # ONE TURN PER REPO AT A TIME. The cursor and the ledger are read, then written across a build and an upload
+    # that take tens of seconds; two turns overlapping there would each read "not sent yet" and the owner would
+    # get the same document twice. Non-blocking on purpose: a second turn has nothing to add and the timer brings
+    # the next one along anyway, so it says so and leaves.
+    lk = os.fdopen(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644), "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"cc-arch: another turn is working on {repo} — this one has nothing to add")
+        return 0
+    head = head_of(root)
+    cur = read_cursor(cursor)
+    if not cur or not known(root, cur):
+        write_new(cursor, head + "\n")
+        print(f"cc-arch: following {repo} from {head[:8]} — nothing posted for what landed before this")
+        return 0
+    if cur == head:
+        return 0
+    rc, o = sh(["git", "-C", root, "log", "--reverse", f"--format={REC}%H{FLD}%s{FLD}%B", f"{cur}..{head}"])
+    if rc != 0:
+        raise Stop(f"cannot list what landed in {repo}: {last(o)}")
+    sent, marks = sent_shas(ledger), []
+    for rec in o.split(REC):
+        if not rec.strip():
+            continue
+        sha, subj, body = (rec.split(FLD, 2) + ["", ""])[:3]
+        sha = sha.strip()
+        if not sha or sha in sent:
+            continue
+        why = declared(body)
+        if why:
+            m = PRNUM.search(subj)
+            marks.append((sha, m.group(1) if m else "", why))
+    if marks:
+        pdf = build(root, head)
+        # POST ONCE. The intent goes down BEFORE the upload: a kill between the two leaves a record saying this
+        # document was already owed to the channel, and the next turn reads those SHAs as answered for. Only an
+        # upload that came back and SAID it failed is written as failed, and only that is tried again.
+        ledger_write(ledger, repo, marks, "sending", pdf)
+        try:
+            where = post(repo, pdf, message(marks))
+        except Stop:
+            ledger_write(ledger, repo, marks, "failed", pdf)
+            raise
+        ledger_write(ledger, repo, marks, where, pdf)
+        print(f"cc-arch: {os.path.basename(pdf)} {where} to #{repo}"
+              + ("".join(f" (PR #{pr})" for _, pr, _ in marks if pr)))
+    write_new(cursor, head + "\n")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "selfcheck":
+        return selfcheck()
+    try:
+        if cmd == "landed" and len(rest) == 1:
+            return landed(rest[0])
+        if cmd == "build" and len(rest) in (1, 2):
+            root, _ = resolve(rest[0])
+            print(build(root, rest[1] if len(rest) > 1 else head_of(root)))
+            return 0
+        if cmd == "marked" and len(rest) == 2:
+            root, _ = resolve(rest[0])
+            why = marked(root, rest[1])
+            if why:
+                print(why)
+            return 0 if why else 1
+    except Stop as e:
+        # A turn this file could not finish is never a caller's failure: cc-publish has already pushed, and the
+        # next turn asks again from a cursor that did not move.
+        print(f"cc-arch: {e}", file=sys.stderr)
+        return 0 if cmd == "landed" else 1
+    print("usage: cc-arch landed <repo> | build <repo> [<ref>] | marked <repo> <ref> | selfcheck", file=sys.stderr)
+    return 2
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────
+# FIXTURES ONLY: a HOME of its own with its own repos and remotes under it, and a stub `cc-slack` that records
+# its argv instead of uploading anything. No repository of this box's is read, nothing leaves the machine, and no
+# state outside the temp HOME is written. The ONE thing it reads from this tree is the overview source next to
+# this file — the document is the deliverable, so a source that stopped building is this tool's failure and not
+# somebody's later surprise. Every case that builds is SKIPPED, not failed, where pdflatex is not installed.
+SLACK_STUB = """#!/usr/bin/env bash
+printf 'cc-slack %s\\n' "$*" >> "$CC_SC_REC"
+[ -z "${CC_SC_SLACK_HANG:-}" ] || sleep 60
+[ -z "${CC_SC_SLACK_DOWN:-}" ] || { echo "channel not found" >&2; exit 1; }
+"""
+# A one-page document in the same dialect the real one is written in — plain pdflatex, psnfss (charter), nothing
+# outside texlive-latex-recommended — so the cases build in a fraction of a second and still exercise the real
+# pdflatex, pdfinfo and pdffonts. The real source gets its own case below.
+TINY = ("\\documentclass[10pt,a4paper]{article}\n\\usepackage[T1]{fontenc}\n\\usepackage{charter}\n"
+        "\\pagestyle{empty}\n\\begin{document}\nThe shape of it.\n\\end{document}\n")
+
+
+def selfcheck():
+    n = f = 0
+
+    def ok(what, cond):
+        nonlocal n, f
+        print(("  ok   " if cond else "  FAIL ") + what)
+        n += 1
+        f += int(not cond)
+
+    th = tempfile.mkdtemp(prefix="cc-arch-sc.")
+    try:
+        # ── what needs no build, and so runs everywhere ──────────────────────────────────────────────────
+        ok("the declaration is a line in the first column of a commit BODY: the word inside a sentence is prose, "
+           "an indented quotation of the instruction is prose, a squashed commit's SUBJECT is prose because the "
+           "squash bullets it — which is why the docs say body, never subject — and a line of its own is read "
+           "back without its whitespace",
+           declared("This is not an ARCHITECTURE: change, it only mentions it.") == ""
+           and declared("  ARCHITECTURE: quoted in a paragraph about this file") == ""
+           and declared("a squash subject (#9)\n\n* ARCHITECTURE: on a bulleted subject line") == ""
+           and declared("a subject\n\nARCHITECTURE:   the box grew a steward  \n\nmore prose") == "the box grew a steward")
+        said_out = clean("ARCHITECTURE <!channel> <@U123> see *this* `now` at https://evil.example/x @here #general "
+                         + "y" * 400)
+        ok("what the box repeats is sanitized where it is read: no mention that pings a room, no link somebody "
+           "follows, no markup that makes it look like the box's own words, one line, capped",
+           "<" not in said_out and "@" not in said_out and "`" not in said_out and "*" not in said_out
+           and "evil.example" not in said_out and "[link]" in said_out and "\n" not in said_out
+           and len(said_out) <= MSG_CAP)
+        hdr = ("name                                 type              encoding         emb sub uni object ID\n"
+               "------------------------------------ ----------------- ---------------- --- --- --- ---------\n")
+        ok("the font check refuses a document with no fonts at all and one whose fonts the reader's device would "
+           "have to supply, and passes one that carries its own",
+           unembedded("") != ""
+           and "Helvetica" in unembedded(hdr + "Helvetica                            Type 1            WinAnsi          no  no  no       7  0\n")
+           and unembedded(hdr + "ABCDEF+CharterBT-Roman               Type 1            Custom           yes yes yes      9  0\n") == "")
+        # THE WRITE HELPERS, on links planted where each of them writes.
+        os.makedirs(f"{th}/w", exist_ok=True)
+        open(f"{th}/w/victim", "w").write("untouched\n")
+        os.symlink(f"{th}/w/victim", f"{th}/w/pdf")
+        os.symlink(f"{th}/w/victim", f"{th}/w/led")
+        write_new(f"{th}/w/pdf", "the real thing\n")
+        try:
+            append_new(f"{th}/w/led", "a line\n")
+            appended = False
+        except OSError:
+            appended = True
+        ok("a link planted where this writes is replaced, never written through — the file it pointed at is "
+           "untouched, and an APPEND onto one is refused outright",
+           open(f"{th}/w/victim").read() == "untouched\n" and not os.path.islink(f"{th}/w/pdf")
+           and open(f"{th}/w/pdf").read() == "the real thing\n" and appended and os.path.islink(f"{th}/w/led"))
+
+        if not shutil.which("pdflatex"):
+            print("  ·    pdflatex is not installed here, so every case that builds a document is skipped "
+                  "(install texlive-latex-recommended and texlive-pictures to run them)")
+            print(f"cc-arch selfcheck: {n - f} passed, {f} failed")
+            return 1 if f else 0
+
+        # ── the fixture box ─────────────────────────────────────────────────────────────────────────────
+        env0 = dict(os.environ)
+        sbin, rec = f"{th}/bin", f"{th}/rec"
+        for d in (sbin, f"{th}/dev"):
+            os.makedirs(d, exist_ok=True)
+        open(f"{sbin}/cc-slack", "w").write(SLACK_STUB)
+        os.chmod(f"{sbin}/cc-slack", 0o755)
+        root, origin = f"{th}/dev/myrepo", f"{th}/origin.git"
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+        sh(["git", "init", "-q", "--bare", "-b", "main", origin])
+        sh(["git", "init", "-q", "-b", "main", root])
+        os.makedirs(f"{root}/core/docs", exist_ok=True)
+        open(f"{root}/core/docs/autobox-overview.tex", "w").write(TINY)
+
+        def commit(msg, touch=None):
+            if touch:
+                open(f"{root}/{touch}", "a").write("x\n")
+            sh(git + ["-C", root, "add", "-A"])
+            sh(git + ["-C", root, "commit", "-q", "--allow-empty", "-m", msg])
+            sh(git + ["-C", root, "push", "-q", origin, "main"])
+            sh(git + ["-C", root, "fetch", "-q", origin, "+main:refs/remotes/origin/main"])
+            return sh(["git", "-C", root, "rev-parse", "HEAD"])[1].strip()
+
+        sh(git + ["-C", root, "remote", "add", "origin", origin])
+        commit("the first thing")
+
+        def cmdline(*argv, **envx):
+            env = dict(env0, HOME=th, CC_ARCH_BIN=sbin, PATH=f"{sbin}:{env0.get('PATH', '')}", CC_SC_REC=rec)
+            for k in ("CC_NOTIFY_LOG_ONLY", "CC_ARCH_SOURCE", "CC_SC_SLACK_DOWN", "CC_SC_SLACK_HANG"):
+                env.pop(k, None)
+            env.update({k: v for k, v in envx.items() if v is not None})
+            return [sys.executable, os.path.realpath(__file__)] + list(argv), env
+
+        def run(*argv, **envx):
+            a, env = cmdline(*argv, **envx)
+            return subprocess.run(a, capture_output=True, text=True, env=env, timeout=300)
+
+        def said():
+            try:
+                return open(rec).read()
+            except OSError:
+                return ""
+
+        def cursor():
+            return read_cursor(f"{th}/.cc/state/arch/myrepo.cursor")
+
+        def pdfs():
+            d = f"{th}/.cc/state/arch"
+            return sorted(x for x in os.listdir(d) if x.endswith(".pdf")) if os.path.isdir(d) else []
+
+        # THE FIRST TURN NEVER ANSWERS FOR THE PAST.
+        head = sh(["git", "-C", root, "rev-parse", "refs/remotes/origin/main"])[1].strip()
+        r = run("landed", "myrepo")
+        ok("a first turn writes the cursor where the repo is and posts nothing — it never answers for the "
+           "history that landed before it existed",
+           r.returncode == 0 and cursor() == head and said() == "" and pdfs() == [])
+
+        # A LANDING THAT DECLARES NOTHING — and it is the one that rewrote the source, so a diff would have said yes.
+        sha = commit("the source, rewritten, saying nothing about it (#11)\n\nReflowed the overview. Nothing "
+                     "about the shape of the box changed.", touch="core/docs/autobox-overview.tex")
+        r = run("landed", "myrepo")
+        ok("a landing that declares nothing posts NOTHING — not even the one that rewrote the overview itself, "
+           "because what counts is declared and never read out of a diff",
+           r.returncode == 0 and "cc-slack" not in said() and pdfs() == [] and cursor() == sha)
+
+        # …AND ONE THAT DOES, read out of the commit that landed and nowhere else.
+        sha = commit("the steward takes the routine events (#12)\n\n* some prose first\n\n"
+                     "ARCHITECTURE: routine events go to a steward now\n\nmore prose")
+        r = run("landed", "myrepo")
+        up = [ln for ln in said().splitlines() if ln.startswith("cc-slack")]
+        built = pdfs()
+        ok("a landing that declares itself an architecture revision rebuilds the overview and puts the FILE in "
+           "the project's channel, once, saying what changed in the words the change used",
+           r.returncode == 0 and len(up) == 1 and "--file" in up[0] and "--to #myrepo" in up[0]
+           and "routine events go to a steward now" in up[0] and len(built) == 1 and cursor() == sha)
+        ok("…and what was sent is a real PDF with its fonts inside it — the check that runs before anything is sent",
+           bool(built) and verify(f"{th}/.cc/state/arch/{built[0]}") == "")
+
+        # THE LEDGER IS KEYED ON THE COMMIT, so winding the cursor back sends nothing.
+        write_new(f"{th}/.cc/state/arch/myrepo.cursor", head + "\n")
+        write_new(rec, "")
+        r = run("landed", "myrepo")
+        ok("a cursor wound all the way back re-reads the same revision and sends nothing: what the ledger keys "
+           "on is the commit that landed, which a rewind cannot change",
+           r.returncode == 0 and "cc-slack" not in said() and cursor() == sha
+           and f'"sha": "{sha}"' in open(f"{th}/.cc/state/arch/myrepo.posted").read())
+
+        # AN UPLOAD THAT COMES BACK FAILED IS STILL OWED; ONE THAT WAS NEVER ANSWERED IS NOT.
+        before = cursor()
+        commit("a second shape change (#13)\n\nARCHITECTURE: a second shape change")
+        write_new(rec, "")
+        r = run("landed", "myrepo", CC_SC_SLACK_DOWN="1")
+        ok("an upload that comes back saying it failed leaves the cursor where it was and is written down as "
+           "failed, so the revision is not silently lost",
+           r.returncode == 0 and cursor() == before
+           and '"to": "failed"' in open(f"{th}/.cc/state/arch/myrepo.posted").read())
+        r = run("landed", "myrepo")
+        ok("…and the next turn sends it", r.returncode == 0 and "--file" in said() and cursor() != before)
+
+        # A KILL BETWEEN THE INTENT AND THE UPLOAD SENDS ONCE, NOT TWICE.
+        before = cursor()
+        commit("a third shape change (#14)\n\nARCHITECTURE: a third shape change")
+        write_new(rec, "")
+        a, env = cmdline("landed", "myrepo", CC_SC_SLACK_HANG="1")
+        p = subprocess.Popen(a, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        end = time.time() + 60
+        while time.time() < end and "cc-slack" not in said():
+            time.sleep(0.1)
+        hung = "cc-slack" in said()
+        p.kill()
+        p.wait(timeout=30)
+        write_new(rec, "")
+        r = run("landed", "myrepo")
+        ok("a turn killed between writing down what it was about to send and the upload answering does NOT send "
+           "the same document again on the next turn — the intent is the record, not the answer",
+           hung and r.returncode == 0 and "cc-slack" not in said()
+           and '"to": "sending"' in open(f"{th}/.cc/state/arch/myrepo.posted").read())
+
+        # TWO TURNS AT ONCE ARE ONE TURN.
+        write_new(f"{th}/.cc/state/arch/myrepo.cursor", before + "\n")
+        write_new(f"{th}/.cc/state/arch/myrepo.posted", "")
+        write_new(rec, "")
+        held = open(f"{th}/.cc/state/arch/myrepo.lock", "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        r = run("landed", "myrepo")
+        quiet = r.returncode == 0 and "cc-slack" not in said() and cursor() == before
+        held.close()
+        r = run("landed", "myrepo")
+        ok("a turn that finds another already working on the repo adds nothing and leaves, and the one after it "
+           "sends — the cursor and the ledger are read and written across a build and an upload, and the owner "
+           "must not be handed the same document twice",
+           quiet and r.returncode == 0 and "--file" in said() and cursor() != before)
+
+        # THE SUITES' OWN SWITCH, HONOURED HERE TOO.
+        write_new(f"{th}/.cc/state/arch/myrepo.cursor", before + "\n")
+        write_new(f"{th}/.cc/state/arch/myrepo.posted", "")
+        write_new(rec, "")
+        r = run("landed", "myrepo", CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th}/notify.log")
+        ok("under CC_NOTIFY_LOG_ONLY the document is built and written down and cc-slack is never called at all, "
+           "so a suite that reaches this far still cannot put a file in a real channel",
+           r.returncode == 0 and "cc-slack" not in said()
+           and "#myrepo" in open(f"{th}/notify.log").read())
+
+        # A SOURCE THAT WILL NOT BUILD, AND ONE THAT TRIES TO READ THE BOX ON ITS WAY.
+        before = cursor()
+        write_new(f"{th}/.cc/state/arch/myrepo.posted", "")
+        write_new(rec, "")
+        open(f"{root}/core/docs/autobox-overview.tex", "w").write(
+            "\\documentclass{article}\n\\begin{document}\n\\undefinedcontrolsequencexyz\n\\end{document}\n")
+        commit("the overview no longer builds (#15)\n\nARCHITECTURE: y")
+        r = run("landed", "myrepo")
+        ok("a source that does not build sends nothing and moves nothing — the owner is never handed a document "
+           "this file could not make",
+           r.returncode == 0 and "cc-slack" not in said() and cursor() == before)
+        secret = f"{th}/secret.tex"
+        open(secret, "w").write("CANARYFROMOUTSIDETHEBUILD\n")
+        open(f"{root}/core/docs/autobox-overview.tex", "w").write(
+            TINY.replace("The shape of it.", "The shape of it. \\input{" + secret + "}"))
+        commit("the overview reads a file of the box's (#16)\n\nARCHITECTURE: z")
+        r = run("landed", "myrepo")
+        leaked = ""
+        for x in pdfs():
+            leaked += sh(["pdftotext", f"{th}/.cc/state/arch/{x}", "-"], timeout=60)[1]
+        ok("a landed source that reads a file from outside the build directory does not build, so nothing of "
+           "this box's can be carried into a document that is about to be uploaded",
+           r.returncode == 0 and "cc-slack" not in said() and cursor() == before
+           and "CANARYFROMOUTSIDETHEBUILD" not in leaked)
+        open(f"{root}/core/docs/autobox-overview.tex", "w").write(TINY)
+        commit("the overview builds again (#17)\n\nnothing declared here")
+        r = run("landed", "myrepo")
+        ok("…and once it builds, the revisions that were waiting go out together, in ONE message and one file",
+           r.returncode == 0 and len([ln for ln in said().splitlines() if ln.startswith("cc-slack")]) == 1
+           and "y; z" in said() and cursor() == sh(["git", "-C", root, "rev-parse", "HEAD"])[1].strip())
+
+        # A LINK PLANTED WHERE THE DOCUMENT GOES.
+        write_new(f"{th}/.cc/state/arch/myrepo.cursor", before + "\n")
+        write_new(f"{th}/.cc/state/arch/myrepo.posted", "")
+        write_new(rec, "")
+        open(f"{th}/outside", "w").write("untouched\n")
+        target = f"{th}/.cc/state/arch/autobox-overview-{time.strftime('%Y-%m-%d')}.pdf"
+        os.path.exists(target) and os.remove(target)
+        os.symlink(f"{th}/outside", target)
+        r = run("landed", "myrepo")
+        ok("a link planted at the path the document is written to is replaced, not followed — the file it named "
+           "is untouched and the document still goes out",
+           r.returncode == 0 and open(f"{th}/outside").read() == "untouched\n"
+           and not os.path.islink(target) and "--file" in said())
+
+        # THE REAL DOCUMENT. Its source is the deliverable, so a source that stopped building fails HERE and not
+        # on the morning the box has something to say. Built through the tool's own door in the fixture HOME —
+        # nothing of this box's state is written, and the copy under test is the one committed in this tree.
+        real = os.path.join(os.path.dirname(BIN), "docs/autobox-overview.tex")
+        if os.path.exists(real):
+            sh(git + ["-C", root, "checkout", "-q", "-B", "real"])
+            open(f"{root}/core/docs/autobox-overview.tex", "w").write(open(real).read())
+            sh(git + ["-C", root, "add", "-A"])
+            sh(git + ["-C", root, "commit", "-q", "-m", "the real overview"])
+            ref = sh(["git", "-C", root, "rev-parse", "HEAD"])[1].strip()
+            r = run("build", root, ref)
+            out = r.stdout.strip()
+            ok("THE OVERVIEW ITSELF builds with plain pdflatex and psnfss fonts, in paranoid file mode, and "
+               "passes the check that gates the send — the document is what this tool exists to deliver"
+               + (f" ({last(r.stderr, 160)})" if r.returncode else ""),
+               r.returncode == 0 and out.endswith(".pdf") and os.path.exists(out) and verify(out) == "")
+        else:
+            ok("the overview source sits next to this file, so its build is checked here", False)
+    finally:
+        shutil.rmtree(th, ignore_errors=True)
+    print(f"cc-arch selfcheck: {n - f} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
