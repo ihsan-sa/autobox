@@ -582,8 +582,8 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # Fail closed, and say what to mint.
   # This is the LAST wall: cc checks the same file on the host before it opens the window (member_credential), and tells
   # #<h> and the owner — a refusal here lands in a pane nobody reads (review-156d).
-  if ! { [ -s "$own" ] && jq -e '.claudeAiOauth.accessToken' "$own" >/dev/null 2>&1; }; then
-    why=missing; [ -e "$own" ] && why="present, but has no .claudeAiOauth.accessToken"
+  if ! cred_usable "$own"; then
+    why=$(cred_why "$own")
     echo "cc-sandbox: $h has no credential of its own ($own: $why) — a workspace never falls back to anyone else's. Mint one: cc-sandbox mint $h — it walks the login and installs what that login produced at $own, mode 600. Nothing starts here until then." >&2
     exit 2
   fi
@@ -647,10 +647,25 @@ owners_own(){   # $1 candidate credentials file · $2 the .claude.json that logi
     [ -n "$a" ] && [ "$a" = "$b" ] && { echo "that login signed in as the owner (same email address)"; return 0; }
   fi
   return 1; }
-mint_usable(){   # $1 a credentials file — THE test of "that login produced something installable", and the only one.
+cred_usable(){   # $1 a credentials file — THE test of "this credential can authenticate", and the only one.
   # mint asked it with jq and the trap that keeps a scratch asked it with -s, so a truncated or wrong-shaped file was
-  # kept and advertised with a --from line that could not work. Two callers, one answer, or they drift again.
-  [ -s "${1:-}" ] && jq -e '.claudeAiOauth.accessToken' "${1:-}" >/dev/null 2>&1; }
+  # kept and advertised with a --from line that could not work. Every wall in here answers it the same way, and so does
+  # the host's own (member_credential in cc), or they drift again.
+  # A BLANK TOKEN IS NOT A TOKEN. `jq -e '.claudeAiOauth.accessToken'` is TRUE for "" — only false and null are falsy in
+  # jq — and "" is exactly what claude leaves in the file when a refresh is refused: accessToken and refreshToken emptied
+  # in place, expiresAt 0, scopes and subscriptionType intact. So every wall waved it through and the session came up
+  # "Not logged in · Run /login" while the board said running and nobody was told (a member's sub-project session,
+  # 2026-09-08: hours alive, 0 context, injected messages never read). Require a non-empty STRING, so a token of the
+  # wrong type is no token either.
+  # This predicate sits OUTSIDE the slice member_v2.py digests (that one ends at CLAUDEBIN= above), so the freeze pin
+  # does not guard it. Its behaviour cases do: the blanked-credential case in selfcheck_member below, and the host
+  # wall's in tests/selftest.sh. Change the rule here and those go red, not the digest.
+  [ -s "${1:-}" ] && jq -e '.claudeAiOauth.accessToken | type == "string" and length > 0' "${1:-}" >/dev/null 2>&1; }
+cred_why(){   # $1 a credentials file that cred_usable refused — the half of the reason a person acts on
+  [ -e "${1:-}" ] || { echo missing; return; }
+  jq -e '.claudeAiOauth.accessToken == ""' "${1:-}" >/dev/null 2>&1 \
+    && { echo 'present, but its access token is EMPTY — that workspace was signed out (a refused refresh blanks the token in place), so it needs minting again'; return; }
+  echo 'present, but has no .claudeAiOauth.accessToken'; }
 MINT_SCRATCH=""; MINT_HANDLE=""; MINT_DEST=""   # the login's throwaway HOME while nothing has been installed from it yet
 mint_left_behind(){   # THE END THAT IS NOT AN INSTALL — on EXIT, however mint got there. The first real mint (2026-09-02)
   # ended here without this: claude was closed rather than quit, mint died with it between the login and the copy, and the
@@ -660,7 +675,7 @@ mint_left_behind(){   # THE END THAT IS NOT AN INSTALL — on EXIT, however mint
   # promise a --from that fails.
   local s="$MINT_SCRATCH"; MINT_SCRATCH=""
   [ -n "$s" ] || return 0
-  if mint_usable "$s/.claude/.credentials.json"; then
+  if cred_usable "$s/.claude/.credentials.json"; then
     echo "cc-sandbox: NOTHING WAS INSTALLED at $MINT_DEST. The login is still in $s — kept, so nobody has to log in twice." >&2
     echo "  Finish it: cc-sandbox mint $MINT_HANDLE --from $s/.claude/.credentials.json" >&2
     echo "  Then delete $s — it holds a working credential." >&2
@@ -694,8 +709,8 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
     src="$scratch/.claude/.credentials.json"; cj="$scratch/.claude.json"
   else cj="$(dirname "$(dirname "$src")")/.claude.json"   # a login writes .claude.json a level above its .claude/: if it is there, WHO logged in is checkable too
   fi
-  if ! mint_usable "$src"; then
-    why=missing; [ -e "$src" ] && why="no .claudeAiOauth.accessToken in it"
+  if ! cred_usable "$src"; then
+    why=$(cred_why "$src")
     echo "cc-sandbox: that login produced no credential ($src: $why) — nothing was written to $dest." >&2
     return 2; fi   # the EXIT trap deletes the scratch: there is no credential in it to leave anyone
   if why=$(owners_own "$src" "$cj"); then
@@ -710,7 +725,7 @@ mint(){   # $1 handle · [--from <file>] — INSTALL WHAT A LOGIN PRODUCED, and 
     rm -f "$own"; echo "cc-sandbox: could not write $dest — nothing was installed" >&2; return 2; fi
   # SAY IT INSTALLED ONLY AFTER READING BACK WHAT LANDED: the message below is the owner's only evidence, and the boundary
   # reads this exact file next. A dest that does not parse is a mint that installed nothing, and says so, non-zero.
-  if ! jq -e '.claudeAiOauth.accessToken' "$dest" >/dev/null 2>&1; then
+  if ! cred_usable "$dest"; then
     echo "cc-sandbox: $dest is not a credential the boundary can read — nothing was installed" >&2; return 2; fi
   if [ -n "$scratch" ]; then rm -rf "$scratch"; MINT_SCRATCH=""; trap - EXIT; fi   # installed: now there is nothing to keep
   # THE CHANNEL THAT WAS TOLD THE WALL IS TOLD IT IS GONE (owner, 2026-09-04). While there was no credential #<h> got
@@ -794,6 +809,15 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   mkdir -p "$(dirname "$own")" && echo '{"claudeAiOauth": {}}' > "$own" || return 1
   out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
   t 'member: a credential file without an access token is no credential — still no start' "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'has no .claudeAiOauth.accessToken' <<<"$out")" 2/0/1
+  # …AND NEITHER IS A BLANKED ONE. This exact file — accessToken and refreshToken emptied in place, expiresAt 0, the rest
+  # of a real credential intact — is what claude leaves behind when a refresh is refused, and `jq -e .accessToken` says
+  # true for "". So the wall passed it and a member's sub-project session sat for hours showing "Not logged in · Run
+  # /login" while its row said running (2026-09-08). It is a signed-out workspace, not an unminted
+  # one, and the refusal has to say which: only one of the two is a mint that never happened.
+  echo '{"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0, "subscriptionType": "max"}}' > "$own" || return 1
+  out=$("$SELF" member "$h" t -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'member: a credential BLANKED by a refused refresh is no credential either — no start, and the reason says signed out rather than unminted' \
+    "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'access token is EMPTY' <<<"$out")" 2/0/1
   # THE WORLD INSIDE, on a credential of its own (the fixture this needs, built here). Only booleans come back out — never a token.
   mine="mbr-only-access-$$"; miner="mbr-only-refresh-$$"
   { jq -n --arg a "$mine" --arg r "$miner" '{claudeAiOauth: {accessToken: $a, refreshToken: $r, expiresAt: 99999999999999}}' > "$own" && chmod 600 "$own"; } || return 1   # 600, as mint installs it

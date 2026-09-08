@@ -1034,6 +1034,24 @@ nocred alice >/dev/null; nocred alice >/dev/null
 [ "$(grep -c -- '^NOTIFY:' "$T/cap.args")" = 2 ] && [ ! -e "$GH/.cc/members/alice/credential-asked" ] \
   && ok "…and a page that failed leaves no day-stamp, so the next attempt pages again instead of inheriting silence" \
   || bad "a failed page kept its day-stamp (pages=$(grep -c -- '^NOTIFY:' "$T/cap.args"), stamp=$(cat "$GH/.cc/members/alice/credential-asked" 2>/dev/null))"
+# A BLANK CREDENTIAL IS NOT A CREDENTIAL (2026-09-08). This wall asked `jq -e '.claudeAiOauth.accessToken'`, which is TRUE
+# for "" — only false and null are falsy in jq — and "" is precisely what claude leaves in the file when a refresh is
+# refused: token and refresh token emptied in place, expiresAt 0, scopes and subscriptionType intact. So the file passed
+# both walls and a member's sub-project session started signed out: hours alive showing "Not logged in · Run /login",
+# the board row saying running, its channel unanswered, injected messages never read, and nobody told. A blanked
+# credential must refuse exactly as a missing one does, and NAME the blank: the fix is a re-mint, and nothing in the
+# old line said so.
+printf '#!/usr/bin/env bash\nprintf "NOTIFY: %%s\\n" "$*" >> "%s"\n' "$T/cap.args" > "$NB/cc-notify"; chmod +x "$NB/cc-notify"
+: > "$T/cap.args"; : > "$T/tmux.log"; rm -f "$GH/.cc/members/alice/credential-asked" "$GH/.cc/members/alice/credential-told"
+mkdir -p "$GH/.cc/members/alice"; echo '{"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0, "subscriptionType": "max"}}' > "$GH/.cc/members/alice/credentials.json"
+b1=$(nocred alice); rb1=$?; b2=$(nocred alice todo); rb2=$?; b3=$(nocred alice todo --go x); rb3=$?
+{ [ "$rb1" = 1 ] && [ "$rb2" = 1 ] && [ "$rb3" = 1 ] && ! grep -q 'new-window' "$T/tmux.log" \
+  && grep -q 'no credential of its own' <<<"$b1" && [ "$(printf '%s\n' "$b1" "$b2" "$b3" | grep -c 'access token is EMPTY')" = 3 ] \
+  && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] && [ ! -f "$GH/.cc/state/member-spend.json" ] \
+  && [ "$(grep -c -- '^NOTIFY: -t alice --owner -- .*needs a credential minted.*access token is EMPTY' "$T/cap.args")" = 1 ]; } \
+  && ok "a credential blanked by a refused refresh opens NO window either — session, track session and --go all refuse, the row stays queued, and the line the owner gets names the EMPTY token so he re-mints instead of hunting a live pane" \
+  || bad "a blanked credential still started a session (rc=$rb1/$rb2/$rb3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $b1"
+rm -f "$GH/.cc/members/alice/credentials.json" "$GH/.cc/members/alice/credential-asked" "$GH/.cc/members/alice/credential-told"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$mf" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "a marked cwd beats an inherited CC_ROLE=worker (a marker only tightens)" || bad "member marker downgraded by CC_ROLE=worker"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"cc r t --go x"},"cwd":"%s"}' "$GH" | env HOME="$GH" CC_GUARD_ASKS="$T/asks" CC_ROLE=member "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "CC_ROLE=member gates with no marker at all" || bad "CC_ROLE=member ignored"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$mf" | CC_ROLE=member env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing for a member too (no jq = no cwd = no marker walk)" || bad "member guard without jq"
