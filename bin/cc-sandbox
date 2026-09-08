@@ -2,6 +2,9 @@
 # cc-sandbox — a worker's `claude -p` inside bwrap: the box's secrets, the container and tmux sockets, the other tracks and
 # the control plane's source are ABSENT from the process's world, not denied by a regex (docs: design-worker-sandbox, stage 1a).
 #   cc-sandbox <repo> <track> -- <cmd...>   CC_WORKER_SANDBOX=1 → bwrap around <cmd>; anything else → exec <cmd> untouched
+#   cc-sandbox reconcile <repo> <track>     fold what the worker committed in its own branch namespace onto the host's
+#                                           refs/heads/track/<track> (compare-and-swap). cc-loop runs it after every
+#                                           iteration, before the checkpoint that pushes; a no-op if nothing moved.
 #   cc-sandbox selfcheck                    a scratch repo + worktree: the world inside is what this header says
 #   CC_MEMBER_V2=1 cc-sandbox member <workspace> <task> -- /absolute/command [args...]
 #     Opt-in task launcher; provision with cc-member-v2 first. Pipes or /dev/null only.
@@ -47,11 +50,14 @@
 #     and it prints what it changed, including a README it could not write. Refused, with the reason: the box's own
 #     control repo, a repo with git worktrees or live tracks, and a handle the box already answers to (#box, #approvals,
 #     #alerts, an -updates lane, a name in routes.json). Then `mint`; the Slack channel pair stays the daemon's.
-# INSIDE rw: the track worktree · FOUR PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
-#   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects, this track's own
-#   .git/worktrees/<n>, and refs/heads/track plus logs/refs/heads/track — the fixed directory `cc` puts every track
-#   branch in, never a name read from inside (`build` says why a directory and not the ref file, and why a tmpfs and
-#   not a read-only bind). So the worker commits on its own branch and the checkpoint pushes it, while
+# INSIDE rw: the track worktree · THREE PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
+#   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects apart from
+#   objects/pack, this track's own .git/worktrees/<n>, and — AT the fixed paths refs/heads/track and
+#   logs/refs/heads/track, but NOT the host's directories of that name — a per-track branch namespace of this track's
+#   OWN, holding its branch and no sibling's (`rstore`). What it commits there the host folds onto refs/heads/track/<track>
+#   afterwards, by compare-and-swap on that one constant name: `cc-sandbox reconcile <repo> <track>`, which cc-loop runs
+#   before its checkpoint and `build` runs again at the next launch, so an iteration killed in between is not lost.
+#   So the worker commits on its own branch and the checkpoint pushes it, while
 #   refs/heads/main, HEAD, the tags, the remotes, packed-refs, config, config.worktree, hooks and every OTHER track's
 #   git dir are read-only — as are the two files that say where THIS worktree's git dir and common dir are, the
 #   worktree's own .git and .git/worktrees/<n>/commondir, so the host's git can never be sent to a directory a worker
@@ -97,12 +103,21 @@
 #   ~/.cc/config — `STATUS: BLOCKED` in the journal is the escalation), cc --go (no tmux). And, since the ref store went
 #   read-only: `git tag` and `git stash`, neither of which a worker is launched to do. Commit, rebase, amend, reset,
 #   checkout and the checkpoint's own commit on its own branch all work, measured end to end. Missing a path? Add ONE bind line
-#   here, reviewable — never a wider one. Known cost, what is LEFT of it: the ref store is ro apart from the namespace the
-#   track's own branch sits in, so a worker can still move a SIBLING track's branch there, and .git/objects is rw so it
-#   can delete objects — the box's own work in progress, no longer its history. Both want a ref store the host
-#   reconciles, which is cc-loop's side of the line. And a relative core.hooksPath
-#   (this repo's core/.githooks) names tracked files the worker edits: cc-loop's host-side git runs the main checkout's copy
-#   instead, but `cc done` typed by hand on that worktree still merges with the worktree's — review the branch first.
+#   here, reviewable — never a wider one.
+# KNOWN COST, WHAT IS LEFT OF IT — ONE carve-out, ACCEPTED, and the selfcheck drives it rather than this line claiming it:
+#   .git/objects is rw, because every commit a worker makes writes one, so a LOOSE object it can also DELETE. Bounded,
+#   not open: objects/pack AND objects/info are ro on top, so the packed history — nearly all of a repo older than a
+#   day — cannot be deleted, an `alternates` cannot point the host's git at an object directory the worker named, and a
+#   planted `commit-graph` cannot break every host git call in the repo; and the branch a deletion could strand is its
+#   own (the namespace is per-track now). What is left is exactly the loose objects of the last hour. Closing that too
+#   wants a private object store the host merges back, and a merge that is even slightly incomplete leaves a branch
+#   pointing at objects that are not there, which is worse than the deletion it prevents. So it stays accepted.
+#   THE OTHER TWO ARE CLOSED, and each is one bind: a SIBLING track's branch (the namespace above), and re-pointing the
+#   host's git at a directory the worker wrote (the worktree's .git and the admin dir's commondir, both ro, below).
+#   AND ONE THAT IS NOT THIS FILE'S TO CLOSE: a relative core.hooksPath (this repo's core/.githooks) names TRACKED
+#   files the worker edits. cc-loop pins the main checkout's copy for its own host-side git, so the checkpoint and its
+#   push never run a hook a worker wrote — but `cc done` typed by hand on that worktree still merges with the
+#   worktree's. Review the branch before running it.
 set -uo pipefail
 H="$HOME"; SELF=$(readlink -f "$0")
 slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.claude/projects: every / and . becomes -
@@ -216,8 +231,71 @@ branch_warn(){   # $1 the track's own git dir → nothing bound and nothing deci
   local ref; ref=$(sed -n '1s/^ref: //p' "$1/HEAD" 2>/dev/null)
   case "$ref" in ""|"$NSD"/?*) return 0;; esac
   echo "cc-sandbox: this worktree is on '${ref#refs/heads/}', a branch outside $NSD — the ref store is read-only inside, so a commit on it will fail. Track branches are track/<track>." >&2; }
+# ── THE BRANCH NAMESPACE A WORKER WRITES IS ITS OWN COPY, AND THE HOST FOLDS IT FORWARD ─────────────────────────────
+# The rw bind used to be the host's own $NSD directory, which is the box's WHOLE track namespace: every other track's
+# branch sat in there with this one, so a worker could move a sibling's — measured, one `update-ref refs/heads/track/u`
+# from inside came back `moved` and the host's track/u really was on the worker's commit. The directory is the smallest
+# unit the files backend allows (a bind of the ref FILE makes the `<branch>.lock` rename onto it EBUSY and breaks every
+# commit), so the fix is not a narrower mount but a DIFFERENT directory: this track's own, holding its own ref and
+# nothing else. A sibling is not refused in there, it is ABSENT — there is no name to move.
+# WHY NOT ro-bind THE SIBLINGS INSTEAD, which is the obvious smaller change: a mount marks the DENTRY, not one mount
+# namespace, so a ro bind of refs/heads/track/u in THIS sandbox makes the sibling worker's own `rename(u.lock, u)`
+# return EBUSY in ITS sandbox. That does not wall the attacker off, it stops every other worker committing. Recorded
+# so the smaller-looking change is not tried again.
+# THE PRICE, AND WHO PAYS IT: what a worker commits is now in ITS OWN file, so the host's ref does not move until
+# something folds it forward — rs_fold, called by cc-loop after every iteration and again by `build` before the next
+# one starts, so an iteration killed between the two is folded at the next launch instead of being lost. Kill the LOOP
+# in that window and never relaunch the track, and the fold is `cc-sandbox reconcile <repo> <track>` by hand. Nothing is
+# lost while it waits: the commits are loose objects in the shared store from the moment they are written, `git gc`
+# leaves a loose object alone for two weeks, and the worktree's own logs/HEAD names them for longer than that.
+rstore(){ printf '%s' "$H/.cc/sandbox/$1/$2/refstore"; }   # beside the settings copy, and for the same reason: ~/.cc/sandbox is under no bind, so the source is not reachable from inside
+rs_fold(){   # $1 repo · $2 track → the private branch file becomes the host's ref, or it does not and this says why
+  # THE REF NAME IS THE CONSTANT $NSD/<track> FROM ARGV AND NOTHING ELSE. Not the worktree's HEAD, not a name found in
+  # the store: both live in trees the worker writes, and branch_warn is the note on what happened the one time a mount
+  # was chosen from one. So a worker that plants OTHER names in there moves nothing — they are counted and said out
+  # loud, never folded.
+  local dev="$H/dev/$1" rs ref="$NSD/$2" new base cur others rsr rf
+  rs=$(rstore "$1" "$2"); rsr=$(realpath -e "$rs/refs" 2>/dev/null) || return 0
+  # …AND IT IS READ FROM A REAL FILE INSIDE THE STORE, NEVER THROUGH A LINK. Every name BELOW $rs/refs is the worker's,
+  # because that directory is its rw bind: it can delete its own branch file and leave a symlink standing at the name.
+  # `[ -f ]` follows one and so does `<`, and they follow it OUT HERE — on the host, as the owner, with no namespace
+  # around them. Measured (review of #339): a link planted at that name made this function read a host file and print
+  # its bytes onto cc-loop's pane. So the leaf may not be a link, nothing on the way down to it may be one either
+  # (realpath resolves the lot, and the answer has to land back inside the store), and neither refusal repeats a byte.
+  if [ -L "$rs/refs/$2" ]; then
+    echo "cc-sandbox: $1/$2 left a symlink where its branch file goes — $ref was not moved, and what the link pointed at was not read." >&2; return 1; fi
+  rf=$(realpath -e "$rs/refs/$2" 2>/dev/null) || return 0
+  case "$rf" in "$rsr"/*) ;; *) echo "cc-sandbox: $1/$2's branch file resolves out of its own ref store — $ref was not moved, and nothing outside the store was read." >&2; return 1;; esac
+  [ -f "$rf" ] || return 0
+  new=$(tr -d ' \t\n' < "$rf"); base=$(cat "$rs/base" 2>/dev/null || true)
+  others=$(find "$rs/refs" ! -type d 2>/dev/null | grep -vxF "$rs/refs/$2" | wc -l)   # ! -type d rather than -type f: a link left beside it is a name of its own too, and -type f cannot see one
+  [ "$others" = 0 ] || echo "cc-sandbox: $1/$2 left $others branch name(s) of its own in its private ref store — ignored; the host folds $ref and no other name." >&2
+  # WHAT IT LEFT IS DESCRIBED, NOT REPEATED. Printing it is how the link above turned a read into a leak on cc-loop's
+  # pane, so a shape that is not a commit id is answered with its length and a hash of it and nothing else.
+  case "$new" in ''|*[!0-9a-f]*) echo "cc-sandbox: $1/$2 left ${#new} byte(s) that are not a commit id where one goes (sha256 $(printf '%s' "$new" | sha256sum | cut -c1-12)) — $ref was not moved, and what it left is not repeated here." >&2; return 1;; esac
+  git -C "$dev" cat-file -e "$new^{commit}" 2>/dev/null || { echo "cc-sandbox: $1/$2 left $new, which is no commit in $1 — $ref was not moved." >&2; return 1; }
+  cur=$(git -C "$dev" rev-parse -q --verify "$ref" 2>/dev/null || true)
+  [ "$new" = "$cur" ] && { rm -f "$rs/refs/$2" "$rs/base"; return 0; }
+  # COMPARE AND SWAP against where the branch stood when this run was SEEDED, so a fold never overwrites a move the
+  # host itself made meanwhile (a rebase by hand, `cc done`). An empty base is git's "this ref must not exist".
+  # hooksPath OFF for it: `update-ref` fires the `reference-transaction` hook, and this fold is plumbing the host runs
+  # on a worker's say-so. The main checkout's own hooks are not a worker's to write, so this is the belt to that brace.
+  if git -C "$dev" -c core.hooksPath=/dev/null update-ref -m "cc-sandbox: $2" "$ref" "$new" "$base" 2>/dev/null; then rm -f "$rs/refs/$2" "$rs/base"; return 0; fi
+  echo "cc-sandbox: $ref moved to ${cur:-nothing} while $2 was running, so its own $new was not folded in and nothing was overwritten. The commits are in the object store — recover by pointing $ref at $new in ~/dev/$1." >&2
+  return 1; }
+rs_seed(){   # $1 repo · $2 track → a private $NSD holding this track's own ref and its reflog, and nothing else
+  local dev="$H/dev/$1" rs cur; rs=$(rstore "$1" "$2")
+  # A FOLD THAT COULD NOT HAPPEN IS NOT DISCARDED: the store is moved aside under a name that says so, and the launch
+  # goes on. Wiping it here would throw away the one file naming the commits the last run made.
+  rs_fold "$1" "$2" || mv "$rs" "$rs.unfolded.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null
+  rm -rf "$rs"; mkdir -p "$rs/refs/$(dirname "./$2")" "$rs/logs/$(dirname "./$2")" || return 1
+  cur=$(git -C "$dev" rev-parse -q --verify "$NSD/$2" 2>/dev/null || true)
+  printf '%s' "$cur" > "$rs/base"                                  # where the branch stood: the fold's expected-old
+  [ -n "$cur" ] && printf '%s\n' "$cur" > "$rs/refs/$2"            # …and an unborn branch seeds nothing, as git leaves it
+  [ -f "$dev/.git/logs/$NSD/$2" ] && cp "$dev/.git/logs/$NSD/$2" "$rs/logs/$2"   # its own reflog, so an amend inside has something to walk back to
+  return 0; }
 build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the rw targets that may not exist yet are created
-  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f gd
+  local dev="$H/dev/$1" wt="$H/.cc/worktrees/$1/$2" st="$H/.cc/state/$1/$2" proj mem cb f gd rs
   proj="$H/.claude/projects/$(slug "$wt")"; mem="$H/.claude/projects/$(slug "$dev")/memory"
   mkdir -p "$proj" "$mem" "$H/.npm" "$H/.cache" "$H/.cc/boards" "$st"
   B=(--die-with-parent --unshare-pid
@@ -241,20 +319,23 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # ORDER IS MOUNT ORDER: $H is a tmpfs above, so every path under it is pinned after that line, `.git` before what
   # sits in it.
   pinq --bind "$wt"
-  # THE PARENT .git IS THE HOST'S, AND THE WORKER WRITES FOUR PLACES IN IT. It used to be bound rw whole, which handed
+  # THE PARENT .git IS THE HOST'S, AND THE WORKER WRITES THREE PLACES IN IT. It used to be bound rw whole, which handed
   # every worker the box's entire ref store; measured on this file before the change, one `sh -c` inside moved
   # refs/heads/main, deleted a sibling track's branch, repointed the main checkout's HEAD, truncated packed-refs and
   # left `core.hooksPath = /tmp/evil` in the host's .git/config.worktree for its own git to run. None of that is work a
   # worker is launched to do. So the worker's `.git` is A TMPFS OF ITS OWN holding nothing but mountpoints of the real
-  # one, and only these four are mounted rw, in mount order:
-  #   objects/           the objects it commits (the Stop hook commits INSIDE the boundary; cc-loop pushes outside)
+  # one, and only these three are mounted rw, in mount order:
+  #   objects/           the objects it commits (the Stop hook commits INSIDE the boundary; cc-loop pushes outside) —
+  #                      APART FROM objects/pack, ro on top: a commit only ever writes a loose object, so nothing a
+  #                      worker is launched to do needs the packed history writable.
   #   worktrees/<n>/     ITS OWN per-worktree git dir — HEAD, index, logs/HEAD, a rebase in progress. Every OTHER
   #                      track's is ro now, and was not.
-  #   refs/heads/track/ and logs/refs/heads/track/  the DIRECTORY track branches live in, not the ref file: the files
-  #                      backend creates `<branch>.lock` beside the ref and renames it over, and a rename onto a bound
-  #                      FILE is EBUSY, so a bind of the ref itself would break every commit. The directory is the
-  #                      CONSTANT $NSD and refs/heads/main is not in it. It is not derived from the worktree's HEAD or
-  #                      from anything else the worker writes — see branch_warn for what happened when it was.
+  #   refs/heads/track/ and logs/refs/heads/track/  a DIRECTORY, not the ref file: the files backend creates
+  #                      `<branch>.lock` beside the ref and renames it over, and a rename onto a bound FILE is EBUSY,
+  #                      so a bind of the ref itself would break every commit. The PATH is the CONSTANT $NSD, and
+  #                      refs/heads/main is not in it; the DIRECTORY behind it is this track's own (rstore), so no
+  #                      sibling's branch is in it either. Neither is derived from the worktree's HEAD or from anything
+  #                      else the worker writes — see branch_warn for what happened when it was.
   # WHY A TMPFS AND NOT A READ-ONLY BIND OF .git, WHICH IS WHAT THIS WAS FIRST: `git commit` clears MERGE_HEAD and
   # CHERRY_PICK_HEAD, and the files backend takes $GIT_COMMON_DIR/packed-refs.lock for that DELETE. With the directory
   # itself ro it could not, said `error: Unable to create …/packed-refs.lock: Read-only file system`, and left
@@ -262,23 +343,37 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # (measured, on a rebase-then-commit-then-amend the box does every day). A lock file needs a writable DIRECTORY, and
   # this gives it one that is the worker's own: a name the real `.git` does not already have is the worker's to create
   # and NOTHING the host reads, so the wall is deny-by-default — only what is bound below exists in there at all.
-  # WHAT IT STILL LEAVES, plainly and measured: inside that ONE namespace a worker can move a sibling track's branch and
-  # make or delete a loose ref (a sibling still in packed-refs it can move by shadowing, but not delete — that would
-  # rewrite packed-refs, which is ro); and objects/ is rw, so it can delete objects. Both are the box's work in
-  # progress, not its history: refs/heads/main, HEAD, the tags, the remotes, packed-refs, config, config.worktree,
-  # hooks, every branch outside the namespace and every other track's git dir are out of reach, and the selfcheck
-  # drives each one. Closing the last two wants a ref store the host reconciles — cc-loop's side of the line, not this
-  # file's.
+  # WHAT IT STILL LEAVES, plainly and measured: ONE thing, and it is objects/. A loose object a worker writes it can
+  # also delete — the work in progress it has not pushed, and nothing else, because objects/pack is ro on top and every
+  # branch but its own is now out of the namespace it writes. refs/heads/main, HEAD, the tags, the remotes,
+  # packed-refs, config, config.worktree, hooks, every sibling track's branch and every other track's git dir are all
+  # out of reach, and the selfcheck drives each one, the carve-out included.
   B+=(--tmpfs "$dev/.git")
   # …and hooks is MADE here rather than tested for, so its bind is unconditional. `[ -d ] &&` was a name test that
   # skipped quietly: a repo without the directory left the name free for a worker to take, and the next launch bound
   # whatever it found there — or, the link spelling, refused to start with a bwrap message naming neither cause nor cure.
   # …and so are the two rw ref directories, for the same reason and BEFORE the enumeration below, so that `refs` and
   # `logs` are always among the names it walls off and the rw binds land ON TOP of a ro mount rather than beside a gap.
-  mkdir -p "$dev/.git/hooks" "$dev/.git/$NSD" "$dev/.git/logs/$NSD" 2>/dev/null   # the host's checkpoint runs hooks: none of them may be the worker's
+  mkdir -p "$dev/.git/hooks" "$dev/.git/objects/pack" "$dev/.git/objects/info" "$dev/.git/$NSD" "$dev/.git/logs/$NSD" 2>/dev/null   # the host's checkpoint runs hooks: none of them may be the worker's
   for f in "$dev"/.git/* "$dev"/.git/.[!.]*; do   # every entry the real .git HAS, ro; the three rw ones are mounted over it below
     [ -e "$f" ] || continue                        # config, hooks, HEAD, packed-refs, index, info, refs, logs, worktrees…
     case "${f##*/}" in objects) pinq --bind "$f";; *) pinq --ro-bind "$f";; esac; done
+  # …AND objects/pack RO ON TOP OF IT. A worker has to WRITE objects — every commit it makes is one — but it never has
+  # to write a PACK: `git commit`, `rebase` and `amend` only ever write loose objects, and the two commands that do
+  # write packs are already impossible in here (`fetch` and `push`, no credential). So the repository's packed history —
+  # which is what `git gc` has already folded away, and the bulk of every repo the box has had for more than a day —
+  # stops being deletable, while ordinary work is untouched. It does NOT close the objects carve-out: loose objects,
+  # this worker's own and any a sibling wrote in the last hour, are still deletable, and that is written down at
+  # "Known cost" in the header rather than implied away here. Pinned, because objects/ is a tree the worker writes; and
+  # MADE above rather than tested for, on the same rule as hooks — a name test that skips quietly leaves the name free.
+  pinq --ro-bind "$dev/.git/objects/pack"
+  # …AND objects/info WITH IT, for a reason that is not deletion at all. `alternates` in there names another directory
+  # the host's git then reads objects FROM, and `commit-graph` is a file every host git call in the repo parses.
+  # Measured (review of #339): an alternates file written inside outlived the sandbox and the host's git read from a
+  # directory the worker had named; a planted commit-graph made every host git call in ~/dev/<repo> error. Neither is
+  # anything a worker has to write — git writes both in gc and repack, and neither can run in here — so the directory
+  # is ro whole. Made above rather than tested for, on the same rule as hooks: a name test that skips leaves the name.
+  pinq --ro-bind "$dev/.git/objects/info"
   gd=$(track_gitdir "$dev" "$wt") || { echo "cc-sandbox: $wt is not a linked worktree of $dev/.git — its .git and the git dir it names do not agree. Nothing was bound and nothing started." >&2; exit 2; }
   pinq --bind "$gd"
   # …AND THE TWO REDIRECT FILES OUT OF IT, ro. $gd is rw — the worker's own HEAD, index and rebase state live in it —
@@ -290,7 +385,11 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   # review-156b). Unconditional: git writes both when it creates a linked worktree, so an absent one is a name free for
   # a worker to take and the launch should refuse rather than bind whatever is there next time.
   pinq --ro-bind "$wt/.git"; pinq --ro-bind "$gd/commondir"
-  pinq --bind "$dev/.git/$NSD"; pinq --bind "$dev/.git/logs/$NSD"   # a constant, not a name anything inside supplies
+  # …AND THE BRANCH NAMESPACE IS THIS TRACK'S OWN COPY OF IT, not the host's directory (rstore, above). The DEST is the
+  # constant $NSD, never a name anything inside supplies; the SOURCE is under ~/.cc/sandbox, which no bind here reaches,
+  # so it needs no pin — a name a worker cannot reach is not a name it can swap.
+  rs=$(rstore "$1" "$2"); rs_seed "$1" "$2" || { echo "cc-sandbox: could not build $1/$2's own branch namespace under $rs — nothing was bound and nothing started." >&2; exit 2; }
+  B+=(--bind "$rs/refs" "$dev/.git/$NSD" --bind "$rs/logs" "$dev/.git/logs/$NSD")
   branch_warn "$gd"   # AFTER the binds and changing none of them: a diagnostic, never an input
   pinq --bind "$st"; pinq --bind "$proj"; pinq --bind "$mem"
   B+=(--ro-bind "$H/.cc/boards" "$H/.cc/boards" --bind "$H/.npm" "$H/.npm" --bind "$H/.cache" "$H/.cache"
@@ -1188,7 +1287,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
   rm -rf "${fh:?}"; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
-  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out want rc c m0 t0 hd
+  local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out out2 want rc c m0 t0 u0 hd held rsd rsd2 sec
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
   t(){ n=$((n+1)); [ "$2" = "$3" ] && return 0; bad=$((bad+1)); printf 'FAIL %s: got %s, want %s\n' "$1" "$2" "$3"; }
   g(){ sed -n "s/^$1=//p" <<<"$out" | head -1; }
@@ -1205,6 +1304,8 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # sets CHERRY_PICK_HEAD, and clearing that is what needs a writable .git directory (build).
   git -C "$dev" -c user.name=t -c user.email=t@t commit -q --allow-empty -m 'main moves on' || return 1
   m0=$(git -C "$dev" rev-parse main); t0=$(git -C "$dev" rev-parse track/t)   # where main and the track's own branch stand before a worker runs
+  u0=$(git -C "$dev" rev-parse track/u)   # …and the SIBLING track's, which nothing a worker does may move
+  git -C "$dev" repack -a -d -q   # …and a real repo's OBJECTS are packed too: this puts a pack under the ro bind inside, which is what the two pack cases below drive
   git -C "$dev" pack-refs --all   # a real repo's refs are PACKED: it puts a packed-refs file under the ro bind, and leaves
   # refs/heads/main with no loose file at all — so `no loose ref can be planted` below is the shadowing attack, not a rewrite
   # a MEMBER's board beside it, as board_dir leaves one: the file and lock in ~/.cc/members/<h>/board/, ~/.cc/boards/<h>.json and .lock links to them
@@ -1243,6 +1344,22 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     echo packedx=$( (git -C $p update-ref -d refs/heads/track/x) 2>/dev/null && echo deleted || echo refused)   # PACKED: deleting it needs packed-refs, which is ro
     echo newns=$( (git -C $p update-ref refs/heads/track/planted "$mine") 2>/dev/null && echo made || echo refused)
     echo delns=$( (git -C $p update-ref -d refs/heads/track/planted) 2>/dev/null && echo deleted || echo refused)   # …a loose one it made itself does go
+    # THE OBJECT STORE, BOTH HALVES. A worker must be able to WRITE objects, so a loose one it makes it can also
+    # delete — the carve-out. What it may not delete is the PACKED history, which is where a repo older than a day
+    # keeps nearly all of itself. A throwaway of its own is the delete target, so this case cannot cost any later one
+    # the commit it reads.
+    ob=$(printf throwaway | git -C $p hash-object -w --stdin 2>/dev/null)
+    op=$d/objects/$(echo "$ob" | cut -c1-2)/$(echo "$ob" | cut -c3-)
+    echo madeloose=$([ -f "$op" ] && echo yes || echo no)
+    echo delloose=$( (rm -f "$op") 2>/dev/null && echo deleted || echo refused)
+    echo packn=$(ls $d/objects/pack/ 2>/dev/null | grep -c "[.]pack$")
+    echo delpack=$( (rm -f $d/objects/pack/*.pack) 2>/dev/null && echo deleted || echo refused)
+    echo mvpack=$( (mv $d/objects/pack $d/objects/packx) 2>/dev/null && echo moved || echo pinned)
+    echo packn2=$(ls $d/objects/pack/ 2>/dev/null | grep -c "[.]pack$")
+    # …and objects/info, which is not about deleting anything: `alternates` names a directory the HOST'"'"'s git then reads
+    # objects from, and a bogus `commit-graph` is parsed by every host git call in the repo.
+    echo alternates=$( (mkdir -p $d/objects/info; printf "%s\n" $p/plantedobjects > $d/objects/info/alternates) 2>/dev/null && echo wrote || echo refused)
+    echo cgraph=$( (printf notagraph > $d/objects/info/commit-graph) 2>/dev/null && echo wrote || echo refused)
     # THE TWO REDIRECT FILES: where the host'"'"'s own git is TOLD this worktree'"'"'s git dir and common dir are. Both sit in a
     # tree the worker writes, and both still resolve for the worker'"'"'s own git — so each is read here as well as written.
     # `resolves` FIRST, because with the pins gone the writes below make every later git call in this cwd resolve into
@@ -1252,6 +1369,8 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
     echo commondir=$( (printf "/tmp/evil\n" > $d/worktrees/t/commondir) 2>/dev/null && echo wrote || echo refused)
     echo newname=$( (printf x > $d/shallow) 2>/dev/null && echo wrote || echo refused)   # LAST: a bogus shallow file breaks every git call after it
     echo gitconfig=$(git config user.name z 2>/dev/null && echo writable || echo ro); echo bin=$(touch ~/bin/x 2>/dev/null && echo writable || echo ro)
+    echo nsdls=$(ls -A ~/dev/'"$r"'/.git/refs/heads/track 2>/dev/null | tr "\n" " ")   # the branch namespace, from inside: this track only, no sibling to move
+    echo sbxdir=$([ -e ~/.cc/sandbox ] && echo present || echo absent)                # …and the host dir that namespace is a copy of is not in here at all
     echo tracks=$(ls ~/.cc/worktrees/'"$r"' | tr "\n" " "); echo states=$(ls ~/.cc/state/'"$r"' | tr "\n" " "); echo dev=$(ls -A ~/dev/'"$r"' | tr "\n" " ")
     echo tok=${CLAUDE_CODE_OAUTH_TOKEN:+set}; echo cj=$(jq -r "(.projects|length),(.mcpServers|length)" ~/.claude.json | tr "\n" ","); echo cjkeys=$(jq -r "keys|join(\",\")" ~/.claude.json); echo settings=$(touch ~/.claude/settings.json 2>/dev/null && echo writable || echo ro)
     echo tmp=$(touch /tmp/x && echo ok); echo runuser=$(ls -A /run/user/$(id -u) 2>/dev/null | wc -l)
@@ -1314,15 +1433,96 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   # checkpoint outside has something to push. A wall that costs the worker its branch is worse than the hole.
   # `mine` alone would be green with no commit at all — HEAD and track/t agree either way — so the branch is also read
   # against where IT started, t0, not against main. Drop the rw bind of the ref directory and this goes red on that field.
-  t 'the commit the worker made inside is on the host'"'"'s own track/t with a reflog entry, and the branch really advanced' \
-    "$(git -C "$dev" rev-parse refs/heads/track/t)/$(git -C "$dev" reflog show track/t --format=%H 2>/dev/null | head -1)/$([ "$(git -C "$dev" rev-parse refs/heads/track/t)" = "$t0" ] && echo stuck || echo advanced)" \
-    "$(g mine)/$(g mine)/advanced"
-  # THE LIMIT OF THIS WALL, MEASURED RATHER THAN CLAIMED: the branch ref directory is the smallest writable unit the
-  # files backend allows (a bind of the ref FILE makes the rename onto it EBUSY and breaks every commit), so inside
-  # its own namespace — refs/heads/track — a worker can still move a sibling track's branch. Closing that wants a ref
-  # store the host reconciles, which is cc-loop's side of the line. This case says so out loud.
-  t 'still reachable, and this says so: inside its own refs/heads/track namespace a worker moves a sibling, and makes and deletes a loose ref' \
-    "$(g sibling)/$(git -C "$dev" rev-parse refs/heads/track/u)/$(g newns)/$(g delns)" "moved/$(g mine)/made/deleted"
+  # …and it lands through the FOLD, which is the line cc-loop runs before its checkpoint. Both halves are read, in
+  # order: while the worker runs the host's branch has not moved (the namespace inside is this track's own copy), and
+  # after `cc-sandbox reconcile` it is on the worker's commit with a reflog entry for it. Drop the reconcile call from
+  # cc-loop and the third field below goes `stuck` — which is the whole risk this design carries, so it is a case.
+  held=$(git -C "$dev" rev-parse refs/heads/track/t)
+  "$SELF" reconcile "$r" t 2>/dev/null
+  t 'the host'"'"'s track/t does not move while the worker runs, and cc-loop'"'"'s fold is what puts the commit on it' \
+    "$([ "$held" = "$t0" ] && echo held || echo moved)/$(git -C "$dev" rev-parse refs/heads/track/t)/$([ "$(git -C "$dev" rev-parse refs/heads/track/t)" = "$t0" ] && echo stuck || echo advanced)" \
+    "held/$(g mine)/advanced"
+  t '…with a reflog entry on the host'"'"'s own branch, so the checkpoint has a history to push' \
+    "$(git -C "$dev" reflog show track/t --format=%H 2>/dev/null | head -1)" "$(g mine)"
+  # A SIBLING TRACK'S BRANCH, WHICH USED TO BE REACHABLE AND IS NOT (rstore). Driven both ways in one case: the write
+  # inside still REPORTS success, because refs/heads/track in there is this track's own directory and `track/u` is a
+  # name the worker made in it — and the host's track/u is exactly where the fixture left it. Turn the two --bind lines
+  # in `build` back into `pinq --bind "$dev/.git/$NSD"` and the second field becomes the worker's own commit.
+  t 'a sibling track'"'"'s branch cannot be moved: the write lands in this track'"'"'s own namespace and the host'"'"'s track/u never moves' \
+    "$(g sibling)/$(git -C "$dev" rev-parse refs/heads/track/u)/$([ "$(git -C "$dev" rev-parse refs/heads/track/u)" = "$u0" ] && echo untouched || echo moved)" \
+    "moved/$u0/untouched"
+  t '…and the namespace inside holds this track and what the worker itself put there, while the host'"'"'s holds only the folded branch' \
+    "$(g nsdls)/$(g sbxdir)/$(ls -A "$dev/.git/$NSD" 2>/dev/null | tr '\n' ' ')" 't u/absent/t '
+  t '…so a loose ref made inside is made and deleted inside, and reaches the host'"'"'s ref store nowhere' \
+    "$(g newns)/$(g delns)" made/deleted
+  # THE FOLD ITSELF, DRIVEN. It moves the ONE constant name from argv and no other, whatever a worker leaves beside it;
+  # and it is a compare-and-swap, so a branch the host moved while the worker ran keeps the host's move and the worker's
+  # commit is named in the refusal rather than thrown away.
+  # Each of the two builds the store it reads — the ref it asks the fold to move FROM is read here, not inherited from
+  # whatever the case above happened to leave, so neither passes because of the other.
+  rsd=$(rstore "$r" t); mkdir -p "$rsd/refs"
+  hd=$(git -C "$dev" rev-parse refs/heads/track/t)   # where the branch stands NOW: this store's honest base
+  printf '%s\n' "$m0" > "$rsd/refs/u"; printf '%s\n' "$m0" > "$rsd/refs/t"; printf '%s' "$hd" > "$rsd/base"
+  "$SELF" reconcile "$r" t 2>/dev/null
+  t 'the fold moves refs/heads/track/<track> and no other name a worker leaves in its own store' \
+    "$(git -C "$dev" rev-parse refs/heads/track/t)/$(git -C "$dev" rev-parse refs/heads/track/u)" "$m0/$u0"
+  # …and now a base that is deliberately NOT where the branch stands, which is what a host-side move during the run looks like
+  hd=$(git -C "$dev" rev-parse refs/heads/track/t)
+  printf '%s\n' "$(g mine)" > "$rsd/refs/t"; printf '%s' "$t0" > "$rsd/base"
+  out2=$("$SELF" reconcile "$r" t 2>&1); rc=$?
+  t 'a fold whose branch moved on the host meanwhile overwrites nothing, exits non-zero, and names the commit to recover' \
+    "$rc/$([ "$t0" = "$hd" ] && echo same-base || echo stale-base)/$(git -C "$dev" rev-parse refs/heads/track/t)/$(grep -c "$(g mine)" <<<"$out2")" \
+    "1/stale-base/$hd/1"
+  # A LINK WHERE THE BRANCH FILE GOES — the one that leaked. Everything under the store's refs/ is the worker's, so it
+  # can delete its own ref file and leave a symlink at that name; `[ -f ]` and `<` both follow it, out here, as the
+  # owner. Measured before the fix: the fold read a host file through the link and printed its bytes onto cc-loop's
+  # pane. Two shapes, refused by two different lines — the link AT the leaf, and a link on the way DOWN to it — and
+  # both are read against the planted secret's own bytes rather than against an exit code.
+  sec="TOKENthatmustnotbeprinted$$"; printf '%s\n' "$sec" > "$H/.cc/state/$r/b"
+  hd=$(git -C "$dev" rev-parse refs/heads/track/t)
+  rm -f "$rsd/refs/t"; ln -sfn "$H/.cc/state/$r/b" "$rsd/refs/t"; printf '%s' "$t0" > "$rsd/base"
+  out2=$("$SELF" reconcile "$r" t 2>&1); rc=$?
+  t 'a symlink left where the branch file goes is refused, what it pointed at is never read out, and the branch does not move' \
+    "$rc/$(grep -c "$sec" <<<"$out2")/$(grep -c 'left a symlink' <<<"$out2")/$(git -C "$dev" rev-parse refs/heads/track/t)" "1/0/1/$hd"
+  rm -f "$rsd/refs/t"
+  # …and the same reached through a DIRECTORY link, where the leaf itself is an ordinary file: a track name with a
+  # component in it, and that component a link out of the store. `[ -L ]` on the leaf is false here — the confinement
+  # is what refuses it.
+  rsd2=$(rstore "$r" a/b); mkdir -p "$rsd2/refs"; ln -sfn "$H/.cc/state/$r" "$rsd2/refs/a"; printf '%s' "$t0" > "$rsd2/base"
+  out2=$("$SELF" reconcile "$r" a/b 2>&1); rc=$?
+  t '…and a link on the WAY to the branch file is refused too: the leaf is a plain file, but it resolves out of the store' \
+    "$rc/$(grep -c "$sec" <<<"$out2")/$(grep -c 'resolves out of its own ref store' <<<"$out2")" 1/0/1
+  rm -rf "$rsd2"
+  # WHAT THE FILE HOLDS IS DESCRIBED, NOT REPEATED — the second half of the same leak: a worker can put anything in
+  # there, so the refusal answers with a length and a hash. Then the id that is well formed and is no commit here.
+  printf '%s\n' "$sec" > "$rsd/refs/t"; printf '%s' "$t0" > "$rsd/base"
+  out2=$("$SELF" reconcile "$r" t 2>&1); rc=$?
+  t 'what is not a commit id is refused by its shape, and the refusal says how long it was and never what it said' \
+    "$rc/$(grep -c "$sec" <<<"$out2")/$(grep -c 'not a commit id' <<<"$out2")/$(git -C "$dev" rev-parse refs/heads/track/t)" "1/0/1/$hd"
+  printf '%s\n' 0000000000000000000000000000000000000001 > "$rsd/refs/t"; printf '%s' "$t0" > "$rsd/base"
+  out2=$("$SELF" reconcile "$r" t 2>&1); rc=$?
+  t '…and an id that is well formed but is no commit in the repo is refused before update-ref is ever asked' \
+    "$rc/$(grep -c 'which is no commit' <<<"$out2")/$(git -C "$dev" rev-parse refs/heads/track/t)" "1/1/$hd"
+  # A FOLD THAT COULD NOT HAPPEN IS NOT THROWN AWAY (rs_seed). The store is still unfoldable from the case above, so
+  # the NEXT launch moves it aside under a name that says so and seeds a fresh one, rather than wiping the one file
+  # naming the commits the last run made. A real launch, because rs_seed is what `build` calls.
+  rm -rf "$rsd".unfolded.*
+  out2=$(CC_WORKER_SANDBOX=1 "$SELF" "$r" t -- sh -c 'echo STARTED' 2>&1)   # out2, never out: every object-store case below still reads the FIRST probe through `g`
+  t 'a store that could not be folded is moved aside and kept, and the launch goes on with a freshly seeded one' \
+    "$(grep -c STARTED <<<"$out2")/$(cat "$rsd".unfolded.*/refs/t 2>/dev/null)/$(cat "$rsd/refs/t" 2>/dev/null)" \
+    "1/0000000000000000000000000000000000000001/$(git -C "$dev" rev-parse refs/heads/track/t)"
+  rm -rf "$rsd".unfolded.*
+  # THE OBJECT STORE: WHAT IS CLOSED AND WHAT IS ACCEPTED, each read against the other rather than one of them claimed.
+  # objects/ is rw because every commit a worker makes writes one, so a LOOSE object it can delete and this says so.
+  # objects/pack is ro on top, so the packed history cannot be deleted and the directory cannot be walked away from —
+  # remove that one bind and delpack comes back `deleted` with the host's pack really gone.
+  t 'the packed history cannot be deleted or renamed away, and every pack is still there afterwards' \
+    "$(g packn)/$(g delpack)/$(g mvpack)/$(g packn2)/$(shopt -s nullglob; set -- "$dev"/.git/objects/pack/*.pack; echo $#)" 1/refused/pinned/1/1
+  t 'objects/info is ro too — no alternates to point the host'"'"'s git at an object directory a worker named, and no commit-graph to break every host git call in the repo' \
+    "$(g alternates)/$(g cgraph)/$([ -e "$dev/.git/objects/info/alternates" ] && echo left || echo none)/$([ -e "$dev/.git/objects/info/commit-graph" ] && echo left || echo none)/$(git -C "$dev" rev-parse main)" \
+    "refused/refused/none/none/$m0"
+  t 'accepted, and driven rather than asserted: a LOOSE object a worker writes it can also delete — the objects it has not pushed yet, and no more' \
+    "$(g madeloose)/$(g delloose)" yes/deleted
   t '…but a PACKED sibling it cannot delete, because that would rewrite packed-refs' \
     "$(g packedx)/$(git -C "$dev" rev-parse -q --verify refs/heads/track/x >/dev/null && echo alive || echo gone)" refused/alive
   t 'only this track is there' "$(g tracks)" t;  t 'only this track state' "$(g states)" t;  t 'the rest of the repo is gone' "$(g dev)" .git
@@ -1422,6 +1622,8 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
 case "${1:-}" in selfcheck) selfcheck; exit $?;;
   __settings-copy) settings_copy; exit $?;;   # private host-side reuse of the exact legacy merge
+  reconcile) [ $# -eq 3 ] || { echo "usage: cc-sandbox reconcile <repo> <track>" >&2; exit 2; }
+             rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
   mint) shift; mint "$@"; exit $?;;
   convert) shift; convert "${1:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ]; then tr="${1:-}"; shift; fi; [ "${1:-}" = -- ] && shift   # <handle> [<track>|""] [--] cmd
@@ -1432,6 +1634,6 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
 launch "$repo" "$track" "$@"
