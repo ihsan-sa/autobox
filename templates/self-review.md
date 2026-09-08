@@ -16,3 +16,16 @@ a stop costs a fix iteration, a re-review and a re-lane, all of which reading th
    and the current minute is a case with an answer — decide it deliberately, because the edge is where it breaks.
 6. **A word a person set is never rewritten by a machine.** State a human chose (`waiting`, `kind=session`)
    is read by an automatic pass and reported on; it is not overwritten by one.
+
+## And then the last thing you do: hand over a tree a suite has already passed on
+
+Run `cc-green`. It takes the tree your working copy would commit and says, per gate, whether a green record
+already exists for it; `cc-green run` runs the ones that do not. The landing then spends those records instead of
+running the ~22-minute suite again on its own queue, where it is the slowest thing in the flow. A gate that long
+outlives a foreground tool call, so detach it and poll — `setsid nohup cc-green run > /tmp/green.log 2>&1 &` —
+then read the file; backgrounding that dies with your iteration leaves you with no run and no record.
+
+**Fix everything above BEFORE that run, and edit nothing after it.** A doc fix, a comment, a rebuilt artefact —
+each makes a tree nothing has passed on, and reasoning about how harmless it was does not change that. Of the 34
+gate-landings inside one record window on 2026-09-07, 7 spent a record; 11 had run the gate green and then moved
+between one and eight of their own files afterwards, one of them a docs edit its journal called harmless.

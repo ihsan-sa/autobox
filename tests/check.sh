@@ -119,6 +119,10 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # and that a claim is never taken while its owner is alive. No board of this box's is read and no runtime is run.
 # cc-native's drives dispatch, bootstrap and end payloads concurrently in its own HOME, board and local Git
 # remotes, with off and refusal controls. No live runtime or service is used and no settings are applied.
+# cc-green's is throwaway git repos with STUB gates and a record directory of its own — never this box's records
+# and never a real suite: a green run, then one tracked file edited after it, and the record must stop answering.
+# It also reads cc-land's GATES tuple out of that source, because a gate list it has fallen behind on is a worker
+# told it is green on a gate the landing is still going to run.
 # …and only the ones a change reaches, when the landing says what changed (CC_LAND_CHANGED — tests/green.sh has
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
@@ -149,7 +153,7 @@ tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 fail
 # dead the moment this loop goes back to asking `want`. Lifting the list into a variable is what broke it here.
 SCD=$GD   # the dir and its trap are set at the top; a second EXIT trap here would have replaced the first
 running=0; ran=""
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc-green cc; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   ran="$ran $c"
   { rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &

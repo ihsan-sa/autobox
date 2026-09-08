@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/green.sh — what the two suites share: what a green run leaves behind, and how far a change reaches.
-# Sourced by check.sh and selftest.sh; read by cc-land (green_run there).
+# Sourced by check.sh, selftest.sh and cc-green; read by cc-land (green_run there).
 #
 # THE RECORD. The worker runs these suites before it opens its PR and the landing ran them again on the same code —
 # confirmed on PR #211, 2026-09-04 — with nothing reading the second result differently from the first. A sentence
@@ -18,18 +18,29 @@
 # It is written by the SUITE, on green, and by nothing else. It is not a signature: anything running as this user
 # can write one by hand, and no file on this box can stop it. It is evidence of content, which is what the second
 # run was buying.
+green_tree(){     # $1 = a repo root → the git tree its working copy WOULD commit, or nothing if that cannot be taken
+  local idx tree
+  idx=$(mktemp "${TMPDIR:-/tmp}/cc-green.XXXXXX" 2>/dev/null) || return 0
+  # An index of its own, so hashing the working copy neither stages anything nor disturbs the real one.
+  tree=$(cd "$1" && GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null &&
+         GIT_INDEX_FILE="$idx" git add -A 2>/dev/null && GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null) || tree=""
+  rm -f "$idx"
+  printf '%s' "$tree"
+  return 0
+}
+# ONE ALGORITHM, WRITER AND READER. cc-green asks the same question before a worker hands over — is a record
+# already filed for what I am about to push? — and asked with a hash of its own it could answer yes where the
+# suite would have filed a different tree. Two algorithms is how a green comes to name content it did not pass on,
+# which is worse than no green at all. So there is one, here, and both callers go through it.
+
 green_record(){   # $1 = the suite that just passed, as it was invoked ("$0"); $2 = the scope it ran at ("" = everything)
-  local self root rel dir idx tree scope
+  local self root rel dir tree scope
   self=$(readlink -f "$1" 2>/dev/null) || return 0
   root=$(cd "$(dirname "$self")" && git rev-parse --show-toplevel 2>/dev/null) || return 0
   [ -n "$root" ] || return 0
   rel=${self#"$root"/}                     # how the landing names this gate: "core/tests/check.sh", "tests/check.sh"
   dir="${CC_GREEN_DIR:-$HOME/.cc/state/land/green}"
-  idx=$(mktemp "${TMPDIR:-/tmp}/cc-green.XXXXXX" 2>/dev/null) || return 0
-  # An index of its own, so hashing the working copy neither stages anything nor disturbs the real one.
-  tree=$(cd "$root" && GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null &&
-         GIT_INDEX_FILE="$idx" git add -A 2>/dev/null && GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null) || tree=""
-  rm -f "$idx"
+  tree=$(green_tree "$root")
   [ -n "$tree" ] && [ -n "$rel" ] || return 0
   mkdir -p "$dir" 2>/dev/null || return 0
   scope=${2:-}; scope=${scope//[\"\\]/}

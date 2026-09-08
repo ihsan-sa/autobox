@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# cc-green — the tree you are about to hand over, and whether a suite has already passed on THAT tree.
+#
+#   cc-green            per gate: green on this working copy, or not, and why not. exit 1 if any is not
+#   cc-green run        …and run the ones that are not, unscoped and in the foreground, then say so again
+#   cc-green selfcheck  fixtures of its own: a scratch record directory, stub gates, a throwaway repo
+# Three states per gate, not two: `green` a record the landing will spend · `ran` it passed here but files no
+# record, so the landing runs it again · `RUN` neither, and that is what holds a hand-over back.
+#
+# WHY. A landing re-runs a suite the worker already ran, on the same content, and the suite is ~22 minutes.
+# tests/green.sh has recorded what a green run passed on since 2026-09-04 and cc-land's green_run spends it, so
+# the saving is already built — but of the 34 gate-landings inside one record window (2026-09-07, 17:14Z to
+# 23:49Z) only 7 spent a record. It is not the record and not a rebase, which three branches carry and which
+# explains none of them. In 11 the gate HAD run green on the worker's own tree and then 1 to 8 of that branch's
+# own files moved after it: the worker's last suite run was not its last act, it kept editing, the Stop hook
+# committed, and the tree the PR carried was one nothing had ever passed on. #327's journal says so in as many
+# words. The other 16 had no record for any tree the branch ever held.
+#
+# So the missing thing was never a rule. It was that a worker could not ASK. This answers in about a second: it
+# takes the tree the working copy would commit and looks for the record the suite would have filed under it.
+#
+# WHAT IT WILL NOT DO IS CLAIM A MATCH THE LANDING WILL NOT HONOUR. green_run spends a record only when the tree,
+# the suite name, the scope and the clock all agree, so this reads all four the same way and calls anything else
+# not green. Two of those are worth saying out loud:
+#   scope   a suite told what a diff changed (CC_LAND_CHANGED) records the paths it narrowed to, and that record
+#           answers only for a landing narrowed to exactly the same. A worker cannot know what the landing's diff
+#           will be, so a scoped record is reported as not green and `run` always runs unscoped.
+#   clock   a record is spent for GREEN_TTL and then it is not. A PR that waits longer than that in the queue
+#           loses it, which is not a failure — it is the box refusing to trust a six-hour-old answer.
+#
+# AND WHY SOME GATES SHOULD NEVER FILE ONE. A record is written from the WORKING COPY, and spent by a landing that
+# has checked the head out — so a gate that reads `HEAD` rather than the files in front of it is answering a
+# different question in the two places. tests/check-extra.sh greps HEAD for strings that must not be published:
+# recorded at worker time it would pass on a clean HEAD, and the landing would skip the one gate that was going to
+# read the commit. So it files nothing, shows here as `ran`, and the landing runs it. That is the right trade.
+set -uo pipefail
+SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
+USAGE="usage: cc-green [run|selfcheck]"
+# The tree is taken by tests/green.sh's green_tree — the SUITE's own hash, not a second one of ours. See the note
+# there: a reader with an algorithm of its own is how a green comes to name content it did not pass on.
+# shellcheck source=/dev/null
+. "$CORE/tests/green.sh"
+
+# The gates a landing runs, in the order it runs them, copied from cc-land's own GATES tuple. A copy that
+# drifts would leave a worker believing it is green on a gate the landing is still going to run, so the selfcheck
+# reads that tuple out of "$BIN/cc-land" and fails when the two disagree. Naming the file that way is also what
+# puts this selfcheck in the reach of a change to cc-land (land_scope, tests/green.sh).
+GATES="core/tests/check.sh tests/check.sh tests/check-extra.sh core/tests/selftest.sh tests/selftest.sh"
+GREEN_TTL=$((6 * 3600))                             # cc-land's GREEN_TTL. NOT settable from the environment: a knob
+                                                    # here would only move THIS tool's view of the clock, and the
+                                                    # landing would go on spending nothing. The selfcheck ages a
+                                                    # record instead, which is the thing that really happens.
+GDIR="${CC_GREEN_DIR:-$HOME/.cc/state/land/green}"
+
+command -v jq >/dev/null 2>&1 || { echo "cc-green: jq is missing" >&2; exit 2; }
+
+root(){ git rev-parse --show-toplevel 2>/dev/null; }
+
+# Is there a record this landing would spend for $1 (the gate, as the landing names it) on tree $2? Prints the
+# reason it is NOT spendable, and nothing at all when it is — so the caller reads emptiness as green.
+why_not(){
+  local gate=$1 tree=$2 f v tree_r suite scope at age
+  f="$GDIR/$(basename "$gate")-${tree:0:12}.json"
+  [ -f "$f" ] || { echo "no record for this tree"; return; }
+  # A field at a time, one line each. NOT @tsv into `read`: tab is IFS whitespace, so an empty scope — which is
+  # the ordinary case, and the only one a landing spends freely — collapses and every later field shifts left.
+  mapfile -t v < <(jq -r '.tree // "", .suite // "", .scope // "", .at // ""' "$f" 2>/dev/null)
+  [ "${#v[@]}" = 4 ] || { echo "its record is unreadable"; return; }
+  tree_r=${v[0]}; suite=${v[1]}; scope=${v[2]}; at=${v[3]}
+  # The file is named for the tree, so a mismatch here is a collision or a hand-written file, not an edit.
+  [ "$tree_r" = "$tree" ] || { echo "its record names another tree ($tree_r)"; return; }
+  [ "$suite" = "$gate" ] || { echo "that record is $suite's, not this gate's"; return; }
+  [ -z "$scope" ] || { echo "recorded scoped to '$scope' — only a landing whose diff is exactly that spends it"; return; }
+  age=$(( $(date -u +%s) - $(date -u -d "$at" +%s 2>/dev/null || echo 0) ))
+  [ "$age" -le "$GREEN_TTL" ] || { echo "green at $at, which is past the ${GREEN_TTL}s the landing trusts"; return; }
+}
+
+# Every gate this tree actually has, as the landing names it.
+gates_here(){ local r=$1 g; for g in $GATES; do [ -x "$r/$g" ] && echo "$g"; done; }
+
+# A gate that has just run HERE and passed, and files no record at all. tests/check-extra.sh is one, and so is
+# every gate in a repo whose suites do not source tests/green.sh. Its answer is as good as a record's — the tree
+# has not moved since — but the landing has nothing to spend and will run it again, so say both. Set by
+# run_missing, and dropped entirely if the tree moves afterwards, because then it passed on something else.
+RAN=""
+ran_here(){ case " $RAN " in *" $1 "*) return 0;; esac; return 1; }
+
+report(){   # $1 = root, $2 = tree. Prints a line per gate; returns 1 if any gate is not green on that tree.
+  local r=$1 tree=$2 g w bad=0 any=0
+  while read -r g; do
+    any=1; w=$(why_not "$g" "$tree")
+    if [ -z "$w" ]; then echo "  green   $g"
+    elif ran_here "$g"; then echo "  ran     $g — passed here, but it files no record, so the landing runs it again"
+    else echo "  RUN     $g — $w"; bad=1; fi
+  done < <(gates_here "$r")
+  [ "$any" = 1 ] || { echo "  cc-green: no gate in this repo ($(echo "$GATES" | cut -d' ' -f1), …) — nothing to hand over green"; return 1; }
+  return "$bad"
+}
+
+# Run the gates that are not green, in the landing's own order, unscoped and in the foreground.
+run_missing(){
+  local r=$1 tree=$2 g w rc
+  while read -r g; do
+    w=$(why_not "$g" "$tree"); [ -n "$w" ] || continue
+    echo "cc-green: $g — $w; running it"
+    rc=0
+    # NEVER an inherited scope. A worker started from inside a scoped run would otherwise hand this gate that
+    # run's paths, and file a record narrowed to a diff that is not its own.
+    # …and never on the loop's own stdin. The gate names below come from a process substitution, so a gate left
+    # holding that on fd 0 drains it and `read` hits EOF: the run of 2026-09-08T00:20Z went green on
+    # core/tests/check.sh and reported the two gates behind it as never run. It never claimed a false green, but
+    # it did one gate an invocation. Case 13 is that gate.
+    ( cd "$r" && env -u CC_LAND_CHANGED "$r/$g" ) </dev/null || rc=$?
+    [ "$rc" = 0 ] || { echo "cc-green: $g did not pass (exit $rc) — nothing is green and nothing is handed over" >&2; return 1; }
+    RAN="$RAN $g"
+  done < <(gates_here "$r")
+}
+
+main(){
+  local r tree tree2 moved
+  r=$(root) || true
+  [ -n "${r:-}" ] || { echo "cc-green: not in a git checkout" >&2; exit 2; }
+  tree=$(green_tree "$r")
+  [ -n "$tree" ] || { echo "cc-green: cannot take this working copy's tree" >&2; exit 2; }
+  if [ "${1:-}" = run ]; then
+    run_missing "$r" "$tree" || exit 1
+    # A gate can leave the tree it just passed on behind it — a log, a scratch file, a rebuilt artefact — and the
+    # record it filed then names a tree that no longer exists here. Ask again, on what the working copy holds NOW.
+    tree2=$(green_tree "$r")
+    if [ -n "$tree2" ] && [ "$tree2" != "$tree" ]; then
+      moved=$(cd "$r" && git diff --name-only "$tree" "$tree2" 2>/dev/null | tr '\n' ' ')
+      echo "cc-green: the run itself moved the tree ($tree -> $tree2): ${moved:-<unnameable>}"
+      tree=$tree2; RAN=""     # whatever passed, it passed on content this checkout no longer holds
+    fi
+  fi
+  echo "cc-green: what a landing would find on ${tree:0:12}"
+  if report "$r" "$tree"; then
+    echo "cc-green: green on ${tree:0:12} — hand over now. Anything you edit from here is a tree nothing has passed on,"
+    echo "  and the landing runs every gate above again."
+    return 0
+  fi
+  echo "cc-green: NOT green on ${tree:0:12}. \`cc-green run\` runs what is missing; the landing will otherwise run it"
+  echo "  for you, on its own queue, where it is the slowest thing in the flow."
+  return 1
+}
+
+selfcheck(){
+  local n=0 f=0 D D2 R out rc tree rec
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
+  nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }   # …and one that must NOT hold: `t !` runs `!` as a command
+  D=$(mktemp -d); trap 'rm -rf "$D"' RETURN
+
+  # A fixture repo with a stub gate of its own. Every case below builds the state it asserts on: nothing here
+  # reads this box's record directory, and no real suite is ever run.
+  newrepo(){   # $1 = a name → a repo with one file and a stub gate that records green and appends to a log
+    local w="$D/$1"
+    mkdir -p "$w/core/tests"
+    ( cd "$w" && git init -q && git config user.email t@t && git config user.name t )
+    echo one > "$w/a.txt"
+    cat > "$w/core/tests/check.sh" <<EOS
+#!/usr/bin/env bash
+set -e; SELF=\$(readlink -f "\$0"); cd "\$(dirname "\$0")/../.."
+echo check.sh >> "$D/$1.log"
+. "$CORE/tests/green.sh"; green_record "\$SELF" "\${CC_FIXTURE_SCOPE:-}"
+EOS
+    chmod +x "$w/core/tests/check.sh"
+    ( cd "$w" && git add -A && git commit -qm one )
+    echo "$w"
+  }
+
+  # 1-2 THE ONE CASE THIS TOOL EXISTS FOR: a green run, then an edit, and the record must no longer answer.
+  D2=$(mktemp -d); R=$(newrepo moved)
+  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
+  k "$rc" "a working copy the suite just passed on is green"
+  grep -q "green   core/tests/check.sh" <<<"$out"; k "$?" "…and it says which gate the landing will skip"
+  echo two > "$R/a.txt"            # ONE tracked file edited after the run — the whole failure this measures
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "a head that moved after its green run does NOT match"
+  grep -q "RUN     core/tests/check.sh — no record for this tree" <<<"$out"; k "$?" "…and says the record is for another tree"
+  git -C "$R" checkout -q -- a.txt
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 )
+  grep -q "green   core/tests/check.sh" <<<"$out"; k "$?" "…and putting the file back makes the same record answer again"
+  rm -rf "$D2"
+
+  # 3 AN UNTRACKED FILE IS PART OF THE TREE TOO, because green_record hashes what the working copy would COMMIT
+  # and the Stop hook commits it. A worker that drops a note in the tree after its run has moved the tree.
+  D2=$(mktemp -d); R=$(newrepo untracked)
+  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  echo scratch > "$R/note.md"
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "an untracked file added after the run also moves the tree"
+  rm -rf "$D2"
+
+  # 4 SCOPE. A record of a narrowed run answers only a landing narrowed to the same, and a worker cannot know
+  # what that will be — so it is reported as not green, with the scope named, and never quietly spent.
+  D2=$(mktemp -d); R=$(newrepo scoped)
+  ( cd "$R" && CC_GREEN_DIR="$D2" CC_FIXTURE_SCOPE="core/bin/cc-x" ./core/tests/check.sh ) >/dev/null 2>&1
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" bash "$SELF" 2>&1 ) || true
+  grep -q "recorded scoped to 'core/bin/cc-x'" <<<"$out"; k "$?" "a scoped record is not green, and says what it was scoped to"
+  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1     # …the same tree, run unscoped
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" bash "$SELF" 2>&1 ); rc=$?
+  k "$rc" "…and an unscoped run of the same tree is"
+  rm -rf "$D2"
+
+  # 5 THE CLOCK. Past the TTL the landing stops trusting the record, so this must stop reporting it as green —
+  # both sides of the edge, on one fixture, because a TTL that never expires and one that always does look alike.
+  D2=$(mktemp -d); R=$(newrepo aged)
+  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
+  k "$rc" "inside the TTL a record is green"
+  rec=$(ls "$D2"/*.json)     # the same record, aged an hour past the TTL and not otherwise touched
+  jq --arg a "$(date -u -d "@$(( $(date -u +%s) - GREEN_TTL - 3600 ))" +%Y-%m-%dT%H:%M:%SZ)" '.at=$a' "$rec" > "$rec.n" && mv "$rec.n" "$rec"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ) || true
+  grep -q "past the ${GREEN_TTL}s the landing trusts" <<<"$out"; k "$?" "…and past it the same record is not"
+  rm -rf "$D2"
+
+  # 6 A RECORD OF ANOTHER GATE, under the same tree, is not this gate's answer. green_run checks the suite name
+  # for exactly this reason: "core/tests/check.sh" and "tests/check.sh" are filed under the same basename.
+  D2=$(mktemp -d); R=$(newrepo othergate)
+  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  rec=$(ls "$D2"/*.json); jq '.suite="tests/check.sh"' "$rec" > "$rec.n" && mv "$rec.n" "$rec"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ) || true
+  grep -q "that record is tests/check.sh's, not this gate's" <<<"$out"; k "$?" "a record filed by another gate does not answer for this one"
+  rm -rf "$D2"
+
+  # 7 `run` RUNS ONLY WHAT IS MISSING — the saving is the whole point, so a run that re-ran an already-green gate
+  # would cost exactly what it was built to save. Two gates, one already green, and the log says which ran.
+  D2=$(mktemp -d); R=$(newrepo runsome)
+  sed 's#check\.sh#check-extra.sh#g' "$R/core/tests/check.sh" > "$R/tests-extra.tmp"
+  mkdir -p "$R/tests"; mv "$R/tests-extra.tmp" "$R/tests/check-extra.sh"; chmod +x "$R/tests/check-extra.sh"
+  ( cd "$R" && git add -A && git commit -qm two )
+  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1     # check.sh green on THIS tree
+  : > "$D/runsome.log"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$rc" "run leaves every gate green"
+  k "$(t grep -qx check-extra.sh "$D/runsome.log")" "…having run the gate that had no record"
+  k "$(nt grep -qx check.sh "$D/runsome.log")" "…and not the one that had"
+  rm -rf "$D2"
+
+  # 8 A GATE THAT MOVES THE TREE AFTER IT RECORDS leaves a record for content this checkout no longer holds. That
+  # is the one way `run` could hand back a false green, so it re-takes the tree afterwards and says what moved.
+  D2=$(mktemp -d); R=$(newrepo dirty)
+  echo 'echo residue > residue.txt' >> "$R/core/tests/check.sh"
+  ( cd "$R" && git add -A && git commit -qm dirty )
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "a gate that dirties the tree after recording does not come back green"
+  grep -q "the run itself moved the tree" <<<"$out" && grep -q residue.txt <<<"$out"
+  k "$?" "…and the file it left is named"
+  rm -rf "$D2"
+
+  # 9 A GATE THAT FAILS stops everything: no later gate runs, and nothing is called green.
+  D2=$(mktemp -d); R=$(newrepo red)
+  echo 'exit 3' >> "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm red )
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "a gate that fails leaves cc-green red"
+  k "$(t grep -q 'did not pass (exit 3)' <<<"$out")" "…and says which gate and how it exited"
+  rm -rf "$D2"
+
+  # 10 A GATE THAT FILES NO RECORD — tests/check-extra.sh is one, and so is every gate in a repo whose suites do
+  # not source tests/green.sh. Before it runs there is nothing to spend and this says so; after it has run and
+  # passed here, on a tree that has not moved, its answer is as good as a record's and only the landing loses.
+  # Both sides, because crediting it always would call a stale tree green and crediting it never would loop a
+  # worker on a gate that can never satisfy it.
+  D2=$(mktemp -d); R=$(newrepo norecord)
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$R/tests-x"; mkdir -p "$R/tests"
+  mv "$R/tests-x" "$R/tests/check-extra.sh"; chmod +x "$R/tests/check-extra.sh"
+  ( cd "$R" && git add -A && git commit -qm three )
+  ( cd "$R" && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  ( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "a gate that files no record is not green before it has run"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$rc" "…and having run and passed here, it no longer holds the hand-over back"
+  k "$(t grep -q "ran     tests/check-extra.sh — passed here, but it files no record" <<<"$out")" \
+     "…and is reported as a gate the landing will run again, not as one it will skip"
+  rm -rf "$D2"
+
+  # 11 THE COPIED LIST. GATES above is cc-land's, and a landing that gained a gate this does not know would let a
+  # worker hand over believing it is green. Read the tuple out of that source rather than trusting the copy.
+  out=$(sed -n 's/^GATES = (\(.*\))$/\1/p' "$BIN/cc-land" 2>/dev/null | tr -d '"' | tr -d ',' | tr -s ' ')
+  if [ -z "$out" ]; then
+    k 1 "cc-land's GATES tuple could not be read from $BIN/cc-land — the copy below is unchecked"
+  else
+    k "$(t test "$out" = "$GATES")" "the gate list is still cc-land's — got '$out'"
+  fi
+
+  # 12 NOT IN A CHECKOUT is exit 2, not a green: an answer about no tree at all must never read as an answer.
+  mkdir -p "$D/nogit"; ( cd "$D/nogit" && "$SELF" >/dev/null 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 2)" "outside a git checkout it refuses, and does not report green"
+
+  # 13 A GATE THAT READS STDIN MUST NOT SWALLOW THE GATES BEHIND IT. `run` walks its gate names on fd 0, and a
+  # gate that inherits that fd eats the rest of the list — which is how the first real run of this tool ran one
+  # gate, filed its record and called the other two never run. Case 7's stubs read nothing, so it stayed green
+  # over the bug; this one drains fd 0 on purpose and asserts BOTH gates ran, in order.
+  D2=$(mktemp -d); R=$(newrepo eatstdin)
+  sed 's#check\.sh#check-extra.sh#g' "$R/core/tests/check.sh" > "$R/tests-extra.tmp"
+  mkdir -p "$R/tests"; mv "$R/tests-extra.tmp" "$R/tests/check-extra.sh"; chmod +x "$R/tests/check-extra.sh"
+  echo 'cat > /dev/null' >> "$R/core/tests/check.sh"     # …the first gate, after it has recorded, eats all of fd 0
+  ( cd "$R" && git add -A && git commit -qm eat )
+  : > "$D/eatstdin.log"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t grep -qx check.sh "$D/eatstdin.log")" "a gate that reads stdin still runs"
+  k "$(t grep -qx check-extra.sh "$D/eatstdin.log")" "…and does not swallow the gate behind it with the loop's stdin"
+  k "$rc" "…so run comes back green on both, not on the first alone"
+  rm -rf "$D2"
+
+  echo "cc-green selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+
+case "${1:-}" in
+  "")        main ;;
+  run)       main run ;;
+  selfcheck) selfcheck ;;
+  *)         echo "$USAGE" >&2; exit 2 ;;
+esac
