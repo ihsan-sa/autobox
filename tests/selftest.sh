@@ -2833,6 +2833,13 @@ if stanza "the worker loop (cc-loop)"; then
 # back on the box default instead of the worker model would have landed green.
 chk cc-loop   # its own tally line, not the journal fixtures it prints above it
 fi
+if stanza "the mail door on loopback (cc-mail)"; then
+# No fixtures to build: `cc-mail selfcheck` gives every case its own store directory, its own configuration in
+# the environment (which wins over ~/.cc/config, so this box's real allow-list and secret are never read) and a
+# port the KERNEL picks on 127.0.0.1, closed again at the end of the case. This box's ~/.cc/mail is not touched
+# and no mail is sent anywhere: the reply the worker would send is a string in a JSON answer here.
+chk cc-mail
+fi
 if stanza "the graphs on loopback (cc-graphs)"; then
 # No fixtures to build: `cc-graphs selfcheck` writes its own ledger days under a temp dir, points the lane rule at
 # a worktrees path of its own, and its HTTP cases bind a port the KERNEL picks on 127.0.0.1 and close it again — so
