@@ -8,6 +8,7 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
   cc-janitor <repo> [<repo> …] [--dry]      sweep exactly the repos named — never any other
   cc-janitor --configured [--dry]           the repos in CC_JANITOR_REPOS (~/.cc/config); the timer's form
   cc-janitor --fixtures [--dry]             rule 6 alone, no repo: cc-reconcile's 20-min pass calls this
+  cc-janitor quota                          what this user has used of the temp root, and of what limit
   cc-janitor selfcheck                      the decision table + one end-to-end run, no network
     also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
 
@@ -56,10 +57,19 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      CC_JANITOR_ORPHAN_CPU (default 0.10 of a core, averaged over the process's whole life) nothing is proven
      but a leftover nobody is paying for, and that is a finding, not a kill.
   8. what those runs LEFT ON DISK — one entry below the temp root, a file or a directory and everything in it,
-     that this user owns and NOTHING HAS WRITTEN TO for CC_JANITOR_SCRATCH_DAYS days (default 7, 0 = off)  →
+     that this user owns and NOTHING HAS WRITTEN TO for CC_JANITOR_SCRATCH_HOURS hours (default 6, 0 = off)  →
      removed. Rule 7 ends the processes; this is the half that fills a disk. A box running work all day leaves
      tens of thousands of these, nothing else on it removes them, and the first anyone hears of it is something
-     failing for want of space. The age is the NEWEST mtime anywhere in the tree, never the top directory's: a
+     failing for want of space. HOURS AND NOT DAYS because the room that runs out is a day's worth: on
+     2026-09-08 a gate died with "Disk quota exceeded" while df showed 6 GB free, because the limit that ran
+     out was this user's own quota on the temp root rather than the filesystem's, and it was 54,000 leftovers
+     of that same day filling it. A week's patience never gets a day like that back.
+     THE LINE MOVES WITH HOW FULL IT IS: once this user holds CC_JANITOR_SCRATCH_PRESSURE (default 0.85) of
+     what they are allowed there — their quota read through the kernel, or the filesystem itself when they
+     have none — the age drops to CC_JANITOR_SCRATCH_PRESSURE_HOURS (default 1, 0 = off), and never rises
+     above the ordinary line. Pressure moves the PATIENCE and nothing else: everything below still has to
+     pass, so a fuller disk never becomes a reason to take something that is in use.
+     The age is the NEWEST mtime anywhere in the tree, never the top directory's: a
      directory nobody has added a name to for a month can hold a file written a minute ago. Two shapes are not
      leftovers and are never candidates — something this user does not own, and a tree holding anything that is
      not a plain file or directory: a socket, a fifo, a device, another filesystem mounted there. Those are
@@ -81,10 +91,19 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      as unpushed and would have been reported for ever. Rule 1's worktrees under ~/.cc/worktrees belong to a TRACK
      rather than to a subagent and are never candidates here.
 
-NOTHING IS TAKEN OUT FROM UNDER SOMETHING STILL USING IT. Before any rule removes a directory, two generic
+NOTHING IS TAKEN OUT FROM UNDER SOMETHING STILL USING IT. Before any rule removes a directory, four generic
 tests can hold it, and a held directory is REPORTED — "spared", and what holds it — never removed:
   · a live process whose working directory is inside it (`/proc/<pid>/cwd`, every pid this user can read: a cwd
     is a cwd, and this knows nothing about what the process is doing there or what project it belongs to);
+  · a live process HOLDING IT OPEN or running out of it — an fd, `exe`, or the script in its first two argv
+    entries. A cwd alone was the whole process test until 2026-09-08, and it misses the two shapes a temp root
+    is fullest of: something that opened a scratch file and then worked elsewhere, and a watch script running
+    out of a scratch directory. Neither has a cwd inside it and both break when it is taken;
+  · a HARNESS SESSION still writing its transcript, for the scratch directory the harness gives it
+    (`<tmp>/*/<project>/<session>` against `~/.claude/projects/<project>/<session>.jsonl`, written on every
+    turn, judged against rule 8's own age line). A session between two tool calls has no process anywhere and
+    no fd on that directory — the same silence rule 9 knows — and the whole of that tree is ONE candidate, so
+    without this an age test takes hundreds of sessions' scratchpads out from under the live ones;
   · a record pointing into it, in a file THE BOX HAS REGISTERED: CC_JANITOR_HOLDS in ~/.cc/config is whitespace-
     separated globs of JSON files, and every absolute path anywhere inside one holds the directory it names.
     This file registers none and never learns what a record is for — a box that serves something out of a
@@ -114,7 +133,7 @@ either, and they sweep in a pass that is holding rules 1-3 for want of a fresh o
 Every action goes to ~/.cc/state/janitor.log. `--dry` prints what it would do and writes nothing at all.
 Exit: 0 done (with or without findings) · 2 usage.
 """
-import calendar, glob, json, os, re, shutil, signal, stat, subprocess, sys, tempfile, time
+import calendar, ctypes, glob, json, os, re, shutil, signal, stat, struct, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 BIN = os.path.dirname(os.path.realpath(__file__))    # siblings come from the same bin/ as this copy: a worktree tests itself
@@ -134,7 +153,18 @@ AGENT_HOURS = 4       # …and the silence that proves that subagent is gone; CC
 ORPHAN_HOURS = 4      # rule 7: a process in a scratch workspace younger than this is somebody's run in progress
 ORPHAN_CPU = 0.10     # …and one under this share of a core, over its whole life, is a leftover costing nothing
 GRACE = 5             # …seconds between the TERM that asks it to stop and the KILL that does not ask
-SCRATCH_DAYS = 7      # rule 8: a scratch entry nothing has written to for longer is a leftover; 0 = off
+SCRATCH_HOURS = 6     # rule 8: a scratch entry nothing has written to for longer is a leftover; 0 = off
+SCRATCH_PRESSURE = 0.85     # …the share of this user's room in the temp root above which the sweep is harder…
+SCRATCH_PRESSURE_HOURS = 1  # …and the shorter age it sweeps to then; CC_JANITOR_SCRATCH_PRESSURE_HOURS, 0 = off
+Q_GETQUOTA, USRQUOTA = 0x800007, 0   # quotactl's "read one id's limits", for a user: QCMD packs them cmd << 8 | type
+QUOTACTL_FD = 443     # …through the syscall that takes an OPEN FD instead of a block device — a tmpfs has no
+                      # device to name, so this is the only form that can read a quota on one, and no quota tool
+                      # is installed on a box like this anyway. x86_64/arm64 alike; anything else answers ENOSYS.
+DQBLK = "<8QI4x"      # struct if_dqblk: block hard/soft, space used, inode hard/soft, inodes used, 2 times,
+                      # valid — and the 4 bytes of tail padding the KERNEL copies out, without which the write
+                      # it makes is 4 bytes longer than the buffer it was handed
+QIF_BLIMITS, QIF_ILIMITS = 1, 4      # …the two bits of `valid` that say whether those limits mean anything
+DQBLK_BLOCK = 1024    # …and its LIMITS are in 1 kB blocks while its USAGE is in bytes: mixing the two reads 1024×
 HZ = 100              # clock ticks per second, for /proc/<pid>/stat — the real one below, this if it cannot be had
 try:
     HZ = os.sysconf("SC_CLK_TCK") or HZ
@@ -155,7 +185,12 @@ def epoch(ts):
 
 
 def dur(s):
-    return f"{int(s // 86400)}d" if s >= 86400 else f"{int(s // 3600)}h"
+    """A span in the largest unit that says something. Minutes and seconds because rule 8's pressure line can be
+    under an hour, and "the age line is 0h" told a reader nothing about what the pass was about to take."""
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= div:
+            return f"{int(s // div)}{unit}"
+    return f"{int(s)}s"
 
 
 # ── the decisions: pure, so the selfcheck drives every branch with no box around it ──────────────────────
@@ -262,18 +297,33 @@ def orphan_verdict(f):
 
 
 def leftover_verdict(f):
-    """Rule 8. f: {path, ours, plain, age, held, days} → (rm|report|keep, why). `age` is the seconds since
+    """Rule 8. f: {path, ours, plain, age, held, hours} → (rm|report|keep, why). `age` is the seconds since
     anything anywhere in it was last written, `plain` False when it holds something that is not a plain file or
-    directory, `held` the reasons it must stay. Ours and plain first, and both silently: another user's file is
-    not this box's to judge and a socket is a door onto something running, so neither is a finding — a temp root
-    holds dozens of each, and a daily report listing them all is a report nobody reads."""
+    directory, `held` the reasons it must stay, `hours` this pass's age line — which is the configured one, or
+    the shorter pressure one when the temp root is nearly full (`scratch_line` decides that, once, above).
+    Ours and plain first, and both silently: another user's file is not this box's to judge and a socket is a
+    door onto something running, so neither is a finding — a temp root holds dozens of each, and a daily report
+    listing them all is a report nobody reads."""
     if not f["ours"] or not f["plain"]:
         return ("keep", "")
-    if f["age"] < f.get("days", SCRATCH_DAYS) * 86400:
+    if f["age"] < f.get("hours", SCRATCH_HOURS) * 3600:
         return ("keep", "")
     if f["held"]:
         return ("report", f"spared {f['path']}: " + "; ".join(f["held"]))
     return ("rm", f"nothing has written in it for {dur(f['age'])}")
+
+
+def scratch_line(hours, frac, pressure, phours):
+    """Rule 8's age line for THIS pass, and whether pressure set it: (hours, under). The configured `hours`
+    ordinarily; the shorter `phours` once this user is holding `frac` — `pressure` or more of the room they
+    actually have in the temp root. NEVER LONGER than the configured line: a box that already sweeps to an
+    hour does not become laxer for being full. An unmeasurable temp root (`frac` None) is not pressure — a
+    quota nothing could read must not turn into a harder sweep — and `phours` at 0 turns the pressure line
+    off while leaving the ordinary one alone."""
+    if phours <= 0 or frac is None or frac < pressure:
+        return hours, False
+    line = min(hours, phours)
+    return line, line < hours          # …and a box already sweeping to the shorter line says nothing about it
 
 
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -434,6 +484,86 @@ def live_cwds():
     return out
 
 
+def live_paths():
+    """[(pid, path)] — every place a live process points at that is NOT its working directory: the files it has
+    open, the program it is running, and the script it was handed. A cwd was the whole hold test until
+    2026-09-08, and a cwd misses the two shapes a temp root is fullest of — something that opened a scratch
+    file and then worked elsewhere, and a script running out of a scratch directory. Neither has a cwd inside
+    the directory, and both break when it is taken.
+
+    An fd and `exe` are the kernel's word. The first two argv entries are the PROCESS's own, which is why only
+    those two are read and only when they are absolute: a name a process chose can make this sweep spare one
+    more thing and can never make it take one, so the worst a wrong one does is leave a leftover on disk."""
+    out = []
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = os.path.basename(d)
+        try:
+            fds = os.listdir(f"{d}/fd")
+        except OSError:
+            fds = []                                    # another user's, or gone: not evidence either way
+        for fd in fds:
+            try:
+                out.append((pid, os.path.realpath(os.readlink(f"{d}/fd/{fd}"))))
+            except OSError:
+                continue                                # closed while this was reading is not a hold
+        try:
+            out.append((pid, os.path.realpath(os.readlink(f"{d}/exe"))))
+        except OSError:
+            pass
+        try:
+            argv = open(f"{d}/cmdline", "rb").read().split(b"\0")[:2]
+        except OSError:
+            continue
+        out += [(pid, os.path.realpath(a.decode("utf-8", "replace"))) for a in argv if a.startswith(b"/")]
+    return out
+
+
+def live_sessions(tmp, window, projects=None):
+    """`<tmp>/*/<project>/<session>` for every harness session STILL RUNNING — one whose transcript
+    `~/.claude/projects/<project>/<session>.jsonl` was written to inside `window` seconds.
+
+    A session between two tool calls has no process anywhere and no fd open on its scratch directory: the same
+    silence rule 9 already knows, and an age test alone would take 700 sessions' scratchpads out from under the
+    live ones because the whole tree below the temp root is ONE candidate. The transcript is the liveness the
+    directory itself cannot show — it is appended on every turn. A harness convention and nothing of any one
+    box; where the harness is not this one nothing under the temp root matches and this holds nothing.
+    `projects` is where those transcripts live, named so the selfcheck can drive this against a tree of its own.
+
+    ONE READING PER LEVEL, never a glob per session: `<tmp>/*/<project>/<session>` globbed for each of forty
+    live sessions lists a temp root of 55,000 names forty times, which was 7 s of a pass that has to run every
+    twenty minutes. The fresh sessions are collected first and the temp root is then walked ONCE, two levels
+    deep, matching against them."""
+    if not window or window <= 0:
+        return []
+    fresh, cut = {}, now() - window
+    for tx in glob.glob(f"{glob.escape(projects or f'{HOME}/.claude/projects')}/*/*.jsonl"):
+        try:
+            if os.stat(tx).st_mtime < cut:
+                continue                                # last written before the age line: not evidence of life
+        except OSError:
+            continue
+        fresh.setdefault(os.path.basename(os.path.dirname(tx)), set()).add(
+            os.path.basename(tx)[:-len(".jsonl")])
+    if not fresh:
+        return []
+    out = []
+    for root in dirs_in(tmp):                           # …whichever directory the harness put them under
+        for proj in dirs_in(root):
+            for sess in sorted(fresh.get(os.path.basename(proj), ())):
+                if os.path.isdir(f"{proj}/{sess}"):
+                    out.append(f"{proj}/{sess}")
+    return out
+
+
+def dirs_in(path):
+    """The directories one level below `path`, by their full paths — a link is not one, since following one
+    would take a caller out of the tree it is reading. [] for anything that cannot be listed."""
+    try:
+        return [e.path for e in os.scandir(path) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+
+
 def pcomm(pid):
     """The process's own name, for the report: `pid 3117 (node)` says more than a number does."""
     try:
@@ -550,6 +680,94 @@ def size(n):
     return f"{int(n)} B"
 
 
+def quota_read(path):
+    """This user's QUOTA on `path`'s filesystem: (space used, space limit, inodes used, inode limit) in bytes and
+    files, or None when there is no quota there — or nothing that can be asked for one. A limit of 0 is no limit,
+    which is how a quota carrying only a block limit reads, and a filesystem with quotas enabled but nothing set
+    for this user reads as no quota at all.
+
+    Read through the syscall because there is nothing else to read it with: no quota tool is installed on a box
+    like this, and the form that takes a mount point (`quotactl`) wants a BLOCK DEVICE, which a tmpfs does not
+    have. `quotactl_fd` takes an open fd instead, which is why the temp root can be asked at all. Anything the
+    kernel will not answer — an old kernel, another architecture's syscall table, a filesystem with no quota
+    support, EPERM — is None and the caller falls back to what df sees, never to a guess."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(struct.calcsize(DQBLK))
+        rc = ctypes.CDLL(None, use_errno=True).syscall(
+            ctypes.c_long(QUOTACTL_FD), ctypes.c_uint(fd), ctypes.c_uint((Q_GETQUOTA << 8) | USRQUOTA),
+            ctypes.c_uint(os.getuid()), ctypes.byref(buf))
+    except Exception:
+        return None                                     # no libc to call, or no such syscall on this build
+    finally:
+        os.close(fd)
+    return None if rc != 0 else quota_decode(buf.raw)
+
+
+def quota_decode(raw):
+    """One `struct if_dqblk` as the four numbers rule 8 reasons about: (space used, space limit, inodes used,
+    inode limit) in bytes and files, or None when it carries no limit for this user — a filesystem with quotas
+    on and nothing set for them, which is not a quota to be near the end of.
+
+    Every line here is a way to be quietly wrong, which is why it is a function of its own: the LIMITS are in
+    1 kB blocks and the USAGE is in bytes, so multiplying both reads 1024x high and multiplying neither reads
+    1024x low; a limit is the HARD one where there is one and the soft one otherwise; and a limit whose `valid`
+    bit is clear is not a number at all. A wrong offset here does not fail — it returns a plausible fraction
+    and drives the harder sweep on it."""
+    bhard, bsoft, space, ihard, isoft, inodes, _bt, _it, valid = struct.unpack(DQBLK, raw)
+    blimit = (bhard or bsoft) * DQBLK_BLOCK if valid & QIF_BLIMITS else 0
+    ilimit = (ihard or isoft) if valid & QIF_ILIMITS else 0
+    return (space, blimit, inodes, ilimit) if blimit or ilimit else None
+
+
+def fs_usage(path):
+    """…and the same four numbers from the FILESYSTEM itself — what df sees — for a temp root with no quota on
+    it. None when the path cannot be stat'd at all."""
+    try:
+        v = os.statvfs(path)
+    except OSError:
+        return None
+    return ((v.f_blocks - v.f_bfree) * v.f_frsize, v.f_blocks * v.f_frsize, v.f_files - v.f_ffree, v.f_files)
+
+
+def usage_frac(u):
+    """How full those four numbers are, as the WORST of the limits that exist: 'Disk quota exceeded' is space or
+    inodes, and the night rule 8 was rewritten this box had made 54,000 files in one day. A reading with no limit
+    in it at all is 0.0 — nothing to be near the end of."""
+    used, limit, iused, ilimit = u
+    return max((a / b for a, b in ((used, limit), (iused, ilimit)) if b), default=0.0)
+
+
+def usage_line(path, u, src):
+    """One line a person reads when a gate says the disk is full: how much of what limit, and WHOSE limit it is.
+    The whose is the point — a per-user quota is invisible to df, so a box can be 6 GB clear and still refuse
+    every write this user makes."""
+    used, limit, iused, ilimit = u
+    parts = [f"{size(used)} of {size(limit)}"] if limit else [f"{size(used)} used"]
+    if ilimit:
+        parts.append(f"{iused:,} of {ilimit:,} files")
+    if not (limit or ilimit):
+        return f"{path}: {' · '.join(parts)}, no limit on it"
+    return f"{path}: {' · '.join(parts)} — {usage_frac(u) * 100:.0f}% of {src}"
+
+
+def temp_usage(path=None, read=quota_read):
+    """The temp root's fullness for this user: (fraction, one line to print), or None when neither the quota nor
+    the filesystem would answer. The quota first and the filesystem only when there is none — one source, never
+    the two mixed, so the fraction is always a share of a single real limit. `read` is the quota reader, named
+    so the selfcheck can drive both sides of that fallback on a box that has only one of them."""
+    path = os.path.realpath(path or tempfile.gettempdir())
+    u, src = read(path), "this user's quota"
+    if u is None:
+        u, src = fs_usage(path), "the filesystem"
+    if u is None:
+        return None
+    return usage_frac(u), usage_line(path, u, src)
+
+
 def end_proc(pid, ws, grace=GRACE):
     """Ask, then insist: SIGTERM, and SIGKILL whatever is still running when the grace is up. Returns '' when the
     process is gone and why not otherwise. Already gone counts as gone — this pass's job, done by somebody else —
@@ -620,6 +838,7 @@ class Holds:
 
     def __init__(self):
         self.cwds = live_cwds()
+        self.opens = live_paths()       # …and what is merely OPEN in it, or running out of it
         self.records = record_paths()
 
     def records_on(self, path):
@@ -629,34 +848,56 @@ class Holds:
         return [f"{rec} points into it" for tgt, rec in self.records if inside(d, tgt)]
 
     @staticmethod
-    def why(pids, records):
-        """The reasons, worded the same wherever they are read: two processes and a count of the rest — a dev
-        server is a dozen processes — then the records, which come already worded."""
-        why = [f"pid {pid} ({pcomm(pid)}) is working in it" for pid in pids[:2]]
-        if len(pids) > 2:
-            why.append(f"+{len(pids) - 2} more are working in it")
-        return list(dict.fromkeys(why + list(records)))
+    def some(reasons, more, cap=2):
+        """`cap` reasons named and a count of the rest. A dev server is a dozen processes and a live harness
+        tree is held by forty things at once; a spare line nobody can read is a spare nobody acts on."""
+        return list(reasons[:cap]) + ([f"+{len(reasons) - cap} {more}"] if len(reasons) > cap else [])
+
+    @staticmethod
+    def why(pids, records, opens=(), sessions=()):
+        """The reasons, worded the same wherever they are read, and each for WHAT IT IS: working in it, holding
+        it open, a session still writing, then the records, which come already worded."""
+        return list(dict.fromkeys(
+            Holds.some([f"pid {pid} ({pcomm(pid)}) is working in it" for pid in pids], "more are working in it")
+            + Holds.some([f"pid {pid} ({pcomm(pid)}) has it open" for pid in opens], "more have it open")
+            + Holds.some([f"{d} is a session still writing its transcript" for d in sessions],
+                         "more sessions are still writing theirs")
+            + list(records)))
 
     def on(self, path):
         d = os.path.realpath(path)
-        return self.why([pid for pid, c in self.cwds if inside(d, c)], self.records_on(path))
+        cwds = [pid for pid, c in self.cwds if inside(d, c)]
+        return self.why(cwds, self.records_on(path),
+                        dict.fromkeys(pid for pid, c in self.opens if inside(d, c) and pid not in cwds))
 
-    def under(self, tmp):
+    def under(self, tmp, window=None):
         """{scratch workspace: why} for everything held inside the temp root, in ONE walk of the readings. Rule 8
         looks at every name in that root, and asking each of them about every process would be the slow half of
-        the day's sweep; a working directory or a record path below the root already names the one workspace it
-        holds (rule 7's `scratch`), so one pass over the readings answers for all of them."""
-        pids, recs = {}, {}
+        the day's sweep; a working directory, an open file or a record path below the root already names the one
+        workspace it holds (rule 7's `scratch`), so one pass over the readings answers for all of them.
+        `window` is rule 8's own age line in seconds: with one, a harness session still writing its transcript
+        inside that window holds its scratch directory too."""
+        pids, opens, recs = {}, {}, {}
         for pid, cwd in self.cwds:
             ws = scratch(cwd, tmp)
             if ws:
                 pids.setdefault(ws, []).append(pid)
+        for pid, path in self.opens:
+            ws = scratch(path, tmp)
+            if ws and pid not in pids.get(ws, ()) and pid not in opens.get(ws, ()):
+                opens.setdefault(ws, []).append(pid)
         for tgt, rec in self.records:
             ws = scratch(tgt, tmp)
             if ws:
                 recs.setdefault(ws, []).append(f"{rec} points into it")
-        return {ws: self.why(pids.get(ws, []), dict.fromkeys(recs.get(ws, [])))
-                for ws in set(pids) | set(recs)}
+        sess = {}
+        for d in live_sessions(tmp, window):
+            ws = scratch(d, tmp)
+            if ws:
+                sess.setdefault(ws, []).append(d)
+        return {ws: self.why(pids.get(ws, []), dict.fromkeys(recs.get(ws, [])),
+                             opens.get(ws, []), sess.get(ws, []))
+                for ws in set(pids) | set(opens) | set(recs) | set(sess)}
 
 
 def windows():
@@ -1025,7 +1266,7 @@ def sweep_orphans(r, hours, share=ORPHAN_CPU):
             r.act_here("scratch", "end", f"pid {pid} ({pcomm(pid)})", why, lambda p=pid, w=ws: end_proc(p, w))
 
 
-def sweep_leftovers(r, days):
+def sweep_leftovers(r, hours, phours, pressure):
     """Rule 8, once per run and box-wide: what finished runs LEFT ON DISK in the temp root. Every entry in it is
     measured — the last time anything in it was written, what it is holding, and its shape — and one this user
     owns, that is a plain tree, that nothing has written to for `days`, and that neither hold test holds, is
@@ -1034,10 +1275,16 @@ def sweep_leftovers(r, days):
 
     A busy box leaves tens of thousands of these, so what a person reads is one line — how many, how much room
     they were holding, and the largest of them. The spares are named one by one: that is the half worth reading,
-    and the half this rule is judged on."""
-    if days <= 0:
+    and the half this rule is judged on.
+
+    The age line is read ONCE, at the top, against how full the temp root already is for this user: a root near
+    its limit gets the shorter `phours`. Once, and not per entry, so every candidate in one pass is judged by
+    the same line and the log can say which line that was."""
+    if hours <= 0:
         return
     tmp = os.path.realpath(tempfile.gettempdir())
+    usage = temp_usage(tmp)
+    hours, under = scratch_line(hours, usage[0] if usage else None, pressure, phours)
     try:
         dev = os.lstat(tmp).st_dev
         names = sorted(os.listdir(tmp))
@@ -1046,14 +1293,14 @@ def sweep_leftovers(r, days):
         return
     # The pass's own reading, taken before it started walking. CC_JANITOR_SCRATCH_BLIND drops it — tests: the
     # second look below has to be reachable as the only thing standing between the sweep and what is in use.
-    held = {} if os.environ.get("CC_JANITOR_SCRATCH_BLIND") else r.holds.under(tmp)
+    held = {} if os.environ.get("CC_JANITOR_SCRATCH_BLIND") else r.holds.under(tmp, hours * 3600)
     take, spared = [], []
     for name in names:
         p = f"{tmp}/{name}"
         f = scratch_scan(p, dev)
         if f is None:
             continue
-        f.update(path=p, days=days, age=max(0.0, now() - f["newest"]), held=held.get(p, []))
+        f.update(path=p, hours=hours, age=max(0.0, now() - f["newest"]), held=held.get(p, []))
         verdict, why = leftover_verdict(f)
         if verdict == "rm":
             take.append((p, f["bytes"]))
@@ -1061,7 +1308,8 @@ def sweep_leftovers(r, days):
             spared.append((p, why))
     if not take and not spared:
         return
-    print(f"cc-janitor scratch leftovers{' (dry run)' if r.dry else ''}")
+    print(f"cc-janitor scratch leftovers{' (dry run)' if r.dry else ''}"
+          + (f" — {usage[1]}, so the age line is {dur(hours * 3600)} and not the usual one" if under else ""))
     for p, why in spared:
         r.report("scratch", p, why)
     if not take:
@@ -1069,8 +1317,9 @@ def sweep_leftovers(r, days):
 
     def summary(rows, freed):
         big = max(rows, key=lambda t: t[1])
-        return (f"{size(freed)}, nothing written in them for {dur(days * 86400)} or more"
-                f" · largest {big[0]} ({size(big[1])})")
+        return (f"{size(freed)}, nothing written in them for {dur(hours * 3600)} or more"
+                + (f" (under pressure — {usage[1]})" if under else "")
+                + f" · largest {big[0]} ({size(big[1])})")
 
     if r.dry:
         r.log("scratch", "rm", f"{len(take)} leftovers under {tmp}", summary(take, sum(b for _, b in take)))
@@ -1079,13 +1328,13 @@ def sweep_leftovers(r, days):
     # Look again, on readings taken NOW: this pass has been walking a temp root since it read /proc, and what it
     # removes it cannot get back. A candidate something has written to since, or that something is now working
     # in, fails its own rule the second time and stays — with the reason, whichever of the two it is.
-    again = Holds().under(tmp)
+    again = Holds().under(tmp, hours * 3600)
     gone, freed, failed = [], 0, []
     for p, b in take:
         f = scratch_scan(p, dev)
         if f is None:
             continue                                    # gone already: this pass's job, done by somebody else
-        f.update(path=p, days=days, age=max(0.0, now() - f["newest"]), held=again.get(p, []))
+        f.update(path=p, hours=hours, age=max(0.0, now() - f["newest"]), held=again.get(p, []))
         verdict, why = leftover_verdict(f)
         if verdict != "rm":
             r.report("scratch", p, why or f"spared {p}: it changed while this pass was reading the temp root")
@@ -1258,23 +1507,49 @@ def orphan_cpu():
         return ORPHAN_CPU
 
 
-def scratch_days():
-    """Rule 8's threshold in days: CC_JANITOR_SCRATCH_DAYS, default 7. 0 turns the rule off, and so does the key
-    set but empty. A fraction is a fraction of a day — which is how the selfcheck drives the rule against a
-    directory it made a moment ago. A value that is not a number is the default: a typo must not take everything
-    written in the temp root today."""
-    v = setting("CC_JANITOR_SCRATCH_DAYS", str(SCRATCH_DAYS)).strip()
+def hours_setting(key, default):
+    """One of rule 8's two age lines, in hours. 0 turns that line off, and so does the key set but empty. A
+    fraction is a fraction of an hour — which is how the selfcheck drives the rule against a directory it made a
+    moment ago. A value that is not a number is the default: a typo must not take everything written in the temp
+    root in the last minute."""
+    v = setting(key, str(default)).strip()
     if not v:
         return 0.0
     try:
         return max(0.0, float(v))
     except ValueError:
-        return float(SCRATCH_DAYS)
+        return float(default)
+
+
+def scratch_hours():
+    """Rule 8's ordinary age line: CC_JANITOR_SCRATCH_HOURS, default 6. 0 turns the whole rule off."""
+    return hours_setting("CC_JANITOR_SCRATCH_HOURS", SCRATCH_HOURS)
+
+
+def pressure_hours():
+    """…and the shorter one it sweeps to when the temp root is nearly full: CC_JANITOR_SCRATCH_PRESSURE_HOURS,
+    default 1. 0 leaves the ordinary line to do the whole job, however full the root gets."""
+    return hours_setting("CC_JANITOR_SCRATCH_PRESSURE_HOURS", SCRATCH_PRESSURE_HOURS)
+
+
+def scratch_pressure():
+    """…and the share of this user's room in the temp root that counts as nearly full: CC_JANITOR_SCRATCH_PRESSURE,
+    default 0.85. Unreadable is the default — never 0, which would make every pass a pressure pass."""
+    try:
+        return max(0.0, float(setting("CC_JANITOR_SCRATCH_PRESSURE", str(SCRATCH_PRESSURE)).strip()))
+    except ValueError:
+        return SCRATCH_PRESSURE
 
 
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
+    if argv[:1] == ["quota"]:
+        # What box-status prints, and what a session should read the moment something says "Disk quota exceeded":
+        # the limit that ran out is this user's, and df cannot see it.
+        u = temp_usage()
+        print(u[1] if u else f"cc-janitor: {tempfile.gettempdir()}: neither a quota nor a filesystem would answer")
+        return 0 if u else 1
     dry = "--dry" in argv
     net = "--no-net" not in argv
     only_fixtures = "--fixtures" in argv                # rule 6 alone: cheap enough for cc-reconcile's 20-min pass
@@ -1285,7 +1560,8 @@ def main(argv):
             print("cc-janitor: no repos configured (CC_JANITOR_REPOS in ~/.cc/config) — no repo swept")
     elif not repos and not only_fixtures:
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
-        print("usage: cc-janitor <repo> [<repo> …] [--dry] | --configured [--dry] | --fixtures [--dry] | selfcheck", file=sys.stderr)
+        print("usage: cc-janitor <repo> [<repo> …] [--dry] | --configured [--dry] | --fixtures [--dry] | quota"
+              " | selfcheck", file=sys.stderr)
         return 2
     r = Run(dry)
     if not only_fixtures:
@@ -1296,7 +1572,7 @@ def main(argv):
             sweep(repo, r, net)
         sweep_containers(r, container_days())
         sweep_orphans(r, orphan_hours(), orphan_cpu())
-        sweep_leftovers(r, scratch_days())
+        sweep_leftovers(r, scratch_hours(), pressure_hours(), scratch_pressure())
     sweep_fixtures(r)
     print(f"cc-janitor: {len(r.did)} swept, {len(r.said)} reported"
           f"{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
@@ -1453,13 +1729,18 @@ def selfcheck():
 
     # rule 8 — what a finished run left on disk in the temp root
     def L(**kw):
-        d = {"path": "/tmp/ws", "ours": True, "plain": True, "age": 30 * 86400, "held": [], "days": 7}
+        d = {"path": "/tmp/ws", "ours": True, "plain": True, "age": 30 * 86400, "held": [], "hours": 6}
         d.update(kw)
         return d
 
     ok("a scratch entry nothing has written in for weeks is removed", leftover_verdict(L())[0] == "rm")
-    ok("…one written in yesterday is left alone, and unremarked", leftover_verdict(L(age=86400)) == ("keep", ""))
-    ok("…and the days are the configured ones", leftover_verdict(L(age=86400, days=0.5))[0] == "rm")
+    ok("…AND ONE FROM THIS MORNING GOES TOO: the line is hours, because the room that runs out is one day's "
+       "leftovers and a week's patience never gets that day back",
+       leftover_verdict(L(age=7 * 3600))[0] == "rm")
+    ok("…one written in within the hours is left alone, and unremarked",
+       leftover_verdict(L(age=3600)) == ("keep", "") and leftover_verdict(L(age=5 * 3600)) == ("keep", ""))
+    ok("…and the hours are the configured ones",
+       leftover_verdict(L(age=3600, hours=0.5))[0] == "rm" and leftover_verdict(L(age=7 * 3600, hours=12)) == ("keep", ""))
     ok("A DIRECTORY SOMETHING IS WORKING IN SURVIVES, however long its own clock has stood still, and what held "
        "it is named", leftover_verdict(L(held=["pid 42 (node) is working in it"]))[0] == "report"
        and "pid 42 (node)" in leftover_verdict(L(held=["pid 42 (node) is working in it"]))[1])
@@ -1473,8 +1754,112 @@ def selfcheck():
        and leftover_verdict(L(plain=False, age=10 ** 9)) == ("keep", ""))
     ok("what a sweep freed is said in units a person reads",
        size(512) == "512 B" and size(5 << 20) == "5.0 MB" and size(3 << 30) == "3.0 GB")
+    ok("…and so is how long, in the largest unit that means anything — SUB-HOUR TOO, now that the pressure "
+       "line can be one and 'the age line is 0h' says nothing about what is about to go",
+       dur(2 * 86400) == "2d" and dur(6 * 3600) == "6h" and dur(90 * 60) == "1h"
+       and dur(30 * 60) == "30m" and dur(45) == "45s")
 
-    # the hold — what counts as being inside the directory a rule is about to remove
+    # rule 8's other half — the age line moves with how full the temp root is for THIS USER
+    ok("with room to spare the age line is the configured one", scratch_line(6, 0.4, 0.85, 1) == (6, False))
+    ok("…and AT THE PRESSURE MARK IT DROPS to the shorter one, which is what the pass then says it swept to",
+       scratch_line(6, 0.85, 0.85, 1) == (1, True) and scratch_line(6, 0.99, 0.85, 1) == (1, True))
+    ok("PRESSURE NEVER LENGTHENS A LINE: a box already sweeping to half an hour does not become laxer for "
+       "being full — AND SAYS NOTHING ABOUT PRESSURE, because nothing moved",
+       scratch_line(0.5, 0.99, 0.85, 1) == (0.5, False) and scratch_line(1, 0.99, 0.85, 1) == (1, False))
+    ok("A TEMP ROOT NOTHING COULD MEASURE IS NOT PRESSURE — an unreadable quota must not turn into a harder "
+       "sweep", scratch_line(6, None, 0.85, 1) == (6, False))
+    ok("…and 0 pressure hours leaves the ordinary line to do the whole job, however full it is",
+       scratch_line(6, 0.99, 0.85, 0) == (6, False))
+
+    # …and the reading it moves on: this user's quota where there is one, the filesystem where there is not
+    ok("a usage reading is as full as the WORST of the limits it has — space or inodes, since either is what "
+       "'Disk quota exceeded' means", usage_frac((5, 10, 90, 100)) == 0.9 and usage_frac((9, 10, 1, 100)) == 0.9
+       and usage_frac((5, 10, 900, 0)) == 0.5 and usage_frac((5, 0, 9, 0)) == 0.0)
+    ok("…and it is said in one line naming WHOSE limit it is, because a per-user quota is invisible to df",
+       "this user's quota" in usage_line("/tmp", (3 << 30, 6 << 30, 10, 0), "this user's quota")
+       and "50%" in usage_line("/tmp", (3 << 30, 6 << 30, 10, 0), "this user's quota")
+       and "9,000 of 10,000 files" in usage_line("/tmp", (1 << 30, 0, 9000, 10000), "the filesystem")
+       and "no limit on it" in usage_line("/tmp", (1 << 30, 0, 9000, 0), "the filesystem"))
+    # THE DECODE, ON BUFFERS THIS SUITE PACKS ITSELF. A wrong offset or a missing 1024 here does not fail —
+    # it returns a plausible fraction, and the harder sweep runs on it. So every branch is driven, and the
+    # numbers are distinct so a field read off the wrong offset cannot come back looking right.
+    def dqblk(bhard=0, bsoft=0, space=0, ihard=0, isoft=0, inodes=0, valid=QIF_BLIMITS | QIF_ILIMITS):
+        return struct.pack(DQBLK, bhard, bsoft, space, ihard, isoft, inodes, 0, 0, valid)
+
+    ok("the struct this decodes is the struct the KERNEL WRITES — 72 bytes, its tail padding included: a "
+       "68-byte buffer is four bytes shorter than the write it is handed",
+       struct.calcsize(DQBLK) == 72 and len(dqblk()) == 72)
+    ok("EVERY FIELD COMES OFF ITS OWN OFFSET: six distinct numbers in, and used space, limit, inodes and inode "
+       "limit each read back the one that was put there",
+       quota_decode(dqblk(bhard=1, bsoft=2, space=3, ihard=4, isoft=5, inodes=6)) == (3, 1024, 6, 4))
+    ok("…and A LIMIT IS 1 kB BLOCKS WHILE USAGE IS BYTES: scaling both reads 1024x high, scaling neither "
+       "1024x low, and either is a fraction that looks perfectly reasonable",
+       quota_decode(dqblk(bhard=100, space=51200)) == (51200, 102400, 0, 0))
+    ok("the HARD limit is the one that is hit; the soft one answers only where there is no hard one",
+       quota_decode(dqblk(bhard=100, bsoft=50, space=1))[1] == 100 * 1024
+       and quota_decode(dqblk(bsoft=50, space=1))[1] == 50 * 1024)
+    ok("A LIMIT WHOSE `valid` BIT IS CLEAR IS NOT A NUMBER — each half is read only when its own bit says so",
+       quota_decode(dqblk(bhard=100, ihard=9, space=1, valid=QIF_BLIMITS)) == (1, 102400, 0, 0)
+       and quota_decode(dqblk(bhard=100, ihard=9, space=1, valid=QIF_ILIMITS)) == (1, 0, 0, 9)
+       and quota_decode(dqblk(bhard=100, ihard=9, space=1, valid=0)) is None)
+    ok("…and a filesystem with quotas ON but nothing set for this user is NO QUOTA rather than a full one: "
+       "both limits zero is None, however much is in use",
+       quota_decode(dqblk(space=99, inodes=9)) is None and quota_decode(dqblk(ihard=1000, inodes=900))
+       == (0, 0, 900, 1000))
+    ok("THE QUOTA IS THE SOURCE WHERE THERE IS ONE — the fraction is that quota's, and the line says whose it is",
+       temp_usage(tempfile.gettempdir(), read=lambda _p: (1 << 30, 4 << 30, 0, 0))[0] == 0.25
+       and "this user's quota" in temp_usage(tempfile.gettempdir(), read=lambda _p: (1 << 30, 4 << 30, 0, 0))[1])
+    ok("…AND THE FILESYSTEM WHERE THERE IS NONE, named as the filesystem: one source, never the two mixed",
+       (lambda u: u is not None and 0.0 <= u[0] <= 1.0 and "the filesystem" in u[1]
+        and "this user's quota" not in u[1] and u[0] == usage_frac(fs_usage(tempfile.gettempdir())))
+       (temp_usage(tempfile.gettempdir(), read=lambda _p: None)))
+    ok("…and where NEITHER answers it is None and not a guess — a path that is not there crashes nothing, and "
+       "every one of these only READS",
+       temp_usage(f"/nonesuch-{os.getpid()}", read=lambda _p: None) is None
+       and fs_usage(f"/nonesuch-{os.getpid()}") is None and quota_read(f"/nonesuch-{os.getpid()}") is None
+       and (lambda u: u is not None and 0.0 <= u[0] and tempfile.gettempdir() in u[1])(temp_usage()))
+
+    # THE TWO HOLDS A CWD MISSES. Both are the same failure in different clothes: something is plainly using a
+    # directory and has no working directory anywhere near it.
+    with tempfile.TemporaryDirectory() as fdd:
+        open(f"{fdd}/held.bin", "w").write("x")
+        fh = open(f"{fdd}/held.bin")
+        ok("A FILE A LIVE PROCESS HAS OPEN HOLDS ITS DIRECTORY, and is named for what it is — no cwd is "
+           "anywhere near it, and an age test alone would take it out from under the reader",
+           (str(os.getpid()), os.path.realpath(f"{fdd}/held.bin")) in live_paths()
+           and any("has it open" in w for w in Holds().on(fdd))
+           and not any(inside(os.path.realpath(fdd), c) for _pid, c in live_cwds()))
+        fh.close()
+        ok("…and once it is closed it holds nothing: the fd is the evidence, not the name",
+           not any("has it open" in w for w in Holds().on(fdd)))
+
+    with tempfile.TemporaryDirectory() as sd:
+        pj, live_s, quiet_s = f"{sd}/projects", f"{sd}/tmp/claude-1000/proj-x/sess-a", \
+            f"{sd}/tmp/claude-1000/proj-x/sess-b"
+        os.makedirs(f"{pj}/proj-x")
+        for d_ in (live_s, quiet_s):
+            os.makedirs(d_)
+        for n_, age_ in (("sess-a", 60), ("sess-b", 9 * 3600)):
+            open(f"{pj}/proj-x/{n_}.jsonl", "w").write("{}\n")
+            os.utime(f"{pj}/proj-x/{n_}.jsonl", (now() - age_, now() - age_))
+        ok("A SESSION STILL WRITING ITS TRANSCRIPT HOLDS THE SCRATCH DIRECTORY THE HARNESS GAVE IT — between "
+           "two tool calls it has no process and no fd, and its whole tree below the temp root is ONE candidate",
+           live_sessions(f"{sd}/tmp", 6 * 3600, pj) == [live_s])
+        ok("…and one that went quiet before the age line holds nothing, while a longer line reaches both: the "
+           "TRANSCRIPT is the evidence, never the name of the directory",
+           sorted(live_sessions(f"{sd}/tmp", 20 * 3600, pj)) == sorted([live_s, quiet_s])
+           and live_sessions(f"{sd}/tmp", 0, pj) == [] and live_sessions(f"{sd}/tmp", None, pj) == [])
+
+    # the hold — how it is said, and what counts as being inside the directory a rule is about to remove
+    hw = Holds.why([], ["rec.json points into it"], opens=["a", "b", "c"], sessions=["/s1", "/s2", "/s3"])
+    ok("EACH KIND OF HOLD IS NAMED FOR WHAT IT IS, two of it at a time and a count of the rest — a live harness "
+       "tree is held by forty things at once, and a spare line nobody can read is a spare nobody acts on",
+       sum("has it open" in x for x in hw) == 2 and "+1 more have it open" in hw
+       and sum("still writing its transcript" in x for x in hw) == 2
+       and "+1 more sessions are still writing theirs" in hw and hw[-1] == "rec.json points into it")
+    ok("…and under the cap they are all named, with no count tacked on",
+       Holds.some(["one", "two"], "more have it open") == ["one", "two"]
+       and Holds.some(["one", "two", "three"], "more have it open") == ["one", "two", "+1 more have it open"])
     ok("a directory is held by its own path and by anything under it, and by nothing beside it",
        inside("/a/b", "/a/b") and inside("/a/b", "/a/b/c/d") and inside("/a/b/", "/a/b/c")
        and not inside("/a/b", "/a/bb") and not inside("/a/b", "/a") and not inside("/a/b", "/x/a/b"))
@@ -1490,6 +1875,9 @@ def selfcheck():
         env = dict(os.environ, HOME=th, TMPDIR=ftmp, PATH=f"{fake}:{os.environ.get('PATH', '')}",
                    CC_FAKE_TMUX=f"{th}/tmux.txt", CC_FAKE_GH=f"{th}/gh.json", CC_FAKE_DOCKER=f"{th}/docker.txt",
                    CC_JANITOR_HOLDS="~/.cc/state/records/*.json",
+                   CC_JANITOR_SCRATCH_PRESSURE="2",     # …out of reach: a fraction is never 2, so no run below
+                   # is a pressure pass unless it says so — otherwise how full the REAL temp root happens to be
+                   # tonight would decide what this suite sees.
                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
         for name, body in (("tmux", FAKE_TMUX), ("gh", FAKE_GH), ("docker", FAKE_DOCKER)):
             open(f"{fake}/{name}", "w").write(body)
@@ -2070,20 +2458,50 @@ def selfcheck():
            os.path.exists(f"{declared}/build.txt") and f"{recs}/build.json points into it" in r8b.stdout)
         ok("rule 8: A SOCKET DIRECTORY SURVIVES — nothing has touched it for a month and it is still a door",
            os.path.exists(f"{door}/socket"))
+        # THE PRESSURE PATH, in a temp root of its own — three things written a moment ago, so the ordinary
+        # line spares all three and only the pressure line reaches them. Its own root because the one above has
+        # rule 7's workspaces in it too, and this has to be exact about WHAT a fuller disk changes.
+        ptmp = os.path.realpath(f"{th}/ptmp")
+        for d_ in (f"{ptmp}/fresh", f"{ptmp}/pdeclared", f"{ptmp}/pdoor"):
+            os.makedirs(d_, exist_ok=True)
+        open(f"{ptmp}/fresh/now.txt", "w").write("written just now\n")
+        open(f"{ptmp}/pdeclared/build.txt", "w").write("a build somebody declared\n")
+        psock = socket.socket(socket.AF_UNIX)
+        psock.bind(f"{ptmp}/pdoor/socket")
+        json.dump({"name": "p", "dir": f"{ptmp}/pdeclared"}, open(f"{recs}/pdeclared.json", "w"))
+        pe = dict(TMPDIR=ptmp, CC_JANITOR_SCRATCH_PRESSURE_HOURS="0.000001")
+        rp = run("--dry", **pe, CC_JANITOR_SCRATCH_PRESSURE="0")
+        rn = run("--dry", **pe, CC_JANITOR_SCRATCH_PRESSURE="2")
+        ok("rule 8: A FULL TEMP ROOT SWEEPS HARDER — the tree written a moment ago is a candidate under "
+           "pressure, and the pass says how full the root is and what line it dropped to",
+           f"would rm 1 leftovers under {ptmp}" in rp.stdout and "the age line is" in rp.stdout
+           and f"{ptmp}:" in rp.stdout and "%" in rp.stdout)
+        ok("rule 8: …and with room to spare the same tree is left alone: nothing differs but the fullness",
+           f"leftovers under {ptmp}" not in rn.stdout and "the age line is" not in rn.stdout)
+        ok("rule 8: PRESSURE MOVES THE PATIENCE AND NOTHING ELSE — a fuller disk is never a reason to take "
+           "what is held or what is a door, and it is still only what --dry says it would take",
+           f"spared {ptmp}/pdeclared" in rp.stdout and f"{ptmp}/pdoor" not in rp.stdout
+           and os.path.exists(f"{ptmp}/fresh/now.txt") and os.path.exists(f"{ptmp}/pdoor/socket"))
+        ok("rule 8: …and 0 pressure hours leaves the ordinary line alone, however full it is said to be",
+           f"leftovers under {ptmp}" not in
+           run("--dry", TMPDIR=ptmp, CC_JANITOR_SCRATCH_PRESSURE="0",
+               CC_JANITOR_SCRATCH_PRESSURE_HOURS="0").stdout)
+        psock.close()
+        os.remove(f"{recs}/pdeclared.json")
         ok("rule 8: what it cleared is in the log, with the room it made",
            f"rm 2 leftovers under {ftmp}" in open(f"{th}/.cc/state/janitor.log").read())
-        ok("rule 8: …and 0 days turns the rule off — the same temp root, and not a word about it",
+        ok("rule 8: …and 0 hours turns the rule off — the same temp root, and not a word about it",
            "scratch leftovers" in run("--dry").stdout
-           and "scratch leftovers" not in run("--dry", CC_JANITOR_SCRATCH_DAYS="0").stdout
-           and "scratch leftovers" not in run("--dry", CC_JANITOR_SCRATCH_DAYS="").stdout)
+           and "scratch leftovers" not in run("--dry", CC_JANITOR_SCRATCH_HOURS="0").stdout
+           and "scratch leftovers" not in run("--dry", CC_JANITOR_SCRATCH_HOURS="").stdout)
         ok("rule 8: …and a value that is not a number is the DEFAULT — neither off, which would let a temp root "
            "fill again quietly, nor a sweep of everything written today",
-           f"leftovers under {ftmp}" in run("--dry", CC_JANITOR_SCRATCH_DAYS="0.000001").stdout
-           and f"leftovers under {ftmp}" not in run("--dry", CC_JANITOR_SCRATCH_DAYS="nonsense").stdout
-           and f"spared {serving}" in run("--dry", CC_JANITOR_SCRATCH_DAYS="nonsense").stdout)
+           f"leftovers under {ftmp}" in run("--dry", CC_JANITOR_SCRATCH_HOURS="0.000001").stdout
+           and f"leftovers under {ftmp}" not in run("--dry", CC_JANITOR_SCRATCH_HOURS="nonsense").stdout
+           and f"spared {serving}" in run("--dry", CC_JANITOR_SCRATCH_HOURS="nonsense").stdout)
         # …AND WITH THE AGE LINE AT ZERO THE HOLD IS ALL THAT IS LEFT. Every entry in the root is a candidate
         # now, so what comes through this comes through on what is using it and on nothing else.
-        rz = run(CC_JANITOR_SCRATCH_DAYS="0.000001")
+        rz = run(CC_JANITOR_SCRATCH_HOURS="0.000001")
         ok("rule 8: with the age line at zero the young tree goes — being young was the only thing keeping it",
            not os.path.exists(touched))
         ok("rule 8: …and THE HELD ONES AND THE DOOR ARE STILL THERE, on the hold and the shape alone",
@@ -2097,12 +2515,47 @@ def selfcheck():
         # temp root holds a minutes-old picture by the time it removes anything, and a process that started in
         # the meantime would not be in it. Here the first reading is dropped altogether, so the hold that spares
         # these two is the one taken at the removal itself.
-        rb = run(CC_JANITOR_SCRATCH_DAYS="0.000001", CC_JANITOR_SCRATCH_BLIND="1")
+        rb = run(CC_JANITOR_SCRATCH_HOURS="0.000001", CC_JANITOR_SCRATCH_BLIND="1")
         ok("rule 8: THE SECOND LOOK IS WHAT IT DELETES ON — with the pass's own reading dropped, the directory a "
            "live process is working in and the one a record points into both still survive, and are named",
            os.path.exists(f"{serving}/cache.txt") and os.path.exists(f"{declared}/build.txt")
            and f"spared {serving}" in rb.stdout and f"spared {declared}" in rb.stdout
            and f"pid {sitter8.pid}" in rb.stdout and f"{recs}/build.json points into it" in rb.stdout)
+        # THE TWO HOLDS A CWD MISSES, END TO END, in a temp root of its own. Everything in it is a month old,
+        # so the age line reaches all three and only the hold decides — which is the whole point: at six hours
+        # a busy box's temp root is full of directories in use that no process is STANDING in.
+        stmp, proj = os.path.realpath(f"{th}/stmp"), "-home-x-dev-p"
+        slive, squiet, sopen = f"{stmp}/claude-live", f"{stmp}/claude-quiet", f"{stmp}/opened"
+        os.makedirs(f"{th}/.claude/projects/{proj}", exist_ok=True)
+        for d_ in (f"{slive}/{proj}/sess-a", f"{squiet}/{proj}/sess-b", sopen):
+            os.makedirs(d_, exist_ok=True)
+        open(f"{sopen}/data.bin", "w").write("z" * 2048)
+        for n_, age_ in (("sess-a", 60), ("sess-b", 30 * 86400)):     # one still writing, one long finished
+            tx_ = f"{th}/.claude/projects/{proj}/{n_}.jsonl"
+            open(tx_, "w").write("{}\n")
+            os.utime(tx_, (now() - age_, now() - age_))
+        for p_ in (slive, f"{slive}/{proj}", f"{slive}/{proj}/sess-a", squiet, f"{squiet}/{proj}",
+                   f"{squiet}/{proj}/sess-b", sopen, f"{sopen}/data.bin"):
+            os.utime(p_, (month, month))
+        # …and one process holding a file open in the third, standing nowhere near it
+        opener = fixture("bash", "-c", f"exec 9< '{sopen}/data.bin'; sleep 300", cwd=th)
+        time.sleep(0.4)
+        rs = run("--dry", TMPDIR=stmp)
+        ok("rule 8: A FILE SOMETHING HAS OPEN HOLDS ITS DIRECTORY — nothing's cwd is inside it, and the pass "
+           "says which pid holds it and how",
+           f"spared {sopen}" in rs.stdout and f"pid {opener.pid}" in rs.stdout and "has it open" in rs.stdout)
+        ok("rule 8: A HARNESS SESSION STILL WRITING ITS TRANSCRIPT HOLDS ITS SCRATCH TREE — it has no process "
+           "at all between two tool calls, and one live session spares the tree it shares",
+           f"spared {slive}" in rs.stdout and "still writing its transcript" in rs.stdout)
+        ok("rule 8: …while a tree holding only a session that went quiet is a leftover like any other — it is "
+           "the transcript that decides and never the name",
+           f"spared {squiet}" not in rs.stdout and f"would rm 1 leftovers under {stmp}" in rs.stdout
+           and f"largest {squiet}" in rs.stdout)
+        ok("rule 8: …and every one of those three is still on disk: that was a dry run",
+           os.path.isdir(slive) and os.path.isdir(squiet) and os.path.exists(f"{sopen}/data.bin"))
+        os.killpg(os.getpgid(opener.pid), signal.SIGKILL)
+        opener.wait(timeout=10)
+
         sock.close()
         os.killpg(os.getpgid(sitter8.pid), signal.SIGKILL)
         sitter8.wait(timeout=10)

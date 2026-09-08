@@ -32,8 +32,32 @@ def kind(t): return t.get("kind") or "track"
 # row actually carries is here — what `add` stamps, `agent`/`agent_at` (owner, 2026-09-04) and `instructions` (the
 # door's own name, handled above and never reaching the check below) — so a typo is refused, naming this list,
 # rather than writing a key nothing will ever read.
-FIELDS = ("agent", "agent_at", "branch", "created", "instructions", "kind", "notes",
+FIELDS = ("agent", "agent_at", "branch", "created", "held", "held_at", "held_by", "instructions", "kind", "notes",
           "pr", "session_id", "started", "status", "title", "updated", "worktree")
+# A ROW SOMEBODY IS DELIBERATELY SITTING ON (2026-09-07). A status word says where the work got to; it cannot say
+# "a person stopped this, and here is what has to happen first". So every watcher that judged a row by its status
+# alone nagged about rows that were held on purpose: the secretary called a board undriven because of one, and the
+# board watchdog told a reader four times to "review and land it" — once about a PR whose approval had been
+# withdrawn because landing it early opened a hole. `held` is the reason, in the holder's own words, and it is
+# read by cc-secretary's driving count, cc-reconcile's watchdog and cc-pulse's dispatch offer, each of which
+# leaves such a row alone. It changes NOTHING else about the row — status, PR, notes and the `agent` mark all
+# stand, and `cc board show` prints the row with its reason, because a held row must stay visible to be released.
+# Set and cleared here and nowhere else: `set <repo> <track> held "<reason>"`, `set … held ""` to lift it.
+# `held_by`/`held_at` are stamped beside it, like `agent_at` beside a mark, and neither is settable by hand.
+def holder():
+    """Who put a row on hold — the tmux window a session runs in, else the login name. Best effort and NEVER
+    fatal: unlike a mark, a hold claims nothing and grants nothing, so a name nobody can read is a worse label
+    and not a hole. The reason is what a reader acts on; this only says whom to go and ask."""
+    pane = os.environ.get("TMUX_PANE") or ""
+    if pane:
+        try:
+            p = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{window_name}"],
+                               capture_output=True, text=True, timeout=10)
+            if not p.returncode and (p.stdout or "").strip("\n"):
+                return clean(p.stdout.strip("\n"))
+        except Exception:
+            pass
+    return clean(os.environ.get("USER") or "?")
 # WHO IS ON A ROW, when nothing on the box is (owner, 2026-09-04: backlog rows run as a planning session's own
 # subagents). Such a row has no worker process, no cc-loop and no tmux window of its own, so cc-reconcile saw an
 # empty worktree and called it abandoned ten minutes later, and cc-pulse offered it for dispatch on every tick.
@@ -414,10 +438,19 @@ def main(a):
             # box doing it, which is the failure the expiry exists to end (review of #242).
             sys.exit("cc-board set … agent_at: not settable — the time is stamped by `set … agent me`, which is "
                      "also how a session still on a row refreshes it")
+        if key in ("held_at", "held_by"):
+            # Same rule, same reason as agent_at: both are stamped as a side effect of the hold itself, and a
+            # hand-written holder would name somebody who never agreed to be asked about it.
+            sys.exit(f"cc-board set … {key}: not settable — both are stamped by `set … held \"<reason>\"`, which "
+                     "is also how a hold is lifted (`set … held \"\"`)")
         if key not in FIELDS:
             sys.exit(f"cc-board set: '{key}' is not a field this board knows — known fields: {', '.join(FIELDS)}")
         if key == "agent": val = agent_id(val, repo)  # `me` becomes this session's window — asked BEFORE the lock,
-        with Lock(repo):                              # because it shells out to tmux and the board is one file
+        held_by = ""                                  # because it shells out to tmux and the board is one file
+        if key == "held":                             # …and holder() shells out to tmux the same way, with the same
+            val = clean(val)                          # 10 s timeout: a board every session writes must not be held
+            held_by = holder() if val else ""         # shut while one of them waits on a tmux server
+        with Lock(repo):
             d = need(repo)
             if track not in d["tracks"]: sys.exit(f"no track '{track}'")
             if key=="started": val = val.lower() in ("1","true","yes")
@@ -427,6 +460,13 @@ def main(a):
             # WHEN the mark was made, beside it. `updated` cannot answer this — every other `set` moves it too —
             # and the readers need the age to expire a mark whose session moved on (see the note on agent_id).
             if key=="agent": d["tracks"][track]["agent_at"] = now() if val else ""
+            # …and WHO and WHEN beside a hold, for the same reason: the readers below print the reason, and a
+            # reader who wants it lifted has to know whom to ask. Logged both ways — a hold nobody can find in
+            # the log is a hold nobody lifts.
+            if key=="held":
+                d["tracks"][track]["held_by"] = held_by
+                d["tracks"][track]["held_at"] = now() if val else ""
+                d["log"].append({"ts":now(),"track":track,"msg":f"held: {val}" if val else "hold lifted"})
             d["tracks"][track][key]=val; d["tracks"][track]["updated"]=now()
             _save(repo,d)
     elif cmd == "handover":
@@ -534,6 +574,10 @@ def main(a):
             else: print(f"  {ico.get(t.get('status'),'?')} \033[1m{tr}\033[0m [{t.get('status')}]  {t.get('title','')}")
             detail = delivery(repo, tr) if kind(t) != "session" else ""
             if detail: print(detail)
+            # THE HOLD IS THE FIRST THING UNDER THE ROW. Every watcher is quiet about a held row on purpose, so
+            # this view is the only place it is offered to a person at all — and a hold with no reason in sight
+            # is the note the watchdog could not read, again.
+            if t.get("held"): print(f"      held ({t.get('held_by') or '?'}): {str(t['held'])[:160]}")
             b = brief(repo, tr).strip()   # a legacy row migrates on this read, like every other read of the brief
             if b: print(f"      task: {b[:200]}")
             if t.get("pr"): print(f"      PR: {t['pr']}")
@@ -879,6 +923,34 @@ def selfcheck():
            typed.returncode != 0 and fld("h2", "agent") == "@3:900")
         d = json.load(open(f"{th}/.cc/boards/r.json"))
         for row in ("h1", "h2", "h3", "h4"): d["tracks"].pop(row)
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        # A ROW SOMEBODY IS DELIBERATELY SITTING ON (see `held` up top). The watchers each have their own case;
+        # these are the ones this file owns — the word goes on, the word comes off, and the row is otherwise
+        # exactly the row it was.
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        d["tracks"]["k1"] = {"title": "k1", "status": "review", "kind": "track", "pr": "#325",
+                             "agent": "@3:900", "agent_at": "2020-01-01T00:00:00Z",
+                             "notes": [{"ts": now(), "msg": "behind #309"}], "updated": now()}
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        run("set", "r", "k1", "held", "behind #309, which carries a paid verdict — #309 first, then rebase")
+        sh = run("show", "r").stdout
+        ok("`set … held` stores the reason and stamps who held it and when",
+           fld("k1", "held").startswith("behind #309") and fld("k1", "held_by") and fld("k1", "held_at"))
+        ok("…and `show` still lists a held row, with its reason: every watcher is quiet about it on purpose, so "
+           "this is the only place a person is offered it at all",
+           "\033[1mk1\033[0m [review]" in sh and "      held (" in sh and "behind #309" in sh)
+        ok("…while NOTHING ELSE about the row changes — status, PR, notes and the `agent` mark all stand",
+           (fld("k1", "status"), fld("k1", "pr"), fld("k1", "agent")) == ("review", "#325", "@3:900")
+           and fld("k1", "agent_at") == "2020-01-01T00:00:00Z" and "#325" in sh and "behind #309" in sh)
+        by, at = run("set", "r", "k1", "held_by", "someone"), run("set", "r", "k1", "held_at", now())
+        ok("neither stamp is settable by hand — a typed holder names somebody who never agreed to be asked — "
+           "and the hold is left exactly as it was",
+           by.returncode != 0 and at.returncode != 0 and fld("k1", "held_by") != "someone"
+           and fld("k1", "held").startswith("behind #309"))
+        run("set", "r", "k1", "held", "")
+        ok("`set … held ''` lifts the hold and clears both stamps: the row goes back to being every watcher's",
+           (fld("k1", "held"), fld("k1", "held_by"), fld("k1", "held_at")) == ("", "", ""))
+        d = json.load(open(f"{th}/.cc/boards/r.json")); d["tracks"].pop("k1")
         json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
         # A FIXTURE IS NOT A BOARD: a `_cctest<pid>` board with a waiting row beside the real one is in neither `list`
         # nor `boards` unless `--all` asks — the one rule every reader of ~/.cc/boards calls or names
