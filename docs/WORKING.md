@@ -43,10 +43,15 @@ itself, with git and `gh`.
 A hand-made `planning/<branch>` gets no automatic repair round: on a LAND-AFTER-FIX the landing queue's fix
 iteration branches a fresh worktree and pushes where the PR is not, so on that path this session resumes the
 builder itself. Keep the prompt minimal — point it at the row's `task.md` and at these working rules, and say
-it stays in the worktree and does not commit. When it returns, this session commits and lands it, and the landing's review is the verdict. A
-reviewer subagent reads the diff first only where the landing will not review that head — a paused repo, a
-`--no-review` landing — and a security-reviewer where a gate or a member boundary changes; never as a second
-opinion on a diff the lander is about to read (astra review 2026-09-06, cut 3).
+it stays in the worktree and does not commit. When it returns, this session commits, opens the PR and reviews
+it HERE — once, at the open, not again inside the landing slot. A reviewer subagent reads the diff against the
+row's brief (on the worker model where the diff is control layer: that is the read the landing would otherwise
+buy), and `cc-land record <repo> <pr> <verdict> --by <who> --head <the sha it read>` writes the answer onto the
+PR — `--head` because a branch pushed between the read and the record would otherwise inherit the pass. The
+record is keyed to the diff and not the head SHA, so the rebase before merging keeps it and an edit does not.
+A landing that finds one buys no review — most of the hour a PR used to spend queued. A security-reviewer still
+reads anything touching a gate or a member boundary. Record nothing and the landing reviews it itself, as
+before (astra review 2026-09-06, cut 3: the diff is read once — this moves that one read to the open).
 
 Leave the row `queued` while a subagent holds it, and record the claim with `cc-board note`. `queued` is the
 only word cc-reconcile leaves alone: a subagent is not a worker, a cc-loop or a track pane, so the row is

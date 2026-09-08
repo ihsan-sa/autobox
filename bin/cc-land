@@ -3,9 +3,13 @@
 
   cc-land <repo> <pr-number> [<pr-number> …]      the PR path; several PRs deploy once, at the end
   cc-land <repo> <pr-number> --no-review          …without the review gate: land a diff nothing read
-  cc-land <repo> <pr-number> --re-review          …asking again about a head already reviewed (it costs again)
+  cc-land <repo> <pr-number> --re-review          …asking again about a diff already reviewed (it costs again)
   cc-land <repo> <pr-number> --full-gates         …every gate, instead of the ones the diff has earned
   cc-land <repo> --track <t> --note "<what>"      work with no PR (a config edit, a host change)
+  cc-land record <repo> <pr> <verdict> --by <who> [--head <sha>] [--findings <text>|-]
+                                                  write down a review that already happened, against the change the
+                                                  PR is at now (--head: the SHA you read, refused if it has moved).
+                                                  The landing that finds it buys no review of its own
   cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does
   cc-land queue --task <repo> <row>               complete a task; JSON receipt on stdout, queue only with a grant
   cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). Every
@@ -44,8 +48,13 @@ WHAT IT WILL NOT DO, and why each line is here:
     NOT take that way — the review is the thing that replaces a person reading the diff. It fails CLOSED: a
     Claude usage limit merges nothing unread — the queued job WAITS for the reset cc-limit names (not_before) and
     runs itself again then, the attempt uncounted and the owner untroubled, because nothing has been decided about
-    the PR. One verdict per head: a re-run reads the verdict back off its own PR comment instead of buying a
-    second, differing opinion. And a review that runs out of the cap THIS script sets — money or turns,
+    the PR. ONE VERDICT PER CHANGE, and the landing does not care who reached it: the answer is a comment THIS BOX
+    wrote on the PR, keyed to the change itself (a digest of the diff against its merge-base, which a rebase does
+    not move and a real edit does — see change_digest), so a landing that finds one reads it instead of buying a
+    second, differing opinion. That is what `cc-land record` writes: the planning session reviews its own diff when
+    it OPENS the PR and records the verdict, and the landing slot then only checks — the change is the one that was
+    read, the gates are green, the PR is mergeable — and merges. A paid review still happens here when nothing
+    recorded one. And a review that runs out of the cap THIS script sets — money or turns,
     `CC_LAND_REVIEW_BUDGET` and `CC_LAND_REVIEW_TURNS`, both settable without editing this file — is a third
     outcome rather than a verdict: it read nothing, so it says what it spent and which number to raise, it costs
     the change neither its routine review nor its repair round, and that head is refused until the cap that
@@ -118,7 +127,7 @@ honest answer and the point: an ask nobody can measure is not an ask that is don
 Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
 cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
-import ast, calendar, fcntl, fnmatch, glob, json, os, re, select, shlex, shutil, signal, subprocess, sys
+import ast, calendar, fcntl, fnmatch, glob, hashlib, json, os, re, select, shlex, shutil, signal, subprocess, sys
 import tempfile, threading, time
 import urllib.parse, urllib.request
 
@@ -1058,6 +1067,31 @@ def name_status(text):
     return rows
 
 
+HUNK = re.compile(r"^@@ -[0-9,]+ \+[0-9,]+ @@")
+
+
+def change_digest(diff):
+    """A `git diff` text -> the 40 hex characters that name the CHANGE it describes, or "" for no diff at all.
+
+    Two lines of that text move under a rebase without the change moving, and they are the only two dropped here:
+      · `index <blob>..<blob> <mode>` — the pre-image blob's name, which changes whenever the base side of that
+        file changed, however far from the hunk.
+      · the line NUMBERS in a hunk header, which shift when the base grew or shrank above the hunk.
+    Everything else is hashed verbatim, WHITESPACE INCLUDED. `git patch-id` was the obvious thing to call here and
+    it is wrong for this: it strips whitespace, so moving a statement out of an `if` in a .py file — a behaviour
+    change — hashes identical to the original (measured on a throwaway repo, 2026-09-08). That answer is what a
+    landing skips its review on, so the one direction this must never err in is calling two different diffs the
+    same. `patch-id --verbatim` keeps the whitespace but keys on the line numbers too, and git refuses to combine
+    it with `--stable`."""
+    keep = []
+    for ln in (diff or "").splitlines():
+        if ln.startswith("index "):
+            continue
+        keep.append(HUNK.sub("@@", ln) if ln.startswith("@@ ") else ln)
+    body = "\n".join(keep).strip()
+    return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:40] if body else ""
+
+
 # ── the landing ──────────────────────────────────────────────────────────────────────────────────────────
 class Land:
     def __init__(self, repo, pr=None, track=None, note="", span=None, review=True, re_review=False, full_gates=False):
@@ -1069,6 +1103,7 @@ class Land:
         self.verdict = ""        # the review's answer as a FIELD, so the queue can act on LAND-AFTER-FIX without
         self.findings = ""       # re-reading its own error message — and what the reviewer said, for the fix brief
         self.by = ""             # which model actually read it, so the PR comment cannot claim a different one
+        self._ckey = None        # (head, digest, merge-base): what change this IS — see change_key()
         self._tier = None        # (head, tier, why): decided ONCE per head and shared by the review and the gates
         self.span = span         # (installed_sha, tip_sha): a deploy with no PR, catching the box up to a merge it missed
         self.job = ""            # the queue file this landing is running out of, if any — the stage is written to it
@@ -1248,11 +1283,19 @@ class Land:
         self.reviewed = self.head        # the SHA a dispatched fix round is waiting to see move off
         prior = self.prior_review()
         if prior and not self.re_review:
-            # A re-run of the SAME head does NOT re-ask. It costs ~$2 to be told the same thing non-deterministically,
-            # and the marker would then suppress the new comment — so a second 👍 after a DO-NOT-LAND could merge on a
-            # LAND the PR thread never shows. One head, one verdict, until somebody types --re-review or pushes.
-            verdict, said = prior
-            return self.verdict_result(verdict, said, "reviewed earlier", "at this head",
+            # THE RECORDED VERDICT, and it is the ordinary path now rather than only a guard against buying twice.
+            # The brief: "a PR's review happens once, when the PR opens, and its verdict is recorded against that
+            # exact head; the landing slot then only checks that the head is unchanged since the recorded pass" —
+            # asked here of the CHANGE and not the head SHA (change_key), because the rebase every PR here gets
+            # before it lands moves the head without moving the change. Whoever recorded it — this gate on an
+            # earlier run, or the planning session's own reviewer through `cc-land record` — it is one answer and it
+            # is not bought again. Asking again costs ~$2 to be told the same thing non-deterministically, and the
+            # marker would then suppress the new comment — so a second 👍 after a DO-NOT-LAND could merge on a LAND
+            # the PR thread never shows. One change, one verdict, until somebody types --re-review or pushes a
+            # different diff.
+            verdict, said, who = prior
+            return self.verdict_result(verdict, said, f"read already by {who or 'this box'}",
+                                       "recorded for this change",
                                        ", already on the PR (--re-review to ask again)")
         self.by, tier, why = self.review_model()
         if not self.by:
@@ -1270,9 +1313,10 @@ class Land:
             raise Failed(
                 f"the review budget for this change is spent: PR #{self.pr} has already bought "
                 f"{spent.get('reviews', 0)} review(s) and {spent.get('repairs', 0)} repair round(s), and "
-                f"{self.head[:12]} is a head none of them read. The planning session decides now — read the diff and "
-                f"`cc-land {self.repo} {self.pr} --no-review`, or buy one more with "
-                f"`cc-land {self.repo} {self.pr} --re-review`")
+                f"the diff at {self.head[:12]} is not one they read. The planning session decides now — read it "
+                f"itself and write that down (`cc-land record {self.repo} {self.pr} LAND --by <who>`, which this "
+                f"landing then reads), land with no verdict on the PR (`cc-land {self.repo} {self.pr} "
+                f"--no-review`), or buy one more (`cc-land {self.repo} {self.pr} --re-review`)")
         # …and whether this exact head has already died on a cap. Once it has, it has cost the whole cap to read
         # nothing, and the identical run against the cap that stopped it is the one thing certain to do it again —
         # #194 was queued a second time and would have. So the wall is remembered against the cap that BOUND, and
@@ -1342,27 +1386,93 @@ class Land:
                          f"like a red gate.\n{said}")
         return f"{verb}: LAND on PR #{self.pr} ({cost}{posted})"
 
-    def marker(self, verdict=""):
-        """The comment's machine-readable half: the head it was written about, and the verdict reached there. The
+    def change_key(self):
+        """What this PR IS, as a key a rebase does not change: change_digest() of the diff from its merge-base to
+        its head, and that merge-base. Returns (key, merge-base), either of them "" when git could not say.
+
+        The head SHA was the obvious key and it is the wrong one, in BOTH directions (board note, 2026-09-07):
+          · Too strict. Every PR here is rebased onto the default branch immediately before it lands, which gives a
+            new head SHA for a byte-identical change — #298, #297 and #305 were each refused as "a head none of them
+            read" on a night when eight things landed. Keyed on the head, EVERY landing re-reviews and the point of
+            recording a verdict is never reached. The digest is stable across a pure rebase, and it CHANGES when
+            resolving a conflict altered the diff — which is exactly the case that must be read again, so the
+            property falls out rather than being special-cased.
+          · Too loose. An unchanged head does not mean the pass still holds, because the base moved underneath it.
+            That is a different question — "is this still good on top of what main has now?" — and it belongs to the
+            GATES, which re-run against the real base every landing. It is not answered by buying a second review.
+        Cached per head: this is asked by prior_review() and again by post_review(), and the answer cannot change
+        under a head that has not moved."""
+        if self._ckey and self._ckey[0] == self.head:
+            return self._ckey[1], self._ckey[2]
+        key, mb = "", ""
+        rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root, timeout=120)
+        if rc == 0 and o.strip():
+            mb = o.strip().split()[0]
+            # `mb..head` and `mb...head` are the same diff once mb IS the merge-base, and this one does not need
+            # git to find it again. -U3 is git's default, said out loud so a repo-level diff.context cannot make
+            # the record and the landing that reads it hash two different texts.
+            rc, d = sh(["git", "diff", "-U3", mb, self.head], cwd=self.root, timeout=300, stdout_only=True)
+            if rc == 0:
+                key = change_digest(d)
+        self._ckey = (self.head, key, mb)
+        return key, mb
+
+    def marker(self, verdict="", by=""):
+        """The comment's machine-readable half: what it was written about, and the verdict reached there. The
         VERDICT lives in the marker and not in the prose underneath because the prose is the model's, and a finding
-        about a reviewer quotes verdicts; an HTML comment this script wrote is the only line here it can trust."""
-        return f"<!-- {REVIEW_MARK} {self.head[:12]}{(' ' + verdict) if verdict else ''}"
+        about a reviewer quotes verdicts; an HTML comment this script wrote is the only line here it can trust.
+
+        Keyed on the change (`v2 change=<digest>`) where git can name one, and on the head where it cannot — a
+        repo with no merge-base to read, or a diff git returned nothing for. The fallback is the STRICTER of the
+        two, so an answer we cannot key properly is re-read rather than reused."""
+        key, mb = self.change_key()
+        if not key:     # the older shape, and it is read as well as written: `by` has no place in it, because a
+                        # reader that predates this line would stop matching the moment one appeared
+            return f"<!-- {REVIEW_MARK} {self.head[:12]}{(' ' + verdict) if verdict else ''} -->"
+        v = f" verdict={verdict}" if verdict else ""
+        w = f" by={re.sub(r'[^A-Za-z0-9._@-]+', '-', by)}" if by else ""
+        return f"<!-- {REVIEW_MARK} v2 change={key} base={mb[:12]} head={self.head[:12]}{v}{w} -->"
+
+    def prior_verdict(self, body):
+        """The verdict THIS body records about THIS change, or "". Anchored at the start of the comment, because
+        that is where post_review() and `record` both put the marker and a reviewer's prose is everything after it:
+        a finding that quotes a marker — reviewing this file, one does — is text about the change, not the answer to
+        it, and matching anywhere let the quote win. Reads the v2 key and the older head-keyed one alike, so a
+        verdict recorded before this shape existed is still honoured rather than bought again.
+        Returns (verdict, findings, who read it) or ""."""
+        key, _mb = self.change_key()
+        pats = [re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} {re.escape(self.head[:12])} "
+                           r"(LAND-AFTER-FIX|DO-NOT-LAND|LAND) -->")]
+        if key:                     # …and the change key first: it is the one that survives the rebase before landing
+            pats.insert(0, re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} v2 change={re.escape(key)}(?: [^>]*?)? "
+                                      r"verdict=(LAND-AFTER-FIX|DO-NOT-LAND|LAND)\b[^>]*-->"))
+        for pat in pats:
+            m = pat.match(body)
+            if m:
+                who = re.search(r"\bby=([A-Za-z0-9._@-]+)", m.group(0))
+                return m.group(1), body[m.end():].strip(), (who.group(1) if who else "")
+        return ""
 
     def prior_review(self):
-        """The verdict this box already reached about THIS head, read back off the PR — the comment IS the record,
-        so the thread and the landing can never disagree about what was decided. Returns (verdict, body) or None."""
+        """The verdict this box already reached about THIS change, read back off the PR — the comment IS the record,
+        so the thread, the planning session and the landing can never disagree about what was decided. That is what
+        makes `cc-land record` a first-class writer of it: the landing reads one thing, whoever wrote it.
+
+        Only a comment THIS BOX wrote counts (`viewerDidAuthor`). Anyone who can comment on a PR can type a marker,
+        and this answer is now the ordinary way a landing skips its review rather than a way to avoid buying a second
+        one — so an unverified author here is a merge nobody read. Returns (verdict, findings, who) or None."""
         rc, o = sh(["gh", "pr", "view", str(self.pr), "--json", "comments"], cwd=self.root, timeout=120)
         if rc:
             return None
         try:
-            bodies = [c.get("body") or "" for c in (json.loads(o).get("comments") or [])]
+            cs = json.loads(o).get("comments") or []
         except ValueError:
             return None
-        pat, found = re.compile(re.escape(self.marker()) + r" (LAND-AFTER-FIX|DO-NOT-LAND|LAND) -->"), None
-        for b in bodies:                  # chronological, and the LAST one wins: --re-review posts a second
-            m = pat.search(b)             # comment for the same head on purpose, and its answer is the current one
-            if m:
-                found = m.group(1), b[m.end():].strip()
+        found = None
+        for c in cs:                      # chronological, and the LAST one wins: --re-review posts a second
+            if not isinstance(c, dict) or not c.get("viewerDidAuthor"):
+                continue                  # comment for the same change on purpose, and its answer is the current one
+            found = self.prior_verdict(c.get("body") or "") or found
         return found
 
     def review_prompt(self, tpl, tree, dpath):
@@ -1444,14 +1554,14 @@ class Land:
                          f"Re-run, or --no-review and read it yourself. Said: {last(o)}")
         return text, cost, toks
 
-    def post_review(self, verdict, said):
-        """ONE comment per head, ever. The marker carries the SHA it reviewed, so re-running the same landing adds
-        nothing and a new push gets its own review — the alternative is a PR whose thread is four copies of one
-        verdict, which is how a reviewer stops being read."""
+    def post_review(self, verdict, said, by=""):
+        """ONE comment per change, ever. The marker carries what it was written about, so re-running the same landing
+        adds nothing and a diff that actually moved gets its own review — the alternative is a PR whose thread is
+        four copies of one verdict, which is how a reviewer stops being read."""
         if self.prior_review() and not self.re_review:
             return ", comment already on the PR"
-        body = (f"{self.marker(verdict)} -->\n**cc-land review** — `{self.head[:12]}`, model "
-                f"`{self.by or REVIEW_MODEL}`\n\n"
+        who = by or self.by or REVIEW_MODEL
+        body = (f"{self.marker(verdict, who)}\n**cc-land review** — `{self.head[:12]}`, read by `{who}`\n\n"
                 f"**VERDICT: {verdict}**\n\n{said}")
         rc, o = sh(["gh", "pr", "comment", str(self.pr), "--body", body], cwd=self.root, timeout=120)
         return ", commented on the PR" if rc == 0 else f", the comment did not post ({last(o)})"
@@ -1952,8 +2062,10 @@ class Land:
     def steps(self):
         return self.pr_steps() + self.deploy_steps()
 
-    def load(self):
-        """What GitHub says about the PR, read once, before anything runs."""
+    def load(self, verb="landing"):
+        """What GitHub says about the PR, read once, before anything runs. `verb` is what the caller is here to do:
+        `record` loads a PR it is not going to land, and a first line that said "landing" would be the only word
+        about that run a person sees in the log."""
         if self.span:
             emit(f"deploying [{self.repo}] {self.what()} — merged without this box, so it was never installed")
             return True
@@ -1970,7 +2082,7 @@ class Land:
         except ValueError:
             print(f"cc-land: gh returned no PR #{self.pr}", file=sys.stderr)
             return False
-        emit(f"landing [{self.repo}] PR #{self.pr}: {self.facts.get('title', '')}")
+        emit(f"{verb} [{self.repo}] PR #{self.pr}: {self.facts.get('title', '')}")
         return True
 
     def walk(self, steps):
@@ -2884,6 +2996,117 @@ def cmd_queue(argv):
     return 0
 
 
+def cmd_record(argv):
+    """`cc-land record <repo> <pr> <verdict> --by <who> [--head <sha>] [--findings <text>|-]` — write down a review
+    that has ALREADY happened, against the change the PR is at right now, in the one place the landing reads
+    (see prior_review).
+
+    This is what makes the brief's shape possible: the review happens once, when the PR opens, and the landing slot
+    only checks. The planning session reads its own diff with a reviewer subagent before it opens the PR; that pass
+    is the recorded verdict (boundary, 2026-09-05), and the landing that finds it buys nothing. Where a paid read is
+    still wanted, it happens BEFORE the landing and is recorded here too — never inside the slot.
+
+    What it will not do:
+      · It does not review anything. It writes down an answer somebody else reached, and the `by` field says who, so
+        a verdict with nobody's name on it cannot be recorded at all.
+      · It records against the head the PR is at NOW, resolved here, and never a SHA the caller typed: `--head` is
+        checked against that head and is never used in its place, so a branch pushed between the read and this
+        command is refused instead of inheriting the pass. A record for a head that is not the one on the PR is a
+        pass for code nobody is landing.
+      · It records the CHANGE (a digest of the diff against the merge-base), so the rebase before landing does not
+        throw the record away and a diff that actually moved does not inherit it. See change_digest().
+      · It merges nothing, gates nothing and deploys nothing. The landing still runs the gates, still checks the PR
+        is mergeable and still refuses a head that moved after this record."""
+    repo, rest = (argv[0] if argv else ""), argv[1:]
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo or "") or not rest:
+        print("cc-land: record <repo> <pr> <verdict> --by <who> [--head <sha>] [--findings <text>|-]",
+              file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"[0-9]+", rest[0] or ""):
+        print(f"cc-land: '{rest[0]}' is not a PR number", file=sys.stderr)
+        return 2
+    pr, rest = int(rest.pop(0)), rest
+    verdict = rest.pop(0) if rest else ""
+    if verdict not in REVIEW_VERDICTS:
+        print(f"cc-land: '{verdict}' is not a verdict — one of {', '.join(REVIEW_VERDICTS)}", file=sys.stderr)
+        return 2
+    by, findings, head = "", "", ""
+    while rest:
+        a = rest.pop(0)
+        if a == "--by" and rest:
+            by = rest.pop(0)
+        elif a == "--findings" and rest:
+            findings = rest.pop(0)
+        elif a == "--head" and rest:
+            head = rest.pop(0)
+        else:
+            print(f"cc-land: unexpected '{a}'", file=sys.stderr)
+            return 2
+    if findings == "-":
+        findings = sys.stdin.read().strip()
+    if not by:
+        # A verdict is somebody's. Recorded with no name, it is a line the landing trusts and nobody owns — and the
+        # PR comment it becomes is the only place a person will ever look to find out who read this diff.
+        print("cc-land: record needs --by <who> — a verdict nobody signed is not one this box merges on", file=sys.stderr)
+        return 2
+    head = head.strip().lower()
+    if head and not re.fullmatch(r"[0-9a-f]{7,40}", head):
+        # Shorter than git's own shortest abbreviation, this would match heads it was never about.
+        print(f"cc-land: '{head}' is not a commit — --head takes 7 to 40 hex characters", file=sys.stderr)
+        return 2
+    L = Land(repo, pr=pr)
+    if not os.path.isdir(f"{L.root}/.git"):
+        print(f"cc-land: {L.root} is not a git repo", file=sys.stderr)
+        return 2
+    if not L.load(verb="recording on"):
+        return 1
+    if (L.facts.get("state") or "").upper() == "MERGED":
+        print(f"cc-land: PR #{pr} is already merged — a record guards the merge, and it has happened", file=sys.stderr)
+        return 1
+    try:
+        L.fetch_head()
+    except Failed as e:
+        print(f"cc-land: {e}", file=sys.stderr)
+        return 1
+    # …and the head the caller READ, where it says. Between a reviewer finishing and this command running, the
+    # branch can be pushed again — and this records against whatever is on the PR now, so without this check the
+    # answer to one diff would silently become the pass for another. `--head` is the caller saying which diff was
+    # read; a mismatch is refused rather than recorded, because "a head that moves after its pass is reviewed
+    # again" (the brief's boundary) is only true if something notices the move.
+    if head and not L.head.lower().startswith(head):
+        print(f"cc-land: PR #{pr} is at {L.head[:12]} now, not {head[:12]} — the branch moved after that "
+              f"read, so it is a pass for a diff nobody is landing. Review the head that is there", file=sys.stderr)
+        return 1
+    # A record already standing for THIS change is not quietly overwritten, and not quietly kept either. Same
+    # verdict: nothing to do, say so. Different verdict: refuse and name what stands — a landing reads the LAST
+    # matching comment, so a silent second record would change what merges without anybody deciding it did. To
+    # change the answer, change the diff (which is a new change and a new record) or land with --re-review.
+    stands = L.prior_review()
+    if stands:
+        was, _said, who = stands
+        if was == verdict:
+            print(f"[{repo}] PR #{pr}: {verdict} is already recorded for this change by {who or 'this box'} — "
+                  f"nothing to do")
+            return 0
+        print(f"cc-land: PR #{pr} already carries {was} for this change (by {who or 'this box'}); recording "
+              f"{verdict} over it would change what merges. Push the fix, or land with --re-review", file=sys.stderr)
+        return 1
+    posted = L.post_review(verdict, findings or "No findings.", by=by)
+    if posted != ", commented on the PR":
+        # post_review is the only writer, and it has two ways of not writing: the comment failed, or a record
+        # appeared between the read above and this line. Either way nothing is on the PR, and "recorded" for a
+        # verdict that is not there is the one thing this command must never say — a landing would then look for
+        # a record, find none, and buy the review this claimed it had saved.
+        print(f"cc-land: the record did not reach PR #{pr}{posted}", file=sys.stderr)
+        return 1
+    key, mb = L.change_key()
+    ledger(f"recorded {repo}#{pr} {verdict} by={re.sub(r'[^A-Za-z0-9._@-]+', '-', by)} "
+           f"head={L.head[:12]} change={key[:12] or '-'} base={mb[:12] or '-'}")
+    print(f"[{repo}] PR #{pr}: {verdict} recorded by {by} for {L.head[:12]}{posted} — "
+          f"the landing reads this instead of buying a review")
+    return 0
+
+
 # ── selfcheck: the decision table, with the whole outside world stood in for ─────────────────────────────
 def cmd_selfcheck():
     import contextlib, io
@@ -3353,11 +3576,12 @@ def cmd_selfcheck():
     # The same landing, run again against the same head. The verdict already ON the PR is the answer — asking again
     # costs another ~$2 to be told something slightly different, and the marker would then hide the new answer
     # under the old comment: a second 👍 after a DO-NOT-LAND could merge on a LAND the thread never shows.
-    def again(verdict, **kw):
+    def again(verdict, mine=True, **kw):
         L = fresh(pr=7, **kw)
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
         world["gh pr view 7 --json comments"] = (0, json.dumps({"comments": [
-            {"body": f"<!-- {REVIEW_MARK} {HEAD[:12]} {verdict} -->\n1. a.py:2 — VERDICT: LAND is quoted here"}]}))
+            {"body": f"<!-- {REVIEW_MARK} {HEAD[:12]} {verdict} -->\n1. a.py:2 — VERDICT: LAND is quoted here",
+             "viewerDidAuthor": mine}]}))
         return L, caught(L.review)
     L, r = again("LAND")
     check("re-running the landing does NOT post it twice, and does NOT ask again — one head, one verdict, read "
@@ -3372,6 +3596,159 @@ def cmd_selfcheck():
     check("--re-review is the one way to ask again, and it costs again: the model runs and the new answer is "
           "posted rather than hidden under the old comment",
           [c for c in calls if c[0] == CLAUDE] and len(commented()) == 1)
+    # …and the same LAND written by somebody who is not this box. Anyone who can comment on a PR can type a marker,
+    # and a recorded verdict is now the ordinary way a landing skips its review — so the author is checked, not the
+    # text. A member repo where this were not checked would merge on a comment its own contributor wrote.
+    L, r = again("LAND", mine=False)
+    check("a marker comment this box did NOT write is not a verdict: the review is bought and read as if the "
+          "comment were not there, so a planted LAND merges nothing",
+          [c for c in calls if c[0] == CLAUDE] and "LAND on PR #7" in str(r))
+
+    # ── THE RECORDED VERDICT ────────────────────────────────────────────────────────────────────────────────
+    # The brief: the review happens ONCE, when the PR opens, its verdict is recorded against that change, and the
+    # landing slot only checks that the change is the one that was read. Keyed on a digest of the diff against its
+    # merge-base and NOT on the head SHA, because every PR here is rebased onto main immediately before it lands:
+    # keyed on the head, every landing re-reviews and none of this saves a minute.
+    MB = "b" * 40
+    REBASED = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c"
+    DIFF = ("diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -1,3 +1,4 @@\n def f(x):\n     if x:\n         a()\n+        c()\n")
+    # The same change after a rebase over a base that grew above it: the pre-image blob and the hunk's line numbers
+    # move, not one character of the change. And a genuinely different one.
+    DIFF_REBASED = DIFF.replace("index 1111111..2222222", "index 3333333..4444444").replace("@@ -1,3 +1,4 @@",
+                                                                                            "@@ -40,3 +40,4 @@")
+    DIFF_OTHER = DIFF.replace("+        c()", "+        d()")
+    # …and the one `git patch-id` gets wrong, which is why change_digest does not call it: `c()` moved OUT of the
+    # `if`, which in Python is a different program and to patch-id --stable is the same patch (measured, 09-08).
+    DIFF_DEDENT = DIFF.replace("+        c()", "+    c()")
+    KEY, OTHER = change_digest(DIFF), change_digest(DIFF_OTHER)
+    check("the change key is the diff's own text: a rebase that moves only the blob names and the hunk's line "
+          "numbers keeps it, and a whitespace-only edit — `c()` dedented out of the `if`, which is a different "
+          "program in Python — does NOT, so a recorded pass cannot cover code nobody read",
+          change_digest(DIFF_REBASED) == KEY and change_digest(DIFF_DEDENT) != KEY and OTHER != KEY
+          and len(KEY) == 40 and not change_digest(""))
+
+    def at_change(diff, head=HEAD, recorded="", by="reviewer-subagent", mine=True, **kw):
+        """A landing in front of PR #7 whose diff IS `diff` — with `recorded` (a change key) already written down
+        on it by `by`, or nothing written down at all. Its own fixture, start to finish."""
+        L = fresh(pr=7, **kw)
+        os.makedirs("/tmp/_ccland/.git", exist_ok=True)
+        world["git rev-parse FETCH_HEAD"] = (0, head + "\n")
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        world[f"{BIN}/cc-scope list"] = (0, "[]")
+        world["git merge-base"] = (0, MB + "\n")
+        world[f"git diff -U3 {MB}"] = (0, diff)
+        body = (f"<!-- {REVIEW_MARK} v2 change={recorded} base={MB[:12]} head={HEAD[:12]} verdict=LAND by={by} -->\n"
+                f"**cc-land review** — read by `{by}`\n\n**VERDICT: LAND**\n\n1. a.py:2 — VERDICT: DO-NOT-LAND quoted")
+        world["gh pr view 7 --json comments"] = (0, json.dumps(
+            {"comments": [{"body": body, "viewerDidAuthor": mine}] if recorded else []}))
+        return L, caught(L.review)
+
+    L, r = at_change(DIFF, recorded=KEY)
+    check("a landing whose change carries a recorded pass runs NO review: no model is asked, nothing is bought, "
+          "and the ✓ line names who did read it rather than pretending this landing did",
+          not [c for c in calls if c[0] == CLAUDE] and "LAND on PR #7" in str(r)
+          and "reviewer-subagent" in str(r) and not root_work("myrepo", 7).get("reviews")
+          and not commented())
+    L, r = at_change(DIFF_OTHER, recorded=KEY)
+    check("...and the control: the same PR with the same recorded comment, whose diff has since become a "
+          "DIFFERENT change, is read again — a record is for the change it was written about and no other",
+          len([c for c in calls if c[0] == CLAUDE]) == 1 and root_work("myrepo", 7).get("reviews") == 1)
+    L, r = at_change(DIFF_DEDENT, recorded=KEY)
+    check("...and the control that git patch-id would have failed: the edit is whitespace ONLY, and it is read "
+          "again, because in a .py file that is a different program",
+          len([c for c in calls if c[0] == CLAUDE]) == 1 and root_work("myrepo", 7).get("reviews") == 1)
+    L, r = at_change(DIFF_REBASED, head=REBASED, recorded=KEY)
+    check("a rebase onto a moved base is not a new change: the head SHA is different, the blob names and line "
+          "numbers moved, the change did not, and the recorded pass still answers — this is the case that made "
+          "the head SHA the wrong key",
+          not [c for c in calls if c[0] == CLAUDE] and "LAND on PR #7" in str(r)
+          and REBASED != HEAD and not root_work("myrepo", 7).get("reviews"))
+    L, r = at_change(DIFF, recorded=KEY, mine=False)
+    check("...and a recorded pass on the right change that this box did not WRITE is still no verdict: the "
+          "author is checked on the v2 record exactly as it is on the older one",
+          len([c for c in calls if c[0] == CLAUDE]) == 1)
+
+    # The writer and the reader, end to end: what `record` puts on the PR is what a landing reads back off it. Two
+    # halves that agree by inspection and not by test are two halves that drift — this posts for real (through the
+    # fake gh) and hands the landing exactly the body that came out.
+    wrote = []                # one PR's comment thread, carried across the calls below on purpose: a second record
+                              # has to SEE the first, which is the whole of what these cases are about
+
+    def pr7(diff=DIFF, head=HEAD):
+        """PR #7 as both halves see it: the same diff, the same change key, whatever `wrote` holds so far."""
+        L = fresh(pr=7)
+        os.makedirs("/tmp/_ccland/.git", exist_ok=True)
+        world["git rev-parse FETCH_HEAD"] = (0, head + "\n")
+        world["git rev-parse --abbrev-ref HEAD"] = (0, "main\n")
+        world[f"{BIN}/cc-scope list"] = (0, "[]")
+        world["git merge-base"] = (0, MB + "\n")
+        world[f"git diff -U3 {MB}"] = (0, diff)
+        world["gh pr comment"] = lambda a: (wrote.append(a[a.index("--body") + 1]), (0, ""))[1]
+        world["gh pr view 7 --json comments"] = lambda a: (0, json.dumps(
+            {"comments": [{"body": b, "viewerDidAuthor": True} for b in wrote]}))
+        return L
+
+    def record(argv, world_after=None, **kw):
+        """`record` run against that PR, its output caught rather than printed: a refusal is what several of these
+        cases ARE, and a gate whose green run prints its own error messages is one nobody reads."""
+        pr7(**kw)
+        world.update(world_after or {})
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()) as e:
+            rc = cmd_record(argv)
+        return rc, o.getvalue() + e.getvalue()
+    rc, said = record(["myrepo", "7", "LAND", "--by", "reviewer subagent"])
+    check("`record` writes ONE comment carrying the change it was written about, the head, and who read it — and "
+          "it merges nothing, gates nothing and deploys nothing on its way",
+          rc == 0 and len(wrote) == 1 and f"change={KEY}" in wrote[0] and f"head={HEAD[:12]}" in wrote[0]
+          and "by=reviewer-subagent" in wrote[0] and not ran("gh pr merge") and not ran("install.sh")
+          and not [c for c in calls if c[0] == CLAUDE])
+    r = caught(pr7().review)
+    check("...and the landing reads that very comment back as the verdict, buying nothing — the review happened "
+          "once, when the PR opened, and the slot only checked",
+          "LAND on PR #7" in str(r) and "reviewer-subagent" in str(r)
+          and not [c for c in calls if c[0] == CLAUDE])
+    rc, said = record(["myrepo", "7", "LAND", "--by", "someone else"])
+    check("...and recording the same verdict twice writes nothing further: one change, one comment, whoever asks",
+          rc == 0 and len(wrote) == 1 and "already recorded" in said)
+    rc, said = record(["myrepo", "7", "DO-NOT-LAND", "--by", "someone else"])
+    check("...while recording a DIFFERENT verdict over one that stands is refused and says what stands — a second "
+          "record would silently change what merges, and the landing reads the last one",
+          rc == 1 and len(wrote) == 1 and "already carries LAND" in said)
+    # The three refusals below stand on their own: each counts the thread from where IT found it, so a case that
+    # is moved or dropped cannot make the next one pass for the wrong reason.
+    before = len(wrote)
+    rc, said = record(["myrepo", "7", "LAND"])
+    check("a verdict with nobody's name on it is not recorded: --by is what a person reads to find out who read "
+          "this diff, and the landing prints it instead of claiming the read as its own",
+          rc == 2 and len(wrote) == before and not ran("gh pr comment") and "--by" in said)
+    before = len(wrote)
+    rc, said = record(["myrepo", "7", "PROBABLY-FINE", "--by", "me"])
+    check("...and a word that is not one of the three verdicts is refused before anything is posted",
+          rc == 2 and len(wrote) == before and not ran("gh pr comment"))
+    before = len(wrote)
+    rc, said = record(["myrepo", "7", "LAND", "--by", "me"],
+                      world_after={"gh pr view": (0, json.dumps(dict(FACTS, state="MERGED")))})
+    check("...and a PR that is already MERGED takes no record: a verdict guards the merge, that has happened, and "
+          "one written afterwards reads like a pass somebody landed on",
+          rc == 1 and len(wrote) == before and not ran("gh pr comment") and "already merged" in said)
+    # …and the race the whole thing turns on: a push between the reviewer finishing and this command running. The
+    # record is written against the head the PR is at NOW, so `--head` is the caller naming the diff it actually
+    # read — "a head that moves after its pass is reviewed again" only holds if something notices the move.
+    before = len(wrote)
+    rc, said = record(["myrepo", "7", "LAND", "--by", "me", "--head", HEAD[:12]], diff=DIFF_OTHER)
+    check("`--head` naming the diff that IS on the PR records it: the read and the record are about one head",
+          rc == 0 and len(wrote) == before + 1 and f"head={HEAD[:12]}" in wrote[-1])
+    before = len(wrote)
+    rc, said = record(["myrepo", "7", "LAND", "--by", "me", "--head", "0" * 12], diff=DIFF_OTHER)
+    check("...and the control: a --head the PR has MOVED off is refused, not recorded — the branch was pushed "
+          "after that read, so the pass is for a diff nobody is landing",
+          rc == 1 and len(wrote) == before and not ran("gh pr comment") and "moved after that read" in said)
+    before = len(wrote)
+    rc, said = record(["myrepo", "7", "LAND", "--by", "me", "--head", "abc"])
+    check("...and something too short to name a commit is refused before the PR is even read: a 3-character "
+          "prefix would match heads it was never about",
+          rc == 2 and len(wrote) == before and not ran("gh pr view"))
 
     # A merge that lands during the GATES — the slow half, up to an hour between the one `gh pr view` load() makes
     # and this step. Read off that one answer, a PR already on the default branch buys a review of itself.
@@ -3659,9 +4036,11 @@ def cmd_selfcheck():
           and isinstance(again_r, Failed) and not bought2 and "budget for this change is spent" in str(again_r))
     check("...and it says who decides now — the planning session, never 'a person' the message pages a phone for "
           "(the review-budget wall is its own to spend) — with how many reviews and repair rounds this change has "
-          "had, the head none of them read, and the two commands that end it: read it yourself, or buy one more",
+          "had, the diff none of them read, and the three commands that end it: read it yourself and record that, "
+          "land with no verdict, or buy one more",
           "The planning session decides now" in str(again_r) and "A PERSON decides" not in str(again_r)
           and "1 review(s)" in str(again_r) and "0 repair round(s)" in str(again_r) and NEXT[:12] in str(again_r)
+          and "record myrepo 7 LAND --by" in str(again_r)
           and "--no-review" in str(again_r) and "--re-review" in str(again_r))
     check("...and the tally is the CHANGE's, not the job's: one review counted, and the refusal counted nothing "
           "(a head that was never read cost nothing to refuse)",
@@ -5204,8 +5583,9 @@ def cmd_selfcheck():
             posted.setdefault(argv[3], []).append(argv[argv.index("--body") + 1])
             return (0, "")
 
-        def comments(pr):
-            return lambda a: (0, json.dumps({"comments": [{"body": b} for b in posted.get(pr, [])]}))
+        def comments(pr):     # …read back as GitHub returns them: the box's own, so viewerDidAuthor is true
+            return lambda a: (0, json.dumps({"comments": [{"body": b, "viewerDidAuthor": True}
+                                                          for b in posted.get(pr, [])]}))
 
         fetches, fetched, overlapped = threading.Barrier(2, timeout=1.5), [], []
 
@@ -5606,6 +5986,8 @@ def main(argv):
     default_signals()                      # once, on the main thread: every gate and reviewer below inherits it
     if argv and argv[0] == "selfcheck":
         return cmd_selfcheck()
+    if argv and argv[0] == "record":
+        return cmd_record(argv[1:])
     if argv and argv[0] == "queue":
         return cmd_queue(argv[1:])
     if argv and argv[0] == "work":
