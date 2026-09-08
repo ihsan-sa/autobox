@@ -35,7 +35,21 @@
 #   PUBLISH_BRANCH   branch on the public repo                  (default: main)
 #   PUBLISH_DENY     extra ERE that must never appear in it     (this box's user, host and repo names always deny)
 #   PUBLISH_ALLOW    paths inside the prefix the gate skips     (default: LICENSE README.md — they name the public repo)
+#   CC_PUSH_TIMEOUT  seconds any one command may spend on the remote (default 120; env only)
+#
+# AND NOTHING HERE WAITS FOR A PERSON. This runs off a timer with nobody watching, so a git that asks for a
+# username — the public repo's credential gone, a remote that stops answering — would sit on that prompt for
+# ever, holding publish.lock, and every later run would exit 0 saying another publish is running. So every git
+# below that reaches a remote — both fetches, the ls-remote and the push — goes through ${UNATTENDED[@]}:
+# prompts off, askpass off, ssh in batch mode, and CC_PUSH_TIMEOUT around each. A publish that hits the bound
+# fails loudly and the next timer tick retries.
 set -uo pipefail
+PUSH_TIMEOUT=${CC_PUSH_TIMEOUT:-120}   # seconds, per command that reaches the remote
+# The prefix every remote-touching git below wears. The prompt locks turn "ask for a username" into an error;
+# the timeout catches what they cannot — a credential helper that blocks on its own, a connection accepted and
+# then never answered — and signals the whole process group, so the transport helper dies with it.
+UNATTENDED=(timeout -k 5 "$PUSH_TIMEOUT" env -u GIT_ASKPASS -u SSH_ASKPASS GIT_TERMINAL_PROMPT=0
+            SSH_ASKPASS_REQUIRE=never GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes")
 SELF="$(realpath "$0")"; BIN="$(dirname "$SELF")"
 STATE="${CC_PUBLISH_STATE:-$HOME/.cc/state}"   # log + lock; tests point it at their own dir so two runs never share a lock
 LOG="$STATE/publish.log"; SEEN="$STATE/publish.notified"   # the abort the owner was last paged about (see die)
@@ -103,7 +117,7 @@ repo_lock_path() {
 LOCKF=""                                      # set once $R is known, below; empty = fetch unlocked
 LOCKW="${CC_PUBLISH_LOCK_WAIT:-180}"          # seconds to wait for it before this run gives up (see above)
 git_locked() {
-  [ -n "$LOCKF" ] || { git "$@"; return; }
+  [ -n "$LOCKF" ] || { "${UNATTENDED[@]}" git -c core.askPass= "$@"; return; }
   # -o: flock forks and holds the lock in ITSELF, but without -o the fork it execs `git` in keeps a duplicate of
   # the same fd — un-close-on-exec by design, per flock(1) — so anything git forks (its detached auto-gc,
   # gc.autoDetach defaults on) inherits it too and can hold the lock open long after this command, and cc-publish,
@@ -111,7 +125,7 @@ git_locked() {
   # to inherit; cc-land's own lock never had this hole because ITS fd is opened O_CLOEXEC from the start.
   # gc.auto=0 on top so the fetch does not spawn gc under the lock at all; the box's ordinary git traffic still
   # runs it elsewhere.
-  flock -w "$LOCKW" -E 75 -o "$LOCKF" git -c gc.auto=0 "$@"; local rc=$?   # -E: a code no git command exits with,
+  flock -w "$LOCKW" -E 75 -o "$LOCKF" "${UNATTENDED[@]}" git -c gc.auto=0 -c core.askPass= "$@"; local rc=$?   # -E: a code no git command exits with,
   [ "$rc" = 75 ] || return "$rc"                       # so a timeout is never mistaken for the fetch's own failure
   printf '%s\tLOCK\t%s\n' "$(date -u +%FT%TZ)" "gave up after ${LOCKW}s on $LOCKF — nothing fetched" >> "$LOG"
   echo "cc-publish: the repo lock was held longer than ${LOCKW}s — nothing published, the next run retries"
@@ -262,7 +276,7 @@ $names"
 
 exec 9>"$STATE/publish.lock"
 flock -n 9 || { echo "cc-publish: another publish is running"; exit 0; }
-ls="$(git ls-remote --heads "$REMOTE" "$BRANCH")" || die "cannot reach the public repo ($REMOTE)"
+ls="$("${UNATTENDED[@]}" git -c core.askPass= ls-remote --heads "$REMOTE" "$BRANCH")" || die "cannot reach the public repo ($REMOTE) — no answer, or no credential for it within ${PUSH_TIMEOUT}s"
 PARENT=""; PTREE=""
 if [ -n "$ls" ]; then
   # A ref namespace of our own, but every fetch writes the shared FETCH_HEAD, so this one takes the lock too.
@@ -302,7 +316,7 @@ if [ "$dry" = 1 ]; then
 fi
 # Plain push, no lease and no force: the parent IS the tip we just read, so this is a fast-forward or it fails. A
 # public repo that moved under us keeps its commits — re-running rebuilds on the new tip.
-git -C "$R" push --quiet "$REMOTE" "$COMMIT:refs/heads/$BRANCH" || die "push to the public repo failed (it may have moved — re-run)"
+"${UNATTENDED[@]}" git -C "$R" -c core.askPass= push --quiet "$REMOTE" "$COMMIT:refs/heads/$BRANCH" || die "push to the public repo failed (it may have moved, or there is no credential for it — re-run)"
 printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "${SRC:0:12}" "${COMMIT:0:12}" "$BRANCH" >> "$LOG"
 rm -f "$SEEN"
 echo "cc-publish: published $PREFIX/ at ${SRC:0:8} as ${COMMIT:0:8} on $BRANCH"

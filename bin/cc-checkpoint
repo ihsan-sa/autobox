@@ -20,6 +20,14 @@
 # app pushes unattended. The token is minted for the push and nothing about it is written here. For a MEMBER
 # WORKSPACE's track it is minted FOR that workspace, so it opens that workspace's repositories and no other
 # member's (cc-gh-token, docs/design-member-workspaces.md).
+# NO PUSH HERE CAN WAIT FOR A PERSON. Every one of them runs unattended, and a git with no credential asks for a
+# username on the terminal, where nothing will ever answer: a member track sat 6h38m inside git-remote-https on
+# that prompt, held its sandbox slot and reported nothing (2026-09-07). So every command below that reaches a
+# remote goes through git_unattended — prompts off, askpass off, ssh in batch mode, and a hard bound on EACH
+# (CC_PUSH_TIMEOUT, 120 s), because a transport that stalls with nothing to say is the same outage. A turn
+# against a dead remote therefore costs a few minutes at worst, not a night. Hitting the bound is a failed push
+# like any other: non-zero, with the reason on .cc/push.err, which `cc ls` and `cc digest` already show as
+# `push!`. GETTING a credential to a member worker is #225's — the rule here is only that the push ENDS.
 # WHERE IT PUSHES: `origin`, except a member workspace's project, which pushes to its OWN repository — the
 # remote named after the track, or `origin` when origin is that repository (a workspace's first project is
 # wired up as origin). Each project has its own repository (owner, 2026-09-03), so a workspace project with no
@@ -57,6 +65,24 @@ SECRETS='(^|/)(\.env[^/]*|.*\.(pem|key)|credentials[^/]*)$'
 BIN=$(dirname "$(readlink -f "$0")")   # siblings come from the same bin/ as this copy
 MODE=commit; STRICT=0
 case "${1:-}" in --commit) STRICT=1;; --push) MODE=push;; --remote) MODE=remote;; selfcheck) MODE=selfcheck;; "") ;; *) echo "cc-checkpoint: unknown argument '$1'" >&2; exit 2;; esac
+# ── no push waits for a person ───────────────────────────────────────────────────────────────────
+PUSH_TIMEOUT=${CC_PUSH_TIMEOUT:-120}   # seconds. A track's push is seconds of work, so this is a wall, not a budget.
+git_unattended(){   # git that can ask nobody anything and cannot run past the bound. Exit codes are git's, plus
+  # 124/137 from `timeout`. Both locks are needed and neither is enough: the prompt locks turn "ask for a
+  # username" into an error the caller can read, and the bound catches everything they do not — a credential
+  # helper that blocks on its own, a connection accepted and then never answered. `timeout` runs the command in
+  # a process group of its own and signals the GROUP, so the transport helper dies with it instead of outliving
+  # the run (the lesson the gate runner learned on its own subprocesses, cc-steward:368).
+  timeout -k 5 "$PUSH_TIMEOUT" env -u GIT_ASKPASS -u SSH_ASKPASS \
+    GIT_TERMINAL_PROMPT=0 SSH_ASKPASS_REQUIRE=never \
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" \
+    git -c core.askPass= "$@"; }
+bound_hit(){   # $1 a git_unattended exit code, $2 the file its stderr went to.  0 when the bound fired.
+  # `timeout` KILLS the command, so git wrote nothing at all — without this the push fails with an empty
+  # push.err, which is the same silence the bound exists to end.
+  case "$1" in 124|137) ;; *) return 1;; esac
+  printf '%s the push to %s did not finish within %ss and was killed — nothing was pushed. A push that hangs this long has no credential it can use, or a remote that is not answering.\n' \
+    "$(date -u +%FT%TZ)" "$remote" "$PUSH_TIMEOUT" >> "$2"; }
 # ── the lease ────────────────────────────────────────────────────────────────────────────────────
 # A track branch has exactly one writer, so a worker that rebased its own branch must still reach the remote. A
 # plain push is rejected non-fast-forward there and the work never becomes a PR: on 2026-08-31 a track finished
@@ -255,10 +281,10 @@ seed_base(){   # cwd = worktree root, $remote and $cred from lease_push.  Always
     "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: this project's repository was made, but its base branch '$base' is not in this checkout — nothing was seeded, so it opens on whichever branch landed first" >/dev/null 2>&1
     rm -f "$root/.cc/base-seed"; return 0; }
   send=$(seed_head "$tip"); [ -n "$send" ] || send="$tip"   # an EMPTY source in a refspec DELETES the branch: never that
-  if ! err=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" push -q "$remote" "$send:refs/heads/$base" 2>&1); then
+  if ! err=$(git_unattended "${cred[@]}" push -q "$remote" "$send:refs/heads/$base" 2>&1); then
     grep -qE 'rejected|non-fast-forward|already exists' <<<"$err" || return 0   # could not reach it: try again next turn
   fi
-  def=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" ls-remote --symref "$remote" HEAD 2>/dev/null | sed -n 's#^ref: refs/heads/\([^[:space:]]*\).*$#\1#p' | head -1)
+  def=$(git_unattended "${cred[@]}" ls-remote --symref "$remote" HEAD 2>/dev/null | sed -n 's#^ref: refs/heads/\([^[:space:]]*\).*$#\1#p' | head -1)
   if [ "$def" != "$base" ] && ! "$BIN/cc-gh-token" default "$workspace" "$WSTRACK" "$base" >/dev/null 2>&1; then
     "$BIN/cc-board" note "$WSREPO" "$WSTRACK" "github: $base is in this project's repository but its default branch is still ${def:-whichever branch arrived first} — 'cc-gh-token default $WSREPO $WSTRACK $base' sets it" >/dev/null 2>&1
   fi
@@ -286,7 +312,7 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
     [ "$(url_key "$url")" != "$own" ] || continue
     grep -qxF "$url" "$root/.cc/evict.same" 2>/dev/null && continue   # known to be this project's own repository under another spelling: never cycled again
     local -a c=(); mapfile -t c < <("$BIN/cc-gh-token" gitargs "$url" "$workspace" 2>/dev/null)
-    sha=$(GIT_TERMINAL_PROMPT=0 git "${c[@]}" ls-remote --heads "$o" "refs/heads/$branch" 2>/dev/null | awk 'NR==1{print $1}')
+    sha=$(git_unattended "${c[@]}" ls-remote --heads "$o" "refs/heads/$branch" 2>/dev/null | awk 'NR==1{print $1}')
     [ -n "$sha" ] || continue   # it does not have this branch, or it could not be asked: nothing to remove either way
     if ! git merge-base --is-ancestor "$sha" "$branch" 2>/dev/null; then
       printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch at $sha, which is not in this branch — left alone. This project pushes to $remote; move or delete that branch by hand." >> "$root/.cc/evict.err.tmp"
@@ -295,16 +321,16 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
     # A delete the other repository REFUSES — GitHub refuses a repository's default branch, and an empty repository
     # takes its default from the first branch pushed into it, which can be the sibling's — is the case that leaves
     # the contamination in place, so it is said, not swallowed (review of #217).
-    if ! err=$(GIT_TERMINAL_PROMPT=0 git "${c[@]}" push -q "$o" --delete "refs/heads/$branch" 2>&1); then
+    if ! err=$(git_unattended "${c[@]}" push -q "$o" --delete "refs/heads/$branch" 2>&1); then
       printf '%s %s\n' "$(date -u +%FT%TZ)" "$o still holds $branch — the delete was refused: $(tr '\n' ' ' <<<"$err" | cut -c1-160). Delete or retarget it by hand; a repository's default branch cannot be deleted, so point that repository's default at its own project's branch first." >> "$root/.cc/evict.err.tmp"
       continue; fi
     # A URL IS NOT A REPOSITORY'S IDENTITY. The same repository under a spelling url_key cannot unify (ssh and
     # https, a symlink) has just had its branch deleted out from under it — so ask the project's own remote
     # whether the branch is still there, and if the answer is that it is gone, put it back and say so (review of
     # #217). An ask that failed says nothing either way and changes nothing.
-    still=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" ls-remote --heads "$remote" "refs/heads/$branch" 2>/dev/null); src=$?
+    still=$(git_unattended "${cred[@]}" ls-remote --heads "$remote" "refs/heads/$branch" 2>/dev/null); src=$?
     if [ "$src" = 0 ] && [ -z "$still" ]; then
-      git "${cred[@]}" push -q -u "$remote" "$branch" 2>/dev/null
+      git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>/dev/null
       printf '%s\n' "$url" >> "$root/.cc/evict.same"   # remembered: deleting and restoring it every turn would close any open PR on the branch (review of #217)
       printf '%s %s\n' "$(date -u +%FT%TZ)" "$o is this project's own repository under another spelling — its branch was put back and that remote is skipped from now on. Keep one remote for it." >> "$root/.cc/evict.err.tmp"
       continue; fi
@@ -321,7 +347,7 @@ evict_elsewhere(){   # $1 = the branch just pushed to $remote, cwd = worktree ro
   return 0
 }
 lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed · 2 the lease was refused
-  local branch="$1" lease
+  local branch="$1" lease prc
   # The credential. `cc-gh-token gitargs` prints the `git -c …` arguments that authenticate as this box's
   # GitHub App — and prints NOTHING for a remote the app does not cover, or on a box with no app, so every
   # other push still uses whatever helper ~/.gitconfig gives it. Without this a member project's push has no
@@ -331,14 +357,18 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   # Plain push FIRST, and force nothing when it works: a fast-forward never needed a lease. It is also how a
   # branch that has taken the other writer's commit in (git rebase origin/<branch>) clears itself — a stale
   # .cc/pushed would otherwise refuse that branch for ever, and a block nobody can lift is its own outage.
-  if git "${cred[@]}" push -q -u "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; evict_elsewhere "$branch"; return 0; fi
+  git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; prc=$?
+  [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch"; return 0; }
+  bound_hit "$prc" "$root/.cc/push.err.tmp"   # killed at the bound: git said nothing, so the reason is written here
   grep -qE 'non-fast-forward|fetch first' "$root/.cc/push.err.tmp" || { mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
   lease=$(cat "$root/.cc/pushed" 2>/dev/null)
   # Nothing recorded yet (a track older than .cc/pushed): the tracking ref is the best account of the remote we
   # have, and one push from here replaces the guess with the real thing.
   [ -n "$lease" ] || lease=$(git rev-parse -q --verify "refs/remotes/$remote/$branch" 2>/dev/null)
   if [ -n "$lease" ]; then
-    if git "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; then lease_keep "$branch"; evict_elsewhere "$branch"; return 0; fi
+    git_unattended "${cred[@]}" push -q -u --force-with-lease="refs/heads/$branch:$lease" "$remote" "$branch" 2>"$root/.cc/push.err.tmp"; prc=$?
+    [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch"; return 0; }
+    bound_hit "$prc" "$root/.cc/push.err.tmp"
     mv "$root/.cc/push.err.tmp" "$root/.cc/push.err"
     grep -qE 'stale info|non-fast-forward|fetch first' "$root/.cc/push.err" && return 2
     return 1; fi
@@ -532,6 +562,39 @@ SH
   runp "$d"
   k "$(has "$od" track/t2 && echo 0 || echo 1)" "a plain repo still pushes to origin" "not on $od"
   k "$(has "$td" track/t2 && echo 0 || echo 1)" "and nothing is removed from its other remotes" "deleted from $td"
+  # ── no push waits for a person ──────────────────────────────────────────────────────────────────────
+  # The 2026-09-07 hang: a member track with no credential sat 6h38m inside git-remote-https on a username
+  # prompt, on a stdin no unattended run can answer. Both halves of the rule are checked, each on its own
+  # fixture: the ask turned into an error, and the bound that catches a transport hanging with nothing to say.
+  # THE ASK, in one offline step. `git credential fill` IS the code the wedged push was blocked inside, so this
+  # asks git the same question the push did and wants an error back rather than a wait.
+  out=$( printf 'protocol=https\nhost=example.test\n\n' | ( PUSH_TIMEOUT=5; git_unattended credential fill ) 2>&1 ); rc=$?
+  k "$([ "$rc" != 0 ] && grep -q 'terminal prompts disabled' <<<"$out" && echo 0 || echo 1)" \
+    "no credential: git comes back non-zero saying the prompt is disabled, instead of waiting on it" "rc=$rc out='$out'"
+  # …and the case that is NOT suppressed: the lock is on asking a PERSON, not on authenticating. A credential
+  # that is there is still used — otherwise this rule would break every push it was meant to keep.
+  printf '#!/usr/bin/env bash\n[ "$1" = get ] && printf "username=u\\npassword=p\\n"\nexit 0\n' > "$bin/cred"; chmod +x "$bin/cred"
+  out=$( printf 'protocol=https\nhost=example.test\n\n' | ( PUSH_TIMEOUT=5; git_unattended -c credential.helper="$bin/cred" credential fill ) 2>&1 ); rc=$?
+  k "$([ "$rc" = 0 ] && grep -qx 'username=u' <<<"$out" && echo 0 || echo 1)" \
+    "…while a credential that IS there is still handed over" "rc=$rc out='$out'"
+  # THE BOUND, end to end through --push. The remote is ssh-shaped and its transport sleeps, which is the
+  # 6h38m shape with the clock wound down: nothing to read, nothing to say, and no reason to ever return.
+  owW=$(bare ownW)
+  printf '#!/usr/bin/env bash\nsleep 45\n' > "$bin/wedge-ssh"; chmod +x "$bin/wedge-ssh"   # a path unique to this run, so the survivor check below can name it
+  d=$(mkproj myrepoW/tW origin "user@example.test:w.git")
+  t0=$(date +%s)
+  ( cd "$d" && env CC_PUSH_TIMEOUT=3 GIT_SSH_COMMAND="$bin/wedge-ssh" "$bin/cc-checkpoint" --push >/dev/null 2>&1 ); rc=$?
+  el=$(( $(date +%s) - t0 ))
+  k "$([ "$rc" != 0 ] && [ "$el" -lt 30 ] && echo 0 || echo 1)" \
+    "a transport that never answers is killed at the bound, so the push cannot outlive its loop" "rc=$rc after ${el}s"
+  k "$(grep -q 'did not finish within 3s' "$d/.cc/push.err" && echo 0 || echo 1)" \
+    "…and push.err carries the reason, which the kill leaves git itself with no chance to write" "$(cat "$d/.cc/push.err" 2>/dev/null)"
+  k "$(pgrep -f "$bin/wedge-ssh" >/dev/null && echo 1 || echo 0)" "…and the transport dies with it, rather than being left behind" "a helper outlived the push"
+  # The same worktree against a remote that answers: pushed as before, and the marker cleared. A bound that
+  # also stopped working pushes would pass every case above and be an outage.
+  git -C "$d" remote set-url origin "$owW"; runp "$d"; rc=$?
+  k "$([ "$rc" = 0 ] && has "$owW" track/tW && [ ! -e "$d/.cc/push.err" ] && echo 0 || echo 1)" \
+    "…while a remote that answers is pushed to as before, and push.err is cleared" "rc=$rc"
   # ── which branch the repository the box made opens on ───────────────────────────────────────────────
   # GitHub gives an empty repository whichever branch lands first as its default, and the track landing first is
   # the bug: the base goes in ahead of it, and is asked for by name if that still did not settle it. Here `create`

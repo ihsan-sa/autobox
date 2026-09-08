@@ -38,6 +38,8 @@
 #   cc done <repo> <track> --json   task receipt on stdout, human lines on stderr. Safe to run again: it retries
 #                             whatever projection is still pending. Nonzero when the delivery or the board write
 #                             did not land — an approval card Slack could not take is pending, not a failure
+#                             Nothing it runs against a remote can wait for a person: each is bounded by
+#                             CC_PUSH_TIMEOUT (120 s), the same knob cc-checkpoint's pushes obey
 #   cc lands <repo>           does that repo hold the standing grant? 0 yes · 1 no · 2 named but member-facing
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
 #   cc rename <old> <new>     rename a project everywhere the box keys by its name: ~/dev, worktrees, state, board,
@@ -296,7 +298,7 @@ nolink(){   # A TRACK'S STATE DIR AND ITS WORKTREE'S .cc ARE BOUND READ-WRITE in
   local p; for p; do [ -L "$p" ] && { echo "cc: $p is a symlink — refused (nothing here writes through a planted name)"; return 1; }; done; return 0; }
 lock(){ mkdir -p "$(dirname "$1")"; nolink "$1" || exit 1; exec 9>>"$1"; flock 9; }   # two concurrent `cc <repo> <track>` would otherwise create twin windows tmux can no longer address
 unlock(){ exec 9>&-; }
-usage(){ sed -n '2,51p' "$0"; }   # the whole header block, down to the `cc selfcheck` line — bump it when a line is added
+usage(){ sed -n '2,55p' "$0"; }   # the whole header block, down to the `cc selfcheck` line — bump it when a line is added
 
 # THE CLAIM. A row has one writer at a time, and which one is not a matter of who typed first: cc-task records the
 # owner off the running process and refuses a second live one (bin/cc-task says how it decides). Two steps, and
@@ -639,7 +641,10 @@ case "${1:-}" in
       [ -n "$rem" ] || done_fail push "no remote — no PR opened"
       rurl=$(git -C "$wt" remote get-url --push "$rem") || done_fail push "cannot resolve push remote"
       cred=(); mapfile -t cred < <("$BIN/cc-gh-token" gitargs "$rurl" "$repo" 2>/dev/null)
-      remote_tip=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote "$rurl" "refs/heads/$branch") \
+      # Bounded, like every other command here that reaches a remote: `cc done` runs unattended inside a worker,
+      # and a remote that accepts the connection and then never answers would hang it exactly as a credential
+      # prompt did on 2026-09-07 (cc-checkpoint's git_unattended, same knob).
+      remote_tip=$(timeout -k 5 "${CC_PUSH_TIMEOUT:-120}" env GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote "$rurl" "refs/heads/$branch") \
         || done_fail push "cannot verify pushed head"
       tip=$(git -C "$wt" rev-parse HEAD)   # workspace base seeding may have added a commit during push
       [ "${remote_tip%%$'\t'*}" = "$tip" ] || done_fail push "remote does not hold the committed head"
@@ -676,7 +681,7 @@ case "${1:-}" in
       # #214). An answered HEAD names the base; an answer with no HEAD is a repository with no branch to open a
       # PR against.
       query_remote="$rem"; [ "$done_managed" = 0 ] || query_remote="$rurl"
-      symref=$(GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote --symref "$query_remote" HEAD 2>/dev/null); lsrc=$?
+      symref=$(timeout -k 5 "${CC_PUSH_TIMEOUT:-120}" env GIT_TERMINAL_PROMPT=0 git "${cred[@]}" -C "$wt" ls-remote --symref "$query_remote" HEAD 2>/dev/null); lsrc=$?
       [ "$done_managed" = 0 ] || [ "$lsrc" = 0 ] || done_fail pr "remote base lookup failed — no PR created"
       rbase=$(sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p' <<<"$symref" | head -1)
       # …and a repository whose default branch IS this track has nothing to open a PR against either: GitHub makes
