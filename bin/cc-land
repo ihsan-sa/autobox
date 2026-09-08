@@ -10,12 +10,17 @@
                                                   write down a review that already happened, against the change the
                                                   PR is at now (--head: the SHA you read, refused if it has moved).
                                                   The landing that finds it buys no review of its own
-  cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does
+  cc-land queue <repo> <pr> [--chat C --ts T]     hand a PR to the queue and start the worker — what a 👍 does.
+                                                  A job a landing has already refused for a reason a re-queue
+                                                  cannot mend is refused HERE, in a second, and exits non-zero
   cc-land queue --task <repo> <row>               complete a task; JSON receipt on stdout, queue only with a grant
   cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). Every
                                                   queued job is gated and reviewed AT ONCE — side by side where their files
                                                   do not overlap, one after another where they do; the merges and the deploy
-                                                  stay serial, in queue order. A queued PR SURVIVES a usage-limit
+                                                  stay serial, in queue order. A PR is MERGED as soon as its own
+                                                  gates and review are done rather than when the whole batch is;
+                                                  the deploy half waits for every gate still running, because
+                                                  install.sh and the restarts are the box itself. A queued PR SURVIVES a usage-limit
                                                   review (it waits for the reset) and a red gate (3 tries, 15 min
                                                   apart): the sweep that keeps a job arms its own next run. A
                                                   LAND-AFTER-FIX sends ONE fix iteration and waits for that branch to
@@ -36,11 +41,20 @@ WHAT IT WILL NOT DO, and why each line is here:
     approval is the one thing a pause must not do — but the review is not bought, the merge and the deploy do not
     happen, the catch-up poll skips the repo, and the queue arms no timer for it, so a parked job costs nothing at
     all rather than re-driving itself every few seconds. `cc-pause off <repo>` and `cc-land work` land it unchanged.
+  · It does not start a suite for a job that cannot succeed. A landing refused for a reason a re-queue cannot mend
+    — the review budget for this change is spent, or this head already died on a review cap — writes that down
+    against the change, and `queue` reads it back before it writes a job file: the 👍 is answered in about a second
+    with the reason and the commands that end it, and no gate runs. Measured 2026-09-07: 8 of 25 "budget spent"
+    landings were a re-queue of a PR already refused for exactly that, and all 25 ran the whole suite first —
+    753 minutes of gate time that bought nothing. It refuses ONLY on certainty: it asks GitHub, in one call and
+    touching no git, whether the head has moved, whether a verdict for that change is now on the PR, and whether
+    the cap that bound has been raised, and any of those — or a `gh` that does not answer — queues the job as
+    before.
   · It never merges a diff nobody read — when the diff is worth a paid read: the repo's own CONTROL LAYER
     (core/tests/control-layer — what runs unattended, or touches secrets, GitHub, the sandbox, the model or the
     landing), a wide diff, the tests, the install, the config, the reviewer's rules. A change outside that lands on
-    the gates it reaches and the planning session's own read (owner, 2026-09-04). The review, run BESIDE the suite
-    once the cheap gates are green: one headless `claude -p` against the PR's own head, with no shell and nothing
+    the gates it reaches and the planning session's own read (owner, 2026-09-04). The review, started at t=0 and run
+    BESIDE every gate: one headless `claude -p` against the PR's own head, with no shell and nothing
     to write with, answering LAND / LAND-AFTER-FIX / DO-NOT-LAND. The two
     stopping verdicts stop the landing exactly like a red gate, and the findings are posted as ONE PR comment.
     This is a gate and not a session's habit on purpose: a review a session does by hand dies with that session,
@@ -69,10 +83,12 @@ WHAT IT WILL NOT DO, and why each line is here:
   · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
     afterwards — not against the default branch, which does not contain the change, so gating it there would
     be a green light for code nobody ran. A red gate or a conflicting PR stops everything before the merge.
-    The cheap ones run FIRST and alone, before a token is spent; the suite runs beside the paid review, because
-    serial they were the whole of a landing's wall clock (owner, 2026-09-04), and it is handed the paths the diff
-    changed so a suite that knows its own shape runs only what those reach. A red cheap gate rejects a head having
-    bought nothing; a read that ran beside a red suite is still COUNTED, because it was still paid for — refunded,
+    ALL of them run at once, and the paid read starts with them rather than after the cheap ones: serial they were
+    the whole of a landing's wall clock — ~5 + ~3 + ~14 minutes, measured 2026-09-07 — and a landing's gates now
+    cost the slowest of them instead of the sum. Each is handed the paths the diff changed, so a suite that knows
+    its own shape runs only what those reach, and the one concurrency number the machine says it has (gate_slots).
+    The trade is that a head a cheap gate rejects no longer rejects it for free: it has bought a read and a suite.
+    A read that ran beside a red gate is still COUNTED, because it was still paid for — refunded,
     it would let one worker buy a paid read on every red head it pushes (usage audit 2026-09-02, P0). And a gate is
     timed on its SILENCE, not the clock: PR #227's landing spent its gate hour waiting for the suite's lock and timed
     out with an empty log — a suite that is waiting says so every minute, and one that says nothing for an hour
@@ -178,7 +194,23 @@ GATE_MEMO_TTL = 3600                      # a memo ("these gates passed on this 
 GREEN_TTL = 6 * 3600                      # …and how long a SUITE's own record of what it passed on is spent instead
                                           # of running it again (green_run). The key there is content, which cannot
                                           # go stale; the box around it can, so the record is good for hours, not days.
-PREPARE_AT_ONCE = int(os.environ.get("CC_LAND_PREPARE") or 4)   # reviews and gates in flight at once (test hook)
+
+
+def gate_slots():
+    """How many gate SUITES this box runs side by side. ONE number, derived from the machine, read by the landing
+    (how many jobs prepare() has in flight) and handed to every suite it starts as CC_SELFTEST_SLOTS — which is the
+    cap the suite enforces on itself, across processes, with its own lock files.
+
+    They were two literals that both happened to say 4, in two files, neither set anywhere. Nothing kept them in
+    step: raise the lander's alone and every landing queues at a lock the suite never widened. More of them is not
+    the answer either — measured 2026-09-07, across every gate log since 09-04 seven runs ever waited for a slot,
+    ~8 minutes in total, so the cap is not what a slow gate is waiting on. Two thirds of the cores, never under 2
+    and never over 6: that is the width measured good on 09-02 (441 s for the slowest of four against 426 s alone)
+    on a six-core host, and it follows the machine rather than being retyped for the next one."""
+    return max(2, min(6, (os.cpu_count() or 4) * 2 // 3))
+
+
+PREPARE_AT_ONCE = int(os.environ.get("CC_LAND_PREPARE") or gate_slots())   # jobs in flight at once (test hook)
 GATE_IDLE = 3600                          # a gate that has said NOTHING for this long is dead, and is killed. Silence, not
                                           # wall clock: a suite waiting for one of its slots says so every minute, and
                                           # PR #227's landing counted that wait as the run — timed out, empty log (09-04)
@@ -609,6 +641,9 @@ def record_applied(repo, sha):
 
 _OUT = threading.local()
 _LOCKS, _LOCKS_GUARD = {}, threading.Lock()
+_PREPARING = None       # the Prepared pool THIS sweep is gating with, while it is gating (cmd_work sets it, and
+                        # clears it in a finally). Read by Land.settle, and by nothing else: the deploy half of one
+                        # job may not touch the box while another job's gates are still running.
 
 
 def git_lock_path(root):
@@ -971,6 +1006,49 @@ def root_done(repo, pr):
         pass
 
 
+def doomed(repo, pr):
+    """Why a landing of this PR CANNOT succeed, or "" — asked at QUEUE time, in about a second, before any gate.
+
+    Measured 2026-09-07: of 25 landings that ended "the review budget for this change is spent", 8 were a re-queue
+    of a PR already refused for exactly that, with no `--re-review` — a job that could not succeed. Every one of the
+    25 ran the whole gate suite first, because `queue` checked nothing and the budget and wall checks live in
+    review_now(), on the thread that runs BESIDE the gates: its failure is only raised at the join, after them.
+    753 minutes of gate time bought nothing that day. So the refusal that already knows the answer writes it down
+    (Land.mark_doomed) and this reads it back before a job file is ever written.
+
+    IT MUST NEVER REFUSE SOMETHING THAT COULD HAVE LANDED, so every uncertainty here answers "" — queue it, and let
+    the landing decide as it does today. Certainty comes from asking GitHub the two things that could have changed,
+    in ONE `gh pr view`, and from touching no git at all: a fetch here would be a fourth writer of the FETCH_HEAD
+    that two landings already race over (see git_lock), and this runs on the 👍 path where no lock is held.
+      · The head moved — somebody pushed. A new head is a new question and nothing recorded answers it.
+      · A verdict for the recorded change is now on the PR — `cc-land record`, or a `--re-review` that has since
+        been bought. Then review_now() takes the prior-verdict path and never reaches the check that refused.
+        ANY verdict clears it, not only LAND: a DO-NOT-LAND is refused by a different rule with a different
+        message, and it is not this function's business to predict a rule it does not implement.
+      · For a cap wall, the cap that BOUND has been raised (wall_stands) — the one thing that re-opens that head.
+    A `gh` that errors, times out or answers something unreadable is also "": the network is not evidence."""
+    d = (root_work(repo, pr) or {}).get("doomed") or {}
+    if not d.get("head") or not d.get("why"):
+        return ""
+    rc, o = sh(["gh", "pr", "view", str(pr), "--json", "headRefOid,comments"], cwd=repo_root(repo), timeout=60)
+    if rc:
+        return ""
+    try:
+        j = json.loads(o)
+        head, cs = j.get("headRefOid") or "", j.get("comments") or []
+    except (ValueError, AttributeError):
+        return ""
+    if head != d["head"]:
+        return ""
+    if d.get("wall") and not wall_stands(d["wall"]):
+        return ""
+    for c in cs:                  # only a comment THIS BOX wrote, exactly as prior_review() counts them: anyone
+        if (isinstance(c, dict) and c.get("viewerDidAuthor")      # who can comment on a PR can type a marker
+                and verdict_in(c.get("body") or "", d.get("key") or "", d["head"])):
+            return ""
+    return d["why"]
+
+
 def sweep_roots():
     """A tally for a change that never landed — a PR closed unmerged, a branch abandoned — goes once nothing has
     touched it for ROOT_TTL, by which age root_work() has already stopped believing it (every spend rewrites the
@@ -1030,6 +1108,30 @@ def stale_note(root, base_ref, base, head, mine=()):
                if moved else "")
     return (f" — and this branch is {behind}" + (f", {missing}" if missing else "")
             + f": rebase it onto {base} and run again before hunting for a bug that may already be fixed")
+
+
+def verdict_in(body, key, head):
+    """The verdict a PR comment records about a change, or "". Anchored at the START of the comment, because that
+    is where post_review() and `record` both put the marker and a reviewer's prose is everything after it: a
+    finding that quotes a marker — reviewing this file, one does — is text about the change, not the answer to it,
+    and matching anywhere let the quote win. Reads the v2 change key and the older head-keyed shape alike, so a
+    verdict recorded before the key existed is still honoured rather than bought again.
+
+    Module-level and not a method, because two callers ask it: Land.prior_verdict, which has just computed the
+    key from git, and doomed(), which is at QUEUE time with no checkout and only the key a refusal wrote down.
+    One implementation, so the queue's reading of the PR and the landing's cannot drift apart.
+    Returns (verdict, findings, who read it) or ""."""
+    pats = [re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} {re.escape(head[:12])} "
+                       r"(LAND-AFTER-FIX|DO-NOT-LAND|LAND) -->")] if head else []
+    if key:                     # …and the change key first: it is the one that survives the rebase before landing
+        pats.insert(0, re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} v2 change={re.escape(key)}(?: [^>]*?)? "
+                                  r"verdict=(LAND-AFTER-FIX|DO-NOT-LAND|LAND)\b[^>]*-->"))
+    for pat in pats:
+        m = pat.match(body)
+        if m:
+            who = re.search(r"\bby=([A-Za-z0-9._@-]+)", m.group(0))
+            return m.group(1), body[m.end():].strip(), (who.group(1) if who else "")
+    return ""
 
 
 def verdict_of(answer):
@@ -1149,7 +1251,7 @@ class Land:
         return self.head
 
     def resolve_head(self):
-        """The same question, answered WITHOUT touching self.head. The review runs on a THREAD beside the suite and
+        """The same question, answered WITHOUT touching self.head. The review runs on a THREAD beside the gates and
         asks it again there (a push during the gates must not be merged); writing self.head from that thread moved
         a value the landing that owns it was about to file its green gate memo under, so the memo said "these gates
         passed" for a SHA the gates never ran on. Only the thread that owns the landing writes self.head."""
@@ -1205,9 +1307,9 @@ class Land:
 
     # -- 1. the review -------------------------------------------------------------------------------------
     def review(self):
-        """The review step. The read itself usually happens BESIDE the suite — gates() starts it on a thread once
-        the cheap gates are green — and this step collects what it decided; a landing whose suite did not run (a
-        memo spent it, a tier dropped it, a record answered for it) makes the read here instead. Either way the
+        """The review step. The read itself usually happens BESIDE the gates — gates() starts it on a thread at
+        t=0, before the first of them — and this step collects what it decided; a landing whose gates did not run (a
+        memo spent them, a tier dropped them, a record answered for the read) makes the read here instead. Either way the
         answer is judged on the same terms (verdict_result), and a push while both ran is caught here: what was
         gated and read is not what is there, so nothing merges."""
         if self._review is None:
@@ -1217,13 +1319,14 @@ class Land:
         if self.gated and self.head != self.gated:
             raise Failed(f"PR #{self.pr} moved while it was being gated and read: {self.gated[:12]} was gated, "
                          f"{self.head[:12]} is there now — nothing merges ungated. Re-run to gate the new head")
-        return said + " — read while the suite ran"
+        return said + " — read while the gates ran"
 
     def read_alongside(self):
-        """Start the read on a thread, to run while the suite does: the two were serial and nobody was waiting on
-        either — minutes of suite and then minutes of read, per PR (owner, 2026-09-04). The thread's lines go where
-        the caller's do, so prepare() still keeps a job's lines together. What it decides is collected by review(),
-        and by a red suite too (gates), so a verdict already paid for is never lost."""
+        """Start the read on a thread, to run while the GATES do — from t=0, not after the cheap ones: the two were
+        serial and nobody was waiting on either, minutes of suite and then minutes of read, per PR (owner,
+        2026-09-04), and starting the read behind the cheap gates left ~8 of those minutes still serial. The
+        thread's lines go where the caller's do, so prepare() still keeps a job's lines together. What it decides is
+        collected by review(), and by a red gate too (gates), so a verdict already paid for is never lost."""
         if self._review is not None or not self.pr or not self.want_review:
             return
         buf = getattr(_OUT, "buf", None)
@@ -1310,13 +1413,13 @@ class Land:
         spent = root_work(self.repo, self.pr)
         allowed = ROOT_REVIEWS + min(spent.get("repairs", 0), ROOT_REPAIRS)
         if spent.get("reviews", 0) >= allowed and not self.re_review:
-            raise Failed(
+            raise self.mark_doomed(Failed(
                 f"the review budget for this change is spent: PR #{self.pr} has already bought "
                 f"{spent.get('reviews', 0)} review(s) and {spent.get('repairs', 0)} repair round(s), and "
                 f"the diff at {self.head[:12]} is not one they read. The planning session decides now — read it "
                 f"itself and write that down (`cc-land record {self.repo} {self.pr} LAND --by <who>`, which this "
                 f"landing then reads), land with no verdict on the PR (`cc-land {self.repo} {self.pr} "
-                f"--no-review`), or buy one more (`cc-land {self.repo} {self.pr} --re-review`)")
+                f"--no-review`), or buy one more (`cc-land {self.repo} {self.pr} --re-review`)"))
         # …and whether this exact head has already died on a cap. Once it has, it has cost the whole cap to read
         # nothing, and the identical run against the cap that stopped it is the one thing certain to do it again —
         # #194 was queued a second time and would have. So the wall is remembered against the cap that BOUND, and
@@ -1327,11 +1430,12 @@ class Land:
         if wall.get("head") == self.head and wall_stands(wall) and not self.re_review:
             name = (WALL_SUBTYPE.get(wall.get("hit") or "") or ("the cap", ""))[0]
             var, more = review_caps(wall.get("hit") or "")[1:3]
-            raise Failed(f"{WALL}: PR #{self.pr} already spent {wall.get('cost')} at {wall.get('cap')} on "
-                         f"{self.head[:12]} and read nothing — {name} stopped it and has not moved since, so this "
-                         f"run is not bought. Raise the cap that stopped it "
-                         f"(`{var}={more} cc-land {self.repo} {self.pr}`), read the diff yourself (`--no-review`), "
-                         f"or buy that same run over again (`--re-review`).")
+            raise self.mark_doomed(Failed(
+                f"{WALL}: PR #{self.pr} already spent {wall.get('cost')} at {wall.get('cap')} on "
+                f"{self.head[:12]} and read nothing — {name} stopped it and has not moved since, so this "
+                f"run is not bought. Raise the cap that stopped it "
+                f"(`{var}={more} cc-land {self.repo} {self.pr}`), read the diff yourself (`--no-review`), "
+                f"or buy that same run over again (`--re-review`)."), wall=wall)
         stamp = sh([f"{BIN}/cc-limit", "status"], timeout=60)
         if stamp[0] == 0:
             raise Failed(f"no review: {stamp[1].strip()} — the landing waits for the model, or --no-review")
@@ -1385,6 +1489,24 @@ class Land:
             raise Failed(f"{verdict} on PR #{self.pr} ({cost}{posted}) — the landing stops here, exactly "
                          f"like a red gate.\n{said}")
         return f"{verb}: LAND on PR #{self.pr} ({cost}{posted})"
+
+    def mark_doomed(self, why, **rec):
+        """Write down, against the change, that a landing of this PR at this head cannot succeed — and hand the
+        failure straight back, so a refusal is `raise self.mark_doomed(Failed(…))` and the message a person reads
+        is the message the queue will read back. Two writers of one sentence is how the two drift apart.
+
+        This is the whole of what makes the queue's second-in refusal possible: the check that KNOWS the answer is
+        here, minutes into a landing and on the thread that runs beside the gates, and the queue is where somebody
+        is still waiting. What it stores is what doomed() needs to be certain the answer still holds — the head, the
+        change key (already computed by prior_review just above, so this costs no git) and, for a cap wall, the cap
+        that bound. Never raises: a queue directory that cannot be written must not become a landing that stops."""
+        try:
+            root_spend(self.repo, self.pr,
+                       doomed={"at": stamp(), "head": self.head, "key": self.change_key()[0],
+                               "why": str(why), **rec})
+        except Exception:
+            pass
+        return why
 
     def change_key(self):
         """What this PR IS, as a key a rebase does not change: change_digest() of the diff from its merge-base to
@@ -1440,18 +1562,7 @@ class Land:
         it, and matching anywhere let the quote win. Reads the v2 key and the older head-keyed one alike, so a
         verdict recorded before this shape existed is still honoured rather than bought again.
         Returns (verdict, findings, who read it) or ""."""
-        key, _mb = self.change_key()
-        pats = [re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} {re.escape(self.head[:12])} "
-                           r"(LAND-AFTER-FIX|DO-NOT-LAND|LAND) -->")]
-        if key:                     # …and the change key first: it is the one that survives the rebase before landing
-            pats.insert(0, re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} v2 change={re.escape(key)}(?: [^>]*?)? "
-                                      r"verdict=(LAND-AFTER-FIX|DO-NOT-LAND|LAND)\b[^>]*-->"))
-        for pat in pats:
-            m = pat.match(body)
-            if m:
-                who = re.search(r"\bby=([A-Za-z0-9._@-]+)", m.group(0))
-                return m.group(1), body[m.end():].strip(), (who.group(1) if who else "")
-        return ""
+        return verdict_in(body, self.change_key()[0], self.head)
 
     def prior_review(self):
         """The verdict this box already reached about THIS change, read back off the PR — the comment IS the record,
@@ -1572,13 +1683,17 @@ class Land:
         branch whatever they say — and running them anyway cost a three-PR landing five minutes of suite it could
         not act on. The no-PR path still gates: there the checkout IS what is about to be deployed.
 
-        The cheap gates first and ALONE: a head they reject buys nothing. Then the suite and the paid review
-        TOGETHER — each is minutes, and serial they were the whole of a landing's wall clock (owner, 2026-09-04).
-        A red suite still stops the landing before the merge; the read that ran beside it is collected rather than
-        abandoned (its verdict is on the PR for the retry to read back) and its buy STANDS — the read was paid for,
-        and giving it back would let N red heads buy N paid reads with the tally reading 0 throughout. The suite is
-        handed what the diff changed (gate_scope) and every gate is timed on its silence, streamed to a log
-        (run_gate)."""
+        EVERY gate at once, and the paid read started at t=0 beside them, so the landing's gate wall clock is the
+        SLOWEST gate rather than the sum of them: ~5 + ~3 + ~14 minutes ran serially, behind which the read had not
+        even begun (measured 2026-09-07). The cheap gates no longer run first and alone — a head one of them
+        rejects now costs a read and a started suite, which is the trade for taking ~8 minutes off every landing
+        that is green, and the read is not thrown away when that happens.
+        A red gate still stops the landing before the merge, and the first red IN GATE ORDER is the one reported,
+        not whichever thread lost. The read that ran beside them is collected rather than abandoned (its verdict is
+        on the PR for the retry to read back) and its buy STANDS — the read was paid for, and giving it back would
+        let N red heads buy N paid reads with the tally reading 0 throughout. The suite is handed what the diff
+        changed (gate_scope) and the one concurrency number the machine says it has (gate_slots, as CC_SELFTEST_SLOTS), and
+        every gate is timed on its silence, streamed to a log (run_gate)."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
         tree, tmp = self.root, None
@@ -1617,6 +1732,9 @@ class Land:
                 start["env"].pop("CC_LAND_CHANGED", None)   # never an inherited scope: a landing run from inside a
                 if scope:                                    # scoped suite would hand its gates that suite's paths
                     start["env"]["CC_LAND_CHANGED"] = scope
+                start["env"]["CC_SELFTEST_SLOTS"] = str(PREPARE_AT_ONCE)   # the ONE number, said out loud to the
+                                                          # suite: what prepare() runs at once IS what the suite's
+                                                          # own cap allows at once, so no landing waits at that lock
                 keep = f"{tempfile.gettempdir()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
                 rc, o = run_gate([f"{tree}/{g}"], tree, keep, start["env"])
                 bad = FAILED_RE.search(o)
@@ -1624,15 +1742,35 @@ class Land:
                     raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
                                  f"  [full output: {keep}]")
 
-            quick, slow = [g for g in found if g not in SUITE], [g for g in found if g in SUITE]
-            for g in quick:
-                run(g)
-            if any(not green_run(content, g, scope) for g in slow):
+            # ALL OF THEM AT ONCE, and the read from t=0. Serial, this was ~22 minutes of a landing's wall clock for
+            # a suite that is ~14 of them (measured 2026-09-07), and the paid read did not start until the two cheap
+            # gates had finished — so a green landing paid the cheap gates' minutes twice over, once in the gates and
+            # once in front of the read. Nothing about WHAT a gate asserts changes; only when it is started.
+            # The cost of the change, said plainly: a head a cheap gate rejects now also buys a read (and starts a
+            # suite) that a serial order would have skipped. That is the trade the brief asks for — a red gate is
+            # the rare landing and a green one is every other landing — and the read is not wasted either way,
+            # because its verdict goes on the PR for the retry to read back for free.
+            buf = getattr(_OUT, "buf", None)     # gate threads are new threads: without this their lines go to
+                                                 # stdout instead of the job's buffer, and prepare() interleaves
+            if any(not green_run(content, g, scope) for g in found):
                 self.read_alongside()
-            try:
-                for g in slow:
+            errs = {}
+
+            def go(g):
+                _OUT.buf = buf
+                try:
                     run(g)
-            except Failed:
+                except BaseException as e:
+                    errs[g] = e
+
+            ts = [threading.Thread(target=go, args=(g,), name=f"gate-{self.repo}-{os.path.basename(g)}", daemon=True)
+                  for g in found]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()     # every one of them, always: a gate left running would still hold a suite slot and
+                             # still be writing to the checkout this landing is about to throw away
+            if errs:
                 if self._review is not None:
                     try:
                         self.review_aside()
@@ -1643,9 +1781,12 @@ class Land:
                         # promises: a worker pushing red head after red head buys a paid read every time while
                         # `reviews` reads 0 for ever — the amplification the 2026-09-02 audit's P0 exists to stop.
                         # What the retry gets instead is the verdict, already on the PR and read back for free.
-                        out("·", "the review that ran beside the suite is COUNTED against this change — the read "
+                        out("·", "the review that ran beside the gates is COUNTED against this change — the read "
                                  "was paid for — and its verdict is on the PR for the retry to read back")
-                raise
+                raise errs[next(g for g in found if g in errs)]   # the first RED IN GATE ORDER, not whichever
+                                                                  # thread happened to finish first: the landing
+                                                                  # must say the same thing about the same tree
+                                                                  # twice running
             on = f"PR #{self.pr}" if self.head else f"the {self.base()} checkout"
             if self.pr and self.fill_memo:
                 try:    # what the serial phase spends instead of running these again — an optimisation, never a fact
@@ -1656,7 +1797,7 @@ class Land:
                 except OSError:
                     pass
             again = f" — {len(reused)} of them already green on {content[:12]}, not run again" if reused else ""
-            beside = " — the review ran beside the suite" if self._review is not None else ""
+            beside = " — the review ran beside the gates" if self._review is not None else ""
             return f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): {', '.join(found)}{again}{beside}"
         finally:
             if tmp:
@@ -2044,20 +2185,46 @@ class Land:
 
     # -- the sequence, in two halves ------------------------------------------------------------------------
     def pr_steps(self):
-        """About THIS change: gate it, read it, merge it, and record that it landed. The gates step runs the cheap
-        gates first and alone, then the suite with the paid read BESIDE it; the review step collects that read.
-        Reviewing before any gate optimised wall clock and was backwards for usage — a head the suite rejects had
-        bought a review of code that could never merge, and every repair pushed a new SHA and bought another (audit
-        2026-09-02, P0) — so nothing is bought before the cheap gates are green, and a buy made beside a red suite
-        still counts, because it was still paid for."""
+        """About THIS change: gate it, read it, merge it, and record that it landed. The gates step runs every gate
+        at once with the paid read BESIDE them from t=0; the review step collects that read.
+        Reviewing BEFORE any gate is still what this order refuses — the read starts with the gates, never in front
+        of them, so a landing the gates never began buys nothing. What it no longer waits for is the cheap gates
+        being green, which cost ~8 minutes at the front of every landing that was going to be green anyway. The
+        bound the 2026-09-02 audit's P0 asks for is the one that holds instead: a buy made beside a red gate still
+        COUNTS, because it was still paid for, so a worker pushing red head after red head cannot buy a paid read
+        every time with its tally reading 0."""
         return [("gates", self.gates), ("review", self.review), ("merge", self.merge), ("card", self.card),
                 ("board", self.close_board), ("ledger", self.close_ledger)]
 
+    def settle(self):
+        """Wait for every gate still running in this sweep before the box itself is touched. Skips when nothing
+        else is being gated, which is every landing run by hand and most sweeps.
+
+        THE ONE THING THE PIPELINE MAY NOT PULL FORWARD. Since 2026-09-08 a job is taken as soon as its OWN gates
+        and review are done (Prepared) rather than when the whole batch is — that is the merge overlapping the
+        gates behind it, and it costs nothing. The steps after the merge are a different thing: `git pull`,
+        install.sh, daemon-reload and `systemctl --user restart` are the box, and run beside another job's
+        ~14-minute suite they reinstall and restart the very tools it is asserting about. Merging early is free;
+        deploying early buys a red nobody wrote. So the deploy half waits here, for the gates already running and
+        never for a new one — the pool is fixed when the sweep starts, so this cannot wait on work queued after it.
+
+        It never fails: a wait is not a verdict, and a sweep with no pool (a landing run by hand, `run_batch`)
+        finds none and goes straight on."""
+        pool = _PREPARING
+        n = pool.pending() if pool is not None else 0
+        if not n:
+            raise Skip("nothing else is being gated — the box is touched at once")
+        t0 = time.time()
+        pool.join()
+        return (f"waited {int(time.time() - t0)}s for the gates of {n} other queued job(s) before touching the "
+                f"box: a suite that asserts about this box must not have it reinstalled and restarted under it")
+
     def deploy_steps(self):
         """About the BOX: they do the same thing whether one change landed or three, which is what lets a batch
-        run them once at the end instead of once per PR."""
-        return [("install", self.install), ("units", self.enable_units), ("restart", self.restart),
-                ("verify", self.verify_delivery)]
+        run them once at the end instead of once per PR. `settle` is first and belongs to all of them: everything
+        below this line changes the box, so none of it may run while another queued job is still being gated."""
+        return [("settle", self.settle), ("install", self.install), ("units", self.enable_units),
+                ("restart", self.restart), ("verify", self.verify_delivery)]
 
     def steps(self):
         return self.pr_steps() + self.deploy_steps()
@@ -2745,9 +2912,54 @@ def preparable(path):
                 and stamp() >= (j.get("not_before") or "") and j.get("attempts", 0) < LAND_TRIES)
 
 
+class Prepared:
+    """What prepare() hands cmd_work: one waiter per queued job, so the serial phase can merge a job the moment
+    ITS OWN gates and review are done — instead of joining the whole pool first.
+
+    THE BARRIER THIS REMOVES. Until 2026-09-08 cmd_work joined every prepare thread before its first merge, so a
+    job ready in five minutes waited on the slowest job beside it. Measured 2026-09-07 the suite runs 15.6 min
+    median but 34.6 mean and 165 worst, so a batch of four was priced at its outlier, and the merges — a minute
+    each — then ran in wall clock nothing else was using. Now they overlap the gates still running behind them.
+
+    WHAT DOES NOT CHANGE, and what wait() is for. The merges are still one at a time and still in QUEUE ORDER
+    (owner, 2026-09-04): cmd_work walks the queue in order and each job's wait() returns only once that job's own
+    preparation finished, so a job merges on a head its own gates ran on and never on one nothing read. A job
+    prepare did not take — a deploy, a paused repo, one out of attempts — has no waiter and keeps its place in
+    that walk.
+
+    WHAT IT MUST NOT PULL FORWARD IS THE DEPLOY. A PR job's walk does not stop at the merge — install.sh,
+    daemon-reload and the unit restarts come after it, and those are the box itself. Taken early they would
+    reinstall and restart the very tools another job's ~14-minute suite is asserting about, and its red would be
+    nobody's change; before this class existed that was impossible, because prepare() joined every gate thread
+    before the first job was taken at all. Land.settle() is where it is held instead, at the head of
+    deploy_steps() — so it holds for a queued deploy job too, which has no waiter here.
+
+    join() is why a gate worktree is not left behind when a merge raises: the normal sweep has waited for every
+    job already and it returns at once, but an exception out of the merge loop must still not leave the pool
+    running into interpreter exit."""
+
+    def __init__(self, header, ready, bufs, threads):
+        self.header, self._ready, self._bufs, self._threads = header, ready, bufs, threads
+
+    def wait(self, path):
+        """Block until THIS job's gates and review are finished, and return the lines they printed."""
+        if path not in self._ready:
+            return []
+        self._ready[path].wait()
+        return self._bufs[path] or [f"  · {os.path.basename(path)}: nothing to prepare"]
+
+    def pending(self):
+        """How many jobs are still being gated — 0 when there is nothing left for settle() to wait for."""
+        return sum(1 for e in self._ready.values() if not e.is_set())
+
+    def join(self):
+        for t in self._threads:
+            t.join()
+
+
 def prepare(paths):
     """The half of a landing that changes NOTHING, for every queued job at once: the gates (in a throwaway worktree)
-    and the review (minutes of `claude -p`, run beside the suite). Both already leave their answer somewhere durable —
+    and the review (minutes of `claude -p`, run beside them). Both already leave their answer somewhere durable —
     the gates as a memo keyed by head SHA, and the review as its own PR comment keyed the same way — so this phase
     only fills those, and the serial phase below then spends them. That is the whole design: prepare can be skipped,
     killed or crash and the landing is byte for byte what it was before, just slower. Nothing here writes a job
@@ -2760,11 +2972,15 @@ def prepare(paths):
     in its turn. The suite itself no longer holds a box-wide lock (its fixtures are isolated per run and it caps
     itself), so nothing here waits on another job's suite except by this rule.
 
-    WHAT STAYS SERIAL is everything after: merge, install.sh, the units and the restarts, in queue order, exactly as
-    they were."""
+    WHAT STAYS SERIAL is everything after the gates, exactly as it was, one at a time and in queue order. What
+    changed on 2026-09-08 is only WHEN the first of them starts: this returns a Prepared as soon as the pool is
+    running rather than when it is done, and the serial phase takes each job as its own preparation finishes
+    instead of waiting for the whole batch of four. The DEPLOY half of that walk is the exception and waits for
+    the pool anyway (Land.settle), because it changes the box a running suite is asserting about."""
     jobs = [p for p in paths if preparable(p)]
     if len(jobs) < 2:
-        return []               # one job is what the serial phase already does, and a pool around it is just risk
+        return Prepared([], {}, {}, [])   # one job is what the serial phase already does, and a pool around it is
+                                          # just risk — an empty handle waits for nothing and joins nothing
     lands, files, bufs = {}, {}, {}
     for path in jobs:
         j = read_json(path) or {}
@@ -2803,6 +3019,7 @@ def prepare(paths):
                 out("✗", f"{e.__class__.__name__}: {e}")
 
     done, running, cv = set(), set(), threading.Condition()
+    ready = {path: threading.Event() for path in jobs}   # …and the one cmd_work waits on, per job (Prepared)
 
     def touches(a, b):
         return files[a] is None or files[b] is None or bool(files[a] & files[b])
@@ -2839,17 +3056,14 @@ def prepare(paths):
                     running.discard(q)
                     done.add(q)
                     cv.notify_all()
+                ready[q].set()      # this job may be taken now; the ones behind it are still gating
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(PREPARE_AT_ONCE, len(jobs)))]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
-    lines = [f"gating and reading {len(jobs)} queued job(s) — side by side where their files do not overlap, one "
-             f"after another where they do; the merges stay serial, in queue order:"]
-    for path in jobs:
-        lines += bufs[path] or [f"  · {os.path.basename(path)}: nothing to prepare"]
-    return lines
+    return Prepared([f"gating and reading {len(jobs)} queued job(s) — side by side where their files do not "
+                     f"overlap, one after another where they do; the merges stay serial and in queue order, each "
+                     f"as soon as its own gates and review are done:"], ready, bufs, threads)
 
 
 def cmd_work(argv):
@@ -2873,9 +3087,16 @@ def cmd_work(argv):
         sweep_memos()
         sweep_roots()
         paths = sorted(glob.glob(f"{LANDQ}/*.json"))
-        lines += prepare(paths)                  # the reviews and the gates of all of them, at once and changing nothing
-        for path in paths:
-            lines.append(run_one(path))          # every sweep: this is what finishes a landing a reboot interrupted
+        pool = prepare(paths)                    # the reviews and the gates of all of them, at once and changing nothing
+        lines += pool.header
+        globals()["_PREPARING"] = pool           # …and what each job's deploy half waits on (Land.settle)
+        try:
+            for path in paths:
+                lines += pool.wait(path)         # THIS job's gates and review — not the whole batch's (Prepared)
+                lines.append(run_one(path))      # every sweep: this is what finishes a landing a reboot interrupted
+        finally:
+            globals()["_PREPARING"] = None
+            pool.join()                          # nothing gating is left running past the sweep, take or raise
         if "--catch-up" in argv or due_catchup():
             for repo in catchup():
                 lines.append(run_one(job_path(repo, "deploy")))
@@ -2942,7 +3163,11 @@ def queue_task(argv):
 def cmd_queue(argv):
     """Put a PR on the queue and start the worker. This is the whole of what a 👍 does now, and its EXIT CODE is the
     caller's answer: non-zero means nothing has merged and nothing will until somebody acts, which is what cc-slack
-    puts in the channel rather than merging anyway."""
+    puts in the channel rather than merging anyway.
+
+    …and that is now also how a DOOMED job is answered — one that a landing has already refused for a reason a
+    re-queue cannot mend. It is refused HERE, in about a second, with the reason and the commands that end it,
+    instead of being discovered after a full gate suite (doomed)."""
     if argv and argv[0] == "--task": return queue_task(argv[1:])
     repo, pr, chat, ts, who, start = "", "", "", "", "", True
     rest = list(argv)
@@ -2971,6 +3196,16 @@ def cmd_queue(argv):
         print(f"[{repo}] PR #{pr} is already queued — one job per PR, so two 👍 are still one landing")
         ledger(f"again {repo}#{pr} by={by}")
     else:
+        # AT THE DOOR, before a job file exists and before a suite is ever started. A landing that already reached
+        # this same answer wrote it down (mark_doomed); doomed() re-asks GitHub whether anything has changed since,
+        # in one call and about a second, and answers "" for every uncertainty. This is the whole of what stops a
+        # re-queue spending ~22 minutes of gates to be told what was known when it was typed.
+        why = doomed(repo, pr)
+        if why:
+            print(f"cc-land: PR #{pr} is not queued — it cannot succeed as it stands, and this was decided when it "
+                  f"was asked for rather than after its gates:\n{why}", file=sys.stderr)
+            ledger(f"refused {repo}#{pr} by={by} doomed")
+            return 1
         try:
             write_atomic(path, {"repo": repo, "pr": int(pr), "chat": chat, "ts": ts, "who": who, "by": by,
                                 "queued_at": stamp(), "attempts": 0, "stage": "queued"})
@@ -3996,9 +4231,10 @@ def cmd_selfcheck():
     world["git rev-parse FETCH_HEAD"] = (0, MOVED + "\n")     # somebody pushed between the gates and the review
     moved = caught(L.review)
     check("a push between the gates and the review stops the landing: what was gated is named, what is there now "
-          "is named, and nothing merges ungated",
+          "is named, and nothing merges ungated — the read that ran beside the gates was bought against the SHA "
+          "they ran on, and a head nothing gated is not merged on somebody else's verdict",
           isinstance(moved, Failed) and HEAD[:12] in str(moved) and MOVED[:12] in str(moved)
-          and not ran("gh pr merge") and not [c for c in calls if c[0] == CLAUDE])
+          and not ran("gh pr merge") and len([c for c in calls if c[0] == CLAUDE]) == 1)
     check("...and the worktree the gates made is still removed — a refusal must not leave unmerged code on disk",
           ran("git worktree remove", "--force"))
     L = fresh(pr=7)
@@ -4078,9 +4314,15 @@ def cmd_selfcheck():
     check("a failing gate stops the landing and nothing is merged", rc == 1 and not ran("gh pr merge"))
     check("a failing gate stops before install.sh and before any systemctl", not ran("install.sh") and not ran("systemctl"))
 
-    # …and it stops before a token is bought. The gates run FIRST now, so a head the suite refuses is rejected
-    # having cost nothing: reviewing first optimised wall clock and paid a model to read code that could not merge
-    # (docs/architecture-usage-efficiency-audit-2026-09-02.md, P0). A real gate script, red, on its own fixture.
+    # …and it stops before the merge, having also bought the read that ran beside it. Until 2026-09-07 the cheap
+    # gates ran first and ALONE, so a head they refused cost nothing — and every green landing paid their minutes
+    # twice over, once in the gates and once again in front of a read that had not started (measured: ~22 minutes
+    # serial for a suite that is ~14 of them). The read starts at t=0 now, which is that trade taken the other way:
+    # a red gate is the rare landing and a green one is every other landing. What must NOT change is the bound the
+    # 2026-09-02 audit's P0 put there — the buy is counted whatever the gates then said, because a refund here lets
+    # a worker push red head after red head and buy a paid read each with the tally reading 0 for ever. The read is
+    # not wasted either: its verdict goes on the PR for the retry to read back. A real gate script, red, on its own
+    # fixture.
     def red_gate(**extra):
         L = fresh(pr=7)
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
@@ -4099,11 +4341,12 @@ def cmd_selfcheck():
         return L, rc
 
     L, rc = red_gate(**{"git rev-list --count": (0, "0\n")})
-    check("a red gate rejects the head with ZERO model spend: no reviewer was asked about code the suite has "
-          "already refused, and nothing was counted against the change for it",
+    check("a red gate rejects the head and nothing merges — and the read that ran BESIDE it is collected rather "
+          "than abandoned: one model call, its verdict on the PR for the retry to read back, and its buy COUNTED, "
+          "so N red heads cannot buy N paid reads with the tally reading 0 throughout",
           rc == 1 and L.stopped == "gates" and "the row was wrong" in L.why
-          and not [c for c in calls if c[0] == CLAUDE]
-          and not ran("gh pr merge") and not root_work("myrepo", 7).get("reviews"))
+          and len([c for c in calls if c[0] == CLAUDE]) == 1 and len(commented()) == 1
+          and not ran("gh pr merge") and root_work("myrepo", 7).get("reviews") == 1)
     check("CONTROL, all the way through a run: that head is level with its base, so the landing says the failing "
           "case and nothing else — a red branch written against today's main reads as red",
           "behind main" not in L.why and "rebase" not in L.why)
@@ -4403,16 +4646,47 @@ def cmd_selfcheck():
             return (0, "  ✓ all\n== result: 5 passed, 0 failed ==\n")
         L, g, r = both(gate_answer, reviewer_says)
         check("the read runs BESIDE the suite: the fake suite and the fake reviewer each answer only once the other "
-              "is in flight, and the landing lands — gates green, LAND, read while the suite ran, one model call",
-              not meet.broken and isinstance(g, str) and "ran beside the suite" in g and isinstance(r, str)
-              and "LAND on PR #7" in r and "read while the suite ran" in r
+              "is in flight, and the landing lands — gates green, LAND, read while the gates ran, one model call",
+              not meet.broken and isinstance(g, str) and "ran beside the gates" in g and isinstance(r, str)
+              and "LAND on PR #7" in r and "read while the gates ran" in r
               and len([c for c in calls if c[0] == CLAUDE]) == 1)
-        check("...and the cheap gate went first and ALONE: check.sh had answered before the reviewer was asked",
-              0 <= idx("gate", "check.sh") < idx("review", "asked"))
+        # …and EVERY gate at once with it, which is the other half of the same change. The cheap gates used to run
+        # first and alone and the read began only once they were done — ~5 + ~3 minutes in front of a ~14-minute
+        # suite, none of it overlapping (measured 2026-09-07). Three-way rendezvous: check.sh, selftest.sh and the
+        # reviewer each answer only once the other two are in flight, so ANY pair of them still running in series
+        # breaks the barrier and this case goes red. It is the whole proof that the landing's gate wall clock is
+        # the slowest gate rather than the sum of them.
+        meet3 = threading.Barrier(3, timeout=10)
+
+        def all_three(argv):
+            name = os.path.basename(argv[0])
+            ev("gate", name)
+            with contextlib.suppress(threading.BrokenBarrierError):
+                meet3.wait()
+            ev("answered", name)    # …when the gate is DONE, which is the only order the barrier fixes: which of
+                                    # the three got there first is the scheduler's business and is asserted nowhere
+            return (0, "== result: 5 passed, 0 failed ==\n") if name == "selftest.sh" else (0, "check.sh: OK\n")
+
+        def reviewer_three(argv):
+            ev("review", "asked")
+            with contextlib.suppress(threading.BrokenBarrierError):
+                meet3.wait()
+            return (0, REVIEWED("LAND"))
+        L, g, r = both(all_three, reviewer_three)
+        check("the cheap gate, the suite and the paid read are ALL three in flight at once — a rendezvous none of "
+              "them can reach alone — and the landing still lands: gates green, LAND, one model call",
+              not meet3.broken and isinstance(g, str) and "ran beside the gates" in g and isinstance(r, str)
+              and "LAND on PR #7" in r and len([c for c in calls if c[0] == CLAUDE]) == 1)
+        check("...so the read did not WAIT for the cheap gate: it was asked before check.sh had ANSWERED, where "
+              "serial it could not be asked until after it — ~8 minutes off every green landing",
+              0 <= idx("review", "asked") < idx("answered", "check.sh"))
         L, g, r = both(lambda a: (1, "shellcheck: SC2086\n") if a[0].endswith("check.sh") else (0, "0 failed\n"),
-                       reviewer_says)
-        check("a red CHEAP gate stops the landing before a token is spent: no reviewer was asked, and the ✗ names "
-              "the gate", isinstance(g, Failed) and "check.sh" in str(g) and not [c for c in calls if c[0] == CLAUDE])
+                       lambda a: (ev("review", "asked"), (0, REVIEWED("LAND")))[1])   # nothing to meet: this case
+                                                          # is about what a RED gate does to the read beside it
+        check("a red CHEAP gate still stops the landing and the ✗ names the gate — and the read it no longer runs "
+              "in front of is collected, not abandoned: one model call, its verdict on the PR, its buy counted",
+              isinstance(g, Failed) and "check.sh" in str(g) and len([c for c in calls if c[0] == CLAUDE]) == 1
+              and len(commented()) == 1 and root_work("myrepo", 7).get("reviews") == 1 and not ran("gh pr merge"))
         meet = threading.Barrier(2, timeout=10)
 
         def suite_says(argv):
@@ -4450,28 +4724,27 @@ def cmd_selfcheck():
         # (review-235). The thread keeps its answer in a local now, and the memo is filed under self.gated.
         for p in glob.glob(f"{gate_dir()}/*.json"):
             os.unlink(p)
-        # The push lands the moment the CHEAP gate is done, before the read is even started, and the suite does
-        # not finish until the read has seen it — so the read's answer is always in before the memo is filed, and
-        # this case cannot pass by winning a race. (A push timed against the suite instead is a coin toss: the
-        # read either resolves before it and lands, or after it and refuses, and only the second shape proves
-        # anything. That flake is what made the gate red on 2026-09-04 while the same case was green here.)
-        pushed = threading.Event()
+        # The push lands the instant the gates start, and the ORDER is pinned by the fixture rather than by any
+        # timing: FETCH_HEAD answers the old SHA once — to gates(), on the main thread, which pins self.gated with
+        # it — and the new one to every reader after that, the read on its thread first. No barrier, no sleep,
+        # nothing to win a race against. (It used to be the cheap gate that installed the push, which worked only
+        # while the read started AFTER that gate; started at t=0 the read now resolves the old head first and lands,
+        # which proves nothing about the memo. Timing it loosely against the suite is the same coin toss that made
+        # this gate red on 2026-09-04 while the case was green here.)
+        heads = [HEAD, MOVED]
 
-        def moved(argv):
-            pushed.set()            # …the read has just resolved the new head
-            return (0, MOVED + "\n")
+        def then_moved(argv):
+            return (0, (heads.pop(0) if len(heads) > 1 else heads[0]) + "\n")
 
         def gate_pushes(argv):
-            if os.path.basename(argv[0]) == "check.sh":
-                world["git rev-parse FETCH_HEAD"] = moved
-                return (0, "check.sh: OK\n")
-            pushed.wait(10)
-            time.sleep(0.05)        # …and is a frame or two past it, wherever it puts the answer
-            return (0, "== result: 5 passed, 0 failed ==\n")
-        L, g, r = both(gate_pushes, reviewer_says, fill_memo=True)
+            return (0, "check.sh: OK\n") if os.path.basename(argv[0]) == "check.sh" else \
+                   (0, "== result: 5 passed, 0 failed ==\n")
+        L, g, r = both(gate_pushes, reviewer_says, fill_memo=True,
+                       **{"git rev-parse FETCH_HEAD": then_moved})
         memos = sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json"))
-        check("a push between the cheap gate and the suite leaves NO memo for the new head: what the prepare phase "
-              "files is keyed to the SHA the gates ran on, and the read beside the suite never moves it",
+        check("a push the moment the gates start leaves NO memo for the new head: what the prepare phase files is "
+              "keyed to the SHA the gates RAN on, and the read beside them keeps the SHA it resolved in a local — "
+              "written to self.head it made the memo a green record for a tree nothing gated (review-235)",
               isinstance(g, str) and L.gated == HEAD and L.head == HEAD
               and memos == [f"myrepo-7-{HEAD[:12]}-full.json"])
         check("...so the serial phase has nothing to spend for that new head and GATES it, where a memo filed under "
@@ -4489,6 +4762,31 @@ def cmd_selfcheck():
         L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\nM\tcore/bin/cc-graphs\n", **graphs)
         check("the suite is handed the paths the diff changed — CC_LAND_CHANGED, sorted, as git names them — so a "
               "suite that knows its own shape runs only what those reach", told() == ["core/bin/cc-graphs install.sh"])
+        slots = lambda: [e.get("CC_SELFTEST_SLOTS") for c, e in zip(calls, envs) if c[0].endswith("selftest.sh")]
+        check("...and the ONE concurrency number with it: what the lander runs at once IS what the suite's own "
+              "lock allows at once, said out loud in the suite's environment, so no landing ever waits at a cap "
+              "its own lander widened past", slots() == [str(PREPARE_AT_ONCE)] and PREPARE_AT_ONCE == gate_slots())
+        # …and the number itself follows the MACHINE. It was 4 typed here and 4 typed again in selftest.sh, in two
+        # files, neither set anywhere and nothing keeping them in step. Both derive it now, and the two derivations
+        # are checked against each other by RUNNING the shell one — a text match on that file would go green the
+        # day somebody edited its arithmetic and left the comment alone.
+        real_cpus, sh_slots = os.cpu_count, f"{os.path.dirname(BIN)}/tests/selftest.sh"
+        block = re.search(r"^if \[ -z \"\$\{CC_SELFTEST_SLOTS:-\}\" \]; then\n(.*?)^else$",
+                          open(sh_slots).read(), re.S | re.M)
+        try:
+            for cpus, want in [(1, 2), (3, 2), (4, 2), (6, 4), (9, 6), (64, 6), (None, 2)]:
+                os.cpu_count = lambda n=cpus: n
+                same = subprocess.run(["sh", "-c", f'nproc(){{ echo {cpus if cpus else 4}; }}\n{block.group(1)}\n'
+                                                   'echo "$SLOTS"'], capture_output=True, text=True).stdout.strip()
+                got, agrees = gate_slots(), same == str(gate_slots())
+                if got != want or not agrees:
+                    break
+        finally:
+            os.cpu_count = real_cpus
+        check("the one number is two thirds of the cores, never under 2 and never over 6 — six cores say 4, one "
+              "core says 2, sixty-four say 6, a machine that will not say says 2 — and selftest.sh's own default, "
+              "run as the shell runs it, answers the same for every one of them",
+              bool(block) and got == want and agrees and gate_slots() == max(2, min(6, (os.cpu_count() or 4) * 2 // 3)))
         L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\nM\tcore/bin/cc-graphs\n",
                        land={"full_gates": True}, **graphs)
         check("...and --full-gates hands it nothing, which is everything", told() == [None])
@@ -4752,14 +5050,21 @@ def cmd_selfcheck():
                                                 "settings edit outside the repo"))
 
     # 9. the sequence itself, and what each step's failure means
-    check("the steps are the remembered ones, in that order — the GATES first (the cheap ones alone, the suite with "
-          "the paid read beside it), the review step collecting that read, and the check that says it reached the "
-          "owner LAST, after install.sh and the restart, because before those the box still runs the old code",
+    check("the steps are the remembered ones, in that order — the GATES first (all of them at once, with the paid "
+          "read beside them), the review step collecting that read, `settle` between the merge and the box because "
+          "everything after it changes the box, and the check that says it reached the owner LAST, after install.sh "
+          "and the restart, because before those the box still runs the old code",
           [n for n, _ in Land("myrepo", pr=1).steps()] ==
-          ["gates", "review", "merge", "card", "board", "ledger", "install", "units", "restart", "verify"])
+          ["gates", "review", "merge", "card", "board", "ledger", "settle", "install", "units", "restart", "verify"])
     check("the fatal steps are exactly the ones that leave the box wrong; card, board, ledger and the delivery "
-          "check are not among them — nothing follows the check, and a landing it cannot confirm is still landed",
-          set(FATAL) == {n for n, _ in Land("myrepo", pr=1).steps()} - {"card", "board", "ledger", "verify"})
+          "check are not among them — nothing follows the check, and a landing it cannot confirm is still landed. "
+          "Nor is `settle`, which only ever waits: a wait is not a verdict, and one that failed would stop a "
+          "landing over another job's gates",
+          set(FATAL) == {n for n, _ in Land("myrepo", pr=1).steps()}
+          - {"card", "board", "ledger", "verify", "settle"})
+    check("...and settle skips outright when no sweep is gating, which is every landing run by hand: it is the "
+          "pipeline's own bound, never a step that can hold one up on its own",
+          isinstance(caught(Land("myrepo", pr=1).settle), Skip))
 
     # 10. a batch: every PR merged on its own, the box deployed once at the end
     fresh(pr=7)
@@ -4857,8 +5162,91 @@ def cmd_selfcheck():
               rcQ == 0 and len(glob.glob(f"{qdir}/myrepo-*.json")) == 1
               and read_json(job_path("myrepo", 7)).get("ts") == "1.1")
 
-        # ---- fail closed, both ways. Nothing here has a fallback that merges: that fallback IS the bug.
+        # ---- AT THE DOOR. Measured 2026-09-07: of 25 landings that ended "the review budget for this change is
+        # spent", 8 were a re-queue of a PR already refused for exactly that with no --re-review — jobs that could
+        # not succeed — and every one of the 25 ran the whole gate suite before saying so, because cmd_queue checked
+        # nothing and the budget and wall checks live in review_now(), on the thread beside the gates whose failure
+        # is only raised at the join AFTER them. 753 minutes of gate time bought nothing that day. The refusal that
+        # knows the answer writes it down (mark_doomed) and the queue reads it back, in one `gh` call.
         os.unlink(job_path("myrepo", 7))
+        WHY = "the review budget for this change is spent: PR #7 has already bought 1 review(s)"
+        GH7 = "gh pr view 7 --json headRefOid,comments"
+        MARK = f"<!-- {REVIEW_MARK} {HEAD[:12]} LAND -->\nnothing to add"
+
+        def refused(comments=(), head=HEAD, **w):
+            """A PR a landing already refused, 👍'd again. `comments`/`head` are what GitHub says NOW."""
+            fresh(pr=7)
+            for p in glob.glob(f"{qdir}/myrepo-*.json"):
+                os.unlink(p)
+            root_spend("myrepo", 7, doomed={"at": stamp(), "head": HEAD, "key": "", "why": WHY, **w})
+            world[GH7] = (0, json.dumps({"headRefOid": head,
+                                         "comments": [{"body": b, "viewerDidAuthor": True} for b in comments]}))
+            del started[:]
+            return quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+        rcQ = refused()
+        check("a 👍 on a PR a landing has already refused for a reason a re-queue cannot mend is refused AT THE "
+              "DOOR: no job file, no worker, a non-zero answer for cc-slack to put in the channel — and the reason "
+              "is the one the landing wrote, not a second telling of it",
+              rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started
+              and f"\trefused myrepo#7 by=" in open(f"{qdir}/queue.log").read()
+              and open(f"{qdir}/queue.log").read().rstrip().endswith("doomed"))
+        check("...and NO SUITE was started for it: not a gate, not a fetch, not a checkout — the whole of what "
+              "those 25 landings spent 753 minutes on before reaching this same sentence",
+              not [c for c in calls if c[0].endswith((".sh", "check.sh"))] and not ran("git fetch")
+              and not ran("git worktree add") and not [c for c in calls if c[0] == CLAUDE])
+        # IT MUST NEVER REFUSE SOMETHING THAT COULD HAVE LANDED, so each of the three things that re-open it is
+        # its own case, and each queues the job the previous one refused.
+        rcQ = refused(head=MOVED)
+        check("a head that has MOVED since the refusal is queued: somebody pushed, that is a new question, and "
+              "nothing recorded answers it", rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started)
+        rcQ = refused(comments=[MARK])
+        check("a verdict for that same head now ON the PR queues it too — `cc-land record`, or a --re-review since "
+              "bought: review_now() takes the recorded-verdict path and never reaches the check that refused",
+              rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started)
+        rcQ = refused(comments=["<!-- cc-land-review 0000deadbeef LAND -->\nabout a different head"])
+        check("...but a marker about some OTHER head does not: the record still stands, and a comment that answers "
+              "a question nobody asked is not an answer to this one",
+              rcQ == 1 and not os.path.exists(job_path("myrepo", 7)) and not started)
+        # …and the network is not evidence either way. A `gh` that errors or answers gibberish means the queue does
+        # not KNOW, and not knowing queues it — the landing then decides exactly as it does today.
+        for bad in [(1, "gh: could not resolve host\n"), (0, "not json at all\n"), (0, "{}\n")]:
+            rcQ = refused(**{})
+            world[GH7] = bad
+            for p in glob.glob(f"{qdir}/myrepo-*.json"):
+                os.unlink(p)
+            del started[:]
+            rcQ = quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+            check(f"a `gh` that answers {bad[1].strip()[:24]!r} is not evidence: the job is QUEUED and the landing "
+                  f"decides as it does today — an uncertainty that refused would be a PR nobody can land",
+                  rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started)
+        # A CAP WALL is re-opened by raising the cap that BOUND, and by nothing else — the same rule review_now()
+        # applies, asked here in the same words (wall_stands), so the door and the landing cannot drift apart.
+        _caps_real = (REVIEW_BUDGET, REVIEW_TURNS)
+        globals()["REVIEW_BUDGET"], globals()["REVIEW_TURNS"] = "3", "40"
+        try:
+            rcQ = refused(wall={"head": HEAD, "hit": "error_max_budget_usd", "was": "3", "cap": "$3.00", "cost": "$3.00"})
+            check("a refusal recorded against a CAP is refused at the door while that cap stands", rcQ == 1
+                  and not os.path.exists(job_path("myrepo", 7)) and not started)
+            globals()["REVIEW_BUDGET"] = "6"
+            rcQ = refused(wall={"head": HEAD, "hit": "error_max_budget_usd", "was": "3", "cap": "$3.00", "cost": "$3.00"})
+            check("...and queued the moment somebody raises THAT cap — the one thing that makes the same run at the "
+                  "same head worth buying", rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started)
+        finally:
+            globals()["REVIEW_BUDGET"], globals()["REVIEW_TURNS"] = _caps_real
+        # A PR with NO refusal recorded is the ordinary 👍 and asks GitHub nothing at all: the door costs a landing
+        # that has never been refused neither a second nor a call.
+        fresh(pr=7)
+        for p in glob.glob(f"{qdir}/myrepo-*.json"):
+            os.unlink(p)
+        del started[:]
+        rcQ = quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
+        check("a PR nothing has refused is queued without asking GitHub anything: the door is a lookup on disk "
+              "first, so the ordinary 👍 pays nothing for it",
+              rcQ == 0 and os.path.exists(job_path("myrepo", 7)) and started and not ran("gh pr view"))
+
+        # ---- fail closed, both ways. Nothing here has a fallback that merges: that fallback IS the bug.
+        for p in glob.glob(f"{qdir}/myrepo-*.json"):
+            os.unlink(p)
         globals()["start_worker"] = lambda: (False, "systemd-run: no user manager; detached: OSError")
         rcQ = quiet(cmd_queue, ["myrepo", "7"])
         check("queued but the worker will not start is a FAILURE the caller must act on — cc-slack says so in the "
@@ -5135,12 +5523,22 @@ def cmd_selfcheck():
                   kept.get("attempts") == 1 and (kept.get("last") or "").startswith("gates: gate core/tests/check.sh")
                   and "✗ H4" in kept["last"] and not gh_merges() and not ran_sub("cc-slack", "post")
                   and not ran("cc-notify") and armed() == [f"--on-active={RETRY_AFTER}"] and RETRY_AFTER == 900)
+            # The read ran BESIDE that red gate — that is the trade for taking the cheap gates off the front of it
+            # (gates) — so its verdict is on the PR now and the fake GitHub is told so. Which is exactly what keeps
+            # the trade cheap: the buy stands, and the re-drive reads that verdict back instead of buying a second.
+            # Without it a gate that flakes twice would spend a change's whole review budget on nothing and the
+            # re-drive below would be refused for it.
+            world["gh pr view 7 --json comments"] = (
+                0, json.dumps({"comments": [{"body": c[c.index("--body") + 1], "viewerDidAuthor": True}
+                                            for c in commented()]}))
             world[GATE] = (0, "  ✓ the first\n  ✓ H4\n0 failed\n")            # the flake passes this time
             quiet(cmd_work, [])
             check("...and the next sweep re-drives the same job: gated green, merged, one ✅ — no second 👍, no "
-                  "reaction from the bot",
+                  "reaction from the bot, and NO second read: the one the red gate paid for is read back off the "
+                  "PR, so a flaking gate cannot spend a change's review budget a try at a time",
                   len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7))
-                  and not reacted and len(ran_sub("cc-slack", "post")) == 1)
+                  and not reacted and len(ran_sub("cc-slack", "post")) == 1
+                  and len(commented()) == 1 and len([c for c in calls if c[0] == CLAUDE]) == 1)
             landing(**{GATE: (1, "  ✗ the row was wrong\n1 failed\n")})
             for _ in range(LAND_TRIES):
                 quiet(cmd_work, [])
@@ -5610,15 +6008,22 @@ def cmd_selfcheck():
         quiet(cmd_queue, ["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2", "--no-start"])
         calls.clear()
         # The memo is the ONE thing the parallel half hands the serial one, so it is watched being handed over
-        # rather than inspected after the fact: `after_prepare` is the memo dir as it stood the instant prepare()
-        # returned. Read only at the end, it is empty whatever the memo code does — which is exactly how this
-        # assertion passed while nothing ever wrote a memo at all (review of PR #176).
+        # rather than inspected after the fact. Read only at the end it is empty whatever the memo code does —
+        # which is exactly how this assertion passed while nothing ever wrote a memo at all (review of PR #176).
+        # The handover is now per job rather than per batch, so `after_prepare` is one snapshot of the memo dir
+        # per job, taken the instant THAT job's wait() returns and before its own merge spends the memo.
         real_prepare, after_prepare = prepare, []
 
         def watched_prepare(paths):
-            lines = real_prepare(paths)
-            after_prepare.extend(sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json")))
-            return lines
+            pool = real_prepare(paths)
+            real_wait = pool.wait
+
+            def wait(path):
+                lines = real_wait(path)
+                after_prepare.append(sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json")))
+                return lines
+            pool.wait = wait
+            return pool
 
         # …and a gate only runs at all if there is one to find: without this patch both jobs Skip on "no gates in
         # myrepo", no memo is ever written, and every line below is true of a mechanism that does not exist.
@@ -5633,13 +6038,17 @@ def cmd_selfcheck():
         swept = buf.getvalue()
         gate_runs = [c for c in calls if os.path.basename(c[0]) == "check.sh"]
         merged = [c[3] for c in gh_merges()]
-        first_merge = next((i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "merge"]), len(calls))
+        merge_at = {c[3]: i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "merge"]}
+        read_at = {pr: next((i for i, c in enumerate(calls)
+                             if c[0] == CLAUDE and f"/pr-{pr}.diff" in " ".join(c)), None) for pr in ("7", "8")}
         check("the reviews of several queued jobs really do run at the same time — the fake reviewer only answers "
               "once BOTH are in flight, so a serial sweep cannot get past this line",
               not gate.broken and len(seen) == 2)
-        check("...and every review and every gate happens before the FIRST merge: that phase split is what keeps "
-              "merge, install, the units and the restarts serial while the slow half overlaps",
-              first_merge > 0 and not [c for c in calls[first_merge:] if c[0] == CLAUDE])
+        check("...and each PR is gated and read before ITS OWN merge — which is the whole of what the phase split "
+              "has to guarantee now that a ready job no longer waits for the batch (Prepared.wait): a merge never "
+              "runs on a head nothing read",
+              all(read_at[pr] is not None and merge_at.get(pr) is not None and read_at[pr] < merge_at[pr]
+                  for pr in ("7", "8")))
         check("...the merges themselves are one at a time and in queue order, both of them, and each PR is told "
               "about once", merged == ["7", "8"] and len(ran_sub("cc-slack", "post")) == 2)
         check("...and each PR is REVIEWED once, not twice: the prepare phase's verdict is the one the merge reads "
@@ -5647,8 +6056,10 @@ def cmd_selfcheck():
               len([c for c in calls if c[0] == CLAUDE]) == 2 and len(posted.get("7", [])) == 1
               and len(posted.get("8", [])) == 1)
         check("...the prepare phase leaves ONE memo per PR, keyed by that PR's head SHA and by the tier the serial "
-              "half will ask with — the whole of what the parallel work hands over",
-              after_prepare == [f"myrepo-7-{HEAD[:12]}-full.json", f"myrepo-8-{HEAD[:12]}-full.json"])
+              "half will ask with — the whole of what the parallel work hands over. Watched as each job is handed "
+              "over: 7's memo is there when 7 is, and by the time 8 is handed over 7's has been spent and gone",
+              len(after_prepare) == 2 and f"myrepo-7-{HEAD[:12]}-full.json" in after_prepare[0]
+              and after_prepare[1] == [f"myrepo-8-{HEAD[:12]}-full.json"])
         check("...the serial half SPENDS them rather than re-running: it says so on both PRs, and the gate itself "
               "was executed exactly twice across the whole sweep — once each, where an unread memo is four",
               swept.count("run for this sweep by the prepare phase") == 2 and len(gate_runs) == 2)
@@ -5659,6 +6070,68 @@ def cmd_selfcheck():
               "file per repo, so interleaved fetches hand a thread its sibling's head SHA — a review bought "
               "against the wrong diff, and its verdict posted on the wrong PR under a SHA that is not that PR's",
               fetched and not overlapped and not gate.broken)
+
+        # (5b) A PREPARED JOB IS TAKEN AS SOON AS IT IS READY, not when the whole batch is. Until 2026-09-08
+        # cmd_work joined every prepare thread before its first merge, so a job ready in five minutes waited on the
+        # slowest job beside it — and the suite is uneven: 15.6 min median, 34.6 mean, 165 worst (measured
+        # 2026-09-07), so a batch of four was priced at its outlier. The proof is a rendezvous the other way round
+        # from the ones above: PR 8's review does not answer until PR 7 HAS MERGED. Joined first that is a
+        # deadlock — the merge waits on the review that waits on the merge — so the wait times out, `released`
+        # stays empty and this goes red. Its own fixture: fresh() wipes the tallies and the world, and `posted` is
+        # cleared, or the verdicts case 5 left on both PRs would be read back and no review would run at all.
+        fresh(pr=7)
+        posted.clear()
+        merged7, released, when = threading.Event(), [], []
+
+        def paced_review(argv):
+            """Which PR is being read, off the diff the prompt points the reviewer at ({tmp}/pr-<n>.diff) — read
+            from the whole argv, and never .group() on a miss: a fake handed something it does not recognise says
+            so rather than raising inside a worker thread, where the traceback is all anyone gets."""
+            m = re.search(r"/pr-(\d+)\.diff", " ".join(argv))
+            pr = m.group(1) if m else ""
+            if pr == "8" and merged7.wait(20):
+                released.append(pr)
+                time.sleep(1)     # …and 8 is STILL being read when 7's merge returns. Without the wait at the head
+                                  # of the deploy half, 7's `git pull` is microseconds behind its merge and lands
+                                  # in `when` before this line does — which is the regression, deterministically
+            when.append(("read", pr))
+            return (0, REVIEWED("LAND"))
+
+        def paced_merge(argv):
+            when.append(("merge", argv[3]))
+            if argv[3] == "7":
+                merged7.set()
+            return (0, "")
+
+        def paced_pull(argv):       # the first step of the deploy half, and the first thing that touches the box
+            when.append(("deploy", ""))
+            return (0, "")
+
+        world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
+                      "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
+                      f"{CLAUDE} -p": paced_review, "gh pr comment": remember, "gh pr merge": paced_merge,
+                      "git pull --ff-only": paced_pull,
+                      "gh pr view 7 --json comments": comments("7"), "gh pr view 8 --json comments": comments("8")})
+        for pr in ("7", "8"):
+            quiet(cmd_queue, ["myrepo", pr, "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cmd_work([])
+        check("a job that is ready merges without waiting for the batch: PR 7 lands while PR 8 is still being "
+              "read — the fake reviewer for 8 only answers once 7 HAS merged, which a sweep that joins the whole "
+              "prepare pool before its first merge can never reach",
+              released == ["8"] and when[:2] == [("read", "7"), ("merge", "7")])
+        check("...and the DEPLOY half of that same job does NOT come with it: `git pull`, install.sh and the unit "
+              "restarts are the box, so PR 7 merges while PR 8 is still being read but waits for PR 8's gates "
+              "before it touches the box — a suite must not be reinstalled and restarted under (Land.settle)",
+              when.index(("merge", "7")) < when.index(("read", "8")) < when.index(("deploy", "")))
+        check("...and one at a time and in queue order survive it: 7 then 8, each read before it is merged, and "
+              "nothing merged twice — the bound that must hold whatever order the two halves interleave in",
+              [c[3] for c in gh_merges()] == ["7", "8"] and len([e for e in when if e[0] == "merge"]) == 2
+              and all(("read", pr) in when and when.index(("read", pr)) < when.index(("merge", pr))
+                      for pr in ("7", "8")))
+        for k in ("gh pr merge", "git pull --ff-only"):
+            world.pop(k, None)             # …and the paced fakes do not leak into the cases below
 
         # (6) ORDERED BY WHAT THEY TOUCH (owner, 2026-09-04): jobs whose files overlap go one after another in
         # queue order, jobs on disjoint files side by side, and a job overlapping one of two running ones waits for

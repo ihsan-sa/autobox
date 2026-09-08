@@ -30,11 +30,23 @@ SELF="$(readlink -f "$0")"
 # selfcheck started a real `cc-land selfcheckrepo 9` under a CONSTANT name and read the box-wide process table, so
 # a second run saw the first one's lander (1 red in 6 concurrent runs, 09-02). That fixture carries its pid now,
 # and nothing is left for a lock to hold.
-# What stays is a CAP, not a queue: CC_SELFTEST_SLOTS runs at once — four measured on 09-02, 441 s for the slowest
-# of four against 426 s alone — and the next one waits, says whose slots it is waiting on, and says so again every
+# What stays is a CAP, not a queue: $SLOTS runs at once — two thirds of the cores, which was four measured on
+# 09-02 on a six-core host, 441 s for the slowest of four against 426 s alone — and the next one waits, says
+# whose slots it is waiting on, and says so again every
 # minute, because a wait that is silent reads as a hang to whatever is timing the gate (a landing counts silence,
 # not wall clock: see cc-land's gates).
-LOCKF="${CC_SELFTEST_LOCK:-$HOME/.cc/selftest.lock}"; SLOTS=${CC_SELFTEST_SLOTS:-4}; mkdir -p "$(dirname "$LOCKF")"
+LOCKF="${CC_SELFTEST_LOCK:-$HOME/.cc/selftest.lock}"; mkdir -p "$(dirname "$LOCKF")"
+# The default is DERIVED, not typed: two thirds of the cores, never under 2 and never over 6 — the same formula
+# cc-land's gate_slots() uses, because they are one number. It was 4 here and 4 again in cc-land, in two files,
+# and nothing kept them in step: a landing that ran more jobs at once than this cap allows would queue every one
+# of them at the lock above. A landing sets CC_SELFTEST_SLOTS to what it is actually running, so it cannot.
+if [ -z "${CC_SELFTEST_SLOTS:-}" ]; then
+  SLOTS=$(( $(nproc 2>/dev/null || echo 4) * 2 / 3 ))
+  [ "$SLOTS" -ge 2 ] || SLOTS=2      # `||` and never `&&`: a true test must not be this line's exit status
+  [ "$SLOTS" -le 6 ] || SLOTS=6
+else
+  SLOTS=$CC_SELFTEST_SLOTS
+fi
 slot(){ [ "$1" = 1 ] && echo "$LOCKF" || echo "$LOCKF.$1"; }   # slot 1 is the file the lock always was; the rest sit beside it
 if [ -z "${CC_SELFTEST_HELD:-}" ]; then
   waited=0
