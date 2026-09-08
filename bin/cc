@@ -21,7 +21,8 @@
 #                             a cold one — for a repair round, where re-deriving what it already found is the cost
 #   cc <repo> <track> --say "text"           type text into that track's running interactive session
 #   --go and --say are both REFUSED while the project is parked (`cc-pause on <repo>`, or `!pause` in its channel)
-#   cc <repo> --orch <alias> ["brief"]       peer orchestrator session, its own Slack channel (archived when it exits)
+#   cc <repo> --orch <alias> ["brief"]       peer orchestrator session, its own Slack channel (archived when it exits).
+#                             The brief is that session's FIRST TURN — it starts on it with nobody typing (sp_first)
 #   cc handoff <repo> <track> [--over [PCT]]  ask the running session to journal a handoff, then restart it with
 #                             fresh context; --over only if its context REALLY is that full (cc-context; bare = the 40% line)
 #   cc handoff --overlap|--ready|--abandon|--status <target>   OVERLAPPING handoff (cc-handoff): the successor
@@ -107,6 +108,22 @@ sp_main(){ local repo="$1" base="$2"
   printf %s "You are the planning/coordination session for repo '$repo' (primary worktree, branch '$base'). Board: 'cc board show $repo'. To dispatch work: 'cc board add $repo <track> \"<title>\" \"<brief>\"' (the brief's one home is ~/.cc/state/$repo/<track>/task.md; add and --go only ever ADD to it — replacing one is 'cc board set $repo <track> instructions \"...\"') then either 'cc $repo <track> --go \"<instructions>\" [--loop N]' (autonomous headless worker on its own worktree; ends with a PR) or tell the operator to open 'cc $repo <track>' interactively. A row you work in your OWN subagents instead has no worker and no window of its own, so mark it 'cc board set $repo <track> agent me' — nothing on the box can see a subagent, and without the mark the row is reported abandoned ten minutes later and offered for dispatch again. The mark goes cold after 6 h, so run that same command again while you are still on the row; 'cc board set $repo <track> agent \"\"' hands it back when you are done. Send a running track a message: 'cc $repo <track> --say \"...\"'. Status of everything: 'cc digest'. Small fixes you make yourself (no track): log them with 'cc quick \"<what>\"' so the owner sees them on the Slack Home tab. Reach the owner when something must actually reach him: 'cc-notify --decision -t \"$repo blocked\" \"...\"'; a plain cc-notify is an ambient note in the updates lane. You are on '$base' — your edits are NOT auto-committed; keep '$base' clean, let tracks do the writing, and review their PRs (never merge without the owner). Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Keep answers concise; use subagents for large reads; 'cc-context' says how full a session's context really is, and 'cc handoff <repo> <track> --over' hands one off only when it has really crossed the line. $(dispatch_sp)$(writing_sp)$(raise_sp)"; }
 sp_orch(){ local repo="$1" alias="$2" base="$3"   # a function, like the other two, so `cc selfcheck` can read the prompt an orch is actually given
   printf %s "You are orchestrator '$alias' for repo '$repo' — a peer of the main planning session, same primary worktree and branch '$base' (no auto-commit; you may merge). You own Slack threads where you were @'d, and every thread in your OWN channel (#<parent>-$alias-<id>, created for you — no @ needed there; your replies land wherever the message came from). Dispatch work with 'cc $repo <track> --go \"<instructions>\"' (headless worker tracks, each ends with a PR); an orch you spawn with 'cc $repo --orch <alias> \"<brief>\"' gets its own channel under yours. Your Slack replies are signed automatically. Hand a thread back to the main session by writing '@$repo over to you'. Board: 'cc board show $repo'. $(dispatch_sp)$(writing_sp)$(raise_sp)"; }
+# THE FIRST TURN. A session launched WITH A PURPOSE has to start on it. `cc <repo> --orch <alias> "<brief>"` built
+# the system prompt and opened the window and sent no turn at all, so an orch came up knowing who it was and
+# nothing about why — on 2026-09-08 two of them sat at zero tokens until a person typed at them, and the owner
+# read that as the box failing to start its own work. A system prompt is not a task: it says what you are, never
+# what to do now.
+# HANDED TO `claude` AS ITS POSITIONAL PROMPT, not typed at the pane. `claude [options] [prompt]` runs that prompt
+# as the session's first turn before the TUI is even drawn, so there is no window to wait for, no keystroke to
+# lose behind a startup dialog, and nothing to verify afterwards — the alternative (tmux send-keys + capture-pane)
+# is the mechanism that has already dropped opening messages behind modals (cc-msg's whole spool exists for it).
+# No purpose, no positional: the session comes up idle exactly as it always did.
+sp_first(){ local repo="$1" alias="$2" brief="$3" t   # a function so `cc selfcheck` reads the turn an orch is actually handed
+  t="$STBASE/$repo@$alias/task.md"   # (one `local` cannot read its own earlier name under `set -u`)
+  [ -n "$brief" ] || return 0
+  printf %s "$brief"
+  [ -f "$t" ] && printf %s " Your brief is $t — read it first."
+  printf %s " Start on it now."; }
 member_facing(){ [ -f "$1/.cc/member-facing" ]; }   # marker file, like .cc/track: cc-guard reads it off the cwd and gates that session as role=member
 # THE ADDRESS. Every session this script starts wears a tmux window name of one of three shapes, and that name is
 # also what cc-handoff takes as a target (its TARGET_RE/parts()) and what the Slack layer routes on:
@@ -467,15 +484,17 @@ ensure_track(){  # $1 repo $2 track -> creates worktree/branch/state/board entry
   [ -n "$("$BOARD" get "$repo" "$track" session_id)" ] || "$BOARD" set "$repo" "$track" session_id "$(cat /proc/sys/kernel/random/uuid)"
 }
 
-# `cc selfcheck` — the prompts this script hands out and the addresses it names its sessions by, and nothing else.
-# Pure text: no tmux, no board, no worktree, no git, no session started, nothing under ~/.cc read or written. What
+# `cc selfcheck` — the prompts this script hands out, the addresses it names its sessions by, and the first turn a
+# session launched with a purpose is handed. Pure text but for the last of those, which starts the real __runorch
+# branch against a stub `claude` under a throwaway HOME — the only way to prove a built prompt is actually SENT;
+# still no tmux window, no board, no git, no session, nothing of the box's own read or written. What
 # it is for: the shared dispatch text has to reach EVERY session kind, and a variant that quietly stops carrying it
 # is invisible until an orch spends a whole worker on a ten-line change; and every kind has to keep an address
 # `addr_parts` splits and `sp_for` boots as itself, or that kind can never be handed off. Each case has a control —
 # the text taken away, the splitter it replaced, the three prompts held apart — so a case that stopped
 # discriminating is caught here rather than trusted.
 selfcheck(){
-  local n=0 bad=0 rc D W R S trk mn orch none_t none_m none_o w line dup=0 dupw=0 dupr=0
+  local n=0 bad=0 rc D W R S trk mn orch none_t none_m none_o w line ft dup=0 dupw=0 dupr=0
   t(){ n=$((n+1)); [ "$2" = 0 ] && return 0; bad=$((bad+1)); printf 'FAIL %s\n' "$1"; }
   has(){ [ -n "$2" ] || return 1; case "$1" in *"$2"*) return 0;; esac; return 1; }
   carries(){ has "$1" "$D"; }
@@ -556,6 +575,38 @@ selfcheck(){
   rc=0; [ "$(sp_for r "" t   main)" = "$trk"  ] || rc=1; t "…and a track's on the track prompt" "$rc"
   rc=0; { [ "$mn" = "$orch" ] || [ "$mn" = "$trk" ] || [ "$orch" = "$trk" ]; } && rc=1
   t "control: those three prompts are three different texts, so the cases above tell the kinds apart" "$rc"
+  # THE FIRST TURN — the one an orch never got. A system prompt says what a session IS and never what to do now,
+  # so an orch launched with a purpose came up and did nothing with it (2026-09-08, twice in one evening).
+  T=$(mktemp -d); trap 'rm -rf "$T"' EXIT   # T is deliberately not local: the EXIT trap runs after this frame
+  mkdir -p "$T/bin" "$T/dev/r1" "$T/.cc/state/r1@a1"
+  rc=0; ft=$(sp_first r a "ship the widget"); has "$ft" "ship the widget" || rc=1
+  t "the first turn an orch is handed carries the purpose it was launched with" "$rc"
+  rc=0; [ -n "$(sp_first r a "")" ] && rc=1
+  t "control: launched with no purpose there is no first turn — that session comes up idle, as it always did" "$rc"
+  : > "$T/.cc/state/r1@a1/task.md"
+  rc=0; ft=$(STBASE="$T/.cc/state"; sp_first r1 a1 "ship the widget"); has "$ft" "$T/.cc/state/r1@a1/task.md" || rc=1
+  t "…and names the brief's own file when the row has one, so the session reads it rather than guessing" "$rc"
+  rc=0; ft=$(STBASE="$T/.cc/state"; sp_first r1 nosuch "ship the widget"); has "$ft" "task.md" && rc=1
+  t "control: no brief file, no path invented" "$rc"
+  # …AND IT REACHES THE CLI. Every case above passes with the positional dropped from the launch line, which IS
+  # the bug — the turn was buildable and never sent. So one run of the real __runorch branch against a stub
+  # `claude` that writes down its argv and exits: no tmux window, no session, nothing of the box's own touched
+  # (its own HOME, its own ~/dev). This is the only case here that is not pure text, and the only one that
+  # could have caught it.
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "$CC_ARGV"\n' > "$T/bin/claude"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/tmux"   # have_window/pane_live answer nothing; cc-started sees no window and stops
+  chmod +x "$T/bin/claude" "$T/bin/tmux"
+  runorch(){ HOME="$T" PATH="$T/bin:$PATH" CC_CLAUDE="$T/bin/claude" CC_ARGV="$T/$1" \
+               bash "$S" __runorch r1 a1 ${2+"$2"} </dev/null >/dev/null 2>&1; }
+  runorch argv "ship the widget"
+  ft=$(STBASE="$T/.cc/state"; sp_first r1 a1 "ship the widget")   # what that launch should have handed it, to the byte
+  rc=0; grep -qxF -- "$ft" "$T/argv" 2>/dev/null || rc=1
+  t "a fresh orch's claude is started WITH that exact turn as its prompt — no keypress at any pane" "$rc"
+  rc=0; grep -q -- '--append-system-prompt' "$T/argv" 2>/dev/null || rc=1
+  t "…alongside the orch system prompt, not instead of it" "$rc"
+  runorch argv2
+  rc=0; grep -q . "$T/argv2" 2>/dev/null || rc=1; grep -q -- 'ship the widget' "$T/argv2" 2>/dev/null && rc=1
+  t "control: the same branch with no purpose starts the same session and hands it no prompt" "$rc"
   printf 'cc selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]
 }
@@ -953,11 +1004,12 @@ PY
     member_facing "$DEV/$repo" && { export CC_ROLE=member; sp="$sp $MEMBER_SP"; }   # convenience only — the marker is what cc-guard actually reads
     "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo" "${CH[@]}" "${MO[@]}"; echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runorch)  # internal: peer orchestrator session in the primary worktree, addressable in Slack by alias
-    repo="$2"; alias="$3"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
+    repo="$2"; alias="$3"; brief="${4:-}"; cd "$DEV/$repo" || exit 1; base=$(default_branch "$DEV/$repo")
     sp=$(sp_orch "$repo" "$alias" "$base")
     export CC_SLACK_ALIAS="$alias"
     mapfile -t CH < <(chan_args "$repo"); mapfile -t MO < <(model_args); chan_accept "$repo@$alias"; start_check "$repo@$alias"
-    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}"
+    ft=$(sp_first "$repo" "$alias" "$brief")   # the purpose, as the session's own first turn — see sp_first
+    "$CLAUDE" "${AUTO[@]}" --append-system-prompt "$sp" --remote-control "$repo@$alias" "${CH[@]}" "${MO[@]}" ${ft:+"$ft"}
     [ -f "$SLACKON" ] && "$BIN/cc-slack" archive --orch "$repo" "$alias" >/dev/null 2>&1   # the orch is finished: its channel is history, not a live route
     echo; echo "[claude exited — shell stays; 'exit' closes the window]"; exec bash ;;
   __runplain)  # internal: plain session in a folder that is not a git repo
@@ -977,7 +1029,10 @@ if [ "$track" = "--orch" ]; then
   alias="${1:-}"; brief="${2:-}"; [[ "$alias" =~ ^[a-z0-9-]{2,20}$ ]] || { echo "cc: --orch alias must match ^[a-z0-9-]{2,20}\$"; exit 1; }
   win="$repo@$alias"; lock "$HOME/.cc/win.lock"; fresh=""
   if have_window "$win" && ! pane_live "$win"; then tmux kill-window -t "$(win_id "$win")"; fi   # the orch exited, only the fallback shell is left
-  have_window "$win" || { tmux new-window -d -t "$SESSION" -n "$win" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runorch %q %q' "$CLAUDE" "$SELF" "$repo" "$alias")"; fresh=1; }
+  # The brief goes THROUGH to the window: __runorch hands it to claude as the first turn (sp_first). Only a FRESH
+  # window gets one — re-running this on a live orch attaches to the session it already has, and a purpose typed
+  # into that would be a second brief nobody asked for.
+  have_window "$win" || { tmux new-window -d -t "$SESSION" -n "$win" -c "$DEV/$repo" "$(printf 'CC_CLAUDE=%q %q __runorch %q %q %q' "$CLAUDE" "$SELF" "$repo" "$alias" "$brief")"; fresh=1; }
   unlock
   # only a freshly STARTED orch asks for a channel: re-running this on a live one must never mint a second channel
   if [ -n "$fresh" ] && [ -f "$SLACKON" ]; then   # its own channel, once (nested under the spawner's when an orch spawns an orch); @alias in #<repo> keeps working either way

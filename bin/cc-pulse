@@ -76,6 +76,12 @@ a one-shot at the reset; cc-limit nudges it back to the turn it was on when the 
 seen on the limit but is not recording yet (nothing corroborates it, or no reset time named) is left alone in
 exactly the same way — it is a limited pane either way. See cc-limit.
 
+A SESSION THAT NEVER STARTED IS NAMED on the way past. A launcher hands a session its purpose as its first
+turn (`cc <repo> --orch <alias> "<brief>"`); when that turn is lost the window looks perfectly healthy and
+nobody is working in it — two orchs sat at zero tokens on 2026-09-08 until a person typed at them. A target
+live for CC_PULSE_STALL_MIN minutes (20; negative turns it off) with no finished turn on record is reported,
+and then ticked like any other: the tick is the recovery, the finding is what was missing. See never_started().
+
 THREE SWITCHES, because a loop that wakes the whole machine must be stoppable by whoever it wakes:
   CC_PULSE=0 in ~/.cc/config   the drive loop is off — no run does anything, dry or not
   ~/.cc/state/<target>/pulse.off   that one target is left alone; everything else still runs
@@ -104,6 +110,10 @@ ORCHS = f"{HOME}/.cc/slack/orchs.json"          # {"<chat>": {target, alias, par
 LOG = f"{STATE}/pulse.log"
 LOG_MAX = 4000                                  # a 2 h timer over a dozen targets fills this in about a month
 GAP_MIN = 90                                    # minutes; see THE GAP above before changing it
+STALL_MIN = 20                                  # minutes a live session may sit without EVER finishing a turn
+                                                # before the pulse names it (CC_PULSE_STALL_MIN; negative = never).
+                                                # Under the 20-minute mark a session is just thinking; past it,
+                                                # nothing has happened since it was launched — see never_started()
 QUIET_H = 24                                    # hours a session already told THIS EXACT LOOK is left alone
                                                 # (CC_PULSE_QUIET; 0 turns the back-off off entirely). It was 6,
                                                 # and it applied only to a look with nothing in it at all — so a
@@ -292,6 +302,51 @@ def headless(pid):
     except OSError:
         return False
     return b"-p" in argv or b"--print" in argv
+
+
+def pane_age(pane_pid):
+    """Seconds since that pane's process started, which is near enough the launch: `cc` opens the window ON the
+    command that becomes this pid, so the pane is exactly as old as the session under it. Read with `ps`, and no
+    launch stamp of our own — a file written at every launch is one more thing to keep, prune and get wrong, and
+    a session restarted in place would carry a stale one. None when ps cannot say."""
+    p = sh("ps", "-o", "etimes=", "-p", str(pane_pid), timeout=20)
+    if p is None or p.returncode != 0:
+        return None
+    try:
+        return int(p.stdout.strip())
+    except ValueError:
+        return None
+
+
+def never_started(target, pane_pid, r):
+    """Has this session been sitting there since it was launched without ever finishing a turn? Minutes if so,
+    else None — and None too whenever anything below cannot answer, because a tool that is unwell must never
+    become a finding about a session that is working fine.
+
+    WHY THIS IS ASKED AT ALL. A session is launched WITH a purpose — `cc <repo> --orch <alias> "<brief>"` hands
+    it as the session's first turn — and a launch that loses that turn leaves a window that looks perfectly
+    healthy with nobody working in it. On 2026-09-08 two orchs came up with their system prompt and nothing
+    else and sat at zero tokens until a person typed at them; the owner noticed, the box did not. Nothing else
+    asks it: cc-started watches the first 90 s and only ever asks whether a PROMPT WAS DRAWN, which it was.
+
+    TWO FACTS, NO NEW STATE. How old the pane is, and when this session last FINISHED a turn — cc-context's
+    record store is written by the Stop hook and by nothing else, so a record is proof of a completed turn and
+    its age says when. A record older than the pane belongs to whatever ran in that window before this session.
+    Column one of `cc-context --all` is the session's address (`<repo>` and `<repo>@<alias>` are two sessions in
+    one checkout), column two its track, column seven the record's age in seconds."""
+    stall = conf("CC_PULSE_STALL_MIN", STALL_MIN)
+    if stall < 0:
+        return None
+    age = pane_age(pane_pid)
+    if age is None or age < stall * 60:
+        return None
+    seen = r.turns()
+    if seen is None:                                # cc-context could not answer: say nothing rather than guess
+        return None
+    last = seen.get(target)
+    if last is not None and last <= age:            # a turn finished since this pane started: it got going
+        return None
+    return age // 60
 
 
 def screen(wid):
@@ -554,7 +609,29 @@ class Run:
     """One pass. Holds the dry-run flag and the tally so every target reports the same way."""
 
     def __init__(self, dry=False):
-        self.dry, self.n = dry, {}
+        self.dry, self.n, self._turns = dry, {}, None
+
+    def turns(self):
+        """{address: seconds since its last finished turn} for every session cc-context has a record of, read
+        ONCE a run — a dozen targets must not mean a dozen forks. None when cc-context could not answer."""
+        if self._turns is None:
+            p = sh(f"{BIN}/cc-context", "--all", timeout=30)
+            if p is None or p.returncode != 0:
+                self._turns = False
+            else:
+                idx = {}
+                for ln in p.stdout.splitlines():
+                    f = ln.split("\t")
+                    if len(f) < 7 or f[1] != "-":   # column two is a TRACK's name; a session a person steers,
+                        continue                    # and an orch, both carry "-" there
+                    try:
+                        a = int(f[6])
+                    except ValueError:
+                        continue
+                    if f[0] not in idx or a < idx[f[0]]:
+                        idx[f[0]] = a
+                self._turns = idx
+        return None if self._turns is False else self._turns
 
     def log(self, target, verb, msg):
         self.n[verb] = self.n.get(verb, 0) + 1
@@ -721,6 +798,14 @@ def pulse(target, r):
                               "corroborates it, or no reset time named) — a tick would meet that same limit")
         return
 
+    # NAMED, NEVER ACTED ON. A session that never took its first turn is reported here and then ticked by the
+    # normal path below, which is the recovery this file already has; the finding is what was missing. Below the
+    # limit test on purpose — a session the limit stopped on its opening turn is that, not a lost launch.
+    stalled = never_started(target, w[1], r)
+    if stalled is not None:
+        r.log(target, "report", f"live for {stalled}m and has never finished a turn — whatever launched it left "
+                                f"it with no first turn to work on (tmux select-window -t main:{target})")
+
     # THE BACK-OFF, now that there is a live session it can be true of, and BELOW the limit test on purpose.
     # `limit_state()` above is the only thing on the box that hands an interactive session to `cc-limit record`,
     # which is what arms the one-shot that nudges it back to its interrupted turn at the reset. Held above that
@@ -845,7 +930,8 @@ def selfcheck():
             os.makedirs(d, exist_ok=True)
         for name, body in (("tmux", FAKE_TMUX), ("cc", FAKE_CC), ("cc-msg", FAKE_MSG), ("cc-handoff", FAKE_HANDOFF),
                            ("cc-limit", FAKE_LIMIT), ("cc-scope", FAKE_SCOPE), ("cc-pause", FAKE_PAUSE),
-                           ("cc-broker", FAKE_BROKER), ("cc-brief", FAKE_BRIEF)):
+                           ("cc-broker", FAKE_BROKER), ("cc-brief", FAKE_BRIEF),
+                           ("cc-context", FAKE_CONTEXT), ("ps", FAKE_PS)):
             open(f"{BIN}/{name}", "w").write(body)
             os.chmod(f"{BIN}/{name}", 0o755)
         # a process whose name really is `claude`, for pgrep -x. A COPY OF BASH, not of sleep: this box's
@@ -853,6 +939,7 @@ def selfcheck():
         shutil.copy(os.path.realpath("/bin/bash"), f"{BIN}/claude")
 
         tmuxf, calls = f"{th}/tmux.txt", f"{th}/calls.txt"
+        real_ps = shutil.which("ps") or "/usr/bin/ps"       # FAKE_PS's own fallback, before BIN goes on PATH
         os.environ.update(PATH=BIN + os.pathsep + os.environ.get("PATH", ""), CC_FAKE_TMUX=tmuxf,
                           CC_FAKE_CALLS=calls, CC_FAKE_BUSY="", CC_FAKE_DIALOG="", CC_FAKE_HANDOFF="",
                           CC_FAKE_HANDOFF_BROKEN="", CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="",
@@ -867,7 +954,14 @@ def selfcheck():
                           CC_FAKE_READY="",
                           # …and cc-limit's resumed-episode file under $th, not the box's: a real limit that
                           # lifted this morning must not decide whether a mark in a fixture below is cold.
-                          CC_LIMIT_RESUMED=f"{th}/limit-resumed")
+                          CC_LIMIT_RESUMED=f"{th}/limit-resumed",
+                          # …and the never-started catch OFF for every case that is not about it: the fixture
+                          # panes are seconds old, so a threshold in minutes would never fire anyway, but a
+                          # negative one says so rather than leaving it to arithmetic.
+                          CC_PULSE_STALL_MIN="-1", CC_FAKE_CTX="", CC_FAKE_CTX_BROKEN="",
+                          # …and every real `ps` answered for real, except the one pid named here — pane_age's
+                          # own tool-unwell case, off everywhere but the one block that tests it.
+                          CC_REAL_PS=real_ps, CC_FAKE_PS_GONE="")
 
         def fixture(*cmd):                          # own group, no handle on our stdout (a stray child holds a pipe open)
             return subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
@@ -1392,6 +1486,67 @@ def selfcheck():
            "msg beta " in did())
         os.environ["CC_PULSE_QUIET"] = "6"
 
+        # ---- A SESSION THAT NEVER STARTED. The launch hands an orch its purpose as the first turn; when that
+        # turn is lost the window still looks healthy, and until 2026-09-08 nothing on the box said so.
+        os.environ["CC_PULSE_QUIET"] = "0"
+        os.environ["CC_PULSE_STALL_MIN"] = "0"          # the fixture panes are seconds old; the AGE bound is its own case below
+        os.environ.update(CC_FAKE_BUSY="", CC_FAKE_DIALOG="", CC_FAKE_HANDOFF="", CC_FAKE_HANDOFF_BROKEN="",
+                          CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="", CC_FAKE_CTX="", CC_FAKE_CTX_BROKEN="")
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n")   # earlier cases rewrote it
+        board("beta", {"t1": {"status": "queued"}})
+        L0 = logged()
+        run("beta@scout")
+        ok("a live session with no record of ever finishing a turn is NAMED — with its address, so the finding "
+           "says which pane to look at", "beta@scout report" in since(L0) and "never finished a turn" in since(L0))
+        ok("…and it is still ticked: the finding is the news, the tick is the recovery this file already had",
+           "msg beta@scout " in did())
+        # THE CONTROL, and it is the one that matters: a session that HAS taken a turn must never be named. Age 0
+        # is a record written since that pane started, which is exactly what "it got going" looks like.
+        L0 = logged()
+        os.environ["CC_FAKE_CTX"] = "beta@scout\t-\t12\t120000\t1000000\tprocess\t0\t-\t-\n"
+        run("beta@scout")
+        ok("control: a session cc-context has a record for since its pane started is working, and is not named",
+           "never finished a turn" not in since(L0))
+        # …and a record from BEFORE this pane is a previous session's in the same window, not this one's.
+        L0 = logged()
+        os.environ["CC_FAKE_CTX"] = "beta@scout\t-\t12\t120000\t1000000\tprocess\t99999\t-\t-\n"
+        run("beta@scout")
+        ok("…and a record older than the pane belongs to whatever ran there before: still never started",
+           "never finished a turn" in since(L0))
+        # A TRACK'S ROW IS NOT ITS REPO'S. Column two carries the track, and reading it as the session a person
+        # steers would call a repo started because one of its workers had taken a turn.
+        L0 = logged()
+        os.environ["CC_FAKE_CTX"] = "beta@scout\tsomework\t12\t120000\t1000000\tprocess\t0\t-\t-\n"
+        run("beta@scout")
+        ok("control: a TRACK's record is not the session's — column two is read, not ignored",
+           "never finished a turn" in since(L0))
+        # NEVER CRY WOLF OVER A TOOL THAT CANNOT ANSWER.
+        L0 = logged()
+        os.environ.update(CC_FAKE_CTX="", CC_FAKE_CTX_BROKEN="1")
+        run("beta@scout")
+        ok("cc-context unable to answer is not a finding — a sick tool must not report a healthy session",
+           "never finished a turn" not in since(L0))
+        os.environ["CC_FAKE_CTX_BROKEN"] = ""
+        # NOR A ps THAT CANNOT ANSWER. pane_age's own ps call can fail the same way — the pid raced or exited
+        # between the tmux snapshot and this call — and that must be just as quiet; nothing tested it before now.
+        L0 = logged()
+        os.environ["CC_FAKE_PS_GONE"] = str(live.pid)
+        run("beta@scout")
+        ok("pane_age's own ps failing (a bogus or gone pid) is not a finding either — same rule as a tool that "
+           "cannot answer", "never finished a turn" not in since(L0))
+        os.environ["CC_FAKE_PS_GONE"] = ""
+        # …AND NOT BEFORE ITS TIME. The whole point of the bound is that a session mid-first-turn is thinking.
+        L0 = logged()
+        os.environ["CC_PULSE_STALL_MIN"] = "600"
+        run("beta@scout")
+        ok("control: under the stall bound a session with no turn yet is simply young, and is not named",
+           "never finished a turn" not in since(L0))
+        L0 = logged()
+        os.environ["CC_PULSE_STALL_MIN"] = "-1"
+        run("beta@scout")
+        ok("control: a negative bound turns the catch off entirely", "never finished a turn" not in since(L0))
+        os.environ["CC_PULSE_QUIET"] = "6"
+
         # ---- --dry-run: the whole verdict, in writing, having touched nothing
         board("beta", {"t1": {"status": "queued"}})
         if os.path.exists(f"{STATE}/beta/pulse.look"):
@@ -1518,6 +1673,24 @@ set -u
 t="${2:-}"; t="${t%%/*}"; t="${t%%@*}"
 case " ${CC_FAKE_PAUSED:-} " in *" $t "*) exit 0;; esac
 exit 1
+"""
+
+FAKE_CONTEXT = r"""#!/usr/bin/env bash
+# `cc-context --all`: $CC_FAKE_CTX is the TSV, $CC_FAKE_CTX_BROKEN makes it unable to answer.
+[ -n "$CC_FAKE_CTX_BROKEN" ] && exit 1
+printf '%s' "$CC_FAKE_CTX"
+"""
+
+FAKE_PS = r"""#!/usr/bin/env bash
+# selfcheck stub for the two `ps` calls this file makes: passed straight to the real ps, except pane_age's own
+# `-p $CC_FAKE_PS_GONE` etimes query, which is made to fail — standing in for a pid that raced or exited between
+# the tmux snapshot and this call, the one pane_age failure mode nothing else here answers for.
+set -u
+if [ "${1:-}" = "-o" ] && [ "${2:-}" = "etimes=" ] && [ "${3:-}" = "-p" ] && [ -n "${CC_FAKE_PS_GONE:-}" ] \
+   && [ "${4:-}" = "$CC_FAKE_PS_GONE" ]; then
+  exit 1
+fi
+exec "${CC_REAL_PS:-/usr/bin/ps}" "$@"
 """
 
 FAKE_HANDOFF = r"""#!/usr/bin/env bash
