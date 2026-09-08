@@ -76,6 +76,11 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # splits that decide every number it prints: worker vs fix round, and which population a dollar belongs to.
 # cc-time's is the clock rule itself: a known UTC instant rendered in a zone of its own (never this box's), and
 # cc-notify's one Slack-facing stamp driven through in log-only mode with the UTC log line beside it.
+# cc-watch's is fixtures too — a process table in a file, a queue log and a `gh` of its own in a temp HOME — over
+# the false alarms its two watches were rebuilt four times to stop: a landing keyed on repo+PR and not on pid,
+# gone only after two consecutive polls and confirmed with gh, a duplicate loop that has to survive two polls,
+# and a headless run reported by pid and cwd with never a word of its argv. No process of this box's is read,
+# nothing is killed, and no PR anywhere is asked about.
 # cc-broker's runs the classifier, the grouping and the debounce against a stub for the daemon's door in a HOME
 # of its own: no session on this box is written to, and no message of this box's is read.
 # cc-guard's runs the gates themselves against fixtures in a HOME of its own, with the owner's two real
@@ -153,7 +158,7 @@ tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 fail
 # dead the moment this loop goes back to asking `want`. Lifting the list into a variable is what broke it here.
 SCD=$GD   # the dir and its trap are set at the top; a second EXIT trap here would have replaced the first
 running=0; ran=""
-for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc-green cc; do
+for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-watch cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc-green cc; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   ran="$ran $c"
   { rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &

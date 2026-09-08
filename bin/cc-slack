@@ -3725,13 +3725,12 @@ class Daemon:
             # daemon holds the token, so the escalation is made OUT here, as an escalation (`--owner`: the owner's DM,
             # #alerts unpaired), never routed into the member's own channel where everyone but the owner reads it.
             title = str(first[verb] or "").strip()[:80] or f"{h} escalation"
-            prio = str(first.get("priority") or "default")
-            if prio not in ("low", "default", "high", "urgent"):
-                prio = "default"
             text = str(first.get("text") or "").strip()[:1500]
             if not text:
                 return {"ok": False, "error": "an escalation needs something to say"}
-            r = EFFECTS.run([f"{BIN}/cc-notify", "-t", f"{h}: {title}", "-p", prio, "--owner", "--", text],
+            # NO PRIORITY CROSSES THE BOUNDARY. It used to, and cc-notify overwrote it from the table one line
+            # later — a rung a member appeared to set and never did. The `escalation` row decides this, out here.
+            r = EFFECTS.run([f"{BIN}/cc-notify", "-t", f"{h}: {title}", "--owner", "--", text],
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
             log(f"escalate {h}: {title} rc={r.returncode}")
             if r.returncode != 0:
@@ -13523,8 +13522,10 @@ def cmd_selfcheck():
           and made_cap == [("alice", "todo2"), ("bob", "hers"), ("alice", "fits")])
     check("MEMBER socket: `escalate` is the way out — inside the boundary cc-notify has no config to push with, so it "
           "hands the daemon the message and the daemon makes a REAL `cc-notify --owner` call on the host (the owner's "
-          "DM, never the member's own channel where everyone but him reads it); an empty one is refused",
-          r_esc.get("ok") and ranMS[len(ran_two):] == [[f"{BIN}/cc-notify", "-t", "alice: blocked", "-p", "default",
+          "DM, never the member's own channel where everyone but him reads it); the call carries the title and the "
+          "words and NO priority, because how loudly an escalation lands is the table's row out here and never the "
+          "member's to set; an empty one is refused",
+          r_esc.get("ok") and ranMS[len(ran_two):] == [[f"{BIN}/cc-notify", "-t", "alice: blocked",
                                                         "--owner", "--", "the owner must decide this"]]
           and r_esc_empty.get("ok") is False and "something to say" in r_esc_empty.get("error", ""))
     check("MEMBER socket: a subscriber that hangs up is gone from the table, and the member dir a join makes is what the "
@@ -14080,18 +14081,20 @@ def main(argv):
         print(r.get("text") or r.get("error") or ""); return 0 if r.get("ok") else 1
     elif cmd == "escalate":   # inside a member boundary: cc-notify's push rungs need ~/.cc/config, which is not in there.
         # The daemon makes the call with the token and delivers it to the OWNER (Daemon.member_verb "escalate").
-        title, prio, args = "", "default", []
+        title, args = "", []
         i = 0
         while i < len(rest):
             if rest[i] == "-t" and i + 1 < len(rest):
                 title = rest[i + 1]; i += 2
             elif rest[i] == "-p" and i + 1 < len(rest):
-                prio = rest[i + 1]; i += 2
+                i += 2                     # ACCEPTED AND DROPPED: how loudly this lands is the table's, outside the
+                                           # boundary. Still swallowed so an old caller's `-p high` cannot become
+                                           # two words of the message it was escalating.
             else:
                 args.append(rest[i]); i += 1
         text = " ".join(args) if args else sys.stdin.read()
         try:
-            r = sock_request({"escalate": title, "priority": prio, "text": text}, timeout=60)
+            r = sock_request({"escalate": title, "text": text}, timeout=60)
         except Exception as e:
             print(f"the workspace's Slack link did not answer ({e.__class__.__name__}) — nobody was told", file=sys.stderr); return 1
         print(r.get("text") or "") if r.get("ok") else print(r.get("error") or "", file=sys.stderr)

@@ -1161,9 +1161,9 @@ M(){ : > "$T/slack.args"
      ( cd "$T/chan" && env -u CC_NOTIFY_LOG_ONLY -u SLACK_BOT_TOKEN -u SLACK_OWNER_ID -u SLACK_WEBHOOK -u SLACK_ALERTS \
            -u NTFY_TOPIC -u NTFY_SERVER -u CC_BOX CC_MEMBER_SANDBOX=1 HOME="$NH" \
            CC_NOTIFY_LOG="$NH/.cc/notify.log" "$B/cc-notify" "$@" >/dev/null 2>&1 ); }
-M -t "alice help" "I am blocked and need the owner"; mrc=$?
-{ [ "$mrc" = 0 ] && grep -qx 'escalate -t alice help -p default' "$T/slack.args"; } \
-  && ok "inside a member boundary the escalation goes out over the workspace's socket (cc-slack escalate) — the config it cannot see is not the route" \
+M -p high -t "alice help" "I am blocked and need the owner"; mrc=$?
+{ [ "$mrc" = 0 ] && grep -qx 'escalate -t alice help' "$T/slack.args"; } \
+  && ok "inside a member boundary the escalation goes out over the workspace's socket (cc-slack escalate) — the config it cannot see is not the route, and the caller's -p does not travel with it: the table decides that outside the boundary" \
   || bad "in-boundary escalation: rc=$mrc args=$(cat "$T/slack.args")"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$NH/bin/cc-slack"; chmod +x "$NH/bin/cc-slack"
 M -t "alice help" "nobody is listening"; mrc=$?
@@ -2475,6 +2475,14 @@ jq -e --arg d "$TH/real-dir" '.projects[$d]' "$TH/.claude.json" >/dev/null && [ 
 fi
 if stanza "cc-reconcile (board vs reality: decision table + one end-to-end apply, no network)"; then
 chk cc-reconcile
+
+fi
+if stanza "cc-watch (the planning session's two watches: false alarms, and the argv it must never print)"; then
+# Fixtures only — a process table in a file, a queue log and a `gh` of its own — so no process of this box's is
+# read and no PR anywhere is asked about. Every case has a mutation behind it: keying a landing on pid, reporting
+# it after one absence, dropping the gh confirmation, reporting a duplicate on sight, or printing a headless
+# run's argv each turns one of them red.
+chk cc-watch
 
 fi
 if stanza "cc-janitor (the daily sweep: decision table + one end-to-end pass over a fake box)"; then

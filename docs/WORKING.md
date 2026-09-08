@@ -22,6 +22,10 @@ Scripts hold the invariants (reconcile, audit, janitor); the secretary (`cc-secr
 records every finding in its own ledger. It interrupts you only when a person, an approval or a choice the files
 cannot settle is needed — one `secretary/…` line, worth exactly one glance. The rest is `cc-secretary status`.
 
+Two watches run beside the loop, started once per session and never copied from anywhere: `cc-watch land` and
+`cc-watch orphans`, each detached into a log this session reads (`setsid nohup cc-watch land > land.log 2>&1 &`)
+— a landing that vanished, and a duplicate or reparented worker. `cc-watch --help` has the options.
+
 The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wakes every session
 every 2 h — the tick carries what the files say (red main, open asks, queued rows, rows in flight) so an empty check
 is cheap — and each one works the order above on its own; nothing here waits to be asked.

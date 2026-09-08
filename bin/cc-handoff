@@ -506,20 +506,18 @@ def notify(title, msg):
     run([os.path.join(BIN, "cc-notify"), "-t", title, msg])
 
 
-def alert(msg):
-    """#alerts (owner, 2026-09-01): every handover leaves one line there. Best-effort like notify —
-    a handover must never fail on Slack being down. Test state never pages: cc-notify's rule, which the
-    Slack layer's post command does not apply — a synthetic _cctest/_selfcheck name, or CC_NOTIFY_LOG_ONLY
-    (every suite sets it), goes to the log file instead of #alerts: three _cctest handovers hit the REAL
-    #alerts from inside a gate run the first night this shipped."""
-    if os.environ.get("CC_NOTIFY_LOG_ONLY") or re.search(r"(^|[^A-Za-z0-9])_(cctest|selfcheck)", msg):
-        try:
-            with open(os.environ.get("CC_NOTIFY_LOG") or os.path.expanduser("~/.cc/state/notify.log"), "a") as fh:
-                fh.write(f"alerts\t{msg}\n")
-        except OSError:
-            pass
-        return logd("not posted (test state): " + msg)
-    run([os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts", msg])
+def alert(target, msg):
+    """#alerts (owner, 2026-09-01): every handover leaves one line there — and it lands there because the
+    `alerts` kind is rung 4 in cc-notify's table, not because this file names a channel. Naming one cost
+    twice: the line skipped the table altogether, and the test-state rule that lives at cc-notify's door had
+    to be kept here as a second copy (the Slack layer applies none of it, and three _cctest handovers hit the
+    REAL #alerts the first night this shipped). One door, one rule, and the line is in ~/.cc/notify.log.
+
+    THE TITLE IS WHAT THE TABLE READS, and it must not start with the emoji the line carries: `kind_of` keys
+    on the title's SECOND word, so "🔁 <target>: handover" made that word the target's own name — no row, so
+    ambient — and `scope_of` would key every handover on one emoji. The emoji stays in the message, where it
+    is for the reader. Best-effort like notify(): a handover must never fail on Slack being down."""
+    run([os.path.join(BIN, "cc-notify"), "--kind", "alerts", "-t", f"{target} handover", msg])
 
 
 # ---- the predecessor's subagents -----------------------------------------------------------------------
@@ -731,7 +729,7 @@ def kick_lost(target, why):
     line = (f"{target}: the successor came up but {why} — it is sitting blank in main:{target}{NEXT}; "
             f"brief it by hand (`cc-msg {target}{NEXT} …`) or `cc-handoff --abandon {target}`")
     logd("NO opening prompt — " + line)
-    alert("⚠️ " + line)
+    alert(target, "⚠️ " + line)
     journal(target, line)
     return 1
 
@@ -844,7 +842,7 @@ def ready(target=None, forced=False):
     rec["phase"] = "cutover"
     rec["cutover"] = time.time()
     staying = f"the predecessor is staying for {len(held)} subagent(s)" if held else "the predecessor is retiring"
-    alert(f"🔁 {target}: handover — the successor is live; {staying}")
+    alert(target, f"🔁 {target}: handover — the successor is live; {staying}")
     ledger(rec, "overlap-forced" if forced else "overlap-cutover")
     write(rec)
     derive(rec, first)
@@ -1321,7 +1319,7 @@ def finalize(rec, why):
     if nid and not win_id(target):                 # the predecessor is gone: its name is free
         tmux("rename-window", "-t", nid, target)
     rec["phase"] = "done"
-    alert(f"🔁 {target}: handover finalized by the sweep — {why}")
+    alert(target, f"🔁 {target}: handover finalized by the sweep — {why}")
     ledger(rec, "overlap-swept", why)
     write(rec)
     mark_done(rec)
@@ -1407,7 +1405,7 @@ def sweep():
         told[wid] = now
         line = (f"main:{name} has been up {secs / 3600:.1f} h with no handoff record — nobody will finish it: "
                 f"brief it by hand or `tmux kill-window -t {wid}`")
-        alert("⚠️ " + line)
+        alert(name, "⚠️ " + line)
         print("cc-handoff: " + line)
     # AND A KIND THAT STOPPED BEING RECOGNISED. Reported the same way and on the same timer: a live session
     # whose window name is not one of the three shapes can never be handed off, and the only reason nobody
@@ -1418,7 +1416,7 @@ def sweep():
         told[wid] = now
         line = (f"main:{name} is a live session this handoff cannot address ({SHAPES}) — it can never be "
                 f"handed off, and its context shares a key with its neighbours. Teach `parts`/`kind` its shape.")
-        alert("⚠️ " + line)
+        alert(name, "⚠️ " + line)
         print("cc-handoff: " + line)
     try:
         os.makedirs(HANDOFF, exist_ok=True)
@@ -1668,10 +1666,9 @@ def brief(target):
 
 def selfcheck():
     os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
-    nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the harness switch reroutes alert(); these cases assert the REAL path via the stubbed run()
+    nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the suite sets it; these cases read what run() was handed, not what a door did with it
     import tempfile
-    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, alert, self_wid, age
-    real_alert = alert
+    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age
     real_out = out
     p = f = 0
 
@@ -1768,8 +1765,6 @@ def selfcheck():
         def notify(t, m):
             msgs.append(["notify", t, m])
 
-        def alert(m):                              # the real one is gated on the caller's env; its shape is kept
-            msgs.append([os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts", m])
 
         ok("a target with a track slugs to one flat file",
            os.path.basename(path("r1/t1")) == "r1--t1.json" and os.path.basename(path("r1")) == "r1.json")
@@ -1847,7 +1842,9 @@ def selfcheck():
         ok("the child's one log line stays inside the fixture — no test writes real state",
            os.path.exists(os.path.join(RECORDS, "handoff.log")))
 
-        posts = lambda: sum(1 for a in msgs if isinstance(a, list) and a[1:4] == ["post", "-c", "#alerts"])
+        # An #alerts line is now a cc-notify call with the `alerts` KIND — the table puts that at rung 4, which
+        # is #alerts. Counting the channel name here would have gone green on a file that named it itself.
+        posts = lambda: sum(1 for a in msgs if isinstance(a, list) and a[1:3] == ["--kind", "alerts"])
         typed = lambda: sum(1 for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg"))
         told0, typed0 = posts(), typed()
         panes[nid] = "Do you trust the files in this folder?\n  Enter to confirm · Esc to cancel"
@@ -1904,14 +1901,16 @@ def selfcheck():
            kick("r1", "abc") == 1 and len(tui["typed"]) == n0 and posts() == told0 + 1 and clk[0] - t0 <= 62)
         time.time, time.sleep = real_t, real_s
 
-        # the real alert() and its gate: test state stops at the log (the Slack layer applies no such rule)
-        os.environ.pop("CC_NOTIFY_LOG_ONLY", None)
-        n0 = posts(); real_alert("🔁 _cctest99/hx: handover"); real_alert("🔁 _selfcheck/hx: handover")
-        ok("alert() never posts a synthetic _cctest/_selfcheck name to the box's #alerts", posts() == n0)
-        os.environ["CC_NOTIFY_LOG_ONLY"] = "1"; real_alert("🔁 realrepo: handover")
-        ok("...nor anything with CC_NOTIFY_LOG_ONLY set, which every suite sets", posts() == n0)
-        os.environ.pop("CC_NOTIFY_LOG_ONLY", None); real_alert("🔁 realrepo: handover")
-        ok("...while a real handover's line goes through", posts() == n0 + 1)
+        # THE HANDOVER LINE IS THE TABLE'S TO PLACE. This file used to name #alerts itself, which meant the line
+        # skipped the table and the test-state rule had to be copied in beside it; both are cc-notify's now.
+        n0 = posts(); alert("r1/t1", "🔁 r1/t1: handover — the successor is live")
+        ok("a handover line goes out as the `alerts` KIND, which the table places at rung 4 (#alerts) — this "
+           "file names no channel of its own", posts() == n0 + 1)
+        ok("...under a title the table can read: its SECOND word decides the kind, and the emoji the line "
+           "carries is kept out of it (the title '🔁 r1/t1: handover' filed every handover ambient)",
+           msgs[-1][msgs[-1].index("-t") + 1] == "r1/t1 handover" and msgs[-1][-1].startswith("🔁"))
+        ok("...and it is one cc-notify call, so the synthetic-name and log-only rules that live at that one "
+           "door are the only copy of them", msgs[-1][0].endswith("cc-notify") and len(msgs[-1]) == 6)
         for k, v in env1.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
@@ -2421,7 +2420,7 @@ def selfcheck():
         ok("...and the journal says the successor is live and this session is staying",
            "stays for the 1 subagent" in open(jp20).read())
         ok("...and the #alerts line says it is staying, not that it is retiring",
-           any(a[:4] == [os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts"] and "staying for 1 subagent" in a[4]
+           any(a[1:3] == ["--kind", "alerts"] and "staying for 1 subagent" in a[-1]
                for a in msgs if isinstance(a, list) and len(a) > 4))
         n20 = len(said("r20~old"))
         ok("a retried --ready re-derives, but says nothing twice: no second STAY message, no second journal line",
@@ -2579,8 +2578,9 @@ def selfcheck():
         sweep()                                         # strike one: the stamp
         rr = read("s1"); rr["gone_since"] = time.time() - 301; write(rr)   # a sweep later, still nobody
         ok("a predecessor gone past the grace is finalized (two sweeps apart)", sweep() == 0 and read("s1") is None)
-        ok("...and the handover leaves one line in #alerts (owner, 2026-09-01)",
-           any(a[:4] == [os.path.join(BIN, "cc-slack"), "post", "-c", "#alerts"] for a in msgs if isinstance(a, list)))
+        ok("...and the handover leaves one line in #alerts (owner, 2026-09-01) — as an `alerts` kind, which is "
+           "the rung that lands there",
+           any(a[1:3] == ["--kind", "alerts"] for a in msgs if isinstance(a, list)))
         ok("...with the marker cc-guard reads, so the survivor is not gated by the record of its own success",
            os.path.exists(done_path(r["id"])))
         ok("...and the successor is left holding the target's window name",

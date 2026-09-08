@@ -171,8 +171,7 @@ spool_n(){ local sp; sp="$(sdir "$1")/inbox.spool"; if [ -f "$sp" ]; then wc -l 
 # ── the standing-dialog report ───────────────────────────────────────────────────────────────────────────────
 # A dialog nobody answers is the whole failure this script exists for: the queue behind it never moves, and on
 # this box that meant a silent session for hours. After STAND_MIN it is said ONCE — to the box's planning session
-# (which can look, and answer), and to the owner if they have asked to be paged (CC_SECRETARY_PAGES > 0) or if that
-# session could not be reached at all, which is the case nothing else would ever surface.
+# (which can look, and answer), and as one ambient line for the owner saying it happened and who has it.
 # It is a dialog WITH MAIL BEHIND IT that is reported: a pane nobody is trying to reach is cc-secretary's beat,
 # not this script's, and this script only ever looks at the windows it has been handed something for.
 # WHO IS TOLD: the box's control repo — the checkout this copy of cc-msg lives in (~/bin is symlinks into its
@@ -183,6 +182,15 @@ cfg(){ "$BIN/cc-config" get "$1" 2>/dev/null; }
 ctl(){ local d=$BIN
   case "$d" in "$HOME/dev/"*) d=${d#"$HOME/dev/"}; d=${d%%/*}; [ -n "$d" ] && { printf '%s' "$d"; return 0; };; esac
   printf 'box'; }
+# HOW IT IS TOLD: through cc-broker, the same door a stopped worker's escalation takes (cc-loop's tell_planner).
+# It writes the event down BEFORE it sends anything and owns delivery from there, so a session that is not up in
+# this second still gets it, and a line asking for a choice is delivered on arrival instead of riding a digest —
+# which is why the report below says "needs you" in cc-broker's own words. A dialog is a session's to clear, so
+# reaching one is the whole point: the owner used to be paged when this door did not open, and he cannot press a
+# key in a pane from his phone. Without a broker beside this copy, the daemon's own door, exactly as before.
+tell_session(){   # $1 target  $2 text -> the injector's verdict on stdout, its rc as ours
+  if [ -x "$BIN/cc-broker" ]; then timeout 30 "$BIN/cc-broker" inject --no-start --source msg "$1" "$2" 2>/dev/null
+  else "$BIN/cc-slack" inject --no-start "$1" "$2" 2>/dev/null; fi; }
 dialog_seen(){   # $1 window  $2 pane text
   local f now first rep att line res rc n text tgt
   f="$(sdir "$1")/inbox.dialog"; now=$(date +%s); line=$(dialog_line "$2")
@@ -194,34 +202,37 @@ dialog_seen(){   # $1 window  $2 pane text
   { [ "$rep" = 1 ] || [ $((now - first)) -lt $((STAND_MIN * 60)) ]; } && return 0
   [ "$att" -lt "$REPORT_TRIES" ] || return 0   # tried REPORT_TRIES times and heard by nobody: stop (see below)
   n=$(spool_n "$1")
-  text="cc-msg: main:$1 has had a dialog open for ${STAND_MIN}+ min and $n message(s) are queued behind it — the session is unreachable until it is answered (tmux select-window -t main:$1). The dialog: $line"
+  text="cc-msg: main:$1 needs you — a dialog has stood ${STAND_MIN}+ min with $n message(s) queued behind it, and the session is unreachable until it is answered (tmux select-window -t main:$1). The dialog: $line"
   # REPORTED ONCE MEANS HEARD ONCE. The stamp is closed only when the injector says the text reached a live session
   # ("delivered" to its channel, or "typed" at its keyboard). "queued"/"spooled", or a daemon that was not running
   # (a deploy restarts it, and a drain tick can fall in that second), mean NOBODY has read it: rep stays 0 and the
   # next tick tries again. A report that could not be taken at all is the box going quiet with mail behind a dialog
-  # — that one reaches the owner whatever CC_SECRETARY_PAGES says, but only on the first failure, not every minute.
+  # — that one is said to the owner too, but only on the first failure, not every minute.
   # AND ONLY REPORT_TRIES TIMES: the injector stamps every inject as a new message (a fresh meta.ts is its sender
   # name, so this script's own retry-collapse never matches it), and with the told session simply not running each
   # tick appended one more copy of this line to its queue — sixty an hour, flushed at it the moment it came up
-  # (review-157e). The owner has been paged by then; a report nobody could take three times waits for them.
+  # (review-157e). The owner has his line by then; a report nobody could take three times waits for them.
   # AND NEVER INTO THE PANE IT IS ABOUT: when the stuck window IS the session we would tell, the inject would come
   # back through this same script (no subscriber → cc-slack types it → cc-msg → this dialog again, round and round).
   tgt=${CC_MSG_REPORT_TO:-$(ctl)}
   if [ "$tgt" = "$1" ]; then res='it is the stuck session itself'; rc=1
-  else res=$("$BIN/cc-slack" inject --no-start "$tgt" "$text" 2>/dev/null); rc=$?; fi
+  else res=$(tell_session "$tgt" "$text"); rc=$?; fi
   res=$(printf '%s' "$res" | tr -d '\r' | tail -1)
   case "$rc:$res" in
     0:delivered|0:typed) rep=1;;
     *)                   att=$((att + 1));;
   esac
   printf '%s\t%s\t%s\t%s\n' "$first" "$rep" "$att" "$line" > "$f"
+  # THE OWNER IS TOLD WHAT HAPPENED, AND THE TABLE DECIDES HOW LOUDLY. Both of these used to buy their own rung —
+  # `-p high` when a session had it, `--decision` when none could be told — and the first was ambient anyway
+  # (cc-notify overwrites a caller's -p) while the second rang his phone about a key that is not his to press.
+  # A standing dialog is a session's to clear, so this is an ambient line either way and the chasing is
+  # tell_session's job (owner, 2026-09-07: the phone is for a decision, and a modal at a pane is not one).
   if [ "$rep" = 1 ]; then
-    case "$(cfg CC_SECRETARY_PAGES)" in ''|0|*[!0-9]*) ;;
-      *) "$BIN/cc-notify" -p high -t "[$1] a dialog has stood ${STAND_MIN} min" \
-           "$n message(s) queued behind it — $line" >/dev/null 2>&1;;
-    esac
+    "$BIN/cc-notify" -t "[$1] a dialog has stood ${STAND_MIN} min" \
+      "$n message(s) queued behind it, and $tgt has been told — $line" >/dev/null 2>&1
   elif [ "$att" = 1 ]; then
-    "$BIN/cc-notify" --decision -t "[$1] a dialog has stood ${STAND_MIN} min and no session could be told" \
+    "$BIN/cc-notify" -t "[$1] a dialog has stood ${STAND_MIN} min and no session could be told" \
       "$n message(s) queued behind it; the box session could not be reached ('${res:-nothing}', rc $rc) — $line" >/dev/null 2>&1
   fi
   return 0
@@ -248,20 +259,20 @@ orphan_seen(){   # $1 window — its spool has NO window to drain into (a handof
   text="cc-msg: $n message(s) are spooled for main:$1 but no such window exists — a rename or an exit left them behind ($(sdir "$1")/inbox.spool). Deliver or delete them; nothing drains this by itself."
   tgt=${CC_MSG_REPORT_TO:-$(ctl)}
   if [ "$tgt" = "$1" ]; then res='it is the stuck session itself'; rc=1
-  else res=$("$BIN/cc-slack" inject --no-start "$tgt" "$text" 2>/dev/null); rc=$?; fi
+  else res=$(tell_session "$tgt" "$text"); rc=$?; fi
   res=$(printf '%s' "$res" | tr -d '\r' | tail -1)
   case "$rc:$res" in
     0:delivered|0:typed) rep=1;;
     *)                   att=$((att + 1));;
   esac
   printf '%s\t%s\n' "$rep" "$att" > "$f"
+  # Ambient either way, for the same reason as dialog_seen's: a spool with no window is delivered or deleted by a
+  # session, and there is nothing in it the owner's phone could do at 3 a.m.
   if [ "$rep" = 1 ]; then
-    case "$(cfg CC_SECRETARY_PAGES)" in ''|0|*[!0-9]*) ;;
-      *) "$BIN/cc-notify" -p high -t "[$1] spooled mail has no window" \
-           "$n message(s) with nowhere to go — $(sdir "$1")/inbox.spool" >/dev/null 2>&1;;
-    esac
+    "$BIN/cc-notify" -t "[$1] spooled mail has no window" \
+      "$n message(s) with nowhere to go, and $tgt has been told — $(sdir "$1")/inbox.spool" >/dev/null 2>&1
   elif [ "$att" = 1 ]; then
-    "$BIN/cc-notify" --decision -t "[$1] spooled mail has no window and no session could be told" \
+    "$BIN/cc-notify" -t "[$1] spooled mail has no window and no session could be told" \
       "$n message(s) in $(sdir "$1")/inbox.spool ('${res:-nothing}', rc $rc)" >/dev/null 2>&1
   fi
   return 0
@@ -704,6 +715,12 @@ printf 'inject %s\n' "$*" >> "$CC_FAKE_CALLS"
 printf '%s\n' "${CC_FAKE_INJECT:-delivered}"     # the verdict the real one prints: delivered · typed · queued · …
 exit "${CC_FAKE_INJECT_RC:-0}"
 STUB
+  cat > "$T/bin/cc-broker" <<'STUB'
+#!/usr/bin/env bash
+printf 'broker %s\n' "$*" >> "$CC_FAKE_CALLS"
+printf '%s\n' "${CC_FAKE_INJECT:-delivered}"   # the real one always says delivered: it has written the event down
+exit "${CC_FAKE_INJECT_RC:-0}"
+STUB
   cat > "$T/bin/cc" <<'STUB'
 #!/usr/bin/env bash
 printf 'cc %s\n' "$*" >> "$CC_FAKE_CALLS"
@@ -718,7 +735,6 @@ STUB
   cat > "$T/bin/cc-config" <<'STUB'
 #!/usr/bin/env bash
 case "${2:-}" in
-  CC_SECRETARY_PAGES)  echo "${CC_FAKE_PAGES:-0}";;
   CC_QUERIES_CHANNEL)  echo "${CC_FAKE_QCHAN:-}";;
   CC_QUERIES_SESSION)  echo "${CC_FAKE_QSESS:-}";;
   CC_QUERIES_FALLBACK) echo "${CC_FAKE_QFB:-}";;
@@ -727,7 +743,7 @@ exit 0
 STUB
   cp "$(readlink -f "${BASH_SOURCE[0]}")" "$T/bin/cc-msg"; chmod +x "$T"/bin/*
   export PATH="$T/bin:$PATH" HOME="$T" CC_FAKE_SCREEN="$T/screen" CC_FAKE_KEYS="$T/keys" \
-         CC_FAKE_CALLS="$T/calls" CC_FAKE_WIN="$W" CC_FAKE_ESC_CLEARS=1 CC_FAKE_PROC=claude CC_FAKE_PAGES=0 \
+         CC_FAKE_CALLS="$T/calls" CC_FAKE_WIN="$W" CC_FAKE_ESC_CLEARS=1 CC_FAKE_PROC=claude \
          CC_FAKE_GONE="$T/gone" CC_FAKE_MODE_F="$T/mode" \
          CC_MSG_KEY_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck
   local SP="$T/.cc/state/$W/inbox.spool" DG="$T/.cc/state/$W/inbox.dialog"
@@ -966,72 +982,88 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; scr "$PERM"; msg "sweep me" >/dev/null; scr "$FREE"; "$T/bin/cc-msg" --drain
   k "$(t grep -qF 'sweep me' "$T/keys")" "cc-msg --drain with no argument finds the window's spool by itself"
 
-  # (9) a dialog that stands: reported ONCE, to the box session, and to the owner only when pages are on
+  # (9) a dialog that stands: reported ONCE, to a SESSION that can clear it, with one ambient line for the owner.
+  # He is not the door here and never was: a modal at a pane is answered by whoever can reach the keyboard.
+  stand(){ printf '%s\t0\t0\tDo you want to make this edit?\n' "$(( $(date +%s) - 700 ))" > "$DG"; }
   reset; scr "$PERM"; msg "stuck" >/dev/null
   k "$(nt grep -q inject "$T/calls")" "a dialog just seen is not reported — most are answered within a minute"
   printf '%s\t0\tDo you want to make this edit?\n' "$(( $(date +%s) - 700 ))" > "$DG"   # 3 fields: a stamp an
                                                                     # older copy left behind must still parse
   "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c inject "$T/calls")" = 1)" "a dialog standing 10 min is told to the box's planning session"
+  k "$(t grep -q '^broker inject --no-start --source msg ' "$T/calls")" "…through cc-broker, the door a stopped worker's escalation already takes — it writes the event down before it sends, so a session that is not up this second still gets it"
   k "$(t grep -q "main:$W" "$T/calls")" "…naming the window"
   k "$(t grep -qF 'Do you want to' "$T/calls")" "…and the dialog text"
-  k "$(nt grep -q notify "$T/calls")" "…and NOT the owner: CC_SECRETARY_PAGES is 0"
   k "$(nt grep -qE 'The dialog: *$' "$T/calls")" "…and the report names a line, not an empty one (keys already sent echo on the pane)"
+  # A LINE ASKING FOR A CHOICE IS DELIVERED ON ARRIVAL; everything else waits out cc-broker's 12 min debounce. A
+  # queue standing behind a dialog cannot wait that long, so the words are read from cc-broker's OWN list here
+  # rather than retyped — a reword that drops them makes this red instead of quietly slowing the report down.
+  local marks said decides=1 mk
+  marks=$(sed -n '/^DECISION_MARKS = (/,/)/p' "$BIN/cc-broker" 2>/dev/null | grep -o '"[^"]*"' | tr -d '"')
+  said=$(tr 'A-Z' 'a-z' < "$T/calls")
+  while IFS= read -r mk; do [ -n "$mk" ] && case "$said" in *"$mk"*) decides=0;; esac; done <<<"$marks"
+  k "$(t test -n "$marks")" "cc-broker still names the words that make an event wake a session NOW rather than ride a digest"
+  k "$decides" "…and the report carries one, so a dialog blocking a queue is delivered on arrival"
+  k "$(t grep -q '^notify -t ' "$T/calls")" "…and the owner gets ONE line saying it happened and who has it"
+  k "$(nt grep -qE '^notify (--decision|--owner|-p )' "$T/calls")" "…that buys no rung of its own: the table files a standing dialog ambient, and this call says only what happened"
   "$T/bin/cc-msg" --drain "$W"; "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(grep -c inject "$T/calls")" = 1)" "ONCE: two more ticks on the same standing dialog say nothing"
-  reset; scr "$PERM"; CC_FAKE_PAGES=1 msg "stuck2" >/dev/null
-  stand(){ printf '%s\t0\t0\tDo you want to make this edit?\n' "$(( $(date +%s) - 700 ))" > "$DG"; }
-  stand
-  CC_FAKE_PAGES=1 "$T/bin/cc-msg" --drain "$W"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "with CC_SECRETARY_PAGES>0 the owner is paged too, once"
+  k "$(t test "$(grep -c '^notify' "$T/calls")" = 1)" "…and the owner's line is said once too"
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
   k "$(nt test -f "$DG")" "the standing-dialog stamp is cleared when the pane comes free"
 
-  # (9b) SAID IS NOT HEARD. The stamp closes only when the injector says a live session took the text; a daemon
-  # that is not running, or a verdict that means it was only parked, leaves it open for the next tick — and since
-  # nothing reached anyone at all, the owner is told once whatever CC_SECRETARY_PAGES says.
+  # (9b) SAID IS NOT HEARD. The stamp closes only when the injector says a live session took the text; a door that
+  # is not there, or a verdict that means it was only parked, leaves it open for the next tick — and since nothing
+  # reached anyone at all, the owner is told once.
   reset; scr "$PERM"; msg "stuck3" >/dev/null; stand
   CC_FAKE_INJECT='daemon not running (ConnectionRefusedError) — cc slack on' CC_FAKE_INJECT_RC=1 \
     "$T/bin/cc-msg" --drain "$W"
-  k "$(t test "$(grep -c '^inject' "$T/calls")" = 1)" "the daemon is down: the report was attempted"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 1)" "the door is down: the report was attempted"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and NOT stamped as reported — a failed inject must not suppress every later try"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…with nothing said anywhere, the owner hears it once even at CC_SECRETARY_PAGES=0"
-  k "$(t grep -q '^notify --decision .*no session could be told' "$T/calls")" "…and as a rung 1 decision: the box has run out of people to tell, which is the one thing that still reaches him"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…with nothing said anywhere, the owner hears it once"
+  k "$(t grep -q '^notify -t .*no session could be told' "$T/calls")" "…and even THAT one does not ring him: he cannot press a key in a pane, so the line is ambient and the next tick keeps chasing a session"
   CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"
-  k "$(t test "$(grep -c '^inject' "$T/calls")" = 2)" "the next tick tries again"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 2)" "the next tick tries again"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and 'queued' is not heard either: the daemon parked it, no session read it"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner is not paged a second time: once a failure, not once a minute"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner is not told a second time: once a failure, not once a minute"
   CC_FAKE_INJECT=typed "$T/bin/cc-msg" --drain "$W"
   k "$(t test "$(cut -f2 "$DG")" = 1)" "'typed' (cc-msg put it on the session's keyboard) IS heard: the stamp closes"
   "$T/bin/cc-msg" --drain "$W"
-  k "$(t test "$(grep -c '^inject' "$T/calls")" = 3)" "…and the tick after that says nothing: reported once, for real"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 3)" "…and the tick after that says nothing: reported once, for real"
 
   # (9b′) …AND NOT FOR EVER. Every inject is a NEW message to the daemon (it stamps a fresh meta.ts as the sender, so
   # this script's own retry-collapse never matches it): with the told session not running, a retry a minute was a
   # copy a minute in its queue, sixty an hour, flushed at it when it came up (review-157e). A report nobody hears is
-  # tried CC_MSG_REPORT_TRIES times and then left — the owner was paged on the first failure.
+  # tried CC_MSG_REPORT_TRIES times and then left — the owner had his line on the first failure.
   reset; scr "$PERM"; msg "stuck7" >/dev/null; stand
   for _ in 1 2 3 4 5; do CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"; done
-  k "$(t test "$(grep -c '^inject' "$T/calls")" = 3)" "five ticks that nobody hears: three injects (CC_MSG_REPORT_TRIES), the fourth and fifth make none"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 3)" "five ticks that nobody hears: three injects (CC_MSG_REPORT_TRIES), the fourth and fifth make none"
   k "$(t test "$(cut -f3 "$DG")" = 3)" "…the stamp counts the tries"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and is still open: the stop is a bound, not a claim it was heard"
-  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner was paged once, on the first failure, as before"
+  k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…and the owner was told once, on the first failure, as before"
 
   # (9c) WHO hears it: the control repo this copy of cc-msg lives in (~/dev/<repo>/core/bin, which ~/bin links to),
   # whose planning session can walk over to the window — not a name written into the script.
   reset; scr "$PERM"; msg "stuck4" >/dev/null; stand
   mkdir -p "$T/dev/ctlrepo/core"; cp -r "$T/bin" "$T/dev/ctlrepo/core/bin"
   "$T/dev/ctlrepo/core/bin/cc-msg" --drain "$W"
-  k "$(t grep -q 'no-start ctlrepo ' "$T/calls")" "the report goes to the control repo's session, derived from where this copy lives"
+  k "$(t grep -qE '^broker inject .* ctlrepo cc-msg:' "$T/calls")" "the report goes to the control repo's session, derived from where this copy lives"
   reset; scr "$PERM"; msg "stuck5" >/dev/null; stand
   CC_MSG_REPORT_TO=box "$T/bin/cc-msg" --drain "$W"
-  k "$(t grep -q 'no-start box ' "$T/calls")" "…and CC_MSG_REPORT_TO overrides it (the Remote-Control session)"
+  k "$(t grep -qE '^broker inject .* box cc-msg:' "$T/calls")" "…and CC_MSG_REPORT_TO overrides it (the Remote-Control session)"
+  # …and a copy with NO cc-broker beside it still reports, over the daemon's own door: whether a standing dialog
+  # is chased at all may not depend on a tool this copy might not have (cc-loop's tell_planner has the same guard).
+  reset; scr "$PERM"; msg "stuck8" >/dev/null; stand
+  mv "$T/bin/cc-broker" "$T/broker-away"
+  "$T/bin/cc-msg" --drain "$W"
+  k "$(t grep -qE '^inject inject --no-start ' "$T/calls")" "no cc-broker beside this copy: the report goes out over the daemon's own door instead"
+  mv "$T/broker-away" "$T/bin/cc-broker"
 
   # (9d) …and never into the pane it is about: the session we would tell IS the stuck one, so the report would be
   # typed into that pane, spool behind the same dialog, and be reported again from there — a loop. The owner instead.
   reset; scr "$PERM"; msg "stuck6" >/dev/null; stand
   CC_MSG_REPORT_TO="$W" "$T/bin/cc-msg" --drain "$W"
-  k "$(nt grep -q '^inject' "$T/calls")" "the stuck window is the one that would hear it: nothing is injected — that is the loop"
+  k "$(nt grep -q '^broker' "$T/calls")" "the stuck window is the one that would hear it: nothing is injected — that is the loop"
   k "$(t test "$(grep -c notify "$T/calls")" = 1)" "…the owner is told instead, once"
   k "$(t test "$(cut -f2 "$DG")" = 0)" "…and the stamp stays open in case the session comes back"
 
@@ -1040,16 +1072,16 @@ $BUSY"; out=$(msg "hello mid-turn")
   reset; scr "$PERM"; msg "stranded" >/dev/null                     # spools behind the dialog while the window exists
   touch -d '20 minutes ago' "$SP"
   CC_FAKE_WIN='' "$T/bin/cc-msg" --drain "$W"
-  k "$(t test "$(grep -c '^inject' "$T/calls")" = 1)" "a spool with no window, older than STAND_MIN: the box session is told"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 1)" "a spool with no window, older than STAND_MIN: the box session is told"
   k "$(t grep -qF 'no such window' "$T/calls")" "…saying the window is gone, not that a dialog stands"
   CC_FAKE_WIN='' "$T/bin/cc-msg" --drain "$W"
-  k "$(t test "$(grep -c '^inject' "$T/calls")" = 1)" "…and ONCE: the next tick says nothing"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 1)" "…and ONCE: the next tick says nothing"
   scr "$FREE"; "$T/bin/cc-msg" --drain "$W"
   k "$(t grep -qF 'stranded' "$T/keys")" "the window came back: the spool drains after all"
   k "$(nt test -f "$T/.cc/state/$W/inbox.orphan")" "…and the orphan stamp is gone with it"
   reset; scr "$PERM"; msg "stranded2" >/dev/null; touch -d '20 minutes ago' "$SP"
   for _ in 1 2 3 4 5; do CC_FAKE_WIN='' CC_FAKE_INJECT=queued "$T/bin/cc-msg" --drain "$W"; done
-  k "$(t test "$(grep -c '^inject' "$T/calls")" = 3)" "…and a report of it that nobody hears is bounded the same way: three tries, then quiet"
+  k "$(t test "$(grep -c '^broker' "$T/calls")" = 3)" "…and a report of it that nobody hears is bounded the same way: three tries, then quiet"
 
   # (9f) a target whose repo segment is a suite fixture's (_cctest<pid>) is never reported this way: the gate suite
   # spools one behind a fixture window every run, and the sweep found it orphaned the same as a real one — four

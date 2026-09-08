@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# cc-watch — the two watches a planning session keeps running beside its work.
+#
+#   cc-watch land [--interval S] [--logs DIR]    a landing that vanished, and new terminal lines in the queue log
+#   cc-watch orphans [--interval S]              a duplicate cc-loop, and a headless run reparented to init
+#   cc-watch selfcheck
+#
+# Each polls until it is killed and writes ONE EVENT LINE PER FINDING to stdout and nothing else — no banner, no
+# heartbeat, no "still watching" — so a session starts one detached and reads the log:
+#
+#     setsid nohup cc-watch land    > "$logs/land.log"   2>&1 &
+#     setsid nohup cc-watch orphans > "$logs/orphans.log" 2>&1 &
+#
+# WHY IT IS A TOOL. Both watches lived in one session's scratchpad and were copied forward by hand at every
+# handoff, so a session that forgot had none — and each copy carried the last copy's bugs. The lander watch keyed
+# on PID, and a landing is a shell wrapper AND the python3 it wraps: either one going while the other stayed read
+# as "the lander died", and the workaround ("confirm with gh before acting on it") was passed between sessions as
+# a spoken warning across at least three handoffs instead of being fixed once. The three things those false
+# alarms bought are the three rules below, and each has a case in the selfcheck:
+#
+#   1. A LANDING IS KEYED ON REPO+PR, never on a pid. Its processes come and go under one key.
+#   2. IT IS GONE ONLY AFTER TWO CONSECUTIVE POLLS, and gh is asked for the real state before anything is said.
+#      Two absences are still a guess about a process table; the state on GitHub is the answer.
+#   3. A DUPLICATE MUST SURVIVE TWO POLLS. A worker finishing an iteration, or running `cc done`, briefly shows
+#      two cc-loop processes and that is not an orphan.
+#
+# And one rule that is not about false alarms: A CLAUDE PROCESS'S ARGV IS NEVER PRINTED — a headless run carries
+# its whole prompt there. The pid and the cwd are what a session needs, and they are all it gets.
+#
+# Nothing here ends a process. `cc-reconcile` is what stops an orphan; this only says one is there.
+set -u
+
+USAGE="usage: cc-watch land [--interval S] [--logs DIR] | orphans [--interval S] | selfcheck"
+
+stamp(){ date -u +%H:%M:%SZ; }   # a log line, read by whoever is reconstructing an incident: UTC, with its Z
+
+# THE PROCESS TABLE for one poll, as `pid ppid argv`. One reader for both watches — and the one thing the
+# selfcheck replaces with a fixture, so no case of its own reads this box's processes.
+snapshot(){
+  if [ -n "${CC_WATCH_PS_FILE:-}" ]; then cat "$CC_WATCH_PS_FILE" 2>/dev/null; return 0; fi
+  ps -e -ww -o pid=,ppid=,args= 2>/dev/null
+}
+
+# ---- land ---------------------------------------------------------------------------------------------------
+declare -A LAND_MISS=()   # "<repo> <pr>" -> consecutive polls it has been absent for
+LANDQ_POS=""              # lines of the queue log already read ("" = not yet opened)
+
+land_state(){   # $1 repo, $2 pr — what gh says the PR REALLY is, asked in that repo's checkout (gh reads the cwd)
+  local d="$HOME/dev/$1" s=""
+  command -v gh >/dev/null 2>&1 || { printf 'unconfirmed (no gh)'; return 0; }
+  [ -d "$d" ] || d=$PWD
+  s=$(cd "$d" && gh pr view "$2" --json state -q .state 2>/dev/null)
+  printf 'gh says %s' "${s:-unconfirmed}"
+}
+
+land_poll(){   # $1 = this poll's process table, $2 = the direct-landing log dir ("" = none)
+  local snap=$1 logs=$2 tag repo pr m log
+  local -A now=()
+  while read -r tag; do [ -n "$tag" ] && now["$tag"]=1; done < <(
+    grep -oE 'cc-l[a]nd [a-z][a-z0-9_-]* [0-9]+' <<<"$snap" | sed 's/^[^ ]* //' | sort -u)
+  for tag in "${!now[@]}"; do LAND_MISS["$tag"]=0; done
+  for tag in "${!LAND_MISS[@]}"; do
+    [ -n "${now[$tag]:-}" ] && continue
+    m=$(( ${LAND_MISS[$tag]} + 1 )); LAND_MISS["$tag"]=$m
+    [ "$m" -ge 2 ] || continue      # one poll's absence is the wrapper exiting, not the landing ending
+    unset "LAND_MISS[$tag]"         # said once: a landing does not come back, and a repeated line is noise
+    repo=${tag%% *}; pr=${tag##* }; log=""
+    [ -n "$logs" ] && log=$(ls -t "$logs"/*"$pr"*.log 2>/dev/null | head -1)
+    printf '%s LANDER GONE %s #%s :: %s%s\n' "$(stamp)" "$repo" "$pr" "$(land_state "$repo" "$pr")" \
+      "${log:+ :: $(tail -2 "$log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)}"
+  done
+}
+
+land_queue(){   # new TERMINAL lines in the shared queue log. Both halves, because either alone has gone quiet on us
+  local q=${CC_LAND_QUEUE_LOG:-$HOME/.cc/state/land/queue.log} new
+  new=$(wc -l < "$q" 2>/dev/null) || new=0
+  [ -n "$new" ] || new=0
+  # The backlog at start-up is not news, and a log that SHRANK was rotated: take the position, say nothing.
+  { [ -z "$LANDQ_POS" ] || [ "$new" -lt "$LANDQ_POS" ]; } && { LANDQ_POS=$new; return 0; }
+  [ "$new" -gt "$LANDQ_POS" ] && sed -n "$((LANDQ_POS + 1)),${new}p" "$q" 2>/dev/null \
+    | grep -Ei 'done|merged|fix-|again|error|stale|red|wall|budget|refus|fail|limit' | cut -c1-200
+  LANDQ_POS=$new
+  return 0
+}
+
+# ---- orphans ------------------------------------------------------------------------------------------------
+declare -A ORPH_SAID=()   # keys already reported, so each orphan is one line and not one line per poll
+ORPH_PREV=" "             # the duplicates the previous poll saw, space-delimited
+
+orphan_poll(){   # $1 = this poll's process table
+  local snap=$1 d pid ppid cwd cur
+  # A REAL RUN ONLY: argv is `bash <absolute path>/cc-loop <repo> <track>`. The absolute path excludes the
+  # `bash -c …` launcher that starts one, and a repo or track has to start with a letter, which excludes the
+  # suites' `_cctest…` fixtures — killing a fixture's loop is killing a running test.
+  cur=$(sed -nE 's|^ *[0-9]+ +[0-9]+ +bash /[^ ]*/cc-l[o]op ([a-z][a-z0-9-]{2,}) ([a-z][a-z0-9-]+)( .*)?$|\1/\2|p' \
+    <<<"$snap" | sort | uniq -d)
+  for d in $cur; do
+    case "$ORPH_PREV" in *" $d "*) ;; *) continue;; esac   # not in the previous poll: still settling, not an orphan
+    [ -n "${ORPH_SAID[$d]:-}" ] && continue
+    ORPH_SAID["$d"]=1
+    printf '%s ORPHAN two cc-loop runs on %s, across two polls — the older is a relaunch leftover\n' "$(stamp)" "$d"
+  done
+  ORPH_PREV=" $(tr '\n' ' ' <<<"$cur") "
+  # A HEADLESS RUN WHOSE PARENT IS GONE: nothing will time it out or commit what it writes. The pid and the cwd,
+  # and NOT ONE WORD OF ITS ARGV — that is the prompt, and this line ends up in a log and in a Slack message.
+  while read -r pid ppid; do
+    [ "$ppid" = 1 ] || continue
+    [ -n "${ORPH_SAID[re:$pid]:-}" ] && continue
+    ORPH_SAID["re:$pid"]=1
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+    printf '%s ORPHAN pid %s — headless claude reparented to init, cwd %s\n' "$(stamp)" "$pid" "${cwd:-unknown}"
+  done < <(sed -nE 's|^ *([0-9]+) +([0-9]+) +([^ ]*/)?claude -p( .*)?$|\1 \2|p' <<<"$snap")
+  return 0
+}
+
+# ---- selfcheck ----------------------------------------------------------------------------------------------
+# Fixtures only: a process table in a file, a queue log in a temp dir, a `gh` of its own on PATH. No process of
+# this box's is read, nothing is killed, and no PR anywhere is asked about.
+selfcheck(){
+  local n=0 bad=0 tmp o rc
+  t(){ n=$((n+1)); [ "$2" = 0 ] && return 0; bad=$((bad+1)); printf 'FAIL %s\n' "$1"; }
+  has(){ case "$2" in *"$1"*) return 0;; esac; return 1; }
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/cc-watch-selfcheck-XXXXXX") || return 1
+  printf '#!/bin/sh\necho MERGED\n' > "$tmp/gh"; chmod +x "$tmp/gh"
+  export PATH="$tmp:$PATH" HOME="$tmp" CC_LAND_QUEUE_LOG="$tmp/queue.log"
+
+  # A landing as the table really shows it: the wrapper AND the python3 it wraps, under one repo+PR.
+  local both one none other
+  both=' 1010  900 bash -c exec python3 /b/cc-land myrepo 346
+ 1011 1010 python3 /b/cc-land myrepo 346
+ 2001 1900 sshd: session'
+  one=' 1011 1010 python3 /b/cc-land myrepo 346
+ 2001 1900 sshd: session'
+  none=' 2001 1900 sshd: session'
+  other=' 3011 3010 python3 /b/cc-land otherrepo 346
+ 2001 1900 sshd: session'
+  poll2(){ local a=$1 b=$2; land_poll "$a" ""; land_poll "$b" ""; }   # two polls, one shell, state shared
+
+  o=$(poll2 "$both" "$one")
+  rc=0; [ -z "$o" ] || rc=1
+  t "the wrapper exiting while the python3 it wraps stays is NOT a landing ending (four false alarms)" "$rc"
+  o=$(poll2 "$both" "$none"); rc=0; [ -z "$o" ] || rc=1
+  t "one poll's absence says nothing — it takes two" "$rc"
+  o=$(land_poll "$both" ""; land_poll "$none" ""; land_poll "$none" "")
+  rc=0; has 'LANDER GONE myrepo #346' "$o" || rc=1
+  t "two consecutive absences report it, named by repo and PR" "$rc"
+  rc=0; has 'gh says MERGED' "$o" || rc=1
+  t "…and the line carries what gh says the PR really is, not just that the process went" "$rc"
+  rc=0; [ "$(grep -c 'LANDER GONE' <<<"$o")" = 1 ] || rc=1
+  t "said once, not once per poll for ever" "$rc"
+  # KEYED ON REPO+PR, NOT ON PID. Same landing, different pids each poll: nothing has ended.
+  o=$(land_poll "$both" ""; land_poll "${both//10/70}" ""; land_poll "${both//10/80}" "")
+  rc=0; [ -z "$o" ] || rc=1
+  t "a landing whose pids all change between polls is the same landing (the bug that keyed on pid)" "$rc"
+  # …and the key is the WHOLE tag: two repos landing the same PR number are two landings.
+  o=$(land_poll "$both$(printf '\n')${other#?}" ""; land_poll "$other" ""; land_poll "$other" "")
+  rc=0; { has 'LANDER GONE myrepo #346' "$o" && ! has 'otherrepo' "$o"; } || rc=1
+  t "PR #346 of one repo going does not report PR #346 of another, still running" "$rc"
+  # The direct-landing log dir is an OPTION now (it was a hard-coded scratchpad path). Given one, its tail rides along.
+  mkdir -p "$tmp/logs"; echo 'merged after the gates' > "$tmp/logs/land346.log"
+  o=$(land_poll "$both" "$tmp/logs"; land_poll "$none" "$tmp/logs"; land_poll "$none" "$tmp/logs")
+  rc=0; has 'merged after the gates' "$o" || rc=1
+  t "--logs DIR tails that landing's own log onto the line; without it the line still stands" "$rc"
+
+  # The queue log: the backlog at start-up is not news — and it is terminal lines that are, not chatter. The
+  # backlog line here is a terminal one on purpose, or the start-up rule would pass by being filtered anyway.
+  printf 'old\tmerged myrepo#0\n' > "$tmp/queue.log"
+  o=$(land_queue; printf 'new\tqueued myrepo#2\nnew\tmerged myrepo#1\n' >> "$tmp/queue.log"; land_queue)
+  rc=0; { has 'merged myrepo#1' "$o" && ! has 'queued myrepo#2' "$o" && ! has 'merged myrepo#0' "$o"; } || rc=1
+  t "the queue log gives up its new TERMINAL lines only — not its backlog, not its chatter" "$rc"
+
+  # Orphans. A duplicate that lives one poll is a worker finishing an iteration or running `cc done`.
+  local dup solo launcher fixture
+  dup=' 4001 4000 bash /w/bin/cc-loop myrepo build --loop 3
+ 4009    1 bash /w/bin/cc-loop myrepo build --loop 3
+ 2001 1900 sshd: session'
+  solo=' 4001 4000 bash /w/bin/cc-loop myrepo build --loop 3
+ 2001 1900 sshd: session'
+  launcher=' 5001 5000 bash -c cd /w && exec bash /w/bin/cc-loop myrepo build
+ 5002 5000 bash -c cd /w && exec bash /w/bin/cc-loop myrepo build'
+  fixture=' 6001 6000 bash /w/bin/cc-loop _cctest99 hx
+ 6002 6000 bash /w/bin/cc-loop _cctest99 hx'
+  o=$(orphan_poll "$solo"; orphan_poll "$dup"); rc=0; [ -z "$o" ] || rc=1
+  t "a duplicate seen in ONE poll is a worker between iterations, not an orphan" "$rc"
+  o=$(orphan_poll "$dup"; orphan_poll "$dup"); rc=0; has 'ORPHAN two cc-loop runs on myrepo/build' "$o" || rc=1
+  t "a duplicate that survives two polls is reported, named repo/track" "$rc"
+  o=$(orphan_poll "$dup"; orphan_poll "$dup"; orphan_poll "$dup")
+  rc=0; [ "$(grep -c 'two cc-loop' <<<"$o")" = 1 ] || rc=1
+  t "…once, however long it persists" "$rc"
+  o=$(orphan_poll "$launcher"; orphan_poll "$launcher"); rc=0; [ -z "$o" ] || rc=1
+  t "the \`bash -c …\` launcher that starts a loop is not a second loop" "$rc"
+  o=$(orphan_poll "$fixture"; orphan_poll "$fixture"); rc=0; [ -z "$o" ] || rc=1
+  t "a suite's _cctest fixture loop is never called an orphan — that would kill a running test" "$rc"
+
+  # The reparented headless run, and the rule that it is reported without its prompt.
+  local secret reparented parented
+  secret='SECRETPROMPT-do-not-print-this'
+  reparented=" 7001    1 /u/.local/bin/claude -p --model x $secret
+ 2001 1900 sshd: session"
+  parented=" 7001 6999 /u/.local/bin/claude -p --model x $secret
+ 2001 1900 sshd: session"
+  o=$(orphan_poll "$reparented"); rc=0; has 'ORPHAN pid 7001' "$o" || rc=1
+  t "a headless claude whose parent is gone (ppid 1) is reported by pid" "$rc"
+  rc=0; ! has "$secret" "$o" || rc=1
+  t "…and never a word of its argv, which is the whole prompt" "$rc"
+  o=$(orphan_poll "$parented"); rc=0; [ -z "$o" ] || rc=1
+  t "a headless claude with a live parent above it is not an orphan" "$rc"
+
+  # The one door out to the real process table, driven for shape only: it must not answer with argv it was
+  # never asked for, and it must be replaceable — every case above depends on that.
+  printf ' 8001    1 /u/.local/bin/claude -p %s\n' "$secret" > "$tmp/ps.txt"
+  o=$(CC_WATCH_PS_FILE="$tmp/ps.txt" snapshot); rc=0; has "$secret" "$o" || rc=1
+  t "control: the fixture reader really is what the watches read (this snapshot has the argv in it)" "$rc"
+
+  # The way in. A watch is started detached and read out of a log, so a bad argument has to come back NOW — a
+  # flag with no value that fell through `shift 2` used to leave the same argument in place and spin.
+  local st
+  o=$(main land --interval 2>&1); st=$?
+  rc=0; { [ "$st" = 2 ] && has 'needs a value' "$o"; } || rc=1
+  t "a flag given no value is refused, not looped on" "$rc"
+  o=$(main land --interval soon 2>&1); st=$?
+  rc=0; { [ "$st" = 2 ] && has 'whole seconds' "$o"; } || rc=1
+  t "an interval that is not seconds is refused before the first poll" "$rc"
+  o=$(main --help); rc=0; { has 'cc-watch land' "$o" && has 'orphans' "$o"; } || rc=1
+  t "--help names both watches and their options" "$rc"
+
+  rm -rf "$tmp"
+  printf 'cc-watch selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
+  [ "$bad" = 0 ]
+}
+
+# ---- main ---------------------------------------------------------------------------------------------------
+main(){
+  local cmd=${1:-} interval="" logs=${CC_WATCH_LOG_DIR:-}
+  [ -n "$cmd" ] || { echo "$USAGE" >&2; return 2; }
+  shift
+  while [ $# -gt 0 ]; do
+    # A flag given no value must not `shift 2` off the end: that leaves the same argument in place and spins here
+    # for ever. Nothing about this tool is allowed to sit in a loop printing nothing.
+    case "$1" in
+      --interval) [ $# -ge 2 ] || { echo "cc-watch: --interval needs a value" >&2; return 2; }; interval=$2; shift 2;;
+      --logs)     [ $# -ge 2 ] || { echo "cc-watch: --logs needs a value" >&2; return 2; }; logs=$2; shift 2;;
+      -h|--help)  echo "$USAGE"; return 0;;
+      *) echo "cc-watch: $1?" >&2; echo "$USAGE" >&2; return 2;;
+    esac
+  done
+  if [ -n "$interval" ]; then
+    case "$interval" in *[!0-9]*|0|"") echo "cc-watch: --interval takes whole seconds" >&2; return 2;; esac
+  fi
+  case "$cmd" in
+    land)
+      while :; do land_poll "$(snapshot)" "$logs"; land_queue; sleep "${interval:-30}"; done;;
+    orphans)
+      while :; do orphan_poll "$(snapshot)"; sleep "${interval:-45}"; done;;
+    selfcheck)  selfcheck;;
+    -h|--help)  echo "$USAGE";;
+    *) echo "$USAGE" >&2; return 2;;
+  esac
+}
+
+main "$@"
