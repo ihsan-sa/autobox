@@ -2,11 +2,36 @@
 # tests/check.sh — static checks over core/. bin/ and config/ are LIVE via symlinks: run before committing on
 # the default branch (the pre-commit hook does). Extra python files to compile can be passed as arguments
 # (a private overlay adds its own that way).
+# WALL CLOCK (measured 2026-09-08, docs/2026-09-08-gate-profile.md): the tools' own selfchecks are about two
+# thirds of this gate and shellcheck is most of the rest. Both now run CC_CHECK_JOBS at a time (default 4; 1 is
+# one at a time, the old behaviour). Concurrency only: every file is still shellchecked and every selfcheck still
+# runs, each judged in the same order by the same rules — nothing here is skipped to make the gate faster.
 set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$0")/.."   # $0 is resolved BEFORE the cd moves out from under it
 sh=(); py=()
 for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
+JOBS=${CC_CHECK_JOBS:-4}   # how many of this gate's own jobs run at once. Concurrency, never coverage.
+GD=$(mktemp -d "${TMPDIR:-/tmp}/cc-check.XXXXXX"); trap 'rm -rf "$GD"' EXIT   # one scratch dir, one trap, both blocks
 bash -n "${sh[@]}"
-shellcheck -S warning -e SC1090,SC1010 "${sh[@]}"
+# SHELLCHECK EVERY FILE, $JOBS AT A TIME. One call over all of bin/ was 38 s of this gate on one core — the largest
+# block after the selfchecks. Splitting it changes no file's report: -e SC1090 already forbids following a `source`,
+# so shellcheck never read one of these files while checking another, and the only thing the single call added was a
+# single exit code. Each file's report is kept whole in a file of its own and printed BELOW IN LIST ORDER, so a red
+# gate reads the way it always did instead of four processes interleaving mid-finding. `rc=0 … || rc=$?` is not
+# decoration: `set -e` is on and inherited by these subshells, so without it a file WITH a finding would die before
+# writing its rc, and the loop below would call that the killed-job case instead of the finding it is.
+nsh=0
+for f in "${sh[@]}"; do
+  { rc=0; shellcheck -S warning -e SC1090,SC1010 "$f" > "$GD/sc.$nsh.out" 2>&1 || rc=$?; echo "$rc" > "$GD/sc.$nsh.rc"; } &
+  nsh=$((nsh + 1)); [ "$((nsh % JOBS))" -ne 0 ] || wait
+done
+wait
+scrc=0
+for i in $(seq 0 $((nsh - 1))); do
+  [ -f "$GD/sc.$i.rc" ] || { echo "check.sh: shellcheck of ${sh[$i]} was started and left no result — it was killed,"
+                             echo "  or it died before it could report. Nothing here passed."; exit 1; }
+  cat "$GD/sc.$i.out"; [ "$(cat "$GD/sc.$i.rc")" = 0 ] || scrc=1
+done
+[ "$scrc" = 0 ] || exit 1
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" tests/slack_sim.py tests/member_v2.py tests/member_broker.py tests/member_import.py "$@"
 for f in slack/*.json config/claude-settings.json config/units.json config/claude-managed.json; do jq -e . "$f" >/dev/null; done
 # the agent types (templates/home/agents/ -> ~/.claude/agents/). Nothing else reads these files: a frontmatter the
@@ -112,9 +137,34 @@ tally_ok x "x selfcheck: 12 passed, 0 failed" && tally_ok x "x selfcheck: 0 fail
   && ! tally_ok x "x selfcheck: 28/28" && ! tally_ok x "x selfcheck: all passed" \
   && ! tally_ok x "x selfcheck: 4 passed, 10 failed" && ! tally_ok x "ran 12 cases, none failed" \
   || { echo "check.sh: the tally-shape rule no longer tells a readable tally from an unreadable one"; exit 1; }
+# RUN THEM AT ONCE, JUDGE THEM IN ORDER. Every selfcheck above is hermetic by construction — its own HOME, its own
+# temp dir, its own fixtures, reading nothing of this box's (that is what the paragraphs above each promise) — so
+# nothing makes them a queue except that they were written as one. Serially they were the largest block in this
+# gate: 26 tools, one core, on a gate that runs for every PR. They are started $JOBS at a time and each
+# one's output is kept whole in a file of its own; the verdict loop below then reads them back IN THE LIST'S
+# ORDER, so what this prints, and which tool it stops on, is exactly what it printed and stopped on serially.
+# Nothing is judged in the background: a case's rc and output are only read here, by the same three rules.
+# THE LIST STAYS ONE LITERAL `for c in cc-…` LINE, and the gate on it stays one `want_selfcheck "$c"`: cc-board's
+# own selfcheck reads this file and pins both, because the rule that its tripwire runs for a change to ANY tool is
+# dead the moment this loop goes back to asking `want`. Lifting the list into a variable is what broke it here.
+SCD=$GD   # the dir and its trap are set at the top; a second EXIT trap here would have replaced the first
+running=0; ran=""
 for c in cc-units cc-settings cc-board cc-task cc-native cc-broker cc-config cc-msg cc-spend cc-econ cc-time cc-guard cc-brief cc-gh-token cc-checkpoint cc-digest cc-notify cc-pause cc-publish cc-voice cc-fence cc-member-broker cc-steward cc-member-import cc-sense cc; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
-  rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?
+  ran="$ran $c"
+  { rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &
+  running=$((running + 1))
+  [ "$running" -lt "$JOBS" ] || { wait -n 2>/dev/null || wait; running=$((running - 1)); }
+done
+wait
+# THE VERDICT LOOP WALKS WHAT WAS STARTED, not what happens to have left a file behind. A job killed before it
+# could write its rc leaves nothing, and a loop reading the directory would have counted that silence as a tool
+# that was never in reach — the one failure this gate exists to catch, passing quietly. Started and empty is red.
+for c in $ran; do
+  [ -f "$SCD/$c.rc" ] || { echo "$c: its selfcheck was started and left no result — killed, or it died before it"
+                           echo "  could report. Nothing here passed; run 'bin/$c selfcheck' on its own to see it."
+                           exit 1; }
+  rc=$(cat "$SCD/$c.rc"); o=$(cat "$SCD/$c.out")
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.
   # Its line is printed and stays visible — that is not a pass. Any other tool exiting 77, and cc-fence exiting
   # 77 for any other reason (it refuses to report a skip when the kernel HAS Landlock and declined), fails here.
@@ -164,6 +214,51 @@ while IFS= read -r ln; do
        echo "  ${ln:0:200}"
        echo "  Rung 1 is --decision (or --owner). A plain cc-notify is rung 5: no phone, no @-mention."; exit 1;; esac
 done < <(grep -n 'Reach the owner' bin/cc)
+
+# THE PREFETCH WINDOW, as a tripwire rather than a comment. selftest.sh starts a few tools' selfchecks early and
+# collects each at its own `chk`. A selfcheck inherits whatever that file has exported by the time it starts, so an
+# `export`, `unset` or `cd` added BETWEEN the `prefetch` line and the `chk` that reads it makes the tool run under
+# an environment its stanza never set up: it still prints a tally, still goes green, and is checking something
+# else. That is the one trade the suite must not make, and nothing else would notice it. Conservative on purpose —
+# it flags such a line even inside a `( … )` subshell, where it would not actually leak. The fix is to move the
+# `prefetch` line to after the change, never to delete this.
+pf_window(){ awk '
+  # PER TOOL, not per file: each one is checked between ITS OWN prefetch line and the first chk that collects it,
+  # so a second `prefetch` line elsewhere is covered too rather than quietly moving the window for all of them.
+  /^prefetch / { for (i = 2; i <= NF; i++) pf[$i] = NR }
+  /^chk /      { if ($2 in pf && !($2 in ck)) ck[$2] = NR }   # the FIRST chk of that tool is the one that reads it
+  /^(export|unset|cd) / { off[NR] = $0 }
+  END {
+    for (t in pf) {
+      if (!(t in ck)) { printf "  %s is started early but nothing ever collects it — there is no `chk %s`\n", t, t; continue }
+      for (n in off) if (n+0 > pf[t] && n+0 < ck[t])
+        printf "  line %d sits between `prefetch %s` and its `chk`: %.90s\n", n, t, off[n]
+    }
+  }' "$1"; }   # <file> -> one line per offence, empty when the window is clean
+# PROVEN BOTH WAYS BEFORE IT IS TRUSTED, on fixtures of its own — never on selftest.sh, whose window is clean today
+# and so can only ever show the quiet half. A tripwire nobody has watched fire is a comment with an exit code; and
+# the half that matters as much here is the QUIET one, because a rule that flagged everything would be obeyed by
+# deleting it. These also pin what the rule does NOT see, which is the honest limit of reading a shell file with
+# awk: only a line that BEGINS with export, unset or cd, so `foo; export BAR=1` mid-line goes through. Widening
+# that is a change to the awk above and a case here, in that order.
+pf_case(){ local want=$1 name=$2 got saw
+  printf '%s\n' "$3" > "$GD/pf.$name"; got=$(pf_window "$GD/pf.$name")
+  if [ -n "$got" ]; then saw=flag; else saw=quiet; fi
+  [ "$saw" = "$want" ] || { echo "check.sh: the prefetch-window rule reads the '$name' fixture as $saw, not $want:"
+                            printf '%s\n' "$3" | sed 's/^/    /'; echo "$got"; exit 1; }; }
+pf_case quiet clean           $'prefetch cc-a\nchk cc-a'
+pf_case flag  export-inside   $'prefetch cc-a\nexport X=1\nchk cc-a'
+pf_case flag  unset-inside    $'prefetch cc-a\nunset X\nchk cc-a'
+pf_case flag  cd-inside       $'prefetch cc-a\ncd /tmp\nchk cc-a'
+pf_case quiet export-before   $'export X=1\nprefetch cc-a\nchk cc-a'
+pf_case quiet export-after    $'prefetch cc-a\nchk cc-a\nexport X=1'
+pf_case flag  never-collected $'prefetch cc-a\nchk cc-b'
+pf_case flag  second-tool     $'prefetch cc-a cc-b\nchk cc-a\nexport X=1\nchk cc-b'
+pf_case quiet first-chk-wins  $'prefetch cc-a\nchk cc-a\nexport X=1\nchk cc-a'
+w=$(pf_window tests/selftest.sh)
+[ -z "$w" ] || { echo "check.sh: tests/selftest.sh prefetches a selfcheck across a change to its own environment:"
+                 echo "$w"
+                 echo "  A prefetched tool must run under the same environment as the chk that reads it."; exit 1; }
 
 # Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
 # again on the same files the worker already ran it on (tests/green.sh, read by cc-land).

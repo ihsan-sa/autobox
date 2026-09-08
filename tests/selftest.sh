@@ -6,6 +6,9 @@ export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage li
 # worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait (see the slots below)
 # and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
 # the paths a PR changed, in which case only what that change reaches runs (see "WHAT RUNS" below).
+# A few tools' selfchecks are STARTED EARLY and collected at the stanza that always printed them, so they overlap
+# the tmux stanzas instead of queueing behind them (see "PREFETCH" below). CC_SELFTEST_PREFETCH=0 runs every one
+# inline again. Nothing is skipped either way: the same tools run, print in the same order and are judged the same.
 # Exercises the bin/ THIS file ships with (a track worktree tests its own copy, not the ~/bin symlinks).
 set -uo pipefail
 exec </dev/null; unset CC_ROLE CC_HANDOFF CLAUDECODE "${!CLAUDE_@}"   # never inherit a tty (`cc` would attach tmux and swallow the run) nor a
@@ -117,7 +120,19 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · lin
          # tally is the tool's own line, found by name, never whatever printed last — no tally = it died = red.
   local t=$1 o r rc keep
   want_selfcheck "$t" || { echo "  · $t selfcheck: not in this change's reach, not run"; return 0; }
-  o=$("$B/$t" selfcheck 2>&1); rc=$?; r=$(grep -o "$t selfcheck: .*" <<<"$o" | tail -1)
+  if [ -n "${PFPID[$t]:-}" ]; then   # `prefetch` started this one earlier; it is READ here, where it always printed
+    wait "${PFPID[$t]}" 2>/dev/null || true
+    # AND IT LEAVES $KIDS THE MOMENT IT IS REAPED, the way the holder fixtures below do. The trap kills each pid
+    # in that list by looking its process group up in ps, so a pid left there after the process is gone is a pid
+    # the kernel may have handed to somebody else by then — and the trap would take that stranger's whole group.
+    # Dropping it here also means a second `chk` of this tool runs the tool again, inline, exactly as it used to.
+    unclaim "${PFPID[$t]}"; unset "PFPID[$t]"
+    # Started and empty is red, never a quiet pass — the same rule check.sh's loop uses. A job that was killed
+    # before it could write its rc has proved nothing, and silence is exactly what this suite exists to catch.
+    if [ -f "$PFD/$t.rc" ]; then rc=$(cat "$PFD/$t.rc"); o=$(cat "$PFD/$t.out")
+    else bad "$t selfcheck: started early and left no result — killed, or it died before it could report"; return 0; fi
+  else o=$("$B/$t" selfcheck 2>&1); rc=$?; fi
+  r=$(grep -o "$t selfcheck: .*" <<<"$o" | tail -1)
   # ANCHORED: "10 failed" ends in "0 failed", so a bare substring test reads any tally ending in a zero as green —
   # 10, 20, 100 failed cases all landed. The two shapes the tools write are "…: 0 failed" and "…, 0 failed".
   grep -qE '(: |, )0 failed' <<<"$r" && { ok "$r"; return 0; }
@@ -129,6 +144,28 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · lin
   bad "$t selfcheck: no tally line — exit $rc, $(printf %s "$o" | wc -c) bytes, kept in $keep"
   [ -n "$o" ] && tail -3 <<<"$o" | sed 's/^/      /'
   return 0; }
+# PREFETCH — the same selfcheck, started earlier, printed and judged in the same place by the same rules. A
+# selfcheck is CPU and the stanzas it sits between are mostly waiting on tmux, so running them side by side is
+# nearly free: the six below were ~2 min of this suite, serially, on one core.
+# THE WINDOW IS THE WHOLE OF THE RULE. A tool's selfcheck inherits whatever this file has exported where its `chk`
+# sits — CC_CTX_RECORDS at the cc-context block, CC_HANDOFF_DIR/RETIRE_GRACE at cc-handoff's, CC_SLACK_DIR before
+# the tail — so a tool may be started early ONLY from a point with no export, unset or cd between there and its
+# chk. Move a `prefetch` line across one of those and the tool runs under a different environment and quietly
+# proves something else, which is the one trade this suite must never make.
+# cc-sandbox is deliberately NOT prefetched: its "a process swapping the track worktree DURING the launch" case is
+# a real race and goes red under concurrency (177/1 at 22-way, 178/0 alone, measured 2026-09-08). It stays inline.
+# CC_SELFTEST_PREFETCH=0 starts nothing, and every chk runs the tool inline exactly as it did before.
+declare -A PFPID; PFD=""
+unclaim(){ local k n=""; for k in $KIDS; do [ "$k" = "$1" ] || n="$n $k"; done; KIDS=$n; }   # exact pid, never a substring
+prefetch(){
+  [ "${CC_SELFTEST_PREFETCH:-1}" != 0 ] || return 0
+  PFD="$T/prefetch"; mkdir -p "$PFD"
+  local x
+  for x in "$@"; do
+    want_selfcheck "$x" || continue   # the gate chk uses: a tool this change does not reach is not started either
+    { rc=0; o=$("$B/$x" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$PFD/$x.out"; echo "$rc" > "$PFD/$x.rc"; } &
+    PFPID[$x]=$!; KIDS="$KIDS $!"   # so an unclaimed one dies with the run rather than outliving it
+  done; }
 # Every run owns a namespace ($RUN): repo name, fixture dir, notify log, usage-limit stamp, tmux windows and
 # processes all carry it. Two selftests (two worktrees, one box) must never read, write or kill each other's things
 # — a global `pkill` here once failed 4 tests in a run that was, on its own, green.
@@ -143,7 +180,8 @@ export CC_HANDOFF_NO_KICK=1   # ...and no --kick child at all: a fixture success
                                           # successors, and cc-guard walks that directory on every single call.
 MT(){ env -u TMUX TMUX_TMPDIR="$T" tmux "$@"; }   # the model section's scratch tmux server: own socket, under $T
 wins(){ tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null | awk -v r="$1" '$2==r || index($2,r"/")==1 {print $1}'; }
-KIDS=""   # long-lived fixtures started below; the trap takes each one's whole process group, by PID, never by pattern
+KIDS=""   # long-lived fixtures started below, and each prefetched selfcheck until its chk reaps it; the trap takes
+          # each one's whole process group, by PID, never by pattern — so a pid leaves this list when it is reaped
 cleanup(){ rc=$?; trap - EXIT
   for p in $KIDS; do pg=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
     if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$p" 2>/dev/null; fi; done
@@ -2194,6 +2232,13 @@ pg=$(ps -o pgid= -p "$SD" 2>/dev/null | tr -d ' ')   # OUR daemon, by recorded p
 if [ -n "$pg" ] && [ "$pg" != "$(ps -o pgid= -p $$ | tr -d ' ')" ]; then kill -TERM -- -"$pg" 2>/dev/null; else kill -TERM "$SD" 2>/dev/null; fi
 for _ in 1 2 3 4 5; do kill -0 "$SD" 2>/dev/null || break; sleep 0.4; done; unset CC_SLACK_DIR
 fi
+# START THE SIX SELFCHECKS THE TAIL WILL ASK FOR. Placed after this `fi` on purpose: the only environment change
+# before any of their `chk` calls is the CC_SLACK_DIR export inside the stanza above, and here it has either
+# happened or been skipped — whichever it is, it is the same for these six as for the chk that collects them. The
+# next top-level `cd` is inside the cc-publish stanza, well after the last of them. Nothing may be added to this
+# line without re-reading that window: a tool started across an export runs under an environment its chk did not
+# have, and would quietly prove something else. They are collected in the stanzas that always printed them.
+prefetch cc-reconcile cc-janitor cc-rename cc-started cc-pulse cc-secretary
 if stanza "model fallback (cc-model + cc-limit)"; then
 # own HOME and own tmux server (TMUX unset, TMUX_TMPDIR into $T): the live sessions' models are never touched
 MH="$T/mh"; mkdir -p "$MH/.cc/state" "$T/fb"; printf '#!/usr/bin/env bash\ncat\n' > "$T/fb/cc-loop"; chmod +x "$T/fb/cc-loop"
