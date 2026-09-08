@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cc-guard — PreToolUse hook: deterministic human gates for AUTONOMOUS and MEMBER-FACING sessions.
-# Applies when CC_ROLE=worker|member is set, or the session cwd is under a dir marked .cc/track (a cc track
+# Applies when CC_ROLE=worker|member|steward is set, or the session cwd is under a dir marked .cc/track (a cc track
 # worktree, role=worker) or .cc/member-facing (a session anybody in a Slack channel can talk to, role=member) —
 # so interactive TRACK sessions are gated too (intended); plain operator/planning sessions are not.
 # The MARKER is the truth: CC_ROLE is only a convenience, the walk works with no env at all.
@@ -24,6 +24,8 @@
 # EVERY gated role, worker included: no container runtime (this user is in group `docker`, which is root-equivalent)
 # and no reading the two files that ARE the box's credentials (~/.claude/.credentials.json, ~/ccbox/env).
 # role=member = every worker gate PLUS: no dispatching workers, no reading the box's other secrets, no re-wiring Slack.
+# role=steward (CC_ROLE only — cc-steward's run dir carries no marker) = every worker gate PLUS that same set, minus
+# the member workspace's carve-outs and without recording a query: a steward's refusal is its own exit code and log.
 # A MEMBER WORKSPACE (~/dev/<handle>/.cc/member-workspace, and any track of it) is the one exception: it dispatches
 # workers and makes tracks INSIDE itself and nowhere else — docs/design-member-workspaces.md.
 # It also gates whichever session is NOT live during an overlapping handoff (cc-handoff), by session id and
@@ -32,8 +34,11 @@
 # Env: CC_GUARD_ASKS, CC_GUARD_ASK_TTL (where a member-facing query is de-duplicated, and for how long) ·
 # CC_GUARD_ROOT_PID (test hook: the session process the worker kill fence measures its subtree from).
 set -uo pipefail
-# No jq = no cwd, so no marker walk either: fail CLOSED on the role we do know from the env (cc sets it for both).
-command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in *worker*|*member*|*handoff*) echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2;; esac; exit 0; }
+# No jq = no cwd, so no marker walk either: fail CLOSED on every role we can know from the env alone — `cc` sets it
+# for a worker and a member, cc-steward for a steward. A gated role missing from this list is a role whose gates are
+# silently OFF on a broken PATH, which for the steward would be the widest tier of all: it is the one session that
+# runs unattended, so "refused by cc-guard and not merely discouraged" has to hold on the day jq is not there either.
+command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in *worker*|*member*|*steward*|*handoff*) echo "cc-guard: jq is missing (broken PATH?) — the gates cannot be evaluated, so the call is refused" >&2; exit 2;; esac; exit 0; }
 # ---- selfcheck -------------------------------------------------------------------------------------------
 # It sits ABOVE the read of stdin because that read is where every other path here begins, and a hook has no
 # other door. Each case builds its own fixture — its own HOME, its own asks dir, its own stub binaries — and
@@ -1172,6 +1177,80 @@ a noclobber-override redirection, whose | the split read as a pipe%cd sub && cp 
 W45
   ok "a write is judged over the whole statement, not the pieces the cd walk cuts it into: a destination after a substitution — in the middle, nested, redirected or inside the substitution itself — reaches the fence like a bare one" $r
 
+  # 46. THE STEWARD RUNS AT ITS OWN TIER. cc-steward is one headless `claude -p` per routine event, unattended and
+  #     on the cheap model, so what keeps it from dispatching, spending or reading the box's secrets has to be a
+  #     rule and not a sentence in its prompt. CC_ROLE=steward is the whole tell — its run dir is ~/.cc/steward/<repo>
+  #     and carries no marker — and the refusal is the steward's own: no query recorded, nothing sent to the owner.
+  ASKS=$T/asks46; CALLS=$T/calls46; : > "$CALLS"; GERR=$T/err46; SD=$H/.cc/steward/demo
+  QS=$H/.cc/state/_nomarker/queries.spool; rm -f "$QS"; r=0
+  while IFS='%' read -r fam what why; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"; got=$(g Bash "{\"command\":\"$what\"}" "$SD" CC_ROLE=steward)
+    # the REASON too, not just rc 2: several rules can refuse one line, and a case that reads only the code
+    # cannot tell the rule it means to test from a neighbour that happened to fire first.
+    { [ "$got" = 2 ] && grep -qF "$why" "$GERR"; } \
+      || { r=1; echo "      $fam: rc $got, refused for: $(head -c 70 "$GERR")"; }
+  done <<W46
+dispatching a worker%cc demo t2 --go fix it%does not dispatch workers (cc --go)
+starting an orch%cc demo --orch dash a project%does not start an orch
+the runner underneath a worker%cc-loop demo t2%does not dispatch workers (cc-loop)
+a second headless model call%claude -p do the thing --model sonnet%a second model call
+another steward, recursing%cc-steward run demo%does not run another steward
+reading the box's config%cat ~/.cc/config%reading the box's secrets
+re-wiring the box's Slack%cc-slack mkchannel new%re-wiring the box's Slack
+rewriting the box's config%cc-config set CC_STEWARD_MODEL opus%not a steward's to read or rewrite
+landing, inherited from the worker tier%cc-land 7%landing a change
+posting in the owner's name, likewise%cc-slack post --to demo hi%posting to the owner's Slack
+sudo, likewise%sudo systemctl restart cc-broker%sudo / host changes
+W46
+  # …and the work it exists to do is untouched, or the tier is just an off switch.
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"; got=$(g Bash "{\"command\":\"$what\"}" "$SD" CC_ROLE=steward)
+    [ "$got" = 0 ] || { r=1; echo "      steward refused its own work — $fam: rc $got, $(head -c 70 "$GERR")"; }
+  done <<A46
+reading the reconciler's snapshot%cat ~/.cc/state/sense.json
+escalating to the owner%cc-notify a steward needs a person
+asking whether a repo holds the landing grant%cc lands demo
+appending its own run log%echo ran >> ~/.cc/state/steward/runs.jsonl
+A46
+  [ -s "$CALLS" ] && { r=1; echo "      a steward refusal reached the owner"; }
+  [ -s "$QS" ] && { r=1; echo "      a steward refusal recorded a member query"; }
+  ok "a steward is refused dispatch, a second model call, the box's secrets and its Slack wiring — inherits the worker gates, still runs its own work, and asks nobody" $r
+
+  # 47. …AND NO OTHER TIER MOVED. The steward rules are keyed on $CC_ROLE alone, so the same lines must still pass
+  #     for a WORKER (which dispatches subagents and workers, and reads the config) and for a PLANNING session
+  #     (ungated: no role, no marker). If this goes red the tier leaked onto sessions that already had the grant.
+  ASKS=$T/asks47; CALLS=$T/calls47; : > "$CALLS"; GERR=$T/err47; r=0
+  while IFS='%' read -r fam what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"; w=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker); p=$(g Bash "{\"command\":\"$what\"}" "$H")
+    { [ "$w" = 0 ] && [ "$p" = 0 ]; } \
+      || { r=1; echo "      $fam: worker rc $w, planning rc $p — $(head -c 70 "$GERR")"; }
+  done <<W47
+dispatching a worker%cc demo t2 --go fix it
+the runner underneath one%cc-loop demo t2
+a headless model call%claude -p do the thing --model sonnet
+reading the box's config%cat ~/.cc/config
+rewriting the box's config%cc-config set CC_STEWARD_MODEL opus
+making a Slack channel%cc-slack mkchannel new
+W47
+  ok "the steward tier is the steward's alone: a worker and a planning session still dispatch, read the config and wire Slack" $r
+
+  # 48. GATING ~/.cc/config IN BASH ALONE WOULD BE THEATRE FOR THIS TIER — Read/Grep/Glob is the tool set the
+  #     steward actually holds today (cc-steward: THE MODEL GETS NO SHELL), so the file tools carry the member's
+  #     secret list for it too. The worker's list is unchanged: it reads the config and not the credentials.
+  ASKS=$T/asks48; CALLS=$T/calls48; : > "$CALLS"; GERR=$T/err48; SD=$H/.cc/steward/demo; r=0
+  s1=$(g Read "{\"file_path\":\"$H/.cc/config\"}" "$SD" CC_ROLE=steward)
+  s2=$(g Read "{\"file_path\":\"$H/.claude/.credentials.json\"}" "$SD" CC_ROLE=steward)
+  s3=$(g Read "{\"file_path\":\"$H/.cc/state/sense.json\"}" "$SD" CC_ROLE=steward)
+  w1=$(g Read "{\"file_path\":\"$H/.cc/config\"}" "$WT" CC_ROLE=worker)
+  w2=$(g Read "{\"file_path\":\"$H/.claude/.credentials.json\"}" "$WT" CC_ROLE=worker)
+  p1=$(g Read "{\"file_path\":\"$H/.cc/config\"}" "$H")
+  [ "$s1$s2$s3" = "220" ] || { r=1; echo "      steward: config $s1, credentials $s2, snapshot $s3"; }
+  [ "$w1$w2$p1" = "020" ] || { r=1; echo "      worker: config $w1, credentials $w2; planning: config $p1"; }
+  ok "a steward may not READ the box's secrets either, still reads the state it must not guess, and the worker and planning tiers read what they always did" $r
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -1545,7 +1624,14 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
-role="${CC_ROLE:-}"; mdir=""; mws=""; root=""; trepo=""; ttrack=""   # $root: the ONE tree this session writes (rule 5 below)
+role="${CC_ROLE:-}"; steward=""; mdir=""; mws=""; root=""; trepo=""; ttrack=""   # $root: the ONE tree this session writes (rule 5 below)
+# THE STEWARD IS A WORKER THAT MAY NOT SPEND. cc-steward runs one headless `claude -p` per routine event, on the
+# cheap model and unattended — which is the worst thing to leave at the widest tier. There is no marker to walk
+# to: its cwd is ~/.cc/steward/<repo>, deliberately not a worktree (cc-steward, RUNS), so $CC_ROLE is the whole
+# tell. It maps onto the worker tier — every rule below applies to it unchanged — plus the steward block in the
+# Bash case, which is the member tier's "no spend, no leak" set. Strictly narrower than worker, so nothing here
+# widens a non-owner tier; a marker walk can still promote it to member, which is stricter again.
+case "$role" in steward) steward=1; role=worker;; esac
 track_dir(){   # $1 holds a .cc/track marker: rc 0 = a real track worktree, and role/root/repo/track are set from its PATH
   # A TRACK WORKTREE LIVES UNDER ~/.cc/worktrees/<repo>/<track> — `cc` makes them nowhere else — and ONLY THERE does
   # .cc/track mean anything. Anywhere else it is a file somebody wrote, and the walk goes on past it to whatever
@@ -2219,6 +2305,10 @@ case "$tool" in
     #    a Bash blocklist is not a sandbox: it stops accidents and casual prompt-injection, not a determined attacker
     #    (a redirection, a copied binary, a script it writes first). Real containment is ccbox. cc-notify stays
     #    allowed on purpose: it is how this session escalates to the owner.
+    # One list, read by rule 4 and rule 6: a secret added here has to reach every tier that may not see it, and a
+    # second copy in the steward block below is a copy that would be updated once. $RD is set above; these ADD to
+    # the credentials no role reads at all.
+    SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.cc/sandbox\b|\.ssh\b|\.claude/settings\.json)'
     if [ "$role" = member ]; then
       # A MEMBER WORKSPACE DISPATCHES INSIDE ITSELF, AND ONLY THERE. ~/dev/<handle> is one member's whole world:
       # tracks, workers and channels under `<handle>` are theirs to make. Keyed on the .cc/member-workspace marker
@@ -2243,18 +2333,38 @@ case "$tool" in
         never "creating outside \`$mws\` — this workspace makes tracks, boards and sessions under ~/dev/$mws and nowhere else"
       fi
       grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && never "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
-      SEC='(~|\$HOME|/home/[^ /]*)/(\.cc/config|\.cc/sandbox\b|\.ssh\b|\.claude/settings\.json)'   # $RD is set above: these ADD to the credentials no role reads
       grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && never "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json and the sealed-session copies of it under ~/.cc/sandbox)"
       grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' <<<"$cmd" && never "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
       # cc-config is the one sanctioned reader of ~/.cc/config — which makes it the one clean way AROUND the
       # secrets line above for a session that may not see them. Members get neither the read nor the write.
       grep -qE "$AT"'([^ ]*/)?cc-config\b' <<<"$cmd" && never "the box's config is not a member's to read or rewrite (cc-config)"
     fi
+    # 6. steward only: everything above at the worker tier, plus the member tier's "no spend, no leak" — minus the
+    #    workspace carve-outs, because a steward has no workspace to dispatch inside. Merging, landing, deploying,
+    #    force pushes and posting in the owner's name are already refused by the worker rules above, so what a
+    #    steward tier ADDS is dispatch and the box's other secrets. Same honest ceiling as rule 4: a Bash blocklist
+    #    stops accidents and casual prompt-injection, not a redirection or a script written first — cc-steward's
+    #    real wall is still that the model has no Bash at all (--disallowedTools), and this is what is left if that
+    #    day ever comes. cc-notify stays allowed: escalating to the owner is the steward's own job.
+    if [ -n "$steward" ]; then
+      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && never "a steward does not dispatch workers (cc --go) — it runs one named chain and escalates everything else"
+      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--orch\b' <<<"$cmd" && never "a steward does not start an orch (cc --orch) — a project a person steers is not a routine event"
+      grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd" && never "a steward does not dispatch workers (cc-loop)"
+      # A steward IS a headless model call: another one is unbudgeted spend nobody is watching, and cc-steward
+      # recursing on itself is that with a loop around it.
+      grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && never "a steward does not spend the owner's budget on a second model call (a headless claude)"
+      grep -qE "$AT"'([^ ]*/)?cc-steward +run\b' <<<"$cmd" && never "a steward does not run another steward (cc-steward run) — one event, one run"
+      grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && never "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json and the sealed-session copies of it under ~/.cc/sandbox)"
+      grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' <<<"$cmd" && never "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
+      grep -qE "$AT"'([^ ]*/)?cc-config\b' <<<"$cmd" && never "the box's config is not a steward's to read or rewrite (cc-config)"
+    fi
     ;;
   Read|NotebookRead|Grep|Glob)   # gating these files in Bash alone would be theatre if a file-reading TOOL served them
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // ""' <<<"$inp")
     [ -n "$fp" ] && fp=$(realpath -m -- "$fp" 2>/dev/null || echo "$fp")
-    if [ "$role" = member ]; then secret_path "$fp" && never "reading the box's secrets ($fp)"
+    # …and the steward reads with the member's list, not the worker's: Read/Grep/Glob is the one tool set it
+    # actually holds today, so gating ~/.cc/config in Bash alone would gate nothing it can reach.
+    if [ "$role" = member ] || [ -n "$steward" ]; then secret_path "$fp" && never "reading the box's secrets ($fp)"
     else secret_all "$fp" && never "reading the box's credentials ($fp)"; fi ;;
   Edit|Write|MultiEdit|NotebookEdit)
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$inp")

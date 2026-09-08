@@ -546,6 +546,13 @@ c(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s","transcript_path":"%s"
   && ok "a worker that cd'd into ~/dev/<repo> is still fenced to its worktree — the transcript path says where it started" || bad "a cd'd worker is fenced by its cwd"
 rm -f "/tmp/cc-selftest-$RUN-lnk"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
+# …and for a steward, whose whole tier lives in that env: no marker names it, so a role missing from the no-jq
+# list is a steward running unattended with every gate off. The planning session is the other side of the same
+# line — it is ungated by design, so a broken PATH must NOT start refusing its calls.
+#   `env -u` first: this suite's own runner may hold a CC_ROLE or a CC_HANDOFF, and either one inherited would
+#   make the ungated half of the assertion pass for the wrong reason (both are read by the same `case`).
+njq(){ printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | env -u CC_ROLE -u CC_HANDOFF ${1:+CC_ROLE=$1} PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?; }
+[ "$(njq steward)" = 2 ] && [ "$(njq)" = 0 ] && ok "…and for a steward too, while an ungated planning session still runs" || bad "guard without jq: steward=$(njq steward) planning=$(njq) (want 2 and 0)"
 # member-facing: the .cc/member-facing marker alone (NO CC_ROLE — the env is a convenience) = every worker gate plus spend/leak/wiring
 # A MEMBER DENY NOW SPEAKS (see below), so every member probe runs against a STUB HOME: a fake ~/bin/cc-slack and
 # ~/bin/cc-notify that only record their argv, and a ~/.cc/config with no real token. Nothing in this file may
