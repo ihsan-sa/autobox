@@ -1830,6 +1830,12 @@ HOME_AGENT_QUIET = 300                         # a transcript written this recen
                                                # inside it need be read. A longer silence is NOT death: an agent inside
                                                # ONE long Bash call writes nothing at all while it waits, so past this
                                                # the file is judged by its last record instead (home_agent_done).
+HOME_AGENT_STALE = 7200                        # …but a silence THIS long is death, whatever the last record says. An
+                                               # agent killed mid-turn never writes its final report, so home_agent_done
+                                               # says "not done" for ever and the session outliving it keeps the row on
+                                               # the tab: one sat there for 23 hours (owner asked, 2026-09-07). Nothing
+                                               # here waits two hours inside one call — the longest is a `timeout 3600`
+                                               # — so past this the row is gone work, not quiet work.
 HOME_AGENT_TAIL = 65536                        # bytes of the END of a transcript read to find that last record — with
                                                # HOME_AGENT_HEAD, the whole of what this file ever looks at.
 HOME_AGENT_HEAD = 4096                         # bytes of a subagent transcript this file looks at — its first record,
@@ -3085,6 +3091,19 @@ def home_agent_repo(prompt):
     return m.group(1) if m else ""    # a repo name never ENDS on a `.`: `PR #7 of abox. Read…` names `abox`, not `abox.`
 
 
+def home_agent_dir(proj, home=None, dev=None):
+    """The directory a session's tasks live under, back from the harness's flattened name for it. The harness names
+    that directory after the session's cwd with every non-alphanumeric turned into `-`, which CANNOT be reversed on
+    its own: `a-b` and `a/b` flatten to the same string. So do not reverse it — flatten the
+    directories this box actually has and see which one matches. Returns "" when none does, which is the honest
+    answer for a session in a directory that is gone."""
+    home, dev = home or HOME, dev or DEV
+    for d in [home] + sorted(glob.glob(f"{dev}/*")):
+        if re.sub(r"[^A-Za-z0-9]", "-", d) == proj:
+            return d
+    return ""
+
+
 def home_agent_target(path, n=HOME_AGENT_HEAD):
     """Where a subagent runs, mapped onto the SAME target every other band on the tab keys on — a repo, a
     member handle (detect_target). Its own transcript opens with the harness's `cwd`, exactly like a session's
@@ -3196,8 +3215,9 @@ def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None, targe
                    land_titles=None):
     """[{"id", "task", "mark", "target", "title", "repo", "idle"}] — the subagents a session has out RIGHT NOW, busiest first,
     each under the name its parent gave it (home_agent_names), the PR or board row its prompt names (home_agent_mark),
-    and the SESSION'S target (home_agent_target) — a repo, a member handle — so the tab can group them the
-    way it groups everything else. A mark that names a PR carries that PR's own title too (home_pr_title), looked up
+    and the SESSION'S target (home_agent_target, falling back to the flattened project directory — home_agent_dir —
+    when the transcript's own `cwd` sits past the head read) — a repo, a member handle — so the tab can group them
+    the way it groups everything else. A mark that names a PR carries that PR's own title too (home_pr_title), looked up
     in the repo the PROMPT names (`PR #7 of abox` → `repo`, home_agent_repo), falling back to the session's own
     target only when that is a plain repo — a cross-repo agent's row must not print another repo's PR title, and a
     planning session's `box` target names no repo at all: a count of subagents and a number to look up told the owner
@@ -3211,19 +3231,20 @@ def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None, targe
     writing its output, and neither is a subagent. Nothing else in this repo reads these files.
 
     LIVE is the whole difficulty, because the file OUTLIVES the agent: a finished agent's `.output` sits in the
-    session's tmp directory for as long as that directory does. Two things must hold. (1) The session that owns it is
+    session's tmp directory for as long as that directory does. Three things must hold. (1) The session that owns it is
     still up (home_session_live). (2) Its transcript was written within `quiet` seconds, OR its last record is not the
     agent's final report (home_agent_done) — an agent inside ONE long Bash call writes nothing at all while it waits,
-    and reading that one as gone is the expensive mistake.
+    and reading that one as gone is the expensive mistake. (3) That silence has not run past HOME_AGENT_STALE — past
+    that the row is gone work, not quiet work, whatever its last record says: one sat on the tab for 23 hours before
+    this cut (owner asked, 2026-09-07).
 
     `idle` is that second case made visible instead of silent: alive and not done, but nothing written for `quiet`
     seconds. It stays a row here — dropping it read as the work having vanished while a builder sat quiet inside a
     long test run (owner, 2026-09-05, thread 1788625605) — but is tagged so a wall of busy-looking rows does not hide
     that one of them has gone quiet. A row that is merely fresh (age < quiet) is never idle regardless of `done`.
 
-    THE FAILURE MODES, both accepted: a session started by hand as a bare `claude`, with no id on its command line,
-    shows none of its agents — the band under-counts rather than invents work; and an agent KILLED mid-turn never
-    writes a final report, so it is counted (and eventually shown idle) until the session that owns it ends.
+    THE FAILURE MODE, accepted: a session started by hand as a bare `claude`, with no id on its command line,
+    shows none of its agents — the band under-counts rather than invents work.
 
     A session running IN A TRACK WORKTREE is skipped: that is a worker, its board row is already the running section,
     and counting its agents again would count one piece of work twice."""
@@ -3232,7 +3253,7 @@ def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None, targe
     target = home_agent_target if target is None else target
     pr_title = home_pr_title if pr_title is None else pr_title
     worker = re.sub(r"[^A-Za-z0-9]", "-", f"{HOME}/.cc/worktrees") + "-"   # the harness's project dir is the cwd, flattened
-    out, asked, boards = [], {}, None
+    out, asked, boards, projs = [], {}, None, {}
     for d in sorted(glob.glob(f"{root}/*/*/tasks")):
         proj, sid = d.split("/")[-3], d.split("/")[-2]
         if proj.startswith(worker):
@@ -3245,11 +3266,17 @@ def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None, targe
         if not asked[sid]:
             continue                           # the session is gone; what it left behind is not work in flight
         named = home_agent_names(home_session_file(agents[0], sid))    # one pass over the session's transcript, not one per agent
+        if proj not in projs:                  # …and ONE directory lookup per project, never one per agent
+            d0 = home_agent_dir(proj)
+            projs[proj] = detect_target(d0) if d0 else ""
+        projtgt = projs[proj]
         for f in agents:
             try:
                 m = os.stat(f).st_mtime        # THROUGH the link: the link itself is written once and never again
             except OSError:
                 continue                       # dangling: a transcript that is gone is nobody's work
+            if now - m >= HOME_AGENT_STALE:
+                continue                       # gone, whatever its last record says: see HOME_AGENT_STALE
             done = now - m >= quiet and home_agent_done(f)
             if done:
                 continue
@@ -3261,7 +3288,11 @@ def home_subagents(root=None, quiet=HOME_AGENT_QUIET, now=None, live=None, targe
             aid = os.path.basename(f)[:-len(".output")]
             desc, prompt = named.get(aid, ("", ""))
             task = home_clip(desc, HOME_AGENT_LINE) or home_agent_task(f)     # its name, or the prompt when it has none
-            mark, tgt = home_agent_mark(prompt or task, task), target(f) or ""
+            # the transcript's own `cwd` first; then the directory its tasks are filed under, because a first
+            # record big enough to push `cwd` past the head read (a CLAUDE.md attachment does it) grouped a real
+            # agent under `?` on the tab (owner asked, 2026-09-07)
+            mark = home_agent_mark(prompt or task, task)
+            tgt = target(f) or projtgt or ""
             num, title, repo = mark[1:] if re.fullmatch(r"#\d+", mark) else "", "", ""
             if num:                                # the repo the PROMPT names wins; the session's own target answers
                 repo = home_agent_repo(prompt or task) or \
@@ -11208,8 +11239,44 @@ def cmd_selfcheck():
                                {("abox", "99"): "x"}) == {("abox", "12")}
               and home_land_wanted([{"mark": "#12", "title": "", "repo": "abox"}],
                                    {("abox", "12"): ""}) == set())
+        # A GROUP THAT SAYS `?` IS A ROW THE OWNER CANNOT PLACE (he asked, 2026-09-07, having found one on the tab).
+        # The target comes off the `cwd` in the transcript's FIRST record, and a first record big enough to push
+        # `cwd` past HOME_AGENT_HEAD — a CLAUDE.md attachment does exactly that — left a real agent under `?`. The
+        # directory the harness files a session's tasks under IS that cwd, flattened.
+        hhome = tempfile.mkdtemp(prefix="cc-slack-selfcheck-home-")
+        os.makedirs(f"{hhome}/dev/abox")
+        hflat = re.sub(r"[^A-Za-z0-9]", "-", f"{hhome}/dev/abox")
+        os.makedirs(f"{hagd}/{hflat}/s9/tasks"); os.makedirs(f"{hagd}/{hflat}/s9/subagents")
+        hjl = f"{hagd}/{hflat}/s9/subagents/agent-c1.jsonl"
+        with open(hjl, "w") as fh:                       # `cwd` present, but PAST the head read — the real shape
+            fh.write(json.dumps({"attachment": "x" * (HOME_AGENT_HEAD * 2), "cwd": f"{hhome}/dev/abox",
+                                 "type": "user", "message": {"role": "user", "content": "review the thing"}}) + "\n")
+            fh.write(json.dumps(hmid) + "\n")
+        os.symlink(hjl, f"{hagd}/{hflat}/s9/tasks/c1.output")
+        hlive9 = hlive + ("s9",)
+        _homeA, _devA = globals()["HOME"], globals()["DEV"]   # detect_target answers for the box it is on: BE that box
+        globals()["HOME"], globals()["DEV"] = hhome, f"{hhome}/dev"
+        hgrp = {a["id"]: a for a in home_subagents(root=hagd, live=lambda sid: sid in hlive9)}
+        check("home_subagents: an agent whose transcript hides its `cwd` behind a big first record still groups "
+              "under its project — the directory its tasks are filed under is that cwd flattened, and flattening "
+              "cannot be reversed (`a-b` and `a/b` flatten alike), so the box's own "
+              "directories are flattened and matched instead; one that matches nothing still says `?`",
+              hgrp["c1"]["target"] == "abox" and home_agent_target(hjl) == ""
+              and home_agent_dir(hflat, hhome, f"{hhome}/dev") == f"{hhome}/dev/abox"
+              and home_agent_dir("-no-such-directory", hhome, f"{hhome}/dev") == "")
+        os.utime(hjl, (time.time() - HOME_AGENT_STALE - 60,) * 2)
+        check("home_subagents: …and past HOME_AGENT_STALE it is gone whatever its last record says — an agent "
+              "KILLED mid-turn never writes its final report, so `done` stays false for ever and the session "
+              "outliving it kept the row on the tab for 23 hours (owner, 2026-09-07). Quiet is not dead; this long "
+              "is: nothing here spends two hours inside one call",
+              "c1" not in {a["id"] for a in home_subagents(root=hagd, live=lambda sid: sid in hlive9)}
+              and not home_agent_done(hjl)
+              and "c1" in {a["id"] for a in home_subagents(root=hagd, live=lambda sid: sid in hlive9,
+                                                           now=time.time() - 3600)})
+        globals()["HOME"], globals()["DEV"] = _homeA, _devA
     finally:
         shutil.rmtree(hagd, ignore_errors=True)
+        shutil.rmtree(locals().get("hhome") or "/nonexistent", ignore_errors=True)
     _homeT = globals()["HOME"]
     htd = tempfile.mkdtemp(prefix="cc-slack-selfcheck-pr-title-")
     try:
