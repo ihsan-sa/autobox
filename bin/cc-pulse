@@ -34,6 +34,15 @@ is (the one exception is a row carrying an `agent` mark, below, which costs one 
   · every other target is woken, and the tick CARRIES WHAT THE FILES SAY — the `main-gate` row, `cc-scope count
     <repo>`, the rows queued or blocked, and the rows still in flight (a PR in `review` above all) — so a
     session with nothing to do costs one cheap turn instead of re-deriving all of it.
+  · …and WHICH of those queued rows could actually be STARTED right now, from `cc-brief ready <repo>`: the ones
+    nothing in flight is holding a file of, and the ones that share a file and so are one builder's work rather
+    than two. A count of queued rows was never an answer to "is there room" — the width is capped by one writer
+    per file, and working that out was left to whoever happened to look, so fifteen changes landed in seven hours
+    while twenty rows sat queued and the box still looked idle. The tick carries the headline and the command for
+    the rest; it is silent when nothing could start, and nothing here dispatches anything. That headline may say
+    the answer is WITHHELD — a row in flight that nothing can place makes every "free" unsafe, and cc-brief says
+    which row to give a branch to. It reaches GitHub for those rows only, which is the one call in this tick that
+    leaves the box.
   · a row a LIVE session is doing in its own subagents is in flight, not work waiting to be picked up. It has
     no worker and no worktree anyone holds, so `queued` was offered for dispatch on every tick; the session
     marks it (`cc board set <repo> <track> agent me`) and the mark holds while that tmux window holds a
@@ -475,6 +484,25 @@ def due(target):
     # one line, and bare is not enough to compare on: `queued` → `blocked` is a row that stopped, and reading
     # that as unchanged would hold the wake that says so.
     ready_st = sorted(f"{k} {st}" for k, st in board if st in BOARD_DUE and k not in taken)
+    # …AND WHICH OF THOSE COULD ACTUALLY BE STARTED RIGHT NOW. A count of queued rows is not an answer to "is
+    # there room": the width is capped by one writer per file, and working out which rows collide with nothing
+    # in flight was left to whoever happened to look. Fifteen changes landed in seven hours while twenty rows
+    # sat queued and the box looked idle (owner, 2026-09-07). cc-brief owns that arithmetic — it is the board's
+    # rows against git's answer about each live branch — and this hands it the rows it has already decided are
+    # unheld, because only this file can test an `agent` mark's window. It reports and starts nothing; the
+    # session reads the headline and runs `cc-brief ready <repo>` for the rest.
+    # IT IS NOT IN THE LOOK, on purpose. The look decides whether a wake happens at all, and this figure moves
+    # every time a live branch commits a file some queued row happens to name — a wake per commit, at a full
+    # context each, to say the room changed by one. The event that really opens the room is a row leaving flight,
+    # and the look already carries that. So this rides the ticks that were going out anyway.
+    could = ""
+    if ready:
+        out = sh(f"{BIN}/cc-brief", "ready", repo, *ready, timeout=120)
+        if out is None:                                    # killed at the budget: say so rather than read as "nothing"
+            could = "cc-brief ready timed out — which rows could start is unread this tick"
+        else:
+            head = ((out.stdout or "").strip().splitlines() or [""])[0] if out.returncode == 0 else ""
+            could = head.split(": ", 1)[1] if ": " in head else ""
     aloft = sorted(f"{k} {st}" + (" (on hold)" if k in on_hold else " (a subagent has it)" if k in held else "")
                    for k, st in board if k not in ready and st not in DONE_ROW)
     note = " · ".join(filter(None, [
@@ -482,6 +510,7 @@ def due(target):
         (f"{asks} owner ask{'' if asks == 1 else 's'} open" if asks > 0 else
          "cc-scope could not count the open asks" if asks < 0 else ""),
         f"{len(ready)} row{'' if len(ready) == 1 else 's'} queued/blocked ({', '.join(ready[:3])})" if ready else "",
+        f"{could} (cc-brief ready {repo})" if could else "",
         f"{len(aloft)} row{'' if len(aloft) == 1 else 's'} in flight ({', '.join(aloft[:3])})" if aloft else "",
     ])) or "no red main, no open ask, no row queued or in flight — goals are the work"
     anything = bool(red or asks != 0 or ready or aloft)  # a ledger that could not answer counts as something too
@@ -816,7 +845,7 @@ def selfcheck():
             os.makedirs(d, exist_ok=True)
         for name, body in (("tmux", FAKE_TMUX), ("cc", FAKE_CC), ("cc-msg", FAKE_MSG), ("cc-handoff", FAKE_HANDOFF),
                            ("cc-limit", FAKE_LIMIT), ("cc-scope", FAKE_SCOPE), ("cc-pause", FAKE_PAUSE),
-                           ("cc-broker", FAKE_BROKER)):
+                           ("cc-broker", FAKE_BROKER), ("cc-brief", FAKE_BRIEF)):
             open(f"{BIN}/{name}", "w").write(body)
             os.chmod(f"{BIN}/{name}", 0o755)
         # a process whose name really is `claude`, for pgrep -x. A COPY OF BASH, not of sleep: this box's
@@ -833,6 +862,9 @@ def selfcheck():
                           # board twice is decided by the rule it is about and not by the same-look mark. The
                           # block at the end turns it on and is the only place that tests it.
                           CC_FAKE_ASKS="0", CC_FAKE_SCOPE_BROKEN="", CC_PULSE_QUIET="0", CC_FAKE_PAUSED="",
+                          # …and nothing could start, for every case that is not about that: cc-brief's answer
+                          # when no queued row is free is no output at all, and the tick then carries no clause.
+                          CC_FAKE_READY="",
                           # …and cc-limit's resumed-episode file under $th, not the box's: a real limit that
                           # lifted this morning must not decide whether a mark in a fixture below is cold.
                           CC_LIMIT_RESUMED=f"{th}/limit-resumed")
@@ -1124,6 +1156,21 @@ def selfcheck():
         d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "blocked"}, "t3": {"status": "running"}})
         ok("…and the rows that are queued or blocked, by name", "2 rows queued/blocked (t1, t2)" in d)
         ok("…and the rows already in flight, with the status each is in", "1 row in flight (t3 running)" in d)
+        ok("a count of queued rows says nothing about ROOM, so the tick makes no such claim on its own",
+           "could start now" not in d)
+
+        # WHICH OF THOSE COULD ACTUALLY BE STARTED is cc-brief's arithmetic — the board against git against each
+        # brief — and the tick carries its headline. Both directions, because the useful half of a report that
+        # only speaks up when there is something to say is that it is silent the rest of the time.
+        os.environ["CC_FAKE_READY"] = "beta: 2 of 3 queued rows could start now — 1 group shares a file"
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}, "t3": {"status": "queued"}})
+        ok("the tick says which of the queued rows could be STARTED right now, and where the rest of it is",
+           "2 of 3 queued rows could start now" in d and "1 group shares a file" in d and "cc-brief ready beta" in d)
+        ok("…and the repo is not named twice — the tick already says whose board it is", "beta: 2 of 3" not in d)
+        os.environ["CC_FAKE_READY"] = ""
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}, "t3": {"status": "queued"}})
+        ok("…and NOTHING is said when nothing could start: no clause, no count, no pointer",
+           "could start now" not in d and "cc-brief ready" not in d and "3 rows queued/blocked" in d)
 
         # A ROW A LIVE SESSION IS DOING IN ITS OWN SUBAGENTS is work in flight, not work waiting to be picked up.
         # Nothing on the box holds its worktree — no worker, no cc-loop, no window of its own — so `queued` read
@@ -1443,6 +1490,15 @@ FAKE_SCOPE = r"""#!/usr/bin/env bash
 set -u
 [ -n "${CC_FAKE_SCOPE_BROKEN:-}" ] && exit 2
 printf '%s\n' "${CC_FAKE_ASKS:-0}"
+"""
+
+FAKE_BRIEF = r"""#!/usr/bin/env bash
+# selfcheck stub for `cc-brief ready <repo> <row>…`: prints $CC_FAKE_READY, and prints nothing when it is empty —
+# which is the real one's answer when no queued row could be started. Exit 0 either way: it reports, never gates.
+set -u
+[ "${1:-}" = ready ] || exit 0
+[ -n "${CC_FAKE_READY:-}" ] && printf '%s\n' "$CC_FAKE_READY"
+exit 0
 """
 
 FAKE_BROKER = r"""#!/usr/bin/env bash

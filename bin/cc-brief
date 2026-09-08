@@ -5,8 +5,10 @@
   cc-brief judge [FILE|-]        a small model reads the same brief -> 0 approved · 1 REJECTED · 2 not judged
   …either gate, --for <repo>/<track>   names the track in the refusal (display only)
   cc-brief refresh <repo> <track>   recompute that track's IN FLIGHT block from the board, in its task.md
+  cc-brief ready <repo> [<track>…] [--no-net]   which queued rows nothing in flight is holding, and which share
+                                 a file. `--no-net` keeps it off GitHub, and it then answers less often
   cc-brief selfcheck             fixtures for every signal, both gates, the recorded override and the row that is
-                                 not one, the unjudged dispatch it records, the block rewrite
+                                 not one, the unjudged dispatch it records, the block rewrite, the ready arithmetic
 
 WHY A CHECK AND NOT A RULE. What a brief may say is written down in two places already, and a session that had
 read both still dispatched a page of prescription; a third copy is the move that has already failed twice. So the
@@ -64,11 +66,41 @@ answer, and leaves whatever the brief has. At most 12 files are listed, then a c
 
 Only that block is ever rewritten: everything a person typed in the brief is left exactly as typed, and a row a
 person marked `kind=session` is not a track holding files, so it is read and skipped rather than reported.
+
+WHICH QUEUED ROWS COULD START RIGHT NOW is the same arithmetic asked from the other end, and `ready` answers it.
+Fifteen changes landed in seven hours on a box that still looked idle, because two or three builders ran at a time
+while twenty rows sat queued: one writer per file is the right rule and is what caps the width, but it was read as
+"wait" when the answer was usually "start it, nothing is holding its files". Nobody should have to work that out by
+hand, so it is worked out from what is already written down — the board's rows, git's answer about each live
+branch, and the paths each queued row's own brief names.
+  A ROW'S FILES ARE THE ONES ITS BRIEF NAMES, and named() is the whole of that guess: a path that resolves in the
+checkout, or a bare name that is exactly one tracked file (`cc-land`, `check.sh` — briefs write those constantly).
+It errs toward collision: a file mentioned only as background counts. So this REPORTS and a session DECIDES — it
+dispatches nothing, and it never edits a brief.
+  …AND THE ROWS IT NAMES, which is the half a first version missed: briefs write "it goes after one-landing-queue
+— it builds on it and cannot be written in parallel (same file)" and never spell the file, so the row read as free
+while that PR held it. A brief that names another row inherits that row's files, held and named both.
+  WHICH ROW HOLDS WHAT COMES OFF THE REF THAT IS REALLY THERE, not off the board's `branch` field, which goes
+stale as a matter of course — a row cut on a branch of its own keeps the `track/<name>` it was created with. That
+field naming nothing gave the same answer as a branch that had changed nothing, so a live PR held no files at all
+and everything sharing them read as free. row_ref() tries the ref, then the row's own worktree (which has to be a
+worktree of THIS repo — that field goes stale too, and a reused path would answer for somebody else's branch),
+then a fetched refs/pull/<n>/head, then GitHub.
+  AND A ROW NONE OF THOSE PLACE STOPS THE ANSWER RATHER THAN QUALIFYING IT. Its files are unknown, so no row can
+be called free — free is a claim of safety, and the files that brief happens to name are a guess, empty or not.
+The row is printed with its goal line so a person can place it: give it the branch the work is on. That is why
+`gh` is asked by default and only about those rows — two seconds on a board of 105 — and `--no-net` is for a run
+that must not leave the box.
+  TWO ROWS THAT NAME THE SAME FILE ARE ONE BUILDER'S WORK, not two, and that is the second half of the answer:
+splitting them across two workers has cost this box a rebase and, twice, the same fix written twice. They come out
+grouped, by the file they share, joined through it — a and b sharing one file and b and c another is one group.
+  SILENCE WHEN NOTHING COULD START, like every other report worth reading: no free row, no output. A board that
+cannot be read is not the same answer and also says nothing — not-knowing is never reported as nothing.
 Env: CC_BOARDS · CC_STATE (both so a test run keeps out of the box's own state) · CC_BRIEF_FORCE · CC_BRIEF_MACHINE ·
 CC_BRIEF_MODEL (default haiku) · CC_BRIEF_TIMEOUT (default 120 s) · CC_CLAUDE · CC_BRIEF_FAKE (tests: the
 judge's answer, or empty for a judge that is not there — no call is made).
 """
-import json, os, re, subprocess, sys, time
+import calendar, json, os, re, subprocess, sys, time
 
 HOME = os.path.expanduser("~")
 BOARDS = os.environ.get("CC_BOARDS") or os.path.expanduser("~/.cc/boards")
@@ -86,6 +118,7 @@ def board_read(path):
         board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
     return board_read.mod.read(path)
 LIVE = ("queued", "running", "waiting", "review")   # a row that is not finished: its branch may be under a hand right now
+DUE = ("queued", "blocked", "todo")   # a row WAITING to be picked up; `todo` is older boards' spelling of queued
 MARK_A, MARK_B = "<!-- cc-brief:inflight -->", "<!-- /cc-brief:inflight -->"
 BLOCK_RE = re.compile(re.escape(MARK_A) + r".*?" + re.escape(MARK_B) + r"\n?", re.S)
 MAX_FILES = 12          # a brief carrying a page of paths is the problem this is here to avoid
@@ -213,26 +246,164 @@ def changed(path, base, branch):
     return []
 
 
-def inflight(repo, exclude=""):
-    """The IN FLIGHT block for repo, excluding one track (its own brief). Computed from the board, every time.
-    Three answers, and they are not the same: the block · "" nothing is held right now · None the board could not
-    be read, so nothing is known — and a caller must not mistake not-knowing for nothing and delete a real block."""
+def board_of(repo):
+    """The repo's board, or None when it cannot be read at all. NOT-KNOWING IS NOT NOTHING, and every caller
+    below turns on that difference, so the two answers are separated here once."""
     try:
-        d = board_read(os.path.join(BOARDS, repo + ".json"))
+        return board_read(os.path.join(BOARDS, repo + ".json"))
     except Exception:
         return None
-    if d is None:
+
+
+PR_NUM = re.compile(r"(\d+)\s*$")
+
+
+def pr_number(pr):
+    """The number a row's `pr` field carries. Rows hold both shapes — `225` and the whole URL — so both read."""
+    m = PR_NUM.search(str(pr or "").strip().rstrip("/"))
+    return m.group(1) if m else ""
+
+
+def ref_names(path):
+    """Every ref this checkout has, in each form a board row might name one: the full `refs/…`, a branch without
+    its `refs/heads/`, and a remote-tracking name without its `refs/remotes/`. ONE call for the whole board —
+    asking git row by row cost three processes a row on a loop that runs over every repo every couple of hours,
+    and this file's whole claim is that it is cheap enough to run without anyone weighing it."""
+    try:
+        r = subprocess.run(["git", "-C", path, "for-each-ref", "--format=%(refname)"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if r.returncode != 0:
+        return set()
+    out = set()
+    for ln in r.stdout.splitlines():
+        n = ln.strip()
+        if not n:
+            continue
+        out.add(n)
+        for prefix in ("refs/heads/", "refs/remotes/"):
+            if n.startswith(prefix):
+                out.add(n[len(prefix):])
+    return out
+
+
+def common_dir(path):
+    """The git directory a checkout SHARES with its linked worktrees, absolute. "" when it is not a checkout."""
+    try:
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    d = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return os.path.realpath(os.path.join(path, d)) if d else ""
+
+
+def row_ref(path, refs, row, name, git_dir=""):
+    """The ref in THIS checkout that actually carries a row's work, or "" when no local ref does.
+
+    THE `branch` FIELD GOES STALE, and that is normal rather than a fault: a row is created with `track/<name>`
+    and the work is often cut on a branch of its own, so the field names a ref that was never pushed. Reading it
+    and stopping there is what made a live PR hold NO files at all — the ref did not resolve, changed() returned
+    the empty list, and every queued row that shares that PR's files read as free (review of #367). Three local
+    answers, most certain first, and NONE of them touches the network: the ref itself, the row's own worktree
+    (which is on the real branch, whatever the board says), and refs/pull/<n>/head when somebody has fetched it.
+    A row none of them places is UNKNOWN, and held_files says so rather than reporting it as holding nothing."""
+    ref = row.get("branch") or f"track/{name}"
+    for cand in (ref, "origin/" + ref):
+        if cand in refs:
+            return cand
+    # THE `worktree` FIELD IS AS STALE AS THE `branch` ONE — the same row carried both wrong — and a directory
+    # at that path is not evidence it is this repo's: a worktree removed and its path reused by anything else
+    # would answer for a branch of somebody else's repository. One call settles both questions, because the
+    # branch and the git dir it shares come back together: the head, and the checkout it belongs to.
+    wt = row.get("worktree") or ""
+    if wt and git_dir and os.path.isdir(wt):
+        try:
+            r = subprocess.run(["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD", "--git-common-dir"],
+                               capture_output=True, text=True, timeout=20)
+            out = (r.stdout or "").splitlines() if r.returncode == 0 else []
+        except (OSError, subprocess.SubprocessError):
+            out = []
+        head = out[0].strip() if len(out) > 1 else ""
+        shared = os.path.realpath(os.path.join(wt, out[1].strip())) if len(out) > 1 else ""
+        if head and head != "HEAD" and head in refs and shared == git_dir:
+            return head
+    pr = pr_number(row.get("pr"))
+    if pr and f"refs/pull/{pr}/head" in refs:
+        return f"refs/pull/{pr}/head"
+    return ""
+
+
+def pr_files(path, pr):
+    """The files a PR changes, asked of GitHub. None = it could not say. THE ONLY THING HERE THAT REACHES THE
+    NETWORK, and it is off unless the caller asks for it (`ready --net`): about a second a call, on a loop that
+    runs over every repo every couple of hours, and this has to stay cheap enough to run without anyone weighing
+    the cost. So the pulse's tick never makes it, and a row whose branch is gone and whose PR was never fetched
+    is reported UNKNOWN there — which is true, and is what a person types `--net` to settle."""
+    try:
+        r = subprocess.run(["gh", "pr", "view", pr, "--json", "files", "-q", ".files[].path"],
+                           cwd=path or None, capture_output=True, text=True, timeout=15)   # a hung gh must not outlast the pulse tick
+    except (OSError, subprocess.SubprocessError):
         return None
-    path, base = d.get("path") or "", d.get("default_branch") or "main"
-    held = {}
-    for name, t in sorted((d.get("tracks") or {}).items()):
+    if r.returncode != 0:
+        return None
+    return [f for f in r.stdout.splitlines() if f.strip()]
+
+
+def started(row, st):
+    """Has this row's work begun ANYWHERE? A row still waiting to be picked up, with no ref in the checkout, no
+    PR and nobody marked on it, has never been dispatched: it holds no file, and calling it unreadable instead
+    would block every queued row that shares a file its brief happens to name. A row a person is deliberately
+    sitting on is exactly that case — the hold is why nobody is writing it. Anything past `queued` has begun."""
+    return st not in DUE or bool(pr_number(row.get("pr"))) or bool((row.get("agent") or "").strip())
+
+
+def held_files(board, skip=(), net=False):
+    """({row: (status, [files])}, [the rows nothing could place]) — what each live track is holding, and the ones
+    whose work no ref in this checkout carries. `skip` is the rows the caller is ASKING ABOUT: a brief is never
+    told it holds its own files, and the rows `ready` weighs are weighed against what is in flight, not against
+    each other. THE TWO ANSWERS ARE NOT ONE: a row holding nothing and a row nobody could read look identical in
+    a file list, and reading the second as the first is how a PR held nothing at all."""
+    path, base = board.get("path") or "", board.get("default_branch") or "main"
+    refs = ref_names(path) if path else set()
+    git_dir = common_dir(path) if path else ""
+    out, unknown = {}, []
+    for name, t in sorted((board.get("tracks") or {}).items()):
         # kind=session is a word a person set: a channel with no task and no PR. Read it, honour it, never a holder.
-        if name == exclude or (t.get("kind") or "track") != "track":
+        if name in skip or (t.get("kind") or "track") != "track":
             continue
         st = t.get("status") or ""
         if st not in LIVE:
             continue
-        for f in changed(path, base, t.get("branch") or f"track/{name}"):
+        ref = row_ref(path, refs, t, name, git_dir)
+        files = changed(path, base, ref) if ref else None
+        if files is None and net:
+            pr = pr_number(t.get("pr"))
+            files = pr_files(path, pr) if pr else None
+        if files is None and not started(t, st):
+            files = []          # never dispatched: no ref, no PR, nobody on it — there is no work to hold a file
+        if files is None:
+            unknown.append(name)
+            continue
+        out[name] = (st, files)
+    return out, unknown
+
+
+def inflight(repo, exclude=""):
+    """The IN FLIGHT block for repo, excluding one track (its own brief). Computed from the board, every time.
+    Three answers, and they are not the same: the block · "" nothing is held right now · None the board could not
+    be read, so nothing is known — and a caller must not mistake not-knowing for nothing and delete a real block."""
+    d = board_of(repo)
+    if d is None:
+        return None
+    # NO NETWORK HERE, unlike `ready`: this runs inside every dispatch, and a `gh` that is slow or logged out
+    # must never be what holds one up. A row row_ref() cannot place locally is left out of the block, which is
+    # what this has always done — the block is a pointer at the board, and `ready` is where being sure matters.
+    byrow, _unplaced = held_files(d, skip={exclude} if exclude else set(), net=False)
+    held = {}
+    for name, (st, files) in sorted(byrow.items()):
+        for f in files:
             held.setdefault(f, []).append(f"{name} [{st}]")
     if not held:
         return ""      # nothing is held: a brief carries no line about it, and a block left from before comes out
@@ -275,6 +446,225 @@ def refresh(repo, track):
         with open(tmp, "w") as f:
             f.write(new)
         os.replace(tmp, p)
+    return 0
+
+
+# ── which queued rows could start right now ──────────────────────────────────────────────────────────────────
+GOAL_QUOTE = 120      # how much of a blind row's goal line is quoted back: enough to recognise the row
+MARK_H = 6            # CC_AGENT_MARK_HOURS, cc-pulse's and cc-reconcile's: how long a session's `agent` mark holds
+# A FILE A BRIEF NAMES, and both shapes have to RESOLVE before they count — a brief is prose, and guessing at
+# prose is how a report becomes noise nobody reads. A token carrying a slash is checked against the checkout; a
+# bare one is looked up among the tracked files and counts only when exactly ONE file carries that name, because
+# briefs write `cc-land` and `check.sh` far more often than they write the whole path. A bare token must carry a
+# `.` or a `-` besides, or every English word in the brief would be asked about.
+TOKEN = re.compile(r"(?<![\w./~@+-])[\w.@+-]+(?:/[\w.@+-]+)*")
+
+
+def epoch(s):
+    """A board stamp back to seconds; anything unreadable is long ago, so a mark nobody can date holds nothing."""
+    try:
+        return float(calendar.timegm(time.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def tracked(root):
+    """{basename: path} over the files git tracks in `root`, keeping only the names exactly one file carries.
+    A name two directories share names NEITHER of them, and a checkout git cannot answer about names nothing."""
+    try:
+        r = subprocess.run(["git", "-C", root, "ls-files"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    idx, dup = {}, set()
+    for line in r.stdout.splitlines():
+        f = line.strip()
+        b = os.path.basename(f)
+        if not b:
+            continue
+        if b in idx:
+            dup.add(b)
+        idx[b] = f
+    for b in dup:
+        idx.pop(b, None)
+    return idx
+
+
+def named(text, root, index):
+    """The repo files this brief names. THE IN FLIGHT BLOCK IS NOT THE ROW'S OWN: every path in it is somebody
+    else's file, written there by this tool, so reading it as this row's would make every annotated brief collide
+    with everything in flight — including itself. strip_block() takes it out, as it does before the shape check."""
+    out = set()
+    for tok in TOKEN.findall(strip_block(text)):
+        tok = tok.rstrip(".,;:")
+        if ".." in tok.split("/"):
+            continue          # a brief's `../` is somebody's shell line, and nothing outside the checkout is a
+        if "/" in tok:        # file of this repo's — held_files only ever names paths git gave it
+            if root and os.path.isfile(os.path.join(root, tok)):
+                out.add(tok)
+        elif ("." in tok or "-" in tok) and tok in index:
+            out.add(index[tok])
+    return out
+
+
+def candidates(board, only=()):
+    """The rows `ready` weighs: exactly the ones named, or every row waiting to be picked up. Two rows are NOT
+    waiting even though `queued` is all either can say — one a person is deliberately sitting on (cc-board's
+    `held`), and one a live session has marked as its own subagent's work (`agent`, still warm). Offering either
+    is offering work somebody is already doing or has already stopped. A caller that can test the mark's window
+    properly — cc-pulse does, with tmux — passes its own rows in and this list is not consulted."""
+    rows = {k: v for k, v in (board.get("tracks") or {}).items()
+            if isinstance(v, dict) and (v.get("kind") or "track") == "track"}
+    if only:
+        return {k: v for k, v in rows.items() if k in set(only)}
+    cold = time.time() - float(os.environ.get("CC_AGENT_MARK_HOURS") or MARK_H) * 3600
+    out = {}
+    for k, v in rows.items():
+        if (v.get("status") or "queued") not in DUE or str(v.get("held") or "").strip():
+            continue
+        if (v.get("agent") or "").strip() and epoch(v.get("agent_at")) > cold:
+            continue
+        out[k] = v
+    return out
+
+
+def grouped(wants):
+    """{row: files} -> [(the files they share, the rows), …] biggest first — the rows that belong to ONE builder.
+    THE JOIN IS TRANSITIVE: a and b share one file, b and c another, and splitting those three across two workers
+    puts two writers on b's files. Only groups of two or more come out; a row sharing nothing is nobody's group."""
+    seen, out = set(), []
+    for start in sorted(wants):
+        if start in seen:
+            continue
+        team, files, edge = {start}, set(), [start]
+        seen.add(start)
+        while edge:
+            k = edge.pop()
+            for other in sorted(wants):
+                if other in team:
+                    continue
+                shared = wants[k] & wants[other]
+                if shared:
+                    files |= shared
+                    team.add(other)
+                    seen.add(other)
+                    edge.append(other)
+        if len(team) > 1:
+            out.append((sorted(files), sorted(team)))
+    return sorted(out, key=lambda g: (-len(g[1]), g[1]))
+
+
+def brief_text(repo, track):
+    """A row's brief with the IN FLIGHT block taken out. That block is this tool's own writing and it names other
+    tracks and their files — left in, every annotated brief would read as naming every row in flight."""
+    try:
+        with open(os.path.join(STATE, repo, track, "task.md"), errors="replace") as fh:
+            return strip_block(fh.read())
+    except OSError:
+        return ""
+
+
+def referred(text, names):
+    """The other rows this brief names. A DEPENDENCY NAMED BY TRACK IS A COLLISION, and briefs say it that way
+    far more often than they list paths: "it goes after one-landing-queue — it builds on it and cannot be
+    written in parallel (same file)" names the row and never spells the file, so the row read as free while
+    that PR held it (review of #367). One level deep: the row this brief names, and not what that row names."""
+    return {n for n in names if re.search(r"(?<![\w-])" + re.escape(n) + r"(?![\w-])", text)}
+
+
+def goal_of(text):
+    """A brief's GOAL line, or its first line — enough for a person to recognise the row and go and place it."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines:
+        if ln.upper().startswith("GOAL"):
+            return ln[:GOAL_QUOTE]
+    return lines[0][:GOAL_QUOTE] if lines else ""
+
+
+def ready(repo, only=(), net=True):
+    """(the rows that could start now, their groups, how many were weighed, the rows nothing could place, the
+    ones of those that could not even be guessed at). None = the board could not be read, which is NOT the same
+    answer as nothing could start.
+
+    A ROW NOTHING COULD PLACE STANDS ON ITS OWN BRIEF. Its branch is gone and its PR was never fetched, so git
+    cannot say what it holds; treating that as "holds nothing" is what let a live PR's files go unclaimed. The
+    files its brief names stand in — a guess, and the caller is told which rows it was made for.
+
+    …AND IT NEVER MAKES A ROW FREE. A stand-in is a guess about a row nobody could read, and FREE IS A CLAIM OF
+    SAFETY: the row this was measured on holds two files its brief never spells, so a queued row naming one of
+    them came back free with a general note that some row was unread as the only warning (re-review of #367). An
+    empty guess and a partial one are worth the same here — neither can be stood behind — so an unplaced row
+    withholds the whole answer. It can still take a row OUT of the free list, and it can never put one in.
+    WHICH IS WHY THE NETWORK IS ON BY DEFAULT. Withholding is only useful if the ordinary run has something to
+    withhold about: `gh pr view` is asked ONLY about the handful of rows no local ref places, measured at about
+    two seconds on a board of 105 rows, and `--no-net` is there for a run that must not leave the box."""
+    d = board_of(repo)
+    if d is None:
+        return None
+    cand = candidates(d, only)
+    if not cand:
+        return [], [], 0, [], []
+    byrow, unplaced = held_files(d, skip=set(cand), net=net)
+    root = d.get("path") or ""
+    index = tracked(root) if root else {}
+    rows = [k for k, v in (d.get("tracks") or {}).items()
+            if isinstance(v, dict) and (v.get("kind") or "track") == "track"]
+    text = {k: brief_text(repo, k) for k in rows}
+    own = {k: named(text[k], root, index) for k in rows}
+    files_of = {k: set(v[1]) for k, v in byrow.items()}
+    for u in unplaced:
+        files_of[u] = set(own.get(u, ()))
+    held = set().union(*files_of.values()) if files_of else set()
+    wants = {}
+    for k in cand:
+        w = set(own[k])
+        for other in referred(text[k], rows) - {k}:
+            w |= files_of.get(other, set()) | own.get(other, set())
+        wants[k] = w
+    if unplaced:
+        return [], [], len(cand), sorted(unplaced), sorted(u for u in unplaced if not files_of.get(u))
+    free = sorted(k for k in cand if not (wants[k] & held))
+    return free, grouped({k: wants[k] for k in free}), len(cand), [], []
+
+
+def cmd_ready(repo, only, net=False):
+    """Print the answer, and NOTHING AT ALL when there is none. Exit is always 0: this reports, it does not gate,
+    and a caller reading it as a verdict on anything is reading it wrong. THE ROWS NOTHING COULD PLACE ARE
+    PRINTED WITH IT — an answer that is partial and does not say so is the shape this whole file is against —
+    and a row that could not even be guessed at withholds the answer instead of qualifying it."""
+    r = ready(repo, only, net=net)
+    if r is None:
+        return 0
+    free, groups, weighed, unplaced, blind = r
+    if unplaced:
+        # NOT A COUNT EITHER. "N could start, unread" reads as room, and the number is exactly what cannot be
+        # stood behind: an unplaced row's files are unknown, so any of those N may be the one it collides with.
+        one = len(unplaced) == 1
+        print(f"{repo}: {weighed} queued row{'' if weighed == 1 else 's'}, none can be called free — "
+              f"{'a row is' if one else f'{len(unplaced)} rows are'} in flight and nothing places "
+              f"{'it' if one else 'them'}")
+        for u in unplaced:
+            goal = goal_of(brief_text(repo, u))
+            where = "brief names no file either" if u in blind else "read from its brief only"
+            print(f"  {u} ({where}) — {goal or 'no brief on file'}")
+        print(f"  give {'that row' if one else 'those rows'} the branch the work is really on, or run this where "
+              f"`gh` can reach GitHub")
+        return 0
+    if not free:
+        return 0
+    head = f"{repo}: {len(free)} of {weighed} queued row{'' if weighed == 1 else 's'} could start now"
+    if groups:
+        head += f" — {len(groups)} group{'' if len(groups) == 1 else 's'} share a file"
+    print(head)
+    together = set()
+    for files, ks in groups:
+        together |= set(ks)
+        shown = ", ".join(files[:3]) + (f" and {len(files) - 3} more" if len(files) > 3 else "")
+        print(f"  one builder for {shown}: {', '.join(ks)}")
+    alone = [k for k in free if k not in together]
+    if alone:
+        print(f"  a builder each: {', '.join(alone)}")
     return 0
 
 
@@ -519,6 +909,12 @@ def main(a):
             print("cc-brief refresh: needs <repo> <track>", file=sys.stderr)
             return 0
         return refresh(a[1], a[2])
+    if cmd == "ready":
+        rest = [x for x in a[1:] if x not in ("--net", "--no-net")]
+        if not rest:
+            print("cc-brief ready: needs <repo> [<track>…] [--no-net]", file=sys.stderr)
+            return 2
+        return cmd_ready(rest[0], rest[1:], net="--no-net" not in a[1:])
     if cmd == "selfcheck":
         return selfcheck()
     print(f"cc-brief: unknown command '{cmd}'", file=sys.stderr)
@@ -638,12 +1034,32 @@ def selfcheck():
     subprocess.run(["git", "init", "-q", "-b", "main", src], capture_output=True)
     open(os.path.join(src, "held.txt"), "w").write("base\n")
     open(os.path.join(src, "other.txt"), "w").write("base\n")
+    # …and, for the `ready` cases at the end: a file whose bare name is its own, and one basename two share.
+    for d, fn in (("bin", "cc-fixture"), ("a", "dup.txt"), ("b", "dup.txt")):
+        os.makedirs(os.path.join(src, d), exist_ok=True)
+        open(os.path.join(src, d, fn), "w").write("base\n")
+    for fn in ("pulled.txt", "wt.txt"):        # for the stale-`branch` cases: reached by PR ref and by worktree
+        open(os.path.join(src, fn), "w").write("base\n")
     git("add", "-A"); git("commit", "-qm", "base")
-    for br, fn in (("track/one", "held.txt"), ("track/two", "held.txt"), ("track/gone", "other.txt")):
+    for br, fn in (("track/one", "held.txt"), ("track/two", "held.txt"), ("track/gone", "other.txt"),
+                   ("track/tool", "bin/cc-fixture"), ("cut/elsewhere", "pulled.txt"), ("cut/checked-out", "wt.txt")):
         git("checkout", "-q", "-b", br, "main")
         open(os.path.join(src, fn), "a").write(br + "\n")
         git("add", "-A"); git("commit", "-qm", br)
     git("checkout", "-q", "main")
+    # A ROW WHOSE `branch` FIELD IS STALE, both ways it is still readable without the network: somebody fetched
+    # the PR, and the row's own worktree is sitting on the real branch whatever the board says.
+    git("update-ref", "refs/pull/9/head", "cut/elsewhere")
+    wt = os.path.join(tmp, "wt")
+    git("worktree", "add", "-q", wt, "cut/checked-out")
+    # A CHECKOUT THAT IS NOT THIS ONE, for the `worktree` guard: same branch name, another repository entirely.
+    foreign = os.path.join(tmp, "foreign")
+    subprocess.run(["git", "init", "-q", "-b", "cut/checked-out", foreign], capture_output=True)
+    open(os.path.join(foreign, "wt.txt"), "w").write("theirs\n")
+    subprocess.run(["git", "-C", foreign, "add", "-A"], capture_output=True)
+    subprocess.run(["git", "-C", foreign, "commit", "-qm", "theirs"], capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
 
     def board(tracks):
         with open(os.path.join(BOARDS, repo + ".json"), "w") as fh:
@@ -704,6 +1120,183 @@ def selfcheck():
     refresh("no-such-board", "mine")
     ok("a board that cannot be read leaves the block alone rather than deleting it",
        MARK_A in open(task).read())
+
+    # ── ready: which queued rows nothing in flight is holding, and which of them are one builder's work ──
+    def brief_of(track, text):
+        d = os.path.join(STATE, repo, track)
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "task.md"), "w").write(text)
+
+    def say(*only):
+        """cmd_ready as `main` would reach it, so the flag parsing is under test too, not just the arithmetic."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["ready", repo, *only])
+        return rc, buf.getvalue()
+
+    idx = tracked(src)
+    ok("a bare name exactly one tracked file carries IS that file — briefs write `cc-fixture`, not its path",
+       named("GOAL: cc-fixture answers the wrong question.\n", src, idx) == {"bin/cc-fixture"})
+    ok("…and a basename two directories share names neither of them, so it is not read as a file at all",
+       named("GOAL: dup.txt is wrong.\n", src, idx) == set())
+    ok("a whole path counts when it resolves in the checkout, and is prose when it does not",
+       named("GOAL: bin/cc-fixture, not bin/cc-nothing.\n", src, idx) == {"bin/cc-fixture"})
+    ok("an ordinary word is never a file, however many of them a brief has",
+       named("GOAL: the box says what could be running, and nobody has to notice by hand.\n", src, idx) == set())
+
+    FRESH = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    board({"one": {"status": "review", "branch": "track/one"},
+           "q1": {"status": "queued"}, "q2": {"status": "queued"}, "q3": {"status": "queued"},
+           "sat": {"status": "queued", "held": "the owner has not decided yet"},
+           "mine": {"status": "queued", "agent": "@1:7", "agent_at": FRESH, "branch": "track/tool"}})
+    brief_of("q1", "GOAL: what held.txt says is wrong.\n")
+    brief_of("q2", "GOAL: other.txt says the wrong thing.\n")
+    brief_of("q3", "GOAL: other.txt again, from the other end.\n")
+    brief_of("sat", "GOAL: other.txt, but nobody is to touch it yet.\n")
+    brief_of("mine", "GOAL: bin/cc-fixture, and a subagent is already on it.\n")
+    free, groups, weighed, unplaced, blind = ready(repo)
+    ok("THE ROWS THAT COULD START NOW ARE NAMED — nothing in flight is holding a file their briefs name",
+       free == ["q2", "q3"])
+    ok("…and a queued row whose brief names a file a live track is holding is not one of them", "q1" not in free)
+    ok("a row a person is sitting on and a row a live session marked as its own are not even weighed",
+       weighed == 3 and "sat" not in free and "mine" not in free)
+    ok("two free rows naming the SAME file are ONE builder's work, and come out grouped by that file",
+       groups == [(["other.txt"], ["q2", "q3"])])
+    rc, out = say()
+    ok("the printed answer carries both halves — how many could start, and which belong together",
+       rc == 0 and "2 of 3 queued rows could start now" in out and "one builder for other.txt: q2, q3" in out)
+
+    board({"a1": {"status": "queued"}, "a2": {"status": "queued"}, "a3": {"status": "queued"}})
+    brief_of("a1", "GOAL: held.txt.\n")
+    brief_of("a2", "GOAL: held.txt, and other.txt with it.\n")
+    brief_of("a3", "GOAL: other.txt.\n")
+    ok("the join is transitive: a shares with b and b with c, so all three are one builder's and not two workers'",
+       ready(repo)[1] == [(["held.txt", "other.txt"], ["a1", "a2", "a3"])])
+    ok("a caller that has already decided which rows to weigh gets exactly those weighed",
+       ready(repo, only=["a1"])[2] == 1)
+
+    board({"tool": {"status": "running", "branch": "track/tool"}, "q4": {"status": "queued"}})
+    brief_of("q4", "GOAL: cc-fixture answers the wrong question.\n")
+    ok("a row naming its file the way a brief actually writes it — the bare name — still sees the collision",
+       ready(repo)[0] == [])
+
+    board({"one": {"status": "review", "branch": "track/one"}, "q2": {"status": "queued"}})
+    brief_of("q2", "GOAL: other.txt says the wrong thing.\n\n" + MARK_A +
+             "\nIN FLIGHT (from the board, 1999-01-01T00:00Z):\n  held.txt — one [review]\n" + MARK_B + "\n")
+    ok("the IN FLIGHT block is this tool's own writing, so a brief carrying one does not collide with it",
+       ready(repo)[0] == ["q2"])
+
+    # ── A STALE `branch` FIELD IS NORMAL, and reading it as the whole answer is how a live PR held nothing at
+    # all: the ref did not resolve, the diff came back empty, and every queued row sharing that PR's files read
+    # as free (review of #367). Three ways the work is still found without the network, then the honest UNKNOWN.
+    ok("the number is read off a `pr` field written either way — bare, or as the whole URL",
+       pr_number("9") == "9" and pr_number("https://example.invalid/x/y/pull/364") == "364")
+    board({"wt": {"status": "review", "branch": "track/long-gone", "worktree": wt}, "q6": {"status": "queued"}})
+    brief_of("q6", "GOAL: wt.txt is wrong.\n")
+    byrow, unplaced = held_files(board_of(repo), skip={"q6"})
+    ok("a row whose branch field is stale is placed by its own WORKTREE, which is on the real branch",
+       byrow.get("wt") == ("review", ["wt.txt"]) and unplaced == [])
+    ok("…so the queued row that shares that file is not offered as free", ready(repo)[0] == [])
+
+    board({"pr9": {"status": "review", "branch": "track/long-gone", "pr": "9"}, "q7": {"status": "queued"}})
+    brief_of("q7", "GOAL: pulled.txt is wrong.\n")
+    byrow, unplaced = held_files(board_of(repo), skip={"q7"})
+    ok("a row with no worktree either is placed by its PR, from a refs/pull ref somebody fetched — no network",
+       byrow.get("pr9") == ("review", ["pulled.txt"]) and unplaced == [])
+    ok("…and that PR's files are held against the queued row that names one", ready(repo)[0] == [])
+
+    # ── A ROW NOTHING PLACES WITHHOLDS THE ANSWER RATHER THAN QUALIFYING IT. Its files are unknown, and FREE IS
+    # A CLAIM OF SAFETY: the row this was measured on holds two files its brief never spells, so a queued row
+    # naming one of them came back free with a general note that some row was unread as the only warning
+    # (re-review of #367). The guess its brief gives can take a row OUT of the free list; it can never put one in.
+    board({"lost": {"status": "review", "branch": "track/long-gone"}, "q8": {"status": "queued"},
+           "q9": {"status": "queued"}})
+    brief_of("lost", "GOAL: pulled.txt is wrong, and nothing here says where the work is.\n")
+    brief_of("q8", "GOAL: pulled.txt from the other end.\n")
+    brief_of("q9", "GOAL: wt.txt, which nobody is on.\n")
+    free, groups, weighed, unplaced, blind = ready(repo, net=False)
+    ok("a row IN FLIGHT that nothing places is UNKNOWN, never 'holds nothing'",
+       unplaced == ["lost"] and blind == [])
+    ok("…and NO row is called free while it is there — not the one that shares its files, nor the one that does "
+       "not: a brief's paths are a guess, and free is a claim of safety",
+       free == [] and "q9" not in free)
+    rc, out = say("--no-net")
+    ok("…and the answer names it with its goal line, so a person can go and place it by hand",
+       "none can be called free" in out and "lost (read from its brief only) — GOAL: pulled.txt is wrong" in out)
+    ok("…and says what would settle it, and gives no count that reads as room",
+       "the branch the work is really on" in out and "could start now" not in out)
+
+    board({"blind": {"status": "review", "branch": "track/long-gone"}, "qa": {"status": "queued"}})
+    brief_of("blind", "GOAL: a member session's work reaches the far end without a person.\n\n"
+                      "WHY: it is described here in prose and no filename appears anywhere in it.\n")
+    brief_of("qa", "GOAL: held.txt is wrong.\n")
+    free, groups, weighed, unplaced, blind = ready(repo, net=False)
+    ok("a row whose OWN BRIEF names no file either is blind — nothing at all is known about what it holds",
+       blind == ["blind"] and unplaced == ["blind"] and free == [])
+    rc, out = say("--no-net")
+    ok("…and the answer says which of the two it is, so the reader knows there is nothing to go on",
+       "blind (brief names no file either) — GOAL: a member session's work reaches" in out)
+    board({"blind": {"status": "review", "branch": "track/long-gone", "worktree": src},
+           "qa": {"status": "queued"}})
+    ok("…and placing it — here by a worktree that IS this repo's — brings the whole answer back",
+       ready(repo, net=False) == (["qa"], [], 1, [], []))
+    board({"blind": {"status": "review", "branch": "track/long-gone", "worktree": tmp}, "qa": {"status": "queued"}})
+    ok("a `worktree` field is as stale as a `branch` one: a directory that is not a checkout places nothing",
+       ready(repo, net=False)[3] == ["blind"])
+    board({"blind": {"status": "review", "branch": "track/long-gone", "worktree": foreign},
+           "qa": {"status": "queued"}})
+    ok("…and a checkout that is ANOTHER repository's places nothing either, whatever branch it is on",
+       ready(repo, net=False)[3] == ["blind"])
+
+    # …and GitHub is the last place a row can be placed, which is why it is asked BY DEFAULT: withholding is only
+    # worth anything if the ordinary run has something to withhold about. `--no-net` is for a run that must not
+    # leave the box, and it answers less often — that is the trade, and both halves are here.
+    gbin = os.path.join(tmp, "gbin")
+    os.makedirs(gbin, exist_ok=True)
+    open(os.path.join(gbin, "gh"), "w").write("#!/bin/sh\nprintf '%s\\n' held.txt\n")
+    os.chmod(os.path.join(gbin, "gh"), 0o755)
+    was_path = os.environ["PATH"]
+    os.environ["PATH"] = gbin + os.pathsep + was_path
+    board({"lost": {"status": "review", "branch": "track/long-gone", "pr": "https://example.invalid/x/pull/77"},
+           "qn": {"status": "queued"}, "qz": {"status": "queued"}})
+    brief_of("lost", "GOAL: nothing here says where the work is.\n")
+    brief_of("qn", "GOAL: held.txt is wrong.\n")
+    brief_of("qz", "GOAL: other.txt is wrong.\n")
+    ok("GitHub places a row no local ref could, and the answer comes back whole — the PR's files held, the row "
+       "that shares none of them free",
+       ready(repo) == (["qz"], [], 2, [], []))
+    ok("…and --no-net makes no call at all: the row is unplaced, and nothing is called free",
+       ready(repo, net=False) == ([], [], 2, ["lost"], ["lost"]))
+    os.environ["PATH"] = was_path
+
+    board({"never": {"status": "queued", "branch": "track/long-gone"}, "q8": {"status": "queued"}})
+    ok("a row nobody ever dispatched — no ref, no PR, no mark — holds nothing and is not unknown either",
+       ready(repo, only=["q8"]) == (["q8"], [], 1, [], []))
+
+    # ── A DEPENDENCY NAMED BY TRACK IS A COLLISION. Briefs say "it goes after <row> — same file" and never spell
+    # the file, so the row read as free while that row's PR held it.
+    board({"the-holder-row": {"status": "review", "branch": "track/one"},
+           "q10": {"status": "queued"}, "q11": {"status": "queued"}})
+    brief_of("q10", "GOAL: a thing.\n\nBOUNDARIES: this goes after the-holder-row - it builds on it and cannot "
+                    "be written in parallel with it.\n")
+    brief_of("q11", "GOAL: a thing that stands on its own and names nobody.\n")
+    free, groups, weighed, unplaced, blind = ready(repo)
+    ok("a brief that names another ROW inherits that row's held files, spelled out or not", free == ["q11"])
+    board({"q12": {"status": "queued"}, "q13": {"status": "queued"}})
+    brief_of("q12", "GOAL: this follows q13 and lands on top of it.\n")
+    brief_of("q13", "GOAL: other.txt says the wrong thing.\n")
+    ok("…and two QUEUED rows joined that way are one builder's work, by the file only one of them named",
+       ready(repo)[1] == [(["other.txt"], ["q12", "q13"])])
+
+    board({"one": {"status": "review", "branch": "track/one"}, "q1": {"status": "queued"}})
+    ok("NOTHING COULD START IS SILENCE — not a count, not a heading, not a line", say() == (0, ""))
+    board({"one": {"status": "merged", "branch": "track/one"}})
+    ok("…and so is a board with no row waiting at all", say() == (0, ""))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cmd_ready("no-such-board", ())
+    ok("a board that cannot be READ is not the same answer as nothing, and neither is printed as the other",
+       ready("no-such-board") is None and rc == 0 and buf.getvalue() == "")
 
     # ── the judge: it reads prose, and its three answers are different on purpose ──
     def run_judge(text, fake, force=False, machine_=False):
