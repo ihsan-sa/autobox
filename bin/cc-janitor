@@ -11,7 +11,7 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
   cc-janitor selfcheck                      the decision table + one end-to-end run, no network
     also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
 
-PER REPO, NEVER ACROSS THEM — rules 1-4. Those entry points take repo names: a tool that deletes has to be
+PER REPO, NEVER ACROSS THEM — rules 1-4 and 9. Those entry points take repo names: a tool that deletes has to be
 pointed, and the timer is pointed by a config line the owner writes. Four passes are box-wide because what
 they sweep points at itself rather than at a repo: rule 5 (a container names itself `ccbox-*`), rule 6 (a
 fixture names itself `_cc<suite><pid>`), rule 7 (a process says where it is working and what that costs) and
@@ -66,6 +66,20 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      doors onto something running, or somewhere else entirely, and a temp root is full of them; the socket
      every terminal session reaches its multiplexer through sits in a directory whose own clock stopped the day
      it was made.
+  9. a SUBAGENT WORKTREE — one the repo's own checkout has registered under `<repo>/.claude/worktrees/`, which is
+     where the harness puts a worktree it hands a subagent — that NOTHING HAS WRITTEN TO for
+     CC_JANITOR_AGENT_HOURS hours (default 4, 0 = off)  →  `git worktree remove`, which frees the branch it was
+     holding. A subagent dies with the session that spawned it and takes no cleanup with it, so these pile up
+     inside the primary checkout — 72 of them on this box on 2026-09-07 — and each one silently RESERVES A BRANCH
+     NAME: that day the fix round of PR #325 was refused ("track/… is already used by worktree at
+     .claude/worktrees/agent-aa11f878be1ed1ac1") and the landing stalled 81 minutes until a person removed it by
+     hand. THE SILENCE IS THE OWNER TEST HERE: a subagent between two tool calls has no process anywhere, so an
+     empty working directory is no evidence of death and hours of nobody writing is. Two shapes are reported and
+     left where they are: a worktree with uncommitted work, and one holding commits no remote has — except when
+     its branch's PR is MERGED and those commits predate that merge, which is not unpushed work but the ordinary
+     residue of a SQUASH merge, the form every landing here takes. Without that exception 48 of this box's 72 read
+     as unpushed and would have been reported for ever. Rule 1's worktrees under ~/.cc/worktrees belong to a TRACK
+     rather than to a subagent and are never candidates here.
 
 NOTHING IS TAKEN OUT FROM UNDER SOMETHING STILL USING IT. Before any rule removes a directory, two generic
 tests can hold it, and a held directory is REPORTED — "spared", and what holds it — never removed:
@@ -93,9 +107,9 @@ LIVENESS IS NOT DECIDED HERE. `cc-reconcile` already owns "what is really alive"
 would drift into a tool that kills working sessions. This reads its snapshot (~/.cc/state/reconcile.json,
 refreshed first when stale) and treats `live` as final. The snapshot only covers tracks the board knows, so a
 window for a track that was never on it falls back to the pane test `cc` itself uses (pane_live: the pane's
-shell has a child) — the same rule, not a second one. Both must be quiet before anything is killed. Rule 6 is
-outside all of this: a suite pid is not a track, so the snapshot has nothing to say about it and `/proc/<pid>`
-is the whole test.
+shell has a child) — the same rule, not a second one. Both must be quiet before anything is killed. Rules 6 and 9 are
+outside all of this: neither a suite pid nor a subagent is a track, so the snapshot has nothing to say about
+either, and they sweep in a pass that is holding rules 1-3 for want of a fresh one.
 
 Every action goes to ~/.cc/state/janitor.log. `--dry` prints what it would do and writes nothing at all.
 Exit: 0 done (with or without findings) · 2 usage.
@@ -115,6 +129,8 @@ NEXT = "~next"        # cc-handoff's successor window suffix; `~` is not legal i
 CONTAINER_DAYS = 7    # rule 5: a ccbox-* container stopped longer is a leftover; CC_JANITOR_CONTAINER_DAYS overrides, 0 = off
 FIXTURE = "_cc"       # rule 6: the prefix every suite's scratch names share, whichever suite made them…
 SUITE = re.compile(r"_cc[a-z]+(\d+)(?:[/~]|$)")   # …and each carries its run's pid: `_cctest<pid>`, `_ccsbx<pid>/t`
+AGENT_WT = ".claude/worktrees"   # rule 9: where the harness puts a worktree it hands a subagent, inside the repo's own checkout
+AGENT_HOURS = 4       # …and the silence that proves that subagent is gone; CC_JANITOR_AGENT_HOURS overrides, 0 = off
 ORPHAN_HOURS = 4      # rule 7: a process in a scratch workspace younger than this is somebody's run in progress
 ORPHAN_CPU = 0.10     # …and one under this share of a core, over its whole life, is a leftover costing nothing
 GRACE = 5             # …seconds between the TERM that asks it to stop and the KILL that does not ask
@@ -176,6 +192,31 @@ def branch_verdict(f):
     if f["pr"] == "?":
         return ("report", "its PR state could not be read")
     return ("report", "no PR was ever opened for it")
+
+
+def agent_wt_verdict(f):
+    """Rule 9. f: {idle, dirty, local, newest, pr, merged, branch, hours} → (rm|report|keep, why). `idle` is
+    seconds since anything in the worktree was written; `local` how many commits its HEAD carries that no
+    remote-tracking ref reaches, -1 when git would not say; `newest` when the newest of those was committed; `pr`
+    and `merged` the state of its branch's PR and the second the merge landed ('?' and 0.0 when GitHub could not
+    be asked, None when the branch has no PR). Silence first: a worktree its subagent may be sitting between two
+    tool calls in is simply young, not a finding — nothing on this box holds one while the subagent thinks."""
+    if f["hours"] <= 0 or f["idle"] < f["hours"] * 3600:
+        return ("keep", "")
+    if f["dirty"]:
+        return ("report", "uncommitted work in it")
+    if f["local"] < 0:
+        return ("report", "git would not say whether it holds commits no remote has")
+    if f["local"]:
+        # THE BOUNDARY THIS RULE IS JUDGED ON: "a worktree … holding commits that are not on any remote must
+        # survive". A squash merge leaves exactly that shape behind for work that DID land, so the one thing that
+        # answers it is a merged PR for this branch whose merge came after the commits. The merge's own second
+        # counts as after — the edge spares, because a commit this rule is unsure about is work.
+        if f["pr"] != "MERGED" or not f["merged"] or f["newest"] >= f["merged"]:
+            return ("report", f"{f['local']} commit{'' if f['local'] == 1 else 's'} on no remote"
+                              + (" that its merged PR does not contain" if f["pr"] == "MERGED" else ""))
+    return ("rm", f"nothing has written to it for {dur(f['idle'])}"
+                  + (f", and it holds {f['branch']}" if f["branch"] else ""))
 
 
 def window_verdict(f):
@@ -300,6 +341,78 @@ def dirty(wt):
     except Exception:
         return True
     return p.returncode != 0 or bool(p.stdout.strip())
+
+
+def newest_write(path):
+    """The last mtime ANYWHERE below a directory, or None when it is not there. A checkout's own top-level clock
+    stops the moment it is made, so it says nothing about whether anybody has worked in it since; the newest name
+    under it does. Links are measured, never followed — and a worktree's `.git` is a FILE pointing at the repo's
+    bookkeeping, so this walks the checkout and never the object store. That is also why running `git status` in
+    it cannot reset this clock: git writes the refreshed index into the bookkeeping directory, which is not here."""
+    try:
+        newest = os.lstat(path).st_mtime
+    except OSError:
+        return None
+    for root, dirs, files in os.walk(path, onerror=lambda e: None):
+        for name in dirs + files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, name)).st_mtime)
+            except OSError:
+                continue                                # gone while this was reading is not a write
+    return newest
+
+
+def local_only(repo_dir, head):
+    """(how many commits `head` carries that no remote-tracking ref reaches, when the newest of them was
+    committed). A question git refuses to answer is (-1, 0.0) — unknown, which rule 9 treats as work to keep."""
+    if not head:
+        return (0, 0.0)
+    try:
+        p = subprocess.run(["git", "-C", repo_dir, "log", "--format=%ct", head, "--not", "--remotes"],
+                           capture_output=True, text=True, timeout=120)
+    except Exception:
+        return (-1, 0.0)
+    if p.returncode != 0:
+        return (-1, 0.0)
+    ts = [float(x) for x in p.stdout.split() if x.strip().isdigit()]
+    return (len(ts), max(ts) if ts else 0.0)
+
+
+def agent_worktrees(repo):
+    """Rule 9's candidates, measured: [{path, name, branch, idle, dirty, local, newest}] for every worktree the
+    repo's own checkout has registered directly under `.claude/worktrees/`. Nothing else is a candidate — the
+    primary checkout is not, and neither is a track's worktree under ~/.cc/worktrees, which is rule 1's. A repo
+    git will not answer about has no candidates, which is the safe answer."""
+    dev = os.path.realpath(f"{DEV}/{repo}")
+    try:
+        p = subprocess.run(["git", "-C", dev, "worktree", "list", "--porcelain"],
+                           capture_output=True, text=True, timeout=120)
+    except Exception:
+        return []
+    if p.returncode != 0:
+        return []
+    rows, cur = [], {}
+    for line in p.stdout.splitlines() + [""]:
+        if not line.strip():
+            if cur.get("worktree"):
+                rows.append(cur)
+            cur = {}
+            continue
+        k, _, v = line.partition(" ")
+        cur[k] = v
+    hits = []
+    for w in rows:
+        path = w["worktree"].rstrip("/")
+        if os.path.dirname(path) != f"{dev}/{AGENT_WT}":
+            continue
+        written = newest_write(path)
+        if written is None:
+            continue                                    # already off disk: `git worktree prune` owns that shape
+        local, newest = local_only(dev, w.get("HEAD") or "")
+        hits.append({"path": path, "name": os.path.basename(path), "idle": max(0.0, now() - written),
+                     "branch": (w.get("branch") or "").replace("refs/heads/", ""),
+                     "dirty": dirty(path), "local": local, "newest": newest})
+    return hits
 
 
 def inside(d, p):
@@ -576,7 +689,8 @@ def pane_bare(wid):
 
 
 def pr_states(repo, net=True):
-    """{branch: MERGED|OPEN|CLOSED} for the repo, in ONE call. A branch absent from the map has no PR; when
+    """{branch: (MERGED|OPEN|CLOSED, merged_at)} for the repo, in ONE call — `merged_at` the epoch second the
+    merge landed, and 0.0 when it did not or GitHub did not say. A branch absent from the map has no PR; when
     GitHub could not be asked at all the map is None, and every branch reads '?' — an unreachable GitHub is
     not evidence about a branch, and this deletes nothing on it."""
     cwd = f"{DEV}/{repo}"
@@ -584,7 +698,7 @@ def pr_states(repo, net=True):
         return None
     try:
         p = subprocess.run(["gh", "pr", "list", "--state", "all", "--limit", str(PRMAX),
-                            "--json", "number,state,headRefName"], cwd=cwd, capture_output=True, text=True, timeout=60)
+                            "--json", "number,state,headRefName,mergedAt"], cwd=cwd, capture_output=True, text=True, timeout=60)
         rows = json.loads(p.stdout) if p.returncode == 0 else None
     except Exception:
         rows = None
@@ -592,8 +706,16 @@ def pr_states(repo, net=True):
         return None
     out = {}
     for r in rows:                                      # newest first: an older PR on the same branch never overwrites
-        out.setdefault(r.get("headRefName") or "", str(r.get("state", "")).upper())
+        out.setdefault(r.get("headRefName") or "", (str(r.get("state", "")).upper(), epoch(r.get("mergedAt"))))
     return out
+
+
+def pr_of(prs, branch):
+    """One branch's answer out of `pr_states`' map: ('?', 0.0) when GitHub could not be asked at all, and
+    (None, 0.0) when it answered and this branch has no PR."""
+    if prs is None:
+        return ("?", 0.0)
+    return prs.get(branch) or (None, 0.0)
 
 
 def remote_tracks(repo):
@@ -740,7 +862,7 @@ def paused(target):
 
 
 def sweep(repo, r, net=True, stale=STALE):
-    """One repo, the four rules in order. Rule 1 first, because `cc rm` takes the window and the board row with
+    """One repo, the five rules in order — 1-4, then 9. Rule 1 first, because `cc rm` takes the window and the board row with
     it — so rules 2 and 3 read a board that has already had the dead swept out of it."""
     # One repo, so a pause is refused here rather than in main(): both doors — the timer's `--configured` form
     # and an explicit `cc-janitor <repo>` — come through this function, and rules 5 and 6 (containers, fixtures)
@@ -784,17 +906,17 @@ def sweep(repo, r, net=True, stale=STALE):
     d = board(repo) or d
     tracks = d.get("tracks") or {}
     branches = remote_tracks(repo)
+    prs = pr_states(repo, net)      # ONE `gh pr list` for the repo: rules 2 and 9 read the same map
     if branches is None:
         # …unless the repo HAS no origin by design: a member workspace is local-only (docs/design-member-workspaces.md),
         # so "could not be listed" is the expected answer there, not news. It was reported for every member, every Sunday.
         if not os.path.exists(f"{DEV}/{repo}/.cc/member-workspace"):
             r.report(repo, f"origin/{repo}", "origin could not be listed — no branch was touched")
     else:
-        prs = pr_states(repo, net)
         for b in sorted(branches):
             track = b[len("track/"):]
             t = tracks.get(track) or {}
-            f = {"board": t.get("status", ""), "pr": "?" if prs is None else prs.get(b),
+            f = {"board": t.get("status", ""), "pr": pr_of(prs, b)[0],
                  "dirty": dirty(t.get("worktree") or f"{WTS}/{repo}/{track}")}
             verdict, why = branch_verdict(f)
             if verdict == "delete":
@@ -819,6 +941,23 @@ def sweep(repo, r, net=True, stale=STALE):
             r.act(repo, "kill", f"window {name}", why, ["tmux", "kill-window", "-t", wid])
         elif verdict == "report":
             r.report(repo, f"window {name}", why)
+
+    # 9 — the worktrees the harness left inside the repo's own checkout when their subagents died. This waits for
+    # no cc-reconcile snapshot: a subagent is not a track, so the snapshot has nothing to say about one, and the
+    # liveness that matters here is the generic hold below plus the worktree's own silence.
+    hours = agent_hours()
+    for w in agent_worktrees(repo):
+        state, merged = pr_of(prs, w["branch"])
+        verdict, why = agent_wt_verdict(dict(w, pr=state, merged=merged, hours=hours))
+        if verdict == "rm":
+            spared = r.holds.on(w["path"])              # a live cwd inside it, or a registered record pointing at it
+            if spared:
+                verdict, why = "report", f"spared {w['path']}: " + "; ".join(spared)
+        if verdict == "rm":
+            r.act(repo, "rm", f"worktree {w['path']}", why,
+                  ["git", "-C", f"{DEV}/{repo}", "worktree", "remove", w["path"]])
+        elif verdict == "report":
+            r.report(repo, f"worktree {w['path']}", why)
 
 
 def sweep_containers(r, days):
@@ -1096,6 +1235,20 @@ def orphan_hours():
         return float(ORPHAN_HOURS)
 
 
+def agent_hours():
+    """Rule 9's threshold in hours: CC_JANITOR_AGENT_HOURS, default 4. 0 turns the rule off, and so does the key
+    set but empty. A fraction is a fraction of an hour — which is how the selfcheck drives the rule against a
+    worktree it made a moment ago. A value that is not a number is the default: a typo must not take a worktree a
+    subagent is still working in."""
+    v = setting("CC_JANITOR_AGENT_HOURS", str(AGENT_HOURS)).strip()
+    if not v:
+        return 0.0
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        return float(AGENT_HOURS)
+
+
 def orphan_cpu():
     """…and the share of a core below which rule 7 reports an orphan instead of ending it: CC_JANITOR_ORPHAN_CPU,
     default 0.10. Unreadable or unset is the default — never 0, which would end every idle leftover on the box."""
@@ -1218,6 +1371,40 @@ def selfcheck():
        window_verdict(W(board="running")) == ("keep", ""))
     ok("…for every non-terminal word the board has",
        all(window_verdict(W(board=s)) == ("keep", "") for s in ("queued", "waiting", "review", "blocked")))
+
+    # rule 9 — the subagent worktree left inside the repo's own checkout
+    def A(**kw):
+        d = {"idle": 9 * 3600, "dirty": False, "local": 0, "newest": 0.0, "pr": None, "merged": 0.0,
+             "branch": "track/sample", "hours": 4}
+        d.update(kw)
+        return d
+
+    ok("a subagent worktree nothing has written to for hours is removed", agent_wt_verdict(A())[0] == "rm")
+    ok("…and the line names the branch it frees, which is the whole point of removing it",
+       "track/sample" in agent_wt_verdict(A())[1])
+    ok("A LIVE SUBAGENT'S WORKTREE SURVIVES: silence shorter than the threshold is not even a finding, because a "
+       "subagent between two tool calls holds nothing anywhere on the box",
+       agent_wt_verdict(A(idle=600)) == ("keep", ""))
+    ok("…and 0 hours turns rule 9 off altogether", agent_wt_verdict(A(hours=0)) == ("keep", ""))
+    ok("UNCOMMITTED WORK SURVIVES: the worktree is reported, never removed",
+       agent_wt_verdict(A(dirty=True))[0] == "report")
+    ok("…and so do commits no remote has", agent_wt_verdict(A(local=2, newest=100.0))[0] == "report")
+    ok("…and so does a question git would not answer", agent_wt_verdict(A(local=-1))[0] == "report")
+    ok("A SQUASH MERGE'S RESIDUE IS NOT UNPUSHED WORK: commits its own merged PR already landed hold nothing",
+       agent_wt_verdict(A(local=2, newest=100.0, pr="MERGED", merged=200.0))[0] == "rm")
+    ok("…but a commit made after that merge is work nothing landed, and holds it",
+       agent_wt_verdict(A(local=2, newest=300.0, pr="MERGED", merged=200.0))[0] == "report")
+    ok("…and a commit in the merge's own second holds it too — the edge spares, since the two are one second apart\n"
+       "           at the resolution GitHub prints and this cannot tell which came first",
+       agent_wt_verdict(A(local=2, newest=200.0, pr="MERGED", merged=200.0))[0] == "report")
+    ok("…and a merged PR whose merge time GitHub did not give is no evidence either",
+       agent_wt_verdict(A(local=2, newest=100.0, pr="MERGED", merged=0.0))[0] == "report")
+    ok("…nor is an open PR, a closed one, or no PR at all",
+       all(agent_wt_verdict(A(local=2, newest=100.0, pr=x))[0] == "report" for x in ("OPEN", "CLOSED", None)))
+    ok("…nor is a GitHub that could not be asked — an unreachable one never frees a worktree",
+       agent_wt_verdict(A(local=2, newest=100.0, pr="?"))[0] == "report")
+    ok("a worktree with nothing local and nothing dirty goes whatever its PR says, including none at all",
+       all(agent_wt_verdict(A(pr=x))[0] == "rm" for x in ("OPEN", "CLOSED", "?", None)))
 
     # rule 5 — the ccbox container
     def C(**kw):
@@ -1392,8 +1579,13 @@ def selfcheck():
                 f"@4\t{repo}/held{NEXT}\t{live.pid}\n"         # a handoff leftover with a live process → reported
                 f"@5\t{repo}/stalenext{NEXT}\t{bare.pid}\n")   # …and one without → killed, like its base track
         setwins()
-        json.dump([{"number": 1, "state": "MERGED", "headRefName": "track/gone"},
-                   {"number": 2, "state": "OPEN", "headRefName": "track/openpr"}], open(f"{th}/gh.json", "w"))
+        def iso(ago):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - ago))
+
+        json.dump([{"number": 1, "state": "MERGED", "headRefName": "track/gone", "mergedAt": iso(3 * 86400)},
+                   {"number": 2, "state": "OPEN", "headRefName": "track/openpr", "mergedAt": None},
+                   {"number": 3, "state": "MERGED", "headRefName": "track/squashed", "mergedAt": iso(3600)}],
+                  open(f"{th}/gh.json", "w"))
         # five containers on the fake docker, one of them rule 5's
         dockf = f"{th}/docker.txt"
 
@@ -1439,6 +1631,71 @@ def selfcheck():
         ok("no liveness snapshot: the deletion rules HOLD — report-only, nothing removed",
            "gone" in board_read(bj)["tracks"] and "held: no fresh liveness snapshot" in rn.stdout)
 
+        # RULE 9: the worktrees the harness leaves inside the repo's OWN checkout when a subagent dies. Built
+        # here, after the passes above, so each one stands on a branch and a history of its own rather than on
+        # anything rule 1's fixture left behind. Six worktrees, six answers.
+        adir = f"{dev}/{AGENT_WT}"
+        os.makedirs(adir, exist_ok=True)
+
+        def wt_commit(p, ago):
+            """One commit in a worktree, dated — rule 9 compares when a commit was made against when its branch's
+            PR merged, so the date is the fixture."""
+            open(f"{p}/note.txt", "w").write("what the subagent wrote\n")
+            e = dict(env, GIT_AUTHOR_DATE=iso(ago), GIT_COMMITTER_DATE=iso(ago))
+            subprocess.run(["git", "-C", p, "add", "-A"], env=e, capture_output=True, timeout=60)
+            subprocess.run(["git", "-C", p, "commit", "-qm", "work"], env=e, capture_output=True, timeout=60)
+
+        def age_tree(p, ago):
+            """Backdate everything in a checkout, top directory included: rule 9's clock is the newest write
+            ANYWHERE in it, so a fixture that is not aged whole is not aged at all."""
+            t = now() - ago
+            for root, dirs, files in os.walk(p):
+                for n_ in files + dirs:
+                    try:
+                        os.utime(os.path.join(root, n_), (t, t), follow_symlinks=False)
+                    except (OSError, NotImplementedError):
+                        pass
+            os.utime(p, (t, t))
+
+        # …one on the branch of an OPEN PR, at exactly what origin has: the shape that stalled PR #325 for 81 min
+        sh("git", "-C", dev, "worktree", "add", "-q", "-b", "track/openpr", f"{adir}/agent-pushed", "origin/track/openpr")
+        # …one holding commits NO remote has, whose branch's PR merged after they were made: a squash's residue
+        sh("git", "-C", dev, "worktree", "add", "-q", "-b", "track/squashed", f"{adir}/agent-squash", "main")
+        wt_commit(f"{adir}/agent-squash", 6 * 3600)
+        # …one holding a commit nothing landed and nobody opened a PR for: work, and it must survive
+        sh("git", "-C", dev, "worktree", "add", "-q", "-b", "track/kept", f"{adir}/agent-work", "main")
+        wt_commit(f"{adir}/agent-work", 6 * 3600)
+        # …one with a file nobody committed
+        sh("git", "-C", dev, "worktree", "add", "-q", "-b", "track/nopr", f"{adir}/agent-dirty", "origin/track/nopr")
+        open(f"{adir}/agent-dirty/scratch.txt", "w").write("not committed\n")
+        # …one a live process is standing in — nothing about it says so but the process itself
+        sh("git", "-C", dev, "worktree", "add", "-q", "--detach", f"{adir}/agent-live", "main")
+        for a_ in ("agent-pushed", "agent-squash", "agent-work", "agent-dirty", "agent-live"):
+            age_tree(f"{adir}/{a_}", 5 * 3600)          # past the 4 h default, all five
+        held = fixture("sleep", "300", cwd=f"{adir}/agent-live")
+        # …and one whose subagent may still be thinking: written to a moment ago, and never aged
+        sh("git", "-C", dev, "worktree", "add", "-q", "-b", "track/fresh", f"{adir}/agent-young", "main")
+        time.sleep(0.3)                                 # `held` needs to exist before the sweep reads /proc
+
+        def agents():
+            return sorted(n for n in os.listdir(adir) if n.startswith("agent-"))
+
+        all6 = agents()
+        ok("rule 9's six fixtures are all on disk before the sweep — an assertion about a worktree that was\n"
+           "           never built passes for the wrong reason",
+           all6 == ["agent-dirty", "agent-live", "agent-pushed", "agent-squash", "agent-work", "agent-young"])
+        rd9 = run("--dry")
+        ok("--dry previews rule 9 and removes not one worktree",
+           "would rm worktree" in rd9.stdout and f"{adir}/agent-pushed" in rd9.stdout and agents() == all6)
+        ok("RULE 9 NEEDS NO cc-reconcile SNAPSHOT — a subagent is not a track, so this pass swept them in the very "
+           "run it was holding rules 1-3 for want of one",
+           f"would rm worktree {adir}/agent-pushed" in rd9.stdout
+           and "held: no fresh liveness snapshot" in rd9.stdout)
+        ok("CC_JANITOR_AGENT_HOURS moves the line — 6 hours spares every one of them",
+           f"worktree {adir}" not in run("--dry", CC_JANITOR_AGENT_HOURS="6").stdout)
+        ok("…and 0 turns rule 9 off, as does the key set but empty — off, not float('') and not the 4 h default",
+           all(f"worktree {adir}" not in run("--dry", CC_JANITOR_AGENT_HOURS=v).stdout for v in ("0", "")))
+
         r1 = run()
         b2 = board_read(bj)["tracks"]
         ok("end to end: the track merged 5 days ago is gone — worktree, branch, board row and all",
@@ -1475,6 +1732,24 @@ def selfcheck():
            all(n in dk for n in ("ccbox-fresh", "ccbox-live", "other-old")) and "ccbox-fresh" not in r1.stdout)
         ok("end to end: a container whose stop time cannot be read is kept, and reported",
            "ccbox-odd" in dk and "container ccbox-odd" in r1.stdout)
+        left9 = agents()
+        ok("end to end: RULE 9 — a subagent worktree nobody has written to in hours is gone, and the branch of the "
+           "open PR it was holding can be checked out again, which is the stall it exists to prevent",
+           "agent-pushed" not in left9
+           and sh("git", "-C", dev, "worktree", "add", "-q", f"{th}/reuse", "track/openpr").returncode == 0)
+        ok("end to end: …and so is one holding only the commits its own merged PR squashed away",
+           "agent-squash" not in left9)
+        ok("end to end: A WORKTREE HOLDING COMMITS NO REMOTE HAS SURVIVES, with the work still in it, and is reported",
+           "agent-work" in left9 and os.path.exists(f"{adir}/agent-work/note.txt") and "on no remote" in r1.stdout)
+        ok("end to end: …and so does one with a file nobody committed",
+           "agent-dirty" in left9 and os.path.exists(f"{adir}/agent-dirty/scratch.txt")
+           and f"worktree {adir}/agent-dirty" in r1.stdout)
+        ok("end to end: A WORKTREE A LIVE PROCESS IS STANDING IN SURVIVES — the sweep says it spared it, names the "
+           "process, and says nothing about the one whose subagent may still be thinking",
+           "agent-live" in left9 and f"spared {adir}/agent-live" in r1.stdout and f"pid {held.pid}" in r1.stdout
+           and "agent-young" in left9 and "agent-young" not in r1.stdout)
+        sh("git", "-C", dev, "worktree", "remove", f"{th}/reuse")
+
         log = open(f"{th}/.cc/state/janitor.log").read()
         ok("end to end: every action is in the log, with what it was and why",
            all(s in log for s in ("rm sampleproj/gone", "delete origin/track/gone", "kill window sampleproj/ghost",
@@ -1783,7 +2058,7 @@ def selfcheck():
         os.killpg(os.getpgid(sitter8.pid), signal.SIGKILL)
         sitter8.wait(timeout=10)
 
-        for proc in (live, bare, served):               # the group, so the `sleep` under the live shell goes too
+        for proc in (live, bare, served, held):         # the group, so the `sleep` under the live shell goes too
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except OSError:
