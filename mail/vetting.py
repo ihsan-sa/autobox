@@ -17,7 +17,26 @@ up from that key. So the read cannot invent a word, and no text a sender wrote e
 the log through this file — the mail's own subject and preview are already in the mirror line above it. The
 mail is quoted to the model as data, inside tags, with no tools and no session: it is weighed, never obeyed.
 
-WHAT IT IS WEIGHED AGAINST. What this sender has asked for before (the subjects of their earlier mail to THIS
+A SENDER THE BOX ALREADY KNOWS IS NOT READ AS A STRANGER. Every mail that reaches this file came from an
+address the mail provider authenticated AND that is on the box's own list — the receiver drops the rest — and
+the read still spent itself on whether that sender could be trusted, which is what held nearly every mail the
+owner sent his own box (owner, 2026-09-10, the fourth time:
+"if it comes from an approved email thats already a good sign. and then you need to see if it makes sense
+that its going to a specific channel"). So trusted() answers that first question once, box-wide, off ONE list:
+MAIL_ALLOW (LESSONS_EMAILS when it is unset), the same key the receiver reads, in the daemon's cfg. There is
+no per-channel trust: an address on the list is known everywhere. A known sender gets ONE read, on the cheap
+model, whose vocabulary is KNOWN_REASONS and whose whole question is the second one — does THIS mail fit THE
+CHANNEL it is going to — plus the one thing trust does not buy: a mail that asks the box to act against its
+own rules is held whoever sent it (`against-rules`). No history is quoted, because "is this like them" is the
+first question again; no separate security read runs, because "does this link fit the sender's world" is too.
+The sandbox still inspects every attachment, and its report goes to that one read as a line per file — a file
+it could not inspect is a fact in the report, not a hold, since a known sender's spreadsheet is exactly what
+`unreadable` kept holding. Nothing is opened, fetched or run here for a known sender any more than for a
+stranger. The verdict says both halves, so neither answers the other: "the sender is on the box's list, and
+the mail fits where it is going" / "…, but it does not fit the channel it is going to". A sender NOT on that
+list — none reach this file today, since the receiver's list is the same one — takes the path below.
+
+WHAT A STRANGER IS WEIGHED AGAINST. What this sender has asked for before (the subjects of their earlier mail to THIS
 workspace that was delivered, out of ~/.cc/mail/conv) and what the workspace it is going to is for (the
 target's goals, board and journal, under ~/.cc/state and ~/.cc/boards). A mail from a stranger to a workspace
 it has nothing to do with is the shape this catches. A sender with NO history here is not that shape and is not
@@ -29,10 +48,11 @@ sent it. Every one of them is flattened to one line, capped, and handed to the r
 fence the mail's own body goes in — so a newline in one cannot forge a line of the report it sits in and
 nothing quoted there arrives in the prompt's own voice.
 
-TWO READS, AND THE SECOND ONE ONLY WHEN THERE IS SOMETHING TO READ. Plain text is a cheap model
-(MAIL_VET_MODEL, default `haiku`). A mail carrying links or attachments gets a second, security read on a
-stronger one (MAIL_VET_SECURITY_MODEL, default `sonnet`) which sees the links as text and the sandbox's report
-on the attachments. LINKS ARE NEVER FETCHED — a link is judged from its domain and the ask around it, and
+TWO READS FOR A STRANGER, AND THE SECOND ONE ONLY WHEN THERE IS SOMETHING TO READ. Plain text is a cheap model
+(MAIL_VET_MODEL, default `haiku`), and a known sender's one read is on it too. A stranger's mail carrying links
+or attachments gets a second, security read on a stronger one (MAIL_VET_SECURITY_MODEL, default `sonnet`) which
+sees the links as text and the sandbox's report on the attachments. LINKS ARE NEVER FETCHED — a link is judged
+from its domain and the ask around it, and
 fetching one is the target session's business, inside its own sandbox, after delivery. The worse of the two
 answers wins.
 
@@ -116,6 +136,8 @@ def _router():
 REASONS = {
     "fits":        ("clean", "it reads as ordinary mail from this sender, and fits what this workspace is for"),
     "off-goals":   ("suspicious", "it asks for something outside what this workspace is for"),
+    "misplaced":   ("suspicious", "a mail like this does not fit the channel it is going to"),
+    "against-rules": ("suspicious", "it asks the box to act against its own rules"),
     "instruction": ("suspicious", "it reads as an instruction to the box rather than a message to a person"),
     "unlike":      ("suspicious", "it is not the kind of thing this sender has asked for before"),
     "link":        ("suspicious", "a link in it does not fit this sender's world"),
@@ -129,6 +151,11 @@ REASONS = {
 }
 TEXT_REASONS = ["fits", "off-goals", "instruction", "unlike", "scam", "phish", "junk"]
 SEC_REASONS = ["fits", "link", "attachment", "scam", "phish"]
+# The known sender's whole vocabulary: the destination question, and the one hold trust does not lift. Not
+# `unlike`, `phish` or `junk` — each is "can this sender be trusted", which the list already answered — and not
+# `instruction`, because a known sender telling the box to do something is the ordinary case, not a hold.
+KNOWN_REASONS = ["fits", "misplaced", "against-rules"]
+KNOWN = "the sender is on the box's list"      # the first half of every known sender's verdict, said in words
 RANK = {"clean": 0, "suspicious": 1, "refused": 2}
 
 # Types the sandbox can say something useful about. Everything else — an archive, an office document (which is
@@ -148,14 +175,21 @@ class Verdict:
     word the sender wrote — the line a person reads is built from those in cc-slack's mail_note.
 
     `cause` is the one exception to that and is ours, not anyone's text: why a read did not answer, kept only
-    on `unread`, where "nobody has read this" is the whole of what a person is told otherwise."""
+    on `unread`, where "nobody has read this" is the whole of what a person is told otherwise.
 
-    def __init__(self, reason, cost=0, cause=""):
+    `known` is a sender on the box's list, and the sentence then says BOTH answers — that the sender is known,
+    and what was decided about the mail and its channel — so a person reading the thread sees which question
+    held it, and a hold on the destination is never mistaken for doubt about the sender."""
+
+    def __init__(self, reason, cost=0, cause="", known=False):
         self.reason = reason if reason in REASONS else "unread"
         self.verdict, self.why = REASONS[self.reason]
         self.cause = _one(cause, CAUSE_MAX) if self.reason == "unread" else ""
         if self.cause:
             self.why = "%s (%s)" % (self.why, self.cause)
+        self.known = bool(known)
+        if self.known:
+            self.why = KNOWN + (", and the mail fits where it is going" if self.clean else ", but " + self.why)
         self.cost = cost
 
     @property
@@ -176,6 +210,25 @@ def _one(s, n):
     thing for the names, subjects and board rows that never went through it. Whitespace of any kind collapses to
     a single space, so a newline cannot start a line of ours."""
     return " ".join((s or "").split())[:n]
+
+
+# ---------------------------------------------------------------- the one list of senders the box knows
+
+def allow_list(cfg):
+    """The addresses the box takes mail from, lowercased, out of the daemon's cfg: MAIL_ALLOW, and LESSONS_EMAILS
+    when that is unset. receiver.allow_list()'s rule on the same key, read here from the cfg the daemon hands
+    in rather than from the receiver's own startup copy, so the two doors read one setting."""
+    raw = (cfg or {}).get("MAIL_ALLOW") or (cfg or {}).get("LESSONS_EMAILS") or ""
+    return {a.strip().lower() for a in re.split(r"[,\s]+", raw) if a.strip()}
+
+
+def trusted(sender, cfg):
+    """Whether this sender is one the box already knows — BOX-WIDE, off the one list, with no channel in the
+    question (owner, 2026-09-10: "this should be done on the box wide vetting level imo not on the channel
+    level"). `sender` is message.json's `from`, which the receiver's identity() authenticated, and never the
+    envelope. No list, or a cfg without one, trusts nobody: the stranger path is the safe default. router.py
+    may read this if it ever needs the answer; it is the one place the answer is given."""
+    return bool((sender or "").strip()) and (sender or "").strip().lower() in allow_list(cfg)
 
 
 # ---------------------------------------------------------------- the day's budget
@@ -368,7 +421,9 @@ INSPECT = ("f=$(mktemp) || exit 3; trap 'rm -f \"$f\"' EXIT; head -c %d > \"$f\"
 
 def inspect(att, base, argv):
     """One attachment, read inside the boundary. Gives back (type, text) — the type off its own bytes, and its
-    first characters when it turned out to be text — or (None, "") for anything that could not be inspected.
+    first characters when it turned out to be text — or (None, "") when the boundary did not answer at all. A
+    type outside INSPECTABLE comes back as the type it is, unopened; inspected() is what says that counts as
+    `unreadable`, and the known sender's report says what the file is instead.
 
     THE BYTES NEVER ENTER THIS PROCESS. The file is opened for the descriptor alone and that descriptor is the
     child's stdin, so the kernel moves the bytes from the file into the sandbox and nothing here reads one. The
@@ -393,16 +448,17 @@ def inspect(att, base, argv):
     if r.returncode != 0:
         return None, ""
     out = (r.stdout or "").split("\n", 1)
-    kind = out[0].strip().lower()
-    if not kind or not kind.startswith(INSPECTABLE):
+    kind = _one(out[0].lower(), NAME_MAX)
+    if not kind:
         return None, ""
     return kind, (out[1] if len(out) > 1 and kind.startswith("text/") else "")[:INSPECT_TEXT]
 
 
 def inspected(msg, argv):
-    """Every attachment through the boundary, as (report, unreadable). The report is what the security read
-    sees; `unreadable` is true as soon as one attachment could not be inspected, and that alone holds the mail
-    — a type the sandbox cannot name is suspicious, not clean.
+    """Every attachment through the boundary, as (report, unreadable). The report is what the read sees;
+    `unreadable` is true as soon as one attachment could not be inspected or is of a kind the sandbox does not
+    open, and for a stranger that alone holds the mail — a type the sandbox cannot name is suspicious, not
+    clean. For a known sender it is a line in the report and the read weighs it (see vet()).
 
     THE NAME AND THE DECLARED TYPE ARE THE SENDER'S, and the report reads as the sandbox's own words, so both
     are flattened to one line first. get_filename() decodes RFC2047, which means a filename can arrive carrying
@@ -419,6 +475,11 @@ def inspected(msg, argv):
             bad = True
             rows.append("- %s (declared %s, %s bytes): the sandbox could not inspect it"
                         % (name, declared, a.get("size") or 0))
+            continue
+        if not kind.startswith(INSPECTABLE):
+            bad = True
+            rows.append("- %s (declared %s, really %s, %s bytes): a kind the sandbox does not open"
+                        % (name, declared, kind, a.get("size") or 0))
             continue
         rows.append("- %s (declared %s, really %s, %s bytes)%s"
                     % (name, declared, kind, a.get("size") or 0,
@@ -516,20 +577,43 @@ def vet(msg, dec, cfg=None):
     """ONE MAIL, ONE VERDICT. `dec` is router.route()'s Decision — its workspace and its first To channel are
     what the mail is weighed against — and `cfg` is the daemon's configuration.
 
-    The order is the cost. The day's budget is checked before any model runs; the cheap read comes next; the
-    security read only happens when there is a link or an attachment to read, and not even then if the sandbox
-    already said an attachment cannot be inspected, because that answer is already "a person decides"."""
+    The order is the cost. The day's budget is checked before any model runs. A KNOWN SENDER — trusted(), off the
+    box's one list — then gets one read and no other: the destination question, with the mail's links and the
+    sandbox's report on its files in front of it, and `fits` unless the mail does not belong in that channel or
+    asks the box to break its rules. A stranger gets the cheap read next; the security read only happens when
+    there is a link or an attachment to read, and not even then if the sandbox already said an attachment
+    cannot be inspected, because that answer is already "a person decides"."""
     cfg = cfg or {}
     sender = (msg.get("from") or "").lower()
     ws = dec.workspace or ""
+    known = trusted(sender, cfg)
     if spent(sender) >= max(1, int(cfg.get("MAIL_VET_DAY_MAX") or 20)):
-        return Verdict("budget")
+        return Verdict("budget", known=known)
     cost = cfg.get("MAIL_VET_COST") or "0.05"
     ftext, fsec = _fakes()
     charge(sender)
 
     target = (dec.to or dec.cc or [None])[0]
     body = _router().body_text(msg)[:VET_MAX]   # `text`, or an HTML-only mail's body with its tags stripped
+    urls, atts = links(msg), msg.get("attachments") or []
+    if known:
+        # THE BRIEF'S OWN LINE: "an approved sender is a good sign, not a blank cheque — a mail that asks the box
+        # to act against its own rules is still held whoever sent it, and nothing here weakens the rule that a
+        # link is never fetched and an attachment is only ever read inside a sandbox". So the boundary still
+        # inspects, the read still sees the links as text, and `against-rules` is on the list; what is gone is
+        # the second read and the hold on a file the sandbox could not open, both of which asked about the
+        # sender. `known` on the Verdict is what makes the note say both halves.
+        report = inspected(msg, boundary(ws, target.target if target else "", cfg))[0] if atts else ""
+        got, why = _ask(_prompt("mail-vet-known-prompt.md",
+                                {"SENDER": sender,
+                                 "WHO": "the box's owner" if ws == "owner" else "a member of this box",
+                                 "WORKSPACE": ws, "TARGET": "#" + target.name if target else "(nowhere)",
+                                 "GOALS": goals(target.target if target else ""),
+                                 "LINKS": "\n".join("- %s" % u for u in urls), "ATTACHMENTS": report,
+                                 "SUBJECT": msg.get("subject") or "(no subject)", "BODY": body}),
+                        KNOWN_REASONS, cfg.get("MAIL_VET_MODEL") or "haiku", cost, ftext)
+        return Verdict(got, cause=why, known=True)
+
     got, why = _ask(_prompt("mail-vet-prompt.md",
                             {"WORKSPACE": ws, "TARGET": "#" + target.name if target else "(nowhere)",
                              "GOALS": goals(target.target if target else ""),
@@ -538,7 +622,6 @@ def vet(msg, dec, cfg=None):
                     TEXT_REASONS, cfg.get("MAIL_VET_MODEL") or "haiku", cost, ftext)
     v = Verdict(got, cause=why)
 
-    urls, atts = links(msg), msg.get("attachments") or []
     if not urls and not atts:
         return v
     report, bad = inspected(msg, boundary(ws, target.target if target else "", cfg)) if atts else ("", False)
