@@ -7,14 +7,15 @@
                                       it in every session; the target comes from the session cwd unless given:
                                       ~/dev/<repo> → <repo>, a track worktree (.cc/track) → <repo>/<track>, ~/dev or ~ → box
   cc-slack inject [--no-start] <target> "text"      push a message into a session as if it came from Slack (tests/scripts)
-  cc-slack post [-c CHANNEL] [--thread TS] [--route TITLE] [--mention] [--major] "text"   post as the bot (cc-notify uses --route).
+  cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--mention] [--major] "text"   post as the bot (cc-notify uses --route).
+                                      --ts = the message this answers; naming a mail's line in its mirror thread mails the post
                                       --mention = the top of the notification ladder: the MAIN channel (never the -updates
                                       lane) and an @-mention of the owner. For a blocked decision only — see ~/COMMS.md
                                       -c '#<repo>' takes a question ('?'), a decision (❓ / an @-mention) or a MAJOR update
                                       — --major (alias --main): something that changes what the owner would do today.
                                       Anything else is routine → #<repo>-updates, one stderr line says so; --thread stays put
-  cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--title T] [-m "text"]   upload a file as the bot;
-                                      --thread lands it in that thread (default target: DM the owner); Web API only
+  cc-slack post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m "text"]   upload a file as the bot;
+                                      --thread lands it in that thread (default target: DM the owner); --ts as above; Web API only
   cc-slack post-approval [--force|--landed] [--print-chat] <repo> <pr-number|url>   "[repo] PR #n: title — url" into #approvals; the owner's :+1:
                                       there squash-merges it (daemon). One card per PR: a second caller finds the first and does nothing
                                       (--force re-posts). A MERGED/CLOSED PR never gets one: its card is edited to "landed ✓" (--landed: on the caller's word)
@@ -729,16 +730,19 @@ def outbox(kind, chat, thread, text):
         f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{kind}\t{chat}\t{thread or ''}\t{text.replace(chr(10), ' ')[:2000]}\n")
 
 
-def post(cfg, chat, text, thread=None, username=None, mail=True):
+def post(cfg, chat, text, thread=None, username=None, mail=True, ts=None):
     """Post mrkdwn text (chunked) as the bot; without a token it only lands in the outbox log. Returns (n_chunks, first_ts).
 
     `mail` is milestone 4's tap. Everything the box says goes through here — `cc-slack post`, the member
     socket's `reply` verb, a session's own reply tool, Daemon.say — and a PERSON'S Slack message never does, so
     a post in a mail's mirror thread travelling on to the people that mail carried is decided here and nowhere
     else (core/mail/outbound.py). It is TRUE here because the callers of post() ARE the box's answers to the
-    sender: a session's reply, its progress, its result. It is FALSE in Daemon.say, whose callers are the
-    daemon's own plumbing, and mail=False here besides at the mail door's own lines — the mirror line, the move
-    offer, a hold's answer, and outbound's "not sent" notice, which would otherwise recurse.
+    sender: a session's reply, its result. It is FALSE in Daemon.say, whose callers are the daemon's own
+    plumbing, and mail=False here besides at the mail door's own lines — the mirror line, the move offer, a
+    hold's answer, and outbound's "not sent" notice, which would otherwise recurse.
+    `ts` is the message this post ANSWERS — the reply tool's own `ts` — and the door reads the medium off it:
+    only a post answering a message that arrived by mail travels; one answering the owner's Slack message in
+    that thread, or answering nothing (progress, a note), stays in Slack (owner, 2026-09-10).
     Nothing is tapped when nothing reached Slack: the two returns below are before it."""
     outbox("post", chat, thread, text)
     tok = cfg.get("SLACK_BOT_TOKEN")
@@ -750,7 +754,7 @@ def post(cfg, chat, text, thread=None, username=None, mail=True):
         r = api("chat.postMessage", tok, channel=chat, text=c, thread_ts=thread, username=uname, unfurl_links="false", unfurl_media="false")
         first = first or r.get("ts")
     if mail:
-        mail_tap(cfg, chat, thread, text=text)
+        mail_tap(cfg, chat, thread, text=text, ts=ts)
     return len(chunks(text)), first
 
 
@@ -870,15 +874,16 @@ def voice_text(path, timeout=VOICE_MAX):
     return d if (d.get("transcript") or "").strip() else None
 
 
-def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True):
+def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True, ts=None):
     """Upload one file to `to` (a chat id, #name, U… user, or None for the owner's DM), optionally into `thread`:
     files.getUploadURLExternal -> POST the bytes -> files.completeUploadExternal (files.upload is deprecated).
     Same contract as post(): without a token, or to "local", it ONLY lands in the outbox log — a caller is never told
     a file was sent when it was not. Returns (file_id, chat); file_id is None when nothing reached Slack.
 
-    `mail` is post()'s tap, for a file: one posted in a mail's mirror thread travels on as an attachment, with
-    `comment`, as it was written, as the text beside it. A file the workspace does not own, or one over the byte cap, travels as a
-    line naming it instead — core/mail/outbound.py decides which, and this file never opens it twice."""
+    `mail` is post()'s tap, for a file: one posted in a mail's mirror thread IN ANSWER TO A MAIL (`ts`, post()'s
+    rule) travels on as an attachment, with `comment`, as it was written, as the text beside it. A file the
+    workspace does not own, or one over the byte cap, travels as a line naming it instead — core/mail/outbound.py
+    decides which, and this file never opens it twice."""
     if os.path.isdir(path):
         raise UploadRefused(f"{path} is a directory — send one file, not a folder")
     if not os.path.isfile(path):
@@ -912,7 +917,7 @@ def upload_file(cfg, path, to, thread=None, comment=None, title=None, mail=True)
         # `said`, not `comment`: by here linkify_mentions has turned @ada into <@U…> and mrkdwn has rewritten
         # the markup for Slack, and a raw Slack id is no use to whoever reads it at the other end. post() taps
         # its text as written for the same reason — "the reply text as written" is one rule, not two.
-        mail_tap(cfg, to, thread, text=said, path=path)
+        mail_tap(cfg, to, thread, text=said, path=path, ts=ts)
     return done["files"][0]["id"], to
 
 
@@ -3722,13 +3727,14 @@ def mail_outbound():
     return outbound
 
 
-def mail_tap(cfg, chat, thread, text="", path=""):
+def mail_tap(cfg, chat, thread, text="", path="", ts=None):
     """One post that has already reached Slack, offered to milestone 4. `thread` empty is every top-level post
     on this box, and is out before the import — the mail door is not loaded to decide that a post starting a
-    thread is not a reply in one.
+    thread is not a reply in one. `ts` is the message the post answers, handed on as it is: the door decides
+    whether that message came by mail (outbound.by_mail), this function does not.
 
-    outbound.send() answers "" for everything that is not the box replying in a mail's mirror thread, which is
-    almost every post here; a line back means it did NOT go out, and that line is posted in the thread with
+    outbound.send() answers "" for everything that is not the box answering a mail in its mirror thread, which
+    is almost every post here; a line back means it did NOT go out, and that line is posted in the thread with
     mail=False. False is not an exception to the rule at the top of post(): the line IS the notice, and tapping
     it would ask outbound to carry the news that outbound could not carry anything.
 
@@ -3737,7 +3743,7 @@ def mail_tap(cfg, chat, thread, text="", path=""):
     if not (chat and thread):
         return
     try:
-        note = mail_outbound().send(cfg, chat, thread, text=text, path=path)
+        note = mail_outbound().send(cfg, chat, thread, text=text, path=path, ts=ts or "")
     except Exception as e:
         log(f"mail out: {e!r}")
         return
@@ -4151,7 +4157,7 @@ class Daemon:
         if verb == "reply":
             text = str(first.get("text") or ""); thread = first.get("thread_ts") or None; ts = first.get("ts") or ""
             missed = unresolved_mentions(self.cfg, text, chat if chat != "local" else None)
-            n, _ = post(self.cfg, chat, text, thread, username=display_name(target))
+            n, _ = post(self.cfg, chat, text, thread, username=display_name(target), ts=ts or None)
             if ts:
                 react(self.cfg, chat, ts, "eyes", remove=True)
             root = thread or ts
@@ -4176,7 +4182,8 @@ class Daemon:
             roots = (f"{DEV}/{h}", f"{HOME}/.cc/worktrees/{h}", f"{member_dir(h)}/files")
             if not any(path.startswith(r + "/") for r in roots):
                 return {"ok": False, "error": f"{first.get('path')} is not visible outside the boundary — put it under ~/dev/{h} first"}
-            fid, _ = upload_file(self.cfg, path, chat, first.get("thread_ts") or None, comment=first.get("text") or None, title=first.get("title") or None)
+            fid, _ = upload_file(self.cfg, path, chat, first.get("thread_ts") or None, comment=first.get("text") or None, title=first.get("title") or None,
+                                 ts=str(first.get("ts") or "") or None)
             if first.get("ts"):
                 react(self.cfg, chat, str(first["ts"]), "eyes", remove=True)
             if not fid:
@@ -5292,6 +5299,12 @@ class Daemon:
             posted[pl.chat] = (ts, ts)
             rec.setdefault("roots", []).append({"chat": pl.chat, "ts": ts, "name": pl.name, "target": pl.target,
                                                 "alias": pl.alias, "role": "to" if pl in dec.to else "cc"})
+        # WHICH LINES IN THE THREAD ARE A MAIL'S, kept on the record for milestone 4: a session's reply names
+        # the message it answers, and only one answering a line written here goes back out as mail —
+        # outbound.by_mail reads this list. Written before either save below, so a held mail's line counts
+        # once it is delivered too.
+        for c, (_root, at) in posted.items():
+            rec.setdefault("mirrors", []).append({"chat": c, "ts": at, "mail": mail_id})
         # "#name" -> [chat, root ts] for every thread this mail now sits in: what the receiver channel's reply
         # links to. It is the sorter's own table, so it carries only channels the mirror line actually reached.
         threads = {"#" + r["name"]: [r["chat"], posted[r["chat"]][0]]
@@ -7875,7 +7888,9 @@ TOOLS = [
          "chat_id": {"type": "string", "description": "chat_id from the inbound <channel> tag"},
          "text": {"type": "string"},
          "thread_ts": {"type": "string", "description": "thread_ts from the tag (reply in that thread)"},
-         "ts": {"type": "string", "description": "ts of the message being answered (its 👀 ack is cleared)"},
+         "ts": {"type": "string", "description": "ts of the message being answered (its 👀 ack is cleared). It also picks the medium: "
+                                                 "answering a message that arrived by mail (via=\"mail\" in its tag) sends this reply "
+                                                 "to the sender by mail as well; answering a Slack message, or leaving ts off, stays in Slack"},
          "needs_owner": {"type": "boolean", "description": "true = you are STOPPED until they answer (a decision, an approval, a "
                                                            "choice only they can make). A question you are not waiting on is false."}},
          "required": ["chat_id", "text"]}},
@@ -7890,7 +7905,8 @@ TOOLS = [
          "thread_ts": {"type": "string", "description": "thread_ts from the tag (the file lands in that thread)"},
          "text": {"type": "string", "description": "the message that goes with the file — say what it shows"},
          "title": {"type": "string", "description": "title for the file in Slack (default: its filename)"},
-         "ts": {"type": "string", "description": "ts of the message being answered (its 👀 ack is cleared)"}},
+         "ts": {"type": "string", "description": "ts of the message being answered (its 👀 ack is cleared). As for reply: answering a "
+                                                 "message that arrived by mail sends the file to the sender as an attachment too"}},
          "required": ["path", "chat_id"]}},
     {"name": "react",
      "description": "Add an emoji reaction to a Slack message (name, e.g. white_check_mark, eyes, +1). On one of the OWNER's messages this is your ANSWER when no text is needed — +1 yes, -1 no, white_check_mark done, x can't, thinking_face unclear; the thread counts as handled and its 👀 comes off. eyes only means 'received'. Add 🏁 to a thread's root ONLY when the owner asks you to close it — never on your own judgment (the owner concludes threads).",
@@ -8035,7 +8051,8 @@ class Channel:
                 # sent as code (never as a plain "@Name" that reads like a ping) and named back to this session in
                 # the tool result. Silence here is what let an escalation reach nobody with the sender none the wiser.
                 missed = unresolved_mentions(self.cfg, a.get("text", ""), chat if chat != "local" else None)
-                n, _ = post(self.cfg, chat, a.get("text", ""), a.get("thread_ts") or None, username=display_name(self.target, self.alias))
+                n, _ = post(self.cfg, chat, a.get("text", ""), a.get("thread_ts") or None, username=display_name(self.target, self.alias),
+                            ts=a.get("ts") or None)
                 if a.get("ts"):
                     react(self.cfg, chat, a["ts"], "eyes", remove=True)   # V2: the 👀 comes off, nothing replaces it
                 root = a.get("thread_ts") or a.get("ts")
@@ -8054,7 +8071,8 @@ class Channel:
                 try:
                     path = check_upload_path(a.get("path", ""))
                     fid, _ = upload_file(self.cfg, path, chat, a.get("thread_ts") or None,
-                                         comment=a.get("text") or None, title=a.get("title") or None)
+                                         comment=a.get("text") or None, title=a.get("title") or None,
+                                         ts=a.get("ts") or None)
                 except UploadRefused as e:
                     return f"not sent — {e}", True
                 if a.get("ts"):
@@ -8342,7 +8360,7 @@ def cmd_setup(argv):
 
 def cmd_post(argv):
     cfg = load_cfg()
-    chan = thread = route = None
+    chan = thread = route = ts = None
     mention = major = False
     args = []
     i = 0
@@ -8355,6 +8373,8 @@ def cmd_post(argv):
             chan = argv[i + 1]; i += 2
         elif argv[i] == "--thread":
             thread = argv[i + 1]; i += 2
+        elif argv[i] == "--ts":   # the message this answers: the reply tool's own `ts`, by hand (the mail door reads it)
+            ts = argv[i + 1]; i += 2
         elif argv[i] == "--route":
             route = argv[i + 1]; i += 2
         else:
@@ -8362,7 +8382,7 @@ def cmd_post(argv):
     text = " ".join(args) if args else sys.stdin.read()
     if os.environ.get("CC_MEMBER_SANDBOX") == "1":   # inside a boundary (cc-guard's 🔐 line, cc's budget notice): the member socket, scoped
         try:
-            r = sock_request({"reply": chan or "", "text": text, "thread_ts": thread}, timeout=60)
+            r = sock_request({"reply": chan or "", "text": text, "thread_ts": thread, "ts": ts or ""}, timeout=60)
         except Exception as e:
             print(f"cc-slack post: the member socket did not answer ({e.__class__.__name__})", file=sys.stderr); return 3
         print("" if r.get("ok") else r.get("error", ""), file=sys.stdout if r.get("ok") else sys.stderr); return 0 if r.get("ok") else 3
@@ -8407,20 +8427,21 @@ def cmd_post(argv):
         # notify for real and no caller here knows the owner's handle. Unpaired, the post still goes to the main lane.
         text = f"<@{cfg['SLACK_OWNER_ID']}> {text}"
     missed = unresolved_mentions(cfg, text, chan)
-    n, ts = post(cfg, chan, text, thread)
-    print(ts or "")
+    n, posted_ts = post(cfg, chan, text, thread, ts=ts)
+    print(posted_ts or "")
     if missed:                                       # stderr, so a caller piping the ts is unaffected and a human still sees it
         print("cc-slack:" + mention_warning(missed).strip(), file=sys.stderr)
     return 0
 
 
 def cmd_post_file(argv):
-    """post --file PATH [--to C…|U…|#name] [--thread TS] [--title T] [-m TEXT] — the upload_file() helper, the same one the
-    channel server's `file` tool uses. Default target: the owner's DM. Pure Web API. Exit 2 usage/refused, 3 no token, 1 API error."""
-    usage = "cc-slack post --file <path> [--to <channel-or-user-id|#name>] [--thread <ts>] [--title <t>] [-m|--text <msg>]"
-    cfg = load_cfg(); opt = {"--file": None, "--to": None, "--thread": None, "--title": None, "-m": None}
+    """post --file PATH [--to C…|U…|#name] [--thread TS] [--ts TS] [--title T] [-m TEXT] — the upload_file() helper, the same
+    one the channel server's `file` tool uses; --ts is the message the file answers, as the tool's own `ts`. Default target:
+    the owner's DM. Pure Web API. Exit 2 usage/refused, 3 no token, 1 API error."""
+    usage = "cc-slack post --file <path> [--to <channel-or-user-id|#name>] [--thread <ts>] [--ts <ts>] [--title <t>] [-m|--text <msg>]"
+    cfg = load_cfg(); opt = {"--file": None, "--to": None, "--thread": None, "--ts": None, "--title": None, "-m": None}
     i = 0
-    while i + 1 < len(argv) and argv[i] in ("--file", "--to", "--thread", "--title", "-m", "--text"):
+    while i + 1 < len(argv) and argv[i] in ("--file", "--to", "--thread", "--ts", "--title", "-m", "--text"):
         opt["-m" if argv[i] == "--text" else argv[i]] = argv[i + 1]; i += 2
     path = opt["--file"]
     if i != len(argv) or not path or not os.path.isfile(path):
@@ -8428,7 +8449,7 @@ def cmd_post_file(argv):
     if not cfg.get("SLACK_BOT_TOKEN"):
         print("cc-slack post --file: no SLACK_BOT_TOKEN", file=sys.stderr); return 3
     try:
-        fid, to = upload_file(cfg, path, opt["--to"], opt["--thread"], comment=opt["-m"], title=opt["--title"])
+        fid, to = upload_file(cfg, path, opt["--to"], opt["--thread"], comment=opt["-m"], title=opt["--title"], ts=opt["--ts"])
     except UploadRefused as e:
         print(f"cc-slack post --file: {e}", file=sys.stderr); return 2
     except Exception as e:
@@ -9471,7 +9492,7 @@ def cmd_selfcheck():
             try:
                 globals()["api"] = api2
                 globals()["find_channel"] = lambda cfg, n: ("CAPPR", True)
-                globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: posted.append(text) or (1, "9.9")
+                globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: posted.append(text) or (1, "9.9")
                 subprocess.run = lambda cmd, **kw: type("R", (), {"returncode": 0, "stderr": "",
                                                                   "stdout": json.dumps({"title": "t", "url": "https://x/7"})})()
                 with contextlib.redirect_stdout(io.StringIO()) as o1:
@@ -10957,7 +10978,7 @@ def cmd_selfcheck():
     real_rc, real_post = resolve_channel, post
     try:
         globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else f"C-{name}"
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: posted16.append(chat) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: posted16.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL": "#fallback"}
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "[myrepo] PR #3: fix things", "merge failed"])
@@ -10972,7 +10993,7 @@ def cmd_selfcheck():
     postedA = []
     try:
         globals()["resolve_channel"] = lambda cfg, name: "C-alerts" if name == "alerts" else None
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedA.append(chat) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedA.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_CHANNEL": "#fallback"}
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "box boot", "Up at 05:54Z"])
@@ -10983,7 +11004,7 @@ def cmd_selfcheck():
     postedB = []
     try:
         globals()["resolve_channel"] = lambda cfg, name: {"alerts": "C-alerts"}.get(name, "C-" + name)   # every channel exists, incl. #<hostname>
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedB.append(chat) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedB.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
         host = socket.gethostname().split(".")[0]
         rbox = BOX; alt = f"{host}-alt"              # CC_BOX set to something that is NOT this host's name: cc-notify
@@ -11003,7 +11024,7 @@ def cmd_selfcheck():
     postedC = []
     try:                                                     # …and a box with no lane yet: the digest still reaches #alerts
         globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else ("C-alerts" if name == "alerts" else "C-" + name)
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedC.append(chat) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedC.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
         globals()["BOX"] = alt
         with contextlib.redirect_stdout(io.StringIO()):
@@ -11016,7 +11037,7 @@ def cmd_selfcheck():
     postedL = []
     try:                                                     # THE LADDER (owner, 2026-09-01): rung 1 vs rung 5, told apart only by --mention
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedL.append((chat, text)) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedL.append((chat, text)) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "[myrepo] blocked", "--mention", "which database do I restore?"])
@@ -11029,7 +11050,7 @@ def cmd_selfcheck():
     postedM = []
     try:                                                     # …and an unpaired owner still gets the main lane: a rung-1 post is never ambient
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedM.append((chat, text)) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedM.append((chat, text)) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
         with contextlib.redirect_stdout(io.StringIO()):
             cmd_post(["--route", "[myrepo] blocked", "--mention", "which database do I restore?"])
@@ -11041,7 +11062,7 @@ def cmd_selfcheck():
     real_um = unresolved_mentions
     try:                                                     # THE MAIN LANE IS THE OWNER'S (owner, 2026-09-01): a question, a decision or a major
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedG.append(chat) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedG.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
         globals()["unresolved_mentions"] = lambda cfg, text, chat=None: []   # the fake token cannot ask users.list; the warning path has its own cases
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errG):
@@ -11070,7 +11091,7 @@ def cmd_selfcheck():
     postedH = []
     try:                                                     # …and a repo with no twin yet keeps its routine post: the gate redirects, it never drops
         globals()["resolve_channel"] = lambda cfg, name: None if name.endswith(f"-{UPDATES}") else f"C-{name}"
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedH.append(chat) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedH.append(chat) or (1, "1.0")
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             cmd_post(["-c", "#myrepo", "routine, no twin yet"])
@@ -11772,7 +11793,7 @@ def cmd_selfcheck():
         globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
         try:
             with contextlib.redirect_stdout(io.StringIO()) as cli_out:
-                rc_cli = cmd_post_file(["--file", ok_file, "--to", "#myrepo", "--thread", "1700.1",
+                rc_cli = cmd_post_file(["--file", ok_file, "--to", "#myrepo", "--thread", "1700.1", "--ts", "1700.1",
                                         "--title", "carpet", "-m", "the rectified carpet"])
         finally:
             globals()["upload_file"], globals()["load_cfg"] = real_upload, real_cfg_u
@@ -11787,10 +11808,11 @@ def cmd_selfcheck():
               (fid_dm, to_dm) == ("F123", "DOWNER") and calls[0][0] == "conversations.open"
               and calls[0][1]["users"] == "UOWNER"
               and dict(calls)["files.completeUploadExternal"]["channel_id"] == "DOWNER")
-        check("upload: `post --file --thread` goes through the very same upload_file() — one three-step upload, not two",
+        check("upload: `post --file --thread --ts` goes through the very same upload_file() — one three-step upload, not "
+              "two — and --ts, the message the file answers, is forwarded as the file tool's own `ts`",
               rc_cli == 0 and len(cli_args) == 1
               and cli_args[0][0][1:] == (ok_file, "#myrepo", "1700.1")
-              and cli_args[0][1] == {"comment": "the rectified carpet", "title": "carpet"}
+              and cli_args[0][1] == {"comment": "the rectified carpet", "title": "carpet", "ts": "1700.1"}
               and "ok file=F9 channel=C9" in cli_out.getvalue())
         # -- reply/react are untouched by any of this ------------------------------------------
         chR = Channel("myrepo"); chR.cfg = {}
@@ -11866,7 +11888,7 @@ def cmd_selfcheck():
     chL = Channel("myrepo"); chL.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
     real_postL = globals()["post"]
     try:
-        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: sentL.append((chat, text)) or (1, "1.0")
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: sentL.append((chat, text)) or (1, "1.0")
         globals()["api"] = lambda method, token, **kw: {"ts": "1"}
         chL.call("reply", {"chat_id": "C-lane", "text": "still building", "thread_ts": "5.0", "ts": "5.1"})
         chL.call("reply", {"chat_id": "C-main", "text": "yes", "thread_ts": "6.0", "ts": "6.1"})
@@ -14971,7 +14993,7 @@ def cmd_selfcheck():
     os.makedirs(f"{DEV}/myrepo", exist_ok=True); os.makedirs(f"{DEV}/other", exist_ok=True)
     postedMS, reactedMS, ranMS = [], [], []
     real_post_ms, real_react_ms, real_run_ms, real_api_ms = post, react, EFFECTS.run_impl, globals()["api"]
-    globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True: postedMS.append((chat, text, username)) or (1, "5.5")
+    globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedMS.append((chat, text, username)) or (1, "5.5")
     globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: reactedMS.append((chat, ts, name, remove, k.get("thread")))
     globals()["api"] = lambda method, token, **kw: {"messages": [], "channel": {"name": "?"}}
     EFFECTS.run_impl = lambda cmd, **kw: ranMS.append(list(cmd)) or types.SimpleNamespace(returncode=0, stdout="worker started", stderr="")
@@ -15604,6 +15626,13 @@ def cmd_selfcheck():
               and [h[0] for h in mhanded] == ["mem", "mem/site"]
               and [m["thread_ts"] for _, _, m, _, _ in mhanded] == [rootsA["C-MEM"], rootsA["C-SITE"]]
               and [m["ts"] for _, _, m, _, _ in mhanded] != [rootsA["C-MEM"], rootsA["C-SITE"]])
+        recB = R.conv_by_root("C-MEM", rootsA["C-MEM"])
+        mirB = {(m["chat"], m["ts"], m["mail"]) for m in recB.get("mirrors") or []}
+        check("mail: every mail's mirror line is on the record as (chat, ts, mail) — M1's roots and M2's lines "
+              "under them, the very ts each session was handed — which is what the outbound door reads to tell "
+              "a reply to a mail from a reply to the owner in the same thread (owner, 2026-09-10)",
+              mirB == {(c, ts, "M1") for c, ts in rootsA.items()} | {(c, ts, "M2") for c, _, _, ts in msaid}
+              and all((m["chat_id"], m["ts"], "M2") in mirB for _, _, m, _, _ in mhanded))
 
         # (c) THE MOVE, on a conversation of its own so the target is somewhere it is not already.
         mail_write("N1", to=["mem@box.example"], subject="the invoice")
@@ -16140,14 +16169,15 @@ def cmd_selfcheck():
         # tap runs after Slack has the message and never before it, that the door's answer is posted in the
         # thread without being offered back to the door, and that a broken door costs the copy and not the
         # reply. So the door itself is a stand-in through these cases and the real one is never opened.
-        taps, sent = [], []
+        taps, sent, answered = [], [], []
 
         class FakeOut:
             """core/mail/outbound.py as post() sees it: send() takes the post and answers "" or one line."""
             note = ""
 
-            def send(self, cfg, chat, thread, text="", path="", now=None):
+            def send(self, cfg, chat, thread, text="", path="", now=None, ts=""):
                 taps.append((chat, thread, text, path))
+                answered.append(ts)
                 return self.note
 
         class BrokenOut:
@@ -16217,6 +16247,18 @@ def cmd_selfcheck():
                   "which is why a resolved @handle leaves as the name and not as a raw Slack id",
                   taps == [("C-MEM", "9.0", "here is the **finished** lesson", tapfile)]
                   and [x[2] for x in sent] == ["here is the *finished* lesson", "a note for the channel"])
+
+            # THE MESSAGE A POST ANSWERS REACHES THE DOOR AS IT WAS GIVEN (owner, 2026-09-10): the door decides
+            # the medium off it, so a ts dropped or invented on the way here would mail a Slack answer or
+            # silence a mail's. Text and file alike; a post answering nothing hands "" and not None.
+            taps.clear(); sent.clear(); answered.clear()
+            post(tapcfg, "C-MEM", "answering the mail", "9.0", ts="9.0")
+            post(tapcfg, "C-MEM", "answering the owner", "9.0", ts="9.3")
+            post(tapcfg, "C-MEM", "progress, answering nobody", "9.0")
+            upload_file(tapcfg, tapfile, "C-MEM", "9.0", comment="the file, answering the mail", ts="9.0")
+            check("mail out: post() and upload_file() hand the door the ts of the message each one answers, "
+                  "unchanged, and \"\" when there is none — the door reads the medium off it and nothing here does",
+                  answered == ["9.0", "9.3", "", "9.0"] and len(taps) == 4 and len(sent) == 4)
 
             # THE DAEMON'S OWN PLUMBING DOES NOT TRAVEL. A person's words never reach post() — that is the
             # first half of the rule — and the second half is that what the DAEMON says in a mirror thread is

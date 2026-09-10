@@ -63,7 +63,11 @@ SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the term
 the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path — the
 daemon does not have one, so no mail's body, no member and no Slack message can start a mail. It goes only to
 an address on MAIL_SEND_ALLOW (MAIL_ALLOW when that is unset), which is the owner's own set of verified
-destinations, and it is charged the same caps and written to the same ~/.cc/mail/out.log as a reply.
+destinations, and it is charged the same caps and written to the same ~/.cc/mail/out.log as a reply. It comes
+From the sending SESSION'S OWN channel address, `<channel>@MAIL_DOMAIN`, when the session has one (a track
+worker's `#<repo>--<track>`, an orch's channel) so the answer lands in that channel's mirror thread; a session
+with no channel of its own — a repo's main session, the box session, a plain shell — sends From home@ (or
+MAIL_SEND_FROM). Which it is comes off where the command runs, never off the ask (outbound.session_channel).
 
 THE WIRE, which core/mail/inbound-worker.js is written against:
   POST /inbound                             every other method and path is 404
@@ -1118,7 +1122,10 @@ def cmd_send(opt):
     to, subject, body, attachments = ask
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import outbound                          # noqa: E402 — a sibling, imported here for cc-mail's own reason
-    ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments)
+    # The From is the session's own channel's address when it has one, home@ when it does not — read off where
+    # this command runs (session_channel), never off the ask: there is no key or flag for it (owner, 2026-09-10).
+    ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments,
+                                channel=outbound.session_channel())
     print(line, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 

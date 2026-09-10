@@ -1856,7 +1856,7 @@ def run():
         fresh()
         rec = conv()
         with FakeWorker() as w:
-            note = outbound.send(conf(w), "C-mem", "1700.1", text="*done* — the cert is renewed")
+            note = outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1", text="*done* — the cert is renewed")
             call = w.one()
         k(note == "" and call["auth"] == "Bearer s3cret" and call["path"] == "/send",
           "a bot reply in a mirror thread goes out once, with the box's secret, and says nothing in Slack")
@@ -1886,7 +1886,7 @@ def run():
         fresh()
         conv()
         with FakeWorker() as w:
-            outbound.send(conf(w), "C-mem", "1700.1",
+            outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1",
                           text="cc'ing boss@elsewhere.example and <mailto:x@evil.example|x@evil.example>")
             call = w.one()
         k(not any("evil.example" in a or "elsewhere.example" in a for a in call["to"]),
@@ -1897,7 +1897,7 @@ def run():
         fresh()
         conv(role="cc")
         with FakeWorker() as w:
-            k(outbound.send(conf(w), "C-mem", "1700.1", text="hello") == "" and not w.calls,
+            k(outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1", text="hello") == "" and not w.calls,
               "a reply in a channel the mail only COPIED sends nothing: a Cc watches, it does not answer")
             k(outbound.send(conf(w), "C-box", "9999.9", text="hello") == "" and not w.calls,
               "…and a thread that is not a mirror root at all is left alone, which is every other thread here")
@@ -1911,7 +1911,7 @@ def run():
         with open(lesson, "wb") as f:
             f.write(b"%PDF-1.4 pretend")
         with FakeWorker() as w:
-            outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1",
+            outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", ts="1700.1",
                           text="here it is", path=lesson)
             call = w.one()
         names = [q.get_filename() for q in call["msg"].iter_attachments()]
@@ -1928,7 +1928,7 @@ def run():
         with FakeWorker() as w:
             outbound.send(conf(w, MAIL_OUT_ROOTS=dev, MAIL_OUT_MAX_ATTACH_BYTES=1024,
                                MAIL_OUT_LINKS="%s=https://pub.example/m" % os.path.join(dev, "mem")),
-                          "C-mem", "1700.1", text="the lesson", path=big)
+                          "C-mem", "1700.1", ts="1700.1", text="the lesson", path=big)
             call = w.one()
         body = call["msg"].get_body(("plain",)).get_content()
         k(not list(call["msg"].iter_attachments())
@@ -1947,7 +1947,7 @@ def run():
         link = os.path.join(dev, "mem", "linked.txt")
         os.symlink(outside, link)
         with FakeWorker() as w:
-            outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", text="", path=link)
+            outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", ts="1700.1", text="", path=link)
             call = w.one()
         sym_body = call["msg"].get_body(("plain",)).get_content()
         k(not list(call["msg"].iter_attachments()) and "not attached" in sym_body
@@ -2012,8 +2012,8 @@ def run():
         conv()
         with FakeWorker() as w:
             for _ in range(2):
-                outbound.send(conf(w, MAIL_OUT_PER_HOUR=2), "C-mem", "1700.1", text="progress")
-            note = outbound.send(conf(w, MAIL_OUT_PER_HOUR=2), "C-mem", "1700.1", text="progress")
+                outbound.send(conf(w, MAIL_OUT_PER_HOUR=2), "C-mem", "1700.1", ts="1700.1", text="progress")
+            note = outbound.send(conf(w, MAIL_OUT_PER_HOUR=2), "C-mem", "1700.1", ts="1700.1", text="progress")
             k(len(w.calls) == 2 and "MAIL_OUT_PER_HOUR" in note and "reply is here" in note,
               "over the thread's hourly cap the reply stays in Slack and one line says the mail did not go")
         k(sum("MAIL_OUT_PER_HOUR" in ln for ln in logged()) == 1,
@@ -2022,8 +2022,8 @@ def run():
         fresh()
         conv()
         with FakeWorker() as w:
-            outbound.send(conf(w, MAIL_OUT_PER_DAY=1), "C-mem", "1700.1", text="one")
-            note = outbound.send(conf(w, MAIL_OUT_PER_DAY=1), "C-mem", "1700.1", text="two")
+            outbound.send(conf(w, MAIL_OUT_PER_DAY=1), "C-mem", "1700.1", ts="1700.1", text="one")
+            note = outbound.send(conf(w, MAIL_OUT_PER_DAY=1), "C-mem", "1700.1", ts="1700.1", text="two")
             k(len(w.calls) == 1 and "MAIL_OUT_PER_DAY" in note and "friend@allowed.example" in note,
               "the day's cap is per recipient, and the refusal names the one it stopped at")
 
@@ -2034,8 +2034,8 @@ def run():
         with FakeWorker() as w:
             off = dict(conf(w))
             off["MAIL_SEND_URL"] = ""
-            k(outbound.send(off, "C-mem", "1700.1", text="a") == ""
-              and outbound.send(off, "C-mem", "1700.1", text="b") == "" and not w.calls,
+            k(outbound.send(off, "C-mem", "1700.1", ts="1700.1", text="a") == ""
+              and outbound.send(off, "C-mem", "1700.1", ts="1700.1", text="b") == "" and not w.calls,
               "with no worker URL the tap is a no-op and the thread is not told about mail at all")
         k(len(logged()) == 1 and "sending is off" in logged()[0],
           "…and it says so ONCE per process, not once per reply")
@@ -2046,14 +2046,14 @@ def run():
         with FakeWorker({"ok": True, "sent": ["friend@allowed.example"],
                          "failed": [{"to": "watcher@allowed.example",
                                      "error": "destination address not verified"}]}) as w:
-            note = outbound.send(conf(w), "C-mem", "1700.1", text="done")
+            note = outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1", text="done")
         k("watcher@allowed.example" in note and "not verified" in note,
           "an address Cloudflare will not deliver to is named in the thread, not dropped quietly")
 
         fresh()
         refused = conv()          # this case's own conversation: the id it must NOT gain is its own
         with FakeWorker({"ok": False, "error": "unauthorized"}, status=401) as w:
-            note = outbound.send(conf(w), "C-mem", "1700.1", text="done")
+            note = outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1", text="done")
         k("401" in note and "reply is here" in note,
           "a worker that refuses the call is one line in the thread and one in the log")
         k(router.load_conv(refused["id"])["message_ids"] == [MID],
@@ -2330,6 +2330,276 @@ def run():
               "…a MAIL_UNPLACED that is not `bounce` is `main`")
         finally:
             os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
+
+    # ------------------------------- 21. the reply's medium follows the message it answers (owner, 2026-09-10)
+    # Brief: "a message the owner sends in Slack gets a Slack reply only, even inside a mail's mirror thread; a
+    # message that arrived by mail gets a mail reply; a post that answers nothing in a mail thread stays in
+    # Slack; an explicit way to mail when asked remains (answering the mail-origin root)". Every case is its own
+    # conversation on disk, and every one asserts BOTH the post that travels and the post that does not.
+    with Box(allow=",".join([ALLOWED, OTHER, OWNER]), MAIL_RATE=500) as b:
+        ROOT, LATER, OWNER_TS, NOBODY = "1800.1", "1800.4", "1800.7", ""
+        made = [0]
+
+        def thread(mirrors=None, **kw):
+            """One mail through the real door, its own record, mirrored as the `to` root of one channel — plus,
+            when given, the lines later mails on the same conversation left under it, as take_mail records
+            them. The root index points at the newest, so no case reads the one before."""
+            made[0] += 1
+            msg = arrived(b, ALLOWED, rcpt="mem@box.example", to="mem@box.example",
+                          headers={"Message-ID": "<m21-%d@allowed.example>" % made[0]}, **kw)
+            rec = router.new_conv(msg, "mem")
+            rec["roots"] = [{"chat": "C-mem", "ts": ROOT, "name": "mem", "target": "mem", "alias": None,
+                             "role": "to"}]
+            if mirrors is not None:
+                rec["mirrors"] = mirrors
+            router.save_conv(rec)
+            return rec
+
+        def conf(worker, **kw):
+            c = {"MAIL_SEND_URL": worker.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example"}
+            c.update({k: str(v) for k, v in kw.items()})
+            return c
+
+        def fresh():
+            shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            open(outbound.LOGFILE, "w").close()
+            outbound._UNCONFIGURED_SAID[0] = False
+
+        def out_log():
+            with open(outbound.LOGFILE) as f:
+                return [ln for ln in f.read().splitlines() if ln.strip()]
+
+        # (a) THE ROOT IS THE MAIL; THE OWNER'S LINE UNDER IT IS NOT. A record with no `mirrors` at all — one
+        # written before this rule — so the root alone is what answers for the mail.
+        fresh()
+        rec = thread()
+        k(outbound.by_mail(rec, "C-mem", ROOT) and not outbound.by_mail(rec, "C-mem", OWNER_TS)
+          and not outbound.by_mail(rec, "C-mem", NOBODY) and not outbound.by_mail(rec, "C-other", ROOT),
+          "by_mail: the thread's root arrived by mail; a Slack line in the thread, no message, and the same ts "
+          "in another channel did not")
+        with FakeWorker() as w:
+            note_m = outbound.send(conf(w), "C-mem", ROOT, ts=ROOT, text="the cert is renewed")
+            went = len(w.calls)
+            note_s = outbound.send(conf(w), "C-mem", ROOT, ts=OWNER_TS, text="yes, doing that now")
+            stayed = len(w.calls) - went
+        k(went == 1 and note_m == "",
+          "a reply answering the mail's own line goes out as mail, as before")
+        k(stayed == 0 and note_s == "",
+          "…and a reply answering the OWNER'S Slack message in that same thread stays in Slack — no mail, and "
+          "no line in the thread saying so, because nothing was promised")
+        k(not any("not sent" in ln for ln in out_log()),
+          "…and a reply that stays in Slack is not a refusal: out.log has no `not sent` line for it")
+
+        # (b) A LATER MAIL'S LINE UNDER THE ROOT IS A MAIL TOO — the ts the session was handed for the second
+        # mail, which take_mail wrote to `mirrors`. A ts in neither list is a Slack message, whatever it says.
+        fresh()
+        rec = thread(mirrors=[{"chat": "C-mem", "ts": ROOT, "mail": "m1"},
+                              {"chat": "C-mem", "ts": LATER, "mail": "m2"}])
+        k(outbound.by_mail(rec, "C-mem", LATER) and not outbound.by_mail(rec, "C-mem", OWNER_TS),
+          "by_mail: a follow-up mail's line, recorded in `mirrors`, arrived by mail; a ts recorded nowhere did not")
+        with FakeWorker() as w:
+            outbound.send(conf(w), "C-mem", ROOT, ts=LATER, text="on the second mail: done")
+            went = len(w.calls)
+            outbound.send(conf(w), "C-mem", ROOT, ts=OWNER_TS, text="on the owner's line: done")
+            stayed = len(w.calls) - went
+        k(went == 1 and stayed == 0,
+          "a reply answering the second mail's line goes out; one answering a Slack line beside it does not")
+
+        # (c) A POST THAT ANSWERS NOTHING STAYS IN SLACK — progress, a note — and the explicit way remains: the
+        # same words, answering the root, go out. Neither the cap nor the log is touched by the one that stayed.
+        fresh()
+        thread()
+        with FakeWorker() as w:
+            outbound.send(conf(w), "C-mem", ROOT, text="progress: halfway")
+            stayed = len(w.calls)
+            rate_before = os.path.exists(outbound.RATEFILE)
+            outbound.send(conf(w), "C-mem", ROOT, ts=ROOT, text="progress: halfway")
+            went = len(w.calls) - stayed
+        k(stayed == 0 and went == 1,
+          "a post in the thread that answers no message stays in Slack; the same post answering the root is "
+          "the explicit way to mail, and goes")
+        k(not rate_before and os.path.exists(outbound.RATEFILE),
+          "…and the post that stayed charged neither cap — the rate clock is first written by the one that went")
+
+        # (d) A FILE FOLLOWS THE SAME RULE: an attachment for the mail's line, nothing for the owner's.
+        fresh()
+        thread()
+        dev = os.path.join(b.tmp, "dev21")
+        os.makedirs(os.path.join(dev, "mem"), exist_ok=True)
+        report = os.path.join(dev, "mem", "report.pdf")
+        with open(report, "wb") as f:
+            f.write(b"%PDF-1.4 the report")
+        with FakeWorker() as w:
+            outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", ROOT, ts=OWNER_TS, text="here", path=report)
+            stayed = len(w.calls)
+            outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", ROOT, ts=ROOT, text="here", path=report)
+            call = w.one()
+        k(stayed == 0 and [q.get_filename() for q in call["msg"].iter_attachments()] == ["report.pdf"],
+          "a file posted in answer to the owner's Slack line stays in Slack; the same file in answer to the "
+          "mail's line goes out as an attachment")
+
+        # (e) THE MEDIUM IS DECIDED BEFORE THE CAPS: a Slack answer in a thread that is over its hourly cap is
+        # not told "not mailed" — it was never going to be — while the mail answer beside it still is.
+        fresh()
+        thread()
+        with FakeWorker() as w:
+            outbound.send(conf(w, MAIL_OUT_PER_HOUR=1), "C-mem", ROOT, ts=ROOT, text="one")
+            note_s = outbound.send(conf(w, MAIL_OUT_PER_HOUR=1), "C-mem", ROOT, ts=OWNER_TS, text="two")
+            note_m = outbound.send(conf(w, MAIL_OUT_PER_HOUR=1), "C-mem", ROOT, ts=ROOT, text="three")
+        k(note_s == "" and note_m.startswith("📪 not mailed") and len(w.calls) == 1,
+          "over the cap, a Slack answer says nothing in the thread and a mail answer says it was not mailed")
+
+    # ------------------------------- 22. a channel's mail comes from its address (owner, 2026-09-10)
+    # Brief: "a mail a channel's session STARTS comes From <channel>@<MAIL_DOMAIN>, the address the router
+    # already maps back to that channel; a session with no channel of its own (planning seat, box session)
+    # keeps home@ (or MAIL_SEND_FROM). The From is derived from the session's channel by the box, never typed by
+    # the caller; stays on MAIL_DOMAIN." Every case builds the place it runs from — a marker, an env, a table —
+    # under its own tmp, and asserts both the session that gets its own address and the one that keeps home@.
+    with Box(allow=ALLOWED) as b:
+        sd = os.path.join(b.tmp, "slack22")
+        os.makedirs(sd)
+        with open(os.path.join(sd, "orchs.json"), "w") as f:
+            json.dump({"C-live": {"target": "abox", "alias": "email", "name": "abox-email-1en6", "archived": False},
+                       "C-gone": {"target": "abox", "alias": "lessons", "name": "abox-lessons-yl41", "archived": True}}, f)
+        wt = os.path.join(b.tmp, "wt22", "abox", "fix-the-door")
+        os.makedirs(os.path.join(wt, ".cc"))
+        with open(os.path.join(wt, ".cc", "track"), "w") as f:
+            f.write("abox\nfix-the-door\n0000-uuid\n")
+        os.makedirs(os.path.join(wt, "core", "mail"))
+        none = {}                                      # a shell with nothing of a session's in its env
+        sc = lambda cwd, **env: outbound.session_channel(cwd, env, sd)   # noqa: E731
+
+        # (a) WHICH SESSION HAS A CHANNEL OF ITS OWN. Read off where the process runs and nothing else.
+        k(sc(wt) == "abox--fix-the-door" and sc(os.path.join(wt, "core", "mail")) == "abox--fix-the-door",
+          "a track worktree (the `.cc/track` marker, found up the tree) is the session of #<repo>--<track>")
+        k(sc(os.path.join(outbound.DEV, "abox"), CC_SLACK_ALIAS="email") == "abox-email-1en6",
+          "an orch (CC_SLACK_ALIAS) is the session of the channel the daemon opened for it, from orchs.json")
+        k(sc(b.tmp, CC_SLACK_TARGET="abox", CC_SLACK_ALIAS="email") == "abox-email-1en6",
+          "…found by its target from CC_SLACK_TARGET as well, for an orch shell outside ~/dev")
+        k(sc(os.path.join(outbound.DEV, "abox")) == "" and sc(outbound.DEV) == "" and sc(outbound.H) == "",
+          "a repo's main session (the planning seat), ~/dev and ~ (the box session) have no channel of their own")
+        k(sc(b.tmp) == "" and sc(b.tmp, CC_SLACK_TARGET="abox") == "",
+          "…nor does a shell with no session behind it, or one whose target is a repo with no alias")
+        k(sc(os.path.join(outbound.DEV, "abox"), CC_SLACK_ALIAS="lessons") == ""
+          and sc(os.path.join(outbound.DEV, "abox"), CC_SLACK_ALIAS="nobody") == "",
+          "…nor an orch whose channel is archived, or one orchs.json never recorded: those keep home@")
+        k(sc(wt, CC_SLACK_ALIAS="email") == "abox--fix-the-door",
+          "…and a track keeps its own channel whatever alias its shell inherited from the orch that spawned it: "
+          "the marker outranks the env, as it does when cc places the session")
+
+        # (b) THE FROM. <channel>@ for a session with a channel, home@ (or MAIL_SEND_FROM) without one — and
+        # MAIL_SEND_FROM does not move a channel's mail off its own address.
+        c = {"MAIL_DOMAIN": "box.example"}
+        k(outbound.cold_from(c, "abox--fix-the-door") == "abox--fix-the-door@box.example"
+          and outbound.cold_from(c, "#Abox-Email-1en6") == "abox-email-1en6@box.example",
+          "cold_from: a channel's address is <channel>@MAIL_DOMAIN, the name lower-cased and without its #")
+        k(outbound.cold_from(c, "") == "home@box.example"
+          and outbound.cold_from(dict(c, MAIL_SEND_FROM="Ops@box.example"), "") == "ops@box.example",
+          "…and no channel is home@, or MAIL_SEND_FROM when the owner set one")
+        k(outbound.cold_from(dict(c, MAIL_SEND_FROM="ops@box.example"), "abox--fix-the-door")
+          == "abox--fix-the-door@box.example",
+          "…and MAIL_SEND_FROM is the channel-less session's only: a channel's mail stays From its own address")
+        k(outbound.cold_from({}, "abox--fix-the-door") == "",
+          "…and with no MAIL_DOMAIN there is no address of ours to send from, channel or not")
+
+        # (c) THE SEND, BOTH WAYS, through the same worker section 19 uses — the From on the wire, in the
+        # message and in the log, and the line a person reads.
+        def cold22(worker, **kw):
+            c = {"MAIL_SEND_URL": worker.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example",
+                 "MAIL_SEND_ALLOW": ALLOWED}
+            c.update({k: str(v) for k, v in kw.items()})
+            return c
+
+        def fresh22():
+            shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            open(outbound.LOGFILE, "w").close()
+            outbound._UNCONFIGURED_SAID[0] = False
+
+        def log22():
+            with open(outbound.LOGFILE) as f:
+                return [ln for ln in f.read().splitlines() if ln.strip()]
+
+        fresh22()
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold22(w), ALLOWED, "from the track", "the door is fixed",
+                                        channel=outbound.session_channel(wt, none, sd))
+            call = w.one()
+        k(ok and call["from"] == "abox--fix-the-door@box.example"
+          and call["msg"]["From"] == "abox--fix-the-door@box.example" and call["to"] == [ALLOWED],
+          "a mail a track's session starts goes From <repo>--<track>@ the box's domain")
+        k("from abox--fix-the-door@box.example" in line
+          and any("cold: sent from=abox--fix-the-door@box.example" in ln for ln in log22()),
+          "…and the line printed and the line logged both name that address")
+        fresh22()
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold22(w), ALLOWED, "from the seat", "the door is fixed",
+                                        channel=outbound.session_channel(os.path.join(outbound.DEV, "abox"), none, sd))
+            call = w.one()
+        k(ok and call["from"] == "home@box.example" and call["msg"]["From"] == "home@box.example"
+          and "from home@box.example" in line and any("cold: sent from=home@box.example" in ln for ln in log22()),
+          "the same mail from a repo's main session goes From home@, printed and logged the same way")
+        fresh22()
+        with FakeWorker() as w:
+            ok, _ = outbound.send_to(cold22(w, MAIL_SEND_FROM="ops@box.example"), ALLOWED, "s", "t",
+                                     channel=outbound.session_channel(wt, none, sd))
+            first = w.one()["from"]
+            ok2, _ = outbound.send_to(cold22(w, MAIL_SEND_FROM="ops@box.example"), ALLOWED, "s", "t",
+                                      channel=outbound.session_channel(b.tmp, none, sd))
+            second = w.calls[-1]["from"]
+        k(ok and ok2 and first == "abox--fix-the-door@box.example" and second == "ops@box.example",
+          "with MAIL_SEND_FROM set, a track's mail still comes from its channel and a channel-less one from that")
+
+        # (d) THE COMMAND ITSELF: `cc-mail send` run from inside the worktree, and from a place with no
+        # session — the channel is read off the cwd by cmd_send, and the ask carries no key that could name it.
+        env22 = {k: "" for k in r.SEND_KEYS if k not in Box.KEYS}   # every key cmd_send reads, so none falls to the box's own config
+        env22.update({"MAIL_SEND_ALLOW": ALLOWED, "MAIL_SEND_SECRET": "s3cret"})
+        saved22 = {k: os.environ.get(k) for k in env22}
+        here22, out22 = os.getcwd(), sys.stdout
+        try:
+            os.environ.update(env22)
+            with FakeWorker() as w:
+                os.environ["MAIL_SEND_URL"] = w.url
+                ask = os.path.join(b.tmp, "ask22.json")
+                with open(ask, "w") as f:
+                    json.dump({"to": ALLOWED, "subject": "by command", "body": "from the command line"}, f)
+                fresh22()
+                os.chdir(wt)
+                sys.stdout = io.StringIO()
+                rc = r.cmd_send({"--json": ask})
+                said_wt = sys.stdout.getvalue()
+                sys.stdout = out22
+                from_wt = w.calls[-1]["from"]
+                os.chdir(b.tmp)
+                sys.stdout = io.StringIO()
+                rc2 = r.cmd_send({"--json": ask})
+                said_tmp = sys.stdout.getvalue()
+                sys.stdout = out22
+                from_tmp = w.calls[-1]["from"]
+                with open(ask, "w") as f:
+                    json.dump({"to": ALLOWED, "subject": "s", "body": "b", "from": "anyone@box.example"}, f)
+                sys.stdout = io.StringIO()
+                rc3 = r.cmd_send({"--json": ask})
+                sys.stdout = out22
+                n_before = len(w.calls)
+        finally:
+            sys.stdout = out22
+            os.chdir(here22)
+            for k22, v in saved22.items():
+                if v is None:
+                    os.environ.pop(k22, None)
+                else:
+                    os.environ[k22] = v
+        k(rc == 0 and from_wt == "abox--fix-the-door@box.example" and "from abox--fix-the-door@box.example" in said_wt,
+          "`cc-mail send` run inside a track's worktree prints from=<repo>--<track>@ and sent it so")
+        k(rc2 == 0 and from_tmp == "home@box.example" and "from home@box.example" in said_tmp,
+          "…and run where no session is, prints and sends from home@")
+        k(rc3 == 2 and n_before == 2 and b.err.getvalue().count("unknown key from") == 1,
+          "…and an ask that tries to carry a `from` is refused by name before anything is sent: the address is "
+          "the box's to derive, not the caller's to type")
+        k(len([ln for ln in log22() if "cold: sent from=" in ln]) == 2
+          and any("from=abox--fix-the-door@box.example" in ln for ln in log22())
+          and any("from=home@box.example" in ln for ln in log22()),
+          "…and out.log has one `sent from=` line per mail, each naming the address it went from")
 
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0

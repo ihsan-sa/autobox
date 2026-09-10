@@ -2,10 +2,19 @@
 """The way out — the box's own mail. Two ways in, and they are deliberately not the same shape. Milestone 4.
 
 WHAT IT IS. Milestone 2 gave every mail a mirror thread in Slack and wrote the conversation to disk
-(core/mail/router.py, ~/.cc/mail/conv/). This file is the tap on that thread: every message and every file the
-BOX posts in it goes out as a mail in the same conversation — threaded on the mail's own Message-ID, reply-all
-to the addresses that mail carried, From the address it was sent to. So a person who mails a brief gets the
-session's progress and its finished result without ever opening Slack.
+(core/mail/router.py, ~/.cc/mail/conv/). This file is the tap on that thread: a message or a file the BOX posts
+in it IN ANSWER TO A MAIL goes out as a mail in the same conversation — threaded on the mail's own Message-ID,
+reply-all to the addresses that mail carried, From the address it was sent to. So a person who mails a brief
+gets the session's answer without ever opening Slack.
+
+THE REPLY'S MEDIUM FOLLOWS THE MESSAGE IT ANSWERS (owner, 2026-09-10). A post carries the ts of the message it
+answers — the reply tool's `ts` — and `by_mail()` asks whether THAT message arrived by mail: the mirror line of
+any mail on the conversation (the thread's root, or a later mail's line under it, which take_mail records in the
+conversation's `mirrors`). Only then does the post travel. A post answering a Slack message in the thread — the
+owner talking to the session there — stays in Slack, and so does a post that answers nothing at all: progress,
+a note, a line for the channel. Before this rule every post in a mirror thread went out, and four Slack answers
+in one thread were four mails in the sender's inbox. The explicit way to mail is unchanged: answer the mail's
+own line (the root), or `cc-mail send`.
 
 WHERE THE TAP IS. `post()` and `upload_file()` in core/bin/cc-slack, which are the one place everything the box
 says goes through — Daemon.say, `cc-slack post`, the member socket's `reply` verb and a session's reply tool all
@@ -80,9 +89,13 @@ CONFIG, all of it in ~/.cc/config, read by cc-slack and handed here as a dict:
                          box: mailing them first opens nothing that answering them did not. Both unset = no
                          cold mail goes anywhere. Replies are NOT filtered by it — they go where the mail they
                          answer came from, and Cloudflare refuses an address it has not verified
-      MAIL_SEND_FROM     the address a cold mail comes From, which must be on MAIL_DOMAIN. Unset = home@ that
-                         domain, the address the door already receives on, so an answer to a cold mail arrives
-                         back here and is routed like any other
+      MAIL_SEND_FROM     the address a cold mail comes From when the session sending it has no channel of its
+                         own, which must be on MAIL_DOMAIN. Unset = home@ that domain, the address the door
+                         already receives on, so an answer to a cold mail arrives back here and is routed like
+                         any other. A session WITH a channel of its own — a track worker, an orch — never uses
+                         it: its cold mail comes From <channel>@MAIL_DOMAIN, the address the router already
+                         maps back to that channel, so an answer lands in that channel's mirror thread
+                         (session_channel, cold_from; owner, 2026-09-10)
       MAIL_OUT_PER_HOUR  6 mails per mirror thread per hour, and 6 cold mails an hour for the whole box
       MAIL_OUT_PER_DAY   30 mails per recipient per day, counted across both paths
       MAIL_OUT_MAX_ATTACH_BYTES  8388608 (8 MiB) per file. Over it a reply's file goes as a link line and a
@@ -299,14 +312,76 @@ def verified(cfg):
     return out
 
 
-def cold_from(cfg):
+SLACKDIR = os.environ.get("CC_SLACK_DIR") or os.path.join(H, ".cc", "slack")
+DEV = os.path.join(H, "dev")
+CHAN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")   # a channel name as the router reads one off an address (router.py)
+
+
+def session_channel(cwd=None, env=None, slack_dir=None):
+    """The channel THIS SESSION owns — a name without the `#` — or "" for a session that has none.
+
+    "The From is derived from the session's channel by the box, never typed by the caller" (owner, 2026-09-10).
+    So it is read off where the process runs, the same two facts cc-slack's detect_target and Channel read to
+    place a session, and no argument names it: a track worktree carries the `.cc/track` marker `cc` wrote
+    (`<repo> <track>`, found up the tree from cwd) and that session's channel is `#<repo>--<track>`; an orch
+    carries CC_SLACK_ALIAS (set by `cc <repo> --orch`) and its channel is the one the daemon opened for it,
+    on record in ~/.cc/slack/orchs.json under the repo and the alias. Both are names the router maps straight
+    back to that channel (`<channel>@` in core/mail/router.py), so an answer lands in its mirror thread.
+
+    "a session with no channel of its own (planning seat, box session) keeps home@": a repo's main session
+    answers "" — #<repo> is the project's channel, where the owner steers, not that session's own — and so do
+    the box session, a shell with no session behind it, and an orch whose channel is archived or unrecorded."""
+    env = os.environ if env is None else env
+    d = os.path.realpath(cwd or os.getcwd())
+    x, target = d, ""
+    while x and x != "/":
+        marker = os.path.join(x, ".cc", "track")
+        if os.path.isfile(marker):
+            try:
+                with open(marker) as f:
+                    parts = f.read().split()
+            except OSError:
+                parts = []
+            target = "/".join(parts[:2]) if len(parts) >= 2 else ""
+            break
+        x = os.path.dirname(x)
+    if not target:
+        if d.startswith(DEV + os.sep):
+            target = d[len(DEV) + 1:].split(os.sep)[0]
+        elif d not in (DEV, H):
+            target = (env.get("CC_SLACK_TARGET") or "").strip()
+    if "/" in target:                   # a track is its own session whatever alias its shell inherited (cc: track before alias)
+        name = target.replace("/", "--", 1).lower()   # the channel was made lower-cased (cc-slack mkchannel)
+        return name if CHAN_RE.fullmatch(name) else ""
+    alias = (env.get("CC_SLACK_ALIAS") or "").strip()
+    if alias and target:
+        try:
+            with open(os.path.join(slack_dir or SLACKDIR, "orchs.json")) as f:
+                orchs = json.load(f)
+        except (OSError, ValueError):
+            orchs = {}
+        for e in (orchs.values() if isinstance(orchs, dict) else []):
+            if (isinstance(e, dict) and not e.get("archived") and e.get("target") == target
+                    and e.get("alias") == alias and CHAN_RE.fullmatch(str(e.get("name") or ""))):
+                return str(e["name"])
+    return ""                           # a repo's main session, the box, a plain shell: no channel of its own
+
+
+def cold_from(cfg, channel=""):
     """The From of a mail the box starts, or "" when there is none it may use.
 
-    MAIL_SEND_FROM when it is set and on our own domain — the worker refuses any other From anyway, so an
-    address off the domain is caught here where the reason can be said. Unset, it is home@<MAIL_DOMAIN>: the
-    address the door already receives on, so an answer to a cold mail comes back through the door and is routed
-    like any other mail rather than bouncing off an address nothing listens to."""
+    `channel` is the sending session's own channel (session_channel), and when there is one the From is
+    <channel>@<MAIL_DOMAIN> — "the address the router already maps back to that channel, so an answer lands in
+    that channel's mirror thread" (owner, 2026-09-10). It stays on MAIL_DOMAIN whatever MAIL_SEND_FROM says.
+
+    Without one: MAIL_SEND_FROM when it is set and on our own domain — the worker refuses any other From
+    anyway, so an address off the domain is caught here where the reason can be said. Unset, it is
+    home@<MAIL_DOMAIN>: the address the door already receives on, so an answer to a cold mail comes back
+    through the door and is routed like any other mail rather than bouncing off an address nothing listens to."""
     domain = (cfg.get("MAIL_DOMAIN") or "").strip().lower().lstrip("@")
+    channel = (channel or "").strip().lstrip("#").lower()
+    if channel and domain:
+        return channel + "@" + domain
     a = _norm(cfg.get("MAIL_SEND_FROM") or "")
     if a:
         return a if ours(a, domain) else ""
@@ -514,13 +589,31 @@ def call_worker(cfg, from_a, rcpts, raw):
 
 # ---------------------------------------------------------------- the tap
 
-def send(cfg, chat, thread, text="", path="", now=None):
-    """ONE POST IN A MIRROR THREAD, MAILED. Returns "" when there is nothing to say in Slack, or the one line
-    the caller posts in that thread saying the mail did not go and why.
+def by_mail(rec, chat, ts):
+    """Did the message at (chat, ts) arrive by mail? True for the mirror line of any mail on this conversation:
+    a root (the first mail's line, or the line a move re-posted) and every later mail's line under it, which
+    take_mail writes to `mirrors` as it posts them. False for everything else — a person's Slack message in the
+    thread, and no message at all (`ts` empty). A record written before `mirrors` existed still answers for its
+    root, so a conversation from before this rule can still be answered by mail."""
+    ts = str(ts or "").strip()
+    if not ts:
+        return False
+    if any(r.get("chat") == chat and str(r.get("ts")) == ts for r in (rec.get("roots") or [])):
+        return True
+    return any(m.get("chat") == chat and str(m.get("ts")) == ts for m in (rec.get("mirrors") or []))
+
+
+def send(cfg, chat, thread, text="", path="", now=None, ts=""):
+    """ONE POST IN A MIRROR THREAD, MAILED WHEN IT ANSWERS A MAIL. Returns "" when there is nothing to say in
+    Slack, or the one line the caller posts in that thread saying the mail did not go and why.
 
     `chat`/`thread` are the only way in: the addresses come off the conversation those two name on disk, so
     there is no argument here a caller could point at somebody else. Everything that is not a `to` root of a
-    known conversation returns "" and does nothing, which is every ordinary post on the box."""
+    known conversation returns "" and does nothing, which is every ordinary post on the box.
+
+    `ts` is the message the post answers. It decides the medium and nothing else: a post answering a message
+    that came by mail (by_mail) goes out; one answering a Slack message, or answering nothing, stays in Slack
+    and this returns "" without a word — nothing was promised, so the thread says nothing."""
     if not thread or not chat:
         return ""
     R = _router()
@@ -530,6 +623,10 @@ def send(cfg, chat, thread, text="", path="", now=None):
     if not any(r.get("chat") == chat and r.get("ts") == thread and r.get("role") == "to"
                for r in (rec.get("roots") or [])):
         return ""                       # a channel that was only copied on the mail does not speak for the box
+    # "a post answering a Slack-origin message stays in Slack; one answering a mail-origin message goes out as
+    # mail as today; a post that answers nothing in a mail thread stays in Slack" (owner, 2026-09-10)
+    if not by_mail(rec, chat, ts):
+        return ""
     if not configured(cfg):
         log_once("sending is off (MAIL_SEND_URL or MAIL_SEND_SECRET unset) — %s stayed in Slack" % rec.get("id"))
         return ""                       # nothing was promised, so the thread says nothing
@@ -589,8 +686,13 @@ def send(cfg, chat, thread, text="", path="", now=None):
 COLD_KEY = "cold"       # every cold mail shares one per-hour bucket: see send_to()
 
 
-def send_to(cfg, to, subject, text, attachments=None, now=None):
+def send_to(cfg, to, subject, text, attachments=None, now=None, channel=""):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
+
+    `channel` is the sending session's own channel, or "" — session_channel() read off where the process
+    runs, and the caller passes nothing it typed. It decides the From alone (cold_from): <channel>@ for a
+    session that has one, so the answer lands in that channel's mirror thread; home@ (or MAIL_SEND_FROM) for
+    one that does not. The verified list, the caps and the reply path do not see it.
 
     A FILE EITHER GOES AS A FILE OR NOTHING GOES. `attachments` is the list of paths the caller named, each
     read through attach_bytes() under a reply's rules — a regular file inside MAIL_OUT_ROOTS, under
@@ -607,7 +709,7 @@ def send_to(cfg, to, subject, text, attachments=None, now=None):
     WHAT IS DIFFERENT FROM A REPLY, and it is only the first three lines: a reply's addresses come off a
     conversation on disk and cannot be argued with, and this one is HANDED an address. So the address is
     checked against verified() before anything leaves — the list is the owner's, not this call's — and the From
-    is the box's own (cold_from()), never one the caller chose.
+    is the box's own (cold_from(), off the session's channel), never one the caller chose.
 
     WHAT IS THE SAME: the worker, the secret, both caps and the log. The per-hour cap is charged against one
     key for the whole box rather than per thread, because there is no thread to spread a runaway over: a
@@ -632,7 +734,7 @@ def send_to(cfg, to, subject, text, attachments=None, now=None):
         return refuse("no recipient")
     if not configured(cfg):
         return refuse("sending is off — MAIL_SEND_URL or MAIL_SEND_SECRET is unset")
-    from_a = cold_from(cfg)
+    from_a = cold_from(cfg, channel)
     if not from_a:
         return refuse("no address of ours to send from — set MAIL_DOMAIN, or MAIL_SEND_FROM on that domain")
     unknown = [a for a in rcpts if a not in allowed]
