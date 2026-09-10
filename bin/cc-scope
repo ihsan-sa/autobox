@@ -38,6 +38,18 @@ it says so on every line you read, and it never overwrites a check that once pas
 a check should outlive its track — `check-cmd --script` copies the script in beside the ledger, and a check
 that runs a script out of a directory which dies with its track is refused.
 
+KEPT BEFORE IT IS CLASSIFIED. The classifier below is a filter and it has been wrong: "Ok well do whatever
+you need to speed up the whole landing and review process" (2026-09-08) was dropped whole because the
+sentence opened with an acknowledgement, and the only copy left of it was a seen.log line clipped at 160
+characters and waiting to be trimmed. So every turn whose PROVENANCE says the owner wrote it is written to
+~/.cc/scope/turns.jsonl in full, with its source, BEFORE the classifier runs. One the classifier keeps is
+disposed of on the spot; one it skips stays PENDING until a person or a session says what it was — `classify`
+(run the classifier over it again), `promote` (open the ask from the kept text, nothing retyped), or `dismiss
+--why`. Compaction moves disposed records to turns-archive.jsonl and never touches a pending one: nothing
+leaves that file for being old. Machine turns are excluded by provenance, not by wording, and are not kept at
+all — see NOT_A_PERSON. What IS kept has its tokens redacted first (cc-slack's pattern) and one absurd
+paste cut at TURN_MAX; `missed` prints the size of the record, because nothing ages out of it.
+
   cc-scope add <repo> "<ask>" [--src REF] [--track T] [--done-when "..."] [--check "<cmd>"] [--who W] [--at ISO]
   cc-scope list [<repo>] [--all] [--status S] [--track T] [--json]   unsettled asks (all repos if none named)
   cc-scope show <repo> <id>                                          one ask in full: parts, repeats, notes
@@ -51,7 +63,10 @@ that runs a script out of a directory which dies with its track is refused.
   cc-scope track|note <repo> <id> "<text>"                           link an ask to a track / add a note
   cc-scope check <repo> [--track T]                                  exit 1 while anything is unsettled
   cc-scope capture <repo> [--src REF] [--who W]                      classify a message on stdin
-  cc-scope missed [<repo>] [--since HOURS]                           owner messages the classifier skipped
+  cc-scope missed [<repo>] [--since H] [--all] [--full] [--json]     his turns nobody has classified yet
+  cc-scope classify [<repo>] [--id T]                                run the classifier over them again
+  cc-scope promote <turn> [--track T] [--done-when …] [--check …]    open the ask from the kept text
+  cc-scope dismiss <turn> --why "<why it is not an ask>"             it was not an ask, and here is why
   cc-scope digest [<repo>] · count [<repo>] · import <repo> <file> · selfcheck
   cc-scope hook                                                      UserPromptSubmit hook (always 0; speaks only for cc-handoff --relay)
 
@@ -73,6 +88,19 @@ EXAMPLES = "systemctl --user is-active <unit> · test bin/x -nt <the merge> · a
 CHECK_TIMEOUT = 300  # a verification is meant to be CHEAP: one grep, one systemctl is-active, one curl
 MAXTEXT = 800          # a whole essay is not an ask; the source ref is how you read the rest
 SEEN_KEEP = 400        # lines of seen.log kept — enough to catch a miss the same day
+TURNS = "turns.jsonl"                  # the record: every owner turn in full, written before it is classified
+TURNS_ARCHIVE = "turns-archive.jsonl"  # where compaction puts the DISPOSED ones — nothing is ever deleted
+TURNS_KEEP = 400                       # records in the live file before disposed ones are archived out of it
+TURN_MAX = 100000                      # one turn's text: an ask is not 100 KB, and a paste that size is not
+                                       # made more useful by keeping every byte of it forever
+# A TOKEN HE PASTED IS NOT KEPT. This record holds what he typed, in full, for as long as nobody disposes of
+# it — and a terminal is where people paste credentials. The pattern is cc-slack's own SECRET_RE ("what a
+# tool preview relayed to Slack must never carry"), COPIED and not imported: this runs in the
+# UserPromptSubmit hook on every prompt, and importing that file to borrow one regex would cost every
+# session a parse of it. The selfcheck reads cc-slack's source and holds this copy to it, so it cannot
+# drift in silence.
+SECRET_RE = re.compile(r"(xox[abpsr]-[A-Za-z0-9-]+|Authorization:\s*\S+(?:\s+\S+)?|Bearer\s+[A-Za-z0-9._~+/=-]{8,}"
+                       r"|AKIA[0-9A-Z]{12,}|gh[pousr]_[A-Za-z0-9]{20,})")
 # bash's own two codes for "there was nothing to run": 127 not found, 126 found but not executable. A check
 # that comes back either of these did not answer the question — see CANNOT RUN in the header.
 CANNOT_RUN = (126, 127)
@@ -121,8 +149,15 @@ def repos():
 # Deterministic, no LLM: the capture path runs on every prompt and must be cheap, silent and predictable.
 # It keeps DIRECTIVES — the things that outlive the reply. A plain question is answered in the reply and
 # would bury the ledger, so it is logged to seen.log and not opened; `missed` is where you go looking.
-ACK = re.compile(r"^\W*(thanks?|thx|ty|ok(ay)?|k|cool|nice|great|good|sure|yes|yeah|yep|no|nope|perfect|"
-                 r"lgtm|got ?it|right|agreed|👍|👌|🙏|🎉|❤️)\b", re.I)
+_ACKS = (r"thanks?|thx|ty|ok(?:ay)?|k|cool|nice|great|good|sure|yes|yeah|yep|no|nope|perfect|lgtm|"
+         r"got ?it|right|agreed|👍|👌|🙏|🎉|❤️")
+ACK = re.compile(r"^\W*(?:%s)\b" % _ACKS, re.I)
+# AN ACKNOWLEDGEMENT CAN OPEN A REAL INSTRUCTION. A sentence beginning with one used to be dropped whole, so
+# "Ok well do whatever you need to speed up the whole landing and review process" (2026-09-08) never
+# reached the cue that is plainly in it. The lead is stripped and what follows is judged on its own; what is
+# KEPT is still his sentence, ack and all. A bare ack strips to nothing and stays out, and `is_ask` keeps its
+# own floor under the short ones ("ok cool, thanks a lot").
+ACK_LEAD = re.compile(r"^\W*(?:%s)\b[\s,.:;!—–-]*" % _ACKS, re.I)
 CUE_START = re.compile(r"^\W*(add|allow|always|answer|archive|ask|attach|be|break|build|cancel|change|"
                        r"check|clean|close|come|connect|cut|delete|deny|deploy|describe|disable|do|don'?t|"
                        r"drop|enable|ensure|explain|fix|fold|give|go|group|handle|have|hide|hold|install|"
@@ -137,14 +172,27 @@ CUE_ANY = re.compile(r"\b(should|shouldn'?t|must|from now on|going forward|i wan
 SPLIT = re.compile(r"(?<=[.!?;])\s+|\n+")
 
 
+def without_ack(s, rounds=3):
+    """Strip the acknowledgements a sentence leads with: `ok, cool, do X` → `do X`. Bounded, so a sentence
+    that is nothing but acks strips down to nothing and carries no cue of its own."""
+    for _ in range(rounds):
+        t = ACK_LEAD.sub("", s, count=1).strip()
+        if t == s: break
+        s = t
+    return s
+
+
 def parts_of(text):
     """The directive sentences inside a message. A compound ask is where scope goes missing, so they are
     kept separately and shown by `show` — the row is the message, the parts are what it actually asked."""
     out = []
     for s in SPLIT.split(text):
         s = s.strip(" -*·\t")
-        if len(s.split()) < 2 or ACK.match(s): continue
-        if CUE_START.match(s) or CUE_ANY.search(s): out.append(s[:200])
+        if len(s.split()) < 2: continue
+        core = without_ack(s)
+        # CUE_START on what is left once the ack is off; CUE_ANY on the WHOLE sentence, because a cue can
+        # begin with an ack word ("no longer …") and stripping it would lose one.
+        if core and (CUE_START.match(core) or CUE_ANY.search(s)): out.append(s[:200])
     return out
 
 
@@ -373,6 +421,126 @@ def log_seen(repo, decision, text, src):
     except OSError: pass
 
 
+# ---- the record: kept before it is classified ------------------------------------------------------
+# seen.log is a trail for a person to read: one line per turn, clipped at 160 characters and trimmed to the
+# last SEEN_KEEP lines — which is how the only copy of a real ask went missing. This is the record itself:
+# full text, who, where, and what was eventually decided about it. Nothing leaves it for being old.
+
+def redact(text):
+    """Tokens out, before anything writes the turn down. Idempotent — running it twice changes nothing."""
+    return SECRET_RE.sub("[redacted]", text or "")
+
+
+def turns_path(name=TURNS): return os.path.join(SCOPE, name)
+
+
+def read_turns(name=TURNS):
+    out = []
+    try:
+        with open(turns_path(name)) as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln: continue
+                try: out.append(json.loads(ln))
+                except ValueError: continue        # one half-written line is not a reason to lose the rest
+    except OSError: pass
+    return out
+
+
+def write_turns(recs):
+    tmp = turns_path() + ".tmp"
+    with open(tmp, "w") as f:
+        for r in recs: f.write(json.dumps(r) + "\n")
+    os.replace(tmp, turns_path())
+
+
+def compact_turns():
+    """Move the DISPOSED records to the archive and keep every pending one. The caller holds the lock.
+    A file that is all pending simply grows: turns nobody has classified are a backlog, and trimming them
+    by age is the bug this record exists to end."""
+    recs = read_turns()
+    if len(recs) <= TURNS_KEEP: return 0
+    gone = [r for r in recs if r.get("disposed")]
+    if not gone: return 0
+    with open(turns_path(TURNS_ARCHIVE), "a") as f:
+        for r in gone: f.write(json.dumps(r) + "\n")
+    write_turns([r for r in recs if not r.get("disposed")])
+    return len(gone)
+
+
+def keep_turn(repo, text, who="owner", src=""):
+    """Write one owner turn down, in full, before anything judges it. Returns its id, or "" if it could not
+    be written — the hook must never break a session, so this raises nothing."""
+    try:
+        os.makedirs(SCOPE, exist_ok=True)
+        text = redact(text)                             # every caller's text, not just the capture path's
+        if len(text) > TURN_MAX:
+            text = text[:TURN_MAX] + " … [%d characters not kept: one turn over %d]" % (
+                len(text) - TURN_MAX, TURN_MAX)
+        ts = now()
+        with Lock("turns"):
+            p = turns_path()
+            seq = os.path.getsize(p) if os.path.exists(p) else 0
+            tid = "t" + hashlib.sha1(("%s|%s|%d" % (ts, text, seq)).encode()).hexdigest()[:8]
+            with open(p, "a") as f:
+                f.write(json.dumps({"id": tid, "ts": ts, "repo": repo, "who": who, "src": src,
+                                    "text": text, "disposed": "", "why": "", "ask": ""}) + "\n")
+            compact_turns()
+        return tid
+    except OSError: return ""
+
+
+def dispose_turn(tid, how, why="", ask=""):
+    """What the turn turned out to be: classified, promoted or dismissed. A record already disposed of keeps
+    the first answer given — this is a log of what was decided, not a field to overwrite."""
+    try:
+        with Lock("turns"):
+            recs = read_turns()
+            for r in recs:
+                if r.get("id") == tid and not r.get("disposed"):
+                    r.update(disposed=how, why=why, ask=ask, closed=now())
+                    write_turns(recs)
+                    return True
+    except OSError: pass
+    return False
+
+
+def get_turn(tid):
+    for name in (TURNS, TURNS_ARCHIVE):
+        for r in read_turns(name):
+            if r.get("id") == tid: return r
+    sys.exit("cc-scope: no kept turn %s — `cc-scope missed --all` lists the ones still waiting" % tid)
+
+
+def turns_size():
+    """(pending, rows, bytes) of the live record. Nothing ages out of that file, so the one place it is read
+    is the place that has to say how big it has become — before it is somebody's surprise."""
+    try: b = os.path.getsize(turns_path())
+    except OSError: b = 0
+    recs = read_turns()
+    return sum(1 for r in recs if not r.get("disposed")), len(recs), b
+
+
+def human(b):
+    for u in ("B", "KB", "MB", "GB"):
+        if b < 1024 or u == "GB": return "%d %s" % (b, u) if u == "B" else "%.1f %s" % (b, u)
+        b /= 1024.0
+
+
+def pending_turns(repo=None, since=0.0):
+    """The turns nobody has answered for yet, oldest first."""
+    out = []
+    for r in read_turns():
+        if r.get("disposed"): continue
+        if repo and r.get("repo") != repo: continue
+        if since:
+            try:
+                if calendar.timegm(time.strptime(r.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ")) < since: continue
+            except ValueError: continue
+        out.append(r)
+    return out
+
+
 # The Slack path: a channel message reaches the session as a user turn, so the UserPromptSubmit hook sees it
 # with its <channel …> tag intact and `capture` takes the rest from there — no hook inside cc-slack. If a
 # delivery ever bypasses that turn, one line in cc-slack's deliver() closes the gap and nothing else changes:
@@ -391,7 +559,13 @@ REACTION = "reaction"
 
 
 def capture(repo, text, who="owner", src=""):
+    """PROVENANCE, THEN KEEP, THEN CLASSIFY — in that order, because the classifier is the part that has
+    been wrong. Everything the provenance rules accept as his is on disk in full before `is_ask` is asked
+    anything, and a turn it skips stays pending in that record instead of surviving only as a clipped log
+    line. What provenance excludes — a member, a machine, a reaction, which carries no words of his — is not
+    kept at all: this is a record of what the OWNER said, and padding it makes it useless."""
     body, attrs = strip_tag(text)
+    body = redact(body)                                 # before the record, the ledger and seen.log alike
     if attrs:
         if attrs.get("role") and attrs["role"] != "owner":
             log_seen(repo, "skip:not-owner", body, src); return None, False   # the ledger is the OWNER's asks
@@ -400,9 +574,13 @@ def capture(repo, text, who="owner", src=""):
             src = "slack %s %s" % (attrs["channel"], attrs.get("thread_ts") or attrs.get("ts") or "")
         if attrs.get("kind") == REACTION:
             log_seen(repo, "skip:reaction", body, src); return None, False    # our own reply, quoted back
+    if not_a_person(text, attrs): return None, False    # the hook's own gate, and the same one for `capture`
+    tid = keep_turn(repo, body, who, src.strip())
     if not is_ask(body):
-        log_seen(repo, "skip:no-directive", body, src); return None, False
+        log_seen(repo, "skip:no-directive", body, src)
+        return None, False                              # the record stays pending until somebody disposes of it
     aid, repeated = add(repo, body, who=who, src=src.strip())
+    dispose_turn(tid, "classified", ask="%s %s" % (repo, aid))
     log_seen(repo, "kept:%s%s" % (aid, "+" if repeated else ""), body, src)
     return aid, repeated
 
@@ -749,23 +927,67 @@ def main(argv):
                                                             " (%s)" % why if why else ""))
 
     elif cmd == "missed":
+        # Read out of the RECORD, not out of seen.log: these are the turns themselves, so anything listed
+        # here can be promoted verbatim. Pending only — a turn somebody has already answered for is not a miss.
+        everything, full = flag(args, "--all"), flag(args, "--full")
         since = float(opt(args, "--since", "24")) * 3600
         repo = args[0] if args else None
-        cut = time.time() - since
-        try: rows = open(os.path.join(SCOPE, SEEN)).read().splitlines()
-        except OSError: rows = []
-        out = []
+        rows = pending_turns(repo, 0 if everything else time.time() - since)
+        pend, total, size = turns_size()
+        if js:
+            print(json.dumps({"pending": pend, "rows": total, "bytes": size, "turns": rows}, indent=2)); return
+        when = "all of them" if everything else "last %gh" % (since / 3600)
+        # The whole file, not this repo's slice: it is one record and its growth is one number.
+        print("record: %d pending of %d rows, %s (%s)" % (pend, total, human(size), turns_path()))
+        if not rows: print("nothing of his is waiting to be classified (%s)" % when); return
+        print("owner turns kept, never classified (%s) — `promote <id>` or `dismiss <id> --why`:" % when)
+        # A clipped list that does not say it is clipped is how this went wrong the first time.
+        if len(rows) > 40: print("  … %d older ones not printed — --json has every one" % (len(rows) - 40))
+        for r in rows[-40:]:
+            print("  %s %s %s  %s" % (r["id"], r["ts"], r["repo"], r.get("src") or "-"))
+            print("      %s" % (r["text"] if full else " ".join(r["text"].split())[:160]))
+
+    elif cmd == "promote":
+        # The whole point of keeping the turn: the row is opened from HIS text, dated when he sent it, with
+        # the thread it came from. Nothing is retyped and nothing is paraphrased.
+        r = get_turn(args[0])
+        if r.get("disposed"):
+            sys.exit("cc-scope: %s was already %s%s" % (r["id"], r["disposed"],
+                                                        " (%s)" % (r.get("ask") or r.get("why")) if
+                                                        (r.get("ask") or r.get("why")) else ""))
+        chk = opt(args, "--check")
+        refuse_doomed(r["repo"], "<new>", chk)
+        aid, rep = add(r["repo"], r["text"], who=r.get("who") or "owner", src=r.get("src", ""),
+                       track=opt(args, "--track"), done_when=opt(args, "--done-when"),
+                       check=chk, at=r.get("ts", ""))
+        dispose_turn(r["id"], "promoted", ask="%s %s" % (r["repo"], aid))
+        print("%s %s%s ← %s" % (r["repo"], aid, " (asked again)" if rep else "", r["id"]))
+
+    elif cmd == "dismiss":
+        why = opt(args, "--why")
+        if not why: sys.exit("cc-scope: dismiss needs --why — a turn leaves the list with a reason, like a decline")
+        r = get_turn(args[0])
+        if r.get("disposed"): sys.exit("cc-scope: %s was already %s" % (r["id"], r["disposed"]))
+        dispose_turn(r["id"], "dismissed", why=why)
+        print("%s dismissed: %s" % (r["id"], why))
+
+    elif cmd == "classify":
+        # The classifier is a filter that has been wrong and will be again, so this is how a session runs the
+        # current one over what an older one skipped. Only the turns it now keeps move; the rest stay pending,
+        # which is the honest answer rather than a second silent drop.
+        tid = opt(args, "--id")
+        rows = [get_turn(tid)] if tid else pending_turns(args[0] if args else None)
+        rows = [r for r in rows if not r.get("disposed")]
+        kept = 0
         for r in rows:
-            f = r.split("\t")
-            if len(f) < 5 or not f[2].startswith("skip"): continue
-            if repo and f[1] != repo: continue
-            try:
-                if calendar.timegm(time.strptime(f[0], "%Y-%m-%dT%H:%M:%SZ")) < cut: continue
-            except ValueError: continue
-            out.append("  %s %s  %s" % (f[0], f[1], f[4]))
-        print("owner messages the classifier did not open an ask for (last %gh):" % (since / 3600) if out
-              else "nothing skipped in the last %gh" % (since / 3600))
-        for o in out[-40:]: print(o)
+            if not is_ask(r["text"]): continue
+            aid, _ = add(r["repo"], r["text"], who=r.get("who") or "owner", src=r.get("src", ""),
+                         at=r.get("ts", ""))
+            dispose_turn(r["id"], "classified", ask="%s %s" % (r["repo"], aid))
+            print("  %s %s ← %s  %s" % (r["repo"], aid, r["id"], " ".join(r["text"].split())[:80]))
+            kept += 1
+        print("cc-scope: %d of %d pending turn(s) opened a row, %d still waiting" %
+              (kept, len(rows), len(rows) - kept))
 
     elif cmd == "import":         # seed/replay: <at>TAB<src>TAB<track>TAB<status>TAB<evidence>TAB<text>
         repo, f = args[0], args[1]
@@ -797,8 +1019,8 @@ def main(argv):
 
 # ---- selfcheck -------------------------------------------------------------------------------------
 def selfcheck():
-    global SCOPE
-    import tempfile, shutil
+    global SCOPE, TURNS_KEEP, TURN_MAX
+    import tempfile, shutil, io
     SCOPE = tempfile.mkdtemp(prefix="cc-scope-selfcheck-")
     p = f = 0
     def ok(n): nonlocal p; p += 1; print("  ✓ %s" % n)
@@ -1158,6 +1380,140 @@ def selfcheck():
           n == 0 and '"block"' in out and "use window _hooktest" in out)
         t("...and from any other session the same prompt is neither blocked nor lost",
           hook_run("please add the relay case to the hook", record=retired) == (1, ""))
+        # ---- KEPT BEFORE IT IS CLASSIFIED --------------------------------------------------------------
+        # The real miss, verbatim (2026-09-08 01:0xZ). One sentence, opening with an ack, with every
+        # cue it carries sitting behind that ack — so it was skipped, and the only copy of it left was a
+        # seen.log line clipped at 160 characters.
+        miss = "Ok well do whatever you need to speed up the whole landing and review process"
+        t("a directive that opens with an acknowledgement is an ask", is_ask(miss))
+        t("...and what is kept is his whole sentence, ack and all", parts_of(miss) == [miss])
+        t("...while a bare ack, and an ack that only compliments, are still not asks",
+          not is_ask("thanks!") and not is_ask("ok cool, thanks a lot")
+          and not is_ask("nice, this is exactly what I was hoping for, really good work"))
+
+        # `rec` is how every case below reads the record back, and it answers {} rather than raising: a
+        # missing record is the failure these cases exist to report, and one that ends the run reports
+        # nothing about the cases after it.
+        def rec(txt):
+            r = [x for x in read_turns() if x["text"] == txt]
+            return r[0] if len(r) == 1 else {}
+
+        aM, _ = capture(R, '<channel source="cc-slack" chat_id="C1" thread_ts="19.1" ts="19.2" '
+                           'user="ada.byron" role="owner" channel="#demo">\n' + miss)
+        rM = rec(miss)
+        t("that exact message is kept in full, with its thread, and opens a row",
+          aM and rM and rM["src"].startswith("slack #demo 19.1")
+          and rM["disposed"] == "classified" and get(R, aM)["text"] == miss)
+
+        # ...and one the classifier skips is kept just the same, and stays PENDING until somebody answers for it
+        skipped_turn = "ok, ship it"
+        capture(R, skipped_turn, src="terminal ab12cd34")
+        pend = rec(skipped_turn)
+        t("a turn the classifier skips opens no row and is kept anyway",
+          not is_ask(skipped_turn) and pend and not pend["disposed"])
+        t("...and it is what `missed` lists, by an id you can act on",
+          pend and pend["id"] in run_capture(["missed", R, "--all"]))
+        before = len(load(R)["asks"])
+        if pend: quiet(["promote", pend["id"]])
+        prom = [a for a in load(R)["asks"].values() if a["text"] == skipped_turn]
+        t("promote opens the ask from the kept text — his words, his source, the time he sent it",
+          len(load(R)["asks"]) == before + 1 and len(prom) == 1 and pend
+          and prom[0]["src"] == "terminal ab12cd34" and prom[0]["asked"] == pend["ts"])
+        t("...and the record is disposed of, so it drops off the missed list",
+          pend and get_turn(pend["id"])["disposed"] == "promoted"
+          and pend["id"] not in run_capture(["missed", R, "--all"]))
+
+        capture(R, "ok nice one", src="terminal ab12cd34")
+        dmr = rec("ok nice one")
+        dm = dmr.get("id", "nothing-was-kept")
+        try:
+            quiet(["dismiss", dm]); bad("dismiss without a reason is refused")
+        except SystemExit as e: t("dismiss without a reason is refused", "--why" in str(e))
+        t("a dismissed turn leaves the list with the reason on the record",
+          bool(dmr) and quiet(["dismiss", dm, "--why", "an ack on its own, nothing asked"]) == 0
+          and get_turn(dm)["disposed"] == "dismissed" and dm not in run_capture(["missed", R, "--all"]))
+        # A turn an OLDER classifier skipped: `classify` is how a session runs today's over the backlog.
+        tC = keep_turn(R, "please put the ask count on the tab", "ada.byron", "terminal old")
+        t("classify runs the classifier again and opens the rows it now keeps",
+          quiet(["classify", R]) == 0 and get_turn(tC)["disposed"] == "classified"
+          and any(a["text"] == "please put the ask count on the tab" for a in load(R)["asks"].values()))
+
+        # ---- A TOKEN HE PASTED IS NOT KEPT ------------------------------------------------------------
+        # split so the file itself never holds a token shape: GitHub push protection refused the public publish on it
+        tok = "xox" + "b-2222222222-3333333333-abcdefghijklmnop"
+        capture(R, "the deploy token is %s by the way" % tok, src="terminal ab12cd34")
+        rT = [r for r in read_turns() if r["text"].startswith("the deploy token is")]
+        t("a token in a turn is redacted before the turn is written down",
+          len(rT) == 1 and tok not in rT[0]["text"] and "[redacted]" in rT[0]["text"])
+        if rT: quiet(["promote", rT[0]["id"]])
+        aT = [a for a in load(R)["asks"].values() if a["text"].startswith("the deploy token is")]
+        t("...and the ask promoted from it carries the redacted text, not the token",
+          len(aT) == 1 and tok not in aT[0]["text"] and "[redacted]" in aT[0]["text"])
+        t("...and the token is nowhere in the record or the log beside it",
+          not any(tok in json.dumps(r) for r in read_turns())
+          and tok not in open(os.path.join(SCOPE, SEEN)).read())
+        # THE COPY MUST NOT DRIFT. cc-slack owns this pattern; its source is parsed (never imported — that
+        # would cost every prompt a parse of the whole file) and this copy is held to it character for character.
+        sib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-slack")
+        theirs = ""
+        try:
+            import ast
+            for nd in ast.walk(ast.parse(io.open(sib, encoding="utf-8").read())):
+                if (isinstance(nd, ast.Assign) and getattr(nd.targets[0], "id", "") == "SECRET_RE"
+                        and isinstance(nd.value, ast.Call) and nd.value.args):
+                    theirs = ast.literal_eval(nd.value.args[0])
+        except Exception: theirs = ""
+        t("the secret pattern is cc-slack's own, not a copy that has drifted away from it",
+          SECRET_RE.pattern == theirs if theirs else not os.path.exists(sib))
+
+        keep_max, TURN_MAX = TURN_MAX, 200
+        try:
+            tB = keep_turn(R, "ok, " + "x" * 400, "ada.byron", "terminal ab12cd34")
+            t("one absurd paste is cut, and the record says how much of it was not kept",
+              len(get_turn(tB)["text"]) < 400 and "204 characters not kept" in get_turn(tB)["text"])
+        finally:
+            TURN_MAX = keep_max
+
+        # ---- COMPACTION ARCHIVES DISPOSED RECORDS, IT DOES NOT TRIM BY AGE -----------------------------
+        # seen.log keeps its last 400 lines, so a real ask aged out of the only copy of it. The way out of
+        # this file is being disposed of, and even then the record is appended to the archive, not dropped.
+        keep_n, TURNS_KEEP = TURNS_KEEP, 6
+        try:
+            stays = keep_turn(R, "ok whatever you think is best, your call", "ada.byron", "terminal ab12cd34")
+            gone = [keep_turn(R, "filler turn %d" % i, "ada.byron", "terminal ab12cd34") for i in range(10)]
+            for g in gone: dispose_turn(g, "dismissed", why="filler")
+            keep_turn(R, "one more, which puts the file over the threshold", "ada.byron", "terminal ab12cd34")
+            live = {r["id"] for r in read_turns()}
+            t("a pending turn survives compaction however big the file gets",
+              stays in live and get_turn(stays)["text"].startswith("ok whatever"))
+            t("...and the disposed ones are archived, not deleted",
+              not (set(gone) & live) and set(gone) <= {r["id"] for r in read_turns(TURNS_ARCHIVE)})
+        finally:
+            TURNS_KEEP = keep_n
+
+        out = run_capture(["missed", R, "--all"])
+        t("`missed` says how big the record has got — pending, rows and bytes, on one line",
+          re.search(r"record: \d+ pending of \d+ rows, [\d.]+ ?\w+ \(", out))
+        # .get(), not [], all the way through: a json form that lost the numbers is what this case is for,
+        # and it should say so rather than end the run on a KeyError.
+        jm = json.loads(run_capture(["missed", R, "--all", "--json"]))
+        t("...and the json form carries the same three numbers beside the turns",
+          isinstance(jm, dict) and jm.get("rows") == len(read_turns())
+          and jm.get("pending") == len(pending_turns())
+          and jm.get("bytes") == os.path.getsize(turns_path())
+          and [x["id"] for x in jm.get("turns", [])] == [x["id"] for x in pending_turns(R)])
+
+        # A MACHINE'S TURN IS NOT KEPT — decided on provenance, never on how the sentence reads.
+        was = len(read_turns())
+        t("a machine's turn is not kept at all, though a real one right after it is",
+          hook_asks("Your claude.ai usage limit has reset. Continue the task you were working on when the "
+                    "limit was reached.") == 0
+          and hook_asks("<task-notification>\n<summary>the digest is down, restart it</summary>\n"
+                        "</task-notification>") == 0
+          and len(read_turns()) == was
+          and hook_asks("ok well do whatever you need to speed the landing up") == 1
+          and len(read_turns()) == was + 1)
+
         n = int(run_capture(["count", R]))
         t("count is the number of unsettled asks", n == len(select(R)))
         t("digest says nothing when nothing is open", run_capture(["digest", "_empty"]).strip() == "")

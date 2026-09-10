@@ -14,11 +14,26 @@
  * travels in the mail's own Authentication-Results headers, which are part of the raw bytes, and the receiver
  * re-reads them there.
  *
+ * THE OTHER DIRECTION, milestone 4: `fetch()` below is the box's way OUT. The box builds the whole RFC822
+ * message itself (core/mail/outbound.py) and POSTs it here with the recipients listed explicitly; this worker
+ * checks the secret, checks the From is on its own domain, and hands one EmailMessage per recipient to the
+ * `send_email` binding. It never reads a recipient out of the message it was given, so nothing in a mail's
+ * body or headers can add one. Cloudflare will only deliver to a destination address VERIFIED in the account
+ * (developers.cloudflare.com/email-routing/email-workers/send-email/), and a refusal comes back to the box as
+ * a named failure rather than a silent drop.
+ *
  * Config (Workers → Settings):
  *   BOX_URL      var    — the tunnel hostname plus the path, e.g. https://<hostname>/inbound
  *   MAIL_SECRET  SECRET — must be a Wrangler *secret* (`wrangler secret put MAIL_SECRET`), never a var in
  *                         wrangler.toml: a var is plain text in the dashboard and in the repo, and this value
  *                         is the only thing that proves a caller is this worker.
+ *   SEND_SECRET  SECRET — the other direction's lock: what proves a caller of `fetch()` is the box. A
+ *                         DIFFERENT value from MAIL_SECRET on purpose — one secret doing both jobs means a
+ *                         leak in either direction costs both.
+ *   SEND_DOMAIN  var    — the box's mail domain. A From that is not on it is refused, so this worker can only
+ *                         ever send AS the box and never as anybody else.
+ *   SEND         send_email binding — `[[send_email]] name = "SEND"` in wrangler.toml. Without it `fetch()`
+ *                         answers 503 and the box shows that in the thread.
  *   ACCESS_CLIENT_ID, ACCESS_CLIENT_SECRET
  *                SECRETs — optional, and recommended: a Cloudflare Access service token on the tunnel
  *                         hostname. With them set, Access turns away everything that is not this worker at
@@ -127,7 +142,88 @@ export default {
       console.log(`reply not sent (${answer.status}): ${err}`);
     }
   },
+
+  /**
+   * THE BOX'S WAY OUT (milestone 4). POST <worker>/send, Bearer SEND_SECRET, JSON:
+   *   {"from": "<an address on SEND_DOMAIN>", "to": ["<recipient>", …], "raw": "<base64 RFC822>"}
+   * Answers 200 {"ok":true,"sent":[…],"failed":[{"to":…,"error":…}]} or 4xx/503 {"ok":false,"error":…}.
+   *
+   * THE RECIPIENTS ARE THE ONES THE BOX NAMED, AND `raw` IS NEVER READ FOR ONE. The box has already narrowed
+   * them to the addresses the original mail carried, so parsing To:/Cc: here would only be a second, weaker
+   * chance to get it wrong — and a mail body that writes its own headers would then have a way out.
+   *
+   * A FAILURE PER RECIPIENT, NOT FOR THE CALL. `send_email` refuses an address the account has not verified,
+   * and a mail to four people where one is unverified should still reach the other three; the refusal comes
+   * back named, the box logs it and shows it in the thread, and nothing is dropped quietly.
+   */
+  async fetch(request, env) {
+    const bad = (status, error) => new Response(JSON.stringify({ ok: false, error }), {
+      status, headers: { "Content-Type": "application/json" },
+    });
+    if (new URL(request.url).pathname !== "/send") return bad(404, "not found");
+    if (request.method !== "POST") return bad(405, "POST only");
+    // The secret is the whole authentication. Compared without an early exit, so the answer's timing says
+    // nothing about how much of a guess was right.
+    const offered = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+    if (!env.SEND_SECRET || !sameSecret(offered, env.SEND_SECRET)) return bad(401, "unauthorized");
+    if (!env.SEND) return bad(503, "this worker has no send_email binding");
+
+    let body;
+    try {
+      body = await request.json();
+    } catch (err) {
+      return bad(400, "the body is not JSON");
+    }
+    const from = typeof body?.from === "string" ? body.from.trim() : "";
+    const domain = (env.SEND_DOMAIN || "").trim().toLowerCase();
+    if (!domain) return bad(503, "SEND_DOMAIN is not set on this worker");
+    // ONLY AS ITSELF, AND ONLY ONE ADDRESS. Cloudflare requires the From to be on a domain of this account;
+    // checking it here as well turns a runtime throw into one refusal the box can show, and states the rule
+    // where it is read. The SHAPE is checked exactly as a recipient's is, because `endsWith` alone takes
+    // "attacker@evil.test, x@box.example" — a second address smuggled in front of ours ends on our domain
+    // just as well: one local part, one @, and the domain that follows it is this one and nothing else.
+    const fromOk = /^[^\s@<>,;:"]+@[^\s@<>,;:"]+$/.test(from)
+      && from.slice(from.indexOf("@") + 1).toLowerCase() === domain;
+    if (!fromOk) return bad(403, `From is not one address on ${domain}`);
+
+    const to = Array.isArray(body?.to)
+      ? body.to.map((a) => String(a || "").trim()).filter((a) => /^[^\s@<>,]+@[^\s@<>,]+$/.test(a))
+      : [];
+    if (!to.length) return bad(400, "no recipient");
+    if (to.length > 20) return bad(400, "too many recipients");
+
+    let raw;
+    try {
+      raw = atob(String(body?.raw || ""));
+    } catch (err) {
+      return bad(400, "raw is not base64");
+    }
+    if (!raw) return bad(400, "raw is empty");
+
+    const sent = [], failed = [];
+    for (const rcpt of to) {
+      try {
+        await env.SEND.send(new EmailMessage(from, rcpt, raw));
+        sent.push(rcpt);
+      } catch (err) {
+        // The commonest one by far: a destination address nobody has verified in this account. It is the
+        // owner's runbook step, not a bug, and it has to reach a person as words rather than as a lost mail.
+        failed.push({ to: rcpt, error: String(err && err.message ? err.message : err).slice(0, 300) });
+      }
+    }
+    return new Response(JSON.stringify({ ok: true, sent, failed }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    });
+  },
 };
+
+// Equal-length, no early exit. Two strings of different lengths are not equal and that much the timing may say.
+function sameSecret(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
 
 // Anything that came off the incoming mail is attacker-controlled. A CR or an LF in it would end the header
 // and start one of the sender's choosing, so they never survive into a header line.

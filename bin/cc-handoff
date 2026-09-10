@@ -63,10 +63,26 @@ no overlap is open and the LAST one for this target ended with the predecessor s
 abandoned, expired, or started and never finished). A cut-over target is never retried — the successor holds the
 window by then, and starting a second overlap would aim at it. Everything else is the 40% path unchanged.
 
-BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 45 min, ~/.cc/config). The watchdog is the
-predecessor's own Stop hook, which already runs every turn — no new timer, no new daemon. At the deadline the
+BOUNDED, AND SHORT. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 20 min, ~/.cc/config). The watchdog is
+the predecessor's own Stop hook, which already runs every turn — no new timer, no new daemon. At the deadline the
 context ceiling decides: below it, abandon and tell the owner once; at or over it, force the cutover, or fall
 back to today's stop-then-restart `cc handoff`. The new path fails INTO the old one and cannot take it down.
+The cap was 45 min until 2026-09-08. An overlap runs TWO planning-class sessions side by side, and a wake of one
+re-reads its whole context — so the tail of an overlap is the most expensive idle on the box. The retiring seat
+measured about 15 of those 45 minutes as actually used (planning seat e2), and the window ends at the successor's
+--ready anyway; 20 min is the wait for a successor that is going to make it, not the wait for one that is not.
+
+AND QUIET WHILE IT IS OPEN. The successor's questions are the only thing worth a predecessor's turn during an
+overlap: it is retiring, so a drive-loop tick or a machine digest buys a full-context wake for work it will hand
+over minutes later. So start() marks the target quiet — `~/.cc/state/<target>/pulse.off`, the opt-out cc-pulse
+already honours (cc-pulse:690-694) — and the mark comes off at cutover (from that instant the name is the
+SUCCESSOR's and the drive loop must reach it) and again in clear(), which every path that ends an overlap goes
+through. A mark this file did not make is never removed: the record lists what start() wrote, and only that is
+taken back, so a session or an owner who switched the pulse off keeps it switched off.
+Machine digests are cc-broker's, and its only per-target hold is `cc-pause is <target>` — which parks the whole
+PROJECT (its loops, the landing queue, publish, janitor), far wider than one retiring session, so it is not used
+here. What bounds them instead is the cap above: cc-broker debounces a digest 12 min, so a 20 min overlap is at
+most a wake or two of machine chatter rather than 45 minutes of it.
 
 NOTHING IS LEFT TO A SESSION THAT MAY BE GONE. Every phase above is driven by a session's own Stop hook, which
 is exactly what a crashed one no longer has — so --sweep, on the EXISTING cc-reconcile timer, finishes what no
@@ -129,7 +145,8 @@ BIN = os.path.dirname(os.path.realpath(__file__))
 SESSION = "main"
 NEXT = "~next"                     # the successor's window suffix; `~` is not legal in a repo/track name
 OLD = "~old"                       # ...and the predecessor's, from cutover to the end of its drain
-DEFAULT_MAX = 45 * 60
+DEFAULT_MAX = 20 * 60              # the overlap's cap — see BOUNDED, AND SHORT; CC_HANDOFF_OVERLAP_MAX overrides it
+QUIET_MARK = "pulse.off"           # the file cc-pulse reads to leave a target alone, and the only mark we write
 NAME = r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}"
 ALIAS = r"[a-z0-9-]{2,20}"         # `cc <repo> --orch <alias>` accepts exactly this, so this accepts exactly it
 TARGET_RE = re.compile(rf"^{NAME}(@{ALIAS}|/{NAME})?$")   # the three shapes above, and nothing else
@@ -247,7 +264,59 @@ def brief_path(target):
     return os.path.join(HANDOFF, slug(target) + ".brief")
 
 
+def quiet_path(target):
+    """The drive loop's own opt-out for this address — `~/.cc/state/<target>/pulse.off`, keyed exactly as
+    cc-pulse keys it, so `r1` and `r1@dash` are separate files and a track's sits under its repo."""
+    return os.path.join(STATE, target, QUIET_MARK)
+
+
+def quiet_claim(target):
+    """Which marks this overlap may make — [] when a pulse.off is already there, because that one is somebody
+    else's decision and is neither rewritten nor, later, taken away. Asked BEFORE the record is written, so the
+    record can name the mark before the mark exists: a crash between the two leaves nothing to remove, while a
+    mark no record names would leave the target out of the drive loop for good."""
+    return [] if os.path.exists(quiet_path(target)) else [QUIET_MARK]
+
+
+def quiet(target, marks):
+    """Make the marks the record has already claimed. Mark the retiring session quiet for the overlap: the
+    successor's questions are the only thing worth a full-context wake from a session that is handing over."""
+    if QUIET_MARK not in (marks or []):
+        return []
+    p = quiet_path(target)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write("cc-handoff: an overlap is open on %s — the drive loop leaves the retiring session alone "
+                    "until it is over. Removed by cc-handoff itself.\n" % target)
+    except OSError:
+        return []                                  # a mark we could not write is one nobody waits on
+    return [QUIET_MARK]
+
+
+def unquiet(rec):
+    """Take back the marks THIS overlap made, and nothing else. Called at cutover — from that instant the name
+    belongs to the successor and the drive loop must reach it — and again from clear(), which every path that
+    ends an overlap goes through, so a crashed cutover still leaves no target muted for good."""
+    if not rec:
+        return []
+    gone = []
+    for m in rec.get("quiet") or []:
+        if m != QUIET_MARK:                        # the record is a file: never build a path out of what it says
+            continue
+        try:
+            os.remove(quiet_path(rec["target"]))
+            gone.append(m)
+        except OSError:
+            pass
+    if gone and os.path.exists(path(rec["target"])):   # only ever stamp a record still on disk
+        rec["quiet"] = [m for m in (rec.get("quiet") or []) if m not in gone]
+        write(rec)
+    return gone
+
+
 def clear(target):
+    unquiet(read(target))          # the record is still on disk here, and it is what says which marks are ours
     for f in (path(target), brief_path(target)):
         try:
             os.remove(f)
@@ -556,7 +625,11 @@ def subagents(sid, idle=None):
 
 # ---- phases --------------------------------------------------------------------------------------------
 
-BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. Your FIRST tool call is \
+BRIEF = """You are the SUCCESSOR in an overlapping handoff of {target}. THE OVERLAP IS SHORT: {mins} minutes at \
+most, because every minute of it runs two sessions of this size, and it ends the moment you run \
+`cc-handoff --ready`. So the order is fixed — read the packet, ask your ONE batch of questions FIRST, and go \
+ready as soon as they are answered. Anything you could do just as well alone five minutes later, do it then. \
+Your FIRST tool call is \
 `cc-handoff --brief {target}` — one packet holding the last entry of {journal} and the dated lines after it, \
 the unfinished board, what is landing, the live workers, the open PRs and the open asks. That packet plus what \
 your predecessor tells you is everything you start from; rebuilding it a call at a time is what made a handover \
@@ -678,7 +751,8 @@ def landed(wid, text):
 
 KICK = (MACHINE + "{hid}: you are the SUCCESSOR for {target} — your handoff brief is in your system prompt. "
         "Start now: run `cc-handoff --brief {target}` first, ask the predecessor ONE batch of questions about "
-        "what the packet did not answer, and run `cc-handoff --ready` only once you have the context.")
+        "what the packet did not answer, and run `cc-handoff --ready` as soon as they are answered — the "
+        "overlap is short and costs two sessions for every minute it is open.")
 
 
 def kick(target, hid=""):
@@ -770,15 +844,19 @@ def start(target, pct=None, session_id="", flight=""):
     now = time.time()
     hid = uuid.uuid4().hex[:12]
     sid = str(uuid.uuid4())
+    cap = cfg("CC_HANDOFF_OVERLAP_MAX", DEFAULT_MAX)    # once: the deadline and the brief must name the same number
     rec = {"id": hid, "target": target, "phase": "overlap", "live": "predecessor",
            "predecessor": {"session_id": session_id or "", "tmux": wid, "window": target},
            "successor": {"session_id": sid, "tmux": "", "window": target + NEXT},
-           "started": now, "deadline": now + cfg("CC_HANDOFF_OVERLAP_MAX", DEFAULT_MAX),
+           "started": now, "deadline": now + cap,
+           # …and for as long as that runs, nothing but the successor wakes the predecessor — see AND QUIET.
+           "quiet": quiet_claim(target),
            "pct_at_start": pct, "told_owner": None, "phases": []}
     ledger(rec, "overlap-started")
     write(rec)          # before the window, never after: a successor whose record is missing must find itself gated
+    quiet(target, rec["quiet"])     # after the record names it, never before: see quiet_claim()
     with open(brief_path(target), "w") as f:
-        f.write(BRIEF.format(target=target, journal=journal_for(target), tmux=wid,
+        f.write(BRIEF.format(target=target, journal=journal_for(target), tmux=wid, mins=int(cap // 60),
                              flight=(f"Unfinished RIGHT NOW, which a journal always omits: {flight} — ask about it."
                                      if flight else "")))
     # The successor's OWN window name, carried into it: `cc __runnext` knows the target but not this suffix, so
@@ -919,6 +997,9 @@ def derive(rec, first=False):
         cmds += ([";"] if cmds else []) + ["rename-window", "-t", suc, target]
     if cmds:
         tmux(*cmds)
+    # …and the quiet marks come off with the name. `<target>` is the SUCCESSOR's from here, and it is not
+    # retiring: leaving pulse.off on it would take the new session out of the drive loop for good.
+    unquiet(rec)
     # kick() spooled the opening prompt under the successor's STARTUP name (<target>~next); the rename above would
     # strand that mail forever (review-157b) — it moves with the window, appended behind anything already spooled
     # for the live name, and the ~next state dir (only ever cc-msg inbox files; `~` is not legal in a name) goes too.
@@ -1781,12 +1862,45 @@ def selfcheck():
         ok("an overlap starts on a live window", start("r1", pct=41.2) == 0)
         rec = read("r1")
         ok("the record names the predecessor as live", rec and rec["live"] == "predecessor")
-        ok("the deadline is bounded", rec["deadline"] - rec["started"] == DEFAULT_MAX)
+        ok("the deadline is bounded, and the cap is 20 min — an overlap runs two planning-class sessions side "
+           "by side, and the retiring seat measured ~15 of the old 45 min as actually used (2026-09-08)",
+           DEFAULT_MAX == 20 * 60 and rec["deadline"] - rec["started"] == DEFAULT_MAX)
         ok("a second overlap for the same target is refused", start("r1") == 1)
         nw = [a for a in tcalls if a[0] == "new-window"][-1]
         ok("the successor is told ITS OWN window name, so it accepts the startup dialog in its own pane and "
            "not in its predecessor's — one parked on that confirmation until a human noticed (2026-09-01)",
            "CC_HANDOFF_WINDOW='r1~next' " in nw[-1] and nw[nw.index("-n") + 1] == "r1~next")
+        # …and the number is still the box's to set: CC_HANDOFF_OVERLAP_MAX through cc-config, env first.
+        wins["r1cap"] = "@1cap"
+        os.environ["CC_HANDOFF_OVERLAP_MAX"] = "300"
+        ok("CC_HANDOFF_OVERLAP_MAX overrides the default, and the brief the successor reads names the same "
+           "number as the deadline", start("r1cap") == 0
+           and read("r1cap")["deadline"] - read("r1cap")["started"] == 300
+           and "5 minutes at most" in open(brief_path("r1cap")).read())
+        os.environ.pop("CC_HANDOFF_OVERLAP_MAX", None)
+        abandon("r1cap")
+        ok("an overlap that ends without a cutover takes its own quiet mark back — clear() is the failsafe "
+           "every ending goes through, so no target is left out of the drive loop for good",
+           not os.path.exists(quiet_path("r1cap")) and read("r1cap") is None)
+        wins.pop("r1cap~next", None); wins.pop("r1cap", None)
+
+        # ---- QUIET WHILE IT IS OPEN. The successor's questions are the only thing worth a full-context wake
+        # from a session that is handing over; a drive-loop tick during the overlap buys one for work it is
+        # about to give away. The mark is cc-pulse's own opt-out — no second mechanism to keep in step.
+        ok("the overlap marks the retiring target quiet, with cc-pulse's own opt-out",
+           os.path.exists(quiet_path("r1")) and read("r1")["quiet"] == [QUIET_MARK])
+        ok("...and the record says which mark is OURS, so nothing else's is taken back later",
+           quiet_path("r1") == os.path.join(STATE, "r1", "pulse.off"))
+        wins["r1q"] = "@1q"
+        os.makedirs(os.path.join(STATE, "r1q"), exist_ok=True)
+        open(quiet_path("r1q"), "w").write("the owner switched this one off\n")
+        ok("a pulse.off that was already there is somebody else's decision: not claimed, not rewritten",
+           start("r1q") == 0 and read("r1q")["quiet"] == []
+           and "owner" in open(quiet_path("r1q")).read())
+        abandon("r1q")
+        ok("...and abandoning the overlap leaves it exactly where it was", os.path.exists(quiet_path("r1q")))
+        wins.pop("r1q~next", None); wins.pop("r1q", None)
+
         # Hermetic on purpose: the CALLER's $HOME and $CC_CTX_RECORDS are exactly what this case is about, so
         # neither may decide it — selftest.sh sets the latter, and the case passed alone and failed in the run.
         env0 = {k: os.environ.get(k) for k in ("HOME", "CC_CTX_RECORDS")}
@@ -1924,12 +2038,19 @@ def selfcheck():
         ok("the commit point moved ownership forward", read("r1")["live"] == "successor")
         ok("the predecessor was told to journal and exit",
            any("cc-msg" in a[0] for a in msgs if isinstance(a, list)))
+        # THE OVERLAP ENDS AT THE READY SIGNAL, not at the deadline: --ready is the successor saying its one
+        # batch is answered, and the retirement is started from the commit point itself.
+        ok("--ready retires the predecessor there and then — the deadline is the other way out, not the way",
+           any(isinstance(a, list) and a[-2:] == ["--retire", "r1"] for a in msgs))
+        ok("...and the quiet marks come off with the name: `r1` is the SUCCESSOR's now, and a live session left "
+           "out of the drive loop is worse than the wakes this saved",
+           not os.path.exists(quiet_path("r1")) and read("r1")["quiet"] == [])
         ok("--ready is idempotent, never a rollback", ready() == 0 and read("r1")["live"] == "successor")
         ok("--abandon after cutover is refused", abandon("r1") == 1 and read("r1")["live"] == "successor")
 
         lines = [json.loads(l) for l in open(os.path.join(RECORDS, "handoffs.jsonl"))]
-        ok("one ledger line per phase, and never two",
-           [l["kind"] for l in lines] == ["overlap-started", "overlap-cutover"])
+        ok("one ledger line per phase, and never two",     # of THIS handoff: the cases above open others
+           [l["kind"] for l in lines if l["target"] == "r1"] == ["overlap-started", "overlap-cutover"])
 
         # a successor that dies before --ready: ownership never moved, so the predecessor never noticed
         clear("r1")

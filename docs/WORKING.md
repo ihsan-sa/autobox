@@ -2,6 +2,16 @@
 
 The system's rules live in scripts; this is the part that takes judgement. Read once per session.
 
+## spend comes first
+What the box costs is the context carried per wake-up, not the code written — the cache reads of a busy day run
+two orders of magnitude above everything written in it. So the four calls that set the bill come before the rest
+of this file, and every session kind is handed the short form of them at start (`config/spend-prompt.md`):
+fewest wake-ups, smallest context, cheapest model that holds quality, one review read per head. The numbers and
+the reasoning are where they belong — waking under **dispatch judgement**, the bands under **model policy**, the
+single read under **taking a board row** — and this section only says which comes first when they compete.
+It is a rule about how you work, not a throttle: the usage limit is the owner's to set, and no session holds
+work back for it or asks him to choose between a review and a landing.
+
 ## the standard
 A session is a productive employee, not a task runner. It does not invent work — but when the
 immediate task is done it looks up: what are the standing goals, what has the owner been talking
@@ -26,9 +36,12 @@ Two watches run beside the loop, started once per session and never copied from 
 `cc-watch orphans`, each detached into a log this session reads (`setsid nohup cc-watch land > land.log 2>&1 &`)
 — a landing that vanished, and a duplicate or reparented worker. `cc-watch --help` has the options.
 
-The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wakes every session
-every 2 h — the tick carries what the files say (red main, open asks, queued rows, rows in flight) so an empty check
-is cheap — and each one works the order above on its own; nothing here waits to be asked.
+The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wakes a planning seat when the
+files say there is something it can act on now — main is red, a row stopped, a queued row could actually be
+started, or an owner ask has sat past its line — and once a day when there is not, which is the tick that sends
+a session to its goals. An orch is never pulsed; its own channel and its own workers wake it. The tick carries
+what the files say (red main, open asks, queued rows, rows in flight) so an empty check is cheap, and each
+session works the order above on its own; nothing here waits to be asked.
 
 ## taking a board row
 The native managed path is opt-in: `cc-config get CC_NATIVE_ADAPTER 0` must return `1`, and the owner must
@@ -106,8 +119,8 @@ so anything left running is the successor's to pick up, worktrees and landing bo
   itself and re-queues the PR when that branch pushes. You hear about the second stop.
   A subagent's branch has no worker to push it: resume the same builder, then commit and push its worktree yourself.
 - No worker-to-worker messaging, no agent teams. An orch (`cc <repo> --orch <alias>`) is a peer session with its own channel, not a layer under the planner.
-- Only decision-class events wake a session; everything else goes to a file it reads on its next turn. Events arriving together cost a fraction of the same events spread out.
-- Hand off when replaying the context per turn costs more than a handoff over the turns still to come: an event-driven planner around 40% of the window. A worker's iteration ends at that same 40% line: cc-context marks the journal, and cc-loop's next fresh iteration is the handoff. The 60% ceiling is the backstop for interactive sessions. Keep history append-only.
+- Only decision-class events wake a session; everything else goes to a file it reads on its next turn. Events arriving together cost a fraction of the same events spread out. A monitor, watch or notifier emits on TERMINAL states only and once — a line per stage it passes through is the same information at several times the price.
+- Hand off when replaying the context per turn costs more than a handoff over the turns still to come: an event-driven planner at about 150k tokens carried. That is a token count and not a percentage on purpose — on a 1M window `cc-context`'s own handoff line sits far above it, so the count is what a session watches and the tool's word is the backstop. A worker's iteration ends on the same count: cc-context marks the journal, and cc-loop's next fresh iteration is the handoff. cc-context's own 40% handoff line and 60% ceiling stay the backstop for interactive sessions. Keep history append-only.
 
 ## model policy
 Planning sessions and orchs run the strongest available model (cc-model's primary, Fable); a headless

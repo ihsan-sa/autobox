@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""cc-mail — the box's mail door, inbound only, on loopback.
+"""cc-mail — the box's mail door: a server for what comes in, and one subcommand for a mail the box starts.
 
 WHAT IT IS. A Cloudflare Email Worker (`inbound-worker.js`, next to this file) is handed every mail for the
 box's mail domain and POSTs it here over HTTPS through a tunnel of its own. This server checks the call, the
 sender, the size and a rate limit, writes what passes into ~/.cc/mail/inbox/, and answers the worker in the same
-event so the worker can reply "received" to the sender before Cloudflare closes it. Nothing is routed, read or
-acted on here — that is milestone 2. See docs/2026-09-08-email.md for the owner's one-time activation.
+event so the worker can reply "received" to the sender before Cloudflare closes it.
+
+WHERE THE MAIL THEN GOES IS NOT DECIDED HERE. Once it is stored, this server puts the id on the cc-slack
+daemon's socket and that is its whole part in delivery: core/mail/router.py decides which channels the mail
+belongs in and the daemon posts and delivers them. This process holds no Slack token and makes no Slack call.
+The daemon's answer is what the sender hears back, so a refusal ("I could not tell whose workspace this address belongs to") reaches
+them; a daemon that is down costs the delivery and not the mail. See docs/2026-09-08-email.md.
 
 BINDING IS THE BOUNDARY. It binds 127.0.0.1, never a public interface, not configurable, so no inbound port is
 open and the tunnel is the only way in. The shared secret is the second lock: a tunnel published without it, or
@@ -43,6 +48,22 @@ the verdict before the rate limit: no path can answer a stranger with a reason.
   cc-mail list [--n N]                      the last N stored mails, newest first
   cc-mail show <id>                         one mail's message.json on stdout
   cc-mail selfcheck                         tests; own fixtures, no network, no live server, no config of the box's
+  cc-mail send --json FILE                  mail somebody the box is NOT replying to. FILE (`-` = stdin) is one
+                                            JSON object: {"to": "A" or ["A","B"], "subject": "S", "body": "TEXT",
+                                            "attachments": ["/abs/path", ...]} — those four keys and no others;
+                                            attachments may be left out. Every file named is attached, or the
+                                            mail is not sent and the line names the file and why (a file
+                                            attaches only from under MAIL_OUT_ROOTS and under the byte cap).
+                                            One line either way — stdout when the mail went, stderr and exit 1
+                                            when it did not, exit 2 when the ask itself was malformed
+  cc-mail send --to A[,B] --subject S [--body TEXT]
+                                            the same with no files: the body is --body, or stdin without it
+
+SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the terminal it was typed in, talks to
+the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path — the
+daemon does not have one, so no mail's body, no member and no Slack message can start a mail. It goes only to
+an address on MAIL_SEND_ALLOW (MAIL_ALLOW when that is unset), which is the owner's own set of verified
+destinations, and it is charged the same caps and written to the same ~/.cc/mail/out.log as a reply.
 
 THE WIRE, which core/mail/inbound-worker.js is written against:
   POST /inbound                             every other method and path is 404
@@ -53,7 +74,9 @@ THE WIRE, which core/mail/inbound-worker.js is written against:
   body: the raw RFC822 bytes, unmodified
 The answer is always JSON with a `status` and a `reply`. `reply` is either a string the worker relays to the
 sender with message.reply(), or null meaning the worker says nothing:
-  200 {"status":"stored","id":…,"reply":…}        it is on disk
+  200 {"status":"stored","id":…,"reply":…}        it is on disk. `reply` is the router's line when the daemon
+                                                  answered — where it went, or why it went nowhere — and
+                                                  "Received. It is in the queue as <id>." when it did not
   401 {"status":"unauthorized","reply":null}      no secret, or the wrong one
   403 {"status":"dropped","reply":null}           the verdict says fail, no authenticated identity, or an
                                                   identity that is not on the allow-list
@@ -98,7 +121,11 @@ THE STORE IS THE CONTRACT MILESTONE 2 READS. One directory per mail:
                     a date whose weekday disagrees with its day comes out corrected, which is what a reader
                     wants and what raw.eml still has the original of
       text          every text/plain part of the body, decoded and joined. text/html is NEVER rendered or
-                    stripped into this field: an HTML part is stored as an attachment like any other bytes
+                    stripped into this field — the HTML goes to `html` as it was written
+      html          the mail's inline text/html parts, decoded and joined, cut at MAX_HTML characters. This is
+                    the copy of the body every mail client sends beside the text: it is BODY, not a file, so it
+                    is not in `attachments` and nothing is written to disk for it. "" when there is none, and
+                    the only field that can be cut — raw.eml has all of it. Never rendered, opened or fetched
       attachments   [{name, path, size, type}] — `name` is the filename the SENDER gave, kept for milestone 2
                     to show and trusted for nothing; `path` is ours, relative to this directory, and is where
                     the bytes actually are; `size` is bytes on disk; `type` is the part's declared Content-Type
@@ -123,10 +150,15 @@ key below before it binds, and changing one takes a HUP or a restart. That is th
 it is written on the reload step of the runbook.
       MAIL_SECRET        the shared secret the worker holds. NO DEFAULT: while it is unset every call is 503
       MAIL_PORT          5220
-      MAIL_DOMAIN        the box's mail domain, as a record of which one this door is for. `status` prints it
-                         and nothing else reads it: the worker builds its reply out of the address the mail
-                         was sent TO, and this server accepts whatever the worker delivered. Deliberately not
-                         a blocker — a door that works is not "NOT ready" over a label
+      MAIL_DOMAIN        the box's mail domain. This server accepts whatever the worker delivered and never
+                         checks it; the ROUTER reads it, because `<channel>@<domain>` is only a channel name
+                         when the domain is ours. Unset, every address reads as somebody else's and only the
+                         reply thread of a mail already routed still works. `status` prints it
+      MAIL_WORKSPACE     the owner's override table, `addr=owner` / `addr=<handle>` rows separated by commas
+                         or newlines, read by the router before it asks Slack who an address is. A row with an
+                         empty value (`addr=`) refuses that address. His word, and it outranks the lookup.
+                         The only key here this process never loads: the daemon reads it, so a change takes
+                         the daemon's restart and not this one's HUP
       MAIL_ALLOW         the allow-list, comma- or space-separated. Falls back to LESSONS_EMAILS, which is the
                          list the box already keeps of the people it will talk to. An address added here
                          reaches the door on the next HUP or restart, not on the next mail
@@ -154,6 +186,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -175,11 +208,17 @@ LOG_CAP = 4 * 1024 * 1024   # ...and serve.log is rolled at this size, one gener
 MAX_BYTES = 10 * 1024 * 1024
 MAX_PARTS = 64
 MAX_ATTACH_BYTES = 10 * 1024 * 1024
+MAX_HTML = 256 * 1024   # how much of an inline text/html body is kept in message.json. raw.eml has all of it
 MAX_CONN = 8
 BUSY_WAIT = 1.0         # seconds a connection waits for one of those slots before it is answered 503 busy
 HEADER_BYTES = 65536    # how much of an OVER-cap mail is still read, so its headers can say who sent it
 RATE = 10
 RATE_WINDOW = 3600
+
+# The daemon's own socket (cc-slack). It is how a stored mail reaches the session it is for without a second
+# Slack connection: this process holds no token and makes no Slack call of its own — it hands over an id.
+SLACKSOCK = os.path.join(os.environ.get("CC_SLACK_DIR") or os.path.join(H, ".cc", "slack"), "sock")
+ROUTE_WAIT = 25         # seconds to wait for the routing answer, which rides inside the worker's own event
 
 # A method result that means the mail failed its check. `none` (no policy published), `neutral` and `temperror`
 # are not failures and must not be treated as one — a temporary DNS error at Cloudflare would otherwise drop a
@@ -455,7 +494,7 @@ def parse(msg, who, auth, envelope_to, mail_id, received_at, attach_dir):
     for a in addrs(msg, "To"):
         if a not in to:
             to.append(a)
-    text, attachments, n, total = [], [], 0, 0
+    text, html, attachments, n, total = [], [], [], 0, 0
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
             continue
@@ -467,9 +506,16 @@ def parse(msg, who, auth, envelope_to, mail_id, received_at, attach_dir):
             body = None
         if body is None:                       # a part with no decodable payload is nothing to store
             continue
-        # The body is text/plain that is not an attachment. Everything else — text/html included — is bytes.
+        # THE BODY IS NOT AN ATTACHMENT. text/plain the sender did not attach is `text`, and the text/html
+        # copy of it beside it — inline, unnamed, which is how every mail client writes the alternative — is
+        # `html`. Counting that copy made every mail from Gmail a mail with a file in it, and the vetting read
+        # duly held them all for the owner (2026-09-09). What is still a file, counted and written: a part
+        # whose disposition says `attachment`, a part the sender NAMED, and anything that is not text.
         if ctype == "text/plain" and disp != "attachment":
             text.append(safe_decode(body, part.get_content_charset()))
+            continue
+        if ctype == "text/html" and disp != "attachment" and not part.get_filename():
+            html.append(safe_decode(body, part.get_content_charset()))
             continue
         n += 1
         total += len(body)
@@ -485,7 +531,8 @@ def parse(msg, who, auth, envelope_to, mail_id, received_at, attach_dir):
             "subject": header(msg, "Subject"), "message_id": header(msg, "Message-ID"),
             "in_reply_to": header(msg, "In-Reply-To"),
             "references": [r for r in header(msg, "References").split() if r],
-            "date": header(msg, "Date"), "text": "\n".join(text), "attachments": attachments,
+            "date": header(msg, "Date"), "text": "\n".join(text),
+            "html": "\n".join(html)[:MAX_HTML], "attachments": attachments,
             "auth": auth, "received_at": received_at}
 
 
@@ -564,6 +611,44 @@ def _write_rate(seen):
         os.rename(tmp, RATEFILE)
     except OSError:
         pass        # a counter that cannot be written must not refuse a real mail; the caps above still hold
+
+
+def routed(mail_id):
+    """Hand the stored mail to the daemon. Gives back (the line the sender should hear, a word for the log).
+
+    ONE REQUEST STILL LEAVES ONE LOG LINE — the word comes back to the caller instead of being written here,
+    because "what happened to this mail" is one sentence and splitting it over two lines is how a log stops
+    being readable per mail.
+
+    THE DECISION IS NOT MADE HERE, and neither is any Slack call: this process has no token and never gets one.
+    It puts an id on the daemon's socket (`{"mail": "<id>"}`, an owner verb) and the daemon does the rest —
+    core/mail/router.py decides, cc-slack posts the mirror line and delivers. The answer comes back inside this
+    same HTTP event, which is what lets a refusal ("I could not tell whose workspace this address belongs to") reach the sender.
+
+    EVERY FAILURE IS QUIET TOWARDS THE SENDER. No daemon, no socket, a timeout, an answer that is not JSON:
+    the line comes back empty and the caller falls to "Received. It is in the queue as <id>.", which is true.
+    Routing that did not happen is this box's problem to read in `route=` in the log, not a stranger's to be
+    handed a reason for."""
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(ROUTE_WAIT)
+        try:
+            c.connect(SLACKSOCK)
+            c.sendall((json.dumps({"mail": mail_id}) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                d = c.recv(65536)
+                if not d:
+                    break
+                buf += d
+        finally:
+            c.close()
+        answer = json.loads(buf or b"{}")
+    except Exception as e:
+        return "", "unreachable %s" % clip(str(e))
+    if not answer.get("ok"):
+        return "", "failed %s" % clip(str(answer.get("error") or answer))
+    return answer.get("reply") or "", "yes" if answer.get("routed") else "nowhere"
 
 
 # ---------------------------------------------------------------- the server
@@ -709,7 +794,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.refused(429, "too many messages: the limit is %d in %d seconds" % (limit, window),
                                 who)
 
-        # 7. STORE, and answer in the same event so the worker can still reply.
+        # 7. STORE, ROUTE, and answer in the same event so the worker can still reply. Store first and always:
+        # a mail on disk is the promise this door makes, and routing is what happens to a mail that is already
+        # kept. So a daemon that is down costs the delivery and not the mail — `cc-mail list` still has it.
         try:
             rec = store(raw, msg, who, auth, rcpt)
         except Refuse as e:         # over MAIL_MAX_ATTACH_BYTES, found while writing; store() cleaned up
@@ -717,11 +804,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:      # one broken mail must not take the door down for the next one
             self.say("error store from=%s %s: %s" % (clip(who), type(e).__name__, clip(str(e))))
             return self._json(500, {"status": "error", "reason": "could not store", "reply": None})
-        self.say("store id=%s from=%s(%s) to=%s bytes=%d attachments=%d auth=%s subject=%s"
+        line, why = routed(rec["id"])
+        self.say("store id=%s from=%s(%s) to=%s bytes=%d attachments=%d auth=%s route=%s subject=%s"
                  % (rec["id"], clip(who), how, clip(rcpt), len(raw), len(rec["attachments"]),
-                    rec["auth"]["verdict"], clip(rec["subject"])))
+                    rec["auth"]["verdict"], why, clip(rec["subject"])))
         self._json(200, {"status": "stored", "id": rec["id"],
-                         "reply": "Received. It is in the queue as %s." % rec["id"]})
+                         "reply": line or "Received. It is in the queue as %s." % rec["id"]})
 
 
 class Server(ThreadingHTTPServer):
@@ -960,8 +1048,84 @@ def cmd_show(opt):
     return 0
 
 
+# The keys the cold send reads. NOT in CONF_KEYS: the server never sends, so it has no reason to hold a send
+# secret in memory for the life of a process that answers a public tunnel. `send` reads them per run instead,
+# which costs a few forks in a command a person typed and means an owner's edit is live on the next one.
+SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ALLOW",
+             "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES")
+SEND_JSON_KEYS = ("to", "subject", "body", "attachments")
+SEND_USAGE = ("usage: cc-mail send --json FILE   (FILE or `-`: {\"to\", \"subject\", \"body\", \"attachments\": [...]})\n"
+              "       cc-mail send --to A[,B] --subject S [--body TEXT]   (body on stdin without --body)")
+
+
+def arg(opt, name):
+    """One --flag's value, or "". flags() gives a bare `--to` its own name back, which is not an address."""
+    v = opt.get(name) or ""
+    return "" if v == name else v.strip()
+
+
+def send_ask(opt):
+    """The (to, subject, body, attachments) a `cc-mail send` asks for, or a str saying what was wrong with the
+    ask. Two shapes: `--json FILE` — one object, the four SEND_JSON_KEYS and no others, so a mistyped key
+    (`attachment`, `file`) is refused by name rather than silently dropped — and the flag form, text only.
+
+    The owner's shape (2026-09-09): "the model just gives a json with subject and body etc and then points to
+    attachments and the script does the rest so it's more consistent". The JSON is the whole ask; nothing
+    about the mail is decided here, only read."""
+    src = arg(opt, "--json")
+    if src:
+        try:
+            doc = json.loads(sys.stdin.read() if src == "-" else open(os.path.expanduser(src), encoding="utf-8").read())
+        except (OSError, ValueError) as e:
+            return "cc-mail send: cannot read %s as JSON — %s" % (src, e)
+        if not isinstance(doc, dict):
+            return "cc-mail send: the JSON must be one object with " + ", ".join(SEND_JSON_KEYS)
+        odd = sorted(set(doc) - set(SEND_JSON_KEYS))
+        if odd:
+            return "cc-mail send: unknown key %s — the keys are %s" % (", ".join(odd), ", ".join(SEND_JSON_KEYS))
+        to, atts = doc.get("to"), doc.get("attachments") or []
+        if not isinstance(atts, list) or not all(isinstance(a, str) and a.strip() for a in atts):
+            return "cc-mail send: attachments must be a list of file paths"
+        if isinstance(to, list):
+            to = ",".join(str(a) for a in to)
+        if not str(to or "").strip():
+            return "cc-mail send: no \"to\""
+        body = doc.get("body")
+        if body is not None and not isinstance(body, str):
+            return "cc-mail send: body must be a string"
+        return str(to), str(doc.get("subject") or ""), body or "", atts
+    to, subject = arg(opt, "--to"), arg(opt, "--subject")
+    body = opt.get("--body")
+    body = "" if body is None or body == "--body" else body
+    if not to:
+        return SEND_USAGE
+    if not body:
+        if sys.stdin.isatty():
+            return "cc-mail send: no body — pass --body TEXT, or pipe one in"
+        body = sys.stdin.read()
+    return to, subject, body, []
+
+
+def cmd_send(opt):
+    """`cc-mail send` — one mail the box starts. outbound.send_to() decides everything; this reads the ask.
+
+    A malformed ask is exit 2 and a line saying what was wrong — including a terminal with neither --body nor
+    stdin, which is told so rather than left waiting on a tty. Exit 1 is the mail's own refusal, from send_to()."""
+    ask = send_ask(opt)
+    if isinstance(ask, str):
+        print(ask, file=sys.stderr)
+        return 2
+    to, subject, body, attachments = ask
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import outbound                          # noqa: E402 — a sibling, imported here for cc-mail's own reason
+    ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments)
+    print(line, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
 def main(argv):
-    cmds = {"serve": serve, "stop": stop, "status": status, "list": cmd_list, "show": cmd_show}
+    cmds = {"serve": serve, "stop": stop, "status": status, "list": cmd_list, "show": cmd_show,
+            "send": cmd_send}
     cmd = argv[0] if argv else ""
     if cmd == "selfcheck":
         sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))

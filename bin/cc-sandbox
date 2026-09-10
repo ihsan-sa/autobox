@@ -2,6 +2,10 @@
 # cc-sandbox — a worker's `claude -p` inside bwrap: the box's secrets, the container and tmux sockets, the other tracks and
 # the control plane's source are ABSENT from the process's world, not denied by a regex (docs: design-worker-sandbox, stage 1a).
 #   cc-sandbox <repo> <track> -- <cmd...>   CC_WORKER_SANDBOX=1 → bwrap around <cmd>; anything else → exec <cmd> untouched
+#   cc-sandbox vet -- <cmd...>              THE BOX'S OWN BOUNDARY, the one that needs no workspace: the distribution and
+#                                           NOTHING OF THIS BOX — no home, no ~/.cc, no credential, no repo, no network, not
+#                                           even the hostname. The mail door reads a stranger's attachment in here
+#                                           (core/mail/vetting.py). Always bwrap: no opt-in and no fallback to the host.
 #   cc-sandbox reconcile <repo> <track>     fold what the worker committed in its own branch namespace onto the host's
 #                                           refs/heads/track/<track> (compare-and-swap). cc-loop runs it after every
 #                                           iteration, before the checkpoint that pushes; a no-op if nothing moved.
@@ -426,6 +430,25 @@ launch(){   # $1 repo · $2 track · the rest is the command
   exec bwrap "${B[@]}" --file 3 "$H/.claude.json" --perms 0600 --file 4 "$cred" -- "$@" \
     3< <(jq --arg wt "$wt" '{projects: ((.projects // {}) | with_entries(select(.key == $wt))), mcpServers: {}}' "$H/.claude.json" 2>/dev/null || printf '{}') \
     4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
+launch_vet(){   # cc-sandbox vet -- <cmd...> — THE BOUNDARY THE BOX PROVIDES FOR ITSELF, and the only one that needs
+  # no repo, no worktree, no workspace and no configuration. The mail door opens a stranger's attachment in here: it
+  # hands the file in as stdin, a descriptor and never a path, and runs `file` and `head` on it (core/mail/vetting.py,
+  # boundary()). So the world in here is the distribution and NOTHING OF THIS BOX — no home, no ~/.cc, no credential,
+  # no repo, no board, no socket, no network, not even the hostname. There is nothing in here to read, which is the
+  # point: whatever a hostile file could make `file` do, it does it somewhere with nothing in it.
+  # NO OPT-IN AND NO FALLBACK, unlike `<repo> <track>`, which execs the command untouched when CC_WORKER_SANDBOX is not
+  # 1. The caller's whole rule is "inside a boundary or not at all", so a boundary that will not start must be a read
+  # that did not happen rather than one that happened on the host: with no bwrap this refuses, non-zero and saying so,
+  # and vetting reads that as `unreadable`, which holds the mail for a person.
+  command -v bwrap >/dev/null 2>&1 || { echo "cc-sandbox: bwrap is not installed, so there is no boundary to read this inside — nothing was run." >&2; exit 2; }
+  # --unshare-all takes the network with it, so nothing a read touches can be fetched. /etc is a tmpfs rather than the
+  # box's: the loader's cache and file's optional magic are the only two names in it, and both are --try because a box
+  # without them still has to start. HOME and TMPDIR are the tmpfs /tmp, which is where `mktemp` writes the head.
+  exec bwrap --die-with-parent --unshare-all --new-session --clearenv --hostname sandbox --chdir / \
+    --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
+    --tmpfs /etc --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache --ro-bind-try /etc/magic /etc/magic \
+    --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+    --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv TMPDIR /tmp --setenv LC_ALL C -- "$@"; }
 board_dir(){   # $1 handle — THE BOARD IS ONE FILE ON BOTH SIDES. ~/.cc/boards/<h>.json and .lock become links into
   # ~/.cc/members/<h>/board/, and build_member binds THAT DIRECTORY as the session's ~/.cc/boards. The file itself used to be
   # bound, and a file bind pins an inode: cc-board saves by renaming a new file over the old one, so every host save swapped
@@ -1310,6 +1333,28 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   real1=$(md5sum "$H/.claude/settings.json" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
   t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
   rm -rf "${fh:?}"; }
+selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it, what cannot be reached from it, and that
+  # there is no way of being outside it. The last one is the case with a history — every other profile here has an
+  # opt-in (`<repo> <track>` execs the command untouched unless CC_WORKER_SANDBOX=1), and the mail door's rule is that
+  # a stranger's file is opened inside a boundary or not at all, so this one is run with that variable EMPTY.
+  local out
+  out=$(printf '%%PDF-1.4\ntrailer\n' | CC_WORKER_SANDBOX='' TMUX=/tmp/tmux-0/x CLAUDE_CODE_OAUTH_TOKEN=leak \
+        "$SELF" vet -- sh -c '
+    e(){ [ -e "$1" ] && echo present || echo absent; }
+    echo home=$(e '"$H"'); echo cc=$(e '"$H"'/.cc); echo dev=$(e '"$H"'/dev); echo etc=$(e /etc/hostname)
+    echo tok=${CLAUDE_CODE_OAUTH_TOKEN:-unset}; echo tmux=${TMUX:-unset}
+    echo nics=$(sed -n "s/^ *\([^:]*\):.*/\1/p" /proc/net/dev | grep -vc "^lo$")
+    f=$(mktemp) && head -c 4096 > "$f" && echo kind=$(file -b --mime-type "$f")' 2>&1)
+  t 'the vet profile is bwrap with CC_WORKER_SANDBOX empty: it has no opt-in, because its caller has no host path' \
+    "$(g home)/$(g dev)" absent/absent
+  t 'and nothing of this box is inside it: no ~/.cc, no hostname, no token, no tmux socket' \
+    "$(g cc)/$(g etc)/$(g tok)/$(g tmux)" 'absent/absent/unset/unset'
+  t 'nor is there anything to fetch with: every interface but lo is gone' "$(g nics)" 0
+  t 'and it does the one job it exists for — the type of the bytes handed in on stdin' "$(g kind)" application/pdf
+  # A CONTROL, so the four above cannot pass by the command having quietly not run: the same script on the host
+  # finds this box's home. If that ever reads `absent` the cases above are testing nothing.
+  out=$(sh -c 'e(){ [ -e "$1" ] && echo present || echo absent; }; echo home=$(e '"$H"')' 2>&1)
+  t 'control: the same test outside a boundary DOES find this box' "$(g home)" present; }
 selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets absent, git whole, the other track gone; off = untouched
   local r="_ccsbx$$" mb="_ccsbxb$$" dev wt st n=0 bad=0 out out2 want rc c m0 t0 u0 hd held rsd rsd2 sec
   dev="$H/dev/$r"; wt="$H/.cc/worktrees/$r/t"; st="$H/.cc/state/$r/t"
@@ -1635,7 +1680,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
   out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
-  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline
+  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
@@ -1649,6 +1694,9 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
   reconcile) [ $# -eq 3 ] || { echo "usage: cc-sandbox reconcile <repo> <track>" >&2; exit 2; }
              rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
   mint) shift; mint "$@"; exit $?;;
+  vet) shift; [ "${1:-}" = -- ] && shift
+       [ $# -gt 0 ] || { echo "usage: cc-sandbox vet -- <cmd...>" >&2; exit 2; }
+       launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
   convert) shift; convert "${1:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ]; then tr="${1:-}"; shift; fi; [ "${1:-}" = -- ] && shift   # <handle> [<track>|""] [--] cmd
           [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] -- <cmd...>" >&2; exit 2; }
@@ -1658,6 +1706,6 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
 launch "$repo" "$track" "$@"

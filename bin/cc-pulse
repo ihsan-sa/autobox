@@ -3,7 +3,8 @@
 itself whether there is work. Nothing else on the box starts development; every other timer reacts to something
 that already happened. This is the one that makes the rest run continuously with no human poke.
 
-  cc-pulse                       THE WHOLE MACHINE — every repo with a board and every live orch
+  cc-pulse                       THE WHOLE MACHINE — every repo with a board; a live orch is enumerated and
+                                 gets a verdict line, but is never pulsed (see DUE-NESS)
   cc-pulse <target> [<target>…]  exactly those
   cc-pulse --list                the targets this run would cover, one per line
   cc-pulse --dry-run             who would be woken and why, and everyone skipped and why; touches nothing
@@ -19,21 +20,35 @@ hand-written list would have to be remembered by whoever adds the next one, and 
 
 A WAKE IS NOT FREE. Every tick is a full-context turn on a session carrying 200-400k of cache, and the machine
 paid that for twelve sessions every 2 h — course and channel sessions among them — mostly to be told "nothing
-due" (efficiency audit 2026-09-01). The answer is NOT to wake only what is due: a session that runs only when a
-row is queued never lifts its head to its goals, and that lifting is the whole drive loop (owner, 2026-09-01).
-So the pulse reads the files first, and spends the wake better. Past that gate it still holds no opinion about
-the WORK: it starts an idle session where there is none, types one line into every live one, and the SESSION
-judges. It dispatches nothing, spends nothing, and writes no state but its own log (~/.cc/state/pulse.log), the
-quiet mark below, and, once, a goals skeleton for a target that has none, so the tick never points at an empty
-file.
+due" (efficiency audit 2026-09-01). Measured again over 2026-09-02..08: $589 of pulse wakes, $91 a day, 175 of
+them to planning seats at $2.54 each and 51 to orchs at $2.84, and the seat's own answer to most was "nothing
+due, reply nothing". So a tick now goes only where the files say the seat can ACT — see DUE-NESS — and a target
+with nothing to act on is looked at once a day instead of twelve times. The lifting of the head to the goals is
+what that daily look-up is for: a session that runs only when a row is startable never does it, and that
+lifting is the drive loop (owner, 2026-09-01). Past the gate the pulse still holds no opinion about the WORK: it
+starts an idle session where there is none, types one line into every live one, and the SESSION judges. It
+dispatches nothing, spends nothing, and writes no state but its own log (~/.cc/state/pulse.log), the quiet mark
+below, and, once, a goals skeleton for a target that has none, so the tick never points at an empty file.
 
 DUE-NESS IS READ OFF FILES — no session, no judgement — and it decides who is worth waking, not what the work
 is (the one exception is a row carrying an `agent` mark, below, which costs one tmux listing):
   · a repo whose board rows are ALL kind=session is NEVER pulsed. A channel/course session has no track work,
     no brief and no done; the people in its channel are its loop.
-  · every other target is woken, and the tick CARRIES WHAT THE FILES SAY — the `main-gate` row, `cc-scope count
-    <repo>`, the rows queued or blocked, and the rows still in flight (a PR in `review` above all) — so a
-    session with nothing to do costs one cheap turn instead of re-deriving all of it.
+  · AN ORCH IS NEVER PULSED EITHER (`<repo>@<alias>`). It is a project a person steers in its own channel, and
+    that channel and its own workers are what wake it — the tick was 51 wakes in a week telling an orch with no
+    board of its own what it had already told its channel.
+  · a target IS woken when the files say there is something it can ACT ON now: main is red, a row STOPPED
+    (`blocked` — what a landing that died leaves behind), a queued row could actually be STARTED (below), or an
+    owner ask has sat past its line (CC_PULSE_ASK_H, 24 h — a fresher one arrived in a message the session read
+    for itself). A tool that could not answer counts as actionable: a ledger that cannot be read is not a
+    ledger saying "nothing open".
+  · …and it is woken ONCE A DAY (CC_PULSE_IDLE_H) when none of that is true — rows in flight, asks inside their
+    line, queued rows nothing can place. That look-up is the drive loop's, and the tick still CARRIES WHAT THE
+    FILES SAY — the `main-gate` row, the open asks, the rows queued or blocked, and the rows still in flight (a
+    PR in `review` above all) — so the session costs one cheap turn instead of re-deriving all of it. Every
+    other tick on that path is one line in the log saying what it saw, and wakes nobody. The round is taken in
+    pulse() below the liveness and limit tests, like the back-off and for the same reason: a seat that died
+    inside it is still started, and one the limit stopped still reaches `cc-limit record`.
   · …and WHICH of those queued rows could actually be STARTED right now, from `cc-brief ready <repo>`: the ones
     nothing in flight is holding a file of, and the ones that share a file and so are one builder's work rather
     than two. A count of queued rows was never an answer to "is there room" — the width is capped by one writer
@@ -41,8 +56,8 @@ is (the one exception is a row carrying an `agent` mark, below, which costs one 
     while twenty rows sat queued and the box still looked idle. The tick carries the headline and the command for
     the rest; it is silent when nothing could start, and nothing here dispatches anything. That headline may say
     the answer is WITHHELD — a row in flight that nothing can place makes every "free" unsafe, and cc-brief says
-    which row to give a branch to. It reaches GitHub for those rows only, which is the one call in this tick that
-    leaves the box.
+    which row to give a branch to; withheld wakes the seat, because giving that row a branch is the work. It
+    reaches GitHub for those rows only, which is the one call in this tick that leaves the box.
   · a row a LIVE session is doing in its own subagents is in flight, not work waiting to be picked up. It has
     no worker and no worktree anyone holds, so `queued` was offered for dispatch on every tick; the session
     marks it (`cc board set <repo> <track> agent me`) and the mark holds while that tmux window holds a
@@ -53,8 +68,9 @@ is (the one exception is a row carrying an `agent` mark, below, which costs one 
   · THE SAME LOOK IS NOT SENT TWICE. Every tick writes what it carried to ~/.cc/state/<target>/pulse.look, and
     a tick whose look is identical to that one is not sent inside CC_PULSE_QUIET (default 24 h): it goes to the
     target's events file instead (`cc-broker ledger --once`), which wakes nobody and rides out on the next
-    message the session does get. A look that CHANGED — a row moved, an ask opened, main went red — wakes at
-    once, exactly as it always did; only the repeat is held. The back-off is taken in pulse(), below the
+    message the session does get. This holds an ACTIONABLE repeat and only that — main red yesterday and red
+    still — so a look that changes INTO something to act on wakes at once, exactly as it always did. The other
+    path is held by the daily floor above, not by this. The back-off is taken in pulse(), below the
     liveness and limit tests: a target whose session DIED is started whatever the mark says, a handoff clears
     it, and a session the limit stopped is still handed to `cc-limit record` before anything is held.
     Measured 2026-09-05: a planning session with one PR parked in `review` for two days paid a full-context
@@ -77,10 +93,12 @@ seen on the limit but is not recording yet (nothing corroborates it, or no reset
 exactly the same way — it is a limited pane either way. See cc-limit.
 
 A SESSION THAT NEVER STARTED IS NAMED on the way past. A launcher hands a session its purpose as its first
-turn (`cc <repo> --orch <alias> "<brief>"`); when that turn is lost the window looks perfectly healthy and
-nobody is working in it — two orchs sat at zero tokens on 2026-09-08 until a person typed at them. A target
-live for CC_PULSE_STALL_MIN minutes (20; negative turns it off) with no finished turn on record is reported,
-and then ticked like any other: the tick is the recovery, the finding is what was missing. See never_started().
+turn; when that turn is lost the window looks perfectly healthy and nobody is working in it — two orchs sat at
+zero tokens on 2026-09-08 until a person typed at them. A target live for CC_PULSE_STALL_MIN minutes (20;
+negative turns it off) with no finished turn on record is reported, and then ticked like any other: the tick is
+the recovery, the finding is what was missing. It is a PLANNING SEAT's catch only, now that an orch takes no
+tick — a never-started orch is its channel's to notice, and that is the price of not pulsing one at all. See
+never_started().
 
 THREE SWITCHES, because a loop that wakes the whole machine must be stoppable by whoever it wakes:
   CC_PULSE=0 in ~/.cc/config   the drive loop is off — no run does anything, dry or not
@@ -118,6 +136,14 @@ QUIET_H = 24                                    # hours a session already told T
                                                 # (CC_PULSE_QUIET; 0 turns the back-off off entirely). It was 6,
                                                 # and it applied only to a look with nothing in it at all — so a
                                                 # board that never moved bought a full-context turn every 2 h.
+IDLE_H = 24                                     # hours between LOOK-UPS for a target with nothing to act on
+                                                # (CC_PULSE_IDLE_H; 0 turns the floor off). The one wake left on
+                                                # that path — #173's amendment, kept at once a day, not twelve.
+ASK_H = 24                                      # hours an owner ask may sit unsettled before the pulse counts it
+                                                # as past its line (CC_PULSE_ASK_H; negative = no ask ever is).
+                                                # The session READ the message the ask was made in, so a fresh
+                                                # one is already in its context and the pulse is not how it hears
+                                                # of it. One it has left for a day is a different thing.
 MAIN_GATE = "main-gate"                         # cc-audit's one row for "main's own suite is red"
 SESSION_ROW = "session"                         # cc-board's kind for a long-lived channel session: never track work
 DONE_ROW = ("merged", "done")                   # a row in one of these is history, not work
@@ -444,14 +470,28 @@ def kind(row):
 
 
 def open_asks(repo):
-    """How many owner asks are still unsettled, from cc-scope, which owns that ledger. -1 = it could not say."""
-    p = sh(f"{BIN}/cc-scope", "count", repo, timeout=60)
+    """(unsettled owner asks, how many of those are PAST THEIR LINE) from cc-scope, which owns that ledger.
+    (-1, 0) = it could not say.
+
+    ONE call where there were two: `cc-scope count` is the length of this same list, and the ages are the half a
+    count cannot give. The line is CC_PULSE_ASK_H — see ASK_H: an ask inside it is one the session read for
+    itself, and waking it to say so is the wake this file is trying to stop paying for."""
+    p = sh(f"{BIN}/cc-scope", "list", repo, "--json", timeout=60)
     if p is None or p.returncode != 0:
-        return -1
+        return -1, 0
     try:
-        return int((p.stdout or "").strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return -1
+        asks = json.loads(p.stdout or "")
+    except ValueError:
+        return -1, 0
+    if not isinstance(asks, list):
+        return -1, 0
+    line = conf("CC_PULSE_ASK_H", ASK_H) * 3600
+    if line < 0:
+        return len(asks), 0
+    # epoch() reads an unparseable stamp as "long ago", which here means past the line: a row whose date nobody
+    # can read is one nobody can say is fresh, and the cheap answer to that is a wake, not a silence.
+    old = sum(1 for a in asks if isinstance(a, dict) and now() - epoch(a.get("asked")) > line)
+    return len(asks), old
 
 
 def last_look(target):
@@ -491,28 +531,37 @@ def ledger(target, note):
 
 
 def due(target):
-    """(wake?, why, what the files say, was-anything-due, the look, held-as-a-repeat?) — the whole decision, off
-    files, before any session is looked at. It is NOT a judgement about the work: a quiet board still gets its
-    tick, because a session that only ever runs when a row is queued never lifts its head to the goals, and that
-    lifting is the drive loop. What it IS a judgement about is whether the tick would say anything the session
-    does not already have — see THE SAME LOOK at the bottom.
+    """(wake?, why, what the files say, was-anything-due, the look, held?, floored?) — the whole decision, off
+    files, before any session is looked at. Two questions, in this order: is there anything here the seat can
+    ACT ON right now (see `actionable`), and if so would the tick say anything the session does not already
+    have (see THE SAME LOOK). A target with nothing to act on is not dropped — it gets the look-up that keeps
+    the drive loop, once a day rather than every couple of hours.
 
-    `held` is that last one and ONLY that one: a back-off from repeating ourselves to a session that heard us
-    the first time. It assumes there is such a session, which is why pulse() takes it below the liveness test
+    `held` is the same-look back-off and ONLY that: a back-off from repeating ourselves to a session that heard
+    us the first time. It assumes there is such a session, which is why pulse() takes it below the liveness test
     and not here — a target whose session died must still be started, and a 24 h mark must not be what stops
-    that. Every other False is a target this loop has no business waking at all, live or dead."""
-    repo = target.split("@")[0]                     # an orch is due for whatever its repo is due for
+    that.
+
+    `floored` is the once-a-day round, and it is a SEPARATE flag for the same reason and one more. Same reason:
+    it too assumes a session that was looked at, so a seat that has since died must still be started and a
+    limited one must still reach `cc-limit record` — both of which pulse() only does below. One more: unlike a
+    held tick it repeats nothing the session was told, so nothing goes to its events file. That is the whole
+    difference between the two flags at the bottom of pulse().
+
+    Every other False is a target this loop has no business waking at all, live or dead."""
+    repo = target.split("@")[0]                     # pulse() turns an orch away before this, so the split is
+                                                    # a no-op here — kept so due() answers for any target shape
     rows = board_rows(repo)
 
     # A CHANNEL/COURSE REPO IS NEVER PULSED. Its rows are `session` — a long-lived session in a channel, with no
     # brief, no PR and no done. There is no track work to drive, and the people in the channel are its loop.
     if rows and all(kind(r) == SESSION_ROW for r in rows.values()):
         return (False, "every board row is kind=session — a channel repo's sessions are driven by their channel",
-                "", False, "", False)
+                "", False, "", False, False)
 
     gate = rows.get(MAIN_GATE)
     red = gate is not None and gate.get("status") not in DONE_ROW
-    asks = open_asks(repo)
+    asks, old = open_asks(repo)
 
     # A ROW THAT IS NOT HISTORY IS SOMETHING TO LOOK AT, and the two kinds are different sentences. Queued or
     # blocked is work WAITING to be picked up; `review`, `running` and `waiting` are work ALREADY IN FLIGHT —
@@ -539,6 +588,11 @@ def due(target):
     # one line, and bare is not enough to compare on: `queued` → `blocked` is a row that stopped, and reading
     # that as unchanged would hold the wake that says so.
     ready_st = sorted(f"{k} {st}" for k, st in board if st in BOARD_DUE and k not in taken)
+    # …and the ones that STOPPED. The brief: "a decision-class event (red main, a stopped landing, an ask past
+    # its line) must still reach the seat within one tick as today". `blocked` is the word a stop wears —
+    # cc-reconcile writes it for a row with no worker and nothing saying why — and a stop is a decision for the
+    # seat whatever cc-brief thinks of the row's files, so it is read here and not through the room arithmetic.
+    stopped = sorted(k for k, st in board if st == "blocked" and k not in taken)
     # …AND WHICH OF THOSE COULD ACTUALLY BE STARTED RIGHT NOW. A count of queued rows is not an answer to "is
     # there room": the width is capped by one writer per file, and working out which rows collide with nothing
     # in flight was left to whoever happened to look. Fifteen changes landed in seven hours while twenty rows
@@ -550,14 +604,26 @@ def due(target):
     # every time a live branch commits a file some queued row happens to name — a wake per commit, at a full
     # context each, to say the room changed by one. The event that really opens the room is a row leaving flight,
     # and the look already carries that. So this rides the ticks that were going out anyway.
-    could = ""
+    #   …AND THE COARSE ANSWER — free, withheld, none, unread — IS in it, which is not a contradiction of the
+    # paragraph above. That flag moves when the ROOM opens or closes and at no other time, so it costs a wake
+    # when a row becomes startable and nothing when a live branch commits one more file.
+    could, start = "", "none"
     if ready:
         out = sh(f"{BIN}/cc-brief", "ready", repo, *ready, timeout=120)
-        if out is None:                                    # killed at the budget: say so rather than read as "nothing"
-            could = "cc-brief ready timed out — which rows could start is unread this tick"
+        # A TOOL THAT COULD NOT ANSWER IS NOT A TOOL SAYING "NO ROOM", and a crash is that as much as a timeout
+        # is — the non-zero exit was read as an empty answer, so a broken cc-brief read as "no room" and every
+        # queued row waited on the daily floor with the seat told nothing at all.
+        if out is None or out.returncode != 0:
+            could = ("cc-brief ready " + ("timed out" if out is None else f"failed: {why(out)}")
+                     + " — which rows could start is unread this tick")
+            start = "unread"
         else:
-            head = ((out.stdout or "").strip().splitlines() or [""])[0] if out.returncode == 0 else ""
+            head = ((out.stdout or "").strip().splitlines() or [""])[0]
             could = head.split(": ", 1)[1] if ": " in head else ""
+            # cc-brief's two answers, told apart by its own words: rows it can call free, or an answer it
+            # WITHHELD because a row in flight is unplaced. Withheld is work for the seat — cc-brief names the
+            # row to give a branch to — so it wakes; no answer at all is no room, and wakes nobody.
+            start = "free" if "could start now" in could else "withheld" if could else "none"
     aloft = sorted(f"{k} {st}" + (" (on hold)" if k in on_hold else " (a subagent has it)" if k in held else "")
                    for k, st in board if k not in ready and st not in DONE_ROW)
     note = " · ".join(filter(None, [
@@ -568,7 +634,10 @@ def due(target):
         f"{could} (cc-brief ready {repo})" if could else "",
         f"{len(aloft)} row{'' if len(aloft) == 1 else 's'} in flight ({', '.join(aloft[:3])})" if aloft else "",
     ])) or "no red main, no open ask, no row queued or in flight — goals are the work"
-    anything = bool(red or asks != 0 or ready or aloft)  # a ledger that could not answer counts as something too
+    # …and this one picks the tick's TEXT, not whether there is a tick: `anything` false is the GOALS tick and
+    # nothing else. What decides a wake is `actionable`, below. (A ledger that could not answer counts as
+    # something too, so the tick says so rather than reading as "no asks".)
+    anything = bool(red or asks != 0 or ready or aloft)
 
     # THE SAME LOOK IS NOT NEWS, and a wake that carries nothing new costs exactly what one that does costs: a
     # full-context turn, 200-400k of cache re-written because the last tick's copy expired an hour before this
@@ -580,28 +649,54 @@ def due(target):
     # only in the fourth row, or in one row's word, share a note. Deduping on the note would hide a real change;
     # deduping on this cannot.
     #   #173's finding is not undone by any of it. A row in flight still never sends the session to its goals
-    # tick, and the FIRST tick that carries one still goes out at once. Only the repeat is held, and held is not
-    # dropped: pulse() writes it to the target's events file, where cc-broker carries it out on the next message
-    # the session gets for a real reason.
-    look = f"red={int(red)} asks={asks} ready={','.join(ready_st)} aloft={','.join(aloft)}"
+    # tick — it carries the work note instead, on whichever wake it gets. Held is not dropped either: pulse()
+    # writes it to the target's events file, where cc-broker carries it out on the next message the session
+    # gets for a real reason. The mark only ever holds an ACTIONABLE repeat; what holds the other path is the
+    # once-a-day floor below, which is a different question and reads a different file.
+    look = (f"red={int(red)} asks={asks}/{old} start={start} "
+            f"ready={','.join(ready_st)} aloft={','.join(aloft)}")
+
+    # WHAT THE SEAT CAN ACT ON NOW is a narrower question than "is anything on the files", and it is the one
+    # that decides a wake. Measured over 2026-09-02..08: 175 planning wakes at $2.54 each, $91 a day, and the
+    # seat's own answer to most of them was "nothing due, reply nothing" (owner, 2026-09-08: "make curbing
+    # spend a number one priority"). Three things a seat can do something about the moment it reads them:
+    #   · main is red — the gate row is the whole box's stop
+    #   · a row STOPPED — `blocked`, which is what a landing that died leaves behind
+    #   · a queued row could actually be STARTED, or cc-brief withheld the answer because a row in flight needs
+    #     a branch, or it could not answer at all (a tool that cannot say is not a tool saying "no room")
+    #   · an owner ask has sat past CC_PULSE_ASK_H, or the ledger could not be read
+    # What is NOT here is deliberate. A row in flight has a worker or an open PR and lands itself; an ask made
+    # an hour ago arrived in a message this session read; a queued row nothing can place is not room. Each of
+    # those was a wake, and each one bought the answer "unchanged, no action".
+    actionable = bool(red or stopped or start in ("free", "withheld", "unread") or old or asks < 0)
+
     seen, when = last_look(target)
     window = conf("CC_PULSE_QUIET", QUIET_H) * 3600
     same = bool(window and seen == look and when and now() - when < window)
     ago = f"{int((now() - when) // 60)}m ago" if when else "already"
 
-    if anything:
+    if actionable:
         if same:
             return (False, f"the tick {ago} carried this same look and nothing has changed since — it goes to "
-                           f"the target's events file, which wakes nobody", note, True, look, True)
-        return True, note, note, True, look, False
+                           f"the target's events file, which wakes nobody", note, True, look, True, False)
+        return True, note, note, anything, look, False, False
 
-    # NOTHING DUE IS STILL A TICK — once. It is the one repeat that keeps its turn, because it asks for work off
-    # the goals file rather than restating a status, and the session does something different with it each time.
-    # The mark is what stops it being every 2 h.
-    if same:
-        return (False, f"woken with nothing due {ago} and still nothing due — the next look is "
-                       f"{int(window // 3600)}h after that one", note, False, look, True)
-    return True, "nothing due — the drive tick: the session looks up at its goals", note, False, look, False
+    # NOTHING TO ACT ON IS STILL A LOOK-UP — once a day. The brief: "a repo with no live rows and no open asks
+    # is looked at once a day, not twelve times". That is #173's amendment and this path's only wake: a
+    # session that runs solely when a row is startable never lifts its head to its goals, and that lifting is
+    # the drive loop. The floor is measured against the last TICK and not against the look, because on this
+    # path the look moves for reasons none of which are worth a turn — a row's word changing from `running` to
+    # `review` is a thing the seat can read later, out of the ledger, on a wake it was getting anyway.
+    floor = conf("CC_PULSE_IDLE_H", IDLE_H) * 3600
+    last = last_tick(target)
+    if floor and last and now() - last < floor:
+        # …and this skip is decided BELOW, like the back-off and for the same reasons: see `floored` above.
+        return (False, f"nothing to act on — {note} — and the look-up {int((now() - last) // 60)}m ago was "
+                       f"inside the {int(floor // 3600)}h round", note, anything, look, False, True)
+    if anything:
+        return (True, f"the once-a-day look-up, nothing on the files to act on: {note}", note, True, look,
+                False, False)
+    return True, "nothing due — the drive tick: the session looks up at its goals", note, False, look, False, False
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -707,18 +802,35 @@ def pulse(target, r):
     if paused(target):
         r.log(target, "skip", f"paused — `cc-pause off {repo}` puts the whole project back")
         return
+    # AN ORCH IS NOT PULSED AT ALL. It is a project a person steers in its own channel, and it is woken by the
+    # two things that actually carry its work: a message in that channel, and its own workers reporting back.
+    # A drive tick on top of those was 51 wakes over 2026-09-02..08 at $2.84 each, and the answer to a tick an
+    # orch has no board of its own to read is the answer it already gave its channel. Above ensure_goals on
+    # purpose: a goals file for a target nothing points at is a file nobody reads.
+    #   Below `paused` on purpose too — `cc-pause on <repo>` parks the repo AND its orchs, and a pause is the
+    # louder fact about a target, so the log says the pause and not this.
+    #   WHAT THIS COSTS, named rather than glossed: the rounds below are also the only thing that hands an
+    # ORCH's limited pane to `cc-limit record`, and the only thing that names an orch that never took its first
+    # turn. Both go with the tick. An orch's channel is the loop that has to notice either now.
+    if orch:
+        r.log(target, "skip", "an orch is not pulsed — its channel and its own workers wake it, and restarting "
+                              "one is not this loop's either (a fresh one mints a new Slack channel)")
+        return
     ensure_goals(target, r)
 
     # THE CHEAPEST GATE RUNS FIRST. Everything below this line costs a tmux capture, a walk of the process table
     # or, at the end, a whole turn of somebody's context; this costs a few stat()s and one `cc-scope count`.
-    wake, why_due, note, anything, look, held = due(target)
-    if not wake and not held:
+    wake, why_due, note, anything, look, held, floored = due(target)
+    if not wake and not (held or floored):
         r.log(target, "skip", why_due)
         return
-    # A HELD TICK IS NOT DECIDED YET. The back-off says "this session already heard this", so it is taken below,
-    # once a live session is actually there to have heard it and the limit test has had its say. Taken here it
-    # would swallow the START branch — a target whose planning session died, with a PR parked in `review`, would
-    # go unstarted for the whole 24 h — and the limit branch with it, which is worse: see the note down there.
+    # A HELD TICK IS NOT DECIDED YET, AND NEITHER IS A FLOORED ONE. The back-off says "this session already heard
+    # this"; the round says "this session was looked at recently". Both assume a session, so both are taken
+    # below, once a live one is actually there and the limit test has had its say. Taken here, either swallows
+    # the START branch — a target whose planning session died, with a PR parked in `review`, would go unstarted
+    # for the whole window — and the limit branch with it, which is worse: see the note down there. The floor
+    # said all that and was still taken here (review of #390): for up to CC_PULSE_IDLE_H a dead seat went
+    # unstarted and a limit-stopped one never reached `cc-limit record`, which is the #246 loss again.
 
     # THE HANDOFF CHECK COMES AHEAD OF THE WINDOW being looked at at all. It used to run only once the
     # window was found live, and that order is a trap: a target mid-overlap whose predecessor claude has already
@@ -745,13 +857,6 @@ def pulse(target, r):
             # the cheap half of this job is done blind.
             r.log(target, "report", "no live session, and cc-handoff could not say whether one is being handed "
                                     "over — not starting a second one blind")
-            return
-        if orch:
-            # Rule 1 stops at the repos on purpose. Starting an orch is not free the way an idle planning
-            # session is: `cc <repo> --orch <alias>` mints that orch a NEW Slack channel every time it starts
-            # one fresh, so a pulse that resurrects them would cut a channel every 2 h for every orch that
-            # ever exited. An orch is spawned by whoever needs it and archived when it goes.
-            r.log(target, "skip", "orch session gone — not restarted here (a fresh one would mint a new channel)")
             return
         if not os.path.isdir(f"{DEV}/{repo}"):
             r.log(target, "skip", f"a board with no ~/dev/{repo} — nothing to start")
@@ -815,8 +920,11 @@ def pulse(target, r):
     # A HELD TICK IS STILL RECORDED — but only one with something in it, since the goals tick's "nothing at
     # all" is nothing to write down. A held target that is also mid-turn or limited is logged as that instead,
     # and its line is written by the next pulse: the look that held it has not changed either.
-    if held:
-        if not r.dry and look and anything:
+    #   A FLOORED TICK IS NOT RECORDED. It is not a repeat of anything the session was told — there is nothing
+    # on the files to act on, which is why it is here — so an events line would be one more thing to read for
+    # the sake of "still nothing". It rides the same channel as the back-off only to get PAST the tests above.
+    if held or floored:
+        if held and not r.dry and look and anything:
             ledger(target, note)
         r.log(target, "skip", why_due)
         return
@@ -948,10 +1056,15 @@ def selfcheck():
                           # working ledger, and the back-off OFF (CC_PULSE_QUIET=0) so a case that runs the same
                           # board twice is decided by the rule it is about and not by the same-look mark. The
                           # block at the end turns it on and is the only place that tests it.
-                          CC_FAKE_ASKS="0", CC_FAKE_SCOPE_BROKEN="", CC_PULSE_QUIET="0", CC_FAKE_PAUSED="",
+                          CC_FAKE_ASKS="0", CC_FAKE_ASKS_OLD="0", CC_FAKE_SCOPE_BROKEN="",
+                          CC_PULSE_QUIET="0", CC_FAKE_PAUSED="",
+                          # …and the once-a-day floor OFF (CC_PULSE_IDLE_H=0), for the same reason: a case that
+                          # runs the same board twice is decided by the rule it is about. The block at the end
+                          # turns it on and is the only place that tests it.
+                          CC_PULSE_IDLE_H="0",
                           # …and nothing could start, for every case that is not about that: cc-brief's answer
                           # when no queued row is free is no output at all, and the tick then carries no clause.
-                          CC_FAKE_READY="",
+                          CC_FAKE_READY="", CC_FAKE_BRIEF_BROKEN="",
                           # …and cc-limit's resumed-episode file under $th, not the box's: a real limit that
                           # lifted this morning must not decide whether a mark in a fixture below is cold.
                           CC_LIMIT_RESUMED=f"{th}/limit-resumed",
@@ -1042,13 +1155,17 @@ def selfcheck():
         ok("(1) a repo with no live session is started, idle", "cc alpha\n" in did() and "alpha start" in L)
         ok("(1) …and is NOT ticked in the same run: a session that just started has nothing to be woken from",
            "msg alpha " not in did())
-        ok("(2) the two live idle sessions are woken, exactly once each",
-           did().count("msg beta ") == 1 and did().count("msg beta@scout ") == 1)
+        ok("(2) the live idle planning seat is woken, exactly once",
+           did().count("msg beta ") == 1)
+        ok("(2) …and the ORCH is not woken AT ALL: its own channel and its own workers are its loop",
+           did().count("msg beta@scout ") == 0 and "an orch is not pulsed" in L)
         ok("the tick names the target and its goals file, and hands the judgement to the session",
-           "independent engineer for beta@scout" in did() and "~/.cc/state/beta@scout/goals.md" in did()
+           "independent engineer for beta" in did() and "~/.cc/state/beta/goals.md" in did()
            and "Nothing due = do nothing" in did())
-        ok("(3) every target with no goals file got the skeleton, so no tick points at nothing",
-           all("no goals recorded yet" in open(f"{STATE}/{t}/goals.md").read() for t in tg))
+        ok("(3) every REPO with no goals file got the skeleton, so no tick points at nothing",
+           all("no goals recorded yet" in open(f"{STATE}/{t}/goals.md").read() for t in tg if "@" not in t))
+        ok("(3) …and an orch gets none: a goals file for a target nothing ever points at is a file nobody reads",
+           not os.path.exists(f"{STATE}/beta@scout/goals.md"))
 
         # ---- (1) the started session is live one cycle later, and is ticked then
         run()
@@ -1063,13 +1180,14 @@ def selfcheck():
         ok("a goals file that exists is never rewritten", open(f"{STATE}/beta/goals.md").read() == "ship the thing\n")
 
         # ---- (3) mid-handoff and mid-turn, with the gap out of the way
-        os.environ.update(CC_PULSE_GAP_MIN="0", CC_FAKE_HANDOFF="beta", CC_FAKE_BUSY="@2")
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n@3\talpha\t{live.pid}\n")
+        os.environ.update(CC_PULSE_GAP_MIN="0", CC_FAKE_HANDOFF="beta", CC_FAKE_BUSY="@3")
         run()
         L = logged()
         ok("(3) a mid-handoff session is skipped — a tick would land on two sessions at once",
            "msg beta " not in did() and "beta skip — mid-handoff" in L)
         ok("(3) …and a session mid-turn is skipped too: its last tick is still unanswered",
-           "msg beta@scout " not in did() and "mid-turn" in L)
+           "msg alpha " not in did() and "mid-turn" in L)
         ok("(3) both skips are one log line each, and nothing else happens", "beta report" not in L)
 
         # ---- a session the usage limit stopped mid-turn
@@ -1115,11 +1233,11 @@ def selfcheck():
         run()
         ok("a board with no ~/dev/<repo> is skipped, not started", "cc delta" not in did() and "nothing to start" in logged())
 
-        # ---- an orch whose session went away
+        # ---- an orch, dead or alive, is neither ticked nor started
         open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
-        run("beta@scout")
-        ok("an orch whose session is gone is logged, never resurrected — restarting one mints a Slack channel",
-           "cc beta" not in did() and "orch session gone" in logged())
+        L0 = logged(); run("beta@scout")
+        ok("an orch whose session is gone is not restarted either — a fresh one would mint a Slack channel",
+           "cc beta" not in did() and "msg " not in did() and "an orch is not pulsed" in since(L0))
 
         # ---- it never wakes a pane with no interactive claude in it
         open(tmuxf, "w").write(f"@1\tbeta\t{dead.pid}\n")
@@ -1180,22 +1298,23 @@ def selfcheck():
         os.environ["CC_FAKE_DIALOG"] = ""
 
         # ---- the per-target opt-out
-        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n")
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\talpha\t{live.pid}\n")
         open(f"{STATE}/beta/pulse.off", "w").close()
-        L0 = logged(); run("beta", "beta@scout")
+        L0 = logged(); run("beta", "alpha")
         ok("a target with pulse.off is left alone, and only that one",
-           "msg beta " not in did() and "pulse.off" in since(L0) and "msg beta@scout " in did())
+           "msg beta " not in did() and "pulse.off" in since(L0) and "msg alpha " in did())
         os.remove(f"{STATE}/beta/pulse.off")
 
-        # ---- the PROJECT pause, which is wider than the opt-out above. `cc-pause on beta` parks the project, so
-        # both `beta` and `beta@scout` go quiet — an opt-out would have needed a file per target and the orch would
-        # have kept ticking. Its own fixture: the tmux table is written here and CC_FAKE_PAUSED set and cleared
-        # around the run, so no later case inherits either.
+        # ---- the PROJECT pause. `cc-pause on beta` parks a whole project and nothing else — cc-pause is asked
+        # about the target, and it reads the repo out of either shape. Its own fixture: the tmux table is written
+        # here and CC_FAKE_PAUSED set and cleared around the run, so no later case inherits either.
         open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n@3\talpha\t{live.pid}\n")
         os.environ["CC_FAKE_PAUSED"] = "beta"
         L0 = logged(); run("beta", "beta@scout", "alpha")
-        ok("a paused project is not ticked — its planning session AND its orch, off one flag",
-           "msg beta " not in did() and "msg beta@scout " not in did() and "paused" in since(L0))
+        ok("a paused project is not ticked, and the log says the pause",
+           "msg beta " not in did() and "beta skip — paused" in since(L0))
+        ok("…and the pause is read for an orch too, so its line says the pause and not the orch rule — a person "
+           "reading the log must see the louder fact", "beta@scout skip — paused" in since(L0))
         ok("…and another project pulses exactly as before: per project, never box-wide",
            "msg alpha " in did())
         os.environ["CC_FAKE_PAUSED"] = ""
@@ -1219,10 +1338,11 @@ def selfcheck():
         os.environ.update(CC_PULSE_GAP_MIN="0", CC_FAKE_HANDOFF="", CC_FAKE_BUSY="", CC_FAKE_DIALOG="")
         open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
 
-        def decide(tracks, asks="0"):
-            """One due-ness case: that board, that many open asks, one run on beta, no same-look mark left over."""
+        def decide(tracks, asks="0", old="0"):
+            """One due-ness case: that board, that many open asks (`old` of them past their line), one run on
+            beta, no same-look mark left over."""
             board("beta", tracks)
-            os.environ["CC_FAKE_ASKS"] = asks
+            os.environ.update(CC_FAKE_ASKS=asks, CC_FAKE_ASKS_OLD=old)
             if os.path.exists(f"{STATE}/beta/pulse.look"):
                 os.remove(f"{STATE}/beta/pulse.look")
             was = logged()
@@ -1392,7 +1512,7 @@ def selfcheck():
         # not. Measured 2026-09-05 — a session with one PR parked in `review` paid a full-context wake every 2 h
         # to answer "unchanged, no action": 12 turns and $51 in a day it did no work.
         os.environ["CC_PULSE_QUIET"] = "6"
-        d, L = decide({"t1": {"status": "review"}})
+        d, L = decide({MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}})
         ok("every tick writes down the look it carried, not just an empty one",
            "msg beta " in d and os.path.exists(f"{STATE}/beta/pulse.look"))
         L0 = logged(); run("beta")
@@ -1400,7 +1520,8 @@ def selfcheck():
            "msg beta " not in did() and "same look" in since(L0))
         ok("…and the held tick is WRITTEN DOWN, once, where it wakes nobody — cc-broker carries it out on the "
            "next message the session gets for a real reason",
-           "broker ledger --once beta pulse: 1 row in flight (t1 review)" in did())
+           "broker ledger --once beta pulse: main-gate row RED · 2 rows in flight (main-gate running, "
+           "t1 review)" in did())
 
         os.truncate(calls, 0); run("--dry-run", "beta")
         ok("…and a HELD tick on a dry run writes nothing at all — no ledger line, the same as no tick",
@@ -1419,21 +1540,21 @@ def selfcheck():
            and "usage limit stopped it mid-turn" in since(L0))
         os.environ["CC_FAKE_LIMITED"] = ""
 
-        board("beta", {"t1": {"status": "review"}, "t2": {"status": "queued"}})
+        board("beta", {MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}, "t2": {"status": "queued"}})
         L0 = logged(); run("beta")
         ok("a look that CHANGED breaks the window at once — the mark holds a repeat, it does not mute a session",
            "msg beta " in did() and "1 row queued/blocked (t2)" in did())
 
         # A ROW'S WORD IS PART OF THE LOOK. The note prints queued/blocked rows bare, so `queued` → `blocked`
         # shares a note with what came before it — and that is a row that STOPPED.
-        decide({"t1": {"status": "queued"}}); os.truncate(calls, 0)
-        board("beta", {"t1": {"status": "blocked"}})
+        decide({MAIN_GATE: {"status": "running"}, "t1": {"status": "queued"}}); os.truncate(calls, 0)
+        board("beta", {MAIN_GATE: {"status": "running"}, "t1": {"status": "blocked"}})
         run("beta")
         ok("a queued row that went blocked is a change, not a repeat — the note reads the same and the mark "
            "must not", "msg beta " in did())
 
         # THE BACK-OFF IS A BACK-OFF FROM REPEATING OURSELVES, so it needs somebody who heard us the first time.
-        decide({"t1": {"status": "review"}})                    # a live beta, ticked: the mark is set
+        decide({MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}})     # a live beta, ticked: the mark is set
         open(tmuxf, "w").write("")                              # …and now its session is gone
         os.truncate(calls, 0); L0 = logged(); run("beta")
         ok("a target whose session DIED is started even though the mark says it heard this — the back-off must "
@@ -1442,7 +1563,7 @@ def selfcheck():
         ok("…and starting one clears the mark, because the session that heard the last tick is not there any "
            "more", not os.path.exists(f"{STATE}/beta/pulse.look"))
 
-        decide({"t1": {"status": "review"}})
+        decide({MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}})
         os.environ["CC_FAKE_HANDOFF"] = "beta"
         os.truncate(calls, 0); run("beta")
         ok("…and a successor mid-handoff is not muted by what its predecessor was told: the mark goes with the "
@@ -1456,74 +1577,71 @@ def selfcheck():
 
         # The note truncates to three row names so the tick stays one line; the mark must not, or a board whose
         # fourth row moved would read as unchanged and the session would never hear about it.
-        board("beta", {"t1": {"status": "review"}, "t2": {"status": "review"},
+        board("beta", {MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}, "t2": {"status": "review"},
                        "t3": {"status": "review"}, "t4": {"status": "review"}})
         run("beta"); os.truncate(calls, 0)
-        board("beta", {"t1": {"status": "review"}, "t2": {"status": "review"},
+        board("beta", {MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}, "t2": {"status": "review"},
                        "t3": {"status": "review"}, "t4": {"status": "running"}})
         run("beta")
         ok("a row that moved BEYOND the three the tick names still counts as a change — the mark is the whole "
            "board state, never the sentence the session reads", "msg beta " in did())
 
-        decide({"t1": {"status": "review"}})                    # a fresh mark, then age it past the window
+        decide({MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}})     # a fresh mark, then age it past the window
         t = now() - 7 * 3600
         os.utime(f"{STATE}/beta/pulse.look", (t, t))
         os.truncate(calls, 0); run("beta")
         ok("past CC_PULSE_QUIET the session gets that look again — a back-off, not silence", "msg beta " in did())
 
         d, L = decide({"t1": {"status": "merged"}})
-        ok("nothing at all on the files is the GOALS tick, and it backs off the same way",
-           "msg beta " in d and "goals tick" in d)
-        L0 = logged(); run("beta")
-        ok("…and the second one inside the window is skipped, and writes NO ledger line — an empty look is "
-           "nothing to record", "msg beta " not in did() and "still nothing due" in since(L0)
-           and "broker " not in did())
+        ok("nothing at all on the files is the GOALS tick — the look mark is not what holds THAT path, the "
+           "once-a-day floor is (its own block below)", "msg beta " in d and "goals tick" in d)
 
-        decide({"t1": {"status": "review"}})
+        decide({MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}})
         os.environ["CC_PULSE_QUIET"] = "0"
         os.truncate(calls, 0); run("beta")
         ok("CC_PULSE_QUIET=0 turns the back-off off entirely: every pulse looks, the way it did before this",
            "msg beta " in did())
         os.environ["CC_PULSE_QUIET"] = "6"
 
-        # ---- A SESSION THAT NEVER STARTED. The launch hands an orch its purpose as the first turn; when that
+        # ---- A SESSION THAT NEVER STARTED. The launch hands a session its purpose as the first turn; when that
         # turn is lost the window still looks healthy, and until 2026-09-08 nothing on the box said so.
+        # A PLANNING SEAT is the fixture: an orch takes no tick at all now, so this catch is the seats'.
         os.environ["CC_PULSE_QUIET"] = "0"
         os.environ["CC_PULSE_STALL_MIN"] = "0"          # the fixture panes are seconds old; the AGE bound is its own case below
         os.environ.update(CC_FAKE_BUSY="", CC_FAKE_DIALOG="", CC_FAKE_HANDOFF="", CC_FAKE_HANDOFF_BROKEN="",
                           CC_FAKE_LIMITED="", CC_FAKE_LIMIT_SEEN="", CC_FAKE_CTX="", CC_FAKE_CTX_BROKEN="")
-        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n@2\tbeta@scout\t{live.pid}\n")   # earlier cases rewrote it
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")                        # earlier cases rewrote it
         board("beta", {"t1": {"status": "queued"}})
         L0 = logged()
-        run("beta@scout")
+        run("beta")
         ok("a live session with no record of ever finishing a turn is NAMED — with its address, so the finding "
-           "says which pane to look at", "beta@scout report" in since(L0) and "never finished a turn" in since(L0))
+           "says which pane to look at", "beta report" in since(L0) and "never finished a turn" in since(L0))
         ok("…and it is still ticked: the finding is the news, the tick is the recovery this file already had",
-           "msg beta@scout " in did())
+           "msg beta " in did())
         # THE CONTROL, and it is the one that matters: a session that HAS taken a turn must never be named. Age 0
         # is a record written since that pane started, which is exactly what "it got going" looks like.
         L0 = logged()
-        os.environ["CC_FAKE_CTX"] = "beta@scout\t-\t12\t120000\t1000000\tprocess\t0\t-\t-\n"
-        run("beta@scout")
+        os.environ["CC_FAKE_CTX"] = "beta\t-\t12\t120000\t1000000\tprocess\t0\t-\t-\n"
+        run("beta")
         ok("control: a session cc-context has a record for since its pane started is working, and is not named",
            "never finished a turn" not in since(L0))
         # …and a record from BEFORE this pane is a previous session's in the same window, not this one's.
         L0 = logged()
-        os.environ["CC_FAKE_CTX"] = "beta@scout\t-\t12\t120000\t1000000\tprocess\t99999\t-\t-\n"
-        run("beta@scout")
+        os.environ["CC_FAKE_CTX"] = "beta\t-\t12\t120000\t1000000\tprocess\t99999\t-\t-\n"
+        run("beta")
         ok("…and a record older than the pane belongs to whatever ran there before: still never started",
            "never finished a turn" in since(L0))
         # A TRACK'S ROW IS NOT ITS REPO'S. Column two carries the track, and reading it as the session a person
         # steers would call a repo started because one of its workers had taken a turn.
         L0 = logged()
-        os.environ["CC_FAKE_CTX"] = "beta@scout\tsomework\t12\t120000\t1000000\tprocess\t0\t-\t-\n"
-        run("beta@scout")
+        os.environ["CC_FAKE_CTX"] = "beta\tsomework\t12\t120000\t1000000\tprocess\t0\t-\t-\n"
+        run("beta")
         ok("control: a TRACK's record is not the session's — column two is read, not ignored",
            "never finished a turn" in since(L0))
         # NEVER CRY WOLF OVER A TOOL THAT CANNOT ANSWER.
         L0 = logged()
         os.environ.update(CC_FAKE_CTX="", CC_FAKE_CTX_BROKEN="1")
-        run("beta@scout")
+        run("beta")
         ok("cc-context unable to answer is not a finding — a sick tool must not report a healthy session",
            "never finished a turn" not in since(L0))
         os.environ["CC_FAKE_CTX_BROKEN"] = ""
@@ -1531,21 +1649,156 @@ def selfcheck():
         # between the tmux snapshot and this call — and that must be just as quiet; nothing tested it before now.
         L0 = logged()
         os.environ["CC_FAKE_PS_GONE"] = str(live.pid)
-        run("beta@scout")
+        run("beta")
         ok("pane_age's own ps failing (a bogus or gone pid) is not a finding either — same rule as a tool that "
            "cannot answer", "never finished a turn" not in since(L0))
         os.environ["CC_FAKE_PS_GONE"] = ""
         # …AND NOT BEFORE ITS TIME. The whole point of the bound is that a session mid-first-turn is thinking.
         L0 = logged()
         os.environ["CC_PULSE_STALL_MIN"] = "600"
-        run("beta@scout")
+        run("beta")
         ok("control: under the stall bound a session with no turn yet is simply young, and is not named",
            "never finished a turn" not in since(L0))
         L0 = logged()
         os.environ["CC_PULSE_STALL_MIN"] = "-1"
-        run("beta@scout")
+        run("beta")
         ok("control: a negative bound turns the catch off entirely", "never finished a turn" not in since(L0))
         os.environ["CC_PULSE_QUIET"] = "6"
+
+        # ---- A TICK GOES WHERE THE SEAT CAN ACT, AND NOWHERE ELSE. Measured over 2026-09-02..08: pulse
+        # wakes cost $589, $91 a day, and the seat's own answer to most of them was "nothing due, reply
+        # nothing" (owner, 2026-09-08: "make curbing spend a number one priority"). The floor is read off the
+        # LOG — the last tick — so every case here writes the log it is deciding against and owns it.
+        def ticked(mins):
+            """The log this target would have if it had last been ticked `mins` ago, and nothing else — plus
+            cc-brief back to silent, so a case that wants an answer out of it says so itself."""
+            open(LOG, "w").write(f"{stamp(now() - mins * 60)} beta tick — a look-up {mins}m ago\n")
+            os.environ["CC_FAKE_READY"] = ""
+
+        os.environ.update(CC_FAKE_READY="", CC_PULSE_IDLE_H="6")
+        ticked(10)
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "review"}}, asks="2", old="0")
+        ok("(1) green main, a queued row nothing can start, asks inside their line: NOBODY is woken",
+           "msg beta " not in d)
+        ok("(1) …and the one line it writes says what it saw and why it woke nobody",
+           "nothing to act on" in L and "1 row queued/blocked (t1)" in L and "2 owner asks open" in L
+           and "1 row in flight (t2 review)" in L)
+        ok("(1) …and it dispatches nothing, starts nothing and writes no events line for it",
+           "cc " not in d and "broker " not in d)
+
+        # (2) EACH of the three things a seat can act on, and beside each one the control that differs only in
+        # that thing. The payload is today's, unchanged — the wake is what moved, not the sentence.
+        ticked(10)
+        d, L = decide({MAIN_GATE: {"status": "running"}, "t1": {"status": "review"}})
+        ok("(2) a RED main wakes the seat inside the round, carrying the payload it always did",
+           "msg beta " in d and "main-gate row RED" in d and "t1 review" in d)
+
+        ticked(10)
+        os.environ["CC_FAKE_READY"] = "beta: 1 of 2 queued rows could start now"
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}})
+        ok("(2) a queued row that could actually be STARTED wakes it — a count of queued rows never could",
+           "msg beta " in d and "1 of 2 queued rows could start now" in d)
+        ticked(10)
+        os.environ["CC_FAKE_READY"] = ("beta: 2 queued rows, none can be called free — a row is in flight and "
+                                       "nothing places it")
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}})
+        ok("(2) …and an answer cc-brief WITHHELD wakes it too: giving that row a branch is the work",
+           "msg beta " in d and "none can be called free" in d)
+        ticked(10)
+        os.environ["CC_FAKE_READY"] = ""
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}})
+        ok("(2) control: the same two queued rows with nothing able to start them wake nobody",
+           "msg beta " not in d and "nothing to act on" in L)
+        # …AND A cc-brief THAT CRASHED IS NOT THAT CONTROL. Its non-zero exit was read as an empty answer, so a
+        # broken tool read as "no room" and the queued rows waited on the daily floor with nobody told (review
+        # of #390). The timeout beside it has always been unread; a crash is the same fact.
+        ticked(10)
+        os.environ["CC_FAKE_BRIEF_BROKEN"] = "1"
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}})
+        ok("(2) …and a cc-brief that CRASHED wakes the seat: a tool that cannot answer is not a tool saying "
+           "there is no room", "msg beta " in d and "is unread this tick" in d and "no such board" in d)
+        os.environ["CC_FAKE_BRIEF_BROKEN"] = ""
+
+        ticked(10)
+        d, L = decide({"t1": {"status": "blocked"}})
+        ok("(2) a row that STOPPED wakes the seat — `blocked` is what a landing that died leaves behind, and "
+           "unsticking it is a decision only the seat takes",
+           "msg beta " in d and "1 row queued/blocked (t1)" in d)
+        ticked(10)
+        d, L = decide({"t1": {"status": "blocked", "held": "behind #309, which carries a paid verdict"}})
+        ok("(2) control: the same row a PERSON is deliberately sitting on is not a stop to unstick — a hold is "
+           "lifted by the person who set it, and a wake cannot do it",
+           "msg beta " not in d and "nothing to act on" in L)
+
+        ticked(10)
+        d, L = decide({"t1": {"status": "merged"}}, asks="1", old="1")
+        ok("(2) an owner ask that has waited PAST ITS LINE wakes the seat",
+           "msg beta " in d and "1 owner ask open" in d)
+        ticked(10)
+        d, L = decide({"t1": {"status": "merged"}}, asks="1", old="0")
+        ok("(2) control: the same ask INSIDE its line wakes nobody — the session read the message it was made "
+           "in, so the pulse is not how it hears of it", "msg beta " not in d)
+        ticked(10)
+        os.environ["CC_FAKE_SCOPE_BROKEN"] = "1"
+        d, L = decide({"t1": {"status": "merged"}})
+        ok("(2) …and a ledger that CANNOT ANSWER wakes it: that is not a ledger saying 'nothing open'",
+           "msg beta " in d and "could not count the open asks" in d)
+        os.environ["CC_FAKE_SCOPE_BROKEN"] = ""
+
+        # (4) …and a repo with nothing to act on is still looked at, once a round.
+        ticked(10)
+        d, L = decide({"t1": {"status": "merged"}})
+        ok("(4) a repo with no live row and no open ask, looked at ten minutes ago, is not looked at again",
+           "msg beta " not in d and "inside the 6h round" in L and "broker " not in d)
+        ticked(7 * 60)
+        d, L = decide({"t1": {"status": "merged"}})
+        ok("(4) …and past the round it is: a floor, not silence — this is the wake that lifts the session's "
+           "head to its goals", "msg beta " in d and "goals tick" in d)
+        ticked(7 * 60)
+        d, L = decide({"t1": {"status": "review"}, "t2": {"status": "queued"}})
+        ok("(4) …and the daily look-up for a board that is NOT empty carries what the files say, not the goals "
+           "line", "msg beta " in d and "1 row in flight (t1 review)" in d and "goals tick" not in d)
+
+        # (4) THE ROUND HOLDS A WAKE AND NOTHING ELSE. It was taken at the cheap gate, above the liveness and
+        # limit tests, so inside the round a seat that had died stayed dead for up to CC_PULSE_IDLE_H and a
+        # limit-stopped one never reached `cc-limit record` — the #246 loss again (review of #390).
+        ticked(10)
+        board("beta", {"t1": {"status": "merged"}})         # nothing to act on: the round is what holds the tick
+        open(tmuxf, "w").write("")                          # …and the seat is not there at all any more
+        os.truncate(calls, 0); L0 = logged(); run("beta")
+        ok("(4) a seat that DIED inside the round is still started — the floor holds a wake, never a restart",
+           "cc beta" in did() and "msg beta " not in did() and "beta start" in since(L0))
+        open(tmuxf, "w").write(f"@1\tbeta\t{live.pid}\n")
+
+        ticked(10)
+        os.environ["CC_FAKE_LIMITED"] = "beta"
+        board("beta", {"t1": {"status": "merged"}})
+        os.truncate(calls, 0); L0 = logged(); run("beta")
+        ok("(4) …and a seat the usage limit stopped inside the round is still handed to cc-limit, so the "
+           "one-shot that resumes its interrupted turn is armed",
+           "limit record @1 beta" in did() and "msg beta " not in did()
+           and "usage limit stopped it mid-turn" in since(L0))
+        os.environ["CC_FAKE_LIMITED"] = ""
+        ticked(10)
+        d, L = decide({"t1": {"status": "merged"}})
+        ok("(4) …and a floored tick writes NO events line: it repeats nothing the session was told, so there is "
+           "nothing for cc-broker to carry out", "broker " not in d and "inside the 6h round" in L)
+        os.environ["CC_PULSE_IDLE_H"] = "0"
+
+        # (3) THE ORCH, one last time and from the dry run: a verdict per target, and its reason, touching nothing.
+        buf = io.StringIO()
+        os.truncate(calls, 0)
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--dry", "beta", "beta@scout"])
+        out = buf.getvalue()
+        # Read it PER TARGET and not as one blob: `"beta" in out` is satisfied by the orch's own line, so a
+        # seat that had silently stopped being printed would have passed. Every verdict line is
+        # "  <target padded> <verb> <reason>", so the first word is the target it is about.
+        verdict = {ln.split()[0]: ln for ln in out.splitlines() if ln.startswith("  ")}
+        ok("(3) --dry prints a verdict for EVERY target, the orch among them, with the reason beside it",
+           rc == 0 and "skip" in verdict.get("beta@scout", "")
+           and "an orch is not pulsed" in verdict.get("beta@scout", "")
+           and "would wake" in verdict.get("beta", "") and "msg " not in did())
 
         # ---- --dry-run: the whole verdict, in writing, having touched nothing
         board("beta", {"t1": {"status": "queued"}})
@@ -1640,17 +1893,31 @@ exit 1
 """
 
 FAKE_SCOPE = r"""#!/usr/bin/env bash
-# selfcheck stub for `cc-scope count <repo>`: prints $CC_FAKE_ASKS, and exits 2 when $CC_FAKE_SCOPE_BROKEN is
-# set — the ledger is there but cannot answer.
+# selfcheck stub for `cc-scope list <repo> --json`: the array the real one prints for the UNSETTLED asks —
+# $CC_FAKE_ASKS of them, of which the first $CC_FAKE_ASKS_OLD were asked long ago and the rest a minute back.
+# Exits 2 when $CC_FAKE_SCOPE_BROKEN is set: the ledger is there and cannot answer.
 set -u
 [ -n "${CC_FAKE_SCOPE_BROKEN:-}" ] && exit 2
-printf '%s\n' "${CC_FAKE_ASKS:-0}"
+n="${CC_FAKE_ASKS:-0}"; old="${CC_FAKE_ASKS_OLD:-0}"
+fresh=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)
+printf '['
+i=0
+while [ "$i" -lt "$n" ]; do
+  [ "$i" -gt 0 ] && printf ','
+  if [ "$i" -lt "$old" ]; then at=2000-01-01T00:00:00Z; else at="$fresh"; fi
+  printf '{"id":"a%s","status":"open","asked":"%s"}' "$i" "$at"
+  i=$((i+1))
+done
+printf ']\n'
 """
 
 FAKE_BRIEF = r"""#!/usr/bin/env bash
 # selfcheck stub for `cc-brief ready <repo> <row>…`: prints $CC_FAKE_READY, and prints nothing when it is empty —
 # which is the real one's answer when no queued row could be started. Exit 0 either way: it reports, never gates.
+# $CC_FAKE_BRIEF_BROKEN is the tool DEAD ON ITS FEET — a non-zero exit with a word about it on stderr, which is
+# not the same fact as "no queued row could start" and must never be read as one.
 set -u
+if [ -n "${CC_FAKE_BRIEF_BROKEN:-}" ]; then echo "cc-brief: no such board" >&2; exit 1; fi
 [ "${1:-}" = ready ] || exit 0
 [ -n "${CC_FAKE_READY:-}" ] && printf '%s\n' "$CC_FAKE_READY"
 exit 0

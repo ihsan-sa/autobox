@@ -18,40 +18,48 @@
                                    pending. Column one is the session, not the repo — `<repo>` and
                                    `<repo>@<alias>` are two live sessions in one checkout
   cc-context --record              stdin = a Stop hook payload -> measure, record, and tell the session
-  cc-context --thresholds          "<journal> <handoff> <ceiling>" (percentages)
+  cc-context --thresholds          "<journal> <handoff> <ceiling>" in TOKENS, for $CC_CTX_WINDOW (else 1M)
   cc-context --handoffs [--json]   the durable handoff record: one countable line per crossing
   cc-context selfcheck             fixtures for the parser, the window chain and the record store
     also: --json · -q (exit code only) · --over [PCT] (exit 0 at/over, 1 under, 2 unmeasurable;
           bare = that session's own handoff line, floors and window included)
 
-THREE LINES, EACH A PERCENTAGE OF THE WINDOW WITH A FLOOR UNDER IT (all six in ~/.cc/config):
-  30%, never under 60k   journal — the session is told, once, to append its handoff entry now
-  40%, never under 90k   hand off — due, but only when nothing is in flight
-  60%                    ceiling — hand off regardless of what is in flight
-                         CC_CONTEXT_{WARN,HANDOFF}_PCT · CC_CONTEXT_{WARN,HANDOFF}_MIN · CC_CONTEXT_CEILING_PCT
-…AND A RETRY LINE EVERY FIVE PERCENT BETWEEN THE HANDOFF LINE AND THE CEILING (45, 50, 55 on the defaults;
-CC_CONTEXT_RETRY_PCT, 0 for none). A handoff can DIE — the one started at 01:35Z on 2026-09-05 sat on a
-permission prompt and was abandoned — and until then the session that had taken it had nothing left before the
-ceiling: `handed_off` made every later turn 'already taken'. Each of these lines is one more crossing, sent
+THREE LINES, EACH A PERCENTAGE OF THE WINDOW CAPPED AT AN ABSOLUTE TOKEN COUNT, WITH A FLOOR UNDER IT
+(all nine in ~/.cc/config) — 60k / 90k / 120k on a 200k window, 112k / 150k / 225k on a 1M one:
+  30%, at most 112.5k, never under 60k   journal — told once to append its handoff entry now
+  40%, at most 150k,   never under 90k   hand off — due, but only when nothing is in flight
+  60%, at most 225k                      ceiling — hand off regardless of what is in flight
+            CC_CONTEXT_{WARN,HANDOFF}_PCT · CC_CONTEXT_{WARN,HANDOFF}_MIN · CC_CONTEXT_CEILING_PCT
+            CC_CONTEXT_{WARN,HANDOFF,CEILING}_MAX
+…AND A RETRY LINE EVERY FIVE PERCENT OF THE WINDOW BETWEEN THE HANDOFF LINE AND THE CEILING (100k and 110k on
+200k; one, at 200k, on 1M — the cap shortens that band, so the first retry still comes 50k after the handoff
+line and what follows is tighter than it was, not sparser; CC_CONTEXT_RETRY_PCT, 0 for none). A handoff can
+DIE — the one started at 01:35Z on 2026-09-05 sat on a permission prompt and was abandoned — and until then
+the session that had taken it had nothing left before the ceiling: `handed_off` made every later turn
+'already taken'. Each of these lines is one more crossing, sent
 with --retry, and the ceiling is the last of them so a dead overlap cannot take its teeth with it. Whether a
 crossing MEANS a new attempt is cc-handoff's call (its `retryable`: only an overlap that ended with the
 predecessor still in charge is tried again); a crossing while one is open is only the watchdog, as before.
-On the 1M window the box's sessions run that is 300k / 400k / 600k. They are early on purpose: this is about
-how SHARP a session is, not about running out of room. The evidence says there is no plateau to sit just
-below — Chroma's "Context Rot" finds degradation at every input length it tested, and NoLiMa has 10 of 12
-long-context models below half their short-context score by 32k, a quarter of the advertised window. So the
-question is not where the cliff is but how low we can sit and still get work done.
 
-A PERCENTAGE, AND A FLOOR. Degradation tracks ABSOLUTE tokens far more than the fraction used, so a smaller
-window does not buy a session more good tokens. But a bare percentage of a small window lands under what a
-session needs to do anything (30% of 128k is 38k, most of it prompt and tools). The floor reads: as low as we
-can sit, but never so low that a session is handed off before it can work — 60k/90k on a 200k model.
+AN ABSOLUTE LINE, NOT A SHARE OF THE WINDOW (2026-09-08). A percentage alone put the handoff at 400k on a 1M
+window, and that is wrong twice over. SHARP: degradation tracks ABSOLUTE tokens, not the fraction used, and
+there is no plateau to sit just below — Chroma's "Context Rot" finds it at every input length tested, and
+NoLiMa has 10 of 12 long-context models below half their short-context score by 32k. Past roughly 150k the
+answers are worse whatever the window says it can hold. CHEAP: every wake re-reads the whole context as cache,
+so a session carrying 400k pays for 400k on each of its turns all day, and cache reads are where this box's
+money goes. A 1M window therefore buys room for ONE long task, not a longer idle life — which is what a
+percentage of it was quietly selling.
+
+AND A FLOOR UNDER IT. A bare percentage of a SMALL window lands under what a session needs to do anything
+(30% of 128k is 38k, most of it prompt and tools). The floor reads: as low as we can sit, but never so low
+that a session is handed off before it can work — 60k/90k on a 200k model, where the caps never bite and this
+change moved nothing.
 
 PENDING, NOT IMMEDIATE. Crossing the handoff line sets a handoff PENDING; it does not restart anything. The
 restart happens at the first turn where nothing is in flight — no background or scheduled task, no unfinished
 merge/rebase, nothing uncommitted or unpushed in any worktree of this repo (see `in_flight`, which is
 deliberately pessimistic: a wrong "idle" reading is a handoff in the middle of something, and mid-task state
-lives in no file). The 60% ceiling goes anyway: past it, what a degraded session gets wrong costs more than
+lives in no file). The ceiling goes anyway: past it, what a degraded session gets wrong costs more than
 the in-flight state it drops. A HEADLESS WORKER is never restarted or handed off from here — its loop already
 gives it a fresh context — so it is told to journal and END ITS TURN, and one fixed line goes into the journal
 saying so, which is what stops cc-loop reading an iteration that ended itself as a refusal (`worker`, `MARK`).
@@ -148,14 +156,18 @@ def cfg(name, default):
 
 
 def thresholds(window=BIG_WINDOW):
-    """The three lines, in TOKENS, for a window: a percentage each, with a floor under the first two.
-    Degradation tracks absolute tokens more than the fraction used, so a small window does not buy a session
-    more good tokens — but a bare percentage of one lands under what a session needs to do anything at all
-    (30% of 128k is 38k, most of it prompt and tools). Floors keep the rule 'as low as we can sit, never so
-    low that a session is handed off before it can work'. The ceiling never sits under the handoff line."""
-    j = max(window * cfg("CC_CONTEXT_WARN_PCT", 30.0) / 100, cfg("CC_CONTEXT_WARN_MIN", 60000))
-    h = max(window * cfg("CC_CONTEXT_HANDOFF_PCT", 40.0) / 100, cfg("CC_CONTEXT_HANDOFF_MIN", 90000))
-    return j, h, max(window * cfg("CC_CONTEXT_CEILING_PCT", 60.0) / 100, h)
+    """The three lines, in TOKENS, for a window: min(a percentage of it, an absolute cap), with a floor under
+    the first two. Degradation tracks absolute tokens, not the fraction used, and every wake re-reads the whole
+    context as cache — so a bigger window buys neither sharpness nor cheaper turns, and the cap is what stops a
+    1M session from sitting on 400k all day. The floor is the other end of the same rule: a bare percentage of
+    a small window lands under what a session needs to work at all (30% of 128k is 38k, most of it prompt and
+    tools). On 200k the caps never bite and nothing has moved. The ceiling never sits under the handoff line."""
+    j = min(window * cfg("CC_CONTEXT_WARN_PCT", 30.0) / 100, cfg("CC_CONTEXT_WARN_MAX", 112500))
+    h = min(window * cfg("CC_CONTEXT_HANDOFF_PCT", 40.0) / 100, cfg("CC_CONTEXT_HANDOFF_MAX", 150000))
+    c = min(window * cfg("CC_CONTEXT_CEILING_PCT", 60.0) / 100, cfg("CC_CONTEXT_CEILING_MAX", 225000))
+    j = max(j, cfg("CC_CONTEXT_WARN_MIN", 60000))
+    h = max(h, cfg("CC_CONTEXT_HANDOFF_MIN", 90000))
+    return j, h, max(c, h)
 
 
 def retry_lines(window=BIG_WINDOW):
@@ -447,9 +459,14 @@ def session_at(target):
     session that owns no board row and does not own its working directory alone: an orchestrator shares
     ~/dev/<repo> with the planning session, so "the newest transcript in that directory" answers for whichever
     of the two stopped last — which is the misreading this address exists to end."""
-    for d in records():
-        if (d.get("target") or "") == target and d.get("session_id"):
-            return d["session_id"]
+    # EITHER SPELLING. A record is stored under the window name `<repo>@<alias>`, and what a person reads and
+    # copies is `<alias>@<repo>` (shown), so an address typed back from a listing has to find its own session.
+    # Both are tried against the records themselves rather than guessed at from the string, so nothing is
+    # resolved that no session has actually written.
+    for want in (target, flipped(target)):
+        for d in records():
+            if (d.get("target") or "") == want and d.get("session_id"):
+                return d["session_id"]
     return None
 
 
@@ -745,6 +762,23 @@ ADDRESS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(@[a-z0-9-]{2,20}|/[A
 SUFFIXES = ("~next", "~old")            # the two sides of a handoff in flight; both measure AS their target
 
 
+def flipped(addr):
+    """The two halves of an orch address swapped: `<repo>@<alias>` <-> `<alias>@<repo>`; anything else unchanged.
+    One function, two callers, opposite directions — `shown` prints a name and `session_at` takes one back."""
+    head, sep, track = str(addr or "").partition("/")
+    left, at, right = head.partition("@")
+    return (f"{right}@{left}" + sep + track) if at and left and right else str(addr or "")
+
+
+def shown(addr):
+    """WHAT A PERSON IS CALLED THIS SESSION: an orch reads `<alias>@<repo>` — dashboard@myrepo, the dashboard orch
+    OF myrepo (owner, 2026-09-06, thread 1788680869). DISPLAY ONLY, and that split is the whole point: `address()`
+    below is still the tmux window name, still the key the record is stored under, and still what cc-pulse matches
+    against tmux and what `cc ls` joins on, so `--all`'s first column is left exactly as it was. This names the
+    `name` field, which is a label — the dashboard's session row prints it and nothing keys on it."""
+    return flipped(addr)
+
+
 def address(repo, track):
     """THE ONE KEY A SESSION IS RECORDED UNDER: its tmux window name in `main`, which is exactly what
     cc-handoff takes as a target and what the Slack layer routes on.
@@ -787,7 +821,7 @@ def record(payload):
     if not repo and cwd and os.path.dirname(os.path.realpath(cwd)) == os.path.expanduser("~/dev"):
         repo = os.path.basename(os.path.realpath(cwd))   # a planning session: ~/dev/<repo>, no track marker
     m.update({"cwd": cwd, "repo": repo, "track": track, "level": level_of(m["used"], m["window"]),
-              "name": session_name(repo, track), "target": address(repo, track)})
+              "name": shown(session_name(repo, track)), "target": address(repo, track)})
     os.makedirs(RECORDS, exist_ok=True)
     p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
     was = {}
@@ -934,9 +968,11 @@ def main(argv):
         elif a == "--all":
             do_all = True
         elif a == "--thresholds":
-            print(" ".join(f"{cfg(k, d):g}" for k, d in (("CC_CONTEXT_WARN_PCT", 30.0),
-                                                         ("CC_CONTEXT_HANDOFF_PCT", 40.0),
-                                                         ("CC_CONTEXT_CEILING_PCT", 60.0))))
+            try:                                  # the window to read them for: the same env every measurement
+                w = float(os.environ.get("CC_CTX_WINDOW") or BIG_WINDOW)      # source honours, else the 1M one
+            except ValueError:                                                # the box's sessions actually run
+                w = BIG_WINDOW
+            print(" ".join(f"{x:g}" for x in thresholds(w)))
             return 0
         elif a == "--record":
             do_record = True
@@ -1208,9 +1244,15 @@ def selfcheck():
                bool(rp) and rp.get("target") == "repo2" and not rp.get("track"))
             os.environ["CC_SLACK_ALIAS"] = "dash"
             r3 = record({"session_id": "sid-o", "transcript_path": t, "cwd": plan})
-            ok("an orch with no pane is named AND addressed repo@alias — the alias is the only thing between it "
+            ok("an orch with no pane is ADDRESSED repo@alias — the alias is the only thing between it "
                "and the session a person steers in the same worktree, so without it they were one key",
-               bool(r3) and r3.get("name") == "repo2@dash" and r3.get("target") == "repo2@dash")
+               bool(r3) and r3.get("target") == "repo2@dash")
+            # …AND NAMED THE OTHER WAY ROUND (owner, 2026-09-06, thread 1788680869: "naming for suborch should be
+            # dashboard@myrepo not the other way around"). `name` is the label the dashboard's session row prints;
+            # `target` is the key, the tmux window and what cc-pulse matches, so only the label flips.
+            ok("…and NAMED alias@repo, which is a label and not the key — the two differ for an orch and for "
+               "nothing else", r3.get("name") == "dash@repo2" and r3.get("name") != r3.get("target")
+               and rp.get("name") == rp.get("target") == "repo2")
             ok("…so the two live sessions sharing that worktree are two addresses, not one",
                rp.get("target") != r3.get("target"))
             r3b = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
@@ -1220,7 +1262,19 @@ def selfcheck():
             os.environ["TMUX_PANE"] = "%999999"           # a pane tmux does not know: the name falls back, nothing raises
             r4 = record({"session_id": "sid-o", "transcript_path": t, "cwd": plan})
             ok("a pane tmux cannot name falls back to the parts, never raises",
-               bool(r4) and r4.get("name") == "repo2@dash" and r4.get("target") == "repo2@dash")
+               bool(r4) and r4.get("name") == "dash@repo2" and r4.get("target") == "repo2@dash")
+            # TYPED BACK. The name printed above is what a person copies into `cc-context <address>`, so the
+            # record store answers to it — tried against the records, never guessed from the string. The control
+            # is the lookup this replaced: exact-match only, which could not find a session by its own name.
+            ok("the name a person is shown is accepted back: `cc-context dash@repo2` finds the session recorded "
+               "under repo2@dash, and the stored spelling still finds it too",
+               session_at("dash@repo2") == "sid-o" and session_at("repo2@dash") == "sid-o")
+            ok("control: without the flip an exact match on the shown name finds nothing, which is a live orch "
+               "unreachable by the only name the box prints for it",
+               not [d for d in records() if (d.get("target") or "") == "dash@repo2"])
+            ok("…and a name that is nobody's is still nobody's, either way round",
+               session_at("nosuch@repo2") is None and flipped("repo1/track1") == "repo1/track1"
+               and flipped("repo2") == "repo2")
         finally:
             for k, v in envN.items():
                 os.environ.pop(k, None)
@@ -1298,19 +1352,53 @@ def selfcheck():
         ok("...but the canonical name wins the moment it exists too, so the two never fork",
            journal_of(mo) == "~/.cc/state/repo3/o-handoff.md")
 
-        # the three lines: a percentage each, with a floor under the first two
-        ok("30/40/60 of the 1M window", thresholds(BIG_WINDOW) == (300000.0, 400000.0, 600000.0))
-        ok("the floors hold a 200k window up", thresholds(DEFAULT_WINDOW) == (60000.0, 90000.0, 120000.0))
+        # the three lines: a percentage each, capped at an absolute token count, with a floor under the first two
+        ok("the 1M window is capped at 112k/150k/225k, not 30/40/60 of it",
+           thresholds(BIG_WINDOW) == (112500.0, 150000.0, 225000.0))
+        ok("...and a window past 1M buys no more room either — the cap is absolute, not relative",
+           thresholds(2_000_000) == (112500.0, 150000.0, 225000.0))
+        ok("the floors hold a 200k window up, where the caps never bite: this change moved nothing there",
+           thresholds(DEFAULT_WINDOW) == (60000.0, 90000.0, 120000.0))
         ok("on 128k the floor is the whole rule", thresholds(128000) == (60000.0, 90000.0, 90000.0))
         ok("the ceiling is never under the handoff", thresholds(100000)[2] >= thresholds(100000)[1])
-        ok("levels, in order", [level_of(u, BIG_WINDOW) for u in (299999, 300000, 400000, 600000)]
+        ok("the retry lines still land strictly between the two capped lines",
+           bool(retry_lines(BIG_WINDOW)) and all(thresholds(BIG_WINDOW)[1] < x < thresholds(BIG_WINDOW)[2]
+                                                 for x in retry_lines(BIG_WINDOW)))
+        for k, v in (("CC_CONTEXT_WARN_MAX", "150000"), ("CC_CONTEXT_HANDOFF_MAX", "200000"),
+                     ("CC_CONTEXT_CEILING_MAX", "300000")):
+            os.environ[k] = v
+        ok("each cap has its own override", thresholds(BIG_WINDOW) == (150000.0, 200000.0, 300000.0))
+        ok("...and raising them still cannot move a 200k window: the percentage is the smaller of the two there",
+           thresholds(DEFAULT_WINDOW) == (60000.0, 90000.0, 120000.0))
+        os.environ["CC_CONTEXT_HANDOFF_MAX"] = "50000"
+        ok("...and a cap under the floor loses: a session is never handed off before it can work",
+           thresholds(BIG_WINDOW)[1] == 90000.0)
+        for k in ("CC_CONTEXT_WARN_MAX", "CC_CONTEXT_HANDOFF_MAX", "CC_CONTEXT_CEILING_MAX"):
+            os.environ.pop(k, None)
+        ok("levels, in order", [level_of(u, BIG_WINDOW) for u in (112499, 112500, 150000, 225000)]
                                == [None, "journal", "handoff", "ceiling"])
         ok("the same rule fires on a 200k model", level_of(60000, DEFAULT_WINDOW) == "journal")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            os.environ["CC_CTX_WINDOW"] = str(BIG_WINDOW)
+            main(["--thresholds"])
+            os.environ["CC_CTX_WINDOW"] = str(DEFAULT_WINDOW)
+            main(["--thresholds"])
+            os.environ.pop("CC_CTX_WINDOW")
+        ok("--thresholds prints the lines in TOKENS, for the window asked about",
+           buf.getvalue().split("\n")[:2] == ["112500 150000 225000", "60000 90000 120000"])
 
         # nothing real is ever restarted or started from a selfcheck: the ONE shell-out is stubbed. It stands
         # in for cc-handoff, which owns the phases — so this fixture answers exactly as that CLI does, with the
         # action it took, and these cases assert what THIS file does with the answer, never what cc-handoff
         # decides (that has its own selfcheck, and selftest.sh drives the two together on real windows).
+        # The crossing fixtures below are about the MACHINERY — which line fires, what is said, what is
+        # started, what lands on the ledger — not about where the lines sit (asserted above). Pin the caps out
+        # of the way so they keep reading in round percentages of the 1M window, 300k/400k/600k, and so the
+        # retry ladder still has three rungs to walk. Put back where the stubs are.
+        for k, v in (("CC_CONTEXT_WARN_MAX", "300000"), ("CC_CONTEXT_HANDOFF_MAX", "400000"),
+                     ("CC_CONTEXT_CEILING_MAX", "600000")):
+            os.environ[k] = v
         global have_window, overlap_open, event
         hw0, ev0, oo0 = have_window, event, overlap_open
         live, events, started, on, tried = [True], [], [], [False], []
@@ -1547,6 +1635,8 @@ def selfcheck():
         on[0] = False
         os.remove(os.path.join(wt, "dirty.txt"))
         have_window, event, overlap_open = hw0, ev0, oo0
+        for k in ("CC_CONTEXT_WARN_MAX", "CC_CONTEXT_HANDOFF_MAX", "CC_CONTEXT_CEILING_MAX"):
+            os.environ.pop(k, None)
 
         # ---- the status line's own number: preferred when fresh, ignored when stale, absent or incomplete ----
         global STATUSLINE_DIR

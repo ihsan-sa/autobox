@@ -1488,6 +1488,50 @@ def selfcheck():
     ok("an orchestrator's mark holds its own repo's row, and still holds no other repo's",
        mark_why(dict(_at, agent="@5:900"), _wo, "proj", now(), 6 * 3600)[0]
        and not mark_why(dict(_at, agent="@6:900"), _wo, "proj", now(), 6 * 3600)[0])
+    # …AND AN ORCH'S WINDOW IS NOT IN TMUX SESSION `main`. It is grouped onto main under a session name of its
+    # own — tmux answers `main-18` for its pane — and this file never asks a session's name at all, because
+    # `list-panes -a` is every pane on the SERVER. Nothing held that, so a listing narrowed to one session
+    # would pass every case above and drop every orch's mark on the real box. Own tmux server, on a socket
+    # under $TMUX_TMPDIR with $TMUX unset (selftest.sh's pattern), so the box's own server is never touched —
+    # and if anything already answers there, this touches nothing and fails rather than guessing.
+    #
+    # THE SOCKET IS NAMED TWICE, AND THE TEARDOWN IS A SESSION. tmux_live() is the code under test and shells out
+    # to a bare `tmux`, so the ENV has to point it here; every call this fixture makes names that same path with
+    # `-S` as well, so no later refactor of the env can aim one of them at the box's own server. And it ends with
+    # `kill-session`: `kill-server` on the wrong socket takes every session on this box down with it, and being
+    # right today only because two lines above popped $TMUX is not a thing to leave lying about.
+    _started, _pid, _wid, _fw = False, "", "", {}
+    with tempfile.TemporaryDirectory() as _ts:
+        _sock = os.path.join(_ts, "tmux-%d" % os.getuid(), "default")   # where TMUX_TMPDIR=_ts resolves to
+        os.makedirs(os.path.dirname(_sock), exist_ok=True)
+        os.chmod(os.path.dirname(_sock), 0o700)         # tmux refuses a socket dir anyone else can read
+        _keep = {k: os.environ.get(k) for k in ("TMUX", "TMUX_TMPDIR")}
+        os.environ["TMUX_TMPDIR"] = _ts
+        os.environ.pop("TMUX", None)
+        def _tx(*a):
+            try:
+                return subprocess.run(["tmux", "-S", _sock, *a], capture_output=True, text=True, timeout=20)
+            except Exception:                           # no tmux at all, or one that will not answer in time:
+                return subprocess.CompletedProcess(a, 1, "", "")   # tmux_live swallows the same, and this case
+        try:                                            # then goes RED with the rest — never a traceback
+            if _tx("list-sessions").returncode != 0:    # nothing answers on our own socket: ours to make
+                _started = _tx("-f", "/dev/null", "new-session", "-d", "-s", "notmain",
+                               "-n", "proj@dash", "sleep 600").returncode == 0
+            if _started:
+                def _ask(fmt):
+                    return _tx("display-message", "-p", "-t", "notmain:proj@dash", fmt).stdout.strip()
+                _pid, _wid = _ask("#{pane_pid}"), _ask("#{window_id}:#{pid}")
+                _fw = tmux_live({_pid}, {_pid})[2]
+        finally:
+            if _started:
+                _tx("kill-session", "-t", "notmain")
+            for _k, _v in _keep.items():
+                os.environ.pop(_k, None) if _v is None else os.environ.update({_k: _v})
+    ok("a real tmux window `<repo>@<alias>` in a session that is NOT `main` is read as that repo's, and its "
+       "mark holds the row — an orch lives in a session of its own and every one of its rows turns on this",
+       _started and _fw.get(_wid) == "proj@dash"
+       and mark_why(dict(_at, agent=_wid), _fw, "proj", now(), 6 * 3600) == (True, "")
+       and mark_why(dict(_at, agent=_wid), _fw, "other", now(), 6 * 3600) == (False, ""))
     ok("A CHILD IN THE PANE IS NOT A SESSION: a window left with a `tail -f` or an `htop` in it after the session "
        "exited has one for ever, and a mark on it would keep a row alive for ever — it is live for the TRACK "
        "rule and unusable as a mark, which is the difference the two tests exist for",

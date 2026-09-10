@@ -347,11 +347,31 @@ env PATH="$T/ghc:$PATH" CC_SLACK="$T/ccslack/cc-slack" "$B/cc" done $REPO c6 >"$
   && [ "$(jq -r '.executions[-1].outcome' < "$d6")" = "released: delivered" ]; } \
   && ok "cc done ends the claim the delivered work was done under — the row is in review and nobody still holds it" \
   || bad "cc done left the row claimed: $(tr -d '\n' < "$d6" | head -c 200) :: $(cat "$T/c6done.out")"
+# …AND FROM THAT PR ON, THE ROW IS THE LANDING QUEUE'S. A plain dispatch — this process's or any other's — is
+# refused before it writes a brief or buys a turn, because the remainder of a track kept running inside a change
+# already delivered and landed it twice (arch review 2026-09-08 rec 6). The queue's own reservation for that PR
+# and head is the one way back in, and the dispatch it then runs adopts that repair rather than claiming afresh.
+cp "$d6" "$T/c6before.json"
 ( "$B/cc" $REPO c6 --go "" >"$T/c6go.out" 2>&1; echo $? > "$T/c6go.rc" )   # a subshell of its own: a different owner
-{ [ "$(cat "$T/c6go.rc")" = 0 ] && [ "$(jq -r .task_id < "$d6")" = "$c6tid" ] \
-  && [ "$(jq -r .claim.generation < "$d6")" = 2 ]; } \
-  && ok "…so another process dispatches it afterwards — the repair round the lander runs — on the same task" \
-  || bad "a delivered row would not dispatch: rc=$(cat "$T/c6go.rc") $(cat "$T/c6go.out")"
+{ [ "$(cat "$T/c6go.rc")" != 0 ] && grep -q 'delivery-pending' "$T/c6go.out" \
+  && grep -q 'fixture/repo/pull/1' "$T/c6go.out" \
+  && cmp -s "$d6" "$T/c6before.json" && [ -z "$(wins "$REPO/c6")" ]; } \
+  && ok "…and a delivered row is not dispatched again: the refusal names the PR, and no window, brief or record write was spent" \
+  || bad "a delivered row dispatched anyway: rc=$(cat "$T/c6go.rc") $(cat "$T/c6go.out")"
+# The queue's two steps, in one process the way cc-land runs them: the reservation, then its own dispatch. Both
+# plain commands here — a $(…) or a subshell would be a second owner, which is what D5 of cc-task refuses.
+"$B/cc-task" reserve-repair $REPO c6 --generation 1 --branch track/c6 \
+  --pr https://github.com/fixture/repo/pull/1 --head 6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c >"$T/c6res.out" 2>&1; r6=$?
+"$B/cc" $REPO c6 --go "" >"$T/c6go2.out" 2>&1; g6=$?
+e6=$(jq -r .execution_id < "$T/c6res.out")   # the reservation's own execution: adopting it appends no second one
+{ [ "$r6" = 0 ] && [ "$(jq -r .launch < "$T/c6res.out")" = true ] && [ "$g6" = 0 ] \
+  && [ -n "$(wins "$REPO/c6")" ] && [ "$(jq -r .task_id < "$d6")" = "$c6tid" ] \
+  && [ "$(jq -r .claim.generation < "$d6")" = 2 ] \
+  && [ "$(jq -r '.executions[-1].execution_id' < "$d6")" = "$e6" ] \
+  && [ "$(jq -r '.executions[-1].phase' < "$d6")" = repair ] \
+  && [ "$(jq -r '.executions[-1].outcome' < "$d6")" = "released: worker launched" ]; } \
+  && ok "…so the queue's repair round is what dispatches it afterwards — the same task, its reservation adopted instead of a claim of its own" \
+  || bad "the repair round would not dispatch a delivered row: reserve rc=$r6 go rc=$g6 $(cat "$T/c6res.out" "$T/c6go2.out")"
 for id in $(wins "$REPO/c6"); do tmux kill-window -t "$id"; done
 # NOTHING THE HOST OPENS IN A TRACK'S OWN DIRECTORIES IS WRITTEN THROUGH A PLANTED NAME. $wt/.cc and $st are
 # bound read-write into that track's worker sandbox and into a member workspace, so a link left at a name the

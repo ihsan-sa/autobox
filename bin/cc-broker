@@ -92,6 +92,14 @@ steward, over lines that are already written down, and it never wakes a session 
   The steward keeps its OWN cursor, so the same lines are never handed to it twice, and the session's cursor is
   untouched — those lines are still owed to the session and still ride out on its next real message.
   A pulse that the steward does not handle does not move its cursor: the next tick offers the same lines again.
+  A LINE OLDER THAN STALE_S IS NOT NEWS and is never handed over. The cursor starts at 0, so the first tick for a
+  target sweeps its whole history: on 2026-09-08 that was 27 board-watchdog and pulse lines back to 09-03, all
+  long dealt with, and the steward — which has no chain for a three-day-old watchdog line — escalated the lot to
+  the planning seat as one `needs you`, buying the very turn this tick exists to save. So an old line is counted
+  in ONE summary line beside whatever is fresh, the cursor moves past it, and no tick offers it again. A line
+  carrying no stamp this file can read is never old: dropping one is the thing this file does not do.
+  A tick with nothing FRESH runs nobody at all — a summary on its own is not worth a call — and still moves the
+  cursor past the old lines, so they are dropped from consideration rather than swept again every two hours.
   A paused project gets no pulse, like every other timer-driven spender.
 
 NOTHING IS DROPPED, EVER (owner, 2026-09-02: "we dont worry about where we are in the daily limit, ill just tell
@@ -141,6 +149,10 @@ PULSE = f"{BROKER}/pulse.json"          # the steward's own read cursor per targ
 # flush. cc-broker-pulse.timer comes round every 30 min; a target that had a tick inside this window is skipped,
 # so the interval is one number in one place and a missed run costs a late tick rather than a lost one.
 PULSE_S = int(os.environ.get("CC_STEWARD_PULSE_S", "7200"))            # 2 h
+# PAST THIS A LEDGER LINE IS HISTORY, not a tick's business. A day, because the ledger's own writers repeat on the
+# hour and the session that owns the target has had every one of its own messages in between to read them on; what
+# is left after a day was either acted on or is nobody's, and neither is worth a model call or a planning turn.
+STALE_S = int(os.environ.get("CC_BROKER_STALE_S", "86400"))            # 24 h
 # A group the session was told about less than this ago, with no decision in it, is the machine saying the same
 # thing twice: it goes to the ledger instead of buying a second wake. Past the hour it digests again — the
 # suppression is bounded, and either way nothing is dropped, because the ledger's count rides on the next message.
@@ -315,6 +327,22 @@ def ledger_lines(target):
             return [ln.rstrip("\n") for ln in f if ln.startswith("- ")]
     except OSError:
         return []
+
+
+LEDGER_TS = re.compile(r"^- (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) ")
+
+
+def ledger_at(line):
+    """When that line was written, off the stamp ledger_write() puts on it. None where there is no stamp this file
+    can read — and None is never old, because a line whose age we cannot tell must ride out rather than be
+    dropped, which is the promise the rest of this file is built on."""
+    m = LEDGER_TS.match(line)
+    if not m:
+        return None
+    try:
+        return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
 
 
 def ledger_unread(target):
@@ -596,7 +624,10 @@ def pulse_one(target):
 
     The cursor moves only on a run the steward HANDLED, so a tick it could not take comes round again. And it is
     the steward's own cursor: read.json is untouched here, so every line handed over is still owed to the
-    session and still rides out on its next real message."""
+    session and still rides out on its next real message.
+
+    AND ONLY WHAT IS STILL NEWS GOES OVER. Anything past STALE_S is counted in one line and never handed to the
+    steward, because a line that old reaches a person only as a `needs you` about something dealt with days ago."""
     if not steward_sources() or paused(target):
         return 0
     with locked():
@@ -609,13 +640,33 @@ def pulse_one(target):
         if not lines:
             return 0                      # and NOT claimed: a target with nothing to say has not had a tick, so
                                           # a line written a minute from now does not wait out the window
-        shown = lines[-LEDGER_TAIL:]
-        of = f" (the last {len(shown)})" if len(lines) > len(shown) else ""
+        cut = time.time() - STALE_S
+        old, fresh = [], []
+        for ln in lines:
+            at = ledger_at(ln)
+            (old if at is not None and at < cut else fresh).append(ln)
+        # ONE LINE FOR ALL OF IT, and the date of the oldest so a reader can tell what was let go. Never the lines
+        # themselves: 27 of them is the message that bought a planning turn on 2026-09-08. The date is a `min` and
+        # not the first line, because file order is the order they were APPENDED and a hand-edited ledger is not
+        # sorted — the stamp is fixed-width ISO-8601 Z, so it sorts as a string.
+        summary = (f"\n· {len(old)} older line{'s' if len(old) != 1 else ''} skipped, oldest "
+                   f"{min(ln[2:12] for ln in old)}") if old else ""
+        if not fresh:
+            # NOTHING NEW TO SAY, so nobody is called and nothing is spent — but the old lines are done with:
+            # the cursor moves past them here, or every tick from now on sweeps the same history again.
+            d.setdefault(target, {})["read"] = seen + len(lines)
+            save(PULSE, d)
+            log_event(at=now_s(), type="pulse", target=target, to="steward", lines=0, verdict="stale-only",
+                      skipped=len(old), woke=0, stewarded=0)
+            return 0
+        shown = fresh[-LEDGER_TAIL:]
+        of = f" (the last {len(shown)})" if len(fresh) > len(shown) else ""
         # THE SAME FENCE tail() carries, and for the same reason: no word of cc-steward's DECISION_MARKS in
         # framing of ours, or the tick is refused unread and escalated back as a `needs you` this file then wakes
         # the session with — every tick that had anything to hand over, which is the tick's whole point (#343, F1).
-        body = (f"pulse: {len(lines)} recorded with nothing in them to answer and nobody has read them{of}, "
-                f"and all of them are in {ledger_path(target)}:\n" + "\n".join(f"  {ln}" for ln in shown))
+        body = (f"pulse: {len(fresh)} recorded with nothing in them to answer and nobody has read them{of}, "
+                f"and all of them are in {ledger_path(target)}:\n"
+                + "\n".join(f"  {ln}" for ln in shown) + summary)
         # CLAIMED HERE, BEFORE THE RUN AND UNDER THE LOCK, not after it. The window is the only thing keeping two
         # ticks off the same lines, and claiming it afterwards leaves a second caller — a `--pulse` typed by hand
         # while the timer's run is in flight — passing the same test and paying for the same lines again. It is
@@ -629,8 +680,8 @@ def pulse_one(target):
             d = load(PULSE, {})
             d.setdefault(target, {})["read"] = seen + len(lines)
             save(PULSE, d)
-    log_event(at=now_s(), type="pulse", target=target, to="steward", lines=len(lines), verdict=verdict,
-              woke=0, stewarded=int(took))
+    log_event(at=now_s(), type="pulse", target=target, to="steward", lines=len(fresh), verdict=verdict,
+              skipped=len(old), woke=0, stewarded=int(took))
     return int(took)
 
 
@@ -1335,6 +1386,47 @@ def selfcheck():
            bool(marks) and "w/t review" in ticked and "w/t review" in flushed
            and not any(m in ticked.lower() or m in flushed.lower() for m in marks)
            and not decision_needed(ticked) and not decision_needed(flushed))
+
+        # A LINE FROM TWO DAYS AGO IS NOT NEWS. The tick's cursor starts at 0, so the first one for a target sweeps
+        # its whole history: 27 lines back to 09-03 went over on 2026-09-08 and came back as one `needs you` at the
+        # planning seat, about work long done. Its own fixture, written by hand because `ledger` stamps now: one
+        # stale line, one fresh, and TWO ticks over the same file.
+        p7 = f"{th}/.cc/state/p7/events.md"
+        os.makedirs(os.path.dirname(p7), exist_ok=True)
+        aged = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * 86400))
+        with open(p7, "w") as f:
+            f.write(f"- {aged} pulse: v/t review — unchanged\n")
+        run("ledger", "p7", "pulse: v/u running — unchanged")
+        os.truncate(rec, 0)
+        run("--pulse", "p7", CC_STEWARD_SOURCES="secretary")
+        first, ran = said(), runs()
+        os.truncate(rec, 0)
+        run("--pulse", "p7", CC_STEWARD_SOURCES="secretary", CC_STEWARD_PULSE_S="0")
+        ok("a ledger line older than a day is counted in ONE summary line and never handed over, and a second "
+           "tick over that same ledger hands over nothing at all — neither line is offered twice",
+           ran == 1 and "v/u running" in first and "v/t review" not in first
+           and f"1 older line skipped, oldest {aged[:10]}" in first
+           and not any(m in first.lower() for m in marks) and not decision_needed(first)
+           and runs() == 0 and calls() == 0)
+
+        # …AND A TICK WITH NOTHING BUT OLD LINES BUYS NOTHING AT ALL — not a call, not a wake — and still lets go
+        # of them, or every tick from now on sweeps the same history. Its own fixture: one stale line, then a
+        # fresh one written after the tick that let it go.
+        p8 = f"{th}/.cc/state/p8/events.md"
+        os.makedirs(os.path.dirname(p8), exist_ok=True)
+        with open(p8, "w") as f:
+            f.write(f"- {aged} pulse: x/t review — unchanged\n")
+        os.truncate(rec, 0)
+        run("--pulse", "p8", CC_STEWARD_SOURCES="secretary")
+        quiet = runs() == 0 and calls() == 0
+        run("ledger", "p8", "pulse: x/u running — unchanged")
+        # AND THE WINDOW IS NOT FORCED OPEN HERE, unlike every case above: nothing went over, so nothing was
+        # claimed, and this second tick lands inside the default 2 h and still gets its turn.
+        run("--pulse", "p8", CC_STEWARD_SOURCES="secretary")
+        ok("…and a tick with nothing but old lines runs nobody and does not spend the window either: it moves "
+           "past them, and the very next tick carries the new line alone, with no summary of what it let go",
+           quiet and runs() == 1 and "x/u running" in said() and "x/t review" not in said()
+           and "older line" not in said())
         os.truncate(rec, 0)
 
         out = run("report").stdout

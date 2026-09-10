@@ -60,6 +60,14 @@ field authorizes a service call. `cc rm` retires the record beside the repo's ot
 CLOSING IS FOR WORK THAT REALLY ENDED, because a closed record refuses every later claim. A merge is that; a
 delivery with no PR is not — a workspace project whose branch IS the delivery says `done` on the board and is
 dispatched again the next week. `delivered` is that ending: the same board projection, no closure.
+
+AND BETWEEN THE PR AND THAT ENDING THE ROW IS DELIVERY-PENDING. Once `pr` is on the record the change has left
+this box: the landing queue reviews it, merges it or sends it back. A plain claim there is a second worker
+inside a change already delivered, which is how the remainder of a track kept running and how the same change
+landed twice (arch review 2026-09-08 rec 6). So every ordinary claim is refused from the PR to the closure, and
+`cc … --go` asks `check` before it writes a brief or buys a turn. The ONE re-entry is the queue's own
+`reserve-repair` for that same PR and head, which launches once; the `cc … --go` the queue then runs is that
+dispatcher's own claim and adopts the reservation. New work is a new task, not this one carried on.
 """
 import argparse, fcntl, json, os, re, shutil, stat, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
@@ -185,9 +193,28 @@ def takeover(held, who, executor):
     if same_owner(held.get("owner"), who) or not alive(held.get("owner")): return True
     return executor == "worker" and held.get("executor") == "subagent"
 
-def check(record, repo, row, wt, who, executor=None):
-    """Raises when this owner may not write the row. A claim held by a LIVE other owner is the only refusal, and
-    `takeover` says which of those may be taken anyway. No executor named is the strict reading: nothing is taken."""
+def delivery_pending(record):
+    """Is this task's change out of the box's hands? Its PR is recorded and nothing has closed it, so the landing
+    queue decides what happens next. `close` ends this state in both directions: merged, or done."""
+    return bool(record) and bool(record.get("pr")) and not record.get("closed")
+
+def adopts_repair(record, who, executor):
+    """Is this claim the reservation's own launch? cc-land reserves the repair and then runs `cc … --go` as its
+    own child, so that worker claim arrives under the same owner and the same live repair claim — the launch the
+    reservation already granted, not a second way into a delivered change."""
+    c = (record or {}).get("claim") or {}
+    return (c.get("phase") == "repair" and not c.get("ended_at") and executor == "worker"
+            and c.get("executor") == "worker" and same_owner(c.get("owner"), who))
+
+def check(record, repo, row, wt, who, executor=None, claiming=True):
+    """Raises when this owner may not write the row. A claim held by a LIVE other owner is one refusal and
+    `takeover` says which of those may be taken anyway; a delivery-pending task is the other. No executor named is
+    the strict reading: nothing is taken.
+
+    `claiming` is false for the two callers that are not taking the row and must never be walled off it: renew and
+    release, where the owner is ending a claim it already holds — `cc done` records the PR and then releases, so a
+    delivery-pending refusal there would leave every finished subagent holding its row for ever — and
+    reserve_repair, which IS the re-entry this refusal leaves open and checks the PR and head itself."""
     if record is None: return
     if record.get("schema") != SCHEMA:
         raise ValueError(f"delivery.json is schema {record.get('schema')!r}, and this cc-task writes {SCHEMA}")
@@ -198,6 +225,11 @@ def check(record, repo, row, wt, who, executor=None):
         raise ValueError(f"{repo}/{row} is claimed by a live owner (generation {c['generation']}, "
                          f"{c['executor']}, since {c['started_at']}) — it releases it, or a person removes "
                          f"{Path.home() / '.cc/state' / repo / row / 'delivery.json'}")
+    if claiming and delivery_pending(record) and not adopts_repair(record, who, executor):
+        raise ValueError(f"{repo}/{row} is delivery-pending: {record['pr'].get('url')} carries this task and "
+                         f"the landing queue owns it until that PR merges or is sent back. The one way back "
+                         f"in is that queue's repair round. New work is a new task — a new row, or "
+                         f"`cc rm {repo} {row}` once the PR has settled.")
 
 def rekey(record, repo, row, wt):
     """THE PATH IS THE KEY, and the name in the record is a copy of it. `cc rename` moves ~/.cc/state/<old> to
@@ -294,7 +326,7 @@ def reserve_repair(d, a, wt, who):
             return dict(e, launch=False)
     if a.generation != (d.get("claim") or {}).get("generation"):
         raise ValueError("repair generation does not match the claim")
-    check(d, a.repo, a.row, wt, who, "worker")
+    check(d, a.repo, a.row, wt, who, "worker", claiming=False)   # the reservation IS the delivery-pending re-entry
     resume = d["claim"]["executor"] == "worker"
     do_claim(d, who, "worker", "repair")
     e = d["executions"][-1]
@@ -515,7 +547,7 @@ def main(argv):
         check(read(state), a.repo, a.row, wt, who, ex); return 0   # and only `claim` is ever the atomic answer
     with Lock(state):
         d = read(state)
-        check(d, a.repo, a.row, wt, who, ex)
+        check(d, a.repo, a.row, wt, who, ex, claiming=(a.cmd == "claim"))
         moved = d is not None and rekey(d, a.repo, a.row, wt)
         if a.cmd == "claim":
             prepared(a.repo, a.row, wt)
@@ -639,15 +671,22 @@ def selfcheck():
         # alive until the gate is removed — so the winner's claim can be tested while its owner is still running,
         # which is the whole of the rule. Sharing this process as a parent does not make them one owner.
         record.unlink()
-        # A separate owner: it waits for the gate, claims, optionally hands the claim straight back, writes its
-        # status and then stays alive until the gate is removed. Being started by this process does not make it
-        # this process.
+        # A separate owner: it waits for the gate, claims — or, in `repair` mode, reserves a repair and then takes
+        # the dispatcher's own claim on it — optionally hands the claim straight back, writes its status and then
+        # stays alive until the gate is removed. Being started by this process does not make it this process.
         helper = root / "owner.py"
         helper.write_text(
             "import json,pathlib,subprocess,sys,time\n"
             "gate,out,mode,ex,py,tool,repo,row = sys.argv[1:9]\n"
+            "extra = sys.argv[9:]\n"
             "g=pathlib.Path(gate)\n"
             "while not g.exists(): time.sleep(.01)\n"
+            "if mode=='repair':\n"
+            "    v=subprocess.run([py,tool]+extra,capture_output=True,text=True)\n"
+            "    w=subprocess.run([py,tool,'claim',repo,row,'--executor','worker'],capture_output=True,text=True)\n"
+            "    pathlib.Path(out).write_text('%d%d' % (v.returncode,w.returncode))\n"
+            "    while g.exists(): time.sleep(.01)\n"
+            "    raise SystemExit(0)\n"
             "r=subprocess.run([py,tool,'claim',repo,row,'--executor',ex],capture_output=True,text=True)\n"
             "if mode=='release' and r.returncode==0:\n"
             "    c=json.loads(r.stdout)['claim']\n"
@@ -655,10 +694,10 @@ def selfcheck():
             "                    '--reason','handed back'],capture_output=True)\n"
             "pathlib.Path(out).write_text(str(r.returncode))\n"
             "while g.exists(): time.sleep(.01)\n")
-        def owners(mode, n, gate, ex="subagent"):
+        def owners(mode, n, gate, ex="subagent", row="t", extra=()):
             for stale in root.glob("rc*"): stale.unlink()
             ps = [subprocess.Popen([sys.executable, str(helper), str(gate), f"{root}/rc{i}", mode, ex,
-                                    sys.executable, __file__, "r", "t"], env=env) for i in range(n)]
+                                    sys.executable, __file__, "r", row, *extra], env=env) for i in range(n)]
             gate.touch()
             for _ in range(6000):
                 if all((root / f"rc{i}").exists() for i in range(n)): break
@@ -783,12 +822,19 @@ def selfcheck():
            and finish("project", "card", "--chat", "fixture", "--ts", "1.3").returncode != 0
            and json.loads(record2.read_text())["executions"] == got["executions"]
            and settled["errors"] == [])
+        # C5b's subject is the workspace delivery: a branch that IS the delivery, with no PR anywhere. C4's PR is
+        # taken off the record for it and put back after, because a task that HAS one is delivery-pending and
+        # refuses the claim (D1) — what this case is about is `delivered` not CLOSING the record.
+        carded = json.loads(record2.read_text())
+        record2.write_text(json.dumps(dict(carded, pr=None, card=None)))
         ok("C5b: a delivery with no PR projects done and leaves the task claimable — C6 is its control, where a "
            "merge closes the record and the next claim is refused",
            finish("delivered").returncode == 0
            and json.loads(run("receipt", "r", "t2").stdout)["pending"]["board"] == {"status": "done"}
            and json.loads(record2.read_text())["closed"] is None
            and run("check", "r", "t2", "--executor", "worker").returncode == 0)
+        record2.write_text(json.dumps(dict(json.loads(record2.read_text()),
+                                           pr=carded["pr"], card=carded["card"])))
         finish("close", "merged"); closed = json.loads(run("receipt", "r", "t2").stdout)
         ok("C6: closed receipts still accept pending board acknowledgements; claims and artifact rewrites are refused",
            closed["closed"]["status"] == "merged" and closed["pending"]["board"]["status"] == "merged"
@@ -851,6 +897,90 @@ def selfcheck():
            worker["repair"]["resume"] and worker["launch"] and changed["launch"]
            and changed["execution_id"] != worker["execution_id"]
            and not json.loads(run(*reserve).stdout)["launch"])
+
+        # D1-D4: DELIVERY-PENDING. From the PR to the closure the change belongs to the landing queue, so an
+        # ordinary claim is refused — `cc … --go` asks `check` before it writes a brief or buys a turn, so the
+        # refusal costs nothing. The queue's own reservation is the one re-entry, and it launches once. Each case
+        # resets the record first, so one of them failing leaves the next reading the state it was written for.
+        pending = json.loads(json.dumps(repair_base))
+        pending["claim"].update(executor="subagent", phase="starting", ended_at=stamp(), reason="delivered")
+        gen = str(pending["claim"]["generation"]); url = pending["pr"]["url"]
+        def delivered():
+            record2.write_text(json.dumps(pending)); return record2.read_bytes()
+        def answer(r): return json.loads(r.stdout or "{}")
+        reserve2 = ("reserve-repair", "r", "t2", "--generation", gen, "--branch", "track/t2",
+                    "--pr", url, "--head", sha)
+
+        before = delivered(); refused = run("claim", "r", "t2", "--executor", "worker")
+        astray = run("claim", "r", "t2", "--executor", "subagent")
+        asked = run("check", "r", "t2", "--executor", "worker"); unwritten = record2.read_bytes() == before
+        # …and the builder's OWN live claim is no way round it either: `cc done` records the PR from inside that
+        # claim, so the record is delivery-pending while the claim that built it is still live and still this
+        # owner's. Only a claim in the repair PHASE is the queue's re-entry.
+        building = json.loads(json.dumps(pending))
+        building["claim"].update(ended_at=None, phase="starting", executor="worker", reason=None)
+        record2.write_text(json.dumps(building)); before = record2.read_bytes()
+        ok("D1: a recorded PR makes the row delivery-pending — claim and check refuse, naming the PR, and nothing "
+           "is written, whether the claim that built it has ended or is still live and this owner's; C5b's "
+           "delivery with no PR is its control",
+           refused.returncode != 0 and url in refused.stderr and "delivery-pending" in refused.stderr
+           and astray.returncode != 0 and asked.returncode != 0 and unwritten
+           and run("claim", "r", "t2", "--executor", "worker").returncode != 0
+           and record2.read_bytes() == before)
+
+        delivered(); denied = run("claim", "r", "t2", "--executor", "worker")
+        granted = answer(run(*reserve2)); after = record2.read_bytes()
+        adopted = run("claim", "r", "t2", "--executor", "worker"); unchanged = record2.read_bytes() == after
+        sub = run("claim", "r", "t2", "--executor", "subagent")   # the reservation launches ONE worker, not a subagent
+        ok("D2: the reservation is the way in that D1 refuses without — it launches, and the `cc … --go` the queue "
+           "then runs adopts that repair instead of taking a claim of its own, while a subagent on that same "
+           "reservation is still refused",
+           denied.returncode != 0 and granted.get("launch") and adopted.returncode == 0 and unchanged
+           and sub.returncode != 0
+           and json.loads(record2.read_text())["claim"]["phase"] == "repair"
+           and json.loads(record2.read_text())["executions"][-1]["execution_id"] == granted["execution_id"])
+
+        delivered(); spent = answer(run(*reserve2)); held = json.loads(record2.read_text())["claim"]
+        run("release", "r", "t2", held["claim_id"], str(held["generation"]), "--reason", "worker launched")
+        before = record2.read_bytes(); replay = answer(run(*reserve2))
+        ok("D3: a second repair for the same PR and head buys nothing — the replay grants no launch, and the row "
+           "is delivery-pending again the moment the launched worker's claim ends; D2 is its control",
+           spent.get("launch") and replay.get("launch") is False
+           and replay["execution_id"] == spent["execution_id"]
+           and run("claim", "r", "t2", "--executor", "worker").returncode != 0
+           and run("claim", "r", "t2", "--executor", "subagent").returncode != 0
+           and record2.read_bytes() == before)
+
+        delivered(); old = json.loads(record2.read_text())
+        receipts = root / ".cc/state/r/.receipts"; receipts.mkdir(parents=True, exist_ok=True)
+        kept = receipts / f"t2.{old['task_id']}.json"
+        blocked = run("claim", "r", "t2", "--executor", "worker")
+        os.replace(record2, kept)   # what `cc rm` does with a finished row: the receipt outlives it
+        fresh = answer(run("claim", "r", "t2", "--executor", "worker"))
+        ok("D4: new work never inherits the delivered task — refused on that record, and given a new identity only "
+           "once the record is retired, which keeps the old task and its PR in the receipt",
+           blocked.returncode != 0 and fresh.get("task_id") not in (None, old["task_id"])
+           and fresh["pr"] is None and fresh["claim"]["generation"] == 1 and len(fresh["executions"]) == 1
+           and json.loads(kept.read_text())["pr"] == old["pr"]
+           and json.loads(kept.read_text())["task_id"] == old["task_id"])
+
+        # D5: THE RESERVATION IS THE PROCESS'S THAT TOOK IT, and only two real processes can say so — every run()
+        # above shares this one as its owner. cc-land reserves and then launches; a second dispatcher arriving at
+        # that same PR is not that launch, whether cc-land is still running or died between the two.
+        delivered(); gate5 = root / "gate5"
+        land_ps, rcs5 = owners("repair", 1, gate5, row="t2", extra=reserve2)
+        reserved5 = json.loads(record2.read_text())
+        while_alive = run("claim", "r", "t2", "--executor", "worker")
+        gate5.unlink()
+        for p in land_ps: p.wait(timeout=60)
+        once_gone = run("claim", "r", "t2", "--executor", "worker")
+        ok("D5: another process's repair reservation is not this one's launch — its own claim is, and a second "
+           "dispatcher is refused both while it runs and after it dies holding the reservation; D2 is the "
+           "same-owner control",
+           rcs5 == ["00"] and reserved5["claim"]["phase"] == "repair"
+           and not same_owner(reserved5["claim"]["owner"], owner())
+           and while_alive.returncode != 0 and once_gone.returncode != 0
+           and answer(run(*reserve2)).get("launch") is False)
 
         # B1-B5: the runtime payload is the only agent identity. The helper is a hook stand-in, kept in
         # this fixture; no CLI accepts an agent id. Both children have this selfcheck as their parent.

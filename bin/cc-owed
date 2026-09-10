@@ -202,7 +202,7 @@ class Outbox(dict):
 
 def outbox_index(nbytes=OUTBOX_TAIL):
     """Every word this box has SENT, indexed by where it landed: {(chat, thread_ts): [(epoch, text)…]} plus
-    {(chat, None): [(epoch, text)…]} for the channel as a whole. The text rides along because a SHARED lane needs
+    {(chat, None): [(epoch, text)…]} for the channel as a whole, `chat` being the id it resolves to (see below). The text rides along because a SHARED lane needs
     it: #alerts carries every repo's news, and telling a word about this track from a word about another one is
     reading what it says (see `owner_chats`). cc-slack writes one outbox.log line per post and per
     reaction before it calls the API, so this asks Slack nothing, costs no network read, and sees exactly the
@@ -237,8 +237,15 @@ def outbox_index(nbytes=OUTBOX_TAIL):
         if said.startswith(VOICE_PREFIX):
             continue                    # the box's transcript of a voice memo: their own words read back to them,
                                         # so counting it as ours reports an unanswered memo as answered
-        idx.setdefault((f[2], f[3]), []).append((at, said))
-        idx.setdefault((f[2], None), []).append((at, said))
+        chat = chat_id(f[2])            # THE ID, NOT THE SPELLING. cc-slack writes down the chat it was HANDED,
+                                        # so one channel appears in this log both ways — #<repo>-email-<id> by name
+                                        # at 04:49:52Z on 2026-09-09 and by id two minutes later — while every
+                                        # question below resolves the chat it is asking about. Keyed literally, a
+                                        # word logged under the name answered no ask at all, and the steward woke
+                                        # the planning seat over an ask answered three minutes earlier. A name the
+                                        # box cannot resolve is still itself, so nothing that used to match stops.
+        idx.setdefault((chat, f[3]), []).append((at, said))
+        idx.setdefault((chat, None), []).append((at, said))
     if not whole:
         idx.begins = first or time.time()   # the read started mid-file: everything before this line has rolled
                                             # off, and a tail it could date no line in answers for nothing at all
@@ -1010,6 +1017,26 @@ def selfcheck():
        answered("#alpha", RXV, epoch(ASKED), outbox_index())["n"] == 1)
     ok("the prefix this filter matches is still the one cc-slack posts — a rename there would switch it off in silence",
        f'VOICE_PREFIX = "{VOICE_PREFIX}"' in open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-slack"), encoding="utf-8").read())
+
+    # A CHANNEL NAMED TWO WAYS IS ONE CHANNEL (2026-09-09, #<repo>-email-<id>): cc-slack writes down the chat it was
+    # handed, so that lane went into the log by name at 04:49:52Z and by id at 04:50:32Z, while every question here
+    # resolves the chat it asks about. Keyed literally, a word logged under the name answered no ask at all —
+    # whichever way the ask itself named the channel — and the steward raised an answered ask and woke the seat.
+    BYNAME, BYID = "1788306300.100000", "1788306300.200000"
+    with open(os.path.join(SLACK_DIR, "outbox.log"), "a") as fh:
+        fh.write(f"2026-09-01T23:59:10Z\tpost\t#alpha\t{BYNAME}\tanswered, logged under the channel's name\n")
+        fh.write(f"2026-09-01T23:59:11Z\tpost\t#alpha-updates\t{BYNAME}\tanother lane, the same thread stamp\n")
+        fh.write(f"2026-09-01T23:59:12Z\tpost\t{C1}\t{BYID}\tanswered, logged under the channel's id\n")
+    nm = outbox_index()
+    ok("a word logged under the channel's NAME answers the ask, whichever way the ask named the channel",
+       answered("#alpha", BYNAME, epoch(ASKED), nm)["n"] == 1
+       and answered(C1, BYNAME, epoch(ASKED), nm)["n"] == 1)
+    ok("…and a word logged under its ID does the same: which spelling the writer used decides nothing",
+       answered("#alpha", BYID, epoch(ASKED), nm)["n"] == 1
+       and answered(C1, BYID, epoch(ASKED), nm)["n"] == 1)
+    ok("…while another channel's word at that same thread stamp answers nothing: the two names resolve, they do not merge",
+       answered("#alerts", BYNAME, epoch(ASKED), nm)["n"] == 0
+       and answered("#alpha-updates", BYID, epoch(ASKED), nm)["n"] == 0)
 
     # --- the owner debt: the board's own `waiting`, and whether he was reached since
     def wrote_board(status, updated, repo="alpha", track="t9", log=None, pr=""):

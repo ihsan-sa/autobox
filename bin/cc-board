@@ -73,13 +73,17 @@ def holder():
 # already expired stays expired — and that is the whole of the exception.
 # WHAT A READER COUNTS is one thing, and a mark that misses it is worse than no mark at all. Both readers ask
 # the same of a mark's window: cc-pulse's agent_held lists `-t main` and keeps a mark only where
-# `#{window_name}` is the row's own repo, and cc-reconcile's mark_why keeps one only where its wins[] entry —
-# the window's name again — is that repo. A window named anything else is read by NEITHER, so a claim made from
-# one records an owner nobody recognises: the row reads unowned, the watchdog calls it abandoned ten minutes
-# later, and cc-pulse offers it for dispatch while the subagent is still writing it. The claim does the exact
-# opposite of what it was for. Three live windows are named something else — `<repo>~old`, a session cc-handoff
-# has retired and whose subagents are still running (found building #318, 2026-09-07); `<repo>@<alias>`, an
-# orch; `<repo>/<track>`, a track session — so this is not only the retiring session's problem.
+# `#{window_name}` is the row's own repo or that repo with an `@<alias>` after it, and cc-reconcile's mark_why
+# keeps one only where its wins[] entry — the window's name again — passes that same test. A window named
+# anything else is read by NEITHER, so a claim made from one records an owner nobody recognises: the row reads
+# unowned, the watchdog calls it abandoned ten minutes later, and cc-pulse offers it for dispatch while the
+# subagent is still writing it. The claim does the exact opposite of what it was for.
+# `<repo>@<alias>` IS AN ORCHESTRATOR — a peer session on the same checkout and the same board — and both readers
+# have counted its mark since #329. Only this end still refused it, so an orch could not claim a row of its own
+# repo at all: two rows two orchs were working were flipped to `blocked` on the owner's list and offered for
+# dispatch a second time (2026-09-08). Two live windows are still named something no reader counts, so the
+# refusal stays: `<repo>~old`, a session cc-handoff has retired whose subagents are still running (found
+# building #318, 2026-09-07), and `<repo>/<track>`, a track session.
 SESSION = "main"   # the tmux session cc puts every window in, and the only one cc-pulse lists
 # LITERAL ON PURPOSE, never $CC_TMUX_SESSION. cc-limit, cc-started and cc-model read that override, so changing
 # this to match them looks like tidying — but the two READERS, cc-pulse and cc-reconcile, hardcode `main`. This
@@ -95,7 +99,8 @@ def agent_id(val, repo):
     would hold a row open silently — no worker, nothing to see, and no ask ever raised. A mark can only ever be
     made BY the session it names.
 
-    …AND ONLY FROM A WINDOW A READER COUNTS: in tmux session `main`, named for `repo`. This adds no way to write
+    …AND ONLY FROM A WINDOW A READER COUNTS: in tmux session `main`, named for `repo` — `<repo>` for the session
+    a person steers, `<repo>@<alias>` for an orchestrator beside it. This adds no way to write
     a mark — `me` is still the only value and it is still this process's own window — it refuses one that would
     be written into the dark. The refusal comes BEFORE the lock, so the row keeps whatever it already had; a
     session that wants the row anyway asks from a window that is read, and `agent ''` still hands a row back
@@ -130,12 +135,21 @@ def agent_id(val, repo):
     except Exception as e:
         sys.exit(f"cc-board set … agent me: tmux would not list '{SESSION}' ({e})")
     counted = q.returncode == 0 and f[0].split(":")[0] in (q.stdout or "").split()
-    if not counted or f[2] != repo:
+    # THE NAME TEST, AND IT IS THE WHOLE NAME. `<repo>`, or `<repo>@<alias>` on cc's own alias grammar
+    # (cc:1043, `^[a-z0-9-]{2,20}$`) — never a prefix, because a prefix is looser than the READERS are and this
+    # end must not write what they mis-parse. `startswith(repo + "@")` took `r@x1~old` (a retired orch, which
+    # cc-handoff renames exactly so its marks stop counting), bare `r@`, and worst `r@a\nzzz`: the readers split
+    # a tmux listing on lines, so that mark's window reads as `zzz`, holds nothing, and the row is offered for
+    # dispatch while its session is on it — a claim that releases the row, the one thing this refusal exists to
+    # stop. `re.fullmatch` sees the newline for what it is; `$` would not.
+    named = re.fullmatch(re.escape(repo) + r"(@[a-z0-9-]{2,20})?", f[2]) is not None
+    if not counted or not named:
         sys.exit(f"cc-board set … agent me: refused — this window is '{f[2]}' in tmux session '{f[1]}'"
                  + ("" if counted else f", which '{SESSION}' does not list") + ", and a "
-                 f"mark is only read off a window named '{repo}' in '{SESSION}'. cc-reconcile and cc-pulse would "
+                 f"mark is only read off a window named '{repo}' or '{repo}@<alias>' in '{SESSION}'. "
+                 f"cc-reconcile and cc-pulse would "
                  f"both ignore one made here, so the row would read as unowned and be offered for dispatch while "
-                 f"you are still on it. Row unchanged — mark it from the '{repo}' window.")
+                 f"you are still on it. Row unchanged — mark it from one of those windows.")
     return f[0]
 # A FIXTURE IS NOT A BOARD (owner, 2026-09-01). A suite names everything one run makes `_cc<suite><pid>` — board, lock,
 # worktree, state, tmux windows — and a suite that dies mid-run leaves them behind: one such board's `waiting` row
@@ -805,8 +819,9 @@ def selfcheck():
         # window that session does not have.
         def win_stub(sess, name, mark="@7:4242", listed=True):
             wid = mark.split(":")[0]
+            nm = name.replace("\n", "\\n")   # a window name MAY hold a newline, and that is a case below: printf puts it back
             tmux_stub(f'[ "$1" = list-windows ] && {{ printf "@4\\n{wid if listed else "@6"}\\n"; exit 0; }}\n'
-                      f'printf "{mark}\\t{sess}\\t{name}\\n"')
+                      f'printf "{mark}\\t{sess}\\t{nm}\\n"')
         win_stub("main", "r")
         runt("set", "r", "t1", "agent", "me")
         ok("`set … agent me` stores this session's window AND the tmux server that numbered it — window ids "
@@ -862,17 +877,22 @@ def selfcheck():
         json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
         u1 = lambda k="agent": json.load(open(f"{th}/.cc/boards/r.json"))["tracks"]["u1"].get(k, "")
         for sess, name, why in (("main", "r~old", "a session cc-handoff retired, subagents still running"),
-                                ("main", "r@x1", "an orch"),
                                 ("main", "r/t1", "a track session"),
                                 ("main", "other", "a session speaking for another repo"),
-                                ("work", "r", "the right name outside the tmux session cc-pulse lists")):
+                                ("main", "other@x1", "an orch of another repo"),
+                                ("main", "rr@x1", "an orch of a repo whose name merely starts with this one"),
+                                ("main", "r@x1~old", "an orch cc-handoff retired, whose marks stopped counting"),
+                                ("main", "r@", "an orch shape with no alias in it"),
+                                ("main", "r@a\nzzz", "a name whose SECOND line is what a reader would parse"),
+                                ("work", "r", "the right name outside the tmux session cc-pulse lists"),
+                                ("work", "r@x1", "an orch outside the tmux session cc-pulse lists")):
             win_stub(sess, name, listed=(sess != "work"))
             rf = runt("set", "r", "u1", "agent", "me")
             ok(f"a mark from {why} — window '{name}' in '{sess}' — is refused, the reason names both what this "
                "window is and what a read one would be, and the row keeps the mark and the clock it already "
                "had: a claim must never be the thing that releases a row",
                rf.returncode != 0 and f"'{name}' in tmux session '{sess}'" in rf.stderr
-               and "named 'r' in 'main'" in rf.stderr
+               and "named 'r' or 'r@<alias>' in 'main'" in rf.stderr
                and u1() == "@5:900" and u1("agent_at") == "2020-01-01T00:00:00Z"
                and u1("updated") == "2020-01-01T00:00:00Z")
         # A SESSION GROUPED ONTO `main` IS ON `main`. `tmux new-session -t main` shares main's windows, and tmux
@@ -885,6 +905,18 @@ def selfcheck():
         ok("a session grouped onto `main` — tmux answers 'main-13' for its pane — marks its own row, because "
            "the readers list that window under `main` and would count it",
            rf.returncode == 0 and u1() == "@7:4242")
+        # AN ORCHESTRATOR IS A SESSION OF THIS REPO. `cc <repo> --orch <alias>` opens `<repo>@<alias>` beside the
+        # planning window, on the same checkout and the same board, and both readers have counted its mark since
+        # #329 — only this end refused it, so an orch could not claim a row at all. Two rows two orchs were
+        # working were flipped to `blocked` on the owner's list and offered for dispatch again (2026-09-08).
+        d = json.load(open(f"{th}/.cc/boards/r.json"))
+        d["tracks"]["u1"]["agent"] = "@5:900"; d["tracks"]["u1"]["agent_at"] = "2020-01-01T00:00:00Z"
+        json.dump(d, open(f"{th}/.cc/boards/r.json", "w"))
+        win_stub("main-18", "r@improve")
+        rf = runt("set", "r", "u1", "agent", "me")
+        ok("…and so does an ORCHESTRATOR of this repo, from 'r@improve' in the session tmux answers for its "
+           "pane: it is a peer session on the same board, and both readers count that name",
+           rf.returncode == 0 and u1() == "@7:4242" and u1("agent_at") > "2020-01-01T00:00:00Z")
         run("set", "r", "u1", "agent", "@5:900")
         d = json.load(open(f"{th}/.cc/boards/r.json"))
         d["tracks"]["u1"]["agent"] = "@5:900"; d["tracks"]["u1"]["agent_at"] = "2020-01-01T00:00:00Z"

@@ -87,9 +87,17 @@ WHAT IT WILL NOT DO, and why each line is here:
     review and the round that verdict dispatched at 23:14 — 37 minutes and $7.87 on a fix that could never land,
     and the branch the merge had deleted pushed back onto origin by the worker. A merge found at either point
     dispatches nothing; the job goes back on the queue and the next run deploys it.
-  · It never merges on a promise. The gates run against the PR's OWN head, in a worktree thrown away
-    afterwards — not against the default branch, which does not contain the change, so gating it there would
-    be a green light for code nobody ran. A red gate or a conflicting PR stops everything before the merge.
+  · It never merges on a promise, and WHAT IT GATES IS THE MERGE. The gates run in a throwaway worktree of the
+    default branch MERGED WITH the PR's head (merge_result) — the tree the branch will hold once this squashes
+    into it — and never on the branch alone, which does not contain the change, nor on the head alone, which does
+    not contain what has landed since it forked. A head green on its own can be red merged, and until 2026-09-08
+    nothing ran the suite on the result: N PRs each green on their own base, gated side by side and merged one
+    after another, could leave the default branch red on a box that then deploys it to itself. In a sweep each
+    job's merge is built on the base with the jobs QUEUED BEFORE IT already in, since that is the order they
+    merge in, so the last one's gate is the integration run for the whole batch — a batch of PRs that do not
+    touch each other costs one wave of gates rather than one suite each, and a red one is the PR that was added
+    last rather than the batch failing blindly. A red gate or a conflicting PR stops everything before the merge,
+    and a red one says which tree it ran on (behind_base).
     ALL of them run at once, and the paid read starts with them rather than after the cheap ones: serial they were
     the whole of a landing's wall clock — ~5 + ~3 + ~14 minutes, measured 2026-09-07 — and a landing's gates now
     cost the slowest of them instead of the sum. Each is handed the paths the diff changed, so a suite that knows
@@ -1031,15 +1039,17 @@ def gate_dir():
     return f"{LANDQ}/gates"
 
 
-def memo_path(repo, pr, sha, tier):
-    return f"{gate_dir()}/{repo}-{pr}-{sha[:12]}-{tier}.json"
+def memo_path(repo, pr, key, tier):
+    return f"{gate_dir()}/{repo}-{pr}-{key[:12]}-{tier}.json"
 
 
-def gate_memo(repo, pr, sha, tier):
-    """"These gates already passed, on THIS sha, at THIS tier" — the one thing the parallel prepare phase leaves
-    behind for the serial one to spend. Keyed by the commit, so it can never answer for code that has moved, and
-    given a short life besides: a memo older than GATE_MEMO_TTL is ignored and swept."""
-    path = memo_path(repo, pr, sha, tier)
+def gate_memo(repo, pr, key, tier):
+    """"These gates already passed, on THIS tree, at THIS tier" — the one thing the parallel prepare phase leaves
+    behind for the serial one to spend. `key` is the TREE the gates ran on (gates() passes the merge of the base
+    into the head), so a memo can answer neither for code that has moved nor for a base that has: once a sibling
+    job merges, the tree this PR would produce is a different one and the memo is simply not found. Given a short
+    life besides: a memo older than GATE_MEMO_TTL is ignored and swept."""
+    path = memo_path(repo, pr, key, tier)
     j = read_json(path) or {}
     try:            # SPENT ON READ. A memo hands one sweep's prepare phase to that same sweep's serial one and
         os.unlink(path)     # nothing further: left lying about, the green it recorded would answer for the NEXT
@@ -1244,6 +1254,56 @@ def stale_note(root, base_ref, base, head, mine=()):
             + f": rebase it onto {base} and run again before hunting for a bug that may already be fixed")
 
 
+def merge_result(root, base, head):
+    """The commit whose TREE is what `base` will hold once `head` is squashed into it — what the gates run on, so
+    that what gets merged is what got tested.
+
+    Until 2026-09-08 the gates checked out the PR's own head and nothing ever ran the suite on the result of the
+    merge. Both arms of the 2026-09-07 flow review found the same hole independently: N PRs each green on their
+    own base, gated side by side and squash-merged one after another, can leave the default branch red with
+    nothing having run on what it now holds — on a box that installs and deploys that branch to itself minutes
+    later. `--match-head-commit` pins the head the merge takes; it says nothing about the base it was tested
+    against.
+
+    Returns (commit-ish, base-sha, tree). The commit-ish is `head` itself when the base is already an ancestor of
+    it — then the merge IS the head, and everything downstream is byte for byte what it was — and base-sha and
+    tree are "" in that case, which is how the caller knows there was no merge to name. It is "" when git could
+    not answer at all, which is a DIFFERENT thing from the head and has to stay different: the caller gates the
+    head, and prepare() must not carry a head with no base in it forward as the next job's base. A merge is built with
+    plumbing only (`merge-tree --write-tree` writes the tree, `commit-tree` gives it two parents): nothing is
+    checked out here, no index and no ref is touched, so this is safe to call under the repo lock and cannot
+    disturb the checkout the box itself runs from. The TREE comes back because the commit cannot be a key —
+    `commit-tree` stamps the clock into it, so the same merge built twice a minute apart is two different SHAs,
+    and a gate memo filed under one of them would never be found by the other. The tree is the same both times.
+
+    A TEXTUAL conflict raises: the caller has already asked GitHub the same question, and GitHub's answer can be
+    hours old. Anything else git says — an unfetched base, a plumbing version that will not answer — comes back as
+    ("", "", ""), because a landing that cannot build the merge must still gate something."""
+    if not base or not head:
+        return "", "", ""
+    rc, o = sh(["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"], cwd=root)
+    base_sha = o.strip() if rc == 0 else ""
+    if not base_sha:
+        return "", "", ""
+    if sh(["git", "merge-base", "--is-ancestor", base_sha, head], cwd=root)[0] == 0:
+        return head, "", ""   # the head already holds the base: merging it changes nothing, so gate the head
+    rc, o = sh(["git", "merge-tree", "--write-tree", base_sha, head], cwd=root, timeout=300)
+    tree = (o.splitlines() or [""])[0].strip()
+    if rc == 1:
+        raise Failed(f"{head[:12]} conflicts with {base} at {base_sha[:12]} — rebase it, then land it: "
+                     f"{last(o)}")
+    if rc or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        return "", "", ""
+    ident = dict(os.environ, GIT_AUTHOR_NAME="cc-land", GIT_AUTHOR_EMAIL="cc-land@invalid",
+                 GIT_COMMITTER_NAME="cc-land", GIT_COMMITTER_EMAIL="cc-land@invalid")
+    rc, o = sh(["git", "commit-tree", tree, "-p", base_sha, "-p", head,
+                "-m", f"cc-land: {base} {base_sha[:12]} merged with {head[:12]}"], cwd=root, env=ident)
+    sha = o.strip()
+    if rc or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        return "", "", ""
+    return sha, base_sha, tree
+
+
 def verdict_in(body, key, head):
     """The verdict a PR comment records about a change, or "". Anchored at the START of the comment, because that
     is where post_review() and `record` both put the marker and a reviewer's prose is everything after it: a
@@ -1351,6 +1411,15 @@ class Land:
         self.changed = None      # [(status, path)] this landing makes; worked out once, when it is first needed
         self.head = ""           # the PR head as a SHA — never "FETCH_HEAD", which the pull below overwrites
         self.gated = ""          # …the SHA the gates ran on: what the review after them, and the merge, are pinned to
+        self.merged_on = ""      # …and the BASE it was merged with before they ran, "" when the head already held it:
+                                 # the gates prove the suite passes on the tree the base will have, not on the head
+                                 # alone (merge_result). Set by gates(); read by behind_base() and the landed line
+        self.merge_unbuilt = False   # …and the THIRD state, which "" alone cannot tell apart from the second: git
+                                 # could not build the merge AT ALL (an unfetched base, unrelated histories, a
+                                 # plumbing version that will not answer, the 300 s timeout), so the gates fell back
+                                 # to the head. Said out loud when it happens and named in both lines afterwards —
+                                 # read as "already holds the base" it is a landing claiming the merge was gated
+        self.base_at = ""        # the base commit prepare() projected this job onto — see prepare(). "" = origin/<base>
         self.reviewed = ""       # …and the SHA the review actually read, for the fix round's "has it pushed yet"
         self._review = None      # the review running BESIDE the suite (a thread) and what it decided: see gates()
         self._read = None
@@ -1411,8 +1480,9 @@ class Land:
                 raise Failed(f"cannot resolve the head of PR #{self.pr}: {last(o)}")
         return o.strip()
 
-    def head_checkout(self, step, fetch=True):
-        """The PR's OWN head, in a worktree the caller throws away. The review and the gates each take their own
+    def head_checkout(self, step, fetch=True, at=""):
+        """A commit of this PR's, in a worktree the caller throws away — `at` (the gates hand it the MERGE of the
+        head into the base; see merge_result) or the head itself. The review and the gates each take their own
         rather than sharing one: a step that only runs because an earlier step left a directory behind is a step
         that cannot be skipped, and --no-review would then take the gates down with it. Each step FETCHES for
         itself first — that second answer is how a push during the gates is caught. Returns (tmp, tree).
@@ -1430,7 +1500,7 @@ class Land:
         tree = f"{tmp}/head"
         with git_lock(self.root):    # …and .git/worktrees is shared too. The SHA is explicit here, so this lock
                                      # is only about the bookkeeping git writes, and it is held for a second
-            rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, self.head], cwd=self.root, timeout=300)
+            rc, o = sh(["git", "worktree", "add", "-q", "--detach", tree, at or self.head], cwd=self.root, timeout=300)
         if rc:
             shutil.rmtree(tmp, ignore_errors=True)
             raise Failed(f"cannot check out PR #{self.pr}: {last(o)}")
@@ -1827,9 +1897,17 @@ class Land:
 
     # -- 2. gates ------------------------------------------------------------------------------------------
     def gates(self):
-        """Gate BEFORE merging, never after. Once a PR is in, the gates guard nothing — the change is on the default
-        branch whatever they say — and running them anyway cost a three-PR landing five minutes of suite it could
-        not act on. The no-PR path still gates: there the checkout IS what is about to be deployed.
+        """Gate BEFORE merging, never after, and gate THE MERGE. Once a PR is in, the gates guard nothing — the
+        change is on the default branch whatever they say — and running them anyway cost a three-PR landing five
+        minutes of suite it could not act on. The no-PR path still gates: there the checkout IS what is about to
+        be deployed.
+
+        WHAT IS CHECKED OUT is the base merged with the head (merge_result), so the suite runs on the tree the
+        default branch will hold after this lands rather than on the head in isolation — the head is what the
+        REVIEW reads, and it stays that, because a verdict is about the change and this is about the result. When
+        the head already holds the base the two are the same tree and nothing here differs from before. The gate
+        memo is filed under that tree and not under the head, so a memo written against one base can never be
+        spent against another: after a sibling job merges, the base has moved and the memo simply does not match.
 
         EVERY gate at once, and the paid read started at t=0 beside them, so the landing's gate wall clock is the
         SLOWEST gate rather than the sum of them: ~5 + ~3 + ~14 minutes ran serially, behind which the read had not
@@ -1844,18 +1922,29 @@ class Land:
         every gate is timed on its silence, streamed to a log (run_gate)."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
-        tree, tmp = self.root, None
+        tree, tmp, at, key = self.root, None, "", ""
         if self.pr:
             if self.facts.get("mergeable") == "CONFLICTING":
                 raise Failed(f"PR #{self.pr} conflicts with {self.base()} — rebase it, then land it")
             self.fetch_head()       # asked BEFORE the checkout now: the tier and the memo are both keyed by the SHA
             self.gated = self.head  # …and pinned here, for the review after this and the merge after that
+            with git_lock(self.root):   # merge_result reads refs the fetches above and a sibling landing's pull
+                                        # both move; it writes only loose objects, so the lock is held for a moment
+                at, self.merged_on, mtree = merge_result(self.root, self.base_at or f"origin/{self.base()}", self.head)
+            self.merge_unbuilt = not at   # merge_result gives the head back when the head already holds the base and
+            if self.merge_unbuilt:        # "" only when it could not answer: the same empty merged_on, two meanings
+                out("!", f"the merge of {self.base()} with the head could not be built — an unfetched base, "
+                         f"unrelated histories, or git unable to answer in time — so these gates run on the BRANCH "
+                         f"ALONE and nothing here proves what {self.base()} holds once this lands")
+            key = mtree or self.head    # WHAT WAS GATED is what the memo answers for: the merged tree, so a memo
+                                        # written against one base can never be spent against another. The head
+                                        # alone when there is no merge — then the two are the same tree anyway
         tier, why = self.tier_for()
         if self.pr:
-            done = "" if self.fill_memo else gate_memo(self.repo, self.pr, self.head, tier)
+            done = "" if self.fill_memo else gate_memo(self.repo, self.pr, key, tier)
             if done:
-                return f"{done} — the {tier} tier, {why}; run for this sweep by the prepare phase, on {self.head[:12]}"
-            tmp, tree = self.head_checkout("gates", fetch=False)
+                return f"{done} — the {tier} tier, {why}; run for this sweep by the prepare phase, on {self.gated_on()}"
+            tmp, tree = self.head_checkout("gates", fetch=False, at=at)
         asked = tier          # the memo is filed under the tier the SERIAL phase will ask with, which is what
                               # tier_for() says — not under the one the fallback below may round up to
         try:
@@ -1935,12 +2024,12 @@ class Land:
                                                                   # thread happened to finish first: the landing
                                                                   # must say the same thing about the same tree
                                                                   # twice running
-            on = f"PR #{self.pr}" if self.head else f"the {self.base()} checkout"
+            on = f"PR #{self.pr} on {self.gated_on()}" if self.head else f"the {self.base()} checkout"
             if self.pr and self.fill_memo:
                 try:    # what the serial phase spends instead of running these again — an optimisation, never a fact
-                    write_atomic(memo_path(self.repo, self.pr, self.gated or self.head, asked),   # the SHA the
-                                 # gates RAN on, never whatever self.head says by now: a memo under any other one
-                                 # is a green record for a tree nothing gated, and the serial phase spends it
+                    write_atomic(memo_path(self.repo, self.pr, key, asked),   # the TREE the gates RAN on, never
+                                 # whatever self.head says by now: a memo under any other key is a green record
+                                 # for a tree nothing gated, and the serial phase spends it
                                  {"at": stamp(), "tier": tier, "why": why, "gates": found})
                 except OSError:
                     pass
@@ -1951,13 +2040,34 @@ class Land:
             if tmp:
                 self.drop_checkout(tmp, tree)
 
+    def gated_on(self):
+        """WHICH TREE the gates ran on, in one phrase — for the ✓ line, the ✗ line and the landed card alike. A
+        landing that only says "gated" is the thing this row was opened for: it reads as a promise about what is
+        being merged and was a promise about the head alone."""
+        if not self.head:
+            return f"the {self.base()} checkout"
+        if self.merged_on:
+            return f"{self.base()} at {self.merged_on[:12]} merged with the head {self.head[:12]}"
+        if self.merge_unbuilt:
+            return f"the branch {self.head[:12]} alone — the merge with {self.base()} could not be built"
+        return f"the head {self.head[:12]}, which already holds {self.base()} — the merge is the head"
+
     def behind_base(self):
-        """How far this head is behind what it will land on, said out loud on a RED gate and nowhere else
-        (stale_note). It changes nothing the landing does — the branch is nobody's to rewrite from here, and a
-        rebase this file performed unasked would be a worse problem than the bug hunt it saves. A no-PR deploy has
-        no branch to be behind: the checkout IS the base."""
+        """Why a red gate may be the CALENDAR rather than a bug, said out loud on a RED gate and nowhere else. A
+        no-PR deploy has no branch to be behind: the checkout IS the base.
+
+        WHICH sentence depends on what was gated, and getting that wrong sends the reader the opposite way. When
+        the gates ran on the MERGE, every commit the base has that the head does not was already IN the tree that
+        went red — so "rebase it and run again before hunting for a bug" is false, and the honest note is that the
+        head alone may well be green and the clash is with what landed on the base since it forked. That is the
+        merge NAMED as the reason. Only when the gates ran on the head alone (merge_result could not build the
+        merge, so it fell back) does stale_note's rebase advice still hold."""
         if not self.pr or not self.head:
             return ""
+        if self.merged_on:
+            return (f" — and these gates ran on {self.gated_on()}, not on the head alone: a head that is green by "
+                    f"itself goes red here when its change clashes with what landed on {self.base()} since it "
+                    f"forked. Read the failure as that clash before reading it as this branch's own bug")
         return stale_note(self.root, f"origin/{self.base()}", self.base(), self.head,
                           [p for _, p in self.changed_files()])
 
@@ -2642,10 +2752,24 @@ def result_of(L, rc, job, tail):
     the only fact that decides between ‘approved and done’ and ‘approved and nothing happened’."""
     what = f"[{L.repo}] " + (f"PR #{L.pr}" if L.pr else L.what())
     tries = job.get("attempts", 1)
+    # WHICH TREE the gates ran on, in the one sentence the owner reads. "gated" alone reads as a promise about
+    # what is being merged and was a promise about the head alone; this says which of the THREE it was: the merge,
+    # a head that already holds the base, or a merge git could not build — the last of those is head-only gating
+    # and says so, rather than borrowing the sentence for the second. Plainly and with no SHA — the phrase with the
+    # SHAs in it is on the ✓ line in the thread, for anyone who wants it. Asked for LAZILY: a landing that stopped
+    # before the gates has no answer, and the stop lines below must not need one.
+    def on():
+        if not L.pr:
+            return "gated"
+        if L.merged_on:
+            return f"gated on {L.base()} merged with the branch"
+        if L.merge_unbuilt:
+            return "gated on the branch alone — the merge could not be built"
+        return f"gated on the branch, which already holds {L.base()}"
     if rc == 0:
-        short = f"{what}: landed ✅ — gated, merged, deployed, and its check ran here and passed."
+        short = f"{what}: landed ✅ — {on()}, merged, deployed, and its check ran here and passed."
     elif rc == COSMETIC:
-        short = f"{what}: landed ✅ — gated, merged and deployed; a bookkeeping step wants a hand."
+        short = f"{what}: landed ✅ — {on()}, merged and deployed; a bookkeeping step wants a hand."
     elif rc == UNVERIFIED:
         short = f"{what}: merged and deployed ✅ — but nothing here could confirm you can see it, so the ask stays open."
     elif L.stopped in ("review", "gates", "load"):
@@ -3269,6 +3393,10 @@ def prepare(paths):
     in its turn. The suite itself no longer holds a box-wide lock (its fixtures are isolated per run and it caps
     itself), so nothing here waits on another job's suite except by this rule.
 
+    EACH JOB IS GATED ON THE TREE IT WILL LAND ON, not on its own head: the base with every earlier job of its
+    repo merged in, and then its own head merged into that. So the last job's gate is the integration run for the
+    whole batch, and a red one is the PR that was added last — named, rather than the batch failing blindly.
+
     WHAT STAYS SERIAL is everything after the gates, exactly as it was, one at a time and in queue order. What
     changed on 2026-09-08 is only WHEN the first of them starts: this returns a Prepared as soon as the pool is
     running rather than when it is done, and the serial phase takes each job as its own preparation finishes
@@ -3291,6 +3419,30 @@ def prepare(paths):
                     files[path] = {p for _, p in L.changed_files()}
             except Exception as e:      # unreadable: it touches everything, and says so
                 out("✗", f"{e.__class__.__name__}: {e}")
+
+    # THE TREE EACH JOB WILL ACTUALLY LAND ON. The merges below are serial and in queue order, so by the time job
+    # i merges, the base holds jobs 1..i-1 as well. Gating every job against origin/<base> alone would be right
+    # for the FIRST of them and a guess for the rest, and the memo each filed would then miss in the serial phase
+    # and buy the whole suite again, one job at a time — the wall clock this pool exists to remove. So each job is
+    # gated on the base with every EARLIER job of its own repo merged in: job i's gate IS the integration run for
+    # the batch up to i, they still run side by side, and a red one names the PR that was added last rather than
+    # failing the batch blindly. Per repo, because a batch spans repos and each has its own base.
+    # If an earlier job then does NOT merge — a red gate, a stop verdict — the base it left out is not the base
+    # the later job meets, its memo does not match, and the serial phase gates it again for real. Wrong here
+    # costs a re-run; it never merges a tree nothing ran on.
+    proj = {}
+    for path in jobs:
+        L = lands[path]
+        if not L.facts or not L.head:
+            continue
+        L.base_at = proj.get(L.repo) or f"origin/{L.base()}"
+        try:
+            with git_lock(L.root):
+                nxt = merge_result(L.root, L.base_at, L.head)[0]
+        except (Failed, OSError):
+            nxt = ""            # conflicts with the projection, or git would not say: leave the projection where
+        if nxt:                 # it is, so the jobs behind this one are gated on the base they will really meet
+            proj[L.repo] = nxt
 
     def one(path):
         L = lands[path]
@@ -3863,6 +4015,85 @@ def cmd_selfcheck():
           stale_note(srepo, "origin/no-such-base", "no-such-base", old_head, []) == "")
     shutil.rmtree(srepo, ignore_errors=True)
 
+    # THE PAIR THIS ROW EXISTS FOR, in real git and with a real suite: two changes on the same repo, each green on
+    # its own head, red on the result of merging them. `main` renamed a function and fixed its one caller; the PR
+    # added a second call to the old name, on a line far enough away that git merges the file without a murmur —
+    # so `mergeable` is MERGEABLE, no textual conflict is raised anywhere, and until 2026-09-08 both runs the box
+    # made were green and what it installed was broken. Nothing here is faked: git does the merge, python runs the
+    # suite, and the only thing under test is which TREE the suite is run on.
+    mrepo = tempfile.mkdtemp(prefix="cc-land-selfcheck-merge-")
+
+    def mgit(*a):
+        rc, o = sh(["git"] + list(a), cwd=mrepo, env=genv, timeout=60)
+        return o.strip() if rc == 0 else ""
+
+    def mwrite(**files):
+        for path, text in files.items():
+            open(f"{mrepo}/{path.replace('_', '.')}", "w").write(text)
+        mgit("add", "-A")
+        mgit("commit", "-q", "--no-gpg-sign", "-m", "x")
+        return mgit("rev-parse", "HEAD")
+
+    def suite_on(commitish):
+        """The suite, run on a tree without disturbing the checkout — which is exactly what gates() does. Returns
+        the exit code: 0 is green."""
+        w = f"{mrepo}/.gate-{abs(hash(commitish)) % 10**6}"
+        mgit("worktree", "add", "-q", "--detach", w, commitish)
+        return sh([sys.executable, "run.py"], cwd=w, env=genv, timeout=60)[0]
+
+    mgit("init", "-q")
+    mgit("symbolic-ref", "HEAD", "refs/heads/main")
+    #                          the caller A moves ↓                        the call B adds goes ↓ at the far end
+    base = mwrite(lib_py="def greet(name):\n    return 'hi ' + name\n",
+                  run_py="import lib\n\nprint(lib.greet('a'))\n#\n#\n#\n#\n# more calls below\n")
+    mgit("checkout", "-q", "-b", "pr")
+    pr_head = mwrite(run_py="import lib\n\nprint(lib.greet('a'))\n#\n#\n#\n#\n# more calls below\n"
+                            "print(lib.greet('b'))\n")
+    mgit("checkout", "-q", "main")
+    main_at = mwrite(lib_py="def hello(name):\n    return 'hi ' + name\n",
+                     run_py="import lib\n\nprint(lib.hello('a'))\n#\n#\n#\n#\n# more calls below\n")
+    mgit("update-ref", "refs/remotes/origin/main", main_at)
+    merge, merged_on, mtree_at = merge_result(mrepo, "origin/main", pr_head)
+    check("EACH HEAD IS GREEN ON ITS OWN and the merge of the two is RED: the suite passes on the PR's head, "
+          "passes on main, and fails on the tree main will hold once the PR is in — the whole of what this row "
+          "is about, in real git with a real suite and no conflict anywhere for anyone to notice",
+          suite_on(pr_head) == 0 and suite_on(main_at) == 0 and merge and suite_on(merge) != 0)
+    check("...so what the gates check out is that merge: a commit of both, whose tree is neither head's, and the "
+          "base it was merged with comes back by name so the failure can say which merge went red",
+          merged_on == main_at and mtree_at == mgit("rev-parse", f"{merge}^{{tree}}")
+          and mtree_at not in (mgit("rev-parse", f"{pr_head}^{{tree}}"), mgit("rev-parse", f"{main_at}^{{tree}}")))
+    check("...and git itself calls that merge CLEAN — no conflict, nothing for `mergeable` to have caught: a "
+          "landing that only asks GitHub whether the branch merges learns nothing about whether it works",
+          sh(["git", "merge-tree", "--write-tree", main_at, pr_head], cwd=mrepo, env=genv, timeout=60)[0] == 0)
+    check("...and it is built with plumbing alone: no ref moved, no branch checked out, nothing staged — the "
+          "landing runs this on the box's own clone, under the same lock a deploy's pull takes",
+          mgit("rev-parse", "main") == main_at and mgit("rev-parse", "pr") == pr_head
+          and mgit("rev-parse", "--abbrev-ref", "HEAD") == "main"
+          and not [l for l in mgit("status", "--porcelain").splitlines() if ".gate-" not in l])
+    again = merge_result(mrepo, "origin/main", pr_head)
+    check("...and the same pair merged twice gives the same TREE though not the same commit — which is why a gate "
+          "memo is keyed by the tree: commit-tree stamps the clock in, so two runs a second apart would file "
+          "their green under two names and neither would ever be found",
+          again[2] == mtree_at and again[0] and re.fullmatch(r"[0-9a-f]{40,64}", again[0]))
+    check("CONTROL: a head that already holds the base has no merge to build — merge_result gives the head back "
+          "and names no base, so a PR written on top of today's main is gated exactly as it was before this row",
+          merge_result(mrepo, base, pr_head) == (pr_head, "", ""))
+    check("...and a base git cannot answer for is not a merge either: the caller gates the head and the landing "
+          "still happens, where a raise here would stop every landing on a repo whose base was never fetched",
+          merge_result(mrepo, "origin/no-such-base", pr_head) == ("", "", "")
+          and merge_result(mrepo, "", pr_head) == ("", "", ""))
+    mgit("checkout", "-q", "-b", "clashes", base)
+    clash = mwrite(lib_py="def greet(name):\n    return 'HI ' + name\n")
+    try:
+        merge_result(mrepo, "origin/main", clash)
+        conflict = "no raise"
+    except Failed as e:
+        conflict = str(e)
+    check("...and a TEXTUAL conflict raises rather than gating something git had to guess at: GitHub was asked "
+          "the same question and its answer can be hours old, so this is the fresh one",
+          "conflicts with origin/main" in conflict and clash[:12] in conflict)
+    shutil.rmtree(mrepo, ignore_errors=True)
+
     def REVIEWED(verdict, where="", what="", fix="", cost=0.42):
         """What `claude -p --output-format json --json-schema …` hands back — the fake model, standing in for the
         whole call. `structured_output` is the schema-validated object; `result` is its text twin, and the two are
@@ -3887,6 +4118,28 @@ def cmd_selfcheck():
                      linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
                      board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland",
                      live_processes=lambda: list(PROCS[0]), own_ancestry=lambda: set(MINE[0]))
+    # THE MERGE THE GATES RUN ON, as git plumbing really answers it (merge_result). The default fixture is the
+    # ordinary case — a branch forked before the base's last landing, so there IS a merge to build — because that
+    # is what nearly every landing on this box is; the "head already holds the base" case is asked for explicitly
+    # below. `mtree` and `mcommit` are derived from their inputs rather than fixed, so two different (base, head)
+    # pairs give two different trees, which is the whole point of keying a gate memo on the tree.
+    BASE_SHA = "ba5e" + "0" * 36
+    AT = [BASE_SHA]      # where the default branch IS — a box, because a merge MOVES it, and a case that merges
+                         # two PRs in one sweep only proves anything if the second meets the base the first left
+    # The digits that differ go FIRST: memo_path keys a memo by the first 12 of the tree, so a fixture whose
+    # trees differ only in their tail would file two different merges under one name and prove nothing.
+    hex40 = lambda n: "%016x" % (n & ((1 << 64) - 1)) + "0" * 24
+    mtree = lambda a: (0, hex40(int(a[3][:8], 16) * 31 + int(a[4][:8], 16)) + "\n")     # merge-tree <base> <head>
+    mcommit = lambda a: (0, hex40(int(a[2][:8], 16) * 7 + 1) + "\n")                    # commit-tree <tree> …
+    def resolved(argv):
+        """`git rev-parse --verify --quiet <ref>` — origin/<base> is wherever AT says the branch is now, anything
+        else is itself. `^{tree}` answers a tree DERIVED from that commit rather than the commit: two commits must
+        not share a tree here, or a case comparing a projected base with the real one would pass on any two."""
+        ref = argv[-1]
+        c = AT[0] if ref.startswith("origin/") else ref.split("^")[0]
+        return (0, (hex40(int(c[:8], 16) * 3 + 2) if "^{tree}" in ref else c) + "\n")
+    NO_MERGE = {"git merge-base --is-ancestor": (0, "")}     # …for a case that wants the head gated as the head
+
     FACTS = {"title": "a change", "state": "OPEN", "mergeable": "MERGEABLE",
              "headRefName": "track/w1", "mergeCommit": None}
 
@@ -3904,6 +4157,11 @@ def cmd_selfcheck():
         BOARD[0] = {"default_branch": "main", "path": "/tmp/_ccland",
                     "tracks": {"w1": {"pr": "https://github.com/o/r/pull/7", "branch": "track/w1", "status": "review"}}}
         world["gh pr view"] = (0, json.dumps(FACTS))
+        AT[0] = BASE_SHA
+        world["git rev-parse --verify --quiet"] = resolved      # what the base ref is at, for merge_result
+        world["git merge-base --is-ancestor"] = (1, "")         # the base has moved on: there is a merge to gate
+        world["git merge-tree --write-tree"] = mtree            # …and this is the tree it produces
+        world["git commit-tree"] = mcommit                      # …wrapped in a commit for `worktree add` to take
         world[f"{BIN}/cc-limit status"] = (1, "clear\n")     # no usage limit standing over the box
         world[f"{CLAUDE} -p"] = (0, REVIEWED("LAND"))                    # the reviewer's default answer
         world["gh pr view 7 --json comments"] = (0, json.dumps({"comments": []}))   # …and no review on the PR yet
@@ -4047,6 +4305,11 @@ def cmd_selfcheck():
 
     # 1. the review gate: the step that reads the diff, and the two verdicts that stop a landing dead
     HEAD = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
+    # The tree the gates run on, as the fixture's own plumbing answers it: the base merged with the head. This is
+    # what a gate memo is keyed by, so a case that asserts about a memo asks for it here rather than for the head.
+    GATED = lambda head=HEAD, base=None: mtree(["git", "merge-tree", "--write-tree", base or AT[0], head])[1].strip()
+    MERGE = lambda head=HEAD, base=None: mcommit(["git", "commit-tree", GATED(head, base)])[1].strip()
+
     def reviewed(verdict, *finding, **kw):
         L = fresh(pr=7, **kw)
         world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
@@ -4729,21 +4992,44 @@ def cmd_selfcheck():
           "case and nothing else — a red branch written against today's main reads as red",
           "behind main" not in L.why and "rebase" not in L.why)
 
-    # …and the same red gate on a head written against an OLDER main names that, in the line the queue card and
-    # the ledger carry — the failing case FIRST, the calendar after it. Four landings behind, one unnamed case,
-    # several turns of bug hunt, and a rebase that changed nothing else went green (PR #305, PR #303, 2026-09-07).
+    # …and the same red gate, on the ordinary head: one written before main's last landing, so the gates ran on
+    # main MERGED with it. That is the stop this row exists for, and the failure has to NAME the merge — a head
+    # green by itself is red here because of what it meets on main, and "rebase and try again" would be the
+    # opposite of the truth, since every commit a rebase would bring in was already in the tree that went red.
     L, rc = red_gate(**{"git rev-list --count": (0, "4\n"), "git merge-base": (0, "b" * 40 + "\n"),
                         "git diff --name-only": (0, "core/bin/cc-land\ncore/tests/check.sh\n")})
-    check("a red gate on a branch four landings behind its base says so IN THE FAILURE, naming the files it does "
-          "not have, so the first move is a rebase and not a hunt for a bug that main has already fixed",
-          rc == 1 and L.stopped == "gates" and "4 commits behind main" in L.why
-          and "core/bin/cc-land" in L.why and "rebase it onto main" in L.why)
-    check("...and the gate's own failing case still comes FIRST: the branch being old is an explanation offered "
+    check("a red gate names THE MERGE as what it ran on: main at its own SHA merged with the head, and the reading "
+          "that goes with it — a head green on its own goes red here when its change clashes with what has landed "
+          "since it forked. Nothing merges, and no PR is touched to find out",
+          rc == 1 and L.stopped == "gates" and L.merged_on == BASE_SHA
+          and f"main at {BASE_SHA[:12]} merged with the head" in L.why
+          and "clashes with what landed on main" in L.why and not ran("gh pr merge"))
+    check("...and it does NOT tell the reader to rebase: the gates already ran with everything a rebase would "
+          "bring in, so 'this branch is 4 commits behind, rebase it' is a sentence the merge gate made false",
+          "commits behind main" not in L.why and "rebase" not in L.why)
+    check("...and the gate's own failing case still comes FIRST: which tree it ran on is an explanation offered "
           "under the failure, never a replacement for it — the landing stops either way, and nothing merged",
-          "the row was wrong" in L.why and "behind main" in L.why
-          and L.why.index("the row was wrong") < L.why.index("behind main") and not ran("gh pr merge"))
-    check("...and the landing rebases NOTHING to say it: no checkout, no rebase, no push — the branch belongs to "
-          "whoever wrote it",
+          "the row was wrong" in L.why and "merged with the head" in L.why
+          and L.why.index("the row was wrong") < L.why.index("merged with the head"))
+    check("...and the landing rebases NOTHING to gate the merge: no rebase, no push, no ref moved — the branch "
+          "belongs to whoever wrote it, and the merge is built with plumbing into loose objects",
+          not ran_sub("git", "rebase") and not ran_sub("git", "push") and not ran_sub("git", "update-ref")
+          and ran("git merge-tree", "--write-tree") and ran("git commit-tree"))
+
+    # THE FALLBACK, and the only path on which stale_note still speaks: git cannot build the merge (an unfetched
+    # base, a plumbing version that will not answer), so the gates run on the HEAD ALONE. Then the head really is
+    # an old copy of code the base has since moved, and "rebase it" is the right first move again — the same
+    # sentence, on the one case that still earns it. PR #305 failed one unnamed case, was rebased with nothing
+    # else changed, and went green (2026-09-07).
+    L, rc = red_gate(**{"git rev-list --count": (0, "4\n"), "git merge-base": (0, "b" * 40 + "\n"),
+                        "git merge-tree --write-tree": (128, "fatal: not something we can merge\n"),
+                        "git diff --name-only": (0, "core/bin/cc-land\ncore/tests/check.sh\n")})
+    check("a merge git will not build falls back to gating the head, and THEN a branch four landings behind says "
+          "so in the failure, naming the files it does not have: the landing gates something rather than nothing",
+          rc == 1 and L.stopped == "gates" and not L.merged_on and "4 commits behind main" in L.why
+          and "core/bin/cc-land" in L.why and "rebase it onto main" in L.why
+          and ran("git worktree add", HEAD))
+    check("...and that fallback rebases NOTHING to say it either: the branch belongs to whoever wrote it",
           not ran_sub("git", "rebase") and not ran_sub("git", "push"))
 
     # …and a gate's verdict is its own tally, not just its exit code (a suite can exit 0 and say "1 failed")
@@ -4944,10 +5230,15 @@ def cmd_selfcheck():
               "tier_for() says — not under the `full` this fallback rounded the RUN up to. Keyed by the rounded "
               "one it is a memo nobody ever asks for, and the repo whose only gate is a ten-minute suite runs it "
               "twice on every landing: the exact cost this whole phase exists to cut",
-              os.path.exists(memo_path("myrepo", 7, HEAD, "docs"))
-              and not os.path.exists(memo_path("myrepo", 7, HEAD, "full"))
-              and (read_json(memo_path("myrepo", 7, HEAD, "docs")) or {}).get("gates") == ["core/tests/selftest.sh"])
-        os.unlink(memo_path("myrepo", 7, HEAD, "docs"))
+              os.path.exists(memo_path("myrepo", 7, GATED(), "docs"))
+              and not os.path.exists(memo_path("myrepo", 7, GATED(), "full"))
+              and (read_json(memo_path("myrepo", 7, GATED(), "docs")) or {}).get("gates") == ["core/tests/selftest.sh"])
+        check("...and it is filed under the TREE THE GATES RAN ON — the merge — and never under the head. Keyed by "
+              "the head it would answer for a base that has since moved, which is exactly the green record for a "
+              "tree nothing gated that this row exists to stop: after a sibling job merges, the merge this PR "
+              "makes is a different tree and the memo is simply not found",
+              GATED() != HEAD and not os.path.exists(memo_path("myrepo", 7, HEAD, "docs")))
+        os.unlink(memo_path("myrepo", 7, GATED(), "docs"))
 
         # …and a gate this exact CONTENT has already passed is not bought a second time. The worker runs the
         # suites before it opens its PR and this ran them again on the same code — ten minutes a landing, and
@@ -4983,6 +5274,9 @@ def cmd_selfcheck():
         with evlock:
             events.append(e)
 
+    SAID = [""]     # …and what the landing PRINTED while it ran: a line the caller only reads back if it asks for
+                    # it, so the cases that do not care stay three-tuples
+
     def both(suite, reviewer, changed="M\tinstall.sh\n", land=None, fill_memo=False, **w):
         L = fresh(pr=7, **(land or {}))
         L.fill_memo = fill_memo         # …the prepare phase's landing: it files a memo the serial one spends
@@ -4992,9 +5286,11 @@ def cmd_selfcheck():
                       f"{tempfile.gettempdir()}/cc-land.": suite, f"{CLAUDE} -p": reviewer})
         world.update(w)
         events.clear()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        said = io.StringIO()
+        with contextlib.redirect_stdout(said), contextlib.redirect_stderr(io.StringIO()):
             g = caught(L.gates)
             r = caught(L.review) if not isinstance(g, Failed) else None
+        SAID[0] = said.getvalue()
         return L, g, r
 
     def gate_answer(argv):          # what a gate says, by name: the suite's answer is whatever the case set
@@ -5058,6 +5354,52 @@ def cmd_selfcheck():
         check("...so the read did not WAIT for the cheap gate: it was asked before check.sh had ANSWERED, where "
               "serial it could not be asked until after it — ~8 minutes off every green landing",
               0 <= idx("review", "asked") < idx("answered", "check.sh"))
+
+        # WHICH TREE THE GATES RAN ON, said in both places a person reads: the ✓ line in the thread, with the SHAs
+        # for anyone who wants them, and the landed card, plainly and with none. "gated" alone was a promise about
+        # what is being merged and was a promise about the head — the three green landings below are the ordinary
+        # case, the one where the head already holds the base, and the one where git could not build the merge at
+        # all, and each says which of the three it was.
+        L, g, r = both(gate_answer, lambda a: (0, REVIEWED("LAND")))
+        card = result_of(L, 0, {"attempts": 1}, "")
+        check("a green gate's ✓ line names the tree it ran on — main at its own SHA merged with the head — and the "
+              "worktree it ran in was checked out at THAT merge, while the REVIEW beside it still takes the head: "
+              "a verdict is about the change (#354) and the gates are about the result",
+              isinstance(g, str) and L.merged_on == BASE_SHA
+              and f"main at {BASE_SHA[:12]} merged with the head {HEAD[:12]}" in g
+              and ran("git worktree add", MERGE()) and ran("git worktree add", HEAD)
+              and isinstance(r, str) and L.reviewed == HEAD)
+        check("...and the landed card says it too, in the owner's own words and with no SHA in them: he reads this "
+              "on a phone, and the sentence he needs is which tree the suite passed on, not which commit it was",
+              "gated on main merged with the branch, merged, deployed" in card["short"]
+              and BASE_SHA[:12] not in card["short"] and HEAD[:12] not in card["short"])
+        L, g, r = both(gate_answer, lambda a: (0, REVIEWED("LAND")), **NO_MERGE)
+        card = result_of(L, 0, {"attempts": 1}, "")
+        check("CONTROL: a head that already holds main is gated as the head — there is no merge to build — and "
+              "BOTH lines say that rather than claiming a merge nobody made",
+              isinstance(g, str) and not L.merged_on and "already holds main — the merge is the head" in g
+              and "gated on the branch, which already holds main" in card["short"]
+              and ran("git worktree add", HEAD) and not ran("git merge-tree", "--write-tree"))
+
+        # …and the THIRD state, on a GREEN landing: git could not build the merge, so the gates ran on the branch
+        # alone. merged_on is "" here exactly as it is above, and until 2026-09-08 both lines read that as "the head
+        # already holds main" — a landing that gated the head telling the owner the merge was gated, with no line
+        # anywhere saying the gate had narrowed. The red half of this is covered where stale_note speaks; this is
+        # the half nobody sees, because it lands.
+        L, g, r = both(gate_answer, lambda a: (0, REVIEWED("LAND")),
+                       **{"git merge-tree --write-tree": (128, "fatal: not something we can merge\n")})
+        card = result_of(L, 0, {"attempts": 1}, "")
+        check("a merge git CANNOT build is not a head that already holds main: the ✓ line and the card both name "
+              "the branch alone and say the merge could not be built, and neither claims the head holds main",
+              isinstance(g, str) and not L.merged_on and L.merge_unbuilt
+              and f"the branch {HEAD[:12]} alone — the merge with main could not be built" in g
+              and "gated on the branch alone — the merge could not be built" in card["short"]
+              and "already holds" not in g and "already holds" not in card["short"]
+              and ran("git worktree add", HEAD))
+        check("...and the landing SAYS SO while it runs, rather than narrowing to head-only gating in silence: the "
+              "one thing a reader of the thread has to know is that these gates stopped proving what main will hold",
+              "the merge of main with the head could not be built" in SAID[0]
+              and "gates run on the BRANCH ALONE" in SAID[0])
         L, g, r = both(lambda a: (1, "shellcheck: SC2086\n") if a[0].endswith("check.sh") else (0, "0 failed\n"),
                        lambda a: (ev("review", "asked"), (0, REVIEWED("LAND")))[1])   # nothing to meet: this case
                                                           # is about what a RED gate does to the read beside it
@@ -5121,13 +5463,13 @@ def cmd_selfcheck():
                        **{"git rev-parse FETCH_HEAD": then_moved})
         memos = sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json"))
         check("a push the moment the gates start leaves NO memo for the new head: what the prepare phase files is "
-              "keyed to the SHA the gates RAN on, and the read beside them keeps the SHA it resolved in a local — "
+              "keyed to the tree the gates RAN on, and the read beside them keeps the SHA it resolved in a local — "
               "written to self.head it made the memo a green record for a tree nothing gated (review-235)",
               isinstance(g, str) and L.gated == HEAD and L.head == HEAD
-              and memos == [f"myrepo-7-{HEAD[:12]}-full.json"])
+              and memos == [f"myrepo-7-{GATED()[:12]}-full.json"])
         check("...so the serial phase has nothing to spend for that new head and GATES it, where a memo filed under "
               "it would have skipped every gate and merged with --match-head-commit",
-              not gate_memo("myrepo", 7, MOVED, "full") and isinstance(r, Failed) and "moved" in str(r)
+              not gate_memo("myrepo", 7, GATED(MOVED), "full") and isinstance(r, Failed) and "moved" in str(r)
               and MOVED[:12] in str(r))
         for p in glob.glob(f"{gate_dir()}/*.json"):
             os.unlink(p)
@@ -6650,10 +6992,20 @@ def cmd_selfcheck():
                 pass
             return (0, "")
 
+        def merge_moves_base(argv):
+            """A MERGE MOVES THE DEFAULT BRANCH, which is the whole reason prepare() projects each job onto the
+            base with the jobs queued before it already merged in. Left still, this fixture would gate job 8
+            against a main that never changed and prove nothing about a batch — and a real second job would meet a
+            base its gates had never seen. Squashing head onto AT[0] leaves a branch holding exactly the tree the
+            projection built, which is what the fake merge-tree above says too."""
+            AT[0] = MERGE(HEAD, AT[0])
+            return (0, "")
+
         fresh(pr=7)
         world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
                       "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
                       f"{CLAUDE} -p": rendezvous, "gh pr comment": remember, "git fetch -q origin pull": fetch_pull,
+                      "gh pr merge": merge_moves_base,
                       "gh pr view 7 --json comments": comments("7"), "gh pr view 8 --json comments": comments("8")})
         quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
         quiet(cmd_queue, ["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2", "--no-start"])
@@ -6706,13 +7058,16 @@ def cmd_selfcheck():
               "back off the PR, so overlapping the reviews costs no extra model call",
               len([c for c in calls if c[0] == CLAUDE]) == 2 and len(posted.get("7", [])) == 1
               and len(posted.get("8", [])) == 1)
-        check("...the prepare phase leaves ONE memo per PR, keyed by that PR's head SHA and by the tier the serial "
-              "half will ask with — the whole of what the parallel work hands over. Watched as each job is handed "
-              "over: 7's memo is there when 7 is, and by the time 8 is handed over 7's has been spent and gone",
-              len(after_prepare) == 2 and f"myrepo-7-{HEAD[:12]}-full.json" in after_prepare[0]
-              and after_prepare[1] == [f"myrepo-8-{HEAD[:12]}-full.json"])
-        check("...the serial half SPENDS them rather than re-running: it says so on both PRs, and the gate itself "
-              "was executed exactly twice across the whole sweep — once each, where an unread memo is four",
+        check("...the prepare phase leaves ONE memo per PR, keyed by THE TREE THAT PR WILL LAND ON and by the tier "
+              "the serial half will ask with — the whole of what the parallel work hands over. 7's is main merged "
+              "with 7; 8's is that merged with 8, because by the time 8 merges main holds 7. Watched as each job "
+              "is handed over: 7's memo is there when 7 is, and by then 8 is gating on a base that includes it",
+              len(after_prepare) == 2 and f"myrepo-7-{GATED(HEAD, BASE_SHA)[:12]}-full.json" in after_prepare[0]
+              and after_prepare[1] == [f"myrepo-8-{GATED(HEAD, MERGE(HEAD, BASE_SHA))[:12]}-full.json"])
+        check("...so a batch costs ONE run per PR and not one per PR per base it might meet: the projection is what "
+              "the serial half then finds, so it SPENDS both memos rather than re-running — it says so on both PRs, "
+              "and the gate itself was executed exactly twice across the whole sweep. Gated against main alone, 8's "
+              "memo would be filed under a tree the serial half never asks for and its gates would run again",
               swept.count("run for this sweep by the prepare phase") == 2 and len(gate_runs) == 2)
         check("...and the memo is gone when the sweep is: spent on read, so the green it recorded can never answer "
               "for the NEXT sweep — the one a kept job is re-gated by (`gates` is in RETRY because the suite flakes)",
@@ -6784,6 +7139,52 @@ def cmd_selfcheck():
         for k in ("gh pr merge", "git pull --ff-only"):
             world.pop(k, None)             # …and the paced fakes do not leak into the cases below
 
+        # (5c) AND THE PROJECTION IS ONLY EVER AN OPTIMISATION. prepare() gates job 8 on the base with job 7
+        # merged in, which is the base 8 will meet — IF 7 merges. When 7 does not (a red gate, a stop verdict),
+        # the base 8 meets is the one 7 left alone, and the memo 8 filed answers for a tree nothing will hold.
+        # Spending it would merge a tree no gate ever ran on, which is the whole of what this row was opened to
+        # stop. It cannot be spent because the memo is keyed by THE MERGED TREE and the serial half asks under the
+        # real base — run_job builds its own Land, and a Land is projected onto nothing unless prepare says so.
+        # Said in prepare()'s docstring and until now proven by nothing: the batch case above is the happy path,
+        # where every job merges and every memo matches.
+        fresh(pr=7)
+        posted.clear()
+
+        def stops_7(argv):
+            # DO-NOT-LAND on 7, LAND on 8 — told apart by the diff the prompt points the reviewer at, and never
+            # .group() on a miss: a fake handed something it does not know says so rather than raising in a thread
+            m = re.search(r"/pr-(\d+)\.diff", " ".join(argv))
+            return (0, REVIEWED("DO-NOT-LAND" if m and m.group(1) == "7" else "LAND",
+                                "core/bin/cc-land", "this change should not exist", "drop it"))
+        world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
+                      "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
+                      f"{CLAUDE} -p": stops_7, "gh pr comment": remember, "gh pr merge": merge_moves_base,
+                      "gh pr view 7 --json comments": comments("7"), "gh pr view 8 --json comments": comments("8")})
+        for pr in ("7", "8"):
+            quiet(cmd_queue, ["myrepo", pr, "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
+        calls.clear()
+        buf = io.StringIO()
+        real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                cmd_work([])
+        finally:
+            os.access = real_access
+        swept, gate_runs = buf.getvalue(), [c for c in calls if os.path.basename(c[0]) == "check.sh"]
+        check("an earlier job that does NOT merge leaves the base where it was, and the job behind it is gated "
+              "again FOR REAL: 7 is stopped by its verdict, so 8 meets main without 7 in it, the memo 8 filed "
+              "against main-with-7 does not match what the serial half asks for, and 8's gate runs a third time",
+              [c[3] for c in gh_merges()] == ["8"] and len(gate_runs) == 3
+              and swept.count("run for this sweep by the prepare phase") == 1)
+        check("...and that memo is left UNSPENT rather than quietly matched: it is still on disk, keyed by the "
+              "tree 8 would have landed on had 7 merged — a tree main never held, and spending it would have "
+              "merged 8 on the word of a gate that ran against a base that does not exist",
+              [os.path.basename(m) for m in glob.glob(f"{gate_dir()}/*.json")]
+              == [f"myrepo-8-{GATED(HEAD, MERGE(HEAD, BASE_SHA))[:12]}-full.json"])
+        world.pop("gh pr merge", None)
+        posted.clear()      # …and the DO-NOT-LAND this case posted on PR 7 goes with it: left there, the sections
+                            # below read it back off the PR and stop a landing they never asked to stop
+
         # (6) ORDERED BY WHAT THEY TOUCH (owner, 2026-09-04): jobs whose files overlap go one after another in
         # queue order, jobs on disjoint files side by side, and a job overlapping one of two running ones waits for
         # that one alone. changed_files() is asked in queue order, once per job up front and once more per job in
@@ -6799,6 +7200,9 @@ def cmd_selfcheck():
             world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
                           "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
                           "gh pr comment": remember, "git merge-base": (0, A + "\n"),
+                          "gh pr merge": merge_moves_base,   # a merge MOVES the base, so the serial half meets the
+                                         # tree prepare() projected for the job behind it and spends that job's
+                                         # memo instead of gating it again — without this the pool is bought twice
                           "git diff --numstat": (0, "3\t2\tx\n"), "git diff --name-status": by_turn,
                           f"{tempfile.gettempdir()}/cc-land.": gate_says})
             for pr in prs:
