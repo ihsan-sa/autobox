@@ -22,11 +22,14 @@
 #     and ~/.cc/state/<handle> rw (every track of the workspace, no other repo's) · the workspace's board, in a DIRECTORY of its
 #     own (~/.cc/members/<handle>/board/, seen AS ~/.cc/boards; ~/.cc/boards/<handle>.json is a link into it — board_dir says why)
 #     · ~/.cc/slack/member/<handle>/ seen AS ~/.cc/slack: the daemon's member-scoped socket, an `enabled` flag and the attachment cache —
-#     the bot token, the owner-level socket and every other channel stay outside · a private ~/.claude/projects, ~/.npm and ~/.cache under
-#     ~/.cc/members/<handle>/ · the control plane's core/bin bound ro AS ~/bin, so ~/dev/<control repo> does not exist inside · ONE credential
+#     the bot token, the owner-level socket and every other channel stay outside · a private ~/.claude, ~/.npm and ~/.cache under
+#     ~/.cc/members/<handle>/ — ~/.claude is the WHOLE config dir (~/.cc/members/<handle>/claude), one dir for every session of the
+#     handle, because claude's cross-process refresh lock is made INSIDE it (~/.claude/.oauth_refresh.lock) and a lock made in a
+#     per-session tmpfs serialises nothing (launch_member says what that cost) · the control plane's core/bin bound ro AS ~/bin, so
+#     ~/dev/<control repo> does not exist inside · ONE credential
 #     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner with
 #     `cc-sandbox mint`, kept whole, BOUND rw at that path so the refresh a session makes inside is what the next launch
-#     starts from; its host path is not inside) and
+#     starts from and what every other live session of the handle reads next; its host path is not inside) and
 #     whichever account the owner minted for it, his own included: a member can print whatever is in there, so that is his call to
 #     make per workspace. With no credential of its own the workspace does not start · a
 #     ~/.claude.json copy holding only this workspace's projects, only the cc-slack MCP server, and two first-run flags MINTED for the
@@ -633,7 +636,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   done
   B+=(--bind "$H/.cc/state/$h" "$H/.cc/state/$h"
      --bind "$m/board" "$H/.cc/boards"
-     --bind "$sl" "$H/.cc/slack" --bind "$m/claude/projects" "$H/.claude/projects" --bind "$m/npm" "$H/.npm" --bind "$m/cache" "$H/.cache"
+     --bind "$sl" "$H/.cc/slack" --bind "$m/claude" "$H/.claude" --bind "$m/npm" "$H/.npm" --bind "$m/cache" "$H/.cache"
      --ro-bind "$cb" "$H/bin" --ro-bind "$H/.local/bin/claude" "$H/.local/bin/claude"
      --setenv HOME "$H" --setenv PATH "$H/bin:$H/.local/bin:/usr/local/bin:/usr/bin:/bin" --setenv CC_MEMBER_SANDBOX 1 --setenv CC_ROLE member
      --setenv GIT_AUTHOR_NAME "$h" --setenv GIT_AUTHOR_EMAIL "$h@member.$(hostname -s)" --setenv GIT_COMMITTER_NAME "$h" --setenv GIT_COMMITTER_EMAIL "$h@member.$(hostname -s)"
@@ -679,6 +682,18 @@ launch_member(){   # $1 handle · $2 track · the rest is the command — the WO
   # expiry) until the owner re-minted it. Measured on 2.1.261: claude writes the credential IN PLACE (O_TRUNC|O_NOFOLLOW,
   # no rename), so a file bind takes the write — and it refuses a symlink there, so a link would not have done. The mode is
   # the file's own (mint installs 600).
+  # ONE FILE, MANY SESSIONS, ONE LOCK. The workspace session and every track session under it share this bind, and each
+  # claude in there refreshes the token itself. What claude 2.1.268 does (read out of the binary, not guessed): before a
+  # refresh it stats the file and re-reads it when the mtime moved; it takes a lock — mkdir <config dir>/.oauth_refresh.lock,
+  # stale after 60 s — re-reads UNDER the lock and adopts a sibling's rotation instead of posting its own; saves by
+  # compare-and-swap on the refresh token it posted; and on invalid_grant blanks the file only if the file still holds the
+  # token that was refused. All of that is per file and per lock DIRECTORY. The file was already shared; the lock was not:
+  # ~/.claude was a directory in this session's tmpfs, so every session took its own lock, two refreshed the same token at
+  # once, the account rotated it for the first and refused the second, and the second blanked the file for all of them —
+  # the member's channel session sat signed out from 09:31Z on 2026-09-08 while two owner messages went unread (#376's
+  # review). build_member now binds the handle's whole config dir at ~/.claude, so the lock every session makes is the
+  # same host directory: refreshes serialise, the loser re-reads the winner's token, nothing is refused and nothing is
+  # blanked. The selfcheck drives exactly that with two sessions, one holding the lock the way claude does.
   B+=(--bind "$own" "$cred")
   [ -f "$H/.cc/slack/enabled" ] && mcp=$(jq -cn --arg c "$H/bin/cc-slack" '{"cc-slack": {type: "stdio", command: $c, args: ["channel"], env: {}}}')
   # fd 3: the ~/.claude.json copy (the credential is the bind above, not a copy)
@@ -901,7 +916,7 @@ github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitH
   echo "cc-sandbox: ~/dev/$r holds $f from its next launch (~/.cc/members/$r/github-token) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
-  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i
   cb=$(dirname "$SELF")   # the host side of every board case below: THIS tree's cc-board, which resolves a linked board before it renames
   dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
   : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
@@ -1014,6 +1029,24 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'credential: …and the next launch starts from it, with no person' "$(g next)" "refreshed-$$"
   real1=$(md5sum "$c" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
   t 'credential: the box'"'"'s own ~/.claude/.credentials.json is untouched by all of that' "$real1" "$real0"
+  # ── TWO SESSIONS, ONE CREDENTIAL, ONE LOCK (2026-09-08: two sessions of one handle refreshed the same token, the account
+  #    refused the second and it blanked the file for both). Session 1, the workspace session, does what claude does around
+  #    a refresh: mkdir ~/.claude/.oauth_refresh.lock, rotate both tokens in place, hold the lock a moment, rmdir it. Session
+  #    2, a track session launched while 1 holds it, must find that lock TAKEN — the same host directory, so its own refresh
+  #    would wait for 1's — and once it is released must read the token 1 wrote, so it never posts the stale one. A lock in
+  #    a per-session tmpfs said 'free' here. And afterwards the lock is free again and the file whole for the next launch.
+  lockdir="$H/.cc/members/$h/claude/.oauth_refresh.lock"
+  "$SELF" member "$h" -- sh -c 'mkdir ~/.claude/.oauth_refresh.lock || exit 9; jq -c ".claudeAiOauth.accessToken = \"rotated-'"$$"'\" | .claudeAiOauth.refreshToken = \"rotated-r-'"$$"'\"" ~/.claude/.credentials.json > /tmp/c && cat /tmp/c > ~/.claude/.credentials.json; sleep 2; rmdir ~/.claude/.oauth_refresh.lock' >/dev/null 2>&1 &
+  s1=$!
+  i=0; while [ $i -lt 50 ] && [ ! -d "$lockdir" ]; do i=$((i+1)); sleep 0.1; done
+  t 'credential: the refresh lock a session takes is a directory on the host, in the handle'"'"'s own config dir' "$([ -d "$lockdir" ] && echo held || echo none)" held
+  out=$("$SELF" member "$h" t -- sh -c 'if mkdir ~/.claude/.oauth_refresh.lock 2>/dev/null; then echo lock=free; rmdir ~/.claude/.oauth_refresh.lock; else echo lock=taken; fi; i=0; while [ $i -lt 80 ] && [ -d ~/.claude/.oauth_refresh.lock ]; do i=$((i+1)); sleep 0.1; done; echo after=$(jq -r .claudeAiOauth.accessToken ~/.claude/.credentials.json)' 2>&1); wait "$s1"
+  t 'credential: a track session launched while the workspace session holds the lock finds it TAKEN — its refresh waits, it does not race' "$(g lock)" taken
+  t 'credential: …and once released it reads the token the first session rotated — it keeps working on that, never posting its own stale refresh' "$(g after)" "rotated-$$"
+  out=$("$SELF" member "$h" t -- sh -c 'if mkdir ~/.claude/.oauth_refresh.lock 2>/dev/null; then echo lock=free; rmdir ~/.claude/.oauth_refresh.lock; else echo lock=taken; fi' 2>&1)
+  t 'credential: with the first session gone the lock is free again for the next refresh' "$(g lock)" free
+  t 'credential: the shared file is whole after both — both tokens rotated, still 600, nothing blanked' \
+    "$(jq -r '[.claudeAiOauth.accessToken, .claudeAiOauth.refreshToken] | join(",")' "$own" 2>/dev/null)/$(stat -c %a "$own" 2>/dev/null)" "rotated-$$,rotated-r-$$/600"
   # ── THE GIT DIR IS THE HOST'S, THREE WAYS. Every source of a member-side bind is opened here and handed to bwrap as a
   #    descriptor (pin), so there is no name left for a member to redirect; `.git` and `.git/worktrees` are bound onto
   #    themselves, which makes them mountpoints their own session cannot rename. One case per class that got here.

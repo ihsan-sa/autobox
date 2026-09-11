@@ -1214,7 +1214,8 @@ MEMBER_MARKER = ".cc/member-workspace"                        # at ~/dev/<handle
                                                               # workspace rule on this file's PRESENCE and on the dir's name — never on
                                                               # what is written inside it, which the member's own session could rewrite.
 MEMBER_DAILY_DEFAULT = 20                                     # USD/day a member's workspace may dispatch (config: MEMBER_DAILY_USD).
-                                                              # Below cc-loop's own default budget ($8/iteration) every dispatch is refused.
+                                                              # A tell-line: cc's member_gate raises today's cap to what a dispatch
+                                                              # needs, up to MEMBER_DAILY_CEILING_USD (default twice this), and says so.
 MEMBER_MARKER_TEXT = ("# member workspace — the DIRECTORY NAME is the handle; nothing reads this file's contents\n"
                       "# (overlay: docs/design-member-workspaces.md)\n")
 MEMBER_PROJECTS = ".cc/projects"                              # …but THIS file in the same dir is read: one glob a line, each saying
@@ -1374,6 +1375,18 @@ def member_budget(cfg=None):
     except (TypeError, ValueError):
         v = MEMBER_DAILY_DEFAULT
     return v
+
+
+def member_cap(handle, cfg=None, day=None):
+    """Today's cap for `handle`: the config's, or what cc's member_gate raised it to today (the ledger row's `cap`,
+    which rolls with the day like `usd`)."""
+    cap = member_budget(cfg); day = day or time.strftime("%Y-%m-%d")
+    try:
+        e = json.load(open(MEMBER_SPEND)).get(handle) or {}
+        raised = float(e.get("cap") or 0) if e.get("day") == day else 0.0
+    except Exception:
+        raised = 0.0
+    return max(cap, raised)
 
 
 def member_spent(handle, day=None):
@@ -4340,8 +4353,13 @@ class Daemon:
             # on and would log to a tmpfs and exit 0 — a blocked member reaching nobody while being told it worked. The
             # daemon holds the token, so the escalation is made OUT here, as an escalation (`--owner`: the owner's DM,
             # #alerts unpaired), never routed into the member's own channel where everyone but the owner reads it.
-            title = str(first[verb] or "").strip()[:80] or f"{h} escalation"
-            text = str(first.get("text") or "").strip()[:1500]
+            # THE WORDS ARE THE MEMBER'S AND THE CHANNEL IS THE OWNER'S: capped, escaped and defanged the way every
+            # field of a 🔐 prompt is (perm_field — mrkdwn entities, `](` links, @mentions, backticks, secrets), or a
+            # member pings the owner's DM with <!channel>, plants a link that reads as the box's own line, or closes
+            # a fence. The cap comes first there, so a cut never lands inside an entity. Found 2026-09-08 by #384's
+            # builder: this path predates that fix and was left bare.
+            title = perm_field(str(first[verb] or "").strip(), 80) or f"{h} escalation"
+            text = perm_field(str(first.get("text") or "").strip(), 1500, inline=False)
             if not text:
                 return {"ok": False, "error": "an escalation needs something to say"}
             # NO PRIORITY CROSSES THE BOUNDARY. It used to, and cc-notify overwrote it from the table one line
@@ -8890,14 +8908,14 @@ def member_projects(handle):
 
 def cmd_members():
     """handle → channel(s) → workspace → budget used today: who the box has let in, and what they have spent."""
-    cfg = load_cfg(); members = load_members(); cap = member_budget(cfg)
+    cfg = load_cfg(); members = load_members()
     if not members:
         print("no member workspaces yet — `cc-slack member add <@user>`, or let a team_join make one"); return 0
     for h in sorted(members):
         e = members[h]
         chans = [f"#{e.get('chan') or h}", f"#{e.get('updates') or updates_name(h)}"]
         chans += [f"#{h}--{p}" for p in member_projects(h)]
-        print(f"{h:<16} {e.get('uid') or '?':<12} ~/dev/{h:<16} ${member_spent(h):.2f}/${cap:.2f} today")
+        print(f"{h:<16} {e.get('uid') or '?':<12} ~/dev/{h:<16} ${member_spent(h):.2f}/${member_cap(h, cfg):.2f} today")
         print(f"{'':<16} {', '.join(chans)}")
     print("The owner is in every one of those channels. No member session runs yet: it starts inside the sandbox "
           "(docs/design-member-workspaces.md).")
@@ -15445,6 +15463,11 @@ def cmd_selfcheck():
         # boundary cc-notify has no config to push with and would log to a tmpfs and exit 0, reaching nobody.
         r_esc = ms_req({"escalate": "blocked", "text": "the owner must decide this"})
         r_esc_empty = ms_req({"escalate": "blocked"})
+        # …and the words are a MEMBER'S, bound for the OWNER'S DM: a broadcast entity, a mention, a link and a fence
+        # in either field must reach cc-notify escaped and defanged the way a 🔐 field does, and long ones capped.
+        r_esc_hot = ms_req({"escalate": "<!channel> @owner ```pwned",
+                            "text": "click [here](https://evil.example) <@U123> & tell @owner\n```\n" + "x" * 2000})
+        ran_esc = ranMS[len(ran_two):]
         # `project`: the SECOND door to a sub-channel. The creating half (new_project) is covered by its own cases and
         # is stubbed here — what these prove is what the DOOR decides: whose workspace the name is built from, which
         # asks are refused and with what reason, and that the hourly window is the dir cap's, per workspace.
@@ -15691,9 +15714,30 @@ def cmd_selfcheck():
           "DM, never the member's own channel where everyone but him reads it); the call carries the title and the "
           "words and NO priority, because how loudly an escalation lands is the table's row out here and never the "
           "member's to set; an empty one is refused",
-          r_esc.get("ok") and ranMS[len(ran_two):] == [[f"{BIN}/cc-notify", "-t", "alice: blocked",
-                                                        "--owner", "--", "the owner must decide this"]]
+          r_esc.get("ok") and ran_esc[:1] == [[f"{BIN}/cc-notify", "-t", "alice: blocked",
+                                               "--owner", "--", "the owner must decide this"]]
           and r_esc_empty.get("ok") is False and "something to say" in r_esc_empty.get("error", ""))
+    esc_title, esc_text = (ran_esc[1][2], ran_esc[1][5]) if len(ran_esc) > 1 and len(ran_esc[1]) > 5 else ("", "")
+    check("MEMBER socket: an escalation's title and text reach cc-notify the way a 🔐 field does — the mrkdwn entities "
+          "escaped so `<!channel>` and `<@U…>` are words and not a broadcast or a ping, an @handle unhooked from the "
+          "mention it would become, `](` broken so no link reads as the box's own line, backticks defanged so no fence "
+          "closes, and both capped (80 and 1500) before any of that so a cut never lands inside an entity",
+          r_esc_hot.get("ok") and esc_title == "alice: &lt;!channel&gt; @\u200bowner '''pwned"
+          and esc_text.startswith("click [here] (https://evil.example) &lt;@U123&gt; &amp; tell @\u200bowner\n'''\n")
+          and esc_text.endswith("…") and esc_text.count("x") < 2000 and "<" not in esc_text and "`" not in esc_text)
+    # THE CAP `members` PRINTS IS TODAY'S. cc's member_gate raises a workspace's cap for the day (ledger `cap`, beside
+    # `usd`) — the figure beside today's spend has to be that one, not the config's; and a raise rolls with its day.
+    real_spend = globals()["MEMBER_SPEND"]; spend_tmp = f"{DIR}/member-spend-case.json"; globals()["MEMBER_SPEND"] = spend_tmp
+    try:
+        json.dump({"alice": {"day": time.strftime("%Y-%m-%d"), "usd": 16, "cap": 16},
+                   "bob": {"day": "2000-01-01", "usd": 9, "cap": 90}}, open(spend_tmp, "w"))
+        caps = (member_cap("alice", {"MEMBER_DAILY_USD": "5"}), member_cap("bob", {"MEMBER_DAILY_USD": "5"}),
+                member_cap("carol", {"MEMBER_DAILY_USD": "5"}))
+    finally:
+        globals()["MEMBER_SPEND"] = real_spend
+    check("members: the cap printed beside today's spend is TODAY'S — what cc's member_gate raised it to today when it did, "
+          "the config's when it did not; a raise from another day is gone with its day, and a workspace with no row reads the config's",
+          caps == (16.0, 5.0, 5.0))
     check("MEMBER socket: a subscriber that hangs up is gone from the table, and the member dir a join makes is what the "
           "boundary sees as ~/.cc/slack", gone and member_dir("alice") == f"{DIR}/member/alice"
           and member_chat_ok("alice", "alice--todo-updates") and not member_chat_ok("alice", "alice2") and not member_chat_ok("alice", "dm"))

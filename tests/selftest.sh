@@ -1011,8 +1011,10 @@ chmod +x "$NB/cc-slack"; : > "$T/cap.args"
 # variable used to be the flag that got a workspace past the old sandbox_gate; it now means "inside the boundary",
 # where `cc … --go` writes the brief and brokers the launch to the daemon (core/bin/cc, the `go)` case) because the
 # ledger ~/.cc/state/member-spend.json does not exist in there. Setting it here would test the broker, not the cap.
+# CAP_CEIL is the owner's ceiling (MEMBER_DAILY_CEILING_USD): at the cap itself, as here, the box may raise nothing and
+# every crossing is a refusal — the shape these first cases were written against. The raise cases below move it.
 cap(){ ( cd "$GH/dev/alice" && env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" CC_CLAUDE=/bin/true \
-           MEMBER_DAILY_USD=5 CAP_SLACK_RC="${CAP_SLACK_RC:-0}" "$NB/cc" alice todo --go x 2>&1 ); }
+           MEMBER_DAILY_USD=5 MEMBER_DAILY_CEILING_USD="${CAP_CEIL-5}" CAP_SLACK_RC="${CAP_SLACK_RC:-0}" "$NB/cc" alice todo --go x 2>&1 ); }
 c1=$(cap); r1=$?; m1=$(grep -c -- '--mention' "$T/cap.args" 2>/dev/null)
 grep -q 'refused' <<<"$c1" && [ "$r1" = 1 ] && [ "$m1" = 1 ] \
   && grep -q -- '-c #alice --mention' "$T/cap.args" && grep -q -- '-c #alice-updates' "$T/cap.args" \
@@ -1030,12 +1032,45 @@ CAP_SLACK_RC=1 cap >/dev/null; m3=$(grep -c -- '--mention' "$T/cap.args" 2>/dev/
   && ok "…and a mention nobody heard releases the day-stamp: a failed post is retried on the next refusal, not inherited as silence" \
   || bad "a failed mention kept its day-stamp (marker='$mkA', attempts=$m3)"
 rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
+# Every case above stopped AT the gate; the raises below go through it, on to `cc-task claim` and the (stub) window,
+# so the track needs the worktree `cc` makes rather than the plain dir the forged-marker cases planted at alice/todo.
+rm -rf "$GH/.cc/worktrees/alice/todo"
+# THE CAP IS A TELL-LINE AND THE BOX RAISES IT ITSELF, UNDER THE OWNER'S CEILING (owner 2026-09-08; a member workspace sat capped
+# overnight on 2026-09-09 with its Odoo run queued because a refusal only asked him). Cap $5, ceiling $30, a dispatch
+# asking $8: not refused — today's cap becomes $8 in the ledger, the $8 is charged, and one line goes to -updates and
+# one to the owner in #alice. Two more (+$8 each) raise it to $16 and $24; the fourth would need $32 and that is over
+# the ceiling: refused, with the ceiling named and the once-a-day mention, exactly as a crossing of the cap used to be.
+c4=$(CAP_CEIL=30 cap); r4=$?; l4=$(jq -c '[.alice.cap, .alice.usd]' "$GH/.cc/state/member-spend.json" 2>/dev/null)
+[ "$r4" = 0 ] && grep -q 'cap raised to \$8.00 for today (ceiling \$30.00)' <<<"$c4" && [ "$l4" = '[8,8]' ] \
+  && grep -q -- '-c #alice-updates .*raised today.s cap to \$8.00' "$T/cap.args" && grep -q -- '-c #alice --mention raised `alice`.s cap to \$8.00 for today (was \$5.00' "$T/cap.args" \
+  && ok "a dispatch over the day cap but under the owner's ceiling is NOT refused: the box raises today's cap to what it needs, charges it, and says so in one line in -updates and one to the owner" \
+  || bad "the cap was not raised under the ceiling (rc=$r4, ledger=$l4): $c4 / $(cat "$T/cap.args" 2>/dev/null)"
+: > "$T/cap.args"; CAP_CEIL=30 cap >/dev/null; CAP_CEIL=30 cap >/dev/null
+l5=$(jq -c '[.alice.cap, .alice.usd, .alice.mentioned // "none"]' "$GH/.cc/state/member-spend.json" 2>/dev/null); n5=$(grep -c -- '--mention raised' "$T/cap.args")
+c6=$(CAP_CEIL=30 cap); r6=$?; l6=$(jq -c '[.alice.cap, .alice.usd, .alice.mentioned // "none"]' "$GH/.cc/state/member-spend.json" 2>/dev/null)
+[ "$l5" = '[24,24,"none"]' ] && [ "$n5" = 2 ] && [ "$r6" = 1 ] && grep -q 'over its \$30.00 ceiling, refused' <<<"$c6" \
+  && [ "$l6" = "[24,24,\"$(date -u +%F)\"]" ] && grep -q -- '-c #alice --mention `alice` hit its \$30.00/day ceiling' "$T/cap.args" \
+  && ok "…each raise is its own line to the owner, the raised cap is today's from then on, and the CEILING is where the box stops: the dispatch that would cross it is refused with the ceiling named and the once-a-day mention" \
+  || bad "the ceiling did not hold (after two more: $l5, mentions=$n5; over: rc=$r6 ledger=$l6): $c6 / $(cat "$T/cap.args" 2>/dev/null)"
+rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
+# …and with no ceiling set the default is twice the cap, so a $5 cap raises once to $8 and refuses $16: the incident's
+# shape recovers by itself on a box whose owner set only the cap, and a ceiling below the cap never lowers it.
+c7=$(CAP_CEIL= cap); r7=$?; c8=$(CAP_CEIL= cap); r8=$?; l8=$(jq -c '[.alice.cap, .alice.usd]' "$GH/.cc/state/member-spend.json" 2>/dev/null)
+rm -f "$GH/.cc/state/member-spend.json"; c9=$(CAP_CEIL=1 cap); r9=$?
+[ "$r7" = 0 ] && grep -q 'raised to \$8.00 for today (ceiling \$10.00)' <<<"$c7" && [ "$r8" = 1 ] && grep -q 'over its \$10.00 ceiling' <<<"$c8" && [ "$l8" = '[8,8]' ] \
+  && [ "$r9" = 1 ] && grep -q 'over its \$5.00 ceiling' <<<"$c9" \
+  && ok "…the ceiling defaults to twice the cap when the owner set none, and one set below the cap is the cap" \
+  || bad "the default ceiling is wrong (first rc=$r7 '$c7'; second rc=$r8 '$c8'; ledger $l8; ceiling<cap rc=$r9 '$c9')"
+rm -f "$GH/.cc/state/member-spend.json"; : > "$T/cap.args"
 # …and the other side of that same wall: INSIDE the boundary the very same command charges nothing and opens no
-# window — it writes the brief and hands the daemon a `dispatch`, which is what charges the cap out here.
-ci=$( ( cd "$GH/dev/alice" && env HOME="$GH" CC_MEMBER_SANDBOX=1 MEMBER_DAILY_USD=5 "$NB/cc" alice todo --go 'from inside' 2>&1 ) ); ri=$?
+# window — it writes the brief and hands the daemon a `dispatch`, which is what charges the cap out here. A MEMBER
+# SESSION NEVER RAISES ITS OWN CAP: the ceiling in ITS environment is nobody's — what crosses to the host is the brief
+# and the loop count, no cap, no ceiling, and the ledger out here is untouched.
+ci=$( ( cd "$GH/dev/alice" && env HOME="$GH" CC_MEMBER_SANDBOX=1 MEMBER_DAILY_USD=5 MEMBER_DAILY_CEILING_USD=1000 "$NB/cc" alice todo --go 'from inside' 2>&1 ) ); ri=$?
 [ "$ri" = 0 ] && grep -q -- 'dispatch alice/todo --loop' "$T/cap.args" && ! grep -q -- '--mention' "$T/cap.args" \
+  && ! grep -qi -- 'ceiling\|MEMBER_DAILY\|raised' "$T/cap.args" \
   && [ ! -f "$GH/.cc/state/member-spend.json" ] && grep -q 'from inside' "$GH/.cc/state/alice/todo/task.md" \
-  && ok "…and inside the boundary the same dispatch is BROKERED, not charged: the brief is written to the workspace's own state dir and the daemon is asked to run it on the host, where the ledger and this cap actually live" \
+  && ok "…and inside the boundary the same dispatch is BROKERED, not charged: the brief is written to the workspace's own state dir and the daemon is asked to run it on the host, where the ledger, the cap and the ceiling actually live — a ceiling in the member's own environment raises nothing" \
   || bad "a dispatch from inside the boundary did not broker (rc=$ri, args='$(cat "$T/cap.args" 2>/dev/null)'): $ci"
 rm -f "$GH/.cc/state/member-spend.json"
 # NO CREDENTIAL, NO WINDOW — AND SOMEBODY IS TOLD (review-156d). cc-sandbox member refuses a workspace without its own
