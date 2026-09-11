@@ -98,7 +98,11 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # reuse, the expiry margin, an absent key and which remotes it answers for — and, over a ~/dev of member
 # workspaces it builds itself, which repositories a workspace owns, that its token is minted for those alone
 # and for no other workspace's, that creating one wires it up, and that `default` moves a repository's default
-# branch to the base and refuses a track. No GitHub App of this box's is read,
+# branch to the base and refuses a track; and, under the owner's own account, that a workspace's push, its create
+# and any other operation on its own repository carry his personal token from a file under the fixture's HOME, that
+# a repository already there is wired rather than created, that a create his token may not make names what he does
+# instead, that a refusal names the permission GitHub asked for, and that another workspace's repository or a
+# missing file is refused. No GitHub App of this box's is read, no personal token of his either,
 # nothing leaves the machine, no repository is created anywhere (the create endpoint is the fixture's too),
 # and its token caches are files under the temp dir, never the real ones.
 # cc-checkpoint's is the rule that decides WHERE a track pushes, which branch the repository it makes opens on, and

@@ -4,20 +4,29 @@
 #   cc-gh-token gitargs <remote-url> [<workspace>]   the `git -c …` arguments that make git authenticate as
 #                                       the app for that remote, one per line — and NOTHING for any other
 #                                       remote, so every other push keeps whatever helper ~/.gitconfig gives
-#                                       it. With a workspace: nothing for a repository it does not own either
-#   cc-gh-token repos <workspace>       the repositories that workspace owns, one per line
-#   cc-gh-token create <workspace> <name>   create <name> in the app's org FOR that workspace and wire it as a
-#                                       remote of ~/dev/<workspace>, so its next push has somewhere to go;
-#                                       prints the url. Idempotent, and it refuses a name already someone else's
+#                                       it. With a workspace: nothing for a repository it does not own either —
+#                                       under the owner's own account, the reset alone, so gh's login cannot answer
+#   cc-gh-token repos <workspace>       the repositories that workspace owns in the app's org, one per line
+#   cc-gh-token create <workspace> [<owner>/]<name>   wire <name> up FOR that workspace as a remote of
+#                                       ~/dev/<workspace>, so its next push has somewhere to go — in the app's org,
+#                                       or under the owner's own account when <owner> is CC_GH_PERSONAL_OWNER.
+#                                       There, a repository he already made is wired AS IT STANDS and only a missing
+#                                       one is created; prints the url. Idempotent, it refuses a name already someone
+#                                       else's, and a create his token may not make names what he does instead
+#   cc-gh-token api <workspace> <METHOD> <path> [<json>]   any other operation his token allows on a repository that
+#                                       workspace owns under CC_GH_PERSONAL_OWNER — Pages, Actions, branches,
+#                                       releases, settings, whatever it is. Prints the response; a refusal names the
+#                                       permission GitHub itself says it wanted, so the owner adds exactly that one
 #   cc-gh-token default <workspace> <name> <branch>   make <branch> the default branch of that workspace's <name>,
 #                                       once the branch is really there. GitHub gives an empty repository the FIRST
 #                                       branch pushed into it as its default, and a project's first push is its
 #                                       track — so a track is refused here, and so is another workspace's repository
 #   cc-gh-token [--workspace <w>] get|store|erase   git's credential-helper protocol on stdin (gitargs wires
 #                                       this up, workspace and all)
-#   cc-gh-token selfcheck               minting, reuse, expiry, an absent key, the per-workspace scoping and
-#                                       the creation path, on fixtures of its own: its own RSA key, its own
-#                                       API on localhost, its own ~/dev of workspaces, its own cache
+#   cc-gh-token selfcheck               minting, reuse, expiry, an absent key, the per-workspace scoping, the
+#                                       creation path, the owner's own account and the api route, on fixtures of
+#                                       its own: its own RSA key, its own API on localhost, its own ~/dev of
+#                                       workspaces, its own cache, its own token file under its own HOME
 #
 # THE APP IS CONFIGURATION, NEVER CONTENT. Nothing here names a box, an org, an ID or a key path — those are
 # keys in ~/.cc/config, which is absent inside every sandbox profile (cc-sandbox), read through cc-config,
@@ -27,6 +36,25 @@
 # and two with defaults: CC_GH_APP_HOST (github.com) · CC_GH_API (the public API).
 # Configure none of them and nothing here reaches GitHub: gitargs prints nothing, so a box with no app pushes
 # exactly as it did before, and asking for a credential or a repository says which keys are missing.
+#
+# THE OWNER'S OWN ACCOUNT IS A SECOND DOOR, FOR WORKSPACES ONLY. A workspace can also own repositories under his
+# personal account (CC_GH_PERSONAL_OWNER in ~/.cc/config). The credential there is a fine-grained personal access
+# token he made himself, at ~/.cc/secrets/github-personal.token (mode 600; docs/github-app.md says what it must be
+# allowed), read straight from that file for each push or create — no mint, no cache. A PAT cannot be narrowed per
+# request the way the app token is, so the ownership rule below is its whole limit: gitargs wires it only for a
+# repository ~/dev/<handle> names under that account, the helper checks the same again where the token is handed
+# over, and for a workspace's push under that account gitargs ALWAYS resets git's helper list first, so the box's
+# own gh login (~/.gitconfig) never pushes on a workspace's behalf — the two revoke independently. Asked with no
+# workspace it prints nothing: the box's own pushes to that account go on exactly as they did. Unset
+# CC_GH_PERSONAL_OWNER and none of this exists. The file lives in ~/.cc/secrets, which no sandbox profile binds,
+# and the push it serves runs on the host (cc-checkpoint --sweep, cc-loop) — inside the boundary the Stop hook
+# commits and neither the file nor the config is there to read.
+# THAT DOOR IS FULL CONTROL OF THOSE REPOSITORIES, NOT A LIST OF VERBS (owner, 2026-09-11). Pushing is one
+# operation; Pages, Actions, branch protection, releases and every other repository setting are ordinary API
+# calls, and `api` below makes any of them on the same terms — host-side, the same ownership check, the token
+# read for the call and handed to nobody. What the token may actually do is the TOKEN's business, not a list
+# written down here: GitHub answers a request it does not cover with 403 and names the permission it wanted in
+# `X-Accepted-GitHub-Permissions`, and that name is printed, so the owner adds exactly that one and nothing else.
 #
 # A WORKSPACE OPENS ITS OWN REPOSITORIES AND NOBODY ELSE'S. The installation covers the whole org
 # (repository_selection "all", measured), so an unscoped token opens every member workspace's project. A token
@@ -48,7 +76,7 @@ umask 077   # the cache below is a credential: never group- or world-readable, n
 
 SELF="$(readlink -f "$0")"
 BIN="$(dirname "$SELF")"
-USAGE="usage: cc-gh-token gitargs <remote-url> [<workspace>] | repos <workspace> | create <workspace> <name> | default <workspace> <name> <branch> | [--workspace <w>] get | store | erase | selfcheck"
+USAGE="usage: cc-gh-token gitargs <remote-url> [<workspace>] | repos <workspace> | create <workspace> [<owner>/]<name> | api <workspace> <METHOD> <path> [<json>] | default <workspace> <name> <branch> | [--workspace <w>] get | store | erase | selfcheck"
 MARGIN=300   # seconds of life a cached token must still have to be reused — see cache_read
 
 cfg(){ "$BIN/cc-config" get "$1" "${2:-}"; }
@@ -56,6 +84,8 @@ APP_ID=$(cfg CC_GH_APP_ID)
 INSTALL_ID=$(cfg CC_GH_APP_INSTALL_ID)
 KEY=$(cfg CC_GH_APP_KEY)
 OWNER=$(cfg CC_GH_APP_OWNER)
+POWNER=$(cfg CC_GH_PERSONAL_OWNER)   # the owner's own account — a second door, workspaces only (header)
+PTOKEN="$HOME/.cc/secrets/github-personal.token"
 HOST=$(cfg CC_GH_APP_HOST github.com)
 API=$(cfg CC_GH_API https://api.github.com)
 CACHE="${CC_GH_TOKEN_CACHE:-$HOME/.cc/secrets/gh-app-token.json}"
@@ -64,31 +94,39 @@ SCOPE=()          # the repositories that workspace owns — all a token minted 
 SCOPE_JSON=null   # the same list as the cache records it, so a token minted before a repo existed is re-minted
 
 configured(){ [ -n "$APP_ID" ] && [ -n "$INSTALL_ID" ] && [ -n "$KEY" ] && [ -n "$OWNER" ]; }
+is_personal(){   # $1 an owner → 0 when it is the owner's own account. The app's org wins a name both keys hold.
+  [ -n "$POWNER" ] && [ "${1,,}" = "${POWNER,,}" ] && [ "${1,,}" != "${OWNER,,}" ]; }
+personal_token(){   # prints the PAT as the file holds it; a missing file is a refusal that names it, and nothing sent
+  local t
+  [ -r "$PTOKEN" ] || die "the personal token is not readable at $PTOKEN — the owner places it (docs/github-app.md); nothing was sent"
+  t=$(tr -d '[:space:]' < "$PTOKEN"); [ -n "$t" ] || die "$PTOKEN is empty — nothing was sent"
+  printf '%s' "$t"
+}
 die(){ echo "cc-gh-token: $1" >&2; exit 1; }
 
 # ── whose repository is it ───────────────────────────────────────────────────────────────────────
 # The marker, never the name: ~/dev/<handle>/.cc/member-workspace is what makes a directory a workspace
 # (docs/design-member-workspaces.md), and its remotes are what it owns.
-ws_repos(){   # $1 handle → its repo names under the app's owner, one per line, sorted. 1 = not a workspace,
+ws_repos(){   # $1 handle [$2 owner, the app's by default] → its repo names under that owner, one per line, sorted. 1 = not a workspace,
               # which is NOT the same answer as a workspace with no repository yet (0, and nothing printed):
               # git exits non-zero when a repo has no remote at all, and under pipefail that read as "no
               # workspace" and said so — measured on a real one, 2026-09-04.
-  local d url u cfg
+  local d url u cfg own="${2:-$OWNER}"
   case "$1" in ''|.|..|*/*) return 1 ;; esac
   d="$HOME/dev/$1"
   [ -f "$d/.cc/member-workspace" ] || return 1
   cfg=$(git -C "$d" config --get-regexp '^remote\..*\.url$' 2>/dev/null) || cfg=''
   printf '%s\n' "$cfg" | while read -r _ url; do
     u=${url%.git}
-    case "${u,,}" in "https://${HOST,,}/${OWNER,,}/"*) ;; *) continue ;; esac   # another host or another owner: not ours to open
+    case "${u,,}" in "https://${HOST,,}/${own,,}/"*) ;; *) continue ;; esac   # another host or another owner: not ours to open
     u=${u##*/}; [ -n "$u" ] && printf '%s\n' "$u"
   done | sort -u
 }
-ws_owns(){ ws_repos "$1" 2>/dev/null | grep -qixF -- "$2"; }
-ws_owner_of(){   # $1 repo name → the handle of the workspace that owns it, or nothing
+ws_owns(){ ws_repos "$1" "${3:-}" 2>/dev/null | grep -qixF -- "$2"; }   # $1 handle, $2 repo name [$3 owner]
+ws_owner_of(){   # $1 repo name [$2 owner] → the handle of the workspace that owns it, or nothing
   local d h
   for d in "$HOME"/dev/*/; do h=${d%/}; h=${h##*/}
-    ws_owns "$h" "$1" && { printf '%s' "$h"; return 0; }
+    ws_owns "$h" "$1" "${2:-}" && { printf '%s' "$h"; return 0; }
   done
   return 1
 }
@@ -169,9 +207,24 @@ token(){ local t; scope_init; t=$(cache_read) && [ -n "$t" ] && { printf '%s' "$
 gitargs(){   # $1 remote url, $2 the workspace pushing (optional). Prints the -c arguments, one per line,
              # ONLY for a remote this app covers — and, for a workspace, only for one of its OWN repositories.
   local url="$1" ws="${2:-}" rest owner repo
-  configured || return 0
   case "$url" in "https://$HOST/"*) rest=${url#"https://$HOST/"} ;; *) return 0 ;; esac   # ssh and every other host: not ours
   owner=${rest%%/*}
+  repo=${rest#*/}; repo=${repo%.git}; repo=${repo%%/*}
+  # The owner's own account — "a workspace's pushes carry the credential only for remotes ~/dev/<handle> names,
+  # and a workspace with no remote under that account gets none". With no workspace it is the box's own push,
+  # and that keeps ~/.gitconfig's helper untouched. For a real workspace the reset goes out EVEN WHEN nothing is
+  # wired after it: gh's helper is logged in as this very account, and without the reset a workspace's push
+  # there would go through as the box — the one thing this door must not do.
+  # The marker is checked FIRST, though: `cc done` passes a plain repo name here whether or not it is a
+  # workspace, and the reset alone would leave the box's own push to its own repository with no helper at all.
+  if is_personal "$owner" && [ -n "$ws" ]; then
+    [ -f "$HOME/dev/$ws/.cc/member-workspace" ] || return 0
+    printf -- '-c\ncredential.helper=\n'
+    ws_owns "$ws" "$repo" "$POWNER" || return 0
+    printf -- '-c\ncredential.helper=!%q --workspace %q\n-c\ncredential.useHttpPath=true\n' "$SELF" "$ws"
+    return 0
+  fi
+  configured || return 0
   [ "${owner,,}" = "${OWNER,,}" ] || return 0
   # The empty value first RESETS the helper list: ~/.gitconfig already names a helper for this host (gh's),
   # it is tried before anything -c appends, and it would answer for the app's org with the wrong account.
@@ -179,7 +232,6 @@ gitargs(){   # $1 remote url, $2 the workspace pushing (optional). Prints the -c
   if [ -n "$ws" ]; then
     # "the token any workspace gets opens its own repositories and nobody else's" — so another workspace's
     # repository gets no credential at all here, and the push stops rather than crossing the boundary.
-    repo=${rest#*/}; repo=${repo%.git}; repo=${repo%%/*}
     ws_owns "$ws" "$repo" || return 0
     # useHttpPath makes git send the repository as well as the host, so the helper can check it a second
     # time where the token is actually handed over.
@@ -195,9 +247,19 @@ helper_get(){   # git's credential protocol: key=value lines in, username/passwo
     k=${line%%=*}; v=${line#*=}
     case "$k" in host) host=$v ;; protocol) proto=$v ;; path) path=$v ;; esac
   done
-  configured || die "no GitHub App is configured (CC_GH_APP_ID, CC_GH_APP_INSTALL_ID, CC_GH_APP_KEY, CC_GH_APP_OWNER in ~/.cc/config)"
   # gitargs only wires this helper up for the app's own host, but a redirect can move the request: check.
-  [ "$proto" = https ] && [ "${host,,}" = "${HOST,,}" ] || die "asked for $proto://$host, which this app does not cover"
+  [ "$proto" = https ] && [ "${host,,}" = "${HOST,,}" ] || die "asked for $proto://$host, which this box holds no credential for"
+  # The owner's own account. A PAT has no per-request scope, so the ownership check IS the limit, and it is made
+  # here, where the token is handed over — for a workspace's own repository under that account and for nothing
+  # else, the box itself included.
+  if is_personal "${path%%/*}"; then
+    [ -n "$WS" ] || die "$POWNER is the owner's own account: only a workspace's push is answered for it, and this ask names none"
+    repo=${path#*/}; repo=${repo%.git}; repo=${repo%%/*}
+    ws_owns "$WS" "$repo" "$POWNER" || die "$POWNER/$repo is not a repository of workspace $WS"
+    tok=$(personal_token) && [ -n "$tok" ] || exit 1
+    printf 'username=%s\npassword=%s\n' "$POWNER" "$tok"; return 0
+  fi
+  configured || die "no GitHub App is configured (CC_GH_APP_ID, CC_GH_APP_INSTALL_ID, CC_GH_APP_KEY, CC_GH_APP_OWNER in ~/.cc/config)"
   # gitargs refused another workspace's repository already; git sends the path (credential.useHttpPath, set
   # there), so it is refused again HERE, before anything is minted.
   if [ -n "$WS" ] && [ -n "$path" ]; then
@@ -214,19 +276,60 @@ helper_get(){   # git's credential protocol: key=value lines in, username/passwo
 # Repository creation is what the app's ORGANIZATION Administration permission is for (granted deliberately,
 # 2026-09-03). It is an ORG action, so it needs an unscoped token: a token scoped to repositories cannot make
 # a repository that does not exist yet.
-create(){   # $1 handle, $2 repo name — a workspace's project ends up with somewhere to push, nobody present
-  local ws="$1" name="$2" d url tok r msg other rn
-  configured || die "no GitHub App is configured (CC_GH_APP_ID, CC_GH_APP_INSTALL_ID, CC_GH_APP_KEY, CC_GH_APP_OWNER in ~/.cc/config)"
+# Under the owner's OWN account (create <ws> <CC_GH_PERSONAL_OWNER>/<name>) WIRING COMES FIRST. A fine-grained
+# token is normally scoped to repositories the owner made himself — his is — and such a token cannot create at
+# all: POST /user/repos comes back 403, and a repository that is already there comes back 422. So the existing
+# repository is asked for first and wired as it stands, which is the path that actually runs; creating is what
+# happens only when nothing is there and the token is allowed to. A refused create names what he does instead,
+# because "GitHub refused" on its own leaves him guessing. The token is read from its file, and a missing file
+# is a refusal before anything is asked or added.
+repo_exists(){   # $1 owner, $2 name, $3 token → 0 when GitHub already has it. Only a plain 200 is a yes: a 404 is
+                 # "not there", and anything else is not an answer to build on, so the create below runs and says
+                 # whatever GitHub says. -K - keeps the token out of argv, as everywhere else here.
+  local code
+  code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -K - <<EOF
+url = "$API/repos/$1/$2"
+request = "GET"
+header = "Authorization: Bearer $3"
+header = "Accept: application/vnd.github+json"
+header = "X-GitHub-Api-Version: 2022-11-28"
+EOF
+  ) || return 1
+  [ "$code" = 200 ]
+}
+wire(){   # $1 workspace dir, $2 repo name, $3 url → the remote that makes it THIS workspace's (ws_repos above).
+          # `origin` for a workspace that has no remote at all — its first repository, and nowhere to push until
+          # now — and the repository's own name otherwise, because each project has its own repository (owner,
+          # 2026-09-03) and must not take another project's remote.
+  local rn=origin
+  [ -z "$(git -C "$1" remote 2>/dev/null)" ] || rn="$2"
+  git -C "$1" remote add "$rn" "$3" 2>/dev/null
+}
+create(){   # $1 handle, $2 [<owner>/]<name> — a workspace's project ends up with somewhere to push, nobody present
+  local ws="$1" name="$2" d url tok r msg other owner="$OWNER" ep
+  case "$name" in */*) owner=${name%%/*}; name=${name#*/} ;; esac
   case "$name" in ''|*[!A-Za-z0-9._-]*) die "'$name' is not a repository name" ;; esac
   d="$HOME/dev/$ws"
   [ -f "$d/.cc/member-workspace" ] || die "$ws is not a member workspace (~/dev/$ws/.cc/member-workspace)"
-  url="https://$HOST/$OWNER/$name.git"
-  ws_owns "$ws" "$name" && { printf '%s\n' "$url"; return 0; }   # already its own: nothing is created twice
-  other=$(ws_owner_of "$name") && die "$OWNER/$name is workspace $other's — narrowing what a workspace reaches needs nobody, widening it is the owner's alone"
-  WS=""   # org action: see above
-  tok=$(token) && [ -n "$tok" ] || exit 1
+  if is_personal "$owner"; then
+    owner="$POWNER"; ep="$API/user/repos"
+  else
+    [ "${owner,,}" = "${OWNER,,}" ] || die "$owner is not an account this box holds a credential for (the app's org${POWNER:+, or $POWNER})"
+    configured || die "no GitHub App is configured (CC_GH_APP_ID, CC_GH_APP_INSTALL_ID, CC_GH_APP_KEY, CC_GH_APP_OWNER in ~/.cc/config)"
+    owner="$OWNER"; ep="$API/orgs/$OWNER/repos"
+  fi
+  url="https://$HOST/$owner/$name.git"
+  ws_owns "$ws" "$name" "$owner" && { printf '%s\n' "$url"; return 0; }   # already its own: nothing is created twice
+  other=$(ws_owner_of "$name" "$owner") && die "$owner/$name is workspace $other's — narrowing what a workspace reaches needs nobody, widening it is the owner's alone"
+  if is_personal "$owner"; then tok=$(personal_token); else WS=""; tok=$(token); fi   # WS="": org action, see above
+  [ -n "$tok" ] || exit 1
+  # The owner's own account: the repository he already made is the ordinary case, and it is wired, not created.
+  if is_personal "$owner" && repo_exists "$owner" "$name" "$tok"; then
+    wire "$d" "$name" "$url" || die "$owner/$name is already on github.com, but it could not be added as a remote of $d — add it by hand: git -C $d remote add $name $url"
+    printf '%s\n' "$url"; return 0
+  fi
   r=$(curl -sS --max-time 20 --data "$(jq -nc --arg n "$name" --arg h "$ws" '{name:$n,private:true,description:("the \($h) workspace on this box")}')" -K - <<EOF
-url = "$API/orgs/$OWNER/repos"
+url = "$ep"
 request = "POST"
 header = "Authorization: Bearer $tok"
 header = "Accept: application/vnd.github+json"
@@ -236,14 +339,59 @@ EOF
   ) || die "the create request did not complete"
   [ "$(jq -r '.name // empty' <<<"$r" 2>/dev/null)" = "$name" ] || {
     msg=$(jq -r '.errors[0].message // .message // empty' <<<"$r" 2>/dev/null)
-    die "GitHub refused to create $OWNER/$name: ${msg:-no repository in the response}"; }
-  # The remote is what makes it THIS workspace's (ws_repos above). `origin` for a workspace that has no
-  # remote at all — its first repository, and nowhere to push until now — and the repository's own name
-  # otherwise, because each project has its own repository (owner, 2026-09-03) and must not take another
-  # project's remote.
-  rn=origin; [ -z "$(git -C "$d" remote 2>/dev/null)" ] || rn="$name"
-  git -C "$d" remote add "$rn" "$url" 2>/dev/null || die "created $OWNER/$name, but could not add it as the '$rn' remote of $d — add it by hand and nothing is created twice"
+    # A token scoped to repositories cannot create one, and that refusal is the expected one here — so it says
+    # what the owner does, rather than leaving him with GitHub's sentence and no next move. Nothing was wired.
+    is_personal "$owner" && die "GitHub refused to create $owner/$name: ${msg:-no repository in the response}. His token is scoped to the repositories it names, and a token like that cannot make one. So: make $owner/$name on $HOST, add it to that token's repository list (Settings → Developer settings → Fine-grained tokens), then run this again — or wire the one that is there: git -C $HOME/dev/$ws remote add $name $url"
+    die "GitHub refused to create $owner/$name: ${msg:-no repository in the response}"; }
+  wire "$d" "$name" "$url" || die "created $owner/$name, but could not add it as a remote of $d — add it by hand and nothing is created twice"
   printf '%s\n' "$url"
+}
+
+# ── everything else a workspace's own repository needs ───────────────────────────────────────────
+# Pages, Actions, branch protection, releases, a description, a topic: each is one API call on a repository, and
+# a workspace gets all of them under the owner's account on the terms its push already has — HERE, on the host,
+# where the token is read for the call and never leaves. The path is checked the way the credential helper checks
+# one, and for the same reason: a PAT has no per-request scope, so the ownership rule IS the limit. Anything the
+# token itself may not do is GitHub's 403, and GitHub says in `X-Accepted-GitHub-Permissions` which permission it
+# wanted — printed verbatim, so the owner adds that one rather than guessing or widening the token.
+gh_api(){   # $1 handle, $2 METHOD, $3 /repos/<owner>/<repo>[/…], $4 a json body (optional; never a secret)
+  local ws="$1" m="${2^^}" p="$3" payload="${4:-}" rest owner repo tok code msg perm out t
+  local -a data=()
+  case "$m" in GET|POST|PATCH|PUT|DELETE) ;; *) die "'$2' is not a method — GET, POST, PATCH, PUT or DELETE" ;; esac
+  [ -n "$POWNER" ] || die "no CC_GH_PERSONAL_OWNER in ~/.cc/config: this route is the owner's own account, and this box names none"
+  # The path is taken apart, never merely matched: `..`, a host of its own or a query smuggled in front of the
+  # repository would otherwise reach a repository the check below thinks it has already passed.
+  case "$p" in /repos/*) ;; *) die "'$p' is not a repository path — this route reaches /repos/<owner>/<repo>/… and nothing else" ;; esac
+  case "$p" in *[!A-Za-z0-9/._~%=?-]*) die "'$p' is not a path this route sends" ;; esac
+  case "$p" in *//*|*/../*|*/..) die "'$p' is not a path this route sends" ;; esac
+  [ -f "$HOME/dev/$ws/.cc/member-workspace" ] || die "$ws is not a member workspace (~/dev/$ws/.cc/member-workspace)"
+  rest=${p#/repos/}; owner=${rest%%/*}
+  [ -n "$owner" ] && [ "$owner" != "$rest" ] || die "'$p' names no repository — /repos/<owner>/<repo>/…"
+  rest=${rest#*/}; repo=${rest%%/*}; repo=${repo%%[?]*}
+  [ -n "$repo" ] || die "'$p' names no repository — /repos/<owner>/<repo>/…"
+  is_personal "$owner" || die "$owner is not the owner's own account: this route reaches ${POWNER}'s repositories and no others'"
+  ws_owns "$ws" "$repo" "$POWNER" || die "$owner/$repo is not a repository of workspace $ws"
+  tok=$(personal_token) && [ -n "$tok" ] || exit 1
+  # --data-raw, never --data-binary: curl reads a body that STARTS WITH @ as a filename, and a payload like
+  # @~/.cc/secrets/gh-app-key.pem would then send that file to GitHub. Raw sends the bytes it was given.
+  [ -n "$payload" ] && data=(--data-raw "$payload")
+  t=$(mktemp -d) || die "could not make a temp dir to read the response into"
+  code=$(curl -sS --max-time 30 -D "$t/h" -o "$t/b" -w '%{http_code}' "${data[@]}" -K - <<EOF
+url = "$API$p"
+request = "$m"
+header = "Authorization: Bearer $tok"
+header = "Accept: application/vnd.github+json"
+header = "Content-Type: application/json"
+header = "X-GitHub-Api-Version: 2022-11-28"
+EOF
+  ) || { rm -rf "$t"; die "the $m $p request did not complete"; }
+  perm=$(tr -d '\r' < "$t/h" | sed -n 's/^[Xx]-[Aa]ccepted-[Gg]it[Hh]ub-[Pp]ermissions: *//p' | tail -1)
+  msg=$(jq -r '.message // empty' "$t/b" 2>/dev/null)
+  out=$(cat "$t/b" 2>/dev/null); rm -rf "$t"
+  # The body goes to stdout on a success and NOWHERE on a failure — the message is the part that helps, and a
+  # response is not a place to be careless (the header above).
+  case "$code" in 2*) [ -n "$out" ] && printf '%s\n' "$out"; return 0 ;; esac
+  die "GitHub refused $m $p (HTTP $code): ${msg:-no message}${perm:+ — the token is missing this permission on $owner/$repo: $perm. The owner adds it at $HOST → Settings → Developer settings → Fine-grained tokens → this token → Repository permissions; nothing on the box changes}"
 }
 
 # ── which branch a repository opens on ───────────────────────────────────────────────────────────
@@ -273,7 +421,7 @@ EOF
 }
 
 selfcheck(){
-  local n=0 f=0 out rc port tok tok2 sig body iss   # pid and T are NOT local: the EXIT trap that stops the
+  local n=0 f=0 out rc port tok tok2 sig body iss ptok   # pid and T are NOT local: the EXIT trap that stops the
   # fixture API and removes the temp dir fires in the global scope, after this function's locals are gone. A
   # local `pid` there reads empty, the server is never killed, and it holds the pipe of whatever captured this
   # selfcheck's output open FOR EVER — which is check.sh hanging, not a test failing.
@@ -288,27 +436,43 @@ import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 T = sys.argv[1]
 class H(BaseHTTPRequestHandler):
-    def do_PATCH(self):                         # the default-branch endpoint
-        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        open(T + "/patched", "a").write(self.path + " " + raw.decode() + "\n")
-        if os.path.exists(T + "/patchfail"):
-            code, body = 422, json.dumps({"message": "Cannot update default branch"}).encode()
-        else:
-            code = 200
-            body = json.dumps({"default_branch": json.loads(raw or b"{}").get("default_branch", "")}).encode()
+    def reply(self, code, obj, extra=None):
+        body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+    def refuse(self, perm):                     # GitHub's own shape for "the token does not cover this"
+        self.reply(403, {"message": "Resource not accessible by personal access token"},
+                   {"X-Accepted-GitHub-Permissions": perm})
+    def flag(self, name):
+        return os.path.exists(T + "/" + name)
+    def do_PATCH(self):                         # the default-branch endpoint
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        open(T + "/patched", "a").write(self.path + " " + raw.decode() + "\n")
+        if self.flag("patchfail"):
+            return self.reply(422, {"message": "Cannot update default branch"})
+        self.reply(200, {"default_branch": json.loads(raw or b"{}").get("default_branch", "")})
+    def do_GET(self):
+        open(T + "/got", "a").write(self.path + "\n")
+        parts = self.path.split("?")[0].strip("/").split("/")
+        if len(parts) == 3 and parts[0] == "repos":   # does this repository already exist? (create asks first)
+            try: have = open(T + "/exists").read().split()
+            except Exception: have = []
+            if self.path in have:
+                return self.reply(200, {"name": parts[2], "full_name": parts[1] + "/" + parts[2]})
+            return self.reply(404, {"message": "Not Found"})
+        if self.flag("deny"):                   # anything else is the api route
+            return self.refuse("pages=write")
+        self.reply(200, {"path": self.path})
+    def do_PUT(self): self.other("PUT")
+    def do_DELETE(self): self.other("DELETE")
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        code = 201
-        if self.path.endswith("/repos"):        # the creation endpoint
-            open(T + "/created", "a").write(self.path + " " + raw.decode() + "\n")
-            body = json.dumps({"name": json.loads(raw or b"{}").get("name", ""),
-                               "clone_url": "http://x/%s" % self.path}).encode()
-        else:                                   # the installation-token endpoint
+        if self.path.endswith("/access_tokens"):     # the installation-token endpoint
             try: n = int(open(T + "/mints").read())
             except Exception: n = 0
             n += 1
@@ -316,13 +480,22 @@ class H(BaseHTTPRequestHandler):
             open(T + "/auth", "w").write(self.headers.get("Authorization", ""))
             open(T + "/path", "w").write(self.path)
             open(T + "/body", "w").write(raw.decode())   # the `repositories` the token was asked to be limited to
-            body = json.dumps({"token": "ghs_fixture%d" % n,
-                               "expires_at": open(T + "/expires").read().strip()}).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            return self.reply(201, {"token": "ghs_fixture%d" % n,
+                                    "expires_at": open(T + "/expires").read().strip()})
+        if self.path.endswith("/repos"):        # the creation endpoint
+            if self.flag("createfail"):         # a token scoped to repositories cannot make one
+                return self.refuse("administration=write")
+            open(T + "/created", "a").write(self.path + " " + raw.decode() + "\n")
+            return self.reply(201, {"name": json.loads(raw or b"{}").get("name", ""),
+                                    "clone_url": "http://x/%s" % self.path})
+        self.other("POST", raw)
+    def other(self, m, raw=None):               # the api route: any operation on a repository
+        if raw is None:
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        open(T + "/called", "a").write(m + " " + self.path + " " + raw.decode() + "\n")
+        if self.flag("deny"):
+            return self.refuse("pages=write")
+        self.reply(201, {"path": self.path})
     def log_message(self, *a): pass
 s = HTTPServer(("127.0.0.1", 0), H)
 open(T + "/port", "w").write(str(s.server_address[1]))
@@ -330,7 +503,7 @@ s.serve_forever()
 PY
   future(){ date -u -d "+$1" +%FT%TZ; }
   d64(){ python3 -c 'import base64,sys;s=sys.stdin.read().strip();sys.stdout.buffer.write(base64.urlsafe_b64decode(s+"="*(-len(s)%4)))'; }
-  echo "$(future '60 minutes')" > "$T/expires"; echo 0 > "$T/mints"
+  echo "$(future '60 minutes')" > "$T/expires"; echo 0 > "$T/mints"; : > "$T/exists"   # nothing is on the fixture's github yet
   python3 "$T/api.py" "$T" & pid=$!
   for _ in $(seq 50); do [ -s "$T/port" ] && break; sleep 0.1; done
   port=$(cat "$T/port" 2>/dev/null); [ -n "$port" ] || { echo "cc-gh-token selfcheck: the fixture API did not start"; return 1; }
@@ -339,6 +512,7 @@ CC_GH_APP_ID=12345
 CC_GH_APP_INSTALL_ID=67890
 CC_GH_APP_KEY=$T/key.pem
 CC_GH_APP_OWNER=myorg
+CC_GH_PERSONAL_OWNER=myself
 CC_GH_API=http://127.0.0.1:$port
 EOF
   # Every case runs the real script with a config, a cache and a mint counter it sets itself.
@@ -490,6 +664,133 @@ EOF
   out=$(CC_CONFIG=/dev/null HOME="$T" "$SELF" create wsa other 2>&1 >/dev/null); rc=$?
   k "$(t test $rc != 0)" "…and a box with no app configured creates nothing"
 
+  # ── the owner's own account: a workspace's door, with his personal token, and nobody else's ──
+  # The fixture's token file is under the fixture's own HOME ($T), and the fixture token has no token SHAPE, so
+  # nothing here holds one (cc-secretary, cc-steward scan for those).
+  ptok="pat_fixture_$$"; mkdir -p "$T/.cc/secrets"; chmod 700 "$T/.cc/secrets"
+  printf '%s\n' "$ptok" > "$T/.cc/secrets/github-personal.token"
+  mkws wsp https://github.com/myself/own-repo.git https://github.com/myorg/org-repo.git
+  mkws wsq https://github.com/myself/other-repo.git   # a second workspace with a repository of its own there
+  echo 0 > "$T/mints"; rm -f "$T"/cache*.json
+  k "$(t test "$(G repos wsp)" = org-repo)" "repos lists a workspace's ORG repositories only: one under the owner's account is not in the app's scope"
+  k "$(t test -z "$(G gitargs https://github.com/myself/own-repo.git)")" "a remote under the owner's account with NO workspace gets nothing: the box's own pushes there are untouched"
+  out=$(G gitargs https://github.com/myself/own-repo.git wsp)
+  k "$(t test "$(sed -n 2p <<<"$out")" = 'credential.helper=')" "a workspace's push to its own repository there resets git's helper list FIRST, so the box's gh login never answers it"
+  k "$(t grep -q -- '--workspace wsp' <<<"$out")" "…and wires this helper up for that workspace"
+  k "$(t grep -qx 'credential.useHttpPath=true' <<<"$out")" "…asking git for the repository too, so the helper can check it again"
+  out=$(G gitargs https://github.com/myself/own-repo.git wsq)
+  k "$(t grep -qx 'credential.helper=' <<<"$out")" "ANOTHER workspace's push there still resets the helper list"
+  k "$(t test -z "$(grep -- '--workspace' <<<"$out")")" "…and gets NO credential: that push stops rather than going through as the box"
+  k "$(t test -z "$(G gitargs https://github.com/myself/x.git plain)")" "a name that is no member workspace gets NOTHING — not even the reset, which alone would leave the box's own push to its own repository with no helper"
+  askp(){ printf 'protocol=https\nhost=github.com\npath=myself/%s.git\n\n' "$2" | G --workspace "$1" get; }
+  out=$(askp wsp own-repo); rc=$?
+  k "$(t test $rc = 0)" "the helper answers a workspace's push to its own repository under the owner's account"
+  k "$(t grep -qx "password=$ptok" <<<"$out")" "…with the token from ~/.cc/secrets/github-personal.token, as the file holds it"
+  k "$(t grep -qx 'username=myself' <<<"$out")" "…as that account's own user"
+  k "$(t test "$(cat "$T/mints")" = 0)" "…and nothing else's: no app token is minted on the way"
+  out=$(askp wsq own-repo 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "asked at the helper for another workspace's repository there, it refuses and prints no credential"
+  k "$(t grep -q wsq "$T/err")" "…saying which workspace was asking"
+  out=$(printf 'protocol=https\nhost=github.com\npath=myself/own-repo.git\n\n' | G get 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "asked with no workspace at all, it refuses: the token is a workspace's door, never the box's"
+  : > "$T/created"
+  out=$(G create wsp myself/new-proj); rc=$?
+  k "$(t test $rc = 0 -a "$out" = https://github.com/myself/new-proj.git)" "create <ws> <owner>/<name> under the owner's account makes the repository and prints the url"
+  k "$(t grep -q '^/user/repos ' "$T/created")" "…through the account's own endpoint, not the org's"
+  k "$(t test "$(jq -r '.private,.name' <<<"$(cut -d' ' -f2- "$T/created")" | tr '\n' ' ')" = "true new-proj ")" "…private, under the name it was asked for"
+  k "$(t test "$(git -C "$T/dev/wsp" remote get-url new-proj)" = https://github.com/myself/new-proj.git)" "…wired as a remote of the workspace, named after itself"
+  k "$(t grep -q -- '--workspace wsp' <<<"$(G gitargs https://github.com/myself/new-proj.git wsp)")" "…so its very next push has the credential"
+  k "$(t test "$(cat "$T/mints")" = 0)" "…and no app token was minted for any of it"
+  : > "$T/created"
+  out=$(G create wsp myself/new-proj); rc=$?
+  k "$(t test $rc = 0 -a "$out" = https://github.com/myself/new-proj.git -a ! -s "$T/created")" "creating it again prints the url and creates nothing"
+  out=$(G create wsq myself/new-proj 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/created")" "another workspace cannot create over a repository that is already someone's there"
+  k "$(t grep -q wsp "$T/err")" "…and is told whose it is"
+  mkws wspnone
+  out=$(G create wspnone myself/first)
+  k "$(t test "$(git -C "$T/dev/wspnone" remote get-url origin)" = https://github.com/myself/first.git)" "a workspace with no remote at all gets its first repository there as origin"
+  : > "$T/created"
+  out=$(G create wsp nobody/x 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/created")" "an owner that is neither the org nor the account creates nothing"
+  k "$(t test -z "$(git -C "$T/dev/wsp" remote get-url x 2>/dev/null)")" "…and adds no remote"
+  # without the file: a refusal that names it, and nothing done
+  mv "$T/.cc/secrets/github-personal.token" "$T/ptok.away"; : > "$T/created"
+  out=$(askp wsp own-repo 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "without the token file a push is refused, with no half credential on stdout"
+  k "$(t grep -q 'github-personal.token' "$T/err")" "…naming the file it wanted"
+  out=$(G create wsp myself/never 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/created")" "…and create says what is missing and creates nothing"
+  k "$(t grep -q 'github-personal.token' "$T/err")" "…naming the file"
+  k "$(t test -z "$(git -C "$T/dev/wsp" remote get-url never 2>/dev/null)")" "…and adds no remote"
+  mv "$T/ptok.away" "$T/.cc/secrets/github-personal.token"
+  # ── a repository he already made is WIRED, not created: that is the shape his token actually has ──
+  : > "$T/created"; : > "$T/got"; echo /repos/myself/already-there > "$T/exists"
+  mkws wsr
+  out=$(G create wsr myself/already-there); rc=$?
+  k "$(t test $rc = 0 -a "$out" = https://github.com/myself/already-there.git)" "create wires a repository that is ALREADY under the owner's account and prints its url"
+  k "$(t grep -qx /repos/myself/already-there "$T/got")" "…having asked GitHub for it first, which is the question a scoped token can answer"
+  k "$(t test ! -s "$T/created")" "…and created nothing: a repository that exists is not made twice"
+  k "$(t test "$(git -C "$T/dev/wsr" remote get-url origin)" = https://github.com/myself/already-there.git)" "…wired as the workspace's origin, so its next push has somewhere to go"
+  k "$(t grep -q -- '--workspace wsr' <<<"$(G gitargs https://github.com/myself/already-there.git wsr)")" "…and that push carries the credential"
+  : > "$T/exists"
+  # ── a token that may not create says what the owner does, and wires nothing ──
+  : > "$T/created"; touch "$T/createfail"
+  out=$(G create wsp myself/refused 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/created")" "a create GitHub refuses is a failure, not a silent success"
+  k "$(t grep -q 'Resource not accessible' "$T/err")" "…saying what GitHub said"
+  k "$(t grep -q "repository list" "$T/err")" "…and the steps the owner takes: make it, add it to the token's repository list, run this again"
+  k "$(t test -z "$(git -C "$T/dev/wsp" remote get-url refused 2>/dev/null)")" "…and no remote is wired to a repository that was never made"
+  rm -f "$T/createfail"
+  # ── every OTHER operation on a repository the workspace owns: the same door, the same ownership rule ──
+  : > "$T/called"
+  out=$(G api wsp POST /repos/myself/own-repo/pages '{"build_type":"workflow"}'); rc=$?
+  k "$(t test $rc = 0)" "api makes an operation the token allows on a repository the workspace owns — Pages here, and by the same route Actions, branches, releases, settings"
+  k "$(t grep -q '^POST /repos/myself/own-repo/pages .*build_type' "$T/called")" "…as that request, on that repository, with the body it was given"
+  k "$(t grep -q '"path"' <<<"$out")" "…and prints what GitHub answered"
+  k "$(t test "$(cat "$T/mints")" = 0)" "…with no app token minted on the way"
+  : > "$T/called"; printf 'this-file-is-not-a-request-body\n' > "$T/bait"
+  out=$(G api wsp POST /repos/myself/own-repo/pages "@$T/bait" 2>/dev/null)
+  k "$(t grep -qF -- "@$T/bait" "$T/called")" "a body starting with @ is sent as those very characters: curl reads one as a FILENAME, and a payload naming a key would otherwise send that file off the box"
+  : > "$T/called"
+  out=$(G api wsq POST /repos/myself/own-repo/pages 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/called")" "ANOTHER workspace's repository there is refused before anything is sent"
+  k "$(t grep -q wsq "$T/err")" "…saying which workspace was asking"
+  out=$(G api wsp GET /repos/myorg/org-repo 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/called")" "…and so is a repository outside the owner's own account: this route is that account's"
+  out=$(G api wsp GET /user 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/called")" "…and any path that is not a repository's at all"
+  out=$(G api wsp GET /repos/myself/own-repo/../../../user 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/called")" "…and one walking out of the repository with .., which would pass a check made on the prefix alone"
+  out=$(G api wsp SNEAK /repos/myself/own-repo 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/called")" "…and a method this route does not make"
+  # THE REFUSAL THAT MATTERS: the owner has to learn WHICH permission to add, not that something went wrong.
+  touch "$T/deny"
+  out=$(G api wsp POST /repos/myself/own-repo/pages 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a -z "$out")" "an operation the token does not cover fails, printing no response body"
+  k "$(t grep -q 'pages=write' "$T/err")" "…naming the exact permission from GitHub's own X-Accepted-GitHub-Permissions header, so the owner adds that one"
+  k "$(t grep -q 'Resource not accessible' "$T/err")" "…alongside what GitHub said"
+  rm -f "$T/deny"
+  # without the file: nothing is sent, and the refusal names it
+  mv "$T/.cc/secrets/github-personal.token" "$T/ptok.away"; : > "$T/called"
+  out=$(G api wsp POST /repos/myself/own-repo/pages 2>"$T/err"); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/called")" "without the token file the operation is refused and nothing is sent"
+  k "$(t grep -q 'github-personal.token' "$T/err")" "…naming the file it wanted"
+  mv "$T/ptok.away" "$T/.cc/secrets/github-personal.token"
+  # without the key: none of this exists
+  grep -v '^CC_GH_PERSONAL_OWNER=' "$T/config" > "$T/config.nopersonal"
+  k "$(t test -z "$(CC_CONFIG="$T/config.nopersonal" HOME="$T" "$SELF" gitargs https://github.com/myself/own-repo.git wsp)")" "with no CC_GH_PERSONAL_OWNER that remote gets nothing, even from the workspace that names it"
+  out=$(CC_CONFIG="$T/config.nopersonal" HOME="$T" "$SELF" create wsp myself/x 2>/dev/null); rc=$?
+  k "$(t test $rc != 0)" "…and create refuses that owner"
+  : > "$T/called"
+  out=$(CC_CONFIG="$T/config.nopersonal" HOME="$T" "$SELF" api wsp GET /repos/myself/own-repo 2>/dev/null); rc=$?
+  k "$(t test $rc != 0 -a ! -s "$T/called")" "…and api has no account to reach at all"
+  # the org path is what it was: a personal remote is not in the app token's list
+  : > "$T/body"; rm -f "$T"/cache*.json
+  out=$(askws wsp org-repo)
+  k "$(t test "$(jq -c .repositories "$T/body")" = '["org-repo"]')" "an app token for that workspace is still minted for its ORG repositories alone — the personal remote is not in the list"
+  k "$(t test -z "$(grep -F "$ptok" <<<"$out")")" "…and the org push is not handed the personal token"
+
   # ── a repository opens on the project's base, never on the branch that arrived first ──
   : > "$T/patched"; rm -f "$T"/cache*.json; echo 0 > "$T/mints"; : > "$T/body"
   out=$(G default wsa proj-x main 2>"$T/err"); rc=$?
@@ -513,6 +814,8 @@ EOF
   tok=$(ask | sed -n 's/^password=//p')
   k "$(t test "$(grep -rl -F -- "$tok" "$T" 2>/dev/null)" = "$T/cache.json")" \
      "the minted token is in the mode-600 cache and in NO other file the mint touched — no log, no journal, no board row"
+  k "$(t test "$(grep -rl -F -- "$ptok" "$T" 2>/dev/null)" = "$T/.cc/secrets/github-personal.token")" \
+     "the personal token is in its own file and in NO other file anything above touched"
   echo "cc-gh-token selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
 }
@@ -525,6 +828,7 @@ case "${1:-}" in
   repos)          shift; [ $# -eq 1 ] || { echo "$USAGE" >&2; exit 2; }
                   ws_repos "$1" || die "$1 is not a member workspace (~/dev/$1/.cc/member-workspace)" ;;
   create)         shift; [ $# -eq 2 ] || { echo "$USAGE" >&2; exit 2; }; create "$1" "$2" ;;
+  api)            shift; [ $# -ge 3 ] && [ $# -le 4 ] || { echo "$USAGE" >&2; exit 2; }; gh_api "$1" "$2" "$3" "${4:-}" ;;
   default)        shift; [ $# -eq 3 ] || { echo "$USAGE" >&2; exit 2; }; set_default "$1" "$2" "$3" ;;
   get)            helper_get ;;
   store|erase)    exit 0 ;;   # git's protocol requires both; nothing here stores or forgets on git's say-so
