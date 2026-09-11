@@ -52,7 +52,9 @@
                                                   step closes the PR's own row and every row its body names
                                                   with `Closes <row>` (`Closes a, b and c` — commas, `and`, or
                                                   both; anywhere in the body, so the brief's own sentence counts);
-                                                  a row a person holds or a track is live on is left open and said
+                                                  a row a person holds or a track is live on is left open and
+                                                  said, while one a session is doing in a SUBAGENT (cc-board's
+                                                  `agent` mark, which has no landing of its own) is closed
   cc-land cancel <repo> <pr> --reason "<why>"     take a queued job out, on the record: the reason goes in the
                                                   ledger. A job a running sweep is landing right now is refused
   cc-land status <repo> <pr>                      is this PR being landed, by ANY path: the queue job, a direct
@@ -2877,13 +2879,26 @@ class Land:
                 if re.search(r"[-_0-9]", r):
                     unknown.append(r)
                 continue
-            if rows[r].get("held") or rows[r].get("status") in ("running", "review"):
+            # A SUBAGENT'S ROW IS NOT A TRACK'S. The skip below is for a row whose OWN landing will close it — a
+            # worker is in its worktree, its PR is on the way. A row carrying cc-board's `agent` mark has no such
+            # landing: the mark says a session is doing the row in its own subagent (no worker, no cc-loop, no
+            # track), and cc-reconcile turns that mark into `running` — the only reason the row reads running at
+            # all. PR #434 (2026-09-11) said `Closes raised-an-owner-kept-unit-runs-old-code-unasked` and the row
+            # stayed open past its fix: the subagent's PR carried another row's name, so that Closes line was the
+            # only closer there would ever be, and it was the one skipped.
+            mark = (rows[r].get("agent") or "").strip()
+            if rows[r].get("held") or (rows[r].get("status") in ("running", "review") and not mark):
                 held.append(r)                # a person is sitting on it, in their own words, or a track is live on
                 continue                      # it and its own landing will close it: not this pass's to close
             rc, o = sh([f"{BIN}/cc-board", "status", self.project, r, "done"])
             if rc:
                 raise Failed(f"cc-board status {r}: {last(o)}")
             sh([f"{BIN}/cc-board", "note", self.project, r, f"closed by cc-land: {self.what()} says Closes {r}"])
+            if mark:
+                # …and the mark goes back with it. `agent ''` hands the row over from anywhere (cc-board agent_id);
+                # a mark left on a closed row is a claim on work that is in, and the next session to read the board
+                # sees a row somebody is still on. Cosmetic if it fails — the row is closed either way.
+                sh([f"{BIN}/cc-board", "set", self.project, r, "agent", ""])
             closed.append(r)
         if closed:
             line += f"; closes {', '.join(closed)}"
@@ -7400,23 +7415,44 @@ def cmd_selfcheck():
     BOARD[0]["tracks"]["raised-e"]["status"] = "running"   # a track is live on it: its own landing closes it
     L.facts["body"] = "the brief. Closes raised-a, raised-b, raised-c, raised-d, raised-e and raised-zz. BOUNDARIES: none"
     said = L.close_board()
+    # ran_sub, never ran, for every assertion here: `ran` matches argv[0] too, and argv[0] is the path this
+    # checkout happens to sit at — a worktree named after the row being fixed (`raised-a…`) made the control
+    # below pass on its own directory name, and go red (2026-09-11).
     check("a landing closes every row the PR body names with `Closes`: each open one is set `done` with a note "
           "naming the PR, the track's own row is `merged` as before, a row already closed is left as it is, a row a "
           "person is sitting on (`held`) or a track is live on (`running`) is left open and said, and a name the "
           "board does not have is SAID rather than skipped — the typo is the difference between a row closed and a "
           "row a person re-dispatches (PR #422)",
           "-> merged; closes raised-a, raised-b" in said and "no row on the board: raised-zz" in said
-          and "left open: raised-d, raised-e" in said and ran("cc-board", "status", "myrepo", "w1", "merged")
-          and ran("cc-board", "status", "myrepo", "raised-a", "done") and ran("cc-board", "status", "myrepo", "raised-b", "done")
-          and not ran("cc-board", "status", "myrepo", "raised-c") and not ran("cc-board", "status", "myrepo", "raised-d")
-          and not ran("cc-board", "status", "myrepo", "raised-e") and not ran("cc-board", "status", "myrepo", "raised-zz")
+          and "left open: raised-d, raised-e" in said and ran_sub("cc-board", "status", "myrepo", "w1", "merged")
+          and ran_sub("cc-board", "status", "myrepo", "raised-a", "done") and ran_sub("cc-board", "status", "myrepo", "raised-b", "done")
+          and not ran_sub("cc-board", "status", "myrepo", "raised-c") and not ran_sub("cc-board", "status", "myrepo", "raised-d")
+          and not ran_sub("cc-board", "status", "myrepo", "raised-e") and not ran_sub("cc-board", "status", "myrepo", "raised-zz")
           and ran_sub("cc-board", "note", "myrepo", "raised-a", "Closes raised-a"))
     L = row_for("7", "track/w1", rows=("w1", "raised-a"))
     L.facts["body"] = "this closes the fd and Closes w1 itself; #422's Closes line left two rows queued"
     said = L.close_board()
     check("...and the control: prose that `closes` something, a Closes naming the PR's own row, or prose ABOUT the "
           "contract ('Closes line') closes no other row and says nothing — only a row-shaped name is reported unknown",
-          said == "board: myrepo/w1 -> merged" and not ran("cc-board", "status", "myrepo", "raised-a"))
+          said == "board: myrepo/w1 -> merged" and not ran_sub("cc-board", "status", "myrepo", "raised-a"))
+    # A ROW A SUBAGENT WORKED IS NOT A ROW A TRACK IS LIVE ON. PR #434 (2026-09-11) carried "Closes
+    # raised-an-owner-kept-unit-runs-old-code-unasked" and the row stayed open: it read `running` only because the
+    # planning seat had marked it `agent me` (cc-board: a session doing the row in its own subagent, no worker, no
+    # track), which cc-reconcile turns into `running`. There was no landing of its own coming — the subagent's PR
+    # carried another row's name — so the Closes line was the only closer, and it was the one skipped.
+    L = row_for("7", "track/w1", rows=("w1", "raised-a", "raised-b"))
+    BOARD[0]["tracks"]["raised-a"]["agent"] = "@7:4210"                  # a session's subagent has this one
+    BOARD[0]["tracks"]["raised-a"]["agent_at"] = "2026-09-11T16:29:00Z"
+    L.facts["body"] = "the brief. Closes raised-a and raised-b."
+    said = L.close_board()
+    check("a row that is `running` only because a session marked it `agent me` has no landing of its own to close "
+          "it: the Closes line closes it and hands the mark back — while a row a real track is live on is still "
+          "left open for its own landing (PR #434)",
+          "closes raised-a" in said and "left open: raised-b" in said
+          and ran_sub("cc-board", "status", "myrepo", "raised-a", "done")
+          and ran_sub("cc-board", "set", "myrepo", "raised-a", "agent")
+          and not ran_sub("cc-board", "status", "myrepo", "raised-b")
+          and not ran_sub("cc-board", "set", "myrepo", "raised-b", "agent"))
 
     # 8. the no-PR path — the one that left a track open for half an hour
     L = fresh(track="w1", note="settings edit outside the repo")
