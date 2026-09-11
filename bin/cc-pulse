@@ -101,10 +101,14 @@ the recovery, the finding is what was missing. It is a PLANNING SEAT's catch onl
 tick — a never-started orch is its channel's to notice, and that is the price of not pulsing one at all. See
 never_started().
 
-THREE SWITCHES, because a loop that wakes the whole machine must be stoppable by whoever it wakes:
+FOUR SWITCHES, because a loop that wakes the whole machine must be stoppable by whoever it wakes:
   CC_PULSE=0 in ~/.cc/config   the drive loop is off — no run does anything, dry or not
   ~/.cc/state/<target>/pulse.off   that one target is left alone; everything else still runs
   cc-pause on <repo>           that whole project is parked — its repo, its tracks and its orchs, not one target
+  cc-tier set stop             the box-wide spend tier: nobody is woken or started, one log line per target.
+                               Under `essential` a queued row counts as startable only when cc-tier says so (a
+                               row marked critical, one at a time) and the once-a-day goals look-up waits; the
+                               rows the tier holds are named in the tick, and `cc-tier allows` is the one reading.
 
 THE GAP IS SHORTER THAN THE PERIOD ON PURPOSE (CC_PULSE_GAP_MIN in ~/.cc/config, default 90 min against a 2 h
 timer). Equal, and a run that starts a second later than the one before it measures 1 h 59 m since its own last
@@ -607,15 +611,23 @@ def due(target):
     board = [(k, r.get("status") or "queued")       # cc-board's own default for a row written without one
              for k, r in rows.items() if kind(r) != SESSION_ROW]
     ready = sorted(k for k, st in board if st in BOARD_DUE and k not in taken)
+    # …AND ONLY THE ROWS THE SPEND TIER LETS START. Under `essential` that is the rows marked critical, and none
+    # while any row on any board is running (one at a time); cc-tier reads both off the boards. A row the tier
+    # holds is not "queued/blocked" work waiting on the seat — waking a seat to be told a row it may not start
+    # is the wake this tier exists to cut — so it is left out of `ready` and `stopped` alike, and the note below
+    # says how many wait and why. Under moderate and autonomous cc-tier answers yes for every row, and this is a
+    # no-op that costs one cheap call per queued row.
+    waits = sorted(k for k in ready if not tier_allows("start", f"{repo}/{k}"))
+    ready = [k for k in ready if k not in waits]
     # …and the same rows WITH the word each is wearing, for the look below. The note prints them bare to stay
     # one line, and bare is not enough to compare on: `queued` → `blocked` is a row that stopped, and reading
     # that as unchanged would hold the wake that says so.
-    ready_st = sorted(f"{k} {st}" for k, st in board if st in BOARD_DUE and k not in taken)
+    ready_st = sorted(f"{k} {st}" for k, st in board if st in BOARD_DUE and k not in taken and k not in waits)
     # …and the ones that STOPPED. The brief: "a decision-class event (red main, a stopped landing, an ask past
     # its line) must still reach the seat within one tick as today". `blocked` is the word a stop wears —
     # cc-reconcile writes it for a row with no worker and nothing saying why — and a stop is a decision for the
     # seat whatever cc-brief thinks of the row's files, so it is read here and not through the room arithmetic.
-    stopped = sorted(k for k, st in board if st == "blocked" and k not in taken)
+    stopped = sorted(k for k, st in board if st == "blocked" and k not in taken and k not in waits)
     # …AND WHICH OF THOSE COULD ACTUALLY BE STARTED RIGHT NOW. A count of queued rows is not an answer to "is
     # there room": the width is capped by one writer per file, and working out which rows collide with nothing
     # in flight was left to whoever happened to look. Fifteen changes landed in seven hours while twenty rows
@@ -648,9 +660,12 @@ def due(target):
             # row to give a branch to — so it wakes; no answer at all is no room, and wakes nobody.
             start = "free" if "could start now" in could else "withheld" if could else "none"
     aloft = sorted(f"{k} {st}" + (" (on hold)" if k in on_hold else " (a subagent has it)" if k in held else "")
-                   for k, st in board if k not in ready and st not in DONE_ROW)
+                   for k, st in board if k not in ready and k not in waits and st not in DONE_ROW)
+    tier = tier_line() if waits or not tier_allows("goals") else ""   # named only when it changes what the seat may do
     note = " · ".join(filter(None, [
+        tier,
         "main-gate row RED" if red else "",
+        f"{len(waits)} row{'' if len(waits) == 1 else 's'} the tier holds ({', '.join(waits[:3])})" if waits else "",
         (f"{asks} owner ask{'' if asks == 1 else 's'} open" if asks > 0 else
          "cc-scope could not count the open asks" if asks < 0 else ""),
         f"{len(ready)} row{'' if len(ready) == 1 else 's'} queued/blocked ({', '.join(ready[:3])})" if ready else "",
@@ -714,6 +729,12 @@ def due(target):
     # the drive loop. The floor is measured against the last TICK and not against the look, because on this
     # path the look moves for reasons none of which are worth a turn — a row's word changing from `running` to
     # `review` is a thing the seat can read later, out of the ledger, on a wake it was getting anyway.
+    # …UNLESS THE SPEND TIER SAYS THE SEAT MAY NOT TAKE ON WORK IT FINDS ITSELF (`cc-tier allows goals`: no under
+    # stop and essential). The goals look-up is exactly that lifting of the head, so under those tiers it is not
+    # wanted and this is one log line, wake or no wake — the seat still hears every actionable thing above.
+    if not tier_allows("goals"):
+        return (False, f"{tier} — nothing to act on, and the goals look-up waits for a wider tier", note, anything,
+                look, False, False)
     floor = conf("CC_PULSE_IDLE_H", IDLE_H) * 3600
     last = last_tick(target)
     if floor and last and now() - last < floor:
@@ -811,6 +832,23 @@ def paused(target):
         return False
 
 
+def tier_allows(what, row=""):
+    """The box-wide spend tier (`cc-tier allows <what> [<repo>/<row>]`): exit 1 is "wait", exit 0 is "go", and a
+    cc-tier that cannot answer — absent, a crash, a timeout — is "go", exactly as `paused` treats cc-pause: a tier
+    nobody can read is never the reason the drive loop stops working. cc-tier owns the table; this reads its exit."""
+    try:
+        return subprocess.run([f"{BIN}/cc-tier", "allows", what] + ([row] if row else []), stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=10).returncode != 1
+    except Exception:
+        return True
+
+
+def tier_line():
+    """`cc-tier line`, for the tick and the log — or nothing on a box that cannot answer it."""
+    out = sh(f"{BIN}/cc-tier", "line", timeout=10)
+    return (out.stdout or "").strip() if out is not None and out.returncode == 0 else ""
+
+
 def opted_out(target):
     """`touch ~/.cc/state/<target>/pulse.off` and the pulse leaves that one alone. A session that wants to be
     left alone, or an owner who wants one repo quiet, must not have to switch the whole drive loop off."""
@@ -828,6 +866,13 @@ def pulse(target, r):
     # ensure_goals, which is the one file the pulse writes into a parked project's state dir.
     if paused(target):
         r.log(target, "skip", f"paused — `cc-pause off {repo}` puts the whole project back")
+        return
+    # THE SPEND TIER `stop` (cc-tier): "nothing starts … the planning seat answers the owner only". A tick is a
+    # full-context turn and a start is a session; neither is the owner asking, so under stop the loop wakes and
+    # starts nobody and says so once per target. A message from the owner still reaches the seat through cc-slack,
+    # which is not this loop. Below the pause on purpose — a pause is the narrower, louder fact about one project.
+    if not tier_allows("pulse"):
+        r.log(target, "skip", f"{tier_line() or 'spend tier stop'} — nobody is woken or started; `cc-tier set` a wider tier")
         return
     # AN ORCH IS NOT PULSED AT ALL. It is a project a person steers in its own channel, and it is woken by the
     # two things that actually carry its work: a message in that channel, and its own workers reporting back.
@@ -1066,7 +1111,7 @@ def selfcheck():
             os.makedirs(d, exist_ok=True)
         for name, body in (("tmux", FAKE_TMUX), ("cc", FAKE_CC), ("cc-msg", FAKE_MSG), ("cc-handoff", FAKE_HANDOFF),
                            ("cc-limit", FAKE_LIMIT), ("cc-scope", FAKE_SCOPE), ("cc-pause", FAKE_PAUSE),
-                           ("cc-broker", FAKE_BROKER), ("cc-brief", FAKE_BRIEF),
+                           ("cc-broker", FAKE_BROKER), ("cc-brief", FAKE_BRIEF), ("cc-tier", FAKE_TIER),
                            ("cc-context", FAKE_CONTEXT), ("ps", FAKE_PS)):
             open(f"{BIN}/{name}", "w").write(body)
             os.chmod(f"{BIN}/{name}", 0o755)
@@ -1086,6 +1131,9 @@ def selfcheck():
                           # block at the end turns it on and is the only place that tests it.
                           CC_FAKE_ASKS="0", CC_FAKE_ASKS_OLD="0", CC_FAKE_SCOPE_BROKEN="",
                           CC_PULSE_QUIET="0", CC_FAKE_PAUSED="",
+                          # …and the spend tier autonomous (the default) with no row critical, for every case
+                          # that is not about the tier: the block that is sets both and clears both.
+                          CC_FAKE_TIER="", CC_FAKE_CRITICAL="",
                           # …and the once-a-day floor OFF (CC_PULSE_IDLE_H=0), for the same reason: a case that
                           # runs the same board twice is decided by the rule it is about. The block at the end
                           # turns it on and is the only place that tests it.
@@ -1782,6 +1830,43 @@ def selfcheck():
            "lifted by the person who set it, and a wake cannot do it",
            "msg beta " not in d and "nothing to act on" in L)
 
+        # ---- THE SPEND TIER (cc-tier), one case per tier, each on the same two-row board so the tier is the only
+        # thing that differs. The stub answers `allows` the way the real table does (cc-tier's own selfcheck pins
+        # that table); what is under test here is that the pulse ASKS, per row, and honours the exit.
+        ticked(10)
+        if os.path.exists(f"{calls}.brief"):
+            os.remove(f"{calls}.brief")             # the earlier (2) cases asked cc-brief; these read only their own asks
+        os.environ.update(CC_FAKE_TIER="stop", CC_FAKE_CRITICAL="beta/t1",
+                          CC_FAKE_READY="beta: 2 of 2 queued rows could start now (t1, t2)")
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "blocked"}})
+        ok("stop: nobody is woken and nothing is started, whatever the board says — a critical row, a stopped "
+           "row and cc-brief's yes included — and the log names the tier",
+           "msg beta " not in d and "cc " not in d and not os.path.exists(f"{calls}.brief") and "spend tier: stop" in L)
+        ticked(10)
+        os.environ.update(CC_FAKE_TIER="essential", CC_FAKE_READY="beta: 1 of 1 queued rows could start now (t1)")
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}})
+        ok("essential: the critical row is startable and the tick carries it, the plain row is named as held by "
+           "the tier, and the tick says which tier",
+           "msg beta " in d and "1 row queued/blocked (t1)" in d and "1 row the tier holds (t2)" in d
+           and "spend tier: essential" in d)
+        ok("…and cc-brief was asked about the critical row alone — a row the tier holds is not room",
+           open(f"{calls}.brief").read() == "brief ready beta t1\n")
+        os.remove(f"{calls}.brief")
+        ticked(10)
+        os.environ.update(CC_FAKE_CRITICAL="", CC_FAKE_READY="")
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}})
+        ok("essential: with no row critical nothing is startable, nobody is woken, and the goals look-up waits "
+           "for a wider tier — taking on work it finds itself is what essential stops",
+           "msg beta " not in d and "goals look-up waits" in L)
+        ticked(10)
+        os.environ.update(CC_FAKE_TIER="moderate", CC_FAKE_READY="beta: 2 of 2 queued rows could start now (t1, t2)")
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}})
+        ok("moderate: control — both plain rows are startable and nothing is named as held; what moderate holds "
+           "is the seat's own judgement (WORKING.md), not a row",
+           "msg beta " in d and "2 rows queued/blocked (t1, t2)" in d and "the tier holds" not in d
+           and "spend tier" not in d)
+        os.environ.update(CC_FAKE_TIER="", CC_FAKE_CRITICAL="", CC_FAKE_READY="")
+
         ticked(10)
         d, L = decide({"t1": {"status": "merged"}}, asks="1", old="1")
         ok("(2) an owner ask that has waited PAST ITS LINE wakes the seat",
@@ -1969,6 +2054,7 @@ FAKE_BRIEF = r"""#!/usr/bin/env bash
 # $CC_FAKE_BRIEF_BROKEN is the tool DEAD ON ITS FEET — a non-zero exit with a word about it on stderr, which is
 # not the same fact as "no queued row could start" and must never be read as one.
 set -u
+printf 'brief %s\n' "$*" >> "$CC_FAKE_CALLS.brief"   # which rows it was asked about: a file of its own, read by the tier cases alone
 if [ -n "${CC_FAKE_BRIEF_BROKEN:-}" ]; then echo "cc-brief: no such board" >&2; exit 1; fi
 [ "${1:-}" = ready ] || exit 0
 [ -n "${CC_FAKE_READY:-}" ] && printf '%s\n' "$CC_FAKE_READY"
@@ -1992,6 +2078,27 @@ set -u
 t="${2:-}"; t="${t%%/*}"; t="${t%%@*}"
 case " ${CC_FAKE_PAUSED:-} " in *" $t "*) exit 0;; esac
 exit 1
+"""
+
+FAKE_TIER = r"""#!/usr/bin/env bash
+# selfcheck stub for `cc-tier`: $CC_FAKE_TIER is the tier (empty = autonomous), $CC_FAKE_CRITICAL the rows marked
+# critical. `allows` answers the real table by exit code — 0 go, 1 wait — because that exit is the contract the
+# pulse reads; the table itself is proved by cc-tier's own selfcheck, not here. `line` prints the real shape.
+set -u
+t="${CC_FAKE_TIER:-autonomous}"
+case "${1:-}" in
+  "") echo "$t"; exit 0;;
+  line) echo "spend tier: $t — fixture"; exit 0;;
+  allows) ;;
+  *) exit 2;;
+esac
+case "$t" in
+  stop) exit 1;;
+  essential) case "${2:-}" in gates|pulse) exit 0;; goals|explore) exit 1;;
+               start|continue) case " ${CC_FAKE_CRITICAL:-} " in *" ${3:-} "*) exit 0;; esac; exit 1;; esac;;
+  moderate) [ "${2:-}" = explore ] && exit 1; exit 0;;
+  *) exit 0;;
+esac
 """
 
 FAKE_CONTEXT = r"""#!/usr/bin/env bash

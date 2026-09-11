@@ -3,3 +3,4 @@ FEWEST WAKE-UPS. A monitor, watch or notifier fires on TERMINAL states only, and
 SMALLEST CONTEXT. Hand off at about 150k tokens of context — `cc-context` gives the count, and on a large window that is well before it calls a handoff due. Send a large read to a subagent and keep its answer, not the files.
 CHEAPEST MODEL THAT HOLDS QUALITY. Sonnet for a change that fits one file and a dozen lines; the strongest available only where the work spans tools, touches a gate or a sandbox boundary, or needs its failure path reasoned through.
 ONE REVIEW READ PER HEAD, and none where the landing will read it. Record the verdict you already bought rather than buying the same diff read twice.
+THE SPEND TIER IS THE OWNER'S DIAL. `cc-tier` says it — stop, essential, moderate or autonomous — and WORKING.md's "the spend tier" section says what each lets you take on; when he says one of those words to a planning seat, that seat runs `cc-tier set <word>` and answers in one line.

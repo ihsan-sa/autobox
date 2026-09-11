@@ -2,6 +2,7 @@
 # selftest.sh — end-to-end test of the cc layer against a throwaway local repo (bare "remote"). No API calls:
 export CC_NOTIFY_LOG_ONLY=1   # never push to the owner from tests
 export CC_LIMIT_MIN_WAIT=1    # cc-limit test hook: any 'wait until the usage limit resets' is capped at 1 s
+export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never colours a fixture: each --go below must start
 # claude is stubbed (CC_CLAUDE). Safe to run anytime, INCLUDING alongside other copies of itself from other
 # worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait (see the slots below)
 # and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
@@ -405,6 +406,17 @@ rm -f ~/.cc/state/$REPO/c1/.lock
   && [ "$(cat "$decoy")" = "do not touch" ] && [ -z "$(wins "$REPO/c1")" ]; } \
   && ok "a link planted at a track's done.lock or its state lock is refused — the file it named is untouched" \
   || bad "cc wrote through a planted lock: done rc=$k1 go rc=$k2 decoy='$(cat "$decoy")' $(cat "$T/lk1.out" "$T/lk2.out")"
+# THE SPEND TIER refuses --go HERE, before any window opens: the dispatcher — cc-land's fix round, the planning seat —
+# must hear exit 1, not "worker started" for a loop that dies at its door (review of #414). The planted lock is the
+# control: under autonomous the same command gets PAST the tier and the lock stops it instead, so no window either way.
+ln -sf "$decoy" ~/.cc/state/$REPO/c1/.lock
+CC_SPEND_TIER=stop "$B/cc" $REPO c1 --go "" >"$T/tier1.out" 2>&1; tr1=$?
+CC_SPEND_TIER=autonomous "$B/cc" $REPO c1 --go "" >"$T/tier2.out" 2>&1; tr2=$?
+rm -f ~/.cc/state/$REPO/c1/.lock
+{ [ "$tr1" = 1 ] && grep -q 'waits' "$T/tier1.out" && ! grep -q 'symlink' "$T/tier1.out" \
+  && [ "$tr2" != 0 ] && grep -q 'symlink' "$T/tier2.out" && ! grep -q 'waits' "$T/tier2.out" && [ -z "$(wins "$REPO/c1")" ]; } \
+  && ok "cc --go is refused by the spend tier before any window opens (exit 1, 'waits'); under autonomous the same command gets past it" \
+  || bad "tier gate on --go: stop rc=$tr1 '$(cat "$T/tier1.out")' autonomous rc=$tr2 '$(cat "$T/tier2.out")'"
 { env PATH="$T/ghc:$PATH" CC_SLACK="$T/ccslack/cc-slack" "$B/cc" done $REPO c1 >"$T/lk3.out" 2>&1 \
   && [ ! -L ~/.cc/worktrees/$REPO/c1/.cc/done.lock ]; } \
   && ok "…and with plain files back at those names the same command runs as before" \

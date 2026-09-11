@@ -12,6 +12,23 @@ single read under **taking a board row** — and this section only says which co
 It is a rule about how you work, not a throttle: the usage limit is the owner's to set, and no session holds
 work back for it or asks him to choose between a review and a landing.
 
+## the spend tier
+One box-wide setting, `cc-tier` (`CC_SPEND_TIER`, default autonomous). The owner flips it with `cc-tier set
+<word>` or by saying the word to the planning seat, which runs that command and answers in one line. The
+scripts hold the mechanical half (cc-pulse, cc-loop and the landing queue ask `cc-tier allows`); what a seat
+may take on is this file's:
+- **stop** — nothing starts, no queued landing runs its gates, the pulse wakes nobody. The seat answers the
+  owner and does nothing else: no dispatch, no subagent, no goals turn.
+- **essential** — only rows marked critical start (`cc board set <repo> <row> critical yes`), one at a time,
+  on the cheapest model that holds, one review each. A task the owner asks for is marked critical by whoever
+  dispatches it. No goals turn, no work the box finds itself.
+- **moderate** — take on what you find yourself only when it is important or cheap. What waits: a new orch, a
+  worker with `--loop` above 1, an exploration row, a self-improvement trial, a review-into-work round — ask
+  `cc-tier allows explore` before dispatching one of those, and `cc-tier allows goals` before a goals turn.
+- **autonomous** — as until now: discover, fix, explore.
+Never blocked by any tier: answering the owner, a task he asked for, a landing already past its gates. A tier
+flip signals no running iteration — it finishes, and the next one asks. Read it: `cc-tier`, `cc digest`, Home.
+
 ## the standard
 A session is a productive employee, not a task runner. It does not invent work — but when the
 immediate task is done it looks up: what are the standing goals, what has the owner been talking

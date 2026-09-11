@@ -57,6 +57,8 @@
 #     | 5 errors | 6 step limit with nothing committed | 7 capped twice with no progress | 9 runaway (spending without producing — see above) | 10 every model on the chain refused
 #     | 11 the whole project is paused (`cc-pause on <repo>`), board `queued`, nobody notified — the owner parked it himself
 #     | 12 completion has no usable receipt, board `blocked` (notified); delivery is unconfirmed
+#     | 13 the spend tier (`cc-tier`) holds it at the next iteration — stop, or essential with no `critical` on the row — board `queued`, nobody notified;
+#       at dispatch the same tier is exit 2 before anything runs
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
 # Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
@@ -319,7 +321,12 @@ tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation f
   # writes the event down BEFORE it sends anything, so its own 60 s flush delivers what this gave up waiting for.
   # The cost of the timeout is therefore a duplicate — a page AND a late wake — and never a dropped stop.
   timeout 30 "$BIN/cc-broker" inject --no-start --source loop "$repo" "$1" >/dev/null 2>&1; }
-stop_prio(){ [ "$1" = yes ] && echo low || echo high; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
+stop_prio(){ [ "$1" = yes ] && echo low || echo high; }
+tier_hold(){   # $1 start|continue · $2 repo/track -> 0 the spend tier says this must WAIT, 1 it may go. cc-tier owns the
+               # table (`cc-tier allows`); this reads its exit alone: 1 is "wait", 0 is "go", and anything else — no
+               # cc-tier on this box, a crash — is "go", the same leniency `cc-pause is` gets: a tier that cannot be
+               # read must never be the reason a worker stops.
+  "$BIN/cc-tier" allows "$1" "$2" >/dev/null 2>&1; [ $? = 1 ]; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
 selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the model it moves to, what it does with
                # an iteration that was rerouted but still worked (F4), and the line it journals.
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
@@ -609,6 +616,13 @@ down still leaves the board write and the updates line, which is the half of thi
   t 'control: with the mail capability gone, the worker prompt fails that same test' "$(mails "$mgone")" no
   t '…and the mail capability is said once too: no line of it is pasted into this script' \
     "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$mtext"; echo "$dup")" no
+  # THE SPEND TIER'S ANSWER IS READ OFF ITS EXIT ALONE: 1 holds, 0 goes, and a cc-tier that cannot answer (absent,
+  # crashed) is "go" — the leniency `cc-pause is` has, so a tier nobody can read is never what stops a worker.
+  mkdir -p "$d/tbin"; printf '#!/bin/sh\n[ "$3" = r/held ] && exit 1; [ "$3" = r/broken ] && exit 3; exit 0\n' > "$d/tbin/cc-tier"; chmod +x "$d/tbin/cc-tier"
+  t 'a row the tier says must wait is held'        "$(BIN="$d/tbin"; tier_hold start r/held && echo held || echo go)"  held
+  t 'a row the tier lets through goes'             "$(BIN="$d/tbin"; tier_hold start r/free && echo held || echo go)"  go
+  t 'a cc-tier that cannot answer never holds'     "$(BIN="$d/tbin"; tier_hold start r/broken && echo held || echo go)" go
+  t 'no cc-tier on the box at all never holds'     "$(BIN="$d/absent"; tier_hold start r/held && echo held || echo go)" go
   sed 's/^/  journal fixture | /' "$d/progress.md"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
@@ -630,6 +644,9 @@ if [ -f "$HOME/dev/$repo/.cc/member-workspace" ] && [ "${CC_MEMBER_SANDBOX:-}" !
 fi
 if "$BIN/cc-pause" is "$repo" 2>/dev/null; then   # the whole project is parked: a worker for it is the first thing that must not start
   echo "cc-loop: $repo is paused — \`cc-pause off $repo\` starts its workers again" >&2; exit 2
+fi
+if tier_hold start "$repo/$track"; then   # the box-wide spend tier (cc-tier): under stop nothing starts; under essential only a row marked critical, one at a time
+  echo "cc-loop: $("$BIN/cc-tier" line) — $repo/$track waits (mark it critical: cc board set $repo $track critical yes, or cc-tier set <tier>)" >&2; exit 2
 fi
 ST="$HOME/.cc/state/$repo/$track"; WT="$HOME/.cc/worktrees/$repo/$track"; BOARD="$BIN/cc-board"; CLAUDE="${CC_CLAUDE:-$HOME/.local/bin/claude}"
 # Host-side git on the worktree (the checkpoint, its push, cc done) runs the MAIN checkout's hooks, never the worktree's: with a
@@ -668,6 +685,15 @@ parked(){ "$BIN/cc-pause" is "$repo" 2>/dev/null || return 1
   "$BOARD" status "$repo" "$track" queued >/dev/null 2>&1
   "$BOARD" note "$repo" "$track" "loop exit 11: project paused — cc-pause off $repo restarts it" >/dev/null 2>&1
   log "exit 11: $repo is paused — standing down; nothing more spends here until cc-pause off $repo"; exit 11; }
+# THE SPEND TIER, the same way but box-wide and only at the iteration boundary: `cc-tier set` signals nothing, so
+# the iteration in flight finishes and the NEXT one asks `cc-tier allows continue` before anything is charged. Under
+# stop no worker goes on; under essential only a row marked critical does. Standing down leaves the board honest
+# (`queued`) and does not page — the owner set the tier himself. `cc <repo> <track> --go ""` re-dispatches it.
+tiered(){ [ "$i" -gt 0 ] || return 1   # iteration 1 was let through by the start check above; this is the next ones
+  tier_hold continue "$repo/$track" || return 1
+  "$BOARD" status "$repo" "$track" queued >/dev/null 2>&1
+  "$BOARD" note "$repo" "$track" "loop exit 13: $("$BIN/cc-tier" line) — a wider tier, or critical=yes on this row, re-dispatches it" >/dev/null 2>&1
+  log "exit 13: $("$BIN/cc-tier" line) — standing down after iteration $i; cc $repo $track --go \"\" resumes it"; exit 13; }
 base=$(worker_base "$repo")
 SP=$(sp_worker "$base")
 "$BOARD" status "$repo" "$track" running >/dev/null 2>&1 || true
@@ -676,6 +702,7 @@ barren=0; rounds=0; nocommit=0; sincecost=0; cn=0; ccost=0; prevsig=""   # the r
 chainend=0   # the end of the cc-model chain is journalled once per loop, not once per iteration
 while [ $i -lt "$MAXI" ]; do
   parked   # read before the limit stamp and before anything is charged: a project paused mid-run stops at this line
+  tiered   # …and the spend tier the same way, for iteration 2 onwards
   if p=$("$BIN/cc-limit" status 2>/dev/null); then log "$p — waiting before starting (another run hit it)"   # a stamp any run on this box set
     "$BIN/cc-limit" wait || stop 8 "waiting" "Claude $p — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""; fi
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"

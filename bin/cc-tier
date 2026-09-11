@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# cc-tier — the box's one spend tier, and the one place that says what each tier lets the box start.
+#
+#   cc-tier                          the tier, one word
+#   cc-tier set <tier>               stop | essential | moderate | autonomous — writes CC_SPEND_TIER via cc-config
+#   cc-tier line                     one line for `cc digest` and the Slack Home tab: the tier, since when, what it means
+#   cc-tier allows <what> [<repo>/<row>]   exit 0 when the tier lets it happen, 1 when it must wait, 2 usage
+#   cc-tier selfcheck
+#
+# WHY (owner, 2026-09-10: "we need a cost savings mode where if i activate, all non priority work halts"; the
+# four levels named 2026-09-11). Spend is the box's first priority, and the only lever was stopping timers by
+# hand. One setting, CC_SPEND_TIER in ~/.cc/config, default autonomous; every spender asks this file, the way it
+# asks `cc-pause is`. Flip it with `cc-tier set <word>`, or say the word to the planning seat, which runs that.
+#
+# THE TIERS, and the table every consumer reads through `allows`:
+#   stop        nothing starts, no queued landing runs its gates, no pulse: the planning seat answers the owner only
+#   essential   only rows marked critical start (`cc board set <repo> <row> critical yes`), one at a time, on the
+#               cheapest model that holds, one review each
+#   moderate    the box takes on work it finds itself only when it is important or cheap; expensive or recursive
+#               work — a new orch, a multi-iteration worker, an exploration row, a self-improvement trial — waits
+#   autonomous  as until now: it discovers, fixes and explores
+#
+#   allows …    stop   essential        moderate   autonomous
+#   start       no     critical, alone  yes        yes         a worker may start
+#   continue    no     critical         yes        yes         a running worker may go on to its next iteration
+#   gates       no     yes              yes        yes         a queued landing may run its gates and buy its review
+#   pulse       no     yes              yes        yes         the drive loop may wake a seat about its board
+#   goals       no     no               yes        yes         a seat may take on work it finds itself
+#   explore     no     no               no         yes         the expensive or recursive work moderate holds
+#
+# `allows start <repo>/<row>` reads the row's `critical` field off the board (through `cc-board`, never the file)
+# and, under essential, whether any other row on any board is already `running` — "one at a time" is read off the
+# boards, so a row a dead worker left `running` holds the next one until cc-reconcile corrects it (≤20 min).
+# Without a row, `start` answers for the tier alone: yes unless stop, and under essential only when nothing runs.
+# `continue` is `start` without the one-at-a-time half: two workers already running when the tier drops to
+# essential would each see the other and both stand down, and neither is the new start the rule is about.
+#
+# WHAT THE TIER NEVER BLOCKS: answering the owner, a task he asked for (mark its row critical), a landing already
+# past its gates (cc-land holds a job at its gates only, never one at its merge or deploy). It is not a throttle
+# on the usage limit, which is his. Nothing here reaches outside the box.
+#
+# `set` writes ~/.cc/state/tier.log (`<utc> <old> -> <new>`) so `line` can say since when. Leaving stop names the
+# landing jobs that waited, and the command that drives them, exactly as `cc-pause off` does.
+set -uo pipefail
+B="$(dirname "$(readlink -f "$0")")"   # sibling, so a worktree copy tests itself
+STATE="$HOME/.cc/state"; LOG="$STATE/tier.log"; LANDQ="$STATE/land/queue"
+TIERS="stop essential moderate autonomous"
+USAGE="usage: cc-tier | set <stop|essential|moderate|autonomous> | line | allows <start|continue|gates|pulse|goals|explore> [<repo>/<row>] | selfcheck"
+
+die(){ echo "cc-tier: $*" >&2; exit 2; }
+now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+valid(){ case " $TIERS " in *" $1 "*) return 0;; esac; return 1; }
+
+# The tier, one word. A value nobody set, or a word this file does not know, is autonomous: a typo in the config
+# must not become a stop nobody asked for — and must not become a start either, which is why `set` refuses it.
+tier(){ local t; t="$("$B/cc-config" get CC_SPEND_TIER autonomous 2>/dev/null)"; valid "$t" && echo "$t" || echo autonomous; }
+
+# What each tier means, in the words the owner gave (the header above is the long form).
+meaning(){ case "$1" in
+  stop)       echo "nothing starts, no landing runs its gates; the planning seat answers the owner only";;
+  essential)  echo "only critical rows start, one at a time, cheapest model, one review each";;
+  moderate)   echo "work it finds itself only when important or cheap; orchs, multi-iteration workers, exploration and trials wait";;
+  autonomous) echo "discovers, fixes and explores";;
+esac; }
+
+since(){ [ -f "$LOG" ] || return 0; tail -n 1 "$LOG" 2>/dev/null | awk '{print $1}'; }
+
+line(){ local t s; t="$(tier)"; s="$(since)"
+  printf 'spend tier: %s%s — %s\n' "$t" "${s:+ (since $s)}" "$(meaning "$t")"; }
+
+# Is any track row on any board `running`, other than the one named? Read through cc-board, never the file.
+# A `session` row is a channel session and never counts; an `agent`-marked queued row is a seat's own subagent,
+# which the pulse and the seat account for, not this.
+other_running(){ local me="${1:-}" r
+  for r in $("$B/cc-board" boards 2>/dev/null); do
+    "$B/cc-board" json "$r" 2>/dev/null | python3 -c '
+import json, sys
+me, repo = sys.argv[1], sys.argv[2]
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+for k, t in (d.get("tracks") or {}).items():
+    if not isinstance(t, dict) or t.get("kind") == "session": continue
+    if t.get("status") == "running" and f"{repo}/{k}" != me: sys.exit(0)
+sys.exit(1)' "$me" "$r" && return 0
+  done; return 1; }
+
+critical(){ local row="$1" v   # `yes`, `1`, `true` — a word a person set; anything else is not critical
+  case "$row" in */*) ;; *) return 1;; esac
+  v="$("$B/cc-board" get "${row%%/*}" "${row#*/}" critical 2>/dev/null | tr 'A-Z' 'a-z')"
+  case "$v" in yes|1|true) return 0;; *) return 1;; esac; }
+
+allows(){ local what="$1" row="${2:-}" t; t="$(tier)"
+  case "$what" in start|continue|gates|pulse|goals|explore) ;; *) die "$USAGE";; esac
+  case "$row" in ""|*/*) ;; *) die "a row is <repo>/<row>, got '$row'";; esac
+  case "$t" in
+    autonomous) return 0;;
+    moderate)   [ "$what" != explore ];;
+    essential)  case "$what" in
+                  gates|pulse) return 0;;
+                  goals|explore) return 1;;
+                  start) # "only rows tagged critical start, one at a time" — both halves, off the board
+                         if [ -n "$row" ]; then critical "$row" || return 1; fi
+                         ! other_running "$row";;
+                  continue) # the critical half alone: see `continue` above
+                         if [ -n "$row" ]; then critical "$row" || return 1; fi; return 0;;
+                esac;;
+    stop)       return 1;;
+  esac; }
+
+set_tier(){ local new="${1:-}" old n
+  valid "$new" || die "'$new' is not a tier — one of: $TIERS"
+  old="$(tier)"
+  "$B/cc-config" set CC_SPEND_TIER "$new" || die "cc-config would not write CC_SPEND_TIER"
+  mkdir -p "$STATE" && printf '%s %s -> %s\n' "$(now)" "$old" "$new" >> "$LOG"
+  line
+  if [ "$old" = stop ] && [ "$new" != stop ]; then   # what stop held: the landing queue's untouched jobs
+    n=$(ls "$LANDQ"/*.json 2>/dev/null | wc -l)
+    [ "$n" -gt 0 ] && echo "$n landing job(s) waited for this: \`cc-land work\` lands them."
+  fi
+  return 0; }
+
+selfcheck(){
+  local n=0 f=0 rc out before   # T is NOT local: the EXIT trap that removes it fires outside this function
+  k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
+  T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+  # A HOME of its own: its own config (cc-config honours CC_CONFIG), its own boards and its own log — never this
+  # box's tier, and never this box's boards. cc-board reads $HOME/.cc/boards, so HOME is the fixture's.
+  mkdir -p "$T/home/.cc/boards" "$T/home/.cc/state/land/queue"
+  C(){ HOME="$T/home" CC_CONFIG="$T/home/.cc/config" "$B/cc-tier" "$@"; }
+  BOARD(){ HOME="$T/home" "$B/cc-board" "$@"; }
+  BOARD init alpha "$T/home/dev/alpha" >/dev/null 2>&1 || true
+  BOARD init beta "$T/home/dev/beta" >/dev/null 2>&1 || true
+  BOARD add alpha crit "the critical one" >/dev/null 2>&1
+  BOARD add alpha plain "an ordinary row" >/dev/null 2>&1
+  BOARD add beta other "another repo's row" >/dev/null 2>&1
+  BOARD set alpha crit critical yes >/dev/null 2>&1
+
+  k "$([ "$(C)" = autonomous ] && echo 0 || echo 1)" "no setting at all reads as autonomous (the default)"
+  HOME="$T/home" CC_CONFIG="$T/home/.cc/config" "$B/cc-config" set CC_SPEND_TIER sideways
+  k "$([ "$(C)" = autonomous ] && echo 0 || echo 1)" "a word this file does not know reads as autonomous, never as a stop nobody asked for"
+  C set sideways >/dev/null 2>&1; rc=$?; k "$([ $rc = 2 ] && echo 0 || echo 1)" "…and set refuses it"
+  out=$(C set stop); rc=$?
+  k "$([ $rc = 0 ] && [ "$(C)" = stop ] && echo 0 || echo 1)" "set stop writes the config and reads back"
+  k "$(grep -q '^spend tier: stop (since 20' <<<"$out" && echo 0 || echo 1)" "…and prints the line, dated since the flip"
+  k "$(grep -q ' autonomous -> stop$' "$T/home/.cc/state/tier.log" && echo 0 || echo 1)" "…and logs old -> new"
+
+  # THE TABLE, every cell, one row of asserts per tier. `t` = the tier, then start / start on a critical row /
+  # start on a plain row / continue on a critical row / continue on a plain row / gates / pulse / goals / explore,
+  # each `y` or `n`.
+  cells(){ local t="$1" got="" q
+    C set "$t" >/dev/null
+    for q in "start" "start alpha/crit" "start alpha/plain" "continue alpha/crit" "continue alpha/plain" gates pulse goals explore; do
+      if C allows $q; then got+=y; else got+=n; fi; done
+    echo "$got"; }
+  k "$([ "$(cells stop)" = nnnnnnnnn ] && echo 0 || echo 1)" "stop: nothing starts or continues, no gates, no pulse, no goals, no exploring — a critical row included"
+  k "$([ "$(cells essential)" = yynynyynn ] && echo 0 || echo 1)" "essential: a critical row starts and continues, a plain one waits; gates and the pulse run; goals and exploring wait"
+  k "$([ "$(cells moderate)" = yyyyyyyyn ] && echo 0 || echo 1)" "moderate: everything but exploring"
+  k "$([ "$(cells autonomous)" = yyyyyyyyy ] && echo 0 || echo 1)" "autonomous: everything"
+
+  # ONE AT A TIME under essential, read off the boards: a row running on ANY board holds the next start, the
+  # running row itself may go on (its next iteration asks with its own name), and the other tiers ignore it.
+  C set essential >/dev/null
+  BOARD status beta other running >/dev/null 2>&1
+  C allows start alpha/crit; rc=$?; k "$([ $rc = 1 ] && echo 0 || echo 1)" "essential: a row running on another board holds a critical start"
+  BOARD status beta other queued >/dev/null 2>&1; BOARD status alpha crit running >/dev/null 2>&1
+  C allows start alpha/crit; rc=$?; k "$([ $rc = 0 ] && echo 0 || echo 1)" "…the running critical row itself may take its next iteration"
+  C allows start; rc=$?; k "$([ $rc = 1 ] && echo 0 || echo 1)" "…and with no row named, a running row means no start"
+  BOARD status beta other running >/dev/null 2>&1
+  C allows continue alpha/crit; rc=$?; k "$([ $rc = 0 ] && echo 0 || echo 1)" "…and a critical row running beside another running row still continues: one-at-a-time is about starts"
+  BOARD status beta other queued >/dev/null 2>&1
+  C set moderate >/dev/null
+  C allows start alpha/plain; rc=$?; k "$([ $rc = 0 ] && echo 0 || echo 1)" "control: moderate starts a plain row beside a running one"
+  BOARD status alpha crit queued >/dev/null 2>&1
+  BOARD add alpha chat "a channel session" >/dev/null 2>&1; BOARD set alpha chat kind session >/dev/null 2>&1
+  BOARD status alpha chat running >/dev/null 2>&1
+  C set essential >/dev/null
+  C allows start alpha/crit; rc=$?; k "$([ $rc = 0 ] && echo 0 || echo 1)" "a running session row (kind=session) is not work in flight and holds nothing"
+
+  # THE WORD A PERSON SET IS READ, NOT REWRITTEN: allows never writes the board or the config.
+  before=$(md5sum "$T/home/.cc/boards/alpha.json" "$T/home/.cc/config" | md5sum)
+  C allows start alpha/crit >/dev/null; C allows goals >/dev/null; C line >/dev/null
+  k "$([ "$before" = "$(md5sum "$T/home/.cc/boards/alpha.json" "$T/home/.cc/config" | md5sum)" ] && echo 0 || echo 1)" "allows and line read; neither writes the board or the config"
+
+  # LEAVING STOP names the landing jobs it held, as cc-pause off does; entering it, or any other flip, says nothing.
+  C set stop >/dev/null; echo '{"repo":"alpha","pr":7}' > "$T/home/.cc/state/land/queue/alpha-7.json"
+  out=$(C set essential); k "$(grep -q '^1 landing job(s) waited for this' <<<"$out" && echo 0 || echo 1)" "leaving stop names the landing jobs that waited, and the command that drives them"
+  out=$(C set moderate); k "$(grep -q 'landing job' <<<"$out" && echo 1 || echo 0)" "…a flip that was not from stop does not"
+  C allows sideways >/dev/null 2>&1; rc=$?; k "$([ $rc = 2 ] && echo 0 || echo 1)" "a question this file does not know is usage, not a verdict"
+  C allows start alpha >/dev/null 2>&1; rc=$?; k "$([ $rc = 2 ] && echo 0 || echo 1)" "a row is <repo>/<row>; a bare repo is refused rather than read as one"
+  k "$(grep -q '^spend tier: moderate (since .*) — work it finds itself' <<<"$(C line)" && echo 0 || echo 1)" "line: the tier, since when, and what it means"
+  echo "cc-tier selfcheck: $((n - f)) passed, $f failed"
+  [ "$f" -eq 0 ]
+}
+
+case "${1:-}" in
+  "")        tier ;;
+  set)       [ $# -eq 2 ] || die "$USAGE"; set_tier "$2" ;;
+  line)      line ;;
+  allows)    [ $# -ge 2 ] && [ $# -le 3 ] || die "$USAGE"; allows "$2" "${3:-}" ;;
+  selfcheck) selfcheck ;;
+  *)         die "$USAGE" ;;
+esac

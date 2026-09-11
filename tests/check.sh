@@ -91,6 +91,9 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # — over pause, resume and the cold start a reboot is: the flag is a file, so a fresh process with no memory of
 # the pause still reads it. Its fixture projects carry this process's pid in their names, because `on` finds the
 # loops to stop with pgrep over the whole process table and a shared name would signal a real project's worker.
+# cc-tier's is a HOME and a config of its own — two boards through cc-board, never this box's tier or rows —
+# over the whole table (which question each tier answers yes to), one-at-a-time under essential, and that
+# reading it writes nothing.
 # cc-brief's is fixtures too — briefs it writes itself, a board and a throwaway git repo under a temp dir, and
 # CC_BRIEF_FAKE standing in for the judge's verdict, or a fake `claude` of its own where the CALL is what is
 # being pinned (the turn cap, the wall it carries), so the fast gate never reaches a model.

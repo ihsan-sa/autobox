@@ -3137,7 +3137,7 @@ def dispatch_fix(path, job, L):
     rc, o = sh([f"{BIN}/cc", L.repo, track, "--go", go, "--loop", FIX_LOOP,
                 *(["--resume-last"] if resume else []), "--no-extend",
                 "--model", FIX_MODEL, "--budget", FIX_BUDGET], timeout=300)
-    if rc:
+    if rc:   # paused project, spend tier holding the row (cc-tier: stop, or essential without `critical`), a timeout
         ledger(f"fix-refused {L.repo}#{L.pr} track={track} rc={rc} {last(o)[:160]} — reservation kept")
         return f"[{L.repo}] PR #{L.pr}: repair launch unconfirmed in {track}; reservation kept, no retry worker"
     ledger(f"fix-dispatch {L.repo}#{L.pr} track={track} verdict={L.verdict} model={FIX_MODEL} loop={FIX_LOOP} "
@@ -3398,6 +3398,27 @@ def paused(target):
         return False
 
 
+AFTER_GATES = ("merge", "card", "board", "ledger", "settle", "install", "units", "restart", "daemons", "verify")
+
+
+def tier_holds(job):
+    """The box-wide spend tier `stop` (cc-tier): "no queued landing runs its gates … the tier never blocks a landing
+    already past its gates". A PR job whose recorded stage is still in front of the merge — nothing yet, `queued`,
+    `gates`, `fixing`, `deferred`, or `review` (a killed review re-runs the gates) — is held: no gate, no paid read,
+    no attempt counted, the file untouched. One whose stage is the merge or anything after it goes on: its gates
+    are spent and a merge half-done is a box to put right, not spend to save. A deploy job has no gates and is
+    never held. cc-tier owns the tier; this reads `allows gates` by exit alone — 1 is "wait", and a cc-tier that
+    cannot answer is "go", the leniency `paused` gives cc-pause: a tier nobody can read is never what stops a
+    landing."""
+    if not job.get("pr") or job.get("stage") in AFTER_GATES:
+        return False
+    try:
+        return subprocess.run([f"{BIN}/cc-tier", "allows", "gates"], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=10).returncode == 1
+    except Exception:
+        return False
+
+
 def run_one(path):
     job = read_json(path)
     if not job or not job.get("repo") or not (job.get("pr") or job.get("span")):
@@ -3410,6 +3431,11 @@ def run_one(path):
     if paused(job["repo"]):
         what = f"PR #{job['pr']}" if job.get("pr") else "deploy"
         return f"[{job['repo']}] {what}: {job['repo']} is paused — still queued, lands after `cc-pause off {job['repo']}`"
+    # THE SPEND TIER `stop` holds a job at its gates the same way — file untouched, nothing counted — and only
+    # there: see tier_holds. Below the pause on purpose: the pause is the narrower, louder fact.
+    if tier_holds(job):
+        return (f"[{job['repo']}] PR #{job['pr']}: spend tier stop — still queued, its gates run after "
+                f"`cc-tier set` a wider tier")
     if job.get("state") == "done":
         finish(path, job)                        # killed between deciding and saying it: say it now, once
         return (job.get("result") or {}).get("short", "")
@@ -3510,6 +3536,9 @@ def next_wake():
                         # untried job a 5 s wake, and since run_one leaves a paused job untried, the sweep would re-arm
                         # itself every 5 s for as long as the project stayed parked. With the queue holding nothing but
                         # paused jobs this returns None, so no timer is armed — `cc-pause off` is what re-drives them.
+        if tier_holds(j):
+            continue    # …and a job the spend tier holds at its gates is the same: `cc-tier set` names the command
+                        # that drives the queue when the tier widens, exactly as `cc-pause off` does.
         nb = epoch_of(j.get("not_before", ""))
         waits.append(nb - now + 60 if nb > now else (RETRY_AFTER if j.get("attempts") else 5))
     return int(min(waits)) if waits else None
@@ -3614,6 +3643,8 @@ def preparable(path):
     if paused(j.get("repo") or ""):
         return False                # parked: the review is the dearest thing this file buys, and the serial phase below
                                     # will not land the job anyway — so buying one now is spend on a project nobody is on
+    if tier_holds(j):
+        return False                # spend tier stop: "no queued landing runs its gates" — and this phase IS the gates
     return bool(j.get("repo") and j.get("pr") and j.get("state") != "done"
                 and stamp() >= (j.get("not_before") or "") and j.get("attempts", 0) < LAND_TRIES)
 
@@ -7361,6 +7392,23 @@ def cmd_selfcheck():
               not ran_sub("cc", "myrepo", "w1", "--go")
               and read_json(f"{stdir}/delivery.json")["executions"] == reserved["executions"]
               and read_json(job_path("myrepo", 7))["fix"]["execution_id"] == job["fix"]["execution_id"])
+        # F4b: THE SPEND TIER. Under `essential` only a row marked critical starts, and `cc … --go` says so with exit 1
+        # BEFORE any window opens (review of #414: the loop used to refuse at its door after cc had returned 0, so the
+        # fix was ledgered as dispatched and no repair ever ran). What this queue must do with that exit is what it does
+        # with any refused launch: ledger it refused, keep the reservation and the fixing job, buy no second worker.
+        dispatched = open(f"{LANDQ}/queue.log").read().count("fix-dispatch myrepo#7")
+        tier_no = (1, "cc: 🪫 spend tier essential — myrepo/w1 waits (mark it critical: cc board set myrepo w1 critical yes, or cc-tier set <tier>)")
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": tier_no}); quiet(cmd_work, [])
+        job, log = read_json(job_path("myrepo", 7)), open(f"{LANDQ}/queue.log").read()
+        check("F4b: under the spend tier `essential` a LAND-AFTER-FIX on a row not marked critical is ledgered REFUSED, "
+              "not dispatched — the job stays `fixing` on its reservation, the board is not told a fix went out",
+              len(ran_sub("cc", "myrepo", "w1", "--go")) == 1 and "fix-refused myrepo#7" in log and "waits" in log
+              and log.count("fix-dispatch myrepo#7") == dispatched and job["stage"] == "fixing"
+              and root_work("myrepo", 7)["repairs"] == 1 and not ran_sub("cc-board", "note", "dispatched"))
+        calls.clear(); quiet(cmd_work, [])
+        check("F4b control: the next sweep buys no second worker either (F4's rule) — a wider tier, or critical=yes on "
+              "the row, is what re-dispatches it", not ran_sub("cc", "myrepo", "w1", "--go")
+              and read_json(job_path("myrepo", 7))["stage"] == "fixing")
         for answer in ((1, "unavailable"), (0, json.dumps(dict(FACTS, state="CLOSED", url=repair_base["pr"]["url"])))):
             repair_case(**{"gh pr view 7 --json url,state,headRefName": answer}); quiet(cmd_work, [])
             check("F5: a closed or unreadable PR cannot reserve or launch; F1 is its control",
@@ -8195,6 +8243,62 @@ def cmd_selfcheck():
             globals()["BIN"] = pdir
             check("control: with cc-pause back on the box, that same parked job is held again",
                   not preparable(job_path("myrepo", 7)) and next_wake() is None)
+
+            # ---- THE SPEND TIER `stop` (cc-tier), on the same stub-binary footing as the pause above: `allows
+            # gates` answers by exit status off a file beside it, so the exit-code contract is what is pinned.
+            # Under stop a job at its gates is held on every door — not preparable, untouched by the sweep, no
+            # timer — and a job past them goes on; every other tier is the unparked case.
+            with open(f"{pdir}/cc-tier", "w") as f:
+                f.write('#!/usr/bin/env bash\n[ "$1" = allows ] || exit 2\n'
+                        '[ "$(cat "$(dirname "$0")/tier" 2>/dev/null)" = stop ] && exit 1\nexit 0\n')
+            os.chmod(f"{pdir}/cc-tier", 0o755)
+
+            def tier(word):
+                with open(f"{pdir}/tier", "w") as f:
+                    f.write(word)
+
+            park()
+            job = job_path("myrepo", 7)
+            tier("stop")
+            before = open(job, "rb").read()
+            line = run_one(job)
+            check("spend tier stop: a queued job is held at its gates — the sweep leaves the file byte for byte, "
+                  "counts no attempt, merges nothing, and says which tier",
+                  "spend tier stop" in line and open(job, "rb").read() == before and not gh_merges())
+            check("...it is not preparable (that phase IS the gates, and the paid read beside them), and the queue "
+                  "arms no timer for it", not preparable(job) and next_wake() is None)
+            j = read_json(job)
+            for st in ("queued", "gates", "review", "fixing", "deferred"):
+                j["stage"] = st
+                write_atomic(job, j)
+                if not tier_holds(read_json(job)):
+                    check(f"stage {st!r} is in front of the merge and is held under stop", False)
+            for st in AFTER_GATES:
+                j["stage"] = st
+                write_atomic(job, j)
+                if tier_holds(read_json(job)):
+                    check(f"stage {st!r} is past the gates and is NOT held under stop", False)
+            check("a job past its gates is not held by stop — 'the tier never blocks a landing already past its "
+                  "gates' — while one at them is: the stage on the file decides",
+                  not tier_holds({"repo": "myrepo", "pr": 7, "stage": "merge"})
+                  and tier_holds({"repo": "myrepo", "pr": 7, "stage": "queued"}))
+            check("...and a deploy job, which has no gates, is never held",
+                  not tier_holds({"repo": "myrepo", "span": ["a", "b"]}))
+            j["stage"] = "queued"
+            write_atomic(job, j)
+            for word in ("essential", "moderate", "autonomous"):
+                tier(word)
+                if not (preparable(job) and next_wake() == 5):
+                    check(f"under {word} the same job runs its gates: only stop holds a landing", False)
+            check("under essential, moderate and autonomous that same job is preparable and wanted at once: only "
+                  "stop holds a landing", preparable(job) and next_wake() == 5)
+            tier("stop")
+            globals()["BIN"] = nopause
+            check("and where cc-tier cannot be asked at all, the queue behaves exactly as before the tier existed",
+                  preparable(job) and next_wake() == 5)
+            globals()["BIN"] = pdir
+            check("control: with cc-tier back, stop holds it again", not preparable(job) and next_wake() is None)
+            os.unlink(f"{pdir}/tier")
             os.unlink(job_path("myrepo", 7))
         finally:
             globals()["BIN"] = real_bin
