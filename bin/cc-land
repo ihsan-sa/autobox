@@ -3644,8 +3644,10 @@ def dispatch_fix(path, job, L, conflict=""):
     branch, and let the checkpoint hook push it (it carries the lease a rebased branch needs).
 
     Returns the line for the sweep, or "" to let the ordinary path tell the owner. Every "" here is deliberate: no
-    track carries this PR, no state dir to leave the verdict in, every finding a person's, or the dispatch itself
-    refused — things a person has to know about, and none of them something a second attempt would fix."""
+    track carries this PR, no state dir to leave the verdict in, or every finding a person's — things a person has
+    to know about, and none of them something a second attempt would fix. A LAUNCH THE BOX COULD NOT MAKE is the
+    one that ends differently: the reservation is already spent, so the job is held here, with the reason on the
+    record and one line in the track's lane, rather than left waiting on a round nobody dispatched."""
     verdict = "CONFLICT" if conflict else L.verdict
     track = L.find_track()
     st = f"{STATE}/{L.project}/{track}" if track else ""
@@ -3757,12 +3759,49 @@ def dispatch_fix(path, job, L, conflict=""):
     if not launch:
         ledger(f"fix-reserved {L.repo}#{L.pr} track={track} — existing repair; no second launch")
         return f"[{L.repo}] PR #{L.pr}: waiting on the reserved repair in {track}; no second worker launched"
+    # CC_BRIEF_MACHINE: this brief is the box's own writing, built from the review above — it is not a brief a person
+    # typed, and cc-brief's gates are there to hold a PERSON to goal-shaped briefs. The judge refused this one on
+    # 2026-09-11 (PR #433) for the review's own findings, and the landing had nowhere to go with the refusal. Forcing
+    # it (CC_BRIEF_FORCE) would pass, but records an override in the ledger that counts people bypassing the gate —
+    # the machine seam is the one cc-audit and cc-probe use for their own rows, and it takes precedence by design.
     rc, o = sh([f"{BIN}/cc", L.project, track, "--go", go, "--loop", FIX_LOOP,
                 *(["--resume-last"] if resume else []), "--no-extend",
-                "--model", FIX_MODEL, "--budget", FIX_BUDGET], timeout=300)
-    if rc:   # paused project, spend tier holding the row (cc-tier: stop, or essential without `critical`), a timeout
+                "--model", FIX_MODEL, "--budget", FIX_BUDGET], timeout=300,
+               env=dict(os.environ, CC_BRIEF_MACHINE="1"))
+    if rc and "TimeoutExpired" in o:
+        # A TIMEOUT IS NOT A REFUSAL: `cc` has not answered in five minutes and the window it opens may well exist,
+        # so the job keeps its reservation and its `fixing` stage and fix_progress watches for the push (F4). Holding
+        # a round that IS running would read its next checkpoint as a finished change (review-176c).
         ledger(f"fix-refused {L.repo}#{L.pr} track={track} rc={rc} {last(o)[:160]} — reservation kept")
         return f"[{L.repo}] PR #{L.pr}: repair launch unconfirmed in {track}; reservation kept, no retry worker"
+    if rc:   # `cc` itself answered: a paused project, the spend tier (cc-tier: stop, or essential without `critical`),
+             # a brief the judge would not pass. No window opened, and nothing is coming.
+        # A ROUND NOBODY DISPATCHED IS A HOLD, NOT A WAIT. This used to leave the job at `fixing` with a 90-minute
+        # deadline and a five-minute poll, so a refused launch was a PR with no worker, no wake-up and no word: the
+        # brief for PR #433 was refused at 15:37Z and the planning seat found it 20 minutes later while reading
+        # queue.log for something else. The job is HELD instead — the reason on the record, a `held` line in the
+        # ledger (what the watchers match), and one line in the track's lane — and fix_refused keeps it held, so
+        # no gate and no second review is bought for a change nothing has touched.
+        # THE REASON IS THE HEAD OF WHAT `cc` SAID, not its last line: a judge refusal ends on "cut those and
+        # dispatch again", and a record that carries only that does not say what refused or why. Flattened, because
+        # a newline in a ledger line forges a second row (the same wall `cancel --reason` keeps).
+        said = " ".join((o or "").split())[:200] or f"`cc` exited {rc} with nothing to say"
+        why = f"the repair round for PR #{L.pr} was not dispatched to {track}: {said}"
+        ledger(f"fix-refused {L.repo}#{L.pr} track={track} rc={rc} {last(o)[:160]} — reservation kept")
+        ledger(f"held {L.repo}#{L.pr} — {why}")
+        job["fix"] = dict(job["fix"], over="refused", refused=why)
+        job.update(stage="held", held=why, last=f"review: {verdict}, {why}"[:400],
+                   not_before=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + RETRY_AFTER)))
+        write_atomic(path, job)                  # the record before the word about it, as everywhere else here
+        # Said ONCE, ever: the producer id is this job's, so a later sweep through the same hold says nothing twice.
+        # Titled on L.project — the name cc and cc-board know this work by — so a MEMBER workspace's round is said in
+        # that workspace's own lane and not in the box's (MEMBERS: nothing of a member landing touches the box).
+        sh([f"{BIN}/cc-slack", "post", "--route", f"{L.project}/{track} repair not dispatched",
+            "--id", f"land:{L.repo}:{L.pr}:fix-refused@{job.get('queued_at') or at}",
+            f"[{L.repo}] PR #{L.pr}: {verdict}, and its repair round could not be dispatched to {track} — "
+            f"{said}. The landing is held and nothing re-drives it: dispatch the round by hand, or "
+            f"`cc-land cancel {L.repo} {L.pr} --reason …`."], timeout=60)
+        return (f"[{L.repo}] PR #{L.pr}: held — {why}. The reservation is kept and no retry worker was bought")
     what = "rebase" if conflict else "fix"
     ledger(f"fix-dispatch {L.repo}#{L.pr} track={track} verdict={verdict} model={FIX_MODEL} loop={FIX_LOOP} "
            f"budget={FIX_BUDGET} head={head[:12]} brief={rv}")
@@ -3771,6 +3810,20 @@ def dispatch_fix(path, job, L, conflict=""):
         f"re-queues itself when this branch pushes"], timeout=60)
     return (f"[{L.repo}] PR #{L.pr}: {verdict} — one {what} iteration dispatched to track {track} on {FIX_MODEL}, "
             f"and the PR stays queued; it is re-reviewed when that branch pushes")
+
+
+def fix_refused(job, L):
+    """Why a job whose repair round was REFUSED is still held, or "". dispatch_fix holds it the moment the launch
+    comes back non-zero; this is what keeps it held on every look after, so the queue buys no gate and no second
+    review for a change nothing has touched. THE HOLD LIFTS ITSELF when the branch moves: a round dispatched by
+    hand, or any push to that branch, makes this a different change — which is the one thing the queue re-reads."""
+    fix = job.get("fix") or {}
+    if fix.get("over") != "refused":
+        return ""
+    head = remote_head(job.get("repo") or "", (L.facts or {}).get("headRefName") or "")
+    if head and fix.get("head") and head != fix.get("head"):
+        return ""
+    return fix.get("refused") or f"the repair round for PR #{job.get('pr')} was refused — no worker was dispatched"
 
 
 def track_running(repo, track):
@@ -3935,7 +3988,7 @@ def run_job(path, job):
     buf, held = io.StringIO(), ""
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         if L.load():
-            held = L.held()
+            held = L.held() or fix_refused(job, L)    # …GitHub's reasons, then the box's own: a refused repair launch
             rc = 1 if held else L.walk(L.steps() if pr else L.deploy_steps())
         else:
             rc, L.stopped, L.why = 1, "load", f"cannot read PR #{pr} in {L.root}"
@@ -4282,6 +4335,9 @@ def preparable(path):
     if (fix and not fix.get("over") and stamp() < (fix.get("deadline") or "")
             and track_running(j.get("repo") or "", fix.get("track") or "")):
         return False                # mid-fix-round: a review bought now would judge an intermediate checkpoint (review-176c)
+    if fix.get("over") == "refused" and j.get("stage") == "held":
+        return False                # a repair launch the box could not make: the change is exactly what the review
+                                    # already answered, and run_job holds it again — a second read would buy that verdict twice
     if paused(j.get("repo") or ""):
         return False                # parked: the review is the dearest thing this file buys, and the serial phase below
                                     # will not land the job anyway — so buying one now is spend on a project nobody is on
@@ -8303,20 +8359,66 @@ def cmd_selfcheck():
         # F4b: THE SPEND TIER. Under `essential` only a row marked critical starts, and `cc … --go` says so with exit 1
         # BEFORE any window opens (review of #414: the loop used to refuse at its door after cc had returned 0, so the
         # fix was ledgered as dispatched and no repair ever ran). What this queue must do with that exit is what it does
-        # with any refused launch: ledger it refused, keep the reservation and the fixing job, buy no second worker.
+        # with any launch `cc` itself refuses: ledger it refused, keep the reservation, and HOLD the job — F4's timeout
+        # is the one that stays at `fixing`, because there the round may be running.
         dispatched = open(f"{LANDQ}/queue.log").read().count("fix-dispatch myrepo#7")
         tier_no = (1, "cc: 🪫 spend tier essential — myrepo/w1 waits (mark it critical: cc board set myrepo w1 critical yes, or cc-tier set <tier>)")
-        repair_case(**{f"{BIN}/cc myrepo w1 --go": tier_no}); quiet(cmd_work, [])
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": tier_no}); calls.clear(); quiet(cmd_work, [])
         job, log = read_json(job_path("myrepo", 7)), open(f"{LANDQ}/queue.log").read()
         check("F4b: under the spend tier `essential` a LAND-AFTER-FIX on a row not marked critical is ledgered REFUSED, "
-              "not dispatched — the job stays `fixing` on its reservation, the board is not told a fix went out",
+              "not dispatched — the job is HELD on its reservation, the board is not told a fix went out",
               len(ran_sub("cc", "myrepo", "w1", "--go")) == 1 and "fix-refused myrepo#7" in log and "waits" in log
-              and log.count("fix-dispatch myrepo#7") == dispatched and job["stage"] == "fixing"
+              and log.count("fix-dispatch myrepo#7") == dispatched and job["stage"] == "held"
               and root_work("myrepo", 7)["repairs"] == 1 and not ran_sub("cc-board", "note", "dispatched"))
         calls.clear(); quiet(cmd_work, [])
-        check("F4b control: the next sweep buys no second worker either (F4's rule) — a wider tier, or critical=yes on "
-              "the row, is what re-dispatches it", not ran_sub("cc", "myrepo", "w1", "--go")
-              and read_json(job_path("myrepo", 7))["stage"] == "fixing")
+        check("F4b control: the next sweep buys no second worker either (F4's rule) — the job is held, and a hand "
+              "dispatch or a push to the branch is what lifts it", not ran_sub("cc", "myrepo", "w1", "--go")
+              and read_json(job_path("myrepo", 7))["stage"] == "held")
+        # F4c: A REFUSED DISPATCH IS A DEAD END UNLESS SOMEBODY IS TOLD. PR #433 (2026-09-11) got LAND-AFTER-FIX, the
+        # brief judge refused the round's brief, and the job sat at `fixing` with no worker and no wake-up: the planning
+        # seat found it 20 minutes later reading queue.log for another PR. Two things answer that — the brief goes out
+        # as the box's own writing (F4d), and any refusal that still happens ends somewhere a watcher looks.
+        judge_no = (1, "cc-brief: REJECTED by the judge for myrepo/w1 — it says how, not what\n"
+                       "      cut: rename the helper and add a test for it\n"
+                       "  Cut those and dispatch again, or CC_BRIEF_FORCE=1 to send it as typed (that is recorded).")
+        held_lines = open(f"{LANDQ}/queue.log").read().count("held myrepo#7")
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": judge_no}); calls.clear(); quiet(cmd_work, [])
+        job, log = read_json(job_path("myrepo", 7)), open(f"{LANDQ}/queue.log").read()
+        check("F4c: a repair round the box could not dispatch HOLDS the landing — the job is `held` with the refusal "
+              "on its record, the ledger gets the `held` line the watchers already match, and the track's lane is "
+              "told once. Left at `fixing` it was a PR with no worker, no wake-up and nobody told (PR #433)",
+              job.get("stage") == "held" and "REJECTED by the judge" in (job.get("held") or "")
+              and (job.get("fix") or {}).get("over") == "refused"
+              and log.count("held myrepo#7") == held_lines + 1 and "fix-refused myrepo#7" in log
+              and len(ran_sub("cc-slack", "post", "--route", "repair not dispatched")) == 1)
+        j = read_json(job_path("myrepo", 7)); j.pop("not_before", None)
+        write_atomic(job_path("myrepo", 7), j); calls.clear(); quiet(cmd_work, [])
+        check("F4c control: every sweep after re-holds it in silence — no second worker, no second line, no second "
+              "post, and no review bought for a change nothing has touched",
+              read_json(job_path("myrepo", 7))["stage"] == "held" and not preparable(job_path("myrepo", 7))
+              and not ran_sub("cc", "myrepo", "w1", "--go") and not ran_sub("cc-slack", "post", "--route")
+              and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == held_lines + 1)
+        # …and the way OUT of that hold, which is the only one this feature has: the branch moved. A round dispatched
+        # by hand, or any push to it, makes this a change nothing has answered — so fix_refused stops holding and the
+        # job is gated and read like any other. Untested, the hold would be a one-way door.
+        pushed_head = "b1c2d3e4f5061728394a5b6c7d8e9f00b1c2d3e4"
+        j = read_json(job_path("myrepo", 7)); j.pop("not_before", None)
+        write_atomic(job_path("myrepo", 7), j)
+        world["git ls-remote origin refs/heads/track/w1"] = (0, f"{pushed_head}\trefs/heads/track/w1\n")
+        calls.clear(); quiet(cmd_work, [])
+        lifted = read_json(job_path("myrepo", 7)) or {}
+        check("F4c recovery: a push to the branch LIFTS the hold — origin names a head the refusal was not written "
+              "against, so the job leaves `held`, is gated and read like any other, and no second `held` line is "
+              "written. This is the one way back from a refused dispatch, and nothing else re-drives it",
+              lifted.get("stage") != "held" and (ran("check.sh") or [c for c in calls if c[0] == CLAUDE])
+              and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == held_lines + 1)
+        repair_case(**{f"{BIN}/cc myrepo w1 --go": (0, "dispatched")}); calls.clear(); quiet(cmd_work, [])
+        machine = [e.get("CC_BRIEF_MACHINE") for c, e in zip(calls, envs)
+                   if os.path.basename(c[0]) == "cc" and "--go" in c]
+        check("F4d: the round's brief is the LANDING'S OWN WRITING — built here from the review, typed by nobody — so "
+              "it goes out as a machine row (CC_BRIEF_MACHINE=1) and the brief judge, which is there to hold a PERSON "
+              "to a goal-shaped brief, cannot refuse the queue its repair (PR #433)",
+              machine == ["1"])
         for answer in ((1, "unavailable"), (0, json.dumps(dict(FACTS, state="CLOSED", url=repair_base["pr"]["url"])))):
             repair_case(**{"gh pr view 7 --json url,state,headRefName": answer}); quiet(cmd_work, [])
             check("F5: a closed or unreadable PR cannot reserve or launch; F1 is its control",

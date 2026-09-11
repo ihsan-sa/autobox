@@ -133,7 +133,8 @@ so anything left running is the successor's to pick up, worktrees and landing bo
 - A brief is a goal: what, why, the boundaries, 3-5 testable done-criteria — never the steps. The PR review gets the contract and the diff, never the worker's journal.
 - One repair round, resumed in the same worker session so its cache and its discovery survive. Never a fresh context re-deriving what it knew; never a second open-ended budget. Then split or escalate.
 - A LAND-AFTER-FIX is not yours to dispatch: the landing queue sends one fix iteration
-  itself and re-queues the PR when that branch pushes. You hear about the second stop.
+  itself and re-queues the PR when that branch pushes. You hear about the second stop —
+  and about a round it could not dispatch at all, which holds the PR and says so once.
   A subagent's branch has no worker to push it: resume the same builder, then commit and push its worktree yourself.
 - No worker-to-worker messaging, no agent teams. An orch (`cc <repo> --orch <alias>`) is a peer session with its own channel, not a layer under the planner.
 - Only decision-class events wake a session; everything else goes to a file it reads on its next turn. Events arriving together cost a fraction of the same events spread out. A monitor, watch or notifier emits on TERMINAL states only and once — a line per stage it passes through is the same information at several times the price.
