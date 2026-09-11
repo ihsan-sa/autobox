@@ -9,8 +9,8 @@ the owner's idea of what the box is doing — reads the board, so that drift is 
   cc-reconcile [repo …]              report the drift, change nothing
   cc-reconcile --apply               …and fix what is mechanically decidable, and STOP a runaway
   cc-reconcile --apply --notify      …and push what is NOT to the owner (once a day per finding)
-  cc-reconcile snapshot              print the read-only state snapshot (and refresh it), ask nothing of the network
-  cc-reconcile view                  the snapshot as `cc ls` and cc-digest take it: TSV repo/track · state · waiting_on · why; no rows when missing or stale
+  cc-reconcile snapshot [repo …]     print the state snapshot and WRITE NOTHING — no file, no ledger, no sweep, no network
+  cc-reconcile view                  the snapshot file as `cc ls` and cc-digest take it: TSV repo/track · state · waiting_on · why; no rows when missing or stale
   cc-reconcile selfcheck             the decision table + one end-to-end run, no network
     also: --json · -q · --no-net (never ask GitHub) · --grace SEC (default 600) · --repeat SEC (default 86400)
           --no-stop (report a runaway, never end it)
@@ -64,6 +64,12 @@ iterations has declared nothing and is simply running. See waits_for(); nothing 
 THE SNAPSHOT (~/.cc/state/reconcile.json, review rec #7). Every unfiltered run writes what it just decided —
 effective state, live presence, who each track waits on and why. This tool is the sole decider; `cc-digest` and
 `cc ls` read it through `view` (one TSV row per track) rather than re-deriving any of it; missing or stale, the board's word stands.
+THE HOME TAB AND cc-pulse TAKE A FRESH ONE INSTEAD (arch review 2026-09-08, rec 8): each pass runs `snapshot` once
+and reads state, live, waiting_on and why off it — neither keeps a state, blocked-reason or liveness ladder of its own
+any more, so every consumer says the same thing about the same box. `snapshot` is pure for that reason: it decides
+and prints, and touches neither the file above nor the wedged ledger nor the sweeps below, so a tab refresh or a
+pulse tick can never move the timer's state. A consumer that gets no snapshot keeps the board's word and claims nothing
+alive — the same fallback `view` gives.
 
 THE ONE RUNAWAY cc-loop CANNOT CATCH is its own. cc-loop judges a loop that is looping — three iterations in a
 row with nothing to show and it stops itself. A loop that is WEDGED never finishes an iteration, so it never
@@ -98,11 +104,16 @@ BOARDS, WTS, STATE = f"{HOME}/.cc/boards", f"{HOME}/.cc/worktrees", f"{HOME}/.cc
 GRACE = 600        # a track the board touched less than this ago is left alone: `cc --go` writes the board, then claude takes a moment to appear
 REPEAT = 86400     # a finding that persists is worth one push a day, not one every timer tick
 PRMAX = 40         # PR lookups per run — a timer job must never stall on the network
+ORPHANPRS = 10     # …and the same cap for the branch→PR lookups orphans() makes: past it a worktree is reported as it always was
 WEDGED = 3 * 3600  # a worker alive with nothing moved for this long: cc-loop caps one iteration at 1 h and logs both ends
 IDLE = 2 * 3600    # a live pane with nobody typing at it for this long: open is not working (owner, 2026-09-01)
 AGENT_MARK = 6 * 3600   # …and the same rule for an `agent` mark: it holds a row for this long, then goes cold
 WEDGE_SEEN = 5400  # …and only if the previous run saw it too, which on a 20-min timer is one strike, then another
 PENDING = 14400    # finished with an open PR for this long and nobody landing it: the session was told 12 times already
+BETWEEN_ROUNDS = 1800   # a landing is ROUNDS with gaps between them — a repair to dispatch, a spend decision handed
+                        # back, a re-queue — and only a round holds a job file. A PR whose landing record was written
+                        # less ago than this is between rounds, not abandoned: PR #421, 2026-09-11, was nagged by the
+                        # 10:51Z tick, which fell in the six minutes between one round ending and the next being queued
 TERMINAL = ("merged", "done")
 FRESH = 3600       # a snapshot older than this (~3 ticks of the 20-min timer) decides nothing: `view` prints no rows and its readers keep the board's word
 QUEUED = ("queued", "todo")   # the board says `queued` (one vocabulary with the App Home tab); boards written before
@@ -134,7 +145,7 @@ def mark_why(t, wins, repo, t0, mark, started=0.0):
     says so by marking again, which costs it one command; one that moved on says nothing, and the row comes
     back (review of #242).
 
-    A USAGE LIMIT ENDS A MARK BEFORE ITS TIME, on the bound cc-pulse's agent_held() uses too. On 2026-09-05 a
+    A USAGE LIMIT ENDS A MARK BEFORE ITS TIME — decided here once; cc-pulse reads the snapshot. On 2026-09-05 a
     limit at 09:05Z killed a planning session's subagents mid-row; their marks stayed warm until 15:05Z, four
     hours after the limit lifted. `started` is when the last episode cc-limit came back from BEGAN, and a mark
     that old was made before the 429 that killed the subagent holding it. The START and not the reset: the box
@@ -409,6 +420,25 @@ def pr_state(repo, url, net=True):
     return s if s in ("MERGED", "OPEN", "CLOSED") else "?"
 
 
+def branch_prs(repo, branch, net=True):
+    """[(number, STATE)] for the PRs opened FROM <branch>, newest first — the other direction from pr_state(), which
+    starts at a PR a board row already names. None when the answer could not be had (no network, no gh, no checkout
+    to ask from, a call that failed), and None is not "there is no PR": it is no evidence, and the caller falls back
+    to what it can decide without GitHub. Asked from the repo's own checkout — `gh pr list --head` with no repo in
+    front of it reads whatever repo the cwd belongs to, which would answer about the wrong project."""
+    cwd = f"{HOME}/dev/{repo}"
+    if not net or not branch or not shutil.which("gh") or not os.path.isdir(cwd):
+        return None
+    try:
+        p = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "10",
+                            "--json", "number,state"], cwd=cwd, capture_output=True, text=True, timeout=20)
+        if p.returncode:
+            return None
+        return [(int(r["number"]), str(r.get("state") or "").upper()) for r in json.loads(p.stdout or "[]")]
+    except Exception:
+        return None
+
+
 def alert(msg):
     """#alerts, best-effort: a timer job must never fail on Slack being down. Under a harness
     (CC_NOTIFY_LOG_ONLY, the switch every suite sets) it goes to the log, not the real channel."""
@@ -471,6 +501,20 @@ def commit_marker(repo, track, home=None):
     return next((p for p in (host, member) if os.path.exists(p)), host)
 
 
+def wt_branch(wt):
+    """The branch checked out in <wt>, or "" — a detached HEAD, a directory that is no checkout of its own, and a git
+    that would not answer all say "", because none of them is a branch anything here can look up. The `.git` test is
+    what keeps `git -C` from walking UP out of the directory and answering about some enclosing repo instead."""
+    if not os.path.exists(f"{wt}/.git"):
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", wt, "symbolic-ref", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ""
+    return "" if r.returncode else r.stdout.strip()
+
+
 def branch_unpushed(wt):
     """Does this worktree really hold commits origin does not have? True yes · False no · None cannot tell.
 
@@ -485,10 +529,10 @@ def branch_unpushed(wt):
             return subprocess.run(["git", "-C", wt, *a], capture_output=True, text=True, timeout=10)
         except Exception:
             return None
-    br = git("rev-parse", "--abbrev-ref", "HEAD")
-    if not br or br.returncode or br.stdout.strip() in ("", "HEAD"):
+    br = wt_branch(wt)
+    if not br:
         return None                      # no git here, or a detached HEAD: nothing this rule can say
-    up = git("rev-parse", "-q", "--verify", f"refs/remotes/origin/{br.stdout.strip()}")
+    up = git("rev-parse", "-q", "--verify", f"refs/remotes/origin/{br}")
     if not up or up.returncode:
         return None                      # the branch has never been on origin: nothing to compare it against
     anc = git("merge-base", "--is-ancestor", "HEAD", up.stdout.strip())
@@ -699,6 +743,8 @@ def effective(f, recs):
     # …and `idle` is the word for the other half of that: RUNNING is a claim that something is happening, and a session
     # parked at its prompt makes no such claim. Only ever narrows `running` — every word decide() reached first
     # (`waiting`, `blocked`, `merged`) is a fact about the work, and outranks a fact about the keyboard.
+    if word == "todo":
+        return "queued"     # one vocabulary (see QUEUED): the consumers print `queued`, and never a second word for it
     return "idle" if word == "running" and idle_session(f) else word
 
 
@@ -723,9 +769,10 @@ def pr_number(url):
 
 
 def landing():
-    """{(repo, pr)} somebody is already landing: named by a live cc-land argv (the PR path, or `queue`), or by a
-    job under ~/.cc/state/land/ — cc-land keeps that file until the landing is said and done. Nagging a session
-    about one of these is telling it to do what is being done (nine lines a tick, 2026-09-01)."""
+    """{(repo, pr)} somebody is already landing: named by a live cc-land argv (the PR path, or `queue`), by a job
+    under ~/.cc/state/land/ — cc-land keeps that file until the landing is said and done — or by a fresh work
+    record under ~/.cc/state/land/root/, which is the one thing that spans the GAPS between a landing's rounds.
+    Nagging a session about one of these is telling it to do what is being done (nine lines a tick, 2026-09-01)."""
     out = set()
     for path in glob.glob(f"{HOME}/.cc/state/land/*.json"):
         try:
@@ -734,6 +781,19 @@ def landing():
                 out.add((j["repo"], int(j["pr"])))
         except Exception:
             continue                                # half-written, or a catch-up job with no PR: no PR named
+    # BETWEEN ROUNDS IS STILL BEING LANDED. The job file is a round, not the landing: a LAND-AFTER-FIX repair, a
+    # spent review budget the seat must decide, a conflict merge — each ends the round and deletes the file minutes
+    # before the next one is queued. cc-land's work record outlives the round that wrote it and goes when the PR
+    # lands, so a record touched within BETWEEN_ROUNDS says a landing is mid-flight; an older one is only history.
+    for path in glob.glob(f"{HOME}/.cc/state/land/root/*.json"):
+        try:
+            if now() - os.path.getmtime(path) > BETWEEN_ROUNDS:
+                continue
+            j = json.load(open(path))
+            if j.get("repo") and j.get("pr"):
+                out.add((j["repo"], int(j["pr"])))
+        except Exception:
+            continue
     me = os.getpid()
     for d in os.listdir("/proc"):
         if not d.isdigit() or int(d) == me:
@@ -760,43 +820,21 @@ def snapshot(rows, limit=0.0):
     return {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "epoch": int(now()),
             "limit_until": int(limit or 0),
             "tracks": {f"{repo}/{track}": {"state": state, "board": f["status"],
+                                           "kind": f.get("kind") or "track",   # `session`: a channel's row, never a task
                                            # a subagent is alive too — the mark's window is what says so
                                            "live": bool(f["live"] or f.get("agent_live")),
                                            "waiting_on": who, "why": why,
                                            # seconds since the track's pane last moved: what tells `idle` from `running`
-                                           "idle_for": int(f.get("pane_idle") or 0)}
+                                           "idle_for": int(f.get("pane_idle") or 0),
+                                           # …and the three facts the Home tab and cc-pulse used to read for themselves:
+                                           # a live `cc-loop` (the only thing that makes an iteration count current),
+                                           # a live session's `agent` mark (a subagent has the row), a person's hold
+                                           "loop": bool(f.get("loops")), "agent": bool(f.get("agent_live")),
+                                           "held": str(f.get("held") or "").strip()}
                        for repo, track, f, state, who, why in rows}}
 
 
 # ── the run ──────────────────────────────────────────────────────────────────────────────────────────────
-_LIN = None
-def lineage():
-    """This process's pid chain to init, from /proc — cached: a tool's ancestry does not move while it runs."""
-    global _LIN
-    if _LIN is None:
-        _LIN, pid = set(), os.getpid()
-        while pid > 1 and pid not in _LIN:
-            _LIN.add(pid)
-            try:
-                with open(f"/proc/{pid}/status") as f: pid = int(next(l for l in f if l.startswith("PPid:")).split()[1])
-            except (OSError, StopIteration, ValueError): break
-    return _LIN
-
-
-SUITE = re.compile(r"^_cc[a-z]+(\d+)$")      # a suite's scratch namespace: `_cc<suite><pid>`, the pid of the run
-def fixture(repo):
-    """A test suite's `_cc<suite><pid>` repo, seen from outside the run that made it — selftest.sh's `_cctest<pid>`,
-    cc-sandbox's `_ccsbx<pid>`. It is a repo — board AND worktree — only to a process under <pid>; to anyone else it
-    is scaffolding, never a finding, and the prefix is the namespace rather than one suite's name because a leaked
-    `_ccsbx<pid>` was reported here as two worktrees of real work with no board entry (2026-09-02). cc-board `real`
-    is the rule, copied here rather than called: one file pass, and the selfcheck's HOME is the environment's. The
-    leftovers themselves are cc-janitor rule 6's, which removes them once the pid is gone."""
-    if not repo.startswith("_cc"):
-        return False
-    m = SUITE.match(repo)
-    return not (m and int(m.group(1)) in lineage())
-
-
 def paused(target):
     """`cc-pause on <repo>` parks a whole project — its repo, its tracks and its orchs — and nothing the box does
     on its own may spend on it until `cc-pause off`. cc-pause owns that state; asking it is the only reading of it
@@ -811,13 +849,12 @@ def paused(target):
 
 def boards():
     """Every REAL sidecar board, sorted: (path, board or None if unreadable). A suite that died mid-run left a
-    fixture board whose `waiting` row was reconciled, snapshotted and shown to the owner as real (2026-09-01);
-    cc-janitor --fixtures sweeps it once its pid is gone."""
+    fixture board whose `waiting` row was reconciled, snapshotted and shown to the owner as real (2026-09-01):
+    a `_cc<suite><pid>` board is a board only to a process under <pid>, and cc-board's `reals` says which these
+    are — one batch, never a copy of its rule; cc-janitor --fixtures sweeps the rest once their pid is gone."""
     out = []
-    for fn in sorted(glob.glob(f"{BOARDS}/*.json")):
-        n = os.path.basename(fn)[:-5]
-        if fixture(n):
-            continue
+    for n in ccboard().reals(sorted(os.path.basename(fn) for fn in glob.glob(f"{BOARDS}/*.json"))):
+        fn = f"{BOARDS}/{n}"
         try:
             out.append((fn, board_read(fn)))
         except Exception:
@@ -825,16 +862,23 @@ def boards():
     return out
 
 
-def board_read(path):
-    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
-    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
-    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
-    if not hasattr(board_read, "mod"):
+def ccboard():
+    """cc-board imported as a module (the way cc-time is), beside THIS copy, not a stubbed BIN: its opener `read`, and its
+    `reals` — the one rule for which of ~/.cc/boards is a board and which is a suite's fixture. This file carried the
+    rule itself until 2026-09-11 and two others read `_cctest` alone; now every reader asks (cc-board FIXTURE)."""
+    if not hasattr(ccboard, "mod"):
         import importlib.machinery, importlib.util
         s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
-            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
-        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
-    return board_read.mod.read(path)
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))
+        ccboard.mod = importlib.util.module_from_spec(s); s.loader.exec_module(ccboard.mod)
+    return ccboard.mod
+
+
+def board_read(path):
+    """A board file, read through cc-board's opener: a member's board is a link into a directory the MEMBER writes, and
+    a plain open here followed whatever it planted — a pipe hung this tool for good (review of #224). None = no board
+    there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    return ccboard().read(path)
 
 
 def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT_MARK):
@@ -886,22 +930,53 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
             yield repo, track, t, f
 
 
-def orphans(repos):
+def orphans(repos, net=True, grace=GRACE, busy=None):
     """Worktrees with no board entry at all — real work the board has never heard of. Reported only: inventing
-    a track from a directory name is the kind of guess this tool exists to avoid."""
-    known = set()
+    a track from a directory name is the kind of guess this tool exists to avoid.
+
+    A DELIVERY IN FLIGHT IS NOT ONE. A planning session's builder works a row in a worktree named for its BRANCH,
+    not for the row, so no board entry will ever carry that name however well the row is kept — and this went out
+    twice on 2026-09-11 about worktrees whose PRs were open (one of them queued in the landing), each costing the
+    seat a wake-up and a read that found nothing to do. Four things say delivery rather than leftover, and the
+    worktree is skipped on any of them: a row NAMES this directory (whatever the row is called), it was made inside
+    `grace` (the same window a new track gets to appear in), its branch has an OPEN PR, or its branch's PR is one
+    somebody is landing — landing(), the same reader #429 gave the PR nag: a job file, a live cc-land argv, or a
+    work record between two rounds. The queue LOG is not consulted: it keeps every landing this box ever ran, so a
+    PR merged last week would read as in flight forever. Nothing else is forgiven — with no network the branch
+    cannot be looked up and the worktree is reported exactly as it always was."""
+    known, claimed = set(), set()
     for fn, d in boards():
         if d is None:
             return []                                   # an unreadable board makes every track look orphaned: say nothing
         repo = d.get("repo") or os.path.basename(fn)[:-5]
-        known |= {f"{repo}/{t}" for t in d.get("tracks", {})}
-    out = []
+        for t, tr in (d.get("tracks") or {}).items():
+            known.add(f"{repo}/{t}")
+            wt = (tr or {}).get("worktree")              # a row may name a directory of its own: that is a board entry too
+            if wt:
+                claimed.add(os.path.realpath(os.path.expanduser(wt)))
+    out, asked = [], 0
     for p in sorted(glob.glob(f"{WTS}/*/*")):
         repo, track = p.split(os.sep)[-2:]
-        if fixture(repo):
-            continue                                    # the suite's own scaffolding, not work: `known` never has it either
-        if os.path.isdir(p) and f"{repo}/{track}" not in known and (not repos or repo in repos):
-            out.append((repo, track, ("ask", None, "a worktree with no board entry")))
+        if not ccboard().real(repo):                    # a suite's `_cc<suite><pid>` scaffolding (a leaked `_ccsbx<pid>` was
+            continue                                    # reported as two worktrees of work, 2026-09-02), not work: `known` never has it either
+        if not os.path.isdir(p) or f"{repo}/{track}" in known or (repos and repo not in repos):
+            continue
+        if os.path.realpath(p) in claimed:
+            continue
+        try:
+            if now() - os.path.getmtime(p) < grace:     # `git worktree add` stamps the directory: minutes old is a
+                continue                                # delivery still being set up, not one the board never heard of
+        except OSError:
+            pass
+        prs = None
+        if asked < ORPHANPRS:
+            asked += 1                                  # counted whether or not GitHub answered: the cap is on asking
+            prs = branch_prs(repo, wt_branch(p), net)
+        if prs:
+            busy = landing() if busy is None else busy  # one process-table read a run, and only with a PR to match
+            if any(st == "OPEN" or (repo, n) in busy for n, st in prs):
+                continue
+        out.append((repo, track, ("ask", None, "a worktree with no board entry")))
     return out
 
 
@@ -979,6 +1054,9 @@ def main(argv):
     snap_only = argv[:1] == ["snapshot"]
     if snap_only:
         argv = argv[1:] + ["--no-net"]              # a snapshot is a local read: it must never stall on GitHub
+        if any(a in ("--apply", "--notify") for a in argv):
+            print("cc-reconcile: snapshot writes nothing — it takes no --apply or --notify", file=sys.stderr)
+            return 2
     repos, apply_, notify, as_json, quiet, net, grace, repeat = [], False, False, False, False, True, GRACE, REPEAT
     no_stop, wedged = False, int(os.environ.get("CC_RECONCILE_WEDGED") or WEDGED)   # env: tests do not wait three hours
     mark = float(os.environ.get("CC_AGENT_MARK_HOURS") or AGENT_MARK / 3600) * 3600
@@ -1029,8 +1107,9 @@ def main(argv):
             if kind == "stop":
                 rec["pids"] = f["workers"] + f["loops"]
             recs.append(rec)
-    ledger(f"{STATE}/wedged.json", wedging)             # only what is still wedged survives: one that recovers starts over
-    for repo, track, (kind, st, why) in orphans(repos):
+    if not snap_only:                                   # `snapshot` is pure: the wedged strike count is the timer's to keep
+        ledger(f"{STATE}/wedged.json", wedging)         # only what is still wedged survives: one that recovers starts over
+    for repo, track, (kind, st, why) in orphans(repos, net, grace):
         recs.append({"repo": repo, "track": track, "kind": kind, "from": "", "to": st, "why": why})
     for r in recs:
         if r["kind"] == "stop":         # the one record that ENDS something instead of describing it
@@ -1050,6 +1129,9 @@ def main(argv):
                 log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t"
                           f"{r['repo']}/{r['track']}\t{what}\t{r['why']}\n")
     snap = snapshot(snaprows, limit_until())
+    if snap_only:                                   # pure: decided and printed, and nothing on disk is different for it
+        print(json.dumps(snap, indent=2))
+        return 0
     if not repos:                                   # a filtered run knows about one repo: it must never clobber the whole box's
         try:
             os.makedirs(STATE, exist_ok=True)
@@ -1075,9 +1157,6 @@ def main(argv):
                 subprocess.run([f"{BIN}/cc-slack", "approvals-sweep"], capture_output=True, timeout=180)
             except Exception:                       # edited (a merge in GitHub's UI, a card from before the edit
                 pass                                # existed). cc-slack owns the card; this only gives it a turn
-    if snap_only:
-        print(json.dumps(snap, indent=2))
-        return 0
     asks = [r for r in recs if r["kind"] in ("ask", "stop")]   # a runaway that was ended is still a person's to settle
     if as_json:
         print(json.dumps({"tracks": tracks, "records": recs}, indent=2))
@@ -1128,9 +1207,9 @@ def main(argv):
         # Landing it is one command, not a decision — but the session hears it ONCE per PR, not every tick (nine
         # identical lines a tick for PRs already queued in land lanes; owner, 2026-09-01), and the owner only once
         # it has stood past the window, then once per window. Two rows are nobody's to nag: one the board says is
-        # `waiting` (pending() itself says why), and one whose PR somebody is landing — a live cc-land argv, or a
-        # job under ~/.cc/state/land/. Either drops the keys, so a PR that falls out of a lane unlanded is news
-        # again, once.
+        # `waiting` (pending() itself says why), and one whose PR somebody is landing — a live cc-land argv, a job
+        # under ~/.cc/state/land/, or a landing mid-flight between two rounds. Either drops the keys, so a PR that
+        # falls out of a lane unlanded is news again, once.
         keep, busy = {}, None
         for repo, track, f, state, _, _ in snaprows:
             if project_parked(repo) or f.get("held"):
@@ -1395,8 +1474,16 @@ def selfcheck():
        effective(F(status="review", pr="u", pr_state="OPEN"), []) == "review")
     ok("the snapshot carries who and why, which one status word cannot",
        snapshot([("r", "t", F(status="running", live=True), "waiting", "person", "which syllabus?")])
-       ["tracks"]["r/t"] == {"state": "waiting", "board": "running", "live": True,
-                             "waiting_on": "person", "why": "which syllabus?", "idle_for": 0})
+       ["tracks"]["r/t"] == {"state": "waiting", "board": "running", "kind": "track", "live": True,
+                             "waiting_on": "person", "why": "which syllabus?", "idle_for": 0,
+                             "loop": False, "agent": False, "held": ""})
+    ok("…and the three facts the Home tab and cc-pulse used to read for themselves: a live loop, a live agent mark, "
+       "a person's hold — so neither needs a process table, a tmux or a board field of its own",
+       {k: v for k, v in snapshot([("r", "t", F(status="queued", loops=[2], agent="@1:9", agent_live=True, held=" mine "),
+                                     "running", "", "")])["tracks"]["r/t"].items() if k in ("loop", "agent", "held")}
+       == {"loop": True, "agent": True, "held": "mine"})
+    ok("`todo` is an older board's word for `queued`, and the snapshot says `queued` — one vocabulary for every reader",
+       eff(status="todo") == "queued" and eff(status="queued") == "queued")
 
     # A SUBAGENT IS NOBODY TO /proc (owner, 2026-09-04: backlog rows run as a planning session's subagents). No
     # worker, no loop, no window of the track's own — so the row went to NEEDS YOU as "nothing says why" ten
@@ -1801,6 +1888,16 @@ def selfcheck():
                        capture_output=True, text=True, timeout=120)
         ok("end to end: …and one nobody took still pages the owner",
            sum("board" in ln for ln in open(f"{th}/notify.log").read().splitlines()) == base + 1)
+        def tree(root):   # every file under it with its size and mtime: what a pure read must leave exactly as it found
+            out = {}
+            for d, _, fs in os.walk(root):
+                for x in fs:
+                    try:
+                        st_ = os.stat(f"{d}/{x}"); out[f"{d}/{x}"] = (st_.st_size, st_.st_mtime_ns)
+                    except OSError:
+                        pass
+            return out
+        before = tree(f"{th}/.cc")
         r3 = subprocess.run([sys.executable, os.path.realpath(__file__), "snapshot"],
                             env=env, capture_output=True, text=True, timeout=120)
         snp = json.loads(r3.stdout)
@@ -1808,7 +1905,16 @@ def selfcheck():
            snp["tracks"][f"{repo}/t1"]["state"] == "waiting"
            and snp["tracks"][f"{repo}/t1"]["waiting_on"] == "person"
            and "which schema?" in snp["tracks"][f"{repo}/t1"]["why"])
-        ok("end to end: …and leaves it on disk for cc-digest and `cc ls` to read",
+        ok("end to end: …and WRITES NOTHING — no reconcile.json, no wedged ledger, no sweep's leftovers: the Home tab "
+           "and cc-pulse take one per pass, and a pass must never move the timer's state",
+           r3.returncode == 0 and not os.path.exists(f"{th}/.cc/state/reconcile.json") and tree(f"{th}/.cc") == before)
+        rA = subprocess.run([sys.executable, os.path.realpath(__file__), "snapshot", "--apply"],
+                            env=env, capture_output=True, text=True, timeout=120)
+        ok("end to end: …and refuses --apply and --notify outright, rather than quietly doing either",
+           rA.returncode == 2 and "writes nothing" in rA.stderr and tree(f"{th}/.cc") == before)
+        subprocess.run([sys.executable, os.path.realpath(__file__), "--no-net", "--grace", "0"],
+                       env=env, capture_output=True, text=True, timeout=120)   # the timer's shape: unfiltered, so it writes
+        ok("end to end: the unfiltered run is what leaves it on disk for cc-digest and `cc ls` to read",
            json.load(open(f"{th}/.cc/state/reconcile.json"))["tracks"][f"{repo}/t1"]["state"] == "waiting")
         view_ = lambda: subprocess.run([sys.executable, os.path.realpath(__file__), "view"], env=env,
                                        capture_output=True, text=True, timeout=60)
@@ -1833,7 +1939,7 @@ def selfcheck():
         rS = subprocess.run(argvN, env=dict(env, CC_RECONCILE_INJECT="/bin/false"), capture_output=True, text=True, timeout=120)
         snap_ = lambda: json.loads(subprocess.run([sys.executable, os.path.realpath(__file__), "snapshot"], env=env,
                                                   capture_output=True, text=True, timeout=120).stdout)["tracks"]
-        snpS = snap_().get(f"{repo}/sess9") or {}   # a filtered run never writes the file: `snapshot` is the unfiltered one
+        snpS = snap_().get(f"{repo}/sess9") or {}   # `snapshot` is pure: it is the box as it stands, not the file
         ok("end to end: a session's question reaches the owner like a track's — `waiting` on the board, in the run's "
            "output, in the snapshot with who and why, and paged when no session took it",
            cb("get", repo, "sess9", "status").stdout.strip() == "waiting" and "sess9" in rS.stdout
@@ -1936,6 +2042,24 @@ def selfcheck():
         ok("end to end: a PR named by a live cc-land argv is being landed — no nag", offered() == 2)
         subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
         ok("end to end: …and one that falls out of a lane unlanded is news again, once", offered() == 3)
+        # …and the gap BETWEEN two rounds, which is where the nag actually got out (PR #421, 2026-09-11): the round
+        # ended at 10:47Z and took its job file with it, the next was queued at 10:53Z, and the tick fell between
+        # them. cc-land's work record is the one thing that stands through that gap.
+        os.makedirs(f"{th}/.cc/state/land/root", exist_ok=True)
+        rootp = f"{th}/.cc/state/land/root/{repo}-9.json"
+        json.dump({"repo": repo, "pr": 9, "reviews": 2, "repairs": 1}, open(rootp, "w"))
+        json.dump({}, open(seenp, "w"))                  # a clean ledger: only the record can silence this run
+        o_ = offered()
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: a PR between two landing rounds — no job file, but a work record a landing wrote minutes "
+           "ago — is mid-flight, not abandoned: no nag", offered() == o_)
+        cold = now() - BETWEEN_ROUNDS - 60
+        os.utime(rootp, (cold, cold))
+        json.dump({}, open(seenp, "w"))
+        subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+        ok("end to end: …and a record older than that is history, not a landing: the same row is nagged once",
+           offered() == o_ + 1)
+        os.remove(rootp)
 
         # A PARKED PROJECT IS NOT NAGGED — not its session, not the owner. The REAL cc-pause is asked here, reading
         # the real flag file in this scratch HOME, so the whole path is pinned rather than a stand-in for it. Its own
@@ -2049,6 +2173,104 @@ def selfcheck():
            and f"{repo}/stray" in rS.stdout and "a worktree with no board entry" in rS.stdout)
         shutil.rmtree(f"{th}/.cc/worktrees/{repo}/stray", ignore_errors=True)
         shutil.rmtree(f"{th}/.cc/worktrees/_ccsbx99999999", ignore_errors=True)
+        # A DELIVERY IN FLIGHT IS NOT A WORKTREE THE BOARD NEVER HEARD OF (2026-09-11, twice: PR #425 open and
+        # PR #429 queued, both reported, both a wasted seat wake-up). A real checkout on a real branch, `gh` faked
+        # on PATH the way the pending cases fake it, and the PR list swapped per case — so what is pinned is the
+        # rule and not the fixture. The control comes FIRST: with no PR at all the worktree is still reported.
+        deliv, prj = f"{th}/.cc/worktrees/{repo}/deliver", f"{th}/prs.json"
+        os.makedirs(f"{th}/dev/{repo}", exist_ok=True)      # branch_prs asks from the repo's own checkout or not at all
+        subprocess.run(["git", "init", "-q", "-b", "track/deliver-x", deliv], capture_output=True, timeout=30)
+        open(f"{th}/gh", "w").write(f'#!/bin/sh\ncase "$*" in\n  *"pr list"*) cat {prj} ;;\n  *) echo OPEN ;;\nesac\n')
+        os.chmod(f"{th}/gh", 0o755)
+
+        def orphaned(*flags):
+            open(prj, "w").write(flags[0])
+            r_ = subprocess.run([sys.executable, os.path.realpath(__file__), repo, *flags[1:]],
+                                env=penv, capture_output=True, text=True, timeout=120)
+            return f"{repo}/deliver" in r_.stdout
+
+        ok("a worktree whose branch has no PR and no landing is work the board never heard of, as it always was",
+           orphaned("[]", "--grace", "0"))
+        ok("…but one whose branch has an OPEN PR is a delivery in flight — the builder's worktree is named for its "
+           "branch, so no row will ever carry that name, and the offer is a wake-up that finds nothing to do",
+           not orphaned('[{"number":9,"state":"OPEN"}]', "--grace", "0"))
+        ok("…while a PR that is closed and nobody is landing leaves the worktree a leftover again: reported",
+           orphaned('[{"number":9,"state":"CLOSED"}]', "--grace", "0"))
+        os.makedirs(f"{th}/.cc/state/land", exist_ok=True)
+        json.dump({"repo": repo, "pr": 9}, open(f"{th}/.cc/state/land/{repo}-9.json", "w"))
+        ok("…and the same PR with a job in the landing queue is mid-delivery, whatever state GitHub says it is in",
+           not orphaned('[{"number":9,"state":"CLOSED"}]', "--grace", "0"))
+        os.remove(f"{th}/.cc/state/land/{repo}-9.json")
+        ok("a worktree made inside the grace window is not reported before its row or its PR can exist",
+           not orphaned("[]"))
+        ok("…and with no network the branch cannot be looked up, so nothing is forgiven on suspicion",
+           orphaned('[{"number":9,"state":"OPEN"}]', "--grace", "0", "--no-net"))
+        # the board's OWN answer, no network needed: a row that names this directory is a board entry for it
+        cb("add", repo, "namedwt", "a row whose worktree is not named after it", "")
+        cb("set", repo, "namedwt", "worktree", deliv)
+        ok("a row that names the directory outright is the board having heard of it, under any row name and with "
+           "no GitHub in it at all", not orphaned("[]", "--grace", "0", "--no-net"))
+        shutil.rmtree(deliv, ignore_errors=True)
+    # ONE FIXTURE, EVERY CONSUMER (arch review 2026-09-08, rec 8). Five tracks the box disagrees with its board about —
+    # a stale board, a blocked journal, a live worker, an idle pane, an agent mark — decided here once, and the Home
+    # tab and cc-pulse must read the same word, liveness, who and why off that snapshot: both are imported as modules
+    # and handed the rows the way home_snapshot() and Run.snapshot() hand them, so neither has a ladder of its own left
+    # to disagree with. `cc ls` and cc digest take `view`, which is this same dict on disk. No process and no tmux: the
+    # facts ARE the fixture, exactly as in the decision table above.
+    def load(name):
+        import importlib.machinery, importlib.util
+        sp = importlib.util.spec_from_loader(name.replace("-", "_"),
+                                             importlib.machinery.SourceFileLoader(name.replace("-", "_"), f"{BIN}/{name}"))
+        m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+        return m
+    five = {"stale": F(status="blocked", live=True, workers=[1]),              # the board says blocked; a worker is in it
+            "asked": F(status="running", journal=("BLOCKED", "which key?")),    # its journal declared a question
+            "worker": F(status="running", live=True, workers=[1], loops=[2]),   # a loop and its worker, working
+            "idle": F(status="running", live=True, pane_idle=3 * 3600),         # a pane open, nobody at it for 3 h
+            "marked": F(status="queued", agent="@3:900", agent_live=True)}      # a live session's subagent has it
+    rows5 = []
+    for t, fx5 in five.items():
+        st5 = effective(fx5, decide(fx5))
+        rows5.append(("r", t, fx5, st5) + (waits_for(fx5) if st5 not in TERMINAL else ("", "")))
+    snap5 = snapshot(rows5)["tracks"]
+    ok("the fixture decides as the table says — running · waiting · running · idle · running, alive where something "
+       "is, the question and the mark and the loop and the idle clock carried",
+       {k: (v["state"], v["live"], v["waiting_on"]) for k, v in snap5.items()}
+       == {"r/stale": ("running", True, ""), "r/asked": ("waiting", False, "person"), "r/worker": ("running", True, ""),
+           "r/idle": ("idle", True, ""), "r/marked": ("running", True, "")}
+       and snap5["r/asked"]["why"] == "which key?" and snap5["r/marked"]["agent"] and snap5["r/worker"]["loop"]
+       and snap5["r/idle"]["idle_for"] == 3 * 3600)
+    th5 = tempfile.mkdtemp(prefix="cc-reconcile-consumers-")
+    try:
+        os.makedirs(f"{th5}/.cc/boards")
+        board5 = {t: {"status": fx5["status"], "updated": "2026-09-01T00:00:00Z"} for t, fx5 in five.items()}
+        json.dump({"repo": "r", "tracks": board5}, open(f"{th5}/.cc/boards/r.json", "w"))
+        slack, pulse = load("cc-slack"), load("cc-pulse")
+        slack.HOME = th5
+        home5 = {t["name"]: t for t in slack.home_tracks(snap5, {})[0]}
+        ok("THE HOME TAB SAYS WHAT THIS SAID — the same word and the same question for all five, the board it "
+           "contradicts printed as stale, the idle clock and no iteration count where no loop is: it reads "
+           "home_snapshot() and decides nothing of its own",
+           {k: v["state"] for k, v in home5.items()} == {k: v["state"] for k, v in snap5.items()}
+           and {k: v["reason"] for k, v in home5.items()}
+               == {k: (v["why"] if v["waiting_on"] == "person" else "") for k, v in snap5.items()}
+           and "board stale" in home5["r/stale"]["detail"] and "board stale" in home5["r/marked"]["detail"]
+           and "idle 3h" in home5["r/idle"]["detail"] and "board stale" not in home5["r/worker"]["detail"])
+        pw5 = pulse.words("r", board5, snap5)
+        ok("AND cc-pulse SAYS THE SAME — the word each row wears for its tick is this snapshot's, and the marked row is "
+           "the one a subagent has: it reads Run.snapshot() and lists no tmux and no ps of its own",
+           {k: w for k, (w, _, _) in pw5.items()} == {k.split("/", 1)[1]: v["state"] for k, v in snap5.items()}
+           and {k for k, (a, _) in ((k, (a, h)) for k, (_, a, h) in pw5.items()) if a} == {"marked"}
+           and not any(h for _, _, h in pw5.values()))
+        home0 = {t["name"]: t for t in slack.home_tracks({}, {})[0]}
+        pw0 = pulse.words("r", board5, None)
+        ok("…and with NO snapshot both fall back the way `view` does — the board's own word, nothing alive, no question, "
+           "no mark holding — so a decider that cannot answer never splits the two",
+           {k: (v["state"], v["reason"], v["detail"]) for k, v in home0.items()}
+           == {f"r/{t}": (r["status"], "", "—") for t, r in board5.items()}
+           and pw0 == {t: (r["status"], False, False) for t, r in board5.items()})
+    finally:
+        shutil.rmtree(th5, ignore_errors=True)
     # A PIPE PLANTED WHERE A BOARD SHOULD BE (review of #224): the read is cc-board's opener now, so it is no board, never a hang
     def bounded(fn, secs=10):   # a read that hangs on the pipe (a plain open would, for good) fails THIS case, not the suite
         import threading

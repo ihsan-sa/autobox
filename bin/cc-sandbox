@@ -6,6 +6,19 @@
 #                                           NOTHING OF THIS BOX — no home, no ~/.cc, no credential, no repo, no network, not
 #                                           even the hostname. The mail door reads a stranger's attachment in here
 #                                           (core/mail/vetting.py). Always bwrap: no opt-in and no fallback to the host.
+#   cc-sandbox probe <home> -- <cmd...>     A PROBE'S BOUNDARY (cc-probe): claude runs with HOME=<home>, a throwaway fixture
+#                                           under ~/.cc/state/probes/ that the runner built and will delete, so every command
+#                                           it tries reads and writes the fixture's ~/.cc and ~/dev and never the box's — those
+#                                           are ABSENT, not denied: of the box's ~/.cc only the fixture's own directory is there
+#                                           (no config, no boards, no track state, no Slack socket, no landing queue); no ~/dev
+#                                           beyond core/bin, no ~/.config/gh, no ~/.ssh, no tmux, no container socket, --clearenv.
+#                                           The session is gated as a worker (CC_ROLE=worker: cc-guard is its hook). Inside
+#                                           <home>: ~/bin → the box's ~/bin (ro, so cc-guard and the commands under test are the
+#                                           real ones), ~/.claude a tmpfs holding the SAME stripped credential a worker gets
+#                                           (access token, no refresh token, gone with the run), settings = his + the sealed
+#                                           baseline, ro, and ~/.claude/projects/<slug> bound from the host's ~/.claude/projects
+#                                           so the transcript lands where cc-spend counts it. Network untouched (claude needs
+#                                           it; egress is not contained here either, see NETWORK). Always bwrap, no fallback.
 #   cc-sandbox reconcile <repo> <track>     fold what the worker committed in its own branch namespace onto the host's
 #                                           refs/heads/track/<track> (compare-and-swap). cc-loop runs it after every
 #                                           iteration, before the checkpoint that pushes; a no-op if nothing moved.
@@ -40,6 +53,11 @@
 #     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets
 #     — except in a workspace GRANTED a GitHub token (`cc-sandbox github`, below): there ~/.config/gh and ~/.gitconfig hold
 #     that token and its credential helper, read-only, and nothing else of either.
+#   cc-sandbox member <handle> [<track>] --tree <dir> -- <cmd...>   THE SAME BOUNDARY, WITH ONE TREE OF THE HOST'S IN IT: <dir>
+#     — a landing's throwaway checkout, `${TMPDIR:-/tmp}/cc-land.run.*/cc-land.gates.*/head` and nothing else — is bound
+#     read-write at its own path and is the working directory. This is how a member project's PR is gated (cc-land, MEMBERS): the merged
+#     tree is built on the host, and its test scripts run in HERE, in the member's world, never on the host as the owner.
+#     Nothing else about the boundary changes: same binds, same asks, same cleared environment, same credential wall.
 #   cc-sandbox mint <handle> [--from <file>]   THE WORKSPACE'S OWN CREDENTIAL, the one thing `member` will not start without.
 #     It runs claude in a THROWAWAY HOME so <handle> logs in there, then installs what that login produced at
 #     ~/.cc/members/<handle>/credentials.json, mode 600 — the path and shape the boundary reads. `--from <file>` installs a
@@ -145,6 +163,7 @@
 #   worktree's. Review the branch before running it.
 set -uo pipefail
 H="$HOME"; SELF=$(readlink -f "$0")
+TREE=""   # `member … --tree <dir>`: one host tree bound into the boundary as the working directory (a landing's gates)
 slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.claude/projects: every / and . becomes -
 # ── THE PERMISSION BASELINE OF A SEALED SESSION ───────────────────────────────────────────────────────────────────
 # A prompt the boundary already answers buys no safety and costs the owner a message. Worse, a stream of harmless ones
@@ -216,12 +235,12 @@ settings_copy(){   # $1 "" | owner → stdout: the settings.json the sealed sess
             allow: ((.permissions.allow // []) + ($a - (.permissions.allow // []))),
             ask:   ((.permissions.ask   // []) + ($k - (.permissions.ask   // [])))})}' "$s" \
     || { echo "cc-sandbox: the sealed-session baseline would not merge into ~/.claude/settings.json — is permissions.allow or permissions.ask something other than a list?" >&2; return 1; }; }
-settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | owner (settings_copy's) → put the copy there and mount it ro at his path
+settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | owner (settings_copy's) · [$3 where the copy is seen inside, default his path] → put the copy there and mount it ro
   # It has to be a REAL FILE ON THE HOST, ro-bound like any other path. Measured 2026-09-02: handed in over an fd
   # (`--ro-bind-data`, `--file`) the copy is readable inside — jq reads it — and claude applies NONE of it, his own
   # rules included, so a session got no settings at all. The mount, not the copy, is what makes it read-only, and a
   # session that could rewrite its own settings.json could unregister cc-guard from it.
-  local d="$1" own="${2:-}" f
+  local d="$1" own="${2:-}" at="${3:-$H/.claude/settings.json}" f
   if mkdir -p "$d" 2>/dev/null; then
     f="$d/settings.json"
     # THREE things have to hold before it is installed, and the middle one is not redundant: settings_copy can fail
@@ -229,7 +248,7 @@ settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | o
     # Either way the copy is not the file it claims to be, so it is re-read as JSON here and a bad one is never
     # mounted — the fallback below is strictly better than a session holding an empty settings.json.
     if ( umask 077; settings_copy "$own" > "$f.tmp.$$" ) && jq -e . "$f.tmp.$$" >/dev/null 2>&1 && mv "$f.tmp.$$" "$f"; then
-      B+=(--ro-bind "$f" "$H/.claude/settings.json"); return 0; fi
+      B+=(--ro-bind "$f" "$at"); return 0; fi
     rm -f "$f.tmp.$$"; fi
   # No usable copy — it could not be built, or could not be written. Bind HIS file unchanged rather than nothing:
   # the hooks in there are the box's mechanical gates, and a session with no settings at all has no cc-guard either.
@@ -240,7 +259,9 @@ settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | o
   else
     echo "cc-sandbox: no ~/.claude/settings.json to build a sealed-session copy from — binding no settings at all. The permission baseline is NOT applied and no hook is registered: this session prompts like an unsandboxed one." >&2
   fi
-  [ -f "$H/.claude/settings.json" ] && B+=(--ro-bind "$H/.claude/settings.json" "$H/.claude/settings.json"); return 0; }
+  # AT $at, the path the caller asked for: under `probe` his path is inside the tmpfs $H while HOME is the fixture, so a
+  # fallback bound at his path would leave the probe with no settings and no hook while this line says the file was bound
+  [ -f "$H/.claude/settings.json" ] && B+=(--ro-bind "$H/.claude/settings.json" "$at"); return 0; }
 track_gitdir(){   # $1 the parent repo · $2 the track worktree → $1/.git/worktrees/<n>, THE ONE BOTH SIDES AGREE ON, or 1
   # The worktree's `.git` is a gitlink FILE in a tree the worker writes, so its text is not on its own a reason to bind
   # anything rw. It is read here for the NAME only, and the name is then required to be a plain entry under the host's
@@ -478,6 +499,46 @@ launch_vet(){   # cc-sandbox vet -- <cmd...> — THE BOUNDARY THE BOX PROVIDES F
     --tmpfs /etc --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache --ro-bind-try /etc/magic /etc/magic \
     --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
     --setenv PATH /usr/bin:/bin --setenv HOME /tmp --setenv TMPDIR /tmp --setenv LC_ALL C -- "$@"; }
+launch_probe(){   # cc-sandbox probe <home> -- <cmd...> — the header's `probe` paragraph, and the reasons here
+  local fx="$1" cred="$H/.claude/.credentials.json" tok exp left cb slugd real; shift
+  # THE FIXTURE IS THE HOME. A worker keeps the real HOME and gets binds; a probe's whole point is that the board,
+  # the config, the Slack client and the rest resolve ~/.cc to a directory that is thrown away afterwards, and the
+  # cheapest way to make every one of them do that at once is HOME itself. claude follows HOME too, so its config,
+  # credential and transcripts move with it — each handled below. The dir is the runner's own, under one root no
+  # other bind of any boundary reaches, and it is refused anywhere else: a HOME the caller chose is a HOME the
+  # caller could point at his real one.
+  real=$(readlink -f -- "$fx" 2>/dev/null) || real=""
+  case "$real" in "$H"/.cc/state/probes/*) [ -d "$real" ] && [ "$real" = "$fx" ] || real="";; *) real="";; esac
+  [ -n "$real" ] || { echo "cc-sandbox: a probe home is a real directory under ~/.cc/state/probes/, not '$fx' — nothing started." >&2; exit 2; }
+  command -v bwrap >/dev/null 2>&1 || { echo "cc-sandbox: bwrap is not installed, so there is no boundary to probe inside — nothing was run." >&2; exit 2; }
+  tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred" 2>/dev/null) || tok=""
+  if [ -z "$tok" ]; then echo "cc-sandbox: no access token in $cred — claude inside will not authenticate" >&2
+  else exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred" 2>/dev/null); left=$(( ${exp:-0} / 1000 - $(date +%s) ))
+    [ "$left" -lt 3900 ] && echo "cc-sandbox: the access token expires in $((left / 60)) min — a probe still running then errors" >&2; fi
+  slugd="$H/.claude/projects/$(slug "$fx")"; mkdir -p "$slugd" "$fx/.claude" || exit 2
+  ln -sfn "$H/bin" "$fx/bin"   # his settings register hooks as $HOME/bin/cc-guard: the fixture's ~/bin is the box's, ro inside
+  B=(--die-with-parent --unshare-pid --clearenv
+     --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin
+     --ro-bind /etc /etc --proc /proc --dev /dev --tmpfs /tmp --tmpfs "$H"
+     --ro-bind "$H/bin" "$H/bin" --ro-bind "$H/.local/bin" "$H/.local/bin")
+  cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
+  [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
+  [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
+  for f in .local/share/claude .npmrc; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done
+  # ORDER IS MOUNT ORDER: the fixture rw, then a tmpfs over its ~/.claude (the credential copy lives in memory and
+  # not in a run directory on disk), then the one host dir inside that tmpfs — the transcript's — and the settings copy.
+  pinq --bind "$fx"
+  B+=(--tmpfs "$fx/.claude" --bind "$slugd" "$fx/.claude/projects/$(slug "$fx")")
+  settings_bind "$H/.cc/sandbox/probe" "" "$fx/.claude/settings.json"
+  B+=(--setenv HOME "$fx" --setenv PATH "$H/bin:$H/.local/bin:/usr/bin:/bin" --setenv TMPDIR /tmp --setenv LANG C.UTF-8
+      --setenv TERM dumb --setenv CC_ROLE worker --setenv CC_PROBE 1
+      --setenv GIT_AUTHOR_NAME probe --setenv GIT_AUTHOR_EMAIL probe@sandbox --setenv GIT_COMMITTER_NAME probe --setenv GIT_COMMITTER_EMAIL probe@sandbox
+      --chdir "$fx")
+  # fd 3: a ~/.claude.json MADE FROM NOTHING OF HIS — the two first-run flags on the fixture's own path and no MCP server;
+  # fd 4: the credential copy — claudeAiOauth minus its refresh token, nothing else of the file (the worker's, exactly)
+  exec bwrap "${B[@]}" --perms 0600 --file 3 "$fx/.claude.json" --perms 0600 --file 4 "$fx/.claude/.credentials.json" -- "$@" \
+    3< <(jq -n --arg fx "$fx" '{hasCompletedOnboarding: true, projects: {($fx): {hasTrustDialogAccepted: true}}, mcpServers: {}}') \
+    4< <(jq '{claudeAiOauth: ((.claudeAiOauth // {}) | del(.refreshToken))}' "$cred" 2>/dev/null || printf '{}'); }
 board_dir(){   # $1 handle — THE BOARD IS ONE FILE ON BOTH SIDES. ~/.cc/boards/<h>.json and .lock become links into
   # ~/.cc/members/<h>/board/, and build_member binds THAT DIRECTORY as the session's ~/.cc/boards. The file itself used to be
   # bound, and a file bind pins an inode: cc-board saves by renaming a new file over the old one, so every host save swapped
@@ -559,6 +620,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"
+  [ -n "$TREE" ] && cwd="$TREE"   # …or the landing's tree (--tree): checked in launch_member before this runs, bound below
   cb=$(dirname "$SELF")   # the bin THIS copy lives in (~/bin is symlinks into the control repo's core/bin; a track worktree tests its own), bound AS ~/bin
   gw="$H/.cc/sandbox/$h/gitwall"   # THE HOST'S OWN COPIES, in a dir under no bind below: the source of a wall is never a path the walled-off session can reach
   mkdir -p "$m/claude/projects" "$m/npm" "$m/cache" "$m/board" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$sl/files" "$H/.cc/boards" "$gw"; : >> "$sl/enabled"
@@ -641,6 +703,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
      --setenv HOME "$H" --setenv PATH "$H/bin:$H/.local/bin:/usr/local/bin:/usr/bin:/bin" --setenv CC_MEMBER_SANDBOX 1 --setenv CC_ROLE member
      --setenv GIT_AUTHOR_NAME "$h" --setenv GIT_AUTHOR_EMAIL "$h@member.$(hostname -s)" --setenv GIT_COMMITTER_NAME "$h" --setenv GIT_COMMITTER_EMAIL "$h@member.$(hostname -s)"
      --chdir "$cwd")
+  [ -n "$TREE" ] && B+=(--bind "$TREE" "$TREE")   # the one host tree a landing's gates run on, rw, at its own path (see the header)
   # His hooks (cc-guard: depth inside the wall) come through this copy unchanged, with the sealed-session permissions
   # appended. ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside.
   # THE OWNER'S OWN WORKSPACE asks nothing (cc-sandbox own). The marker sits in $m, which no bind above reaches — only
@@ -659,9 +722,20 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
 launch_member(){   # $1 handle · $2 track · the rest is the command — the WORKSPACE'S OWN credential, or no launch at all;
                    # a narrower ~/.claude.json
   local h="$1" tr="$2" dev="$H/dev/$1" cred="$H/.claude/.credentials.json" own="$H/.cc/members/$1/credentials.json" mcp='{}' cwd why
+  if [ -n "$TREE" ]; then
+    # ONLY A LANDING'S OWN CHECKOUT: the resolved path must be the throwaway tree cc-land names (its head_checkout
+    # contract, `cc-land.run.<pid>.<random>/cc-land.gates.<repo>.<pr>.<random>/head` under the run's own root, since
+    # 2026-09-11) — not a link to anywhere, not a path under ~/dev or ~/.cc, which a name like that resolved to would
+    # be. A tree that is not there is refused, never made.
+    why=$(readlink -f -- "$TREE" 2>/dev/null) || why=""
+    case "$why" in "${TMPDIR:-/tmp}"/cc-land.run.*/cc-land.gates.*/head) ;; *) echo "cc-sandbox: --tree takes a landing's own checkout (TMPDIR/cc-land.run.*/cc-land.gates.*/head), not '$TREE'" >&2; exit 2;; esac
+    [ -d "$why" ] && [ ! -L "$TREE" ] || { echo "cc-sandbox: --tree $TREE is not a directory of its own" >&2; exit 2; }
+    TREE="$why"
+  fi
   build_member "$h" "$tr"; shift 2
   [ -z "$tr" ] || [ -d "$H/.cc/worktrees/$h/$tr" ] || { echo "cc-sandbox: no worktree for $h/$tr" >&2; exit 2; }
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"   # the same cwd build_member chdirs to: the trust key is its git root
+  [ -n "$TREE" ] && cwd="$TREE"
   # WHATEVER CREDENTIAL IS INSIDE, THE MEMBER CAN PRINT IT — they drive a session in there. A workspace runs on the credential
   # MINTED FOR IT at ~/.cc/members/<h>/credentials.json (bound rw at ~/.claude/.credentials.json — the member sees the file
   # at claude's path and never its host path), and without one it does not start. What it must never be again is the
@@ -916,7 +990,7 @@ github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitH
   echo "cc-sandbox: ~/dev/$r holds $f from its next launch (~/.cc/members/$r/github-token) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
-  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree
   cb=$(dirname "$SELF")   # the host side of every board case below: THIS tree's cc-board, which resolves a linked board before it renames
   dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
   : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
@@ -1117,6 +1191,37 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'gitwall: a second session swapping a track name DURING the launch never reaches the mount — the descriptor was already the real gitlink' \
     "$(g RAN)/$(grep -c decoy-git <<<"$out")" yes/0
   out=$("$SELF" member "$o" -- true 2>&1); t 'member: a repo without the marker is refused' "${out#*: ~/dev/}" "$o is not a member workspace (no .cc/member-workspace)"
+  # ── --tree: A LANDING'S OWN CHECKOUT AND NOTHING ELSE (launch_member, build_member). Under a TMPDIR of the fixture's,
+  #    so nothing is made in /tmp. A real directory elsewhere, a link at the right name (to elsewhere, and to another
+  #    landing's real tree) and a name with nothing there are each refused before any bind; the real thing is the cwd,
+  #    rw, with the rest of the boundary as it was.
+  tmp="$H/.cc/sandbox/$h/tmp"; run="$tmp/cc-land.run.4242.xyz"; tree="$run/cc-land.gates.$o.1.abc/head"
+  mkdir -p "$run/cc-land.gates.$o.1.abc" "$run/cc-land.gates.$o.2.def/head" "$tmp/cc-land.gates.$o.3.old/head" || return 1
+  out=$(TMPDIR="$tmp" "$SELF" member "$h" t --tree "$H/dev/$o" -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'tree: a directory outside TMPDIR/cc-land.run.*/cc-land.gates.*/head is refused, the refusal names that shape, and nothing starts' \
+    "$rc/$(grep -c STARTED <<<"$out")/$(grep -cF 'cc-land.run.*/cc-land.gates.*/head' <<<"$out")" 2/0/1
+  out=$(TMPDIR="$tmp" "$SELF" member "$h" t --tree "$tmp/cc-land.gates.$o.3.old/head" -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'tree: the shape from before the run root (TMPDIR/cc-land.gates.*/head, straight under the temp root) is refused too' \
+    "$rc/$(grep -c STARTED <<<"$out")" 2/0
+  for pl in "$H/dev/$o" "$run/cc-land.gates.$o.2.def/head"; do
+    ln -sfn "$pl" "$tree"
+    out=$(TMPDIR="$tmp" "$SELF" member "$h" t --tree "$tree" -- sh -c 'echo STARTED' 2>&1); rc=$?
+    t "tree: a symlink at the right name is refused, and nothing starts (→ ${pl#"$H/"})" "$rc/$(grep -c STARTED <<<"$out")" 2/0
+    rm -f "$tree"
+  done
+  out=$(TMPDIR="$tmp" "$SELF" member "$h" t --tree "$tree" -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'tree: a name of the right shape with nothing there is refused, not made' "$rc/$(grep -c STARTED <<<"$out")/$([ -e "$tree" ] && echo made || echo none)" 2/0/none
+  mkdir -p "$tree" || return 1
+  out=$(CC_MEMBER_V2=1 TMPDIR="$tmp" "$SELF" member "$h" t --tree "$tree" -- sh -c 'echo STARTED' 2>&1); rc=$?
+  t 'tree: not a cc-member-v2 option — refused before anything runs' "$rc/$(grep -c STARTED <<<"$out")/$(grep -c 'not a cc-member-v2 option' <<<"$out")" 2/0/1
+  out=$(TMPDIR="$tmp" "$SELF" member "$h" t --tree "$tree" -- sh -c '
+    e(){ [ -e "$1" ] && echo present || echo absent; }
+    echo cwd=$PWD; echo wrote=$(echo hi > out.txt 2>/dev/null && echo ok || echo ro)
+    echo other=$(e ~/dev/'"$o"'); echo ssh=$(e ~/.ssh); echo ledger=$(e ~/.cc/state/member-spend.json); echo inside=${CC_MEMBER_SANDBOX:-unset}/${CC_ROLE:-unset}' 2>&1)
+  t 'tree: the landing'"'"'s checkout is the cwd, at its own path' "$(g cwd)" "$tree"
+  t 'tree: …and rw — what the gates write there is on the host afterwards' "$(g wrote)/$(cat "$tree/out.txt" 2>/dev/null)" ok/hi
+  t 'tree: the rest of the boundary is as it was — another repo, ~/.ssh and the ledger absent, the member env set' \
+    "$(g other)/$(g ssh)/$(g ledger)/$(g inside)" absent/absent/absent/1/member
   rm -f "$own" "$kf"
   git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
   rm -rf "${dev:?}" "${H:?}/dev/${o:?}" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$H/.cc/state/$o" "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.lock" "$H/.cc/boards/$o.json" \
@@ -1909,17 +2014,23 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
   vet) shift; [ "${1:-}" = -- ] && shift
        [ $# -gt 0 ] || { echo "usage: cc-sandbox vet -- <cmd...>" >&2; exit 2; }
        launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
+  probe) fx="${2:-}"; shift 2 2>/dev/null; [ "${1:-}" = -- ] && shift
+       [ -n "$fx" ] && [ $# -gt 0 ] || { echo "usage: cc-sandbox probe <home> -- <cmd...>" >&2; exit 2; }
+       launch_probe "$fx" "$@";;   # bwrap or nothing, like vet
   convert) shift; convert "${1:-}"; exit $?;;
   own) shift; own "${1:-}"; exit $?;;
   github) shift; github "${1:-}" "${2:-}"; exit $?;;
-  member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ]; then tr="${1:-}"; shift; fi; [ "${1:-}" = -- ] && shift   # <handle> [<track>|""] [--] cmd
-          [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] -- <cmd...>" >&2; exit 2; }
+  member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ] && [ "${1:-}" != --tree ]; then tr="${1:-}"; shift; fi   # <handle> [<track>|""] [--tree <dir>] [--] cmd
+          if [ "${1:-}" = --tree ]; then TREE="${2:-}"; shift 2; [ -n "$TREE" ] || { echo "cc-sandbox: --tree takes a directory" >&2; exit 2; }; fi
+          [ "${1:-}" = -- ] && shift
+          [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] [--tree <dir>] -- <cmd...>" >&2; exit 2; }
           if [ "${CC_MEMBER_V2:-}" = 1 ]; then
+            [ -z "$TREE" ] || { echo "cc-sandbox: --tree is not a cc-member-v2 option" >&2; exit 2; }
             BIN=$(dirname "$SELF"); exec "$BIN/cc-member-v2" run "$h" "${tr:-$h}" -- "$@"
           fi
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox probe <home> -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
 launch "$repo" "$track" "$@"

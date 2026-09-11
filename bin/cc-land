@@ -20,6 +20,12 @@
                                                   queue, and whether the sweep just started takes it or a sweep
                                                   already running means it waits for the next one
   cc-land queue --task <repo> <row>               complete a task; JSON receipt on stdout, queue only with a grant
+  cc-land queue <handle>--<track> <pr>            a MEMBER WORKSPACE'S project: its PR lands into the member's own
+                                                  repository on the workspace's own token, the gates run inside its
+                                                  sandbox, no deploy, the review charged to its daily cap, a stop
+                                                  said in #<handle> — and nothing of it touches the box (MEMBERS,
+                                                  below). cc-checkpoint --sweep queues these; a session inside the
+                                                  boundary cannot
   cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min). Every
                                                   queued job is gated and reviewed AT ONCE — side by side where their files
                                                   do not overlap, one after another where they do; the merges and the deploy
@@ -36,8 +42,17 @@
                                                   or a review that ran out of its own cap ends it. A PR that
                                                   CANNOT merge yet — a draft, or one that conflicts with its base
                                                   — is HELD, untried and its tries intact, looked at again every
-                                                  15 min and said once in the ledger. A PR that merged while its
-                                                  review ran gets no round at all — it is deployed
+                                                  15 min and said once in the ledger; a CONFLICT first sends ONE
+                                                  rebase round to the PR's own track, the way the fix round goes,
+                                                  and the push re-queues it. A fix round is asked only for what
+                                                  cc-guard lets a track do; a finding the review marks NOT THE
+                                                  TRACK'S is left to the person it names, and a review made only
+                                                  of those dispatches nothing. A PR that merged while its
+                                                  review ran gets no round at all — it is deployed. The board
+                                                  step closes the PR's own row and every row its body names
+                                                  with `Closes <row>` (`Closes a, b and c` — commas, `and`, or
+                                                  both; anywhere in the body, so the brief's own sentence counts);
+                                                  a row a person holds or a track is live on is left open and said
   cc-land cancel <repo> <pr> --reason "<why>"     take a queued job out, on the record: the reason goes in the
                                                   ledger. A job a running sweep is landing right now is refused
   cc-land status <repo> <pr>                      is this PR being landed, by ANY path: the queue job, a direct
@@ -252,6 +267,8 @@ PREPARE_AT_ONCE = int(os.environ.get("CC_LAND_PREPARE") or gate_slots())   # job
 GATE_IDLE = 3600                          # a gate that has said NOTHING for this long is dead, and is killed. Silence, not
                                           # wall clock: a suite waiting for one of its slots says so every minute, and
                                           # PR #227's landing counted that wait as the run — timed out, empty log (09-04)
+FAIL_LOG_KEEP = 256 * 1024                # what stays of a RED gate's log after the run: its last bytes, where the
+                                          # failure is; the megabytes of progress above them are read by nobody afterwards
 # The review gate. ONE generic prompt, shipped beside this script (core/config/), because a reviewer per repo is a
 # reviewer nobody maintains; what a repo wants said about ITSELF goes in its own docs/REVIEW.md, read from the BASE
 # branch, never the PR — a change to the rules is reviewed under the old ones, or a PR could rewrite its own reviewer.
@@ -306,10 +323,19 @@ REVIEW_DENY = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebF
                # thing a reviewer never needs — a diff's own worktree is still readable.
                + "".join(f",Read(/{HOME}/{p}),Grep(/{HOME}/{p})" for p in SECRET_PATHS))
 NEVER = "tmux-main.service"               # restarting it takes the shared tmux server — every session on the box — down
+# What a landing says to the person a unit's restart is KEPT for (config/units.json restart=owner), and the row it
+# writes in the ask ledger so the fact outlives the card. Keyed on the unit alone — no PR number, no date — because
+# an ask already open for that unit is what stops the next landing saying it again: between 2026-09-08 and
+# 2026-09-11 three landings changed the code one such unit ran, each left it alone exactly as its row says to, and
+# nothing told the one person who could restart it. It ran the old code for three days while two of those landings
+# were reported landed.
+OWNER_ASK = ("restart {unit}: a landing changed the code it runs and config/units.json keeps its restart for you "
+             "(restart=owner), so the box is on the old code until you run `{cmd}`")
+OWNER_ASK_KEY = "restart {unit}:"         # …and the prefix an ask still open for THIS unit is recognised by
 # The steps a failure of which leaves the BOX wrong, so nothing after them may run. Everything else — card,
 # board, ledger — is a record of what happened, not the thing that happened: it reports ✗, the sequence carries
 # on, and the run exits 3 so the operator still knows one of them wants a hand.
-FATAL = ("review", "gates", "merge", "install", "units", "restart", "daemons")
+FATAL = ("walls", "review", "gates", "merge", "install", "units", "restart", "daemons")   # walls: a member PR's (MEMBERS)
 # …and of those, the ones worth trying AGAIN unattended. A review verdict and a refused merge are decisions: re-running
 # them buys the same answer, and they want a person. install/units/restart fail on the STATE of the box — a checkout
 # parked on a feature branch, a unit mid-restart — which the next attempt may well find fixed, and PR #87 sat
@@ -317,7 +343,8 @@ FATAL = ("review", "gates", "merge", "install", "units", "restart", "daemons")
 # (cc-slack's selfcheck, boarded apart), and a job that ended on a flake is why 39 tmux lanes chained waiter pids into
 # a queue of their own on top of this one. A PR that CONFLICTS, or is a DRAFT, never reaches that step from the
 # queue: it cannot merge yet, so run_job HOLDS it with its tries intact rather than burning them fifteen minutes
-# apart (Land.held). A usage limit at the review is neither: the job is DEFERRED to the reset, uncounted (see run_job).
+# apart (Land.held) — a conflict after ONE rebase round sent to its own track (dispatch_fix). A usage limit at the
+# review is neither: the job is DEFERRED to the reset, uncounted (see run_job).
 RETRY = ("gates", "install", "units", "restart", "daemons")
 RETRY_AFTER = 900                         # …and how long a kept job waits before the queue re-runs itself (see rearm)
 # A LAND-AFTER-FIX is the one stopping verdict that names its own remedy, and dispatching that remedy was a dozen
@@ -348,6 +375,12 @@ ROOT_REPAIRS = 1        # …and repair rounds per change: a SECOND model stop g
                         # whichever job it arrives on. The round is the FIX that answers a LAND-AFTER-FIX, whoever
                         # pushed it — the queue's own dispatch, or a person's builder (PR #410, 2026-09-11, refused
                         # at the wall for a fix that answered the findings line by line): see reads_earned().
+ROOT_REBASES = 1        # …and REBASE rounds per change: a PR that conflicts with its base goes back to its own track
+                        # to rebase, once, the way a LAND-AFTER-FIX does (dispatch_fix). #417 and #418 (2026-09-11)
+                        # were held on a conflict with no route back until the seat rebased them by hand through
+                        # subagents. Counted apart from `repairs`: a conflict is not a verdict, a change may meet
+                        # both, and a resolved conflict is a moved diff — so the round earns the read of it
+                        # (reads_earned), or the re-queue would be refused at the wall for a diff nobody read.
 ROOT_TTL = 30 * 86400   # a record for a PR nobody ever landed is swept, so an abandoned change cannot bound a
                         # later one that reuses its number.
 COSMETIC = 3                              # exit code for "the box is right, its bookkeeping is not"
@@ -364,7 +397,16 @@ class Skip(Exception):
 
 # ── the outside world, each in one place, so `selfcheck` can stand in for all of it ──────────────────────
 def sh(argv, cwd=None, timeout=300, stdout_only=False, **kw):
-    """(returncode, output) — stdout and stderr together, never a raise: every caller decides what failure means."""
+    """(returncode, output) — stdout and stderr together, never a raise: every caller decides what failure means.
+    A `gh` or `git` run in a MEMBER CLONE (member_root) carries that workspace's own GitHub token in its environment
+    and nothing of the box's login — decided here, where every call passes, so no call site can forget it (and none
+    can be added that does). Without a token for that workspace nothing runs there at all: git's helper would
+    otherwise fall back to the box's own login, which is the one credential a member landing must never hold."""
+    if argv and argv[0] in ("gh", "git") and cwd and member_root(cwd):
+        tok = member_token(member_root(cwd))
+        if not tok:
+            return 1, f"no GitHub token granted to workspace {member_root(cwd)} (cc-sandbox github <workspace>) — nothing asked"
+        kw["env"] = dict(kw.get("env") or os.environ, GH_TOKEN=tok, GH_CONFIG_DIR=f"{cwd}/.gh-none")   # env, never argv
     try:
         r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, **kw)
         if stdout_only:
@@ -384,6 +426,140 @@ def kill_group(p):
         os.killpg(p.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         p.kill()
+
+
+# ── the run's scratch root ───────────────────────────────────────────────────────────────────────────────
+# "each landing's checkout and logs live under one job-owned scratch root, removed in the worker's outermost
+# finally, keeping only bounded failure logs" (row a-landing-cleans-its-own-scratch, 2026-09-11).
+_RUN = {"root": None, "keep": set(), "lock": threading.Lock()}
+KEPT = ".kept"       # the marker drop_run_root leaves in a root it kept a red gate's log in: a FINISHED run's, for the
+                     # janitor's age and room lines to reclaim — never the next worker's, which takes only a KILLED run's
+
+
+def run_root():
+    """THIS PROCESS's scratch root, `<tmp>/cc-land.run.<pid>.<random>`, made on first use. Everything a landing throws
+    away is made inside it — the review's and the gates' checkouts, the gate logs — so that drop_run_root() in
+    main()'s finally takes the lot with one walk, whatever step the run stopped at. The PID in the name is what makes
+    a root LEFT BEHIND identifiable: a worker killed mid-gate, or a box rebooted under one, leaves exactly one of
+    these, and the next worker removes every root whose pid is not a live cc-land (sweep_run_roots). Until 2026-09-11
+    each checkout and each log was its own entry in /tmp, owned by nothing once its step was over: seven dead gate
+    directories from landings of 09-03..09-07 sat there a week, and /tmp reached 9.7 GB once."""
+    with _RUN["lock"]:                   # gate threads ask at once; two roots would leave one for the next worker
+        root = _RUN["root"]
+        if root and os.path.isdir(root):
+            return root
+        _RUN["root"] = tempfile.mkdtemp(prefix=f"cc-land.run.{os.getpid()}.")
+        return _RUN["root"]
+
+
+def keep_log(path):
+    """A log worth keeping past the run — a red gate's, whose path the failure message printed."""
+    _RUN["keep"].add(path)
+
+
+def bound_log(path, limit=FAIL_LOG_KEEP):
+    """Cut `path` to its last `limit` bytes, saying so on its first line."""
+    try:
+        n = os.path.getsize(path)
+        if n <= limit:
+            return
+        with open(path, "rb") as f:
+            f.seek(n - limit)
+            tail = f.read()
+        with open(path, "wb") as f:
+            f.write(f"cc-land: the first {n - limit} bytes of this log were dropped after the run; "
+                    f"the last {limit} are below\n".encode())
+            f.write(tail)
+    except OSError:
+        pass
+
+
+def checkout_repo(head):
+    """The repo a throwaway checkout `head` belongs to, read off its `.git` — a FILE naming <repo>/.git/worktrees/<n>
+    — or '' when it is not a worktree at all. What `git worktree prune` has to be run in once the checkout is gone."""
+    try:
+        gitdir = open(f"{head}/.git").read().strip().partition("gitdir:")[2].strip()
+    except OSError:
+        return ""
+    return gitdir.split("/.git/worktrees/")[0] if "/.git/worktrees/" in gitdir else ""
+
+
+def clear_root(root, keep=()):
+    """Everything in `root` goes except the files in `keep`, which are cut to FAIL_LOG_KEEP each, and the repos whose
+    worktrees it held are pruned so `.git/worktrees` does not keep the dead entries. Returns whether anything was
+    kept. Shared by the run's own finally and by the sweep of what a killed run left."""
+    kept, prunes = False, set()
+    for name in sorted(os.listdir(root)):
+        p = f"{root}/{name}"
+        if p in keep and os.path.isfile(p):
+            bound_log(p)
+            kept = True
+        elif os.path.isdir(p) and not os.path.islink(p):
+            prunes.add(checkout_repo(f"{p}/head"))
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    for repo in sorted(prunes - {""}):
+        if os.path.isdir(repo):
+            with git_lock(repo):
+                sh(["git", "worktree", "prune"], cwd=repo, timeout=120)
+    return kept
+
+
+def drop_run_root():
+    """The outermost finally. The root goes whole, except the logs keep_log() named: those are cut to FAIL_LOG_KEEP
+    each and stay at the paths the failure message printed, under a KEPT marker that says the run finished and
+    meant to leave them. A root with nothing kept is gone; one with kept logs holds those and nothing else, and
+    cc-janitor's age and room lines reclaim it."""
+    root = _RUN["root"]
+    if not root or not os.path.isdir(root):
+        return
+    if clear_root(root, _RUN["keep"]):
+        open(f"{root}/{KEPT}", "w").close()
+    else:
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+    _RUN["root"], _RUN["keep"] = None, set()
+
+
+def live_lander(pid):
+    """Whether `pid` is a cc-land still running — the test a left-behind root is judged on. A pid the box has handed
+    to something else since is a stranger, and the root it names is dead."""
+    try:
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        return False
+    return any(b"cc-land" in a for a in argv[:3])
+
+
+def sweep_run_roots():
+    """What a KILLED worker or a reboot left: every `cc-land.run.<pid>.*` in the temp root whose pid is not a live
+    cc-land and that carries no KEPT marker is removed whole, its repos' worktrees pruned. A root with the marker is
+    a finished run's kept failure logs — bounded, and cc-janitor's to reclaim by age or room, not this sweep's. Once,
+    at the start of a sweep — the worker holds the queue lock, so no other WORKER is live, and a foreground
+    `cc-land <repo> <pr>` has its live pid in its root's name and is left alone. Returns what it removed."""
+    gone = []
+    for p in sorted(glob.glob(f"{tempfile.gettempdir()}/cc-land.run.*")):
+        m = re.fullmatch(r"cc-land\.run\.(\d+)\..*", os.path.basename(p))
+        if not m or not os.path.isdir(p) or os.path.islink(p) or os.path.exists(f"{p}/{KEPT}"):
+            continue
+        pid = int(m.group(1))
+        if pid == os.getpid() or live_lander(pid):
+            continue
+        clear_root(p)
+        try:
+            os.rmdir(p)
+        except OSError:
+            continue
+        gone.append(p)
+    if gone:
+        ledger(f"removed {len(gone)} scratch root(s) left by killed runs: {' '.join(gone)}"[:400])
+    return gone
 
 
 def run_gate(argv, cwd, log, env):
@@ -472,16 +648,22 @@ def default_signals():
         signal.signal(s, signal.SIG_DFL)
 
 
-def board_read(path):
-    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
-    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
-    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
-    if not hasattr(board_read, "mod"):
+def ccboard():
+    """cc-board imported as a module (the way cc-time is), beside THIS copy, not a stubbed BIN: its opener `read`, and its
+    `reals` — the one rule for which of ~/.cc/boards is a board and which is a suite's fixture (cc-board FIXTURE)."""
+    if not hasattr(ccboard, "mod"):
         import importlib.machinery, importlib.util
         s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
-            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
-        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
-    return board_read.mod.read(path)
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))
+        ccboard.mod = importlib.util.module_from_spec(s); s.loader.exec_module(ccboard.mod)
+    return ccboard.mod
+
+
+def board_read(path):
+    """A board file, read through cc-board's opener: a member's board is a link into a directory the MEMBER writes, and
+    a plain open here followed whatever it planted — a pipe hung this tool for good (review of #224). None = no board
+    there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    return ccboard().read(path)
 
 
 def board(repo):
@@ -492,9 +674,169 @@ def board(repo):
 
 
 def repo_root(repo):
-    """Where the repo actually is: the board knows, and a repo with no board is the usual ~/dev/<repo>."""
+    """Where the repo actually is: the board knows, and a repo with no board is the usual ~/dev/<repo> — except a
+    member workspace's PROJECT (`<handle>--<track>`), which lands out of a clone of its own (member_clone)."""
+    if member_of(repo)[1]:
+        return f"{clones_dir()}/{repo}"
     p = board(repo).get("path") or ""
     return p if p and os.path.isdir(f"{p}/.git") else f"{DEV}/{repo}"
+
+
+# ── a member workspace's own landing ────────────────────────────────────────────────────────────────────
+# A member workspace's finished track lands into the member's own repository the way a box project's does — gates,
+# the review, the merge, no 👍 — and nothing of it touches the box or another workspace (owner, 2026-09-05: "keep it
+# identical since ultimately it only touches its own repo"). The session inside the boundary cannot run this, so the
+# host lands on its behalf, the way cc-checkpoint --sweep pushes for it; the sweep is what queues (cc-checkpoint).
+# The job's repo is `<handle>--<track>` — the project's own name on this box (#<handle>--<name> is its channel) —
+# because a workspace's every project is its own GitHub repository, so a PR NUMBER alone names nothing.
+#   · EVERY GitHub call uses that workspace's token and repository and no other: the landing runs out of a HOST-ONLY
+#     clone of the project's repository (member_clone, under ~/.cc/state/land/clones — no sandbox binds it), whose
+#     credential is the token the workspace was granted (cc-sandbox github: ~/.cc/members/<h>/github-token), handed
+#     to gh and git in the environment by sh() and to nobody else; the repository must be one ~/dev/<handle> names
+#     under the owner's own account (cc-gh-token repos), which is the same ownership rule the push has.
+#   · THE GATES RUN INSIDE THAT WORKSPACE'S SANDBOX, never the head's own test scripts on the host as the owner:
+#     the merged tree is built here, then run through `cc-sandbox member <h> <track> --tree <dir>`, where only the
+#     member's world exists. The host runs git plumbing and gh, and nothing the PR's head wrote.
+#   · THE DEPLOY HALF NEVER RUNS: install.sh, units, restarts and the delivery check are the box's, and a
+#     repository that is not the box's gets none of them (deploy_steps).
+#   · THE REVIEW IS CHARGED TO THAT WORKSPACE'S DAILY CAP (~/.cc/state/member-spend.json, the ledger `cc <h> <t>
+#     --go` pre-charges; MEMBER_DAILY_USD): the cap reached is a wait for the day to reset, not a verdict.
+#   · A PR THAT TOUCHES THE BOUNDARY OR A TOKEN STOPS before any gate runs (member_walls): a path under .cc/ (the
+#     markers that make a directory a workspace), a secret's path shape (SECRET_PATHS), or an added line that looks
+#     like a token or a private key. Written down as doomed for that head, reported in #<handle>, no suite bought.
+#   · A stop is reported in the WORKSPACE'S OWN channel (say_result), never routed to the owner's alert lane or
+#     injected into the box's planning session: nothing of it involves the box.
+#   · The repair round is the same one a box project gets (`cc <h> <track> --go`, charged to the same cap); a change
+#     that has spent its review and its repair is told to open a NEW PR — a new PR is a new budget — because the
+#     commands a box project's planning session would run are not a member's to run.
+# The three places, read AT CALL TIME like gate_dir() so the selfcheck's HOME, LANDQ and STATE are the ones they follow:
+def members_dir():   return f"{HOME}/.cc/members"              # the grants live here: a directory no sandbox bind reaches
+def clones_dir():    return f"{LANDQ}/clones"                   # host-only clones of member projects, one per <handle>--<track>
+def member_spend():  return f"{STATE}/member-spend.json"       # the per-workspace daily ledger, cc's member_gate shape
+MEMBER_DAILY_USD = 20                            # cc's default when MEMBER_DAILY_USD is not in ~/.cc/config
+BOUNDARY_PATHS = (".cc/**",) + SECRET_PATHS      # what a member PR may not touch: the boundary's markers, a secret's place
+TOKEN_SHAPES = re.compile(r"github_pat_[A-Za-z0-9_]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bsk-ant-[A-Za-z0-9_-]{20,}"
+                          r"|\bxox[abpr]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----")
+
+
+def member_of(repo):
+    """(handle, track) when `repo` names a member workspace's project — `<handle>--<track>` — or (handle, "") for
+    the workspace itself; ("", "") for anything of the box's. The marker decides (~/dev/<handle>/.cc/member-workspace),
+    never the name: a box repo called `a--b` is still the box's."""
+    h, _, t = (repo or "").partition("--")
+    if h and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", h) and os.path.isfile(f"{DEV}/{h}/.cc/member-workspace"):
+        return h, t
+    return "", ""
+
+
+def boundary_path(path):
+    """True for a path a member PR may not touch: under .cc/ or shaped like a secret's (BOUNDARY_PATHS)."""
+    for g in BOUNDARY_PATHS:
+        if g.endswith("/**"):
+            if path == g[:-3] or path.startswith(g[:-2]):
+                return True
+        elif fnmatch.fnmatchcase(path, g) or path.endswith("/" + g):
+            return True
+    return False
+
+
+def member_root(cwd):
+    """The workspace whose clone `cwd` is in, or "" — how sh() knows a gh or git call is a member landing's."""
+    rel = os.path.relpath(cwd, clones_dir())
+    if rel.startswith(".."):
+        return ""
+    return member_of(rel.split("/", 1)[0])[0]
+
+
+def member_token(handle):
+    """The token the workspace was GRANTED (cc-sandbox github): ~/.cc/members/<h>/github-token links to a file of the
+    owner's, mode 600. Read for the call and printed nowhere; "" when there is no grant, no file, or the wrong mode."""
+    g = f"{members_dir()}/{handle}/github-token"
+    try:
+        f = os.path.realpath(g)
+        st = os.stat(f)
+        if not os.path.islink(g) or not os.path.isfile(f) or (st.st_mode & 0o777) != 0o600:
+            return ""
+        return open(f).read().strip()
+    except OSError:
+        return ""
+
+
+def member_config(key, default):
+    rc, o = sh([f"{BIN}/cc-config", "get", key], timeout=30)
+    return (o.strip() if rc == 0 and o.strip() else "") or default
+
+
+def member_project_url(handle, track, pr):
+    """The repository the project's PR is in, as a clone url — or ("", why). The board row's `pr` says which repository
+    (the row is the member's to write, so it is CHECKED, not trusted): the owner must be the box owner's own account
+    (CC_GH_PERSONAL_OWNER, the account a grant's token is for) and the name one of the repositories ~/dev/<handle>
+    itself names there (cc-gh-token repos — ~/dev/<handle>/.git/config is read-only inside the boundary, so the
+    remotes are the host's word). Any other repository is refused before a token is read."""
+    row = (board(handle).get("tracks") or {}).get(track) or {}
+    m = re.fullmatch(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/([0-9]+)", row.get("pr") or "")
+    if not m or m.group(3) != str(pr):
+        return "", f"the {handle} board row for {track} does not carry PR #{pr} (pr='{row.get('pr') or ''}')"
+    owner, name = m.group(1), m.group(2)
+    powner = member_config("CC_GH_PERSONAL_OWNER", "")
+    if not powner or owner.lower() != powner.lower():
+        return "", f"{owner}/{name} is not under the owner's own account ({powner or 'CC_GH_PERSONAL_OWNER is not set'}) — a granted token opens nothing else"
+    rc, o = sh([f"{BIN}/cc-gh-token", "repos", handle, powner], timeout=60)
+    if rc or name.lower() not in {x.strip().lower() for x in o.splitlines() if x.strip()}:
+        return "", f"{owner}/{name} is not a repository of workspace {handle} (cc-gh-token repos {handle} {powner})"
+    return f"https://github.com/{owner}/{name}.git", ""
+
+
+def member_clone(repo, url):
+    """The host-only clone a member project lands out of, made or pointed at `url`. No checkout (the gates and the
+    review take worktrees of their own); the credential is gh's helper, which answers with the GH_TOKEN sh() sets
+    and — GH_CONFIG_DIR pointing at nothing — never with the box's login. Returns (root, why)."""
+    root = f"{clones_dir()}/{repo}"
+    if os.path.isdir(f"{root}/.git"):
+        if sh(["git", "remote", "get-url", "origin"], cwd=root, timeout=30)[1].strip() != url:
+            sh(["git", "remote", "set-url", "origin", url], cwd=root, timeout=30)
+        return root, ""
+    try:
+        os.makedirs(clones_dir(), mode=0o700, exist_ok=True)
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        os.makedirs(f"{root}/.gh-none", mode=0o700, exist_ok=True)
+    except OSError as e:
+        return "", f"cannot make {root}: {e}"
+    rc, o = sh(["git", "clone", "-q", "--no-checkout", "-c", "credential.helper=",
+                "-c", "credential.helper=!gh auth git-credential", url, "."], cwd=root, timeout=900)
+    if rc:
+        shutil.rmtree(root, ignore_errors=True)
+        return "", f"cannot clone {url}: {last(o)}"
+    return root, ""
+
+
+def member_charge(handle, usd):
+    """Charge `usd` to the workspace's day in the ledger cc's member_gate keeps, under its lock — or refuse. Returns
+    (spent_before, cap) on a refusal and None when charged: the same pre-charge a dispatch makes, so the review a
+    landing buys counts against the same cap as the worker that made the change."""
+    try:
+        cap = float(member_config("MEMBER_DAILY_USD", str(MEMBER_DAILY_USD)))
+    except ValueError:
+        cap = float(MEMBER_DAILY_USD)
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    os.makedirs(STATE, exist_ok=True)
+    with open(f"{member_spend()}.lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            cur = json.load(open(member_spend()))
+            if not isinstance(cur, dict):
+                cur = {}
+        except (OSError, ValueError):
+            cur = {}
+        row = cur.get(handle) if isinstance(cur.get(handle), dict) else {}
+        spent = float(row.get("usd") or 0) if row.get("day") == day else 0.0
+        if spent + usd > cap:
+            return spent, cap
+        row = dict(row) if row.get("day") == day else {}
+        row.update(day=day, usd=round(spent + usd, 2))
+        cur[handle] = row
+        write_atomic(member_spend(), cur)
+    return None
 
 
 def linked_units():
@@ -760,7 +1102,29 @@ def reads_earned(spent):
     "deliberately not bounded here" (ROOT_REVIEWS), yet it was counted into `reviews` and consumed the routine
     allowance, so the repair round that followed had nothing left to read with. `asked` is the number of those buys,
     written beside `reviews` by review_now and taken back with it when a limit refunds the read."""
-    return ROOT_REVIEWS + min(spent.get("repairs", 0), ROOT_REPAIRS) + spent.get("asked", 0)
+    return ROOT_REVIEWS + min(spent.get("repairs", 0), ROOT_REPAIRS) + min(spent.get("rebases", 0), ROOT_REBASES) \
+        + spent.get("asked", 0)
+
+
+# THE CLOSES LINE. `Closes <row>` — one row, or several joined by commas and/or `and` — anywhere in the PR body:
+# `Closes raised-a and raised-b.`, `Closes raised-a, raised-b, raised-c.`, `Closes: raised-a`. Read wherever it stands,
+# not only at a line's start, because the brief that names the rows is a paragraph and `cc done` puts it in the body
+# whole. A capital C: the contract's own word, and the one prose does not write ("closes the fd"). The list ends at
+# the first thing that is not a row name — a full stop, a new sentence — so a sentence after it is never read as a row.
+CLOSES_RE = re.compile(r"\bCloses:?\s+([A-Za-z0-9][A-Za-z0-9_-]*(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)[A-Za-z0-9][A-Za-z0-9_-]*)*)")
+
+
+def closes_rows(body):
+    """The row names a PR body says it closes, in order, each once."""
+    seen = []
+    for m in CLOSES_RE.finditer(body or ""):
+        # Split on the grammar CLOSES_RE accepts, the Oxford comma included: `, and` is one separator, or
+        # `raised-a, raised-b, and raised-c` gives back 'and raised-c' and leaves raised-c queued (review of #430).
+        for r in re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", m.group(1)):
+            r = r.strip()
+            if r and r.lower() != "and" and r not in seen:
+                seen.append(r)
+    return seen
 
 
 # The two ways the runner stops a review on cc-land's OWN cap rather than on the diff, named as the runner names
@@ -1528,6 +1892,9 @@ class Land:
         self.stopped = ""        # the step that stopped it, so the worker knows whether trying again could differ
         self.why = ""            # …and what it said
         self.root = repo_root(repo)
+        self.member, self.mtrack = member_of(repo)   # a member workspace's project: <handle>, <track> (see MEMBERS)
+        self.project = self.member or repo   # the name cc, cc-board, cc-scope and cc-task know this repo by — a member
+                                 # project's is its workspace's handle, its job name is not a repo to any of them
         self.hurt = []           # cosmetic steps that failed: reported, not fatal, named again at the end
         self.facts = {}          # what GitHub says about the PR
         self.changed = None      # [(status, path)] this landing makes; worked out once, when it is first needed
@@ -1550,9 +1917,13 @@ class Land:
         self.restarted = []
         self.stale = []          # what is still running the old code because nothing here could restart it —
                                  # named in the deploy's line AND on the card, never silently called deployed
+        self.owner_asks = []     # …and what is on the old code because the manifest keeps its restart for the
+                                 # owner: same fact, but somebody CAN restart it, so this carries the command
         self.unverified = []     # ledger rows this landing could not confirm: named, and left open
 
     def base(self):
+        if self.member and self.mtrack:   # the project's repository, not the workspace's board: what the PR says
+            return self.facts.get("baseRefName") or "main"
         return board(self.repo).get("default_branch") or "main"
 
     def what(self):
@@ -1632,7 +2003,7 @@ class Land:
         if fetch:
             self.fetch_head()
         tag = re.sub(r"[^A-Za-z0-9_-]+", "-", self.repo or "") or "repo"      # no dots: they separate the fields
-        tmp = tempfile.mkdtemp(prefix=f"cc-land.{step}.{tag}.{self.pr or 'base'}.")
+        tmp = tempfile.mkdtemp(prefix=f"cc-land.{step}.{tag}.{self.pr or 'base'}.", dir=run_root())
         tree = f"{tmp}/head"
         with git_lock(self.root):    # …and .git/worktrees is shared too. The SHA is explicit here, so this lock
                                      # is only about the bookkeeping git writes, and it is held for a second
@@ -1792,10 +2163,12 @@ class Land:
             raise self.mark_doomed(Failed(
                 f"the review budget for this change is spent: PR #{self.pr} has already bought "
                 f"{spent.get('reviews', 0)} review(s) and {spent.get('repairs', 0)} repair round(s), and "
-                f"the diff at {self.head[:12]} is not one they read. The planning session decides now — read it "
-                f"itself and write that down (`cc-land record {self.repo} {self.pr} LAND --by <who>`, which this "
-                f"landing then reads), land with no verdict on the PR (`cc-land {self.repo} {self.pr} "
-                f"--no-review`), or buy one more (`cc-land {self.repo} {self.pr} --re-review`)"))
+                f"the diff at {self.head[:12]} is not one they read. "
+                + (f"A new PR is a new budget: close this one and open another for the fixed branch" if self.member else
+                   f"The planning session decides now — read it "
+                   f"itself and write that down (`cc-land record {self.repo} {self.pr} LAND --by <who>`, which this "
+                   f"landing then reads), land with no verdict on the PR (`cc-land {self.repo} {self.pr} "
+                   f"--no-review`), or buy one more (`cc-land {self.repo} {self.pr} --re-review`)")))
         # …and whether this exact head has already died on a cap. Once it has, it has cost the whole cap to read
         # nothing, and the identical run against the cap that stopped it is the one thing certain to do it again —
         # #194 was queued a second time and would have. So the wall is remembered against the cap that BOUND, and
@@ -1815,6 +2188,15 @@ class Land:
         stamp = sh([f"{BIN}/cc-limit", "status"], timeout=60)
         if stamp[0] == 0:
             raise Failed(f"no review: {stamp[1].strip()} — the landing waits for the model, or --no-review")
+        if self.member:
+            # THE REVIEW IS CHARGED TO THAT WORKSPACE'S DAILY CAP, the same ledger `cc <h> <t> --go` pre-charges, and
+            # BEFORE the buy. The cap reached is weather, not a verdict: the fixed prefix is the usage-limit one
+            # (limited), and the reset it names is the day's — 00:00Z — so run_job defers the job to it, uncounted.
+            over = member_charge(self.member, float(REVIEW_BUDGET))
+            if over:
+                raise Failed(f"no review: usage limit until 00:00Z — {self.member} has used ${over[0]:.2f} of its "
+                             f"${over[1]:.0f}/day (MEMBER_DAILY_USD) and this review asks ${float(REVIEW_BUDGET):.2f}; "
+                             f"the landing waits for the day to reset")
         tmp, tree = self.head_checkout("review", fetch=False)   # fetched above, to answer "read this head already?"
         try:
             rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root)
@@ -1996,7 +2378,7 @@ class Land:
         reads it judges the story rather than the diff — the done-criteria and the diff are the two things this
         gate exists to compare."""
         t = self.find_track()
-        d = f"{STATE}/{self.repo}/{t}" if t else ""
+        d = f"{STATE}/{self.project}/{t}" if t else ""
         task = f"{d}/task.md" if d and os.path.exists(f"{d}/task.md") else ""
         if not task:
             return ("No brief was found for this PR — no track on the board carries it, or it has no state "
@@ -2168,10 +2550,22 @@ class Land:
                 start["env"]["CC_SELFTEST_SLOTS"] = str(PREPARE_AT_ONCE)   # the ONE number, said out loud to the
                                                           # suite: what prepare() runs at once IS what the suite's
                                                           # own cap allows at once, so no landing waits at that lock
-                keep = f"{tempfile.gettempdir()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
-                rc, o = run_gate([f"{tree}/{g}"], tree, keep, start["env"])
+                keep = f"{run_root()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
+                argv = [f"{tree}/{g}"]
+                if self.member and self.mtrack:
+                    # THE GATES RUN INSIDE THAT WORKSPACE'S SANDBOX, never the head's own scripts on the host as the
+                    # owner: the merged tree, built here, is bound into the member's boundary (cc-sandbox member
+                    # --tree) and the gate runs there with only the member's world around it. Its scope and slot
+                    # count go in as arguments, because the boundary clears the environment.
+                    wt = f"{HOME}/.cc/worktrees/{self.member}/{self.mtrack}"
+                    argv = ([f"{BIN}/cc-sandbox", "member", self.member, self.mtrack if os.path.isdir(wt) else "",
+                             "--tree", tree, "--", "env"]
+                            + [f"{k}={start['env'][k]}" for k in ("CC_LAND_CHANGED", "CC_SELFTEST_SLOTS") if k in start["env"]]
+                            + [f"{tree}/{g}"])
+                rc, o = run_gate(argv, tree, keep, start["env"])
                 bad = FAILED_RE.search(o)
                 if rc or (bad and bad.group(1) != "0"):
+                    keep_log(keep)                   # the one log that outlives the run — bounded, at this path
                     raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
                                  f"  [full output: {keep}]")
 
@@ -2365,8 +2759,9 @@ class Land:
         is one somebody marked not ready, on purpose: PR #324 (2026-09-07) was queued by `cc done` and then drafted
         to keep it behind a security fix, and until this existed the tool had no word for a draft at all — the
         queue would have tried it three times, fifteen minutes apart, and had no tries left when it was ready. A
-        CONFLICT is a state a person must fix, and fifteen minutes changes nothing about it either. The queue holds
-        such a job (run_job); the direct path refuses it before a gate runs (gates)."""
+        CONFLICT is a state only its own track can mend, and fifteen minutes changes nothing about it either. The
+        queue sends ONE rebase round to that track and otherwise holds such a job (run_job); the direct path refuses
+        it before a gate runs (gates)."""
         if not self.pr:
             return ""
         if self.facts.get("isDraft"):
@@ -2437,7 +2832,9 @@ class Land:
         and read as abandoned by the watchdog until then."""
         if self.track:
             return self.track
-        rows = board(self.repo).get("tracks", {})
+        if self.mtrack:
+            return self.mtrack
+        rows = board(self.project).get("tracks", {})
         for name, t in rows.items():
             pr = str(t.get("pr") or "")
             if re.search(rf"/pull/{self.pr}(?:/|$)", pr) or pr == str(self.pr):
@@ -2455,19 +2852,51 @@ class Land:
         t = self.find_track()
         if not t:
             raise Skip(f"no track on the board carries PR #{self.pr} — nothing to close")
-        if t not in board(self.repo).get("tracks", {}):
-            raise Failed(f"the {self.repo} board has no track '{t}'")
+        if t not in board(self.project).get("tracks", {}):
+            raise Failed(f"the {self.project} board has no track '{t}'")
         st = "merged" if self.pr else "done"
-        rc, o = sh([f"{BIN}/cc-board", "status", self.repo, t, st])
+        rc, o = sh([f"{BIN}/cc-board", "status", self.project, t, st])
         if rc:
             raise Failed(f"cc-board status: {last(o)}")
-        sh([f"{BIN}/cc-board", "note", self.repo, t, f"landed by cc-land: {self.what()}"])
-        return f"board: {self.repo}/{t} -> {st}"
+        sh([f"{BIN}/cc-board", "note", self.project, t, f"landed by cc-land: {self.what()}"])
+        line = f"board: {self.project}/{t} -> {st}"
+        # THE ROWS THE PR SAYS IT CLOSES. "Closes raised-a and raised-b" in PR #422's body (2026-09-11) closed
+        # nothing: both rows stayed [queued] after the merge, and `cc-brief ready` offered one of them as startable
+        # — a second worker for a fix already in. The brief that names the rows is in the PR body (cc done puts it
+        # there), so the body is where the contract is read. A row named that the board does not have is SAID,
+        # not skipped: the typo is the whole difference between a row closed and a row a person re-dispatches.
+        closed, unknown, held = [], [], []
+        rows = board(self.project).get("tracks", {})
+        for r in closes_rows(self.facts.get("body") or ""):
+            if r == t or rows.get(r, {}).get("status") in ("merged", "done"):
+                continue                      # its own row is closed above; a row already closed stays as it is
+            if r not in rows:
+                # Said only when it is shaped like a row (a hyphen, an underscore, a digit: raised-x, w1). A bare
+                # word is prose about the contract — "#422's Closes line", "the Closes contract" — and a line
+                # that reported those on every landing would be the line nobody reads.
+                if re.search(r"[-_0-9]", r):
+                    unknown.append(r)
+                continue
+            if rows[r].get("held") or rows[r].get("status") in ("running", "review"):
+                held.append(r)                # a person is sitting on it, in their own words, or a track is live on
+                continue                      # it and its own landing will close it: not this pass's to close
+            rc, o = sh([f"{BIN}/cc-board", "status", self.project, r, "done"])
+            if rc:
+                raise Failed(f"cc-board status {r}: {last(o)}")
+            sh([f"{BIN}/cc-board", "note", self.project, r, f"closed by cc-land: {self.what()} says Closes {r}"])
+            closed.append(r)
+        if closed:
+            line += f"; closes {', '.join(closed)}"
+        if held:
+            line += f" (held by a person or live on a track, left open: {', '.join(held)})"
+        if unknown:
+            line += f" (Closes names no row on the board: {', '.join(unknown)})"
+        return line
 
     # -- 6. the ask ledger ---------------------------------------------------------------------------------
     def ledger_rows(self, t):
         """The unsettled rows on this track, or None if there is no ledger here at all."""
-        rc, o = sh([f"{BIN}/cc-scope", "list", self.repo, "--track", t, "--json"])
+        rc, o = sh([f"{BIN}/cc-scope", "list", self.project, "--track", t, "--json"])
         if rc:
             return None
         try:
@@ -2488,11 +2917,11 @@ class Land:
             raise Skip("no track — no ledger rows to close")
         asks = self.ledger_rows(t)
         if asks is None:
-            raise Skip(f"no ask ledger for {self.repo}")
+            raise Skip(f"no ask ledger for {self.project}")
         if not asks:
             raise Skip(f"no unsettled ask on track {t}")
         for a in asks:
-            rc, o = sh([f"{BIN}/cc-scope", "merged", self.repo, a["id"], "--evidence", self.what()])
+            rc, o = sh([f"{BIN}/cc-scope", "merged", self.project, a["id"], "--evidence", self.what()])
             if rc:
                 raise Failed(f"cc-scope merged {a['id']}: {last(o)}")
         return (f"ledger: {len(asks)} ask(s) on {t} marked MERGED — not delivered until their own checks pass "
@@ -2607,7 +3036,7 @@ class Land:
                                                            # it would re-do a boot job. Checked BEFORE the name test's
                                                            # verdict, or a RemainAfterExit oneshot reads active and runs
             if declared.get(u) == "owner":
-                owned.append(u)                            # units.json: never automatically — the landing says it instead
+                owned.append(self.owner_ask(u))            # units.json: never automatically — the landing asks them
                 continue
             if sh(["systemctl", "--user", "is-active", u], timeout=60)[1].strip() != "active":
                 continue                                   # not running: its next start picks the new code up
@@ -2618,11 +3047,47 @@ class Land:
         tail = (f"; {NEVER} runs a script that moved too — restarting it would take every session on this box "
                 f"down, so do it by hand (`cc rc restart`)") if held else ""
         if owned:
-            tail += f"; {', '.join(owned)} moved too and is the owner's to restart (units.json restart=owner)"
+            tail += "; " + "; ".join(owned)
         tail += "".join(f"; {p} imports {m}, which moved" for p, m in sorted(via.items()))
         if not self.restarted:
             raise Skip("nothing running uses, or imports, the files this change touched" + tail)
         return f"restarted: {', '.join(self.restarted)}{tail}"
+
+    def owner_ask(self, unit):
+        """A unit the manifest keeps for the owner (units.json restart=owner) whose code this change moved. Nothing
+        here restarts it — that is what the row says — so the fact has to reach the person who can: the unit and the
+        one command that brings it current, on the card, and an ask in the ledger, which is where this box keeps
+        what it owes somebody. Returns the sentence for the step's own line; nothing is restarted either way.
+
+        ONCE PER UNIT, not once per landing. The ask is keyed on the unit alone, so a second landing while the first
+        is still open adds nothing — three cards saying the same thing is how a warning stops being read. A SETTLED
+        ask is not the same: the owner acted, and this is code they have not seen, so that opens a fresh row.
+
+        A unit that is plainly stopped is asked about for neither: its next start IS this change. Only a clear
+        answer counts as stopped — a template unit, which systemctl will not answer for at all, is asked about
+        rather than guessed at, because it is its INSTANCES that run and the manifest says so.
+
+        A ledger that will not answer is not a reason to stop a deploy whose PR is already merged: the card still
+        carries the unit and the command, and the step says the row could not be written."""
+        cmd = f"systemctl --user restart {unit}"
+        said = f"{unit} moved too and is the owner's to restart (units.json restart=owner)"
+        if sh(["systemctl", "--user", "is-active", unit], timeout=60)[1].strip() in ("inactive", "failed"):
+            return said + ", and it is not running — its next start is this change"
+        rc, o = sh([f"{BIN}/cc-scope", "list", self.project, "--json"], timeout=60)
+        if rc == 0:
+            try:
+                rows = json.loads(o or "[]")
+            except ValueError:
+                rows = []
+            for a in rows:
+                if (a.get("text") or "").startswith(OWNER_ASK_KEY.format(unit=unit)):
+                    return said + f"; already asked ({a.get('id') or '?'}), so this landing does not ask again"
+        self.owner_asks.append(f"{unit} (`{cmd}`)")      # on the card whatever the ledger does below
+        rc, o = sh([f"{BIN}/cc-scope", "add", self.project, OWNER_ASK.format(unit=unit, cmd=cmd),
+                    "--who", "box", "--src", self.what()], timeout=60)
+        if rc:
+            return said + f"; the ask ledger would not take it ({last(o)}) — the card is the only record"
+        return said + f", asked: {last(o)}"
 
     def importers(self, files):
         """{program: module} — every file of this tree a live process is RUNNING whose imports reach one of `files`,
@@ -2738,7 +3203,7 @@ class Land:
             raise Skip("no track — no ask to check")
         asks = self.ledger_rows(t)
         if asks is None:
-            raise Skip(f"no ask ledger for {self.repo}")
+            raise Skip(f"no ask ledger for {self.project}")
         rows = [a for a in asks if a.get("status") in ("open", "claimed", "merged")]
         if not rows:
             raise Skip(f"no ask on track {t} waiting to be delivered")
@@ -2773,8 +3238,32 @@ class Land:
         bound the 2026-09-02 audit's P0 asks for is the one that holds instead: a buy made beside a red gate still
         COUNTS, because it was still paid for, so a worker pushing red head after red head cannot buy a paid read
         every time with its tally reading 0."""
-        return [("gates", self.gates), ("review", self.review), ("merge", self.merge), ("card", self.card),
-                ("board", self.close_board), ("ledger", self.close_ledger)]
+        walls = [("walls", self.member_walls)] if self.member and self.mtrack else []
+        return walls + [("gates", self.gates), ("review", self.review), ("merge", self.merge), ("card", self.card),
+                        ("board", self.close_board), ("ledger", self.close_ledger)]
+
+    def member_walls(self):
+        """A member PR that touches the boundary or a token stops HERE, before a gate runs or a read is bought: a
+        path under .cc/ (the markers that make ~/dev/<handle> a workspace and a track a track), a secret's own path
+        shape (SECRET_PATHS), or an added line shaped like a token or a private key. Doomed for this head — a
+        re-queue is refused at the door until the branch moves — and said in the workspace's channel."""
+        self.fetch_head()
+        hit = sorted({path for _, path in self.changed_files() if boundary_path(path)})
+        rc, o = sh(["git", "merge-base", f"origin/{self.base()}", self.head], cwd=self.root)
+        if rc:
+            raise Failed(f"cannot find where PR #{self.pr} left {self.base()}: {last(o)}")
+        rc, d = sh(["git", "diff", "-U0", o.strip(), self.head], cwd=self.root, timeout=300, stdout_only=True)
+        if rc:
+            raise Failed(f"cannot read the diff of PR #{self.pr}: {last(d)}")
+        tokens = [ln for ln in d.splitlines() if ln.startswith("+") and not ln.startswith("+++")
+                  and TOKEN_SHAPES.search(ln)]
+        if hit or tokens:
+            what = (f"it changes {', '.join(hit)}" if hit else "") + (" and " if hit and tokens else "") \
+                 + (f"it adds {len(tokens)} line(s) shaped like a token or a private key" if tokens else "")
+            raise self.mark_doomed(Failed(
+                f"PR #{self.pr} touches the boundary or a token — {what} — and nothing lands that on a member's "
+                f"behalf. Take it out of the PR and push; the next head is a new question"))
+        return f"PR #{self.pr} touches neither the boundary (.cc/, a secret's path) nor a token"
 
     def settle(self):
         """Wait for every gate still running in this sweep before the box itself is touched. Skips when nothing
@@ -2799,10 +3288,17 @@ class Land:
         return (f"waited {int(time.time() - t0)}s for the gates of {n} other queued job(s) before touching the "
                 f"box: a suite that asserts about this box must not have it reinstalled and restarted under it")
 
+    def no_deploy(self):
+        raise Skip(f"{self.repo} is a member workspace's, not the box's — nothing installed, no units, no restarts")
+
     def deploy_steps(self):
         """About the BOX: they do the same thing whether one change landed or three, which is what lets a batch
         run them once at the end instead of once per PR. `settle` is first and belongs to all of them: everything
-        below this line changes the box, so none of it may run while another queued job is still being gated."""
+        below this line changes the box, so none of it may run while another queued job is still being gated.
+        A MEMBER WORKSPACE'S repository gets none of it: install.sh, the units and the restarts are the box itself,
+        and a landing for a repository that is not the box's must never run them (MEMBERS, above)."""
+        if self.member:
+            return [("deploy", self.no_deploy)]
         return [("settle", self.settle), ("install", self.install), ("units", self.enable_units),
                 ("restart", self.restart), ("daemons", self.daemons), ("verify", self.verify_delivery)]
 
@@ -2820,7 +3316,8 @@ class Land:
             emit(f"landing [{self.repo}] {self.track}: {self.note}")
             return True
         rc, o = sh(["gh", "pr", "view", str(self.pr), "--json",              # isDraft: what held() reads —
-                    "title,url,state,mergeable,headRefName,mergeCommit,isDraft"], cwd=self.root, timeout=120)
+                    "title,url,state,mergeable,headRefName,baseRefName,mergeCommit,isDraft,body"],   # body: closes_rows
+                   cwd=self.root, timeout=120)
         if rc:
             print(f"cc-land: cannot read PR #{self.pr} in {self.root}: {last(o)}", file=sys.stderr)
             return False
@@ -2889,6 +3386,9 @@ class Land:
                   f"{'them' if len(self.stale) > 1 else 'it'} — a systemd unit, or a `daemons` row in "
                   f"config/units.json, is what would let a landing bring "
                   f"{'them' if len(self.stale) > 1 else 'it'} back.")
+        if self.owner_asks:
+            print(f"YOURS TO RESTART: {', '.join(self.owner_asks)} — config/units.json keeps that for the owner, "
+                  f"so the box runs the old code until somebody does. Asked: `cc-scope list {self.project}`.")
         return rc
 
 
@@ -2960,27 +3460,69 @@ def say_result(job, r):
     in #<repo>-updates — no push. A stopped landing used to page a phone for a decision the session already makes
     on its own: 11 of the last 51 pushes were exactly that (comms audit, 2026-09-07). No reaction goes on the
     approval card either: the text already says landed ✅ or NOT merged ❌ (result_of), so a reaction in
-    #approvals stays a person's mark alone, never the box's."""
+    #approvals stays a person's mark alone, never the box's.
+    EVERY POST CARRIES THE JOB'S PRODUCER ID (`land:<repo>:<pr>:<outcome>`, plus the moment it was queued, so a later
+    landing of the same PR is its own event), and cc-slack's ledger sends each once, ever: this function used to be
+    called again by the next sweep whenever `posted` had not reached disk, and said the same result again (arch
+    review 2026-09-08, rec 4). Returns whether Slack ACCEPTED the word — the reply thread's, when there is one —
+    and finish() marks the job posted only then. "No token" is not a refusal: with no Slack there is nothing that
+    could ever accept it, and the ledger line finish() writes is the record. The line injected into the planning
+    session on a stop goes with the FIRST attempt only: a retry sweep posts again, it does not inject again."""
     chat, ts, repo, pr = job.get("chat") or "", job.get("ts") or "", job.get("repo") or "", job.get("pr")
+    pid = f"land:{repo}:{pr or 'deploy'}:{'landed' if r.get('ok') else 'stopped'}" + (f"@{job['queued_at']}" if job.get("queued_at") else "")
+    def took(rc, out):
+        return rc == 0 or "no SLACK_BOT_TOKEN" in out
+    said = True
     if chat:
-        sh([f"{BIN}/cc-slack", "post", "-c", chat] + (["--thread", ts] if ts else []) + [r.get("text", "")], timeout=180)
+        rc, out = sh([f"{BIN}/cc-slack", "post", "-c", chat] + (["--thread", ts] if ts else []) + ["--id", pid, r.get("text", "")], timeout=180)
+        said = took(rc, out)
+    handle = member_of(repo)[0]
+    if handle:
+        # A MEMBER PROJECT'S landing is said in that workspace's own channels and nowhere of the box's: landed in
+        # its updates lane, a stop in its main lane where the member reads (no route to the owner's alert lane, no
+        # line injected into the box's planning session — nothing of it involves the box).
+        lane = f"#{handle}-updates" if r.get("ok") else f"#{handle}"
+        rc, out = sh([f"{BIN}/cc-slack", "post", "-c", lane, "--id", f"{pid}:lane", r.get("text", "")], timeout=180)
+        return said and (took(rc, out) or bool(chat))   # the thread already has it: a lane that refused is not a reason to say it twice
     if r.get("ok"):
-        return
+        return said
     title = f"[{repo}] " + (f"PR #{pr} " if pr else "") + "landing stopped"
-    sh([f"{BIN}/cc-slack", "post", "--route", title, r.get("short", "")[:300]], timeout=60)
+    rc, out = sh([f"{BIN}/cc-slack", "post", "--route", title, "--id", f"{pid}:route", r.get("short", "")[:300]], timeout=60)
+    said = said and (took(rc, out) or bool(chat))
     again = f"cc-land queue {repo} {pr}" if pr else "cc-land work"
-    sh([f"{BIN}/cc-slack", "inject", repo,
-        f"{r.get('text', '')}\nNothing re-drives this now — fix it, then `{again}`: every step already done is a "
-        f"no-op the second time."], timeout=120)
+    if not job.get("say_tries"):
+        # THE FIRST ATTEMPT ONLY (review of #423, finding 1: "inject only on the first attempt"): a sweep that retries a
+        # result Slack refused comes back through here, and the line into the planning session carries no producer id
+        # of its own — said again each sweep it would be the duplicate this ledger exists to remove.
+        sh([f"{BIN}/cc-slack", "inject", repo,
+            f"{r.get('text', '')}\nNothing re-drives this now — fix it, then `{again}`: every step already done is a "
+            f"no-op the second time."], timeout=120)
+    return said
+
+
+SAY_TRIES = 6   # sweeps (RETRY_AFTER apart) a result whose post Slack refuses is kept for before the ledger line is all it gets
 
 
 def finish(path, job):
     """Say it once, then forget the job. ‘Said’ is written down before the file goes, so a kill after the message went
-    out cannot send a second one, and a kill before it cannot swallow the only word the owner gets."""
+    out cannot send a second one, and a kill before it cannot swallow the only word the owner gets.
+    SAID MEANS SLACK TOOK IT (arch review 2026-09-08, rec 4: "cc-land ignores send results before marking its job
+    posted"). A post Slack refused leaves the job on disk unposted, and the next sweep says it again — through the
+    same producer id, so cc-slack posts it once however many sweeps try — until SAY_TRIES of them have, when the
+    ledger line below is the record and the job goes."""
     if not job.get("posted"):
-        say_result(job, job.get("result") or {})
         r = job.get("result") or {}
-        ledger(f"done {job.get('repo')}#{job.get('pr') or 'deploy'} rc={r.get('rc')} {r.get('short', '')}")
+        said = say_result(job, r)
+        if not said and job.get("say_tries", 0) + 1 < SAY_TRIES:
+            job["say_tries"] = job.get("say_tries", 0) + 1
+            ledger(f"unsaid {job.get('repo')}#{job.get('pr') or 'deploy'}: Slack did not take the result (try {job['say_tries']} of {SAY_TRIES}) — kept for the next sweep")
+            try:
+                write_atomic(path, job)
+            except OSError:
+                pass
+            return
+        ledger(f"done {job.get('repo')}#{job.get('pr') or 'deploy'} rc={r.get('rc')} {r.get('short', '')}"
+               + ("" if said else " (Slack never took the result)"))
         job["posted"] = True
         try:
             write_atomic(path, job)
@@ -3048,29 +3590,62 @@ def result_of(L, rc, job, tail):
         short += (f" ⚠️ {', '.join(L.stale)} still "
                   f"{'run' if len(L.stale) > 1 else 'runs'} the old code — nothing here could restart "
                   f"{'them' if len(L.stale) > 1 else 'it'}.")
+    # …and the same fact for a unit whose restart the manifest KEEPS for the owner: on the old code too, but this
+    # one has somebody who can fix it in a second, so the sentence carries the command rather than a warning. Only
+    # the landing that raised the ask says it — the next one reads the open row and stays quiet (Land.owner_ask).
+    if L.owner_asks and rc in (0, COSMETIC, UNVERIFIED):
+        short += (f" ⚠️ yours to restart: {', '.join(L.owner_asks)} — until then the box runs the old code for "
+                  f"{'them' if len(L.owner_asks) > 1 else 'it'}.")
     if L.stopped == "load" and job.get("by"):     # a phantom PR: the culprit is the caller, so say who that was
         short += f" — queued by {job['by'][:160]}"
     return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short,
             "text": short if rc == 0 else f"{short}\n```\n{tail[-900:]}\n```"}
 
 
-def dispatch_fix(path, job, L):
+def not_tracks(findings):
+    """(the track's findings, a person's) — split on the reviewer's own marker. The review gate is told what
+    cc-guard lets a track do and writes a remedy outside that as `NOT THE TRACK'S: <who> — <what>` (review-prompt.md);
+    a round dispatched on such a line is a round spent on a refusal: PR #412's (2026-09-11) asked the track to push
+    a default branch, cc-guard denied it, and the one round the change had was gone."""
+    ours, theirs = [], []
+    for line in (findings or "").splitlines():
+        (theirs if NOT_TRACKS_RE.search(line) else ours).append(line)
+    mine = [l for l in ours if re.match(r"\s*\d+\.\s", l)]      # findings, not the header a read-back comment carries
+    return ("\n".join(ours).strip() if mine or not theirs else ""), "\n".join(theirs).strip()
+
+
+NOT_TRACKS_RE = re.compile(r"\bNOT THE TRACK['’]S\b", re.I)
+
+
+def dispatch_fix(path, job, L, conflict=""):
     """ONE fix iteration for a LAND-AFTER-FIX, dispatched by the queue itself, and the PR kept on the queue while it
     runs. The verdict is written where the worker will look for it — `review-<pr>.md` in the track's own state dir,
     which is the name the planning session had been typing by hand — and the brief is a GOAL: what, why, the
     boundaries, and how done is judged. What to change, what to test and what to document are the worker's.
 
+    `conflict` makes it the REBASE round instead: the same track, the same worktree, the same one-iteration bound,
+    for a PR that cannot merge because its base moved under it — the way back a held conflict never had (#417,
+    #418). The brief asks for what cc-guard lets a track do there: fetch, rebase or merge origin/<base> on its own
+    branch, and let the checkpoint hook push it (it carries the lease a rebased branch needs).
+
     Returns the line for the sweep, or "" to let the ordinary path tell the owner. Every "" here is deliberate: no
-    track carries this PR, no state dir to leave the verdict in, or the dispatch itself refused — three things a
-    person has to know about, and none of them something a second attempt would fix."""
+    track carries this PR, no state dir to leave the verdict in, every finding a person's, or the dispatch itself
+    refused — things a person has to know about, and none of them something a second attempt would fix."""
+    verdict = "CONFLICT" if conflict else L.verdict
     track = L.find_track()
-    st = f"{STATE}/{L.repo}/{track}" if track else ""
+    st = f"{STATE}/{L.project}/{track}" if track else ""
     if not track or not os.path.isdir(st):
-        ledger(f"fix-none {L.repo}#{L.pr} verdict={L.verdict} — no track state dir carries this PR")
+        ledger(f"fix-none {L.repo}#{L.pr} verdict={verdict} — no track state dir carries this PR")
+        return ""
+    findings, theirs = (conflict, "") if conflict else not_tracks(L.findings)
+    if theirs and not findings:
+        # Every remedy the review named is one cc-guard refuses a track — a base-branch push, a rename, the API.
+        # The round is not spent on it: the stop says whose line it is, in the reviewer's own words.
+        ledger(f"fix-none {L.repo}#{L.pr} verdict={verdict} — every finding is a person's: {last(theirs)[:200]}")
         return ""
     reservation, resume, task, facts = None, True, None, {}
     if os.path.lexists(f"{st}/delivery.json"):
-        rc, out = sh([f"{BIN}/cc-task", "show", L.repo, track])
+        rc, out = sh([f"{BIN}/cc-task", "show", L.project, track])
         try:
             task = json.loads(out)
             # Ask in the path-selected repository. The task's repo and URL are evidence, never credentials.
@@ -3090,17 +3665,31 @@ def dispatch_fix(path, job, L):
         return ""
     rv = f"{st}/review-{L.pr}.md"
     try:
-        with open(rv, "w") as f:
-            f.write(f"# cc-land review of PR #{L.pr} — {stamp()}\n\nVERDICT: {L.verdict}\n\n{L.findings}\n")
+        # ~/.cc/state/<handle>/<track> is bound read-WRITE into a member's boundary, and `open(…, "w")` follows a
+        # link: a name planted there would have the host truncate whatever it points at. So the directory must be
+        # what it says (no link on the way) and the file is opened O_NOFOLLOW — the same wall `cc done` keeps.
+        if os.path.realpath(st) != st:
+            raise OSError(f"{st} is not a plain directory (a link on the way)")
+        fd = os.open(rv, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w") as f:
+            f.write(f"# cc-land review of PR #{L.pr} — {stamp()}\n\nVERDICT: {verdict}\n\n{findings}\n"
+                    + (f"\nNOT THE TRACK'S — left to the person each line names, not this round's to attempt:\n"
+                       f"{theirs}\n" if theirs else ""))
     except OSError as e:
         ledger(f"fix-none {L.repo}#{L.pr} — cannot write {rv}: {e}")
+        return ""
+    # A conflict was not reviewed and no gate fetched it, so the head the round starts from is asked of origin
+    # itself; without one, fix_progress could not tell the round's push from the head it began at.
+    head = L.reviewed or L.head or remote_head(L.repo, L.facts.get("headRefName") or "")
+    if not head:
+        ledger(f"fix-none {L.repo}#{L.pr} verdict={verdict} — origin does not say where {L.facts.get('headRefName')} is")
         return ""
     if task is not None:
         # Last, because a reservation is durable: taken before the findings file exists, a write that fails leaves
         # an execution spent on a round that can never launch.
-        rc, out = sh([f"{BIN}/cc-task", "reserve-repair", L.repo, track,
+        rc, out = sh([f"{BIN}/cc-task", "reserve-repair", L.project, track,
                       "--generation", str((task.get("claim") or {}).get("generation")),
-                      "--branch", facts["headRefName"], "--pr", facts["url"], "--head", L.reviewed])
+                      "--branch", facts["headRefName"], "--pr", facts["url"], "--head", head])
         try:
             if rc: raise ValueError(last(out))
             reservation = json.loads(out)
@@ -3111,41 +3700,61 @@ def dispatch_fix(path, job, L):
     context = ("This continues your own session, so you already have the change in front of you — do not re-derive it. "
                if resume else "This is a fresh worker recovering a subagent-built change in the same canonical "
                "worktree. Read task.md, the findings file, progress.md and the branch diff to recover the context. ")
-    go = (f"REPAIR ROUND, dispatched by the landing queue itself — no person is waiting in this loop, and there is "
-          f"exactly ONE of these: what it does not fix goes to a person. {context}GOAL: PR #{L.pr} passes the review "
-          f"gate. WHY: the gate answered {L.verdict}, so the change is wanted and is not yet right; its findings "
-          f"are in {rv}. BOUNDARIES: this branch and this PR only — do not open a second PR, do not merge, and do "
-          f"not widen the change beyond what the findings ask for. DONE: every finding in that file is addressed "
-          f"and this repo's own gates are green on the branch. You choose the implementation, the tests and the "
-          f"docs.")
+    # WHAT A TRACK MAY BE ASKED FOR is what cc-guard lets it do: edits on this branch in this worktree. A base-branch
+    # push, a branch rename, a raw GitHub API call — each is refused there, and a round told to do one is spent on
+    # the refusal (PR #412). So the brief says the limit in the worker's own terms, and where a finding still asks
+    # for one, the round names whose line it is rather than trying.
+    limit = (f"cc-guard confines you to this branch in this worktree: no push to {L.base()} or any other branch, no "
+             f"branch rename or repoint, no merge, no `gh api`, no PR comment or close — the checkpoint hook pushes "
+             f"this branch for you. A finding that needs one of those is not yours: leave it, and end with "
+             f"'STATUS: BLOCKED: <whose line it is — owner or planning seat> — <what>' in progress.md.")
+    if conflict:
+        go = (f"REBASE ROUND, dispatched by the landing queue itself — no person is waiting in this loop, and there is "
+              f"exactly ONE of these: what it does not resolve goes to a person. {context}GOAL: PR #{L.pr} merges "
+              f"cleanly into {L.base()}. WHY: {conflict} — the base moved under this branch, so the landing holds it "
+              f"and nothing else can move it; the note is in {rv}. BOUNDARIES: this branch and this PR only — "
+              f"`git fetch origin {L.base()}` and rebase (or merge) origin/{L.base()} here, keep both sides' "
+              f"intent where they collide, change nothing the conflict does not touch, do not open a second PR. "
+              f"{limit} DONE: the branch merges into origin/{L.base()} with no conflict and this repo's own gates "
+              f"are green on the result.")
+    else:
+        go = (f"REPAIR ROUND, dispatched by the landing queue itself — no person is waiting in this loop, and there is "
+              f"exactly ONE of these: what it does not fix goes to a person. {context}GOAL: PR #{L.pr} passes the review "
+              f"gate. WHY: the gate answered {L.verdict}, so the change is wanted and is not yet right; its findings "
+              f"are in {rv}. BOUNDARIES: this branch and this PR only — do not open a second PR, do not merge, and do "
+              f"not widen the change beyond what the findings ask for. {limit} DONE: every finding in that file "
+              f"that is the track's is addressed and this repo's own gates are green on the branch. You choose the "
+              f"implementation, the tests and the docs.")
     launch = reservation is None or reservation["launch"]
     at = reservation["repair"]["at"] if reservation else stamp()
-    job["fix"] = {"track": track, "verdict": L.verdict, "head": L.reviewed, "at": stamp(),
+    job["fix"] = {"track": track, "verdict": verdict, "head": head, "at": stamp(),
                   "by": f"{FIX_MODEL}, loop {FIX_LOOP}, ${FIX_BUDGET}, {'resumed' if resume else 'fresh'}",
                   "deadline": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch_of(at) + FIX_WAIT))}
     if reservation: job["fix"]["execution_id"] = reservation["execution_id"]
     # Uncounted, like a usage-limit deferral and for the same reason: the PR was read and answered, and the answer
     # is being acted on. Burning a landing try on it would leave a fixed PR one flake short of its last attempt.
-    job.update(attempts=job["attempts"] - 1, stage="fixing", last=f"review: {L.verdict}, fixing in {track}"[:400],
+    job.update(attempts=job["attempts"] - 1, stage="fixing", last=f"review: {verdict}, fixing in {track}"[:400],
                not_before=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL)))
+    job.pop("held", None)             # a held conflict is being worked on now: the next hold, if any, is a new line
     write_atomic(path, job)
     # Both records precede launch. A timeout can mean the window exists; keep waiting on this reservation.
-    if launch: root_spend(L.repo, L.pr, repairs=1)
+    if launch: root_spend(L.repo, L.pr, **({"rebases": 1} if conflict else {"repairs": 1}))
     if not launch:
         ledger(f"fix-reserved {L.repo}#{L.pr} track={track} — existing repair; no second launch")
         return f"[{L.repo}] PR #{L.pr}: waiting on the reserved repair in {track}; no second worker launched"
-    rc, o = sh([f"{BIN}/cc", L.repo, track, "--go", go, "--loop", FIX_LOOP,
+    rc, o = sh([f"{BIN}/cc", L.project, track, "--go", go, "--loop", FIX_LOOP,
                 *(["--resume-last"] if resume else []), "--no-extend",
                 "--model", FIX_MODEL, "--budget", FIX_BUDGET], timeout=300)
     if rc:   # paused project, spend tier holding the row (cc-tier: stop, or essential without `critical`), a timeout
         ledger(f"fix-refused {L.repo}#{L.pr} track={track} rc={rc} {last(o)[:160]} — reservation kept")
         return f"[{L.repo}] PR #{L.pr}: repair launch unconfirmed in {track}; reservation kept, no retry worker"
-    ledger(f"fix-dispatch {L.repo}#{L.pr} track={track} verdict={L.verdict} model={FIX_MODEL} loop={FIX_LOOP} "
-           f"budget={FIX_BUDGET} head={L.reviewed[:12]} brief={rv}")
-    sh([f"{BIN}/cc-board", "note", L.repo, track,
-        f"cc-land: {L.verdict} on PR #{L.pr} — one fix iteration dispatched automatically ({FIX_MODEL}); the PR "
+    what = "rebase" if conflict else "fix"
+    ledger(f"fix-dispatch {L.repo}#{L.pr} track={track} verdict={verdict} model={FIX_MODEL} loop={FIX_LOOP} "
+           f"budget={FIX_BUDGET} head={head[:12]} brief={rv}")
+    sh([f"{BIN}/cc-board", "note", L.project, track,
+        f"cc-land: {verdict} on PR #{L.pr} — one {what} iteration dispatched automatically ({FIX_MODEL}); the PR "
         f"re-queues itself when this branch pushes"], timeout=60)
-    return (f"[{L.repo}] PR #{L.pr}: {L.verdict} — one fix iteration dispatched to track {track} on {FIX_MODEL}, "
+    return (f"[{L.repo}] PR #{L.pr}: {verdict} — one {what} iteration dispatched to track {track} on {FIX_MODEL}, "
             f"and the PR stays queued; it is re-reviewed when that branch pushes")
 
 
@@ -3317,12 +3926,26 @@ def run_job(path, job):
             rc, L.stopped, L.why = 1, "load", f"cannot read PR #{pr} in {L.root}"
     print(buf.getvalue(), end="", flush=True)
     tail = "\n".join(x for x in buf.getvalue().splitlines() if x.strip())
+    # A CONFLICT HAS A WAY BACK: its own track. GitHub's word (held) or git's own, met building the merge (the
+    # `decided` gates stop below) — either way the base moved under the branch, and the only thing that mends it
+    # is a rebase in the worktree the branch was built in. One round per change (ROOT_REBASES), dispatched exactly
+    # as a LAND-AFTER-FIX's is; a second conflict, or a track nothing can dispatch to, falls through to the hold and
+    # the stop as before. #417 and #418 (2026-09-11) sat held with nothing on the box able to move them.
+    conflict = (held if " conflicts with " in held else
+                L.why if rc == 1 and L.stopped == "gates" and " conflicts with " in L.why else "")
+    fix = job.get("fix") or {}
+    if (conflict and (not fix or fix.get("over"))      # no round of either kind still out on this job
+            and root_work(repo, pr).get("rebases", 0) < ROOT_REBASES and not L.merged_since()):
+        line = dispatch_fix(path, job, L, conflict=conflict)
+        if line:
+            return line
     if held:
         # A PR THAT CANNOT MERGE YET IS HELD, NOT TRIED. A draft, or a conflict: no gate runs, no read is bought, the
         # try counted above is given back, and the queue looks again in RETRY_AFTER. Until this existed a drafted PR
         # was tried three times fifteen minutes apart and had no tries left when it was ready (PR #324, 2026-09-07),
-        # and a conflicting one was ENDED on the spot — a person then had to re-queue it after the rebase. ONE ledger
-        # line per reason, not one per look: the job remembers what it was last held for.
+        # and a conflicting one was ENDED on the spot — a person then had to re-queue it after the rebase. A conflict
+        # reaches here once its rebase round is spent or nothing can be dispatched (above). ONE ledger line per
+        # reason, not one per look: the job remembers what it was last held for.
         job.update(attempts=job["attempts"] - 1, stage="held", last=f"held: {held}"[:400],
                    not_before=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + RETRY_AFTER)))
         if job.get("held") != held:
@@ -3341,8 +3964,9 @@ def run_job(path, job):
         job.update(attempts=job["attempts"] - 1, stage="deferred", not_before=until, last=f"review: {L.why}"[:400])
         write_atomic(path, job)
         return f"[{repo}] {L.what()}: review deferred until {until} — {L.why[:160]}"
-    if (rc == 1 and L.stopped == "review" and L.verdict == "LAND-AFTER-FIX" and not job.get("fix")
-            and root_work(repo, pr).get("repairs", 0) < ROOT_REPAIRS):
+    if (rc == 1 and L.stopped == "review" and L.verdict == "LAND-AFTER-FIX" and (not fix or fix.get("over"))
+            and root_work(repo, pr).get("repairs", 0) < ROOT_REPAIRS):   # a rebase round that ended does not
+                                                                          # use up the fix round: the root tally bounds each
         # The one verdict that names its own remedy, and exactly ROOT_REPAIRS of them per CHANGE. `job["fix"]` alone
         # bounded it per JOB: a re-queue writes a new job file, so a PR that came back stopped after its fix round
         # bought another round and another review, and another — seven on PR #171 in one night. The root tally
@@ -3392,6 +4016,7 @@ def paused(target):
     there is. It cannot run (no such sibling on this box, a timeout): behave exactly as this file did before the
     pause existed — a pause must never be the reason a pass stops working."""
     try:
+        target = member_of(str(target))[0] or target   # a member project is parked with its workspace
         return subprocess.run([f"{BIN}/cc-pause", "is", str(target)], stdin=subprocess.DEVNULL,
                               capture_output=True, timeout=10).returncode == 0
     except Exception:
@@ -3453,12 +4078,13 @@ def run_one(path):
 
 
 def known_repos():
-    """Every repo this box tracks — the boards name them — plus any it has already deployed."""
+    """Every repo this box tracks — the boards name them — plus any it has already deployed. A `_cc<suite><pid>` board
+    or ledger entry is a suite's fixture, not a repo: 52 of them were phantom repos on every catch-up tick (2026-09-01),
+    and cc-board's `reals` is the one rule that says which names are real — asked, since the copy here read `_cctest`
+    alone and let a leaked `_ccsbx<pid>` through (arch review 2026-09-08, rec 11)."""
     names = {os.path.basename(x)[:-5] for x in glob.glob(f"{BOARDS}/*.json")}
     names |= {os.path.basename(x)[:-len(".applied")] for x in glob.glob(f"{LANDQ}/*.applied")}
-    return sorted(n for n in names if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", n)
-                  and not n.startswith("_cctest"))   # a `_cctest<pid>` board or ledger entry is a selftest suite's fixture (cc-board
-                                                     # FIXTURE, the one rule): 52 of them were phantom repos on every catch-up tick (2026-09-01)
+    return ccboard().reals(sorted(n for n in names if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", n)))
 
 
 def catchup():
@@ -3468,9 +4094,10 @@ def catchup():
     repos it queued a deploy for."""
     made = []
     for repo in known_repos():
-        if paused(repo):
+        if paused(repo) or member_of(repo)[0]:
             continue        # parked: do not even queue it. This poll is idempotent — origin is still ahead after the
                             # resume, so the very same deploy job is written by the first catch-up that follows it.
+                            # A MEMBER WORKSPACE never: the deploy half is the box's and its tree is the member's (MEMBERS)
         root, base = repo_root(repo), (board(repo).get("default_branch") or "main")
         if not os.path.isdir(f"{root}/.git") or os.path.exists(job_path(repo, "deploy")):
             continue
@@ -3863,6 +4490,7 @@ def cmd_work(argv):
     try:
         sweep_memos()
         sweep_roots()
+        sweep_run_roots()                        # what a killed or rebooted worker left in the temp root
         paths = queue_order(glob.glob(f"{LANDQ}/*.json"))
         pool = prepare(paths)                    # the reviews and the gates of all of them, at once and changing nothing
         lines += pool.header
@@ -3928,7 +4556,7 @@ def queue_task(argv):
         result = int(any(e.get("stage") in ("commit", "push", "pr") for e in rec["errors"]))
     elif grant == 0:
         card = rec.get("card") or {}
-        args = [repo, pr[1], "--who", "cc done"]
+        args = [f"{repo}--{row}" if member_of(repo)[0] else repo, pr[1], "--who", "cc done"]
         if card.get("chat") and card.get("ts"): args += ["--chat", card["chat"], "--ts", card["ts"]]
         with contextlib.redirect_stdout(sys.stderr): result = cmd_queue(args)
         status = "queued" if result == 0 else "failed"
@@ -3973,6 +4601,30 @@ def cmd_queue(argv):
         print('cc-land: queue takes <repo> <pr-number> [--chat C… --ts 1788… --who name]', file=sys.stderr)
         return 2
     path, by = job_path(repo, pr), asked_by()
+    handle, mtrack = member_of(repo)
+    if handle and not mtrack:
+        print(f"cc-land: {repo} is a member workspace — its projects land as <handle>--<track> (the track that "
+              f"carries the PR), never the workspace itself", file=sys.stderr)
+        return 2
+    if handle:
+        # A MEMBER PROJECT lands out of a host-only clone of ITS repository, on the workspace's own token: the
+        # repository is checked against what ~/dev/<handle> names (member_project_url) and the grant must exist
+        # before a job is written — a landing that cannot ask GitHub at all is refused here, in a second.
+        if not member_token(handle):
+            print(f"cc-land: {handle} is granted no GitHub token (cc-sandbox github {handle}) — nothing can land for "
+                  f"it", file=sys.stderr)
+            ledger(f"refused {repo}#{pr} by={by} no-token")
+            return 1
+        url, why = member_project_url(handle, mtrack, pr)
+        if not url:
+            print(f"cc-land: PR #{pr} is not queued — {why}", file=sys.stderr)
+            ledger(f"refused {repo}#{pr} by={by} not-its-repository")
+            return 1
+        root, why = member_clone(repo, url)
+        if not root:
+            print(f"cc-land: PR #{pr} is not queued — {why}", file=sys.stderr)
+            ledger(f"refused {repo}#{pr} by={by} no-clone")
+            return 1
     if os.path.exists(path):
         print(f"[{repo}] PR #{pr} is already queued — one job per PR, so two 👍 are still one landing")
         ledger(f"again {repo}#{pr} by={by}")
@@ -4286,6 +4938,12 @@ def cmd_selfcheck():
         return [c for c in calls if os.path.basename(c[0]) == tool and len(c) > 1 and c[1] == sub
                 and all(w in " ".join(c[1:]) for w in rest)]
 
+    def ran_unit(verb, unit):
+        """`systemctl --user <verb> <unit>`, by POSITION and nothing else. `ran` matches words anywhere in a joined
+        argv, and a landing that ASKS the owner to restart a unit hands the ask ledger that very command as text —
+        so every word of a restart now appears in an argv that restarts nothing at all."""
+        return [c for c in calls if list(c[:4]) == ["systemctl", "--user", verb, unit]]
+
     check("a red gate is reported by its ✗ line, not by whatever printed last",
           gate_fail("banner\n  ✓ ok\n  ✗ the row was wrong\nsome stderr noise") == "✗ the row was wrong")
     check("…and with no failure marker anywhere, the last line still stands",
@@ -4401,6 +5059,81 @@ def cmd_selfcheck():
     finally:
         globals()["GATE_IDLE"] = real_idle
         shutil.rmtree(probe, ignore_errors=True)
+
+    # THE RUN'S SCRATCH ROOT (row a-landing-cleans-its-own-scratch, 2026-09-11): "each landing's checkout and logs
+    # live under one job-owned scratch root, removed in the worker's outermost finally, keeping only bounded failure
+    # logs". Real directories under the fixture temp root, and the helpers as main() and cmd_work() call them.
+    _run_before = dict(_RUN)
+    try:
+        _RUN.update(root=None, keep=set())
+        root = run_root()
+        check("the run's scratch root is ONE directory in the temp root, named with this process's pid, and asking "
+              "again is the same one",
+              os.path.isdir(root) and os.path.dirname(root) == tempfile.gettempdir()
+              and os.path.basename(root).startswith(f"cc-land.run.{os.getpid()}.") and run_root() == root)
+        os.makedirs(f"{root}/cc-land.gates.myrepo.7.abcd/head", exist_ok=True)
+        open(f"{root}/cc-land-gate-myrepo-7-check.sh.log", "w").write("== result: 3 passed, 0 failed ==\n")
+        drop_run_root()
+        check("a run that ends GREEN leaves nothing: the outermost finally takes the checkout, the log and the root "
+              "itself", not os.path.exists(root) and _RUN["root"] is None)
+        root = run_root()
+        os.makedirs(f"{root}/cc-land.gates.myrepo.7.abcd/head", exist_ok=True)
+        os.makedirs(f"{root}/cc-land.review.myrepo.7.efgh/head", exist_ok=True)
+        red = f"{root}/cc-land-gate-myrepo-7-selftest.sh.log"
+        open(red, "w").write("x" * (FAIL_LOG_KEEP + 5000) + "\n  ✗ the row was wrong\n1 failed\n")
+        open(f"{root}/cc-land-gate-myrepo-7-check.sh.log", "w").write("== result: 3 passed, 0 failed ==\n")
+        keep_log(red)
+        drop_run_root()
+        kept = open(red).read() if os.path.exists(red) else ""
+        check("…and a run that ends on a RED gate keeps that gate's log and nothing else — at the path the failure "
+              "message printed, cut to its last FAIL_LOG_KEEP bytes with a line saying so — while the green gate's "
+              "log and both checkouts go",
+              sorted(os.listdir(root)) == sorted([KEPT, os.path.basename(red)])
+              and kept.startswith("cc-land: the first 5034 bytes of this log were dropped")
+              and kept.endswith("1 failed\n") and len(kept.encode()) < FAIL_LOG_KEEP + 200)
+        kept_root = f"{tempfile.gettempdir()}/cc-land.run.4194305.kept"    # …renamed to a DEAD pid's, for the sweep below
+        os.rename(root, kept_root)
+        red = f"{kept_root}/{os.path.basename(red)}"
+        # …and what a DEAD run left is the next worker's to take: a root named with a pid nothing runs under, one
+        # with this process's own, and one with a pid that is alive but is not a cc-land (a stranger who inherited
+        # the number after a reboot — that root is dead too).
+        dead = tempfile.mkdtemp(prefix="cc-land.run.4194304.")            # above pid_max on this box: nobody's
+        os.makedirs(f"{dead}/cc-land.gates.myrepo.8.zzzz/head", exist_ok=True)
+        mine = run_root()
+        stranger = tempfile.mkdtemp(prefix="cc-land.run.1.")               # pid 1 is alive and is not a cc-land
+        check("live_lander: this process is a cc-land; pid 1 is not; a pid nothing runs under is not",
+              live_lander(os.getpid()) and not live_lander(1) and not live_lander(4194304))
+        gone = sweep_run_roots()
+        check("THE NEXT WORKER TAKES WHAT A KILLED ONE LEFT: the root whose pid is dead and the one whose pid belongs "
+              "to a stranger are removed whole; this run's own root stays — AND SO DOES THE KEPT ONE, its pid as dead "
+              "as the others: a finished run's failure log is the janitor's to reclaim, not the next worker's",
+              sorted(gone) == sorted([dead, stranger]) and not os.path.exists(dead) and not os.path.exists(stranger)
+              and os.path.isdir(mine) and os.path.isfile(red) and os.path.exists(f"{kept_root}/{KEPT}"))
+        shutil.rmtree(kept_root, ignore_errors=True)
+        drop_run_root()
+        # KILL INJECTION — the DONE line: "kill/reboot injection leaves at most one identifiable run root; the next
+        # worker reclaims unheld roots". A real second cc-land process, in this fixture's temp root, makes its root,
+        # a checkout and a gate log the way a landing does, and is SIGKILLed mid-"gate" — no finally runs.
+        code = ("import os, sys, importlib.machinery, importlib.util, tempfile, time\n"
+                "s = importlib.util.spec_from_loader('cl', importlib.machinery.SourceFileLoader('cl', sys.argv[1]))\n"
+                "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+                "root = m.run_root(); os.makedirs(f'{root}/cc-land.gates.myrepo.9.kill/head')\n"
+                "open(f'{root}/cc-land-gate-myrepo-9-check.sh.log', 'w').write('== waiting ==\\n')\n"
+                "print(root, flush=True); time.sleep(120)\n")
+        victim = subprocess.Popen([sys.executable, "-c", code, os.path.realpath(__file__)], stdout=subprocess.PIPE,
+                                  text=True, env=dict(os.environ, TMPDIR=tempfile.gettempdir()))
+        vroot = victim.stdout.readline().strip()
+        victim.kill()
+        victim.wait()
+        roots = lambda: [d for d in glob.glob(f"{tempfile.gettempdir()}/cc-land.run.*")
+                         if not os.path.basename(d).startswith(f"cc-land.run.{os.getpid()}.")]
+        check("KILL INJECTION: a cc-land killed mid-gate leaves EXACTLY ONE root, and its name says whose it was",
+              roots() == [vroot] and os.path.basename(vroot).startswith(f"cc-land.run.{victim.pid}.")
+              and os.path.isdir(f"{vroot}/cc-land.gates.myrepo.9.kill/head"))
+        check("…and the next worker's first act reclaims it whole — checkout, log and root — because that pid is "
+              "no longer a cc-land", sweep_run_roots() == [vroot] and roots() == [] and not os.path.exists(vroot))
+    finally:
+        _RUN.update(_run_before)
 
     # A red gate on a branch that is simply OLD. On a real repo, with real git plumbing — the whole question is
     # what `merge-base`, `rev-list` and `diff` say about two lines of history, and a fake world answering them
@@ -4555,6 +5288,7 @@ def cmd_selfcheck():
 
     REAL = {k: globals()[k] for k in ("sh", "run_gate", "linked_units", "read_unit", "board",
                                       "repo_root", "live_processes", "own_ancestry")}
+    real_sh, real_root = sh, repo_root      # …the real ones, for the member cases that ask what a clone's git is handed
     globals().update(sh=fake_sh, run_gate=lambda argv, cwd, log, env: fake_sh(argv, cwd=cwd, env=env, log=log),
                      linked_units=lambda: LINKED[0], read_unit=lambda u: BODY[0].get(u, ""),
                      board=lambda r: BOARD[0], repo_root=lambda r: "/tmp/_ccland",
@@ -5271,7 +6005,7 @@ def cmd_selfcheck():
         # automatic repair round. The clause that names the round belongs to a verdict — nothing read this diff, so
         # the round did not fail here, and saying it did is what sent #194 to a person as a change twice rejected.
         class Ended:
-            repo, pr, stopped, stale = "myrepo", 7, "review", ()
+            repo, pr, stopped, stale, owner_asks = "myrepo", 7, "review", (), ()
 
             def __init__(self, why):
                 self.why = why
@@ -5493,7 +6227,7 @@ def cmd_selfcheck():
                 rc = L.run()
         finally:
             os.access = real_access
-            for f in glob.glob(f"{tempfile.gettempdir()}/cc-land-gate-myrepo-*.log"):
+            for f in glob.glob(f"{run_root()}/cc-land-gate-myrepo-*.log"):
                 with contextlib.suppress(OSError):
                     os.unlink(f)
         return L, rc
@@ -6286,6 +7020,8 @@ def cmd_selfcheck():
     msg = L.restart()
     check("#265: a change under a unit's declared paths restarts it, though the file its ExecStart names never moved",
           L.restarted == ["dash.service"] and "dash.service" in msg)
+    check("…and a unit the manifest restarts ITSELF asks the owner for nothing: the box is already current",
+          not L.owner_asks and not ran_sub("cc-scope", "add"))
     check("…and the question is asked about the repo being landed, so another repo's dashboard/ is not this box's",
           ran("cc-units", "restart-for", "--root", L.root, "dashboard/web/app.js"))
     L = with_dash((0, ""))
@@ -6297,10 +7033,65 @@ def cmd_selfcheck():
           "the boot oneshot stays put instead of re-doing every lesson and timing the deploy out",
           isinstance(r, Skip) and not ran("restart", "lesson-up.service"))
 
+    # 7a. a unit whose restart the manifest KEEPS for the owner. It is never restarted from here — and since
+    # 2026-09-11 it is never left silent either: PRs #406, #409 and #415 changed the code one such unit ran, the
+    # manifest left it alone each time exactly as its row says to, and nothing ever told the one person who could
+    # restart it. It served the old code for three days while two of those landings were reported landed.
     L = with_dash((0, "dash.service\towner\n"))
+    world[f"{BIN}/cc-scope add"] = (0, "myrepo a9\n")
     r = caught(L.restart)
     check("a declared unit whose row says restart=owner is named for them, never restarted from here",
-          isinstance(r, Skip) and not ran("restart", "dash.service") and "owner" in str(r))
+          isinstance(r, Skip) and not ran_unit("restart", "dash.service") and "owner" in str(r))
+    check("…and the owner is ASKED: the unit and the one command that brings it current, on the card",
+          L.owner_asks == ["dash.service (`systemctl --user restart dash.service`)"]
+          and all(s in result_of(L, 0, {"attempts": 1}, "")["short"]
+                  for s in ("landed ✅", "dash.service", "systemctl --user restart dash.service", "old code")))
+    check("…and it is written down where this box keeps what it owes somebody, so it outlives the card",
+          ran_sub("cc-scope", "add", "myrepo", "restart dash.service:", "systemctl --user restart dash.service"))
+
+    # …and the SECOND landing on that unit while the ask is still open says nothing: the ledger is carrying it,
+    # and a card that repeats a warning three times is a card nobody finishes reading
+    L = with_dash((0, "dash.service\towner\n"))
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a9", "status": "open",
+                                                     "text": "restart dash.service: a landing changed the code it "
+                                                             "runs and config/units.json keeps its restart for you"}]))
+    r = caught(L.restart)
+    check("a second landing while that ask is open does not ask again, and names the row that is already open",
+          not ran_sub("cc-scope", "add") and not L.owner_asks and "a9" in str(r)
+          and "dash.service" not in result_of(L, 0, {"attempts": 1}, "")["short"])
+    # …an open ask about a DIFFERENT unit is not this one's: matched on the unit, not on the shape of the sentence
+    L = with_dash((0, "dash.service\towner\n"))
+    world[f"{BIN}/cc-scope list"] = (0, json.dumps([{"id": "a8", "status": "open",
+                                                     "text": "restart other.service: a landing changed the code it runs"}]))
+    r = caught(L.restart)
+    check("…and an ask open for another unit is not this unit's: the key is the unit, not the wording",
+          ran_sub("cc-scope", "add", "restart dash.service:") and L.owner_asks)
+
+    # a unit the owner keeps that is not RUNNING is on no old code at all — its next start is this change — and an
+    # ask nobody needs is how the ones that matter stop being read. Only a clear answer counts as stopped: a
+    # template unit, which systemctl refuses to answer for, is asked about rather than guessed at.
+    L = with_dash((0, "dash.service\towner\n"))
+    world["systemctl --user is-active dash.service"] = (0, "inactive\n")
+    r = caught(L.restart)
+    check("a unit the owner keeps which is not running raises no ask: its next start IS this change",
+          not ran_sub("cc-scope", "add") and not L.owner_asks and "not running" in str(r))
+    L = with_dash((0, "dash.service\towner\n"))
+    world["systemctl --user is-active dash.service"] = (1, "Failed to retrieve unit state: Unit name dash@.service "
+                                                           "is neither a valid invocation ID nor unit name.\n")
+    r = caught(L.restart)
+    check("…but a unit systemctl will not answer for — a TEMPLATE, whose instances are what run — is asked about, "
+          "not guessed silent: the failure this exists to stop is the ask that was never made",
+          ran_sub("cc-scope", "add", "restart dash.service:") and L.owner_asks)
+
+    # and the ledger refusing the row does not red a deploy whose PR is already merged — the card still carries it
+    L = with_dash((0, "dash.service\towner\n"))
+    world[f"{BIN}/cc-scope add"] = (1, "cc-scope: no ledger here\n")
+    r = caught(L.restart)
+    check("an ask ledger that will not take the row leaves the landing standing and the fact on the card, and says "
+          "the record is missing — a merged PR is not undone by a bookkeeping refusal",
+          isinstance(r, Skip) and "would not take it" in str(r) and L.owner_asks
+          and "systemctl --user restart dash.service" in result_of(L, 0, {"attempts": 1}, "")["short"])
+
     L = with_dash((2, "cc-units: no manifest at /nope\n"))
     check("and a manifest the landing cannot read is a red deploy — guessing past it is what left the old "
           "process serving the merged code",
@@ -6590,6 +7381,42 @@ def cmd_selfcheck():
           "board does not have closes nothing, so a landing never marks the wrong row merged",
           row_for("70", "planning/elsewhere").find_track() == ""
           and isinstance(caught(row_for("70", "planning/elsewhere").close_board), Skip))
+    # 7c. THE ROWS THE PR SAYS IT CLOSES. PR #422 (2026-09-11): "Closes raised-a and raised-b." in the body, merged,
+    # and both rows stayed [queued] — `cc-brief ready` then offered one as startable. The brief's own sentence is in
+    # the body (cc done puts it there), mid-paragraph, so the line is read wherever it stands.
+    check("closes_rows reads the contract's phrasings — `and`, commas, both, a colon — anywhere in the body, each row "
+          "once, and stops at the sentence's end",
+          closes_rows("done.\n\nCloses raised-a and raised-b.\n\n- a bullet") == ["raised-a", "raised-b"]
+          and closes_rows("GOAL: x. Closes raised-a, raised-b, raised-c. BOUNDARIES: y") == ["raised-a", "raised-b", "raised-c"]
+          and closes_rows("Closes: raised-a, raised-b and raised-c\nCloses raised-a") == ["raised-a", "raised-b", "raised-c"]
+          and closes_rows("Closes raised-a, raised-b, and raised-c.") == ["raised-a", "raised-b", "raised-c"]
+          and closes_rows("Closes raised-a. The rest is prose") == ["raised-a"]
+          and closes_rows("this closes the fd, and Closes nothing named") == ["nothing"])
+    L = row_for("7", "track/w1", rows=("w1", "raised-a", "raised-b", "raised-c", "raised-d", "raised-e"))
+    for r in ("raised-a", "raised-b", "raised-d"):
+        BOARD[0]["tracks"][r]["status"] = "queued"          # #422's shape: rows nobody has started (row_for says running)
+    BOARD[0]["tracks"]["raised-c"]["status"] = "done"
+    BOARD[0]["tracks"]["raised-d"]["held"] = "behind the security fix"
+    BOARD[0]["tracks"]["raised-e"]["status"] = "running"   # a track is live on it: its own landing closes it
+    L.facts["body"] = "the brief. Closes raised-a, raised-b, raised-c, raised-d, raised-e and raised-zz. BOUNDARIES: none"
+    said = L.close_board()
+    check("a landing closes every row the PR body names with `Closes`: each open one is set `done` with a note "
+          "naming the PR, the track's own row is `merged` as before, a row already closed is left as it is, a row a "
+          "person is sitting on (`held`) or a track is live on (`running`) is left open and said, and a name the "
+          "board does not have is SAID rather than skipped — the typo is the difference between a row closed and a "
+          "row a person re-dispatches (PR #422)",
+          "-> merged; closes raised-a, raised-b" in said and "no row on the board: raised-zz" in said
+          and "left open: raised-d, raised-e" in said and ran("cc-board", "status", "myrepo", "w1", "merged")
+          and ran("cc-board", "status", "myrepo", "raised-a", "done") and ran("cc-board", "status", "myrepo", "raised-b", "done")
+          and not ran("cc-board", "status", "myrepo", "raised-c") and not ran("cc-board", "status", "myrepo", "raised-d")
+          and not ran("cc-board", "status", "myrepo", "raised-e") and not ran("cc-board", "status", "myrepo", "raised-zz")
+          and ran_sub("cc-board", "note", "myrepo", "raised-a", "Closes raised-a"))
+    L = row_for("7", "track/w1", rows=("w1", "raised-a"))
+    L.facts["body"] = "this closes the fd and Closes w1 itself; #422's Closes line left two rows queued"
+    said = L.close_board()
+    check("...and the control: prose that `closes` something, a Closes naming the PR's own row, or prose ABOUT the "
+          "contract ('Closes line') closes no other row and says nothing — only a row-shaped name is reported unknown",
+          said == "board: myrepo/w1 -> merged" and not ran("cc-board", "status", "myrepo", "raised-a"))
 
     # 8. the no-PR path — the one that left a track open for half an hour
     L = fresh(track="w1", note="settings edit outside the repo")
@@ -6614,8 +7441,8 @@ def cmd_selfcheck():
           "check are not among them — nothing follows the check, and a landing it cannot confirm is still landed. "
           "Nor is `settle`, which only ever waits: a wait is not a verdict, and one that failed would stop a "
           "landing over another job's gates",
-          set(FATAL) == {n for n, _ in Land("myrepo", pr=1).steps()}
-          - {"card", "board", "ledger", "verify", "settle"})
+          set(FATAL) - {"walls"} == {n for n, _ in Land("myrepo", pr=1).steps()}
+          - {"card", "board", "ledger", "verify", "settle"})   # walls: a member PR's step alone, fatal there (M3)
     check("...and settle skips outright when no sweep is gating, which is every landing run by hand: it is the "
           "pipeline's own bound, never a step that can hold one up on its own",
           isinstance(caught(Land("myrepo", pr=1).settle), Skip))
@@ -6994,6 +7821,51 @@ def cmd_selfcheck():
         quiet(cmd_work, [])
         check("...and killed AFTER saying it, it is not said twice: 'posted' is written down before the file goes",
               not ran_sub("cc-slack", "post") and not os.path.exists(job_path("myrepo", 7)))
+        # arch review 2026-09-08, rec 4: the result post carries a producer id, and 'posted' follows Slack's answer
+        fresh(pr=7)
+        write_atomic(job_path("myrepo", 7),
+                     {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1", "state": "done", "queued_at": "2026-09-11T10:00:00Z",
+                      "result": {"ok": True, "text": "[myrepo] PR #7: landed ✅"}})
+        world[f"{BIN}/cc-slack post -c CAPPR"] = (1, "cc-slack post: land:myrepo:7:landed@2026-09-11T10:00:00Z not sent (RuntimeError: chat.postMessage: ratelimited)")
+        quiet(cmd_work, [])
+        kept = read_json(job_path("myrepo", 7))
+        check("a result Slack REFUSED is not 'posted': the job stays on disk for the next sweep, and the post named its "
+              "producer id (land:<repo>:<pr>:<outcome>@<queued>) so that sweep cannot say it twice",
+              len(ran_sub("cc-slack", "post", "CAPPR", "--id land:myrepo:7:landed@2026-09-11T10:00:00Z")) == 1
+              and kept and not kept.get("posted") and kept.get("say_tries") == 1)
+        world[f"{BIN}/cc-slack post -c CAPPR"] = (0, "1.2\n")
+        quiet(cmd_work, [])
+        check("…and the sweep after that says it — once, through the same id — and only then does the job go",
+              len(ran_sub("cc-slack", "post", "CAPPR", "--id land:myrepo:7:landed@2026-09-11T10:00:00Z")) == 2
+              and not os.path.exists(job_path("myrepo", 7)))
+        fresh(pr=7)
+        write_atomic(job_path("myrepo", 7),
+                     {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1", "state": "done", "say_tries": SAY_TRIES - 1,
+                      "result": {"ok": True, "text": "[myrepo] PR #7: landed ✅"}})
+        world[f"{BIN}/cc-slack post -c CAPPR"] = (1, "not sent")
+        quiet(cmd_work, [])
+        check("…and a result Slack refuses SAY_TRIES sweeps running is given up on: the ledger line is its record and the job goes",
+              not os.path.exists(job_path("myrepo", 7)))
+        fresh(pr=7)
+        write_atomic(job_path("myrepo", 7),
+                     {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1", "state": "done",
+                      "result": {"ok": True, "text": "[myrepo] PR #7: landed ✅"}})
+        world[f"{BIN}/cc-slack post -c CAPPR"] = (3, "cc-slack post: no SLACK_BOT_TOKEN")
+        quiet(cmd_work, [])
+        check("…while a box with NO Slack is not a refusal: nothing could ever accept it, so the job is done on the first sweep",
+              not os.path.exists(job_path("myrepo", 7)))
+        fresh(pr=7)
+        write_atomic(job_path("myrepo", 7),
+                     {"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1", "state": "done",
+                      "result": {"ok": False, "text": "[myrepo] PR #7: NOT merged ❌", "short": "gate red"}})
+        world[f"{BIN}/cc-slack post -c CAPPR"] = (1, "not sent")
+        quiet(cmd_work, []); quiet(cmd_work, [])
+        check("…and a STOPPED result Slack refuses is retried WITHOUT the planning session hearing 'fix it, then cc-land "
+              "queue' again: two sweeps, two thread posts, ONE inject — the line goes with the first attempt only "
+              "(review of #423, finding 1)",
+              len(ran_sub("cc-slack", "post", "CAPPR")) == 2 and len(ran_sub("cc-slack", "inject", "myrepo")) == 1
+              and (read_json(job_path("myrepo", 7)) or {}).get("say_tries") == 2)
+        world.pop(f"{BIN}/cc-slack post -c CAPPR", None)
 
         fresh(pr=7)
         write_atomic(job_path("myrepo", 11), {"queued_at": stamp()})      # half a job: no repo, no PR
@@ -7226,7 +8098,7 @@ def cmd_selfcheck():
             os.unlink(job_path("myrepo", 7))                     # kept, as it should be: drained by hand for the next
         finally:
             os.access = real_access
-            for f in glob.glob(f"{tempfile.gettempdir()}/cc-land-gate-myrepo-*.log"):
+            for f in glob.glob(f"{run_root()}/cc-land-gate-myrepo-*.log"):
                 os.unlink(f)
 
         # …and the same for the step BELOW the restarts. A deploy that could not be told what runs outside
@@ -7497,6 +8369,88 @@ def cmd_selfcheck():
               and not os.path.exists(job_path("myrepo", 7)) and "NOT merged" in told()
               and "AFTER 1 automatic fix iteration on this change" in told()
               and len(ran_sub("cc-slack", "post", "--route")) == 1 and not ran("cc-notify"))
+
+        # (4b) A CONFLICT HAS A WAY BACK: the PR's own track. #417 and #418 (2026-09-11) were held on a conflict with
+        # main — "rebase it, then land it", said to nobody — until the seat rebased them by hand through subagents.
+        # ONE rebase round, dispatched as the fix round is and bounded per change apart from it (ROOT_REBASES).
+        SHA1 = "a" * 40
+        landing(**{"gh pr view": (0, json.dumps(dict(FACTS, mergeable="CONFLICTING"))),
+                   "git ls-remote": (0, f"{SHA1}\trefs/heads/track/w1\n")})
+        n_held = open(f"{LANDQ}/queue.log").read().count("held myrepo#7")
+        quiet(cmd_work, [])
+        job, went = read_json(job_path("myrepo", 7)) or {}, ran_sub("cc", "myrepo", "w1", "--go")
+        brief = open(f"{stdir}/review-7.md").read()
+        check("a PR that CONFLICTS with its base is not held to nobody: ONE rebase round goes to its own track — the "
+              "brief asks for what cc-guard lets a track do there (fetch, rebase origin/main, no base push, the hook "
+              "pushes) — the job waits as `fixing` from the head origin names, no read is bought, no `held` line, "
+              "nobody paged (#417/#418, 2026-09-11)",
+              len(went) == 1 and "REBASE ROUND" in " ".join(went[0]) and "origin/main" in " ".join(went[0])
+              and "cc-guard confines you" in " ".join(went[0]) and "--no-extend" in went[0]
+              and job.get("stage") == "fixing" and (job.get("fix") or {}).get("verdict") == "CONFLICT"
+              and job["fix"].get("head") == SHA1 and "VERDICT: CONFLICT" in brief and "held" not in job
+              and root_work("myrepo", 7).get("rebases") == 1 and not root_work("myrepo", 7).get("repairs")
+              and not [c for c in calls if c[0] == CLAUDE] and not gh_merges()
+              and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == n_held
+              and not ran_sub("cc-slack", "post") and not ran("cc-notify"))
+        check("...and the round earns the read of what it changed: a resolved conflict is a moved diff, and a "
+              "re-queue refused at the wall for it would be the same stall in a new place",
+              reads_earned(root_work("myrepo", 7)) == ROOT_REVIEWS + 1 and ROOT_REBASES == 1)
+        calls.clear()             # the round pushed and ended; GitHub has not caught up and still says CONFLICTING
+        write_atomic(job_path("myrepo", 7), dict({k: v for k, v in job.items() if k != "not_before"},
+                                                 fix=dict(job["fix"], over="pushed"), stage="queued", attempts=0))
+        quiet(cmd_work, [])
+        kept = read_json(job_path("myrepo", 7)) or {}
+        check("...a SECOND conflict on the same change buys no second round: the job is held as before, one `held` "
+              "line, the tally still one rebase — one round, then a person, exactly as the fix round is bounded",
+              not ran_sub("cc", "myrepo", "w1", "--go") and kept.get("stage") == "held"
+              and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == n_held + 1
+              and root_work("myrepo", 7).get("rebases") == 1)
+        write_atomic(job_path("myrepo", 7), dict(kept, not_before="2000-01-01T00:00:00Z"))
+        world["gh pr view"] = (0, json.dumps(FACTS))
+        quiet(cmd_work, [])
+        check("...and once the rebased branch merges cleanly, the SAME job lands — nobody re-queued it",
+              len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7)))
+        landing(**{"git merge-tree --write-tree": lambda a: (1, "<<<<<<< CONFLICT (content): Merge conflict in a.py\n"),
+                   "git ls-remote": (0, f"{SHA1}\trefs/heads/track/w1\n")})
+        quiet(cmd_work, [])
+        job = read_json(job_path("myrepo", 7)) or {}
+        check("...and a conflict git meets ITSELF building the merge — GitHub's `mergeable` said clean — takes the "
+              "same road: one rebase round to the track, the job kept as `fixing` rather than ended with 'rebase it' "
+              "said to nobody (the control above, with no track to send to, still ends it)",
+              len(ran_sub("cc", "myrepo", "w1", "--go")) == 1 and job.get("stage") == "fixing"
+              and (job.get("fix") or {}).get("verdict") == "CONFLICT" and not gh_merges()
+              and not ran_sub("cc-slack", "post", "CAPPR"))
+        os.unlink(job_path("myrepo", 7))
+
+        # (4c) THE ROUND IS ASKED ONLY FOR WHAT A TRACK CAN DO. PR #412's review (2026-09-11) told the track to push a
+        # default branch; cc-guard denied it, and the one round the change had was spent on the refusal. The prompt
+        # now says where cc-guard's wall is, and a finding the reviewer marks NOT THE TRACK'S is a person's line.
+        THEIRS = REVIEWED("LAND-AFTER-FIX", "docs/x.md:9", "main is not on origin",
+                          "NOT THE TRACK'S: the owner — push main to origin from the host")
+        landing(**{f"{CLAUDE} -p": (0, THEIRS)})
+        quiet(cmd_work, [])
+        check("a LAND-AFTER-FIX whose every finding is NOT THE TRACK'S dispatches NO round: the stop names whose line "
+              "it is in the reviewer's words, and the repair round is still there for a finding the track can answer",
+              not ran_sub("cc", "myrepo", "w1", "--go") and not os.path.exists(job_path("myrepo", 7))
+              and "NOT THE TRACK'S: the owner" in told() and "NOT merged" in told()
+              and not root_work("myrepo", 7).get("repairs")
+              and "every finding is a person's" in open(f"{LANDQ}/queue.log").read())
+        prompt = open(f"{os.path.dirname(BIN)}/{REVIEW_PROMPT}").read()
+        check("...because the review prompt says what cc-guard lets a track do and how to mark what it cannot",
+              "NOT THE TRACK'S" in prompt and "cannot push to the base branch" in prompt and "GitHub API" in prompt)
+        mixed = json.loads(THEIRS)
+        mixed["structured_output"]["findings"].append({"where": "a.py:9", "what": "the call has no timeout", "fix": "name it"})
+        mixed["result"] = json.dumps(mixed["structured_output"])
+        landing(**{f"{CLAUDE} -p": (0, json.dumps(mixed))})
+        quiet(cmd_work, [])
+        went, brief = ran_sub("cc", "myrepo", "w1", "--go"), open(f"{stdir}/review-7.md").read()
+        check("...while one finding the track CAN answer still gets its round: the findings file keeps the person's "
+              "line apart from the worker's, and the brief says where cc-guard's wall is and what to do at it",
+              len(went) == 1 and "cc-guard confines you" in " ".join(went[0]) and "STATUS: BLOCKED" in " ".join(went[0])
+              and "the call has no timeout" in brief.split("NOT THE TRACK'S —")[0]
+              and "push main to origin" in brief.split("NOT THE TRACK'S —")[1]
+              and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing")
+        os.unlink(job_path("myrepo", 7))
 
         # (5) …and NONE of that at a PR that merged while its review ran. load() reads the state once, before the
         # gates, and the gates take up to an hour: PR #193 was OPEN when it was read at 22:58, merged at 23:12, and
@@ -8111,6 +9065,25 @@ def cmd_selfcheck():
               "told it did not land (twice in August an owner was told a merge failed that had landed)",
               "overlapped" in L.merge())
 
+        # ---- WHICH REPOS THE CATCH-UP WALKS is cc-board's `reals` on the boards and the deploy ledger: 52 `_cctest<pid>`
+        # ledger entries were phantom repos on every tick (2026-09-01), and the copy that then read `_cctest` alone let a
+        # leaked `_ccsbx<pid>` through (arch review 2026-09-08, rec 11). Its own fixture, every answer: another suite's
+        # orphans on the board and in the ledger are no repo, this run's own fixture is (the selfcheck stands in for the
+        # suite), and a repo that merely contains the word always was.
+        os.makedirs(BOARDS, exist_ok=True)
+        own = f"_cctest{os.getpid()}"
+        for n in ("_ccsbx99999999", "myrepo_cctesting", own):
+            with open(f"{BOARDS}/{n}.json", "w") as f: json.dump({"repo": n, "tracks": {}}, f)
+        for n in ("_cctest99999999", "myrepo"):
+            with open(f"{LANDQ}/{n}.applied", "w") as f: json.dump({}, f)
+        seen = real_repos()
+        for n in ("_ccsbx99999999", "myrepo_cctesting", own):
+            os.unlink(f"{BOARDS}/{n}.json")
+        for n in ("_cctest99999999", "myrepo"):
+            os.unlink(f"{LANDQ}/{n}.applied")
+        check("known_repos asks cc-board `reals`: an orphan `_ccsbx<pid>` board and `_cctest<pid>` ledger entry are no "
+              "repo to the catch-up, this run's own fixture and the repo that merely contains the word are",
+              seen == [own, "myrepo", "myrepo_cctesting"])
         # ---- a merge this box never made. Nothing on the 👍 path can notice one; this asks the only question
         # that has an answer without GitHub — has origin moved past what install.sh last ran on.
         globals()["known_repos"] = lambda: ["myrepo"]
@@ -8309,6 +9282,264 @@ def cmd_selfcheck():
         globals().update(LANDQ=_real_landq, STATE=_real_state, start_worker=real_start, known_repos=real_repos)
         shutil.rmtree(qdir, ignore_errors=True)
 
+    # M. A MEMBER WORKSPACE'S OWN LANDING (MEMBERS, above). The fixture: a workspace `alice` (its marker under this
+    # selfcheck's ~/dev), its project `site`, PR #7 in o/r under the owner's own account `o`. Every case builds its
+    # own board row, diff and ledger; the world is the fake one, so nothing here reaches GitHub, a sandbox or a token
+    # of the box's — the one real call is sh() itself, asked what it would hand a git run in a member clone.
+    H, T, MR = "alice", "site", "alice--site"
+    os.makedirs(f"{DEV}/{H}/.cc", exist_ok=True)
+    open(f"{DEV}/{H}/.cc/member-workspace", "w").close()
+    os.makedirs(f"{DEV}/a--b", exist_ok=True)
+    os.makedirs(f"{HOME}/.cc/worktrees/{H}/{T}", exist_ok=True)
+    check("M1: member_of names a workspace's project by the MARKER — alice--site is (alice, site), alice alone is "
+          "(alice, ''), and a box repo called a--b with no marker under ~/dev/a is the box's",
+          member_of(MR) == (H, T) and member_of(H) == (H, "") and member_of("a--b") == ("", "")
+          and member_of("myrepo") == ("", "") and member_of("") == ("", ""))
+    check("M1: a member project lands out of a HOST-ONLY clone under the queue's own dir, never ~/dev or a bind; a "
+          "box repo is where it always was",
+          real_root(MR) == f"{clones_dir()}/{MR}" and (BOARD.__setitem__(0, {}) or real_root("myrepo") == f"{DEV}/myrepo"))
+    check("M1: a boundary path is one under .cc/ or shaped like a secret's (SECRET_PATHS) — and an ordinary path, "
+          "or one that merely mentions .cc deeper down, is not",
+          all(boundary_path(p) for p in (".cc", ".cc/track", ".cc/member-workspace", "ccbox/env", ".ssh/id_ed25519"))
+          and not any(boundary_path(p) for p in ("src/app.py", "docs/cc/notes.md", "tests/check.sh", "x.cc/y")))
+    real_access, real_start, real_run, real_repos = os.access, start_worker, subprocess.run, known_repos
+    os.access = lambda p, m: p.endswith(("core/tests/check.sh", "core/tests/selftest.sh"))
+    globals().update(start_worker=lambda: (True, "a stand-in worker"))
+    ROW = {"pr": "https://github.com/o/r/pull/7", "branch": "track/site", "status": "review"}
+    GREEN = (0, "  ✓ all\n== result: 5 passed, 0 failed ==\n")
+
+    def mworld(changed="M\tsrc/app.py\nM\ttests/test_app.py\n", added="+x = 1\n", row=None, **w):
+        fresh(pr=7)                                  # the box's default world and board, then the member's on top
+        BOARD[0] = {"default_branch": "main", "path": f"{DEV}/{H}", "tracks": {T: dict(ROW, **(row or {}))}}
+        for p in (member_spend(), f"{member_spend()}.lock"):
+            if os.path.exists(p):
+                os.unlink(p)                         # every case charges its own day
+        world.update({"gh pr view": (0, json.dumps(dict(FACTS, baseRefName="main"))),
+                      "git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git merge-base": (0, A + "\n"),
+                      "git diff --name-status": (0, changed), "git diff --numstat": (0, "3\t2\tx\n"),
+                      "git diff -U0": (0, added), "git rev-parse HEAD^{tree}": (0, TREE + "\n"),
+                      "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
+                      f"{tempfile.gettempdir()}/cc-land.": GREEN, f"{BIN}/cc-sandbox member": GREEN,
+                      f"{BIN}/cc-config get CC_GH_PERSONAL_OWNER": (0, "o\n"),
+                      f"{BIN}/cc-gh-token repos": (0, "r\nother\n"), f"{BIN}/cc-scope list": (0, "[]")})
+        world.update(w)
+
+    def mland(**kw):
+        mworld(**kw)
+        L = Land(MR, pr=7)
+        L.facts = dict(FACTS, baseRefName="main")
+        return L
+
+    def mrun(L):
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()) as e:
+            rc = L.run()
+        return rc, o.getvalue() + e.getvalue()
+
+    def mqueue(*argv):
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()) as e:
+            rc = cmd_queue(list(argv))
+        return rc, o.getvalue() + e.getvalue()
+
+    sandboxed = lambda: [c for c in calls if os.path.basename(c[0]) == "cc-sandbox"]
+    on_host = lambda: [c for c in calls if c[0].endswith(("check.sh", "selftest.sh"))]
+    asked_model = lambda: [c for c in calls if c[0] == CLAUDE]
+    clone = f"{clones_dir()}/{MR}"
+    seen = []
+
+    class _Ran:
+        returncode, stdout, stderr = 0, "", ""
+    try:
+        # the door: cmd_queue on a member name, before and after a grant
+        mworld()
+        rc, said = mqueue(H, "7")
+        check("M6: the workspace itself is not a job — its projects land as <handle>--<track>, and the door says so",
+              rc == 2 and "land as <handle>--<track>" in said and not os.path.exists(job_path(H, 7)))
+        rc, said = mqueue(MR, "7")
+        check("M6: a workspace granted no GitHub token has nothing to land on: refused at the door, no job, no clone",
+              rc == 1 and "granted no GitHub token" in said and not os.path.exists(job_path(MR, 7))
+              and not os.path.isdir(clone))
+        subprocess.run = lambda argv, **kw: (seen.append((argv, kw)), _Ran())[1]
+        os.makedirs(clone, exist_ok=True)
+        rc, o = real_sh(["git", "fetch", "origin"], cwd=clone)
+        check("M6: sh() runs NO git in a member clone without a grant — git's helper would fall back to the box's own "
+              "login, the one credential a member landing must never hold",
+              rc == 1 and "no GitHub token" in o and not seen)
+        # THE GRANT: ~/.cc/members/alice/github-token, a link to a mode-600 file of the owner's (cc-sandbox github)
+        tokf = f"{fixture_home}/.gh-token-file"
+        with open(tokf, "w") as f:
+            f.write("ghp_" + "x" * 36 + "\n")
+        os.chmod(tokf, 0o600)
+        os.makedirs(f"{members_dir()}/{H}", exist_ok=True)
+        os.symlink(tokf, f"{members_dir()}/{H}/github-token")
+        rc, o = real_sh(["gh", "pr", "view", "7"], cwd=clone)
+        argv, kw = seen[-1]
+        env = kw.get("env") or {}
+        check("M6: ...and with one, gh and git THERE carry the workspace's token in the ENVIRONMENT (GH_TOKEN), never "
+              "on argv, with gh's config dir pointed at nothing so the box's login cannot answer",
+              rc == 0 and argv == ["gh", "pr", "view", "7"] and env.get("GH_TOKEN") == "ghp_" + "x" * 36
+              and env.get("GH_CONFIG_DIR") == f"{clone}/.gh-none" and "ghp_" not in " ".join(argv))
+        real_sh(["git", "fetch", "origin"], cwd=f"{DEV}/myrepo")
+        real_sh([f"{BIN}/cc-sandbox", "member", H, T, "--", "true"], cwd=clone)
+        check("M6: ...and nothing else is handed it: not a box repo's git, not another tool run in the clone",
+              len(seen) == 3 and all("GH_TOKEN" not in ((k.get("env") or {})) for _, k in seen[1:]))
+        os.chmod(tokf, 0o644)
+        check("M6: a grant file that is not mode 600 is no grant", member_token(H) == "")
+        os.chmod(tokf, 0o600)
+        subprocess.run = real_run
+        shutil.rmtree(clone, ignore_errors=True)
+        mworld(row={"pr": "https://github.com/evil/r/pull/7"})
+        rc, said = mqueue(MR, "7")
+        check("M6: PR #7 in a repository under ANOTHER account is refused before a token is read — a granted token "
+              "opens nothing else",
+              rc == 1 and "not under the owner's own account" in said and not os.path.exists(job_path(MR, 7))
+              and not ran("git clone"))
+        mworld(row={"pr": "https://github.com/o/stranger/pull/7"})
+        rc, said = mqueue(MR, "7")
+        check("M6: ...and so is one in a repository ~/dev/alice does not name (cc-gh-token repos): the row is the "
+              "member's to write, so it is checked, never trusted",
+              rc == 1 and "not a repository of workspace alice" in said and not os.path.exists(job_path(MR, 7)))
+        mworld(row={"pr": "https://github.com/o/r/pull/8"})
+        rc, said = mqueue(MR, "7")
+        check("M6: ...and a PR the board row does not carry",
+              rc == 1 and "does not carry PR #7" in said and not os.path.exists(job_path(MR, 7)))
+        mworld()
+        rc, said = mqueue(MR, "7")
+        cloned = [cw for c, cw in zip(calls, cwds) if c[:2] == ["git", "clone"] and "https://github.com/o/r.git" in c]
+        check("M6: the project's own PR in its own repository queues — a host-only clone of THAT repository is made "
+              "under the queue's dir first, with gh's helper as its only credential, and the job is written",
+              rc == 0 and os.path.exists(job_path(MR, 7)) and cloned == [clone] and os.path.isdir(f"{clone}/.gh-none")
+              and any("credential.helper=!gh auth git-credential" in c for c in calls if c[:2] == ["git", "clone"]))
+        os.unlink(job_path(MR, 7))
+
+        # the landing itself
+        L = mland()
+        rc, said = mrun(L)
+        gates = sandboxed()
+        tree = [c[c.index("--tree") + 1] for c in gates if "--tree" in c]
+        check("M2: a green member landing MERGES on the PR's own head and deploys NOTHING — no install.sh, no "
+              "systemctl — because the deploy half is the box's; the step says so",
+              rc == 0 and "landed." in said and ran("gh pr merge", "--match-head-commit", HEAD)
+              and not ran("install.sh") and not [c for c in calls if "systemctl" in c[0]]
+              and "not the box's" in said)
+        check("M2: EVERY gate ran inside that workspace's sandbox — `cc-sandbox member alice site --tree <the merged "
+              "checkout> -- env … <gate>` — and no gate script of the head's was ever argv[0] on the host",
+              len(gates) == 2 and all(c[1:4] == ["member", H, T] and c[c.index("--") + 1] == "env" for c in gates)
+              and len(set(tree)) == 1 and re.fullmatch(rf"{re.escape(tempfile.gettempdir())}/cc-land\.run\.\d+\.[^/]+"
+                                                    r"/cc-land\.gates\.[^/]+/head", tree[0])
+              and all(c[-1].startswith(tree[0] + "/core/tests/") for c in gates)
+              and not on_host())
+        check("M2: ...with the scope and the slot count handed in as arguments, because the boundary clears the "
+              "environment",
+              any("CC_LAND_CHANGED=src/app.py tests/test_app.py" in c and f"CC_SELFTEST_SLOTS={PREPARE_AT_ONCE}" in c
+                  for c in gates if c[-1].endswith("selftest.sh")))
+        led = (read_json(member_spend()) or {}).get(H) or {}
+        check("M2: the review was CHARGED to the workspace's day in the ledger a dispatch pre-charges — one review's "
+              "budget, under today's date — and the model was asked once",
+              led.get("usd") == float(REVIEW_BUDGET) and led.get("day") == time.strftime("%Y-%m-%d", time.gmtime())
+              and len(asked_model()) == 1)
+        check("M2: the board and the ask ledger are the WORKSPACE's (alice), never the job's name: the row goes to "
+              "merged there",
+              ran_sub("cc-board", "status", H, T, "merged") and ran_sub("cc-scope", "list", H)
+              and not ran_sub("cc-board", "status", MR) and L.project == H)
+        L = mland(changed="M\tsrc/app.py\n")
+        rc, said = mrun(L)
+        check("M2: a member diff is TIERED exactly as a box one (gate_tier): a narrow change outside the control layer "
+              "is gated in the sandbox and merged with nobody paid to read it — and nothing charged to the cap",
+              rc == 0 and "focused" in said and sandboxed() and not asked_model() and ran("gh pr merge")
+              and not (read_json(member_spend()) or {}).get(H))
+        shutil.rmtree(f"{HOME}/.cc/worktrees/{H}/{T}")
+        L = mland()
+        rc, said = mrun(L)
+        check("M2: a track whose worktree is gone is gated in the WORKSPACE's boundary (the track slot empty), never "
+              "on the host", rc == 0 and sandboxed() and all(c[1:4] == ["member", H, ""] for c in sandboxed())
+              and not on_host())
+        os.makedirs(f"{HOME}/.cc/worktrees/{H}/{T}", exist_ok=True)
+        L = mland(**{"gh pr view": (0, json.dumps(dict(FACTS, baseRefName="dev")))})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            L.load()
+        check("M2: the base is the PR's own (baseRefName), not the workspace board's default_branch — a member "
+              "project is its own repository", L.base() == "dev")
+
+        # the walls: the boundary and a token
+        L = mland(changed="M\tsrc/app.py\nA\t.cc/track\n")
+        rc, said = mrun(L)
+        check("M3: a member PR that touches the BOUNDARY — a path under .cc/ — stops before a gate runs or a read is "
+              "bought, says which path, and merges nothing",
+              rc == 1 and "touches the boundary" in said and ".cc/track" in said and not sandboxed()
+              and not on_host() and not asked_model() and not ran("gh pr merge"))
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": HEAD, "comments": []}))
+        rcq, saidq = mqueue(MR, "7")
+        check("M3: ...and is written down as DOOMED for that head, so the same PR is refused at the door until the "
+              "branch moves",
+              ((root_work(MR, 7) or {}).get("doomed") or {}).get("head") == HEAD and rcq == 1
+              and "cannot succeed as it stands" in saidq and not os.path.exists(job_path(MR, 7)))
+        L = mland(changed="M\tccbox/env\n")
+        rc, said = mrun(L)
+        check("M3: a secret's path shape (SECRET_PATHS) is the boundary too",
+              rc == 1 and "touches the boundary" in said and "ccbox/env" in said and not sandboxed())
+        L = mland(added="+GITHUB_TOKEN=ghp_" + "A" * 36 + "\n")
+        rc, said = mrun(L)
+        check("M3: a member PR that ADDS a line shaped like a token stops the same way — no gate, no read, no merge",
+              rc == 1 and "shaped like a token" in said and not sandboxed() and not asked_model()
+              and not ran("gh pr merge"))
+        L = mland(added="-GITHUB_TOKEN=ghp_" + "A" * 36 + "\n+GITHUB_TOKEN=\n")
+        rc, said = mrun(L)
+        check("M3: ...while one that REMOVES such a line is exactly the fix that should land: gated, read, merged",
+              rc == 0 and sandboxed() and asked_model() and ran("gh pr merge"))
+
+        # the cap
+        L = mland(**{f"{BIN}/cc-config get MEMBER_DAILY_USD": (0, "2\n")})
+        rc, said = mrun(L)
+        check("M4: the review is charged BEFORE the buy, and over the workspace's daily cap there is no buy: the stop "
+              "is the usage-limit shape naming the day's reset (00:00Z) — the weather run_job defers on, not a "
+              "verdict — nothing merges and nothing is charged",
+              rc == 1 and limited(L.why) and limit_until(L.why) and "MEMBER_DAILY_USD" in said
+              and not asked_model() and not ran("gh pr merge")
+              and not ((read_json(member_spend()) or {}).get(H) or {}).get("usd"))
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        L = mland(**{f"{BIN}/cc-config get MEMBER_DAILY_USD": (0, "20\n")})
+        write_atomic(member_spend(), {H: {"day": today, "usd": 17.5}})
+        rc, said = mrun(L)
+        check("M4: today's spend counts: $17.50 used of $20 and a $3 review is over",
+              rc == 1 and limited(L.why) and "$17.50" in said and not asked_model())
+        L = mland(**{f"{BIN}/cc-config get MEMBER_DAILY_USD": (0, "20\n")})
+        write_atomic(member_spend(), {H: {"day": "2020-01-01", "usd": 19.5}})
+        rc, said = mrun(L)
+        check("M4: ...and yesterday's does not — the day reset is the reset the stop names",
+              rc == 0 and ((read_json(member_spend()) or {}).get(H) or {}) == {"day": today, "usd": float(REVIEW_BUDGET)})
+
+        # where it is said
+        calls.clear()
+        say_result({"repo": MR, "pr": 7, "chat": "C1", "ts": "1.2"}, {"ok": True, "text": "landed"})
+        check("M5: a member landing is said in the WORKSPACE's own lanes and nowhere of the box's — landed in "
+              "#alice-updates (and the thread that asked), no --route to the owner's alert lane, no line injected "
+              "into the box's planning session",
+              [c[1:] for c in ran_sub("cc-slack", "post")]
+              == [["post", "-c", "C1", "--thread", "1.2", "--id", f"land:{MR}:7:landed", "landed"],
+                  ["post", "-c", f"#{H}-updates", "--id", f"land:{MR}:7:landed:lane", "landed"]]
+              and not ran_sub("cc-slack", "inject") and not ran("--route"))
+        calls.clear()
+        say_result({"repo": MR, "pr": 7}, {"ok": False, "text": "stopped", "short": "s"})
+        check("M5: ...and a stop in #alice, where the member reads",
+              [c[1:] for c in ran_sub("cc-slack", "post")] == [["post", "-c", f"#{H}", "--id", f"land:{MR}:7:stopped:lane", "stopped"]]
+              and not ran_sub("cc-slack", "inject") and not ran("--route"))
+        calls.clear()
+        say_result({"repo": "myrepo", "pr": 7}, {"ok": False, "text": "stopped", "short": "s"})
+        check("M5: ...while a box repo's stop still goes the box's way: routed, and injected into its planning session",
+              ran("--route") and ran_sub("cc-slack", "inject", "myrepo"))
+
+        # the catch-up poll
+        globals().update(known_repos=lambda: [MR])
+        calls.clear()
+        quiet(catchup)
+        check("M7: the catch-up poll never queues a deploy for a member project — the deploy half is the box's",
+              not [c for c in calls if c[0] == "git"] and not os.path.exists(job_path(MR, "deploy")))
+    finally:
+        os.access, subprocess.run = real_access, real_run
+        globals().update(start_worker=real_start, known_repos=real_repos)
+        shutil.rmtree(clone, ignore_errors=True)
+
     # 12. the seam itself, with the fakes taken back off: the REAL cc-scope, in a real subprocess, on a
     # throwaway ledger. Everything above stubs sh(), so nothing above proves the one thing this depends on —
     # that "0 delivered / 1 the check failed / 2 there is no check" survives the process boundary. It is the
@@ -8460,4 +9691,7 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    finally:
+        drop_run_root()                        # the outermost finally: this run's scratch, whatever step it stopped at

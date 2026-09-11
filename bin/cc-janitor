@@ -69,6 +69,16 @@ work — is REPORTED and left exactly where it is. This tool has no "probably".
      have none — the age drops to CC_JANITOR_SCRATCH_PRESSURE_HOURS (default 1, 0 = off), and never rises
      above the ordinary line. Pressure moves the PATIENCE and nothing else: everything below still has to
      pass, so a fuller disk never becomes a reason to take something that is in use.
+     AND THEN THE ROOM LINE, WHATEVER THE AGE: once this user's entries in the temp root are more than
+     CC_JANITOR_SCRATCH_COUNT (default 10000), hold more than CC_JANITOR_SCRATCH_BYTES (default 4 GiB), or fill
+     CC_JANITOR_SCRATCH_FULL (default 0.95) of the room this user has there, the OLDEST unheld ones go, one after
+     another, until all three are back under their line — the fullness to the pressure line, net of what the
+     age line is already taking, the other two to theirs — and being written to a minute ago is no defence (each
+     0 = that line off). A held one is said once, whichever line reached it. An age line, however
+     short, cannot stop a same-day burst: a landing's checkouts and gate logs are made by the thousand on a busy
+     day, and a day's worth is what filled 9.7 GB. The one grace is two minutes: `mkdtemp()` and the first write
+     into it are two calls, and between them nothing holds the directory. Everything below still has to pass —
+     the room line, like pressure, never takes what is held or what is a door.
      The age is the NEWEST mtime anywhere in the tree, never the top directory's: a
      directory nobody has added a name to for a month can hold a file written a minute ago. Two shapes are not
      leftovers and are never candidates — something this user does not own, and a tree holding anything that is
@@ -146,8 +156,8 @@ PRMAX = 200           # one `gh pr list` per repo, capped: a timer job must neve
 TERMINAL = ("merged", "done")
 NEXT = "~next"        # cc-handoff's successor window suffix; `~` is not legal in a repo or track name
 CONTAINER_DAYS = 7    # rule 5: a ccbox-* container stopped longer is a leftover; CC_JANITOR_CONTAINER_DAYS overrides, 0 = off
-FIXTURE = "_cc"       # rule 6: the prefix every suite's scratch names share, whichever suite made them…
-SUITE = re.compile(r"_cc[a-z]+(\d+)(?:[/~]|$)")   # …and each carries its run's pid: `_cctest<pid>`, `_ccsbx<pid>/t`
+                      # rule 6 names nothing of its own: the prefix every suite's scratch shares and the pid a name carries
+                      # are cc-board's FIXTURE / suite_pid, asked through ccboard() — the one rule, not a copy of it
 AGENT_WT = ".claude/worktrees"   # rule 9: where the harness puts a worktree it hands a subagent, inside the repo's own checkout
 AGENT_HOURS = 4       # …and the silence that proves that subagent is gone; CC_JANITOR_AGENT_HOURS overrides, 0 = off
 ORPHAN_HOURS = 4      # rule 7: a process in a scratch workspace younger than this is somebody's run in progress
@@ -156,6 +166,10 @@ GRACE = 5             # …seconds between the TERM that asks it to stop and the
 SCRATCH_HOURS = 6     # rule 8: a scratch entry nothing has written to for longer is a leftover; 0 = off
 SCRATCH_PRESSURE = 0.85     # …the share of this user's room in the temp root above which the sweep is harder…
 SCRATCH_PRESSURE_HOURS = 1  # …and the shorter age it sweeps to then; CC_JANITOR_SCRATCH_PRESSURE_HOURS, 0 = off
+SCRATCH_COUNT = 10000       # …and the ROOM line, whatever the age — by count of this user's entries there…
+SCRATCH_BYTES = 4 * 2 ** 30  # …by what they hold… (CC_JANITOR_SCRATCH_COUNT / _BYTES / _FULL; each 0 = off)
+SCRATCH_FULL = 0.95         # …and by fullness, swept back to SCRATCH_PRESSURE. Oldest first, unheld only.
+ROOM_GRACE = 120            # …except anything younger than this: mkdtemp() and the first write are two calls
 Q_GETQUOTA, USRQUOTA = 0x800007, 0   # quotactl's "read one id's limits", for a user: QCMD packs them cmd << 8 | type
 QUOTACTL_FD = 443     # …through the syscall that takes an OPEN FD instead of a block device — a tmpfs has no
                       # device to name, so this is the only form that can read a quota on one, and no quota tool
@@ -326,17 +340,71 @@ def scratch_line(hours, frac, pressure, phours):
     return line, line < hours          # …and a box already sweeping to the shorter line says nothing about it
 
 
+def room_take(entries, count, bytes_, full, pressure, usage, grace=ROOM_GRACE, freed=(0, 0)):
+    """Rule 8's ROOM line — "the janitor reclaims unheld roots by count, bytes or free space regardless of age"
+    (row a-landing-cleans-its-own-scratch). `entries` are this user's plain trees in the temp root that the age
+    pass is leaving, each {path, bytes, files, age, held}; `usage` the temp root's four numbers (space used, space
+    limit, inodes used, inode limit) or None when nothing would give them. Returns ([(path, bytes)…], why): the
+    OLDEST unheld entries, taken one after another until every line crossed is back under — the count and the
+    bytes under their own lines, the fullness under `pressure` on space and on inodes both — why, in one line
+    naming the lines crossed, and the held entries it passed over on the way, [(path, [what holds it])], for the
+    caller to report; ([], '', []) when no line is crossed. A line at 0 is off; a fullness nothing can measure
+    is not full (the same reading scratch_line makes); an entry younger than `grace` is never taken; and a held
+    one is skipped, not taken, so a root full of what is in use stays full and is reported, never emptied.
+    `freed` is (bytes, files) the age pass is already taking: `usage` was read before its removals, so the
+    fullness need is what those leave outstanding, and a root the age line alone brings back is not crossed
+    (review of #426, finding 1). The count and bytes lines need no such netting — they are measured on `entries`,
+    which already excludes the age pass's take."""
+    crossed, need_count, need_bytes, need_space, need_files = [], 0, 0, 0, 0
+    total, held_bytes = len(entries), sum(e["bytes"] for e in entries)
+    if count and total > count:
+        need_count = total - count
+        crossed.append(f"{total:,} entries, over the {count:,} line")
+    if bytes_ and held_bytes > bytes_:
+        need_bytes = held_bytes - bytes_
+        crossed.append(f"{size(held_bytes)} held, over the {size(bytes_)} line")
+    if full and usage and usage_frac(usage) >= full:
+        used, limit, iused, ilimit = usage
+        back = min(pressure, full)                  # …to the pressure line, or the full one if that is the lower
+        need_space = max(0, int(used - freed[0] - back * limit)) if limit else 0     # less the age pass's take
+        need_files = max(0, int(iused - freed[1] - back * ilimit)) if ilimit else 0
+        if need_space or need_files:
+            crossed.append(f"{usage_frac(usage) * 100:.0f}% of this user's room, over the {full * 100:.0f}% line"
+                           + (" even after what the age line takes" if freed[0] or freed[1] else ""))
+    if not crossed:
+        return [], "", []
+    take, passed, n, b, f = [], [], 0, 0, 0
+    for e in sorted(entries, key=lambda e: -e["age"]):          # oldest first, whatever the age line said
+        if n >= need_count and b >= need_bytes and b >= need_space and f >= need_files:
+            break
+        if e["held"]:
+            passed.append((e["path"], e["held"]))
+            continue
+        if e["age"] < grace:
+            continue
+        take.append((e["path"], e["bytes"]))
+        n, b, f = n + 1, b + e["bytes"], f + e.get("files", 1)
+    return take, "; ".join(crossed), passed
+
+
 # ── reality ──────────────────────────────────────────────────────────────────────────────────────────────
-def board_read(path):
-    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
-    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
-    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
-    if not hasattr(board_read, "mod"):
+def ccboard():
+    """cc-board imported as a module (the way cc-time is), beside THIS copy, not a stubbed BIN: its opener `read`, and the
+    fixture rule — FIXTURE, the prefix every suite's scratch shares, and `suite_pid`, the run a `_cc<suite><pid>` name
+    belongs to — which rule 6 asks rather than copies (cc-board FIXTURE)."""
+    if not hasattr(ccboard, "mod"):
         import importlib.machinery, importlib.util
         s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
-            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
-        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
-    return board_read.mod.read(path)
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))
+        ccboard.mod = importlib.util.module_from_spec(s); s.loader.exec_module(ccboard.mod)
+    return ccboard.mod
+
+
+def board_read(path):
+    """A board file, read through cc-board's opener: a member's board is a link into a directory the MEMBER writes, and
+    a plain open here followed whatever it planted — a pipe hung this tool for good (review of #224). None = no board
+    there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    return ccboard().read(path)
 
 
 def board(repo):
@@ -357,7 +425,7 @@ def terminal_since(d, track, t):
 
 
 def snapshot(refresh=True):
-    """cc-reconcile's read-only view of what is alive. Refreshed first when stale — `snapshot` is a local read
+    """cc-reconcile's read-only view of what is alive. Refreshed first when stale — `--no-net` is a local read
     that asks nothing of the network. NOT under --dry, which writes nothing anywhere, not even another tool's
     cache; a preview that finds the snapshot stale says so instead, because without it this cannot see who is
     alive and its verdicts would be more confident than the real pass. Returns (tracks, stale)."""
@@ -369,7 +437,7 @@ def snapshot(refresh=True):
         fresh = False
     if not fresh and refresh:
         try:
-            subprocess.run([f"{BIN}/cc-reconcile", "snapshot"], capture_output=True, timeout=120)
+            subprocess.run([f"{BIN}/cc-reconcile", "--no-net"], capture_output=True, timeout=120)   # `snapshot` writes nothing
             fresh = now() - os.stat(SNAP).st_mtime < SNAP_MAX
         except Exception:
             pass
@@ -630,8 +698,9 @@ def scratch(cwd, tmp):
 
 
 def scratch_scan(path, dev):
-    """One entry below the temp root, measured: {newest, bytes, plain, ours}, or None when it is not a tree this
-    sweep judges at all. `newest` is the last mtime ANYWHERE inside it, `bytes` what it is holding, `plain` False
+    """One entry below the temp root, measured: {newest, bytes, files, plain, ours}, or None when it is not a tree
+    this sweep judges at all. `newest` is the last mtime ANYWHERE inside it, `bytes` what it is holding and `files`
+    how many names (the inode half of the room line, the entry itself counted), `plain` False
     when anything in it is not a plain file or directory — a socket, a fifo, a device, or a name on another
     filesystem, which is a mount rather than something a run wrote. A symlink at the top is not a tree either:
     following one would take this sweep out of the temp root entirely."""
@@ -641,7 +710,7 @@ def scratch_scan(path, dev):
         return None
     if stat.S_ISLNK(st.st_mode) or st.st_dev != dev:
         return None
-    f = {"newest": st.st_mtime, "bytes": st.st_size, "plain": True, "ours": st.st_uid == os.getuid()}
+    f = {"newest": st.st_mtime, "bytes": st.st_size, "files": 1, "plain": True, "ours": st.st_uid == os.getuid()}
     if stat.S_ISREG(st.st_mode):
         return f
     if not stat.S_ISDIR(st.st_mode):
@@ -656,6 +725,7 @@ def scratch_scan(path, dev):
                 return dict(f, plain=False)
             f["newest"] = max(f["newest"], t.st_mtime)
             f["bytes"] += t.st_size
+            f["files"] += 1
     return f
 
 
@@ -755,9 +825,9 @@ def usage_line(path, u, src):
 
 
 def temp_usage(path=None, read=quota_read, fs=fs_usage):
-    """The temp root's fullness for this user: (fraction, one line to print), or None when neither the quota nor
-    the filesystem would answer. The quota first and the filesystem only when there is none — one source, never
-    the two mixed, so the fraction is always a share of a single real limit. `read` is the quota reader and `fs`
+    """The temp root's fullness for this user: (fraction, one line to print, the four numbers it was read from), or
+    None when neither the quota nor the filesystem would answer. The quota first and the filesystem only when there
+    is none — one source, never the two mixed, so the fraction is always a share of a single real limit. `read` is the quota reader and `fs`
     the filesystem's, both named so the selfcheck can drive both sides of that fallback on a box that has only
     one of them — and on numbers it chose, because two live statvfs reads of a /tmp the suite itself is writing
     to are never equal under load (red on 2026-09-09, one full gate run spent on it)."""
@@ -767,7 +837,7 @@ def temp_usage(path=None, read=quota_read, fs=fs_usage):
         u, src = fs(path), "the filesystem"
     if u is None:
         return None
-    return usage_frac(u), usage_line(path, u, src)
+    return usage_frac(u), usage_line(path, u, src), u
 
 
 def end_proc(pid, ws, grace=GRACE):
@@ -1268,7 +1338,7 @@ def sweep_orphans(r, hours, share=ORPHAN_CPU):
             r.act_here("scratch", "end", f"pid {pid} ({pcomm(pid)})", why, lambda p=pid, w=ws: end_proc(p, w))
 
 
-def sweep_leftovers(r, hours, phours, pressure):
+def sweep_leftovers(r, hours, phours, pressure, room=(SCRATCH_COUNT, SCRATCH_BYTES, SCRATCH_FULL)):
     """Rule 8, once per run and box-wide: what finished runs LEFT ON DISK in the temp root. Every entry in it is
     measured — the last time anything in it was written, what it is holding, and its shape — and one this user
     owns, that is a plain tree, that nothing has written to for `days`, and that neither hold test holds, is
@@ -1281,7 +1351,12 @@ def sweep_leftovers(r, hours, phours, pressure):
 
     The age line is read ONCE, at the top, against how full the temp root already is for this user: a root near
     its limit gets the shorter `phours`. Once, and not per entry, so every candidate in one pass is judged by
-    the same line and the log can say which line that was."""
+    the same line and the log can say which line that was.
+
+    And after the age pass, the ROOM pass (room_take): what the age line is leaving is counted, weighed and set
+    against the temp root's fullness less what the age line takes, and if any of `room`'s three lines is crossed
+    the oldest unheld entries go too, whatever their age, until it is not. Each is judged again at the removal on
+    the hold alone — the age that spared it once is not the question the room line asks."""
     if hours <= 0:
         return
     tmp = os.path.realpath(tempfile.gettempdir())
@@ -1296,7 +1371,7 @@ def sweep_leftovers(r, hours, phours, pressure):
     # The pass's own reading, taken before it started walking. CC_JANITOR_SCRATCH_BLIND drops it — tests: the
     # second look below has to be reachable as the only thing standing between the sweep and what is in use.
     held = {} if os.environ.get("CC_JANITOR_SCRATCH_BLIND") else r.holds.under(tmp, hours * 3600)
-    take, spared = [], []
+    take, spared, left, aged_files = [], [], [], 0
     for name in names:
         p = f"{tmp}/{name}"
         f = scratch_scan(p, dev)
@@ -1306,21 +1381,40 @@ def sweep_leftovers(r, hours, phours, pressure):
         verdict, why = leftover_verdict(f)
         if verdict == "rm":
             take.append((p, f["bytes"]))
+            aged_files += f["files"]
         elif verdict == "report":
             spared.append((p, why))
+        if verdict != "rm" and f["ours"] and f["plain"]:
+            left.append(f)                                  # what the age pass leaves: the room pass's world
+    # THE ROOM LINE. "the janitor reclaims unheld roots by count, bytes or free space regardless of age": what the
+    # age line leaves is measured against the three lines, and the oldest of it goes until they are back under.
+    # …less what the age pass is already taking, since `usage` was read before its removals.
+    more, crossed, passed = room_take(left, *room, pressure=pressure, usage=usage[2] if usage else None,
+                                      freed=(sum(b for _, b in take), aged_files))
+    aged = set(p for p, _ in take)
+    take += more
+    # Held, and the room line wanted it. One older than the age line is in `spared` already — the age pass
+    # reported it — and is not said twice (review of #426, finding 2).
+    said = {p for p, _ in spared}
+    spared += [(p, f"spared {p}: " + "; ".join(why)) for p, why in passed if p not in said]
     if not take and not spared:
         return
     print(f"cc-janitor scratch leftovers{' (dry run)' if r.dry else ''}"
           + (f" — {usage[1]}, so the age line is {dur(hours * 3600)} and not the usual one" if under else ""))
     for p, why in spared:
         r.report("scratch", p, why)
+    if crossed:
+        print(f"  the room line is crossed — {crossed} — so the {len(more)} oldest unheld go too, whatever their age"
+              if more else f"  the room line is crossed — {crossed} — and nothing left is unheld, so nothing more goes")
     if not take:
         return
 
     def summary(rows, freed):
         big = max(rows, key=lambda t: t[1])
+        by_room = [t for t in rows if t[0] not in aged]
         return (f"{size(freed)}, nothing written in them for {dur(hours * 3600)} or more"
                 + (f" (under pressure — {usage[1]})" if under else "")
+                + (f", {len(by_room)} of them by the room line ({crossed})" if by_room else "")
                 + f" · largest {big[0]} ({size(big[1])})")
 
     if r.dry:
@@ -1337,7 +1431,11 @@ def sweep_leftovers(r, hours, phours, pressure):
         if f is None:
             continue                                    # gone already: this pass's job, done by somebody else
         f.update(path=p, hours=hours, age=max(0.0, now() - f["newest"]), held=again.get(p, []))
-        verdict, why = leftover_verdict(f)
+        if p in aged:
+            verdict, why = leftover_verdict(f)
+        else:                                               # a room pick: the hold alone decides, never the age
+            verdict = "rm" if f["ours"] and f["plain"] and not f["held"] else "report"
+            why = f"spared {p}: " + "; ".join(f["held"]) if f["held"] else ""
         if verdict != "rm":
             r.report("scratch", p, why or f"spared {p}: it changed while this pass was reading the temp root")
             continue
@@ -1361,26 +1459,29 @@ def fixtures():
     clone, the run's scratch dir, its entry in the deploy ledger, its context dir — the namespace a suite gives one run
     (RUN=$$) and its own trap removes, when the run lives to reach the trap. The glob is the prefix, so it also reaches
     names with no pid in them (`_cclive.lock`); the pid below is what decides, and those match nothing and are left."""
-    found = {}
-    for pat in (f"{BOARDS}/{FIXTURE}*", f"{WTS}/{FIXTURE}*", f"{STATE}/{FIXTURE}*", f"{DEV}/{FIXTURE}*",
-                f"{HOME}/.cc/selftest-[0-9]*", f"{STATE}/land/{FIXTURE}*.applied", f"{HOME}/.claude/projects/{FIXTURE}*"):
+    found, fx = {}, ccboard().FIXTURE
+    for pat in (f"{BOARDS}/{fx}*", f"{WTS}/{fx}*", f"{STATE}/{fx}*", f"{DEV}/{fx}*",
+                f"{HOME}/.cc/selftest-[0-9]*", f"{STATE}/land/{fx}*.applied", f"{HOME}/.claude/projects/{fx}*"):
         for p in glob.glob(pat):
-            m = re.search(r"(?:_cc[a-z]+|selftest-)(\d+)", os.path.basename(p))
-            if m:
-                found.setdefault(int(m.group(1)), []).append(p)
+            pid = fixture_pid(os.path.basename(p))
+            if pid is not None:
+                found.setdefault(pid, []).append(p)
     return found
 
 
 def fixture_pid(name):
-    """The suite pid a fixture's name STARTS with (`_cctest<pid>`, `_ccsbx<pid>/t`, `_cctest<pid>/hx~next`), or None."""
-    m = SUITE.match(name)
-    return int(m.group(1)) if m else None
+    """The suite pid a fixture's name STARTS with — cc-board's `suite_pid` (`_cctest<pid>`, `_ccsbx<pid>/t`,
+    `_cctest<pid>/hx~next`, `_cctest<pid>.json`), or the run's own scratch dir `selftest-<pid>`, which is the one
+    thing a suite names without the prefix — or None."""
+    m = re.fullmatch(r"selftest-(\d+)", name)
+    return int(m.group(1)) if m else ccboard().suite_pid(name)
 
 
 def line_pid(line):
-    """…and the one a handoff-ledger line carries anywhere in it, or None. Searched rather than sliced at the first
-    `_cc`: the prefix alone is short enough to hit some other word first and lose the fixture that follows it."""
-    m = SUITE.search(line)
+    """…and the one a handoff-ledger line carries anywhere in it, or None. Searched (cc-board's SUITE, which stops at
+    a word boundary either side) rather than sliced at the first `_cc`: the prefix alone is short enough to hit some
+    other word first and lose the fixture that follows it."""
+    m = ccboard().SUITE.search(line)
     return int(m.group(1)) if m else None
 
 
@@ -1510,10 +1611,10 @@ def orphan_cpu():
 
 
 def hours_setting(key, default):
-    """One of rule 8's two age lines, in hours. 0 turns that line off, and so does the key set but empty. A
-    fraction is a fraction of an hour — which is how the selfcheck drives the rule against a directory it made a
-    moment ago. A value that is not a number is the default: a typo must not take everything written in the temp
-    root in the last minute."""
+    """One of rule 8's lines — an age in hours, or the room line's count, bytes or share. 0 turns that line off,
+    and so does the key set but empty. A fraction is a fraction of an hour — which is how the selfcheck drives
+    the rule against a directory it made a moment ago. A value that is not a number is the default: a typo must
+    not take everything written in the temp root in the last minute."""
     v = setting(key, str(default)).strip()
     if not v:
         return 0.0
@@ -1532,6 +1633,14 @@ def pressure_hours():
     """…and the shorter one it sweeps to when the temp root is nearly full: CC_JANITOR_SCRATCH_PRESSURE_HOURS,
     default 1. 0 leaves the ordinary line to do the whole job, however full the root gets."""
     return hours_setting("CC_JANITOR_SCRATCH_PRESSURE_HOURS", SCRATCH_PRESSURE_HOURS)
+
+
+def scratch_room():
+    """…and the room line's three numbers: CC_JANITOR_SCRATCH_COUNT (entries, default 10000), CC_JANITOR_SCRATCH_BYTES
+    (default 4 GiB) and CC_JANITOR_SCRATCH_FULL (a share of this user's room, default 0.95). Each 0 = that line off."""
+    return (int(hours_setting("CC_JANITOR_SCRATCH_COUNT", SCRATCH_COUNT)),
+            int(hours_setting("CC_JANITOR_SCRATCH_BYTES", SCRATCH_BYTES)),
+            hours_setting("CC_JANITOR_SCRATCH_FULL", SCRATCH_FULL))
 
 
 def scratch_pressure():
@@ -1574,7 +1683,7 @@ def main(argv):
             sweep(repo, r, net)
         sweep_containers(r, container_days())
         sweep_orphans(r, orphan_hours(), orphan_cpu())
-        sweep_leftovers(r, scratch_hours(), pressure_hours(), scratch_pressure())
+        sweep_leftovers(r, scratch_hours(), pressure_hours(), scratch_pressure(), scratch_room())
     sweep_fixtures(r)
     print(f"cc-janitor: {len(r.did)} swept, {len(r.said)} reported"
           f"{' (dry run — nothing changed)' if dry else f' · log {LOG}'}")
@@ -1773,6 +1882,48 @@ def selfcheck():
     ok("…and 0 pressure hours leaves the ordinary line to do the whole job, however full it is",
        scratch_line(6, 0.99, 0.85, 0) == (6, False))
 
+    # …and the ROOM line: "the janitor reclaims unheld roots by count, bytes or free space regardless of age".
+    def E(i, age, b=1000, held=(), files=6):
+        return {"path": f"/tmp/e{i}", "age": age, "bytes": b, "files": files, "held": list(held)}
+    room = [E(1, 5 * 3600), E(2, 4 * 3600), E(3, 3 * 3600), E(4, 2 * 3600), E(5, 600)]   # every one under the age line
+    ok("with every line under, the room pass takes nothing and says nothing",
+       room_take(room, 10, 10 ** 9, 0.95, 0.85, (1, 100, 1, 100)) == ([], "", []))
+    ok("OVER THE COUNT LINE THE OLDEST GO, however young, until the count is under it — and the pass says which "
+       "line was crossed",
+       room_take(room, 3, 0, 0, 0.85, None) == ([("/tmp/e1", 1000), ("/tmp/e2", 1000)], "5 entries, over the 3 line", []))
+    ok("…a held one is skipped, not taken, and the next oldest goes in its place — and the held one is handed back, "
+       "with what holds it, for the pass to report",
+       room_take([E(1, 5 * 3600, held=["pid 4 is working in it"])] + room[1:], 3, 0, 0, 0.85, None)
+       == ([("/tmp/e2", 1000), ("/tmp/e3", 1000)], "5 entries, over the 3 line", [("/tmp/e1", ["pid 4 is working in it"])]))
+    ok("…and one younger than the two-minute grace is never taken, even when the line is still crossed after "
+       "everything older has gone", room_take([E(1, 30), E(2, 40), E(3, 3600)], 1, 0, 0, 0.85, None)[0]
+       == [("/tmp/e3", 1000)])
+    ok("over the BYTES line the oldest go until what is held is under it",
+       room_take(room, 0, 2500, 0, 0.85, None) == ([("/tmp/e1", 1000), ("/tmp/e2", 1000), ("/tmp/e3", 1000)],
+                                                   f"{size(5000)} held, over the {size(2500)} line", []))
+    ok("over the FULL line the oldest go until this user's room is back under the PRESSURE line — on space, or on "
+       "inodes when that is the limit that is full",
+       room_take(room, 0, 0, 0.95, 0.85, (960, 1000, 0, 0))[0] == [("/tmp/e1", 1000)]     # 960 → ≤850: one entry
+       and room_take(room, 0, 0, 0.95, 0.85, (0, 0, 97, 100))[0] == [("/tmp/e1", 1000), ("/tmp/e2", 1000)]
+       and "97% of this user's room, over the 95% line" in room_take(room, 0, 0, 0.95, 0.85, (0, 0, 97, 100))[1])
+    ok("…LESS WHAT THE AGE PASS IS ALREADY TAKING: the reading is from before its removals, so a full root asks "
+       "the room line only for what those leave outstanding, and one the age line alone brings back under is not "
+       "crossed at all — while the count and bytes lines, measured on what the age pass leaves, are unchanged",
+       room_take(room, 0, 0, 0.95, 0.85, (9600, 10000, 0, 0))[0] == [("/tmp/e1", 1000), ("/tmp/e2", 1000)]
+       and room_take(room, 0, 0, 0.95, 0.85, (9600, 10000, 0, 0), freed=(600, 0))[0] == [("/tmp/e1", 1000)]
+       and "even after what the age line takes"
+       in room_take(room, 0, 0, 0.95, 0.85, (9600, 10000, 0, 0), freed=(600, 0))[1]
+       and room_take(room, 0, 0, 0.95, 0.85, (9600, 10000, 0, 0), freed=(1100, 0)) == ([], "", [])
+       and room_take(room, 0, 0, 0.95, 0.85, (0, 0, 97, 100), freed=(0, 6))[0] == [("/tmp/e1", 1000)]
+       and room_take(room, 3, 0, 0.95, 0.85, (9600, 10000, 0, 0), freed=(1100, 0))
+       == ([("/tmp/e1", 1000), ("/tmp/e2", 1000)], "5 entries, over the 3 line", []))
+    ok("…while a root under the full line, however far over the pressure line, is not the room line's to sweep, "
+       "and one nothing can measure is not full",
+       room_take(room, 0, 0, 0.95, 0.85, (900, 1000, 0, 0)) == ([], "", [])
+       and room_take(room, 0, 0, 0.95, 0.85, None) == ([], "", []))
+    ok("each line at 0 is off, so three zeros ask nothing of a root of any size",
+       room_take(room, 0, 0, 0, 0.85, (999, 1000, 99, 100)) == ([], "", []))
+
     # …and the reading it moves on: this user's quota where there is one, the filesystem where there is not
     ok("a usage reading is as full as the WORST of the limits it has — space or inodes, since either is what "
        "'Disk quota exceeded' means", usage_frac((5, 10, 90, 100)) == 0.9 and usage_frac((9, 10, 1, 100)) == 0.9
@@ -1884,6 +2035,7 @@ def selfcheck():
                    CC_JANITOR_SCRATCH_PRESSURE="2",     # …out of reach: a fraction is never 2, so no run below
                    # is a pressure pass unless it says so — otherwise how full the REAL temp root happens to be
                    # tonight would decide what this suite sees.
+                   CC_JANITOR_SCRATCH_FULL="0",         # …and the room line's fullness off, for the same reason
                    GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
         for name, body in (("tmux", FAKE_TMUX), ("gh", FAKE_GH), ("docker", FAKE_DOCKER)):
             open(f"{fake}/{name}", "w").write(body)
@@ -2494,6 +2646,50 @@ def selfcheck():
                CC_JANITOR_SCRATCH_PRESSURE_HOURS="0").stdout)
         psock.close()
         os.remove(f"{recs}/pdeclared.json")
+        # THE ROOM LINE, end to end, in a temp root of its own: four trees written ten minutes ago — the age line
+        # spares every one — and a count line of 2. The two oldest go, oldest first; the held one is skipped and
+        # the next goes in its place; --dry first, then the real run, and the log says the line that did it.
+        rtmp = os.path.realpath(f"{th}/rtmp")
+        for i, d_ in enumerate(("r-oldest", "r-held", "r-older", "r-newest")):
+            os.makedirs(f"{rtmp}/{d_}", exist_ok=True)
+            open(f"{rtmp}/{d_}/a.txt", "w").write("x" * 100)
+            for p_ in (f"{rtmp}/{d_}", f"{rtmp}/{d_}/a.txt"):
+                os.utime(p_, (now() - 600 + i, now() - 600 + i))
+        json.dump({"name": "r", "dir": f"{rtmp}/r-held"}, open(f"{recs}/rheld.json", "w"))
+        re_ = dict(TMPDIR=rtmp, CC_JANITOR_SCRATCH_COUNT="2")
+        rr = run("--dry", **re_)
+        ok("rule 8: THE ROOM LINE TAKES THE OLDEST WHATEVER THEIR AGE — over the count line, the two oldest unheld "
+           "trees written ten minutes ago are taken, the held one is skipped and named, and the pass says the line",
+           f"would rm 2 leftovers under {rtmp}" in rr.stdout and "the room line is crossed — 4 entries, over the 2 line"
+           in rr.stdout and f"largest {rtmp}/r-oldest" in rr.stdout and f"spared {rtmp}/r-held" in rr.stdout
+           and all(os.path.exists(f"{rtmp}/{d_}/a.txt") for d_ in ("r-oldest", "r-held", "r-older", "r-newest")))
+        ok("rule 8: …and with the count line at its default the same root is nothing to say a word about",
+           f"leftovers under {rtmp}" not in run("--dry", TMPDIR=rtmp).stdout)
+        rr2 = run(**re_)
+        ok("rule 8: …the real run takes exactly those two — the held tree and the newest are still there — and "
+           "the log names the room line as the reason",
+           not os.path.exists(f"{rtmp}/r-oldest") and not os.path.exists(f"{rtmp}/r-older")
+           and os.path.exists(f"{rtmp}/r-held/a.txt") and os.path.exists(f"{rtmp}/r-newest/a.txt")
+           and f"rm 2 leftovers under {rtmp}" in rr2.stdout
+           and "2 of them by the room line (4 entries, over the 2 line)" in open(f"{th}/.cc/state/janitor.log").read())
+        # …and a HELD tree OLDER than the age line, in a root the room line is over: the age pass reports it and
+        # the room pass passes over it, and the pass says it once (review of #426, finding 2). Its own root; the
+        # two young unheld trees make the count line cross and both go, so the held one is the oldest passed over.
+        dtmp = os.path.realpath(f"{th}/dtmp")
+        for d_, ago in (("d-old-held", 30 * 86400), ("d-young", 600), ("d-younger", 590)):
+            os.makedirs(f"{dtmp}/{d_}", exist_ok=True)
+            open(f"{dtmp}/{d_}/a.txt", "w").write("x" * 100)
+            for p_ in (f"{dtmp}/{d_}", f"{dtmp}/{d_}/a.txt"):
+                os.utime(p_, (now() - ago, now() - ago))
+        json.dump({"name": "d", "dir": f"{dtmp}/d-old-held"}, open(f"{recs}/dheld.json", "w"))
+        rd = run("--dry", TMPDIR=dtmp, CC_JANITOR_SCRATCH_COUNT="1")
+        ok("rule 8: A HELD TREE OLDER THAN THE AGE LINE, IN A ROOT THE ROOM LINE IS OVER, IS SAID ONCE — the age pass "
+           "reports it and the room pass skips it, and the two young unheld trees go in its place",
+           rd.stdout.count(f"spared {dtmp}/d-old-held") == 1 and f"would rm 2 leftovers under {dtmp}" in rd.stdout
+           and "the room line is crossed — 3 entries, over the 1 line" in rd.stdout
+           and all(os.path.exists(f"{dtmp}/{d_}/a.txt") for d_ in ("d-old-held", "d-young", "d-younger")))
+        os.remove(f"{recs}/dheld.json")
+        os.remove(f"{recs}/rheld.json")
         ok("rule 8: what it cleared is in the log, with the room it made",
            f"rm 2 leftovers under {ftmp}" in open(f"{th}/.cc/state/janitor.log").read())
         ok("rule 8: …and 0 hours turns the rule off — the same temp root, and not a word about it",

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # cc-notify — reach the owner. Always logs to ~/.cc/notify.log; pushes via ntfy and/or Slack when the KIND says so.
-#   cc-notify [-t title] [--kind <kind>] [--owner] [--decision] [-p …] "message"   (or message on stdin)
+#   cc-notify [-t title] [--kind <kind>] [--owner] [--decision] [--id <producer-id>] [-p …] "message"   (or message on stdin)
+#     --id names the EVENT (land:<repo>:<pr>:<outcome>, credential:<member>, …): cc-slack's ledger sends it once, ever —
+#     a replay of an id Slack already accepted is logged `dedup` and reaches no door, phone included (rec 4, 2026-09-08)
 #   cc-notify report [today|yesterday|YYYY-MM-DD]   how much was sent to the owner that day, at which rungs
 #   cc-notify setup        create the ntfy topic + show the phone subscription steps
 #   cc-notify test         send a test push
@@ -388,6 +390,24 @@ PY
   k "$(no_ pushed)" "…while a rung 4 notice Slack ACCEPTS still stays off his phone: the fallback is a failure path, not a second channel"
   k "$(yes_ grep -q 'send=slack$' <<<"$(last)")" "…and that one logs the door it really used too"
 
+  # THE PRODUCER ID (arch review 2026-09-08, rec 4). `idstub <sent-rc> <post-rc>`: a cc-slack whose ledger answers
+  # `sent <id>` with the first code and whose `post` exits with the second, logging both calls as the stub above does.
+  idstub(){ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\ncase "$1" in sent) exit %s;; esac\nexit %s\n' "$T/slack.args" "$1" "$2" > "$NH/bin/cc-slack"
+            chmod +x "$NH/bin/cc-slack"; }
+  idstub 1 0
+  N --owner -t alice --id credential:alice "alice needs a credential minted"
+  k "$(yes_ grep -q -- '^sent credential:alice$' <<<"$(args)")" "an --id is asked of cc-slack's ledger first (cc-slack sent <id>)"
+  k "$(yes_ grep -q -- '^post .* --id credential:alice ' <<<"$(args)")" "…and one it has not accepted is posted WITH the id, so cc-slack sends it once"
+  k "$(yes_ pushed)" "…and a rung 1 notice still rings the phone the first time"
+  idstub 0 0
+  N --owner -t alice --id credential:alice "alice needs a credential minted"
+  k "$(yes_ grep -q 'send=dedup$' <<<"$(last)")" "a replay of an id Slack already accepted is logged dedup"
+  k "$(no_ pushed)" "…and reaches no door: the phone does not ring again for the same event"
+  k "$(no_ grep -q -- '^post' <<<"$(args)")" "…and nothing is posted — permanent, not a window: the ledger, not this script, remembers"
+  N --owner -t bob "bob needs a credential minted"
+  k "$(no_ grep -q -- '^sent' <<<"$(args)")" "…while a call without --id never asks the ledger: the window dedup is its only memory, as before"
+  slackstub 0
+
   # HOW IT READS ON HIS PHONE. The rule he has asked for three times, said at the moment a session is writing to him
   # rather than in a memory that dies with that session — and it is a NOTE: every case below asserts the message
   # itself goes out untouched, because a door that shortened what a session wrote would be the worse failure. It only
@@ -416,7 +436,7 @@ PY
 }
 
 BOX="$(cfg CC_BOX)"; BOX="${BOX:-$(hostname -s)}"   # this box's name (override with CC_BOX in ~/.cc/config): default title + ntfy topic prefix
-title="$BOX"; prio="default"; decision=0; want=""
+title="$BOX"; prio="default"; decision=0; want=""; pid=""
 case "${1:-}" in
   setup)
     NTFY_TOPIC="$(cfg NTFY_TOPIC)"
@@ -439,6 +459,7 @@ d="$PWD"; while [ -n "$d" ] && [ "$d" != / ]; do
 [ -n "$from" ] && title="$from escalation"
 while [ $# -gt 0 ]; do case "$1" in -t) title="$2"; shift 2;; -p) prio="$2"; shift 2;; --owner) owner=1; shift;;
   --kind) want="$2"; shift 2;;
+  --id) pid="$2"; shift 2;;
   --decision) decision=1; shift;; --) shift; break;; *) break;; esac; done   # `--`: the message is next whatever it starts with — a caller relaying somebody else's words (the member socket) cannot let them become flags
 msg="${*:-$(cat)}"; [ -z "$msg" ] && exit 0
 
@@ -513,6 +534,12 @@ if [ "${CC_MEMBER_SANDBOX:-}" = 1 ]; then
     took socket; record "$went"; stamp; exit 0; fi
   record none; echo "cc-notify: the workspace's Slack link did not take this — it is in $LOG and nowhere else" >&2; exit 1
 fi
+# THE PRODUCER ID IS THE PERMANENT DEDUP, and cc-slack keeps it (arch review 2026-09-08, rec 4): an id Slack has
+# already accepted reaches no door here — not the phone either, which the window below never governed for rung 1.
+# Below the sandbox for the same reason the window is: in there the daemon re-enters this script, and it asks then.
+if [ -n "$pid" ] && "$HOME/bin/cc-slack" sent "$pid" >/dev/null 2>&1; then
+  record dedup; echo "cc-notify: $pid was already sent (cc-slack's ledger) — logged, not sent again" >&2; exit 0
+fi
 # THE DEDUP, and it sits BELOW the sandbox on purpose: the table is not applied inside a member boundary, so an
 # escalation in there is never held back by a window this side of it.
 if [ "$window" -gt 0 ] && [ -f "$SEEN/$key" ]; then
@@ -548,6 +575,7 @@ if [ "$to_slack" = 1 ]; then   # one channel: the bot, else the webhook
   if [ "$owner" = 1 ]; then dest=(-c "${SLACK_OWNER_ID:-#${SLACK_ALERTS:-alerts}}")   # a DM already IS rung 1
   elif [ "$rung" = 4 ]; then dest=(-c "#${SLACK_ALERTS:-alerts}")
   else dest=(--route "$title"); [ "$rung" = 1 ] && dest+=(--mention); fi   # rung 1: the main channel, @-mentioned
+  [ -n "$pid" ] && dest+=(--id "$pid")   # the event's name: cc-slack posts it once and answers a replay with the ts it has
   if [ -n "${SLACK_BOT_TOKEN:-}" ] && "$HOME/bin/cc-slack" post "${dest[@]}" "$(printf '*%s*%s\n%s' "$title" "$bang" "$msg")" >/dev/null 2>&1; then
     took slack   # posted by the bot (owner DM, project channel or SLACK_CHANNEL)
   elif [ -n "${SLACK_WEBHOOK:-}" ] &&

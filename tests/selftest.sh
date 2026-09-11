@@ -1080,7 +1080,9 @@ rm -f "$GH/.cc/state/member-spend.json"
 # it counts: ONE line in #<h> with the command that fixes it, the owner paged ONCE (a day-stamp beside the file), nothing
 # opened, nothing charged. Once, not each time (owner, 2026-09-04): the drive loop runs exactly this — `cc <repo>` — every
 # 2 h, and a workspace waiting to be minted carried the same line in its channel for a day. A second stamp
-# (credential-told) is what makes the channel line once; the owner's page is unchanged.
+# (credential-told) is what makes the channel line once; the owner's page is unchanged. Both now carry the event's
+# producer id (`credential:alice`, and `:owner` for the page) — cc-slack's ledger is what makes "once" hold across
+# every attempt the box makes (arch review 2026-09-08, rec 4); the stamps here are the guard in front of it.
 # Same stub HOME and stub bots as the cap: the page is asserted on cc-notify's argv and never sent.
 rm -f "$NB/cc-notify"; printf '#!/usr/bin/env bash\nprintf "NOTIFY: %%s\\n" "$*" >> "%s"\n' "$T/cap.args" > "$NB/cc-notify"; chmod +x "$NB/cc-notify"
 # NC_SLACK_RC, not CAP_SLACK_RC: a `VAR=1 cap` above leaves that one set in this shell, and a stub post that "failed"
@@ -1091,24 +1093,24 @@ env HOME="$GH" "$B/cc-board" status alice todo queued >/dev/null 2>&1
 n1=$(nocred alice); rn1=$?; n2=$(nocred alice todo); rn2=$?; n3=$(nocred alice todo --go x); rn3=$?
 { [ "$rn1" = 1 ] && [ "$rn2" = 1 ] && [ "$rn3" = 1 ] && grep -q 'no credential of its own' <<<"$n1$n2$n3" \
   && ! grep -q 'new-window' "$T/tmux.log" && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] \
-  && [ "$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")" = 1 ] \
-  && [ "$(grep -c -- '^NOTIFY: -t alice --owner -- .*needs a credential minted' "$T/cap.args")" = 1 ] \
+  && [ "$(grep -c -- '^post -c #alice --major --id credential:alice mint incomplete' "$T/cap.args")" = 1 ] \
+  && [ "$(grep -c -- '^NOTIFY: -t alice --owner --id credential:alice:owner -- .*needs a credential minted' "$T/cap.args")" = 1 ] \
   && [ -s "$GH/.cc/members/alice/credential-told" ] \
   && [ "$(cat "$GH/.cc/members/alice/credential-asked")" = "$(date -u +%F)" ] && [ ! -f "$GH/.cc/state/member-spend.json" ] \
   && grep -q 'cc-sandbox mint alice' <<<"$n1" && grep -q 'cc-sandbox mint alice' "$T/cap.args"; } \
   && ok "a workspace with no credential of its own opens NO window (session, track session, --go): #alice is told ONCE what to mint however often the box tries — three attempts, one line — the owner is paged once, the row never says running and nothing is charged" \
   || bad "a workspace without a credential still died in a pane, or said it more than once (rc=$rn1/$rn2/$rn3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $n1"
 : > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-told"   # a line nobody heard leaves no stamp: the next attempt says it again
-NC_SLACK_RC=1 nocred alice >/dev/null; NC_SLACK_RC=1 nocred alice >/dev/null; p1=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")
-NC_SLACK_RC=0 nocred alice >/dev/null; p2=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")
+NC_SLACK_RC=1 nocred alice >/dev/null; NC_SLACK_RC=1 nocred alice >/dev/null; p1=$(grep -c -- '^post -c #alice --major --id credential:alice mint incomplete' "$T/cap.args")
+NC_SLACK_RC=0 nocred alice >/dev/null; p2=$(grep -c -- '^post -c #alice --major --id credential:alice mint incomplete' "$T/cap.args")
 [ "$p1" = 2 ] && [ "$p2" = 3 ] && [ -s "$GH/.cc/members/alice/credential-told" ] \
   && ok "…and the once is a line somebody HEARD: a post that failed leaves no stamp and is tried again, and the attempt that lands is the one that stops the rest" \
   || bad "the channel line's stamp does not follow the post (failed=$p1, then=$p2, stamp=$(cat "$GH/.cc/members/alice/credential-told" 2>/dev/null))"
 # …and "the post went out" is not "#alice heard it": with no such channel `cc-slack post` files the line in #alerts and
 # still exits 0, so the stamp would call a member's channel told by a line that never reached it, for good.
 : > "$T/cap.args"; rm -f "$GH/.cc/members/alice/credential-told"
-NC_NO_CHAN=1 nocred alice >/dev/null; q1=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")
-NC_NO_CHAN= nocred alice >/dev/null; q2=$(grep -c -- '^post -c #alice --major mint incomplete' "$T/cap.args")   # cleared, not omitted: an assignment prefixing a FUNCTION call stays set afterwards (see NC_SLACK_RC above)
+NC_NO_CHAN=1 nocred alice >/dev/null; q1=$(grep -c -- '^post -c #alice --major --id credential:alice mint incomplete' "$T/cap.args")
+NC_NO_CHAN= nocred alice >/dev/null; q2=$(grep -c -- '^post -c #alice --major --id credential:alice mint incomplete' "$T/cap.args")   # cleared, not omitted: an assignment prefixing a FUNCTION call stays set afterwards (see NC_SLACK_RC above)
 [ "$q1" = 0 ] && [ "$q2" = 1 ] && [ -s "$GH/.cc/members/alice/credential-told" ] \
   && ok "…and with no #alice to post in, nothing is posted and nothing is stamped — the owner's page is the escalation, and the first attempt after that channel exists is the one that tells it" \
   || bad "the told-stamp was claimed without a channel to say it in (no-channel posts=$q1, then=$q2, stamp=$(cat "$GH/.cc/members/alice/credential-told" 2>/dev/null))"
@@ -1132,7 +1134,7 @@ b1=$(nocred alice); rb1=$?; b2=$(nocred alice todo); rb2=$?; b3=$(nocred alice t
 { [ "$rb1" = 1 ] && [ "$rb2" = 1 ] && [ "$rb3" = 1 ] && ! grep -q 'new-window' "$T/tmux.log" \
   && grep -q 'no credential of its own' <<<"$b1" && [ "$(printf '%s\n' "$b1" "$b2" "$b3" | grep -c 'access token is EMPTY')" = 3 ] \
   && [ "$(env HOME="$GH" "$B/cc-board" get alice todo status)" = queued ] && [ ! -f "$GH/.cc/state/member-spend.json" ] \
-  && [ "$(grep -c -- '^NOTIFY: -t alice --owner -- .*needs a credential minted.*access token is EMPTY' "$T/cap.args")" = 1 ]; } \
+  && [ "$(grep -c -- '^NOTIFY: -t alice --owner --id credential:alice:blank@[0-9]*:owner -- .*needs a credential minted.*access token is EMPTY' "$T/cap.args")" = 1 ]; } \
   && ok "a credential blanked by a refused refresh opens NO window either — session, track session and --go all refuse, the row stays queued, and the line the owner gets names the EMPTY token so he re-mints instead of hunting a live pane" \
   || bad "a blanked credential still started a session (rc=$rb1/$rb2/$rb3, status=$(env HOME="$GH" "$B/cc-board" get alice todo status 2>&1), tmux='$(tr '\n' '|' < "$T/tmux.log")', args='$(tr '\n' '|' < "$T/cap.args")'): $b1"
 rm -f "$GH/.cc/members/alice/credentials.json" "$GH/.cc/members/alice/credential-asked" "$GH/.cc/members/alice/credential-told"
@@ -1548,7 +1550,8 @@ tm4=~/.cc/state/$REPO/g4/task.md
 { grep -q 'just do this one thing' "$tm4" && grep -q 'a different brief entirely' "$tm4"; } \
   && ok "cc-board add APPENDS to an existing brief, it never overwrites one" || bad "add clobbered task.md: $(cat "$tm4")"
 "$B/cc-board" set $REPO g4 instructions "an explicitly replaced brief" >/dev/null
-[ "$(cat "$tm4")" = "an explicitly replaced brief" ] \
+# `typed`: the replace is of what a person wrote; the computed IN FLIGHT block is the box's and is kept, refreshed.
+[ "$(typed < "$tm4")" = "an explicitly replaced brief" ] \
   && ok "…and 'cc-board set … instructions' is the explicit way to replace one" || bad "set instructions: $(cat "$tm4")"
 
 # …AND NONE OF THAT IS WRITTEN THROUGH A LINK. ~/.cc/state/<repo> is bound read-WRITE into a member's boundary
@@ -1590,10 +1593,11 @@ gs=$("$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1); grc=$?
 gs=$("$B/cc" $REPO g6 --go "$STEPS" 2>&1); grc=$?
 { [ $grc != 0 ] && grep -q 'step-list' <<<"$gs" && [ ! -s ~/.cc/state/$REPO/g6/task.md ]; } \
   && ok "--go refuses the same note before it starts a worker" || bad "--go dispatched a step list (rc=$grc): $gs"
-# CC_STATE points cc-brief's override ledger at this run's temp dir: the ledger is one file for the whole box
-# (no repo in its path), so a forced fixture here would otherwise land in the box's own record of real overrides.
+# CC_STATE points the state home — cc-brief's override ledger AND cc-board's task.md — at this run's temp dir:
+# the ledger is one file for the whole box (no repo in its path), so a forced fixture here would otherwise land
+# in the box's own record of real overrides. The brief lands under the same root, and that is where it is read.
 gs=$(CC_STATE="$T/briefstate" CC_BRIEF_FORCE=1 "$B/cc-board" add $REPO g10 "g10" "$STEPS" 2>&1)
-{ grep -q 'FLAGGED' <<<"$gs" && grep -q 'cc-foo' ~/.cc/state/$REPO/g10/task.md \
+{ grep -q 'FLAGGED' <<<"$gs" && grep -q 'cc-foo' "$T/briefstate/$REPO/g10/task.md" \
   && grep -q '"what": "step-list"' "$T/briefstate/brief/overrides.jsonl"; } \
   && ok "CC_BRIEF_FORCE=1 flags the same brief, lets it through and writes it to the ledger — force is never silence" || bad "force: $gs"
 # …and what another live track is holding is COMPUTED into the brief, never typed. This case builds its own
@@ -2351,12 +2355,13 @@ n=$(tail -n +$((nl0+1)) "$CC_NOTIFY_LOG" 2>/dev/null | grep -c "$(hostname) limi
 [ "$("$B/cc-limit" status)" = clear ] && ok "the stamp is cleared by the run that got through" || bad "stamp left behind"
 "$B/cc" rm $REPO w4 >/dev/null 2>&1
 fi
-if stanza "one limit episode, end to end (cc-limit writes the record and the episode down; cc-model, cc-pulse and cc-reconcile read them)"; then
+if stanza "one limit episode, end to end (cc-limit writes the record and the episode down; cc-model and cc-reconcile read them)"; then
 # The seam no selfcheck can reach. `cc-limit resume` writes ~/.cc/state/limit-resumed
-# ("<started>\t<reset>\t<resumed>") and both cc-pulse and cc-reconcile read field 1 — the episode's START — to
-# decide that a subagent's mark predates the limit that killed it. One bash writer, two python readers, each green
-# against its own literal: move field 1 and all three stay green while every mark goes warm again, which is the six
-# hours of rows nobody was doing that this ended.
+# ("<started>\t<reset>\t<resumed>") and cc-reconcile reads field 1 — the episode's START — to decide that a
+# subagent's mark predates the limit that killed it (cc-pulse used to read it too; it takes the mark's verdict off
+# cc-reconcile's snapshot now, so there is one reader). One bash writer, one python reader, each green against its
+# own literal: move field 1 and both stay green while every mark goes warm again, which is the six hours of rows
+# nobody was doing that this ended.
 EH=$T/ehome; mkdir -p "$EH/.cc/state"; ereset=$(( $(date -u +%s) - 300 ))   # an episode whose reset has passed
 estart=$(( ereset - 7200 ))                                                # …and which began two hours before that
 # A pane id no tmux has: `resume` captures it, gets nothing, and says so — no pane on this box is read or typed
@@ -2377,16 +2382,16 @@ m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 print(int(m.limit_started()))
 PY
 }
-ereads(){ emiss=""; local et eg; for et in "$B/cc-pulse" "$B/cc-reconcile"; do
+ereads(){ emiss=""; local et eg; for et in "$B/cc-reconcile"; do
   eg=$(erd "$et"); [ "$eg" = "$1" ] || emiss="$emiss [$(basename "$et"): $eg, want $1]"; done; }
 ereads "$estart"
-[ -z "$emiss" ] && ok "…and both readers read that same file as that same START — a mark older than it is cold" \
+[ -z "$emiss" ] && ok "…and the reader reads that same file as that same START — a mark older than it is cold" \
   || bad "a reader disagrees with the writer:$emiss"
 # The suppressed case, so the two above cannot pass by echoing field 1 back: an episode whose RESET is still ahead
 # has not ended, its subagents are not dead yet, and both readers must decide nothing off it.
 printf '%s\t%s\t%s\n' "$estart" "$(( $(date -u +%s) + 3600 ))" "$(date -u +%s)" > "$EH/.cc/state/limit-resumed"
 ereads 0
-[ -z "$emiss" ] && ok "…and an episode whose reset has NOT passed decides nothing in either of them" \
+[ -z "$emiss" ] && ok "…and an episode whose reset has NOT passed decides nothing in it" \
   || bad "a reader acted on a limit that is still standing:$emiss"
 # The record has a second reader: cc-model, which counts a row tagged `indep` as the second run that hit the limit
 # and moves every session to the fallback on it (review of #264). Same seam, same risk — cc-limit writes the tag,

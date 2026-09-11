@@ -27,10 +27,20 @@ carries the `rule` that placed it, and take_mail writes it to the log, the conve
 THE SENDER DECIDES THE WORKSPACE, BEFORE ANY MODEL RUNS. The sender is message.json's `from`, which is the
 address the receiver AUTHENTICATED and matched against the allow-list, never the envelope on its own —
 see identity() there. `workspace_for` maps it to `owner` or to a member handle, in this order: the MAIL_WORKSPACE override table the owner writes, then the Slack
-profile email behind members.json, then the owner's own address. Nothing else is a workspace, and a sender
-that maps to none is refused in one line rather than being given the benefit of the doubt. This is what keeps
+profile email behind members.json, then the owner's own address. Nothing else is a workspace. This is what keeps
 a member's mail out of the owner's workspace and out of another member's: the classifier is only ever handed
 that one workspace's places, so there is no target it could pick that would cross the boundary.
+
+AN ADDRESS THE DOOR TRUSTS AND NO ROW PLACES IS THE OWNER'S TO PLACE, NOT A BOUNCE (2026-09-11). A sender that
+maps to none used to be refused in one line — "I could not tell whose workspace this address belongs to" — and
+receiver.py drops every sender NOT on MAIL_ALLOW at the door, so that line could only ever reach an address the
+owner had added himself: it told an approved sender the opposite of what the box had just decided about them.
+Such a mail is an unplaced one instead, and it goes where an unplaced mail goes: the OWNER'S main session,
+carrying the one line saying the address is trusted and placed by nobody and which MAIL_WORKSPACE row places
+it, because writing that row is his. It reaches nothing else — no name in its To is resolved and no classifier
+runs, there being no workspace whose places could be offered — so the boundary above is untouched. The one
+address that IS still refused is one he wrote a row for with nothing after the `=`: that is the owner saying
+"not this address" himself, and a word a person set is not rewritten by a machine.
 
 UNSURE IS AN ANSWER, NOT A GUESS. The classifier is a cheap model with a fixed list of names and a schema that
 admits nothing else; its answer is checked against the list again here. A model that times out, errs, is not
@@ -47,6 +57,17 @@ WORKSPACE knows goes straight to that conversation's roots and targets — the c
 one thread. One that names another workspace's is refused, and a Message-ID is only ever looked up under the
 workspace that used it, so no sender can take an id somebody else is using.
 
+A MAIL THE BOX STARTS IS A CONVERSATION TOO (owner, 2026-09-10: his reply to a channel's own mail opened a
+new thread). When a session with a channel sends one (`cc-mail send`, outbound.send_to), cc-slack's `mailed`
+verb posts one line in that channel — `email to `a@b` · subject` — and writes started_conv: the line is the
+conversation's `to` root and the record sits under the RECIPIENT'S workspace. THEIR ANSWER DOES NOT NAME THE
+ID WE SENT: the relay rewrites the Message-ID on the wire (2026-09-11), so the mail asks to be answered at
+`<channel>+<tag>@<domain>` and the answer's envelope recipient brings the tag back — looked up under that
+workspace, on that address, like a Message-ID (conv_for_reply). A mail sent before the tag, or answered by a
+client that ignores Reply-To, is matched on sender + our address + subject inside that workspace instead
+(started_match). The root of such a conversation is the box's own word, not a sender's: their_line() tells
+the two apart.
+
 MOVING. One form, and only one: a reply in a mirror thread reading `move #<channel>` (the `#` is optional),
 from the owner, or from the member whose own channel it is. It is offered to THEM, in the thread — a session's
 reply is a bot message the daemon never reads back as a move, so the syntax would be a dead letter in a
@@ -60,6 +81,7 @@ body_text() is the one place that answers "the body, as text" for both: `text` a
 its tags stripped. Nothing renders, opens or fetches the HTML — here or anywhere in this door.
 """
 import fcntl
+import glob
 import json
 import os
 import re
@@ -128,7 +150,8 @@ class Decision:
     is read — so the syntax goes where someone who can use it will see it.
 
     `rule` is the one word saying which rule placed the mail — the ledger's answer to "why is it there":
-    `reply`, `named`, `cc-only`, `classified`, `unsure`, and the `no-channel:` forms of the last two (plus
+    `reply`, `named`, `cc-only`, `classified`, `unsure`, `unmapped` for a sender the door trusts and no row
+    places, and the `no-channel:` forms of `classified`/`unsure` (plus
     `no-channel:bounce`) for a mail whose To named a channel the sender cannot reach. `note` is one sentence
     for the SENDER about that address, put before the reply they get, and "" when there is nothing to say."""
 
@@ -154,7 +177,8 @@ class Decision:
 def overrides(raw):
     """The MAIL_WORKSPACE table, `addr=workspace` separated by commas or newlines. `owner` and a member handle
     are the only values that mean anything; an empty one (`addr=`) is the owner saying "not this address",
-    which refuses. Malformed rows are skipped rather than guessed at."""
+    which refuses — the one per-address switch the daemon reads live, without a receiver HUP. Malformed rows
+    are skipped rather than guessed at."""
     table = {}
     for row in re.split(r"[,\n]", raw or ""):
         addr, sep, ws = row.strip().partition("=")
@@ -164,7 +188,9 @@ def overrides(raw):
 
 
 def workspace_for(sender, table, d):
-    """`owner`, a member handle, or None — and None is a refusal, never a default.
+    """`owner`, a member handle, or None — and None is nobody's, never a default. What the callers do with it is
+    theirs: route() refuses it when the owner's own row says so (refused_by_row) and otherwise hands the mail
+    to him as an unplaced one; cc-slack's `mailed` verb starts no thread it could not key.
 
     THE OWNER'S TABLE FIRST. A row he wrote is a decision, and a lookup that disagreed with it would be a
     machine overruling a person. Then Slack: one users.lookupByEmail on that address gives a uid, and the uid
@@ -191,6 +217,13 @@ def workspace_for(sender, table, d):
     return None
 
 
+def refused_by_row(sender, table):
+    """Whether the owner's table has a row for this address with nothing after the `=`. That row is his own
+    "not this address" and the one case a trusted sender is still refused. A row naming a handle no member has,
+    or no row at all, is not this: those place the address nowhere, which is his to fix, not theirs to be told."""
+    return table.get((sender or "").strip().lower()) == ""
+
+
 # ---------------------------------------------------------------- the addresses on our domain
 
 def addressed(msg, domain):
@@ -198,16 +231,27 @@ def addressed(msg, domain):
     and each one once. Everything else in To:/Cc: is somebody else's mail and is ignored.
 
     message.json's `to` already leads with the envelope recipient, so a mail Cloudflare delivered to one
-    address still names it even when the header does not."""
+    address still names it even when the header does not.
+
+    `<name>+<tag>@` names `<name>` (RFC 5233 subaddressing): the tag is a cold mail's Reply-To carrying its
+    conversation (split_tag, conv_for_reply), and a channel name never holds a `+`. An answer to a mail the
+    box started thus still names the channel it came from even when its tag is unknown here."""
     def parts(field):
         out = []
         for a in msg.get(field) or []:
             local, sep, dom = (a or "").strip().lower().rpartition("@")
+            local = split_tag(local)[0]
             if sep and dom == (domain or "").strip().lower() and local and local not in out:
                 out.append(local)
         return out
     to = parts("to")
     return to, [c for c in parts("cc") if c not in to]
+
+
+def split_tag(local):
+    """(name, tag) off a local part — `mem+ab12` is ("mem", "ab12"), `mem` is ("mem", "")."""
+    name, _, tag = (local or "").partition("+")
+    return name, tag
 
 
 # ---------------------------------------------------------------- the conversation on disk
@@ -276,22 +320,33 @@ def save_conv(rec):
     Message-ID is a string the SENDER chooses: on one table the last mail to use a string owned it, so a member
     could take an id of the owner's and his own reply to his own mail was then refused as another workspace's.
     Under his own key it is his, whatever anyone else writes. The root side needs no key — a (chat, ts) is a
-    channel of ours, and which workspace that channel belongs to is already settled."""
+    channel of ours, and which workspace that channel belongs to is already settled.
+
+    THE TAG SIDE IS KEYED THE SAME WAY, for the same reason: a tag rides in on an address anyone can type."""
     with _locked():
         _write(os.path.join(CONVDIR, "%s.json" % rec["id"]), rec)
         idx = _read(INDEX, {})
         by_mid = {w: dict(v) for w, v in (idx.get("message_id") or {}).items() if isinstance(v, dict)}
+        by_tag = {w: dict(v) for w, v in (idx.get("tag") or {}).items() if isinstance(v, dict)}
         by_root = dict(idx.get("root") or {})
         mine = by_mid.setdefault(rec.get("workspace") or "", {})
         for mid in rec.get("message_ids") or []:
             mine[mid] = rec["id"]
+        if rec.get("tag"):
+            by_tag.setdefault(rec.get("workspace") or "", {})[rec["tag"]] = rec["id"]
         for root in rec.get("roots") or []:
             by_root["%s/%s" % (root.get("chat"), root.get("ts"))] = rec["id"]
-        _write(INDEX, {"message_id": by_mid, "root": by_root})
+        _write(INDEX, {"message_id": by_mid, "tag": by_tag, "root": by_root})
 
 
 def conv_by_root(chat, ts):
     return load_conv((_read(INDEX, {}).get("root") or {}).get("%s/%s" % (chat, ts)))
+
+
+def _side(idx, side):
+    # A value that is not a table is not a workspace's: `x in v` on a string would be a substring test, and
+    # every id would start belonging to somebody.
+    return {w: v for w, v in (idx.get(side) or {}).items() if isinstance(v, dict)}
 
 
 def conv_for_reply(msg, ws):
@@ -302,11 +357,23 @@ def conv_for_reply(msg, ws):
 
     Only `ws`'s own Message-IDs are looked in. `foreign` is the other answer: the mail named a thread this
     workspace does not have and another one does, which is refused rather than routed — it is not this
-    sender's conversation, and it is not going to be started for them in their own channel either."""
-    # A value that is not a table is not a workspace's: `mid in v` on a string would be a substring test, and
-    # every id would start belonging to somebody.
-    idx = {w: v for w, v in (_read(INDEX, {}).get("message_id") or {}).items() if isinstance(v, dict)}
-    mine, foreign = idx.get(ws) or {}, False
+    sender's conversation, and it is not going to be started for them in their own channel either.
+
+    A MAIL THE BOX STARTED IS FOUND TWO MORE WAYS, because the id we minted for it is not the one that comes
+    back: the relay puts its own Message-ID on the wire (2026-09-11, the owner's answer to the email channel's
+    proof mail opened a new root), and the box cannot choose that one. So the cold mail carries its
+    conversation's TAG in `Reply-To: <channel>+<tag>@<domain>` (outbound.tagged) and the answer brings it back
+    as the address it was delivered to — the envelope recipient, which no relay or client rewrites, unlike a
+    header. The tag is looked up under `ws` only, like a Message-ID, and only on the address it was issued
+    for; one that belongs to another workspace is `foreign`, refused like a foreign id, and one nobody knows is
+    no tag at all — the mail routes as any mail to that channel does. Last, for a mail sent before the tag
+    existed and for a client that answers From instead of Reply-To: a mail from a person the box wrote to, to
+    the address it wrote from, on the same subject, is the answer to the newest such conversation
+    (started_match). Every match is inside `ws`, so a subject or an address anyone can type reaches nothing
+    of anyone else's."""
+    idx = _read(INDEX, {})
+    by_mid, by_tag = _side(idx, "message_id"), _side(idx, "tag")
+    mine, foreign = by_mid.get(ws) or {}, False
     for mid in [msg.get("in_reply_to")] + list(reversed(msg.get("references") or [])):
         mid = (mid or "").strip()
         if not mid:
@@ -315,8 +382,66 @@ def conv_for_reply(msg, ws):
             rec = load_conv(mine[mid])
             if rec:
                 return rec, False
-        foreign = foreign or any(mid in (v or {}) for w, v in idx.items() if w != ws)
-    return {}, foreign
+        foreign = foreign or any(mid in (v or {}) for w, v in by_mid.items() if w != ws)
+    if foreign:
+        return {}, True
+    mine = by_tag.get(ws) or {}
+    for addr in recipients_of(msg):
+        local, _, dom = addr.rpartition("@")
+        name, tag = split_tag(local)
+        if not tag:
+            continue
+        if tag in mine:
+            rec = load_conv(mine[tag])
+            # only on the address it was issued for: the record's own address (started_conv, `to[0]`)
+            if rec and (rec.get("to") or [""])[0].strip().lower() == "%s@%s" % (name, dom):
+                return rec, False
+        if any(tag in (v or {}) for w, v in by_tag.items() if w != ws):
+            return {}, True
+    return started_match(msg, ws), False
+
+
+def recipients_of(msg):
+    """Every address the mail was sent to, lower-cased, the envelope recipient first (message.json's `to[0]`)."""
+    return [a.strip().lower() for a in (msg.get("to") or []) + (msg.get("cc") or []) if (a or "").strip()]
+
+
+_PREFIX = re.compile(r"^\s*(?:(?:re|fwd?|aw|sv|tr)\s*(?:\[\d+\])?\s*:\s*)+", re.I)
+
+
+def same_subject(a, b):
+    """Two subjects are the same once the reply prefixes a client stacks on (`Re:`, `Fwd:`, `AW:` …), case
+    and runs of whitespace are set aside. Empty is never the same as anything: a mail with no subject answers
+    nothing by its subject."""
+    def norm(s):
+        return " ".join(_PREFIX.sub("", s or "").split()).casefold()
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
+def started_match(msg, ws):
+    """The newest conversation the BOX started, in `ws`, that this mail reads as the answer to: its sender is
+    one of the people the box wrote to, it came to the address the box wrote from, and its subject is ours
+    under the client's `Re:`. Only `rule=started` records — a mail a person sent first is found by their own
+    Message-ID in References, which every client keeps. {} when there is none.
+
+    Only for a mail that IS a reply: one that names something in In-Reply-To or References, even when what it
+    names is the relay's id and not ours. A fresh mail with neither — the same person writing `deploy` to the
+    same address a month after the box once mailed them `deploy` — is a new mail, not the answer to that one,
+    whatever its subject says (review of #435: "a mail that names nothing we know is not a reply")."""
+    if not ((msg.get("in_reply_to") or "").strip() or any((r or "").strip() for r in msg.get("references") or [])):
+        return {}
+    sender = (msg.get("from") or "").strip().lower()
+    to = {"%s@%s" % (split_tag(a.rpartition("@")[0])[0], a.rpartition("@")[2]) for a in recipients_of(msg)}
+    if not sender or not to:
+        return {}
+    for path in sorted(glob.glob(os.path.join(CONVDIR, "out-*.json")), reverse=True):
+        rec = _read(path, {})
+        if rec.get("rule") != STARTED or rec.get("workspace") != ws:
+            continue
+        ours, theirs = (rec.get("to") or [""])[0].strip().lower(), [a.strip().lower() for a in (rec.get("to") or [])[1:]]
+        if ours in to and sender in theirs and same_subject(msg.get("subject"), rec.get("subject")):
+            return rec
+    return {}
 
 
 def new_conv(msg, workspace):
@@ -338,6 +463,49 @@ def join_conv(rec, msg):
         if r not in rec.setdefault("references", []):
             rec["references"].append(r)
     return rec
+
+
+STARTED = "started"          # the `rule` of a conversation the BOX opened — cc-mail's mail, mirrored by the daemon
+
+
+def started_conv(ask, workspace, cid=None):
+    """The record of a mail the BOX started (outbound.send_to, mirrored by cc-slack's `mailed` verb): a
+    received mail's record turned around, so the reply path and the router read it unchanged. `to` leads with
+    OUR address, the one the mail came From (outbound.from_addr answers from `to[0]`), then the people it went
+    to (recipients() drops ours and answers them); `tag` is what the mail's Reply-To carries, so the person's
+    answer brings it back and conv_for_reply finds the record by it (`message_ids` is the id we minted, kept
+    for the reply path's References — the relay does not put it on the wire, so no answer names it); `mails`
+    is empty until one does; `from` is nobody, there being no sender but us. `workspace` is the RECIPIENT'S —
+    the key their answer is looked up under, which is why the daemon settles it (workspace_for) and this only
+    records it."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return {"id": cid or "out-%s-%s" % (now.replace("-", "").replace(":", ""), os.urandom(3).hex()),
+            "workspace": workspace, "from": "", "subject": ask.get("subject") or "", "mails": [],
+            "message_ids": [m for m in [ask.get("message_id")] if m], "tag": str(ask.get("tag") or ""),
+            "to": [ask.get("from") or ""] + [a for a in (ask.get("to") or []) if a], "cc": [],
+            "references": [], "roots": [], "moves": [], "rule": STARTED, "at": now}
+
+
+def started_line(ask):
+    """The one line a mail the box started leaves in the sending channel, and the root its answer threads
+    under: `_email to `a@b` · subject · 1 attachment_` — mirror_line's shape, read the other way."""
+    bits = ["email to %s" % ", ".join("`%s`" % _plain(a, 80, at=False) for a in (ask.get("to") or [])),
+            _plain(ask.get("subject") or "(no subject)", 120)]
+    n = len(ask.get("attachments") or [])
+    if n:
+        bits.append("%d attachment%s" % (n, "" if n == 1 else "s"))
+    return "_%s_" % " · ".join(bits)
+
+
+def their_line(rec, chat, ts):
+    """Is the message at (chat, ts) a line quoting a mail that ARRIVED — the sender's word, for every door
+    that asks whose turn it is? True for every inbound mail's mirror line (`mirrors`, which take_mail writes
+    for a root and for each later mail's line under it); False for the root of a conversation the box
+    STARTED (started_conv — that line is the box's own), for a person's Slack message in the thread, and for
+    no message at all. Distinct from outbound.by_mail, which also counts a started root: a session answering
+    that line IS mailing the people it went to, but nobody is waiting on an answer to it."""
+    ts = str(ts or "").strip()
+    return bool(ts) and any(m.get("chat") == chat and str(m.get("ts")) == ts for m in (rec.get("mirrors") or []))
 
 
 def conv_places(rec, role=None):
@@ -520,20 +688,49 @@ def unplaced_note(names):
         ", ".join("#" + _plain(n, 60) for n in names), "is" if len(names) == 1 else "are")
 
 
+UNMAPPED = "unmapped"        # the `rule` of a mail from an address the door trusts and no row places
+
+
+def unmapped_line(sender):
+    """The one line a mail from an address MAIL_ALLOW has and MAIL_WORKSPACE does not carries: that the address
+    got in on the owner's own list and belongs to no workspace, and the row that would place it. It goes to the
+    owner's session and into his mirror thread, so the address is folded like any sender's text (_plain)."""
+    a = _plain(sender, 80, at=False)
+    return ("`%s` is trusted at the door and mapped to no workspace, so this mail is here. A MAIL_WORKSPACE row "
+            "in ~/.cc/config places it: `%s=owner`, or `%s=<member handle>`." % (a, a, a))
+
+
 def route(msg, d, domain, table=None, unplaced_to="main"):
     """The whole decision for one stored mail. Returns a Decision; `refuse` set means nothing else happened.
 
     The order is the boundary. The workspace is settled from the authenticated sender before anything is resolved,
     so every place considered below already belongs to that one workspace and no later step can cross out of
-    it. Then a reply follows its own thread, then the addresses a person typed, and only then the classifier.
+    it — and a sender no row places has no workspace to consider, which is answered there and nowhere else.
+    Then a reply follows its own thread, then the addresses a person typed, and only then the classifier.
 
     `unplaced_to` is MAIL_UNPLACED: where a mail goes when its To named a channel the sender cannot reach AND
     the classifier could not place it — `main` (the default, and anything that is not the other word) delivers
     it to the workspace's main session with the question; `bounce` refuses it in one line to the sender."""
-    ws = workspace_for(msg.get("from", ""), overrides(table), d)
+    rows = overrides(table)
+    ws = workspace_for(msg.get("from", ""), rows, d)
     if ws is None:
-        return Decision(refuse="I could not tell whose workspace this address belongs to, so I did not deliver "
-                               "it. Ask the box's owner to add it.")
+        if refused_by_row(msg.get("from", ""), rows):
+            # THE OWNER'S OWN "NOT THIS ADDRESS". An `addr=` row is a word a person set: it is read and obeyed
+            # here, never rewritten into a delivery. Refused, in a line that says what happened.
+            return Decision(refuse="This address is placed nowhere on this box, so I did not deliver it.")
+        # TRUSTED AT THE DOOR, PLACED BY NOBODY. The owner put this address on MAIL_ALLOW and receiver.py let the
+        # mail in on the strength of that, so refusing it here answered an approved sender with the opposite of
+        # what the box had decided about them (2026-09-11). It is an unplaced mail and takes the unplaced path:
+        # the owner's main session, with the line saying which row would place it. Decided here and going no
+        # further — no To of theirs is resolved, no classifier runs — so a sender no row places reaches one
+        # session, the owner's own, and nothing of anyone else's.
+        main = d.main("owner")
+        if main is None:
+            # Brief: an approved sender "is never told 'ask the box's owner to add it'". With no owner session
+            # there is nowhere for the mail to go, and the line says that and nothing about the sender.
+            return Decision(refuse="The box's owner has no channel on this box yet, so I did not deliver this.")
+        line = unmapped_line(msg.get("from", ""))
+        return Decision(to=[main], workspace="owner", question=line, offer=line, rule=UNMAPPED)
 
     rec, foreign = conv_for_reply(msg, ws)
     if foreign:

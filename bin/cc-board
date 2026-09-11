@@ -2,10 +2,17 @@
 """cc-board — shared per-repo task/status board for orchestrated Claude sessions.
 Board file: ~/.cc/boards/<repo>.json  (sidecar; never in git, so no merge noise).
 Every orchestrated session reads/writes it so sessions know what the others are doing.
+The brief itself lives in ~/.cc/state/<repo>/<track>/task.md, and `brief append|replace|annotate <repo> <track>
+<text|->` (`--top` puts an appended note first) is the ONE writer of that file — a locked read-modify-write that
+`add`, `set … instructions`, `cc --go` and `cc-brief refresh` all go through. CC_STATE points that home elsewhere
+(a test run keeps out of the box's own state), as it does for cc-brief.
 `add` and `set … instructions` are the doors a brief comes in by: cc-brief refuses one that prescribes the steps
 — by its own arithmetic and by a small model reading the prose, which says what to cut; a judge that cannot answer
 does not stop it. CC_BRIEF_FORCE=1 sends it as typed and records that; CC_BRIEF_MACHINE=1 is for a row the box
-wrote itself and records nothing. What other live tracks are holding is computed in."""
+wrote itself and records nothing. What other live tracks are holding is computed in.
+A brief that says `Closes <row>` (several: `Closes a, b and c`) closes those rows when its PR lands: `cc done` puts
+the brief in the PR body and the landing (cc-land) reads the sentence there, wherever it stands. A row a person holds
+or a track is live on is left open and said."""
 import sys, os, json, time, fcntl, calendar, errno, re, subprocess, stat, tempfile, glob
 BOARDS = os.path.expanduser("~/.cc/boards")
 # ONE VOCABULARY with the App Home tab (§02 of the Home handoff: the word is "queued", never "todo"). The board used to
@@ -73,9 +80,9 @@ def holder():
 # the session it names and by nothing else, and only from a window a reader counts (agent_id); the one thing that
 # may move an existing one is `handover` below — which moves the name and NOT the clock, so a mark that had
 # already expired stays expired — and that is the whole of the exception.
-# WHAT A READER COUNTS is one thing, and a mark that misses it is worse than no mark at all. Both readers ask
-# the same of a mark's window: cc-pulse's agent_held lists `-t main` and keeps a mark only where
-# `#{window_name}` is the row's own repo or that repo with an `@<alias>` after it, and cc-reconcile's mark_why
+# WHAT A READER COUNTS is one thing, and a mark that misses it is worse than no mark at all. The one reader is
+# cc-reconcile's mark_why (cc-pulse and the Home tab take its snapshot): it keeps a mark only where
+# `#{window_name}` is the row's own repo or that repo with an `@<alias>` after it, and mark_why
 # keeps one only where its wins[] entry — the window's name again — passes that same test. A window named
 # anything else is read by NEITHER, so a claim made from one records an owner nobody recognises: the row reads
 # unowned, the watchdog calls it abandoned ten minutes later, and cc-pulse offers it for dispatch while the
@@ -157,14 +164,18 @@ def agent_id(val, repo):
 # worktree, state, tmux windows — and a suite that dies mid-run leaves them behind: one such board's `waiting` row
 # reached the owner's NEEDS YOU list. core/tests/selftest.sh is `_cctest<pid>`, cc-sandbox's selfchecks `_ccsbx<pid>`,
 # and it was the second of those that the board watchdog reported as two worktrees of real work (2026-09-02) — the
-# prefix is the namespace, not one suite's name. This is THE place that says what a real board is. A reader of
-# ~/.cc/boards either calls `cc-board boards` / `list` (cc-digest, cc ls, cc-audit) or, where it must stay in-process
-# (the Home tab, cc-reconcile, the landing queue), copies this one test and names it. Only cc-reconcile's copy carries
-# the prefix so far — the other two still read `_cctest` alone, so a leaked `_ccsbx<pid>` board is a board to them until
-# cc-janitor rule 6 removes it, a tick of the 20-min pass later; widening a paging gate is its own change. `--all` is
-# how a fixture is seen from outside its run.
+# prefix is the namespace, not one suite's name. This is THE place that says what a real board is, and the rule is
+# ASKED, never copied: a shell reader calls `cc-board boards` / `list` (cc-digest, cc ls, cc-audit); the in-process
+# readers — cc-reconcile, the Home tab, cc-land's catch-up, cc-janitor — import this file (the way they read a board
+# through `read`) and hand `reals` the names they hold, one batch, or ask `suite_pid` whose run a name belongs to.
+# Two of them once carried a copy that read `_cctest` alone, so a leaked `_ccsbx<pid>` was scaffolding to reconcile
+# and a repo to the Home tab and the landing queue at the same time — 52 phantom repos on one catch-up tick (arch
+# review 2026-09-08, rec 11); the selfcheck's tripwire now fails a sibling that grows a copy. `--all` is how a
+# fixture is seen from outside its run.
 FIXTURE = "_cc"                          # every suite's scratch names start here…
-SUITE = re.compile(r"^_cc[a-z]+(\d+)$")  # …and each carries the pid of the run that made it, which is the whole test
+SUITE = re.compile(r"(?<![A-Za-z0-9_])_cc[a-z]+(\d+)(?![A-Za-z0-9])")   # …and each carries the pid of the run that made it,
+                                         # which is the whole test: `_cctest<pid>`, `_ccsbx<pid>/t`, `<name>.json`, `<name>~next`
+                                         # — a word that merely contains it (myrepo_cctest123) is not one
 _LIN = None
 def lineage():
     """This process's pid chain to init, from /proc — cached: a tool's ancestry does not move while it runs."""
@@ -177,20 +188,33 @@ def lineage():
                 with open(f"/proc/{pid}/status") as f: pid = int(next(l for l in f if l.startswith("PPid:")).split()[1])
             except (OSError, StopIteration, ValueError): break
     return _LIN
+def suite_pid(name):
+    """The run pid a `_cc<suite><pid>` name STARTS with — bare, or followed by anything that is not a name character
+    (`_cctest123.json`, the window `_ccsbx123/t`, `_cctest123~next`) — or None: a real repo, and a prefixed name
+    carrying no pid (`_cclive.lock`), which is nobody's run. The name as the caller holds it, not a path: a directory
+    goes in by its basename. cc-janitor's rule 6 keys what a run left behind by this."""
+    m = SUITE.match(name)
+    return int(m.group(1)) if m else None
 def real(name):
     """A `_cc<suite><pid>` board is a board only INSIDE the run that made it — to a process under <pid>, so the suite's own
     `cc ls` / `cc digest` see their track — and nowhere else: no timer, Home tab or landing queue descends from a suite.
     A name under the prefix carrying no pid is nobody's run either, so it is scaffolding too; a real repo that merely
     CONTAINS the word (myrepo_cctesting) does not start with it and is never touched by this."""
-    n = os.path.basename(name).split(".", 1)[0]
+    n = os.path.basename(name)
     if not n.startswith(FIXTURE):
         return True
-    m = SUITE.match(n)
-    return bool(m) and int(m.group(1)) in lineage()
+    pid = suite_pid(n)
+    return pid is not None and pid in lineage()
+def reals(names):
+    """THE BATCHED ANSWER: the names among `names` (bare or `.json`, in the order given) that are boards to THIS process —
+    real repos, and the fixtures of the run this process is under. What every in-process reader of ~/.cc/boards, or of a
+    directory keyed by repo name, filters its listing through."""
+    return [n for n in names if real(n)]
 def boards(all_=False):
     """Board names in BOARDS, sorted — the real ones, or every one with all_."""
     if not os.path.isdir(BOARDS): return []
-    return sorted(fn[:-5] for fn in os.listdir(BOARDS) if fn.endswith(".json") and (all_ or real(fn)))
+    names = sorted(fn[:-5] for fn in os.listdir(BOARDS) if fn.endswith(".json"))
+    return names if all_ else reals(names)
 def clean(s):
     """A title is display text. argv arrives surrogateescaped, so a shell-mangled emoji is a lone surrogate — json.dump
     stores it happily and every later print of the board raises. Replace it on the way in; never store one."""
@@ -227,7 +251,7 @@ def _open(t, flags, mode=0o644):
     try: fd = os.open(t, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, mode)
     except OSError as e:
         if e.errno in (errno.ELOOP, errno.ENXIO, errno.EISDIR, errno.ENOTDIR):
-            raise Refused(f"cc-board: {t} is a link, a pipe or a directory, not a board file — refused")
+            raise Refused(f"cc-board: {t} is a link, a pipe or a directory, not a plain file — refused")
         raise
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
@@ -300,20 +324,118 @@ def need(repo):
 # 4590-byte brief became one sentence on 2026-08-31). Two authorities cannot be kept equal, so there is now one:
 # the file. This JSON keeps a display `title` and nothing a worker is meant to read. `instructions` survives only
 # as the NAME callers already type for the brief — get/set route it to the file, they never touch the JSON.
-STATE = os.path.expanduser("~/.cc/state")
-def tpath(repo, track): return os.path.join(STATE, repo, track, "task.md")
+STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")   # CC_STATE: a test run keeps out of the box's own
+def tpath(repo, track, state=None): return os.path.join(state or STATE, repo, track, "task.md")
 def read_brief(repo, track):
     try:
         with open(tpath(repo, track), errors="replace") as f: return f.read()
     except OSError: return ""
-def write_brief(repo, track, text):
-    p = tpath(repo, track); os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"                                  # atomic: a half-written brief is worse than an old one
-    with open(tmp, "w") as f: f.write(text if text.endswith("\n") else text + "\n")
-    os.replace(tmp, p)
-# cc-brief writes a delimited IN FLIGHT block into task.md and owns it; these are the same two markers. A reader
-# asking for the BRIEF gets what a person typed — `cc done` builds the PR body out of this.
-INFLIGHT_RE = re.compile(re.escape("<!-- cc-brief:inflight -->") + r".*?" + re.escape("<!-- /cc-brief:inflight -->") + r"\n?", re.S)
+# cc-brief computes a delimited IN FLIGHT block into task.md and owns it; these are the markers. A reader asking
+# for the BRIEF gets what a person typed — `cc done` builds the PR body out of this.
+MARK_A, MARK_B = "<!-- cc-brief:inflight -->", "<!-- /cc-brief:inflight -->"
+INFLIGHT_RE = re.compile(re.escape(MARK_A) + r".*?" + re.escape(MARK_B) + r"\n?", re.S)
+def merge(text, block):
+    """Put block where the last one was, or at the end; "" takes the old one out. ONLY the delimited block moves —
+    every line a person typed is left exactly as typed (self-review 6: a machine does not rewrite a human's word)."""
+    if INFLIGHT_RE.search(text):
+        out = INFLIGHT_RE.sub(lambda m: block, text, count=1)
+        if block: return out
+        # Removing it undoes exactly what appending it did — the block and the blank line it was put after — and
+        # nothing else. A blank line a person left three deep in their own brief is theirs, not this tool's to tidy.
+        return (out.rstrip("\n") + "\n") if out.strip() else ""
+    if not block: return text
+    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
+# ── ONE LOCKED WRITER (2026-09-11). task.md had THREE writers, each an unlocked read-replace with a temp name of
+# its own — `add`/`set` here, `cc --go` (dd + mv) and `cc-brief refresh` (.brief.tmp) — so a dispatch note, an
+# append and the block's recompute landing together kept whichever wrote last and lost the rest (arch review
+# 2026-09-08, rec 10). Every mutation is now this one read-modify-write under the track's own flock, the way
+# cc-config edits its file: `append` (a note joins the brief — at the bottom for `add`, on TOP for `cc --go` so
+# the worker reads it first; a repeat is never stacked up), `replace` (`set … instructions`, the one deliberate
+# way to lose a brief) and `annotate` (cc-brief's block, and ONLY the block). append and replace are doors, so
+# the shape gate runs inside them, BEFORE the lock: the judge can take two minutes, and nothing waits on it.
+# The walls are `cc --go`'s (security review of #225), in the same order: the track dir is really itself (the
+# state dir is bound read-write into a member's boundary and a worker's sandbox, so a link on the way is theirs),
+# the lock and the file are opened O_NOFOLLOW as regular files with one name, the temp file is mkstemp's, and
+# rename(2) replaces a link left at task.md rather than writing through it. `cc-board brief …` is the CLI face;
+# `add`, `set` and cc-brief call brief_edit() in-process. Nothing else on the box writes this file.
+BRIEF_VERBS = ("append", "replace", "annotate")
+def track_dir(repo, track, state=None):
+    """~/.cc/state/<repo>/<track>, made if missing, and refused unless it is really itself — no link at <repo>, none
+    on the way, no `/` or `..` in a name walking out of it."""
+    root = state or STATE
+    if "/" in repo or "/" in track or repo in (".", "..") or track in (".", "..") or not repo or not track:
+        raise Refused(f"cc-board: '{repo}/{track}' is not a track name — refused")
+    d = os.path.join(root, repo, track)
+    if os.path.islink(os.path.join(root, repo)) or os.path.islink(d):   # checked BEFORE the mkdir, which would otherwise
+        raise Refused(f"cc-board: refusing {repo}/{track}'s state dir — {d} is a symlink or sits behind one")   # make a dir through it
+    try: os.makedirs(d, exist_ok=True)
+    except OSError as e: raise Refused(f"cc-board: refusing {repo}/{track}'s state dir — {d} could not be made: {e.strerror}")
+    if os.path.realpath(d) != os.path.join(os.path.realpath(root), repo, track):
+        raise Refused(f"cc-board: refusing {repo}/{track}'s state dir — {d} is a symlink or sits behind one")
+    return d
+class BriefLock:
+    """flock on <track dir>/task.md.lock: the same wait-then-refuse as the board's Lock, on the brief's own file, so
+    two tracks' briefs never queue on each other and a member holding one holds only its own."""
+    def __init__(self, d):
+        self.p = os.path.join(d, "task.md.lock")
+        self.f = os.fdopen(_open(self.p, os.O_WRONLY | os.O_CREAT), "w")
+    def __enter__(self):
+        end = time.monotonic() + LOCK_WAIT
+        while True:
+            try: fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    self.f.close(); raise Refused(f"cc-board: {self.p} is held by another process — gave up after {LOCK_WAIT} s")
+                time.sleep(0.05)
+    def __exit__(self, *a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+def _read_task(p):
+    """task.md through _open: a link there would hand an owner-only file to whoever reads the brief (it is read
+    back into every write), so it is refused, not followed. Nothing there reads as an empty brief."""
+    try: fd = _open(p, os.O_RDONLY)
+    except FileNotFoundError: return ""
+    with os.fdopen(fd, errors="replace") as f: return f.read()
+def _write_task(p, text):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix="task.md.", suffix=".tmp")   # O_EXCL, a fresh name
+    os.fchmod(fd, 0o644)
+    with os.fdopen(fd, "w") as f: f.write(text if text.endswith("\n") else text + "\n")
+    os.replace(tmp, p)                               # atomic: a reader sees the old brief or the new one, never half
+def human(text): return INFLIGHT_RE.sub("", text)    # what a person typed: the file without the machine's block
+def brief_edit(verb, repo, track, text, top=False, state=None, gated=True):
+    """The one mutation of task.md. Returns (before, after) — equal when nothing needed writing.
+    append   text joins the brief: at the bottom, above the block (`add`: never clobber a brief as a side effect
+             of another command), or with top=True on the first line (`cc --go`: the dispatch note first, so the
+             worker reads it first). A note already there — anywhere, for the bottom; on the head, for the top,
+             which is what a re-dispatch repeats — is not stacked up.
+    replace  text IS the brief; the block, if one is there, stays where it was until the next refresh recomputes it.
+    annotate text is the block, markers included, or "" to take it out; a brief that does not exist is not made
+             for it. Every other byte is a person's and is left exactly as typed.
+    gated=False is for text already accepted: the pre-#94 copy brief() moves, and the selfcheck's own lock cases."""
+    if verb not in BRIEF_VERBS: raise Refused(f"cc-board brief: '{verb}' is not one of {'|'.join(BRIEF_VERBS)}")
+    if verb == "annotate":
+        if text and not (text.startswith(MARK_A) and text.rstrip("\n").endswith(MARK_B)
+                         and text.count(MARK_A) == 1 and text.count(MARK_B) == 1):
+            raise Refused("cc-board brief annotate: the block must open with the marker, close with it, and hold no other")
+        block = text.rstrip("\n") + "\n" if text else ""
+        if not os.path.lexists(tpath(repo, track, state)): return "", ""   # no brief: nothing to annotate, no file made
+    elif not text.strip():
+        raise Refused(f"cc-board brief {verb}: nothing to write")
+    elif gated: check_shape(repo, track, text)       # a door: the shape gate runs before the lock, never under it
+    d = track_dir(repo, track, state); p = os.path.join(d, "task.md")
+    def edit(cur):
+        if verb == "annotate": return merge(cur, block)
+        body, blk = text.rstrip("\n") + "\n", INFLIGHT_RE.search(cur)
+        if verb == "replace": return merge(body, blk.group(0) if blk else "")
+        typed, note = human(cur), text.strip("\n") + "\n"          # the note as WHOLE LINES: `head -c` and a substring
+        if top:                                                       # test both took "note 1" for "note 10" (stress case)
+            if (typed + "\n").startswith(note): return cur              # already on top: a re-dispatch repeating its note
+            return body + ("\n" + cur if cur.strip() else "")
+        if "\n" + note in "\n" + typed + "\n": return cur             # already in the brief: the same add twice
+        typed = (typed.rstrip("\n") + "\n\n" if typed.strip() else "") + body
+        return merge(typed, blk.group(0) if blk else "")
+    with BriefLock(d):
+        cur = _read_task(p); new = edit(cur)
+        if new == cur: return cur, cur
+        _write_task(p, new); return cur, new
 def brief(repo, track):
     """The brief, migrating a pre-#94 board copy into the file ONCE, on the first read of it. Never call this while
     holding Lock(repo): it takes the lock itself, and flock on a second fd of the same file deadlocks its owner.
@@ -329,8 +451,8 @@ def brief(repo, track):
         d = _load(repo); t = ((d or {}).get("tracks") or {}).get(track) or {}
         legacy = t.pop("instructions", "") or ""
         if not legacy.strip(): return read_brief(repo, track)   # somebody else migrated it while we waited
-        try: write_brief(repo, track, legacy)                   # a brief that cannot be written is still ANSWERED,
-        except OSError: return legacy                           # and its JSON copy kept — `show` must not die on it
+        try: brief_edit("replace", repo, track, legacy, gated=False)   # a brief that cannot be written is still ANSWERED,
+        except (OSError, Refused): return legacy                # and its JSON copy kept — `show` must not die on it
         _save(repo, d)                                          # the file holds it now: drop the copy, one authority
     return legacy
 # ── A FINISHED TRACK LEAVES THE DEFAULT VIEW (owner, 2026-08-30: "this should also remove it from the board") ──
@@ -406,10 +528,12 @@ def offer_join(repo, track):
     into it — the same lane the append notice above uses."""
     _brief_tool("belongs", repo, track, stdout=sys.stderr)
 
-USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"base":2,"list":1,"boards":1,"selfcheck":1,"handover":5}
+USAGE = {"init":3,"add":4,"set":5,"get":4,"status":4,"note":4,"rm":3,"tracks":2,"json":2,"show":2,"base":2,"list":1,"boards":1,"selfcheck":1,"handover":5,"brief":5}
 def main(a):
-    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|base|list [--all]|boards [--all]|rm|tracks|handover|selfcheck} ...")
+    if not a: sys.exit("usage: cc-board {init|add|set|get|status|note|show [--all]|json|base|list [--all]|boards [--all]|rm|tracks|handover|brief|selfcheck} ...")
     cmd = a[0]
+    top = cmd == "brief" and "--top" in a
+    if top: a = [x for x in a if x != "--top"]
     sys.stdout.reconfigure(errors="replace")   # a bad title already on disk prints as '?', never as a traceback
     if cmd in USAGE and len(a) < USAGE[cmd]:   # a short call must say so, not traceback
         sys.exit(f"cc-board {cmd}: needs {USAGE[cmd]-1} argument(s), got {len(a)-1}")
@@ -423,12 +547,10 @@ def main(a):
     elif cmd == "add":
         repo, track, title = a[1], a[2], clean(a[3])
         instr = " ".join(a[4:])
-        have = brief(repo, track)            # migrate a legacy JSON copy FIRST — the pop below would drop it
+        brief(repo, track)                   # migrate a legacy JSON copy FIRST — the pop below would drop it
         if instr.strip():                    # the brief goes to its one home; the board JSON keeps the title
-            check_shape(repo, track, instr)  # …if it is a brief at all: a step list never reaches the file
-            if not have.strip(): write_brief(repo, track, instr)
-            elif instr.strip() not in have:   # something is already there: APPEND. Never clobber a brief as a side
-                write_brief(repo, track, have.rstrip("\n") + "\n\n" + instr)   # effect of another command — that
+            before, after = brief_edit("append", repo, track, instr)   # gated, locked, and it APPENDS: never clobber
+            if human(before).strip() and after != before:              # a brief as a side effect of another command
                 print(f"cc-board add: {repo}/{track} already had a brief — appended rather than replaced.\n"
                       f"  replace it deliberately: cc-board set {repo} {track} instructions '<brief>'", file=sys.stderr)
         with Lock(repo):
@@ -448,13 +570,20 @@ def main(a):
         refresh_inflight(repo, track)        # the row exists now, so the block can name every OTHER live track
         print(f"track '{track}' added to {repo}")
         offer_join(repo, track)              # …and a live row already in these files is offered, not left to memory
+    elif cmd == "brief":
+        # THE CLI FACE OF THE ONE WRITER: `cc --go` pipes its note through `append --top … -`; the stress case in
+        # selfcheck drives all three as separate processes, which is the contention the lock exists for.
+        verb, repo, track, text = a[1], a[2], a[3], a[4]
+        if text == "-": text = sys.stdin.read()
+        before, after = brief_edit(verb, repo, track, text, top=top)
+        print(f"{repo}/{track}: brief {verb} — {'unchanged' if after == before else 'written'}")
     elif cmd == "set":
         repo, track, key, val = a[1], a[2], a[3], a[4]
         if key == "instructions":            # replacing a brief is an EXPLICIT act, and this is the verb for it
             if track not in need(repo)["tracks"]: sys.exit(f"no track '{track}'")
             brief(repo, track)               # migrate first, so the old copy cannot come back over the new one
-            check_shape(repo, track, val)    # …and it is a door like `add`: `set` then `--go ""` would otherwise
-            write_brief(repo, track, val); return    # dispatch a step list past both gates, --go having no text to check
+            brief_edit("replace", repo, track, val)   # gated like `add`: `set` then `--go ""` would otherwise dispatch
+            refresh_inflight(repo, track); return     # a step list past both gates, --go having no text to check
         if key == "agent_at":
             # THE CLOCK ON A MARK IS NOT A FIELD ANYONE SETS. It is written only as a side effect of `set agent
             # me` / `agent ''` below, and for the same reason a mark can only be made by the session it names:
@@ -520,9 +649,9 @@ def main(a):
                 # EXACTLY EQUAL, never a prefix: `@1:900` is not `@12:900`, and a prefix match here would hand one
                 # session's live row to another in silence — worse than the bug this verb exists for.
                 if t is None or (t.get("agent") or "").strip() != frm: continue
-                # THE CLOCK IS CARRIED, NOT RESTARTED. `agent_at` is the age both readers expire a mark on
-                # (cc-reconcile mark_why, cc-pulse agent_held), so a fresh stamp here would make a mark they had
-                # both already given up on warm again: a row marked at 02:00 whose subagent died, cold by 09:00
+                # THE CLOCK IS CARRIED, NOT RESTARTED. `agent_at` is the age the reader expires a mark on
+                # (cc-reconcile mark_why, whose snapshot cc-pulse and the Home tab take), so a fresh stamp here
+                # would make a mark it had already given up on warm again: a row marked at 02:00 whose subagent died, cold by 09:00
                 # and already `blocked`, would read `running` for six more hours with nothing on the box doing
                 # it — 'loosening it would hide a real abandonment'. The successor inherits the hold that was
                 # actually left, and refreshes it the ordinary way (`set … agent me`) because the row names its
@@ -617,6 +746,7 @@ def main(a):
 def selfcheck():
     """STATIC: the two rules this file owns, checked against fixtures — no board, no state dir, no clock beyond
     its own. Run by tests/check.sh, so a regression fails the commit rather than the next `cc board show`."""
+    global BOARDS, LOCK_WAIT   # two cases below shorten the wait and point the boards at the fixture, and put both back
     n = 0
     def ok(what, cond):
         nonlocal n
@@ -674,6 +804,15 @@ def selfcheck():
         run("add", "r", "t1", "T", "a one-line note")
         ok("…and adding the same thing twice stacks nothing up",
            open(f"{th}/.cc/state/r/t1/task.md").read() == body)
+        # …but "the same thing" is a WHOLE LINE, not a prefix: `add` used a substring and --go a `head -c`, and both
+        # took "note 1" for "note 10" — a dispatch note silently dropped (the stress case below found it).
+        run("add", "r", "t4", "T4", "a one-line note")   # its own row: the longer line first, then the prefix, both ways
+        run("add", "r", "t4", "T4", "a one-line"); run("brief", "append", "--top", "r", "t4", "a one-line")
+        body = open(f"{th}/.cc/state/r/t4/task.md").read()
+        ok("a note that is only the start of a line already there is a different note, at the bottom and on top",
+           body.count("a one-line\n") == 2 and body.startswith("a one-line\n\n") and body.count("a one-line note\n") == 1)
+        run("brief", "append", "--top", "r", "t4", "a one-line")
+        ok("…and the note on top, repeated, stacks nothing up", open(f"{th}/.cc/state/r/t4/task.md").read() == body)
         run("set", "r", "t1", "instructions", "REPLACED")
         ok("`set instructions` is the explicit way to replace it",
            open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "REPLACED")
@@ -712,6 +851,75 @@ def selfcheck():
            "M1 LANDED" in fresh and "M1 LANDED" not in stale)
         ok("a13: `--all` still prints it, and the default view says it hid something",
            "M1 LANDED" in run("show", "r", "--all").stdout and "finished" in stale)
+        # ── THE ONE LOCKED WRITER, driven by concurrent PROCESSES — the contention it exists for. Before it, `add`,
+        # `cc --go` and `cc-brief refresh` were three unlocked read-replaces with three temp names, and two landing
+        # together kept whichever wrote last (arch review 2026-09-08, rec 10). Its own row; every arm below is one of
+        # those writers' verbs, as the CLI runs it; afterwards every note is there once and whole, and there is ONE
+        # block, well-formed, at the end. Twelve of each: with the flock taken out, twelve lost a note in every run
+        # measured, six in only some (2026-09-11) — the race is real but narrow, and the case has to see it.
+        run("add", "r", "st", "STRESS", "GOAL: the brief that must survive.")
+        ST = f"{th}/.cc/state/r/st/task.md"; SENV = {**os.environ, "HOME": th, "CC_BRIEF_FAKE": '{"verdict":"approve","why":"","cut":[]}'}
+        def blk(i): return f"{MARK_A}\nIN FLIGHT (from the board, 2026-09-11T00:{i:02d}Z): f{i}.txt — o [running]\n{MARK_B}\n"
+        def spawn(*args, stdin=None):
+            pr = subprocess.Popen([sys.executable, os.path.realpath(__file__), *args], env=SENV, text=True,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            pr.stdin.write(stdin or ""); pr.stdin.close(); return pr
+        def finish(procs):
+            out = []
+            for pr in procs:
+                try: out.append((pr.wait(timeout=120), pr.stderr.read()))
+                except subprocess.TimeoutExpired: pr.kill(); out.append((124, "hung"))
+            return out
+        N = 12
+        procs = []
+        for i in range(N):   # interleaved: an add's append, a --go's re-dispatch and a refresh's annotate, six times over
+            procs += [spawn("brief", "append", "r", "st", f"bottom note {i}"),
+                      spawn("brief", "append", "--top", "r", "st", f"dispatch note {i}"),
+                      spawn("brief", "annotate", "r", "st", "-", stdin=blk(i))]
+        rcs = finish(procs); got = open(ST).read(); typed = human(got); b = INFLIGHT_RE.search(got)
+        ok("stress: 12 appends, 12 re-dispatches and 12 annotates at once all serialise — none refused, none hung",
+           all(rc == 0 for rc, _ in rcs) or print("   ", [e for rc, e in rcs if rc]))
+        ok("stress: no note is lost, torn or doubled, and the brief they joined is whole",
+           "GOAL: the brief that must survive.\n" in typed
+           and all(typed.count(f"bottom note {i}\n") == 1 and typed.count(f"dispatch note {i}\n") == 1 for i in range(N)))
+        ok("stress: exactly one block afterwards, well-formed, one annotate's own, and last in the file",
+           got.count(MARK_A) == 1 and got.count(MARK_B) == 1 and b is not None
+           and b.group(0) in [blk(i) for i in range(N)] and got.endswith(b.group(0)))
+        # …and a REPLACE in the mix: the new brief is there once, a note that landed after it is whole, and one before
+        # it is gone — that is what replace is for — and the block is still one block.
+        procs = [spawn("brief", "append", "r", "st", f"late note {i}") for i in range(3)]
+        procs.insert(1, spawn("brief", "replace", "r", "st", "REPLACED: the brief, deliberately."))
+        procs.insert(3, spawn("brief", "annotate", "r", "st", "-", stdin=blk(9)))
+        rcs = finish(procs); got = open(ST).read(); typed = human(got)
+        ok("stress: a replace among appends and an annotate — none refused, the new brief once, every surviving note whole, one block",
+           all(rc == 0 for rc, _ in rcs) and typed.count("REPLACED: the brief, deliberately.\n") == 1
+           and all(typed.count(f"late note {i}\n") in (0, 1) for i in range(3)) and "bottom note" not in typed
+           and got.count(MARK_A) == 1 and got.count(MARK_B) == 1)
+        # A LOCK SOMEBODY ELSE HOLDS is waited for, briefly, then refused in one line — never a hang, never a write
+        # through it — and the same edit lands once it is free. In-process, ungated: the judge is not what is under test.
+        real_wait, LOCK_WAIT, sroot = LOCK_WAIT, 0.5, f"{th}/.cc/state"
+        try:
+            holder = open(f"{th}/.cc/state/r/st/task.md.lock", "w"); fcntl.flock(holder, fcntl.LOCK_EX)
+            before = open(ST).read(); t0 = time.monotonic()
+            got = bounded(lambda: brief_edit("append", "r", "st", "a note under a held lock", state=sroot, gated=False), 5)
+            waited = time.monotonic() - t0; holder.close()
+            ok("a brief lock somebody else holds is waited for, briefly, then refused in one line — not a hang — and nothing is written",
+               isinstance(got, Refused) and "held by another process" in str(got) and 0.4 < waited < 5 and open(ST).read() == before)
+            got = bounded(lambda: brief_edit("append", "r", "st", "a note under a held lock", state=sroot, gated=False), 5)
+            ok("…and the same edit lands once the lock is free", not isinstance(got, Exception) and "a note under a held lock\n" in open(ST).read())
+        finally: LOCK_WAIT = real_wait
+        # THE WALLS (security review of #225), now the writer's: the state dir is member-writable, so a link at the
+        # track dir or at task.md is refused — never made through, read through or written through.
+        os.symlink(f"{th}/elsewhere", f"{sroot}/r/lnk"); os.makedirs(f"{sroot}/r/lnk2")
+        os.symlink("/etc/hostname", f"{sroot}/r/lnk2/task.md")
+        r1 = bounded(lambda: brief_edit("append", "r", "lnk", "x", state=sroot, gated=False), 5)
+        r2 = bounded(lambda: brief_edit("append", "r", "lnk2", "x", state=sroot, gated=False), 5)
+        ok("a link at the track dir is refused, and nothing is made through it",
+           isinstance(r1, Refused) and not os.path.exists(f"{th}/elsewhere"))
+        ok("a link at task.md is refused, not read or written through, and leaves no temp file behind",
+           isinstance(r2, Refused) and os.path.islink(f"{sroot}/r/lnk2/task.md") and not glob.glob(f"{sroot}/r/lnk2/*.tmp"))
+        ok("a brief that is not there is not made for an annotate", brief_edit("annotate", "r", "none", blk(1), state=sroot) == ("", "")
+           and not os.path.exists(f"{sroot}/r/none"))
         # a shell-mangled emoji reaches argv as a lone surrogate; stored once, it turned every `show` into a traceback
         bad = "T \udc94 mangled"
         r = run("add", "r", "s1", bad); run("set", "r", "s1", "title", bad)
@@ -867,9 +1075,9 @@ def selfcheck():
         ok("`agent ''` hands the row back, time and all",
            run("get", "r", "t1", "agent").stdout.strip() == ""
            and run("get", "r", "t1", "agent_at").stdout.strip() == "")
-        # A MARK FROM A WINDOW NO READER COUNTS IS REFUSED (2026-09-07). Both readers keep a mark only where its
-        # window is in tmux session `main` and named for the ROW'S OWN REPO — cc-pulse's agent_held lists `-t
-        # main` and matches `#{window_name}` against the repo, cc-reconcile's mark_why matches the same name. A
+        # A MARK FROM A WINDOW NO READER COUNTS IS REFUSED (2026-09-07). The reader keeps a mark only where its
+        # window is in tmux session `main` and named for the ROW'S OWN REPO — cc-reconcile's mark_why matches
+        # `#{window_name}` against the repo, and cc-pulse and the Home tab read its snapshot. A
         # claim from any other window therefore records an owner nobody recognises: the row reads unowned, the
         # watchdog calls it abandoned and it is offered for dispatch while the subagent is still writing it, so
         # the claim RELEASES the row instead of holding it. Its own row, marked by a window it does not use.
@@ -1028,6 +1236,36 @@ def selfcheck():
            bs == [mine, "myrepo_cctesting", "r"] and "_ccsbx99999999" in ba)
         for b in ("_ccsbx99999999", "myrepo_cctesting", mine):
             os.remove(f"{th}/.cc/boards/{b}.json")
+        # …AND THE RULE IS ASKED, NOT COPIED (arch review 2026-09-08, rec 11). cc-reconcile, the Home tab, cc-land's
+        # catch-up and cc-janitor import this file and call these — so the whole answer, in one batch, on the names
+        # a listing hands them, with this process standing in for the suite (its pid is the one in lineage):
+        # a suite's live fixture is a board to its descendants only, an orphan is a board to nobody, and a repo that
+        # merely contains the word is real everywhere.
+        ex = ["_cctest99999999", "_ccsbx99999999.json", "myrepo_cctesting", f"_cctest{os.getpid()}", "_cclive.lock",
+              f"_ccsbx{os.getpid()}.json", "r.json", "myrepo_cctest12"]
+        ok("`reals` is the batched answer: from one listing, in its order, the real repos and this run's own fixtures — "
+           "another suite's, an orphan's and a prefixed name with no pid are gone; the repo that contains the word stays",
+           reals(ex) == ["myrepo_cctesting", f"_cctest{os.getpid()}", f"_ccsbx{os.getpid()}.json", "r.json", "myrepo_cctest12"])
+        ok("`suite_pid` reads the pid off the name as a reader holds it — a board file, a window `<name>/t`, a handoff "
+           "successor `<name>~next` — and nothing off a real repo, a prefixed name with no pid, or a pid glued to letters",
+           [suite_pid(x) for x in ("_cctest123", "_cctest123.json", "_ccsbx123/t", "_cctest123/hx~next", "_cclive.lock",
+                                   "myrepo_cctesting", "myrepo_cctest123", "_cctest123abc")] == [123, 123, 123, 123, None, None, None, None]
+           and SUITE.search("cc-handoff: _cctest99999999/hx — gone").group(1) == "99999999"
+           and SUITE.search("cc-handoff: myrepo_cctest12/hx — real") is None)
+        # …and a tripwire on the siblings: none carries a copy of the rule again — no `startswith("_cc…")` and no
+        # `_cc[a-z]+` regex of its own outside this file. Two copies read `_cctest` alone for ten days (2026-09-01 →
+        # 2026-09-11) and a leaked `_ccsbx<pid>` was a repo to the Home tab and the landing queue while scaffolding
+        # to reconcile. Comments are stripped; a docstring that names the shape is not a rule.
+        here = os.path.dirname(os.path.realpath(__file__))
+        COPY = re.compile(r"""startswith\(\s*["']_cc|_cc\[a-z\]""")
+        def copies_in(path):
+            lines = open(path, errors="replace").read().split("\n")
+            if not (lines[0].startswith("#!") and "python" in lines[0]): return []
+            return [i for i, line in enumerate(lines, 1) if COPY.search(line.split("#")[0])]
+        copies = [f"{n}:{i}" for n in sorted(os.listdir(here)) if n.startswith("cc") and n != "cc-board" and os.path.isfile(f"{here}/{n}")
+                  for i in copies_in(f"{here}/{n}")]
+        ok("no sibling tool carries its own copy of the fixture rule — each asks `reals` / `suite_pid` (tripwire)", not copies)
+        if copies: print("       " + ", ".join(copies))
         # ── A NEW ROW IS TOLD WHICH LIVE ROW IS ALREADY IN THESE FILES, at the door it comes in by. Every extra
         # row costs its own gates, review read and merge, so two asks in one file that could have been one brief
         # buy a second landing for nothing — and whether they are one concern was a match made from memory, missed
@@ -1198,7 +1436,6 @@ def selfcheck():
         # inside a member boundary — rename over a mount point is EBUSY — and for nothing else: a full or read-only disk used
         # to truncate the live board to zero bytes on the way to failing. os.replace is stood in for; the board dir is this
         # run's own; _save is called in-process, the way every writer calls it.
-        global BOARDS, LOCK_WAIT
         real_boards, real_replace, real_wait = BOARDS, os.replace, LOCK_WAIT
         BOARDS = f"{th}/.cc/boards"
         try:

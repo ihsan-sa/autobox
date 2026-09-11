@@ -1116,8 +1116,32 @@ def run():
                                Dir(), "box.example")
             k(not dec.refuse and [p.name for p in dec.places] == ["mem"],
               "…and to one of the OWNER'S channels, likewise")
-            dec = router.route(arrived(b, STRANGER), Dir(), "box.example")
-            k("whose workspace" in dec.refuse, "a sender who maps to no workspace is refused in one line")
+            # -- AN ADDRESS THE DOOR TRUSTS AND NO ROW PLACES IS NOT BOUNCED (2026-09-11: this address was on
+            # MAIL_ALLOW, which is how its mail got past receiver.py at all, and was answered "I could not tell
+            # whose workspace this address belongs to" — the opposite of what the owner's own list had decided).
+            # It is an unplaced mail: the owner's main session, and the line saying which row places it.
+            du = Dir()
+            dec = router.route(arrived(b, STRANGER), du, "box.example")
+            k(not dec.refuse and dec.workspace == "owner" and [p.target for p in dec.to] == ["box"]
+              and not dec.cc and dec.rule == "unmapped",
+              "a sender the door let in and no row places is delivered to the OWNER'S main session, unplaced")
+            k("trusted at the door and mapped to no workspace" in dec.question
+              and "MAIL_WORKSPACE" in dec.question and "~/.cc/config" in dec.question
+              and "%s=owner" % STRANGER in dec.question and "=<member handle>" in dec.question
+              and dec.offer == dec.question,
+              "…and the line it carries says the address is trusted, placed by nobody, and how to place it — to "
+              "the session that reads the mail and to the owner in the mirror thread both")
+            k(du.asked == [STRANGER] and not any(p.name in ("mem", "mem--site", "other") for p in dec.places),
+              "…and nothing else was looked up: no member's place is resolved for an address no row places")
+            # …and with no owner session to hand it to (MAIL_HOME naming a channel the bot is not in, or the DM
+            # not opening) the line says THAT — the brief's "ask the box's owner to add it" is gone for good.
+            dn = Dir()
+            dn.MAIN = {"mem": "mem", "other": "other"}
+            dec = router.route(arrived(b, STRANGER), dn, "box.example")
+            k(dec.refuse == "The box's owner has no channel on this box yet, so I did not deliver this."
+              and not dec.to and "owner to add" not in dec.refuse and "whose workspace" not in dec.refuse,
+              "…and when the owner's session has no channel the sender is told that, never to ask him to add "
+              "an address he already added")
             k(router.route(arrived(b, ALLOWED), Dir(), "box.example").refuse == ""
               and router.route(arrived(b, ALLOWED), Dir(), "").refuse != "",
               "with no MAIL_DOMAIN configured no address on it is ours, so nothing routes by name")
@@ -1141,8 +1165,21 @@ def run():
             dec = router.route(arrived(b, ALLOWED), d, "box.example", "friend@allowed.example=owner")
             k(dec.workspace == "owner" and d.asked == [],
               "a MAIL_WORKSPACE row the owner wrote decides, and Slack is not asked at all")
+            # A row with NOTHING after the `=` is the owner's own "not this address" and still refuses — a word
+            # a person set is not rewritten into a delivery (review of #433). A row naming a handle no member
+            # has, or no row, is the unplaced case above: his to fix, not the sender's to be refused for.
             dec = router.route(arrived(b, OWNER), Dir(), "box.example", "owner@box.example=")
-            k(dec.refuse and not dec.to, "…and a row with an empty value refuses that address outright")
+            k(dec.refuse == "This address is placed nowhere on this box, so I did not deliver it." and not dec.to,
+              "…and a row with an empty value refuses that address outright, in a line that says so")
+            dec = router.route(arrived(b, OWNER), Dir(), "box.example", "owner@box.example=nosuch")
+            k(not dec.refuse and dec.rule == "unmapped" and [p.target for p in dec.to] == ["box"],
+              "…while a row naming a handle no member has places the address nowhere: unplaced, to the owner")
+            k(router.refused_by_row(OWNER, router.overrides("owner@box.example="))
+              and router.refused_by_row(" %s " % OWNER.upper(), router.overrides("owner@box.example="))
+              and not router.refused_by_row(OWNER, router.overrides("owner@box.example=nosuch"))
+              and not router.refused_by_row(OWNER, router.overrides(""))
+              and not router.refused_by_row("", router.overrides("=")),
+              "refused_by_row is the empty row and only the empty row, read the receiver's way")
 
             # -- a reply follows its own thread, and the classifier never runs on it.
             first = arrived(b, ALLOWED, headers={"Message-ID": "<one@allowed.example>"})
@@ -1323,6 +1360,17 @@ def run():
           "the daemon's line is what the worker relays to the sender")
         k(asked == [{"mail": ans["id"]}],
           "…and all that crossed the socket was the mail's id: this process holds no token and no decision")
+        try:
+            with open(outbound.LOGFILE) as f:
+                acks = [ln for ln in f.read().splitlines() if ": ack to=" in ln]
+        except OSError:
+            acks = []
+        k(len(acks) == 2 and acks[-1].endswith("%s: ack to=%s by=worker: Received. It is in #mem--site."
+                                                % (ans["id"], ALLOWED))
+          and "ack to=%s by=worker: Received. It is in the queue as " % ALLOWED in acks[0],
+          "…and the reply the worker sends back is in out.log as an `ack` line, for this mail and for the one "
+          "no daemon answered — the ack a held sender gets is on record beside every mail that goes out: %r"
+          % (acks,))
         b.clear()
         b.post(eml())
         lines = b.lines()
@@ -1782,6 +1830,17 @@ def run():
             p = asked_with[0][0] if asked_with else ""
             k("the box's owner" in p and "in the owner workspace" in p and v.clean,
               "…and a mail from the owner says so, which is what makes his own channel fit anything he asks")
+            # …but a sender the door trusts and NO row places is not the owner, though its Decision says
+            # workspace="owner" — the mail is in his session for him to place it. Told "the box's owner", the
+            # read would fit anything such a sender wrote to his channel (review of #433, 2026-09-11).
+            unmapped_cfg = dict(known, MAIL_ALLOW=known["MAIL_ALLOW"] + "," + STRANGER)
+            _, v = vetted("fits", STRANGER, cfg=unmapped_cfg)
+            p = asked_with[0][0] if asked_with else ""
+            k(len(asked_with) == 1 and asked_with[0][1] == vetting.KNOWN_REASONS
+              and "the box's owner" not in p and "no workspace claims" in p and "in the owner workspace" in p
+              and "#dm" in p and v.clean and v.known,
+              "…while a listed sender no row places gets the known read, in the owner's session, and is NOT "
+              "called the box's owner in it: an address on the list that no workspace claims")
 
             # (d) THE HOLD THAT STAYS: the destination, and the rules. Each is held, and the note says which half
             # held it — "on the box's list, BUT" — so trust is never read as a blank cheque and a destination
@@ -1902,6 +1961,31 @@ def run():
             k(outbound.send(conf(w), "C-box", "9999.9", text="hello") == "" and not w.calls,
               "…and a thread that is not a mirror root at all is left alone, which is every other thread here")
 
+        # (c2) A HELD MAIL CAN BE ANSWERED BY MAIL (owner, 2026-09-09: 'at least an ack ... or telling me to
+        # check slack'). The record take_mail writes for a mail the vetting step HOLDS is the delivered mail's
+        # record with `holds` on it — the same `to` root, the line's ts on `mirrors` — so a post in the hold
+        # thread answering that line reaches the sender exactly as it would for a delivered mail, out.log
+        # shows it, and the hold itself is untouched: answering the sender is not deciding the mail.
+        fresh()
+        rec = conv()
+        rec["mirrors"] = [{"chat": "C-mem", "ts": "1700.1", "mail": rec["mails"][0]}]
+        rec["holds"] = [{"mail": rec["mails"][0], "reason": "off-goals", "question": "", "ats": {"C-mem": "1700.1"},
+                         "at": "2026-09-09T04:20:00Z"}]
+        router.save_conv(rec)
+        with FakeWorker() as w:
+            note = outbound.send(conf(w), "C-mem", "1700.1", ts="1700.1",
+                                 text="Parked for now — a person is looking at it; check Slack.")
+            call = w.one()
+        after = router.load_conv(rec["id"])
+        k(note == "" and call["from"] == "mem@box.example" and "friend@allowed.example" in call["to"]
+          and call["msg"]["In-Reply-To"] == MID and after["holds"] == rec["holds"]
+          and any(": sent from=mem@box.example to=" in ln for ln in logged()),
+          "a post in a HELD mail's thread answering its line goes to the sender by mail, threaded under theirs, "
+          "with the hold still in place and a `sent` line in out.log — the ack a held sender was owed")
+        with FakeWorker() as w:
+            k(outbound.send(conf(w), "C-mem", "1700.1", text="deliver it") == "" and not w.calls,
+              "…and a decision typed in that thread (`deliver it`, answering no line) is not mailed to them")
+
         # (d) A FILE THE WORKSPACE OWNS GOES AS AN ATTACHMENT.
         fresh()
         rec = conv()
@@ -1918,17 +2002,17 @@ def run():
         k(names == ["lesson.pdf"] and call["msg"].get_body(("plain",)).get_content().strip() == "here it is",
           "a file the box posts in the thread goes out as an attachment, with the comment as the text")
 
-        # …and one that is too big does not. It travels as a line, and MAIL_OUT_LINKS decides whether that
-        # line can carry a URL.
+        # …and one that is too big does not. With a URL (MAIL_OUT_LINKS) the mail goes carrying a link line,
+        # and the thread is told it went as a link and not a file.
         fresh()
         conv()
         big = os.path.join(dev, "mem", "big.pdf")
         with open(big, "wb") as f:
             f.write(b"x" * 4096)
         with FakeWorker() as w:
-            outbound.send(conf(w, MAIL_OUT_ROOTS=dev, MAIL_OUT_MAX_ATTACH_BYTES=1024,
-                               MAIL_OUT_LINKS="%s=https://pub.example/m" % os.path.join(dev, "mem")),
-                          "C-mem", "1700.1", ts="1700.1", text="the lesson", path=big)
+            note = outbound.send(conf(w, MAIL_OUT_ROOTS=dev, MAIL_OUT_MAX_ATTACH_BYTES=1024,
+                                      MAIL_OUT_LINKS="%s=https://pub.example/m" % os.path.join(dev, "mem")),
+                                 "C-mem", "1700.1", ts="1700.1", text="the lesson", path=big)
             call = w.one()
         body = call["msg"].get_body(("plain",)).get_content()
         k(not list(call["msg"].iter_attachments())
@@ -1937,8 +2021,26 @@ def run():
           "a file over the cap goes as a link line instead, with the URL MAIL_OUT_LINKS maps it to")
         k(b.tmp not in body,
           "…and never a path on this box, which is no use to the reader and says more than it should")
+        k(note.startswith("📎 big.pdf") and "4 KB" in note and "1 KB attachment cap" in note and "as a link" in note,
+          "…and the thread is told in one line that it went as a link, with the file's size against the cap")
 
-        # …and a file NOTHING in the workspace owns is not attached at all, whatever a session says it is.
+        # …and with NO URL for it nothing is mailed: the thread gets the line, the log the refusal, and the
+        # session is told where to put the file. "A file either arrives as a file, or the caller and the
+        # thread are told it did not" (the brief, 2026-09-11).
+        fresh()
+        conv()
+        with FakeWorker() as w:
+            note = outbound.send(conf(w, MAIL_OUT_ROOTS=dev, MAIL_OUT_MAX_ATTACH_BYTES=1024),
+                                 "C-mem", "1700.1", ts="1700.1", text="the lesson", path=big)
+        k(not w.calls and note.startswith("📎 big.pdf (4 KB) is over the 1 KB attachment cap")
+          and "Nothing was mailed" in note,
+          "a file over the cap with no URL to stand in for it is NOT mailed, and the thread's line says so "
+          "and says why: the session posted a file, and a mail without it is not what it posted")
+        k(any("not sent" in ln and "big.pdf" in ln and "too large" in ln for ln in logged()),
+          "…and the log has the refusal, not a `sent` line")
+
+        # …and a file NOTHING in the workspace owns is not attached at all, whatever a session says it is —
+        # and its line names the OTHER reason, so out-of-tree and too-large are never one word.
         fresh()
         conv()
         outside = os.path.join(b.tmp, "secret.txt")
@@ -1947,12 +2049,69 @@ def run():
         link = os.path.join(dev, "mem", "linked.txt")
         os.symlink(outside, link)
         with FakeWorker() as w:
-            outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", ts="1700.1", text="", path=link)
-            call = w.one()
-        sym_body = call["msg"].get_body(("plain",)).get_content()
-        k(not list(call["msg"].iter_attachments()) and "not attached" in sym_body
-          and "not the workspace's" not in sym_body,
-          "a symlink out of the workspace's own tree is out of the tree: the file does not leave, the line does")
+            note = outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", ts="1700.1", text="", path=link)
+        k(not w.calls and note.startswith("📎 linked.txt is not in a tree a mail may attach from")
+          and "put it under" in note and os.path.join(dev, "mem") in note and "Nothing was mailed" in note
+          and "cap" not in note and "not the workspace's" not in note,
+          "a symlink out of the workspace's own tree is out of the tree: the file does not leave, nothing is "
+          "mailed, and the thread's line says out-of-tree (not too-large) and names the trees that would do")
+        # …and a file mapped to a URL goes as a link line that says which reason; a size reads in KB for a
+        # small file, never `0.0 MB`.
+        fresh()
+        conv()
+        k(outbound.link_line(big, conf(w, MAIL_OUT_LINKS="%s=https://pub.example/m" % dev), outbound.NOT_OURS)
+          == "[big.pdf — not in a tree a mail may attach from, https://pub.example/m/mem/big.pdf]"
+          and outbound.human_size(4096) == "4 KB" and outbound.human_size(30 * 1024) == "30 KB"
+          and outbound.human_size(3 * 1024 * 1024 + 200000) == "3.2 MB" and outbound.human_size(0) == "0 bytes",
+          "the link line carries the reason as its own words, and a size reads in KB below a megabyte")
+
+        # THE WORKSPACE'S SLACK FILES DIR IS ONE OF ITS TREES — the place a person's upload lands and the
+        # `file` tool reads from (2026-09-09: the owner's spreadsheet went as a line from exactly there).
+        # Its own files dir per workspace: the owner's ~/.cc/slack/files, a member's member dir — and one
+        # member's is not another's.
+        slack_d = os.path.join(b.tmp, "slack17")
+        mem_files = os.path.join(slack_d, "member", "mem", "files")
+        other_files = os.path.join(slack_d, "member", "other", "files")
+        owner_files = os.path.join(slack_d, "files")
+        for d17 in (mem_files, other_files, owner_files):
+            os.makedirs(d17)
+        staged = os.path.join(mem_files, "export.xlsx")
+        with open(staged, "wb") as f:
+            f.write(b"PK stock export")
+        with open(os.path.join(other_files, "theirs.xlsx"), "wb") as f:
+            f.write(b"PK another member's")
+        with open(os.path.join(owner_files, "owners.pdf"), "wb") as f:
+            f.write(b"%PDF the owner's")
+        saved_sd = outbound.SLACKDIR
+        outbound.SLACKDIR = slack_d
+        try:
+            fresh()
+            conv()
+            with FakeWorker() as w:
+                note = outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", ts="1700.1",
+                                     text="the export", path=staged)
+                call = w.one()
+            k(note == "" and [q.get_filename() for q in call["msg"].iter_attachments()] == ["export.xlsx"],
+              "a file staged in the workspace's own Slack files dir attaches, and the thread hears nothing")
+            fresh()
+            conv()
+            with FakeWorker() as w:
+                note = outbound.send(conf(w, MAIL_OUT_ROOTS=dev), "C-mem", "1700.1", ts="1700.1",
+                                     text="theirs", path=os.path.join(other_files, "theirs.xlsx"))
+            k(not w.calls and note.startswith("📎 theirs.xlsx is not in a tree"),
+              "…and one staged in ANOTHER workspace's files dir does not: a member's file never leaves in "
+              "somebody else's mail")
+            k(outbound.attach_bytes(os.path.join(owner_files, "owners.pdf"), {"workspace": "owner"}, {"MAIL_OUT_ROOTS": dev}, 1 << 20)
+              == (b"%PDF the owner's", "")
+              and outbound.attach_bytes(os.path.join(owner_files, "owners.pdf"), {"workspace": "mem"}, {"MAIL_OUT_ROOTS": dev}, 1 << 20)
+              == (None, outbound.NOT_OURS)
+              and outbound.attach_bytes(staged, {}, {"MAIL_OUT_ROOTS": dev}, 1 << 20) == (None, outbound.NOT_OURS),
+              "…the owner's files dir is the owner's conversations' (and a cold mail's), and a member's is not it")
+            k(outbound.trees({"workspace": "mem"}, {"MAIL_OUT_ROOTS": dev})
+              == "%s or %s" % (os.path.join(dev, "mem"), mem_files),
+              "…and the line that says where to put a file names that dir beside the roots")
+        finally:
+            outbound.SLACKDIR = saved_sd
 
         # THE FILE IS OPENED ONCE AND EVERY ANSWER COMES OFF THAT FD. Checking a path and then opening it
         # again is two lookups of a name the member owns: between them the file becomes a symlink to the box's
@@ -2037,7 +2196,9 @@ def run():
             k(outbound.send(off, "C-mem", "1700.1", ts="1700.1", text="a") == ""
               and outbound.send(off, "C-mem", "1700.1", ts="1700.1", text="b") == "" and not w.calls,
               "with no worker URL the tap is a no-op and the thread is not told about mail at all")
-        k(len(logged()) == 1 and "sending is off" in logged()[0],
+        # (the door's own `ack` line for conv()'s mail is in the same file: count only the sending-off line)
+        k(len([ln for ln in logged() if "sending is off" in ln]) == 1
+          and not any(": sent " in ln for ln in logged()),
           "…and it says so ONCE per process, not once per reply")
 
         # (g) CLOUDFLARE'S OWN REFUSAL IS SHOWN, NEVER SWALLOWED.
@@ -2287,11 +2448,12 @@ def run():
             k(not any(p.name in ("dashboard", "box", "dm", "other") for p in dec_o.places),
               "…and the mail reaches no channel of the owner's or of another member's")
 
-            # (d) an unknown sender to a name no channel has: refused before any place is looked at
+            # (d) a sender no row places, to a name no channel has: the name is not looked at at all — the mail is
+            # the owner's unplaced one (section 14 has the whole of that), and no channel of a member's is reached
             d = Dir()
             dec = router.route(to("nosuch", STRANGER), d, "box.example")
-            k(dec.refuse and not dec.to and not dec.cc and not dec.places,
-              "a mail to a name no channel has from an unknown sender reaches no channel")
+            k(not dec.refuse and dec.rule == "unmapped" and [p.target for p in dec.to] == ["box"] and not dec.cc,
+              "a mail to a name no channel has from a sender no row places reaches the owner's main session only")
             k(d.asked == [STRANGER],
               "…and the only thing looked up was who the sender is — no channel was resolved for a stranger")
 
@@ -2600,6 +2762,380 @@ def run():
           and any("from=abox--fix-the-door@box.example" in ln for ln in log22())
           and any("from=home@box.example" in ln for ln in log22()),
           "…and out.log has one `sent from=` line per mail, each naming the address it went from")
+
+    # ------------------------------- 23. a mail the box starts has a thread (owner, 2026-09-10)
+    # Brief: "when a session starts a mail (cc-mail send, the cold path), the sending channel gets one mirror
+    # line for it and a conversation record, so the person's answer is routed under that line instead of
+    # opening a new top-level thread". The line and the record are the daemon's (`mailed`; cc-slack's own
+    # selfcheck posts it), so what is settled here is the hand-over — what `cc-mail send` puts on the socket,
+    # and what it prints when the daemon answers, refuses, or is not there — and the record's shape: written
+    # as the daemon writes it, then a real reply through the real door lands on it by the reply rule.
+    with Box(allow=ALLOWED + "," + OWNER + "," + OTHER) as b:
+        wt = os.path.join(b.tmp, "wt23", "abox", "fix-the-door")
+        os.makedirs(os.path.join(wt, ".cc"))
+        with open(os.path.join(wt, ".cc", "track"), "w") as f:
+            f.write("abox\nfix-the-door\n0000-uuid\n")
+
+        class FakeDaemon:
+            """cc-slack's owner socket, answering ONE verb with a canned line and keeping what it was asked."""
+            def __init__(self, answer):
+                self.answer, self.asked = answer, []
+
+            def __enter__(self):
+                self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.srv.bind(r.SLACKSOCK)
+                self.srv.listen(4)
+
+                def serve():
+                    while True:
+                        try:
+                            c, _ = self.srv.accept()
+                        except OSError:
+                            return
+                        with c:
+                            buf = b""
+                            while not buf.endswith(b"\n"):
+                                d = c.recv(65536)
+                                if not d:
+                                    break
+                                buf += d
+                            self.asked.append(json.loads(buf or b"{}"))
+                            c.sendall((json.dumps(self.answer) + "\n").encode())
+                threading.Thread(target=serve, daemon=True).start()
+                return self
+
+            def __exit__(self, *_):
+                self.srv.close()
+                try:
+                    os.unlink(r.SLACKSOCK)
+                except OSError:
+                    pass
+
+        env23 = {k: "" for k in r.SEND_KEYS if k not in Box.KEYS}
+        # ALLOWED is the member `mem`'s address and OTHER the member `other`'s (Dir): both verified, so the
+        # two-workspace case below is about the THREAD and not about who the box may write to at all.
+        env23.update({"MAIL_SEND_ALLOW": ALLOWED + "," + OTHER, "MAIL_SEND_SECRET": "s3cret"})
+        saved23 = {k: os.environ.get(k) for k in env23}
+        here23, out23 = os.getcwd(), sys.stdout
+
+        def send23(cwd, doc):
+            """`cc-mail send --json` run from `cwd`, as the command runs it: (rc, stdout, stderr-so-far)."""
+            ask = os.path.join(b.tmp, "ask23.json")
+            with open(ask, "w") as f:
+                json.dump(doc, f)
+            os.chdir(cwd)
+            sys.stdout = io.StringIO()
+            try:
+                rc = r.cmd_send({"--json": ask})
+                return rc, sys.stdout.getvalue()
+            finally:
+                sys.stdout = out23
+                os.chdir(here23)
+
+        try:
+            os.environ.update(env23)
+            with FakeWorker() as w:
+                os.environ["MAIL_SEND_URL"] = w.url
+                # (a) FROM A CHANNEL: the daemon is asked once, with the mail as sent, and the line says where.
+                with FakeDaemon({"ok": True, "id": "out-1", "chat": "C-fix", "ts": "1800.1", "name": "abox--fix-the-door"}) as d:
+                    rc, said = send23(wt, {"to": ALLOWED, "subject": "the door", "body": "it is fixed"})
+                    call = w.calls[-1]
+                k(rc == 0 and len(d.asked) == 1 and list(d.asked[0]) == ["mailed"],
+                  "`cc-mail send` from a track's worktree asks the daemon for the mail's thread, once, by the "
+                  "`mailed` verb and no other")
+                m23 = d.asked[0]["mailed"]
+                k(m23 == {"channel": "abox--fix-the-door", "from": "abox--fix-the-door@box.example", "to": [ALLOWED],
+                          "subject": "the door", "message_id": call["msg"]["Message-ID"], "attachments": [],
+                          "tag": m23.get("tag")}
+                  and call["msg"]["Reply-To"] == "abox--fix-the-door+%s@box.example" % m23.get("tag"),
+                  "…handing over the channel, the From, who it went to, the subject, the Message-ID we put on the "
+                  "wire and the TAG the mail's Reply-To carries — the key the person's answer will bring back")
+                k(said.strip().endswith("Its thread is in #abox--fix-the-door"),
+                  "…and the line printed says where the thread is")
+                # (b) NO CHANNEL: home@ mail asks for nothing and prints as before.
+                with FakeDaemon({"ok": True}) as d:
+                    rc, said = send23(b.tmp, {"to": ALLOWED, "subject": "s", "body": "b"})
+                k(rc == 0 and d.asked == [] and "from home@box.example" in said and "thread" not in said,
+                  "a mail from a session with no channel asks the daemon nothing: no line, no record, and its "
+                  "answer opens a new thread as it always did")
+                # (c) THE DAEMON REFUSES, OR IS NOT THERE: the mail went either way, and the line says so.
+                with FakeDaemon({"ok": False, "error": "#abox--fix-the-door is not a channel the bot is in"}) as d:
+                    rc, said = send23(wt, {"to": ALLOWED, "subject": "s", "body": "b"})
+                k(rc == 0 and len(d.asked) == 1 and "mailed " + ALLOWED in said
+                  and "No line in #abox--fix-the-door" in said and "not a channel the bot is in" in said
+                  and "opens a new thread" in said,
+                  "a daemon that refuses costs the thread and not the mail: exit 0, `mailed`, and why there is no line")
+                n_calls = len(w.calls)
+                rc, said = send23(wt, {"to": ALLOWED, "subject": "s", "body": "b"})   # no socket at all
+                k(rc == 0 and len(w.calls) == n_calls + 1 and "No line in #abox--fix-the-door" in said
+                  and "did not answer" in said,
+                  "…and no daemon at all is the same: the mail is away and the line says the thread is not")
+                # (d) A FILE WITH IT is counted in the hand-over, so the channel's line can say `1 attachment`.
+                dev23 = os.path.join(b.tmp, "dev23")
+                os.makedirs(dev23)
+                pdf = os.path.join(dev23, "plan.pdf")
+                with open(pdf, "wb") as f:
+                    f.write(b"%PDF plan")
+                os.environ["MAIL_OUT_ROOTS"] = dev23
+                with FakeDaemon({"ok": True, "name": "abox--fix-the-door"}) as d:
+                    rc, said = send23(wt, {"to": ALLOWED, "subject": "plan", "body": "attached", "attachments": [pdf]})
+                k(rc == 0 and d.asked[0]["mailed"]["attachments"] == ["plan.pdf"],
+                  "…and a file that went is named in the hand-over by its name, not its path")
+                # (e) TWO WORKSPACES, NO THREAD. One record holds one workspace, so the daemon refuses a mail
+                # written to people in two of them and the sender's line says so. What that buys is the second
+                # half: the recipient the record would NOT have been keyed to answers, naming the id we sent,
+                # and with no record of it that answer is routed as a new mail. Keyed to the FIRST recipient's
+                # workspace it would have read as another workspace's thread and been refused — a mail dropped
+                # from somebody the box itself wrote to.
+                with FakeDaemon({"ok": False, "error": "recipients span workspaces — no thread"}) as d:
+                    rc, said = send23(wt, {"to": "%s,%s" % (ALLOWED, OTHER), "subject": "both", "body": "b"})
+                    spanned = w.calls[-1]["msg"]["Message-ID"]
+                k(rc == 0 and d.asked[0]["mailed"]["to"] == [ALLOWED, OTHER]
+                  and "mailed %s, %s" % (ALLOWED, OTHER) in said and "recipients span workspaces" in said
+                  and "opens a new thread" in said,
+                  "a mail to people in TWO workspaces goes to both and is refused a thread: the daemon's reason "
+                  "is on the line the sender reads, where a thread for one of them would have been a wrong one")
+                route23 = os.environ.get("CC_MAIL_ROUTE_FAKE")
+                os.environ["CC_MAIL_ROUTE_FAKE"] = ""       # unsure: no classifier is spawned for this one
+                try:
+                    theirs = arrived(b, OTHER, rcpt="abox--fix-the-door@box.example",
+                                     headers={"In-Reply-To": spanned})
+                    dec23 = router.route(theirs, Dir(), "box.example")
+                finally:
+                    if route23 is None:
+                        os.environ.pop("CC_MAIL_ROUTE_FAKE", None)
+                    else:
+                        os.environ["CC_MAIL_ROUTE_FAKE"] = route23
+                k(router.conv_for_reply(theirs, "other") == ({}, False) and not dec23.refuse
+                  and dec23.rule != "reply" and dec23.workspace == "other" and dec23.to,
+                  "…so the SECOND recipient's answer to it is delivered as a new mail and not refused: there is "
+                  "no thread of another workspace's for it to land on, which is the whole of why there is none")
+        finally:
+            os.chdir(here23)
+            sys.stdout = out23
+            for k23, v in saved23.items():
+                if v is None:
+                    os.environ.pop(k23, None)
+                else:
+                    os.environ[k23] = v
+
+        # (f) THE RECORD, AND A REAL REPLY LANDING ON IT. Written as the daemon's `mailed` verb writes it —
+        # the person's workspace, the line as its `to` root — and then a mail from that person naming the id
+        # we sent goes through the real door and the real router: rule `reply`, delivered to that root.
+        ask = {"channel": "mem", "from": "mem@box.example", "to": [ALLOWED], "subject": "the plan",
+               "message_id": "<out-7@box.example>", "attachments": ["plan.pdf"]}
+        k(router.started_line(ask) == "_email to `friend@allowed.example` · the plan · 1 attachment_"
+          and router.started_line(dict(ask, attachments=[], subject="")) == "_email to `friend@allowed.example` · (no subject)_",
+          "the channel's line reads `email to `a@b` · subject · 1 attachment` — the inbound mirror line, turned around")
+        rec = router.started_conv(ask, "mem")
+        rec["roots"] = [{"chat": "C-mem", "ts": "1800.5", "name": "mem", "target": "mem", "alias": None, "role": "to"}]
+        router.save_conv(rec)
+        k(rec["id"].startswith("out-") and rec["rule"] == router.STARTED and rec["mails"] == []
+          and rec["message_ids"] == ["<out-7@box.example>"] and rec["to"] == ["mem@box.example", ALLOWED]
+          and rec["from"] == "" and rec["workspace"] == "mem",
+          "the record is a received mail's turned around: our address leads `to`, the id we sent is its "
+          "Message-ID, no mail has arrived on it yet, and it sits under the RECIPIENT'S workspace")
+        k(outbound.from_addr(rec, "box.example") == "mem@box.example"
+          and outbound.recipients(rec, "box.example") == ([ALLOWED], []),
+          "…so the reply path answers from the channel's address, to the people the mail went to")
+        d = Dir()
+        reply = arrived(b, ALLOWED, rcpt="mem@box.example", subject="Re: the plan",
+                        headers={"In-Reply-To": "<out-7@box.example>", "Message-ID": "<theirs-1@allowed.example>"})
+        dec = router.route(reply, d, "box.example")
+        k(not dec.refuse and dec.rule == "reply" and dec.conv and dec.conv["id"] == rec["id"]
+          and [(p.chat, p.name) for p in dec.to] == [("C-mem", "mem")] and not d.asked[1:],
+          "a mail from that person naming the id we sent is a REPLY on that conversation: routed to the "
+          "channel's line as its root, and the classifier never runs")
+        joined = router.join_conv(dec.conv, reply)
+        k(joined["mails"] == [reply["id"]] and joined["message_ids"] == ["<out-7@box.example>", "<theirs-1@allowed.example>"],
+          "…and it joins the record, so the session's answer to it threads on the person's own mail")
+        k(outbound.by_mail(rec, "C-mem", "1800.5") and not router.their_line(rec, "C-mem", "1800.5"),
+          "the started root is a line a session may answer BY MAIL (by_mail), but not a sender's word that "
+          "waits on an answer (their_line) — nobody wrote it but the box")
+        rec["mirrors"] = [{"chat": "C-mem", "ts": "1800.9", "mail": reply["id"]}]
+        k(router.their_line(rec, "C-mem", "1800.9") and not router.their_line(rec, "C-mem", "")
+          and not router.their_line(rec, "C-mem", "1800.7"),
+          "…while the reply's own line under it is theirs, and a Slack message in the thread is nobody's mail")
+        stranger = arrived(b, OWNER, rcpt="mem@box.example", headers={"In-Reply-To": "<out-7@box.example>"})
+        k(router.route(stranger, d, "box.example").refuse,
+          "a mail from ANOTHER workspace naming that id is refused, as any reply across workspaces is: the "
+          "record is keyed by the recipient's workspace and nobody else can take its thread")
+
+        # (g) THE ID WE SENT IS NOT THE ONE THAT COMES BACK (owner, 2026-09-11: his reply to the email channel's
+        # proof mail named a Message-ID the relay minted, not ours, and opened a new root). Brief: "a reply to a
+        # mail the box started lands under that mail's own line in Slack, every time … find a carrier that
+        # survives the round trip … a tag must only ever reach a conversation in that sender's own workspace,
+        # and an unknown or foreign tag is treated exactly as today". The carrier is Reply-To `<channel>+<tag>@`.
+        fresh22()
+        with FakeWorker() as w:
+            asks = []
+            ok, _ = outbound.send_to(cold22(w), ALLOWED, "the tag", "answer me", channel="mem", mirror=asks.append)
+            tagged_call = w.one()
+            ok2, _ = outbound.send_to(cold22(w), ALLOWED, "no tag", "answer me")
+            home_call = w.calls[-1]
+        tag = (asks or [{}])[0].get("tag") or ""
+        k(ok and re.fullmatch(r"[0-9a-f]{8}", tag) and tagged_call["msg"]["Reply-To"] == "mem+%s@box.example" % tag
+          and tagged_call["msg"]["From"] == "mem@box.example",
+          "a mail a channel starts asks to be answered at `<channel>+<tag>@` (Reply-To), and the tag it minted "
+          "goes to the mirror in the ask — the wire Message-ID is the relay's, so this is the key the answer keeps")
+        k(ok2 and home_call["msg"]["Reply-To"] is None and len(asks) == 1,
+          "…a mail from home@ carries no tag: it has no channel, so no thread to key")
+        long_name = "abox--" + "a-very-long-track-name-" * 3        # 75 characters: a local part no MTA need take
+        with FakeWorker() as w:
+            ok3, _ = outbound.send_to(cold22(w), ALLOWED, "long", "answer me", channel=long_name, mirror=asks.append)
+            long_call = w.one()
+        k(ok3 and long_call["msg"]["Reply-To"] is None and long_call["msg"]["From"] == long_name + "@box.example"
+          and asks[-1]["channel"] == long_name and asks[-1]["tag"] == "",
+          "…and a channel whose name would push the tagged local part past 64 octets sends without one — the "
+          "mail still goes, From its own address, and the record is told there is no tag to index")
+        k(router.addressed({"to": ["mem+%s@box.example" % tag, "Mem+x@Box.Example"], "cc": ["other+1@box.example"]},
+                           "box.example") == (["mem"], ["other"]),
+          "`<name>+<tag>@` names #<name>: the tag never becomes a channel name, and a stray one still lands "
+          "the mail in the channel it was written from")
+        askT = {"channel": "mem", "from": "mem@box.example", "to": [ALLOWED], "subject": "the tag",
+                "message_id": "<out-8@box.example>", "tag": tag}
+        recT = router.started_conv(askT, "mem")
+        recT["roots"] = [{"chat": "C-mem", "ts": "1800.11", "name": "mem", "target": "mem", "alias": None, "role": "to"}]
+        router.save_conv(recT)
+        idxT = router._read(router.INDEX, {})
+        k(recT["tag"] == tag and idxT["tag"]["mem"][tag] == recT["id"] and "owner" not in idxT["tag"],
+          "the record keeps the tag, and the index holds it under the RECIPIENT'S workspace, as it holds an id")
+        answer = arrived(b, ALLOWED, rcpt="mem+%s@box.example" % tag, subject="Re: the tag",
+                         headers={"In-Reply-To": "<relay-made@box.example>", "References": "<relay-made@box.example>",
+                                  "Message-ID": "<theirs-2@allowed.example>"})
+        decT = router.route(answer, d, "box.example")
+        k(not decT.refuse and decT.rule == "reply" and decT.conv and decT.conv["id"] == recT["id"]
+          and [(p.chat, p.name) for p in decT.to] == [("C-mem", "mem")],
+          "an answer whose In-Reply-To and References name NOTHING in the index, delivered to `<channel>+<tag>@`, "
+          "is a REPLY on the started conversation: the tag came back where the id did not")
+        forged = arrived(b, OWNER, rcpt="mem+%s@box.example" % tag, subject="Re: the tag",
+                         headers={"In-Reply-To": "<relay-made@box.example>"})
+        decF = router.route(forged, d, "box.example")
+        k(decF.refuse and "another workspace" in decF.refuse,
+          "the same tag typed by a sender in ANOTHER workspace is refused, as a foreign Message-ID is — a tag "
+          "reaches a conversation in the sender's own workspace and nothing of anyone else's")
+        # (a subject of its own, so the fallback below has nothing to match: this is the tag path alone)
+        mine_only = arrived(b, ALLOWED, rcpt="mem+%s@box.example" % ("0" * 12), subject="a new thing",
+                            headers={"In-Reply-To": "<relay-made@box.example>"})
+        decU = router.route(mine_only, d, "box.example")
+        k(not decU.refuse and decU.rule != "reply" and [(p.chat, p.name) for p in decU.to] == [("C-mem", "mem")],
+          "a tag nobody knows is no tag: the mail routes as any mail to that channel does — a new mail in #mem, "
+          "on no conversation of anyone's")
+        wrong_addr = arrived(b, ALLOWED, rcpt="mem--site+%s@box.example" % tag, subject="Re: the tag",
+                             headers={"In-Reply-To": "<relay-made@box.example>"})
+        decW = router.route(wrong_addr, d, "box.example")
+        k(not decW.refuse and decW.rule != "reply" and [(p.chat, p.name) for p in decW.to] == [("C-mem--site", "mem--site")],
+          "…and a known tag on an address it was not issued for is no tag either: the address is part of the key")
+        # THE FALLBACK, for the mail already in the owner's inbox (sent before the tag existed) and for a client
+        # that answers From rather than Reply-To: sender + our address + subject, inside the workspace, newest
+        # wins. Two untagged records on one subject, a day apart, so "newest" is a claim this case tests.
+        askP = {"channel": "mem", "from": "mem@box.example", "to": [ALLOWED], "subject": "the fallback",
+                "message_id": "<out-9@box.example>", "tag": ""}
+        recP1 = router.started_conv(askP, "mem", cid="out-20260101T000000Z-aaaaaa")
+        recP2 = router.started_conv(dict(askP, message_id="<out-10@box.example>"), "mem", cid="out-20260102T000000Z-bbbbbb")
+        for r_, ts_ in ((recP1, "1800.21"), (recP2, "1800.22")):
+            r_["roots"] = [{"chat": "C-mem", "ts": ts_, "name": "mem", "target": "mem", "alias": None, "role": "to"}]
+            router.save_conv(r_)
+        plain_reply = arrived(b, ALLOWED, rcpt="mem@box.example", subject="RE: Re: the fallback",
+                              headers={"In-Reply-To": "<relay-made-2@box.example>", "Message-ID": "<theirs-3@allowed.example>"})
+        decP = router.route(plain_reply, d, "box.example")
+        k(not decP.refuse and decP.rule == "reply" and decP.conv and decP.conv["id"] == recP2["id"]
+          and [(p.chat, p.name) for p in decP.to] == [("C-mem", "mem")] and recP2["id"] > recP1["id"],
+          "with no tag and no known id, a mail from the person the box wrote to, to the address it wrote from, "
+          "on the same subject under the client's `Re:`s, is the answer to the NEWEST such started conversation")
+        other_subject = arrived(b, ALLOWED, rcpt="mem@box.example", subject="Re: something else",
+                                headers={"In-Reply-To": "<relay-made-3@box.example>"})
+        other_sender = arrived(b, OTHER, rcpt="mem@box.example", subject="Re: the fallback",
+                               headers={"In-Reply-To": "<relay-made-4@box.example>"})
+        decS, decO = router.route(other_subject, d, "box.example"), router.route(other_sender, d, "box.example")
+        k(decS.rule != "reply" and decO.rule != "reply" and not decS.refuse and not decO.refuse,
+          "…but another subject, or a sender the box did not write to, is not that answer: routed as a new mail")
+        # A FRESH MAIL IS NOT A REPLY, whatever its subject: no In-Reply-To, no References — the same person
+        # writing the same subject to the same address a month later opens a new root (review of #435).
+        fresh = arrived(b, ALLOWED, rcpt="mem@box.example", subject="the fallback",
+                        headers={"Message-ID": "<theirs-4@allowed.example>"})
+        assert not fresh.get("in_reply_to") and not fresh.get("references"), fresh
+        decF = router.route(fresh, d, "box.example")
+        k(decF.rule != "reply" and not decF.refuse and (decF.conv or {}).get("rule") != router.STARTED
+          and [(p.chat, p.name) for p in decF.to] == [("C-mem", "mem")],
+          "…and a mail that names nothing at all — no In-Reply-To, no References — is not a reply either, on "
+          "the same subject from the same person to the same address: a new mail, routed as one")
+        k(router.same_subject("Fwd: RE: the plan", "Re: the  plan") and not router.same_subject("", "")
+          and not router.same_subject("Re: the plan", "the plans"),
+          "the subject match sets the client's prefixes, case and whitespace aside and matches nothing on empty")
+
+    # ------------------------------- 24. a held mail can be answered by mail (owner, 2026-09-09)
+    # Brief: "while an inbound e-mail is held for the owner's decision, the box can still write to its sender
+    # by e-mail (an ack, 'parked, check Slack', a question) ... a held e-mail's sender receives the box's ack
+    # and any later post in the hold thread by e-mail; out.log shows each; placing the hold keeps the same
+    # conversation". The hold is placed by the daemon (take_mail, cc-slack's own selfcheck); what is settled
+    # here is the record it writes — saved, with the mirror line as its `to` root and the hold on it — and
+    # what that record lets the mail door do: the mail's ack is on record from the door, a post answering
+    # the held line goes out to the sender, and the sender's next mail lands on the same held conversation.
+    with Box(allow=ALLOWED + "," + OWNER, MAIL_RATE=500) as b:
+        HROOT = "1900.1"
+
+        def held_conf(worker):
+            return {"MAIL_SEND_URL": worker.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example"}
+
+        def held_log():
+            with open(outbound.LOGFILE) as f:
+                return [ln for ln in f.read().splitlines() if ln.strip()]
+
+        shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+        open(outbound.LOGFILE, "w").close()
+        outbound._UNCONFIGURED_SAID[0] = False
+        msg = arrived(b, ALLOWED, rcpt="mem@box.example", to="mem@box.example", subject="the held ask",
+                      headers={"Message-ID": "<held-24@allowed.example>"})
+        acks = [ln for ln in held_log() if ln.endswith("%s: ack to=%s by=worker: Received. It is in the queue as %s."
+                                                        % (msg["id"], ALLOWED, msg["id"]))]
+        k(len(acks) == 1,
+          "the door's own answer to the mail — the ack its sender hears, and for a held mail the only word "
+          "until a person decides — is in out.log before anything else is: %r" % (held_log(),))
+        # The record as take_mail writes it for a `suspicious` verdict: the mirror line is the `to` root AND
+        # on `mirrors`, the hold is on it, and `asks` is not — a held mail is not the sender's history.
+        rec = router.new_conv(msg, "mem")
+        rec["roots"] = [{"chat": "C-mem", "ts": HROOT, "name": "mem", "target": "mem", "alias": None, "role": "to"}]
+        rec["mirrors"] = [{"chat": "C-mem", "ts": HROOT, "mail": msg["id"]}]
+        rec["holds"] = [{"mail": msg["id"], "reason": "off-goals", "question": "", "ats": {"C-mem": HROOT},
+                         "at": "2026-09-09T04:20:00Z"}]
+        router.save_conv(rec)
+        k(router.conv_by_root("C-mem", HROOT)["holds"][0]["mail"] == msg["id"]
+          and outbound.by_mail(rec, "C-mem", HROOT) and router.their_line(rec, "C-mem", HROOT),
+          "the held mail's record is on disk under its mirror line: the line arrived by mail (by_mail) and is "
+          "the sender's word (their_line), so the thread is a mail thread while the hold stands")
+        with FakeWorker() as w:
+            note = outbound.send(held_conf(w), "C-mem", HROOT, ts=HROOT,
+                                 text="Parked for a person to look at — check Slack if you have it.")
+            went = list(w.calls)
+            note_s = outbound.send(held_conf(w), "C-mem", HROOT, ts="", text="I am looking at it now")
+            stayed = len(w.calls) - len(went)
+        k(note == "" and len(went) == 1 and went[0]["to"] == [ALLOWED] and went[0]["from"] == "mem@box.example"
+          and went[0]["msg"]["In-Reply-To"] == "<held-24@allowed.example>"
+          and went[0]["msg"]["Subject"] == "Re: the held ask"
+          and went[0]["msg"].get_content().strip() == "Parked for a person to look at — check Slack if you have it.",
+          "a post in the hold thread answering the held line goes out by mail: to the sender only, from the "
+          "address the mail was sent to, threaded on the held mail — the hold stops the DELIVERY, not the box "
+          "writing back")
+        k(stayed == 0 and note_s == "",
+          "…while a post there that answers nothing stays in Slack, as in any mail thread")
+        sent = [ln for ln in held_log() if ln.endswith("%s: sent from=mem@box.example to=%s" % (msg["id"], ALLOWED))]
+        k(len(sent) == 1 and held_log().index(acks[0]) < held_log().index(sent[0]),
+          "…and out.log shows each — the ack first, then the reply, both against the held mail's id: %r"
+          % (held_log(),))
+        again = router.load_conv(rec["id"])
+        k(again["holds"] == rec["holds"] and again["message_ids"] == ["<held-24@allowed.example>",
+                                                                       went[0]["msg"]["Message-ID"]]
+          and "asks" not in again,
+          "the reply joins the held record without touching the hold — it is still there for `deliver it`, "
+          "and the held subject is still not the sender's history")
+        theirs = arrived(b, ALLOWED, rcpt="mem@box.example", subject="Re: the held ask",
+                         headers={"In-Reply-To": went[0]["msg"]["Message-ID"],
+                                  "Message-ID": "<held-24-back@allowed.example>"})
+        found, foreign = router.conv_for_reply(theirs, "mem")
+        k(found.get("id") == rec["id"] and not foreign and found["holds"][0]["mail"] == msg["id"],
+          "the sender's answer to that mail lands on the SAME held conversation: placing the hold kept it, so "
+          "their reply threads under the held line rather than opening a new one")
 
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0

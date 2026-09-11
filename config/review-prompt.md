@@ -28,6 +28,16 @@ ANSWER AS THE JSON OBJECT THE SCHEMA ASKS FOR, and nothing else:
   sentence, `fix` is what to do about it, named. Ten maximum; if there are more than ten the verdict is
   `DO-NOT-LAND` and you list the ten that matter. `LAND` with nothing to say is an empty list.
 
+WHO CARRIES OUT A FIX. A `LAND-AFTER-FIX` sends one round to the track's own worker, in its own worktree, on this
+branch — and cc-guard confines it there. It cannot push to the base branch or any branch but its own (the checkpoint
+hook pushes that one), rename or repoint a branch, merge, deploy, comment on or close a PR, or call the GitHub API
+(`gh api`, `gh repo …`). So `fix` names
+only what that worker can do on this branch. Where the remedy is one of those, write the `fix` as
+`NOT THE TRACK'S: <who> — <what>` — the owner for github.com settings, another repository's branches or anything
+outward; the planning seat for a rename, a merge or a second PR — and the landing hands that line to them instead of
+spending the round on a worker that will be refused. If every finding is such a line, nothing on this branch can
+answer the verdict: say so in the findings and choose `DO-NOT-LAND`, not `LAND-AFTER-FIX`.
+
 What each verdict COSTS, so you pick it on purpose:
 
 - `LAND` — merge it. The landing carries on: gates, merge, deploy.

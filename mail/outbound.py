@@ -45,13 +45,16 @@ reply path's, unchanged: the same worker, the same secret, the same two caps, th
 
 ONLY OUR OWN FILES ARE ATTACHED, AND THE FILE IS OPENED ONCE. `attach_bytes()` opens the path with O_NOFOLLOW
 and then decides everything on that one fd — regular file, under the byte cap, and its real place (read off
-/proc/self/fd) inside the workspace's own tree (MAIL_OUT_ROOTS, narrowed to `<root>/<handle>` for a member).
-Nothing is checked by path and re-opened afterwards: the member owns that name and could swap a secret in
-between. A file that is not ours, or one over the cap, is not attached: the mail carries a LINK LINE instead,
-which is a URL when MAIL_OUT_LINKS maps the path to one and the file's name and size when it does not.
-That downgrade is the REPLY path's only: a cold mail (`cc-mail send --json`) names its files up front, and one
-that cannot go stops the whole send with the file and the reason — see send_to(). A mail the box starts never
-says "sent" about a file it dropped.
+/proc/self/fd) inside the workspace's own trees (MAIL_OUT_ROOTS, narrowed to `<root>/<handle>` for a member,
+plus that workspace's Slack files dir — see in_workspace). Nothing is checked by path and re-opened
+afterwards: the member owns that name and could swap a secret in between. A FILE EITHER ARRIVES AS A FILE, OR
+THE CALLER AND THE THREAD ARE TOLD IT DID NOT (owner, 2026-09-09: "Attachements dont always work well"). On
+the reply path a file that is not ours, or one over the cap, is one 📎 line in the thread naming it and the
+reason: when MAIL_OUT_LINKS maps the path to a URL the mail still goes, carrying a LINK LINE in the file's
+place, and the thread's line says it went as a link; when nothing maps it NOTHING is mailed and the line says
+where to put the file. A cold mail (`cc-mail send --json`) names its files up front, and one that cannot go
+stops the whole send with the file and the reason — see send_to(). Neither path ever says "sent" about a
+file it dropped.
 
 SENDING IS OFF UNTIL CONFIGURED. With no MAIL_SEND_URL or no MAIL_SEND_SECRET every call is a no-op that logs
 one line per process and nothing else — the reply is in Slack and the thread says nothing about mail, because
@@ -98,13 +101,15 @@ CONFIG, all of it in ~/.cc/config, read by cc-slack and handed here as a dict:
                          (session_channel, cold_from; owner, 2026-09-10)
       MAIL_OUT_PER_HOUR  6 mails per mirror thread per hour, and 6 cold mails an hour for the whole box
       MAIL_OUT_PER_DAY   30 mails per recipient per day, counted across both paths
-      MAIL_OUT_MAX_ATTACH_BYTES  8388608 (8 MiB) per file. Over it a reply's file goes as a link line and a
-                         cold mail is refused, naming the file
+      MAIL_OUT_MAX_ATTACH_BYTES  8388608 (8 MiB) per file. Over it a reply's file is a 📎 line in the thread
+                         (and a link line in the mail when MAIL_OUT_LINKS has a URL for it) and a cold mail is
+                         refused, naming the file
       MAIL_OUT_ROOTS     ~/dev:~/.cc/worktrees — the trees a file may be attached from, colon-separated. A
-                         member's workspace is narrowed to `<root>/<handle>` inside them
+                         member's workspace is narrowed to `<root>/<handle>` inside them. The workspace's own
+                         Slack files dir (~/.cc/slack/files; a member's member dir) is always one more
       MAIL_OUT_LINKS     `<path prefix>=<url base>` rows, comma- or newline-separated, the same shape as
-                         MAIL_WORKSPACE. A file under a prefix gets a URL in the link line; one under none gets
-                         its name and its size
+                         MAIL_WORKSPACE. A file under a prefix that cannot be attached goes as a URL in a link
+                         line; one under no prefix is not mailed at all, and the thread is told
 State is ~/.cc/mail/out/rate.json (the two caps' clocks) and the log is ~/.cc/mail/out.log — its own file, not
 the daemon's, because `cc-slack post` on the command line has no daemon log to write to.
 """
@@ -423,16 +428,36 @@ def _roots(cfg):
 def in_workspace(real, rec, cfg):
     """Is this REAL path inside the workspace's own tree? A member's workspace is narrowed to their own
     directory under each root, so one member's file can never leave in another's mail. The caller passes a
-    path it has already resolved — this function resolves nothing, so it cannot be raced."""
-    ws = (rec.get("workspace") or "").strip()
-    for root in _roots(cfg):
-        base = root if ws in ("", "owner") else os.path.join(root, ws)
+    path it has already resolved — this function resolves nothing, so it cannot be raced.
+
+    THE WORKSPACE'S SLACK FILES DIR IS ONE OF ITS TREES (2026-09-09, the owner's spreadsheet; 2026-09-10, a
+    PDF): a file a person uploads into a thread is downloaded there, and it is the one place the `file` tool
+    reads from besides a session's own folder — so it was exactly the ordinary way a file reached a mail
+    thread, and the one way it could not travel. It is the files dir of THIS workspace and no other."""
+    for base in bases(rec, cfg):
         if real == base or real.startswith(base.rstrip("/") + "/"):
             return True
     return False
 
 
-NOT_OURS = "not attached"
+def files_dir(ws, slack_dir=None):
+    """The Slack files directory of one workspace — where cc-slack downloads what a person uploads into a
+    thread, and where the `file` tool reads from. The owner's is ~/.cc/slack/files; a member's is the `files/`
+    of their own member dir (cc-slack's member_dir), which their boundary sees AS ~/.cc/slack/files."""
+    ws = (ws or "").strip()
+    d = slack_dir or SLACKDIR
+    return os.path.join(d, "files") if ws in ("", "owner") else os.path.join(d, "member", ws, "files")
+
+
+def bases(rec, cfg):
+    """Every directory a file may be attached from for this conversation's workspace, resolved: each of
+    MAIL_OUT_ROOTS (narrowed to `<root>/<handle>` for a member) and that workspace's own Slack files dir."""
+    ws = (rec.get("workspace") or "").strip()
+    out = [root if ws in ("", "owner") else os.path.join(root, ws) for root in _roots(cfg)]
+    return out + [os.path.realpath(files_dir(ws))]
+
+
+NOT_OURS = "not in a tree a mail may attach from"
 TOO_BIG = "too large to attach"
 
 
@@ -493,17 +518,41 @@ def link_for(path, cfg):
     return best[1]
 
 
+def human_size(n):
+    """`40 KB`, `12.3 MB` — never `0.0 MB` for a file that is merely small, which read as if it were empty
+    (the owner's spreadsheet, 2026-09-09)."""
+    n = int(n or 0)
+    if n >= 1024 * 1024:
+        return "%.1f MB" % (n / (1024 * 1024))
+    return "%d KB" % max(1, round(n / 1024)) if n else "0 bytes"
+
+
 def link_line(path, cfg, why):
-    """The line a mail carries instead of a file. It names the file, says why it is not attached, and gives a
-    URL when MAIL_OUT_LINKS has one. Never a filesystem path: a path on this box is no use to a reader and
-    says more about the box than it should."""
-    name = os.path.basename(path)
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        size = 0
-    url = link_for(path, cfg)
-    return "[%s — %s%s]" % (name, why, ", " + url if url else ", %.1f MB" % (size / (1024 * 1024)) if size else "")
+    """The line a mail carries instead of a file, when MAIL_OUT_LINKS gives it a URL. It names the file, says
+    WHICH reason kept it out — out of tree (NOT_OURS) and over the cap (TOO_BIG) are two different fixes — and
+    carries the URL. Never a filesystem path: a path on this box is no use to a reader and says more about the
+    box than it should."""
+    return "[%s — %s, %s]" % (os.path.basename(path), why, link_for(path, cfg))
+
+
+def not_attached(path, rec, cfg, why, cap):
+    """The one line the THREAD gets when a file the box posted did not go as a file: the file, the reason and
+    what fixes it. Row a-file-the-box-sends-actually-arrives: 'a file that genuinely may not travel produces a
+    failure the caller sees and a line in the thread saying so' — before this the log said "not inside the
+    workspace's own tree" and then "sent", and the session believed it had delivered a file."""
+    name = clip(os.path.basename(path))
+    if why == TOO_BIG:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        return "📎 %s (%s) is over the %s attachment cap" % (name, human_size(size), human_size(cap))
+    return "📎 %s is not in a tree a mail may attach from — put it under %s" % (name, trees(rec, cfg))
+
+
+def trees(rec, cfg):
+    """bases(), as a person reads them: `~/dev or ~/.cc/worktrees or ~/.cc/slack/files`."""
+    return " or ".join(p.replace(H, "~", 1) if p == H or p.startswith(H + "/") else p for p in bases(rec, cfg))
 
 
 # ---------------------------------------------------------------- the message
@@ -513,21 +562,43 @@ def subject_of(rec):
     return s if re.match(r"^\s*re:", s, re.I) else "Re: " + s
 
 
-def build(rec, from_a, to, cc, text, attach=None, mid=None, now=None, subject=None):
+LOCAL_MAX = 64          # octets in a local part (RFC 5321 4.5.3.1.1) — a longer one is refused by many an MTA
+
+
+def tagged(addr, tag):
+    """`local+tag@domain` — the address a cold mail asks to be answered at (RFC 5233 subaddressing). The
+    router strips the `+tag` to name the channel and reads the tag to name the conversation (router.addressed,
+    router.conv_for_reply). "" when there is no tag or no address, and "" when the tagged local part would
+    pass LOCAL_MAX — a track's channel name can run to 60 characters on its own, and an address the recipient's
+    server refuses would lose the answer altogether; such a mail carries no tag and its answer is matched
+    the other way (router.started_match)."""
+    local, sep, dom = _norm(addr).rpartition("@")
+    if not (tag and sep and local) or len(local) + 1 + len(tag) > LOCAL_MAX:
+        return ""
+    return "%s+%s@%s" % (local, tag, dom)
+
+
+def build(rec, from_a, to, cc, text, attach=None, mid=None, now=None, subject=None, reply_to=""):
     """The whole RFC822 message, as bytes, plus the Message-ID it carries.
 
     THREADING IS THE POINT OF THE HEADERS. In-Reply-To names the LAST mail of the conversation — the one this
     reply answers — and References carries the chain plus that id, which is what puts our mail under the
     sender's own thread in their client rather than beside it.
 
-    The Message-ID we mint is handed back so `send()` can put it in the conversation's own `message_ids`: a
-    reply to THIS mail then names an id the router knows, and the round trip closes. Without that step the
-    sender's answer to us would look like a new conversation."""
+    The Message-ID we mint is handed back so `send()` can put it in the conversation's own `message_ids`. On
+    the REPLY path that is enough: the person's next mail carries References, and their own first mail's id
+    is in it. It is NOT enough for a mail the box starts: the relay behind MAIL_SEND_URL puts its own
+    Message-ID on the wire (2026-09-11: the owner's reply named an id nothing here had minted), so the id we
+    minted never comes back and the box cannot choose the one that does. `reply_to` is the carrier that
+    survives: the cold path passes `<channel>+<tag>@<domain>` (tagged), the client answers to it, and the tag
+    comes back in the envelope recipient, which nothing between here and the door rewrites."""
     m = email.message.EmailMessage()
     m["From"] = from_a
     m["To"] = ", ".join(to)
     if cc:
         m["Cc"] = ", ".join(cc)
+    if reply_to:
+        m["Reply-To"] = reply_to
     # `subject` is the cold path's, given whole. A mail that answers nothing is not "Re: " anything, and
     # subject_of() would put the prefix on it; every other caller passes None and gets subject_of() as before.
     m["Subject"] = subject_of(rec) if subject is None else subject
@@ -639,16 +710,25 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
         return ""                       # neither is a session's doing and neither is news in the thread
 
     body = plain(text)
-    attach = None
+    attach, note = None, ""
     if path:
         cap = cfg_int(cfg, "MAIL_OUT_MAX_ATTACH_BYTES", MAX_ATTACH)
         data, why = attach_bytes(path, rec, cfg, cap)
-        if why:
-            body = (body + "\n\n" + link_line(path, cfg, why)).strip()
-            if why == NOT_OURS:
-                log("%s: %s is not inside the workspace's own tree — sent as a line, not a file" % (rec.get("id"), clip(path)))
-        else:
+        if not why:
             attach = (path, data)
+        else:
+            # "a file either arrives as a file, or the caller and the thread are told it did not" (the brief,
+            # 2026-09-11): a file that will not travel is one line in the thread, always. With a URL
+            # (MAIL_OUT_LINKS) the mail still goes and carries the link instead; without one NOTHING goes — a
+            # mail whose only news is that a file was left out is not an answer, and the session that posted
+            # it is better told where to put the file and asked to post it again.
+            note = not_attached(path, rec, cfg, why, cap)
+            if not link_for(path, cfg):
+                log("%s: not sent — %s: %s" % (rec.get("id"), clip(os.path.basename(path)), why))
+                return note + ". Nothing was mailed; post it again once it is."
+            body = (body + "\n\n" + link_line(path, cfg, why)).strip()
+            note += " — it went as a link, not a file"
+            log("%s: %s %s — sent as a link line, not a file" % (rec.get("id"), clip(os.path.basename(path)), why))
     if not body and not attach:
         return ""
 
@@ -678,7 +758,7 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
         return "📪 Cloudflare would not deliver to %s: %s%s" % (
             clip(one.get("to")), clip(one.get("error")),
             " (and %d other%s)" % (len(failed) - 1, "" if len(failed) == 2 else "s") if len(failed) > 1 else "")
-    return ""
+    return note                         # "" when everything went as posted; the link-not-file line when not
 
 
 # ---------------------------------------------------------------- the mail the box starts
@@ -686,13 +766,19 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
 COLD_KEY = "cold"       # every cold mail shares one per-hour bucket: see send_to()
 
 
-def send_to(cfg, to, subject, text, attachments=None, now=None, channel=""):
+def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
 
     `channel` is the sending session's own channel, or "" — session_channel() read off where the process
     runs, and the caller passes nothing it typed. It decides the From alone (cold_from): <channel>@ for a
     session that has one, so the answer lands in that channel's mirror thread; home@ (or MAIL_SEND_FROM) for
     one that does not. The verified list, the caps and the reply path do not see it.
+
+    `mirror` is the caller's one chance to give the mail a thread. It is called ONCE, after the mail is away
+    and only for a session with a channel, with what a mirror needs — {"channel", "from", "to", "subject",
+    "message_id", "tag", "attachments"} — and whatever line it answers is appended to the line returned here. cc-mail
+    hands it to the daemon's `mailed` verb, which posts one line in that channel and writes the conversation
+    record (see the docstring's last paragraph); the daemon itself never calls this and passes none.
 
     A FILE EITHER GOES AS A FILE OR NOTHING GOES. `attachments` is the list of paths the caller named, each
     read through attach_bytes() under a reply's rules — a regular file inside MAIL_OUT_ROOTS, under
@@ -716,9 +802,15 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel=""):
     session in a loop calling this is one bucket of six an hour, and the per-recipient day cap is shared with
     the reply path so a person cannot be mailed thirty times by one path and thirty by the other.
 
-    NOTHING IS THREADED AND NO CONVERSATION IS WRITTEN. There is no mail to be In-Reply-To, and an id recorded
-    against no conversation would thread a stranger's answer onto somebody else's. An answer to a cold mail
-    arrives at the door as a new mail and is routed like one."""
+    NOTHING IS THREADED HERE, and the conversation is the mirror's to write. There is no mail to be
+    In-Reply-To, and an id recorded against no conversation would thread a stranger's answer onto somebody
+    else's — so this function writes none. A session WITH a channel gets one through `mirror`: the line it
+    posts in that channel is the root, and the record beside it carries the people it went to and the TAG the
+    mail asks to be answered at — `Reply-To: <channel>+<tag>@<domain>` — so the person's answer is routed under
+    that line instead of opening a new thread (owner, 2026-09-10: his reply to a channel's own mail arrived as
+    a new root; 2026-09-11: it still did, because the relay rewrites the Message-ID we mint, so the id in the
+    record is never the one a reply names — see build()). An answer to a mail from a channel-less session
+    (home@) still arrives at the door as a new mail and is routed like one."""
     rcpts, allowed = [], verified(cfg)
     for piece in (to if isinstance(to, (list, tuple)) else re.split(r"[,\s]+", str(to or ""))):
         a = _norm(piece)
@@ -755,14 +847,21 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel=""):
                           % (clip(os.path.basename(path)),
                              "%d MiB" % (cap // (1024 * 1024)) if cap >= 1024 * 1024 else "%d-byte" % cap))
         if why:
-            return refuse("%s cannot be attached — not a readable regular file inside the box's own trees "
-                          "(MAIL_OUT_ROOTS: %s) — nothing sent" % (clip(os.path.basename(path)), ":".join(_roots(cfg))))
+            return refuse("%s cannot be attached — not a readable regular file under %s — nothing sent"
+                          % (clip(os.path.basename(path)), trees({}, cfg)))
         attach.append((path, data))
 
     why = caps(cfg, COLD_KEY, rcpts, now=now)
     if why:
         return refuse(why)
-    raw, _ = build({}, from_a, rcpts, [], body, attach=attach, now=now, subject=subject)
+    # THE TAG IS THE THREAD'S KEY, minted here because it has to be on the wire before the daemon writes the
+    # record (`mirror` runs after the send). A session with a channel gets one; home@ has no thread to key. It
+    # identifies, it does not hide: a tag only ever reaches a conversation in the sender's own workspace
+    # (router.conv_for_reply), so eight hex digits are plenty and leave room for the channel's name (tagged).
+    tag = os.urandom(4).hex() if channel else ""
+    reply_to = tagged(from_a, tag)
+    tag = tag if reply_to else ""          # a tag the mail does not carry is not one the record may index
+    raw, mid = build({}, from_a, rcpts, [], body, attach=attach, now=now, subject=subject, reply_to=reply_to)
     ok, failed, err = call_worker(cfg, from_a, rcpts, raw)
     if not ok:
         return refuse(err)
@@ -773,11 +872,17 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel=""):
     log("%s: sent from=%s to=%s subject=%s%s" % (COLD_KEY, from_a, ",".join(sent) or "(none)", clip(subject),
                                                  " attach=" + ",".join(names) if names else ""))
     with_files = (", with %s attached" % ", ".join(names)) if names else ""
+    # THE MIRROR, once the mail is away and only when somebody was reached: a thread for a mail nobody got
+    # would wait for an answer that cannot come. `channel` empty is the home@ case and keeps today's behaviour.
+    tail = ""
+    if sent and channel and mirror is not None:
+        tail = str(mirror({"channel": (channel or "").strip().lstrip("#").lower(), "from": from_a, "to": sent,
+                           "subject": subject, "message_id": mid, "tag": tag, "attachments": names}) or "")
     if failed:
         one = failed[0]
         line = "Cloudflare would not deliver to %s: %s" % (clip(one.get("to")), clip(one.get("error")))
         log("%s: %s" % (COLD_KEY, line))
         # A verified address of ours that Cloudflare still refuses is the owner's runbook to fix, not a bug
         # here, so it is named rather than counted — and the people it DID reach are named beside it.
-        return bool(sent), ("mailed %s%s. %s" % (", ".join(sent), with_files, line)) if sent else line
-    return True, "mailed %s from %s%s" % (", ".join(sent), from_a, with_files)
+        return bool(sent), ("mailed %s%s. %s%s" % (", ".join(sent), with_files, line, tail)) if sent else line
+    return True, "mailed %s from %s%s%s" % (", ".join(sent), from_a, with_files, tail)

@@ -138,16 +138,20 @@ BOARDS = os.environ.get("CC_BOARDS") or os.path.expanduser("~/.cc/boards")
 STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")
 
 
-def board_read(path):
-    """A board file, read through cc-board's opener (imported, the way cc-time is): a member's board is a link into a
-    directory the MEMBER writes, and a plain open here followed whatever it planted — a pipe hung this tool for good
-    (review of #224). None = no board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
-    if not hasattr(board_read, "mod"):
+def _board():
+    """cc-board, imported the way cc-time is — beside THIS copy, not a stubbed BIN. It owns the board's opener and,
+    since 2026-09-11, the brief's one locked writer; both are reached through here."""
+    if not hasattr(_board, "mod"):
         import importlib.machinery, importlib.util
         s = importlib.util.spec_from_loader("ccboard", importlib.machinery.SourceFileLoader(
-            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))   # beside THIS copy, not a stubbed BIN
-        board_read.mod = importlib.util.module_from_spec(s); s.loader.exec_module(board_read.mod)
-    return board_read.mod.read(path)
+            "ccboard", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-board")))
+        _board.mod = importlib.util.module_from_spec(s); s.loader.exec_module(_board.mod)
+    return _board.mod
+def board_read(path):
+    """A board file, read through cc-board's opener: a member's board is a link into a directory the MEMBER writes,
+    and a plain open here followed whatever it planted — a pipe hung this tool for good (review of #224). None = no
+    board there; cc-board's Refused for anything planted, which a caller treats as unreadable."""
+    return _board().read(path)
 LIVE = ("queued", "running", "waiting", "review")   # a row that is not finished: its branch may be under a hand right now
 DUE = ("queued", "blocked", "todo")   # a row WAITING to be picked up; `todo` is older boards' spelling of queued
 MARK_A, MARK_B = "<!-- cc-brief:inflight -->", "<!-- /cc-brief:inflight -->"
@@ -446,37 +450,18 @@ def inflight(repo, exclude=""):
     return f"{MARK_A}\n{body}\n{MARK_B}\n"
 
 
-def merge(text, block):
-    """Put block where the last one was, or at the end; "" takes the old one out. ONLY the delimited block moves —
-    every line a person typed is left exactly as typed (self-review 6: a machine does not rewrite a human's word)."""
-    if BLOCK_RE.search(text):
-        out = BLOCK_RE.sub(lambda m: block, text, count=1)
-        if block:
-            return out
-        # Removing it undoes exactly what appending it did — the block and the blank line it was put after — and
-        # nothing else. A blank line a person left three deep in their own brief is theirs, not this tool's to tidy.
-        return (out.rstrip("\n") + "\n") if out.strip() else ""
-    if not block:
-        return text
-    return (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
-
-
 def refresh(repo, track):
-    p = os.path.join(STATE, repo, track, "task.md")
-    try:
-        with open(p, errors="replace") as f:
-            text = f.read()
-    except OSError:
-        return 0            # no brief yet: nothing to annotate, and never a reason to fail a dispatch
+    """The block, recomputed and put where the last one was through cc-board's locked writer (`annotate`): ONLY the
+    delimited block moves, every line a person typed is left exactly as typed (self-review 6), and a note being
+    appended or a re-dispatch landing at the same moment is serialised with it, not overwritten by it. Never a
+    reason to fail a dispatch: no brief, an unreadable board, a held lock all leave the file as it was."""
     block = inflight(repo, exclude=track)
     if block is None:
         return 0        # the board could not be read: leave whatever is in the brief alone
-    new = merge(text, block)
-    if new != text:
-        tmp = p + ".brief.tmp"          # atomic, like every other writer of this file
-        with open(tmp, "w") as f:
-            f.write(new)
-        os.replace(tmp, p)
+    try:
+        _board().brief_edit("annotate", repo, track, block, state=STATE)
+    except Exception as e:      # a link planted at the file or the lock, a lock somebody holds: said, not fatal
+        print(f"cc-brief refresh: {repo}/{track} left as it was — {e}", file=sys.stderr)
     return 0
 
 
@@ -1348,6 +1333,7 @@ def selfcheck():
     # ITS OWN FIXTURE, and a pure one: put the block in and take it out again, and the writer's text — including a
     # gap they left — must come back byte for byte. The tool tidying a brief it did not write is the thing to catch.
     theirs = "GOAL: a thing.\n\n\n\nwith a gap the writer left.\n"
+    merge = _board().merge
     ok("adding the block and taking it out again returns the typed brief byte for byte",
        merge(merge(theirs, MARK_A + "\nIN FLIGHT: x\n" + MARK_B + "\n"), "") == theirs)
 

@@ -43,7 +43,8 @@ the handle); the third is read off the board and the outbox:
 
 THE ONE THREAD READ. `outbox_index()` / `answered()` are the single place that answers "was there a word in
 that thread, and was it ours", from cc-slack's own outbox.log (one line per post and per reaction, written
-before the API call — so no network read, and only words that are OURS). The owner debt asks it backwards
+once Slack ACCEPTED it — a refused one is logged `post-failed`/`react-failed`/`file-failed` and counts for
+nothing here — so no network read, and only words that are ours AND reached them). The owner debt asks it backwards
 ("did we answer him"); cc-secretary's asks rubric asks it forwards ("was this answered") through `--answered`.
 Built twice they would disagree, and a disagreement between those two IS a false "the owner is waiting" —
 which is the whole of the 2026-09-02 defect: five such findings in ninety minutes, every one answered in its
@@ -94,6 +95,8 @@ BOARDS = os.environ.get("CC_OWED_BOARDS") or os.path.expanduser("~/.cc/boards")
 OUTBOX_TAIL = 2 * 1024 * 1024   # the log is append-only and ~1 MB a day; the tail is every thread of the last days
 SENT = frozenset(("post", "file", "react"))   # outbox kinds that are a WORD OF OURS. `react-auto` is not one:
 # it is the 👍 the box itself puts on a message a session finished silently, which says "handled" and no more.
+# Nor are `post-failed`, `file-failed`, `react-failed`: cc-slack writes those when Slack REFUSED the word (arch
+# review 2026-09-08, rec 4 — "rejected sends never satisfy cc-owed"), so a send that reached nobody pays no debt.
 ANSWERLESS = frozenset(("eyes", "question", "red_circle", "large_orange_circle", "large_yellow_circle",
                         "hammer_and_wrench", "checkered_flag"))   # cc-slack's OUR_ANSWER_SKIP by another name:
 # 👀 says only "received", ❓🔴🟠 are the bot's own marks and 🏁 closes a thread. ✅ is NOT here — it says done.
@@ -205,8 +208,9 @@ def outbox_index(nbytes=OUTBOX_TAIL):
     {(chat, None): [(epoch, text)…]} for the channel as a whole, `chat` being the id it resolves to (see below). The text rides along because a SHARED lane needs
     it: #alerts carries every repo's news, and telling a word about this track from a word about another one is
     reading what it says (see `owner_chats`). cc-slack writes one outbox.log line per post and per
-    reaction before it calls the API, so this asks Slack nothing, costs no network read, and sees exactly the
-    words that are OURS. A REACTION COUNTS: on their message it IS the answer — cc-slack tells sessions so, and
+    reaction once Slack accepted it (a refused one is a `*-failed` line, not in SENT), so this asks Slack nothing,
+    costs no network read, and sees exactly the words that are OURS and got there. A REACTION COUNTS: on their
+    message it IS the answer — cc-slack tells sessions so, and
     the transcript half of this tool has always read one that way — so leaving it out would put the two halves
     in disagreement, which is the false "the owner is waiting" all over again. It is filed under the ts it sits
     on, which for a thread's own root is that thread. Bookkeeping reactions answer nothing and are skipped.
@@ -986,6 +990,19 @@ def selfcheck():
         fh.write(f"2026-09-01T23:59:00Z\treact-auto\t{C1}\t{RXB}\t+1\n")
     ok("the box's OWN 👍 for a session that said nothing is not an answer — that is the silence to notice",
        answered("#alpha", RXB, epoch(ASKED), outbox_index())["n"] == 0)
+    # arch review 2026-09-08, rec 4: "rejected sends never satisfy cc-owed". cc-slack now writes the outbox line
+    # AFTER Slack accepted the word, and a refused one as `post-failed` — a send that reached nobody is silence here.
+    RXF = "1788306100.150000"
+    with open(os.path.join(SLACK_DIR, "outbox.log"), "a") as fh:
+        fh.write(f"2026-09-01T23:59:10Z\tpost-failed\t{C1}\t{RXF}\tI answered, or so I thought\n")
+        fh.write(f"2026-09-01T23:59:11Z\treact-failed\t{C1}\t{RXF}\t+1\n")
+        fh.write(f"2026-09-01T23:59:12Z\tfile-failed\t{C1}\t{RXF}\t/tmp/x.png (12 bytes)\n")
+    ok("a post, a reaction or a file Slack REFUSED answers nothing: a rejected send never satisfies this hook",
+       answered("#alpha", RXF, epoch(ASKED), outbox_index())["n"] == 0)
+    with open(os.path.join(SLACK_DIR, "outbox.log"), "a") as fh:
+        fh.write(f"2026-09-01T23:59:13Z\tpost\t{C1}\t{RXF}\tI answered, for real this time\n")
+    ok("…and the retry Slack accepted is the word that pays it",
+       answered("#alpha", RXF, epoch(ASKED), outbox_index())["n"] == 1)
     # review of PR #194, finding 1: a session may react with the NAME or with the character, and cc-slack writes
     # down whichever it was handed — so a 👀 spelt 👀 read as a word, and a question nobody answered became
     # unflaggable: `answered=yes` on the ask, and the owner debt reading a thread he only ever got a 👀 in as reached.

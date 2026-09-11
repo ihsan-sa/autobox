@@ -9,7 +9,7 @@ event so the worker can reply "received" to the sender before Cloudflare closes 
 WHERE THE MAIL THEN GOES IS NOT DECIDED HERE. Once it is stored, this server puts the id on the cc-slack
 daemon's socket and that is its whole part in delivery: core/mail/router.py decides which channels the mail
 belongs in and the daemon posts and delivers them. This process holds no Slack token and makes no Slack call.
-The daemon's answer is what the sender hears back, so a refusal ("I could not tell whose workspace this address belongs to") reaches
+The daemon's answer is what the sender hears back, so a refusal ("That address is not one I route") reaches
 them; a daemon that is down costs the delivery and not the mail. See docs/2026-09-08-email.md.
 
 BINDING IS THE BOUNDARY. It binds 127.0.0.1, never a public interface, not configurable, so no inbound port is
@@ -41,6 +41,9 @@ the worker sends nothing, so an unknown sender learns nothing at all — not tha
 there is an allow-list, not that anything happened. A refusal (too large, too many) does send a one-line reason,
 which is only ever seen by someone already on the allow-list. So the allow-list is checked before the size and
 the verdict before the rate limit: no path can answer a stranger with a reason.
+The stored mail's answer (`reply` in the 200, which the worker sends back to the sender) is the box's ACK — for a
+held mail the only word its sender gets until a person decides — and it is written to ~/.cc/mail/out.log as an
+`ack` line beside every mail that goes out, so one file shows all of what a sender was sent (acked()).
 
   cc-mail serve [--port N] [--foreground]   start (or restart): 127.0.0.1:N
   cc-mail stop                              stop it
@@ -53,9 +56,11 @@ the verdict before the rate limit: no path can answer a stranger with a reason.
                                             "attachments": ["/abs/path", ...]} — those four keys and no others;
                                             attachments may be left out. Every file named is attached, or the
                                             mail is not sent and the line names the file and why (a file
-                                            attaches only from under MAIL_OUT_ROOTS and under the byte cap).
-                                            One line either way — stdout when the mail went, stderr and exit 1
-                                            when it did not, exit 2 when the ask itself was malformed
+                                            attaches only from under MAIL_OUT_ROOTS or ~/.cc/slack/files, and
+                                            under the byte cap). One line either way — stdout when the mail
+                                            went, stderr and exit 1 when it did not, exit 2 when the ask
+                                            itself was malformed. From a session with a channel the line ends
+                                            with where the mail's thread is (see below)
   cc-mail send --to A[,B] --subject S [--body TEXT]
                                             the same with no files: the body is --body, or stdin without it
 
@@ -68,6 +73,11 @@ From the sending SESSION'S OWN channel address, `<channel>@MAIL_DOMAIN`, when th
 worker's `#<repo>--<track>`, an orch's channel) so the answer lands in that channel's mirror thread; a session
 with no channel of its own — a repo's main session, the box session, a plain shell — sends From home@ (or
 MAIL_SEND_FROM). Which it is comes off where the command runs, never off the ask (outbound.session_channel).
+A MAIL FROM A CHANNEL GETS A THREAD THERE: once it is away, `send` hands it to the daemon (`mailed` on the
+owner socket) which posts one line in that channel — `email to `a@b` · subject` — and writes the conversation
+that line is the root of, so the person's answer is routed under it rather than opening a new thread (owner,
+2026-09-10). The daemon down costs the line and the thread, not the mail, and `send` says so. home@ mail has
+no channel and no line, and its answer arrives as a new mail, as before.
 
 THE WIRE, which core/mail/inbound-worker.js is written against:
   POST /inbound                             every other method and path is 404
@@ -617,6 +627,19 @@ def _write_rate(seen):
         pass        # a counter that cannot be written must not refuse a real mail; the caps above still hold
 
 
+def acked(mail_id, who, reply):
+    """The worker's immediate reply is the box's ACK to a sender — for a held mail the only word they get until
+    a person decides (owner, 2026-09-09: 'at least an ack ... or telling me to check slack') — and it leaves as
+    this handler's answer, not through outbound.send, so out.log showed nothing for it and a held sender read
+    as never written to. One `ack` line there, in the file every mail that goes out is written to. Best
+    effort: the log is never the mail, and a log that will not write costs the line and nothing else."""
+    try:
+        import outbound                      # noqa: E402 — a sibling, imported here for this one line
+        outbound.log("%s: ack to=%s by=worker: %s" % (mail_id, who, reply))
+    except Exception:
+        pass
+
+
 def routed(mail_id):
     """Hand the stored mail to the daemon. Gives back (the line the sender should hear, a word for the log).
 
@@ -627,32 +650,55 @@ def routed(mail_id):
     THE DECISION IS NOT MADE HERE, and neither is any Slack call: this process has no token and never gets one.
     It puts an id on the daemon's socket (`{"mail": "<id>"}`, an owner verb) and the daemon does the rest —
     core/mail/router.py decides, cc-slack posts the mirror line and delivers. The answer comes back inside this
-    same HTTP event, which is what lets a refusal ("I could not tell whose workspace this address belongs to") reach the sender.
+    same HTTP event, which is what lets a refusal ("That address is not one I route") reach the sender.
 
     EVERY FAILURE IS QUIET TOWARDS THE SENDER. No daemon, no socket, a timeout, an answer that is not JSON:
     the line comes back empty and the caller falls to "Received. It is in the queue as <id>.", which is true.
     Routing that did not happen is this box's problem to read in `route=` in the log, not a stranger's to be
     handed a reason for."""
     try:
-        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.settimeout(ROUTE_WAIT)
-        try:
-            c.connect(SLACKSOCK)
-            c.sendall((json.dumps({"mail": mail_id}) + "\n").encode())
-            buf = b""
-            while not buf.endswith(b"\n"):
-                d = c.recv(65536)
-                if not d:
-                    break
-                buf += d
-        finally:
-            c.close()
-        answer = json.loads(buf or b"{}")
+        answer = daemon({"mail": mail_id})
     except Exception as e:
         return "", "unreachable %s" % clip(str(e))
     if not answer.get("ok"):
         return "", "failed %s" % clip(str(answer.get("error") or answer))
     return answer.get("reply") or "", "yes" if answer.get("routed") else "nowhere"
+
+
+def daemon(req):
+    """One request on cc-slack's owner socket, one JSON answer back. Raises on no daemon, a timeout or an
+    answer that is not JSON — each caller says what that costs in its own words."""
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(ROUTE_WAIT)
+    try:
+        c.connect(SLACKSOCK)
+        c.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            d = c.recv(65536)
+            if not d:
+                break
+            buf += d
+    finally:
+        c.close()
+    return json.loads(buf or b"{}")
+
+
+def mirrored(ask):
+    """outbound.send_to's `mirror`, for `cc-mail send`: the mail is away, so hand it to the daemon's `mailed`
+    verb, which posts one line in the sending session's channel and writes the conversation that line is the
+    root of — the thread the person's answer will land under. Returns the tail of cc-mail's own line: where
+    the thread is, or why there is none. A daemon that is down or refuses costs the thread, never the mail,
+    and says so: an answer to a mail with no thread opens a new one in that channel, as before."""
+    try:
+        answer = daemon({"mailed": ask})
+    except Exception as e:
+        return ". No line in #%s — the channel daemon did not answer (%s), so a reply opens a new thread" % (
+            ask.get("channel"), clip(str(e)))
+    if not answer.get("ok"):
+        return ". No line in #%s — %s, so a reply opens a new thread" % (
+            ask.get("channel"), clip(str(answer.get("error") or "the daemon refused")))
+    return ". Its thread is in #%s" % (answer.get("name") or ask.get("channel"))
 
 
 # ---------------------------------------------------------------- the server
@@ -812,8 +858,9 @@ class Handler(BaseHTTPRequestHandler):
         self.say("store id=%s from=%s(%s) to=%s bytes=%d attachments=%d auth=%s route=%s subject=%s"
                  % (rec["id"], clip(who), how, clip(rcpt), len(raw), len(rec["attachments"]),
                     rec["auth"]["verdict"], why, clip(rec["subject"])))
-        self._json(200, {"status": "stored", "id": rec["id"],
-                         "reply": line or "Received. It is in the queue as %s." % rec["id"]})
+        reply = line or "Received. It is in the queue as %s." % rec["id"]
+        acked(rec["id"], who, reply)
+        self._json(200, {"status": "stored", "id": rec["id"], "reply": reply})
 
 
 class Server(ThreadingHTTPServer):
@@ -1124,8 +1171,10 @@ def cmd_send(opt):
     import outbound                          # noqa: E402 — a sibling, imported here for cc-mail's own reason
     # The From is the session's own channel's address when it has one, home@ when it does not — read off where
     # this command runs (session_channel), never off the ask: there is no key or flag for it (owner, 2026-09-10).
+    # `mirrored` runs only for a session with a channel, once the mail is away: the line in that channel and
+    # the conversation its answer threads under (the daemon's `mailed` verb). home@ gets neither, as before.
     ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments,
-                                channel=outbound.session_channel())
+                                channel=outbound.session_channel(), mirror=mirrored)
     print(line, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 

@@ -9,6 +9,12 @@
 #   cc-msg --drain [<window>]   deliver what is spooled, in order, while the pane is free (cc-msg.timer, 60 s); a
 #                               bare --drain also routes member-refusal queries to the box (see drain_queries below)
 #   cc-msg --ask <window> /cmd  type a bare /command at a FREE pane and print what it draws (never spooled)
+#   cc-msg --sweep              every window on the box: a dialog the KNOWN_SAFE table answers is pressed, whether
+#                               or not anything is queued for that pane (cc-sweep.timer, 2 min); one it does not
+#                               know is reported (dialog_seen), never guessed at.
+#                               Each press is a line in ~/.cc/state/sweep.log. (2026-09-10: six paused sessions
+#                               sat on 'Switch to Fable 5.1?' for hours — nothing was delivered to them, so nothing
+#                               ever read the table at them.)
 #   cc-msg selfcheck
 # Prints "queued" (rc 0) when the text went to the spool, nothing when it was typed.
 # The spool collapses only a RETRY — the same sender's same text inside $CC_MSG_DEDUP_S (120 s); the same words
@@ -33,6 +39,7 @@ HUNG_WAIT="${CC_MSG_HUNG_WAIT:-1}"           # a pane that has not moved YET: se
 HUNG_TRIES="${CC_MSG_HUNG_TRIES:-3}"         # it never will — a live pane costs one read, only a wedged one waits
 HUNG_COOLDOWN="${CC_MSG_HUNG_COOLDOWN:-30}"  # min before one window is restarted again: a session that comes back
                                              # wedged is not a thing to keep killing
+SWEEP_LOG="$HOME/.cc/state/sweep.log"        # one line per key the sweep pressed: when, window, key, the dialog
 
 # THE DIALOG GUARD. A modal is waiting for a keypress, so the text — or the Enter after it, or a digit inside it —
 # ANSWERS it, and a tool-permission prompt answered by a script is an unattended approval of exactly what the owner
@@ -56,17 +63,26 @@ PERMISSION_MARKS=('Do you want to' 'No, and tell Claude what to do differently' 
                   'I trust this folder')
 WORKING_MARK='esc to interrupt'              # Claude Code's footer for the whole of a turn (cc-pulse reads the same)
 
-# THE KNOWN-SAFE TABLE — the only prompts this script ever answers. One row: <key> TAB <substring> TAB <substring>…,
-# and EVERY substring must be on the pane for the row to fire. Both rows press Escape, and Escape on both means
-# KEEP WHAT THE SESSION ALREADY HAS: no model is switched, nothing is approved, nothing is spent.  Adding a row is
-# a decision about what a script may press unattended — the bar is that the worst case is a no-op.
+# THE KNOWN-SAFE TABLE — the only prompts this script ever answers. One row: <keys> TAB <substring> TAB <substring>…,
+# and EVERY substring must be on the pane for the row to fire. <keys> is one or more tmux key names separated by
+# spaces, pressed in order — and every key after the first only while the dialog still stands (press_safe), so a
+# key that closed it on its own is never followed by one landing in the prompt behind it. Rows 1-2 press Escape,
+# and Escape on both means KEEP WHAT THE SESSION ALREADY HAS: no model is switched, nothing is approved, nothing is
+# spent.  Adding a row is a decision about what a script may press unattended — the bar is that the worst case
+# is a no-op.
 #   1  the model-limit prompt, in every wording it has ("You've reached your Fable limit … Switch to <m> and
-#      continue", "Switch to Fable 5? … runs on usage credits"): all of them offer "No, keep my current model",
-#      which is what Escape does, and all of them footer "Esc to cancel", which is the pane SAYING so.
+#      continue", "Switch to Fable 5? … runs on usage credits", "Switch to Fable 5.1? …"): all of them offer
+#      "No, keep my current model", which is what Escape does, and all of them footer "Esc to cancel", which is
+#      the pane SAYING so.
 #   2  the /model confirm ("Switch model?" · "No, go back") left open in a live conversation
+#   3  the startup "Teach auto mode about your environment?" nudge (1 Yes · 2 Not now · 3 Don't show again):
+#      option 3, which writes the ONE shared ~/.claude.json (autoModeEnvSetup) so no session on the box draws it
+#      again; Escape here is "Not now" and it comes back next start (dismissed by hand 5 times, 2026-09-10).
+#      Nothing is scanned, no model runs, no permission changes: the worst case is the same nudge once more.
 KNOWN_SAFE=(
   $'Escape\tkeep my current model\tEsc to cancel'
   $'Escape\tSwitch model?\tNo, go back'
+  $'3 Enter\tTeach auto mode about your environment\tDon\'t show again'
 )
 
 has(){ case "$2" in *"$1"*) return 0;; esac; return 1; }   # $1 needle in $2 haystack
@@ -78,6 +94,16 @@ safe_key(){   # $1 = pane text → the keystroke that dismisses a KNOWN-SAFE pro
     IFS=$'\t' read -r -a cols <<<"$row"; ok=1
     for m in "${cols[@]:1}"; do has "$m" "$s" || { ok=0; break; }; done
     [ "$ok" = 1 ] && { printf '%s' "${cols[0]}"; return 0; }
+  done
+}
+
+press_safe(){   # $1 = window id  $2 = a KNOWN_SAFE <keys> cell → pressed in order; a key after the first only while
+  local k scr first=1   # the dialog still stands, so "3 Enter" never puts an Enter into the prompt behind a dialog "3" closed
+  for k in $2; do
+    if [ "$first" = 0 ]; then
+      scr=$(tmux capture-pane -p -t "$1" 2>/dev/null); [ "$(blocked "$scr")" = dialog ] || break
+    fi
+    tmux send-keys -t "$1" "$k"; sleep "$DIALOG_WAIT"; first=0
   done
 }
 
@@ -392,7 +418,7 @@ free_pane(){  # $1 window  $2 window id → 0 when the pane will take keys now; 
   if [ "$st" = dialog ]; then                  # ONLY a pane a dialog is actually holding is ever pressed: the same
     key=$(safe_key "$scr")                     # words in a transcript are text, and a key sent at a free or busy
     if [ -n "$key" ]; then                     # pane is a keystroke nobody asked for
-      tmux send-keys -t "$2" "$key"; sleep "$DIALOG_WAIT"
+      press_safe "$2" "$key"; sweep_log "$1" "$key" "$(dialog_line "$scr")"
       scr=$(tmux capture-pane -p -t "$2" 2>/dev/null); st=$(blocked "$scr")
     fi
   fi
@@ -591,6 +617,48 @@ drain(){   # $1 = one window, or nothing = every window with a spool
   drain_queries   # …and the member-refusal queries, routed to the box's queries session (never a member's channel)
 }
 
+# ── the sweep: the table, on a timer, at every pane ──────────────────────────────────────────────────────────
+# free_pane() answers a known-safe dialog only on the way to DELIVERING something, so a pane nothing was sent to —
+# a paused project, an orch between turns — kept its dialog for as long as nobody wrote to it (six of them, hours,
+# 2026-09-10). This walks every window in `main` on cc-sweep.timer and applies the same table, and only the table:
+# a permission dialog (PERMISSION_MARKS) is never pressed here either, safe_key() being the one judge of that.
+# A dialog the table does not know goes down the standing-dialog report (dialog_seen: the planning session is
+# told after STAND_MIN) — reported, never guessed at; no model reads a pane here (landing review of #419).
+sweep_log(){ mkdir -p "$(dirname "$SWEEP_LOG")" 2>/dev/null   # $1 window  $2 keys  $3 dialog line
+             printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" "$3" >> "$SWEEP_LOG" 2>/dev/null || true; }
+sweep(){
+  local id w scr st key
+  while read -r id w; do
+    [ -n "$id" ] && [ -n "$w" ] || continue
+    live_claude "$id" || continue                  # a bare shell or a `claude -p` draws no dialog anyone may press
+    in_copy_mode "$id" && continue                 # somebody is scrolling: a key here is eaten and drops them out
+    scr=$(tmux capture-pane -p -t "$id" 2>/dev/null)   # a cheap pre-filter, so a free or mid-turn pane — nearly all
+    st=$(blocked "$scr")                              # of them — never waits on the lock. NOTHING is pressed on it.
+    case "$st" in
+      busy)   continue;;                           # mid-turn ends by itself
+      dialog) ;;
+      *)      dialog_gone "$w"; continue;;
+    esac
+    ( flock -w 10 9 || exit 0                      # the window's own lock: not a key on top of a drain's
+      scr=$(tmux capture-pane -p -t "$id" 2>/dev/null)   # …and the KEY IS CHOSEN FROM A PANE READ UNDER IT. The
+      st=$(blocked "$scr")                               # pre-filter's screen can be a whole drain old: the drain
+      case "$st" in                                      # held the lock, answered that very dialog, typed its
+        busy)   exit 0;;                                 # message and started a turn — so a key picked from the
+        dialog) ;;                                       # stale read lands as an Escape into 'esc to interrupt'
+        *)      dialog_gone "$w"; exit 0;;                # and interrupts it (landing review of #419).
+      esac
+      key=$(safe_key "$scr")                     # the table, and only the table
+      if [ -n "$key" ]; then
+        press_safe "$id" "$key"; sweep_log "$w" "$key" "$(dialog_line "$scr")"
+        scr=$(tmux capture-pane -p -t "$id" 2>/dev/null)
+        if [ "$(blocked "$scr")" = dialog ]; then dialog_seen "$w" "$scr"; else dialog_gone "$w"; fi
+      else
+        dialog_seen "$w" "$scr"                    # not the table's: reported, never guessed at
+      fi
+    ) 9>"$(lock "$w")"
+  done < <(tmux list-windows -t main -F '#{window_id} #W' 2>/dev/null)
+}
+
 send(){    # $1 window  $2 text — THE contract: delivered, or queued and reported as queued. Never dropped.
   local id
   id=$(win_id "$1") || true
@@ -660,6 +728,22 @@ Learn more: https://support.claude.com/en/articles/12429409-extra-usage-for-paid
 ❯ No, keep my current model
   Manage usage credits on claude.ai
 Enter to confirm · Esc to cancel"
+LIMIT3="Switch to Fable 5.1?
+Fable 5.1 runs on usage credits — you have CA\$0.00 in credits.
+❯ No, keep my current model
+  Manage usage credits on claude.ai
+Enter to confirm · Esc to cancel"
+TEACH="Teach auto mode about your environment?
+Auto mode works better when it knows your environment. Takes about a minute.
+❯ 1. Yes
+  2. Not now
+  3. Don't show again
+Enter to confirm · Esc to cancel"
+ODD="Something new?
+This dialog is in no table.
+❯ 1. Keep going
+  2. Stop here
+Enter to confirm · Esc to cancel"
 MODEL='Switch model?
 This conversation is cached for the current model.
 ❯ 1. Yes, switch to Opus 5
@@ -684,12 +768,19 @@ selfcheck(){
 case "$1" in
   list-windows) [ -n "${CC_FAKE_WIN:-}" ] && [ ! -f "$CC_FAKE_GONE" ] && printf '@1 %s\n' "$CC_FAKE_WIN";;
   list-panes)   echo 991234;;
-  capture-pane) cat "$CC_FAKE_SCREEN" 2>/dev/null;;
+  capture-pane) cat "$CC_FAKE_SCREEN" 2>/dev/null
+                if [ -n "${CC_FAKE_SWAP_AFTER:-}" ]; then   # the pane CHANGES under the reader: another holder of the
+                  c=$(cat "$CC_FAKE_SWAP_N" 2>/dev/null || echo 0); c=$((c+1))   # window's lock got there first, and
+                  printf '%s\n' "$c" > "$CC_FAKE_SWAP_N"                        # what it left is what a key lands in
+                  [ "$c" = "$CC_FAKE_SWAP_AFTER" ] && printf '%s\n' "${CC_FAKE_SWAP_TO:-}" > "$CC_FAKE_SCREEN"
+                fi;;
   display-message) if [ -s "$CC_FAKE_MODE_F" ]; then cat "$CC_FAKE_MODE_F"; else printf '%s\n' "${CC_FAKE_MODE:-0}"; fi;;
   send-keys)    shift; printf '%s\n' "$*" >> "$CC_FAKE_KEYS"
                 # `?*`: an EMPTY literal send types nothing, so real tmux puts no character on the pane either
                 case "$*" in *' -l -- '?*) [ -z "${CC_FAKE_HUNG:-}" ] && printf '%s\n' "${*#* -l -- }" >> "$CC_FAKE_SCREEN";; esac
                 case "$*" in *Escape*) [ -n "${CC_FAKE_ESC_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac
+                case "$*" in *' 3') [ -n "${CC_FAKE_3_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac   # a digit that confirms on its own
+                case "$*" in *' Enter') [ -n "${CC_FAKE_ENTER_CLEARS:-}" ] && printf '> \n' > "$CC_FAKE_SCREEN";; esac
                 # Enter is copy-selection-and-cancel in both default copy-mode tables: the mode is OVER once a
                 # message has been typed, so anything that asks after the keys is asking too late.
                 case "$*" in *Enter*) [ "${CC_FAKE_MODE:-0}" = 1 ] && printf '0\n' > "$CC_FAKE_MODE_F";; esac;;
@@ -744,14 +835,14 @@ STUB
   cp "$(readlink -f "${BASH_SOURCE[0]}")" "$T/bin/cc-msg"; chmod +x "$T"/bin/*
   export PATH="$T/bin:$PATH" HOME="$T" CC_FAKE_SCREEN="$T/screen" CC_FAKE_KEYS="$T/keys" \
          CC_FAKE_CALLS="$T/calls" CC_FAKE_WIN="$W" CC_FAKE_ESC_CLEARS=1 CC_FAKE_PROC=claude \
-         CC_FAKE_GONE="$T/gone" CC_FAKE_MODE_F="$T/mode" \
+         CC_FAKE_GONE="$T/gone" CC_FAKE_MODE_F="$T/mode" CC_FAKE_SWAP_N="$T/swapn" \
          CC_MSG_KEY_WAIT=0 CC_MSG_DIALOG_WAIT=0 CC_MSG_FROM=selfcheck
   local SP="$T/.cc/state/$W/inbox.spool" DG="$T/.cc/state/$W/inbox.dialog"
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }
   scr(){ printf '%s\n' "$1" > "$T/screen"; }
-  reset(){ : > "$T/keys"; : > "$T/calls"; rm -rf "$T/.cc/state"; rm -f "$T/gone" "$T/mode"; }
+  reset(){ : > "$T/keys"; : > "$T/calls"; rm -rf "$T/.cc/state"; rm -f "$T/gone" "$T/mode" "$T/swapn"; }
   msg(){ "$T/bin/cc-msg" "$W" "$1"; }
   keys(){ cat "$T/keys"; }
   calls(){ cat "$T/calls"; }
@@ -1316,6 +1407,40 @@ $BUSY"; out=$(msg "hello mid-turn")
   k "$(t test -s "$TL")" "…and the plant is left untouched in the worker's own directory"
   k "$(t grep -q '^inject .*ws1 was refused' "$T/calls")" "…while the one-level spool the guard actually writes still delivers"
 
+  # (12) THE SWEEP: the table at every pane, on a timer, with nothing queued for it (row a-dialog-nobody-answers-is-swept)
+  SL="$T/.cc/state/sweep.log"
+  reset; scr "$LIMIT3"; "$T/bin/cc-msg" --sweep
+  k "$(t grep -q ' Escape$' "$T/keys")" "sweep: 'Switch to Fable 5.1?' with NOTHING queued is answered Escape (keep my current model) — the 2026-09-10 six"
+  k "$(t grep -q "^[0-9TZ:-]*	$W	Escape	Switch to Fable 5.1?" "$SL")" "…and the press is logged: when, window, key, the dialog line"
+  k "$(nt test -f "$DG")" "…and the dialog it cleared leaves no standing-dialog stamp"
+  reset; scr "$LIMIT2"; out=$(msg "hello 5"); reset; scr "$LIMIT3"; out3=$(msg "hello 5.1")
+  k "$(t test -z "$out$out3")" "delivery too: 'Switch to Fable 5?' and 'Switch to Fable 5.1?' are both one table row — the wording changed and the row still fires"
+  reset; scr "$TEACH"; CC_FAKE_ENTER_CLEARS=1 "$T/bin/cc-msg" --sweep
+  k "$(t test "$(keys | awk '{print $NF}')" = $'3\nEnter')" "sweep: 'Teach auto mode about your environment?' is answered 3 then Enter = Don't show again (the one shared ~/.claude.json), not Escape = Not now"
+  k "$(t grep -q "	$W	3 Enter	Teach auto mode" "$SL")" "…logged as one press of the row's keys"
+  reset; scr "$TEACH"; CC_FAKE_3_CLEARS=1 "$T/bin/cc-msg" --sweep
+  k "$(t test "$(keys | awk '{print $NF}')" = '3')" "…and when the 3 closes the dialog by itself no Enter follows it into the prompt behind"
+  reset; scr "$PERM"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "sweep: a PERMISSION dialog is never pressed — by the sweep, by the table"
+  reset; scr "$ODD"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "sweep: a dialog the table does not know gets NO key — reported, never guessed at (no model reads the pane: landing review of #419)"
+  k "$(t test -f "$DG")" "…and is stamped as a standing dialog, which dialog_seen reports to the planning session after STAND_MIN"
+  k "$(nt grep -q . "$SL")" "…and nothing is logged as pressed"
+  reset; scr "$LIMIT3
+$BUSY"; "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "sweep: a busy pane whose scrollback quotes a table row is left alone — no Escape mid-turn"
+  reset; scr "$LIMIT3"; CC_FAKE_PROC=bash "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "sweep: a window with no interactive claude under it gets no key"
+  reset; scr "$LIMIT3"; CC_FAKE_MODE=1 "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "sweep: a pane somebody is scrolling (copy mode) gets no key"
+  # The pane can change between the read and the press: the drain holds the lock, answers that same dialog, types its
+  # message and starts a turn. A key chosen from the earlier read would go into 'esc to interrupt' and INTERRUPT the
+  # turn just started, after the message was already popped as delivered (landing review of #419).
+  reset; scr "$LIMIT3"; CC_FAKE_SWAP_AFTER=1 CC_FAKE_SWAP_TO="$BUSY" "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "sweep: a pane that went busy between the read and the press gets NO key — the key is chosen from a read taken under the window's lock"
+  reset; scr "$LIMIT3"; CC_FAKE_SWAP_AFTER=1 CC_FAKE_SWAP_TO="> " "$T/bin/cc-msg" --sweep
+  k "$(nt grep -q . "$T/keys")" "…and one whose dialog was answered by whoever held the lock gets none either"
+
   echo "cc-msg selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ]
 }
@@ -1324,7 +1449,8 @@ $BUSY"; out=$(msg "hello mid-turn")
 case "${1:-}" in
   --drain)    shift; drain "${1:-}";;
   --ask)      shift; ask "${1:?cc-msg: --ask needs a window}" "${2:?cc-msg: --ask needs a /command}";;
+  --sweep)    sweep;;
   selfcheck)  selfcheck;;
-  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --drain [<window>] | cc-msg --ask <window> /cmd | cc-msg selfcheck' >&2; exit 2;;
+  ''|-h|--help) echo 'usage: cc-msg <window> "text" | cc-msg --drain [<window>] | cc-msg --sweep | cc-msg --ask <window> /cmd | cc-msg selfcheck' >&2; exit 2;;
   *)          w=$1; shift; send "$w" "${*:-$(cat)}";;
 esac

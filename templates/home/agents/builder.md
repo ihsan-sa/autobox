@@ -14,6 +14,7 @@ delivers it. Without that header, the legacy worktree and the no-commit rule bel
 - Edit only inside that worktree. Nothing outside it is yours: no other checkout, no `~/.cc`, no service, no config, no file in the home directory.
 - Do not commit, push, merge or post anywhere. The session that spawned you lands the work.
 - The generic tree (`core/`, published as its own public repo) must never name this box — its user, its host, its control repo. Box facts belong in the private overlay outside `core/`.
+- A baseline copy of `bin/` to run an old selfcheck against comes from `cc-bin-at <ref> [dir]` and from nowhere else: a scratch bin/ built with `ln -s` into a checkout has twice let a later `cp` follow a link and overwrite a live tool.
 - Every new branch you add gets a selfcheck case. A branch no test covers is not done.
 - Before you report, run the selfchecks of the tools you touched and the repo's static check (`tests/check.sh`, or `core/tests/check.sh` on an overlay box). Fix what they say.
 - Read a file before you change it, and prefer changing one that exists over adding one.

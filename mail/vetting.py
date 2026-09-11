@@ -604,9 +604,17 @@ def vet(msg, dec, cfg=None):
         # the second read and the hold on a file the sandbox could not open, both of which asked about the
         # sender. `known` on the Verdict is what makes the note say both halves.
         report = inspected(msg, boundary(ws, target.target if target else "", cfg))[0] if atts else ""
+        # WHO is the sender's own standing, not the Decision's workspace. An `unmapped` mail (router.UNMAPPED)
+        # carries workspace="owner" because it is in the owner's session for HIM to place — the sender is an
+        # address on the list that no workspace claims, and a read told "the box's owner" would wave through
+        # as fitting his channel whatever a stranger to every workspace wrote (review of #433, 2026-09-11).
+        if dec.rule == _router().UNMAPPED:
+            who = ("an address on the box's list that no workspace claims — the mail is in the owner's own "
+                   "channel so that he can place it, which is where every such mail goes")
+        else:
+            who = "the box's owner" if ws == "owner" else "a member of this box"
         got, why = _ask(_prompt("mail-vet-known-prompt.md",
-                                {"SENDER": sender,
-                                 "WHO": "the box's owner" if ws == "owner" else "a member of this box",
+                                {"SENDER": sender, "WHO": who,
                                  "WORKSPACE": ws, "TARGET": "#" + target.name if target else "(nowhere)",
                                  "GOALS": goals(target.target if target else ""),
                                  "LINKS": "\n".join("- %s" % u for u in urls), "ATTACHMENTS": report,

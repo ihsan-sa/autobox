@@ -42,7 +42,8 @@
 #                             did not land — an approval card Slack could not take is pending, not a failure
 #                             Nothing it runs against a remote can wait for a person: each is bounded by
 #                             CC_PUSH_TIMEOUT (120 s), the same knob cc-checkpoint's pushes obey
-#   cc lands <repo>           does that repo hold the standing grant? 0 yes · 1 no · 2 named but member-facing
+#   cc lands <repo>           does that repo hold the standing grant? 0 yes · 1 no · 2 named, but a member-facing repo
+#                             or a member workspace with no GitHub token — nothing can land for it
 #   cc rm <repo> <track>      remove a track (worktree + local branch + board entry + state)
 #   cc rename <old> <new>     rename a project everywhere the box keys by its name: ~/dev, worktrees, state, board,
 #                             ask ledger, its Slack channels (renamed in place, so their history stays), routes, tmux
@@ -203,18 +204,19 @@ member_workspace(){ [ -f "$DEV/$1/.cc/member-workspace" ]; }   # ~/dev/<handle> 
 # discriminator is not a variable at all: it is which PROCESS does the queueing. `cc lands <repo>` is this test,
 # exposed so the loop can ask it, and it merely answers.
 #
-# A MEMBER WORKSPACE — and any member-facing repo — IS MEANT TO HOLD IT TOO (owner, 2026-09-05) and cannot yet:
-# exit 2, said out loud rather than dropped, because a grant that silently does nothing is worse than one that is
-# refused. Three host-side pieces are missing, and each is its own change: the gates run the head's own
-# `tests/check.sh` and `tests/selftest.sh` on the HOST as the owner, which there is member-authored code outside
-# the sandbox that exists to contain it; `gh` is called bare, so a PR in the workspace's own repository needs
-# GH_REPO and a token minted for that workspace (cc-gh-token), the way cc-checkpoint already pushes on its behalf;
-# and the deploy half (install.sh, units, restarts) must never run for a repository that is not the box's.
+# A MEMBER WORKSPACE HOLDS IT TOO (owner, 2026-09-05: "keep it identical since ultimately it only touches its own
+# repo"), once it is GRANTED a GitHub token (cc-sandbox github <h>): the host then lands its projects' PRs on its
+# behalf, the way cc-checkpoint --sweep pushes for it — out of a host-only clone on that token, the gates inside its
+# sandbox, no deploy half, the review charged to its daily cap, a stop said in #<h> (cc-land, MEMBERS). The sweep
+# is what queues (a session inside the boundary cannot spell the queue), and it asks this first. A workspace named
+# here but granted no token is exit 2, said out loud rather than dropped — a grant that silently does nothing is
+# worse than one that is refused — and so is a member-FACING repo, which has no boundary to gate inside of.
 self_lands(){
   local r
   for r in $("$BIN/cc-config" get CC_SELF_LAND_REPOS 2>/dev/null); do
     [ "$r" = "$1" ] || continue
-    { member_workspace "$1" || member_facing "$DEV/$1"; } && return 2
+    if member_workspace "$1"; then [ -f "$HOME/.cc/members/$1/github-token" ] && return 0; return 2; fi
+    member_facing "$DEV/$1" && return 2
     return 0
   done
   return 1
@@ -245,6 +247,11 @@ member_credential(){   # $1 handle · $2 track ("" = the main session) — THE H
   [ -s "$own" ] && jq -e '.claudeAiOauth.accessToken | type == "string" and length > 0' "$own" >/dev/null 2>&1 && return 0
   [ -s "$own" ] && jq -e '.claudeAiOauth.accessToken == ""' "$own" >/dev/null 2>&1 && blank=": its access token is EMPTY, so that workspace was signed out rather than never minted"
   what="\`$h\`"; [ -n "$tr" ] && what="\`$h/$tr\`"
+  # THE EVENT'S NAME, for cc-slack's ledger (arch review 2026-09-08, rec 4: 17 credential nags over 6 days, after the
+  # owner asked for the command once). `credential:<h>` is posted once, ever, however often this runs — the stamps
+  # below are only the cheap local guard in front of it. A credential that WENT blank after a mint is a new event, so
+  # that id carries the file's own mtime; a mint writes a new file, and a later blank names a later moment.
+  local cid="credential:$h"; [ -n "$blank" ] && cid="credential:$h:blank@$(stat -c %Y "$own" 2>/dev/null || echo 0)"
   echo "cc: $h has no credential of its own ($own$blank) — nothing starts until one is minted (cc-sandbox mint $h); #$h is told once, the owner is paged (once a day)."
   day=$(date -u +%F); mkdir -p "$(dirname "$stamp")"
   # THE CHANNEL IS RESOLVED BEFORE THE STAMP IS CLAIMED. `cc-slack post` falls back to #alerts (then SLACK_CHANNEL)
@@ -256,10 +263,10 @@ member_credential(){   # $1 handle · $2 track ("" = the main session) — THE H
   # and a message arriving together — say it once between them, and a failure is retried rather than inherited.
   if grep -q "^#${h}[[:space:]]" <<<"$("$BIN/cc-slack" channels 2>/dev/null)" \
      && ( set -o noclobber; date -u +%FT%TZ > "$told" ) 2>/dev/null; then
-    "$BIN/cc-slack" post -c "#$h" --major "mint incomplete — on the box: \`cc-sandbox mint $h\`" >/dev/null 2>&1 || rm -f "$told"
+    "$BIN/cc-slack" post -c "#$h" --major --id "$cid" "mint incomplete — on the box: \`cc-sandbox mint $h\`" >/dev/null 2>&1 || rm -f "$told"
   fi
   if [ "$(cat "$stamp" 2>/dev/null)" != "$day" ]; then
-    "$BIN/cc-notify" -t "$h" --owner -- "$what needs a credential minted: a message in #$h tried to start its session and there is none at $own$blank. Mint one on the box: \`cc-sandbox mint $h\` walks that person's login in a throwaway HOME and installs what it produced. The next message starts the session. If you mint your OWN account it installs that too and says so — whoever uses that workspace can then use the account anywhere." >/dev/null 2>&1 && echo "$day" > "$stamp"
+    "$BIN/cc-notify" -t "$h" --owner --id "$cid:owner" -- "$what needs a credential minted: a message in #$h tried to start its session and there is none at $own$blank. Mint one on the box: \`cc-sandbox mint $h\` walks that person's login in a throwaway HOME and installs what it produced. The next message starts the session. If you mint your OWN account it installs that too and says so — whoever uses that workspace can then use the account anywhere." >/dev/null 2>&1 && echo "$day" > "$stamp"
   fi
   return 1; }
 # THE BOUNDARY (docs/design-member-workspaces.md). A member workspace's session and every worker it dispatches run inside
@@ -363,37 +370,20 @@ state_dir_ok(){   # $1 repo · $2 track → 0 when ~/.cc/state/<repo>/<track> is
     && [ "$(readlink -f "$STBASE/$1/$2")" = "$(readlink -f "$STBASE")/$1/$2" ]; } && return 0
   echo "cc: refusing $1/$2's state dir — ~/.cc/state/$1/$2 is a symlink, sits behind one, or could not be made"; return 1; }
 write_brief(){   # $st/task.md from $text — THE BRIEF HAS ONE HOME (see the --go case for the history)
-  # THE SHAPE IS CHECKED AT THE DOOR, not remembered by whoever is dispatching (cc-brief): a note that prescribes
-  # the steps is refused here, with the lines that made it one, before anything is written. CC_BRIEF_FORCE=1 turns
-  # the refusal into a flag for a note that really must carry a command. What is IN FLIGHT is then computed from
-  # the board into the brief, so no dispatcher types a list of files that was true when they typed it.
-  # Two gates, and they answer differently on purpose. `check` is arithmetic: the shapes it can prove. `judge`
-  # is a small model reading the prose, because a page of prescription written as paragraphs is what got past two
-  # written copies of the rule — it exits 1 when it READ the brief and rejected it (hard, with what to cut) and 2
-  # when it could not judge at all (no binary, timeout, usage limit), and 2 dispatches: a box that cannot start
-  # work because a judge is down is worse than a box that dispatches a wordy brief.
-  if [ -n "$text" ]; then
-    printf '%s\n' "$text" | "$BIN/cc-brief" check - --for "$repo/$track" || return 1
-    printf '%s\n' "$text" | "$BIN/cc-brief" judge - --for "$repo/$track"; [ $? = 1 ] && return 1
-  fi
-  state_dir_ok "$repo" "$track" || return 1   # …and the directory it goes in is this track's own: the two walls above
+  # …AND ONE WRITER (2026-09-11): `cc-board brief append --top`, a read-modify-write under the track's own lock.
+  # This used to be a third unlocked read-replace of the file beside `cc board add` and `cc-brief refresh`, each
+  # with a temp name of its own, so a dispatch note and the block's recompute landing together kept whichever
+  # wrote last (arch review 2026-09-08, rec 10). The shape gate — cc-brief `check` (arithmetic) then `judge` (a
+  # small model; 1 = read and rejected, 2 = could not judge, and 2 dispatches) — runs inside that writer, before
+  # its lock, with CC_BRIEF_FORCE=1 turning a refusal into a flag; a refusal prints its reason and exits 1 here.
+  # The walls are the writer's too (security review of #225): the track dir is really itself, the file and the
+  # lock are opened O_NOFOLLOW, the temp name is mkstemp's. state_dir_ok stays in front, BEFORE the migrating
+  # `get`, since that read must not walk a link either.
+  state_dir_ok "$repo" "$track" || return 1
   "$BOARD" get "$repo" "$track" instructions >/dev/null 2>&1   # migrates a pre-#94 board copy into the file, once
   if [ -n "$text" ]; then
-    # The last two walls are the file's: task.md is READ back into the write below, so a link there hands an
-    # owner-only file to whoever can read the brief; and task.md.tmp is what `>` opened. Both are checked, and the
-    # write itself is opened O_NOFOLLOW (dd), so a link raced in after the checks is refused by the KERNEL. `mv` is
-    # rename(2): it replaces a link left at task.md rather than writing through it, so it needs no wall of its own.
-    if [ -L "$st/task.md" ] || [ -L "$st/task.md.tmp" ]; then
-      echo "cc: refusing $repo/$track's brief — $st/task.md or its .tmp is a symlink"; return 1; fi
-    t0=$(printf '%s' "$text"); n=$(printf '%s' "$t0" | wc -c)   # both sides trailing-newline-stripped by $( )
-    if [ "$(head -c "$n" "$st/task.md" 2>/dev/null)" != "$t0" ]; then   # not already on top (a re-dispatch
-      { printf '%s\n' "$text"                                          # repeating its note): don't stack it up.
-        if [ -s "$st/task.md" ]; then echo; cat "$st/task.md"; fi; } \
-        | dd oflag=nofollow "of=$st/task.md.tmp" status=none 2>/dev/null \
-        || { echo "cc: could not write $st/task.md.tmp — $repo/$track's brief is unchanged"; return 1; }
-      mv "$st/task.md.tmp" "$st/task.md"                                # this only ever looks at the head, which
-    fi                                                                  # this same code wrote — never at the brief below it
-  else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi
+    printf '%s\n' "$text" | "$BOARD" brief append --top "$repo" "$track" - >/dev/null || return 1   # the note on top,
+  else [ -s "$st/task.md" ] || { echo "cc: --go \"\" re-dispatches $st/task.md, but it is empty or missing"; exit 1; }; fi   # not stacked
   "$BIN/cc-brief" refresh "$repo" "$track" 2>/dev/null   # …and the IN FLIGHT block is recomputed at every dispatch,
   return 0; }                                            # including a bare --go "" — that is when it must be true
 ensure_main(){ tmux has-session -t "$SESSION" 2>/dev/null || "$BIN/cc-boot"; }   # server creation goes through tmux-main.service (cgroup ownership; 2026-08-26 incident)
@@ -850,6 +840,21 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   rc=0; ask "\"attachment\": [\"$T/dev/proj/report.txt\"]" >/dev/null; [ "$?" = 2 ] && has "$(cat "$T/err")" "unknown key attachment" || rc=1
   t "…and a mistyped key is refused by name (exit 2) rather than dropped" "$rc"
   kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  # `cc lands` — self_lands' four answers, one fixture repo, DEV/HOME pointed at $T so the box's own config is never read.
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS="" self_lands r1; [ "$?" = 1 ] || rc=1
+  t "cc lands: a repo not named in CC_SELF_LAND_REPOS is 1" "$rc"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 0 ] || rc=1
+  t "…a named, ordinary repo is 0" "$rc"
+  mkdir -p "$T/dev/r1/.cc"; : > "$T/dev/r1/.cc/member-facing"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 2 ] || rc=1
+  t "…a named, member-facing repo is 2" "$rc"
+  rm -f "$T/dev/r1/.cc/member-facing"; : > "$T/dev/r1/.cc/member-workspace"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 2 ] || rc=1
+  t "…a named member workspace with no GitHub token is 2" "$rc"
+  mkdir -p "$T/.cc/members/r1"; : > "$T/.cc/members/r1/github-token"
+  rc=0; DEV="$T/dev" HOME="$T" CC_SELF_LAND_REPOS=r1 self_lands r1; [ "$?" = 0 ] || rc=1
+  t "…and once granted a token, that workspace is 0" "$rc"
+  rm -f "$T/dev/r1/.cc/member-workspace" "$T/.cc/members/r1/github-token"
   # A WORKER'S OWN NOTE RIDES IN THE PR (raised-worker-cannot-write-pr-body): pr-body.md in the track's state dir is put
   # between the brief and cc's footer when the PR is opened; without one the body is what it always was.
   mkdir -p "$T/pb/r/t"
@@ -956,7 +961,8 @@ case "${1:-}" in
     if [ "$kind" = main ]; then ensure_main; tmux select-window -t "$(win_id "$a2")"; attach_main; else exec "$SELF" "$a2" "$a3"; fi; exit 0 ;;
   lands)
     # `cc lands <repo>` — the grant TEST, and only the test (self_lands, above): 0 it holds the standing grant · 1 it
-    # does not · 2 it is named but member-facing, which nothing here can land for yet. cc-loop asks it before queueing;
+    # does not · 2 it is named but nothing can land for it (member-facing, or a workspace with no GitHub token).
+    # cc-loop asks it before queueing, and so does cc-checkpoint --sweep for a member workspace's finished track;
     # this command queues nothing, merges nothing and writes nothing, so it is safe from any tier that can run `cc`.
     repo="${2:?repo}"; valid_name "$repo"; self_lands "$repo"; exit $? ;;
   done)
@@ -1168,9 +1174,15 @@ PY
       fi
       case "$card" in *[!\ ]\ *[!\ ]*) echo "card: $card" ;; esac
       prn=${url##*/}; self_lands "$repo"; sl=$?
+      # INSIDE A WORKSPACE'S BOUNDARY the grant cannot be read (~/.cc/config and ~/.cc/members are not bound), so the answer
+      # is not "no" but "the host's": cc-checkpoint --sweep asks `cc lands` on the host and queues the landing for it.
+      inside && sl=3
       case "$sl" in
-        0)  echo "$repo lands its own PRs (CC_SELF_LAND_REPOS): the loop queues PR #$prn — nothing here does, and nothing waits on a 👍. Started by hand? cc-land queue $repo $prn" ;;
-        2)  echo "cc: $repo is named in CC_SELF_LAND_REPOS but is member-facing — nothing here can land for it yet (self_lands says what is missing). PR #$prn waits for a 👍." ;;
+        3)  echo "the host lands this for you: cc-checkpoint --sweep queues PR #$prn within five minutes when this workspace holds the grant (CC_SELF_LAND_REPOS and a GitHub token) — nothing here does, and nothing waits on a 👍" ;;
+        0)  if member_workspace "$repo"; then echo "$repo lands its own PRs (CC_SELF_LAND_REPOS): the host's sweep queues PR #$prn as $repo--$track (cc-checkpoint --sweep, within five minutes) — nothing waits on a 👍. Now? cc-land queue $repo--$track $prn"
+            else echo "$repo lands its own PRs (CC_SELF_LAND_REPOS): the loop queues PR #$prn — nothing here does, and nothing waits on a 👍. Started by hand? cc-land queue $repo $prn"; fi ;;
+        2)  if member_workspace "$repo"; then echo "cc: $repo is named in CC_SELF_LAND_REPOS but is granted no GitHub token (cc-sandbox github $repo) — nothing can land for it. PR #$prn waits for a 👍."
+            else echo "cc: $repo is named in CC_SELF_LAND_REPOS but is member-facing — nothing here can land for it (self_lands says why). PR #$prn waits for a 👍."; fi ;;
         *)  echo "land it with:  cc-land $repo $prn   (gates, merge, card, board, ledger, install, units, restarts — or just 👍 the card to merge)" ;;
       esac
     else echo "PR creation failed (no remote? try: cd $wt && gh pr create --base $base)"; "$BOARD" status "$repo" "$track" review >/dev/null; fi
