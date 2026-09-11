@@ -421,22 +421,77 @@ def pr_state(repo, url, net=True):
 
 
 def branch_prs(repo, branch, net=True):
-    """[(number, STATE)] for the PRs opened FROM <branch>, newest first — the other direction from pr_state(), which
-    starts at a PR a board row already names. None when the answer could not be had (no network, no gh, no checkout
-    to ask from, a call that failed), and None is not "there is no PR": it is no evidence, and the caller falls back
-    to what it can decide without GitHub. Asked from the repo's own checkout — `gh pr list --head` with no repo in
-    front of it reads whatever repo the cwd belongs to, which would answer about the wrong project."""
+    """[(number, STATE, merged_at)] for the PRs opened FROM <branch>, newest first — the other direction from
+    pr_state(), which starts at a PR a board row already names. `merged_at` is epoch seconds for a MERGED one and
+    0.0 for every other state, because WHEN it merged is the difference between a delivery being cleaned up and a
+    leftover (see orphans()). None when the answer could not be had (no network, no gh, no checkout to ask from, a
+    call that failed), and None is not "there is no PR": it is no evidence, and the caller falls back to what it
+    can decide without GitHub. Asked from the repo's own checkout — `gh pr list --head` with no repo in front of
+    it reads whatever repo the cwd belongs to, which would answer about the wrong project."""
     cwd = f"{HOME}/dev/{repo}"
     if not net or not branch or not shutil.which("gh") or not os.path.isdir(cwd):
         return None
     try:
         p = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "10",
-                            "--json", "number,state"], cwd=cwd, capture_output=True, text=True, timeout=20)
+                            "--json", "number,state,mergedAt"], cwd=cwd, capture_output=True, text=True, timeout=20)
         if p.returncode:
             return None
-        return [(int(r["number"]), str(r.get("state") or "").upper()) for r in json.loads(p.stdout or "[]")]
+        return [(int(r["number"]), str(r.get("state") or "").upper(), epoch(r.get("mergedAt")))
+                for r in json.loads(p.stdout or "[]")]
     except Exception:
         return None
+
+
+REVIEW_MARK = "cc-land-review"      # the HTML comment cc-land writes a review down in; the verdict is a FIELD of it
+# The two shapes it writes, ANCHORED AT THE START of the comment exactly as cc-land's own verdict_in() is: a
+# finding that quotes a marker — reviewing anything that reviews, one does — is text about the change, not the
+# answer to it, and matching anywhere let the quote win. The v2 shape carries the change key; the older one is
+# keyed by the head alone and is still honoured.
+VERDICT_RE = (re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} v2 change=[0-9a-f]+[^>]*? head=([0-9a-f]+)"
+                         r"[^>]*? verdict=(LAND-AFTER-FIX|DO-NOT-LAND|LAND)\b"),
+              re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} ([0-9a-f]{{12}}) "
+                         r"(LAND-AFTER-FIX|DO-NOT-LAND|LAND) -->"))
+STOPPING = ("DO-NOT-LAND", "LAND-AFTER-FIX")   # the two verdicts cc-land refuses to merge on, a red gate's equal
+
+
+def refused(repo, url, net=True):
+    """The stopping verdict already recorded on <url>'s CURRENT head — "DO-NOT-LAND" / "LAND-AFTER-FIX" — or "".
+    "" when there is none AND when GitHub could not be asked: a verdict nobody can read is not a refusal, and this
+    only ever silences a nag, so the doubt costs a wake-up and never a merge.
+
+    WHY THE WATCHDOG ASKS AT ALL. "finished, PR open, not landed — review and land it" is the box reading a status
+    and guessing at a next move, and it is the wrong move for a change the box has already read and said no to. PR
+    #404 drew it on 2026-09-11 with DO-NOT-LAND recorded against its head twice — the landing's own re-review and
+    a security read — while a replacement row was already building the fix: a wake-up and a turn to say no, and a
+    less careful seat would have queued a refused change for deploy. `OPEN` was all this rule read, and a PR state
+    is not a verdict.
+
+    THE HEAD IS HALF THE ANSWER. A verdict is about a CHANGE, so the push that answers it spends it: once the head
+    moves the PR is unread again and "land it" is the right offer. Only a marker written about the head the PR is
+    at NOW counts, and of those the LAST stands — cc-land lets a stricter verdict be written over one that already
+    does, so the newest is the one in force.
+
+    Asked only about a row that is otherwise about to be nagged, which is a handful a run at most."""
+    if not net or not url or not shutil.which("gh"):
+        return ""
+    cwd = f"{HOME}/dev/{repo}"
+    try:
+        p = subprocess.run(["gh", "pr", "view", str(url), "--json", "headRefOid,comments"],
+                           cwd=cwd if os.path.isdir(cwd) else None, capture_output=True, text=True, timeout=20)
+        if p.returncode:
+            return ""
+        j = json.loads(p.stdout or "{}")
+        head = str(j.get("headRefOid") or "")
+        if not head:
+            return ""
+        out = ""
+        for c in j.get("comments") or []:
+            m = next((x for x in (r.match(str(c.get("body") or "")) for r in VERDICT_RE) if x), None)
+            if m and head.startswith(m.group(1)):
+                out = m.group(2)                    # the last marker about this head is the one that stands
+        return out if out in STOPPING else ""
+    except Exception:
+        return ""
 
 
 def alert(msg):
@@ -942,8 +997,17 @@ def orphans(repos, net=True, grace=GRACE, busy=None):
     `grace` (the same window a new track gets to appear in), its branch has an OPEN PR, or its branch's PR is one
     somebody is landing — landing(), the same reader #429 gave the PR nag: a job file, a live cc-land argv, or a
     work record between two rounds. The queue LOG is not consulted: it keeps every landing this box ever ran, so a
-    PR merged last week would read as in flight forever. Nothing else is forgiven — with no network the branch
-    cannot be looked up and the worktree is reported exactly as it always was."""
+    PR merged last week would read as in flight forever.
+
+    …AND A FIFTH: A MERGE THAT HAS JUST HAPPENED, which is the one the four above still missed. The merge, the
+    worktree's removal and this pass race each other, and between them there are minutes in which the PR is no
+    longer OPEN, the landing has taken its job file and its work record with it, and the directory is still there.
+    A person was paged about exactly that on 2026-09-11: PR #434 merged at 16:29:43Z and the 16:31:29Z pass called
+    its worktree one the board had never heard of, 106 seconds later. So a MERGED PR forgives the worktree for
+    BETWEEN_ROUNDS — the same window a landing's own gaps get — and no longer: a worktree still sitting there an
+    hour after its PR landed is a leftover somebody should clear, and saying so is this rule's whole job. Nothing
+    else is forgiven — with no network the branch cannot be looked up and the worktree is reported exactly as it
+    always was."""
     known, claimed = set(), set()
     for fn, d in boards():
         if d is None:
@@ -954,7 +1018,7 @@ def orphans(repos, net=True, grace=GRACE, busy=None):
             wt = (tr or {}).get("worktree")              # a row may name a directory of its own: that is a board entry too
             if wt:
                 claimed.add(os.path.realpath(os.path.expanduser(wt)))
-    out, asked = [], 0
+    out, asked, t0 = [], 0, now()
     for p in sorted(glob.glob(f"{WTS}/*/*")):
         repo, track = p.split(os.sep)[-2:]
         if not ccboard().real(repo):                    # a suite's `_cc<suite><pid>` scaffolding (a leaked `_ccsbx<pid>` was
@@ -974,7 +1038,8 @@ def orphans(repos, net=True, grace=GRACE, busy=None):
             prs = branch_prs(repo, wt_branch(p), net)
         if prs:
             busy = landing() if busy is None else busy  # one process-table read a run, and only with a PR to match
-            if any(st == "OPEN" or (repo, n) in busy for n, st in prs):
+            if any(st == "OPEN" or (repo, n) in busy or (st == "MERGED" and t0 - at <= BETWEEN_ROUNDS)
+                   for n, st, at in prs):
                 continue
         out.append((repo, track, ("ask", None, "a worktree with no board entry")))
     return out
@@ -1229,6 +1294,12 @@ def main(argv):
                 continue
             busy = landing() if busy is None else busy   # one process-table read a run, and only with something pending
             if (repo, pr_number(f.get("pr"))) in busy:
+                continue
+            if refused(repo, f.get("pr"), net):
+                # …AND A PR THE BOX HAS ALREADY REFUSED IS NOBODY'S TO NAG EITHER, on the same terms as `held`
+                # above: no offer, no page, and no memo kept, so the PR is news again — once — when a push moves
+                # the head past the verdict. See refused(); the alternative is telling a session, on a schedule
+                # and in the box's own voice, to land a change the box itself said must not land.
                 continue
             first = float(old.get(k) or 0) or t0          # first seen pending, carried across runs
             last, stood = float(old.get(ak) or 0), t0 - first    # `held` is taken above, and means something else
@@ -2119,6 +2190,48 @@ def selfcheck():
            "finding was not lost", offered() == o2 + 1)
         json.dump({}, open(seenp, "w"))
 
+        # A PR THE BOX HAS ALREADY READ AND REFUSED IS NOT ONE TO "REVIEW AND LAND". PR #404 was offered to its
+        # session at 16:3xZ on 2026-09-11 with DO-NOT-LAND recorded against its head twice — the landing's own
+        # re-review and a security read — while a replacement row was already building the fix. `OPEN` was all
+        # this rule ever read, it cost a wake-up and a turn to say no, and a less careful seat would have queued a
+        # refused change for deploy. Own fixture, clean ledger, and a `gh` that answers the verdict question the
+        # way GitHub does, so nothing but the verdict can be the reason.
+        vj, HD = f"{th}/verdict.json", "09dd584c561e9e18d3025a8db244809f9d5b776a"
+        open(f"{th}/gh", "w").write(f'#!/bin/sh\ncase "$*" in\n  *headRefOid*) cat {vj} ;;\n  *) echo OPEN ;;\nesac\n')
+        os.chmod(f"{th}/gh", 0o755)
+        mark = f"<!-- cc-land-review v2 change=369953f4b8fd base=a178c4925378 head={HD[:12]} verdict=%s by=w -->"
+
+        def verdicts(*bodies):
+            """Offers made in one run with exactly these comments on the PR, off a clean ledger."""
+            json.dump({"headRefOid": HD, "comments": [{"body": b} for b in bodies]}, open(vj, "w"))
+            json.dump({}, open(seenp, "w"))
+            o_ = offered()
+            subprocess.run(argvP, env=penv, capture_output=True, text=True, timeout=120)
+            return offered() - o_
+
+        ok("end to end: a PR with DO-NOT-LAND recorded against the head it is at NOW is never offered as 'review "
+           "and land it' — the box read this change and said no, and the PR state is not the verdict",
+           verdicts(mark % "DO-NOT-LAND" + "\n1. a.py:1 — the finding") == 0)
+        ok("end to end: …and no memo is kept for it, so the PR is news again, once, when the head moves past the "
+           "verdict", not any("t2" in k for k in json.load(open(seenp))))
+        ok("end to end: LAND-AFTER-FIX stops a landing exactly as DO-NOT-LAND does, so 'review and land it' is "
+           "the wrong move for it too — the remedy is the fix that verdict names",
+           verdicts(mark % "LAND-AFTER-FIX") == 0)
+        ok("end to end: the older head-keyed marker shape is read the same way — a verdict recorded before the "
+           "change key existed is still a refusal",
+           verdicts(f"<!-- cc-land-review {HD[:12]} DO-NOT-LAND -->") == 0)
+        ok("end to end: a verdict about a head the PR has moved PAST is spent: the push answered it, the change "
+           "is unread again and landing it is the right offer",
+           verdicts("<!-- cc-land-review v2 change=1 base=2 head=ffffffffffff verdict=DO-NOT-LAND by=w -->") == 1)
+        ok("end to end: a LAND standing on this head silences nothing — that is the watchdog's line being right",
+           verdicts(mark % "LAND") == 1)
+        ok("end to end: …and a finding that QUOTES a marker is text about the change, not the answer to it: the "
+           "read is anchored at the start of the comment, as cc-land's own is",
+           verdicts("1. cc-land:9 — a comment that starts " + mark % "DO-NOT-LAND") == 1)
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        os.chmod(f"{th}/gh", 0o755)
+        json.dump({}, open(seenp, "w"))
+
         victim = subprocess.Popen(["sleep", "60"], start_new_session=True)   # its own group, so nothing else is in range
         ended = end_it([victim.pid])
         try:
@@ -2194,6 +2307,16 @@ def selfcheck():
         ok("…but one whose branch has an OPEN PR is a delivery in flight — the builder's worktree is named for its "
            "branch, so no row will ever carry that name, and the offer is a wake-up that finds nothing to do",
            not orphaned('[{"number":9,"state":"OPEN"}]', "--grace", "0"))
+        ok("…and one whose PR MERGED a minute ago is that same delivery landing: the merge, the worktree's removal "
+           "and this pass race each other, and a person was paged about a worktree whose PR had merged 106 s "
+           "before the run (2026-09-11)",
+           not orphaned('[{"number":9,"state":"MERGED","mergedAt":"%s"}]'
+                        % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - 60)), "--grace", "0"))
+        ok("…while one merged longer ago than a landing's own gap is a leftover nothing is coming back for, and "
+           "is reported as a worktree with no board entry always was",
+           orphaned('[{"number":9,"state":"MERGED","mergedAt":"%s"}]'
+                    % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - BETWEEN_ROUNDS - 60)),
+                    "--grace", "0"))
         ok("…while a PR that is closed and nobody is landing leaves the worktree a leftover again: reported",
            orphaned('[{"number":9,"state":"CLOSED"}]', "--grace", "0"))
         os.makedirs(f"{th}/.cc/state/land", exist_ok=True)
