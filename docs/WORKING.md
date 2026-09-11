@@ -21,12 +21,15 @@ may take on is this file's:
   owner and does nothing else: no dispatch, no subagent, no goals turn.
 - **essential** — only rows marked critical start (`cc board set <repo> <row> critical yes`), one at a time,
   on the cheapest model that holds, one review each. A task the owner asks for is marked critical by whoever
-  dispatches it. No goals turn, no work the box finds itself.
+  dispatches it. No goals turn, no work the box finds itself — a self-improvement trial and a failure
+  investigation wait with everything else.
 - **moderate** — take on what you find yourself only when it is important or cheap. What waits: a new orch, a
-  worker with `--loop` above 1, an exploration row, a self-improvement trial, a review-into-work round — ask
-  `cc-tier allows explore` before dispatching one of those, and `cc-tier allows goals` before a goals turn.
+  worker with `--loop` above 1, an exploration row, a self-improvement trial, a failure investigation, a
+  review-into-work round — ask `cc-tier allows explore` before dispatching one of those, and `cc-tier allows
+  goals` before a goals turn.
 - **autonomous** — as until now: discover, fix, explore.
-Never blocked by any tier: answering the owner, a task he asked for, a landing already past its gates. A tier
+Never blocked by any tier: answering the owner, a task he asked for, a landing already past its gates, or
+recording to a board — a finding, a raised- row, a backlog note. A tier
 flip signals no running iteration — it finishes, and the next one asks. Read it: `cc-tier`, `cc digest`, Home.
 
 ## the standard
