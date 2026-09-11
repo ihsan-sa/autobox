@@ -447,6 +447,16 @@ claim_delivered(){   # …and for a SUBAGENT the thing that ends it is delivery:
 
 done_write(){ "$BIN/cc-task" "$1" "$repo" "$track" --generation "$done_generation" "${@:2}" >/dev/null || exit 1; }
 done_fail(){ done_write error "$1" "$2"; echo "cc: $2"; exit 1; }
+pr_body(){   # the PR's body: the brief, the worker's own note when it left one, then cc's footer.
+  # A WORKER SETS ITS PR BODY THROUGH THE DOOR THAT OPENS THE PR (raised-worker-cannot-write-pr-body, 2026-09-10):
+  # `gh pr edit --body-file` dies on a projectCards deprecation and sets nothing, and the API patch and a PR comment
+  # are both gated, so a note the lander had to read ("cc-slackd needs a restart after merge") went to the board.
+  # It is $STBASE/<repo>/<track>/pr-body.md — the track's own state dir, which the worker already writes — read here
+  # when the PR is opened; a file written after that changes nothing.
+  local instr="$1" repo="$2" track="$3" note=""
+  [ -s "$STBASE/$repo/$track/pr-body.md" ] && note=$(printf '\n\n---\n%s' "$(cat "$STBASE/$repo/$track/pr-body.md")")
+  printf '%s%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$note" "$track" "$repo" "$track"
+}
 done_project(){
   local rec status pr chat ts extra
   rec=$("$BIN/cc-task" receipt "$repo" "$track") || exit 1
@@ -809,6 +819,14 @@ print(",".join(p.get_filename() or "" for p in m.iter_attachments()))' "$T/posts
   rc=0; ask "\"attachment\": [\"$T/dev/proj/report.txt\"]" >/dev/null; [ "$?" = 2 ] && has "$(cat "$T/err")" "unknown key attachment" || rc=1
   t "…and a mistyped key is refused by name (exit 2) rather than dropped" "$rc"
   kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+  # A WORKER'S OWN NOTE RIDES IN THE PR (raised-worker-cannot-write-pr-body): pr-body.md in the track's state dir is put
+  # between the brief and cc's footer when the PR is opened; without one the body is what it always was.
+  mkdir -p "$T/pb/r/t"
+  rc=0; [ "$(STBASE="$T/pb" pr_body BRIEF r t)" = "$(printf 'BRIEF\n\n---\nOpened by cc from track t. Review before merge.\nJournal: ~/.cc/state/r/t/progress.md')" ] || rc=1
+  t "cc done: with no pr-body.md the PR body is the brief and the footer, unchanged" "$rc"
+  printf 'cc-slackd needs a restart after merge\n' > "$T/pb/r/t/pr-body.md"
+  rc=0; case "$(STBASE="$T/pb" pr_body BRIEF r t)" in "BRIEF"$'\n\n'"---"$'\n'"cc-slackd needs a restart after merge"$'\n\n'"---"$'\n'"Opened by cc from track t."*) ;; *) rc=1;; esac
+  t "cc done: the worker's pr-body.md rides in the PR between the brief and the footer" "$rc"
   printf 'cc selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]
 }
@@ -1101,7 +1119,7 @@ PY
         exit 0
       fi
       if [ "$done_managed" = 1 ]; then done_write error pr "PR create response pending; retry lookup by repository and head"; fi
-      url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$(printf '%s\n\n---\nOpened by cc from track %s. Review before merge.\nJournal: ~/.cc/state/%s/%s/progress.md' "$instr" "$track" "$repo" "$track")" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
+      url=$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$(pr_body "$instr" "$repo" "$track")" 2>&1 | grep -oE 'https://github.com/[^ ]+' | head -1)
       crc=$?; [ "$done_managed" = 0 ] || { [ "$crc" = 0 ] && [ -n "$url" ]; } || done_fail pr "PR creation failed or response lost — retry cc done"
     fi
     "$BIN/cc-scope" check "$repo" --track "$track" 2>/dev/null   # 'done' measured against what was asked: the unsettled asks this track was meant to close, printed where the session still sees them. Never fatal — a ledger does not get to block a PR

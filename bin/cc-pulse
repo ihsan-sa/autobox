@@ -58,7 +58,9 @@ is (the one exception is a row carrying an `agent` mark, below, which costs one 
     the rest; it is silent when nothing could start, and nothing here dispatches anything. That headline may say
     the answer is WITHHELD — a row in flight that nothing can place makes every "free" unsafe, and cc-brief says
     which row to give a branch to; withheld wakes the seat, because giving that row a branch is the work. It
-    reaches GitHub for those rows only, which is the one call in this tick that leaves the box.
+    reaches GitHub for those rows only, which is the one call in this tick that leaves the box. On a BOX-WIDE
+    USAGE LIMIT (cc-limit's stamp with two observers) no row can start, so the tick says that and until when,
+    asks cc-brief nothing, and wakes nobody for room that is not there.
   · a row a LIVE session is doing in its own subagents is in flight, not work waiting to be picked up. It has
     no worker and no worktree anyone holds, so `queued` was offered for dispatch on every tick; the session
     marks it (`cc board set <repo> <track> agent me`) and the mark holds while that tmux window holds a
@@ -643,7 +645,17 @@ def due(target):
     # paragraph above. That flag moves when the ROOM opens or closes and at no other time, so it costs a wake
     # when a row becomes startable and nothing when a live branch commits one more file.
     could, start = "", "none"
-    if ready:
+    # NOTHING STARTS ON A BOX-WIDE USAGE LIMIT. cc-limit's stamp with two observers parks every worker at launch,
+    # so "2 of 3 queued rows could start now" is false for as long as it stands — on 2026-09-09 a worker was
+    # dispatched on that line, hit the limit ten minutes in, and was dispatched again by hand fourteen hours later.
+    # cc-limit owns the test (`status`: exit 0 = the stamp binds; "(this run only)" = one run's, not the box's),
+    # and the room is not measured at all: the answer would be the same and the line would repeat every tick.
+    lim = sh(f"{BIN}/cc-limit", "status", timeout=30) if ready else None
+    parked = lim is not None and lim.returncode == 0 and "(this run only)" not in (lim.stdout or "")
+    if parked:
+        could = (f"{len(ready)} queued row{'' if len(ready) == 1 else 's'}, none can start — the box is on the "
+                 + (lim.stdout or "").strip().split(" [")[0] + " (cc-limit)")
+    elif ready:
         out = sh(f"{BIN}/cc-brief", "ready", repo, *ready, timeout=120)
         # A TOOL THAT COULD NOT ANSWER IS NOT A TOOL SAYING "NO ROOM", and a crash is that as much as a timeout
         # is — the non-zero exit was read as an empty answer, so a broken cc-brief read as "no room" and every
@@ -669,7 +681,7 @@ def due(target):
         (f"{asks} owner ask{'' if asks == 1 else 's'} open" if asks > 0 else
          "cc-scope could not count the open asks" if asks < 0 else ""),
         f"{len(ready)} row{'' if len(ready) == 1 else 's'} queued/blocked ({', '.join(ready[:3])})" if ready else "",
-        f"{could} (cc-brief ready {repo})" if could else "",
+        could if parked else f"{could} (cc-brief ready {repo})" if could else "",
         f"{len(aloft)} row{'' if len(aloft) == 1 else 's'} in flight ({', '.join(aloft[:3])})" if aloft else "",
     ])) or "no red main, no open ask, no row queued or in flight — goals are the work"
     # …plus the owner's 📌 list, on whichever tick goes out. It is in the NOTE and never in `look`, `anything` or
@@ -1216,8 +1228,8 @@ def selfcheck():
         # ---- --dry touches nothing at all
         run("--dry")
         ok("--dry starts no session and wakes nobody", "cc " not in did() and "msg " not in did())
-        ok("--dry only reads: its one call, the limit test, is made dry as well",
-           all(ln.startswith("limit record --dry ") for ln in did().splitlines()))
+        ok("--dry only reads: its one call, the limit test, is made dry as well (and `status` is a read)",
+           all(ln.startswith("limit record --dry ") or ln == "limit status" for ln in did().splitlines()))
         ok("--dry writes no log, and no goals skeleton either",
            not os.path.exists(LOG) and not os.path.exists(f"{STATE}/alpha/goals.md"))
 
@@ -1461,6 +1473,19 @@ def selfcheck():
         d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}, "t3": {"status": "queued"}})
         ok("…and NOTHING is said when nothing could start: no clause, no count, no pointer",
            "could start now" not in d and "cc-brief ready" not in d and "3 rows queued/blocked" in d)
+        # …AND NOTHING COULD START ON A BOX-WIDE USAGE LIMIT, whatever cc-brief's arithmetic would say: the stamp
+        # parks every worker at launch (2026-09-09: one dispatched on "could start now", dead ten minutes in).
+        os.environ["CC_FAKE_READY"] = "beta: 2 of 3 queued rows could start now — 1 group shares a file"
+        os.environ["CC_FAKE_BOX_LIMIT"] = "22:00Z"
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}, "t3": {"status": "queued"}})
+        ok("on a box-wide usage limit the tick says no row can start, and until when — never 'could start now'",
+           "could start now" not in d and "none can start" in d and "usage limit until 22:00Z" in d)
+        ok("…and cc-brief ready is not asked: the room is the same until the limit lifts",
+           "cc-brief ready" not in d)
+        os.environ.pop("CC_FAKE_BOX_LIMIT", None)
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "queued"}, "t3": {"status": "queued"}})
+        ok("…and the same board with the limit lifted says the rows could start again", "2 of 3 queued rows could start now" in d)
+        os.environ["CC_FAKE_READY"] = ""
 
         # A ROW A LIVE SESSION IS DOING IN ITS OWN SUBAGENTS is work in flight, not work waiting to be picked up.
         # Nothing on the box holds its worktree — no worker, no cc-loop, no window of its own — so `queued` read
@@ -1948,7 +1973,7 @@ def selfcheck():
         ok("--dry-run names who would be woken and what the files say, and writes nothing at all — no tick, no "
            "log, no mark, and the one call it does make (the limit test) is made dry too",
            rc == 0 and "would wake" in buf.getvalue() and "1 row queued/blocked (t1)" in buf.getvalue()
-           and all(ln.startswith("limit record --dry ") for ln in did().splitlines())
+           and all(ln.startswith("limit record --dry ") or ln == "limit status" for ln in did().splitlines())
            and since(L0) == "" and not os.path.exists(f"{STATE}/beta/pulse.look"))
 
         # ---- the log is the record, and it is bounded
@@ -2022,6 +2047,10 @@ FAKE_LIMIT = r"""#!/usr/bin/env bash
 # an hour, which the real thing reads as scrollback. Records the call, so --dry can be shown to stay dry.
 set -u
 printf 'limit %s\n' "$*" >> "$CC_FAKE_CALLS"
+# `cc-limit status`: the box-wide stamp, when $CC_FAKE_BOX_LIMIT names a reset ("HH:MMZ"); "clear" + exit 1 otherwise.
+if [ "${1:-}" = status ]; then
+  [ -n "${CC_FAKE_BOX_LIMIT:-}" ] && { printf 'usage limit until %s (30m left)\n' "$CC_FAKE_BOX_LIMIT"; exit 0; }
+  echo clear; exit 1; fi
 tgt=""; for a in "$@"; do tgt="$a"; done          # the target is the last argument
 case " ${CC_FAKE_LIMITED:-} " in *" $tgt "*) exit 0;; esac
 case " ${CC_FAKE_LIMIT_SEEN:-} " in *" $tgt "*) exit 2;; esac

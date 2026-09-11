@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """cc-context — how full a Claude session's context REALLY is, read off its own transcript.
 
-  cc-context                       the session running in $PWD (newest transcript for this cwd)
+  cc-context                       the session this runs inside ($CLAUDE_CODE_SESSION_ID), else the newest
+                                   transcript for this cwd
   cc-context <repo> <track>        that track's session (session id from the board)
   cc-context <address>             one session by its ADDRESS — `<repo>` a session a person steers,
                                    `<repo>@<alias>` an orchestrator, `<repo>/<track>` a track. An orch owns no
@@ -474,6 +475,15 @@ def resolve(repo=None, track=None, sid=None, cwd=None):
     """-> (transcript_path, session_id) or (None, None)."""
     if sid:
         return transcript_for_session(sid), sid
+    if not (repo and track):
+        # A BARE RUN FROM INSIDE A SESSION IS ABOUT THAT SESSION. The harness exports its id into every tool
+        # call it makes, and "the newest transcript for this cwd" is whichever of two sessions sharing the
+        # directory wrote last: during an overlap the successor's first `cc-context` reported the
+        # predecessor's 154k / 15% "hand off" as its own (2026-09-09, raised-handoff-fires-on-a-stale-session-id).
+        mine = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+        p = transcript_for_session(mine) if mine else None
+        if p:
+            return p, mine
     if repo and track:
         sid = board_get(repo, track, "session_id")
         p = transcript_for_session(sid) if sid else None
@@ -820,8 +830,9 @@ def record(payload):
     repo, track = track_of(root or cwd or "")
     if not repo and cwd and os.path.dirname(os.path.realpath(cwd)) == os.path.expanduser("~/dev"):
         repo = os.path.basename(os.path.realpath(cwd))   # a planning session: ~/dev/<repo>, no track marker
+    name = session_name(repo, track)
     m.update({"cwd": cwd, "repo": repo, "track": track, "level": level_of(m["used"], m["window"]),
-              "name": shown(session_name(repo, track)), "target": address(repo, track)})
+              "name": shown(name), "target": address(repo, track)})
     os.makedirs(RECORDS, exist_ok=True)
     p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
     was = {}
@@ -838,6 +849,17 @@ def record(payload):
     # THE ADDRESS, not the bare repo: `<repo>` and `<repo>@<alias>` are two live sessions in one worktree, and
     # under one key each was told about the other's crossing and gated by the other's overlap.
     target = m["target"]
+    # THE CROSSING IS THIS SESSION'S OWN WINDOW'S, OR IT IS NOBODY'S HANDOFF. address() falls back to the repo
+    # when the window is named for something else, so the record stays findable — but the event opens an overlap
+    # on the TARGET's window, and the session in that window is then somebody else: 2026-09-09 04:26Z the `box`
+    # window's session (cwd ~/dev/<repo>) crossed 22%, and cc-handoff recorded the `<repo>` window's session — a
+    # different one, at 9% — as the predecessor to retire (raised-handoff-fires-on-a-stale-session-id). The
+    # suffix comes off exactly as address() takes it off: both sides of a handoff measure as their target.
+    own = name
+    for suf in SUFFIXES:
+        if own.endswith(suf):
+            own = own[:-len(suf)]
+    own = (own == target)
     # no window = a headless worker: its loop is its handoff. So is a cc-loop ITERATION that happens to have
     # one — the loop occupies the track's window while the session inside it is headless (worker).
     live = bool(repo) and have_window(target) and not worker()
@@ -870,8 +892,8 @@ def record(payload):
     # …and never from a worker either: cc-handoff refuses it a phase (its `worker`), so forking that process
     # every turn, for what is a large share of this box's sessions, only buys a "no". Same cheap half of the
     # rule as mid_handoff above — the authoritative half stays over there.
-    if repo and not mid_handoff() and not worker() and ((fresh and lvl != "journal") or retry
-                                                       or overlap_open(target)):
+    if repo and own and not mid_handoff() and not worker() and ((fresh and lvl != "journal") or retry
+                                                               or overlap_open(target)):
         act = event(target, m, lvl or "", busy or "", live, taken, retry)
     if fresh or retry:
         kind = (lvl + "-retry") if (retry and not fresh) else lvl
@@ -1129,6 +1151,9 @@ def selfcheck():
                                       "cache_read_input_tokens": cr, "output_tokens": out}}}
 
     env0 = os.environ.pop("CC_CTX_WINDOW", None)
+    sid0 = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)   # resolve() reads it: the session RUNNING the test is not a fixture
+    pane0 = os.environ.pop("TMUX_PANE", None)  # …nor is its window: record() now asks whether the crossing's window is the
+                                               # target's own, and the pane running the test is never a fixture's
     box0 = os.environ.get("CC_CTX_BOX_MODEL")
     os.environ["CC_CTX_BOX_MODEL"] = ""        # hermetic: what THIS box runs must not decide a fixture's window
     role0 = os.environ.pop("CC_ROLE", None)    # a --go worker runs these gates as often as a session does, and
@@ -1215,7 +1240,7 @@ def selfcheck():
 
     # records: written from a Stop payload, read back newest-first per track
     with tempfile.TemporaryDirectory() as d:
-        global RECORDS, HANDOFF, STATE
+        global RECORDS, HANDOFF, STATE, PROJECTS, session_name
         keeps, STATE = STATE, os.path.join(d, "state")     # mark_journal writes a real file: not the box's
         keep, RECORDS = RECORDS, os.path.join(d, "context")
         keeph, HANDOFF = HANDOFF, os.path.join(d, "handoff")   # mid_handoff() reads <id>.done from here: a
@@ -1658,6 +1683,24 @@ def selfcheck():
            "planning or windowless session with work in flight has no loop coming to continue it",
            "PENDING" in (r.get("say") or "") and "END YOUR TURN" not in (r.get("say") or ""))
         live[0] = True
+        # ---- 2026-09-09 04:26Z: a session in a window named for something else (`box`, cwd ~/dev/<repo>) crossed
+        # its line, the crossing was addressed to `<repo>` by the fallback, and the overlap retired the session
+        # that actually sat in the `<repo>` window. The record still says what it said; the event does not go.
+        sn0 = session_name
+        try:
+            session_name = lambda repo, track: "box"
+            n, ne = len(started), len(events)
+            r = at(420000, "sid-18")
+            ok("a crossing in a window that is not the target's own opens nothing: no event, no successor, and "
+               "the session is told rather than handed off",
+               len(started) == n and len(events) == ne and not r["handed_off"] and r["target"] == "repo1/track1"
+               and r["name"] == "box" and bool(r.get("say")))
+            session_name = lambda repo, track: "repo1/track1~next"
+            r = at(420000, "sid-19")
+            ok("…while a side of a handoff in flight is still its target's window, suffix and all, and its "
+               "crossing still goes out", len(events) == ne + 1 and events[-1][0] == "repo1/track1")
+        finally:
+            session_name = sn0
 
         on[0] = False
         os.remove(os.path.join(wt, "dirty.txt"))
@@ -1706,6 +1749,10 @@ def selfcheck():
 
     if env0 is not None:
         os.environ["CC_CTX_WINDOW"] = env0
+    if sid0 is not None:
+        os.environ["CLAUDE_CODE_SESSION_ID"] = sid0
+    if pane0 is not None:
+        os.environ["TMUX_PANE"] = pane0
     if cfg0 is None:
         os.environ.pop("CC_CONFIG", None)
     else:
@@ -1770,6 +1817,29 @@ def selfcheck():
             rc = main(["--true"])
         ok("--true with no target is an error: it types at a keyboard, and the one keyboard it must never type "
            "at is its own caller's", rc == 2 and "needs a target" in err.getvalue())
+        # …and a bare run from INSIDE a session is about that session, not about whichever of two sessions in
+        # its cwd wrote last: the successor's first `cc-context` during an overlap reported the predecessor's
+        # number as its own (2026-09-09). The harness exports the id; with it unset the cwd's newest still answers.
+        pj0, PROJECTS = PROJECTS, os.path.join(d, "projects")
+        try:
+            cw = os.path.join(d, "two-sessions")
+            os.makedirs(cw, exist_ok=True)
+            pd = os.path.join(PROJECTS, re.sub(r"[/.]", "-", os.path.realpath(cw)))
+            os.makedirs(pd, exist_ok=True)
+            for nm, mt in (("sid-mine", 1000), ("sid-theirs", 2000)):     # theirs is the NEWER transcript
+                fp = os.path.join(pd, nm + ".jsonl")
+                open(fp, "w").write("{}\n")
+                os.utime(fp, (mt, mt))
+            os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-mine"
+            mine = resolve(cwd=cw)
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            theirs = resolve(cwd=cw)
+            ok("a bare run inside a session measures THAT session's transcript, though another in the same cwd "
+               "wrote later", mine[1] == "sid-mine" and mine[0].endswith("sid-mine.jsonl"))
+            ok("…and with no session id in the environment the cwd's newest transcript still answers",
+               theirs[1] == "sid-theirs")
+        finally:
+            PROJECTS = pj0
         # …and the FALLBACK belongs to the target too. No --transcript here: this is the documented bare form,
         # and resolve() with nothing to go on returns the newest transcript for whatever cwd this process is in.
         globals()["pane_ask"] = lambda target, cmd="/context": None

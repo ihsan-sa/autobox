@@ -8,6 +8,8 @@
                                       ~/dev/<repo> → <repo>, a track worktree (.cc/track) → <repo>/<track>, ~/dev or ~ → box
   cc-slack inject [--no-start] <target> "text"      push a message into a session as if it came from Slack (tests/scripts)
   cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--mention] [--major] "text"   post as the bot (cc-notify uses --route).
+                                      An unknown flag is an error (exit 2), never text. A session's -c '#name' post into
+                                      ANOTHER session's channel is handed to that session (Daemon.wake); --route never is.
                                       --ts = the message this answers; naming a mail's line in its mirror thread mails the post
                                       --mention = the top of the notification ladder: the MAIN channel (never the -updates
                                       lane) and an @-mention of the owner. For a blocked decision only — see ~/COMMS.md
@@ -4040,6 +4042,7 @@ class Daemon:
         self.warned, self.told = set(), {}
         self.warned_users = set()                           # non-owners told once per daemon run that DMs are owner-only
         self.starting = {}
+        self.unminted = set()                                # targets whose last `starting` stamp was an unminted attempt
         self.pending = {}                                   # "tmux" -> expiry (unix time) of an armed !restart tmux confirm
         self.names, self.users = {}, {}
         self.noticed = {}                                   # (target, text) -> t of the last join/left notice (reconnects repeat them)
@@ -4170,18 +4173,49 @@ class Daemon:
         whole tree is bound rw inside her boundary (cc-sandbox) — so `~/dev/<handle>/.cc/track` saying "<control
         repo> <track>" handed any process standing in it the control repo's name, and with it the answer to every
         member's 🔐 prompt. Authority never comes from a file the asker can write."""
+        seat = self.peer_seat(peer, member)
+        return seat[0] if seat else None
+
+    def peer_seat(self, peer, member=None):
+        """peer_session's answer with the alias beside it: (target, alias) — an orch and its repo's main session share a
+        target and are told apart by nothing else. None when no live subscription owns the caller."""
         if member or not peer or peer[1] != os.getuid():
             return None
         with self.lock:
-            conns = [(t, c.info.get("pid")) for t, v in self.subs.items() for c in v if not c.info.get("member")]
+            conns = [(t, c.info.get("alias") or None, c.info.get("pid")) for t, v in self.subs.items() for c in v
+                     if not c.info.get("member")]
         for a in pid_line(peer[0]):                     # nearest first: the innermost session owning the caller wins
-            for t, pid in conns:
+            for t, alias, pid in conns:
                 if pid and pid > 1 and (pid == a or (pid_line(pid)[1:2] or [0])[0] == a):
-                    return t
+                    return t, alias
         return None
 
+    def wake(self, chat, ts, thread, text, peer):
+        """{"wake": chat, "ts": …, "thread_ts": …, "text": …} from `cc-slack post -c '#name'`: ONE SESSION'S WORD IN
+        ANOTHER SESSION'S CHANNEL IS HANDED TO THAT SESSION. Our own post's event is dropped by on_event (it is our
+        word), so a hand-off the planning seat posted into an orch's #<repo>-<alias>-xxxx started nothing there and the owner did
+        it by hand (2026-09-11, raised-a-box-post-does-not-wake-a-channel-session). Only a caller that IS a session
+        (peer_seat) wakes anything — machinery's --route posts and a bare shell's do not — and only a channel that
+        is somebody else's: a session's post into its own lane is not a message to itself. The session answers in
+        the post's own thread, so the meta names the real message; the author is the box, never a claimed identity."""
+        target = self.route(chat, "im" if str(chat).startswith("D") else None)
+        if not target or str(chat).startswith("D"):
+            return {"ok": True, "result": "no-session"}
+        alias = self.chan_alias(chat)
+        seat = self.peer_seat(peer)
+        if not seat:
+            return {"ok": True, "result": "not-a-session"}
+        if seat == (target, alias):
+            return {"ok": True, "result": "own"}
+        name = self.chan_name(chat)
+        meta = {"chat_id": chat, "thread_ts": thread or ts, "ts": ts, "user": "box", "role": "owner",
+                "channel": "#" + (name or str(chat)), "target": target, "from": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
+        res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=alias)
+        log(f"wake {target}{'@' + alias if alias else ''} from {meta['from']}: {res}")
+        return {"ok": True, "result": res, "target": target}
+
     MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project")
-    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "mail")
+    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "mail", "wake")
 
     def verbs_of(self, first):
         """Every recognised verb key in a request. EXACTLY ONE is allowed, because exactly one is authorised: the
@@ -4422,6 +4456,10 @@ class Daemon:
                 c.sendall((json.dumps({"ok": True, "slack": self.use_slack, "connected": self.connected, "bot_user": self.bot_user,
                                        "owner": self.cfg.get("SLACK_OWNER_ID") or None, "pair_code": self.pair_code,
                                        "subs": subs, "queued": queued, "uptime": int(time.time() - self.t0)}) + "\n").encode())
+            elif verb == "wake":         # {"wake": chat, "ts":…, "thread_ts":…, "text":…} — a session's post into another session's channel
+                res = self.wake(str(first["wake"] or ""), str(first.get("ts") or ""), first.get("thread_ts") or None,
+                                str(first.get("text") or ""), self.peer_of(c))
+                c.sendall((json.dumps(res) + "\n").encode())
             elif verb == "permission":   # {"permission": "<request_id>", "answer": "yes"|"no"} — the SAME path a Slack
                 # `yes <id>` takes, for the session that reads the -threads lane: it can answer without a round trip
                 # through the owner's phone. WHO answered is peer_session's to say — this socket and a live
@@ -4568,8 +4606,9 @@ class Daemon:
             return "live-no-channel"                    # something runs there (session without the channel, or a --go worker)
         if track_missing(target) and not workspace_of(target):   # a member's project has a board row and no worktree yet: cc makes it, inside its own workspace
             return "no-track"                           # #repo--typo: `cc repo typo` would create the track — never from Slack
-        if time.time() - self.starting.get(target, 0) < 90:
-            return state
+        if time.time() - self.starting.get(target, 0) < 90 and not (state == "starting" and target in self.unminted):
+            return state                                # an unminted attempt opened nothing: the first start after the
+                                                        # mint does not sit out its cooldown (2026-09-10, #ece298a)
         # A MESSAGE NEVER STARTS A TRACK'S SESSION (2026-09-06). A `--go` worker's window is gone the moment it
         # finishes, so `cc <repo> <track>` here would put a fresh interactive session on a worktree whose work is
         # done — one nobody asked for, on a branch that may already be merged. The message is not dropped: the
@@ -4578,6 +4617,7 @@ class Daemon:
         if "/" in target and not ws and not asked:
             return "no-session"
         self.starting[target] = time.time()
+        (self.unminted.add if state == "no-credential" else self.unminted.discard)(target)
         if wid:                                         # idle leftover shell (claude exited) → drop it, cc recreates
             tmux("kill-window", "-t", wid)
         no_tmux = tmux("has-session", "-t", "main")[0] != 0
@@ -7213,7 +7253,9 @@ class Daemon:
             mine = self.marks.get(f"{chat}:{root}:hammer_and_wrench", 0) <= since + 1
             if mine:                                      # (else the session re-set it itself since we did: not ours any more,
                 self.marks.pop(f"{chat}:{root}:hammer_and_wrench", None); save_marks(self.marks)   # and it is still on the job)
-                self.set_work(chat, root, None)
+                if f"{chat}:{root}:white_check_mark" not in self.marks:
+                    self.set_work(chat, root, None)       # the session's own ✅ has already replaced the wrench: the slot is its,
+                                                          # and clearing it took a ✅ off one second after it was set (2026-09-10)
                 self.mark_dirty({"type": "reaction_removed", "item": {"channel": chat, "ts": root}})   # the sweep re-marks the root
         if idle and mine and owed:
             self.ack_silence(*owed)
@@ -8484,6 +8526,11 @@ def cmd_setup(argv):
     return 0
 
 
+def post_flag(tok):
+    """Is this argv token a flag? A dash and a word with no space in it — so "- first point" and "-3" are text."""
+    return bool(re.match(r"^--?[A-Za-z][\w-]*$", tok))
+
+
 def cmd_post(argv):
     cfg = load_cfg()
     chan = thread = route = ts = None
@@ -8495,6 +8542,8 @@ def cmd_post(argv):
             mention = True; i += 1
         elif argv[i] in ("--major", "--main"):
             major = True; i += 1
+        elif argv[i] in ("-c", "--thread", "--ts", "--route") and i + 1 >= len(argv):
+            print(f"cc-slack post: {argv[i]} needs a value", file=sys.stderr); return 2
         elif argv[i] == "-c":
             chan = argv[i + 1]; i += 2
         elif argv[i] == "--thread":
@@ -8503,9 +8552,19 @@ def cmd_post(argv):
             ts = argv[i + 1]; i += 2
         elif argv[i] == "--route":
             route = argv[i + 1]; i += 2
+        elif post_flag(argv[i]):
+            # A FLAG THIS COMMAND DOES NOT KNOW IS AN ERROR, NOT TEXT. `post --to #<channel> <text>` (the file
+            # form's flag) and `post --help` were each posted word for word to the default channel with exit 0 and a
+            # ts, and the seat told the owner the work had been handed over when it had not (2026-09-10,
+            # raised-slack-post-eats-flags-as-text). The three stray lines could not even be unsaid. A flag is a
+            # dash and a word with no space in it: "- first point" and "-3" are text, as they always were.
+            print(f"cc-slack post: unknown option {argv[i]} — cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] "
+                  f"[--route TITLE] [--mention] [--major] \"text\" (a file goes with post --file PATH --to CHANNEL)",
+                  file=sys.stderr); return 2
         else:
             args.append(argv[i]); i += 1
     text = " ".join(args) if args else sys.stdin.read()
+    named = bool(chan and chan.startswith("#"))      # a `-c '#name'` post: the one kind that may be another session's message (wake)
     if os.environ.get("CC_MEMBER_SANDBOX") == "1":   # inside a boundary (cc-guard's 🔐 line, cc's budget notice): the member socket, scoped
         try:
             r = sock_request({"reply": chan or "", "text": text, "thread_ts": thread, "ts": ts or ""}, timeout=60)
@@ -8557,6 +8616,15 @@ def cmd_post(argv):
     print(posted_ts or "")
     if missed:                                       # stderr, so a caller piping the ts is unaffected and a human still sees it
         print("cc-slack:" + mention_warning(missed).strip(), file=sys.stderr)
+    if posted_ts and named:
+        # ONE SESSION'S POST INTO ANOTHER SESSION'S CHANNEL WAKES IT (Daemon.wake decides whether this is one). A
+        # `--route` post is machinery and never asks; a post into the caller's own lane comes back "own".
+        try:
+            r = sock_request({"wake": chan, "ts": posted_ts, "thread_ts": thread, "text": text}, timeout=15)
+        except Exception:
+            r = {}                                   # no daemon: the post stands, and there is no session to hand it to
+        if r.get("target"):
+            print(f"cc-slack: handed to {r['target']} ({r.get('result')})", file=sys.stderr)
     return 0
 
 
@@ -9424,6 +9492,24 @@ def cmd_selfcheck():
                           "`cc` is still asked (it tells #<h> once what to mint and pages the owner), and the same "
                           "target starts like any other the moment the credential is there",
                           st_nc == "no-credential" and asked_cc == [f"{BIN}/cc", "mintless"] and st_m == "starting")
+                    # …AND WITHOUT THE COOLDOWN BEING CLEARED BY HAND (the pop above): the unminted attempt opened nothing,
+                    # so the first message after the mint must start the session inside those 90 s, and only that one
+                    os.makedirs(f"{DEV}/mintless2/.cc", exist_ok=True)
+                    open(f"{DEV}/mintless2/{MEMBER_MARKER}", "w").close()
+                    _popM = EFFECTS.popen_impl
+                    EFFECTS.popen_impl = lambda cmd, **k: scalls.append(cmd) or type("P", (), {"poll": lambda s: 0})()
+                    st_pre = Daemon.autostart(dm, "mintless2"); n_pre = len(scalls)
+                    os.makedirs(f"{hw}/.cc/members/mintless2", exist_ok=True)
+                    with open(f"{hw}/.cc/members/mintless2/credentials.json", "w") as fmc:
+                        json.dump({"claudeAiOauth": {"accessToken": "selfcheck"}}, fmc)
+                    st_post = Daemon.autostart(dm, "mintless2"); ran_post = len(scalls) - n_pre
+                    st_again = Daemon.autostart(dm, "mintless2"); ran_again = len(scalls) - n_pre - ran_post
+                    EFFECTS.popen_impl = _popM
+                    check("autostart: the first start after a mint is not swallowed by the cooldown of the unminted attempt "
+                          "before it (2026-09-10: #ece298a's second message was told 'starting' and nothing started); a "
+                          "second start inside 90 s of a REAL one still waits",
+                          st_pre == "no-credential" and st_post == "starting" and ran_post == 1
+                          and st_again == "starting" and ran_again == 0)
                     # A MESSAGE NEVER STARTS A TRACK'S SESSION (2026-09-06): a finished `--go` worker leaves a worktree
                     # whose window is gone, and starting `cc <repo> <track>` there is a session nobody asked for. The
                     # owner naming it (`!start`, `!restart` → asked=True) is the one thing that still does.
@@ -9475,6 +9561,14 @@ def cmd_selfcheck():
               and cmd_post_approval(["no-such-repo-zz", "1"]) == 2 and cmd_post_approval(["myrepo", "x1"]) == 2 and cmd_post_approval(["myrepo", "https://github.com/a/b/pulls/3"]) == 2)
         check("post --file: usage errors exit 2 (no path, missing file, stray arg)",
               cmd_post_file([]) == 2 and cmd_post_file(["--file", "/no/such/file"]) == 2 and cmd_post_file(["--file", __file__, "--bogus"]) == 2)
+        # 2026-09-10: `post --to #chan text` and `post --help` were posted as text. The flag is refused before any
+        # token is read (this block has no token, so a post that got past the check would fail on that instead of
+        # returning 2).
+        check("post: an unknown flag is an error (exit 2), never text — --to, --help, and a flag with no value; a dash "
+              "bullet, a negative number and a bare dash are still text",
+              cmd_post(["--to", "#x", "hello"]) == 2 and cmd_post(["--help"]) == 2 and cmd_post(["-c"]) == 2
+              and cmd_post(["hello", "--bogus"]) == 2 and post_flag("--to") and post_flag("-x")
+              and not post_flag("- first point") and not post_flag("-3") and not post_flag("-"))
         check("history/thread/edit/unsay/pin/canvas: usage errors exit 2",
               cmd_history([]) == 2 and cmd_thread(["C1"]) == 2 and cmd_edit(["C1", "1.1"]) == 2
               and cmd_unsay(["C1"]) == 2 and cmd_pin(["C1"]) == 2 and cmd_canvas(["C1"]) == 2)
@@ -14034,9 +14128,22 @@ def cmd_selfcheck():
         for _ in range(WORK_IDLE_TICKS):                      # its pane never works: nothing subscribed, and yet…
             dmBZ.busy_cycle()
         stranded = "gone" not in dmBZ.working                 # …the holder still lets it go (it would sit forever)
+        # the session answered the owner's root with its own ✅ (react white_check_mark, keyed to that ts) and its turn
+        # ended: releasing OUR wrench must leave that ✅ standing — the slot is the session's now
+        dmBZ.marks.clear(); dmBZ.working.clear(); dmBZ.idle_ticks.clear(); del rmBZ[:]
+        dmBZ.hold_wrench("repo", "CB", "52.0")
+        dmBZ.marks["CB:52.0:white_check_mark"] = time.time()  # what session_mark records for the session's own ✅
+        dmBZ.drop_wrench("repo", idle=True)
+        kept_done = ("hammer_and_wrench", True) not in rmBZ and "repo" not in dmBZ.working
+        dmBZ.marks.clear(); dmBZ.working.clear(); del rmBZ[:]
+        dmBZ.hold_wrench("repo", "CB", "53.0"); dmBZ.drop_wrench("repo", idle=True)
+        cleared = ("hammer_and_wrench", True) in rmBZ           # and with no ✅ the release still takes the 🔧 off
     finally:
         globals()["tmux_window"], globals()["pane_working"] = _twBZ, _pwBZ
         globals()["react"], globals()["api"] = _rcBZ, _apiBZ
+    check("a session's own ✅ on the owner's root survives the release of our auto 🔧: drop_wrench used to clear the work "
+          "slot it no longer held and took the ✅ off one second after it was set, so the root stalled to ❓ and re-woke "
+          "the seat 43 min later (2026-09-10); a release with no ✅ still takes the 🔧 off", kept_done and cleared)
     check(f"auto 🔧: a session mid-turn gets ONE 🔧 on the thread it last heard from; it survives {WORK_IDLE_TICKS - 1} idle "
           f"ticks and comes off after {WORK_IDLE_TICKS} (≈{WORK_IDLE_TICKS // 2} min — a pause between turns of a live "
           "conversation must not blink it); a 🔧 the session set itself is never placed over or taken off, a ✅ (done) root "
@@ -15284,6 +15391,19 @@ def cmd_selfcheck():
         heldC = []
         ms_req({"hello": CTL, "pid": os.getpid()}, member=None, hold=heldC)
         r_psub = ms_req({"permission": "abcde", "answer": "yes"}, member=None, peer=(os.getpid(), os.getuid(), f"{DEV}/alice/proj"))
+        # wake: ONE SESSION'S POST INTO ANOTHER SESSION'S CHANNEL IS HANDED TO THAT SESSION — the caller is the CTL
+        # session (heldC owns this pid), #myrepo is somebody else's, so it is delivered there in the post's own
+        # thread as the box's word; the same seat's post into its OWN lane is "own", a caller no session owns wakes
+        # nothing, and a member socket has no such verb
+        os.makedirs(f"{DEV}/{CTL}", exist_ok=True); dmMS.names["CCTL"] = CTL
+        wokeMS = []; _delW = dmMS.deliver
+        dmMS.deliver = lambda target, payload, autostart=True, alias=None: wokeMS.append((target, alias, payload)) or "delivered"
+        me_peer = (os.getpid(), os.getuid(), f"{DEV}/{CTL}")
+        r_wake = ms_req({"wake": "CMY", "ts": "7.7", "thread_ts": None, "text": "please take this"}, member=None, peer=me_peer)
+        r_wown = ms_req({"wake": "CCTL", "ts": "7.8", "text": "to myself"}, member=None, peer=me_peer)
+        r_wnone = ms_req({"wake": "CMY", "ts": "7.9", "text": "from a cron"}, member=None, peer=(999999, os.getuid(), DEV))
+        r_wmem = ms_req({"wake": "CMY", "ts": "8.0", "text": "x"})
+        dmMS.deliver = _delW
         subprocess.run(["rm", "-rf", f"{DEV}/alice/proj", f"{DEV}/alice/own"])
         # the MEMBER socket: hello as itself only; inject stamps member and starts nothing
         held = []
@@ -15451,6 +15571,16 @@ def cmd_selfcheck():
           "names the control repo buys nothing, and a real session's call is its own target's whatever cwd it has",
           r_pcwd.get("ok") is False and f"{CTL}'s to give" in r_pcwd.get("error", "")
           and r_psub.get("ok") is False and "is waiting" in r_psub.get("error", ""))
+    check("wake: a session's `post -c '#other'` is handed to #other's session in the post's own thread, as the box's word "
+          "(2026-09-11: a hand-off posted into an orch's channel started nothing there); its post into its own lane is "
+          "'own', a caller no session owns wakes nothing, and the member socket has no such verb",
+          r_wake.get("result") == "delivered" and r_wake.get("target") == "myrepo" and len(wokeMS) == 1
+          and wokeMS[0][0] == "myrepo" and wokeMS[0][2]["content"] == "please take this"
+          and wokeMS[0][2]["meta"].get("chat_id") == "CMY" and wokeMS[0][2]["meta"].get("thread_ts") == "7.7"
+          and wokeMS[0][2]["meta"].get("role") == "owner" and wokeMS[0][2]["meta"].get("user") == "box"
+          and wokeMS[0][2]["meta"].get("from") == CTL
+          and r_wown.get("result") == "own" and r_wnone.get("result") == "not-a-session"
+          and r_wmem.get("ok") is False)
     check("MEMBER socket: a permission_request is scoped like every other line she writes — it was handled ABOVE that "
           "gate — so one naming a channel that is not hers is dropped whole, and one naming none is relayed to the "
           "lane the daemon picks itself and stamped as HERS",

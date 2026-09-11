@@ -518,6 +518,19 @@ W11B
   if [ "$p1" = 0 ] && [ "$p2" = 0 ] && [ "$d1" = 2 ] && [ "$d2" = 2 ] && [ "$own" = 0 ]; then r=0; else r=1; fi
   ok "a member workspace passes a heredoc or echo that only NAMES another repo (a ';' inside quotes is prose), still refuses a real dispatch or create of one, and still runs its own" $r
 
+  # 15b. A REDIRECTION AFTER `cc done`/`cc handoff` IS NOT A REPO NAME. 2026-09-10 a workspace session's own
+  #      `cc done --help 2>&1 | head` was refused as "creating outside" its workspace: the repo scan stops at the
+  #      `&` of `2>&1` and read the leftover `2>` as a repo. A redirection is skipped; a real other-repo name
+  #      after the same verb, redirection or not, is still refused; the workspace's own still runs.
+  ASKS=$T/asks15b; CALLS=$T/calls15b; : > "$CALLS"
+  h1=$(g Bash '{"command":"cd ~/.cc/worktrees/ws1/t1; cc done --help 2>&1 | head -30; cc-context 2>&1 | tail -3"}' "$H/dev/ws1" CC_ROLE=member)
+  h2=$(g Bash '{"command":"cc handoff 2>/dev/null | head"}' "$H/dev/ws1" CC_ROLE=member)
+  o1=$(g Bash '{"command":"cc done other 2>&1 | head"}' "$H/dev/ws1" CC_ROLE=member)
+  o2=$(g Bash '{"command":"cc done 2>&1 other | head"}' "$H/dev/ws1" CC_ROLE=member)
+  own=$(g Bash '{"command":"cc done ws1 2>&1 | head"}' "$H/dev/ws1" CC_ROLE=member)
+  if [ "$h1" = 0 ] && [ "$h2" = 0 ] && [ "$o1" = 2 ] && [ "$o2" = 2 ] && [ "$own" = 0 ]; then r=0; else r=1; fi
+  ok "a member workspace's \`cc done --help 2>&1 | head\` runs (a redirection is not a repo name), another repo after the same verb is still refused, and its own still runs" $r
+
   # 16. A PATH NAMED IN PROSE IS NOT A PATH WRITTEN. The same fix, for the write fence: a worker's note may DESCRIBE
   #     a copy or a redirect into the box's live tree — the ';' and the '>' inside the quotes cannot split or
   #     redirect anything — while a REAL copy or redirect into ~/bin is still refused.
@@ -1825,13 +1838,19 @@ ws_cc_ok(){   # every `cc …` in $1 that NAMES A REPO names workspace $2 — se
     inv=${inv#*cc }; read -r -a a <<<"$inv"; v=${a[0]:-}; r=""
     case "$v" in
       board) r=${a[2]:-}; case "$r" in -*) r="";; esac;;   # every board verb takes the repo there: reading another one is outside too
-      done|rm|handoff|-c) for x in "${a[@]:1}"; do case "$x" in -*) ;; *) r=$x; break;; esac; done;;
+      # A REDIRECTION IS NOT A REPO. The scan above stops at the first ; & or |, so `cc done --help 2>&1 | head`
+      # leaves the token `2>` — not a flag, so it was read as a repo named `2>` and refused as creating outside the
+      # workspace (raised-guard-reads-a-redirection-as-a-repo-name). A token carrying < or > is a redirection
+      # (2>, >>, &>, <file, 2>/dev/null), and the shell never hands one to cc as an argument. The `&` of a
+      # descriptor dup (2>&1, >&2, &>f) is folded away BEFORE the scan below, so it no longer ends the scan
+      # early: `cc done 2>&1 other` still reaches `other`.
+      done|rm|handoff|-c) for x in "${a[@]:1}"; do case "$x" in -*|*[\<\>]*) ;; *) r=$x; break;; esac; done;;
       ""|-*|slack|rc|digest|quick|ls|resume) ;;
       *) r=$v;;
     esac
     r=${r%%/*}                                       # `cc handoff --overlap <repo>/<track>`
     [ -n "$r" ] && [ "$r" != "$w" ] && ok=""
-  done < <(grep -oE "$AT"'([^ ]*/)?cc +[^;&|]*' <<<"$c")
+  done < <(grep -oE "$AT"'([^ ]*/)?cc +[^;&|]*' <<<"$(sed -E 's/([0-9]*[<>]{1,2})&([0-9]+|-)/\1\2/g; s/(^|[[:space:]])&>/\1>/g' <<<"$c")")
   [ -n "$ok" ]
 }
 # TWO lists. secret_all() is the credentials NO gated role reads: ~/.claude/.credentials.json is the box's Claude

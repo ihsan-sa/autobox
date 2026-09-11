@@ -30,6 +30,8 @@
 # its step limit, for as long as it keeps producing; what it may never do is spend without producing.
 # Task text:  ~/.cc/state/<repo>/<track>/task.md      (written by `cc <repo> <track> --go "..."` or by hand)
 # Journal:    ~/.cc/state/<repo>/<track>/progress.md  (worker appends; a fresh iteration reads it)
+# PR body:    ~/.cc/state/<repo>/<track>/pr-body.md   (worker writes it before DONE; cc done puts it under the brief)
+# Slack post: ~/.cc/state/<repo>/<track>/slack-post.md (#channel on line 1, text below; the loop posts it once at DONE)
 # Runs in the track's git worktree; every iteration ends with cc-checkpoint (commit+push to track branch).
 # Self-review: templates/self-review.md — the six kinds of finding the landing review keeps stopping PRs for. The worker
 #             prompt carries it verbatim (selfrev_block, inlined because a sandboxed worker has core/bin bound and not
@@ -260,7 +262,7 @@ selfrev_block(){   # $1 the base branch → the self-review paragraph the worker
     "$1" "$(cat "$CHECKLIST")"; }
 sp_worker(){   # $1 the base branch → the whole system prompt a headless worker is given. A function, like the
                # three in `cc`, so `cc-loop selfcheck` can read the prompt a worker really gets, not a copy of it.
-  printf %s "You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$1' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal.$(dispatch_block)$(writing_block)$(raise_block)$(spend_block)$(mail_block)$(selfrev_block "$1")"; }
+  printf %s "You are an autonomous worker for track '$track' of repo '$repo', running headless in a loop: each iteration is a FRESH context. Durable state lives in files, not in your memory: the task is in $ST/task.md, your journal is $ST/progress.md (read it first; append a dated entry as you go, EARLY rather than at the end — an iteration that is cut short with nothing written leaves the next one blind: what you did, what is next, gotchas). Work on the next unfinished step only; keep changes committed-ready (a hook auto-commits and pushes to branch track/$track after you finish; do not run git commit/push yourself). Never touch branch '$1' or files outside this worktree. Board: 'cc board show $repo' and 'cc board note $repo $track \"...\"'. Before deciding the task is complete, re-read $ST/task.md in full — the owner/supervisor may have appended scope since this iteration began; if so, do that work first. When the WHOLE task (including appends) is complete, append the exact line 'STATUS: DONE' to progress.md. If you need an owner decision, append 'STATUS: BLOCKED: <one-line question>' and stop. Batch independent tool calls in one turn; edit with targeted replacements, never whole-file rewrites. Be concise in the journal. A note the lander must read with the PR (a restart after merge, a migration) goes in $ST/pr-body.md before you finish: cc done puts it in the PR body under the brief. A Slack post the brief names as the deliverable goes in $ST/slack-post.md (first line the #channel, then the text): the loop posts it once at DONE, since you cannot.$(dispatch_block)$(writing_block)$(raise_block)$(spend_block)$(mail_block)$(selfrev_block "$1")"; }
 this_iteration(){   # the lines $2 has gained since the snapshot $1 was taken — BY POSITION, never by text.
   # A set difference (`grep -vxFf`) drops a line because an identical one is already in the snapshot, and
   # 'STATUS: DONE' is the same eleven bytes every time: a re-dispatched track whose journal already carried one
@@ -321,12 +323,28 @@ tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation f
   # writes the event down BEFORE it sends anything, so its own 60 s flush delivers what this gave up waiting for.
   # The cost of the timeout is therefore a duplicate — a page AND a late wake — and never a dropped stop.
   timeout 30 "$BIN/cc-broker" inject --no-start --source loop "$repo" "$1" >/dev/null 2>&1; }
-stop_prio(){ [ "$1" = yes ] && echo low || echo high; }
+stop_prio(){ [ "$1" = yes ] && echo low || echo high; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
 tier_hold(){   # $1 start|continue · $2 repo/track -> 0 the spend tier says this must WAIT, 1 it may go. cc-tier owns the
                # table (`cc-tier allows`); this reads its exit alone: 1 is "wait", 0 is "go", and anything else — no
                # cc-tier on this box, a crash — is "go", the same leniency `cc-pause is` gets: a tier that cannot be
                # read must never be the reason a worker stops.
-  "$BIN/cc-tier" allows "$1" "$2" >/dev/null 2>&1; [ $? = 1 ]; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
+  "$BIN/cc-tier" allows "$1" "$2" >/dev/null 2>&1; [ $? = 1 ]; }
+deliver_post(){   # THE WORKER'S SLACK DELIVERABLE, posted by the loop and never by the worker (raised-headless-cannot-deliver-to-slack).
+  # A worker is guarded from every outward post, so a track whose done-criterion is a message in a channel reached its
+  # last step, was refused, and ended BLOCKED with the work done and undelivered (a test member, 2026-09-09). It
+  # writes $ST/slack-post.md instead — first line the #channel, the rest the text — and this loop, which runs outside
+  # the guard (on the host; inside a member's boundary the post is scoped to the member's own channels by the member
+  # socket), posts it ONCE at DONE. The dispatcher's brief is the authority: it named the channel. The file is
+  # renamed on the way out so a second DONE cannot post it twice, and the ts goes to the journal.
+  local f="$ST/slack-post.md" chan text ts
+  [ -s "$f" ] || return 0
+  chan=$(head -1 "$f" | tr -d '[:space:]'); text=$(tail -n +2 "$f")
+  case "$chan" in '#'?*) ;; *) printf '%s slack-post.md: the first line must be the #channel (got %s) — not posted\n' "$(date -u +%FT%TZ)" "${chan:-nothing}" >> "$LOG"; return 0;; esac
+  [ -n "$text" ] || { printf '%s slack-post.md: no text under the channel line — not posted\n' "$(date -u +%FT%TZ)" >> "$LOG"; return 0; }
+  if ts=$("${CC_SLACK:-$BIN/cc-slack}" post -c "$chan" --major "$text" 2>>"$LOG"); then   # CC_SLACK: test hook
+    mv -f "$f" "$f.sent"; printf -- '- slack-post.md delivered to %s by cc-loop at DONE (ts %s)\n' "$chan" "$ts" >> "$ST/progress.md"
+  else printf '%s slack-post.md: the post to %s failed — the file stands for a retry\n' "$(date -u +%FT%TZ)" "$chan" >> "$LOG"; fi
+}
 selfcheck(){   # the refusal path on fixtures: the classes the loop acts on, the model it moves to, what it does with
                # an iteration that was rerouted but still worked (F4), and the line it journals.
                # The fixtures are REAL `-p` result shapes, carrying the two traps that fooled the old classifier: a
@@ -624,6 +642,20 @@ down still leaves the board write and the updates line, which is the half of thi
   t 'a cc-tier that cannot answer never holds'     "$(BIN="$d/tbin"; tier_hold start r/broken && echo held || echo go)" go
   t 'no cc-tier on the box at all never holds'     "$(BIN="$d/absent"; tier_hold start r/held && echo held || echo go)" go
   sed 's/^/  journal fixture | /' "$d/progress.md"
+  # THE SLACK DELIVERABLE (raised-headless-cannot-deliver-to-slack): slack-post.md is posted by the loop at DONE, once,
+  # to the channel on its first line; a file with no #channel line posts nothing; nothing at all posts nothing.
+  mkdir -p "$d/dp"; printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/dp/calls"; echo 12.34\n' "$d" > "$d/dp/slack"; chmod +x "$d/dp/slack"
+  printf '#proj--t\nthe report is in docs/report.md\nsecond line\n' > "$d/dp/slack-post.md"
+  (ST="$d/dp" LOG="$d/dp/log" CC_SLACK="$d/dp/slack"; deliver_post; deliver_post)
+  t 'slack-post.md is posted once, to its first-line channel, as --major, with the text under it' \
+    "$(cat "$d/dp/calls" 2>/dev/null)" "post -c #proj--t --major the report is in docs/report.md
+second line"
+  t '…the file is renamed .sent so a second DONE cannot post it again' "$(n=0; for f in "$d"/dp/slack-post.md*; do [ -e "$f" ] && n=$((n + 1)); done; echo "$n")" 1
+  t '…and the journal carries the ts' "$(grep -c 'delivered to #proj--t by cc-loop at DONE (ts 12.34)' "$d/dp/progress.md")" 1
+  rm -f "$d/dp/calls"; printf 'no channel here\nsome text\n' > "$d/dp/slack-post.md"
+  (ST="$d/dp" LOG="$d/dp/log" CC_SLACK="$d/dp/slack"; deliver_post)
+  t 'control: a file whose first line is not a #channel posts nothing and is left where it is' \
+    "$([ -e "$d/dp/calls" ] && echo posted || echo no)/$([ -e "$d/dp/slack-post.md" ] && echo kept)" no/kept
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
@@ -754,6 +786,7 @@ while [ $i -lt "$MAXI" ]; do
     # RECEIPT it prints, never from an exit code — a board or card projection that could not be written used to
     # turn a real PR into "finished, but opened no PR". The branch below is the legacy one, for a row that has no
     # record; milestone 7 removes it with the rest.
+    deliver_post   # the worker's Slack deliverable, if the brief asked for one: posted here, once, before the PR
     if [ -e "$ST/delivery.json" ] || [ -L "$ST/delivery.json" ]; then
       log "DONE"
       rec=$(env "${HG[@]}" "${CC_LAND:-$BIN/cc-land}" queue --task "$repo" "$track" 2>>"$LOG")   # CC_LAND: test hook
