@@ -19,8 +19,11 @@
 # (record_query below, class page for a deny and nopage for a never) — nothing in the member's own channel, no page
 # to the owner (owner, 2026-09-04). Writing outside the session's own tree is `never` too, but QUIET: the session
 # aimed that write itself and reads the reason on stderr; not even a query is recorded for it.
-# Either gated tier also kills only its own descendants — never a session, a loop runner, or anything it
-# did not start (a member workspace's own workers run at role=member, so `worker` alone would miss them).
+# Either gated tier also kills only its own descendants and a run it detached that stands in its own TRACK
+# worktree (a member-facing dir is shared ground, and so is a cwd no marker named) — never a session, `-p` or
+# interactive, a loop runner, a pane of the shared tmux, or anything it did not start (a member workspace's own
+# workers run at role=member, so `worker` alone would miss them). Signal 0 in effect is a question, to a live
+# pid or a gone one; any other signal to a gone pid is refused, since by the time it lands that pid is anybody's.
 # EVERY gated role, worker included: no container runtime (this user is in group `docker`, which is root-equivalent)
 # and no reading the two files that ARE the box's credentials (~/.claude/.credentials.json, ~/ccbox/env).
 # role=member = every worker gate PLUS: no dispatching workers, no reading the box's other secrets, no re-wiring Slack.
@@ -53,7 +56,8 @@ if [ "${1:-}" = selfcheck ]; then
   # $HOME, because it is the one dir outside /tmp that exists in every place this runs; it goes with $T below.
   # Empty = case 12 FAILS rather than testing nothing: a fixture under /tmp would go green having gated nothing.
   T2=$(mktemp -d "$HOME/.cc-guard-selfcheck.XXXXXX" 2>/dev/null) || T2=""
-  trap '[ -n "$pids" ] && { kill $pids 2>/dev/null; sleep 0.2; kill -9 $pids 2>/dev/null; }; rm -rf "$T" ${T2:+"$T2"}' EXIT
+  endkids(){ local kp; for kp in "$@"; do pkill -P "$kp" 2>/dev/null; done; }   # a fixture script is sh + a sleep: end the sleep too
+  trap '[ -n "$pids" ] && { endkids $pids; kill $pids 2>/dev/null; sleep 0.2; kill -9 $pids 2>/dev/null; }; rm -rf "$T" ${T2:+"$T2"}' EXIT
   mkdir -p "$H/bin" "$H/.cc" "$H/dev/alice/.cc" "$H/dev/_cctest1/.cc" "$WT/.cc"
   : > "$H/dev/alice/.cc/member-facing"; : > "$H/dev/_cctest1/.cc/member-facing"; : > "$WT/.cc/track"
   # The owner's two real doors, stubbed: a case can then say "this was sent" and "nothing was".
@@ -1289,6 +1293,273 @@ W47
   [ "$w1$w2$p1" = "020" ] || { r=1; echo "      worker: config $w1, credentials $w2; planning: config $p1"; }
   ok "a steward may not READ the box's secrets either, still reads the state it must not guess, and the worker and planning tiers read what they always did" $r
 
+  # 49-54. THE GUARD READS THE COMMAND, NOT THE TEXT (track a-guard-reads-the-command-not-the-text, 2026-09-10).
+  #     Eight board rows in ten days, each a session losing turns to a word that merely APPEARED in its Bash call:
+  #     inside a Python heredoc, a journal heredoc, a grep pattern, a board note, a `#` comment, or a liveness
+  #     probe. Each case below is one row's shape, and each asserts BOTH sides: the mention passes, the same
+  #     action really run is still refused, at the worker tier and (where the row was a member's) the member's.
+  gc(){ local c=$1; shift; g Bash "$(jq -cn --arg c "$c" '{command:$c}')" "$@"; }   # a raw command, JSON-escaped here
+  pair(){   # $1 = case name; stdin = records split by a `--` line, each MENTION lines, a `%` line, then RUN lines
+    local nm=$1 m="" x="" side=m ln r=0   # the mention must pass and the run must be refused, at BOTH tiers
+    judge(){ [ -n "$m$x" ] || return 0; local wm mm wx mx
+      if [ -n "$m" ]; then wm=$(gc "$m" "$WT" CC_ROLE=worker); mm=$(gc "$m" "$H/dev/alice" CC_ROLE=member)
+        { [ "$wm" = 0 ] && [ "$mm" = 0 ]; } || { r=1; echo "      refused a mention (worker $wm, member $mm): ${m:0:70}"; }; fi
+      if [ -n "$x" ]; then wx=$(gc "$x" "$WT" CC_ROLE=worker); mx=$(gc "$x" "$H/dev/alice" CC_ROLE=member)
+        { [ "$wx" = 2 ] && [ "$mx" = 2 ]; } || { r=1; echo "      let a run through (worker $wx, member $mx): ${x:0:70}"; }; fi
+      m=""; x=""; side=m; }
+    while IFS= read -r ln; do
+      case "$ln" in --) judge; continue;; %) side=x; continue;; esac
+      if [ "$side" = m ]; then m=${m:+$m$'\n'}$ln; else x=${x:+$x$'\n'}$ln; fi
+    done; judge; ok "$nm" $r; }
+  # 49. A HEREDOC FED TO PYTHON IS PYTHON, NOT SHELL (rows raised-guard-reads-heredoc-body-as-a-command,
+  #     raised-guard-blocks-the-token-in-a-heredoc, raised-guard-denies-edits-under-core-mail): a patch script
+  #     whose string literals, comments and docstring name the outbound door passes; the same interpreter told to
+  #     run the door, or to land, is still refused — and so is the script under sudo, whatever it says.
+  ASKS=$T/asks49; CALLS=$T/calls49; : > "$CALLS"
+  pair "a python heredoc that only NAMES the outbound door passes; one that runs it, lands, or runs as root does not" <<'P49'
+python3 - <<'PY'
+import pathlib  # the patch script; it's the mail door's outbound half
+p = pathlib.Path("core/mail/outbound.py"); s = p.read_text()
+"""docstring: sends mail when the owner said yes; cc-land is not run here"""
+p.write_text(s.replace("held; mail is not sent", "held"))
+PY
+%
+python3 - <<'PY'
+import os; os.system("mail -s subject owner@example.com < body.txt")
+PY
+--
+python3 - <<'PY'
+# it's the outbound half: a string literal with a separator inside it
+msg = "held; mail is not sent until the owner says so; systemctl --user restart x later"
+open("core/mail/outbound.py", "a").write(msg)
+PY
+%
+python3 - <<'PY'
+import subprocess; subprocess.run("cc-land 7", shell=True)
+PY
+--
+%
+sudo python3 - <<'PY'
+print("harmless")
+PY
+--
+%
+python3 - <<'PY' | bash
+print("cc-land 7")
+PY
+P49
+  # 50. THE LANDING TOOL'S NAME IN A JOURNAL, A GREP OR A COMMIT MESSAGE (row raised-guard-refuses-the-landing-
+  #     tools-name-in-any-text): a date-stamped heredoc line, a pattern piped to sed, and prose behind a
+  #     substitution all pass; the tool run from a heredoc substitution, a backtick, an interpreter string or a
+  #     shell heredoc is still refused. (`$(date)` was the trap: the `)` put the next word in command position.)
+  ASKS=$T/asks50; CALLS=$T/calls50; : > "$CALLS"
+  pair "the landing tool's NAME in a journal heredoc, a grep pattern or a commit message passes; the tool RUN from a substitution, a backtick, a -c string or a shell heredoc does not" <<'P50'
+cat >> progress.md <<EOF
+$(date -u +%FT%H:%MZ) cc-land refused the merge; the landing tool reads FETCH_HEAD
+EOF
+%
+cat >> progress.md <<EOF
+$(cc-land 7)
+EOF
+--
+grep -n 'cc-land\|FETCH_HEAD' progress.md | sed -n 1,3p
+%
+cat >> progress.md <<EOF
+note `cc-land 7` here
+EOF
+--
+echo "$(date -u)" && git commit -m "step; cc-land was blocked, the env var was unset"
+%
+bash -c "echo x; cc-land 7"
+--
+cat >> progress.md <<EOF
+$(date -u) sudo is refused; the mail door sends nothing; cc-land reads FETCH_HEAD
+EOF
+%
+bash <<EOF
+echo x; cc-land 7
+EOF
+P50
+  # 51. A NOTE THAT QUOTES A RESTART IS NOT A RESTART (row raised-guard-blocks-notes-quoting-a-restart): the
+  #     exact command the reader needs, in a board note, with prose that happens to say `watch` — and the same
+  #     note over two lines, which used to be read as a second statement. `watch`, `su -c` and a multi-line
+  #     `bash -c` really RUN the restart and are refused.
+  ASKS=$T/asks51; CALLS=$T/calls51; : > "$CALLS"
+  pair "a board note quoting \`systemctl --user restart\` passes, on one line or two; watch/su -c/bash -c running it are refused" <<'P51'
+cc board note demo t1 "needs systemctl --user restart demo-unit after landing; watch the journal"
+%
+watch "systemctl --user restart demo-unit"
+--
+cc board note demo t1 "line one
+systemctl --user restart demo-unit is needed after landing"
+%
+su -c "x; systemctl --user restart demo-unit"
+--
+git commit -m "it's done; watch the log for the restart"
+%
+bash -c "echo one
+systemctl --user restart demo-unit"
+P51
+  # 52. A COMMENT RUNS NOTHING. Writing the fixtures for 49-51 was refused twice for a `# …` line naming the
+  #     landing tool. `${#x}` is a length, `"#"` is a string: a gated command behind either is still refused.
+  ASKS=$T/asks52; CALLS=$T/calls52; : > "$CALLS"
+  pair "a \`#\` comment naming a gated command passes; \${#x} and \"#\" are not comments and the command behind them is refused" <<'P52'
+echo x # cc-land 7 comes later, by hand
+%
+echo x; cc-land 7 # note
+--
+# cc-land 7
+echo done
+%
+echo ${#x}; cc-land 7
+--
+echo "a # b" # sudo needed for the rest
+%
+echo "#"; cc-land 7
+P52
+  # 53. SIGNAL ZERO IS A QUESTION, AND A PID THAT HAS EXITED ANSWERS ONLY THAT (rows raised-guard-blocks-liveness-
+  #     probe-signal-zero, raised-guard-blocks-liveness-check-on-exited-pid). A worker waiting out a detached gate
+  #     asks `kill -0 <pid>`; the pid it asks about is not its own descendant (the run was detached) and, later,
+  #     is gone. Both pass, spelled -0, -s 0, -n 0, pkill -0 and `| xargs kill -0`; a real signal to the same
+  #     foreign pid, the same pkill without -0 and the same pipeline without it are refused, and so is `pkill -s
+  #     0`, whose -s is a session id and not a signal. A REAL SIGNAL TO THE GONE PID IS REFUSED TOO: by the time
+  #     it lands that number can be anybody's (security read of #404 — the first cut waved it through). That
+  #     refusal used to carry the shell's own "/proc/…: No such file" line: stderr is the reason and nothing else.
+  ASKS=$T/asks53; CALLS=$T/calls53; : > "$CALLS"; GERR=$T/err53; r=0
+  pk=probe$$; printf '#!/bin/sh\nsleep 45\n' > "$T/$pk"; chmod +x "$T/$pk"
+  sleep 45 >/dev/null 2>&1 & bare53=$!; pids="$pids $bare53"       # a root that started nothing: every pid below is foreign to it
+  "$T/$pk" >/dev/null 2>&1 & far=$!; pids="$pids $far"
+  sleep 0.1 & gone=$!; wait "$gone"; sleep 0.3
+  for m in "kill -0 $far && echo alive" "kill -s 0 $far" "kill -n 0 $far" "while kill -0 $far 2>/dev/null; do sleep 5; done" \
+           "pkill -0 -f $pk" "pgrep -f $pk | xargs kill -0" "kill -0 $gone" "kill -s 0 $gone"; do
+    : > "$GERR"; w=$(gc "$m" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare53)
+    { [ "$w" = 0 ] && [ ! -s "$GERR" ]; } || { r=1; echo "      refused a probe (rc $w): $m — $(head -c 60 "$GERR")"; }
+  done
+  for x in "kill -9 $far" "kill -s TERM $far" "kill $far" "pkill -f $pk" "pgrep -f $pk | xargs kill" "kill -0 $far; kill $far" \
+           "pkill -s 0 -f $pk" "pgrep -f $pk | xargs pkill -s 0" "kill $gone" "kill -TERM $gone"; do   # pkill -s 0 is this session, not signal 0
+    : > "$GERR"; w=$(gc "$x" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare53)
+    [ "$w" = 2 ] || { r=1; echo "      let a signal through (rc $w): $x"; }
+    [ "$(wc -l < "$GERR")" = 1 ] || { r=1; echo "      stderr is more than the reason: $x — $(head -c 60 "$GERR")"; }
+  done
+  kill -0 "$far" 2>/dev/null || { r=1; echo "      the fixture process is gone: a probe signalled it"; }
+  ok "signal 0 passes the kill fence in every spelling, to a live pid or a gone one; a real signal to a foreign pid or a gone one, and the same pkill and pipeline without -0, are refused with one line" $r
+  # 54. A RUN THIS WORKER DETACHED IS ITS OWN (row raised-guard-blocks-stopping-your-own-detached-run). setsid
+  #     reparented the gate run to init, so the subtree test called it somebody else's. It STANDS in this
+  #     worker's tree: a detached process whose cwd is the worktree, and a child of it that has cd'd away, both
+  #     go from a root that never started them; the same process standing outside the tree does not, and a
+  #     `claude -p` standing inside it is held as it always was. A worker OF A MEMBER WORKSPACE (role=member,
+  #     root = its own track worktree) reads its worktree the same way; the member-facing dir itself is shared
+  #     ground and is NOT a tree of its own — that is case 55.
+  #     THE FIXTURES ARE DETACHED FOR REAL: double-forked, so the intermediate shell exits and the run is adopted
+  #     by init or the user's systemd — the chain a `setsid nohup … &` from a tool shell ends with once the call
+  #     returns. `$!` of an `exec setsid` subshell was still a child of this suite, and above it the session
+  #     running the suite: exactly the chain kcwd refuses. Each is a minted script, found by pgrep -f on its path.
+  ASKS=$T/asks54; CALLS=$T/calls54; : > "$CALLS"; r=0
+  mk(){ printf '#!/bin/sh\n%s\n' "$2" > "$T/$1"; chmod +x "$T/$1"; }   # $1 = name under $T, $2 = body
+  # (the whole background list is redirected, or the forked shell holds this substitution's pipe until the fixture ends)
+  det(){ local d=$1 pat=$2; shift 2; ( ( cd "$d" && exec setsid "$@" ) >/dev/null 2>&1 & ); sleep 0.3; pgrep -f -- "$pat" | head -1; }
+  sleep 45 >/dev/null 2>&1 & bare54=$!; pids="$pids $bare54"
+  mk d54in 'sleep 45'; mk d54ch '(cd /tmp && exec sleep 45); :'; mk d54out 'sleep 45'; mk d54bob 'sleep 45'
+  inw=$(det "$WT" "$T/d54in" "$T/d54in"); pids="$pids $inw"
+  inch=$(det "$WT" "$T/d54ch" "$T/d54ch"); pids="$pids $inch"
+  outw=$(det /tmp "$T/d54out" "$T/d54out"); pids="$pids $outw"
+  helw=$(det "$WT" "$T/claude -p x" "$T/claude" -p x); pids="$pids $helw"
+  mkdir -p "$H/dev/bob/.cc" "$H/.cc/worktrees/bob/t1/.cc"; : > "$H/dev/bob/.cc/member-facing"; : > "$H/dev/bob/.cc/member-workspace"; : > "$H/.cc/worktrees/bob/t1/.cc/track"
+  bobw=$(det "$H/.cc/worktrees/bob/t1" "$T/d54bob" "$T/d54bob"); pids="$pids $bobw"
+  sleep 0.2; inchild=$(pgrep -P "$inch" -x sleep | head -1); pids="$pids $inchild"
+  [ -n "$inw" ] && [ -n "$inchild" ] && [ -n "$outw" ] && [ -n "$helw" ] && [ -n "$bobw" ] || { r=1; echo "      a fixture did not start: in $inw ch $inch/$inchild out $outw held $helw bob $bobw"; }
+  a1=$(gc "kill $inw" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare54)
+  a2=$(gc "kill ${inchild:-$inch}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare54)
+  a3=$(gc "kill $outw" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare54)
+  a4=$(gc "kill $helw" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare54)
+  a5=$(gc "kill $bobw" "$H/.cc/worktrees/bob/t1" CC_GUARD_ROOT_PID=$bare54)      # a member workspace's worker, in its own worktree: role=member by the marker
+  a6=$(gc "kill $inw" "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$bare54)   # another tree's run: not the member's
+  [ "$a1$a2$a3$a4$a5$a6" = "002202" ] || { r=1; echo "      own $a1, own child $a2, outside $a3, held inside $a4, member-workspace worker own $a5, member other tree $a6"; }
+  ok "a detached run standing in this worker's tree is its own to end, its cd'd-away child too; one standing outside is not, a claude -p inside is still held, and a member workspace's worker reads its own worktree the same way" $r
+  # 55. WHAT THE BASE REFUSED, THE NEW FENCE REFUSES TOO (landing review and security read of #404: each of these
+  #     walked through the first cut). The signal is the EFFECTIVE one: `kill -9 <pid> -0` (a later -0 is
+  #     process group 0), `kill -s 0 -s 9`, `kill -0 -s KILL`, `pkill -0 --signal 9` and `killall -0 -s 9` all
+  #     deliver and are refused; -0 and -n 0 in front of the target still pass. And "standing in the tree" holds
+  #     for a track worktree only: a host-owned run standing in the member-facing dir, one standing in a cwd no
+  #     marker named (the fallback root), an INTERACTIVE claude standing in the worktree, the session's own root
+  #     process, and a process whose chain passes a tmux pane are all refused, at whichever tier they were asked.
+  ASKS=$T/asks55; CALLS=$T/calls55; : > "$CALLS"; r=0
+  sleep 45 >/dev/null 2>&1 & bare55=$!; pids="$pids $bare55"       # a root that started nothing
+  pk55=probe55$$; mk "$pk55" 'sleep 45'; "$T/$pk55" >/dev/null 2>&1 & far55=$!; pids="$pids $far55"
+  mk d55fb 'sleep 45'; mk d55me 'sleep 45'; mk tmux 'sleep 45'; mk d55alice 'sleep 45'
+  mem55=$(det "$H/dev/alice" "$T/d55alice" "$T/d55alice"); pids="$pids $mem55"       # host-owned, standing in the member-facing dir
+  fbw=$(det "$T" "$T/d55fb" "$T/d55fb"); pids="$pids $fbw"                        # standing in a dir no marker names
+  icl=$(det "$WT" "$T/claude\$" "$T/claude"); pids="$pids $icl"                    # an interactive claude, no -p
+  mew=$(det "$WT" "$T/d55me" "$T/d55me"); pids="$pids $mew"                        # the root process itself, standing in the tree
+  tmx=$(det "$WT" "$T/tmux" "$T/tmux"); pids="$pids $tmx"; sleep 0.2               # a process under something called tmux
+  tmxc=$(pgrep -P "$tmx" -x sleep | head -1); pids="$pids $tmxc"
+  [ -n "$mem55" ] && [ -n "$fbw" ] && [ -n "$icl" ] && [ -n "$mew" ] && [ -n "$tmxc" ] || { r=1; echo "      a fixture did not start: mem $mem55 fb $fbw claude $icl me $mew tmux $tmx/$tmxc"; }
+  for x in "kill -9 $far55 -0" "kill -s TERM $far55 -s 0" "kill -s 0 -s 9 $far55" "kill -0 -s KILL $far55" "pgrep -f $pk55 | xargs kill -9 -0" \
+           "pkill -0 --signal 9 -f $pk55" "pkill -0 -f $pk55 --signal 9" "killall -0 -s 9 $pk55"; do
+    w=$(gc "$x" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare55)
+    [ "$w" = 2 ] || { r=1; echo "      let a signal through (rc $w): $x"; }
+  done
+  for m in "kill -0 -- $far55" "kill -n 0 $far55" "pkill -0 -f $pk55"; do
+    w=$(gc "$m" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare55)
+    [ "$w" = 0 ] || { r=1; echo "      refused a probe (rc $w): $m"; }
+  done
+  b1=$(gc "kill $mem55" "$H/dev/alice" CC_ROLE=member CC_GUARD_ROOT_PID=$bare55)   # the member-facing dir is shared ground
+  b2=$(gc "kill $fbw" "$T" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare55)               # no marker: the cwd fallback is not a tree
+  b3=$(gc "kill $icl" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare55)              # an interactive claude in the tree
+  b4=$(gc "kill $mew" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$mew)                 # the session's own root process
+  b5=$(gc "kill ${tmxc:-$tmx}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare55)     # under a tmux
+  b6=$(gc "pkill -f $T/d55me" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$bare55)      # …and the same run by pattern, from a root that did not start it: its own, since it stands in the tree
+  [ "$b1$b2$b3$b4$b5$b6" = "222220" ] || { r=1; echo "      member-facing $b1, fallback root $b2, interactive claude $b3, own root $b4, under tmux $b5, in-tree by pattern $b6"; }
+  kill -0 "$far55" 2>/dev/null || { r=1; echo "      the fixture process is gone: a probe signalled it"; }
+  ok "a signal that is not 0 in effect is refused whatever zero the line spells; a run in the member-facing dir, a fallback cwd, an interactive claude, the root process and a pane child are all refused" $r
+  # 56. …AND THE TEXT SHAPES THE BASE REFUSED (the same two reviews). A quoted runner name is the runner: `"bash"
+  #     -c "…; <gated>"` and `SQ sh SQ -c` are refused, a quoted string naming sh in prose still passes. A `#`
+  #     after an escaped blank is inside a word, not a comment, so the command after the `;` is read; a `#`
+  #     quoted for an inner shell cannot be told from a comment once the quotes are off, so the raw re-read
+  #     walks past it. A python body line that hands a string to a shell is read raw as well; a docstring naming
+  #     the tool, and an import with a comment, stay data.
+  ASKS=$T/asks56; CALLS=$T/calls56; : > "$CALLS"
+  pair "a quoted runner name, a \`#\` inside a word or inside an inner shell's quotes, and a python line that runs a shell string are all refused; the prose spellings pass" <<'P56'
+git commit -m "sh: quote the runner name; cc-land is not run here"
+%
+"bash" -c "true; cc-land 7"
+--
+cc board note demo t1 "the -c flag is documented in bash(1)"
+%
+'sh' -c 'nice cc-land 7'
+--
+echo "su" > /dev/null
+%
+'su' -c 'x; systemctl --user restart demo-unit'
+--
+echo a\ \#b # cc-land 7 later, by hand
+%
+echo a\ #b; cc-land 7
+--
+echo "a # b"
+%
+echo a\;#b; tmux kill-server
+--
+bash -c 'echo " # not a comment"'
+%
+bash -c 'echo " #"; timeout 5 cc-land 7'
+--
+python3 - <<'PY'
+import subprocess  # the suite runner below
+"""docstring: cc-land is not run here; the mail door is closed"""
+subprocess.run(["pytest", "-q"])
+PY
+%
+python3 - <<'PY'
+import subprocess; subprocess.run("bash -c 'echo x; cc-land 7'", shell=True)
+PY
+--
+%
+python3 - <<'PY'
+import os; os.system("echo x; cc-land 7")
+PY
+P56
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -1313,7 +1584,13 @@ AT='(^|[;&|(){}`]|\$\() *(((then|else|elif|do|time|env|nohup|xargs|command|eval|
 # its terminator really appears later (an unterminated `<<` swallows nothing), and never when anything on the
 # same line could EXECUTE it — an interpreter, eval, xargs, ssh, sudo fed a heredoc really does run its body,
 # and that is the one case where the body IS the command. Both fail CLOSED, back to matching the raw text.
+# A body a NON-SHELL interpreter runs (python, perl, …: $XI below) is read in that language — quote-aware, never
+# raw — and a body line kept for its substitution keeps the substitution's interior alone (hay: keep, subs).
 X='(^|[;&|(){}`]|[$][(])[ \t]*(((then|else|do|time|env|nohup|xargs|command|sudo)|[A-Za-z_][A-Za-z0-9_]*=[^ \t]+)[ \t]+)*([^ \t]*/)?(bash|sh|zsh|ksh|dash|python[0-9.]*|perl|ruby|node|php|awk|sed|eval|exec|source|[.]|xargs|env|ssh|sudo|systemd-run)([ \t]|$)'
+# …AND WHICH OF THOSE ARE NOT A SHELL. A body fed to one of these is read in that language (hay: keep), because a
+# Python patch script or a docstring naming the outbound door is data, not a command line; the shells and the
+# wrappers that hand a body to one stay in $X alone and their bodies are still walked as shell.
+XI='(^|[;&|(){}`]|[$][(])[ \t]*(((then|else|do|time|env|nohup|xargs|command|sudo)|[A-Za-z_][A-Za-z0-9_]*=[^ \t]+)[ \t]+)*([^ \t]*/)?(python[0-9.]*|perl|ruby|node|php|awk|sed)([ \t]|$)'
 # A WRAPPER WORD IS NOT A WAY PAST A GATE. $AT recognises a fixed set of wrappers, so ANY word it does not
 # know hid the command behind it — measured 2026-09-02: `pkill -f claude` refused, `timeout 5 pkill -f claude`
 # allowed; `tmux kill-server` refused, `setsid tmux kill-server` allowed. That is one hole in all 24 rules, not
@@ -1369,10 +1646,12 @@ NOEXEC=': [ [[ true false test echo printf cd pwd export unset set local declare
 # '<a gated command> did x'` is denied where `git commit -m 'no <gated command> here'` is not, and the leading
 # word is the whole difference. It is kept that way deliberately, because the position that reads the message
 # is the position that reads `su -c '<a gated command>'`; both sides are asserted below (review of #193).
-# THE SAME FENCE AS THE HEREDOC KEEPS IT HONEST: when anything on the line could EXECUTE a string ($Q — a shell,
-# an interpreter, eval, xargs, ssh, sudo, systemd-run), the quotes are ignored and the line is walked as raw
-# text as well, so `bash -c "timeout 5 pkill x"` still puts `pkill x` in command position. A line that ENDS
-# inside a quote is walked raw too. Both fences fail CLOSED, and both only ever ADD positions.
+# THE SAME FENCE AS THE HEREDOC KEEPS IT HONEST: when a BARE word of a statement could EXECUTE a string ($Q — a
+# shell, an interpreter, eval, xargs, ssh, sudo, systemd-run), the quotes of THAT statement are ignored and it is
+# walked as raw text as well, so `bash -c "timeout 5 pkill x"` still puts `pkill x` in command position, while
+# the `sed` at the other end of a pipe, or a `watch` inside a note, no longer turns its neighbours raw (scan).
+# A line that ENDS inside a quote is walked raw whole. Both fences fail CLOSED, and both only ever ADD positions.
+# A line is first made whole: a quote that runs on to the next line joins it (hay), and a `#` comment ends it.
 # $Q IS THE ONE LIST IN HERE WHOSE GAP IS A BYPASS RATHER THAN A FALSE POSITIVE, so it carries everything
 # that runs a STRING, not just the shells: `su -c '<wrapper> <command>'` was allowed while `su -c '<command>'`
 # was refused, because a quoted run is one token and only its FIRST word is a command position — the interior
@@ -1385,7 +1664,7 @@ Q='(^|[^A-Za-z0-9_.-])(bash|sh|zsh|ksh|dash|python[0-9.]*|perl|ruby|node|php|awk
 cmdpos(){   # every position in $1 a command could START at, one per line, original text first
   awk -v NE="$NOEXEC" -v Q="$Q" '
     BEGIN { m = split(NE, a, /[ \t\n]+/); for (i = 1; i <= m; i++) if (a[i] != "") noexec[a[i]] = 1
-            SQ = sprintf("%c", 39); MK = sprintf("%c", 1)     # the two bounds are per statement: see flush()
+            SQ = sprintf("%c", 39); MK = sprintf("%c", 1); M2 = sprintf("%c", 2)   # the two bounds are per statement: see flush()
             for (i = 1; i < 128; i++) ORD[sprintf("%c", i)] = i }   # …and ansic needs a code back from a char
     # A BACKSLASH IS NOT PART OF A COMMAND NAME. `\cc other --go` runs cc — the shell drops the backslash and
     # only skips alias lookup — and `awk "BEGIN{system(\"cmd\")}"` hands awk the same string the single-quoted
@@ -1482,8 +1761,13 @@ cmdpos(){   # every position in $1 a command could START at, one per line, origi
     # closes that pattern and not the substitution. Quotes in there hold their parens too, and one that never
     # closes on the line stays verbatim to the end: fail closed, which is what the whole-line tail did for every
     # line. $(( )) arithmetic and a nested $( ) need no case of their own: their parens count like any other.
-    function flatln(s,   i, n, c, q, j, out, insub, dep, co, cw, cq) {
-      q = ""; out = ""; n = length(s); insub = 0; dep = 0; co = 0; cw = ""; cq = ""
+    # A `#` IS A COMMENT ONLY AT THE START OF A WORD, and the character before it says nothing about that on its
+    # own: in `echo a\ #b; <gated>` the blank before the `#` was CONSUMED by the backslash, so the `#` is inside
+    # the word `a #b` and the shell runs what follows the `;`. Reading the previous character cut the line there
+    # and the gated command never reached ^ (landing review of #404). So `we` tracks whether the current word is
+    # empty — reset only by an UNESCAPED blank or operator, set by anything else emitted — the way scan() does.
+    function flatln(s,   i, n, c, q, j, out, insub, dep, co, cw, cq, we) {
+      q = ""; out = ""; n = length(s); insub = 0; dep = 0; co = 0; cw = ""; cq = ""; we = 1
       for (i = 1; i <= n; i++) { c = substr(s, i, 1)
         if (insub) {                                              # inside a substitution: a separator or redirect in
           # …AND THE SHELL STILL PARSES THE INTERIOR. It once emitted every char verbatim, so a command name quoted
@@ -1529,10 +1813,12 @@ cmdpos(){   # every position in $1 a command could START at, one per line, origi
         # walked past the gate list (2nd adversarial review of #243). Both characters go, in "" and bare alike.
         if (c == "$" && substr(s, i+1, 1) == SQ) {                  # a dollar-quote: ANSI-C, see ansic above
           j = ansend(s, i + 2)
-          if (j) { out = out ansic(substr(s, i + 2, j - i - 2)); i = j; continue } }
-        if (c == "\\" && substr(s, i+1, 1) == "\\") { i++; continue }
-        if (c == "\\") { out = out substr(s, i+1, 1); i++; continue }   # \cc IS cc — and an escaped quote still opens nothing
-        if (c == "\"" || c == SQ) { q = c; continue }               # the opening quote: dropped
+          if (j) { out = out ansic(substr(s, i + 2, j - i - 2)); i = j; we = 0; continue } }
+        if (c == "\\" && substr(s, i+1, 1) == "\\") { i++; we = 0; continue }
+        if (c == "\\") { out = out substr(s, i+1, 1); i++; we = 0; continue }   # \cc IS cc — and an escaped quote still opens nothing; an escaped blank is part of the word
+        if (c == "\"" || c == SQ) { q = c; we = 0; continue }       # the opening quote: dropped, but the word is not empty
+        if (c == "#" && we) break                                   # a comment: see scan(), and the note above
+        we = (index(" \t;&|(", c) > 0)                             # an unescaped blank or operator starts a new word
         out = out c }
       return out
     }
@@ -1550,26 +1836,50 @@ cmdpos(){   # every position in $1 a command could START at, one per line, origi
           print strip(out) }                            # strip, NOT flatln: `--filter=CMD` hands CMD to a shell, so
       }                                                 # loop above never reaches it: split it off at the first =
     }
-    function scan(line, qa,   i, n, c, q, cur, nt, t) {   # returns non-empty if the line ended inside a quote
-      q = ""; cur = ""; nt = 0; n = length(line)
+    # A STRING-RUNNER IS READ PER STATEMENT, NOT PER LINE. The quote-blind reading used to be switched on by a $Q
+    # word ANYWHERE on the line, prose included: `cc board note … "…; watch the journal"` and `grep x f | sed …`
+    # both put every quoted word in command position, and eight board rows in ten days were that one mechanism
+    # (a-guard-reads-the-command-not-the-text). Now the quote-aware scan records each statement it walked — its
+    # source text and whether one of its BARE tokens (never a quoted one) names a string-runner — and only those
+    # statements are re-read raw, while the rest of the same line keeps its quotes. `su -c "…"`, `bash -c "…"`
+    # and `watch "…"` still turn their own statement raw; a `sed` in a pipe no longer turns its neighbours raw.
+    # …AND A QUOTED NAME IS STILL THE NAME. The shell runs `"bash"`, `SQ sh SQ` and `""bash` exactly as bash, so a
+    # token is judged by its STRIPPED form: one word (no blank) that matches $Q is a string-runner, quoted or not
+    # — the first cut called any token that opened with a quote prose, and `"bash" -c "x; <gated>"` walked past
+    # every gate at both tiers (landing review of #404, security read). A quoted string WITH a blank is prose.
+    function tokq(tok,   h) {   # a token that names a string-runner: its statement is walked raw as well
+      if (tok == "") return 0
+      h = strip(tok); if (h ~ /[ \t]/) return 0
+      return (h ~ Q) }
+    function stmt(line, st, i, sep, hq) {   # one statement of the quote-aware scan: kept for the raw re-read
+      NST++; SPN[NST] = substr(line, st, i - st); SEP[NST] = sep; HQ[NST] = hq }
+    function scan(line, qa,   i, n, c, q, cur, nt, t, st, hq) {   # returns non-empty if the line ended inside a quote
+      q = ""; cur = ""; nt = 0; n = length(line); st = 1; hq = 0
       for (i = 1; i <= n; i++) { c = substr(line, i, 1)
         if (q != "") { if (q == "\"" && c == "\\") { cur = cur substr(line, i, 2); i++; continue }   # \" does not close
                        cur = cur c; if (c == q) q = ""; continue }
         if (c == "\\") { cur = cur substr(line, i, 2); i++; continue }   # \| is an escaped char, not a pipe
         if (qa && (c == "\"" || c == SQ)) { q = c; cur = cur c; continue }
-        if (c == " " || c == "\t") { if (cur != "") { t[++nt] = cur; cur = "" }; continue }
-        if (c == "$" && substr(line, i+1, 1) == "(") { if (cur != "") t[++nt] = cur
-          flush(t, nt, qa); delete t; nt = 0; cur = ""; i++; continue }
+        # A COMMENT RUNS NOTHING. A `#` that starts a word — after blank, `;`, `&`, `|` or `(`, or at ^ — ends
+        # the line for the shell, and for every shell an interpreter string reaches; `${#x}` and `a#b` are words.
+        # ONLY THE QUOTE-AWARE PASS CAN SAY SO: the raw re-read has dropped the quotes, so a `#` that was quoted
+        # for the inner shell looks exactly like a comment there — `bash -c "echo \" #\"; timeout 5 <gated>"`
+        # cut the raw walk at the `#` and the gated command never reached ^ (review of #404). The raw pass is
+        # comment-blind, as it was before the per-statement re-read: a false refusal is the safe way to be wrong.
+        if (qa && c == "#" && cur == "" && (i == 1 || index(" \t;&|(", substr(line, i - 1, 1)) > 0)) break
+        if (c == " " || c == "\t") { if (cur != "") { hq += tokq(cur); t[++nt] = cur; cur = "" }; continue }
+        if (c == "$" && substr(line, i+1, 1) == "(") { if (cur != "") { hq += tokq(cur); t[++nt] = cur }
+          flush(t, nt, qa); if (qa) stmt(line, st, i, "$(", hq); delete t; nt = 0; cur = ""; i++; st = i + 1; hq = 0; continue }
         # `{}` GLUED IS THE PLACEHOLDER find PASSES, NEVER A COMMAND GROUP — a group needs a space after the
         # brace, and splitting on it truncated the statement before its target: `find -exec cp {} ~/bin/cc-guard`
         # put a bare `cp` at ^ with nothing after it, so the write fence had no target to judge and it overwrote a
         # live binary (3rd adversarial review of #243). Only the adjacent pair is a word; `{ cd x; …` still splits.
         if (c == "{" && substr(line, i+1, 1) == "}") { cur = cur "{}"; i++; continue }
-        if (index(";&|(){}`", c) > 0) { if (cur != "") t[++nt] = cur
-          flush(t, nt, qa); delete t; nt = 0; cur = ""; continue }
+        if (index(";&|(){}`", c) > 0) { if (cur != "") { hq += tokq(cur); t[++nt] = cur }
+          flush(t, nt, qa); if (qa) stmt(line, st, i, c, hq); delete t; nt = 0; cur = ""; st = i + 1; hq = 0; continue }
         cur = cur c }
-      if (cur != "") t[++nt] = cur
-      flush(t, nt, qa)
+      if (cur != "") { hq += tokq(cur); t[++nt] = cur }
+      flush(t, nt, qa); if (qa) stmt(line, st, i, "", hq)
       return q
     }
     # A STATEMENT LINE IS MARKED, A SUFFIX IS NOT. The first whole-line print below is the command AS THE SHELL
@@ -1597,7 +1907,28 @@ cmdpos(){   # every position in $1 a command could START at, one per line, origi
       # a cd into another repo, then that empty pair, then a write, went through (first cut of this same fix).
       # A statement line is a mark and its text, so it can never spell two. NOTE no apostrophe survives in here:
       # this comment sits inside the single-quoted awk program, and one closed it (this fix, again).
-      if (scan($0, 1) != "" || $0 ~ Q) { print MK MK; print MK strip($0); scan($0, 0) } }' <<<"$1"
+      # …AND ONLY THE STATEMENT WITH A BARE STRING-RUNNER IS RE-READ RAW (see scan). The second marked line is
+      # the same line with just those statements quote-blind, so the cd walk still sees one line read twice;
+      # a line that ends inside a quote is what it always was: unreadable, so the whole of it goes raw.
+      # A LINE OF A NON-SHELL INTERPRETER BODY (M2 in front: see hay) is Python or Perl, not shell: it gets the
+      # quote-aware reading and its suffixes, never the raw one — a docstring or a string literal there is data…
+      # …UNLESS SOMETHING ON THE LINE CAN RUN A STRING. `subprocess.run("bash -c ...; <gated>", shell=True)` and
+      # `os.system("x; <gated>")` hand the string to a shell, and the quote-aware reading left the gated command
+      # inside one opaque token (review of #404; the base refused the first by its $Q word). So a body line that
+      # holds the door that language has to a shell — system, popen, exec, spawn, run/call (subprocess, Popen, check_*), shell=True, a
+      # backtick or qx — is walked raw as well, the fail-closed rule the shell lines keep. Not a $Q word: that
+      # is the trigger the row above took out, and `# the patch script` would turn a comment line raw again. A
+      # docstring or a comment that only NAMES a tool matches none of these and stays data.
+      if (substr($0, 1, 1) == M2) { body = substr($0, 2); print flatln(body); NST = 0; scan(body, 1)
+        if (body ~ /(system|popen|exec|execv[pe]*|spawn[a-z]*|run|call|check_output|check_call|Popen)[ \t]*\(|shell[ \t]*=[ \t]*True|`|\bqx\b|subprocess/) { print strip(body); scan(body, 0) }
+        next }
+      NST = 0; eq = scan($0, 1); anyq = 0
+      for (k = 1; k <= NST; k++) anyq += HQ[k]
+      if (eq != "") { print MK MK; print MK strip($0); scan($0, 0) }
+      else if (anyq) { print MK MK; hyb = ""
+        for (k = 1; k <= NST; k++) hyb = hyb (HQ[k] ? strip(SPN[k]) : flatln(SPN[k])) SEP[k]
+        print MK hyb
+        for (k = 1; k <= NST; k++) if (HQ[k]) scan(SPN[k], 0) } }' <<<"$1"
 }
 hay(){   # the text the rules match: heredoc bodies out, quotes stripped, every command position at ^
   local c=$1
@@ -1605,10 +1936,56 @@ hay(){   # the text the rules match: heredoc bodies out, quotes stripped, every 
   # is a member's to write: `git commit -m "<0x01>cd ~/dev/ws1"` put a marked line in the haystack, so a quoted cd
   # was read as a statement again and cancelled a real one (4th adversarial review of #243). It comes off the text
   # before the walk ever sees it — here, once, so no path into cmdpos can carry one; ansic never emits one either.
-  c=${c//$'\001'/}
-  case "$c" in *'<<'*) c=$(awk -v X="$X" '
-      BEGIN { SQ = sprintf("%c", 39) }
+  c=${c//$'\001'/}; c=${c//$'\002'/}
+  # THIS PRE-PASS NOW RUNS ON EVERY COMMAND, heredoc or not, because it is also where a line is made whole: a
+  # quoted string that runs on to the next line (a board note, a commit message) was cut at the newline and the
+  # second half walked as a fresh statement, so `cc board note … "line one<newline>systemctl --user restart x is
+  # needed"` was refused as a restart. Lines are joined while a quote is open — with a `;`, which is inert inside
+  # the quote and a separator in the raw reading, exactly what a newline is to `bash -c "…"`. A heredoc body is
+  # never joined: it is data, and its terminator must stay a line of its own.
+  c=$(awk -v X="$X" -v XI="$XI" -v Q="$Q" '
+      BEGIN { SQ = sprintf("%c", 39); M2 = sprintf("%c", 2) }
       { L[NR] = $0 }
+      function qend(s,   i, n, c, q) {   # the quote a line ends inside, or nothing; a comment ends the line
+        n = length(s); q = ""
+        for (i = 1; i <= n; i++) { c = substr(s, i, 1)
+          if (q != "") { if (q == "\"" && c == "\\") i++; else if (c == q) q = ""; continue }
+          if (c == "\\") { i++; continue }
+          if (c == "\"" || c == SQ) { q = c; continue }
+          if (c == "#" && (i == 1 || index(" \t;&|(", substr(s, i - 1, 1)) > 0)) return "" }
+        return q
+      }
+      # A KEPT BODY LINE IS ITS SUBSTITUTIONS, NOT THE PROSE AROUND THEM. `$(date -u) cc-land refused the merge`
+      # in a journal heredoc stayed in the haystack whole, and the `)` put the landing tool in command position;
+      # what the shell RUNS there is the interior of the $( ), the backtick and the ${ }, so that is what stays.
+      # One that never closes, or holds a `case` (whose `)` is a pattern, not a close), keeps the whole line.
+      function subs(s,   i, n, c, out, j, d, q, st) {
+        out = ""; n = length(s)
+        for (i = 1; i <= n; i++) { c = substr(s, i, 1)
+          if (c == "\\") { i++; continue }
+          if (c == "`") { j = index(substr(s, i + 1), "`"); if (j == 0) return s
+            out = out substr(s, i + 1, j - 1) "\n"; i += j; continue }
+          if (c == "$" && (substr(s, i + 1, 1) == "(" || substr(s, i + 1, 1) == "{")) {
+            st = i + 2; d = 1; q = ""
+            for (j = st; j <= n; j++) { c = substr(s, j, 1)
+              if (q != "") { if (c == "\\") j++; else if (c == q) q = ""; continue }
+              if (c == "\\") { j++; continue }
+              if (c == "\"" || c == SQ) { q = c; continue }
+              if (c == "(" || c == "{") d++
+              else if (c == ")" || c == "}") { d--; if (d == 0) break } }
+            if (d != 0 || substr(s, st, j - st) ~ /(^|[^A-Za-z0-9_])case([^A-Za-z0-9_]|$)/) return s
+            out = out substr(s, st, j - st) "\n"; i = j; continue } }
+        sub(/\n$/, "", out); return out
+      }
+      # WHAT A KEPT BODY LINE IS TO THE HAYSTACK. Fed to a NON-SHELL interpreter (xi: python, perl, ruby, node,
+      # php, awk, sed) the body is that language, not shell, and it goes out marked M2 so cmdpos gives it the
+      # quote-aware reading only — a string literal or a docstring naming a gated command is data, while
+      # `os.system("<gated command>")` still lands at a `(` (a-guard-reads-the-command-not-the-text). Anything
+      # else keeps only what the shell expands in it (subs). A shell fed a heredoc is not here: its body stays
+      # whole, as statements, the way it always has (head ~ X, and not xi).
+      function keep(s) {
+        if (xi) { print M2 s; if (!bq && s ~ /[$][({]|`/) print subs(s) }
+        else if (s ~ /[$][({]|`/) print subs(s) }
       # A `<<` INSIDE QUOTES OR BEHIND A `#` OPENS NOTHING. This pre-pass was quote- and comment-blind, so
       # `echo \047<< EOF\047` opened a heredoc bash never opens and every line down to the next EOF left the
       # haystack — with it the tmux fence, the gate list and the write fence, all of them, for a payload
@@ -1628,32 +2005,40 @@ hay(){   # the text the rules match: heredoc bodies out, quotes stripped, every 
       # `$(cc other t1 --go)` really dispatches, and the same body could read the credentials, merge a PR or
       # copy over a live binary through a backtick — every one of them was dropped as prose (5th adversarial
       # review of #243). `<<QUOTED` and `<<-\047EOF\047` are literal and still go. So the delimiter says which:
-      # bare, the body lines carrying a substitution or a parameter stay in the haystack, and the rest of the
-      # body — the prose this whole drop exists for — still goes.
+      # bare, the INTERIOR of each substitution or parameter on a body line stays in the haystack (subs above:
+      # the prose around it was refused for a `)` putting the next word in command position), and the rest of
+      # the body — the prose this whole drop exists for — still goes.
       # …AND A BACKSLASH AT THE END OF A BODY LINE JOINS THE NEXT ONE, so a substitution spread over two lines
       # was tested one line at a time and neither half carried the whole of it: `$(cp /dev/null \\` over
       # `~/bin/cc-guard)` truncated a live binary (6th adversarial review of #243). The lines are joined the
       # way the shell joins them, and the join is what gets tested.
-      END { b = 0; bq = 0; hb = ""
+      END { b = 0; bq = 0; hb = ""; xi = 0
         for (i = 1; i <= NR; i++) {
-          if (b) { if (L[i] ~ t) { if (hb ~ /[$][({]|`/) print hb; b = 0; hb = ""; continue }   # a body line held open by a trailing backslash JOINS this delimiter line: its pending substitution stays in the haystack, untested it truncated a live binary (7th adversarial review of #243)
-                   if (bq) continue
+          if (b) { if (L[i] ~ t) { if (hb != "") keep(hb); b = 0; hb = ""; xi = 0; continue }   # a body line held open by a trailing backslash JOINS this delimiter line: its pending substitution stays in the haystack, untested it truncated a live binary (7th adversarial review of #243)
+                   if (bq && !xi) continue
                    hb = hb L[i]
-                   if (hb ~ /\\$/) { sub(/\\$/, "", hb); continue }   # continued: the next line is the same line
-                   if (hb ~ /[$][({]|`/) print hb
-                   hb = ""; continue }
-          print L[i]                                        # the line that OPENS a heredoc is still a command
-          n = hdpos(L[i]); if (n == 0) continue
-          head = substr(L[i], 1, n - 1); rest = substr(L[i], n + 2)
+                   if (!xi && hb ~ /\\$/) { sub(/\\$/, "", hb); continue }   # continued: the next line is the same line
+                   keep(hb); hb = ""; continue }
+          cur = L[i]
+          while (qend(cur) != "" && i < NR) { i++; cur = cur ";" L[i] }   # an open quote runs on: one logical line
+          print cur                                         # the line that OPENS a heredoc is still a command
+          n = hdpos(cur); if (n == 0) continue
+          head = substr(cur, 1, n - 1); rest = substr(cur, n + 2)
           if (index(rest, "<<") > 0) continue               # two on one line: too clever to reason about
           if (!match(rest, "^-?[ \t]*[\"\047]?[A-Za-z_][A-Za-z0-9_]*")) continue   # `<<<` and shifts are not heredocs
           w = substr(rest, RSTART, RLENGTH)
           bq = (w ~ "^-?[ \t]*[\"\047]")                    # a quoted delimiter: the body is literal, all of it
           sub("^-?[ \t]*[\"\047]?", "", w)
-          if (head ~ X) continue                            # the body would be RUN: it stays in the haystack
+          xi = 0
+          if (head ~ X) {                                   # the body would be RUN: it stays in the haystack…
+            # …as shell, unless the ONLY string-runner on the line is a non-shell interpreter (keep above). With
+            # a second one there (`sudo python3`, `python3 … | bash`) the body is walked as shell, as it was.
+            t2 = cur; sub(/(^|[^A-Za-z0-9_.\/-])([^ \t]*\/)?(python[0-9.]*|perl|ruby|node|php|awk|sed)([ \t]|$)/, " ", t2)
+            if (head ~ XI && t2 !~ Q) xi = 1; else continue }
           t = "^[ \t]*" w "[ \t]*$"
           for (j = i + 1; j <= NR; j++) if (L[j] ~ t) { b = 1; hb = ""; break }
-        } }' <<<"$c");; esac
+          if (!b) xi = 0
+        } }' <<<"$c")
   cmdpos "$c"          # …which strips the quotes itself: it needs them to tell an argument from a command
 }
 if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones and their subagents included): nothing may kill the shared tmux server
@@ -1662,7 +2047,7 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
 fi
-role="${CC_ROLE:-}"; steward=""; mdir=""; mws=""; root=""; trepo=""; ttrack=""   # $root: the ONE tree this session writes (rule 5 below)
+role="${CC_ROLE:-}"; steward=""; mdir=""; mws=""; root=""; trepo=""; ttrack=""; kroot=""   # $root: the ONE tree this session writes (rule 5 below); $kroot: it came from a track marker (kill fence)
 # THE STEWARD IS A WORKER THAT MAY NOT SPEND. cc-steward runs one headless `claude -p` per routine event, on the
 # cheap model and unattended — which is the worst thing to leave at the widest tier. There is no marker to walk
 # to: its cwd is ~/.cc/steward/<repo>, deliberately not a worktree (cc-steward, RUNS), so $CC_ROLE is the whole
@@ -1683,7 +2068,7 @@ track_dir(){   # $1 holds a .cc/track marker: rc 0 = a real track worktree, and 
   local r t
   case "$1" in "$HOME"/.cc/worktrees/*/*) r=${1#"$HOME"/.cc/worktrees/}; t=${r#*/}; t=${t%%/*}; r=${r%%/*};; *) return 1;; esac
   case "$r$t" in *[!A-Za-z0-9._-]*) r=""; t="";; esac
-  root=$1; trepo=$r; ttrack=$t
+  root=$1; trepo=$r; ttrack=$t; kroot=1   # a track worktree is the one tree nobody else stands in: see kcwd
   if [ -n "$r" ] && [ -f "$HOME/dev/$r/.cc/member-workspace" ]; then role=member; mdir="$HOME/dev/$r"; mws="$r"
   else [ "$role" = member ] || role=worker; fi
 }
@@ -1978,14 +2363,91 @@ case "$tool" in
       }
       kheld(){   # rc 0 = pid $1 is a session or the loop runner: off limits inside the subtree as much as outside
         local c
+        [ -r "/proc/$1/cmdline" ] || return 1            # …and a pid that is gone is not held (the redirect below printed the shell's own error for it)
+        # ANY claude IS A SESSION, `-p` OR NOT. The planning session, an orch and a handoff peer stand INTERACTIVE
+        # in the same tree a member or a worker does, and a fence that held only `claude -p` left them to kcwd
+        # (review of #404). comm is the kernel's name for the binary, which the cmdline is not.
+        [ "$(cat "/proc/$1/comm" 2>/dev/null)" = claude ] && return 0
         c=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
         case "$c" in *cc-loop*) return 0;; esac
         case " $c " in *' -p '*|*' --print '*) case "$c" in *claude*) return 0;; esac;; esac
         return 1
       }
+      # A RUN THIS WORKER DETACHED IS STILL ITS OWN. The templates tell a worker to `setsid nohup` a long gate so
+      # it outlives the iteration; that reparents the run to init, the subtree test then read it as somebody
+      # else's, and the worker could neither poll nor stand down the run it had armed (rows raised-guard-blocks-
+      # stopping-your-own-detached-run, -liveness-check-on-exited-pid). What a detached run keeps is where it
+      # STANDS: it was started from this worker's tree and its cwd is still there, and nothing another session
+      # started stands in this worker's worktree — a session or a loop runner that does is kheld's, checked first.
+      # So a pid is the worker's own if it is a descendant of its session OR it, or one of its ancestors, has its
+      # cwd inside $root. An ancestor, because the run's own children (a suite cd'd into its gate dir) are its.
+      # …AND ONLY WHERE "NOTHING ELSE STANDS THERE" IS TRUE, WHICH IS A TRACK WORKTREE. A member-facing dir is
+      # shared ground — the planning session, an orch, a lander and a handoff peer all stand in ~/dev/<h> — and the
+      # cwd fallback (an env-only role after a `cd ~`) is every process on the box; a cwd there proves nothing,
+      # so $kroot (set by track_dir alone) gates this. And a chain that passes a claude, a tmux pane or the loop
+      # runner on its way to init is a SESSION's, not a detached run's: the run this fence exists for was
+      # reparented to init and passes none of them (landing review of #404: the first cut handed a host-owned
+      # process standing in a member's dir, and every interactive session in the tree, over to the member).
+      kcwd(){   # rc 0 = pid $1 is a detached run standing in this worker's own worktree, or a child of one
+        [ -n "$kroot" ] || return 1
+        local p=$1 n=0 d r hit=""
+        r=$(realpath -m -- "$root" 2>/dev/null) || r=$root
+        [ -n "$r" ] && [ "$r" != / ] || return 1
+        while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+          case "$(cat "/proc/$p/comm" 2>/dev/null)" in claude|tmux*|cc-loop) return 1;; esac
+          d=$(readlink "/proc/$p/cwd" 2>/dev/null) && case "$d" in "$r"|"$r"/*) hit=1;; esac
+          p=$(kppid "$p"); n=$((n+1))
+        done
+        [ -n "$hit" ]
+      }
+      kabove(){   # rc 0 = pid $1 is this session's own process, or one above it (kdesc excludes both; kcwd must too)
+        local p=$me n=0
+        while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 64 ]; do
+          [ "$p" = "$1" ] && return 0; p=$(kppid "$p"); n=$((n+1))
+        done
+        return 1
+      }
       kfence(){   # $1 = a pid the command would signal, $2 = how it was named
+        # A PID THAT IS NOT THERE IS REFUSED, NOT WAVED THROUGH: by the time the signal is sent that number can be
+        # anybody's, and this cannot see whose. The poll of a finished run is `kill -0`, which kprobe passes before
+        # this is reached (row raised-guard-blocks-liveness-check-on-exited-pid); the first cut of that fix let
+        # ANY signal to a gone pid through (security read of #404). Refused here, with this line as the whole of
+        # stderr — the redirects below used to print the shell's own "/proc/…: No such file" on top of the reason.
+        [ -d "/proc/$1" ] || never "killing pid $1 ($2) — there is no such process now, and by the time the signal lands that pid could be anybody's; a liveness poll is kill -0"
         kheld "$1" && never "killing pid $1 ($2) — that is a session or a loop runner, and a worker that ends one ends itself"
-        kdesc "$1" "$me" || never "killing pid $1 ($2) — it is outside this worker's own process subtree, so it is somebody else's; a worker ends only what it started"
+        kabove "$1" && never "killing pid $1 ($2) — that is this session's own process or one above it, and a worker that ends one ends itself"
+        kdesc "$1" "$me" || kcwd "$1" || never "killing pid $1 ($2) — it is outside this worker's own process subtree and is no detached run standing in its worktree, so it is somebody else's; a worker ends only what it started"
+      }
+      # SIGNAL ZERO DELIVERS NOTHING: `kill -0 <pid>` asks whether the process is there, which is how a worker
+      # waits out the gate run it detached, and the fence read it as a kill (row raised-guard-blocks-liveness-
+      # probe-signal-zero). An invocation whose signal is 0 ends no process, so it fences none; the same command
+      # with any other signal, or none, is fenced exactly as before. Spelled -0, -s 0, -n 0 or --signal 0 —
+      # except that pkill's -s is a SESSION id, not a signal: `pkill -s 0 -f x` kills, in this shell's session.
+      # …AND THE EFFECTIVE SIGNAL IS WHAT IS DELIVERED, NOT ANY ZERO ON THE LINE. The first cut called it a probe
+      # at the first zero spelling anywhere in the argv: `kill -9 <pid> -0` (bash: the FIRST dash-argument is the
+      # signal, a later -0 is process group 0), `kill -s 0 -s 9 <pid>` and `pkill -0 --signal 9 -f x` (the LAST
+      # spec wins in both) all signalled and passed (landing review and security read of #404; each shape run
+      # against a fixture). So it is a probe only when every signal spec on the line says 0 and there is at least
+      # one: for kill, only the dash-arguments in front of the first target are specs at all; for pkill and
+      # killall a spec anywhere counts, since getopt permutes. A spelling this cannot read is not a probe.
+      kprobe(){   # rc 0 = nothing is delivered. $1 = the verb: -n is a signal to kill alone, -s to kill and killall
+        local v=$1 y sk="" seen="" lead=1; shift
+        for y in "$@"; do
+          if [ -n "$sk" ]; then [ "$sk" = sig ] && { seen=1; [ "$y" = 0 ] || return 1; }; sk=""; continue; fi
+          if [ "$v" = kill ] && [ -z "$lead" ]; then continue; fi   # past the first target: pids and groups, never a signal
+          case "$y" in
+            --) lead="";;
+            --signal=*) seen=1; [ "${y#--signal=}" = 0 ] || return 1;;
+            --signal) sk=sig;;
+            -s) if [ "$v" = pkill ]; then sk="val"; else sk="sig"; fi;;   # pkill -s <session id>: a value, no signal
+            -n) if [ "$v" = kill ]; then sk="sig"; elif [ "$v" = killall ]; then sk="val"; fi;;   # pkill -n is --newest, a flag
+            -0|-SIG0) seen=1;;
+            -[0-9]*|-[A-Z]*) return 1;;                  # a real signal, spelled bare
+            -*) ;;                                       # some other flag
+            *) [ "$v" = kill ] && lead="";;              # kill: the first target ends the options
+          esac
+        done
+        [ -n "$seen" ]
       }
       me=$(kroot) || me=""
       [ -n "$me" ] || never "killing a process — this worker cannot find its own session process, so it cannot tell its children from anybody else's"
@@ -2053,6 +2515,7 @@ case "$tool" in
       prev=""
       while IFS= read -r seg; do
         if [[ $seg =~ (^|[^A-Za-z0-9_.-])xargs([[:space:]]+-[^[:space:]]+([[:space:]]+[^-][^[:space:]]*)?)*[[:space:]]+([^ ]*/)?(kill|pkill|killall)([[:space:]]|$) ]]; then
+          [[ $seg =~ (kill|pkill|killall)[[:space:]]+(.*)$ ]] && read -r -a xk <<<"${BASH_REMATCH[2]}" && kprobe "${BASH_REMATCH[1]}" "${xk[@]}" && { prev=$seg; continue; }   # fed to a probe: nothing is signalled
           kresolve "$prev" "the pids a pipeline fed to xargs kill" \
             || never "killing whatever a pipeline finds (… | xargs kill) — the pids arrive on stdin, so this worker cannot tell its own from anybody else's; the one time it guessed, it ended its own iteration"
         fi
@@ -2061,6 +2524,7 @@ case "$tool" in
       while IFS= read -r inv; do
         [[ $inv =~ (^|[^A-Za-z0-9_.-])(kill|pkill|killall)[[:space:]]+(.*)$ ]] || continue
         v=${BASH_REMATCH[2]}; read -r -a a <<<"${BASH_REMATCH[3]}"; skip=""; pat=""
+        kprobe "$v" "${a[@]}" && continue              # signal 0: a liveness probe, nothing to fence (kprobe)
         if [ "$v" = kill ]; then
           first=1                                      # only the FIRST dash-argument can be the signal
           for x in "${a[@]}"; do
