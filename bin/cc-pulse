@@ -44,8 +44,9 @@ is (the one exception is a row carrying an `agent` mark, below, which costs one 
     ledger saying "nothing open".
   · …and it is woken ONCE A DAY (CC_PULSE_IDLE_H) when none of that is true — rows in flight, asks inside their
     line, queued rows nothing can place. That look-up is the drive loop's, and the tick still CARRIES WHAT THE
-    FILES SAY — the `main-gate` row, the open asks, the rows queued or blocked, and the rows still in flight (a
-    PR in `review` above all) — so the session costs one cheap turn instead of re-deriving all of it. Every
+    FILES SAY — the `main-gate` row, the open asks, the rows queued or blocked, the rows still in flight (a
+    PR in `review` above all), and the threads the owner 📌'd to revisit (revisit_line: carried, never a reason
+    to wake) — so the session costs one cheap turn instead of re-deriving all of it. Every
     other tick on that path is one line in the log saying what it saw, and wakes nobody. The round is taken in
     pulse() below the liveness and limit tests, like the back-off and for the same reason: a seat that died
     inside it is still started, and one the limit stopped still reaches `cc-limit record`.
@@ -125,6 +126,8 @@ HOME = os.path.expanduser("~")
 BIN = os.environ.get("CC_PULSE_BIN") or os.path.dirname(os.path.realpath(__file__))   # test hook: stub siblings
 BOARDS, STATE, DEV = f"{HOME}/.cc/boards", f"{HOME}/.cc/state", f"{HOME}/dev"
 ORCHS = f"{HOME}/.cc/slack/orchs.json"          # {"<chat>": {target, alias, parent, …, archived}} — cc-slack owns it
+REVISIT = f"{HOME}/.cc/slack/revisit.json"      # {"<chat>:<root>": {at, channel, target, link, text}} — the threads the
+                                                # owner 📌'd to come back to; cc-slack owns it (on_revisit), this only reads
 LOG = f"{STATE}/pulse.log"
 LOG_MAX = 4000                                  # a 2 h timer over a dozen targets fills this in about a month
 GAP_MIN = 90                                    # minutes; see THE GAP above before changing it
@@ -494,6 +497,26 @@ def open_asks(repo):
     return len(asks), old
 
 
+def revisit_line(repo):
+    """The threads the owner 📌'd to revisit that belong to this repo's channels, as one clause for the tick — or "".
+    Brief: "the pulse/digest a planning session reads carries the pinned threads … without a new wake-up" — so this
+    rides the ticks that go out anyway and is NOT in the look (see due()): a 📌 never wakes anyone. A pin whose
+    channel routes to an orch of this repo (`repo@alias`) rides the repo's tick, since an orch is never pulsed."""
+    try:
+        d = json.load(open(REVISIT))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(d, dict):
+        return ""
+    pins = sorted((v for v in d.values() if isinstance(v, dict) and str(v.get("target") or "").split("@")[0] == repo),
+                  key=lambda v: -float(v.get("at") or 0))
+    if not pins:
+        return ""
+    said = "; ".join(f"{v.get('channel') or '?'} {str(v.get('text') or '')[:60]!r} {v.get('link') or ''}".strip() for v in pins[:3])
+    return (f"{len(pins)} thread{'' if len(pins) == 1 else 's'} the owner pinned 📌 to revisit — not an ask, do not "
+            f"nag him, keep it in view ({said}{f'; +{len(pins) - 3} more' if len(pins) > 3 else ''}; `cc-slack revisit`)")
+
+
 def last_look(target):
     """(what the last tick carried, when it carried it) — the mark the pulse leaves behind so it can tell a look
     it has already sent from a new one. ("", 0) = there has been no tick, and nothing is held against it."""
@@ -634,6 +657,10 @@ def due(target):
         f"{could} (cc-brief ready {repo})" if could else "",
         f"{len(aloft)} row{'' if len(aloft) == 1 else 's'} in flight ({', '.join(aloft[:3])})" if aloft else "",
     ])) or "no red main, no open ask, no row queued or in flight — goals are the work"
+    # …plus the owner's 📌 list, on whichever tick goes out. It is in the NOTE and never in `look`, `anything` or
+    # `actionable` below: a pin is something to keep in view, not something to wake a seat for (brief: "without a
+    # new wake-up"; "nothing nags and nothing counts it as owed").
+    note = " · ".join(filter(None, [note, revisit_line(repo)]))
     # …and this one picks the tick's TEXT, not whether there is a tick: `anything` false is the GOALS tick and
     # nothing else. What decides a wake is `actionable`, below. (A ledger that could not answer counts as
     # something too, so the tick says so rather than reading as "no asks".)
@@ -1019,7 +1046,7 @@ def selfcheck():
     import shutil
     import signal
     import tempfile
-    global HOME, BOARDS, STATE, DEV, ORCHS, LOG, BIN
+    global HOME, BOARDS, STATE, DEV, ORCHS, LOG, BIN, REVISIT
     p = f = 0
 
     def ok(name, cond):
@@ -1034,6 +1061,7 @@ def selfcheck():
         HOME, BIN = th, f"{th}/bin"
         BOARDS, STATE, DEV = f"{th}/.cc/boards", f"{th}/.cc/state", f"{th}/dev"
         ORCHS, LOG = f"{th}/.cc/slack/orchs.json", f"{th}/.cc/state/pulse.log"
+        REVISIT = f"{th}/.cc/slack/revisit.json"
         for d in (BIN, BOARDS, STATE, f"{th}/.cc/slack", f"{DEV}/alpha", f"{DEV}/beta"):
             os.makedirs(d, exist_ok=True)
         for name, body in (("tmux", FAKE_TMUX), ("cc", FAKE_CC), ("cc-msg", FAKE_MSG), ("cc-handoff", FAKE_HANDOFF),
@@ -1685,6 +1713,30 @@ def selfcheck():
            and "1 row in flight (t2 review)" in L)
         ok("(1) …and it dispatches nothing, starts nothing and writes no events line for it",
            "cc " not in d and "broker " not in d)
+
+        # (1b) THE OWNER'S 📌 LIST rides the tick and never makes one. Brief: "the pulse/digest a planning session
+        # reads carries the pinned threads … without a new wake-up" — so the same quiet board with pins on the file
+        # still wakes nobody, and a tick that goes out anyway carries this repo's pins, not another repo's.
+        json.dump({"C1:1.0": {"at": now() - 3600, "channel": "#beta", "target": "beta", "text": "move the lessons site?",
+                              "link": "https://s/p1"},
+                   "C2:2.0": {"at": now() - 60, "channel": "#beta-orch-ab12", "target": "beta@orch", "text": "orch pin",
+                              "link": "https://s/p2"},
+                   "C3:3.0": {"at": now(), "channel": "#alpha", "target": "alpha", "text": "alpha's pin", "link": "https://s/p3"}},
+                  open(REVISIT, "w"))
+        ticked(10)
+        d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "review"}}, asks="2", old="0")
+        ok("(1b) a 📌 on the file is not a reason to wake: the same quiet board, pins and all, still wakes nobody — "
+           "the log line says what it saw, pins included", "msg beta " not in d and "pinned 📌 to revisit" in L)
+        ticked(10 * 60)
+        d, L = decide({"t1": {"status": "merged"}})
+        ok("(1b) …and the tick that goes out anyway carries this repo's pins — its own and its orchs', never another "
+           "repo's — with the channel, the root line and the link, and says it is not an ask",
+           "msg beta " in d and "2 threads the owner pinned 📌 to revisit" in d and "#beta 'move the lessons site?' https://s/p1" in d
+           and "https://s/p2" in d and "alpha" not in d.split("pinned", 1)[1] and "not an ask" in d
+           and "pinned" not in open(f"{STATE}/beta/pulse.look").read())   # in the note, never in the look
+        os.remove(REVISIT)
+        d, L = decide({"t1": {"status": "merged"}})
+        ok("(1b) …and with no file (or none of this repo's) the clause is absent, not empty", "pinned" not in d)
 
         # (2) EACH of the three things a seat can act on, and beside each one the control that differs only in
         # that thing. The payload is today's, unchanged — the wake is what moved, not the sentence.

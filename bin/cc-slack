@@ -23,6 +23,7 @@
   cc-slack history <#chan|C…|D…> [n] | thread <#chan|C…> <ts> [n]   read a channel / a full thread (newest first, cursor-paged)
   cc-slack edit <chan> <ts> "new text" | unsay <chan> <ts>          rewrite / delete one of the BOT's own posts (signed ones too)
   cc-slack pin <chan> <ts> | unpin <chan> <ts> | canvas <chan> "Title" < file.md   pin a message · replace a channel canvas
+  cc-slack revisit [--json]          the threads the owner 📌'd to come back to: when · channel · root line · link (no daemon needed)
   cc-slack status | channels [--for <repo>] | setup [--bot xoxb-…] [--app xapp-…] [--owner-email you@x] | accept-dialog <tmux-window>
                                       --for: `C… #name` for every channel of ONE project — its two lanes, its
                                       #<repo>--<track> channels, its sub-orch channels (cc-pause tells each one)
@@ -75,6 +76,10 @@ already in that channel, the bot never invites anyone, and @main/@<alias> stay s
 A reaction is a verdict, and ANYONE in the channel may give one: a member's :+1: in #approvals merges that PR and their
 🏁 closes a thread, exactly as the owner's does — the owner curates who is in each channel, and that membership IS the gate
 (who reacted travels to the session as name + role). Reactions in a DM stay the owner's, no channel gating them.
+The owner's 📌 is the one reaction that is NOT a verdict: on any message of a thread it marks the thread "revisit" — kept in
+~/.cc/slack/revisit.json until the 📌 comes off, shown on the Home tab (TO REVISIT), carried by the pulse tick and the daily
+digest, listed by `cc-slack revisit`. It opens no ask, counts as nothing owed, reaches no session and never nudges or mails
+him; a member's 📌 does nothing.
 Only the owner steers the box: permission answers, `!` commands beyond !help/!status, @alias hand-offs, status marks and
 App Home are owner-only, and a member cannot authorize what the box gates on the owner.
 In-Slack commands (`!help`/`!status` anyone, the rest owner only, any channel or thread): `!help !ping !status !digest !sessions !start !say !threads !box`
@@ -167,10 +172,12 @@ OWNER_ACK = re.compile(r"^\s*(ok(ay)?|k|kk|thanks?( you)?|thx|ty|great|cool|nice
 ASKED = STATUS_EMOJI["❓"]                                    # the marks key a sender's "this needs the owner" is remembered under
 SESSION_MARKS = WORK_NAMES                                   # the SESSION's own statements on a root (done / working): a 🏁 leaves them
 BOOK_NAMES = CONV_NAMES                                      # the bot's bookkeeping (❓🔴🟠 + the v1 dot): what a 🏁 strips
+REVISIT_NAME = "pushpin"                                       # the owner's 📌: "something I want to come back to" (on_revisit)
 REACTION_CHAR = {"+1": "👍", "thumbsup": "👍", "-1": "👎", "thumbsdown": "👎", "white_check_mark": "✅", "x": "❌",
                  "eyes": "👀", "heavy_check_mark": "✔️", "raised_hands": "🙌", "tada": "🎉"}   # what the owner's reaction is called when we hand it to a session
-OUR_ANSWER_SKIP = (frozenset(STATUS_NAMES) - {"white_check_mark"}) | {"eyes", "checkered_flag"}   # our OWN reactions that answer nothing:
-                                                               # 👀 only says "received", the marks and a 🏁 are bookkeeping
+OUR_ANSWER_SKIP = (frozenset(STATUS_NAMES) - {"white_check_mark"}) | {"eyes", "checkered_flag", REVISIT_NAME}   # reactions that answer nothing,
+                                                               # ours or theirs: 👀 only says "received", the marks and a 🏁 are
+                                                               # bookkeeping, and a 📌 is a bookmark (on_revisit), never a verdict
 ORCHS = "orchs.json"                                           # {"<chat>": {target, alias, parent, name, created, seen, archived}}: a sub-orch's OWN channel
 ORCH_ID_RE = re.compile(r"-[a-z0-9]{4}$")                      # the 4-char tail an orch channel name ends with (stripped when it spawns its own)
 ORCH_KEEP = 7 * 86400                                          # how long an archived orch stays in the table before it is forgotten
@@ -179,6 +186,8 @@ CHAN_MAX = 80                                                  # Slack's cap on 
 B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 CANVASES = "canvases.json"                                     # {"<chat>": {canvas_id, title, updated}}: the canvas WE keep for a channel (see canvas_of)
 FLAGS = "flags.json"                                           # {"<chat>:<root_ts>": <flag_ts>}: WHEN the owner 🏁'd a thread (a newer message re-opens it)
+REVISIT = "revisit.json"                                       # {"<chat>:<root_ts>": {at, channel, target, link, text}}: the threads the owner 📌'd
+                                                               # to come back to (on_revisit). Durable until the 📌 comes off; `cc-slack revisit` lists it
 STALE_AFTER = 48 * 3600                                        # a thread quiet this long leaves the buckets (and loses its mark)
 STALL_AFTER = 30 * 60                                          # the owner's last word unanswered this long = a stalled session
 RETRY_GRACE = 30 * 60                                          # …and after the box has re-handed that thread to the session,
@@ -1828,6 +1837,55 @@ def load_flags():
         return {}
 
 
+def load_revisit():
+    """The threads the owner 📌'd to come back to (see REVISIT): {"<chat>:<root_ts>": {at, channel, target, link, text}}.
+    Everything a reader needs is IN the entry — cc-pulse, cc-digest and `cc-slack revisit` print it without a Slack call."""
+    try:
+        d = json.load(open(f"{DIR}/{REVISIT}"))
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_revisit(d):
+    """Atomic, 0600, under MARKS_LOCK like the other small tables — and NEVER pruned by age: a 📌 stays until the owner
+    takes it off (brief: "kept in a durable list"), which is the one thing save_timed's 30-day cut must not do to it."""
+    with MARKS_LOCK:
+        tmp = None
+        try:
+            os.makedirs(DIR, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=DIR, prefix=f"{REVISIT}.", suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(fd, 0o600); json.dump(dict(d), f)
+            os.replace(tmp, f"{DIR}/{REVISIT}")
+        except Exception as e:
+            log(f"revisit: save failed: {e!r}")
+            if tmp:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+
+
+def revisit_text(text, n=120):
+    """The root message's FIRST LINE as a person would read it: Slack markup gone, one space between words, n ch + ….
+    What the list shows for a thread, so it is decided once, when the 📌 lands, and never re-read from Slack."""
+    line = next((l for l in str(text or "").splitlines() if l.strip()), "")
+    t = re.sub(r"<[^>|]*\|([^>]*)>", r"\1", line)          # <@U…|name>, <http…|label> → the label
+    t = re.sub(r"<[^>]*>", "", t)
+    t = " ".join(re.sub(r"[`*_~]", "", t).split())
+    return t if len(t) <= n else t[:n - 1].rstrip() + "…"
+
+
+def revisit_rows(d, now=None):
+    """The list newest first, one dict per thread, with `age` rendered — the shape the Home band, the CLI and the
+    JSON output share. PURE, so selfcheck asserts it on a fixture."""
+    now = time.time() if now is None else now
+    rows = sorted(d.values(), key=lambda v: -float(v.get("at") or 0))
+    return [{"channel": str(v.get("channel") or "?"), "link": str(v.get("link") or ""), "text": str(v.get("text") or ""),
+             "target": str(v.get("target") or ""), "at": float(v.get("at") or 0),
+             "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(v.get("at") or 0))),
+             "age": home_age(now - float(v.get("at") or 0))} for v in rows]
+
+
 MARKS = "marks.json"
 
 
@@ -2062,7 +2120,7 @@ HOME_DEPTH = 4                                 # deepest sub-channel indent the 
 HOME_GRAPHS_DIR = ".cc/state/graphs"           # where cc-graphs keeps serve.pid/serve.port while it serves (CC_GRAPHS_DIR moves it)
 HOME_GRAPHS_PORT = 5190                        # cc-graphs' own default; a server that is up reports its real port in serve.port
 HOME_GRAPHS_PUB = "sudo tailscale serve --bg --https=443 {url}"   # the owner's line, PRINTED and never run: it opens a port
-HOME_CUT = ("boot", "handoffs", "audit", "spend", "chart", "graphs", "idle", "sessions", "channels", "backlog", "views")   # …and the order they go in when even
+HOME_CUT = ("boot", "handoffs", "audit", "spend", "chart", "graphs", "idle", "sessions", "channels", "revisit", "backlog", "views")   # …and the order they go in when even
                                                # that does not fit (§01d). The chart goes after the grey one-liners and before
                                                # the channels: it is 2 blocks, the most a single cut can free, and the `load`
                                                # line under it carries the same numbers in words. A tab that dropped RUNNING
@@ -2629,6 +2687,8 @@ def home_parts(st):
                           section, suborchs, and subagents to show all the work being done"). The tally counts all four.
       4b idle             tracks alive with nobody at the keyboard for HOME_IDLE — how long, never an iteration count
       5 divider           THE FOLD. Everything below is secondary by contract.
+      5b to revisit       📌 the threads the owner pinned to come back to (on_revisit) — his list, not an ask; first
+                          below the fold so it is seen on every open, cut before the backlog when the tab is full
       6 backlog           ⏳ EVERY queued track; while a usage limit holds, the count and the hour, no lines
       6b board views      To do · Running · Done — three buttons that DM one slice of the board each
       6c sessions         long-lived channel sessions (board kind=session) grouped under their repo — never RUNNING
@@ -2770,6 +2830,19 @@ def home_parts(st):
     if act and not needs:
         p.append(act)
     p.append(("fold", {"type": "divider"}))
+
+    # 5b — TO REVISIT: the threads the owner 📌'd to come back to (Daemon.on_revisit). Not an ask and not a question —
+    #      the box never nags about one and never counts it as owed — but it is his own "do not forget" list, so it is
+    #      the FIRST thing below the fold, where he sees it on every open without it displacing what needs him (owner,
+    #      2026-09-11: "something I want to come back to … something we cannot forget to revisit"). One line each:
+    #      the root's first line, linked to the thread, then the channel and how long ago he pinned it.
+    pins = [x for x in (st.get("revisit") or ()) if isinstance(x, dict)]
+    if pins:
+        p += [("revisit", _home_ctx(f"TO REVISIT · {len(pins)}")),
+              ("revisit", _home_sec(home_list([home_fit("📌 " + home_link(home_clip(x.get("text") or x.get("channel") or "?", HOME_ASK),
+                                                                              x.get("link")),
+                                                         [str(x.get("channel") or ""), str(x.get("age") or "")])
+                                                for x in pins], lambda k: f"_+{k} more · `cc-slack revisit`_")))]
 
     # 6 — the backlog: a name in a list, never a running track's weight
     if queued:
@@ -3940,6 +4013,7 @@ class Daemon:
         self.pairs = {}                                     # chat -> {root_ts: (conversation, work)} from the last sweep
         self.marks = load_marks()                            # "<chat>:<root>:<reaction>" -> when we set ✅/🔧 (v3 marks)
         self.flags = load_flags()                            # "<chat>:<root_ts>" -> ts of the owner's 🏁; a newer message un-flags it (V3)
+        self.revisit = load_revisit()                        # "<chat>:<root_ts>" -> the owner's 📌 (on_revisit): a bookmark, never a mark
         self.alarms = {}                                    # chat -> when a status changes on its own (30 min stall / 48 h expiry)
         self.snap = {}                                      # chat -> (t, buckets): reconcile's snapshot, reused by the nudge cycle
         self.home_links, self.home_cards = {}, {}           # "<chat>:<ts>" -> (permalink, when) · "repo#n" -> its #approvals card's permalink
@@ -5839,6 +5913,13 @@ class Daemon:
             return None                                    # a 🏁 closes a thread on the humans' side, never a message to a session
         if item.get("type") != "message":
             return None
+        if ev.get("reaction") == REVISIT_NAME:
+            # brief: "a :pushpin: by the owner on a root or a reply marks that thread; removing it clears the mark; a
+            # non-owner pushpin does nothing" — and a 📌 is neither an ask nor a verdict, so it reaches no session
+            # (not a delivery, not an answered_by_them: REVISIT_NAME is in OUR_ANSWER_SKIP) and arms nothing.
+            if who == self.cfg.get("SLACK_OWNER_ID"):
+                self.on_revisit(chat, ts, removed, float(ev.get("event_ts") or time.time()))
+            return None
         if self.chan_name(chat) == APPROVALS:              # #approvals is not a session: PR merges only, and only on add
             return None if removed else self.on_approval(chat, ts, ev.get("reaction"), who)
         if not removed and who == self.cfg.get("SLACK_OWNER_ID") and ev.get("reaction") not in OUR_ANSWER_SKIP \
@@ -5939,6 +6020,30 @@ class Daemon:
             self.mirrored.add(key)                         # ours from before a restart: adopt it, so it can still come off
         if ts != root_ts:                                  # 🏁 on a reply: mirror it on the top-level message, where you look
             self.mirror(chat, root_ts, True)
+
+    def on_revisit(self, chat, ts, removed, at):
+        """The owner's 📌 on ANY message of a thread marks the WHOLE thread "revisit" (owner, 2026-09-11: "something I
+        want to come back to … something we cannot forget to revisit"). Not an ask and not a question: no mark on the
+        root, no nudge, no delivery, nothing counted as owed — one entry in REVISIT that the Home tab, the pulse tick,
+        the digest and `cc-slack revisit` print. Keyed by the ROOT, so a 📌 on a reply and one on the root are the same
+        thread; the first 📌 sets the time and a second on the same thread changes nothing. Taking it off (any of them)
+        clears the entry. The entry carries what a reader needs — channel, permalink, the root's first line, when —
+        so no reader pays a Slack call; the two calls here (thread root, permalink) are paid once, at the tap."""
+        root_ts, root = self.thread_root(chat, ts)
+        key = f"{chat}:{root_ts}"
+        if removed:
+            if self.revisit.pop(key, None) is not None:
+                save_revisit(self.revisit); self.home_dirty = True
+                log(f"revisit: -{chat}/{root_ts}")
+            return
+        if key in self.revisit:
+            return
+        name = self.chan_name(chat)
+        self.revisit[key] = {"at": at, "channel": "dm" if chat.startswith("D") else f"#{name}",
+                             "target": self.route(chat, "im" if chat.startswith("D") else None) or "",
+                             "link": self.home_link(chat, root_ts), "text": revisit_text((root or {}).get("text"))}
+        save_revisit(self.revisit); self.home_dirty = True
+        log(f"revisit: +{chat}/{root_ts} {self.revisit[key]['text'][:40]!r}")
 
     def mirror(self, chat, root_ts, on):
         """OUR 🏁 mirror on a thread root: the owner flagged a REPLY, and the flag has to show where you actually look.
@@ -7591,6 +7696,7 @@ class Daemon:
                 "graphs": cached("graphs", HOME_CACHE, home_graphs),
                 "handoffs": cached("handoffs", HOME_CACHE, home_handoffs),
                 "spend": cached("spend", HOME_CACHE, home_spend),
+                "revisit": revisit_rows(self.revisit, now),   # the owner's 📌 list (on_revisit): daemon memory, no read
                 "audit_at": audit_at, "audit": verdict, "boot": boot, "chart": self.chart}
 
     def chart_store_id(self):
@@ -12030,6 +12136,92 @@ def cmd_selfcheck():
           "armed, and once the dwell is over the mirror follows the truth",
           off_entry == {} and not any(n == "checkered_flag" for _, n, _ in off_flag + retap) and armed
           and ("reactions.remove", "checkered_flag", "9300.1") in settled_off)
+    # ---- revisit: the owner's 📌 marks a thread to come back to (on_revisit) — a bookmark, never an ask or a verdict
+    dmRv = Daemon(use_slack=False); dmRv.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    dmRv.bot_user = "UBOT"; dmRv.revisit.clear(); dmRv.home_dirty = False
+    dmRv.route = lambda chat, ctype=None: "beta"; dmRv.chan_name = lambda c: "beta"
+    rv_sent = []; dmRv.deliver = lambda *a, **k: rv_sent.append(a)
+    rv_calls = []
+    rv_msgs = {"9400.1": {"ts": "9400.1", "user": "UOWNER", "text": "Should we move the *lessons* site to <https://x.y|x.y>?\nmore"},
+               "9500.1": {"ts": "9500.1", "user": "UBOT", "text": "a bot root"},
+               "9500.2": {"ts": "9500.2", "thread_ts": "9500.1", "user": "UOWNER", "text": "a reply"},
+               "9600.1": {"ts": "9600.1", "user": "UOWNER", "text": "a member's pick"}}
+    def rv_api(method, token, **kw):
+        rv_calls.append((method, kw.get("ts") or kw.get("message_ts") or kw.get("timestamp")))
+        if method == "conversations.replies":            # a reply's ts answers with the thread's parent first, as Slack does
+            m = rv_msgs[kw["ts"]]
+            return {"messages": [rv_msgs.get(m.get("thread_ts"), m)]}
+        if method == "chat.getPermalink":
+            return {"permalink": f"https://x.slack.com/archives/{kw['channel']}/p{kw['message_ts'].replace('.', '')}"}
+        return {}
+    def rv_ev(ts, who="UOWNER", removed=False, name="pushpin", at="1700.0"):
+        return {"type": "reaction_removed" if removed else "reaction_added", "reaction": name, "user": who, "event_ts": at,
+                "item": {"type": "message", "channel": "CR", "ts": ts}}
+    try:
+        globals()["api"] = rv_api
+        dmRv.on_reaction(rv_ev("9400.1"))                                       # brief (1): "a :pushpin: by the owner on a root … marks that thread"
+        marked = json.loads(json.dumps(dmRv.revisit)); marked_dirty = dmRv.home_dirty; dmRv.home_dirty = False
+        dmRv.on_reaction(rv_ev("9500.2", at="1800.0"))                          # "… or a reply"
+        dmRv.on_reaction(rv_ev("9500.1", at="1900.0"))                          # a second 📌 on the same thread: one entry, first time kept
+        two = json.loads(json.dumps(dmRv.revisit)); on_disk = load_revisit()
+        dmRv.on_reaction(rv_ev("9500.2", removed=True))                         # "removing it clears the mark"
+        cleared = json.loads(json.dumps(dmRv.revisit)); cleared_disk = load_revisit()
+        n_before = len(rv_calls)
+        dmRv.on_reaction(rv_ev("9600.1", who="UMEMBER"))                        # "a non-owner pushpin does nothing"
+        member = json.loads(json.dumps(dmRv.revisit)); member_calls = rv_calls[n_before:]
+        dmRv.on_reaction(rv_ev("9600.1", who="UMEMBER", removed=True))
+        member_off = json.loads(json.dumps(dmRv.revisit))
+    finally:
+        globals()["api"] = real_api
+    rv_one = {"CR:9400.1": {"at": 1700.0, "channel": "#beta", "target": "beta",
+                            "link": "https://x.slack.com/archives/CR/p94001", "text": "Should we move the lessons site to x.y?"}}
+    check("revisit: the owner's 📌 on a ROOT marks that thread — one entry keyed by the root, carrying channel, permalink, "
+          "the root's first line (markup gone, second line dropped) and when; the tab is told to redraw",
+          marked == rv_one and marked_dirty)
+    check("revisit: a 📌 on a REPLY marks the whole thread under its root, and a second 📌 on the same thread keeps the "
+          "first entry and its time — one thread, one row",
+          set(two) == {"CR:9400.1", "CR:9500.1"} and two["CR:9500.1"]["at"] == 1800.0 and two["CR:9500.1"]["text"] == "a bot root"
+          and on_disk == two)
+    check("revisit: taking the 📌 off (from the reply it was put on) clears that thread and no other, on disk too",
+          cleared == rv_one and cleared_disk == rv_one)
+    check("revisit: a member's 📌 does nothing — no entry, and not even a read of the thread; taking it off is as silent",
+          member == rv_one and member_off == rv_one and member_calls == [])
+    check("revisit: a 📌 is neither an ask nor a verdict — nothing is delivered to a session, it settles no thread "
+          "(answered_by_them/answered_by_us ignore it) and it opens no ❓",
+          rv_sent == [] and not dmRv.answered_by_them({"reactions": [{"name": "pushpin", "users": ["UOWNER"]}]})
+          and not dmRv.answered_by_us({"reactions": [{"name": "pushpin", "users": ["UBOT"]}]}) and dmRv.alarms.get("CR") is None)
+    rv_rows = revisit_rows(two, now=1800.0 + 3 * 86400)
+    check("revisit_rows: newest first, age and ISO stamp rendered, and revisit_text clips on a budget",
+          [r["channel"] for r in rv_rows] == ["#beta", "#beta"] and rv_rows[0]["at"] == 1800.0 and rv_rows[0]["age"] == "3d"
+          and rv_rows[1]["when"] == "1970-01-01T00:28:20Z" and revisit_text("x" * 200, 10) == "x" * 9 + "…"
+          and revisit_text("\n\n  first  line \nsecond") == "first line")
+    rv_parts = home_parts({"box": "b", "now": "12:00", "revisit": rv_rows})
+    rv_tags = [t for t, _ in rv_parts]
+    rv_txt = home_text(rv_parts).get("revisit", "")
+    check("home: TO REVISIT is its own band, FIRST below the fold — one 📌 line per thread: the root line linked to the "
+          "thread, then the channel and the age; absent when nothing is pinned",
+          rv_tags.count("revisit") == 2 and rv_tags[rv_tags.index("fold") + 1] == "revisit"
+          and "TO REVISIT · 2" in rv_txt and "📌 <https://x.slack.com/archives/CR/p95001|a bot root> · #beta · 3d" in rv_txt
+          and "revisit" not in [t for t, _ in home_parts({"box": "b", "now": "12:00"})])
+    check("home: the revisit band is cut before the backlog and after the channels — the owner's own list outlives the "
+          "channel roll, and a queued track outlives it", HOME_CUT.index("channels") < HOME_CUT.index("revisit") < HOME_CUT.index("backlog"))
+    rv_out, rv_json, rv_none = io.StringIO(), io.StringIO(), io.StringIO()
+    save_revisit(dict(rv_one))                       # the CLI's own fixture: the file as on_revisit leaves it, written here
+    with contextlib.redirect_stdout(rv_out):
+        rv_rc = cmd_revisit([])
+    with contextlib.redirect_stdout(rv_json):
+        rv_rcj = cmd_revisit(["--json"])
+    with contextlib.redirect_stderr(io.StringIO()):
+        rv_bad = cmd_revisit(["--nope"])
+    dmRv.revisit.clear(); save_revisit(dmRv.revisit)
+    with contextlib.redirect_stdout(rv_none):
+        cmd_revisit([])
+    check("cc-slack revisit: one line per pinned thread off the file (no daemon, no Slack call) — when, channel, root "
+          "line, link; --json the same rows; a stray flag is usage (2); an empty list says so",
+          rv_rc == 0 and rv_out.getvalue() == "1970-01-01T00:28:20Z\t#beta\tShould we move the lessons site to x.y?\t"
+          "https://x.slack.com/archives/CR/p94001\n"
+          and rv_rcj == 0 and json.loads(rv_json.getvalue())[0]["link"] == "https://x.slack.com/archives/CR/p94001"
+          and rv_bad == 2 and rv_none.getvalue().startswith("nothing pinned"))
     dmRx = Daemon(use_slack=False); dmRx.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
     dmRx.bot_user = "UBOT"; dmRx.bot_id = "BBOT"
     dmRx.route = lambda chat, ctype=None: "r"; dmRx.chan_name = lambda c: "repo"
@@ -16574,6 +16766,22 @@ def cmd_pin(argv, remove=False):
     return 0
 
 
+def cmd_revisit(argv):
+    """`cc-slack revisit [--json]` — the threads the owner 📌'd to come back to, newest first: when, channel, the root's
+    first line, permalink. Read off REVISIT, so it needs no daemon and costs no Slack call; --json is the same rows for
+    a tool (cc-pulse and cc-digest read the file themselves, for the same reason)."""
+    if argv not in ([], ["--json"]):
+        print("cc-slack revisit [--json]", file=sys.stderr); return 2
+    rows = revisit_rows(load_revisit())
+    if argv:
+        print(json.dumps(rows)); return 0
+    if not rows:
+        print("nothing pinned to revisit — the owner's 📌 on a thread puts it here"); return 0
+    for r in rows:
+        print("\t".join(x for x in (r["when"], r["channel"], r["text"] or "(no text)", r["link"]) if x))
+    return 0
+
+
 def load_canvases():
     """Which canvas is which channel's, as we last saw it (see CANVASES). Read from disk on every use, like the other
     small tables: a canvas is written from the CLI, never from the daemon, so there is no cache to invalidate."""
@@ -16781,6 +16989,8 @@ def main(argv):
         return cmd_pin(rest)
     elif cmd == "unpin":
         return cmd_pin(rest, remove=True)
+    elif cmd == "revisit":
+        return cmd_revisit(rest)
     elif cmd == "canvas":
         return cmd_canvas(rest)
     else:
