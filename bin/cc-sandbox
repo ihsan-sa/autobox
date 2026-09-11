@@ -54,6 +54,12 @@
 #     and it prints what it changed, including a README it could not write. Refused, with the reason: the box's own
 #     control repo, a repo with git worktrees or live tracks, and a handle the box already answers to (#box, #approvals,
 #     #alerts, an -updates lane, a name in routes.json). Then `mint`; the Slack channel pair stays the daemon's.
+#   cc-sandbox own <repo>   ~/dev/<repo>, a member workspace the OWNER made for HIMSELF (cc-sandbox convert, then this), is
+#     marked as his own: its sealed sessions get the baseline WITHOUT the ask list (SBX_ASK — sudo, the network clients,
+#     WebFetch, WebSearch). Nothing on the box sees a Claude Code ask dialog, so in his own workspace the only answerer
+#     is him, in tmux, for every curl (2026-09-10, his course workspace). Everything else about the boundary stays; a member's
+#     workspace keeps every ask. THE MARKER IS HOST-SIDE: ~/.cc/members/<repo>/owner-workspace, a directory no bind of
+#     the boundary reaches, so a session inside can neither make it nor remove it. `rm` it to take the asks back.
 # INSIDE rw: the track worktree · THREE PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
 #   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects apart from
 #   objects/pack, this track's own .git/worktrees/<n>, and — AT the fixed paths refs/heads/track and
@@ -137,6 +143,8 @@ slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.cla
 #   the outward network — --unshare-net is all-or-nothing and "none" kills claude, so the net is UNTOUCHED in here
 #   (see NETWORK above) and a client is the ordinary way data gets out. `ask` outranks `allow`, so these prompt even
 #   though ~/.claude/settings.json allows `curl` box-wide: inside the boundary the box is STRICTER than outside it.
+#   EXCEPT IN A WORKSPACE THE OWNER MADE FOR HIMSELF (`cc-sandbox own`, the header): there this list is not appended
+#   at all, because the only person who can answer the dialog is the one it interrupts (settings_copy, build_member).
 #   ITS CEILING, MEASURED (2026-09-03, these same rules through `claude -p --settings`): they are command-NAME rules
 #   and they cover a direct call, nothing more. `curl -sS https://example.com/` prompted; `sh -c 'curl …'` and
 #   `/usr/bin/curl …` did not — no denial, 559 bytes off the box, twice. `env curl` and three lines of python are the
@@ -164,14 +172,20 @@ slug(){ printf '%s' "$1" | tr '/.' '--'; }   # claude's per-cwd dir under ~/.cla
 # the file rules carry the same `//**` his own `Read` rule does. Re-measure before changing a specifier.
 SBX_ALLOW='["Bash(*)","Read(//**)","Edit(//**)","Write(//**)","NotebookEdit(//**)","mcp__cc-slack__history","mcp__cc-slack__thread"]'
 SBX_ASK='["Bash(sudo:*)","Bash(curl:*)","Bash(wget:*)","Bash(nc:*)","Bash(ncat:*)","Bash(netcat:*)","Bash(telnet:*)","Bash(socat:*)","Bash(ssh:*)","Bash(scp:*)","Bash(sftp:*)","WebFetch","WebSearch"]'
-settings_copy(){   # stdout: the settings.json the sealed session sees. Read-only in there; his own file is never written.
+settings_copy(){   # $1 "" | owner → stdout: the settings.json the sealed session sees. Read-only in there; his own file is never written.
   # rc 1 = NO copy, and the caller then binds his file unchanged and says the baseline is not applied. THE MERGE CAN
   # FAIL ON A FILE THAT PARSES: `jq -e .` proves his file is JSON, not that this filter can run on it — a hand-edited
   # `"allow": "Bash(x)"` (a string where a list belongs) parses and then aborts jq mid-stream, because `$a - "Bash(x)"`
   # is a type error. jq's exit status is the only thing that says so, so it is not discarded: a swallowed failure here
   # ro-binds an EMPTY settings.json at his path, which is a session with no rules and no cc-guard hook registration,
   # silently — the one outcome this whole function exists to prevent.
-  local s="$H/.claude/settings.json"
+  local s="$H/.claude/settings.json" k="$SBX_ASK"
+  # THE OWNER'S OWN WORKSPACE (cc-sandbox own) GETS NO ASK BASELINE — the brief: "a sealed session in a workspace the
+  # owner made for himself never stops on the ask rules that exist for members' sessions. A member's workspace keeps
+  # every one of them." So `owner` empties the list this merge appends to `ask` and touches nothing else: his own ask
+  # entries still come through, SBX_ALLOW is the same, cc-guard's member rules stand behind it as before. The caller
+  # decides `owner` from a host-side marker, never from anything the session can write (build_member).
+  [ "${1:-}" = owner ] && k='[]'
   # AND HIS FILE IS WHERE THE HOOKS LIVE, so a baseline built without one is a session with permissions and no
   # cc-guard registered — while SBX_ALLOW opens Bash all the way, which makes it MORE open than no baseline at
   # all, not less. Absent is therefore refused exactly like a file that will not parse: the caller binds nothing
@@ -182,24 +196,24 @@ settings_copy(){   # stdout: the settings.json the sealed session sees. Read-onl
   if ! jq -e . "$s" >/dev/null 2>&1; then
     echo "cc-sandbox: ~/.claude/settings.json does not parse." >&2   # the reason; settings_bind prints the consequence
     return 1; fi
-  jq --argjson a "$SBX_ALLOW" --argjson k "$SBX_ASK" \
+  jq --argjson a "$SBX_ALLOW" --argjson k "$k" \
      '. + {permissions: ((.permissions // {}) + {
             allow: ((.permissions.allow // []) + ($a - (.permissions.allow // []))),
             ask:   ((.permissions.ask   // []) + ($k - (.permissions.ask   // [])))})}' "$s" \
     || { echo "cc-sandbox: the sealed-session baseline would not merge into ~/.claude/settings.json — is permissions.allow or permissions.ask something other than a list?" >&2; return 1; }; }
-settings_bind(){   # $1 a host dir NO bind of this boundary reaches → put the copy there and mount it ro at his path
+settings_bind(){   # $1 a host dir NO bind of this boundary reaches · $2 "" | owner (settings_copy's) → put the copy there and mount it ro at his path
   # It has to be a REAL FILE ON THE HOST, ro-bound like any other path. Measured 2026-09-02: handed in over an fd
   # (`--ro-bind-data`, `--file`) the copy is readable inside — jq reads it — and claude applies NONE of it, his own
   # rules included, so a session got no settings at all. The mount, not the copy, is what makes it read-only, and a
   # session that could rewrite its own settings.json could unregister cc-guard from it.
-  local d="$1" f
+  local d="$1" own="${2:-}" f
   if mkdir -p "$d" 2>/dev/null; then
     f="$d/settings.json"
     # THREE things have to hold before it is installed, and the middle one is not redundant: settings_copy can fail
     # (above), and a write that runs out of disk or quota leaves a TRUNCATED file behind with a zero exit status.
     # Either way the copy is not the file it claims to be, so it is re-read as JSON here and a bad one is never
     # mounted — the fallback below is strictly better than a session holding an empty settings.json.
-    if ( umask 077; settings_copy > "$f.tmp.$$" ) && jq -e . "$f.tmp.$$" >/dev/null 2>&1 && mv "$f.tmp.$$" "$f"; then
+    if ( umask 077; settings_copy "$own" > "$f.tmp.$$" ) && jq -e . "$f.tmp.$$" >/dev/null 2>&1 && mv "$f.tmp.$$" "$f"; then
       B+=(--ro-bind "$f" "$H/.claude/settings.json"); return 0; fi
     rm -f "$f.tmp.$$"; fi
   # No usable copy — it could not be built, or could not be written. Bind HIS file unchanged rather than nothing:
@@ -495,7 +509,7 @@ pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen ins
   B+=("${flag}-fd" "$fd" "$tgt"); return 0; }
 pinq(){ pin "$@" || { echo "cc-sandbox: $2 is not the path it should be — a link, a rename, or a swap by another live session. Nothing was bound and nothing started; put the real path back." >&2; exit 2; }; }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
-  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd
+  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"
   cb=$(dirname "$SELF")   # the bin THIS copy lives in (~/bin is symlinks into the control repo's core/bin; a track worktree tests its own), bound AS ~/bin
@@ -582,7 +596,11 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
      --chdir "$cwd")
   # His hooks (cc-guard: depth inside the wall) come through this copy unchanged, with the sealed-session permissions
   # appended. ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside.
-  settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}"
+  # THE OWNER'S OWN WORKSPACE asks nothing (cc-sandbox own). The marker sits in $m, which no bind above reaches — only
+  # its subdirectories are bound, each at another path — so a session inside can neither plant it nor remove it: the
+  # workspace's .cc/ is rw in here, which is why the marker is NOT beside .cc/member-workspace.
+  own=""; [ -f "$m/owner-workspace" ] && own=owner
+  settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}" "$own"
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
   # CC_LOOP_TRIM crosses like the rest: it is set in front of a dispatch on the HOST, and the loop it steers runs in HERE
@@ -810,6 +828,18 @@ convert(){   # $1 repo — an ORDINARY ~/dev/<repo> becomes a member workspace, 
   echo "cc-sandbox: ~/dev/$r is a member workspace now. Changed:"
   for x in ${did[@]+"${did[@]}"}; do echo "  - $x"; done
   echo "Next: cc-sandbox mint $r — it starts on nothing else. Its Slack channel pair and members.json record are the daemon's: cc-slack member add <@user>."; }
+own(){   # $1 repo — a member workspace the owner made for HIMSELF is marked as his own, or the refusal says why. The mark
+  # is one host-side file, ~/.cc/members/<repo>/owner-workspace: the host decides, and it is written where no session
+  # inside can (build_member). It changes ONE thing, the ask baseline (settings_copy); it is not a wider boundary.
+  local r="${1:-}" m
+  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  m="$H/.cc/members/$r"
+  [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — make one first (cc-sandbox convert $r), then mark it" >&2; return 2; }
+  [ -f "$m/owner-workspace" ] && { echo "cc-sandbox: ~/dev/$r is already the owner's own workspace — nothing changed."; return 0; }
+  mkdir -p "$m" && printf '%s\n%s\n' "# the owner's own workspace: its sealed sessions get no ask baseline (cc-sandbox own; docs/design-member-workspaces.md)" \
+                                     "# host-side on purpose — no session inside reaches this directory. rm this file to take the asks back." > "$m/owner-workspace" \
+    || { echo "cc-sandbox: could not write $m/owner-workspace — nothing was changed" >&2; return 2; }
+  echo "cc-sandbox: ~/dev/$r is the owner's own workspace now (~/.cc/members/$r/owner-workspace). Its sealed sessions stop asking about sudo, the network clients, WebFetch and WebSearch from their next launch — reopen any that are running. rm the marker to take it back."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
   local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1
@@ -1254,7 +1284,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   # neither read nor written by anything here, and the last case hashes it to say so. Every case asserts BOTH sides —
   # what the boundary contains is silent AND what crosses it still asks — because a baseline that only ever says yes
   # is the wholesale switch this was not allowed to be.
-  local fh h dev out probe real0 real1 w
+  local fh h dev out probe real0 real1 w ho devo rc
   fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxperm-XXXXXX") || return 1; chmod 700 "$fh"
   real0=$(md5sum "$H/.claude/settings.json" 2>/dev/null | cut -d' ' -f1); real0="${real0:-absent}"
   h="_ccsbxp$$"; dev="$fh/dev/$h"; w="_ccsbxpw$$"
@@ -1276,6 +1306,7 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     echo impossible=$(jq -r "[(.permissions.ask|index(\"Bash(gh:*)\")==null),(.permissions.ask|index(\"Bash(git push:*)\")==null)]|join(\",\")" $s)
     echo his=$(jq -r "[.permissions.allow[0],.permissions.deny[0],.permissions.ask[0],.theme,.hooks.PreToolUse[0].hooks[0].command]|join(\"|\")" $s)
     echo keys=$(jq -r "keys|join(\",\")" $s)
+    echo askn=$(jq -r ".permissions.ask|length" $s)
     echo ro=$( (echo x >> $s) 2>/dev/null && echo writable || echo ro)'
   out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>&1)
   t 'baseline: inside a member workspace, what the boundary contains is silent — Bash, Write, and reading its own Slack channel' \
@@ -1293,13 +1324,47 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
     "$(g his)/$(g keys)" 'Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard/hooks,permissions,theme'
   # A SESSION THAT COULD REWRITE ITS OWN settings.json COULD UNREGISTER cc-guard FROM IT: the ro comes from the mount.
   t 'baseline: the copy is read-only inside — no session grants itself permissions or drops the hook gates' "$(g ro)" ro
-  # ── THE WORKER PATH GETS THE SAME COPY, on its own fixture in the same HOME ────────────────────────────────────
-  mkdir -p "$fh/dev/$w" "$fh/.cc/state/$w/t" "$fh/.cc/worktrees/$w" || return 1
+  # ── A MEMBER'S WORKSPACE KEEPS EVERY ASK: the whole of SBX_ASK on top of his one, counted against the list itself,
+  #    so the owner cases below are read against a number and not against four of thirteen entries.
+  t 'baseline: a member workspace carries every entry of SBX_ASK on top of his own' "$(g askn)" "$((1 + $(jq length <<<"$SBX_ASK")))"
+  # ── THE OWNER'S OWN WORKSPACE, on a fixture of its own in the same HOME. `cc-sandbox own` is refused until the
+  #    workspace marker exists, then makes the one host-side file; the copy that workspace's sessions get carries NO ask
+  #    baseline — his own ask entry, the allow baseline, his hook and the read-only mount are exactly the member copy's.
+  #    The member fixture above is the same launch without the marker, so the 'crosses' case is this one's other side.
+  ho="ccsbxpo$$"; devo="$fh/dev/$ho"; mkdir -p "$devo/.cc" "$fh/.cc/members/$ho" || return 1
+  git -C "$devo" init -q -b main >/dev/null 2>&1; cp "$fh/.cc/members/$h/credentials.json" "$fh/.cc/members/$ho/credentials.json"
+  out=$(env HOME="$fh" "$SELF" own "$ho" 2>&1); rc=$?
+  t 'own: a repo that is not a member workspace is refused — convert first, and no marker is made' \
+    "$rc/$(grep -c 'not a member workspace' <<<"$out")/$([ -e "$fh/.cc/members/$ho/owner-workspace" ] && echo marked || echo none)" 2/1/none
+  : > "$devo/.cc/member-workspace"
+  out=$(env HOME="$fh" "$SELF" own "$ho" 2>&1); rc=$?
+  t 'own: a member workspace becomes the owner'"'"'s own — one host-side marker, and the line says to reopen running sessions' \
+    "$rc/$([ -f "$fh/.cc/members/$ho/owner-workspace" ] && echo marked || echo none)/$(grep -c 'reopen any that are running' <<<"$out")" 0/marked/1
+  out=$(env HOME="$fh" "$SELF" own "$ho" 2>&1); rc=$?
+  t 'own: marking it again changes nothing and says so' "$rc/$(grep -c 'nothing changed' <<<"$out")" 0/1
+  out=$(env HOME="$fh" "$SELF" member "$ho" -- sh -c "$probe" 2>&1)
+  t 'own: inside the owner'"'"'s own workspace nothing of SBX_ASK is asked — his one ask entry is the whole list' \
+    "$(g crosses)/$(g askn)" false,false,false,false/1
+  t 'own: …and everything else is the member copy — the allow baseline, his own rules in his order, his hook, read-only' \
+    "$(g silent)/$(g his)/$(g ro)" 'true,true,true,true/Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard/ro'
+  # ── NOTHING INSIDE PROMOTES ITSELF. The marker's directory is under no bind, so from a MEMBER session a mkdir and a
+  #    write at its path land on the tmpfs HOME and the host's ~/.cc/members/<h> is as it was; from the OWNER'S session
+  #    an rm at the same path reaches nothing either. Both are read on the HOST after the session, and each is followed
+  #    by the launch that would have paid for it: the member still asks, the owner still does not.
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'mkdir -p $HOME/.cc/members/'"$h"' && : > $HOME/.cc/members/'"$h"'/owner-workspace && echo made=$([ -f $HOME/.cc/members/'"$h"'/owner-workspace ] && echo yes)' 2>&1)
+  t 'own: a member session that makes the marker at its path makes it on its own tmpfs — the host has none, and its next launch still asks' \
+    "$(g made)/$([ -e "$fh/.cc/members/$h/owner-workspace" ] && echo marked || echo none)/$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" 2>/dev/null | sed -n 's/^crosses=//p')" yes/none/true,true,true,true
+  out=$(env HOME="$fh" "$SELF" member "$ho" -- sh -c 'rm -rf $HOME/.cc/members; echo gone=$([ -e $HOME/.cc/members/'"$ho"'/owner-workspace ] || echo yes)' 2>&1)
+  t 'own: an owner session that removes the marker at its path removes nothing of the host'"'"'s — still marked, and its next launch still asks nothing' \
+    "$(g gone)/$([ -f "$fh/.cc/members/$ho/owner-workspace" ] && echo marked || echo none)/$(env HOME="$fh" "$SELF" member "$ho" -- sh -c "$probe" 2>/dev/null | sed -n 's/^crosses=//p')" yes/marked/false,false,false,false
+  # ── THE WORKER PATH GETS THE SAME COPY, on its own fixture in the same HOME — and a marker planted under
+  #    ~/.cc/members/<repo> for a repo that is no member workspace changes nothing there: only build_member reads it.
+  mkdir -p "$fh/dev/$w" "$fh/.cc/state/$w/t" "$fh/.cc/worktrees/$w" "$fh/.cc/members/$w" || return 1; : > "$fh/.cc/members/$w/owner-workspace"
   git -C "$fh/dev/$w" init -q -b main >/dev/null 2>&1 \
     && git -C "$fh/dev/$w" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init >/dev/null 2>&1 \
     && git -C "$fh/dev/$w" worktree add -q -b track/t "$fh/.cc/worktrees/$w/t" >/dev/null 2>&1 || return 1
   out=$(env HOME="$fh" CC_WORKER_SANDBOX=1 "$SELF" "$w" t -- sh -c "$probe" 2>&1)
-  t 'baseline: a track worktree gets the same copy, read-only, with his own rules kept' \
+  t 'baseline: a track worktree gets the same copy, read-only, with his own rules kept — a planted owner marker changes nothing on this path' \
     "$(g silent)/$(g crosses)/$(g ro)/$(g his)" 'true,true,true,true/true,true,true,true/ro/Bash(hisown *)|Bash(tmux kill-server:*)|Bash(sudo tee *)|ownr-theme|$HOME/bin/cc-guard'
   # …and with the sandbox OFF there is no boundary, so there is no baseline either: the command runs untouched and
   # reads whatever settings.json the host session already had.
@@ -1690,7 +1755,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
          "$H/.cc/members/$mb" "$H/.cc/boards/$mb.json" "$H/.cc/boards/$mb.lock"
   printf 'cc-sandbox selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"; [ "$bad" = 0 ]; }
 case "${1:-}" in selfcheck) selfcheck; exit $?;;
-  __settings-copy) settings_copy; exit $?;;   # private host-side reuse of the exact legacy merge
+  __settings-copy) settings_copy; exit $?;;   # private host-side reuse of the exact legacy merge — the MEMBER shape: the v2 profile (cc-member-v2) has no owner marker yet
   reconcile) [ $# -eq 3 ] || { echo "usage: cc-sandbox reconcile <repo> <track>" >&2; exit 2; }
              rs_fold "$2" "$3"; exit $?;;   # cc-loop, after every iteration — a no-op when the sandbox was off or the branch did not move
   mint) shift; mint "$@"; exit $?;;
@@ -1698,6 +1763,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
        [ $# -gt 0 ] || { echo "usage: cc-sandbox vet -- <cmd...>" >&2; exit 2; }
        launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
   convert) shift; convert "${1:-}"; exit $?;;
+  own) shift; own "${1:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ]; then tr="${1:-}"; shift; fi; [ "${1:-}" = -- ] && shift   # <handle> [<track>|""] [--] cmd
           [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] -- <cmd...>" >&2; exit 2; }
           if [ "${CC_MEMBER_V2:-}" = 1 ]; then
@@ -1706,6 +1772,6 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
 launch "$repo" "$track" "$@"
