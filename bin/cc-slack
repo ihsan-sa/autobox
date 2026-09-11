@@ -6219,7 +6219,13 @@ class Daemon:
         """WE put (or took back) a ✅ (fully done) / 🔧 (still working) on a message. On a thread ROOT that is the session's
         statement about the task: remember WHEN (reactions carry no time, and only a mark newer than the thread's last
         word counts) and show it now instead of at the next sweep. Reached from the react tool (the daemon knows the time
-        itself — no Slack event needed) and from our own reaction event; both are harmless twice. True when it was a root."""
+        itself — no Slack event needed) and from our own reaction event; both are harmless twice. True when it was a root.
+
+        A REMOVAL ONLY EMPTIES THE SLOT WHEN THE SLOT IS STILL THIS MARK'S. The two marks share one slot, so setting
+        ✅ takes the 🔧 off Slack — and Slack hands that removal back to us as a reaction of ours going away. Reading it
+        as "the work slot is empty now" took the ✅ off a second after the session made it (2026-09-11: a mail answered
+        by ✅ then read unanswered, went ❓ at 30 min and was re-handed). A mark DISPLACED by the other one takes
+        nothing with it; a mark the session genuinely takes back still leaves the slot empty."""
         if name not in SESSION_MARKS or not chat or not ts:
             return False
         _, root0 = self.reacted_message(chat, ts)
@@ -6228,10 +6234,14 @@ class Daemon:
         key = f"{chat}:{ts}:{name}"
         if removed:
             self.marks.pop(key, None)
-        else:
-            self.marks[key] = time.time()
+            save_marks(self.marks)
+            if any(f"{chat}:{ts}:{n}" in self.marks for n in WORK_NAMES if n != name):
+                return True                   # the other work mark holds the slot now: this one was displaced, not taken back
+            self.set_work(chat, ts, None)
+            return True
+        self.marks[key] = time.time()
         save_marks(self.marks)
-        self.set_work(chat, ts, None if removed else ("✅" if name == "white_check_mark" else "🔧"))
+        self.set_work(chat, ts, "✅" if name == "white_check_mark" else "🔧")
         return True
 
     def thread_root(self, chat, ts):
@@ -17393,6 +17403,47 @@ def cmd_selfcheck():
         check("mail: a MEMBER's mail line, the root of a mail the box STARTED to him, and a line with no thread to look "
               "up are not his word — they read as they did before, and nothing here re-hands or nudges for them",
               othersK == (False, True, "🟠", False))
+
+        # (o2) …AND THAT ANSWER SURVIVES THE 🔧 IT REPLACED. A mail's line is handed to a session with the box's
+        # own wrench on it (hold_wrench), so the session's ✅ takes that same slot and Slack hands the displaced
+        # wrench back to us as a removal of OURS. Read as "the work slot is empty now" it took the ✅ off a second
+        # later (2026-09-11): the mail then read unanswered, went ❓ at 30 min and was re-handed to a session that
+        # answered it by mail — the re-hand the closing-mail rule exists to make unnecessary. A removal only empties
+        # the slot when the slot is still this mark's; a mark displaced by the other one takes nothing with it.
+        msaid.clear(); mhanded.clear()
+        mail_write("K2", subject="thanks", text="thanks, that is exactly it", **{"from": "boss@allowed.example"})
+        dmA.take_mail("K2")
+        rootW = {"ts": msaid[0][3], "text": msaid[0][2], "bot_id": "B01", "reply_count": 0, "reactions": []}
+        rxW = []
+
+        def apiW(method, token, **kw):
+            return {"messages": [rootW]} if method == "conversations.replies" else mail_api(method, token, **kw)
+
+        def set_rxW(tok, chat, ts, name, on):
+            rxW.append(("+" if on else "-") + name)
+            if on:
+                rootW["reactions"].append({"name": name, "users": ["UBOT"]})
+            else:
+                rootW["reactions"] = [r for r in rootW["reactions"] if r["name"] != name]
+            return True
+        bot_was, dmA.bot_user, dmA.bot_id = dmA.bot_user, "UBOT", "B01"
+        real_apiW, real_setW = globals()["api"], globals()["set_reaction"]
+        globals()["api"], globals()["set_reaction"] = apiW, set_rxW
+        try:
+            dmA.session_mark("C-BOX", rootW["ts"], "hammer_and_wrench")          # the box takes the mail (hold_wrench)
+            dmA.session_mark("C-BOX", rootW["ts"], "white_check_mark")           # the session answers it with ✅
+            dmA.on_own_reaction("C-BOX", rootW["ts"], "hammer_and_wrench", True)  # …and Slack hands the 🔧 back, removed
+            lateW = float(rootW["ts"]) + STALL_AFTER + 1
+            liveW = (dmA.answered_by_us(rootW), dmA.base_mark(rootW, lateW, rootW, "C-BOX"),
+                     dmA.root_marks(rootW, lateW, rootW, "C-BOX"))
+        finally:
+            globals()["api"], globals()["set_reaction"] = real_apiW, real_setW
+            dmA.bot_user, dmA.bot_id = bot_was, None
+        check("mail: the ✅ answering a mail outlives the 🔧 it replaced — Slack gives the displaced wrench back as a "
+              "removal of ours, and emptying the work slot on it stripped the answer a second after it was made, "
+              "leaving the mail ❓ at 30 min and re-handed (2026-09-11)",
+              rxW == ["+hammer_and_wrench", "-hammer_and_wrench", "+white_check_mark"]
+              and liveW == (True, "🟠", (None, "✅")))
 
         # (p) …NOR IS A MAIL NOBODY WAS GIVEN: one still HELD, and one in a channel that was only Cc'd. take_mail
         # writes `mirrors` before it saves the hold, so both lines were counted as his word — and the ❓ at 30 min
