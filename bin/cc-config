@@ -7,6 +7,7 @@
 #   cc-config list [KEY…]         KEY=VALUE for every key in the file, plus any KEY named here that only the environment has
 #   cc-config path                where the file is
 #   cc-config selfcheck           this reader's own invariants, in a config of its own
+#   CC_CONFIG=FILE                read/write FILE instead · CC_CONFIG_DENY=FILE  that one file reads as empty, is never written
 #
 # NEVER SOURCED, ANYWHERE. That file holds the box's Slack tokens, and a config that is `.`-ed is code: a value
 # like $(rm -rf ~) RUNS, and every key in it lands in the environment of whatever the script spawns next. Here a
@@ -22,8 +23,14 @@
 # whose key is not a shell variable name is not a key: no command here reads it, and set/unset leave it in place.
 #
 # CC_CONFIG points this at another file (tests, and the selfcheck below).
+#
+# CC_CONFIG_DENY names ONE file this run reads as EMPTY and refuses to write. A landing's gate points it at the
+# box's live ~/.cc/config, so nothing a PR's suite runs reaches a credential through here — on PR #323
+# (2026-09-09) a gate fell through to the live keys and completed a billed turn — while a fixture HOME's own
+# .cc/config still reads, which pinning CC_CONFIG (it outranks HOME) would have broken in every such suite.
 set -uo pipefail
 CFG="${CC_CONFIG:-$HOME/.cc/config}"
+denied(){ [ -n "${CC_CONFIG_DENY:-}" ] && [ "$(realpath -m -- "$CFG")" = "$(realpath -m -- "$CC_CONFIG_DENY")" ]; }
 SELF="$(realpath "$0")"
 USAGE="usage: cc-config get KEY [default] | set KEY VALUE | unset KEY | list [KEY…] | path | selfcheck"
 umask 077   # this file is secrets: never create it, its lock or its temp file group- or world-readable
@@ -51,6 +58,7 @@ declare -A FVAL=(); FKEYS=()
 load_file(){
   local line k
   [ -f "$CFG" ] || return 0
+  ! denied || return 0                                             # the denied file reads as empty
   while IFS= read -r line || [ -n "$line" ]; do
     k="$(line_key "$line")" || continue
     [ -n "${FVAL[$k]+x}" ] || FKEYS+=("$k")                        # first appearance fixes the order, last wins the value
@@ -61,6 +69,7 @@ load_file(){
 # Rewrite the file without KEY, appending KEY=VALUE when keep=1. Returns 0 if a line for KEY was there.
 rewrite(){
   local k="$1" keep="$2" v="${3-}" line lk tmp rc=1
+  ! denied || { echo "cc-config: $CFG is denied here (CC_CONFIG_DENY): nothing written" >&2; exit 1; }
   case "$CFG" in */*) mkdir -p "${CFG%/*}" || { echo "cc-config: cannot create ${CFG%/*}" >&2; exit 1; };; esac
   # One writer at a time. Without this, two `set`s that read the same file both write their own copy of it and
   # the first key is simply gone — `cc slack setup` writes three keys, and cc-notify setup writes while it does.
@@ -167,6 +176,18 @@ EOF
   k "$(t test "$(stat -c %a "$T/config")" = 600)" "the file stays mode 600 — it holds tokens"
   C set BAD-NAME v >/dev/null 2>&1; rc=$?; k "$(t test $rc = 2)" "a key that is not a variable name is refused"
   C set MULTI "$(printf 'a\nb')" >/dev/null 2>&1; rc=$?; k "$(t test $rc = 2)" "a value with a newline is refused: it would forge a second key"
+  # DENIED: the one file CC_CONFIG_DENY names reads as empty and is not written; any other file is untouched by it.
+  D(){ CC_CONFIG_DENY="$T/config" "$SELF" "$@"; }
+  out=$(CC_CONFIG="$T/config" D get ALPHA fallback); rc=$?
+  k "$(t test "$out" = fallback -a "$rc" = 1)" "a denied file reads as empty: get gives the default and exits 1"
+  k "$(t test -z "$(CC_CONFIG="$T/config" D list)")" "…and list prints nothing from it"
+  k "$(t test "$(export ALPHA=env; CC_CONFIG="$T/config" D get ALPHA)" = env)" "…while the environment still wins (it is not the file)"
+  ln -s "$T/config" "$T/alias"
+  k "$(t test -z "$(CC_CONFIG="$T/alias" D get ALPHA)")" "the denial holds through a symlink to the same file (realpath)"
+  CC_CONFIG="$T/config" D set ALPHA denied-write >/dev/null 2>&1; rc=$?
+  k "$(t test "$rc" = 1 -a "$(C get ALPHA)" = four)" "set on the denied file exits 1 and writes nothing"
+  k "$(t test "$(C get ALPHA)" = four)" "control: the same file, not denied, still reads"
+  k "$(t test "$(CC_CONFIG="$T/config" CC_CONFIG_DENY="$T/other" "$SELF" get ALPHA)" = four)" "control: a denial naming another file changes nothing here"
   # LOCKING: twenty writers, each read-modify-writing the whole file. Unlocked, most of these keys are lost.
   : > "$T/many"
   for i in $(seq 1 20); do CC_CONFIG="$T/many" "$SELF" set "K$i" "v$i" & done

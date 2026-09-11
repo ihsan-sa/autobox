@@ -754,15 +754,17 @@ def usage_line(path, u, src):
     return f"{path}: {' · '.join(parts)} — {usage_frac(u) * 100:.0f}% of {src}"
 
 
-def temp_usage(path=None, read=quota_read):
+def temp_usage(path=None, read=quota_read, fs=fs_usage):
     """The temp root's fullness for this user: (fraction, one line to print), or None when neither the quota nor
     the filesystem would answer. The quota first and the filesystem only when there is none — one source, never
-    the two mixed, so the fraction is always a share of a single real limit. `read` is the quota reader, named
-    so the selfcheck can drive both sides of that fallback on a box that has only one of them."""
+    the two mixed, so the fraction is always a share of a single real limit. `read` is the quota reader and `fs`
+    the filesystem's, both named so the selfcheck can drive both sides of that fallback on a box that has only
+    one of them — and on numbers it chose, because two live statvfs reads of a /tmp the suite itself is writing
+    to are never equal under load (red on 2026-09-09, one full gate run spent on it)."""
     path = os.path.realpath(path or tempfile.gettempdir())
     u, src = read(path), "this user's quota"
     if u is None:
-        u, src = fs_usage(path), "the filesystem"
+        u, src = fs(path), "the filesystem"
     if u is None:
         return None
     return usage_frac(u), usage_line(path, u, src)
@@ -1809,10 +1811,14 @@ def selfcheck():
     ok("THE QUOTA IS THE SOURCE WHERE THERE IS ONE — the fraction is that quota's, and the line says whose it is",
        temp_usage(tempfile.gettempdir(), read=lambda _p: (1 << 30, 4 << 30, 0, 0))[0] == 0.25
        and "this user's quota" in temp_usage(tempfile.gettempdir(), read=lambda _p: (1 << 30, 4 << 30, 0, 0))[1])
+    # The filesystem side on FIXED numbers, never two live reads of the real /tmp compared for equality: the suite
+    # and every other worker write there the whole time, so the two fractions differed and this case went red on
+    # a tree it had nothing to say about (2026-09-09). The quota reader answering None is what selects the fs.
     ok("…AND THE FILESYSTEM WHERE THERE IS NONE, named as the filesystem: one source, never the two mixed",
-       (lambda u: u is not None and 0.0 <= u[0] <= 1.0 and "the filesystem" in u[1]
-        and "this user's quota" not in u[1] and u[0] == usage_frac(fs_usage(tempfile.gettempdir())))
-       (temp_usage(tempfile.gettempdir(), read=lambda _p: None)))
+       (lambda u: u is not None and u[0] == 0.25 and "the filesystem" in u[1] and "this user's quota" not in u[1])
+       (temp_usage(tempfile.gettempdir(), read=lambda _p: None, fs=lambda _p: (1 << 30, 4 << 30, 0, 0))))
+    ok("…and the quota, when it answers, is the source even where the filesystem would say otherwise",
+       temp_usage(tempfile.gettempdir(), read=lambda _p: (1 << 30, 4 << 30, 0, 0), fs=lambda _p: (3 << 30, 4 << 30, 0, 0))[0] == 0.25)
     ok("…and where NEITHER answers it is None and not a guess — a path that is not there crashes nothing, and "
        "every one of these only READS",
        temp_usage(f"/nonesuch-{os.getpid()}", read=lambda _p: None) is None

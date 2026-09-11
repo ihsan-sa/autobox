@@ -31,9 +31,18 @@
                                                   review (it waits for the reset) and a red gate (3 tries, 15 min
                                                   apart): the sweep that keeps a job arms its own next run. A
                                                   LAND-AFTER-FIX sends ONE fix iteration and waits for that branch to
-                                                  push; a second stop, a DO-NOT-LAND, an unmergeable PR or a
-                                                  review that ran out of its own cap ends it. A PR that merged
-                                                  while its review ran gets no round at all — it is deployed
+                                                  push — and a fix that pushed re-queues the PR however it ended,
+                                                  a fix that pushed nothing says so; a second stop, a DO-NOT-LAND
+                                                  or a review that ran out of its own cap ends it. A PR that
+                                                  CANNOT merge yet — a draft, or one that conflicts with its base
+                                                  — is HELD, untried and its tries intact, looked at again every
+                                                  15 min and said once in the ledger. A PR that merged while its
+                                                  review ran gets no round at all — it is deployed
+  cc-land cancel <repo> <pr> --reason "<why>"     take a queued job out, on the record: the reason goes in the
+                                                  ledger. A job a running sweep is landing right now is refused
+  cc-land status <repo> <pr>                      is this PR being landed, by ANY path: the queue job, a direct
+                                                  `cc-land <repo> <pr>` process, the change's own work record.
+                                                  Exit 0 = something is landing it, 1 = nothing is
   cc-land selfcheck                               the decision table; no network, no systemctl
 
 Landing a change used to be nine separate things to remember — gates, merge, the #approvals card, the mark on
@@ -117,8 +126,16 @@ WHAT IT WILL NOT DO, and why each line is here:
     that the landing STOPS and asks a person, who reads the diff themselves (`--no-review`) or buys another
     review deliberately (`--re-review`). A review a usage limit killed is not a buy — the count goes back, or
     the job deferred for the reset would come back to a head nothing has read and be refused for money it
-    never spent. Nor is a review its own cap killed: that count goes back too, and the cap that head died at is
-    written down in its place, so the money goes once per change rather than once per re-queue.
+    never spent — and that holds whichever way the limit shows: the runner dying, or the runner answering
+    with no verdict, $0.00 and "You've hit your session limit" (PR #390, 2026-09-08, was counted as a read and
+    refused at the wall two hours later). Nor is a review its own cap killed: that count goes back too, and
+    the cap that head died at is written down in its place, so the money goes once per change rather than
+    once per re-queue. A `--re-review` is a person's spend and is added back to what the change may buy
+    (reads_earned), and the repair round is the FIX, not the dispatch: a fix anybody pushed after a
+    LAND-AFTER-FIX — the planning seat's own builder, on PR #410 — counts as the round and earns its read,
+    rather than being refused as a diff nobody read. And a refusal reached at the wall while the gates ran
+    is re-checked against the PR before it stands: a verdict recorded during those minutes (PR #402, recorded
+    three minutes after the mark, refused thirteen minutes later) is read instead.
   · It only ever switches ON a unit this change ADDED. A unit that is off is usually off for a reason (no
     tokens yet, somebody's call), so it stays off and is named in the output instead of started behind their
     back. Enabling the added ones is the step a worker structurally cannot do: cc-guard denies it systemctl.
@@ -298,8 +315,9 @@ FATAL = ("review", "gates", "merge", "install", "units", "restart", "daemons")
 # parked on a feature branch, a unit mid-restart — which the next attempt may well find fixed, and PR #87 sat
 # merged-and-undeployed for exactly the want of that second attempt. gates is here since 2026-09-01: the suite FLAKES
 # (cc-slack's selfcheck, boarded apart), and a job that ended on a flake is why 39 tmux lanes chained waiter pids into
-# a queue of their own on top of this one. A PR that CONFLICTS fails in that step too and is a decision — run_job ends
-# it at once. A usage limit at the review is neither: the job is DEFERRED to the reset, uncounted (see run_job).
+# a queue of their own on top of this one. A PR that CONFLICTS, or is a DRAFT, never reaches that step from the
+# queue: it cannot merge yet, so run_job HOLDS it with its tries intact rather than burning them fifteen minutes
+# apart (Land.held). A usage limit at the review is neither: the job is DEFERRED to the reset, uncounted (see run_job).
 RETRY = ("gates", "install", "units", "restart", "daemons")
 RETRY_AFTER = 900                         # …and how long a kept job waits before the queue re-runs itself (see rearm)
 # A LAND-AFTER-FIX is the one stopping verdict that names its own remedy, and dispatching that remedy was a dozen
@@ -326,8 +344,10 @@ ROOT_REVIEWS = 1        # ROUTINE paid reviews per change. A dispatched repair r
                         # read of what that round changed — so the ceiling is ROOT_REVIEWS plus the repair rounds
                         # actually dispatched, and no push on its own ever buys one. `--re-review` is a PERSON
                         # deciding to spend and is deliberately not bounded here.
-ROOT_REPAIRS = 1        # …and automatic repair rounds per change: a SECOND model stop goes to a person (owner,
-                        # 2026-09-02), whichever job it arrives on.
+ROOT_REPAIRS = 1        # …and repair rounds per change: a SECOND model stop goes to a person (owner, 2026-09-02),
+                        # whichever job it arrives on. The round is the FIX that answers a LAND-AFTER-FIX, whoever
+                        # pushed it — the queue's own dispatch, or a person's builder (PR #410, 2026-09-11, refused
+                        # at the wall for a fix that answered the findings line by line): see reads_earned().
 ROOT_TTL = 30 * 86400   # a record for a PR nobody ever landed is swept, so an abandoned change cannot bound a
                         # later one that reuses its number.
 COSMETIC = 3                              # exit code for "the box is right, its bookkeeping is not"
@@ -415,10 +435,28 @@ def clean_start():
     CLAUDECODE=1, CLAUDE_PID and CLAUDE_CODE_* — a suite carrying those asserts against that session — and a `nohup`
     launch hands it SIGHUP ignored, which exec keeps and bash silently cannot trap: cc-loop's HUP trap was a no-op,
     and selftest's H4 (a HUP'd loop must kill its claude) went red 3/3 in every nohup'd chain of 2026-09-01
-    02:54–04:05Z, then green from tmux with nothing else changed. sh(**clean_start()) for every gate."""
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE" and not k.startswith("CLAUDE_")}
+    02:54–04:05Z, then green from tmux with nothing else changed. sh(**clean_start()) for every gate.
+
+    AND NO CREDENTIAL, on any branch. A gate runs the PR's content, so a fix merged to main protects nothing: on PR
+    #323 (2026-09-09) a lessons case whose tutor was meant to be off fell through to the live keys — `cc-config get`
+    reads ~/.cc/config unless CC_CONFIG says otherwise — and completed a real billed turn from inside a gate. So
+    the box's live config is DENIED — CC_CONFIG_DENY names it and cc-config reads that one file as empty (not
+    CC_CONFIG pinned to an empty file: that outranks HOME, and ~25 suites give a fixture HOME its own .cc/config) —
+    and every credential-shaped variable is dropped: a name ending in one of SECRET_SUFFIXES (_TOKEN, _KEY, _SECRET,
+    _CREDS, _WEBHOOK, _PASSWORD), plus the named API and login tokens (SECRET_ENV). Not a sandbox — the gate runs as this user and can still open ~/.cc/config, ~/.claude,
+    ~/.ssh or gh's own login by path — it closes the ACCIDENTAL reach, which is the one that happened. PATH, HOME,
+    TMUX, LANG and every non-secret CC_* pass. cc-green's run scrubs the same way, so a worker's run and the
+    landing's agree."""
+    env = {k: v for k, v in os.environ.items()
+           if k != "CLAUDECODE" and not k.startswith("CLAUDE_") and k not in SECRET_ENV
+           and not k.endswith(SECRET_SUFFIXES)}
+    env["CC_CONFIG_DENY"] = os.path.realpath(f"{HOME}/.cc/config")
     default_signals()
     return {"env": env}
+
+
+SECRET_ENV = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+SECRET_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_CREDS", "_WEBHOOK", "_PASSWORD")   # cc-green scrubs the same
 
 
 def default_signals():
@@ -575,6 +613,55 @@ def repo_program(argv, root, exe):
     return ""
 
 
+PY_IMPORT_RE = re.compile(r"^[ \t]*(?:import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*)|from[ \t]+(\.*[\w.]*)[ \t]+import\b)", re.M)
+PY_INDEX = {}
+
+
+def py_index(root):
+    """{module name: [the tree's files named <name>.py]}, once per root: what a bare `import vetting` can mean here.
+    Dot-directories, node_modules and __pycache__ are not walked."""
+    if root not in PY_INDEX:
+        idx = {}
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if not d.startswith(".") and d not in ("node_modules", "__pycache__")]
+            for fn in fns:
+                if fn.endswith(".py"):
+                    idx.setdefault(fn[:-3], []).append(os.path.relpath(f"{dp}/{fn}", root))
+        PY_INDEX[root] = idx
+    return PY_INDEX[root]
+
+
+def imports_of(root, prog):
+    """The files of `root` that `prog` (relative to it) reaches through `import`, followed through, read from the
+    SOURCE. Python keeps no module file open after importing it and maps no .py, so the process itself cannot be
+    asked what it loaded; its program's text can. A name resolves to a file of the tree whose path ends in it —
+    `vetting` to core/mail/vetting.py, `a.b` to a/b.py — which is what a sys.path insert makes true. Only a Python
+    program is read (a `#!` naming python, or .py). Missed on purpose: an import by path (importlib and a loader)
+    and a name built at runtime. Counted on purpose: an import inside a function that has not run yet — that is a
+    restart that may not have been needed, never one that was."""
+    try:
+        head = open(f"{root}/{prog}", "rb").read(160)
+    except OSError:
+        return set()
+    if not (prog.endswith(".py") or (head.startswith(b"#!") and b"python" in head.split(b"\n", 1)[0])):
+        return set()
+    idx, seen, todo = py_index(root), set(), [prog]
+    while todo:
+        rel = todo.pop()
+        try:
+            src = open(f"{root}/{rel}", "rb").read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for m in PY_IMPORT_RE.finditer(src):
+            for name in (m.group(1) or m.group(2) or "").split(","):
+                parts = name.strip().lstrip(".").split(".")
+                for cand in idx.get(parts[-1], []):
+                    if cand not in seen and cand != prog and ("/" + cand).endswith("/" + "/".join(parts) + ".py"):
+                        seen.add(cand)
+                        todo.append(cand)
+    return seen
+
+
 def unit_policy(name, field):
     """One cell of config/units.json, via cc-units — the manifest that says whose call a unit is."""
     rc, o = sh([f"{BIN}/cc-units", "policy", name, field], timeout=30)
@@ -656,6 +743,24 @@ def limited(why):
     two fixed prefixes review() raises with, never on the words alone: a verdict's prose quotes anything."""
     return why.startswith("no review: usage limit") or (why.startswith("the reviewer produced nothing")
                                                         and "usage limit" in why)
+
+
+# What the runner's RESULT says when the account's limit stopped it rather than the model finishing: no verdict, no
+# money, and one of these three words in front of "limit". cc-limit's own check does not know "session limit" (it
+# reads usage/rate/429), and that is the one PR #390's reviewer said — "You've hit your session limit", $0.00, no
+# verdict — so ask_reviewer reads the answer itself. Applied ONLY beside a $0.00 cost and no verdict: a verdict's
+# prose quotes anything, and a paid answer about a rate limiter is a paid answer.
+LIMIT_SAID_RE = re.compile(r"\b(session|usage|rate)[ _-]?limit", re.I)
+
+
+def reads_earned(spent):
+    """How many paid reads THIS change has earned, against which `reviews` — every read bought for it — is held:
+    ROOT_REVIEWS routine ones; one more for the repair round, up to ROOT_REPAIRS; and every `--re-review` bought,
+    added back. The last term is what the wall on PR #410 lacked (2026-09-11): a person's --re-review is a spend
+    "deliberately not bounded here" (ROOT_REVIEWS), yet it was counted into `reviews` and consumed the routine
+    allowance, so the repair round that followed had nothing left to read with. `asked` is the number of those buys,
+    written beside `reviews` by review_now and taken back with it when a limit refunds the read."""
+    return ROOT_REVIEWS + min(spent.get("repairs", 0), ROOT_REPAIRS) + spent.get("asked", 0)
 
 
 # The two ways the runner stops a review on cc-land's OWN cap rather than on the diff, named as the runner names
@@ -1231,7 +1336,10 @@ def stale_note(root, base_ref, base, head, mine=()):
     old copy of. Files the head changes too are left out, because there its own version is the point.
 
     Silence is the only honest answer when git cannot say (no merge-base, an unfetched base, a count that will not
-    parse): a landing that guessed "stale" over a real failure would send the next person the other way."""
+    parse): a landing that guessed "stale" over a real failure would send the next person the other way.
+
+    The note names the COMMIT it measured. "This branch is N behind" described what the landing had checked out,
+    and on 2026-09-07 that was a stale pull ref, not the branch — a person read it as the branch's state."""
     rc, o = sh(["git", "rev-list", "--count", f"{head}..{base_ref}"], cwd=root)
     try:
         n = int(o.strip()) if not rc else 0
@@ -1250,7 +1358,7 @@ def stale_note(root, base_ref, base, head, mine=()):
             moved = [l.strip() for l in (o or "").splitlines() if l.strip() and l.strip() not in own]
     missing = ("without " + ", ".join(moved[:3]) + (f" and {len(moved) - 3} more" if len(moved) > 3 else "")
                if moved else "")
-    return (f" — and this branch is {behind}" + (f", {missing}" if missing else "")
+    return (f" — and the commit gated here, {head[:12]}, is {behind}" + (f", {missing}" if missing else "")
             + f": rebase it onto {base} and run again before hunting for a bug that may already be fixed")
 
 
@@ -1328,6 +1436,18 @@ def verdict_in(body, key, head):
     return ""
 
 
+ANY_MARK_RE = re.compile(rf"\A\s*<!-- {re.escape(REVIEW_MARK)} (?:v2 change=[0-9a-f]+(?: [^>]*?)? verdict=|[0-9a-f]{{12}} )"
+                         r"(LAND-AFTER-FIX|DO-NOT-LAND|LAND)\b")
+
+
+def verdict_written(body):
+    """The verdict a marker comment records, WHATEVER change or head it was written about, or "". The same two
+    shapes verdict_in reads and the same anchor, with the key left open: this is not "was THIS change read" — that
+    is verdict_in — but "what did this box last say about this PR at all", which prior_review keeps as `stood`."""
+    m = ANY_MARK_RE.match(body or "")
+    return m.group(1) if m else ""
+
+
 def verdict_of(answer):
     """The reviewer's answer, read as a decision. The schema path is the real one: `verdict` is a validated enum
     field, so the numbered findings underneath — which, reviewing anything that reviews, quote all three verdicts —
@@ -1399,6 +1519,8 @@ class Land:
         self.verdict = ""        # the review's answer as a FIELD, so the queue can act on LAND-AFTER-FIX without
         self.findings = ""       # re-reading its own error message — and what the reviewer said, for the fix brief
         self.by = ""             # which model actually read it, so the PR comment cannot claim a different one
+        self.stood = ""          # the LAST verdict this box wrote on the PR for ANY change of it (prior_review): a
+                                 # LAND-AFTER-FIX standing there, with the diff since moved, is a fix somebody pushed
         self._ckey = None        # (head, digest, merge-base): what change this IS — see change_key()
         self._tier = None        # (head, tier, why): decided ONCE per head and shared by the review and the gates
         self.span = span         # (installed_sha, tip_sha): a deploy with no PR, catching the box up to a merge it missed
@@ -1451,7 +1573,8 @@ class Land:
         was pushed — so the tree fetched here would have been the old one, the reviewer re-reports findings that are
         already fixed, the queue buys a repair round with nothing left to repair, and it repeats. A disagreement
         between the two refs is said out loud and written to the ledger; repairing GitHub's ref is not this box's
-        job. Sets self.head and returns it."""
+        job. The SHA returned is the one ls-remote named for the branch — never FETCH_HEAD's, which any fetch of
+        this checkout rewrites (resolve_head). Sets self.head and returns it."""
         self.head = self.resolve_head()
         return self.head
 
@@ -1475,6 +1598,19 @@ class Land:
             rc, o = sh(["git", "fetch", "-q", "origin", spec], cwd=self.root, timeout=300)
             if rc:
                 raise Failed(f"cannot fetch PR #{self.pr}: {last(o)}")
+            if on_branch:
+                # THE BRANCH'S SHA, not FETCH_HEAD's. FETCH_HEAD is one file per checkout and anything that fetches
+                # there rewrites it — a session's own `git fetch` included. On 2026-09-07 PR #323 logged the stale
+                # pull ref, fetched the branch, read FETCH_HEAD back as the PULL ref's SHA and gated that: a billed
+                # turn on a commit the branch no longer had. What ls-remote named is what is gated, once the fetch
+                # has made it present here; a fetch that did not bring it is refused, naming both — never gated
+                # as the other one.
+                rc, _ = sh(["git", "cat-file", "-e", f"{on_branch}^{{commit}}"], cwd=self.root)
+                if rc:
+                    raise Failed(f"PR #{self.pr}: {branch} is at {on_branch[:12]} on origin, but the fetch did not "
+                                 f"bring that commit here (the pull ref says {on_pull[:12] or 'nothing'}) — "
+                                 f"refusing to gate either")
+                return on_branch
             rc, o = sh(["git", "rev-parse", "FETCH_HEAD"], cwd=self.root)
             if rc:
                 raise Failed(f"cannot resolve the head of PR #{self.pr}: {last(o)}")
@@ -1520,7 +1656,29 @@ class Land:
         gated and read is not what is there, so nothing merges."""
         if self._review is None:
             return self.review_now()
-        said = self.review_aside()
+        try:
+            said = self.review_aside()
+        except Failed as e:
+            if not getattr(e, "doomed", False):
+                raise
+            # A REFUSAL REACHED WHILE THE GATES RAN IS RE-CHECKED BEFORE IT STANDS. The wall (mark_doomed) was
+            # decided on the review thread at t=0, and the gates it ran beside take up to an hour; a verdict
+            # recorded during those minutes answers the very thing the wall refused for. PR #402 (2026-09-10):
+            # doomed at 06:42:46Z, LAND recorded for that head at 06:45:09Z, gates green — and the landing said NOT
+            # merged at 06:58:10Z on the 06:42 decision, thirteen minutes after the record was there to read. The
+            # re-queue then bought a second full run to read it. One `gh pr view` here reads it now.
+            self.fetch_head()
+            if self.gated and self.head != self.gated:
+                raise Failed(f"PR #{self.pr} moved while it was being gated and read: {self.gated[:12]} was gated, "
+                             f"{self.head[:12]} is there now — nothing merges ungated. Re-run to gate the new head")
+            prior = self.prior_review()
+            if not prior:
+                raise               # nothing recorded since the mark: the refusal stands, as it was written
+            verdict, found, who = prior
+            said = self.verdict_result(verdict, found, f"read already by {who or 'this box'}",
+                                       "recorded for this change while the gates ran",
+                                       " — the wall reached at the start of them does not stand against a record")
+            return said
         self.fetch_head()
         if self.gated and self.head != self.gated:
             raise Failed(f"PR #{self.pr} moved while it was being gated and read: {self.gated[:12]} was gated, "
@@ -1617,8 +1775,20 @@ class Land:
         # amplification this bound is here to stop, and it is the SECOND opinion nobody asked for that costs $196 a
         # night. `--re-review` is a person asking, so it is not counted against them.
         spent = root_work(self.repo, self.pr)
-        allowed = ROOT_REVIEWS + min(spent.get("repairs", 0), ROOT_REPAIRS)
-        if spent.get("reviews", 0) >= allowed and not self.re_review:
+        if (self.stood == "LAND-AFTER-FIX" and spent.get("repairs", 0) < ROOT_REPAIRS
+                and spent.get("reviews", 0) >= reads_earned(spent) and not self.re_review):
+            # THE REPAIR ROUND IS THE FIX, NOT THE DISPATCH. The last verdict this box wrote on the PR says "fix
+            # it", and the diff has moved since (or prior_review would have answered above): that push IS the round,
+            # whoever made it, and it earns the read a dispatched round would have. PR #410 (2026-09-11): the seat's
+            # builder pushed the fix that answered the findings line by line, the re-queue ran the gates green and
+            # stopped at "2 review(s) and 0 repair round(s), the diff at 61d4da1 is not one they read" — because
+            # the round had not come through dispatch_fix, nothing had written repairs=1. Counted here, once and
+            # bounded by ROOT_REPAIRS exactly as the dispatched one is, and only where the wall would otherwise
+            # bind — a change with a read still owed does not need it.
+            spent = root_spend(self.repo, self.pr, repairs=1)
+            out("·", f"the push after the LAND-AFTER-FIX on PR #{self.pr} is its repair round — counted as one, "
+                     f"and this read is the one that round earns")
+        if spent.get("reviews", 0) >= reads_earned(spent) and not self.re_review:
             raise self.mark_doomed(Failed(
                 f"the review budget for this change is spent: PR #{self.pr} has already bought "
                 f"{spent.get('reviews', 0)} review(s) and {spent.get('repairs', 0)} repair round(s), and "
@@ -1655,8 +1825,11 @@ class Land:
                 raise Failed(f"cannot read the diff of PR #{self.pr}: {last(diff)}")
             dpath = f"{tmp}/pr-{self.pr}.diff"
             open(dpath, "w").write(diff or "")
-            root_spend(self.repo, self.pr, reviews=1)   # counted BEFORE the money goes, so a reviewer that dies
-            self.bought = True                                                      # half-way through is still a buy
+            # counted BEFORE the money goes, so a reviewer that dies half-way through is still a buy — and a
+            # `--re-review` counted as `asked` beside it, the person's own spend that reads_earned() adds back
+            buy = dict(reviews=1, **({"asked": 1} if self.re_review else {}))
+            root_spend(self.repo, self.pr, **buy)
+            self.bought = True
             try:
                 answer, cost, toks = self.ask_reviewer(self.review_prompt(tpl, tree, dpath), tree, tmp)
             except Failed as e:
@@ -1667,7 +1840,7 @@ class Land:
                 # The refund is HERE and not in that deferral branch because a limit is raised by the cc-limit
                 # pre-check above as well, before anything is counted: a blind -1 there gives a second free review.
                 if limited(str(e)):
-                    root_spend(self.repo, self.pr, reviews=-1)
+                    root_spend(self.repo, self.pr, **{k: -n for k, n in buy.items()})
                     self.bought = False
                 elif getattr(e, "wall", None):
                     # A cap stopped this one, so this buy read nothing either, and the change must not be left owing
@@ -1675,7 +1848,7 @@ class Land:
                     # bought no verdict, which is how #194 ended with its job dropped. The MONEY is not given back —
                     # it went — so what goes on the record instead is the wall, and the next attempt at this head is
                     # refused above rather than spending the cap again to be told the same thing.
-                    root_spend(self.repo, self.pr, reviews=-1, wall=e.wall)
+                    root_spend(self.repo, self.pr, wall=e.wall, **{k: -n for k, n in buy.items()})
                     self.bought = False
                 raise
         finally:
@@ -1705,13 +1878,18 @@ class Land:
         here, minutes into a landing and on the thread that runs beside the gates, and the queue is where somebody
         is still waiting. What it stores is what doomed() needs to be certain the answer still holds — the head, the
         change key (already computed by prior_review just above, so this costs no git) and, for a cap wall, the cap
-        that bound. Never raises: a queue directory that cannot be written must not become a landing that stops."""
+        that bound. Never raises: a queue directory that cannot be written must not become a landing that stops.
+
+        The failure handed back is TAGGED (`doomed`), so review() can tell this refusal — decided at t=0 on the
+        thread beside the gates, from a record that may be minutes old by the time the gates end — from a verdict,
+        and re-read the PR before letting it stand (PR #402, 2026-09-10)."""
         try:
             root_spend(self.repo, self.pr,
                        doomed={"at": stamp(), "head": self.head, "key": self.change_key()[0],
                                "why": str(why), **rec})
         except Exception:
             pass
+        why.doomed = True
         return why
 
     def change_key(self):
@@ -1777,7 +1955,11 @@ class Land:
 
         Only a comment THIS BOX wrote counts (`viewerDidAuthor`). Anyone who can comment on a PR can type a marker,
         and this answer is now the ordinary way a landing skips its review rather than a way to avoid buying a second
-        one — so an unverified author here is a merge nobody read. Returns (verdict, findings, who) or None."""
+        one — so an unverified author here is a merge nobody read. Returns (verdict, findings, who) or None.
+
+        On the way it keeps `self.stood`: the last verdict this box wrote for ANY change of this PR, the current one
+        or an earlier one. When this returns None with a LAND-AFTER-FIX standing there, the diff moved after a "fix
+        it" — which is what a repair round IS, whoever pushed it (PR #410; see review_now)."""
         rc, o = sh(["gh", "pr", "view", str(self.pr), "--json", "comments"], cwd=self.root, timeout=120)
         if rc:
             return None
@@ -1789,7 +1971,9 @@ class Land:
         for c in cs:                      # chronological, and the LAST one wins: --re-review posts a second
             if not isinstance(c, dict) or not c.get("viewerDidAuthor"):
                 continue                  # comment for the same change on purpose, and its answer is the current one
-            found = self.prior_verdict(c.get("body") or "") or found
+            body = c.get("body") or ""
+            found = self.prior_verdict(body) or found
+            self.stood = verdict_written(body) or self.stood
         return found
 
     def review_prompt(self, tpl, tree, dpath):
@@ -1860,6 +2044,17 @@ class Land:
             e.wall = {"head": self.head, "cap": cap, "cost": cost, "turns": j.get("num_turns") or 0,
                       "hit": j.get("subtype"), "was": cap_now(var)}
             raise e
+        if text and not verdict_of(text)[0] and not float(j.get("total_cost_usd") or 0) and LIMIT_SAID_RE.search(text):
+            # THE LIMIT THAT ANSWERS INSTEAD OF DYING. The runner came back rc=0 with a RESULT — "You've hit your
+            # session limit" — no verdict, and $0.00: the model never read a line. Read as "answered without a
+            # verdict" that was a bought review: PR #390 (2026-09-08, 21:07Z) was counted reviews:1, and at 23:05Z
+            # the re-queue was refused at the wall for a read that was never made — a queue slot for an hour, a
+            # session's turn, and a --re-review to buy what the tally said was already bought. This is the
+            # `limited()` prefix, so the buy is refunded (review_now) and run_job DEFERS the job to the reset
+            # exactly as it does when the runner produces nothing. Three conditions, all of them: a verdict is a
+            # verdict whatever its prose says, and a paid answer is a read.
+            raise Failed(f"no review: usage limit — the reviewer answered without a verdict, at {cost}, and said "
+                         f"it hit a limit: {last(text)[:160]} — the landing waits for the model, or --no-review")
         if not text:
             lim = ""
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -1924,8 +2119,9 @@ class Land:
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
         tree, tmp, at, key = self.root, None, "", ""
         if self.pr:
-            if self.facts.get("mergeable") == "CONFLICTING":
-                raise Failed(f"PR #{self.pr} conflicts with {self.base()} — rebase it, then land it")
+            if self.held():             # a draft, or a conflict: the direct path stops here, before a gate or a
+                raise Failed(self.held())   # read is bought for a merge GitHub would refuse (the queue holds
+                                            # such a job before it ever reaches this step — run_job)
             self.fetch_head()       # asked BEFORE the checkout now: the tier and the memo are both keyed by the SHA
             self.gated = self.head  # …and pinned here, for the review after this and the merge after that
             with git_lock(self.root):   # merge_result reads refs the fetches above and a sibling landing's pull
@@ -2164,6 +2360,21 @@ class Land:
         self.facts["state"] = "MERGED"
         return True
 
+    def held(self):
+        """Why this PR CANNOT MERGE YET, or "" — read off what load() was told, so it costs nothing to ask. A DRAFT
+        is one somebody marked not ready, on purpose: PR #324 (2026-09-07) was queued by `cc done` and then drafted
+        to keep it behind a security fix, and until this existed the tool had no word for a draft at all — the
+        queue would have tried it three times, fifteen minutes apart, and had no tries left when it was ready. A
+        CONFLICT is a state a person must fix, and fifteen minutes changes nothing about it either. The queue holds
+        such a job (run_job); the direct path refuses it before a gate runs (gates)."""
+        if not self.pr:
+            return ""
+        if self.facts.get("isDraft"):
+            return f"PR #{self.pr} is a draft — mark it ready for review, then land it"
+        if self.facts.get("mergeable") == "CONFLICTING":
+            return f"PR #{self.pr} conflicts with {self.base()} — rebase it, then land it"
+        return ""
+
     def merge(self):
         """The one place on this box that merges, and it runs AFTER the gates. --subject is the PR title: gh's own
         default squash subject is the branch's commit log ("wip: checkpoint …"), and that is what the default
@@ -2217,17 +2428,27 @@ class Land:
 
     # -- 5. the board --------------------------------------------------------------------------------------
     def find_track(self):
-        """The track that carries this PR: the board row naming it, else the row whose branch is the PR's head."""
+        """The track that carries this PR: the board row naming it — by the PR's URL, or by its bare number — else
+        the row whose branch is the PR's head, else the row the head's name IS: `track/<row>`, or the
+        `planning/<row>` and `builder/<row>` a planning-session subagent builds on since the 09-04 execution model.
+        PR #369 (2026-09-08, branch planning/selfchecks-run-because-the-tool-exists, row of that name, pr field
+        `369`) merged and its row stayed [running] — the URL regex did not match a bare number, the row's branch
+        field says track/<row>, and nothing read the head's own name — so five rows that day were closed by hand
+        and read as abandoned by the watchdog until then."""
         if self.track:
             return self.track
         rows = board(self.repo).get("tracks", {})
         for name, t in rows.items():
-            if re.search(rf"/pull/{self.pr}(?:/|$)", t.get("pr") or ""):
+            pr = str(t.get("pr") or "")
+            if re.search(rf"/pull/{self.pr}(?:/|$)", pr) or pr == str(self.pr):
                 return name
         head = self.facts.get("headRefName") or ""
         for name, t in rows.items():
             if head and t.get("branch") == head:
                 return name
+        m = re.fullmatch(r"(?:track|planning|builder)/(.+)", head)
+        if m and m.group(1) in rows:
+            return m.group(1)
         return ""
 
     def close_board(self):
@@ -2364,9 +2585,11 @@ class Land:
         ExecStart file did not move, and the deploy left the merged page on the previous version's process
         (2026-09-06)."""
         files = [p for st, p in self.changed_files() if st != "D"]
-        moved = {os.path.basename(p) for p in files}
-        if not moved:
+        if not files:
             raise Skip("no file list for this landing — nothing to restart")
+        via = self.importers(files)          # a running program that IMPORTS a changed module moved too
+        files = files + sorted(via)
+        moved = {os.path.basename(p) for p in files}
         declared = units_for_paths(self.root, files)
         held, owned = [], []
         for u in linked_units():
@@ -2396,9 +2619,29 @@ class Land:
                 f"down, so do it by hand (`cc rc restart`)") if held else ""
         if owned:
             tail += f"; {', '.join(owned)} moved too and is the owner's to restart (units.json restart=owner)"
+        tail += "".join(f"; {p} imports {m}, which moved" for p, m in sorted(via.items()))
         if not self.restarted:
-            raise Skip("nothing running uses the files this change touched" + tail)
+            raise Skip("nothing running uses, or imports, the files this change touched" + tail)
         return f"restarted: {', '.join(self.restarted)}{tail}"
+
+    def importers(self, files):
+        """{program: module} — every file of this tree a live process is RUNNING whose imports reach one of `files`,
+        so a changed module counts against the program that loaded it. PR #407 (2026-09-10) changed
+        core/mail/vetting.py; cc-slackd imports it, the deploy keyed on the daemon's own file alone, the daemon
+        kept its 08:30Z pid and the landing said "deployed". The process is found the way daemons() finds one
+        (repo_program: argv checked against the kernel's exe) and its program's source is read (imports_of). The
+        landing's own ancestry is left out, as everywhere else."""
+        root, mine, changed, hit, seen = os.path.realpath(self.root), own_ancestry(), set(files), {}, set()
+        for pid, argv, _unit, exe in live_processes():
+            if pid in mine:
+                continue
+            rel = repo_program(argv, root, exe)
+            if rel and rel not in seen and rel not in changed:
+                seen.add(rel)
+                for mod in sorted(imports_of(root, rel) & changed):
+                    hit[rel] = mod
+                    break
+        return hit
 
     # -- 10. what systemd does NOT own: a server somebody started from a shell -----------------------------
     def daemons(self):
@@ -2420,6 +2663,8 @@ class Land:
         if not files:
             raise Skip("no file list for this landing — nothing to look for")
         root = os.path.realpath(self.root)
+        via = self.importers(files)          # a bare program that IMPORTS a changed module is on old code too
+        files = files + sorted(via)
         rows = daemons_for(self.root, files)
         mine = own_ancestry()
 
@@ -2430,7 +2675,7 @@ class Land:
                     if not unit and pid not in mine]
 
         pids = lambda s: ", ".join(str(p) for p in sorted(s))
-        started, notes = [], []
+        started, notes = [], [f"{p} imports {m}, which moved" for p, m in sorted(via.items())]
         claimed = {runs for _, runs in rows.values()}   # by the file, not by the pid: a daemon that came back on a
                                                         # NEW pid is accounted for, and naming that new process as
                                                         # stale would report the restart this step just proved
@@ -2574,8 +2819,8 @@ class Land:
         if not self.pr:
             emit(f"landing [{self.repo}] {self.track}: {self.note}")
             return True
-        rc, o = sh(["gh", "pr", "view", str(self.pr), "--json",
-                    "title,url,state,mergeable,headRefName,mergeCommit"], cwd=self.root, timeout=120)
+        rc, o = sh(["gh", "pr", "view", str(self.pr), "--json",              # isDraft: what held() reads —
+                    "title,url,state,mergeable,headRefName,mergeCommit,isDraft"], cwd=self.root, timeout=120)
         if rc:
             print(f"cc-land: cannot read PR #{self.pr} in {self.root}: {last(o)}", file=sys.stderr)
             return False
@@ -3003,29 +3248,52 @@ def fix_progress(path, job):
                f"its push")
         return ""
     head = remote_head(repo, branch) or head    # the REMOTE's own ref is the head; the PR object is only the fallback
-    if head and head != fix.get("head"):
-        late = stamp() >= (fix.get("deadline") or "")     # the deadline bounds EVERY wait here, whatever the track looks like
-        if not late and track_running(repo, fix.get("track") or ""):
-            job["not_before"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL))
-            write_atomic(path, job)
-            return (f"[{repo}] PR #{pr}: the fix round pushed a checkpoint ({head[:12]}) but its track "
-                    f"{fix.get('track')} is still running — waiting for the round to end")
+    late = stamp() >= (fix.get("deadline") or "")     # the deadline bounds EVERY wait here, whatever the track looks like
+    alive = lambda: track_running(repo, fix.get("track") or "")     # asked only where the answer decides something
+
+    def wait(why):
+        job["not_before"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL))
+        write_atomic(path, job)
+        return f"[{repo}] PR #{pr}: {why}"
+
+    def requeue(head):
+        """The round ended with a pushed head: the PR is a different change now, and it goes back on the queue with
+        its tries fresh. The ledger says RE-QUEUED, in those words, because the line that was read the other way
+        cost two hours: 'fix-silent … nothing pushed' at 12:28Z, for a round that pushed at 12:30Z (PR #368)."""
         job.update(fix=dict(fix, over="pushed", pushed=head), attempts=0, stage="queued")
         job.pop("not_before", None)          # …and the tries start again: this is a different change now
         write_atomic(path, job)
-        ledger(f"fix-pushed {repo}#{pr} track={fix.get('track')} {(fix.get('head') or '')[:12]}->{head[:12]}"
-               + (" (past the fix deadline: reviewed as it stands)" if late else ""))
+        ledger(f"fix-pushed {repo}#{pr} track={fix.get('track')} {(fix.get('head') or '')[:12]}->{head[:12]} — "
+               f"re-queued" + (" (past the fix deadline: reviewed as it stands)" if late else ""))
         return ""
-    if stamp() >= (fix.get("deadline") or ""):
+    if head and head != fix.get("head"):
+        if not late and alive():
+            return wait(f"the fix round pushed a checkpoint ({head[:12]}) but its track {fix.get('track')} is "
+                        f"still running — waiting for the round to end")
+        return requeue(head)
+    if late:
+        # PAST THE DEADLINE WITH NOTHING PUSHED — and the ROUND IS STILL RUNNING. Its last act is the push: the
+        # iteration on PR #368 (2026-09-08) committed and pushed fc85483 at 12:30Z, two minutes after this branch
+        # had written 'fix-silent … nothing pushed' at 12:28Z and sent the job back to be refused; the PR then sat
+        # until a person re-queued it by hand, two hours into a queued milestone. So a running track is waited for
+        # PAST its deadline, up to one more FIX_WAIT — a bound, not for ever: a corpse the board still calls
+        # running is what the deadline exists for — and the head is read AFTER the iteration has ended, not a
+        # minute before its final push.
+        if (stamp() < time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch_of(fix.get("deadline") or "") + FIX_WAIT))
+                and alive()):
+            return wait(f"the fix iteration in track {fix.get('track')} is past its deadline but still running — "
+                        f"waiting for it to end before reading what it pushed")
+        head = remote_head(repo, branch) or head    # asked again, now that the iteration is over: what it left
+        if head and head != fix.get("head"):
+            return requeue(head)
         job.update(fix=dict(fix, over="no push"), stage="review")
         job.pop("not_before", None)
         write_atomic(path, job)
-        ledger(f"fix-silent {repo}#{pr} track={fix.get('track')} — nothing pushed by {fix.get('deadline')}")
+        ledger(f"fix-silent {repo}#{pr} track={fix.get('track')} — nothing pushed by {fix.get('deadline')}, "
+               f"and the iteration has ended")
         return ""
-    job["not_before"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL))
-    write_atomic(path, job)
-    return (f"[{repo}] PR #{pr}: waiting on the fix iteration in track {fix.get('track')} — dispatched "
-            f"{fix.get('at')}, nothing pushed yet")
+    return wait(f"waiting on the fix iteration in track {fix.get('track')} — dispatched {fix.get('at')}, nothing "
+                f"pushed yet")
 
 
 def run_job(path, job):
@@ -3040,14 +3308,29 @@ def run_job(path, job):
     write_atomic(path, job)                    # counted before anything irreversible: a kill mid-merge is still a try
     L = Land(repo, pr=pr) if pr else Land(repo, span=tuple(span))
     L.job = path
-    buf = io.StringIO()
+    buf, held = io.StringIO(), ""
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         if L.load():
-            rc = L.walk(L.steps() if pr else L.deploy_steps())
+            held = L.held()
+            rc = 1 if held else L.walk(L.steps() if pr else L.deploy_steps())
         else:
             rc, L.stopped, L.why = 1, "load", f"cannot read PR #{pr} in {L.root}"
     print(buf.getvalue(), end="", flush=True)
     tail = "\n".join(x for x in buf.getvalue().splitlines() if x.strip())
+    if held:
+        # A PR THAT CANNOT MERGE YET IS HELD, NOT TRIED. A draft, or a conflict: no gate runs, no read is bought, the
+        # try counted above is given back, and the queue looks again in RETRY_AFTER. Until this existed a drafted PR
+        # was tried three times fifteen minutes apart and had no tries left when it was ready (PR #324, 2026-09-07),
+        # and a conflicting one was ENDED on the spot — a person then had to re-queue it after the rebase. ONE ledger
+        # line per reason, not one per look: the job remembers what it was last held for.
+        job.update(attempts=job["attempts"] - 1, stage="held", last=f"held: {held}"[:400],
+                   not_before=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + RETRY_AFTER)))
+        if job.get("held") != held:
+            job["held"] = held
+            ledger(f"held {repo}#{pr} — {held}")
+        write_atomic(path, job)
+        return (f"[{repo}] PR #{pr}: held, not tried — {held}. The queue looks again in {RETRY_AFTER // 60} min "
+                f"and this costs it no try; `cc-land cancel {repo} {pr} --reason …` takes it out")
     if rc == 1 and L.stopped == "review" and limited(L.why):
         # A usage limit is the BOX's state, not a verdict: nothing read the PR, so there is nothing to tell the owner
         # and nothing to count. The job waits for the reset cc-limit names, and the sweep arms itself for it (rearm).
@@ -3084,7 +3367,9 @@ def run_job(path, job):
         line = dispatch_fix(path, job, L)
         if line:
             return line
-    decided = L.stopped == "gates" and " conflicts with " in L.why    # no flake: nothing but a rebase changes it
+    decided = L.stopped == "gates" and " conflicts with " in L.why    # no flake: nothing but a rebase changes it.
+    # (A conflict GitHub already knew of is held above and never gets here; this is the one merge_result finds
+    # itself, building the merge — GitHub's answer can be hours old, git's is fresh.)
     if rc == 1 and (L.stopped in RETRY or L.stopped == "load") and not decided and job["attempts"] < LAND_TRIES:
         # Kept, so the next sweep re-drives it — the retry PR #87 never had. A not_before goes with the try: the reset
         # this job once waited for is spent, and left on it is read as the schedule, arming the re-run 60 s out and
@@ -3450,6 +3735,9 @@ def prepare(paths):
             try:
                 if not L.facts:
                     return                  # load() already said why
+                if L.held():
+                    out("·", f"{L.held()} — held by the serial phase, so nothing is gated or read for it here")
+                    return                  # a draft: a read bought now judges a change its author has not finished
                 try:
                     out("✓", L.gates())
                 except Skip as e:
@@ -3702,6 +3990,91 @@ def cmd_queue(argv):
     return 0
 
 
+def cmd_cancel(argv):
+    """`cc-land cancel <repo> <pr> --reason "<why>"`: take a queued job out, on the record. Until this existed the
+    only way was to move `~/.cc/state/land/<repo>-<pr>.json` aside — which works because the queue globs that
+    directory, and which the next person cannot know (PR #324, 2026-09-07). The reason is REQUIRED: the ledger is
+    the one place that says why a landing never happened, and "cancelled" alone is the question, not the answer.
+
+    A job a running sweep has in hand — past `queued`, `held`, `deferred` or `fixing`, with a live sweep — is
+    refused: that landing is mid-step and its own writes would put the file straight back. Everything else,
+    including a job a killed sweep left at some stage, goes. Exit 0 taken out · 1 no such job, or refused · 2 usage."""
+    repo, pr, reason, rest = "", "", "", list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--reason" and rest:
+            reason = re.sub(r"\s+", " ", rest.pop(0)).strip()   # one line: a newline in it would forge a ledger row
+        elif not repo:
+            repo = a
+        elif not pr:
+            pr = a
+        else:
+            print(f"cc-land cancel: unexpected '{a}'", file=sys.stderr)
+            return 2
+    if (not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", repo or "") or not re.fullmatch(r"[0-9]+", pr or "")
+            or not reason):
+        print('cc-land: cancel takes <repo> <pr-number> --reason "<why>" — the reason is written to the ledger and '
+              'is not optional', file=sys.stderr)
+        return 2
+    path = job_path(repo, pr)
+    job = read_json(path)
+    if job is None:
+        print(f"[{repo}] PR #{pr}: not queued — nothing to cancel (`cc-land status {repo} {pr}` says what is on it)",
+              file=sys.stderr)
+        return 1
+    stage, running = job.get("stage") or "queued", sweep_running()
+    if running and stage not in ("queued", "held", "deferred", "fixing"):
+        print(f"[{repo}] PR #{pr}: a sweep running since {running} has this job at stage '{stage}' — a landing "
+              f"mid-step cannot be withdrawn from outside it; wait for it to stop, then cancel", file=sys.stderr)
+        return 1
+    try:
+        os.unlink(path)
+    except OSError as e:
+        print(f"cc-land: cannot remove {path}: {e}", file=sys.stderr)
+        return 1
+    ledger(f"cancelled {repo}#{pr} stage={stage} by={asked_by()} reason={reason}")
+    print(f"[{repo}] PR #{pr}: taken out of the queue ({reason}) — `cc-land queue {repo} {pr}` puts it back")
+    return 0
+
+
+def cmd_status(argv):
+    """`cc-land status <repo> <pr>`: is this PR being landed, by ANY path. On 2026-09-07 a session read the queue
+    directory alone, was told "no queue job (direct path, expected)" while a job an hour into its gates sat there,
+    force-pushed, and had the merge refused ('Head branch was modified'). The two paths do not see each other — a
+    direct `cc-land <repo> <pr>` never reads the queue and the queue never looks for a direct one — so the one
+    place that answers reads all three: the job file (job_path), a live cc-land process naming this repo and PR
+    on its command line, and the change's work record (root_path: what has been bought against it, which
+    outlives the job). Exit 0 when a landing is on it, 1 when none is; the record alone is history, not a landing.
+    The process is read by its command line, which is the process's own memory: a decoy can claim to be landing a
+    PR, and the most that buys is a session that waits."""
+    if len(argv) != 2 or not re.fullmatch(r"[0-9]+", argv[1]):
+        print("cc-land: status takes <repo> <pr-number>", file=sys.stderr)
+        return 2
+    repo, pr = argv
+    on, mine = [], own_ancestry()
+    j = read_json(job_path(repo, pr)) or {}
+    if j:
+        on.append(f"queue job {job_path(repo, pr)}: stage={j.get('stage') or '?'} attempts={j.get('attempts') or 0}"
+                  f" queued {j.get('queued_at') or '?'}")
+    for pid, argv_, _unit, _exe in live_processes():
+        if pid in mine:
+            continue
+        i = next((n for n, tok in enumerate(argv_[:2]) if os.path.basename(tok) == "cc-land"), -1)
+        rest = argv_[i + 1:] if i >= 0 else []
+        if rest[:1] == [repo] and pr in [a for a in rest[1:] if re.fullmatch(r"[0-9]+", a)]:
+            shown = re.sub(r"[^\x20-\x7e]", "?", " ".join(rest))[:200]   # another process's argv: bounded, printable
+            on.append(f"direct landing running: pid {pid} (cc-land {shown})")
+    w = root_work(repo, pr)
+    rec = (f"work record {root_path(repo, pr)}: "
+           + " ".join(f"{k}={v}" for k, v in sorted(w.items()) if not isinstance(v, (dict, list)))) if w else ""
+    if on:
+        print(f"[{repo}] PR #{pr} is being landed:\n  " + "\n  ".join(on + ([rec] if rec else [])))
+        return 0
+    print(f"[{repo}] PR #{pr}: no landing on it — no queue job, no direct cc-land process"
+          + (f"\n  {rec}" if rec else ""))
+    return 1
+
+
 def cmd_record(argv):
     """`cc-land record <repo> <pr> <verdict> --by <who> [--head <sha>] [--findings <text>|-]` — write down a review
     that has ALREADY happened, against the change the PR is at right now, in the one place the landing reads
@@ -3917,6 +4290,39 @@ def cmd_selfcheck():
     check("a gate starts clean: no CLAUDE* from the session, SIGHUP back to default (nohup'd chains, H4 red 3/3 "
           "on 2026-09-01)", rc == 0 and "CLAUDE" not in clean and hup_ign(clean) == 0)
 
+    # …and it cannot reach a credential, whatever branch it runs: PR #323's gate (2026-09-09) read the live keys
+    # through `cc-config get` — ~/.cc/config unless CC_CONFIG says otherwise — and completed a real billed turn.
+    # The real cc-config beside this file, a HOME whose config holds a token, and the two variables in the env.
+    probe = tempfile.mkdtemp(prefix="cc-land-selfcheck-secret-")
+    os.makedirs(f"{fixture_home}/.cc", exist_ok=True)
+    with open(f"{fixture_home}/.cc/config", "w") as f:
+        f.write("SLACK_BOT_TOKEN=xoxb-fixture-token\nLESSONS_KEY=key-in-the-file\n")
+    with open(f"{probe}/gate.sh", "w") as f:       # cc-config: the environment wins over the file, so one key of each
+        f.write(f"#!/usr/bin/env bash\necho \"got=$({BIN}/cc-config get SLACK_BOT_TOKEN)\"\n"
+                f"echo \"file=$({BIN}/cc-config get LESSONS_KEY)\"\n"
+                "env | grep -E '^(SLACK_BOT_TOKEN|ANTHROPIC_API_KEY|CC_KEEP|CC_CONFIG_DENY)=' | sort\n")
+    os.chmod(f"{probe}/gate.sh", 0o755)
+    was = {k: os.environ.get(k) for k in ("SLACK_BOT_TOKEN", "ANTHROPIC_API_KEY", "CC_KEEP", "CC_CONFIG")}
+    os.environ.update(SLACK_BOT_TOKEN="xoxb-from-env", ANTHROPIC_API_KEY="sk-from-env", CC_KEEP="yes")
+    os.environ.pop("CC_CONFIG", None)
+    try:
+        dirty = sh([f"{probe}/gate.sh"], cwd=probe, timeout=10)[1]
+        rc, clean = sh([f"{probe}/gate.sh"], cwd=probe, timeout=10, **clean_start())
+    finally:
+        for k, v in was.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        shutil.rmtree(probe, ignore_errors=True)
+        os.unlink(f"{fixture_home}/.cc/config")
+    check("control: without the scrub a gate reads the live config through cc-config and carries the session's "
+          "tokens in its env", "got=xoxb-from-env" in dirty and "file=key-in-the-file" in dirty
+          and "SLACK_BOT_TOKEN=xoxb-from-env" in dirty and "ANTHROPIC_API_KEY=" in dirty)
+    check("a gate cannot reach a credential: the live ~/.cc/config is denied, so cc-config get prints nothing "
+          "from the file or the env, and no *_TOKEN / *_KEY is in its env — while a non-secret CC_* still passes "
+          "(PR #323's gate completed a billed turn on the live keys, 2026-09-09)",
+          rc == 0 and "got=\n" in clean and "file=\n" in clean and "SLACK_BOT_TOKEN" not in clean
+          and "ANTHROPIC_API_KEY" not in clean and "CC_KEEP=yes" in clean
+          and f"CC_CONFIG_DENY={os.path.realpath(fixture_home)}/.cc/config" in clean)
+
     # A gate's output is streamed to its log as it runs, and it is killed for SILENCE, never for the clock: a suite
     # waiting for one of its slots says so every minute, and PR #227's landing counted that wait as the run — timed
     # out at 3600 s with an empty log, merged nothing (2026-09-04). Real subprocesses, like the probe above.
@@ -4001,6 +4407,10 @@ def cmd_selfcheck():
           "nothing else changed, and went green (2026-09-07)",
           "3 commits behind main" in stale and "core/bin/tool" in stale and "core/tests/check.sh" in stale
           and "rebase" in stale)
+    check("…and the note names the COMMIT it measured, not 'this branch': on 2026-09-07 the landing had gated a "
+          "stale pull ref and a person read 'this branch is N behind' as the branch's own state",
+          f"the commit gated here, {old_head[:12]}, is 3 commits behind main" in stale
+          and "this branch is" not in stale)
     check("...and it leaves out the files the branch changes ITSELF: those are not code it is running an old copy "
           "of, they are the change — listing them would send the reader to their own diff",
           "core/bin/other" not in stale)
@@ -4691,6 +5101,30 @@ def cmd_selfcheck():
     check("...and a reviewer that dies any OTHER way is NOT refunded: the model ran, the money went, and a re-run "
           "that buys again is a buy the bound has to see",
           "produced nothing" in str(r) and not limited(str(r)) and root_work("myrepo", 7).get("reviews") == 1)
+    # …and the limit that ANSWERS instead of dying. PR #390 (2026-09-08, 21:07Z): rc=0, a result reading "You've hit
+    # your session limit", $0.00, no verdict — read as "answered without a verdict", counted reviews:1, and the
+    # re-queue at 23:05Z refused at the wall for a read that was never made. cc-limit's own check does not know the
+    # words "session limit", so the runner's answer is read here.
+    def limit_said(text, cost):
+        L = fresh(pr=7)
+        world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+        world[f"{CLAUDE} -p"] = (0, json.dumps({"result": text, "total_cost_usd": cost, "num_turns": 1,
+                                                "usage": {"input_tokens": 12, "output_tokens": 30}}))
+        world[f"{BIN}/cc-limit check"] = (1, "clear\n")     # cc-limit reads usage/rate/429, not this wording
+        return caught(L.review)
+    r = limit_said("You've hit your session limit. Your limit will reset at 3pm (America/Los_Angeles).", 0)
+    check("a reviewer that ANSWERS 'You've hit your session limit' with no verdict and $0.00 is a usage limit, not "
+          "a bought review: the buy is refunded and the stop reads as `limited`, so the queue defers it to the "
+          "reset instead of the wall refusing the next landing for a read never made (PR #390, 2026-09-08)",
+          limited(str(r)) and not root_work("myrepo", 7).get("reviews") and "session limit" in str(r))
+    r = limit_said("VERDICT: LAND-AFTER-FIX\n1. a.py:3 — the rate limit is never applied → apply it", 0.31)
+    check("...and the control: an answer that MENTIONS a limit is not a limit — with a verdict in it, and money "
+          "spent, it is the review it looks like, counted and acted on",
+          not limited(str(r)) and "LAND-AFTER-FIX on PR #7" in str(r) and root_work("myrepo", 7).get("reviews") == 1)
+    r = limit_said("I could not decide; the diff touches the rate limit and I ran out of things to say.", 0.31)
+    check("...and the other control: no verdict and the words 'rate limit', but the money WENT — the model ran and "
+          "read, so it is an answer without a verdict, counted, never a refund",
+          not limited(str(r)) and "without a verdict" in str(r) and root_work("myrepo", 7).get("reviews") == 1)
     # The caps are read from the environment now — that is this change — so a block asserting the exact strings
     # the remedy names has to fix them for its own duration. Without this, an operator who has set
     # CC_LAND_REVIEW_BUDGET turns this suite red: the feature failing its own test (review of #197).
@@ -4937,6 +5371,58 @@ def cmd_selfcheck():
     check("...and the round after THAT is a person's: one repair round is one extra review, not an allowance that "
           "renews on every push",
           isinstance(r, Failed) and not bought5 and "2 review(s) and 1 repair round(s)" in str(r))
+
+    # THE REPAIR ROUND IS THE FIX, NOT THE DISPATCH. PR #410 (2026-09-11): a --re-review bought by the seat came back
+    # LAND-AFTER-FIX; the seat's own builder pushed the fix that answered the findings line by line; the re-queue
+    # ran the gates green and stopped at "2 review(s) and 0 repair round(s), the diff at 61d4da1 is not one they
+    # read" — because the round had not come through dispatch_fix, nothing had counted it. Its own fixture: the
+    # PR's thread carries the verdict this box last wrote, for the change BEFORE the push (KEY), and the tally is
+    # what the earlier landings left.
+    def pushed_after(stood, tally, diff=DIFF_OTHER, head=NEXT, answer="LAND", **kw):
+        L = fresh(pr=7, **kw)
+        os.makedirs("/tmp/_ccland/.git", exist_ok=True)
+        world["git rev-parse FETCH_HEAD"] = (0, head + "\n")
+        world["git merge-base"] = (0, MB + "\n")
+        world[f"git diff -U3 {MB}"] = (0, diff)
+        world[f"{CLAUDE} -p"] = (0, REVIEWED(answer))
+        body = (f"<!-- {REVIEW_MARK} v2 change={KEY} base={MB[:12]} head={HEAD[:12]} verdict={stood} "
+                f"by=claude-opus-5 -->\n**VERDICT: {stood}**\n\n1. a.py:2 — VERDICT: LAND is quoted here")
+        world["gh pr view 7 --json comments"] = (0, json.dumps(
+            {"comments": [{"body": body, "viewerDidAuthor": True}] if stood else []}))
+        if tally:
+            os.makedirs(root_dir(), exist_ok=True)
+            write_atomic(root_path("myrepo", 7), dict(tally, repo="myrepo", pr=7, first=stamp()))
+        return caught(L.review), [c for c in calls if c[0] == CLAUDE]
+    r, bought = pushed_after("LAND", {"reviews": 1}, diff=DIFF, head=HEAD, answer="LAND-AFTER-FIX", re_review=True)
+    tally = read_json(root_path("myrepo", 7)) or {}
+    check("a --re-review is a person's spend and is tallied as one: counted with the reviews AND as `asked`, so "
+          "what it consumed is added back to what the change may buy (reads_earned) rather than eating the one "
+          "routine read",
+          isinstance(r, Failed) and "LAND-AFTER-FIX on PR #7" in str(r) and len(bought) == 1
+          and tally.get("reviews") == 2 and tally.get("asked") == 1 and reads_earned(tally) == 2)
+    r, bought = pushed_after("LAND-AFTER-FIX", tally)
+    check("a fix the planning seat pushed after that LAND-AFTER-FIX IS the repair round: the diff moved off the "
+          "change the verdict was written for, so the read that round earns is bought — LAND, one model call, "
+          "repairs counted 1 — where the wall refused it as '2 review(s) and 0 repair round(s)' (PR #410)",
+          "LAND on PR #7" in str(r) and len(bought) == 1 and root_work("myrepo", 7).get("repairs") == 1
+          and root_work("myrepo", 7).get("reviews") == 3)
+    r, bought = pushed_after("LAND", {"reviews": 2, "asked": 1})
+    check("...and the control: a push after a LAND is not a repair — nothing asked for a fix — so the same tally "
+          "with a LAND standing on the thread is refused at the wall as before, nothing bought",
+          isinstance(r, Failed) and "budget for this change is spent" in str(r) and not bought
+          and not root_work("myrepo", 7).get("repairs"))
+    r, bought = pushed_after("LAND-AFTER-FIX", {"reviews": 3, "asked": 1, "repairs": 1})
+    check("...and the other control: the round after the seat's round is a person's, exactly as it is after a "
+          "dispatched one — a second LAND-AFTER-FIX pushed against is refused, ONE repair round per change",
+          isinstance(r, Failed) and "3 review(s) and 1 repair round(s)" in str(r) and not bought)
+    L = fresh(pr=7, re_review=True)
+    world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+    world[f"{CLAUDE} -p"] = (1, "")
+    world[f"{BIN}/cc-limit check"] = (0, "usage limit until 04:00Z\n")
+    r = caught(L.review)
+    check("...and the tally's `asked` goes back WITH the review when a limit refunds a --re-review, so a person's "
+          "refunded spend is not left inflating what the change may buy",
+          limited(str(r)) and not root_work("myrepo", 7).get("reviews") and not root_work("myrepo", 7).get("asked"))
     L = fresh(pr=7)
     root_spend("myrepo", 7, reviews=9, repairs=9)
     world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
@@ -5407,6 +5893,42 @@ def cmd_selfcheck():
               "in front of is collected, not abandoned: one model call, its verdict on the PR, its buy counted",
               isinstance(g, Failed) and "check.sh" in str(g) and len([c for c in calls if c[0] == CLAUDE]) == 1
               and len(commented()) == 1 and root_work("myrepo", 7).get("reviews") == 1 and not ran("gh pr merge"))
+
+        # A REFUSAL REACHED WHILE THE GATES RAN IS RE-CHECKED BEFORE IT STANDS. PR #402 (2026-09-10): the review
+        # thread hit the budget wall at 06:42:46Z and marked the PR doomed; the orch recorded LAND for that head at
+        # 06:45:09Z; the gates ran green for fifteen minutes; and at 06:58:10Z the landing said NOT merged on the
+        # 06:42 decision, never re-reading the record thirteen minutes old by then. The re-queue at 06:58:37Z bought
+        # a second full run to read it. The fixture: the thread is empty until the mark is written, and carries a
+        # LAND for the head from then on — exactly the order it happened in.
+        def recorded_after_mark(argv):
+            marked = bool((root_work("myrepo", 7) or {}).get("doomed"))
+            return (0, json.dumps({"comments": [{"body": f"<!-- {REVIEW_MARK} {HEAD[:12]} LAND -->\nread by the "
+                                                         f"orch", "viewerDidAuthor": True}] if marked else []}))
+
+        def doomed_beside_gates(comments):
+            """The wall at t=0 on the review thread, the gates green beside it — `both`, but with the one routine
+            read already spent on the change (fresh() wipes the tally, so it is written after it here)."""
+            L = fresh(pr=7)
+            root_spend("myrepo", 7, reviews=1)
+            world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git merge-base": (0, A + "\n"),
+                          "git diff --name-status": (0, "M\tinstall.sh\n"), "git diff --numstat": (0, "3\t2\tx\n"),
+                          "git rev-parse HEAD^{tree}": (0, TREE + "\n"), "gh pr view 7 --json comments": comments,
+                          f"{tempfile.gettempdir()}/cc-land.": lambda a: (0, "== result: 5 passed, 0 failed ==\n")})
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                g = caught(L.gates)
+                r = caught(L.review) if not isinstance(g, Failed) else None
+            return L, g, r
+        L, g, r = doomed_beside_gates(recorded_after_mark)
+        check("a verdict recorded WHILE the gates ran answers the wall the review thread hit at their start: the "
+              "landing re-reads the PR before the refusal stands, finds the LAND, and lands — nothing bought, and "
+              "no second run to read a record already there (PR #402, 2026-09-10)",
+              isinstance(g, str) and isinstance(r, str) and "LAND on PR #7" in r and "while the gates ran" in r
+              and not [c for c in calls if c[0] == CLAUDE] and root_work("myrepo", 7).get("reviews") == 1)
+        L, g, r = doomed_beside_gates((0, json.dumps({"comments": []})))
+        check("...and the control: with nothing recorded since the mark, the same wall stands as it was written — "
+              "the re-read is one `gh pr view`, and it changes nothing when there is nothing to find",
+              isinstance(g, str) and isinstance(r, Failed) and "budget for this change is spent" in str(r)
+              and getattr(r, "doomed", False) and not [c for c in calls if c[0] == CLAUDE])
         meet = threading.Barrier(2, timeout=10)
 
         def suite_says(argv):
@@ -5769,6 +6291,17 @@ def cmd_selfcheck():
     with open(f"{droot}/core/bin/cc-graphs", "w") as _fh:
         _fh.write("#!/usr/bin/env python3\n")   # a REAL #! line: the step reads it to learn which exe is the daemon's
     GPROG, GCMD = f"{droot}/core/bin/cc-graphs", "cc-graphs\tcore/bin/cc-graphs serve\tcore/bin/cc-graphs\n"
+    # …and a daemon that IMPORTS a module, in the real shape of cc-slack: `import vetting` after a sys.path append,
+    # inside a function; vetting.py itself imports router. Made here, before the tree is first indexed.
+    os.makedirs(f"{droot}/core/mail")
+    open(f"{droot}/core/mail/vetting.py", "w").write("import json\nimport router\n")
+    open(f"{droot}/core/mail/router.py", "w").close()
+    open(f"{droot}/core/mail/outbound.py", "w").close()
+    SPROG = f"{droot}/core/bin/cc-slack"
+    with open(SPROG, "w") as _fh:
+        _fh.write("#!/usr/bin/env python3\nimport os, sys\n\n\ndef mail_vetting():\n"
+                  "    sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'mail'))\n"
+                  "    import vetting\n    return vetting\n")
     PY3 = interpreter_of(GPROG)                  # what the kernel would end up running for that #! line
     NOTPY = os.path.realpath(shutil.which("sleep") or "/bin/sleep")   # …and a binary that plainly is not it
 
@@ -5886,6 +6419,85 @@ def cmd_selfcheck():
     check("a manifest the landing cannot read is a red deploy here too — an empty answer from a file nothing "
           "could parse must never read as 'this box runs no daemon at all'",
           isinstance(caught(L.daemons), Failed) and not ran(f"{droot}/core/bin/cc-graphs", "serve"))
+    # 7c. "IS THIS PR BEING LANDED" covers every path. On 2026-09-07 a session read the queue directory alone, was
+    # told "no queue job (direct path, expected)" while a job an hour into its gates sat there, force-pushed, and
+    # had the merge refused. The fake process table stands in for a direct landing.
+    def status_of(pr):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_status(["myrepo", str(pr)])
+        return rc, buf.getvalue()
+
+    fresh(pr=7)
+    write_atomic(job_path("myrepo", 9), {"repo": "myrepo", "pr": 9, "stage": "gates", "attempts": 1,
+                                         "queued_at": "2026-09-07T10:00:00Z"})
+    rc, o = status_of(9)
+    check("status names a queue job, its file and its stage", rc == 0 and job_path("myrepo", 9) in o
+          and "stage=gates" in o and "being landed" in o)
+    os.unlink(job_path("myrepo", 9))
+    PROCS[0] = [(5100, ["/usr/bin/python3", f"{fixture_home}/bin/cc-land", "myrepo", "9", "--re-review"], "", PY3),
+                (5101, ["/usr/bin/python3", f"{fixture_home}/bin/cc-land", "myrepo", "12"], "", PY3),
+                (5102, ["/usr/bin/python3", f"{fixture_home}/bin/cc-land", "other", "9"], "", PY3)]
+    rc, o = status_of(9)
+    check("…and a DIRECT `cc-land <repo> <pr>` process with no job file at all — the path the queue cannot see — "
+          "by its pid; another PR's and another repo's landers are not it",
+          rc == 0 and "direct landing running: pid 5100" in o and "5101" not in o and "5102" not in o)
+    MINE[0] = {5100}
+    rc, o = status_of(9)
+    check("…never counting the asking process's own ancestry as a landing",
+          rc == 1 and "no landing on it" in o)
+    MINE[0] = set()
+    PROCS[0] = []
+    write_atomic(root_path("myrepo", 9), {"first": stamp(), "reviews": 1, "repairs": 0})
+    rc, o = status_of(9)
+    check("…and with neither it says none — the work record is shown as what was spent, and is not a landing",
+          rc == 1 and "no landing on it" in o and "reviews=1" in o and root_path("myrepo", 9) in o)
+    os.unlink(root_path("myrepo", 9))
+
+    # 7d. A DAEMON THAT IMPORTS WHAT MOVED. PR #407 (2026-09-10) changed core/mail/vetting.py; cc-slackd imports it,
+    # the deploy keyed on the daemon's own file and the units manifest alone, the daemon kept its 08:30Z pid and
+    # the landing said "deployed". The unit is the fixture's cc-slackd.service (ExecStart=%h/bin/cc-slack daemon),
+    # its process runs the tree's cc-slack, and nothing in units.json declares the module.
+    def with_importer(changed, restart_for=(0, "")):
+        D = fresh(pr=7)
+        D.root = droot
+        D.changed = list(changed)
+        world[f"{BIN}/cc-units restart-for"] = restart_for
+        world["systemctl --user is-active cc-slackd.service"] = (0, "active\n")
+        PROCS[0] = [proc(4300, "/usr/bin/python3", SPROG, "daemon", unit="cc-slackd.service")]
+        return D
+
+    L = with_importer([("M", "core/mail/vetting.py")])
+    r = caught(L.restart)
+    check("a change to a module a running daemon IMPORTS restarts that daemon, and the line says why: #407 changed "
+          "core/mail/vetting.py and cc-slackd, which imports it, was left on the old code with 'deployed' reported",
+          isinstance(r, str) and ran_sub("systemctl", "--user", "restart", "cc-slackd.service")
+          and "core/bin/cc-slack imports core/mail/vetting.py, which moved" in r)
+    L = with_importer([("M", "core/mail/router.py")])
+    r = caught(L.restart)
+    check("…and the imports are followed through: router.py is two imports away from the daemon and still counts",
+          isinstance(r, str) and ran_sub("systemctl", "--user", "restart", "cc-slackd.service")
+          and "core/bin/cc-slack imports core/mail/router.py" in r)
+    L = with_importer([("M", "core/mail/outbound.py")])
+    r = caught(L.restart)
+    check("a change to a module nothing running imports restarts nothing, and the line says so",
+          isinstance(r, Skip) and not ran_sub("systemctl", "--user", "restart") and "or imports" in str(r))
+    L = with_importer([("M", "core/mail/vetting.py")], (0, "cc-slackd.service\towner\n"))
+    r = caught(L.restart)
+    check("…and a daemon the manifest keeps for the owner is NAMED as left on the old code, with the import as the "
+          "reason, never restarted from here",
+          isinstance(r, Skip) and not ran_sub("systemctl", "--user", "restart")
+          and "cc-slackd.service moved too and is the owner's" in str(r)
+          and "core/bin/cc-slack imports core/mail/vetting.py" in str(r))
+    L = with_importer([("M", "core/mail/vetting.py")])
+    PROCS[0] = [proc(4301, "/usr/bin/python3", SPROG, "channel")]        # the same program, no unit: a session's
+    world[f"{BIN}/cc-units daemons-for"] = (0, "")                          # channel server, undeclared here
+    msg = said(L)
+    check("…and outside systemd the same rule holds: a bare process of a program that imports the changed module "
+          "is named as still on the old code, with the reason",
+          L.stale == ["core/bin/cc-slack (pid 4301)"] and "core/bin/cc-slack imports core/mail/vetting.py" in msg)
+    PROCS[0] = []
+
     # …and the /proc read itself, against a REAL process. Every case above stands on a fake process list, so
     # none of them touches the part that has to be right on the box: reading a live command line back and
     # recognising the file it runs.
@@ -5924,6 +6536,29 @@ def cmd_selfcheck():
             _k.wait()
     shutil.rmtree(preal, ignore_errors=True)
     shutil.rmtree(droot, ignore_errors=True)
+
+    # 7b. WHICH ROW A LANDING CLOSES. PR #369 (2026-09-08): branch planning/selfchecks-run-because-the-tool-exists,
+    # a row of that name with `pr: 369`, merged 14:33Z — and the row stayed [running], because the URL regex did
+    # not match a bare number, the row's branch field says track/<row>, and nothing read the head's own name.
+    # Since the 09-04 execution model most rows are built on planning/<row> by a subagent: five rows that day were
+    # closed by hand, and the watchdog called each abandoned until then.
+    def row_for(pr_field, head, rows=("w1",)):
+        L = fresh(pr=7)
+        BOARD[0]["tracks"] = {r: {"pr": pr_field, "branch": f"track/{r}", "status": "running"} for r in rows}
+        L.facts = dict(FACTS, headRefName=head)
+        return L
+    L = row_for("7", "planning/w1")
+    check("a row whose pr field is the bare number, landed from a planning/<row> branch, is found and closed as "
+          "merged — the number is the PR and the branch's own name is the row (PR #369, 2026-09-08)",
+          L.find_track() == "w1" and "-> merged" in L.close_board()
+          and ran("cc-board", "status", "myrepo", "w1", "merged"))
+    check("...and either half alone is enough: the bare number with a head that names no row, and a builder/<row> "
+          "head with no pr field at all",
+          row_for("7", "feature/elsewhere").find_track() == "w1" and row_for("", "builder/w1").find_track() == "w1")
+    check("...and the control: a bare number is matched WHOLE — pr `70` is not PR #7 — and a head naming a row the "
+          "board does not have closes nothing, so a landing never marks the wrong row merged",
+          row_for("70", "planning/elsewhere").find_track() == ""
+          and isinstance(caught(row_for("70", "planning/elsewhere").close_board), Skip))
 
     # 8. the no-PR path — the one that left a track open for half an hour
     L = fresh(track="w1", note="settings edit outside the repo")
@@ -6470,6 +7105,21 @@ def cmd_selfcheck():
               "the bot",
               len(gh_merges()) == 1 and len(commented()) == 1 and not os.path.exists(job_path("myrepo", 7))
               and not reacted)
+        # (1c) …and the limit that ANSWERS: rc=0, "You've hit your session limit", $0.00, no verdict (PR #390). The
+        # queue deferred nothing for it — the stop read as "answered without a verdict", the job ENDED with reviews:1
+        # on the record, and the re-queue was refused at the wall two hours later.
+        landing(**{f"{CLAUDE} -p": (0, json.dumps({"result": "You've hit your session limit. Resets 3pm.",
+                                                   "total_cost_usd": 0, "num_turns": 1})),
+                   f"{BIN}/cc-limit check": (1, "clear\n")})
+        quiet(cmd_work, [])
+        kept = read_json(job_path("myrepo", 7)) or {}
+        check("a reviewer that ANSWERS with a session limit — no verdict, $0.00 — defers the job exactly as one that "
+              "died of the limit does: stage deferred, the attempt uncounted, nothing posted, the read given back, "
+              "and the job still there for the reset (PR #390: ended, counted, and refused at the wall at 23:05Z)",
+              kept.get("stage") == "deferred" and kept.get("attempts") == 0 and not commented()
+              and not root_work("myrepo", 7).get("reviews") and not gh_merges() and not ran_sub("cc-slack", "post"))
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))      # kept, correctly: drained by hand for the cases below
 
         # (1b) …and a review that ran out of cc-land's OWN cap is neither weather nor a verdict: the limit above
         # lifts by itself and a cap never does, so waiting for it is waiting for nothing.
@@ -6573,12 +7223,63 @@ def cmd_selfcheck():
               and not ran_sub("cc", "myrepo", "w1", "--go")
               and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told() and "LAND-AFTER-FIX" in told()
               and len([c for c in calls if c[0] == CLAUDE]) == 1)
-        landing(**{"gh pr view": (0, json.dumps(dict(FACTS, mergeable="CONFLICTING")))})
+        # (3b) …and a PR that CANNOT MERGE YET does not spend the tries it will need when it can. cc-land had no
+        # word for a draft at all (measured 2026-09-07: grep draft/isDraft, nothing): PR #324 was queued by `cc done`
+        # and then drafted to keep it behind a security fix, and the queue would have tried it three times, fifteen
+        # minutes apart, and had no tries left when it was ready. A conflict is the same shape — a person must fix
+        # it, and fifteen minutes changes nothing — so it is HELD too, where it used to be ended on the spot.
+        for what, facts in (("a DRAFT", dict(FACTS, isDraft=True)), ("a CONFLICTING PR", dict(FACTS, mergeable="CONFLICTING"))):
+            n_held = open(f"{LANDQ}/queue.log").read().count("held myrepo#7")   # the log is not reset: counted
+            landing(**{"gh pr view": (0, json.dumps(facts))})
+            quiet(cmd_work, [])
+            kept = read_json(job_path("myrepo", 7)) or {}
+            log = open(f"{LANDQ}/queue.log").read()
+            check(f"{what} in the queue is HELD, not tried: no gate, no read, no merge, the attempt uncounted and the "
+                  f"job still there with a not_before, one `held` ledger line — and nobody paged, because waiting "
+                  f"is what drafting meant (PR #324, 2026-09-07)",
+                  kept.get("stage") == "held" and kept.get("attempts") == 0 and kept.get("held")
+                  and 0 < epoch_of(kept.get("not_before", "")) - time.time() <= RETRY_AFTER
+                  and not [c for c in calls if c[0] == CLAUDE] and not ran("git worktree add") and not gh_merges()
+                  and log.count("held myrepo#7") == n_held + 1 and not ran_sub("cc-slack", "post")
+                  and not ran("cc-notify"))
+            kept["not_before"] = "2000-01-01T00:00:00Z"      # the next look, fifteen minutes on
+            write_atomic(job_path("myrepo", 7), kept)
+            quiet(cmd_work, [])
+            check(f"...and the next look at {what} still not ready holds it again WITHOUT a second ledger line and "
+                  f"with its tries still intact — one line per reason, not one per look",
+                  (read_json(job_path("myrepo", 7)) or {}).get("attempts") == 0
+                  and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == n_held + 1)
+            kept = dict(read_json(job_path("myrepo", 7)) or {}, not_before="2000-01-01T00:00:00Z")
+            write_atomic(job_path("myrepo", 7), kept)
+            world["gh pr view"] = (0, json.dumps(FACTS))    # marked ready, or rebased: it can merge now
+            quiet(cmd_work, [])
+            check(f"...and once {what} can merge, the SAME job lands on its first real try, with all three still "
+                  f"in hand — nobody re-queued it",
+                  len(gh_merges()) == 1 and not os.path.exists(job_path("myrepo", 7)))
+        # CONTROL: the conflict git finds ITSELF while building the merge — GitHub's answer can be hours old — is
+        # still a red gate and still no flake: ended at once, unarmed, told to rebase, exactly as before.
+        landing(**{"git merge-tree --write-tree": lambda a: (1, "<<<<<<< CONFLICT (content): Merge conflict in a.py\n")})
         quiet(cmd_work, [])
-        check("...and a PR that CONFLICTS with its base fails in the gates step but is no flake: ended at once, "
-              "unarmed, told to rebase",
+        check("...while a conflict GitHub did NOT know of, met by git building the merge, is a gates stop and no "
+              "flake: ended at once, unarmed, told to rebase — the hold reads GitHub's word, the gate reads git's",
               not os.path.exists(job_path("myrepo", 7)) and not armed() and not gh_merges()
-              and "conflicts with main" in told() and "NOT merged" in told())
+              and "conflicts with" in told() and "NOT merged" in told())
+        # …and the other half of the same row: a job comes OUT of the queue by a command, on the record.
+        landing(**{"gh pr view": (0, json.dumps(dict(FACTS, isDraft=True)))})
+        quiet(cmd_work, [])
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc_bare = cmd_cancel(["myrepo", "7"])
+            rc_gone = cmd_cancel(["myrepo", "7", "--reason", "behind the security fix,\nlands after #330"])
+            rc_none = cmd_cancel(["myrepo", "7", "--reason", "again"])
+        log = open(f"{LANDQ}/queue.log").read()
+        check("`cancel <repo> <pr> --reason` takes a queued job out and writes the reason to the ledger; without a "
+              "reason it is usage (2), and with no such job it says so (1) — withdrawing a job is a thing the tool "
+              "does, not a file somebody knows to move",
+              rc_bare == 2 and rc_gone == 0 and rc_none == 1 and not os.path.exists(job_path("myrepo", 7))
+              and "cancelled myrepo#7" in log and "behind the security fix, lands after #330" in log)   # ONE line:
+        # a newline in the reason (a relayed Slack text) would otherwise forge a second ledger row (security read, 09-11)
+        check("...and the usage line names it, beside the other subcommands, so the next person finds it where "
+              "they look", "cc-land cancel <repo> <pr> --reason" in __doc__)
 
         # (4) …and where there IS a track to fix in, the queue dispatches ONE fix iteration and stays out of the
         # planning session's way. Every LAND-AFTER-FIX used to cost it a dozen full-context turns — read the verdict,
@@ -6882,6 +7583,67 @@ def cmd_selfcheck():
               "back to the ordinary path and the owner is told, once, that nothing was re-read",
               not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told()
               and not ran_sub("cc", "myrepo", "w1", "--go"))
+        # …but a round STILL RUNNING at its deadline is not read as silent. Its last act is the push: on PR #368
+        # (2026-09-08) the iteration committed and pushed fc85483 at 12:30Z, two minutes after 'fix-silent … nothing
+        # pushed' had been written at 12:28Z and the job sent back to be refused; the PR then sat two hours until
+        # the orch re-queued it by hand. Past the deadline, a running track is waited for (up to one more
+        # FIX_WAIT), and the head is read AFTER the round has ended.
+        landing(**AFTERFIX)
+        quiet(cmd_work, [])
+        j = read_json(job_path("myrepo", 7))
+        just_past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 120))
+        write_atomic(job_path("myrepo", 7), dict(j, fix=dict(j["fix"], deadline=just_past)))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")     # the round is still going…
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": j["fix"]["head"],
+                                                                  "headRefName": "track/w1"}))
+        n_silent = open(f"{LANDQ}/queue.log").read().count("fix-silent myrepo#7")
+        quiet(cmd_work, [])
+        check("a fix iteration past its deadline with nothing pushed yet, but STILL RUNNING, is waited for rather "
+              "than written off: the job stays at fixing with a fresh not_before, no 'fix-silent' line, nobody "
+              "told — the round's last act is the push (PR #368, 2026-09-08)",
+              (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing"
+              and stamp() < (read_json(job_path("myrepo", 7)) or {}).get("not_before", "")
+              and open(f"{LANDQ}/queue.log").read().count("fix-silent myrepo#7") == n_silent
+              and not ran_sub("cc-slack", "post", "CAPPR"))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "review\n")      # …and now it has ended, having pushed
+        world["git ls-remote origin refs/heads/track/w1"] = (0, f"{'e' * 40}\trefs/heads/track/w1\n")
+        if os.path.exists(job_path("myrepo", 7)):     # (a lander that had already written the job off has no job)
+            write_atomic(job_path("myrepo", 7), dict(read_json(job_path("myrepo", 7)) or {}, not_before="2000-01-01T00:00:00Z"))
+        n_pushed = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
+        quiet(cmd_work, [])
+        log = open(f"{LANDQ}/queue.log").read()
+        check("...and once the round has ended the head is read AGAIN, after it: the push it made is seen, the PR "
+              "is RE-QUEUED and the ledger says so in that word — never 'nothing pushed' for a round that pushed",
+              log.count("fix-pushed myrepo#7") == n_pushed + 1 and "re-queued" in log.split("fix-pushed myrepo#7")[-1]
+              and log.count("fix-silent myrepo#7") == n_silent)
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))      # re-queued and read again by the same sweep; drained by hand here
+        landing(**AFTERFIX)                       # CONTROL: the round ends past its deadline having pushed NOTHING
+        quiet(cmd_work, [])
+        j = read_json(job_path("myrepo", 7))
+        write_atomic(job_path("myrepo", 7), dict(j, fix=dict(j["fix"], deadline=just_past)))
+        for k in [k for k in world if k.startswith("git ls-remote")]:
+            world.pop(k)
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": j["fix"]["head"],
+                                                                  "headRefName": "track/w1"}))
+        n_silent = open(f"{LANDQ}/queue.log").read().count("fix-silent myrepo#7")
+        quiet(cmd_work, [])
+        check("...while a round that has ENDED past its deadline with the head where it was is the silent one: "
+              "'nothing pushed', in those words, the job back on the ordinary path and the owner told once",
+              open(f"{LANDQ}/queue.log").read().count("fix-silent myrepo#7") == n_silent + 1
+              and "nothing pushed" in open(f"{LANDQ}/queue.log").read().split("fix-silent myrepo#7")[-1]
+              and not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told())
+        landing(**AFTERFIX)                       # CONTROL: a track the board still calls running, TWICE the wait on
+        quiet(cmd_work, [])                       # — a corpse is not waited on for ever
+        j = read_json(job_path("myrepo", 7))
+        write_atomic(job_path("myrepo", 7), dict(j, fix=dict(j["fix"], deadline="2000-01-01T00:00:00Z")))
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": j["fix"]["head"],
+                                                                  "headRefName": "track/w1"}))
+        quiet(cmd_work, [])
+        check("...and the wait on a running track is BOUNDED: a round still 'running' a whole FIX_WAIT past its "
+              "deadline is a corpse the board never closed, and the job goes back to the ordinary path",
+              not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told())
 
         # ...and where the head is READ from. The PR object lags the ref it describes: on PR #182 (2026-09-02) gh
         # served a headRefOid 41 minutes older than the branch's real head, and was still serving it 76 minutes
@@ -6947,6 +7709,30 @@ def cmd_selfcheck():
                   and (("the pull ref is stale" in said and ON_BRANCH[:12] in said and ON_PULL[:12] in said
                         and stale == n_stale + 1)
                        if loud else ("stale" not in said and stale == n_stale)))
+        # …and FETCH_HEAD is NOT what is gated. It is one file per checkout and any fetch there rewrites it: on
+        # 2026-09-07 PR #323 logged the stale pull ref, fetched the branch, and gated the PULL ref's SHA anyway —
+        # a billed turn on a commit the branch no longer had. Here FETCH_HEAD answers the pull SHA whatever was
+        # fetched, as a sibling's fetch leaves it.
+        world["git ls-remote origin"] = (0, f"{ON_BRANCH}\trefs/heads/{BR}\n{ON_PULL}\trefs/pull/7/head\n")
+        world["git rev-parse FETCH_HEAD"] = (0, ON_PULL + "\n")
+        L = Land("myrepo", pr=7)
+        L.facts = dict(FACTS, headRefName=BR)
+        fetched.clear(); calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = caught(L.fetch_head)
+        check("the SHA gated is the BRANCH's as origin named it, never FETCH_HEAD's: with the pull ref stale and "
+              "FETCH_HEAD rewritten under the landing, the head is still the branch's (PR #323, 2026-09-07)",
+              got == ON_BRANCH and L.head == ON_BRANCH and fetched[-1:] == [f"refs/heads/{BR}"]
+              and ran("git cat-file -e", ON_BRANCH))
+        world["git cat-file -e"] = (1, "")                # the fetch did not bring that commit
+        L = Land("myrepo", pr=7)
+        L.facts = dict(FACTS, headRefName=BR)
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = caught(L.fetch_head)
+        check("…and when the fetch did not bring the branch's commit the landing REFUSES, naming both SHAs — it "
+              "never falls back to gating the pull ref's",
+              isinstance(r, Failed) and ON_BRANCH[:12] in str(r) and ON_PULL[:12] in str(r) and not L.head)
+        world.pop("git cat-file -e", None)
         for k in ("git fetch -q origin", "git rev-parse FETCH_HEAD", "git ls-remote origin"):
             world.pop(k, None)      # …and the callables above do not leak into the sections that follow
 
@@ -7516,8 +8302,12 @@ def main(argv):
         return cmd_selfcheck()
     if argv and argv[0] == "record":
         return cmd_record(argv[1:])
+    if argv and argv[0] == "status":
+        return cmd_status(argv[1:])
     if argv and argv[0] == "queue":
         return cmd_queue(argv[1:])
+    if argv and argv[0] == "cancel":
+        return cmd_cancel(argv[1:])
     if argv and argv[0] == "work":
         return cmd_work(argv[1:])
     if len(argv) < 2 or argv[0].startswith("-"):

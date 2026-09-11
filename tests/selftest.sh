@@ -148,6 +148,23 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · lin
   # ANCHORED: "10 failed" ends in "0 failed", so a bare substring test reads any tally ending in a zero as green —
   # 10, 20, 100 failed cases all landed. The two shapes the tools write are "…: 0 failed" and "…, 0 failed".
   grep -qE '(: |, )0 failed' <<<"$r" && { ok "$r"; return 0; }
+  # RED ONCE IS NOT RED FOR THE DIFF. This suite runs beside other workers' suites and three landings' gate dirs,
+  # and a case that asserts on timing against live shared state — cc-sandbox's swap during the launch, a delivery
+  # wait — flips under that load and is green alone on the same tree (451/1 twice on one tree, a different case
+  # each time, 2026-09-09; each 183/0 or 192/0 alone). Each red was a ~22 min rerun and no record. So a tool that
+  # came back red is run ONCE more, inline and after its prefetched siblings, and judged again by the same rules:
+  # green now is reported as LOAD-BOUND with the cases that flipped named, so it is never mistaken for a pass that
+  # was clean; red twice is red. A case that is wrong is wrong both times, and a rerun buys it nothing.
+  if [ -n "$r" ] && [ "${CC_SELFTEST_RERUN:-1}" != 0 ]; then
+    local o2 r2 flipped
+    o2=$("$B/$t" selfcheck 2>&1); r2=$(grep -o "$t selfcheck: .*" <<<"$o2" | tail -1)
+    if grep -qE '(: |, )0 failed' <<<"$r2"; then
+      flipped=$(grep -E '✗|✘|FAIL' <<<"$o" | head -n "$RED_CASES" | sed 's/^ *//' | tr '\n' ';')
+      ok "$r2 — LOAD-BOUND: $r beside the suite, green alone; the cases that flipped: ${flipped%;}"; return 0
+    fi
+    [ -n "$r2" ] && { red "$t selfcheck: $r2 (and $r the first time — red alone as well, not load)" "$o2"; return 0; }
+    # …and a rerun that died (no tally) proves nothing either way: the first red stands, judged on its own output.
+  fi
   [ -n "$r" ] && { red "$t selfcheck: $r" "$o"; return 0; }
   # NO TALLY is not a failed case — the selfcheck never reached its last line: killed, or never started. PR #235's
   # gate said "it printed no tally line" and not one thing more, and the same suite was green in ten re-runs after
@@ -3011,6 +3028,21 @@ r=$( B=$CB; REACH=""; chk cc-mute )
   && ok "...and one that dies before its tally says so with the exit status that killed it, its last lines, and the whole output on disk — never a bare 'no tally line' nobody can chase" \
   || bad "chk no-tally: $(tr '\n' ' ' <<<"$r")"
 rm -f "/tmp/cc-mute-selfcheck-$RUN.log"
+# …and a red that is green on its second run, alone, is LOAD-BOUND and said so, never red for the diff; one that
+# is red both times is red. A counter file is the fixture's memory of how many times it has been run.
+printf '#!/bin/sh\nn=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"\nif [ $n = 1 ]; then echo "FAIL the swap during the launch"; echo "cc-flaky selfcheck: 9 passed, 1 failed"; exit 1; fi\necho "cc-flaky selfcheck: 10 passed, 0 failed"\n' > "$CB/cc-flaky"
+printf '#!/bin/sh\necho "FAIL the same case"; echo "cc-broken selfcheck: 9 passed, 1 failed"; exit 1\n' > "$CB/cc-broken"
+chmod +x "$CB/cc-flaky" "$CB/cc-broken"; rm -f "$CB/cc-flaky.n"
+r=$( B=$CB; REACH=""; chk cc-flaky; chk cc-broken )
+{ grep -q '✓ cc-flaky selfcheck: 10 passed, 0 failed — LOAD-BOUND: cc-flaky selfcheck: 9 passed, 1 failed beside the suite, green alone; the cases that flipped: FAIL the swap during the launch' <<<"$r" \
+  && [ "$(cat "$CB/cc-flaky.n")" = 2 ] \
+  && grep -q '✗ cc-broken selfcheck: cc-broken selfcheck: 9 passed, 1 failed (and cc-broken selfcheck: 9 passed, 1 failed the first time — red alone as well, not load)' <<<"$r" \
+  && grep -q 'FAIL the same case' <<<"$r"; } \
+  && ok "chk: a tool red beside the suite and green on its one rerun is LOAD-BOUND, said so with the cases that flipped, and not red; one red both times is red with its cases" \
+  || bad "chk rerun: $(tr '\n' ' ' <<<"$r")"
+r=$( B=$CB; REACH=""; CC_SELFTEST_RERUN=0; rm -f "$CB/cc-flaky.n"; chk cc-flaky )
+{ grep -q '✗ cc-flaky selfcheck: cc-flaky selfcheck: 9 passed, 1 failed' <<<"$r" && [ "$(cat "$CB/cc-flaky.n")" = 1 ]; } \
+  && ok "…and CC_SELFTEST_RERUN=0 runs nothing twice: the first red stands" || bad "chk rerun off: $(tr '\n' ' ' <<<"$r")"
 
 stanza "the suite's own slots (a cap, not a queue)" always
 # Re-runs THIS FILE, stopping at the lock ($CC_SELFTEST_LOCK_ONLY) — no fixtures, no tmux, no repo, so the suite

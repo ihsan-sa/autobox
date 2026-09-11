@@ -124,7 +124,7 @@ plus the append-only handoffs.jsonl above, which is never pruned.
 Env: CC_CTX_WINDOW · CC_CTX_BOX_MODEL · CC_CTX_RECORDS (a test run keeps its records out of the box's) ·
 CC_STATUSLINE_DIR (where cc-statusline's per-session files are read from).
 """
-import glob, json, os, re, subprocess, sys, time
+import glob, json, os, re, shutil, subprocess, sys, time
 
 STATE = os.path.expanduser("~/.cc/state")
 RECORDS = os.environ.get("CC_CTX_RECORDS") or os.path.join(STATE, "context")
@@ -1134,6 +1134,13 @@ def selfcheck():
     role0 = os.environ.pop("CC_ROLE", None)    # a --go worker runs these gates as often as a session does, and
                                                # every case below would take the worker branch if its own role
                                                # leaked in. Same trap as $CC_HANDOFF, restored at the end.
+    # …AND NEITHER MUST THE BOX'S OWN ~/.cc/config. cfg() reads through cc-config, and cc-config reads the live file
+    # unless CC_CONFIG names another; every threshold case below asserts the 30/40/60 defaults, so a
+    # CC_CONTEXT_HANDOFF_PCT=15 set on the box (2026-09-08, 18:50Z) turned this selfcheck red on main's own tree
+    # and in every landing's gate after it. The config this run reads is an EMPTY file of its own.
+    cfg0 = os.environ.get("CC_CONFIG")
+    cfgd = tempfile.mkdtemp(prefix="cc-context-selfcheck-")
+    os.environ["CC_CONFIG"] = os.path.join(cfgd, "config"); open(os.environ["CC_CONFIG"], "w").close()
     hnd0 = os.environ.pop("CC_HANDOFF", None)  # …and WHO IS RUNNING THE TEST must not decide it either. The overlap
                                                # cases below are the only ones that read this, and they read it off
                                                # the ambient environment: `not os.environ.get("CC_HANDOFF")` is how a
@@ -1353,6 +1360,26 @@ def selfcheck():
            journal_of(mo) == "~/.cc/state/repo3/o-handoff.md")
 
         # the three lines: a percentage each, capped at an absolute token count, with a floor under the first two
+        # THE LIVE CONFIG IS OUT OF REACH: a HOME whose ~/.cc/config sets CC_CONTEXT_HANDOFF_PCT — the edit that
+        # turned this selfcheck red on every landing's gate on 2026-09-08 — changes nothing here, because the run
+        # reads the empty file pinned above; the same knob written INTO that file is read, so the pin is a file
+        # cc-config honours and not a reader that stopped reading. 12, not the 15 the box set: on a 1M window
+        # 15% and the 150k cap are the same number, and a case that cannot tell them apart proves nothing.
+        homed = tempfile.mkdtemp(prefix="cc-context-home-"); os.makedirs(os.path.join(homed, ".cc"))
+        with open(os.path.join(homed, ".cc", "config"), "w") as fh:
+            fh.write("CC_CONTEXT_HANDOFF_PCT=12\n")
+        home0 = os.environ.get("HOME"); os.environ["HOME"] = homed
+        try:
+            unread = thresholds(BIG_WINDOW)[1]
+            with open(os.environ["CC_CONFIG"], "w") as fh:
+                fh.write("CC_CONTEXT_HANDOFF_PCT=10\n")
+            read = thresholds(BIG_WINDOW)[1]
+            open(os.environ["CC_CONFIG"], "w").close()
+        finally:
+            os.environ["HOME"] = home0 if home0 is not None else ""
+            shutil.rmtree(homed, ignore_errors=True)
+        ok("this selfcheck never reads the box's ~/.cc/config: a handoff line set there does not move the line here, "
+           "and the same knob in the run's own pinned file does", unread == 150000 and read == 100000)
         ok("the 1M window is capped at 112k/150k/225k, not 30/40/60 of it",
            thresholds(BIG_WINDOW) == (112500.0, 150000.0, 225000.0))
         ok("...and a window past 1M buys no more room either — the cap is absolute, not relative",
@@ -1679,6 +1706,11 @@ def selfcheck():
 
     if env0 is not None:
         os.environ["CC_CTX_WINDOW"] = env0
+    if cfg0 is None:
+        os.environ.pop("CC_CONFIG", None)
+    else:
+        os.environ["CC_CONFIG"] = cfg0
+    shutil.rmtree(cfgd, ignore_errors=True)
     if hnd0 is not None:
         os.environ["CC_HANDOFF"] = hnd0        # put the caller's own handoff back: it gates them, and it is not ours
     if role0 is not None:

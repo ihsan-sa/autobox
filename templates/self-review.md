@@ -20,10 +20,11 @@ a stop costs a fix iteration, a re-review and a re-lane, all of which reading th
 ## And then the last thing you do: hand over a tree a suite has already passed on
 
 Run `cc-green`. It takes the tree your working copy would commit and says, per gate, whether a green record
-already exists for it; `cc-green run` runs the ones that do not. The landing then spends those records instead of
-running the ~22-minute suite again on its own queue, where it is the slowest thing in the flow. A gate that long
-outlives a foreground tool call, so detach it and poll — `setsid nohup cc-green run > /tmp/green.log 2>&1 &` —
-then read the file; backgrounding that dies with your iteration leaves you with no run and no record.
+already exists for it; `cc-green run` runs the ones that do not, one run per worktree, into a log it names. The
+landing then spends those records instead of running the ~22-minute suite again on its own queue, where it is the
+slowest thing in the flow. A gate that long outlives a foreground tool call, so detach it — `setsid nohup cc-green
+run >/dev/null 2>&1 &` — then `cc-green wait` until its exit is not 3 (still going), and read the log it names; a
+background job that dies with your iteration leaves you with no run and no record.
 
 **Fix everything above BEFORE that run, and edit nothing after it.** A doc fix, a comment, a rebuilt artefact —
 each makes a tree nothing has passed on, and reasoning about how harmless it was does not change that. Of the 34

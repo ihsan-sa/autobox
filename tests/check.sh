@@ -305,16 +305,30 @@ discover_selfchecks bin tests/selftest.sh "$also_here"
 nosc_says_selfcheck bin "$NOSC" || exit 1
 others=""; for t in $HERE; do [ "$t" = cc-board ] || others="$others $t"; done
 SCD=$GD   # the dir and its trap are set at the top; a second EXIT trap here would have replaced the first
+# FROM A CWD SHAPED LIKE A TRACK WORKTREE, never from this tree's root. A worker runs this gate inside its worktree,
+# which carries the `.cc/track` marker `cc` wrote; a landing runs it from a checkout that carries none. A case that
+# reads where it runs — the cold-mail From case landed in #409 derived the From from that marker, up from cwd — is
+# green in every landing and red in every worker's cc-green, which is the one place no landing looks (two ~20 min
+# runs bought no record, 2026-09-10/11). So every selfcheck here starts in a scratch dir with a marker of its own,
+# naming no repo of this box's, and a case that reads its cwd is red HERE, in the gate that lands it.
+ROOT=$PWD; mkdir -p "$GD/cwd/.cc"; printf 'fixture-repo fixture-track\n' > "$GD/cwd/.cc/track"
+run_sc(){ cd "$GD/cwd" && "$1" selfcheck; }   # ONE way to start a selfcheck: the loop's and the control's
 running=0; ran=""
 # cc-board is named here for a reason that is not the list's: the loop must stay one literal `for c in cc-…` line
 # holding ` cc-board `, gated by one `want_selfcheck "$c"`, because cc-board's own selfcheck reads this file and
 # pins both shapes — the rule that its tripwire runs for a change to ANY tool is dead the moment this loop goes
 # back to asking `want`. $others is everything else the discovery put HERE, so a tool added tomorrow is run
 # tomorrow by nobody's memory, and the one name in the source is a shape cc-board pins, not a roster to keep.
+# CONTROL, run the way the real ones are: a fixture tool that reads the marker up from its cwd — the read that bit —
+# must find the scratch one and not this tree's, or the loop below is back to running from wherever the gate was.
+printf '#!/usr/bin/env bash\nd=$PWD; while [ "$d" != / ]; do [ -f "$d/.cc/track" ] && { cat "$d/.cc/track"; exit 0; }; d=$(dirname "$d"); done; echo none\n' > "$GD/cwd-probe"
+chmod +x "$GD/cwd-probe"
+[ "$(run_sc "$GD/cwd-probe")" = "fixture-repo fixture-track" ] \
+  || { echo "check.sh: the selfchecks' cwd no longer carries a track marker of its own — a case that reads its cwd would pass here and fail in every worker's worktree"; exit 1; }
 for c in cc-board $others; do
   want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
   ran="$ran $c"
-  { rc=0; o=$("bin/$c" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &
+  { rc=0; o=$(run_sc "$ROOT/bin/$c" 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &
   running=$((running + 1))
   [ "$running" -lt "$JOBS" ] || { wait -n 2>/dev/null || wait; running=$((running - 1)); }
 done
