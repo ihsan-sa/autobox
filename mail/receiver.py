@@ -53,15 +53,18 @@ held mail the only word its sender gets until a person decides — and it is wri
   cc-mail selfcheck                         tests; own fixtures, no network, no live server, no config of the box's
   cc-mail send --json FILE                  mail somebody the box is NOT replying to. FILE (`-` = stdin) is one
                                             JSON object: {"to": "A" or ["A","B"], "subject": "S", "body": "TEXT",
-                                            "attachments": ["/abs/path", ...]} — those four keys and no others;
-                                            attachments may be left out. Every file named is attached, or the
-                                            mail is not sent and the line names the file and why (a file
-                                            attaches only from under MAIL_OUT_ROOTS or ~/.cc/slack/files, and
-                                            under the byte cap). One line either way — stdout when the mail
-                                            went, stderr and exit 1 when it did not, exit 2 when the ask
-                                            itself was malformed. From a session with a channel the line ends
-                                            with where the mail's thread is (see below)
-  cc-mail send --to A[,B] --subject S [--body TEXT]
+                                            "attachments": ["/abs/path", ...], "thread": "<chat_id>/<thread_ts>"}
+                                            — those five keys and no others; attachments and thread may be
+                                            left out. Every file named is attached, or the mail is not sent
+                                            and the line names the file and why (a file attaches only from
+                                            under MAIL_OUT_ROOTS or ~/.cc/slack/files, and under the byte
+                                            cap). `thread` is the Slack thread the mail is started from —
+                                            the chat_id and thread_ts off the message's tag — and the answer
+                                            lands there (see below). One line either way — stdout when the
+                                            mail went, stderr and exit 1 when it did not, exit 2 when the ask
+                                            itself was malformed. From a session with a channel, or with a
+                                            thread, the line ends with where the mail's thread is
+  cc-mail send --to A[,B] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]
                                             the same with no files: the body is --body, or stdin without it
 
 SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the terminal it was typed in, talks to
@@ -76,8 +79,15 @@ MAIL_SEND_FROM). Which it is comes off where the command runs, never off the ask
 A MAIL FROM A CHANNEL GETS A THREAD THERE: once it is away, `send` hands it to the daemon (`mailed` on the
 owner socket) which posts one line in that channel — `email to `a@b` · subject` — and writes the conversation
 that line is the root of, so the person's answer is routed under it rather than opening a new thread (owner,
-2026-09-10). The daemon down costs the line and the thread, not the mail, and `send` says so. home@ mail has
-no channel and no line, and its answer arrives as a new mail, as before.
+2026-09-10). A MAIL STARTED FROM A THREAD IS ANSWERED IN IT: `thread` names the Slack thread the session was
+asked in (the `<channel>` tag's chat_id and thread_ts), the line goes UNDER that thread and the thread's root
+becomes the record's, so the answer lands where the ask was — for any session, the planning seat included,
+whose From stays home@ (owner, 2026-09-11: his answer to a mail started from his thread opened a new one).
+The thread is named by the caller and never guessed: the thread a session last heard from is not the one it
+is writing from once it acts on its own, and an orch shares its record with the repo's seat. A thread that
+is already a mail's own is refused — answer that mail in its thread instead. The daemon down costs the line
+and the thread, not the mail, and `send` says so. home@ mail with no thread has no line, and its answer
+arrives as a new mail, as before.
 
 THE WIRE, which core/mail/inbound-worker.js is written against:
   POST /inbound                             every other method and path is 404
@@ -686,18 +696,22 @@ def daemon(req):
 
 def mirrored(ask):
     """outbound.send_to's `mirror`, for `cc-mail send`: the mail is away, so hand it to the daemon's `mailed`
-    verb, which posts one line in the sending session's channel and writes the conversation that line is the
-    root of — the thread the person's answer will land under. Returns the tail of cc-mail's own line: where
-    the thread is, or why there is none. A daemon that is down or refuses costs the thread, never the mail,
-    and says so: an answer to a mail with no thread opens a new one in that channel, as before."""
+    verb, which posts one line in the sending session's channel — or under the thread the ask names — and
+    writes the conversation whose root the person's answer will land under. Returns the tail of cc-mail's own
+    line: where the thread is, or why there is none. A daemon that is down or refuses costs the thread, never
+    the mail, and says so: an answer to a mail with no thread opens a new one, as before."""
+    thread = ask.get("thread") or {}
+    where = "#%s" % ask.get("channel") if not thread else "the thread %s/%s" % (thread.get("chat"), thread.get("ts"))
     try:
         answer = daemon({"mailed": ask})
     except Exception as e:
-        return ". No line in #%s — the channel daemon did not answer (%s), so a reply opens a new thread" % (
-            ask.get("channel"), clip(str(e)))
+        return ". No line in %s — the channel daemon did not answer (%s), so a reply opens a new thread" % (
+            where, clip(str(e)))
     if not answer.get("ok"):
-        return ". No line in #%s — %s, so a reply opens a new thread" % (
-            ask.get("channel"), clip(str(answer.get("error") or "the daemon refused")))
+        return ". No line in %s — %s, so a reply opens a new thread" % (
+            where, clip(str(answer.get("error") or "the daemon refused")))
+    if thread:
+        return ". Its line is in your thread in #%s, and the answer lands there" % (answer.get("name") or thread.get("chat"))
     return ". Its thread is in #%s" % (answer.get("name") or ask.get("channel"))
 
 
@@ -1104,9 +1118,25 @@ def cmd_show(opt):
 # which costs a few forks in a command a person typed and means an owner's edit is live on the next one.
 SEND_KEYS = ("MAIL_SEND_URL", "MAIL_SEND_SECRET", "MAIL_DOMAIN", "MAIL_SEND_FROM", "MAIL_SEND_ALLOW",
              "MAIL_ALLOW", "MAIL_OUT_PER_HOUR", "MAIL_OUT_PER_DAY", "MAIL_OUT_ROOTS", "MAIL_OUT_MAX_ATTACH_BYTES")
-SEND_JSON_KEYS = ("to", "subject", "body", "attachments")
-SEND_USAGE = ("usage: cc-mail send --json FILE   (FILE or `-`: {\"to\", \"subject\", \"body\", \"attachments\": [...]})\n"
-              "       cc-mail send --to A[,B] --subject S [--body TEXT]   (body on stdin without --body)")
+SEND_JSON_KEYS = ("to", "subject", "body", "attachments", "thread")
+SEND_USAGE = ("usage: cc-mail send --json FILE   (FILE or `-`: {\"to\", \"subject\", \"body\", \"attachments\": [...], "
+              "\"thread\": \"<chat_id>/<thread_ts>\"})\n"
+              "       cc-mail send --to A[,B] --subject S [--body TEXT] [--thread <chat_id>/<thread_ts>]   "
+              "(body on stdin without --body)")
+# The thread a mail is started from, as the session's `<channel>` tag names it: the chat id (or `#name`) and
+# the thread's ts. Read here so a malformed one is exit 2 with the shape, never a mail with no thread.
+THREAD_RE = re.compile(r"^(#?[A-Za-z0-9][A-Za-z0-9_-]*)/(\d+\.\d+)$")
+
+
+def thread_of(value):
+    """(chat, ts) off a `thread` value, None for none, or a str saying what was wrong with it."""
+    v = str(value or "").strip()
+    if not v:
+        return None
+    m = THREAD_RE.match(v)
+    if not m:
+        return "cc-mail send: thread must be <chat_id or #channel>/<thread_ts>, as the message's tag names them"
+    return m.group(1), m.group(2)
 
 
 def arg(opt, name):
@@ -1116,9 +1146,10 @@ def arg(opt, name):
 
 
 def send_ask(opt):
-    """The (to, subject, body, attachments) a `cc-mail send` asks for, or a str saying what was wrong with the
-    ask. Two shapes: `--json FILE` — one object, the four SEND_JSON_KEYS and no others, so a mistyped key
-    (`attachment`, `file`) is refused by name rather than silently dropped — and the flag form, text only.
+    """The (to, subject, body, attachments, thread) a `cc-mail send` asks for, or a str saying what was wrong
+    with the ask. Two shapes: `--json FILE` — one object, the five SEND_JSON_KEYS and no others, so a mistyped
+    key (`attachment`, `file`) is refused by name rather than silently dropped — and the flag form, text only.
+    `thread` is (chat, ts) or None either way (thread_of).
 
     The owner's shape (2026-09-09): "the model just gives a json with subject and body etc and then points to
     attachments and the script does the rest so it's more consistent". The JSON is the whole ask; nothing
@@ -1144,17 +1175,26 @@ def send_ask(opt):
         body = doc.get("body")
         if body is not None and not isinstance(body, str):
             return "cc-mail send: body must be a string"
-        return str(to), str(doc.get("subject") or ""), body or "", atts
+        raw = doc.get("thread")
+        if raw is not None and not isinstance(raw, str):
+            return "cc-mail send: thread must be a string, <chat_id>/<thread_ts>"
+        thread = thread_of(raw)
+        if isinstance(thread, str):
+            return thread
+        return str(to), str(doc.get("subject") or ""), body or "", atts, thread
     to, subject = arg(opt, "--to"), arg(opt, "--subject")
     body = opt.get("--body")
     body = "" if body is None or body == "--body" else body
     if not to:
         return SEND_USAGE
+    thread = thread_of(arg(opt, "--thread"))
+    if isinstance(thread, str):
+        return thread
     if not body:
         if sys.stdin.isatty():
             return "cc-mail send: no body — pass --body TEXT, or pipe one in"
         body = sys.stdin.read()
-    return to, subject, body, []
+    return to, subject, body, [], thread
 
 
 def cmd_send(opt):
@@ -1166,15 +1206,16 @@ def cmd_send(opt):
     if isinstance(ask, str):
         print(ask, file=sys.stderr)
         return 2
-    to, subject, body, attachments = ask
+    to, subject, body, attachments, thread = ask
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import outbound                          # noqa: E402 — a sibling, imported here for cc-mail's own reason
     # The From is the session's own channel's address when it has one, home@ when it does not — read off where
     # this command runs (session_channel), never off the ask: there is no key or flag for it (owner, 2026-09-10).
-    # `mirrored` runs only for a session with a channel, once the mail is away: the line in that channel and
-    # the conversation its answer threads under (the daemon's `mailed` verb). home@ gets neither, as before.
+    # `mirrored` runs once the mail is away, for a session with a channel and for a mail that names the thread
+    # it is started from: the line in that channel (under that thread) and the conversation its answer threads
+    # under (the daemon's `mailed` verb). home@ with no thread gets neither, as before.
     ok, line = outbound.send_to({k: cfg(k, "") for k in SEND_KEYS}, to, subject, body, attachments=attachments,
-                                channel=outbound.session_channel(), mirror=mirrored)
+                                channel=outbound.session_channel(), mirror=mirrored, thread=thread)
     print(line, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 

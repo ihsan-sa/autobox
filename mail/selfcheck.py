@@ -2846,7 +2846,7 @@ def run():
                 m23 = d.asked[0]["mailed"]
                 k(m23 == {"channel": "abox--fix-the-door", "from": "abox--fix-the-door@box.example", "to": [ALLOWED],
                           "subject": "the door", "message_id": call["msg"]["Message-ID"], "attachments": [],
-                          "tag": m23.get("tag")}
+                          "tag": m23.get("tag"), "thread": None}
                   and call["msg"]["Reply-To"] == "abox--fix-the-door+%s@box.example" % m23.get("tag"),
                   "…handing over the channel, the From, who it went to, the subject, the Message-ID we put on the "
                   "wire and the TAG the mail's Reply-To carries — the key the person's answer will bring back")
@@ -2895,6 +2895,45 @@ def run():
                   and "opens a new thread" in said,
                   "a mail to people in TWO workspaces goes to both and is refused a thread: the daemon's reason "
                   "is on the line the sender reads, where a thread for one of them would have been a wrong one")
+                # (f) FROM A THREAD, WITH NO CHANNEL OF ITS OWN (owner, 2026-09-11: a mail the planning seat sent
+                # from his thread in #<repo> got his answer as a new thread). Brief: "cc-mail send (JSON and flag
+                # forms) can carry the thread it is run from … and the answer threads there". The ask names the
+                # thread as the message's tag does, the From stays home@, the daemon is asked with the thread.
+                fresh22()                       # its own ledger: the cases above filled the cold bucket for the hour
+                with FakeDaemon({"ok": True, "id": "out-2", "chat": "C-box", "ts": "1789149609.446619",
+                                 "line": "1789149700.1", "name": "box"}) as d:
+                    rc, said = send23(b.tmp, {"to": ALLOWED, "subject": "from the thread", "body": "asked here",
+                                              "thread": "C-box/1789149609.446619"})
+                    callF = w.calls[-1]
+                m23f = (d.asked or [{"mailed": {}}])[0]["mailed"]
+                k(rc == 0 and len(d.asked) == 1 and callF["from"] == "home@box.example"
+                  and m23f.get("thread") == {"chat": "C-box", "ts": "1789149609.446619"} and m23f.get("channel") == ""
+                  and re.fullmatch(r"[0-9a-f]{8}", m23f.get("tag") or "")
+                  and callF["msg"]["Reply-To"] == "home+%s@box.example" % m23f["tag"]
+                  and said.strip().endswith("Its line is in your thread in #box, and the answer lands there"),
+                  "a session with no channel that names the thread it was asked in still sends From home@, but the "
+                  "mail is keyed (Reply-To home+<tag>@) and the daemon is handed the thread — chat and ts as the "
+                  "message's tag names them — and the line says the answer lands there")
+                n_f = len(w.calls)
+                with FakeDaemon({"ok": True, "name": "box"}) as d:
+                    rc, said = send23(b.tmp, {"to": ALLOWED, "subject": "s", "body": "b", "thread": "C-box"})
+                    rc2, said2 = send23(b.tmp, {"to": ALLOWED, "subject": "s", "body": "b", "thread": ["C-box", "1.2"]})
+                    n_bad = len(w.calls)
+                    os.chdir(b.tmp)
+                    sys.stdout, stdin23 = io.StringIO(), sys.stdin
+                    try:
+                        sys.stdin = io.StringIO("by flag")
+                        rc3 = r.cmd_send({"--to": ALLOWED, "--subject": "s", "--thread": "#box/1789149609.446619"})
+                        said3 = sys.stdout.getvalue()
+                    finally:
+                        sys.stdout, sys.stdin = out23, stdin23
+                        os.chdir(here23)
+                k(rc == 2 and rc2 == 2 and n_bad == n_f and b.err.getvalue().count("thread must be") >= 2,
+                  "…a thread that is not <chat>/<ts>, or not a string, is a malformed ask: exit 2 and nothing sent")
+                k(rc3 == 0 and len(w.calls) == n_f + 1 and len(d.asked) == 1
+                  and d.asked[0]["mailed"]["thread"] == {"chat": "#box", "ts": "1789149609.446619"}
+                  and "Its line is in your thread in #box" in said3,
+                  "…and the flag form carries it the same way, a `#name` for the chat as well as an id")
                 route23 = os.environ.get("CC_MAIL_ROUTE_FAKE")
                 os.environ["CC_MAIL_ROUTE_FAKE"] = ""       # unsure: no classifier is spawned for this one
                 try:
@@ -3063,6 +3102,62 @@ def run():
         k(router.same_subject("Fwd: RE: the plan", "Re: the  plan") and not router.same_subject("", "")
           and not router.same_subject("Re: the plan", "the plans"),
           "the subject match sets the client's prefixes, case and whitespace aside and matches nothing on empty")
+
+        # (h) A MAIL STARTED FROM A THREAD IS ANSWERED IN IT (owner, 2026-09-11: a mail the planning seat sent
+        # from his thread in #<repo> got his answer as a NEW thread — "he expected it where it was asked"). The
+        # seat has no channel, so before this send_to minted no tag and never called the mirror. Brief: "the
+        # sender's answer lands in that thread" — for a session with no channel, From home@, the thread named.
+        fresh22()
+        asksH = []
+        with FakeWorker() as w:
+            okH, lineH = outbound.send_to(cold22(w), ALLOWED, "from the thread", "asked here",
+                                          thread=("C-box", "1789149609.446619"), mirror=lambda a: asksH.append(a) or ". tail")
+            callH = w.one()
+        tagH = (asksH or [{}])[0].get("tag") or ""
+        k(okH and callH["from"] == "home@box.example" and re.fullmatch(r"[0-9a-f]{8}", tagH)
+          and callH["msg"]["Reply-To"] == "home+%s@box.example" % tagH
+          and asksH[0]["thread"] == {"chat": "C-box", "ts": "1789149609.446619"} and asksH[0]["channel"] == ""
+          and lineH.endswith(". tail"),
+          "a thread keys the mail as a channel does: From stays home@ (the From is never the ask's), the Reply-To "
+          "carries a tag, and the mirror is called once with the thread — chat and ts — beside an empty channel")
+        # …the record as the daemon then writes it: the THREAD'S root as the `to` root — a message the owner
+        # typed, in his channel, target `box` — and the box's own `email to` line under it as `line`.
+        askH = {"channel": "box", "from": "home@box.example", "to": [ALLOWED], "subject": "from the thread",
+                "message_id": callH["msg"]["Message-ID"], "tag": tagH}
+        recH = router.started_conv(askH, "mem")
+        recH["roots"] = [{"chat": "C-box", "ts": "1789149609.446619", "name": "box", "target": "box", "alias": None,
+                          "role": "to", "theirs": True}]
+        recH["line"] = {"chat": "C-box", "ts": "1789149700.1"}
+        router.save_conv(recH)
+        answerH = arrived(b, ALLOWED, rcpt="home+%s@box.example" % tagH, subject="Re: from the thread",
+                          headers={"In-Reply-To": "<relay-made-5@box.example>", "Message-ID": "<theirs-5@allowed.example>"})
+        dH = Dir()
+        decH = router.route(answerH, dH, "box.example")
+        k(not decH.refuse and decH.rule == "reply" and decH.conv and decH.conv["id"] == recH["id"]
+          and [(p.chat, p.name, p.target) for p in decH.to] == [("C-box", "box", "box")] and not dH.asked[1:],
+          "the answer, back at home+<tag>@, is a REPLY on that record — found by the tag before the address is "
+          "read, so `home` never reaches the classifier — and is delivered under the thread it was asked in")
+        plainH = arrived(b, ALLOWED, rcpt="home@box.example", subject="RE: from the thread",
+                         headers={"In-Reply-To": "<relay-made-6@box.example>", "Message-ID": "<theirs-6@allowed.example>"})
+        decH2 = router.route(plainH, dH, "box.example")
+        k(not decH2.refuse and decH2.rule == "reply" and decH2.conv and decH2.conv["id"] == recH["id"],
+          "…and a client that answers From instead of Reply-To — plain home@, same subject — finds it by the "
+          "fallback, our address leading the record's `to`")
+        k(not outbound.by_mail(recH, "C-box", "1789149609.446619") and outbound.by_mail(recH, "C-box", "1789149700.1")
+          and not router.their_line(recH, "C-box", "1789149609.446619") and not router.their_line(recH, "C-box", "1789149700.1"),
+          "the root of such a record is the OWNER'S message: a session answering it stays in Slack (by_mail), "
+          "while one answering the box's `email to` line under it mails the people it went to; neither is a "
+          "sender's word waiting on an answer (their_line)")
+        oldH = dict(recH, roots=[{kk: v for kk, v in recH["roots"][0].items() if kk != "theirs"}])
+        oldH.pop("line")
+        k(outbound.by_mail(oldH, "C-box", "1789149609.446619"),
+          "…control: a started record with neither `theirs` nor `line` — written before there were any — still "
+          "has the line as its root, and answering that root mails, as it did")
+        movedH = dict(recH, roots=[{"chat": "C-mem", "ts": "1789149800.1", "name": "mem", "target": "mem", "alias": None,
+                                    "role": "to"}])
+        k(outbound.by_mail(movedH, "C-mem", "1789149800.1") and not outbound.by_mail(movedH, "C-box", "1789149609.446619"),
+          "…and once a move has dropped the person's root and re-posted a mail's line as the new one, a reply "
+          "to that root mails as any moved root does — the mark travels with the root, not the record")
 
     # ------------------------------- 24. a held mail can be answered by mail (owner, 2026-09-09)
     # Brief: "while an inbound e-mail is held for the owner's decision, the box can still write to its sender

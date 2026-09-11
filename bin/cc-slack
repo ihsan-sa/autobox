@@ -5489,6 +5489,14 @@ class Daemon:
         put a mail's thread in a channel the mail did not come from. The record's workspace is the RECIPIENT'S
         (router.workspace_for, the daemon's own tables) — the key their answer will be looked up under.
 
+        OR THE THREAD IS (owner, 2026-09-11: a mail the planning seat sent from his thread in #<repo> got his
+        answer as a new thread; "he expected it where it was asked"). An ask carrying `thread` {chat, ts} —
+        `cc-mail send --thread`, the message's own tag — puts the line UNDER that thread and makes the thread's
+        root the record's root, so the answer is delivered there; the From is then whatever that session sends
+        (home@ for the seat) and only has to be ours. The record's `line` says which message is the mail's, so
+        a session answering the owner's root stays in Slack and one answering the line mails (outbound.by_mail).
+        A thread that already keys a conversation is refused: the mail is answered in it, not started from it.
+
         ONE RECORD HOLDS ONE WORKSPACE, so a mail to people in two of them gets NO thread rather than a wrong
         one. Keyed under the first recipient's, the second's answer — back at the tag we sent — reads as
         another workspace's thread and route() refuses it, dropping a mail from somebody the box itself wrote
@@ -5506,28 +5514,51 @@ class Daemon:
         # The tag is the key the answer comes back with (Reply-To `<channel>+<tag>@`, router.conv_for_reply):
         # hex the sender minted, and nothing else is written into the index under it.
         tag = str(ask.get("tag") or "").strip().lower()
-        if not (name and domain and rcpts and mid) or from_a != f"{name}@{domain}" or not re.fullmatch(r"[0-9a-f]{0,32}", tag):
+        # A THREAD NAMES THE CHANNEL (brief: "when a session starts a mail with cc-mail send from inside a Slack
+        # thread, the sender's answer lands in that thread"). `thread` is {chat, ts} — the Slack thread the ask
+        # was made in, off the message's tag — and then the line goes UNDER it and its root is the record's,
+        # whatever channel that is: the planning seat sends From home@ out of #<repo>. Without a thread the
+        # channel is the mail's own and the From must be its address, as before. Either way the From is on OUR
+        # domain, the only kind a tag comes back on, so nothing here keys a record to a mail that was not ours.
+        thread = ask.get("thread") if isinstance(ask.get("thread"), dict) else None
+        t_chat = str((thread or {}).get("chat") or "").strip().lstrip("#")
+        t_ts = str((thread or {}).get("ts") or "").strip()
+        if thread is not None and not (t_chat and re.fullmatch(r"\d+\.\d+", t_ts)):
+            return {"ok": False, "error": "thread must be {chat, ts}"}
+        ours = from_a.endswith("@" + domain) and "@" in from_a if thread is not None else from_a == f"{name}@{domain}"
+        if not (domain and rcpts and mid and (name or thread)) or not ours or not re.fullmatch(r"[0-9a-f]{0,32}", tag):
             return {"ok": False, "error": "not a mail from a channel of this box"}
         places = MailPlaces(self)
-        pl = places.place(name)
+        pl = places.place(t_chat if thread is not None else name)
         if pl is None:
-            return {"ok": False, "error": f"#{name} is not a channel the bot is in"}
-        ask = {"channel": name, "from": from_a, "to": rcpts, "message_id": mid, "tag": tag,
+            return {"ok": False, "error": f"#{t_chat if thread is not None else name} is not a channel the bot is in"}
+        if thread is not None and R.conv_by_root(pl.chat, t_ts):
+            # The root already keys a conversation (index `root`): a second record would take it over and the
+            # first mail's replies would stop going out. That thread IS a mail's — the session answers it there.
+            return {"ok": False, "error": f"that thread in #{pl.name} is already a mail's own — answer it there instead"}
+        ask = {"channel": pl.name, "from": from_a, "to": rcpts, "message_id": mid, "tag": tag,
                "subject": str(ask.get("subject") or ""), "attachments": [str(a) for a in (ask.get("attachments") or [])]}
         table = R.overrides(self.cfg.get("MAIL_WORKSPACE") or "")
         wss = {R.workspace_for(a, table, places) for a in rcpts}
         if len(wss) != 1 or None in wss:      # before the line: no thread and nothing posted about one
             return {"ok": False, "error": "recipients span workspaces — no thread"}
         ws = wss.pop()
-        ts = self.say(pl.chat, R.started_line(ask))   # mail=False: the box's own line, not a reply to anyone
+        # mail=False: the box's own line, not a reply to anyone. Under the named thread when there is one.
+        ts = self.say(pl.chat, R.started_line(ask), t_ts if thread is not None else None)
         if not ts:
             return {"ok": False, "error": f"could not post in #{pl.name}"}
+        root = t_ts if thread is not None else ts
         rec = R.started_conv(ask, ws)
-        rec["roots"] = [{"chat": pl.chat, "ts": ts, "name": pl.name, "target": pl.target, "alias": pl.alias,
-                         "role": "to"}]
+        # WHICH MESSAGE IS THE MAIL'S: the line, which is the root only when no thread was named; a named thread's
+        # root is the PERSON'S message and is marked `theirs` on the root itself (a move drops that root and
+        # re-posts a mail's line). outbound.by_mail reads both — an answer to the line mails the people it went
+        # to; one to somebody's root stays in Slack.
+        rec["roots"] = [dict({"chat": pl.chat, "ts": root, "name": pl.name, "target": pl.target, "alias": pl.alias,
+                              "role": "to"}, **({"theirs": True} if thread is not None else {}))]
+        rec["line"] = {"chat": pl.chat, "ts": ts}
         R.save_conv(rec)
-        log(f"mail {rec['id']} started from={from_a} to={','.join(rcpts)} ws={ws} in=#{pl.name} root={ts}")
-        return {"ok": True, "id": rec["id"], "chat": pl.chat, "ts": ts, "name": pl.name}
+        log(f"mail {rec['id']} started from={from_a} to={','.join(rcpts)} ws={ws} in=#{pl.name} root={root} line={ts}")
+        return {"ok": True, "id": rec["id"], "chat": pl.chat, "ts": root, "line": ts, "name": pl.name}
 
     def mail_channel(self):
         """The receiver's own channel, or "". MAIL_CHANNEL names it; unset means this box has none and nothing
@@ -17377,6 +17408,69 @@ def cmd_selfcheck():
               and resX2["ok"] and resX2["routed"] and resX2["rule"] != "reply"
               and "another workspace" not in (resX2.get("reply") or "")
               and [h[0] for h in mhanded] == ["box"])
+        # …AND A MAIL STARTED FROM A THREAD IS ANSWERED IN IT (owner, 2026-09-11: a mail the planning seat sent
+        # from his thread in #<repo> got his answer as a new thread — "he expected it where it was asked"). The
+        # seat has no channel and sends From home@; the ask carries the thread — chat and ts as the message's
+        # tag names them — so the line goes UNDER it, its root is the record's, and the answer lands there.
+        # The control first — a channel's mail with no thread: its own line is its root, and nothing is `theirs`.
+        recW = R.conv_by_root("C-SITE", dmA.mail_started(dict(askN, message_id="<out9@box.example>")).get("ts") or "")
+        msaid.clear(); mhanded.clear()
+        rootY = "1789149609.446619"
+        askY = {"channel": "", "from": "home@box.example", "to": ["friend@allowed.example"], "subject": "from the thread",
+                "message_id": "<out6@box.example>", "tag": "0badcafe", "thread": {"chat": "C-BOX", "ts": rootY}}
+        resY = dmA.mail_started(dict(askY))
+        recY = R.conv_by_root("C-BOX", rootY)
+        lineY = (resY.get("line") or "") if resY.get("ok") else ""
+        check("mailed: a mail started from a thread by a session with no channel (From home@) leaves its `email to` "
+              "line IN that thread — the owner's, in #box — and posts nothing anywhere else",
+              resY["ok"] and resY["name"] == "box" and resY["chat"] == "C-BOX" and resY["ts"] == rootY
+              and [(c, t) for c, t, _, _ in msaid] == [("C-BOX", rootY)]
+              and msaid[0][2] == "_email to `friend@allowed.example` · from the thread_" and msaid[0][3] == lineY
+              and mhanded == [])
+        check("mailed: …and the record's `to` root is the THREAD'S root — the owner's own message, marked `theirs`, "
+              "not a line of ours — with the line under it as `line`, the tag the Reply-To carries, and the "
+              "RECIPIENT'S workspace",
+              bool(recY) and recY["rule"] == R.STARTED and recY["workspace"] == "mem" and recY["tag"] == "0badcafe"
+              and [(r["name"], r["ts"], r["role"], r.get("theirs")) for r in recY["roots"]] == [("box", rootY, "to", True)]
+              and bool(recW) and [(r["chat"], r.get("theirs")) for r in recW["roots"]] == [("C-SITE", None)]
+              and recW["line"] == {"chat": "C-SITE", "ts": recW["roots"][0]["ts"]}
+              and recY["line"] == {"chat": "C-BOX", "ts": lineY}
+              and recY["to"] == ["home@box.example", "friend@allowed.example"] and recY["mails"] == []
+              and not mail_outbound().by_mail(recY, "C-BOX", rootY) and mail_outbound().by_mail(recY, "C-BOX", lineY)
+              and not R.their_line(recY, "C-BOX", rootY) and not R.their_line(recY, "C-BOX", lineY))
+        mail_write("O6", to=["home+0badcafe@box.example"], in_reply_to="<relay-made-6@box.example>",
+                   references=["<relay-made-6@box.example>"], subject="Re: from the thread", text="here it is")
+        msaid.clear(); mhanded.clear()
+        resY2 = dmA.take_mail("O6")
+        recY2 = R.conv_by_root("C-BOX", rootY)
+        check("mailed: the person's answer, back at `home+<tag>@`, lands UNDER the thread it was asked in — no new "
+              "root, `home` never read as an address — and is handed to the session there; its line is theirs",
+              resY2["ok"] and resY2["routed"] and resY2["rule"] == "reply"
+              and [(c, t) for c, t, _, _ in msaid] == [("C-BOX", rootY)]
+              and [(h[0], h[2]["thread_ts"], h[2]["mail"]) for h in mhanded] == [("box", rootY, "O6")]
+              and (recY2 or {}).get("id") == recY["id"] and recY2["mails"] == ["O6"]
+              and R.their_line(recY2, "C-BOX", msaid[0][3]) and not R.their_line(recY2, "C-BOX", rootY))
+        msaid.clear(); mhanded.clear()
+        badY = [dmA.mail_started(dict(askY, message_id="<out7@box.example>")),                # that thread is a mail's own already
+                dmA.mail_started(dict(askY, message_id="<out7@box.example>", thread={"chat": "C-BOX", "ts": "1.2"},
+                                      **{"from": "friend@allowed.example"})),                 # From not on our domain
+                dmA.mail_started(dict(askY, message_id="<out7@box.example>", thread={"chat": "C-BOX"})),   # no ts
+                dmA.mail_started(dict(askY, message_id="<out7@box.example>", thread={"chat": "C-BOX", "ts": "x"})),
+                dmA.mail_started(dict(askY, message_id="<out7@box.example>", thread={"chat": "C-NOWHERE", "ts": "1.2"}))]
+        check("mailed: a thread that already keys a conversation is refused (the mail is answered there, not started "
+              "from there), as is a From off our domain, a thread with no ts or a bad one, or one in a channel the "
+              "bot is not in — with no line posted and the first record untouched",
+              all(not r["ok"] for r in badY) and "already a mail's own" in badY[0]["error"]
+              and "thread must be" in badY[2]["error"] and msaid == []
+              and R.conv_by_root("C-BOX", rootY)["id"] == recY["id"])
+        msaid.clear(); mhanded.clear()
+        resZ = dmA.mail_started(dict(askY, message_id="<out8@box.example>", tag="1badcafe",
+                                     thread={"chat": "#box", "ts": "1789149700.5"}))
+        check("mailed: …and `#box` names the thread's channel as its id does — the chat as the tag or the session "
+              "spells it",
+              resZ["ok"] and resZ["chat"] == "C-BOX" and resZ["ts"] == "1789149700.5"
+              and [(c, t) for c, t, _, _ in msaid] == [("C-BOX", "1789149700.5")]
+              and R.conv_by_root("C-BOX", "1789149700.5")["tag"] == "1badcafe")
 
         # (o) A CLOSING MAIL GETS A REACTION, NOT A REPLY (owner, 2026-09-10 17:52Z: 'not every email needs a
         # reply'). The line quoting HIS mail is his word for the owed check (mail_word): 🔴 until a session

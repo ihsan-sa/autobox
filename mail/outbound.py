@@ -665,12 +665,24 @@ def by_mail(rec, chat, ts):
     a root (the first mail's line, or the line a move re-posted) and every later mail's line under it, which
     take_mail writes to `mirrors` as it posts them. False for everything else — a person's Slack message in the
     thread, and no message at all (`ts` empty). A record written before `mirrors` existed still answers for its
-    root, so a conversation from before this rule can still be answered by mail."""
+    root, so a conversation from before this rule can still be answered by mail.
+
+    A MAIL THE BOX STARTED FROM SOMEBODY'S THREAD (`--thread`, send_to) is the one conversation whose root is
+    NOT a mail's line: the root is the person's own message, the one the session was asked in — the daemon
+    marks that root `theirs` — and the box's `email to …` line sits under it as the record's `line`. Answering
+    that line mails the people it went to; answering the root — the owner's Slack message — stays in Slack, as
+    every answer to a Slack message does. The mark is on the root and not on the record because a move drops
+    that root and re-posts a mail's line as the new one, which mails as any moved root does. A started record
+    written before either field has the line as its root and counts as before."""
     ts = str(ts or "").strip()
     if not ts:
         return False
-    if any(r.get("chat") == chat and str(r.get("ts")) == ts for r in (rec.get("roots") or [])):
+    line = rec.get("line") or {}
+    if line.get("chat") == chat and str(line.get("ts")) == ts:
         return True
+    for r in rec.get("roots") or []:
+        if r.get("chat") == chat and str(r.get("ts")) == ts:
+            return not r.get("theirs")  # the thread the mail was started from is the person's, not a mail's line
     return any(m.get("chat") == chat and str(m.get("ts")) == ts for m in (rec.get("mirrors") or []))
 
 
@@ -766,7 +778,7 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
 COLD_KEY = "cold"       # every cold mail shares one per-hour bucket: see send_to()
 
 
-def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None):
+def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
 
     `channel` is the sending session's own channel, or "" — session_channel() read off where the process
@@ -774,11 +786,22 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     session that has one, so the answer lands in that channel's mirror thread; home@ (or MAIL_SEND_FROM) for
     one that does not. The verified list, the caps and the reply path do not see it.
 
+    `thread` is the Slack thread the mail is STARTED FROM — (chat, thread ts), as cc-mail read it off the
+    ask's `thread` — or None. It changes nothing about the From: a session with no channel of its own still
+    sends home@ (owner, 2026-09-10). What it changes is where the answer lands: the mail is keyed (a tag on
+    its Reply-To) and mirrored exactly as a channel's mail is, and the mirror puts the `email to …` line IN
+    that thread and makes the thread's root the record's, so the person's answer is routed under the message
+    they asked in (owner, 2026-09-11: his answer to a mail the planning seat sent from his thread opened a new
+    one — "he expected it where it was asked"). The router finds the record by the tag before it reads the
+    address, so `home+<tag>@` reaches it as `<channel>+<tag>@` does.
+
     `mirror` is the caller's one chance to give the mail a thread. It is called ONCE, after the mail is away
-    and only for a session with a channel, with what a mirror needs — {"channel", "from", "to", "subject",
-    "message_id", "tag", "attachments"} — and whatever line it answers is appended to the line returned here. cc-mail
-    hands it to the daemon's `mailed` verb, which posts one line in that channel and writes the conversation
-    record (see the docstring's last paragraph); the daemon itself never calls this and passes none.
+    and only for a keyed mail — a session with a channel, or a `thread` — with what a mirror needs —
+    {"channel", "from", "to", "subject", "message_id", "tag", "attachments", "thread"}, the last {"chat", "ts"}
+    or None — and whatever line it answers is appended to the line returned here. cc-mail hands it to the
+    daemon's `mailed` verb, which posts one line in that channel (or under that thread) and writes the
+    conversation record (see the docstring's last paragraph); the daemon itself never calls this and passes
+    none.
 
     A FILE EITHER GOES AS A FILE OR NOTHING GOES. `attachments` is the list of paths the caller named, each
     read through attach_bytes() under a reply's rules — a regular file inside MAIL_OUT_ROOTS, under
@@ -809,8 +832,9 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     mail asks to be answered at — `Reply-To: <channel>+<tag>@<domain>` — so the person's answer is routed under
     that line instead of opening a new thread (owner, 2026-09-10: his reply to a channel's own mail arrived as
     a new root; 2026-09-11: it still did, because the relay rewrites the Message-ID we mint, so the id in the
-    record is never the one a reply names — see build()). An answer to a mail from a channel-less session
-    (home@) still arrives at the door as a new mail and is routed like one."""
+    record is never the one a reply names — see build()). A session with no channel gets the same through
+    `thread`. An answer to a mail from a channel-less session that named no thread (home@) still arrives at
+    the door as a new mail and is routed like one."""
     rcpts, allowed = [], verified(cfg)
     for piece in (to if isinstance(to, (list, tuple)) else re.split(r"[,\s]+", str(to or ""))):
         a = _norm(piece)
@@ -855,10 +879,13 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     if why:
         return refuse(why)
     # THE TAG IS THE THREAD'S KEY, minted here because it has to be on the wire before the daemon writes the
-    # record (`mirror` runs after the send). A session with a channel gets one; home@ has no thread to key. It
-    # identifies, it does not hide: a tag only ever reaches a conversation in the sender's own workspace
-    # (router.conv_for_reply), so eight hex digits are plenty and leave room for the channel's name (tagged).
-    tag = os.urandom(4).hex() if channel else ""
+    # record (`mirror` runs after the send). A session with a channel gets one, and so does a mail started from
+    # a thread — "the sender's answer lands in that thread" needs the record the tag keys; home@ with neither
+    # has no thread to key. It identifies, it does not hide: a tag only ever reaches a conversation in the
+    # sender's own workspace (router.conv_for_reply), so eight hex digits are plenty and leave room for the
+    # channel's name (tagged).
+    keyed = bool(channel or thread)
+    tag = os.urandom(4).hex() if keyed else ""
     reply_to = tagged(from_a, tag)
     tag = tag if reply_to else ""          # a tag the mail does not carry is not one the record may index
     raw, mid = build({}, from_a, rcpts, [], body, attach=attach, now=now, subject=subject, reply_to=reply_to)
@@ -873,11 +900,13 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
                                                  " attach=" + ",".join(names) if names else ""))
     with_files = (", with %s attached" % ", ".join(names)) if names else ""
     # THE MIRROR, once the mail is away and only when somebody was reached: a thread for a mail nobody got
-    # would wait for an answer that cannot come. `channel` empty is the home@ case and keeps today's behaviour.
+    # would wait for an answer that cannot come. Neither a channel nor a thread is the home@ case and keeps
+    # today's behaviour: no line, and the answer arrives as a new mail.
     tail = ""
-    if sent and channel and mirror is not None:
+    if sent and keyed and mirror is not None:
         tail = str(mirror({"channel": (channel or "").strip().lstrip("#").lower(), "from": from_a, "to": sent,
-                           "subject": subject, "message_id": mid, "tag": tag, "attachments": names}) or "")
+                           "subject": subject, "message_id": mid, "tag": tag, "attachments": names,
+                           "thread": {"chat": str(thread[0]), "ts": str(thread[1])} if thread else None}) or "")
     if failed:
         one = failed[0]
         line = "Cloudflare would not deliver to %s: %s" % (clip(one.get("to")), clip(one.get("error")))

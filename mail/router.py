@@ -66,7 +66,12 @@ ID WE SENT: the relay rewrites the Message-ID on the wire (2026-09-11), so the m
 workspace, on that address, like a Message-ID (conv_for_reply). A mail sent before the tag, or answered by a
 client that ignores Reply-To, is matched on sender + our address + subject inside that workspace instead
 (started_match). The root of such a conversation is the box's own word, not a sender's: their_line() tells
-the two apart.
+the two apart. A MAIL STARTED FROM A THREAD IS ANSWERED IN IT (owner, 2026-09-11: the planning seat, which
+has no channel, mailed from his thread and his answer opened a new one): `cc-mail send --thread` names the
+Slack thread the ask came in, the line goes UNDER it and the thread's root — the person's own message — is
+the record's `to` root, with the box's line kept as `line`; the From is then home@ and the tag comes back on
+`home+<tag>@`, found before the address is read. outbound.by_mail reads `line`: a session answering that root
+stays in Slack, one answering the line mails.
 
 MOVING. One form, and only one: a reply in a mirror thread reading `move #<channel>` (the `#` is optional),
 from the owner, or from the member whose own channel it is. It is offered to THEM, in the thread — a session's
