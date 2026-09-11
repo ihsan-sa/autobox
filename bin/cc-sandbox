@@ -34,7 +34,9 @@
 #     wizard and asked to sign in on every start. The flags are generated here from no value of his; his file is read for its
 #     `projects` alone, filtered as before, and is never written. The environment is CLEARED and rebuilt
 #     (HOME, PATH, TERM, LANG…, CC_MEMBER_SANDBOX=1, CC_ROLE=member, git identity = the handle). ABSENT: every other ~/dev/*, ~/.cc/config,
-#     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets.
+#     ~/.ssh, ~/.config, ~/.gitconfig, ~/.npmrc, the ledger (~/.cc/state/member-spend.json), other boards, the docker and tmux sockets
+#     — except in a workspace GRANTED a GitHub token (`cc-sandbox github`, below): there ~/.config/gh and ~/.gitconfig hold
+#     that token and its credential helper, read-only, and nothing else of either.
 #   cc-sandbox mint <handle> [--from <file>]   THE WORKSPACE'S OWN CREDENTIAL, the one thing `member` will not start without.
 #     It runs claude in a THROWAWAY HOME so <handle> logs in there, then installs what that login produced at
 #     ~/.cc/members/<handle>/credentials.json, mode 600 — the path and shape the boundary reads. `--from <file>` installs a
@@ -60,6 +62,16 @@
 #     is him, in tmux, for every curl (2026-09-10, his course workspace). Everything else about the boundary stays; a member's
 #     workspace keeps every ask. THE MARKER IS HOST-SIDE: ~/.cc/members/<repo>/owner-workspace, a directory no bind of
 #     the boundary reaches, so a session inside can neither make it nor remove it. `rm` it to take the asks back.
+#   cc-sandbox github <workspace> [<token file>]   ~/dev/<workspace>, a member workspace, is GRANTED A GITHUB TOKEN: a
+#     fine-grained PAT the owner made and scoped to the repositories that workspace may touch (docs/github-app.md; default
+#     ~/.cc/secrets/github-personal.token, mode 600). From its next launch the session inside holds it where gh and git read
+#     it — `gh`, `git push` and the API work from inside, with the token's own scope as the whole permission model, and
+#     nothing on the host runs them for it (owner, 2026-09-11). Inside: ~/.config/gh/hosts.yml and ~/.config/gh/config.yml
+#     holding the token, and a two-line ~/.gitconfig sending github.com through `gh auth git-credential` — all ro, copies the
+#     launch writes under ~/.cc/sandbox/<workspace>/gh, never the token file, never the environment. Everything else about
+#     the boundary is the member's, asks included, and no owner-workspace marker is involved. THE GRANT IS HOST-SIDE:
+#     ~/.cc/members/<workspace>/github-token, a link to the token file, in the directory no bind of the boundary reaches.
+#     `rm` it to take the token back; rotate or revoke the token in its file — every launch copies afresh.
 # INSIDE rw: the track worktree · THREE PLACES IN the parent repo's .git (the worktree's .git is a pointer into it),
 #   which is otherwise A TMPFS holding mountpoints of the real one and nothing else: .git/objects apart from
 #   objects/pack, this track's own .git/worktrees/<n>, and — AT the fixed paths refs/heads/track and
@@ -508,6 +520,38 @@ pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen ins
   [ "$(readlink "/proc/self/fd/$fd" 2>/dev/null)" = "$p" ] || { exec {fd}<&-; return 1; }
   B+=("${flag}-fd" "$fd" "$tgt"); return 0; }
 pinq(){ pin "$@" || { echo "cc-sandbox: $2 is not the path it should be — a link, a rename, or a swap by another live session. Nothing was bound and nothing started; put the real path back." >&2; exit 2; }; }
+gh_bind(){   # $1 handle — A WORKSPACE GRANTED A GITHUB TOKEN HOLDS IT INSIDE (docs/github-app.md, "A granted workspace holds
+  # the token itself"). THE GRANT IS HOST-SIDE: ~/.cc/members/<h>/github-token, a link to the token file (`cc-sandbox github
+  # <h>`), in the one directory of the workspace's that no bind reaches, so a session inside can neither make it nor remove
+  # it. The token is a fine-grained PAT the owner scoped to the repositories the workspace may touch, so its scope is the
+  # whole permission model and the session inside runs `git push` and `gh` itself — nothing on the host runs them for it
+  # (owner, 2026-09-11). It goes in the way gh already reads a token, a hosts.yml, plus the two-line gitconfig that sends
+  # git's github.com credential lookup through `gh auth git-credential` (the host's own ~/.gitconfig does the same). Both
+  # are written HERE, under ~/.cc/sandbox/<h>/gh — no bind reaches the source, and cc-guard already holds that subtree at
+  # the secret tier — and ro-bound at gh's and git's own paths. NOTHING IN THE ENVIRONMENT: `env` is not gated, and every
+  # child would inherit it. No grant → nothing bound and no stale copy left; a grant whose token file is gone → the same,
+  # and the launch names the file. The copy is rewritten on every launch, so the token file on the host is the one place
+  # it is set, rotated or revoked. The token is never printed: the file is read straight into the copy, and a launch that
+  # cannot write the copy says so without it. Nothing else about the boundary changes: same binds, same asks, same cc-guard.
+  local d="$H/.cc/sandbox/$1/gh" grant="$H/.cc/members/$1/github-token" login tok
+  { [ -e "$grant" ] || [ -L "$grant" ]; } || { rm -rf "$d"; return 0; }   # no grant: a member workspace as before
+  login=$("$(dirname "$SELF")/cc-config" get CC_GH_PERSONAL_OWNER 2>/dev/null)
+  if [ ! -f "$grant" ] || [ -z "$login" ]; then
+    rm -rf "$d"; tok=$(readlink "$grant" 2>/dev/null || echo "$grant")
+    echo "cc-sandbox: ~/dev/$1 is granted a GitHub token, but ${login:+$tok is missing}${login:-CC_GH_PERSONAL_OWNER is not set} — no GitHub token inside (docs/github-app.md says how to place it)" >&2
+    return 0; fi
+  # gh 2.46 reads the `users:` + `user:` shape with a config.yml at schema version 1; the older shape starts a
+  # "multi-account migration" that asks GitHub for the login and then WRITES hosts.yml, which fails on a read-only
+  # mount (measured). The shape below is the one gh itself writes today.
+  { mkdir -p "$d" && chmod 700 "$d" && ( umask 077
+      { printf 'github.com:\n    users:\n        %s:\n            oauth_token: ' "$login"; tr -d '\n' < "$grant"
+        printf '\n    git_protocol: https\n    oauth_token: '; tr -d '\n' < "$grant"; printf '\n    user: %s\n' "$login"; } > "$d/hosts.yml.new" \
+      && mv -f "$d/hosts.yml.new" "$d/hosts.yml" \
+      && printf 'version: 1\ngit_protocol: https\n' > "$d/config.yml" \
+      && printf '[credential "https://github.com"]\n\thelper =\n\thelper = !/usr/bin/gh auth git-credential\n' > "$d/gitconfig" ); } \
+    || { rm -rf "$d"; echo "cc-sandbox: could not write the token copy under $d — no GitHub token inside" >&2; return 0; }
+  B+=(--ro-bind "$d/hosts.yml" "$H/.config/gh/hosts.yml" --ro-bind "$d/config.yml" "$H/.config/gh/config.yml"
+     --ro-bind "$d/gitconfig" "$H/.gitconfig"); }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
   local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
@@ -601,6 +645,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   # workspace's .cc/ is rw in here, which is why the marker is NOT beside .cc/member-workspace.
   own=""; [ -f "$m/owner-workspace" ] && own=owner
   settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}" "$own"
+  gh_bind "$h"   # …and a workspace GRANTED a GitHub token holds it inside (gh_bind); the grant is in $m too, and no marker
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
   # CC_LOOP_TRIM crosses like the rest: it is set in front of a dispatch on the HOST, and the loop it steers runs in HERE
@@ -840,6 +885,20 @@ own(){   # $1 repo — a member workspace the owner made for HIMSELF is marked a
                                      "# host-side on purpose — no session inside reaches this directory. rm this file to take the asks back." > "$m/owner-workspace" \
     || { echo "cc-sandbox: could not write $m/owner-workspace — nothing was changed" >&2; return 2; }
   echo "cc-sandbox: ~/dev/$r is the owner's own workspace now (~/.cc/members/$r/owner-workspace). Its sealed sessions stop asking about sudo, the network clients, WebFetch and WebSearch from their next launch — reopen any that are running. rm the marker to take it back."; }
+github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitHub token, or the refusal says why. The grant is one
+  # host-side link, ~/.cc/members/<handle>/github-token → the token file (default ~/.cc/secrets/github-personal.token), written
+  # where no session inside can (build_member). From its next launch the workspace holds that token inside, where gh and git
+  # read it (gh_bind); nothing else about its boundary changes. `rm` the link to take it back.
+  local r="${1:-}" f="${2:-$H/.cc/secrets/github-personal.token}" m
+  handle_ok "$r" || { echo "cc-sandbox: '$r' is not a handle (lower case, digits and -)" >&2; return 2; }
+  m="$H/.cc/members/$r"
+  [ -f "$H/dev/$r/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$r is not a member workspace — make one first (cc-sandbox convert $r), then grant it" >&2; return 2; }
+  [ -f "$f" ] || { echo "cc-sandbox: $f is not a file — place the token first (docs/github-app.md), then grant it" >&2; return 2; }
+  f=$(readlink -f "$f")   # the link is absolute: a relative name would resolve against ~/.cc/members/<handle>/ and dangle
+  [ "$(stat -c %a "$f" 2>/dev/null)" = 600 ] || { echo "cc-sandbox: $f is not mode 600 — a token file is readable by its owner alone; chmod 600 it, then grant it" >&2; return 2; }
+  mkdir -p "$m" && ln -sfn "$f" "$m/github-token" \
+    || { echo "cc-sandbox: could not write $m/github-token — nothing was changed" >&2; return 2; }
+  echo "cc-sandbox: ~/dev/$r holds $f from its next launch (~/.cc/members/$r/github-token) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
   local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1
@@ -1398,6 +1457,61 @@ selfcheck_baseline(){   # THE SEALED-SESSION PERMISSION BASELINE, in a HOME of i
   real1=$(md5sum "$H/.claude/settings.json" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
   t 'baseline: through all of that, the box'"'"'s real ~/.claude/settings.json is untouched — it is his, and this only reads it' "$real1" "$real0"
   rm -rf "${fh:?}"; }
+selfcheck_ghtoken(){   # A WORKSPACE GRANTED A GITHUB TOKEN, in a HOME of its own: a token file and a config of the fixture's, one
+  # member workspace, and the SAME workspace before and after `github`. Each side is asserted — an ungranted launch holds no
+  # token anywhere the session can reach, a granted launch holds it where gh and git read it and nowhere else — and the token
+  # value itself never reaches this output: every check prints a count or a name.
+  local fh h dev out probe rc pat
+  fh=$(mktemp -d "${TMPDIR:-/tmp}/ccsbxgh-XXXXXX") || return 1; chmod 700 "$fh"
+  h="ccsbxg$$"; dev="$fh/dev/$h"; pat="fixture-pat-$$-a"   # a handle `github` accepts (handle_ok)
+  mkdir -p "$dev/.cc" "$fh/.claude" "$fh/.local/bin" "$fh/.cc/boards" "$fh/.cc/members/$h" "$fh/.cc/secrets" || return 1
+  chmod 700 "$fh/.cc/secrets"; : > "$dev/.cc/member-workspace"
+  { [ -e "$CLAUDEBIN" ] && ln -sf "$CLAUDEBIN" "$fh/.local/bin/claude"; } || printf '#!/bin/sh\n' > "$fh/.local/bin/claude"
+  git -C "$dev" init -q -b main >/dev/null 2>&1
+  jq -n '{claudeAiOauth: {accessToken: "gh-access", expiresAt: 99999999999999}}' > "$fh/.cc/members/$h/credentials.json"
+  printf 'CC_GH_PERSONAL_OWNER=someone\n' > "$fh/.cc/config"; ( umask 077; printf '%s\n' "$pat" > "$fh/.cc/secrets/github-personal.token" )
+  # what the session inside can see: gh's token (as a COUNT of the fixture value), git's helper for github.com, gh's own
+  # git-credential answer, whether the copy is writable, and that neither the token file nor the copy's source is there
+  probe='echo tok=$(gh auth token 2>/dev/null | grep -cF -- "$1"); echo helper=$(git config --get credential.https://github.com.helper 2>/dev/null)
+    echo cred=$(printf "protocol=https\nhost=github.com\n" | gh auth git-credential get 2>/dev/null | grep -cF -- "password=$1")
+    echo ro=$( (echo x >> ~/.config/gh/hosts.yml) 2>/dev/null && echo rw || echo ro); echo cfg=$([ -e ~/.config/gh ] && echo present || echo absent)
+    echo secrets=$([ -e ~/.cc/secrets ] && echo present || echo absent); echo copysrc=$([ -e ~/.cc/sandbox ] && echo present || echo absent)
+    echo grant=$([ -e ~/.cc/members ] && echo present || echo absent); echo env=$(env | grep -cF -- "$1")'
+  # "a workspace with no grant is unchanged": the token on the box, no grant → nothing of it inside
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$pat" 2>&1)
+  t 'gh: a workspace with NO GRANT, the token on the box, holds none of it — no gh config, no git helper, no secrets dir, nothing in the environment' \
+    "$(g tok)/$(g helper)/$(g cred)/$(g cfg)/$(g secrets)/$(g env)" '0//0/absent/absent/0'
+  t 'gh: …and no copy was written for it on the host' "$([ -e "$fh/.cc/sandbox/$h/gh" ] && echo copy || echo none)" none
+  # the grant refuses a token file anyone else can read, and writes no link
+  chmod 644 "$fh/.cc/secrets/github-personal.token"; env HOME="$fh" "$SELF" github "$h" >/dev/null 2>&1; rc=$?
+  t 'gh: `github` refuses a token file that is not mode 600, and grants nothing' "$rc/$([ -L "$fh/.cc/members/$h/github-token" ] && echo link || echo none)" 2/none
+  chmod 600 "$fh/.cc/secrets/github-personal.token"
+  env HOME="$fh" "$SELF" github "$h" >/dev/null 2>&1 || return 1
+  t 'gh: the grant is one host-side link, ~/.cc/members/<h>/github-token → the token file' "$(readlink "$fh/.cc/members/$h/github-token")" "$fh/.cc/secrets/github-personal.token"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$pat" 2>&1)
+  t 'gh: the GRANTED workspace holds the token where gh and git read it — gh has it, github.com goes through gh auth git-credential, and that answers with it' \
+    "$(g tok)/$(g helper)/$(g cred)" '1/!/usr/bin/gh auth git-credential/1'
+  t 'gh: …read-only, with the token file, the copy'"'"'s source and the grant all still absent inside, and nothing in the environment' \
+    "$(g ro)/$(g secrets)/$(g copysrc)/$(g grant)/$(g env)" 'ro/absent/absent/absent/0'
+  t 'gh: the copy on the host is under ~/.cc/sandbox/<h>/gh, mode 600 in a 700 dir' \
+    "$(stat -c %a "$fh/.cc/sandbox/$h/gh" "$fh/.cc/sandbox/$h/gh/hosts.yml" 2>/dev/null | tr '\n' /)" '700/600/'
+  # rotated on the host: the next launch carries the new value and not the old
+  ( umask 077; printf '%s\n' "${pat%-a}-b" > "$fh/.cc/secrets/github-personal.token" )
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "${pat%-a}-b" 2>&1); rc="$(g tok)"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "$pat" 2>&1)
+  t 'gh: a token rotated on the host is what the next launch holds — the new value inside, the old one gone' "$rc/$(g tok)" 1/0
+  # the token file removed on the host, the grant still there: nothing inside, no stale copy, and the launch names the file
+  rm -f "$fh/.cc/secrets/github-personal.token"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "${pat%-a}-b" 2>&1)
+  t 'gh: the token file removed on the host — the next launch holds none, the copy is gone too, and the launch names the missing file' \
+    "$(g tok)/$(g cfg)/$(g helper)/$([ -e "$fh/.cc/sandbox/$h/gh" ] && echo copy || echo none)/$(grep -c 'github-personal.token is missing' <<<"$out")" '0/absent//none/1'
+  # the grant removed (rm the link), the token back: an ungranted workspace again, and the last copy does not linger
+  ( umask 077; printf '%s\n' "${pat%-a}-b" > "$fh/.cc/secrets/github-personal.token" ); env HOME="$fh" "$SELF" member "$h" -- true >/dev/null 2>&1
+  rm -f "$fh/.cc/members/$h/github-token"
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c "$probe" _ "${pat%-a}-b" 2>&1)
+  t 'gh: the grant removed — the next launch holds none of the token, the copy is gone, and nothing is said' \
+    "$(g tok)/$(g cfg)/$([ -e "$fh/.cc/sandbox/$h/gh" ] && echo copy || echo none)/$(grep -c 'GitHub token' <<<"$out")" '0/absent/none/0'
+  rm -rf "${fh:?}"; }
 selfcheck_vet(){   # THE BOX'S OWN BOUNDARY, driven for real: what is inside it, what cannot be reached from it, and that
   # there is no way of being outside it. The last one is the case with a history — every other profile here has an
   # opt-in (`<repo> <track>` execs the command untouched unless CC_WORKER_SANDBOX=1), and the mail door's rule is that
@@ -1745,7 +1859,7 @@ selfcheck(){   # a scratch repo with two tracks, real bwrap: secrets and sockets
   out=$(CC_WORKER_SANDBOX='' TMUX=T "$SELF" "$r" t -- sh -c 'printf "%s|" "$0" "$@"; printf "tok=%s tmux=%s" "${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${TMUX:-unset}"' x 'a b' 'c"d' '$e' 2>&1)
   t 'off: argv passes byte for byte' "${out%%tok=*}" 'x|a b|c"d|$e|';  t 'off: environment untouched' "${out#*tok=}" 'unset tmux=T'
   out=$(CC_WORKER_SANDBOX=0 "$SELF" "$r" t -- sh -c 'echo ${CLAUDE_CODE_OAUTH_TOKEN:-unset}' 2>&1); t 'off: 0 is off' "$out" unset
-  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_vet
+  selfcheck_member; selfcheck_member_whitelist; selfcheck_mint; selfcheck_baseline; selfcheck_ghtoken; selfcheck_vet
   # Keep the executable v2 enumeration beside the legacy canary; failure is never a skip.
   local BIN; BIN=$(dirname "$SELF")
   "$BIN/cc-member-v2" selfcheck; t 'v2 cases' "$?" 0
@@ -1764,6 +1878,7 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
        launch_vet "$@";;   # no CC_WORKER_SANDBOX door below: this profile is bwrap or nothing
   convert) shift; convert "${1:-}"; exit $?;;
   own) shift; own "${1:-}"; exit $?;;
+  github) shift; github "${1:-}" "${2:-}"; exit $?;;
   member) h="${2:?handle}"; shift 2; tr=""; if [ "${1:-}" != -- ]; then tr="${1:-}"; shift; fi; [ "${1:-}" = -- ] && shift   # <handle> [<track>|""] [--] cmd
           [ $# -gt 0 ] || { echo "usage: cc-sandbox member <handle> [<track>] -- <cmd...>" >&2; exit 2; }
           if [ "${CC_MEMBER_V2:-}" = 1 ]; then
@@ -1772,6 +1887,6 @@ case "${1:-}" in selfcheck) selfcheck; exit $?;;
           launch_member "$h" "$tr" "$@";;
 esac
 repo="${1:?repo}"; track="${2:?track}"; shift 2; [ "${1:-}" = -- ] && shift
-[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox selfcheck" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: cc-sandbox <repo> <track> -- <cmd...>   |   cc-sandbox member <handle> [<track>] -- <cmd...>   |   cc-sandbox vet -- <cmd...>   |   cc-sandbox reconcile <repo> <track>   |   cc-sandbox mint <handle> [--from <file>]   |   cc-sandbox convert <repo>   |   cc-sandbox own <repo>   |   cc-sandbox github <workspace> [<token file>]   |   cc-sandbox selfcheck" >&2; exit 2; }
 [ "${CC_WORKER_SANDBOX:-}" = 1 ] || exec "$@"   # opt-in only: off means the command runs exactly as given, nothing added
 launch "$repo" "$track" "$@"
