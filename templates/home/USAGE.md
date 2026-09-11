@@ -139,3 +139,5 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-spend cache [--days N]            cache-read tokens per session per day, biggest first
     cc-econ pr [--week|--all]            what an accepted PR cost: worker + fix rounds + reviews, with stops and churn
     cc-econ by-model --bands             the same PRs by model AND by PR size — the routing question
+    cc-lib ask --object '#71' --need current "…"   read the record before you claim: a PR's landing tally, a row and its
+                                         journal, a rule — capped, cited, with COVERAGE and a ticket; `cc-lib --help`

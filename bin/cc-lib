@@ -1,0 +1,1390 @@
+#!/usr/bin/env python3
+"""cc-lib — answer a session's question from the files the box already writes, before it claims anything.
+
+WHY. Of fifteen recorded misses (docs/design-knowledge-library-2026-09-11.md, evidence/misses.md), twelve had
+the record on disk and the session answered from memory or a proxy. So this is a step, not a store: one tool call
+that reads the record, bounded in bytes and time, and leaves a ticket saying what it read. It never calls a
+model, runs no daemon, opens no port, and moves nothing: the index is a rebuildable cache under
+~/.cc/library/owner/ over files left where they are. Owner side only — nothing here changes what a member reads.
+
+  cc-lib ask [--object <id>] [--need current|decision|history|aggregate] [--repo <r>] [--cap <bytes>] [<query>...]
+        One question, one ticket (--need defaults to history). --object names the thing (a PR `#390` or `r1#390`, a board row or track
+        `site` or `r1/site`, a path `~/.cc/state/...`, a SHA); the exact-object routes run first — the landing
+        record for a PR, the board row and its newest notes for a row, the resolved journal (progress.md, else
+        -handoff.md, else the legacy -handover.md — never guessed, each path tried is named) — and only then the
+        FTS5 search over the query, top hits ranked exact id → kind fit for --need → BM25 → freshness, copies of
+        one text collapsed into one hit with provenance. The packet is capped (default 8 KiB, the three worked
+        misses use 2/4/8 KiB) and ends with COVERAGE (sources, watermark, pending, unreadable, excluded, refused,
+        deadline) and OUTCOME answered | partial | not-recorded. It never invents: an empty search is "not
+        recorded in the covered scope", and --need current says in so many words that a live state (a unit, a
+        URL, a token, a process, a merged ref) was not probed — records say what was written, as of their stamps.
+  cc-lib get <rid> [--ticket <T>] [--cap <bytes>]
+        One record page (≤ 8 KiB) by the id a hit printed, with its prev/next span. --ticket charges it to the
+        question's budget (24 KiB cumulative across ask, get and any subagent return); a spent ticket refuses.
+  cc-lib index [--rebuild] [--json]
+        Reconcile every registered source with the index (no deadline) and print the measurements: sources,
+        records, source bytes, text bytes, index bytes and ratios, seconds, peak RSS. `ask` reconciles stale
+        sources too, inside a 1.5 s budget, and names the ones it did not reach as pending; nothing runs a whole
+        rebuild inline, and nothing runs on a timer. A re-read works at record grain: an unchanged text keeps its
+        record and its id, only new texts are inserted and gone ones deleted, so a board whose log grew by five
+        items costs five inserts. The index is a cache with a schema version: an older shape is dropped and rebuilt.
+  cc-lib bench [--n <N>]      FTS and exact-id latency (p50/p95/max) on this index; RSS.
+  cc-lib selfcheck            fixtures of its own under a HOME of its own (check.sh runs it).
+
+SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), indexed in place at record grain:
+  journals    ~/.cc/state/<repo>/<track>/progress.md, <repo>/<alias>-handoff.md | -handover.md — one record per
+              dated `## ` entry (kind checkpoint); an entry over 6 KiB is split at paragraphs into linked spans
+  briefs/docs ~/.cc/state/<repo>/*.md (goals, backlog, packets), <track>/task.md, <project>/docs/**/*.md,
+              <project>/core/docs/*.md, <project>/{CLAUDE,README}.md, ~/*.md (the home guides) — one record per
+              heading (kind document; a heading that says "decision" is kind decision)
+  memory      ~/.claude/projects/*/memory/*.md — one record per file (type feedback → decision, else note)
+  board       rows (kind event, span rows/<name>), notes (kind note), log items (kind event)
+  landing     ~/.cc/state/land/root/<repo>-<pr>.json (the review tally, kind finding), land/<repo>-<pr>.json (the
+              job, kind event), land/queue.log (one event per line)
+  Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
+  is a .md (a memory file is named after its rule); a file over 4 MiB.
+  A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
+  Exact ids (#pr, repo#pr, SHAs, board row names, channel ids) live in a column of their own, so tokenisation
+  cannot split them; text is FTS5 (unicode61, detail=full, BM25).
+
+TICKET. One line per call in ~/.cc/library/owner/tickets.log:
+  <ts> <ticket> <turn> <cmd> <scope> <need> <object> <bytes> <ms> <outcome>   — scope, bytes returned (newline
+  included), tool turns, time and outcome; the object, or q:<hash> for a query-only ask — never the query text.
+  That log is the telemetry every later phase reads.
+"""
+import calendar
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import resource
+import sqlite3
+import sys
+import time
+
+H = os.path.expanduser("~")
+PAGE = 8192            # one returned record page, at most
+SPAN = 6144            # a long entry is split at paragraphs into spans of at most this
+TICKET_CAP = 24576     # cumulative bytes one question may return, across ask/get/subagent
+HITS = 8               # search hits shown per page
+FTS_DEADLINE = 2.0     # seconds, one index operation
+RECONCILE_BUDGET = 1.5 # seconds `ask` spends bringing stale sources in before it searches
+MAX_SOURCE = 4 << 20   # a registered file over this is unreadable, not read
+NEEDS = ("current", "decision", "history", "aggregate")   # kinds: event note decision finding document checkpoint
+# kind fit per need: "a decision outranks a journal opinion about it"; a state record outranks prose for `current`
+FIT = {"current": {"event": 3, "finding": 3, "checkpoint": 2, "note": 2, "decision": 1, "document": 0},
+       "decision": {"decision": 3, "document": 2, "note": 1, "finding": 1, "checkpoint": 0, "event": 0},
+       "history": {"checkpoint": 3, "note": 2, "event": 2, "finding": 2, "document": 1, "decision": 1},
+       "aggregate": {}}
+CAPLINE = "  …(cap reached)"
+CURRENT_CAVEAT = ("CURRENT: records say what was written, as of their stamps; a live state (a unit, a URL, a token's "
+                  "reach, a process, a merged ref) is not probed by cc-lib — probe the object before claiming it is "
+                  "or is not live.")
+STOP = set("a an the is are was were be been of to in on for and or not no it its this that these those with as at by "
+           "from do does did should we i you he she they still yet again another which what who when where why how "
+           "any all our his her their".split())
+SECRET_NAME = re.compile(r"secret|credential|password|(^|\W)\.?env(\W|$)", re.I)
+TOKEN_NAME = re.compile(r"token", re.I)   # a .md may be NAMED after a token rule; any other file named token is a token
+TOKEN_SHAPE = re.compile(r"ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|xox[abprs]-[A-Za-z0-9-]{10,}|"
+                         r"sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY")
+ID_PR = re.compile(r"(?<![\w/])([A-Za-z0-9_.-]+)?#(\d{1,6})\b")
+ID_PRW = re.compile(r"\b(?:PR|pr|pull)[ /#]*(\d{1,6})\b")
+ID_SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
+ID_CHAN = re.compile(r"\bC0[A-Z0-9]{8,10}\b")
+KEBAB = re.compile(r"\b[a-z0-9]+(?:-[a-z0-9]+)+\b")
+DATE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:[T ~]*(\d{2}):?(\d{2})?(?:[:.]?\d{0,2})?)?")
+HEAD = re.compile(r"^(#{1,3}) (.+?)\s*$")
+
+
+def libdir():
+    return os.path.join(H, ".cc", "library", "owner")
+
+
+def dbpath():
+    return os.path.join(libdir(), "index.sqlite")
+
+
+def ticketlog():
+    return os.path.join(libdir(), "tickets.log")
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def tilde(p):
+    return "~" + p[len(H):] if p.startswith(H + "/") else p
+
+
+def rss_mib():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def date_of(s):
+    """First date in s as an ISO stamp: YYYY-MM-DD, with THH:MMZ when the text carries an hour."""
+    m = DATE.search(s or "")
+    if not m:
+        return ""
+    d, hh, mm = m.group(1), m.group(2), m.group(3)
+    if hh and mm:
+        return f"{d}T{hh}:{mm}Z"
+    return d
+
+
+def ts_num(ts):
+    """Seconds since the epoch for a record stamp, or 0 — freshness only, so a date-only stamp is midnight."""
+    if not ts:
+        return 0
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ", "%Y-%m-%d"):
+        try:
+            return calendar.timegm(time.strptime(ts[:len(time.strftime(fmt, time.gmtime(0)))], fmt))
+        except ValueError:
+            continue
+    return 0
+
+
+# ── the registry: which files are knowledge, read from the boards and nothing else ────────────────────────────
+def boards():
+    """repo -> (board path, project path). A board that does not parse is skipped here and named by index()."""
+    out = {}
+    for p in sorted(glob.glob(os.path.join(H, ".cc", "boards", "*.json"))):
+        name = os.path.basename(p)[:-5]
+        if name.startswith("_"):
+            continue
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            out[name] = (p, "")
+            continue
+        out[name] = (p, d.get("path") or "")
+    return out
+
+
+def registry():
+    """[(path, skind, repo, track)] — every file this tool may read. Anything not produced here is never opened."""
+    srcs = []
+    seen = set()
+
+    def add(p, skind, repo="", track=""):
+        p = os.path.abspath(p)
+        if p in seen or not os.path.isfile(p):
+            return
+        seen.add(p)
+        srcs.append((p, skind, repo, track))
+
+    B = boards()
+    for repo, (bp, proj) in B.items():
+        add(bp, "board", repo)
+        st = os.path.join(H, ".cc", "state", repo)
+        for p in sorted(glob.glob(os.path.join(st, "*", "progress.md"))):
+            add(p, "journal", repo, os.path.basename(os.path.dirname(p)))
+        for p in sorted(glob.glob(os.path.join(st, "*", "task.md"))):
+            add(p, "doc", repo, os.path.basename(os.path.dirname(p)))
+        for p in sorted(glob.glob(os.path.join(st, "*.md"))):
+            b = os.path.basename(p)[:-3]
+            if b.endswith("-handoff") or b.endswith("-handover"):
+                add(p, "journal", repo, b.rsplit("-", 1)[0])
+            else:
+                add(p, "doc", repo)
+        if proj and os.path.isdir(proj):
+            for pat in ("docs/**/*.md", "core/docs/*.md", "CLAUDE.md", "README.md", "core/README.md"):
+                for p in sorted(glob.glob(os.path.join(proj, pat), recursive=True)):
+                    add(p, "doc", repo)
+    for p in sorted(glob.glob(os.path.join(H, "*.md"))):
+        add(p, "doc")
+    for p in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "*.md"))):
+        add(p, "memory")
+    land = os.path.join(H, ".cc", "state", "land")
+    for p in sorted(glob.glob(os.path.join(land, "root", "*.json"))):
+        add(p, "land-root", os.path.basename(p)[:-5].rsplit("-", 1)[0])
+    for p in sorted(glob.glob(os.path.join(land, "*.json"))):
+        add(p, "land-job", os.path.basename(p)[:-5].rsplit("-", 1)[0])
+    add(os.path.join(land, "queue.log"), "land-queue")
+    return srcs
+
+
+def excluded(path):
+    """The name policy: a path whose own name says it holds a secret is never opened, whatever list it is on."""
+    b = os.path.basename(path)
+    return bool(SECRET_NAME.search(b)) or (bool(TOKEN_NAME.search(b)) and not b.endswith(".md")) or "/.cc/config" in path
+
+
+# ── parsers: a file -> records at the grain a reader wants back ───────────────────────────────────────────────
+def ids_in(text, repo, rows):
+    """Exact ids a record names, kept in a column of their own so tokenisation cannot split them."""
+    ids = set()
+    for pre, n in ID_PR.findall(text):
+        ids.add(f"#{n}")
+        if pre:
+            ids.add(f"{pre.lower()}#{n}")
+        elif repo:
+            ids.add(f"{repo}#{n}")
+    for n in ID_PRW.findall(text):
+        ids.add(f"#{n}")
+        if repo:
+            ids.add(f"{repo}#{n}")
+    for s in ID_SHA.findall(text):
+        if not s.isdigit() or len(s) >= 12:
+            ids.add(s[:7])
+    ids.update(ID_CHAN.findall(text))
+    if rows:
+        ids.update(k for k in KEBAB.findall(text.lower()) if k in rows)
+    return ids
+
+
+def spans(body):
+    """A body over SPAN bytes is split at paragraph boundaries; a paragraph over SPAN alone is cut at a newline."""
+    if len(body.encode()) <= SPAN:
+        return [body]
+    out, cur = [], ""
+    for para in re.split(r"\n\s*\n", body):
+        cand = (cur + "\n\n" + para) if cur else para
+        if len(cand.encode()) <= SPAN:
+            cur = cand
+            continue
+        if cur:
+            out.append(cur)
+        while len(para.encode()) > SPAN:
+            cut = para.rfind("\n", 0, SPAN) or SPAN
+            cut = cut if cut > 0 else SPAN
+            out.append(para[:cut])
+            para = para[cut:].lstrip("\n")
+        cur = para
+    if cur:
+        out.append(cur)
+    return out
+
+
+def parse_md(path, text, skind, repo, track, rows):
+    """Heading-grain records. A journal's dated `## ` entry is a checkpoint; a doc's heading is a document (or a
+    decision when the heading says so); a memory file is one record, its frontmatter type deciding the kind."""
+    recs = []
+    base = "checkpoint" if skind == "journal" else "document"
+    fdate = date_of(os.path.basename(path))
+    if skind == "memory":
+        m = re.search(r"^type:\s*(\w+)", text, re.M)
+        kind = "decision" if m and m.group(1) == "feedback" else "note"
+        t = re.search(r"^description:\s*(.+)$", text, re.M)
+        title = t.group(1).strip() if t else os.path.basename(path)[:-3]
+        body = re.sub(r"\A---\n.*?\n---\n", "", text, count=1, flags=re.S).strip()
+        for i, s in enumerate(spans(body or title)):
+            recs.append(dict(kind=kind, title=title, ts=fdate or mtime_iso(path), text=s,
+                             span=f"L{0}-{text.count(chr(10))}", part=i, track=track))
+        return recs
+    lines = text.split("\n")
+    sections, fence, start, title, level = [], False, 0, os.path.basename(path), 0
+    for i, l in enumerate(lines):
+        if l.startswith("```"):
+            fence = not fence
+            continue
+        m = HEAD.match(l) if not fence else None
+        if m:
+            sections.append((title, level, start, i))
+            title, level, start = m.group(2), len(m.group(1)), i
+    sections.append((title, level, start, len(lines)))
+    last_ts = fdate
+    for title, level, a, b in sections:
+        body = "\n".join(lines[a:b]).strip()
+        if not body:
+            continue
+        d = date_of(title)
+        if d and level <= 2:
+            last_ts = d
+        ts = d or last_ts or mtime_iso(path)
+        kind = base
+        if base == "document" and re.search(r"decision|decided|rule", title, re.I):
+            kind = "decision"
+        for i, s in enumerate(spans(body)):
+            recs.append(dict(kind=kind, title=title, ts=ts, text=s, span=f"L{a + 1}-{b}", part=i, track=track))
+    return recs
+
+
+def mtime_iso(path):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(os.path.getmtime(path)))
+    except OSError:
+        return ""
+
+
+def parse_board(path, text, repo):
+    d = json.loads(text)
+    recs = []
+    for name, row in (d.get("tracks") or {}).items():
+        if not isinstance(row, dict):
+            continue
+        facts = " ".join(f"{k}={row.get(k)}" for k in ("status", "kind", "pr", "branch", "updated", "created",
+                                                       "agent", "held_by", "held") if row.get(k) not in (None, "", False))
+        recs.append(dict(kind="event", title=f"row {name}: {row.get('title', '')}", ts=row.get("updated") or row.get("created") or "",
+                         text=f"row {name}: {row.get('title', '')}\n{facts}", span=f"rows/{name}", part=0, track=name,
+                         extra_ids={name}))
+        for i, n in enumerate(row.get("notes") or []):
+            if not isinstance(n, dict):
+                continue
+            recs.append(dict(kind="note", title=f"note {name}", ts=n.get("ts", ""), text=f"note {n.get('ts', '')} {name}: {n.get('msg', '')}",
+                             span=f"notes/{name}/{i}", part=0, track=name, extra_ids={name}))
+    for i, e in enumerate(d.get("log") or []):
+        if not isinstance(e, dict):
+            continue
+        tr = e.get("track", "")
+        recs.append(dict(kind="event", title=f"log {tr}", ts=e.get("ts", ""), text=f"log {e.get('ts', '')} {tr}: {e.get('msg', '')}",
+                         span=f"log/{i}", part=0, track=tr, extra_ids={tr} if tr else set()))
+    return recs
+
+
+def parse_land(path, text, skind, repo):
+    d = json.loads(text)
+    pr = d.get("pr") or os.path.basename(path)[:-5].rsplit("-", 1)[-1]
+    ids = {f"#{pr}", f"{repo}#{pr}"}
+    if skind == "land-root":
+        w = d.get("wall") or {}
+        dm = d.get("doomed") or {}
+        lines = [f"landing record {repo}#{pr}: reviews={d.get('reviews', 0)} asked={d.get('asked', 0)} "
+                 f"first={d.get('first', '')} at={d.get('at', '')}"]
+        if w:
+            lines.append(f"wall: head={str(w.get('head', ''))[:12]} cap={w.get('cap', '')} cost={w.get('cost', '')} "
+                         f"turns={w.get('turns', '')} hit={w.get('hit', '')}")
+            if w.get("head"):
+                ids.add(str(w["head"])[:7])
+        for k in ("verdict", "review", "reviewed", "reviewer"):
+            if k in d:
+                lines.append(f"{k}={json.dumps(d[k], ensure_ascii=False)[:600]}")
+        if dm:
+            lines.append(f"doomed: at={dm.get('at', '')} why={dm.get('why', '')}")
+        return [dict(kind="finding", title=f"landing record {repo}#{pr}", ts=d.get("at") or d.get("first") or "",
+                     text="\n".join(lines), span="record", part=0, track="", extra_ids=ids)]
+    facts = " ".join(f"{k}={d[k]}" for k in ("stage", "attempts", "rc", "queued_at", "started", "finished", "who",
+                                             "verdict", "head", "track") if k in d and d[k] not in (None, ""))
+    if d.get("head"):
+        ids.add(str(d["head"])[:7])
+    return [dict(kind="event", title=f"landing job {repo}#{pr}", ts=d.get("finished") or d.get("started") or d.get("queued_at") or "",
+                 text=f"landing job {repo}#{pr}: {facts}\nby={str(d.get('by', ''))[:200]}", span="job", part=0,
+                 track=d.get("track", ""), extra_ids=ids)]
+
+
+def parse_queue(path, text):
+    recs = []
+    for i, l in enumerate(text.split("\n")):
+        if "\t" not in l:
+            continue
+        ts, msg = l.split("\t", 1)
+        m = re.search(r"\b([A-Za-z0-9_.-]+)#(\d+)\b", msg)
+        ids = {f"#{m.group(2)}", f"{m.group(1)}#{m.group(2)}"} if m else set()
+        recs.append(dict(kind="event", title=f"landing {m.group(0) if m else ''}".strip(), ts=ts.strip(), text=l[:2000],
+                         span=f"L{i + 1}", part=0, track="", extra_ids=ids, repo=m.group(1) if m else ""))
+    return recs
+
+
+def parse(path, skind, repo, track, rows):
+    with open(path, "rb") as f:
+        raw = f.read(MAX_SOURCE + 1)
+    if len(raw) > MAX_SOURCE:
+        raise ValueError("over 4 MiB")
+    text = raw.decode("utf-8", "replace")
+    if skind in ("journal", "doc", "memory"):
+        return parse_md(path, text, skind, repo, track, rows)
+    if skind == "board":
+        return parse_board(path, text, repo)
+    if skind in ("land-root", "land-job"):
+        return parse_land(path, text, skind, repo)
+    if skind == "land-queue":
+        return parse_queue(path, text)
+    return []
+
+
+# ── the index ────────────────────────────────────────────────────────────────────────────────────────────────
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY, path TEXT UNIQUE, skind TEXT, repo TEXT, track TEXT,
+  size INTEGER, mtime INTEGER, indexed_at TEXT, nrec INTEGER DEFAULT 0, nbytes INTEGER DEFAULT 0, refused INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'ok');
+CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, source_id INTEGER, rid TEXT UNIQUE, kind TEXT, repo TEXT,
+  track TEXT, ts TEXT, title TEXT, span TEXT, part INTEGER, pos INTEGER, prev TEXT, next TEXT, thash TEXT, text TEXT);
+CREATE INDEX IF NOT EXISTS records_src ON records(source_id);
+CREATE INDEX IF NOT EXISTS records_ts ON records(ts);
+CREATE INDEX IF NOT EXISTS records_thash ON records(thash);
+CREATE TABLE IF NOT EXISTS rids(record_id INTEGER, id TEXT);
+CREATE INDEX IF NOT EXISTS rids_id ON rids(id);
+CREATE INDEX IF NOT EXISTS rids_rec ON rids(record_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, text, content='records', content_rowid='id', detail=full);
+CREATE TRIGGER IF NOT EXISTS records_ai AFTER INSERT ON records BEGIN
+  INSERT INTO fts(rowid, title, text) VALUES (new.id, new.title, new.text); END;
+CREATE TRIGGER IF NOT EXISTS records_ad AFTER DELETE ON records BEGIN
+  INSERT INTO fts(fts, rowid, title, text) VALUES ('delete', old.id, old.title, old.text); END;
+CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE OF title, text ON records BEGIN
+  INSERT INTO fts(fts, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
+  INSERT INTO fts(rowid, title, text) VALUES (new.id, new.title, new.text); END;
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+"""
+
+
+def fts5_available():
+    try:
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE VIRTUAL TABLE t USING fts5(a)")
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+SCHEMA_V = "3"
+
+
+def db():
+    """The index is a cache: one whose schema is not this version is dropped and rebuilt, never migrated."""
+    os.makedirs(libdir(), exist_ok=True)
+    for _ in range(2):
+        c = sqlite3.connect(dbpath(), timeout=5)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.executescript(SCHEMA)
+        v = c.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+        if v and v[0] == SCHEMA_V:
+            return c
+        if not v and not c.execute("SELECT 1 FROM sources LIMIT 1").fetchone():
+            c.execute("INSERT INTO meta(k, v) VALUES ('schema', ?)", (SCHEMA_V,))
+            c.commit()
+            return c
+        c.close()
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(dbpath() + suf)
+            except OSError:
+                pass
+    raise RuntimeError("cc-lib: could not create the index")
+
+
+def rec_ids(r, rrepo, rows):
+    """The exact ids one record carries: those in its title and text, any the parser attached, and its track."""
+    ids = ids_in(r["title"] + "\n" + r["text"], rrepo, rows) | set(r.get("extra_ids") or ())
+    if r.get("track"):
+        ids.add(r["track"])
+    return ids
+
+
+def index_source(c, path, skind, repo, track, rows):
+    """Bring one source's records to what the file holds now, in one transaction, AT RECORD GRAIN: a record whose
+    text is unchanged is kept (its id stays valid for `get`; its position, stamp, title and text are updated where
+    they moved — the FTS row follows by trigger and the ids are re-read, so a memory whose description was edited
+    over an unchanged body is found by its new words), a new text is inserted, a text that is gone is deleted.
+    That is what makes an `ask` cheap on a board whose log grows by five items an hour: five inserts, not 5,800
+    (a whole re-insert measured 7 s on this box's board).
+    The cursor is (size, mtime): a truncated or rewritten file differs on it and is re-read whole."""
+    st = os.stat(path)
+    sid = hashlib.sha1(path.encode()).hexdigest()[:8]
+    try:
+        recs = parse(path, skind, repo, track, rows)
+    except (OSError, ValueError, UnicodeError) as e:
+        c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status) VALUES (?,?,?,?,?,?,?,?) "
+                  "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
+                  "status=excluded.status", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso(), f"unreadable: {e}"))
+        c.commit()
+        return 0
+    c.execute("BEGIN")
+    c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, refused) VALUES (?,?,?,?,?,?,?,'ok',0) "
+              "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
+              "status='ok', refused=0", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso()))
+    source_id = c.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()[0]
+    old = {}   # key -> (id, rid, ts, title, span, pos, prev, next, text)
+    for row in c.execute("SELECT id, rid, ts, title, span, pos, prev, next, thash, text FROM records WHERE source_id=?", (source_id,)):
+        k, n = row[8], 0
+        while f"{k}#{n}" in old:
+            n += 1
+        old[f"{k}#{n}"] = row[:8] + (row[9],)
+    top = c.execute("SELECT COALESCE(MAX(CAST(substr(rid, instr(rid, ':') + 1) AS INTEGER)), -1) FROM records WHERE source_id=?",
+                    (source_id,)).fetchone()[0] + 1
+    kept, refused, nbytes, seen = [], 0, 0, {}
+    for pos, r in enumerate(recs):
+        # a JSON source can carry a lone surrogate (an emoji escaped in halves); text is stored as valid UTF-8 only
+        r["text"] = r["text"].encode("utf-8", "replace").decode("utf-8")
+        r["title"] = str(r["title"]).encode("utf-8", "replace").decode("utf-8")
+        if TOKEN_SHAPE.search(r["text"]):
+            refused += 1
+            continue
+        thash = hashlib.sha1(re.sub(r"\s+", " ", r["text"].lower()).encode()).hexdigest()[:12]
+        n = seen.get(thash, 0)
+        seen[thash] = n + 1
+        r["key"], r["thash"], r["pos"] = f"{thash}#{n}", thash, pos
+        nbytes += len(r["text"].encode())
+        kept.append(r)
+    gone = set(old) - set(r["key"] for r in kept)
+    for k in gone:
+        c.execute("DELETE FROM rids WHERE record_id=?", (old[k][0],))
+        c.execute("DELETE FROM records WHERE id=?", (old[k][0],))
+    rid_of = {}
+    for r in kept:
+        o = old.get(r["key"])
+        rrepo = r.get("repo") or repo
+        if o:
+            rid_of[r["key"]] = o[1]
+            if (o[2], o[3], o[4], o[5], o[8]) != (r["ts"], r["title"], r["span"], r["pos"], r["text"]):
+                c.execute("UPDATE records SET ts=?, title=?, span=?, pos=?, text=? WHERE id=?",
+                          (r["ts"], r["title"], r["span"], r["pos"], r["text"], o[0]))
+            # the ids a record carries come off its title and text (the key is the text alone, case and spacing
+            # folded): where either moved, the ids are read again — the FTS row moved with them, by trigger
+            if (o[3], o[8]) != (r["title"], r["text"]):
+                c.execute("DELETE FROM rids WHERE record_id=?", (o[0],))
+                c.executemany("INSERT INTO rids(record_id, id) VALUES (?,?)", [(o[0], i) for i in rec_ids(r, rrepo, rows)])
+            continue
+        rid = f"{sid}:{top}"
+        top += 1
+        rid_of[r["key"]] = rid
+        cur = c.execute("INSERT INTO records(source_id, rid, kind, repo, track, ts, title, span, part, pos, thash, text) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (source_id, rid, r["kind"], rrepo, r.get("track", ""), r["ts"], r["title"], r["span"], r["part"], r["pos"],
+                         r["thash"], r["text"]))
+        c.executemany("INSERT INTO rids(record_id, id) VALUES (?,?)", [(cur.lastrowid, i) for i in rec_ids(r, rrepo, rows)])
+    # span links follow position: a part>0 record hangs off the one before it. Written only where they changed —
+    # a no-op UPDATE per record was a second of every board re-read.
+    for i, r in enumerate(kept):
+        prev = rid_of[kept[i - 1]["key"]] if i and r["part"] else None
+        nxt = rid_of[kept[i + 1]["key"]] if i + 1 < len(kept) and kept[i + 1]["part"] else None
+        o = old.get(r["key"])
+        if (o and (o[6], o[7]) != (prev, nxt)) or (not o and (prev or nxt)):
+            c.execute("UPDATE records SET prev=?, next=? WHERE rid=?", (prev, nxt, rid_of[r["key"]]))
+    c.execute("UPDATE sources SET nrec=?, nbytes=?, refused=? WHERE id=?", (len(kept), nbytes, refused, source_id))
+    c.commit()
+    return len(kept)
+
+
+def reconcile(c, deadline=None, prefer=(), reg=None):
+    """Bring the index to the registry: changed or new sources re-read, gone ones dropped, `prefer` first. With a
+    deadline the rest is PENDING and named, never silently skipped — and so is a source another cc-lib holds the
+    write lock on past the busy timeout (two asks reconciling the same board at once)."""
+    t0 = time.monotonic()
+    reg = registry() if reg is None else reg
+    known = {p: (s, m) for p, s, m in c.execute("SELECT path, size, mtime FROM sources")}
+    rows = set()
+    for p, skind, repo, track in reg:
+        if skind == "board" and not excluded(p):
+            try:
+                with open(p) as f:
+                    rows.update((json.load(f).get("tracks") or {}).keys())
+            except (OSError, ValueError):
+                pass
+    out = dict(indexed=0, pending=[], unreadable=[], excluded=[], removed=0, refused=0)
+    todo = []
+    for p, skind, repo, track in reg:
+        if excluded(p):
+            out["excluded"].append(p)
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if known.get(p) != (st.st_size, st.st_mtime_ns):
+            todo.append((p, skind, repo, track))
+    live = set(p for p, *_ in reg) - set(out["excluded"])
+    for p in set(known) - live:
+        sid = c.execute("SELECT id FROM sources WHERE path=?", (p,)).fetchone()
+        if sid:
+            c.execute("DELETE FROM rids WHERE record_id IN (SELECT id FROM records WHERE source_id=?)", (sid[0],))
+            c.execute("DELETE FROM records WHERE source_id=?", (sid[0],))
+            c.execute("DELETE FROM sources WHERE id=?", (sid[0],))
+            out["removed"] += 1
+    c.commit()
+    pref = set(os.path.abspath(x) for x in prefer)
+    todo.sort(key=lambda s: (0 if s[0] in pref else 1, s[0]))
+    for s in todo:
+        if deadline is not None and time.monotonic() - t0 > deadline:
+            out["pending"].append(s[0])
+            continue
+        try:
+            index_source(c, *s, rows)
+        except sqlite3.OperationalError:   # locked past the timeout: another cc-lib is writing it; pending, not dead
+            c.rollback()
+            out["pending"].append(s[0])
+            continue
+        out["indexed"] += 1
+    for p, status, refused in c.execute("SELECT path, status, refused FROM sources"):
+        if status != "ok":
+            out["unreadable"].append(f"{tilde(p)} ({status})")
+        out["refused"] += refused or 0
+    out["seconds"] = time.monotonic() - t0
+    return out
+
+
+# ── search ───────────────────────────────────────────────────────────────────────────────────────────────────
+def fts_expr(query, mode):
+    toks = []
+    for t in re.findall(r"[\w#./@:-]+", query or ""):
+        core = t.strip("#.-/:@").lower()
+        if len(core) < 2 or core in STOP or not re.search(r"\w", core):
+            continue
+        toks.append('"%s"' % t.replace('"', '""'))
+    return (" AND " if mode == "and" else " OR ").join(dict.fromkeys(toks))
+
+
+def with_deadline(c, seconds):
+    end = time.monotonic() + seconds
+    c.set_progress_handler(lambda: 1 if time.monotonic() > end else 0, 5000)
+
+
+def search(c, query, repo, need, object_ids, limit=40):
+    """FTS hits, AND phase then one OR reformulation; ranked exact id -> kind fit -> BM25 + freshness."""
+    hits, phase, deadline_hit = [], "", False
+    for mode in ("and", "or"):
+        expr = fts_expr(query, mode)
+        if not expr:
+            break
+        sql = ("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, "
+               "s.path, bm25(fts, 3.0, 1.0) AS score FROM fts JOIN records r ON r.id = fts.rowid JOIN sources s ON s.id = r.source_id "
+               "WHERE fts MATCH ?" + (" AND r.repo = ?" if repo else "") + " ORDER BY score LIMIT ?")
+        args = [expr] + ([repo] if repo else []) + [limit]
+        with_deadline(c, FTS_DEADLINE)
+        try:
+            rows = c.execute(sql, args).fetchall()
+        except sqlite3.OperationalError as e:
+            if "interrupted" in str(e):
+                deadline_hit, rows = True, []
+            else:
+                rows = []
+        finally:
+            c.set_progress_handler(None, 0)
+        if rows:
+            hits, phase = rows, mode
+            break
+    now = time.time()
+    ranked = []
+    for h in hits:
+        rid_ids = set(x[0] for x in c.execute("SELECT id FROM rids WHERE record_id=?", (h[0],)))
+        exact = 0 if (object_ids and rid_ids & object_ids) else 1
+        fit = FIT.get(need, {}).get(h[2], 0)
+        age = max(0.0, (now - ts_num(h[5])) / 86400.0) if ts_num(h[5]) else 365.0
+        ranked.append(((exact, -fit, h[13] + math.log1p(age) / 4.0), h))
+    ranked.sort(key=lambda x: x[0])
+    return [h for _, h in ranked], phase, deadline_hit
+
+
+def collapse(hits):
+    """Copies of one text (same normalised hash) become one hit that names the others."""
+    out, seen = [], {}
+    for h in hits:
+        if h[9] in seen:
+            seen[h[9]].append(h[1])
+        else:
+            seen[h[9]] = []
+            out.append((h, seen[h[9]]))
+    return out
+
+
+def by_ids(c, ids, repo=None, skind=None, kind=None, span_like=None, limit=HITS, order="ts DESC, part ASC"):
+    if not ids:
+        return []
+    q = ("SELECT DISTINCT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+         "FROM rids i JOIN records r ON r.id = i.record_id JOIN sources s ON s.id = r.source_id WHERE i.id IN (%s)"
+         % ",".join("?" * len(ids)))
+    args = list(ids)
+    if repo:
+        q += " AND r.repo=?"
+        args.append(repo)
+    if skind:
+        q += " AND s.skind=?"
+        args.append(skind)
+    if kind:
+        q += " AND r.kind=?"
+        args.append(kind)
+    if span_like:
+        q += " AND r.span LIKE ?"
+        args.append(span_like)
+    q += f" ORDER BY r.{order} LIMIT ?"
+    args.append(limit)
+    return c.execute(q, args).fetchall()
+
+
+def newest_entry(c, path):
+    """The newest dated entry of a journal: the first span of the record with the highest position in the file."""
+    r = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+                  "FROM records r JOIN sources s ON s.id = r.source_id WHERE s.path=? AND r.part=0 "
+                  "ORDER BY r.pos DESC LIMIT 1", (path,)).fetchone()
+    return r
+
+
+def resolve_journal(repo, name):
+    """The journal a row or alias keeps, by the rule cc-handoff and cc-context share: a track's progress.md; else
+    the canonical -handoff.md; else the legacy -handover.md, which is read and never renamed. Returns
+    (path or None, [paths tried])."""
+    st = os.path.join(H, ".cc", "state", repo)
+    tried = [os.path.join(st, name, "progress.md"), os.path.join(st, f"{name}-handoff.md"), os.path.join(st, f"{name}-handover.md")]
+    for p in tried:
+        if os.path.isfile(p):
+            return p, tried
+    return None, tried
+
+
+def parse_object(obj, repo):
+    """-> (kind, repo, key): pr | row | path | id"""
+    if not obj:
+        return None
+    o = obj.strip()
+    if o.startswith("~") or o.startswith("/"):
+        return ("path", repo, os.path.abspath(os.path.expanduser(o)))
+    m = re.fullmatch(r"(?:([A-Za-z0-9_.-]+)#|#|(?:pr|PR)[ #]*)(\d{1,6})", o) or re.fullmatch(r"(\d{1,6})", o)
+    if m:
+        g = m.groups()
+        return ("pr", (g[0] if len(g) > 1 and g[0] else repo), g[-1])
+    m = re.fullmatch(r"([A-Za-z0-9_.-]+)[/@]([A-Za-z0-9_.-]+)", o)
+    if m:
+        return ("row", m.group(1) if "/" in o else m.group(2), m.group(2) if "/" in o else m.group(1))
+    if re.fullmatch(r"[0-9a-f]{7,40}", o):
+        return ("id", repo, o[:7])
+    return ("row", repo, o)
+
+
+# ── the ticket ───────────────────────────────────────────────────────────────────────────────────────────────
+def ticket_new():
+    return "T" + time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + "-" + hashlib.sha1(os.urandom(8)).hexdigest()[:4]
+
+
+def ticket_used(T):
+    used, turns = 0, 0
+    try:
+        with open(ticketlog()) as f:
+            for l in f:
+                p = l.rstrip("\n").split("\t")
+                if len(p) >= 10 and p[1] == T:
+                    turns += 1
+                    try:
+                        used += int(p[7])
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return used, turns
+
+
+def ticket_write(T, turn, cmd, scope, need, obj, nbytes, ms, outcome):
+    os.makedirs(libdir(), exist_ok=True)
+    with open(ticketlog(), "a") as f:
+        f.write("\t".join([now_iso(), T, str(turn), cmd, scope or "all", need or "-", (obj or "-").replace("\t", " ")[:80],
+                           str(nbytes), str(int(ms)), outcome]) + "\n")
+
+
+# ── the packet ───────────────────────────────────────────────────────────────────────────────────────────────
+def cite(h):
+    return f"    ↳ {h[1]} {tilde(h[12])}[{h[7]}] {h[5] or '-'}"
+
+
+def render_hit(h, budget, T, label=None, also=()):
+    """One record inside `budget` bytes: header, text (cut to fit, saying how much is left and how to get it),
+    citation. Returns (lines, bytes) or (None, 0) when even the header will not fit."""
+    head = f"  [{h[2]} {h[5] or '-'}] {label or h[6]}"
+    tail = [cite(h)]
+    if also:
+        tail.append("    also: " + ", ".join(also[:6]) + (f" +{len(also) - 6}" if len(also) > 6 else ""))
+    fixed = len(head.encode()) + sum(len(t.encode()) + 1 for t in tail) + 2
+    if fixed + 40 > budget:
+        return None, 0
+    body = h[8].encode()
+    room = min(budget - fixed, PAGE)
+    for _ in range(6):   # the indent costs 4 bytes a line, so a cut is re-measured and tightened until it fits
+        text = h[8]
+        if len(body) > room:
+            note = f"\n    …(+{len(body) - max(0, room - 80)} bytes: cc-lib get {h[1]} --ticket {T})"
+            text = body[:max(0, room - len(note.encode()))].decode("utf-8", "ignore").rstrip() + note
+        elif h[11]:
+            text += f"\n    (continues: cc-lib get {h[11]} --ticket {T})"
+        lines = [head] + ["    " + l for l in text.split("\n")] + tail
+        n = sum(len(l.encode()) + 1 for l in lines)
+        if n <= budget:
+            return lines, n
+        room -= (n - budget) + 16
+        if room < 40:
+            return None, 0
+    return None, 0
+
+
+def ask(argv):
+    obj, need, repo, cap, q = None, "history", None, PAGE, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--object" and i + 1 < len(argv):
+            obj, i = argv[i + 1], i + 1
+        elif a == "--need" and i + 1 < len(argv):
+            need, i = argv[i + 1], i + 1
+        elif a == "--repo" and i + 1 < len(argv):
+            repo, i = argv[i + 1], i + 1
+        elif a == "--cap" and i + 1 < len(argv):
+            cap, i = int(argv[i + 1]), i + 1
+        elif a == "--query" and i + 1 < len(argv):
+            q.append(argv[i + 1])
+            i += 1
+        elif a.startswith("-"):
+            print(f"cc-lib ask: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            q.append(a)
+        i += 1
+    if need not in NEEDS:
+        print(f"cc-lib ask: --need is one of {', '.join(NEEDS)}", file=sys.stderr)
+        return 2
+    if not obj and not q:
+        print("cc-lib ask: give --object <id>, a query, or both", file=sys.stderr)
+        return 2
+    cap = max(512, min(cap, TICKET_CAP))
+    query = " ".join(q)
+    T = ticket_new()
+    t0 = time.monotonic()
+    c = db()
+    o = parse_object(obj, repo)
+    reg = registry()   # once: the glob over every repo's docs is the slow half of a no-change reconcile
+    prefer = []
+    if o and o[0] == "path":
+        prefer.append(o[2])
+    if o and o[0] in ("row", "pr"):
+        prefer += [p for p, sk, *_ in reg if sk in ("board", "land-root", "land-job", "land-queue")]
+        if o[0] == "row":
+            for r in ([o[1]] if o[1] else boards()):
+                jp, _ = resolve_journal(r, o[2])
+                if jp:
+                    prefer.append(jp)
+    cov = reconcile(c, deadline=RECONCILE_BUDGET, prefer=prefer, reg=reg)
+    sections = []      # (label, [hits]) in route order
+    object_ids = set()
+    notes = []
+    if o:
+        kind, orepo, key = o
+        if kind == "pr":
+            object_ids = {f"#{key}"} | ({f"{orepo}#{key}"} if orepo else set())
+            sections.append(("landing record (review tally)", by_ids(c, object_ids, orepo, skind="land-root", limit=2)))
+            sections.append(("landing job", by_ids(c, object_ids, orepo, skind="land-job", limit=2)))
+            sections.append(("landing events, newest first", by_ids(c, object_ids, orepo, skind="land-queue", limit=3)))
+            sections.append(("board rows with this PR", by_ids(c, object_ids, orepo, span_like="rows/%", limit=2)))
+        elif kind == "row":
+            object_ids = {key}
+            rows = by_ids(c, {key}, orepo, span_like="rows/%", limit=3)
+            sections.append(("board row", rows))
+            sections.append(("board notes, newest first", by_ids(c, {key}, orepo, kind="note", span_like=f"notes/{key}/%", limit=3)))
+            # the journal is looked for in the row's repo first, then every board's: an orch's row can sit on one
+            # board while its journal is kept under another repo's state (seen live: lessons-site)
+            rr = sorted(set(r[3] for r in rows))
+            repos = [orepo] if orepo else rr + [b for b in sorted(boards()) if b not in rr]
+            found = False
+            for r in repos:
+                jp, tried = resolve_journal(r, key)
+                if jp:
+                    found = True
+                    h = newest_entry(c, jp)
+                    absent = [tilde(t) for t in tried if t != jp]
+                    lbl = f"journal {tilde(jp)} (exists" + (f"; absent: {', '.join(absent)}" if absent else "") + "), newest entry"
+                    sections.append((lbl, [h] if h else []))
+                    if not h:
+                        notes.append(f"  journal {tilde(jp)} exists but holds no indexed entry yet" + (" (pending)" if jp in cov["pending"] else ""))
+                    break
+            if not found and repos:
+                notes.append("  journal: none at " + ", ".join(tilde(t) for r in repos for t in resolve_journal(r, key)[1]))
+            if not rows:
+                notes.append(f"  board row: none named {key}" + (f" in {orepo}" if orepo else f" (boards: {', '.join(sorted(boards())) or 'none'})"))
+        elif kind == "path":
+            rs = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+                           "FROM records r JOIN sources s ON s.id=r.source_id WHERE s.path=? AND r.part=0 ORDER BY r.pos DESC "
+                           "LIMIT ?", (key, HITS)).fetchall()
+            sections.append((f"records of {tilde(key)}, newest first", rs))
+            if not rs:
+                notes.append(f"  {tilde(key)}: " + ("not a registered source" if key not in set(p for p, *_ in reg)
+                                                    else "registered, no records" + (" (pending)" if key in cov["pending"] else "")))
+        else:
+            object_ids = {key}
+        if kind in ("pr", "id"):
+            sections.append(("records naming it, newest first", by_ids(c, object_ids, orepo, limit=HITS)))
+    hits, phase, deadline_hit = ([], "", False)
+    if query:
+        hits, phase, deadline_hit = search(c, query, repo, need, object_ids)
+    shown_rids = set()
+    routed = 0
+    body = []
+    header = (f"cc-lib ask {T} · now {now_iso()} · scope {repo or 'all'} · need {need}"
+              + (f" · object {obj}" if obj else "") + f" · cap {cap}")
+    # fixed tail first, so the records get exactly what is left
+    wm = c.execute("SELECT MAX(indexed_at), COUNT(*) FROM sources WHERE status='ok'").fetchone()
+    covline = (f"COVERAGE sources {wm[1]} · watermark {wm[0] or '-'} · pending {len(cov['pending'])}"
+               + (" (" + ", ".join(tilde(p) for p in cov["pending"][:3]) + (", …" if len(cov["pending"]) > 3 else "") + ")" if cov["pending"] else "")
+               + f" · unreadable {len(cov['unreadable'])}" + (" (" + "; ".join(cov["unreadable"][:2]) + ")" if cov["unreadable"] else "")
+               + f" · excluded {len(cov['excluded'])} · refused {cov['refused']}"
+               + (f" · search {phase}-phase" if phase else (" · search: no hit" if query else ""))
+               + (" · DEADLINE HIT (partial)" if deadline_hit else ""))
+    tail = [covline] + ([CURRENT_CAVEAT] if need == "current" else [])
+    last_tpl = f"OUTCOME not-recorded · {cap} bytes · 99999 ms · ticket {T} turn 1 · budget {TICKET_CAP} left {TICKET_CAP}"
+    reserve = sum(len(l.encode()) + 1 for l in tail) + len(header.encode()) + 1 + len(last_tpl.encode()) + 1
+    budget = cap - reserve
+    if budget < 200:
+        print(f"cc-lib ask: --cap {cap} leaves no room for a record (need about {reserve + 200})", file=sys.stderr)
+        return 2
+    used = 0
+    for label, rs in sections:
+        rs = [r for r in rs if r and r[1] not in shown_rids]
+        if not rs:
+            continue
+        line = f"ROUTE {label} ({len(rs)})"
+        used += len(line.encode()) + 1
+        body.append(line)
+        for h in rs:
+            lines, n = render_hit(h, budget - used, T)
+            if lines is None:
+                body.append(CAPLINE)
+                used += len(CAPLINE.encode()) + 1
+                break
+            body += lines
+            used += n
+            shown_rids.add(h[1])
+            routed += 1
+    for n_ in notes:
+        body.append(n_)
+        used += len(n_.encode()) + 1
+    groups = [(h, also) for h, also in collapse(hits) if h[1] not in shown_rids]
+    shown_hits = 0
+    if query and groups:
+        line = f"HITS {min(len(groups), HITS)} of {len(groups)} " + ("(all words)" if phase == "and" else
+                                                                "(any word — no record holds all the words; leads, not an answer)")
+        u, rendered = used + len(line.encode()) + 1, []
+        for h, also in groups[:HITS]:
+            lines, n = render_hit(h, budget - u, T, also=also)
+            if lines is None:
+                rendered.append(CAPLINE)
+                u += len(CAPLINE.encode()) + 1
+                break
+            rendered += lines
+            u += n
+            shown_hits += 1
+        if shown_hits or not routed:   # routes that answered are not followed by a header over nothing
+            body.append(line)
+            body += rendered
+            used = u
+        if need == "aggregate":
+            counts = {}
+            for h, _ in groups:
+                counts[h[2]] = counts.get(h[2], 0) + 1
+            body.append("  aggregate over the index only (not a corpus scan): " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if query and not groups and not routed:
+        body.append("  not recorded: no record in the covered scope matches; the two phases (all words, any word) found nothing"
+                    + (f"; {len(cov['pending'])} source(s) not yet searched (pending)" if cov["pending"] else ""))
+    # OUTCOME: answered when a route or an all-words hit was shown; partial when only any-word leads were, or nothing
+    # could be shown, or coverage is short (pending sources, a deadline); not-recorded only when the covered scope is
+    # complete and holds nothing. The cap cutting a packet short is not partial coverage — the packet says what it cut.
+    if routed or (query and phase == "and" and shown_hits):
+        outcome = "answered"
+    elif groups or (query and phase):
+        outcome = "partial"
+    else:
+        outcome = "not-recorded"
+    if cov["pending"] or deadline_hit:
+        outcome = "partial"
+    ms = (time.monotonic() - t0) * 1000
+    # THE CAP IS THE RULE. The accounting above is what fills the packet; this is what enforces it: the tail
+    # (COVERAGE, the caveat, OUTCOME) is never cut, so a body line is dropped from the end until the whole fits.
+    fixed = len(header.encode()) + 1 + sum(len(l.encode()) + 1 for l in tail) + len(last_tpl.encode()) + 1
+    cut = False
+    while body and fixed + sum(len(l.encode()) + 1 for l in body) > cap - (18 if cut else 0):
+        body.pop()
+        cut = True
+    if cut:
+        body.append(CAPLINE)
+    out = [header] + body + tail
+    nbytes = sum(len(l.encode()) + 1 for l in out) + len(last_tpl.encode()) + 1   # the OUTCOME line, sized on its template
+    last = f"OUTCOME {outcome} · {nbytes} bytes · {ms:.0f} ms · ticket {T} turn 1 · budget {TICKET_CAP} left {TICKET_CAP - nbytes}"
+    out.append(last)
+    text = "\n".join(out)
+    ticket_write(T, 1, "ask", repo, need, obj or ("q:" + hashlib.sha1(query.encode()).hexdigest()[:8]), len(text.encode()) + 1, ms, outcome)
+    print(text)
+    return 0
+
+
+def get(argv):
+    rid, T, cap = None, None, PAGE
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--ticket" and i + 1 < len(argv):
+            T, i = argv[i + 1], i + 1
+        elif a == "--cap" and i + 1 < len(argv):
+            cap, i = int(argv[i + 1]), i + 1
+        elif a.startswith("-") or rid:
+            print("usage: cc-lib get <rid> [--ticket <T>] [--cap <bytes>]", file=sys.stderr)
+            return 2
+        else:
+            rid = a
+        i += 1
+    if not rid:
+        print("usage: cc-lib get <rid> [--ticket <T>] [--cap <bytes>]", file=sys.stderr)
+        return 2
+    t0 = time.monotonic()
+    cap = min(cap, PAGE)
+    if T:
+        used, turns = ticket_used(T)
+        if used >= TICKET_CAP:
+            ticket_write(T, turns + 1, "get", None, None, rid, 0, 0, "refused")
+            print(f"cc-lib get: ticket {T} is spent ({used} of {TICKET_CAP} bytes over {turns} turns) — answer with what "
+                  f"you have, or open a new question with cc-lib ask", file=sys.stderr)
+            return 3
+        cap = min(cap, TICKET_CAP - used)
+    else:
+        T, turns = "-", 0
+    c = db()
+    h = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+                  "FROM records r JOIN sources s ON s.id=r.source_id WHERE r.rid=?", (rid,)).fetchone()
+    if not h:
+        ticket_write(T, turns + 1, "get", None, None, rid, 0, (time.monotonic() - t0) * 1000, "not-recorded")
+        print(f"cc-lib get: no record {rid} (the index may have moved on; ask again)", file=sys.stderr)
+        return 1
+    head = f"cc-lib get {rid} · [{h[2]} {h[5] or '-'}] {h[6]}" + (f" · prev {h[10]}" if h[10] else "") + (f" · next {h[11]}" if h[11] else "")
+    body = h[8].encode()
+    room = cap - len(head.encode()) - len(cite(h).encode()) - 8
+    text = h[8]
+    if len(body) > room:
+        text = body[:max(0, room - 40)].decode("utf-8", "ignore").rstrip() + f"\n…(+{len(body) - room} bytes over the page)"
+    out = "\n".join([head, text, cite(h)])
+    n = len(out.encode()) + 1
+    ticket_write(T, turns + 1, "get", h[3], None, rid, n, (time.monotonic() - t0) * 1000, "answered")
+    print(out)
+    return 0
+
+
+def index(argv):
+    rebuild, as_json = "--rebuild" in argv, "--json" in argv
+    t0 = time.monotonic()
+    if rebuild:
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.remove(dbpath() + suf)
+            except OSError:
+                pass
+    c = db()
+    cov = reconcile(c)
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    n = c.execute("SELECT COUNT(*), COALESCE(SUM(nbytes), 0), COALESCE(SUM(size), 0) FROM sources WHERE status='ok'").fetchone()
+    nrec = c.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+    c.close()
+    ib = os.path.getsize(dbpath())
+    st = dict(sources=n[0], records=nrec, source_bytes=n[2], text_bytes=n[1], index_bytes=ib,
+              index_to_source=round(ib / n[2], 3) if n[2] else None, index_to_text=round(ib / n[1], 3) if n[1] else None,
+              seconds=round(time.monotonic() - t0, 2), peak_rss_mib=round(rss_mib(), 1), indexed_now=cov["indexed"],
+              removed=cov["removed"], unreadable=cov["unreadable"], excluded=[tilde(p) for p in cov["excluded"]],
+              refused=cov["refused"], rebuild=rebuild)
+    if as_json:
+        print(json.dumps(st, indent=1))
+    else:
+        print(f"cc-lib index: {st['sources']} sources, {st['records']} records · source {st['source_bytes']} B, text "
+              f"{st['text_bytes']} B, index {st['index_bytes']} B (index/source {st['index_to_source']}, index/text "
+              f"{st['index_to_text']}) · {st['seconds']} s · peak RSS {st['peak_rss_mib']} MiB · re-read {st['indexed_now']}"
+              f" · removed {st['removed']} · unreadable {len(st['unreadable'])} · excluded {len(st['excluded'])} · refused {st['refused']}")
+        for u in st["unreadable"]:
+            print("  unreadable: " + u)
+    return 0
+
+
+def bench(argv):
+    n = 50
+    if "--n" in argv:
+        n = int(argv[argv.index("--n") + 1])
+    c = db()
+    import random
+    random.seed(7)
+    words = [w for (t,) in c.execute("SELECT text FROM records ORDER BY RANDOM() LIMIT ?", (n * 2,))
+             for w in re.findall(r"[A-Za-z]{5,}", t)[:3]]
+    ids = [i for (i,) in c.execute("SELECT id FROM rids ORDER BY RANDOM() LIMIT ?", (n,))]
+    if not words or not ids:
+        print("cc-lib bench: the index is empty — run cc-lib index first")
+        return 1
+    f, e = [], []
+    for k in range(n):
+        q = " ".join(random.sample(words, min(2, len(words))))
+        t0 = time.monotonic()
+        search(c, q, None, "history", set(), limit=40)
+        f.append((time.monotonic() - t0) * 1000)
+        t0 = time.monotonic()
+        by_ids(c, {random.choice(ids)})
+        e.append((time.monotonic() - t0) * 1000)
+
+    def pct(v, p):
+        v = sorted(v)
+        return v[min(len(v) - 1, int(p * len(v)))]
+    print(f"cc-lib bench: {n} queries · fts p50 {pct(f, .5):.1f} ms p95 {pct(f, .95):.1f} ms max {max(f):.1f} ms · "
+          f"exact-id p50 {pct(e, .5):.2f} ms p95 {pct(e, .95):.2f} ms · peak RSS {rss_mib():.1f} MiB")
+    return 0
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    """Fixtures of its own under a HOME of its own: a board, journals, docs, memory, landing records, a secret
+    that must never be read. The fifteen recorded misses and the unanswerable ones, as questions."""
+    import contextlib
+    import io
+    import shutil
+    import tempfile
+    global H
+    n = [0, 0]
+
+    def ok(what, cond):
+        print(("  ok   " if cond else "  FAIL ") + what)
+        n[0 if cond else 1] += 1
+
+    def run(*argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(list(argv))
+        return rc, buf.getvalue()
+
+    def outcome(out):
+        m = re.search(r"^OUTCOME (\S+)", out, re.M)
+        return m.group(1) if m else "?"
+
+    print("cc-lib selfcheck")
+    ok("the installed Python sqlite3 exposes FTS5 (the whole tool stands on it)", fts5_available())
+    th = tempfile.mkdtemp(prefix="cclib-sc-")
+    H0 = H
+    H = th
+    try:
+        def w(rel, text):
+            p = os.path.join(th, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(text)
+            return p
+        proj = os.path.join(th, "dev", "r1")
+        os.makedirs(proj)
+        board = {"repo": "r1", "path": proj, "tracks": {
+            "site": {"title": "the site is live for members", "kind": "track", "status": "parked", "pr": "https://x/r1/pull/12",
+                     "branch": "track/site", "updated": "2026-09-11T16:49:00Z", "created": "2026-09-01T00:00:00Z", "notes": [
+                         {"ts": "2026-09-10T09:00:00Z", "msg": "parked: waits on his go (opens a hostname)"},
+                         {"ts": "2026-09-11T16:49:00Z", "msg": "closed as delivered elsewhere: units active, owner has used the site"}]},
+            "t1": {"title": "a review is bought once per head", "kind": "track", "status": "review", "pr": "https://x/r1/pull/390",
+                   "branch": "track/t1", "updated": "2026-09-08T10:00:00Z", "notes": [{"ts": "2026-09-08T09:00:00Z", "msg": "waiting until 17:10Z for the worker"}]},
+            "t2": {"title": "a landing that stopped at gates", "kind": "track", "status": "review", "pr": "https://x/r1/pull/320",
+                   "branch": "track/t2", "updated": "2026-09-07T20:00:00Z", "notes": []},
+            "orch-x": {"title": "an orch", "kind": "orch", "status": "running", "pr": "", "branch": "", "updated": "2026-09-07T19:00:00Z", "notes": []}},
+            "log": [{"ts": "2026-09-11T16:49:24Z", "track": "site", "msg": "status -> done"},
+                    {"ts": "2026-09-07T20:10:00Z", "track": "t2", "msg": "#320 stopped at gates: check.sh red, NOT landed"}]}
+        w(".cc/boards/r1.json", json.dumps(board))
+        w(".cc/boards/_cctest.json", json.dumps({"repo": "_cctest", "tracks": {"ghost": {"title": "never indexed", "status": "x", "notes": []}}}))
+        long_entry = "\n\n".join(f"paragraph {k} of a long checkpoint about the site handover, words words words " * 12 for k in range(30))
+        w(".cc/state/r1/site-handover.md", "# site journal\n\n## 2026-09-07T22:50Z first\nthe orch started; the journal is this file.\n\n"
+          "## 2026-09-11T16:01Z newest\nnothing is left of the row; the owner has used the site.\n\n" + long_entry + "\n")
+        w(".cc/state/r1/t1/progress.md", "## 2026-09-08T08:00Z iter 1\nstarted.\n\n## 2026-09-08T09:30Z iter 2\nworker restarted after "
+          "the rate-limit stall; the earlier 'waiting until 17:10Z' line is stale.\n")
+        w(".cc/state/r1/planning-handoff.md",
+          "## 2026-09-07T19:40Z stale ref\n#323's gate read refs/pull/323/head, lagging the force-push; a real billed turn ran.\n\n"
+          "## 2026-09-07T21:00Z landings\n#320 stopped at gates (check.sh red); not landed. Two silent lander deaths, not three.\n\n"
+          "## 2026-09-06T05:10Z selfcheck red\nthe orch shell's CC_SLACK_ALIAS turned cc-slack selfcheck H8 red; not a main regression.\n\n"
+          "## 2026-09-10T23:30Z token\nhe typed the token's scope list earlier: repo, workflow. Not verified against the token.\n\n"
+          "## 2026-09-11T00:00Z leak\na line that must never be indexed ghp_" + "A" * 36 + "\n")
+        w(".cc/state/r1/goals.md", "# goals\n\n## curb spend\nfewest wake-ups.\n")
+        w(".cc/state/r1/secrets.md", "# secrets\nnever read: xox-fake\n")
+        w("dev/r1/docs/design-x.md", "# design x\n\n## 6. Decisions for the owner\n1. Spend tile: number and label trace to ONE source.\n\n"
+          "## Notes\nprose.\n")
+        w("dev/r1/CLAUDE.md", "# r1\n- curb spend first.\n")
+        w("WORKING.md", "# working\n\n## the reading procedure\nask before you claim.\n")
+        w(".claude/projects/-x-dev-r1/memory/verify-figures.md", "---\nname: verify-figures\ndescription: a figure whose number and label come "
+          "from two tools is a bug; check at the hour the bases differ\nmetadata:\n  type: feedback\n---\n\nverify figures at the boundary (owner 09-08).\n")
+        w(".claude/projects/-x-dev-r1/memory/fetch-head.md", "---\nname: fetch-head\ndescription: never git fetch in the shared checkout; "
+          "FETCH_HEAD is per-worktree and cc-land read it\nmetadata:\n  type: feedback\n---\n\nfetch from a linked worktree.\n")
+        w(".claude/projects/-x-dev-r1/memory/green-log.md", "---\nname: green-log\ndescription: the shared /tmp/green.log collides across "
+          "workers; trust cc-green status\nmetadata:\n  type: feedback\n---\n\nread /proc/<pid>/fd/1.\n")
+        w(".claude/projects/-x-dev-r1/memory/token-scope.md", "---\nname: token-scope\ndescription: a public-repo read proves nothing about a "
+          "PAT's scope; probe a private repo\nmetadata:\n  type: feedback\n---\n\ncost a retraction.\n")
+        w(".claude/projects/-x-dev-r1/memory/dup.md", "---\nname: dup\ndescription: never git fetch in the shared checkout; "
+          "FETCH_HEAD is per-worktree and the lander read it\nmetadata:\n  type: project\n---\n\nfetch from a linked worktree.\n")
+        w(".cc/state/land/root/r1-390.json", json.dumps({"first": "2026-09-08T10:00:00Z", "repo": "r1", "pr": 390, "at": "2026-09-08T10:07:00Z",
+                                                          "reviews": 1, "wall": {"head": "09dd584c561e9e18d3025a8db244809f9d5b776a", "cap": "$3/40t", "cost": "$2.10", "turns": 9, "hit": "-"}, "asked": 1}))
+        w(".cc/state/land/root/r1-36.json", json.dumps({"first": "2026-09-08T01:10:00Z", "repo": "r1", "pr": 36, "at": "2026-09-08T01:14:00Z", "reviews": 1,
+                                                         "verdict": "DO-NOT-LAND", "asked": 0}))
+        w(".cc/state/land/r1-320.json", json.dumps({"repo": "r1", "pr": 320, "stage": "gates", "attempts": 1, "rc": 1, "queued_at": "2026-09-07T20:00:00Z", "who": "cc done", "by": "pid 1"}))
+        w(".cc/state/land/queue.log", "2026-09-07T20:00:00Z\tqueued r1#320 who=- by=x\n2026-09-07T20:09:00Z\tdone r1#320 rc=1 NOT merged — gate red\n"
+          "2026-09-08T10:07:00Z\tdone r1#390 rc=0 landed\nnot an event line\n")
+
+        # ---- the index
+        rc, out = run("index")
+        ok("index builds and reports its measurements", rc == 0 and "sources" in out and "index/text" in out)
+        c = db()
+        ok("the secret-named file under state/ is excluded, never opened",
+           not c.execute("SELECT 1 FROM sources WHERE path LIKE '%secrets.md'").fetchone() and "excluded 1" in out
+           and c.execute("SELECT 1 FROM sources WHERE path LIKE '%token-scope.md'").fetchone())
+        ok("a record carrying a token shape is refused, not stored, and the refusal is counted",
+           not c.execute("SELECT 1 FROM records WHERE text LIKE '%ghp_%'").fetchone() and "refused 1" in out)
+        ok("a board named _cctest is not a registry entry",
+           not c.execute("SELECT 1 FROM records WHERE track='ghost'").fetchone())
+        nsp = c.execute("SELECT COUNT(*) FROM records WHERE title LIKE '%newest' AND part>0").fetchone()[0]
+        first = c.execute("SELECT next, prev FROM records WHERE title LIKE '%newest' AND part=0").fetchone()
+        ok("a long entry is split at paragraphs into linked spans under 6 KiB",
+           nsp >= 2 and first and first[0] and not first[1]
+           and all(len(t.encode()) <= SPAN for (t,) in c.execute("SELECT text FROM records")))
+        ok("kinds are derived from the store: journal → checkpoint, feedback memory → decision, heading 'Decisions' → decision, "
+           "board row → event, note → note, landing tally → finding",
+           set(k for (k,) in c.execute("SELECT DISTINCT kind FROM records")) >= {"checkpoint", "decision", "event", "note", "finding", "document"}
+           and c.execute("SELECT kind FROM records WHERE title LIKE '%Decisions%'").fetchone()[0] == "decision")
+        ok("exact ids live in their own column: a SHA prefix and repo#pr find the landing record",
+           by_ids(c, {"09dd584"}, skind="land-root") and by_ids(c, {"r1#390"}, skind="land-root"))
+        c.close()
+
+        # ---- the three worked misses, inside their caps, each with a citation
+        rc, o1 = run("ask", "--object", "site", "--need", "current", "--cap", "4096", "is the site still waiting for approval")
+        ok("miss 1 (site waiting?): board row + newest note + resolved journal, in 4 KiB, cited, and it says live state was not probed",
+           rc == 0 and len(o1.encode()) <= 4096 and "status=parked" in o1 and "owner has used the site" in o1
+           and "site-handover.md (exists; absent: ~/.cc/state/r1/site/progress.md, ~/.cc/state/r1/site-handoff.md)" in o1
+           and "↳" in o1 and "CURRENT:" in o1 and outcome(o1) == "answered")
+        ok("…and every record shown keeps its citation: the cap cuts text, never the ↳ line, and the tail is whole",
+           len(re.findall(r"^  \[", o1, re.M)) == len(re.findall(r"^    ↳ ", o1, re.M)) and o1.rstrip().split("\n")[-1].startswith("OUTCOME ")
+           and o1.rstrip().split("\n")[-3].startswith("COVERAGE "))
+        rc, o7 = run("ask", "--object", "#390", "--need", "current", "--cap", "2048", "buy another review")
+        ok("miss 7 (buy another review for #390?): the landing tally answers in 2 KiB — reviews=1, its head and time, cited",
+           rc == 0 and len(o7.encode()) <= 2048 and "reviews=1" in o7 and "head=09dd584c561e" in o7 and "land/root/r1-390.json" in o7
+           and outcome(o7) == "answered")
+        rc, o15 = run("ask", "--object", "r1/site", "--need", "history", "--cap", "8192")
+        ok("miss 15 (which journal does the successor read?): the legacy -handover.md is resolved and its newest entry returned, "
+           "the absent names listed, in 8 KiB",
+           rc == 0 and len(o15.encode()) <= 8192 and "site-handover.md (exists" in o15 and "nothing is left of the row" in o15
+           and "cc-lib get" in o15 and outcome(o15) == "answered")
+        rc, o15b = run("ask", "--object", "r1/nobody", "--need", "history")
+        ok("…and a row with no journal and no board row is an explicit state naming every path tried, never 'none' as fact",
+           "journal: none at ~/.cc/state/r1/nobody/progress.md, ~/.cc/state/r1/nobody-handoff.md, ~/.cc/state/r1/nobody-handover.md" in o15b
+           and "board row: none named nobody" in o15b and outcome(o15b) == "not-recorded")
+
+        # ---- the other twelve, as the library sees them
+        rc, o = run("ask", "--need", "current", "does the token reach every private repo")
+        ok("miss 2 (token reach): the rule is found (a decision), and the current caveat says the token itself was not probed",
+           "public-repo read proves nothing" in o and "CURRENT:" in o and outcome(o) in ("answered", "partial"))
+        rc, o = run("ask", "--need", "current", "--repo", "r1", "which scopes does the token have")
+        ok("miss 3 (token scopes): what exists is a journal line that says the list was typed and not verified — returned as a "
+           "checkpoint with its stamp, not as the object", "[checkpoint 2026-09-10T23:30Z]" in o and "Not verified" in o)
+        rc, o = run("ask", "--object", "r1#36", "--need", "history", "when was it reviewed")
+        ok("miss 4 (#36 incident): the review's own time comes off the landing record", "at=2026-09-08T01:14:00Z" in o and "DO-NOT-LAND" in o)
+        rc, o = run("ask", "--need", "decision", "dashboard tile number and label source")
+        ok("miss 5 (tile sources): the owner's rule outranks prose — the decision is the first hit",
+           re.search(r"HITS.*\n  \[decision", o) is not None)
+        rc, o = run("ask", "--object", "t1", "--need", "current", "--cap", "4096")
+        ok("miss 6 (stale 'waiting until 17:10Z'): the newest journal entry and `now` are both in the packet",
+           "worker restarted" in o and "· now 20" in o and "waiting until 17:10Z" in o)
+        rc, o = run("ask", "--need", "decision", "git fetch shared checkout FETCH_HEAD")
+        ok("miss 8 (FETCH_HEAD): the rule is found and its copy collapses into one hit with provenance",
+           "FETCH_HEAD is per-worktree" in o and "also:" in o)
+        rc, o = run("ask", "--need", "aggregate", "per-attempt timing of the suite, 9630 seconds")
+        ok("miss 9 (2.7 h gate): no source holds per-attempt timing — not recorded, never a number",
+           outcome(o) == "not-recorded" and "not recorded" in o and "9630" not in o.split("OUTCOME")[0].split("\n", 1)[1])
+        rc, o = run("ask", "--need", "history", "gate red unicorn")
+        ok("a query only the any-word phase matches is labelled a lead, not an answer, and the outcome is partial",
+           "any word" in o and outcome(o) == "partial")
+        rc, o = run("ask", "--need", "decision", "which log does cc-green write")
+        ok("miss 10 (green log): the rule is found", "cc-green status" in o)
+        rc, o = run("ask", "--need", "history", "selfcheck red CC_SLACK_ALIAS")
+        ok("miss 11 (red selfcheck): the journal entry that settled it is found", "not a main regression" in o)
+        rc, o = run("ask", "--object", "orch-x", "--need", "current", "context percent")
+        ok("miss 12 (orch at 72%?): a live figure is not a record — the row is returned and the caveat says probe, nothing invents a percent",
+           "row orch-x" in o and "CURRENT:" in o and "72" not in o)
+        rc, o = run("ask", "--object", "#323", "--need", "history")
+        ok("miss 13 (#323 stale ref): the journal entry naming the PR is found by id", "refs/pull/323/head" in o)
+        rc, o = run("ask", "--object", "#320", "--need", "current", "--cap", "4096")
+        ok("miss 14 (#320 landed?): the landing job says stage=gates rc=1 and the queue says NOT merged; nothing says landed",
+           "stage=gates" in o and "NOT merged" in o and "rc=0 landed" not in o)
+        rc, o = run("ask", "unicorn migration to the moon")
+        ok("an unanswerable question is 'not recorded in the covered scope' with coverage, outcome not-recorded",
+           outcome(o) == "not-recorded" and "COVERAGE sources" in o and "not recorded" in o)
+        rc, o = run("ask", "--cap", "1200", "--need", "history", "--repo", "r1", "site handover journal")
+        ok("the byte cap is the rule: a 1200-byte packet is at most 1200 bytes and says how to get the rest",
+           len(o.encode()) <= 1200 and ("cc-lib get" in o or "cap reached" in o))
+
+        # ---- the ticket: one line per call, scope/bytes/turns/time/outcome, no query text; a spent ticket refuses
+        T = re.search(r"ticket (T\d{8}T\d{6}-[0-9a-f]{4})", o1).group(1)
+        lines = [l.split("\t") for l in open(ticketlog()).read().splitlines()]
+        mine = [l for l in lines if l[1] == T]
+        ok("a ticket line per question: ts, ticket, turn, cmd, scope, need, object, bytes, ms, outcome — and the bytes are the packet's",
+           len(mine) == 1 and mine[0][3] == "ask" and mine[0][5] == "current" and mine[0][6] == "site"
+           and int(mine[0][7]) == len(o1.encode()) and mine[0][9] == "answered" and len(mine[0]) == 10)
+        ok("the query text stays out of the ticket log", "approval" not in open(ticketlog()).read())
+        rid = re.search(r"↳ (\S+)", o15).group(1)
+        rc, g = run("get", rid, "--ticket", T)
+        ok("get returns one page by id, cited, charged to the ticket as turn 2",
+           rc == 0 and "cc-lib get " + rid in g and "↳" in g and ticket_used(T)[1] == 2)
+        for _ in range(3):
+            ticket_write(T, 9, "get", "r1", None, rid, 8192, 1, "answered")
+        rc, g = run("get", rid, "--ticket", T)
+        ok("a spent ticket refuses further output (rc 3) and logs the refusal", rc == 3 and ticket_used(T)[1] == 6
+           and lines_with(T, "refused"))
+        rc, g = run("get", "nope:0")
+        ok("a record id the index does not hold is rc 1 and says so", rc == 1)
+
+        # ---- staleness: a source that changed is re-read on the next ask; one that vanished is dropped
+        c = db()
+        rid0 = c.execute("SELECT rid FROM records WHERE text LIKE '%iter 1%started.'").fetchone()[0]
+        c.close()
+        time.sleep(0.02)
+        p = w(".cc/state/r1/t1/progress.md", "## 2026-09-08T08:00Z iter 1\nstarted.\n\n## 2026-09-08T09:30Z iter 2\nworker restarted after "
+              "the rate-limit stall; the earlier 'waiting until 17:10Z' line is stale.\n\n## 2026-09-08T11:00Z iter 3\nDONE: gates green.\n")
+        os.utime(p, (time.time() + 2, time.time() + 2))
+        rc, o = run("ask", "--object", "r1/t1", "--need", "current")
+        ok("a changed journal is re-read inside ask's reconcile budget: the newest entry is the new one", "DONE: gates green" in o)
+        c = db()
+        ok("…at record grain: the unchanged entries kept their ids (a `get` after the re-index still works); only the new one was inserted",
+           c.execute("SELECT COUNT(*) FROM records r JOIN sources s ON s.id=r.source_id WHERE s.path=?", (p,)).fetchone()[0] == 3
+           and c.execute("SELECT rid FROM records WHERE text LIKE '%iter 1%started.'").fetchone()[0] == rid0)
+        c.close()
+        # a kept record whose TITLE changed (a memory's description edited, its body untouched — so its text hash, the
+        # record's identity, is the same): the FTS row must follow the title, or the new words are "not recorded"
+        c = db()
+        mid = c.execute("SELECT id FROM records WHERE title LIKE 'a figure whose number and label%'").fetchone()[0]
+        c.close()
+        p = w(".claude/projects/-x-dev-r1/memory/verify-figures.md", "---\nname: verify-figures\ndescription: a figure whose number and "
+              "caption come from two tools is a bug; check at the hour the bases differ (the zebrafish rule)\nmetadata:\n  type: feedback\n"
+              "---\n\nverify figures at the boundary (owner 09-08).\n")
+        os.utime(p, (time.time() + 2, time.time() + 2))
+        rc, o = run("ask", "zebrafish rule")
+        c = db()
+        row = c.execute("SELECT id, title FROM records WHERE title LIKE '%zebrafish%'").fetchone()
+        ok("a memory whose description changed under an unchanged body is found by its new words, on the same record id",
+           "zebrafish" in o and row is not None and row[0] == mid)
+        ok("…and the FTS row followed the title: the new word is indexed on that rowid, the word that left it is not",
+           c.execute("SELECT COUNT(*) FROM fts WHERE fts MATCH 'zebrafish' AND rowid=?", (mid,)).fetchone()[0] == 1
+           and c.execute("SELECT COUNT(*) FROM fts WHERE fts MATCH 'label' AND rowid=?", (mid,)).fetchone()[0] == 0)
+        c.close()
+        os.remove(os.path.join(th, ".cc/state/land/r1-320.json"))
+        rc, o = run("ask", "--object", "#320", "--need", "current")
+        ok("a source that vanished is dropped from the index, not answered from", "stage=gates" not in o and "NOT merged" in o)
+        # unreadable: a board that does not parse is named, not skipped in silence
+        w(".cc/boards/r2.json", "{not json")
+        rc, o = run("index")
+        ok("a source that cannot be read is named in the report and in coverage", "unreadable 1" in o and "r2.json" in o)
+        rc, o = run("ask", "anything at all r2")
+        ok("…and every ask carries it in COVERAGE", "unreadable 1" in o)
+    finally:
+        H = H0
+        shutil.rmtree(th, ignore_errors=True)
+    print(f"cc-lib selfcheck: {n[0]} passed, {n[1]} failed")
+    return 1 if n[1] else 0
+
+
+def lines_with(T, outcome):
+    try:
+        return any(l.split("\t")[1] == T and l.rstrip("\n").split("\t")[-1] == outcome for l in open(ticketlog()))
+    except OSError:
+        return False
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "selfcheck":
+        return selfcheck()
+    if not fts5_available():
+        print("cc-lib: this Python's sqlite3 has no FTS5 — nothing here can run", file=sys.stderr)
+        return 2
+    if cmd == "ask":
+        return ask(rest)
+    if cmd == "get":
+        return get(rest)
+    if cmd == "index":
+        return index(rest)
+    if cmd == "bench":
+        return bench(rest)
+    print("usage: cc-lib ask|get|index|bench|selfcheck (cc-lib --help for the contract)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        os._exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
