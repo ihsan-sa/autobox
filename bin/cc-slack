@@ -2201,14 +2201,18 @@ AWAY_GRACE = 60                                # …and how long the 1 s dashboa
 LOOKUP_RETRY_AFTER = 2.0                       # …and how long that call (and the chart upload) waits before its ONE retry of a failed name lookup
 HOME_LEDGER = 1 << 18                          # bytes of cc-context's handoff ledger the dashboard reads (its tail)
 HOME_SLOW = 600                                # the only two inputs that cost a network call (channel list, PR states)
-HOME_MAXBLK, HOME_MAXTEXT = 18, 2900           # OUR budget for one published view (Slack allows 100 blocks and 3000 chars a
-                                               # text): a Home tab that has to be scrolled has already lost its five-second
-                                               # glance. The tab is 15 blocks busy, 13 quiet, 14 degraded, 16 with a
-                                               # handoff line — a ceiling a real board stays UNDER, not one it sits on.
-                                               # Note what does NOT grow it: the whole backlog, every ❓ and every
-                                               # channel are one section block each however long they get, so showing
-                                               # all of all three costs 0 blocks. What DID cost two is the channels
-                                               # band now rendering when nothing in it is busy (quiet, degraded).
+HOME_MAXBLK, HOME_MAXTEXT = 32, 2900           # OUR budget for one published view (Slack allows 100 blocks and 3000 chars a
+                                               # text). The LISTS do not grow it: the whole backlog, every ❓ and every
+                                               # channel are one section block each however long they get. So the tab has
+                                               # a ceiling of its own — every band lit at once, 32 blocks — and this is
+                                               # that ceiling: a band is dropped only when a band is ADDED (selfcheck
+                                               # asserts the whole-tab fixture fits, so adding one goes red and the
+                                               # budget is raised on purpose). It was 18, from when the tab was 15 blocks
+                                               # busy and 13 quiet; on 2026-09-11 a live tab built 26 and home_cut spent
+                                               # the difference on EIGHT bands, the channel roll among them, two weeks
+                                               # after the owner asked for every channel by name. The five-second glance
+                                               # is the FOLD's job (home_parts 5), not this number's — nothing above the
+                                               # fold moved, and the bands below it are scrolled to by design.
 HOME_MARKS = ("❓", "🔴", "🔧")                 # the channel rows count only live threads: needs you · owed · working (🟠/✅ are history)
 # ── THE CHART ON THE TAB (owner, a18/a20: "a graph of system resources … one chart with everything", ON THE HOME
 #    PAGE). cc-vitals draws it; everything here is about getting a LOCAL PNG onto a view Slack renders.
@@ -2967,8 +2971,11 @@ def home_parts(st):
     rows = [f"🔴 *{n} down*" + (f" · {h}" if h else "") for n, ok, h in units if not ok]
     if limit:
         rows.append(f"⛔ *Usage limit* · no runs until {until}")
-    if st.get("tier"):                                       # the spend tier when it is not autonomous (home_tier): he set
-        rows.append(f"🪫 *{st['tier']}*")                     # it, and this is where he reads that it still holds
+    if st.get("tier"):                                       # the spend tier, at EVERY tier (home_tier): 🪫 the box is
+        rows.append(f"{'🔋' if st.get('spend_tier') == 'autonomous' else '🪫'} *{st['tier']}*")   # holding spend back, 🔋
+                                                             # it is not. Autonomous printed no row at all, so the owner
+                                                             # opened the tab at the tier the box actually runs at and
+                                                             # read nothing (2026-09-11: "i dont see the current mode").
     rows += [home_fit(f"🏃 *{names.get(t.get('name'), '?')}*",           # the row's `PR #n` bit opens the PR (2026-09-01)
                       [home_link(b, (t.get("pr") or {}).get("url")) if b == f"PR #{(t.get('pr') or {}).get('num')}" else b
                        for b in (t.get("detail") or "").split(" · ")]) for t in run]
@@ -3258,15 +3265,16 @@ def home_unit_hint(unit):
 
 
 def home_tier():
-    """(the tier, one word; its 🪫 row) — `cc-tier` for the word, always, so ~/.cc/state/home.json carries `spend_tier`
-    for the dashboard site (owner, 2026-09-11: the tier is read on Home AND on the dashboards); `cc-tier line` for the
-    row only when the tier is not autonomous — the default gets no row, like no limit. cc-tier owns the words; a box
-    that cannot answer gives ("", "") rather than a guess."""
+    """(the tier, one word; its row) — `cc-tier` for the word, so ~/.cc/state/home.json carries `spend_tier` for the
+    dashboard site, and `cc-tier line` for the row, BOTH at every tier (owner, 2026-09-11: the tier is read on Home AND
+    on the dashboards). Autonomous used to get no row, like no limit — and autonomous is the tier the box runs at, so
+    the one thing he asked to see was the one thing neither page said. cc-tier owns the words; a box that cannot answer
+    gives ("", "") rather than a guess."""
     try:
         r = EFFECTS.run([f"{BIN}/cc-tier"], capture_output=True, text=True, timeout=5)
         word = r.stdout.strip() if r.returncode == 0 else ""
-        if not word or word == "autonomous":
-            return word, ""
+        if not word:
+            return "", ""
         r = EFFECTS.run([f"{BIN}/cc-tier", "line"], capture_output=True, text=True, timeout=5)
         return word, (r.stdout.strip() if r.returncode == 0 else "")
     except Exception:
@@ -13883,28 +13891,35 @@ def cmd_selfcheck():
           and hdeg[3]["elements"][0]["style"] == "danger"
           and "units: tmux-main ok · audit ok · cc-slackd 🔴 · last boot 01:41 (power cut)" in dtxt
           and hno_empty_header(hdeg, limited=True) and hbudget(hdeg) and hvocab(hdeg))
-    # THE SPEND TIER: one row under the tally when it is not autonomous, sorted with the box's impairments above
-    # whatever is running; autonomous (the default) is no row at all — the reference tab above has none.
-    htier = home_blocks(dict(hfix, tier="spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start, one at a time, cheapest model, one review each"))
-    check("home_blocks (c') the spend tier, when set, is one 🪫 row above the running rows, in cc-tier's words — and "
-          "the reference tab, with none, is unchanged",
-          hfix.get("tier") is None and "🪫" not in json.dumps(home_blocks(hfix), ensure_ascii=False)
-          and any(b.get("type") == "section" and (b.get("text") or {}).get("text", "").startswith(
-              "🪫 *spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start") for b in htier)
-          and hbudget(htier) and hvocab(htier))
-    # …and home_tier, the input behind it: the word always (home.json's `spend_tier`, the dashboard's field), the row only
-    # off the default, and a cc-tier that cannot answer is neither — never a guessed tier.
+    # THE SPEND TIER: one row under the tally at EVERY tier, in cc-tier's words, sorted with the box's impairments
+    # above whatever is running. 🪫 while the box is holding spend back, 🔋 at autonomous — which used to print no row
+    # at all, so the owner opened the tab at the tier the box actually runs at and read nothing about it (2026-09-11:
+    # "i dont see the current mode on the home page or the dashboard").
+    htier = home_blocks(dict(hfix, spend_tier="essential", tier="spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start, one at a time, cheapest model, one review each"))
+    hauto = home_blocks(dict(hfix, spend_tier="autonomous", tier="spend tier: autonomous — discovers, fixes and explores"))
+    hrow = lambda bs, mark: any(b.get("type") == "section" and (b.get("text") or {}).get("text", "").startswith(mark) for b in bs)
+    check("home_blocks (c') the spend tier is one row above the running rows at EVERY tier, in cc-tier's words — 🪫 "
+          "while the box is holding spend back, 🔋 at autonomous, which used to print nothing at all; a state carrying "
+          "no tier (cc-tier could not answer) still prints no row, and the reference tab has none",
+          hfix.get("tier") is None and not hrow(home_blocks(hfix), "🪫") and not hrow(home_blocks(hfix), "🔋")
+          and hrow(htier, "🪫 *spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start")
+          and hrow(hauto, "🔋 *spend tier: autonomous — discovers, fixes and explores")
+          and hbudget(htier) and hvocab(htier) and hbudget(hauto) and hvocab(hauto))
+    # …and home_tier, the input behind it: the word AND cc-tier's line at every tier (home.json's `spend_tier` is the
+    # dashboard's field), and a cc-tier that cannot answer is neither — never a guessed tier.
     _runt = EFFECTS.run_impl
     try:
-        tsay = {"essential": "spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start"}
+        tsay = {"essential": "spend tier: essential (since 2026-09-11T05:00:00Z) — only critical rows start",
+                "autonomous": "spend tier: autonomous — discovers, fixes and explores"}
         tier_run = lambda word, rc=0: (lambda cmd, **kw: types.SimpleNamespace(
             returncode=rc, stdout=(word if str(cmd[-1]).endswith("cc-tier") else tsay.get(word, "")) + "\n", stderr=""))
         EFFECTS.run_impl = tier_run("essential"); tess = home_tier()
         EFFECTS.run_impl = tier_run("autonomous"); tauto = home_tier()
         EFFECTS.run_impl = tier_run("essential", 2); tbroken = home_tier()
-        check("home_tier: essential is the word and cc-tier's line, autonomous is the word and no row, and a cc-tier that "
-              "cannot answer is (\"\", \"\")",
-              tess == ("essential", tsay["essential"]) and tauto == ("autonomous", "") and tbroken == ("", ""))
+        check("home_tier: EVERY tier is the word and cc-tier's own line — autonomous included, so the tab has a row to "
+              "draw at the tier the box runs at — and a cc-tier that cannot answer is (\"\", \"\"), never a guess",
+              tess == ("essential", tsay["essential"]) and tauto == ("autonomous", tsay["autonomous"])
+              and tbroken == ("", ""))
     finally:
         EFFECTS.run_impl = _runt
     hover = home_blocks(dict(hfix, waits=[{"ch": f"c{i}", "age": 60 * (i + 1), "ask": f"ask {i}"} for i in range(4)],
@@ -14049,6 +14064,32 @@ def cmd_selfcheck():
           and "views" not in hcut(8)
           and all(t in hcut(8) for t in ("head", "tally", "needs", "actions")) and len(hcut(8)) == 8
           and all(t in hcut(6) for t in ("head", "tally", "needs")))
+    # …and THE BUDGET IS THE WHOLE TAB, so that order is a last resort and not a thing spent on every publish. Every
+    # band is a fixed one or two blocks however long its list gets (the whole backlog, every ❓, every channel are one
+    # section each), so the tab has a ceiling of its own — every band lit at once — and HOME_MAXBLK is that ceiling.
+    # What the owner saw on 2026-09-11 was a number nobody had raised since the tab was smaller: a live tab built 26
+    # blocks against a budget of 18 and the cut spent the difference on EIGHT bands, the channel roll among them, two
+    # weeks after he asked for every channel by name ("the list of all the channels is off the homepage"). Add a band
+    # and this case goes red — raise the budget on purpose rather than letting §01d quietly drop one he asked for.
+    hfull = dict(hfix, spend_tier="essential", tier="spend tier: essential — only critical rows start",
+                 tracks=list(hfix["tracks"]) + [{"state": "idle", "name": "abox/notes", "detail": "idle 2h", "rank": 3}],
+                 suborchs=[{"repo": "abox", "alias": "carpet"}], subagents=[{"target": "abox", "task": "fix the band"}],
+                 landings=[{"repo": "abox", "pr": "9", "stage": "queued"}],
+                 sessions=[{"repo": "abox", "name": "help", "live": True, "ask": ""}],
+                 revisit=[{"text": "move the lessons site?", "channel": "#beta", "age": "3d", "link": "https://x/y"}],
+                 chart={"file": "F1", "drawn": time.time(), "covers": "vitals · last 24h", "alt": "one chart"},
+                 graphs={"url": "http://127.0.0.1:5190", "up": True},
+                 handoffs={"today": 2, "when": "05:00", "who": "main"},
+                 spend={"today": 6.75, "week": 16.75, "rows": [{"who": "abox/t", "usd": 6.5, "tok": "1.0M"}],
+                        "unattributed": 0.25, "phantoms": ["nobody watching · 1 h"]})
+    hfp = [t for t, _ in home_parts(hfull)]
+    hfb = home_blocks(hfull)
+    check("home_cut: with EVERY band lit at once NOTHING is cut — the tab's own ceiling fits inside HOME_MAXBLK, so "
+          "every band the owner asked for by name (all the channels, the whole backlog, the tier) is on the tab he "
+          "opens, and a band that goes missing means a band was ADDED and the budget was not raised with it",
+          len(hfp) <= HOME_MAXBLK and [t for t, _ in home_cut(home_parts(hfull), HOME_MAXBLK)] == hfp
+          and len(hfb) == len(hfp) and {"channels", "backlog", "revisit", "sessions", "spend"} <= set(hfp)
+          and hbudget(hfb) and hno_empty_header(hfb) and hvocab(hfb))
     # ── THE CHART ON THE TAB (owner a18/a20: "a graph of system resources … on the main home page"). Two blocks, below
     #    the fold, sitting on top of the `load` line that says the same numbers in words.
     hchart = {"file": "F1", "drawn": 1000.0, "covers": "vitals · last 24h · 118 of 1440 minutes recorded",

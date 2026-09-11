@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""cc-failures — the box's failure ledger, apart from the board: one JSON line per failure, counted on read.
+Design: docs/design-failure-noticing-2026-09-11.md (The failures board, The rule). Nothing here launches, queues,
+proposes or posts: the ledger is written, counted and rendered, no more.
+
+usage: cc-failures record --scope S --kind CONTRACT/SYMPTOM --observed TEXT [--expected TEXT] [--evidence TEXT]...
+                          [--detector box|person|unknown] [--detector-evidence TEXT] [--writer W] [--cost k=v]...
+                          [--link k=v]... [--critical REASON] [--status confirmed|asserted|refuted] [--ts UTC]
+                          [--corrects ID]
+       cc-failures show [--scope S] [--as-of UTC] [--all] [ID]   (--json: the records, corrections folded in)
+       cc-failures eligible [--scope S] [--as-of UTC]
+       cc-failures metrics [FIXTURE] [--scope S]        (the shipped one: tests/failures-fixture.jsonl)
+       cc-failures import REPO [--dry]
+       cc-failures kinds
+       cc-failures board REPO [--as-of UTC]                 (what `cc board failures REPO` runs)
+       cc-failures selfcheck
+
+THE LEDGER is ~/.cc/failures/<scope>.jsonl (CC_FAILURES points it elsewhere; a test run keeps out of the box's own),
+append-only, one line per record, written under a lock. Records are immutable; a correction is a record of its
+own (`record --corrects ID --status refuted|confirmed`) and every read folds the latest one in. Clusters and counts
+are computed on read, never stored.
+
+THE RECORD: ts (when it happened, UTC), filed (when it was written), scope, kind, fingerprint (`v1|<scope>|<kind>`)
+and its id `c-<hash>`, expected, observed, evidence (paths, refs, excerpts), detector ({who: box|person|unknown,
+evidence}), writer, cost (a list; unknown stays unknown, never summed), links (row, pr, thread, journal, source,
+episode), status (confirmed|asserted|refuted), critical (a reason from the catalogue, or empty).
+
+THE KIND is `<contract>/<symptom>`: the broken contract and what was seen, never the guessed cause. The catalogue
+is config/failure-kinds.json beside this bin (`kinds` prints it); a kind not in it is accepted and said, so the
+catalogue grows by use — but a typo splits a cluster, so read `kinds` first.
+
+THE RULE (arithmetic, evaluated on read, `--as-of` replays it at another time):
+    eligible = a critical record in the last 14 days
+            OR distinct confirmed episodes of the fingerprint in the last 14 days >= 3
+An episode is a run of records of one fingerprint closer than 30 minutes to each other: the same failure written
+twice in a minute is one episode. A refuted record counts nowhere; an asserted one (a candidate) counts nowhere
+until confirmed. After fourteen quiet days a cluster leaves the active view (`--all` shows it); its records stay.
+
+PERSON-FIRST: `--detector person` writes the record AND a `failure-detection/person-first` record beside it,
+critical, linked by `links.episode` — a person catching a failure the box did not record is critical every time,
+and the gap is a failure of its own that stays out of the failure count.
+
+IMPORT reads a board (through cc-board, never the file) and the briefs under CC_STATE: every `raised-` row is a
+record at its filing time; every note or brief line marked INSTANCE (the word, singular) is a record at the time it states (
+`2026-09-07 19:0xZ`, `17:2xZ`, `17:12 PDT`; none stated: the note's time), filed at the note's time; "again" in a
+note is a lead, not a count. A row files under the first catalogue kind whose `match` regex hits its name, else
+under its own family `board-row/<row>`. Idempotent on links.source. The rows stay the work they are.
+
+METRICS with no argument reads the ledger: records, clusters, eligible, recording delay (filed − ts, minutes),
+the unknown-detector and person-first shares. With a labelled fixture (JSONL: label, row, text, filed, ts) it runs
+the import's own classifier and time parser over each line and prints the false-match rate (pairs grouped
+together whose labels differ), the false-split rate (pairs of one label grouped apart), the share of stated times
+recovered, and the recording delay."""
+import sys, os, re, json, fcntl, hashlib, datetime, subprocess, statistics, tempfile, shutil
+
+B = os.path.dirname(os.path.realpath(__file__))
+DIR = os.environ.get("CC_FAILURES") or os.path.expanduser("~/.cc/failures")
+STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")
+CATALOGUE = os.path.join(B, "..", "config", "failure-kinds.json")
+FIXTURE = os.path.join(B, "..", "tests", "failures-fixture.jsonl")   # the labelled fixture `metrics` is measured on
+WINDOW_DAYS = 14          # "in the last 14 days"
+EPISODES_NEEDED = 3       # "three distinct episodes"
+EPISODE_GAP_MIN = 30      # records of one fingerprint closer than this are one episode
+STATUSES = ("confirmed", "asserted", "refuted")
+DETECTORS = ("box", "person", "unknown")
+GAP_KIND = "failure-detection/person-first"
+FP_VERSION = "v1"
+
+def die(msg, rc=2):
+    print(f"cc-failures: {msg}", file=sys.stderr); sys.exit(rc)
+def utc(dt): return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+def now_dt(): return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+def parse_ts(s):
+    """`2026-09-11T17:20Z`, `2026-09-11T17:20:00Z`, `2026-09-11 17:20` → aware UTC datetime; None when it is not one."""
+    if not s: return None
+    s = s.strip().replace(" ", "T")
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%MZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try: return datetime.datetime.strptime(s, fmt).replace(tzinfo=datetime.timezone.utc)
+        except ValueError: pass
+    return None
+
+def catalogue():
+    try:
+        with open(CATALOGUE) as f: return json.load(f)
+    except (OSError, ValueError) as e: die(f"catalogue {CATALOGUE}: {e}")
+
+def fingerprint(scope, kind): return f"{FP_VERSION}|{scope}|{kind}"
+def fpid(fp): return "c-" + hashlib.sha1(fp.encode()).hexdigest()[:8]
+
+# ---------------------------------------------------------------- the ledger: append under a lock, read and fold
+SCOPE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")   # a board's name; never a path
+def _path(scope):
+    if not SCOPE.match(scope): die(f"scope is a workspace or project name, got '{scope}'")
+    return os.path.join(DIR, f"{scope}.jsonl")
+def append(scope, rec):
+    os.makedirs(DIR, exist_ok=True)
+    line = json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with open(_path(scope), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(line); f.flush(); os.fsync(f.fileno())
+def scopes():
+    if not os.path.isdir(DIR): return []
+    return sorted(fn[:-6] for fn in os.listdir(DIR) if fn.endswith(".jsonl"))
+def load(scope=None):
+    """Every record, corrections folded in: a record with `corrects` sets the status of the record it names (the
+    latest correction wins) and is not itself a record. Unreadable lines are said on stderr and skipped."""
+    recs, corr = [], []
+    for s in ([scope] if scope else scopes()):
+        p = _path(s)
+        if not os.path.isfile(p): continue
+        with open(p) as f:
+            for n, line in enumerate(f, 1):
+                line = line.strip()
+                if not line: continue
+                try: r = json.loads(line)
+                except ValueError: print(f"cc-failures: {p}:{n}: not JSON, skipped", file=sys.stderr); continue
+                (corr if r.get("corrects") else recs).append(r)
+    by = {r["id"]: r for r in recs}
+    for c in sorted(corr, key=lambda c: c.get("ts", "")):
+        if c["corrects"] in by:
+            by[c["corrects"]]["status"] = c["status"]; by[c["corrects"]].setdefault("corrections", []).append(c["id"])
+    return recs
+
+def new_id(seed=None):
+    seed = seed or os.urandom(8).hex()
+    return "f-" + hashlib.sha1(seed.encode()).hexdigest()[:10]
+
+def add_record(scope, kind, observed, expected="", evidence=(), detector="unknown", detector_evidence="",
+               writer="session", cost=(), links=None, critical="", status="confirmed", ts=None, filed=None,
+               source=None, dry=False, corrects=None):
+    """One record, and — for a person-first one — its gap record beside it. Returns the ids written.
+    `corrects`: this line is a correction of that record (its new status is `status`), not a record of its own."""
+    cat = catalogue()
+    if "/" not in kind or kind.startswith("/") or kind.endswith("/"): die(f"kind is <contract>/<symptom>, got '{kind}'")
+    if detector not in DETECTORS: die(f"detector is one of {'|'.join(DETECTORS)}, got '{detector}'")
+    if status not in STATUSES: die(f"status is one of {'|'.join(STATUSES)}, got '{status}'")
+    if critical and critical not in cat["critical"]: die(f"critical is one of {'|'.join(cat['critical'])}, got '{critical}'")
+    if not observed.strip(): die("observed is empty: say what was seen")
+    if kind not in cat["kinds"] and not kind.startswith("board-row/"):
+        print(f"cc-failures: '{kind}' is not in the catalogue ({os.path.normpath(CATALOGUE)}); recorded as a kind of its own", file=sys.stderr)
+    ts = ts or now_dt(); filed = filed if filed is not None else now_dt()
+    fp = fingerprint(scope, kind)
+    rec = {"id": new_id(source), "ts": utc(ts), "filed": utc(filed) if filed else "", "scope": scope, "kind": kind,
+           "fingerprint": fp, "cluster": fpid(fp), "expected": expected, "observed": observed, "evidence": list(evidence),
+           "detector": {"who": detector, "evidence": detector_evidence}, "writer": writer, "cost": list(cost),
+           "links": dict(links or {}), "status": status, "critical": critical}
+    if source: rec["links"]["source"] = source
+    if corrects: rec["corrects"] = corrects
+    ids = [rec["id"]]
+    if not dry: append(scope, rec)
+    # "Every person-first episode is a record of its own, failure-detection/person-first, critical, and points at the
+    # original episode": written here, once, beside the episode — never for the gap record itself.
+    if detector == "person" and kind != GAP_KIND and not corrects:
+        gk = cat["kinds"].get(GAP_KIND, {})
+        gap = dict(rec); gap["id"] = new_id((source or rec["id"]) + "#gap"); gap["kind"] = GAP_KIND
+        gap["fingerprint"] = fingerprint(scope, GAP_KIND); gap["cluster"] = fpid(gap["fingerprint"])
+        gap["expected"] = gk.get("contract", ""); gap["observed"] = f"a person found, not the box: {observed}"
+        gap["critical"] = "person-first"; gap["links"] = dict(rec["links"], episode=rec["id"])
+        if source: gap["links"]["source"] = source + "#gap"
+        ids.append(gap["id"])
+        if not dry: append(scope, gap)
+    return ids
+
+# ---------------------------------------------------------------- the count: episodes, clusters, the rule
+def episodes(recs):
+    """Records of ONE fingerprint → episodes: a new one starts when the gap from the previous record is over
+    EPISODE_GAP_MIN, compared at the minute the stamps are written to."""
+    out = []
+    for r in sorted(recs, key=lambda r: r["ts"]):
+        t = parse_ts(r["ts"]).replace(second=0)
+        if out and (t - out[-1][-1]).total_seconds() < EPISODE_GAP_MIN * 60: out[-1].append(t)   # closer than: 30 apart is a new one
+        else: out.append([t])
+    return out
+
+def clusters(recs, as_of=None):
+    """Group by fingerprint and apply the rule as of `as_of` (default now). Records after as_of are not seen."""
+    as_of = as_of or now_dt()
+    since = as_of - datetime.timedelta(days=WINDOW_DAYS)
+    by = {}
+    for r in recs:
+        if parse_ts(r["ts"]) is None or parse_ts(r["ts"]) > as_of: continue
+        by.setdefault(r["fingerprint"], []).append(r)
+    out = []
+    for fp, rs in by.items():
+        live = [r for r in rs if r.get("status") == "confirmed"]
+        recent = [r for r in live if parse_ts(r["ts"]) >= since]
+        crit = [r for r in recent if r.get("critical")]
+        eps = episodes(live); eps14 = [e for e in eps if e[-1] >= since.replace(second=0)]   # any record of it in the window
+        # THE RULE, verbatim: "eligible = critical OR distinct confirmed episodes of the fingerprint in the last 14 days >= 3"
+        why = f"critical: {crit[0]['critical']}" if crit else (f"{len(eps14)} episodes in {WINDOW_DAYS}d" if len(eps14) >= EPISODES_NEEDED else "")
+        stamps = sorted(r["ts"] for r in live) or sorted(r["ts"] for r in rs)
+        out.append({"id": fpid(fp), "fingerprint": fp, "scope": rs[0]["scope"], "kind": rs[0]["kind"],
+                    "records": len(rs), "confirmed": len(live), "episodes": len(eps), "episodes_14d": len(eps14),
+                    "critical": len(crit), "eligible": why, "active": bool(recent),
+                    "first": stamps[0] if stamps else "", "last": stamps[-1] if stamps else "",
+                    "person_first": sum(1 for r in live if r["detector"]["who"] == "person")})
+    out.sort(key=lambda c: (not c["eligible"], -c["episodes_14d"], c["kind"]))
+    return out
+
+def render(cl, all_=False, board=False):
+    shown = [c for c in cl if all_ or c["active"]]
+    if not cl: print("  (no failures recorded)"); return
+    if not shown: print(f"  ({len(cl)} quiet cluster(s), nothing in the last {WINDOW_DAYS} days — --all)"); return
+    for c in shown:
+        mark = "‼" if c["eligible"] else "·"
+        span = f"{c['first'][:16]}..{c['last'][:16]}" if c["first"] != c["last"] else c["first"][:16]
+        tail = f"  ELIGIBLE ({c['eligible']})" if c["eligible"] else ""
+        pf = f"  person-first:{c['person_first']}" if c["person_first"] else ""
+        print(f"  {mark} {c['id']}  {c['kind']}  {c['confirmed']} record(s), {c['episodes_14d']} episode(s) in {WINDOW_DAYS}d  {span}{pf}{tail}")
+    hid = len(cl) - len(shown)
+    if hid and not board: print(f"  ({hid} quiet cluster(s) — --all)")
+
+# ---------------------------------------------------------------- import: a board's raised- rows and INSTANCE lines
+# A stated time near the head of a note: `2026-09-07 19:0xZ`, `2026-09-09T04:46Z`, `17:2xZ`, `17:12 PDT`,
+# `19:0x–19:4xZ` (the first). `x` is a digit the writer did not know: floor to 0, the source's own resolution.
+STATED = re.compile(r"(?:(\d{4}-\d{2}-\d{2})[ T])?\b(\d{1,2}):(\d)(\d|x)(?::(\d{2}))?\s*(Z|UTC|PDT|PST)?", re.I)
+TZ = {"pdt": 7, "pst": 8, "utc": 0, "z": 0, "": 0}
+HEAD = 90   # how far into a note a stated time is looked for; later times ("again 00:59") are leads, not counts
+# The marker: INSTANCE as a word of its own (`INSTANCE 17:2xZ`, `THIRD INSTANCE,`). Not the plural — `MY 'FIVE
+# INSTANCES' COUNT IS WRONG` is a retraction — and not prose about "INSTANCE lines", which is a brief describing this.
+INSTANCE = re.compile(r"\bINSTANCE\b(?!\s+lines?\b)")
+def stated_time(text, filed):
+    """The time a note states → aware UTC datetime, or None. Dateless: the note's date, or the day before when the
+    time of day is over an hour after the filing (`23:3xZ` filed at 00:10Z)."""
+    m = STATED.search(text[:HEAD])
+    if not m: return None
+    date, hh, m1, m2, ss, tz = m.groups()
+    hh = int(hh)
+    if hh > 23: return None
+    mm = int(m1) * 10 + (0 if m2.lower() == "x" else int(m2))
+    base = filed if filed else now_dt()
+    d = datetime.datetime.strptime(date, "%Y-%m-%d").date() if date else base.date()
+    t = datetime.datetime(d.year, d.month, d.day, hh, mm, tzinfo=datetime.timezone.utc) + datetime.timedelta(hours=TZ[(tz or "").lower()])
+    if not date and filed and t > filed + datetime.timedelta(hours=1): t -= datetime.timedelta(days=1)
+    return t
+
+# Words that say a person DETECTED it. Not "the owner asked": an ask is what the box was doing when it failed,
+# not who saw the failure — `asked` marked four rows person-first that the box's own scripts had caught. Nor
+# "the owner would have found": a counterfactual is not a detection.
+PERSON = re.compile(r"\b(owner|a person|he)\b(?![^.;:]{0,40}\b(would|could|should|might)\b)[^.;:]{0,40}\b(noticed|caught|found|spotted|flagged|reported|pointed (at|out)|had to (notice|point|prompt|ask|catch|find))\b"
+                    r"|\b(the owner's|his) (prompt|nudge|report|correction)\b|\bperson[- ]first\b", re.I)
+def stated_detector(text):
+    """`person` when the words say a person caught it, with the phrase as the evidence; else unknown, said."""
+    m = PERSON.search(text)
+    return ("person", m.group(0)) if m else ("unknown", "the row does not say who caught it")
+
+def classify(row, cat):
+    """A board row's name → the first catalogue kind whose `match` regex hits, else the row's own family."""
+    name = row[len("raised-"):] if row.startswith("raised-") else row
+    for kind, k in cat["kinds"].items():
+        for pat in k.get("match", []):
+            if re.search(pat, name): return kind
+    return f"board-row/{row}"
+
+def board_json(repo):
+    p = subprocess.run([os.path.join(B, "cc-board"), "json", repo], capture_output=True, text=True)
+    if p.returncode != 0: die(f"cc-board json {repo}: {p.stderr.strip() or 'failed'}")
+    return json.loads(p.stdout)
+
+def import_board(repo, dry=False):
+    cat = catalogue(); d = board_json(repo)
+    have = {r["links"].get("source") for r in load(repo) if r.get("links")}
+    n = 0
+    def put(source, **kw):
+        nonlocal n
+        if source in have: return
+        ids = add_record(repo, source=source, writer="import", dry=dry, **kw); n += 1
+        print(f"  {'would write' if dry else 'wrote'} {ids[0]}  {kw['kind']}  {kw['ts'].strftime('%Y-%m-%dT%H:%MZ')}  {source}")
+    for row, t in sorted(d.get("tracks", {}).items()):
+        kind = classify(row, cat); links = {"row": f"{repo}/{row}"}
+        if t.get("pr"): links["pr"] = str(t["pr"])
+        brief_path = os.path.join(STATE, repo, row, "task.md")
+        try:
+            with open(brief_path) as f: brief = f.read()
+        except OSError: brief = ""
+        if row.startswith("raised-"):    # the row itself is a failure record, filed when it was added
+            created = parse_ts(t.get("created") or "") or parse_ts(t.get("updated") or "")
+            if created:
+                who, ev = stated_detector(t.get("title", "") + "\n" + brief)
+                put(f"board:{repo}/{row}", kind=kind, observed=t.get("title", "") or row, ts=created, filed=created,
+                    evidence=[f"board:{repo}/{row}"] + ([brief.strip().split("\n")[0][:300]] if brief.strip() else []),
+                    detector=who, detector_evidence=ev, links=links)
+        for note in t.get("notes", []):   # every INSTANCE line, once each, at the time it states
+            msg = note.get("msg", "")
+            if not INSTANCE.search(msg): continue
+            filed = parse_ts(note.get("ts") or "")
+            if not filed: continue
+            who, ev = stated_detector(msg)
+            put(f"note:{repo}/{row}@{note['ts']}", kind=kind, observed=msg[:400], ts=stated_time(msg, filed) or filed,
+                filed=filed, evidence=[f"note:{repo}/{row}@{note['ts']}"], detector=who, detector_evidence=ev, links=links)
+        for i, line in enumerate(brief.split("\n"), 1):
+            if not INSTANCE.search(line): continue
+            created = parse_ts(t.get("created") or "")
+            who, ev = stated_detector(line)
+            put(f"brief:{repo}/{row}#{i}", kind=kind, observed=line.strip()[:400], ts=stated_time(line, created) or created or now_dt(),
+                filed="", evidence=[f"brief:{repo}/{row}#{i}"], detector=who, detector_evidence=ev, links=links)
+    print(f"cc-failures import {repo}: {n} new record(s){' (dry)' if dry else ''}, {len(have)} already there")
+
+# ---------------------------------------------------------------- metrics
+def minutes(a, b):
+    """b − a in whole minutes at the minute the stamps are written to; never negative (a writer who rounded the
+    stated time up past the filing stamp did not file before it happened)."""
+    return max(0, int(((b.replace(second=0) - a.replace(second=0)).total_seconds()) // 60))
+
+def metrics_ledger(scope=None):
+    recs = load(scope); live = [r for r in recs if r.get("status") == "confirmed"]
+    cl = clusters(recs)
+    delays = [minutes(parse_ts(r["ts"]), parse_ts(r["filed"])) for r in live if parse_ts(r.get("filed")) and parse_ts(r["ts"])]
+    unk = sum(1 for r in live if r["detector"]["who"] == "unknown"); pf = sum(1 for r in live if r["detector"]["who"] == "person")
+    print(f"records: {len(recs)} ({len(live)} confirmed)  clusters: {len(cl)}  eligible: {sum(1 for c in cl if c['eligible'])}")
+    if delays: print(f"recording delay (filed - happened, min): median {statistics.median(delays):.0f}, max {max(delays)}, n={len(delays)} ({len(live)-len(delays)} unknown)")
+    else: print("recording delay: unknown (no record carries both stamps)")
+    if live: print(f"detector: unknown {unk}/{len(live)}, person-first {pf}/{len(live)}, box {len(live)-unk-pf}/{len(live)}")
+
+def metrics_fixture(path):
+    cat = catalogue(); items = []
+    try:
+        with open(path) as f:
+            for n, line in enumerate(f, 1):
+                if line.strip(): items.append(json.loads(line))
+    except (OSError, ValueError) as e: die(f"fixture {path}: {e}")
+    if not items: die(f"fixture {path}: no lines")
+    for it in items:
+        it["_kind"] = classify(it.get("row", ""), cat)
+        filed = parse_ts(it.get("filed", "")); want = parse_ts(it.get("ts", ""))
+        got = stated_time(it.get("text", ""), filed) or filed
+        it["_ok"] = bool(want and got and got == want)
+        it["_delay"] = minutes(want, filed) if want and filed else None
+    fm = fs = together = same = 0
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            a, b = items[i], items[j]
+            if a["_kind"] == b["_kind"]:
+                together += 1
+                if a["label"] != b["label"]: fm += 1
+            if a["label"] == b["label"]:
+                same += 1
+                if a["_kind"] != b["_kind"]: fs += 1
+    delays = [it["_delay"] for it in items if it["_delay"] is not None]
+    print(f"fixture: {len(items)} labelled record(s), {len({it['label'] for it in items})} label(s), {len({it['_kind'] for it in items})} cluster(s) computed")
+    print(f"false match rate: {fm}/{together} pairs grouped together carry different labels" + (f" = {fm/together:.0%}" if together else ""))
+    print(f"false split rate: {fs}/{same} pairs of one label grouped apart" + (f" = {fs/same:.0%}" if same else ""))
+    print(f"true time recovered: {sum(1 for it in items if it['_ok'])}/{len(items)}")
+    if delays: print(f"recording delay (filed - happened, min): median {statistics.median(delays):.0f}, max {max(delays)}, n={len(delays)}")
+
+# ---------------------------------------------------------------- selfcheck: hermetic, its own HOME, ledger and board
+def selfcheck():
+    n = f = 0
+    def ok(what, cond):
+        nonlocal n, f
+        n += 1
+        if not cond: f += 1
+        print(("  ok   " if cond else "  FAIL ") + what)
+    T = tempfile.mkdtemp(prefix="cc-failures-sc.")
+    home = os.path.join(T, "home"); os.makedirs(os.path.join(home, ".cc", "boards"))
+    env = dict(os.environ, HOME=home, CC_FAILURES=os.path.join(T, "failures"), CC_STATE=os.path.join(T, "state"))
+    def C(*a, rc=0, inp=None):
+        p = subprocess.run([os.path.join(B, "cc-failures"), *a], capture_output=True, text=True, env=env, input=inp)
+        return p.returncode, p.stdout, p.stderr
+    ledger = lambda s: open(os.path.join(T, "failures", f"{s}.jsonl")).read() if os.path.isfile(os.path.join(T, "failures", f"{s}.jsonl")) else ""
+    lines = lambda s: [json.loads(l) for l in ledger(s).splitlines() if l.strip()]
+    K = "guard-policy/permitted-text-refused"
+    try:
+        print("cc-failures selfcheck")
+        # ---- record
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "a grep pattern was refused", "--writer", "t")
+        ok("record writes one line and prints its id", rc == 0 and out.startswith("f-") and len(lines("alpha")) == 1)
+        rid = out.split()[0]
+        r = lines("alpha")[0]
+        ok("…the line carries every field the record names", all(k in r for k in ("ts", "filed", "scope", "kind", "fingerprint", "cluster", "expected", "observed", "evidence", "detector", "writer", "cost", "links", "status", "critical")) and r["id"] == rid and r["status"] == "confirmed")
+        rc, out, err = C("record", "--scope", "alpha", "--observed", "no kind")
+        ok("…no kind: refused, rc 2, nothing written", rc == 2 and len(lines("alpha")) == 1)
+        rc, out, err = C("record", "--scope", "../alpha", "--kind", K, "--observed", "x")
+        ok("…a scope that is a path, not a name: refused", rc == 2 and "scope is a" in err and not os.path.exists(os.path.join(T, "alpha.jsonl")))
+        rc, out, err = C("record", "--scope", "alpha", "--kind", "nosymptom", "--observed", "x")
+        ok("…a kind that is not contract/symptom: refused", rc == 2 and len(lines("alpha")) == 1)
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "x", "--critical", "sideways")
+        ok("…a critical reason the catalogue does not list: refused", rc == 2 and "critical is one of" in err and len(lines("alpha")) == 1)
+        rc, out, err = C("record", "--scope", "alpha", "--kind", "fresh/never-seen", "--observed", "x")
+        ok("a kind outside the catalogue is written, and said", rc == 0 and "not in the catalogue" in err and lines("alpha")[-1]["kind"] == "fresh/never-seen")
+        before = len(lines("alpha"))
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "the owner pointed at it", "--detector", "person", "--detector-evidence", "thread")
+        ls = lines("alpha")
+        ok("detector person: the record AND a person-first gap record, critical, linked to it", rc == 0 and len(ls) == before + 2
+           and ls[-1]["kind"] == GAP_KIND and ls[-1]["critical"] == "person-first" and ls[-1]["links"].get("episode") == ls[-2]["id"] and ls[-2]["critical"] == "")
+        before = len(lines("alpha"))
+        C("record", "--scope", "alpha", "--kind", K, "--observed", "seen by a script", "--detector", "box")
+        ok("…detector box: one record, no gap record", len(lines("alpha")) == before + 1)
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "", "--cost", "turns=1", "--link", "pr=7")
+        ok("an empty observed is refused", rc == 2)
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "x", "--cost", "turns=1", "--cost", "owner=one line", "--link", "pr=7", "--evidence", "a", "--evidence", "b", "--ts", "2026-09-01T10:00Z")
+        r = lines("alpha")[-1]
+        ok("cost, links, evidence and --ts are stored as given", r["cost"] == ["turns=1", "owner=one line"] and r["links"] == {"pr": "7"} and r["evidence"] == ["a", "b"] and r["ts"] == "2026-09-01T10:00:00Z")
+        # ---- corrections append; the original line is untouched
+        raw = ledger("alpha")
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "was a correct refusal", "--corrects", rid, "--status", "refuted")
+        ok("a correction is appended, the original bytes are untouched, and the read folds it in", rc == 0 and ledger("alpha").startswith(raw)
+           and next(x for x in load_in(env, "alpha") if x["id"] == rid)["status"] == "refuted")
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "x", "--corrects", rid)
+        ok("…a correction without a status is refused", rc == 2)
+        rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "x", "--corrects", "f-nope", "--status", "refuted")
+        ok("…a correction of an id the ledger does not hold is refused", rc == 2)
+        # ---- eligible: the rule, on its own scope
+        def rec(scope, ts, kind=K, **kw):
+            a = ["record", "--scope", scope, "--kind", kind, "--observed", "o", "--ts", ts]
+            for k, v in kw.items(): a += [f"--{k}", v]
+            return C(*a)
+        elig = lambda *a: [l.split()[0] for l in C("eligible", *a)[1].splitlines() if l.strip()]
+        cid = fpid(fingerprint("beta", K))
+        rec("beta", "2026-09-01T10:00Z"); rec("beta", "2026-09-03T10:00Z")
+        ok("two episodes in 14 days: not eligible", elig("--scope", "beta", "--as-of", "2026-09-04T00:00Z") == [])
+        rec("beta", "2026-09-03T10:20Z")
+        ok("…a third record 20 minutes after the second is the SAME episode: still not eligible", elig("--scope", "beta", "--as-of", "2026-09-04T00:00Z") == [])
+        rec("delta", "2026-09-03T10:00Z"); rec("delta", "2026-09-03T10:29Z"); rec("delta", "2026-09-03T10:59Z")
+        ok("the edge: 29 minutes after the last record is the same episode, 30 exactly is a new one", "2 episode(s)" in C("show", "--scope", "delta", "--as-of", "2026-09-04T00:00Z")[1])
+        rec("beta", "2026-09-05T10:00Z")
+        ok("a third distinct episode: eligible, and eligible prints the cluster id first on its line", elig("--scope", "beta", "--as-of", "2026-09-06T00:00Z") == [cid])
+        ok("…--as-of before the third episode: not eligible", elig("--scope", "beta", "--as-of", "2026-09-04T12:00Z") == [])
+        ok("…--as-of fifteen days after the first: two in the window, not eligible", elig("--scope", "beta", "--as-of", "2026-09-16T12:00Z") == [])
+        rc, out, _ = C("show", "--scope", "beta", "--as-of", "2026-09-30T00:00Z")
+        ok("fourteen quiet days and the cluster leaves the view; --all shows it", "quiet cluster" in out and cid not in out and cid in C("show", "--scope", "beta", "--as-of", "2026-09-30T00:00Z", "--all")[1])
+        rec("beta", "2026-09-05T11:00Z", status="asserted")
+        rc, out, _ = C("show", "--scope", "beta", "--as-of", "2026-09-06T00:00Z")
+        ok("an asserted record is stored but not counted", "4 record(s)" in out and len([x for x in load_in(env, "beta")]) == 5)
+        gid = fpid(fingerprint("gamma", "gate-target/wrong-revision"))
+        rc, out, _ = rec("gamma", "2026-09-05T10:00Z", kind="gate-target/wrong-revision", critical="main-gate-or-deploy-red")
+        crit_id = out.split()[0]
+        ok("a critical record is eligible on first sight", elig("--scope", "gamma", "--as-of", "2026-09-06T00:00Z") == [gid])
+        C("record", "--scope", "gamma", "--kind", "gate-target/wrong-revision", "--observed", "a sanctioned deploy", "--corrects", crit_id, "--status", "refuted")
+        ok("…refuted, it is not", elig("--scope", "gamma", "--as-of", "2026-09-06T00:00Z") == [])
+        ok("…and a person-first record makes the gap cluster eligible at once", fpid(fingerprint("alpha", GAP_KIND)) in elig("--scope", "alpha"))
+        ok("eligible with no scope reads every ledger", set(elig("--as-of", "2026-09-06T00:00Z")) >= {cid})
+        # ---- import: a fixture board, through cc-board
+        repo = f"_ccfail{os.getpid()}"
+        board = {"repo": repo, "path": os.path.join(home, "dev", repo), "default_branch": "main", "log": [], "tracks": {
+            "raised-guard-reads-heredoc-body-as-a-command": {"title": "the guard refused a heredoc", "status": "queued", "created": "2026-09-08T22:00:00Z", "updated": "2026-09-09T21:04:46Z", "notes": [
+                {"ts": "2026-09-09T05:09:07Z", "msg": "INSTANCE 2026-09-09 05:07Z (planning): a member hit it too"},
+                {"ts": "2026-09-09T21:04:46Z", "msg": "INSTANCE 2026-09-09 19:0x–19:4xZ (member): four relays"},
+                {"ts": "2026-09-10T00:10:00Z", "msg": "INSTANCE 23:3xZ, dateless and after the filing hour: the day before"},
+                {"ts": "2026-09-10T02:00:00Z", "msg": "scoped; no instance here"}]},
+            "containment-tests-run-the-shipping-shape": {"title": "not a raised row, but its notes count", "status": "queued", "created": "2026-09-07T18:00:00Z", "notes": [
+                {"ts": "2026-09-07T19:08:49Z", "msg": "2026-09-07 19:3xZ — THIRD INSTANCE, the owner caught it on PR 1"},
+                {"ts": "2026-09-11T03:20:49Z", "msg": "INSTANCE 2026-09-10 17:12 PDT (thread): stated in the server's zone"},
+                {"ts": "2026-09-11T17:18:43Z", "msg": "INSTANCE 17:2xZ (builder): rounded past its own filing"}]},
+            "raised-nothing-said": {"title": "a raised row with no times stated; the owner asked for the file", "status": "queued", "created": "2026-09-10T08:00:00Z", "notes": []},
+            "plain-row": {"title": "no INSTANCE, not raised", "status": "done", "created": "2026-09-01T08:00:00Z", "notes": [{"ts": "2026-09-02T08:00:00Z", "msg": "done"}]}}}
+        with open(os.path.join(home, ".cc", "boards", f"{repo}.json"), "w") as fh: json.dump(board, fh)
+        os.makedirs(os.path.join(T, "state", repo, "raised-nothing-said"))
+        with open(os.path.join(T, "state", repo, "raised-nothing-said", "task.md"), "w") as fh:
+            fh.write("GOAL: x\nINSTANCE 2026-09-10 09:00Z (worker): one in the brief\n")
+        rc, out, err = C("import", repo, "--dry")
+        ok("import --dry writes nothing and says what it would", rc == 0 and ledger(repo) == "" and "would write" in out and "9 new record(s) (dry)" in out)
+        rc, out, err = C("import", repo)
+        ls = {r["links"]["source"]: r for r in load_in(env, repo)}
+        ok("import writes the raised- row at its creation, the INSTANCE notes, and the brief line — one each, nothing for a note or row without one",
+           rc == 0 and len(ls) == 9 + 1 and "note:%s/raised-guard-reads-heredoc-body-as-a-command@2026-09-10T02:00:00Z" % repo not in ls
+           and "board:%s/plain-row" % repo not in ls and "board:%s/containment-tests-run-the-shipping-shape" % repo not in ls)
+        g = "raised-guard-reads-heredoc-body-as-a-command"
+        ok("…the raised row's record is at its filing time, and its filed stamp is the same", ls[f"board:{repo}/{g}"]["ts"] == "2026-09-08T22:00:00Z" == ls[f"board:{repo}/{g}"]["filed"])
+        ok("…a note's stated time is the record's time, the note's own stamp is when it was filed",
+           ls[f"note:{repo}/{g}@2026-09-09T05:09:07Z"]["ts"] == "2026-09-09T05:07:00Z" and ls[f"note:{repo}/{g}@2026-09-09T05:09:07Z"]["filed"] == "2026-09-09T05:09:07Z")
+        ok("…`19:0x–19:4xZ`: the first time, x floored", ls[f"note:{repo}/{g}@2026-09-09T21:04:46Z"]["ts"] == "2026-09-09T19:00:00Z")
+        ok("…`23:3xZ` filed at 00:10Z: the day before", ls[f"note:{repo}/{g}@2026-09-10T00:10:00Z"]["ts"] == "2026-09-09T23:30:00Z")
+        c = "containment-tests-run-the-shipping-shape"
+        ok("…`17:12 PDT` is 00:12Z the next day", ls[f"note:{repo}/{c}@2026-09-11T03:20:49Z"]["ts"] == "2026-09-11T00:12:00Z")
+        ok("…`17:2xZ` filed at 17:18Z is the same day (an hour's slack, not a day's)", ls[f"note:{repo}/{c}@2026-09-11T17:18:43Z"]["ts"] == "2026-09-11T17:20:00Z")
+        ok("…the brief's INSTANCE line: its stated time, filed unknown", ls[f"brief:{repo}/raised-nothing-said#2"]["ts"] == "2026-09-10T09:00:00Z" and ls[f"brief:{repo}/raised-nothing-said#2"]["filed"] == "")
+        ok("a row the catalogue matches files under that kind; one it does not under its own family",
+           ls[f"board:{repo}/{g}"]["kind"] == K and ls[f"board:{repo}/raised-nothing-said"]["kind"] == "board-row/raised-nothing-said" and ls[f"note:{repo}/{c}@2026-09-11T17:18:43Z"]["kind"] == f"board-row/{c}")
+        ok("a note saying the owner caught it is detector person, with the phrase as evidence, and gets its gap record",
+           ls[f"note:{repo}/{c}@2026-09-07T19:08:49Z"]["detector"] == {"who": "person", "evidence": "owner caught"} and ls.get(f"note:{repo}/{c}@2026-09-07T19:08:49Z#gap", {}).get("kind") == GAP_KIND)
+        ok("…one that does not say is unknown, said", ls[f"board:{repo}/{g}"]["detector"]["who"] == "unknown")
+        ok("…and 'the owner asked' is what the box was doing, not who caught it: unknown", ls[f"board:{repo}/raised-nothing-said"]["detector"]["who"] == "unknown")
+        ok("…and 'the owner would have found it' is a counterfactual, not a detection", stated_detector("the owner would have found it first")[0] == "unknown" and stated_detector("the owner found it first")[0] == "person")
+        rc, out, err = C("import", repo)
+        ok("a second import writes nothing: each source once", rc == 0 and "0 new record(s)" in out and len(load_in(env, repo)) == 10)
+        ok("the guard row: three INSTANCE episodes in 14 days of 09-10 — eligible on the real rule", fpid(fingerprint(repo, K)) in elig("--scope", repo, "--as-of", "2026-09-10T12:00Z"))
+        rc, out, err = C("import", "_ccnoboard")
+        ok("a repo with no board is refused, not imported empty", rc == 2 and "cc-board json" in err)
+        # ---- cc board failures renders the ledger
+        p = subprocess.run([os.path.join(B, "cc-board"), "failures", repo], capture_output=True, text=True, env=env)
+        ok("`cc board failures <repo>` renders the scope's clusters, eligible marked", p.returncode == 0 and fpid(fingerprint(repo, K)) in p.stdout and "ELIGIBLE" in p.stdout and repo in p.stdout)
+        p = subprocess.run([os.path.join(B, "cc-board"), "failures", "_ccempty"], capture_output=True, text=True, env=env)
+        ok("…and an empty scope says so", p.returncode == 0 and "no failures recorded" in p.stdout)
+        # ---- metrics: the ledger, and a labelled fixture
+        rc, out, err = C("metrics", "--scope", repo)
+        ok("metrics on a ledger: records, clusters, eligible, the recording delay and the detector shares", rc == 0 and "records: 10" in out and "recording delay" in out and "median" in out and "detector: unknown" in out)
+        # THE LABELLED FIXTURE ships beside the suite (tests/failures-fixture.jsonl): ten September-shaped lines a
+        # person labelled, two of them deliberately where the name-matcher and the label disagree — one row a person
+        # files under the guard family whose name does not start with guard (a split), one correct refusal whose name
+        # does (a match). The numbers below are counted by hand from that file; a change to either moves them.
+        rc, out, err = C("metrics", FIXTURE)
+        ok("metrics on the labelled fixture: the false-match, false-split and true-time rates with their counts, and the delay",
+           rc == 0 and "false match rate: 4/12" in out and "false split rate: 4/12" in out and "true time recovered: 9/10" in out
+           and "recording delay (filed - happened, min): median 1, max 367, n=10" in out)
+        rc, out, err = C("metrics", os.path.join(T, "missing.jsonl"))
+        ok("…a fixture that is not there is refused, not reported empty", rc == 2 and "fixture" in err)
+        rc, out, err = C("kinds")
+        ok("kinds prints the catalogue's six kinds and the critical reasons", rc == 0 and out.count("/") >= 6 and "person-first" in out and K in out)
+        rc, out, err = C("sideways")
+        ok("an unknown command is usage, rc 2", rc == 2)
+    finally:
+        shutil.rmtree(T, ignore_errors=True)
+    print(f"cc-failures selfcheck: {n - f} passed, {f} failed")
+    return 1 if f else 0
+
+def load_in(env, scope):
+    """The ledger as the tool under test reads it — `show ID` prints JSON; the selfcheck asks for the whole scope."""
+    p = subprocess.run([os.path.join(B, "cc-failures"), "show", "--scope", scope, "--json"], capture_output=True, text=True, env=env)
+    return json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else []
+
+# ---------------------------------------------------------------- argv
+def opts(a, flags, lists=()):
+    """--k v pairs → dict (lists collect); bare words → positional. Unknown --flag is usage."""
+    out, pos, i = {k: [] for k in lists}, [], 0
+    while i < len(a):
+        x = a[i]
+        if x.startswith("--"):
+            k = x[2:]
+            if k in ("all", "dry", "json"): out[k] = True; i += 1; continue
+            if k not in flags and k not in lists: die(f"unknown option {x}\n{USAGE}")
+            if i + 1 >= len(a): die(f"{x} needs a value")
+            if k in lists: out[k].append(a[i + 1])
+            else: out[k] = a[i + 1]
+            i += 2
+        else: pos.append(x); i += 1
+    return out, pos
+
+USAGE = "usage: cc-failures record|show|eligible|metrics|import|kinds|selfcheck ...  (the docstring has the flags)"
+def as_of(o):
+    if not o.get("as-of"): return None
+    t = parse_ts(o["as-of"])
+    if not t: die(f"--as-of is a UTC stamp like 2026-09-11T17:20Z, got '{o['as-of']}'")
+    return t
+
+def main(a):
+    if not a: die(USAGE)
+    cmd = a[0]; a = a[1:]
+    if cmd == "record":
+        o, pos = opts(a, ("scope", "kind", "observed", "expected", "detector", "detector-evidence", "writer", "critical", "status", "ts", "corrects"), ("evidence", "cost", "link"))
+        for k in ("scope", "kind", "observed"):
+            if k not in o: die(f"record needs --{k}\n{USAGE}")
+        ts = parse_ts(o["ts"]) if o.get("ts") else None
+        if o.get("ts") and not ts: die(f"--ts is a UTC stamp like 2026-09-11T17:20Z, got '{o['ts']}'")
+        links = {}
+        for kv in o["link"]:
+            if "=" not in kv: die(f"--link is k=v, got '{kv}'")
+            k, v = kv.split("=", 1); links[k] = v
+        status = o.get("status", "confirmed")
+        if o.get("corrects"):
+            # "Records are immutable; corrections append": the correction names the record, carries the status it
+            # now has, and is folded in on every read. It must name a record the ledger holds.
+            if "status" not in o: die("--corrects needs --status confirmed|asserted|refuted: the status the record now has")
+            if not any(r["id"] == o["corrects"] for r in load(o["scope"])): die(f"no record {o['corrects']} in scope {o['scope']}")
+        ids = add_record(o["scope"], o["kind"], o["observed"], expected=o.get("expected", ""), evidence=o["evidence"],
+                         detector=o.get("detector", "unknown"), detector_evidence=o.get("detector-evidence", ""),
+                         writer=o.get("writer", "session"), cost=o["cost"], links=links, critical=o.get("critical", ""),
+                         status=status, ts=ts, corrects=o.get("corrects"))
+        print(" ".join(ids))
+    elif cmd in ("show", "eligible"):
+        o, pos = opts(a, ("scope", "as-of"))
+        recs = load(o.get("scope"))
+        if cmd == "show" and o.get("json"):
+            print(json.dumps(recs, indent=1)); return
+        if cmd == "show" and pos:
+            for r in recs:
+                if r["id"] == pos[0] or r["cluster"] == pos[0]: print(json.dumps(r, indent=1))
+            return
+        cl = clusters(recs, as_of(o))
+        if cmd == "eligible":
+            for c in cl:
+                if c["eligible"]: print(f"{c['id']}\t{c['scope']}\t{c['kind']}\t{c['eligible']}\t{c['episodes_14d']} episode(s)\t{c['first'][:16]}..{c['last'][:16]}")
+        else: render(cl, o.get("all"))
+    elif cmd == "board":   # what `cc board failures <repo>` execs: the board's own heading, then the scope's clusters
+        o, pos = opts(a, ("as-of",))
+        if not pos: die("board needs a repo")
+        print(f"\n\033[1m{pos[0]}\033[0m  failures  (cc-failures; the rule: critical, or {EPISODES_NEEDED} episodes in {WINDOW_DAYS} days)")
+        render(clusters(load(pos[0]), as_of(o)), board=True); print()
+    elif cmd == "metrics":
+        o, pos = opts(a, ("scope",))
+        if pos: metrics_fixture(pos[0])
+        else: metrics_ledger(o.get("scope"))
+    elif cmd == "import":
+        o, pos = opts(a, ())
+        if len(pos) != 1: die("import needs a repo")
+        import_board(pos[0], dry=bool(o.get("dry")))
+    elif cmd == "kinds":
+        cat = catalogue()
+        print(f"catalogue v{cat.get('version')}: {os.path.normpath(CATALOGUE)}")
+        for k, v in cat["kinds"].items(): print(f"  {k}\n      contract: {v.get('contract','')}\n      symptom:  {v.get('symptom','')}")
+        print("critical reasons: " + ", ".join(f"{k} ({v})" for k, v in cat["critical"].items()))
+    elif cmd == "selfcheck":
+        sys.exit(selfcheck())
+    else: die(USAGE)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
