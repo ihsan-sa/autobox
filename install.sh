@@ -157,6 +157,10 @@ fi
 # wrong replays silently. Inspect it with `git rerere status` / `git rerere diff`, drop one with
 # `git rerere forget <path>`, drop all with `rm -r "$(git rev-parse --git-path rr-cache)"`.
 [ -n "$(git config --global --get rerere.enabled 2>/dev/null)" ] || git config --global rerere.enabled true || true   # a git that cannot write must not cost the links above
+# The GitHub orgs this box may not touch (~/.cc/github-deny, a box fact, never in this tree): the credential helper
+# first for github.com, and one url.insteadOf per listed org onto the refusing remote helper, both in the owner's global
+# git config, written idempotently and only on a box that HAS a list. Re-run after editing the list. cc-github-deny says the rest.
+"$R/bin/cc-github-deny" install || echo "warning: cc-github-deny install failed — the git layers of the org deny list are not wired; run it by hand" >&2
 [ -n "$O" ] && git -C "$O" rev-parse --git-dir >/dev/null 2>&1 &&
   git -C "$O" config core.hooksPath "$(realpath --relative-to="$O" "$R/.githooks")" ||   # pre-commit = core/tests/check.sh on the default branch
   git -C "$R" config core.hooksPath .githooks 2>/dev/null || true                        # a bare autobox clone: hook the repo itself

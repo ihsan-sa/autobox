@@ -89,7 +89,7 @@
 #     ~/.cc/secrets/github-personal.token, mode 600). From its next launch the session inside holds it where gh and git read
 #     it — `gh`, `git push` and the API work from inside, with the token's own scope as the whole permission model, and
 #     nothing on the host runs them for it (owner, 2026-09-11). Inside: ~/.config/gh/hosts.yml and ~/.config/gh/config.yml
-#     holding the token, and a two-line ~/.gitconfig sending github.com through `gh auth git-credential` — all ro, copies the
+#     holding the token, and a ~/.gitconfig sending github.com through cc-github-deny then `gh auth git-credential` — all ro, copies the
 #     launch writes under ~/.cc/sandbox/<workspace>/gh, never the token file, never the environment. Everything else about
 #     the boundary is the member's, asks included, and no owner-workspace marker is involved. THE GRANT IS HOST-SIDE:
 #     ~/.cc/members/<workspace>/github-token, a link to the token file, in the directory no bind of the boundary reaches.
@@ -132,6 +132,7 @@
 #   exists. His file is read, never written, and never edited by this box — the paragraph at SBX_ALLOW says why each
 #   way round.
 # INSIDE ro: ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
+#   · ~/.cc/github-deny and ~/.cc/github-deny.gitconfig when the host has them (the GitHub orgs the box may not touch: cc-github-deny)
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
 #   groups become nobody).
@@ -460,7 +461,9 @@ build(){   # $1 repo · $2 track → the global array B (bwrap arguments); the r
   cb=$(dirname "$(readlink -f "$H/bin/cc-loop" 2>/dev/null || echo "$H/bin/cc-loop")")   # ~/bin is symlinks into the control repo's core/bin
   [ "$cb" != "$H/bin" ] && [ -d "$cb" ] && B+=(--ro-bind "$cb" "$cb")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)   # /etc/resolv.conf points here
-  for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
+  # …and the GitHub orgs the box may not touch: the list and the git include cc-github-deny writes from it, ro, so the
+  # gh shim, the credential helper, git's url.insteadOf and cc-guard's rule hold inside exactly as they do here
+  for f in .local/share/claude .config/git .claude/plugins .gitconfig .npmrc .cc/github-deny .cc/github-deny.gitconfig; do [ -e "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done; :; }
 launch(){   # $1 repo · $2 track · the rest is the command
   local wt="$H/.cc/worktrees/$1/$2" cred="$H/.claude/.credentials.json" tok="" exp left
   # AHEAD OF build, not after it: build pins the worktree now, and a track that was never created is a plain mistake
@@ -590,7 +593,7 @@ gh_bind(){   # $1 handle — A WORKSPACE GRANTED A GITHUB TOKEN HOLDS IT INSIDE 
   # <h>`), in the one directory of the workspace's that no bind reaches, so a session inside can neither make it nor remove
   # it. The token is a fine-grained PAT the owner scoped to the repositories the workspace may touch, so its scope is the
   # whole permission model and the session inside runs `git push` and `gh` itself — nothing on the host runs them for it
-  # (owner, 2026-09-11). It goes in the way gh already reads a token, a hosts.yml, plus the two-line gitconfig that sends
+  # (owner, 2026-09-11). It goes in the way gh already reads a token, a hosts.yml, plus the gitconfig that sends
   # git's github.com credential lookup through `gh auth git-credential` (the host's own ~/.gitconfig does the same). Both
   # are written HERE, under ~/.cc/sandbox/<h>/gh — no bind reaches the source, and cc-guard already holds that subtree at
   # the secret tier — and ro-bound at gh's and git's own paths. NOTHING IN THE ENVIRONMENT: `env` is not gated, and every
@@ -613,7 +616,7 @@ gh_bind(){   # $1 handle — A WORKSPACE GRANTED A GITHUB TOKEN HOLDS IT INSIDE 
         printf '\n    git_protocol: https\n    oauth_token: '; tr -d '\n' < "$grant"; printf '\n    user: %s\n' "$login"; } > "$d/hosts.yml.new" \
       && mv -f "$d/hosts.yml.new" "$d/hosts.yml" \
       && printf 'version: 1\ngit_protocol: https\n' > "$d/config.yml" \
-      && printf '[credential "https://github.com"]\n\thelper =\n\thelper = !/usr/bin/gh auth git-credential\n' > "$d/gitconfig" ); } \
+      && printf '[credential "https://github.com"]\n\thelper =\n\thelper = !%s/bin/cc-github-deny\n\thelper = !/usr/bin/gh auth git-credential\n[credential]\n\tuseHttpPath = true\n[include]\n\tpath = ~/.cc/github-deny.gitconfig\n' "$H" > "$d/gitconfig" ); } \
     || { rm -rf "$d"; echo "cc-sandbox: could not write the token copy under $d — no GitHub token inside" >&2; return 0; }
   B+=(--ro-bind "$d/hosts.yml" "$H/.config/gh/hosts.yml" --ro-bind "$d/config.yml" "$H/.config/gh/config.yml"
      --ro-bind "$d/gitconfig" "$H/.gitconfig"); }
@@ -721,6 +724,9 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   gh_bind "$h"   # …and a workspace GRANTED a GitHub token holds it inside (gh_bind); the grant is in $m too, and no marker
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
+  # the GitHub orgs the box may not touch — the list and its git include, ro: read by the gh shim in ~/bin, by cc-guard
+  # inside, and by the granted gitconfig below. The names are the box's; a member sees them only in a refusal it earned.
+  for f in .cc/github-deny .cc/github-deny.gitconfig; do [ -f "$H/$f" ] && B+=(--ro-bind "$H/$f" "$H/$f"); done
   # CC_LOOP_TRIM crosses like the rest: it is set in front of a dispatch on the HOST, and the loop it steers runs in HERE
   # (`cc <h> <t> --go` opens the window as `cc-sandbox member … -- cc-loop`), so without it a member's track is the one
   # track on the box that cannot be trimmed from the dispatch line.
@@ -1055,7 +1061,8 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
     echo pid1=$(ls /proc | grep -c "^[0-9]" | awk "{print (\$1 < 20) ? \"few\" : \"many\"}"); echo tmp=$(touch /tmp/x && echo ok)' 2>&1)
   mcpw="cc-slack,"; [ -f "$H/.cc/slack/enabled" ] || mcpw=","
   t 'member: another repo is ABSENT' "$(g other)" absent;  t 'member: the control repo path is ABSENT' "$(g ctl)" absent
-  t 'member: ~/dev holds the workspace alone' "$(g devls)" "$h";  t 'member: ~/.cc holds boards, slack, state, worktrees and nothing else' "$(g ccls)" 'boards slack state worktrees'
+  ccw="boards slack state worktrees"; [ -f "$H/.cc/github-deny" ] && ccw="boards github-deny$([ -f "$H/.cc/github-deny.gitconfig" ] && echo ' github-deny.gitconfig') slack state worktrees"   # the org deny list and its include ride along, ro, when the host has them
+  t 'member: ~/dev holds the workspace alone' "$(g devls)" "$h";  t 'member: ~/.cc holds boards, slack, state, worktrees (and the org deny list when the host has one) and nothing else' "$(g ccls)" "$ccw"
   t 'member: ~/.cc/config absent' "$(g ccconfig)" absent
   # The app key is org admin: it pushes AND creates repositories. A workspace is member-facing, so whoever is
   # in its channel would hold anything it holds — the key stays outside, and this proves it on its own fixture.
@@ -1672,6 +1679,15 @@ selfcheck_ghtoken(){   # A WORKSPACE GRANTED A GITHUB TOKEN, in a HOME of its ow
     "$(g tok)/$(g helper)/$(g cred)" '1/!/usr/bin/gh auth git-credential/1'
   t 'gh: …read-only, with the token file, the copy'"'"'s source and the grant all still absent inside, and nothing in the environment' \
     "$(g ro)/$(g secrets)/$(g copysrc)/$(g grant)/$(g env)" 'ro/absent/absent/absent/0'
+  # the GitHub orgs the box may not touch, inside a granted workspace: the list is there ro, gh through ~/bin's shim and
+  # git through the granted gitconfig's include both refuse a listed org before any network, and an unlisted gh call runs.
+  # The org is the fixture's; the include is what `cc-github-deny install` writes for this HOME.
+  printf 'ccsbx-denied\n' > "$fh/.cc/github-deny"; env HOME="$fh" "$(dirname "$SELF")/cc-github-deny" install >/dev/null 2>&1
+  out=$(env HOME="$fh" "$SELF" member "$h" -- sh -c 'echo list=$([ -r ~/.cc/github-deny ] && echo ro || echo absent); echo shim=$(gh repo clone ccsbx-denied/x 2>&1 | grep -c "may not touch")
+    echo url=$(git ls-remote https://github.com/ccsbx-denied/x 2>&1 | grep -c "may not touch"); echo runs=$(gh --version 2>/dev/null | grep -c "^gh version")' 2>&1)
+  t 'gh: an org on the box'"'"'s deny list is refused inside — the list ro, gh by the shim in ~/bin, git by the include — and an unlisted gh call still runs' \
+    "$(g list)/$(g shim)/$(g url)/$(g runs)" 'ro/1/1/1'
+  rm -f "$fh/.cc/github-deny" "$fh/.cc/github-deny.gitconfig"
   t 'gh: the copy on the host is under ~/.cc/sandbox/<h>/gh, mode 600 in a 700 dir' \
     "$(stat -c %a "$fh/.cc/sandbox/$h/gh" "$fh/.cc/sandbox/$h/gh/hosts.yml" 2>/dev/null | tr '\n' /)" '700/600/'
   # rotated on the host: the next launch carries the new value and not the old

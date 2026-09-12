@@ -7,6 +7,9 @@
 # Denies (exit 2 + reason) the four owner gates:
 #   1. merge to default branch / deploy      2. external comms in owner's name
 #   3. destructive / infra ops               4. (spend is enforced by --max-budget-usd on headless workers)
+# …and two gates for EVERY session, gated role or not: nothing kills the shared tmux server, and nothing names a GitHub
+# org on the box's deny list (~/.cc/github-deny — cc-github-deny wires the same list into git and gh) as an owner on a
+# line that runs git, gh or reaches github.
 # EVERY rule reads ONE anchor, so a word in front of a command turned all of them off at once (`timeout 5 tmux
 # kill-server` walked past the universal gate). The haystack now carries each statement AND every suffix of it,
 # plus what an option attaches after an `=` (`--filter=CMD` is run by a shell and is never its own word), so a
@@ -1613,6 +1616,42 @@ P56
   fi
   ok "a write into a harness agent worktree, and the isolation: worktree spawn itself, are refused in one line naming both rules and the way out — while every other write outside the tree keeps its own refusal and the session's own tree still writes" $r
 
+  # 58. A GITHUB ORG THE BOX MAY NOT TOUCH IS REFUSED IN EVERY SESSION — no role, and a worker alike — when the line runs
+  #     git, gh or reaches github naming it as an owner, in any case; the reason names the org and the list. A repo of
+  #     that name under another owner, the word in prose, another org and an unrelated gh call pass, and with no list
+  #     nothing is refused. The list is a fixture of this case, never the box's.
+  GDL=$T/github-deny58; printf '# fixture\nAcme-Denied\nzork\n' > "$GDL"; GERR=$T/err58; r=0
+  while IFS='|' read -r fam tier why what; do
+    [ -n "$fam" ] || continue
+    : > "$GERR"
+    case $tier in
+      un) got=$(g Bash "{\"command\":\"$what\"}" "$T" CC_GITHUB_DENY="$GDL");;
+      wt) got=$(g Bash "{\"command\":\"$what\"}" "$WT" CC_ROLE=worker CC_GUARD_ROOT_PID=$$ CC_GITHUB_DENY="$GDL");;
+      no) got=$(g Bash "{\"command\":\"$what\"}" "$T" CC_GITHUB_DENY="$T/no-such-list58");;
+    esac
+    if [ "$why" = pass ]; then [ "$got" = 0 ] || { r=1; echo "      $fam: rc $got, refused for: $(head -c 80 "$GERR")"; }
+    else { [ "$got" = 2 ] && grep -qF "$why" "$GERR" && grep -qF "($GDL)" "$GERR"; } || { r=1; echo "      $fam: rc $got, refused for: $(head -c 80 "$GERR")"; }; fi
+  done <<W58
+a clone, no role|un|touches 'Acme-Denied'|git clone https://github.com/acme-denied/x.git
+a clone, in a track|wt|touches 'Acme-Denied'|git clone https://github.com/Acme-Denied/x.git
+ls-remote, the ssh form|un|touches 'zork'|git ls-remote git@github.com:ZORK/x
+a push by URL|un|touches 'zork'|git push https://github.com/zork/x HEAD:t
+gh with the org in its arguments|un|touches 'zork'|gh repo clone zork/x
+gh with the org bare|un|touches 'zork'|gh repo list zork --limit 5
+gh with GH_REPO|un|touches 'Acme-Denied'|GH_REPO=acme-denied/x gh pr list
+the API by curl|un|touches 'zork'|curl -s https://api.github.com/orgs/zork/repos
+the API by python|un|touches 'Acme-Denied'|python3 -c 'import urllib.request as u; print(u.urlopen(\"https://api.github.com/repos/Acme-Denied/x\").read())'
+the org's raw content|un|touches 'zork'|wget https://raw.githubusercontent.com/zork/x/main/README
+behind a wrapper|un|touches 'zork'|timeout 5 git fetch https://github.com/zork/x
+a repo of that name under another owner|un|pass|git clone https://github.com/other/zork.git
+the word in prose, no git or gh on the line|un|pass|echo zork/x is a path here
+a longer name is another org|un|pass|gh repo clone zorkish/x
+another org|un|pass|gh api repos/acme-ok/x
+an unrelated gh call|un|pass|gh api user
+the list absent, the same clone|no|pass|git clone https://github.com/acme-denied/x.git
+W58
+  ok "a listed GitHub org is refused in any session — git by URL, gh by argument, GH_REPO or bare, the API by curl or python, raw content, behind a wrapper — naming the org and the list; a same-named repo, prose, another org and no list pass" $r
+
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
   exit 0
@@ -2099,6 +2138,21 @@ if [ "$tool" = Bash ]; then   # universal gate, ALL sessions (interactive ones a
   u=${uk//$'\001'/}   # every rule but the cd walk reads a NAME at ^, so the mark comes off here, not in a second pass
   { grep -qE "$AT"'(tmux +kill-se[rs]|(pkill|killall)( +-[^ ]+)* +tmux|systemctl +--user +(restart|stop|kill) +tmux-main)' <<<"$u" \
     || grep -qE 'send-keys[^;&|]*tmux +kill-se[rs]' <<<"$u"; } && { echo "cc-guard: blocked — that takes the shared tmux server (every session on the box) down (\$TMUX beats TMUX_TMPDIR; use tmux -S <path> for scratch servers)" >&2; exit 2; }   # `tmux -S <path> kill-server` still passes: the pattern wants kill-se* right after tmux
+  # THE GITHUB ORGS THIS BOX MAY NOT TOUCH — the second universal gate, every session. The list is ~/.cc/github-deny
+  # (one org per line, # comments; cc-github-deny has the shape and the git and gh layers that read the same file), and
+  # the brief's line is "a session Bash line naming a denied org in a git, gh or GitHub-API command is refused by
+  # cc-guard". Refused: a listed org in OWNER position — `github.com/<org>/`, `git@github.com:<org>/`, `orgs/<org>`,
+  # `<org>/<repo>` — on a line that runs git, gh or reaches github (curl, python, anything); case-insensitive, because
+  # GitHub is. `x/<org>` (a repo of that name under somebody else) and the word in prose on a line with no such
+  # command pass. No list, or one this session cannot read, refuses nothing: the list is the whole of the rule.
+  gdl=${CC_GITHUB_DENY:-$HOME/.cc/github-deny}
+  if [ -r "$gdl" ] && grep -qiE '(^|[^A-Za-z0-9_.-])(gh|git)([^A-Za-z0-9_.-]|$)|github' <<<"$u"; then
+    while IFS= read -r gdo; do
+      gdo=${gdo%%#*}; gdo=${gdo//[[:space:]]/}; [ -n "$gdo" ] || continue; case $gdo in *[!A-Za-z0-9-]*) continue;; esac
+      grep -qiE "(^|[^A-Za-z0-9_./-]|(^|[^A-Za-z0-9_.-])(orgs|users|repos)/|github(usercontent)?\.com[/:])$gdo(/|[^A-Za-z0-9_.-]|$)" <<<"$u" \
+        && { echo "cc-guard: blocked — this touches '$gdo', a GitHub org this box may not ($gdl). Nothing on the box may reach it; ask nobody, do the rest." >&2; exit 2; }
+    done < "$gdl"
+  fi
 fi
 role="${CC_ROLE:-}"; steward=""; mdir=""; mws=""; root=""; trepo=""; ttrack=""; kroot=""   # $root: the ONE tree this session writes (rule 5 below); $kroot: it came from a track marker (kill fence)
 # THE STEWARD IS A WORKER THAT MAY NOT SPEND. cc-steward runs one headless `claude -p` per routine event, on the
