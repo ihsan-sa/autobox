@@ -3612,6 +3612,17 @@ def say_result(job, r):
         lane = f"#{handle}-updates" if r.get("ok") else f"#{handle}"
         rc, out = sh([f"{BIN}/cc-slack", "post", "-c", lane, "--id", f"{pid}:lane", r.get("text", "")], timeout=180)
         return said and (took(rc, out) or bool(chat))   # the thread already has it: a lane that refused is not a reason to say it twice
+    # A RESTART THAT IS THE OWNER'S REACHES THE OWNER, whatever the job was queued with. The ask rides on the card
+    # above, and a landing queued from a bash has no card: PR #433 (2026-09-11) deployed a mail unit, whose
+    # row says restart=owner, with chat '-' — the ⚠️ went into a message that posted nowhere and the box served old
+    # mail code again with nobody asked. So where there is no thread the ask goes on its own, to the repo's channel
+    # and @-mentioned: the same door cc-notify --decision uses for an approval-class ask (post --route … --mention),
+    # which is the main lane rather than the ambient one. With a thread it is NOT said twice — the card carries it.
+    if r.get("restart") and not chat:
+        what = f"[{repo}] " + (f"PR #{pr}" if pr else "deploy") + ": "
+        rc, out = sh([f"{BIN}/cc-slack", "post", "--route", f"[{repo}] restart", "--mention",
+                      "--id", f"{pid}:restart", what + r["restart"]], timeout=60)
+        said = said and took(rc, out)
     if r.get("ok"):
         return said
     title = f"[{repo}] " + (f"PR #{pr} " if pr else "") + "landing stopped"
@@ -3721,12 +3732,16 @@ def result_of(L, rc, job, tail):
     # …and the same fact for a unit whose restart the manifest KEEPS for the owner: on the old code too, but this
     # one has somebody who can fix it in a second, so the sentence carries the command rather than a warning. Only
     # the landing that raised the ask says it — the next one reads the open row and stays quiet (Land.owner_ask).
+    ask = ""
     if L.owner_asks and rc in (0, COSMETIC, UNVERIFIED):
-        short += (f" ⚠️ yours to restart: {', '.join(L.owner_asks)} — until then the box runs the old code for "
-                  f"{'them' if len(L.owner_asks) > 1 else 'it'}.")
+        ask = (f"⚠️ yours to restart: {', '.join(L.owner_asks)} — until then the box runs the old code for "
+               f"{'them' if len(L.owner_asks) > 1 else 'it'}.")
+        short += " " + ask
     if L.stopped == "load" and job.get("by"):     # a phantom PR: the culprit is the caller, so say who that was
         short += f" — queued by {job['by'][:160]}"
-    return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short,
+    # …and the ask ON ITS OWN, because it is the one line here addressed to a PERSON rather than to whoever
+    # 👍'd: say_result routes it to the repo's channel when this job has no thread to carry it.
+    return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short, "restart": ask,
             "text": short if rc == 0 else f"{short}\n```\n{tail[-900:]}\n```"}
 
 
@@ -3971,6 +3986,37 @@ def pane_live(wid):
     return rc == 0
 
 
+ROUND_END_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (?:exit \d+:|DONE\b)")
+ROUND_LOG_TAIL = 65536                    # …how much of a track's loop.log the line below is looked for in
+
+
+def round_ended(repo, track, since):
+    """Has the round dispatched at `since` ENDED — in the TRACK'S OWN WORDS, not in a guess about it?
+
+    cc-loop writes one line per round end into ~/.cc/state/<repo>/<track>/loop.log: `exit <code>: …` for every
+    stop it makes, `DONE` for a worker that finished its own work. Nothing else writes those, and the line is
+    stamped, so it is the one signal about THIS ROUND that needs no inference. track_running has only inferences:
+    the board word belongs to the ROW (the row goes back to `review` when the round ends, and to `running` again
+    the moment anything else picks the track up), and a tmux window is a shell a person may be sitting in.
+
+    On 2026-09-11 the repair round for PR #435 pushed 7980d01 at 17:14Z and logged its end at 17:15Z. The sweeps
+    that followed read the moved head, asked track_running, were told the track was alive, and waited — the push
+    was noticed by the 18:31Z deadline instead, 81 minutes after it happened, with the orch's delivery behind it.
+
+    Only a line stamped at or after the dispatch counts: the round before this one ended in the same file. False
+    for anything unreadable or unstamped — then the caller falls back to track_running exactly as before."""
+    if not (repo and track and since):
+        return False
+    try:
+        with open(f"{STATE}/{repo}/{track}/loop.log", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - ROUND_LOG_TAIL))    # a long-lived track's log, bounded; a split first line
+            tail = f.read().decode("utf-8", "replace").splitlines()   # simply fails the match
+    except OSError:
+        return False
+    return any(m and m.group(1) >= since for m in (ROUND_END_RE.match(x) for x in reversed(tail)))
+
+
 def remote_head(repo, branch):
     """The SHA `branch` really points at on origin, or "" if the remote cannot answer.
 
@@ -4005,11 +4051,13 @@ def remote_shas(repo, *refs):
 def fix_progress(path, job):
     """A job waiting on the fix iteration it dispatched. A pushed head alone is NOT the round ending — the loop
     checkpoints and pushes every iteration (review-176c), so the head moving off the reviewed SHA re-queues the
-    PR only once the track has actually stopped; until then the job waits, and prepare() is gated the same way so
-    no review is bought on an intermediate checkpoint. A fix that never pushes is not waited on for ever either:
-    past its deadline the job goes back to the ordinary path, where the verdict already on the PR stops it and
-    the owner is told, once. And a PR that MERGES under the round is not waited on at all — the push this would
-    otherwise sit here for is the deleted branch coming back.
+    PR only once the ROUND has actually ended; until then the job waits, and prepare() is gated the same way so
+    no review is bought on an intermediate checkpoint. Ended is asked of the round itself first (round_ended: the
+    end line cc-loop writes to the track's loop.log) and only then of what the track looks like from outside.
+    A fix that never pushes is not waited on for ever either: past its deadline the job goes back to the
+    ordinary path, where the verdict already on the PR stops it and the owner is told, once. And a PR that
+    MERGES under the round is not waited on at all — the push this would otherwise sit here for is the deleted
+    branch coming back.
 
     Returns a line to stand down with, or "" to run the job now."""
     fix = job.get("fix") or {}
@@ -4037,9 +4085,17 @@ def fix_progress(path, job):
         ledger(f"fix-merged {repo}#{pr} track={fix.get('track')} — merged while the round ran; not waiting for "
                f"its push")
         return ""
+    # …and where gh could not name the branch at all, the track's canonical one is asked for: dispatch_fix has
+    # already checked the PR's head IS `track/<track>`, and without a branch name there is no head to compare,
+    # so a flake at the PR object used to read as "nothing pushed" for as long as it lasted.
+    branch = branch or (f"track/{fix['track']}" if fix.get("track") else "")
     head = remote_head(repo, branch) or head    # the REMOTE's own ref is the head; the PR object is only the fallback
     late = stamp() >= (fix.get("deadline") or "")     # the deadline bounds EVERY wait here, whatever the track looks like
-    alive = lambda: track_running(repo, fix.get("track") or "")     # asked only where the answer decides something
+    # THE ROUND'S OWN WORD OUTRANKS EVERY GUESS ABOUT IT (round_ended). A round that has logged its end is over,
+    # however the board and the tmux window read — that pair kept PR #435's pushed fix waiting 81 minutes for a
+    # deadline to notice it. Read once, before either wait below: both of them are waits on this same round.
+    over = round_ended(repo, fix.get("track") or "", fix.get("at") or "")
+    alive = lambda: not over and track_running(repo, fix.get("track") or "")   # asked only where the answer decides something
 
     def wait(why):
         job["not_before"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + FIX_POLL))
@@ -7366,6 +7422,36 @@ def cmd_selfcheck():
           isinstance(r, Skip) and "would not take it" in str(r) and L.owner_asks
           and "systemctl --user restart dash.service" in result_of(L, 0, {"attempts": 1}, "")["short"])
 
+    # …and the ask has to REACH him. It rides on the card, and a landing queued from a bash has no card to ride:
+    # PR #433 (2026-09-11) deployed a mail unit, whose row keeps its restart for the owner, on a job queued
+    # with chat '-'. The ⚠️ went into a message that posted nowhere, no board row carried it either, and the box
+    # served old mail code again with nobody asked — 30 minutes after the row for the silent ask was closed.
+    L = with_dash((0, "dash.service\towner\n"))
+    world[f"{BIN}/cc-scope add"] = (0, "myrepo a9\n")
+    world[f"{BIN}/cc-scope list"] = (0, "[]")
+    caught(L.restart)
+    asked = result_of(L, 0, {"attempts": 1}, "")
+    calls.clear()
+    say_result({"repo": "myrepo", "pr": 7, "queued_at": "2026-09-11T15:10:54Z"}, asked)
+    routed = ran_sub("cc-slack", "post", "--route")
+    check("a landing with NO chat still asks the owner: with no thread to carry the card, the restart goes on its "
+          "own to the repo's channel, @-mentioned — the door cc-notify --decision uses for an approval-class ask "
+          "— and carries the unit and the one command (PR #433 put it on a card that posted nowhere)",
+          len(routed) == 1 and "--mention" in routed[0] and "[myrepo] restart" in routed[0]
+          and f"land:myrepo:7:landed@2026-09-11T15:10:54Z:restart" in routed[0]
+          and all(w in " ".join(routed[0]) for w in ("dash.service", "systemctl --user restart dash.service",
+                                                     "old code", "PR #7")))
+    calls.clear()
+    say_result({"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1"}, asked)
+    check("…and it is not said TWICE: where the job has a thread, the card in it already carries the ask",
+          len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and not ran_sub("cc-slack", "post", "--route")
+          and "systemctl --user restart dash.service" in " ".join(ran_sub("cc-slack", "post", "CAPPR")[0]))
+    calls.clear()
+    say_result({"repo": "myrepo", "pr": 7}, {"ok": True, "text": "landed", "short": "landed", "restart": ""})
+    check("…and the control: a chatless landing that owes the owner no restart posts nothing at all — this is an "
+          "ask reaching him, not a landing announcing itself in his main lane",
+          not ran_sub("cc-slack", "post"))
+
     L = with_dash((2, "cc-units: no manifest at /nope\n"))
     check("and a manifest the landing cannot read is a red deploy — guessing past it is what left the old "
           "process serving the merged code",
@@ -8916,6 +9002,53 @@ def cmd_selfcheck():
         check("...and a moved head is not waited on past the deadline either, however alive the track looks: the "
               "pushed head is re-queued and read as it stands, so no state waits unboundedly (review-176d)",
               open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed + 1)
+        # …and a pushed fix is not waited on TO the deadline either. The round for PR #435 (2026-09-11) pushed at
+        # 17:14Z and cc-loop logged its end at 17:15Z; the board had the track back at `running` for other work and
+        # the window still held a live pane, so every sweep read the moved head, asked track_running and waited.
+        # What noticed the push was the 18:31Z deadline — 81 minutes late, with a delivery and the owner's ask
+        # behind it. The round's own end line is read first now, and the deadline is left for a round that is silent.
+        landing(**AFTERFIX)
+        quiet(cmd_work, [])
+        j = read_json(job_path("myrepo", 7))
+        open(f"{stdir}/loop.log", "w").write(
+            f"{j['fix']['at']} iter 1/1 start (budget ${FIX_BUDGET}, turns 80, model {FIX_MODEL})\n"
+            f"{stamp()} exit 0: round over at its step limit with work committed\n")
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")   # the board is on the track's NEXT work
+        world["tmux list-windows"] = (0, "@9 myrepo/w1\n")
+        world["tmux list-panes -t @9"] = (0, "4242\n")
+        world["pgrep -P 4242"] = (0, "4343\n")                            # …and the window still holds a child
+        world["gh pr view 7 --json headRefOid"] = (0, json.dumps({"headRefOid": j["fix"]["head"],
+                                                                  "headRefName": "track/w1"}))
+        world["git ls-remote origin refs/heads/track/w1"] = (0, f"{'d' * 40}\trefs/heads/track/w1\n")
+        n_pushed = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
+        quiet(cmd_work, [])
+        line = open(f"{LANDQ}/queue.log").read().split("fix-pushed myrepo#7")[-1].split("\n")[0]
+        check("a pushed fix is noticed on the NEXT sweep pass, not at its deadline: the track's own loop.log says "
+              "the round ended, so the moved head is re-queued though the board reads running and the window "
+              "holds a live pane — and it is re-queued as a fix that pushed, not as one read past its deadline",
+              open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed + 1
+              and "past the fix deadline" not in line
+              and stamp() < (j["fix"]["deadline"] or ""))         # …and the deadline itself is untouched
+        os.unlink(f"{stdir}/loop.log")
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))
+        # …and the control: the SAME fixture with the round's end line stamped BEFORE the dispatch — a round
+        # before this one — is no signal at all, and the job waits on the track as it always did.
+        landing(**AFTERFIX)
+        quiet(cmd_work, [])
+        j = read_json(job_path("myrepo", 7))
+        open(f"{stdir}/loop.log", "w").write("2000-01-01T00:00:00Z exit 0: round over at its step limit\n")
+        world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")   # the only difference is the stamp above
+        world["git ls-remote origin refs/heads/track/w1"] = (0, f"{'d' * 40}\trefs/heads/track/w1\n")
+        n_pushed = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
+        quiet(cmd_work, [])
+        check("...while an end line from the round BEFORE this one is not this round ending: stamped earlier than "
+              "the dispatch it says nothing, the track is asked as before, and the job waits",
+              open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed
+              and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing")
+        os.unlink(f"{stdir}/loop.log")
+        with contextlib.suppress(OSError):
+            os.unlink(job_path("myrepo", 7))
         landing(**AFTERFIX)
         quiet(cmd_work, [])
         j = read_json(job_path("myrepo", 7))
