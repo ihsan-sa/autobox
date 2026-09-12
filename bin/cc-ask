@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""cc-ask — one question about the box, answered from its written record by a small model, with the source named.
+
+  cc-ask answer <repo> "<question>"    the reply on stdout (Slack mrkdwn, ends with a `_source:_` line); earlier
+                                       messages of the same thread may come on stdin, one per line, as context.
+                                       Exit 0 = a reply (a "Not in the record" line is a reply); exit 1 = no reply
+                                       or an uncited one, one reason on stderr; exit 2 = usage.
+  cc-ask selfcheck                     a stub model and a scratch HOME: no network, no session, no box.
+
+WHY IT EXISTS. The owner asked (2026-09-06) for a place to put a quick question — how do I, where is, what does —
+without waking the planning seat, whose every wake replays a full context. cc-slack hands what is typed in
+`#<repo>-ask` to this (Daemon.ask_soon) and posts what comes back in the thread. Built the way cc-steward is built,
+for the same reasons: a headless `claude -p` per question on the cheap model (CC_ASK_MODEL, default sonnet), fresh
+context every time, no tmux window, no journal, no dir of its own — an always-on session would accumulate exactly
+the context that costs the money.
+
+WHAT IT ANSWERS FROM, and in what order (the FRAME below is the whole instruction): the knowledge library's packet
+for the question — `cc-lib ask` is run HERE, before the model, so the model never needs a shell to reach the record
+— then the home guides (~/USAGE.md, ~/COMMS.md, ~/RUNBOOK.md, ~/WORKING.md, ~/CLAUDE.md), the project's CLAUDE.md,
+docs/ and core/docs/, and a tool's own docstring. Every reply ends with the file it came from. A question the record
+does not answer gets one line saying so and where the answer would live, never a guess.
+
+THE MODEL GETS NO SHELL. Read/Grep/Glob and nothing else, cc-steward's DENY list and its secret paths denied by name,
+`--setting-sources ''` (no hook, no settings file), `--strict-mcp-config` (no MCP server), a turn cap and a dollar
+cap. Anyone in the channel can type the question, so the question is untrusted input: a call that cannot run
+anything and cannot read a token cannot be talked into carrying one out. CC_ROLE=steward names the tier cc-guard
+would hold this to the day a settings source is restored — every worker gate plus no dispatch and no second model
+call — which is strictly narrower than anything else that runs unattended here.
+
+EVERY RUN IS A LINE in ~/.cc/state/ask/runs.jsonl (ts, repo, model, cost, turns, tokens, seconds, outcome): with
+`--no-session-persistence` there is no transcript for cc-spend to price, so this is where the lane's spend is read.
+
+Knobs (env, else ~/.cc/config): CC_ASK_MODEL (sonnet) · CC_ASK_BUDGET (0.25 USD) · CC_ASK_TURNS (12) ·
+CC_ASK_TIMEOUT (120 s) · CC_ASK_PACKET (4096 bytes of cc-lib packet).
+"""
+import sys, os, json, re, time, subprocess
+
+HOME = os.path.expanduser("~")
+DEV = f"{HOME}/dev"
+BIN = os.environ.get("CC_ASK_BIN") or os.path.dirname(os.path.realpath(__file__))
+CLAUDE = os.environ.get("CC_CLAUDE") or f"{HOME}/.local/bin/claude"
+RUNS = f"{HOME}/.cc/ask"                       # cwd for the model, one dir per repo: not a worktree, nothing it reads is relative
+LOG = f"{HOME}/.cc/state/ask/runs.jsonl"
+NOT_RECORDED = "Not in the record"             # the reply's first words when the record does not answer (FRAME, rule 2)
+
+# THE CALL'S WHOLE PERMISSION SURFACE — cc-steward's, copied so this file stands alone (cc-steward:73-91 says why
+# each layer is there: an allow-list with no shell, a deny-list naming the doors exposed without asking, and
+# --strict-mcp-config with no --mcp-config).
+TOOLS = "Read,Grep,Glob"
+DENY_TOOLS = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,"
+              "Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,"
+              "PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree")
+SECRET_PATHS = (".cc/config", ".cc/secrets/**", ".cc/members/**", "ccbox/env", ".ssh/**",
+                ".claude/.credentials.json", ".claude.json", ".config/gh/**")
+
+
+def deny():
+    """The deny list for THIS home: the tools above plus the secret stores by name (`//abs/path` in a rule is one
+    leading `/` plus $HOME)."""
+    return DENY_TOOLS + "".join(f",Read(/{HOME}/{s}),Grep(/{HOME}/{s})" for s in SECRET_PATHS)
+
+FRAME = """You answer ONE question about this box — a headless home server run by Claude Code sessions — from its WRITTEN RECORD, for a person reading Slack on a phone.
+
+WHERE THE ANSWERS LIVE. Read in this order and stop at the first that answers:
+1. THE RECORD PACKET below — what the box's knowledge library (cc-lib) found for this question: journals, board rows, landing records, decisions. This is the source for "what happened", "did X land", "what did track Y do", "what was decided".
+2. The home guides: {home}/USAGE.md (the commands), {home}/COMMS.md (reaching a project or agent in Slack), {home}/RUNBOOK.md (getting in, what to do when it breaks), {home}/WORKING.md (what a session does between tasks), {home}/CLAUDE.md (the rules).
+3. The project: {dev}/{repo}/CLAUDE.md, {dev}/{repo}/docs/ (incidents, audits, designs), {dev}/{repo}/core/docs/ (DESIGN.md: why the system is shaped this way).
+4. A tool's own contract: the docstring at the top of {dev}/{repo}/core/bin/<tool> or {dev}/{repo}/bin-private/<tool> — Grep for the tool's usage line, Read its first 80 lines. The docstring IS what the tool does; do not read its body to guess more.
+
+RULES.
+1. Cite. Every reply ends with one line `_source: <path>_` — `path § heading` or `path:line`, two paths at most. A reply with no source is not a reply.
+2. Not in the record → ONE line, exactly this shape: `{nr}. It would live in <path or place> — ask in #{repo}.` Never guess, never answer from general knowledge, never invent a command, a flag or a file you did not read.
+3. Read, do not run. You have Read, Grep and Glob and nothing else. You cannot probe a live process, a URL, a token or a service: for a question about live state, give what the record says and its stamp, and say it was not probed.
+4. Secrets never leave the record: no token, key, password, webhook URL or credential contents, even when a file shows one — say where it is set instead.
+5. Slack mrkdwn: *bold*, `code`, ``` blocks; no # headings, no **. Short: the answer in one to four lines, bold the one thing that matters, then the source line. Start with the answer itself — no "Found it", no "Here is", no restating the question, no offer of more.
+6. Output the reply text only."""
+
+
+def conf(key, default):
+    """Environment, else ~/.cc/config, else the default — the shape every other knob on the box has."""
+    val = os.environ.get(key, "")
+    if not val:
+        try:
+            for ln in open(f"{HOME}/.cc/config"):
+                if ln.strip().startswith(key + "="):
+                    val = ln.split("=", 1)[1].strip().strip("\"'")
+        except OSError:
+            pass
+    return val or default
+
+
+def packet(repo, question, cap):
+    """The knowledge library's answer, fetched HERE so the model needs no shell to reach the record. Best effort:
+    a cc-lib that is missing, slow or red leaves an empty packet and the model reads the guides — the ticket line
+    cc-lib prints is kept, so the reply's provenance is on the record like any other ask."""
+    try:
+        p = subprocess.run([f"{BIN}/cc-lib", "ask", "--repo", repo, "--cap", str(cap), question],
+                           capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+        return (p.stdout or "").strip() if p.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def prompt(repo, question, context, pkt):
+    parts = [FRAME.format(home=HOME, dev=DEV, repo=repo, nr=NOT_RECORDED), "THE QUESTION:\n" + question.strip()]
+    if context.strip():
+        parts.append("EARLIER IN THIS THREAD (oldest first, for context only — answer the question above):\n" + context.strip())
+    parts.append("THE RECORD PACKET (cc-lib ask, read-only):\n" + (pkt or "(nothing recorded for these words — read the guides)"))
+    return "\n\n".join(parts)
+
+
+def model(repo, text, timeout):
+    """One `claude -p`. Returns (reply or None, usage dict). CC_ASK_FAKE (selfcheck) is the JSON claude would print."""
+    fake = os.environ.get("CC_ASK_FAKE")
+    if fake is not None:
+        try:
+            d = json.loads(fake)
+        except ValueError:
+            return None, {"error": "no JSON (rc=fake)"}
+    else:
+        cwd = f"{RUNS}/{repo}"
+        os.makedirs(cwd, exist_ok=True)
+        env = dict(os.environ, CC_ROLE="steward", MAX_THINKING_TOKENS=str(int(conf("CC_ASK_THINK", 0))))
+        try:
+            p = subprocess.run([CLAUDE, "-p", "--model", conf("CC_ASK_MODEL", "sonnet"),
+                                "--allowedTools", TOOLS, "--disallowedTools", deny(),
+                                "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands",
+                                "--max-turns", conf("CC_ASK_TURNS", "12"), "--no-session-persistence",
+                                "--output-format", "json", "--max-budget-usd", conf("CC_ASK_BUDGET", "0.25")],
+                               input=text, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+        except subprocess.TimeoutExpired:
+            return None, {"error": f"timed out ({timeout} s)"}
+        except Exception as e:
+            return None, {"error": e.__class__.__name__}
+        try:
+            d = json.loads(p.stdout)
+        except ValueError:
+            return None, {"error": f"no JSON (rc={p.returncode})"}
+    u = d.get("usage") or {}
+    usage = {"model": ",".join((d.get("modelUsage") or {}).keys()), "in": u.get("input_tokens", 0),
+             "cache_r": u.get("cache_read_input_tokens", 0), "out": u.get("output_tokens", 0),
+             "turns": d.get("num_turns", 0), "cost": d.get("total_cost_usd", 0)}
+    r = d.get("result")
+    if d.get("is_error") or not isinstance(r, str) or not r.strip():
+        usage["error"] = (r if isinstance(r, str) and r.strip() else d.get("subtype") or "empty result")[:120]
+        return None, usage
+    r = r.strip()
+    # FRAME rule 1: a reply with no source is not a reply. An uncited answer is handled exactly like an empty one —
+    # no reply, exit 1 — so the daemon posts its own line instead of putting something authoritative-looking in the
+    # thread that nothing in the record stands behind. The not-recorded line cites nothing by design (rule 2).
+    if not r.startswith(NOT_RECORDED) and not re.fullmatch(r"_source: .+_", r.rsplit("\n", 1)[-1].strip()):
+        usage["error"] = "no source named"
+        return None, usage
+    return r, usage
+
+
+def record(line):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(json.dumps(line, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def answer(repo, question, context):
+    """The whole path: packet → prompt → model → one line in the log. Returns (exit code, stdout, stderr)."""
+    if not repo or "/" in repo or not os.path.isdir(f"{DEV}/{repo}"):
+        return 1, "", f"cc-ask: no project ~/dev/{repo}"
+    if not question.strip():
+        return 2, "", "cc-ask: an empty question"
+    t0 = time.time()
+    pkt = packet(repo, question, int(conf("CC_ASK_PACKET", 4096)))
+    reply, usage = model(repo, prompt(repo, question, context, pkt), int(conf("CC_ASK_TIMEOUT", 120)))
+    outcome = "error" if reply is None else "not-recorded" if reply.startswith(NOT_RECORDED) else "answered"
+    record({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "repo": repo, "outcome": outcome,
+            "secs": round(time.time() - t0, 1), "packet": len(pkt), "chars": len(reply or ""), **usage})
+    if reply is None:
+        return 1, "", f"cc-ask: no reply — {usage.get('error', 'unknown')}"
+    return 0, reply, ""
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    import tempfile, shutil, io, contextlib
+    global HOME, DEV, BIN, LOG, RUNS, CLAUDE
+    fails, n = [], 0
+
+    def check(name, ok):
+        nonlocal n
+        n += 1
+        if not ok:
+            fails.append(name); print(f"  FAIL {name}")
+
+    th = tempfile.mkdtemp(prefix="cc-ask-sc-")
+    wasH, wasD, wasB, wasL, wasR = HOME, DEV, BIN, LOG, RUNS
+    HOME, DEV, BIN, LOG, RUNS = th, f"{th}/dev", f"{th}/bin", f"{th}/.cc/state/ask/runs.jsonl", f"{th}/.cc/ask"
+    os.makedirs(f"{DEV}/myrepo/docs"); os.makedirs(BIN)
+    # a stub cc-lib: the packet is whatever it prints, and a red one leaves the packet empty
+    with open(f"{BIN}/cc-lib", "w") as f:
+        f.write('#!/usr/bin/env bash\n[ -n "${LIB_FAIL:-}" ] && exit 1\necho "cc-lib ask T1 · scope $3 · cap $5"\necho "HITS 1"\necho "  [document] USAGE § cc-green: run the gates"\n')
+    os.chmod(f"{BIN}/cc-lib", 0o755)
+    env0 = dict(os.environ)
+    try:
+        ok_json = json.dumps({"result": "*Run `cc-green`.*\n_source: ~/USAGE.md § cc-green_", "is_error": False,
+                              "num_turns": 3, "total_cost_usd": 0.041, "usage": {"input_tokens": 10, "output_tokens": 20},
+                              "modelUsage": {"claude-sonnet-5": {}}})
+        os.environ["CC_ASK_FAKE"] = ok_json
+        rc, out, err = answer("myrepo", "how do I run the gates?", "")
+        logged = [json.loads(l) for l in open(LOG)] if os.path.exists(LOG) else []
+        check("answer: a reply comes back on stdout, exit 0, and the run is one logged line with cost, turns and outcome=answered",
+              rc == 0 and out.startswith("*Run `cc-green`.*") and out.endswith("_source: ~/USAGE.md § cc-green_") and err == ""
+              and len(logged) == 1 and logged[0]["outcome"] == "answered" and logged[0]["cost"] == 0.041
+              and logged[0]["turns"] == 3 and logged[0]["repo"] == "myrepo" and logged[0]["packet"] > 0)
+        rc, out, err = answer("myrepo", "what colour is the box?", "")
+        os.environ["CC_ASK_FAKE"] = json.dumps({"result": f"{NOT_RECORDED}. It would live in ~/dev/myrepo/docs/hardware.md — ask in #myrepo.",
+                                                "is_error": False, "num_turns": 2, "total_cost_usd": 0.01, "usage": {}})
+        rc2, out2, _ = answer("myrepo", "what colour is the box?", "")
+        logged = [json.loads(l) for l in open(LOG)]
+        check("answer: the 'Not in the record' line IS a reply (exit 0, posted as it is) and is logged as not-recorded, "
+              "so the lane's misses can be counted against what the docs should hold",
+              rc == 0 and rc2 == 0 and out2.startswith(NOT_RECORDED) and logged[-1]["outcome"] == "not-recorded"
+              and logged[-2]["outcome"] == "answered")
+        # the failure half: an error result, an empty result, no JSON — each is exit 1 with one reason on stderr and nothing on stdout
+        os.environ["CC_ASK_FAKE"] = json.dumps({"result": "Budget of $0.25 exceeded", "is_error": True, "subtype": "error_max_budget_usd"})
+        rcE, outE, errE = answer("myrepo", "q", "")
+        os.environ["CC_ASK_FAKE"] = json.dumps({"result": "", "is_error": False})
+        rcM, outM, errM = answer("myrepo", "q", "")
+        os.environ["CC_ASK_FAKE"] = "not json"
+        rcJ, outJ, errJ = answer("myrepo", "q", "")
+        logged = [json.loads(l) for l in open(LOG)]
+        check("answer: a model that errored, said nothing or printed no JSON is exit 1, nothing on stdout, one reason on "
+              "stderr, and logged as outcome=error — the daemon posts its one line from the reason, never an empty reply",
+              (rcE, outE) == (1, "") and "Budget" in errE and (rcM, outM) == (1, "") and "empty result" in errM
+              and (rcJ, outJ) == (1, "") and "no JSON" in errJ and [l["outcome"] for l in logged[-3:]] == ["error"] * 3)
+        os.environ["CC_ASK_FAKE"] = json.dumps({"result": "*Run `cc-green`.* It runs every gate.", "is_error": False,
+                                                "num_turns": 2, "total_cost_usd": 0.01, "usage": {}})
+        rcU, outU, errU = answer("myrepo", "how do I run the gates?", "")
+        logged = [json.loads(l) for l in open(LOG)]
+        check("answer: a reply whose last line is not `_source: ..._` is no reply at all — exit 1, nothing on stdout, "
+              "'no source' on stderr, logged as outcome=error, so an uncited answer never reaches the thread looking "
+              "authoritative", (rcU, outU) == (1, "") and "no source" in errU and logged[-1]["outcome"] == "error")
+        rcR, _, errR = answer("nosuch", "q", "")
+        rcS, _, errS = answer("my/repo", "q", "")
+        rcQ, _, errQ = answer("myrepo", "   ", "")
+        check("answer: a repo that is not under ~/dev, a repo/track, and an empty question are refused before any "
+              "call — exit 1, 1, 2 with the reason named", (rcR, rcS, rcQ) == (1, 1, 2)
+              and "no project" in errR and "no project" in errS and "empty question" in errQ)
+        # the prompt: the frame's rules, the question, the thread context only when there is one, the packet or its absence
+        pk = packet("myrepo", "how do I run the gates?", 4096)
+        p1 = prompt("myrepo", "how do I run the gates?", "", pk)
+        p2 = prompt("myrepo", "and on a worktree?", "- owner: how do I run the gates?\n- box: *Run `cc-green`.*", pk)
+        os.environ["LIB_FAIL"] = "1"
+        p3 = prompt("myrepo", "q", "", packet("myrepo", "q", 4096))
+        del os.environ["LIB_FAIL"]
+        check("prompt: the frame names the order of sources with the real paths, the cite rule, the not-recorded shape "
+              "for THIS repo and the no-secrets rule; the cc-lib packet is fetched here (cap passed through) and put "
+              "in; thread context appears only for a follow-up; a red cc-lib leaves an explicit empty packet",
+              f"{th}/USAGE.md" in p1 and f"{th}/dev/myrepo/core/bin/<tool>" in p1 and "_source: <path>_" in p1
+              and f"{NOT_RECORDED}. It would live in <path or place> — ask in #myrepo." in p1
+              and "Secrets never leave the record" in p1 and "USAGE § cc-green" in p1 and "cap 4096" in p1
+              and "THE QUESTION:\nhow do I run the gates?" in p1 and "EARLIER IN THIS THREAD" not in p1
+              and "EARLIER IN THIS THREAD" in p2 and "- box: *Run `cc-green`.*" in p2
+              and "nothing recorded for these words" in p3)
+        # the call itself, through a stub claude: read-only tools, the deny list with the secret stores, the caps, the role
+        del os.environ["CC_ASK_FAKE"]
+        calls = f"{th}/calls"
+        with open(f"{BIN}/claude", "w") as f:
+            f.write('#!/usr/bin/env bash\n{ printf "claude"; printf " %s" "$@"; printf " role=%s cwd=%s\\n" "${CC_ROLE:-}" "$PWD"; cat; } > "$CALLS"\n'
+                    'echo \'{"result":"ok\\n_source: x_","is_error":false,"num_turns":1,"total_cost_usd":0.01,"usage":{}}\'\n')
+        os.chmod(f"{BIN}/claude", 0o755)
+        wasC, CLAUDE = CLAUDE, f"{BIN}/claude"
+        os.environ["CALLS"] = calls; os.environ["CC_ASK_MODEL"] = "haiku"; os.environ["CC_ASK_BUDGET"] = "0.05"
+        rcC, outC, _ = answer("myrepo", "what is cc-green?", "")
+        c = open(calls).read() if os.path.exists(calls) else ""
+        check("the call: `claude -p` on CC_ASK_MODEL with Read/Grep/Glob only, cc-steward's deny list (Bash, Monitor, "
+              "the schedulers, the notifiers) and the secret stores denied by name, no settings source, no MCP, "
+              "a turn cap and CC_ASK_BUDGET, no transcript, at CC_ROLE=steward in ~/.cc/ask/<repo>; the prompt is stdin",
+              rcC == 0 and outC == "ok\n_source: x_" and "--model haiku" in c and "--allowedTools Read,Grep,Glob" in c
+              and "Bash,BashOutput" in c and "Monitor" in c and "CronCreate" in c and "PushNotification" in c
+              and f"Read(/{th}/.cc/config)" in c and f"Grep(/{th}/.cc/secrets/**)" in c
+              and "--setting-sources  --disable" in c and "--strict-mcp-config" in c and "--disable-slash-commands" in c
+              and "--max-turns 12" in c and "--max-budget-usd 0.05" in c and "--no-session-persistence" in c
+              and f"role=steward cwd={th}/.cc/ask/myrepo" in c and "THE QUESTION:\nwhat is cc-green?" in c)
+        CLAUDE = wasC
+        # the docstring says what the code does: the knobs and the log path it names exist here
+        src = open(os.path.realpath(__file__)).read()
+        doc = src.split('"""')[1]
+        check("contract: every knob the docstring names is one the code reads, and the log it names is LOG",
+              all(k in src.split('"""', 2)[2] for k in ("CC_ASK_MODEL", "CC_ASK_BUDGET", "CC_ASK_TURNS", "CC_ASK_TIMEOUT", "CC_ASK_PACKET"))
+              and all(k in doc for k in ("CC_ASK_MODEL", "CC_ASK_BUDGET", "CC_ASK_TURNS", "CC_ASK_TIMEOUT", "CC_ASK_PACKET"))
+              and "~/.cc/state/ask/runs.jsonl" in doc and LOG.endswith("/.cc/state/ask/runs.jsonl"))
+        # This file runs unattended on anyone's message in #<repo>-ask and pays for a model call, so it is on the
+        # control layer (core/tests/control-layer, read by cc-land's gate_tier from the BASE side): a later change
+        # that widened TOOLS or dropped a name from deny() buys a paid review, not the gates alone.
+        ctl = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tests", "control-layer")
+        check("this file is named in the control layer, so every future change to it buys a paid review at the landing",
+              "bin/cc-ask" in [ln.strip() for ln in open(ctl).read().splitlines()])
+    finally:
+        os.environ.clear(); os.environ.update(env0)
+        HOME, DEV, BIN, LOG, RUNS = wasH, wasD, wasB, wasL, wasR
+        shutil.rmtree(th, ignore_errors=True)
+    print(f"cc-ask selfcheck: {n - len(fails)} passed, {len(fails)} failed")
+    return 1 if fails else 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip()); return 0 if argv else 2
+    if argv[0] == "selfcheck":
+        return selfcheck()
+    if argv[0] == "answer" and len(argv) >= 3:
+        context = "" if sys.stdin.isatty() else sys.stdin.read()
+        rc, out, err = answer(argv[1], " ".join(argv[2:]), context)
+        if out:
+            print(out)
+        if err:
+            print(err, file=sys.stderr)
+        return rc
+    print(__doc__.strip().splitlines()[0], file=sys.stderr)
+    print("usage: cc-ask answer <repo> \"<question>\" | cc-ask selfcheck", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

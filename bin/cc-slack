@@ -70,7 +70,10 @@ the box's own boot Remote-Control session (tmux window "box", target "box"). TWO
 #<repo>-updates reaches the SAME session as #<repo> and the tag says which lane a message came on (lane="main"/"updates").
 #<repo> is the owner's — questions, answers, decisions, one sentence per idea; the lane carries what is automated or long
 (digests, milestones, progress, audits), which is where every --route post aims when the box is in one. A reply always
-goes back to the lane it was asked on. #approvals and #alerts keep their jobs, and a sub-orch or track channel is not
+goes back to the lane it was asked on. A THIRD NAME IS NOT A SESSION: #<repo>-ask is the question lane — what is typed
+there goes to `cc-ask <repo>` (one small-model read of the docs and the knowledge library, the source named in the
+reply) and comes back in the thread; no session is woken, started or provisioned for it, and a reaction there reaches
+nobody (owner ask a198, 2026-09-06). #approvals and #alerts keep their jobs, and a sub-orch or track channel is not
 split — it is already a parent's detail lane, and inherits the cap. A sub-orchestrator gets its OWN channel
 (~/.cc/slack/orchs.json: chat -> target/alias/parent): a message there reaches that orch exactly as an "@alias" in the
 repo channel does, and an "@main"/"@other" there still hands the thread over. Extend/override in ~/.cc/slack/routes.json
@@ -246,6 +249,8 @@ REVISIT = "revisit.json"                                       # {"<chat>:<root_
                                                                # to come back to (on_revisit). Durable until the 📌 comes off; `cc-slack revisit` lists it
 STALE_AFTER = 48 * 3600                                        # a thread quiet this long leaves the buckets (and loses its mark)
 STALL_AFTER = 30 * 60                                          # the owner's last word unanswered this long = a stalled session
+ASK_TIMEOUT = 150                  # cc-ask's own cap is CC_ASK_TIMEOUT (120 s); this is the daemon's patience past it
+ASK_CONTEXT = 8                    # the most thread messages a follow-up carries to cc-ask as context
 RETRY_GRACE = 30 * 60                                          # …and after the box has re-handed that thread to the session,
                                                                # this much more silence before the owner hears about it at all
 DECLARE_GRACE = 60                                             # a needs_owner declaration covers everything the sender posts in the
@@ -1360,12 +1365,30 @@ def threads_name(name):
     return f"{(name or '').lower()}-{THREADS}"
 
 
+ASK = "ask"                        # #<repo>-ask: the QUESTION lane — a how-do-I / where-is / what-does about the box, answered
+                                   # from the record by cc-ask (one small-model read per question), never by a session
+
+
+def ask_lane(name):
+    """`<repo>-ask` → `<repo>` when #<repo> really is a project on this box; anything else → None. The lane is decided
+    by name like `-updates` is, so a channel the owner makes by hand works with no table to keep in step. Not for a
+    member's workspace or a member-facing dir: the record cc-ask reads is the owner's (cc-lib is owner side only)."""
+    n = (name or "").lower().lstrip("#")
+    suffix = f"-{ASK}"
+    base = n[:-len(suffix)] if n.endswith(suffix) else ""
+    if not base or "--" in base or base == "box" or not valid_target(base) or workspace_of(base) \
+            or os.path.isfile(f"{DEV}/{base}/.cc/member-facing"):
+        return None
+    return base
+
+
 def lane_split(name):
     """Does #name get an -updates sibling? A repo channel does. #approvals and #alerts keep their own jobs, a lane is
     never split again, and a `#<repo>--<track>` channel is not one either — a track is already a repo's detail lane.
-    Nor the box's own picture store (VITALS_STORE): nobody talks there, so it has no second lane to talk in."""
+    Nor the box's own picture store (VITALS_STORE): nobody talks there, so it has no second lane to talk in. Nor the
+    ask lane: it is a lane already, and nothing automated posts in it."""
     n = (name or "").lower()
-    return bool(n) and n not in (APPROVALS, ALERTS, VITALS_STORE) and "--" not in n and not main_lane(n)
+    return bool(n) and n not in (APPROVALS, ALERTS, VITALS_STORE) and "--" not in n and not main_lane(n) and not ask_lane(n)
 
 
 def lane_of(name, target):
@@ -5199,7 +5222,9 @@ class Daemon:
         A `#<repo>-updates` lane is the SAME session as `#<repo>` — routing it by name means a lane the owner made by
         hand works too, and there is no second table to keep in step.
         Never for a DM (owner-only, the box session), #approvals/#alerts (not sessions), a sub-orch channel (live or
-        archived — its orch owns it) or a name nothing valid survives."""
+        archived — its orch owns it), a name nothing valid survives, or `#<repo>-ask` — the question lane is
+        answered by cc-ask (on_event → ask_start) and is nobody's session, so nothing said or reacted there can
+        wake one."""
         e = load_orchs().get(chat)                       # a sub-orch's own channel: every message there is that orch's (chan_alias)
         if e:
             return e.get("target") if not e.get("archived") and valid_target(e.get("target")) else None
@@ -5207,6 +5232,8 @@ class Daemon:
             return "box"
         routes = load_routes()
         name = self.chan_name(chat)
+        if ask_lane(name):
+            return None
         t = routes.get(chat) or routes.get("#" + name)
         if not t:
             # #<repo>-updates is the OTHER LANE of the same session, not a session of its own — but only when #<repo>
@@ -5471,6 +5498,9 @@ class Daemon:
                 log(f"mail dm: {e!r}")
         if not target and ctype != "im" and self.chan_name(chat) in (APPROVALS, ALERTS):   # PR posts / notices only, never a session
             return
+        askr = ask_lane(self.chan_name(chat)) if ctype != "im" else None
+        if askr:   # #<repo>-ask: the question lane. cc-ask answers from the record; no session is looked for or started
+            return self.ask_start(askr, text, chat, thread, ts) if text.strip() else None   # a bare file is no question
         m = PERM_RE.match(text)
         if m:
             allow = m.group(1).lower().startswith("y")
@@ -5538,6 +5568,47 @@ class Daemon:
                 return
             text = self.attach(text, ev["files"], [p for _, p in got], meta, ws)
         return self.hand_off(target, text, meta, chat, thread, ts, route_alias)
+
+    def ask_start(self, repo, text, chat, thread, ts):
+        """A question in #<repo>-ask (owner ask a198, 2026-09-06: quick questions answered without waking the planning
+        seat). 👀 at once, then cc-ask on a thread of its own — a read of the record takes seconds to tens of
+        seconds and on_event runs on this chat's single executor (voice_soon's reason) — and what it prints goes
+        back in the thread. Nothing here reaches a session: no deliver, no autostart, no dir, no mark."""
+        react(self.cfg, chat, ts, "eyes")
+        threading.Thread(target=self._safe, args=(self.ask_soon, repo, text, chat, thread, ts), daemon=True).start()
+        return None
+
+    def ask_soon(self, repo, text, chat, thread, ts):
+        """THE QUESTION, OFF THE EXECUTOR. A follow-up carries the thread so far (its last few messages, who said
+        each) as context on cc-ask's stdin; the reply is cc-ask's stdout, posted as it is. No reply — cc-ask exit
+        1, a timeout, a crash — is ONE line in the thread naming why and where to ask instead: a question left
+        with a 👀 and nothing after it is the failure the owner cannot see."""
+        ctx = ""
+        if thread != ts:
+            try:
+                msgs = replies_tail(self.cfg, chat, thread, ASK_CONTEXT + 1)
+            except Exception:
+                msgs = []
+            ctx = "\n".join(f"- {'box' if self.is_ours(m) else self.user_name(m.get('user'))}: "
+                            f"{' '.join(self.clean(m.get('text') or '').split())[:600]}"
+                            for m in msgs if m.get("ts") != ts)
+        out, why = "", ""
+        try:
+            p = EFFECTS.run([f"{BIN}/cc-ask", "answer", repo, text], input=ctx, capture_output=True, text=True,
+                            timeout=ASK_TIMEOUT)
+            out = (p.stdout or "").strip()
+            why = ((p.stderr or "").strip().splitlines() or [f"cc-ask exit {p.returncode}"])[-1]
+            if p.returncode != 0:
+                out = ""
+        except subprocess.TimeoutExpired:
+            why = f"no answer in {ASK_TIMEOUT} s"
+        except Exception as e:
+            why = e.__class__.__name__
+        if out:
+            self.say(chat, out, thread)
+        else:
+            log(f"ask {repo}: {why}")
+            self.say(chat, f"no answer this time ({why}) — ask again, or ask in #{repo}", thread)
 
     def attach(self, text, files, paths, meta, ws):
         """The `[attached: …]` line and the paths a session opens them by — for a message's ORDINARY files, which is
@@ -9096,7 +9167,9 @@ def cmd_channels(argv=()):
             base = main_lane(ch["name"])
             if not (routes.get(ch["id"]) or routes.get("#" + ch["name"])) and base and valid_target(base.replace("--", "/", 1)):
                 t = base.replace("--", "/", 1)               # an -updates lane is the same session, other lane (Daemon.route)
-            if valid_target(t):
+            if ask_lane(ch["name"]) and not (routes.get(ch["id"]) or routes.get("#" + ch["name"])):
+                shown = f"cc-ask ({ask_lane(ch['name'])}'s question lane — no session)"
+            elif valid_target(t):
                 shown = t + (" [updates lane]" if main_lane(ch["name"]) == t.replace("/", "--") else "")
             elif ch["id"] in orchs or ch["name"] in (APPROVALS, ALERTS) or not chan_target(t) or "/" in chan_target(t):
                 shown = f"(unmapped: {t})"
@@ -9489,12 +9562,13 @@ def cmd_mkchannel(argv):
         try:
             api("conversations.setTopic", tok, channel=cid,
                 topic=f"→ Claude session `{target}` on {BOX} — messages here reach it, replies come back in threads" if valid_target(target)
+                else f"{BOX} — ask anything about the box (how do I, where is, what does): answered from the docs and the record by a small model, each answer names its source" if ask_lane(name)
                 else f"{BOX} PRs land here — :+1: from anyone in this channel squash-merges" if name == APPROVALS
                 else f"{BOX} machinery notices: boots, power, Claude usage limits, audits, digests — nothing here needs a reply" if name == ALERTS
                 else f"{BOX} — no project with this name on the box (rename, or add a route in ~/.cc/slack/routes.json)")
         except RuntimeError as e:
             print(f"  topic: {e}")
-        print(f"  #{name} → {target if valid_target(target) else '(PR approvals)' if name == APPROVALS else '(unmapped)'}")
+        print(f"  #{name} → {target if valid_target(target) else '(PR approvals)' if name == APPROVALS else f'cc-ask ({ask_lane(name)} question lane, no session)' if ask_lane(name) else '(unmapped)'}")
         if not lane_split(name):
             continue
         try:                                     # a repo channel is a PAIR: the sibling comes with it, never separately
@@ -16035,6 +16109,67 @@ def cmd_selfcheck():
         delivP.clear(); saidP.clear()
         evU = lambda chat, text, ts, ct="channel": {"type": "message", "channel": chat, "ts": ts, "user": "UOWNER",
                                                     "text": text, "channel_type": ct}
+        # ---- the question lane (owner ask a198, 2026-09-06): #<repo>-ask is answered by cc-ask and is nobody's session
+        os.makedirs(f"{devP}/memberish/.cc"); open(f"{devP}/memberish/.cc/member-facing", "a").close()
+        namesP["CASK"] = "myrepo-ask"; namesP["CASK2"] = "nosuchrepo-ask"; namesP["CASK3"] = "memberish-ask"
+        check("ask_lane: `<repo>-ask` names the repo when #<repo> is a project here; a base that is no project, a "
+              "member-facing dir, `box`, a track and a bare `ask` are not lanes; the lane is never split into -updates",
+              (ask_lane("myrepo-ask"), ask_lane("#myrepo-ask"), ask_lane("nosuchrepo-ask"), ask_lane("memberish-ask"),
+               ask_lane("box-ask"), ask_lane("myrepo--w1-ask"), ask_lane("ask"), ask_lane("myrepo"), ask_lane(""))
+              == ("myrepo", "myrepo", None, None, None, None, None, None, None)
+              and not lane_split("myrepo-ask") and lane_split("nosuchrepo-ask"))
+        check("route: the question lane is nobody's session — None, like #approvals — while a `<name>-ask` whose base is "
+              "no project (or a member-facing one) is still a channel of its own name",
+              (dmP.route("CASK", "channel"), dmP.route("CASK2", "channel"), dmP.route("CASK3", "channel"))
+              == (None, "nosuchrepo-ask", "memberish-ask"))
+        askedP = []
+        dmP.ask_start = lambda repo, text, chat, thread, ts: askedP.append((repo, text, chat, thread, ts))
+        dmP.on_event(evU("CASK", "how do I run the gates?", "4.1"))
+        dmP.on_event({"type": "message", "channel": "CASK", "ts": "4.2", "user": "UMEMBER", "text": "and where is the log?",
+                      "thread_ts": "4.1", "channel_type": "channel"})
+        dmP.on_event(evU("CASK", "!help", "4.3"))
+        dmP.on_event(evU("CASK", "   ", "4.4"))
+        check("a question in #<repo>-ask — the owner's or a member's, root or follow-up — goes to cc-ask with the repo and "
+              "the thread; nothing is delivered, no session is started, no dir is provisioned, no 'no project maps' "
+              "notice; a `!command` there is still the daemon's and an empty message (a bare file) is no question",
+              askedP == [("myrepo", "how do I run the gates?", "CASK", "4.1", "4.1"),
+                         ("myrepo", "and where is the log?", "CASK", "4.1", "4.2")]
+              and delivP == [] and not [t for _, t in saidP if "no project maps" in t] and not os.path.exists(f"{devP}/myrepo-ask"))
+        del dmP.ask_start
+        # ask_soon itself, through a stub cc-ask: the reply is posted in the thread as printed, a follow-up carries the
+        # thread so far on stdin, and no reply — exit 1, a timeout — is one line naming why and where to ask instead
+        runsA = []
+        def runA(cmd, **k):
+            runsA.append((cmd[-1], k.get("input")))
+            if cmd[-1] == "boom":
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="cc-ask: no reply — Budget of $0.25 exceeded")
+            if cmd[-1] == "slow":
+                raise subprocess.TimeoutExpired(cmd, ASK_TIMEOUT)
+            return subprocess.CompletedProcess(cmd, 0, stdout="*Run `cc-green`.*\n_source: ~/USAGE.md § cc-green_\n", stderr="")
+        wasA = Effects("ask", run=runA, dev=devP).install()
+        _apiA = globals()["api"]
+        globals()["api"] = lambda method, token, **kw: {"messages": [
+            {"ts": "4.1", "user": "UOWNER", "text": "how do I run the gates?"},
+            {"ts": "4.15", "user": dmP.bot_user, "text": "*Run `cc-green`.*"},
+            {"ts": "4.2", "user": "UMEMBER", "text": "and where is the log?"}]} if method == "conversations.replies" else {}
+        try:
+            saidP.clear()
+            dmP.ask_soon("myrepo", "how do I run the gates?", "CASK", "4.1", "4.1")
+            dmP.ask_soon("myrepo", "and where is the log?", "CASK", "4.1", "4.2")
+            dmP.ask_soon("myrepo", "boom", "CASK", "4.1", "4.1")
+            dmP.ask_soon("myrepo", "slow", "CASK", "4.1", "4.1")
+        finally:
+            wasA.install(); globals()["DEV"] = devP; globals()["api"] = _apiA
+        check("ask_soon: cc-ask's stdout is posted in the question's thread as it is; a root question carries no context "
+              "and a follow-up carries the thread's earlier messages (who said each, the question itself left out); "
+              "exit 1 and a timeout each post ONE line with the reason and where to ask — never a 👀 with nothing after it",
+              [q for q, _ in runsA] == ["how do I run the gates?", "and where is the log?", "boom", "slow"]
+              and runsA[0][1] == "" and runsA[1][1] == "- UOWNER: how do I run the gates?\n- box: *Run `cc-green`.*"
+              and [t for c, t in saidP if c == "CASK"] == ["*Run `cc-green`.*\n_source: ~/USAGE.md § cc-green_"] * 2
+              + ["no answer this time (cc-ask: no reply — Budget of $0.25 exceeded) — ask again, or ask in #myrepo",
+                 f"no answer this time (no answer in {ASK_TIMEOUT} s) — ask again, or ask in #myrepo"])
+        shutil.rmtree(f"{devP}/memberish")               # this block's own fixture; the provisioning cases below count devP's dirs
+        delivP.clear(); saidP.clear()
         dmP.on_event(evU("CUPD", "how is the deploy going?", "3.1"))
         dmP.on_event(evU("CREPO", "and the other thing?", "3.2"))
         dmP.on_event(evU("D1", "status?", "3.3", "im"))
