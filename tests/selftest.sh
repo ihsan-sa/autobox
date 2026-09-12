@@ -242,6 +242,8 @@ prefetch(){
 RUN=$$; REPO=_cctest$RUN; T=~/.cc/selftest-$RUN; mkdir -p "$T"
 export CC_NOTIFY_LOG="$T/notify.log"      # not the box's own ~/.cc/notify.log: runs would count each other's lines
 export CC_LIMIT_STAMP="$T/claude-limit"   # not the box's live stamp: a test limit must never make a real loop wait
+export CC_FAILURES="$T/failures"          # not ~/.cc/failures: the loop stops and red gates below are fixtures, and the
+                                          # ledger counts what it holds (cc-loop stop_record, cc-green red)
 export CC_HANDOFF_DIR="$T/handoff"        # not ~/.cc/state/handoff: an overlap case writes REAL records, and they
 export CC_HANDOFF_KICK_WAIT=0          # every real --overlap leaves a detached --kick child: with a wait it polls tmux for
 export CC_HANDOFF_NO_KICK=1   # ...and no --kick child at all: a fixture successor never boots, and a kick that cannot land pages the owner
@@ -2353,6 +2355,13 @@ gnone=$(god env); gon=$(god env CC_LOOP_TRIM=1); goff=$(god env CC_LOOP_TRIM=0)
 { ! grep -q CC_LOOP_TRIM <<<"$gnone" && grep -q 'CC_LOOP_TRIM=1 ' <<<"$gon" && grep -q 'CC_LOOP_TRIM=0 ' <<<"$goff"; } \
   && ok "the trim knob survives \`cc --go\`: set in front of one dispatch it reaches the loop's own window — 0 as loudly as 1, so a box whose config says 1 can still run one track untrimmed — and nothing is carried when it is unset" \
   || bad "CC_LOOP_TRIM does not cross the tmux window: unset='$(head -c 90 <<<"$gnone")' on='$(head -c 90 <<<"$gon")' off='$(head -c 90 <<<"$goff")'"
+# The failures ledger crosses the same way. This file exports CC_FAILURES="$T/failures" so its fixture loops' stops
+# (cc-loop stop_record → cc-green red) land in scratch; off cc's list they landed in the box's own ledger — twelve
+# `_cctest…` records and their excerpts under ~/.cc/failures from one green suite run, 2026-09-12.
+gfl=$(god env CC_FAILURES="$T/flx"); gnofl=$(god env -u CC_FAILURES)
+{ grep -qF "CC_FAILURES=$T/flx " <<<"$gfl" && ! grep -q CC_FAILURES <<<"$gnofl"; } \
+  && ok "CC_FAILURES crosses \`cc --go\` into the loop's window — a suite's fixture stops reach its scratch ledger, never the box's own — and nothing is carried when it is unset" \
+  || bad "CC_FAILURES does not cross the tmux window: set='$(head -c 120 <<<"$gfl")' unset='$(head -c 90 <<<"$gnofl")'"
 for t in w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19; do "$B/cc" rm $REPO $t >/dev/null 2>&1; done
 
 fi

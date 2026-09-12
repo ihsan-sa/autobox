@@ -64,6 +64,11 @@
 #       at dispatch the same tier is exit 2 before anything runs
 #     | 8 Claude usage limit that outlasts CC_LIMIT_MAX_WAIT (6 h). A limited run is not an iteration and not an error:
 #       cc-limit stamps ~/.cc/state/claude-limit, the loop waits it out (owner told once) and reruns the same iteration.
+# A STOP THAT IS A FAILURE IS WRITTEN TO THE FAILURES LEDGER BY THE LOOP, at the moment it stops (stop_record; design-failure-noticing
+# phase 2, "signals kept at their producers"): exits 5 6 9 10 as worker-loop/barren-stop, 4 12 as worker-loop/done-undelivered, 8 as
+# worker-loop/limit-outlasted-wait — one record per stop, through `cc-green red`, with a bounded excerpt of loop.log that outlives the
+# state dir. Not 3 (the worker ASKED, which is the work), 11 or 13 (the owner parked it, or the tier holds it): those are not failures.
+# The record never changes the exit code or the board word; a ledger that cannot be written is one log line.
 # Env (tests): CC_LOOP_RUNAWAY_N how many barren iterations in a row · CC_LOOP_RUNAWAY_X the cost multiple.
 # Env: CC_LOOP_TRIM=1 (cc-config key or the environment) drops OLD TOOL RESULTS from a worker's context — off by
 #      default, and off is byte-for-byte the run this loop always did. What it is and what it measured: trim_body.
@@ -331,6 +336,12 @@ tell_planner(){   # $1 the line -> 0 the broker has it and owns the escalation f
   # The cost of the timeout is therefore a duplicate — a page AND a late wake — and never a dropped stop.
   timeout 30 "$BIN/cc-broker" inject --no-start --source loop "$repo" "$1" >/dev/null 2>&1; }
 stop_prio(){ [ "$1" = yes ] && echo low || echo high; }   # heard by a session -> the owner's line is ambient (ladder rung 5); heard by nobody -> he IS the fallback, so it pushes
+stop_kind(){ case "$1" in 5|6|9|10) echo worker-loop/barren-stop;; 4|12) echo worker-loop/done-undelivered;; 8) echo worker-loop/limit-outlasted-wait;; *) :;; esac; }
+stop_record(){   # $1 exit code, $2 title, $3 message → one failures-ledger record for a stop that is a failure (stop_kind), none for the rest.
+                 # Prints what the ledger said; exit 0 always — "a writer that fails must never fail" the stop it is in.
+  local k r; k=$(stop_kind "$1"); [ -n "$k" ] || { echo "not a failure (exit $1)"; return 0; }
+  r=$("$BIN/cc-green" red "$repo" "$k" "loop:$repo/$track:$1:$$" --observed "cc-loop exit $1 ($2): $3"         --expected "a worker loop ends in a PR, a DONE or a question" --log "${LOG:-}" --writer cc-loop         --link "track=$track" --link "exit=$1" --cost "iterations=${i:-0}" --cost "usd=${spent:-0}" 2>&1 | tail -1) || r="not recorded: cc-green red failed"
+  echo "${r:-not recorded: cc-green red said nothing}"; return 0; }
 tier_hold(){   # $1 start|continue · $2 repo/track -> 0 the spend tier says this must WAIT, 1 it may go. cc-tier owns the
                # table (`cc-tier allows`); this reads its exit alone: 1 is "wait", 0 is "go", and anything else — no
                # cc-tier on this box, a crash — is "go", the same leniency `cc-pause is` gets: a tier that cannot be
@@ -672,6 +683,24 @@ second line"
   (ST="$d/dp" LOG="$d/dp/log" CC_SLACK="$d/dp/slack"; deliver_post)
   t 'control: a file whose first line is not a #channel posts nothing and is left where it is' \
     "$([ -e "$d/dp/calls" ] && echo posted || echo no)/$([ -e "$d/dp/slack-post.md" ] && echo kept)" no/kept
+  # A STOP THAT IS A FAILURE IS WRITTEN DOWN (stop_record), by kind; a stop that is not (a question, a parked project,
+  # a tier hold) writes nothing; and a ledger that cannot be written changes nothing but the line. Each in its own
+  # scratch ledger (CC_FAILURES), with the loop's globals set the way stop() sees them.
+  mkdir -p "$d/fl"; printf 'loop line 1\nerror (2): boom\n' > "$d/fl/loop.log"
+  sr(){ ( export CC_FAILURES="$d/fl/$1"; repo=lp track=t1 LOG="$d/fl/loop.log" i=3 spent=1.5; stop_record "$2" "$3" "$4" ); }
+  t 'exit 9 (runaway) is recorded as worker-loop/barren-stop'   "$(sr a 9 'is running away' '3 barren' | cut -c1-8)" recorded
+  t '…one record, of that kind, written by cc-loop, keyed to this stop' \
+    "$(CC_FAILURES="$d/fl/a" "$BIN/cc-failures" show --json --scope lp | jq -r '[.[] | select(.writer=="cc-loop")] | "\(length) \(.[0].kind) \(.[0].links.exit) \(.[0].links.source | sub(":[0-9]+$";""))"')" \
+    "1 worker-loop/barren-stop 9 loop:lp/t1:9"
+  t '…with a bounded excerpt of loop.log that outlives the state dir' \
+    "$(grep -c 'error (2): boom' "$(CC_FAILURES="$d/fl/a" "$BIN/cc-failures" show --json --scope lp | jq -r '.[0].evidence[] | select(startswith("excerpt:")) | sub("^excerpt:";"")')")" 1
+  t 'exit 4 (cc done failed) is worker-loop/done-undelivered'   "$(sr b 4 'finished, but opened no PR' 'x' >/dev/null; CC_FAILURES="$d/fl/b" "$BIN/cc-failures" show --json --scope lp | jq -r '.[0].kind')" worker-loop/done-undelivered
+  t 'exit 8 (the limit outlasted the wait) is worker-loop/limit-outlasted-wait' "$(sr c 8 waiting 'x' >/dev/null; CC_FAILURES="$d/fl/c" "$BIN/cc-failures" show --json --scope lp | jq -r '.[0].kind')" worker-loop/limit-outlasted-wait
+  t 'exit 3 (the worker asked) is not a failure and writes nothing' "$(sr e 3 waiting 'a question')|$(ls "$d/fl/e" 2>/dev/null | wc -l)" "not a failure (exit 3)|0"
+  t 'exit 11 (parked) and 13 (tier) write nothing either' "$(sr f 11 parked x | cut -c1-13),$(sr f 13 tier x | cut -c1-13)|$(ls "$d/fl/f" 2>/dev/null | wc -l)" "not a failure,not a failure|0"
+  mkdir -p "$d/fl/ro"; chmod 500 "$d/fl/ro"
+  t 'a ledger that cannot be written is one line, exit 0, and the stop goes on' "$(o=$(sr ro/x 9 runaway x); echo "${o:0:12} rc=$?")" "not recorded rc=0"
+  chmod 700 "$d/fl/ro"
   rm -rf "$d"
   printf 'cc-loop selfcheck: %s passed, %s failed\n' "$((n - bad))" "$bad"
   [ "$bad" = 0 ]; }
@@ -719,6 +748,7 @@ stop(){ local code="$1" title="$2" msg="$3" st="${4:-blocked}" heard=no whose=""
   # the very journal line this exit came from, already says `waiting`, and the tab prints the two of them as drift.
   "$BOARD" status "$repo" "$track" "$st" >/dev/null 2>&1; "$BOARD" note "$repo" "$track" "loop exit $code: $msg" >/dev/null 2>&1
   log "exit $code: $msg"
+  log "failures ledger ($repo): $(stop_record "$code" "$title" "$msg")"   # the tool that saw it writes it down; the exit is decided already
   # THE BOARD IS WRITTEN FIRST AND THE UPDATES LINE GOES OUT LAST, whatever the broker does in between: a stop that
   # reached nobody is worse than the ping this replaces, so neither of those two depends on it.
   tell_planner "$(planner_line "$title" "$msg")" && { heard=yes; whose="  ($repo's session has this one.)"; }

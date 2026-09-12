@@ -56,7 +56,9 @@ paste cut at TURN_MAX; `missed` prints the size of the record, because nothing a
   cc-scope claim <repo> <id> [--track T]                             a session/track has taken it on
   cc-scope check-cmd <repo> <id> "<command>" | --script <file>       the row's own verification; exit 0 = true
   cc-scope merged <repo> <id> --evidence "<PR or commit>"            it landed. NOT delivered — still work
-  cc-scope deliver <repo> <id>                                       RUNS the check; exit 0 → delivered
+  cc-scope deliver <repo> <id>                                       RUNS the check; exit 0 → delivered. A MERGED row whose
+                                                                     check fails is written to the failures ledger, once per
+                                                                     ask and merge (delivery/merged-not-delivered, via cc-green red)
   cc-scope verify <repo> <id> [--evidence "…"]                       a PERSON measured it against the ask
   cc-scope unverified [<repo>]                                       landed with nothing observed; exit 1 if any
   cc-scope decline <repo> <id> --why "<why it should not be built>"  a decision, kept in the ledger
@@ -325,6 +327,37 @@ def settled(a):
     if a.get("status") == "delivered":
         return passed(a)
     return a.get("status") in SETTLED
+
+
+def record_undelivered(repo, a, rc, out):
+    """A MERGED FIX THAT STILL FAILS ITS CHECK IS A FAILURE, and the check runner that saw it writes it to the failures
+    ledger (docs/design-failure-noticing-2026-09-11.md, phase 2): kind delivery/merged-not-delivered, through
+    `cc-green red`, ONCE per ask and merge — the key carries the merge's evidence, so the next tick on the same
+    still-red ask writes nothing (`already`) and a new merge that still fails is a new record. Seven such rows were
+    live on 2026-09-11 and nothing counted them. Never a verdict: the row's state and this command's exit code were
+    decided before this ran, and a ledger that cannot be written is one line on stderr, not an error."""
+    try:
+        import tempfile
+        key = "scope-deliver:%s:%s:%s" % (repo, a["id"], hashlib.sha1((a.get("evidence") or "").encode()).hexdigest()[:8])
+        with tempfile.NamedTemporaryFile("w", prefix="cc-scope-check.", suffix=".out", delete=False) as f:
+            f.write(out or ""); log = f.name
+        try:
+            r = subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-green"), "red", repo,
+                                "delivery/merged-not-delivered", key,
+                                "--observed", ("ask %s of %s is merged (%s) and its check still fails (rc %d): %s \u2014 %s"
+                                               % (a["id"], repo, a.get("evidence") or "no evidence", rc, a["check"],
+                                                  " ".join((out or "").split())[-200:] or "(no output)"))[:600],
+                                "--expected", "a merged fix passes the check its ask names", "--log", log,
+                                "--writer", "cc-scope", "--link", "ask=%s" % a["id"], "--link", "check=%s" % a["check"][:200]]
+                               + (["--link", "track=%s" % a["track"]] if a.get("track") else []),
+                               capture_output=True, text=True, timeout=60)
+            word = ((r.stdout.strip() or r.stderr.strip()).splitlines() or ["not recorded: cc-green red said nothing"])[-1]
+        finally:
+            try: os.unlink(log)
+            except OSError: pass
+    except Exception as e:   # the ledger never decides a delivery
+        word = "not recorded: %s: %s" % (e.__class__.__name__, e)
+    print("cc-scope: failures ledger (%s): %s" % (repo, word), file=sys.stderr)
 
 
 def run_check(repo, a):
@@ -804,6 +837,8 @@ def main(argv):
                 x["checked"] = rec
                 x["notes"].append({"ts": now(), "msg": "check FAILED (rc %d) %s \u2014 %s" % (rc, x["check"], tail[:160])})
         edit(repo, aid, upd)
+        if rc and not silent and a.get("status") == "merged":
+            record_undelivered(repo, a, rc, o)   # "a merged fix still fails its check": the ledger's line, once per merge
         if silent:
             if shell_could_not_exec(o):
                 # bash itself never found anything to run — the vanished-script cause #297 was written for.
@@ -1022,6 +1057,12 @@ def selfcheck():
     global SCOPE, TURNS_KEEP, TURN_MAX
     import tempfile, shutil, io
     SCOPE = tempfile.mkdtemp(prefix="cc-scope-selfcheck-")
+    _fl = os.environ.get("CC_FAILURES")
+    os.environ["CC_FAILURES"] = os.path.join(SCOPE, "failures")   # the deliver cases below write records: a scratch ledger, never the box's own
+    def ledger(repo):
+        r = subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-failures"), "show", "--json", "--scope", repo],
+                           capture_output=True, text=True)
+        return [x for x in (json.loads(r.stdout or "[]")) if x.get("kind") == "delivery/merged-not-delivered"]
     p = f = 0
     def ok(n): nonlocal p; p += 1; print("  ✓ %s" % n)
     def bad(n): nonlocal f; f += 1; print("  ✗ %s" % n)
@@ -1085,6 +1126,27 @@ def selfcheck():
           and get(R, a1)["checked"]["rc"] == 3)
         t("the failure is written next to the ask, not swallowed",
           any("check FAILED" in n["msg"] for n in get(R, a1)["notes"]))
+        # …AND TO THE FAILURES LEDGER, by this runner, once: "a merged fix still fails its check" is a failure of its own
+        # (delivery/merged-not-delivered), keyed to the ask and the merge, so a second tick on the same red writes nothing.
+        led = ledger(R)
+        t("a merged ask whose check fails is recorded in the failures ledger as delivery/merged-not-delivered, by cc-scope",
+          len(led) == 1 and led[0]["writer"] == "cc-scope" and led[0]["links"].get("ask") == a1
+          and led[0]["links"]["source"].startswith("scope-deliver:%s:%s:" % (R, a1)) and "rc 3" in led[0]["observed"])
+        quiet(["deliver", R, a1]); quiet(["deliver", R, a1])
+        t("…once, not once per check tick: two more ticks on the same red leave one record", len(ledger(R)) == 1)
+        R3 = R + "-ctl"   # its own ledger: an unsettled row left here would be work the cases below count
+        a3, _ = add(R3, "a claimed ask whose check is red")
+        quiet(["claim", R3, a3, "--track", "t3"]); quiet(["check-cmd", R3, a3, "exit 1"])
+        t("control: a CLAIMED ask whose check fails is red but not merged, so it is not a merged-not-delivered record",
+          quiet(["deliver", R3, a3]) == 1 and not ledger(R3))
+        _ro = os.path.join(SCOPE, "ro"); os.makedirs(_ro); os.chmod(_ro, 0o500)
+        _keepfl = os.environ["CC_FAILURES"]; os.environ["CC_FAILURES"] = os.path.join(_ro, "failures")
+        try:
+            _rc, err = run_capture_err(["deliver", R, a1])
+            t("a writer failure (the ledger unwritable) leaves the verdict unchanged: still exit 1, still merged, one 'not recorded' line",
+              _rc == 1 and get(R, a1)["status"] == "merged" and "failures ledger (%s): not recorded" % R in err)
+        finally:
+            os.chmod(_ro, 0o700); os.environ["CC_FAILURES"] = _keepfl
         try:
             quiet(["verify", R, a1, "--evidence", "I looked and it is fine, honestly"])
             bad("a red check cannot be talked round with a sentence")
@@ -1519,6 +1581,8 @@ def selfcheck():
         t("digest says nothing when nothing is open", run_capture(["digest", "_empty"]).strip() == "")
     finally:
         shutil.rmtree(SCOPE, ignore_errors=True)
+        if _fl is None: os.environ.pop("CC_FAILURES", None)
+        else: os.environ["CC_FAILURES"] = _fl
     print("== cc-scope selfcheck: %d passed, %d failed ==" % (p, f))
     return 1 if f else 0
 

@@ -187,6 +187,10 @@ to know which half: that is the remembering this tool exists to remove, put back
 never posted from here: a landed PR's card is EDITED to "landed ✓", and a landed PR with no card gets none.
 Re-running is the recovery, and is safe: an already-merged PR, an existing card, a settled ledger row and a
 unit that is already on are each "nothing to do".
+A RED GATE IS ALSO WRITTEN TO THE FAILURES LEDGER by this tool, the moment it is seen (record_red → `cc-green red`,
+kind gate-verdict/red, keyed gate:<gate>:<tree> so the worker's cc-green and a fix round's see the same record;
+docs/design-failure-noticing-2026-09-11.md, phase 2). The record never decides anything here: the Failed is the same
+with the ledger unwritable, and that is one line on the output.
 
 MERGED IS NOT DELIVERED, and this is where that is decided. The ledger step no longer closes an ask: it marks
 it `merged`, which is still work. The LAST step runs each of those rows' own check — a command whose exit code
@@ -1779,6 +1783,26 @@ def gate_fail(text):
     return " · ".join(hits[:3])[:400] or last(text)
 
 
+def record_red(scope, gate, content, log, text, pr="", writer="cc-land"):
+    """A RED GATE IS WRITTEN TO THE FAILURES LEDGER BY THE TOOL THAT SAW IT (docs/design-failure-noticing-2026-09-11.md,
+    phase 2): one `cc-green red` call, kind gate-verdict/red, keyed gate:<gate>:<tree> — the SAME key a worker's
+    cc-green files the same tree under, so the red the worker saw, the landing saw and a fix round's worker sees
+    again is one record, whichever wrote first (the others read `already`). The bounded excerpt it keeps outlives
+    the run root this landing's log lives in. NEVER a verdict of its own: whatever the ledger does, the caller's
+    Failed is raised exactly as before — a writer that fails is one line on the landing's output, not a red."""
+    try:
+        rc, o = sh([f"{BIN}/cc-green", "red", scope, "gate-verdict/red", f"gate:{gate}:{content[:12]}",
+                    "--observed", f"gate {gate} did not pass at the landing of {scope}{' PR #' + str(pr) if pr else ''} "
+                                  f"on {content[:12]}: {gate_fail(text)}"[:600],
+                    "--expected", "a tree handed over passes its gates", "--log", log, "--writer", writer,
+                    "--cost", "fix-iteration=1", "--link", f"gate={gate}", "--link", f"tree={content}"]
+                   + (["--link", f"pr={pr}"] if pr else []), timeout=60)
+        word = last(o) or ("recorded" if rc == 0 else "not recorded: cc-green red exited %d" % rc)
+    except Exception as e:                    # noqa: BLE001 — the ledger must never decide a gate
+        word = f"not recorded: {e.__class__.__name__}: {e}"
+    out("·", f"failures ledger ({scope}): {word}")
+
+
 def stale_note(root, base_ref, base, head, mine=()):
     """Why a red gate may be the CALENDAR rather than a bug, as a sentence to hang off the failure — or "" when
     there is nothing to say. On a box that lands ten times in a day every branch is behind by the time the queue
@@ -2675,6 +2699,7 @@ class Land:
                 bad = FAILED_RE.search(o)
                 if rc or (bad and bad.group(1) != "0"):
                     keep_log(keep)                   # the one log that outlives the run — bounded, at this path
+                    record_red(self.project, g, content, keep, o, pr=self.pr)   # …and the ledger line that outlives THAT
                     raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
                                  f"  [full output: {keep}]")
 
@@ -6482,6 +6507,23 @@ def cmd_selfcheck():
     check("CONTROL, all the way through a run: that head is level with its base, so the landing says the failing "
           "case and nothing else — a red branch written against today's main reads as red",
           "behind main" not in L.why and "rebase" not in L.why)
+    # …AND THE RED IS WRITTEN DOWN BY THE TOOL THAT SAW IT (record_red): one `cc-green red` call, kind
+    # gate-verdict/red, keyed gate:<gate>:<tree> with the landing as its writer and the kept log as its excerpt's
+    # source — the same key a worker's cc-green files the same tree under, so the two are one record.
+    reds = ran_sub("cc-green", "red")
+    check("a red gate is recorded in the failures ledger by the landing, once, under gate:<gate>:<tree> — the key "
+          "the worker's own cc-green uses for the same tree, so the red seen twice is one record",
+          len(reds) == 1 and reds[0][2] == "myrepo" and reds[0][3] == "gate-verdict/red"
+          and reds[0][4].startswith("gate:core/tests/check.sh:") and "--writer" in reds[0]
+          and reds[0][reds[0].index("--writer") + 1] == "cc-land" and "--log" in reds[0]
+          and reds[0][reds[0].index("--log") + 1].endswith("check.sh.log") and "pr=7" in reds[0])
+    # …and a WRITER THAT FAILS LEAVES THE VERDICT ALONE: the ledger refusing, the same red gate stops the same way
+    # with the same line, and the landing says the record was not written instead of raising on it.
+    L, rc = red_gate(**{"git rev-list --count": (0, "0\n"), f"{BIN}/cc-green red": (1, "not recorded: ledger unwritable\n")})
+    check("a writer failure (the ledger unwritable) leaves the gate's verdict unchanged: the same stop, the same "
+          "failing case, nothing merged — and no exception where the record should have been",
+          rc == 1 and L.stopped == "gates" and "the row was wrong" in L.why and not ran("gh pr merge")
+          and len(ran_sub("cc-green", "red")) == 1)     # fresh() starts a new call log: one call in this run
 
     # …and the same red gate, on the ordinary head: one written before main's last landing, so the gates ran on
     # main MERGED with it. That is the stop this row exists for, and the failure has to NAME the merge — a head

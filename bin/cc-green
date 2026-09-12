@@ -7,7 +7,21 @@
 #   cc-green wait [SECONDS]  block on that run, SECONDS at most (default 540, under a foreground tool call). Ended,
 #                            or none going: the report for the tree as it is NOW, exit 0/1 as above. Still going:
 #                            `still running (pid, since)`, exit 3 — call again
+#   cc-green red SCOPE KIND KEY --observed TEXT [--log FILE] [--writer W] [--expected TEXT] [--link k=v]... [--cost k=v]...
+#                            one failures-ledger record (cc-failures record), ONCE per KEY: a second call with a KEY the
+#                            scope's ledger already holds under links.source writes nothing and says `already <id>`. The
+#                            last 8 KiB of --log and its ✗/FAIL lines go to a bounded excerpt under
+#                            $CC_FAILURES/excerpts/<scope>/ that outlives the log. ALWAYS exit 0 — the gate, landing
+#                            or loop calling it keeps its own verdict whatever the ledger does; what happened is one
+#                            line on stdout: `recorded <id>` · `already <id>` · `not recorded: <why>`
 #   cc-green selfcheck       fixtures of its own: a scratch record directory, stub gates, a throwaway repo
+# A RED IS WRITTEN DOWN BY THE TOOL THAT SAW IT (docs/design-failure-noticing-2026-09-11.md, phase 2). `run` records
+# a gate that did not pass as kind gate-verdict/red, keyed gate:<gate>:<tree>, so the landing gating the same tree and
+# a fix round's worker seeing the same red land on the same record. A WORKER'S OWN RED IS NOT A FAILURE: a red-first
+# case, or a gate the branch is fixing, is the work — so a red whose ✗ lines name only files the branch itself
+# touches (its diff against the base, plus the working copy) or the gate script itself is said and not recorded.
+# A red that names a file the branch never touched, or names none, is somebody else's — the base, the box, a flake
+# — and is recorded. cc-land's gates and cc-loop's stops call `red` too, with their own kinds (they say which).
 # A gate `run` starts carries no *_TOKEN / *_KEY / *_SECRET / *_CREDS / *_WEBHOOK / *_PASSWORD or named API token from this shell, and has the live
 # ~/.cc/config denied (CC_CONFIG_DENY) — the scrub cc-land's own gate run applies.
 # Three states per gate, not two: `green` a record the landing will spend · `ran` it passed here but files no
@@ -54,7 +68,7 @@
 # detached the run holds nothing but a bounded call and a log path, not a pid that dies within the second.
 set -uo pipefail
 SELF="$(readlink -f "$0")"; BIN="$(dirname "$SELF")"; CORE="$(cd "$BIN/.." && pwd)"
-USAGE="usage: cc-green [run|wait [SECONDS]|selfcheck]"
+USAGE="usage: cc-green [run|wait [SECONDS]|red SCOPE KIND KEY --observed TEXT [--log FILE]…|selfcheck]"
 # The tree is taken by tests/green.sh's green_tree — the SUITE's own hash, not a second one of ours. See the note
 # there: a reader with an algorithm of its own is how a green comes to name content it did not pass on.
 # shellcheck source=/dev/null
@@ -121,6 +135,96 @@ ran_here(){   # $1 = gate, $2 = tree → the note is this gate's and inside the 
   [ "${v[0]:-}" = "$1" ] && [ "$(age_of "${v[1]:-}")" -le "$GREEN_TTL" ]
 }
 
+# ── the failures ledger: `red`, and the rule that keeps a worker's own red out of it ──────────────────────────
+FDIR="${CC_FAILURES:-$HOME/.cc/failures}"   # cc-failures' own default; a test run points both at a scratch dir
+RED_TAIL=8192                                # bytes of a log an excerpt keeps — bounded, so a red never fills a disk
+RED_LINES=40                                 # …and at most this many ✗/FAIL lines ahead of that tail
+RED_RE='✗|✘|FAIL|Error\b|error:|not ok|Traceback|[1-9][0-9]* failed'   # cc-land's gate_fail lines, plus a red tally
+
+excerpt(){   # SCOPE KEY LOG → the path of a bounded excerpt of LOG under the ledger's dir, or nothing when there is no log
+  local scope=$1 key=$2 log=$3 d f n
+  [ -n "$log" ] && [ -r "$log" ] || return 0
+  d="$FDIR/excerpts/$scope"; mkdir -p "$d" 2>/dev/null || return 0
+  f="$d/$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_').log"
+  n=$(stat -c %s "$log" 2>/dev/null || echo 0)
+  { printf 'source=%s\nlog=%s (%s bytes; its red lines first, then its last %s bytes)\n\n' "$key" "$log" "$n" "$RED_TAIL"
+    grep -nE "$RED_RE" "$log" 2>/dev/null | head -n "$RED_LINES"
+    printf '\n--- tail ---\n'; tail -c "$RED_TAIL" "$log" 2>/dev/null; } > "$f" 2>/dev/null || return 0
+  echo "$f"
+}
+
+red(){   # SCOPE KIND KEY --observed TEXT [--log FILE] [--writer W] [--expected TEXT] [--link k=v]... [--cost k=v]...
+  local scope=${1:-} kind=${2:-} key=${3:-} observed="" log="" writer=cc-green expected="" have id ex
+  local -a extra=()
+  [ $# -ge 3 ] && shift 3
+  while [ $# -gt 0 ]; do case "$1" in
+    --observed) observed=${2:-}; shift;; --log) log=${2:-}; shift;; --writer) writer=${2:-}; shift;;
+    --expected) expected=${2:-}; shift;; --link|--cost) extra+=("$1" "${2:-}"); shift;;
+    *) echo "not recorded: red: unknown arg $1" >&2; return 0;; esac; shift; done
+  [ -n "$scope" ] && [ -n "$kind" ] && [ -n "$key" ] && [ -n "$observed" ] \
+    || { echo "not recorded: red needs SCOPE KIND KEY --observed TEXT" >&2; return 0; }
+  # ONCE PER KEY. The ledger is read through cc-failures, never the file: `show --json` folds corrections in and
+  # prints [] for a scope with no ledger yet. A read that fails is said, and nothing is written over it.
+  have=$(CC_FAILURES="$FDIR" "$BIN/cc-failures" show --json --scope "$scope" 2>/dev/null) \
+    || { echo "not recorded: cc-failures show failed for scope $scope" >&2; return 0; }
+  id=$(jq -r --arg k "$key" '[.[] | select(.links.source == $k)] | .[0].id // empty' <<<"$have" 2>/dev/null)
+  [ -z "$id" ] || { echo "already $id"; return 0; }
+  ex=$(excerpt "$scope" "$key" "$log")
+  # ALWAYS EXIT 0: "a writer that fails must never fail the gate or landing it is in" — the caller's verdict was
+  # decided before this ran, and an unwritable ledger is one line here, not a red of its own.
+  if id=$(CC_FAILURES="$FDIR" "$BIN/cc-failures" record --scope "$scope" --kind "$kind" --observed "$observed" \
+            ${expected:+--expected "$expected"} --writer "$writer" --detector box --detector-evidence "$writer saw it" \
+            --link "source=$key" ${log:+--link "log=$log"} ${ex:+--evidence "excerpt:$ex"} "${extra[@]}" 2>&1); then
+    echo "recorded ${id##* }"
+  else echo "not recorded: $(tail -1 <<<"${id:-cc-failures record failed}")" >&2; fi
+  return 0
+}
+
+# A WORKER'S OWN RED IS THE WORK. The branch is measured against the base it was dispatched onto — origin/HEAD is
+# what a clone knows; a fixture with no remote falls to main, then master; with none, "own" is the working copy.
+base_ref(){ local b; for b in origin/HEAD origin/main main master; do
+  git -C "$1" rev-parse -q --verify "$b^{commit}" >/dev/null 2>&1 && { echo "$b"; return; }; done; }
+changed_paths(){   # $1 = root → the repo-relative path of every file the branch touches: its diff from the merge-base,
+  local r=$1 b mb   #   plus the working copy. The gate-itself rule reads THESE, not the basenames below.
+  b=$(base_ref "$r"); mb=HEAD; [ -z "$b" ] || mb=$(git -C "$r" merge-base HEAD "$b" 2>/dev/null || echo HEAD)
+  { git -C "$r" diff --name-only "$mb" 2>/dev/null; git -C "$r" ls-files --others --exclude-standard 2>/dev/null; } | sort -u
+}
+red_names(){   # $1 = a gate's output → basenames of the files its red names: a tool by its red tally, a file by a
+               # `path.sh:12`/`In path line 12`/`File "path"` location, a bin/<tool> word after a space or a quote
+  { sed -nE 's/^([A-Za-z0-9_.-]+) selfcheck: .*[1-9][0-9]* failed.*/\1/p' "$1"
+    grep -E "$RED_RE" "$1" | grep -oE '(^|[[:space:]"'"'"'])[A-Za-z0-9_./-]+\.(sh|py):[0-9]+' | sed -E 's/^[[:space:]"'"'"']//; s/:[0-9]+$//'
+    sed -nE 's/^In ([A-Za-z0-9_./-]+) line [0-9]+:.*/\1/p' "$1"
+    grep -oE '(^|[[:space:]"'"'"'`(])(core/)?bin/[A-Za-z0-9_.-]+' "$1" | sed 's#.*bin/##'
+  } 2>/dev/null | sed 's#.*/##' | sort -u
+}
+own_red(){   # $1 = root, $2 = gate, $3 = its output → 0 when the red is the branch's own work; says why either way
+  local r=$1 g=$2 out=$3 paths changed names n miss=""
+  paths=$(changed_paths "$r")
+  [ -n "$paths" ] || { echo "this branch touches nothing, so the red is not its work"; return 1; }
+  changed=$(sed 's#.*/##' <<<"$paths" | sort -u)   # …and their basenames, which is what red_names gives to compare
+  # THE GATE ITSELF IS MATCHED BY PATH. Against the basename list this repo's own GATES carries two check.sh, so a
+  # branch that edited only tests/check.sh made a red core/tests/check.sh read as its own work and the red was lost.
+  grep -qxF "$g" <<<"$paths" && { echo "this branch edits $g itself"; return 0; }
+  names=$(red_names "$out")
+  [ -n "$names" ] || { echo "the red names no file, so it cannot be this branch's own"; return 1; }
+  for n in $names; do grep -qxF "$n" <<<"$changed" || miss="$miss $n"; done
+  [ -z "$miss" ] && { echo "the red names only files this branch touches ($(tr '\n' ' ' <<<"$names" | sed 's/ $//'))"; return 0; }
+  echo "the red names files this branch never touched:$miss"; return 1
+}
+scope_of(){   # $1 = root → the project the ledger files this under: the worktree's `.cc/track` marker, else the checkout's name
+  local s; s=$(awk '{print $1; exit}' "$1/.cc/track" 2>/dev/null); [ -n "$s" ] || s=$(basename "$(readlink -f "$1")")
+  printf '%s' "$s" | tr -c 'A-Za-z0-9._-' '_'
+}
+red_seen(){   # $1 = root, $2 = gate, $3 = tree, $4 = its exit, $5 = its output file. Says what it did; never fails the run
+  local r=$1 g=$2 tree=$3 rc=$4 out=$5 why line scope
+  if why=$(own_red "$r" "$g" "$out"); then echo "cc-green: not recorded — $why; a worker's own red is the work, not a failure"; return 0; fi
+  line=$(grep -E "$RED_RE" "$out" 2>/dev/null | head -1 | cut -c1-200); scope=$(scope_of "$r")
+  echo "cc-green: failures ledger ($scope): $(red "$scope" gate-verdict/red "gate:$g:${tree:0:12}" \
+      --observed "gate $g did not pass (exit $rc) under cc-green on ${tree:0:12} in $r — $why${line:+; first red line: $line}" \
+      --expected "a tree handed over passes its gates" --log "$out" --writer cc-green --cost suite-run=1 \
+      --link "gate=$g" --link "tree=$tree" ${LOG:+--link "run-log=$LOG"} 2>&1 | tail -1)"
+}
+
 report(){   # $1 = root, $2 = tree. Prints a line per gate; returns 1 if any gate is not green on that tree.
   local r=$1 tree=$2 g w bad=0 any=0
   while read -r g; do
@@ -142,7 +246,7 @@ secret_names(){
 
 # Run the gates that are not green, in the landing's own order, unscoped and in the foreground.
 run_missing(){
-  local r=$1 tree=$2 g w rc n scrub
+  local r=$1 tree=$2 g w rc n scrub gout gp tp
   while read -r g; do
     w=$(why_not "$g" "$tree"); [ -n "$w" ] || continue
     echo "cc-green: $g — $w; running it"
@@ -157,8 +261,26 @@ run_missing(){
     # …and NO CREDENTIAL, on any branch: the same scrub as cc-land's clean_start (PR #323's gate read the live
     # keys through cc-config and completed a billed turn, 2026-09-09), so a worker's run and the landing's agree.
     scrub=(); while read -r n; do scrub+=(-u "$n"); done < <(secret_names)
-    ( cd "$r" && env -u CC_LAND_CHANGED "${scrub[@]}" CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" "$r/$g" ) </dev/null 9>&- || rc=$?
-    [ "$rc" = 0 ] || { echo "cc-green: $g did not pass (exit $rc) — nothing is green and nothing is handed over" >&2; return 1; }
+    # …and its output kept in a file of its own beside the stream: a red is recorded from what THIS gate said
+    # (red_seen), not from whatever the run log holds around it. Gone once the gate passes. The gate writes that
+    # file ITSELF and a tail streams it into the run log until the gate's own exit — never a pipe into tee: a
+    # pipeline ends when every holder of the gate's stdout has, so a child a gate left behind (`sleep 300 &`) held
+    # the run, its lock through tee, and every `wait` on it for the child's whole life (review of #464). Case 21.
+    # …and in a process group of its own, with a Ctrl-C on this run carried into it. bash starts an async job in a
+    # shell without job control with SIGINT and SIGQUIT ignored, and the gate's own bash keeps them ignored: the
+    # Ctrl-C killed cc-green and with it the fd-9 lock while the 20-minute suite ran on as an orphan, and the next
+    # `run` on that root started a second suite beside it. `setsid` in the async subshell — which is not a group
+    # leader, so it sets the group in place and $gp stays its leader — makes the gate and everything it starts one
+    # group the trap below can TERM, so the signal ends the suite the way the foreground gate used to. Case 22.
+    gout=$(mktemp "${TMPDIR:-/tmp}/cc-green.gate.XXXXXX") || gout=/dev/null
+    ( cd "$r" && exec setsid env -u CC_LAND_CHANGED "${scrub[@]}" CC_CONFIG_DENY="$(realpath -m "$HOME/.cc/config")" "$r/$g" ) </dev/null 9>&- >"$gout" 2>&1 & gp=$!
+    tail -n +1 -f -s 0.2 --pid="$gp" "$gout" 9>&- 2>/dev/null & tp=$!
+    trap 'kill -TERM -- -"$gp" "$tp" 2>/dev/null; exit 130' INT TERM
+    wait "$gp" || rc=$?; wait "$tp" 2>/dev/null
+    trap - INT TERM
+    [ "$rc" = 0 ] || { echo "cc-green: $g did not pass (exit $rc) — nothing is green and nothing is handed over" >&2
+                       red_seen "$r" "$g" "$tree" "$rc" "$gout" 2>&1 || true; [ "$gout" = /dev/null ] || rm -f "$gout"; return 1; }
+    [ "$gout" = /dev/null ] || rm -f "$gout"
     RAN="$RAN $g"
   done < <(gates_here "$r")
 }
@@ -240,11 +362,12 @@ main(){
 }
 
 selfcheck(){
-  local n=0 f=0 D D2 R R2 out rc rc2 tree rec p p2 pid log
+  local n=0 f=0 D D2 R R2 out rc rc2 tree rec p p2 pid gpid log
   k(){ n=$((n+1)); if [ "$1" = 0 ]; then echo "  ok   $2"; else echo "  FAIL $2"; f=$((f+1)); fi; }
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }   # …and one that must NOT hold: `t !` runs `!` as a command
   D=$(mktemp -d); trap 'rm -rf "$D"' RETURN
+  export CC_FAILURES="$D/failures"   # every record a case below writes goes to a scratch ledger, never the box's own
 
   # A fixture repo with a stub gate of its own. Every case below builds the state it asserts on: nothing here
   # reads this box's record directory, and no real suite is ever run.
@@ -474,6 +597,111 @@ EOS
   k "$(t grep -q "^CC_CONFIG_DENY=$(realpath -m "$HOME/.cc/config")\$" "$D/secret.env")" "…and the live ~/.cc/config is denied to it (CC_CONFIG_DENY, which cc-config reads as empty)"
   rm -rf "$D2"
 
+  # 18 A RED IS WRITTEN DOWN BY THE TOOL THAT SAW IT — once per gate and tree, in a record that outlives the gate's
+  # output. The fixture is a worker branch off a base whose gate is red naming a tool the branch never touched: nobody's
+  # red-first case, so it is recorded. The gate's own output file is gone by the time the run ends (run_missing
+  # removes it), and the excerpt beside the ledger is what still reads.
+  redrepo(){   # $1 = name, $2 = what the gate prints before failing, $3... = files the branch changes → a repo on track/x
+    local w x; w=$(newrepo "$1")
+    printf 'echo "%s"; exit 1\n' "$2" > "$w/red.sh"; chmod +x "$w/red.sh"
+    printf '#!/usr/bin/env bash\ncd "$(dirname "$0")/../.." && ./red.sh\n' > "$w/core/tests/check.sh"
+    ( cd "$w" && git add -A && git commit -qm base-red && { git rev-parse -q --verify main >/dev/null || git branch main; } \
+      && git checkout -q -b track/x ) >/dev/null 2>&1   # the base is `main` whatever git init called its first branch
+    shift 2; for x in "$@"; do mkdir -p "$w/$(dirname "$x")"; echo change >> "$w/$x"; done   # the branch's own work
+    ( cd "$w" && git add -A && git commit -qm branch ) >/dev/null 2>&1; echo "$w"
+  }
+  D2=$(mktemp -d); R=$(redrepo recorded 'cc-y selfcheck: 3 passed, 1 failed' docs/note.md)
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "a red gate naming a tool the branch never touched is still red"
+  k "$(t grep -q 'failures ledger (recorded): recorded f-' <<<"$out")" "…and is recorded, once, by cc-green"
+  rec=$("$BIN/cc-failures" show --json --scope recorded | jq -c '.[] | select(.kind=="gate-verdict/red")')
+  k "$(t test "$(wc -l <<<"$rec")" = 1)" "…one record of kind gate-verdict/red"
+  tree=$(green_tree "$R")
+  k "$(t test "$(jq -r .links.source <<<"$rec")" = "gate:core/tests/check.sh:${tree:0:12}")" "…keyed gate:<gate>:<tree>, the key the landing will look for"
+  k "$(t grep -q 'never touched: cc-y' <<<"$(jq -r .observed <<<"$rec")")" "…saying which file the red named that the branch did not"
+  ex=$(jq -r '.evidence[] | select(startswith("excerpt:")) | sub("^excerpt:";"")' <<<"$rec")
+  k "$(nt test -e "$(jq -r .links.log <<<"$rec")")" "the gate's own output file is gone after the run"
+  k "$(t grep -q 'cc-y selfcheck: 3 passed, 1 failed' "$ex")" "…and the excerpt beside the ledger still reads the red line"
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ) || true
+  k "$(t grep -q 'failures ledger (recorded): already f-' <<<"$out")" "the same red on the same tree a second time is 'already', not a second record"
+  k "$(t test "$("$BIN/cc-failures" show --json --scope recorded | jq 'length')" = 1)" "…and the ledger still holds one"
+  out=$("$SELF" red recorded gate-verdict/red "gate:core/tests/check.sh:${tree:0:12}" --observed "the landing saw it too" --writer the-landing 2>&1)
+  k "$(t test "$out" = "already $(jq -r .id <<<"$rec")")" "…and the landing, calling 'red' with the same key, gets the same id back"
+  rm -rf "$D2"
+
+  # 19 A WORKER'S OWN RED IS NOT RECORDED: the red-first case (the red names only a tool the branch edits), and the
+  # gate the branch is fixing (the branch edits the gate script itself). The control is case 18: the same shape of
+  # red, naming a tool the branch did not touch, IS recorded — so this cannot pass by never writing.
+  D2=$(mktemp -d); R=$(redrepo ownred 'cc-y selfcheck: 3 passed, 1 failed' core/bin/cc-y)
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "a red-first case is still red"
+  k "$(t grep -q 'not recorded — the red names only files this branch touches (cc-y)' <<<"$out")" "…and is NOT recorded: the red names only a tool the branch edits"
+  k "$(nt test -s "$D/failures/ownred.jsonl")" "…so the scope's ledger holds nothing"
+  R2=$(redrepo fixgate 'something else entirely' docs/x.md)
+  echo '# fixing' >> "$R2/core/tests/check.sh"   # the gate itself, edited in the working copy, uncommitted
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ) || true
+  k "$(t grep -q 'not recorded — this branch edits core/tests/check.sh itself' <<<"$out")" "a gate the branch is fixing is its own red, not recorded"
+  k "$(nt test -s "$D/failures/fixgate.jsonl")" "…and writes nothing"
+  # …and the control for that rule: the branch edits tests/check.sh, which this repo's GATES carries as a gate of
+  # its own and which shares a basename with the red gate. Matched by basename that read as "the branch edits the
+  # gate itself" and a red naming cc-y — a tool untouched here — was lost.
+  R2=$(redrepo sharedname 'cc-y selfcheck: 3 passed, 1 failed' tests/check.sh)
+  out=$( cd "$R2" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ) || true
+  k "$(t grep -q 'failures ledger (sharedname): recorded f-' <<<"$out")" \
+     "a branch editing tests/check.sh does not own a red core/tests/check.sh: the gate is matched by path, not basename"
+  rm -rf "$D2"
+
+  # 20 A WRITER THAT FAILS NEVER FAILS THE GATE: the ledger unwritable, the same red, the same verdict and the same
+  # line — and one line saying it was not recorded.
+  D2=$(mktemp -d); R=$(redrepo unwritable 'cc-y selfcheck: 3 passed, 1 failed' docs/note.md)
+  mkdir -p "$D/ro"; chmod 500 "$D/ro"
+  out=$( cd "$R" && CC_FAILURES="$D/ro/failures" CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$(t test "$rc" -eq 1)" "with the ledger unwritable the gate is exactly as red"
+  k "$(t grep -q 'core/tests/check.sh did not pass (exit 1)' <<<"$out")" "…with the same verdict line"
+  k "$(t grep -q 'failures ledger (unwritable): not recorded:' <<<"$out")" "…and one line saying the record was not written"
+  chmod 700 "$D/ro"; rm -rf "$D2"
+
+  # 21 THE RUN WAITS ON THE GATE, NOT ON WHAT IT LEAVES BEHIND. A gate that ends `sleep N &` leaves a child holding
+  # its stdout; through a pipe into tee that child held the run, the root's lock and every `wait` on it until it
+  # was gone (review of #464). `run` comes back on the gate's own exit — the record filed, the lock free — while
+  # the child is still going; the child's marker not being there yet is the whole claim.
+  D2=$(mktemp -d); R=$(newrepo linger)
+  printf '( sleep 15; touch "%s" ) &\n' "$D/linger.done" >> "$R/core/tests/check.sh"
+  ( cd "$R" && git add -A && git commit -qm linger )
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" run 2>&1 ); rc=$?
+  k "$rc" "a gate that leaves a child behind is green on its own exit"
+  k "$(t test ! -f "$D/linger.done")" "…and run came back while the child was still going, not when it was gone"
+  k "$(t grep -q 'hand over now' <<<"$out")" "…with its report given"
+  k "$(t flock -n "$(ls "$D2"/run-*.lock)" true)" "…and the root's lock free: the child holds no fd of the run's"
+  k "$(t test "$(grep -cx check.sh "$D/linger.log")" = 1)" "…one suite ran"
+  rm -rf "$D2"
+
+  # 22 A CTRL-C TAKES THE SUITE WITH IT. The gate runs async in a shell with no job control, which starts it with
+  # SIGINT ignored: without a group of its own and this run forwarding the signal, the INT ended cc-green and its
+  # lock while the suite ran on as an orphan, and the next `run` on that root was a second suite beside the first.
+  # The gate here says what pid it is, so its death — not just the run's — is what this asserts.
+  D2=$(mktemp -d); R=$(newrepo interrupted)
+  printf '#!/usr/bin/env bash\necho $$ > "%s"\nsleep 8\necho check.sh >> "%s"\n' "$D/interrupted.pid" "$D/interrupted.log" > "$R/core/tests/check.sh"
+  chmod +x "$R/core/tests/check.sh"; ( cd "$R" && git add -A && git commit -qm interrupt ) >/dev/null 2>&1
+  : > "$D/interrupted.log"
+  # …started the way a terminal starts it, INT at default: a shell without job control starts an async job with
+  # INT ignored, and a signal ignored at entry cannot be trapped, so the run under a plain `&` here would sit
+  # through the INT and this case would pass on a tool that never handled one.
+  ( cd "$R" && CC_GREEN_DIR="$D2" env --default-signal=INT,TERM "$SELF" run >/dev/null 2>&1 ) & p=$!
+  for _ in $(seq 100); do [ -s "$D/interrupted.pid" ] && break; sleep 0.1; done
+  gpid=$(cat "$D/interrupted.pid" 2>/dev/null)
+  pid=$(sed -n 's/^pid=//p' "$D2"/run-*.status 2>/dev/null | head -1)
+  k "$(t test -n "$gpid")" "a run with a slow gate has a gate of its own to lose"
+  sleep 0.5                        # the run is on `wait`, past the breath between starting the gate and trapping
+  kill -INT "$pid" 2>/dev/null
+  wait "$p"; rc=$?
+  k "$(t test "$rc" -eq 130)" "an INT on a foreground run ends it, 130"
+  for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
+  k "$(nt kill -0 "$gpid")" "…and the gate goes with it, rather than running on as an orphan"
+  k "$(t flock -n "$(ls "$D2"/run-*.lock)" true)" "…so the root's lock is free, and the next run is not a second suite"
+  k "$(nt grep -qx check.sh "$D/interrupted.log")" "…and the suite it interrupted never finished"
+  rm -rf "$D2"
+
   echo "cc-green selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
 }
@@ -482,6 +710,7 @@ case "${1:-}" in
   "")        main ;;
   run)       main run ;;
   wait)      case "${2:-540}" in *[!0-9]*|"") echo "$USAGE" >&2; exit 2;; esac; main wait "${2:-540}" ;;
+  red)       shift; red "$@" ;;   # no checkout needed: the landing and the loop call this from wherever they are
   selfcheck) selfcheck ;;
   *)         echo "$USAGE" >&2; exit 2 ;;
 esac
