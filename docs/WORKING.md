@@ -135,7 +135,7 @@ or a probe of the object, and the ticket it prints is the receipt. Of fifteen re
 or a proxy. The tool retrieves; it never calls a model. The steps:
 1. Name the claim — current state, a rule or decision, history, or an aggregate — and the object (row, PR, run, path, channel, date). Split only independent claims.
 2. `cc-lib ask --object <id> --need current|decision|history|aggregate "<question>"`. It opens a ticket with the byte cap and 1.5 s budget and prints the best hits, then COVERAGE and OUTCOME.
-3. Authoritative route first: task state from the reconciler, a review from the landing root record at the matching head, a run from its id, cost from `cc-econ` on the right time basis. A live claim needs a live probe of the object — a record about it is not the object.
+3. Authoritative route first: task state from the reconciler, a review from the landing root record at the matching head, a run from its id, cost from `cc-spend` on the right time basis. A live claim needs a live probe of the object — a record about it is not the object.
 4. Search only what is unresolved. Follow a hit to its record (`cc-lib get <rid>`) and its span; never read a whole journal because one line matched.
 5. Widen deliberately: one reformulation, then dates and kinds, then (owner sessions only) across workspaces.
 6. Check identity, authority and time: same head, same run, decision still in force, summary linked to evidence. Missing, unreadable, stale and not-searched are four different answers, and COVERAGE names each (pending, unreadable, hook-misses).

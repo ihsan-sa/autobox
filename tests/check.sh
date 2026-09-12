@@ -95,8 +95,6 @@ else echo "check.sh: · $PART_WHY"; fi
 # prompts it may answer, the ones it must never touch, and the spool: no tmux of this box's is read or typed at.
 # cc-spend's ticks a synthetic transcript in a HOME of its own: the rates table, the offset/dedupe rules and both
 # phantom rules, never this box's ledger and never a model.
-# cc-econ's is fixtures of its own — a fake landing log, fake run files, a throwaway git repo — over the two
-# splits that decide every number it prints: worker vs fix round, and which population a dollar belongs to.
 # cc-time's is the clock rule itself: a known UTC instant rendered in a zone of its own (never this box's), and
 # cc-notify's one Slack-facing stamp driven through in log-only mode with the UTC log line beside it.
 # cc-watch's is fixtures too — a process table in a file, a queue log and a `gh` of its own in a temp HOME — over
