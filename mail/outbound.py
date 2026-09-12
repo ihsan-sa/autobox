@@ -35,9 +35,13 @@ name.
   watching. Only a `to` root speaks for the box, so a reply in a channel that was merely copied stays in Slack.
 
 A MAIL THE BOX STARTS is the second way in and the whole of the difference. `send_to()` at the bottom takes an
-address, a subject and a text, with no mail behind it — the box mailing somebody first. Its only caller is
-`cc-mail send` on this box's own terminal, which is the owner and the sessions running as him; the daemon does
-not call it, so nothing a mail's body says, nothing a member types and no Slack message can start one. The
+address, a subject and a text, with no mail behind it — the box mailing somebody first. Two callers, both a
+`cc-mail send` somebody typed: on this box's own terminal, which is the owner and the sessions running as him;
+and inside a member workspace, where the command has no secret and no worker to talk to, so it hands the ask
+across the member socket and the daemon's `send` verb calls this on the host FOR that workspace — From the
+workspace's own address, its own files only, the same list and the same caps (owner, 2026-09-11: "all
+workspaces should be able to send emails, it's a critical path"). Nothing a mail's body says and no Slack
+message can start one: the daemon runs this on that verb alone, for the handle the socket belongs to. The
 address is checked against the verified list BEFORE anything goes on the wire (see verified()), so a recipient
 nobody meant is one line in the log rather than a POST somebody has to notice; Cloudflare's own set of verified
 destinations is the second gate and refuses whatever the first let through. Everything after that check is the
@@ -778,7 +782,7 @@ def send(cfg, chat, thread, text="", path="", now=None, ts=""):
 COLD_KEY = "cold"       # every cold mail shares one per-hour bucket: see send_to()
 
 
-def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None):
+def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace=""):
     """A MAIL WITH NO MAIL BEHIND IT — the box writing to somebody first. Returns (sent?, one line).
 
     `channel` is the sending session's own channel, or "" — session_channel() read off where the process
@@ -794,6 +798,11 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     they asked in (owner, 2026-09-11: his answer to a mail the planning seat sent from his thread opened a new
     one — "he expected it where it was asked"). The router finds the record by the tag before it reads the
     address, so `home+<tag>@` reaches it as `<channel>+<tag>@` does.
+
+    `workspace` is the member handle a mail is sent FOR, or "" for the box's own — the daemon's member verb
+    `send` passes the socket's handle and nothing off the ask. It narrows where a file may be attached from to
+    that workspace's own trees (in_workspace: `<root>/<handle>` and its Slack files dir), exactly as a reply in
+    a member's mirror thread is narrowed; the From is `channel`'s to decide, as above.
 
     `mirror` is the caller's one chance to give the mail a thread. It is called ONCE, after the mail is away
     and only for a keyed mail — a session with a channel, or a `thread` — with what a mirror needs —
@@ -863,16 +872,17 @@ def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirr
     # "making the attachment actually attach or saying plainly that it did not" (owner, 2026-09-09): a file
     # that will not travel is named on the refusal line and nothing is posted — never a link line here.
     cap = cfg_int(cfg, "MAIL_OUT_MAX_ATTACH_BYTES", MAX_ATTACH)
+    rec = {"workspace": (workspace or "").strip()}   # a member's files come only from their own trees (bases)
     attach = []
     for path in paths:
-        data, why = attach_bytes(os.path.expanduser(path), {}, cfg, cap)
+        data, why = attach_bytes(os.path.expanduser(path), rec, cfg, cap)
         if why == TOO_BIG:
             return refuse("%s is over the %s attachment cap (MAIL_OUT_MAX_ATTACH_BYTES) — nothing sent"
                           % (clip(os.path.basename(path)),
                              "%d MiB" % (cap // (1024 * 1024)) if cap >= 1024 * 1024 else "%d-byte" % cap))
         if why:
             return refuse("%s cannot be attached — not a readable regular file under %s — nothing sent"
-                          % (clip(os.path.basename(path)), trees({}, cfg)))
+                          % (clip(os.path.basename(path)), trees(rec, cfg)))
         attach.append((path, data))
 
     why = caps(cfg, COLD_KEY, rcpts, now=now)

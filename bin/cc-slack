@@ -4245,9 +4245,10 @@ class Daemon:
     # A member workspace's session runs inside bwrap with none of the box in it — not the bot token, not ~/.cc/slack/sock.
     # What it gets is ONE socket of its own, DIR/member/<h>/sock, bound by this daemon and seen inside as ~/.cc/slack/sock.
     # Every verb on it is scoped to that workspace: hello/inject only as <h> or <h>/<x>, reply/react/file/history/thread
-    # only into #<h>, #<h>--* and their -updates lanes, dispatch only `cc <h> <track> --go`. inject stamps role=member.
-    # No DM, no other channel, no owner verb (post/orch/archive/status). The token never crosses the socket: the daemon
-    # makes the Slack call. The MAIN socket gets the same peer check: SO_PEERCRED must be this user, a `hello` must come
+    # only into #<h>, #<h>--* and their -updates lanes, dispatch only `cc <h> <track> --go`, send (a mail the workspace
+    # starts) From <h>@MAIL_DOMAIN with the workspace's own files — the host sends, the secret stays out here. inject
+    # stamps role=member. No DM, no other channel, no owner verb (post/orch/archive/status). The token never crosses the
+    # socket: the daemon makes the Slack call. The MAIN socket gets the same peer check: SO_PEERCRED must be this user, a `hello` must come
     # from a process whose cwd IS the target it claims (detect_target), and the owner-level `post` verb is gone.
     def member_handles(self):
         hs = set(load_members())
@@ -4348,7 +4349,7 @@ class Daemon:
         log(f"wake {target}{'@' + alias if alias else ''} from {meta['from']}: {res}")
         return {"ok": True, "result": res, "target": target}
 
-    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project")
+    MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send")
     OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "mail", "mailed", "wake")
 
     def verbs_of(self, first):
@@ -4381,6 +4382,9 @@ class Daemon:
             elif verb == "project":
                 pass                    # names no channel and no workspace: ask_project DERIVES the name from this
                                         # socket's own workspace, so there is nothing here to point somewhere else
+            elif verb == "send":
+                pass                    # a mail, and the same: the From and the files are this socket's workspace's
+                                        # (member_send), and the recipient is the allow-list's to refuse, not a channel's
             elif verb in self.MEMBER_VERBS:
                 chat = str(first[verb])
                 name = chat[1:] if chat.startswith("#") else self.chan_name(chat) if chat and chat != "local" else chat
@@ -4409,6 +4413,8 @@ class Daemon:
             ok, msg = ask_project(self.cfg, h, str(first[verb] or ""))
             log(f"project {h}: {str(first[verb])[:40]} ok={ok}")
             return {"ok": True, "text": msg} if ok else {"ok": False, "error": msg}
+        if verb == "send":      # A MAIL THE WORKSPACE STARTS, SENT OUT HERE: the secret and the worker never enter the boundary
+            return self.member_send(h, first[verb])
         chat = str(first[verb]); target = str(first.get("target") or h)
         if chat.startswith("#"):
             chat = resolve_channel(self.cfg, chat[1:]) or chat
@@ -4492,6 +4498,71 @@ class Daemon:
                 return {"ok": False, "error": ((r.stderr or r.stdout or "").strip()[-300:]) or "cc-notify reached nobody"}
             return {"ok": True, "text": "the owner was told"}
         return {"ok": False, "error": "unknown verb"}
+
+    SEND_KEYS = ("to", "subject", "body", "attachments", "thread")   # the `send` verb's ask: cc-mail's own JSON shape, no more
+
+    def member_send(self, h, ask):
+        """A MAIL A MEMBER WORKSPACE STARTS — the member verb `send`, and the HOST sends it. Inside the boundary
+        `cc-mail send` has no config, no secret and no worker URL, and is never given them (a member can print
+        anything in there): it reads the ask as it would out here and hands it across; this runs
+        outbound.send_to where the secret already is, as `cc-mail send` on the host does, with two things fixed
+        by the SOCKET and never by the payload — the From is the workspace's own address, `<h>@MAIL_DOMAIN`
+        (channel=h, so the answer lands in #<h>), and a file attaches only from the workspace's own trees
+        (workspace=h: ~/dev/<h>, its worktrees, its Slack files dir). The verified list and both caps decide
+        as for any cold mail, the log is the same, and the one line back is send_to's own. The mirror is
+        mail_started, in-process: one line in #<h> — or under the `thread` the ask names, which must be in one
+        of the workspace's OWN channels (#<h>, #<h>--*): the line and the answer's route go where the thread
+        is, and a thread anywhere else would open a channel the boundary does not — and the record the
+        person's answer threads under. No per-workspace permission yet — owner, 2026-09-11 19:46Z: "all
+        workspaces should be able to send emails, it's a critical path; we can figure out permissions later"."""
+        if not isinstance(ask, dict):
+            return {"ok": False, "error": "send wants one object: {\"to\", \"subject\", \"body\", \"attachments\", \"thread\"}"}
+        odd = sorted(set(ask) - set(self.SEND_KEYS))
+        if odd:
+            return {"ok": False, "error": f"send: unknown key {', '.join(str(k)[:40] for k in odd)} — the keys are {', '.join(self.SEND_KEYS)}"}
+        to = ask.get("to")
+        to = ",".join(str(a) for a in to) if isinstance(to, list) else str(to or "")
+        atts, body = ask.get("attachments") or [], ask.get("body")
+        if not isinstance(atts, list) or not all(isinstance(a, str) and a.strip() for a in atts):
+            return {"ok": False, "error": "send: attachments must be a list of file paths"}
+        if body is not None and not isinstance(body, str):
+            return {"ok": False, "error": "send: body must be a string"}
+        thread = ask.get("thread")
+        if thread is not None:
+            # mail-prompt.md: "a `thread` there is one in the workspace's own channel" — held HERE, before send_to,
+            # because mail_started takes any thread a mail From one of our addresses names.
+            t_chat = str((thread or {}).get("chat") or "").strip().lstrip("#") if isinstance(thread, dict) else ""
+            t_ts = str((thread or {}).get("ts") or "").strip() if isinstance(thread, dict) else ""
+            if not (t_chat and re.fullmatch(r"\d+\.\d+", t_ts)):
+                return {"ok": False, "error": "send: thread must be {chat, ts}"}
+            t_name = (self.names.get(t_chat) or t_chat).lower()
+            if t_name != h.lower() and not t_name.startswith(h.lower() + "--"):
+                return {"ok": False, "error": f"send: the thread is in #{t_name}, not one of {h}'s own channels"}
+            thread = (t_chat, t_ts)
+        # The boundary sees the workspace's own files dir AS ~/.cc/slack/files (the `file` verb's rule): a path
+        # there is the member dir's out here. Nothing else is rewritten and nothing is checked by path —
+        # send_to opens each file once and judges the fd (outbound.attach_bytes, narrowed to this workspace).
+        inside = f"{HOME}/.cc/slack/files/"
+        paths = [HOME + a.strip()[1:] if a.strip().startswith("~/") else a.strip() for a in atts]
+        paths = [f"{member_dir(h)}/files/{q[len(inside):]}" if q.startswith(inside) else q for q in paths]
+        try:
+            OUT = mail_outbound()
+        except ImportError:
+            return {"ok": False, "error": "the mail door is not installed on this box"}
+
+        def mirror(m):   # the tail of the line, worded as cc-mail's own `mirrored` words it
+            r = self.mail_started(m)
+            t = m.get("thread") or {}
+            if not r.get("ok"):
+                where = f"the thread {t.get('chat')}/{t.get('ts')}" if t else f"#{m.get('channel')}"
+                return f". No line in {where} — {str(r.get('error') or 'the daemon refused')[:160]}, so a reply opens a new thread"
+            if t:
+                return f". Its line is in your thread in #{r.get('name') or t.get('chat')}, and the answer lands there"
+            return f". Its thread is in #{r.get('name') or m.get('channel')}"
+        ok, line = OUT.send_to(self.cfg, to, str(ask.get("subject") or ""), body or "", attachments=paths,
+                               channel=h, mirror=mirror, thread=thread, workspace=h)
+        log(f"send {h}: to={to[:80]} files={len(paths)} ok={ok}")
+        return {"ok": True, "text": line} if ok else {"ok": False, "error": line}
 
     def handle_conn(self, c, member=None):
         f = c.makefile("rb")
@@ -16224,6 +16295,42 @@ def cmd_selfcheck():
         made_cap = list(madeMS)
         globals()["new_project"] = real_np_ms
 
+        # ---- A MAIL THE WORKSPACE STARTS IS SENT OUT HERE (member verb `send`). The ask is cc-mail's own JSON shape and
+        # nothing more; the From and the files are THE SOCKET'S workspace's, never the payload's; the secret and the worker
+        # stay on this side. Owner, 2026-09-11: "all workspaces should be able to send emails, it's a critical path".
+        sentMS = []
+
+        class FakeOut:
+            """outbound.send_to as the daemon calls it: records the ask, refuses one address the way the list would."""
+            @staticmethod
+            def send_to(cfg, to, subject, text, attachments=None, now=None, channel="", mirror=None, thread=None, workspace=""):
+                sentMS.append({"to": to, "subject": subject, "text": text, "attachments": list(attachments or []),
+                               "channel": channel, "workspace": workspace, "thread": thread})
+                if to == "stranger@x.example":
+                    return False, "stranger@x.example is not one of the box's verified destinations — nothing sent"
+                tail = mirror({"channel": channel, "from": f"{channel}@box.example", "to": [to], "message_id": "<m@x>", "tag": "ab12",
+                               "thread": {"chat": thread[0], "ts": thread[1]} if thread else None}) if mirror else ""
+                return True, f"mailed to {to} from {channel}@box.example" + tail
+        real_mo_ms = globals()["mail_outbound"]; globals()["mail_outbound"] = lambda: FakeOut
+        r_send = ms_req({"send": {"to": ["a@x.example"], "subject": "hello", "body": "from inside",
+                                  "attachments": ["~/.cc/slack/files/report.pdf", f"{DEV}/alice/notes.txt"]}})
+        r_send_bob = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b"}}, member="bob")
+        r_send_ref = ms_req({"send": {"to": "stranger@x.example", "subject": "s", "body": "b"}})
+        r_send_from = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "from": "owner@box.example"}})
+        r_send_str = ms_req({"send": "a@x.example"})
+        r_send_att = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "attachments": "x"}})
+        # A THREAD IS ONE OF THE WORKSPACE'S OWN: alice's channel by id, her track channel by name, both cross to
+        # send_to as (chat, ts); bob's channel and a malformed thread are refused before send_to sees the ask.
+        r_send_thr = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "thread": {"chat": "CAL", "ts": "1800.5"}}})
+        r_send_thr_track = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "thread": {"chat": "#alice--todo", "ts": "1800.6"}}})
+        n_sent_before_bad_thread = len(sentMS)
+        r_send_thr_bob = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "thread": {"chat": "CBOB", "ts": "1800.7"}}})
+        r_send_thr_bad = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b", "thread": "CAL/1800.8"}})
+        n_sent_before_main = len(sentMS)
+        r_send_main = ms_req({"send": {"to": "a@x.example", "subject": "s", "body": "b"}}, member=None, peer=(999999, os.getuid(), f"{DEV}/myrepo"))
+        sent_ms = list(sentMS)
+        globals()["mail_outbound"] = real_mo_ms
+
         # ---- A COURSE THAT APPEARS GETS ITS CHANNEL, WITH NOBODY TYPING ANYTHING (workspace_projects + projects_sweep)
         # Same door as the asks above, so what these prove is the SWEEP's own two decisions: which directories it
         # calls projects, and that a folder name — which is a MEMBER-CONTROLLED STRING, the thing this whole row
@@ -16377,6 +16484,33 @@ def cmd_selfcheck():
               for r in (r_two_dm, r_two_disp, r_two_own, r_two_main, r_none))
           and ran_two == ran_disp and not any(p[0] == "DM1" for p in postedMS)
           and r_str.get("ok") is False and "JSON object" in r_str.get("error", ""))
+    check("MEMBER socket: `send` is a mail the workspace starts, SENT OUT HERE — the ask crosses as cc-mail's own shape and "
+          "outbound.send_to runs on the host with the From (channel) and the file trees (workspace) taken from THE SOCKET, "
+          "bob's from bob's; a path under the boundary's ~/.cc/slack/files is this member's files dir out here; the line "
+          "back is send_to's own with the mirror's tail, and the mirror is mail_started",
+          r_send.get("ok") and sent_ms[0]["to"] == "a@x.example" and sent_ms[0]["subject"] == "hello"
+          and sent_ms[0]["text"] == "from inside" and sent_ms[0]["channel"] == "alice" and sent_ms[0]["workspace"] == "alice"
+          and sent_ms[0]["attachments"] == [f"{member_dir('alice')}/files/report.pdf", f"{DEV}/alice/notes.txt"]
+          and r_send.get("text", "").startswith("mailed to a@x.example from alice@box.example. No line in #alice")
+          and r_send_bob.get("ok") and sent_ms[1]["channel"] == "bob" and sent_ms[1]["workspace"] == "bob")
+    check("MEMBER socket: what send_to refuses comes back as the refusal, ok=False, and the ask is judged BEFORE the host "
+          "sends — a `from` key (the address is the socket's, not the payload's), a bare string, attachments that are not "
+          "a list: each refused by name with nothing handed to send_to; and `send` is a member-socket verb, not the main's",
+          r_send_ref.get("ok") is False and "verified destinations" in r_send_ref.get("error", "")
+          and r_send_from.get("ok") is False and "unknown key from" in r_send_from.get("error", "")
+          and r_send_str.get("ok") is False and "one object" in r_send_str.get("error", "")
+          and r_send_att.get("ok") is False and "list of file paths" in r_send_att.get("error", "")
+          and len(sent_ms) == 5 and n_sent_before_main == 5
+          and r_send_main.get("ok") is False and "member-socket verb" in r_send_main.get("error", ""))
+    check("MEMBER socket: a `thread` on `send` is held to the workspace's OWN channels — alice's by id and her track channel "
+          "by name cross to send_to as (chat, ts) and the line says where it went; bob's channel and a thread that is not "
+          "{chat, ts} are refused before send_to, so a member cannot put a mail's line, or route its answer, elsewhere",
+          r_send_thr.get("ok") and sent_ms[3]["thread"] == ("CAL", "1800.5") and sent_ms[3]["channel"] == "alice"
+          and ". No line in the thread CAL/1800.5 — " in r_send_thr.get("text", "")   # mail_started's own refusal here: no real channel
+          and r_send_thr_track.get("ok") and sent_ms[4]["thread"] == ("alice--todo", "1800.6")
+          and r_send_thr_bob.get("ok") is False and "not one of alice's own channels" in r_send_thr_bob.get("error", "")
+          and r_send_thr_bad.get("ok") is False and "thread must be {chat, ts}" in r_send_thr_bad.get("error", "")
+          and n_sent_before_bad_thread == 5)
     check("MEMBER socket: `project` is the SECOND door to a sub-channel — a session asks, the daemon creates. The "
           "workspace half of the name is taken from THE SOCKET and never from the payload, so the only thing that "
           "crosses is the leaf; the ask comes back with what was made",

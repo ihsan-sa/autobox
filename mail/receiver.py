@@ -68,8 +68,14 @@ held mail the only word its sender gets until a person decides — and it is wri
                                             the same with no files: the body is --body, or stdin without it
 
 SENDING IS THE ONLY THING HERE THAT IS NOT THE SERVER'S. `send` runs in the terminal it was typed in, talks to
-the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path — the
-daemon does not have one, so no mail's body, no member and no Slack message can start a mail. It goes only to
+the Cloudflare Worker and not to this server, and is the only way into core/mail/outbound.py's cold path — no
+mail's body and no Slack message can start a mail. INSIDE A MEMBER WORKSPACE (CC_MEMBER_SANDBOX=1) the same
+command has no config, no secret and no worker URL, and must not — a member can print anything in there — so
+it reads the ask exactly as here and hands it across the member socket (`~/.cc/slack/sock` inside, which is
+the workspace's own scoped link) as the daemon's member verb `send`; the daemon sends it on the host FOR that
+workspace, From `<handle>@MAIL_DOMAIN`, files from the workspace's own trees only, a `thread` only in the
+workspace's own channels, and the one line comes back the same (owner, 2026-09-11: "all workspaces should be able
+to send emails, it's a critical path"). It goes only to
 an address on MAIL_SEND_ALLOW (MAIL_ALLOW when that is unset), which is the owner's own set of verified
 destinations, and it is charged the same caps and written to the same ~/.cc/mail/out.log as a reply. It comes
 From the sending SESSION'S OWN channel address, `<channel>@MAIL_DOMAIN`, when the session has one (a track
@@ -675,11 +681,12 @@ def routed(mail_id):
     return answer.get("reply") or "", "yes" if answer.get("routed") else "nowhere"
 
 
-def daemon(req):
-    """One request on cc-slack's owner socket, one JSON answer back. Raises on no daemon, a timeout or an
-    answer that is not JSON — each caller says what that costs in its own words."""
+def daemon(req, timeout=ROUTE_WAIT):
+    """One request on cc-slack's owner socket (the member socket, inside a workspace), one JSON answer back.
+    Raises on no daemon, a timeout or an answer that is not JSON — each caller says what that costs in its
+    own words."""
     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    c.settimeout(ROUTE_WAIT)
+    c.settimeout(timeout)
     try:
         c.connect(SLACKSOCK)
         c.sendall((json.dumps(req) + "\n").encode())
@@ -1197,16 +1204,48 @@ def send_ask(opt):
     return to, subject, body, [], thread
 
 
+MEMBER_SEND_WAIT = 90   # seconds a workspace waits for the host's answer: the daemon's call to the worker is
+                        # inside it (outbound.SEND_TIMEOUT), and a wait shorter than that reports a mail that
+                        # went as one that did not
+
+
+def send_across(to, subject, body, attachments, thread=None):
+    """`cc-mail send` INSIDE A MEMBER WORKSPACE: the ask, read and checked here exactly as on the host, handed to
+    the daemon's member verb `send` over the workspace's socket. Returns (sent?, the one line) — the host's own
+    line when it answered, and a line saying the host did not when it did not. Nothing about the mail is
+    decided in here: the From, the list, the caps and the files are the host's, and the secret never crosses.
+    `thread` (chat, ts) crosses as {"chat", "ts"} when the ask named one; the host holds it to the workspace's
+    own channel."""
+    ask = {"to": to, "subject": subject, "body": body, "attachments": list(attachments or [])}
+    if thread:
+        ask["thread"] = {"chat": str(thread[0]), "ts": str(thread[1])}
+    try:
+        answer = daemon({"send": ask}, timeout=MEMBER_SEND_WAIT)
+    except Exception as e:
+        return False, ("not sent — the workspace's socket did not answer (%s): the host sends for this workspace, "
+                       "and nothing there is listening" % clip(str(e)))
+    if not isinstance(answer, dict) or not answer.get("ok"):
+        return False, str((answer or {}).get("error") if isinstance(answer, dict) else "") or "not sent — the host refused"
+    return True, str(answer.get("text") or "mailed")
+
+
 def cmd_send(opt):
     """`cc-mail send` — one mail the box starts. outbound.send_to() decides everything; this reads the ask.
 
     A malformed ask is exit 2 and a line saying what was wrong — including a terminal with neither --body nor
-    stdin, which is told so rather than left waiting on a tty. Exit 1 is the mail's own refusal, from send_to()."""
+    stdin, which is told so rather than left waiting on a tty. Exit 1 is the mail's own refusal, from send_to().
+
+    Inside a member workspace the ask is read the same and then crosses the member socket (send_across): the
+    host runs send_to for the workspace and this prints its line, exit 0/1 by the host's answer."""
     ask = send_ask(opt)
     if isinstance(ask, str):
         print(ask, file=sys.stderr)
         return 2
     to, subject, body, attachments, thread = ask
+    if os.environ.get("CC_MEMBER_SANDBOX") == "1":   # inside a boundary: no config, no secret, no worker — the host sends
+        ok, line = send_across(to, subject, body, attachments, thread)
+        print(line, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import outbound                          # noqa: E402 — a sibling, imported here for cc-mail's own reason
     # The From is the session's own channel's address when it has one, home@ when it does not — read off where

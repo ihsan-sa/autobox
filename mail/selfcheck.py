@@ -3232,6 +3232,125 @@ def run():
           "the sender's answer to that mail lands on the SAME held conversation: placing the hold kept it, so "
           "their reply threads under the held line rather than opening a new one")
 
+
+    # ------------------------------- 25. a member workspace's mail is sent by the host (owner, 2026-09-11)
+    # "all workspaces should be able to send emails, it's a critical path; we can figure out permissions later"
+    # (19:46Z). Two halves, each on its own fixture. (a) send_to's `workspace=`: the daemon's `send` verb passes
+    # the socket's handle, and a file then attaches only from that workspace's own trees — the other member's
+    # file is named on the refusal and nothing is sent; with no workspace the roots are whole, as for the box.
+    # (b) the command INSIDE a boundary: CC_MEMBER_SANDBOX=1, no secret, no worker — `cc-mail send` hands the
+    # ask across the socket as {"send": {...}} and prints the host's line; a malformed ask never reaches the
+    # socket; no daemon, or a refusal, is exit 1 and one line saying so.
+    with Box(allow=ALLOWED + "," + OTHER) as b:
+        dev25 = os.path.join(b.tmp, "dev25")
+        for ws in ("mem", "other"):
+            os.makedirs(os.path.join(dev25, ws))
+            with open(os.path.join(dev25, ws, "notes.txt"), "w") as f:
+                f.write("%s's own file\n" % ws)
+        mine25, theirs25 = os.path.join(dev25, "mem", "notes.txt"), os.path.join(dev25, "other", "notes.txt")
+
+        def cold25(worker, **kw):
+            c = {"MAIL_SEND_URL": worker.url, "MAIL_SEND_SECRET": "s3cret", "MAIL_DOMAIN": "box.example",
+                 "MAIL_SEND_ALLOW": ALLOWED, "MAIL_OUT_ROOTS": dev25}
+            c.update({k: str(v) for k, v in kw.items()})
+            return c
+
+        def fresh25():
+            shutil.rmtree(outbound.OUTDIR, ignore_errors=True)
+            open(outbound.LOGFILE, "w").close()
+            outbound._UNCONFIGURED_SAID[0] = False
+
+        # (a) THE WORKSPACE NARROWS THE TREES. The From is the channel's (section 22); the files are the workspace's.
+        fresh25()
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold25(w), ALLOWED, "mine", "with my file", attachments=[mine25],
+                                        channel="mem", workspace="mem")
+            call = w.one()
+        k(ok and call["from"] == "mem@box.example" and [q.get_filename() for q in call["msg"].iter_attachments()] == ["notes.txt"]
+          and "notes.txt" in line,
+          "a mail sent FOR a member workspace goes From <handle>@ with a file from ~/dev/<handle> attached")
+        fresh25()
+        with FakeWorker() as w:
+            ok, line = outbound.send_to(cold25(w), ALLOWED, "theirs", "with another's file", attachments=[theirs25],
+                                        channel="mem", workspace="mem")
+            n25 = len(w.calls)
+        k(not ok and n25 == 0 and "notes.txt cannot be attached" in line and os.path.join(dev25, "mem") in line
+          and os.path.join(dev25, "other") not in line,
+          "…and another member's file is refused by name and NOTHING is sent: the line names the workspace's own "
+          "trees and not the root — one member's file never leaves in another's mail")
+        fresh25()
+        with FakeWorker() as w:
+            ok, _ = outbound.send_to(cold25(w), ALLOWED, "box", "the box's own", attachments=[theirs25], channel="mem")
+            call = w.one()
+        k(ok and [q.get_filename() for q in call["msg"].iter_attachments()] == ["notes.txt"],
+          "…while with no workspace named — the box's own `cc-mail send` — the same file attaches from the whole root")
+
+        # (b) THE COMMAND INSIDE THE BOUNDARY. The environment is the sandbox's: CC_MEMBER_SANDBOX=1 and none of the
+        # send keys — and a worker IS reachable here on purpose, so that its silence proves the command never
+        # tried it: inside, the host is the only way out.
+        env25 = {k: "" for k in r.SEND_KEYS if k not in Box.KEYS}
+        env25["CC_MEMBER_SANDBOX"] = "1"
+        saved25 = {k: os.environ.get(k) for k in env25}
+        out25, err25 = sys.stdout, sys.stderr
+        ask25 = os.path.join(b.tmp, "ask25.json")
+        try:
+            os.environ.update(env25)
+            with FakeWorker() as w:
+                os.environ["MAIL_SEND_URL"] = w.url; os.environ["MAIL_SEND_SECRET"] = "s3cret"
+                with open(ask25, "w") as f:
+                    json.dump({"to": [ALLOWED], "subject": "from inside", "body": "the workspace's own words",
+                               "attachments": ["~/.cc/slack/files/report.pdf"]}, f)
+                with FakeDaemon({"ok": True, "text": "mailed to %s from mem@box.example. Its thread is in #mem" % ALLOWED}) as d:
+                    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+                    rc = r.cmd_send({"--json": ask25})
+                    said, erred = sys.stdout.getvalue(), sys.stderr.getvalue()
+                    sys.stdout, sys.stderr = out25, err25
+                    crossed = list(d.asked)
+                    with open(ask25, "w") as f:
+                        json.dump({"to": ALLOWED, "subject": "s", "body": "b", "from": "anyone@box.example"}, f)
+                    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+                    rc_bad = r.cmd_send({"--json": ask25})
+                    erred_bad = sys.stderr.getvalue()
+                    sys.stdout, sys.stderr = out25, err25
+                    crossed_bad = len(d.asked)
+                with open(ask25, "w") as f:
+                    json.dump({"to": STRANGER, "subject": "s", "body": "b", "thread": "C-mem/1800.5"}, f)
+                with FakeDaemon({"ok": False, "error": "%s is not one of the box's verified destinations — nothing sent" % STRANGER}) as d:
+                    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+                    rc_ref = r.cmd_send({"--json": ask25})
+                    said_ref, erred_ref = sys.stdout.getvalue(), sys.stderr.getvalue()
+                    sys.stdout, sys.stderr = out25, err25
+                    crossed_ref = list(d.asked)
+                sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+                rc_none = r.cmd_send({"--json": ask25})      # no socket bound: nothing on the host is listening
+                erred_none = sys.stderr.getvalue()
+                sys.stdout, sys.stderr = out25, err25
+                worker_calls = len(w.calls)
+        finally:
+            sys.stdout, sys.stderr = out25, err25
+            for k25, v in saved25.items():
+                if v is None:
+                    os.environ.pop(k25, None)
+                else:
+                    os.environ[k25] = v
+        k(rc == 0 and said.strip() == "mailed to %s from mem@box.example. Its thread is in #mem" % ALLOWED and not erred
+          and crossed == [{"send": {"to": ALLOWED, "subject": "from inside", "body": "the workspace's own words",
+                                    "attachments": ["~/.cc/slack/files/report.pdf"]}}],
+          "`cc-mail send` inside a member boundary hands the ask across the socket as {\"send\": {to, subject, body, "
+          "attachments}} — the paths as typed, the From nowhere in it — and prints the host's line, exit 0")
+        k(worker_calls == 0,
+          "…and never talks to the worker itself, even with a URL and a secret in its environment: inside, the host is "
+          "the only way out")
+        k(rc_bad == 2 and crossed_bad == 1 and "unknown key from" in erred_bad,
+          "…a malformed ask is refused where it was typed, exit 2, and nothing crosses the socket")
+        k(rc_ref == 1 and not said_ref.strip() and "verified destinations" in erred_ref
+          and crossed_ref[0]["send"].get("thread") == {"chat": "C-mem", "ts": "1800.5"}
+          and "thread" not in crossed[0]["send"],
+          "…the host's refusal comes back as the line, on stderr, exit 1; a `thread` the ask names crosses as {chat, ts} "
+          "for the host to hold to the workspace's own channel, and an ask without one carries no thread key")
+        k(rc_none == 1 and "socket did not answer" in erred_none and "nothing there is listening" in erred_none,
+          "…and with nothing listening on the host, exit 1 and a line saying that rather than a hang or a traceback")
+
     print("cc-mail selfcheck: %d passed, %d failed" % (n[0] - len(fails), len(fails)))
     return 1 if fails else 0
 

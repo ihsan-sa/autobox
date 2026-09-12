@@ -39,7 +39,8 @@
 #     ~/.cc/members/<handle>/ — ~/.claude is the WHOLE config dir (~/.cc/members/<handle>/claude), one dir for every session of the
 #     handle, because claude's cross-process refresh lock is made INSIDE it (~/.claude/.oauth_refresh.lock) and a lock made in a
 #     per-session tmpfs serialises nothing (launch_member says what that cost) · the control plane's core/bin bound ro AS ~/bin, so
-#     ~/dev/<control repo> does not exist inside · ONE credential
+#     ~/dev/<control repo> does not exist inside, and its core/mail ro AS ~/mail, where ~/bin/cc-mail (the relative link
+#     ../mail/receiver.py) lands — so `cc-mail send` runs inside and hands the ask over the member socket · ONE credential
 #     at ~/.claude/.credentials.json — the workspace's OWN (~/.cc/members/<handle>/credentials.json, minted by the owner with
 #     `cc-sandbox mint`, kept whole, BOUND rw at that path so the refresh a session makes inside is what the next launch
 #     starts from and what every other live session of the handle reads next; its host path is not inside) and
@@ -130,7 +131,7 @@
 #   contained here and this does not claim to contain it: it is contained when stage 1b (ccbox, an allowlist proxy)
 #   exists. His file is read, never written, and never edited by this box — the paragraph at SBX_ALLOW says why each
 #   way round.
-# INSIDE ro: ~/bin and the bin it links into · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
+# INSIDE ro: ~/bin and the bin it links into · ~/mail (core/mail, the target of ~/bin/cc-mail) · ~/.local/bin + ~/.local/share/claude (claude itself) · ~/.gitconfig · ~/.npmrc
 #   · /usr · /etc.  ABSENT: ~/.config/gh · ~/ccbox · ~/.cc/config · ~/.ssh · /run and /var/run (the container socket) · $TMUX
 #   and its socket · every other track, the rest of ~/dev · and the docker group itself (bwrap maps one uid; supplementary
 #   groups become nobody).
@@ -617,7 +618,7 @@ gh_bind(){   # $1 handle — A WORKSPACE GRANTED A GITHUB TOKEN HOLDS IT INSIDE 
   B+=(--ro-bind "$d/hosts.yml" "$H/.config/gh/hosts.yml" --ro-bind "$d/config.yml" "$H/.config/gh/config.yml"
      --ro-bind "$d/gitconfig" "$H/.gitconfig"); }
 build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a member's world and nothing of the box's
-  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own
+  local h="$1" tr="$2" dev="$H/dev/$1" m="$H/.cc/members/$1" sl="$H/.cc/slack/member/$1" cb v cwd twt tname gw gd own mailsrc
   [ -f "$dev/.cc/member-workspace" ] || { echo "cc-sandbox: ~/dev/$h is not a member workspace (no .cc/member-workspace)" >&2; exit 2; }
   cwd="$dev"; [ -n "$tr" ] && cwd="$H/.cc/worktrees/$h/$tr"
   [ -n "$TREE" ] && cwd="$TREE"   # …or the landing's tree (--tree): checked in launch_member before this runs, bound below
@@ -703,6 +704,12 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
      --setenv HOME "$H" --setenv PATH "$H/bin:$H/.local/bin:/usr/local/bin:/usr/bin:/bin" --setenv CC_MEMBER_SANDBOX 1 --setenv CC_ROLE member
      --setenv GIT_AUTHOR_NAME "$h" --setenv GIT_AUTHOR_EMAIL "$h@member.$(hostname -s)" --setenv GIT_COMMITTER_NAME "$h" --setenv GIT_COMMITTER_EMAIL "$h@member.$(hostname -s)"
      --chdir "$cwd")
+  # ~/bin/cc-mail is the RELATIVE link ../mail/receiver.py, so with core/bin at $H/bin it lands on $H/mail — bound here, ro,
+  # from wherever the link resolves on the host, or `cc-mail send` inside is ENOENT before it reaches the socket (review of
+  # #453). A bin with no cc-mail beside this script (a fixture's copy) binds nothing, and has nothing to run. Nothing secret
+  # is in it: core/ is the published half, and the send secret and the worker URL are in ~/.cc/config, which stays absent.
+  mailsrc=$(dirname "$(readlink -f "$cb/cc-mail" 2>/dev/null || echo /nonexistent/cc-mail)")
+  [ -f "$mailsrc/receiver.py" ] && B+=(--ro-bind "$mailsrc" "$H/mail")
   [ -n "$TREE" ] && B+=(--bind "$TREE" "$TREE")   # the one host tree a landing's gates run on, rw, at its own path (see the header)
   # His hooks (cc-guard: depth inside the wall) come through this copy unchanged, with the sealed-session permissions
   # appended. ~/.cc/sandbox is under no bind above, so the source of the copy is not reachable from inside.
@@ -990,7 +997,7 @@ github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitH
   echo "cc-sandbox: ~/dev/$r holds $f from its next launch (~/.cc/members/$r/github-token) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
-  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree mailrec
   cb=$(dirname "$SELF")   # the host side of every board case below: THIS tree's cc-board, which resolves a linked board before it renames
   dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
   : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
@@ -1103,6 +1110,40 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
   t 'credential: …and the next launch starts from it, with no person' "$(g next)" "refreshed-$$"
   real1=$(md5sum "$c" 2>/dev/null | cut -d' ' -f1); real1="${real1:-absent}"
   t 'credential: the box'"'"'s own ~/.claude/.credentials.json is untouched by all of that' "$real1" "$real0"
+  # ── A MAIL THE WORKSPACE STARTS LEAVES THROUGH THE SOCKET (review of #453: ~/bin/cc-mail is the relative link
+  #    ../mail/receiver.py, and with nothing at ~/mail it was ENOENT inside before any socket was reached — every other case
+  #    of that path fakes the socket in-process). Here the entry point runs from the boundary itself: a fake daemon on the
+  #    HOST listens at the member dir's sock (what ~/.cc/slack/sock is inside), answers one line, and records what crossed.
+  #    Then with the daemon gone the same send fails closed, exit 1, naming the socket — never the worker, never ENOENT.
+  mailrec="$H/.cc/sandbox/$h/mail-asked.$$"; mkdir -p "$(dirname "$mailrec")"; rm -f "$mailrec" "$H/.cc/slack/member/$h/sock"
+  python3 - "$H/.cc/slack/member/$h/sock" "$mailrec" "$h" >/dev/null 2>&1 <<'PY' &
+import json, os, socket, sys
+path, rec, h = sys.argv[1:4]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(path); s.listen(1); s.settimeout(60)
+try:
+    c, _ = s.accept(); line = c.makefile("rb").readline()
+    open(rec, "wb").write(line)
+    c.sendall((json.dumps({"ok": True, "text": "mailed to a@x.example from %s@box.example. Its thread is in #%s" % (h, h)}) + "\n").encode())
+    c.close()
+finally:
+    s.close(); os.unlink(path)
+PY
+  s1=$!
+  i=0; while [ $i -lt 50 ] && [ ! -S "$H/.cc/slack/member/$h/sock" ]; do i=$((i+1)); sleep 0.1; done
+  out=$("$SELF" member "$h" t -- sh -c '
+    echo mailbin=$([ -e ~/bin/cc-mail ] && echo present || echo absent); echo mailrw=$(touch ~/mail/x 2>/dev/null && echo writable || echo ro)
+    printf "%s" "{\"to\": [\"a@x.example\"], \"subject\": \"from inside\", \"body\": \"held text\"}" > /tmp/ask.json
+    o=$(cc-mail send --json /tmp/ask.json 2>/tmp/err); echo rc=$?; echo sent=$o; echo err=$(cat /tmp/err)' 2>&1); wait "$s1"
+  t 'mail: ~/bin/cc-mail resolves inside — its target core/mail is bound at ~/mail, read-only' "$(g mailbin)/$(g mailrw)" present/ro
+  t 'mail: `cc-mail send --json` run INSIDE the boundary exits 0 with the host'"'"'s own line' "$(g rc)/$(g sent)" "0/mailed to a@x.example from $h@box.example. Its thread is in #$h"
+  t 'mail: …and what crossed the socket is the ask as {"send": …} — to, subject, body — with no From, no secret and no URL in it' \
+    "$(jq -c '[(keys | join(",")), (.send | keys | join(",")), .send.to, .send.subject, .send.body]' "$mailrec" 2>/dev/null)" \
+    '["send","attachments,body,subject,to","a@x.example","from inside","held text"]'
+  out=$("$SELF" member "$h" t -- sh -c 'printf "%s" "{\"to\": [\"a@x.example\"], \"subject\": \"s\", \"body\": \"b\"}" > /tmp/ask.json
+    o=$(cc-mail send --json /tmp/ask.json 2>/tmp/err); echo rc=$?; echo sent=$o; echo err=$(cat /tmp/err)' 2>&1)
+  t 'mail: with nothing listening on the host the same send fails CLOSED — exit 1, the socket named, nothing printed as sent' \
+    "$(g rc)/$(g sent)/$(grep -c 'nothing there is listening' <<<"$(g err)")" 1//1
+  rm -f "$mailrec"
   # ── TWO SESSIONS, ONE CREDENTIAL, ONE LOCK (2026-09-08: two sessions of one handle refreshed the same token, the account
   #    refused the second and it blanked the file for both). Session 1, the workspace session, does what claude does around
   #    a refresh: mkdir ~/.claude/.oauth_refresh.lock, rotate both tokens in place, hold the lock a moment, rmdir it. Session
