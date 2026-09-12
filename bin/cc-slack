@@ -4349,8 +4349,25 @@ class Daemon:
         log(f"wake {target}{'@' + alias if alias else ''} from {meta['from']}: {res}")
         return {"ok": True, "result": res, "target": target}
 
+    def sender(self, chat, peer):
+        """{"sender": chat|""} from `cc-slack post`, before it posts: WHO IS SENDING THIS, and is `chat` their own
+        channel. The name comes from the live subscription that owns the caller's pid chain (peer_seat) and from
+        nothing else — not CC_SLACK_ALIAS, which is whatever shell the call was made from (an orch's alias leaked
+        into a suite that way and turned a case red, #267), and not a cwd the caller can write. `own` is False only
+        for another session's channel: a post there opens with a mention of it, so the owner sees it is addressed
+        to that session and not to him (owner, 2026-09-11). No seat — machinery, a cron, a bare shell — is no name
+        and nothing mentioned: the post goes out under the app's plain name, as it always did."""
+        seat = self.peer_seat(peer)
+        if not seat:
+            return {"ok": True, "name": None, "own": True}
+        own = True
+        if chat and not str(chat).startswith("D"):          # a DM is the owner's, never a session's channel
+            target = self.route(chat, None)
+            own = not target or (target, self.chan_alias(chat)) == seat
+        return {"ok": True, "name": display_name(seat[0], seat[1]), "own": own}
+
     MEMBER_VERBS = ("reply", "react", "file", "history", "thread", "dispatch", "escalate", "project", "send")
-    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "mail", "mailed", "wake")
+    OWNER_VERBS = ("hello", "inject", "orch", "archive", "status", "post", "permission", "mail", "mailed", "wake", "sender")
 
     def verbs_of(self, first):
         """Every recognised verb key in a request. EXACTLY ONE is allowed, because exactly one is authorised: the
@@ -4676,6 +4693,8 @@ class Daemon:
                 res = self.wake(str(first["wake"] or ""), str(first.get("ts") or ""), first.get("thread_ts") or None,
                                 str(first.get("text") or ""), self.peer_of(c))
                 c.sendall((json.dumps(res) + "\n").encode())
+            elif verb == "sender":       # {"sender": chat|""} — `cc-slack post` asking who it is, before it posts
+                c.sendall((json.dumps(self.sender(str(first.get("sender") or ""), self.peer_of(c))) + "\n").encode())
             elif verb == "permission":   # {"permission": "<request_id>", "answer": "yes"|"no"} — the SAME path a Slack
                 # `yes <id>` takes, for the session that reads the -threads lane: it can answer without a round trip
                 # through the owner's phone. WHO answered is peer_session's to say — this socket and a live
@@ -8972,6 +8991,21 @@ def post_flag(tok):
     return bool(re.match(r"^--?[A-Za-z][\w-]*$", tok))
 
 
+def sender_name(chat=None):
+    """(display name, own) for the post this process is about to make: the session the DAEMON says is calling, and
+    whether `chat` is that session's own channel. Asked of the daemon and never worked out here — out here there is
+    only the environment, and the environment is whatever shell the call came from (CC_SLACK_ALIAS from an orch
+    shell once signed a suite's posts, #267). No daemon, or no session behind the caller: (None, True) — the app's
+    plain name and no mention, which is what every post did before. CC_SLACK_PLAIN_NAME=1 drops the name only; who
+    a post is addressed to is not a matter of style."""
+    try:
+        r = sock_request({"sender": chat or ""}, timeout=5)
+    except Exception:
+        return None, True
+    name = None if os.environ.get("CC_SLACK_PLAIN_NAME") == "1" else (r.get("name") or None)
+    return name, bool(r.get("own", True))
+
+
 def cmd_post(argv):
     cfg = load_cfg()
     chan = thread = route = ts = pid = None
@@ -9054,10 +9088,18 @@ def cmd_post(argv):
         # RUNG 1 of the ladder: an @-mention in the MAIN channel is "you, NOW" — the raw <@U…> form, because it has to
         # notify for real and no caller here knows the owner's handle. Unpaired, the post still goes to the main lane.
         text = f"<@{cfg['SLACK_OWNER_ID']}> {text}"
+    # WHO SENT IT, AND WHO IT IS FOR (owner, 2026-09-11). The post signs with the session the daemon says is calling,
+    # so the owner reads the sender in the name and not in the text; and a `-c '#name'` post into ANOTHER session's
+    # channel opens with a mention of that channel, because one that did not read to him as addressed to him.
+    # The name is on every post a session makes here, a --route digest included. The mention is on `-c '#name'` and
+    # nothing else — the wake's own condition: a --route post is machinery and a raw C… id is the reply tool's door.
+    uname, own = sender_name(chan)
+    if named and not own:
+        text = f"<#{chan}> {text}"
     missed = unresolved_mentions(cfg, text, chan)
     if pid:
         try:
-            n, posted_ts, how = submit(cfg, pid, chan, text, thread, ts=ts)
+            n, posted_ts, how = submit(cfg, pid, chan, text, thread, username=uname, ts=ts)
         except Exception as e:
             print(f"cc-slack post: {pid} not sent ({e.__class__.__name__}: {str(e)[:160]}) — the intent stands, the "
                   f"same --id sends it once", file=sys.stderr); return 1
@@ -9066,7 +9108,7 @@ def cmd_post(argv):
             print(f"cc-slack: {pid} already sent as {posted_ts} — nothing posted", file=sys.stderr); return 0
     else:
         try:
-            n, posted_ts = post(cfg, chan, text, thread, ts=ts)
+            n, posted_ts = post(cfg, chan, text, thread, username=uname, ts=ts)
         except Exception as e:
             print(f"cc-slack post: not sent ({e.__class__.__name__}: {str(e)[:160]})", file=sys.stderr); return 1
     print(posted_ts or "")
@@ -10034,8 +10076,11 @@ def cmd_selfcheck():
               and cmd_unsay(["C1"]) == 2 and cmd_pin(["C1"]) == 2 and cmd_canvas(["C1"]) == 2)
     check("clamp_n: default/blank/clamp-low/cap-high/non-numeric", clamp_n(None, 20, 100) == 20 and clamp_n("", 20, 100) == 20
           and clamp_n("0", 20, 100) == 1 and clamp_n("500", 20, 100) == 100 and clamp_n("x", 20, 100) == 20)
-    check("display_name: box/planning/track, <box> · prefix", display_name("box") == f"{BOX} · box"
-          and display_name(CTL) == f"{BOX} · planning" and display_name(f"{name}/t1") == f"{BOX} · {name}/t1")
+    check("display_name: the app's own name and then the session — the planning seat is its repo, a track its "
+          "repo/track, a member workspace her handle (and handle/track), the box session `box`",
+          display_name("box") == f"{BOX}-box · box" and display_name(CTL) == f"{BOX}-box · {CTL}"
+          and display_name(f"{name}/t1") == f"{BOX}-box · {name}/t1" and display_name("alice") == f"{BOX}-box · alice"
+          and display_name("alice/todo") == f"{BOX}-box · alice/todo")
     real_load_cfg, real_api = load_cfg, api
     acalls2 = []
     def stub_api(method, token, **kw):
@@ -10147,12 +10192,12 @@ def cmd_selfcheck():
         check("channel tool history: clamps like the CLI, formats compact lines", not err
               and [kw for m, kw in acalls2 if m == "conversations.history"][-1]["limit"] == "100" and "hi" in text)
         acalls2.clear()
-        post({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "hi", username=f"{BOX} · box")
-        check("post: passes username to chat.postMessage", acalls2[-1] == ("chat.postMessage", {"channel": "C1", "text": "hi", "thread_ts": None, "username": f"{BOX} · box", "unfurl_links": "false", "unfurl_media": "false"}))
+        post({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "hi", username=display_name("box"))
+        check("post: passes username to chat.postMessage", acalls2[-1] == ("chat.postMessage", {"channel": "C1", "text": "hi", "thread_ts": None, "username": display_name("box"), "unfurl_links": "false", "unfurl_media": "false"}))
         os.environ["CC_SLACK_PLAIN_NAME"] = "1"
         try:
             acalls2.clear()
-            post({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "hi", username=f"{BOX} · box")
+            post({"SLACK_BOT_TOKEN": "xoxb-test"}, "C1", "hi", username=display_name("box"))
             check("post: CC_SLACK_PLAIN_NAME=1 disables the username", acalls2[-1][1]["username"] is None)
         finally:
             del os.environ["CC_SLACK_PLAIN_NAME"]
@@ -10342,7 +10387,7 @@ def cmd_selfcheck():
     check("alias regex: cc's ^[a-z0-9-]{2,20}$ — valid vs upper/short/long/underscore",
           re.match(r"^[a-z0-9-]{2,20}$", "ai-dev") and re.match(r"^[a-z0-9-]{2,20}$", "ab") and not re.match(r"^[a-z0-9-]{2,20}$", "A")
           and not re.match(r"^[a-z0-9-]{2,20}$", "a") and not re.match(r"^[a-z0-9-]{2,20}$", "a" * 21) and not re.match(r"^[a-z0-9-]{2,20}$", "ai_dev"))
-    check("display_name: alias form overrides the target-derived label", display_name(CTL, "ai-dev") == f"{BOX} · ai-dev" and display_name(CTL) == f"{BOX} · planning")
+    check("display_name: alias form overrides the target-derived label", display_name(CTL, "ai-dev") == f"{BOX}-box · ai-dev" and display_name(CTL) == f"{BOX}-box · {CTL}")
     check("fmt_subs: `cc slack status` / `!sessions` display format — an orch reads alias@repo", fmt_subs({"myrepo": [None]}) == "myrepo [main]" and fmt_subs({"myrepo": [None, "ai-dev"]}) == "myrepo [main], ai-dev@myrepo")
     dm5 = Daemon(use_slack=False); dm5.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dm5.bot_user = "UBOT"; dm5.known_aliases["r"] = {"ai-dev"}
     said5 = []; dm5.say = lambda chat, text, thread=None, mail=True: said5.append(text); dm5.names["C1"] = "c1"
@@ -11970,8 +12015,9 @@ def cmd_selfcheck():
     postedW, errW1, errW2 = [], io.StringIO(), io.StringIO()
     srvW = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srvW.bind(SOCK); srvW.listen(1)
     def daemonW():
-        c, _ = srvW.accept(); c.settimeout(5); c.recv(65536)
-        c.sendall(b'{"target": "myrepo/t1", "result": "starting"}\n'); c.close()
+        for _ in range(2):                       # one post asks twice: who is sending (sender), then the wake
+            c, _ = srvW.accept(); c.settimeout(5); c.recv(65536)
+            c.sendall(b'{"ok": true, "name": null, "own": true, "target": "myrepo/t1", "result": "starting"}\n'); c.close()
     thW = threading.Thread(target=daemonW, daemon=True); thW.start()
     try:
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
@@ -11991,6 +12037,63 @@ def cmd_selfcheck():
           "so the case above sees the same lines from a box shell and from a sandbox",
           SOCK.startswith(DIR) and postedW == ["C-myrepo", "C-myrepo"]
           and errW1.getvalue().strip() == "cc-slack: handed to myrepo/t1 (starting)" and errW2.getvalue().strip() == "")
+    # ── WHO SENT IT, AND WHO IT IS FOR (owner, 2026-09-11): the post signs with the session the DAEMON names —
+    # never an env var of the calling shell — and a post into ANOTHER session's channel opens with a mention of it.
+    postedN, seatN = [], {"name": None, "own": True}
+    srvN = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srvN.bind(SOCK); srvN.listen(8); srvN.settimeout(0.2)
+    stopN = threading.Event()                                # closing a socket another thread blocks in accept() on
+    def daemonN():                                           # frees nothing: the loop polls, and the flag ends it
+        while not stopN.is_set():
+            try:
+                c, _ = srvN.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                return
+            c.settimeout(5)
+            try:
+                req = json.loads(c.recv(65536).decode().splitlines()[0])
+            except Exception:
+                req = {}
+            c.sendall((json.dumps(dict({"ok": True}, **seatN) if "sender" in req
+                                  else {"ok": True, "result": "delivered", "target": "t"}) + "\n").encode())
+            c.close()
+    thN = threading.Thread(target=daemonN, daemon=True); thN.start()
+    os.environ.pop("CC_SLACK_ALIAS", None)                   # an orch shell's alias must not reach any of this (#267)
+    try:
+        globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
+        globals()["post"] = lambda cfg, chat, text, thread=None, username=None, mail=True, ts=None: postedN.append((chat, text, username)) or (1, "1.0")
+        globals()["load_cfg"] = lambda: {"SLACK_BOT_TOKEN": "xoxb-test"}
+        globals()["unresolved_mentions"] = lambda cfg, text, chat=None: []
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            seatN.update(name=display_name(CTL), own=True)
+            cmd_post(["-c", f"#{CTL}", "the planning seat, in its own channel?"])
+            seatN.update(name=display_name(CTL, "email"), own=True)
+            cmd_post(["-c", "#email-x1", "an orch, in its own channel?"])
+            seatN.update(name=display_name(f"{CTL}/t1"), own=True)
+            cmd_post(["-c", f"#{CTL}--t1", "a track, in its own channel?"])
+            seatN.update(name=display_name(CTL), own=False)
+            cmd_post(["-c", "#lessons-site", "the planning seat, in another session's channel?"])
+            cmd_post(["--route", "[lessons-site] PR #3: landed", "machinery, not addressed to anyone?"])
+            os.environ["CC_SLACK_PLAIN_NAME"] = "1"
+            cmd_post(["-c", "#lessons-site", "plain, and still addressed there?"])
+    finally:
+        os.environ.pop("CC_SLACK_PLAIN_NAME", None)
+        globals()["resolve_channel"], globals()["post"], globals()["load_cfg"] = real_rc, real_post, real_load_cfg
+        globals()["unresolved_mentions"] = real_um
+        stopN.set(); thN.join(2); srvN.close()
+        with contextlib.suppress(OSError):
+            os.unlink(SOCK)
+    check("who sent it: every `cc-slack post` carries the name of the session the daemon says is calling — a planning "
+          "seat, an orch under its alias and a track are three different senders, and a --route post is signed too; "
+          "CC_SLACK_PLAIN_NAME=1 posts under the app's plain name",
+          [p_[2] for p_ in postedN] == [display_name(CTL), display_name(CTL, "email"), display_name(f"{CTL}/t1"),
+                                        display_name(CTL), display_name(CTL), None]
+          and len({p_[2] for p_ in postedN[:3]}) == 3)
+    check("…and a post into ANOTHER session's channel opens with <#…>, so the owner sees it is addressed to that "
+          "session and not to him; a post into the caller's own channel is unchanged, and so is a --route post",
+          [p_[1].startswith("<#C-lessons-site> ") for p_ in postedN] == [False, False, False, True, False, True])
+
     check("a question mark glued to a trailing link is still a question (review-159), while a ?q= inside a link is not",
           not routine_text("can I merge https://github.com/o/r/pull/159?") and routine_text("see https://x.y/a?q=1 done")
           and not routine_text("<https://x.y/p|the PR>?"))
@@ -12124,7 +12227,7 @@ def cmd_selfcheck():
     def om_api(method, token, **kw):
         om_calls.append(method)
         if method == "conversations.history":
-            return {"messages": [{"ts": kw.get("latest"), "bot_id": "B01", "username": f"{BOX} · planning", "text": "signed post"}]}
+            return {"messages": [{"ts": kw.get("latest"), "bot_id": "B01", "username": display_name(CTL), "text": "signed post"}]}
         return {"user_id": "UBOT", "bot_id": "B01"}
     try:
         globals()["api"] = om_api
@@ -16302,6 +16405,11 @@ def cmd_selfcheck():
         r_wown = ms_req({"wake": "CCTL", "ts": "7.8", "text": "to myself"}, member=None, peer=me_peer)
         r_wnone = ms_req({"wake": "CMY", "ts": "7.9", "text": "from a cron"}, member=None, peer=(999999, os.getuid(), DEV))
         r_wmem = ms_req({"wake": "CMY", "ts": "8.0", "text": "x"})
+        # sender: the same seat, asked BEFORE a post — the name it signs with and whose channel it is posting into
+        r_who = ms_req({"sender": "CMY"}, member=None, peer=me_peer)
+        r_who_own = ms_req({"sender": "CCTL"}, member=None, peer=me_peer)
+        r_who_none = ms_req({"sender": "CMY"}, member=None, peer=(999999, os.getuid(), DEV))
+        r_who_mem = ms_req({"sender": "CAL"})
         dmMS.deliver = _delW
         subprocess.run(["rm", "-rf", f"{DEV}/alice/proj", f"{DEV}/alice/own"])
         # the MEMBER socket: hello as itself only; inject stamps member and starts nothing
@@ -16521,6 +16629,13 @@ def cmd_selfcheck():
           and wokeMS[0][2]["meta"].get("from") == CTL
           and r_wown.get("result") == "own" and r_wnone.get("result") == "not-a-session"
           and r_wmem.get("ok") is False)
+    check("sender: the seat the daemon sees on the socket is the name a post signs with — the CTL session here, whatever "
+          "the calling shell's environment says — and it is told `own` for its own channel and not for #myrepo's, which "
+          "is what puts a <#…> in front of that post; a caller no session owns has no name, and a member socket has no "
+          "such verb",
+          r_who.get("name") == display_name(CTL) and r_who.get("own") is False
+          and r_who_own.get("name") == display_name(CTL) and r_who_own.get("own") is True
+          and r_who_none.get("name") is None and r_who_none.get("own") is True and r_who_mem.get("ok") is False)
     check("MEMBER socket: a permission_request is scoped like every other line she writes — it was handled ABOVE that "
           "gate — so one naming a channel that is not hers is dropped whole, and one naming none is relayed to the "
           "lane the daemon picks itself and stamped as HERS",
@@ -18111,11 +18226,14 @@ def own_message(cfg, chat, ts):
 
 
 def display_name(target, alias=None):
-    """<box> · <session> for chat.postMessage username= (chat:write.customize); CC_SLACK_PLAIN_NAME=1 disables (Channel.call handles that).
-    An aliased orchestrator (peer of target's main session) is "<box> · <alias>"; the control repo's own session is "· planning"."""
-    if alias:
-        return f"{BOX} · {alias}"
-    return f"{BOX} · " + ("box" if target == "box" else "planning" if target == CTL else target)
+    """`<box>-box · <session>` for chat.postMessage username= (chat:write.customize): the app's own name — the
+    manifest installs it as `<box>-box` — and then WHICH SESSION OF THIS BOX'S IS SPEAKING, so the owner can see
+    who sent what where without reading the text (owner, 2026-09-11: "here you have <box>-box · <repo>, and
+    elsewhere it would be different"). An aliased orchestrator (peer of target's main session) is its alias;
+    every other session is its own target — `<repo>` for a planning seat, `<repo>/<track>` for a track,
+    `<handle>[/<track>]` for a member workspace, `box` for the box session. CC_SLACK_PLAIN_NAME=1 disables it
+    (post() drops the username, sender_name() never asks for one)."""
+    return f"{BOX}-box · " + (alias or target or "box")
 
 
 STARTUP_MCP = ("Use this MCP server", "MCP servers may execute code")      # Claude Code's MCP-server trust prompt
