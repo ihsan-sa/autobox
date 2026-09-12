@@ -7,6 +7,9 @@ export CC_SPEND_TIER=autonomous   # the box's own spend tier (cc-tier) never col
 # worktrees: every run is namespaced (see $RUN below), a few run at once and the rest wait (see the slots below)
 # and each cleans up after itself.  Usage: tests/selftest.sh   — or, from a landing, with CC_LAND_CHANGED naming
 # the paths a PR changed, in which case only what that change reaches runs (see "WHAT RUNS" below).
+# CC_SUITE_PART names WHICH HALF to run — `portable`, the stanzas that are nothing but a tool's own selfcheck and
+# so need no particular machine, or `box`, the ones that drive this one end to end. Unset runs both, which is what
+# a person typing this file gets and what this suite always did; neither half is ever a skip (see "WHICH HALF").
 # A few tools' selfchecks are STARTED EARLY and collected at the stanza that always printed them, so they overlap
 # the tmux stanzas instead of queueing behind them (see "PREFETCH" below). CC_SELFTEST_PREFETCH=0 runs every one
 # inline again. Nothing is skipped either way: the same tools run, print in the same order and are judged the same.
@@ -100,7 +103,11 @@ pass=0; fail=0; ok(){ pass=$((pass+1)); echo "  ✓ $1"; }; bad(){ fail=$((fail+
 # called on green, so a green run reads exactly as it did.
 RED_CASES=5
 red(){ bad "$1"; grep -E '✗|✘|FAIL|Traceback' <<<"${2:-}" | head -n "$RED_CASES"; return 0; }
-. "$(dirname "$SELF")/green.sh"   # what a green run leaves for the landing to spend, and how far a change reaches
+. "$(dirname "$SELF")/green.sh"   # what a green run leaves for the landing to spend, how far a change reaches,
+                                  # and which half of the suite this run is (CC_SUITE_PART)
+# A portable run asserts what it has before it runs a case: off this box a missing tool is not a red gate, it is a
+# stanza that reports nothing and a suite that still ends "0 failed".
+[ "$SUITE_PART" != portable ] || part_caps git jq python3 tmux || { echo "selftest.sh: not runnable here"; exit 1; }
 # WHAT RUNS. Every stanza, unless the landing said what the change touched (CC_LAND_CHANGED; tests/green.sh has the
 # rule for how far that reaches — the changed tools and the tools that invoke them). Then a stanza runs only if it
 # drives a tool the change reaches, read off its own lines — `$B/cc-foo`, `chk cc-foo`, `$B/cc <sub>` for a
@@ -111,24 +118,54 @@ red(){ bad "$1"; grep -E '✗|✘|FAIL|Traceback' <<<"${2:-}" | head -n "$RED_CA
 # runs is that tool's cases and the ones sharing a fixture with it.
 land_scope "$B"
 declare -A STANZA_TOOLS   # title -> the tools its lines drive, scanned once from this file
-while IFS=$'\t' read -r title tools; do STANZA_TOOLS[$title]=$tools; done < <(awk -v have=" $(ls "$B" | tr '\n' ' ')" '
+declare -A STANZA_HALF CHK_HALF   # …and which half of the suite runs it, DERIVED from the body — see below
+# WHICH HALF A STANZA IS IN IS READ OFF ITS OWN BODY, never from a list somebody keeps. A stanza whose body is
+# nothing but `chk cc-foo` lines is that tool's own selfcheck and nothing else: hermetic by chk's contract — its
+# own temp root, its own HOME, its own fixtures — so it runs wherever the portable half runs. A stanza with a body
+# of ITS OWN drives this machine end to end (the tmux session `main`, this box's systemd, its kernel, its ~/.cc)
+# and stays here. That is the whole rule, and it cannot drift out of step with the file the way a list of forty
+# titles would: adding a stanza classifies it, and turning a chk-only stanza into an end-to-end one moves it back
+# to this box on the same commit.
+while IFS=$'\t' read -r title tools half chks; do
+  STANZA_TOOLS[$title]=$tools; STANZA_HALF[$title]=$half
+  for c in $chks; do CHK_HALF[$c]=$half; done   # …and which half will READ each prefetched tool
+done < <(awk -v have=" $(ls "$B" | tr '\n' ' ')" '
   function found(m) { if (index(" " tools " ", " " m " ") == 0) tools = tools " " m }
-  /^(if )?stanza "/ { if (title != "") print title "\t" tools
-                      title = $0; sub(/^(if )?stanza "/, "", title); sub(/".*$/, "", title); tools = "" }
+  function emit() { print title "\t" tools "\t" (other ? "box" : "portable") "\t" chks }
+  /^(if )?stanza "/ { if (title != "") emit()
+                      title = $0; sub(/^(if )?stanza "/, "", title); sub(/".*$/, "", title); tools = ""
+                      chks = ""; other = 0; hdr = 1 }
   { line = $0
-    if (match(line, /(^|[ ;{(])chk +cc-[a-z0-9-]+/)) { m = substr(line, RSTART, RLENGTH); sub(/^.*chk +/, "", m); found(m) }
+    # A body line that is not a comment, not blank, not the `then`/`fi` that wrap the stanza and not a bare `chk`
+    # is a body of the stanza s OWN — which is what puts it in the box half. `then` is excluded for the same reason
+    # as `fi`: it is the wrapper the half is enforced by, not something the stanza does.
+    if (title != "" && !hdr && line !~ /^[ \t]*#/ && line !~ /^[ \t]*$/ && line != "fi" && line != "then" &&
+        line !~ /^chk +cc-[a-z0-9-]+[ \t]*(#.*)?$/) other = 1   # `&&` ENDS the line: awk takes a continuation
+                                                                # after an operator, never before one
+    hdr = 0
+    if (match(line, /(^|[ ;{(])chk +cc-[a-z0-9-]+/)) { m = substr(line, RSTART, RLENGTH); sub(/^.*chk +/, "", m); found(m)
+                                                       if (index(" " chks " ", " " m " ") == 0) chks = chks " " m }
     while (match(line, /\$B\/(cc-[a-z0-9-]+|ccbox|box-status|cc")/)) {
       m = substr(line, RSTART + 3, RLENGTH - 3); rest = substr(line, RSTART + RLENGTH)
       if (m == "cc\"") { m = "cc"; if (match(rest, /^ +[a-z-]+/)) { sub_ = substr(rest, RSTART, RLENGTH); gsub(/ /, "", sub_)
                                                                      if (index(have, " cc-" sub_ " ")) found("cc-" sub_) }
                           if (rest ~ /--go/) found("cc-loop"); if (rest ~ /--say/) found("cc-msg") }   # what `cc … --go` and `--say` start
       found(m); line = rest } }
-  END { if (title != "") print title "\t" tools }' "$SELF")
-stanza(){   # `stanza "<title>" [always]`: the header, and whether this change reaches anything the stanza drives
+  END { if (title != "") emit() }' "$SELF")
+stanza(){   # `stanza "<title>" [always]`: the header, and whether this change reaches anything the stanza drives.
+            # WHICH HALF runs it is not a word here — it is read off the stanza's own body (STANZA_HALF, above),
+            # so there is nothing to keep in step. A body of its own = this box; nothing but `chk` = anywhere.
   echo "== $1 =="
-  { [ -z "$REACH" ] || [ "${2:-}" = always ]; } && return 0
-  local t; for t in ${STANZA_TOOLS[$1]:-}; do want "$t" && return 0; done
-  echo "  · not in this change's reach (${STANZA_TOOLS[$1]:-nothing it drives}): not run"; return 1; }
+  local t hit=""
+  # REACH FIRST, then the half. A stanza this change does not reach is not the other half's either: it runs
+  # nowhere, on purpose, and part_out is what says so to the audit at the end.
+  if [ -n "$REACH" ] && [ "${2:-}" != always ]; then
+    for t in ${STANZA_TOOLS[$1]:-}; do want "$t" && { hit=1; break; }; done
+    [ -n "$hit" ] || { echo "  · not in this change's reach (${STANZA_TOOLS[$1]:-nothing it drives}): not run"
+                       part_out "$1"; return 1; }
+  fi
+  part_here "$1" "${STANZA_HALF[$1]:-box}" || { echo "  · $PART_WHY"; return 1; }
+  return 0; }
 chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · line when the change does not reach it. The
          # tally is the tool's own line, found by name, never whatever printed last — no tally = it died = red.
   local t=$1 o r rc keep
@@ -193,6 +230,9 @@ prefetch(){
   local x
   for x in "$@"; do
     want_selfcheck "$x" || continue   # the gate chk uses: a tool this change does not reach is not started either
+    # …and neither is one whose chk is in the OTHER half. Started here it would never be reaped — the stanza that
+    # reads it does not run — and it would burn the cores this split exists to free.
+    case "$SUITE_PART" in all) ;; *) [ "${CHK_HALF[$x]:-box}" = "$SUITE_PART" ] || continue;; esac
     { rc=0; o=$("$B/$x" selfcheck 2>&1) || rc=$?; printf '%s' "$o" > "$PFD/$x.out"; echo "$rc" > "$PFD/$x.rc"; } &
     PFPID[$x]=$!; KIDS="$KIDS $!"   # so an unclaimed one dies with the run rather than outliving it
   done; }
@@ -255,7 +295,7 @@ echo "- work after the limit lifted" >> "\$st/progress.md"; echo "STATUS: DONE" 
 printf '{"is_error":false,"num_turns":1,"total_cost_usd":0.01,"session_id":"x","result":"ok"}'
 F
 chmod +x "$T/fakeclaude" "$T/cappedclaude" "$T/sleepclaude" "$T/limitclaude"
-stanza "cc main + track creation" always
+if stanza "cc main + track creation" always; then
 cd ~ && "$B/cc" $REPO >/dev/null 2>&1; sleep 1; tmux list-windows -t main -F '#W' | grep -qx "$REPO" && ok "main window created" || bad "main window"
 "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 [ -d ~/.cc/worktrees/$REPO/w1/.cc ] && [ "$(git -C ~/.cc/worktrees/$REPO/w1 symbolic-ref --short HEAD)" = track/w1 ] && ok "worktree on track/w1 with marker" || bad "worktree/branch"
@@ -273,6 +313,7 @@ git -C ~/dev/$REPO fetch -q origin; git -C ~/dev/$REPO symbolic-ref refs/remotes
   && ok "a new track is cut from the board's base even when origin/HEAD names a track branch" \
   || bad "track w9 was cut from origin/HEAD: another project's tree came with it"
 git -C ~/dev/$REPO symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+fi
 if stanza "cc claim: the canonical track prepared and claimed, with nothing launched"; then
 # ONE DELIVERY PATH, milestone 1. A subagent gets the worktree and branch a worker gets — same place, same
 # branch — without a window or a model being started for it, and from then on the row carries one durable task
@@ -442,7 +483,7 @@ if stanza "cc-native: opt-in dispatch, bootstrap and end"; then
 # M4-1: N1-N14 live inside the hook, with each refusal's control and a HOME/board/remote of their own.
 chk cc-native
 fi
-stanza "checkpoint hook" always
+if stanza "checkpoint hook" always; then
 echo hi > ~/.cc/worktrees/$REPO/w1/a.txt; ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
 git -C "$T/remote.git" branch | grep -q track/w1 && ok "checkpoint committed + pushed track branch" || bad "checkpoint push"
 echo junk > ~/dev/$REPO/junk.txt; ( cd ~/dev/$REPO && "$B/cc-checkpoint" ); git -C ~/dev/$REPO status --short | grep -q junk && ok "checkpoint no-op on primary worktree" || bad "primary worktree touched!"
@@ -490,6 +531,7 @@ mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/nu
 [ $? != 0 ] && [ -d ~/.cc/state/${REPO}_canary ] && ok "cc rm refuses a traversing track name" || bad "cc rm traversal!"
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
+fi
 # w1's session and its transcript, and the Stop payload that names them: cc-context's cases and cc-owed's both stand on these
 export CC_CTX_RECORDS="$T/ctx" CC_CTX_BOX_MODEL=   # records under $T, and this box's own model never sizes a fixture
 PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1
@@ -1638,8 +1680,13 @@ fi
 # ALWAYS, unlike every other `chk`: one of cc-board's cases is a tripwire that reads every tool in bin/ for a board
 # file opened behind the board's back, so it guards code that is not cc-board's. Left in the a13 stanza it was
 # gated on the reach of the board's own callers, and a change to any other tool skipped the case that guards it.
-stanza "cc-board (a tripwire over every tool in bin/, so it runs whatever the change)" always
+# …and WRAPPED, like every other stanza, because `stanza` now decides the half as well as the reach and a body
+# nothing guards would run in both. `then` sits on its own line so this one still ends in the word `always`,
+# which is the shape cc-board's own selfcheck reads back to prove this case is not gated on the board's callers.
+if stanza "cc-board (a tripwire over every tool in bin/, so it runs whatever the change)" always
+then
 chk cc-board
+fi
 if stanza "a finished track leaves the default board view (a13)"; then
 # owner, 2026-08-30: "this should also remove it from the board". Filter at render — no archive file to drift.
 # A row stays for cc-board's SHOWN_FOR window after it finishes so the owner sees WHAT landed; then it is history,
@@ -2935,7 +2982,7 @@ if stanza "the graphs on loopback (cc-graphs)"; then
 # this box's ledger is never read and a server already sitting on the real port is never disturbed.
 chk cc-graphs   # its own tally line, never a FAIL line that happens to be last
 fi
-stanza "the suite's own reporting, and what a green run leaves behind" always
+if stanza "the suite's own reporting, and what a green run leaves behind" always; then
 # A red stanza names its cases. The tally alone was the whole record of the gate that stopped PR #211 on 09-04.
 r=$(red "cc-fake selfcheck: 8 passed, 2 failed" "$(printf 'ok   the one that passed\nFAIL the row it wrote was the wrong row\n  ✗ and the other shape\n')")
 { grep -q '8 passed, 2 failed' <<<"$r" && grep -q 'the row it wrote was the wrong row' <<<"$r" \
@@ -2948,20 +2995,24 @@ r=$(red "cc-fake selfcheck: 0 passed, 40 failed" "$(seq 1 40 | sed 's/^/FAIL cas
   || bad "the cap let $(wc -l <<<"$r") lines through"
 # The green record: the CONTENT this passed on, which is what a landing spends instead of running it again. Keyed
 # by the tree the working copy WOULD COMMIT, because the worker runs the suite and the hook commits after it.
+# EVERY green_record BELOW SAYS `SUITE_PART=all`, and does not inherit this run's half. These cases are about
+# the content and the scope a record carries, which is the same question in either half — and a record's
+# name now carries the half, so inheriting one would have them looking for files under another name. The
+# half's own rule is a case of its own, at the end of these.
 GR="$T/green"; GD="$T/greenrepo"; mkdir -p "$GD/tests"
 ( cd "$GD" && git init -q && git config user.email t@t && git config user.name t && echo one > a.txt && git add -A && git commit -qm init ) >/dev/null 2>&1
 echo two > "$GD/a.txt"; echo new > "$GD/b.txt"; : > "$GD/tests/check.sh"   # edited, plus a file not yet added
-( cd / && CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )           # …and from anywhere: cwd is not the key
+( cd / && SUITE_PART=all CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )   # …and from anywhere: cwd is not the key
 rec=$(cat "$GR"/check.sh-*.json 2>/dev/null)
 want=$( cd "$GD" && git add -A && git commit -qm work >/dev/null 2>&1 && git rev-parse "HEAD^{tree}" )
 { grep -q "\"tree\": \"$want\"" <<<"$rec" && grep -q '"suite": "tests/check.sh"' <<<"$rec"; } \
   && ok "a green run records the content it ran on — the tree the commit after it carries — and names the suite as the landing names it" \
   || bad "the green record does not name that content: [$rec] wanted tree $want"
-echo three > "$GD/a.txt"; ( cd / && CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )
+echo three > "$GD/a.txt"; ( cd / && SUITE_PART=all CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )
 [ "$(grep -ho '"tree": "[0-9a-f]*"' "$GR"/check.sh-*.json | sort -u | wc -l)" = 2 ] \
   && ok "...and an edit after the run is a different tree: that record cannot answer for it, so the suite runs again" \
   || bad "an edited tree recorded the same content: $(ls "$GR")"
-( cd / && CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" "core/bin/x core/bin/y" )
+( cd / && SUITE_PART=all CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" "core/bin/x core/bin/y" )
 grep -q '"scope": "core/bin/x core/bin/y"' "$GR"/check.sh-*.json && grep -q '"scope": ""' <<<"$rec" \
   && ok "...and a record says the SCOPE it ran at — the paths it was narrowed to, or nothing when everything ran — so a narrowed run can never answer for a full one" \
   || bad "the scope is not on the record: $(cat "$GR"/check.sh-*.json | tr '\n' ' ')"
@@ -2970,12 +3021,24 @@ grep -q '"scope": "core/bin/x core/bin/y"' "$GR"/check.sh-*.json && grep -q '"sc
 ( cd "$GD" && git worktree add -q "$GD/wt" -b track/w1 ) >/dev/null 2>&1
 mkdir -p "$GD/wt/tests"; : > "$GD/wt/tests/check.sh"; echo four > "$GD/wt/a.txt"
 dirt=$(git -C "$GD/wt" status --porcelain)
-( cd / && CC_GREEN_DIR="$GR" green_record "$GD/wt/tests/check.sh" )
+( cd / && SUITE_PART=all CC_GREEN_DIR="$GR" green_record "$GD/wt/tests/check.sh" )
 still=$(git -C "$GD/wt" status --porcelain)
 wt=$( cd "$GD/wt" && git add -A && git commit -qm w >/dev/null 2>&1 && git rev-parse "HEAD^{tree}" )
 { grep -q "\"tree\": \"$wt\"" "$GR/check.sh-${wt:0:12}.json" 2>/dev/null && [ "$still" = "$dirt" ]; } \
   && ok "...in a track's own worktree too — where the worker runs it — and nothing of that worktree's own index moved" \
   || bad "no record for the worktree's content ($wt), or its index moved: [$dirt] -> [$still]"
+# …AND WHICH HALF LEFT IT, which is the whole safety of running one half off the box: a record of half a run must
+# never answer an ask about the whole gate. So the half is in the file AND in its name, and a half's record sits
+# BESIDE the whole run's rather than on top of it. What is done with the two — which ask each one answers — is
+# cc-land's own selfcheck (green_run); this is only that they are two files and say which is which.
+echo five > "$GD/a.txt"
+( cd / && SUITE_PART=portable CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )
+( cd / && SUITE_PART=all      CC_GREEN_DIR="$GR" green_record "$GD/tests/check.sh" )
+h5=$( cd "$GD" && git add -A && git commit -qm five >/dev/null 2>&1 && git rev-parse "HEAD^{tree}" )
+{ grep -q '"part": "portable"' "$GR/check.sh-portable-${h5:0:12}.json" 2>/dev/null \
+  && grep -q '"part": ""' "$GR/check.sh-${h5:0:12}.json" 2>/dev/null; } \
+  && ok "a run of ONE half records under its own name, beside the whole run's and never over it, and each says which half it was" \
+  || bad "the half is not in the record's name: $(ls "$GR" | tr '\n' ' ')"
 
 # THE REACH OF A CHANGE (tests/green.sh, land_scope): what the landing's CC_LAND_CHANGED turns into here. Its own
 # bin/ of four stubs: a leaf, a caller that runs it, a talker that only names it in a comment, and cc, which runs both.
@@ -3033,7 +3096,7 @@ printf '#!/bin/sh\n' > "$SB3/cc-graphs"; printf '#!/bin/sh\n' > "$SB3/ccbox"
 U8=$(locale -a 2>/dev/null | grep -ix 'en_US.utf-\?8' | head -1); U8=${U8:-C.UTF-8}
 told="core/bin/cc-graphs core/bin/ccbox"   # exactly as cc-land writes it: " ".join(sorted(paths))
 got=$( export LC_ALL=$U8 LANG=$U8; CC_LAND_CHANGED="$told" land_scope "$SB3"; printf '%s' "$SCOPE" )
-CC_GREEN_DIR="$GR3" green_record "$GD/tests/check.sh" "$got"
+( SUITE_PART=all; CC_GREEN_DIR="$GR3" green_record "$GD/tests/check.sh" "$got" )
 spendable(){ CC_GREEN_DIR="$GR3" python3 - "$B/cc-land" "$1" <<'PY'
 import glob, importlib.machinery as M, importlib.util as U, json, os, sys
 sp = U.spec_from_file_location("l", sys.argv[1], loader=M.SourceFileLoader("l", sys.argv[1]))
@@ -3047,10 +3110,25 @@ PY
   || bad "scope round-trip under $U8: got [$got] wanted [$told], cc-land says [$(spendable "$told")]"
 ( REACH=" cc-leaf "; want cc-leaf && ! want cc-talker && REACH="" && want cc-talker ) \
   && ok "want: a reached tool, not an unreached one, and everything when nothing was narrowed" || bad "want"
-( REACH=" cc-other "; STANZA_TOOLS[fake]="cc-leaf"; r1=$(stanza fake); a=$?; STANZA_TOOLS[fake]="cc-leaf cc-other"; stanza fake >/dev/null; b=$?
+# Every fixture stanza below declares THIS run's half, so these cases are about the reach and nothing else; the
+# half is the case after them. Named `fake`/`fake2` in a SUBSHELL, so the audit's inventory never sees them.
+( REACH=" cc-other "; STANZA_TOOLS[fake]="cc-leaf"; STANZA_HALF[fake]=$SUITE_PART; r1=$(stanza fake); a=$?; STANZA_TOOLS[fake]="cc-leaf cc-other"; stanza fake >/dev/null; b=$?
   r3=$(stanza fake always); c=$?; [ $a = 1 ] && grep -q 'not in this change' <<<"$r1" && [ $b = 0 ] && [ $c = 0 ] && ! grep -q 'not run' <<<"$r3" ) \
   && ok "a stanza runs when the change reaches something it drives, or when it is marked always; otherwise it says so and is skipped" \
   || bad "stanza gating"
+# …and THEN the half, which is the second gate and asked only of a stanza the change reaches. Both answers are
+# asserted in every mode: a whole run owns both halves, and each half runs the ones it owns and REFUSES the
+# other's by name — never skips it quietly, which is the one thing a split must not be able to do.
+( REACH=""; STANZA_TOOLS[fake2]="cc-leaf"
+  STANZA_HALF[fake2]=box;      rb=$(stanza fake2); hb=$?
+  STANZA_HALF[fake2]=portable; rp=$(stanza fake2); hp=$?
+  case "$SUITE_PART" in
+    all)      [ $hb = 0 ] && [ $hp = 0 ];;
+    box)      [ $hb = 0 ] && [ $hp = 1 ] && grep -q 'off the box' <<<"$rp" && grep -q fake2 <<<"$rp";;
+    portable) [ $hp = 0 ] && [ $hb = 1 ] && grep -q 'needs this box' <<<"$rb" && grep -q fake2 <<<"$rb";;
+  esac ) \
+  && ok "...and then which HALF owns it: a whole run owns both, and one half runs its own and refuses the other's by name (this run: $SUITE_PART)" \
+  || bad "stanza half gating under SUITE_PART=$SUITE_PART"
 { [ "${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]#* }" != "${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]}" ] \
   && case " ${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]} " in *" cc-limit "*" cc-loop "*|*" cc-loop "*" cc-limit "*) true;; *) false;; esac \
   && case " ${STANZA_TOOLS[resume/digest/rm]} " in *" cc-digest "*) true;; *) false;; esac \
@@ -3095,8 +3173,9 @@ r=$( B=$CB; REACH=""; chk cc-flaky; chk cc-broken )
 r=$( B=$CB; REACH=""; CC_SELFTEST_RERUN=0; rm -f "$CB/cc-flaky.n"; chk cc-flaky )
 { grep -q '✗ cc-flaky selfcheck: cc-flaky selfcheck: 9 passed, 1 failed' <<<"$r" && [ "$(cat "$CB/cc-flaky.n")" = 1 ]; } \
   && ok "…and CC_SELFTEST_RERUN=0 runs nothing twice: the first red stands" || bad "chk rerun off: $(tr '\n' ' ' <<<"$r")"
+fi
 
-stanza "the suite's own slots (a cap, not a queue)" always
+if stanza "the suite's own slots (a cap, not a queue)" always; then
 # Re-runs THIS FILE, stopping at the lock ($CC_SELFTEST_LOCK_ONLY) — no fixtures, no tmux, no repo, so the suite
 # never runs inside itself. On a lock of its own ($CC_SELFTEST_LOCK): the real one is held by the very run doing
 # the testing, and opening it a second time from here would deadlock this run against nobody but itself. Nothing
@@ -3142,8 +3221,15 @@ for _ in $(seq 1 300); do grep -q '^== waiting:' "$T/lock2.out" 2>/dev/null && b
   || bad "the third run did not wait on both: $(tr '\n' ' ' <"$T/lock2.out")"
 touch "$L2.go"; wait $c3; l2rc=$?
 [ $l2rc = 0 ] && ok "...and runs the moment one of them frees" || bad "the waiter never got a slot: rc=$l2rc"
+fi
 cd ~ || exit 1
 # cleanup: windows, the scratch tmux server, every fixture process, $T, the repo dirs and ~/.claude.json — the EXIT
 # trap does it on every path out, including a kill, so nothing this run started can outlive it
+# EVERY STANZA IS ACCOUNTED FOR — it ran here, the other half owns it, or this change does not reach it. A
+# stanza in none of the three is a stanza that runs NOWHERE while both halves report green, which is the one
+# failure splitting this suite could introduce and the one nothing else here would notice. The inventory is the
+# scan's own keys, so it is the file's stanzas and never a list anybody keeps.
+part_audit "selftest.sh" "$(printf '%s\n' "${!STANZA_TOOLS[@]}")" || fail=$((fail+1))
+part_line "selftest.sh"
 echo "== result: $pass passed, $fail failed${SCOPE:+ (scoped to: $SCOPE)} =="; [ $fail = 0 ] || exit 1
 green_record "$SELF" "$SCOPE"   # green: say what content this passed on, and at what scope, so the landing does not run it again (tests/green.sh)

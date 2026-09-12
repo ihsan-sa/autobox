@@ -7,10 +7,18 @@
 # one at a time, the old behaviour). Concurrency only: every file is still shellchecked and every selfcheck still
 # runs, each judged in the same order by the same rules — nothing here is skipped to make the gate faster.
 set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$0")/.."   # $0 is resolved BEFORE the cd moves out from under it
+# WHICH HALF OF THIS GATE IS RUNNING (CC_SUITE_PART; tests/green.sh has the rule). Unset is both halves, which is
+# what the pre-commit hook and a person typing this file get, and is what this gate always did. `portable` is the
+# blocks that need no particular machine; `box` is the ones that need THIS one, each named where it is refused.
+. tests/green.sh
+# A PORTABLE RUN ASSERTS WHAT IT HAS BEFORE IT RUNS A CASE. Off this box a missing tool is not a red gate: it is a
+# block that reports nothing and a gate that still ends "OK". These four are the ones whose absence would be silent.
+if [ "$SUITE_PART" = portable ]; then part_caps shellcheck jq python3 git || { echo "check.sh: not runnable here"; exit 1; }; fi
 sh=(); py=()
 for f in bin/* install.sh ccbox/*.sh; do [ -f "$f" ] || continue; head -1 "$f" | grep -q bash && sh+=("$f"); head -1 "$f" | grep -q python && py+=("$f"); done
 JOBS=${CC_CHECK_JOBS:-4}   # how many of this gate's own jobs run at once. Concurrency, never coverage.
 GD=$(mktemp -d "${TMPDIR:-/tmp}/cc-check.XXXXXX"); trap 'rm -rf "$GD"' EXIT   # one scratch dir, one trap, both blocks
+if part_here shellcheck; then
 bash -n "${sh[@]}"
 # SHELLCHECK EVERY FILE, $JOBS AT A TIME. One call over all of bin/ was 38 s of this gate on one core — the largest
 # block after the selfchecks. Splitting it changes no file's report: -e SC1090 already forbids following a `source`,
@@ -32,6 +40,8 @@ for i in $(seq 0 $((nsh - 1))); do
   cat "$GD/sc.$i.out"; [ "$(cat "$GD/sc.$i.rc")" = 0 ] || scrc=1
 done
 [ "$scrc" = 0 ] || exit 1
+else echo "check.sh: · $PART_WHY"; fi
+if part_here compile-and-manifests; then
 # mail/*.py by name: the loop above finds bin/cc-mail, which is a symlink to mail/receiver.py, so the receiver
 # is compiled — but mail/selfcheck.py is reached by nothing under bin/ and would go uncompiled.
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" mail/*.py tests/slack_sim.py tests/member_v2.py tests/member_broker.py tests/member_import.py "$@"
@@ -64,9 +74,15 @@ for f in templates/home/agents/*.md; do
   grep -q 'cc-lib ask' "$f" && grep -q 'the reading procedure' "$f" \
     || { echo "$f: the type does not carry the reading rule (cc-lib ask + the WORKING.md page 'the reading procedure')"; exit 1; }
 done
+else echo "check.sh: · $PART_WHY"; fi
+# THE UNITS ARE THIS BOX'S HALF, and not because systemd-analyze happens to be missing elsewhere — because where
+# it IS missing this block prints nothing and passes. It is NAMED and refused (part_here) rather than skipped, so
+# the box half is the only place it can report, and a run that did not happen is one somebody can see did not.
+if part_here systemd-units box; then
 H=$(mktemp -d); ln -s "$PWD/bin" "$H/bin"   # verify the units against THIS tree's bin/, not against what the box happens to have linked
 v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config/systemd-user/*.timer 2>&1 | grep -v '^\s*$' || true); rm -rf "$H"
 [ -z "$v" ] || { echo "$v"; exit 1; }
+else echo "check.sh: · $PART_WHY"; fi
 # A unit nobody links is a unit that never runs. install.sh used to name each one, so this test grepped it; now
 # config/units.json is the one list and `cc-units selfcheck` fails when it and config/systemd-user/ disagree in
 # either direction — a new unit file without a row, or a row without a file. Both selfchecks are static: they read
@@ -161,7 +177,7 @@ v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config
 # …and only the ones a change reaches, when the landing says what changed (CC_LAND_CHANGED — tests/green.sh has
 # the rule): the static checks above run whatever the change, a selfcheck of a tool nothing here touched does not.
 # cc-board's is the exception and runs whenever any tool changed — one of its cases reads all the others.
-. tests/green.sh; land_scope "$PWD/bin"; skipped=""
+land_scope "$PWD/bin"; skipped=""   # green.sh was sourced at the top of this file, for CC_SUITE_PART
 # THE TALLY SHAPE, read exactly the way selftest.sh's chk() reads it: the tool's OWN line, found by name, with the
 # count anchored so that "10 failed" is never mistaken for a zero. A selfcheck that ends in any other shape —
 # "28/28", "all passed" — is green here and unreadable there, and chk() reports an unreadable tally the way it
@@ -334,7 +350,10 @@ chmod +x "$GD/cwd-probe"
 [ "$(run_sc "$GD/cwd-probe")" = "fixture-repo fixture-track" ] \
   || { echo "check.sh: the selfchecks' cwd no longer carries a track marker of its own — a case that reads its cwd would pass here and fail in every worker's worktree"; exit 1; }
 for c in cc-board $others; do
-  want_selfcheck "$c" || { skipped="$skipped $c"; continue; }
+  want_selfcheck "$c" || { skipped="$skipped $c"; part_out "$c"; continue; }
+  # …and only by the half that owns it. A tool's selfcheck belongs to this box only if it says so (PART_BOX_TOOLS
+  # in tests/green.sh names the four and why); every other one is portable and runs wherever this half runs.
+  part_here "$c" "$(part_of_tool "$c")" || { echo "  · $PART_WHY"; continue; }
   ran="$ran $c"
   { rc=0; o=$(run_sc "$ROOT/bin/$c" 2>&1) || rc=$?; printf '%s' "$o" > "$SCD/$c.out"; echo "$rc" > "$SCD/$c.rc"; } &
   running=$((running + 1))
@@ -346,7 +365,7 @@ done
 # counted — what ran here, what another runner owns, what ships nothing, what this change did not reach — because
 # a count cannot tell you which tool went missing and the name can.
 n_of(){ set -- $1; echo $#; }   # counted inside a function, so this gate's own "$@" (extra python files) is untouched
-echo "check.sh: selfchecks: $(n_of "$FOUND") of $(n_of "$FOUND$NOSC") tools under bin/ ship one — $(n_of "$ran") ran here, $(n_of "$ELSEWHERE") run elsewhere, $(n_of "$skipped") out of this change's reach"
+echo "check.sh: selfchecks: $(n_of "$FOUND") of $(n_of "$FOUND$NOSC") tools under bin/ ship one — $(n_of "$ran") ran here, $(n_of "$ELSEWHERE") run elsewhere, $(n_of "$skipped") out of this change's reach, $(part_n "$PART_DEFERRED") in the other half"
 echo "  here:$ran"
 echo "  elsewhere, not twice (tests/selftest.sh, or the tool named):$ELSEWHERE"
 echo "  ships none — not a failure, named so an absent selfcheck is visible:$NOSC"
@@ -453,6 +472,13 @@ w=$(pf_window tests/selftest.sh)
 [ -z "$w" ] || { echo "check.sh: tests/selftest.sh prefetches a selfcheck across a change to its own environment:"
                  echo "$w"
                  echo "  A prefetched tool must run under the same environment as the chk that reads it."; exit 1; }
+
+# EVERY UNIT THIS GATE SPLIT IS ACCOUNTED FOR. A split can introduce exactly one new failure that nothing else
+# here would notice: a unit that is in neither half and so runs nowhere, while both halves report green. So the
+# whole inventory is handed to part_audit with the two lists it filled and the change-scope skips, and a name in
+# none of the three stops this gate. Cheap blocks are not in the inventory: they are not split, they always run.
+part_audit check.sh "$(printf '%s\n' shellcheck compile-and-manifests systemd-units cc-board $others)" || exit 1
+part_line check.sh
 
 # Green: leave a record of the CONTENT this passed on — and the scope it ran at — so the landing does not run it
 # again on the same files the worker already ran it on (tests/green.sh, read by cc-land).

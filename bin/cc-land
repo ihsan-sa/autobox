@@ -249,6 +249,25 @@ GATE_MEMO_TTL = 3600                      # a memo ("these gates passed on this 
 GREEN_TTL = 6 * 3600                      # …and how long a SUITE's own record of what it passed on is spent instead
                                           # of running it again (green_run). The key there is content, which cannot
                                           # go stale; the box around it can, so the record is good for hours, not days.
+# THE HALF OF THE SUITE THAT NEEDS NO PARTICULAR MACHINE, run on the repo's own hosted runners instead of here.
+# Much of this suite is hermetic — tool selfchecks that build their own HOME and their own fixtures — and this
+# box has six cores, so a landing whose gates overlap four or more takes 22.4 minutes against 13-14.5 below that
+# (measured 2026-09-08). CC_SUITE_PART (core/tests/green.sh) puts every unit in exactly one half; when the
+# portable half has already passed off the box on this exact head, the gate here runs `box` and the box stops
+# paying for the part no machine of ours was needed for.
+# WHAT THAT IS WORTH, MEASURED, and it is less than the hermetic share suggests: running all six halves back to
+# back gave check.sh 268 s -> 19 s and check-extra 162 s -> 75 s, but selftest 785 s -> 839 s, because the
+# stanzas that half moves off the box are the ones the suite's own prefetch already overlapped with its
+# box-bound ones. And the gates run AT ONCE (below), so a landing's gate wall clock is selftest.sh either way:
+# this buys ~300 CPU-seconds of contention off the box per landing, not a shorter landing.
+# OFF BY DEFAULT, and that is a SPEND decision, not a caution: on a PRIVATE repo these are billed minutes —
+# ~18-25 of them a run on a 2-vCPU runner, ~24,000 a month at forty landings a day against 2,000-3,000 free,
+# about $170 in overage (~$25 if every run is scoped to what its diff reaches). TWO SWITCHES, because there are
+# two spends and they are not the same person's: the workflow's own job is skipped unless the repository variable
+# PORTABLE_GATE is 1, so a repo that merged the file schedules no runner and bills nothing; this variable is only
+# whether a landing SPENDS a run that the first one paid for. Unset — which is how both land — a landing runs the
+# whole suite here exactly as it did before any of this existed.
+PORTABLE_WF = "portable-gate.yml"         # the workflow that runs `CC_SUITE_PART=portable` on the PR head
 
 
 def gate_slots():
@@ -1558,7 +1577,51 @@ def green_dir():
     return os.environ.get("CC_GREEN_DIR") or f"{LANDQ}/green"
 
 
-def green_run(content, gate, scope=""):
+def portable_green(root, sha, base_sha=""):
+    """Has the PORTABLE half of the suite already passed off this box, on this exact head, merged with a base at
+    least as new as the one this landing merged it with? Returns the run's URL — something a person can open — or
+    "" for every other answer, in which case this box runs the whole suite as it always did. Read-only and outbound
+    only: it asks GitHub about a workflow of the repo's own, opens no path into the box, and passes no credential
+    anywhere the `gh` already here does not.
+
+    ASKED ABOUT THE HEAD SHA, and the answer re-checked against it rather than trusted from the filter, because
+    what is spent here is a whole half of a gate: a run on any other commit says nothing about this one. A run
+    still in flight is not waited for either — the landing takes the box half now and the minutes back later, which
+    is strictly better than a landing that blocks on a queue nobody here controls.
+
+    AND NOT OLDER THAN THE BASE. A pull_request run tests the head merged with the base AS IT STOOD WHEN THE RUN
+    STARTED; this landing gates the head merged with the base as it stands now (merge_result). PR A pushes and its
+    portable half goes green off the box; PR B lands and changes a portable tool; A lands later — its box half
+    runs on B's main, its portable half would be spent from a run that never saw B, and the default branch goes
+    red in exactly the 'N PRs each green on their own base' shape merge_result closed. So a run is spent only when
+    it was CREATED AFTER the commit the landing merged with: `createdAt` from the same `gh` call against the base
+    tip's committer date (`%ct`), both in whole seconds as their sources print them, and a run stamped the same second as the
+    base tip is too old — GitHub builds the merge ref it checks out lazily, so a run that started as the base moved
+    may have taken the old one. `base_sha` empty is the head already holding the base (merged_on is "" then): the
+    merge IS the head, and nothing can be stale against it. A base whose date git will not give is treated as
+    newer than every run: the whole suite runs here, which is the direction to be wrong in."""
+    if os.environ.get("CC_PORTABLE_GATE") != "1" or not sha:
+        return ""
+    since = 0
+    if base_sha:
+        rc, o = sh(["git", "log", "-1", "--format=%ct", base_sha], cwd=root)   # committer date, seconds
+        since = int(o.strip()) if not rc and o.strip().isdigit() else 0
+        if not since:
+            return ""       # a base with no date is a base this cannot compare against: run the lot here
+    rc, o = sh(["gh", "run", "list", "--workflow", PORTABLE_WF, "--commit", sha, "-L", "20",
+                "--json", "status,conclusion,headSha,url,createdAt"], cwd=root, timeout=60)
+    try:
+        runs = json.loads(o or "[]") if not rc else []
+    except ValueError:
+        return ""       # GitHub unreachable, gh not logged in, the workflow not there yet: run the lot here
+    for r in runs if isinstance(runs, list) else []:
+        if (r.get("headSha") == sha and r.get("status") == "completed" and r.get("conclusion") == "success"
+                and (not since or epoch_of(r.get("createdAt") or "") > since)):
+            return r.get("url") or PORTABLE_WF
+    return ""
+
+
+def green_run(content, gate, scope="", part=""):
     """Has this gate already passed on THIS content? The worker runs the suites before it opens its PR and the
     landing ran them again on the same code, with nothing reading the second result differently from the first
     (measured on PR #211, 2026-09-04). What a suite records is the git TREE it ran on, not a commit — the worker
@@ -1567,12 +1630,19 @@ def green_run(content, gate, scope=""):
     the gate. Never spent on read, unlike the sweep's own memo: content cannot go stale, so a re-run of a landing
     spends the same record. Only the clock retires it, in case the box changed under it. And the SCOPE: a record of
     a run the suite narrowed to some paths (told what the diff changed) answers only a run narrowed to the same —
-    an unscoped record, the whole suite, answers for any part of itself."""
+    an unscoped record, the whole suite, answers for any part of itself. And the HALF, by the same rule and for the
+    same reason: a record of the `box` half answers an ask about the box half and nothing wider, while a record of a
+    whole run — what a worker's own `cc-green` leaves — answers either half, having run both."""
     if not content:
         return False
-    j = read_json(f"{green_dir()}/{os.path.basename(gate)}-{content[:12]}.json") or {}
-    return (j.get("tree") == content and j.get("suite") == gate and (j.get("scope") or "") in ("", scope)
-            and time.time() - epoch_of(j.get("at", "")) <= GREEN_TTL)
+    base = f"{green_dir()}/{os.path.basename(gate)}"
+    for p in ([f"{base}-{part}-{content[:12]}.json"] if part else []) + [f"{base}-{content[:12]}.json"]:
+        j = read_json(p) or {}
+        if (j.get("tree") == content and j.get("suite") == gate and (j.get("scope") or "") in ("", scope)
+                and (j.get("part") or "") in ("", part)
+                and time.time() - epoch_of(j.get("at", "")) <= GREEN_TTL):
+            return True
+    return False
 
 
 def tree_id(root):
@@ -2518,7 +2588,13 @@ class Land:
         on the PR for the retry to read back) and its buy STANDS — the read was paid for, and giving it back would
         let N red heads buy N paid reads with the tally reading 0 throughout. The suite is handed what the diff
         changed (gate_scope) and the one concurrency number the machine says it has (gate_slots, as CC_SELFTEST_SLOTS), and
-        every gate is timed on its silence, streamed to a log (run_gate)."""
+        every gate is timed on its silence, streamed to a log (run_gate).
+
+        And HALF of it may already have run somewhere else. When CC_PORTABLE_GATE=1 and the portable workflow has
+        passed on this exact head (portable_green), every gate here is run with CC_SUITE_PART=box: the units that
+        need this box's tmux, systemd, kernel and ~/.cc, and nothing else. The half that needs no particular machine
+        is not skipped — it ran off the box, on the same file and the same cases, and the card says so. Unset, or on
+        a head no hosted run passed, this runs the whole suite exactly as it always did."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
         tree, tmp, at, key = self.root, None, "", ""
@@ -2558,9 +2634,15 @@ class Land:
             out("·", f"the {tier} tier: {', '.join(found)} — {why}")
             content, reused = tree_id(tree), []   # …and of those, the ones this exact content has already passed
             scope = self.gate_scope()             # what the diff changed, for a suite that runs only what that reaches
+            off_box = portable_green(self.root, self.gated or self.head, self.merged_on)   # …and the half of them
+            part = "box" if off_box else ""       # a hosted runner has already passed on this head, merged with a
+                                                  # base no older than the one gated here — not re-run by this box
+            if off_box:
+                out("·", f"the portable half of each gate passed off the box on this head ({off_box}) — this box "
+                         f"runs only the half that needs it")
 
             def run(g):
-                if green_run(content, g, scope):
+                if green_run(content, g, scope, part):
                     reused.append(g)
                     out("·", f"{g}: already green on this content ({content[:12]}) — the run that made it left the "
                              f"record, so this landing does not buy the same answer twice")
@@ -2569,6 +2651,9 @@ class Land:
                 start["env"].pop("CC_LAND_CHANGED", None)   # never an inherited scope: a landing run from inside a
                 if scope:                                    # scoped suite would hand its gates that suite's paths
                     start["env"]["CC_LAND_CHANGED"] = scope
+                start["env"].pop("CC_SUITE_PART", None)     # …nor an inherited half, for the same reason
+                if part:
+                    start["env"]["CC_SUITE_PART"] = part
                 start["env"]["CC_SELFTEST_SLOTS"] = str(PREPARE_AT_ONCE)   # the ONE number, said out loud to the
                                                           # suite: what prepare() runs at once IS what the suite's
                                                           # own cap allows at once, so no landing waits at that lock
@@ -2582,7 +2667,9 @@ class Land:
                     wt = f"{HOME}/.cc/worktrees/{self.member}/{self.mtrack}"
                     argv = ([f"{BIN}/cc-sandbox", "member", self.member, self.mtrack if os.path.isdir(wt) else "",
                              "--tree", tree, "--", "env"]
-                            + [f"{k}={start['env'][k]}" for k in ("CC_LAND_CHANGED", "CC_SELFTEST_SLOTS") if k in start["env"]]
+                            + [f"{k}={start['env'][k]}" for k in ("CC_LAND_CHANGED", "CC_SELFTEST_SLOTS", "CC_SUITE_PART")
+                               if k in start["env"]]   # …and the HALF: the card says the box half ran here, so
+                                                       # the sandboxed suite must run that half, not the whole
                             + [f"{tree}/{g}"])
                 rc, o = run_gate(argv, tree, keep, start["env"])
                 bad = FAILED_RE.search(o)
@@ -2601,7 +2688,7 @@ class Land:
             # because its verdict goes on the PR for the retry to read back for free.
             buf = getattr(_OUT, "buf", None)     # gate threads are new threads: without this their lines go to
                                                  # stdout instead of the job's buffer, and prepare() interleaves
-            if any(not green_run(content, g, scope) for g in found):
+            if any(not green_run(content, g, scope, part) for g in found):
                 self.read_alongside()
             errs = {}
 
@@ -2647,7 +2734,13 @@ class Land:
                     pass
             again = f" — {len(reused)} of them already green on {content[:12]}, not run again" if reused else ""
             beside = " — the review ran beside the gates" if self._review is not None else ""
-            return f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): {', '.join(found)}{again}{beside}"
+            # WHERE EACH HALF RAN, on the card, because "the gates passed" now has two possible meanings and the
+            # difference is which machine stands behind them. Said only when the halves were split: with the switch
+            # off there is one half, it ran here, and a line about it would be noise on every landing.
+            where = (f" — the box half here, the portable half off the box on this head ({off_box})" if off_box
+                     else "")
+            return (f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): "
+                    f"{', '.join(found)}{again}{beside}{where}")
         finally:
             if tmp:
                 self.drop_checkout(tmp, tree)
@@ -6903,6 +6996,96 @@ def cmd_selfcheck():
         check("...and a focused landing whose suite is spent by a record buys no read either way: nobody paid reads "
               "a change outside the control layer", isinstance(r, Skip) and "focused tier" in str(r))
         os.unlink(green)
+
+        # …and the HALF of each suite a hosted runner has already passed on this head is not run here again. What
+        # that is worth is ~300 CPU-seconds off the box per landing and no wall clock — the static gates collapse,
+        # selftest.sh barely moves, and the gates run at once (measured 2026-09-08). Each case below builds the
+        # world it needs and asserts BOTH what the box runs and what it does
+        # not: a case that only checked the box half would go green the day the portable half stopped running
+        # anywhere, which is the one failure this whole split can introduce.
+        halves = lambda: [e.get("CC_SUITE_PART") for c, e in zip(calls, envs) if c[0].endswith("selftest.sh")]
+        asked = lambda: [c for c in calls if c[:3] == ["gh", "run", "list"]]
+        RUN_URL = "https://github.com/o/myrepo/actions/runs/99"
+        BASE_AT = 1_800_000_000         # when the base tip the landing merges with was committed (git %ct)…
+        at_ = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        hosted = lambda sha=HEAD, status="completed", conclusion="success", created=BASE_AT + 60: {
+            "gh run list": (0, json.dumps([{"headSha": sha, "status": status, "conclusion": conclusion,
+                                            "url": RUN_URL, "createdAt": at_(created)}])),
+            "git log -1 --format=%ct": (0, f"{BASE_AT}\n")}   # …and a run a minute younger than it, by default
+        os.environ.pop("CC_PORTABLE_GATE", None)
+        L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted())
+        check("with the switch unset a landing runs the WHOLE suite here and does not even ask GitHub: hosted "
+              "minutes are billed on a private repo, so spending them is the owner's call, not a default",
+              halves() == [None] and not asked() and isinstance(g, str) and "off the box" not in g)
+        os.environ["CC_PORTABLE_GATE"] = "1"
+        try:
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted())
+            check("a head whose portable half has passed off the box runs `box` here — the half that needs this "
+                  "machine — and the card says which half ran where, on a run a person can open",
+                  halves() == ["box"] and isinstance(g, str) and "off the box" in g and RUN_URL in g
+                  and [c for c in asked() if HEAD in c])
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted(status="in_progress",
+                                                                                          conclusion=None))
+            check("...a hosted run still IN FLIGHT is not waited for and not spent: the box takes the whole suite "
+                  "now rather than blocking on a queue nobody here controls",
+                  halves() == [None] and isinstance(g, str) and "off the box" not in g)
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted(conclusion="failure"))
+            check("...a hosted run that FAILED is not a portable half that passed", halves() == [None])
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted(sha=MOVED))
+            check("...and a run on ANOTHER commit says nothing about this head, however the filter was asked: what "
+                  "is spent here is a whole half of a gate", halves() == [None])
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n",
+                           **{"gh run list": (1, "gh: not logged in\n")})
+            check("...and GitHub unreachable — gh not logged in, the workflow not there yet — falls back to running "
+                  "the lot here, rather than landing on a half nothing ran",
+                  halves() == [None] and isinstance(g, str) and "off the box" not in g)
+            # "a run is spent only when it was CREATED AFTER the commit the landing merged with" (portable_green):
+            # the hosted run tested the head merged with the base as it stood THEN; this landing merges with it NOW
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted(created=BASE_AT - 60))
+            check("...and a run OLDER than the base tip the landing merged with is not spent: it tested the head "
+                  "on a main that has since moved, so its portable half never ran on the tree being merged — the "
+                  "whole suite runs here, and the card claims no split",
+                  halves() == [None] and isinstance(g, str) and "off the box" not in g and L.merged_on == BASE_SHA
+                  and [c for c in asked() if "createdAt" in " ".join(c)]
+                  and [c for c in calls if c[:3] == ["git", "log", "-1"] and BASE_SHA in c])
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted(created=BASE_AT))
+            check("...a run stamped the SAME SECOND as the base tip is too old as well — GitHub builds the merge "
+                  "ref lazily, so a run that started as main moved may have taken the old one",
+                  halves() == [None] and isinstance(g, str) and "off the box" not in g)
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n",
+                           **dict(hosted(), **{"git log -1 --format=%ct": (0, "")}))
+            check("...and a base tip whose date git will not give is newer than every run: nothing is spent",
+                  halves() == [None] and isinstance(g, str) and "off the box" not in g)
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n",
+                           **dict(hosted(created=BASE_AT - 60), **{"git merge-base --is-ancestor": (0, "")}))
+            check("...while a head that ALREADY HOLDS the base has no merge to be stale against — the merge is the "
+                  "head — so the run's age is not asked and its portable half is spent",
+                  halves() == ["box"] and isinstance(g, str) and "off the box" in g and not L.merged_on
+                  and not [c for c in calls if c[:3] == ["git", "log", "-1"]])
+            world["git merge-base --is-ancestor"] = (1, "")      # the base has moved on again, for what follows
+            # the green record and the half, which is the same superset rule as the scope above it
+            gp = f"{green_dir()}/selftest.sh-box-{TREE[:12]}.json"
+            write_atomic(gp, {"suite": "core/tests/selftest.sh", "tree": TREE, "part": "box", "at": stamp()})
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted())
+            check("a record of the BOX half answers a landing that only needs the box half", isinstance(g, str)
+                  and "already green" in g and not halves())
+            os.environ.pop("CC_PORTABLE_GATE", None)
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted())
+            check("...and answers NOTHING when the whole suite is what is being asked for: half a run is not a run",
+                  isinstance(g, str) and "already green" not in g and halves() == [None])
+            os.unlink(gp)
+            write_atomic(green, {"suite": "core/tests/selftest.sh", "tree": TREE, "at": stamp()})
+            os.environ["CC_PORTABLE_GATE"] = "1"
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted())
+            same = isinstance(g, str) and "already green" in g and not halves()
+            os.environ.pop("CC_PORTABLE_GATE", None)
+            L, g, r = both(gate_answer, reviewer_says, changed="M\tinstall.sh\n", **hosted())
+            check("...while a record of a WHOLE run answers both — it ran both halves, which is why a worker's own "
+                  "`cc-green` is not wasted by any of this",
+                  same and isinstance(g, str) and "already green" in g and not halves())
+            os.unlink(green)
+        finally:
+            os.environ.pop("CC_PORTABLE_GATE", None)
     finally:
         os.access = real_access
 
@@ -9590,7 +9773,24 @@ def cmd_selfcheck():
         check("M2: ...with the scope and the slot count handed in as arguments, because the boundary clears the "
               "environment",
               any("CC_LAND_CHANGED=src/app.py tests/test_app.py" in c and f"CC_SELFTEST_SLOTS={PREPARE_AT_ONCE}" in c
-                  for c in gates if c[-1].endswith("selftest.sh")))
+                  for c in gates if c[-1].endswith("selftest.sh"))
+              and not any("CC_SUITE_PART=" in a for c in gates for a in c))
+        # …and the HALF, by the same route: a card that says "the box half here" over a sandboxed suite that ran
+        # the whole thing would be a split that happened only on the card (review of #469)
+        os.environ["CC_PORTABLE_GATE"] = "1"
+        try:
+            L = mland(**{"gh run list": (0, json.dumps([{"headSha": HEAD, "status": "completed", "conclusion": "success",
+                                                          "url": "https://github.com/o/r/actions/runs/5",
+                                                          "createdAt": "2030-01-01T00:00:00Z"}])),
+                         "git log -1 --format=%ct": (0, "1800000000\n")})
+            rc, said = mrun(L)
+            gates = sandboxed()
+            check("M2: ...and the HALF: a member head whose portable half passed off the box runs the box half in "
+                  "the sandbox — `CC_SUITE_PART=box` handed in as an argument like the scope — and the card says so",
+                  rc == 0 and len(gates) == 2 and all("CC_SUITE_PART=box" in c for c in gates)
+                  and "the box half here, the portable half off the box" in said)
+        finally:
+            os.environ.pop("CC_PORTABLE_GATE", None)
         led = (read_json(member_spend()) or {}).get(H) or {}
         check("M2: the review was CHARGED to the workspace's day in the ledger a dispatch pre-charges — one review's "
               "budget, under today's date — and the model was asked once",
