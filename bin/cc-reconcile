@@ -734,7 +734,22 @@ def decide(f):
     # (facts()) and so goes quiet with it. That is acceptable for these rows and no others: the open or merged PR
     # is the evidence the branch reached origin, and `cc rm` refuses a worktree that still holds uncommitted work.
     landed_elsewhere = st == "review" and has_pr and pr in ("OPEN", "MERGED")
-    if not f["wt_exists"] and not finished and word not in QUEUED and not f.get("agent") and not landed_elsewhere:
+    # WORD IS A PROXY FOR "WAS THIS EVER DISPATCHED", AND THE PROXY BREAKS: `cc-board status`/`note` write ANY
+    # word straight onto a row, dispatch or no. `lessons/tutor-on-a-member-lesson` was `queued`, never claimed —
+    # only a task.md, no worktree ever — and a session, seeing it could not proceed yet, set it `blocked` with a
+    # note explaining why. `word` left QUEUED on that one note and this rule read the empty worktree as loss
+    # (raised 2026-09-11). `delivery` is a fact, not the guess: cc-task writes delivery.json the moment a row is
+    # actually claimed, in STATE rather than the worktree, so it is still there to read after the worktree is
+    # gone. But `delivery` alone reads two dispatch paths (worker, subagent) and misses a third: `cc <repo>
+    # <track>`, run by hand (interactive, `__run`/`__runmember`), calls ensure_track and sets the row `running`
+    # without ever calling `cc-task claim` — `lessons/pdf-companions` today has a worktree, `blocked`, and no
+    # delivery.json. That path is the board's own `started` flag, set true by `__run`/`__runmember` and by
+    # cc-handoff when a session opens the track, so a row it dispatched is caught even with no claim on file. A
+    # row `word` moved off QUEUED by hand, with no claim and never started, is exempted exactly as a `queued` one
+    # is; a row any dispatch path actually touched keeps being asked about, whatever its word says now.
+    if (not f["wt_exists"] and not finished and word not in QUEUED
+            and (f.get("delivery") or f.get("started") or f.get("worked"))
+            and not f.get("agent") and not landed_elsewhere):
         out.append(("ask", None, "its worktree is gone"))   # a queued track has never been started: it is SUPPOSED to have no worktree
     # …AND NEITHER HAS A ROW A SESSION IS WORKING IN ITS SUBAGENTS: nothing dispatches such a row, so `ensure_track`
     # never made it a worktree. The mark flips a `queued` one to `running` above, so `word` leaves QUEUED and this
@@ -982,6 +997,17 @@ def facts(repos, net=True, grace=GRACE, no_stop=False, wedged=WEDGED, mark=AGENT
                 "repo": repo, "track": track, "status": st, "pr": pr, "kind": t.get("kind") or "track",   # decide() narrows by kind
                 "pr_state": pr_state(repo, pr, net) if ask_pr else ("?" if want_pr and net else None),
                 "live": f"{repo}/{track}" in live, "wt_exists": os.path.isdir(wt),
+                "delivery": os.path.exists(f"{STATE}/{repo}/{track}/delivery.json"),   # cc-task's claim record:
+                # written the moment a row is actually claimed (worker or subagent), lives in STATE so it
+                # outlives the worktree it was claimed for — see the worktree rule below for why this exists.
+                "started": bool(t.get("started")),   # the board's own flag: set true by `cc <repo> <track>`
+                # (interactive, __run/__runmember) and by cc-handoff when a session opens the track — the
+                # dispatch path `delivery` above misses, since none of them call `cc-task claim`.
+                "worked": os.path.exists(f"{STATE}/{repo}/{track}/progress.md")
+                          or os.path.exists(f"{STATE}/{repo}/{track}/loop.log"),   # the legacy worker path's own
+                # trace: `cc <repo> <track> --go` predates cc-task claim and sets neither `delivery` nor
+                # `started`, but a row it actually ran left a journal or a loop log — a never-dispatched row has
+                # only task.md (per the brief).
                 "age": max(0.0, t0 - epoch(t.get("updated") or t.get("created"))), "grace": grace,
                 "journal": journal(repo, track), "loop_end": loop_end(repo, track),
                 "commit_err": os.path.exists(commit_marker(repo, track)),
@@ -1452,7 +1478,10 @@ def selfcheck():
              "age": 10 ** 6, "grace": GRACE, "journal": (None, ""), "loop_end": "",
              "commit_err": False, "push_err": False, "unpushed": True, "has_remote": True,
              "limited": False, "loops": [], "workers": [], "pane_idle": 0.0,
-             "agent": "", "agent_live": False, "agent_stale": "", "held": ""}
+             "agent": "", "agent_live": False, "agent_stale": "", "held": "",
+             "delivery": True, "started": False, "worked": False}   # every existing case below is a row that
+             # really was dispatched through cc-task; the never-claimed, interactive-start and legacy-worker
+             # ones are their own tests, below, and set these explicitly
         d.update(kw)
         return d
 
@@ -1501,6 +1530,24 @@ def selfcheck():
        "the board spoke `queued` still say `todo`",
        decide(F(status="queued", wt_exists=False)) == [] and decide(F(status="todo", wt_exists=False)) == []
        and decide(F(status="queued", live=True))[0][:2] == ("fix", "running"))
+    ok("…AND SO IS ONE `word` MOVED OFF QUEUED BY HAND: a person or session can set any status straight onto a "
+       "row (`cc-board status`/`note`), dispatch or not — lessons/tutor-on-a-member-lesson was `queued`, never "
+       "claimed, only a task.md and no worktree ever, and a note marking it `blocked` (nothing wrong with "
+       "starting) was read as a lost worktree. `delivery` is cc-task's claim record, not the board's word, and "
+       "a row nothing ever claimed has none",
+       decide(F(status="blocked", wt_exists=False, delivery=False)) == [])
+    ok("…BUT A ROW cc-task DID CLAIM keeps being asked about, whatever word it wears now: the claim record "
+       "outlives the worktree it was made for",
+       ("ask", None, "its worktree is gone") in decide(F(status="blocked", wt_exists=False, delivery=True)))
+    ok("…AND SO DOES ONE `cc <repo> <track>` STARTED INTERACTIVELY, EVEN WITH NO CLAIM ON FILE: __run/__runmember "
+       "and cc-handoff set the board's `started` flag without ever calling `cc-task claim`, so `delivery` alone "
+       "misses this dispatch path — `started` catches it",
+       ("ask", None, "its worktree is gone") in decide(F(status="blocked", wt_exists=False, delivery=False, started=True)))
+    ok("…AND SO DOES ONE THE LEGACY WORKER PATH RAN, EVEN WITH NEITHER A CLAIM NOR `started` ON FILE: `cc <repo> "
+       "<track> --go` predates cc-task claim and never sets the board's `started` flag, but a row it actually "
+       "ran left a progress.md or loop.log — `worked` catches it, and the never-claimed `blocked` case above "
+       "stays empty",
+       ("ask", None, "its worktree is gone") in decide(F(status="running", wt_exists=False, delivery=False, started=False, worked=True)))
     ok("a refused checkpoint is a finding", any("checkpoint" in w for _, _, w in decide(F(status="review", pr="u", commit_err=True))))
     # THE MARKER IS NOT THE ANSWER: `.cc/push.err` survives a push made any way but cc-checkpoint's own next one
     # (a person pushing after a refused lease), and one such file nagged a pushed worktree every 20 min for days.
