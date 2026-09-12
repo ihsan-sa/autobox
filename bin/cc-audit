@@ -49,6 +49,17 @@
 # and is delivered as ONE message with the file (cc-slack post --file), to the control repo's channel (CC_AUDIT_FAILURE_TO
 # names another, a test chat) — no mention, no canvas, no cc-notify, no board row: a finding cannot make work. The
 # tier is the launcher's check, not this file's: run by hand it runs.
+# TWO THINGS THIS FILE WRITES TO THE FAILURE LEDGER, RULE-BASED, NO MODEL (docs/design-failure-noticing-2026-09-11.md).
+# A FINDING THAT NAMES A KIND IS A RECORD: after a report mode (review, weekly, monthly, delete, arch, patterns) has
+# written its report, every line of it that names a catalogue kind (`<contract>/<symptom>`, as `cc-failures kinds`
+# lists them) becomes ONE `cc-failures record` line — status `asserted`, a candidate until a person or an investigation
+# confirms it, writer cc-audit, links.source naming the report and the line, so the same report never records twice.
+# It makes no row: the board adds below are what they were, and an asserted record counts nowhere until confirmed.
+# `failure` mode is excluded — its packet names its own cluster's kind on every line. See record_findings.
+# THE PIPELINE CHECKS ITSELF in `## failures` under checks: the ledger's door writes (a probe record into a scratch
+# ledger), every producer the design names still calls cc-failures (a writer refactored away records nothing, and
+# nothing else would notice), and an eligible cluster unclaimed for two reconcile passes while the investigation is on
+# and the tier allows it is the pipeline stalled, not a quiet day. See pipeline_check.
 # Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE / CC_CODEX (stub either model) · CODEX_MODEL / CODEX_EFFORT
 # (else ~/.cc/config, else codex's own defaults) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL/_FAILURE_BROAD
 # · CC_AUDIT_FAILURE_TO (where the failure report is posted; default #<control repo>)
@@ -183,6 +194,53 @@ spend_since(){   # spend_since <state root> <epoch> — worker $ since <epoch>, 
   find "$1" -path '*/runs/*.json' -newermt "@$2" -print0 2>/dev/null |
     xargs -0 -I{} jq -r '.total_cost_usd // 0' {} 2>/dev/null | awk '{s+=$1} END{printf "%.2f", s+0}'
 }
+# ---- the failure ledger: findings that name a kind, and the pipeline's own check ----
+FAILURES="${CC_AUDIT_FAILURES_BIN:-$R/bin/cc-failures}"   # the ledger's one door; a test points it at a stub
+PRODUCERS="cc-reconcile cc-guard cc-audit"   # the writers this branch wires, plus this file; cc-land cc-green cc-loop join when their writers land (track a-red-gate-is-recorded-by-the-tool-that-saw-it)
+record_findings(){   # record_findings <report> — one asserted record per line naming a catalogue kind; nothing else
+  local rpt=$1 kinds k ln n have src
+  [ -s "$rpt" ] || return 0
+  kinds=$("$FAILURES" kinds 2>/dev/null | awk '/^  [a-z0-9-]+\/[a-z0-9-]+$/ { print $1 }'); [ -n "$kinds" ] || return 0
+  # what this report already recorded — the source link is the report's name and the line, so a rerun records nothing twice
+  have=$("$FAILURES" show --scope "$CTL" --json 2>/dev/null | jq -r '.[] | .links.source // empty' 2>/dev/null)
+  n=0
+  while IFS= read -r ln; do
+    n=$((n+1))
+    for k in $kinds; do
+      case " $ln " in *"$k"*) ;; *) continue;; esac
+      src="audit:$(basename "$rpt")#$n"
+      grep -qxF -- "$src" <<<"$have" && continue
+      "$FAILURES" record --scope "$CTL" --kind "$k" --status asserted --writer cc-audit --detector box \
+        --detector-evidence "a $mode audit's report named the kind; a finding of a model read, asserted until confirmed" \
+        --observed "$(short "$(sed -E 's/^[-*[:space:]]+//; s/\*\*//g' <<<"$ln")")" --evidence "$rpt:$n" \
+        --link "source=$src" >/dev/null 2>&1 || log "record_findings: cc-failures record failed for $src"
+      log "record_findings: $k ← $src"
+      break   # one record per line, the first kind it names
+    done
+  done < "$rpt"
+  return 0
+}
+pipeline_check(){   # pipeline_check <bin dir> — `## failures` rows into the report; mechanical, reads the objects themselves
+  local bin=$1 scratch o rc p miss="" oldest=0 nel=0 age u v inv="off" tier="" word
+  scratch=$(mktemp -d)
+  o=$(CC_FAILURES=$scratch "$FAILURES" record --scope _ccaudit --kind pipeline/probe --observed "cc-audit probe" --writer cc-audit 2>&1); rc=$?
+  rm -rf "$scratch"; ck $rc "failure ledger — cc-failures record $([ $rc = 0 ] && echo writes || echo "fails: $(short "$o")")"
+  for p in $PRODUCERS; do [ -f "$bin/$p" ] && grep -q 'cc-failures' "$bin/$p" || miss="$miss $p"; done
+  ck "$(tf test -z "$miss")" "failure writers — every producer names cc-failures${miss:+; broken:$miss}"
+  # the oldest unclaimed eligible cluster, in minutes: `eligible` ends each line with `unclaimed 3d 6h` or `claimed …`
+  while IFS=$'\t' read -r _ _ _ _ _ _ word; do
+    case "$word" in unclaimed*) ;; *) continue;; esac
+    nel=$((nel+1)); age=0
+    for u in ${word#unclaimed }; do v=${u%?}; case "$u" in *d) age=$((age + v*1440));; *h) age=$((age + v*60));; *m) age=$((age + v));; esac; done
+    [ "$age" -gt "$oldest" ] && oldest=$age
+  done < <("$FAILURES" eligible 2>/dev/null)
+  [ "$(cfgval CC_FAILURES_INVESTIGATE | tr 'A-Z' 'a-z')" = on ] && inv=on
+  "$R/bin/cc-tier" allows explore >/dev/null 2>&1 && tier=allows || tier=holds
+  if [ "$inv" = on ] && [ "$tier" = allows ]; then
+    ck "$(tf test "$oldest" -le 40)" "failure pipeline — $nel eligible cluster(s) unclaimed, oldest ${oldest} min (two reconcile passes is 40)"
+  else ck 0 "failure pipeline — $nel eligible cluster(s) unclaimed, oldest ${oldest} min; not stalled: investigation $inv, tier $tier explore"; fi
+}
+
 checks(){
   add "$(header)"; add ""; add "_window: since $SINCE UTC_"; add ""; add "## suites"
   # THE BASELINE. Red here belongs to main, not to whichever track happens to run next — every one of them hits it
@@ -229,6 +287,8 @@ checks(){
   local hd="$R/../home" tot=0                 # the private overlay's ~ docs (a bare core clone has none)
   miss=0; for f in "$hd"/*.md; do [ -f "$f" ] || continue; tot=$((tot+1)); [ -L "$HOME/$(basename "$f")" ] || miss=$((miss+1)); done
   ck "$(tf test "$miss" -eq 0)" "home doc symlinks — $miss of $tot missing"
+  add ""; add "## failures"
+  pipeline_check bin
   add ""; add "## leftovers"
   local old orph stale
   old=$(docker ps -a --filter status=exited --filter name=ccbox --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -cE 'day|days|weeks|months')   # "About a day ago" counts
@@ -1037,6 +1097,32 @@ S
   sck "$(tf test "$rc" = 0 && ! test -f "$fh/.cc/failures/reports/$cl.md" && ! test -f "$fh/slack.log" && grep -q '^## message' <<<"$out")" "failure --dry: the report prints, nothing is written under ~/.cc/failures and nothing is posted"
   unset -f fb
 
+  # THE FAILURE LEDGER, BOTH WAYS. record_findings: a report naming two catalogue kinds and one line naming none →
+  # two asserted records in a ledger of the fixture's own, each linked to its report line; the same report again →
+  # nothing new; no board row appears (the fixture has no board, and nothing here calls one). pipeline_check: a bin
+  # dir whose cc-guard has lost its writer, and a cc-failures that fails, are each ONE FAIL row naming the producer.
+  local fb="$d/fbin" rp="$d/2026-01-01-review.md" fl="$d/.cc/failures" CTLsave=$CTL FAILsave=$FAILURES RPTsave=$RPT
+  mkdir -p "$fb" "$fl"; CTL=_ccauditsc; FAILURES="$R/bin/cc-failures"; export CC_FAILURES="$fl"
+  printf '## verdict\n- served well\n- **IMPROVEMENT** two answers rested on a proxy: answer-evidence/wrong-object-or-proxy, twice this window\n- **IMPROVEMENT** the watchdog nagged about a landing in flight (notification/false-action-needed)\n- a line naming no kind at all\n' > "$rp"
+  record_findings "$rp"
+  o=$("$FAILURES" show --scope "$CTL" --json 2>/dev/null)
+  sck "$(tf test "$(jq -r '.[] | select(.status=="asserted" and .writer=="cc-audit") | .kind' <<<"$o" | sort | tr '\n' ' ')" = "answer-evidence/wrong-object-or-proxy notification/false-action-needed ")" "a report naming two catalogue kinds writes two ASSERTED records, one per kind-naming line, and none for the line naming no kind"
+  sck "$(tf test "$(jq -r '.[] | .links.source' <<<"$o" | sort | tr '\n' ' ')" = "audit:2026-01-01-review.md#3 audit:2026-01-01-review.md#4 ")" "…each linked to its report and line"
+  record_findings "$rp"
+  sck "$(tf test "$("$FAILURES" show --scope "$CTL" --json 2>/dev/null | jq length)" = 2)" "…and the same report recorded again writes nothing twice"
+  sck "$(tf test "$("$FAILURES" eligible --scope "$CTL" 2>/dev/null | wc -l)" = 0)" "…asserted records count nowhere: nothing eligible, and no row was made"
+  RPT=""; pass=0; fail=0
+  for p in $PRODUCERS; do printf '#!/bin/sh\ncc-failures record\n' > "$fb/$p"; done
+  pipeline_check "$fb"
+  sck "$(tf test "$fail" = 0 && grep -q 'every producer names cc-failures$' <<<"$RPT")" "pipeline check: a bin where every producer names the writer and the ledger writes → no FAIL row"
+  RPT=""; pass=0; fail=0; printf '#!/bin/sh\necho no writer here\n' > "$fb/cc-guard"
+  pipeline_check "$fb"
+  sck "$(tf grep -q 'FAIL\*\* failure writers — every producer names cc-failures; broken: cc-guard$' <<<"$RPT")" "pipeline check: a producer whose writer is gone is ONE FAIL row naming it (cc-guard)"
+  printf '#!/bin/sh\necho "ledger: disk full" >&2; exit 1\n' > "$fb/cc-failures"; chmod +x "$fb/cc-failures"
+  RPT=""; pass=0; fail=0; FAILURES="$fb/cc-failures"; pipeline_check "$fb"
+  sck "$(tf grep -q 'FAIL\*\* failure ledger — cc-failures record fails: ledger: disk full' <<<"$RPT")" "pipeline check: a ledger door that fails is a FAIL row saying what it said"
+  CTL=$CTLsave; FAILURES=$FAILsave; RPT=$RPTsave; unset CC_FAILURES
+
   unset CC_SC_ARGV; rm -rf "$d"
   echo "cc-audit selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
@@ -1137,6 +1223,7 @@ fi
 if [ "$dry" = 1 ]; then printf '%s\n' "$body"   # OUTDIR is a mktemp dir: the reports and the evidence go with it on EXIT
 else
   printf '%s\n' "$body" > "$out"; echo "$out"
+  [ "$mode" = checks ] || [ "$llm_on" = 0 ] || [ "$llm_ok" = 0 ] || record_findings "$out"   # a finding naming a kind is a record; never a row
   [ "$mode" = checks ] || [ "$llm_on" = 0 ] || printf '%s\n' "$CHK" > "$AD/$DAY-checks.md"   # the "since the last run" window is always a checks file (--no-llm already wrote its index there)
 fi
 if [ "$post" = 1 ]; then

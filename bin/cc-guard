@@ -38,6 +38,11 @@
 # workers and makes tracks INSIDE itself and nowhere else — docs/design-member-workspaces.md.
 # It also gates whichever session is NOT live during an overlapping handoff (cc-handoff), by session id and
 # by $CC_HANDOFF rather than by a marker: the two sessions share one cwd, so the walk below cannot tell them apart.
+# A REFUSAL THAT FELL ON WORDS IS A FAILURE, AND IT IS RECORDED HERE: a rule that read text is re-read against a bare
+# view of the command (quotes, heredoc bodies and comments out); if it no longer matches, the refusal cost the session
+# a turn on permitted text and ONE line goes to the failure ledger (`cc-failures record`, kind
+# guard-policy/permitted-text-refused, the command's shape and the rule, never its text). A correct refusal records
+# nothing, and the write can never change the verdict — see note_refusal.
 #   cc-guard selfcheck     the gates, against fixtures in a HOME of their own — never this box's state or sessions
 # Env: CC_GUARD_ASKS, CC_GUARD_ASK_TTL (where a member-facing query is de-duplicated, and for how long) ·
 # CC_GUARD_ROOT_PID (test hook: the session process the worker kill fence measures its subtree from).
@@ -54,7 +59,7 @@ command -v jq >/dev/null 2>&1 || { case "${CC_ROLE:-}${CC_HANDOFF:+ handoff}" in
 if [ "${1:-}" = selfcheck ]; then
   # The RUNNER's env decides nothing here: a worker running the gates exports CC_ROLE, and a member session its
   # CC_GUARD_ASKS — each case sets what it needs and reaches the child through `env` below.
-  unset CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_ROLE CC_HANDOFF CC_HANDOFF_DIR CC_GUARD_ASKS CC_GUARD_ASK_TTL CC_GUARD_ROOT_PID
+  unset CC_NOTIFY_LOG_ONLY CC_NOTIFY_LOG CC_ROLE CC_HANDOFF CC_HANDOFF_DIR CC_GUARD_ASKS CC_GUARD_ASK_TTL CC_GUARD_ROOT_PID CC_FAILURES
   T=$(mktemp -d); H=$T/home; WT=$H/.cc/worktrees/demo/t1; n=0; f=0; pids=""
   # A SECOND FIXTURE HOME, AND THE POINT OF IT IS THAT IT IS NOT UNDER /tmp: the write-path rules wave /tmp
   # through as scratch, so a fixture there cannot test them at all — every path in $T is already allowed.
@@ -69,6 +74,12 @@ if [ "${1:-}" = selfcheck ]; then
   printf '#!/bin/sh\necho "notify $*" >> "$CALLS"\n' > "$H/bin/cc-notify"
   printf '#!/bin/sh\necho "slack $*" >> "$CALLS"\n' > "$H/bin/cc-slack"
   chmod +x "$H/bin/cc-notify" "$H/bin/cc-slack"
+  # …and the failure ledger's door the same way: the real cc-failures beside this file, logging each call, aimed at
+  # a ledger of the FIXTURE's own. CC_FAILURES is exported for every case below, whichever binary a refusal finds:
+  # a refusal in any case here must never write the box's ledger (note_refusal).
+  export CC_FAILURES=$T/ledger
+  printf '#!/bin/sh\necho "failures $*" >> "$CALLS"\nexec "%s/cc-failures" "$@"\n' "$(dirname "$(realpath "$0")")" > "$H/bin/cc-failures"
+  chmod +x "$H/bin/cc-failures"
   # ...and a stand-in for a session process: `claude -p` is what the kill fence must never let go, and the
   # cases below need one they started themselves rather than a real session of this box's to point at.
   printf '#!/bin/sh\nsleep 45\n' > "$T/claude"; chmod +x "$T/claude"
@@ -1402,6 +1413,39 @@ bash <<EOF
 echo x; cc-land 7
 EOF
 P50
+  # 50a. A REFUSAL THAT FELL ON WORDS IS RECORDED WHERE IT HAPPENED, ONCE, AS THE COMMAND'S SHAPE (note_refusal;
+  #      docs/design-failure-noticing-2026-09-11.md, The writers). Both sides: a commit message whose first word is
+  #      a gated tool is refused (the quoted-run rule keeps it so) and that refusal is a text refusal → one ledger
+  #      line, guard-policy/permitted-text-refused, carrying `git commit -m` and never `did x`; retried, still one
+  #      line. A merge, a `su -c` running the tool, and the tool behind an unlisted wrapper are refused the same way
+  #      and record NOTHING — each is the rule matching the command itself. A write into ~/bin is a judgement rule
+  #      with no pattern: refused, and nothing recorded either.
+  ASKS=$T/asks50a; CALLS=$T/calls50a; : > "$CALLS"; GERR=$T/err50a; r=0; rm -rf "$CC_FAILURES"
+  led(){ cat "$CC_FAILURES"/demo.jsonl 2>/dev/null; }
+  r1=$(gc "git commit -m 'cc-land did x'" "$WT" CC_ROLE=worker)
+  { [ "$r1" = 2 ] && [ "$(led | grep -c permitted-text-refused)" = 1 ]; } || { r=1; echo "      a text refusal (rc $r1) left $(led | grep -c .) record(s), wanted 1"; }
+  led | grep -q '"observed":"refused `git commit -m` as landing' || { r=1; echo "      the record does not carry the shape: $(led | head -c 200)"; }
+  led | grep -q 'did x' && { r=1; echo "      the record carries the message text, not the shape"; }
+  r2=$(gc "git commit -m 'cc-land did x'" "$WT" CC_ROLE=worker)
+  { [ "$r2" = 2 ] && [ "$(led | grep -c .)" = 1 ] && [ "$(grep -c '^failures record' "$CALLS")" = 1 ]; } || { r=1; echo "      the same line retried recorded again: $(led | grep -c .) record(s), $(grep -c '^failures' "$CALLS") call(s)"; }
+  for what in "gh pr merge 5" "su -c 'cc-land 7'" "nice -n 5 cc-land 7" "timeout 5 sudo ls"; do
+    got=$(gc "$what" "$WT" CC_ROLE=worker)
+    [ "$got" = 2 ] || { r=1; echo "      a correct refusal went through: rc $got for $what"; }
+  done
+  got=$(gc "cp x ~/bin/cc-guard" "$WT" CC_ROLE=worker); [ "$got" = 2 ] || { r=1; echo "      the write into ~/bin went through: rc $got"; }
+  [ "$(led | grep -c .)" = 1 ] || { r=1; echo "      the ledger holds $(led | grep -c .) record(s) after the correct refusals, wanted exactly 1: $(led | tail -n +2 | cut -c1-160)"; }
+  got=$(gc "git commit -m 'no cc-land here'" "$WT" CC_ROLE=worker); [ "$got" = 0 ] || { r=1; echo "      a message naming the tool mid-quote was refused: rc $got"; }
+  ok "a refusal that fell on words is recorded once with the command's shape and the rule, its retry is not recorded again, and a merge, a su -c, a wrapped tool and a write into ~/bin — correct refusals — record nothing" $r
+  # 50b. A LEDGER THAT CANNOT BE WRITTEN CHANGES NOTHING ABOUT THE REFUSAL. The same text refusal, with a writer that
+  #      fails loudly: the rc is still 2, the stderr line is still the rule's own, and nothing the writer said reaches
+  #      the session. Under a fixture HOME of its own, so the failing writer is the one the guard finds.
+  ASKS=$T/asks50b; CALLS=$T/calls50b; : > "$CALLS"; GERR=$T/err50b; r=0
+  GH=$T/home50b; mkdir -p "$GH/bin" "$GH/.cc/worktrees/demo/t1/.cc"; : > "$GH/.cc/worktrees/demo/t1/.cc/track"
+  printf '#!/bin/sh\necho "failures $*" >> "$CALLS"\necho "ledger: disk full" >&2; echo "garbage on stdout"; exit 1\n' > "$GH/bin/cc-failures"; chmod +x "$GH/bin/cc-failures"
+  : > "$GERR"; got=$(gc "git commit -m 'cc-land did x'" "$GH/.cc/worktrees/demo/t1" CC_ROLE=worker)
+  { [ "$got" = 2 ] && grep -qF 'blocked — landing a change' "$GERR" && ! grep -q 'ledger\|garbage' "$GERR" && [ "$(grep -c '^failures record' "$CALLS")" = 1 ]; } \
+    || { r=1; echo "      rc $got, $(grep -c '^failures' "$CALLS") writer call(s), stderr: $(head -c 160 "$GERR")"; }
+  GH=""; ok "a ledger write that fails leaves the refusal exactly as it was: rc 2, the rule's own line, and nothing the writer said" $r
   # 51. A NOTE THAT QUOTES A RESTART IS NOT A RESTART (row raised-guard-blocks-notes-quoting-a-restart): the
   #     exact command the reader needs, in a board note, with prose that happens to say `watch` — and the same
   #     note over two lines, which used to be read as a second statement. `watch`, `su -c` and a multi-line
@@ -2313,7 +2357,78 @@ record_query(){   # $1 = reason (why); $2 nonempty = class "page" (owner could a
   ( flock -w 5 9 || exit 0; printf '%s\n' "$rec" >> "$sp" ) 9>"$lock" 2>/dev/null || true
   return 0
 }
+# ---- the failure ledger: a refusal that fell on WORDS is recorded where it happened -----------------------
+# docs/design-failure-noticing-2026-09-11.md, The writers: "cc-guard (a refusal that cost a turn)" — and the brief's
+# own line, "a correct refusal is not a failure, one that cost a turn on permitted text is". The rules read the
+# haystack, which keeps whatever the shell COULD still run: the first word of a quoted run, a bare heredoc's
+# expanding lines, every suffix past a head this does not know — each a false positive chosen over a bypass. So a
+# rule that refused is read ONCE MORE against a BARE view of the same command (bare below): heredoc bodies out
+# entirely, comments out, every quoted run blanked — unless a string-runner ($Q) or an executor ($X) stands on that
+# line, when the quoted text is what runs and it stays — and then through cmdpos, so a wrapper hides nothing here
+# either. A rule that still matches refused a COMMAND, which is the gate doing its job, and nothing is written. One
+# that no longer matches refused WORDS: that is the family the catalogue calls guard-policy/permitted-text-refused,
+# and the record carries the rule's reason and the command's SHAPE — its first words off the bare view, so no
+# message, no pattern and no body ever reaches the ledger. Only a rule that reads text sets $RX (rx/rxn); the kill
+# fence and the write-path rules judge a pid or a path, never words, so they leave it empty and record nothing.
+# ONE record per scope+reason+shape per ASK_TTL, keyed beside the queries: a session retrying the same refused line
+# lost one turn, not five. THE VERDICT IS DECIDED BEFORE THIS RUNS AND NOTHING HERE CAN TOUCH IT: the writer is
+# bounded (timeout 5), its exit and output are dropped, and a ledger that cannot be written changes not one byte of
+# the refusal — case 50b runs the same refusal with a writer that fails and asserts the rc and the stderr line.
+RX=""
+rx(){ grep -qE -- "$1" <<<"$cmd" && RX=$1; }      # a text rule: the pattern that matched is kept for note_refusal
+rxn(){ grep -qE -- "$1" <<<"$cmdn" && RX=$1; }    # …the same, on the blank-squeezed line the two Slack doors read
+bare(){   # $1 = the command as typed → its bare view (above). One awk, quote-aware across lines; no apostrophe in it.
+  awk -v X="$X" -v Q="$Q" '
+    BEGIN { SQ = sprintf("%c", 39) }
+    { L[NR] = $0 }
+    END {
+      q = ""; body = ""; bq = 0
+      for (i = 1; i <= NR; i++) { s = L[i]
+        if (body != "") {   # a dropped heredoc body — but a BARE delimiter expands, and what the shell runs in such
+          if (s ~ ("^[ \t]*" body "[ \t]*$")) body = ""     # a line is the interior of its $( ) and backticks (hay: subs)
+          else if (!bq) { o = ""; while (match(s, /\$\([^)]*\)|`[^`]*`/)) { o = o " " substr(s, RSTART + 2 - (substr(s, RSTART, 1) == "`"), RLENGTH - 3 + (substr(s, RSTART, 1) == "`")); s = substr(s, RSTART + RLENGTH) }; print o }
+          continue }
+        keep = (s ~ Q); o = ""; n = length(s); hd = 0
+        for (j = 1; j <= n; j++) { c = substr(s, j, 1)
+          if (q != "") { if (q == "\"" && c == "\\") { j++; if (keep) o = o c substr(s, j, 1); continue }
+                         if (c == q) { q = ""; o = o " "; continue }
+                         if (keep) o = o c; continue }
+          if (c == "\\") { j++; o = o c substr(s, j, 1); continue }
+          if (c == "\"" || c == SQ) { q = c; o = o " "; continue }
+          if (c == "#" && (j == 1 || index(" \t;&|(", substr(s, j - 1, 1)) > 0)) break
+          if (!hd && c == "<" && substr(s, j + 1, 1) == "<" && substr(s, j + 2, 1) != "<" && substr(s, j - 1, 1) != "<") hd = j
+          o = o c }
+        if (hd && s !~ X) {   # a heredoc opened outside quotes and nothing on the line runs its body: drop it, if it closes
+          w = substr(s, hd + 2); sub(/^-?[ \t]*/, "", w); bq = 0
+          if (substr(w, 1, 1) == "\"" || substr(w, 1, 1) == SQ) { w = substr(w, 2); bq = 1 }
+          match(w, /^[A-Za-z_][A-Za-z0-9_]*/); w = (RLENGTH > 0) ? substr(w, RSTART, RLENGTH) : ""
+          for (k = i + 1; w != "" && k <= NR; k++) if (L[k] ~ ("^[ \t]*" w "[ \t]*$")) { body = w; break } }
+        print o } }' <<<"$1"
+}
+note_refusal(){   # $1 = the reason; writes guard-policy/permitted-text-refused when the rule that refused fell on words
+  local why=$1 rxp=$RX bv shape scope key now was fl
+  RX=""
+  [ -n "$rxp" ] && [ "$tool" = Bash ] || return 0            # a judgement rule, or not a command: nothing to re-read
+  bv=$(cmdpos "$(bare "$qcmd")"); bv=${bv//$'\001'/}
+  grep -qE -- "$rxp" <<<"$bv" && return 0                    # the rule matches the command itself: a correct refusal
+  shape=$(bare "$qcmd" | awk 'NF { for (i = 1; i <= NF && i <= 4; i++) printf "%s%s", (i > 1 ? " " : ""), $i; if (NF > 4) printf " …"; exit }')
+  scope=${trepo:-${mws:-${mdir##*/}}}; [ -n "$scope" ] || scope=_nomarker   # the same name the queries spool under
+  now=$(date +%s); key=f$(printf '%s\n%s\n%s' "$scope" "$shape" "$(sed -E 's# \([~/][^)]*\)##g' <<<"$why")" | cksum | tr -cd '0-9')
+  mkdir -p "$ASKS" 2>/dev/null || return 0
+  if [ -f "$ASKS/$key" ]; then was=$(cat "$ASKS/$key" 2>/dev/null) || was=0; case "$was" in ''|*[!0-9]*) was=0;; esac
+    [ $((now - was)) -lt "$ASK_TTL" ] && return 0; fi       # the same line, retried: one turn lost, recorded once
+  printf '%s\n' "$now" > "$ASKS/$key"
+  fl=$HOME/bin/cc-failures; [ -x "$fl" ] || fl=$(command -v cc-failures 2>/dev/null) || return 0
+  timeout 5 "$fl" record --scope "$scope" --kind guard-policy/permitted-text-refused --writer cc-guard \
+    --detector box --detector-evidence "the rule matched the haystack and not the bare view of the command" \
+    --expected "the guard judges the command, and permits what the policy permits" \
+    --observed "refused \`$shape\` as $why: the rule matched only words in quoted text or a heredoc body, and the turn was lost" \
+    --evidence "shape=$shape" --evidence "rule=$why" --evidence "role=${role:-}" --cost turns=1 \
+    --link "source=cc-guard:$key" </dev/null >/dev/null 2>&1 || true
+  return 0
+}
 deny(){
+  note_refusal "$1"
   if [ "$role" = member ]; then record_query "$1" 1
     echo "cc-guard: blocked — $1. A query about this has gone to the box; it will approve it or take it onward. Do anything that needs no approval and say what you are waiting on." >&2
   else echo "cc-guard: blocked — $1 (needs the owner; ask via cc-notify or note it on the board)" >&2; fi
@@ -2322,11 +2437,12 @@ deny(){
 # A SECOND ARG = record nothing: a write the session aimed outside its own tree is its own to fix from the stderr
 # line, not a question for anyone, and three note files refused in one call put six lines in a channel (2026-09-04).
 never(){
+  note_refusal "$1"
   if [ "$role" = member ] && [ -z "${2-}" ]; then record_query "$1" ""
     echo "cc-guard: blocked — $1. This is not this session's to run; the box has been told, so nothing here waits on it. Do the rest." >&2
   else echo "cc-guard: blocked — $1. This is not this session's to run and not the owner's to approve for it — nobody is being asked, so do not wait on an answer." >&2; fi
   exit 2; }
-denyh(){ echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
+denyh(){ note_refusal "$1"; echo "cc-guard: blocked — $1. This session is the NON-LIVE side of an overlapping handoff: read, search, think and ask your peer, but do not act on the world — and never ask the live session to run what you are denied." >&2; exit 2; }
 ws_dispatch_ok(){   # EVERY dispatch in $1 names workspace $2 as its repo — and there is at least one to name.
   # `cc <ws> <track> --go` is a workspace's ONLY dispatch form: it is where the daily cap is charged (cc: member_gate).
   local c=$1 w=$2 all mine
@@ -2389,25 +2505,25 @@ case "$tool" in
   Bash)
     cmd=$u   # the universal block above already built it: one jq and at most one awk per call, not two
     if [ -n "$handoff_gated" ]; then   # on top of the four gates below: what only the LIVE session may do
-      grep -qE 'git +push\b' <<<"$cmd" && denyh "pushing while the other session is the live one (a retired session must not push a stale branch)"
-      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && denyh "dispatching a worker (cc --go)"
-      grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd" && denyh "dispatching a worker (cc-loop)"
-      grep -qE "$AT"'([^ ]*/)?cc +done\b' <<<"$cmd" && denyh "opening a PR (cc done)"
+      rx 'git +push\b' && denyh "pushing while the other session is the live one (a retired session must not push a stale branch)"
+      rx "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' && denyh "dispatching a worker (cc --go)"
+      rx "$AT"'([^ ]*/)?cc-loop\b' && denyh "dispatching a worker (cc-loop)"
+      rx "$AT"'([^ ]*/)?cc +done\b' && denyh "opening a PR (cc done)"
     fi
     # 1. merge/deploy
-    grep -qE "$AT"'gh +pr +merge' <<<"$cmd" && deny "merging a PR"
-    grep -qE "$AT"'([^ ]*/)?cc-land\b' <<<"$cmd" && never "landing a change (cc-land merges, installs, switches units on and restarts services in one go)"   # one command for all of it is exactly why it stays the owner's
-    grep -qE 'git +push[^;&|]*( -f|--force|--force-with-lease)' <<<"$cmd" && deny "force push"
-    grep -qE 'git +push[^;&|]*\b(main|master)\b' <<<"$cmd" && deny "pushing to the default branch"
-    grep -qE 'git +(checkout|switch) +(main|master)\b' <<<"$cmd" && deny "switching to the default branch inside a track"
-    grep -qE 'git +(symbolic-ref|update-ref|checkout +-B|switch +-C)' <<<"$cmd" && deny "repointing a ref/HEAD (the checkpoint hook would then commit+push that branch)"
-    grep -qE "$AT"'(vercel|netlify|fly|heroku|kubectl|terraform|ansible|aws|gcloud|az) +(deploy|apply|--prod|up\b)' <<<"$cmd" && never "deploying"
+    rx "$AT"'gh +pr +merge' && deny "merging a PR"
+    rx "$AT"'([^ ]*/)?cc-land\b' && never "landing a change (cc-land merges, installs, switches units on and restarts services in one go)"   # one command for all of it is exactly why it stays the owner's
+    rx 'git +push[^;&|]*( -f|--force|--force-with-lease)' && deny "force push"
+    rx 'git +push[^;&|]*\b(main|master)\b' && deny "pushing to the default branch"
+    rx 'git +(checkout|switch) +(main|master)\b' && deny "switching to the default branch inside a track"
+    rx 'git +(symbolic-ref|update-ref|checkout +-B|switch +-C)' && deny "repointing a ref/HEAD (the checkpoint hook would then commit+push that branch)"
+    rx "$AT"'(vercel|netlify|fly|heroku|kubectl|terraform|ansible|aws|gcloud|az) +(deploy|apply|--prod|up\b)' && never "deploying"
     # 2. external comms
-    grep -qE "$AT"'gh +(issue +(create|comment)|pr +(comment|review|close|reopen)|release +create)' <<<"$cmd" && deny "public GitHub comms"
-    grep -qE "$AT"'gh +(repo +(delete|archive)|api)\b' <<<"$cmd" && deny "gh repo delete/archive or a raw gh api call"
-    grep -qE "$AT"'(mail|sendmail|msmtp|mutt)\b' <<<"$cmd" && deny "sending email"
+    rx "$AT"'gh +(issue +(create|comment)|pr +(comment|review|close|reopen)|release +create)' && deny "public GitHub comms"
+    rx "$AT"'gh +(repo +(delete|archive)|api)\b' && deny "gh repo delete/archive or a raw gh api call"
+    rx "$AT"'(mail|sendmail|msmtp|mutt)\b' && deny "sending email"
     # 3. destructive / infra
-    grep -qE "$AT"'cc +slack +off' <<<"$cmd" && never "cc slack off (drops the owner's live Slack link)"
+    rx "$AT"'cc +slack +off' && never "cc slack off (drops the owner's live Slack link)"
     # …and `cc-broker inject`, which is "an argv-compatible wrapper onto the same daemon door" (review of #190,
     # F6): it takes the same arguments and calls `cc-slack inject` itself, so a rule naming only the wrapped
     # command would hand a worker back the door this one closed — typing into any session's prompt. The class,
@@ -2425,16 +2541,16 @@ case "$tool" in
     # $cmdn is the same line with tabs and runs of blanks squeezed to one space, and it is what the two doors
     # below match on — the shell reads them the same way, so this rule has to as well.
     cmdn=$(tr '\t' ' ' <<<"$cmd" | tr -s ' ')
-    grep -qE '(^|[;&|(){}`]|\$\() *[^ ]*(cc-slack +(inject|post|post-approval)|cc-broker +(inject|ledger)|cc-arch +landed)\b' <<<"$cmdn" && deny "posting to the owner's Slack (cc-slack inject/post, cc-broker inject/ledger and cc-arch landed onto the same door)"   # any path to the binary
+    rxn '(^|[;&|(){}`]|\$\() *[^ ]*(cc-slack +(inject|post|post-approval)|cc-broker +(inject|ledger)|cc-arch +landed)\b' && deny "posting to the owner's Slack (cc-slack inject/post, cc-broker inject/ledger and cc-arch landed onto the same door)"   # any path to the binary
     # …AND `cc-publish` IS THE SECOND ROUTE TO THAT UPLOAD, because it gives cc-arch its turn after every push. It
     # also pushes this box's code to a public repository, which is outward comms in its own right. Its READS are
     # left alone — `status` answers a question, `--dry-run` rehearses and `selfcheck` runs on fixtures — so the
     # rule refuses the publish itself and nothing else.
-    grep -qE '(^|[;&|(){}`]|\$\() *[^ ]*cc-publish([^A-Za-z0-9_.-]|$)' <<<"$cmdn" \
+    rxn '(^|[;&|(){}`]|\$\() *[^ ]*cc-publish([^A-Za-z0-9_.-]|$)' \
       && ! grep -qE 'cc-publish +(status|selfcheck|setup|--dry-run|-n)([^A-Za-z0-9_.-]|$)' <<<"$cmdn" \
       && deny "publishing the box's code outward, which posts the architecture overview as a side effect (cc-publish; its status, --dry-run and selfcheck are reads and still run)"
-    grep -qE "$AT"'sudo\b' <<<"$cmd" && never "sudo / host changes"
-    grep -qE 'rm +(-[a-zA-Z-]+ +)*-[a-zA-Z]*r[a-zA-Z]* +(-[a-zA-Z-]+ +)*(~|[$]HOME|\.\.|/home|/etc|/var|/usr|/)([*/ ]|$)' <<<"$cmd" && never "recursive delete outside the worktree"
+    rx "$AT"'sudo\b' && never "sudo / host changes"
+    rx 'rm +(-[a-zA-Z-]+ +)*-[a-zA-Z]*r[a-zA-Z]* +(-[a-zA-Z-]+ +)*(~|[$]HOME|\.\.|/home|/etc|/var|/usr|/)([*/ ]|$)' && never "recursive delete outside the worktree"
     # The container runtime is a way AROUND every other line here, for a WORKER as much as for a member: this user
     # is in group `docker`, so one `docker run -v /:/host` reads and writes the whole filesystem as root — the
     # credentials below included — with no escalation at all. So it is denied for every gated role, which subsumes
@@ -2443,9 +2559,9 @@ case "$tool" in
     # DIRECTORY `docker/Dockerfile` a container run — one `for f in docker/…` refused. A path INTO a dir named
     # docker is not the runtime; a path TO the binary still is, and that is what the prefix ahead of it is for.
     # `-` stays OUT of the exclusion on purpose: `docker-compose up` is the runtime and `\b` was what caught it.
-    grep -qE "$AT"'([^ ]*/)?(docker|podman|nerdctl)([^/A-Za-z0-9_.]|$)' <<<"$cmd" && never "running a container (this user is in group docker, so a bind-mounted container reads and writes everything as root)"
-    grep -qE "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' <<<"$cmd" && never "host/network/service changes"
-    grep -qE 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' <<<"$cmd" && never "destructive git"
+    rx "$AT"'([^ ]*/)?(docker|podman|nerdctl)([^/A-Za-z0-9_.]|$)' && never "running a container (this user is in group docker, so a bind-mounted container reads and writes everything as root)"
+    rx "$AT"'(systemctl|netplan|ip +link|ip +addr|iptables|nft|ufw|shutdown|reboot|poweroff)\b' && never "host/network/service changes"
+    rx 'git +(branch +-D|reset +--hard +origin|clean +-[a-z]*f)' && never "destructive git"
     # 3b. A WORKER KILLS ONLY WHAT IT STARTED. 2026-09-02 11:15Z a worker went hunting a "stray" suite with
     #     `pgrep -f <the suite's filename>`, matched its OWN `claude -p` — its task prompt names that file — and
     #     killed its own iteration mid-run (rc=143, $0 recorded, nothing journalled). A prompt line telling it not
@@ -2697,7 +2813,7 @@ case "$tool" in
     # one rather than replacing it. Same honest ceiling as every line here: a blocklist stops accidents and casual
     # prompt-injection, not a redirection or a script written first.
     RD='(cat|tac|less|more|head|tail|nl|cut|grep|egrep|fgrep|rg|sed|awk|xxd|od|base64|strings|sort|uniq|jq|python[0-9.]* +-c|source|\.)'
-    grep -qE "$AT$RD"' +[^;&|]*(ccbox/env|\.credentials\.json)($|[^A-Za-z0-9_.-])' <<<"$cmd" \
+    rx "$AT$RD"' +[^;&|]*(ccbox/env|\.credentials\.json)($|[^A-Za-z0-9_.-])' \
       && never "reading the box's credentials (~/.claude/.credentials.json is the Claude account and its spend, ~/ccbox/env is a GitHub PAT and a deploy token)"
     # 5. THE WORKTREE IS THE ONLY TREE A TRACK WRITES. ~/dev/<repo> is the checkout the box RUNS and ~/bin symlinks into
     #    it, so a write there is an unreviewed change to a live binary. 2026-09-01: a review agent's `cp x $S/bin/y` landed
@@ -3014,25 +3130,25 @@ case "$tool" in
       # which the sandbox sets — never a member-facing session: `CC_MEMBER_SANDBOX=1 cc alice todo` from a plain member
       # dir passed every rule here and started a member workspace session ON THE HOST, the one thing the hard rule
       # forbids (review 2, A). The ASSIGNMENT is refused (prefix, env, export); naming the variable in a grep is not.
-      grep -qE '(^|[^A-Za-z0-9_])CC_MEMBER_SANDBOX[+:]?=' <<<"$cmd" && never "setting CC_MEMBER_SANDBOX — the boundary opens a workspace session from outside; a member-facing session never opens one on the host"
+      rx '(^|[^A-Za-z0-9_])CC_MEMBER_SANDBOX[+:]?=' && never "setting CC_MEMBER_SANDBOX — the boundary opens a workspace session from outside; a member-facing session never opens one on the host"
       if ! ws_dispatch_ok "$cmd" "$mws"; then
-        grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && never "${mws:+dispatching outside this workspace — }a member-facing session does not dispatch workers (cc --go)${mws:+; inside \`$mws\` it may}"
+        rx "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' && never "${mws:+dispatching outside this workspace — }a member-facing session does not dispatch workers (cc --go)${mws:+; inside \`$mws\` it may}"
       fi
       # cc-loop is the runner UNDERNEATH `cc … --go`, and the day's budget is charged in `cc`, not here: calling it
       # directly spends a workspace's money without ever touching the ledger. So a member never calls it at all.
-      if grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd"; then
+      if rx "$AT"'([^ ]*/)?cc-loop\b'; then
         if [ -n "$mws" ]; then never "dispatching with cc-loop — inside \`$mws\` a worker starts with \`cc $mws <track> --go\`, the one form that charges the daily budget"
         else never "a member-facing session does not dispatch workers (cc-loop)"; fi
       fi
       if [ -n "$mws" ] && ! ws_cc_ok "$cmd" "$mws"; then
         never "creating outside \`$mws\` — this workspace makes tracks, boards and sessions under ~/dev/$mws and nowhere else"
       fi
-      grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && never "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
-      grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && never "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json and the sealed-session copies of it under ~/.cc/sandbox)"
-      grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' <<<"$cmd" && never "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
+      rx "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' && never "a member-facing session does not dispatch workers (a headless claude spends the owner's budget)"
+      rx "$AT$RD"' +[^;&|]*'"$SEC" && never "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json and the sealed-session copies of it under ~/.cc/sandbox)"
+      rx "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' && never "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
       # cc-config is the one sanctioned reader of ~/.cc/config — which makes it the one clean way AROUND the
       # secrets line above for a session that may not see them. Members get neither the read nor the write.
-      grep -qE "$AT"'([^ ]*/)?cc-config\b' <<<"$cmd" && never "the box's config is not a member's to read or rewrite (cc-config)"
+      rx "$AT"'([^ ]*/)?cc-config\b' && never "the box's config is not a member's to read or rewrite (cc-config)"
     fi
     # 6. steward only: everything above at the worker tier, plus the member tier's "no spend, no leak" — minus the
     #    workspace carve-outs, because a steward has no workspace to dispatch inside. Merging, landing, deploying,
@@ -3042,16 +3158,16 @@ case "$tool" in
     #    real wall is still that the model has no Bash at all (--disallowedTools), and this is what is left if that
     #    day ever comes. cc-notify stays allowed: escalating to the owner is the steward's own job.
     if [ -n "$steward" ]; then
-      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' <<<"$cmd" && never "a steward does not dispatch workers (cc --go) — it runs one named chain and escalates everything else"
-      grep -qE "$AT"'([^ ]*/)?cc +[^;&|]*--orch\b' <<<"$cmd" && never "a steward does not start an orch (cc --orch) — a project a person steers is not a routine event"
-      grep -qE "$AT"'([^ ]*/)?cc-loop\b' <<<"$cmd" && never "a steward does not dispatch workers (cc-loop)"
+      rx "$AT"'([^ ]*/)?cc +[^;&|]*--go\b' && never "a steward does not dispatch workers (cc --go) — it runs one named chain and escalates everything else"
+      rx "$AT"'([^ ]*/)?cc +[^;&|]*--orch\b' && never "a steward does not start an orch (cc --orch) — a project a person steers is not a routine event"
+      rx "$AT"'([^ ]*/)?cc-loop\b' && never "a steward does not dispatch workers (cc-loop)"
       # A steward IS a headless model call: another one is unbudgeted spend nobody is watching, and cc-steward
       # recursing on itself is that with a loop around it.
-      grep -qE "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' <<<"$cmd" && never "a steward does not spend the owner's budget on a second model call (a headless claude)"
-      grep -qE "$AT"'([^ ]*/)?cc-steward +run\b' <<<"$cmd" && never "a steward does not run another steward (cc-steward run) — one event, one run"
-      grep -qE "$AT$RD"' +[^;&|]*'"$SEC" <<<"$cmd" && never "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json and the sealed-session copies of it under ~/.cc/sandbox)"
-      grep -qE "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' <<<"$cmd" && never "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
-      grep -qE "$AT"'([^ ]*/)?cc-config\b' <<<"$cmd" && never "the box's config is not a steward's to read or rewrite (cc-config)"
+      rx "$AT"'([^ ]*/)?claude\b[^;&|]* (-p|--print)\b' && never "a steward does not spend the owner's budget on a second model call (a headless claude)"
+      rx "$AT"'([^ ]*/)?cc-steward +run\b' && never "a steward does not run another steward (cc-steward run) — one event, one run"
+      rx "$AT$RD"' +[^;&|]*'"$SEC" && never "reading the box's secrets (~/.cc/config, ~/.ssh, ~/.claude/settings.json and the sealed-session copies of it under ~/.cc/sandbox)"
+      rx "$AT"'(cc +slack|([^ ]*/)?cc-slack) +(off|setup|mkchannel|updates-sweep|archive)\b' && never "re-wiring the box's Slack (cc slack: off, setup, mkchannel, updates-sweep, archive)"
+      rx "$AT"'([^ ]*/)?cc-config\b' && never "the box's config is not a steward's to read or rewrite (cc-config)"
     fi
     ;;
   Agent|Task)   # the one tool that can put this session's work somewhere this session may not write

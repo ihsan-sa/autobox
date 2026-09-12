@@ -105,6 +105,14 @@ here reads the report, opens a row or posts: cc-audit delivers, and a finding ca
 CC_RECONCILE_LAUNCH=CMD (tests) runs `CMD failure <claim>` in place of the unit and skips the running-investigation
 scan, which is box-wide: a fixture must never be held by the box's own investigation.
 
+A NAG THE STATE DISPROVES IS A FAILURE, WRITTEN HERE (the design's writers table: "cc-reconcile (a nag the
+authoritative state disproved)"). Every nag the --notify pass sends — the session's "review and land it", the owner's
+⏳ page, the ask about a worktree the board never heard of — is a memo in the seen-ledger with its time. When a memo
+drops, the pass holds it against the authoritative state AT THAT TIME: a landing cc-land already had (its queue log,
+its work record's `first`), a PR merged or opened before the nag. One the state disproves is one `cc-failures record`
+line, notification/false-action-needed, at the nag's own time, naming the PR; one that simply cleared is nothing, and
+so is one GitHub could not be asked about. The writer never changes the pass: see false_nags() and record_failure().
+
 Exit: 0 the board matches reality · 1 something needs a person · 2 usage error.
 """
 import calendar, glob, json, os, re, shutil, signal, subprocess, sys, time
@@ -432,10 +440,10 @@ def pr_state(repo, url, net=True):
 
 
 def branch_prs(repo, branch, net=True):
-    """[(number, STATE, merged_at)] for the PRs opened FROM <branch>, newest first — the other direction from
-    pr_state(), which starts at a PR a board row already names. `merged_at` is epoch seconds for a MERGED one and
+    """[(number, STATE, merged_at, created_at)] for the PRs opened FROM <branch>, newest first — the other direction
+    from pr_state(), which starts at a PR a board row already names. `merged_at` is epoch seconds for a MERGED one and
     0.0 for every other state, because WHEN it merged is the difference between a delivery being cleaned up and a
-    leftover (see orphans()). None when the answer could not be had (no network, no gh, no checkout to ask from, a
+    leftover (see orphans()); `created_at` is when the PR opened, which is what false_nags() holds a nag against. None when the answer could not be had (no network, no gh, no checkout to ask from, a
     call that failed), and None is not "there is no PR": it is no evidence, and the caller falls back to what it
     can decide without GitHub. Asked from the repo's own checkout — `gh pr list --head` with no repo in front of
     it reads whatever repo the cwd belongs to, which would answer about the wrong project."""
@@ -444,10 +452,10 @@ def branch_prs(repo, branch, net=True):
         return None
     try:
         p = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "10",
-                            "--json", "number,state,mergedAt"], cwd=cwd, capture_output=True, text=True, timeout=20)
+                            "--json", "number,state,mergedAt,createdAt"], cwd=cwd, capture_output=True, text=True, timeout=20)
         if p.returncode:
             return None
-        return [(int(r["number"]), str(r.get("state") or "").upper(), epoch(r.get("mergedAt")))
+        return [(int(r["number"]), str(r.get("state") or "").upper(), epoch(r.get("mergedAt")), epoch(r.get("createdAt")))
                 for r in json.loads(p.stdout or "[]")]
     except Exception:
         return None
@@ -890,6 +898,159 @@ def landing():
     return out
 
 
+ORPHAN_WHY = "a worktree with no board entry"   # orphans()'s one finding, and the one ask false_nags() can re-read
+FALSE_NAG = "notification/false-action-needed"   # the catalogue kind: "a wake or a nag names something a person or a seat must do"
+
+
+def land_windows(repo, pr):
+    """[(start, end)] epochs during which cc-land had <repo>#<pr> in hand, from its queue log — `queued` opens a
+    window, the next `done` closes it, one still open runs to now. The log is kept after the job file and the work
+    record are gone (cc-land: queue.log is KEPT after the job file is drained), which is why it is the source here
+    and not landing(): by the pass that finds a nag cleared, the landing that cleared it has taken its files."""
+    out, start, tag = [], None, f" {repo}#{pr} "
+    try:
+        for ln in open(f"{HOME}/.cc/state/land/queue.log"):
+            if tag not in ln + " ":
+                continue
+            ts, _, ev = ln.rstrip("\n").partition("\t")
+            word = ev.split(" ", 1)[0]
+            if word == "queued" and start is None:
+                start = epoch(ts)
+            elif word == "done" and start is not None:
+                out.append((start, epoch(ts))); start = None
+    except OSError:
+        return out
+    if start is not None:
+        out.append((start, now()))
+    return out
+
+
+def pr_times(repo, url, net=True):
+    """(created_at, merged_at) epochs for a PR a board row names, 0.0 where GitHub says none; None when it could not
+    be asked — no evidence, and false_nags() writes nothing on no evidence."""
+    if not net or not url or not shutil.which("gh"):
+        return None
+    cwd = f"{HOME}/dev/{repo}"
+    try:
+        p = subprocess.run(["gh", "pr", "view", str(url), "--json", "createdAt,mergedAt"],
+                           cwd=cwd if os.path.isdir(cwd) else None, capture_output=True, text=True, timeout=20)
+        if p.returncode:
+            return None
+        j = json.loads(p.stdout or "{}")
+        return epoch(j.get("createdAt")), epoch(j.get("mergedAt"))
+    except Exception:
+        return None
+
+
+def record_failure(scope, kind, observed, ts, evidence=(), links=(), cost=("contexts=1",)):
+    """One line to the failure ledger, through cc-failures, and nothing else: no exception leaves here, no exit code
+    is read, and the pass that called it decides exactly what it would have decided without it."""
+    argv = [f"{BIN}/cc-failures", "record", "--scope", scope, "--kind", kind, "--observed", observed,
+            "--writer", "cc-reconcile", "--detector", "box",
+            "--detector-evidence", "the authoritative state, read on the pass that found the nag cleared, carries a time before the nag",
+            "--expected", "a wake or a nag names something a person or a seat must do",
+            "--ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))]
+    for e in evidence:
+        argv += ["--evidence", e]
+    for l in links:
+        argv += ["--link", l]
+    for c in cost:
+        argv += ["--cost", c]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        how = "recorded " + r.stdout.strip() if r.returncode == 0 else f"writer failed rc={r.returncode}: {r.stderr.strip()[:160]}"
+    except Exception as e:
+        how = f"writer failed: {e.__class__.__name__}"
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(f"{STATE}/reconcile.log", "a") as log:
+            log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\tfailure\t{scope} {kind}\t{how}\n")
+    except OSError:
+        pass
+
+
+def false_nags(gone, prs, net=True):
+    """A nag that went away is read once more against the authoritative state AT THE TIME IT WENT OUT, and one that
+    the state disproves is written to the failure ledger (docs/design-failure-noticing-2026-09-11.md, The writers:
+    "cc-reconcile (a nag the authoritative state disproved)"). `gone` is {memo: when} for the memos the seen-ledger
+    just dropped, `prs` {repo/track: pr} off the board. Two shapes are decidable by a time the box did not consult
+    when it nagged, and only those are written:
+      · `offered <repo>/<track> <pr>` and `alerted <repo>/<track>` — "review and land it", to the session or the
+        owner. Disproved when a landing already had the PR: cc-land's queue log shows a `queued`..`done` window
+        around the nag (land_windows), its work record's `first` predates the nag, or the PR had merged before it.
+      · `<repo>/<track>: a worktree with no board entry` — disproved when a PR from that branch was already open at
+        the nag: created before it and not merged more than BETWEEN_ROUNDS before it, the same forgiveness orphans()
+        itself gives, or a landing window around it.
+    Everything else that cleared — a gone worktree restored, a branch pushed, a PR closed and settled — is a person's
+    doing or undecidable here, and nothing is written; nor is anything written on NO evidence (GitHub unreadable).
+    One record per nag, at the nag's own time, and the ledger's own episode rule folds the session's line and the
+    owner's page about one PR into one. Never raises; never changes the pass."""
+    def when(t):
+        return time.strftime("%H:%MZ", time.gmtime(t))
+    seen = set()
+    for memo, at in sorted(gone.items(), key=lambda kv: kv[1]):
+        try:
+            at = float(at or 0)
+            if not at:
+                continue
+            m = re.match(r"^(offered|alerted) ([^/ ]+)/([^ ]+)(?: (.+))?$", memo)
+            if m:
+                word, repo, track, url = m.groups()
+                url = url or prs.get(f"{repo}/{track}") or ""
+                n = pr_number(url)
+                if not n or (repo, n) in seen:
+                    continue
+                why = ""
+                if any(a <= at <= b for a, b in land_windows(repo, n)):
+                    why = "cc-land's queue log shows a landing of it in flight across that minute"
+                else:
+                    try:
+                        first = epoch(json.load(open(f"{HOME}/.cc/state/land/root/{repo}-{n}.json")).get("first"))
+                    except Exception:
+                        first = 0.0
+                    if first and first <= at:
+                        why = f"cc-land's work record says it had the PR since {when(first)}"
+                    else:
+                        t = pr_times(repo, url, net)
+                        if t and t[1] and t[1] <= at:
+                            why = f"the PR had merged at {when(t[1])}"
+                if not why:
+                    continue
+                seen.add((repo, n))
+                to = "the repo's session" if word == "offered" else "the owner"
+                record_failure(repo, FALSE_NAG,
+                               f"the board watchdog told {to} to review and land PR #{n} ({repo}/{track}) at {when(at)}, and {why}: nothing was needed",
+                               at, evidence=[f"memo={memo}", why], links=[f"row={repo}/{track}", f"pr={n}", f"source=cc-reconcile:{memo}@{int(at)}"],
+                               cost=["contexts=1"] if word == "offered" else ["owner-time=1 page"])
+                continue
+            m = re.match(r"^([^/ ]+)/([^:]+): " + re.escape(ORPHAN_WHY) + "$", memo)
+            if not m:
+                continue
+            repo, track = m.groups()
+            wt = f"{WTS}/{repo}/{track}"
+            cands = [b for b in ([wt_branch(wt)] if os.path.isdir(wt) else [track, f"track/{track}"]) if b]
+            hit = None
+            for b in cands:
+                for n, st, merged, created in (branch_prs(repo, b, net) or []):
+                    if created and created <= at and (not merged or merged >= at - BETWEEN_ROUNDS):
+                        hit = (n, st, "was already open" if not merged or merged > at else f"had merged {(at - merged) / 60:.0f} min before")
+                    elif any(a <= at <= b_ for a, b_ in land_windows(repo, n)):
+                        hit = (n, st, "was being landed")
+                    if hit:
+                        break
+                if hit:
+                    break
+            if not hit or (repo, hit[0]) in seen:
+                continue
+            seen.add((repo, hit[0]))
+            record_failure(repo, FALSE_NAG,
+                           f"the board watchdog reported {repo}/{track} as a worktree with no board entry at {when(at)}, and its PR #{hit[0]} {hit[2]}: a delivery in flight, not a leftover",
+                           at, evidence=[f"memo={memo}", f"pr #{hit[0]} {hit[1]} {hit[2]}"],
+                           links=[f"row={repo}/{track}", f"pr={hit[0]}", f"source=cc-reconcile:{memo}@{int(at)}"])
+        except Exception:
+            continue
+
+
 def snapshot(rows, limit=0.0):
     """The read-only answer to "what is every track, really", as a dict ready for ~/.cc/state/reconcile.json.
 
@@ -1076,7 +1237,7 @@ def orphans(repos, net=True, grace=GRACE, busy=None):
         if prs:
             busy = landing() if busy is None else busy  # one process-table read a run, and only with a PR to match
             if any(st == "OPEN" or (repo, n) in busy or (st == "MERGED" and t0 - at <= BETWEEN_ROUNDS)
-                   for n, st, at in prs):
+                   for n, st, at, _ in prs):
                 continue
         out.append((repo, track, ("ask", None, "a worktree with no board entry")))
     return out
@@ -1429,7 +1590,12 @@ def main(argv):
             keep.update({x: v for x, v in old.items() if x.split(": ")[0].removeprefix("pending ")
                          .removeprefix("alerted ").removeprefix("offered ").split("/")[0] not in repos})
         if keys or keep or old:   # only findings that are still true survive the write: one that comes back is news again
-            ledger(path, dict({k: (t0 if k in told else old.get(k, 0)) for k in keys}, **keep))
+            new = ledger(path, dict({k: (t0 if k in told else old.get(k, 0)) for k in keys}, **keep))
+            # …and a nag that just went away is held against the authoritative state at the time it went out: one
+            # that the state disproves is a failure, written where it happened (false_nags). `pending` is a clock, not a nag.
+            gone = {k: v for k, v in old.items() if k not in new and not k.startswith("pending ")}
+            if gone:
+                false_nags(gone, {f"{repo}/{track}": f.get("pr") for repo, track, f, _, _, _ in snaprows}, net)
         if fresh:
             # THE SESSION FIRST (owner, 2026-08-31, thread 1788215141): most board-vs-box drift — a finished
             # worker with no PR, a closed PR, a gone worktree — is the live planning session's to fix, not an
@@ -2262,6 +2428,98 @@ def selfcheck():
         ok("end to end: …and a record older than that is history, not a landing: the same row is nagged once",
            offered() == o_ + 1)
         os.remove(rootp)
+
+        # A NAG THE AUTHORITATIVE STATE DISPROVES IS A FAILURE, WRITTEN WHERE IT HAPPENED (false_nags; the design's
+        # "cc-reconcile (a nag the authoritative state disproved)"). The row was just nagged (the line above), at a
+        # time the seen-ledger holds. Now cc-land's work record turns up saying it had the PR ten minutes BEFORE that
+        # nag, and the PR reads MERGED: the memo is dropped, and the drop is held against the record → ONE line in the
+        # failure ledger, notification/false-action-needed, at the NAG's time, naming the PR. A fixture ledger of its
+        # own (CC_FAILURES), so nothing here can touch the box's.
+        fdir = f"{th}/.cc/failures"
+        fenv = dict(penv, CC_FAILURES=fdir)
+
+        def failures(kind=FALSE_NAG):
+            try:
+                return [json.loads(ln) for ln in open(f"{fdir}/{repo}.jsonl") if kind in ln]
+            except OSError:
+                return []
+
+        nag_at = float(json.load(open(seenp))[f"offered {repo}/t2 https://example.invalid/pr/9"])
+        json.dump({"repo": repo, "pr": 9, "first": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(nag_at - 600))}, open(rootp, "w"))
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho MERGED\n")
+        rF = subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
+        fl = failures()
+        ok("a nag the landing's own record disproves — cc-land had the PR before the watchdog said 'land it' — is "
+           "written to the failure ledger once the memo drops: one notification/false-action-needed line, at the nag's "
+           "time, naming the PR",
+           len(fl) == 1 and fl[0]["links"].get("pr") == "9" and fl[0]["writer"] == "cc-reconcile"
+           and abs(epoch(fl[0]["ts"]) - nag_at) < 2 and "since" in fl[0]["observed"]
+           and f"offered {repo}/t2 https://example.invalid/pr/9" not in json.load(open(seenp)))
+        ok("…and the pass itself decided what it always decides: the row reconciled to merged, the exit its own "
+           "(1: the fixture's other rows still need a person), no traceback",
+           rF.returncode == 1 and "Traceback" not in rF.stderr and cb("get", repo, "t2", "status").stdout.strip() == "merged")
+        # THE OTHER SIDE: a nag that simply CLEARED — the PR merged after it, no record, no landing window — is a
+        # nag that worked or a person's doing, and nothing is written. Back to review, nagged again, then merged
+        # with nothing predating the nag.
+        os.remove(rootp)
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        cb("status", repo, "t2", "review")
+        json.dump({}, open(seenp, "w"))
+        subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
+        n0 = len(failures())
+        nagged = f"offered {repo}/t2 https://example.invalid/pr/9" in json.load(open(seenp))
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho MERGED\n")
+        subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
+        ok("a nag that cleared with nothing predating it — the PR merged after the session was told — records "
+           "nothing: the memo dropped and the ledger holds what it held",
+           nagged and f"offered {repo}/t2 https://example.invalid/pr/9" not in json.load(open(seenp)) and len(failures()) == n0)
+        # …AND A LEDGER THAT CANNOT BE WRITTEN CHANGES NOTHING ABOUT THE PASS. The disproving record again, with
+        # CC_FAILURES pointing at a FILE: cc-failures cannot make its directory and dies; the pass still drops the
+        # memo, still reconciles the row, still exits 0, and says why in reconcile.log.
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        cb("status", repo, "t2", "review")
+        json.dump({}, open(seenp, "w"))
+        subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
+        nag_at = float(json.load(open(seenp))[f"offered {repo}/t2 https://example.invalid/pr/9"])
+        json.dump({"repo": repo, "pr": 9, "first": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(nag_at - 600))}, open(rootp, "w"))
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho MERGED\n")
+        open(f"{th}/notadir", "w").close()
+        n0 = len(failures())
+        rB = subprocess.run(argvP, env=dict(fenv, CC_FAILURES=f"{th}/notadir"), capture_output=True, text=True, timeout=120)
+        rlog = open(f"{th}/.cc/state/reconcile.log").read() if os.path.exists(f"{th}/.cc/state/reconcile.log") else ""
+        ok("a ledger write that fails leaves the pass exactly as it was — the same exit, the memo dropped, the row "
+           "merged — and reconcile.log says the writer failed",
+           rB.returncode == rF.returncode and "Traceback" not in rB.stderr and cb("get", repo, "t2", "status").stdout.strip() == "merged"
+           and f"offered {repo}/t2 https://example.invalid/pr/9" not in json.load(open(seenp))
+           and "writer failed" in rlog and len(failures()) == n0)
+        os.remove(rootp)
+        # THE ORPHAN NAG: a worktree the board never heard of, reported while GitHub could not be asked (no
+        # evidence, so it is reported as it always was); the next pass finds the directory gone and GitHub answering
+        # that a PR from that branch had been OPEN since an hour before the nag → one line, the PR named. A gh that
+        # fails `pr list` at nag time and answers it at drop time, the way a blip does.
+        os.makedirs(f"{th}/dev/{repo}", exist_ok=True)   # branch_prs asks from the repo's own checkout, which a real box has
+        owt = f"{th}/.cc/worktrees/{repo}/orph-x"
+        os.makedirs(owt, exist_ok=True)
+        old_ = now() - 7200
+        os.utime(owt, (old_, old_))
+        open(f"{th}/gh", "w").write("#!/bin/sh\ncase \"$*\" in *\"pr list\"*) exit 1;; esac\necho OPEN\n")
+        json.dump({}, open(seenp, "w"))
+        subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
+        okey = f"{repo}/orph-x: {ORPHAN_WHY}"
+        onag = float(json.load(open(seenp)).get(okey) or 0)
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime((onag or now()) - 3600))
+        open(f"{th}/gh", "w").write("#!/bin/sh\ncase \"$*\" in *\"pr list\"*) echo '[{\"number\":11,\"state\":\"OPEN\",\"mergedAt\":null,\"createdAt\":\"" + created + "\"}]';; *) echo OPEN;; esac\n")
+        shutil.rmtree(owt)
+        subprocess.run(argvP, env=fenv, capture_output=True, text=True, timeout=120)
+        fo = [r for r in failures() if r["links"].get("pr") == "11"]
+        ok("an orphan-worktree nag whose branch already had an OPEN PR when it went out is written once when the "
+           "memo drops, at the nag's time, naming that PR",
+           onag > 0 and len(fo) == 1 and abs(epoch(fo[0]["ts"]) - onag) < 2 and "already open" in fo[0]["observed"]
+           and okey not in json.load(open(seenp)))
+        # the fixture as the cases below expect it: t2 in review with an OPEN PR, a clean memo ledger
+        open(f"{th}/gh", "w").write("#!/bin/sh\necho OPEN\n")
+        cb("status", repo, "t2", "review")
+        json.dump({}, open(seenp, "w"))
 
         # A PARKED PROJECT IS NOT NAGGED — not its session, not the owner. The REAL cc-pause is asked here, reading
         # the real flag file in this scratch HOME, so the whole path is pinned rather than a stand-in for it. Its own

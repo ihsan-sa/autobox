@@ -10,6 +10,9 @@
 # revisit.json), under "waiting on you" and never counted as one. A row that merged and went quiet answers none of
 # them and does not appear. The corollary is the rule to keep when editing: a new line here has to be worth
 # displacing one of those.
+# ONE LINE MORE, SINCE 2026-09-12: what the failure ledger holds and what crossed its rule (cc-failures; the design's
+# decision 7). It earns its place because an eligible cluster nobody has claimed is the one thing on the box that
+# is failing repeatedly and being told to nobody; it names the kinds, never the records, and makes no work.
 set -uo pipefail
 B="$(dirname "$(readlink -f "$0")")"   # sibling, so a copy in a fixture's own bin tests itself against that bin
 case "${1:-}" in ""|--notify|selfcheck) ;; *) echo "usage: cc-digest [--notify] | selfcheck" >&2; exit 2;; esac
@@ -58,6 +61,20 @@ spend_clause(){   # USD is an estimate and cc-spend says so, so the number is ro
   printf ' $%.0f spent' "$a"
   [ -n "${b:-}" ] && printf ', $%.0f with your own sessions' "$b"
   printf '.'
+}
+
+failures_line(){   # `cc-failures metrics` for the counts, `eligible` for what crossed the rule; nothing when the ledger is empty
+  local m recs cl kinds="" n=0 kind why eps word
+  m=$("$B/cc-failures" metrics 2>/dev/null | head -1) || return 1
+  read -r recs cl _ < <(awk '{ for (i = 1; i <= NF; i++) { if ($i == "records:") r = $(i+1); if ($i == "clusters:") c = $(i+1); if ($i == "eligible:") e = $(i+1) } print r+0, c+0, e+0 }' <<<"$m")
+  [ "${recs:-0}" -gt 0 ] || return 1
+  while IFS=$'\t' read -r _ _ kind why eps _ word; do
+    [ -n "${kind:-}" ] || continue; n=$((n + 1))
+    [ "$n" -le 3 ] && kinds+="${kinds:+; }$kind (${eps% episode(s)}, ${word:-unclaimed})"
+  done < <("$B/cc-failures" eligible 2>/dev/null)
+  [ "$n" -gt 3 ] && kinds+="; and $((n - 3)) more"
+  printf '🧾 Failures: %s in %s; ' "$(plural "$recs" record)" "$(plural "$cl" cluster)"
+  if [ "$n" -gt 0 ]; then printf '%s crossed the rule: %s.' "$n" "$kinds"; else printf 'none has crossed the rule.'; fi
 }
 
 report(){
@@ -147,6 +164,11 @@ report(){
   # it holds. cc-tier owns the words; under autonomous there is no line, because a line that changes nothing is cut.
   local tier=""; tier=$("$B/cc-tier" line 2>/dev/null) || tier=""
   case "$tier" in "spend tier: autonomous"*|"") ;; *) add "🪫 ${tier^}.";; esac
+  # THE FAILURE LEDGER, ONE LINE (docs/design-failure-noticing-2026-09-11.md, decision 7: "the digest line now"): what
+  # it holds and what crossed the rule — the eligible clusters by kind, three named, the rest counted, each with its
+  # episodes and whether an investigation has claimed it. cc-failures owns every number here; an empty ledger, or a
+  # box without one, is no line at all. Never a row, never a page: the ledger is read, not acted on.
+  local fl; fl=$(failures_line) && [ -n "$fl" ] && add "$fl"
 
   # WAITING ON YOU LEADS, AND IS NEVER TRIMMED. The rest of this is news; this is the part he has to act on, and a
   # question held back to save a line is a day of somebody's work stalled to save a line.
@@ -301,6 +323,23 @@ EOF
   k "…and autonomous, the default, is no line at all"                nomatch "$out" "pend tier"
   rm -f "$d/tier"; out=$(run)
   k "…and a box whose cc-tier cannot answer gets no line either, and the report still prints"  nomatch "$out" "pend tier"
+
+  # THE FAILURE LEDGER LINE: cc-failures owns the numbers, so the stub answers `metrics` and `eligible` from files and
+  # the case asserts the line is those numbers — the count, the clusters, three eligible kinds named with their
+  # episodes and claim word, the rest counted. An empty ledger, or no cc-failures at all, is no line.
+  printf '#!/usr/bin/env bash\n[ "$1" = metrics ] && { cat "$CCD/fmetrics" 2>/dev/null; exit; }\n[ "$1" = eligible ] && cat "$CCD/feligible" 2>/dev/null; :\n' > "$d/bin/cc-failures"; chmod +x "$d/bin/cc-failures"
+  printf 'records: 123 (120 confirmed)  clusters: 76  eligible: 4\nrecording delay (filed - happened, min): median 0, max 367, n=120 (3 unknown)\n' > "$d/fmetrics"
+  printf 'c-1\tdemo\tguard-policy/permitted-text-refused\t11 episodes in 14d\t11 episode(s)\t2026-09-08T17:21..2026-09-11T19:11\tunclaimed 3d 6h\nc-2\tdemo\tnotification/false-action-needed\t9 episodes in 14d\t9 episode(s)\t2026-09-09T02:31..2026-09-11T16:45\tclaimed 2h ago i-ab12cd34\nc-3\tdemo\tfailure-detection/person-first\tcritical: person-first\t3 episode(s)\t2026-09-10T16:57..2026-09-11T03:30\tunclaimed 1d 9h\nc-4\tdemo\tboard-row/x\t3 episodes in 14d\t3 episode(s)\t2026-09-08T06:33..2026-09-11T17:20\tunclaimed 8h 59m\n' > "$d/feligible"
+  out=$(run)
+  k "the failure ledger is one line: what it holds, and what crossed the rule — three kinds named with episodes and claim word, the rest counted" \
+    line "$out" "🧾 Failures: 123 records in 76 clusters; 4 crossed the rule: guard-policy/permitted-text-refused (11, unclaimed 3d 6h); notification/false-action-needed (9, claimed 2h ago i-ab12cd34); failure-detection/person-first (3, unclaimed 1d 9h); and 1 more."
+  printf 'records: 5 (5 confirmed)  clusters: 2  eligible: 0\n' > "$d/fmetrics"; : > "$d/feligible"; out=$(run)
+  k "…a ledger with records and nothing eligible says so"          line "$out" "🧾 Failures: 5 records in 2 clusters; none has crossed the rule."
+  printf 'records: 0 (0 confirmed)  clusters: 0  eligible: 0\n' > "$d/fmetrics"; out=$(run)
+  k "…an empty ledger is no line at all"                            nomatch "$out" "Failures:"
+  rm -f "$d/bin/cc-failures"; out=$(run)
+  k "…and a box with no cc-failures gets no line either, and the report still prints"  nomatch "$out" "Failures:"
+  [ -n "$out" ] || { f=$((f + 1)); echo "  FAIL: the report went empty without cc-failures"; }
 
   # A worker whose commits are refused is losing work even while its row still says `running`.
   printf '' > "$d/reconcile"
