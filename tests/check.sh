@@ -58,6 +58,11 @@ for f in templates/home/agents/*.md; do
     [ -n "$t" ] || { echo "$f: a review type must list its 'tools' — with no key it gets every tool, Write and Edit included"; exit 1; }
     case ",$t," in *,Write,*|*,Edit,*) echo "$f: a review type must not list Write or Edit — it reads a diff, it does not fix it"; exit 1;; esac;;
   esac
+  # THE READING RULE reaches a subagent through its type file and nothing else: no `$(library_sp)` builds this text,
+  # so each type carries the line itself — the command and the page, the two words `cc selfcheck` holds the shared
+  # config/library-prompt.md to. A type without it is a spawn that answers from memory with the record on disk.
+  grep -q 'cc-lib ask' "$f" && grep -q 'the reading procedure' "$f" \
+    || { echo "$f: the type does not carry the reading rule (cc-lib ask + the WORKING.md page 'the reading procedure')"; exit 1; }
 done
 H=$(mktemp -d); ln -s "$PWD/bin" "$H/bin"   # verify the units against THIS tree's bin/, not against what the box happens to have linked
 v=$(HOME="$H" systemd-analyze --user verify config/systemd-user/*.service config/systemd-user/*.timer 2>&1 | grep -v '^\s*$' || true); rm -rf "$H"

@@ -1198,6 +1198,26 @@ def write_atomic(path, obj):
         except OSError:
             pass
         raise
+    lib_touch(path)
+
+
+def lib_touch(path):
+    """INDEX-AT-WRITE (cc-lib): a job or root record just written is searchable a minute later, not at the next
+    sweep — `cc-lib ask --object <repo>#<pr>` is how "buy another review?" is answered. It changes nothing decided
+    here: the exit code and output are discarded, a failure is one line in cc-lib's own misses log (`cc-lib ask`
+    reports it as hook-misses), and a cc-lib that is not there is nothing at all. Only the two record shapes the
+    library registers, at the place it registers them (~/.cc/state/land/<repo>-<pr>.json and root/ beside it):
+    a memo, a green record or a scratch LANDQ — the selfcheck's — is never offered, so never a miss."""
+    live = f"{HOME}/.cc/state/land"
+    if os.path.dirname(path) not in (live, f"{live}/root") or not re.fullmatch(r".+-\d+\.json", os.path.basename(path)):
+        return
+    lib = f"{BIN}/cc-lib"
+    if not os.access(lib, os.X_OK):
+        return
+    try:
+        subprocess.run([lib, "index", "--touch", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+    except Exception:
+        pass
 
 
 def job_path(repo, pr):
@@ -9758,6 +9778,26 @@ def cmd_selfcheck():
     finally:
         globals().update(BOARDS=_fb, LANDQ=_fl)
         shutil.rmtree(fxd, ignore_errors=True)
+
+    # INDEX-AT-WRITE: a root record is in the library's index the moment write_atomic returns — `cc-lib ask --object
+    # <repo>#<pr>` finds the tally as kind finding under its ids, and had nothing to re-read itself (re-read absent
+    # from COVERAGE: the hook did it, not the ask). LANDQ is put where the library registers records for this one
+    # case — the scratch queue every other case runs against is never offered to it — and the baseline pass runs
+    # first, so the only stale source a lazy ask could catch up on is the record.
+    _fl = LANDQ
+    try:
+        globals().update(LANDQ=f"{HOME}/.cc/state/land")
+        lib = f"{BIN}/cc-lib"
+        subprocess.run([lib, "index"], capture_output=True, text=True, timeout=60)
+        write_atomic(root_path("myrepo", 4242), {"first": stamp(), "repo": "myrepo", "pr": 4242, "at": stamp(), "reviews": 1,
+                                                 "verdict": "LAND", "review": "zebrafish: bought once at this head"})
+        o = subprocess.run([lib, "ask", "--object", "myrepo#4242", "--need", "current"], capture_output=True, text=True, timeout=60).stdout
+        check("a landing root record is indexed as it is written: cc-lib ask --object myrepo#4242 finds the tally as kind finding "
+              "with its ids, with nothing left for the ask to re-read",
+              "landing record (review tally)" in o and "finding" in o and "myrepo#4242" in o and "zebrafish" in o
+              and "OUTCOME answered" in o and "re-read" not in o)
+    finally:
+        globals().update(LANDQ=_fl)
 
     tempfile.tempdir = _real_tmp
     shutil.rmtree(_tmproot, ignore_errors=True)   # …and everything the fixtures made under it goes with it

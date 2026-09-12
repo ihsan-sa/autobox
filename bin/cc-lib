@@ -15,7 +15,8 @@ model, runs no daemon, opens no port, and moves nothing: the index is a rebuilda
         FTS5 search over the query, top hits ranked exact id → kind fit for --need → BM25 → freshness, copies of
         one text collapsed into one hit with provenance. The packet is capped (default 8 KiB, the three worked
         misses use 2/4/8 KiB) and ends with COVERAGE (sources, watermark, pending, unreadable, excluded, refused,
-        deadline) and OUTCOME answered | partial | not-recorded. It never invents: an empty search is "not
+        deadline, hook-misses when a write hook failed to index, re-read when this ask had to bring a stale source in
+        itself) and OUTCOME answered | partial | not-recorded. It never invents: an empty search is "not
         recorded in the covered scope", and --need current says in so many words that a live state (a unit, a
         URL, a token, a process, a merged ref) was not probed — records say what was written, as of their stamps.
   cc-lib get <rid> [--ticket <T>] [--cap <bytes>]
@@ -25,9 +26,21 @@ model, runs no daemon, opens no port, and moves nothing: the index is a rebuilda
         Reconcile every registered source with the index (no deadline) and print the measurements: sources,
         records, source bytes, text bytes, index bytes and ratios, seconds, peak RSS. `ask` reconciles stale
         sources too, inside a 1.5 s budget, and names the ones it did not reach as pending; nothing runs a whole
-        rebuild inline, and nothing runs on a timer. A re-read works at record grain: an unchanged text keeps its
-        record and its id, only new texts are inserted and gone ones deleted, so a board whose log grew by five
+        rebuild inline, and nothing runs on a timer of its own — cc-checkpoint --sweep (the 5-minute timer the box
+        already has) runs this form, which is what picks up an edit that bypassed the hooks below, and a full pass
+        that reached every source clears the misses log. A re-read works at record grain: an unchanged text keeps
+        its record and its id, only new texts are inserted and gone ones deleted, so a board whose log grew by five
         items costs five inserts. The index is a cache with a schema version: an older shape is dropped and rebuilt.
+  cc-lib index --touch <path|dir>...
+        INDEX-AT-WRITE: the form the writing tools call the moment they have written — cc-board note (the board),
+        cc-land (a landing job or root record), cc-handoff (the journal line it appends), and cc-checkpoint's Stop
+        hook (~/.cc/state and ~/.claude/projects: the journal a session appended to this turn and the memory file
+        it saved) — so a question asked a minute later finds it. A file is re-read (record grain, so a one-line
+        append is one insert); a directory means every registered source under it whose cursor moved. A path that
+        is not a registered source is a miss, never read. It NEVER changes what the caller decided: the callers
+        discard its exit code, and its failure — a locked or unopenable index, an unreadable file — is one line
+        in ~/.cc/library/owner/misses.log (<ts> <path> <reason>) and exit 1, which every `ask` then reports as
+        `hook-misses N` in COVERAGE until a full `cc-lib index` has reconciled everything and cleared the log.
   cc-lib bench [--n <N>]      FTS and exact-id latency (p50/p95/max) on this index; RSS.
   cc-lib selfcheck            fixtures of its own under a HOME of its own (check.sh runs it).
 
@@ -108,6 +121,29 @@ def dbpath():
 
 def ticketlog():
     return os.path.join(libdir(), "tickets.log")
+
+
+def misseslog():
+    return os.path.join(libdir(), "misses.log")
+
+
+def misses():
+    """How many write hooks failed to index since the last full pass — a count, so coverage can carry it."""
+    try:
+        with open(misseslog()) as f:
+            return sum(1 for l in f if l.strip())
+    except OSError:
+        return 0
+
+
+def miss(path, why):
+    """A write hook that could not index: one line, and the write it followed stands untouched."""
+    try:
+        os.makedirs(libdir(), exist_ok=True)
+        with open(misseslog(), "a") as f:
+            f.write(f"{now_iso()} {path} {str(why).replace(chr(10), ' ')[:200]}\n")
+    except OSError:
+        pass
 
 
 def now_iso():
@@ -899,10 +935,13 @@ def ask(argv):
               + (f" · object {obj}" if obj else "") + f" · cap {cap}")
     # fixed tail first, so the records get exactly what is left
     wm = c.execute("SELECT MAX(indexed_at), COUNT(*) FROM sources WHERE status='ok'").fetchone()
+    hm = misses()   # write hooks that failed since the last full pass: the record is re-read here, the failure is still said
     covline = (f"COVERAGE sources {wm[1]} · watermark {wm[0] or '-'} · pending {len(cov['pending'])}"
                + (" (" + ", ".join(tilde(p) for p in cov["pending"][:3]) + (", …" if len(cov["pending"]) > 3 else "") + ")" if cov["pending"] else "")
                + f" · unreadable {len(cov['unreadable'])}" + (" (" + "; ".join(cov["unreadable"][:2]) + ")" if cov["unreadable"] else "")
                + f" · excluded {len(cov['excluded'])} · refused {cov['refused']}"
+               + (f" · hook-misses {hm}" if hm else "")
+               + (f" · re-read {cov['indexed']}" if cov["indexed"] else "")   # sources this ask had to bring in itself: the hooks' misses, measured
                + (f" · search {phase}-phase" if phase else (" · search: no hit" if query else ""))
                + (" · DEADLINE HIT (partial)" if deadline_hit else ""))
     tail = [covline] + ([CURRENT_CAVEAT] if need == "current" else [])
@@ -1041,7 +1080,67 @@ def get(argv):
     return 0
 
 
+def touch(paths):
+    """index --touch: the named files, and the registered sources under the named directories whose cursor moved.
+    Every failure is a miss (logged, exit 1) and nothing else: the write this follows has already happened, and
+    the caller does not read this exit code."""
+    if not paths:
+        print("cc-lib index --touch: name at least one path", file=sys.stderr)
+        return 2
+    try:
+        reg = registry()
+        by_path = {p: (p, sk, r, t) for p, sk, r, t in reg}
+        c = db()
+        known = {p: (sz, m) for p, sz, m in c.execute("SELECT path, size, mtime FROM sources")}
+        rows = set()
+        for p, skind, repo, track in reg:
+            if skind == "board" and not excluded(p):
+                try:
+                    with open(p) as f:
+                        rows.update((json.load(f).get("tracks") or {}).keys())
+                except (OSError, ValueError):
+                    pass
+    except Exception as e:   # the index cannot be opened at all: every path named is a miss
+        for p in paths:
+            miss(os.path.abspath(os.path.expanduser(p)), f"index: {e}")
+        print(f"cc-lib index --touch: {e}", file=sys.stderr)
+        return 1
+    todo, rc = [], 0
+    for p in paths:
+        ap = os.path.abspath(os.path.expanduser(p))
+        if os.path.isdir(ap):
+            for src in reg:
+                if src[0].startswith(ap + "/") and not excluded(src[0]):
+                    try:
+                        st = os.stat(src[0])
+                    except OSError:
+                        continue
+                    if known.get(src[0]) != (st.st_size, st.st_mtime_ns):
+                        todo.append(src)
+        elif ap in by_path and not excluded(ap):
+            todo.append(by_path[ap])      # named outright: re-read, the record grain keeps that cheap
+        else:
+            miss(ap, "not a registered source" if os.path.exists(ap) else "no such file")
+            rc = 1
+    nrec = 0
+    for src in todo:
+        try:
+            nrec += index_source(c, *src, rows)
+        except Exception as e:   # locked past the timeout, or a read that failed: logged, never fatal to the caller
+            try:
+                c.rollback()
+            except Exception:
+                pass
+            miss(src[0], str(e))
+            rc = 1
+    c.close()
+    print(f"cc-lib index --touch: {len(todo)} source(s) re-read, {nrec} record(s) held" + (" · misses logged" if rc else ""))
+    return rc
+
+
 def index(argv):
+    if "--touch" in argv:
+        return touch(argv[argv.index("--touch") + 1:])
     rebuild, as_json = "--rebuild" in argv, "--json" in argv
     t0 = time.monotonic()
     if rebuild:
@@ -1052,6 +1151,12 @@ def index(argv):
                 pass
     c = db()
     cov = reconcile(c)
+    hm = misses()
+    if hm and not cov["pending"]:   # every source is current now, so the hooks' misses are repaired
+        try:
+            os.remove(misseslog())
+        except OSError:
+            pass
     c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     n = c.execute("SELECT COUNT(*), COALESCE(SUM(nbytes), 0), COALESCE(SUM(size), 0) FROM sources WHERE status='ok'").fetchone()
     nrec = c.execute("SELECT COUNT(*) FROM records").fetchone()[0]
@@ -1061,14 +1166,15 @@ def index(argv):
               index_to_source=round(ib / n[2], 3) if n[2] else None, index_to_text=round(ib / n[1], 3) if n[1] else None,
               seconds=round(time.monotonic() - t0, 2), peak_rss_mib=round(rss_mib(), 1), indexed_now=cov["indexed"],
               removed=cov["removed"], unreadable=cov["unreadable"], excluded=[tilde(p) for p in cov["excluded"]],
-              refused=cov["refused"], rebuild=rebuild)
+              refused=cov["refused"], rebuild=rebuild, hook_misses=hm, misses_cleared=bool(hm and not cov["pending"]))
     if as_json:
         print(json.dumps(st, indent=1))
     else:
         print(f"cc-lib index: {st['sources']} sources, {st['records']} records · source {st['source_bytes']} B, text "
               f"{st['text_bytes']} B, index {st['index_bytes']} B (index/source {st['index_to_source']}, index/text "
               f"{st['index_to_text']}) · {st['seconds']} s · peak RSS {st['peak_rss_mib']} MiB · re-read {st['indexed_now']}"
-              f" · removed {st['removed']} · unreadable {len(st['unreadable'])} · excluded {len(st['excluded'])} · refused {st['refused']}")
+              f" · removed {st['removed']} · unreadable {len(st['unreadable'])} · excluded {len(st['excluded'])} · refused {st['refused']}"
+              + (f" · hook-misses {hm}" + (" cleared" if st["misses_cleared"] else " (pending sources, kept)") if hm else ""))
         for u in st["unreadable"]:
             print("  unreadable: " + u)
     return 0
@@ -1270,7 +1376,7 @@ def selfcheck():
         ok("miss 11 (red selfcheck): the journal entry that settled it is found", "not a main regression" in o)
         rc, o = run("ask", "--object", "orch-x", "--need", "current", "context percent")
         ok("miss 12 (orch at 72%?): a live figure is not a record — the row is returned and the caveat says probe, nothing invents a percent",
-           "row orch-x" in o and "CURRENT:" in o and "72" not in o)
+           "row orch-x" in o and "CURRENT:" in o and not re.search(r"72\s*%", o))   # the percent, not the ask's own ms/bytes figures
         rc, o = run("ask", "--object", "#323", "--need", "history")
         ok("miss 13 (#323 stale ref): the journal entry naming the PR is found by id", "refs/pull/323/head" in o)
         rc, o = run("ask", "--object", "#320", "--need", "current", "--cap", "4096")
@@ -1345,6 +1451,90 @@ def selfcheck():
         ok("a source that cannot be read is named in the report and in coverage", "unreadable 1" in o and "r2.json" in o)
         rc, o = run("ask", "anything at all r2")
         ok("…and every ask carries it in COVERAGE", "unreadable 1" in o)
+
+        # ---- index-at-write: `index --touch` is what the writing tools call the moment they wrote. The proof that the
+        # HOOK indexed the line (and not ask's own reconcile, which the staleness cases above already show) is that
+        # the record is in the index before any ask, and the ask then reports no `re-read`.
+        jp = os.path.join(th, ".cc/state/r1/t1/progress.md")
+        with open(jp, "a") as f:
+            f.write("\n## 2026-09-08T12:00Z iter 4\nhook-indexed: the lantern line, r1#391 landed.\n")
+        os.utime(jp, (time.time() + 3, time.time() + 3))
+        rc, o = run("index", "--touch", jp)
+        c = db()
+        row = c.execute("SELECT id, kind, track FROM records WHERE text LIKE '%lantern line%'").fetchone()
+        ok("touch a journal a tool just appended to: exit 0, one source re-read, and the new record is in the index BEFORE any ask, with its kind and ids",
+           rc == 0 and "1 source(s) re-read" in o and row is not None and row[1] == "checkpoint" and row[2] == "t1"
+           and {"t1", "r1#391", "#391"} <= set(i for (i,) in c.execute("SELECT id FROM rids WHERE record_id=?", (row[0],))))
+        c.close()
+        rc, o = run("ask", "--object", "r1/t1", "--need", "current", "lantern line")
+        ok("…so a question a minute later finds it, and COVERAGE carries no `re-read`: ask had nothing to bring in itself",
+           "lantern line" in o and "re-read" not in o and "hook-misses" not in o)
+        # RED-FIRST CONTROL: the same append with no hook. ask still finds it (its own reconcile), but now says so —
+        # `re-read 1` is the hooks' misses, measured, which is the line the hook cases in cc-board/cc-handoff go red on.
+        with open(jp, "a") as f:
+            f.write("\n## 2026-09-08T12:30Z iter 5\nno hook: the candle line.\n")
+        os.utime(jp, (time.time() + 4, time.time() + 4))
+        c = db()
+        gone = not c.execute("SELECT 1 FROM records WHERE text LIKE '%candle line%'").fetchone()
+        c.close()
+        rc, o = run("ask", "--object", "r1/t1", "--need", "current", "candle line")
+        ok("control: the same append with no touch is not in the index until an ask reconciles it, and that ask says `re-read 1`",
+           gone and "candle line" in o and "re-read 1" in o)
+        # the directory form: every registered source under it whose cursor moved, nothing else re-read
+        j2 = os.path.join(th, ".cc/state/r1/site-handover.md")
+        with open(j2, "a") as f:
+            f.write("\n## 2026-09-11T17:00Z after\nthe director line.\n")
+        os.utime(j2, (time.time() + 5, time.time() + 5))
+        with open(jp, "a") as f:
+            f.write("\n## 2026-09-08T13:00Z iter 6\nthe director line too.\n")
+        os.utime(jp, (time.time() + 6, time.time() + 6))
+        rc, o = run("index", "--touch", os.path.join(th, ".cc/state"))
+        ok("touch a DIRECTORY (cc-checkpoint's form): the two registered sources under it whose cursor moved are re-read, the rest are not",
+           rc == 0 and "2 source(s) re-read" in o)
+
+        # ---- a hook that cannot index: the write it followed stands (the callers discard this exit — their own cases
+        # prove that), the failure is one line in misses.log, exit 1, and every ask says `hook-misses N` until a full
+        # index has reconciled everything. Two failure kinds: a path the registry does not know, and an index that
+        # cannot be opened (here: a directory sitting where the sqlite file is, the shape a locked or torn index takes).
+        stray = w(".cc/state/r1/t1/notes.txt", "a file no registry lists\n")
+        rc, o = run("index", "--touch", stray)
+        ml = misseslog()
+        ok("touch a path that is no registered source: exit 1, one miss line naming it and why, nothing read",
+           rc == 1 and "misses logged" in o and os.path.exists(ml) and sum(1 for l in open(ml) if stray in l and "not a registered source" in l) == 1)
+        os.rename(dbpath(), dbpath() + ".held")
+        os.mkdir(dbpath())
+        with open(jp, "a") as f:
+            f.write("\n## 2026-09-08T14:00Z iter 7\nthe beacon line, written while the index was unopenable.\n")
+        os.utime(jp, (time.time() + 7, time.time() + 7))
+        rc, o = run("index", "--touch", jp)
+        ok("touch while the index cannot be opened: exit 1, the miss logged with the reason, and the journal line it followed is still on disk",
+           rc == 1 and sum(1 for l in open(ml) if jp in l and "index:" in l) == 1 and "beacon line" in open(jp).read())
+        os.rmdir(dbpath())
+        os.rename(dbpath() + ".held", dbpath())
+        rc, o = run("ask", "--object", "r1/t1", "--need", "current", "beacon line")
+        ok("…and the next ask says so — `hook-misses 2` in COVERAGE — while still finding the line by its own reconcile (`re-read 1`)",
+           rc == 0 and "hook-misses 2" in o and "re-read 1" in o and "beacon line" in o)
+
+        # ---- an edit that bypassed every hook is picked up by the sweep (cc-checkpoint --sweep runs `cc-lib index`):
+        # the record appears, the misses log is cleared because every source is current, and the ask after it is clean.
+        with open(j2, "a") as f:
+            f.write("\n## 2026-09-11T18:00Z bypass\nthe sextant line, edited by hand.\n")
+        os.utime(j2, (time.time() + 8, time.time() + 8))
+        rc, o = run("index")
+        c = db()
+        found = c.execute("SELECT 1 FROM records WHERE text LIKE '%sextant line%'").fetchone()
+        c.close()
+        ok("the sweep (a full `index`) picks up a hand edit no hook saw, reports `re-read 1`, and clears the hook-misses log (`hook-misses 2 cleared`)",
+           rc == 0 and found and "re-read 1" in o and "hook-misses 2 cleared" in o and not os.path.exists(ml))
+        rc, o = run("ask", "--object", "site", "--need", "history", "sextant line")
+        ok("…after which an ask is clean: the line is found, no `hook-misses`, no `re-read`",
+           "sextant line" in o and "hook-misses" not in o and "re-read" not in o)
+        # control: a sweep that did NOT reach every source keeps the log — a miss is only repaired by a pass that covered it
+        miss(jp, "control")
+        w(".cc/boards/r3.json", "{still not json")
+        rc, o = run("index")
+        ok("control: the log is cleared only by a pass that reached every source; an unreadable one is not pending, so this one clears too "
+           "(unreadable is named in coverage on its own)", "hook-misses 1 cleared" in o and not os.path.exists(ml))
     finally:
         H = H0
         shutil.rmtree(th, ignore_errors=True)
@@ -1377,7 +1567,7 @@ def main(argv):
         return index(rest)
     if cmd == "bench":
         return bench(rest)
-    print("usage: cc-lib ask|get|index|bench|selfcheck (cc-lib --help for the contract)", file=sys.stderr)
+    print("usage: cc-lib ask|get|index [--touch <path>...]|bench|selfcheck (cc-lib --help for the contract)", file=sys.stderr)
     return 2
 
 

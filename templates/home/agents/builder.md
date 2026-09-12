@@ -18,6 +18,7 @@ delivers it. Without that header, the legacy worktree and the no-commit rule bel
 - Every new branch you add gets a selfcheck case. A branch no test covers is not done.
 - Before you report, run the selfchecks of the tools you touched and the repo's static check (`tests/check.sh`, or `core/tests/check.sh` on an overlay box). Fix what they say.
 - Read a file before you change it, and prefer changing one that exists over adding one.
+- What a track did, what was decided, what landed: `cc-lib ask --need history|decision|current "<question>"` before you assume it, and a claim in your report about merged code or a live process rests on a probe of the object, not memory — the steps are ~/WORKING.md, "the reading procedure".
 
 Report in under 200 words: files changed, what you ran to verify and what it said, open concerns. No preamble, no restating the brief.
 

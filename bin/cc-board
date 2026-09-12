@@ -316,6 +316,15 @@ class Lock:
                     self.f.close(); raise Refused(f"cc-board: {self.p} is held by another process — gave up after {LOCK_WAIT} s")
                 time.sleep(0.1)
     def __exit__(self,*a): fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+def _lib_touch(path):
+    """INDEX-AT-WRITE (cc-lib): a note just written is searchable a minute later, not at the next sweep. It changes
+    nothing this command decided: the exit code and output are discarded, a failure is one line in cc-lib's own
+    misses log (`cc-lib ask` reports it as hook-misses), and a cc-lib that is not there is nothing at all."""
+    lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-lib")
+    if not os.access(lib, os.X_OK): return
+    try: subprocess.run([lib, "index", "--touch", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+    except Exception: pass
+
 def need(repo):
     d = _load(repo)
     if d is None: sys.exit(f"cc-board: no board for '{repo}' (run: cc-board init {repo} <path> <branch>)")
@@ -688,6 +697,7 @@ def main(a):
             d["tracks"][track]["updated"]=now()
             d["log"].append({"ts":now(),"track":track,"msg":msg})
             _save(repo,d)
+        _lib_touch(bpath(repo))   # after the lock: the index reads the board another writer may already be taking
     elif cmd == "rm":
         repo, track = a[1], a[2]
         with Lock(repo):
@@ -1471,6 +1481,23 @@ def selfcheck():
                and not glob.glob(f"{th}/.cc/boards/r.json.*tmp"))
         finally:
             BOARDS, os.replace, LOCK_WAIT = real_boards, real_replace, real_wait
+        # INDEX-AT-WRITE: a note is in the library's index the moment `note` returns — `cc-lib ask` finds it with its
+        # kind and ids and had nothing to re-read itself (re-read absent from COVERAGE: the hook did it, not the ask).
+        # Its own HOME, its own board, and the baseline pass first so the only stale source a lazy ask could catch
+        # up on is the note.
+        lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-lib")
+        th2 = tempfile.mkdtemp(prefix="ccboard-sc-lib-"); LENV = {**os.environ, "HOME": th2, "CC_BRIEF_FAKE": '{"verdict":"approve","why":"","cut":[]}'}
+        try:
+            def cli(*args): return subprocess.run([sys.executable, os.path.realpath(__file__), *args], env=LENV, text=True, capture_output=True, timeout=120)
+            def libq(*args): return subprocess.run([lib, *args], env=LENV, text=True, capture_output=True, timeout=60).stdout
+            os.makedirs(f"{th2}/dev/r"); cli("init", "r", f"{th2}/dev/r"); cli("add", "r", "st", "a row", "GOAL: something.")
+            libq("index")
+            cli("note", "r", "st", "zebrafish handover: the unit is active and the owner has used it")
+            o = libq("ask", "--object", "r/st", "--need", "history", "zebrafish handover")
+            ok("cc-board note is indexed as it is written: cc-lib ask finds the note as kind note under its row, with nothing left for the ask to re-read",
+               "zebrafish handover" in o and "note" in o and "st" in o and "OUTCOME answered" in o and "re-read" not in o)
+        finally:
+            shutil.rmtree(th2, ignore_errors=True)
     finally:
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-board selfcheck: {n} failed")

@@ -816,6 +816,21 @@ def journal(target, line):
         with open(p, "a") as f:
             f.write("\n## %s — cc-handoff\n%s\n" % (time.strftime("%Y-%m-%d %H:%MZ", time.gmtime()), line))
     except Exception:
+        return
+    lib_touch(p)
+
+
+def lib_touch(path):
+    """INDEX-AT-WRITE (cc-lib): the entry just appended is searchable a minute later, not at the next sweep. It
+    changes nothing decided here: exit code and output are discarded, a failure is one line in cc-lib's own
+    misses log (`cc-lib ask` reports it as hook-misses), and a cc-lib that is not there is nothing at all.
+    subprocess directly and not run(): the selfcheck stubs run(), and this case needs the real index."""
+    lib = os.path.join(BIN, "cc-lib")
+    if not os.access(lib, os.X_OK):
+        return
+    try:
+        subprocess.run([lib, "index", "--touch", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+    except Exception:
         pass
 
 
@@ -2937,6 +2952,30 @@ def selfcheck():
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = home0
+
+        # INDEX-AT-WRITE: the line journal() appends is in the library's index when it returns — `cc-lib ask` finds
+        # it as a checkpoint under the target's own journal, and had nothing to re-read itself (re-read absent from
+        # COVERAGE: the hook did it, not the ask). Its own HOME with one registered board, and the baseline pass
+        # first, so the only stale source a lazy ask could catch up on is the entry.
+        lhome = os.path.join(d, "libhome"); os.makedirs(os.path.join(lhome, ".cc", "boards"))
+        with open(os.path.join(lhome, ".cc", "boards", "r19.json"), "w") as fh:
+            json.dump({"repo": "r19", "path": os.path.join(lhome, "dev", "r19"), "tracks": {}, "log": []}, fh)
+        home0 = os.environ.get("HOME"); os.environ["HOME"] = lhome
+        try:
+            lib = os.path.join(BIN, "cc-lib")
+            subprocess.run([lib, "index"], capture_output=True, text=True, timeout=60)
+            journal("r19", "handoff: the zebrafish successor is live and owns r19")
+            o = subprocess.run([lib, "ask", "--repo", "r19", "--need", "history", "zebrafish successor"],
+                               capture_output=True, text=True, timeout=60).stdout
+            ok("a handoff line is indexed as it is written: cc-lib ask finds it as a checkpoint in the planning journal, "
+               "with nothing left for the ask to re-read",
+               "zebrafish successor" in o and "checkpoint" in o and "planning-handoff.md" in o
+               and "OUTCOME answered" in o and "re-read" not in o)
+        finally:
+            if home0 is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home0
 
     if nlo is not None:
         os.environ["CC_NOTIFY_LOG_ONLY"] = nlo

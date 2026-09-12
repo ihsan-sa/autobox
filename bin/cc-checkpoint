@@ -31,7 +31,9 @@
 #   cc-checkpoint selfcheck  that rule, on fixtures of its own (check.sh runs it)
 # It also records how full the session's context is (cc-context --record) and what it still owes Slack
 # (cc-owed --check), for EVERY session, track or not: the Stop payload's `transcript_path` is the only
-# handle on either, and this hook is where it arrives.
+# handle on either, and this hook is where it arrives. And it INDEXES what the turn wrote for the knowledge library
+# (`cc-lib index --touch ~/.cc/state ~/.claude/projects`: the journal and the memory file), while --sweep runs the
+# full `cc-lib index` every five minutes for whatever bypassed a hook — the library's only maintenance pass.
 # Committing is what needs a track: no-op unless the cwd is inside one (marker: <worktree-root>/.cc/track). Never touches
 # the primary worktree / default branch (no marker there), so main/planning sessions stay clean.
 # Refuses (and logs to .cc/checkpoint.err) when HEAD is not the track's own branch — a session can rewrite
@@ -1473,6 +1475,40 @@ SH
   eq "land: once pushed, the new head is a new landing" "$(grep -c '^queue ws7--projK 15 ' "$QLOG")" 2
   eq "…stamped at what the host pushed, which is now HEAD" "$(stamp ws7 projK)" "15 $(git -C "$dk" rev-parse HEAD)"
   rm -f "$QREFUSE"; unset CC_LAND
+  # ── the knowledge library (cc-lib): what a turn wrote is indexed by the hook, what bypassed it by the sweep ──────
+  # A HOME of its own with one board, one track journal and one memory file; the REAL cc-lib copied beside the copy
+  # under test (a link into the checkout is what the scratch-bin rule forbids); a baseline pass first, so the only
+  # stale source a lazy ask could catch up on is the write each case makes. `re-read` absent from COVERAGE is the
+  # proof: the ask found the record already indexed and brought nothing in itself.
+  cp "$REALBIN/cc-lib" "$bin/cc-lib"; chmod +x "$bin/cc-lib"
+  LH="$T/libhome"; mkdir -p "$LH/.cc/boards" "$LH/.cc/state/r1/t1" "$LH/.claude/projects/-x/memory" "$LH/dev/r1"
+  printf '{"repo":"r1","path":"%s","tracks":{"t1":{"title":"t","status":"running","notes":[]}},"log":[]}\n' "$LH/dev/r1" > "$LH/.cc/boards/r1.json"
+  printf '## 2026-09-11T10:00Z iter 1\nstarted.\n' > "$LH/.cc/state/r1/t1/progress.md"
+  HOME="$LH" "$bin/cc-lib" index >/dev/null 2>&1
+  printf '\n## 2026-09-11T10:30Z iter 2\nthe zebrafish gate went green at this head.\n' >> "$LH/.cc/state/r1/t1/progress.md"
+  printf -- '---\nname: axolotl-rule\ndescription: an axolotl figure is checked at the boundary\nmetadata:\n  type: feedback\n---\n\nowner 09-11: check the axolotl figure at the boundary.\n' > "$LH/.claude/projects/-x/memory/axolotl-rule.md"
+  ( cd "$T" && HOME="$LH" "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 )   # the Stop hook, as Claude runs it: no payload, no track
+  o=$(HOME="$LH" "$bin/cc-lib" ask --object r1/t1 --need history "zebrafish gate" 2>/dev/null)
+  k "$(grep -q 'zebrafish gate' <<<"$o" && grep -q checkpoint <<<"$o" && grep -q 'OUTCOME answered' <<<"$o" && ! grep -q 're-read' <<<"$o" && echo 0 || echo 1)" \
+    "hook: the journal line a turn appended is indexed when the turn ends — cc-lib ask finds it as a checkpoint under its track, with nothing left for the ask to re-read" "$o"
+  o=$(HOME="$LH" "$bin/cc-lib" ask --need decision "axolotl figure" 2>/dev/null)
+  k "$(grep -q 'axolotl' <<<"$o" && grep -q decision <<<"$o" && grep -q 'OUTCOME answered' <<<"$o" && ! grep -q 're-read' <<<"$o" && echo 0 || echo 1)" \
+    "hook: the memory file a turn saved is indexed when the turn ends — found as a decision (type feedback), nothing re-read" "$o"
+  printf '\n## 2026-09-11T10:40Z iter 3\nwritten inside a member boundary.\n' >> "$LH/.cc/state/r1/t1/progress.md"
+  ( cd "$T" && HOME="$LH" CC_MEMBER_SANDBOX=1 "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 )
+  eq "…and NOT inside a member's boundary: the library is owner-side, so that hook indexes nothing (the next pass finds the journal stale)" \
+    "$(HOME="$LH" "$bin/cc-lib" index --json 2>/dev/null | grep -o '"indexed_now": [0-9]*')" '"indexed_now": 1'
+  # the sweep: an edit that bypassed every hook (a journal appended to and never turned on) is picked up by the
+  # five-minute tick, and a pass that reached everything clears the hooks' misses log
+  printf '\n## 2026-09-11T11:00Z iter 4\nthe pangolin rebase landed with no hook run.\n' >> "$LH/.cc/state/r1/t1/progress.md"
+  echo "2026-09-11T10:59:00Z $LH/.cc/state/r1/t1/progress.md locked" >> "$LH/.cc/library/owner/misses.log"
+  sw=$(cd / && HOME="$LH" "$bin/cc-checkpoint" --sweep 2>&1)
+  eq "sweep: a bypassed edit is reconciled by the tick — a pass right after it finds nothing stale" \
+    "$(HOME="$LH" "$bin/cc-lib" index --json 2>/dev/null | grep -o '"indexed_now": [0-9]*')" '"indexed_now": 0'
+  o=$(HOME="$LH" "$bin/cc-lib" ask --object r1/t1 --need history "pangolin rebase" 2>/dev/null)
+  k "$(grep -q 'pangolin rebase' <<<"$o" && grep -q 'OUTCOME answered' <<<"$o" && ! grep -q 're-read' <<<"$o" && ! grep -q 'hook-misses' <<<"$o" && echo 0 || echo 1)" \
+    "…so cc-lib ask finds it with nothing to re-read, and the misses log the sweep repaired is cleared" "$o"
+  k "$([ -e "$LH/.cc/library/owner/misses.log" ] && echo 1 || echo 0)" "…the misses log itself being gone" "$(cat "$LH/.cc/library/owner/misses.log" 2>/dev/null)"
   echo "cc-checkpoint selfcheck: $((n - f)) passed, $f failed"; [ "$f" = 0 ]
 }
 [ "$MODE" = selfcheck ] && { selfcheck; exit $?; }
@@ -1630,6 +1666,11 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
       land_queue "$h" "$t" "$sd" "$lease"
     done
   done
+  # CURSOR RECONCILIATION for the knowledge library (cc-lib): every registered source whose cursor moved without a
+  # write hook — an edit by hand, a tool that bypassed one, a journal a session appended to and never turned on —
+  # is re-read here, on the five-minute tick the box already has, and a pass that reaches everything clears the
+  # hooks' misses log. 60 ms when nothing changed; nothing here is a timer, unit or daemon of the library's own.
+  [ -x "$BIN/cc-lib" ] && timeout 120 "$BIN/cc-lib" index >/dev/null 2>&1
   exit 0
 fi
 if [ "$MODE" != commit ]; then   # push only: no payload to read, no commit, and a real exit code for `cc done`
@@ -1662,6 +1703,12 @@ fi
 [ "$STRICT" = 1 ] || [ -t 0 ] || payload=$(timeout 5 cat)
 [ -n "${payload:-}" ] && say=$(printf '%s' "$payload" | timeout 20 "$BIN/cc-context" --record 2>/dev/null)
 [ -n "${payload:-}" ] && { owe=$(printf '%s' "$payload" | timeout 15 "$BIN/cc-owed" --check --with "${say:-}" 2>/dev/null); say=${owe:-$say}; }
+# INDEX-AT-WRITE for the knowledge library (cc-lib): the journal this turn appended to (~/.cc/state) and the memory
+# file it saved (~/.claude/projects) are searchable a minute later, not at the next sweep. Every session, track or
+# not, on the hook alone — never `--commit`, and never inside a member's boundary (the library is owner-side; P2
+# scopes it). The exit code is discarded: a failure is one line in cc-lib's misses log, which `cc-lib ask` reports
+# as hook-misses, and a hook that cannot index never costs a session its commit.
+[ "$STRICT" = 1 ] || [ -n "${CC_MEMBER_SANDBOX:-}" ] || [ ! -x "$BIN/cc-lib" ] || timeout 20 "$BIN/cc-lib" index --touch "$HOME/.cc/state" "$HOME/.claude/projects" >/dev/null 2>&1 || true
 exec 8>&1   # the hook's real stdout: every exit below is inside a block that discards stdout, the relay is not
 relay(){ [ -n "${say:-}" ] && printf '%s\n' "$say" >&8; return 0; }
 trap relay EXIT

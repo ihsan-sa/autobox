@@ -127,6 +127,22 @@ Subagents die with the session that spawned them, so a session does not hand off
 finish them or abandon them first. A retired session is gated as a worker — it can no longer push or land —
 so anything left running is the successor's to pick up, worktrees and landing both.
 
+## the reading procedure
+The rule, one line in every session's standing text (`config/library-prompt.md`): an owner-facing claim about a
+permission, a process, merged code, a live service, a PR's review or what a track did is preceded by `cc-lib ask`
+or a probe of the object, and the ticket it prints is the receipt. Of fifteen recorded misses
+(`docs/design-knowledge-library-2026-09-11.md`), twelve had the record on disk and the session answered from memory
+or a proxy. The tool retrieves; it never calls a model. The steps:
+1. Name the claim — current state, a rule or decision, history, or an aggregate — and the object (row, PR, run, path, channel, date). Split only independent claims.
+2. `cc-lib ask --object <id> --need current|decision|history|aggregate "<question>"`. It opens a ticket with the byte cap and 1.5 s budget and prints the best hits, then COVERAGE and OUTCOME.
+3. Authoritative route first: task state from the reconciler, a review from the landing root record at the matching head, a run from its id, cost from `cc-econ` on the right time basis. A live claim needs a live probe of the object — a record about it is not the object.
+4. Search only what is unresolved. Follow a hit to its record (`cc-lib get <rid>`) and its span; never read a whole journal because one line matched.
+5. Widen deliberately: one reformulation, then dates and kinds, then (owner sessions only) across workspaces.
+6. Check identity, authority and time: same head, same run, decision still in force, summary linked to evidence. Missing, unreadable, stale and not-searched are four different answers, and COVERAGE names each (pending, unreadable, hook-misses).
+7. Stop on sufficiency or budget. Cite the record and its stamp. An empty search means "not recorded in the covered scope", never "no".
+8. Delegate only a compressible large read: one bounded subagent, same workspace, no recursive spawning.
+9. Leave only new knowledge — a note for a new decision, finding or explanation. What you write to a journal, the board, a landing record or a memory file is indexed as you write it (the write path calls `cc-lib index --touch`; a hook that could not index shows as `hook-misses` until the 5-minute sweep reconciles), so a minute later you ask rather than remember.
+
 ## dispatch judgement
 - Planner does it itself only when the edit is already known and needs no test cycle: a line of wording, a config value, a one-hunk fix that check.sh alone covers, <=2 files, nothing live holding those files — short branch, PR like anything else. Anything that needs a selfcheck run, a new case or a negative control goes to a builder.
 - Subagent: work that is bounded, already scoped, and finishes inside this session's life — a read whose answer compresses (delegate any that would add more than ~10k here), and equally a known fix, in its own worktree, leaving the commit to this session. Cheapest model that holds quality; never for grep-shaped exploration. It costs a fraction of a worker: a bounded analysis ran to well under $1 where the same job as a worker is a $2.50-$9 repair round. Two things it cannot do — it dies with this session (a handoff killed one mid-flight on 2026-09-02 and the work was redone), and it inherits this session's reach rather than getting its own gates, journal and PR.
