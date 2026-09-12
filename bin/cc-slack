@@ -6,7 +6,8 @@
   cc-slack channel [<target>]         stdio MCP channel server; registered once in user scope (`cc slack on`), claude spawns
                                       it in every session; the target comes from the session cwd unless given:
                                       ~/dev/<repo> → <repo>, a track worktree (.cc/track) → <repo>/<track>, ~/dev or ~ → box
-  cc-slack inject [--no-start] <target> "text"      push a message into a session as if it came from Slack (tests/scripts)
+  cc-slack inject [--no-start] <target> "text"      push a message into a session as if it came from Slack (tests/scripts);
+                                                    `<repo>@<alias>` is that live orch's own session, never started for it
   cc-slack post [-c CHANNEL] [--thread TS] [--ts TS] [--route TITLE] [--id PRODUCER-ID] [--mention] [--major] "text"   post as the bot (cc-notify uses --route).
                                       --id names the event (land:<repo>:<pr>:<outcome>, credential:<member>, …): it is posted
                                       ONCE, ever — a replay prints the ts it already has and posts nothing; a retry after a
@@ -1260,6 +1261,17 @@ def valid_target(t):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*(/[A-Za-z0-9_][A-Za-z0-9_.\-]*)?", t or ""):
         return False
     return os.path.isdir(f"{DEV}/{t.split('/')[0]}")
+
+
+def split_orch(t):
+    """`<repo>@<alias>` — an orch addressed by its own window name, the key cc-broker and cc-pulse use for one — as
+    (repo, alias); any other target as (t, None). A `/` beside the `@` is a track's second window (`repo/track@2`),
+    which is not an orch and is left whole."""
+    if "@" in (t or "") and "/" not in t:
+        repo, _, alias = t.partition("@")
+        if repo and alias:
+            return repo, alias
+    return t, None
 
 
 def track_missing(target):
@@ -4720,8 +4732,12 @@ class Daemon:
                     elif msg.get("type") == "asked":    # the session's own "this needs the owner" via reply(needs_owner)
                         self._safe(self.declare_needs, msg.get("chat", ""), msg.get("root", ""))
             elif verb == "inject":
-                target = first["inject"]
-                if not valid_target(target):
+                # AN ORCH IS A TARGET OF ITS OWN (owner ask a218, go 2026-09-12): `<repo>@<alias>` reaches that orch's
+                # subscription and nobody else's — its steward's escalation is what arrives this way — and is
+                # queued for it when it is down, alias-keyed, like a channel message. NEVER autostarted: an orch is
+                # its channel's to start, and autostart(repo) would start the repo's planning seat instead.
+                target, alias = split_orch(first["inject"])
+                if not valid_target(target) or (alias and not orch_lookup(load_orchs(), target, alias)):
                     c.sendall(b'{"ok":false,"error":"bad target"}\n'); return
                 meta = {"chat_id": "local", "thread_ts": "", "ts": str(time.time()), "user": f"{member} (local)" if member else "local",
                         "role": "member" if member else "owner", "channel": "local", "target": target}   # a process on the box IS owner-level access; one inside a boundary is its member
@@ -4729,7 +4745,8 @@ class Daemon:
                 meta.update({k: str(v) for k, v in (first.get("meta") or {}).items()
                              if k not in ("chat_id", "thread_ts", "user", "role", "channel")})
                 res = self.deliver(target, {"type": "message", "content": first.get("content", ""), "meta": meta},
-                                   autostart=bool(first.get("start", True)) and not member)   # a boundary never starts sessions
+                                   autostart=bool(first.get("start", True)) and not member and not alias,   # a boundary never starts sessions
+                                   alias=alias)
                 c.sendall((json.dumps({"ok": True, "result": res}) + "\n").encode())
             elif verb == "orch":                    # {"orch": target, "alias":…, "parent_alias":…, "brief":…} — `cc <repo> --orch <alias>`
                 try:
@@ -12411,6 +12428,38 @@ def cmd_selfcheck():
           "injected message is owner-level, because running inject already means access to the box — M7",
           meta7.get("chat_id") == "local" and meta7.get("user") == "local" and meta7.get("channel") == "local"
           and meta7.get("thread_ts") == "" and meta7.get("role") == "owner" and meta7.get("source") == "test")
+    # AN ORCH IS A TARGET OF ITS OWN (owner ask a218, go 2026-09-12): `<repo>@<alias>` is delivered to that alias's
+    # subscription, never autostarted; an archived alias or one the table has never seen is a bad target; a
+    # track's `@2` window is not an orch and goes whole.
+    dmO7 = Daemon(use_slack=False)
+    gotO7 = []; dmO7.deliver = lambda target, payload, autostart=True, alias=None: gotO7.append((target, alias, autostart)) or "delivered"
+    os.makedirs(f"{DEV}/myrepo", exist_ok=True)
+    hadO7 = os.path.exists(f"{DIR}/{ORCHS}"); wasO7 = load_orchs() if hadO7 else None
+    save_orchs({"CO7": {"target": "myrepo", "alias": "scout", "name": "myrepo-scout-ab12", "archived": False},
+                "CO7X": {"target": "myrepo", "alias": "old", "name": "myrepo-old-zz99", "archived": True}})
+    ansO7 = []
+    try:
+        for tgt in ("myrepo@scout", "myrepo@old", "myrepo@never", "myrepo", "myrepo/track@2"):
+            aO, bO = socket.socketpair()
+            aO.sendall(json.dumps({"inject": tgt, "content": "steward: needs you — an ask is open"}).encode() + b"\n")
+            aO.shutdown(socket.SHUT_WR); dmO7.handle_conn(bO)
+            aO.settimeout(2)
+            try:
+                ansO7.append(json.loads(aO.recv(65536).decode().splitlines()[0]).get("ok"))
+            except Exception:
+                ansO7.append(None)
+            aO.close()
+    finally:
+        if wasO7 is not None:
+            save_orchs(wasO7)
+        elif os.path.exists(f"{DIR}/{ORCHS}"):
+            os.unlink(f"{DIR}/{ORCHS}")
+    check("inject: `<repo>@<alias>` reaches that live orch's own subscription (alias-keyed, never autostarted); an archived "
+          "or unknown alias is a bad target; a plain repo and a track's `@2` window are unchanged — O7",
+          ansO7 == [True, False, False, True, False] and gotO7[0] == ("myrepo", "scout", False)
+          and gotO7[1][0] == "myrepo" and gotO7[1][1] is None and gotO7[1][2] is True and len(gotO7) == 2
+          and split_orch("myrepo/track@2") == ("myrepo/track@2", None) and split_orch("box") == ("box", None)
+          and split_orch("myrepo@") == ("myrepo@", None))
     dmL13 = Daemon(use_slack=False); dmL13.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
     opened13, real_urlopen = [], urllib.request.urlopen
     class FakeResp:
