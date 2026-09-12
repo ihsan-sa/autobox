@@ -15,6 +15,10 @@
   cc-slack sent <PRODUCER-ID>         did Slack accept that id? prints its ts, exit 0; exit 1 when not (yet).
                                       An unknown flag is an error (exit 2), never text. A session's -c '#name' post into
                                       ANOTHER session's channel is handed to that session (Daemon.wake); --route never is.
+                                      One that wakes nobody (queued, no-session, live-no-channel, no-track — not a paused
+                                      or unminted target, which has no session by design) is written to the failures ledger
+                                      by the daemon (channel-wake/nobody-woken) and the stderr line names the record:
+                                      `cc-slack: woke nobody on <target> (<verdict>) — recorded f-…`.
                                       --ts = the message this answers; naming a mail's line in its mirror thread mails the post
                                       --mention = the top of the notification ladder: the MAIN channel (never the -updates
                                       lane), opening with ❓ and an @-mention of the owner — a DECISION ASK, and the only
@@ -4499,7 +4503,48 @@ class Daemon:
                 "channel": "#" + (name or str(chat)), "target": target, "from": f"{seat[0]}@{seat[1]}" if seat[1] else seat[0]}
         res = self.deliver(target, {"type": "message", "content": text, "meta": meta}, alias=alias)
         log(f"wake {target}{'@' + alias if alias else ''} from {meta['from']}: {res}")
-        return {"ok": True, "result": res, "target": target}
+        out = {"ok": True, "result": res, "target": target}
+        if res not in self.WOKEN and res not in self.NOBODY_BY_DESIGN:
+            out["recorded"] = self.record_nobody_woken(target, alias, meta, res)
+        return out
+
+    # THE OUTCOMES OF deliver() THAT WAKE SOMEBODY, and the ones where nobody is there by design. The brief
+    # (a-post-that-wakes-nobody-is-recorded-by-cc-slack, 2026-09-12): "resolves to nobody woken (the outcome of
+    # deliver that means no session picked it up, within a short window)" — `spooled` and `starting` are picked up
+    # inside that window (cc-msg's drain, the session's first hello), so they wake; "a post spooled for a channel
+    # that has no session by design is not a failure" — `paused` is the owner's cc-pause, `no-credential` a
+    # workspace he has not minted. Everything else with a target — queued, no-session, live-no-channel, no-track, and
+    # a verdict these lists do not know — is a post the sender believed handed over and nobody took: recorded.
+    WOKEN = ("delivered", "typed", "spooled", "starting")
+    NOBODY_BY_DESIGN = ("paused", "no-credential")
+    NOBODY_WOKEN_KIND = "channel-wake/nobody-woken"
+
+    def record_nobody_woken(self, target, alias, meta, res):
+        """A wake that resolved to nobody is written to the failures ledger HERE, by the tool that saw it — the
+        terminal-writer shape cc-green and cc-loop use (`cc-failures record --scope <repo> --kind …`) — and the id
+        goes back to `cc-slack post` for its own return line, so the sender and the box know before the owner does.
+        Before this the wake only logged its result, and a box post that woke nobody was found by the owner
+        (investigation i-e9fb26ce, 2026-09-12). One record per post: wake runs once per `post -c`, and the post's own
+        (chat, ts) is links.source. Returns "recorded <id>" or "not recorded: <why>" — the post already went out,
+        so a writer that fails is one word on the return line and never an error of the post's."""
+        where = f"{target}{'@' + alias if alias else ''}"
+        cmd = [f"{BIN}/cc-failures", "record", "--scope", target.partition("/")[0].partition("@")[0],
+               "--kind", self.NOBODY_WOKEN_KIND, "--writer", "cc-slack",
+               "--observed", f"a post by {meta.get('from')} into {meta.get('channel')} was for {where} and woke nobody: "
+                             f"deliver said {res}, and the post sits in {where}'s queue with nothing coming for it",
+               "--expected", f"{where}'s session takes a post into {meta.get('channel')}",
+               "--detector", "box", "--detector-evidence", f"cc-slack saw deliver return {res}",
+               "--link", f"source=wake:{meta.get('chat_id')}:{meta.get('ts')}", "--link", f"target={where}",
+               "--link", f"outcome={res}"]
+        try:
+            r = EFFECTS.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)   # inside the CLI's 15 s wait
+        except Exception as e:
+            log(f"wake {where}: not recorded ({e.__class__.__name__})"); return f"not recorded: {e.__class__.__name__}"
+        if r.returncode != 0:
+            why = (((r.stderr or r.stdout or "").strip().splitlines() or ["cc-failures record failed"])[-1])[:160]
+            log(f"wake {where}: not recorded ({why})"); return f"not recorded: {why}"
+        rid = ((r.stdout or "").split() or ["?"])[-1]
+        log(f"wake {where}: recorded {rid}"); return f"recorded {rid}"
 
     def sender(self, chat, peer):
         """{"sender": chat|""} from `cc-slack post`, before it posts: WHO IS SENDING THIS, and is `chat` their own
@@ -9377,7 +9422,9 @@ def cmd_post(argv):
             r = sock_request({"wake": chan, "ts": posted_ts, "thread_ts": thread, "text": text}, timeout=15)
         except Exception:
             r = {}                                   # no daemon: the post stands, and there is no session to hand it to
-        if r.get("target"):
+        if r.get("recorded"):                    # nobody took it: the daemon wrote the ledger record, and this line names it
+            print(f"cc-slack: woke nobody on {r['target']} ({r.get('result')}) — {r['recorded']}", file=sys.stderr)
+        elif r.get("target"):
             print(f"cc-slack: handed to {r['target']} ({r.get('result')})", file=sys.stderr)
     return 0
 
@@ -12374,12 +12421,14 @@ def cmd_selfcheck():
     # `-c '#name'` post asks the daemon to wake the channel's session, and cmd_selfcheck points that at THIS run's
     # socket. A fixture daemon there is heard; with none there the post stands alone — and the case above counts the
     # same two stderr lines from a box shell, where the live daemon used to answer, as from a sandbox.
-    postedW, errW1, errW2 = [], io.StringIO(), io.StringIO()
+    postedW, errW1, errW1n, errW2 = [], io.StringIO(), io.StringIO(), io.StringIO()
     srvW = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srvW.bind(SOCK); srvW.listen(1)
     def daemonW():
-        for _ in range(2):                       # one post asks twice: who is sending (sender), then the wake
+        for i in range(4):                       # one post asks twice: who is sending (sender), then the wake
             c, _ = srvW.accept(); c.settimeout(5); c.recv(65536)
-            c.sendall(b'{"ok": true, "name": null, "own": true, "target": "myrepo/t1", "result": "starting"}\n'); c.close()
+            c.sendall(b'{"ok": true, "name": null, "own": true, "target": "myrepo/t1", "result": "starting"}\n' if i < 2 else
+                      b'{"ok": true, "name": null, "own": true, "target": "myrepo/t1", "result": "queued", "recorded": "recorded f-0badc0ffee"}\n')
+            c.close()
     thW = threading.Thread(target=daemonW, daemon=True); thW.start()
     try:
         globals()["resolve_channel"] = lambda cfg, name: f"C-{name}"
@@ -12388,6 +12437,8 @@ def cmd_selfcheck():
         globals()["unresolved_mentions"] = lambda cfg, text, chat=None, **kw: []
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errW1):
             cmd_post(["-c", "#myrepo", "restore which database?"])        # a daemon answers on the fixture socket
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errW1n):
+            cmd_post(["-c", "#myrepo", "restore which database?"])        # …and this time nobody woke: the answer names the record
         thW.join(5); srvW.close(); os.unlink(SOCK)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errW2):
             cmd_post(["-c", "#myrepo", "restore which database?"])        # nothing there: the post stands, no hand-off line
@@ -12397,8 +12448,12 @@ def cmd_selfcheck():
     check("the selfcheck's delivery state is its own: a `-c '#name'` post wakes a session through THIS run's socket, never "
           "the box's — a fixture daemon there is heard ('handed to …'), and with none there the post prints nothing more, "
           "so the case above sees the same lines from a box shell and from a sandbox",
-          SOCK.startswith(DIR) and postedW == ["C-myrepo", "C-myrepo"]
+          SOCK.startswith(DIR) and postedW == ["C-myrepo", "C-myrepo", "C-myrepo"]
           and errW1.getvalue().strip() == "cc-slack: handed to myrepo/t1 (starting)" and errW2.getvalue().strip() == "")
+    check("a post that woke nobody says so on its own return line, and names the ledger record the daemon wrote — the "
+          "sender knows before the owner does (i-e9fb26ce); a post that was handed over keeps its 'handed to' line",
+          errW1n.getvalue().strip() == "cc-slack: woke nobody on myrepo/t1 (queued) — recorded f-0badc0ffee"
+          and "woke nobody" not in errW1.getvalue())
     # ── WHO SENT IT, AND WHO IT IS FOR (owner, 2026-09-11): the post signs with the session the DAEMON names —
     # never an env var of the calling shell — and a post into ANOTHER session's channel opens with a mention of it.
     postedN, seatN = [], {"name": None, "own": True}
@@ -16888,6 +16943,32 @@ def cmd_selfcheck():
         r_wown = ms_req({"wake": "CCTL", "ts": "7.8", "text": "to myself"}, member=None, peer=me_peer)
         r_wnone = ms_req({"wake": "CMY", "ts": "7.9", "text": "from a cron"}, member=None, peer=(999999, os.getuid(), DEV))
         r_wmem = ms_req({"wake": "CMY", "ts": "8.0", "text": "x"})
+        # …AND A WAKE THAT RESOLVES TO NOBODY IS RECORDED BY THE TOOL THAT SAW IT (i-e9fb26ce, 2026-09-12). deliver's
+        # verdict decides: queued, no-session, live-no-channel and no-track each write one record into the REAL
+        # cc-failures (a scratch ledger) and the socket answer names it; the woken four and the by-design pair write
+        # nothing; a writer that fails is a word on the answer and the wake still answers ok.
+        fdirW = tempfile.mkdtemp(prefix="wake-ledger-", dir=DIR); envW = dict(os.environ, CC_FAILURES=fdirW)
+        _runMS = EFFECTS.run_impl
+        EFFECTS.run_impl = lambda cmd, **kw: (subprocess.run(cmd, **dict(kw, env=envW)) if str(cmd[0]).endswith("/cc-failures")
+                                              else _runMS(cmd, **kw))
+        ledgerW = lambda: json.loads(subprocess.run([f"{BIN}/cc-failures", "show", "--json", "--scope", "myrepo"], env=envW,
+                                                    capture_output=True, text=True).stdout or "[]")
+        verdictW = {"v": "queued"}
+        dmMS.deliver = lambda target, payload, autostart=True, alias=None: verdictW["v"]
+        r_wq = ms_req({"wake": "CMY", "ts": "7.71", "text": "nobody there"}, member=None, peer=me_peer)
+        ledger1 = ledgerW()
+        r_wok = []
+        for verdictW["v"] in ("delivered", "typed", "spooled", "starting", "paused", "no-credential"):
+            r_wok.append(ms_req({"wake": "CMY", "ts": "7.72", "text": "somebody, or nobody by design"}, member=None, peer=me_peer))
+        ledger2 = ledgerW()
+        r_wns = []
+        for verdictW["v"] in ("no-session", "live-no-channel", "no-track"):
+            r_wns.append(ms_req({"wake": "CMY", "ts": "7.73", "text": "nobody there either"}, member=None, peer=me_peer))
+        ledger3 = ledgerW()
+        EFFECTS.run_impl = lambda cmd, **kw: types.SimpleNamespace(returncode=1, stdout="", stderr="cc-failures: disk full\n")
+        verdictW["v"] = "queued"
+        r_wfail = ms_req({"wake": "CMY", "ts": "7.74", "text": "nobody, and no ledger"}, member=None, peer=me_peer)
+        EFFECTS.run_impl = _runMS
         # sender: the same seat, asked BEFORE a post — the name it signs with and whose channel it is posting into
         r_who = ms_req({"sender": "CMY"}, member=None, peer=me_peer)
         r_who_own = ms_req({"sender": "CCTL"}, member=None, peer=me_peer)
@@ -17112,6 +17193,23 @@ def cmd_selfcheck():
           and wokeMS[0][2]["meta"].get("from") == CTL
           and r_wown.get("result") == "own" and r_wnone.get("result") == "not-a-session"
           and r_wmem.get("ok") is False)
+    check("wake: a post that wakes nobody is recorded by cc-slack at that moment (i-e9fb26ce: the wake only logged its "
+          "result, and the owner found the post that woke nobody) — queued, no-session, live-no-channel and no-track "
+          "each write ONE record (channel-wake/nobody-woken, scope the target's repo, links.source the post's own "
+          "chat:ts, writer cc-slack, detector box) and the socket answer names its id; delivered, typed, spooled, "
+          "starting and the by-design pair paused/no-credential write nothing and answer without one; a writer that "
+          "fails is 'not recorded: <why>' on the answer and the wake still answers ok",
+          r_wq.get("ok") is True and r_wq.get("result") == "queued" and r_wq.get("recorded", "").startswith("recorded f-")
+          and len(ledger1) == 1 and ledger1[0]["kind"] == "channel-wake/nobody-woken" and ledger1[0]["scope"] == "myrepo"
+          and ledger1[0]["writer"] == "cc-slack" and ledger1[0]["detector"]["who"] == "box"
+          and ledger1[0]["links"].get("source") == "wake:CMY:7.71" and ledger1[0]["links"].get("target") == "myrepo"
+          and r_wq["recorded"].split()[-1] == ledger1[0]["id"] and "nobody there" not in ledger1[0]["observed"]
+          and f"a post by {CTL} into #myrepo was for myrepo and woke nobody: deliver said queued" in ledger1[0]["observed"]
+          and len(r_wok) == 6 and all(r.get("ok") is True and "recorded" not in r for r in r_wok) and len(ledger2) == 1
+          and len(r_wns) == 3 and all(r.get("recorded", "").startswith("recorded f-") for r in r_wns) and len(ledger3) == 4
+          and sorted(x["links"]["outcome"] for x in ledger3) == ["live-no-channel", "no-session", "no-track", "queued"]
+          and r_wfail.get("ok") is True and r_wfail.get("result") == "queued"
+          and r_wfail.get("recorded") == "not recorded: cc-failures: disk full" and len(ledgerW()) == 4)
     check("sender: the seat the daemon sees on the socket is the name a post signs with — the CTL session here, whatever "
           "the calling shell's environment says — and it is told `own` for its own channel and not for #myrepo's, which "
           "is what puts a <#…> in front of that post; a caller no session owns has no name, and a member socket has no "
