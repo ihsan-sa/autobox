@@ -154,6 +154,7 @@ CTL = BOX                                            # the box's control repo = 
 if SELF.startswith(DEV + os.sep):
     CTL = SELF[len(DEV) + 1:].split(os.sep)[0]
 VERSION = "0.1"
+PERM_CARD_PREVIEW = 300   # chars of the tool input a 🔐 card shows; a longer one follows whole as the next message in its thread
 PERM_RE = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})(?:\s+(fix))?\s*$", re.I)   # `fix`: and the capability is being
                                                                                     # given for good (⚙️ beside the ✅)
 SENT_USING_RE = re.compile(r"\s*\*Sent using\*\s+\S+\s*$")     # claude.ai's Slack connector signs every message it sends
@@ -166,6 +167,45 @@ ALERT_KINDS = ("boot", "limit", "audit", "review", "digest", "alerts", "cc-rc", 
 UPDATES = "updates"                                            # #<repo>-updates: every project channel's second lane, for what is automated or long
 UPDATE_KINDS = ("digest",)                                     # …the "<box> <kind>" titles that are PROGRESS, not an alert: they leave #alerts for #<box>-updates
 NOTICE_WINDOW = 900                                            # how long the same join/leave line is not repeated: a reconnect flap is minutes wide, not seconds
+
+
+def notice_state_path():
+    """{DIR}/notices.json — "<target>\t<who>" -> joined|left, the last join/left line each alias got, across daemon
+    restarts. Read at call time: the selfcheck moves DIR, and a path fixed at import would write the live file."""
+    return f"{DIR}/notices.json"
+
+
+def notice_state(text):
+    """`joined` or `left` for a chan_notice line, None for any other text (those are not de-duplicated by state)."""
+    if " joined — " in text:
+        return "joined"
+    if text.endswith(" left."):
+        return "left"
+    return None
+
+
+def notice_key(target, text):
+    return target + "\t" + text.split(" joined — ")[0].split(" left.")[0]
+
+
+def notice_state_load():
+    try:
+        with open(notice_state_path()) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def notice_state_save(d):
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        tmp = notice_state_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, notice_state_path())
+    except OSError as e:
+        log(f"notice state not saved: {e}")
 NUDGE_PREFIXES = ("❓ still waiting", "⏳ no answer", "🔴 still open")   # our own nudge posts (v1's too): never an answer
 VOICE_PREFIX = "🎙️ transcript"                                  # our own transcript of a memo: their message, not our answer to it
 VOICE_MARK = "voice"                                           # marks key on OUR transcript post — "<chat>:<our ts>:voice:<memo ts>":
@@ -434,6 +474,40 @@ def api(method, token, **params):
 
 
 EFFECTS = Effects.real()
+
+
+REPLY_BOLD_MAX = 120    # chars inside a reply's opening *…*: a phone line is ~40, and three lines of bold is a paragraph, not the point
+REPLY_CHARS_MAX = 800   # chars in the whole reply, a link counted as its label: past this, the point and one link (CLAUDE.md)
+
+
+def reply_shape(text):
+    """Why a session's reply would not be read — one line naming the measure — or None if it is within shape.
+    Measured, never judged: the opening bold span (after an optional emoji) over REPLY_BOLD_MAX chars, or the whole
+    text over REPLY_CHARS_MAX with links counted as their label. Limits from docs/2026-09-12-owner-messages.md."""
+    t = (text or "").strip()
+    plain = re.sub(r"<[^>|]*\|([^>]*)>", r"\1", t)       # <url|label> → label
+    plain = re.sub(r"<[^>]*>", "link", plain)             # a bare <url>, <@U…>, <#C…>
+    m = re.match(r"(?:[^\w\s*]{1,4}\s+)?\*([^*\n]+)\*", plain)
+    if m and len(m.group(1)) > REPLY_BOLD_MAX:
+        return (f"not sent — the opening bold is {len(m.group(1))} chars: bold the one clause that matters "
+                f"(under {REPLY_BOLD_MAX}) and put the rest in plain text")
+    if len(plain) > REPLY_CHARS_MAX:
+        return (f"not sent — {len(plain)} chars: send the point and one link (under {REPLY_CHARS_MAX}); "
+                f"the depth goes to the journal, docs/ or the canvas")
+    return None
+
+
+def member_facing_here():
+    """Is this process a member-facing session — `.cc/member-facing` in the cwd or a parent (cc-guard's own marker
+    and walk)? Its replies go to members, and the owner-facing shape rule is not theirs."""
+    d = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(d, ".cc", "member-facing")):
+            return True
+        up = os.path.dirname(d)
+        if up == d:
+            return False
+        d = up
 
 
 def at_token(text, bot_user=None):
@@ -4899,6 +4973,19 @@ class Daemon:
         dropped rather than repeated."""
         if not self.cfg.get("SLACK_BOT_TOKEN"):
             return
+        # A JOIN AFTER A JOIN IS NOT A JOIN. The window above lives in this process, and every landing that touches
+        # this file restarts the daemon: each orch re-hellos and the lane got its "joined" again — 28 of them for
+        # an orch that "left" 0 times in three days, 111 in all (docs/2026-09-12-owner-messages.md, shape 1). So the
+        # last notice each alias got is kept ON DISK, and only a change is posted: joined after left (or never),
+        # left after joined. The state moves either way; the line goes out only on the change, inside the window.
+        state = notice_state(text)
+        if state:
+            last = notice_state_load()
+            key = notice_key(target, text)
+            if last.get(key) == state:
+                return
+            last[key] = state
+            notice_state_save(last)
         now = time.time()
         if now - self.noticed.get((target, text), 0) < NOTICE_WINDOW:
             return   # a socket-mode reconnect re-runs hello/bye: don't spam the channel with the same join/left line
@@ -7938,11 +8025,22 @@ class Daemon:
             log(f"permission_request for {target} but no Slack chat to relay to"); return
         if not self.perm_room(target, chat, thread, bool(rid) and not held):   # a re-sent id and an unanswerable
             return                                                             # one still cost a message: rate-capped
+        # THE CARD IS THE DECISION, THE COMMAND IS ITS EVIDENCE. Seven cards in three days ran a median 943 chars,
+        # most of it the tool input as JSON in the fence (docs/2026-09-12-owner-messages.md, shape 3) — unreadable
+        # on a phone, and it pushed the one line he answers with below the fold. So the card carries the first
+        # PERM_CARD_PREVIEW chars of it and the whole thing follows as the next message in the same thread, one tap
+        # away and posted before anyone can answer: nothing he approves is hidden from him, it is just not in the
+        # headline. perm_field's own cap (1500) still bounds what a session can make the box say.
+        preview = perm_field(msg.get("input_preview"), 1500, inline=False)
+        folded = len(preview) > PERM_CARD_PREVIEW
         text = (f"🔐 `{perm_field(target, 60)}` wants to run *{perm_field(msg.get('tool_name'), 60)}*: "
                 f"{perm_field(msg.get('description'), 500)}\n"
-                f"```\n{perm_field(msg.get('input_preview'), 1500, inline=False)}\n```\n"
+                f"```\n{preview[:PERM_CARD_PREVIEW] + '…' if folded else preview}\n```\n"
+                + ("(the whole command is the next message in this thread) " if folded else "")
                 + (f"Reply `yes {rid}` or `no {rid}`" if rid else "It carries no id anyone can answer by."))
         root = self.say(chat, text, thread) or thread     # the prompt's own ts: where an answer belongs
+        if folded and root:
+            self.say(chat, f"```\n{preview}\n```", thread or root)   # the card's thread when it is a root, else the one it sits in
         if rid:
             # WHO ASKED, BY REQUEST ID. The answer used to be routed by the channel it was typed in, which was the
             # asker's own — now a member's prompt is answered in a channel that belongs to another target, so the id
@@ -8470,7 +8568,7 @@ class Daemon:
 INSTRUCTIONS = """Messages from Slack arrive as <channel source="cc-slack" chat_id="…" thread_ts="…" ts="…" user="…" role="…" channel="…" target="…">.
 Whoever wrote reads Slack, not this terminal: anything they must see goes through the `reply` tool (pass chat_id, thread_ts and ts from the tag) — your normal output never reaches them.
 ANSWER WHERE YOU WERE ASKED: `reply`/`react`/`file` are for a message that arrived with a `<channel>` tag, and for nothing else. A question typed in the terminal is answered in the terminal — posting that answer to Slack is noise in a channel that never asked it (owner, 2026-08-30, after this happened twice).
-Style: Slack mrkdwn (*bold*, `code`, ``` blocks); no # headings or **. BOLD THE ONE THING THAT MATTERS, OR CUT THE MESSAGE (owner, 2026-09-07: 'I ain't reading all that ... either use strategic bolding and stuff to show me the important stuff or just cut it out'): open with what happened or what they must decide, in *bold*, put nothing above it, and DELETE — never demote — a line that does not change what they do next. Being well-structured is not being read: four defensible paragraphs are four they skip, and length is never earned by how long the work took. THE SHORTEST ANSWER THAT IS COMPLETE WINS: one or two sections, one bullet each, a sub-bullet only when it carries a fact the reader will act on. Do not restate the question, do not narrate what you are about to do, do not summarise what you just did unless you were asked. A status answer is one line plus what changed. One message per turn. The owner reads Slack on a phone and must be able to act without digging, so reference material goes where it belongs and the message links it in one line: a channel's *canvas* for that project's living state (`cc-slack canvas '#<repo>' '<title>' < file.md` replaces it wholesale), the repo's `docs/` for lasting reports, the track journal (`~/.cc/state/<repo>/<track>/progress.md`) for running detail. Progress notes only at milestones, or when they change what the owner would do. PLAIN as well as short: no file paths, function names, SHAs, diff stats, test tallies or config keys unless they ask — say what happened, what it means and what they must decide; the depth lives in the terminal, the journal, docs/ or the canvas.
+Style: Slack mrkdwn (*bold*, `code`, ``` blocks); no # headings or **. BOLD THE ONE THING THAT MATTERS, OR CUT THE MESSAGE (owner, 2026-09-07: 'I ain't reading all that ... either use strategic bolding and stuff to show me the important stuff or just cut it out'): open with what happened or what they must decide, in *bold*, put nothing above it, and DELETE — never demote — a line that does not change what they do next. Being well-structured is not being read: four defensible paragraphs are four they skip, and length is never earned by how long the work took. THE SHORTEST ANSWER THAT IS COMPLETE WINS: one or two sections, one bullet each, a sub-bullet only when it carries a fact the reader will act on. Do not restate the question, do not narrate what you are about to do, do not summarise what you just did unless you were asked. A status answer is one line plus what changed. One message per turn. THE TOOL HOLDS THE LINE: `reply` hands back unsent, with the number, an opening bold over 120 chars or a text over 800 chars (links counted as their label) — rewrite it shorter rather than splitting it. The owner reads Slack on a phone and must be able to act without digging, so reference material goes where it belongs and the message links it in one line: a channel's *canvas* for that project's living state (`cc-slack canvas '#<repo>' '<title>' < file.md` replaces it wholesale), the repo's `docs/` for lasting reports, the track journal (`~/.cc/state/<repo>/<track>/progress.md`) for running detail. Progress notes only at milestones, or when they change what the owner would do. PLAIN as well as short: no file paths, function names, SHAs, diff stats, test tallies or config keys unless they ask — say what happened, what it means and what they must decide; the depth lives in the terminal, the journal, docs/ or the canvas.
 ONE SENTENCE PER IDEA is a HARD CAP in a main channel (#<repo>, a DM, #alerts): say each thing once, in one sentence, then stop. You may go past it only when the owner asks for more or a technical explanation genuinely needs it — not because the work was long, and never to show it. Length has its own home: every project channel has a sibling #<repo>-updates and that is where automated posts, progress and depth go (digests, milestones, audits, janitor lines), with the rest in the channel canvas, docs/ or the track journal.
 BOTH LANES ARE THIS SESSION and the tag says which one you are on — lane="main" (the owner's: questions, answers, decisions) or lane="updates". Answer in the lane you were asked on, always; never move a question to the other channel, and never repeat there what you already said here. A sub-orch or #<repo>--<track> channel is a detail lane already, so it is not split and the cap still applies to it.
 HOW LOUD (the ladder, owner 2026-09-01 — take the cheapest rung that does the job): @-mention the owner only for a decision that blocks a track, an approval-class action already waiting, or an incident touching money, access or anything outward — a mention that could have waited is a bug. A question that stalls one track and nothing else is `reply(needs_owner=true)`, which puts it on their NEEDS YOU list instead of buzzing their phone; one tap is an #approvals card; merely notable is #alerts; ambient is #<repo>-updates; anything that can wait for the 11:00 digest waits for it. Litmus (~/COMMS.md): needs a decision → mention · needs a tap → approvals · notable only → alerts · else updates or the digest.
@@ -8494,7 +8592,9 @@ TOOLS = [
                      "Writing @handle mentions that person for real (it notifies them, if they are in that channel — the bot cannot invite anyone); "
                      "the handle is what you saw in their message. @main/@alias still mean a hand-off to a session, not a person. "
                      "Set needs_owner ONLY when you have stopped and cannot go on until they answer — it puts the thread on their "
-                     "NEEDS YOU list, and nothing else does.",
+                     "NEEDS YOU list, and nothing else does. "
+                     "REFUSED UNSENT, with the number: an opening bold over 120 chars, or a text over 800 chars (links count as "
+                     "their label) — rewrite it shorter; the depth goes to the journal, docs/ or the canvas.",
      "inputSchema": {"type": "object", "properties": {
          "chat_id": {"type": "string", "description": "chat_id from the inbound <channel> tag"},
          "text": {"type": "string"},
@@ -8675,6 +8775,17 @@ class Channel:
                     if not r.get("ok"):
                         return f"not answered — {r.get('error')}; nothing was posted", True
                     return r.get("text") or "answered", False
+                # SHORT BY CONSTRUCTION. The Style paragraph above has said "bold the one thing or cut the message"
+                # since 09-07 and it did not hold: of 100 planning replies in the owner's channel over 09-09..12, the
+                # opening bold ran a median 90 chars (32 of them past 120), and the eight longest (830-1780 chars)
+                # were a bold paragraph over three to thirteen bullets (docs/2026-09-12-owner-messages.md, shape 2).
+                # So the tool measures what a reader would skip and hands it back unsent, with the number: one cheap
+                # turn to rewrite, instead of a message he does not read. Not for a member-facing session — a tutor's
+                # answer to a student is the content, not a note to the owner — and not for the box's own inject path.
+                if chat != "local" and not member_facing_here():
+                    why = reply_shape(a.get("text", ""))
+                    if why:
+                        return why, True
                 # WHAT THE MESSAGE WILL ACTUALLY DO, computed before it goes: an @handle that resolves to nobody is
                 # sent as code (never as a plain "@Name" that reads like a ping) and named back to this session in
                 # the tool result. Silence here is what let an escalation reach nobody with the sender none the wiser.
@@ -10188,6 +10299,18 @@ def cmd_selfcheck():
         check("channel tools: a --go worker (CC_ROLE=worker) is refused, nothing is posted (M7)",
               werr and "interactive sessions" in wtext)
         os.environ.pop("CC_ROLE", None)                    # the rest of the tool checks act as an interactive session
+        # SHORT BY CONSTRUCTION: the reply tool measures and refuses, nothing posted; within shape it posts as before.
+        n_posts0 = sum(1 for m, kw in acalls2 if m == "chat.postMessage")
+        longbold, errLB = ch.call("reply", {"chat_id": "C1", "text": "*" + "a bold paragraph that runs on " * 5 + "*\nthen a line"})
+        longbody, errLY = ch.call("reply", {"chat_id": "C1", "text": "*Done.*\n" + "• a bullet of history the reader will skip\n" * 22})
+        check("reply: an opening bold past 120 chars is handed back unsent with its length; so is a text past 800 chars",
+              errLB and "opening bold is 150 chars" in longbold and errLY and "chars: send the point and one link" in longbody
+              and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0)
+        okshort, errOK = ch.call("reply", {"chat_id": "C1", "text": "❓ *Decision:* two workers or one? <https://x.example/a-very-long-url-" + "z" * 700 + "|the plan>"})
+        check("…while a short reply — an emoji before the bold, a long URL behind a short label — posts as before",
+              not errOK and sum(1 for m, kw in acalls2 if m == "chat.postMessage") == n_posts0 + 1
+              and reply_shape("*Left: #430 landing now, one small row next, two guard rows behind #404, the email orch's two fixes, and the four you parked.*") is not None
+              and reply_shape("*Landed (#453).* One thing is yours: the mail allow-list.") is None)
         text, err = ch.call("history", {"chat_id": "C1", "n": 500})
         check("channel tool history: clamps like the CLI, formats compact lines", not err
               and [kw for m, kw in acalls2 if m == "conversations.history"][-1]["limit"] == "100" and "hi" in text)
@@ -10641,6 +10764,26 @@ def cmd_selfcheck():
           said7 == ["🤖 ai-dev@aliastest joined — @ai-dev hands it threads; @main brings the main session back.",
                     "🤖 ai-dev@aliastest left."]
           and "ai-dev" in dm7.known_aliases["aliastest"] and dm7.subs["aliastest"] == [])
+    # A DAEMON RESTART IS NOT A JOIN. The state is on disk: a fresh daemon whose alias is recorded `joined` (the
+    # old daemon died before any bye) says nothing on the re-hello; its bye says left; the join after that is news.
+    globals()["find_channel"] = lambda cfg, name: ("CALIAS", True)
+    try:
+        notice_state_save({notice_key("aliastest", "🤖 ai-dev@aliastest joined — x"): "joined"})
+        dm7b = Daemon(use_slack=False); dm7b.cfg = dm7.cfg; said7b = []; dm7b.say = lambda chat, text, thread=None, **kw: said7b.append(text)
+        a, b = socket.socketpair()
+        b.sendall((json.dumps({"hello": "aliastest", "alias": "ai-dev", "pid": 1}) + "\n").encode()); b.shutdown(socket.SHUT_WR)
+        dm7b.handle_conn(a); b.close()
+        dm7c = Daemon(use_slack=False); dm7c.cfg = dm7.cfg; said7c = []; dm7c.say = lambda chat, text, thread=None, **kw: said7c.append(text)
+        a, b = socket.socketpair()
+        b.sendall((json.dumps({"hello": "aliastest", "alias": "ai-dev", "pid": 1}) + "\n").encode()); b.shutdown(socket.SHUT_WR)
+        dm7c.handle_conn(a); b.close()
+    finally:
+        globals()["find_channel"] = real_fc
+    check("a re-hello after a daemon restart posts no second `joined` — only the left, and the join after a left is posted again",
+          said7b == ["🤖 ai-dev@aliastest left."]
+          and said7c == ["🤖 ai-dev@aliastest joined — @ai-dev hands it threads; @main brings the main session back.",
+                         "🤖 ai-dev@aliastest left."]
+          and notice_state_load().get(notice_key("aliastest", "🤖 ai-dev@aliastest left.")) == "left")
     # -- open-thread nudges (part 2) -----------------------------------------------------------
     now3 = time.time()
     roots8 = {"C1": [{"ts": "2000.1", "reply_count": 1, "text": "old red"}, {"ts": "2000.2", "reply_count": 1, "text": "fresh red"},
@@ -10959,6 +11102,21 @@ def cmd_selfcheck():
             dmQ.relay_permission("mem1", {"tool_name": "Bash", "description": "no id", "input_preview": "x",
                                           "request_id": "NOT-A-RID"})
             norid_said, norid_kept = saidQ[n_norid:], set(dmQ.perm_asks) == ids_norid
+            # A LONG TOOL INPUT IS FOLDED OFF THE CARD: the card shows PERM_CARD_PREVIEW chars of it and says so, the
+            # whole input is the next message in the card's own thread, and the ask still stamps the card's ts.
+            n_fold = len(saidQ)
+            dmQ.perm_posts.clear()
+            dmQ.relay_permission("mem1", {"tool_name": "Bash", "description": "a long one", "request_id": "fghjk",
+                                          "input_preview": "{ \"command\": \"" + "x" * 700 + "\" }"})
+            fold_said = saidQ[n_fold:]
+            fold_ok = (len(fold_said) == 2 and "x" * 300 not in fold_said[0][1] and "…" in fold_said[0][1]
+                       and "the whole command is the next message in this thread" in fold_said[0][1]
+                       and fold_said[0][1].rstrip().endswith("Reply `yes fghjk` or `no fghjk`")
+                       and "x" * 700 in fold_said[1][1]
+                       and fold_said[1][2] == (fold_said[0][2] or f"ts{n_fold + 1}"))   # the card's own thread, or the one it sits in
+            fold_card = (dmQ.perm_asks.get("fghjk") or {}).get("thread") == (fold_said[0][2] or f"ts{n_fold + 1}")
+            dmQ.relay_permission("mem1", {"tool_name": "Bash", "description": "a short one", "request_id": "ghjkl", "input_preview": "ls"})
+            short_said = saidQ[n_fold + 2:]
             # A SESSION WRITES THAT LINE AS FAST AS IT LIKES, and 201 of them posted 201 messages into the lane AND
             # rolled the table over — every entry shed was a session still waiting, and the id it freed was the next
             # asker's to claim, straight through the theft guard above. (The table is cleared first so the count is
@@ -11018,6 +11176,9 @@ def cmd_selfcheck():
         finally:
             globals()["DEV"], globals()["load_routes"], globals()["find_channel"] = _devQ, _routesQ, _fcQ
             subprocess.run(["rm", "-rf", devQ])
+            check("a 🔐 card folds a long tool input: the card shows its head and says where the rest is, the whole input is the "
+                  "next message in the card's thread, the ask stamps the card — and a short input stays on the card, one message",
+                  fold_ok and fold_card and len(short_said) == 1 and "```\nls\n```" in short_said[0][1])
         check("relay_permission: a MEMBER workspace's 🔐 prompt is posted in the control repo's #<repo>-threads lane "
               "— found through routes.json, which is where this box says which channel is which — and NOT in her own "
               "channel, where she may not answer it and the owner has to happen to look. It still names the target "
