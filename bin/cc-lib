@@ -4,8 +4,9 @@
 WHY. Of fifteen recorded misses (docs/design-knowledge-library-2026-09-11.md, evidence/misses.md), twelve had
 the record on disk and the session answered from memory or a proxy. So this is a step, not a store: one tool call
 that reads the record, bounded in bytes and time, and leaves a ticket saying what it read. It never calls a
-model, runs no daemon, opens no port, and moves nothing: the index is a rebuildable cache under
-~/.cc/library/owner/ over files left where they are. Owner side only — nothing here changes what a member reads.
+model, runs no daemon, opens no port, and moves nothing: the index is a rebuildable cache under ~/.cc/library/ over
+files left where they are. SCOPED BY WORKSPACE (below): an owner session reads the union, a member session inside its
+boundary reads one file, its own workspace's, and can reach no other.
 
   cc-lib ask [--object <id>] [--need current|decision|history|aggregate] [--repo <r>] [--cap <bytes>] [<query>...]
         One question, one ticket (--need defaults to history). --object names the thing (a PR `#390` or `r1#390`, a board row or track
@@ -42,7 +43,33 @@ model, runs no daemon, opens no port, and moves nothing: the index is a rebuilda
         in ~/.cc/library/owner/misses.log (<ts> <path> <reason>) and exit 1, which every `ask` then reports as
         `hook-misses N` in COVERAGE until a full `cc-lib index` has reconciled everything and cleared the log.
   cc-lib bench [--n <N>]      FTS and exact-id latency (p50/p95/max) on this index; RSS.
-  cc-lib selfcheck            fixtures of its own under a HOME of its own (check.sh runs it).
+  cc-lib selfcheck            fixtures of its own under a HOME of its own (check.sh runs it), the workspace cases launched
+                              through the real cc-sandbox beside this file (bwrap; CC_LIB_SELFCHECK_BIN=<dir> runs them
+                              against another copy of the launcher, which is how the red run against a baseline is made).
+
+WORKSPACES (docs/design-knowledge-library-2026-09-11.md §4). ~/.cc/library is the PROTECTED PARENT: the host alone writes
+under it and no bind of a member's boundary reaches it. owner/index.sqlite is the AGGREGATE — every record, each source
+stamped with its workspace (sources.ws; a citation ends `ws=<handle>` or `ws=owner`) — and is never mounted anywhere.
+ws/<id>/index.sqlite is ONE WORKSPACE'S records and only those, built by `index` (and by `--touch` when a source of that
+workspace moved) on a copy beside it and RENAMED over the file, so a reader holds a whole file or the next whole file;
+cc-sandbox binds that directory read-only into the member's boundary at ~/.cc/library/workspace — the directory, not
+the inode, so the replacement is seen; nothing else of the library is there. <id> is the workspace's IMMUTABLE ID:
+~/.cc/members/<h>/workspace-id, 16 hex, minted once by the host (here or by the launcher, link-atomically) and never
+rewritten — a rename of the handle moves the file along, and a session launched before the rename keeps reading its
+own directory. registry.json (id → handle) is a cache for a person to read.
+  Scope is decided by WHERE a source is, never by what it says: a member workspace's board (~/.cc/boards/<h>.json), its
+  journals and briefs (~/.cc/state/<h>/**) and its docs (~/dev/<h>: the handle names the project, the board's own `path`
+  is ignored for a member — the member writes that board) carry its id. Everything else is the owner's and never enters
+  a workspace's file: the box's own repos, the home guides, memory, every landing record and the queue (host-produced,
+  mixed or unknown ownership → owner-only). An id that is a link, missing, or not 16 hex is REFUSED: no file is built,
+  `index` names the workspace, the launch binds nothing. A link anywhere under the protected parent is not followed: the
+  host refuses to write through it and the launch of that workspace refuses to start.
+  INSIDE A MEMBER'S BOUNDARY (the bind is there, or CC_MEMBER_SANDBOX=1): `ask` and `get` read that one file, read-only
+  and immutable for the life of the connection, re-read no source and say `scope workspace <h>` and `host-indexed`;
+  `index` and `--touch` write nothing and exit 0 (the host indexes the workspace: its sweep and the write hooks, which
+  the boundary's own cc-checkpoint already skips); tickets go to the session's tmpfs and end with it. A member-facing
+  session WITHOUT the boundary (.cc/member-facing, no bwrap) is unchanged by this: it reads what the host reads, and
+  closing that is the boundary project's (docs/design-member-git-boundary-2026-09-06.md), not the library's.
 
 SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), indexed in place at record grain:
   journals    ~/.cc/state/<repo>/<track>/progress.md, <repo>/<alias>-handoff.md | -handover.md — one record per
@@ -60,7 +87,7 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
   Exact ids (#pr, repo#pr, SHAs, board row names, channel ids) live in a column of their own, so tokenisation
   cannot split them; text is FTS5 (unicode61, detail=full, BM25).
 
-TICKET. One line per call in ~/.cc/library/owner/tickets.log:
+TICKET. One line per call in ~/.cc/library/owner/tickets.log (a member's: its session's tmpfs, gone with it):
   <ts> <ticket> <turn> <cmd> <scope> <need> <object> <bytes> <ms> <outcome>   — scope, bytes returned (newline
   included), tool turns, time and outcome; the object, or q:<hash> for a query-only ask — never the query text.
   That log is the telemetry every later phase reads.
@@ -111,8 +138,31 @@ DATE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:[T ~]*(\d{2}):?(\d{2})?(?:[:.]?\d{0,2}
 HEAD = re.compile(r"^(#{1,3}) (.+?)\s*$")
 
 
+WSID = re.compile(r"^[0-9a-f]{16}$")
+WS = {}   # handle -> immutable workspace id, set by registry(); '' everywhere else means the owner's
+
+
+def libroot():
+    """~/.cc/library — the PROTECTED PARENT: the host alone writes under it, and no bind of a member's boundary reaches
+    it. Under it: owner/ (the aggregate, every record, never mounted anywhere), ws/<id>/ (one workspace's records and
+    only those — the one directory cc-sandbox binds into that workspace's boundary) and registry.json (id → handle)."""
+    return os.path.join(H, ".cc", "library")
+
+
+def member_dir():
+    """Where a member session finds its workspace's file: the ONE directory of the library the launcher binds into the
+    boundary, read-only, at this fixed name — the directory, not the file, so a replacement the host renames in is seen."""
+    return os.path.join(libroot(), "workspace")
+
+
+def member_mode():
+    """Inside a member's boundary: the launcher's bind is there, or the launcher's cleared environment says so. Either
+    way this process reads that one file and writes nothing; it never builds an index of whatever it can see."""
+    return os.path.isdir(member_dir()) or os.environ.get("CC_MEMBER_SANDBOX") == "1"
+
+
 def libdir():
-    return os.path.join(H, ".cc", "library", "owner")
+    return member_dir() if member_mode() else os.path.join(libroot(), "owner")
 
 
 def dbpath():
@@ -120,7 +170,62 @@ def dbpath():
 
 
 def ticketlog():
+    if member_mode():   # the bound directory is read-only; a member's tickets live in its session's tmpfs and end with it
+        return os.path.join(libroot(), "tickets.log")
     return os.path.join(libdir(), "tickets.log")
+
+
+def ws_id(handle, mint=False):
+    """A member workspace's IMMUTABLE ID: ~/.cc/members/<handle>/workspace-id, a host-side file under no bind of the
+    boundary (owner-workspace and github-token sit beside it for the same reason). Minted once — here or by
+    cc-sandbox at launch, the same way: written beside, then link(2)ed into place, so two minters at once still
+    agree on the one that landed — and never rewritten: a rename of the handle moves the file along and the id
+    stays, which is what keeps a session launched before the rename on its own workspace's directory. A link, a
+    missing file or anything but 16 hex is NOT an id (None): that workspace gets no file and is named refused."""
+    f = os.path.join(H, ".cc", "members", handle, "workspace-id")
+    if mint and not os.path.lexists(f):
+        tmp = f + f".mint.{os.getpid()}"
+        try:
+            os.makedirs(os.path.dirname(f), mode=0o700, exist_ok=True)
+            with open(tmp, "w") as fh:
+                fh.write(os.urandom(8).hex() + "\n")
+            os.link(tmp, f)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    try:
+        if os.path.islink(f) or not os.path.isfile(f):
+            return None
+        with open(f) as fh:
+            v = fh.read(64).strip()
+    except OSError:
+        return None
+    return v if WSID.match(v) else None
+
+
+def workspaces():
+    """handle -> id for every member workspace the host knows: a board of its own and the marker cc-sandbox launches
+    on (<workspace>/.cc/member-workspace). A session can strike only ITSELF off (the marker is in its own tree, and
+    without it its next launch is refused too); nothing it writes puts another handle here or moves a record across."""
+    out = {}
+    for repo in boards():
+        if os.path.isfile(os.path.join(H, "dev", repo, ".cc", "member-workspace")):
+            out[repo] = ws_id(repo, mint=True)   # None = refused, kept so index() can name it
+    return out
+
+
+def ws_of(skind, repo):
+    """The workspace a source belongs to, by WHERE it is and nothing it says: a member's board, journals, briefs and
+    docs — the trees its boundary binds read-write — carry its id. Everything else is the owner's ('' here) and is
+    never written into a workspace's file: the box's own repos, the home guides, memory, and every landing record
+    and the queue, which the host produced and a member never held (unknown or mixed ownership is owner-only)."""
+    if skind in ("board", "journal", "doc") and WS.get(repo):
+        return WS[repo]
+    return ""
 
 
 def misseslog():
@@ -211,8 +316,12 @@ def registry():
         seen.add(p)
         srcs.append((p, skind, repo, track))
 
+    global WS
     B = boards()
+    WS = {h: i for h, i in workspaces().items() if i}
     for repo, (bp, proj) in B.items():
+        if repo in WS:   # a member's board is the member's to write: its `path` names nothing here — the workspace IS ~/dev/<h>
+            proj = os.path.join(H, "dev", repo)
         add(bp, "board", repo)
         st = os.path.join(H, ".cc", "state", repo)
         for p in sorted(glob.glob(os.path.join(st, "*", "progress.md"))):
@@ -434,7 +543,7 @@ def parse(path, skind, repo, track, rows):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY, path TEXT UNIQUE, skind TEXT, repo TEXT, track TEXT,
   size INTEGER, mtime INTEGER, indexed_at TEXT, nrec INTEGER DEFAULT 0, nbytes INTEGER DEFAULT 0, refused INTEGER DEFAULT 0,
-  status TEXT DEFAULT 'ok');
+  status TEXT DEFAULT 'ok', ws TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, source_id INTEGER, rid TEXT UNIQUE, kind TEXT, repo TEXT,
   track TEXT, ts TEXT, title TEXT, span TEXT, part INTEGER, pos INTEGER, prev TEXT, next TEXT, thash TEXT, text TEXT);
 CREATE INDEX IF NOT EXISTS records_src ON records(source_id);
@@ -464,15 +573,19 @@ def fts5_available():
         return False
 
 
-SCHEMA_V = "3"
+SCHEMA_V = "4"
 
 
-def db():
-    """The index is a cache: one whose schema is not this version is dropped and rebuilt, never migrated."""
-    os.makedirs(libdir(), exist_ok=True)
+def db(path=None, wal=True):
+    """The index is a cache: one whose schema is not this version is dropped and rebuilt, never migrated. Inside a
+    member's boundary the file is the host's: read-only, and immutable for the life of the connection (db_ro)."""
+    if path is None and member_mode():
+        return db_ro(dbpath())
+    path = path or dbpath()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     for _ in range(2):
-        c = sqlite3.connect(dbpath(), timeout=5)
-        c.execute("PRAGMA journal_mode=WAL")
+        c = sqlite3.connect(path, timeout=5)
+        c.execute("PRAGMA journal_mode=" + ("WAL" if wal else "DELETE"))
         c.execute("PRAGMA synchronous=NORMAL")
         c.executescript(SCHEMA)
         v = c.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
@@ -485,10 +598,123 @@ def db():
         c.close()
         for suf in ("", "-wal", "-shm"):
             try:
-                os.remove(dbpath() + suf)
+                os.remove(path + suf)
             except OSError:
                 pass
     raise RuntimeError("cc-lib: could not create the index")
+
+
+def db_ro(path):
+    """A member's connection: the workspace's file as the host left it, read-only and IMMUTABLE — no lock is taken and
+    no -wal or -shm is looked for or made, which a read-only bind could not take anyway; the host never writes the
+    file in place (build_ws renames a new one in), so the inode this opens does not change under it. No file, or
+    one of a schema this copy does not know, is an EMPTY scope (nothing in it yet), never a rebuild of anything."""
+    c = None
+    if os.path.isfile(path):
+        try:
+            c = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+            v = c.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+            if not v or v[0] != SCHEMA_V:
+                c.close()
+                c = None
+        except sqlite3.Error:
+            c = None
+    if c is None:
+        c = sqlite3.connect(":memory:")
+        c.executescript(SCHEMA)
+    return c
+
+
+def real_dirs(d):
+    """Every component of d from the protected parent down is a REAL directory — made here (0700) if absent, refused
+    (OSError) if a link or anything else sits at its name — so nothing below is ever written through a link that
+    was planted where only the host writes. The name check is followed by the write in the same process with no
+    session of another workspace able to reach this tree; the boundary, not this check, is what keeps them out."""
+    import stat
+    root = libroot()
+    if not d.startswith(root + "/") and d != root:
+        raise OSError(f"{d} is outside {root}")
+    cur = root
+    for part in [""] + d[len(root):].strip("/").split("/"):
+        cur = os.path.join(cur, part) if part else cur
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            os.mkdir(cur, 0o700)
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            raise OSError(f"{tilde(cur)} is a symlink — not followed, nothing written")
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"{tilde(cur)} is not a directory")
+        if cur == root and stat.S_IMODE(st.st_mode) != 0o700:
+            os.chmod(cur, 0o700)   # the parent is the host's alone; P0 made it with the umask
+
+
+def build_ws(wid, handle, reg):
+    """ONE WORKSPACE'S FILE, ~/.cc/library/ws/<id>/index.sqlite: its scope of the registry (ws_of) and nothing else,
+    brought up to date on a COPY beside it and renamed over the file only when something moved. A member session
+    that holds the old file open keeps reading a whole, unchanging file; its next call opens the new one, through
+    the DIRECTORY its launcher bound (a file bind would pin the old inode: the board learnt that on 2026-09-04).
+    Rollback-journal mode, nothing beside it, so the read-only side needs no lock and no journal of its own.
+    Refused, and named, rather than written through a link anywhere under the protected parent."""
+    import shutil
+    d = os.path.join(libroot(), "ws", wid)
+    final = os.path.join(d, "index.sqlite")
+    try:
+        real_dirs(d)
+        if os.path.islink(final) or (os.path.lexists(final) and not os.path.isfile(final)):
+            raise OSError(f"{tilde(final)} is a link, not written through")
+        tmp = os.path.join(d, f".index.{os.getpid()}.tmp")
+        had = os.path.isfile(final)
+        if had:
+            shutil.copyfile(final, tmp)
+        c = db(tmp, wal=False)
+        prev = dict(c.execute("SELECT k, v FROM meta"))
+        cov = reconcile(c, reg=reg)
+        if cov["indexed"] or cov["removed"] or not had or prev.get("workspace") != handle or prev.get("workspace_id") != wid:
+            c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('workspace', ?)", (handle,))
+            c.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('workspace_id', ?)", (wid,))
+            c.commit()
+            c.close()
+            os.chmod(tmp, 0o600)
+            os.rename(tmp, final)   # atomic: a reader sees the old whole file or the new whole file, never a half
+            changed = True
+        else:
+            c.close()
+            os.remove(tmp)
+            changed = False
+        n = 0
+        rc = sqlite3.connect(f"file:{final}?mode=ro&immutable=1", uri=True)
+        n = rc.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        rc.close()
+        return dict(id=wid, handle=handle, file=final, records=n, changed=changed, refused="")
+    except (OSError, sqlite3.Error) as e:
+        return dict(id=wid, handle=handle, file=final, records=0, changed=False, refused=str(e))
+
+
+def build_all_ws(reg, only=None):
+    """Every member workspace's file (or those in `only`), then registry.json — id → handle, a host-side cache a person
+    reads to see which directory under ws/ is whose. A workspace whose id is refused (ws_id) is named and gets no file."""
+    out = []
+    for handle, wid in sorted(workspaces().items()):
+        if only is not None and wid not in only:
+            continue
+        if not wid:
+            out.append(dict(id="", handle=handle, file="", records=0, changed=False,
+                            refused=f"~/.cc/members/{handle}/workspace-id is not an id (a regular file holding 16 hex) — no file built"))
+            continue
+        out.append(build_ws(wid, handle, [s for s in reg if ws_of(s[1], s[2]) == wid]))
+    if only is None:
+        try:
+            real_dirs(libroot())
+            regp = os.path.join(libroot(), "registry.json")
+            with open(regp + f".{os.getpid()}", "w") as f:
+                json.dump({w["id"]: dict(handle=w["handle"], dev=f"~/dev/{w['handle']}", file=tilde(w["file"]), records=w["records"],
+                                         refused=w["refused"]) for w in out if w["id"]}, f, indent=1)
+            os.rename(regp + f".{os.getpid()}", regp)
+        except OSError:
+            pass
+    return out
 
 
 def rec_ids(r, rrepo, rows):
@@ -512,15 +738,15 @@ def index_source(c, path, skind, repo, track, rows):
     try:
         recs = parse(path, skind, repo, track, rows)
     except (OSError, ValueError, UnicodeError) as e:
-        c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status) VALUES (?,?,?,?,?,?,?,?) "
+        c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, ws) VALUES (?,?,?,?,?,?,?,?,?) "
                   "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
-                  "status=excluded.status", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso(), f"unreadable: {e}"))
+                  "status=excluded.status, ws=excluded.ws", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso(), f"unreadable: {e}", ws_of(skind, repo)))
         c.commit()
         return 0
     c.execute("BEGIN")
-    c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, refused) VALUES (?,?,?,?,?,?,?,'ok',0) "
+    c.execute("INSERT INTO sources(path, skind, repo, track, size, mtime, indexed_at, status, refused, ws) VALUES (?,?,?,?,?,?,?,'ok',0,?) "
               "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, indexed_at=excluded.indexed_at, "
-              "status='ok', refused=0", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso()))
+              "status='ok', refused=0, ws=excluded.ws", (path, skind, repo, track, st.st_size, st.st_mtime_ns, now_iso(), ws_of(skind, repo)))
     source_id = c.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()[0]
     old = {}   # key -> (id, rid, ts, title, span, pos, prev, next, text)
     for row in c.execute("SELECT id, rid, ts, title, span, pos, prev, next, thash, text FROM records WHERE source_id=?", (source_id,)):
@@ -665,7 +891,7 @@ def search(c, query, repo, need, object_ids, limit=40):
         if not expr:
             break
         sql = ("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, "
-               "s.path, bm25(fts, 3.0, 1.0) AS score FROM fts JOIN records r ON r.id = fts.rowid JOIN sources s ON s.id = r.source_id "
+               "s.path, bm25(fts, 3.0, 1.0) AS score, s.ws FROM fts JOIN records r ON r.id = fts.rowid JOIN sources s ON s.id = r.source_id "
                "WHERE fts MATCH ?" + (" AND r.repo = ?" if repo else "") + " ORDER BY score LIMIT ?")
         args = [expr] + ([repo] if repo else []) + [limit]
         with_deadline(c, FTS_DEADLINE)
@@ -708,7 +934,7 @@ def collapse(hits):
 def by_ids(c, ids, repo=None, skind=None, kind=None, span_like=None, limit=HITS, order="ts DESC, part ASC"):
     if not ids:
         return []
-    q = ("SELECT DISTINCT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+    q = ("SELECT DISTINCT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0, s.ws "
          "FROM rids i JOIN records r ON r.id = i.record_id JOIN sources s ON s.id = r.source_id WHERE i.id IN (%s)"
          % ",".join("?" * len(ids)))
     args = list(ids)
@@ -731,7 +957,7 @@ def by_ids(c, ids, repo=None, skind=None, kind=None, span_like=None, limit=HITS,
 
 def newest_entry(c, path):
     """The newest dated entry of a journal: the first span of the record with the highest position in the file."""
-    r = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+    r = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0, s.ws "
                   "FROM records r JOIN sources s ON s.id = r.source_id WHERE s.path=? AND r.part=0 "
                   "ORDER BY r.pos DESC LIMIT 1", (path,)).fetchone()
     return r
@@ -791,15 +1017,22 @@ def ticket_used(T):
 
 
 def ticket_write(T, turn, cmd, scope, need, obj, nbytes, ms, outcome):
-    os.makedirs(libdir(), exist_ok=True)
-    with open(ticketlog(), "a") as f:
+    try:
+        os.makedirs(os.path.dirname(ticketlog()), exist_ok=True)
+        f = open(ticketlog(), "a")
+    except OSError:
+        if member_mode():   # the receipt is the line printed; a tmpfs that will not take it is not the member's problem
+            return
+        raise
+    with f:
         f.write("\t".join([now_iso(), T, str(turn), cmd, scope or "all", need or "-", (obj or "-").replace("\t", " ")[:80],
                            str(nbytes), str(int(ms)), outcome]) + "\n")
 
 
 # ── the packet ───────────────────────────────────────────────────────────────────────────────────────────────
 def cite(h):
-    return f"    ↳ {h[1]} {tilde(h[12])}[{h[7]}] {h[5] or '-'}"
+    ws = f"ws={h[3]}" if len(h) > 14 and h[14] else "ws=owner"   # every record names its workspace (the handle), or the owner's
+    return f"    ↳ {h[1]} {tilde(h[12])}[{h[7]}] {h[5] or '-'} {ws}"
 
 
 def render_hit(h, budget, T, label=None, also=()):
@@ -865,18 +1098,29 @@ def ask(argv):
     t0 = time.monotonic()
     c = db()
     o = parse_object(obj, repo)
-    reg = registry()   # once: the glob over every repo's docs is the slow half of a no-change reconcile
-    prefer = []
-    if o and o[0] == "path":
-        prefer.append(o[2])
-    if o and o[0] in ("row", "pr"):
-        prefer += [p for p, sk, *_ in reg if sk in ("board", "land-root", "land-job", "land-queue")]
-        if o[0] == "row":
-            for r in ([o[1]] if o[1] else boards()):
-                jp, _ = resolve_journal(r, o[2])
-                if jp:
-                    prefer.append(jp)
-    cov = reconcile(c, deadline=RECONCILE_BUDGET, prefer=prefer, reg=reg)
+    member = member_mode()
+    if member:
+        # A MEMBER READS THE HOST'S FILE OF ITS WORKSPACE AND RE-READS NOTHING: the sources are what the host indexed
+        # (its sweep and write hooks), the scope is the workspace its launcher bound, and this process has no registry
+        # of its own to walk — what it can see is not the question, what the host indexed for it is.
+        reg, prefer = [], []
+        cov = dict(indexed=0, pending=[], unreadable=[], excluded=[], removed=0, refused=0)
+        regpaths = set(r[0] for r in c.execute("SELECT path FROM sources"))
+        wsname = dict(c.execute("SELECT k, v FROM meta")).get("workspace") or "?"
+    else:
+        reg = registry()   # once: the glob over every repo's docs is the slow half of a no-change reconcile
+        regpaths = set(p for p, *_ in reg)
+        prefer = []
+        if o and o[0] == "path":
+            prefer.append(o[2])
+        if o and o[0] in ("row", "pr"):
+            prefer += [p for p, sk, *_ in reg if sk in ("board", "land-root", "land-job", "land-queue")]
+            if o[0] == "row":
+                for r in ([o[1]] if o[1] else boards()):
+                    jp, _ = resolve_journal(r, o[2])
+                    if jp:
+                        prefer.append(jp)
+        cov = reconcile(c, deadline=RECONCILE_BUDGET, prefer=prefer, reg=reg)
     sections = []      # (label, [hits]) in route order
     object_ids = set()
     notes = []
@@ -914,12 +1158,12 @@ def ask(argv):
             if not rows:
                 notes.append(f"  board row: none named {key}" + (f" in {orepo}" if orepo else f" (boards: {', '.join(sorted(boards())) or 'none'})"))
         elif kind == "path":
-            rs = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+            rs = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0, s.ws "
                            "FROM records r JOIN sources s ON s.id=r.source_id WHERE s.path=? AND r.part=0 ORDER BY r.pos DESC "
                            "LIMIT ?", (key, HITS)).fetchall()
             sections.append((f"records of {tilde(key)}, newest first", rs))
             if not rs:
-                notes.append(f"  {tilde(key)}: " + ("not a registered source" if key not in set(p for p, *_ in reg)
+                notes.append(f"  {tilde(key)}: " + ("not a registered source" if key not in regpaths
                                                     else "registered, no records" + (" (pending)" if key in cov["pending"] else "")))
         else:
             object_ids = {key}
@@ -931,7 +1175,7 @@ def ask(argv):
     shown_rids = set()
     routed = 0
     body = []
-    header = (f"cc-lib ask {T} · now {now_iso()} · scope {repo or 'all'} · need {need}"
+    header = (f"cc-lib ask {T} · now {now_iso()} · scope {('workspace ' + wsname) if member else (repo or 'all')} · need {need}"
               + (f" · object {obj}" if obj else "") + f" · cap {cap}")
     # fixed tail first, so the records get exactly what is left
     wm = c.execute("SELECT MAX(indexed_at), COUNT(*) FROM sources WHERE status='ok'").fetchone()
@@ -942,6 +1186,7 @@ def ask(argv):
                + f" · excluded {len(cov['excluded'])} · refused {cov['refused']}"
                + (f" · hook-misses {hm}" if hm else "")
                + (f" · re-read {cov['indexed']}" if cov["indexed"] else "")   # sources this ask had to bring in itself: the hooks' misses, measured
+               + ((" · host-indexed, this workspace only" + ("" if os.path.isfile(dbpath()) else " · NO FILE BOUND YET (the host has not indexed this workspace)")) if member else "")
                + (f" · search {phase}-phase" if phase else (" · search: no hit" if query else ""))
                + (" · DEADLINE HIT (partial)" if deadline_hit else ""))
     tail = [covline] + ([CURRENT_CAVEAT] if need == "current" else [])
@@ -1061,7 +1306,7 @@ def get(argv):
     else:
         T, turns = "-", 0
     c = db()
-    h = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0 "
+    h = c.execute("SELECT r.id, r.rid, r.kind, r.repo, r.track, r.ts, r.title, r.span, r.text, r.thash, r.prev, r.next, s.path, 0, s.ws "
                   "FROM records r JOIN sources s ON s.id=r.source_id WHERE r.rid=?", (rid,)).fetchone()
     if not h:
         ticket_write(T, turns + 1, "get", None, None, rid, 0, (time.monotonic() - t0) * 1000, "not-recorded")
@@ -1134,11 +1379,23 @@ def touch(paths):
             miss(src[0], str(e))
             rc = 1
     c.close()
-    print(f"cc-lib index --touch: {len(todo)} source(s) re-read, {nrec} record(s) held" + (" · misses logged" if rc else ""))
+    wsn = 0
+    ids = set(ws_of(sk, r) for _, sk, r, _ in todo) - {""}
+    for w in (build_all_ws(reg, only=ids) if ids else []):   # a member's board or journal moved: its file follows, now
+        if w["refused"]:
+            miss(w["file"], w["refused"])
+            rc = 1
+        wsn += 1 if w["changed"] else 0
+    print(f"cc-lib index --touch: {len(todo)} source(s) re-read, {nrec} record(s) held" + (f" · {wsn} workspace file(s) rebuilt" if wsn else "")
+          + (" · misses logged" if rc else ""))
     return rc
 
 
 def index(argv):
+    if member_mode():   # the file is the host's and read-only here; the hooks that call this discard its exit code
+        print("cc-lib index: inside a member's boundary the library is the host's file of this workspace, read-only — "
+              "the host indexes it (its sweep and write hooks); nothing is written from in here")
+        return 0
     if "--touch" in argv:
         return touch(argv[argv.index("--touch") + 1:])
     rebuild, as_json = "--rebuild" in argv, "--json" in argv
@@ -1150,7 +1407,9 @@ def index(argv):
             except OSError:
                 pass
     c = db()
-    cov = reconcile(c)
+    reg = registry()
+    cov = reconcile(c, reg=reg)
+    wss = build_all_ws(reg)   # then each member workspace's own file, from the same registry, its scope only
     hm = misses()
     if hm and not cov["pending"]:   # every source is current now, so the hooks' misses are repaired
         try:
@@ -1166,7 +1425,8 @@ def index(argv):
               index_to_source=round(ib / n[2], 3) if n[2] else None, index_to_text=round(ib / n[1], 3) if n[1] else None,
               seconds=round(time.monotonic() - t0, 2), peak_rss_mib=round(rss_mib(), 1), indexed_now=cov["indexed"],
               removed=cov["removed"], unreadable=cov["unreadable"], excluded=[tilde(p) for p in cov["excluded"]],
-              refused=cov["refused"], rebuild=rebuild, hook_misses=hm, misses_cleared=bool(hm and not cov["pending"]))
+              refused=cov["refused"], rebuild=rebuild, hook_misses=hm, misses_cleared=bool(hm and not cov["pending"]),
+              workspaces=[dict(w, file=tilde(w["file"])) for w in wss])
     if as_json:
         print(json.dumps(st, indent=1))
     else:
@@ -1177,6 +1437,12 @@ def index(argv):
               + (f" · hook-misses {hm}" + (" cleared" if st["misses_cleared"] else " (pending sources, kept)") if hm else ""))
         for u in st["unreadable"]:
             print("  unreadable: " + u)
+        print(f"  workspaces {len(wss)}: " + (", ".join(f"{w['handle']}={w['records']}" + (" (rebuilt)" if w["changed"] else "")
+                                                       for w in wss if not w["refused"]) or "none")
+              + (f" · refused {sum(1 for w in wss if w['refused'])}" if any(w["refused"] for w in wss) else ""))
+        for w in wss:
+            if w["refused"]:
+                print(f"  refused: {w['handle']}: {w['refused']}")
     return 0
 
 
@@ -1535,11 +1801,244 @@ def selfcheck():
         rc, o = run("index")
         ok("control: the log is cleared only by a pass that reached every source; an unreadable one is not pending, so this one clears too "
            "(unreadable is named in coverage on its own)", "hook-misses 1 cleared" in o and not os.path.exists(ml))
+        os.remove(os.path.join(th, ".cc", "boards", "r3.json"))
+        selfcheck_workspaces(th, ok, run, w)
     finally:
         H = H0
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-lib selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
+
+
+def selfcheck_workspaces(th, ok, run, w):
+    """WORKSPACE SCOPING (P2), each case built the way production launches a member: two member workspaces and the
+    box's own repo under the fixture HOME, the REAL cc-sandbox beside this file launching bwrap with HOME=<fixture>,
+    and inside it the cc-lib the launcher binds as ~/bin — this one. The acceptance test is confidentiality: what a
+    member's shell, SQL and grep can reach in there, not what its `ask` chooses to show."""
+    import shutil
+    import subprocess
+    import stat
+    binroot = os.environ.get("CC_LIB_SELFCHECK_BIN") or os.path.dirname(os.path.realpath(__file__))
+    K = "K" + os.urandom(4).hex()   # the secret's shape, minted per run: this file is bound as ~/bin inside, so no literal of it may match
+    sandbox = os.path.join(binroot, "cc-sandbox")
+    env = {k: v for k, v in os.environ.items() if k not in ("CC_MEMBER_SANDBOX", "CC_ROLE")}
+    env["HOME"] = th
+
+    def member(h, script, **kw):
+        """A member session of <h>, the production way: bwrap, cleared environment, cc-lib from ~/bin."""
+        return subprocess.run([sandbox, "member", h, "--", "sh", "-c", script], env=env, capture_output=True, text=True, timeout=60, **kw)
+
+    def mk(h):
+        os.makedirs(os.path.join(th, "dev", h, ".cc"), exist_ok=True)
+        os.makedirs(os.path.join(th, ".cc", "members", h), exist_ok=True)
+        w(f"dev/{h}/.cc/member-workspace", "")
+        w(f"dev/{h}/.cc/member-facing", "")
+        subprocess.run(["git", "-C", os.path.join(th, "dev", h), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", os.path.join(th, "dev", h), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"], check=True)
+        w(f".cc/members/{h}/credentials.json", json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "expiresAt": 99999999999999}}))
+        os.chmod(os.path.join(th, ".cc", "members", h, "credentials.json"), 0o600)
+        w(f".cc/boards/{h}.json", json.dumps({"repo": h, "path": os.path.join(th, "dev", h), "tracks": {
+            "t1": {"title": f"{h} row", "kind": "track", "status": "running", "notes": [{"ts": "2026-09-11T00:00:00Z", "msg": f"{K}-{h}-note"}]}}, "log": []}))
+        w(f".cc/state/{h}/t1/progress.md", f"## 2026-09-11T01:00Z first\n{K}-{h}-journal line.\n")
+        w(f"dev/{h}/docs/d.md", f"# doc\n\n## sec\n{K}-{h}-doc.\n")
+    for h in ("wsa", "wsb"):
+        mk(h)
+    w("dev/r1/docs/owner-only.md", f"# owner\n\n## sec\n{K}-own-doc.\n")
+    w(".local/bin/claude", "")
+    os.chmod(os.path.join(th, ".local", "bin", "claude"), 0o755)
+    w(".claude.json", "{}")
+    w(".claude/settings.json", "{}")
+    probe = ("echo LIB=$(ls -A ~/.cc/library | tr '\\n' ' '); echo WSDIR=$(ls -A ~/.cc/library/workspace | tr '\\n' ' '); "
+             f"echo GREP=$(grep -rl '{K}-wsb\\|{K}-own' \"$HOME\" /tmp 2>/dev/null | wc -l); "
+             "echo OWNER=$(python3 -c \"import sqlite3; sqlite3.connect('file://$HOME/.cc/library/owner/index.sqlite?mode=ro', uri=True).execute('select 1')\" 2>&1 | grep -c 'unable to open'); "
+             "echo SQL=$(python3 -c \"import sqlite3, os\n"
+             "fs = [os.path.join(d, f) for d, _, fs in os.walk(os.environ['HOME']) for f in fs if f.endswith('.sqlite')]\n"
+             "leak = mine = 0\n"
+             "for f in fs:\n"
+             "    c = sqlite3.connect('file:' + f + '?mode=ro&immutable=1', uri=True)\n"
+             f"    leak += c.execute(\\\"select count(*) from records where text like '%{K}-wsb%' or text like '%{K}-own%'\\\").fetchone()[0]\n"
+             f"    mine += c.execute(\\\"select count(*) from records where text like '%{K}-wsa%'\\\").fetchone()[0]\n"
+             "print(len(fs), leak, mine)\"); "
+             "echo WRITE=$(touch ~/.cc/library/workspace/x 2>&1 | grep -c 'Read-only'); "
+             "echo INDEX=$(cc-lib index --touch ~/.cc/state >/dev/null 2>&1; echo $?); "
+             f"cc-lib ask --need history {K}")
+    # ── the host indexes: one file per workspace under the protected parent, the owner's aggregate names each record's workspace ──
+    rc, o = run("index")
+    ida, idb = ws_id("wsa"), ws_id("wsb")
+    ok("the host's index mints an immutable id per member workspace (~/.cc/members/<h>/workspace-id, 16 hex) and builds one file per "
+       "workspace under ~/.cc/library/ws/<id>/, naming each: `workspaces 2: wsa=… wsb=…`",
+       rc == 0 and bool(ida) and bool(idb) and ida != idb and "workspaces 2: wsa=" in o and "wsb=" in o
+       and os.path.isfile(os.path.join(th, ".cc", "library", "ws", ida, "index.sqlite")) and os.path.isfile(os.path.join(th, ".cc", "library", "ws", idb, "index.sqlite")))
+    ok("the protected parent and every workspace directory are the host's alone (0700), and the registry names id → handle",
+       stat.S_IMODE(os.stat(os.path.join(th, ".cc", "library", "ws")).st_mode) == 0o700
+       and json.load(open(os.path.join(th, ".cc", "library", "registry.json")))[ida]["handle"] == "wsa")
+    rc, o = run("ask", "--need", "history", K)
+    ok("the owner's ask returns the UNION, each record's workspace named on its citation: ws=wsa, ws=wsb and ws=owner in one packet",
+       f"{K}-wsa-journal" in o and f"{K}-wsb-journal" in o and f"{K}-own-doc" in o
+       and " ws=wsa" in o and " ws=wsb" in o and " ws=owner" in o)
+    wsa_file = os.path.join(th, ".cc", "library", "ws", ida, "index.sqlite")
+    cw = sqlite3.connect(f"file:{wsa_file}?mode=ro&immutable=1", uri=True)
+    n_leak = cw.execute(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-wsb%' OR text LIKE '%{K}-own%'").fetchone()[0]
+    n_mine = cw.execute(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-wsa%'").fetchone()[0]
+    meta = dict(cw.execute("SELECT k, v FROM meta"))
+    cw.close()
+    ok("a workspace's file holds its own board note, journal entry and doc (3) and NOT ONE record of another workspace or of the owner's, "
+       "and names the workspace it is", n_mine == 3 and n_leak == 0 and meta.get("workspace") == "wsa" and meta.get("workspace_id") == ida)
+    ok("…and it is left in rollback-journal mode with nothing beside it (the read-only side needs no -wal or -shm)",
+       not glob.glob(wsa_file + "-*") and not glob.glob(os.path.join(os.path.dirname(wsa_file), ".index.*")))
+    # ── inside a member's boundary, the production launch: shell, SQL and grep reach one file, its own ──
+    r = member("wsa", probe)
+    g = lambda k: re.search(rf"^{k}=(.*)$", r.stdout, re.M).group(1).strip() if re.search(rf"^{k}=(.*)$", r.stdout, re.M) else "?"
+    ok("a member session launches with ~/.cc/library holding `workspace` alone (the directory bound, ro) and in it one index.sqlite",
+       r.returncode == 0 and g("LIB") == "workspace" and g("WSDIR") == "index.sqlite")
+    ok("inside, a raw grep over the whole HOME and /tmp finds no byte of another workspace's records or the owner's (0 files)", g("GREP") == "0")
+    ok("inside, the owner aggregate's path does not open (absent, not filtered), and SQL over every .sqlite in reach reads 1 file, "
+       "0 records of another workspace or the owner's, 3 of its own", g("OWNER") == "1" and g("SQL") == "1 0 3")
+    ok("inside, the file cannot be written (read-only bind) and `cc-lib index --touch` writes nothing and exits 0 (the hooks discard it)",
+       g("WRITE") == "1" and g("INDEX") == "0")
+    ok("inside, `cc-lib ask` is scoped `workspace wsa`, says the scope is host-indexed, finds its own three records and no other workspace's, "
+       "each citation naming ws=wsa", "scope workspace wsa" in r.stdout and "host-indexed, this workspace only" in r.stdout
+       and f"{K}-wsa-journal" in r.stdout and f"{K}-wsa-note" in r.stdout and f"{K}-wsa-doc" in r.stdout
+       and f"{K}-wsb" not in r.stdout and f"{K}-own" not in r.stdout and " ws=wsa" in r.stdout and " ws=wsb" not in r.stdout)
+    # ── a forged scope at write time is refused: nothing a session writes moves a record across workspaces ──
+    bj = os.path.join(th, ".cc", "boards", "wsa.json")   # a link into the member's board dir since the launch above; the member writes it
+    b = json.load(open(bj))
+    b["path"] = os.path.join(th, "dev", "r1")            # the board claims the box's own repo as its project
+    b["repo"] = "wsb"                                     # …and another handle as its name
+    with open(bj, "w") as f:
+        json.dump(b, f)
+    w("dev/wsa/.cc/workspace-id", idb + "\n")            # …and plants another workspace's id in the tree it owns
+    w(".cc/state/wsa/t1/progress.md", f"## 2026-09-11T01:00Z first\n{K}-wsa-journal line.\n\n## 2026-09-11T02:00Z forged\n{K}-wsa-forged line.\n")
+    rc, o = run("index")
+    cw = sqlite3.connect(f"file:{wsa_file}?mode=ro&immutable=1", uri=True)
+    n_own = cw.execute(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-own%'").fetchone()[0]
+    n_forged = cw.execute(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-wsa-forged%'").fetchone()[0]
+    cw.close()
+    cb_ = sqlite3.connect(f"file:{os.path.join(th, '.cc', 'library', 'ws', idb, 'index.sqlite')}?mode=ro&immutable=1", uri=True)
+    n_cross = cb_.execute(f"SELECT COUNT(*) FROM records WHERE text LIKE '%{K}-wsa%'").fetchone()[0]
+    cb_.close()
+    ok("a member's board claiming the box's repo as its `path` and another handle as its `repo`, and an id planted in its own tree: "
+       "the scope comes from WHERE (the launch's handle, ~/dev/<h>), so its file still gets its own new record (1), no owner doc (0), "
+       "and the other workspace's file gets nothing of it (0)", rc == 0 and n_forged == 1 and n_own == 0 and n_cross == 0 and ws_id("wsa") == ida)
+    b["path"], b["repo"] = os.path.join(th, "dev", "wsa"), "wsa"
+    with open(bj, "w") as f:
+        json.dump(b, f)
+    os.remove(os.path.join(th, "dev", "wsa", ".cc", "workspace-id"))
+    mk("wsc")
+    idf = os.path.join(th, ".cc", "members", "wsc", "workspace-id")
+    os.symlink(os.path.join(th, ".cc", "members", "wsa", "workspace-id"), idf)
+    rc, o = run("index")
+    r = member("wsc", "echo LIB=$(ls -A ~/.cc/library 2>/dev/null | tr '\\n' ' ')x")
+    ok("a workspace-id that is a link (to another workspace's) is refused at write time — no file built, `refused` names it — "
+       "and its launch binds no library at all rather than the wrong one", ws_id("wsc") is None and "refused: wsc:" in o
+       and not os.path.isdir(os.path.join(th, ".cc", "library", "ws", ida, "wsc")) and r.returncode == 0 and "LIB=x" in r.stdout
+       and "is not a workspace id" in r.stderr)
+    os.remove(idf)
+    w(".cc/members/wsc/workspace-id", "../owner\n")
+    rc, o = run("index")
+    ok("…and so is one holding anything but 16 hex (`../owner`): refused, nothing written under that name",
+       ws_id("wsc") is None and "refused: wsc:" in o and not os.path.lexists(os.path.join(th, ".cc", "library", "owner", "index.sqlite.tmp"))
+       and sorted(os.listdir(os.path.join(th, ".cc", "library", "ws"))) == sorted([ida, idb]))
+    shutil.rmtree(os.path.join(th, "dev", "wsc"))
+    shutil.rmtree(os.path.join(th, ".cc", "members", "wsc"))
+    os.remove(os.path.join(th, ".cc", "boards", "wsc.json"))
+    # ── a symlink planted in the protected parent is not followed: not by the host's write, not by the launch ──
+    own_db = os.path.join(th, ".cc", "library", "owner", "index.sqlite")
+
+    def own_meta():   # the aggregate is still the aggregate: a workspace build would have stamped it `workspace`
+        return dict(sqlite3.connect(f"file:{own_db}?mode=ro", uri=True).execute("SELECT k, v FROM meta"))
+    before = os.stat(own_db)
+    wsb_dir = os.path.join(th, ".cc", "library", "ws", idb)
+    shutil.rmtree(wsb_dir)
+    os.symlink(os.path.join(th, ".cc", "library", "owner"), wsb_dir)
+    w(".cc/state/wsb/t1/progress.md", f"## 2026-09-11T01:00Z first\n{K}-wsb-journal line.\n\n## 2026-09-11T03:00Z more\n{K}-wsb-more.\n")
+    rc, o = run("index")
+    after = os.stat(own_db)
+    r = member("wsb", "echo STARTED")
+    ok("ws/<id> replaced by a link to the owner's directory: the host's index refuses that workspace (`refused: wsb: … symlink`), writes "
+       "nothing through it (the owner aggregate's inode, size and mtime are untouched; no .tmp beside it), and the launch of that "
+       "workspace REFUSES (exit 2, nothing bound, nothing started)",
+       "refused: wsb:" in o and "symlink" in o and before.st_ino == after.st_ino and "workspace" not in own_meta()
+       and not glob.glob(os.path.join(th, ".cc", "library", "owner", ".index.*")) and r.returncode == 2 and "STARTED" not in r.stdout
+       and "nothing was bound" in r.stderr.lower())
+    os.remove(wsb_dir)
+    os.mkdir(wsb_dir, 0o700)
+    os.symlink(own_db, os.path.join(wsb_dir, "index.sqlite"))
+    rc, o = run("index")
+    ok("…and a link at ws/<id>/index.sqlite itself: refused too, the owner aggregate still untouched",
+       "refused: wsb:" in o and "link" in o and os.path.islink(os.path.join(wsb_dir, "index.sqlite"))
+       and before.st_ino == os.stat(own_db).st_ino and "workspace" not in own_meta())
+    os.remove(os.path.join(wsb_dir, "index.sqlite"))
+    rc, o = run("index")
+    ok("control: the real directory back, the workspace's file is rebuilt and holds its new entry", "refused:" not in o
+       and f"{K}-wsb-more" in sqlite3.connect(f"file:{wsb_dir}/index.sqlite?mode=ro&immutable=1", uri=True)
+       .execute("SELECT group_concat(text) FROM records").fetchone()[0])
+    # ── a RUNNING member: sees an atomic replacement of its file, and stays on its own workspace across a rename ──
+    st_dir = os.path.join(th, ".cc", "state", "wsa")
+    for f in ("out1", "out2", "out3", "go1", "go2"):
+        try:
+            os.remove(os.path.join(st_dir, f))
+        except OSError:
+            pass
+    script = (f"S=~/.cc/state/wsa; cc-lib ask --need history {K} > $S/out1 2>&1; "
+              f"while [ ! -f $S/go1 ]; do sleep 0.1; done; cc-lib ask --need history {K} > $S/out2 2>&1; "
+              f"while [ ! -f $S/go2 ]; do sleep 0.1; done; cc-lib ask --need history {K} > $S/out3 2>&1; echo scope=$(ls -A ~/.cc/library/workspace)")
+    proc = subprocess.Popen([sandbox, "member", "wsa", "--", "sh", "-c", script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def wait_for(path, secs=15):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < secs:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return True
+            time.sleep(0.1)
+        return False
+    got1 = wait_for(os.path.join(st_dir, "out1"))
+    ino0 = os.stat(wsa_file).st_ino
+    with open(os.path.join(st_dir, "t1", "progress.md"), "a") as f:
+        f.write(f"\n## 2026-09-11T04:00Z replaced\n{K}-wsa-replaced line.\n")
+    rc, o = run("index", "--touch", os.path.join(st_dir, "t1", "progress.md"))   # the hook's form, as cc-checkpoint calls it
+    ino1 = os.stat(wsa_file).st_ino
+    w(".cc/state/wsa/go1", "go")
+    got2 = wait_for(os.path.join(st_dir, "out2"))
+    out1 = open(os.path.join(st_dir, "out1")).read() if got1 else ""
+    out2 = open(os.path.join(st_dir, "out2")).read() if got2 else ""
+    ok("a write hook on the member's journal (`index --touch <file>`) rebuilds its workspace file BY RENAME (a new inode, `1 workspace file(s) "
+       "rebuilt`), and the session already running sees the new entry on its next ask and not before — the directory is bound, not the inode",
+       got1 and got2 and rc == 0 and "1 workspace file(s) rebuilt" in o and ino1 != ino0
+       and f"{K}-wsa-replaced" not in out1 and f"{K}-wsa-replaced" in out2 and f"{K}-wsb" not in out2)
+    # the rename: ~/dev/wsa → ~/dev/wsz, its host-side member dir, state and board with it; the id file moves along, the id stays
+    os.rename(os.path.join(th, "dev", "wsa"), os.path.join(th, "dev", "wsz"))
+    os.rename(os.path.join(th, ".cc", "members", "wsa"), os.path.join(th, ".cc", "members", "wsz"))
+    os.rename(st_dir, os.path.join(th, ".cc", "state", "wsz"))
+    bsrc = os.path.join(th, ".cc", "members", "wsz", "board")
+    os.rename(os.path.join(bsrc, "wsa.json"), os.path.join(bsrc, "wsz.json"))
+    b = json.load(open(os.path.join(bsrc, "wsz.json")))
+    b["repo"], b["path"] = "wsz", os.path.join(th, "dev", "wsz")
+    with open(os.path.join(bsrc, "wsz.json"), "w") as f:
+        json.dump(b, f)
+    for f in ("wsa.json", "wsa.lock"):
+        try:
+            os.remove(os.path.join(th, ".cc", "boards", f))
+        except OSError:
+            pass
+    os.symlink(os.path.join(bsrc, "wsz.json"), os.path.join(th, ".cc", "boards", "wsz.json"))
+    rc, o = run("index")
+    w(".cc/state/wsz/go2", "go")
+    try:
+        so, se = proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        so, se = proc.communicate()
+    out3p = os.path.join(th, ".cc", "state", "wsz", "out3")
+    out3 = open(out3p).read() if os.path.exists(out3p) else ""
+    ok("the handle renamed under a RUNNING session (wsa → wsz: dev, member dir, state, board): the host re-indexes under the new name into the "
+       "SAME directory (the id moved with the member dir), and the session launched before the rename still reads its own workspace — "
+       "`scope workspace wsz`, its records under their new paths, nothing of another workspace's",
+       proc.returncode == 0 and ws_id("wsz") == ida and "workspaces 2: wsb=" in o and "wsz=" in o and "scope workspace wsz" in out3
+       and f"{K}-wsa-journal" in out3 and "~/.cc/state/wsz/t1/progress.md" in out3 and " ws=wsz" in out3 and f"{K}-wsb" not in out3
+       and "scope=index.sqlite" in so)
+    rc, o = run("ask", "--need", "history", f"{K}-wsa-journal")
+    ok("…and the owner's aggregate now names it ws=wsz, with no record left under the old handle", " ws=wsz" in o and " ws=wsa" not in o)
 
 
 def lines_with(T, outcome):

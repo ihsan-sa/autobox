@@ -35,7 +35,10 @@
 #     and ~/.cc/state/<handle> rw (every track of the workspace, no other repo's) · the workspace's board, in a DIRECTORY of its
 #     own (~/.cc/members/<handle>/board/, seen AS ~/.cc/boards; ~/.cc/boards/<handle>.json is a link into it — board_dir says why)
 #     · ~/.cc/slack/member/<handle>/ seen AS ~/.cc/slack: the daemon's member-scoped socket, an `enabled` flag and the attachment cache —
-#     the bot token, the owner-level socket and every other channel stay outside · a private ~/.claude, ~/.npm and ~/.cache under
+#     the bot token, the owner-level socket and every other channel stay outside · ~/.cc/library/ws/<id>/ seen AS ~/.cc/library/workspace,
+#     RO: the knowledge library's file of this workspace and nothing else of it — not the owner's aggregate, not another
+#     workspace's; the directory, so the host's rename-in replacement is seen; <id> the immutable id the host minted at
+#     ~/.cc/members/<handle>/workspace-id (lib_bind; `cc-lib --help`, WORKSPACES) · a private ~/.claude, ~/.npm and ~/.cache under
 #     ~/.cc/members/<handle>/ — ~/.claude is the WHOLE config dir (~/.cc/members/<handle>/claude), one dir for every session of the
 #     handle, because claude's cross-process refresh lock is made INSIDE it (~/.claude/.oauth_refresh.lock) and a lock made in a
 #     per-session tmpfs serialises nothing (launch_member says what that cost) · the control plane's core/bin bound ro AS ~/bin, so
@@ -588,6 +591,33 @@ pin(){   # $1 --bind|--ro-bind · $2 the host object · [$3 where it is seen ins
   [ "$(readlink "/proc/self/fd/$fd" 2>/dev/null)" = "$p" ] || { exec {fd}<&-; return 1; }
   B+=("${flag}-fd" "$fd" "$tgt"); return 0; }
 pinq(){ pin "$@" || { echo "cc-sandbox: $2 is not the path it should be — a link, a rename, or a swap by another live session. Nothing was bound and nothing started; put the real path back." >&2; exit 2; }; }
+ws_id(){   # $1 handle → the workspace's IMMUTABLE ID on stdout, or 1: ~/.cc/members/<h>/workspace-id, a host-side file under no
+  # bind of the boundary (owner-workspace and github-token sit beside it for the same reason). Minted ONCE, here or by cc-lib
+  # index, the same way — written beside, then link(2)ed into place, so two minters at once still agree on the one that
+  # landed — and never rewritten: a rename of the handle moves the file along and the id stays, which is what keeps a session
+  # launched before the rename on its own workspace's directory (lib_bind). A link, or anything but 16 hex, is not an id.
+  local m="$H/.cc/members/$1" f="$H/.cc/members/$1/workspace-id" t id
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    t=$(mktemp "$m/.wsid.XXXXXX" 2>/dev/null) && head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$t" && ln "$t" "$f" 2>/dev/null; rm -f "$t"
+  fi
+  [ -L "$f" ] && return 1; [ -f "$f" ] || return 1
+  id=$(head -c 17 "$f" 2>/dev/null | tr -d '\n'); [[ "$id" =~ ^[0-9a-f]{16}$ ]] || return 1
+  printf '%s' "$id"; }
+lib_bind(){   # $1 handle — THE KNOWLEDGE LIBRARY, THIS WORKSPACE'S FILE OF IT AND NOTHING ELSE OF IT (cc-lib; docs/design-knowledge-
+  # library-2026-09-11.md §4). The host indexes every workspace's records into a file of its own under the protected parent,
+  # ~/.cc/library/ws/<id>/ — a parent no bind here reaches, beside the owner's aggregate (~/.cc/library/owner, the union, never
+  # mounted into any member) — and this binds THAT DIRECTORY, read-only, at ~/.cc/library/workspace: the directory and not
+  # the file, because the host replaces the file by rename and a file bind would pin the old inode (what the board taught on
+  # 2026-09-04). So a member's shell, SQL and grep inside can open one index, its own; a workspace it was never told about is
+  # absent, not filtered. The id, not the handle, names the directory: a session launched before a rename keeps its mount and
+  # the host keeps writing there. Pinned like every other source (pinq): a link planted at ws/<id> — where only the host
+  # writes, so something is wrong if there is one — refuses the launch rather than mount whatever it points at.
+  local id d
+  id=$(ws_id "$1") || { echo "cc-sandbox: ~/.cc/members/$1/workspace-id is not a workspace id (a regular file holding 16 hex) — no library is bound; remove it and the next launch mints one" >&2; return 0; }
+  d="$H/.cc/library/ws/$id"
+  [ -L "$H/.cc/library" ] || [ -L "$H/.cc/library/ws" ] || [ -L "$d" ] && { echo "cc-sandbox: a symlink sits under ~/.cc/library, where only the host writes — nothing was bound and nothing started; put the real directory back." >&2; exit 2; }
+  mkdir -p "$d" 2>/dev/null; chmod 700 "$H/.cc/library" 2>/dev/null
+  pinq --ro-bind "$d" "$H/.cc/library/workspace"; }
 gh_bind(){   # $1 handle — A WORKSPACE GRANTED A GITHUB TOKEN HOLDS IT INSIDE (docs/github-app.md, "A granted workspace holds
   # the token itself"). THE GRANT IS HOST-SIDE: ~/.cc/members/<h>/github-token, a link to the token file (`cc-sandbox github
   # <h>`), in the one directory of the workspace's that no bind reaches, so a session inside can neither make it nor remove
@@ -721,6 +751,7 @@ build_member(){   # $1 handle · $2 track ("" = the workspace root) → B; a mem
   # workspace's .cc/ is rw in here, which is why the marker is NOT beside .cc/member-workspace.
   own=""; [ -f "$m/owner-workspace" ] && own=owner
   settings_bind "$H/.cc/sandbox/$h/${tr:-_workspace}" "$own"
+  lib_bind "$h"   # the knowledge library: this workspace's own index file, ro, and none of the rest of it (lib_bind)
   gh_bind "$h"   # …and a workspace GRANTED a GitHub token holds it inside (gh_bind); the grant is in $m too, and no marker
   [ -d "$H/.local/share/claude" ] && B+=(--ro-bind "$H/.local/share/claude" "$H/.local/share/claude")
   [ -d /run/systemd/resolve ] && B+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
@@ -1003,7 +1034,7 @@ github(){   # $1 handle [$2 token file] — a member workspace is GRANTED a GitH
   echo "cc-sandbox: ~/dev/$r holds $f from its next launch (~/.cc/members/$r/github-token) — git push, gh and the API answer with it, on the repositories that token is scoped to. Reopen any session that is running. rm the link to take it back."; }
 selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo: inside, the other repo, the config, the ledger and the
                       # control repo's path do not exist; the workspace, its track, its board and its Slack dir do; git and cc-board work
-  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree mailrec
+  local h="_ccsbxm$$" o="_ccsbxo$$" dev out ctl c rc mcpw own mine miner kf cb real0 real1 lockdir s1 i pl tmp tree mailrec wid
   cb=$(dirname "$SELF")   # the host side of every board case below: THIS tree's cc-board, which resolves a linked board before it renames
   dev="$H/dev/$h"; mkdir -p "$dev/.cc" "$H/dev/$o" "$H/.cc/state/$o" "$H/.cc/state/$h" || return 1
   : > "$dev/.cc/member-workspace"; : > "$dev/.cc/member-facing"; echo x > "$H/dev/$o/secret"; echo '{}' > "$H/.cc/boards/$o.json"
@@ -1061,8 +1092,8 @@ selfcheck_member(){   # a scratch member workspace next to a scratch OTHER repo:
     echo pid1=$(ls /proc | grep -c "^[0-9]" | awk "{print (\$1 < 20) ? \"few\" : \"many\"}"); echo tmp=$(touch /tmp/x && echo ok)' 2>&1)
   mcpw="cc-slack,"; [ -f "$H/.cc/slack/enabled" ] || mcpw=","
   t 'member: another repo is ABSENT' "$(g other)" absent;  t 'member: the control repo path is ABSENT' "$(g ctl)" absent
-  ccw="boards slack state worktrees"; [ -f "$H/.cc/github-deny" ] && ccw="boards github-deny$([ -f "$H/.cc/github-deny.gitconfig" ] && echo ' github-deny.gitconfig') slack state worktrees"   # the org deny list and its include ride along, ro, when the host has them
-  t 'member: ~/dev holds the workspace alone' "$(g devls)" "$h";  t 'member: ~/.cc holds boards, slack, state, worktrees (and the org deny list when the host has one) and nothing else' "$(g ccls)" "$ccw"
+  ccw="boards library slack state worktrees"; [ -f "$H/.cc/github-deny" ] && ccw="boards github-deny$([ -f "$H/.cc/github-deny.gitconfig" ] && echo ' github-deny.gitconfig') library slack state worktrees"   # the org deny list and its include ride along, ro, when the host has them
+  t 'member: ~/dev holds the workspace alone' "$(g devls)" "$h";  t 'member: ~/.cc holds boards, library, slack, state, worktrees (and the org deny list when the host has one) and nothing else' "$(g ccls)" "$ccw"
   t 'member: ~/.cc/config absent' "$(g ccconfig)" absent
   # The app key is org admin: it pushes AND creates repositories. A workspace is member-facing, so whoever is
   # in its channel would hold anything it holds — the key stays outside, and this proves it on its own fixture.
@@ -1272,6 +1303,7 @@ PY
     "$(g other)/$(g ssh)/$(g ledger)/$(g inside)" absent/absent/absent/1/member
   rm -f "$own" "$kf"
   git -C "$dev" worktree remove --force "$H/.cc/worktrees/$h/t" >/dev/null 2>&1
+  wid=$(ws_id "$h" 2>/dev/null) && [ -n "$wid" ] && rm -rf "$H/.cc/library/ws/$wid"   # the library file the launches above had the host mint
   rm -rf "${dev:?}" "${H:?}/dev/${o:?}" "$H/.cc/worktrees/$h" "$H/.cc/state/$h" "$H/.cc/state/$o" "$H/.cc/boards/$h.json" "$H/.cc/boards/$h.lock" "$H/.cc/boards/$o.json" \
          "$H/.cc/members/$h" "$H/.cc/slack/member/$h" "$H/.cc/sandbox/$h"; }
 selfcheck_member_whitelist(){   # THE ~/.claude.json COPY IS A PRIVACY BOUNDARY, and the first-run flags in it are MINTED, not carried.
