@@ -6467,11 +6467,29 @@ class Daemon:
             log(f"reaction: {chat} {ts}: {e!r}"); return None, root
         return next((m for m in msgs if m.get("ts") == ts), None), root
 
+    def plain_ack(self, chat, root, msg, name):
+        """WHICH REACTIONS WAKE A SESSION: a 👍 on one of our own messages wakes one only when that message ASKED for a
+        decision — a 🔐 permission prompt, a `STATUS: BLOCKED` line, a `reply(needs_owner=true)` declaration or a
+        "[repo] PR #n:" card — while a 👍 on an ordinary reply (and taking it off, and putting it back) is an
+        acknowledgement that settles the thread and reaches nobody; every other reaction keeps the path it had (👎/❌/✅
+        delivered as a verdict, 🏁 closes the thread, 📌 marks it to revisit, 👀 and our own marks are bookkeeping).
+
+        Raised 2026-09-11: the owner 👍'd the planning seat's reply, took it off and put it back inside a minute, and
+        each of the three arrived as its own kind=reaction message — three full context reads of a thread that was
+        already answered. The owed side is untouched: answered_by_them reads the 👍 off the message itself, so the
+        thread still turns 🟠 and stops nudging whether or not a session ever hears about it."""
+        if name not in ("+1", "thumbsup"):
+            return False
+        text = (msg.get("text") or "").strip()
+        return not (asks_owner(text) or PR_RE.match(text) or self.declared(chat, {"ts": root}, msg))
+
     def deliver_reaction(self, chat, ts, name, removed, who=None):
         """Someone in the channel reacting to one of OUR messages is an answer: hand it to that session as a message
         (meta kind=reaction) so a 👍 counts as the confirmation it looks like. The meta carries WHO — their display name
         and role=owner|member — so the session can weigh a colleague's verdict against the owner's. LIVE sessions only —
-        a reaction is never worth starting one, and a queued 👍 that arrives an hour late would confirm the wrong thing."""
+        a reaction is never worth starting one, and a queued 👍 that arrives an hour late would confirm the wrong thing.
+        A plain ack is dropped here rather than in on_reaction, because only the message itself says whether it asked
+        anything — and the bookkeeping a 👍 performs (arm → answered_by_them → 🟠) has already run by then."""
         target = self.route(chat, "im" if chat.startswith("D") else None)
         with self.lock:
             live = bool(target and self.subs.get(target))
@@ -6480,6 +6498,9 @@ class Daemon:
         msg, root = self.reacted_message(chat, ts)
         if not msg or not self.is_ours(msg):
             return None                                    # a reaction on a human's message (theirs or anyone's) tells a session nothing
+        if self.plain_ack(chat, root, msg, name):
+            log(f"reaction: 👍 {'off' if removed else 'on'} {chat}/{ts} is an ack — settled, no session woken")
+            return None
         alias = self.thread_owner.get((chat, root), self.chan_alias(chat))
         with self.lock:
             if not any((c.info.get("alias") or None) == alias for c in self.subs.get(target, [])):
@@ -13046,6 +13067,8 @@ def cmd_selfcheck():
     dmRx.user_name = lambda u: {"UOWNER": "The Owner", "UMEMBER": "Ada Byron"}.get(u, u)
     rx, rx_calls = [], []
     dmRx.deliver = lambda target, payload, **k: rx.append((target, payload, k)) or "delivered"
+    dmRx.marks = {f"C1:9400.1:{ASKED}": 9400.2}    # the session posted 9400.2 with needs_owner=true: it ASKED, so a 👍 on
+                                                   # it is a decision and not the ack the block below drops (plain_ack)
     rx_msgs = {"9400.2": {"ts": "9400.2", "thread_ts": "9400.1", "bot_id": "BBOT", "text": "pushed the branch, all green"},
                "9400.3": {"ts": "9400.3", "thread_ts": "9400.1", "user": "UOWNER", "text": "the owner's own message"},
                "9400.1": {"ts": "9400.1", "user": "UOWNER", "text": "root"}}
@@ -13086,6 +13109,61 @@ def cmd_selfcheck():
           "one on a human's own message, a 🏁 and anything in #approvals are never delivered — V3", len(rx) == 3)
     check("reactions to the session: with no session live nothing is delivered and nothing is even read — a reaction "
           "never starts a session — V3", dead_rx == ([], []))
+
+    # ---- AN ACK IS NOT A TURN (raised 2026-09-11): the owner 👍'd the planning seat's reply in the repo channel, took it off and
+    #      put it back inside a minute, and each of the three came through as its own kind=reaction message — three full
+    #      context reads of a thread that was already answered. A 👍 wakes a session only where the message it sits on
+    #      ASKED for a decision; everything else about reactions is unchanged.
+    dmAk = Daemon(use_slack=False); dmAk.cfg = {"SLACK_BOT_TOKEN": "xoxb-test", "SLACK_OWNER_ID": "UOWNER"}
+    dmAk.bot_user = "UBOT"; dmAk.bot_id = "BBOT"
+    dmAk.route = lambda chat, ctype=None: "r"; dmAk.chan_name = lambda c: "repo"
+    dmAk.user_name = lambda u: "The Owner"
+    dmAk.subs["r"] = [Conn(None, "r", {"alias": None})]
+    ak, ak_appr = [], []
+    dmAk.deliver = lambda target, payload, **k: ak.append(payload) or "delivered"
+    ak_msgs = {"8100.1": {"ts": "8100.1", "user": "UOWNER", "text": "how did it go?"},
+               "8100.2": {"ts": "8100.2", "thread_ts": "8100.1", "bot_id": "BBOT", "text": "landed it, all green"},
+               "8100.3": {"ts": "8100.3", "thread_ts": "8100.1", "bot_id": "BBOT",
+                          "text": "🔐 deploy the mail door? reply `yes a1b2c`"},
+               "8100.4": {"ts": "8100.4", "thread_ts": "8100.1", "bot_id": "BBOT", "text": "[demo] PR #446: a thing"}}
+    ak_ev = lambda ts="8100.2", **k: {"type": "reaction_added", "reaction": "+1", "user": "UOWNER",
+                                      "item": {"type": "message", "channel": "C1", "ts": ts}, **k}
+    ak_api = lambda method, token, **kw: {"messages": [ak_msgs[kw["ts"]]]} if kw.get("ts") in ak_msgs else {"messages": []}
+    try:
+        globals()["api"] = ak_api
+        dmAk.pairs["C1"] = {"8100.1": ("❓", None)}     # this chat HAS a thread waiting: the arm branch is live
+        dmAk.on_reaction(ak_ev())                                       # 👍 on our plain reply
+        ak_plain, ak_armed = list(ak), dmAk.alarms.get("C1")
+        dmAk.on_reaction(ak_ev(type="reaction_removed"))                # …taken off…
+        dmAk.on_reaction(ak_ev())                                       # …and put back: one toggle, still no turn
+        ak_toggle = list(ak)
+        dmAk.on_reaction(ak_ev(ts="8100.3"))                            # 👍 on a 🔐 prompt: that one IS the decision
+        dmAk.on_reaction(ak_ev(ts="8100.4"))                            # 👍 on a PR card: land it
+        dmAk.on_reaction(ak_ev(reaction="-1"))                          # 👎 on the plain reply: a verdict, not an ack
+        ak_woke = [p["content"] for p in ak]
+        dmAk.on_reaction(ak_ev(reaction=REVISIT_NAME, ts="8100.1"))     # 📌: its own path, a bookmark, never a delivery
+        ak_pin = (len(ak), list(dmAk.revisit))
+        dmAk.chan_name = lambda c: APPROVALS
+        dmAk.on_approval = lambda chat, ts, reaction, who=None: ak_appr.append((ts, reaction)) or None
+        dmAk.on_reaction(ak_ev(ts="8100.2"))                            # the same plain 👍 in #approvals: still a landing
+    finally:
+        globals()["api"] = real_api
+    check("an ack is not a turn: the owner's 👍 on a reply of ours that asked nothing wakes NO session — and the toggle "
+          "that cost three wake-ups (off, then on again) wakes none either",
+          ak_plain == [] and ak_toggle == [])
+    check("an ack still does the owed bookkeeping it always did: the chat is armed for the next tick, and the 👍 on our "
+          "reply reads as the answer it is — the thread turns 🟠, handled, and is never asked about again",
+          ak_armed is not None and dmAk.answered_by_them({"reactions": [{"name": "+1", "users": ["UOWNER"]}]})
+          and dmAk.base_mark({"ts": "8100.2", "bot_id": "BBOT", "text": "landed it, all green",
+                              "reactions": [{"name": "+1", "users": ["UOWNER"]}]}, time.time()) == "🟠")
+    check("a 👍 on a message that ASKED — a 🔐 prompt, a PR card — is a decision and still reaches the session, and so "
+          "does a 👎 on the plain reply: only the plain yes is dropped",
+          len(ak_woke) == 3 and "deploy the mail door" in ak_woke[0] and "PR #446" in ak_woke[1]
+          and ak_woke[2].startswith("👎 on your "))
+    check("the other reactions keep their own paths: a 📌 still marks the thread to revisit without delivering, and a "
+          "👍 in #approvals is still handed to on_approval — the ack rule never sees either",
+          ak_pin == (3, ["C1:8100.1"]) and ak_appr == [("8100.2", "+1")] and len(ak) == 3)
+    dmAk.revisit.clear(); save_revisit(dmAk.revisit)    # the 📌 above is this block's fixture, not the next one's
     with tempfile.TemporaryDirectory(prefix="_selfcheck_flags_") as tdf:
         real_dirf = DIR
         try:
