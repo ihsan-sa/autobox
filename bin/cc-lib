@@ -81,6 +81,11 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
   board       rows (kind event, span rows/<name>), notes (kind note), log items (kind event)
   landing     ~/.cc/state/land/root/<repo>-<pr>.json (the review tally, kind finding), land/<repo>-<pr>.json (the
               job, kind event), land/queue.log (one event per line)
+  failures    ~/.cc/failures/<scope>.jsonl (cc-failures' ledger: one record per line, kind finding, the cluster as its
+              span; a correction is a note on the record it names), failures/claims.jsonl (one event per claim),
+              failures/reports/<claim>.md (the investigation's report, a doc). The ledger stays the only writer; the
+              library keeps no count of its own. `ask --object c-…|f-…|i-…` finds the records naming a cluster, a
+              record or a claim id.
   Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
   is a .md (a memory file is named after its rule); a file over 4 MiB.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
@@ -348,6 +353,14 @@ def registry():
     for p in sorted(glob.glob(os.path.join(land, "*.json"))):
         add(p, "land-job", os.path.basename(p)[:-5].rsplit("-", 1)[0])
     add(os.path.join(land, "queue.log"), "land-queue")
+    fl = os.path.join(H, ".cc", "failures")
+    for p in sorted(glob.glob(os.path.join(fl, "*.jsonl"))):
+        b = os.path.basename(p)[:-6]
+        if b.startswith("_"):   # a fixture scope (a selfcheck's _cctest…), as a _-board is skipped above
+            continue
+        add(p, "failures", "" if b == "claims" else b)
+    for p in sorted(glob.glob(os.path.join(fl, "reports", "*.md"))):
+        add(p, "doc")
     return srcs
 
 
@@ -522,6 +535,56 @@ def parse_queue(path, text):
     return recs
 
 
+FAIL_ID = re.compile(r"\b[cfi]-[0-9a-f]{8,10}\b")   # cc-failures' ids: c- a cluster, f- a record, i- a claim
+
+
+def parse_failures(path, text, repo):
+    """cc-failures' JSONL, one record per line: a failure is kind finding (span its cluster, so `get` pages through a
+    cluster), a correction is a note on the record it names, a claim (claims.jsonl) is an event. The rendering is the
+    record's own fields, so the words a person wrote — kind, expected, observed, evidence — are what the search sees."""
+    recs = []
+    for i, l in enumerate(text.split("\n")):
+        if not l.strip():
+            continue
+        try:
+            d = json.loads(l)
+        except ValueError:
+            continue
+        ids = set(FAIL_ID.findall(l))
+        links = d.get("links") or {}
+        if "cluster" in d and "why" in d:   # a claim
+            recs.append(dict(kind="event", title=f"failure claim {d.get('id', '')} · {d.get('kind', '')}", ts=d.get("ts", ""),
+                             text=f"claim {d.get('id', '')} of cluster {d.get('cluster', '')} scope {d.get('scope', '')} kind {d.get('kind', '')}: "
+                                  f"{d.get('why', '')} · slot {d.get('slot', '')}" + (" · critical" if d.get("critical") else ""),
+                             span=f"L{i + 1}", part=0, track="", extra_ids=ids, repo=d.get("scope", "")))
+            continue
+        if d.get("corrects"):
+            recs.append(dict(kind="note", title=f"correction of {d['corrects']}: {d.get('status', '')}", ts=d.get("ts", ""),
+                             text=f"correction {d.get('id', '')} of {d['corrects']} ({d.get('kind', '')}): now {d.get('status', '')} — {d.get('observed', '')}",
+                             span=f"L{i + 1}", part=0, track="", extra_ids=ids))
+            continue
+        det = d.get("detector") or {}
+        lines = [f"failure {d.get('id', '')} cluster {d.get('cluster', '')} scope {d.get('scope', '')} kind {d.get('kind', '')} at {d.get('ts', '')}"
+                 f" filed {d.get('filed', '') or '-'} status {d.get('status', '')}" + (f" CRITICAL {d['critical']}" if d.get("critical") else "")
+                 + f" detector {det.get('who', '')} writer {d.get('writer', '')}"]
+        for k in ("expected", "observed"):
+            if d.get(k):
+                lines.append(f"{k}: {d[k]}")
+        if d.get("evidence"):
+            lines.append("evidence: " + " · ".join(str(e) for e in d["evidence"]))
+        if det.get("evidence"):
+            lines.append(f"detector evidence: {det['evidence']}")
+        if d.get("cost"):
+            lines.append("cost: " + ", ".join(str(c) for c in d["cost"]))
+        if links:
+            lines.append("links: " + " · ".join(f"{k}={v}" for k, v in links.items()))
+        if links.get("row"):
+            ids.add(str(links["row"]).split("/", 1)[-1])
+        recs.append(dict(kind="finding", title=f"failure {d.get('kind', '')}: {str(d.get('observed', ''))[:80]}", ts=d.get("ts", ""),
+                         text="\n".join(lines)[:4000], span=f"cluster {d.get('cluster', '')}", part=0, track="", extra_ids=ids))
+    return recs
+
+
 def parse(path, skind, repo, track, rows):
     with open(path, "rb") as f:
         raw = f.read(MAX_SOURCE + 1)
@@ -536,6 +599,8 @@ def parse(path, skind, repo, track, rows):
         return parse_land(path, text, skind, repo)
     if skind == "land-queue":
         return parse_queue(path, text)
+    if skind == "failures":
+        return parse_failures(path, text, repo)
     return []
 
 
@@ -991,6 +1056,8 @@ def parse_object(obj, repo):
         return ("row", m.group(1) if "/" in o else m.group(2), m.group(2) if "/" in o else m.group(1))
     if re.fullmatch(r"[0-9a-f]{7,40}", o):
         return ("id", repo, o[:7])
+    if FAIL_ID.fullmatch(o):   # a cc-failures cluster, record or claim id: the records naming it
+        return ("id", repo, o)
     return ("row", repo, o)
 
 
@@ -1564,6 +1631,22 @@ def selfcheck():
         w(".cc/state/land/r1-320.json", json.dumps({"repo": "r1", "pr": 320, "stage": "gates", "attempts": 1, "rc": 1, "queued_at": "2026-09-07T20:00:00Z", "who": "cc done", "by": "pid 1"}))
         w(".cc/state/land/queue.log", "2026-09-07T20:00:00Z\tqueued r1#320 who=- by=x\n2026-09-07T20:09:00Z\tdone r1#320 rc=1 NOT merged — gate red\n"
           "2026-09-08T10:07:00Z\tdone r1#390 rc=0 landed\nnot an event line\n")
+        # cc-failures' ledger (the failure-noticing design, phase 3: the ledger readable through the library): a record,
+        # its correction, a claim and the claim's report
+        w(".cc/failures/r1.jsonl", json.dumps({"id": "f-0a1b2c3d4e", "ts": "2026-09-07T20:50:00Z", "filed": "2026-09-07T21:10:00Z", "scope": "r1",
+                                               "kind": "answer-evidence/wrong-object-or-proxy", "fingerprint": "v1|r1|answer-evidence/wrong-object-or-proxy",
+                                               "cluster": "c-9545168e", "expected": "", "observed": "PR #320 reported landed; it had stopped at gates",
+                                               "evidence": ["queue.log"], "detector": {"who": "person", "evidence": "caught by someone looking"},
+                                               "writer": "session", "cost": ["turns=1"], "links": {"row": "r1/t2"}, "status": "confirmed", "critical": ""}) + "\n"
+          + json.dumps({"id": "f-ffffffffff", "ts": "2026-09-08T09:00:00Z", "filed": "2026-09-08T09:00:00Z", "scope": "r1", "kind": "answer-evidence/wrong-object-or-proxy",
+                        "fingerprint": "v1|r1|answer-evidence/wrong-object-or-proxy", "cluster": "c-9545168e", "expected": "", "observed": "was a correct report after all",
+                        "evidence": [], "detector": {"who": "unknown", "evidence": ""}, "writer": "session", "cost": [], "links": {}, "status": "refuted", "critical": "",
+                        "corrects": "f-0a1b2c3d4e"}) + "\n")
+        w(".cc/failures/claims.jsonl", json.dumps({"id": "i-11223344", "ts": "2026-09-08T03:40:00Z", "cluster": "c-9545168e", "scope": "r1",
+                                                   "kind": "answer-evidence/wrong-object-or-proxy", "why": "3 episodes in 14d", "slot": "routine", "critical": False}) + "\n")
+        w(".cc/failures/reports/i-11223344.md", "# finding i-11223344\n\n## Decision: review how answers select their source\nthree episodes used a proxy.\n")
+        w(".cc/failures/_cctest77.jsonl", json.dumps({"id": "f-eeeeeeeeee", "ts": "2026-09-08T09:00:00Z", "scope": "_cctest77", "kind": "x/y", "cluster": "c-eeeeeeee",
+                                                     "observed": "a fixture ledger a selfcheck left in the live dir", "status": "confirmed", "detector": {}, "links": {}}) + "\n")
 
         # ---- the index
         rc, out = run("index")
@@ -1585,6 +1668,22 @@ def selfcheck():
            "board row → event, note → note, landing tally → finding",
            set(k for (k,) in c.execute("SELECT DISTINCT kind FROM records")) >= {"checkpoint", "decision", "event", "note", "finding", "document"}
            and c.execute("SELECT kind FROM records WHERE title LIKE '%Decisions%'").fetchone()[0] == "decision")
+        # ---- the failure ledger through the library
+        fr = c.execute("SELECT kind, repo, span, text FROM records WHERE title LIKE 'failure answer-evidence%'").fetchone()
+        ok("a failure record is indexed from the ledger as kind finding, under its scope, its cluster as the span, its words as the text",
+           fr and fr[0] == "finding" and fr[1] == "r1" and fr[2] == "cluster c-9545168e" and "stopped at gates" in fr[3] and "detector person" in fr[3])
+        ok("…a fixture scope (_cctest…) left in the live dir is never a source", not c.execute("SELECT 1 FROM sources WHERE path LIKE '%_cctest77.jsonl'").fetchone())
+        ok("…its correction is a note on the record it names, the claim an event, the report a doc",
+           c.execute("SELECT kind FROM records WHERE title LIKE 'correction of f-0a1b2c3d4e%'").fetchone()[0] == "note"
+           and c.execute("SELECT kind FROM records WHERE title LIKE 'failure claim i-11223344%'").fetchone()[0] == "event"
+           and c.execute("SELECT 1 FROM sources WHERE path LIKE '%reports/i-11223344.md' AND skind='doc'").fetchone())
+        rc, o = run("ask", "--object", "c-9545168e", "--need", "history")
+        ok("the ledger answers a query by cluster id: the record, its correction and the claim all name it",
+           rc == 0 and "records naming it" in o and "stopped at gates" in o and "correction of f-0a1b2c3d4e" in o and "failure claim i-11223344" in o and outcome(o) == "answered")
+        rc, o = run("ask", "--repo", "r1", "--need", "history", "proxy answer stopped at gates")
+        ok("…and by words: the failure's own observed text is a search hit", rc == 0 and "failure answer-evidence/wrong-object-or-proxy" in o)
+        rc, o = run("ask", "--object", "#320", "--need", "history")
+        ok("…and a PR named in a failure record is found through the record too", "failure answer-evidence" in o)
         ok("exact ids live in their own column: a SHA prefix and repo#pr find the landing record",
            by_ids(c, {"09dd584"}, skind="land-root") and by_ids(c, {"r1#390"}, skind="land-root"))
         c.close()

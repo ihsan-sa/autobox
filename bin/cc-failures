@@ -12,6 +12,8 @@ usage: cc-failures record --scope S --kind CONTRACT/SYMPTOM --observed TEXT [--e
        cc-failures claim [--scope S] [--as-of UTC] [--dry]      (one eligible cluster, claimed once; the launch's call)
        cc-failures packet ID                                   (the investigation's packet, markdown; ID a claim or a cluster)
        cc-failures metrics [FIXTURE] [--scope S]        (the shipped one: tests/failures-fixture.jsonl)
+       cc-failures replay [EVENTS] [--catalogue JSON] [--candidate EXE] [--candidate-catalogue JSON] [--json]
+                                                        (the shipped one: tests/failures-replay.jsonl)
        cc-failures import REPO [--dry]
        cc-failures kinds
        cc-failures board REPO [--as-of UTC]                 (what `cc board failures REPO` runs)
@@ -28,7 +30,8 @@ evidence}), writer, cost (a list; unknown stays unknown, never summed), links (r
 episode), status (confirmed|asserted|refuted), critical (a reason from the catalogue, or empty).
 
 THE KIND is `<contract>/<symptom>`: the broken contract and what was seen, never the guessed cause. The catalogue
-is config/failure-kinds.json beside this bin (`kinds` prints it); a kind not in it is accepted and said, so the
+is config/failure-kinds.json beside this bin (`kinds` prints it; CC_FAILURES_CATALOGUE names another — a test's, or
+the one `replay` scores); a kind not in it is accepted and said, so the
 catalogue grows by use — but a typo splits a cluster, so read `kinds` first.
 
 THE RULE (arithmetic, evaluated on read, `--as-of` replays it at another time):
@@ -64,14 +67,30 @@ METRICS with no argument reads the ledger: records, clusters, eligible, recordin
 the unknown-detector and person-first shares. With a labelled fixture (JSONL: label, row, text, filed, ts) it runs
 the import's own classifier and time parser over each line and prints the false-match rate (pairs grouped
 together whose labels differ), the false-split rate (pairs of one label grouped apart), the share of stated times
-recovered, and the recording delay."""
+recovered, and the recording delay.
+
+REPLAY scores a detector change on pinned raw events before it touches the live ledger (docs: Phased plan, phase 3).
+EVENTS is a frozen JSONL of events as their writers would have written them — `ts`, `filed`, `scope`, `text`, and
+either `kind` (a session's line) or `row` (a board's, classified by the catalogue under test), plus `detector`,
+`critical`, `status`, `label` and `control` as needed; the shipped one is September's, from the design's evidence, under the neutral scope `box` with names scrubbed.
+Each run plays the events in order into a temporary ledger of its own — the live one is never read or written —
+and asks the rule after every event, so a cluster's `fired` is the first moment the rule would have said so. The
+BASELINE is this executable with its catalogue (`--catalogue` swaps it); the CANDIDATE is `--candidate EXE`
+(another cc-failures, run as `EXE replay EVENTS --json`), `--candidate-catalogue JSON` (this one with that
+catalogue), or both. It prints what each would have fired and when, what stayed quiet, and the difference: fired
+by one and not the other, and a crossing that moved. NEGATIVE CONTROLS are events whose `control` names why their
+cluster must stay quiet (one episode written three times, two episodes, three across fifteen days, candidates
+never confirmed, a refuted critical); a control cluster holds control events only, and a run in which one fires
+— or a control that shares a cluster with a real event — exits 1, so a candidate that fires on a control is not
+scored green. No model call, no board, no claim: `replay` writes nothing outside its temporary directory."""
 import sys, os, re, json, fcntl, hashlib, datetime, subprocess, statistics, tempfile, shutil, collections
 
 B = os.path.dirname(os.path.realpath(__file__))
 DIR = os.environ.get("CC_FAILURES") or os.path.expanduser("~/.cc/failures")
 STATE = os.environ.get("CC_STATE") or os.path.expanduser("~/.cc/state")
-CATALOGUE = os.path.join(B, "..", "config", "failure-kinds.json")
+CATALOGUE = os.environ.get("CC_FAILURES_CATALOGUE") or os.path.join(B, "..", "config", "failure-kinds.json")   # replay swaps it per run
 FIXTURE = os.path.join(B, "..", "tests", "failures-fixture.jsonl")   # the labelled fixture `metrics` is measured on
+EVENTS = os.path.join(B, "..", "tests", "failures-replay.jsonl")     # the pinned raw events `replay` scores a detector on
 WINDOW_DAYS = 14          # "in the last 14 days"
 EPISODES_NEEDED = 3       # "three distinct episodes"
 EPISODE_GAP_MIN = 30      # records of one fingerprint closer than this are one episode
@@ -461,6 +480,129 @@ def metrics_fixture(path):
     print(f"true time recovered: {sum(1 for it in items if it['_ok'])}/{len(items)}")
     if delays: print(f"recording delay (filed - happened, min): median {statistics.median(delays):.0f}, max {max(delays)}, n={len(delays)}")
 
+# ---------------------------------------------------------------- replay: baseline and candidate on the same frozen events
+def read_events(path):
+    """The pinned events, in order of when they happened. Every line must carry ts or filed, scope, text and kind or row."""
+    evs = []
+    try:
+        with open(path) as f:
+            for n, line in enumerate(f, 1):
+                if not line.strip(): continue
+                try: e = json.loads(line)
+                except ValueError: die(f"events {path}:{n}: not JSON")
+                e["_n"] = n
+                if not (e.get("ts") or e.get("filed")) or not e.get("scope") or not (e.get("kind") or e.get("row")) or not e.get("text"):
+                    die(f"events {path}:{n}: needs ts or filed, scope, text, and kind or row")
+                evs.append(e)
+    except OSError as e: die(f"events {path}: {e}")
+    if not evs: die(f"events {path}: no lines")
+    return evs
+
+def play(evs, cat_path=None):
+    """One detector run over the events: this executable's rule with `cat_path` (default its own catalogue), into a
+    temporary ledger. Returns {clusters: {cid: {...fired, control...}}, controls: {name: cid}, errors: [...],
+    unknown_kinds: [...]} — everything the comparison and the printer need, nothing from the live ledger."""
+    global DIR, CATALOGUE
+    import io, contextlib
+    T = tempfile.mkdtemp(prefix="cc-failures-replay."); keep = (DIR, CATALOGUE); DIR = T
+    if cat_path: CATALOGUE = cat_path
+    err = io.StringIO()
+    try:
+        cat = catalogue()
+        labels, control, playing = {}, {}, []
+        for e in sorted(evs, key=lambda e: parse_ts(e.get("ts") or e["filed"]) or now_dt()):
+            filed = parse_ts(e.get("filed") or "")
+            ts = parse_ts(e.get("ts") or "") or stated_time(e["text"], filed) or filed
+            kind = e.get("kind") or classify(e["row"], cat)
+            who, ev = (e["detector"], e.get("detector_evidence", "the event says so")) if e.get("detector") else stated_detector(e["text"])
+            with contextlib.redirect_stderr(err):
+                ids = add_record(e["scope"], kind, e["text"], expected=e.get("expected", ""), evidence=e.get("evidence") or [],
+                                 detector=who, detector_evidence=ev, writer=e.get("writer", "replay"), critical=e.get("critical", ""),
+                                 status=e.get("status", "confirmed"), ts=ts, filed=filed or "", source=f"replay:{e['_n']}",
+                                 links={"row": e["row"]} if e.get("row") else None)
+            cid = fpid(fingerprint(e["scope"], kind)); lbl = e.get("label") or f"#{e['_n']}"; labels.setdefault(cid, []).append(lbl)
+            if len(ids) > 1: labels.setdefault(fpid(fingerprint(e["scope"], GAP_KIND)), []).append(lbl + "#gap")   # its person-first gap record
+            if e.get("control"): control.setdefault(cid, e["control"])
+            playing.append((utc(ts), cid, bool(e.get("control"))))
+        recs = load()
+        errors = []
+        for cid, name in control.items():
+            real = [t for t, c, is_ctl in playing if c == cid and not is_ctl]
+            if real: errors.append(f"control '{name}' shares cluster {cid} with {len(real)} real event(s): a control cluster holds control events only")
+        # ask the rule after every event: a cluster's `fired` is the first moment it would have said eligible
+        fired, last = {}, {}
+        for t in sorted({t for t, _, _ in playing}):
+            for c in clusters(recs, parse_ts(t), ks=[]):
+                last[c["id"]] = c
+                if c["eligible"] and c["id"] not in fired: fired[c["id"]] = {"at": c["crossed"] or t, "seen": t, "why": c["eligible"]}
+        out = {}
+        for cid, c in last.items():
+            out[cid] = {"scope": c["scope"], "kind": c["kind"], "records": c["records"], "confirmed": c["confirmed"], "episodes": c["episodes"],
+                        "first": c["first"], "last": c["last"], "labels": labels.get(cid, []), "control": control.get(cid, ""),
+                        "fired": fired.get(cid)}
+        unknown = sorted({m.group(1) for m in re.finditer(r"'([^']+)' is not in the catalogue", err.getvalue())})
+        return {"catalogue": os.path.normpath(CATALOGUE), "events": len(evs), "clusters": out, "errors": errors, "unknown_kinds": unknown}
+    finally:
+        DIR, CATALOGUE = keep
+        shutil.rmtree(T, ignore_errors=True)
+
+def replay(path, cat_path=None, candidate=None, cand_cat=None, as_json=False):
+    evs = read_events(path)
+    base = play(evs, cat_path)
+    if as_json and not (candidate or cand_cat):
+        print(json.dumps(base, indent=1)); return 0 if not (base["errors"] or fired_controls(base)) else 1
+    cand = None
+    if candidate:
+        # another cc-failures: its own rule, its own classifier, and its own catalogue when one sits beside it (a checkout);
+        # a bare copy (a scratch file) gets the baseline's, so the difference is the code's — or the one named
+        own = os.path.join(os.path.dirname(os.path.realpath(candidate)), "..", "config", "failure-kinds.json")
+        cc = cand_cat or (None if os.path.isfile(own) else (cat_path or CATALOGUE))
+        p = subprocess.run([candidate, "replay", path, "--json"] + (["--catalogue", cc] if cc else []), capture_output=True, text=True)
+        try: cand = json.loads(p.stdout)
+        except ValueError: die(f"candidate {candidate}: no replay JSON (rc={p.returncode}): {(p.stderr or p.stdout).strip()[-300:]}")
+        cand["exe"] = candidate
+    elif cand_cat:
+        cand = play(evs, cand_cat); cand["exe"] = os.path.join(B, "cc-failures")
+    base["exe"] = os.path.join(B, "cc-failures")
+    span = sorted(c["first"] for c in base["clusters"].values())
+    ctl = sum(1 for c in base["clusters"].values() if c["control"])
+    print(f"replay {os.path.normpath(path)}: {base['events']} event(s), {len(base['clusters'])} cluster(s) of which {ctl} control(s), "
+          f"{span[0][:16] if span else '-'} .. {max(c['last'] for c in base['clusters'].values())[:16] if span else '-'}")
+    red = False
+    for tag, run in (("baseline", base), ("candidate", cand)):
+        if not run: continue
+        print(f"\n{tag}: {os.path.normpath(run['exe'])}  catalogue {run['catalogue']}")
+        for cid, c in sorted(run["clusters"].items(), key=lambda kv: (not kv[1]["fired"], bool(kv[1]["control"]), kv[1]["fired"]["at"] if kv[1]["fired"] else kv[1]["kind"])):
+            f = c["fired"]
+            if c["control"]:
+                print(f"  {'FIRED' if f else 'quiet'}  control '{c['control']}'  {c['kind']}  {c['confirmed']} confirmed of {c['records']}, {c['episodes']} episode(s)"
+                      + (f"  — fired {f['at'][:16]} ({f['why']}): A CONTROL MUST STAY QUIET" if f else ""))
+                red = red or bool(f)
+            elif f:
+                print(f"  ‼ {cid}  {c['scope']}  {c['kind']}  fired {f['at'][:16]} ({f['why']})  {c['confirmed']} record(s), {c['episodes']} episode(s)  [{', '.join(c['labels'][:6])}]")
+            else:
+                print(f"  · {cid}  {c['scope']}  {c['kind']}  quiet  {c['confirmed']} record(s), {c['episodes']} episode(s)")
+        if run["unknown_kinds"]: print(f"  kinds outside this catalogue (recorded as their own): {', '.join(run['unknown_kinds'])}")
+        for e in run["errors"]: print(f"  ERROR {e}")
+        red = red or bool(run["errors"])
+    if cand:
+        print("\ncandidate vs baseline (the same events):")
+        bf = {cid: c for cid, c in base["clusters"].items() if c["fired"]}; cf = {cid: c for cid, c in cand["clusters"].items() if c["fired"]}
+        gained = [cid for cid in cf if cid not in bf]; lost = [cid for cid in bf if cid not in cf]
+        moved = [(cid, bf[cid]["fired"]["at"], cf[cid]["fired"]["at"]) for cid in cf if cid in bf and cf[cid]["fired"]["at"] != bf[cid]["fired"]["at"]]
+        for cid in gained: print(f"  + fires {cid}  {cf[cid]['scope']}  {cf[cid]['kind']}  at {cf[cid]['fired']['at'][:16]} ({cf[cid]['fired']['why']})")
+        for cid in lost: print(f"  - no longer fires {cid}  {bf[cid]['scope']}  {bf[cid]['kind']}  (baseline: {bf[cid]['fired']['at'][:16]})")
+        for cid, a, b in moved:
+            ta, tb = parse_ts(a), parse_ts(b)
+            print(f"  ~ {cid}  {cf[cid]['kind']}  crossing moved {a[:16]} → {b[:16]} ({'earlier' if tb < ta else 'later'} by {age(max(ta, tb), min(ta, tb))})")
+        if not (gained or lost or moved): print("  no difference: the same clusters fire at the same moments")
+        kb, kc = set(base["clusters"]), set(cand["clusters"])
+        if kc - kb or kb - kc: print(f"  clusters only in the candidate: {len(kc - kb)}; only in the baseline: {len(kb - kc)} (a kind the catalogue change split or merged)")
+    print("\n" + ("RED: a control fired, or the events are not a fixture — not scored" if red else "controls quiet: scored"))
+    return 1 if red else 0
+
+def fired_controls(run): return [c for c in run["clusters"].values() if c["control"] and c["fired"]]
+
 # ---------------------------------------------------------------- selfcheck: hermetic, its own HOME, ledger and board
 def selfcheck():
     n = f = 0
@@ -657,6 +799,55 @@ def selfcheck():
            and "recording delay (filed - happened, min): median 1, max 367, n=10" in out)
         rc, out, err = C("metrics", os.path.join(T, "missing.jsonl"))
         ok("…a fixture that is not there is refused, not reported empty", rc == 2 and "fixture" in err)
+        # ---- replay: the shipped September events, this detector, then candidates on the same frozen inputs
+        rc, out, err = C("replay")
+        AE, GAP = fpid(fingerprint("box", "answer-evidence/wrong-object-or-proxy")), fpid(fingerprint("box", GAP_KIND))
+        ok("replay on the shipped events: the 09-07 crossing the design cites — answer-evidence fires at the third episode, 20:50Z",
+           rc == 0 and f"‼ {AE}  box  answer-evidence/wrong-object-or-proxy  fired 2026-09-07T20:50 (3 episodes in 14d)" in out)
+        ok("…the person-first gap cluster fires on first sight, 09-06 05:02Z", f"‼ {GAP}  box  failure-detection/person-first  fired 2026-09-06T05:02 (critical: person-first)" in out)
+        ok("…a two-episode cluster stays quiet, and is printed as quiet", "gate-target/wrong-revision  quiet  2 record(s), 2 episode(s)" in out)
+        ctl = [l for l in out.splitlines() if "control '" in l]
+        ok("…every negative control is printed, quiet, and the run is scored", len(ctl) == 5 and all(l.strip().startswith("quiet  control") for l in ctl) and out.rstrip().endswith("controls quiet: scored"))
+        ok("…the live ledger was neither read nor written: no box scope appeared under CC_FAILURES", not os.path.exists(os.path.join(T, "failures", "box.jsonl")))
+        rc, out, err = C("replay", "--json")
+        j = json.loads(out) if rc == 0 else {}
+        ok("replay --json prints the run: clusters with fired/control, no errors", rc == 0 and j.get("clusters", {}).get(AE, {}).get("fired", {}).get("at") == "2026-09-07T20:50:00Z" and j["errors"] == [])
+        rc, out, err = C("replay", os.path.join(T, "none.jsonl"))
+        ok("an events file that is not there is refused, not replayed empty", rc == 2 and "events" in err)
+        bad = os.path.join(T, "bad.jsonl"); open(bad, "w").write('{"ts": "2026-09-01T10:00Z", "scope": "s", "text": "no kind and no row"}\n')
+        rc, out, err = C("replay", bad)
+        ok("…and a line with neither kind nor row is refused", rc == 2 and "kind or row" in err)
+        # CANDIDATES: the same events, another detector. A copy of this file with the episode gap cut to 5 minutes turns the
+        # "one episode written three times" control into three episodes: it fires, and the run is red, not scored.
+        src = open(os.path.join(B, "cc-failures")).read()
+        cand = os.path.join(T, "cand-gap5"); open(cand, "w").write(src.replace("EPISODE_GAP_MIN = 30 ", "EPISODE_GAP_MIN = 5 ")); os.chmod(cand, 0o755)
+        rc, out, err = C("replay", "--candidate", cand)
+        ok("a candidate that fires on a negative control: the control line says FIRED, the run is RED, rc 1",
+           rc == 1 and any(l.strip().startswith("FIRED  control 'one episode written three times'") for l in out.splitlines()) and "RED: a control fired" in out
+           and out.count("controls quiet") == 0)
+        ok("…the baseline in the same run still shows the control quiet", "baseline:" in out and out.split("candidate:")[0].count("quiet  control") == 5)
+        cand2 = os.path.join(T, "cand-two"); open(cand2, "w").write(src.replace("EPISODES_NEEDED = 3 ", "EPISODES_NEEDED = 2 ")); os.chmod(cand2, 0o755)
+        rc, out, err = C("replay", "--candidate", cand2)
+        ok("a candidate needing two episodes: the crossing moves earlier and the difference says by how much — and the two-episode control fires, so it is red",
+           rc == 1 and f"~ {AE}  answer-evidence/wrong-object-or-proxy  crossing moved 2026-09-07T20:50 → 2026-09-07T19:30 (earlier by 1h 20m)" in out
+           and any(l.strip().startswith("FIRED  control 'two episodes in fourteen days'") for l in out.splitlines()))
+        cat2 = json.load(open(CATALOGUE)); cat2["kinds"]["notification/false-action-needed"]["match"] = []
+        ccat = os.path.join(T, "cat-no-steward.json"); json.dump(cat2, open(ccat, "w"))
+        rc, out, err = C("replay", "--candidate-catalogue", ccat)
+        NF = fpid(fingerprint("box", "notification/false-action-needed"))
+        ok("a candidate catalogue that drops a match: the rows file under their own families and that cluster no longer fires",
+           rc == 0 and f"- no longer fires {NF}  box  notification/false-action-needed" in out and "only in the candidate: 4" in out)
+        ok("…the baseline's catalogue is untouched by --candidate-catalogue", f"‼ {NF}" in out.split("candidate:")[0])
+        rc, out, err = C("replay", "--candidate", cand2, "--candidate-catalogue", ccat)
+        ok("…both together: the candidate executable runs with the candidate catalogue", rc == 1 and f"- no longer fires {NF}" in out and "crossing moved" in out)
+        rc, out, err = C("replay", "--candidate-catalogue", CATALOGUE)
+        ok("the same detector twice: no difference", rc == 0 and "no difference: the same clusters fire at the same moments" in out)
+        mixed = os.path.join(T, "mixed.jsonl")
+        with open(mixed, "w") as fh:
+            fh.write('{"label": "real", "ts": "2026-09-01T10:00Z", "scope": "s", "kind": "a/b", "text": "a real event", "detector": "box"}\n')
+            fh.write('{"label": "ctl", "control": "must not fire", "ts": "2026-09-02T10:00Z", "scope": "s", "kind": "a/b", "text": "a control in the same cluster", "detector": "box"}\n')
+        rc, out, err = C("replay", mixed)
+        ok("a control that shares a cluster with a real event is a fixture error: said, and rc 1", rc == 1 and "ERROR control 'must not fire' shares cluster" in out)
         rc, out, err = C("kinds")
         ok("kinds prints the catalogue's kinds and the critical reasons", rc == 0 and out.count("/") >= 6 and "person-first" in out and K in out)
         rc, out, err = C("sideways")
@@ -688,7 +879,7 @@ def opts(a, flags, lists=()):
         else: pos.append(x); i += 1
     return out, pos
 
-USAGE = "usage: cc-failures record|show|eligible|claim|packet|metrics|import|kinds|selfcheck ...  (the docstring has the flags)"
+USAGE = "usage: cc-failures record|show|eligible|claim|packet|metrics|replay|import|kinds|selfcheck ...  (the docstring has the flags)"
 def as_of(o):
     if not o.get("as-of"): return None
     t = parse_ts(o["as-of"])
@@ -751,6 +942,12 @@ def main(a):
         o, pos = opts(a, ("scope",))
         if pos: metrics_fixture(pos[0])
         else: metrics_ledger(o.get("scope"))
+    elif cmd == "replay":
+        o, pos = opts(a, ("catalogue", "candidate", "candidate-catalogue"))
+        if len(pos) > 1: die("replay takes one events file")
+        for k in ("catalogue", "candidate", "candidate-catalogue"):
+            if o.get(k) and not os.path.isfile(o[k]): die(f"--{k}: no such file {o[k]}")
+        sys.exit(replay(pos[0] if pos else EVENTS, o.get("catalogue"), o.get("candidate"), o.get("candidate-catalogue"), as_json=bool(o.get("json"))))
     elif cmd == "import":
         o, pos = opts(a, ())
         if len(pos) != 1: die("import needs a repo")
