@@ -7,10 +7,13 @@
 #
 # WHAT SHIPS is the prefix and nothing else: the whole tree at <prefix> goes, unfiltered. This script never picks
 # paths, never rewrites content, never cherry-picks — the public/private boundary is the directory boundary, drawn
-# once where the code lives, not re-decided at publish time. Its ONE veto is the identity gate: if anything in that
-# tree (a file's contents, a file's name, or the commit message about to be written) matches this box's own name,
-# the publish ABORTS loudly and pushes nothing. Shipping a trimmed tree is never an option — a red gate is a bug in
-# the source repo, and it is fixed there.
+# once where the code lives, not re-decided at publish time. Its ONE veto is the identity gate: if a file's
+# contents or a file's name under that tree matches this box's own name, the publish ABORTS loudly and pushes
+# nothing. Shipping a trimmed tree is never an option — a red gate is a bug in the source repo, and it is fixed
+# there. The COMMIT MESSAGE is the one thing this tool writes rather than ships, so it is not vetoed but built to
+# pass: merged subjects go through the gate's own regex first and a subject that would trip it loses those words,
+# or the whole headline becomes a count and a SHA range. A message a person gives with --message is still refused
+# if it names the box — those are their words, not ours.
 #
 # ONE COMMIT PER PUBLISH, parented on the public repo's tip: the private repo's history stays private. A
 # history-preserving `git subtree split` would republish every past commit of the prefix, so any identity that ever
@@ -36,6 +39,11 @@
 #   PUBLISH_DENY     extra ERE that must never appear in it     (this box's user, host and repo names always deny)
 #   PUBLISH_ALLOW    paths inside the prefix the gate skips     (default: LICENSE README.md — they name the public repo)
 #   CC_PUSH_TIMEOUT  seconds any one command may spend on the remote (default 120; env only)
+#
+# A RUN THAT FAILS IS NOTICED ONCE. Every abort writes a line to the log, records a failure in the ledger
+# (cc-failures) and pages the owner (cc-notify) — the record and the page once per REASON, so a cause that sticks
+# across 43 timer runs is one record and one page, and the same cause coming back after a good publish is a second
+# episode. See `die` below.
 #
 # AND NOTHING HERE WAITS FOR A PERSON. This runs off a timer with nobody watching, so a git that asks for a
 # username — the public repo's credential gone, a remote that stops answering — would sit on that prompt for
@@ -240,24 +248,74 @@ PY
   rc=$?
   k "$(t test "$rc" = 0)" "a publish still succeeds when its fetch backgrounds a detached child"
   k "$(t flock -n "$(repo_lock_path "$T/src")" true)" "…and the lock is free the instant it returns, not held until that child exits"
+  # …while that detached `sleep` DOES still hold this tool's own publish.lock — it inherited fd 9, which is the
+  # very thing the case above is about — so wait for it before anything below runs: a publish that finds that
+  # lock taken says "another publish is running" and exits 0 having done nothing, and every case after it would
+  # then pass or fail for the wrong reason.
+  for _ in $(seq 1 200); do flock -n "$T/state/publish.lock" true 2>/dev/null && break; sleep 0.05; done
+  # A MERGED SUBJECT THAT NAMES THE BOX MUST NOT STOP THE MIRROR (2026-09-11: one did, and the composed message
+  # was refused on all 43 ticks of eleven hours). The denied word is INVENTED and handed in through PUBLISH_DENY,
+  # so the gate's own regex is exercised without this file — which ships — carrying anything this box is called.
+  # The failing runs below reach `die`, so they also page: CC_NOTIFY_LOG_ONLY keeps that in a file under $T.
+  DW=zqbox; DENYW=""; REM=""
+  fpub(){ ( cd "$T/src" && PATH="$T/stub:$PATH" HOME="$T" CC_PUBLISH_STATE="$T/state" \
+            CC_NOTIFY_LOG="$T/notify.log" CC_NOTIFY_LOG_ONLY=1 CC_FAILURES="$T/failures" CC_PUBLISH_ARCH="$T/arch" \
+            PUBLISH_DENY="$DENYW" PUBLISH_REMOTE="${REM:-$T/pub.git}" PUBLISH_REPO='' PUBLISH_PREFIX=pfx \
+            PUBLISH_BRANCH=main "$SELF" ); }
+  echo 2 > "$T/src/pfx/f2"; git -C "$T/src" add -A
+  git -C "$T/src" commit -qm "a prompt is answered in #$DW-threads, not somewhere else"
+  git -C "$T/src" push -q origin main
+  DENYW="$DW"; fpub >/dev/null 2>&1; rc=$?; DENYW=""
+  pmsg="$(git -C "$T/pub.git" log -1 --format=%B main 2>/dev/null)"
+  leaked=0; grep -qi "$DW" <<<"$pmsg" && leaked=1
+  k "$(t test "$rc" = 0)" "a merged subject that names the box publishes anyway — the message is built to pass, not refused"
+  k "$leaked" "…with the denied word nowhere in the commit message that was written"
+  k "$(t grep -q -- '-threads, not somewhere else' <<<"$pmsg")" "…and the rest of the subject still says what changed"
+  k "$(t grep -q "Published-From: $(git -C "$T/src" rev-parse HEAD)" <<<"$pmsg")" "…and the trailer the next range is read from is intact"
+  # RECORDED ONCE, NOT ONCE A TICK. The TREE gate is made to fire — that one is never scrubbed — and the publish
+  # run three times: one ledger record and one page for the three, and a DIFFERENT reason gets its own record.
+  echo "$DW" > "$T/src/pfx/f3"; git -C "$T/src" add -A
+  git -C "$T/src" commit -qm "the tree itself names it"; git -C "$T/src" push -q origin main
+  rm -f "$T/state/publish.notified"; rm -rf "$T/failures"; : > "$T/notify.log"
+  DENYW="$DW"; fpub >/dev/null 2>&1; rc=$?; fpub >/dev/null 2>&1; fpub >/dev/null 2>&1; DENYW=""
+  LED="$T/failures/$(basename "$T/src").jsonl"
+  k "$(t test "$rc" = 1)" "a TREE that names the box still stops the publish — that gate is untouched"
+  k "$(t test "$(wc -l < "$LED" 2>/dev/null)" = 1)" "…and three runs of the SAME failure are ONE record in the ledger, not three"
+  k "$(t grep -q '"kind":"mirror-freshness/publish-blocked"' "$LED")" "…filed under the kind the catalogue names, by the box itself"
+  k "$(t test "$(wc -l < "$T/notify.log")" = 1)" "…and the owner was paged once, not once a tick"
+  k "$(t test "$(grep -c ABORT "$T/state/publish.log")" = 3)" "…while the log still says it every run"
+  REM="$T/nowhere.git"; fpub >/dev/null 2>&1; REM=""
+  k "$(t test "$(wc -l < "$LED" 2>/dev/null)" = 2)" "a DIFFERENT reason is a record of its own — the dedup is per reason, not per tool"
   echo "cc-publish selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]; exit $?
 fi
 
-# A publish that cannot happen is not silent: it reaches the owner (ntfy/Slack) and leaves a line in the log.
+# A publish that cannot happen is not silent: it is RECORDED in the failure ledger, it pages the owner (ntfy/Slack)
+# and it leaves a line in the log.
 die() {
   local sig; sig="$(cksum <<<"$1")"
   printf 'cc-publish: %s\n' "$1" >&2
   printf '%s\tABORT\t%s\n' "$(date -u +%FT%TZ)" "$(printf '%s' "$1" | tr '\n' ' ')" >> "$LOG"
-  # Only a REAL publish pages the owner. `status` is a query and `--dry-run` is a rehearsal: neither is a failure of
-  # the box, and a read-only command that pushes a phone alert teaches its reader to ignore the alert.
-  # Once per REASON, too, now that a timer runs this unattended every few minutes: a stuck cause — a gate hit, a
-  # remote that is down — would otherwise page the same alert all day, which teaches the same lesson. The stderr
-  # line, the log and the unit's own failure still say it every run; the next publish that gets through forgets the
-  # reason, so it pages again if it comes back.
-  if [ "$mode" = publish ] && [ "$dry" = 0 ] && [ -x "$BIN/cc-notify" ] && [ "$(cat "$SEEN" 2>/dev/null)" != "$sig" ]; then
+  # Only a REAL publish is a failure of the box. `status` is a query and `--dry-run` is a rehearsal: neither is,
+  # and a read-only command that pushes a phone alert teaches its reader to ignore the alert.
+  # ONCE PER REASON, too, now that a timer runs this unattended every few minutes. A stuck cause — a gate hit, a
+  # remote that is down — must cost one record and one page, not one per tick: on 2026-09-11 the same abort
+  # repeated 43 times over eleven hours and left nothing behind but journal lines. The stderr line, the log and
+  # the unit's own failure still say it every run; the next publish that gets through forgets the reason, so a
+  # cause that comes back is recorded again and counts as a second episode. The mark is written BEFORE either
+  # call and independently of both — it used to hang off cc-notify being installed, which would have swallowed
+  # the ledger record with the page.
+  if [ "$mode" = publish ] && [ "$dry" = 0 ] && [ "$(cat "$SEEN" 2>/dev/null)" != "$sig" ]; then
     printf '%s\n' "$sig" > "$SEEN"
-    "$BIN/cc-notify" -p high -t "${REPO:+[$REPO] }publish blocked" "$1" >/dev/null 2>&1   # a title starting with the repo routes to its channel
+    # BOUNDED, like everything else this unattended run calls: cc-failures appends under a lock, and a holder that
+    # never lets go must not hold the timer's run open. A record that cannot be written costs the page nothing.
+    [ -x "$BIN/cc-failures" ] && timeout 30 "$BIN/cc-failures" record \
+      --scope "${REPO:-$(basename "${R:-$PWD}")}" --kind mirror-freshness/publish-blocked \
+      --expected "the public repo follows the default branch, one publish per timer tick" \
+      --observed "$1" --evidence "$LOG" --detector box \
+      --detector-evidence "cc-publish aborted; recorded once per reason, not once per run" \
+      --writer cc-publish >/dev/null 2>&1
+    [ -x "$BIN/cc-notify" ] && "$BIN/cc-notify" -p high -t "${REPO:+[$REPO] }publish blocked" "$1" >/dev/null 2>&1   # a title starting with the repo routes to its channel
   fi
   exit 1
 }
@@ -298,6 +356,12 @@ lit() { sed 's/[][\\.^$*+?(){}|]/\\&/g' <<<"$1"; }
 DENY="$(lit "$(id -un)")|$(lit "$(hostname -s)")"
 [ -n "$REPO" ] && DENY="$DENY|$(lit "$REPO")"
 [ -n "$DENY_X" ] && DENY="$DENY|$DENY_X"
+# Every deny word out of a line, replaced by an ellipsis. The TREE is never put through this — a name in the code
+# is a bug in the source repo and still stops the publish — only the commit MESSAGE this tool composes for itself,
+# whose words come from the private repo's merged subjects and are not code at all. Same regex as the gate, so
+# what comes out of it is what the gate accepts. The delimiter is a control character because DENY is an ERE the
+# owner may have written: `/` and `|` can both be in it, \001 cannot.
+scrub() { sed -E "s$(printf '\001')${DENY}$(printf '\001')…$(printf '\001')gI" <<<"$1"; }
 paths=("$PREFIX"); for a in $ALLOW; do paths+=(":!$PREFIX/$a"); done
 hits="$(git -C "$R" grep -I -i -n -E "$DENY" "$SRC" -- "${paths[@]}" 2>/dev/null | head -10)"
 [ -z "$hits" ] || die "identity gate: '$PREFIX/' at ${SRC:0:8} names this box — NOTHING was published (fix it in the source repo; the tree is never trimmed to get past this):
@@ -323,6 +387,14 @@ if [ "$mode" = status ]; then
 fi
 [ "$PTREE" = "$TREE" ] && { rm -f "$SEEN"; echo "cc-publish: already up to date ($PREFIX/ == $BRANCH at ${PARENT:0:8})"; exit 0; }
 
+# A SUBJECT THIS TOOL CAN ALWAYS WRITE: how many commits, and the range they cover. It names nothing but the
+# prefix and two SHAs, so it stands in wherever the merged subjects cannot be used.
+range_line() {
+  local n=${#subs[@]} s=s
+  [ "$n" = 1 ] && s=""
+  if [ -n "${base:-}" ]; then printf '%s commit%s of %s/ (%s..%s)' "$n" "$s" "$PREFIX" "${base:0:8}" "${SRC:0:8}"
+  else                        printf '%s commit%s of %s/ at %s'    "$n" "$s" "$PREFIX" "${SRC:0:8}"; fi
+}
 if [ -z "$msg" ]; then
   # What changed since last time: the previous publish says where it came from, so the range is exact. Without that
   # trailer (the first publish onto a repo filled by hand) it is just the newest subject.
@@ -332,8 +404,18 @@ if [ -z "$msg" ]; then
   subs=()
   [ -n "$base" ] && mapfile -t subs < <(git -C "$R" log --format=%s "$base..$SRC" -- "$PREFIX")
   [ "${#subs[@]}" -gt 0 ] || mapfile -t subs < <(git -C "$R" log -1 --format=%s "$SRC")
+  # THE MESSAGE THIS TOOL WRITES IS NEVER ONE IT REFUSES. Merged subjects are the private repo's words and may
+  # name this box: on 2026-09-11 one did, and the gate below refused the composed message on every 15-minute tick
+  # for eleven hours while nothing reached the public repo and nobody was told. So the deny words come out of
+  # each subject before it is used, and a headline left with no word in it at all is replaced by the range.
+  for i in "${!subs[@]}"; do subs[i]="$(scrub "${subs[i]}")"; done
   msg="${subs[0]}"
+  [ -n "${msg//[^[:alnum:]]/}" ] || msg="$(range_line)"
   [ "${#subs[@]}" -gt 1 ] && msg="$msg"$'\n\n'"$(printf -- '- %s\n' "${subs[@]:1}")"
+  # Belt and braces over the whole block. A scrub cannot leave behind a match of the same regex it just ran, but
+  # PUBLISH_DENY is an ERE a person writes, and one that matched the ellipsis itself would: that costs the
+  # subjects, not the publish.
+  grep -qiE "$DENY" <<<"$msg" && msg="$(scrub "$(range_line)")"
   msg="$msg"$'\n\n'"Published-From: $SRC"
 fi
 grep -qiE "$DENY" <<<"$msg" && die "identity gate: the commit message names this box — NOTHING was published. Re-run with --message '<text>':
