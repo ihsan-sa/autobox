@@ -552,10 +552,13 @@ out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
   && ok "an unmeasurable context refuses the handoff instead of guessing" || bad "unmeasurable handoff: rc=$rc $out"
 mv "$T/tx.jsonl" "$PD/$sid.jsonl"
 # the Stop hook is the only place the transcript path is handed over: it must record from the payload
-printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 \
-  | ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" )
+d0=$(printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 \
+  | ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" ))
 [ -s "$T/ctx/$sid.json" ] && grep -q '"pct": 10' "$T/ctx/$sid.json" && ok "the Stop hook records the measurement it was handed" || bad "no record from the Stop hook"
-grep -q 'decision' "$T/ctx/$sid.json" && bad "a session under the line was told something" || ok "under the journal line the session is left alone"
+# read off the hook's STDOUT, like the over-the-line case below: the record's `name` is the tmux window the
+# suite runs in, and a track called a-decision-… made a grep for 'decision' on the record red (2026-09-12)
+{ ! grep -q '"decision": "block"' <<<"$d0"; } && ! grep -q '"say"' "$T/ctx/$sid.json" \
+  && ok "under the journal line the session is left alone" || bad "a session under the line was told something: $d0"
 # over the line: the hook answers on stdout with the Stop decision that makes the session journal (once)
 rm -f "$T/ctx/$sid.json"
 # the fixture is 20k of a 200k window, so the floors (60k/90k) are lowered out of the way for these cases.

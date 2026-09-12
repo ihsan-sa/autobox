@@ -13,14 +13,16 @@ A reply comes back in the lane you asked on. `#alerts` and `#approvals` keep the
 ## How loudly you hear about it
 The ladder — cheapest rung that does the job; the agent picks, you never filter:
 
-1. **@-mention in `#<repo>`** — *you, now*: a decision blocking a track, an approval-class action waiting, an incident touching money, access or anything outward. A mention that could have waited is a bug.
-2. **`needs_owner`** — *next time you open Slack*: a question stalling one track, as a row on your NEEDS YOU list.
+1. **`cc-notify --decision`** — *you, now*: a decision blocking a track, an approval-class action waiting, an incident touching money, access or anything outward. A mention that could have waited is a bug.
+2. **`needs_owner`** — *a question stalling one track*: the thread goes on your NEEDS YOU list as well.
 3. **`#approvals` card** — *one tap when convenient*.
 4. **`#alerts`** — *notable, nothing to do*: handovers, watchdog fallbacks, unit failures.
 5. **`#<repo>-updates`** — *ambient*.
 6. **The digest** — anything that can wait for 11:00 waits for it.
 
-Litmus: needs a decision → mention · needs a tap → approvals · notable only → alerts · else updates or the digest.
+**A message that needs your decision opens with ❓ and @-mentions you; an update, or one session posting into another's channel, carries neither — and nothing else can mention you** (rungs 1 and 2, and a mail the box holds for your verdict, are the only doors; a typed handle of yours goes out as code).
+
+Litmus: needs a decision → ❓ + mention · needs a tap → approvals · notable only → alerts · else updates or the digest.
 
 ## The six ways in
 1. **Slack `#<repo>`** — ask or instruct; that repo's planning session answers in a thread, started for you if it isn't up. Phone-first, and the one to reach for. `#<repo>-updates` reaches the same session and carries what is automated. **Speak it if that is easier** — a voice memo in the channel arrives as a message: the box transcribes it locally, replies under your recording with the words as spoken and the condensed text in italics beneath, and the session answers the condensed text. Needs `cc-voice install` once (USAGE); a parked project stays parked — nothing is transcribed, so the recording queues as an attachment and the session reads it with `cc-voice text <path>` at `!resume`.
