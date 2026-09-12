@@ -5,6 +5,7 @@
 # It does own ONE thing, though: the `main-gate` board row. Every mode runs the `## suites` gates, and the first red one
 # becomes a single row on the control repo's board that updates in place and closes itself on green — see main_gate().
 #   cc-audit checks|review|weekly|monthly|delete|arch|patterns|auto|scopes|selfcheck [--scope N] [--dry] [--no-post] [--no-llm]
+#   cc-audit failure <claim>   one recorded failure cluster, investigated (see FAILURE below; no checks, no gates)
 #   checks = mechanical, no LLM · review = checks + an LLM read of how well the box served the OWNER over 3 days
 #   weekly = checks + one LLM code audit (area rotates by ISO week) · monthly = checks + all four areas + a synthesis
 #   delete = checks + a SECOND OPINION on one question — what should simply go — asked of ANOTHER model (codex).
@@ -38,8 +39,19 @@
 # JSONL events as it goes — verified against a real run before this was written, which is the only reason a silence
 # guard is honest here — so "no output at all for CC_AUDIT_SILENCE seconds" is a real hang signal. When it fires the
 # report SAYS the run was abandoned and how long it had been silent; a killed run is never presented as a review.
+# FAILURE — `cc-audit failure <claim>` (docs/design-failure-noticing-2026-09-11.md, The investigation). The claim is a
+# line cc-reconcile took with `cc-failures claim` (or a cluster id, by hand); `cc-failures packet` is the whole
+# evidence. Two passes of the SAME Claude child, behind the SAME wall: the broad pass (Sonnet) notices the pattern,
+# locates the origin and writes a hypothesis, a rival and one test into a handoff; the narrow pass (a fresh context
+# on the band the handoff names — routine Sonnet, interacting Opus, authority Fable) runs that test. Caps for the job,
+# broad pass included: $1 routine, $2 the other two; BUD_FAIL_BROAD is the broad pass's share. `TEST: none` in the
+# handoff means no narrow pass. The report goes to ~/.cc/failures/reports/<claim>.md (CC_FAILURES moves the dir)
+# and is delivered as ONE message with the file (cc-slack post --file), to the control repo's channel (CC_AUDIT_FAILURE_TO
+# names another, a test chat) — no mention, no canvas, no cc-notify, no board row: a finding cannot make work. The
+# tier is the launcher's check, not this file's: run by hand it runs.
 # Env: CC_AUDIT_DATE=YYYY-MM-DD (tests) · CC_CLAUDE / CC_CODEX (stub either model) · CODEX_MODEL / CODEX_EFFORT
-# (else ~/.cc/config, else codex's own defaults) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL
+# (else ~/.cc/config, else codex's own defaults) · CC_AUDIT_BUDGET_REVIEW/_WEEKLY/_MONTHLY_TOTAL/_FAILURE_BROAD
+# · CC_AUDIT_FAILURE_TO (where the failure report is posted; default #<control repo>)
 # · CC_AUDIT_SILENCE (seconds of total silence before a codex run is abandoned; default 2700) · CC_AUDIT_POLL.
 set -uo pipefail
 case ":$PATH:" in *":$HOME/bin:"*) ;; *) PATH="$HOME/bin:$PATH";; esac; case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH";; esac; export PATH   # systemd-started: no ~/bin
@@ -60,6 +72,7 @@ cfgval(){ "$R/bin/cc-config" get "$1"; }   # the one reader: it never sources th
 CODEX_MODEL="$(cfgval CODEX_MODEL)"; CODEX_EFFORT="$(cfgval CODEX_EFFORT)"
 BUD_REVIEW="${CC_AUDIT_BUDGET_REVIEW:-6}"; BUD_CODE="${CC_AUDIT_BUDGET_WEEKLY:-8}"; BUD_MONTH="${CC_AUDIT_BUDGET_MONTHLY_TOTAL:-30}"
 BUD_PATTERNS="${CC_AUDIT_BUDGET_PATTERNS:-10}"   # the Slack pass reads a lot of history and is the half that carries the value
+BUD_FAIL_BROAD="${CC_AUDIT_BUDGET_FAILURE_BROAD:-0.40}"; CAP_ROUTINE=1; CAP_STRONG=2   # the failure job: "$1 routine, $2 strong", two passes inside it
 stamp_init(){   # ONE UTC clock read for both: the header's date is the report's date, even at 23:59:59Z, and a
   local now      # CC_AUDIT_DATE (tests) pins the date beside the time rather than leaving the real day next to it.
   now="$(date -u +%FT%TZ)"; DAY="${CC_AUDIT_DATE:-${now%T*}}"; STAMP="${DAY}T${now#*T}"
@@ -67,7 +80,7 @@ stamp_init(){   # ONE UTC clock read for both: the header's date is the report's
 stamp_init
 header(){ printf '# %s audit — checks — %s\n' "$BOX" "$STAMP"; }   # the one place date and time are joined
 log(){ printf '%s\t%s\n' "$STAMP" "$*" >> "$LOG"; }
-USAGE="usage: cc-audit checks|review|weekly|monthly|delete|arch|patterns|auto|scopes|selfcheck [--scope <name>] [--dry] [--no-post] [--no-llm]"
+USAGE="usage: cc-audit checks|review|weekly|monthly|delete|arch|patterns|auto|scopes|selfcheck [--scope <name>] [--dry] [--no-post] [--no-llm] | failure <claim> [--dry] [--no-post] [--no-llm]"
 
 # ---- scopes: DERIVED, so the list cannot rot ----
 # A scope is a subsystem keyword. The names come from the repo itself, in two families:
@@ -97,11 +110,13 @@ scope_files(){   # <scope> -> repo-relative paths, the command first, then its n
       sort -t: -k2,2nr | cut -d: -f1 | sed 's|^\./||'
   } | awk '!seen[$0]++' | head -60
 }
-mode=""; dry=0; post=1; llm_on=1; SCOPE=""; want_scope=0; gate_only=0
+mode=""; dry=0; post=1; llm_on=1; SCOPE=""; want_scope=0; gate_only=0; FID=""; want_id=0
 for a in "$@"; do
   if [ "$want_scope" = 1 ]; then SCOPE="$a"; want_scope=0; continue; fi
+  if [ "$want_id" = 1 ]; then FID="$a"; want_id=0; continue; fi
   case "$a" in
   checks|review|weekly|monthly|delete|arch|patterns|auto|scopes) mode="$a" ;;
+  failure) mode="$a"; want_id=1 ;;
   selfcheck) mode="$a"; dry=1; post=0 ;;   # --dry already guarantees the one thing a selfcheck must guarantee: it writes nothing real
   --scope) want_scope=1 ;;
   --scope=*) SCOPE="${a#--scope=}" ;;
@@ -112,6 +127,7 @@ for a in "$@"; do
 esac; done
 [ "$want_scope" = 0 ] || { echo "cc-audit: --scope needs a name" >&2; echo "$USAGE" >&2; exit 2; }
 [ -n "$mode" ] || { echo "$USAGE" >&2; exit 2; }
+[ "$mode" != failure ] || [ -n "$FID" ] || { echo "cc-audit: failure needs a claim id (cc-failures claim)" >&2; echo "$USAGE" >&2; exit 2; }
 [ "$mode" = scopes ] && { scope_list; exit 0; }
 if [ -n "$SCOPE" ]; then   # an unknown scope is a typo, and the fix is the list — never a silent whole-repo review
   case "$mode" in arch) ;; *) echo "cc-audit: --scope applies to \`arch\` only (got $mode)" >&2; exit 2 ;; esac
@@ -408,10 +424,10 @@ LLM_COST=0
 POSTPONED=""
 dur(){ local s=${1:-0}; if [ "$s" -lt 90 ]; then printf '%ss' "$s"; else printf '%sm %ss' $((s/60)) $((s%60)); fi; }   # how long it ran, in the report: the only cost signal this mode has
 postponed(){ printf '_(postponed: %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; POSTPONED="$2"; }   # $2 names the model too: two backends postpone here now
-llm(){   # llm <out-file> <budget> <prompt> — 20 min hard cap; a failed run leaves a stub and never aborts the audit
-  local out=$1 bud=$2 prompt=$3 j rc res p; j=$(mktemp)
+llm(){   # llm <out-file> <budget> <prompt> [model] — 20 min hard cap; a failed run leaves a stub and never aborts the audit
+  local out=$1 bud=$2 prompt=$3 model=${4:-claude-opus-5} j rc res p; j=$(mktemp)
   if p=$("$LIMIT" status 2>/dev/null); then postponed "$out" "Claude $p"; rm -f "$j"; return 1; fi   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
-  CC_ROLE=worker timeout 20m "$CLAUDE" -p "$prompt" --model claude-opus-5 --max-budget-usd "$bud" --max-turns 60 \
+  CC_ROLE=worker timeout 20m "$CLAUDE" -p "$prompt" --model "$model" --max-budget-usd "$bud" --max-turns 60 \
     --output-format json --setting-sources '' --strict-mcp-config --disable-slash-commands \
     --allowedTools "$ALLOW" --disallowedTools "$DENY" >"$j" 2>>"$LOG"
   rc=$?
@@ -532,6 +548,45 @@ fed_line(){ if [ "$2" = 1 ]; then printf '%s failure patterns fed to codex as `%
   else printf '**no Slack failure patterns fed in** — the Claude pass did not run, so codex reviewed without them'; fi; }
 under(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a < b)}'; }
 short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; printf '%s' "$s"; }   # a phone-readable cut: on a space, never mid-word
+
+# ---- failure: one claimed cluster, two passes behind the wall, one report, one message (FAILURE, top of file) ----
+failure_prompt(){ sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" -e "s|@ID@|$FID|g" "$R/config/audit-failure-$1-prompt.md"; }
+failure_run(){
+  local FDIR="${CC_FAILURES:-$HOME/.cc/failures}" packet="$EV/01-packet.md" hand="$EV/02-handoff.md" narrow="$EV/03-narrow.md"
+  local rep band test model cap bud t0 secs cost_b cost_n msg kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL}"
+  log "start mode=failure id=$FID dry=$dry post=$post ev=$EV"
+  # the packet is the whole evidence; an id the ledger does not hold ends here, before any model runs
+  if ! "$R/bin/cc-failures" packet "$FID" > "$packet" 2>"$EV/packet.err"; then
+    echo "cc-audit: cc-failures packet $FID: $(cat "$EV/packet.err")" >&2; log "failure $FID: no packet"; exit 2; fi
+  scrub; kind=$(sed -n 's/^kind: //p' "$packet" | head -1); t0=$(date +%s)
+  [ "$llm_on" = 1 ] || { echo "$packet"; log "done mode=failure id=$FID no-llm: the packet only"; exit 0; }   # --no-llm: the packet, no spend, no post
+  # steps 1-3, the broad pass: Sonnet, the packet, a handoff a fresh context can take
+  llm "$hand" "$BUD_FAIL_BROAD" "$(failure_prompt broad)" claude-sonnet-5 || ok=0
+  cost_b=${LLM_COST:-0}
+  band=$(sed -n 's/^BAND:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1); test=$(sed -n 's/^TEST:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1)
+  # "Sonnet for a single-tool mechanism, Opus for interacting tools or concurrency, Fable for authority, security or system-level reasoning"
+  case "$band" in interacting) model=claude-opus-5; cap=$CAP_STRONG ;; authority) model=claude-fable-5-1; cap=$CAP_STRONG ;; *) band=routine; model=claude-sonnet-5; cap=$CAP_ROUTINE ;; esac
+  if [ "$ok" = 0 ]; then printf '_(no narrow pass: the broad pass did not run)_\n' > "$narrow"; cost_n=0
+  elif [ "$test" = none ]; then printf '_(no narrow pass: the broad pass found no discriminating test — see its ## test)_\n' > "$narrow"; cost_n=0   # "If no discriminating test exists, stop here"
+  else   # step 4, the narrow pass: a fresh context, the handoff and the packet, the band's model, what the cap has left
+    bud=$(awk -v c="$cap" -v b="$cost_b" 'BEGIN{r=c-b; if (r<0.10) r=0.10; printf "%.2f", r}')
+    llm "$narrow" "$bud" "$(failure_prompt narrow)" "$model" || ok=0
+    cost_n=${LLM_COST:-0}
+  fi
+  secs=$(( $(date +%s) - t0 ))
+  rep="$FDIR/reports/$FID.md"; [ "$dry" = 1 ] && rep="$OUTDIR/$FID.md"
+  mkdir -p "$(dirname "$rep")" || exit 1
+  { printf '_investigation %s · %s · band %s (%s) · Sonnet $%.2f + $%.2f · ran %s · %s_\n\n' "$FID" "$kind" "$band" "$model" "$cost_b" "$cost_n" "$(dur "$secs")" "$STAMP"
+    printf '## broad pass (claude-sonnet-5)\n\n'; cat "$hand"; printf '\n---\n\n## narrow pass (%s)\n\n' "$model"; cat "$narrow"; } > "$rep"
+  # the five lines the owner reads; a report with none gets one line and the file, never nothing
+  msg=$(sed -n '/^## message/,$p' "$narrow" | sed '1d' | grep -v '^[[:space:]]*$' | head -5)
+  [ -n "$msg" ] || msg="**Investigation $FID** ($kind): $( [ "$ok" = 1 ] && echo "no five-line message came back" || echo "the model run failed or was postponed" ) — the report is attached."
+  if [ "$dry" = 1 ]; then cat "$rep"; else echo "$rep"; fi
+  # ONE message, the file with it, where the box's reports go — and nothing else: no canvas, no cc-notify, no board row
+  [ "$post" = 0 ] || cc-slack post --file "$rep" --to "$to" -m "$msg" >/dev/null 2>>"$LOG" || log "failure $FID: post to $to failed"
+  log "done mode=failure id=$FID band=$band model=$model cost=$cost_b+$cost_n secs=$secs ok=$ok test=${test:-?} out=$rep"
+  exit 0
+}
 
 # ---- selfcheck: every branch of codex_run(), against stub codex binaries. No network, no spend, no real files ----
 # The logged-out branch is the one that matters today: codex is installed on this box but NOT logged in, so this is
@@ -924,6 +979,64 @@ PY
   local DAY STAMP; CC_AUDIT_DATE=2026-01-01 stamp_init
   sck "$(tf grep -Eq '^# .+ audit — checks — 2026-01-01T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<<"$(header)")" "header: <local date>T<utc time>Z cannot happen — a fixed CC_AUDIT_DATE is the date beside the time"
 
+  # 11. `failure <claim>`: the packet, two passes behind the same wall, one report, one message, no board row.
+  # A HOME of its own: the stub model, cc-slack, cc-board and cc-notify sit in $HOME/bin, which line 3 puts first
+  # on PATH; the ledger is CC_FAILURES; nothing reaches the box's own state, channel or board.
+  local fh="$d/fhome" cl F; mkdir -p "$fh/bin" "$fh/.cc/failures"; F="$R/bin/cc-failures"
+  cat > "$fh/bin/claude" <<'S'
+#!/bin/sh
+printf '%s\n' "$@" >> "$CC_SC_ARGV"
+p=""; n=0; for a in "$@"; do [ "$n" = 1 ] && { p=$a; n=0; }; [ "$a" = -p ] && n=1; done
+case "$p" in
+  *"You are the narrow pass"*) printf '{"result":"## hypothesis\\nthe guard reads the text, not the command\\n## message\\n**Decision:** review the guard.\\nPattern: three refusals on text.\\nHypothesis: text, not command.\\nCost so far: three turns.\\nNext review: the guard selfcheck.\\n","total_cost_usd":0.30}';;
+  *) printf '{"result":"## pattern\\nrefusals on text\\n## test\\nrun the guard on the three commands\\nBAND: %s\\nTEST: %s\\n","total_cost_usd":0.05}' "${CC_SC_BAND:-interacting}" "${CC_SC_TEST:-yes}";;
+esac
+S
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "$HOME/slack.log"\n' > "$fh/bin/cc-slack"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "$HOME/board.log"; [ "$1" = boards ] && exit 0; echo "{}"\n' > "$fh/bin/cc-board"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" >> "$HOME/notify.log"\n' > "$fh/bin/cc-notify"
+  chmod +x "$fh"/bin/*
+  local day; for day in 01 03 05; do CC_FAILURES="$fh/.cc/failures" "$F" record --scope sc --kind guard-policy/permitted-text-refused --observed "a grep pattern was refused" --ts "2026-09-${day}T10:00Z" >/dev/null; done
+  cl=$(CC_FAILURES="$fh/.cc/failures" "$F" claim | cut -f1)
+  CC_SC_ARGV="$d/fargv"; : > "$CC_SC_ARGV"
+  # off $R, not $0: line 58 already cd-ed, so a relative $0 (core/bin/cc-audit selfcheck from the repo root) no longer resolves
+  fb(){ env HOME="$fh" CC_FAILURES="$fh/.cc/failures" CC_CLAUDE="$fh/bin/claude" CC_BOARD="$fh/bin/cc-board" CC_AUDIT_FAILURE_TO='#sc-test' "$@" "$R/bin/cc-audit" failure "$cl"; }
+  out=$(fb 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0)" "failure: runs end to end against the stub model — rc 0, the report path on stdout"
+  sck "$(tf test -s "$fh/.cc/failures/reports/$cl.md")" "failure: ONE report, at ~/.cc/failures/reports/<claim>.md, and show says reported"
+  sck "$(tf grep -q "$cl reported" <<<"$(CC_FAILURES="$fh/.cc/failures" "$F" show --scope sc)")" "…and cc-failures show says so"
+  sck "$(tf test "$(grep -cxF -- "$ALLOW" "$CC_SC_ARGV")" = 2)" "failure: THE WALL — both passes carry the allow-list: Read, Grep, Glob, LS and nothing else"
+  local rh; rh=${DENY#*Read(/}; rh=${rh%%/.cc/config)*}   # the HOME the list above was built with: section 8 made HOME local
+  sck "$(tf test "$(grep -cxF -- "${DENY//$rh/$fh}" "$CC_SC_ARGV")" = 2)" "failure: …and the deny-list: Bash, every escape hatch, the secret paths (under the child's own HOME)"
+  sck "$(tf test "$(grep -c -- '^--strict-mcp-config$' "$CC_SC_ARGV")" = 2)" "failure: …and no MCP server, so no Slack tool to post with"
+  sck "$(tf test "$(grep -c -- '^--setting-sources$' "$CC_SC_ARGV")" = 2)" "failure: …and no settings file, so the allow-list is the whole permission surface"
+  sck "$(tf test "$(grep -A1 -- '^--model$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = 'claude-sonnet-5 claude-opus-5')" "failure: the broad pass is Sonnet; BAND: interacting sends the narrow pass to Opus"
+  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.40 1.95')" "failure: the strong cap is \$2 for the job — the narrow pass gets what the broad pass left"
+  sck "$(tf test "$(grep -c '^post$' "$fh/slack.log")" = 1)" "failure: ONE message — no canvas, no second post"
+  sck "$(tf grep -qx -- '--to' "$fh/slack.log" && grep -qx '#sc-test' "$fh/slack.log" && grep -q '^\*\*Decision:\*\* review the guard\.' "$fh/slack.log" && grep -qx -- "$fh/.cc/failures/reports/$cl.md" "$fh/slack.log")" "…to the chat named, the five lines opening with the decision, the report as its file"
+  sck "$(ntf grep -q -- '--mention' "$fh/slack.log")" "…and no mention"
+  sck "$(ntf test -s "$fh/board.log")" "failure: no board row — a finding cannot make work"
+  sck "$(ntf test -s "$fh/notify.log")" "failure: no cc-notify — the one message is the whole delivery"
+  sck "$(tf grep -q '^_investigation .* band interacting (claude-opus-5) .* ran ' "$fh/.cc/failures/reports/$cl.md")" "failure: the report's first line says the band, the model and what it cost"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  out=$(fb CC_SC_BAND=authority 2>&1)
+  sck "$(tf test "$(grep -A1 -- '^--model$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = 'claude-sonnet-5 claude-fable-5-1')" "failure: BAND: authority sends the narrow pass to Fable"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  out=$(fb CC_SC_BAND=routine 2>&1)
+  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.40 0.95')" "failure: BAND: routine — Sonnet both passes, \$1 for the job"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  out=$(fb CC_SC_TEST=none 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1)" "failure: TEST: none — no discriminating test, so no narrow pass: one model context, not two"
+  sck "$(tf grep -q 'no narrow pass' "$fh/.cc/failures/reports/$cl.md" && grep -q '^\*\*Investigation ' "$fh/slack.log")" "…the report says so and the message is the fallback line, still one post"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  out=$(env HOME="$fh" CC_FAILURES="$fh/.cc/failures" CC_CLAUDE="$fh/bin/claude" "$R/bin/cc-audit" failure i-nope 2>&1); rc=$?
+  sck "$(tf test "$rc" = 2 && ! test -s "$CC_SC_ARGV" && ! test -f "$fh/slack.log")" "failure: an id the ledger does not hold is refused before any model runs, rc 2, nothing posted"
+  out=$(env HOME="$fh" CC_FAILURES="$fh/.cc/failures" CC_CLAUDE="$fh/bin/claude" "$R/bin/cc-audit" failure "$cl" --no-llm 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && ! test -s "$CC_SC_ARGV" && ! test -f "$fh/slack.log" && grep -q '^# failure packet' "$out")" "failure --no-llm: the packet is built and printed by path, no model runs, nothing is posted"
+  out=$(env HOME="$fh" CC_FAILURES="$fh/.cc/failures" CC_CLAUDE="$fh/bin/claude" "$R/bin/cc-audit" failure "$cl" --dry 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && ! test -f "$fh/.cc/failures/reports/$cl.md" && ! test -f "$fh/slack.log" && grep -q '^## message' <<<"$out")" "failure --dry: the report prints, nothing is written under ~/.cc/failures and nothing is posted"
+  unset -f fb
+
   unset CC_SC_ARGV; rm -rf "$d"
   echo "cc-audit selfcheck: $((n - f)) passed, $f failed"
   [ "$f" -eq 0 ]
@@ -931,6 +1044,7 @@ PY
 [ "$mode" = selfcheck ] && { selfcheck; exit $?; }
 
 # ---- run ----
+[ "$mode" = failure ] && failure_run   # exits: the investigation runs no checks and owns no gate row
 log "start mode=$mode dry=$dry post=$post llm=$llm_on day=$DAY since=$SINCE ev=$EV"
 checks
 [ "$dry" = 1 ] || main_gate "$SUITE_FAIL"   # ONE owned row for main's baseline, in every mode: they all run checks

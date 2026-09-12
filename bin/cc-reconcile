@@ -94,6 +94,17 @@ Ending one means SIGTERM to its process group, `blocked` on the board, and one l
 numbers. There is no spend cap anywhere in this box (owner, 2026-08-31: "no spend cap as some just are
 expensive"): an expensive job that keeps moving is never touched by any of this.
 
+THE FAILURE INVESTIGATION rides the same turn (docs/design-failure-noticing-2026-09-11.md, The investigation). Once
+per unfiltered --apply pass: if ~/.cc/config has CC_FAILURES_INVESTIGATE=on — the owner's one named setting, and
+absent it is inert on every box — and `cc-tier allows explore` says yes, and no `cc-audit failure` is running, the
+pass takes ONE eligible cluster with `cc-failures claim` (once per cluster, two a day; the ledger says why not) and
+launches `cc-audit failure <claim>` as a transient user unit that outlives this oneshot (a detached child without a
+user manager). The tier saying no stands the pass down and claims nothing: the cluster stays eligible and visible
+with its age on `cc board failures`. Recording is never gated; the launch is the only thing the tier holds. Nothing
+here reads the report, opens a row or posts: cc-audit delivers, and a finding cannot make work. See investigate().
+CC_RECONCILE_LAUNCH=CMD (tests) runs `CMD failure <claim>` in place of the unit and skips the running-investigation
+scan, which is box-wide: a fixture must never be held by the box's own investigation.
+
 Exit: 0 the board matches reality · 1 something needs a person · 2 usage error.
 """
 import calendar, glob, json, os, re, shutil, signal, subprocess, sys, time
@@ -1066,6 +1077,75 @@ def end_it(pids):
     return ok
 
 
+INVESTIGATE_KEY = "CC_FAILURES_INVESTIGATE"   # the one named setting (decision 5): `cc-config set CC_FAILURES_INVESTIGATE on`
+
+
+def investigate():
+    """Claim one eligible failure cluster and launch its bounded investigation (docstring: THE FAILURE INVESTIGATION).
+    Returns the line to print, or None when there was nothing to say. Never raises: a timer pass is not to die on this."""
+    def run(*a, timeout=30):
+        try:
+            return subprocess.run(a, capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            return None
+    p = run(f"{BIN}/cc-config", "get", INVESTIGATE_KEY)
+    if not p or p.stdout.strip().lower() != "on":
+        return None                                 # inert until the owner turns it on; no line, no claim
+    p = run(f"{BIN}/cc-failures", "eligible")
+    if not p or p.returncode != 0 or not p.stdout.strip():
+        return None                                 # nothing eligible: a quiet day adds nothing
+    # "the launch checks `cc-tier allows explore` and stands down when it says no, the cluster staying eligible and
+    # visible with its age" — no claim is taken, so `cc board failures` keeps saying `unclaimed <age>`
+    t = run(f"{BIN}/cc-tier", "allows", "explore")
+    if not t or t.returncode != 0:
+        n = sum(1 for ln in p.stdout.splitlines() if ln.strip() and "\tunclaimed" in ln)
+        return f"  held       failure investigation: the tier holds explore work; {n} eligible cluster(s) wait, unclaimed" if n else None
+    launcher = os.environ.get("CC_RECONCILE_LAUNCH")   # tests: a stub in place of the unit
+    me = os.getpid()                                # one at a time: an investigation still running holds the next
+    # The scan is box-wide, so a test must not run it: with the setting on, the box's own investigation in flight
+    # (two passes, up to 20 min) would hold a fixture's launch and turn the selfcheck red (the same process-table
+    # flake selftest.sh records fixing). A stubbed launcher runs nothing that outlives the pass, so nothing to hold on.
+    for d in [] if launcher else os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            argv = open(f"/proc/{d}/cmdline", "rb").read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if any(os.path.basename(a) == "claude" for a in argv):
+            continue                                # a session's prompt QUOTES the command; it is not running it
+        if any(os.path.basename(a) == "cc-audit" and argv[i + 1:i + 2] == ["failure"] for i, a in enumerate(argv)):
+            return None
+    c = run(f"{BIN}/cc-failures", "claim")
+    if not c or c.returncode != 0:
+        return None                                 # claimed already, or the day's slots spent: cc-failures said why
+    claim, cluster, scope, kind = (c.stdout.rstrip("\n").split("\t") + ["", "", "", ""])[:4]
+    if launcher:
+        r = run(launcher, "failure", claim); how = "stub" if r and r.returncode == 0 else "stub failed"
+    else:
+        # A transient unit, not a child: this pass is a oneshot service, and a child in its control group dies with it
+        # minutes before the model answers — the same reason the lander's queue worker is started this way.
+        unit = f"cc-audit-failure-{claim}"
+        r = run("systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}",
+                "--description=cc-audit: one bounded failure investigation", f"{BIN}/cc-audit", "failure", claim, timeout=120)
+        if r and r.returncode == 0:
+            how = unit
+        else:
+            try:
+                subprocess.Popen([f"{BIN}/cc-audit", "failure", claim], start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                how = "a detached child (no systemd --user here)"
+            except Exception as e:
+                how = f"launch failed: {e.__class__.__name__}"
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(f"{STATE}/reconcile.log", "a") as log:
+            log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\tinvestigation\t{claim} {cluster} {scope}/{kind}\t{how}\n")
+    except OSError:
+        pass
+    return f"  investigation  {claim} {scope}/{kind} ({cluster}) — cc-audit failure launched: {how}"
+
+
 def board(*args):
     try:
         return subprocess.run([f"{BIN}/cc-board", *args], capture_output=True, text=True, timeout=30).returncode == 0
@@ -1222,6 +1302,10 @@ def main(argv):
                 subprocess.run([f"{BIN}/cc-slack", "approvals-sweep"], capture_output=True, timeout=180)
             except Exception:                       # edited (a merge in GitHub's UI, a card from before the edit
                 pass                                # existed). cc-slack owns the card; this only gives it a turn
+        if apply_:                                  # and one failure investigation, if the owner's setting and the tier allow (investigate())
+            inv = investigate()
+            if inv and not quiet and not as_json:
+                print(inv)
     asks = [r for r in recs if r["kind"] in ("ask", "stop")]   # a runaway that was ended is still a person's to settle
     if as_json:
         print(json.dumps({"tracks": tracks, "records": recs}, indent=2))
@@ -2411,6 +2495,74 @@ def selfcheck():
            bounded(lambda: [(os.path.basename(fn), d) for fn, d in boards()]) == [("pipe.json", None), ("real.json", {"repo": "real", "tracks": {}})])
     finally:
         shutil.rmtree(BOARDS, ignore_errors=True); BOARDS = _b
+    # ── the failure investigation: inert until the owner's setting, held by the tier, one claim, one launch ──
+    th6 = tempfile.mkdtemp(prefix="cc-reconcile-inv-")
+    try:
+        env6 = dict(os.environ, HOME=th6, CC_CONFIG=f"{th6}/.cc/config", CC_FAILURES=f"{th6}/.cc/failures",
+                    CC_NOTIFY_LOG_ONLY="1", CC_NOTIFY_LOG=f"{th6}/notify.log", CC_RECONCILE_INJECT="/bin/true",
+                    CC_RECONCILE_LAUNCH=f"{th6}/launch")
+        os.makedirs(f"{th6}/.cc/boards"); os.makedirs(f"{th6}/.cc/state")
+        open(f"{th6}/launch", "w").write(f'#!/bin/sh\necho "$@" >> {th6}/launch.log\n'); os.chmod(f"{th6}/launch", 0o755)
+        F6 = f"{BIN}/cc-failures"
+
+        def rec6(kind, days_ago, **kw):
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days_ago * 86400))
+            a = [F6, "record", "--scope", "sc", "--kind", kind, "--observed", "o", "--ts", ts]
+            for k, v in kw.items():
+                a += [f"--{k}", v]
+            subprocess.run(a, env=env6, capture_output=True)
+
+        def launched():
+            return open(f"{th6}/launch.log").read().splitlines() if os.path.exists(f"{th6}/launch.log") else []
+
+        def elig():
+            return subprocess.run([F6, "eligible"], env=env6, capture_output=True, text=True).stdout
+
+        def run6(*extra):
+            return subprocess.run([sys.executable, os.path.realpath(__file__), *extra, "--no-net", "--grace", "0"],
+                                  env=env6, capture_output=True, text=True, timeout=120)
+
+        for d in (5, 3, 1):
+            rec6("guard-policy/permitted-text-refused", d)           # three episodes: eligible on the rule
+        r = run6("--apply", "--notify")
+        ok("INERT: with no setting the pass claims nothing and launches nothing; the cluster reads eligible and unclaimed",
+           launched() == [] and "unclaimed" in elig() and "investigation" not in r.stdout)
+        subprocess.run([f"{BIN}/cc-config", "set", "CC_FAILURES_INVESTIGATE", "on"], env=env6, capture_output=True)
+        # the tier is pinned in the ENVIRONMENT, not written with `cc-tier set`: the environment outranks the file
+        # (cc-config), and selftest.sh exports CC_SPEND_TIER=autonomous over every fixture it runs
+        env6["CC_SPEND_TIER"] = "moderate"
+        r = run6("--apply", "--notify")
+        ok("TIER STAND-DOWN: the setting on but `cc-tier allows explore` says no (moderate): no claim, no launch, "
+           "the cluster still eligible and unclaimed with its age, and the run says the tier holds it",
+           launched() == [] and re.search(r"\tunclaimed \d", elig()) and "tier holds" in r.stdout)
+        env6["CC_SPEND_TIER"] = "autonomous"
+        # a `cc-audit failure` running on the BOX (here: a sleeping script by that name) must not hold a stubbed pass —
+        # the running-investigation scan is box-wide, and skipped under CC_RECONCILE_LAUNCH
+        open(f"{th6}/cc-audit", "w").write("#!/bin/sh\nsleep 60\n"); os.chmod(f"{th6}/cc-audit", 0o755)
+        ghost = subprocess.Popen([f"{th6}/cc-audit", "failure", "i-elsewhere"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            r = run6("--apply", "--notify")
+        finally:
+            ghost.kill(); ghost.wait()
+        ok("LAUNCH: the setting on and the tier autonomous: ONE claim, ONE launch of `cc-audit failure <claim>` — "
+           "with a `cc-audit failure` of the box's own running, which a stubbed pass does not see",
+           len(launched()) == 1 and launched()[0].startswith("failure i-") and "claimed" in elig() and "investigation" in r.stdout)
+        r = run6("--apply", "--notify")
+        ok("CLAIM ONCE: a second pass launches nothing — the cluster is held by its claim", len(launched()) == 1)
+        ok("…and the launch is in reconcile.log", os.path.exists(f"{th6}/.cc/state/reconcile.log")
+           and "investigation" in open(f"{th6}/.cc/state/reconcile.log").read())
+        rec6("gate-target/wrong-revision", 1, critical="main-gate-or-deploy-red")   # a second cluster, critical: the day's other slot
+        r = run6()
+        ok("a report-only pass (no --apply) never launches, whatever is eligible", len(launched()) == 1)
+        r = run6("snapshot")
+        ok("…nor does `snapshot`, which is pure", len(launched()) == 1)
+        r = run6("--apply", "--notify")
+        ok("…the next --apply pass claims and launches the critical cluster: one launch per pass", len(launched()) == 2 and "failure i-" in launched()[1])
+        notified = open(f"{th6}/notify.log").read() if os.path.exists(f"{th6}/notify.log") else ""   # the handoff sweep may log the box's own panes here
+        ok("no page and no board row came of it: a claim and a launch are ledger writes, and the report is cc-audit's to deliver",
+           "investigation" not in notified and all(ln.split()[1] not in notified for ln in launched()) and os.listdir(f"{th6}/.cc/boards") == [])
+    finally:
+        shutil.rmtree(th6, ignore_errors=True)
     print(f"cc-reconcile selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 

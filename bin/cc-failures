@@ -9,6 +9,8 @@ usage: cc-failures record --scope S --kind CONTRACT/SYMPTOM --observed TEXT [--e
                           [--corrects ID]
        cc-failures show [--scope S] [--as-of UTC] [--all] [ID]   (--json: the records, corrections folded in)
        cc-failures eligible [--scope S] [--as-of UTC]
+       cc-failures claim [--scope S] [--as-of UTC] [--dry]      (one eligible cluster, claimed once; the launch's call)
+       cc-failures packet ID                                   (the investigation's packet, markdown; ID a claim or a cluster)
        cc-failures metrics [FIXTURE] [--scope S]        (the shipped one: tests/failures-fixture.jsonl)
        cc-failures import REPO [--dry]
        cc-failures kinds
@@ -36,6 +38,18 @@ An episode is a run of records of one fingerprint closer than 30 minutes to each
 twice in a minute is one episode. A refuted record counts nowhere; an asserted one (a candidate) counts nowhere
 until confirmed. After fourteen quiet days a cluster leaves the active view (`--all` shows it); its records stay.
 
+THE CLAIM (docs: The investigation). `claim` takes the first eligible cluster nobody holds and writes one line to
+~/.cc/failures/claims.jsonl (`i-<hash>`, the finding id); it prints `<claim>\t<cluster>\t<scope>\t<kind>\t<why>\t<slot>`
+and exits 1 with a reason on stderr when there is nothing to claim. One claim per cluster per 14 days — later
+instances attach; a cluster still eligible 14 days on is a repeat and may be claimed again. Two a rolling day, by
+slot: one `routine` (any cluster) and one `critical` (a cluster with a critical record; it may take the routine slot
+too). The claim is the ledger's whole part in an investigation: the tier check, the launch and the report belong to
+cc-reconcile and `cc-audit failure <claim>`, and the report lands at ~/.cc/failures/reports/<claim>.md. `show`,
+`eligible` and `board` say `claimed <when> <claim>` (`reported` once the file is there) or `unclaimed <age>`, the age
+counted from the moment the rule fired, so a cluster nobody may investigate stays visible with its age. `packet`
+prints what the investigation reads: the count, span, writers, detectors and costs, the first, the crossing and the
+newest record, at most six excerpts of distinct evidence, and the scope's other clusters.
+
 PERSON-FIRST: `--detector person` writes the record AND a `failure-detection/person-first` record beside it,
 critical, linked by `links.episode` — a person catching a failure the box did not record is critical every time,
 and the gap is a failure of its own that stays out of the failure count.
@@ -51,7 +65,7 @@ the unknown-detector and person-first shares. With a labelled fixture (JSONL: la
 the import's own classifier and time parser over each line and prints the false-match rate (pairs grouped
 together whose labels differ), the false-split rate (pairs of one label grouped apart), the share of stated times
 recovered, and the recording delay."""
-import sys, os, re, json, fcntl, hashlib, datetime, subprocess, statistics, tempfile, shutil
+import sys, os, re, json, fcntl, hashlib, datetime, subprocess, statistics, tempfile, shutil, collections
 
 B = os.path.dirname(os.path.realpath(__file__))
 DIR = os.environ.get("CC_FAILURES") or os.path.expanduser("~/.cc/failures")
@@ -65,6 +79,8 @@ STATUSES = ("confirmed", "asserted", "refuted")
 DETECTORS = ("box", "person", "unknown")
 GAP_KIND = "failure-detection/person-first"
 FP_VERSION = "v1"
+SLOTS = {"routine": 1, "critical": 1}   # claims per rolling day, by slot: "one routine and one extra critical per rolling day"
+DAY = 86400
 
 def die(msg, rc=2):
     print(f"cc-failures: {msg}", file=sys.stderr); sys.exit(rc)
@@ -90,7 +106,7 @@ def fpid(fp): return "c-" + hashlib.sha1(fp.encode()).hexdigest()[:8]
 # ---------------------------------------------------------------- the ledger: append under a lock, read and fold
 SCOPE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")   # a board's name; never a path
 def _path(scope):
-    if not SCOPE.match(scope): die(f"scope is a workspace or project name, got '{scope}'")
+    if not SCOPE.match(scope) or scope == "claims": die(f"scope is a workspace or project name, got '{scope}'")   # claims.jsonl is the claim ledger, never a scope
     return os.path.join(DIR, f"{scope}.jsonl")
 def append(scope, rec):
     os.makedirs(DIR, exist_ok=True)
@@ -100,7 +116,7 @@ def append(scope, rec):
         f.write(line); f.flush(); os.fsync(f.fileno())
 def scopes():
     if not os.path.isdir(DIR): return []
-    return sorted(fn[:-6] for fn in os.listdir(DIR) if fn.endswith(".jsonl"))
+    return sorted(fn[:-6] for fn in os.listdir(DIR) if fn.endswith(".jsonl") and fn != "claims.jsonl")
 def load(scope=None):
     """Every record, corrections folded in: a record with `corrects` sets the status of the record it names (the
     latest correction wins) and is not itself a record. Unreadable lines are said on stderr and skipped."""
@@ -120,6 +136,32 @@ def load(scope=None):
         if c["corrects"] in by:
             by[c["corrects"]]["status"] = c["status"]; by[c["corrects"]].setdefault("corrections", []).append(c["id"])
     return recs
+
+def claims_path(): return os.path.join(DIR, "claims.jsonl")
+def report_path(claim_id): return os.path.join(DIR, "reports", f"{claim_id}.md")
+def claims():
+    p = claims_path()
+    if not os.path.isfile(p): return []
+    out = []
+    with open(p) as f:
+        for n, line in enumerate(f, 1):
+            if not line.strip(): continue
+            try: out.append(json.loads(line))
+            except ValueError: print(f"cc-failures: {p}:{n}: not JSON, skipped", file=sys.stderr)
+    return out
+def append_claim(rec):
+    os.makedirs(DIR, exist_ok=True)
+    with open(claims_path(), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n"); f.flush(); os.fsync(f.fileno())
+def held(cid, ks, as_of):
+    """The claim holding cluster `cid` as of `as_of`: the newest one younger than the window, else None."""
+    mine = [k for k in ks if k.get("cluster") == cid and parse_ts(k.get("ts")) and
+            0 <= (as_of - parse_ts(k["ts"])).total_seconds() < WINDOW_DAYS * DAY]
+    return max(mine, key=lambda k: k["ts"]) if mine else None
+def age(a, b):
+    m = int((a - b).total_seconds() // 60)
+    return f"{m // 1440}d {m % 1440 // 60}h" if m >= 1440 else (f"{m // 60}h {m % 60}m" if m >= 60 else f"{m}m")
 
 def new_id(seed=None):
     seed = seed or os.urandom(8).hex()
@@ -172,9 +214,10 @@ def episodes(recs):
         else: out.append([t])
     return out
 
-def clusters(recs, as_of=None):
-    """Group by fingerprint and apply the rule as of `as_of` (default now). Records after as_of are not seen."""
-    as_of = as_of or now_dt()
+def clusters(recs, as_of=None, ks=None):
+    """Group by fingerprint and apply the rule as of `as_of` (default now). Records after as_of are not seen.
+    `ks`: the claims (read once by the caller), so each eligible cluster knows who holds it."""
+    as_of = as_of or now_dt(); ks = claims() if ks is None else ks
     since = as_of - datetime.timedelta(days=WINDOW_DAYS)
     by = {}
     for r in recs:
@@ -188,23 +231,98 @@ def clusters(recs, as_of=None):
         eps = episodes(live); eps14 = [e for e in eps if e[-1] >= since.replace(second=0)]   # any record of it in the window
         # THE RULE, verbatim: "eligible = critical OR distinct confirmed episodes of the fingerprint in the last 14 days >= 3"
         why = f"critical: {crit[0]['critical']}" if crit else (f"{len(eps14)} episodes in {WINDOW_DAYS}d" if len(eps14) >= EPISODES_NEEDED else "")
+        # when the rule fired: the critical record's own time, or the first stamp of the third episode in the window
+        crossed = min(r["ts"] for r in crit) if crit else (utc(eps14[EPISODES_NEEDED - 1][0]) if why else "")
         stamps = sorted(r["ts"] for r in live) or sorted(r["ts"] for r in rs)
-        out.append({"id": fpid(fp), "fingerprint": fp, "scope": rs[0]["scope"], "kind": rs[0]["kind"],
+        cid = fpid(fp); k = held(cid, ks, as_of) if why else None
+        out.append({"id": cid, "fingerprint": fp, "scope": rs[0]["scope"], "kind": rs[0]["kind"],
                     "records": len(rs), "confirmed": len(live), "episodes": len(eps), "episodes_14d": len(eps14),
-                    "critical": len(crit), "eligible": why, "active": bool(recent),
+                    "critical": len(crit), "eligible": why, "crossed": crossed, "active": bool(recent),
                     "first": stamps[0] if stamps else "", "last": stamps[-1] if stamps else "",
-                    "person_first": sum(1 for r in live if r["detector"]["who"] == "person")})
+                    "person_first": sum(1 for r in live if r["detector"]["who"] == "person"),
+                    "claim": k, "reported": bool(k and os.path.isfile(report_path(k["id"])))})
     out.sort(key=lambda c: (not c["eligible"], -c["episodes_14d"], c["kind"]))
     return out
 
-def render(cl, all_=False, board=False):
+def claim_word(c, as_of=None):
+    """What show/eligible/board say beside an eligible cluster: who holds it, or how long nobody has."""
+    if not c["eligible"]: return ""
+    if c["claim"]: return f"claimed {c['claim']['ts'][:16]} {c['claim']['id']}" + (" reported" if c["reported"] else "")
+    return f"unclaimed {age(as_of or now_dt(), parse_ts(c['crossed']))}"
+
+def claim_one(scope=None, as_of=None, dry=False):
+    """The first eligible cluster nobody holds, within the day's slots → the claim (written unless dry), or None
+    with the reason on stderr. Never touches a scope ledger: recording stays what it was."""
+    as_of = as_of or now_dt(); ks = claims()
+    cl = [c for c in clusters(load(scope), as_of, ks) if c["eligible"]]
+    free = [c for c in cl if not c["claim"]]
+    today = [k for k in ks if parse_ts(k.get("ts")) and 0 <= (as_of - parse_ts(k["ts"])).total_seconds() < DAY]
+    used = {slot: sum(1 for k in today if k.get("slot") == slot) for slot in SLOTS}
+    for c in free:
+        # a critical cluster takes the critical slot, or the routine one when that is free; a routine cluster only the routine one
+        slot = next((sl for sl in (("critical", "routine") if c["critical"] else ("routine",)) if used[sl] < SLOTS[sl]), None)
+        if not slot: continue
+        k = {"id": "i-" + hashlib.sha1(f"{c['id']}|{utc(as_of)}".encode()).hexdigest()[:8], "ts": utc(as_of), "cluster": c["id"],
+             "scope": c["scope"], "kind": c["kind"], "why": c["eligible"], "slot": slot, "critical": bool(c["critical"])}
+        if not dry: append_claim(k)
+        return k
+    why = (f"{len(cl)} eligible, {len(cl) - len(free)} claimed" + (f", the day's {'/'.join(sl for sl in SLOTS if used[sl] >= SLOTS[sl])} slot(s) used" if free else "")) if cl else "nothing eligible"
+    print(f"cc-failures: nothing to claim: {why}", file=sys.stderr)
+    return None
+
+def packet(ident, as_of=None):
+    """The investigation's packet (docs: The investigation, step 1), for a claim id or a cluster id."""
+    ks = claims(); k = next((x for x in ks if x.get("id") == ident), None)
+    cid = k["cluster"] if k else ident
+    recs = [r for r in load() if r["cluster"] == cid]
+    if not recs: die(f"no claim or cluster {ident}")
+    scope = recs[0]["scope"]; as_of = as_of or now_dt()
+    k = k or held(cid, ks, as_of)   # by cluster id: the claim holding it now, if any
+    cl = clusters(load(scope), as_of, ks); c = next((x for x in cl if x["id"] == cid), None)
+    if not c: die(f"cluster {cid} has no record as of {utc(as_of)}")
+    cat = catalogue().get("kinds", {}).get(c["kind"], {})
+    live = sorted((r for r in recs if r["status"] == "confirmed" and parse_ts(r["ts"]) <= as_of), key=lambda r: r["ts"])
+    if not live: die(f"cluster {cid} has no confirmed record")
+    def rec(r, tag):
+        L = [f"### {tag}: {r['id']}  {r['ts']}  writer {r['writer']}  detector {r['detector']['who']}" + (f"  CRITICAL ({r['critical']})" if r["critical"] else ""),
+             f"expected: {r['expected'] or '(not stated)'}", f"observed: {r['observed']}"]
+        if r["evidence"]: L.append("evidence: " + " · ".join(r["evidence"]))
+        if r["links"]: L.append("links: " + " · ".join(f"{a}={b}" for a, b in r["links"].items()))
+        if r["cost"]: L.append("cost: " + ", ".join(r["cost"]))
+        if r["detector"].get("evidence"): L.append(f"detector evidence: {r['detector']['evidence']}")
+        return "\n".join(L)
+    crossing = next((r for r in live if r["ts"] >= c["crossed"]), live[-1]) if c["crossed"] else live[-1]
+    picked, seen = [], set()
+    for r, tag in ((live[0], "first"), (crossing, "the crossing"), (live[-1], "newest")):
+        if r["id"] not in seen: picked.append((r, tag)); seen.add(r["id"])
+    for r in live:   # then distinct mechanisms: a record whose evidence (or, without any, its observed text) is not one already picked
+        if len(picked) >= 6: break
+        sig = tuple(r["evidence"]) or r["observed"]
+        if r["id"] in seen or any(sig == (tuple(x["evidence"]) or x["observed"]) for x, _ in picked): continue
+        picked.append((r, "excerpt")); seen.add(r["id"])
+    cnt = lambda key: ", ".join(f"{v} {n}" for n, v in sorted(collections.Counter(key(r) for r in live).items(), key=lambda kv: -kv[1]))
+    costs = [x for r in live for x in r["cost"]]
+    out = [f"# failure packet {k['id'] if k else cid} — cluster {cid}", "",
+           f"scope: {scope}", f"kind: {c['kind']}", f"contract: {cat.get('contract', '(not in the catalogue)')}", f"symptom: {cat.get('symptom', '')}",
+           f"records: {c['confirmed']} confirmed of {c['records']}; episodes: {c['episodes']} ({c['episodes_14d']} in {WINDOW_DAYS}d); critical: {c['critical']}; person-first: {c['person_first']}",
+           f"span: {c['first']} .. {c['last']}", f"the rule fired: {c['crossed'] or '(not eligible as of ' + utc(as_of) + ')'} ({c['eligible'] or 'not eligible'})",
+           f"claimed: {k['ts'] + ' slot ' + k['slot'] if k else 'no'}", f"writers: {cnt(lambda r: r['writer'])}", f"detectors: {cnt(lambda r: r['detector']['who'])}",
+           "known costs (as recorded, never summed): " + ("; ".join(costs) if costs else "none recorded"), "",
+           "## records: the first, the crossing, the newest, then distinct excerpts (at most six)", ""]
+    for r, tag in picked: out += [rec(r, tag), ""]
+    out += ["## the scope's other clusters", ""]
+    others = [x for x in cl if x["id"] != cid]
+    out += [f"- {x['id']}  {x['kind']}  {x['confirmed']} record(s), {x['episodes_14d']} episode(s) in {WINDOW_DAYS}d" + (f"  ELIGIBLE ({x['eligible']})" if x["eligible"] else "") for x in others] or ["(none)"]
+    print("\n".join(out))
+
+def render(cl, all_=False, board=False, as_of=None):
     shown = [c for c in cl if all_ or c["active"]]
     if not cl: print("  (no failures recorded)"); return
     if not shown: print(f"  ({len(cl)} quiet cluster(s), nothing in the last {WINDOW_DAYS} days — --all)"); return
     for c in shown:
         mark = "‼" if c["eligible"] else "·"
         span = f"{c['first'][:16]}..{c['last'][:16]}" if c["first"] != c["last"] else c["first"][:16]
-        tail = f"  ELIGIBLE ({c['eligible']})" if c["eligible"] else ""
+        tail = f"  ELIGIBLE ({c['eligible']}) {claim_word(c, as_of)}" if c["eligible"] else ""
         pf = f"  person-first:{c['person_first']}" if c["person_first"] else ""
         print(f"  {mark} {c['id']}  {c['kind']}  {c['confirmed']} record(s), {c['episodes_14d']} episode(s) in {WINDOW_DAYS}d  {span}{pf}{tail}")
     hid = len(cl) - len(shown)
@@ -430,6 +548,50 @@ def selfcheck():
         ok("…refuted, it is not", elig("--scope", "gamma", "--as-of", "2026-09-06T00:00Z") == [])
         ok("…and a person-first record makes the gap cluster eligible at once", fpid(fingerprint("alpha", GAP_KIND)) in elig("--scope", "alpha"))
         ok("eligible with no scope reads every ledger", set(elig("--as-of", "2026-09-06T00:00Z")) >= {cid})
+        # ---- claim: once per cluster, two a rolling day by slot, the scope ledgers untouched. As of 2026-09-06 only
+        # beta is eligible (alpha's records are stamped now, gamma's critical is refuted, delta has two episodes).
+        claims_f = lambda: [json.loads(l) for l in open(os.path.join(T, "failures", "claims.jsonl")).read().splitlines() if l.strip()] if os.path.isfile(os.path.join(T, "failures", "claims.jsonl")) else []
+        raw_beta = ledger("beta")
+        ok("before any claim an eligible cluster reads unclaimed, aged from the moment the rule fired (the third episode)", any(l.startswith(cid) and l.endswith("\tunclaimed 14h 0m") for l in C("eligible", "--as-of", "2026-09-06T00:00Z")[1].splitlines()))
+        rc, out, err = C("claim", "--as-of", "2026-09-06T00:00Z", "--dry")
+        ok("claim --dry says what it would claim and writes nothing", rc == 0 and out.split("\t")[1] == cid and claims_f() == [])
+        rc, out, err = C("claim", "--as-of", "2026-09-06T00:00Z")
+        f1 = out.rstrip("\n").split("\t")
+        ok("claim takes the one eligible cluster: one claims line; prints claim, cluster, scope, kind, why, slot", rc == 0 and len(f1) == 6 and f1[0].startswith("i-") and f1[1] == cid and f1[2] == "beta" and f1[3] == K and f1[4] == "3 episodes in 14d" and f1[5] == "routine" and len(claims_f()) == 1)
+        claim1 = f1[0]
+        rc, out, err = C("claim", "--as-of", "2026-09-06T00:00Z")
+        ok("CLAIM ONCE: a second pass claims nothing, says why, and writes no line", rc == 1 and out == "" and "nothing to claim: 1 eligible, 1 claimed" in err and len(claims_f()) == 1)
+        ok("…the scope ledger's bytes are untouched: a claim is not a record", ledger("beta") == raw_beta)
+        ok("…and the cluster stays eligible, now saying who holds it", any(l.startswith(cid) and l.endswith(f"\tclaimed 2026-09-06T00:00 {claim1}") for l in C("eligible", "--as-of", "2026-09-06T00:00Z")[1].splitlines())
+           and f"claimed 2026-09-06T00:00 {claim1}" in C("show", "--scope", "beta", "--as-of", "2026-09-06T00:00Z")[1])
+        os.makedirs(os.path.join(T, "failures", "reports")); open(os.path.join(T, "failures", "reports", f"{claim1}.md"), "w").write("# r\n")
+        ok("…and `reported` once the report file is there", f"{claim1} reported" in C("show", "--scope", "beta", "--as-of", "2026-09-06T00:00Z")[1])
+        # the day's slots: a routine cluster only takes the routine slot; a critical one takes critical, or routine when critical is spent
+        for d in ("01", "03", "05"): rec("eps", f"2026-09-{d}T09:00Z")
+        for sc in ("crit2", "crit3"): rec(sc, "2026-09-05T09:00Z", critical="main-gate-or-deploy-red")
+        rc, out, err = C("claim", "--as-of", "2026-09-06T00:10Z")
+        ok("the routine slot spent, a routine cluster waits and a critical one takes the critical slot", rc == 0 and out.split("\t")[2] == "crit2" and out.rstrip("\n").split("\t")[5] == "critical")
+        rc, out, err = C("claim", "--as-of", "2026-09-06T00:10Z")
+        ok("…both slots spent: nothing, and it says which", rc == 1 and "routine/critical slot(s) used" in err and len(claims_f()) == 2)
+        ok("…the unclaimed clusters stay eligible and visible with their age", sum(l.endswith("\tunclaimed 15h 10m") for l in C("eligible", "--as-of", "2026-09-06T00:10Z")[1].splitlines()) == 2)
+        rc, out, err = C("claim", "--as-of", "2026-09-07T00:10Z")
+        ok("a rolling day later the routine slot is free: the routine cluster (more episodes) goes first", rc == 0 and out.split("\t")[2] == "eps" and out.rstrip("\n").split("\t")[5] == "routine")
+        rc, out, err = C("claim", "--as-of", "2026-09-07T00:10Z")
+        ok("…then the critical one, in the critical slot", rc == 0 and out.split("\t")[2] == "crit3" and out.rstrip("\n").split("\t")[5] == "critical")
+        for sc in ("crit4", "crit5"): rec(sc, "2026-09-07T09:00Z", critical="main-gate-or-deploy-red")
+        rc, out, err = C("claim", "--as-of", "2026-09-08T00:10Z"); rc2, out2, err2 = C("claim", "--as-of", "2026-09-08T00:10Z")
+        ok("a critical cluster may take the routine slot once the critical one is spent", rc == 0 and out.rstrip("\n").split("\t")[5] == "critical" and rc2 == 0 and out2.rstrip("\n").split("\t")[5] == "routine")
+        for d in ("15", "17", "19"): rec("beta", f"2026-09-{d}T10:00Z")
+        rc, out, err = C("claim", "--scope", "beta", "--as-of", "2026-09-21T00:00Z")
+        ok("a cluster still eligible fourteen days after its claim is a repeat: claimed again, a new id", rc == 0 and out.split("\t")[1] == cid and out.split("\t")[0] != claim1)
+        # ---- packet: what the investigation reads
+        rc, out, err = C("packet", claim1, "--as-of", "2026-09-06T00:00Z")
+        ok("packet by claim id: the header, the count, the crossing at the third episode, the scope's other clusters", rc == 0 and out.startswith(f"# failure packet {claim1} — cluster {cid}")
+           and "records: 4 confirmed of 5" in out and "### the crossing: " in out and "2026-09-05T10:00:00Z" in out.split("### the crossing")[1].splitlines()[0] and "the rule fired: 2026-09-05T10:00:00Z (3 episodes in 14d)" in out and "## the scope's other clusters" in out)
+        rc, out, err = C("packet", cid, "--as-of", "2026-09-06T00:00Z")
+        ok("…and by cluster id", rc == 0 and f"cluster {cid}" in out and "claimed: no" not in out)
+        rc, out, err = C("packet", "i-nope")
+        ok("…an id nobody holds is refused", rc == 2 and "no claim or cluster" in err)
         # ---- import: a fixture board, through cc-board
         repo = f"_ccfail{os.getpid()}"
         board = {"repo": repo, "path": os.path.join(home, "dev", repo), "default_branch": "main", "log": [], "tracks": {
@@ -526,7 +688,7 @@ def opts(a, flags, lists=()):
         else: pos.append(x); i += 1
     return out, pos
 
-USAGE = "usage: cc-failures record|show|eligible|metrics|import|kinds|selfcheck ...  (the docstring has the flags)"
+USAGE = "usage: cc-failures record|show|eligible|claim|packet|metrics|import|kinds|selfcheck ...  (the docstring has the flags)"
 def as_of(o):
     if not o.get("as-of"): return None
     t = parse_ts(o["as-of"])
@@ -569,13 +731,22 @@ def main(a):
         cl = clusters(recs, as_of(o))
         if cmd == "eligible":
             for c in cl:
-                if c["eligible"]: print(f"{c['id']}\t{c['scope']}\t{c['kind']}\t{c['eligible']}\t{c['episodes_14d']} episode(s)\t{c['first'][:16]}..{c['last'][:16]}")
-        else: render(cl, o.get("all"))
+                if c["eligible"]: print(f"{c['id']}\t{c['scope']}\t{c['kind']}\t{c['eligible']}\t{c['episodes_14d']} episode(s)\t{c['first'][:16]}..{c['last'][:16]}\t{claim_word(c, as_of(o))}")
+        else: render(cl, o.get("all"), as_of=as_of(o))
+    elif cmd == "claim":
+        o, pos = opts(a, ("scope", "as-of"))
+        k = claim_one(o.get("scope"), as_of(o), dry=bool(o.get("dry")))
+        if not k: sys.exit(1)
+        print(f"{k['id']}\t{k['cluster']}\t{k['scope']}\t{k['kind']}\t{k['why']}\t{k['slot']}")
+    elif cmd == "packet":
+        o, pos = opts(a, ("as-of",))
+        if len(pos) != 1: die("packet needs a claim or cluster id")
+        packet(pos[0], as_of(o))
     elif cmd == "board":   # what `cc board failures <repo>` execs: the board's own heading, then the scope's clusters
         o, pos = opts(a, ("as-of",))
         if not pos: die("board needs a repo")
         print(f"\n\033[1m{pos[0]}\033[0m  failures  (cc-failures; the rule: critical, or {EPISODES_NEEDED} episodes in {WINDOW_DAYS} days)")
-        render(clusters(load(pos[0]), as_of(o)), board=True); print()
+        render(clusters(load(pos[0]), as_of(o)), board=True, as_of=as_of(o)); print()
     elif cmd == "metrics":
         o, pos = opts(a, ("scope",))
         if pos: metrics_fixture(pos[0])
