@@ -44,8 +44,10 @@
 # evidence. Two passes of the SAME Claude child, behind the SAME wall: the broad pass (Sonnet) notices the pattern,
 # locates the origin and writes a hypothesis, a rival and one test into a handoff; the narrow pass (a fresh context
 # on the band the handoff names — routine Sonnet, interacting Opus, authority Fable) runs that test. Caps for the job,
-# broad pass included: $1 routine, $2 the other two; BUD_FAIL_BROAD is the broad pass's share. `TEST: none` in the
-# handoff means no narrow pass. The report goes to ~/.cc/failures/reports/<claim>.md (CC_FAILURES moves the dir)
+# broad pass included: $1 routine, $2 the other two; BUD_FAIL_BROAD is the broad pass's share ($0.60: why, at its
+# line). `TEST: none` in the handoff means no narrow pass. A pass that ends without a result — budget, turns, timeout,
+# an error — is named as such in the report, the message and audit.log (the JSON's subtype and is_error, via
+# llm_why), never as a bare exit code. The report goes to ~/.cc/failures/reports/<claim>.md (CC_FAILURES moves the dir)
 # and is delivered as ONE message with the file (cc-slack post --file), to the control repo's channel (CC_AUDIT_FAILURE_TO
 # names another, a test chat) — no mention, no canvas, no cc-notify, no board row: a finding cannot make work. The
 # tier is the launcher's check, not this file's: run by hand it runs.
@@ -83,7 +85,12 @@ cfgval(){ "$R/bin/cc-config" get "$1"; }   # the one reader: it never sources th
 CODEX_MODEL="$(cfgval CODEX_MODEL)"; CODEX_EFFORT="$(cfgval CODEX_EFFORT)"
 BUD_REVIEW="${CC_AUDIT_BUDGET_REVIEW:-6}"; BUD_CODE="${CC_AUDIT_BUDGET_WEEKLY:-8}"; BUD_MONTH="${CC_AUDIT_BUDGET_MONTHLY_TOTAL:-30}"
 BUD_PATTERNS="${CC_AUDIT_BUDGET_PATTERNS:-10}"   # the Slack pass reads a lot of history and is the half that carries the value
-BUD_FAIL_BROAD="${CC_AUDIT_BUDGET_FAILURE_BROAD:-0.40}"; CAP_ROUTINE=1; CAP_STRONG=2   # the failure job: "$1 routine, $2 strong", two passes inside it
+CAP_ROUTINE=1; CAP_STRONG=2   # the failure job: "$1 routine, $2 strong", two passes inside it; the split below moves, the caps do not
+# THE BROAD PASS'S SHARE. A Sonnet read of a real packet costs $0.33-0.35 when it finishes (i-a0410573, i-e9fb26ce), and
+# claude checks the budget BETWEEN turns, so a run passes the cap by a turn before it is killed: at $0.40 the first live
+# investigation (i-b3fc3b8b, 2026-09-12) died at $0.44 with no handoff, and the narrow pass never ran. $0.60 clears the
+# measured read with a turn to spare and still leaves the routine narrow pass (measured $0.32) its $0.40 of the $1 cap.
+BUD_FAIL_BROAD="${CC_AUDIT_BUDGET_FAILURE_BROAD:-0.60}"
 stamp_init(){   # ONE UTC clock read for both: the header's date is the report's date, even at 23:59:59Z, and a
   local now      # CC_AUDIT_DATE (tests) pins the date beside the time rather than leaving the real day next to it.
   now="$(date -u +%FT%TZ)"; DAY="${CC_AUDIT_DATE:-${now%T*}}"; STAMP="${DAY}T${now#*T}"
@@ -485,7 +492,7 @@ POSTPONED=""
 dur(){ local s=${1:-0}; if [ "$s" -lt 90 ]; then printf '%ss' "$s"; else printf '%sm %ss' $((s/60)) $((s%60)); fi; }   # how long it ran, in the report: the only cost signal this mode has
 postponed(){ printf '_(postponed: %s — the next scheduled run picks this up)_\n' "$2" > "$1"; log "llm $1 postponed: $2"; POSTPONED="$2"; }   # $2 names the model too: two backends postpone here now
 llm(){   # llm <out-file> <budget> <prompt> [model] — 20 min hard cap; a failed run leaves a stub and never aborts the audit
-  local out=$1 bud=$2 prompt=$3 model=${4:-claude-opus-5} j rc res p; j=$(mktemp)
+  local out=$1 bud=$2 prompt=$3 model=${4:-claude-opus-5} j rc res p; j=$(mktemp); LLM_WHY=""   # a postponed run leaves no stale cause behind
   if p=$("$LIMIT" status 2>/dev/null); then postponed "$out" "Claude $p"; rm -f "$j"; return 1; fi   # a limit any run on this box hit: no LLM, no retry loop — the timer comes back
   CC_ROLE=worker timeout 20m "$CLAUDE" -p "$prompt" --model "$model" --max-budget-usd "$bud" --max-turns 60 \
     --output-format json --setting-sources '' --strict-mcp-config --disable-slash-commands \
@@ -494,8 +501,26 @@ llm(){   # llm <out-file> <budget> <prompt> [model] — 20 min hard cap; a faile
   if p=$("$LIMIT" check "$j" 2>/dev/null); then   # hit it mid-audit: record it, postpone, leave the stamp for everyone else
     postponed "$out" "Claude usage limit until $(date -u -d "@${p#LIMIT }" +%H:%M)Z"; rm -f "$j"; return 1; fi
   res=$(jq -r '.result // empty' "$j" 2>/dev/null); LLM_COST=$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null)
-  if [ -n "$res" ]; then printf '%s\n' "$res" > "$out"; else printf '_(audit run failed: rc=%s)_\n' "$rc" > "$out"; log "llm $out failed rc=$rc"; fi
+  # A RUN THAT ENDED WITHOUT A RESULT SAYS WHY, never a bare exit code: the JSON's subtype and is_error name the cause
+  # (i-b3fc3b8b, 2026-09-12: the report said `rc=1` and the owner had to ask what happened; the codex path had kept
+  # its reason all along). is_error true is a failed run whatever `.result` holds — that text is the error, not a report.
+  if [ -n "$res" ] && [ "$(jq -r '.is_error // false' "$j" 2>/dev/null)" != true ]; then printf '%s\n' "$res" > "$out"; LLM_WHY=""
+  else LLM_WHY=$(llm_why "$j" "$rc" "$bud" "$model"); printf '_(audit run failed: %s)_\n' "$LLM_WHY" > "$out"; log "llm $out failed: $LLM_WHY"; res=""; fi
   rm -f "$j"; [ -n "$res" ]
+}
+LLM_WHY=""   # why the last llm() run ended without a result, for a report that has to say so downstream (failure_run)
+llm_why(){   # llm_why <json> <rc> <budget> <model> — one phone-readable clause from what the run left behind
+  local j=$1 rc=$2 bud=$3 model=$4 sub err cost turns
+  [ "$rc" = 124 ] && { printf 'timed out: the 20 min cap fell before %s answered (rc=124, no result JSON)' "$model"; return; }
+  sub=$(jq -r '.subtype // empty' "$j" 2>/dev/null); cost=$(jq -r '.total_cost_usd // 0' "$j" 2>/dev/null); turns=$(jq -r '.num_turns // 0' "$j" 2>/dev/null)
+  err=$(jq -r '[(.errors // [])[]?, (.error // empty), (if .is_error == true then .result else empty end)] | map(select(type == "string" and . != "")) | join("; ")' "$j" 2>/dev/null)
+  case "$sub" in
+    error_max_budget_usd) printf 'budget ran out: $%.2f spent of the $%s cap after %s turns (%s, subtype %s)' "$cost" "$bud" "$turns" "$model" "$sub" ;;
+    error_max_turns) printf 'turns ran out: %s turns, $%.2f spent (%s, subtype %s)' "$turns" "$cost" "$model" "$sub" ;;
+    '') if [ -s "$j" ]; then printf 'rc=%s and a result JSON with no result or subtype — stderr is in audit.log' "$rc"
+        else printf 'rc=%s and nothing on stdout (%s) — stderr is in audit.log' "$rc" "$model"; fi ;;
+    *) printf 'subtype %s, is_error %s, $%.2f spent after %s turns (%s)%s' "$sub" "$(jq -r '.is_error // false' "$j" 2>/dev/null)" "$cost" "$turns" "$model" "${err:+: $(short "$err")}" ;;
+  esac
 }
 # codex_run <out-file> <prompt> — the second opinion. Same contract as llm(): it writes the report or a stub, returns
 # non-zero on failure, and NEVER aborts the audit. Three differences from llm(), all deliberate:
@@ -613,7 +638,7 @@ short(){ local s=$1; [ ${#s} -le 160 ] || { s="${s:0:160}"; s="${s% *}…"; }; p
 failure_prompt(){ sed -e "s|@BOX@|$BOX|g" -e "s|@EVIDENCE@|$EV|g" -e "s|@ID@|$FID|g" "$R/config/audit-failure-$1-prompt.md"; }
 failure_run(){
   local FDIR="${CC_FAILURES:-$HOME/.cc/failures}" packet="$EV/01-packet.md" hand="$EV/02-handoff.md" narrow="$EV/03-narrow.md"
-  local rep band test model cap bud t0 secs cost_b cost_n msg kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL}"
+  local rep band test model cap bud t0 secs cost_b cost_n why_b msg kind ok=1 to="${CC_AUDIT_FAILURE_TO:-#$CTL}"
   log "start mode=failure id=$FID dry=$dry post=$post ev=$EV"
   # the packet is the whole evidence; an id the ledger does not hold ends here, before any model runs
   if ! "$R/bin/cc-failures" packet "$FID" > "$packet" 2>"$EV/packet.err"; then
@@ -622,11 +647,11 @@ failure_run(){
   [ "$llm_on" = 1 ] || { echo "$packet"; log "done mode=failure id=$FID no-llm: the packet only"; exit 0; }   # --no-llm: the packet, no spend, no post
   # steps 1-3, the broad pass: Sonnet, the packet, a handoff a fresh context can take
   llm "$hand" "$BUD_FAIL_BROAD" "$(failure_prompt broad)" claude-sonnet-5 || ok=0
-  cost_b=${LLM_COST:-0}
+  cost_b=${LLM_COST:-0}; why_b=$LLM_WHY
   band=$(sed -n 's/^BAND:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1); test=$(sed -n 's/^TEST:[[:space:]]*\([a-z]*\).*/\1/p' "$hand" | tail -1)
   # "Sonnet for a single-tool mechanism, Opus for interacting tools or concurrency, Fable for authority, security or system-level reasoning"
   case "$band" in interacting) model=claude-opus-5; cap=$CAP_STRONG ;; authority) model=claude-fable-5-1; cap=$CAP_STRONG ;; *) band=routine; model=claude-sonnet-5; cap=$CAP_ROUTINE ;; esac
-  if [ "$ok" = 0 ]; then printf '_(no narrow pass: the broad pass did not run)_\n' > "$narrow"; cost_n=0
+  if [ "$ok" = 0 ]; then printf '_(no narrow pass: the broad pass ended without a handoff — %s)_\n' "${why_b:-${POSTPONED:-it did not run}}" > "$narrow"; cost_n=0   # the cause, named again where the reader lands
   elif [ "$test" = none ]; then printf '_(no narrow pass: the broad pass found no discriminating test — see its ## test)_\n' > "$narrow"; cost_n=0   # "If no discriminating test exists, stop here"
   else   # step 4, the narrow pass: a fresh context, the handoff and the packet, the band's model, what the cap has left
     bud=$(awk -v c="$cap" -v b="$cost_b" 'BEGIN{r=c-b; if (r<0.10) r=0.10; printf "%.2f", r}')
@@ -640,7 +665,7 @@ failure_run(){
     printf '## broad pass (claude-sonnet-5)\n\n'; cat "$hand"; printf '\n---\n\n## narrow pass (%s)\n\n' "$model"; cat "$narrow"; } > "$rep"
   # the five lines the owner reads; a report with none gets one line and the file, never nothing
   msg=$(sed -n '/^## message/,$p' "$narrow" | sed '1d' | grep -v '^[[:space:]]*$' | head -5)
-  [ -n "$msg" ] || msg="**Investigation $FID** ($kind): $( [ "$ok" = 1 ] && echo "no five-line message came back" || echo "the model run failed or was postponed" ) — the report is attached."
+  [ -n "$msg" ] || msg="**Investigation $FID** ($kind): $( [ "$ok" = 1 ] && echo "no five-line message came back" || echo "the model run ended without a result — ${LLM_WHY:-${POSTPONED:-postponed}}" ) — the report is attached."
   if [ "$dry" = 1 ]; then cat "$rep"; else echo "$rep"; fi
   # ONE message, the file with it, where the box's reports go — and nothing else: no canvas, no cc-notify, no board row
   [ "$post" = 0 ] || cc-slack post --file "$rep" --to "$to" -m "$msg" >/dev/null 2>>"$LOG" || log "failure $FID: post to $to failed"
@@ -1047,6 +1072,11 @@ PY
 #!/bin/sh
 printf '%s\n' "$@" >> "$CC_SC_ARGV"
 p=""; n=0; for a in "$@"; do [ "$n" = 1 ] && { p=$a; n=0; }; [ "$a" = -p ] && n=1; done
+case "$CC_SC_END" in   # how the BROAD pass ends without a result, the way `claude -p --output-format json` really does (probed 2026-09-12)
+  budget) printf '{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":null,"total_cost_usd":0.44,"num_turns":9}'; exit 1;;
+  turns) printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":null,"total_cost_usd":0.21,"num_turns":60}'; exit 1;;
+  timeout) exit 124;;   # what `timeout 20m` leaves the caller: rc 124 and nothing on stdout
+esac
 case "$p" in
   *"You are the narrow pass"*) printf '{"result":"## hypothesis\\nthe guard reads the text, not the command\\n## message\\n**Decision:** review the guard.\\nPattern: three refusals on text.\\nHypothesis: text, not command.\\nCost so far: three turns.\\nNext review: the guard selfcheck.\\n","total_cost_usd":0.30}';;
   *) printf '{"result":"## pattern\\nrefusals on text\\n## test\\nrun the guard on the three commands\\nBAND: %s\\nTEST: %s\\n","total_cost_usd":0.05}' "${CC_SC_BAND:-interacting}" "${CC_SC_TEST:-yes}";;
@@ -1071,7 +1101,7 @@ S
   sck "$(tf test "$(grep -c -- '^--strict-mcp-config$' "$CC_SC_ARGV")" = 2)" "failure: …and no MCP server, so no Slack tool to post with"
   sck "$(tf test "$(grep -c -- '^--setting-sources$' "$CC_SC_ARGV")" = 2)" "failure: …and no settings file, so the allow-list is the whole permission surface"
   sck "$(tf test "$(grep -A1 -- '^--model$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = 'claude-sonnet-5 claude-opus-5')" "failure: the broad pass is Sonnet; BAND: interacting sends the narrow pass to Opus"
-  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.40 1.95')" "failure: the strong cap is \$2 for the job — the narrow pass gets what the broad pass left"
+  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.60 1.95')" "failure: the strong cap is \$2 for the job — the narrow pass gets what the broad pass left"
   sck "$(tf test "$(grep -c '^post$' "$fh/slack.log")" = 1)" "failure: ONE message — no canvas, no second post"
   sck "$(tf grep -qx -- '--to' "$fh/slack.log" && grep -qx '#sc-test' "$fh/slack.log" && grep -q '^\*\*Decision:\*\* review the guard\.' "$fh/slack.log" && grep -qx -- "$fh/.cc/failures/reports/$cl.md" "$fh/slack.log")" "…to the chat named, the five lines opening with the decision, the report as its file"
   sck "$(ntf grep -q -- '--mention' "$fh/slack.log")" "…and no mention"
@@ -1083,8 +1113,26 @@ S
   sck "$(tf test "$(grep -A1 -- '^--model$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = 'claude-sonnet-5 claude-fable-5-1')" "failure: BAND: authority sends the narrow pass to Fable"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
   out=$(fb CC_SC_BAND=routine 2>&1)
-  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.40 0.95')" "failure: BAND: routine — Sonnet both passes, \$1 for the job"
+  sck "$(tf test "$(grep -A1 -- '^--max-budget-usd$' "$CC_SC_ARGV" | grep -v -- '^--' | paste -sd' ')" = '0.60 0.95')" "failure: BAND: routine — Sonnet both passes, \$1 for the job"
   : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$fh/.cc/failures/reports/$cl.md"
+  # A BROAD PASS THAT ENDS WITHOUT A RESULT NAMES ITS CAUSE — in the report, the message and audit.log — never `rc=1`:
+  # "the report said only '(audit run failed: rc=1)' ... and the owner had to ask why" (i-b3fc3b8b, 2026-09-12).
+  local flog="$fh/.cc/state/audit/audit.log" frep="$fh/.cc/failures/reports/$cl.md"
+  out=$(fb CC_SC_END=budget 2>&1); rc=$?
+  sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1 && test -s "$frep")" "failure: a budget-killed broad pass still ends in a report, rc 0, and no narrow pass is bought on a missing handoff"
+  sck "$(tf grep -q 'audit run failed: budget ran out: \$0\.44 spent of the \$0\.60 cap after 9 turns (claude-sonnet-5, subtype error_max_budget_usd)' "$frep")" "…the report's broad pass names the cause: budget, what was spent against which cap, the subtype"
+  sck "$(tf grep -q 'no narrow pass: the broad pass ended without a handoff — budget ran out' "$frep")" "…and its narrow pass says the same where the reader lands"
+  sck "$(tf grep -q 'model run ended without a result — budget ran out: \$0\.44' "$fh/slack.log")" "…the one message carries it too"
+  sck "$(tf grep -q 'llm .*02-handoff.md failed: budget ran out: \$0\.44 .* subtype error_max_budget_usd' "$flog")" "…and so does audit.log"
+  sck "$(ntf grep -Eq 'rc=1\b' "$frep" "$fh/slack.log")" "…no bare exit code anywhere a reason belongs"
+  sck "$(tf grep -q 'Sonnet \$0\.44 + \$0\.00' "$frep")" "…the first line still says what it cost"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
+  out=$(fb CC_SC_END=turns 2>&1)
+  sck "$(tf grep -q 'audit run failed: turns ran out: 60 turns, \$0\.21 spent (claude-sonnet-5, subtype error_max_turns)' "$frep" && grep -q 'failed: turns ran out' "$flog")" "failure: a turn-capped broad pass names that (error_max_turns), report and log"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
+  out=$(fb CC_SC_END=timeout 2>&1)
+  sck "$(tf grep -q 'audit run failed: timed out: the 20 min cap fell before claude-sonnet-5 answered (rc=124, no result JSON)' "$frep" && grep -q 'failed: timed out' "$flog" && ! grep -q 'no narrow pass: the broad pass did not run' "$frep")" "failure: a timed-out broad pass names the cap, not a bare rc"
+  : > "$CC_SC_ARGV"; rm -f "$fh/slack.log" "$frep"
   out=$(fb CC_SC_TEST=none 2>&1); rc=$?
   sck "$(tf test "$rc" = 0 && test "$(grep -c -- '^--model$' "$CC_SC_ARGV")" = 1)" "failure: TEST: none — no discriminating test, so no narrow pass: one model context, not two"
   sck "$(tf grep -q 'no narrow pass' "$fh/.cc/failures/reports/$cl.md" && grep -q '^\*\*Investigation ' "$fh/slack.log")" "…the report says so and the message is the fallback line, still one post"
