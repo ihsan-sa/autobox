@@ -1650,13 +1650,15 @@ gs=$(CC_STATE="$T/briefstate" CC_BRIEF_FORCE=1 "$B/cc-board" add $REPO g10 "g10"
 # …and what another live track is holding is COMPUTED into the brief, never typed. This case builds its own
 # holder: g1 is live on the board and its branch really does change a file, so the block has something to say.
 "$B/cc-board" status $REPO g1 running >/dev/null
-( cd ~/.cc/worktrees/$REPO/g1 && echo held > held-by-g1.txt && git add held-by-g1.txt \
-  && git -c user.email=t@t -c user.name=t commit -qm "g1 holds a file" -- held-by-g1.txt ) >/dev/null 2>&1
+g1c=$( ( cd ~/.cc/worktrees/$REPO/g1 && echo held > held-by-g1.txt && git add held-by-g1.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "g1 holds a file" -- held-by-g1.txt ) 2>&1 )
 godisp g7 "GOAL: something worth doing, said as a goal."
 t7=~/.cc/state/$REPO/g7/task.md
+# A red here says which of its three legs gave (2026-09-12, one red in 40 runs and the block alone could not say):
+# what the board held g1 at, what track/g1 changes against main, and what the commit above printed.
 { grep -q 'IN FLIGHT' "$t7" && grep -q 'held-by-g1.txt — g1 \[running\]' "$t7"; } \
   && ok "a dispatched brief carries what the board says is in flight, computed at dispatch, never typed" \
-  || bad "no IN FLIGHT block for g1: $(cat "$t7" 2>/dev/null)"
+  || bad "no IN FLIGHT block for g1 (board: g1=$("$B/cc-board" get $REPO g1 status 2>&1); track/g1 vs main: $(git -C ~/dev/$REPO diff --name-only main...track/g1 2>&1 | tr '\n' ' '); commit: ${g1c:-quiet}): $(cat "$t7" 2>/dev/null)"
 # THE SECOND GATE IS A JUDGE, and its two failure answers must not look alike. CC_BRIEF_FAKE stands in for the
 # model here — this suite makes no API calls — so both are exercised for real through the doors themselves.
 PROSE="GOAL: something worth doing, said as a goal and nothing more."

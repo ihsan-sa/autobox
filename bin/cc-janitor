@@ -9,6 +9,13 @@ box owner noticed and asked for, which is the wrong shape for a chore that comes
   cc-janitor --configured [--dry]           the repos in CC_JANITOR_REPOS (~/.cc/config); the timer's form
   cc-janitor --fixtures [--dry]             rule 6 alone, no repo: cc-reconcile's 20-min pass calls this
   cc-janitor quota                          what this user has used of the temp root, and of what limit
+  cc-janitor library [--days N] [--dry]     THE KNOWLEDGE LIBRARY'S 30-DAY CUT AND THE AUDIT ROLLUP, AS A REPORT ONLY:
+                                            what would leave the hot index (closed bodies older than N days, from
+                                            `cc-lib index --cold`) and which audit raw-input dirs (~/.cc/state/audit/
+                                            <day>-<mode>/) would roll up into a monthly listing and be cut. It cuts
+                                            NOTHING and no form of it does: the report goes to ~/.cc/state/library-cold.md
+                                            (--dry: printed only) for a person to read, and the cut is a separate go
+                                            after that (docs/design-knowledge-library-2026-09-11.md, decision 8).
   cc-janitor selfcheck                      the decision table + one end-to-end run, no network
     also: --no-net (never ask GitHub) · --dry (print, change nothing, write no log)
 
@@ -1652,9 +1659,86 @@ def scratch_pressure():
         return SCRATCH_PRESSURE
 
 
+LIBREPORT = f"{STATE}/library-cold.md"   # the dry-run report a person reads before any cut is given a go
+AUDIT = f"{STATE}/audit"                  # cc-audit's reports (<day>-<mode>.md, kept) and raw inputs (<day>-<mode>/, +MBs a run)
+COLD_DAYS = 30
+
+
+def library(days, dry):
+    """The library's retention pass, dry-run and nothing else (decision 8: "closed bodies leave the hot index after 30
+    days; audit raw inputs rolled up and cut only after a restore check and a separate go"). Two lists, one report:
+    the cold set, which is cc-lib's own reading of its index (`index --cold`, the tool that holds the schema decides
+    what a closed body is), and the audit raw-input dirs older than the cutoff, grouped by month with the rollup
+    each would fold into. Nothing here has a write path to the index or to the audit dir; the one file written is
+    the report, and not under --dry."""
+    cutoff = time.time() - days * 86400
+    stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime())
+    lines = [f"# library — what the {days}-day cut would take (dry-run, {stamp}; nothing was cut)", ""]
+    lib = f"{BIN}/cc-lib"
+    cold = None
+    if os.access(lib, os.X_OK):
+        try:
+            r = subprocess.run([lib, "index", "--cold", str(days), "--json"], capture_output=True, text=True, timeout=120)
+            cold = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+        except Exception:
+            cold = None
+    if cold is None:
+        lines += ["## hot index", f"cc-lib would not answer (`cc-lib index --cold {days} --json`): the cold set is unknown, not empty", ""]
+    else:
+        lines += [f"## hot index: {cold['sources']} source(s), {cold['records']} record(s), {cold['bytes']} B of text in closed bodies "
+                  f"stamped before {cold['cutoff']} would leave it (descriptors stay searchable) · cut {cold['cut']}"]
+        for o in cold["would"]:
+            lines.append(f"- would cold {o['path']} · {o['records']} record(s), {o['bytes']} B, newest {o['newest'] or '-'} · {o['why']}")
+        lines.append("")
+    months, nd, nb, kept = {}, 0, 0, 0
+    for d in sorted(glob.glob(f"{AUDIT}/*-*/")):
+        d = d.rstrip("/")
+        name = os.path.basename(d)
+        if not re.match(r"^\d{4}-\d{2}-\d{2}-", name):
+            continue
+        try:
+            newest = max((os.path.getmtime(os.path.join(r_, f)) for r_, _, fs in os.walk(d) for f in fs), default=os.path.getmtime(d))
+        except OSError:
+            continue
+        size = sum(os.path.getsize(os.path.join(r_, f)) for r_, _, fs in os.walk(d) for f in fs if os.path.isfile(os.path.join(r_, f)))
+        if newest >= cutoff:
+            kept += 1
+            continue
+        months.setdefault(name[:7], []).append((name, size))
+        nd += 1
+        nb += size
+    lines.append(f"## audit raw inputs: {nd} dir(s), {nb} B under {AUDIT} older than {days} days would roll up and be cut; "
+                 f"{kept} newer kept; the reports (<day>-<mode>.md) are never cut")
+    for m in sorted(months):
+        lines.append(f"- would roll up {len(months[m])} dir(s), {sum(b for _, b in months[m])} B into {AUDIT}/{m}-rollup.md, then cut: "
+                     + ", ".join(n for n, _ in months[m]))
+    lines += ["", "Nothing above was cut. A cut is a separate go, after a person has read this and a restore has been checked."]
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    if dry:
+        print(f"cc-janitor library: dry run — report printed, {LIBREPORT} not written")
+        return 0
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = LIBREPORT + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, LIBREPORT)
+        print(f"cc-janitor library: report written to {LIBREPORT} · cut 0")
+    except OSError as e:
+        print(f"cc-janitor library: could not write {LIBREPORT}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
+    if argv[:1] == ["library"]:
+        days = COLD_DAYS
+        if "--days" in argv and argv.index("--days") + 1 < len(argv) and argv[argv.index("--days") + 1].isdigit():
+            days = int(argv[argv.index("--days") + 1])
+        return library(days, "--dry" in argv)
     if argv[:1] == ["quota"]:
         # What box-status prints, and what a session should read the moment something says "Disk quota exceeded":
         # the limit that ran out is this user's, and df cannot see it.
@@ -2768,6 +2852,49 @@ def selfcheck():
             except OSError:
                 pass
             proc.wait(timeout=10)
+    # THE LIBRARY'S DRY RUN, on a HOME of its own: a merged row's journal with an old entry (a closed body) and an open
+    # row's (not one), an audit raw-input dir 40 days old and one from today. It names what it would take, with the
+    # bytes, and takes nothing: index, audit dirs and their bytes are as they were, and the report is the one file.
+    with tempfile.TemporaryDirectory(prefix="ccjan-lib-") as lh:
+        def W(rel, text, age=0):
+            path = os.path.join(lh, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(text)
+            if age:
+                os.utime(path, (time.time() - age, time.time() - age))
+            return path
+        W(".cc/boards/r1.json", json.dumps({"repo": "r1", "path": f"{lh}/dev/r1", "tracks": {
+            "old": {"title": "a merged row", "status": "merged", "notes": [{"ts": "2026-07-01T10:00:00Z", "msg": "merged as #7"}]},
+            "live": {"title": "an open row", "status": "running", "notes": []}}, "log": []}))
+        W(".cc/state/r1/old/progress.md", "## 2026-07-01T09:00Z iter 1\nTHE-CLOSED-BODY of a merged row.\n")
+        W(".cc/state/r1/live/progress.md", "## 2026-07-01T09:00Z iter 1\nan old entry of a row still open.\n")
+        ev_old = W(".cc/state/audit/2026-07-01-review/evidence/x.log", "raw input " * 100, age=40 * 86400)
+        os.utime(os.path.dirname(os.path.dirname(ev_old)), (time.time() - 40 * 86400,) * 2)
+        os.utime(os.path.dirname(ev_old), (time.time() - 40 * 86400,) * 2)
+        W(".cc/state/audit/2026-07-01-review.md", "# a report, kept\n", age=40 * 86400)
+        ev_new = W(".cc/state/audit/2026-09-12-review/evidence/y.log", "fresh raw input\n")
+        lenv = dict(os.environ, HOME=lh)
+        subprocess.run([f"{BIN}/cc-lib", "index"], env=lenv, capture_output=True, text=True, timeout=120)
+        idx = os.path.join(lh, ".cc", "library", "owner", "index.sqlite")
+        before = (os.path.getsize(idx), open(ev_old, "rb").read(), open(ev_new, "rb").read(),
+                  subprocess.run([f"{BIN}/cc-lib", "index", "--json"], env=lenv, capture_output=True, text=True, timeout=120).stdout)
+        rl = subprocess.run([sys.executable, os.path.realpath(__file__), "library", "--days", "30"], env=lenv, capture_output=True, text=True, timeout=300)
+        rep = os.path.join(lh, ".cc", "state", "library-cold.md")
+        ok("library: the dry run names the closed body it would cold (the merged row's journal, with counts) and not the open row's",
+           rl.returncode == 0 and "would cold ~/.cc/state/r1/old/progress.md" in rl.stdout and "row r1/old merged" in rl.stdout
+           and "r1/live/progress.md" not in rl.stdout and "cut 0" in rl.stdout)
+        ok("library: …and the audit raw-input dir older than 30 days, by month, with its bytes and the rollup it would fold into; today's is kept, the .md report is never cut",
+           "audit raw inputs: 1 dir(s), 1000 B" in rl.stdout and "1 newer kept" in rl.stdout and "2026-07-rollup.md" in rl.stdout
+           and "2026-07-01-review" in rl.stdout and "2026-09-12-review" not in rl.stdout.split("would roll up")[1])
+        after = (os.path.getsize(idx), open(ev_old, "rb").read(), open(ev_new, "rb").read(),
+                 subprocess.run([f"{BIN}/cc-lib", "index", "--json"], env=lenv, capture_output=True, text=True, timeout=120).stdout)
+        ok("library: …AND CUTS NOTHING — the index, the raw inputs and their bytes are exactly as they were; the report is the one file written, and it says so",
+           before == after and os.path.exists(rep) and "nothing was cut" in open(rep).read() and "Nothing above was cut" in open(rep).read())
+        rl2 = subprocess.run([sys.executable, os.path.realpath(__file__), "library", "--days", "30", "--dry"], env=dict(lenv, HOME=lh + "/none"), capture_output=True, text=True, timeout=300)
+        ok("library: --dry prints the same report and writes not even that file; a HOME with no index has an empty cold set, said as 0, not as an error",
+           rl2.returncode == 0 and "not written" in rl2.stdout and not os.path.exists(f"{lh}/none/.cc/state/library-cold.md")
+           and "hot index: 0 source(s)" in rl2.stdout and not os.path.exists(f"{lh}/none/.cc"))
     print(f"cc-janitor selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 

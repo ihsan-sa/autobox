@@ -42,6 +42,29 @@ boundary reads one file, its own workspace's, and can reach no other.
         discard its exit code, and its failure — a locked or unopenable index, an unreadable file — is one line
         in ~/.cc/library/owner/misses.log (<ts> <path> <reason>) and exit 1, which every `ask` then reports as
         `hook-misses N` in COVERAGE until a full `cc-lib index` has reconciled everything and cleared the log.
+  cc-lib view <journal> [--cap <bytes>] [--from <regex>]
+        THE CHECKPOINT VIEW (P3): the newest whole entries of a journal that fit the cap (default 8 KiB), latest last,
+        under one header — `checkpoint view: N of M entries of <path>[, 1 cut] · older entries: cc-lib ask --object
+        <r/track> --need history` — so the reader knows what it was not shown and the one call that reaches it. The
+        first entry that does not fit is cut at a line and says so (an older entry keeps its head; the newest, when it
+        alone is over the cap, keeps its tail, where its STATUS lines are). --from starts the view at the LAST entry
+        whose heading matches (cc-handoff: `journal at N%`, the marked entry a successor is told to read); no match,
+        no effect. Read from the file, never the index, so never stale. cc-handoff --brief carries this instead of a
+        64 KiB tail, cc-loop's iteration prompt instead of `tail -c 6000`; both fall back to the tail without cc-lib.
+  cc-lib memory [--dry-run]
+        THE MEMORY INDEX SPLIT (P3): every ~/.claude/projects/*/memory/MEMORY.md — the index the harness loads into a
+        session's prompt at start — keeps the lines whose file is a RULE (frontmatter type feedback or user: a session
+        cannot search for a rule it does not know it is breaking) and moves the lines whose file is a FACT (type project
+        or reference) to MEMORY-facts.md beside it, which nothing loads, with one pointer line last saying `cc-lib ask`
+        finds them. A line whose file is missing or untyped is not classified and stays; a facts line whose file now
+        says feedback comes back, once, and the facts file goes when nothing is left in it. The memory files are never
+        touched: they are the records, indexed already (the two index files are not sources). Writes ONLY when the content differs — a no-op rewrite would still move the
+        prompt under a running session's cache. cc-checkpoint's Stop hook runs it before its --touch, every turn.
+  cc-lib index --cold [<days>] [--json]
+        WHAT WOULD LEAVE THE HOT INDEX, and nothing leaves (P3, decision 8: dry-run until a person has read it): the
+        records of closed bodies — a board row in merged|done|dropped|closed: its journal, its task, its notes, and
+        every landing record — stamped before <days> (30) ago, per source with record and byte counts, `cut 0`
+        always. cc-janitor library reads this into its report. No form of this tool cuts.
   cc-lib bench [--n <N>]      FTS and exact-id latency (p50/p95/max) on this index; RSS.
   cc-lib selfcheck            fixtures of its own under a HOME of its own (check.sh runs it), the workspace cases launched
                               through the real cc-sandbox beside this file (bwrap; CC_LIB_SELFCHECK_BIN=<dir> runs them
@@ -77,7 +100,13 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
   briefs/docs ~/.cc/state/<repo>/*.md (goals, backlog, packets), <track>/task.md, <project>/docs/**/*.md,
               <project>/core/docs/*.md, <project>/{CLAUDE,README}.md, ~/*.md (the home guides) — one record per
               heading (kind document; a heading that says "decision" is kind decision)
-  memory      ~/.claude/projects/*/memory/*.md — one record per file (type feedback → decision, else note)
+  memory      ~/.claude/projects/*/memory/*.md — one record per file (type feedback → decision, else note); MEMORY.md and
+              MEMORY-facts.md, the two index files, are pointers and never sources
+  slack       ~/.cc/slack/archive/<target>/<chat>/<YYYY-MM>.jsonl — the daemon's inbound archive (P3): one record per
+              human message received (kind note), titled `slack #<channel> <user> (<role>) <stamp>`; the chat id, the
+              message ts and its thread's ts are exact ids, so `ask --object C0…|D0…|<ts>` finds a channel's words, a
+              thread (root and every reply) or one message. <target> is the route's — a member handle's archive is
+              that workspace's, everything else the owner's; a `_`-prefixed target is a fixture and never read
   board       rows (kind event, span rows/<name>), notes (kind note), log items (kind event)
   landing     ~/.cc/state/land/root/<repo>-<pr>.json (the review tally, kind finding), land/<repo>-<pr>.json (the
               job, kind event), land/queue.log (one event per line)
@@ -89,7 +118,7 @@ SOURCES, registered from ~/.cc/boards/<repo>.json (repo → project path), index
   Never read: anything not listed; a file whose name says secret, credential, password or .env, or token unless it
   is a .md (a memory file is named after its rule); a file over 4 MiB.
   A record carrying a token shape (ghp_, github_pat_, xox?-, sk-ant-, AKIA, PRIVATE KEY) is refused, not stored.
-  Exact ids (#pr, repo#pr, SHAs, board row names, channel ids) live in a column of their own, so tokenisation
+  Exact ids (#pr, repo#pr, SHAs, board row names, channel ids, Slack message ts) live in a column of their own, so tokenisation
   cannot split them; text is FTS5 (unicode61, detail=full, BM25).
 
 TICKET. One line per call in ~/.cc/library/owner/tickets.log (a member's: its session's tmpfs, gone with it):
@@ -138,6 +167,15 @@ ID_PR = re.compile(r"(?<![\w/])([A-Za-z0-9_.-]+)?#(\d{1,6})\b")
 ID_PRW = re.compile(r"\b(?:PR|pr|pull)[ /#]*(\d{1,6})\b")
 ID_SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
 ID_CHAN = re.compile(r"\bC0[A-Z0-9]{8,10}\b")
+ID_SLACK = re.compile(r"^[CDG]0[A-Z0-9]{8,10}$|^\d{10}\.\d{6}$")   # a chat id or a message ts, as --object
+MEM_LINE = re.compile(r"^- \[[^\]]*\]\(([^)]+\.md)\)")   # one MEMORY.md line: `- [Title](file.md) — hook`
+MEM_KEEP = ("feedback", "user")   # the types that are RULES and stay in the loaded text; project and reference are facts
+MEM_FACTS = "MEMORY-facts.md"
+MEM_POINTER = ("- Facts (project and reference memories) are not loaded: `cc-lib ask --need history \"<words>\"` finds them; "
+               "the list is memory/" + MEM_FACTS + ".")
+VIEW_CAP = 8192        # a checkpoint view (cc-handoff's slice, the worker prompt's journal block), at most
+COLD_DAYS = 30         # a closed body older than this would leave the hot index (index --cold; dry-run only, nothing cuts)
+CLOSED = ("merged", "done", "dropped", "closed")   # a board row in one of these is a closed body
 KEBAB = re.compile(r"\b[a-z0-9]+(?:-[a-z0-9]+)+\b")
 DATE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:[T ~]*(\d{2}):?(\d{2})?(?:[:.]?\d{0,2})?)?")
 HEAD = re.compile(r"^(#{1,3}) (.+?)\s*$")
@@ -228,7 +266,7 @@ def ws_of(skind, repo):
     docs — the trees its boundary binds read-write — carry its id. Everything else is the owner's ('' here) and is
     never written into a workspace's file: the box's own repos, the home guides, memory, and every landing record
     and the queue, which the host produced and a member never held (unknown or mixed ownership is owner-only)."""
-    if skind in ("board", "journal", "doc") and WS.get(repo):
+    if skind in ("board", "journal", "doc", "slack") and WS.get(repo):   # slack: the archive dir is named after the route's target
         return WS[repo]
     return ""
 
@@ -346,7 +384,16 @@ def registry():
     for p in sorted(glob.glob(os.path.join(H, "*.md"))):
         add(p, "doc")
     for p in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "*.md"))):
+        if os.path.basename(p) in ("MEMORY.md", MEM_FACTS):   # the two index files are pointers; the files they point at are the records
+            continue
         add(p, "memory")
+    # the Slack daemon's inbound archive: ~/.cc/slack/archive/<target>/<chat>/<YYYY-MM>.jsonl — the target is the route's
+    # (a repo, a member handle, box, unrouted) and carries the workspace; never under member/<h>, which is what a boundary binds
+    for p in sorted(glob.glob(os.path.join(H, ".cc", "slack", "archive", "*", "*", "*.jsonl"))):
+        tgt = os.path.basename(os.path.dirname(os.path.dirname(p)))
+        if tgt.startswith("_"):
+            continue
+        add(p, "slack", tgt)
     land = os.path.join(H, ".cc", "state", "land")
     for p in sorted(glob.glob(os.path.join(land, "root", "*.json"))):
         add(p, "land-root", os.path.basename(p)[:-5].rsplit("-", 1)[0])
@@ -423,7 +470,7 @@ def parse_md(path, text, skind, repo, track, rows):
     base = "checkpoint" if skind == "journal" else "document"
     fdate = date_of(os.path.basename(path))
     if skind == "memory":
-        m = re.search(r"^type:\s*(\w+)", text, re.M)
+        m = re.search(r"^\s*type:\s*(\w+)", text, re.M)   # `metadata:\n  type: feedback` — the field is indented
         kind = "decision" if m and m.group(1) == "feedback" else "note"
         t = re.search(r"^description:\s*(.+)$", text, re.M)
         title = t.group(1).strip() if t else os.path.basename(path)[:-3]
@@ -585,6 +632,34 @@ def parse_failures(path, text, repo):
     return recs
 
 
+def parse_slack(path, text):
+    """One record per inbound Slack message (kind note): the daemon's archive line carries ts, thread_ts, chat, channel,
+    user, role, target, text. The chat id, the message ts and its thread's ts go in the id column, so `ask --object`
+    with any of the three finds the message — the thread's ts finds the root and every reply."""
+    recs = []
+    for i, line in enumerate(text.split("\n")):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        ts, th = str(d.get("ts") or ""), str(d.get("thread_ts") or d.get("ts") or "")
+        try:
+            stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(float(ts)))
+        except (ValueError, OverflowError, OSError):
+            stamp = date_of(str(d.get("at") or ""))
+        who = str(d.get("user") or "?") + (f" ({d['role']})" if d.get("role") else "")
+        title = f"slack {d.get('channel') or d.get('chat') or '?'} {who} {stamp}" + (" reply" if th and th != ts else "")
+        body = str(d.get("text") or "")
+        ids = {str(x) for x in (d.get("chat"), ts, th) if x}
+        for k, sp in enumerate(spans(body or title)):
+            recs.append(dict(kind="note", title=title, ts=stamp, text=sp, span=f"L{i + 1}", part=k, track="", extra_ids=ids))
+    return recs
+
+
 def parse(path, skind, repo, track, rows):
     with open(path, "rb") as f:
         raw = f.read(MAX_SOURCE + 1)
@@ -601,6 +676,8 @@ def parse(path, skind, repo, track, rows):
         return parse_queue(path, text)
     if skind == "failures":
         return parse_failures(path, text, repo)
+    if skind == "slack":
+        return parse_slack(path, text)
     return []
 
 
@@ -1056,6 +1133,8 @@ def parse_object(obj, repo):
         return ("row", m.group(1) if "/" in o else m.group(2), m.group(2) if "/" in o else m.group(1))
     if re.fullmatch(r"[0-9a-f]{7,40}", o):
         return ("id", repo, o[:7])
+    if ID_SLACK.match(o):   # a Slack chat id or message ts: the archive records carrying it
+        return ("id", repo, o)
     if FAIL_ID.fullmatch(o):   # a cc-failures cluster, record or claim id: the records naming it
         return ("id", repo, o)
     return ("row", repo, o)
@@ -1465,6 +1544,8 @@ def index(argv):
         return 0
     if "--touch" in argv:
         return touch(argv[argv.index("--touch") + 1:])
+    if "--cold" in argv:
+        return cold(argv)
     rebuild, as_json = "--rebuild" in argv, "--json" in argv
     t0 = time.monotonic()
     if rebuild:
@@ -1511,6 +1592,274 @@ def index(argv):
             if w["refused"]:
                 print(f"  refused: {w['handle']}: {w['refused']}")
     return 0
+
+
+def cold(argv):
+    """index --cold [<days>] [--json]: WHAT WOULD LEAVE THE HOT INDEX, and nothing leaves. A closed body is a record
+    of a board row in a closed state (its journal, its task, its notes, its landing records — the row is what a
+    person closed), stamped before the cutoff. A descriptor (title, stamp, ids) is not a body and would stay; only
+    the text would go. This prints the set per source with record and byte counts, for cc-janitor's dry-run
+    report; it writes nothing, and no form of this tool cuts — a cut is a separate go after a person has read it."""
+    i = argv.index("--cold")
+    days = int(argv[i + 1]) if i + 1 < len(argv) and argv[i + 1].isdigit() else COLD_DAYS
+    cutoff = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(time.time() - days * 86400))
+    closed = {}   # repo -> {row: status}
+    for repo, (bp, _) in boards().items():
+        try:
+            with open(bp) as f:
+                tr = json.load(f).get("tracks") or {}
+        except (OSError, ValueError):
+            continue
+        closed[repo] = {k: v.get("status") for k, v in tr.items() if isinstance(v, dict) and v.get("status") in CLOSED}
+    c = db_ro(dbpath()) if os.path.isfile(dbpath()) else None
+    out = []
+    if c:
+        for sid, path, skind, repo, track in c.execute("SELECT id, path, skind, repo, track FROM sources WHERE status='ok'"):
+            rows = closed.get(repo) or {}
+            if skind in ("journal", "doc") and track and track in rows:
+                q, args = "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)),0), MAX(ts) FROM records WHERE source_id=? AND ts<?", (sid, cutoff)
+                why = f"row {repo}/{track} {rows[track]}"
+            elif skind == "board" and rows:
+                q = ("SELECT COUNT(*), COALESCE(SUM(LENGTH(text)),0), MAX(ts) FROM records WHERE source_id=? AND ts<? AND track IN (%s)"
+                     % ",".join("?" * len(rows)))
+                args, why = (sid, cutoff, *rows), f"{len(rows)} closed row(s)"
+            elif skind in ("land-root", "land-job"):
+                q, args, why = "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)),0), MAX(ts) FROM records WHERE source_id=? AND ts<?", (sid, cutoff), "landing record"
+            else:
+                continue
+            n, b, newest = c.execute(q, args).fetchone()
+            if n:
+                out.append(dict(path=tilde(path), skind=skind, repo=repo, track=track, records=n, bytes=b, newest=newest, why=why))
+        c.close()
+    tot = dict(days=days, cutoff=cutoff, sources=len(out), records=sum(o["records"] for o in out), bytes=sum(o["bytes"] for o in out), cut=0, would=out)
+    if "--json" in argv:
+        print(json.dumps(tot, indent=1))
+        return 0
+    print(f"cc-lib index --cold {days}: {tot['sources']} source(s), {tot['records']} record(s), {tot['bytes']} B of text stamped before "
+          f"{cutoff} in closed bodies would leave the hot index · cut 0 (dry-run: this tool never cuts)")
+    for o in out:
+        print(f"  would cold {o['path']} · {o['records']} record(s), {o['bytes']} B, newest {o['newest'] or '-'} · {o['why']}")
+    return 0
+
+
+def entries(text):
+    """A journal as whole entries: one per `## ` heading (fence-aware; a `# ` title or a `###` stays inside), plus the
+    preamble before the first `## ` when it says more than a title. [(title, text)] in file order; [] when the
+    file has no `## ` at all."""
+    lines = text.split("\n")
+    out, fence, start, title = [], False, 0, ""
+    for i, l in enumerate(lines):
+        if l.startswith("```"):
+            fence = not fence
+            continue
+        if not fence and l.startswith("## "):
+            out.append((title, "\n".join(lines[start:i]).strip("\n")))
+            title, start = l, i
+    if not out:
+        return []
+    out.append((title, "\n".join(lines[start:]).strip("\n")))
+    return [(t, b) for t, b in out if t or any(x.strip() and not x.startswith("#") for x in b.split("\n"))]
+
+
+def view_label(path):
+    """How `ask` names this journal: r/track for ~/.cc/state/<r>/<track>/progress.md, r/alias for <r>/<alias>-hand*.md,
+    else the path itself."""
+    st = os.path.join(H, ".cc", "state") + os.sep
+    if path.startswith(st):
+        rel = path[len(st):].split(os.sep)
+        if len(rel) == 3 and rel[2] == "progress.md":
+            return f"{rel[0]}/{rel[1]}"
+        if len(rel) == 2 and (rel[1].endswith("-handoff.md") or rel[1].endswith("-handover.md")):
+            return f"{rel[0]}/{rel[1].rsplit('-', 1)[0]}"
+    return tilde(path)
+
+
+def view(argv):
+    """cc-lib view <journal> [--cap <bytes>]: THE CHECKPOINT VIEW — the newest whole entries of a journal that fit the
+    cap, latest last, under one header that says how many of how many are shown and how to reach the rest
+    (`cc-lib ask --object <label> --need history`). The first entry that does not fit is cut at a line and says so:
+    an older entry keeps its head, the newest — when it alone is over the cap — keeps its tail, where its STATUS
+    lines are. Read from the file, never the index, so it is never stale; a journal with no heading is its tail.
+    --from <regex>: the view starts at the LAST entry whose heading matches (cc-handoff: the last `journal at N%`
+    entry, which the successor is told to read); entries before it are counted as older, never shown. No match, no
+    effect — a track journal has no marker anywhere."""
+    path, cap, frm = None, VIEW_CAP, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--cap" and i + 1 < len(argv):
+            cap, i = int(argv[i + 1]), i + 1
+        elif a == "--from" and i + 1 < len(argv):
+            frm, i = argv[i + 1], i + 1
+        elif a.startswith("-") or path:
+            print("usage: cc-lib view <journal> [--cap <bytes>] [--from <regex>]", file=sys.stderr)
+            return 2
+        else:
+            path = a
+        i += 1
+    if not path:
+        print("usage: cc-lib view <journal> [--cap <bytes>] [--from <regex>]", file=sys.stderr)
+        return 2
+    try:
+        frm = re.compile(frm) if frm else None
+    except re.error as e:
+        print(f"cc-lib view: --from: {e}", file=sys.stderr)
+        return 2
+    p = os.path.abspath(os.path.expanduser(path))
+    try:
+        with open(p, "rb") as f:
+            f.seek(max(0, os.path.getsize(p) - MAX_SOURCE))
+            text = f.read().decode("utf-8", "replace")
+    except OSError as e:
+        print(f"cc-lib view: {e}", file=sys.stderr)
+        return 1
+    cap = max(256, cap)
+    older = f"cc-lib ask --object {view_label(p)} --need history \"<words>\""
+    ents = entries(text)
+    if not ents:
+        head = f"checkpoint view: no entry in {tilde(p)} (its tail follows) · older text: {older}"
+        body = text.encode()[-(cap - len(head.encode()) - 1):].decode("utf-8", "ignore")
+        print(head + "\n" + body.strip("\n"))
+        return 0
+    # the header is fixed-length enough to reserve for; its counts are filled in after the selection
+    reserve = len((f"checkpoint view: {len(ents)} of {len(ents)} entries of {tilde(p)}, 1 cut · older entries: {older}").encode()) + 2
+    budget = cap - reserve
+    picked, cut = [], 0
+    start = max((k for k, (t, _) in enumerate(ents) if frm.search(t)), default=0) if frm else 0
+    for t, b in reversed(ents[start:]):
+        eb = b.encode()
+        if len(eb) + 1 <= budget:
+            picked.append(b)
+            budget -= len(eb) + 1
+            continue
+        if not picked:   # the newest alone is over the cap: its tail, where the STATUS lines are
+            mark = f"{t}\n…(cut: the first {len(eb) - budget} bytes of this entry; whole: {older})\n"
+            room = budget - len(mark.encode())
+            if room < 80:   # a cap that leaves no line of it: the header alone says where it is
+                break
+            keep = eb[-room:].decode("utf-8", "ignore")
+            keep = keep[keep.find("\n") + 1:] if "\n" in keep else keep
+            picked.append(mark + keep)
+        else:            # an older entry that does not fit keeps its head
+            mark = f"\n…(cut: {len(eb) - budget} bytes of this entry follow; whole: {older})"
+            room = budget - len(mark.encode())
+            if room < 80:
+                break
+            keep = eb[:room].decode("utf-8", "ignore")
+            keep = keep[:keep.rfind("\n")] if "\n" in keep else keep
+            picked.append(keep + mark)
+        cut = 1
+        break
+    shown = len(picked)
+    head = (f"checkpoint view: {shown} of {len(ents)} entries of {tilde(p)}" + (f", {cut} cut" if cut else "")
+            + (f" · older entries: {older}" if shown < len(ents) or cut else ""))
+    out = head + "\n" + "\n".join(reversed(picked))
+    print(out.encode()[:cap].decode("utf-8", "ignore") if len(out.encode()) > cap else out)
+    return 0
+
+
+def mem_type(path):
+    """The `type:` a memory file's frontmatter carries, or '' when the file is missing, unreadable or says none."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.read(4096)
+    except OSError:
+        return ""
+    m = re.search(r"^\s*type:\s*(\w+)", head, re.M)
+    return m.group(1).lower() if m else ""
+
+
+def memory(argv):
+    """cc-lib memory [--dry-run]: THE MEMORY INDEX SPLIT. Every ~/.claude/projects/*/memory/MEMORY.md is what the harness
+    loads into a session's prompt at start, one line per memory file. The lines whose file is a RULE (type feedback,
+    user) stay — a session cannot search for a rule it does not know it is breaking; the lines whose file is a FACT
+    (type project, reference) move to MEMORY-facts.md beside it, which nothing loads, and one pointer line at the end
+    says where facts are found (`cc-lib ask`). A line whose file is missing or carries no type is not classified and
+    stays. A facts line whose file now says feedback or user comes back. The files themselves are never touched; they
+    are the records and were indexed already. WRITES ONLY WHAT CHANGED: a rewrite that changed nothing would still
+    move the prompt under a running session's cache, which has turned a smaller prompt into higher spend before."""
+    dry = "--dry-run" in argv
+    rc = 0
+    for mi in sorted(glob.glob(os.path.join(H, ".claude", "projects", "*", "memory", "MEMORY.md"))):
+        mdir = os.path.dirname(mi)
+        fp = os.path.join(mdir, MEM_FACTS)
+        try:
+            with open(mi, encoding="utf-8", errors="replace") as f:
+                loaded = f.read().split("\n")
+        except OSError as e:
+            print(f"cc-lib memory: {tilde(mi)}: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                facts = [l for l in f.read().split("\n") if MEM_LINE.match(l)]
+        except OSError:
+            facts = []
+        keep, move, back, seen = [], [], [], set()   # seen: the files the loaded text names — one line per file, wherever it came from
+        for l in loaded:
+            if l.strip() == MEM_POINTER.strip():
+                continue
+            m = MEM_LINE.match(l)
+            if m and mem_type(os.path.join(mdir, m.group(1))) in ("project", "reference"):
+                move.append(l)
+            else:
+                keep.append(l)
+                if m:
+                    seen.add(m.group(1))
+        stay = []
+        for l in facts:
+            fn = MEM_LINE.match(l).group(1)
+            if mem_type(os.path.join(mdir, fn)) in MEM_KEEP:
+                if fn not in seen:   # a line the loaded text already carries is not brought back a second time
+                    back.append(l)
+                    seen.add(fn)
+            elif fn not in {MEM_LINE.match(x).group(1) for x in move} and fn not in {MEM_LINE.match(x).group(1) for x in stay}:
+                stay.append(l)
+        while keep and not keep[-1].strip():
+            keep.pop()
+        new_loaded = keep + back
+        all_facts = stay + move
+        if all_facts:
+            new_loaded += ["", MEM_POINTER]
+        new_loaded_t = "\n".join(new_loaded) + "\n"
+        new_facts_t = ("# Memory facts — not loaded into any prompt; `cc-lib ask --need history \"<words>\"` finds each file's record\n\n"
+                       + "\n".join(all_facts) + "\n") if all_facts else ""
+        try:
+            cur_facts = open(fp, encoding="utf-8", errors="replace").read()
+        except OSError:
+            cur_facts = ""
+        moved_b = sum(len(l.encode()) + 1 for l in move)
+        changed = (new_loaded_t != open(mi, encoding="utf-8", errors="replace").read()) or (all_facts and new_facts_t != cur_facts) \
+            or (not all_facts and os.path.exists(fp))   # nothing left to list: the facts file goes, or a stale one brings lines back
+        what = (f"cc-lib memory: {tilde(mdir)}: {len(new_loaded) - (2 if all_facts else 0)} rule line(s) stay "
+                f"({len(new_loaded_t.encode())} B loaded), {len(move)} fact line(s) move ({moved_b} B), {len(back)} come back, "
+                f"{len(stay)} already in {MEM_FACTS}")
+        if dry:
+            print(what + " · DRY-RUN, nothing written")
+            for l in move:
+                print("  would move: " + l[:100])
+            for l in back:
+                print("  would bring back: " + l[:100])
+            continue
+        if not changed:
+            print(what + " · unchanged, nothing written")
+            continue
+        try:
+            for path, txt in ((mi, new_loaded_t), (fp, new_facts_t)):
+                if not txt:
+                    if os.path.exists(path):
+                        os.remove(path)   # only ever the facts file: the loaded text is never empty (its own lines, or the pointer)
+                    continue
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(txt)
+                os.replace(tmp, path)
+        except OSError as e:
+            print(f"cc-lib memory: {tilde(mdir)}: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        print(what + " · written")
+    return rc
 
 
 def bench(argv):
@@ -1667,7 +2016,10 @@ def selfcheck():
         ok("kinds are derived from the store: journal → checkpoint, feedback memory → decision, heading 'Decisions' → decision, "
            "board row → event, note → note, landing tally → finding",
            set(k for (k,) in c.execute("SELECT DISTINCT kind FROM records")) >= {"checkpoint", "decision", "event", "note", "finding", "document"}
-           and c.execute("SELECT kind FROM records WHERE title LIKE '%Decisions%'").fetchone()[0] == "decision")
+           and c.execute("SELECT kind FROM records WHERE title LIKE '%Decisions%'").fetchone()[0] == "decision"
+           # the frontmatter says `metadata:\n  type: feedback` — indented; a `^type:` read made every memory a note (P0, live index)
+           and c.execute("SELECT kind FROM records WHERE title LIKE 'a figure whose number%'").fetchone()[0] == "decision"
+           and c.execute("SELECT kind FROM records WHERE title LIKE 'never git fetch%' AND kind='note'").fetchone())
         # ---- the failure ledger through the library
         fr = c.execute("SELECT kind, repo, span, text FROM records WHERE title LIKE 'failure answer-evidence%'").fetchone()
         ok("a failure record is indexed from the ledger as kind finding, under its scope, its cluster as the span, its words as the text",
@@ -1901,12 +2253,165 @@ def selfcheck():
         ok("control: the log is cleared only by a pass that reached every source; an unreadable one is not pending, so this one clears too "
            "(unreadable is named in coverage on its own)", "hook-misses 1 cleared" in o and not os.path.exists(ml))
         os.remove(os.path.join(th, ".cc", "boards", "r3.json"))
+        selfcheck_p3(th, ok, run, w)
         selfcheck_workspaces(th, ok, run, w)
     finally:
         H = H0
         shutil.rmtree(th, ignore_errors=True)
     print(f"cc-lib selfcheck: {n[0]} passed, {n[1]} failed")
     return 1 if n[1] else 0
+
+
+def selfcheck_p3(th, ok, run, w):
+    """P3: the checkpoint view, the memory index split, the inbound Slack archive, the cold set. Each on a fixture of
+    its own, and each asserting both the case that is kept and the case that is suppressed."""
+    def outcome(out):
+        m = re.search(r"^OUTCOME (\S+)", out, re.M)
+        return m.group(1) if m else "?"
+    # ---- the checkpoint view: cc-handoff's slice and the worker prompt's journal block read this, not a byte tail
+    jv = w(".cc/state/r1/t3/progress.md", "# t3\n\n## 2026-09-10T10:00Z iter 1\nOLD-ENTRY-REACHABLE the first step.\n\n"
+           "## 2026-09-10T11:00Z iter 2\n" + "a middle line of the second entry, MIDDLE-HEAD first\n" * 40
+           + "\n## 2026-09-10T12:00Z iter 3\nNEWEST-ENTRY the last step.\n```\n## not a heading, fenced\n```\n"
+           + "a line of the newest entry\n" * 20 + "STATUS: DONE\n")
+    rc, o = run("view", jv, "--cap", "1600")
+    ok("view: the newest whole entries within the cap, latest last, the header naming N of M and how to reach the rest",
+       rc == 0 and len(o.encode()) <= 1600 and o.startswith("checkpoint view: 2 of 3 entries of ~/.cc/state/r1/t3/progress.md, 1 cut")
+       and "NEWEST-ENTRY" in o and o.rstrip().endswith("STATUS: DONE") and "OLD-ENTRY-REACHABLE" not in o
+       and "older entries: cc-lib ask --object r1/t3 --need history" in o and "not a heading, fenced" in o)
+    ok("…an older entry that does not fit keeps its head and says it was cut; the newest is whole",
+       "MIDDLE-HEAD" in o and "…(cut: " in o and o.count("a middle line") < 40 and o.index("iter 2") < o.index("iter 3")
+       and o.count("a line of the newest entry") == 20)
+    rc, o2 = run("view", jv, "--cap", "500")
+    ok("…and when the newest alone is over the cap it keeps its TAIL, where the STATUS line is, and names the cut",
+       rc == 0 and len(o2.encode()) <= 500 and o2.rstrip().endswith("STATUS: DONE") and "…(cut: the first" in o2 and "1 of 3" in o2
+       and "NEWEST-ENTRY" not in o2 and o2.split("\n")[1] == "## 2026-09-10T12:00Z iter 3")
+    rc, o3 = run("view", jv)
+    ok("…control: under the default cap the whole journal is the view, no cut, no pointer needed",
+       rc == 0 and o3.startswith("checkpoint view: 3 of 3 entries") and "cut" not in o3.split("\n")[0] and "OLD-ENTRY-REACHABLE" in o3)
+    rc, o4 = run("view", w(".cc/state/r1/raw.md", "no heading here at all\n" * 30), "--cap", "300")
+    ok("…a journal with no heading is its tail under a header that says so", rc == 0 and len(o4.encode()) <= 300 and o4.startswith("checkpoint view: no entry"))
+    jm = w(".cc/state/r1/plan-handoff.md", "## 2026-01-01 00:0xZ — journal at 30% ctx (the OLD one)\nOLD-MARKED\n\n## 2026-01-01 01:00Z unmarked between\nBETWEEN\n\n"
+           "## 2026-01-02 00:0xZ — journal at 31% ctx (the LAST one)\nKEPT-MARKED\n\n## 2026-01-02 01:00Z OVERLAP\nAFTER-IT\n")
+    rc, o5 = run("view", jm, "--from", r"journal at \d+%")
+    ok("…--from <regex>: the view starts at the LAST entry whose heading matches (cc-handoff's marked entry) and counts the rest as older",
+       rc == 0 and o5.startswith("checkpoint view: 2 of 4 entries of ~/.cc/state/r1/plan-handoff.md · older entries: cc-lib ask --object r1/plan")
+       and "KEPT-MARKED" in o5 and "AFTER-IT" in o5 and "OLD-MARKED" not in o5 and "BETWEEN" not in o5)
+    rc, o6 = run("view", jv, "--from", r"journal at \d+%")
+    ok("…control: with no matching heading --from changes nothing (a track journal has no marker)", rc == 0 and o6 == o3)
+    run("index")
+    rc, o = run("ask", "--object", "r1/t3", "--need", "history", "OLD-ENTRY-REACHABLE first step")
+    ok("…and the entry the view left out is still reachable, by the ask the header names", rc == 0 and "OLD-ENTRY-REACHABLE" in o and outcome(o) == "answered")
+
+    # ---- the memory index split: rules stay in the loaded text, facts move to the library and are found on demand
+    md = ".claude/projects/-x-dev-r1/memory/"
+    w(md + "dashboard.md", "---\nname: dashboard\ndescription: orch dashboard, channel and packet paths\nmetadata:\n  type: project\n---\n\n"
+      "M1 landed as #259; the CAPYBARA packet is under state/dashboard-site.\n")
+    w(md + "owner.md", "---\nname: owner\ndescription: the owner is admin, not family\nmetadata:\n  type: user\n---\n\nmembers are members.\n")
+    w(md + "api-ref.md", "---\nname: api-ref\ndescription: the routing API dashboard URL\nmetadata:\n  type: reference\n---\n\nhttps://x/y\n")
+    w(md + "untyped.md", "---\nname: untyped\ndescription: no type at all\n---\n\nunclassified.\n")
+    mi = w(md + "MEMORY.md", "- [Verify figures](verify-figures.md) — a figure from two tools is a bug\n"
+           "- [Fetch head](fetch-head.md) — never git fetch in the shared checkout\n"
+           "- [Dashboard](dashboard.md) — orch dashboard, channel and packet paths\n"
+           "- [Owner](owner.md) — the owner is admin, not family\n"
+           "- [API](api-ref.md) — the routing API dashboard URL\n"
+           "- [Untyped](untyped.md) — a file with no type\n"
+           "- [Nowhere](nowhere.md) — a line whose file is gone\n")
+    fp = os.path.join(th, md, MEM_FACTS)
+    before = open(mi).read()
+    rc, o = run("memory", "--dry-run")
+    ok("memory --dry-run names the two fact lines (project, reference) it would move and writes nothing",
+       rc == 0 and "2 fact line(s) move" in o and "would move: - [Dashboard]" in o and "would move: - [API]" in o and "DRY-RUN" in o
+       and open(mi).read() == before and not os.path.exists(fp))
+    rc, o = run("memory")
+    loaded = open(mi).read()
+    facts = open(fp).read() if os.path.exists(fp) else ""
+    ok("memory: the loaded index keeps the rules (feedback, user), the line it cannot classify (no type, no file), and ONE pointer line, last",
+       rc == 0 and "written" in o and "[Verify figures]" in loaded and "[Fetch head]" in loaded and "[Owner]" in loaded and "[Untyped]" in loaded
+       and "[Nowhere]" in loaded and "[Dashboard]" not in loaded and "[API]" not in loaded
+       and loaded.count("cc-lib ask") == 1 and loaded.rstrip().split("\n")[-1] == MEM_POINTER)
+    ok("…the facts are in MEMORY-facts.md beside it, which nothing loads, and the memory files themselves are untouched",
+       "[Dashboard](dashboard.md)" in facts and "[API](api-ref.md)" in facts and "[Verify figures]" not in facts
+       and open(os.path.join(th, md, "dashboard.md")).read().startswith("---\nname: dashboard"))
+    rc, o = run("ask", "--need", "history", "CAPYBARA packet dashboard")
+    ok("…a fact moved out of the loaded text is found by cc-lib ask (its file is the record)", rc == 0 and "CAPYBARA packet" in o and outcome(o) == "answered")
+    c = db()
+    ok("…and neither index file is a source: the files they point at are the records",
+       not c.execute("SELECT 1 FROM sources WHERE path LIKE '%/MEMORY.md' OR path LIKE '%/MEMORY-facts.md'").fetchone())
+    c.close()
+    m0 = (os.stat(mi).st_mtime_ns, os.stat(fp).st_mtime_ns)
+    rc, o = run("memory")
+    ok("…idempotent: a second pass rewrites nothing (a no-op rewrite would still move the prompt under a running session's cache)",
+       rc == 0 and "unchanged, nothing written" in o and (os.stat(mi).st_mtime_ns, os.stat(fp).st_mtime_ns) == m0)
+    w(md + "api-ref.md", "---\nname: api-ref\ndescription: the routing API dashboard URL\nmetadata:\n  type: feedback\n---\n\nnow a rule.\n")
+    rc, o = run("memory")
+    loaded, facts = open(mi).read(), open(fp).read()
+    ok("…a facts line whose file now says feedback comes back to the loaded text; the other fact stays out",
+       rc == 0 and "1 come back" in o and "[API]" in loaded and "[API]" not in facts and "[Dashboard]" in facts and "[Dashboard]" not in loaded)
+    w(md + "dashboard.md", "---\nname: dashboard\ndescription: orch dashboard\nmetadata:\n  type: feedback\n---\n\nnow a rule too.\n")
+    run("memory")
+    rc, o = run("memory")
+    loaded = open(mi).read()
+    ok("…when the last fact comes back, the facts file and the pointer line go with it, and a further pass brings nothing back and writes "
+       "nothing: each line is in the loaded text ONCE (a stale facts file once brought the same line back every pass)",
+       rc == 0 and "unchanged, nothing written" in o and "0 come back" in o and loaded.count("[API]") == 1 and loaded.count("[Dashboard]") == 1
+       and "cc-lib ask" not in loaded and not os.path.exists(fp))
+
+    # ---- inbound Slack, archived by the daemon per target/chat/month, found by channel, thread and ts
+    w(".cc/slack/archive/r1/C0AAAAAAAA1/2026-09.jsonl",
+      json.dumps({"ts": "1789236000.000100", "thread_ts": "1789236000.000100", "chat": "C0AAAAAAAA1", "channel": "#r1", "user": "ada",
+                  "role": "owner", "target": "r1", "text": "ship the site tonight, the MARMOSET members are waiting", "at": "2026-09-12T18:00:00Z"}) + "\n"
+      + json.dumps({"ts": "1789236060.000200", "thread_ts": "1789236000.000100", "chat": "C0AAAAAAAA1", "channel": "#r1", "user": "ada",
+                    "role": "owner", "target": "r1", "text": "and the hostname stays private, MARMOSET again", "at": "2026-09-12T18:01:00Z"}) + "\n"
+      + json.dumps({"ts": "1789239600.000300", "thread_ts": "1789239600.000300", "chat": "C0AAAAAAAA1", "channel": "#r1", "user": "bob",
+                    "role": "member", "target": "r1", "text": "a second thread, the OCELOT one", "at": "2026-09-12T19:00:00Z"}) + "\n"
+      + "not json\n")
+    w(".cc/slack/archive/_cctest/C0ZZZZZZZZ9/2026-09.jsonl", json.dumps({"ts": "1789236000.000900", "chat": "C0ZZZZZZZZ9", "text": "a fixture archive"}) + "\n")
+    rc, o = run("index")
+    c = db()
+    sl = c.execute("SELECT kind, repo, title, ts FROM records WHERE text LIKE 'ship the site tonight%'").fetchone()
+    ok("an archived message is one record (kind note) under the route's target, titled by channel, user, role and stamp",
+       sl and sl[0] == "note" and sl[1] == "r1" and sl[2] == "slack #r1 ada (owner) 2026-09-12T18:00Z" and sl[3] == "2026-09-12T18:00Z"
+       and c.execute("SELECT COUNT(*) FROM records WHERE title LIKE 'slack #r1%'").fetchone()[0] == 3
+       and not c.execute("SELECT 1 FROM sources WHERE path LIKE '%_cctest/C0ZZZZZZZZ9%'").fetchone())
+    ok("…its ids: the chat id, its ts and its thread's ts, in the id column",
+       by_ids(c, {"C0AAAAAAAA1"}, skind=None) and len(by_ids(c, {"1789236000.000100"})) == 2 and len(by_ids(c, {"1789236060.000200"})) == 1)
+    c.close()
+    rc, o = run("ask", "--object", "C0AAAAAAAA1", "--need", "history", "MARMOSET")
+    ok("found by CHANNEL: --object <chat id> routes to the records naming it", rc == 0 and "records naming it" in o and "MARMOSET" in o and outcome(o) == "answered")
+    rc, o = run("ask", "--object", "1789236000.000100", "--need", "history")
+    ok("found by THREAD: --object <thread ts> is the root and every reply, and not the other thread",
+       rc == 0 and "ship the site tonight" in o and "hostname stays private" in o and "OCELOT" not in o and "reply" in o)
+    rc, o = run("ask", "--object", "1789239600.000300", "--need", "history")
+    ok("found by TS: --object <message ts> is that message alone, a member's words under the member role",
+       rc == 0 and "OCELOT" in o and "bob (member)" in o and "MARMOSET" not in o)
+
+    # ---- the cold set: what would leave the hot index, and nothing leaves
+    with open(os.path.join(th, ".cc", "boards", "r1.json")) as f:
+        bd = json.load(f)
+    bd["tracks"]["t1"]["status"] = "merged"
+    bd["tracks"]["t1"]["notes"].append({"ts": "2026-09-08T10:00:00Z", "msg": "merged as #390"})
+    w(".cc/boards/r1.json", json.dumps(bd))
+    tk = w(".cc/state/r1/t1/task.md", "# t1\n\nthe brief of a merged row.\n")
+    os.utime(tk, (time.time() - 40 * 86400, time.time() - 40 * 86400))   # a doc's stamp is its mtime: this one is 40 days old
+    run("index")
+    c = db()
+    nrec, ntext = c.execute("SELECT COUNT(*), SUM(LENGTH(text)) FROM records").fetchone()
+    c.close()
+    rc, o = run("index", "--cold", "1")
+    ok("index --cold names the closed bodies before the cutoff — a merged row's journal, task and notes, the landing records — with counts",
+       rc == 0 and "cut 0" in o and "dry-run" in o and "would cold ~/.cc/state/r1/t1/progress.md" in o and "row r1/t1 merged" in o
+       and "would cold ~/.cc/state/r1/t1/task.md" in o and "would cold ~/.cc/boards/r1.json" in o and "closed row(s)" in o
+       and "would cold ~/.cc/state/land/root/r1-390.json" in o and "landing record" in o)
+    ok("…and not the open rows: t2 (review) and the site journal are not in it; a docs page is never a body",
+       "r1/t2/" not in o and "site-handover" not in o and "design-x.md" not in o and "goals.md" not in o)
+    rc, oj = run("index", "--cold", "1", "--json")
+    c = db()
+    ok("…and it cuts nothing: the same records and bytes are in the index after it, `cut` is 0 in the JSON too",
+       rc == 0 and json.loads(oj)["cut"] == 0 and json.loads(oj)["records"] > 0
+       and c.execute("SELECT COUNT(*), SUM(LENGTH(text)) FROM records").fetchone() == (nrec, ntext))
+    c.close()
+    rc, o = run("index", "--cold", "3650")
+    ok("control: a cutoff before every record names nothing", rc == 0 and "0 source(s), 0 record(s)" in o and "would cold" not in o)
 
 
 def selfcheck_workspaces(th, ok, run, w):
@@ -2163,9 +2668,13 @@ def main(argv):
         return get(rest)
     if cmd == "index":
         return index(rest)
+    if cmd == "view":
+        return view(rest)
+    if cmd == "memory":
+        return memory(rest)
     if cmd == "bench":
         return bench(rest)
-    print("usage: cc-lib ask|get|index [--touch <path>...]|bench|selfcheck (cc-lib --help for the contract)", file=sys.stderr)
+    print("usage: cc-lib ask|get|view|memory|index [--touch <path>...|--cold [days]]|bench|selfcheck (cc-lib --help for the contract)", file=sys.stderr)
     return 2
 
 

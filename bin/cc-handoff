@@ -630,7 +630,8 @@ most, because every minute of it runs two sessions of this size, and it ends the
 `cc-handoff --ready`. So the order is fixed — read the packet, ask your ONE batch of questions FIRST, and go \
 ready as soon as they are answered. Anything you could do just as well alone five minutes later, do it then. \
 Your FIRST tool call is \
-`cc-handoff --brief {target}` — one packet holding the last entry of {journal} and the dated lines after it, \
+`cc-handoff --brief {target}` — one packet holding the checkpoint view of {journal} (its newest entries, 8 kB; \
+`cc-lib ask --need history` reaches the older ones), \
 the unfinished board, what is landing, the live workers, the open PRs and the open asks. That packet plus what \
 your predecessor tells you is everything you start from; rebuilding it a call at a time is what made a handover \
 cost about two million tokens. You are NOT the live session yet: the live one owns this target's channel and \
@@ -1568,7 +1569,9 @@ def status(target=None, as_json=False):
 # N%" and a track's `progress.md` does not (of the 93 here, none does) — so a missing marker is the NORMAL
 # case for a track and must not tip the raw tail into the packet. The marker wins where there is one; where
 # there is none the last dated `## ` heading is the entry, and the packet says which of the two it cut on.
-BRIEF_CAP = 64 * 1024                # the most of a journal --brief will ever read
+# SINCE P3 OF THE LIBRARY this reader is the FALLBACK: the brief carries `cc-lib view` (journal_view, 8 kB, whole
+# entries from the last marker, a header naming the ask that reaches the rest) and reads this way only without cc-lib.
+BRIEF_CAP = 64 * 1024                # the most of a journal --brief will ever read (the fallback tail; the view is 8 kB)
 JOURNAL_MARK = re.compile(r"^## .*journal at \d+%", re.M)
 JOURNAL_HEAD = re.compile(r"^## ", re.M)         # any dated entry: what a track journal has instead
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -1642,6 +1645,30 @@ def tail_entry(path, cap=BRIEF_CAP):
         return text[head.start():], read, "last dated entry"
     return (f"(no dated '## ' entry in the last {read // 1024} kB of {path} — the tail follows)\n"
             + buf.decode("utf-8", "replace"), read, "raw tail")
+
+
+VIEW_CAP = 8 * 1024                  # the checkpoint view a brief carries: 8 kB, where the tail could be 64
+
+
+def journal_view(path):
+    """THE CHECKPOINT VIEW of the journal (cc-lib view): the newest whole entries that fit 8 kB, latest last, starting
+    at the last `journal at N%` entry where there is one (the marker wins, as tail_entry's rule has it), under a
+    header that names how many of how many entries are shown and the `cc-lib ask` that reaches the rest. Returns
+    (text, label) — or (None, None) when cc-lib is not beside this file or fails, and the caller falls back to
+    tail_entry, so a brief never loses its journal section to the library. subprocess directly, not out(): the
+    selfcheck stubs out() and this section needs the real view."""
+    lib = os.path.join(BIN, "cc-lib")
+    if not os.access(lib, os.X_OK):
+        return None, None
+    try:
+        r = subprocess.run([lib, "view", os.path.expanduser(path), "--cap", str(VIEW_CAP), "--from", r"journal at \d+%"],
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None, None
+    if r.returncode != 0 or not r.stdout.startswith("checkpoint view"):
+        return None, None
+    head, _, body = r.stdout.partition("\n")
+    return body, head[len("checkpoint view: "):]
 
 
 def board_open(repo):
@@ -1727,7 +1754,10 @@ def brief(target):
     time. Read-only and best-effort throughout — this must never be the thing that fails a handoff."""
     repo = parts(target)[0]
     rec = read(target)
-    journal, jread, janchor = tail_entry(journal_for(target))
+    journal, jlabel = journal_view(journal_for(target))
+    if journal is None:   # no cc-lib: the 64 kB tail it was
+        journal, jread, janchor = tail_entry(journal_for(target))
+        jlabel = f"the {janchor} and every line after it ({jread // 1024 or 1} kB read of {journal_for(target)}, never the whole file)"
     pre = (rec or {}).get("predecessor") or {}
     who = [f"target        {target}",
            f"predecessor   window main:{pre.get('window') or target}   tmux {pre.get('tmux') or win_id(target) or '?'}",
@@ -1736,8 +1766,7 @@ def brief(target):
         who.append(f"handoff       id {rec.get('id')}   phase {rec.get('phase')}   live {live_side(rec)}   "
                    f"{int((rec.get('deadline', 0) - time.time()) / 60)}m left")
     sections = [
-        (f"journal — the {janchor} and every line after it "
-         f"({jread // 1024 or 1} kB read of {journal_for(target)}, never the whole file)", journal),
+        (f"journal — checkpoint view: {jlabel}", journal),
         (f"board — {repo}, unfinished rows only", board_open(repo)),
         ("land — lanes and the landing queue", lanes()),
         (f"workers — live loops under {repo}, last line of each", live_workers(repo)),
@@ -2879,6 +2908,20 @@ def selfcheck():
         ok("...the journal section is the LAST 'journal at N%' entry and the dated lines after it",
            "KEPT-ENTRY" in b and "DATED-LINE-AFTER-IT" in b and "the LAST one" in b
            and anchor == "last 'journal at N%' entry")
+        jsec = b.split("== journal — ")[1].split("\n== ")[0] if "== journal — " in b else ""
+        ok("...and it is the CHECKPOINT VIEW (cc-lib view, 8 kB cap): its header names 1 of 2 entries and the ask that reaches the older one, "
+           "and the 140 kB between the two marked entries is neither read into the packet nor over the cap",
+           jsec.startswith("checkpoint view: 1 of 2 entries of") and "older entries: cc-lib ask --object r9/t9 --need history" in jsec
+           and len(jsec.encode()) <= VIEW_CAP + 200)
+        jv, jl = journal_view(jpath)
+        bin0 = BIN
+        globals()["BIN"] = os.path.join(d, "no-such-bin")
+        try:
+            jnone = journal_view(jpath)
+        finally:
+            globals()["BIN"] = bin0
+        ok("...journal_view returns the body and the label; with no cc-lib beside this file it returns nothing, and the brief falls back to the tail",
+           jv is not None and "KEPT-ENTRY" in jv and jl.startswith("1 of 2 entries") and jnone == (None, None))
         ok("...and it never reads past that entry: the one before it is in the file and not in the packet",
            "OLD-ENTRY-NEVER-READ" not in b and "the OLD one" not in b
            and nread < os.path.getsize(jpath) and nread <= BRIEF_CAP)

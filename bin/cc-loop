@@ -264,6 +264,14 @@ library_block(){   # → that shared rule with a leading space, or NOTHING if th
                    # question, a PR body — each is read by a person later. `cc selfcheck` covers the other kinds;
                    # this prompt is built here, so the case for it is below.
   local l; l=$(cat "$LIBRARY" 2>/dev/null); [ -n "$l" ] || return 0; printf ' %s' "$l"; }
+JOURNAL_CAP=6000   # bytes of journal an iteration's prompt carries — the same six thousand the byte tail carried
+journal_block(){   # $1 the journal → THE CHECKPOINT VIEW of it (cc-lib view): the newest whole entries that fit the cap, latest
+                   # last, under a header that says how many of how many are shown and how to reach the rest (`cc-lib ask`).
+                   # `tail -c` started mid-line inside whatever entry the byte count fell in, and the iteration read the rest
+                   # of a half entry it could not place; the view starts at an entry and names the entries it left out. Where
+                   # cc-lib is missing or fails the tail is what it was, so an iteration never starts with no journal at all.
+  [ -x "$BIN/cc-lib" ] && timeout 10 "$BIN/cc-lib" view "$1" --cap "$JOURNAL_CAP" 2>/dev/null && return 0
+  tail -c "$JOURNAL_CAP" "$1"; }
 selfrev_block(){   # $1 the base branch → the self-review paragraph the worker prompt carries, or NOTHING if the
                    # checklist is missing. The worker reads the diff against it before STATUS: DONE, so the review
                    # stops fewer PRs for what the worker could have seen itself. It is inlined rather than linked
@@ -661,6 +669,17 @@ down still leaves the board write and the updates line, which is the half of thi
   t 'control: with the reading rule gone, the worker prompt fails that same test' "$(reads "$lgone")" no
   t '…and the reading rule is said once too: no line of it is pasted into this script' \
     "$(dup=no; while IFS= read -r l; do [ ${#l} -ge 40 ] || continue; grep -qF -- "$l" "$0" && dup=yes; done <<<"$ltext"; echo "$dup")" no
+  # THE JOURNAL BLOCK IS THE CHECKPOINT VIEW, not a byte tail: it starts at an entry, keeps the newest whole ones inside
+  # the cap, and its header names how many it left out and the ask that reaches them. The one cut it makes is named.
+  # Without cc-lib the tail is what it was — an iteration never starts with no journal at all.
+  mkdir -p "$d/jv"; { printf '## 2026-09-10T10:00Z iter 1\nTHE-OLD-ENTRY\n'; for k in $(seq 200); do printf 'a line of the middle entry, number %s\n' "$k"; done | sed '1s/^/## 2026-09-10T11:00Z iter 2\n/'; printf '## 2026-09-10T12:00Z iter 3\nTHE-NEWEST-ENTRY\nSTATUS: DONE\n'; } > "$d/jv/progress.md"
+  jb=$(journal_block "$d/jv/progress.md")
+  t 'the journal block is the checkpoint view: newest entries whole, latest last, its header naming N of M and the ask for the rest' \
+    "$(case "$jb" in "checkpoint view: "*"of 3 entries"*"cc-lib ask --object"*) echo yes;; *) echo no;; esac):$(grep -c 'THE-NEWEST-ENTRY' <<<"$jb"):$(grep -c 'THE-OLD-ENTRY' <<<"$jb"):$(tail -1 <<<"$jb")" 'yes:1:0:STATUS: DONE'
+  t '…inside the cap, starting at an entry heading, not mid-line' "$(printf '%s' "$jb" | wc -c | awk -v c="$JOURNAL_CAP" '{print ($1 <= c) ? "yes" : "no"}'):$(sed -n 2p <<<"$jb")" 'yes:## 2026-09-10T11:00Z iter 2'
+  mkdir -p "$d/nolib"; jt=$(BIN="$d/nolib" journal_block "$d/jv/progress.md")
+  t 'control: with no cc-lib beside this script the block is the byte tail it was, and never empty' \
+    "$(case "$jt" in "checkpoint view"*) echo view;; "") echo empty;; *) echo tail;; esac):$(tail -1 <<<"$jt")" 'tail:STATUS: DONE'
   # THE SPEND TIER'S ANSWER IS READ OFF ITS EXIT ALONE: 1 holds, 0 goes, and a cc-tier that cannot answer (absent,
   # crashed) is "go" — the leniency `cc-pause is` has, so a tier nobody can read is never what stops a worker.
   mkdir -p "$d/tbin"; printf '#!/bin/sh\n[ "$3" = r/held ] && exit 1; [ "$3" = r/broken ] && exit 3; exit 0\n' > "$d/tbin/cc-tier"; chmod +x "$d/tbin/cc-tier"
@@ -785,7 +804,7 @@ while [ $i -lt "$MAXI" ]; do
     "$BIN/cc-limit" wait || stop 8 "waiting" "Claude $p — longer than cc-loop waits (CC_LIMIT_MAX_WAIT); rerun with: cc $repo $track --go \"\""; fi
   i=$((i+1)); before_head=$(git -C "$WT" rev-parse HEAD 2>/dev/null); before_prog=$(md5sum "$ST/progress.md" | cut -c1-8); cp "$ST/progress.md" "$SNAP"
   cont=""; [ "$rounds" -gt 0 ] && cont=" This loop passed its original step limit and carried on because you are still committing work — pick up exactly where the journal stops."
-  prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(tail -c 6000 "$ST/progress.md")" "$i" "$MAXI" "$cont")
+  prompt=$(printf '# TASK\n%s\n\n# PROGRESS JOURNAL (latest last)\n%s\n\n# THIS ITERATION\nContinue from the journal. Do the next step. Journal it early, not at the end. Iteration %s of %s.%s\n' "$(cat "$ST/task.md")" "$(journal_block "$ST/progress.md")" "$i" "$MAXI" "$cont")
   args=(-p "$prompt" --permission-mode auto --max-turns "$TURNS" --max-budget-usd "$BUDGET" --output-format json --append-system-prompt "$SP")
   m=$(worker_model "$MODEL")   # resolved every iteration, not pinned at dispatch: an override mid-loop (a limit) moves this worker too
   [ -n "$m" ] && args+=(--model "$m"); [ -n "$EFFORT" ] && args+=(--effort "$EFFORT")

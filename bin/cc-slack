@@ -867,6 +867,36 @@ def outbox(kind, chat, thread, text):
         f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\t{kind}\t{chat}\t{thread or ''}\t{text.replace(chr(10), ' ')[:2000]}\n")
 
 
+def archive_in(target, chat, thread, ts, user, role, channel, text):
+    """THE INBOUND ARCHIVE (knowledge library P3, docs/design-knowledge-library-2026-09-11.md §7: the owner's own words
+    were the largest evidence gap). One JSON line per human message this daemon received and accepted — after the
+    pairing, bot and stranger drops, before any command, thread-word or permission branch takes it — under
+    ~/.cc/slack/archive/<target>/<chat>/<YYYY-MM>.jsonl. THE TARGET IS THE ROUTE'S (a repo, a member handle, box;
+    `unrouted` for a channel no project maps to), so the file's place carries the workspace the way cc-lib scopes
+    every source: a member handle's archive is that workspace's, everything else the owner's. It is never under
+    member/<h>, which is the slice a boundary binds — nothing of the archive is mounted into a member; the member reads
+    its own channel's records through its workspace's index file, which the host builds. One os.write of one line on an
+    O_APPEND fd: on_event runs on the chat's own executor, so a chat's file has one writer at a time and a line is never
+    interleaved. Best-effort: a failure is one log line and the message is still delivered."""
+    try:
+        d = f"{DIR}/archive/{target or 'unrouted'}/{chat}"
+        os.makedirs(d, exist_ok=True)
+        try:
+            month = time.strftime("%Y-%m", time.gmtime(float(ts)))
+        except (ValueError, OverflowError, OSError):
+            month = time.strftime("%Y-%m", time.gmtime())
+        line = json.dumps({"ts": ts, "thread_ts": thread or ts, "chat": chat, "channel": channel, "user": user, "role": role,
+                           "target": target or "", "text": text, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+                          ensure_ascii=False) + "\n"
+        fd = os.open(f"{d}/{month}.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except Exception as e:
+        log(f"archive: {chat} {ts}: {e!r}")
+
+
 # ── the outbound ledger: one eventual post per producer id ─────────────────────────────────────────────────
 # THE ONE AUTHORITY ON OUTBOUND ACCEPTANCE (arch review 2026-09-08, rec 4). Every producer with a notice that has an
 # identity — cc-notify, a landing's result, the credential nag — used to keep its own memory of having said it, and
@@ -5514,6 +5544,12 @@ class Daemon:
             if shared:
                 text = (text + "\n" + shared).strip()
         cmd = text.startswith("!")                      # a command to the daemon: never a conversation of its own (A2)
+        # every human word from here on is archived, whatever branch below takes it (a command, a thread word, a
+        # permission answer, an unrouted channel): the archive is what was said, not what was delivered
+        # …at no API call of its own: the name and channel are the cached ones (the first delivered message in the
+        # daemon's life fills both), else the ids, which are stable and are what cc-lib's --object takes anyway
+        archive_in(target, chat, thread, ts, self.users.get(user, (user,))[0], "owner" if is_owner else "member",
+                   "dm" if ctype == "im" else "#" + self.names.get(chat, chat), text)
         if is_owner and target and not (cmd and thread == ts):   # marks/nudges track the OWNER's turn, not a member's
             self.arm(chat, time.time() + STALL_AFTER)   # V1(b): unanswered 30 min from now = a stalled session → ❓
             if thread == ts:
@@ -10766,6 +10802,29 @@ def cmd_selfcheck():
         dm5.on_event({"type": "message", "channel": "C3", "ts": "5.2", "thread_ts": "5.1", "user": "UOWNER", "text": "any update?"})
     check("route: alias with no live conn → not-running reply naming `cc <repo> --orch <alias>`, nothing delivered or queued",
           said5 and "@ai-dev is not running here" in said5[-1] and "cc r --orch ai-dev" in said5[-1] and not delivered5 and not dm5.queues["r"])
+    # THE INBOUND ARCHIVE, on a daemon of its own: three human messages in one channel (an owner root, an owner reply in
+    # its thread, a member's root) are three lines of archive/<target>/<chat>/<month>.jsonl, in order, each carrying
+    # ts, thread_ts, chat, channel, user, role, target and the words; a bot message and a stranger's DM leave nothing.
+    dmA = Daemon(use_slack=False); dmA.cfg = {"SLACK_OWNER_ID": "UOWNER", "SLACK_BOT_TOKEN": "xoxb-test"}; dmA.bot_user = "UBOT"
+    dmA.route = lambda chat, ctype: "r" if chat == "C0ARCHIVE01" else ("box" if ctype == "im" else None)
+    dmA.deliver = lambda *a, **k: "delivered"; dmA.clear_needs = lambda *a, **k: None; dmA.names["C0ARCHIVE01"] = "r"
+    dmA.users["UOWNER"] = ("Ada", "ada")   # a cached name is what the archive carries; an uncached one is the id — never a users.info of its own
+    with offline_slack():
+        dmA.on_event({"type": "message", "channel": "C0ARCHIVE01", "ts": "1789236000.000100", "user": "UOWNER", "text": "ship the MARMOSET tonight"})
+        dmA.on_event({"type": "message", "channel": "C0ARCHIVE01", "ts": "1789236060.000200", "thread_ts": "1789236000.000100", "user": "UOWNER", "text": "and keep the hostname private"})
+        dmA.on_event({"type": "message", "channel": "C0ARCHIVE01", "ts": "1789239600.000300", "user": "UMEMBER", "text": "a member's OCELOT question"})
+        dmA.on_event({"type": "message", "channel": "C0ARCHIVE01", "ts": "1789239660.000400", "user": "UBOT", "text": "a bot line, never archived"})
+        dmA.on_event({"type": "message", "channel": "D0STRANGER1", "channel_type": "im", "ts": "1789239700.000500", "user": "USTRANGER", "text": "a stranger's DM"})
+    arch = f"{DIR}/archive/r/C0ARCHIVE01/2026-09.jsonl"
+    rows = [json.loads(l) for l in open(arch)] if os.path.exists(arch) else []
+    check("archive: an accepted human message is one JSON line under archive/<target>/<chat>/<month>.jsonl — ts, thread_ts, chat, channel, user, role, target, text",
+          len(rows) == 3 and rows[0]["ts"] == "1789236000.000100" and rows[0]["thread_ts"] == "1789236000.000100" and rows[0]["chat"] == "C0ARCHIVE01"
+          and rows[0]["channel"] == "#r" and rows[0]["user"] == "Ada" and rows[0]["role"] == "owner" and rows[0]["target"] == "r" and rows[0]["text"] == "ship the MARMOSET tonight"
+          and rows[1]["thread_ts"] == "1789236000.000100" and rows[1]["ts"] == "1789236060.000200"
+          and rows[2]["role"] == "member" and rows[2]["user"] == "UMEMBER" and rows[2]["thread_ts"] == rows[2]["ts"] and "OCELOT" in rows[2]["text"]
+          and (os.stat(arch).st_mode & 0o777) == 0o600)
+    check("…and the bot line and the stranger's DM are nowhere in it: only what the daemon accepted from a person is archived",
+          not any("bot line" in r["text"] for r in rows) and not os.path.exists(f"{DIR}/archive/box") and not glob.glob(f"{DIR}/archive/*/D0STRANGER1"))
     cmain, corch = Conn(None, "r", {"alias": None}), Conn(None, "r", {"alias": "ai-dev"})
     sent5 = []; cmain.send = lambda p: sent5.append(("main", p)); corch.send = lambda p: sent5.append(("ai-dev", p))
     dm6 = Daemon(use_slack=False); dm6.subs["r"] = [cmain, corch]
