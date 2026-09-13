@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """cc-bundle — queued rows whose briefs name the same file run as ONE worker, chosen and started by the box.
 
-  cc-bundle show <repo> [--json] [--no-net]   the bundles it would run — rows, files, model, name — and what holds
-                                              them right now; nothing to run prints nothing
+  cc-bundle show <repo> [--json] [--no-net]   the bundles it would run — rows, files, model, name, the rows waiting
+                                              behind each — and what holds them right now; nothing to run prints nothing
   cc-bundle go <repo> [--dry-run] [--no-net]  start the first bundle nothing holds, one per call; --dry-run says
                                               which and starts nothing
   cc-bundle --tick                            `go` for every repo with a board — rides cc-reconcile.service
@@ -23,12 +23,23 @@ board — `queued` because cc-land's closer skips a running row, the field becau
 read it as "being written" while the bundle row is live, so nothing offers the member twice. A bundle that lands
 closes its members; one that is abandoned or removed hands them back to the pool by the same test.
 
-WHAT STAYS OUT. A project row — a brief with milestones, or one an orch holds with its `agent` mark — stays whole:
-the mark keeps it out of `ready`, and a brief carrying milestones is dropped from a group here. A row in flight
-or under review is never re-bundled: a member is a row whose status is `queued` and that has no PR — `ready`
-also offers a `blocked` row (a landing that died leaves one, with a PR and commits of its own), and bundling that
-would redo its work off main, open a second PR for it and close it on the bundle's Closes line with its own PR
-still open. A row sharing a file with nothing is not a bundle and is left to the seat, exactly as today.
+A BUNDLE IS ONE WORKER'S DIFF AND ONE REVIEWER'S READ: at most ROWS_MAX (6) rows, naming at most FILES_MAX (6)
+files between them (CC_BUNDLE_ROWS, CC_BUNDLE_FILES). The join is transitive, and the first live tick after #471
+offered ONE bundle of 33 rows over 19 files — every queued raised- row, glued through the test suite and two
+tools — which no worker finishes and no reviewer reads. A group over a cap is SPLIT ON THE FILE ITS ROWS MOST
+SHARE: the rows naming it fill one bundle, narrowest first, up to the caps; a leftover row naming a file that
+bundle names waits for it to land (`show` says so: "N wait behind it") and the rest are grouped again the same
+way. Bundles offered together never name a file in common, and neither does a bundle offered later while one
+is live: a row naming a file a live bundle's members name is no member until that bundle row is done.
+
+WHAT STAYS OUT. A project row stays whole: a brief that says "milestones" or numbers them (M1, M2 — anywhere in
+its text), and a row carrying an `agent` mark, warm or cold — `ready` offers a row whose mark went cold, which
+is right for a seat that can ask the session, but a bundle asks nobody, and the row is that session's until it
+hands it back (`agent ""`). A row in flight or under review is never re-bundled: a member is a row whose status
+is `queued` and that has no PR — `ready` also offers a `blocked` row (a landing that died leaves one, with a PR
+and commits of its own), and bundling that would redo its work off main, open a second PR for it and close it on
+the bundle's Closes line with its own PR still open. A row sharing a file with nothing is not a bundle and is
+left to the seat, exactly as today.
 
 WHAT HOLDS A DISPATCH, in order, and `show` names the first that applies:
   · the project is parked — `cc-pause is <repo>`, the check every timer-driven spender makes before it spends
@@ -48,17 +59,22 @@ the box's bands (WORKING.md, model policy): Sonnet when the members name ONE fil
 the repo's control layer (tests/control-layer, what buys a paid review), Opus otherwise.
 
 EVERYTHING IT DID IS IN ~/.cc/state/bundle/<repo>.jsonl — one line per dispatch, refusal or hold — and a tick that
-started nothing prints nothing. Env: CC_BUNDLE_WIDTH · CC_BUNDLE_BIN (tests: where the siblings are) · CC_BOARDS,
-CC_STATE (cc-brief's, so a test run keeps out of the box's own state).
+started nothing prints nothing. Env: CC_BUNDLE_WIDTH · CC_BUNDLE_ROWS · CC_BUNDLE_FILES · CC_BUNDLE_BIN (tests:
+where the siblings are) · CC_BOARDS, CC_STATE (cc-brief's, so a test run keeps out of the box's own state).
 """
-import fnmatch, glob, hashlib, json, os, re, subprocess, sys, time
+import collections, fnmatch, glob, hashlib, json, os, re, subprocess, sys, time
 
 BIN = os.environ.get("CC_BUNDLE_BIN") or os.path.dirname(os.path.realpath(__file__))
 QUEUE_HOLD = 4          # landing jobs on disk before no new work is started (owner's line, 2026-09-12)
 REFUSED_H = 24          # hours a refused bundle stays off the offer
 LOOP = "3"              # iterations a bundle worker gets: one per member is too many, one is too few
+ROWS_MAX = 6            # CC_BUNDLE_ROWS: members a bundle carries at most — what one worker finishes in LOOP runs
+FILES_MAX = 6           # CC_BUNDLE_FILES: files its members name between them at most — what one reviewer reads
 MODELS = {"sonnet": "claude-sonnet-5", "opus": "claude-opus-5"}
-MILESTONE = re.compile(r"\bmilestones?\b|^\s*M[1-9]\b", re.I | re.M)   # a project brief: it stays whole
+# A PROJECT BRIEF, which stays whole: it says "milestones", or it numbers them — M1, M2 — anywhere in its text,
+# not only at a line's start: the improve orch's row writes "SHAPE PROPOSED (the orch decides the method): M1 THE
+# SCORER …" mid-line, and the line-anchored test let it into a 33-row bundle (2026-09-13).
+MILESTONE = re.compile(r"(?i:\bmilestones?\b)|\bM[1-9]\d?\b")
 
 
 def home():
@@ -176,10 +192,58 @@ def bundle_name(files, rows):
     return f"bundle-{stem}-{h}"
 
 
+def shared_by(own):
+    """The files two or more of these rows name — what a second worker in the same files would collide on."""
+    n = collections.Counter(f for v in own.values() for f in v)
+    return sorted(f for f, c in n.items() if c >= 2)
+
+
+def caps():
+    return (int(os.environ.get("CC_BUNDLE_ROWS") or ROWS_MAX), int(os.environ.get("CC_BUNDLE_FILES") or FILES_MAX))
+
+
+def fitted(own):
+    """{row: files} -> [(shared files, rows, the rows waiting behind it)], every one within the caps. `grouped`
+    joins transitively, and the first live tick after #471 joined 33 rows over 19 files through the test suite and
+    two shared tools: a worker cannot finish that and a reviewer cannot read it. A GROUP OVER A CAP IS SPLIT ON
+    THE FILE ITS ROWS MOST SHARE: the rows naming that file fill one bundle up to the caps, narrowest first —
+    the fewest files that rows outside that set also name, then the fewest files, so a broad row (13 files on the
+    live board) is the one left over rather than the one that glues. A row left over that names a file the bundle
+    names WAITS for it to land — two workers in one file is what bundling is against — and the rest are grouped
+    again the same way. A pair too wide for the caps on its own is no bundle: the seat's, as a lone row is."""
+    rows_max, files_max = caps()
+    G = brief_mod().grouped
+    out, stack = [], [team for _, team in G(own)]
+    while stack:
+        team = stack.pop()
+        sub = {k: own[k] for k in team}
+        if len(team) <= rows_max and len(set().union(*sub.values())) <= files_max:
+            out.append((shared_by(sub), sorted(team), []))
+            continue
+        count = collections.Counter(f for v in sub.values() for f in v)
+        pivot = min(count, key=lambda f: (-count[f], f))
+        outside = set().union(*(v for v in sub.values() if pivot not in v))
+        picked, named = [], set()
+        for k in sorted((k for k in team if pivot in sub[k]), key=lambda k: (len(sub[k] & outside), len(sub[k]), k)):
+            if len(picked) < rows_max and len(named | sub[k]) <= files_max:
+                picked.append(k); named |= sub[k]
+        if not picked:      # even the narrowest row naming the pivot is over the files cap: those rows are the seat's
+            stack.extend(t for _, t in G({k: v for k, v in sub.items() if pivot not in v}))
+            continue
+        rest = {k: v for k, v in sub.items() if k not in picked and not (v & named)}
+        if len(picked) >= 2:
+            out.append((shared_by({k: sub[k] for k in picked}), sorted(picked),
+                        sorted(k for k in team if k not in picked and k not in rest)))
+        stack.extend(t for _, t in G(rest))
+    return sorted(out, key=lambda g: (-len(g[1]), g[1]))
+
+
 def bundles(repo, net=True):
-    """[{name, rows, files (shared), named (every file the members name), model, titles}] — biggest first, or
-    None when the board could not be read. Groups come from cc-brief's `ready`; a member whose brief carries
-    milestones is a project row and is dropped, and a group that drops below two rows is no bundle."""
+    """[{name, rows, files (shared), named (every file the members name), waits (rows behind it), model, titles}]
+    — biggest first, or None when the board could not be read. Groups come from cc-brief's `ready`; a member
+    whose brief carries milestones or whose row carries an `agent` mark is a project row and is dropped, one naming
+    a file a live bundle's members name is dropped until that bundle is done, a group over the caps is split
+    (fitted), and a group that drops below two rows is no bundle."""
     B = brief_mod()
     r = B.ready(repo, net=net)
     if r is None:
@@ -191,6 +255,17 @@ def bundles(repo, net=True):
     root = d.get("path") or ""
     index = B.tracked(root) if root else {}
     tracks = d.get("tracks") or {}
+    # THE FILES A LIVE BUNDLE'S MEMBERS NAME ARE TAKEN, and a row naming one is no member of another bundle. A wait
+    # `fitted` computes holds only inside the tick that computed it: once the first bundle is dispatched its
+    # members leave `ready` (marked `bundle`), and a bundle row with no commit yet holds no files (cc-brief's
+    # held_files reads the branch), so the rows that waited would group again on the same file at the next tick
+    # and start a second worker in it — the collision `show` had just promised would wait (review of #478). Read
+    # off the members' own briefs, which is what the bundle's worker is editing, until the bundle row is no
+    # longer live — landed, its members closed with it; abandoned, everything back in the pool.
+    taken = set()
+    for k, v in tracks.items():
+        if isinstance(v, dict) and B.bundled(v, tracks):
+            taken |= B.named(B.brief_text(repo, k), root, index)
     out = []
     for files, rows in groups:
         text = {k: B.brief_text(repo, k) for k in rows}
@@ -199,20 +274,28 @@ def bundles(repo, net=True):
         # …and only a row that is `queued` with no PR: `ready` offers a `blocked` row too (DUE), and one whose
         # landing died carries a PR and commits — its work is somewhere, and the brief says a row in flight is
         # never re-bundled (review of #471).
+        # …and never a row carrying an `agent` mark, WARM OR COLD. `ready` counts a mark for MARK_H and then offers
+        # the row, which is right for a seat that can ask the session; a bundle asks nobody, and a row a session
+        # held in its own subagent — an orch's project row above all — is that session's until it hands the row
+        # back (`agent ""`), however long ago the mark was made (the brief's own line: "an orch-held project row
+        # stays out even when its agent mark has gone cold").
+        own = {k: B.named(text[k], root, index) for k in rows}
         members = [k for k in rows if not k.startswith("bundle-") and not MILESTONE.search(text[k])
                    and ((tracks.get(k) or {}).get("status") or "queued") == "queued"
-                   and not (tracks.get(k) or {}).get("pr")]
+                   and not (tracks.get(k) or {}).get("pr")
+                   and not str((tracks.get(k) or {}).get("agent") or "").strip()
+                   and not (own[k] & taken)]
         if len(members) < 2:
             continue
         # …and the survivors are grouped AGAIN, on the files they name themselves: `ready` joined them
         # transitively, and a row dropped just above may have been the only link — a project brief naming a dozen
         # files glued a dozen unrelated one-file rows into one bundle. A group under two rows falls out here as
         # it does in `grouped` (review of #471).
-        own = {k: B.named(text[k], root, index) for k in members}
-        for shared, team in B.grouped(own):
+        own = {k: own[k] for k in members}
+        for shared, team, waits in fitted(own):
             named = set().union(*(own[k] for k in team))
             out.append({"name": bundle_name(shared, team), "rows": team, "files": sorted(shared),
-                        "named": sorted(named), "model": model_for(named or set(shared), root),
+                        "named": sorted(named), "waits": waits, "model": model_for(named or set(shared), root),
                         "titles": {k: (tracks.get(k) or {}).get("title") or k for k in team}})
     return sorted(out, key=lambda b: (-len(b["rows"]), b["rows"]))
 
@@ -262,7 +345,7 @@ def compose(repo, b):
     shown = ", ".join(files[:3]) + (f" and {len(files) - 3} more" if len(files) > 3 else "")
     closes = ", ".join(rows[:-1]) + f" and {rows[-1]}" if len(rows) > 1 else rows[0]
     B = brief_mod()
-    head = (f"GOAL: one PR that settles these {len(rows)} queued rows, whose briefs all name {shown}: {closes}. "
+    head = (f"GOAL: one PR that settles these {len(rows)} queued rows, whose briefs name {shown} between them: {closes}. "
             f"One worktree, one worker, one landing instead of {len(rows)}.\n\n"
             "WHY: every row costs its own landing — gates, a paid review read, a merge — and two workers in one "
             "file has cost this box a rebase and, twice, the same fix written twice. cc-bundle grouped these rows "
@@ -346,6 +429,8 @@ def show(repo, as_json=False, net=True):
                  else f" (row exists [{(tracks.get(b['name']) or {}).get('status', '?')}])" if b["name"] in tracks
                  else "")
         print(f"  {b['name']} [{b['model']}] {shown}: {', '.join(b['rows'])}{state}")
+        if b["waits"]:
+            print(f"    {len(b['waits'])} wait behind it (they name a file it names): {', '.join(b['waits'])}")
     return 0
 
 
@@ -385,7 +470,7 @@ def main(a):
 
 # ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
 def selfcheck():
-    import shutil, tempfile
+    import contextlib, io, shutil, tempfile
     global BIN
     p = f = 0
 
@@ -490,6 +575,88 @@ def selfcheck():
     brief_of("proj", "GOAL: a library.\nM1: bin/cc-slackx writes to it.\nM2: bin/cc-guardx reads it.\n")
     ok("…and a project row that was the only link between two rows sharing nothing leaves no bundle behind",
        bundles(repo) == [])
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"}, "proj": {"status": "queued"}})
+    brief_of("proj", "GOAL: a loop.\nSHAPE PROPOSED (the orch decides): M1 the scorer on bin/cc-slackx, M2 the loop.\n")
+    ok("a brief numbering its milestones mid-line (M1 … M2, no line of their own) is a project row too",
+       [b["rows"] for b in bundles(repo)] == [["row-a", "row-b"]])
+    brief_of("proj", "GOAL: bin/cc-slackx, plainly.\n")
+    ok("…and the same row with a plain brief is a member", [b["rows"] for b in bundles(repo)] == [["proj", "row-a", "row-b"]])
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"},
+           "proj": {"status": "queued", "agent": "@1:2", "agent_at": "2020-01-01T00:00:00Z"}})
+    ok("a row whose agent mark went cold is offered by `ready`, and is no member here: nobody handed it back",
+       [b["rows"] for b in bundles(repo)] == [["row-a", "row-b"]])
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"},
+           "proj": {"status": "queued", "agent": "@1:2", "agent_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}})
+    ok("…nor is one whose mark is warm", [b["rows"] for b in bundles(repo)] == [["row-a", "row-b"]])
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"}, "proj": {"status": "queued", "agent": "", "agent_at": ""}})
+    ok("…and a row handed back (`agent \"\"`) is a member again", [b["rows"] for b in bundles(repo)] == [["proj", "row-a", "row-b"]])
+
+    # ── the caps: a group over one is split on the file its rows most share, and what it leaves waits
+    rows = {f"r{i}": {"status": "queued"} for i in range(1, 8)}
+    rows.update({"glue": {"status": "queued"}, "s1": {"status": "queued"}, "s2": {"status": "queued"}})
+    board(rows)
+    for i in range(1, 8):
+        brief_of(f"r{i}", f"GOAL: bin/other-tool prints line {i} wrong.\n")
+    brief_of("glue", "GOAL: bin/other-tool and bin/cc-slackx disagree.\n")
+    brief_of("s1", "GOAL: bin/cc-slackx, one thing.\n"); brief_of("s2", "GOAL: bin/cc-slackx, another.\n")
+    bs = bundles(repo)
+    ok("ten rows one broad row glues are not one bundle: the file most of them share takes ROWS_MAX of them, the "
+       "rest are grouped again on their own",
+       [b["rows"] for b in bs] == [["r1", "r2", "r3", "r4", "r5", "r6"], ["s1", "s2"]])
+    ok("…the rows left over that name a file it names wait behind it, the broad one among them",
+       bs[0]["waits"] == ["glue", "r7"] and bs[1]["waits"] == [])
+    ok("…and bundles offered together name no file in common", not (set(bs[0]["named"]) & set(bs[1]["named"])))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        show(repo)
+    ok("…and `show` says which rows wait", "2 wait behind it (they name a file it names): glue, r7" in buf.getvalue())
+    board({f"r{i}": {"status": "queued"} for i in range(1, 7)})
+    bs = bundles(repo)
+    ok("a group at the cap is offered whole", [b["rows"] for b in bs] == [["r1", "r2", "r3", "r4", "r5", "r6"]] and bs[0]["waits"] == [])
+    # …and the wait holds ACROSS ticks, not only inside the one that computed it (review of #478): the dispatched
+    # bundle's members leave `ready`, and its row holds no files until the worker commits, so the rows that waited
+    # would have grouped again on the same file at the next tick and started a second worker in it.
+    board(rows)
+    open(calls, "w").close()
+    went = go(repo, out=io.StringIO())
+    tr = B.board_of(repo).get("tracks") or {}
+    first = bundle_name(["bin/other-tool"], [f"r{i}" for i in range(1, 7)])
+    ok("go starts the first bundle of a split and marks its members",
+       went == first and all(tr[f"r{i}"].get("bundle") == first for i in range(1, 7)))
+
+    def edit(fn):
+        pth = os.path.join(boards, repo + ".json")
+        with open(pth) as fh:
+            dd = json.load(fh)
+        fn(dd["tracks"])
+        with open(pth, "w") as fh:
+            json.dump(dd, fh)
+    ok("…and while its row is live with no commit, the rows that waited are still no bundle, the rest still are",
+       [b["rows"] for b in bundles(repo)] == [["s1", "s2"]])
+    edit(lambda t: t[first].update(status="running"))
+    ok("…the same once it is running", [b["rows"] for b in bundles(repo)] == [["s1", "s2"]])
+
+    def landed(t):
+        t[first].update(status="done")
+        for i in range(1, 7):
+            t[f"r{i}"].update(status="done")
+    edit(landed)
+    ok("…and once it has landed, they are grouped again", [b["rows"] for b in bundles(repo)] == [["glue", "r7", "s1", "s2"]])
+    open(calls, "w").close()
+    os.environ["CC_BUNDLE_FILES"] = "2"
+    board({"f1": {"status": "queued"}, "f2": {"status": "queued"}, "f3": {"status": "queued"}})
+    brief_of("f1", "GOAL: bin/other-tool and notes.txt.\n")
+    brief_of("f2", "GOAL: bin/other-tool and bin/cc-guardx.\n")
+    brief_of("f3", "GOAL: bin/other-tool alone.\n")
+    ok("the files cap (here CC_BUNDLE_FILES=2) splits the same way: the narrowest rows fill it, the one that would "
+       "widen it waits", [(b["rows"], b["named"], b["waits"]) for b in bundles(repo)]
+       == [(["f1", "f3"], ["bin/other-tool", "notes.txt"], ["f2"])])
+    board({"p": {"status": "queued"}, "q": {"status": "queued"}, "s1": {"status": "queued"}, "s2": {"status": "queued"}})
+    brief_of("p", "GOAL: bin/other-tool, notes.txt and bin/cc-guardx.\n")
+    brief_of("q", "GOAL: bin/other-tool, notes.txt and tests/control-layer.\n")
+    ok("…and a pair too wide for it on its own is no bundle — the seat's — and costs the rows beside it nothing",
+       [b["rows"] for b in bundles(repo)] == [["s1", "s2"]])
+    os.environ.pop("CC_BUNDLE_FILES")
 
     board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"},
            "live": {"status": "review", "branch": "track/live", "pr": "1"}})
@@ -514,7 +681,6 @@ def selfcheck():
     os.environ["CC_FAKE_PAUSE_RC"] = "0"
     ok("a parked project holds it before anything else, and says so",
        holds(repo, B.board_of(repo)) == "the project is paused (cc-pause)")
-    import io
     went = go(repo, out=io.StringIO())
     tr = B.board_of(repo).get("tracks") or {}
     ok("…and `go` on a parked project adds no row, marks no member and starts nothing — the board is untouched",
@@ -544,7 +710,6 @@ def selfcheck():
     os.environ.pop("CC_BUNDLE_WIDTH")
 
     board({"row-a": {"status": "queued", "title": "a is wrong"}, "row-b": {"status": "queued", "title": "b too"}})
-    import io
     for i in range(QUEUE_HOLD):
         open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
     go(repo, dry=True, out=io.StringIO())
@@ -609,7 +774,6 @@ def selfcheck():
     # ── show
     os.remove(log_path(repo))
     board({"row-a": {"status": "queued", "title": "row-a"}, "row-b": {"status": "queued", "title": "row-b"}})
-    import contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         show(repo)
