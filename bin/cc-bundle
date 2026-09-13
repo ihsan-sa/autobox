@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""cc-bundle — queued rows whose briefs name the same file run as ONE worker, chosen and started by the box.
+
+  cc-bundle show <repo> [--json] [--no-net]   the bundles it would run — rows, files, model, name — and what holds
+                                              them right now; nothing to run prints nothing
+  cc-bundle go <repo> [--dry-run] [--no-net]  start the first bundle nothing holds, one per call; --dry-run says
+                                              which and starts nothing
+  cc-bundle --tick                            `go` for every repo with a board — rides cc-reconcile.service
+  cc-bundle selfcheck
+
+WHY (owner, 2026-09-12: "How much of the backlog can be consolidated into a few PRs and workers or sub agents?
+That should be an automatic process."). Forty-odd rows sat queued, most of them one-file raised- findings, and
+each was dispatched one at a time by a seat reading the board — every row buying its own landing (gates, a paid
+review read, a merge), and two of them in one file buying a rebase besides. `cc-brief ready` already computes
+which queued rows share a file and says "one builder for …"; this is the half that acts on it.
+
+A BUNDLE IS A GROUP `cc-brief ready` PRINTS: two or more queued rows nothing in flight is holding, joined by a
+file their briefs name (transitively — a and b sharing one file and b and c another is one bundle). It becomes
+ONE board row, `bundle-<file>-<hash>`, carrying ONE brief: a goal for the whole, then each member's brief under
+its own heading, verbatim, and the `Closes a, b and c` line that makes the bundle's PR close every member when it
+lands (cc-land reads that line off the PR body). Each member stays `queued` and gets `bundle: <row>` on the
+board — `queued` because cc-land's closer skips a running row, the field because cc-brief, cc-pulse and cc-digest
+read it as "being written" while the bundle row is live, so nothing offers the member twice. A bundle that lands
+closes its members; one that is abandoned or removed hands them back to the pool by the same test.
+
+WHAT STAYS OUT. A project row — a brief with milestones, or one an orch holds with its `agent` mark — stays whole:
+the mark keeps it out of `ready`, and a brief carrying milestones is dropped from a group here. A row in flight
+or under review is never re-bundled: a member is a row whose status is `queued` and that has no PR — `ready`
+also offers a `blocked` row (a landing that died leaves one, with a PR and commits of its own), and bundling that
+would redo its work off main, open a second PR for it and close it on the bundle's Closes line with its own PR
+still open. A row sharing a file with nothing is not a bundle and is left to the seat, exactly as today.
+
+WHAT HOLDS A DISPATCH, in order, and `show` names the first that applies:
+  · the project is parked — `cc-pause is <repo>`, the check every timer-driven spender makes before it spends
+    (DESIGN: a parked board is left untouched, and the judge's read is spend)
+  · the landing queue — QUEUE_HOLD (4) or more jobs in ~/.cc/state/land/, any repo: a landing is the slowest
+    thing in the flow, and a worker started now would only join the back of it
+  · the spend tier — `cc-tier allows goals`: work the box takes on by itself is moderate's and autonomous's
+  · a box-wide usage limit — `cc-limit status`: nothing starts until it lifts, as cc-pulse already holds
+  · width — CC_BUNDLE_WIDTH (2) bundle rows already live (queued, running or waiting) on the repo's board
+  · a bundle refused inside REFUSED_H (24 h) — the judge said no, `cc` said no — is not offered again until the
+    set of rows in it changes; the reason is in the log, and the seat reads it there
+One bundle per call, so one tick starts at most one worker and the queue hold decides the next.
+
+THE JUDGE STILL READS THE BUNDLED BRIEF: the row goes in through `cc-board add`, the door every brief enters by,
+and a refusal there is recorded and the bundle is not started — no CC_BRIEF_MACHINE and no force. The model is
+the box's bands (WORKING.md, model policy): Sonnet when the members name ONE file between them and it is outside
+the repo's control layer (tests/control-layer, what buys a paid review), Opus otherwise.
+
+EVERYTHING IT DID IS IN ~/.cc/state/bundle/<repo>.jsonl — one line per dispatch, refusal or hold — and a tick that
+started nothing prints nothing. Env: CC_BUNDLE_WIDTH · CC_BUNDLE_BIN (tests: where the siblings are) · CC_BOARDS,
+CC_STATE (cc-brief's, so a test run keeps out of the box's own state).
+"""
+import fnmatch, glob, hashlib, json, os, re, subprocess, sys, time
+
+BIN = os.environ.get("CC_BUNDLE_BIN") or os.path.dirname(os.path.realpath(__file__))
+QUEUE_HOLD = 4          # landing jobs on disk before no new work is started (owner's line, 2026-09-12)
+REFUSED_H = 24          # hours a refused bundle stays off the offer
+LOOP = "3"              # iterations a bundle worker gets: one per member is too many, one is too few
+MODELS = {"sonnet": "claude-sonnet-5", "opus": "claude-opus-5"}
+MILESTONE = re.compile(r"\bmilestones?\b|^\s*M[1-9]\b", re.I | re.M)   # a project brief: it stays whole
+
+
+def home():
+    return os.path.expanduser("~")
+
+
+def brief_mod():
+    """cc-brief, imported beside THIS copy — it owns `ready` (which rows could start, grouped by the file they
+    share), `named` (the files a brief names) and the board reader; nothing here recomputes any of it."""
+    if not hasattr(brief_mod, "mod"):
+        import importlib.machinery, importlib.util
+        s = importlib.util.spec_from_loader("ccbrief", importlib.machinery.SourceFileLoader(
+            "ccbrief", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-brief")))
+        brief_mod.mod = importlib.util.module_from_spec(s); s.loader.exec_module(brief_mod.mod)
+    return brief_mod.mod
+
+
+def sh(*cmd, timeout=120, env=None):
+    """Run a sibling and hand back the result, or None: a timer job never dies of a command that hung."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception:
+        return None
+
+
+def said(p):
+    """The HEAD of what a sibling said, not its tail: a judge refusal ends on "cut those and dispatch again", and a
+    record carrying only that does not say what refused or why (the same lesson cc-land's fix dispatch learned)."""
+    out = ((p.stderr or "") + (p.stdout or "")).strip() if p is not None else ""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return lines[0] if lines else ("no answer" if p is None else f"exit {p.returncode}")
+
+
+def log_path(repo):
+    return os.path.join(home(), ".cc", "state", "bundle", repo + ".jsonl")
+
+
+def log(repo, event, name, **kw):
+    p = log_path(repo)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "a") as fh:
+        fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event,
+                             "name": name, **kw}) + "\n")
+
+
+def last_hold(repo):
+    """The reason the last logged line held on, or "" when the last line was anything else — so a hold that has
+    not changed since the last tick is not written again (72 identical lines a day while a queue stays full)."""
+    try:
+        with open(log_path(repo)) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return ""
+    for ln in reversed(lines):
+        try:
+            j = json.loads(ln)
+        except ValueError:
+            continue
+        return j.get("why", "") if j.get("event") == "held" else ""
+    return ""
+
+
+def refused_recently(repo):
+    """The bundle names refused inside REFUSED_H — read back off the log, so a refusal costs one line and no state
+    file of its own. A later `dispatched` line for the same name lifts it (the set was fixed and went)."""
+    cold = time.time() - REFUSED_H * 3600
+    out = {}
+    try:
+        with open(log_path(repo)) as fh:
+            for ln in fh:
+                try:
+                    j = json.loads(ln)
+                except ValueError:
+                    continue
+                if brief_mod().epoch(j.get("ts")) < cold:
+                    continue
+                if j.get("event") == "refused":
+                    out[j.get("name")] = j.get("why", "")
+                elif j.get("event") == "dispatched":
+                    out.pop(j.get("name"), None)
+    except OSError:
+        pass
+    return out
+
+
+def control_layer(root):
+    """The globs of the repo's control layer, as paths under `root`. The file describes the tree it sits in
+    (`bin/cc-land`, not `core/bin/cc-land`), so each is prefixed with that tree's own place in the checkout."""
+    pats = []
+    for tree in ("", "core"):
+        p = os.path.join(root, tree, "tests", "control-layer")
+        try:
+            with open(p) as fh:
+                lines = [ln.strip() for ln in fh]
+        except OSError:
+            continue
+        pats += [os.path.join(tree, ln) if tree else ln for ln in lines if ln and not ln.startswith("#")]
+    return pats
+
+
+def model_for(files, root):
+    """`sonnet` for a bundle that names one file outside the control layer; `opus` for anything wider or that
+    touches a gate, the sandbox, the landing — the bands WORKING.md gives, read off what the rows name."""
+    if len(files) != 1:
+        return "opus"
+    f = next(iter(files))
+    return "opus" if any(fnmatch.fnmatch(f, pat) for pat in control_layer(root)) else "sonnet"
+
+
+def bundle_name(files, rows):
+    """`bundle-<basename of the first shared file>-<4 hex of the member set>`: deterministic for the same rows,
+    so a refusal is remembered by name and the same set is never added twice under two names."""
+    stem = re.sub(r"[^a-z0-9]+", "-", os.path.basename(sorted(files)[0]).lower()).strip("-") or "rows"
+    h = hashlib.sha1("\n".join(sorted(rows)).encode()).hexdigest()[:4]
+    return f"bundle-{stem}-{h}"
+
+
+def bundles(repo, net=True):
+    """[{name, rows, files (shared), named (every file the members name), model, titles}] — biggest first, or
+    None when the board could not be read. Groups come from cc-brief's `ready`; a member whose brief carries
+    milestones is a project row and is dropped, and a group that drops below two rows is no bundle."""
+    B = brief_mod()
+    r = B.ready(repo, net=net)
+    if r is None:
+        return None
+    free, groups, _weighed, unplaced, _blind = r
+    if unplaced or not groups:
+        return []
+    d = B.board_of(repo) or {}
+    root = d.get("path") or ""
+    index = B.tracked(root) if root else {}
+    tracks = d.get("tracks") or {}
+    out = []
+    for files, rows in groups:
+        text = {k: B.brief_text(repo, k) for k in rows}
+        # …and a bundle row is never a member of another: one that stopped is `blocked`, which is a row waiting
+        # to be picked up as far as `ready` is concerned, and it would join its own members under a new name.
+        # …and only a row that is `queued` with no PR: `ready` offers a `blocked` row too (DUE), and one whose
+        # landing died carries a PR and commits — its work is somewhere, and the brief says a row in flight is
+        # never re-bundled (review of #471).
+        members = [k for k in rows if not k.startswith("bundle-") and not MILESTONE.search(text[k])
+                   and ((tracks.get(k) or {}).get("status") or "queued") == "queued"
+                   and not (tracks.get(k) or {}).get("pr")]
+        if len(members) < 2:
+            continue
+        # …and the survivors are grouped AGAIN, on the files they name themselves: `ready` joined them
+        # transitively, and a row dropped just above may have been the only link — a project brief naming a dozen
+        # files glued a dozen unrelated one-file rows into one bundle. A group under two rows falls out here as
+        # it does in `grouped` (review of #471).
+        own = {k: B.named(text[k], root, index) for k in members}
+        for shared, team in B.grouped(own):
+            named = set().union(*(own[k] for k in team))
+            out.append({"name": bundle_name(shared, team), "rows": team, "files": sorted(shared),
+                        "named": sorted(named), "model": model_for(named or set(shared), root),
+                        "titles": {k: (tracks.get(k) or {}).get("title") or k for k in team}})
+    return sorted(out, key=lambda b: (-len(b["rows"]), b["rows"]))
+
+
+def queue_depth():
+    """Landing jobs on disk, every repo — cc-land's own queue shape: one `<repo>-<pr>.json` per PR."""
+    n = 0
+    for p in glob.glob(os.path.join(home(), ".cc", "state", "land", "*.json")):
+        try:
+            with open(p) as fh:
+                if (json.load(fh) or {}).get("repo"):
+                    n += 1
+        except (OSError, ValueError):
+            continue
+    return n
+
+
+def holds(repo, d):
+    """The first reason nothing may start now, or "" — the order the docstring gives."""
+    # A PARKED PROJECT IS LEFT UNTOUCHED — asked before anything else, because everything past this point spends:
+    # the judge's read at `cc-board add`, the members' marks, the worker (review of #471; DESIGN's cc-pause rule).
+    pz = sh(f"{BIN}/cc-pause", "is", repo, timeout=30)
+    if pz is not None and pz.returncode == 0:
+        return "the project is paused (cc-pause)"
+    n = queue_depth()
+    if n >= QUEUE_HOLD:
+        return f"the landing queue holds {n} jobs (hold at {QUEUE_HOLD})"
+    t = sh(f"{BIN}/cc-tier", "allows", "goals", timeout=30)
+    if t is None or t.returncode != 0:
+        return "the spend tier holds work the box takes on itself (cc-tier allows goals)"
+    lim = sh(f"{BIN}/cc-limit", "status", timeout=30)
+    if lim is not None and lim.returncode == 0 and "(this run only)" not in (lim.stdout or ""):
+        return "the box is on a usage limit (cc-limit)"
+    width = int(os.environ.get("CC_BUNDLE_WIDTH") or 2)
+    live = sorted(k for k, v in (d.get("tracks") or {}).items()
+                  if k.startswith("bundle-") and (v.get("status") or "") in ("queued", "running", "waiting"))
+    if len(live) >= width:
+        return f"{len(live)} bundles already live ({', '.join(live[:3])}), width {width}"
+    return ""
+
+
+def compose(repo, b):
+    """The one brief: the goal for the whole, then each member's brief verbatim under its own heading, and the
+    Closes line. Judged like any brief when the row is added — the raised- exemption is the member rows', not
+    this row's — so the frame says what each section IS: an account for the worker to scope."""
+    rows, files = b["rows"], b["files"]
+    shown = ", ".join(files[:3]) + (f" and {len(files) - 3} more" if len(files) > 3 else "")
+    closes = ", ".join(rows[:-1]) + f" and {rows[-1]}" if len(rows) > 1 else rows[0]
+    B = brief_mod()
+    head = (f"GOAL: one PR that settles these {len(rows)} queued rows, whose briefs all name {shown}: {closes}. "
+            f"One worktree, one worker, one landing instead of {len(rows)}.\n\n"
+            "WHY: every row costs its own landing — gates, a paid review read, a merge — and two workers in one "
+            "file has cost this box a rebase and, twice, the same fix written twice. cc-bundle grouped these rows "
+            "by the files their briefs name (what `cc-brief ready` prints as one builder's work).\n\n"
+            "BOUNDARIES: the files these rows name and what settling them needs, nothing wider. A raised- section "
+            "below is an account of what broke, for this worker to scope — the fix is the worker's to design. A "
+            "row that turns out to need a design of its own is left out and named in the journal, not half-done.\n\n"
+            f"DONE WHEN: every row below is settled in this one PR, or the journal names the one left out and why. "
+            f"Gates run in the foreground and reported verbatim.\n\nCloses {closes}.\n")
+    parts = [head]
+    for k in rows:
+        parts.append(f"\n## {k} — {b['titles'].get(k, k)}\n\n{B.brief_text(repo, k).strip()}\n")
+    return "".join(parts)
+
+
+def go(repo, dry=False, net=True, out=sys.stdout):
+    """Start the first bundle nothing holds. Returns the name started, "" for nothing; prints what it did and,
+    on --dry-run, what it would do. Every refusal and hold is one line in the log, so a seat reading `show`
+    later sees why the backlog did not move."""
+    B = brief_mod()
+    d = B.board_of(repo)
+    if d is None:
+        return ""
+    bs = bundles(repo, net=net)
+    if not bs:
+        return ""
+    why = holds(repo, d)
+    if why:
+        if dry:
+            print(f"{repo}: would not start {bs[0]['name']} — {why}", file=out)
+        elif why != last_hold(repo):
+            log(repo, "held", bs[0]["name"], rows=bs[0]["rows"], why=why)
+        return ""
+    refused = refused_recently(repo)
+    tracks = d.get("tracks") or {}
+    for b in bs:
+        name = b["name"]
+        if name in refused or name in tracks:
+            continue          # refused inside the window, or a row of that name already exists: the seat's now
+        model = MODELS[b["model"]]
+        if dry:
+            print(f"{repo}: would start {name} on {b['model']} — {', '.join(b['rows'])}", file=out)
+            return name
+        title = f"bundle: {len(b['rows'])} queued rows on {', '.join(b['files'][:2])} — {', '.join(b['rows'])}"
+        r = sh(f"{BIN}/cc-board", "add", repo, name, title[:200], compose(repo, b), timeout=240)
+        if r is None or r.returncode != 0:
+            log(repo, "refused", name, rows=b["rows"], why=f"cc-board add: {said(r)}"[:300])
+            print(f"{repo}: {name} refused at the door — {said(r)[:200]}", file=out)
+            continue
+        for k in b["rows"]:   # the members are marked BEFORE the launch: a crash between leaves them out of the
+            sh(f"{BIN}/cc-board", "set", repo, k, "bundle", name, timeout=60)   # pool while the row is live
+        r = sh(f"{BIN}/cc", repo, name, "--go", "", "--loop", LOOP, "--model", model, timeout=300)
+        if r is None or r.returncode != 0:
+            log(repo, "refused", name, rows=b["rows"], model=model, why=f"cc --go: {said(r)}"[:300])
+            print(f"{repo}: {name} added but not started — {said(r)[:200]}", file=out)
+            return ""
+        log(repo, "dispatched", name, rows=b["rows"], files=b["files"], model=model)
+        print(f"{repo}: started {name} on {b['model']} — {', '.join(b['rows'])}", file=out)
+        return name
+    return ""
+
+
+def show(repo, as_json=False, net=True):
+    bs = bundles(repo, net=net)
+    if bs is None:
+        return 0
+    if as_json:
+        print(json.dumps(bs, indent=1))
+        return 0
+    if not bs:
+        return 0
+    d = brief_mod().board_of(repo) or {}
+    why = holds(repo, d)
+    refused = refused_recently(repo)
+    tracks = d.get("tracks") or {}
+    print(f"{repo}: {len(bs)} bundle{'' if len(bs) == 1 else 's'} the box would run"
+          + (f" — held: {why}" if why else ""))
+    for b in bs:
+        shown = ", ".join(b["files"][:3]) + (f" and {len(b['files']) - 3} more" if len(b["files"]) > 3 else "")
+        state = (f" (refused: {refused[b['name']][:80]})" if b["name"] in refused
+                 else f" (row exists [{(tracks.get(b['name']) or {}).get('status', '?')}])" if b["name"] in tracks
+                 else "")
+        print(f"  {b['name']} [{b['model']}] {shown}: {', '.join(b['rows'])}{state}")
+    return 0
+
+
+def tick():
+    """Every repo with a board, one `go` each — from cc-reconcile's turn, every 20 min. Silent when it started
+    nothing; a board that cannot be read is skipped, like everywhere else."""
+    r = sh(f"{BIN}/cc-board", "boards", timeout=60)
+    if r is None or r.returncode != 0:
+        return 0
+    for repo in (r.stdout or "").split():
+        try:
+            go(repo)
+        except Exception as e:      # one repo's fault must not cost the others their turn
+            print(f"cc-bundle: {repo}: {e}", file=sys.stderr)
+    return 0
+
+
+USAGE = "usage: cc-bundle show <repo> [--json] [--no-net] | go <repo> [--dry-run] [--no-net] | --tick | selfcheck"
+
+
+def main(a):
+    if not a:
+        sys.exit(USAGE)
+    if a[0] == "--tick":
+        return tick()
+    if a[0] == "selfcheck":
+        return selfcheck()
+    if len(a) < 2 or a[0] not in ("show", "go"):
+        sys.exit(USAGE)
+    flags = set(a[2:])
+    net = "--no-net" not in flags
+    if a[0] == "show":
+        return show(a[1], as_json="--json" in flags, net=net)
+    go(a[1], dry="--dry-run" in flags, net=net)
+    return 0
+
+
+# ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────────
+def selfcheck():
+    import shutil, tempfile
+    global BIN
+    p = f = 0
+
+    def ok(name, cond):
+        nonlocal p, f
+        print(("ok   " if cond else "FAIL ") + name)
+        p, f = p + (1 if cond else 0), f + (0 if cond else 1)
+
+    tmp = tempfile.mkdtemp(prefix="cc-bundle-sc.")
+    fake_home = os.path.join(tmp, "home")
+    boards, state = os.path.join(fake_home, ".cc", "boards"), os.path.join(fake_home, ".cc", "state")
+    os.makedirs(boards); os.makedirs(os.path.join(state, "land"))
+    # cc-brief and cc-board both read their homes at import: point them here BEFORE the first import.
+    os.environ.update(HOME=fake_home, CC_BOARDS=boards, CC_STATE=state, CC_BRIEF_FAKE='{"verdict":"approve"}')
+    os.environ.pop("CC_BUNDLE_WIDTH", None)
+    B = brief_mod()
+    repo = "beta"
+    src = os.path.join(tmp, "src")
+
+    def git(*args):
+        return subprocess.run(["git", "-C", src, *args], capture_output=True, text=True,
+                              env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    subprocess.run(["git", "init", "-q", "-b", "main", src], capture_output=True)
+    os.makedirs(os.path.join(src, "bin")); os.makedirs(os.path.join(src, "tests"))
+    for fn in ("bin/cc-slackx", "bin/cc-guardx", "bin/other-tool", "notes.txt"):
+        open(os.path.join(src, fn), "w").write("base\n")
+    open(os.path.join(src, "tests", "control-layer"), "w").write("# the gate\nbin/cc-guardx\n")
+    git("add", "-A"); git("commit", "-qm", "base")
+    git("checkout", "-q", "-b", "track/live", "main")
+    open(os.path.join(src, "notes.txt"), "a").write("live\n")
+    git("add", "-A"); git("commit", "-qm", "live"); git("checkout", "-q", "main")
+
+    def board(tracks):
+        with open(os.path.join(boards, repo + ".json"), "w") as fh:
+            json.dump({"repo": repo, "path": src, "default_branch": "main", "tracks": tracks, "log": []}, fh)
+
+    def brief_of(track, text):
+        d = os.path.join(state, repo, track)
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "task.md"), "w").write(text)
+
+    # ── the siblings, stubbed: `cc` records its argv; cc-tier and cc-limit answer what the case sets.
+    fbin = os.path.join(tmp, "bin")
+    os.makedirs(fbin)
+    calls = os.path.join(tmp, "calls")
+    open(os.path.join(fbin, "cc"), "w").write(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS\"\nexit \"${CC_FAKE_CC_RC:-0}\"\n")
+    open(os.path.join(fbin, "cc-tier"), "w").write("#!/bin/sh\nexit \"${CC_FAKE_TIER_RC:-0}\"\n")
+    open(os.path.join(fbin, "cc-pause"), "w").write("#!/bin/sh\nexit \"${CC_FAKE_PAUSE_RC:-1}\"\n")
+    open(os.path.join(fbin, "cc-limit"), "w").write(
+        "#!/bin/sh\n[ -n \"$CC_FAKE_LIMIT\" ] && { echo \"$CC_FAKE_LIMIT\"; exit 0; }\nexit 1\n")
+    for t in ("cc-board", "cc-brief"):      # the real ones, beside this copy
+        os.symlink(os.path.join(os.path.dirname(os.path.realpath(__file__)), t), os.path.join(fbin, t))
+    for fn in os.listdir(fbin):
+        os.chmod(os.path.join(fbin, fn), 0o755)
+    os.environ["CALLS"] = calls
+    BIN = fbin
+
+    def calls_made():
+        try:
+            return open(calls).read().splitlines()
+        except OSError:
+            return []
+
+    # ── what a bundle is
+    board({"row-a": {"status": "queued", "title": "a is wrong"}, "row-b": {"status": "queued", "title": "b too"},
+           "row-c": {"status": "queued", "title": "c stands alone"}, "row-d": {"status": "queued"},
+           "row-e": {"status": "queued"}})
+    brief_of("row-a", "GOAL: bin/cc-slackx says the wrong thing.\n")
+    brief_of("row-b", "GOAL: bin/cc-slackx says another wrong thing.\n")
+    brief_of("row-c", "GOAL: notes.txt on its own.\n")
+    brief_of("row-d", "GOAL: bin/cc-guardx refuses a thing, and bin/other-tool with it.\n")
+    brief_of("row-e", "GOAL: bin/other-tool prints the wrong line.\n")
+    bs = bundles(repo)
+    ok("two queued rows naming one file are a bundle, and a row sharing nothing is not in any",
+       bs is not None and [b["rows"] for b in bs] == [["row-a", "row-b"], ["row-d", "row-e"]])
+    one = next(b for b in bs if b["rows"] == ["row-a", "row-b"])
+    ok("a bundle on one file outside the control layer runs on Sonnet", one["model"] == "sonnet")
+    two = next(b for b in bs if b["rows"] == ["row-d", "row-e"])
+    ok("…and one that names a control-layer file, or more than one file, runs on Opus", two["model"] == "opus")
+    ok("the name carries the shared file and a hash of the member set", re.fullmatch(r"bundle-cc-slackx-[0-9a-f]{4}", one["name"]) is not None
+       and bundle_name(["bin/cc-slackx"], ["row-a", "row-b"]) == one["name"] and bundle_name(["bin/cc-slackx"], ["row-a", "x"]) != one["name"])
+    ok("the shared files and everything the members name are both reported",
+       one["files"] == ["bin/cc-slackx"] and two["named"] == ["bin/cc-guardx", "bin/other-tool"])
+
+    text = compose(repo, one)
+    ok("the composed brief closes every member, so the bundle's PR closes them all when it lands",
+       "Closes row-a and row-b." in text)
+    ok("…and carries each member's brief verbatim under its own heading",
+       "## row-a — a is wrong" in text and "bin/cc-slackx says another wrong thing" in text)
+    ok("…and says what a raised- section is, for the judge", "account of what broke" in text)
+
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"}, "proj": {"status": "queued"}})
+    brief_of("proj", "GOAL: a knowledge library.\nM1: bin/cc-slackx learns to write to it.\nM2: the rest.\n")
+    ok("a project row — a brief with milestones — stays whole: dropped from the group it would join",
+       [b["rows"] for b in bundles(repo)] == [["row-a", "row-b"]])
+    board({"row-a": {"status": "queued"}, "proj": {"status": "queued"}})
+    ok("…and a group left with one row is no bundle", bundles(repo) == [])
+    board({"row-a": {"status": "queued"}, "row-d": {"status": "queued"}, "proj": {"status": "queued"}})
+    brief_of("proj", "GOAL: a library.\nM1: bin/cc-slackx writes to it.\nM2: bin/cc-guardx reads it.\n")
+    ok("…and a project row that was the only link between two rows sharing nothing leaves no bundle behind",
+       bundles(repo) == [])
+
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"},
+           "live": {"status": "review", "branch": "track/live", "pr": "1"}})
+    brief_of("row-a", "GOAL: notes.txt is held by the live row.\n")
+    brief_of("row-b", "GOAL: notes.txt as well.\n")
+    ok("rows sharing a file a live track holds are not offered — `ready` calls neither free", bundles(repo) == [])
+    brief_of("row-a", "GOAL: bin/cc-slackx says the wrong thing.\n")
+    brief_of("row-b", "GOAL: bin/cc-slackx says another wrong thing.\n")
+    board({"row-a": {"status": "queued"}, "died": {"status": "blocked", "pr": "7", "branch": "track/live"}})
+    brief_of("died", "GOAL: bin/cc-slackx, whose landing died with the PR open.\n")
+    ok("a blocked row with a PR — a landing that died — is in flight, not a member: no bundle with the queued row",
+       bundles(repo) == [])
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued", "pr": "8"}})
+    ok("…nor is a queued row that already carries a PR", bundles(repo) == [])
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "blocked"}})
+    ok("…nor a blocked row without one: only `queued` rows are members", bundles(repo) == [])
+
+    # ── the holds, each on its own fixture, and the dispatch
+    board({"row-a": {"status": "queued", "title": "a is wrong"}, "row-b": {"status": "queued", "title": "b too"}})
+    for i in range(QUEUE_HOLD):
+        open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
+    os.environ["CC_FAKE_PAUSE_RC"] = "0"
+    ok("a parked project holds it before anything else, and says so",
+       holds(repo, B.board_of(repo)) == "the project is paused (cc-pause)")
+    import io
+    went = go(repo, out=io.StringIO())
+    tr = B.board_of(repo).get("tracks") or {}
+    ok("…and `go` on a parked project adds no row, marks no member and starts nothing — the board is untouched",
+       went == "" and sorted(tr) == ["row-a", "row-b"] and not any(tr[k].get("bundle") for k in tr)
+       and calls_made() == [])
+    os.environ.pop("CC_FAKE_PAUSE_RC")
+    try:
+        os.remove(log_path(repo))   # the hold it logged; the queue cases below count their own lines
+    except OSError:
+        pass
+    ok("the landing queue at the hold stops a dispatch, and says so", "landing queue holds 4" in holds(repo, B.board_of(repo)))
+    os.remove(os.path.join(state, "land", "x-0.json"))
+    ok("…and one job under it does not", holds(repo, B.board_of(repo)) == "")
+    os.environ["CC_FAKE_TIER_RC"] = "1"
+    ok("the spend tier holds it", "spend tier" in holds(repo, B.board_of(repo)))
+    os.environ.pop("CC_FAKE_TIER_RC")
+    os.environ["CC_FAKE_LIMIT"] = "usage limit until 18:00"
+    ok("a box-wide usage limit holds it", "usage limit" in holds(repo, B.board_of(repo)))
+    os.environ["CC_FAKE_LIMIT"] = "usage limit until 18:00 (this run only)"
+    ok("…but one run's own limit is not the box's", holds(repo, B.board_of(repo)) == "")
+    os.environ.pop("CC_FAKE_LIMIT")
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"}, "bundle-p-0000": {"status": "running"},
+           "bundle-q-0000": {"status": "queued"}})
+    ok("two bundles already live is the width, and a third waits", "2 bundles already live" in holds(repo, B.board_of(repo)))
+    os.environ["CC_BUNDLE_WIDTH"] = "3"
+    ok("…and CC_BUNDLE_WIDTH widens it", holds(repo, B.board_of(repo)) == "")
+    os.environ.pop("CC_BUNDLE_WIDTH")
+
+    board({"row-a": {"status": "queued", "title": "a is wrong"}, "row-b": {"status": "queued", "title": "b too"}})
+    import io
+    for i in range(QUEUE_HOLD):
+        open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
+    go(repo, dry=True, out=io.StringIO())
+    ok("a dry run under a hold writes nothing", not os.path.exists(log_path(repo)))
+    go(repo, out=io.StringIO()); go(repo, out=io.StringIO())
+    ok("a hold is logged once, not once per tick while it stands",
+       [json.loads(l)["event"] for l in open(log_path(repo))] == ["held"])
+    for i in range(QUEUE_HOLD):
+        os.remove(os.path.join(state, "land", f"x-{i}.json"))
+    os.remove(log_path(repo))
+    buf = io.StringIO()
+    went = go(repo, dry=True, out=buf)
+    ok("--dry-run names the bundle and the model and starts nothing",
+       went == one["name"] and "would start bundle-cc-slackx" in buf.getvalue() and "sonnet" in buf.getvalue()
+       and calls_made() == [] and one["name"] not in (B.board_of(repo).get("tracks") or {}))
+    buf = io.StringIO()
+    went = go(repo, out=buf)
+    tr = B.board_of(repo).get("tracks") or {}
+    ok("go adds the bundle row through cc-board add, with the composed brief as its task",
+       went == one["name"] and one["name"] in tr and "Closes row-a and row-b." in B.brief_text(repo, one["name"]))
+    ok("…marks every member `bundle: <row>` and leaves it queued",
+       all(tr[k].get("bundle") == one["name"] and tr[k].get("status") == "queued" for k in ("row-a", "row-b")))
+    ok("…starts the worker with `cc <repo> <row> --go \"\"` on the band's model, --loop 3",
+       calls_made() == [f"{repo} {one['name']} --go  --loop 3 --model claude-sonnet-5"])
+    ok("…logs the dispatch", any(json.loads(l)["event"] == "dispatched" for l in open(log_path(repo))))
+    ok("…and the members are out of the pool while the bundle row is live: nothing to run now",
+       bundles(repo) == [] and set(B.candidates(B.board_of(repo))) == {one["name"]})
+    buf = io.StringIO()
+    ok("a second go starts nothing and prints nothing", go(repo, out=buf) == "" and buf.getvalue() == "")
+
+    # …a bundle row that already exists is not added twice, whatever its status
+    board({"row-a": {"status": "queued"}, "row-b": {"status": "queued"}, one["name"]: {"status": "blocked"}})
+    open(calls, "w").close()
+    ok("a bundle whose row already exists (here blocked) is left to the seat, not re-added or re-started",
+       go(repo, out=io.StringIO()) == "" and calls_made() == [])
+
+    # …and a refusal at the door is recorded and not retried inside the window
+    os.remove(log_path(repo))
+    board({"row-a": {"status": "queued", "title": "row-a"}, "row-b": {"status": "queued", "title": "row-b"}})
+    os.environ["CC_BRIEF_FAKE"] = '{"verdict":"reject","why":"it prescribes","cut":["says the wrong thing"]}'
+    buf = io.StringIO()
+    went = go(repo, out=buf)
+    tr = B.board_of(repo).get("tracks") or {}
+    ok("the judge's refusal at cc-board add stops the bundle: no row, no marks, no worker, said and logged",
+       went == "" and "refused at the door" in buf.getvalue() and one["name"] not in tr
+       and not tr["row-a"].get("bundle") and calls_made() == [] and one["name"] in refused_recently(repo))
+    os.environ["CC_BRIEF_FAKE"] = '{"verdict":"approve"}'
+    ok("…and the same set is not offered again inside the window",
+       go(repo, dry=True, out=io.StringIO()) == "")
+    os.remove(log_path(repo))
+
+    # …and `cc` refusing the launch (a paused project, the tier at the row) leaves the row for the seat
+    board({"row-a": {"status": "queued", "title": "row-a"}, "row-b": {"status": "queued", "title": "row-b"}})
+    os.environ["CC_FAKE_CC_RC"] = "1"
+    buf = io.StringIO()
+    went = go(repo, out=buf)
+    ok("`cc --go` refusing leaves the added row and its marks for the seat, and logs the refusal",
+       went == "" and "added but not started" in buf.getvalue()
+       and any(json.loads(l)["event"] == "refused" for l in open(log_path(repo))))
+    os.environ.pop("CC_FAKE_CC_RC")
+
+    # ── show
+    os.remove(log_path(repo))
+    board({"row-a": {"status": "queued", "title": "row-a"}, "row-b": {"status": "queued", "title": "row-b"}})
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        show(repo)
+    ok("show prints each bundle with its model, files and rows",
+       "1 bundle the box would run" in buf.getvalue() and f"{one['name']} [sonnet] bin/cc-slackx: row-a, row-b" in buf.getvalue())
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        show(repo, as_json=True)
+    ok("…and --json is the same answer as data", json.loads(buf.getvalue())[0]["rows"] == ["row-a", "row-b"])
+    for i in range(QUEUE_HOLD):
+        open(os.path.join(state, "land", f"x-{i}.json"), "w").write(json.dumps({"repo": "x", "pr": str(i)}))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        show(repo)
+    ok("…and names what holds them", "held: the landing queue holds 4" in buf.getvalue())
+    board({"row-c": {"status": "queued"}})
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        show(repo)
+    ok("nothing to run prints nothing", buf.getvalue() == "")
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"\ncc-bundle selfcheck: {p} passed, {f} failed")
+    return 1 if f else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

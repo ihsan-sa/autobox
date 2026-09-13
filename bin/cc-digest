@@ -93,12 +93,12 @@ report(){
   done < <("$B/cc-reconcile" view 2>/dev/null)
 
   local -A SHIP MOVE
-  local need="" stop="" review="" held="" bd rp tr kd st ti sl up nt key why wd md
-  local n_ship=0 n_move=0 n_need=0 n_stop=0 n_held=0 n_q=0 n_park=0 n_sess=0
+  local need="" stop="" review="" held="" bd rp tr kd st ti sl up nt ib key why wd md
+  local n_ship=0 n_move=0 n_need=0 n_stop=0 n_held=0 n_q=0 n_bund=0 n_park=0 n_sess=0
   while IFS= read -r bd; do
     [ -n "$bd" ] || continue
     # `cc-board json`, never the file: no sibling opens ~/.cc/boards/<repo>.json itself (cc-board's own tripwire).
-    while IFS=$'\x1f' read -r rp tr kd st ti sl up nt; do
+    while IFS=$'\x1f' read -r rp tr kd st ti sl up nt ib; do
       [ -n "${tr:-}" ] || continue
       key="$rp/$tr"; ti="${sl:-$ti}"   # a row nobody titled falls back to its own name; say it as words, not a slug
       # A session row is what it IS, not what it says, so the snapshot never renames one. Every other row takes
@@ -119,7 +119,10 @@ report(){
         review)   review+="$ti"$'\n'; n_move=$((n_move + 1)) ;;
         waiting)  need+="$rp"$'\x1f'"${why:-$ti}"$'\n'; n_need=$((n_need + 1)) ;;
         blocked)  stop+="$rp"$'\x1f'"$ti"$'\x1f'"$nt"$'\n'; n_stop=$((n_stop + 1)) ;;
-        queued)   n_q=$((n_q + 1)) ;;
+        # A QUEUED ROW INSIDE A LIVE BUNDLE IS BEING WRITTEN — by the bundle row, which is what shows under
+        # Moving. cc-bundle leaves the member `queued` so the bundle's PR can close it, and marks it `bundle`;
+        # counting it as queued would say the backlog has not moved when it has (brief: bundles, not rows).
+        queued)   if [ "$ib" = 1 ]; then n_bund=$((n_bund + 1)); else n_q=$((n_q + 1)); fi ;;
         session)  n_sess=$((n_sess + 1)) ;;
         *)        n_park=$((n_park + 1)) ;;   # parked, and any word a later cc-board adds: shelved, not broken
       esac
@@ -140,10 +143,11 @@ report(){
     # every later one up a place: a blocked row with no `updated` stamp read its own last note as its timestamp and
     # lost the one sentence saying what broke. \x1f is not whitespace, so an empty field stays an empty field.
     done < <("$B/cc-board" json "$bd" 2>/dev/null | jq -j --arg b "$bd" '
-      (.repo // $b) as $r | (.tracks // {}) | to_entries[] |
+      (.repo // $b) as $r | (.tracks // {}) as $tr | $tr | to_entries[] |
       [$r, .key, (.value.kind // "track"), (.value.status // "?"), (.value.title // .key),
        ((.value.title // .key) as $t | if ($t | test(" ")) then "" else ($t | gsub("[-_]"; " ")) end),
-       (.value.updated // ""), (((.value.notes // []) | last | .msg) // "")]
+       (.value.updated // ""), (((.value.notes // []) | last | .msg) // ""),
+       ((.value.bundle // "") as $bn | if $bn != "" and (($tr[$bn].status // "") | IN("queued","running","waiting","review")) then 1 else 0 end)]
       | map(tostring | gsub("[\n\r\u001f]"; " ")) | join("\u001f"), "\n"')
   done < <("$B/cc-board" boards 2>/dev/null)
 
@@ -211,6 +215,7 @@ report(){
   fi
   local -a rest=()
   [ "$n_q" -gt 0 ] && rest+=("$n_q queued")
+  [ "$n_bund" -gt 0 ] && rest+=("$n_bund in bundles")
   [ "$n_park" -gt 0 ] && rest+=("$n_park parked")
   [ "$n_sess" -gt 0 ] && rest+=("$(plural "$n_sess" session) open")
   [ ${#rest[@]} -gt 0 ] && { add ""; add "$(join_c "${rest[@]}")."; }
@@ -261,6 +266,8 @@ EOF
     dead:   {status:"blocked", title:"the nightly export",
              notes:[{ts:"x", msg:"the exporter ran out of disk and gave up"}]},
     later:  {status:"queued",  title:"a thing nobody started"},
+    pack:   {status:"running", title:"bundle: 2 queued rows on the importer"},
+    inpack: {status:"queued",  title:"a row inside that bundle", bundle:"pack"},
     shelf:  {status:"parked",  title:"a thing set aside"},
     chat:   {kind:"session",   status:"running", title:"a course session"}}}' > "$d/boards/proj.json"
   printf 'proj/ask\twaiting\tperson\tdo you want the importer to skip a bad row or stop?\n' > "$d/reconcile"
@@ -280,9 +287,11 @@ EOF
   k "a running row is what is moving"                                  has "$out" "search over the archive"
   k "a row in review is moving too, said once for the whole box"       has "$out" "in review: the login page remembers you."
   k "queued, parked and session rows are a count in the tail, not lines of their own" \
-    line "$out" "1 queued, 1 parked, 1 session open."
+    line "$out" "1 queued, 1 in bundles, 1 parked, 1 session open."
+  k "a running bundle is what is moving, and its member is counted in it rather than as queued" \
+    has "$out" "bundle: 2 queued rows on the importer"
   k "the first line is the whole report: the counts, then the day's cost" \
-    line "$out" "*fixturebox* today: 1 shipped, 2 moving, 1 waiting on you, 1 stopped. \$13 spent, \$40 with your own sessions."
+    line "$out" "*fixturebox* today: 1 shipped, 3 moving, 1 waiting on you, 1 stopped. \$13 spent, \$40 with your own sessions."
   k "no PR state, path or per-row dollar figure hangs off any line" \
     nomatch "$out" "PR:|/home/|[$][0-9]+[.][0-9][0-9]"
   k "the report fits the 30 lines the board is worth"      test "$(wc -l <<<"$out")" -le 30

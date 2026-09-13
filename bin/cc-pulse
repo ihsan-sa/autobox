@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """cc-pulse — the drive loop: every couple of hours the box wakes its own sessions, and each one decides for
-itself whether there is work. Nothing else on the box starts development; every other timer reacts to something
-that already happened. This is the one that makes the rest run continuously with no human poke.
+itself whether there is work. Nothing else on the box starts a session on development; every other timer reacts
+to something that already happened (cc-bundle's tick starts a worker, but only for rows already queued and sharing
+a file — it decides no work). This is the one that makes the rest run continuously with no human poke.
 
   cc-pulse                       THE WHOLE MACHINE — every repo with a board; a live orch is enumerated and
                                  gets a verdict line, but is never pulsed (see DUE-NESS)
@@ -64,7 +65,8 @@ is. The files are the boards and ONE `cc-reconcile snapshot` per run (below), ne
   · THE WORD EACH ROW WEARS IS cc-reconcile's, NOT THE BOARD's. One `cc-reconcile snapshot` per run (Run.snapshot;
     it writes nothing) says each row's effective state — `blocked` for a running row nobody is in, `running` for a
     queued row a live session's `agent` mark holds (`cc board set <repo> <track> agent me`: a subagent has it, so
-    it is in flight and never offered), `queued` again once that mark is cold — and carries a person's `held`. This
+    it is in flight and never offered), `queued` again once that mark is cold — and carries a person's `held`. A
+    queued row inside a live bundle (cc-board's `bundle`, cc-bundle's mark) is in flight the same way. This
     file used to decide the mark for itself from tmux and ps, on the same bounds cc-reconcile used, and the two
     drifted (arch review 2026-09-08, rec 8: DESIGN's sole-decider rule); those bounds — CC_AGENT_MARK_HOURS, a mark
     made before a usage limit's START — are cc-reconcile's mark_why() now, decided once, and the Home tab and `cc ls`
@@ -578,7 +580,13 @@ def due(target, snap=None):
     # the only thing that releases it is a person lifting it.
     held = {k for k, (_, a, _) in tracks.items() if a}
     on_hold = {k for k, (_, _, h) in tracks.items() if h}
-    taken = held | on_hold
+    # …AND NEITHER IS A ROW INSIDE A LIVE BUNDLE. cc-bundle runs several queued rows as one worker: the bundle row
+    # is what is running, and each member stays `queued` with `bundle: <row>` so the bundle's PR can close it.
+    # The same test cc-brief's candidates() makes, so the tick and `cc-brief ready` never disagree about it.
+    bundled = {k for k, v in rows.items()
+               if str(v.get("bundle") or "").strip() in rows
+               and tracks.get(str(v.get("bundle") or "").strip(), ("",))[0] in ("queued", "running", "waiting", "review")}
+    taken = held | on_hold | bundled
     board = [(k, w) for k, (w, _, _) in tracks.items()]
     ready = sorted(k for k, st in board if st in BOARD_DUE and k not in taken)
     # …AND ONLY THE ROWS THE SPEND TIER LETS START. Under `essential` that is the rows marked critical, and none
@@ -640,7 +648,8 @@ def due(target, snap=None):
             # WITHHELD because a row in flight is unplaced. Withheld is work for the seat — cc-brief names the
             # row to give a branch to — so it wakes; no answer at all is no room, and wakes nobody.
             start = "free" if "could start now" in could else "withheld" if could else "none"
-    aloft = sorted(f"{k} {st}" + (" (on hold)" if k in on_hold else " (a subagent has it)" if k in held else "")
+    aloft = sorted(f"{k} {st}" + (" (on hold)" if k in on_hold else " (a subagent has it)" if k in held
+                                  else f" (in bundle {rows[k].get('bundle')})" if k in bundled else "")
                    for k, st in board if k not in ready and k not in waits and st not in DONE_ROW)
     tier = tier_line() if waits or not tier_allows("goals") else ""   # named only when it changes what the seat may do
     note = " · ".join(filter(None, [
@@ -1443,6 +1452,13 @@ def selfcheck():
         d, L = decide({"t1": {"status": "queued"}, "t2": {"status": "blocked"}, "t3": {"status": "running"}})
         ok("…and the rows that are queued or blocked, by name", "2 rows queued/blocked (t1, t2)" in d)
         ok("…and the rows already in flight, with the status each is in", "1 row in flight (t3 running)" in d)
+        d, L = decide({"t1": {"status": "queued"}, "bundle-x-0000": {"status": "running"},
+                       "t2": {"status": "queued", "bundle": "bundle-x-0000"}})
+        ok("a queued row inside a live bundle is in flight, not waiting: the bundle row is what is running it",
+           "1 row queued/blocked (t1)" in d and "t2 queued (in bundle bundle-x-0000)" in d)
+        d, L = decide({"t1": {"status": "queued"}, "bundle-x-0000": {"status": "done"},
+                       "t2": {"status": "queued", "bundle": "bundle-x-0000"}})
+        ok("…and is waiting again once the bundle row is no longer live", "2 rows queued/blocked (t1, t2)" in d)
         ok("a count of queued rows says nothing about ROOM, so the tick makes no such claim on its own",
            "could start now" not in d)
 
