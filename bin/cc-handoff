@@ -19,7 +19,9 @@ nothing to defer on — which is what dissolves the "handoff PENDING, deferred a
                                                           predecessor goes to its successor, blocked here with a pointer
   cc-handoff --brief <target>            ONE packet of everything a successor would otherwise re-read: the
                                          last journal entry, the unfinished board, what is landing, live
-                                         workers, open PRs, open asks, and who the predecessor is
+                                         workers, open PRs, open asks, and who the predecessor is; a packet
+                                         at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures record
+                                         (spend/handoff-packet-over-band), once per handoff
   cc-handoff --status [<target>] [--json]                 what phase, who is live, how long left
   cc-handoff selfcheck
 
@@ -133,7 +135,8 @@ CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_
 CC_HANDOFF_AGENT_IDLE (a subagent's transcript may be silent this long and still count as running, 30 min),
 CC_HANDOFF_AGENT_MAX (the cap on a stay, 1 h) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS (test hooks:
 put the record, the ledger and the harness's task files somewhere else) ·
-CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log must be before it stops counting as live, 1 h).
+CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log must be before it stops counting as live, 1 h) ·
+CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB).
 """
 import fcntl, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time, uuid
 
@@ -1778,13 +1781,43 @@ def brief(target):
         ("scope — open asks from the owner", out([os.path.join(BIN, "cc-scope"), "list", repo])),
         ("who", "\n".join(who)),
     ]
-    print(f"cc-handoff --brief {target}  ({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})")
+    lines = [f"cc-handoff --brief {target}  ({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})"]
     for title, body in sections:
-        print(f"\n== {title} ==")
-        print(body.rstrip() if body.strip() else "(none)")
-    print(f"\nThat is the whole packet. What is left is what no file holds: ask your predecessor ONE batch of "
-          f"questions about it, and run `cc-handoff --ready` when they are answered.")
+        lines += [f"\n== {title} ==", body.rstrip() if body.strip() else "(none)"]
+    lines.append(f"\nThat is the whole packet. What is left is what no file holds: ask your predecessor ONE batch of "
+                 f"questions about it, and run `cc-handoff --ready` when they are answered.")
+    packet = "\n".join(lines) + "\n"
+    sys.stdout.write(packet)
+    sys.stdout.flush()                                 # the successor has its packet before the ledger is asked
+    record_packet(target, rec, len(packet.encode()))
     return 0
+
+
+PACKET_KIND = "spend/handoff-packet-over-band"
+PACKET_BAND = 24 * 1024            # bytes; CC_BRIEF_PACKET_BAND overrides it
+
+
+def record_packet(target, rec, size):
+    """A packet at or over the band is one failures record, once per handoff (the record's id; with no handoff open,
+    once per target per UTC day): the successor re-reads all of it every turn. Best-effort like the rest of --brief —
+    the packet is already out, so a writer that fails is one stderr line."""
+    band = int(cfg("CC_BRIEF_PACKET_BAND", PACKET_BAND))
+    if size < band:                                    # "crosses a band": at the band is over it
+        return
+    key = (rec or {}).get("id") or time.strftime("%Y-%m-%d", time.gmtime())
+    cmd = [os.path.join(BIN, "cc-failures"), "record", "--once", "--scope", parts(target)[0], "--kind", PACKET_KIND,
+           "--writer", "cc-handoff", "--detector", "box", "--detector-evidence", "cc-handoff --brief measured the packet it printed",
+           "--observed", f"the handoff packet for {target} was {size:,} bytes, over the {band:,}-byte band: "
+                         f"the successor re-reads all of it every turn",
+           "--expected", f"a handoff packet under {band:,} bytes", "--cost", f"packet_bytes={size}",
+           "--link", f"source=brief:{target}:{key}", "--link", f"target={target}"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10)
+        if r.returncode != 0:
+            print(f"cc-handoff: packet over the band, not recorded: "
+                  f"{((r.stderr or r.stdout).strip().splitlines() or ['cc-failures record failed'])[-1]}", file=sys.stderr)
+    except Exception as e:
+        print(f"cc-handoff: packet over the band, not recorded: {e.__class__.__name__}", file=sys.stderr)
 
 
 # ---- selfcheck -----------------------------------------------------------------------------------------
@@ -2938,6 +2971,30 @@ def selfcheck():
         ok("...and the helpers are asked once each, for this repo only — cc-scope with `list`, not `count`",
            [c[-2:] for c in calls if c[0].endswith("cc-board")] == [["show", "r9"]]
            and [c[-2:] for c in calls if c[0].endswith("cc-scope")] == [["list", "r9"]])
+        # ---- the packet's size, into the failures ledger: its own ledger dir, the band either side of this packet
+        env0 = {k: os.environ.get(k) for k in ("CC_FAILURES", "CC_BRIEF_PACKET_BAND")}
+        os.environ["CC_FAILURES"] = os.path.join(d, "brief-failures")
+        pled = os.path.join(d, "brief-failures", "r9.jsonl")
+        pledger = lambda: [json.loads(ln) for ln in open(pled)] if os.path.isfile(pled) else []
+        size, ncalls, ngh = len(b.encode()), len(calls), len(ghcwd)
+        try:
+            os.environ["CC_BRIEF_PACKET_BAND"] = str(size + 64)       # the "m left" line may shift a byte between calls
+            with contextlib.redirect_stdout(_io.StringIO()):
+                brief("r9/t9")
+            under = pledger()
+            os.environ["CC_BRIEF_PACKET_BAND"] = str(size - 64)
+            with contextlib.redirect_stdout(_io.StringIO()):
+                brief("r9/t9"); brief("r9/t9")
+            over = pledger()
+        finally:
+            for k, v in env0.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            del calls[ncalls:], ghcwd[ngh:]                           # the cases below count the first brief's helper calls
+        ok("a packet under CC_BRIEF_PACKET_BAND writes no failures record", under == [])
+        ok("...one over it writes one spend/handoff-packet-over-band record under its repo, keyed on the handoff, "
+           "and a second brief of the same handoff writes none",
+           len(over) == 1 and over[0]["kind"] == PACKET_KIND and over[0]["writer"] == "cc-handoff"
+           and over[0]["links"]["source"] == "brief:r9/t9:b0")
 
         # THE OTHER JOURNAL SHAPE, which is the common one: a track's `progress.md` carries no
         # "journal at N%" line anywhere, so a rule that only knows that marker hands the successor the

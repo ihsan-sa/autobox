@@ -7,7 +7,7 @@
   cc-reconcile snapshot [repo …]     print the state snapshot; writes nothing, asks no network
   cc-reconcile view                  the snapshot file as TSV: repo/track · state · waiting_on · why (no rows when stale)
   cc-reconcile sweep [<repo>…|--configured] [--dry]   remove what is finished and forgotten; report what is uncertain
-  cc-reconcile digest [--notify]     the owner's daily line: shipped, moving, waiting on you, stopped, cost
+  cc-reconcile digest [--notify]     the whole report: shipped, moving, waiting on you, stopped, cost; --notify posts the phone one
   cc-reconcile selfcheck             the decision table and one end-to-end run of each part, no network
     flags: --json · -q · --no-net (never ask GitHub) · --grace SEC (600) · --repeat SEC (86400) · --no-stop
 
@@ -63,7 +63,11 @@ DIGEST (`digest`): the five questions off the boards and the snapshot — shippe
 row inside a live bundle is counted "in bundles", not queued: the bundle row is what is moving), waiting
 on you (each row's question, then the owner's 📌 pins from ~/.cc/slack/revisit.json), stopped, cost (cc-spend
 today) — and one line from the failure ledger, what it holds and what crossed the rule (cc-failures owns the numbers;
-an empty ledger is no line). `--notify` posts it as a major update to the box's main channel; the tick posts once a day.
+an empty ledger is no line). That whole report is what `digest` prints. What is POSTED — `--notify`, and the tick once
+a day, a major update to the box's main channel — is the phone one: the counts line, the limit and the tier's word,
+how many failure kinds crossed the rule (none is no line), every waiting row's question (cut to 120) and the asks count,
+then one line naming what it left out, linked to CC_DIGEST_LINK (~/.cc/config, an https URL; anything else reads "the
+Home tab"). `--notify` prints what it posts.
 
 A NAG THE STATE DISPROVES IS A FAILURE, WRITTEN HERE (the design's writers table: "cc-reconcile (a nag the
 authoritative state disproved)"). Every nag the --notify pass sends — the session's "review and land it", the owner's
@@ -1531,10 +1535,11 @@ def box_name():
     return setting("CC_BOX") or os.environ.get("CC_BOX") or (sh("hostname", "-s") or subprocess.CompletedProcess([], 1, "", "")).stdout.strip()
 
 
-def failures_line():
+def failures_line(named=True):
     """One line from the failure ledger (docs/design-failure-noticing-2026-09-11.md, decision 7): what it holds and
     what crossed the rule — the eligible clusters by kind, three named with episodes and claim word, the rest
-    counted. cc-failures owns every number; an empty ledger, or a box without one, is '' — no line. Read, never acted on."""
+    counted; `named=False` (the posted digest) is only how many crossed, and no line when none did. cc-failures owns
+    every number; an empty ledger, or a box without one, is '' — no line. Read, never acted on."""
     mp = sh(sib("cc-failures"), "metrics", timeout=30)
     if mp is None or mp.returncode != 0:
         return ""
@@ -1546,13 +1551,16 @@ def failures_line():
     rows = [ln.split("\t") for ln in (ep.stdout or "").splitlines() if ep is not None and ln.strip()]
     kinds = [f"{r[2]} ({r[4].split(' ')[0]}, {r[6] if len(r) > 6 else 'unclaimed'})" for r in rows[:3] if len(r) > 4]
     line = f"🧾 Failures: {recs} record{'' if recs == 1 else 's'} in {cl} cluster{'' if cl == 1 else 's'}; "
+    if not named:
+        return f"🧾 Failures: {len(rows)} crossed the rule." if rows else ""
     if not rows:
         return line + "none has crossed the rule."
     return line + f"{len(rows)} crossed the rule: " + "; ".join(kinds) + (f"; and {len(rows) - 3} more." if len(rows) > 3 else ".")
 
 
-def digest_text(snap=None):
-    """The report: shipped in the window, moving, waiting on you (+ 📌 pins), stopped, held, cost, the failure ledger's line."""
+def digest_text(snap=None, phone=False):
+    """The report: shipped in the window, moving, waiting on you (+ 📌 pins), stopped, held, cost, the failure ledger's line.
+    `phone` is the one that is posted: the counts, what waits on him, and one link for the rest."""
     snap = snap_file() if snap is None else snap
     cut = stamp(now() - int(os.environ.get("CC_DIGEST_WINDOW") or 86400))
     ship, move, review, need, stop, held = {}, {}, [], [], [], []
@@ -1614,26 +1622,37 @@ def digest_text(snap=None):
     out = [f"*{box_name()}* today: {', '.join(head) if head else 'nothing moved'}.{spend}"]
     lp = sh(sib("cc-limit"), "status", timeout=30)
     lim = (lp.stdout or "").strip() if lp is not None and lp.returncode == 0 else ""
-    if held:
+    if held and not phone:   # the phone one counts them on the first line and names none
         out.append(f"⏳ Held by the usage limit: {few(held, 4)}" + (f" Claude {lim}." if lim else ""))
     elif lim:
         out.append(f"⏳ Claude {lim}.")
     tp = sh(sib("cc-tier"), "line", timeout=10)
     tier = (tp.stdout or "").strip() if tp is not None and tp.returncode == 0 else ""
     if tier and not tier.startswith("spend tier: autonomous"):
+        tier = re.split(r" \(| — ", tier)[0] if phone else tier   # the phone one: the word, not since when or what it means
         out.append(f"🪫 {tier[0].upper() + tier[1:]}.")
-    fl = failures_line()   # the ledger's one line (#461): what it holds and what crossed the rule, or nothing
+    fl = failures_line(named=not phone)   # the ledger's one line (#461): what it holds and what crossed the rule, or nothing
     if fl:
         out.append(fl)
     ap = sh(sib("cc-scope"), "digest", timeout=60)
     ask = (ap.stdout or "").strip() if ap is not None and ap.returncode == 0 else ""
+    ask = ask.split(" (")[0] if phone else ask   # "91 asks of yours still open", without the breakdown
     if need or ask:
-        out += ["", "*Waiting on you*"] + [f"• {rp}: {trim(why, 240)}" for rp, why in need] + ([ask] if ask else [])
+        out += ["", "*Waiting on you*"] + [f"• {rp}: {trim(why, 120 if phone else 240)}" for rp, why in need] + ([ask] if ask else [])
     try:
-        pins = json.load(open(f"{HOME}/.cc/slack/revisit.json"))
+        pins = json.load(open(os.path.expanduser("~/.cc/slack/revisit.json")))   # HOME at call time: a fixture reads its own pins
         pins = sorted((v for v in pins.values() if isinstance(v, dict)), key=lambda v: -float(v.get("at") or 0))
     except Exception:
         pins = []
+    if phone:
+        # "fits one phone screen: the counts line, the needs-you items he can act on, one link to the dashboard/canvas
+        # for the rest" (brief, 2026-09-12). Every waiting row and the asks line stay above; the rest is named, not listed.
+        rest = [x for c, x in ((stop, "why each stopped"), (n_ship or n_move, "what moved"),
+                               (pins, f"your {len(pins)} 📌")) if c]
+        link = setting("CC_DIGEST_LINK")
+        if rest:
+            out += ["", f"More on {f'<{link}|the dashboard>' if link.startswith('https://') else 'the Home tab'}: {', '.join(rest)}."]
+        return "\n".join(out) + "\n"
     if pins:
         out += ["", "*To revisit* (your 📌)"] + [trim(f"• {v.get('channel') or '?'}: {v.get('text') or ''}"
                                                     + (f" ({v['link']})" if v.get("link") else ""), 240) for v in pins[:4]]
@@ -1670,7 +1689,7 @@ def digest_cmd(argv):
     if argv not in ([], ["--notify"]):
         print("usage: cc-reconcile digest [--notify]", file=sys.stderr)
         return 2
-    text = digest_text()
+    text = digest_text(phone=bool(argv))   # a person at a terminal reads the whole report; what is posted is the phone one
     sys.stdout.write(text)
     if argv:
         digest_post(text)
@@ -1706,7 +1725,7 @@ def tick(snap, net):
     except OSError:
         posted = ""
     if at.hour >= DIGEST_HOUR and posted != today:
-        digest_post(digest_text(snap))
+        digest_post(digest_text(snap, phone=True))
         open(ds, "w").write(today + "\n")
 
 
@@ -3178,6 +3197,74 @@ def selfcheck():
         ok("…and once the bundle row is no longer live its member is queued again", "2 queued" in btext and "in bundles" not in btext)
     finally:
         restore(); shutil.rmtree(te, ignore_errors=True)
+    # (f) the POSTED digest fits a phone: a box as busy as the 09-10 one (1736 chars) — every section full, every
+    # sibling answering — posts the counts, what waits on him and one link; the whole report stays for the terminal
+    tf = tempfile.mkdtemp(prefix="cc-reconcile-phone-")
+    try:
+        scratch(tf, dict(NOOP, **{
+            "cc-config": f'case "$2" in CC_BOX) echo fixturebox;; CC_DIGEST_LINK) cat "{tf}/link";; *) echo "$3";; esac',
+            "cc-spend": "echo 'total 538.4 40.2'", "cc-limit": "echo 'is at 91% of its 5-hour window'",
+            "cc-tier": "echo 'spend tier: essential (since 2026-09-14T18:22:47Z) — only what the owner asked for'",
+            "cc-scope": "echo '• 📋 91 asks of yours still open (5 merged but not delivered, 2 asked more than once)'",
+            "cc-failures": f'case "$1" in metrics) echo "records: 123 (120 confirmed)  clusters: 76  eligible: 4";; '
+                           f'eligible) cat "{tf}/feligible";; esac'}))
+        open(f"{tf}/link", "w").write("https://example.slack.com/app-home\n")
+        open(f"{tf}/feligible", "w").write("".join(f"c-{i}\tdemo\tkind-{i}/symptom-of-some-length\t9 episodes in 14d\t9 episode(s)\tx..y\tunclaimed 3d\n"
+                                                   for i in range(4)))
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now() - 3600))
+        asks = {"ask1": "the importer skips rows whose date is in the old format — skip them for good, backfill from the March "
+                        "export, or stop the nightly run until you decide which?",
+                "ask2": "the member workspace for the tutor wants a second GitHub token scoped to its own repo; grant it or keep "
+                        "landing its PRs by hand from the host?"}
+        tr = {k: {"status": "waiting", "title": k, "updated": old} for k in asks}
+        tr.update({f"ship{i}": {"status": "merged", "title": f"shipped piece number {i} with a title as long as the real ones get",
+                                "updated": recent} for i in range(7)})
+        tr.update({f"move{i}": {"status": "running", "title": f"moving piece number {i} with a title as long as the real ones get",
+                                "updated": old} for i in range(6)})
+        tr.update({f"stop{i}": {"status": "blocked", "title": f"stopped piece {i}", "updated": old,
+                                "notes": [{"ts": "x", "msg": f"INSTANCE 2026-09-12T03:2xZ: paused at 2 iterations, committed nothing, note {i}"}]}
+                   for i in range(4)})
+        tr["clock"] = {"status": "running", "title": "the nightly export", "updated": old}
+        json.dump({"repo": "busy", "tracks": tr}, open(f"{tf}/.cc/boards/busy.json", "w"))
+        os.makedirs(f"{tf}/.cc/slack", exist_ok=True)
+        json.dump({f"C1:{i}": {"at": 1788000000 + i, "channel": "#demo", "text": f"pinned thread {i} about something worth a second look",
+                               "link": f"https://example.slack.com/archives/C1/p178800000{i}"} for i in range(5)},
+                  open(f"{tf}/.cc/slack/revisit.json", "w"))
+        snap = {f"busy/{k}": {"state": "waiting", "waiting_on": "person", "why": q} for k, q in asks.items()}
+        snap["busy/clock"] = {"state": "running", "waiting_on": "clock", "why": "a Claude usage limit"}
+        full, ptext = digest_text(snap), digest_text(snap, phone=True)
+        shown = re.sub(r"<https://[^|>]+\|([^>]+)>", r"\1", ptext)   # what the screen shows: a link is its label, as cc-slack counts
+        ok(f"PHONE DIGEST: the fixture is as busy as the 09-10 post (whole report {len(full)} chars, over 1200) and the "
+           f"posted one fits a screen ({len(shown)} chars shown, at most 600)", len(full) > 1200 and len(shown) <= 600)
+        wait = ptext.split("*Waiting on you*", 1)[-1]
+        ok("…every needs-you item is still there, under Waiting on you: each row's question and the asks line",
+           "*Waiting on you*" in ptext and all(f"• busy: {q[:100]}" in wait for q in asks.values()) and "91 asks of yours still open" in wait)
+        ok("…the counts line is the whole report's own, word for word", ptext.splitlines()[0] == full.splitlines()[0]
+           and ptext.startswith("*fixturebox* today: 7 shipped, 6 moving, 2 waiting on you, 4 stopped, 1 held. $538 spent"))
+        ok("…and the rest is one line, linked, naming what it left out",
+           "More on <https://example.slack.com/app-home|the dashboard>: why each stopped, what moved, your 5 📌." in ptext)
+        ok("…what it left out is not listed — stopped notes, shipped titles, pins, failure kinds, held names, the tier's gloss, the asks' "
+           "breakdown — while the whole report keeps every one",
+           all(x not in ptext and x in full for x in ("committed nothing", "shipped piece number", "archives/C1", "kind-0/symptom",
+                                                     "nightly export", "since 2026-09-14", "5 merged but not delivered"))
+           and "🧾 Failures: 4 crossed the rule." in ptext and "🪫 Spend tier: essential.\n" in ptext
+           and "⏳ Claude is at 91% of its 5-hour window." in ptext)
+        open(f"{tf}/feligible", "w").close()
+        ok("…and a ledger where nothing crossed the rule is no line in the phone one, while the whole report still says so",
+           "Failures" not in digest_text(snap, phone=True) and "none has crossed the rule." in digest_text(snap))
+        open(f"{tf}/link", "w").write("the dashboard\n")
+        ok("…a CC_DIGEST_LINK that is not an https URL is no link: the line names the Home tab",
+           "More on the Home tab: why each stopped" in digest_text(snap, phone=True) and "<" not in digest_text(snap, phone=True))
+        posted = quietly(digest_cmd, ["--notify"])
+        ok("…`digest --notify` prints the phone one it posts, and bare `digest` prints the whole report",
+           posted == digest_text({}, phone=True) and "*Stopped*" in quietly(digest_cmd, [])
+           and open(f"{tf}/notify.log").read().startswith("digest\t*fixturebox* today: 7 shipped"))
+        json.dump({"repo": "busy", "tracks": {k: v for k, v in tr.items() if k in asks}}, open(f"{tf}/.cc/boards/busy.json", "w"))
+        os.remove(f"{tf}/.cc/slack/revisit.json")
+        ok("…and a box with only questions for him has no rest line at all", "More on" not in digest_text(snap, phone=True)
+           and "*Waiting on you*" in digest_text(snap, phone=True))
+    finally:
+        restore(); shutil.rmtree(tf, ignore_errors=True)
     print(f"cc-reconcile selfcheck: {p} passed, {f} failed")
     return 1 if f else 0
 

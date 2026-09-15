@@ -32,6 +32,15 @@ The tick WRITES that list to phantoms.tsv as well as printing it on demand, so a
 show it without re-deriving the rule from tmux, the boards and the loops — and the answer it shows is the same
 one `cc-spend phantoms` gives, because `grew` only changes at a tick anyway.
 
+CONTEXT COST, INTO THE FAILURES LEDGER. A turn is one API response, and its cache read is the context the session
+re-read to take it. When the tick reads a turn whose cache read is at or over the band (CC_SPEND_CONTEXT_BAND, env
+then ~/.cc/config, default 150k tokens: the context a session hands off at), it writes one `spend/context-over-band`
+record (`cc-failures record --once`) under the session's repo, at the turn's time. Once per session per UTC day
+(links.source spend-context:<session>:<day>), so a session that stays over the band is one record a day, not one a
+tick. Only turns inside GREW_WINDOW count, so a first tick's backfill writes no history; a session with no repo
+(`-`) has no ledger to go to and is skipped. The failure detector clusters and investigates those records like any
+other kind; a writer that fails is one stderr line and never fails the tick.
+
   cc-spend                     today, by session, biggest first
   cc-spend --by repo|track|model|kind [--week]
   cc-spend --week              the last 7 days
@@ -458,8 +467,11 @@ def scan_file(path, prev, seen_rids=None, sub_rids=None):
         ts = parse_ts(rec.get("timestamp")) or datetime.fromtimestamp(stt.st_mtime, timezone.utc)
         cwd = rec.get("cwd") or "-"
         key = (sid, model, iso(ts)[:10])
-        a = agg.setdefault(key, {"ts": ts, "cwd": cwd, "kind": kind_of(rec, cwd), "tok": [0, 0, 0, 0], "usd": 0.0})
+        a = agg.setdefault(key, {"ts": ts, "cwd": cwd, "kind": kind_of(rec, cwd), "tok": [0, 0, 0, 0], "usd": 0.0,
+                                 "turn_cr": 0, "turn_ts": ts})
         a["ts"] = max(a["ts"], ts)
+        if tok[2] > a["turn_cr"]:              # the largest cache read on one turn: the context carried, for the band
+            a["turn_cr"], a["turn_ts"] = tok[2], ts
         a["cwd"], a["kind"] = cwd, kind_of(rec, cwd)
         for i in range(4):
             a["tok"][i] += tok[i]
@@ -519,7 +531,7 @@ def tick():
     off = load_offsets()
     files = off.get("files") or {}
     sub_rids = {sid: set(rids) for sid, rids in (off.get("sub_rids") or {}).items()}   # {session: {requestId}}
-    rows, grew, seen_files = [], {}, set()
+    rows, grew, seen_files, peaks = [], {}, set(), {}
     seen_rids = set()                          # (session, requestId) across every file this tick reads
     # Recursive: a SUBAGENT writes its own transcript one level deeper, <project>/<session>/subagents/*.jsonl.
     # A one-level glob missed those, and most of a busy hour's spend now runs in subagents.
@@ -562,6 +574,11 @@ def tick():
                 g["usd"] += a["usd"]
                 g["tok"] += i + o + cr + cw
                 g["ts"] = max(g["ts"], iso(a["ts"]))
+            if repo != "-" and (stamp - a["turn_ts"]).total_seconds() <= GREW_WINDOW:
+                pk = (sid, iso(a["turn_ts"])[:10])
+                if a["turn_cr"] > peaks.get(pk, {}).get("cr", -1):
+                    peaks[pk] = {"cr": a["turn_cr"], "ts": a["turn_ts"], "repo": repo, "track": track,
+                                 "model": model, "path": path}
     for gone in set(files) - seen_files:       # a transcript that vanished takes its offset with it
         del files[gone]
     for done in set(sub_rids) - live_sub_sessions:   # its subagents/ files are gone from this walk too — a
@@ -570,6 +587,8 @@ def tick():
     # Rows first, offsets second: a crash between them re-reads and duplicates a tick's rows, where the other
     # order would lose them outright. Over-counting once is visible and fixable; a hole in the ledger is not.
     append_rows(rows)
+    # Records after the rows and before the offsets: a crash between re-reads the bytes, and --once writes nothing twice.
+    recorded = record_context(peaks)
     procs = proc_snapshot()
     save_tsv(PROCS, PCOLS, [[iso(stamp)] + [p[c] for c in PCOLS[1:]] for p in procs])
     save_json(OFF, {"tick": iso(stamp), "files": files, "grew": grew,
@@ -579,8 +598,46 @@ def tick():
     ph = phantom_now(grew, stamp)
     save_tsv(PHANTOMS, PHCOLS, [[iso(stamp)] + [r[c] for c in PHCOLS[1:]] for r in ph])
     print(f"cc-spend tick {iso(stamp)}: {len(rows)} row(s), {len(grew)} session(s) grew, "
-          f"{len(procs)} live claude, {len(ph)} phantom(s), ${sum(float(r[-1]) for r in rows):.4f} est")
+          f"{len(procs)} live claude, {len(ph)} phantom(s), ${sum(float(r[-1]) for r in rows):.4f} est"
+          + (f", {recorded} over the context band" if recorded else ""))
     return 0
+
+
+CONTEXT_KIND = "spend/context-over-band"
+CONTEXT_BAND = 150_000            # cache-read tokens on one turn; CC_SPEND_CONTEXT_BAND overrides it
+
+
+def record_context(peaks):
+    """The tick's peaks — {(session, UTC day): the largest fresh turn} — over the band, each written to the failures
+    ledger once. Returns how many sessions were over it. Never raises: the tick's own work is already on disk."""
+    import subprocess
+    if not peaks:
+        return 0
+    bin_ = os.path.dirname(os.path.realpath(__file__))
+    try:
+        r = subprocess.run([os.path.join(bin_, "cc-config"), "get", "CC_SPEND_CONTEXT_BAND"], capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, timeout=10)
+        band = int(float(r.stdout.strip())) if r.returncode == 0 and r.stdout.strip() else CONTEXT_BAND
+    except (OSError, subprocess.SubprocessError, ValueError):
+        band = CONTEXT_BAND
+    over = {k: p for k, p in peaks.items() if p["cr"] >= band}   # "crosses a band": at the band is over it
+    for (sid, day), p in sorted(over.items()):
+        cmd = [os.path.join(bin_, "cc-failures"), "record", "--once", "--scope", p["repo"], "--kind", CONTEXT_KIND,
+               "--writer", "cc-spend", "--detector", "box", "--detector-evidence", "cc-spend tick read the transcript",
+               "--observed", f"session {sid[:8]} ({p['repo']}/{p['track']}, {p['model']}) read {p['cr']:,} cache "
+                             f"tokens on one turn, over the {band:,} band: every later turn re-reads that context",
+               "--expected", f"the session hands off before one turn re-reads {band:,} tokens of context",
+               "--ts", iso(p["ts"]), "--cost", f"cache_read_one_turn={p['cr']}", "--evidence", f"transcript:{p['path']}",
+               "--link", f"source=spend-context:{sid}:{day}", "--link", f"session={sid}"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10)
+            if r.returncode != 0:
+                print(f"cc-spend: {sid[:8]} over the context band, not recorded: "
+                      f"{((r.stderr or r.stdout).strip().splitlines() or ['cc-failures record failed'])[-1]}",
+                      file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"cc-spend: {sid[:8]} over the context band, not recorded: {e.__class__.__name__}", file=sys.stderr)
+    return len(over)
 
 
 def save_tsv(path, cols, rows):
@@ -1251,6 +1308,51 @@ def selfcheck():
                len(files4) == 2 and len(open(day4).read().splitlines()) == len(rows4) + 1)
         finally:
             shutil.rmtree(th4, ignore_errors=True)
+        # CONTEXT COST: a turn over the band is one failures record, once per session per day; below the band, or a
+        # turn older than GREW_WINDOW (a backfill), is none. Its own HOME, ledger and band, never the host's.
+        thc = tempfile.mkdtemp(prefix="ccspend-ctx-")
+        try:
+            projc = os.path.join(thc, ".claude", "projects", "-pc")
+            os.makedirs(projc)
+            fl = os.path.join(thc, "failures")
+            envc = {k: v for k, v in os.environ.items() if k not in ("CC_CONFIG", "CC_SPEND_CONTEXT_BAND")}
+            envc.update(HOME=thc, CC_FAILURES=fl)
+            fresh = iso(now() - timedelta(minutes=2))
+
+            def recc(sid, rid, cr, ts=fresh, repo="rc"):
+                return json.dumps({"type": "assistant", "requestId": rid, "timestamp": ts, "sessionId": sid,
+                                   "cwd": os.path.join(thc, ".cc", "worktrees", repo, "tc"), "entrypoint": "sdk-cli",
+                                   "message": {"model": "claude-opus-5", "usage": {
+                                       "input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": cr,
+                                       "cache_creation_input_tokens": 0}}}) + "\n"
+
+            def ledger_c(scope):
+                f = os.path.join(fl, f"{scope}.jsonl")
+                return [json.loads(ln) for ln in open(f)] if os.path.isfile(f) else []
+
+            hot = os.path.join(projc, "hot.jsonl")
+            open(hot, "w").write(recc("hot", "h1", 120_000) + recc("hot", "h2", CONTEXT_BAND))
+            open(os.path.join(projc, "cool.jsonl"), "w").write(recc("cool", "c1", CONTEXT_BAND - 1, repo="rcool"))
+            open(os.path.join(projc, "old.jsonl"), "w").write(
+                recc("old", "o1", 400_000, ts=iso(now() - timedelta(seconds=GREW_WINDOW + 600)), repo="rold"))
+            rc1 = subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
+            l1 = ledger_c("rc")
+            ok("a turn at the context band writes exactly one spend/context-over-band record, under the session's repo",
+               rc1.returncode == 0 and len(l1) == 1 and l1[0]["kind"] == CONTEXT_KIND and l1[0]["writer"] == "cc-spend"
+               and l1[0]["links"]["source"] == f"spend-context:hot:{fresh[:10]}" and "1 over the context band" in rc1.stdout)
+            ok("…a turn one token below the band writes none, and neither does an over-band turn older than GREW_WINDOW",
+               ledger_c("rcool") == [] and ledger_c("rold") == [])
+            subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
+            open(hot, "a").write(recc("hot", "h3", 300_000))
+            rc3 = subprocess.run([sys.executable, me, "tick"], env=envc, capture_output=True, text=True)
+            ok("…a second tick writes none, and nor does a third over a new over-band turn the same day",
+               rc3.returncode == 0 and len(ledger_c("rc")) == 1 and "1 over the context band" in rc3.stdout)
+            shown = subprocess.run([os.path.join(os.path.dirname(me), "cc-failures"), "show", "--scope", "rc"],
+                                   env=envc, capture_output=True, text=True).stdout
+            ok("…and cc-failures shows it in its cluster", f"{l1[0]['cluster']}  {CONTEXT_KIND}  1 record(s)" in shown
+               if l1 else False)
+        finally:
+            shutil.rmtree(thc, ignore_errors=True)
         # …and the same record reached twice is still counted once — but a record found only in a parent is
         # never just discarded. s5 has the SAME requestId in its parent and its subagent file (neither marked
         # isSidechain — the plain cross-file dedupe). s6 has a sidechain record with NO subagents/ directory

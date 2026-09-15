@@ -6,7 +6,7 @@ proposes or posts: the ledger is written, counted and rendered, no more.
 usage: cc-failures record --scope S --kind CONTRACT/SYMPTOM --observed TEXT [--expected TEXT] [--evidence TEXT]...
                           [--detector box|person|unknown] [--detector-evidence TEXT] [--writer W] [--cost k=v]...
                           [--link k=v]... [--critical REASON] [--status confirmed|asserted|refuted] [--ts UTC]
-                          [--corrects ID]
+                          [--corrects ID] [--once]
        cc-failures show [--scope S] [--as-of UTC] [--all] [ID]   (--json: the records, corrections folded in)
        cc-failures eligible [--scope S] [--as-of UTC]
        cc-failures claim [--scope S] [--as-of UTC] [--dry]      (one eligible cluster, claimed once; the launch's call)
@@ -22,7 +22,9 @@ usage: cc-failures record --scope S --kind CONTRACT/SYMPTOM --observed TEXT [--e
 THE LEDGER is ~/.cc/failures/<scope>.jsonl (CC_FAILURES points it elsewhere; a test run keeps out of the box's own),
 append-only, one line per record, written under a lock. Records are immutable; a correction is a record of its
 own (`record --corrects ID --status refuted|confirmed`) and every read folds the latest one in. Clusters and counts
-are computed on read, never stored.
+are computed on read, never stored. `record --once` is for a writer that sees the same failure every tick: it needs
+`--link source=KEY`, and when the scope already holds a record with that source it writes nothing and prints
+`already <id>`. The read and the append are not one lock, so a writer that can race itself holds its own.
 
 THE RECORD: ts (when it happened, UTC), filed (when it was written), scope, kind, fingerprint (`v1|<scope>|<kind>`)
 and its id `c-<hash>`, expected, observed, evidence (paths, refs, excerpts), detector ({who: box|person|unknown,
@@ -652,6 +654,15 @@ def selfcheck():
         rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "x", "--cost", "turns=1", "--cost", "owner=one line", "--link", "pr=7", "--evidence", "a", "--evidence", "b", "--ts", "2026-09-01T10:00Z")
         r = lines("alpha")[-1]
         ok("cost, links, evidence and --ts are stored as given", r["cost"] == ["turns=1", "owner=one line"] and r["links"] == {"pr": "7"} and r["evidence"] == ["a", "b"] and r["ts"] == "2026-09-01T10:00:00Z")
+        # ---- --once: one record per links.source, on a scope of its own
+        rc1, out1, _ = C("record", "--scope", "once", "--kind", K, "--observed", "x", "--link", "source=k:1", "--once")
+        rc2, out2, _ = C("record", "--scope", "once", "--kind", K, "--observed", "x again", "--link", "source=k:1", "--once")
+        rc3, out3, _ = C("record", "--scope", "once", "--kind", K, "--observed", "y", "--link", "source=k:2", "--once")
+        ok("--once writes the first record of a source, and a second with that source writes nothing and names the first",
+           rc1 == rc2 == rc3 == 0 and out2.strip() == f"already {out1.split()[0]}" and out3.startswith("f-")
+           and [r["links"]["source"] for r in lines("once")] == ["k:1", "k:2"])
+        rc, out, err = C("record", "--scope", "once", "--kind", K, "--observed", "z", "--once")
+        ok("…--once with no source is refused, nothing written", rc == 2 and "--once needs" in err and len(lines("once")) == 2)
         # ---- corrections append; the original line is untouched
         raw = ledger("alpha")
         rc, out, err = C("record", "--scope", "alpha", "--kind", K, "--observed", "was a correct refusal", "--corrects", rid, "--status", "refuted")
@@ -871,7 +882,7 @@ def opts(a, flags, lists=()):
         x = a[i]
         if x.startswith("--"):
             k = x[2:]
-            if k in ("all", "dry", "json"): out[k] = True; i += 1; continue
+            if k in ("all", "dry", "json", "once"): out[k] = True; i += 1; continue
             if k not in flags and k not in lists: die(f"unknown option {x}\n{USAGE}")
             if i + 1 >= len(a): die(f"{x} needs a value")
             if k in lists: out[k].append(a[i + 1])
@@ -906,6 +917,10 @@ def main(a):
             # now has, and is folded in on every read. It must name a record the ledger holds.
             if "status" not in o: die("--corrects needs --status confirmed|asserted|refuted: the status the record now has")
             if not any(r["id"] == o["corrects"] for r in load(o["scope"])): die(f"no record {o['corrects']} in scope {o['scope']}")
+        if o.get("once"):
+            if not links.get("source"): die("--once needs --link source=KEY: the key it is written once for")
+            have = next((r["id"] for r in load(o["scope"]) if (r.get("links") or {}).get("source") == links["source"]), None)
+            if have: print(f"already {have}"); return
         ids = add_record(o["scope"], o["kind"], o["observed"], expected=o.get("expected", ""), evidence=o["evidence"],
                          detector=o.get("detector", "unknown"), detector_evidence=o.get("detector-evidence", ""),
                          writer=o.get("writer", "session"), cost=o["cost"], links=links, critical=o.get("critical", ""),
