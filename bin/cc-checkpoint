@@ -53,6 +53,10 @@
 # against a dead remote therefore costs a few minutes at worst, not a night. Hitting the bound is a failed push
 # like any other: non-zero, with the reason on .cc/push.err, which `cc ls` and `cc digest` already show as
 # `push!`. GETTING a credential to a member worker is #225's — the rule here is only that the push ENDS.
+# A PUSH THE REMOTE REJECTS IS SAID, NOT JUST MARKED. `push!` says only that a push failed, and push.err is replaced
+# every run, so a remote refusing every checkpoint (a workflow file the token has no scope for) looked like any
+# flaky push for 3.6 days (2026-09-08). git's `[remote rejected]` line is kept in .cc/push.rejected until a push
+# succeeds, and goes to the row's board note and the track's journal once per distinct reason (push_rejected).
 # WHERE IT PUSHES: `origin`, except a member workspace's project, which pushes to its OWN repository — the
 # remote named after the track, or `origin` when origin is that repository (a workspace's first project is
 # wired up as origin). Each project has its own repository (owner, 2026-09-03), so a workspace project with no
@@ -118,7 +122,7 @@ bound_hit(){   # $1 a git_unattended exit code, $2 the file its stderr went to. 
 # else's commit without a murmur — measured, not assumed. Given an explicit value git compare-and-swaps against
 # what is REALLY on the remote, so a refusal means exactly one thing: something this worktree did not write is on
 # that branch. That is never overwritten and never swallowed — see lease_refused.
-# WHERE THIS FILE KEEPS ITS STATE — $ST, and EVERY name it writes: pushed, adopted, push.err, push.err.tmp,
+# WHERE THIS FILE KEEPS ITS STATE — $ST, and EVERY name it writes: pushed, adopted, push.err, push.err.tmp, push.rejected,
 # checkpoint.err, create.err, create.err.tmp, base-seed, evict.err, evict.err.tmp, evict.same. All of them are written with shell
 # redirections, and a redirection FOLLOWS A SYMLINK — while ~/.cc/worktrees/<h> stays bound read-WRITE in the
 # member's live boundary, so a session looping `ln -sf ~/.ssh/authorized_keys .cc/push.err.tmp` wins the window
@@ -469,7 +473,7 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   git_unattended "${cred[@]}" push -q -u "$remote" "$branch" 2>"$ST/push.err.tmp"; prc=$?
   [ "$prc" = 0 ] && { lease_keep "$branch"; evict_elsewhere "$branch" "$had_lease"; return 0; }
   bound_hit "$prc" "$ST/push.err.tmp"   # killed at the bound: git said nothing, so the reason is written here
-  grep -qE 'non-fast-forward|fetch first' "$ST/push.err.tmp" || { mv "$ST/push.err.tmp" "$ST/push.err"; return 1; }   # not a divergence: a plainly broken push (no network, no permission)
+  grep -qE 'non-fast-forward|fetch first' "$ST/push.err.tmp" || { mv "$ST/push.err.tmp" "$ST/push.err"; push_rejected; return 1; }   # not a divergence: a plainly broken push (no network, no permission, the remote refusing it)
   lease=$(cat "$ST/pushed" 2>/dev/null)
   # Nothing recorded yet (a track older than .cc/pushed): the tracking ref is the best account of the remote we
   # have, and one push from here replaces the guess with the real thing.
@@ -486,7 +490,7 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
     bound_hit "$prc" "$ST/push.err.tmp"
     mv "$ST/push.err.tmp" "$ST/push.err"
     grep -qE 'stale info|non-fast-forward|fetch first' "$ST/push.err" && return 2
-    return 1; fi
+    push_rejected; return 1; fi
   mv "$ST/push.err.tmp" "$ST/push.err"
   # DIVERGED WITH NO LEASE OF OUR OWN. For the box's own repos the tracking-ref fallback above always gave us one, so
   # this is a member workspace whose ~/.cc/push-state lease is empty. Two shapes reach here and they must part ways:
@@ -506,11 +510,11 @@ lease_push(){   # $1 = branch, cwd = worktree root.  0 pushed · 1 push failed �
   return 2
 }
 lease_keep(){ git rev-parse "$1" > "$ST/pushed" 2>/dev/null   # next time's lease: what the remote holds, because we just put it there
-  rm -f "$ST/push.err" "$ST/push.err.tmp" "$ST/adopted"; }   # …and this lease IS one of ours now, adopted or not
-lease_refused(){   # a write this worktree did not make, on a single-writer branch: say so three ways, never none
-  local branch="$1" repo track msg f
+  rm -f "$ST/push.err" "$ST/push.err.tmp" "$ST/push.rejected" "$ST/adopted"; }   # …and this lease IS one of ours now, adopted or not; a rejection the remote has since taken back is stale
+row_ids(){   # → the CALLER's local repo and track for this worktree's board row and journal.  1 = no safe name
+  local f
   # WHOSE track this is comes from the PATH, never .cc/track — the header's rule, and it matters most here: the
-  # sweep runs --push as the owner every five minutes, and the board note and the journal below land under
+  # sweep runs --push as the owner every five minutes, and the board note and the journal land under
   # whatever name is picked. A member writing another workspace's name into line 1 of that read-write file would
   # put this warning on THAT workspace's board and its Slack lane, and create a directory under ~/.cc/state for
   # it (review of #225). Only a worktree that is not under ~/.cc/worktrees — nothing a member session is bound
@@ -518,11 +522,32 @@ lease_refused(){   # a write this worktree did not make, on a single-writer bran
   if path_ids "$root"; then repo="$WSREPO"; track="$WSTRACK"
   else repo=$(sed -n 1p "$root/.cc/track" 2>/dev/null); track=$(sed -n 2p "$root/.cc/track" 2>/dev/null)
     # A NAME AND NOTHING ELSE: no slash and no leading dot, which would walk out of ~/.cc/state, and no leading
-    # dash, which reaches `cc-board note` as an option word and not as a repo. push.err below is owed either way.
+    # dash, which reaches `cc-board note` as an option word and not as a repo. push.err is owed either way.
     for f in "$repo" "$track"; do case "$f" in ''|-*|.*|*[!A-Za-z0-9._-]*) repo=''; track=''; break ;; esac; done; fi
+  [ -n "$repo" ] && [ -n "$track" ]; }
+push_rejected(){   # after a failed push (lease_push rc=1): the REMOTE's refusal, kept and said once per distinct reason
+  # GitHub turning away a workflow file the token has no scope for (or a protected branch, a repository rule) fails
+  # every checkpoint the same way. push.err held git's line, and nobody read it: every reader asks only whether it
+  # EXISTS (`push!`, the watchdog's "its branch is not pushed"), and each run replaces it. A track sat blocked 3.6
+  # days on that with no note and no ask (2026-09-08). So git's `[remote rejected]` line goes to push.rejected, which
+  # only a push that succeeds removes (lease_keep) — a run that pushed nothing, or failed for another reason, leaves
+  # it — and the board note and the journal hear it when it differs from the one already kept, not every checkpoint.
+  local why repo track jf msg
+  why=$(grep -m1 -F '[remote rejected]' "$ST/push.err" 2>/dev/null | LC_ALL=C tr -cd '[:print:]' | sed 's/^ *! *//' | cut -c1-300)
+  [ -n "$why" ] || return 0
+  [ "$(cat "$ST/push.rejected" 2>/dev/null)" = "$why" ] && return 0
+  printf '%s\n' "$why" > "$ST/push.rejected"
+  row_ids || return 0
+  msg="push rejected by $remote, so no commit of this branch reaches it until that is fixed: $why"
+  "$BIN/cc-board" note "$repo" "$track" "$msg" >/dev/null 2>&1
+  jf=$(journal_file "$repo" "$track") || return 0
+  printf '\n%s cc-checkpoint: %s\n' "$(date -u +%FT%TZ)" "$msg" | dd oflag=append,nofollow conv=notrunc "of=$jf" status=none 2>/dev/null
+  return 0; }
+lease_refused(){   # a write this worktree did not make, on a single-writer branch: say so three ways, never none
+  local branch="$1" repo track msg
   msg="push refused: $remote/$branch is not what this worktree last pushed, so something else wrote to that branch. The work is committed here and was NOT overwritten. Read 'git fetch $remote && git log $remote/$branch' before anything else."
   printf '%s %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$ST/push.err"
-  [ -n "$repo" ] && [ -n "$track" ] || return 0
+  row_ids || return 0
   "$BIN/cc-board" note "$repo" "$track" "$msg" >/dev/null 2>&1
   journal_blocked "$repo" "$track" "$msg"; }
 journal_blocked(){   # $1 repo · $2 track · $3 the message — the STATUS: BLOCKED line, into a journal ITS READER CAN WRITE
@@ -538,12 +563,8 @@ journal_blocked(){   # $1 repo · $2 track · $3 the message — the STATUS: BLO
   #   · progress.md is not a link — and the append itself is opened O_NOFOLLOW (dd), so a link raced in after these
   #     checks is refused by the KERNEL and not by a test that has already run.
   # Refusing costs the third of three warnings: push.err and the board note are written above and stand either way.
-  local jd jf
-  [ ! -L "$HOME/.cc/state/$1" ] || return 0
-  jd="$HOME/.cc/state/$1/$2"; jf="$jd/progress.md"
-  mkdir -p "$jd" 2>/dev/null || return 0   # a track whose journal has not been started yet is still owed the warning
-  [ "$(readlink -f "$jd" 2>/dev/null)" = "$(readlink -f "$HOME/.cc/state" 2>/dev/null)/$1/$2" ] || return 0
-  [ ! -L "$jf" ] || return 0
+  local jf
+  jf=$(journal_file "$1" "$2") || return 0
   # cc-loop greps ^STATUS: BLOCKED out of the journal after every iteration and stops the track there (board
   # `waiting`, owner told once) — that is the whole point of writing it. Only skipped when the journal ALREADY
   # ends with this, so a hook firing every turn cannot spam it; anything else and it is said again. Loud twice
@@ -551,6 +572,15 @@ journal_blocked(){   # $1 repo · $2 track · $3 the message — the STATUS: BLO
   [ "$(grep -v '^[[:space:]]*$' "$jf" 2>/dev/null | tail -1)" = "STATUS: BLOCKED: $3" ] && return 0
   printf '\n%s cc-checkpoint: %s\nSTATUS: BLOCKED: %s\n' "$(date -u +%FT%TZ)" "$3" "$3" \
     | dd oflag=append,nofollow conv=notrunc "of=$jf" status=none 2>/dev/null; return 0; }
+journal_file(){   # $1 repo · $2 track → the journal's path, once the walls listed above hold.  1 = refused
+  # Their last half, O_NOFOLLOW on the append itself, is each caller's: every write to it goes through dd with it.
+  local jd
+  [ ! -L "$HOME/.cc/state/$1" ] || return 1
+  jd="$HOME/.cc/state/$1/$2"
+  mkdir -p "$jd" 2>/dev/null || return 1   # a track whose journal has not been started yet is still owed the warning
+  [ "$(readlink -f "$jd" 2>/dev/null)" = "$(readlink -f "$HOME/.cc/state" 2>/dev/null)/$1/$2" ] || return 1
+  [ ! -L "$jd/progress.md" ] || return 1
+  printf '%s\n' "$jd/progress.md"; }
 adopt(){   # $1 handle · $2 track · $3 (optional) the sha the operator has read on the remote.  0 recorded · 1 not
   # THE ONE WAY OUT OF rc=3. A member workspace track whose lease predates ~/.cc/push-state has none the host wrote,
   # so a branch rebased since then can neither fast-forward nor be leased, and every automatic path stops: the old
@@ -834,6 +864,49 @@ SH
   git -C "$d" remote set-url origin "$owW"; runp "$d"; rc=$?
   k "$([ "$rc" = 0 ] && has "$owW" track/tW && [ ! -e "$d/.cc/push.err" ] && echo 0 || echo 1)" \
     "…while a remote that answers is pushed to as before, and push.err is cleared" "rc=$rc"
+  # ── a push the remote rejects is said, once per reason ─────────────────────────────────────────────
+  # 2026-09-08: GitHub rejected every checkpoint of a track (a workflow file, no `workflow` scope), and all anyone
+  # saw was `push!`. A bare repository whose hook declines is the same answer from a real git remote: the line
+  # git prints is `! [remote rejected] <branch> -> <branch> (<reason>)`, as it is from GitHub.
+  deny(){ printf '#!/bin/sh\nexit 1\n' > "$1/hooks/$2"; chmod +x "$1/hooks/$2"; }   # $1 bare repo · $2 pre-receive|update
+  commit_on(){ echo "$2" >> "$1/work.txt"; git -C "$1" add -A; git -C "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
+  rjR=$(bare rejR); deny "$rjR" pre-receive
+  d=$(mkproj myrepoR/tR origin "$rjR"); jR="$HOME/.cc/state/myrepoR/tR/progress.md"
+  runp "$d"; rc=$?
+  k "$([ "$rc" != 0 ] && grep -qx '\[remote rejected\] track/tR -> track/tR (pre-receive hook declined)' "$d/.cc/push.rejected" 2>/dev/null && echo 0 || echo 1)" \
+    "a push the remote rejects keeps the remote's own line in push.rejected" "rc=$rc $(cat "$d/.cc/push.rejected" 2>/dev/null)"
+  k "$(grep -c 'push rejected by origin.*pre-receive hook declined' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" "…and the row's board note names it" "$(cat "$NOTES")"
+  k "$(grep -q 'push rejected by origin.*pre-receive hook declined' "$jR" 2>/dev/null && echo 0 || echo 1)" "…and so does the track's journal" "$(cat "$jR" 2>/dev/null)"
+  : > "$NOTES"; commit_on "$d" second; ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  k "$([ -s "$NOTES" ] && echo 1 || echo 0)" "…once per reason, not once per checkpoint" "$(cat "$NOTES")"
+  k "$(grep -c 'push rejected by' "$jR" | grep -qx 1 && echo 0 || echo 1)" "…in the journal too" "$(cat "$jR")"
+  # A later run that fails for ANOTHER reason (the sandboxed Stop hook has no credential) replaces push.err, and
+  # must not take the rejection with it: nothing has reached the remote since.
+  git -C "$d" remote set-url origin "$T/nowhere.git"; ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  k "$(grep -q 'rejected' "$d/.cc/push.err" && echo 1 || echo 0)" "a later push failing for another reason replaces push.err" "$(cat "$d/.cc/push.err")"
+  k "$(grep -q 'pre-receive hook declined' "$d/.cc/push.rejected" 2>/dev/null && [ ! -s "$NOTES" ] && echo 0 || echo 1)" \
+    "…and leaves the kept rejection, with nothing said again" "$(cat "$d/.cc/push.rejected" 2>/dev/null) notes: $(cat "$NOTES")"
+  # A DIFFERENT refusal is new news.
+  rjU=$(bare rejU); deny "$rjU" update; git -C "$d" remote set-url origin "$rjU"; ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 )
+  k "$(grep -c 'push rejected by origin.*(hook declined)' "$NOTES" | grep -qx 1 && grep -q '(hook declined)' "$d/.cc/push.rejected" && echo 0 || echo 1)" \
+    "a different rejection is said again, and replaces the kept one" "$(cat "$NOTES")"
+  # …and a push that goes through leaves no stale rejection behind.
+  rm -f "$rjU/hooks/update"; ( cd "$d" && "$bin/cc-checkpoint" --push >/dev/null 2>&1 ); rc=$?
+  k "$([ "$rc" = 0 ] && has "$rjU" track/tR && [ ! -e "$d/.cc/push.rejected" ] && [ ! -e "$d/.cc/push.err" ] && echo 0 || echo 1)" \
+    "a push that succeeds clears push.rejected" "rc=$rc $(cat "$d/.cc/push.rejected" 2>/dev/null)"
+  # THE STOP HOOK, on a fixture of its own: the path a worker's every turn takes. Rejected, then accepted, then
+  # rejected again with the same reason — which is said again, because the success in between made it news.
+  stop(){ ( cd "$1" && "$bin/cc-checkpoint" </dev/null >/dev/null 2>&1 ); }   # the Stop hook (`hook` below is the same, defined later)
+  rjH=$(bare rejH); deny "$rjH" pre-receive
+  d=$(mkproj myrepoH/tH origin "$rjH"); : > "$NOTES"; echo hooked >> "$d/work.txt"; stop "$d"   # the hook pushes what it commits
+  k "$(grep -q 'pre-receive hook declined' "$d/.cc/push.rejected" 2>/dev/null && grep -c 'push rejected by origin' "$NOTES" | grep -qx 1 && echo 0 || echo 1)" \
+    "the Stop hook's push, rejected, is kept and said" "$(cat "$NOTES")"
+  stop "$d"   # a turn with nothing to commit pushes nothing, and wipes nothing
+  k "$([ -s "$d/.cc/push.rejected" ] && echo 0 || echo 1)" "…a turn that committed nothing leaves it standing" "gone"
+  rm -f "$rjH/hooks/pre-receive"; echo accepted >> "$d/work.txt"; stop "$d"
+  k "$(has "$rjH" track/tH && [ ! -e "$d/.cc/push.rejected" ] && echo 0 || echo 1)" "…and the hook's push that succeeds clears it" "$(cat "$d/.cc/push.rejected" 2>/dev/null)"
+  deny "$rjH" pre-receive; echo again >> "$d/work.txt"; stop "$d"
+  k "$(grep -c 'push rejected by origin' "$NOTES" | grep -qx 2 && echo 0 || echo 1)" "…so the same rejection after a success is said again" "$(cat "$NOTES")"
   # ── which branch the repository the box made opens on ───────────────────────────────────────────────
   # GitHub gives an empty repository whichever branch lands first as its default, and the track landing first is
   # the bug: the base goes in ahead of it, and is asked for by name if that still did not settle it. Here `create`
@@ -1545,7 +1618,7 @@ if [ "$MODE" = sweep ]; then   # member workspaces only: a worker's loop pushes 
     # dangling link is caught FIRST: -e is false through one.
     local wt="$1" f
     [ -d "$wt/.cc" ] && [ ! -L "$wt/.cc" ] || { echo "$wt/.cc is not a directory of its own"; return 1; }
-    for f in pushed adopted push.err push.err.tmp create.err create.err.tmp evict.err evict.err.tmp evict.same base-seed; do
+    for f in pushed adopted push.err push.err.tmp push.rejected create.err create.err.tmp evict.err evict.err.tmp evict.same base-seed; do
       [ ! -L "$wt/.cc/$f" ] || { echo "$wt/.cc/$f is a symlink"; return 1; }
       [ ! -e "$wt/.cc/$f" ] || [ -f "$wt/.cc/$f" ] || { echo "$wt/.cc/$f is not a plain file"; return 1; }
     done

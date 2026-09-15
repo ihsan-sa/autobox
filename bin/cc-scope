@@ -38,6 +38,12 @@ it says so on every line you read, and it never overwrites a check that once pas
 a check should outlive its track — `check-cmd --script` copies the script in beside the ledger, and a check
 that runs a script out of a directory which dies with its track is refused.
 
+A CHECK IS NOT REPLACED IN SILENCE. Ask a342's orch registered a check that read the live mail log; an hour
+later another seat wrote over its checks/ script with one that ran a selftest, and `deliver` passed it on a
+fixture (2026-09-12). So check-cmd will not replace a row's check without `--replace "<why>"`, prints the one
+that is there when it refuses, and keeps the reason in the row's notes. And every script under checks/ a check
+runs is fingerprinted when it is registered: `deliver` refuses (exit 3) to run one edited since.
+
 KEPT BEFORE IT IS CLASSIFIED. The classifier below is a filter and it has been wrong: "Ok well do whatever
 you need to speed up the whole landing and review process" (2026-09-08) was dropped whole because the
 sentence opened with an acknowledgement, and the only copy left of it was a seen.log line clipped at 160
@@ -55,6 +61,7 @@ paste cut at TURN_MAX; `missed` prints the size of the record, because nothing a
   cc-scope show <repo> <id>                                          one ask in full: parts, repeats, notes
   cc-scope claim <repo> <id> [--track T]                             a session/track has taken it on
   cc-scope check-cmd <repo> <id> "<command>" | --script <file>       the row's own verification; exit 0 = true
+            [--replace "<why>"]                                      required when the row already has one
   cc-scope merged <repo> <id> --evidence "<PR or commit>"            it landed. NOT delivered — still work
   cc-scope deliver <repo> <id>                                       RUNS the check; exit 0 → delivered. A MERGED row whose
                                                                      check fails is written to the failures ledger, once per
@@ -73,9 +80,10 @@ paste cut at TURN_MAX; `missed` prints the size of the record, because nothing a
   cc-scope hook                                                      UserPromptSubmit hook (always 0; speaks only for cc-handoff --relay)
 
 Exit, for the commands a caller acts on: 0 did it · 1 the check ran and FAILED · 2 the row names no check ·
-3 the check COULD NOT RUN, so nothing was measured either way.
+3 the check COULD NOT RUN, or was not run because its script changed since it was registered, so nothing was
+measured either way.
 """
-import sys, os, re, json, time, fcntl, hashlib, calendar, shutil, subprocess
+import sys, os, re, json, time, fcntl, hashlib, calendar, shutil, shlex, subprocess
 
 HOME = os.path.expanduser("~")
 SCOPE = os.environ.get("CC_SCOPE_DIR", os.path.join(HOME, ".cc", "scope"))
@@ -243,7 +251,7 @@ def add(repo, text, who="owner", src="", track="", done_when="", check="", at=""
         d["asks"][aid] = {"id": aid, "text": text, "parts": parts_of(text), "fp": fp, "who": who,
                           "src": src, "track": track, "done_when": done_when, "status": "open",
                           "asked": at or now(), "repeats": 1, "evidence": "", "reason": "", "closed": "",
-                          "check": check.strip(), "checked": {}, "notes": []}
+                          "check": check.strip(), "check_files": check_files(check), "checked": {}, "notes": []}
         save(repo, d)
         return aid, False
 
@@ -307,15 +315,53 @@ def refuse_doomed(repo, aid, c):
 def install_script(repo, aid, src):
     """Copy a check script in beside the LEDGER. A track's state dir and its worktree are both temporary by
     design — the janitor takes them when the track is done — so a check that lives in one is a check with an
-    expiry date on it. This is the durable place: the ledger's own dir, keyed by repo and ask."""
+    expiry date on it. This is the durable place: the ledger's own dir, keyed by repo and ask. `--script` may
+    name the installed file itself, to register what is there now; copying a file onto itself would fail."""
     src = os.path.expanduser(src)
     if not os.path.isfile(src):
         sys.exit("cc-scope: --script %s is not a file. Point it at the script as it is now: check-cmd copies "
                  "it in, so the original may be in a track dir that later goes away." % src)
     dst = os.path.join(check_dir(), "%s.%s.sh" % (repo, aid))
-    shutil.copyfile(src, dst)
+    if os.path.realpath(src) != os.path.realpath(dst):
+        shutil.copyfile(src, dst)
     os.chmod(dst, 0o755)
     return dst
+
+
+def check_files(c):
+    """{path: sha} of every file under checks/ the command names, "" for one not there. Recorded on the row
+    when the check is registered, and compared by `deliver`: see A CHECK IS NOT REPLACED IN SILENCE."""
+    d = os.path.realpath(os.path.join(SCOPE, CHECKS))
+    out = {}
+    for tok in re.findall(r"[^\s;&|()<>`'\"=]+", c or ""):
+        tok = re.sub(r"^(?:~|\$HOME|\$\{HOME\})(?=/)", lambda m: HOME, tok)
+        p = os.path.realpath(tok)
+        if tok.startswith("/") and p.startswith(d + os.sep):
+            try:
+                with open(p, "rb") as f: out[p] = hashlib.sha256(f.read()).hexdigest()[:16]
+            except OSError: out[p] = ""
+    return out
+
+
+def drifted(a):
+    """The scripts under checks/ this row's check runs that are not what was registered. A row registered
+    before fingerprints has none recorded, and nothing tells its script from an edited one, so it counts.
+    A script that is gone is not drift: it fails to run."""
+    was = a.get("check_files")
+    return [p for p, s in check_files(a.get("check")).items() if s and (was is None or was.get(p) != s)]
+
+
+def check_text(a):
+    """The row's check as the next seat has to read it: the command, then each script under checks/ it runs."""
+    out, ed = ["    " + a["check"]], drifted(a)
+    for p in check_files(a["check"]):
+        try:
+            body = open(p, errors="replace").read().splitlines()
+        except OSError:
+            out.append("    --- %s: not there" % p); continue
+        out.append("    --- %s%s" % (p, "  (not what check-cmd fingerprinted)" if p in ed else ""))
+        out += ["    | " + l for l in body[:40]] + (["    | ... %d more lines" % (len(body) - 40)] if len(body) > 40 else [])
+    return "\n".join(out)
 
 
 def settled(a):
@@ -789,16 +835,26 @@ def main(argv):
         for n in a["notes"]: print("  note    %s %s" % (n["ts"], n["msg"]))
 
     elif cmd == "check-cmd":
-        script = opt(args, "--script")
+        script, why = opt(args, "--script"), opt(args, "--replace").strip()
         repo, aid = args[0], args[1]
-        get(repo, aid)     # before anything is copied anywhere
+        a = get(repo, aid)     # before anything is copied anywhere
+        if has_check(a) and not why:
+            sys.exit("cc-scope: %s %s already has a check, and check-cmd does not replace one in silence (see A "
+                     "CHECK IS NOT\n  REPLACED IN SILENCE in --help). Read the one that is there:\n%s\n"
+                     "  Replace it only if it is wrong, and say why; the reason is kept on the row:\n"
+                     "    cc-scope check-cmd %s %s ... --replace \"<why the check above is wrong>\""
+                     % (repo, aid, check_text(a), repo, aid))
         if script:
             c = "bash %s" % install_script(repo, aid, script)
         else:
             c = (args[2] if len(args) > 2 else "").strip()
             if not c: sys.exit("cc-scope: check-cmd needs a command — one that exits 0 only when the ask is TRUE")
             refuse_doomed(repo, aid, c)
-        edit(repo, aid, lambda a: a.update(check=c, checked={}))
+        def upd(x):
+            if has_check(x):
+                x["notes"].append({"ts": now(), "msg": "check replaced (was: %s) because: %s" % (x["check"], why)})
+            x.update(check=c, checked={}, check_files=check_files(c))
+        edit(repo, aid, upd)
         print("%s %s check: %s" % (repo, aid, c))
 
     elif cmd == "deliver":
@@ -818,6 +874,15 @@ def main(argv):
                                                                    repo, aid),
                   file=sys.stderr)
             return 2
+        if drifted(a):
+            print("cc-scope: %s %s is NOT delivered and its check was NOT run: a script it runs is not what\n"
+                  "  check-cmd fingerprinted. It was edited in place, or registered before scripts were\n"
+                  "  fingerprinted. Read it:\n%s\n"
+                  "  If it is right, register it as it is now, and say why:\n"
+                  "    cc-scope check-cmd %s %s %s --replace \"<why>\"" % (repo, aid, check_text(a), repo, aid,
+                                                                      shlex.quote(a["check"])),
+                  file=sys.stderr)
+            return 3
         rc, o = run_check(repo, a)
         tail = " ".join((o or "").split())[-300:]
         silent = rc in CANNOT_RUN     # no answer, which is not the answer no
@@ -843,7 +908,7 @@ def main(argv):
             if shell_could_not_exec(o):
                 # bash itself never found anything to run — the vanished-script cause #297 was written for.
                 fix = ("  Give it a command that is there, or keep the script beside the ledger where it "
-                       "outlives\n  the track that wrote it:  cc-scope check-cmd %s %s --script <file>"
+                       "outlives\n  the track that wrote it:  cc-scope check-cmd %s %s --script <file> --replace \"<why>\""
                        % (repo, aid))
             else:
                 # The interpreter ran the check fine; the check chose this rc itself to say it could not
@@ -881,7 +946,7 @@ def main(argv):
             if has_check(a) and not passed(a):
                 sys.exit("cc-scope: %s names a check and it has not passed — the ledger runs the check, it does "
                          "not take a sentence for it.\n  %s\nRun it (`cc-scope deliver %s %s`), or replace it "
-                         "with one that can pass (`cc-scope check-cmd %s %s ...`)."
+                         "with one that can pass (`cc-scope check-cmd %s %s ... --replace \"<why>\"`)."
                          % (aid, a["check"], repo, aid, repo, aid))
             if not (ev or a.get("evidence")):
                 sys.exit("cc-scope: verify needs --evidence — name what YOU looked at, in your own words. This is "
@@ -1155,7 +1220,7 @@ def selfcheck():
         t("...and the row is still not settled", get(R, a1)["status"] == "merged" and quiet(["check", R]) == 1)
 
         # and a check that PASSES is what delivery means
-        quiet(["check-cmd", R, a1, "true"])
+        quiet(["check-cmd", R, a1, "true", "--replace", "exit 3 was the red case above"])
         t("a check that passes is what makes a row delivered",
           quiet(["deliver", R, a1]) == 0 and get(R, a1)["status"] == "delivered")
         t("the evidence is the check itself, not a sentence about it",
@@ -1186,7 +1251,7 @@ def selfcheck():
         t("it says why, on the line you read", "back on the queue" in run_capture(["list", R]))
         t("and it is reported unverified, with the sentence it was closed on",
           quiet(["unverified", R]) == 1 and "closed on a sentence" in run_capture(["unverified", R]))
-        quiet(["check-cmd", R, a1, "true"]); quiet(["deliver", R, a1])
+        quiet(["check-cmd", R, a1, "true", "--replace", "same check, re-registered"]); quiet(["deliver", R, a1])
         t("giving it a check that passes is what settles it", quiet(["check", R]) == 0)
 
         a3, _ = add(R, "rewrite the whole box in rust")
@@ -1237,7 +1302,7 @@ def selfcheck():
         t("...and the line you read says the check has not passed",
           "its check has not passed" in run_capture(["list", R]))
         gone = os.path.join(HOME, ".cc", "scope", CHECKS, "_selfcheck-no-such-check.sh")
-        quiet(["check-cmd", R, aC, "bash %s" % gone])
+        quiet(["check-cmd", R, aC, "bash %s" % gone, "--replace", "the cannot-run case"])
         t("a check that CANNOT RUN is a different answer: exit 3, not the 1 a real failure gets",
           quiet(["deliver", R, aC]) == 3 and get(R, aC)["checked"]["rc"] in CANNOT_RUN)
         t("...and the row says no answer, not failure",
@@ -1259,7 +1324,7 @@ def selfcheck():
         rc, out = run_capture_err(["deliver", R, aC])   # aC's check is still `bash <gone>` from just above
         t("the vanished-script cause still gets told to give it a command that is there",
           rc == 3 and "give it a command that is there" in out.lower())
-        quiet(["check-cmd", R, aC, "echo could not start 2 of 5, nothing failed >&2; exit 126"])
+        quiet(["check-cmd", R, aC, "echo could not start 2 of 5, nothing failed >&2; exit 126", "--replace", "chosen 126"])
         rc2, out2 = run_capture_err(["deliver", R, aC])
         t("a check that RAN and chose CANNOT_RUN itself is still read as no answer, not a failure",
           rc2 == 3 and get(R, aC)["checked"]["rc"] == 126)
@@ -1297,7 +1362,7 @@ def selfcheck():
         t("...but the SAME path merely looked at is not refused — 'the janitor took it' is a real check",
           quiet(["check-cmd", R, aE, "test ! -f %s/.cc/state/%s/some-track/boundary-check.sh" % (HOME, R)]) == 0)
         t("...and running a script that merely takes a temp path as an argument is not refused either",
-          quiet(["check-cmd", R, aE, "bash install.sh /tmp/out.log"]) == 0)
+          quiet(["check-cmd", R, aE, "bash install.sh /tmp/out.log", "--replace", "a temp path as an argument"]) == 0)
         # …and `add --check` is the SAME door: it was open while check-cmd's was shut, which is a documented
         # way to write exactly the row this refusal exists to prevent (review of #297).
         try:
@@ -1311,6 +1376,57 @@ def selfcheck():
         newid = run_capture(["add", R, "an ask with a fine check", "--check", fine]).split()[1]
         t("...and an ordinary check at `add --check` is still what ends up ON the row",
           get(R, newid).get("check") == fine)
+
+        # ---- A CHECK IS NOT REPLACED IN SILENCE ---------------------------------------------------------
+        # a342 (2026-09-12): a settler wrote over a live check with a selftest it never compared to the one
+        # there, and `deliver` passed the ask on a fixture.
+        aF, _ = add(R, "prove the member send reached the mail log")
+        t("a first check-cmd on a row is not refused", quiet(["check-cmd", R, aF, "grep -q sent /dev/null"]) == 0)
+        try:
+            quiet(["check-cmd", R, aF, "true"]); bad("replacing a check without --replace is refused")
+        except SystemExit as e:
+            t("replacing a check without --replace is refused, prints the check that is there, and keeps it",
+              "grep -q sent /dev/null" in str(e) and "--replace" in str(e) and get(R, aF)["check"] == "grep -q sent /dev/null")
+        try:
+            quiet(["check-cmd", R, aF, "true", "--replace", " "]); bad("--replace with no reason is refused")
+        except SystemExit:
+            t("--replace with no reason is refused too", get(R, aF)["check"] == "grep -q sent /dev/null")
+        t("--replace with a reason replaces it, and the old check and the reason are kept in the notes",
+          quiet(["check-cmd", R, aF, "true", "--replace", "the log moved"]) == 0 and get(R, aF)["check"] == "true"
+          and any("the log moved" in n["msg"] and "grep -q sent" in n["msg"] for n in get(R, aF)["notes"]))
+        live, fixture = os.path.join(SCOPE, "_orch", "live.sh"), os.path.join(SCOPE, "_settler", "fixture.sh")
+        for fp_, body_ in ((live, "# reads the live mail log\nexit 0\n"), (fixture, "# runs a selftest\nexit 0\n")):
+            os.makedirs(os.path.dirname(fp_), exist_ok=True)
+            with open(fp_, "w") as fh: fh.write(body_)
+        aG, _ = add(R, "prove the live send")
+        quiet(["check-cmd", R, aG, "--script", live])
+        instG = get(R, aG)["check"].split()[1]
+        try:
+            quiet(["check-cmd", R, aG, "--script", fixture]); bad("a --script over an installed check is refused")
+        except SystemExit as e:
+            t("a --script over an installed check is refused, prints the script's body, and copies nothing over it",
+              "reads the live mail log" in str(e) and "reads the live mail log" in open(instG).read())
+        # an installed script edited in place, by a Write tool and not check-cmd, is not run by deliver
+        aI, _ = add(R, "prove the live send, untouched")
+        quiet(["check-cmd", R, aI, "--script", live])
+        t("an installed script nobody edited delivers", quiet(["deliver", R, aI]) == 0)
+        aH, _ = add(R, "prove the live send, edited")
+        quiet(["check-cmd", R, aH, "--script", live])
+        instH = get(R, aH)["check"].split()[1]
+        with open(instH, "w") as fh: fh.write("# runs a selftest\nexit 0\n")
+        rc, out = run_capture_err(["deliver", R, aH])
+        t("a script edited in place after registration is not run: exit 3, it says so and shows the script",
+          rc == 3 and "fingerprinted" in out and "runs a selftest" in out
+          and get(R, aH)["status"] == "open" and not get(R, aH)["checked"])
+        t("...and registering it as it is now, with a reason, is what lets it deliver (--script may name itself)",
+          quiet(["check-cmd", R, aH, "--script", instH, "--replace", "read it; the selftest is right"]) == 0
+          and quiet(["deliver", R, aH]) == 0)
+        aJ, _ = add(R, "prove the live send, via add", check="bash %s" % instG)
+        t("a check given at add is fingerprinted too, so it delivers", quiet(["deliver", R, aJ]) == 0)
+        with Lock(R):
+            d = load(R); d["asks"][aJ].pop("check_files"); save(R, d)
+        t("a row from before fingerprints that runs a script under checks/ is not run either",
+          quiet(["deliver", R, aJ]) == 3)
 
         aid, _ = capture(R, '<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.2" '
                             'user="ada.byron" role="owner" channel="#demo">\nplease put the open asks on Home',

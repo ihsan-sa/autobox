@@ -735,7 +735,7 @@ miss=""; for probe in 'Bash|{"command":"ls -la"}' 'Bash|{"command":"git log --on
 [ "$(w Bash '{"command":"systemctl --user list-units"}' "$wt")" = 2 ] \
   && ok "...and a worker's systemctl read is unchanged — denied before stage 0, denied after (the list sorts by spelling, not reach)" || bad "systemctl gate moved under stage 0"
 MP=('Bash|{"command":"sudo apt install x"}' 'Bash|{"command":"gh pr merge 1"}' 'Bash|{"command":"cc r t --go build it"}'
-    'Bash|{"command":"cc board add r t title text --go"}' 'Bash|{"command":"cc-loop r t"}' 'Bash|{"command":"claude -p do it"}'
+    'Bash|{"command":"cc board add r t title text; cc r t --go"}' 'Bash|{"command":"cc-loop r t"}' 'Bash|{"command":"claude -p do it"}'
     'Bash|{"command":"cat ~/.cc/config"}' 'Bash|{"command":"tail -5 $HOME/.ssh/id_ed25519"}'
     'Bash|{"command":"docker run -v /:/host alpine"}' 'Bash|{"command":"cat ~/.claude/.credentials.json"}'
     'Bash|{"command":"head -1 ~/ccbox/env"}'
