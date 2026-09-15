@@ -526,6 +526,11 @@ echo after > "$wt/d.txt"; ( cd "$wt" && "$B/cc-checkpoint" )
   && ok "once the foreign commit is rebased in, the very next checkpoint pushes again (the block is not sticky)" || bad "still blocked after the branch was reconciled"
 rm -rf "$T/foreign"
 # H2: a hand-deleted worktree dir stays registered in git; cc must prune + rebuild it, never stamp a plain dir
+# THE RELAUNCH MUST FIND W1'S TRANSCRIPT. `cc __run` on a started session with no transcript mints a NEW session_id,
+# a second or more later in its own window. The cc-context fixture below reads the id after this, so under load it
+# read the old one and every cc-context case said 'no transcript' (the #463 and #465 landings, 2026-09-12). With a
+# transcript there, the relaunch resumes the id it has; the fixture fills the file in.
+PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"; : > "$PD/$("$B/cc-board" get $REPO w1 session_id).jsonl"
 rm -rf "$wt"; "$B/cc" $REPO w1 >/dev/null 2>&1; sleep 1
 [ "$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" = "$(readlink -f "$wt")" ] && [ -f "$wt/.cc/track" ] && ok "hand-deleted worktree is rebuilt as a real worktree" || bad "worktree rebuilt as a plain dir"
 # H3: repo/track names are validated — no path traversal, no options as track names
@@ -536,7 +541,7 @@ rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
 fi
 # w1's session and its transcript, and the Stop payload that names them: cc-context's cases stand on these
 export CC_CTX_RECORDS="$T/ctx" CC_CTX_BOX_MODEL=   # records under $T, and this box's own model never sizes a fixture
-PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1
+PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1 (and see H2: it must exist before a relaunch)
 sid=$("$B/cc-board" get $REPO w1 session_id)
 printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":19000,"output_tokens":5}}}\n' > "$PD/$sid.jsonl"
 pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
@@ -544,7 +549,7 @@ if stanza "cc-context (the real number, and what refuses to run without it)"; th
 chk cc-context
 chk cc-statusline   # the harness's own per-turn file cc-context prefers over its transcript estimate
 chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
-"$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1)"
+"$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1) (fixture sid $sid, board sid $("$B/cc-board" get $REPO w1 session_id))"
 out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
 { [ $rc = 0 ] && grep -q 'under 90%' <<<"$out" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
   && ok "handoff --over leaves a session that is not full alone" || bad "handoff --over 90 at 10%: rc=$rc $out"

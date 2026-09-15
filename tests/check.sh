@@ -346,6 +346,26 @@ printf '#!/usr/bin/env bash\nd=$PWD; while [ "$d" != / ]; do [ -f "$d/.cc/track"
 chmod +x "$GD/cwd-probe"
 [ "$(run_sc "$GD/cwd-probe")" = "fixture-repo fixture-track" ] \
   || { echo "check.sh: the selfchecks' cwd no longer carries a track marker of its own — a case that reads its cwd would pass here and fail in every worker's worktree"; exit 1; }
+# RED ONCE IS NOT RED FOR THE DIFF — selftest.sh's chk() rule, here too. This gate runs beside other roots' suites,
+# and a case that races the machine goes red under that load and green alone on the same tree: cc-member-broker's
+# /proc fd read and cc-digest's ledger line each cost a whole cc-green run on 2026-09-12. So a selfcheck that exits
+# red is run ONCE more, alone, after the rest are done. Green then is printed as LOAD-BOUND with the cases that
+# flipped, never as a clean pass, and its output is the one judged after; red twice is red, and prints both runs.
+rerun_alone(){   # <tool path> <first output> -> 0 green alone (says LOAD-BOUND, output in RERUN_OUT), 1 red again (prints both)
+  local t=${1##*/} rc2=0
+  RERUN_OUT=$(run_sc "$1" 2>&1) || rc2=$?
+  if [ "$rc2" = 0 ] && tally_ok "$t" "$RERUN_OUT"; then
+    echo "  $t: LOAD-BOUND — $(tally_line "$t" "$2") beside the other selfchecks, $(tally_line "$t" "$RERUN_OUT") alone; the cases that flipped:"
+    grep -E '✗|✘|FAIL' <<<"$2" | head -5 | sed 's/^ */    /'; return 0; fi
+  printf '%s\n' "$2"; echo "  $t: red again alone (exit $rc2), so not load:"; printf '%s\n' "$RERUN_OUT"; return 1; }
+# CONTROL: a fixture red on its first run and green on its second passes as LOAD-BOUND; one red both times fails.
+printf '#!/bin/sh\nn=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"\n[ $n = 1 ] && { echo "FAIL a race"; echo "cc-flaky selfcheck: 1 passed, 1 failed"; exit 1; }\necho "cc-flaky selfcheck: 2 passed, 0 failed"\n' > "$GD/cc-flaky"
+printf '#!/bin/sh\necho "FAIL a bug"; echo "cc-broken selfcheck: 1 passed, 1 failed"; exit 1\n' > "$GD/cc-broken"
+chmod +x "$GD/cc-flaky" "$GD/cc-broken"
+rf=$(run_sc "$GD/cc-flaky" 2>&1) || true; rb=$(run_sc "$GD/cc-broken" 2>&1) || true
+{ fl=$(rerun_alone "$GD/cc-flaky" "$rf") && grep -q 'LOAD-BOUND .* 1 failed beside .* 0 failed alone' <<<"$fl" && grep -q 'FAIL a race' <<<"$fl" \
+  && [ "$(cat "$GD/cc-flaky.n")" = 2 ] && ! br=$(rerun_alone "$GD/cc-broken" "$rb") && grep -q 'red again alone (exit 1)' <<<"$br" && grep -q 'FAIL a bug' <<<"$br"; } \
+  || { echo "check.sh: the rerun-once rule no longer tells a load flake from a red — flaky: ${fl:-} broken: ${br:-}"; exit 1; }
 for c in cc-board $others; do
   want_selfcheck "$c" || { skipped="$skipped $c"; part_out "$c"; continue; }
   # …and only by the half that owns it. A tool's selfcheck belongs to this box only if it says so (PART_BOX_TOOLS
@@ -379,7 +399,8 @@ for c in $ran; do
   # 77 is cc-fence's ALONE, and means one thing: this kernel has no Landlock to apply, so its cases did not run.
   # Its line is printed and stays visible — that is not a pass. Any other tool exiting 77, and cc-fence exiting
   # 77 for any other reason (it refuses to report a skip when the kernel HAS Landlock and declined), fails here.
-  [ "$rc" = 0 ] || { echo "$o"; { [ "$rc" = 77 ] && [ "$c" = cc-fence ]; } || exit 1; }
+  if [ "$rc" = 77 ] && [ "$c" = cc-fence ]; then echo "$o"
+  elif [ "$rc" != 0 ]; then rerun_alone "$ROOT/bin/$c" "$o" || exit 1; o=$RERUN_OUT; fi   # the tally judged below is the green run's
   tally_ok "$c" "$o" || { g=$(tally_line "$c" "$o")
     echo "$c: its cases passed, but its tally line is a shape selftest.sh's chk() cannot read, so the suite will"
     echo "  call this tool dead when it is green. Fix the tool's last line — chk() is right, see its comment."

@@ -130,7 +130,16 @@ def selfcheck(m):
                 broker_pid = next(int(pid) for pid in Path(f"/proc/{p.pid}/task/{p.pid}/children").read_text().split()
                                   if b"cc-member-broker" in Path(f"/proc/{pid}/cmdline").read_bytes())
                 def descriptors():
-                    return sorted(os.readlink(f) for f in Path(f"/proc/{broker_pid}/fd").iterdir())
+                    # The broker closes a connection only after its reply, so under load the last ask's socket
+                    # can close between this listing and its readlink (ENOENT, which turned check.sh red on
+                    # 2026-09-12). A descriptor that closed is not held: skip it.
+                    held = []
+                    for f in Path(f"/proc/{broker_pid}/fd").iterdir():
+                        try:
+                            held.append(os.readlink(f))
+                        except FileNotFoundError:
+                            pass
+                    return sorted(held)
                 old = descriptors()
                 for _ in range(3): ask(req(), fd=True)
                 check(descriptors().count("/dev/null") == old.count("/dev/null") == 0
