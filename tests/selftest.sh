@@ -2199,10 +2199,18 @@ exec "$D/bin/cc-land" "$@"
 SH
 printf '#!/bin/sh\necho "$*" >> "$D/starts"\nexit 0\n' > "$D/bin/systemd-run"
 printf '#!/bin/sh\necho "$*" >> "$D/notices"\n' > "$D/bin/cc-notify"
-printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$D/bin/cc-sandbox"
+printf '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n' > "$D/bin/cc-sandbox"
 for tool in cc-pause tmux; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
 for tool in cc-model cc-limit cc-scope cc-trust cc-gh-token; do printf '#!/bin/sh\nexit 1\n' > "$D/bin/$tool"; done
 chmod +x "$D/bin/"*
+# THAT cc-sandbox STANDS IN FOR A BOUNDARY, SO IT HAS TO BE ABLE TO FAIL. Everything up to `--` is the profile —
+# `<repo> <track> --`, `member <h> --` and `vet --` — and the command after it runs whole. The fixed `shift 3` it
+# replaced ate a `vet` profile's first command word (core/mail/selfcheck.py); that stub, and no stub, read red here.
+sbx_runs(){ for p in 'r row' 'member h' vet; do [ "$("$1" $p -- printf '%s|' timeout 'a b' 2>/dev/null)" = 'timeout|a b|' ] || return 1; done; }
+printf '#!/bin/sh\nshift 3\nexec "$@"\n' > "$D/shift3-sandbox"; chmod +x "$D/shift3-sandbox"
+{ sbx_runs "$D/bin/cc-sandbox" && ! sbx_runs "$D/shift3-sandbox" && ! sbx_runs "$D/no-such-sandbox"; } \
+  && ok "P9s: the fixture's cc-sandbox runs the command whole after every profile; a shift-3 stub and a missing one read red" \
+  || bad "P9s: the fixture's cc-sandbox mis-reads a profile, or the control stubs pass"
 export CC_LAND="$D/bin/host-queue"
 git init -q -b main "$HOME/dev/r"; git init -q --bare "$D/remote.git"
 echo '/.cc/' > "$HOME/dev/r/.gitignore"

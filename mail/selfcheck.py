@@ -1593,13 +1593,14 @@ def run():
         # argv it was given; with no boundary at all NOTHING runs, which is the whole claim — there is no host
         # path to fall back to, so an attachment is never read outside the sandbox the workspace runs in.
         seen = os.path.join(b.tmp, "argv.txt")
+        optin = os.path.join(b.tmp, "optin.txt")   # …and the CC_WORKER_SANDBOX it was handed, which argv cannot show
         vetting.SANDBOX = os.path.join(b.tmp, "fake-sandbox")
         with open(vetting.SANDBOX, "w") as f:
             # Everything up to `--` is the profile, which is the real dispatch's own shape: `member <h> --`,
             # `<repo> <track> --` and `vet --` are two, three and one word of it. A fixed `shift 3` read the
             # `vet` profile's `timeout` as part of the profile and ran the rest without it.
-            f.write("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n"
-                    "while [ \"$1\" != -- ]; do shift; done; shift\nexec \"$@\"\n" % seen)
+            f.write("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\nprintf '%%s\\n' \"${CC_WORKER_SANDBOX:-unset}\" >> %s\n"
+                    "while [ \"$1\" != -- ]; do shift; done; shift\nexec \"$@\"\n" % (seen, optin))
         os.chmod(vetting.SANDBOX, 0o755)
         pdf = [("report.pdf", b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n")]
         # A WORKSPACE WITH NO BOUNDARY OF ITS OWN STILL GETS ONE, and it is not the host. No member marker, no
@@ -1638,9 +1639,31 @@ def run():
         os.remove(seen)
         shutil.rmtree(os.path.join(vetting.DEV, "mem"))
         os.makedirs(os.path.join(vetting.WORKTREES, "mem", "site"), exist_ok=True)
-        _, v = vetted("fits|fits", attach=pdf)
-        k(v.clean and open(seen).read().split("\n")[0].split()[:3] == ["mem", "site", "--"],
-          "…and a workspace that is a track with a worktree goes through the worker profile of that track")
+        # THE WORKER PROFILE IS OPT-IN: `cc-sandbox <repo> <track>` runs the command untouched unless
+        # CC_WORKER_SANDBOX=1, so the argv alone passes with no boundary at all. The case reads what the boundary
+        # was handed, from an environment that does not have it, and its control takes the opt-in away.
+        def worker_read():
+            for p in (seen, optin):
+                if os.path.exists(p):
+                    os.remove(p)
+            _, v = vetted("fits|fits", attach=pdf)
+            first = [open(p).read().split("\n")[0] if os.path.exists(p) else "" for p in (seen, optin)]
+            return v.clean and first[0].split()[:3] == ["mem", "site", "--"] and first[1] == "1"
+        real_run, inherited = vetting.subprocess.run, os.environ.pop("CC_WORKER_SANDBOX", None)
+        k(worker_read(), "…and a workspace that is a track with a worktree goes through the worker profile of that "
+          "track, with the opt-in that makes that profile a boundary")
+
+        def no_optin(*a, **kw):
+            kw["env"] = {e: x for e, x in (kw.get("env") or os.environ).items() if e != "CC_WORKER_SANDBOX"}
+            return real_run(*a, **kw)
+        vetting.subprocess.run = no_optin
+        try:
+            held = worker_read()
+        finally:
+            vetting.subprocess.run = real_run
+            if inherited is not None:
+                os.environ["CC_WORKER_SANDBOX"] = inherited
+        k(not held, "…and with that opt-in removed the case above goes red: the same argv with no boundary is no pass")
         os.remove(seen)
         _, v = vetted("fits|fits", attach=[("books.zip", b"PK\003\004\000\000\000\000")])
         k(v.verdict == "suspicious" and v.reason == "unreadable" and os.path.exists(seen),

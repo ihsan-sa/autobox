@@ -7791,9 +7791,24 @@ def run_selfcheck():
     os.makedirs(f"{mdir}/dev/mem/.cc", exist_ok=True)
     with open(f"{mdir}/dev/mem/{MEMBER_MARKER}", "w") as fh:
         fh.write(MEMBER_MARKER_TEXT)
-    with open(V.SANDBOX, "w") as fh:
+    with open(V.SANDBOX, "w") as fh:   # everything up to `--` is the profile: `vet --` is one word of it, not two
+        fh.write('#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n')
+    with open(f"{mdir}/shift3-sandbox", "w") as fh:
         fh.write('#!/bin/sh\nshift 3\nexec "$@"\n')
     os.chmod(V.SANDBOX, 0o755)
+    os.chmod(f"{mdir}/shift3-sandbox", 0o755)
+
+    def sandbox_runs(path):   # every profile V.boundary answers, and the worker's, runs the command after `--` whole
+        try:
+            return all(subprocess.run([path, *prof, "--", "printf", "%s|", "timeout", "a b"], capture_output=True,
+                                      text=True, timeout=10).stdout == "timeout|a b|"
+                       for prof in (V.boundary("mem", "", {})[1:-1], V.boundary("", "", {})[1:-1], ["r", "t"]))
+        except OSError:
+            return False
+    check("mail: the fake cc-sandbox runs the command whole after every profile, and it can fail — a shift-3 stub "
+          "and a missing one read red",
+          sandbox_runs(V.SANDBOX) and not sandbox_runs(f"{mdir}/shift3-sandbox")
+          and not sandbox_runs(f"{mdir}/no-such-sandbox"))
     os.environ["CC_MAIL_ROUTE_FAKE"] = ""       # a classifier that is not there = unsure, the safe default
     os.environ["CC_MAIL_VET_FAKE"] = "fits|fits"  # …and a vetting read that says every mail below is ordinary,
     # which is what makes these cases about ROUTING. The vetting cases of their own are (i) below, and each of
