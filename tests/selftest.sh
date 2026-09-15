@@ -534,7 +534,7 @@ mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/nu
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
 fi
-# w1's session and its transcript, and the Stop payload that names them: cc-context's cases and cc-owed's both stand on these
+# w1's session and its transcript, and the Stop payload that names them: cc-context's cases stand on these
 export CC_CTX_RECORDS="$T/ctx" CC_CTX_BOX_MODEL=   # records under $T, and this box's own model never sizes a fixture
 PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1
 sid=$("$B/cc-board" get $REPO w1 session_id)
@@ -616,41 +616,6 @@ if stanza "cc-brief (the shape of a brief, checked at the door instead of rememb
 chk cc-brief
 
 fi
-if stanza "cc-owed (the same hook says what is still owed in Slack)"; then
-chk cc-owed
-OWD="$T/owed"; SLD="$T/slackdir"; mkdir -p "$SLD"     # records and cc-slack's marks both under $T: never the box's own
-CH=C0TEST0001; RT=1700000000.000100
-hook(){ pay "${2:-}" | ( cd ~/.cc/worktrees/$REPO/w1 && env CC_OWED_RECORDS="$OWD" CC_SLACK_DIR="$SLD" ${1:+env $1} "$B/cc-checkpoint" ); }
-cat >> "$PD/$sid.jsonl" <<EOF
-{"type":"user","timestamp":"2026-01-01T01:00:00Z","message":{"role":"user","content":"<channel source=\"cc-slack\" chat_id=\"$CH\" thread_ts=\"$RT\" ts=\"$RT\" user=\"Owner\" role=\"owner\" channel=\"#one\" target=\"one\">\ndid it land\n</channel>"}}
-EOF
-o1=$(hook)
-{ grep -q 'OWED' <<<"$o1" && grep -q "$CH" <<<"$o1" && grep -q 'did it land' <<<"$o1"; } \
-  && ok "a message nothing answered is said back to the session, with the call that pays it" || bad "no owed decision: $o1"
-[ -z "$(hook)" ] && ok "it is said once, not every turn" || bad "the session was told twice: $(hook)"
-"$B/cc-owed" --transcript "$PD/$sid.jsonl" >/dev/null 2>&1; [ $? = 1 ] \
-  && ok "a debt is an exit code too, for anything that asks" || bad "cc-owed --transcript did not report the debt"
-rm -f "$T/ctx/$sid.json" "$OWD/$sid.json"    # both hooks fresh: one decision must carry both, owed first
-o2=$(hook "$CTXP CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2" ',"background_tasks":[{"id":"x"}]')
-{ grep -q 'OWED' <<<"$o2" && grep -q 'CONTEXT 10%' <<<"$o2" && [ "$(grep -c decision <<<"$o2")" = 1 ]; } \
-  && ok "the context line and the debt arrive as ONE decision, the debt first" || bad "hooks did not merge: $o2"
-python3 - "$SLD/marks.json" "$CH:$RT:white_check_mark" <<'PY'   # cc-slack's own file, written here as it writes it
-import json, sys
-json.dump({sys.argv[2]: 9999999999.0}, open(sys.argv[1], "w"))
-PY
-rm -f "$OWD/$sid.json"
-[ -z "$(hook)" ] && ok "a ✅ the session put on the thread settles it — cc-slack's marks are read, not recomputed" \
-  || bad "a done thread was still owed: $(hook)"
-rm -f "$SLD/marks.json" "$OWD/$sid.json"
-cat >> "$PD/$sid.jsonl" <<EOF
-{"type":"assistant","timestamp":"2026-01-01T01:01:00Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"mcp__cc-slack__reply","input":{"chat_id":"$CH","thread_ts":"$RT","ts":"$RT","text":"it landed"}}]}}
-EOF
-[ -z "$(hook)" ] && ok "a word in that thread ends the debt" || bad "answered thread still owed: $(hook)"
-[ "$(env CC_OWED_RECORDS="$OWD" "$B/cc-owed" --ledger | wc -l)" = 2 ] \
-  && ok "every debt said is one countable line on the ledger" || bad "ledger: $(env CC_OWED_RECORDS="$OWD" "$B/cc-owed" --ledger)"
-unset CC_CTX_BOX_MODEL
-
-fi
 if stanza "guard"; then
 g(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$1" "$2" "$3" | CC_ROLE=worker "$B/cc-guard" >/dev/null 2>&1; echo $?; }
 [ "$(g Bash '{"command":"gh pr merge 1"}' "$wt")" = 2 ] && ok "guard blocks merge in a track (by cwd marker)" || bad "guard merge"
@@ -692,13 +657,13 @@ c(){ printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s","transcript_path":"%s"
   && ok "a worker that cd'd into ~/dev/<repo> is still fenced to its worktree — the transcript path says where it started" || bad "a cd'd worker is fenced by its cwd"
 rm -f "/tmp/cc-selftest-$RUN-lnk"
 [ "$(printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | CC_ROLE=worker env PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?)" = 2 ] && ok "guard refuses when jq is missing (gates would be silently off)" || bad "guard without jq"
-# …and for a steward, whose whole tier lives in that env: no marker names it, so a role missing from the no-jq
-# list is a steward running unattended with every gate off. The planning session is the other side of the same
-# line — it is ungated by design, so a broken PATH must NOT start refusing its calls.
+# …while the planning session is the other side of the same line — it is ungated by design, so a broken PATH must
+# NOT start refusing its calls. (The steward tier that lived in that env went with cc-steward; a worker is the
+# gated role above.)
 #   `env -u` first: this suite's own runner may hold a CC_ROLE or a CC_HANDOFF, and either one inherited would
-#   make the ungated half of the assertion pass for the wrong reason (both are read by the same `case`).
+#   make the assertion fail for the wrong reason (both are read by the same `case`).
 njq(){ printf '{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"%s"}' "$wt" | env -u CC_ROLE -u CC_HANDOFF ${1:+CC_ROLE=$1} PATH=/nonexistent /bin/bash "$B/cc-guard" >/dev/null 2>&1; echo $?; }
-[ "$(njq steward)" = 2 ] && [ "$(njq)" = 0 ] && ok "…and for a steward too, while an ungated planning session still runs" || bad "guard without jq: steward=$(njq steward) planning=$(njq) (want 2 and 0)"
+[ "$(njq)" = 0 ] && ok "…while an ungated planning session with no jq still runs" || bad "guard without jq: planning=$(njq) (want 0)"
 # member-facing: the .cc/member-facing marker alone (NO CC_ROLE — the env is a convenience) = every worker gate plus spend/leak/wiring
 # A MEMBER DENY NOW SPEAKS (see below), so every member probe runs against a STUB HOME: a fake ~/bin/cc-slack and
 # ~/bin/cc-notify that only record their argv, and a ~/.cc/config with no real token. Nothing in this file may
@@ -1011,7 +976,7 @@ mrow(){ local t=$1; shift   # the one t8 row out of cc ls ("alice   t8 ")
 # report names no row at all (#303) and counts the project as stopped — "the work it is doing is not being saved".
 # So the digest is read by its OWN count of stopped work, which is what this rule can move there, and never by a
 # marker it no longer prints. dgm keeps the whole report, for the leak check: no reader renders a member's bytes.
-dgm=""; dgstop(){ dgm=$(env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" "$B/cc-digest" 2>/dev/null)
+dgm=""; dgstop(){ dgm=$(env HOME="$GH" PATH="$T/stub:$B:$PATH" TMUX_STUB_LOG="$T/tmux.log" "$B/cc-reconcile" digest 2>/dev/null)
   local n; n=$(head -1 <<<"$dgm" | grep -oE '[0-9]+ stopped'); printf '%s' "${n%% *}"; }
 q0=$(dgstop)   # the fixture's own stopped count, before any marker of t8's exists
 touch "$GH/.cc/worktrees/alice/t8/.cc/push.err"   # the member's own, which nothing on the host writes or clears
@@ -2473,7 +2438,7 @@ if stanza "resume/digest/rm"; then
 # gh stubbed: the digest asks GitHub about every PR on every board of the box, and each fixture PR here is a URL
 # that answers nothing — 70 s of timeouts for one grep (measured 09-04: 92 s with gh, 22 s without)
 mkdir -p "$T/nogh"; printf '#!/bin/sh\nexit 1\n' > "$T/nogh/gh"; chmod +x "$T/nogh/gh"
-grep -q "$REPO" <<<"$(PATH="$T/nogh:$PATH" "$B/cc" digest)" && ok "digest lists the track" || bad "digest"
+grep -q "$REPO" <<<"$(PATH="$T/nogh:$PATH" "$B/cc-reconcile" digest)" && ok "digest lists the track" || bad "digest"
 "$B/cc" rm $REPO w1 >/dev/null 2>&1; [ ! -d ~/.cc/worktrees/$REPO/w1 ] && ok "rm removed worktree" || bad "rm"
 "$B/cc" rm $REPO w2 >/dev/null 2>&1
 fi
@@ -2561,7 +2526,7 @@ fi
 # next top-level `cd` is inside the cc-publish stanza, well after the last of them. Nothing may be added to this
 # line without re-reading that window: a tool started across an export runs under an environment its chk did not
 # have, and would quietly prove something else. They are collected in the stanzas that always printed them.
-prefetch cc-reconcile cc-janitor cc-rename cc-started cc-pulse cc-secretary
+prefetch cc-reconcile cc-rename cc-started
 if stanza "model fallback (cc-model + cc-limit)"; then
 # own HOME and own tmux server (TMUX unset, TMUX_TMPDIR into $T): the live sessions' models are never touched
 MH="$T/mh"; mkdir -p "$MH/.cc/state" "$T/fb"; printf '#!/usr/bin/env bash\ncat\n' > "$T/fb/cc-loop"; chmod +x "$T/fb/cc-loop"
@@ -2788,19 +2753,6 @@ if stanza "cc-reconcile (board vs reality: decision table + one end-to-end apply
 chk cc-reconcile
 
 fi
-if stanza "cc-watch (the planning session's two watches: false alarms, and the argv it must never print)"; then
-# Fixtures only — a process table in a file, a queue log and a `gh` of its own — so no process of this box's is
-# read and no PR anywhere is asked about. Every case has a mutation behind it: keying a landing on pid, reporting
-# it after one absence, dropping the gh confirmation, reporting a duplicate on sight, or printing a headless
-# run's argv each turns one of them red.
-chk cc-watch
-
-fi
-if stanza "cc-janitor (the daily sweep: decision table + one end-to-end pass over a fake box)"; then
-# Its own HOME, board, origin and stub tmux/gh — nothing here can reach this box's tmux server or GitHub.
-chk cc-janitor
-
-fi
 if stanza "cc-rename (a project's name, everywhere the box keys by it)"; then
 # Every case there builds a whole HOME of its own — a git repository with two linked worktrees, a board, a state
 # dir, an ask ledger, a config, a Slack directory and stub tmux/pgrep/cc — so it moves no path of this box's,
@@ -2823,17 +2775,6 @@ if stanza "cc-started (a launched session is confirmed to be running, or the own
 chk cc-started
 
 fi
-if stanza "cc-pulse (the drive loop: whole-machine enumeration, start, tick, and the three reasons not to)"; then
-# Its own HOME with two boards and one orch, and stub tmux/cc/cc-msg/cc-handoff — it starts no session
-# on this box and types into none of the live ones.
-chk cc-pulse
-
-fi
-if stanza "cc-secretary (the judgment layer: fixtures, a fake model, the whole escalation ladder, no network)"; then
-# Its own HOME, stub tmux/ps/claude/cc-slack/cc-notify — it reads no pane and reaches no session on this box.
-chk cc-secretary
-
-fi
 if stanza "what the snapshot's four readers do with it (waiting vs the clock, and without it)"; then
 # cc-reconcile's own selfcheck covers PRODUCING the snapshot; this covers the two things that only break in the
 # readers. Its own HOME, because ~/.cc/state/reconcile.json is a fixed path and this box's live one must not move.
@@ -2846,7 +2787,7 @@ sb status sr s_ask waiting >/dev/null; sb status sr s_clock running >/dev/null; 
 lsn=$(HOME=$SH "$B/cc" ls 2>&1); lsrc=$?
 [ $lsrc = 0 ] && grep -q 's_ask' <<<"$lsn" && ok "no snapshot: \`cc ls\` still prints every track (a missing key must not kill the listing)" || bad "cc ls without a snapshot: rc=$lsrc"
 grep -q '❓' <<<"$lsn" && ok "no snapshot: a waiting track is still marked, with no question to show" || bad "cc ls dropped the waiting mark"
-dgn=$(HOME=$SH "$B/cc-digest" 2>/dev/null)
+dgn=$(HOME=$SH "$B/cc-reconcile" digest 2>/dev/null)
 dga=$(sed -n '/^\*Waiting on you\*/,/^$/p' <<<"$dgn")   # the digest marks him needed by the SECTION a row is filed under
 grep -q 'title s_ask' <<<"$dga" && ! grep -qE ': *$' <<<"$dga" && ok "no snapshot: the digest still says he is needed, with no colon trailing a question it does not have" || bad "digest fallback wording: $dga"
 # an EMPTY or non-JSON snapshot must read as stale, not kill the reader: jq on empty input exits 0 with no
@@ -2855,7 +2796,7 @@ grep -q 'title s_ask' <<<"$dga" && ! grep -qE ': *$' <<<"$dga" && ok "no snapsho
 lse=$(HOME=$SH "$B/cc" ls 2>&1); lserc=$?
 [ $lserc = 0 ] && grep -q 's_ask' <<<"$lse" && ok "empty snapshot: \`cc ls\` treats it as stale and still prints the board" || bad "empty snapshot killed cc ls: rc=$lserc — $lse"
 printf 'not json' > "$SH/.cc/state/reconcile.json"
-dge=$(HOME=$SH "$B/cc-digest" 2>/dev/null); dgerc=$?
+dge=$(HOME=$SH "$B/cc-reconcile" digest 2>/dev/null); dgerc=$?
 [ $dgerc = 0 ] && grep -q 's_ask' <<<"$dge" && ok "corrupt snapshot: the digest falls back to the board" || bad "corrupt snapshot broke the digest: rc=$dgerc"
 # the snapshot cc-reconcile leaves behind — a question a PERSON must answer, and a loop waiting on the CLOCK while
 # its board word is still `running` (it hit the limit mid-run). The clock is never "needs you".
@@ -2865,7 +2806,7 @@ cat > "$SH/.cc/state/reconcile.json" <<JSON
  "sr/s_clock":{"state":"running","board":"running","live":true,"waiting_on":"clock","why":"a Claude usage limit"},
  "sr/s_stop":{"state":"blocked","board":"blocked","live":false,"waiting_on":"","why":""}}}
 JSON
-lss=$(HOME=$SH "$B/cc" ls 2>&1); dgs=$(HOME=$SH "$B/cc-digest" 2>/dev/null)
+lss=$(HOME=$SH "$B/cc" ls 2>&1); dgs=$(HOME=$SH "$B/cc-reconcile" digest 2>/dev/null)
 grep -q 'which syllabus?' <<<"$lss" && grep -q 'which syllabus?' <<<"$dgs" && ok "snapshot: \`cc ls\` and the digest print the same question, from the one file" || bad "the question did not reach both readers"
 grep -q '⏳ held by the usage limit' <<<"$(grep s_clock <<<"$lss")" && grep -q '^⏳ Held by the usage limit:.*title s_clock' <<<"$dgs" && ! grep -q 'title s_clock' <<<"$(sed -n '/^\*Waiting on you\*/,/^$/p;/^\*Stopped\*/,/^$/p' <<<"$dgs")" && ok "snapshot: a loop held by the limit says so in both — whatever word it wears (\`running\` here, not \`blocked\`) — and the digest NAMES it without filing it as his" || bad "clock row invisible while the board says running"
 dgh=$(head -1 <<<"$dgs"); grep -q '1 waiting on you' <<<"$dgh" && grep -q '1 held' <<<"$dgh" && ok "snapshot: the clock is counted as held, NOT as one more thing waiting on him — the tally he reads first" || bad "a usage limit was reported as needing the owner: $dgh"
@@ -2912,7 +2853,7 @@ IR="$T/autobox"; IH="$T/blank"; mkdir -p "$IR" "$IH"
 tar -C "$B/.." --exclude=./ccbox/env --exclude=__pycache__ -cf - . | tar -C "$IR" -xf -
 inst(){ ( cd "$IH" && env HOME="$IH" XDG_CONFIG_HOME="$IH/.config" USER=tester CC_BOX=testbox GIT_CEILING_DIRECTORIES="$T" "$IR/install.sh" --no-services ) >"$T/install.log" 2>&1; }   # XDG too: the installer writes global git config, and a fixture reads nobody's but its own
 inst && ok "install.sh runs clean on a blank HOME (--no-services)" || bad "install.sh failed on a blank HOME: $(tail -3 "$T/install.log" | tr '\n' ' ')"
-[ "$(readlink -f "$IH/bin/cc")" = "$IR/bin/cc" ] && [ "$(readlink -f "$IH/bin/cc-pulse")" = "$IR/bin/cc-pulse" ] && ok "bin/* linked into ~/bin from the installed tree" || bad "~/bin links missing or pointing elsewhere"
+[ "$(readlink -f "$IH/bin/cc")" = "$IR/bin/cc" ] && [ "$(readlink -f "$IH/bin/cc-reconcile")" = "$IR/bin/cc-reconcile" ] && ok "bin/* linked into ~/bin from the installed tree" || bad "~/bin links missing or pointing elsewhere"
 # the prune is scoped to what this tree linked: a stale link of its own (target left the tree) goes, a dangling
 # link someone ELSE put in ~/bin stays — install.sh used to delete every dangling link in ~/bin, whoever made it
 ln -s "$IR/bin/retired-script" "$IH/bin/retired-script"; ln -s "$T/never-ours" "$IH/bin/foreign"
@@ -2920,7 +2861,7 @@ inst
 [ ! -L "$IH/bin/retired-script" ] && [ -L "$IH/bin/foreign" ] && ok "prune removes only this tree's stale ~/bin links — a foreign dangling link is left alone" || bad "prune scope: retired link $([ -L "$IH/bin/retired-script" ] && echo kept || echo gone), foreign link $([ -L "$IH/bin/foreign" ] && echo kept || echo gone)"
 rm -f "$IH/bin/foreign"
 miss=""; for u in $("$IR/bin/cc-units" link); do [ -L "$IH/.config/systemd/user/$u" ] || miss="$miss $u"; done
-[ -z "$miss" ] && ok "every unit in the manifest is linked, cc-pulse.timer included (switching on is the services step)" || bad "units not linked:$miss"
+[ -z "$miss" ] && ok "every unit in the manifest is linked, cc-reconcile.timer included (switching on is the services step)" || bad "units not linked:$miss"
 { [ -f "$IH/CLAUDE.md" ] && [ ! -L "$IH/CLAUDE.md" ] && grep -q '^# testbox — ' "$IH/CLAUDE.md" && grep -q 'Autonomy is the norm' "$IH/CLAUDE.md" && grep -q 'The owner approves' "$IH/CLAUDE.md" && grep -q '~/WORKING.md' "$IH/CLAUDE.md" && ! grep -q '<user>' "$IH/CLAUDE.md"; } && ok "~/CLAUDE.md seeded as a copy of the contract, <box>/<user> filled in, the rest left to the owner" || bad "~/CLAUDE.md not seeded as the box contract"
 miss=""; for g in USAGE COMMS RUNBOOK; do [ -f "$IH/$g.md" ] || miss="$miss $g"; done
 [ -z "$miss" ] && ok "the guides the contract points at exist at ~ (USAGE COMMS RUNBOOK; SLACK folded into COMMS)" || bad "guides missing:$miss"
@@ -3145,7 +3086,7 @@ PY
   || bad "stanza half gating under SUITE_PART=$SUITE_PART"
 { [ "${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]#* }" != "${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]}" ] \
   && case " ${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]} " in *" cc-limit "*" cc-loop "*|*" cc-loop "*" cc-limit "*) true;; *) false;; esac \
-  && case " ${STANZA_TOOLS[resume/digest/rm]} " in *" cc-digest "*) true;; *) false;; esac \
+  && case " ${STANZA_TOOLS[resume/digest/rm]} " in *" cc-reconcile "*) true;; *) false;; esac \
   && case " ${STANZA_TOOLS[cc-reconcile (board vs reality: decision table + one end-to-end apply, no network)]} " in *" cc-reconcile "*) true;; *) false;; esac; } \
   && ok "the scan reads each stanza's tools off its own lines: \$B/cc-foo, chk cc-foo, and \$B/cc <sub> as the cc-<sub> it dispatches to" \
   || bad "the scan: limits=[${STANZA_TOOLS[usage limits (cc-limit + cc-loop)]}] resume=[${STANZA_TOOLS[resume/digest/rm]}]"

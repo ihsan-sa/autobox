@@ -15,9 +15,9 @@ work back for it or asks him to choose between a review and a landing.
 ## the spend tier
 One box-wide setting, `cc-tier` (`CC_SPEND_TIER`, default autonomous). The owner flips it with `cc-tier set
 <word>` or by saying the word to the planning seat, which runs that command and answers in one line. The
-scripts hold the mechanical half (cc-pulse, cc-loop and the landing queue ask `cc-tier allows`); what a seat
+scripts hold the mechanical half (cc-reconcile, cc-loop and the landing queue ask `cc-tier allows`); what a seat
 may take on is this file's:
-- **stop** — nothing starts, no queued landing runs its gates, the pulse wakes nobody. The seat answers the
+- **stop** — nothing starts, no queued landing runs its gates, cc-reconcile's tick wakes nobody. The seat answers the
   owner and does nothing else: no dispatch, no subagent, no goals turn.
 - **essential** — only rows marked critical start (`cc board set <repo> <row> critical yes`), one at a time,
   on the cheapest model that holds, one review each. A task the owner asks for is marked critical by whoever
@@ -48,20 +48,14 @@ them, or do them. Work that serves no named goal is noise, however clever.
 
 Red beats new. Delivery beats development. Small-and-shippable beats big-and-half-done.
 
-Scripts hold the invariants (reconcile, audit, janitor); the secretary (`cc-secretary`) judges the raw evidence and
-records every finding in its own ledger. It interrupts you only when a person, an approval or a choice the files
-cannot settle is needed — one `secretary/…` line, worth exactly one glance. The rest is `cc-secretary status`.
+Scripts hold the invariants (reconcile, audit). Judgment — what looks wrong, what needs you — is the session's
+own now: no secretary reads the evidence for it, and no separate watch loops run beside it either; a vanished
+landing or a duplicate worker is this session's own to notice.
 
-Two watches run beside the loop, started once per session and never copied from anywhere: `cc-watch land` and
-`cc-watch orphans`, each detached into a log this session reads (`setsid nohup cc-watch land > land.log 2>&1 &`)
-— a landing that vanished, and a duplicate or reparented worker. `cc-watch --help` has the options.
-
-The pulse runs this loop unattended: where `cc-pulse.timer` is switched on it wakes a planning seat when the
-files say there is something it can act on now — main is red, a row stopped, a queued row could actually be
-started, or an owner ask has sat past its line — and once a day when there is not, which is the tick that sends
-a session to its goals. An orch is never pulsed; its own channel and its own workers wake it. The tick carries
-what the files say (red main, open asks, queued rows, rows in flight) so an empty check is cheap, and each
-session works the order above on its own; nothing here waits to be asked.
+`cc-reconcile`'s tick runs this loop unattended: a queued row that can start, or a row that stopped (`blocked`),
+wakes that repo's planning seat once per state — there is no 2-hourly wake of every session any more. An orch is
+never woken this way; its own channel and its own workers wake it. Each session works the order above on its own;
+nothing here waits to be asked.
 
 ## taking a board row
 The native managed path is opt-in: `cc-config get CC_NATIVE_ADAPTER 0` must return `1`, and the owner must
@@ -93,8 +87,8 @@ before (astra review 2026-09-06, cut 3: the diff is read once — this moves tha
 Leave the row `queued` while a subagent holds it, and record the claim with `cc-board note`. `queued` is the
 only word cc-reconcile leaves alone: a subagent is not a worker, a cc-loop or a track pane, so the row is
 never live to it, and `running` or `waiting` becomes `blocked` once the 10 min grace passes ("no worker, and
-nothing says why"). The cost is that cc-pulse still counts a queued row as work waiting to be picked up — the
-tick reaches this same session, which reads its own note.
+nothing says why"). The cost is that cc-reconcile's tick still counts a queued row as work waiting to be picked
+up — the tick reaches this same session, which reads its own note.
 
 Then commit the worktree, push, and open the PR with `gh` — and close the row out in this order, because the
 status word on its own tells nothing downstream anything:

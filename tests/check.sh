@@ -321,7 +321,6 @@ cc-brief
 cc-native
 cc-notify
 cc-task
-cc-watch
 '
 discover_selfchecks bin tests/selftest.sh "$also_here"
 nosc_says_selfcheck bin "$NOSC" || exit 1

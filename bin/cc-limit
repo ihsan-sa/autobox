@@ -34,7 +34,7 @@
 #
 # RESUMING AN INTERACTIVE SESSION. A headless worker parks and reruns itself at the reset; an interactive session just
 # prints the limit line and sits at its prompt, and the turn it was in the middle of is lost until a human comes back.
-# So: whoever notices the line (cc-pulse on its rounds, or `check` on the run that hit the same limit) calls `record`,
+# So: whoever notices the line (cc-reconcile's wake on its rounds, or `check` on the run that hit the same limit) calls `record`,
 # which writes <pane-id, window, reset-epoch, episode-start, tags> to ~/.cc/state/limit-interrupted (the last two are
 # the FIRST sighting's answers and are never revised — see record()) and arms a ONE-SHOT systemd-run timer at
 # the reset — no new always-on unit. At the reset `resume` types one line into each recorded session through cc-msg
@@ -63,7 +63,7 @@
 # observers, or the pane scan), which is the safe way for this to be wrong.
 # WHAT ELSE THE LIMIT KILLED. A nudge puts a SESSION back on its work; the subagents it had out when the 429 came
 # are gone, and the board rows they were working still carry the `agent` mark that says somebody is doing them.
-# That mark holds a row for six hours (cc-reconcile mark_why; cc-pulse reads its snapshot), so a row whose subagent died at
+# That mark holds a row for six hours (cc-reconcile mark_why), so a row whose subagent died at
 # 09:05Z on 2026-09-05 stayed in flight until six hours after its mark was written — nearly four hours after the
 # limit had lifted, offered to nobody the whole time. So `resume` publishes the episode
 # it just ended to ~/.cc/state/limit-resumed, "<started>\t<reset>\t<resumed>", one line, latest episode wins.
@@ -112,7 +112,7 @@ PANE_RE='usage limit reached|out of usage credits|limit will reset|limit reached
 TAIL=15   # the pane's LAST 15 visible lines (capture-pane piped through tail). A session STOPPED by the limit
           # shows that line just above its input box; higher up may be anything — including a file that quotes
           # the wording. Narrow beats clever: the window is read again at the reset, before anything is typed.
-WORK_MARK='esc to interrupt'      # Claude Code's footer for the whole of a turn (cc-msg, cc-pulse and cc-started read the same)
+WORK_MARK='esc to interrupt'      # Claude Code's footer for the whole of a turn (cc-msg, cc-reconcile and cc-started read the same)
 SETTLE="${CC_LIMIT_SETTLE:-2}"    # after the Escape that ends a dead turn, before cc-msg reads that pane
 stamp(){   # the shared stamp's five fields. Split by awk and NOT by `IFS=$'\t' read`: tab is IFS WHITESPACE, so bash
            # folds "\t\t" into one delimiter — and the stamp of 2026-09-04 named no model, so its empty field 4 slid
@@ -295,13 +295,13 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
   # to print — "LIMIT 0", and the owner is told the limit resumes at 00:00Z (review of #171).
   local pane="$1" win="$2" cap line at old p u how rolled from_pane=0
   # A window id or a window name is accepted and resolved to the PANE id first: the record is keyed on the pane, so
-  # cc-pulse (which holds window ids) and scan (which holds pane ids) write one record for a session, not two — and
+  # cc-reconcile's wake (which holds window ids) and scan (which holds pane ids) write one record for a session, not two — and
   # two records for one session is two nudges.
   p=$(tmux display-message -p -t "$pane" '#{pane_id}' 2>/dev/null | head -1); case "$p" in %[0-9]*) pane="$p";; esac
   cap=$(tmux capture-pane -p -t "$pane" 2>/dev/null | tail -n "$TAIL")   # the LAST lines: -S sets a history start, it does not bound the read
   line=$(grep -iE "$PANE_RE" <<<"$cap" | tail -1); [ -n "$line" ] || return 1
   # Past this line the pane IS sitting on the limit, and every "no" below is exit 2, not 1: a caller that read a
-  # plain failure as "nothing wrong here" would type at a limited session, which is what cc-pulse must not do.
+  # plain failure as "nothing wrong here" would type at a limited session, which is what the wake must not do.
   nudged_recently "$pane" && return 2
   if ! corroborated "$cap" "$win"; then
     # Nothing corroborates the line. For its first hour that means "cc-model has not judged it yet" — exit 2, no
@@ -365,7 +365,7 @@ record(){   # $1 pane id, or a window id/name to resolve  $2 window name
 live_claude(){   # is there an interactive `claude` ANYWHERE under pane pid $1? The DIRECT-child test was wrong here in
                  # the one case that matters: a `cc-handoff --overlap` successor runs `bash -c '… cc __runnext …'`,
                  # so its claude is a GRANDCHILD, and calling that session dead is never recording the very session
-                 # this file exists to rescue (review of #171). Same subtree walk cc-msg and cc-pulse make; `-p` is
+                 # this file exists to rescue (review of #171). Same subtree walk cc-msg and cc-reconcile make; `-p` is
                  # excluded because a headless worker parks and reruns itself and has no prompt to type into.
   local pid
   for pid in $(ps -eo pid=,ppid=,comm= | awk -v root="${1:-0}" '
@@ -561,7 +561,7 @@ EOF
   t 'a pane that shows no limit at all is not a record' \
     "$([ -e "$d/.cc/state/limit-interrupted" ] && echo yes || echo no)" no
 
-  # cc-pulse holds WINDOW ids and `scan` holds pane ids: one session must not become two records, which is two nudges.
+  # cc-reconcile's wake holds WINDOW ids and `scan` holds pane ids: one session must not become two records, which is two nudges.
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/%7"
   printf '%s\n' '%7' > "$d/panes/@5.id"
   printf '%s\t%s\t%s\t%s\n' "$((t1 + 1800))" iso "$t1" fable > "$d/.cc/state/claude-limit"
@@ -597,7 +597,7 @@ EOF
   t 'a backoff GUESS is not a reset: the time the PANE names is recorded, not the guess' \
     "$(cut -f3 "$d/.cc/state/limit-interrupted" 2>/dev/null)" $((t3 + 1800))
 
-  # THE EXIT CODE IS A CONTRACT (finding 4): cc-pulse reads it to decide whether that pane may be typed at, so
+  # THE EXIT CODE IS A CONTRACT (finding 4): cc-reconcile's wake reads it to decide whether that pane may be typed at, so
   # "limited, and I am not recording it" must not look like "nothing to see here".
   rm -f "$d/.cc/state/limit-interrupted" "$d/.cc/state/limit-nudged"
   printf 'Claude usage limit reached. Your limit will reset in 30 minutes\n> \n' > "$d/panes/@1"
