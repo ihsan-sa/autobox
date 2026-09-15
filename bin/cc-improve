@@ -31,7 +31,9 @@ copied out of a doc. Both arms run on the same pinned trace with the same replay
 between them is the patch.
 
 THE LEDGER is `~/.cc/state/<repo>/improve/trials.tsv`, one line per trial, kept or reverted:
-  at · name · base · baseline score line · candidate score line · verdict · reason
+  at · name · base · baseline score line · candidate score line · verdict · reason · trace version
+A line from before the trace-version column has seven fields and was scored on a v1 trace; it reads as `v1`.
+Scores on a v1 and a v2 trace are not comparable (cc-replay's docstring says why).
 The score lines are cc-replay's own, verbatim, so a kept change's PR body can carry its number next to the
 baseline it beat. A reverted trial's line stays too — those are the research record.
 
@@ -235,14 +237,26 @@ def resolve_base(repo, given=""):
     return o.strip()
 
 
+LEDGER_COLUMNS = ("at", "name", "base", "baseline", "candidate", "verdict", "reason", "trace")
+
+
+def trace_version(trace):
+    """`v1` or `v2` as the trace file names itself, `-` when there is none to read."""
+    try:
+        with open(trace) as f:
+            return f"v{json.load(f)['version']}"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "-"
+
+
 def read_ledger(repo):
     rows = []
     try:
         with open(ledger_path(repo)) as f:
             for line in f:
                 c = line.rstrip("\n").split("\t")
-                if len(c) == 7:
-                    rows.append(dict(zip(("at", "name", "base", "baseline", "candidate", "verdict", "reason"), c)))
+                if len(c) in (7, 8):
+                    rows.append(dict(zip(LEDGER_COLUMNS, c + ["v1"] * (8 - len(c)))))
     except OSError:
         pass
     return rows
@@ -251,8 +265,7 @@ def read_ledger(repo):
 def append_ledger(repo, row):
     """One line, appended, whatever happened. A trial that ends without one is a trial nobody can read back."""
     os.makedirs(improve_dir(repo), exist_ok=True)
-    line = "\t".join(str(row[k]).replace("\t", " ").replace("\n", " ")
-                     for k in ("at", "name", "base", "baseline", "candidate", "verdict", "reason"))
+    line = "\t".join(str(row[k]).replace("\t", " ").replace("\n", " ") for k in LEDGER_COLUMNS)
     with open(ledger_path(repo), "a") as f:
         f.write(line + "\n")
     return line
@@ -293,11 +306,12 @@ def trial(repo, name, base_sha="", trace="", prepare=PREPARE, conflicts=CONFLICT
     except Unscoreable as e:
         verdict, reason = "revert", str(e)
     row = {"at": at, "name": name, "base": short_base(base), "verdict": verdict, "reason": reason,
-           "baseline": baseline["line"] if baseline else "-", "candidate": candidate["line"] if candidate else "-"}
+           "baseline": baseline["line"] if baseline else "-", "candidate": candidate["line"] if candidate else "-",
+           "trace": trace_version(trace) if trace else "-"}
     line = append_ledger(repo, row)
     with open(f"{d}/result", "w") as f:
         f.write(f"tried    {at}\nbase     {row['base']}\ntrace    {os.path.basename(trace) if trace else '-'} "
-                f"(--prepare {prepare} --conflicts {conflicts})\n"
+                f"({row['trace']}, --prepare {prepare} --conflicts {conflicts})\n"
                 f"baseline {row['baseline']}\ncandidate {row['candidate']}\nverdict  {verdict} — {reason}\n")
     return row, line
 
@@ -521,8 +535,9 @@ def cmd_selfcheck():
         check("...and it wrote no candidate score it does not have", r3["candidate"] == "-")
 
         rows = read_ledger(repo)
-        check("the ledger holds one seven-column line per trial, in the order they ran",
-              len(rows) == 3 and [r["name"] for r in rows] == ["a-keeps", "b-reverts", "c-rots"])
+        check("the ledger holds one eight-column line per trial, in the order they ran, naming the trace version",
+              len(rows) == 3 and [r["name"] for r in rows] == ["a-keeps", "b-reverts", "c-rots"]
+              and [r["trace"] for r in rows] == ["v1", "v1", "v1"])
         check("...every line names the base it was tried on, RESOLVED — twelve characters of the SHA the ref "
               "named, never twelve characters of the refname",
               all(r["base"] == head[:12] for r in rows) and len(head) == 40 and head[:12] != "HEAD")
@@ -531,7 +546,17 @@ def cmd_selfcheck():
         with open(ledger_path(repo)) as f:
             raw = f.read().splitlines()
         check("...and a line is tab-separated with no tab or newline smuggled into a field",
-              all(len(l.split("\t")) == 7 for l in raw) and len(raw) == 3)
+              all(len(l.split("\t")) == 8 for l in raw) and len(raw) == 3)
+
+        # The trace column, on fixtures of its own: a line from before it reads as v1, a v2 trace names itself.
+        os.makedirs(improve_dir("old-ledger"), exist_ok=True)
+        with open(ledger_path("old-ledger"), "w") as f:
+            f.write("\t".join(["2026-09-08T17:17:30Z", "x", "e7b25da0b4af", "score 1.0", "score 1.0", "revert", "flat"]) + "\n")
+        with open(f"{home}/trace-v2.json", "w") as f:
+            json.dump(dict(fixture_trace(), version=2), f)
+        check("a seven-column line from before the trace column reads as scored on v1; a v2 trace names v2",
+              [r["trace"] for r in read_ledger("old-ledger")] == ["v1"] and trace_version(f"{home}/trace-v2.json") == "v2"
+              and trace_version(f"{home}/gone.json") == "-")
 
         # Determinism: the same proposal on the same trace scores the same, twice, but for the stamp.
         os.unlink(f"{proposals_dir(repo)}/a-keeps/result")

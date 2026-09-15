@@ -5,7 +5,10 @@
       Build the trace: which PRs were queued when, what their gates and reviews answered, how long they took,
       what a repair round pushed and when. Read from the landing queue's own ledger (queue.log), the sweeps'
       journal (journalctl --user), the gate logs under $TMPDIR, the reviewer transcripts, and `gh pr view`.
-      Reads only. Prints what it could not recover and how the gap was filled.
+      Reads only. Writes a v2 trace and prints its event counts, then what it could not recover and how the gap was filled.
+  cc-replay extract --from OLD --out FILE
+      Make a v1 trace v2 without re-reading what may be gone since (gate logs, transcripts): add the three event
+      classes from the journal and the checkout's own objects, keep the rest as it was read then.
   cc-replay score --candidate PATH --trace FILE [--prepare N] [--conflicts history|files|none] [--verbose] [--keep]
       Import PATH as a module, stand the world in for it from the trace, and drive its own `queue` and `work`
       commands through the trace's arrivals on a VIRTUAL clock: a gate or a review parks its thread until the
@@ -15,13 +18,13 @@
       input prints the same bytes every time. --verbose writes the world's log and the candidate's own output to
       stderr; --keep leaves the temp root in place to read afterwards.
   cc-replay selfcheck
-      The virtual clock, the conflict model, the trace loader and determinism, on fixtures of its own.
+      The virtual clock, the conflict model, the trace loader, determinism and the three v2 event classes, on fixtures of its own.
 
 THE SCORE is the median minutes from a PR's first `queued` to its merge in the replay, over the PRs that merged;
 suites run, paid reviews bought, repair rounds dispatched and PRs left unmerged are the secondary columns. A
 `history` line gives history's median over the PRs both merged, for calibration. The per-PR table's last column
-says how history merged each PR: `queue` (the landing queue did) or `hand` (a person did, outside it — the replay
-lands one of those only where a LAND was recorded).
+says how history merged each PR: `queue` (the landing queue did) or `hand` (a person did, outside it — on a v1
+trace the replay lands one of those only where a LAND was recorded; on v2 see TRACE V2).
 
 WHAT THE WORLD ANSWERS, and from where:
   · a gate returns its recorded rc after its recorded duration for that PR (else the trace median for that gate);
@@ -39,6 +42,18 @@ WHAT THE WORLD ANSWERS, and from where:
   · green records history spent are seeded for every head of the PR they were spent on, from its first arrival;
   · git is answered from the trace — file lists, per-file churn, a synthetic merge-base and diff per change —
     never from a checkout, so a decision that needs file CONTENTS (comment-only detection) reads every file as code.
+
+TRACE V2 adds three event classes, and on a v2 trace (only there: a v1 trace scores to the bytes it always did):
+  · memo: each landing's recorded memo hits and misses. The world answers the plumbing merge_result asks
+    (rev-parse X^{commit}, merge-base --is-ancestor, merge-tree, commit-tree, rev-list --count) from content
+    sets, so a memo is keyed the way the candidate itself keys it — by head or by projected tree — and hits or
+    misses as it would. Report line 2 counts `memo-hits` and `memo-misses`;
+  · stops: a landing stopped `behind` or on a `conflict`, with its head and how far behind the base it stood.
+    `conflicted` counts only real conflicts; a PR stopped merely behind is refused by `gh pr merge` with GitHub's
+    `--auto` words whenever the replay has it behind at all (`behind-refused`), and `gh pr update-branch` merges
+    the base in: a new head, the same change, UPDATE_SECS on the clock (`base-updates`);
+  · person: a PR a person merged outside the queue merges at that time (`person-merged`) unless the candidate
+    lands it first. The median then covers those PRs too, so a v2 score is not comparable with a v1 score.
 
 WHAT IT CANNOT SCORE: a suite made faster or slower, a reviewer made better or worse, or anything that depends on
 what a file contains rather than which files changed. It scores the LANDING — order, parallelism, what is bought,
@@ -61,6 +76,7 @@ REVIEW_MODEL_RE = re.compile(r"^claude-")        # a verdict signed by a model w
 DEFAULTS = {"gate": {"check.sh": 120, "check-extra.sh": 180, "selftest.sh": 900}, "review": 480, "fix": 1500}
 GATE_MIN, GATE_MAX = 20, 4 * 3600               # a log span outside this is not one run of one gate
 GATE_SPAN_CAP = 3                               # nor is one past this many times the gate's median
+UPDATE_SECS = 30                                # v2: what `gh pr update-branch` takes; nothing recorded it
 
 
 def stamp(e):
@@ -274,6 +290,103 @@ def repo_of_pr(pr, facts):
     return hits.pop() if len(hits) == 1 else ""
 
 
+# ── trace v2: the three event classes v1 could not see ──────────────────────────────────────────────────
+PREPARE_HEADER = re.compile(r"^gating and reading \d+ queued job")
+STOP_BEHIND = re.compile(r"is not mergeable yet|base branch policy prohibits")
+STOP_CONFLICT = re.compile(r"conflicts with \S+ — rebase|merge conflicts")
+
+
+def memo_facts(lines, prs):
+    """{(repo, pr): [(at, hit)]} — whether a sweep's serial walk spent the gate memo its own prepare phase left. A
+    hit prints `run for this sweep by the prepare phase`; a miss is a PR whose gates passed twice in one sweep that
+    ran a prepare phase, once in the pool and once again in the walk (a sweep is one process, so one pid). A walk
+    that missed its memo and then went red is not counted: the red line does not say which phase ran it."""
+    out, passes, prep, repo_of = {}, {}, set(), {}
+    for at, pid, text in lines:
+        m = LANDING_LINE.match(text)
+        if m:
+            repo_of[pid] = m.group(1)
+        if PREPARE_HEADER.match(text):
+            prep.add(pid)
+        m = GATE_LINE.search(text)
+        if not m:
+            continue
+        pr = int(m.group(2))
+        repo = repo_of.get(pid) if (repo_of.get(pid), pr) in prs else repo_of_pr(pr, dict.fromkeys(prs))
+        if not repo:
+            continue
+        if "by the prepare phase" in text:
+            out.setdefault((repo, pr), []).append((at, True))
+        elif m.group(3):
+            passes.setdefault((pid, repo, pr), []).append(at)
+    for (pid, repo, pr), ats in passes.items():
+        if pid in prep and len(ats) >= 2:
+            out.setdefault((repo, pr), []).append((max(ats), False))
+    return out
+
+
+def behind_by(root, base, head, at):
+    """How many commits the base held at `at` that `head` did not, read from the checkout's own objects — read-only,
+    None when a head or the base at that time is not there."""
+    rc, o = sh(["git", "rev-parse", "--verify", "-q", f"{head}^{{commit}}"], cwd=root)
+    if rc:
+        return None
+    full = o.strip()
+    rc, o = sh(["git", "rev-list", "-1", f"--before=@{at}", f"origin/{base}"], cwd=root)
+    if rc or not o.strip():
+        return None
+    rc, o = sh(["git", "rev-list", "--count", f"{full}..{o.strip()}"], cwd=root)
+    return int(o.strip()) if rc == 0 and o.strip().isdigit() else None
+
+
+def stops_of(l, root):
+    """The landings history stopped short of the merge on mergeability, not on a gate: `behind` (GitHub refused the
+    merge, the queue printed "not mergeable yet") or `conflict`, each with the head it stood on and how far behind
+    the base that head was then."""
+    out = []
+    for d in l.get("dones") or []:
+        if re.search(r"gate \S+ did not pass", d["short"]):
+            continue
+        kind = "behind" if STOP_BEHIND.search(d["short"]) else "conflict" if STOP_CONFLICT.search(d["short"]) else ""
+        if kind:
+            at = epoch(d["at"])
+            head = next((h["sha"] for h in reversed(l["heads"]) if epoch(h["at"]) <= at), l["heads"][0]["sha"])
+            out.append({"at": d["at"], "kind": kind, "head": head, "behind": behind_by(root, l.get("base") or "main", head, at)})
+    return out
+
+
+def upgrade(trace, lines):
+    """A v1 trace made v2, in place: each landing gains `memo` (history's memo hits and misses), `stops` (its
+    mergeability stops) and `person` (the time a person merged it outside the queue, or null); `conflicted` is
+    re-read from the stops, so a PR merely behind is no longer counted as one that conflicted."""
+    until = epoch(trace.get("until")) or int(time.time())
+    prs = {(l["repo"], l["pr"]) for l in trace["landings"]}
+    memo = memo_facts([ln for ln in lines if ln[0] <= until], prs)
+    for l in trace["landings"]:
+        l["memo"] = [{"at": stamp(at), "hit": hit} for at, hit in sorted(memo.get((l["repo"], l["pr"]), []))]
+        l["stops"] = stops_of(l, repo_root_of(l["repo"]))
+        l["conflicted"] = any(s["kind"] == "conflict" for s in l["stops"])
+        l["person"] = {"at": l["merged"]} if l.get("merged") and not l.get("queue_merged") else None
+    ls = trace["landings"]
+    counts = {"memo_hits": sum(m["hit"] for l in ls for m in l["memo"]),
+              "memo_misses": sum(not m["hit"] for l in ls for m in l["memo"]),
+              "stops_behind": sum(s["kind"] == "behind" for l in ls for s in l["stops"]),
+              "stops_conflict": sum(s["kind"] == "conflict" for l in ls for s in l["stops"]),
+              "person": sum(1 for l in ls if l["person"])}
+    gaps = [g for g in trace.get("gaps") or [] if not re.search(r"conflicted in history|merged OUTSIDE the queue", g)]
+    gaps.append(f"{sum(1 for l in ls if l['conflicted'])} PRs conflicted in history and "
+                f"{sum(1 for l in ls if any(s['kind'] == 'behind' for s in l['stops']))} were stopped merely behind; "
+                f"--conflicts history conflicts only the first, and only the second are refused as behind")
+    gaps.append(f"{sum(1 for l in ls for s in l['stops'] if s['behind'] is None)} of "
+                f"{counts['stops_behind'] + counts['stops_conflict']} stops have no distance behind (the head or the "
+                f"base of that hour is not in the checkout)")
+    gaps.append(f"{counts['person']} PRs a person merged outside the queue merge in the replay at their history "
+                f"time, unless the candidate lands them first")
+    gaps.append("a memo the serial walk missed and then went red on is not in `memo`: the red line does not name its phase")
+    trace.update(version=2, counts=counts, gaps=gaps)
+    return counts
+
+
 def gate_log_spans(tmpdir):
     """{(repo, pr, gate-basename): seconds} from each gate log's birth to its last write. The file is truncated and
     rewritten on every run of that gate for that PR, and truncation keeps the inode, so the span covers EVERY run:
@@ -468,12 +581,22 @@ def build_landing(repo, pr, events, gh, jf, spans, rspans, until):
             "unkeyed_heads": unkeyed, "queue_merged": bool(jf.get("queue_merged"))}
 
 
+def print_counts(out, trace):
+    c = trace["counts"]
+    print(f"wrote {out}: trace v{trace['version']}, {len(trace['landings'])} landings, "
+          f"{sum(len(l['arrivals']) for l in trace['landings'])} arrivals")
+    print(f"  memo: {c['memo_hits']} hit, {c['memo_misses']} missed · stops: {c['stops_behind']} behind, "
+          f"{c['stops_conflict']} conflict · person merges: {c['person']}")
+
+
 def cmd_extract(argv):
-    repos, since, until, out = [], 0, int(time.time()), ""
+    repos, since, until, out, old = [], 0, int(time.time()), "", ""
     rest = list(argv)
     while rest:
         a = rest.pop(0)
-        if a == "--repo" and rest:
+        if a == "--from" and rest:
+            old = rest.pop(0)
+        elif a == "--repo" and rest:
             repos.append(rest.pop(0))
         elif a == "--since" and rest:
             since = epoch(rest.pop(0))
@@ -487,6 +610,14 @@ def cmd_extract(argv):
     if not out:
         print("cc-replay extract: --out FILE is required", file=sys.stderr)
         return 2
+    if old:     # the v1 half is kept as it was read then: its gate spans and transcripts may be gone since
+        trace = load_trace(old)
+        upgrade(trace, journal_lines(epoch(trace["since"])))
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(trace, f, indent=1, sort_keys=True)
+        print_counts(out, trace)
+        return 0
     since = since or until - 86400
     events = ledger_events(f"{LANDQ}/queue.log", since, until)
     prs = sorted({(e["repo"], e["pr"]) for e in events if e["kind"] == "queued" and (not repos or e["repo"] in repos)})
@@ -494,7 +625,8 @@ def cmd_extract(argv):
         print("cc-replay extract: no `queued` line in that window", file=sys.stderr)
         return 1
     print(f"extracting {len(prs)} PR(s) queued between {stamp(since)} and {stamp(until)}", file=sys.stderr)
-    jf = journal_facts(journal_lines(since))
+    jlines = journal_lines(since)
+    jf = journal_facts(jlines)
     spans = gate_log_spans(tempfile.gettempdir())
     rspans = review_spans()
     landings, gaps, missing_gh = [], [], []
@@ -559,20 +691,21 @@ def cmd_extract(argv):
                     f"treated as a one-file change with no history")
     trace = {"version": 1, "since": stamp(since), "until": stamp(until), "repos": repos_out, "medians": medians,
              "landings": landings, "gaps": gaps}
+    upgrade(trace, jlines)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w") as f:
         json.dump(trace, f, indent=1, sort_keys=True)
-    print(f"wrote {out}: {len(landings)} landings, {sum(len(l['arrivals']) for l in landings)} arrivals")
+    print_counts(out, trace)
     print("could not recover, and how it was filled:")
-    for g in gaps:
+    for g in trace["gaps"]:
         print(f"  · {g}")
     return 0
 
 
 def load_trace(path):
     t = read_json(path)
-    if not isinstance(t, dict) or t.get("version") != 1 or not isinstance(t.get("landings"), list):
-        raise SystemExit(f"cc-replay: {path} is not a v1 trace")
+    if not isinstance(t, dict) or t.get("version") not in (1, 2) or not isinstance(t.get("landings"), list):
+        raise SystemExit(f"cc-replay: {path} is not a v1 or v2 trace")
     for l in t["landings"]:
         for k in ("repo", "pr", "arrivals", "heads", "files"):
             if k not in l:
@@ -580,6 +713,7 @@ def load_trace(path):
         l.setdefault("verdicts", []); l.setdefault("fixes", []); l.setdefault("gates", {}); l.setdefault("red", {})
         l.setdefault("green", []); l.setdefault("review_secs", []); l.setdefault("perfile", {}); l.setdefault("base", "main")
         l.setdefault("branch", ""); l.setdefault("merged", ""); l.setdefault("title", ""); l.setdefault("conflicted", False)
+        l.setdefault("memo", []); l.setdefault("stops", []); l.setdefault("person", None)
     t.setdefault("medians", dict(DEFAULTS)); t["medians"].setdefault("gate", dict(DEFAULTS["gate"]))
     t["medians"].setdefault("review", DEFAULTS["review"]); t["medians"].setdefault("fix", DEFAULTS["fix"])
     t.setdefault("repos", {})
@@ -832,11 +966,21 @@ class World:
         self.digest, self.mark, self.v2_markers = change_digest, "cc-land-review", True   # the candidate's own, once loaded
         self.mtimes = {}
         self.rearm, self.work_wanted = [], False
-        self.n = {"suites": 0, "gates": 0, "reviews": 0, "repairs": 0, "merges": 0, "conflicts": 0}
+        self.n = {"suites": 0, "gates": 0, "reviews": 0, "repairs": 0, "merges": 0, "conflicts": 0,
+                  "memo_hits": 0, "memo_misses": 0, "behind": 0, "updates": 0, "person": 0}
         self.calls = []
+        # v2 only, so a v1 trace scores to the bytes it always did: git plumbing answered from CONTENT SETS. A commit
+        # holds a set of changes ("pr:gen"); the base tip holds every change merged so far, a head the changes merged
+        # before its base plus its own, a merge the union; a tree is named by its set. So merge_result builds the
+        # merge a real checkout would, and a memo keyed by that tree hits or misses as it would have. The brief:
+        # "memos keyed the way cc-land keyed them at that revision" — the candidate's own code picks the key.
+        self.v2 = trace.get("version", 1) >= 2
+        self.changes = []       # [(repo, "pr:gen")], in step with self.merges
+        self.commits, self.trees = {}, {}
+        self.memo_counted, self.sweep_at = set(), 0
         for key, l in self.prs.items():
             self.state[key] = {"merged_at": None, "comments": [], "base_seq": 0, "fix": None, "fix_gens": 0,
-                               "fix_pushes": [], "extra_gens": 0}
+                               "fix_pushes": [], "extra_gens": 0, "updates": []}
 
     # -- where a path points --
     def repo_of_path(self, path):
@@ -875,17 +1019,21 @@ class World:
     def head(self, key, at=None):
         l, st, at = self.prs[key], self.state[key], self.clock.now if at is None else at
         cur = l["heads"][0]
+        cur_at = epoch(cur["at"])
         for h in l["heads"]:
             if h["via"] == "fix":
                 continue
             if epoch(h["at"]) <= at and h["gen"] >= cur["gen"]:
-                cur = h
+                cur, cur_at = h, epoch(h["at"])
         fix_heads = [h for h in l["heads"] if h["via"] == "fix"]
         for i, pushed_at in enumerate(st["fix_pushes"]):
             if pushed_at <= at:
                 h = fix_heads[i] if i < len(fix_heads) else {"sha": hexname(key, "fix", i), "gen": (fix_heads[-1]["gen"] if fix_heads else cur["gen"]) + 1 + (i - len(fix_heads))}
                 if h["gen"] >= cur["gen"]:
-                    cur = h
+                    cur, cur_at = h, pushed_at
+        for u_at, sha, gen in st["updates"]:      # the base merged in (v2): the same change on a new head
+            if u_at <= at and gen >= cur["gen"] and u_at >= cur_at:
+                cur, cur_at = {"sha": sha, "gen": gen}, u_at
         return cur["sha"], cur["gen"]
 
     def verdict_for(self, key, sha, gen):
@@ -937,6 +1085,84 @@ class World:
     def rebase(self, key):
         self.state[key]["base_seq"] = len(self.merges)
 
+    def behind(self, key):
+        """How many merges into its repo the PR's base has not seen, in the replay's order."""
+        st = self.state[key]
+        return sum(1 for seq, repo, pr, _, _ in self.merges if repo == key[0] and seq >= st["base_seq"] and (repo, pr) != key)
+
+    def refused_behind(self, key):
+        """v2: GitHub refuses the merge of a PR history saw stopped merely behind, whenever the replay has it behind
+        at all — the rule it enforces is binary. Only those PRs, like --conflicts history: a queue that merges behind
+        branches every day says GitHub does not refuse every one. The distance history recorded is calibration only."""
+        return self.v2 and any(s.get("kind") == "behind" for s in self.prs[key].get("stops") or []) and self.behind(key) > 0
+
+    def land(self, key, why="merged"):
+        repo, pr = key
+        _, gen = self.head(key)
+        self.state[key]["merged_at"] = self.clock.now
+        self.merges.append((len(self.merges), repo, pr, self.clock.now, {p for _, p in self.prs[key]["files"]}))
+        self.changes.append((repo, f"{pr}:{gen}"))
+        self.tip[repo] = hexname(repo, "tip", len(self.merges))
+        self.commits[self.tip[repo]] = frozenset(c for r, c in self.changes if r == repo)
+        self.n["merges"] += 1
+        self.log(f"{stamp(self.clock.now)} {why} {repo}#{pr}")
+
+    def person_merge(self, key):
+        """v2: a PR a person merged by hand in history is merged at that time here too. The brief: "a hand merge
+        stays the person's action at its time unless the candidate's own logic lands the PR earlier"."""
+        if self.state[key]["merged_at"] is not None:     # the candidate landed it earlier: not the person's
+            return
+        self.n["person"] += 1
+        self.land(key, "a person merged")
+
+    def content(self, repo, sha):
+        """The set of changes a commit holds (v2), or None for a commit nobody made."""
+        sha = (sha or "").strip()
+        if sha in ("HEAD", self.base_of(repo), f"origin/{self.base_of(repo)}"):
+            sha = self.tip.get(repo) or hexname(repo, "tip", 0)
+        if sha in self.commits:
+            return self.commits[sha]
+        if sha == hexname(repo, "tip", 0):
+            return frozenset()
+        key = self.key_of_sha(repo, sha) if sha else None
+        if not key:
+            return None
+        st = self.state[key]
+        gens = [(h["sha"], h["gen"]) for h in self.prs[key]["heads"]] + [(s, g) for _, s, g in st["updates"]]
+        gen = next((g for s, g in gens if sha.startswith(s) or s.startswith(sha[:12])), None)
+        if gen is None:
+            gen = self.head(key)[1]
+        return frozenset([c for r, c in self.changes[:st["base_seq"]] if r == repo] + [f"{key[1]}:{gen}"])
+
+    def plumbing(self, repo, sub, args):
+        """v2: what merge_result asks — rev-parse X^{commit}, merge-base --is-ancestor, merge-tree, commit-tree —
+        and rev-list --count A..B, answered from content sets. None for anything else."""
+        revs = [a for a in args if not a.startswith("-")]
+        if sub == "rev-parse" and revs and revs[-1].endswith("^{commit}"):
+            what = revs[-1][:-len("^{commit}")]
+            if self.content(repo, what) is None:
+                return 1, ""
+            sha = (self.tip.get(repo) or hexname(repo, "tip", 0)) if what in ("HEAD", f"origin/{self.base_of(repo)}") else what
+            return 0, sha + "0" * max(0, 40 - len(sha)) + "\n"
+        if sub == "merge-base" and "--is-ancestor" in args and len(revs) >= 2:
+            a, b = self.content(repo, revs[-2]), self.content(repo, revs[-1])
+            return (128, "fatal: not a commit") if a is None or b is None else (0 if a <= b else 1, "")
+        if sub == "merge-tree" and len(revs) >= 2:
+            a, b = self.content(repo, revs[-2]), self.content(repo, revs[-1])
+            if a is None or b is None:
+                return 128, "fatal: not a commit"
+            tree = hexname("tree", *sorted(a | b))
+            self.trees[tree] = a | b
+            return 0, tree + "\n"
+        if sub == "commit-tree" and args and args[0] in self.trees:
+            sha = hexname("commit", args[0], *[args[i + 1] for i, a in enumerate(args[:-1]) if a == "-p"])
+            self.commits[sha] = self.trees[args[0]]
+            return 0, sha + "\n"
+        if sub == "rev-list" and "--count" in args and revs and ".." in revs[-1]:
+            a, b = (self.content(repo, x) for x in revs[-1].split("..", 1))
+            return 0, f"{len(b - a) if a is not None and b is not None else 0}\n"
+        return None
+
     # -- the answers --
     def gh(self, argv, cwd):
         repo = self.repo_of_path(cwd)
@@ -961,7 +1187,24 @@ class World:
                      "mergeCommit": {"oid": hexname(key, "merge")} if merged else None,
                      "mergedAt": stamp(st["merged_at"]) if merged else None,
                      "comments": [dict(c) for c in st["comments"]]}
+            if self.v2:
+                facts["mergeStateStatus"] = ("MERGED" if merged else "DIRTY" if facts["mergeable"] == "CONFLICTING"
+                                             else "BEHIND" if self.behind(key) else "CLEAN")
             return 0, json.dumps({k: facts.get(k) for k in fields} if fields else facts)
+        if argv[2] == "update-branch" and self.v2:
+            # GitHub's Update branch button: the base merged into the branch, a new head holding the same change.
+            if st["merged_at"] is not None or self.conflicting(key):
+                return 1, "X Cannot update PR branch due to conflicts" if st["merged_at"] is None else "X PR is merged"
+            if not self.behind(key):
+                return 0, "! PR branch already up-to-date\n"
+            self.clock.sleep(UPDATE_SECS)
+            _, gen = self.head(key)
+            sha = hexname(key, "update", len(st["updates"]))[:12]
+            self.rebase(key)
+            st["updates"].append((self.clock.now, sha, gen))
+            self.n["updates"] += 1
+            self.log(f"{stamp(self.clock.now)} updated {repo}#{pr} with its base: head {sha}")
+            return 0, "✓ PR branch updated\n"
         if argv[2] == "comment":
             body = argv[argv.index("--body") + 1] if "--body" in argv else ""
             st["comments"].append({"body": body, "viewerDidAuthor": True, "createdAt": stamp(self.clock.now)})
@@ -976,11 +1219,12 @@ class World:
             if self.conflicting(key):
                 self.n["conflicts"] += 1
                 return 1, "GraphQL: Pull Request has merge conflicts (mergePullRequest)"
-            st["merged_at"] = self.clock.now
-            self.merges.append((len(self.merges), repo, pr, self.clock.now, {p for _, p in l["files"]}))
-            self.tip[repo] = hexname(repo, "tip", len(self.merges))
-            self.n["merges"] += 1
-            self.log(f"{stamp(self.clock.now)} merged {repo}#{pr}")
+            if self.refused_behind(key):
+                self.n["behind"] += 1
+                self.log(f"{stamp(self.clock.now)} refused {repo}#{pr}: {self.behind(key)} merge(s) behind")
+                return 1, (f"X Pull request #{pr} is not mergeable: the base branch policy prohibits the merge.\n"
+                           "To have the pull request merged after all the requirements have been met, add the `--auto` flag.")
+            self.land(key)
             return 0, ""
         return 1, "gh: not answered here"
 
@@ -992,6 +1236,9 @@ class World:
         tip = self.tip.get(repo) or hexname(repo, "tip", 0)
         if sub in ("fetch", "pull", "worktree"):
             return 0, ""
+        answered = self.plumbing(repo, sub, args) if self.v2 else None
+        if answered is not None:
+            return answered
         if sub == "ls-remote":
             out = []
             for ref in args[1:]:
@@ -1014,6 +1261,8 @@ class World:
             if what == "HEAD^{tree}":
                 if key and key in self.prs:
                     sha, gen = self.head(key)
+                    if any(s == sha for _, s, _ in self.state[key]["updates"]):
+                        return 0, hexname(key, "tree", gen, sha) + "\n"    # a tree no recorded green run was on
                     return 0, self.tree_id(key, gen) + "\n"
                 return 0, hexname(repo, "basetree", tip) + "\n"
             if what in ("HEAD", f"origin/{base}"):
@@ -1078,6 +1327,9 @@ class World:
                     return (r, p)
             for i in range(self.state[(r, p)]["fix_pushes"].__len__()):
                 if sha.startswith(hexname((r, p), "fix", i)):
+                    return (r, p)
+            for _, u, _ in self.state[(r, p)]["updates"]:
+                if sha.startswith(u):
                     return (r, p)
         return None
 
@@ -1221,12 +1473,31 @@ def load_candidate(path, root, world, clock, verbose_log):
         real_write(p, obj)
         world.mtimes[p] = clock.now
 
+    real_memo = ns.get("gate_memo")
+
+    def gate_memo(repo, pr, key, *a):
+        """v2's memo count: a hit is a memo spent; a miss is none for this key while one was filed for this PR in
+        this sweep under another — the prepare phase gated a tree the serial walk did not ask about."""
+        memo_dir = ns["gate_dir"]() if "gate_dir" in ns else f"{ns['LANDQ']}/gates"
+        # >= : a memo filed in the second this sweep started is this sweep's. One the previous sweep left unspent
+        # in that same second would count too; accepted, as it needs a sweep to end and the next to start in it.
+        filed = [p for p in glob.glob(f"{memo_dir}/{repo}-{pr}-*.json")
+                 if world.mtimes.get(p, -1) >= world.sweep_at and (p, world.mtimes.get(p)) not in world.memo_counted]
+        got = real_memo(repo, pr, key, *a)
+        if got or filed:
+            world.n["memo_hits" if got else "memo_misses"] += 1
+            world.memo_counted.update((p, world.mtimes.get(p)) for p in filed)
+            world.log(f"{stamp(clock.now)} memo {'hit' if got else 'MISS'} {repo}#{pr} at {key[:12]}")
+        return got
+
     ns.update(threading=FakeThreading(clock), time=FakeTime(clock), os=FakeOs(world, world.mtimes, clock),
               sh=world.sh, run_gate=lambda argv, cwd, log, env: world.gate(argv, cwd), write_atomic=write_atomic,
               board=world.board, repo_root=lambda r: f"{root}/dev/{r}", paused=lambda t: False,
               linked_units=lambda: [], read_unit=lambda u: "")
     if "default_signals" in ns:
         ns["default_signals"] = lambda: None
+    if world.v2 and real_memo:
+        ns["gate_memo"] = gate_memo
     return mod
 
 
@@ -1247,7 +1518,9 @@ def score(candidate, trace, prepare=4, conflicts="history", verbose=False, keep_
             raise SystemExit("cc-replay: the trace has no arrivals")
         records = [(epoch(v["at"]), 0, l["repo"], l["pr"], v) for l in trace["landings"] for v in l["verdicts"]
                    if v.get("kind") == "recorded" and epoch(v["at"])]
-        events = sorted(arrivals + records, key=lambda e: e[:4])    # a record and a queue in one second: the record first
+        persons = [(epoch(l["person"]["at"]), 2, l["repo"], l["pr"], None) for l in trace["landings"]
+                   if trace.get("version", 1) >= 2 and l.get("person") and epoch(l["person"].get("at"))]
+        events = sorted(arrivals + records + persons, key=lambda e: e[:4])    # one second: the record, the queue, the hand merge
         clock = Clock(events[0][0] - 1)
         world = World(trace, root, clock, conflicts, log)
         for repo in sorted({l["repo"] for l in trace["landings"]}):
@@ -1269,6 +1542,9 @@ def score(candidate, trace, prepare=4, conflicts="history", verbose=False, keep_
 
         def inject(payload):
             kind, repo, pr, v = payload
+            if kind == 2:
+                world.person_merge((repo, pr))
+                return
             if kind == 0 and not world.record((repo, pr), v):
                 return
             world.rebase((repo, pr))
@@ -1296,6 +1572,7 @@ def score(candidate, trace, prepare=4, conflicts="history", verbose=False, keep_
             armed = [a for a in armed if a > clock.now]
             world.rearm = []
             sweeps += 1
+            world.sweep_at = clock.now
             log(f"{stamp(clock.now)} sweep {sweeps}")
             with contextlib_redirect(chatter):
                 mod.cmd_work([])
@@ -1354,7 +1631,9 @@ def report(trace, world, clock, sweeps):
     med = statistics.median(mins) if mins else 0.0
     lines = [f"score {med:.1f} suites={n['suites']} reviews={n['reviews']} repairs={n['repairs']} unmerged={total - merged} merged={merged}/{total}",
              f"gates={n['gates']} conflicts={n['conflicts']} sweeps={sweeps} clock-advances={clock.advances} "
-             f"span={stamp(clock.now)[:16]} hand-merged={sum(1 for r in rows if r[6] == 'hand')}",
+             f"span={stamp(clock.now)[:16]} hand-merged={sum(1 for r in rows if r[6] == 'hand')}"
+             + (f" trace=v2 memo-hits={n['memo_hits']} memo-misses={n['memo_misses']} behind-refused={n['behind']} "
+                f"base-updates={n['updates']} person-merged={n['person']}" if world.v2 else ""),
              f"history {statistics.median(both) if both else 0.0:.1f} over the {len(both)} PRs both merged "
              f"({statistics.median(both_q) if both_q else 0.0:.1f} over the {len(both_q)} the queue merged)",
              f"{'pr':<22} {'queued':<16} {'merged-in-replay':<16} {'min':>7} {'merged-in-history':<17} {'min-hist':>8} {'hist-by':<7}"]
@@ -1396,10 +1675,11 @@ def cmd_score(argv):
 
 
 # ── selfcheck ────────────────────────────────────────────────────────────────────────────────────────────
-def fixture_trace(n=4, t0=1_800_000_000, stopped=(), recorded_at=0):
+def fixture_trace(n=4, t0=1_800_000_000, stopped=(), recorded_at=0, version=1, person=(), behind=()):
     """n PRs on disjoint files, queued a minute apart, each with its own gate durations; PR 2 and 3 share a file.
     A PR in `stopped` bought a DO-NOT-LAND on its head; with `recorded_at`, a person recorded LAND on it that many
-    seconds after it was queued."""
+    seconds after it was queued. v2 only: a PR in `person` was merged by hand at its history time, one in `behind`
+    was stopped merely behind."""
     landings = []
     for i in range(1, n + 1):
         files = [["M", f"bin/tool{i}"]] + ([["M", "bin/shared"]] if i in (2, 3) else [])
@@ -1417,7 +1697,11 @@ def fixture_trace(n=4, t0=1_800_000_000, stopped=(), recorded_at=0):
             if recorded_at:
                 landings[-1]["verdicts"].append({"at": stamp(t0 + 60 * i + recorded_at), "head": f"{i:012x}", "gen": 0,
                                                  "kind": "recorded", "verdict": "LAND", "by": "a person", "cost": 0.0})
-    return {"version": 1, "since": stamp(t0), "until": stamp(t0 + 86400),
+        if version >= 2:
+            landings[-1].update(memo=[], person={"at": stamp(t0 + 3600 * i)} if i in person else None,
+                                queue_merged=i not in person,
+                                stops=[{"at": stamp(t0 + 1800), "kind": "behind", "head": f"{i:012x}", "behind": 1}] if i in behind else [])
+    return {"version": version, "since": stamp(t0), "until": stamp(t0 + 86400),
             "repos": {"r": {"default_branch": "main", "gates": ["tests/check.sh", "tests/selftest.sh"], "control": None}},
             "medians": {"gate": {"check.sh": 60, "selftest.sh": 600}, "review": 200, "fix": 900}, "landings": landings, "gaps": []}
 
@@ -1553,7 +1837,7 @@ def cmd_selfcheck():
             bad = False
         except SystemExit:
             bad = True
-        check("…and a file that is not a v1 trace is refused", bad)
+        check("…and a file that is not a v1 or v2 trace is refused", bad)
         # the ledger and marker readers, on lines of the shapes the sources print
         ev = ledger_events_from_text("2026-09-07T10:00:00Z\tqueued r#7 who=- chat=- by=x\n2026-09-07T10:30:00Z\tdone r#7 rc=0 [r] PR #7: landed ✅\n"
                                      "2026-09-07T10:31:00Z\tqueued r#deploy span=a..b by=the catch-up sweep\n", 0, 2_000_000_000)
@@ -1587,8 +1871,107 @@ def cmd_selfcheck():
               c.splitlines()[0] != first)
         if not (a == b and "merged=4/4" in first):
             print(la[-3000:]); print(ca[-3000:])
+        check("…and a v1 trace's report names no v2 counts", "trace=v2" not in a.splitlines()[1])
+        # v2, end to end. Memos: PR 1 lands alone; 2-4 queue behind it and are prepared together, PR 2 projected onto
+        # the base first. Every one merges in the projected order, so every memo is spent (hits, no miss)…
+        h, _, _ = score(cand, fixture_trace(version=2), prepare=4)
+        hits = re.search(r"memo-hits=(\d+) memo-misses=(\d+)", h)
+        check(f"v2 memo: a batch that merges in its projected order spends its memos ({hits and hits.group(0)})",
+              hits is not None and int(hits.group(1)) > 0 and hits.group(2) == "0")
+        # …and when PR 2 is stopped on a DO-NOT-LAND, the trees 3 and 4 were gated on held a merge that never came.
+        mm, _, _ = score(cand, fixture_trace(version=2, stopped=(2,)), prepare=4)
+        miss = re.search(r"memo-hits=(\d+) memo-misses=(\d+)", mm)
+        check(f"…and one that loses a projected merge misses the memos behind it ({miss and miss.group(0)})",
+              miss is not None and int(miss.group(2)) > 0)
+        # A person's hand merge: PR 1 stopped on its DO-NOT-LAND merges at the time a person merged it in history…
+        p2, _, _ = score(cand, fixture_trace(version=2, stopped=(1,), person=(1,)), prepare=4)
+        check("v2 person: a PR stopped in the replay is merged at its hand-merge time, counted as the person's",
+              "merged=4/4" in p2.splitlines()[0] and "person-merged=1" in p2.splitlines()[1])
+        # …a PR the candidate lands before that time stays the candidate's…
+        p3, _, _ = score(cand, fixture_trace(version=2, person=(4,)), prepare=4)
+        check("…a hand-merged PR the candidate lands first is not a person's merge", "person-merged=0" in p3.splitlines()[1])
+        # …and the same stop on a v1 trace stays open, as it always did.
+        p1, _, _ = score(cand, fixture_trace(version=1, stopped=(1,), person=(1,)), prepare=4)
+        check("…and a v1 trace never merges it", "merged=3/4" in p1.splitlines()[0])
     else:
         print("  · no cc-land beside this file — the end-to-end cases did not run")
+
+    # 5. trace v2's plumbing, behind stops and extraction, each on a fixture of its own.
+    root = tempfile.mkdtemp(prefix="cc-replay-selfcheck-")
+    try:
+        cwd = f"{root}/dev/r"
+        w = World(fixture_trace(version=2), root, Clock(0), "history")
+        g = lambda *a: w.git(["git", *a], cwd)
+        tip0 = g("rev-parse", "--verify", "--quiet", "origin/main^{commit}")[1].strip()
+        check("v2 plumbing: a head on an unmoved base holds it (is-ancestor rc 0), so merge_result gates the head",
+              g("merge-base", "--is-ancestor", tip0, "3".zfill(12) + "0" * 28)[0] == 0)
+        proj = g("commit-tree", g("merge-tree", "--write-tree", "1".zfill(12), "3".zfill(12))[1].strip(), "-p", "1".zfill(12), "-p", "3".zfill(12))[1].strip()
+        projected = g("merge-tree", "--write-tree", proj, "4".zfill(12))[1].strip()
+        w.clock.now = 10
+        w.land(("r", 1)); w.land(("r", 3))
+        tip = g("rev-parse", "--verify", "--quiet", "origin/main^{commit}")[1].strip()
+        check("…once PR 1 merged past it, the base is no ancestor (rc 1) and the tip is a new commit",
+              tip != tip0 and g("merge-base", "--is-ancestor", tip, "4".zfill(12))[0] == 1)
+        check("…the merge of the base with PR 4, once 1 and 3 merged, is the very tree the projection gated (a memo hit)",
+              g("merge-tree", "--write-tree", tip, "4".zfill(12))[1].strip() == projected)
+        w2 = World(fixture_trace(version=2), root, Clock(0), "history")
+        w2.clock.now = 10
+        w2.land(("r", 1))
+        tip1 = w2.git(["git", "rev-parse", "origin/main^{commit}"], cwd)[1].strip()
+        check("…and when PR 3 did not merge, it is another tree (a memo miss)",
+              w2.git(["git", "merge-tree", "--write-tree", tip1, "4".zfill(12)], cwd)[1].strip() != projected)
+        v1w = World(fixture_trace(version=1), root, Clock(0), "history")
+        v1w.merges.append((0, "r", 1, 0, {"bin/tool1"}))
+        check("…while a v1 world answers as it always did: every head holds the base",
+              v1w.git(["git", "merge-base", "--is-ancestor", "x", "4".zfill(12)], cwd)[0] == 0)
+        # behind: PR 3 history saw stopped merely behind is refused once a merge passed its base; PR 4 is not.
+        wb = World(fixture_trace(version=2, behind=(3,)), root, Clock(1_800_000_000), "history")
+        wb.land(("r", 1))
+        rc, o = wb.gh(["gh", "pr", "merge", "3", "--squash"], cwd)
+        view = json.loads(wb.gh(["gh", "pr", "view", "3", "--json", "mergeStateStatus"], cwd)[1])
+        check("v2 behind: a PR history stopped behind is refused with GitHub's --auto words while a merge passed its base",
+              rc == 1 and "--auto" in o and view["mergeStateStatus"] == "BEHIND" and wb.n["behind"] == 1)
+        check("…and a PR history never saw stopped merges though just as behind", wb.gh(["gh", "pr", "merge", "4", "--squash"], cwd)[0] == 0)
+        old_head = wb.head(("r", 3))[0]
+        rc, o = wb.gh(["gh", "pr", "update-branch", "3"], cwd)
+        new_head, gen = wb.head(("r", 3))
+        check(f"…gh pr update-branch merges the base in: a new head, the same change, {UPDATE_SECS} s on the clock, and it merges",
+              rc == 0 and new_head != old_head and gen == 0 and wb.clock.now == 1_800_000_000 + UPDATE_SECS
+              and wb.behind(("r", 3)) == 0 and wb.gh(["gh", "pr", "merge", "3", "--squash"], cwd)[0] == 0)
+        wv1 = World(fixture_trace(version=1), root, Clock(0), "history")
+        wv1.land(("r", 1))
+        wv1.prs[("r", 3)]["stops"] = [{"kind": "behind", "behind": 1}]
+        check("…and a v1 world neither refuses it nor answers update-branch",
+              wv1.gh(["gh", "pr", "update-branch", "3"], cwd)[0] == 1 and wv1.gh(["gh", "pr", "merge", "3", "--squash"], cwd)[0] == 0)
+        # extraction: the three classes read off lines of the shapes the sources print
+        L = lambda at, pid, text: (at, pid, text)
+        lines = [L(10, 7, "gating and reading 2 queued job(s) — side by side"),
+                 L(11, 7, "  ✓ 1 gate(s) passed on PR #1 at the full tier (x): tests/check.sh"),
+                 L(12, 7, "  ✓ 1 gate(s) passed on PR #2 at the full tier (x): tests/check.sh"),
+                 L(13, 7, "  ✓ 1 gate(s) passed on PR #1: tests/check.sh — the full tier, x; run for this sweep by the prepare phase, on y"),
+                 L(14, 7, "  ✓ 1 gate(s) passed on PR #2 at the full tier (x): tests/check.sh"),
+                 L(20, 8, "  ✓ 1 gate(s) passed on PR #3 at the full tier (x): tests/check.sh"),
+                 L(21, 8, "  ✓ 1 gate(s) passed on PR #3 at the full tier (x): tests/check.sh")]
+        mf = memo_facts(lines, {("r", 1), ("r", 2), ("r", 3)})
+        check("extract memo: a `by the prepare phase` line is a hit, gates passed twice in a prepared sweep a miss…",
+              mf.get(("r", 1)) == [(13, True)] and mf.get(("r", 2)) == [(14, False)])
+        check("…and twice in a sweep that prepared nothing is not a miss", ("r", 3) not in mf)
+        tr = fixture_trace(person=(2,))
+        tr["landings"][1]["queue_merged"] = False
+        tr["landings"][0]["dones"] = [{"at": stamp(1_800_000_100), "rc": 1, "short": "[r] PR #1: NOT merged ❌ — PR #1 is not mergeable yet (checks pending, or it needs a rebase)"}]
+        tr["landings"][2]["dones"] = [{"at": stamp(1_800_000_100), "rc": 1, "short": "[r] PR #3: NOT merged ❌ — PR #3 conflicts with main — rebase it, then land it"}]
+        tr["landings"][3]["dones"] = [{"at": stamp(1_800_000_100), "rc": 1, "short": "[r] PR #4: NOT merged ❌ — gate tests/check.sh did not pass: a merge conflicts with x"}]
+        counts = upgrade(tr, lines)
+        by = {l["pr"]: l for l in tr["landings"]}
+        check("extract stops: `not mergeable yet` is behind, `conflicts with main — rebase` a conflict, a red gate neither",
+              [s["kind"] for s in by[1]["stops"]] == ["behind"] and [s["kind"] for s in by[3]["stops"]] == ["conflict"]
+              and by[4]["stops"] == [] and by[3]["conflicted"] and not by[1]["conflicted"])
+        check("extract person: a PR merged outside the queue carries its merge time, a queue merge none",
+              by[2]["person"] == {"at": by[2]["merged"]} and by[1]["person"] is None)
+        check("…and the trace names its version and the counts it printed",
+              tr["version"] == 2 and counts == {"memo_hits": 1, "memo_misses": 1, "stops_behind": 1, "stops_conflict": 1, "person": 1})
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
     print(f"cc-replay selfcheck: {len(fails)} failed")
     return 1 if fails else 0
 
@@ -1605,7 +1988,7 @@ def ledger_events_from_text(text, since, until):
 
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__.strip().split("\n\n")[0] + "\n\n" + "\n".join(l for l in __doc__.splitlines()[2:20] if l.startswith("  ")))
+        print(__doc__.strip().split("\n\n")[0] + "\n\n" + "\n".join(l for l in __doc__.splitlines()[2:24] if l.startswith("  ")))
         return 0 if argv else 2
     cmd, rest = argv[0], argv[1:]
     if cmd == "extract":
