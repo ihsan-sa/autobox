@@ -1056,17 +1056,28 @@ def memo_path(repo, pr, key, tier):
     return f"{gate_dir()}/{repo}-{pr}-{key[:12]}-{tier}.json"
 
 
-def gate_memo(repo, pr, key, tier):
-    """'These gates already passed on this tree at this tier', left by the prepare phase for the serial one. `key` is the tree the gates ran on (the merge of base into head), so a moved head or base misses; a memo older than GATE_MEMO_TTL is ignored and swept."""
+def gate_memo(repo, pr, key, tier, head="", base=""):
+    """'These gates already passed at this tier', left by the prepare phase for the serial one. `key` is the tree the gates ran on (the merge of base into head) and is asked first. When no memo holds that tree, one filed for the SAME HEAD at this tier answers instead: the prepare phase gated the head on the base it projected (origin/<base> with every queued job ahead merged in), and the serial walk that meets a different base — a job ahead did not merge, one arrived mid-sweep, a person merged by hand — spends that answer rather than buying the suite again for the same head. A moved head still misses (the memo names its head), and so does a memo older than GATE_MEMO_TTL, which is swept. `base` is the base commit the CALLER is about to gate against — its own sha whether or not a merge was built on it — and an answer spent across a base that moved says so, naming the base the gates ran on and this one; without it the line would report the projected base as though the caller had met it."""
     path = memo_path(repo, pr, key, tier)
     j = read_json(path) or {}
+    if not j.get("gates") and head:
+        # The brief: "the serial walk re-uses the gate answer it already bought when the tree it meets is not the
+        # one it projected". Same PR, same tier, same head; any base the prepare phase projected.
+        for p in sorted(glob.glob(f"{gate_dir()}/{repo}-{pr}-*-{tier}.json")):
+            k = read_json(p) or {}
+            if k.get("gates") and k.get("head") == head:
+                path, j = p, k
+                break
     try:            # SPENT ON READ. A memo hands one sweep's prepare phase to that same sweep's serial one and
         os.unlink(path)     # nothing further: left lying about, the green it recorded would answer for the NEXT
     except OSError:         # sweep too, and a kept job would then never re-run the gate it was kept for — which is
         pass                # the whole of why `gates` is in RETRY (the suite flakes). Caught by selfcheck (2).
     if not j.get("gates") or time.time() - epoch_of(j.get("at", "")) > GATE_MEMO_TTL:
         return ""
-    return f"{len(j['gates'])} gate(s) passed on PR #{pr}: {', '.join(j['gates'])}"
+    on = f" on {j['on']}" if j.get("on") else ""
+    moved = (f" — that base as projected at the start of the sweep; it is at {base[:12]} now"
+             if base and j.get("base") and j["base"] != base else "")
+    return f"{len(j['gates'])} gate(s) passed on PR #{pr}{on}: {', '.join(j['gates'])}{moved}"
 
 
 def green_dir():
@@ -1223,7 +1234,7 @@ def stale_note(root, base_ref, base, head, mine=()):
 
 
 def merge_result(root, base, head):
-    """The commit whose tree `base` will hold once `head` is squashed in, built with plumbing only (merge-tree, commit-tree), as (commit-ish, base-sha, tree): `head` with ('', '') when the base is an ancestor already, ('', '', '') when git cannot build it. A textual conflict raises."""
+    """The commit whose tree `base` will hold once `head` is squashed in, built with plumbing only (merge-tree, commit-tree), as (commit-ish, base-sha, tree): `head` and the base's own sha with NO tree when the base is an ancestor already (nothing to merge), ('', '', '') when git cannot build it. The base sha is the one the caller records and compares bases by, so it is answered whether or not a merge was built; an empty TREE, not an empty base, is what says no merge happened. A textual conflict raises."""
     if not base or not head:
         return "", "", ""
     rc, o = sh(["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"], cwd=root)
@@ -1231,7 +1242,8 @@ def merge_result(root, base, head):
     if not base_sha:
         return "", "", ""
     if sh(["git", "merge-base", "--is-ancestor", base_sha, head], cwd=root)[0] == 0:
-        return head, "", ""   # the head already holds the base: merging it changes nothing, so gate the head
+        return head, base_sha, ""   # the head already holds the base: merging it changes nothing, so gate the head —
+                                    # but say WHICH base that was, for the caller comparing it with the one projected
     rc, o = sh(["git", "merge-tree", "--write-tree", base_sha, head], cwd=root, timeout=300)
     tree = (o.splitlines() or [""])[0].strip()
     if rc == 1:
@@ -1719,14 +1731,18 @@ class Land:
         """Gate the merge (merge_result), before merging: every gate at once, the paid read beside them from t=0, the suite handed CC_LAND_CHANGED and CC_SELFTEST_SLOTS, each gate timed on silence (run_gate). The memo is filed under the gated tree; the first red in gate order is reported; the read's buy stands."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
-        tree, tmp, at, key = self.root, None, "", ""
+        tree, tmp, at, key, base_sha = self.root, None, "", "", ""
         if self.pr:
             if self.held():             # a draft, or a conflict: the direct path stops here, before a gate or a
                 raise Failed(self.held())   # read is bought for a merge GitHub would refuse (the queue holds such a job: run_job)
             self.fetch_head()       # asked BEFORE the checkout now: the tier and the memo are both keyed by the SHA
             self.gated = self.head  # …and pinned here, for the review after this and the merge after that
             with git_lock(self.root):   # merge_result reads refs a sibling landing's pull moves; it writes loose objects only
-                at, self.merged_on, mtree = merge_result(self.root, self.base_at or f"origin/{self.base()}", self.head)
+                at, base_sha, mtree = merge_result(self.root, self.base_at or f"origin/{self.base()}", self.head)
+            # base_sha is the base these gates ran against, answered even when no merge was built — what the memo
+            # records and what a later walk compares its own base with. merged_on is the narrower fact the ✗ line
+            # and gated_on() key on: a base that was MERGED IN, so it stays empty when the head already held it.
+            self.merged_on = base_sha if mtree else ""
             self.merge_unbuilt = not at   # merge_result gives the head back when the head already holds the base and
             if self.merge_unbuilt:        # "" only when it could not answer: the same empty merged_on, two meanings
                 out("!", f"the merge of {self.base()} with the head could not be built — an unfetched base, "
@@ -1735,9 +1751,9 @@ class Land:
             key = mtree or self.head    # the memo answers for the tree that was gated: the merge, or the head when there is none
         tier, why = self.tier_for()
         if self.pr:
-            done = "" if self.fill_memo else gate_memo(self.repo, self.pr, key, tier)
-            if done:
-                return f"{done} — the {tier} tier, {why}; run for this sweep by the prepare phase, on {self.gated_on()}"
+            done = "" if self.fill_memo else gate_memo(self.repo, self.pr, key, tier, self.head, base_sha)
+            if done:        # the memo names the tree its gates ran on; on a moved base that is not gated_on()
+                return f"{done} — the {tier} tier, {why}; run for this sweep by the prepare phase"
             tmp, tree = self.head_checkout("gates", fetch=False, at=at)
         asked = tier          # the memo is filed under the tier the serial phase will ask with (tier_for), not the fallback's
         try:
@@ -1815,8 +1831,9 @@ class Land:
             on = f"PR #{self.pr} on {self.gated_on()}" if self.head else f"the {self.base()} checkout"
             if self.pr and self.fill_memo:
                 with contextlib.suppress(OSError):   # what the serial phase spends instead of running these again — an optimisation, never a fact
-                    write_atomic(memo_path(self.repo, self.pr, key, asked),   # keyed on the tree the gates ran on, never on self.head
-                                 {"at": stamp(), "tier": tier, "why": why, "gates": found})
+                    write_atomic(memo_path(self.repo, self.pr, key, asked),   # keyed on the tree the gates ran on; head and base beside it, for a serial walk that meets another base (gate_memo)
+                                 {"at": stamp(), "tier": tier, "why": why, "gates": found,
+                                  "head": self.head, "base": base_sha, "on": self.gated_on()})
             again = f" — {len(reused)} of them already green on {content[:12]}, not run again" if reused else ""
             beside = " — the review ran beside the gates" if self._review is not None else ""
             return (f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): "
@@ -3099,7 +3116,7 @@ def prepare(paths):
             except Exception as e:      # unreadable: it touches everything, and says so
                 out("✗", f"{e.__class__.__name__}: {e}")
 
-    # The tree each job will land on: the base with every earlier job of its own repo merged in, so job i's gate is the integration run for the batch up to i and a red one names the PR added last. If an earlier job does not merge, the later job's memo misses and the serial phase gates it again: a re-run, never a tree nothing ran on.
+    # The tree each job will land on: the base with every earlier job of its own repo merged in, so job i's gate is the integration run for the batch up to i and a red one names the PR added last. If an earlier job does not merge, the later job lands on a base its gates did not see: the serial phase spends the answer bought on the projection anyway (gate_memo, same head), and says on the ✓ line which base that was.
     proj = {}
     for path in jobs:
         L = lands[path]

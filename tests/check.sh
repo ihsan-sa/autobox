@@ -113,9 +113,8 @@ else echo "check.sh: · $PART_WHY"; fi
 # cc-tier's is a HOME and a config of its own — two boards through cc-board, never this box's tier or rows —
 # over the whole table (which question each tier answers yes to), one-at-a-time under essential, and that
 # reading it writes nothing.
-# cc-brief's is fixtures too — briefs it writes itself, a board and a throwaway git repo under a temp dir, and
-# CC_BRIEF_FAKE standing in for the judge's verdict, or a fake `claude` of its own where the CALL is what is
-# being pinned (the turn cap, the wall it carries), so the fast gate never reaches a model.
+# cc-brief's is fixtures too — briefs it writes itself, a board and a throwaway git repo under a temp dir; the
+# shape check is arithmetic, so no model is anywhere near it.
 # cc-gh-token's mints against an API of its own on localhost, signing with an RSA key it generates: minting,
 # reuse, the expiry margin, an absent key and which remotes it answers for — and, over a ~/dev of member
 # workspaces it builds itself, which repositories a workspace owns, that its token is minted for those alone
@@ -136,16 +135,6 @@ else echo "check.sh: · $PART_WHY"; fi
 # temp HOME, that the file it locks is the one cc-land's own git_lock_path names — for a checkout, a linked
 # worktree and a directory with no .git — and that its fetch waits while a landing holds it. Nothing of this
 # box's is fetched and the public repo is never reached: it publishes into a bare repo in the temp dir.
-# …and that it gives cc-arch its turn after a push and not otherwise, against a stub that records its argv, and
-# that the turn it allows covers cc-arch's own worst case and sits inside this unit's — both read out of the
-# files rather than written down twice.
-# cc-arch's own is fixtures too — its own HOME with its own repos and remotes under it and a stub `cc-slack` that
-# records instead of uploading — over the one promise: a landing posts the rebuilt overview only where the commit
-# that landed DECLARED itself an architecture revision, including the landing that rewrote the source and said
-# nothing. It runs the real pdflatex, on a one-page document of its own and once on the overview source in this
-# tree, which is how a document that stopped building fails here rather than on the morning the box has something
-# to say; those cases are SKIPPED with a line, never failed, where pdflatex is not installed. Nothing leaves the
-# machine, nothing outside its temp HOME is written, and a link planted where it writes is a case of its own.
 # cc-fence's is the only one that runs its cases against the KERNEL: private fixtures, and every forbidden
 # operation run three times — unfenced (so a case that stopped testing anything is caught), fenced outside the
 # task tree, fenced inside it. Nothing of this box's is written. cc-member-v2 applies the fence, behind

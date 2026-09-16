@@ -1629,22 +1629,6 @@ t7=~/.cc/state/$REPO/g7/task.md
 { grep -q 'IN FLIGHT' "$t7" && grep -q 'held-by-g1.txt — g1 \[running\]' "$t7"; } \
   && ok "a dispatched brief carries what the board says is in flight, computed at dispatch, never typed" \
   || bad "no IN FLIGHT block for g1 (board: g1=$("$B/cc-board" get $REPO g1 status 2>&1); track/g1 vs main: $(git -C ~/dev/$REPO diff --name-only main...track/g1 2>&1 | tr '\n' ' '); commit: ${g1c:-quiet}): $(cat "$t7" 2>/dev/null)"
-# THE SECOND GATE IS A JUDGE, and its two failure answers must not look alike. CC_BRIEF_FAKE stands in for the
-# model here — this suite makes no API calls — so both are exercised for real through the doors themselves.
-PROSE="GOAL: something worth doing, said as a goal and nothing more."
-gs=$(CC_BRIEF_FAKE='{"verdict":"reject","why":"it hands over the design","cut":["said as a goal"]}' \
-     "$B/cc-board" add $REPO g8 "g8" "$PROSE" 2>&1); grc=$?
-{ [ $grc != 0 ] && grep -q 'hands over the design' <<<"$gs" && grep -q 'cut: said as a goal' <<<"$gs" \
-  && [ ! -s ~/.cc/state/$REPO/g8/task.md ]; } \
-  && ok "the judge rejects prose the arithmetic cannot see, says what to cut, and the door writes nothing" \
-  || bad "judge reject at the door (rc=$grc): $gs"
-# Its own track, not g8 again: this case must stand on an empty brief of its own, not on the one above
-# having correctly written nothing.
-gs=$(CC_BRIEF_FAKE= "$B/cc-board" add $REPO g9 "g9" "$PROSE" 2>&1); grc=$?
-{ [ $grc = 0 ] && grep -q 'NOT judged' <<<"$gs" && grep -q 'said as a goal' ~/.cc/state/$REPO/g9/task.md; } \
-  && ok "…while a judge that is not there does NOT stop the brief: it lands, and the door says it was not judged" \
-  || bad "absence blocked the door (rc=$grc): $gs"
-
 # …and it is recomputed, not accumulated: g1 finishes, and the next dispatch stops naming its file. Asserted on
 # g1's own file rather than on the block as a whole — other fixture tracks in this suite are live and hold files too.
 "$B/cc-board" status $REPO g1 merged >/dev/null
@@ -1752,7 +1736,7 @@ mkdir -p "$HOME/dev/r" "$D/bin"
 export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
 unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST CC_GIT_NAME CC_GIT_EMAIL CC_SELF_LAND_REPOS
 export GH_REPO=wrong/repository CC_SLACK="$D/bin/cc-slack"
-export CC_BRIEF_FAKE='{"verdict":"approve"}' CC_CLAUDE=/bin/true
+export CC_CLAUDE=/bin/true
 printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"
 cp "$B/cc" "$B/cc-task" "$D/bin/"; cp "$B/cc-checkpoint" "$D/bin/checkpoint-real"
 cat > "$D/bin/cc-checkpoint" <<'SH'
@@ -2162,7 +2146,6 @@ export HOME="$T/delivery-home" D="$T/delivery-fixture" REALBIN="$B"
 mkdir -p "$HOME/dev/r" "$D/bin"
 export PATH="$D/bin:/usr/bin:/bin" GIT_CONFIG_GLOBAL="$D/gitconfig" GIT_CONFIG_SYSTEM=/dev/null
 export CC_CONFIG="$D/config" CC_SELF_LAND_REPOS=r CC_SLACK="$D/bin/cc-slack" CC_CLAUDE="$D/bin/claude"
-export CC_BRIEF_FAKE='{"verdict":"approve"}'
 unset GIT_CONFIG_COUNT GH_TOKEN GH_HOST GH_REPO TMUX TMUX_PANE CC_MEMBER_SANDBOX CC_WORKER_SANDBOX
 printf '[user]\n name = fixture\n email = fixture@example.test\n' > "$D/gitconfig"; : > "$D/config"
 cp "$B/cc" "$B/cc-task" "$B/cc-loop" "$B/cc-land" "$B/cc-checkpoint" "$B/cc-config" "$D/bin/"

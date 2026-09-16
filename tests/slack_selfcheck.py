@@ -5303,6 +5303,42 @@ def run_selfcheck():
           "when the caller asks for it, and never a Z",
           hhmm(hI) == "00:02" and hhmm(hI, day=True) == "2026-09-02 00:02" and hhmm_all([hI, hI + 3600]) == ["00:02", "01:02"]
           and hhmm_all([]) == [] and "Z" not in hhmm())
+    # ── THE AUDIT LINE READS THE REPORT cc-audit STILL WRITES. Its glob used to be `*-review.md`; the model-read
+    #    modes came out in shrink M3 and nothing writes one any more, so the tab would have shown the verdict of
+    #    the last review ever run as the box's current state, for good (review of #494). Its own HOME, with a
+    #    stale `-review.md` sitting beside the checks reports: both halves, because a case that only read the
+    #    checks report would pass just as well with the old glob restored on a box that has no review file left.
+    hAH = tempfile.mkdtemp(prefix="cc-slack-selfcheck-audit-")
+    os.makedirs(f"{hAH}/.cc/state/audit")
+    hAw = lambda n, t: open(f"{hAH}/.cc/state/audit/{n}", "w").write(t)
+    hAw("2026-09-10-checks.md", "# box audit — checks\n\n## suites\n- **PASS** tests/check.sh — OK\n\n"
+                                "**verdict: OK — 0 of 23 checks failed**\n")
+    hAw("2026-09-14-checks.md", "# box audit — checks\n\n## suites\n- **PASS** tests/check.sh — OK\n"
+                                "- **FAIL** tests/selftest.sh — == result: 460 passed, 1 failed ==\n"
+                                "- **FAIL** settings — UNAPPLIED: hook PreToolUse\n\n"
+                                "**verdict: ATTENTION — 3 of 23 checks failed**\n")
+    # …and it carries a verdict line of BOTH shapes, the old `## verdict` section and the new bold one, so that a
+    # reader pointed back at this file picks something up from it and this case goes red. A stale fixture the
+    # parser could find nothing in would pass whichever file was read, which is no check at all.
+    hAw("2026-09-16-review.md", "## verdict\n- a review nobody has run since M3\n\n"
+                                "**verdict: STALE — a review nobody has run since M3**\n")
+    hAhome = globals()["HOME"]
+    try:
+        globals()["HOME"] = hAH
+        hA_at, hA_v, _ = home_audit()
+        globals()["HOME"] = tempfile.mkdtemp(prefix="cc-slack-selfcheck-audit-none-")
+        hA_none = home_audit()[:2]
+    finally:
+        globals()["HOME"] = hAhome
+    check("home_audit: the glance's audit line is the NEWEST checks report's verdict — and a red one carries the "
+          "first failing check, because '3 of 23 checks failed' names nothing to act on",
+          hA_at and hA_v.startswith("ATTENTION — 3 of 23 checks failed")
+          and "tests/selftest.sh — == result: 460 passed, 1 failed ==" in hA_v)
+    check("…and a `-review.md` left over from a mode that no longer runs is NOT what it reads, however new it is "
+          "— the stale file here is dated after every checks report and must not reach the tab",
+          "review nobody has run" not in hA_v)
+    check("…and a box with no report at all says nothing, rather than an empty verdict beside a time",
+          hA_none == ("", ""))
     check("home_boot / home_until: the two lines the glance reads OUT OF a UTC log are converted where they are "
           "shown — cc-limit and power-events.log still speak UTC, because cc-land parses one of them",
           home_boot("2026-08-30T01:44:42Z boot=2026-08-30T01:41:33Z last_alive=… gap=100362s cause=power-loss (gap = …)")

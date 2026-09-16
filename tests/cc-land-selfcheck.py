@@ -371,8 +371,11 @@ def selfcheck():
           "their green under two names and neither would ever be found",
           again[2] == mtree_at and again[0] and re.fullmatch(r"[0-9a-f]{40,64}", again[0]))
     check("CONTROL: a head that already holds the base has no merge to build — merge_result gives the head back "
-          "and names no base, so a PR written on top of today's main is gated exactly as it was before this row",
-          merge_result(mrepo, base, pr_head) == (pr_head, "", ""))
+          "with an EMPTY TREE, which is what says no merge happened, and still names the base it was asked "
+          "about: a landing that spends a gate answer across a base that moved has no merge commit to read that "
+          "base off, and printed the projection instead (review of PR #495). A PR written on top of today's main "
+          "is gated exactly as it was before either row",
+          merge_result(mrepo, base, pr_head) == (pr_head, base, "") and base != main_at)
     check("...and a base git cannot answer for is not a merge either: the caller gates the head and the landing "
           "still happens, where a raise here would stop every landing on a repo whose base was never fetched",
           merge_result(mrepo, "origin/no-such-base", pr_head) == ("", "", "")
@@ -1626,12 +1629,85 @@ def selfcheck():
               os.path.exists(memo_path("myrepo", 7, GATED(), "docs"))
               and not os.path.exists(memo_path("myrepo", 7, GATED(), "full"))
               and (read_json(memo_path("myrepo", 7, GATED(), "docs")) or {}).get("gates") == ["core/tests/selftest.sh"])
-        check("...and it is filed under the TREE THE GATES RAN ON — the merge — and never under the head. Keyed by "
-              "the head it would answer for a base that has since moved, which is exactly the green record for a "
-              "tree nothing gated that this row exists to stop: after a sibling job merges, the merge this PR "
-              "makes is a different tree and the memo is simply not found",
-              GATED() != HEAD and not os.path.exists(memo_path("myrepo", 7, HEAD, "docs")))
+        check("...and it is filed under the TREE THE GATES RAN ON — the merge — and never under the head, with the "
+              "head, the projected base and the phrase naming that tree written INSIDE it: after a sibling job "
+              "merges, the merge this PR makes is a different tree, and what answers then is the memo's own head",
+              GATED() != HEAD and not os.path.exists(memo_path("myrepo", 7, HEAD, "docs"))
+              and (read_json(memo_path("myrepo", 7, GATED(), "docs")) or {}).get("head") == HEAD
+              and (read_json(memo_path("myrepo", 7, GATED(), "docs")) or {}).get("base") == BASE_SHA)
+        # The brief (improve-trial-07-memo): "the serial walk re-uses the gate answer it already bought when the
+        # tree it meets is not the one it projected". Same head on another base: spent, and the line names the base
+        # the gates ran on and the one main is at now. Another head on that base: not spent, and the memo stays.
+        ELSEWHERE = "e15e" + "0" * 36            # where main is when the serial walk arrives: not the projection
+        said = gate_memo("myrepo", 7, GATED(HEAD, ELSEWHERE), "docs", HEAD, ELSEWHERE)
+        check("a serial walk that meets a base the prepare phase did not project (a job ahead did not merge, a "
+              "person merged by hand) spends the memo filed for the SAME HEAD and says which base was gated and "
+              "which main is at now",
+              "as projected" in said and BASE_SHA[:12] in said and ELSEWHERE[:12] in said
+              and "core/tests/selftest.sh" in said and not os.path.exists(memo_path("myrepo", 7, GATED(), "docs")))
+        docs_diff(fill=True)
+        ANOTHER = "a10e" + "0" * 36              # a head the memo does not name: a repair pushed
+        check("...and a MOVED head on that same base is not answered by it — the memo names its head — and the memo "
+              "is left where it was, unspent", not gate_memo("myrepo", 7, GATED(ANOTHER, ELSEWHERE), "docs", ANOTHER, ELSEWHERE)
+              and os.path.exists(memo_path("myrepo", 7, GATED(), "docs")))
         os.unlink(memo_path("myrepo", 7, GATED(), "docs"))
+
+        # …and the base a spent memo is measured against is the base the gates RAN against, which is not always a
+        # merge commit: where the head already holds main there is nothing to merge, so a ✓ line reading that base
+        # off the merge printed the projected one alone — asserting main stood at a sha it never pointed at, in the
+        # commonest shape this whole fallback is for, and dropping the one disclosure that pays for spending the
+        # memo (review of PR #495). Both runs below build their own memo; neither reads the one above.
+        AHEAD = "a11e" + "0" * 36                # main with the job ahead merged in, as prepare() projected it
+
+        def prepared(base_at):
+            """The prepare phase's run: gate this head on the base it projects, and leave the memo for the walk."""
+            for p in glob.glob(f"{gate_dir()}/*.json"):   # fresh() clears the tally dir beside this one, not this
+                os.unlink(p)                              # one, so the case that reads a memo files it itself
+            L = fresh(pr=7)
+            L.fill_memo, L.base_at = True, base_at
+            world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
+            world["git diff --name-status"] = (0, "M\tdocs/USAGE.md\n")
+            world["git diff --numstat"] = (0, "3\t2\tdocs/USAGE.md\n")
+            world["git rev-parse HEAD^{tree}"] = (0, TREE + "\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                L.gates()
+                if L._review is not None:
+                    caught(L.review_aside)
+
+        def walked():
+            """…and the serial half meeting that memo with a head that ALREADY HOLDS main: no merge, no merge sha.
+            No fresh() here — it would reset the world this walk needs and is the wrong shape anyway: the walk is a
+            second landing of the same PR against the state the prepare phase left, memo included."""
+            world.update(NO_MERGE)
+            S = Land("myrepo", pr=7)
+            S.facts = dict(FACTS)
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                said = S.gates()
+                if S._review is not None:
+                    caught(S.review_aside)
+            world["git merge-base --is-ancestor"] = (1, "")     # …and the world goes back as the cases after expect
+            return said
+
+        was_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
+        prepared(AHEAD)
+        said = walked()
+        check("a memo spent where the head ALREADY HOLDS the base names BOTH bases: no merge commit exists on that "
+              "path, so a ✓ line that read the gated base off the merge named the projection alone and said main "
+              "was at a sha it never pointed at — and the gate is still not re-run, which is the point of spending it",
+              "run for this sweep by the prepare phase" in said and "as projected at the start of the sweep" in said
+              and AHEAD[:12] in said and f"it is at {BASE_SHA[:12]} now" in said
+              and not [c for c in calls if os.path.basename(c[0]) == "check.sh"])
+        prepared("")
+        said = walked()
+        check("...and the same walk over a base that did NOT move says nothing of the sort: the correction is what "
+              "a moved base buys, and printed under a base that held it would read as a warning on every landing",
+              "run for this sweep by the prepare phase" in said
+              and "as projected at the start of the sweep" not in said
+              and not [c for c in calls if os.path.basename(c[0]) == "check.sh"])
+        for p in glob.glob(f"{gate_dir()}/*.json"):    # spent on read, both of them — and nothing of this case is
+            os.unlink(p)                               # left for the cases below whatever a spend does with the file
+        os.access = was_access                         # …nor the gate list it needed, which is not theirs
 
         # …and a gate this exact CONTENT has already passed is not bought a second time. The worker runs the
         # suites before it opens its PR and this ran them again on the same code — ten minutes a landing, and
@@ -1898,10 +1974,11 @@ def selfcheck():
               "written to self.head it made the memo a green record for a tree nothing gated (review-235)",
               isinstance(g, str) and L.gated == HEAD and L.head == HEAD
               and memos == [f"myrepo-7-{GATED()[:12]}-full.json"])
-        check("...so the serial phase has nothing to spend for that new head and GATES it, where a memo filed under "
-              "it would have skipped every gate and merged with --match-head-commit",
-              not gate_memo("myrepo", 7, GATED(MOVED), "full") and isinstance(r, Failed) and "moved" in str(r)
-              and MOVED[:12] in str(r))
+        check("...so the serial phase has nothing to spend for that new head — not by the tree, not by the head the "
+              "memo names — and GATES it, where a memo filed under it would have skipped every gate and merged "
+              "with --match-head-commit",
+              not gate_memo("myrepo", 7, GATED(MOVED), "full") and not gate_memo("myrepo", 7, GATED(MOVED), "full", MOVED)
+              and isinstance(r, Failed) and "moved" in str(r) and MOVED[:12] in str(r))
         for p in glob.glob(f"{gate_dir()}/*.json"):
             os.unlink(p)
         # …and the suite is told what the diff changed, so one that knows its own shape runs only what that reaches
@@ -4130,14 +4207,14 @@ def selfcheck():
         for k in ("gh pr merge", "git pull --ff-only"):
             world.pop(k, None)             # …and the paced fakes do not leak into the cases below
 
-        # (5c) AND THE PROJECTION IS ONLY EVER AN OPTIMISATION. prepare() gates job 8 on the base with job 7
-        # merged in, which is the base 8 will meet — IF 7 merges. When 7 does not (a red gate, a stop verdict),
-        # the base 8 meets is the one 7 left alone, and the memo 8 filed answers for a tree nothing will hold.
-        # Spending it would merge a tree no gate ever ran on, which is the whole of what this row was opened to
-        # stop. It cannot be spent because the memo is keyed by THE MERGED TREE and the serial half asks under the
-        # real base — run_job builds its own Land, and a Land is projected onto nothing unless prepare says so.
-        # Said in prepare()'s docstring and until now proven by nothing: the batch case above is the happy path,
-        # where every job merges and every memo matches.
+        # (5c) AND A WRONG PROJECTION IS SPENT, NOT RE-RUN. prepare() gates job 8 on the base with job 7 merged
+        # in, which is the base 8 will meet — IF 7 merges. When 7 does not (a red gate, a stop verdict), the base
+        # 8 meets is the one 7 left alone, and the memo 8 filed answers for a tree main will not hold. Until
+        # 2026-09-15 that memo stayed unspent and 8's gate ran a third time (#378); the replay priced that re-run
+        # at half the median (trial 07-a, docs/replay-2026-09-08.md, Trace v2), so the serial half now spends the
+        # memo filed for the same HEAD and says on the ✓ line which base was gated and where main is. What is
+        # kept: 8 was gated on main-with-7, never on its head alone. The brief: "the serial walk re-uses the gate
+        # answer it already bought when the tree it meets is not the one it projected".
         fresh(pr=7)
         posted.clear()
 
@@ -4162,16 +4239,17 @@ def selfcheck():
         finally:
             os.access = real_access
         swept, gate_runs = buf.getvalue(), [c for c in calls if os.path.basename(c[0]) == "check.sh"]
-        check("an earlier job that does NOT merge leaves the base where it was, and the job behind it is gated "
-              "again FOR REAL: 7 is stopped by its verdict, so 8 meets main without 7 in it, the memo 8 filed "
-              "against main-with-7 does not match what the serial half asks for, and 8's gate runs a third time",
-              [c[3] for c in gh_merges()] == ["8"] and len(gate_runs) == 3
-              and swept.count("run for this sweep by the prepare phase") == 1)
-        check("...and that memo is left UNSPENT rather than quietly matched: it is still on disk, keyed by the "
-              "tree 8 would have landed on had 7 merged — a tree main never held, and spending it would have "
-              "merged 8 on the word of a gate that ran against a base that does not exist",
-              [os.path.basename(m) for m in glob.glob(f"{gate_dir()}/*.json")]
-              == [f"myrepo-8-{GATED(HEAD, MERGE(HEAD, BASE_SHA))[:12]}-full.json"])
+        check("an earlier job that does NOT merge leaves the base where it was, and the job behind it is NOT gated "
+              "again: 7 is stopped by its verdict, so 8 meets main without 7 in it; the memo 8 filed against "
+              "main-with-7 does not match the tree the serial half asks for, but it names 8's head, so it is spent "
+              "and 8's gate ran twice in all — once per job, in the prepare phase",
+              [c[3] for c in gh_merges()] == ["8"] and len(gate_runs) == 2
+              and swept.count("run for this sweep by the prepare phase") == 2)
+        check("...and the ✓ line says so rather than quietly matching: it names the base 8 was gated on (main with "
+              "7 merged in, as projected) and the base main is at now (without 7), and the spent memo is gone",
+              swept.count("as projected at the start of the sweep") == 1
+              and MERGE(HEAD, BASE_SHA)[:12] in swept and f"it is at {BASE_SHA[:12]} now" in swept
+              and glob.glob(f"{gate_dir()}/*.json") == [])
         world.pop("gh pr merge", None)
         posted.clear()      # …and the DO-NOT-LAND this case posted on PR 7 goes with it: left there, the sections
                             # below read it back off the PR and stop a landing they never asked to stop
