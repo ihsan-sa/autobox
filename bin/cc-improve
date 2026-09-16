@@ -3,22 +3,38 @@
 
   cc-improve next [--repo R]
       Print the first UNTRIED proposal — the first, in name order, with no `result` file. Nothing else.
+  cc-improve propose [--source measurement|outside|row] [--n 1] [--repo R] [--base REF]
+      Write the NEXT proposal with one headless model call: the ledger, every past `why`, the reading this box
+      names, and the base landing go in; a patch and a `why` come back and are written as a new proposal.
   cc-improve trial <name> [--repo R] [--base REF]
       Score the base landing and the base+patch landing on the pinned trace, in this one run, decide by the keep
       rule, write the proposal's `result`, append one line to the trials ledger, and print the verdict line.
-  cc-improve pulse [--repo R] [--base REF]
-      `next`, then `trial` on it; and when the verdict is keep, commit the patch on a branch `improve/<name>`
-      in a linked worktree and print the branch. Pushing it and queueing the PR is the orch's, not this tool's.
-      Exits 1 if a kept change produced no branch; a revert is a finished cycle and exits 0.
+  cc-improve pulse [--source S] [--repo R] [--base REF]
+      `propose` when nothing is untried, then `next`, then `trial` on it; and when the verdict is keep, commit
+      the patch on a branch `improve/<name>` in a linked worktree and print the branch. Pushing it and queueing
+      the PR is the orch's, not this tool's. One unattended run leaves one ledger line.
+      Exits 1 if a kept change produced no branch, or if the proposal it had to write failed to generate.
   cc-improve selfcheck
-      Keep, revert, a patch that does not apply, and the ledger's shape — on fixtures of its own.
+      Keep, revert, a patch that does not apply, the propose path against a stubbed model, and the ledger's
+      shape — on fixtures of its own.
 
-A PROPOSAL is a directory `~/.cc/state/<repo>/improve/proposals/<name>/` holding two files a person wrote:
+A PROPOSAL is a directory `~/.cc/state/<repo>/improve/proposals/<name>/` holding two files, written by a person
+or by `propose`:
   patch   a unified diff against `core/bin/cc-land`, one hunk where it can be, applying at the base named below;
   why     one paragraph — where the idea came from (a measurement, an outside view, or a row somebody raised),
           the mechanism, and what in the replay it should move.
 A trial adds a third, `result`. Untried means there is no `result`, so a proposal is tried once and its answer is
 kept; delete the `result` to try it again.
+
+A MODEL-WRITTEN PROPOSAL is the same two files and is trialled by the same rule; its `why` ends with the line
+`Written by cc-improve propose — <model>, source <source>, base <sha>, <when>`, which is what says nobody chose
+it. The model is read-only — Read, Grep and Glob over a scratch directory holding the base landing, the ledger,
+every past `why` and the paths named in `~/.cc/state/<repo>/improve/reading` — and is capped in dollars and
+turns. A GENERATION THAT FAILS IS NOT A CRASH and is not a trial: the proposal is written with a `result` saying
+what went wrong (no answer, a patch touching the wrong file, a patch that does not apply at the base), so `next`
+walks past it and no replay run is spent on it. A run stopped by its own cap is not one of those failures: it
+stops at the tool call carrying the answer, so when the envelope has none the session's transcript is read for
+the call itself, and the proposal it already wrote is the proposal.
 
 THE KEEP RULE is fixed in the candidates note before any trial, so no result can bend it:
   keep iff candidate.median < baseline.median − 0.5 min AND candidate.merged ≥ baseline.merged
@@ -49,7 +65,7 @@ that grows is not a benchmark.
 
 Stdlib only, and no box's names or paths in the code — the repo is an argument and everything hangs off $HOME.
 """
-import glob, json, os, re, shutil, subprocess, sys, tempfile, time
+import contextlib, glob, io, json, os, re, shutil, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 STATE = f"{HOME}/.cc/state"
@@ -59,6 +75,32 @@ TARGET = "core/bin/cc-land"                  # the one file a proposal may patch
 KEEP_MINUTES = 0.5                           # the rule, in the units the ledger prints
 KEEP_SUITES = 1.1
 PREPARE, CONFLICTS = 4, "history"            # the replay settings every CLI trial runs both arms with
+# The propose call: cc-land's reviewer invocation, same shape — read-only tools, no settings file, no MCP server,
+# one scratch directory, an answer the schema validates. The caps are the runner's, in dollars and in turns.
+CLAUDE = os.environ.get("CC_CLAUDE", f"{HOME}/.local/bin/claude")
+PROPOSE_PROMPT = "config/propose-prompt.md"  # relative to the repo THIS tool lives in, like cc-land's reviewer prompt
+PROPOSE_MODEL = os.environ.get("CC_IMPROVE_MODEL") or "claude-opus-5"   # the worker model, not a box's fallback
+PROPOSE_BUDGET = os.environ.get("CC_IMPROVE_BUDGET") or "2"
+PROPOSE_TURNS = os.environ.get("CC_IMPROVE_TURNS") or "20"
+PROPOSE_ALLOW = "Read,Grep,Glob,LS"          # it reads the base landing and the record; it writes nothing itself
+PROPOSE_DENY = ("Bash,BashOutput,KillShell,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,"
+                "Workflow,Skill,ToolSearch,CronCreate,CronDelete,CronList,ScheduleWakeup,SendMessage,RemoteTrigger,"
+                "PushNotification,DesignSync,ListAgents,EnterWorktree,ExitWorktree")
+SOURCES = ("measurement", "outside", "row")  # where a proposal may come from; it says which in its `why`
+READING = "reading"                          # one path per line in the improve dir: what else the proposer is given
+TRIED = "tried.md"                           # every past proposal's `why`, in one file so it costs one read
+# One argv for every place a proposal's patch is applied, so the pre-check and the trial cannot disagree about
+# what applies. --recount infers each hunk's line counts from its own body instead of trusting the `@@` header:
+# a diff written by hand gets those counts wrong while every context line is right, and the first patch a model
+# wrote for this loop was thrown away for exactly that. The context lines still have to match the base.
+APPLY = ["git", "apply", "-p1", "--whitespace=nowarn", "--recount"]
+READING_MAX = 256 * 1024                     # …and the most of any one of them that is copied in
+MARK = "Written by cc-improve propose"       # the line in a `why` that says no person chose this proposal
+PROPOSE_SCHEMA = json.dumps({
+    "type": "object", "additionalProperties": False, "required": ["name", "patch", "why"],
+    "properties": {"name": {"type": "string"},      # three to six words; this tool puts the number in front
+                   "patch": {"type": "string"},     # the unified diff, verbatim
+                   "why": {"type": "string"}}})     # the paragraph a person reads the verdict against
 SCORE_RE = re.compile(r"^score (\d+\.\d) suites=(\d+) reviews=(\d+) repairs=(\d+) unmerged=(\d+) merged=(\d+)/(\d+)$")
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -67,10 +109,10 @@ def stamp():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def sh(argv, cwd=None, timeout=600, stdin=None):
+def sh(argv, cwd=None, timeout=600, stdin=None, env=None):
     """Every outside call goes through here. Never raises: a dead tool is an rc and its output, like any other."""
     try:
-        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env,
                            input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as e:
@@ -206,7 +248,7 @@ def apply_patch(patch, src, dst):
         shutil.copyfile(src, f"{d}/{TARGET}")
         with open(patch) as f:
             body = f.read()
-        rc, o = sh(["git", "apply", "-p1", "--whitespace=nowarn", "-"], cwd=d, timeout=120, stdin=body)
+        rc, o = sh(APPLY + ["-"], cwd=d, timeout=120, stdin=body)
         if rc:
             raise Unscoreable(f"the patch does not apply: {last(o)}")
         shutil.copyfile(f"{d}/{TARGET}", dst)
@@ -340,7 +382,7 @@ def branch_it(repo, name, row, line):
         return False, f"cc-improve: no worktree for {branch}: {last(o)}"
     with open(f"{proposals_dir(repo)}/{name}/patch") as f:
         body = f.read()
-    rc, o = sh(["git", "apply", "-p1", "--whitespace=nowarn", "-"], cwd=tree, timeout=120, stdin=body)
+    rc, o = sh(APPLY + ["-"], cwd=tree, timeout=120, stdin=body)
     if rc:
         return False, f"cc-improve: the patch did not apply in {tree}: {last(o)}"
     try:
@@ -357,6 +399,242 @@ def branch_it(repo, name, row, line):
     if rc:
         return False, f"cc-improve: nothing committed on {branch}: {last(o)}"
     return True, f"branch {branch} in {tree} — one commit, the patch; push it and queue the PR"
+
+
+# ── the model writes the next proposal ───────────────────────────────────────────────────────────────────
+def clean_env():
+    """The environment the model call runs in: the session's own CLAUDE* variables gone so it inherits no session,
+    and anything credential-shaped dropped so a read-only reader carries no token. cc-land's clean_start, without
+    the signal reset — nothing here runs a gate."""
+    named = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+    shaped = ("_TOKEN", "_KEY", "_SECRET", "_CREDS", "_WEBHOOK", "_PASSWORD")
+    return {k: v for k, v in os.environ.items()
+            if k != "CLAUDECODE" and not k.startswith("CLAUDE_") and k not in named and not k.endswith(shaped)}
+
+
+def keep_rule():
+    """The rule, in the words the trial decides by and out of the same constants — so the prompt cannot drift from
+    what `verdict_of` actually does."""
+    return (f"keep iff candidate.median < baseline.median − {KEEP_MINUTES} min AND candidate.merged >= "
+            f"baseline.merged AND candidate.suites <= {KEEP_SUITES} x baseline.suites. Anything else reverts.\n"
+            f"The medians are compared at the resolution the replay prints them, one decimal: half a minute exactly "
+            f"is a revert. A change that is faster and merges one fewer PR is a revert. So is one that is faster on "
+            f"more than a tenth again as many suite runs.")
+
+
+def reading_files(repo, into):
+    """What this box gives the proposer besides the ledger and the base landing: every path named in the improve
+    directory's `reading` file, one per line, copied into the scratch. Named in a file rather than written into
+    this tool, because the seam map, the candidate list and the replay's own "what it cannot score" list live
+    wherever a repo keeps them. Returns the names copied, in the order they were named."""
+    try:
+        with open(f"{improve_dir(repo)}/{READING}") as f:
+            named = [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+    except OSError:
+        named = []
+    out = []
+    for p in named:
+        src = os.path.expanduser(p)
+        if not os.path.isfile(src) or os.path.getsize(src) > READING_MAX:
+            continue
+        name = os.path.basename(src)
+        shutil.copyfile(src, f"{into}/{name}")
+        out.append(name)
+    return out
+
+
+def tried_whys(repo, into):
+    """Every proposal's `why` under its own heading, in ONE file. The ledger says how each one scored; these say
+    what each one WAS, which is what stops the next proposal being one of them with a different constant.
+
+    One file and not one per proposal because the reader pays a turn and a slice of its two dollars for every
+    read: three runs in a row spent the whole budget reading and were cut before they could answer, and the
+    eighteen `why` files were the largest count of reads in front of them. Returns how many were written."""
+    parts = []
+    for d in proposals(repo):
+        w = f"{d}/why"
+        if os.path.isfile(w) and os.path.getsize(w) <= READING_MAX:
+            with open(w) as f:
+                parts.append(f"## {os.path.basename(d)}\n\n{f.read().strip()}\n")
+    with open(f"{into}/{TRIED}", "w") as f:                  # always written: the prompt names it to be read
+        f.write("\n".join(parts) if parts else "Nothing has been tried yet. This is the first proposal.\n")
+    return len(parts)
+
+
+def propose_prompt(source, files):
+    """The template beside this tool, filled in. Every path in it is relative to the scratch directory the model
+    is given, so the prompt names nothing of any particular box."""
+    path = f"{os.path.dirname(BIN)}/{PROPOSE_PROMPT}"
+    try:
+        with open(path) as f:
+            tpl = f.read()
+    except OSError as e:
+        raise Unscoreable(f"no propose prompt at {path} ({e.__class__.__name__}) — this checkout is not installed")
+    reading = ("\n".join(f"   `reading/{n}` — given to you as the reading for this proposal." for n in files)
+               if files else "   (this repo names no further reading; the ledger and the base landing are all "
+                             "you have, so say so in your `why` if it bounds what you could propose.)")
+    # The caps go in from the same constants the call is made with, like the keep rule: a prompt that says twenty
+    # turns while the call allows ten is worse than one that says nothing. READ_BY is three fifths of them, which
+    # is the point a run has to stop reading and answer to have anything to show for the budget.
+    turns = int(PROPOSE_TURNS)
+    vals = {"FILE": TARGET, "SOURCE": source, "LEDGER": "trials.tsv", "TRIED": TRIED,
+            "TARGET": f"base/{TARGET}", "READING": reading.strip(), "RULE": keep_rule(),
+            "TURNS": str(turns), "BUDGET": PROPOSE_BUDGET, "READ_BY": str(max(1, turns * 3 // 5))}
+    return re.sub(r"@([A-Z_]+)@", lambda m: vals.get(m.group(1), m.group(0)), tpl)
+
+
+def answer_from_transcript(session_id):
+    """The answer the runner HAD and did not hand back, or None.
+
+    A run stopped by its own budget cap stops at the tool call carrying the structured answer: the envelope it
+    then prints has no `structured_output`, while the session's own transcript holds the call, answer and all.
+    Twice in one night that threw away a finished proposal and the two dollars that bought it, so the envelope
+    is not the only place this looks. The last such call wins — an earlier one was superseded."""
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", session_id or ""):
+        return None
+    root = os.environ.get("CLAUDE_CONFIG_DIR") or f"{HOME}/.claude"
+    got = None
+    for path in glob.glob(f"{root}/projects/*/{session_id}.jsonl"):
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        content = (json.loads(line).get("message") or {}).get("content")
+                    except ValueError:
+                        continue
+                    for b in content if isinstance(content, list) else []:
+                        if (isinstance(b, dict) and b.get("type") == "tool_use"
+                                and b.get("name") == "StructuredOutput" and isinstance(b.get("input"), dict)):
+                            got = b["input"]
+        except OSError:
+            continue
+    return got
+
+
+def ask_model(prompt, tmp):
+    """One headless call in the scratch directory, cc-land's reviewer shape. Returns (answer or None, one line
+    saying what it cost or what went wrong). Never raises: a runner that is not there is a sentence, not a stack."""
+    if not os.access(CLAUDE, os.X_OK):
+        return None, f"no model runner at {CLAUDE} (CC_CLAUDE names another)"
+    argv = [CLAUDE, "-p", prompt, "--model", PROPOSE_MODEL, "--effort", "high",
+            "--max-budget-usd", PROPOSE_BUDGET, "--max-turns", PROPOSE_TURNS, "--output-format", "json",
+            "--json-schema", PROPOSE_SCHEMA, "--setting-sources", "", "--strict-mcp-config",
+            "--disable-slash-commands", "--add-dir", tmp, "--allowedTools", PROPOSE_ALLOW,
+            "--disallowedTools", PROPOSE_DENY]
+    rc, o = sh(argv, cwd=tmp, timeout=1800, env=clean_env())
+    try:
+        j = json.loads(o)
+    except ValueError:
+        j = {}
+    got = j.get("structured_output")
+    if not isinstance(got, dict):
+        try:                                  # a runner without --json-schema answers in `result`, as the object
+            got = json.loads((j.get("result") or "").strip())
+        except ValueError:
+            got = None
+    recovered = ""
+    if not isinstance(got, dict) or not (got.get("patch") or "").strip():
+        got = answer_from_transcript(j.get("session_id"))   # the cap stopped it AT the answer; the answer stands
+        recovered = ", recovered from the transcript" if isinstance(got, dict) else ""
+    cost = f"${float(j.get('total_cost_usd') or 0):.2f}"
+    if not isinstance(got, dict) or not (got.get("patch") or "").strip():
+        return None, f"the model wrote no patch (rc {rc}, {cost}): {last(o)[:200]}"
+    return got, f"{PROPOSE_MODEL}, {cost}, {j.get('num_turns') or '?'} turns{recovered}"
+
+
+def patch_touches(body):
+    """Every path a diff names, from both sides of its headers. A proposal that edits anything but the one file is
+    refused here rather than at the trial: the replay scores one landing, so a second file is scored by nothing."""
+    return sorted({m.group(1) for m in re.finditer(r"^(?:---|\+\+\+) [ab]/(\S+)", body, re.M)}
+                  | {m.group(1) for m in re.finditer(r"^diff --git a/(\S+) b/\S+", body, re.M)})
+
+
+def check_patch(body, base_file):
+    """`git apply --check` against the base landing in a scratch tree, on APPLY's argv so it is exactly the check
+    the trial would meet. "" when it applies, the reason when it does not, made before a replay run is spent."""
+    d = tempfile.mkdtemp(prefix="cc-improve-check-")
+    try:
+        os.makedirs(f"{d}/{os.path.dirname(TARGET)}", exist_ok=True)
+        shutil.copyfile(base_file, f"{d}/{TARGET}")
+        rc, o = sh(APPLY + ["--check", "-"], cwd=d, timeout=120, stdin=body)
+        return "" if rc == 0 else last(o)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def next_name(repo, said):
+    """`NN-<slug>`: the number after the highest already in the proposals directory, and the model's own name cut
+    down to a slug. The number is what keeps `next`'s name order the order they were written in."""
+    n = 0
+    for p in glob.glob(f"{proposals_dir(repo)}/*"):
+        m = re.match(r"(\d+)", os.path.basename(p))
+        if m:
+            n = max(n, int(m.group(1)))
+    slug = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", (said or "").lower())).strip("-")[:48]
+    return f"{n + 1:02d}-{slug or 'proposal'}"
+
+
+def write_proposal(repo, name, patch, why, mark, failed=""):
+    """The proposal on disk: `patch`, `why` ending in the line that says a model wrote it, and — when the
+    generation failed — the `result` that keeps it out of `next` and out of the ledger."""
+    d = f"{proposals_dir(repo)}/{name}"
+    os.makedirs(d, exist_ok=True)
+    body = (patch or "").rstrip("\n")
+    with open(f"{d}/patch", "w") as f:
+        f.write(body + "\n" if body else "")
+    with open(f"{d}/why", "w") as f:
+        f.write((why or "").strip() + "\n\n" + mark + "\n")
+    if failed:
+        with open(f"{d}/result", "w") as f:
+            f.write(f"proposed {stamp()}\n{mark}\nresult   not tried — the generation failed: {failed}\n")
+    return d
+
+
+def propose(repo, source="measurement", base_sha=""):
+    """One model call writes the next proposal. Returns (name, ok, one line).
+
+    NEVER RAISES AND NEVER LEAVES NOTHING BEHIND: a runner that is not there, an answer that is not a patch, a
+    patch naming another file and a patch that does not apply at the base are all the same thing here — a proposal
+    on disk whose `result` says what went wrong. The two it cannot write a proposal for are a base that will not
+    resolve and a missing prompt, because neither leaves anything to name a proposal after; both are a line and a
+    non-zero exit."""
+    if source not in SOURCES:
+        return "", False, f"cc-improve: --source is one of {', '.join(SOURCES)}"
+    tmp = tempfile.mkdtemp(prefix="cc-improve-propose-")
+    try:
+        try:
+            base = resolve_base(repo, base_sha)
+            os.makedirs(f"{tmp}/base/{os.path.dirname(TARGET)}", exist_ok=True)
+            base_file = base_landing(repo, base, f"{tmp}/base/{TARGET}")
+            os.makedirs(f"{tmp}/reading", exist_ok=True)
+            with open(f"{tmp}/trials.tsv", "w") as f:
+                f.write("\t".join(LEDGER_COLUMNS) + "\n"
+                        + "".join("\t".join(r[k] for k in LEDGER_COLUMNS) + "\n" for r in read_ledger(repo)))
+            tried_whys(repo, tmp)
+            prompt = propose_prompt(source, reading_files(repo, f"{tmp}/reading"))
+        except Unscoreable as e:
+            return "", False, f"cc-improve: no proposal — {e}"
+        got, said = ask_model(prompt, tmp)
+        mark = f"{MARK} — {PROPOSE_MODEL}, source {source}, base {short_base(base)}, {stamp()}."
+        if got is None:
+            name = next_name(repo, "the-model-wrote-nothing")
+            write_proposal(repo, name, "", f"source: {source}. The model was asked for a proposal on {TARGET} at "
+                                           f"{short_base(base)} and did not write one.", mark, failed=said)
+            return name, False, f"cc-improve: no proposal — {said} (written as {name}, not tried)"
+        patch, name = got["patch"], next_name(repo, got.get("name"))
+        touched = patch_touches(patch)
+        failed = ""
+        if [p for p in touched if p != TARGET] or not touched:
+            failed = f"the patch names {', '.join(touched) or 'no file'}, and a proposal may only patch {TARGET}"
+        else:
+            failed = check_patch(patch, base_file)
+        write_proposal(repo, name, patch, got.get("why") or f"source: {source}. The model gave no reason.", mark,
+                       failed=failed)
+        if failed:
+            return name, False, f"cc-improve: {name} was written but not tried — {failed} ({said})"
+        return name, True, f"cc-improve: {name} — {said}, applies at {short_base(base)}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ── commands ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -381,6 +659,25 @@ def cmd_next(argv):
     return 0
 
 
+def cmd_propose(argv):
+    """`--n` proposals, one model call each. Exits 0 when at least one is untried — there is something for a trial
+    to score; 1 when every call failed, and each failure is on disk as a proposal with its `result`."""
+    repo, n = need_repo(argv), opt(argv, "--n", "1")
+    try:
+        n = max(1, int(n))
+    except ValueError:
+        print(f"cc-improve: --n takes a number, not {n!r}", file=sys.stderr)
+        return 2
+    wrote = 0
+    for _ in range(n):
+        name, ok, said = propose(repo, source=opt(argv, "--source", "measurement"), base_sha=opt(argv, "--base"))
+        print(said)
+        wrote += 1 if ok else 0
+        if not name:                 # no base, no prompt: the next call would fail the same way
+            break
+    return 0 if wrote else 1
+
+
 def cmd_trial(argv):
     if not argv or argv[0].startswith("-"):
         print("cc-improve trial <name> [--repo R] [--base REF]", file=sys.stderr)
@@ -397,8 +694,13 @@ def cmd_pulse(argv):
     repo = need_repo(argv)
     left = untried(repo)
     if not left:
-        print(f"cc-improve: nothing untried in {proposals_dir(repo)} — write a proposal, or delete a result")
-        return 1
+        # The loop closes here: nothing untried is not an empty pulse, it is the pulse writing the next proposal
+        # itself and then scoring it, so one unattended run leaves one ledger line.
+        _, ok, said = propose(repo, source=opt(argv, "--source", "measurement"), base_sha=opt(argv, "--base"))
+        print(said)
+        left = untried(repo)
+        if not ok or not left:
+            return 1          # a generation that failed is on disk with its `result`; there is nothing to score
     name = os.path.basename(left[0])
     row, line = trial(repo, name, base_sha=opt(argv, "--base"))
     print(verdict_line(row))
@@ -455,6 +757,23 @@ def diff_against(base, edited, path):
         shutil.rmtree(d, ignore_errors=True)
 
 
+STUB_MODEL = '''#!/usr/bin/env python3
+"""A model runner for the selfcheck: it answers with the file CC_IMPROVE_STUB names, and writes what it was
+given — the scratch it was run in, its prompt and its argv — to CC_IMPROVE_STUB_LOG. No model is called."""
+import json, os, sys
+
+log = os.environ.get("CC_IMPROVE_STUB_LOG")
+if log:
+    seen = [os.path.relpath(os.path.join(r, f), ".") for r, _, fs in os.walk(".") for f in fs]
+    with open(log, "w") as f:
+        json.dump({"cwd": sorted(seen), "argv": sys.argv[1:],
+                   "tried": open("tried.md").read() if os.path.isfile("tried.md") else "",
+                   "prompt": sys.argv[sys.argv.index("-p") + 1] if "-p" in sys.argv else ""}, f)
+out = os.environ.get("CC_IMPROVE_STUB") or ""
+sys.stdout.write(open(out).read() if os.path.isfile(out) else "this is not an answer at all")
+'''
+
+
 def cmd_selfcheck():
     passed, failed = 0, 0
 
@@ -472,7 +791,7 @@ def cmd_selfcheck():
         print(f"  ✗ no {TARGET} beside this tool to build fixtures on")
         return 1
     home = tempfile.mkdtemp(prefix="cc-improve-selfcheck-")
-    saved = {"STATE": STATE, "WORKTREES": WORKTREES}
+    saved = {"STATE": STATE, "WORKTREES": WORKTREES, "CLAUDE": CLAUDE}
     try:
         globals()["STATE"] = f"{home}/state"
         globals()["WORKTREES"] = f"{home}/worktrees"
@@ -505,6 +824,9 @@ def cmd_selfcheck():
         with open(f"{proposals_dir(repo)}/c-rots/patch", "w") as f:
             f.write(f"--- a/{TARGET}\n+++ b/{TARGET}\n@@ -1,3 +1,3 @@\n"
                     " a line this file never held\n-and another\n+and another one\n a third\n")
+        for d in proposals(repo):      # every proposal carries a `why`; `propose` hands them to the model as the record
+            with open(f"{d}/why", "w") as f:
+                f.write(f"source: measurement. {os.path.basename(d)}, written by hand for this fixture.\n")
 
         check("`next` is the first untried proposal in name order", os.path.basename(untried(repo)[0]) == "a-keeps")
 
@@ -589,6 +911,168 @@ def cmd_selfcheck():
         check(f"a worktree already on disk means NO branch, and branch_it says so ({said[-24:]})",
               ok is False and tree in said)
 
+        # ── the model writes the proposal, against a stub that is not one ────────────────────────────────
+        # The stub answers with a file and records what it was handed, so these cases test the propose PATH —
+        # what goes into the scratch, what the call may touch, and what comes of each kind of answer.
+        stub = f"{home}/stub-claude"
+        with open(stub, "w") as f:
+            f.write(STUB_MODEL)
+        os.chmod(stub, 0o755)
+        globals()["CLAUDE"] = stub
+        with open(f"{home}/map.md", "w") as f:
+            f.write("# a seam map, standing in for whatever this repo names as its reading\n")
+        with open(f"{improve_dir(repo)}/{READING}", "w") as f:
+            f.write(f"# comments and a path that is not there are skipped\n{home}/map.md\n{home}/never-written.md\n")
+        three = f"{home}/three"
+        with open(three, "w") as f:
+            f.write(body.replace(knob, "PREPARE_AT_ONCE = max(3, int(os.environ.get(\"CC_LAND_PREPARE\") or gate_slots()))"))
+        good = diff_against(src, three, f"{home}/good.patch")
+        os.environ["CC_IMPROVE_STUB_LOG"] = f"{home}/stub.json"
+
+        def stubbed(answer):
+            """What the next model call answers, in the shape the real runner's --output-format json prints."""
+            with open(f"{home}/stub.out", "w") as f:
+                f.write(answer)
+            os.environ["CC_IMPROVE_STUB"] = f"{home}/stub.out"
+
+        def answered(**kw):
+            return json.dumps({"structured_output": kw, "total_cost_usd": 0.01, "num_turns": 3})
+
+        def result_of(name):
+            with open(f"{proposals_dir(repo)}/{name}/result") as f:
+                return f.read()
+
+        stubbed(answered(name="A Wider Prepare Pool", patch=good,
+                         why="source: measurement. The ledger's own lines say the wait is the pool."))
+        n1, ok1, said1 = propose(repo, source="measurement", base_sha="HEAD")
+        check(f"a model answer whose patch applies is written as a proposal ({said1[:34]})",
+              ok1 is True and n1 == "01-a-wider-prepare-pool")
+        with open(f"{proposals_dir(repo)}/{n1}/patch") as f:
+            wrote = f.read()
+        with open(f"{proposals_dir(repo)}/{n1}/why") as f:
+            said_why = f.read()
+        check("...holding the patch the model returned, verbatim", wrote.rstrip("\n") == good.rstrip("\n"))
+        check("...and a `why` naming the source, marked as nobody's choice but the model's",
+              "source: measurement" in said_why and MARK in said_why and "source measurement" in said_why)
+        check("...and no `result`, so `next` picks it and a trial scores it",
+              not os.path.exists(f"{proposals_dir(repo)}/{n1}/result") and os.path.basename(untried(repo)[0]) == n1)
+        with open(f"{home}/stub.json") as f:
+            seen = json.load(f)
+        check("the call was given the base landing, the ledger, every past `why`, and the reading this repo names",
+              f"base/{TARGET}" in seen["cwd"] and "trials.tsv" in seen["cwd"] and "reading/map.md" in seen["cwd"]
+              and TRIED in seen["cwd"])
+        check("...the whys in ONE file, under a heading each, so the reader spends one turn on them and not one each",
+              all(f"## {os.path.basename(d)}" in seen["tried"] for d in proposals(repo)
+                  if os.path.basename(d) != n1) and f"## {n1}" not in seen["tried"])
+        check("...and its prompt named the source, the file it may patch, and the rule it will be judged by",
+              "measurement" in seen["prompt"] and TARGET in seen["prompt"]
+              and f"{KEEP_MINUTES} min" in seen["prompt"] and f"{KEEP_SUITES} x" in seen["prompt"])
+        check("...and the caps IN the prompt are the caps the call was made with, so it cannot be told the wrong one",
+              f"{PROPOSE_TURNS} TURNS" in seen["prompt"] and f"${PROPOSE_BUDGET}," in seen["prompt"])
+        argv = seen["argv"]
+        check("...and the call is read-only: those tools and no others, no settings file, no MCP server",
+              argv[argv.index("--allowedTools") + 1] == PROPOSE_ALLOW
+              and argv[argv.index("--disallowedTools") + 1].startswith("Bash,")
+              and argv[argv.index("--setting-sources") + 1] == "" and "--strict-mcp-config" in argv
+              and argv[argv.index("--max-budget-usd") + 1] == PROPOSE_BUDGET
+              and argv[argv.index("--max-turns") + 1] == PROPOSE_TURNS)
+
+        stubbed(answered(name="a hunk from nowhere", why="source: measurement.",
+                         patch=f"--- a/{TARGET}\n+++ b/{TARGET}\n@@ -1,3 +1,3 @@\n a line this file never held\n"
+                               f"-and another\n+and another one\n a third\n"))
+        n2, ok2, said2 = propose(repo, source="measurement", base_sha="HEAD")
+        check(f"a patch that does not apply at the base is NOT tried, and says so in its result ({said2[-24:]})",
+              ok2 is False and "does not apply" in result_of(n2) and "not tried" in result_of(n2))
+        check("...and it is on disk all the same, so the record holds what the model wrote, and `next` walks past it",
+              os.path.getsize(f"{proposals_dir(repo)}/{n2}/patch") > 0 and os.path.basename(untried(repo)[0]) == n1)
+
+        stubbed(answered(name="two files at once", why="source: outside.", patch=good.replace(TARGET, "bin/other")))
+        n3, ok3, _ = propose(repo, source="outside", base_sha="HEAD")
+        check("a patch that edits any other file is refused, naming the file it reached for",
+              ok3 is False and "bin/other" in result_of(n3) and "not tried" in result_of(n3))
+
+        os.environ["CC_IMPROVE_STUB"] = f"{home}/no-such-answer"   # the stub then prints something that is not JSON
+        n4, ok4, said4 = propose(repo, source="row", base_sha="HEAD")
+        check(f"a runner that answers nothing usable is a proposal with a result, not a crash ({said4[-20:]})",
+              ok4 is False and "no patch" in result_of(n4) and "not tried" in result_of(n4))
+        check("...and every failed generation is still out of `next`, so no trial is spent on one",
+              [os.path.basename(p) for p in untried(repo)] == [n1])
+
+        # A RUN STOPPED BY ITS OWN BUDGET CAP stops at the tool call that carries the answer, and the envelope it
+        # prints then holds none of it. Both arms on their own fixture: the same envelope, with the transcript and
+        # without it. This box lost a finished proposal and $2 to it twice before the fallback was written.
+        os.environ["CLAUDE_CONFIG_DIR"] = conf = f"{home}/claude-config"
+        session, said_why = "d81f3bb4-5f9a-4c31-9a01-1f5ce0fb0a11", "source: outside. The cap stopped it at the answer."
+        capped = json.dumps({"stop_reason": "tool_use", "session_id": session, "total_cost_usd": 2.04})
+        stubbed(capped)
+        n5, ok5, said5 = propose(repo, source="outside", base_sha="HEAD")
+        check(f"an envelope with no answer and no transcript to find one in stays a failure ({said5[-18:]})",
+              ok5 is False and "no patch" in result_of(n5))
+        os.makedirs(f"{conf}/projects/-tmp-a-scratch", exist_ok=True)
+        with open(f"{conf}/projects/-tmp-a-scratch/{session}.jsonl", "w") as f:
+            for answer in ({"name": "superseded", "patch": "a patch it thought better of", "why": "no"},
+                           {"name": "the cap stopped it at the answer", "patch": good, "why": said_why}):
+                f.write(json.dumps({"message": {"content": [{"type": "text", "text": "thinking about it"},
+                                                            {"type": "tool_use", "name": "StructuredOutput",
+                                                             "input": answer}]}}) + "\n")
+        stubbed(capped)
+        n6, ok6, said6 = propose(repo, source="outside", base_sha="HEAD")
+        check(f"...and with the transcript there, the answer it already wrote is recovered and tried ({said6[-34:]})",
+              ok6 is True and n6 == "06-the-cap-stopped-it-at-the-answer" and "recovered from the transcript" in said6)
+        with open(f"{proposals_dir(repo)}/{n6}/why") as f:
+            check("...the LAST answer in the transcript, whole, and marked as the model's own like any other",
+                  said_why in f.read() and open(f"{proposals_dir(repo)}/{n6}/patch").read().rstrip("\n")
+                  == good.rstrip("\n"))
+        del os.environ["CLAUDE_CONFIG_DIR"]
+
+
+        check("an unknown --source writes nothing at all",
+              propose(repo, source="guesswork", base_sha="HEAD")[:2] == ("", False)
+              and not os.path.exists(f"{proposals_dir(repo)}/07-proposal"))
+        check("a base that does not resolve is a line, not a proposal and not a stack",
+              propose(repo, source="measurement", base_sha="origin/no/such/ref")[:2] == ("", False))
+
+        # PULSE WITH NOTHING UNTRIED: it proposes first, then trials what it proposed — one ledger line, one run.
+        for d in untried(repo):
+            with open(f"{d}/result", "w") as f:
+                f.write("tried by hand, so this fixture has nothing untried left\n")
+        stubbed(answered(name="the pulse writes its own", patch=good,
+                         why="source: measurement. The pulse had nothing untried, so it wrote this."))
+        before = len(read_ledger(repo))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cmd_pulse(["--repo", repo, "--base", "HEAD"])
+        rows = read_ledger(repo)
+        check(f"a pulse with nothing untried proposes, trials it, and leaves ONE ledger line (rc {rc})",
+              rc == 0 and len(rows) == before + 1 and rows[-1]["name"] == "07-the-pulse-writes-its-own"
+              and rows[-1]["verdict"] in ("keep", "revert"))
+        check("...and said both what it proposed and how that scored",
+              "applies at" in out.getvalue() and "07-the-pulse-writes-its-own" in out.getvalue()
+              and "baseline  score " in out.getvalue())
+        stubbed("")                       # a model that answers with nothing at all
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cmd_pulse(["--repo", repo, "--base", "HEAD"])
+        check(f"...and a pulse whose proposal failed to generate exits non-zero rather than scoring nothing",
+              rc == 1 and len(read_ledger(repo)) == before + 1)
+        # --recount FORGIVES A COUNT, NOT A CONTEXT LINE. A diff written by hand gets the `@@` numbers wrong and
+        # every context line right, and the first patch a model wrote for this loop was thrown away for that alone.
+        # Both arms on their own fixture: the same wrong counts over the base's own text, and over text it never had.
+        miscount = re.sub(r"@@ -(\d+),\d+ \+(\d+),\d+ @@", r"@@ -\1,99 +\2,99 @@", good)
+        check("the fixture is really miscounted — its header claims 99 lines and its hunk is nothing like that long",
+              miscount != good and "99 @@" in miscount and len(miscount.splitlines()) < 99)
+        stubbed(answered(name="counts wrong lines right", why="source: measurement.", patch=miscount))
+        n7, ok7, said7 = propose(repo, source="measurement", base_sha="HEAD")
+        check(f"a patch whose `@@` counts are wrong over the base's OWN text is tried all the same ({said7[-20:]})",
+              ok7 is True and not os.path.exists(f"{proposals_dir(repo)}/{n7}/result"))
+        stubbed(answered(name="counts wrong lines wrong too", why="source: measurement.",
+                         patch=f"--- a/{TARGET}\n+++ b/{TARGET}\n@@ -1,99 +1,99 @@\n a line this file never held\n"
+                               f"-and another\n+and another one\n"))
+        n8, ok8, _ = propose(repo, source="measurement", base_sha="HEAD")
+        check("...and the same wrong counts over text the base never held are refused, so nothing was loosened",
+              ok8 is False and "not tried" in result_of(n8)
+              and n8 not in [os.path.basename(u) for u in untried(repo)])
+
         base = {"median": 21.6, "suites": 75, "merged": 90}
         check("the rule: half a minute EXACTLY is not enough — it must be more",
               verdict_of(base, {"median": 21.1, "suites": 75, "merged": 90})[0] == "revert")
@@ -601,6 +1085,8 @@ def cmd_selfcheck():
     finally:
         globals().update(saved)
         globals()["base_landing"] = BASE_LANDING
+        for k in ("CC_IMPROVE_STUB", "CC_IMPROVE_STUB_LOG", "CLAUDE_CONFIG_DIR"):
+            os.environ.pop(k, None)
         shutil.rmtree(home, ignore_errors=True)
     print(f"cc-improve selfcheck: {passed} passed, {failed} failed")
     return 1 if failed else 0
@@ -612,11 +1098,13 @@ BASE_LANDING = base_landing
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__.strip().split("\n\n")[0] + "\n\n"
-              + "\n".join(l for l in __doc__.splitlines()[2:12] if l.startswith("  ")))
+              + "\n".join(l for l in __doc__.splitlines()[2:18] if l.startswith("  ")))
         return 0 if argv else 2
     cmd, rest = argv[0], argv[1:]
     if cmd == "next":
         return cmd_next(rest)
+    if cmd == "propose":
+        return cmd_propose(rest)
     if cmd == "trial":
         return cmd_trial(rest)
     if cmd == "pulse":
