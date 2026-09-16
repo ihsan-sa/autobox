@@ -6,6 +6,7 @@ The brief itself lives in ~/.cc/state/<repo>/<track>/task.md, and `brief append|
 <text|->` (`--top` puts an appended note first) is the ONE writer of that file — a locked read-modify-write that
 `add`, `set … instructions`, `cc --go` and `cc-brief refresh` all go through. CC_STATE points that home elsewhere
 (a test run keeps out of the box's own state), as it does for cc-brief.
+`add` refuses a repo or row name `cc` could not dispatch (cc's valid_name: 64 characters at most), before writing.
 `add` and `set … instructions` are the doors a brief comes in by: cc-brief refuses one that prescribes the steps
 by its arithmetic over the brief's shape. CC_BRIEF_FORCE=1 sends it as typed and records that; CC_BRIEF_MACHINE=1 is for a row the box
 wrote itself and records nothing. What other live tracks are holding is computed in.
@@ -25,6 +26,7 @@ STATES = ["queued","running","waiting","review","blocked","merged","done"]
 # `STATUS: BLOCKED: <question>` journal line); blocked = it stopped for any other reason — a loop that gave up,
 # a usage limit, a kill. Only `waiting` reaches the owner's NEEDS YOU list, and cc-reconcile is what writes it.
 ALIAS = {"todo":"queued"}
+NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}")   # cc's own valid_name: `add` refuses a repo or row name cc cannot dispatch
 def state(st): return ALIAS.get(st, st)
 # A ROW'S KIND (owner, 2026-09-01): `track` is everything above — a brief, a worker or a session on it, a PR, done.
 # `session` is a long-lived channel session (a course-builder's per-course sessions): no brief needed, no PR, never done,
@@ -492,7 +494,7 @@ def delivery(repo, track):
     record naming another row, or one that will not parse, shows nothing, and every other row prints as it always
     did. Read through `read` for the same reason a board is: what sits in a state dir is somebody's file, so a
     link, a pipe or a directory at that name is refused rather than followed."""
-    if not all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,63}", n) for n in (repo, track)): return ""
+    if not all(NAME_RE.fullmatch(n) for n in (repo, track)): return ""
     try:
         # THE SHAPE IS CHECKED, NOT THE EXCEPTION. That state dir is bound read-write into the track's worker
         # sandbox and into a member workspace, so what is in it is somebody's file: valid JSON that is a string,
@@ -554,6 +556,12 @@ def main(a):
     elif cmd == "add":
         repo, track, title = a[1], a[2], clean(a[3])
         instr = " ".join(a[4:])
+        # A NAME `cc` WILL NOT DISPATCH IS REFUSED HERE, where it is chosen: PR #451's 66-character row was taken by
+        # `add`, then refused by cc's valid_name when the landing sent it a repair round, and the job sat held (2026-09-11).
+        for n in (repo, track):
+            if not NAME_RE.fullmatch(n):
+                sys.exit(f"cc-board add: '{n}' is not a name cc can dispatch ({len(n)} characters; allowed "
+                         f"{NAME_RE.pattern}, 64 at most) — nothing written")
         brief(repo, track)                   # migrate a legacy JSON copy FIRST — the pop below would drop it
         if instr.strip():                    # the brief goes to its one home; the board JSON keeps the title
             before, after = brief_edit("append", repo, track, instr)   # gated, locked, and it APPENDS: never clobber
@@ -800,6 +808,13 @@ def selfcheck():
         ok("`add` writes the brief to task.md", open(f"{th}/.cc/state/r/t1/task.md").read().strip() == "THE BRIEF, in full.")
         ok("…and the board JSON keeps no copy of it", "instructions" not in blob and "THE BRIEF" not in blob)
         ok("`get instructions` reads that file", run("get", "r", "t1", "instructions").stdout.strip() == "THE BRIEF, in full.")
+        # #451: a 66-character row the board took and cc then refused to dispatch. Its own names: 64 kept, 65 refused.
+        n64, n65 = "n" * 64, "m" * 65
+        k, x = run("add", "r", n64, "T", "GOAL: kept."), run("add", "r", n65, "T", "GOAL: refused.")
+        rows = json.loads(run("json", "r").stdout)["tracks"]
+        ok("`add` takes a 64-character row name and refuses a 65-character one cc could not dispatch, writing nothing for it",
+           k.returncode == 0 and n64 in rows and x.returncode != 0 and "64 at most" in x.stderr
+           and n65 not in rows and not os.path.exists(f"{th}/.cc/state/r/{n65}"))
         # Its own fixture: cc-brief's block written into that file by hand, so this stands whether or not a board
         # anywhere has a live track. `cc done` builds the PR body out of this read.
         open(f"{th}/.cc/state/r/t1/task.md", "a").write(

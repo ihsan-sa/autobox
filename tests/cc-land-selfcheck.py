@@ -2299,8 +2299,8 @@ def selfcheck():
           ran_sub("cc-scope", "add", "restart dash.service:") and L.owner_asks)
 
     # a unit the owner keeps that is not RUNNING is on no old code at all — its next start is this change — and an
-    # ask nobody needs is how the ones that matter stop being read. Only a clear answer counts as stopped: a
-    # template unit, which systemctl refuses to answer for, is asked about rather than guessed at.
+    # ask nobody needs is how the ones that matter stop being read. Only a clear answer counts as stopped: a unit
+    # systemctl refuses to answer for is asked about rather than guessed at.
     L = with_dash((0, "dash.service\towner\n"))
     world["systemctl --user is-active dash.service"] = (0, "inactive\n")
     r = caught(L.restart)
@@ -2310,9 +2310,39 @@ def selfcheck():
     world["systemctl --user is-active dash.service"] = (1, "Failed to retrieve unit state: Unit name dash@.service "
                                                            "is neither a valid invocation ID nor unit name.\n")
     r = caught(L.restart)
-    check("…but a unit systemctl will not answer for — a TEMPLATE, whose instances are what run — is asked about, "
+    check("…but a unit systemctl will not answer for is asked about, "
           "not guessed silent: the failure this exists to stop is the ask that was never made",
           ran_sub("cc-scope", "add", "restart dash.service:") and L.owner_asks)
+
+    # A TEMPLATE runs as its instances. PR #473 (2026-09-12) handed the owner `systemctl --user restart
+    # <template>@.service`, and systemd refused it: the name is missing its instance. Each case builds its own.
+    def with_template(policy, listed):
+        D = fresh(pr=7)
+        LINKED[0].append("site@.service")
+        BODY[0]["site@.service"] = "[Service]\nExecStart=%h/bin/sited %i\n"
+        world["systemctl --user is-active"] = (0, "active\n")
+        world["systemctl --user list-units"] = listed
+        world[f"{BIN}/cc-units restart-for"] = (0, f"site@.service\t{policy}\n")
+        world[f"{BIN}/cc-scope add"] = (0, "myrepo a9\n")
+        D.changed = [("M", "site/server.py")]
+        return D
+    L = with_template("owner", (0, "site@blog.service loaded active running Site blog\n"))
+    r = caught(L.restart)
+    check("a template kept for the owner is asked about by its INSTANCE, with a command systemd accepts",
+          L.owner_asks == ["site@blog.service (`systemctl --user restart site@blog.service`)"]
+          and ran_sub("cc-scope", "add", "restart site@blog.service:") and "site@.service`" not in str(r))
+    L = with_template("restart", (0, "site@a.service loaded active running A\nsite@b.service loaded active running B\n"))
+    L.restart()
+    check("…and one the landing restarts itself restarts each instance, never the template's own name",
+          L.restarted == ["site@a.service", "site@b.service"] and not ran_unit("restart", "site@.service"))
+    L = with_template("owner", (0, ""))
+    r = caught(L.restart)
+    check("…and a template with no instance loaded runs no old code, so nobody is asked",
+          isinstance(r, Skip) and not L.owner_asks and not ran_sub("cc-scope", "add"))
+    L = with_template("owner", (1, "Failed to list units\n"))
+    caught(L.restart)
+    check("…and when systemctl will not list them the ask names the glob systemctl expands, never the bare template",
+          L.owner_asks == ["site@*.service (`systemctl --user restart 'site@*.service'`)"])
 
     # and the ledger refusing the row does not red a deploy whose PR is already merged — the card still carries it
     L = with_dash((0, "dash.service\towner\n"))

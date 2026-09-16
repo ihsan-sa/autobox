@@ -543,6 +543,22 @@ def unit_is(query, unit):
     return sh(["systemctl", "--user", query, unit], timeout=60)[1].strip()
 
 
+def unit_instances(unit):
+    """The names a linked unit FILE runs under: itself, or for a template (`name@.service`) each instance systemd has
+    loaded. A template's own name cannot be restarted or asked about — `systemctl --user restart site@.service` is
+    refused as missing its instance, and that is the line PR #473's landing handed the owner (2026-09-12). A
+    template with no instance loaded runs nothing; one systemctl will not list is named by its glob, which
+    `systemctl restart` expands itself, rather than by a name that cannot work."""
+    if "@." not in unit:
+        return [unit]
+    glob_name = unit.replace("@.", "@*.", 1)
+    rc, o = sh(["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", glob_name], timeout=60)
+    if rc:
+        return [glob_name]
+    head, tail = unit.split("@.", 1)
+    return sorted({w for w in o.split() if w.startswith(head + "@") and w.endswith("." + tail) and w != unit})
+
+
 def read_unit(name):
     try:
         return open(f"{UNITS}/{name}", errors="replace").read()
@@ -2128,7 +2144,7 @@ class Land:
 
     # -- 9. restart only what moved ------------------------------------------------------------------------
     def restart(self):
-        """Restart each running unit whose Exec line runs a file this change touched or that imports one (importers), or whose units.json row declares a path it changed: a `none` row is left alone, an `owner` row becomes an ask (owner_ask), NEVER is named and left."""
+        """Restart each running unit whose Exec line runs a file this change touched or that imports one (importers), or whose units.json row declares a path it changed: a `none` row is left alone, an `owner` row becomes an ask (owner_ask), NEVER is named and left. A template unit is restarted or asked about as its instances (unit_instances), never by its own name."""
         files = [p for st, p in self.changed_files() if st != "D"]
         if not files:
             raise Skip("no file list for this landing — nothing to restart")
@@ -2149,15 +2165,16 @@ class Land:
                 continue
             if declared.get(u) == "none":
                 continue                                   # units.json says none: the next start picks the change up; checked before is-active
-            if declared.get(u) == "owner":
-                owned.append(self.owner_ask(u))            # units.json: never automatically — the landing asks them
-                continue
-            if unit_is("is-active", u) != "active":
-                continue                                   # not running: its next start picks the new code up
-            rc, o = sh(["systemctl", "--user", "restart", u], timeout=180)
-            if rc:
-                raise Failed(f"systemctl restart {u}: {last(o)}")
-            self.restarted.append(u)
+            for inst in unit_instances(u):                 # a template runs as its instances, and only they can be restarted or named
+                if declared.get(u) == "owner":
+                    owned.append(self.owner_ask(inst))     # units.json: never automatically — the landing asks them
+                    continue
+                if unit_is("is-active", inst) != "active":
+                    continue                               # not running: its next start picks the new code up
+                rc, o = sh(["systemctl", "--user", "restart", inst], timeout=180)
+                if rc:
+                    raise Failed(f"systemctl restart {inst}: {last(o)}")
+                self.restarted.append(inst)
         tail = (f"; {NEVER} runs a script that moved too — restarting it would take every session on this box "
                 f"down, so do it by hand (`cc rc restart`)") if held else ""
         if owned:
@@ -2169,7 +2186,7 @@ class Land:
 
     def owner_ask(self, unit):
         """A unit units.json keeps for the owner (restart=owner) whose code moved: not restarted; the unit and its restart command go on the card and into the ask ledger, once per unit while an ask is open. A stopped unit is not asked about; a ledger that will not answer does not stop the deploy. Returns the step's sentence."""
-        cmd = f"systemctl --user restart {unit}"
+        cmd = f"systemctl --user restart {shlex.quote(unit)}"     # a unit name passes bare; a template's glob is quoted
         said = f"{unit} moved too and is the owner's to restart (units.json restart=owner)"
         if unit_is("is-active", unit) in ("inactive", "failed"):
             return said + ", and it is not running — its next start is this change"
