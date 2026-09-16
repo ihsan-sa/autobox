@@ -37,6 +37,7 @@ A message never starts a #<repo>--<track> session on its own; with none live it 
 ANYONE who can post in a routed channel is heard — Slack channel membership is the access control, the owner curates it; DMs stay owner-only, a stranger's DM gets 👋 and no session.
 A reply can @-mention a person already in the channel; @main/@<alias> are session hand-offs, not people.
 A session's post naming @main, an orch alias or a live track (reply tool, `cc-slack post`, a card) reaches that session: mirrored into its own channel with a link back, delivered once in the original thread, the poster told where it went.
+A session handed another session's post 👍s it on the first tool call of the turn that post woke, so the channel shows it was read and taken on even when no reply follows; the box's 👀 still only means received, and the owner's own messages keep the reply-or-react rule.
 A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's.
 The owner's 📌 marks a thread "revisit", not a verdict — kept until the 📌 comes off, listed by `cc-slack revisit`.
 Only the owner steers: permission answers, `!` commands, @alias hand-offs and App Home.
@@ -69,6 +70,7 @@ PERM_RE = re.compile(r"^\s*(y|yes|n|no)\s+([a-km-z]{5})(?:\s+(fix))?\s*$", re.I)
 SENT_USING_RE = re.compile(r"\s*\*Sent using\*\s+\S+\s*$")     # claude.ai's Slack connector signs every message it sends
 CHUNK = 3900
 APPROVALS = "approvals"                                        # #approvals is not a session: the owner's :+1: on a bot post there merges the PR
+ACK_MAX = 10                                                   # agent posts one session can be waiting to 👍 at once
 REEXEC = "CC_SLACK_REEXEC"                                     # set on a re-exec'd channel server: the host initialised the copy before it
 GIT_WORK = threading.Lock()                                    # two publishes fetching the same checkout at once race index.lock
 ALERTS = "alerts"                                              # #alerts is not a session: machinery notices (boot, limits, audits, digest) land there
@@ -3612,6 +3614,17 @@ class Daemon:
         rid = ((r.stdout or "").split() or ["?"])[-1]
         log(f"wake {where}: recorded {rid}"); return f"recorded {rid}"
 
+    def ack_post(self, target, alias, chat, ts):
+        """The 👍 a woken session leaves on the agent post that woke it, put on here because the daemon holds the
+        token (a member workspace has none). The owner, 2026-09-12: "a thumbs up from the session would be good
+        beyond regular eyes emoji" — 👀 says the box received it, 👍 says the session read it and took it on, so a
+        post nobody replied to no longer reads as dropped. One per post: the channel server sends it once, on the
+        first tool call of the turn the post woke (Channel.woke_by / ack_woken)."""
+        if not chat or not ts:
+            return
+        self._safe(react, self.cfg, chat, ts, "+1")
+        log(f"ack {target}{'@' + alias if alias else ''}: 👍 on {chat}/{ts}")
+
     def sender(self, chat, peer):
         """`{"sender": chat|""}` from `cc-slack post`: who is sending, is `chat` their own channel.
         Name comes only from the live sub in caller's pid chain (peer_seat), never CC_SLACK_ALIAS or cwd.
@@ -3865,6 +3878,8 @@ class Daemon:
                         continue
                     if msg.get("type") == "permission_request":
                         self.relay_permission(target, msg, alias)
+                    elif msg.get("type") == "ack":   # scoped for a member by the chat check above, like every other type
+                        self.ack_post(target, alias, str(msg.get("chat") or ""), str(msg.get("ts") or ""))
                     elif msg.get("type") == "log":
                         log(f"[{target}] {msg.get('text', '')}")
                     elif member and not member_chat_ok(member, self.chan_name(str(msg.get("chat") or ""))):
@@ -6382,6 +6397,7 @@ class Channel:
         self.handoff = os.environ.get("CC_HANDOFF") or None     # set by `cc __runnext`: this is the successor session
         self.member = os.environ.get("CC_MEMBER_SANDBOX") == "1"   # in a workspace boundary: no token, socket is the member's scoped link
         self.link_started = False   # link starts only after notifications/initialized, else backlog is emitted pre-handshake and dropped
+        self.acks = []              # agent posts handed to this session, waiting for the 👍 its next turn puts on them
         import asyncio
         self.aio = asyncio
         self.out_lock = asyncio.Lock()
@@ -6456,6 +6472,7 @@ class Channel:
         elif m == "tools/call":
             text, err = await self.aio.to_thread(self.call, p.get("name"), p.get("arguments") or {})
             await self.send({"jsonrpc": "2.0", "id": id_, "result": {"content": [{"type": "text", "text": text}], "isError": err}})
+            await self.ack_woken()      # this session is in a turn: 👍 the agent post that woke it (after the result, never before)
         elif m == "notifications/claude/channel/permission_request":
             await self.to_daemon({"type": "permission_request", **{k: str(v) for k, v in p.items()}})
         elif m and m.startswith("notifications/"):
@@ -6469,6 +6486,29 @@ class Channel:
             return False
         rec = handoff_record(self.target)
         return rec is not None and handoff_muted(rec, self.handoff)
+
+    def woke_by(self, meta):
+        """Remember an agent's post so this session's next turn can 👍 it. `from` is in the meta of a post routed by
+        Daemon.wake_channel / route_mentions and of nothing else, so it marks exactly a post another session handed
+        to this one — never the owner's own message (which keeps its reply-or-react rule) and never this session's
+        own post (a poster is handed back "own", never the post itself). Kept here and not in the daemon: the turn
+        that reads the post is the one this server sees the next tools/call from."""
+        if meta.get("from") and meta.get("chat_id") and meta.get("ts"):
+            self.acks.append((meta["chat_id"], meta["ts"]))
+            del self.acks[:-ACK_MAX]     # woken this often with no turn in between: queueing, not reading
+
+    async def ack_woken(self):
+        """👍 each agent post this turn woke, once, riding that turn — no extra wake-up, no poll, no message.
+        The daemon puts the reaction on: it holds the token, and inside a member workspace this process has none.
+        Nothing is said by the muted half of a handoff (the live side owns the channel) or by a --go worker, which
+        never speaks in the owner's channels; either way the post is dropped rather than held for a later turn."""
+        if not self.acks:
+            return
+        posts, self.acks = self.acks, []
+        if os.environ.get("CC_ROLE") == "worker" or self.muted():
+            return
+        for chat, ts in posts:
+            await self.to_daemon({"type": "ack", "chat": chat, "ts": ts})
 
     def call(self, name, a):
         if os.environ.get("CC_ROLE") == "worker":
@@ -6610,8 +6650,10 @@ class Channel:
                         break
                     ev = json.loads(line)
                     if ev.get("type") == "message":
+                        meta = {k: str(v) for k, v in (ev.get("meta") or {}).items()}
                         await self.send({"jsonrpc": "2.0", "method": "notifications/claude/channel",
-                                         "params": {"content": ev.get("content", ""), "meta": {k: str(v) for k, v in (ev.get("meta") or {}).items()}}})
+                                         "params": {"content": ev.get("content", ""), "meta": meta}})
+                        self.woke_by(meta)
                     elif ev.get("type") == "permission":
                         await self.send({"jsonrpc": "2.0", "method": "notifications/claude/channel/permission",
                                          "params": {"request_id": ev.get("request_id"), "behavior": ev.get("behavior")}})

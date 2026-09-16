@@ -2924,6 +2924,64 @@ def run_selfcheck():
           "(addendum 2)",
           answer_rx == [("reactions.add", "+1", "9.7"), ("reactions.remove", "eyes", "9.7")]
           and ack_rx == [("reactions.add", "eyes", "9.8")])
+
+    # ---- THE WOKEN SESSION'S OWN 👍 ON THE POST THAT WOKE IT (owner, 2026-09-12: "channels should react to
+    #      messages sent by agents in slack too so i know it was seen/received/acked ... a thumbs up from the session
+    #      would be good beyond regular eyes emoji"). A real wake through Daemon.wake, the post the channel server is
+    #      handed, the ack its first tool call sends, and the reaction the daemon puts on for it.
+    roleTU = os.environ.pop("CC_ROLE", None)      # a --go worker acks nothing; a suite run from one must not inherit that
+    seatTU = {"s": ("myrepo", "improve")}       # the poster: another seat of this repo, posting into this one's channel
+    dmTU = Daemon(use_slack=False); dmTU.cfg = {"SLACK_BOT_TOKEN": "xoxb-test"}
+    dmTU.route = lambda chat, ctype=None: "myrepo"; dmTU.chan_name = lambda c: "myrepo"
+    dmTU.peer_seat = lambda peer, member=None: seatTU["s"]
+    sentTU, ackedTU, rxTU = [], [], []
+    cTU = Conn(None, "myrepo", {"alias": None}); cTU.send = lambda pl: sentTU.append(pl)
+    dmTU.subs["myrepo"] = [cTU]
+    chTU = Channel("myrepo"); chTU.cfg = {}; chTU.muted = lambda: False
+
+    async def takeTU(obj):
+        ackedTU.append(obj)
+    chTU.to_daemon = takeTU
+    _rxTU = globals()["react"]
+    try:
+        globals()["react"] = lambda cfg, chat, ts, name, remove=False, **k: rxTU.append((chat, ts, name, remove))
+        wokeTU = dmTU.wake("CMY", "5.1", None, "@main one answer each in this thread", None)
+        seatTU["s"] = ("myrepo", None)            # …and the same post made by this session itself
+        ownTU = dmTU.wake("CMY", "5.2", None, "a note of my own", None)
+        for pl in sentTU:
+            chTU.woke_by({k: str(v) for k, v in pl["meta"].items()})
+        pendTU = list(chTU.acks)
+        chTU.woke_by({"chat_id": "CMY", "ts": "5.3", "user": "The Owner", "role": "owner"})   # the owner's: reply-or-react, no 👍
+        ownerTU = list(chTU.acks)
+        chTU.aio.run(chTU.ack_woken())
+        flushTU, emptyTU = list(ackedTU), list(chTU.acks)
+        chTU.aio.run(chTU.ack_woken())            # one 👍 per post, not one per tool call
+        twiceTU = list(ackedTU)
+        for a in flushTU:
+            dmTU.ack_post("myrepo", None, a["chat"], a["ts"])
+        dmTU.ack_post("myrepo", None, "CMY", "")  # an ack naming no message: nothing to react to
+        chTU.acks = [("CMY", "5.4")]; chTU.muted = lambda: True
+        chTU.aio.run(chTU.ack_woken())            # the muted half of a handoff says nothing into the channel
+        mutedTU = (list(ackedTU) == twiceTU and chTU.acks == [])
+    finally:
+        globals()["react"] = _rxTU
+        if roleTU is not None:
+            os.environ["CC_ROLE"] = roleTU
+    check("a post another agent made to wake this session carries that session's 👍 once the session has read it: the "
+          "wake hands the post over with `from` in its meta, the channel server holds it, and the first tool call of "
+          "the turn it woke sends the ack the daemon reacts with — the owner sees from the channel that it was taken "
+          "on, with no reply, no extra wake-up and nothing posted",
+          wokeTU.get("result") == "delivered" and pendTU == [("CMY", "5.1")]
+          and flushTU == [{"type": "ack", "chat": "CMY", "ts": "5.1"}] and emptyTU == []
+          and rxTU == [("CMY", "5.1", "+1", False)])
+    check("…and only an agent's post: the owner's own message is handed over with no `from`, so it keeps today's rule "
+          "(a reply or a reaction is its answer), and a session's OWN post is never handed back to it at all — "
+          "nothing to 👍, and nobody 👍s themselves",
+          ownerTU == pendTU and ownTU.get("result") == "own" and len(sentTU) == 1)
+    check("…once per post, and never from a session that must not speak: a second tool call in the same turn sends "
+          "nothing more, the muted half of a handoff drops its acks instead of reacting into the channel the live "
+          "side owns, and an ack naming no message reacts to nothing",
+          twiceTU == flushTU and mutedTU and len(rxTU) == 1)
     check("the INSTRUCTIONS carry the human half of the owner gates: a member asking for one gets the part that needs no "
           "permission, a plain word about which part does not, and an @-mention of the owner in that thread",
           "that is how you @-mention the owner" in INSTRUCTIONS and "Do not refuse and stop" in INSTRUCTIONS
