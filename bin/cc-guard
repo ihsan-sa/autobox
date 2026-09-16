@@ -22,8 +22,9 @@
 # (record_query below, class page for a deny and nopage for a never) — nothing in the member's own channel, no page
 # to the owner (owner, 2026-09-04). Writing outside the session's own tree is `never` too, but QUIET: the session
 # aimed that write itself and reads the reason on stderr; not even a query is recorded for it.
-# The Agent tool's `isolation: worktree` hands a subagent a tree this session may not write, so that spawn is
-# refused where the guard can see it, and the first write into such a worktree says so in one line (agent_wt).
+# The Agent tool's `isolation: worktree` hands a subagent a tree of its own, and rule 5 FOLLOWS it there: a call
+# standing in <checkout>/.claude/worktrees/<agent> writes THAT tree and no more of ~/dev around it ($awt, in_root)
+# — when git says that dir is a LINKED WORKTREE, a mkdir'd one of the same name being the fence itself.
 # Either gated tier also kills only its own descendants and a run it detached that stands in its own TRACK
 # worktree (a member-facing dir is shared ground, and so is a cwd no marker named) — never a session, `-p` or
 # interactive, a loop runner, a pane of the shared tmux, or anything it did not start (a member workspace's own
@@ -83,7 +84,9 @@ if [ "${1:-}" = selfcheck ]; then
   ok(){ n=$((n+1)); if [ "$2" = 0 ]; then echo "  ✓ $1"; else f=$((f+1)); echo "  ✗ $1"; fi; }
   g(){ local t=$1 i=$2 c=$3 pl; shift 3   # a payload through the gate, in a HOME of its own; rc is the answer
     #  …and the REASON too, for a case that sets $GERR: rc 2 alone cannot say WHICH rule refused (case 11).
-    pl=$(printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"}' "$t" "$i" "$c")
+    #  …and the TRANSCRIPT PATH for a case that sets $GTP: the walk falls back to it when the cwd holds no marker,
+    #  and a subagent's cwd never does — without it case 57 would anchor on the cwd and reproduce nothing.
+    pl=$(printf '{"tool_name":"%s","tool_input":%s,"cwd":"%s"%s}' "$t" "$i" "$c" "${GTP:+,\"transcript_path\":\"$GTP\"}")
     # A PAYLOAD THAT IS NOT JSON IS NOT A TEST. jq fails, the guard sees no tool at all and exits 0, so a row
     # asserting "still allowed" goes GREEN having gated nothing — one did, for a whole review round (#193).
     # rc 99 is neither 0 nor 2, so it fails whichever side the case is asserting.
@@ -1579,39 +1582,69 @@ import os; os.system("echo x; cc-land 7")
 PY
 P56
 
-  # 57. THE TWO FENCES ARE SAID ONCE, AT THE SPAWN AND AT THE FIRST WRITE (row raised-isolated-subagent-refused-
-  #     by-the-guard). A worker spawned builders with the Agent tool's `isolation: worktree`; the harness put each
-  #     in ~/dev/<repo>/.claude/worktrees/agent-<id> and every write there was refused as "outside this session's
-  #     worktree" — a tree the harness would not let them into. Two runs, ~9 min and about $3 each, no file
-  #     changed. Now the spawn is refused where the guard can see it, and a write into such a worktree names both
-  #     rules and the way out. THE OTHER SIDE MUST NOT MOVE: any other path outside the tree keeps its own
-  #     refusal, ~/bin keeps the live-tree one, the session's own tree still writes, a spawn with no isolation
-  #     still runs, and a session whose root IS the checkout writes the agent worktree inside it.
+  # 57. THE FENCE FOLLOWS THE SUBAGENT INTO ITS OWN WORKTREE (rows raised-isolated-subagent-refused-by-the-guard
+  #     and raised-isolation-worktree-writes-refused). `isolation: worktree` puts a builder in
+  #     ~/dev/<repo>/.claude/worktrees/agent-<id>, which holds no marker — so the walk fell back to the transcript
+  #     slug, anchored rule 5 on the PARENT's worktree, and refused first the spawn and then every write the
+  #     subagent made in the tree the harness had just given it: two builders came back read-only after a full
+  #     pass each (~6 min, ~140k tokens) and the work was re-dispatched without isolation (2026-09-15). The
+  #     transcript path is the fixture here — without it the walk would anchor on the cwd and reproduce nothing.
+  #     AND THE DIR MUST BE A WORKTREE, NOT A NAME: a `mkdir -p <checkout>/.claude/worktrees/fake` and a `cd`
+  #     there would otherwise hand a worker the fence itself, `git -C .` from that cwd being the checkout
+  #     (review of #507) — so both dirs are here, one made by `git worktree add` and one by `mkdir`.
+  #     THE OTHER SIDE MUST NOT MOVE: that subagent writes its OWN tree and no more of ~/dev/<repo> around it,
+  #     ~/bin keeps the live-tree refusal from inside it, the parent standing in its own worktree still may not
+  #     write the agent tree by either door, any other path outside the tree keeps its own refusal, the session's
+  #     own tree still writes and a member-facing session is untouched.
   ASKS=$T/asks57; CALLS=$T/calls57; : > "$CALLS"; GERR=$T/err57; r=0
   if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: the write rules wave every path there through"
   else
     H2=$T2/home; WT2=$H2/.cc/worktrees/demo/t1; aw=$H2/dev/demo/.claude/worktrees/agent-7f3
-    mkdir -p "$WT2/.cc" "$aw" "$H2/bin" "$H2/dev/alice/.cc"; : > "$WT2/.cc/track"; : > "$H2/dev/alice/.cc/member-facing"
+    fk=$H2/dev/demo/.claude/worktrees/fake   # …and the same path HAND-MADE: a name, not a worktree
+    mkdir -p "$WT2/.cc" "$fk" "$H2/bin" "$H2/dev/alice/.cc"; : > "$WT2/.cc/track"; : > "$H2/dev/alice/.cc/member-facing"
+    # $aw IS A REAL LINKED WORKTREE, made the way the harness makes one, because that is what the rule now asks
+    # git about — a fixture that only mkdir'd it would assert the refusal for both dirs and prove nothing.
+    git -C "$H2/dev/demo" init -q 2>/dev/null
+    git -C "$H2/dev/demo" -c user.name=t -c user.email=t@e commit -q --allow-empty -m x 2>/dev/null
+    git -C "$H2/dev/demo" worktree add -q --detach "$aw" >/dev/null 2>&1
+    [ -f "$aw/.git" ] || { r=1; echo "      fixture: no linked worktree at $aw — git worktree add failed, so the allow side below tests nothing"; }
     cp "$H/bin/cc-notify" "$H/bin/cc-slack" "$H2/bin/"
     says(){ grep -q "$1" "$GERR" || { r=1; echo "      $2: $(head -c 200 "$GERR")"; }; }
-    e1=$(GH=$H2 g Edit "{\"file_path\":\"$aw/main.py\"}" "$WT2" CC_ROLE=worker)
-    says 'isolation: worktree' "the write refusal does not name the rule"; says 'without isolation' "the write refusal does not name the way out"
-    b1=$(GH=$H2 g Bash "{\"command\":\"echo x > $aw/main.py\"}" "$WT2" CC_ROLE=worker)
-    says 'isolation: worktree' "the redirect refusal does not name the rule"
-    s1=$(GH=$H2 g Agent '{"subagent_type":"builder","isolation":"worktree","prompt":"fix it"}' "$WT2" CC_ROLE=worker)
-    says 'isolation: worktree' "the spawn refusal does not name the rule"; says 'without isolation' "the spawn refusal does not name the way out"
-    s0=$(GH=$H2 g Agent '{"subagent_type":"builder","prompt":"fix it"}' "$WT2" CC_ROLE=worker)
-    o1=$(GH=$H2 g Edit "{\"file_path\":\"$H2/dev/other/x.md\"}" "$WT2" CC_ROLE=worker)
+    tp=$T/tr57/$(printf '%s' "$WT2" | tr '/.' '--')/session.jsonl   # the slug Claude Code makes of the PARENT's worktree
+    # the subagent: cwd IS the agent worktree, the parent's CC_ROLE and transcript ride along
+    a1=$(GTP=$tp GH=$H2 g Edit "{\"file_path\":\"$aw/main.py\"}" "$aw" CC_ROLE=worker)
+    a2=$(GTP=$tp GH=$H2 g Bash '{"command":"echo x > main.py"}' "$aw" CC_ROLE=worker)
+    a3=$(GTP=$tp GH=$H2 g Bash "{\"command\":\"cp /tmp/x $aw/sub/y\"}" "$aw" CC_ROLE=worker)
+    # …and it is fenced to that tree: the checkout around it, and ~/bin, are still refused
+    a4=$(GTP=$tp GH=$H2 g Edit "{\"file_path\":\"$H2/dev/demo/core/bin/x\"}" "$aw" CC_ROLE=worker)
+    says 'editing outside this session' "the subagent lost the fence on the checkout around its worktree"
+    a5=$(GTP=$tp GH=$H2 g Bash '{"command":"cp /tmp/x ~/bin/b"}' "$aw" CC_ROLE=worker)
+    says "box's live tree" "the subagent lost the live-tree refusal on ~/bin"
+    a6=$(GTP=$tp GH=$H2 g Bash '{"command":"git -C . reset --hard HEAD"}' "$aw" CC_ROLE=worker)   # …and git in its own tree, which is what it was given one for
+    s1=$(GTP=$tp GH=$H2 g Agent '{"subagent_type":"builder","isolation":"worktree","prompt":"fix it"}' "$WT2" CC_ROLE=worker)
+    s0=$(GTP=$tp GH=$H2 g Agent '{"subagent_type":"builder","prompt":"fix it"}' "$WT2" CC_ROLE=worker)
+    # the PARENT, standing in its own worktree: the agent tree is not its to write, by either door
+    p1=$(GTP=$tp GH=$H2 g Edit "{\"file_path\":\"$aw/main.py\"}" "$WT2" CC_ROLE=worker)
+    says 'editing outside this session' "the parent lost its refusal on the agent worktree"
+    p2=$(GTP=$tp GH=$H2 g Bash "{\"command\":\"cp /tmp/x $aw/main.py\"}" "$WT2" CC_ROLE=worker)
+    says "box's live tree" "the parent's Bash door lost its refusal on the agent worktree"
+    # A HAND-MADE DIR OF THE SAME SHAPE IS NOT A WORKTREE. Standing in one is how a worker would have taken the
+    # fence with a `mkdir`: the Edit is outside the tree as it always was, and `git -C .` there IS the checkout.
+    f1=$(GTP=$tp GH=$H2 g Edit "{\"file_path\":\"$fk/x\"}" "$fk" CC_ROLE=worker)
+    says 'editing outside this session' "a mkdir'd .claude/worktrees dir was taken for a worktree by the Write door"
+    f2=$(GTP=$tp GH=$H2 g Bash '{"command":"git -C . reset --hard HEAD"}' "$fk" CC_ROLE=worker)
+    says "box's live tree" "a mkdir'd .claude/worktrees dir let git rewrite the checkout around it"
+    o1=$(GTP=$tp GH=$H2 g Edit "{\"file_path\":\"$H2/dev/other/x.md\"}" "$WT2" CC_ROLE=worker)
     says 'editing outside this session' "an ordinary write outside the tree lost its own refusal"
-    o2=$(GH=$H2 g Bash '{"command":"cp /tmp/x ~/bin/b"}' "$WT2" CC_ROLE=worker)
+    o2=$(GTP=$tp GH=$H2 g Bash '{"command":"cp /tmp/x ~/bin/b"}' "$WT2" CC_ROLE=worker)
     says "box's live tree" "a write into ~/bin lost the live-tree refusal"
-    own=$(GH=$H2 g Edit "{\"file_path\":\"$WT2/core/bin/x\"}" "$WT2" CC_ROLE=worker)
-    ownb=$(GH=$H2 g Bash '{"command":"echo x > notes.md"}' "$WT2" CC_ROLE=worker)
+    own=$(GTP=$tp GH=$H2 g Edit "{\"file_path\":\"$WT2/core/bin/x\"}" "$WT2" CC_ROLE=worker)
+    ownb=$(GTP=$tp GH=$H2 g Bash '{"command":"echo x > notes.md"}' "$WT2" CC_ROLE=worker)
     mine=$(GH=$H2 g Edit "{\"file_path\":\"$H2/dev/alice/.claude/worktrees/agent-1/x.md\"}" "$H2/dev/alice")
-    [ "$e1$b1$s1$s0$o1$o2$own$ownb$mine" = "222022000" ] || { r=1
-      echo "      edit $e1 redirect $b1 spawn $s1 plain-spawn $s0 other $o1 bin $o2 own $own own-redirect $ownb member $mine"; }
+    [ "$a1$a2$a3$a4$a5$a6$s1$s0$p1$p2$f1$f2$o1$o2$own$ownb$mine" = "00022000222222000" ] || { r=1
+      echo "      sub edit $a1 redirect $a2 cp $a3 checkout $a4 bin $a5 git $a6 | spawn $s1 plain-spawn $s0 | parent edit $p1 cp $p2 | fake edit $f1 fake git $f2 | other $o1 bin $o2 own $own own-redirect $ownb member $mine"; }
   fi
-  ok "a write into a harness agent worktree, and the isolation: worktree spawn itself, are refused in one line naming both rules and the way out — while every other write outside the tree keeps its own refusal and the session's own tree still writes" $r
+  ok "a subagent spawned with isolation: worktree writes and runs git in the worktree the harness gave it — the spawn runs and rule 5 follows it there — while a hand-made dir of the same shape is refused by both doors, that subagent still may not write the checkout around it or ~/bin, the parent still may not write the agent tree by either door, and every other write outside the tree keeps its own refusal" $r
 
   # 58. A GITHUB ORG THE BOX MAY NOT TOUCH IS REFUSED IN EVERY SESSION — no role, and a worker alike — when the line runs
   #     git, gh or reaches github naming it as an owner, in any case; the reason names the org and the list. A repo of
@@ -1648,6 +1681,55 @@ an unrelated gh call|un|pass|gh api user
 the list absent, the same clone|no|pass|git clone https://github.com/acme-denied/x.git
 W58
   ok "a listed GitHub org is refused in any session — git by URL, gh by argument, GH_REPO or bare, the API by curl or python, raw content, behind a wrapper — naming the org and the list; a same-named repo, prose, another org and no list pass" $r
+
+  # 59. A DIRECTORY NAMED `mail` IS NOT A SEND VERB (row raised-a-path-under-core-mail-is-read-as-sending-email).
+  #     cmdpos puts every SUFFIX of a statement at ^ and `\b` matched across a slash, so an ARGUMENT like
+  #     `mail/vetting.py` stood in command position: a sed read, a grep and a python run of core's own mail suite
+  #     were each refused "sending email" on 2026-09-15, four turns, and the workaround was to spell the directory
+  #     through a shell variable. Those reads go through now. THE SEND VERBS DO NOT MOVE: bare, behind a wrapper,
+  #     after a pipe, and each of the four names — that half is the whole point of the rule.
+  ASKS=$T/asks59; CALLS=$T/calls59; : > "$CALLS"; GERR=$T/err59; r=0
+  says(){ grep -q "$1" "$GERR" || { r=1; echo "      $2: $(head -c 200 "$GERR")"; }; }
+  p1=$(g Bash '{"command":"sed -n 1,50p mail/vetting.py"}' "$WT" CC_ROLE=worker)
+  p2=$(g Bash '{"command":"python3 mail/selfcheck.py"}' "$WT" CC_ROLE=worker)
+  p3=$(g Bash '{"command":"cd core; python3 mail/selfcheck.py"}' "$WT" CC_ROLE=worker)
+  p4=$(g Bash '{"command":"shellcheck mail/run.sh"}' "$WT" CC_ROLE=worker)   # NOT `git diff mail/x`: `diff` is a NOEXEC head, so the walk stops before the path and that spelling never reproduced
+  p5=$(g Bash '{"command":"python3 -m pytest mail.tests"}' "$WT" CC_ROLE=worker)
+  v1=$(g Bash '{"command":"mail -s x owner@example.com"}' "$WT" CC_ROLE=worker)
+  says 'sending email' "a bare mail(1) lost the rule"
+  v2=$(g Bash '{"command":"flock /tmp/l mail -s x owner@example.com"}' "$WT" CC_ROLE=worker)
+  says 'sending email' "mail(1) behind a wrapper lost the rule"
+  v3=$(g Bash '{"command":"sendmail -t < /tmp/m"}' "$WT" CC_ROLE=worker)
+  v4=$(g Bash '{"command":"echo hi | mutt -s x owner@example.com"}' "$WT" CC_ROLE=worker)
+  v5=$(g Bash '{"command":"msmtp owner@example.com"}' "$WT" CC_ROLE=worker)
+  [ "$p1$p2$p3$p4$p5$v1$v2$v3$v4$v5" = "0000022222" ] || { r=1
+    echo "      sed $p1 python $p2 after-cd $p3 shellcheck $p4 dotted $p5 | mail $v1 wrapped $v2 sendmail $v3 mutt $v4 msmtp $v5"; }
+  ok "a sed read, a python run, a shellcheck and a dotted module name that name a directory called mail are not sending email, while mail, sendmail, mutt and msmtp are still refused bare, behind a wrapper and after a pipe" $r
+
+  # 60. THE WRITE TOOL AND A `cp` GIVE THE SAME ANSWER ABOUT THE IMPROVE PROPOSALS DIR (row raised-cc-guard-
+  #     refuses-the-write-tool-into-the-improve-proposals-dir). ~/.cc/state/<repo>/improve/proposals is the improve
+  #     orch's shared ledger, written by cc-improve from whichever track runs a trial: the Bash door always let a
+  #     `cp` land there, while the Write tool was refused as "another track's state" — one turn on 2026-09-15 and
+  #     a workaround every trial would repeat. Both doors allow it now, for THIS repo's. NOTHING ELSE MOVES:
+  #     another track's state dir, another repo's proposals and the improve ledger beside the dir are refused as
+  #     before, the track's own state dir still writes, and a member-facing session is not this repo's track.
+  ASKS=$T/asks60; CALLS=$T/calls60; : > "$CALLS"; GERR=$T/err60; r=0
+  if [ -z "$T2" ]; then r=1; echo "      no fixture home outside /tmp: these rules wave /tmp through, so nothing here would be gated"
+  else
+    H2=$T2/home; WT2=$H2/.cc/worktrees/demo/t1; pd=$H2/.cc/state/demo/improve/proposals
+    mkdir -p "$WT2/.cc" "$H2/dev/alice/.cc"; : > "$WT2/.cc/track"; : > "$H2/dev/alice/.cc/member-facing"
+    w1=$(GH=$H2 g Write "{\"file_path\":\"$pd/07-a/why\"}" "$WT2" CC_ROLE=worker)
+    b1=$(GH=$H2 g Bash "{\"command\":\"cp /tmp/why $pd/07-a/why\"}" "$WT2" CC_ROLE=worker)
+    w2=$(GH=$H2 g Write "{\"file_path\":\"$H2/.cc/state/demo/other-track/task.md\"}" "$WT2" CC_ROLE=worker)
+    says 'another track' "another track's state dir lost its refusal"
+    w3=$(GH=$H2 g Write "{\"file_path\":\"$H2/.cc/state/other-repo/improve/proposals/07-a/why\"}" "$WT2" CC_ROLE=worker)
+    w4=$(GH=$H2 g Write "{\"file_path\":\"$H2/.cc/state/demo/improve/trials.tsv\"}" "$WT2" CC_ROLE=worker)
+    w5=$(GH=$H2 g Write "{\"file_path\":\"$H2/.cc/state/demo/t1/progress.md\"}" "$WT2" CC_ROLE=worker)
+    mem=$(GH=$H2 g Write "{\"file_path\":\"$pd/07-a/why\"}" "$H2/dev/alice")
+    [ "$w1$b1$w2$w3$w4$w5$mem" = "0022202" ] || { r=1
+      echo "      write $w1 cp $b1 other-track $w2 other-repo $w3 ledger $w4 own $w5 member $mem"; }
+  fi
+  ok "the Write tool and a cp both land in this repo's improve proposals dir, while another track's state, another repo's proposals, the ledger beside the dir and a member-facing session are refused exactly as before" $r
 
   echo "cc-guard selfcheck: $((n - f)) passed, $f failed"
   [ "$f" = 0 ] || exit 1
@@ -2187,6 +2269,34 @@ if [ -z "$root" ] && [ "$role" = worker ]; then
   if [ -n "$slug" ]; then for w in "$HOME"/.cc/worktrees/*/*; do s=${w//\//-}; s=${s//./-}
     [ "$s" = "$slug" ] || continue; [ -f "$w/.cc/track" ] && track_dir "$w"; break; done; fi
 fi
+# A SUBAGENT SPAWNED WITH `isolation: worktree` STANDS IN A TREE OF ITS OWN, AND RULE 5 FOLLOWS IT THERE.
+# The harness puts it in <checkout>/.claude/worktrees/agent-<id> and will accept no other cwd. That dir holds no
+# marker, so the walk above fell through to the transcript slug — which names the dir the SESSION started in, the
+# PARENT's worktree — and rule 5 then fenced the subagent to a tree the harness would not let it into: on
+# 2026-09-15 two builders spawned that way came back read-only after a full pass each (~6 min, ~140k tokens) and
+# the work was re-dispatched without isolation (row raised-isolation-worktree-writes-refused). The fence is not
+# the parent's tree, it is the tree this call is STANDING in: $awt is added to $root rather than replacing it, so
+# the subagent writes its own worktree and the parent still writes its own when it steps into one to collect the
+# files. Nothing else moves — the rest of ~/dev/<repo>, ~/bin and ANOTHER agent's worktree keep their refusals,
+# and a member session is untouched (its marker sets $root and $mdir above, and in_root already spans $mdir).
+# AND THE DIRECTORY MUST REALLY BE A LINKED WORKTREE, not a path that looks like one. On a bare glob, anyone who
+# could MAKE the path took the fence with it: `mkdir -p ~/dev/<repo>/.claude/worktrees/x` (mkdir is no verb of
+# wscan's) and a `cd` there made in_root true for a plain subdir of the checkout, so `git -C .` reset, checkout
+# or clean from that cwd rewrote ~/dev/<repo> itself — which wtgt had refused before this rule existed (review
+# of #507). So git is asked, and only a linked worktree answers: its git dir is <common dir>/worktrees/<name>,
+# while a mkdir'd subdir resolves to the checkout's own .git and a `git init` or a hand-written `.git` gives a
+# git dir that is not under the common one at all. Anything else — including no git and no such dir — leaves
+# $awt empty and rule 5 stands exactly where it did. A gated session cannot manufacture the yes either: `git
+# worktree add` hands ~/dev/<repo> to wtgt, and writing the `.git` file by hand is the very write being decided.
+# GIT_DIR and its two siblings are unset for the question — they are the caller's to set, and an exported one
+# would otherwise answer it.
+awt=""
+case "$cwd" in */.claude/worktrees/*) awp=${cwd%%/.claude/worktrees/*}/.claude/worktrees/; awr=${cwd#"$awp"}; awt=$awp${awr%%/*};; esac
+if [ -n "$awt" ]; then
+  awg=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git -C "$awt" rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null)
+  awd=${awg%%$'\n'*}; awc=${awg##*$'\n'}   # line 1: this dir's own git dir; line 2: the common one it shares
+  [ "$awd" != "$awc" ] && [ "${awd%/*}" = "$awc/worktrees" ] || awt=""
+fi
 case "$mws" in *[!a-z0-9-]*) mws="";; esac   # the handle goes into a regex below: [a-z0-9-] or nothing at all
 # $mdir is the member-facing session dir, and its basename is its Slack channel: the refusal below is posted there.
 # An OVERLAPPING HANDOFF (cc-handoff): two sessions share this cwd, and exactly one of them is LIVE. The other
@@ -2236,22 +2346,16 @@ fi
 [ -n "$handoff_gated" ] && [ "$role" != member ] && role=worker   # the four owner gates below, at least
 case "$role" in worker|member) ;; *) exit 0;; esac
 [ -n "$root" ] || root=$cwd   # nothing to anchor on (an env-only role, a handoff-gated session): the cwd, as before
-in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && case "$1" in "$mdir"|"$mdir"/*) return 0;; esac; return 1; }
-# TWO FENCES THAT CANNOT BOTH BE SATISFIED ARE SAID ONCE, NOT A HUNDRED TIMES. The Agent tool's `isolation:
-# worktree` puts a subagent in <repo checkout>/.claude/worktrees/agent-<id> and will accept no other cwd; rule 5
-# below fences a track to its own worktree and will accept no other tree. On 2026-09-11 two Opus builders spawned
-# that way from a worker session had every Edit, Write and redirect refused as "outside this session's worktree",
-# naming a tree the harness would not let them into: ~9 min and about $3 each, no file changed, and nothing said
-# at spawn time that the pair is impossible. So it is said at the spawn, and at the first write.
-# WHY NOT ALLOW THE WRITE INSTEAD — the other half of this row. A tight allowance was weighed and refused: that
-# worktree lives INSIDE ~/dev/<repo>, the checkout the box runs, so allowing it opens the one fence rule 5 exists
-# for (and its Bash half with it, since the subagent must also `git -C` there); its branch is cut from that
-# checkout's HEAD, not from the session's branch, so it cannot even be tied back to the session; and nothing in
-# `cc` commits or lands a tree under ~/dev/<repo>/.claude, so the builder would finish into a worktree no PR ever
-# reaches — the same wasted run, more quietly. Refusing early costs one turn.
-agent_wt(){ case "$1" in */.claude/worktrees/*) return 0;; esac; return 1; }
-agent_wt_never(){   # $1 = the tree the harness confined the subagent to
-  never "isolation: worktree cannot be used from this session — the harness confines that subagent to $1, rule 5 here fences this session to $root, and no write satisfies both; spawn the builder again without isolation and it writes this worktree directly" quiet; }
+in_root(){ case "$1" in "$root"|"$root"/*) return 0;; esac; [ -n "$mdir" ] && case "$1" in "$mdir"|"$mdir"/*) return 0;; esac
+  [ -n "$awt" ] && case "$1" in "$awt"|"$awt"/*) return 0;; esac; return 1; }   # $awt: the agent worktree this call stands in — see above
+# THE TWO FENCES USED TO BE IMPOSSIBLE TOGETHER, AND THE ANSWER WAS TO REFUSE THE SPAWN. It is now to move the
+# fence: $awt above makes rule 5 follow the subagent into <checkout>/.claude/worktrees/agent-<id>, so `isolation:
+# worktree` spawns, writes and is still fenced — to ITS OWN tree, not to the whole checkout around it. The earlier
+# reading (that allowing the write "opens the one fence rule 5 exists for") was wrong about the SIZE of the
+# opening: what opens is one ephemeral worktree the harness just made for this session's own subagent, not
+# ~/dev/<repo>. Its branch is still cut from the checkout's HEAD rather than the session's, and nothing in `cc`
+# lands a tree under ~/dev/<repo>/.claude — so the PARENT collects the files and commits them in its own
+# worktree, which is what a subagent's work has always needed (WORKING.md: "you commit and land what it wrote").
 # A MEMBER REFUSAL IS A QUERY TO THE BOX, NOT A LINE IN THE MEMBER'S CHANNEL. Until now a member-facing deny put a
 # 🔐 line in the member's own channel (which the members read) and DM'd the owner. The owner's call (2026-09-04): a
 # member session "should have enough permissions to do stuff. These errors should just be routed to you instead" —
@@ -2500,7 +2604,14 @@ case "$tool" in
     # 2. external comms
     rx "$AT"'gh +(issue +(create|comment)|pr +(comment|review|close|reopen)|release +create)' && deny "public GitHub comms"
     rx "$AT"'gh +(repo +(delete|archive)|api)\b' && deny "gh repo delete/archive or a raw gh api call"
-    rx "$AT"'(mail|sendmail|msmtp|mutt)\b' && deny "sending email"
+    # A DIRECTORY NAMED `mail` IS NOT A SEND VERB. cmdpos puts every SUFFIX of a statement at ^, and `\b` matched
+    # across a slash, so `python3 mail/selfcheck.py`, `sed -n 1,50p mail/vetting.py` and `cd core; grep … mail/x`
+    # each stood a PATH in command position and were refused "sending email" — a read, a grep and a test run of
+    # core's own mail suite, four turns of it (row raised-a-path-under-core-mail-is-read-as-sending-email,
+    # 2026-09-15). The verb ends the word here: a `/`, a `.` or a `-` after it makes the token a path or another
+    # name, and neither sends anything. `mail -s x o@e.com` and `mail` alone are unchanged — a space, a
+    # separator and end-of-line all still close it.
+    rx "$AT"'(mail|sendmail|msmtp|mutt)([^A-Za-z0-9_./-]|$)' && deny "sending email"
     # 3. destructive / infra
     rx "$AT"'cc +slack +off' && never "cc slack off (drops the owner's live Slack link)"
     # …and `cc-broker inject`, which is "an argv-compatible wrapper onto the same daemon door" (review of #190,
@@ -2838,8 +2949,7 @@ case "$tool" in
       case "$t" in "$HOME"/dev/*|"$HOME"/bin|"$HOME"/bin/*|"$HOME"/.cc/state/arch|"$HOME"/.cc/state/arch/*) in_root "$t" && return 1; hit=$t; return 0;; esac
       [ -n "$g" ] && wspan "$t" "$HOME/dev/" "$HOME/bin" "$HOME/.cc/state/arch" && return 0
       return 1; }
-    wdeny(){ agent_wt "$hit" && agent_wt_never "$hit"   # a harness agent worktree under ~/dev/<repo> gets the reason it is really refused for
-      never "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs, ~/bin symlinks into it and ~/.cc/state/arch is the ledger for what has already been sent outward — a track writes its worktree, /tmp and the rest of its own ~/.cc/state dir, and the rest arrives as a PR"; }
+    wdeny(){ never "writing into the box's live tree ($hit): ~/dev/<repo> is the checkout the box runs, ~/bin symlinks into it and ~/.cc/state/arch is the ledger for what has already been sent outward — a track writes its worktree, /tmp and the rest of its own ~/.cc/state dir, and the rest arrives as a PR"; }
     # DELETING THE RECORD IS THE OTHER HALF OF WRITING IT, and the fence above only covered writing. cc-arch reads
     # ~/.cc/state/arch to know which architecture revisions it has already sent; a shell that cannot overwrite the
     # cursor but CAN unlink it drops the tool onto its first-run branch, which re-pins to the head of the branch
@@ -3130,10 +3240,6 @@ case "$tool" in
       rx "$AT"'([^ ]*/)?cc-config\b' && never "the box's config is not a member's to read or rewrite (cc-config)"
     fi
     ;;
-  Agent|Task)   # the one tool that can put this session's work somewhere this session may not write
-    if [ "$(jq -r '.tool_input.isolation // ""' <<<"$inp")" = worktree ] && [ -n "$trepo" ] && ! in_root "$HOME/dev/$trepo/.claude/worktrees"; then
-      never "spawning a subagent with isolation: worktree — the harness would put it under ~/dev/$trepo/.claude/worktrees/agent-<id>, rule 5 fences this session to $root, and every write it made there would be refused; spawn it without isolation and it works in this worktree" quiet
-    fi ;;
   Read|NotebookRead|Grep|Glob)   # gating these files in Bash alone would be theatre if a file-reading TOOL served them
     fp=$(jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.path // ""' <<<"$inp")
     [ -n "$fp" ] && fp=$(realpath -m -- "$fp" 2>/dev/null || echo "$fp")
@@ -3158,9 +3264,16 @@ case "$tool" in
           own=""; [ -n "$mws" ] && case "$fp" in "$HOME/.cc/state/$mws"|"$HOME/.cc/state/$mws"/*) own=1;; esac
           [ -n "$own" ] || never "writing another session's state ($fp) — a task.md there is work the box would run" quiet
         elif [ -n "$trepo" ]; then case "$fp" in "$HOME/.cc/state/$trepo/$ttrack"|"$HOME/.cc/state/$trepo/$ttrack"/*) ;;
+          # THE TWO DOORS GIVE THE SAME ANSWER. ~/.cc/state/<repo>/improve/proposals is the improve orch's shared
+          # ledger — cc-improve writes it from whichever track runs a trial — and the Bash door has always let a
+          # `cp` land there (wtgt fences ~/dev, ~/bin and ~/.cc/state/arch, not the rest of a track's state),
+          # while this one refused the Write tool the same bytes as "another track's state": one turn, and a
+          # workaround every improve trial would repeat (row raised-cc-guard-refuses-the-write-tool-into-the-
+          # improve-proposals-dir, 2026-09-15). This session's OWN repo's, matching what cp already reaches;
+          # another repo's, and every other track's state dir, are refused exactly as before.
+          "$HOME/.cc/state/$trepo/improve/proposals"|"$HOME/.cc/state/$trepo/improve/proposals"/*) ;;
           *) never "writing another track's state ($fp) — this track's is ~/.cc/state/$trepo/$ttrack" quiet;; esac
         fi;;
-      */.claude/worktrees/*) agent_wt_never "$fp";;   # the harness's own agent worktree: the impossibility, not the hundredth refusal
       *) never "editing outside this session's worktree ($fp) — a track writes its worktree, /tmp and its own ~/.cc/state dir" quiet;;
     esac; fi ;;
 esac

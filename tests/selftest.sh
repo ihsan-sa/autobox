@@ -2813,7 +2813,11 @@ fi
 if stanza "cc-publish: core/ publishes itself"; then
 PUB="$T/mirror.git"; git init -q --bare "$PUB"
 cd ~/dev/$REPO || exit 1
-pub(){ env CC_PUBLISH_STATE="$T" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE="$PUB" PUBLISH_REPO=$REPO PUBLISH_PREFIX=core PUBLISH_BRANCH=main PUBLISH_ALLOW=LICENSE "$B/cc-publish"; }
+# A LEDGER OF ITS OWN, beside the call that needs it — not the run-wide export far above. The abort below RECORDS
+# a failure, and on 2026-09-11 that record landed in the box's LIVE ~/.cc/failures as scope `_cctest<pid>`, 18 times
+# over the next day, where the detector read every one as real. Pointed here, the two cases after the abort read
+# both ends: the record is in this dir, and the live one gained nothing. Drop this and the first goes red.
+pub(){ env CC_PUBLISH_STATE="$T" CC_FAILURES="$T/failures-publish" CC_NOTIFY_LOG="$T/notify.log" PUBLISH_REMOTE="$PUB" PUBLISH_REPO=$REPO PUBLISH_PREFIX=core PUBLISH_BRANCH=main PUBLISH_ALLOW=LICENSE "$B/cc-publish"; }
 mkdir -p core/bin && echo generic > core/bin/tool && echo "overlay only" > private.md
 git add -A && git commit -qm "core: a generic tool" >/dev/null && git push -q origin HEAD
 pub >/dev/null 2>&1
@@ -2831,6 +2835,10 @@ out=$(pub 2>&1); rc=$?
 paged(){ grep -c "publish blocked" "$T/notify.log" 2>/dev/null || echo 0; }
 n=$(paged); out=$(pub 2>&1); rc=$?
 { [ "$(paged)" = "$n" ] && [ $rc != 0 ] && grep -q "identity gate" <<<"$out"; } && ok "the same abort pages the owner once, not once per timer tick (it still fails loudly)" || bad "a repeated abort re-paged the owner (was $n, now $(paged))"
+# BOTH ENDS of the record that abort wrote: it is in this stanza's own ledger, and the box's live one gained no
+# `_cctest…` scope. The second line only READS ~/.cc/failures — this suite never writes or deletes anything there.
+[ -s "$T/failures-publish/$REPO.jsonl" ] && ok "the abort's failure record lands in the ledger this stanza pointed the recorder at" || bad "the abort recorded nothing in $T/failures-publish — the pointer in pub() is gone, and the next hand to remove the run-wide one leaks into ~/.cc/failures"
+[ ! -e ~/.cc/failures/"$REPO".jsonl ] && ok "…and the box's LIVE ~/.cc/failures never gains a \`$REPO\` scope — the 2026-09-11 leak, now a case" || bad "a selftest run wrote $REPO.jsonl into the live ~/.cc/failures"
 git rm -q core/bin/leak && git commit -qm "core: no leak" >/dev/null && git push -q origin HEAD
 pub >/dev/null 2>&1
 [ -f "$T/publish.notified" ] && bad "a publish that got through still remembers the old abort — it would never page again" || ok "a publish that gets through forgets the abort, so the same reason pages again if it returns"
