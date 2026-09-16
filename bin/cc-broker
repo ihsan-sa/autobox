@@ -47,6 +47,8 @@ A TARGET IS A KEY and is never parsed here: `<repo>` for a planning seat, `<repo
 NOTHING IS DROPPED, EVER. There is no budget in this file and no rule that declines to act. A held event is
 delivered late, never not at all. If the target does not hear it, the box's own session is offered it; if nobody
 answers at all, the group is retried every 60 s and then said out loud to the owner by escalate().
+WHAT HOLDS ONE. The flush asks `cc-tier allows pulse` as it asks `cc-pause is` — under tier stop, whose whole
+meaning is that nobody is woken, an injected event bought the seat a turn all the same. Held, never dropped.
 """
 import sys, os, re, json, time, calendar, socket, subprocess, fcntl, contextlib
 
@@ -299,6 +301,16 @@ def paused(target):
         return False
 
 
+def tier_allows(what):
+    """`cc-tier allows <what>`: exit 1 is "wait"; any other exit, or a cc-tier that cannot run, is "go" — the same
+    reading cc-reconcile's wake takes, so the box's two wake paths cannot drift apart on the same dial."""
+    try:
+        return subprocess.run([f"{BIN}/cc-tier", "allows", str(what)], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=10).returncode != 1
+    except Exception:
+        return True
+
+
 def flush_one(target):
     """THREE PHASES, and the middle one is not under the lock. Read-modify-write pending, then send, then
     read-modify-write pending again with the result — because a lock held across a send is held for as long as the
@@ -306,9 +318,10 @@ def flush_one(target):
     while still waiting for the lock, before it was ever written down (review of #190, F2). And this target's
     outcome is saved before the next one is even tried, so one hung target cannot throw away a whole run's worth
     of deliveries and re-wake every other session a minute later (F3)."""
-    # A PAUSED PROJECT BUYS NO WAKE. Returning here leaves the group PENDING, which is this file's whole promise:
-    # the events ride out on the first flush after the resume.
-    if paused(target):
+    # A PAUSED PROJECT BUYS NO WAKE, and neither does one under a spend tier that wakes nobody. Returning here
+    # leaves the group PENDING, which is this file's whole promise: the events ride out on the first flush after
+    # the resume, or after the tier lifts.
+    if paused(target) or not tier_allows("pulse"):
         return 0
     # PHASE A — locked. What is due, and the exact message for it.
     with locked():
@@ -533,7 +546,9 @@ def selfcheck():
 
     def env(**extra):
         return {**os.environ, "HOME": th, "CC_BROKER_INJECT": stub, "CC_SC_REC": rec, "CC_SC_SLOW": slow,
-                "CC_BOX": "abox", "CC_NOTIFY_LOG_ONLY": "1", "CC_NOTIFY_LOG": f"{th}/notify.log", **extra}
+                "CC_BOX": "abox", "CC_NOTIFY_LOG_ONLY": "1", "CC_NOTIFY_LOG": f"{th}/notify.log",
+                "CC_SPEND_TIER": "autonomous",     # the tier the box is on right now is nobody's fixture
+                **extra}
 
     def run(*args, **extra):
         return subprocess.run([sys.executable, os.path.realpath(__file__), *args],
@@ -639,6 +654,18 @@ def selfcheck():
         run("--flush", "rp")
         ok("a paused project is not woken, and the event waits in pending for the first flush after the resume",
            parked and calls() == 1 and "rp/t needs you" in said() and not pending("rp"))
+        os.truncate(rec, 0)
+
+        # AND NEITHER DOES A SPEND TIER THAT WAKES NOBODY — the box's other dial, asked the same way. Its own
+        # fixture: the real cc-tier, reading the tier out of the environment cc-config hands it.
+        run("inject", "--source", "reconcile", "rt", "rt/t needs you: pick", CC_SPEND_TIER="stop")
+        held = calls() == 0 and bool(pending("rt"))
+        run("--flush", "rt", CC_SPEND_TIER="stop")
+        held = held and calls() == 0 and bool(pending("rt"))
+        run("--flush", "rt", CC_SPEND_TIER="autonomous")
+        ok("under a tier whose whole meaning is that nobody is woken the event is held too, not even for a "
+           "decision, and it rides out on the first flush after the tier lifts",
+           held and calls() == 1 and "rt/t needs you" in said() and not pending("rt"))
         os.truncate(rec, 0)
 
         # `queued` IS SOMEBODY HAVING IT. The daemon holds it for a session that is not up yet and tells the owner
