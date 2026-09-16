@@ -41,8 +41,9 @@ A session handed another session's post 👍s it on the first tool call of the t
 A reaction is a verdict from anyone in the channel (a member's :+1: in #approvals merges the PR, exactly as the owner's does); DM reactions stay the owner's.
 The owner's 📌 marks a thread "revisit", not a verdict — kept until the 📌 comes off, listed by `cc-slack revisit`.
 Only the owner steers: permission answers, `!` commands, @alias hand-offs and App Home.
-The `!` commands are `!pause`/`!resume`, `!restart <box|repo[/track]|slack|tmux>` and `!reboot`, owner-only, any channel or thread; anything else typed is a message to the session.
+The `!` commands are `!pause`/`!resume` (each also as `-only` and `-under`), `!restart <box|repo[/track]|slack|tmux>` and `!reboot`, owner-only, any channel or thread; anything else typed is a message to the session.
 `!pause` parks this channel's project and everything declared under it, queuing what arrives; `!resume` unparks it; a project parked on its own stays parked when its parent resumes.
+`!pause-only`/`!resume-only` stop at this project and leave what is under it exactly as it was; `!pause-under`/`!resume-under` say the walk out loud and mean what the bare verbs already do. Either way the answer ends with a `Reach:` line naming how far it went, so nobody has to predict it from CC_PROJECT_CHILDREN.
 App Home republishes every 30s and on open, leading with what needs the owner, then running/idle counts, the backlog, the channels, a 24h vitals chart, then load, handoff count, audit and boot.
 While a handoff overlap is open on a target, only the session the record calls live is delivered to (permission answers included); the muted one's reply/react/file are refused.
 See ~/COMMS.md and ~/USAGE.md.
@@ -5493,25 +5494,35 @@ class Daemon:
         cmd = cmd.lower()
         if not is_owner:
             return self.say(chat, f"`!{cmd}` is the owner's", thread)
-        if cmd in ("pause", "resume"):
-            return self.cmd_pause(cmd, arg, chat, thread, target)
+        # THE REACH IS PART OF THE VERB (owner, 2026-09-16): `-only` stops at this project, `-under` walks
+        # everything declared under it, and the bare word keeps the meaning it has always had, which is `-under`.
+        # He asked for this after predicting the wrong reach from a channel and telling a seat to undo a cascade
+        # that had never run — so the suffix is what a person types, not something inferred from a config key.
+        if cmd in ("pause", "resume", "pause-only", "resume-only", "pause-under", "resume-under"):
+            verb, _, reach = cmd.partition("-")
+            return self.cmd_pause(verb, arg, chat, thread, target, only=(reach == "only"))
         if cmd == "restart":
             return self.cmd_restart(arg, chat, thread)
         if cmd == "reboot":
             return self.cmd_reboot(arg, chat, thread)
-        self.say(chat, f"unknown command `!{cmd}` — the commands are `!pause` `!resume` `!restart <box|repo[/track]|slack|tmux>` "
-                       f"`!reboot`; anything without a `!` is a message to the session", thread)
+        self.say(chat, f"unknown command `!{cmd}` — the commands are `!pause` `!resume` (and `!pause-only` "
+                       f"`!resume-only` for this project alone, `!pause-under` `!resume-under` for it and everything "
+                       f"under it), `!restart <box|repo[/track]|slack|tmux>` `!reboot`; anything without a `!` is a "
+                       f"message to the session", thread)
 
-    def cmd_pause(self, cmd, arg, chat, thread, target):
-        """`!pause`/`!resume` parks or unparks the channel's whole project in one line.
+    def cmd_pause(self, cmd, arg, chat, thread, target, only=False):
+        """`!pause`/`!resume` parks or unparks the channel's project in one line.
         Channel is the argument (`!pause` pauses that project); a name pauses another; a track pauses it.
+        `only=True` (from `!pause-only`/`!resume-only`) stops at this project and never walks what is declared
+        under it; the default walks them, which is what the bare verbs have always done.
         Owner only. The channel keeps working: `!resume` answers; other messages queue."""
         repo = (arg or "").split()[0] if (arg or "").strip() else (target or "").partition("/")[0].partition("@")[0]
         if not repo:
             return self.say(chat, f"`!{cmd}`: no project for this channel — say `!{cmd} <repo>`", thread)
         try:
             # --from skips this channel (it gets the answer below); cc-pause tells every other one that went quiet.
-            p = subprocess.run([f"{BIN}/cc-pause", "on" if cmd == "pause" else "off", repo, "--from", chat],
+            p = subprocess.run([f"{BIN}/cc-pause", "on" if cmd == "pause" else "off", repo, "--from", chat]
+                               + (["--only"] if only else []),
                                capture_output=True, text=True, timeout=120, cwd=HOME)
         except subprocess.TimeoutExpired:
             return self.say(chat, f"`cc-pause {'on' if cmd == 'pause' else 'off'} {repo}` timed out after 120 s — "
@@ -5520,8 +5531,10 @@ class Daemon:
         if p.returncode == 0 and cmd != "pause":          # hand over what was said while it was parked
             # resume drains children's queues too, not just this repo's, or a child's messages sit until the TTL
             # drops them; a child still paused on its own keeps its queue.
+            # `!resume-only` did not resume a child, so draining one here would deliver its queue to a project
+            # that is still parked — the queue must stay with the pause until whoever lifts it lifts that too.
             n = self.drain_resumed(repo)
-            for child in self.pause_children(repo):
+            for child in ([] if only else self.pause_children(repo)):
                 if not paused(child):
                     n += self.drain_resumed(child)
             if n:

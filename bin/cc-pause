@@ -5,8 +5,15 @@
 # cc-land queue all skip it on their next tick. Nothing is lost: worktrees, journals, board rows, open PRs and
 # Slack messages queued for its session are all still there when it is resumed.
 #
-#   cc-pause on <repo> [--by <who>] [--note <text>] [--from <chat>]   park it; prints what it stopped
-#   cc-pause off <repo> [--from <chat>]               unpark it; prints what it started again
+#   cc-pause on <repo> [--only] [--by <who>] [--note <text>] [--from <chat>]   park it; prints what it stopped
+#   cc-pause off <repo> [--only] [--from <chat>]      unpark it; prints what it started again
+#                                                     --only stops at THIS project and never walks its children;
+#                                                     without it both walk everything declared under the project,
+#                                                     which is the default and what `!pause`/`!resume` have always
+#                                                     done. Either way the last line names the reach, so a channel
+#                                                     can read how far the command went instead of inferring it
+#                                                     from CC_PROJECT_CHILDREN and the `via` fields (owner,
+#                                                     2026-09-16, after predicting the wrong reach from a channel).
 #   cc-pause is <target>                              exit 0 when paused — THE check every spender makes.
 #                                                     Lenient: `myrepo`, `myrepo/track` and `myrepo@alias` all
 #                                                     ask about the project `myrepo`, so no caller re-derives it.
@@ -120,6 +127,25 @@ descendants(){
   done < <(children_of "$1")
 }
 
+# HOW FAR THIS COMMAND WENT, said out loud. The reach used to be readable only by cross-referencing
+# CC_PROJECT_CHILDREN against the `via` field of each flag file: the owner predicted it wrong from a channel and
+# told a seat to undo a cascade that had never happened (2026-09-16), which is what `--only`/under exist for.
+# $1 project · $2 non-empty when --only · $3 what happened to it, for the sentence ("paused" / "resumed").
+# It runs its own walk inside a subshell: `descendants` advances the global SEEN, and the cascade has just
+# finished consuming it, so asking out here would answer "nothing is under it" for every cascade that ran.
+reach_line(){
+  local repo="$1" only="$2" word="$3" kids
+  kids=$(SEEN=" "; descendants "$repo" | tr '\n' ' ')
+  kids="${kids%" "}"
+  if [ -z "$kids" ]; then
+    echo "Reach: \`$repo\` alone — nothing is declared under it, so --only and the default do the same thing here."
+  elif [ -n "$only" ]; then
+    echo "Reach: \`$repo\` alone ($word). Left exactly as they were: $kids"
+  else
+    echo "Reach: \`$repo\` and everything declared under it ($word): $kids"
+  fi
+}
+
 # ONE LINE, IN EVERY CHANNEL THAT WENT QUIET. A track's channel, a sub-orch's, and every channel of a project
 # declared under this one never saw the `!pause`; without this the next person to type in one gets silence.
 # cc-slack owns which channels a project has — the naming, the routes and the orch table are all its business.
@@ -194,10 +220,11 @@ cascade_off(){   # $1 parent · $2 the project whose pause did it · $3 chat id 
 }
 
 cmd_on(){
-  local repo="" by="" note="" via="" from="" msg
+  local repo="" by="" note="" via="" from="" only="" msg
   while [ $# -gt 0 ]; do case "$1" in
     --by) by="${2:-}"; shift 2;; --note) note="${2:-}"; shift 2;;
     --via) via="${2:-}"; shift 2;; --from) from="${2:-}"; shift 2;;
+    --only) only=1; shift;;
     -*) die "unknown option $1";; *) [ -n "$repo" ] && die "one repo at a time"; repo="$1"; shift;;
   esac; done
   msg=$(valid_repo "$repo") || die "$msg"
@@ -241,15 +268,19 @@ cmd_on(){
   if [ -z "$via" ]; then
     first_visit "$repo"
     [ -n "$already" ] || announce "$repo" "$repo" on "$from"
-    cascade_on "$repo" "$repo" "$from"
+    # --only STOPS HERE. The announce above still runs: this project's own channels went quiet either way, and
+    # what changes is the reach, not who is told about this one.
+    [ -n "$only" ] || cascade_on "$repo" "$repo" "$from"
   fi
   echo "Nothing lost — \`cc-pause off $repo\` puts it back, worker loops included."
+  reach_line "$repo" "$only" paused
 }
 
 cmd_off(){
-  local repo="" via="" from="" msg
+  local repo="" via="" from="" only="" msg
   while [ $# -gt 0 ]; do case "$1" in
     --via) via="${2:-}"; shift 2;; --from) from="${2:-}"; shift 2;;
+    --only) only=1; shift;;
     -*) die "unknown option $1";; *) [ -n "$repo" ] && die "one repo at a time"; repo="$1"; shift;;
   esac; done
   msg=$(valid_repo "$repo") || die "$msg"
@@ -276,9 +307,13 @@ cmd_off(){
   if [ -z "$via" ]; then
     first_visit "$repo"
     [ "$was_paused" = 1 ] && announce "$repo" "$repo" off "$from"
-    cascade_off "$repo" "$repo" "$from"
+    # --only STOPS HERE, and for a resume that is the whole point: a child parked on its own is already left
+    # alone by `cascade_off`, but --only also leaves a child THIS project's pause parked, which is the case the
+    # owner asked for — resume the channel he is talking in without waking everything beneath it.
+    [ -n "$only" ] || cascade_off "$repo" "$repo" "$from"
   fi
   echo "The timers pick it up on their next tick."
+  reach_line "$repo" "$only" resumed
   # A 👍 GIVEN WHILE IT WAS PARKED IS STILL ON THE QUEUE, and nothing re-drives it: the queue arms its transient
   # timer from the jobs it may run, and a paused repo's job is not one of those. So say it, and name the one command
   # that lands it — resuming a project is not the owner approving a merge and a deploy, and must not perform one.
@@ -414,6 +449,34 @@ STUB
   P off $R > /dev/null 2>&1
   P is $C; t "resuming the parent resumes the child" "$?" 1
   P is $G; t "…and the grandchild with it" "$?" 1
+
+  # ---- THE REACH IS PART OF THE VERB -------------------------------------------------------------------------
+  # The owner had to predict how far one word would go by cross-referencing CC_PROJECT_CHILDREN against each
+  # flag's `via`, got it wrong from a channel, and told a seat to undo a cascade that had never run
+  # (2026-09-16). So `--only` stops here, the default walks, and BOTH say which they did.
+  box reach-only
+  decl "$R:$C $C:$G"
+  P on $R --only > "$h/only.out" 2>&1;  t "--only pauses the project it names" "$?" 0
+  P is $R; t "…that project really is parked" "$?" 0
+  P is $C; t "…and the project declared under it is NOT touched — that is the whole point of --only" "$?" 1
+  P is $G; t "…nor the grandchild" "$?" 1
+  grep -q 'Reach: .*alone' "$h/only.out"; t "…and the answer says it stopped there, so a channel need not infer it" "$?" 0
+  grep -q "$C" "$h/only.out"; t "…naming what it deliberately left alone" "$?" 0
+
+  box reach-under
+  decl "$R:$C"
+  P on $R > "$h/under.out" 2>&1
+  P is $C; t "without --only the walk still happens: the default reach is unchanged" "$?" 0
+  grep -q 'Reach: .*and everything declared under it' "$h/under.out"; t "…and the default says so out loud too" "$?" 0
+
+  box reach-off-only
+  decl "$R:$C"
+  P on $R > /dev/null 2>&1                        # cascade parks parent and child
+  P is $C; t "setup: the cascade parked the child" "$?" 0
+  P off $R --only > "$h/offonly.out" 2>&1;  t "--only resumes the project it names" "$?" 0
+  P is $R; t "…that project is running again" "$?" 1
+  P is $C; t "…and a child THIS pause parked stays parked: resume-only wakes nothing beneath it" "$?" 0
+  grep -q 'Reach: .*alone' "$h/offonly.out"; t "…and the resume says it stopped there" "$?" 0
 
   box own-pause
   decl "$R:$C"
