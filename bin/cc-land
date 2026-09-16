@@ -20,9 +20,9 @@
                                                   the workspace's token, gates inside its sandbox, no deploy, the
                                                   review charged to its daily cap, a stop said in #<handle>
                                                   (cc-checkpoint --sweep queues these; a session inside cannot)
-  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min): every job
-                                                  gated and reviewed at once, merges and the deploy serial in queue
-                                                  order across repos. A job survives a usage-limit review (waits for
+  cc-land work [--detach] [--catch-up]            drain the queue (and poll origin, at most every 15 min): one job at
+                                                  a time in queue order across repos, each gated, reviewed, merged and
+                                                  deployed before the next is touched. A job survives a usage-limit review (waits for
                                                   the reset) and a red gate (3 tries, 15 min apart); a LAND-AFTER-FIX
                                                   sends ONE fix iteration to the PR's track and re-queues on its push;
                                                   a draft or conflicting PR is HELD and looked at every 15 min (a
@@ -37,7 +37,7 @@ merge has the jobs queued before it already in, so the last gate is the batch's 
 #approvals card edited to "landed ✓" (never posted from here) → board rows → ask ledger rows marked `merged` →
 install.sh → units this change ADDED switched on (a unit that is off stays off and is named) → restarts proved by
 a new pid (never the unit that owns the shared tmux server; a `daemons` row in config/units.json brings back what
-systemd does not own, anything else running a touched file is named and left) → each ledger row's own check, run
+systemd does not own, and nothing undeclared is looked for) → each ledger row's own check, run
 LAST because until then the box still runs the old code. Only a check exiting 0 makes a row delivered; a row with
 no check is reported UNVERIFIED and stays open.
 
@@ -109,16 +109,15 @@ DOC_RE = re.compile(r"\.(md|markdown|txt|rst|adoc|org)$|(^|/)(docs|doc)/|(^|/)(L
 COMMENT_RE = re.compile(r"^\s*($|#|//|--[ \t]|\*[ \t/]|\*$|/\*)")   # a line comment in the syntaxes this box writes
 WIDE_FILES = 12                           # past this many files, or this many changed lines, "narrow" is a claim
 WIDE_LINES = 600                          # nobody can check — the suite is cheaper than being wrong about it
-GATE_MEMO_TTL = 3600                      # a gate memo is trusted no longer than this; its directory is gate_dir(), read at call time
-GREEN_TTL = 6 * 3600                      # …and how long a suite's own green record is spent instead of running it again (green_run)
+GREEN_TTL = 6 * 3600                      # how long a suite's own green record is spent instead of running it again (green_run)
 
 
 def gate_slots():
-    """How many gate suites this box runs at once: two thirds of the cores, never under 2 and never over 6. Read by prepare() and handed to every suite as CC_SELFTEST_SLOTS, the cap the suite enforces on itself."""
+    """How many test slots a suite gets: two thirds of the cores, never under 2 and never over 6, handed to every suite as CC_SELFTEST_SLOTS, the cap the suite enforces on itself."""
     return max(2, min(6, (os.cpu_count() or 4) * 2 // 3))
 
 
-PREPARE_AT_ONCE = int(os.environ.get("CC_LAND_PREPARE") or gate_slots())   # jobs in flight at once (test hook)
+SUITE_SLOTS = gate_slots()
 GATE_IDLE = 3600                          # a gate that has said nothing for this long is killed: silence, not wall clock
 FAIL_LOG_KEEP = 256 * 1024                # what stays of a red gate's log after the run: its last bytes
 # The review gate: one generic prompt beside this script (core/config/); a repo's own rules are docs/REVIEW.md, read from the base branch, never the PR. CC_CLAUDE points the model elsewhere.
@@ -414,7 +413,7 @@ def repo_root(repo):
 #   · the deploy half never runs (deploy_steps); the review is charged to the workspace's daily cap (~/.cc/state/member-spend.json, MEMBER_DAILY_USD);
 #   · a PR touching the boundary or a token stops before any gate (member_walls); a stop is reported in the workspace's own channel (say_result);
 #   · the repair round is the same one a box project gets; a change that spent its review and its repair is told to open a new PR.
-# The three places, read at call time like gate_dir():
+# The three places, read at call time like green_dir():
 def members_dir():   return f"{HOME}/.cc/members"              # the grants live here: a directory no sandbox bind reaches
 def clones_dir():    return f"{LANDQ}/clones"                   # host-only clones of member projects, one per <handle>--<track>
 def member_spend():  return f"{STATE}/member-spend.json"       # the per-workspace daily ledger, cc's member_gate shape
@@ -636,48 +635,6 @@ def repo_program(argv, root, exe):
     return ""
 
 
-PY_IMPORT_RE = re.compile(r"^[ \t]*(?:import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*)|from[ \t]+(\.*[\w.]*)[ \t]+import\b)", re.M)
-PY_INDEX = {}
-
-
-def py_index(root):
-    """{module name: [the tree's files named <name>.py]}, once per root; dot-directories, node_modules and __pycache__ are not walked."""
-    if root not in PY_INDEX:
-        idx = {}
-        for dp, dns, fns in os.walk(root):
-            dns[:] = [d for d in dns if not d.startswith(".") and d not in ("node_modules", "__pycache__")]
-            for fn in fns:
-                if fn.endswith(".py"):
-                    idx.setdefault(fn[:-3], []).append(os.path.relpath(f"{dp}/{fn}", root))
-        PY_INDEX[root] = idx
-    return PY_INDEX[root]
-
-
-def imports_of(root, prog):
-    """The files of `root` that Python program `prog` reaches through `import`, followed through the source (a name resolves to the tree file whose path ends in it). An import by path or a runtime-built name is missed; an import inside a function not yet run is counted."""
-    try:
-        head = open(f"{root}/{prog}", "rb").read(160)
-    except OSError:
-        return set()
-    if not (prog.endswith(".py") or (head.startswith(b"#!") and b"python" in head.split(b"\n", 1)[0])):
-        return set()
-    idx, seen, todo = py_index(root), set(), [prog]
-    while todo:
-        rel = todo.pop()
-        try:
-            src = open(f"{root}/{rel}", "rb").read().decode("utf-8", "replace")
-        except OSError:
-            continue
-        for m in PY_IMPORT_RE.finditer(src):
-            for name in (m.group(1) or m.group(2) or "").split(","):
-                parts = name.strip().lstrip(".").split(".")
-                for cand in idx.get(parts[-1], []):
-                    if cand not in seen and cand != prog and ("/" + cand).endswith("/" + "/".join(parts) + ".py"):
-                        seen.add(cand)
-                        todo.append(cand)
-    return seen
-
-
 def unit_policy(name, field):
     """One cell of config/units.json, via cc-units — the manifest that says whose call a unit is."""
     rc, o = sh([f"{BIN}/cc-units", "policy", name, field], timeout=30)
@@ -866,9 +823,7 @@ def record_applied(repo, sha):
     write_atomic(f"{LANDQ}/{repo}.applied", {"sha": sha, "at": stamp()})
 
 
-_OUT = threading.local()
 _LOCKS, _LOCKS_GUARD = {}, threading.Lock()
-_PREPARING = None       # the Prepared pool this sweep is gating with (cmd_work sets and clears it); read by Land.settle only
 
 
 def git_lock_path(root):
@@ -936,27 +891,12 @@ class git_lock:
 
 
 def emit(text):
-    """Everything this tool says about a landing goes through here, so prepare() can keep each job's lines together: a thread with a buffer set collects, any other prints."""
-    buf = getattr(_OUT, "buf", None)
-    print(text, flush=True) if buf is None else buf.append(text)
+    """Everything this tool says about a landing goes through here."""
+    print(text, flush=True)
 
 
 def out(mark, text):
     emit(f"  {mark} {text}")
-
-
-class collected:
-    """This thread's lines kept instead of printed (thread-local, so other threads' output is untouched); given a list, it fills that one."""
-
-    def __init__(self, buf=None):
-        self.buf = buf
-
-    def __enter__(self):
-        _OUT.buf = self.buf if self.buf is not None else []
-        return _OUT.buf
-
-    def __exit__(self, *a):
-        _OUT.buf = None
 
 
 # ── which gates a diff has earned ────────────────────────────────────────────────────────────────────────
@@ -1063,41 +1003,8 @@ def gate_tier(root, a, b, changed):
     return "focused", f"a narrow change outside the control layer ({', '.join(code[:3])}): the gates it reaches, and nobody paid to read it"
 
 
-def gate_dir():
-    """Where the gate memos live, derived from LANDQ at call time so the selfcheck's scratch queue is followed, never the live one."""
-    return f"{LANDQ}/gates"
-
-
-def memo_path(repo, pr, key, tier):
-    return f"{gate_dir()}/{repo}-{pr}-{key[:12]}-{tier}.json"
-
-
-def gate_memo(repo, pr, key, tier, head="", base=""):
-    """'These gates already passed at this tier', left by the prepare phase for the serial one. `key` is the tree the gates ran on (the merge of base into head) and is asked first. When no memo holds that tree, one filed for the SAME HEAD at this tier answers instead: the prepare phase gated the head on the base it projected (origin/<base> with every queued job ahead merged in), and the serial walk that meets a different base — a job ahead did not merge, one arrived mid-sweep, a person merged by hand — spends that answer rather than buying the suite again for the same head. A moved head still misses (the memo names its head), and so does a memo older than GATE_MEMO_TTL, which is swept. `base` is the base commit the CALLER is about to gate against — its own sha whether or not a merge was built on it — and an answer spent across a base that moved says so, naming the base the gates ran on and this one; without it the line would report the projected base as though the caller had met it."""
-    path = memo_path(repo, pr, key, tier)
-    j = read_json(path) or {}
-    if not j.get("gates") and head:
-        # The brief: "the serial walk re-uses the gate answer it already bought when the tree it meets is not the
-        # one it projected". Same PR, same tier, same head; any base the prepare phase projected.
-        for p in sorted(glob.glob(f"{gate_dir()}/{repo}-{pr}-*-{tier}.json")):
-            k = read_json(p) or {}
-            if k.get("gates") and k.get("head") == head:
-                path, j = p, k
-                break
-    try:            # SPENT ON READ. A memo hands one sweep's prepare phase to that same sweep's serial one and
-        os.unlink(path)     # nothing further: left lying about, the green it recorded would answer for the NEXT
-    except OSError:         # sweep too, and a kept job would then never re-run the gate it was kept for — which is
-        pass                # the whole of why `gates` is in RETRY (the suite flakes). Caught by selfcheck (2).
-    if not j.get("gates") or time.time() - epoch_of(j.get("at", "")) > GATE_MEMO_TTL:
-        return ""
-    on = f" on {j['on']}" if j.get("on") else ""
-    moved = (f" — that base as projected at the start of the sweep; it is at {base[:12]} now"
-             if base and j.get("base") and j["base"] != base else "")
-    return f"{len(j['gates'])} gate(s) passed on PR #{pr}{on}: {', '.join(j['gates'])}{moved}"
-
-
 def green_dir():
-    """Where a passed suite leaves its own record (tests/green.sh writes them): CC_GREEN_DIR, else derived from LANDQ at call time like gate_dir()."""
+    """Where a passed suite leaves its own record (tests/green.sh writes them): CC_GREEN_DIR, else derived from LANDQ at call time, so the selfcheck's scratch queue is followed, never the live one."""
     return os.environ.get("CC_GREEN_DIR") or f"{LANDQ}/green"
 
 
@@ -1121,10 +1028,9 @@ def tree_id(root):
     return "" if rc else o.strip()
 
 
-def sweep_memos():
-    """Spent or stale memos go, green records past their hours with them, and a change's tally nothing has touched for ROOT_TTL (root_work has stopped believing it by then); an optimisation only, so it never raises."""
-    for pattern, ttl in ((f"{gate_dir()}/*.json", GATE_MEMO_TTL), (f"{green_dir()}/*.json", GREEN_TTL),
-                         (f"{root_dir()}/*.json", ROOT_TTL)):
+def sweep_records():
+    """Green records past their hours go, and a change's tally nothing has touched for ROOT_TTL (root_work has stopped believing it by then); an optimisation only, so it never raises."""
+    for pattern, ttl in ((f"{green_dir()}/*.json", GREEN_TTL), (f"{root_dir()}/*.json", ROOT_TTL)):
         for p in glob.glob(pattern):
             try:
                 if time.time() - os.path.getmtime(p) > ttl:
@@ -1134,7 +1040,7 @@ def sweep_memos():
 
 
 def root_dir():
-    """Where a change's own tally lives, derived from LANDQ at call time like gate_dir()."""
+    """Where a change's own tally lives, derived from LANDQ at call time like green_dir()."""
     return f"{LANDQ}/root"
 
 
@@ -1350,7 +1256,6 @@ class Land:
         self.want_review = review    # --no-review turns the gate off. Default ON everywhere, the 👍 path included
         self.re_review = re_review   # …and --re-review buys a SECOND opinion on a head one was already bought for
         self.full_gates = full_gates  # --full-gates: never scope the gates to the diff, run every one of them
-        self.fill_memo = False   # prepare() sets it: this Land WRITES a gate memo for the serial phase, and reads none
         self.verdict = ""        # the review's answer as a FIELD, so the queue can act on LAND-AFTER-FIX without
         self.findings = ""       # re-reading its own error message — and what the reviewer said, for the fix brief
         self.by = ""             # which model actually read it, so the PR comment cannot claim a different one
@@ -1372,13 +1277,11 @@ class Land:
         self.gated = ""          # …the SHA the gates ran on: what the review after them, and the merge, are pinned to
         self.merged_on = ""      # …and the base it was merged with before they ran (merge_result); "" when the head already held it
         self.merge_unbuilt = False   # …and the third state: git could not build the merge, so the gates ran on the head alone
-        self.base_at = ""        # the base commit prepare() projected this job onto — see prepare(). "" = origin/<base>
         self.reviewed = ""       # …and the SHA the review actually read, for the fix round's "has it pushed yet"
         self._review = None      # the review running BESIDE the suite (a thread) and what it decided: see gates()
         self._read = None
         self.bought = False      # …and whether that read spent a buy: given back only by a usage limit or a cap, never by a red suite
         self.restarted = []
-        self.stale = []          # what still runs the old code because nothing here could restart it: named on the deploy line and the card
         self.owner_asks = []     # …and what is on the old code because the manifest keeps its restart for the owner: carries the command
         self.unverified = []     # ledger rows this landing could not confirm: named, and left open
 
@@ -1471,13 +1374,11 @@ class Land:
                          f"{now[:12]} is there now — nothing merges ungated. Re-run to gate the new head")
 
     def read_alongside(self):
-        """Start the read on a thread at t=0 beside the gates, its lines going where the caller's do; review() collects what it decided, and a red gate does too, so a paid verdict is never lost."""
+        """Start the read on a thread at t=0 beside the gates; review() collects what it decided, and a red gate does too, so a paid verdict is never lost."""
         if self._review is not None or not self.pr or not self.want_review:
             return
-        buf = getattr(_OUT, "buf", None)
 
         def go():
-            _OUT.buf = buf
             try:
                 self._read = ("ok", self.review_now())
             except BaseException as e:
@@ -1507,7 +1408,7 @@ class Land:
         except OSError as e:
             raise Failed(f"the reviewer prompt is missing ({e}) — install.sh did not link this checkout, or "
                          f"land with --no-review and read the diff yourself")
-        # A local, never self.head: this runs on the review thread while the owning thread is about to file a memo under self.head.
+        # A local, never self.head: this runs on the review thread while the owning thread is still gating self.head.
         now = self.resolve_head()
         self.moved_since_gated(now)
         if not self.gated:
@@ -1744,34 +1645,28 @@ class Land:
 
     # -- 2. gates ------------------------------------------------------------------------------------------
     def gates(self):
-        """Gate the merge (merge_result), before merging: every gate at once, the paid read beside them from t=0, the suite handed CC_LAND_CHANGED and CC_SELFTEST_SLOTS, each gate timed on silence (run_gate). The memo is filed under the gated tree; the first red in gate order is reported; the read's buy stands."""
+        """Gate the merge (merge_result), before merging: every gate at once, the paid read beside them from t=0, the suite handed CC_LAND_CHANGED and CC_SELFTEST_SLOTS, each gate timed on silence (run_gate). The first red in gate order is reported; the read's buy stands."""
         if self.pr and self.facts.get("state") == "MERGED":
             raise Skip(f"PR #{self.pr} is already merged — gates guard the merge, and it has happened")
-        tree, tmp, at, key, base_sha = self.root, None, "", "", ""
+        tree, tmp, at, base_sha = self.root, None, "", ""
         if self.pr:
             if self.held():             # a draft, or a conflict: the direct path stops here, before a gate or a
                 raise Failed(self.held())   # read is bought for a merge GitHub would refuse (the queue holds such a job: run_job)
-            self.fetch_head()       # asked BEFORE the checkout now: the tier and the memo are both keyed by the SHA
+            self.fetch_head()       # asked BEFORE the checkout: the tier is keyed by the SHA
             self.gated = self.head  # …and pinned here, for the review after this and the merge after that
             with git_lock(self.root):   # merge_result reads refs a sibling landing's pull moves; it writes loose objects only
-                at, base_sha, mtree = merge_result(self.root, self.base_at or f"origin/{self.base()}", self.head)
-            # base_sha is the base these gates ran against, answered even when no merge was built — what the memo
-            # records and what a later walk compares its own base with. merged_on is the narrower fact the ✗ line
-            # and gated_on() key on: a base that was MERGED IN, so it stays empty when the head already held it.
+                at, base_sha, mtree = merge_result(self.root, f"origin/{self.base()}", self.head)
+            # merged_on is the fact the ✗ line and gated_on() key on: a base that was MERGED IN, so it stays empty
+            # when the head already held it.
             self.merged_on = base_sha if mtree else ""
             self.merge_unbuilt = not at   # merge_result gives the head back when the head already holds the base and
             if self.merge_unbuilt:        # "" only when it could not answer: the same empty merged_on, two meanings
                 out("!", f"the merge of {self.base()} with the head could not be built — an unfetched base, "
                          f"unrelated histories, or git unable to answer in time — so these gates run on the BRANCH "
                          f"ALONE and nothing here proves what {self.base()} holds once this lands")
-            key = mtree or self.head    # the memo answers for the tree that was gated: the merge, or the head when there is none
         tier, why = self.tier_for()
         if self.pr:
-            done = "" if self.fill_memo else gate_memo(self.repo, self.pr, key, tier, self.head, base_sha)
-            if done:        # the memo names the tree its gates ran on; on a moved base that is not gated_on()
-                return f"{done} — the {tier} tier, {why}; run for this sweep by the prepare phase"
             tmp, tree = self.head_checkout("gates", fetch=False, at=at)
-        asked = tier          # the memo is filed under the tier the serial phase will ask with (tier_for), not the fallback's
         try:
             found = [g for g in GATES if os.access(f"{tree}/{g}", os.X_OK) and (tier != "docs" or g not in SUITE)]
             if not found:
@@ -1795,7 +1690,7 @@ class Land:
                 if scope:                                    # scoped suite would hand its gates that suite's paths
                     start["env"]["CC_LAND_CHANGED"] = scope
                 start["env"].pop("CC_SUITE_PART", None)     # …nor an inherited half, for the same reason
-                start["env"]["CC_SELFTEST_SLOTS"] = str(PREPARE_AT_ONCE)   # the one slot number, handed to the suite
+                start["env"]["CC_SELFTEST_SLOTS"] = str(SUITE_SLOTS)   # the one slot number, handed to the suite
                 keep = f"{run_root()}/cc-land-gate-{self.repo}-{self.pr or 'base'}-{os.path.basename(g)}.log"
                 argv = [f"{tree}/{g}"]
                 if self.member and self.mtrack:
@@ -1815,13 +1710,11 @@ class Land:
                                  f"  [full output: {keep}]")
 
             # All gates at once, and the read from t=0: a head a cheap gate rejects also buys a read, whose verdict goes on the PR for the retry.
-            buf = getattr(_OUT, "buf", None)     # gate threads are new threads: their lines go to the job's buffer, not stdout
             if any(not green_run(content, g, scope) for g in found):
                 self.read_alongside()
             errs = {}
 
             def go(g):
-                _OUT.buf = buf
                 try:
                     run(g)
                 except BaseException as e:
@@ -1845,11 +1738,6 @@ class Land:
                                  "was paid for — and its verdict is on the PR for the retry to read back")
                 raise errs[next(g for g in found if g in errs)]   # the first red in gate order, not whichever thread finished first
             on = f"PR #{self.pr} on {self.gated_on()}" if self.head else f"the {self.base()} checkout"
-            if self.pr and self.fill_memo:
-                with contextlib.suppress(OSError):   # what the serial phase spends instead of running these again — an optimisation, never a fact
-                    write_atomic(memo_path(self.repo, self.pr, key, asked),   # keyed on the tree the gates ran on; head and base beside it, for a serial walk that meets another base (gate_memo)
-                                 {"at": stamp(), "tier": tier, "why": why, "gates": found,
-                                  "head": self.head, "base": base_sha, "on": self.gated_on()})
             again = f" — {len(reused)} of them already green on {content[:12]}, not run again" if reused else ""
             beside = " — the review ran beside the gates" if self._review is not None else ""
             return (f"{len(found)} gate(s) passed on {on} at the {tier} tier ({why}): "
@@ -2144,12 +2032,10 @@ class Land:
 
     # -- 9. restart only what moved ------------------------------------------------------------------------
     def restart(self):
-        """Restart each running unit whose Exec line runs a file this change touched or that imports one (importers), or whose units.json row declares a path it changed: a `none` row is left alone, an `owner` row becomes an ask (owner_ask), NEVER is named and left. A template unit is restarted or asked about as its instances (unit_instances), never by its own name."""
+        """Restart each running unit whose Exec line runs a file this change touched, or whose units.json row declares a path it changed: a `none` row is left alone, an `owner` row becomes an ask (owner_ask), NEVER is named and left. A template unit is restarted or asked about as its instances (unit_instances), never by its own name."""
         files = [p for st, p in self.changed_files() if st != "D"]
         if not files:
             raise Skip("no file list for this landing — nothing to restart")
-        via = self.importers(files)          # a running program that IMPORTS a changed module moved too
-        files = files + sorted(via)
         moved = {os.path.basename(p) for p in files}
         declared = units_for_paths(self.root, files)
         held, owned = [], []
@@ -2179,9 +2065,8 @@ class Land:
                 f"down, so do it by hand (`cc rc restart`)") if held else ""
         if owned:
             tail += "; " + "; ".join(owned)
-        tail += "".join(f"; {p} imports {m}, which moved" for p, m in sorted(via.items()))
         if not self.restarted:
-            raise Skip("nothing running uses, or imports, the files this change touched" + tail)
+            raise Skip("nothing running uses the files this change touched" + tail)
         return f"restarted: {', '.join(self.restarted)}{tail}"
 
     def owner_ask(self, unit):
@@ -2206,29 +2091,13 @@ class Land:
             return said + f"; the ask ledger would not take it ({last(o)}) — the card is the only record"
         return said + f", asked: {last(o)}"
 
-    def importers(self, files):
-        """{program: module} for every file of this tree a live process is running (repo_program) whose imports (imports_of) reach one of `files`; the landing's own ancestry is left out."""
-        root, mine, changed, hit, seen = os.path.realpath(self.root), own_ancestry(), set(files), {}, set()
-        for pid, argv, _unit, exe in live_processes():
-            if pid in mine:
-                continue
-            rel = repo_program(argv, root, exe)
-            if rel and rel not in seen and rel not in changed:
-                seen.add(rel)
-                for mod in sorted(imports_of(root, rel) & changed):
-                    hit[rel] = mod
-                    break
-        return hit
-
     # -- 10. what systemd does NOT own: a server somebody started from a shell -----------------------------
     def daemons(self):
-        """Long-lived processes no unit owns: one a units.json `daemons` row declares is restarted by that row's command and must come back under a new pid, or the step is red; anything else running a touched file is named on the card and left alone. The daemon is repo_program's answer, never the command line alone."""
+        """Long-lived processes no unit owns: one a units.json `daemons` row declares is restarted by that row's command and must come back under a new pid, or the step is red; a `none` row is left for its next start, an `owner` row is named. A process no row declares is not looked for. The daemon is repo_program's answer, never the command line alone."""
         files = [p for st, p in self.changed_files() if st != "D"]
         if not files:
             raise Skip("no file list for this landing — nothing to look for")
         root = os.path.realpath(self.root)
-        via = self.importers(files)          # a bare program that IMPORTS a changed module is on old code too
-        files = files + sorted(via)
         rows = daemons_for(self.root, files)
         mine = own_ancestry()
 
@@ -2238,8 +2107,7 @@ class Land:
                     if not unit and pid not in mine]
 
         pids = lambda s: ", ".join(str(p) for p in sorted(s))
-        started, notes = [], [f"{p} imports {m}, which moved" for p, m in sorted(via.items())]
-        claimed = {runs for _, runs in rows.values()}   # by the file, not the pid: a daemon back on a new pid is accounted for
+        started, notes = [], []
         for name in sorted(rows):
             policy, runs = rows[name]
             was = {pid for pid, rel in bare() if rel == runs}
@@ -2250,8 +2118,7 @@ class Land:
                 notes.append(f"{name} picks this up on its next start (units.json restart=none)")
                 continue
             if policy == "owner":
-                self.stale.append(f"{name} (pid {pids(was)})")
-                notes.append(f"{name} is the owner's to restart (units.json restart=owner)")
+                notes.append(f"{name} (pid {pids(was)}) is the owner's to restart (units.json restart=owner)")
                 continue
             argv = [f"{root}/{policy.split()[0]}"] + policy.split()[1:]
             rc, o = sh(argv, cwd=root, timeout=180)
@@ -2263,23 +2130,10 @@ class Land:
                              f"{'pid ' + pids(now & was) if now & was else 'not running'} — the running thing did "
                              f"not change, so the box is on the old code whatever this step printed")
             started.append(f"{name} (pid {pids(now)})")
-        others = {}
-        for pid, rel in bare():
-            if rel in set(files) and rel not in claimed:
-                others.setdefault(rel, []).append(pid)
-        # One entry per program, not per pid; the pids are listed while few enough to act on.
-        for rel in sorted(others):
-            self.stale.append(f"{rel} (pid {pids(others[rel])})" if len(others[rel]) < 4
-                              else f"{rel} ({len(others[rel])} processes)")
-        if not started and not self.stale:
-            raise Skip("nothing outside systemd runs the files this change touched"
-                       + ("; " + "; ".join(notes) if notes else ""))
-        bits = []
-        if started:
-            bits.append("restarted, and back on a new pid: " + ", ".join(started))
-        if self.stale:
-            bits.append("NOT restarted, still on the old code: " + ", ".join(self.stale))
-        return "; ".join(bits + notes)
+        tail = "; " + "; ".join(notes) if notes else ""
+        if not started:
+            raise Skip("no declared daemon runs the files this change touched" + tail)
+        return "restarted, and back on a new pid: " + ", ".join(started) + tail
 
     # -- 11. delivery: the ask's own check, run last of all ---------------------------------------------------
     def verify_delivery(self):
@@ -2333,25 +2187,14 @@ class Land:
                 f"behalf. Take it out of the PR and push; the next head is a new question"))
         return f"PR #{self.pr} touches neither the boundary (.cc/, a secret's path) nor a token"
 
-    def settle(self):
-        """Wait for every gate still running in this sweep before the box is touched: the deploy half may not reinstall and restart the tools another job's suite is asserting about. Waits on the pool fixed when the sweep started, never on a new job; never fails."""
-        pool = _PREPARING
-        n = pool.pending() if pool is not None else 0
-        if not n:
-            raise Skip("nothing else is being gated — the box is touched at once")
-        t0 = time.time()
-        pool.join()
-        return (f"waited {int(time.time() - t0)}s for the gates of {n} other queued job(s) before touching the "
-                f"box: a suite that asserts about this box must not have it reinstalled and restarted under it")
-
     def no_deploy(self):
         raise Skip(f"{self.repo} is a member workspace's, not the box's — nothing installed, no units, no restarts")
 
     def deploy_steps(self):
-        """About the box: run once at the end of a batch, `settle` first. A member workspace's repository gets none of them (MEMBERS)."""
+        """About the box: run once at the end of a batch. A member workspace's repository gets none of them (MEMBERS)."""
         if self.member:
             return [("deploy", self.no_deploy)]
-        return [("settle", self.settle), ("install", self.install), ("units", self.enable_units),
+        return [("install", self.install), ("units", self.enable_units),
                 ("restart", self.restart), ("daemons", self.daemons), ("verify", self.verify_delivery)]
 
     def steps(self):
@@ -2420,11 +2263,6 @@ class Land:
                   f"command to retry just those: everything else is a no-op the second time.")
         elif rc == 0:
             print("landed.")
-        if self.stale:
-            print(f"NOT restarted, still on the old code: {', '.join(self.stale)}. Nothing here owns "
-                  f"{'them' if len(self.stale) > 1 else 'it'} — a systemd unit, or a `daemons` row in "
-                  f"config/units.json, is what would let a landing bring "
-                  f"{'them' if len(self.stale) > 1 else 'it'} back.")
         if self.owner_asks:
             print(f"YOURS TO RESTART: {', '.join(self.owner_asks)} — config/units.json keeps that for the owner, "
                   f"so the box runs the old code until somebody does. Asked: `cc-scope list {self.project}`.")
@@ -2463,34 +2301,32 @@ def notify(*args, timeout=180):
 
 
 def say_result(job, r):
-    """Say the result under the job's producer id (`land:<repo>:<pr>:<outcome>@<queued_at>`, sent once): the reply thread gets the full text; a stop also wakes the planning session (first attempt only) and gets a line in #<repo>-updates; a member project hears in its own lanes; an owner's restart with no thread goes to the repo's channel, @-mentioned. Returns whether Slack took it."""
+    """Say the result ONCE — the brief: "a landing notifies once per terminal state". One `cc-slack post` under the job's producer id (`land:<repo>:<pr>:<outcome>@<queued_at>`, so a retry never posts twice), written to the queue log as `notify`: in the reply thread when the job has one; else a member project's own lane (#<handle>-updates landed, #<handle> stopped); else a stop is routed (`post --route`, the repo's updates lane) and a landing with no thread is its card, already edited to landed ✓ — unless the text carries a restart that is the owner's, which is routed with the one @-mention allowed to page him. A stop of a box repo also wakes its planning session (`cc-slack inject`, first attempt only): the seat's wake, not a post. Returns whether Slack took it."""
     chat, ts, repo, pr = job.get("chat") or "", job.get("ts") or "", job.get("repo") or "", job.get("pr")
-    pid = f"land:{repo}:{pr or 'deploy'}:{'landed' if r.get('ok') else 'stopped'}" + (f"@{job['queued_at']}" if job.get("queued_at") else "")
-    took = lambda rc, out: rc == 0 or "no SLACK_BOT_TOKEN" in out
-    said = not chat or took(*notify("-c", chat, *(["--thread", ts] if ts else []), "--id", pid, r.get("text", "")))
+    state = "landed" if r.get("ok") else "stopped"
+    pid = f"land:{repo}:{pr or 'deploy'}:{state}" + (f"@{job['queued_at']}" if job.get("queued_at") else "")
+    what = f"[{repo}] " + (f"PR #{pr}" if pr else "deploy")
     handle = member_of(repo)[0]
-    if handle:
-        # A member project's landing is said in that workspace's own channels only: landed in its updates lane, a stop in its main lane.
-        lane = f"#{handle}-updates" if r.get("ok") else f"#{handle}"
-        # …and the thread already has it: a lane that refused is not a reason to say it twice. `&=` so every post is made whatever the one before said.
-        said &= took(*notify("-c", lane, "--id", f"{pid}:lane", r.get("text", ""))) or bool(chat)
-        return said
-    # A restart that is the owner's reaches the owner: with no thread the ask goes to the repo's channel, @-mentioned (post --route ... --mention); with a thread the card carries it.
-    if r.get("restart") and not chat:
-        what = f"[{repo}] " + (f"PR #{pr}" if pr else "deploy") + ": "
-        said &= took(*notify("--route", f"[{repo}] restart", "--mention", "--id", f"{pid}:restart", what + r["restart"], timeout=60))
-    if r.get("ok"):
-        return said
-    title = f"[{repo}] " + (f"PR #{pr} " if pr else "") + "landing stopped"
-    said &= took(*notify("--route", title, "--id", f"{pid}:route", r.get("short", "")[:300], timeout=60)) or bool(chat)
-    again = f"cc-land queue {repo} {pr}" if pr else "cc-land work"
-    if not job.get("say_tries"):
+    if chat:
+        where, args = "thread", ["-c", chat, *(["--thread", ts] if ts else [])]
+    elif handle:
+        where = f"#{handle}-updates" if r.get("ok") else f"#{handle}"
+        args = ["-c", where]
+    elif r.get("ok") and not r.get("restart"):
+        where, args = "card", []
+    else:
+        where, args = "route", ["--route", f"{what} {state}"] + (["--mention"] if r.get("restart") else [])
+    said = True
+    if args:
+        rc, o = notify(*args, "--id", pid, r.get("text", ""), timeout=180 if chat else 60)
+        said = rc == 0 or "no SLACK_BOT_TOKEN" in o
+    ledger(f"notify {repo}#{pr or 'deploy'} {state} → {where}" + ("" if said else f" — Slack did not take it: {last(o, 120)}"))
+    if not r.get("ok") and not handle and not job.get("say_tries"):
         # The first attempt only: the injected line carries no producer id, so a retry sweep must not say it again.
-        # Short, because the card is already in the thread and in #<repo>-updates — this just wakes the seat.
+        # Short, because the thread or the updates lane has the full text — this just wakes the seat.
         short = (r.get("short") or "")[:200].replace("\n", " ")
-        sh([f"{BIN}/cc-slack", "inject", repo,
-            f"[{repo}] " + (f"PR #{pr} " if pr else "deploy ") +
-            f"landing stopped: {short}. Fix it, then `{again}`."], timeout=120)
+        again = f"cc-land queue {repo} {pr}" if pr else "cc-land work"
+        sh([f"{BIN}/cc-slack", "inject", repo, f"{what} landing stopped: {short}. Fix it, then `{again}`."], timeout=120)
     return said
 
 
@@ -2558,12 +2394,7 @@ def result_of(L, rc, job, tail):
     else:
         short = (f"{what}: merged, but the deploy stopped at {L.stopped} ❌ after {tries} tries — the box is still "
                  f"running the old code.")
-    # 'deployed' is a claim about what is running, so what could not be restarted goes in the same sentence as the ✅.
-    if L.stale and rc in (0, COSMETIC, UNVERIFIED):
-        short += (f" ⚠️ {', '.join(L.stale)} still "
-                  f"{'run' if len(L.stale) > 1 else 'runs'} the old code — nothing here could restart "
-                  f"{'them' if len(L.stale) > 1 else 'it'}.")
-    # ...and a unit whose restart the manifest keeps for the owner: on the old code too, and the sentence carries the command. Only the landing that raised the ask says it.
+    # A unit whose restart the manifest keeps for the owner is on the old code, and the sentence carries the command. Only the landing that raised the ask says it.
     ask = ""
     if L.owner_asks and rc in (0, COSMETIC, UNVERIFIED):
         ask = (f"⚠️ yours to restart: {', '.join(L.owner_asks)} — until then the box runs the old code for "
@@ -2916,7 +2747,7 @@ def paused(target):
         return False
 
 
-AFTER_GATES = ("merge", "card", "board", "ledger", "settle", "install", "units", "restart", "daemons", "verify")
+AFTER_GATES = ("merge", "card", "board", "ledger", "install", "units", "restart", "daemons", "verify")
 
 
 def tier_holds(job):
@@ -2931,7 +2762,7 @@ def tier_holds(job):
 
 
 def box_hold(job):
-    """Why the box itself holds this job, or '': its project parked (paused — the narrower, louder fact, said first), or the spend tier `stop` at its gates (tier_holds). The one question every door asks; a job it holds is not tried, not prepared and not timed, and the file is not touched, so it lands on the first sweep after the resume."""
+    """Why the box itself holds this job, or '': its project parked (paused — the narrower, louder fact, said first), or the spend tier `stop` at its gates (tier_holds). The one question every door asks; a job it holds is not tried and not timed, and the file is not touched, so it lands on the first sweep after the resume."""
     if paused(job.get("repo") or ""):
         return f"{job['repo']} is paused — still queued, lands after `cc-pause off {job['repo']}`"
     if tier_holds(job):
@@ -3077,145 +2908,6 @@ def queue_place(path, running):
                f"written, so the NEXT sweep takes it — armed when the running one ends" if running else ""))
 
 
-def preparable(path):
-    """Is this job one the prepare phase should read and gate now? Only a PR job the serial phase is about to reach and would land: not deferred, not out of tries, not held on a refused repair launch, not paused."""
-    j = read_json(path) or {}
-    fix = j.get("fix") or {}
-    if (fix and not fix.get("over") and stamp() < (fix.get("deadline") or "")
-            and round_live(j.get("repo") or "", fix.get("track") or "")):
-        return False                # mid-fix-round: a review bought now would judge an intermediate checkpoint (review-176c)
-    if fix.get("over") == "refused" and j.get("stage") == "held":
-        return False                # a refused repair launch: the review already answered, and run_job holds it
-    if box_hold(j):
-        return False                # parked, or spend tier stop: the serial phase will not land it, so no review is bought — and this phase IS the gates
-    return bool(j.get("repo") and j.get("pr") and j.get("state") != "done"
-                and stamp() >= (j.get("not_before") or "") and j.get("attempts", 0) < LAND_TRIES)
-
-
-class Prepared:
-    """What prepare() hands cmd_work: one waiter per queued job, so the serial phase merges a job the moment its own gates and review are done, still one at a time in queue order; a job prepare did not take keeps its place. The deploy half waits in Land.settle(); join() stops a raising merge leaving the pool running."""
-
-    def __init__(self, header, ready, bufs, threads):
-        self.header, self._ready, self._bufs, self._threads = header, ready, bufs, threads
-
-    def wait(self, path):
-        """Block until THIS job's gates and review are finished, and return the lines they printed."""
-        if path not in self._ready:
-            return []
-        self._ready[path].wait()
-        return self._bufs[path] or [f"  · {os.path.basename(path)}: nothing to prepare"]
-
-    def pending(self):
-        """How many jobs are still being gated — 0 when there is nothing left for settle() to wait for."""
-        return sum(1 for e in self._ready.values() if not e.is_set())
-
-    def join(self):
-        for t in self._threads:
-            t.join()
-
-
-def prepare(paths):
-    """The half of a landing that changes nothing, for every queued job at once: the gates and the review, each answer left durably (memo, PR comment) for the serial phase to spend. Overlapping jobs run in queue order, disjoint ones side by side up to PREPARE_AT_ONCE, each gated on the base with every earlier job of its repo merged in. Returns a Prepared once the pool is running."""
-    jobs = [p for p in paths if preparable(p)]
-    if len(jobs) < 2:
-        return Prepared([], {}, {}, [])   # one job needs no pool: an empty handle waits for nothing and joins nothing
-    lands, files, bufs = {}, {}, {}
-    for path in jobs:
-        j = read_json(path) or {}
-        L = Land(j["repo"], pr=j["pr"])
-        L.fill_memo = True
-        lands[path], files[path] = L, None
-        with collected() as buf:
-            bufs[path] = buf
-            try:
-                if L.load() and L.fetch_head():
-                    files[path] = {p for _, p in L.changed_files()}
-            except Exception as e:      # unreadable: it touches everything, and says so
-                out("✗", f"{e.__class__.__name__}: {e}")
-
-    # The tree each job will land on: the base with every earlier job of its own repo merged in, so job i's gate is the integration run for the batch up to i and a red one names the PR added last. If an earlier job does not merge, the later job lands on a base its gates did not see: the serial phase spends the answer bought on the projection anyway (gate_memo, same head), and says on the ✓ line which base that was.
-    proj = {}
-    for path in jobs:
-        L = lands[path]
-        if not L.facts or not L.head:
-            continue
-        L.base_at = proj.get(L.repo) or f"origin/{L.base()}"
-        try:
-            with git_lock(L.root):
-                nxt = merge_result(L.root, L.base_at, L.head)[0]
-        except (Failed, OSError):
-            nxt = ""            # conflicts with the projection, or git would not say: leave the projection where
-        if nxt:                 # it is, so the jobs behind this one are gated on the base they will really meet
-            proj[L.repo] = nxt
-
-    def one(path):
-        L = lands[path]
-        with collected(bufs[path]):
-            try:
-                if not L.facts:
-                    return                  # load() already said why
-                if L.held():
-                    out("·", f"{L.held()} — held by the serial phase, so nothing is gated or read for it here")
-                    return                  # a draft: a read bought now judges a change its author has not finished
-                for step, fn in (("gates", L.gates), ("review", L.review)):
-                    try:
-                        out("✓", fn())
-                    except Skip as e:
-                        out("·", str(e))
-                    except Failed as e:
-                        out("✗", f"{step}: {e}")
-                        return              # a red gate: the serial phase stops at the same gate, so no review is bought
-            except Exception as e:          # prepare is an optimisation: it may never be the reason a sweep dies
-                out("✗", f"{e.__class__.__name__}: {e}")
-
-    done, running, cv = set(), set(), threading.Condition()
-    ready = {path: threading.Event() for path in jobs}   # …and the one cmd_work waits on, per job (Prepared)
-
-    def touches(a, b):
-        return files[a] is None or files[b] is None or bool(files[a] & files[b])
-
-    def clear(path):        # every earlier job that shares a file with it is finished, and nothing running shares one
-        for q in jobs:
-            if q == path:
-                break
-            if q not in done and touches(q, path):
-                return False
-        return not any(touches(r, path) for r in running)
-
-    def take():
-        with cv:
-            while True:
-                left = [q for q in jobs if q not in done and q not in running]
-                if not left:
-                    return None
-                for q in left:
-                    if clear(q):
-                        running.add(q)
-                        return q
-                cv.wait()
-
-    def worker():
-        while True:
-            q = take()
-            if q is None:
-                return
-            try:
-                one(q)
-            finally:
-                with cv:
-                    running.discard(q)
-                    done.add(q)
-                    cv.notify_all()
-                ready[q].set()      # this job may be taken now; the ones behind it are still gating
-
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(PREPARE_AT_ONCE, len(jobs)))]
-    for t in threads:
-        t.start()
-    return Prepared([f"gating and reading {len(jobs)} queued job(s) — side by side where their files do not "
-                     f"overlap, one after another where they do; the merges stay serial and in queue order, each "
-                     f"as soon as its own gates and review are done:"], ready, bufs, threads)
-
-
 def refuse(msg, rc=2):
     """`return refuse("…")`: the one line on stderr a command says no with, and the exit code it hands back."""
     print(f"cc-land: {msg}", file=sys.stderr)
@@ -3242,19 +2934,10 @@ def cmd_work(argv):
         write_atomic(running_at, {"pid": os.getpid(), "since": stamp()})
     lines = []
     try:
-        sweep_memos()
+        sweep_records()
         sweep_run_roots()                        # what a killed or rebooted worker left in the temp root
-        paths = queue_order(glob.glob(f"{LANDQ}/*.json"))
-        pool = prepare(paths)                    # the reviews and the gates of all of them, at once and changing nothing
-        lines += pool.header
-        globals()["_PREPARING"] = pool           # …and what each job's deploy half waits on (Land.settle)
-        try:
-            for path in paths:
-                lines += pool.wait(path)         # THIS job's gates and review — not the whole batch's (Prepared)
-                lines.append(run_one(path))      # every sweep: this is what finishes a landing a reboot interrupted
-        finally:
-            globals()["_PREPARING"] = None
-            pool.join()                          # nothing gating is left running past the sweep, take or raise
+        for path in queue_order(glob.glob(f"{LANDQ}/*.json")):
+            lines.append(run_one(path))          # every sweep: this is what finishes a landing a reboot interrupted
         if "--catch-up" in argv or due_catchup():
             for repo in catchup():
                 lines.append(run_one(job_path(repo, "deploy")))

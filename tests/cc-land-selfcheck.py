@@ -366,8 +366,8 @@ def selfcheck():
           and mgit("rev-parse", "--abbrev-ref", "HEAD") == "main"
           and not [l for l in mgit("status", "--porcelain").splitlines() if ".gate-" not in l])
     again = merge_result(mrepo, "origin/main", pr_head)
-    check("...and the same pair merged twice gives the same TREE though not the same commit — which is why a gate "
-          "memo is keyed by the tree: commit-tree stamps the clock in, so two runs a second apart would file "
+    check("...and the same pair merged twice gives the same TREE though not the same commit — which is why a green "
+          "record is keyed by the tree: commit-tree stamps the clock in, so two runs a second apart would file "
           "their green under two names and neither would ever be found",
           again[2] == mtree_at and again[0] and re.fullmatch(r"[0-9a-f]{40,64}", again[0]))
     check("CONTROL: a head that already holds the base has no merge to build — merge_result gives the head back "
@@ -421,11 +421,11 @@ def selfcheck():
     # ordinary case — a branch forked before the base's last landing, so there IS a merge to build — because that
     # is what nearly every landing on this box is; the "head already holds the base" case is asked for explicitly
     # below. `mtree` and `mcommit` are derived from their inputs rather than fixed, so two different (base, head)
-    # pairs give two different trees, which is the whole point of keying a gate memo on the tree.
+    # pairs give two different trees, which is the whole point of keying a green record on the tree.
     BASE_SHA = "ba5e" + "0" * 36
     AT = [BASE_SHA]      # where the default branch IS — a box, because a merge MOVES it, and a case that merges
                          # two PRs in one sweep only proves anything if the second meets the base the first left
-    # The digits that differ go FIRST: memo_path keys a memo by the first 12 of the tree, so a fixture whose
+    # The digits that differ go FIRST: a green record is keyed by the first 12 of the tree, so a fixture whose
     # trees differ only in their tail would file two different merges under one name and prove nothing.
     hex40 = lambda n: "%016x" % (n & ((1 << 64) - 1)) + "0" * 24
     mtree = lambda a: (0, hex40(int(a[3][:8], 16) * 31 + int(a[4][:8], 16)) + "\n")     # merge-tree <base> <head>
@@ -604,8 +604,8 @@ def selfcheck():
 
     # 1. the review gate: the step that reads the diff, and the two verdicts that stop a landing dead
     HEAD = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"
-    # The tree the gates run on, as the fixture's own plumbing answers it: the base merged with the head. This is
-    # what a gate memo is keyed by, so a case that asserts about a memo asks for it here rather than for the head.
+    # The tree the gates run on, as the fixture's own plumbing answers it: the base merged with the head — what a
+    # case asserting about the gated tree asks for, rather than the head.
     GATED = lambda head=HEAD, base=None: mtree(["git", "merge-tree", "--write-tree", base or AT[0], head])[1].strip()
     MERGE = lambda head=HEAD, base=None: mcommit(["git", "commit-tree", GATED(head, base)])[1].strip()
 
@@ -1597,9 +1597,8 @@ def selfcheck():
     real_access = os.access
     TREE = "7" * 40                          # the content the fixture checkout holds, as git names it
     try:    # end to end: the tier really does drop the suite from the gates that RUN, and never the other way about
-        def docs_diff(fill=False, **kw):
+        def docs_diff(**kw):
             L = fresh(pr=7, **kw)
-            L.fill_memo = fill               # …as prepare() sets it: this run WRITES the memo the serial half spends
             world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
             world["git merge-base"] = (0, A + "\n")
             world["git diff --name-status"] = (0, "M\tdocs/USAGE.md\n")
@@ -1621,94 +1620,6 @@ def selfcheck():
         check("a repo whose ONLY gate is its suite still runs it: a tier takes gates out of a run, it never leaves "
               "a landing with none — scoping that lands a diff nobody ran is not scoping, it is skipping",
               all(w in docs_diff() for w in ("selftest", "only gate")))
-        docs_diff(fill=True)
-        check("...and THAT run's memo is filed under the tier the serial half will ask with — `docs`, what "
-              "tier_for() says — not under the `full` this fallback rounded the RUN up to. Keyed by the rounded "
-              "one it is a memo nobody ever asks for, and the repo whose only gate is a ten-minute suite runs it "
-              "twice on every landing: the exact cost this whole phase exists to cut",
-              os.path.exists(memo_path("myrepo", 7, GATED(), "docs"))
-              and not os.path.exists(memo_path("myrepo", 7, GATED(), "full"))
-              and (read_json(memo_path("myrepo", 7, GATED(), "docs")) or {}).get("gates") == ["core/tests/selftest.sh"])
-        check("...and it is filed under the TREE THE GATES RAN ON — the merge — and never under the head, with the "
-              "head, the projected base and the phrase naming that tree written INSIDE it: after a sibling job "
-              "merges, the merge this PR makes is a different tree, and what answers then is the memo's own head",
-              GATED() != HEAD and not os.path.exists(memo_path("myrepo", 7, HEAD, "docs"))
-              and (read_json(memo_path("myrepo", 7, GATED(), "docs")) or {}).get("head") == HEAD
-              and (read_json(memo_path("myrepo", 7, GATED(), "docs")) or {}).get("base") == BASE_SHA)
-        # The brief (improve-trial-07-memo): "the serial walk re-uses the gate answer it already bought when the
-        # tree it meets is not the one it projected". Same head on another base: spent, and the line names the base
-        # the gates ran on and the one main is at now. Another head on that base: not spent, and the memo stays.
-        ELSEWHERE = "e15e" + "0" * 36            # where main is when the serial walk arrives: not the projection
-        said = gate_memo("myrepo", 7, GATED(HEAD, ELSEWHERE), "docs", HEAD, ELSEWHERE)
-        check("a serial walk that meets a base the prepare phase did not project (a job ahead did not merge, a "
-              "person merged by hand) spends the memo filed for the SAME HEAD and says which base was gated and "
-              "which main is at now",
-              "as projected" in said and BASE_SHA[:12] in said and ELSEWHERE[:12] in said
-              and "core/tests/selftest.sh" in said and not os.path.exists(memo_path("myrepo", 7, GATED(), "docs")))
-        docs_diff(fill=True)
-        ANOTHER = "a10e" + "0" * 36              # a head the memo does not name: a repair pushed
-        check("...and a MOVED head on that same base is not answered by it — the memo names its head — and the memo "
-              "is left where it was, unspent", not gate_memo("myrepo", 7, GATED(ANOTHER, ELSEWHERE), "docs", ANOTHER, ELSEWHERE)
-              and os.path.exists(memo_path("myrepo", 7, GATED(), "docs")))
-        os.unlink(memo_path("myrepo", 7, GATED(), "docs"))
-
-        # …and the base a spent memo is measured against is the base the gates RAN against, which is not always a
-        # merge commit: where the head already holds main there is nothing to merge, so a ✓ line reading that base
-        # off the merge printed the projected one alone — asserting main stood at a sha it never pointed at, in the
-        # commonest shape this whole fallback is for, and dropping the one disclosure that pays for spending the
-        # memo (review of PR #495). Both runs below build their own memo; neither reads the one above.
-        AHEAD = "a11e" + "0" * 36                # main with the job ahead merged in, as prepare() projected it
-
-        def prepared(base_at):
-            """The prepare phase's run: gate this head on the base it projects, and leave the memo for the walk."""
-            for p in glob.glob(f"{gate_dir()}/*.json"):   # fresh() clears the tally dir beside this one, not this
-                os.unlink(p)                              # one, so the case that reads a memo files it itself
-            L = fresh(pr=7)
-            L.fill_memo, L.base_at = True, base_at
-            world["git rev-parse FETCH_HEAD"] = (0, HEAD + "\n")
-            world["git diff --name-status"] = (0, "M\tdocs/USAGE.md\n")
-            world["git diff --numstat"] = (0, "3\t2\tdocs/USAGE.md\n")
-            world["git rev-parse HEAD^{tree}"] = (0, TREE + "\n")
-            with contextlib.redirect_stdout(io.StringIO()):
-                L.gates()
-                if L._review is not None:
-                    caught(L.review_aside)
-
-        def walked():
-            """…and the serial half meeting that memo with a head that ALREADY HOLDS main: no merge, no merge sha.
-            No fresh() here — it would reset the world this walk needs and is the wrong shape anyway: the walk is a
-            second landing of the same PR against the state the prepare phase left, memo included."""
-            world.update(NO_MERGE)
-            S = Land("myrepo", pr=7)
-            S.facts = dict(FACTS)
-            calls.clear()
-            with contextlib.redirect_stdout(io.StringIO()):
-                said = S.gates()
-                if S._review is not None:
-                    caught(S.review_aside)
-            world["git merge-base --is-ancestor"] = (1, "")     # …and the world goes back as the cases after expect
-            return said
-
-        was_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
-        prepared(AHEAD)
-        said = walked()
-        check("a memo spent where the head ALREADY HOLDS the base names BOTH bases: no merge commit exists on that "
-              "path, so a ✓ line that read the gated base off the merge named the projection alone and said main "
-              "was at a sha it never pointed at — and the gate is still not re-run, which is the point of spending it",
-              "run for this sweep by the prepare phase" in said and "as projected at the start of the sweep" in said
-              and AHEAD[:12] in said and f"it is at {BASE_SHA[:12]} now" in said
-              and not [c for c in calls if os.path.basename(c[0]) == "check.sh"])
-        prepared("")
-        said = walked()
-        check("...and the same walk over a base that did NOT move says nothing of the sort: the correction is what "
-              "a moved base buys, and printed under a base that held it would read as a warning on every landing",
-              "run for this sweep by the prepare phase" in said
-              and "as projected at the start of the sweep" not in said
-              and not [c for c in calls if os.path.basename(c[0]) == "check.sh"])
-        for p in glob.glob(f"{gate_dir()}/*.json"):    # spent on read, both of them — and nothing of this case is
-            os.unlink(p)                               # left for the cases below whatever a spend does with the file
-        os.access = was_access                         # …nor the gate list it needed, which is not theirs
-
         # …and a gate this exact CONTENT has already passed is not bought a second time. The worker runs the
         # suites before it opens its PR and this ran them again on the same code — ten minutes a landing, and
         # nothing read the second answer differently from the first (PR #211, 2026-09-04). What is spent is the
@@ -1735,8 +1646,8 @@ def selfcheck():
         os.access = real_access
 
     # 4d. THE READ RUNS BESIDE THE SUITE (owner, 2026-09-04): serial they were the whole of a landing's wall clock.
-    # The proof is a rendezvous, as in the prepare cases below: the fake suite and the fake reviewer each answer
-    # only once the other is in flight, so a serial landing cannot get past it.
+    # The proof is a rendezvous: the fake suite and the fake reviewer each answer only once the other is in
+    # flight, so a serial landing cannot get past it.
     events, evlock = [], threading.Lock()
 
     def ev(*e):
@@ -1746,9 +1657,8 @@ def selfcheck():
     SAID = [""]     # …and what the landing PRINTED while it ran: a line the caller only reads back if it asks for
                     # it, so the cases that do not care stay three-tuples
 
-    def both(suite, reviewer, changed="M\tinstall.sh\n", land=None, fill_memo=False, **w):
+    def both(suite, reviewer, changed="M\tinstall.sh\n", land=None, **w):
         L = fresh(pr=7, **(land or {}))
-        L.fill_memo = fill_memo         # …the prepare phase's landing: it files a memo the serial one spends
         world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git merge-base": (0, A + "\n"),
                       "git diff --name-status": (0, changed), "git diff --numstat": (0, "3\t2\tx\n"),
                       "git rev-parse HEAD^{tree}": (0, TREE + "\n"),
@@ -1944,20 +1854,16 @@ def selfcheck():
               "is there now is named, and nothing merges ungated",
               isinstance(g, str) and isinstance(r, Failed) and HEAD[:12] in str(r) and MOVED[:12] in str(r)
               and "moved" in str(r) and not ran("gh pr merge"))
-        # …and the memo the PREPARE phase leaves is keyed to the SHA the gates RAN on. The push lands between the
-        # cheap gate and the suite; the review thread resolves the new head and used to write it to self.head, so
-        # the memo went in under a SHA nothing was gated at — and the serial phase, fetching that same new head,
-        # found the memo, skipped every gate, bought a fresh review and merged it with --match-head-commit
-        # (review-235). The thread keeps its answer in a local now, and the memo is filed under self.gated.
-        for p in glob.glob(f"{gate_dir()}/*.json"):
-            os.unlink(p)
+        # …and what was GATED stays pinned to the SHA the gates ran on whatever the read then resolves. The push
+        # lands between the cheap gate and the suite; the review thread resolves the new head and used to write it
+        # to self.head, so the landing carried a SHA nothing was gated at and merged it with --match-head-commit
+        # (review-235). The thread keeps its answer in a local now, and self.gated is the main thread's.
         # The push lands the instant the gates start, and the ORDER is pinned by the fixture rather than by any
         # timing: FETCH_HEAD answers the old SHA once — to gates(), on the main thread, which pins self.gated with
         # it — and the new one to every reader after that, the read on its thread first. No barrier, no sleep,
         # nothing to win a race against. (It used to be the cheap gate that installed the push, which worked only
-        # while the read started AFTER that gate; started at t=0 the read now resolves the old head first and lands,
-        # which proves nothing about the memo. Timing it loosely against the suite is the same coin toss that made
-        # this gate red on 2026-09-04 while the case was green here.)
+        # while the read started AFTER that gate. Timing it loosely against the suite is the same coin toss that
+        # made this gate red on 2026-09-04 while the case was green here.)
         heads = [HEAD, MOVED]
 
         def then_moved(argv):
@@ -1966,21 +1872,12 @@ def selfcheck():
         def gate_pushes(argv):
             return (0, "check.sh: OK\n") if os.path.basename(argv[0]) == "check.sh" else \
                    (0, "== result: 5 passed, 0 failed ==\n")
-        L, g, r = both(gate_pushes, reviewer_says, fill_memo=True,
-                       **{"git rev-parse FETCH_HEAD": then_moved})
-        memos = sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json"))
-        check("a push the moment the gates start leaves NO memo for the new head: what the prepare phase files is "
-              "keyed to the tree the gates RAN on, and the read beside them keeps the SHA it resolved in a local — "
-              "written to self.head it made the memo a green record for a tree nothing gated (review-235)",
+        L, g, r = both(gate_pushes, reviewer_says, **{"git rev-parse FETCH_HEAD": then_moved})
+        check("a push the moment the gates start does not move what this landing says it gated: the read beside "
+              "them keeps the SHA it resolved in a local — written to self.head it made every later step speak for "
+              "a tree nothing gated (review-235) — and the landing stops on the head that moved",
               isinstance(g, str) and L.gated == HEAD and L.head == HEAD
-              and memos == [f"myrepo-7-{GATED()[:12]}-full.json"])
-        check("...so the serial phase has nothing to spend for that new head — not by the tree, not by the head the "
-              "memo names — and GATES it, where a memo filed under it would have skipped every gate and merged "
-              "with --match-head-commit",
-              not gate_memo("myrepo", 7, GATED(MOVED), "full") and not gate_memo("myrepo", 7, GATED(MOVED), "full", MOVED)
               and isinstance(r, Failed) and "moved" in str(r) and MOVED[:12] in str(r))
-        for p in glob.glob(f"{gate_dir()}/*.json"):
-            os.unlink(p)
         # …and the suite is told what the diff changed, so one that knows its own shape runs only what that reaches
         # (core/tests/selftest.sh does; core/tests/green.sh has the rule) — and a green record answers only for
         # its own scope.
@@ -1991,9 +1888,9 @@ def selfcheck():
         check("the suite is handed the paths the diff changed — CC_LAND_CHANGED, sorted, as git names them — so a "
               "suite that knows its own shape runs only what those reach", told() == ["core/bin/cc-graphs install.sh"])
         slots = lambda: [e.get("CC_SELFTEST_SLOTS") for c, e in zip(calls, envs) if c[0].endswith("selftest.sh")]
-        check("...and the ONE concurrency number with it: what the lander runs at once IS what the suite's own "
+        check("...and the ONE concurrency number with it: what the lander hands the suite IS what the suite's own "
               "lock allows at once, said out loud in the suite's environment, so no landing ever waits at a cap "
-              "its own lander widened past", slots() == [str(PREPARE_AT_ONCE)] and PREPARE_AT_ONCE == gate_slots())
+              "its own lander widened past", slots() == [str(SUITE_SLOTS)] and SUITE_SLOTS == gate_slots())
         # …and the number itself follows the MACHINE. It was 4 typed here and 4 typed again in selftest.sh, in two
         # files, neither set anywhere and nothing keeping them in step. Both derive it now, and the two derivations
         # are checked against each other by RUNNING the shell one — a text match on that file would go green the
@@ -2365,11 +2262,13 @@ def selfcheck():
     calls.clear()
     say_result({"repo": "myrepo", "pr": 7, "queued_at": "2026-09-11T15:10:54Z"}, asked)
     routed = ran_sub("cc-slack", "post", "--route")
-    check("a landing with NO chat still asks the owner: with no thread to carry the card, the restart goes on its "
-          "own to the repo's channel, @-mentioned — the door cc-notify --decision uses for an approval-class ask "
-          "— and carries the unit and the one command (PR #433 put it on a card that posted nowhere)",
-          len(routed) == 1 and "--mention" in routed[0] and "[myrepo] restart" in routed[0]
-          and f"land:myrepo:7:landed@2026-09-11T15:10:54Z:restart" in routed[0]
+    check("a landing with NO chat still asks the owner: with no thread to carry the card, the one post this "
+          "landing makes is routed to the repo's channel and @-mentioned — the door cc-notify --decision uses for "
+          "an approval-class ask — and carries the unit and the one command (PR #433 put it on a card that posted "
+          "nowhere)",
+          len(routed) == 1 and "--mention" in routed[0] and "[myrepo] PR #7 landed" in routed[0]
+          and f"land:myrepo:7:landed@2026-09-11T15:10:54Z" in routed[0]
+          and len(ran_sub("cc-slack", "post")) == 1
           and all(w in " ".join(routed[0]) for w in ("dash.service", "systemctl --user restart dash.service",
                                                      "old code", "PR #7")))
     calls.clear()
@@ -2382,6 +2281,73 @@ def selfcheck():
     check("…and the control: a chatless landing that owes the owner no restart posts nothing at all — this is an "
           "ask reaching him, not a landing announcing itself in his main lane",
           not ran_sub("cc-slack", "post"))
+
+    # 8b. ONE POST PER TERMINAL STATE, and a ledger line saying where it went. A stop used to say the same sentence
+    # three times — the thread, #<repo>-updates and the route — under three producer ids, so a person reading two
+    # of those lanes read the same landing twice and the queue log recorded none of it.
+    def notified(job, r):
+        """One say_result on a fixture of its own: the posts it made, the injects, and its `notify` ledger line."""
+        calls.clear()
+        say_result(job, r)
+        lines = [l for l in open(f"{LANDQ}/queue.log").read().splitlines() if "\tnotify " in l]
+        return ran_sub("cc-slack", "post"), ran_sub("cc-slack", "inject"), (lines[-1] if lines else "")
+
+    LANDED = {"ok": True, "text": "[myrepo] PR #7: landed ✅", "short": "landed", "restart": ""}
+    STOPPED = {"ok": False, "text": "[myrepo] PR #7: NOT merged ❌", "short": "the gate went red"}
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1"}, LANDED)
+    check("a landing with a thread is said THERE and once: one post, in that thread, under the job's producer id "
+          "— and the queue log records which door it went through",
+          [c[1:] for c in posts] == [["post", "-c", "CAPPR", "--thread", "1.1", "--id", "land:myrepo:7:landed",
+                                      LANDED["text"]]]
+          and not injects and line.endswith("notify myrepo#7 landed → thread"))
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1"}, STOPPED)
+    check("…and a STOP with a thread is one post in the same thread and one line injected into the repo's planning "
+          "session — the seat's wake, never a second telling of the same news",
+          len(posts) == 1 and posts[0][1:5] == ["post", "-c", "CAPPR", "--thread"]
+          and "--id" in posts[0] and posts[0][-1] == STOPPED["text"]
+          and len(injects) == 1 and injects[0][2] == "myrepo" and "the gate went red" in injects[0][3]
+          and "cc-land queue myrepo 7" in injects[0][3]
+          and line.endswith("notify myrepo#7 stopped → thread"))
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7}, STOPPED)
+    check("a stop with NO thread is routed to the repo's own updates lane — one post, not a thread's and a lane's "
+          "and a route's — and the seat is still woken",
+          len(posts) == 1 and posts[0][2:5] == ["--route", "[myrepo] PR #7 stopped", "--id"]
+          and "--mention" not in posts[0] and len(injects) == 1
+          and line.endswith("notify myrepo#7 stopped → route"))
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7, "say_tries": 1}, STOPPED)
+    check("…and the RETRY of that stop posts again under the same id but does not wake the seat twice: the "
+          "injected line carries no producer id, so nothing downstream could de-duplicate it",
+          len(posts) == 1 and not injects and line.endswith("notify myrepo#7 stopped → route"))
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7}, LANDED)
+    check("a landing with no thread and nothing to ask says NOTHING: the card step has already edited the "
+          "#approvals card to landed ✓, and a post beside it is the same news a second time",
+          not posts and not injects and line.endswith("notify myrepo#7 landed → card"))
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7}, dict(LANDED, restart="⚠️ yours to restart: x"))
+    check("…unless it owes the owner a restart, which is the one thing that pages him: a single routed post, "
+          "@-mentioned, carrying the landing's own text",
+          len(posts) == 1 and posts[0][2:4] == ["--route", "[myrepo] PR #7 landed"] and "--mention" in posts[0]
+          and posts[0][-1] == LANDED["text"] and not injects
+          and line.endswith("notify myrepo#7 landed → route"))
+    os.makedirs(f"{DEV}/bob/.cc", exist_ok=True)      # a member workspace, decided by the marker and never the name
+    open(f"{DEV}/bob/.cc/member-workspace", "w").close()
+    posts, injects, line = notified({"repo": "bob--site", "pr": 7}, LANDED)
+    check("a member project is said in the workspace's own lane and nowhere of the box's: one post to "
+          "#bob-updates, no route to the owner, and no line injected into a planning session it has none of",
+          [c[1:] for c in posts] == [["post", "-c", "#bob-updates", "--id", "land:bob--site:7:landed",
+                                      LANDED["text"]]]
+          and not injects and line.endswith("notify bob--site#7 landed → #bob-updates"))
+    posts, injects, line = notified({"repo": "bob--site", "pr": 7}, STOPPED)
+    check("…and its STOP in #bob, where the member reads — still one post, and still no inject: a member project "
+          "has no seat of the box's to wake",
+          len(posts) == 1 and posts[0][2:4] == ["-c", "#bob"] and not injects
+          and line.endswith("notify bob--site#7 stopped → #bob"))
+    world[f"{BIN}/cc-slack post"] = (1, "cc-slack post: not sent (ratelimited)")
+    posts, injects, line = notified({"repo": "myrepo", "pr": 7, "chat": "CAPPR", "ts": "1.1"}, LANDED)
+    check("…and a door that REFUSED says so on the same ledger line: the record is what the retry and anyone "
+          "reading back are left with, so 'said' and 'not said' cannot look alike",
+          len(posts) == 1 and "notify myrepo#7 landed → thread — Slack did not take it:" in line
+          and "ratelimited" in line)
+    world.pop(f"{BIN}/cc-slack post", None)
 
     L = with_dash((2, "cc-units: no manifest at /nope\n"))
     check("and a manifest the landing cannot read is a red deploy — guessing past it is what left the old "
@@ -2449,44 +2415,43 @@ def selfcheck():
         return go
 
     L = with_daemon((0, ""), [proc(4242, "/usr/bin/python3", GPROG, "serve", "--port", "5190")])
-    msg = said(L)
-    check("a server no unit owns, running a file this change touched, is NAMED by the deploy and left running — "
-          "#295's process answered on the old code while the landing reported success",
-          L.stale == ["core/bin/cc-graphs (pid 4242)"] and "core/bin/cc-graphs (pid 4242)" in msg)
-    check("…and the owner reads it in the SAME sentence as the ✅, not in a tail below it — 'deployed' is a claim "
-          "about what is RUNNING",
-          all(s in result_of(L, 0, {"attempts": 1}, "")["short"]
-              for s in ("landed ✅", "core/bin/cc-graphs (pid 4242)", "old code")))
-    L = with_daemon((0, ""), [proc(4260 + i, "/usr/bin/python3", GPROG, "serve") for i in range(5)])
-    check("many processes of ONE program are one entry with the count, not a dozen pids: a card nobody finishes "
-          "reading is a warning that does not warn",
-          "core/bin/cc-graphs (5 processes)" in said(L) and L.stale == ["core/bin/cc-graphs (5 processes)"])
-    L = with_daemon((0, ""), [proc(4243, "/usr/bin/python3", GPROG, "serve", unit="cc-graphs.service")])
-    check("a process a UNIT owns is the restart step's business, not this one's: it is not named a second time",
-          isinstance(caught(L.daemons), Skip) and not L.stale)
-    L = with_daemon((0, ""), [proc(4244, "/usr/bin/python3", GPROG, "serve")])
+    r = caught(L.daemons)
+    check("a server NO ROW DECLARES is not looked for: the step has nothing to restart and says so, where naming "
+          "every bare process running a touched file put a warning on the card that nothing here could ever act on",
+          isinstance(r, Skip) and "no declared daemon runs the files this change touched" in str(r)
+          and not ran(f"{droot}/core/bin/cc-graphs"))
+    L = with_daemon((0, GCMD), [proc(4243, "/usr/bin/python3", GPROG, "serve", unit="cc-graphs.service")])
+    r = caught(L.daemons)
+    check("a process a UNIT owns is the restart step's business, not this one's: the declared row finds nothing "
+          "running outside systemd and nothing is restarted twice",
+          isinstance(r, Skip) and "cc-graphs is not running here" in str(r)
+          and not ran(f"{droot}/core/bin/cc-graphs", "serve"))
+    L = with_daemon((0, GCMD), [proc(4244, "/usr/bin/python3", GPROG, "serve")])
     MINE[0] = {4244}
-    check("the landing's own process tree is never named — cc-land is itself a file in the repo it lands",
-          isinstance(caught(L.daemons), Skip) and not L.stale)
-    L = with_daemon((0, ""), [proc(4245, "/usr/bin/grep", "-n", "serve", GPROG, exe=NOTPY)])
+    r = caught(L.daemons)
+    check("the landing's own process tree is never taken for the daemon — cc-land is itself a file in the repo it "
+          "lands, and a restart proved against its own ancestry proves nothing",
+          isinstance(r, Skip) and "cc-graphs is not running here" in str(r))
+    MINE[0] = set()
+    L = with_daemon((0, GCMD), [proc(4245, "/usr/bin/grep", "-n", "serve", GPROG, exe=NOTPY)])
     check("a repo file handed to another tool as an ARGUMENT is not a process running it: the program is "
-          "argv[0] or argv[1] and no further, or a grep over the diff is named as a server left on old code",
-          isinstance(caught(L.daemons), Skip) and not L.stale)
+          "argv[0] or argv[1] and no further, or a grep over the diff stands in for the daemon",
+          isinstance(caught(L.daemons), Skip))
     # A COMMAND LINE IS THE PROCESS'S OWN MEMORY. `exec -a <path>/cc-graphs sleep 999` names any process the
     # daemon at no privilege at all, so every answer below is cross-checked against /proc/<pid>/exe, which the
     # kernel writes at exec and which a process cannot move without exec'ing that very file.
-    L = with_daemon((0, ""), [proc(4252, GPROG, "999", exe=NOTPY)])
-    check("a process that merely CALLS itself the daemon is not NAMED as a stale server: its argv says the file "
-          "this change touched, the kernel says it is executing something else, and the kernel is the one that "
-          "was not asked — a forgeable warning is one anybody can put on the owner's card",
-          isinstance(caught(L.daemons), Skip) and not L.stale)
+    L = with_daemon((0, GCMD), [proc(4252, GPROG, "999", exe=NOTPY)])
+    check("a process that merely CALLS itself the daemon is not taken for it: its argv says the file this change "
+          "touched, the kernel says it is executing something else, and the kernel is the one that was not asked "
+          "— taken for the daemon, a restart that never happened reads as one that did",
+          isinstance(caught(L.daemons), Skip))
 
     L = with_daemon((0, GCMD), [proc(4246, "/usr/bin/python3", GPROG, "serve")])
     world[f"{droot}/core/bin/cc-graphs serve"] = comes_back(4247)
     msg = said(L)
     check("a declared daemon comes back through its OWN restart command — the tool's, which stops the pid in its "
           "own pidfile — and the deploy proves it by the new pid, not by what the command printed",
-          ran(f"{droot}/core/bin/cc-graphs", "serve") and "pid 4247" in msg and not L.stale)
+          ran(f"{droot}/core/bin/cc-graphs", "serve") and "pid 4247" in msg)
     L = with_daemon((0, GCMD), [proc(4246, "/usr/bin/python3", GPROG, "serve")])
     r = caught(L.daemons)          # no world answer: the command exits 0 and changes nothing, which is exactly
                                    # what a restart that reloaded no code looks like from the outside
@@ -2500,7 +2465,7 @@ def selfcheck():
     check("…and a decoy alive on BOTH sides of a real restart does not turn it red: taken for the daemon it would "
           "sit in `was` and in `now`, so a restart that worked would read as 'the running thing did not change' "
           "and burn all three tries on a change that was already deployed",
-          "pid 4247" in msg and "4253" not in msg and not L.stale)
+          "pid 4247" in msg and "4253" not in msg)
     L = with_daemon((0, GCMD), [proc(4246, "/usr/bin/python3", GPROG, "serve")])
 
     def only_decoy(_argv):
@@ -2518,25 +2483,26 @@ def selfcheck():
     world[f"{droot}/core/bin/cc-graphs serve"] = comes_back(4249)
     check("a daemon whose ASSETS moved is restarted too, though the file it runs never changed — the row's "
           "declared paths answer where a program name cannot",
-          "pid 4249" in said(L) and not L.stale)
+          "pid 4249" in said(L))
     L = with_daemon((0, GCMD), [])
     check("a declared daemon that is not running is left alone: nothing to restart is not a failure",
           isinstance(caught(L.daemons), Skip) and not ran(f"{droot}/core/bin/cc-graphs", "serve"))
     L = with_daemon((0, "cc-graphs\towner\tcore/bin/cc-graphs\n"),
                     [proc(4250, "/usr/bin/python3", GPROG, "serve")])
-    msg = said(L)
-    check("a daemon the manifest marks the owner's is named and never restarted from here",
-          not ran(f"{droot}/core/bin/cc-graphs", "serve") and L.stale == ["cc-graphs (pid 4250)"] and "owner" in msg)
+    r = caught(L.daemons)
+    check("a daemon the manifest marks the owner's is named, with its pid and whose call it is, and never "
+          "restarted from here",
+          not ran(f"{droot}/core/bin/cc-graphs", "serve") and isinstance(r, Skip)
+          and "cc-graphs (pid 4250) is the owner's to restart (units.json restart=owner)" in str(r))
     L = with_daemon((2, "cc-units: /r/config/units.json is not valid json — nothing can be told what to restart\n"),
                     [proc(4251, "/usr/bin/python3", GPROG, "serve")])
     check("a manifest the landing cannot read is a red deploy here too — an empty answer from a file nothing "
           "could parse must never read as 'this box runs no daemon at all'",
           isinstance(caught(L.daemons), Failed) and not ran(f"{droot}/core/bin/cc-graphs", "serve"))
-    # 7d. A DAEMON THAT IMPORTS WHAT MOVED. PR #407 (2026-09-10) changed core/mail/vetting.py; cc-slackd imports it,
-    # the deploy keyed on the daemon's own file and the units manifest alone, the daemon kept its 08:30Z pid and
-    # the landing said "deployed". The unit is the fixture's cc-slackd.service (ExecStart=%h/bin/cc-slack daemon),
-    # its process runs the tree's cc-slack, and nothing in units.json declares the module.
-    def with_importer(changed, restart_for=(0, "")):
+    # 7d. A MODULE NOTHING DECLARES. A daemon whose program imports a changed module is not looked for: what a
+    # landing restarts is what a unit's Exec line runs or what a units.json row declares, and a change that wants
+    # a restart beyond that says so in the manifest (units.json `paths`) rather than being guessed at.
+    def with_module(changed, restart_for=(0, "")):
         D = fresh(pr=7)
         D.root = droot
         D.changed = list(changed)
@@ -2545,35 +2511,17 @@ def selfcheck():
         PROCS[0] = [proc(4300, "/usr/bin/python3", SPROG, "daemon", unit="cc-slackd.service")]
         return D
 
-    L = with_importer([("M", "core/mail/vetting.py")])
+    L = with_module([("M", "core/mail/vetting.py")])
     r = caught(L.restart)
-    check("a change to a module a running daemon IMPORTS restarts that daemon, and the line says why: #407 changed "
-          "core/mail/vetting.py and cc-slackd, which imports it, was left on the old code with 'deployed' reported",
-          isinstance(r, str) and ran_sub("systemctl", "--user", "restart", "cc-slackd.service")
-          and "core/bin/cc-slack imports core/mail/vetting.py, which moved" in r)
-    L = with_importer([("M", "core/mail/router.py")])
-    r = caught(L.restart)
-    check("…and the imports are followed through: router.py is two imports away from the daemon and still counts",
-          isinstance(r, str) and ran_sub("systemctl", "--user", "restart", "cc-slackd.service")
-          and "core/bin/cc-slack imports core/mail/router.py" in r)
-    L = with_importer([("M", "core/mail/outbound.py")])
-    r = caught(L.restart)
-    check("a change to a module nothing running imports restarts nothing, and the line says so",
-          isinstance(r, Skip) and not ran_sub("systemctl", "--user", "restart") and "or imports" in str(r))
-    L = with_importer([("M", "core/mail/vetting.py")], (0, "cc-slackd.service\towner\n"))
-    r = caught(L.restart)
-    check("…and a daemon the manifest keeps for the owner is NAMED as left on the old code, with the import as the "
-          "reason, never restarted from here",
+    check("a change to a module NO unit's Exec line runs and no units.json row declares restarts nothing, and the "
+          "line says exactly that — a repo that wants that daemon back declares the path",
           isinstance(r, Skip) and not ran_sub("systemctl", "--user", "restart")
-          and "cc-slackd.service moved too and is the owner's" in str(r)
-          and "core/bin/cc-slack imports core/mail/vetting.py" in str(r))
-    L = with_importer([("M", "core/mail/vetting.py")])
-    PROCS[0] = [proc(4301, "/usr/bin/python3", SPROG, "channel")]        # the same program, no unit: a session's
-    world[f"{BIN}/cc-units daemons-for"] = (0, "")                          # channel server, undeclared here
-    msg = said(L)
-    check("…and outside systemd the same rule holds: a bare process of a program that imports the changed module "
-          "is named as still on the old code, with the reason",
-          L.stale == ["core/bin/cc-slack (pid 4301)"] and "core/bin/cc-slack imports core/mail/vetting.py" in msg)
+          and str(r) == "nothing running uses the files this change touched")
+    L = with_module([("M", "core/mail/vetting.py")], (0, "cc-slackd.service\trestart\n"))
+    r = caught(L.restart)
+    check("…and the same change WITH the row declared restarts that daemon: the manifest is what answers where a "
+          "program name cannot",
+          isinstance(r, str) and ran_sub("systemctl", "--user", "restart", "cc-slackd.service"))
     PROCS[0] = []
 
     # …and the /proc read itself, against a REAL process. Every case above stands on a fake process list, so
@@ -2697,21 +2645,15 @@ def selfcheck():
 
     # 9. the sequence itself, and what each step's failure means
     check("the steps are the remembered ones, in that order — the GATES first (all of them at once, with the paid "
-          "read beside them), the review step collecting that read, `settle` between the merge and the box because "
-          "everything after it changes the box, and the check that says it reached the owner LAST, after install.sh "
-          "and the restart, because before those the box still runs the old code",
+          "read beside them), the review step collecting that read, and the check that says it reached the owner "
+          "LAST, after install.sh and the restart, because before those the box still runs the old code",
           [n for n, _ in Land("myrepo", pr=1).steps()] ==
-          ["gates", "review", "merge", "card", "board", "ledger", "settle", "install", "units", "restart",
+          ["gates", "review", "merge", "card", "board", "ledger", "install", "units", "restart",
            "daemons", "verify"])
     check("the fatal steps are exactly the ones that leave the box wrong; card, board, ledger and the delivery "
-          "check are not among them — nothing follows the check, and a landing it cannot confirm is still landed. "
-          "Nor is `settle`, which only ever waits: a wait is not a verdict, and one that failed would stop a "
-          "landing over another job's gates",
+          "check are not among them — nothing follows the check, and a landing it cannot confirm is still landed",
           set(FATAL) - {"walls"} == {n for n, _ in Land("myrepo", pr=1).steps()}
-          - {"card", "board", "ledger", "verify", "settle"})   # walls: a member PR's step alone, fatal there (M3)
-    check("...and settle skips outright when no sweep is gating, which is every landing run by hand: it is the "
-          "pipeline's own bound, never a step that can hold one up on its own",
-          isinstance(caught(Land("myrepo", pr=1).settle), Skip))
+          - {"card", "board", "ledger", "verify"})   # walls: a member PR's step alone, fatal there (M3)
 
     # 11. the queue: at most one merge however many 👍, kills, sweeps and reboots ask for one at once
     qdir = tempfile.mkdtemp(prefix="cc-land-selfcheck-q-")
@@ -3025,12 +2967,12 @@ def selfcheck():
                   and "the NEXT sweep takes it" not in out.getvalue())
             os.unlink(job_path("myrepo", 8))
             os.unlink(f"{odir}/.running")
-            seen, real_memos = [], sweep_memos
-            globals()["sweep_memos"] = lambda: seen.append(sweep_running())   # a seam INSIDE the held queue
+            seen, real_sweep = [], sweep_records
+            globals()["sweep_records"] = lambda: seen.append(sweep_running())   # a seam INSIDE the held queue
             try:
                 quiet(cmd_work, [])
             finally:
-                globals()["sweep_memos"] = real_memos
+                globals()["sweep_records"] = real_sweep
             check("...and a sweep says on disk that it is running, for exactly as long as it holds the queue: a "
                   "👍 arriving mid-sweep is answered from that, never by probing the flock — a probe that won "
                   "the lock for a millisecond would make a real worker stand down and drain nothing — and the "
@@ -3128,9 +3070,11 @@ def selfcheck():
         quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
         for _ in range(LAND_TRIES):
             quiet(cmd_work, [])
-        paged = ran_sub("cc-slack", "post", "--route")
-        check("a PR the box cannot read is NOT merged, said once, ambient in #myrepo-updates",
-              len(paged) == 1 and not gh_merges() and "NOT merged" in paged[0][-1]
+        said = ran_sub("cc-slack", "post", "CAPPR")
+        check("a PR the box cannot read is NOT merged, and the ask that queued it hears that ONCE — in its own "
+              "thread, with nothing routed to #myrepo-updates beside it",
+              len(said) == 1 and not gh_merges() and "NOT merged" in said[0][-1]
+              and not ran_sub("cc-slack", "post", "--route")
               and not os.path.exists(job_path("myrepo", 7)))
 
         # ---- the retry PR #87 never had, and the point it stops.
@@ -3146,11 +3090,11 @@ def selfcheck():
               and not ran_sub("cc-slack", "post"))
         quiet(cmd_work, [])
         quiet(cmd_work, [])
-        check("...and it gives up after 3 tries rather than retrying for ever — the thread hears once, the repo's "
-              "own planning session wakes to it, one ambient line lands in #myrepo-updates, no reaction from the "
-              "bot and no push to a phone",
+        check("...and it gives up after 3 tries rather than retrying for ever — the thread hears once and the "
+              "repo's own planning session is woken once, and that is the whole telling: nothing routed to "
+              "#myrepo-updates beside it, no reaction from the bot and no push to a phone",
               read_json(job_path("myrepo", 7)) is None and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
-              and len(ran_sub("cc-slack", "post", "--route")) == 1
+              and not ran_sub("cc-slack", "post", "--route")
               and len(ran_sub("cc-slack", "inject")) == 1 and not ran("cc-notify") and not reacted)
 
         fresh(pr=7)
@@ -3319,12 +3263,13 @@ def selfcheck():
             landing(**{GATE: (1, "  ✗ the row was wrong\n1 failed\n")})
             for _ in range(LAND_TRIES):
                 quiet(cmd_work, [])
-            check("...while one that stays red stops after 3 tries and says NOT merged, once, with the ✗ line — never "
-                  "'the deploy stopped', since nothing merged; the update lane hears it too, no push",
+            check("...while one that stays red stops after 3 tries and says NOT merged ONCE, in the thread that "
+                  "asked, with the ✗ line — never 'the deploy stopped', since nothing merged; and nothing routed "
+                  "to #myrepo-updates saying it a second time, no push",
                   read_json(job_path("myrepo", 7)) is None and not gh_merges()
                   and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told()
                   and "✗ the row was wrong" in told() and "after 3 tries" in told() and "old code" not in told()
-                  and len(ran_sub("cc-slack", "post", "--route")) == 1 and not ran("cc-notify"))
+                  and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
             landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n"),
                        GATE: (0, "  ✓ the first\n  ✓ H4\n0 failed\n")})
             quiet(cmd_work, [])                # gated green, and THEN the limit: deferred, uncounted, PR unread —
@@ -3531,8 +3476,9 @@ def selfcheck():
         write_atomic(job_path("myrepo", 7), j); calls.clear(); quiet(cmd_work, [])
         check("F4c control: every sweep after re-holds it in silence — no second worker, no second line, no second "
               "post, and no review bought for a change nothing has touched",
-              read_json(job_path("myrepo", 7))["stage"] == "held" and not preparable(job_path("myrepo", 7))
+              read_json(job_path("myrepo", 7))["stage"] == "held"
               and not ran_sub("cc", "myrepo", "w1", "--go") and not ran_sub("cc-slack", "post", "--route")
+              and not [c for c in calls if c[0] == CLAUDE]
               and open(f"{LANDQ}/queue.log").read().count("held myrepo#7") == held_lines + 1)
         # …and the way OUT of that hold, which is the only one this feature has: the branch moved. A round dispatched
         # by hand, or any push to it, makes this a change nothing has answered — so fix_refused stops holding and the
@@ -3593,12 +3539,12 @@ def selfcheck():
         world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "running\n")
         quiet(cmd_work, [])
         check("a checkpoint push MID-ROUND does not re-queue: the loop pushes every iteration, so a moved head while "
-              "the track still runs is a half-finished branch — the job waits, and prepare() will not buy a review "
-              "of it either (review-176c)",
+              "the track still runs is a half-finished branch — the job waits, and no review is bought of an "
+              "intermediate checkpoint (review-176c)",
               os.path.exists(job_path("myrepo", 7))
               and (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing"
               and "fix-pushed myrepo#7" not in open(f"{LANDQ}/queue.log").read()
-              and not preparable(job_path("myrepo", 7)))
+              and not [c for c in calls if c[0] == CLAUDE])
         world[f"{BIN}/cc-board get myrepo w1 status"] = (0, "review\n")
         world["tmux list-windows"] = (0, "@9 myrepo/w1\n")
         world["tmux list-panes -t @9"] = (0, "4242\n")
@@ -3606,23 +3552,24 @@ def selfcheck():
         n_pushed = open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7")
         quiet(cmd_work, [])
         check("...the board word gone but the window still holding a loop (its pane shell has a child): still "
-              "mid-round, still waiting, still not preparable (review-176d)",
+              "mid-round, still waiting, and still nothing read (review-176d)",
               (read_json(job_path("myrepo", 7)) or {}).get("stage") == "fixing"
               and open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed
-              and not preparable(job_path("myrepo", 7)))
+              and not [c for c in calls if c[0] == CLAUDE])
         world["pgrep -P 4242"] = (1, "")
         quiet(cmd_work, [])
         check("a push on that branch re-queues the PR once the track has STOPPED: the head off the reviewed SHA plus "
               "a loop no longer running IS 'the round ended with a pushed head' — and `cc --go` leaves the worker's "
               "window behind as a bare shell, so a window that merely EXISTS is not a loop (review-176d)",
               open(f"{LANDQ}/queue.log").read().count("fix-pushed myrepo#7") == n_pushed + 1)
-        check("...and the SECOND stop is where the planning session finally hears about it — once in the thread, "
-              "once ambient in #myrepo-updates, no push — saying that a fix round has already been spent, and "
-              "with no second worker dispatched",
+        check("...and the SECOND stop is where the planning session finally hears about it — once in the thread "
+              "and once into the seat, nothing routed beside it and no push — saying that a fix round has already "
+              "been spent, and with no second worker dispatched",
               not os.path.exists(job_path("myrepo", 7)) and not ran_sub("cc", "myrepo", "w1", "--go")
               and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told()
               and "AFTER one automatic fix iteration" in told()
-              and len(ran_sub("cc-slack", "post", "--route")) == 1 and not ran("cc-notify"))
+              and len(ran_sub("cc-slack", "inject", "myrepo")) == 1
+              and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
         # …and the same bound across a RE-QUEUE, which is the one that never held. A 👍 after a stopped landing
         # writes a NEW job file that knows nothing of the round already spent, and `job["fix"]` bounded only the file
         # it was written on — so PR #171 came back seven times in one night, buying a round and a review each time.
@@ -3642,7 +3589,8 @@ def selfcheck():
               len(one) == 1 and spent_now.get("repairs") == 1 and not ran_sub("cc", "myrepo", "w1", "--go")
               and not os.path.exists(job_path("myrepo", 7)) and "NOT merged" in told()
               and "AFTER 1 automatic fix iteration on this change" in told()
-              and len(ran_sub("cc-slack", "post", "--route")) == 1 and not ran("cc-notify"))
+              and len(ran_sub("cc-slack", "inject", "myrepo")) == 1
+              and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
 
         # (4b) A CONFLICT HAS A WAY BACK: the PR's own track. #417 and #418 (2026-09-11) were held on a conflict with
         # main — "rebase it, then land it", said to nobody — until the seat rebased them by hand through subagents.
@@ -3834,10 +3782,11 @@ def selfcheck():
         landing(**{f"{CLAUDE} -p": (0, REVIEWED("DO-NOT-LAND", "a.py:9", "it deletes the queue", "drop it"))})
         quiet(cmd_work, [])
         check("a DO-NOT-LAND dispatches nothing and stops at once, no push: it says the change should not exist, "
-              "so there is no remedy to hand a worker — only LAND-AFTER-FIX names its own",
+              "so there is no remedy to hand a worker — only LAND-AFTER-FIX names its own; the thread that asked "
+              "hears that once and #myrepo-updates is not told it again",
               not ran_sub("cc", "myrepo", "w1", "--go") and not os.path.exists(job_path("myrepo", 7))
-              and "NOT merged" in told() and len(ran_sub("cc-slack", "post", "--route")) == 1
-              and not ran("cc-notify"))
+              and "NOT merged" in told() and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
+              and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
         landing(**AFTERFIX)
         quiet(cmd_work, [])
         j = read_json(job_path("myrepo", 7))
@@ -4050,23 +3999,10 @@ def selfcheck():
 
         shutil.rmtree(stdir, ignore_errors=True)
 
-        # (5) SEVERAL jobs are read and gated AT ONCE, and the merges still happen one at a time, in queue order.
-        # A landing was two serial things nobody was waiting on — a review of minutes and a suite of ten — done once
-        # per PR; four approvals were most of an hour of wall clock in which nothing could merge.
-        posted, gate = {}, threading.Barrier(2, timeout=30)
-        seen = []
-
-        def rendezvous(argv):
-            """The proof of concurrency, not a description of it: neither review returns until the OTHER one has
-            started too. Run serially, this cannot complete — the barrier times out and breaks, and the check below
-            fails on exactly that."""
-            seen.append(1)
-            if len(seen) <= 2:
-                try:
-                    gate.wait()
-                except threading.BrokenBarrierError:
-                    pass
-            return (0, REVIEWED("LAND"))
+        # (5) SEVERAL queued jobs in ONE sweep: each gated, read, merged and deployed before the next is touched.
+        # The whole batch is one walk in queue order, so what has to hold is per job — nothing merges on a head
+        # nothing read, and nothing is gated or read twice for the same head.
+        posted = {}
 
         def remember(argv):     # gh pr comment <pr> --body <body>: the review's own durable record of its verdict
             posted.setdefault(argv[3], []).append(argv[argv.index("--body") + 1])
@@ -4076,296 +4012,46 @@ def selfcheck():
             return lambda a: (0, json.dumps({"comments": [{"body": b, "viewerDidAuthor": True}
                                                           for b in posted.get(pr, [])]}))
 
-        fetches, fetched, overlapped = threading.Barrier(2, timeout=1.5), [], []
-
-        def fetch_pull(argv):
-            """The mirror image of the rendezvous above: this barrier completes ONLY if two threads are inside a
-            fetch of the same checkout at once, which the repo lock must make impossible — so it times out, breaks,
-            and `overlapped` stays empty. Everything after it is broken-barrier, i.e. instant."""
-            fetched.append(argv[-1])
-            try:
-                fetches.wait()
-                overlapped.append(argv[-1])
-            except threading.BrokenBarrierError:
-                pass
-            return (0, "")
-
         def merge_moves_base(argv):
-            """A MERGE MOVES THE DEFAULT BRANCH, which is the whole reason prepare() projects each job onto the
-            base with the jobs queued before it already merged in. Left still, this fixture would gate job 8
-            against a main that never changed and prove nothing about a batch — and a real second job would meet a
-            base its gates had never seen. Squashing head onto AT[0] leaves a branch holding exactly the tree the
-            projection built, which is what the fake merge-tree above says too."""
+            """A MERGE MOVES THE DEFAULT BRANCH. Left still, this fixture would gate job 8 against a main that
+            never changed and prove nothing about a batch — and a real second job would meet a base its gates had
+            never seen. Squashing head onto AT[0] leaves a branch holding exactly the tree the fake merge-tree
+            above says it does."""
             AT[0] = MERGE(HEAD, AT[0])
             return (0, "")
 
         fresh(pr=7)
         world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
                       "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
-                      f"{CLAUDE} -p": rendezvous, "gh pr comment": remember, "git fetch -q origin pull": fetch_pull,
-                      "gh pr merge": merge_moves_base,
+                      "gh pr comment": remember, "gh pr merge": merge_moves_base,
                       "gh pr view 7 --json comments": comments("7"), "gh pr view 8 --json comments": comments("8")})
         quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
         quiet(cmd_queue, ["myrepo", "8", "--chat", "CAPPR", "--ts", "1.2", "--no-start"])
         calls.clear()
-        # The memo is the ONE thing the parallel half hands the serial one, so it is watched being handed over
-        # rather than inspected after the fact. Read only at the end it is empty whatever the memo code does —
-        # which is exactly how this assertion passed while nothing ever wrote a memo at all (review of PR #176).
-        # The handover is now per job rather than per batch, so `after_prepare` is one snapshot of the memo dir
-        # per job, taken the instant THAT job's wait() returns and before its own merge spends the memo.
-        real_prepare, after_prepare = prepare, []
-
-        def watched_prepare(paths):
-            pool = real_prepare(paths)
-            real_wait = pool.wait
-
-            def wait(path):
-                lines = real_wait(path)
-                after_prepare.append(sorted(os.path.basename(p) for p in glob.glob(f"{gate_dir()}/*.json")))
-                return lines
-            pool.wait = wait
-            return pool
-
         # …and a gate only runs at all if there is one to find: without this patch both jobs Skip on "no gates in
-        # myrepo", no memo is ever written, and every line below is true of a mechanism that does not exist.
+        # myrepo" and every line below is true of a sweep that gated nothing.
         real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
-        globals()["prepare"] = watched_prepare
-        buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 cmd_work([])
         finally:
-            os.access, globals()["prepare"] = real_access, real_prepare
-        swept = buf.getvalue()
+            os.access = real_access
         gate_runs = [c for c in calls if os.path.basename(c[0]) == "check.sh"]
         merged = [c[3] for c in gh_merges()]
         merge_at = {c[3]: i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "merge"]}
         read_at = {pr: next((i for i, c in enumerate(calls)
                              if c[0] == CLAUDE and f"/pr-{pr}.diff" in " ".join(c)), None) for pr in ("7", "8")}
-        check("the reviews of several queued jobs really do run at the same time — the fake reviewer only answers "
-              "once BOTH are in flight, so a serial sweep cannot get past this line",
-              not gate.broken and len(seen) == 2)
-        check("...and each PR is gated and read before ITS OWN merge — which is the whole of what the phase split "
-              "has to guarantee now that a ready job no longer waits for the batch (Prepared.wait): a merge never "
-              "runs on a head nothing read",
-              all(read_at[pr] is not None and merge_at.get(pr) is not None and read_at[pr] < merge_at[pr]
-                  for pr in ("7", "8")))
-        check("...the merges themselves are one at a time and in queue order, both of them, and each PR is told "
-              "about once", merged == ["7", "8"] and len(ran_sub("cc-slack", "post")) == 2)
-        check("...and each PR is REVIEWED once, not twice: the prepare phase's verdict is the one the merge reads "
-              "back off the PR, so overlapping the reviews costs no extra model call",
-              len([c for c in calls if c[0] == CLAUDE]) == 2 and len(posted.get("7", [])) == 1
-              and len(posted.get("8", [])) == 1)
-        check("...the prepare phase leaves ONE memo per PR, keyed by THE TREE THAT PR WILL LAND ON and by the tier "
-              "the serial half will ask with — the whole of what the parallel work hands over. 7's is main merged "
-              "with 7; 8's is that merged with 8, because by the time 8 merges main holds 7. Watched as each job "
-              "is handed over: 7's memo is there when 7 is, and by then 8 is gating on a base that includes it",
-              len(after_prepare) == 2 and f"myrepo-7-{GATED(HEAD, BASE_SHA)[:12]}-full.json" in after_prepare[0]
-              and after_prepare[1] == [f"myrepo-8-{GATED(HEAD, MERGE(HEAD, BASE_SHA))[:12]}-full.json"])
-        check("...so a batch costs ONE run per PR and not one per PR per base it might meet: the projection is what "
-              "the serial half then finds, so it SPENDS both memos rather than re-running — it says so on both PRs, "
-              "and the gate itself was executed exactly twice across the whole sweep. Gated against main alone, 8's "
-              "memo would be filed under a tree the serial half never asks for and its gates would run again",
-              swept.count("run for this sweep by the prepare phase") == 2 and len(gate_runs) == 2)
-        check("...and the memo is gone when the sweep is: spent on read, so the green it recorded can never answer "
-              "for the NEXT sweep — the one a kept job is re-gated by (`gates` is in RETRY because the suite flakes)",
-              not glob.glob(f"{gate_dir()}/*.json") and gate_dir() == f"{qdir}/gates")
-        check("...and no two of them are ever inside a fetch of the SAME checkout at once: .git/FETCH_HEAD is one "
-              "file per repo, so interleaved fetches hand a thread its sibling's head SHA — a review bought "
-              "against the wrong diff, and its verdict posted on the wrong PR under a SHA that is not that PR's",
-              fetched and not overlapped and not gate.broken)
-
-        # (5b) A PREPARED JOB IS TAKEN AS SOON AS IT IS READY, not when the whole batch is. Until 2026-09-08
-        # cmd_work joined every prepare thread before its first merge, so a job ready in five minutes waited on the
-        # slowest job beside it — and the suite is uneven: 15.6 min median, 34.6 mean, 165 worst (measured
-        # 2026-09-07), so a batch of four was priced at its outlier. The proof is a rendezvous the other way round
-        # from the ones above: PR 8's review does not answer until PR 7 HAS MERGED. Joined first that is a
-        # deadlock — the merge waits on the review that waits on the merge — so the wait times out, `released`
-        # stays empty and this goes red. Its own fixture: fresh() wipes the tallies and the world, and `posted` is
-        # cleared, or the verdicts case 5 left on both PRs would be read back and no review would run at all.
-        fresh(pr=7)
-        posted.clear()
-        merged7, released, when = threading.Event(), [], []
-
-        def paced_review(argv):
-            """Which PR is being read, off the diff the prompt points the reviewer at ({tmp}/pr-<n>.diff) — read
-            from the whole argv, and never .group() on a miss: a fake handed something it does not recognise says
-            so rather than raising inside a worker thread, where the traceback is all anyone gets."""
-            m = re.search(r"/pr-(\d+)\.diff", " ".join(argv))
-            pr = m.group(1) if m else ""
-            if pr == "8" and merged7.wait(20):
-                released.append(pr)
-                time.sleep(1)     # …and 8 is STILL being read when 7's merge returns. Without the wait at the head
-                                  # of the deploy half, 7's `git pull` is microseconds behind its merge and lands
-                                  # in `when` before this line does — which is the regression, deterministically
-            when.append(("read", pr))
-            return (0, REVIEWED("LAND"))
-
-        def paced_merge(argv):
-            when.append(("merge", argv[3]))
-            if argv[3] == "7":
-                merged7.set()
-            return (0, "")
-
-        def paced_pull(argv):       # the first step of the deploy half, and the first thing that touches the box
-            when.append(("deploy", ""))
-            return (0, "")
-
-        world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
-                      "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
-                      f"{CLAUDE} -p": paced_review, "gh pr comment": remember, "gh pr merge": paced_merge,
-                      "git pull --ff-only": paced_pull,
-                      "gh pr view 7 --json comments": comments("7"), "gh pr view 8 --json comments": comments("8")})
-        for pr in ("7", "8"):
-            quiet(cmd_queue, ["myrepo", pr, "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
-        calls.clear()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            cmd_work([])
-        check("a job that is ready merges without waiting for the batch: PR 7 lands while PR 8 is still being "
-              "read — the fake reviewer for 8 only answers once 7 HAS merged, which a sweep that joins the whole "
-              "prepare pool before its first merge can never reach",
-              released == ["8"] and when[:2] == [("read", "7"), ("merge", "7")])
-        check("...and the DEPLOY half of that same job does NOT come with it: `git pull`, install.sh and the unit "
-              "restarts are the box, so PR 7 merges while PR 8 is still being read but waits for PR 8's gates "
-              "before it touches the box — a suite must not be reinstalled and restarted under (Land.settle)",
-              when.index(("merge", "7")) < when.index(("read", "8")) < when.index(("deploy", "")))
-        check("...and one at a time and in queue order survive it: 7 then 8, each read before it is merged, and "
-              "nothing merged twice — the bound that must hold whatever order the two halves interleave in",
-              [c[3] for c in gh_merges()] == ["7", "8"] and len([e for e in when if e[0] == "merge"]) == 2
-              and all(("read", pr) in when and when.index(("read", pr)) < when.index(("merge", pr))
+        check("two queued jobs are drained in ONE sweep, one at a time and in queue order, and each is gated and "
+              "read before ITS OWN merge: a merge never runs on a head nothing read",
+              merged == ["7", "8"] and len(gate_runs) == 2
+              and all(read_at[pr] is not None and merge_at.get(pr) is not None and read_at[pr] < merge_at[pr]
                       for pr in ("7", "8")))
-        for k in ("gh pr merge", "git pull --ff-only"):
-            world.pop(k, None)             # …and the paced fakes do not leak into the cases below
-
-        # (5c) AND A WRONG PROJECTION IS SPENT, NOT RE-RUN. prepare() gates job 8 on the base with job 7 merged
-        # in, which is the base 8 will meet — IF 7 merges. When 7 does not (a red gate, a stop verdict), the base
-        # 8 meets is the one 7 left alone, and the memo 8 filed answers for a tree main will not hold. Until
-        # 2026-09-15 that memo stayed unspent and 8's gate ran a third time (#378); the replay priced that re-run
-        # at half the median (trial 07-a, docs/replay-2026-09-08.md, Trace v2), so the serial half now spends the
-        # memo filed for the same HEAD and says on the ✓ line which base was gated and where main is. What is
-        # kept: 8 was gated on main-with-7, never on its head alone. The brief: "the serial walk re-uses the gate
-        # answer it already bought when the tree it meets is not the one it projected".
-        fresh(pr=7)
-        posted.clear()
-
-        def stops_7(argv):
-            # DO-NOT-LAND on 7, LAND on 8 — told apart by the diff the prompt points the reviewer at, and never
-            # .group() on a miss: a fake handed something it does not know says so rather than raising in a thread
-            m = re.search(r"/pr-(\d+)\.diff", " ".join(argv))
-            return (0, REVIEWED("DO-NOT-LAND" if m and m.group(1) == "7" else "LAND",
-                                "core/bin/cc-land", "this change should not exist", "drop it"))
-        world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
-                      "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
-                      f"{CLAUDE} -p": stops_7, "gh pr comment": remember, "gh pr merge": merge_moves_base,
-                      "gh pr view 7 --json comments": comments("7"), "gh pr view 8 --json comments": comments("8")})
-        for pr in ("7", "8"):
-            quiet(cmd_queue, ["myrepo", pr, "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
-        calls.clear()
-        buf = io.StringIO()
-        real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
-        try:
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-                cmd_work([])
-        finally:
-            os.access = real_access
-        swept, gate_runs = buf.getvalue(), [c for c in calls if os.path.basename(c[0]) == "check.sh"]
-        check("an earlier job that does NOT merge leaves the base where it was, and the job behind it is NOT gated "
-              "again: 7 is stopped by its verdict, so 8 meets main without 7 in it; the memo 8 filed against "
-              "main-with-7 does not match the tree the serial half asks for, but it names 8's head, so it is spent "
-              "and 8's gate ran twice in all — once per job, in the prepare phase",
-              [c[3] for c in gh_merges()] == ["8"] and len(gate_runs) == 2
-              and swept.count("run for this sweep by the prepare phase") == 2)
-        check("...and the ✓ line says so rather than quietly matching: it names the base 8 was gated on (main with "
-              "7 merged in, as projected) and the base main is at now (without 7), and the spent memo is gone",
-              swept.count("as projected at the start of the sweep") == 1
-              and MERGE(HEAD, BASE_SHA)[:12] in swept and f"it is at {BASE_SHA[:12]} now" in swept
-              and glob.glob(f"{gate_dir()}/*.json") == [])
+        check("...and each PR is gated once, read once and told about once — the second job meets the base the "
+              "first left (a merge MOVES main) and buys its own answers there, never a second read of the same head",
+              len([c for c in calls if c[0] == CLAUDE]) == 2 and len(ran_sub("cc-slack", "post")) == 2
+              and len(posted.get("7", [])) == 1 and len(posted.get("8", [])) == 1)
         world.pop("gh pr merge", None)
-        posted.clear()      # …and the DO-NOT-LAND this case posted on PR 7 goes with it: left there, the sections
-                            # below read it back off the PR and stop a landing they never asked to stop
-
-        # (6) ORDERED BY WHAT THEY TOUCH (owner, 2026-09-04): jobs whose files overlap go one after another in
-        # queue order, jobs on disjoint files side by side, and a job overlapping one of two running ones waits for
-        # that one alone. changed_files() is asked in queue order, once per job up front and once more per job in
-        # the serial phase, so the answers cycle.
-        def overlap_run(prs, files_by_pr, gate_says):
-            fresh(pr=7)
-            answers = [files_by_pr[pr] for pr in prs]
-            turn = [0]
-
-            def by_turn(argv):
-                turn[0] += 1
-                return (0, answers[(turn[0] - 1) % len(answers)])
-            world.update({"git rev-parse FETCH_HEAD": (0, HEAD + "\n"), "git rev-parse --abbrev-ref HEAD": (0, "main\n"),
-                          "git rev-parse HEAD": (0, "deadbeef\n"), f"{BIN}/cc-scope list": (0, "[]"),
-                          "gh pr comment": remember, "git merge-base": (0, A + "\n"),
-                          "gh pr merge": merge_moves_base,   # a merge MOVES the base, so the serial half meets the
-                                         # tree prepare() projected for the job behind it and spends that job's
-                                         # memo instead of gating it again — without this the pool is bought twice
-                          "git diff --numstat": (0, "3\t2\tx\n"), "git diff --name-status": by_turn,
-                          f"{tempfile.gettempdir()}/cc-land.": gate_says})
-            for pr in prs:
-                world[f"gh pr view {pr} --json comments"] = comments(str(pr))
-                quiet(cmd_queue, ["myrepo", str(pr), "--chat", "CAPPR", "--ts", "1.1", "--no-start"])
-            calls.clear()
-            events.clear()
-            real_access, os.access = os.access, lambda p, m: p.endswith("core/tests/check.sh")
-            try:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    cmd_work([])
-            finally:
-                os.access = real_access
-
-        def pr_of(argv):
-            """Which PR's gate this is, off the checkout it runs in — read from the WHOLE argv, and never .group()
-            on a miss: a fake that is handed something it does not recognise says so, it does not raise inside a
-            worker thread where the traceback is the only thing anyone gets (PR #235's gate, 2026-09-04)."""
-            m = re.search(r"cc-land\.gates\.myrepo\.(\d+)\.", " ".join(argv))
-            return m.group(1) if m else ""
-        order = lambda *e: events.index(e) if e in events else 99
-        pair = threading.Barrier(2, timeout=30)
-
-        def gate3(argv):
-            pr = pr_of(argv)
-            if not pr:
-                return (0, "check.sh: OK\n")   # not a gate of ours: answered, never recorded as one
-            ev("start", pr)
-            if pr in ("7", "8"):
-                try:
-                    pair.wait()
-                except threading.BrokenBarrierError:
-                    pass
-            if pr == "8":                       # 8 holds until 9 has started: 9 waited for 7 alone, not for 8
-                for _ in range(100):
-                    if ("start", "9") in events:
-                        break
-                    time.sleep(0.1)
-            ev("end", pr)
-            return (0, "check.sh: OK\n")
-        overlap_run([7, 8, 9], {7: "M\tinstall.sh\n", 8: "M\tcore/bin/cc-x\n", 9: "M\tinstall.sh\n"}, gate3)
-        check("two queued PRs on DISJOINT files are gated side by side: each one's fake gate answers only once the "
-              "other's is in flight", not pair.broken and order("start", "7") < order("end", "8")
-              and order("start", "8") < order("end", "7"))
-        check("...a third PR sharing a file with the first waits for THAT one alone: it starts after 7 ends and "
-              "while 8 is still running", order("end", "7") < order("start", "9") < order("end", "8"))
-        check("...and the merges are still one at a time, in queue order", [c[3] for c in gh_merges()] == ["7", "8", "9"])
-        same = threading.Barrier(2, timeout=1.5)
-
-        def gate2(argv):
-            pr = pr_of(argv)
-            if not pr:
-                return (0, "check.sh: OK\n")
-            ev("start", pr)
-            try:
-                same.wait()
-            except threading.BrokenBarrierError:
-                pass
-            ev("end", pr)
-            return (0, "check.sh: OK\n")
-        overlap_run([7, 9], {7: "M\tinstall.sh\n", 9: "M\tinstall.sh\n"}, gate2)
-        check("two queued PRs on the SAME file are gated one after another, in queue order: a barrier that needs "
-              "both in flight breaks, and 9's gate starts only after 7's has ended",
-              same.broken and order("end", "7") < order("start", "9"))
+        posted.clear()      # …left there, the sections below read a verdict of this case's back off the PR
 
         fresh(pr=7)
         world["gh pr merge"] = (1, "failed to merge: Merge already in progress")
@@ -4458,6 +4144,10 @@ def selfcheck():
             with open(f"{pdir}/parked", "w") as f:
                 f.write("".join(r + "\n" for r in repos))
 
+        # The one question every door asks (box_hold): a job it holds is not tried and not timed, and its file is
+        # not touched, so it lands on the first sweep after the resume.
+        held = lambda path: bool(box_hold(read_json(path) or {}))
+
         globals()["BIN"] = pdir
         try:
             fresh(pr=7)
@@ -4479,11 +4169,12 @@ def selfcheck():
             check("...the queue arms no timer for it either: with only parked jobs on disk next_wake is None, "
                   "where an untried job asks for 5 s — which would re-drive the whole sweep every 5 s for as "
                   "long as the project stayed parked", next_wake() is None)
-            check("...and the review, the dearest thing this file buys, is not bought: a job whose project is "
-                  "parked is not preparable", not preparable(job))
+            check("...and the box's own door is what says so: a job whose project is parked is held there, so "
+                  "nothing of it is tried and the review, the dearest thing this file buys, is never bought",
+                  held(job))
             park()                            # `cc-pause off myrepo`, and the SAME job is live again
-            check("resumed, that very same job is preparable again and wanted at once: the pause was what held "
-                  "it, and nothing about the job itself changed", preparable(job) and next_wake() == 5)
+            check("resumed, that very same job is through that door again and wanted at once: the pause was what "
+                  "held it, and nothing about the job itself changed", not held(job) and next_wake() == 5)
 
             # run_one's own control. Out of tries is its cheapest branch that really acts on the file — it says
             # the last word and drains the job — so it shows the parked call above returned early, not that the
@@ -4516,22 +4207,22 @@ def selfcheck():
             fresh(pr=7)
             quiet(cmd_queue, ["myrepo", "7", "--chat", "CAPPR", "--ts", "1.1"])
             park("otherrepo")
-            check("parking one project parks ONLY it: with otherrepo the parked one, myrepo's job is preparable "
-                  "and wanted at once — pause is per project, never box-wide",
-                  preparable(job_path("myrepo", 7)) and next_wake() == 5)
+            check("parking one project parks ONLY it: with otherrepo the parked one, myrepo's job is through the "
+                  "door and wanted at once — pause is per project, never box-wide",
+                  not held(job_path("myrepo", 7)) and next_wake() == 5)
             park("myrepo")
             globals()["BIN"] = nopause
             check("and where cc-pause cannot be asked at all, the queue behaves exactly as it did before pausing "
                   "existed: a gate that cannot answer must never be the reason a landing stops",
-                  preparable(job_path("myrepo", 7)) and next_wake() == 5)
+                  not held(job_path("myrepo", 7)) and next_wake() == 5)
             globals()["BIN"] = pdir
             check("control: with cc-pause back on the box, that same parked job is held again",
-                  not preparable(job_path("myrepo", 7)) and next_wake() is None)
+                  held(job_path("myrepo", 7)) and next_wake() is None)
 
             # ---- THE SPEND TIER `stop` (cc-tier), on the same stub-binary footing as the pause above: `allows
             # gates` answers by exit status off a file beside it, so the exit-code contract is what is pinned.
-            # Under stop a job at its gates is held on every door — not preparable, untouched by the sweep, no
-            # timer — and a job past them goes on; every other tier is the unparked case.
+            # Under stop a job at its gates is held on every door — untouched by the sweep, no timer — and a
+            # job past them goes on; every other tier is the unparked case.
             with open(f"{pdir}/cc-tier", "w") as f:
                 f.write('#!/usr/bin/env bash\n[ "$1" = allows ] || exit 2\n'
                         '[ "$(cat "$(dirname "$0")/tier" 2>/dev/null)" = stop ] && exit 1\nexit 0\n')
@@ -4549,8 +4240,8 @@ def selfcheck():
             check("spend tier stop: a queued job is held at its gates — the sweep leaves the file byte for byte, "
                   "counts no attempt, merges nothing, and says which tier",
                   "spend tier stop" in line and open(job, "rb").read() == before and not gh_merges())
-            check("...it is not preparable (that phase IS the gates, and the paid read beside them), and the queue "
-                  "arms no timer for it", not preparable(job) and next_wake() is None)
+            check("...the door holds it before a gate or a paid read is bought, and the queue arms no timer for "
+                  "it", held(job) and next_wake() is None)
             j = read_json(job)
             for st in ("queued", "gates", "review", "fixing", "deferred"):
                 j["stage"] = st
@@ -4572,16 +4263,16 @@ def selfcheck():
             write_atomic(job, j)
             for word in ("essential", "moderate", "autonomous"):
                 tier(word)
-                if not (preparable(job) and next_wake() == 5):
+                if not (not held(job) and next_wake() == 5):
                     check(f"under {word} the same job runs its gates: only stop holds a landing", False)
-            check("under essential, moderate and autonomous that same job is preparable and wanted at once: only "
-                  "stop holds a landing", preparable(job) and next_wake() == 5)
+            check("under essential, moderate and autonomous that same job is through the door and wanted at once: "
+                  "only stop holds a landing", not held(job) and next_wake() == 5)
             tier("stop")
             globals()["BIN"] = nopause
             check("and where cc-tier cannot be asked at all, the queue behaves exactly as before the tier existed",
-                  preparable(job) and next_wake() == 5)
+                  not held(job) and next_wake() == 5)
             globals()["BIN"] = pdir
-            check("control: with cc-tier back, stop holds it again", not preparable(job) and next_wake() is None)
+            check("control: with cc-tier back, stop holds it again", held(job) and next_wake() is None)
             os.unlink(f"{pdir}/tier")
             os.unlink(job_path("myrepo", 7))
         finally:
@@ -4742,7 +4433,7 @@ def selfcheck():
               and not on_host())
         check("M2: ...with the scope and the slot count handed in as arguments, because the boundary clears the "
               "environment",
-              any("CC_LAND_CHANGED=src/app.py tests/test_app.py" in c and f"CC_SELFTEST_SLOTS={PREPARE_AT_ONCE}" in c
+              any("CC_LAND_CHANGED=src/app.py tests/test_app.py" in c and f"CC_SELFTEST_SLOTS={SUITE_SLOTS}" in c
                   for c in gates if c[-1].endswith("selftest.sh"))
               and not any("CC_SUITE_PART=" in a for c in gates for a in c))
         led = (read_json(member_spend()) or {}).get(H) or {}
@@ -4824,17 +4515,16 @@ def selfcheck():
         # where it is said
         calls.clear()
         say_result({"repo": MR, "pr": 7, "chat": "C1", "ts": "1.2"}, {"ok": True, "text": "landed"})
-        check("M5: a member landing is said in the WORKSPACE's own lanes and nowhere of the box's — landed in "
-              "#alice-updates (and the thread that asked), no --route to the owner's alert lane, no line injected "
-              "into the box's planning session",
+        check("M5: a member landing that asked in a thread is said THERE, once, and nowhere of the box's — no "
+              "--route to the owner's alert lane, no line injected into the box's planning session",
               [c[1:] for c in ran_sub("cc-slack", "post")]
-              == [["post", "-c", "C1", "--thread", "1.2", "--id", f"land:{MR}:7:landed", "landed"],
-                  ["post", "-c", f"#{H}-updates", "--id", f"land:{MR}:7:landed:lane", "landed"]]
+              == [["post", "-c", "C1", "--thread", "1.2", "--id", f"land:{MR}:7:landed", "landed"]]
               and not ran_sub("cc-slack", "inject") and not ran("--route"))
         calls.clear()
         say_result({"repo": MR, "pr": 7}, {"ok": False, "text": "stopped", "short": "s"})
-        check("M5: ...and a stop in #alice, where the member reads",
-              [c[1:] for c in ran_sub("cc-slack", "post")] == [["post", "-c", f"#{H}", "--id", f"land:{MR}:7:stopped:lane", "stopped"]]
+        check("M5: ...and with no thread, a stop in #alice, where the member reads — one post, still nothing of "
+              "the box's",
+              [c[1:] for c in ran_sub("cc-slack", "post")] == [["post", "-c", f"#{H}", "--id", f"land:{MR}:7:stopped", "stopped"]]
               and not ran_sub("cc-slack", "inject") and not ran("--route"))
         calls.clear()
         say_result({"repo": "myrepo", "pr": 7}, {"ok": False, "text": "stopped", "short": "s"})
