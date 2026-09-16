@@ -78,6 +78,14 @@ ON. Re-running is the recovery and is safe: merged, carded, settled and enabled 
 is also written to the failures ledger the moment it is seen (record_red → `cc-green red`, keyed gate:<gate>:<tree>
 so the worker's cc-green and a fix round's see one record); the record never decides anything.
 
+WHAT A STOP SAYS. A landing that does not merge is ONE line under STOP_CARD_MAX characters, everywhere it is said
+(the ask thread, #<repo>-updates, a member's lane): `[<repo>] PR #<n>: NOT merged ❌ — <why, in a few words>.
+<whose move it is>. <the PR's url>`. A gate red names the case that FAILED — never a case that passed, however its
+name is worded (gate_fail). The SHAs, the review's cost, the repair-round tally, the gate log's path and the run's
+output are NOT on it: they are in the landing record — the `done …` line in `queue.log`, `work.log`, the kept gate
+log and the failures ledger — and in the PR thread, which that url opens. The why keeps the words cc-replay
+classifies a stop by (`gate <g> did not pass`, `conflicts with <base> — rebase`): it reads these cards.
+
 Exit: 0 landed and delivered · 1 a step the box depends on failed (nothing after it ran) · 3 landed, but a
 cosmetic step wants a hand · 4 merged and deployed, but nothing observed it reaching the owner · 2 usage.
 """
@@ -178,7 +186,15 @@ UNVERIFIED = 4                            # "the box is deployed, and nothing ha
 
 
 class Failed(Exception):
-    """A step that was asked to do something and could not. Nothing after it runs."""
+    """A step that was asked to do something and could not. Nothing after it runs.
+
+    `short` is the same stop in a few words, for the NOT-merged card: a step that can name the thing that failed
+    better than the card could trim its message out of it says so here (stop_why). Without one the card trims.
+    """
+
+    def __init__(self, *args, short=""):
+        super().__init__(*args)
+        self.short = short
 
 
 class Skip(Exception):
@@ -1112,11 +1128,18 @@ def last(text, n=200):
     return next((l.strip() for l in reversed((text or "").splitlines()) if l.strip()), "")[-n:]
 
 
+GATE_RED = re.compile(r"✗|✘|FAIL|Error\b|error:|not ok|Traceback")
+GATE_PASS = re.compile(r"^\W*[✓✔]|^\s*(?:ok|pass(?:ed)?)\b", re.I)   # …and what a line REPORTING A PASS looks like
+
+
 def gate_fail(text):
-    """The line somebody can act on when a gate goes red: the ✗/FAIL case lines, else the last line."""
-    hits = [l.strip() for l in (text or "").splitlines()
-            if re.search(r"✗|✘|FAIL|Error\b|error:|not ok|Traceback", l)]
-    return " · ".join(hits[:3])[:400] or last(text)
+    """The line somebody can act on when a gate goes red: the ✗/FAIL case lines, else the last line — and a line
+    that reports a PASS is never either of them, however it is worded. '✓ …and when the link does not take it,
+    cc-notify FAILS' is a case that PASSED whose name holds the word FAIL; naming it as the failure sent #485's
+    worker after a case that was green while the real red went unnamed for 17 hours (2026-09-15)."""
+    lines = [l for l in (text or "").splitlines() if not GATE_PASS.match(l)]
+    hits = [l.strip() for l in lines if GATE_RED.search(l)]
+    return " · ".join(hits[:3])[:400] or last("\n".join(lines)) or last(text)
 
 
 def record_red(scope, gate, content, log, text, pr="", writer="cc-land"):
@@ -1170,7 +1193,10 @@ def merge_result(root, base, head):
     tree = (o.splitlines() or [""])[0].strip()
     if rc == 1:
         raise Failed(f"{head[:12]} conflicts with {base} at {base_sha[:12]} — rebase it, then land it: "
-                     f"{last(o)}")
+                     f"{last(o)}",
+                     # The card names the base and the remedy, never the two SHAs — and in cc-replay's words
+                     # (STOP_CONFLICT: `conflicts with \S+ — rebase`), which is how a stop is classified.
+                     short=f"the branch conflicts with {base} — rebase it")
     if rc or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
         return "", "", ""
     ident = dict(os.environ, GIT_AUTHOR_NAME="cc-land", GIT_AUTHOR_EMAIL="cc-land@invalid",
@@ -1267,6 +1293,7 @@ class Land:
         self.job = ""            # the queue file this landing is running out of, if any — the stage is written to it
         self.stopped = ""        # the step that stopped it, so the worker knows whether trying again could differ
         self.why = ""            # …and what it said
+        self.why_short = ""      # …and the few words of it the card carries, when the step named them (Failed.short)
         self.root = repo_root(repo)
         self.member, self.mtrack = member_of(repo)   # a member workspace's project: <handle>, <track> (see MEMBERS)
         self.project = self.member or repo   # the name cc, cc-board, cc-scope and cc-task know this repo by (a member project's: its handle)
@@ -1707,7 +1734,11 @@ class Land:
                     keep_log(keep)                   # the one log that outlives the run — bounded, at this path
                     record_red(self.project, g, content, keep, o, pr=self.pr)   # …and the ledger line that outlives THAT
                     raise Failed(f"gate {g} did not pass: {gate_fail(o)}{self.behind_base()}"
-                                 f"  [full output: {keep}]")
+                                 f"  [full output: {keep}]",
+                                 # the card gets the gate and the case that FAILED and nothing else: the stale-base
+                                 # reading and the log's path are the landing record's, and are kept above. In
+                                 # cc-replay's words (`gate \S+ did not pass`), which is how it keys a red gate.
+                                 short=f"gate {os.path.basename(g)} did not pass: {gate_fail(o)}")
 
             # All gates at once, and the read from t=0: a head a cheap gate rejects also buys a read, whose verdict goes on the PR for the retry.
             if any(not green_run(content, g, scope) for g in found):
@@ -2225,7 +2256,7 @@ class Land:
                 out("·", str(e))
             except Failed as e:
                 out("✗", f"{name}: {e}")
-                self.stopped, self.why = name, str(e)
+                self.stopped, self.why, self.why_short = name, str(e), getattr(e, "short", "")
                 if name in FATAL:
                     print("cc-land: STOPPED there — nothing after it ran. Fix that and re-run the same command: "
                           "every step already done is a no-op the second time.", file=sys.stderr)
@@ -2301,7 +2332,7 @@ def notify(*args, timeout=180):
 
 
 def say_result(job, r):
-    """Say the result ONCE — the brief: "a landing notifies once per terminal state". One `cc-slack post` under the job's producer id (`land:<repo>:<pr>:<outcome>@<queued_at>`, so a retry never posts twice), written to the queue log as `notify`: in the reply thread when the job has one; else a member project's own lane (#<handle>-updates landed, #<handle> stopped); else a stop is routed (`post --route`, the repo's updates lane) and a landing with no thread is its card, already edited to landed ✓ — unless the text carries a restart that is the owner's, which is routed with the one @-mention allowed to page him. A stop of a box repo also wakes its planning session (`cc-slack inject`, first attempt only): the seat's wake, not a post. Returns whether Slack took it."""
+    """Say the result ONCE — the brief: "a landing notifies once per terminal state". One `cc-slack post` under the job's producer id (`land:<repo>:<pr>:<outcome>@<queued_at>`, so a retry never posts twice), written to the queue log as `notify`: in the reply thread when the job has one; else a member project's own lane (#<handle>-updates landed, #<handle> stopped); else a stop is routed (`post --route`, the repo's updates lane) and a landing with no thread is its card, already edited to landed ✓ — unless the text carries a restart that is the owner's, which is routed with the one @-mention allowed to page him. A stop of a box repo also wakes its planning session (`cc-slack inject`, first attempt only): the seat's wake, not a post. A stop's card is the one line result_of built (stop_card) and nothing else. Returns whether Slack took it."""
     chat, ts, repo, pr = job.get("chat") or "", job.get("ts") or "", job.get("repo") or "", job.get("pr")
     state = "landed" if r.get("ok") else "stopped"
     pid = f"land:{repo}:{pr or 'deploy'}:{state}" + (f"@{job['queued_at']}" if job.get("queued_at") else "")
@@ -2344,7 +2375,10 @@ def finish(path, job):
             with contextlib.suppress(OSError):
                 write_atomic(path, job)
             return
+        # …and the ledger keeps what the card handed it (result_of's `detail`): the step's whole message, the
+        # repair-round tally and which try this was. The card is one line because this line is not.
         ledger(f"done {job.get('repo')}#{job.get('pr') or 'deploy'} rc={r.get('rc')} {r.get('short', '')}"
+               + (f" | {r['detail']}" if r.get("detail") else "")
                + ("" if said else " (Slack never took the result)"))
         job["posted"] = True
         with contextlib.suppress(OSError):
@@ -2353,10 +2387,84 @@ def finish(path, job):
         os.unlink(path)
 
 
+STOP_CARD_MAX = 200   # the whole NOT-merged card. It is the commonest thing the box puts in front of the owner and
+                      # he reads it on a phone, so it is one line: which PR, why in a few words, whose move, the
+                      # link. Everything that used to ride along — the SHAs, the review's cost, the repair-round
+                      # tally, the gate log's path, the fenced run output — is in the landing record (queue.log,
+                      # work.log, the kept gate log, the failures ledger) and in the PR thread, both of them one
+                      # tap from that link.
+STOP_ASIDE = re.compile(r"\s*\[[^\]]*\]|\s*\((?:\$|rc=)[^)]*\)")   # a kept log's path, a review's cost: the record's
+STOP_PROSE = re.compile(r"\s+—\s.*\Z", re.S)                       # …and the advice after the first em-dash
+
+
+def stop_why(L):
+    """Why the landing stopped, in a few words for the card: the step's own `short` when it named one (a gate gives
+    the case that FAILED), else its message with the record's asides and its trailing advice trimmed off."""
+    if L.stopped == "review" and exhausted(L.why):
+        # A cap is not a verdict — nothing read this diff — so the card says that and not what the reviewer charged.
+        return "the review hit its own cap: nothing read the diff"
+    if L.why_short:
+        return L.why_short
+    why = STOP_PROSE.sub("", STOP_ASIDE.sub("", (L.why or "").strip())).strip(" .")
+    return why or "the box could not read it"
+
+
+def stop_who(L):
+    """Whose move it is next, in a few words. By the time a NOT-merged card is written the queue has stopped trying
+    and every automatic round it had is spent (run_job), so the move is a person's; what differs is where they look.
+    A review stop sends them to the verdict already on the PR, anything else to the thing that failed."""
+    if L.stopped == "review":
+        return "yours: the verdict is on the PR" if L.verdict else "yours: re-queue to buy a read"
+    return "yours: fix it, then re-queue"
+
+
+def pr_link(L):
+    """The PR's own url for the card: what GitHub said when the PR was read, else one built from the checkout's
+    origin, since a landing that could NOT read the PR still owes the owner somewhere to look. '' with no PR."""
+    if L.facts.get("url"):
+        return L.facts["url"]
+    if not L.pr:
+        return ""
+    rc, o = sh(["git", "remote", "get-url", "origin"], cwd=L.root, timeout=30)
+    m = re.search(r"github\.com[:/]+([^/\s]+?)/([^/\s]+?)(?:\.git)?\s*$", o or "")
+    return f"https://github.com/{m.group(1)}/{m.group(2)}/pull/{L.pr}" if not rc and m else ""
+
+
+def stop_card(L):
+    """The whole NOT-merged card, one line under STOP_CARD_MAX: which PR, why in a few words, whose move, the link. The
+    reason is the only part that gives ground when the line is too long — without the link none of it is actionable,
+    and the reason it is cut from is in the landing record at the other end of that link."""
+    head = f"[{L.repo}] " + (f"PR #{L.pr}" if L.pr else L.what()) + ": NOT merged ❌ — "
+    link = pr_link(L)
+    tail = f". {stop_who(L)}." + (f" {link}" if link else "")
+    room = STOP_CARD_MAX - len(head) - len(tail)
+    why = " ".join(stop_why(L).split())
+    if len(why) > room:
+        why = why[:room - 1].rstrip() + "…" if room > 1 else ""   # …and with no room at all it goes, not the link
+    return head + why + tail
+
+
+def stop_rounds(L, job):
+    """The automatic rounds this change has already spent, for the landing record — never for the card. A cap is
+    NOT a verdict: nothing read this diff, so no round failed here, and saying it had sent #194 to a person as a
+    change twice rejected."""
+    if L.stopped == "review" and exhausted(L.why):
+        return ""
+    fix = job.get("fix") or {}
+    if fix.get("over") == "no push":
+        return f"the fix iteration the queue dispatched to {fix.get('track')} ended without pushing anything"
+    if fix:
+        return f"after one automatic fix iteration in {fix.get('track')}"
+    # …and the same fact for a stop that arrived on a LATER job: the round was spent, this job never saw it
+    n = (root_work(L.repo, L.pr) if L.pr else {}).get("repairs") or 0
+    return f"after {n} automatic fix iteration{'s' if n > 1 else ''} on this change" if n else ""
+
+
 def result_of(L, rc, job, tail):
-    """What this landing means, in one sentence the owner can act on, and whether the PR is in."""
+    """What this landing means, in one sentence the owner can act on, and whether the PR is in. A stop says it in
+    one line under STOP_CARD_MAX (stop_card) and hands the rest to `detail`, which the ledger keeps."""
     what = f"[{L.repo}] " + (f"PR #{L.pr}" if L.pr else L.what())
-    tries = job.get("attempts", 1)
+    tries, detail = job.get("attempts", 1), ""
     # Which tree the gates ran on, in the sentence the owner reads: the merge, a head that already holds the base, or a merge git could not build. Asked lazily: a landing that stopped before the gates has no answer.
     def on():
         if not L.pr:
@@ -2372,25 +2480,14 @@ def result_of(L, rc, job, tail):
         short = f"{what}: landed ✅ — {on()}, merged and deployed; a bookkeeping step wants a hand."
     elif rc == UNVERIFIED:
         short = f"{what}: merged and deployed ✅ — but nothing here could confirm you can see it, so the ask stays open."
-    elif L.stopped in ("review", "gates", "load"):
+    elif L.stopped in ("review", "gates", "load", "merge"):
         # review belongs here, not in the deploy branch: it runs before the merge, so a stop leaves the PR out.
-        short = f"{what}: NOT merged ❌ — {L.why[:200] or 'the box could not read it'}"
-        fix, spent = job.get("fix") or {}, (root_work(L.repo, L.pr) if L.pr else {})
-        if L.stopped == "review" and exhausted(L.why):
-            pass          # a cap is not a verdict: nothing read this diff, so no fix round failed here
-        elif fix.get("over") == "no push":
-            short += (f" — the fix iteration the queue dispatched to {fix.get('track')} ended without pushing "
-                      f"anything, so nothing was re-read")
-        elif fix:
-            short += f" — and that is AFTER one automatic fix iteration in {fix.get('track')}"
-        elif spent.get("repairs"):
-            # the same sentence for a stop that arrived on a LATER job: the round was spent, this job never saw it
-            short += (f" — and that is AFTER {spent['repairs']} automatic fix iteration"
-                      f"{'s' if spent['repairs'] > 1 else ''} on this change, so this one is yours")
-        if tries > 1 and L.stopped != "review":
-            short += f" (after {tries} tries)"
-    elif L.stopped == "merge":
-        short = f"{what}: NOT merged ❌ — {L.why[:200]}"
+        short = stop_card(L)
+        # The tallies and the full message: the record's, not the card's — finish() writes them to the queue log,
+        # which is ONE LINE PER EVENT — so the step's message is flattened and bounded, and the tallies, which are
+        # what the record is read for, come after it whole. The whole verdict is on the PR, which the card links.
+        detail = "; ".join(x for x in (f"{L.stopped}: {' '.join((L.why or '').split())[:400]}",
+                                       stop_rounds(L, job), f"try {tries} of {LAND_TRIES}") if x)
     else:
         short = (f"{what}: merged, but the deploy stopped at {L.stopped} ❌ after {tries} tries — the box is still "
                  f"running the old code.")
@@ -2401,8 +2498,10 @@ def result_of(L, rc, job, tail):
                f"{'them' if len(L.owner_asks) > 1 else 'it'}.")
         short += " " + ask
     # ...and the ask on its own: the one line addressed to a person, routed by say_result when the job has no thread.
-    return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short, "restart": ask,
-            "text": short if rc == 0 else f"{short}\n```\n{tail[-900:]}\n```"}
+    # A NOT-merged card is the line and nothing else: the run's output rode along fenced until 2026-09-16 and made
+    # the card as long as 1275 characters, and none of it is what the owner decides on. It is in the landing record.
+    return {"ok": rc in (0, COSMETIC, UNVERIFIED), "rc": rc, "short": short, "restart": ask, "detail": detail,
+            "text": short if rc == 0 or detail else f"{short}\n```\n{tail[-900:]}\n```"}
 
 
 def not_tracks(findings):

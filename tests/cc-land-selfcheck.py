@@ -67,6 +67,15 @@ def selfcheck():
 
     check("a red gate is reported by its ✗ line, not by whatever printed last",
           gate_fail("banner\n  ✓ ok\n  ✗ the row was wrong\nsome stderr noise") == "✗ the row was wrong")
+    # …and a line that REPORTS A PASS is never the failure, however its name is worded. cc-notify's suite has a case
+    # called '…and when the link does not take it, cc-notify FAILS', and its ✓ line matched on the word FAIL: the
+    # card sent #485's worker after a case that was green while the real red went unnamed for 17 hours (2026-09-15).
+    check("a ✓ case whose NAME holds the word FAIL is not the failure — the ✗ below it is",
+          gate_fail("  ✓ …and when the link does not take it, cc-notify FAILS\n  ✗ H8: the route was wrong\n1 failed")
+          == "✗ H8: the route was wrong")
+    check("…and with no ✗ anywhere the fallback takes the last line that is NOT a pass, not the ✓ whose name says FAIL",
+          gate_fail("  ✓ a check that FAILS loudly\n  the run died at step 4") == "the run died at step 4")
+
     check("…and with no failure marker anywhere, the last line still stands",
           gate_fail("banner\nall quiet") == "all quiet")
     err = io.StringIO()
@@ -440,7 +449,8 @@ def selfcheck():
     NO_MERGE = {"git merge-base --is-ancestor": (0, "")}     # …for a case that wants the head gated as the head
 
     FACTS = {"title": "a change", "state": "OPEN", "mergeable": "MERGEABLE",
-             "headRefName": "track/w1", "mergeCommit": None}
+             "headRefName": "track/w1", "mergeCommit": None,
+             "url": "https://github.com/o/r/pull/7"}   # load() asks for it; a NOT-merged card is built round it
 
     def fresh(**kw):
         calls.clear(); cwds.clear(); envs.clear(); reacted.clear(); world.clear()
@@ -1131,26 +1141,117 @@ def selfcheck():
         # …and how that outcome READS to the owner, on #194's exact shape: a cap stop arriving after the change's one
         # automatic repair round. The clause that names the round belongs to a verdict — nothing read this diff, so
         # the round did not fail here, and saying it did is what sent #194 to a person as a change twice rejected.
+        # Since 2026-09-16 that clause is not on the CARD at all (it is in the record the ledger keeps), so the case
+        # reads it there: what must never happen is a cap stop CARRYING it, in either place.
         class Ended:
             repo, pr, stopped, stale, owner_asks = "myrepo", 7, "review", (), ()
+            why_short, facts = "", {"url": "https://github.com/o/r/pull/7"}
 
-            def __init__(self, why):
-                self.why = why
+            def __init__(self, why, verdict=""):
+                self.why, self.verdict = why, verdict
 
             def what(self):
                 return "PR #7"
 
         after = {"attempts": 1, "fix": {"track": "w1", "at": stamp()}}
         capped = result_of(Ended(f"{WALL}, not the diff: $3.00 and 35 turns on PR #7 read nothing"), 1, after, "")
-        verdicted = result_of(Ended("DO-NOT-LAND on PR #7 ($0.42) — the landing stops here."), 1, after, "")
+        verdicted = result_of(Ended("DO-NOT-LAND on PR #7 ($0.42) — the landing stops here.",
+                                    "DO-NOT-LAND"), 1, after, "")
         check("a cap stop that arrives AFTER the change's one repair round does not blame that round, while a real "
               "verdict on the same job still does — one of them read the fix and rejected it, the other never read "
               "anything, and #194 was reported as the first",
               "hit its own cap" in capped["short"] and not capped["ok"]
-              and "AFTER one automatic fix iteration" not in capped["short"]
-              and "AFTER one automatic fix iteration" in verdicted["short"])
+              and "after one automatic fix iteration" not in capped["short"] + capped["detail"]
+              and "after one automatic fix iteration" in verdicted["detail"])
     finally:
         globals()["REVIEW_BUDGET"], globals()["REVIEW_TURNS"] = _caps_real
+
+    # THE WHOLE SHAPE OF A NOT-MERGED CARD, one stop reason at a time. 36 of these reached the owner's phone in the
+    # three days to 2026-09-16, median 250 characters and one of them 1275, carrying SHAs, a review's cost, a
+    # repair-round tally and the run's own output fenced underneath — none of which is what he decides on. The card
+    # is now one line: which PR, why in a few words, whose move, the link. Everything else is in the landing record
+    # and on the PR, both one tap from that link.
+    class Stopped:
+        """A landing that has stopped and nothing else — the fields result_of reads — so what is under test here is
+        the card and not the run that produced it. Each reason below builds its own."""
+        repo, pr, stale, owner_asks, root = "myrepo", 77, (), (), "/nowhere"
+        facts = {"url": "https://github.com/o/r/pull/77"}
+
+        def __init__(self, stopped, why, short="", verdict=""):
+            self.stopped, self.why, self.why_short, self.verdict = stopped, why, short, verdict
+
+        def what(self):
+            return "PR #77"
+
+    REASONS = {
+        "a review verdict": (Stopped("review", "DO-NOT-LAND on PR #77 ($0.42, 61k tokens, commented on the PR) — "
+                                               "the landing stops here, exactly like a red gate.\n1. a.py:9 — the "
+                                               "call has no timeout \u2192 name it", verdict="DO-NOT-LAND"),
+                             "DO-NOT-LAND on PR #77", "yours: the verdict is on the PR"),
+        "a review that hit its own cap": (
+            Stopped("review", f"{WALL}, not the diff: $3.00 and 35 turns on PR #77 read nothing and answered "
+                              f"nothing — the money cap (CC_LAND_REVIEW_BUDGET) stopped it."),
+            "the review hit its own cap", "yours: re-queue to buy a read"),
+        "a red gate": (Stopped("gates", "gate core/tests/check.sh did not pass: ✗ the row was wrong — and these "
+                                        "gates ran on main at ba5e00000000 merged with the head 1a2b3c4d5e6f, not "
+                                        "on the head alone  [full output: /tmp/gate-check.sh.log]",
+                               short="gate check.sh did not pass: ✗ the row was wrong"),
+                       "gate check.sh did not pass: ✗ the row was wrong", "yours: fix it, then re-queue"),
+        "a branch that conflicts": (Stopped("gates", "1a2b3c4d5e6f conflicts with main at ba5e00000000 — rebase "
+                                                     "it, then land it: CONFLICT (content): Merge conflict in a.py",
+                                            short="the branch conflicts with main — rebase it"),
+                                    "the branch conflicts with main — rebase it", "yours: fix it, then re-queue"),
+        "a PR the box could not read": (Stopped("load", "gh pr view 77 (rc=1): could not resolve to a PullRequest"),
+                                        "could not resolve to a PullRequest", "yours: fix it, then re-queue"),
+        "a merge GitHub refused": (Stopped("merge", "gh pr merge 77 (rc=1): Base branch was modified"),
+                                   "Base branch was modified", "yours: fix it, then re-queue"),
+    }
+    cards = {}
+    for _reason, (_L, _why, _who) in REASONS.items():
+        r = result_of(_L, 1, {"attempts": 1}, "GATEOUTPUT-that-nobody-decides-on")
+        cards[_reason] = r["short"]
+        check(f"the NOT-merged card for {_reason} is ONE line under {STOP_CARD_MAX} characters and carries only "
+              f"what the owner acts on: which PR, why in a few words, whose move next, the PR's link",
+              "\n" not in r["short"] and len(r["short"]) <= STOP_CARD_MAX and not r["ok"]
+              and r["short"].startswith("[myrepo] PR #77: NOT merged ❌ — ")
+              and _why in r["short"] and _who in r["short"]
+              and r["short"].endswith("https://github.com/o/r/pull/77")
+              # …and the run's output no longer rides along fenced: the card IS the whole text that is said.
+              and r["text"] == r["short"] and "GATEOUTPUT" not in r["text"]
+              # …while the step's whole message stays in the landing record, which finish() writes to queue.log.
+              and " ".join(_L.why.split())[:100] in r["detail"] and "try 1 of 3" in r["detail"])
+    check("...and the two stops a person answers DIFFERENTLY still read differently: a verdict sends them to the "
+          "read already on the PR, a red gate to the case that FAILED — never to a case that passed",
+          cards["a review verdict"] != cards["a red gate"]
+          and "the verdict is on the PR" in cards["a review verdict"]
+          and "the verdict is on the PR" not in cards["a red gate"]
+          and "✗ the row was wrong" in cards["a red gate"] and "DO-NOT-LAND" not in cards["a red gate"])
+    # …and cc-replay READS these cards out of queue.log to say what stopped a PR and how often (stops_of, gate_red:
+    # `gate \S+ did not pass`, STOP_CONFLICT `conflicts with \S+ — rebase`). Shortening the card is ours to do;
+    # shortening it out of the words another tool classifies by would leave every gate stop unclassified there.
+    check("...and a card another tool reads keeps the words it reads: cc-replay keys a red gate and a conflict off "
+          "the card text, so both still carry the phrase its own patterns look for",
+          re.search(r"gate \S+ did not pass", cards["a red gate"])
+          and re.search(r"conflicts with \S+ — rebase", cards["a branch that conflicts"]))
+    _long = result_of(Stopped("gates", "x" * 900, short="the gate said " + "something very long " * 20),
+                      1, {"attempts": 1}, "")["short"]
+    check("...and a reason too long for the line gives ground to the two parts without which the card is not "
+          "actionable: it is cut with an ellipsis, whose move it is and the link survive whole, the bound holds",
+          len(_long) <= STOP_CARD_MAX and "…" in _long and "yours: fix it, then re-queue" in _long
+          and _long.endswith("https://github.com/o/r/pull/77"))
+    _blind = Stopped("load", "gh pr view 77 (rc=1): HTTP 502")
+    _blind.facts, _blind.root = {}, f"{DEV}/myrepo"
+    _ORIGIN, _MISSING = "git remote get-url origin", object()
+    _was = world.get(_ORIGIN, _MISSING)          # …and put the world back exactly as it was: the cases after this
+    world[_ORIGIN] = (0, "git@github.com:o/r.git\n")     # one build on it, and this is not a fixture of theirs
+    try:
+        _card = result_of(_blind, 1, {"attempts": 1}, "")["short"]
+    finally:
+        world.pop(_ORIGIN) if _was is _MISSING else world.update({_ORIGIN: _was})
+    check("...and a landing that could not read the PR at all still owes the owner somewhere to look: with no url "
+          "from GitHub the card builds the PR's own from the checkout's origin remote",
+          _card.endswith("https://github.com/o/r/pull/77") and len(_card) <= STOP_CARD_MAX
+          and "yours: fix it, then re-queue" in _card)
 
     check("the reviewer prompt ships beside the script, and asks for exactly the fields the schema validates",
           os.access(f"{os.path.dirname(BIN)}/{REVIEW_PROMPT}", os.R_OK) and
@@ -3132,6 +3233,24 @@ def selfcheck():
             posts = ran_sub("cc-slack", "post", "CAPPR")
             return " ".join(posts[0]) if posts else ""
 
+        def card():
+            """The card ITSELF — the last argument `cc-slack post` was handed, which is the text the owner reads.
+            A NOT-merged one is one line under STOP_CARD_MAX; everything trimmed off it is in record() below."""
+            posts = ran_sub("cc-slack", "post", "CAPPR")
+            return posts[-1][-1] if posts else ""
+
+        def record():
+            """The landing record's last `done …` line in queue.log: where a stop's detail lives now that the card
+            carries only the reason, whose move it is and the link (result_of's `detail`, written by finish())."""
+            rows = [l for l in open(f"{LANDQ}/queue.log").read().splitlines() if "\tdone myrepo#" in l]
+            return rows[-1] if rows else ""
+
+        def one_line(text, why, who="yours", link="https://"):
+            """The whole shape a NOT-merged card owes the owner, in one predicate: one line, under the bound, with
+            the reason, whose move it is and the PR's link on it."""
+            return ("\n" not in text and len(text) <= STOP_CARD_MAX and "NOT merged ❌" in text
+                    and why in text and who in text and link in text)
+
         # (1) a usage limit is the box's weather, not a verdict on the PR
         landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n")})
         quiet(cmd_work, [])
@@ -3223,10 +3342,13 @@ def selfcheck():
               not os.path.exists(job_path("myrepo", 7)) and not gh_merges() and not commented()
               and not ran_sub("cc", "myrepo", "--go") and not ran("systemd-run", "--on-active=")
               and not reacted)
-        check("...and the thread is told what it COST and which number would change it, once — the ✗ a person can "
-              "act on, rather than a verdict the review never reached",
-              len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told() and "$3.00" in told()
-              and "hit its own cap" in told() and "CC_LAND_REVIEW_BUDGET" in told())
+        check("...and the thread is told, once, that nothing read the diff — the one line a person can act on, "
+              "rather than a verdict the review never reached; what it COST and which number would change it are "
+              "in the landing record, one tap away, because neither is what he decides on",
+              len(ran_sub("cc-slack", "post", "CAPPR")) == 1
+              and one_line(card(), "the review hit its own cap", "yours: re-queue to buy a read")
+              and "$3.00" in record() and "CC_LAND_REVIEW_BUDGET" in record()
+              and "$3.00" not in card() and "CC_LAND_REVIEW_BUDGET" not in card())
         check("...and it costs the change neither of the two things it is bounded by: the review it never got is "
               "given back and the automatic repair round is untouched, so the person who raises the cap is not "
               "then refused for a budget that bought no verdict (#194's stop consumed both and was dropped)",
@@ -3264,11 +3386,14 @@ def selfcheck():
             for _ in range(LAND_TRIES):
                 quiet(cmd_work, [])
             check("...while one that stays red stops after 3 tries and says NOT merged ONCE, in the thread that "
-                  "asked, with the ✗ line — never 'the deploy stopped', since nothing merged; and nothing routed "
-                  "to #myrepo-updates saying it a second time, no push",
+                  "asked, in ONE line naming the gate and the case that FAILED — never 'the deploy stopped', since "
+                  "nothing merged; the try count is in the landing record, and nothing routed to #myrepo-updates "
+                  "saying it a second time, no push",
                   read_json(job_path("myrepo", 7)) is None and not gh_merges()
-                  and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told()
-                  and "✗ the row was wrong" in told() and "after 3 tries" in told() and "old code" not in told()
+                  and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
+                  and one_line(card(), "gate check.sh did not pass: ✗ the row was wrong",
+                               "yours: fix it, then re-queue")
+                  and "try 3 of 3" in record() and "old code" not in told()
                   and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
             landing(**{f"{BIN}/cc-limit status": (0, "usage limit until 04:00Z (35m left)\n"),
                        GATE: (0, "  ✓ the first\n  ✓ H4\n0 failed\n")})
@@ -3566,8 +3691,9 @@ def selfcheck():
               "and once into the seat, nothing routed beside it and no push — saying that a fix round has already "
               "been spent, and with no second worker dispatched",
               not os.path.exists(job_path("myrepo", 7)) and not ran_sub("cc", "myrepo", "w1", "--go")
-              and len(ran_sub("cc-slack", "post", "CAPPR")) == 1 and "NOT merged" in told()
-              and "AFTER one automatic fix iteration" in told()
+              and len(ran_sub("cc-slack", "post", "CAPPR")) == 1
+              and one_line(card(), "LAND-AFTER-FIX", "yours: the verdict is on the PR")
+              and "after one automatic fix iteration in w1" in record()
               and len(ran_sub("cc-slack", "inject", "myrepo")) == 1
               and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
         # …and the same bound across a RE-QUEUE, which is the one that never held. A 👍 after a stopped landing
@@ -3588,7 +3714,7 @@ def selfcheck():
               "change is closed",
               len(one) == 1 and spent_now.get("repairs") == 1 and not ran_sub("cc", "myrepo", "w1", "--go")
               and not os.path.exists(job_path("myrepo", 7)) and "NOT merged" in told()
-              and "AFTER 1 automatic fix iteration on this change" in told()
+              and "after 1 automatic fix iteration on this change" in record()
               and len(ran_sub("cc-slack", "inject", "myrepo")) == 1
               and not ran_sub("cc-slack", "post", "--route") and not ran("cc-notify"))
 
@@ -3654,7 +3780,7 @@ def selfcheck():
         check("a LAND-AFTER-FIX whose every finding is NOT THE TRACK'S dispatches NO round: the stop names whose line "
               "it is in the reviewer's words, and the repair round is still there for a finding the track can answer",
               not ran_sub("cc", "myrepo", "w1", "--go") and not os.path.exists(job_path("myrepo", 7))
-              and "NOT THE TRACK'S: the owner" in told() and "NOT merged" in told()
+              and "NOT THE TRACK'S: the owner" in open(f"{LANDQ}/queue.log").read() and "NOT merged" in told()
               and not root_work("myrepo", 7).get("repairs")
               and "every finding is a person's" in open(f"{LANDQ}/queue.log").read())
         prompt = open(f"{os.path.dirname(BIN)}/{REVIEW_PROMPT}").read()
@@ -3853,7 +3979,7 @@ def selfcheck():
         quiet(cmd_work, [])
         check("...and a fix iteration that never pushes is not waited on for ever: past its deadline the job goes "
               "back to the ordinary path and the owner is told, once, that nothing was re-read",
-              not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told()
+              not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in record()
               and not ran_sub("cc", "myrepo", "w1", "--go"))
         # …but a round STILL RUNNING at its deadline is not read as silent. Its last act is the push: on PR #368
         # (2026-09-08) the iteration committed and pushed fc85483 at 12:30Z, two minutes after 'fix-silent … nothing
@@ -3904,7 +4030,7 @@ def selfcheck():
               "'nothing pushed', in those words, the job back on the ordinary path and the owner told once",
               open(f"{LANDQ}/queue.log").read().count("fix-silent myrepo#7") == n_silent + 1
               and "nothing pushed" in open(f"{LANDQ}/queue.log").read().split("fix-silent myrepo#7")[-1]
-              and not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told())
+              and not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in record())
         landing(**AFTERFIX)                       # CONTROL: a track the board still calls running, TWICE the wait on
         quiet(cmd_work, [])                       # — a corpse is not waited on for ever
         j = read_json(job_path("myrepo", 7))
@@ -3915,7 +4041,7 @@ def selfcheck():
         quiet(cmd_work, [])
         check("...and the wait on a running track is BOUNDED: a round still 'running' a whole FIX_WAIT past its "
               "deadline is a corpse the board never closed, and the job goes back to the ordinary path",
-              not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in told())
+              not os.path.exists(job_path("myrepo", 7)) and "ended without pushing" in record())
 
         # ...and where the head is READ from. The PR object lags the ref it describes: on PR #182 (2026-09-02) gh
         # served a headRefOid 41 minutes older than the branch's real head, and was still serving it 76 minutes
