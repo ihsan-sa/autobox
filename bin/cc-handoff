@@ -1,141 +1,60 @@
 #!/usr/bin/env python3
-"""cc-handoff — overlapping handoff: the successor starts ALONGSIDE its predecessor, reads the journal, asks
-what the journal missed, and only then retires it. Nothing has to be idle for a session to start, so there is
-nothing to defer on — which is what dissolves the "handoff PENDING, deferred again" loop.
+"""cc-handoff — the overlapping handoff: a successor starts ALONGSIDE its predecessor, reads the journal, asks
+what the journal missed, and only then retires it. A session runs it itself when its context is worth the
+spend of two sessions; nothing on the box measures a line and runs it for you.
 
-  cc-handoff --overlap <target> [--pct N] [--session ID] [--in-flight "…"]   start a successor alongside
-  cc-handoff --ready [<target>] [--forced]                run BY THE SUCCESSOR: preflight, commit, retire
-  cc-handoff --replace <target> [--over [PCT]]            the OLD path: journal, exit, restart on fresh context
-  cc-handoff --abandon <target> [--why "…"]               give up: successor's window goes, record clears
-  cc-handoff --due <target> [--over-ceiling]              the deadline: below the ceiling abandon, at/over force
-  cc-handoff --event <target> [--level L] [--pct N] [--session ID] [--in-flight "…"] [--live] [--taken]
-                              [--retry]
-                                    a context line was crossed (cc-context): decide and take the phase, print it
-  cc-handoff --sweep                records no session is left to finish (run from the cc-reconcile timer)
-  cc-handoff --kick <target> [<id>]         internal: brief the successor once it is up, and check it landed
-  cc-handoff --retire <target>              internal: wait out the predecessor's subagents, DRAIN it, end it
-  cc-handoff --relay                                      internal: from the UserPromptSubmit hook (cc-scope hook), the
-                                                          hook payload on stdin — a prompt typed into the retiring
-                                                          predecessor goes to its successor, blocked here with a pointer
-  cc-handoff --brief <target>            ONE packet of everything a successor would otherwise re-read: the
-                                         last journal entry, the unfinished board, what is landing, live
-                                         workers, open PRs, open asks, and who the predecessor is; a packet
-                                         at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures record
-                                         (spend/handoff-packet-over-band), once per handoff
-  cc-handoff --status [<target>] [--json]                 what phase, who is live, how long left
+  cc-handoff --overlap <target> [--session ID] [--in-flight "…"]   start a successor alongside
+  cc-handoff --ready [<target>] [--forced]   run BY THE SUCCESSOR: the one atomic cutover, then retire
+  cc-handoff --abandon <target> [--why "…"]  give up: the successor's window goes, the record clears
+  cc-handoff --sweep                         from the cc-reconcile timer: finish what no session is left to
+  cc-handoff --kick <target> [<id>]          internal: brief the successor once it is up, check it landed
+  cc-handoff --retire <target>               internal: wait out the predecessor's subagents, DRAIN it, end it
+  cc-handoff --brief <target>                ONE packet of everything a successor would otherwise re-read; a
+                                             packet at or over CC_BRIEF_PACKET_BAND (24 kB) is one failures
+                                             record (spend/handoff-packet-over-band), once per handoff
+  cc-handoff --status [<target>] [--json]    what phase, who is live, how long left
   cc-handoff selfcheck
 
-ONE OWNER (2026-08-31, review rec #8). The handoff path used to be three files: `cc` held the stop-then-restart
-sequence, `cc-context` decided which phase to take, and this file held the overlap. That split is what let a
-survivor's un-gate depend on a marker nobody swept. Now `cc-context` MEASURES and emits one --event; every phase
-decision, both paths and the sweep live here. `cc handoff <repo> <track>` delegates to --replace, and the overlap
-still fails INTO it.
-
-TARGET IS THE SESSION'S OWN TMUX WINDOW NAME in session `main`, which is also the address the Slack layer
-routes on. There are three shapes and every session this box starts wears one of them:
+TARGET IS THE SESSION'S OWN TMUX WINDOW NAME in session `main`, the address the Slack layer routes on:
   `<repo>`            a session a PERSON steers in the primary worktree — planning, plain, member workspace
-  `<repo>@<alias>`    an ORCHESTRATOR, and a sub-orch alongside it: same repo, same worktree, its own session
+  `<repo>@<alias>`    an ORCHESTRATOR, and a sub-orch alongside it: same worktree, its own session
   `<repo>/<track>`    a TRACK, interactive or headless, in its own worktree
-Only the third has a stop-then-restart path (a track can be killed and relaunched from its board row); the
-first two are handed off by the overlap or not at all, which is exactly why the overlap has to reach them.
-A HEADLESS RUN wears the track's address and takes no phase at any of them — a loop iteration and a steward's
-one-shot both end their turn, and the next run reads the journal on a fresh context. That IS their handoff and
-it costs no second session (`worker`, and the paragraph below).
-`parts` splits an address and `kind` names it — nothing here splits a target by hand. Until 2026-09-07 the
-grammar had no room for `@`, so an orchestrator's real address was refused as "not a target": no orch had ever
-been handed off, one sat past the ceiling with no successor and nothing able to start one, and its readings
-shared a key with the planning session in the same repo. The successor's window is `<target>~next` until cutover.
+`parts` splits an address and `kind` names it. The successor's window is `<target>~next` until cutover.
+A headless run (CC_ROLE=worker) is never handed off: it journals, ends its turn, and the next iteration
+reads the journal on a fresh context (`worker`).
 
-ONLY AN INTERACTIVE SESSION IS HANDED OFF. A headless cc-loop iteration (CC_ROLE=worker) takes no phase at all:
-it journals, ends its turn, and the loop starts the next iteration on a fresh context reading that journal —
-that IS its handoff, and it costs no second session. See `worker`.
+THE INVARIANT. One record, ~/.cc/state/handoff/<target>.json, names the LIVE session. The live one owns the
+channel and may act on the world; the other is muted and gated (cc-guard and cc-slack read the same record).
+Cutover is ONE os.replace() of that record; everything after it is derived, idempotent and retried, never
+rolled back. Ownership only moves forward on an explicit successful act, so a missing, corrupt or unreadable
+record means the predecessor keeps the channel and the successor stays gated.
 
-THE INVARIANT. One record file, ~/.cc/state/handoff/<target>.json, names the LIVE session. The live one owns
-the channel and may act on the world; the other is muted and gated (cc-guard reads the same record). Cutover
-is ONE atomic os.replace() of that record — the single commit point — and everything after it is derived,
-idempotent and retried, never rolled back. Ownership only ever moves forward, on an explicit successful act,
-so every failure lands on "the predecessor is still in charge": a missing, corrupt or unreadable record means
-the predecessor keeps the channel and the successor stays gated.
+BOUNDED. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 20 min). The sweep IS the deadline: --sweep, on
+the cc-reconcile timer, expires an overlap past it quietly (the predecessor never stopped working, so there is
+nothing to tell it) and finalizes a record whose predecessor is gone past the grace, so the survivor is not
+gated by the record of its own success.
 
-AN OVERLAP THAT DIED IS TRIED AGAIN, NOT WAITED OUT. Until 2026-09-05 the first attempt was the only one:
-the 40% overlap started at 01:35Z died on a permission prompt and left the predecessor with one already "taken"
-and nothing between it and the 60% ceiling. Now every five-percent line above the handoff line (45, 50, 55 —
-cc-context's CC_CONTEXT_RETRY_PCT) is a crossing that arrives here with --retry, and one is a fresh attempt when
-no overlap is open and the LAST one for this target ended with the predecessor still in charge (`retryable`:
-abandoned, expired, or started and never finished). A cut-over target is never retried — the successor holds the
-window by then, and starting a second overlap would aim at it. Everything else is the 40% path unchanged.
+QUIET WHILE OPEN. start() marks the target `~/.cc/state/<target>/pulse.off` (cc-reconcile's wake honours it)
+and takes the mark back at cutover and in clear(). A mark this file did not make is never removed.
 
-BOUNDED, AND SHORT. deadline = started + CC_HANDOFF_OVERLAP_MAX (default 20 min, ~/.cc/config). The watchdog is
-the predecessor's own Stop hook, which already runs every turn — no new timer, no new daemon. At the deadline the
-context ceiling decides: below it, abandon and tell the owner once; at or over it, force the cutover, or fall
-back to today's stop-then-restart `cc handoff`. The new path fails INTO the old one and cannot take it down.
-The cap was 45 min until 2026-09-08. An overlap runs TWO planning-class sessions side by side, and a wake of one
-re-reads its whole context — so the tail of an overlap is the most expensive idle on the box. The retiring seat
-measured about 15 of those 45 minutes as actually used (planning seat e2), and the window ends at the successor's
---ready anyway; 20 min is the wait for a successor that is going to make it, not the wait for one that is not.
+RETIREMENT DRAINS THE PREDECESSOR, THEN ENDS IT. At cutover the names move: the predecessor becomes
+`<target>~old` and the successor takes `<target>`. The predecessor keeps its window for CC_HANDOFF_DRAIN, or
+until it is idle with nothing typed, never less than CC_HANDOFF_RETIRE_GRACE; then the window is killed. A
+predecessor with live subagents STAYS first (read off the harness's task files; silence for
+CC_HANDOFF_AGENT_IDLE counts as done; capped at CC_HANDOFF_AGENT_MAX), hands each report to the successor, and
+gets the final message when the last one is in. Its board rows held by an `agent` mark move to the successor
+with the name (carry_marks). The kill is fenced by refuse_kill(): only the window the record names, only after
+cutover, never the caller's own.
 
-AND QUIET WHILE IT IS OPEN. The successor's questions are the only thing worth a predecessor's turn during an
-overlap: it is retiring, so a drive-loop tick or a machine digest buys a full-context wake for work it will hand
-over minutes later. So start() marks the target quiet — `~/.cc/state/<target>/pulse.off`, the opt-out
-cc-reconcile's wake honours — and the mark comes off at cutover (from that instant the name is the
-SUCCESSOR's and the drive loop must reach it) and again in clear(), which every path that ends an overlap goes
-through. A mark this file did not make is never removed: the record lists what start() wrote, and only that is
-taken back, so a session or an owner who switched the pulse off keeps it switched off.
-Machine digests are cc-broker's, and its only per-target hold is `cc-pause is <target>` — which parks the whole
-PROJECT (its loops, the landing queue, publish, janitor), far wider than one retiring session, so it is not used
-here. What bounds them instead is the cap above: cc-broker debounces a digest 12 min, so a 20 min overlap is at
-most a wake or two of machine chatter rather than 45 minutes of it.
+EVERY PROMPT THIS FILE TYPES INTO A SESSION LEADS WITH `[cc-handoff]` (MACHINE): cc-scope's ask ledger skips it
+by the tag, never by the wording.
 
-NOTHING IS LEFT TO A SESSION THAT MAY BE GONE. Every phase above is driven by a session's own Stop hook, which
-is exactly what a crashed one no longer has — so --sweep, on the EXISTING cc-reconcile timer, finishes what no
-session can: a record whose predecessor is gone past the grace is finalized (the marker cc-guard reads, then the
-record), and an overlap that never reached --ready expires quietly past its deadline.
-
-RETIREMENT DRAINS THE PREDECESSOR, THEN ENDS IT. A session cannot exit itself — `/exit` is a slash command a
-human types into the TUI — so waiting for its pane to disappear waits for an event only a watching person can
-cause. At cutover the NAMES move: the predecessor becomes `<target>~old` and the successor takes `<target>`, so
-an owner attaching lands on the live one from the first instant. The predecessor then keeps its window for a
-drain — CC_HANDOFF_DRAIN (600 s), or until it is idle with nothing typed, never less than
-CC_HANDOFF_RETIRE_GRACE (120 s: the turn in flight, the journal flushed) — and anything typed into it meanwhile
-is RELAYED into the successor's window by the UserPromptSubmit hook (--relay) and blocked in place with a
-pointer, so nothing typed is lost (2026-09-01 02:2xZ: the owner's question, typed a minute before the kill,
-was). At drain end input is refused with the pointer and the window is KILLED — the drain expires into a kill,
-never into "it keeps its window". A `~next` or `~old` window left with no record is reported by --sweep.
-
-THE PREDECESSOR STAYS FOR ITS SUBAGENTS. Hand off a session whose subagents are still running and their reports
-have nowhere to land: at cutover it is gone, and each one arrives in a window nobody reads (owner, 2026-09-04).
-So the cutover itself is unchanged — the successor is live for the channel from the same instant — but a
-predecessor with live subagents is told to STAY: watch them through, hand each report to the successor
-(`cc-msg <target>`, or SendMessage), and take the final handoff message only when the last one is in. Its
-retirement waits for that, and the journal says both that it is staying and what ended the stay. Live is read
-off the harness's own per-session task files — <tmp>/claude-<uid>/<project>/<session id>/tasks, one
-`<id>.output` per task, a symlink for a subagent and a plain file for a background command. Nothing in them
-says "finished", so silence is the signal: a transcript untouched for CC_HANDOFF_AGENT_IDLE counts as done. No
-session id on the record, no such files, none running — all three read as "no subagents", and the retirement is
-exactly the one above. The stay is bounded by CC_HANDOFF_AGENT_MAX and expires into that same drain-then-kill;
-a stay is never a session that keeps its window.
-
-AND ITS BOARD ROWS COME WITH IT. A row worked in a subagent has no worker and no window of its own: it is held
-only by the `agent` mark naming that session's window, and a reader stops counting that mark the moment the
-window is no longer a session named for the repo — which the cutover rename does. So the marks are handed to
-the successor with the name (carry_marks), because that is where those subagents' reports now land. A mark that
-is not exactly the predecessor's, and a row a real worker is in, are never touched.
-
-EVERY PROMPT THIS FILE TYPES INTO A SESSION LEADS WITH `[cc-handoff]` (MACHINE). A prompt a tool types reaches
-UserPromptSubmit looking like a user turn, and the ask ledger opened a row for four of them — the successor's
-opening prompt (a121, a126, a131) and the retiring session's stop message (a132) — each costing that session a
-turn to decline a row about its own startup or retirement. The tag is the whole of what cc-scope matches on (its
-NOT_A_PERSON), so it never learns a sentence and a prompt added here later is machine chatter from its first
-use. A relay is NOT tagged: it carries a person's own words and must still open a row where it lands.
-
-Env: CC_HANDOFF (the successor's own record id, exported into its process by `cc __runnext`; it OUTLIVES the
-handoff, so `<id>.done` and not the variable is what says one is still open — mid_handoff) · CC_HANDOFF_WINDOW
-(the successor's own tmux window, so it accepts its own startup dialog) ·
-CC_HANDOFF_RETIRE_GRACE, CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT (~/.cc/config) ·
-CC_HANDOFF_AGENT_IDLE (a subagent's transcript may be silent this long and still count as running, 30 min),
-CC_HANDOFF_AGENT_MAX (the cap on a stay, 1 h) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS (test hooks:
-put the record, the ledger and the harness's task files somewhere else) ·
-CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log must be before it stops counting as live, 1 h) ·
+Env: CC_HANDOFF (the successor's own record id, exported by `cc __runnext`; it outlives the handoff, so
+`<id>.done` and not the variable says one is still open) · CC_HANDOFF_WINDOW (the successor's own tmux
+window, so it accepts its own startup dialog) · CC_HANDOFF_OVERLAP_MAX, CC_HANDOFF_RETIRE_GRACE,
+CC_HANDOFF_DRAIN, CC_HANDOFF_DONE_TTL, CC_HANDOFF_KICK_WAIT, CC_HANDOFF_GONE_CONFIRM, CC_HANDOFF_AGENT_IDLE,
+CC_HANDOFF_AGENT_MAX (~/.cc/config) · CC_HANDOFF_DIR, CC_CTX_RECORDS, CC_HANDOFF_TASKS (test hooks) ·
+CC_BRIEF_WORKER_IDLE (--brief: how quiet a track's loop.log may be and still count as live, 1 h) ·
 CC_BRIEF_PACKET_BAND (--brief: the packet size, in bytes, that is recorded as context cost, 24 kB).
 """
 import fcntl, glob, json, os, re, shlex, shutil, subprocess, sys, tempfile, time, uuid
@@ -171,13 +90,6 @@ def cfg(name, default):
         return default
 
 
-def enabled():
-    """`CC_HANDOFF_OVERLAP=1` in ~/.cc/config turns the whole path on; the default is off, and flipping it is
-    the owner's call. cc-slack mutes the non-live session since 2026-08-31 (delivery, the permission fanout
-    and its own reply/react/file), so one channel keeps one voice while an overlap is open."""
-    return cfg("CC_HANDOFF_OVERLAP", 0) >= 1
-
-
 # ---- the address -----------------------------------------------------------------------------------------
 # ONE PLACE SPLITS AN ADDRESS. Every phase below used to do `target.partition("/")` and call the left half the
 # repo, which is true of two shapes out of three: for `<repo>@<alias>` it made the repo the whole `repo@alias`
@@ -204,6 +116,8 @@ def kind(target):
 
 ARTICLE = {"session": "a session a person steers", "orch": "an orchestrator", "track": "a track"}
 SHAPES = "<repo>, <repo>@<alias> or <repo>/<track>"
+WORKER_REFUSAL = ("a worker iteration is not handed off — it journals, ends its turn, and its loop starts the "
+                  "next one with a fresh context")   # one text: worker() and worker_held() are the same refusal
 
 
 # ---- the record ----------------------------------------------------------------------------------------
@@ -362,24 +276,6 @@ def mark_done(rec):
     return True
 
 
-def mid_handoff():
-    """Is this session the second half of a handoff that is STILL GOING ON? `cc __runnext` exports $CC_HANDOFF
-    into a successor and it lives as long as that PROCESS — by design, so the model cannot unset it. So the
-    variable answers "was this session BORN a successor", which is not the question anything here asks: once
-    the handoff RETIRES, the successor is the only session left and must be able to hand ITSELF off in turn.
-    Read as a bare flag it does the opposite — 2026-09-01: the planning session won an overlap at 03:06Z, ran
-    all evening past the hand-off line to 51.5%, and no event ever fired, because it still carried
-    CC_HANDOFF=bbbae9cd948f whose <id>.done had been on disk since 03:56Z. The overlap was a thing the box
-    could do exactly ONCE per target, and the box's own handoff had to be started by hand.
-    <id>.done is the same evidence cc-guard already un-gates on (cc-guard:84 — a record that is gone because
-    everything went RIGHT vs one lost because something went WRONG); three files now read $CC_HANDOFF the same
-    way. An id we cannot account for still holds: every failure here falls towards not policing your own."""
-    hid = os.environ.get("CC_HANDOFF") or ""
-    if not hid:
-        return False
-    return not (ID_RE.match(hid) and os.path.exists(os.path.join(HANDOFF, hid + ".done")))
-
-
 def worker():
     """Is this turn a HEADLESS cc-loop iteration? Then it takes no phase: it journals, ENDS ITS TURN, and the
     loop starts the next iteration with a fresh context reading that journal — that IS the handoff, and it
@@ -390,6 +286,54 @@ def worker():
     on that reading, and the INTERACTIVE successor it started finished the work, ran `cc done`, and then sat in
     the track window forever — the Home tally showed the track RUNNING over a stale board."""
     return os.environ.get("CC_ROLE") == "worker"
+
+
+def worker_held(wid):
+    """Is that WINDOW a headless worker's — a cc-loop — rather than a session's? worker() asks the CALLER, and the
+    caller is the hole: `cc handoff <repo> <track>` from a planning seat passes it, win_id() then finds the LOOP's
+    window, and the record gates the running `claude -p` through cc-guard mid-iteration while an interactive
+    successor spends beside it — the 2026-09-01 incident worker() describes, reached from the outside. So the
+    target is asked too, by the only thing that knows: its own pane's processes.
+    THE LOOP IS THE TELL, NOT THE ITERATION. `cc --go` makes the window as `cc-sandbox … -- cc-loop …; exec bash`
+    (core/bin/cc:1398), so cc-loop is alive between iterations too, and when it ends `exec bash` leaves a bare
+    shell that answers False. Reading only the iteration's `claude -p` would wave a handoff through in the gap
+    between two of them and gate the NEXT one. Both are read, each as a TOKEN and never as a substring: a
+    headless prompt carries the whole brief in argv and matches anything you grep for.
+    UNREADABLE SAYS HELD. A pane that will not answer — tmux gone, the window dead, ps timed out — returns True,
+    because the two mistakes do not cost the same: a wrong refusal costs a retry, a wrong allow costs the incident
+    above, a gated worker and a second paid session in its worktree. start() has already resolved the window by
+    the time it asks, so an unreadable pane there is an anomaly, not the ordinary case. A foreground lander in an
+    interactive pane is the one false positive, which refuses safely."""
+    if not wid:
+        return False
+    pids = (tmux("list-panes", "-t", wid, "-F", "#{pane_pid}") or "").split()
+    if not pids:
+        return True                     # win_id() resolved it a moment ago: no panes now is a misread, not an answer
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return True                     # same: no answer is not "not a worker"
+    kids, argv = {}, {}
+    for line in ps.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            kids.setdefault(parts[1], []).append(parts[0])
+            argv[parts[0]] = parts[2]
+    seen, stack = set(), list(pids)
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        toks = argv.get(pid, "").split()
+        for i, t in enumerate(toks):
+            base = os.path.basename(t)
+            if base == "cc-loop":
+                return True
+            if base == "claude" and set(toks[i + 1:i + 4]) & {"-p", "--print"}:
+                return True
+        stack += kids.get(pid, [])
+    return False
 
 
 def live_side(rec):
@@ -404,7 +348,9 @@ def ledger(rec, kind, why=""):
     rec["phases"].append(kind)
     os.makedirs(RECORDS, exist_ok=True)
     repo, alias, track = parts(rec["target"])
-    row = {"ts": time.time(), "kind": kind, "handoff": rec["id"], "target": rec["target"],
+    # ISO, never a float: cc-slack's home_handoffs() buckets these rows by local day, and after this PR
+    # deletes cc-context's ledger() this file is their only writer (review of #501).
+    row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind, "handoff": rec["id"], "target": rec["target"],
            "repo": repo, "alias": alias or None, "track": track or None, "pct": rec.get("pct_at_start"),
            "session_id": (rec.get(live_side(rec)) or {}).get("session_id")}
     if why:
@@ -412,35 +358,6 @@ def ledger(rec, kind, why=""):
     with open(os.path.join(RECORDS, "handoffs.jsonl"), "a") as f:
         f.write(json.dumps(row) + "\n")
     return True
-
-
-def last_overlap(target):
-    """The ledger kinds of the most recent overlap on this target, in order — [] if there never was one. The
-    RECORD is deleted when an overlap ends, so the append-only ledger is the only thing that outlives one."""
-    kinds, hid = {}, None
-    try:
-        with open(os.path.join(RECORDS, "handoffs.jsonl")) as f:
-            for l in f:
-                try:
-                    row = json.loads(l)
-                except Exception:
-                    continue                       # one bad line never hides the rest
-                if row.get("target") != target or not row.get("handoff"):
-                    continue
-                hid = row["handoff"]
-                kinds.setdefault(hid, []).append(row.get("kind"))
-    except OSError:
-        pass
-    return kinds.get(hid, [])
-
-
-def retryable(target):
-    """Did the last overlap on this target end with the PREDECESSOR still in charge? Abandoned, expired, or
-    started and never finished all say yes: the session that crossed the line is still the one to hand off, so
-    the next five-percent line may try again. A cutover says no — the predecessor may outlive it (its drain, or
-    a stay for its subagents) and a second overlap would be started against the SUCCESSOR's window."""
-    kinds = last_overlap(target)
-    return bool(kinds) and not any(k in ("overlap-cutover", "overlap-forced") for k in kinds)
 
 
 # ---- tmux ----------------------------------------------------------------------------------------------
@@ -838,15 +755,14 @@ def lib_touch(path):
         pass
 
 
-def start(target, pct=None, session_id="", flight=""):
+def start(target, session_id="", flight=""):
     """--overlap: the successor comes up beside the predecessor, muted and gated, with the same working
     directory. Refused while a record for this target is open — one successor at a time, never a chain."""
     if not TARGET_RE.match(target):
         print(f"cc-handoff: '{target}' is not a target ({SHAPES})", file=sys.stderr)
         return 1
     if worker():
-        print("cc-handoff: a worker iteration is not handed off — it journals, ends its turn, and its loop "
-              "starts the next one with a fresh context", file=sys.stderr)
+        print(f"cc-handoff: {WORKER_REFUSAL}", file=sys.stderr)
         return 1
     old = read(target)
     if old:
@@ -856,6 +772,9 @@ def start(target, pct=None, session_id="", flight=""):
     wid = win_id(target)
     if not wid:
         print(f"cc-handoff: no live window main:{target} — nothing to start alongside")
+        return 1
+    if worker_held(wid):
+        print(f"cc-handoff: main:{target} reads as a headless worker's window — {WORKER_REFUSAL}", file=sys.stderr)
         return 1
     if win_id(target + NEXT):
         print(f"cc-handoff: main:{target}{NEXT} already exists with no record — clear it by hand first")
@@ -870,7 +789,7 @@ def start(target, pct=None, session_id="", flight=""):
            "started": now, "deadline": now + cap,
            # …and for as long as that runs, nothing but the successor wakes the predecessor — see AND QUIET.
            "quiet": quiet_claim(target),
-           "pct_at_start": pct, "told_owner": None, "phases": []}
+           "pct_at_start": None, "told_owner": None, "phases": []}
     ledger(rec, "overlap-started")
     write(rec)          # before the window, never after: a successor whose record is missing must find itself gated
     quiet(target, rec["quiet"])     # after the record names it, never before: see quiet_claim()
@@ -895,7 +814,7 @@ def start(target, pct=None, session_id="", flight=""):
         return 1
     rec["successor"]["tmux"] = win_id(target + NEXT) or ""
     write(rec)
-    # Detached, because the successor takes a minute to boot and this call is on a Stop hook: it waits out the
+    # Detached, because the successor takes a minute to boot and the caller must not wait: it waits out the
     # startup dialog, sends the opening prompt and verifies the pane took it. Without it the successor has a
     # brief and no first turn — a window that looks right and a session doing nothing.
     if os.environ.get("CC_HANDOFF_NO_KICK"):   # a suite's fixture window never boots a claude: a kick there can only
@@ -922,7 +841,7 @@ def ready(target=None, forced=False):
         return 0
     if not forced and hid != rec["id"]:
         print("cc-handoff: --ready belongs to the successor (its CC_HANDOFF must match the record); "
-              "the predecessor's watchdog uses --forced", file=sys.stderr)
+              "--forced cuts over by hand", file=sys.stderr)
         return 1
     if forced and not pane_live(rec["successor"]["window"]):
         print(f"cc-handoff: {target} has no live successor to force onto", file=sys.stderr)
@@ -1063,78 +982,18 @@ def derive(rec, first=False):
 RETIRE_MSG = (MACHINE + " Handoff complete: your successor is live and owns this target now — it holds window "
               "{target}; you are {old} and retiring. Append your final entry to the journal — what is done, what "
               "is next (ordered), gotchas — and stop. You are no longer the live session: merging, pushing, "
-              "dispatching and posting outward are refused from here on, anything typed here is relayed to your "
-              "successor, and this window ends by itself once you are idle.")
+              "dispatching and posting outward are refused from here on, and this window ends by itself once "
+              "you are idle.")
 STAY_MSG = (MACHINE + " Handoff cut over: your successor is live and owns this target now — it holds window "
             "{target}, you are {old}, and you are NOT finished. {n} of your subagents are still running and "
             "their reports have nowhere else to land, so STAY: watch them through, and hand each report on to "
             "your successor as it comes in — `cc-msg {target} '<the report, in a line or two>'`, or SendMessage "
             "if you hold it as a peer — because it is the one who will act on it. Start nothing new: merging, "
-            "pushing, dispatching and posting outward are refused from here on, and anything typed here is "
-            "relayed to {target}. When the last one is in you get the final handoff message; then journal and "
-            "stop. This window ends by itself once your subagents are done. The board rows those subagents are "
+            "pushing, dispatching and posting outward are refused from here on. When the last one is in you get "
+            "the final handoff message; then journal and stop. This window ends by itself once your subagents "
+            "are done. The board rows those subagents are "
             "on are marked to {target} now — leave them alone: `cc board set … agent me` is REFUSED from here, "
             "because this window is one no reader counts and the mark would be the same as releasing them.")
-RELAY_PREFIX = "[relayed from the retiring session] "
-# What reaches UserPromptSubmit as a "user" turn but was written by the harness or a peer — cc-scope's
-# NOT_A_PERSON less MACHINE, which is this file's own tag and is guarded beside this list; kept in step by hand. Relayed, the successor's own cross-session message came back typed into it, and the
-# predecessor lost its task notifications mid-journal (review of #140). A <channel …> Slack turn is NOT here: that
-# is a person, and the one the drain exists for.
-NOT_A_PERSON = ("<task-notification", "<cross-session-message", "[SYSTEM NOTIFICATION",
-                "[Cross-session idle notice]", "<command-name", "<local-command-stdout")
-
-
-def retiring(payload):
-    """The record under which THIS process's session is the retired predecessor, or None. Keyed on the window —
-    $TMUX_PANE's window id against the id the record names — and, second, on the payload's session_id, which
-    the record may hold EMPTY (a planning session's is unknown at --overlap time: the 2026-09-01 incident's was),
-    so the window is the key that always works. Never a guess: no match, no record."""
-    recs = read_all()
-    if not recs:
-        return None
-    wid, sid = self_wid(), payload.get("session_id") or ""
-    for rec in recs:
-        if live_side(rec) != "successor":
-            continue                               # before cutover nobody is retiring, whatever the window
-        pre = rec.get("predecessor") or {}
-        if (wid and wid == pre.get("tmux")) or (sid and sid == pre.get("session_id")):
-            return rec
-    return None
-
-
-def block(reason):
-    print(json.dumps({"decision": "block", "reason": reason}))
-    return 0
-
-
-def relay(payload):
-    """--relay, called by the UserPromptSubmit hook (`cc-scope hook`) with the hook's payload on stdin. Prints a
-    block decision when the prompt was typed into the RETIRING predecessor: during the drain it is relayed into
-    the successor's window (cc-msg <target>) and blocked here with a pointer; once the drain is over (phase
-    `retired`) it is refused with the pointer. Prints NOTHING — the hook then does nothing — in every other
-    case: another session, a slash command (that is for THIS TUI: /exit is how a human ends it), a turn the harness
-    or a peer wrote (NOT_A_PERSON), a prompt this file typed itself (MACHINE), and a relay cc-msg could not take at
-    all (no window, no interactive claude there): then the prompt stays with the session it was typed into, which
-    is alive and answers it, and the journal keeps a copy. A relay cc-msg QUEUED (the successor's pane is busy or
-    holds a dialog) counts as relayed — its drain delivers it. Nothing typed is ever lost."""
-    text = payload.get("prompt") or ""
-    if not text.strip():
-        return 0
-    rec = retiring(payload)
-    if not rec:
-        return 0
-    target = rec["target"]
-    if text.lstrip().startswith(("/", MACHINE) + NOT_A_PERSON):
-        return 0                                   # whatever the phase: /exit must still end a retired TUI
-    if rec.get("phase") == "retired":
-        return block(f"retired — use window {target}")
-    line = RELAY_PREFIX + " ".join(text.splitlines())   # one line: a newline typed into the TUI would submit early
-    if run([os.path.join(BIN, "cc-msg"), target, line]):
-        logd(f"{target}: relayed a prompt from the retiring session ({len(text)} chars)")
-        return block(f"relayed to {target} — this session is retiring; the answer will come from window {target}")
-    journal(target, f"NOT relayed (cc-msg could not reach main:{target}); the retiring session answers it: {text}")
-    logd(f"{target}: could not relay a prompt from the retiring session — it answers it itself")
-    return 0
 
 
 def refuse_kill(rec, wid):
@@ -1199,13 +1058,11 @@ def drain_start(rec, amax):
 
 def retire(target):
     """--retire, detached by derive(): DRAIN the predecessor, then END it — every time, not only when a human
-    happened to be watching. The old wait-it-out never completed on its own (a session cannot exit itself; on
-    2026-08-31 a retired one ran on for 35 min as a second live voice), and the plain grace-then-kill that
-    replaced it lost what was typed in its last minute (2026-09-01 02:2xZ). So the window lives on — renamed
-    `<target>~old` at cutover — for CC_HANDOFF_DRAIN, or until it is idle with nothing typed, never less than
-    CC_HANDOFF_RETIRE_GRACE (the turn in flight, the journal flushed), while --relay carries anything typed into
-    it to the successor. A predecessor staying for its subagents waits them out before any of that begins.
-    Then the record says `retired` (--relay refuses from here) and the window is killed.
+    happened to be watching (a session cannot exit itself; on 2026-08-31 a retired one ran on for 35 min as a
+    second live voice). The window lives on — renamed `<target>~old` at cutover — for CC_HANDOFF_DRAIN, or
+    until it is idle with nothing typed, never less than CC_HANDOFF_RETIRE_GRACE (the turn in flight, the
+    journal flushed). A predecessor staying for its subagents waits them out before any of that begins.
+    Then the record says `retired` and the window is killed.
     Kills ONLY the window the record names as the predecessor, ONLY once the record says the successor is live,
     and never the caller's own — see refuse_kill(). No record, or no cutover: nothing is killed at all."""
     rec = read(target)
@@ -1229,7 +1086,7 @@ def retire(target):
     if not rec or live_side(rec) != "successor":
         return 0                                   # finalized or cleared under us: nothing here is ours to end
     if rec.get("phase") != "retired":
-        rec["phase"] = "retired"                   # the drain is over: from here --relay REFUSES with the pointer
+        rec["phase"] = "retired"                   # the drain is over
         write(rec)
     wid = pre if win_alive(pre) else ""            # by the id the record names: `<target>` is the SUCCESSOR's name now
     if wid:
@@ -1255,8 +1112,8 @@ def retire(target):
 
 
 def abandon(target, why=""):
-    """--abandon: the deadline below the ceiling. The successor's window goes, the record clears, the owner
-    hears it ONCE — the record's absence is what makes a second call a no-op. Never two sessions forever."""
+    """--abandon: call the overlap off. The successor's window goes, the record clears, the owner hears it
+    ONCE — the record's absence is what makes a second call a no-op. Never two sessions forever."""
     rec = read(target)
     if not rec:
         return 0
@@ -1273,136 +1130,6 @@ def abandon(target, why=""):
                    f"The original session is still running and still in charge.")
     print(f"cc-handoff: {target} — overlap abandoned, the predecessor carries on")
     return 0
-
-
-def due(target, over_ceiling=False):
-    """--due: the predecessor's Stop hook, every turn. Silent until the deadline; then the ceiling decides."""
-    rec = read(target)
-    if not rec or live_side(rec) == "successor" or time.time() < rec.get("deadline", 0):
-        return 0
-    if not over_ceiling:
-        return abandon(target, "the successor did not become ready inside the overlap window")
-    if pane_live(rec["successor"]["window"]):
-        return ready(target, forced=True)          # it has the journal, which is all a fresh session ever got
-    _, _, track = parts(target)
-    abandon(target, "at the context ceiling with no live successor")
-    if track:                                      # fall back INTO the old path: stop, journal, restart fresh
-        run([os.path.realpath(__file__), "--replace", target], wait=False)
-    else:
-        notify(target, f"{target} is at its context ceiling and the overlapping handoff did not take. "
-                       f"There is no stop-then-restart path for {ARTICLE[kind(target)]} — it needs a hand.")
-    return 0
-
-
-REPLACE_MSG = (MACHINE + " Handoff: append to {jrn} a dated handoff entry for a fresh session — what is done, "
-               "what is next (ordered), gotchas/decisions — then run /exit.")
-
-
-def replace(target, over=None):
-    """--replace: the ORIGINAL handoff, and the one the overlap falls back INTO — tell the session to journal,
-    wait for it to exit, then restart it on a fresh context. It was `cc handoff <repo> <track>` until
-    2026-08-31; `cc` still spells it that way and delegates here, so the lifecycle has one owner and one file
-    to read. Every refusal leaves the session running and says why: a restart that loses a context nobody
-    journalled is worse than no restart.
-    A handoff costs the session its working memory, so --over decides on the MEASURED number, never a hunch."""
-    repo, _, track = parts(target)
-    if not track:
-        print(f"cc-handoff: {target} is {ARTICLE[kind(target)]} — there is no stop-then-restart path for one "
-              f"(only a track can be killed and relaunched from its board row). It is handed off by the "
-              f"overlap: cc-handoff --overlap {target}", file=sys.stderr)
-        return 1
-    if not win_id(target):
-        print(f"cc-handoff: no live window {target}")
-        return 1
-    st = os.path.join(STATE, repo, track)
-    jrn = os.path.join(st, "progress.md")
-    if over:
-        argv = [os.path.join(BIN, "cc-context"), repo, track, "--over"] + ([] if over == "any" else [over])
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
-            rc, ctx = r.returncode, r.stdout.split("  ")[0].strip()
-        except Exception:
-            rc, ctx = 2, ""
-        line = "under the handoff line" if over == "any" else f"under {over}%"
-        if rc == 2:
-            print(f"cc-handoff: cannot measure {target}'s context (no answered turn yet) — "
-                  f"not handing off on a guess")
-            return 1
-        if rc == 1:
-            print(f"cc-handoff: {target} is at {ctx}, {line} — nothing to hand off")
-            return 0
-        print(f"cc-handoff: {target} is at {ctx} (over {line[len('under '):]}) — handing off")
-    else:
-        try:
-            r = subprocess.run([os.path.join(BIN, "cc-context"), repo, track],
-                               capture_output=True, text=True, timeout=120)
-            if r.returncode == 0:
-                print(f"cc-handoff: {target} is at {r.stdout.split('  ')[0].strip()} — handing off")
-        except Exception:
-            pass
-    def mtime():
-        try:
-            return os.stat(jrn).st_mtime
-        except OSError:
-            return 0
-    before = mtime()
-    if not run([os.path.join(BIN, "cc-msg"), target, REPLACE_MSG.format(jrn=jrn)]):
-        print(f"cc-handoff: cc-msg could not reach {target} (no window, or no interactive session there) — "
-              f"not restarting", file=sys.stderr)
-        return 1
-    for _ in range(120):
-        if not pane_live(target):
-            break
-        time.sleep(5)
-    if pane_live(target):
-        print("cc-handoff: session did not exit in 10 min; the handoff journal may still be written. "
-              "Not restarting.", file=sys.stderr)
-        return 1
-    if mtime() == before:
-        print(f"cc-handoff: {jrn} never changed — no handoff journal was written, so a fresh context would "
-              f"start blind. Not restarting (read the pane, then: cc {repo} {track})", file=sys.stderr)
-        return 1
-    wid = win_id(target)
-    if wid:
-        tmux("kill-window", "-t", wid)
-    board = os.path.join(BIN, "cc-board")
-    run([board, "set", repo, track, "session_id", str(uuid.uuid4())])
-    run([board, "set", repo, track, "started", "false"])
-    run([board, "note", repo, track, "handoff: restarted with fresh context"])
-    run([os.path.join(BIN, "cc"), repo, track])
-    return 0
-
-
-def event(target, level="", pct=None, session="", busy="", live=False, taken=False, retry=False):
-    """--event: the ONE call cc-context makes. It measures and says WHAT was crossed; which phase that means is
-    decided here, in the file that owns every phase. Returns the action taken, for the caller's own record:
-      ""         nothing — the line was the journal nudge, or a phase is already open, or nothing could start
-      "overlap"  a successor is coming up alongside (the predecessor is not interrupted)
-      "replace"  the old stop-then-restart path is running, detached
-    `taken` = that session has already taken a phase, or a Stop hook is holding it: nothing NEW starts, but the
-    level still decides the watchdog below, which is why cc-context sends it either way.
-    `retry` = one of the five-percent lines between the handoff line and the ceiling. It overrides `taken` —
-    and only that — when the last overlap here died with the predecessor still in charge (retryable), so an
-    attempt that failed is tried again at the next line instead of waiting for the ceiling.
-    Never from the SUCCESSOR of an OPEN handoff: a session must not police, abandon or restart the handoff it
-    is itself the second half of — but only while that handoff is still open (mid_handoff).
-    Never for a headless cc-loop iteration either (worker): its loop is its handoff, and there is nothing here
-    that is worth a second session. The level is still MEASURED and the session still told to journal — that is
-    cc-context's half — but no phase is opened, so the watchdog below is not run for it."""
-    if worker() or mid_handoff():
-        return ""
-    if read(target):
-        due(target, level == "ceiling")     # an overlap is open: its deadline, every turn, from the predecessor
-    if not level or level == "journal" or not live or read(target):
-        return ""                           # the journal line is a nudge, not a phase; and one phase at a time
-    if taken and not (retry and retryable(target)):
-        return ""                           # …and a phase already taken is not taken twice, unless it DIED
-    if enabled() and start(target, pct, session, busy) == 0:
-        return "overlap"                    # nothing has to be idle: starting a second session interrupts nobody
-    if kind(target) == "track" and not busy:   # the overlap is off or would not open: fail INTO the old path,
-        run([os.path.realpath(__file__), "--replace", target], wait=False)   # which DOES have to wait for idle
-        return "replace"
-    return ""
 
 
 def finalize(rec, why):
@@ -1431,20 +1158,17 @@ def finalize(rec, why):
 
 
 def sweep():
-    """--sweep: the reaper, run from the EXISTING cc-reconcile timer (no new unit). Everything else here is
-    driven by a session's own Stop hook, which is precisely what a crashed session no longer has: a retirement
-    that dies between mark_done() and clear() leaves the survivor gated by the record of its own success, and a
-    predecessor that dies mid-overlap leaves a record nothing reaps. Two cases, both unambiguous:
+    """--sweep: the reaper, run from the EXISTING cc-reconcile timer (no new unit). Nothing polices a record
+    from inside a session, so the sweep IS the deadline, and it finishes what no session is left to:
       the predecessor's session is GONE past the retire grace -> finalize. Nobody but the successor is in
         charge of that target, and a record saying otherwise is gating the only session left.
-      an overlap that never reached --ready is past its deadline -> it expires QUIETLY. The predecessor never
-        stopped working and was never told anything, so there is nothing to tell it now; --due, which the
-        predecessor's own hook runs, gets first refusal (hence the extra grace) and tells the owner when it acts.
+      an overlap that never reached --ready is past its deadline (plus the grace) -> it expires QUIETLY. The
+        predecessor never stopped working and was never told anything, so there is nothing to tell it now.
       a cut-over predecessor STILL ALIVE past drain+grace -> ended here, then finalized (one told to STAY for
         its subagents is past nothing until that stay ends or its cap runs out: drain_start). The --retire that
         should have ended it died, or refused because a --forced cutover runs it from the predecessor's own pane
-        (refuse_kill); left alone it is `~old` forever at phase retired — prompts refused, not relayed — and its
-        successor can never hand off (mid_handoff). Same fence as --retire; the sweep has no pane of its own.
+        (refuse_kill); left alone it is `~old` forever at phase retired, and its successor's <id>.done is never
+        written. Same fence as --retire; the sweep has no pane of its own.
     A sweep only ever un-gates, so a WRONG 'gone' is the expensive direction: if tmux cannot be read at all —
     no server, no session main — every window looks gone, so nothing is swept."""
     if tmux("list-windows", "-t", SESSION, "-F", "#{window_id}") is None:
@@ -1823,1264 +1547,12 @@ def record_packet(target, rec, size):
 # ---- selfcheck -----------------------------------------------------------------------------------------
 
 def selfcheck():
-    os.environ.pop("CC_HANDOFF_NO_KICK", None)   # the suite exports it for ITS fixtures; every start() here is stubbed and the kick cases need the spawn
-    nlo = os.environ.pop("CC_NOTIFY_LOG_ONLY", None)   # the suite sets it; these cases read what run() was handed, not what a door did with it
-    import tempfile
-    global HANDOFF, RECORDS, STATE, DEV, win_id, pane_live, pane_live_id, tmux, run, out, notify, self_wid, age
-    real_out = out
-    p = f = 0
-
-    def ok(what, cond):
-        nonlocal p, f
-        if cond:
-            p += 1
-            print(f"  ✓ {what}")
-        else:
-            f += 1
-            print(f"  ✗ {what}")
-
-    with tempfile.TemporaryDirectory() as d:
-        HANDOFF = os.path.join(d, "handoff")
-        RECORDS = os.path.join(d, "context")
-        STATE = os.path.join(d, "state")               # derive/retire touch spool dirs under it: never the real one
-        # nothing real is started, killed or pushed from a selfcheck: tmux and the shell-outs are stubbed
-        wins, msgs, dead, me, tcalls, panes = {"r1": "@1"}, [], set(), [""], [], {}
-
-        def win_id(n):
-            return wins.get(n)
-
-        def pane_live(n):
-            return n in wins and n not in dead      # `dead` = the window is still there, the session in it is not
-
-        def pane_live_id(wid):
-            return any(i == wid and n not in dead for n, i in wins.items())
-
-        ages = {}
-
-        def age(pid):
-            return ages.get(pid, 0)                 # the orphan stub hands the window id over as the pane pid
-
-        def self_wid():
-            return me[0]                            # the window --retire is pretending to run in
-
-        def tmux(*a, _log=True, **k):
-            if _log:
-                tcalls.append(a)
-            if ";" in a:                            # `cmd … ; cmd …`: one call, run in order
-                i = a.index(";")
-                tmux(*a[:i], _log=False); tmux(*a[i + 1:], _log=False)
-                return ""
-            if a[0] == "list-windows":
-                if "pane_start_command" in " ".join(a):   # lanes(): name, id, pane pid, the command it was made with
-                    return "\n".join("\t".join([n, i, "4242", f"cc-land {n[4:]} --wait"]) for n, i in wins.items())
-                if "pane_pid" in " ".join(a):       # orphans(): id, "pid", name
-                    return "\n".join(f"{i} {i} {n}" for n, i in wins.items())
-                return "\n".join(wins.values())
-            if a[0] == "capture-pane":
-                return shown(a[-1])
-            if a[0] == "display-message":       # `-t <window id> "#{window_id}:#{pid}"`: the mark cc-board would
-                return f"{a[a.index('-t') + 1]}:900"   # stamp for that window. 900 stands in for the server pid,
-                                                       # which is one number for every window on the server.
-            if a[0] == "new-window":
-                wins[a[a.index("-n") + 1]] = "@%d" % (len(wins) + 1)
-            elif a[0] == "kill-window":
-                for n, i in list(wins.items()):
-                    if i == a[-1]:
-                        del wins[n]
-            elif a[0] == "rename-window":
-                for n, i in list(wins.items()):
-                    if i == a[a.index("-t") + 1]:
-                        wins[a[-1]] = wins.pop(n)
-            return ""
-
-        # the fake TUI: a pane is a string, or a callable drawing the screen of the moment. `tui` is its
-        # keyboard log — when accept-dialog was asked per window, and what was typed where, and when.
-        BOX = '╭──────────────────────╮\n│ > Try "fix the bug"   │\n╰──────────────────────╯'
-        IDLE = BOX + "\n  " + IDLE_HINT
-        DIALOG = ("WARNING: Loading development channels can be unsafe.\n ❯ 1. I am using this for local "
-                  "development\n   2. Exit\n Enter to confirm · Esc to cancel")
-        tui = {"asked": {}, "typed": []}
-
-        def shown(wid):
-            v = panes.get(wid, "")
-            return v() if callable(v) else v
-
-        def run(argv, wait=True):
-            msgs.append(list(argv))
-            if argv[0].endswith("cc-slack") and argv[1:2] == ["accept-dialog"]:
-                tui["asked"][argv[2]] = time.time()
-            if argv[0].endswith("cc-msg"):        # the keyboard: keys reach whatever is in FRONT of the pane, so
-                wid = wins.get(argv[1])           # the stub fails where cc-msg would not type — no window, or a
-                                                  # dialog it may not answer (the real one spools there; a handoff
-                                                  # that cannot type NOW is what these cases are about)
-                if wid is None or any(x in shown(wid) for x in ("Enter to confirm", "development channels")):
-                    return False
-                tui["typed"].append((wid, argv[2], time.time()))
-                if not callable(panes.get(wid)):  # a static screen: draw the taken turn the way the TUI does
-                    panes[wid] = shown(wid) + "\n> " + argv[2] + "\n\n✻ Thinking… (" + WORKING + ")\n" + BOX
-            return True
-
-        def notify(t, m):
-            msgs.append(["notify", t, m])
-
-
-        ok("a target with a track slugs to one flat file",
-           os.path.basename(path("r1/t1")) == "r1--t1.json" and os.path.basename(path("r1")) == "r1.json")
-        ok("a target cannot escape the record dir", not TARGET_RE.match("../etc")
-           and not TARGET_RE.match("r1/t1/x") and TARGET_RE.match("r1/t1"))
-
-        os.environ.pop("CC_HANDOFF", None)
-        role0 = os.environ.pop("CC_ROLE", None)   # …and neither may the ROLE of whoever is running them: these
-                                                  # gates are run from a --go worker as often as from a session,
-                                                  # and `worker()` would then refuse every start below. Same trap
-                                                  # as $CC_HANDOFF above, restored at the end of the section.
-        ok("no record at all -> nothing is open", read("r1") is None and status("r1") == 1)
-        ok("an overlap needs a live window", start("nosuch") == 1)
-        ok("an overlap starts on a live window", start("r1", pct=41.2) == 0)
-        rec = read("r1")
-        ok("the record names the predecessor as live", rec and rec["live"] == "predecessor")
-        ok("the deadline is bounded, and the cap is 20 min — an overlap runs two planning-class sessions side "
-           "by side, and the retiring seat measured ~15 of the old 45 min as actually used (2026-09-08)",
-           DEFAULT_MAX == 20 * 60 and rec["deadline"] - rec["started"] == DEFAULT_MAX)
-        ok("a second overlap for the same target is refused", start("r1") == 1)
-        nw = [a for a in tcalls if a[0] == "new-window"][-1]
-        ok("the successor is told ITS OWN window name, so it accepts the startup dialog in its own pane and "
-           "not in its predecessor's — one parked on that confirmation until a human noticed (2026-09-01)",
-           "CC_HANDOFF_WINDOW='r1~next' " in nw[-1] and nw[nw.index("-n") + 1] == "r1~next")
-        # …and the number is still the box's to set: CC_HANDOFF_OVERLAP_MAX through cc-config, env first.
-        wins["r1cap"] = "@1cap"
-        os.environ["CC_HANDOFF_OVERLAP_MAX"] = "300"
-        ok("CC_HANDOFF_OVERLAP_MAX overrides the default, and the brief the successor reads names the same "
-           "number as the deadline", start("r1cap") == 0
-           and read("r1cap")["deadline"] - read("r1cap")["started"] == 300
-           and "5 minutes at most" in open(brief_path("r1cap")).read())
-        os.environ.pop("CC_HANDOFF_OVERLAP_MAX", None)
-        abandon("r1cap")
-        ok("an overlap that ends without a cutover takes its own quiet mark back — clear() is the failsafe "
-           "every ending goes through, so no target is left out of the drive loop for good",
-           not os.path.exists(quiet_path("r1cap")) and read("r1cap") is None)
-        wins.pop("r1cap~next", None); wins.pop("r1cap", None)
-
-        # ---- QUIET WHILE IT IS OPEN. The successor's questions are the only thing worth a full-context wake
-        # from a session that is handing over; a drive-loop tick during the overlap buys one for work it is
-        # about to give away. The mark is cc-pulse's own opt-out — no second mechanism to keep in step.
-        ok("the overlap marks the retiring target quiet, with cc-pulse's own opt-out",
-           os.path.exists(quiet_path("r1")) and read("r1")["quiet"] == [QUIET_MARK])
-        ok("...and the record says which mark is OURS, so nothing else's is taken back later",
-           quiet_path("r1") == os.path.join(STATE, "r1", "pulse.off"))
-        wins["r1q"] = "@1q"
-        os.makedirs(os.path.join(STATE, "r1q"), exist_ok=True)
-        open(quiet_path("r1q"), "w").write("the owner switched this one off\n")
-        ok("a pulse.off that was already there is somebody else's decision: not claimed, not rewritten",
-           start("r1q") == 0 and read("r1q")["quiet"] == []
-           and "owner" in open(quiet_path("r1q")).read())
-        abandon("r1q")
-        ok("...and abandoning the overlap leaves it exactly where it was", os.path.exists(quiet_path("r1q")))
-        wins.pop("r1q~next", None); wins.pop("r1q", None)
-
-        # Hermetic on purpose: the CALLER's $HOME and $CC_CTX_RECORDS are exactly what this case is about, so
-        # neither may decide it — selftest.sh sets the latter, and the case passed alone and failed in the run.
-        env0 = {k: os.environ.get(k) for k in ("HOME", "CC_CTX_RECORDS")}
-        os.environ.pop("CC_CTX_RECORDS", None)
-        os.environ["HOME"] = os.path.join(d, "fakehome")
-        got = [handoff_log()]
-        os.environ["CC_CTX_RECORDS"] = RECORDS
-        got.append(handoff_log())
-        ok("a detached child's log follows $HOME, and $CC_CTX_RECORDS ahead of it — a fixture leaves no line "
-           "in the box's real handoff.log",
-           got == [os.path.join(d, "fakehome", ".cc", "state", "context", "handoff.log"),
-                   os.path.join(RECORDS, "handoff.log")])
-        for k, v in env0.items():
-            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-
-        ok("every prompt this file types into a session leads with the machine tag — the kick, the retirement "
-           "message and --replace's — so the ask ledger skips them by the tag and never by their wording",
-           all(p.startswith(MACHINE) for p in (KICK, RETIRE_MSG, REPLACE_MSG)))
-
-        # ---- the successor must be BRIEFED, and the brief SEEN to land. The brief itself rides in the system
-        # prompt, which nothing acts on by itself; on 2026-09-01 a successor sat blank for 25 min because the
-        # startup dialog ate the prompt typed at it and nobody read the pane back.
-        env1 = {k: os.environ.get(k) for k in ("CC_HANDOFF_KICK_WAIT", "CC_CTX_RECORDS", "HOME", "CC_NOTIFY_LOG_ONLY",
-                                               "CC_HANDOFF_NO_KICK")}
-        os.environ["CC_HANDOFF_KICK_WAIT"] = "0"        # no naps, and no waiting on a window that will not come
-        os.environ.pop("CC_HANDOFF_NO_KICK", None)      # the suite sets it for ITS fixtures; these cases are about the kick
-        os.environ["CC_CTX_RECORDS"] = RECORDS          # ...and the detached child's log line stays in here
-        os.environ["HOME"] = os.path.join(d, "fakehome")   # ...as does the journal line kick_lost() leaves
-        ok("start() leaves a detached child to brief the successor",
-           any(isinstance(a, list) and a[-3:-1] == ["--kick", "r1"] for a in msgs))
-        ok("...and the successor's pane shell EXECS cc, so claude is the pane's direct child — where cc-msg looks "
-           "(forked, it was a grandchild and every automatic kick was refused)",
-           re.search(r" exec \S*cc __runnext ", nw[-1]) and not nw[-1].endswith("exec bash"))
-        nid = wins["r1~next"]
-        panes[nid] = IDLE
-        ok("a successor at its prompt gets its opening prompt — a brief in the system prompt starts no turn",
-           kick("r1", "abc") == 0)
-        last = [a for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg")][-1]
-        ok("...typed into r1~next, ITS window, naming what it is the successor of",
-           last[1] == "r1~next" and "SUCCESSOR for r1" in last[2])
-        ok("...and leading with the machine tag, so the successor does not spend its first turn declining an "
-           "owner row about its own startup (a121, a126, a131)", last[2].startswith(MACHINE))
-        t = last[2]
-        ok("...and landing is checked by reading the pane BACK", landed(nid, t))
-        wrap = "\n".join(t[i:i + 17] for i in range(0, len(t), 17))   # the TUI wraps at the pane width
-        panes[nid] = "> " + wrap + "\n\n⏺ Read(progress.md)\n" + IDLE
-        ok("...a wrapped echo above the successor's first tool line counts as landed", landed(nid, t))
-        panes[nid] = "│ > " + t[:40] + "\n│   " + t[40:80] + "\n  " + IDLE_HINT
-        ok("...but the text still SITTING in the input box does not — Enter was not taken (03:32Z's successor)",
-           not landed(nid, t))
-        panes[nid] = "Welcome to Claude Code\n" + IDLE
-        ok("...and a pane that never took it does not pass as landed", not landed(nid, t))
-        ok("the child's one log line stays inside the fixture — no test writes real state",
-           os.path.exists(os.path.join(RECORDS, "handoff.log")))
-
-        # An #alerts line is now a cc-notify call with the `alerts` KIND — the table puts that at rung 4, which
-        # is #alerts. Counting the channel name here would have gone green on a file that named it itself.
-        posts = lambda: sum(1 for a in msgs if isinstance(a, list) and a[1:3] == ["--kind", "alerts"])
-        typed = lambda: sum(1 for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg"))
-        told0, typed0 = posts(), typed()
-        panes[nid] = "Do you trust the files in this folder?\n  Enter to confirm · Esc to cancel"
-        ok("a prompt is never typed at an open dialog — that is the dialog eating it, again",
-           kick("r1", "abc") == 1 and typed() == typed0)
-        ok("...cc-slack is asked to press through THAT window first",
-           any(isinstance(a, list) and a[:3] == [os.path.join(BIN, "cc-slack"), "accept-dialog", "r1~next"]
-               for a in msgs))
-        ok("...and a successor left blank goes to #alerts, not left silent beside a live session",
-           posts() == told0 + 1)
-        jp = os.path.join(d, "fakehome", ".cc", "state", "r1", "planning-handoff.md")
-        ok("...and into the target's journal, where the next session reads first",
-           os.path.exists(jp) and "sitting blank in main:r1~next" in open(jp).read())
-        panes[nid] = lambda: ""                          # live, and never draws a thing
-        told0, typed0 = posts(), typed()
-        ok("a pane that never drew a prompt is NOT a dialog: one try at the deadline, judged by the pane — "
-           "which took nothing, so the owner hears", kick("r1", "abc") == 1 and typed() == typed0 + 1 and posts() == told0 + 1)
-
-        # THE LATE DIALOG, on the real loop with a fake clock: the pane is live from the first instant (the
-        # shell forked cc), Claude Code draws the dialog seconds later, and it clears only once pressed.
-        real_t, real_s = time.time, time.sleep
-        clk = [real_t()]
-        time.time = lambda: clk[0]
-        # a sub-second sleep is subprocess's own wait poll (cfg() shells out to cc-config): it sleeps for real and
-        # leaves the clock alone — on the fake clock it spun the child's whole run into minutes (flake, 2026-09-02)
-        time.sleep = lambda n: real_s(n) if 0 < n < 1 else clk.__setitem__(0, clk[0] + (n or 1))
-        os.environ["CC_HANDOFF_KICK_WAIT"] = "60"
-        tui["asked"].pop("r1~next", None)                # the earlier dialog's press is not this one's
-        t0 = clk[0]
-
-        def late():
-            if clk[0] - t0 < 4:
-                return ""                                        # booting: live, nothing drawn yet
-            asked = tui["asked"].get("r1~next")
-            if asked is None or clk[0] < asked + 3:
-                return DIALOG                                    # up until cc-slack presses it through
-            turns = [x for x in tui["typed"] if x[0] == nid and x[2] >= asked + 3]
-            return IDLE if not turns else "> " + turns[-1][1] + "\n\n✻ Thinking… (" + WORKING + ")\n" + BOX
-
-        panes[nid] = late
-        n0, typed0 = len(tui["typed"]), typed()
-        acc0 = sum(1 for a in msgs if isinstance(a, list) and a[1:3] == ["accept-dialog", "r1~next"])
-        rc = kick("r1", "abc")
-        sent = tui["typed"][n0:]
-        ok("a dialog that draws LATE is waited out: the prompt is typed once, after it has shown AND cleared",
-           rc == 0 and len(sent) == 1 and typed() == typed0 + 1
-           and sent[0][2] >= tui["asked"]["r1~next"] + 3 and clk[0] - t0 < 60)
-        ok("...and cc-slack was asked to press it through, once",
-           sum(1 for a in msgs if isinstance(a, list) and a[1:3] == ["accept-dialog", "r1~next"]) == acc0 + 1)
-        tui["asked"].pop("r1~next"); t0 = clk[0]
-        panes[nid] = lambda: "" if clk[0] - t0 < 4 else DIALOG   # a dialog nobody's Enter ever clears
-        n0, told0 = len(tui["typed"]), posts()
-        ok("...a dialog that never clears is never typed at, and the owner hears within the wait",
-           kick("r1", "abc") == 1 and len(tui["typed"]) == n0 and posts() == told0 + 1 and clk[0] - t0 <= 62)
-        time.time, time.sleep = real_t, real_s
-
-        # THE HANDOVER LINE IS THE TABLE'S TO PLACE. This file used to name #alerts itself, which meant the line
-        # skipped the table and the test-state rule had to be copied in beside it; both are cc-notify's now.
-        n0 = posts(); alert("r1/t1", "🔁 r1/t1: handover — the successor is live")
-        ok("a handover line goes out as the `alerts` KIND, which the table places at rung 4 (#alerts) — this "
-           "file names no channel of its own", posts() == n0 + 1)
-        ok("...under a title the table can read: its SECOND word decides the kind, and the emoji the line "
-           "carries is kept out of it (the title '🔁 r1/t1: handover' filed every handover ambient)",
-           msgs[-1][msgs[-1].index("-t") + 1] == "r1/t1 handover" and msgs[-1][-1].startswith("🔁"))
-        ok("...and it is one cc-notify call, so the synthetic-name and log-only rules that live at that one "
-           "door are the only copy of them", msgs[-1][0].endswith("cc-notify") and len(msgs[-1]) == 6)
-        for k, v in env1.items():
-            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-
-        os.environ["CC_HANDOFF"] = "wrong-id"
-        ok("--ready from a session whose CC_HANDOFF does not match is refused", ready("r1") == 1)
-        ok("...and the predecessor is still live", read("r1")["live"] == "predecessor")
-
-        os.environ["CC_HANDOFF"] = rec["id"]
-        ok("--ready with no target finds the record by CC_HANDOFF", by_id(rec["id"])["target"] == "r1")
-        ok("the successor cuts over", ready() == 0)
-        ok("the commit point moved ownership forward", read("r1")["live"] == "successor")
-        ok("the predecessor was told to journal and exit",
-           any("cc-msg" in a[0] for a in msgs if isinstance(a, list)))
-        # THE OVERLAP ENDS AT THE READY SIGNAL, not at the deadline: --ready is the successor saying its one
-        # batch is answered, and the retirement is started from the commit point itself.
-        ok("--ready retires the predecessor there and then — the deadline is the other way out, not the way",
-           any(isinstance(a, list) and a[-2:] == ["--retire", "r1"] for a in msgs))
-        ok("...and the quiet marks come off with the name: `r1` is the SUCCESSOR's now, and a live session left "
-           "out of the drive loop is worse than the wakes this saved",
-           not os.path.exists(quiet_path("r1")) and read("r1")["quiet"] == [])
-        ok("--ready is idempotent, never a rollback", ready() == 0 and read("r1")["live"] == "successor")
-        ok("--abandon after cutover is refused", abandon("r1") == 1 and read("r1")["live"] == "successor")
-
-        lines = [json.loads(l) for l in open(os.path.join(RECORDS, "handoffs.jsonl"))]
-        ok("one ledger line per phase, and never two",     # of THIS handoff: the cases above open others
-           [l["kind"] for l in lines if l["target"] == "r1"] == ["overlap-started", "overlap-cutover"])
-
-        # a successor that dies before --ready: ownership never moved, so the predecessor never noticed
-        clear("r1")
-        os.environ.pop("CC_HANDOFF", None)
-        wins.pop("r1~next", None)
-        wins["r1"] = "@1"
-        ok("a fresh overlap opens once the last one is cleared", start("r1") == 0)
-        wins.pop("r1~next", None)                       # the successor's window is gone
-        ok("successor dead before --ready -> the predecessor is still live",
-           read("r1")["live"] == "predecessor" and ready("r1", forced=True) == 2)
-        ok("--due before the deadline does nothing", due("r1") == 0 and read("r1") is not None)
-
-        r = read("r1")
-        r["deadline"] = time.time() - 1
-        write(r)
-        told1 = sum(1 for m in msgs if m and m[0] == "notify")     # a count, not a total: the cases above tell the owner too
-        ok("--due past the deadline below the ceiling abandons", due("r1") == 0 and read("r1") is None)
-        ok("the owner heard it once", sum(1 for m in msgs if m and m[0] == "notify") == told1 + 1)
-        ok("--due on a cleared record is a no-op (never twice)", due("r1") == 0
-           and sum(1 for m in msgs if m and m[0] == "notify") == told1 + 1)
-
-        # at the ceiling with no successor: fall back INTO today's stop-then-restart path
-        wins["r1/t1"] = "@2"
-        start("r1/t1")
-        r = read("r1/t1")
-        r["deadline"] = time.time() - 1
-        write(r)
-        wins.pop("r1/t1~next", None)
-        due("r1/t1", over_ceiling=True)
-        ok("at the ceiling with no successor, the old path runs — and it is OURS now, not a call back into cc",
-           any(isinstance(a, list) and a[-2:] == ["--replace", "r1/t1"] for a in msgs))
-        ok("...and the record is cleared, so nothing stays gated", read("r1/t1") is None)
-
-        # ---- retirement DRAINS the predecessor, then ENDS it. A session cannot exit itself, so the drain
-        # expires into a KILL; and the names move at cutover, so an owner attaching lands on the live one.
-        os.environ["CC_HANDOFF_RETIRE_GRACE"] = "0"
-        os.environ["CC_HANDOFF_DRAIN"] = "0"
-
-        def cutover(t):
-            """a target at the moment after the commit point: predecessor alive, successor waiting"""
-            wins[t] = "@" + t
-            start(t)
-            os.environ["CC_HANDOFF"] = read(t)["id"]
-            ready(t)
-            return read(t)
-
-        def decide(payload):
-            """what --relay hands the hook back for this payload: the decision dict, or None for nothing"""
-            import io, contextlib
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                relay(payload)
-            return json.loads(buf.getvalue()) if buf.getvalue().strip() else None
-
-        relays = lambda: [a for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg") and a[2].startswith(RELAY_PREFIX)]
-
-        # ---- EVERY KIND OF SESSION THIS BOX STARTS, ALL THE WAY THROUGH -----------------------------------
-        # Until 2026-09-07 the grammar had room for two shapes out of three, so an ORCHESTRATOR asked about
-        # itself came back "is not a target": no orch had ever been handed off, one sat past the context
-        # ceiling with no successor and nothing on the box able to start one, and a person had to restart it by
-        # hand. A case that only asserts an address is ACCEPTED proves nothing about a handoff completing, so
-        # each kind here is driven the whole way — started, cut over, its names moved, retired.
-        os.environ.pop("CC_HANDOFF", None)
-        for addr, what in (("k1", "session"), ("k1@dash", "orch"), ("k1/t1", "track")):
-            ok(f"{addr} is an address, and it is {ARTICLE[what]}",
-               bool(TARGET_RE.match(addr)) and kind(addr) == what)
-            r = cutover(addr)
-            os.environ.pop("CC_HANDOFF", None)
-            ok(f"{ARTICLE[what]}: the overlap starts and the record names one live side",
-               bool(r) and r["target"] == addr and live_side(r) in ("predecessor", "successor")
-               and r["predecessor"]["window"] == addr + OLD)
-            ok(f"{ARTICLE[what]}: it reaches CUTOVER — the successor is live, once, on one record",
-               r["phase"] == "cutover" and live_side(r) == "successor"
-               and [l for l in open(os.path.join(RECORDS, "handoffs.jsonl"))
-                    if json.loads(l)["target"] == addr and json.loads(l)["kind"] == "overlap-cutover"])
-            ok(f"{ARTICLE[what]}: the names moved, so an owner attaching lands on the live session",
-               wins.get(addr) == r["successor"]["tmux"] and addr + OLD in wins and addr + NEXT not in wins)
-            ok(f"{ARTICLE[what]}: the ledger row keeps the repo whole and the address whole",
-               [json.loads(l) for l in open(os.path.join(RECORDS, "handoffs.jsonl"))
-                if json.loads(l)["target"] == addr][-1]["repo"] == "k1")
-            ok(f"{ARTICLE[what]}: it retires, and the predecessor's window goes with it",
-               retire(addr) == 0 and addr + OLD not in wins and wins.get(addr) == r["successor"]["tmux"])
-
-        # TWO LIVE SESSIONS IN ONE WORKTREE ARE TWO HANDOFFS. `k1` and `k1@dash` share a repo, a checkout and a
-        # Slack channel; only the alias tells them apart. Under one key an overlap open on either would refuse
-        # the other, both would journal into the same file, and the ledger could not say which was handed off.
-        ok("a session a person steers and an orchestrator beside it are separate records",
-           path("k1") != path("k1@dash") and slug("k1@dash") == "k1@dash")
-        ok("...and separate journals: a shared one hands each the other's handoff entry",
-           journal_for("k1") != journal_for("k1@dash") != journal_for("k1/t1"))
-
-        # A JOURNAL KEPT UNDER THE WRONG NAME IS NOT A MISSING JOURNAL. No prompt ever told an orch's own
-        # session where its running notes belonged (a track is handed `progress.md` outright; an orch is
-        # handed nothing), so at least one (lessons@lessons-site, seen live) kept a `-handover.md` of its own.
-        # Before this fix journal_for() only ever named `-handoff.md`, so `--brief` found nothing and printed
-        # the journal section empty over 230+ kB of real history sitting one word away.
-        with tempfile.TemporaryDirectory() as jd:
-            home0 = os.environ.get("HOME")
-            os.environ["HOME"] = jd
-            try:
-                st = os.path.join(jd, ".cc", "state", "j1")
-                os.makedirs(st)
-                ok("neither name exists yet: a fresh address still gets the canonical one",
-                   journal_for("j1@o") == "~/.cc/state/j1/o-handoff.md")
-                with open(os.path.join(st, "o-handover.md"), "w") as fh:
-                    fh.write("legacy journal\n")
-                ok("...a legacy '-handover.md' with no '-handoff.md' beside it is what gets read — the "
-                   "regression: an orch's real history was printing as '(none)'",
-                   journal_for("j1@o") == "~/.cc/state/j1/o-handover.md")
-                with open(os.path.join(st, "o-handoff.md"), "w") as fh:
-                    fh.write("canonical journal\n")
-                ok("...but the canonical name wins the moment it exists too, so the two never fork",
-                   journal_for("j1@o") == "~/.cc/state/j1/o-handoff.md")
-            finally:
-                if home0 is None:
-                    os.environ.pop("HOME", None)
-                else:
-                    os.environ["HOME"] = home0
-
-        wins["k2"], wins["k2@dash"] = "@k2", "@k2d"
-        ok("...and an overlap open on one does not refuse the other",
-           start("k2") == 0 and read("k2") and start("k2@dash") == 0 and read("k2@dash")
-           and read("k2")["id"] != read("k2@dash")["id"])
-        abandon("k2"); abandon("k2@dash")
-
-        # ONLY A TRACK HAS THE STOP-THEN-RESTART PATH, and the refusal has to say which kind it is talking to:
-        # "there is no path for a planning session" was printed at orchestrators too, which is how the one that
-        # needed a hand looked like a session that had already been considered.
-        wins["k3"], wins["k3@dash"] = "@k3", "@k3d"
-        errs = {}
-        for addr in ("k3", "k3@dash"):
-            import contextlib as _c, io as _io
-            e = _io.StringIO()
-            with _c.redirect_stderr(e), _c.redirect_stdout(_io.StringIO()):
-                errs[addr] = (replace(addr), e.getvalue())
-        ok("--replace refuses a session a person steers, and calls it that",
-           errs["k3"][0] == 1 and "a session a person steers" in errs["k3"][1])
-        ok("--replace refuses an ORCHESTRATOR, and calls it that — not a planning session",
-           errs["k3@dash"][0] == 1 and "an orchestrator" in errs["k3@dash"][1]
-           and "planning session" not in errs["k3@dash"][1])
-
-        os.environ["CC_ROLE"] = "worker"
-        ok("a HEADLESS run takes no phase at any address — a loop iteration and a steward's one-shot both "
-           "journal, end the turn, and let the next run start on a fresh context reading it",
-           all(start(a) == 1 and read(a) is None for a in ("k1", "k1@dash", "k1/t1")))
-        os.environ.pop("CC_ROLE", None)
-
-        # THE TRIPWIRE. A kind that stops being recognised — a new launcher, a window renamed by hand — is a
-        # session that can never be handed off and whose context shares a key with its neighbours. Nothing
-        # watched for that, which is the only reason it was true of every orchestrator for weeks.
-        ok("with every live window an address, nothing is reported as unaddressable",
-           [n for n, _, _ in unaddressable()] == [])
-        wins["not an address!"] = "@bad"
-        ok("a live session whose window name is no address at all is REPORTED, by name",
-           [n for n, _, _ in unaddressable()] == ["not an address!"])
-        wins["k5" + NEXT] = "@k5n"
-        ok("...and a side of a handoff in flight is not one of those — `orphans` owns those",
-           [n for n, _, _ in unaddressable()] == ["not an address!"])
-        del wins["not an address!"], wins["k5" + NEXT]
-
-        os.environ.pop("CC_HANDOFF", None)
-        wins["r2"] = "@r2"
-        ok("--retire with no record kills nothing", retire("r2") == 0 and wins.get("r2") == "@r2")
-        start("r2")
-        ok("--retire BEFORE cutover kills nothing", retire("r2") == 0 and wins.get("r2") == "@r2"
-           and read("r2") is not None)
-        me[0] = "@r2"
-        ok("...and a prompt into the predecessor before cutover is nobody's to relay",
-           decide({"prompt": "early", "session_id": ""}) is None and not relays())
-        me[0] = ""
-        clear("r2")
-        del wins["r2~next"]
-
-        r = cutover("r2")
-        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
-        ok("AT CUTOVER the predecessor is `<target>~old` and the successor holds `<target>` — an owner attaching "
-           "lands on the live one from the first instant",
-           wins.get("r2~old") == pre and wins.get("r2") == suc and "r2~next" not in wins)
-        ok("...and the record names the windows they hold now",
-           r["predecessor"]["window"] == "r2~old" and r["successor"]["window"] == "r2")
-        ren = [a for a in tcalls if a[0] == "rename-window" and "r2~old" in a]
-        ok("...both names move in ONE tmux call — no instant with no `<target>` window for a `cc <repo>` to fill",
-           len(ren) == 1 and ren[0].count("rename-window") == 2 and ren[0][-1] == "r2")
-        told = [a for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg") and a[1] == "r2~old"]
-        ok("...the predecessor is told, in ITS window, that it is retiring and that typing here is relayed",
-           told and "retiring" in told[-1][2] and "relayed" in told[-1][2])
-        ok("...and it too leads with the machine tag: the retiring session's stop message opened an owner row "
-           "as well (a132)", told and told[-1][2].startswith(MACHINE))
-        ok("a predecessor still alive past the drain is ENDED, and only the successor holds the name",
-           retire("r2") == 0 and wins.get("r2") == suc and "r2~old" not in wins and "r2~next" not in wins)
-        ok("...the record is cleared afterwards, so nothing stays gated", read("r2") is None)
-        ok("...and the completed retirement is remembered where clear() cannot reach it (2026-08-31: a "
-           "finished handoff gated the only session left)", os.path.exists(done_path(r["id"])))
-        marked = done_path(r["id"])
-        ok("one ledger line for the retirement",
-           [json.loads(l)["kind"] for l in open(os.path.join(RECORDS, "handoffs.jsonl"))][-1] == "overlap-retired")
-
-        r = cutover("r3")
-        dead.add("r3~old")                              # /exit was typed: the window is a bare shell now
-        ok("a predecessor that already exited still ends, renames and clears",
-           retire("r3") == 0 and wins.get("r3") == r["successor"]["tmux"] and "r3~old" not in wins
-           and read("r3") is None)
-
-        # kick() spools the opening prompt under the STARTUP name; cutover moves it to the live name, and
-        # retirement removes mail addressed to the dead ~old window (review-157b: both were stranded forever).
-        os.makedirs(os.path.join(STATE, "r9~next"), exist_ok=True)
-        with open(os.path.join(STATE, "r9~next", "inbox.spool"), "w") as fh:
-            fh.write('{"text":"opening prompt"}\n')
-        r = cutover("r9")
-        ok("cutover moves the ~next spool to the live name — the opening prompt is not stranded by the rename",
-           not os.path.exists(os.path.join(STATE, "r9~next"))
-           and open(os.path.join(STATE, "r9", "inbox.spool")).read() == '{"text":"opening prompt"}\n')
-        # ...and it takes cc-msg's own lock while it does it: the 60 s drain rewrites that same file as tail+mv,
-        # so an append the drain did not see is replaced by its mv — and the rmtree then deletes the only copy.
-        held, _fl = [], fcntl.flock
-        fcntl.flock = lambda fh, op: held.append((getattr(fh, "name", ""), op,
-                                                  os.path.exists(os.path.join(STATE, "r14", "inbox.spool"))))
-        try:
-            os.makedirs(os.path.join(STATE, "r14~next"), exist_ok=True)
-            with open(os.path.join(STATE, "r14~next", "inbox.spool"), "w") as fh:
-                fh.write('{"text":"opening prompt"}\n')
-            cutover("r14")
-        finally:
-            fcntl.flock = _fl
-        ok("...holding cc-msg's own .inbox.lock, taken before a byte is written and released after the ~next dir "
-           "is gone — outside it the drain's mv wins and the moved prompt is deleted with the dir it came from",
-           held[:1] == [(os.path.join(STATE, "r14", ".inbox.lock"), fcntl.LOCK_EX, False)]
-           and open(os.path.join(STATE, "r14", "inbox.spool")).read() == '{"text":"opening prompt"}\n'
-           and not os.path.exists(os.path.join(STATE, "r14~next")))
-
-        os.makedirs(os.path.join(STATE, "r9~old"), exist_ok=True)
-        with open(os.path.join(STATE, "r9~old", "inbox.spool"), "w") as fh:
-            fh.write('{"text":"retire msg"}\n')
-        ok("...and retirement leaves no ~old junk: mail addressed to the dead window dies with it",
-           retire("r9") == 0 and not os.path.exists(os.path.join(STATE, "r9~old")))
-
-        # ---- THE ROWS IT WAS WORKING IN ITS OWN SUBAGENTS COME WITH IT. The cutover rename ends every `agent`
-        # mark the predecessor made, while those subagents are still running and still reporting into the
-        # successor: ten minutes later the watchdog called five such rows abandoned and blocked them, and a
-        # blocked row is offered for dispatch again (2026-09-07, twice in one hour). carry_marks() hands them
-        # over — and the two rows it must leave alone are the ones these cases are really about.
-        boardf, hcalls = {}, []
-
-        def out(argv, timeout=25, cwd=None, fail=""):
-            if argv[0].endswith("cc-board") and argv[1] == "json":
-                return json.dumps(boardf.get(argv[2]) or {"tracks": {}})
-            if argv[0].endswith("cc-board") and argv[1] == "handover":
-                hcalls.append(list(argv[2:]))          # cc-board owns the write and its own exact-match rule
-                repo, frm, to, names = argv[2], argv[3], argv[4], argv[5:]
-                mv = [t for t in names if (boardf[repo]["tracks"][t].get("agent") or "") == frm]
-                for t in mv:
-                    boardf[repo]["tracks"][t]["agent"] = to
-                return "\n".join(mv)
-            return real_out(argv, timeout=timeout, cwd=cwd, fail=fail)
-
-        home0 = os.environ.get("HOME")
-        os.environ["HOME"] = os.path.join(d, "fakehome")   # journal() writes under ~, and never the real one
-        try:
-            boardf["r15"] = {"tracks": {
-                "sub":    {"status": "running", "agent": "@r15:900"},    # the predecessor's own subagent
-                "worked": {"status": "running", "agent": "@r15:900"},    # …and a real worker is in this one
-                "third":  {"status": "running", "agent": "@r150:900"},   # another session, one digit along
-                "free":   {"status": "queued"},                          # nobody's
-            }}
-            wins["r15/worked"] = "@w15"                 # the track's own window, live: how the watchdog reads a worker
-            r = cutover("r15")
-            suc15 = r["successor"]["tmux"] + ":900"
-            ok("a row the retiring session held in a subagent is the SUCCESSOR's after cutover — five such rows "
-               "were blocked as abandoned ten minutes after one (2026-09-07)",
-               hcalls == [["r15", "@r15:900", suc15, "sub"]]
-               and boardf["r15"]["tracks"]["sub"]["agent"] == suc15)
-            # …and these three are asked of what carry_marks NAMED, not only of what came back: a row it should
-            # never have offered is a bug here even when cc-board's own exact match happens to spare it.
-            named = [t for c in hcalls for t in c[3:]]
-            ok("...a row marked by a THIRD session is never even offered, and a prefix would have offered it "
-               "(`@r15` is the head of `@r150`): the whole mark is compared, never the window id alone",
-               "third" not in named and boardf["r15"]["tracks"]["third"]["agent"] == "@r150:900")
-            ok("...nor is a row a real worker is in — that work is not this handoff's to move",
-               "worked" not in named and boardf["r15"]["tracks"]["worked"]["agent"] == "@r15:900")
-            ok("...and a row nobody marked is not claimed: nothing is held that was not held before",
-               "free" not in named and not boardf["r15"]["tracks"]["free"].get("agent"))
-            jp15 = os.path.expanduser(journal_for("r15"))   # a regression is ONE red case, never a suite that dies
-            jrn = open(jp15).read() if os.path.exists(jp15) else ""
-            ok("...the journal says which rows moved, so the successor can see it did", "sub" in jrn
-               and "successor's now" in jrn)
-            derive(read("r15"))
-            ok("...and a retried derive() moves nothing: the marks are the successor's already",
-               len(hcalls) == 1)
-        finally:
-            out = real_out
-            clear("r15")
-            for w in ("r15/worked", "r15~old", "r15"):   # the window count is what the stub numbers new ids from
-                wins.pop(w, None)
-            os.environ.pop("CC_HANDOFF", None)
-            if home0 is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = home0
-
-        r = cutover("r4")
-        me[0] = r["predecessor"]["tmux"]                # --retire called from the very window it would kill
-        ok("--retire never kills the pane it is called from",
-           retire("r4") == 1 and wins.get("r4~old") == r["predecessor"]["tmux"] and read("r4") is not None)
-        ok("...and a refused kill leaves no completion marker: the successor stays gated",
-           not os.path.exists(done_path(r["id"])))
-        ok("...the drain is over, so a prompt typed there is REFUSED with the pointer, not relayed",
-           read("r4")["phase"] == "retired" and (decide({"prompt": "hello?", "session_id": ""}) or {}).get("decision")
-           == "block" and "retired — use window r4" in decide({"prompt": "hello?"})["reason"] and not relays())
-        ok("...but /exit still reaches it: that is how a human ends a TUI", decide({"prompt": "/exit"}) is None)
-        me[0] = ""
-        r["predecessor"]["tmux"] = r["successor"]["tmux"]   # the record names one window on both sides
-        write(r)
-        ok("a record naming the same window on both sides kills nothing", retire("r4") == 1
-           and wins.get("r4") == r["successor"]["tmux"] and read("r4") is not None)
-        r["predecessor"]["tmux"] = "@somebody-else"     # the record names a window that is not there
-        write(r)
-        ok("a record naming a window that is not there kills nothing — whatever holds `~old` is left alone",
-           retire("r4") == 0 and wins.get("r4~old") == "@r4" and wins.get("r4") == r["successor"]["tmux"])
-        wins.pop("r4~old")
-
-        r = cutover("r6")
-        wins["r6-renamed"] = wins.pop("r6~old")          # its window no longer carries the retiring name
-        ok("a predecessor whose window was renamed by hand is still ended, by the id the record names",
-           retire("r6") == 0 and r["predecessor"]["tmux"] not in wins.values()
-           and wins.get("r6") == r["successor"]["tmux"] and read("r6") is None)
-
-        wins["r13"] = "@r13"
-        start("r13")
-        rr = read("r13"); nid = rr["successor"]["tmux"]; rr["successor"]["tmux"] = ""; write(rr)
-        os.environ["CC_HANDOFF"] = rr["id"]
-        ok("a record with no successor id still renames it at cutover, by its `~next` name — and learns the id",
-           ready("r13") == 0 and wins.get("r13") == nid and "r13~next" not in wins
-           and read("r13")["successor"]["tmux"] == nid)
-        os.environ.pop("CC_HANDOFF", None)
-        clear("r13"); wins.pop("r13~old", None); wins.pop("r13", None)
-
-        r = cutover("r5")
-        os.environ["CC_HANDOFF_DONE_TTL"] = "0"         # every marker is now older than the TTL
-        retire("r5")
-        ok("a completion marker is pruned once no session can still be holding that id",
-           os.path.exists(done_path(r["id"])) and not os.path.exists(marked))
-        os.environ.pop("CC_HANDOFF_DONE_TTL", None)
-
-        # ---- THE DRAIN: what reaches the predecessor between cutover and its end goes to the successor.
-        # 02:2xZ, 2026-09-01: the owner's question, typed a minute before the kill, was seen by nobody.
-        env2 = {k: os.environ.get(k) for k in ("HOME", "CC_CTX_RECORDS")}
-        os.environ["HOME"] = os.path.join(d, "fakehome")
-        os.environ["CC_CTX_RECORDS"] = RECORDS
-        os.environ["CC_HANDOFF_DRAIN"] = "600"
-        r = cutover("r7")
-        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
-        me[0] = pre                                     # the hook runs in the predecessor's pane
-        panes[suc] = IDLE
-        n0 = len(relays())
-        dec = decide({"prompt": "where did the PR land?", "session_id": ""})
-        ok("DURING THE DRAIN a prompt typed into the retiring session reaches the successor's window — "
-           "`<target>`, which the successor holds — marked as relayed",
-           len(relays()) == n0 + 1 and relays()[-1][1] == "r7"
-           and relays()[-1][2] == RELAY_PREFIX + "where did the PR land?")
-        ok("...NOT tagged as machine chatter — they are the owner's own words, and the row for them belongs to "
-           "the successor that now answers them", not relays()[-1][2].startswith(MACHINE))
-        ok("...and is blocked locally with the pointer, so it is answered exactly once",
-           dec and dec.get("decision") == "block" and "relayed to r7" in dec.get("reason", ""))
-        ok("...keyed on the pane ($TMUX_PANE), which works with the session_id EMPTY in the record",
-           r["predecessor"]["session_id"] == "" and read("r7") is not None)
-        ok("a multi-line prompt is relayed as one line — a newline typed into the TUI would submit early",
-           decide({"prompt": "first\nsecond"}) and relays()[-1][2].endswith("first second"))
-        n0 = len(relays())
-        ok("a slash command is for THIS TUI (/exit is how a human ends it): not relayed, not blocked",
-           decide({"prompt": "/exit"}) is None and len(relays()) == n0)
-        ok("the handoff's own line to the predecessor is never relayed back",
-           decide({"prompt": RETIRE_MSG.format(target="r7", old="r7~old")}) is None and len(relays()) == n0)
-        # one case per shape: relayed, the successor's own message to the predecessor was blocked there and typed
-        # back into the successor, and the predecessor lost its task notifications mid-journal (review of #140)
-        for shape in NOT_A_PERSON:
-            ok(f"a turn the harness or a peer wrote ({shape}…) is neither relayed nor blocked",
-               decide({"prompt": f"{shape} from=\"peer\">\nplease add the failing track to the board"}) is None
-               and len(relays()) == n0)
-        me[0] = suc
-        ok("the SUCCESSOR's own prompts are its own: nothing relayed, nothing blocked",
-           decide({"prompt": "carry on"}) is None and len(relays()) == n0)
-        me[0] = "@unrelated"
-        ok("...nor another session's, and an empty session_id matches nothing",
-           decide({"prompt": "carry on", "session_id": ""}) is None and len(relays()) == n0)
-        me[0] = ""
-        rr = read("r7"); rr["predecessor"]["session_id"] = "sid-p"; write(rr)
-        ok("with no pane to go on, the payload's session_id still identifies the predecessor",
-           (decide({"prompt": "by sid", "session_id": "sid-p"}) or {}).get("decision") == "block"
-           and len(relays()) == n0 + 1)
-        me[0] = pre
-        panes[suc] = DIALOG                             # the successor cannot take keys right now
-        n0 = len(tui["typed"])                          # what LANDED, not what was tried
-        jp = os.path.join(d, "fakehome", ".cc", "state", "r7", "planning-handoff.md")
-        ok("a relay the successor cannot take is NOT blocked: the retiring session answers it itself",
-           decide({"prompt": "still there?"}) is None and len(tui["typed"]) == n0)
-        ok("...and the journal keeps the text, so nothing typed is lost",
-           os.path.exists(jp) and "still there?" in open(jp).read())
-        panes[suc] = IDLE
-        me[0] = ""
-        clear("r7")
-        wins.pop("r7~old", None); wins.pop("r7", None)
-
-        # the drain's clock: idle ends it early, work runs it to the end, and the kill comes after either
-        real_t, real_s = time.time, time.sleep
-        clk = [real_t()]
-        time.time = lambda: clk[0]
-        # a sub-second sleep is subprocess's own wait poll (cfg() shells out to cc-config): it sleeps for real and
-        # leaves the clock alone — on the fake clock it spun the child's whole run into minutes (flake, 2026-09-02)
-        time.sleep = lambda n: real_s(n) if 0 < n < 1 else clk.__setitem__(0, clk[0] + (n or 1))
-        os.environ["CC_HANDOFF_RETIRE_GRACE"] = "120"
-        r = cutover("r8")
-        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
-        t0 = clk[0]
-        panes[pre] = "❯ journalled, done.\n\n──────\n❯\u00a0\n──────\n  auto mode on (shift+tab to cycle)"
-        ok("an idle predecessor with nothing typed is ended once the grace is up — not the whole drain",
-           retire("r8") == 0 and 120 <= clk[0] - t0 < 600 and pre not in wins.values()
-           and wins.get("r8") == suc and read("r8") is None)
-        me[0] = pre
-        ok("AFTER THE DRAIN the window is gone and a prompt there has no record to go by",
-           decide({"prompt": "too late"}) is None)
-        me[0] = ""
-        r = cutover("r9")
-        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
-        t0 = clk[0]
-        panes[pre] = "❯ working\n\n✻ Thinking… (" + WORKING + ")\n──────\n❯\u00a0\n──────"
-        ok("a turn in flight is never cut short: the predecessor runs to the end of the drain, then ends",
-           retire("r9") == 0 and clk[0] - t0 >= 600 and pre not in wins.values() and read("r9") is None)
-        r = cutover("r10")
-        pre = r["predecessor"]["tmux"]
-        t0 = clk[0]
-        panes[pre] = "──────\n❯ half a question typed and not yet sen\n──────\n  auto mode on"
-        ok("text sitting in the input box is not idle — it waits for the drain too",
-           retire("r10") == 0 and clk[0] - t0 >= 600 and read("r10") is None)
-        r = cutover("r11")
-        pre = r["predecessor"]["tmux"]
-        t0 = clk[0]
-        panes[pre] = "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel"
-        ok("...and neither is a dialog waiting for a key", retire("r11") == 0 and clk[0] - t0 >= 600)
-        r = cutover("r12")
-        pre = r["predecessor"]["tmux"]
-        panes[pre] = IDLE                               # the older TUI: `>` and a placeholder in the box
-        t0 = clk[0]
-        ok("the older TUI's empty box (`>` and a placeholder) reads as idle too",
-           retire("r12") == 0 and 120 <= clk[0] - t0 < 600)
-
-        # ---- THE PREDECESSOR STAYS FOR ITS SUBAGENTS: the successor is live for the channel from cutover, the
-        # old session keeps running to hand each report on, and its retirement waits for the last one.
-        env3 = {k: os.environ.get(k) for k in ("CC_HANDOFF_TASKS", "CC_HANDOFF_AGENT_IDLE", "CC_HANDOFF_AGENT_MAX")}
-        troot = os.path.join(d, "tasks-root")
-        tasks = os.path.join(troot, "project", "sid-sub", "tasks")
-        os.makedirs(tasks)
-        os.environ["CC_HANDOFF_TASKS"] = troot
-        os.environ["CC_HANDOFF_AGENT_IDLE"] = "600"
-        for name, quiet in (("a-live", 0), ("a-quiet", -4000)):
-            t = os.path.join(d, name + ".jsonl")
-            open(t, "w").close()
-            os.utime(t, (clk[0] + quiet, clk[0] + quiet))   # mtimes on the FAKE clock these cases run on
-            os.symlink(t, os.path.join(tasks, name + ".output"))
-        open(os.path.join(tasks, "b-background.output"), "w").close()   # a background command, not a subagent
-        os.symlink(os.path.join(d, "no-such.jsonl"), os.path.join(tasks, "a-gone.output"))
-        ok("a subagent is a task file that is a live SYMLINK — a background command, a dangling link and a "
-           "transcript gone quiet are not", subagents("sid-sub") == ["a-live"])
-        ok("an unknown session id, or one with no task files, reads as no subagents — and the handoff is then "
-           "exactly the one it was before", subagents("") == [] and subagents("sid-none") == [])
-
-        def cutover_sub(t):
-            """cutover(), for a predecessor whose session id is the one the fixture's subagents belong to"""
-            wins[t] = "@" + t
-            start(t)
-            rr = read(t); rr["predecessor"]["session_id"] = "sid-sub"; write(rr)
-            os.environ["CC_HANDOFF"] = rr["id"]
-            ready(t)
-            os.environ.pop("CC_HANDOFF", None)
-            return read(t)
-
-        said = lambda w: [a for a in msgs if isinstance(a, list) and a[0].endswith("cc-msg") and a[1] == w]
-        r = cutover_sub("r20")
-        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
-        jp20 = os.path.expanduser("~/.cc/state/r20/planning-handoff.md")
-        ok("AT CUTOVER the successor is live exactly as ever — the channel never waits for a subagent",
-           live_side(r) == "successor" and wins.get("r20") == suc and wins.get("r20~old") == pre)
-        ok("...but a predecessor with one still running is told to STAY and hand each report on, not that it "
-           "is retiring", said("r20~old") and said("r20~old")[-1][2].startswith(MACHINE)
-           and "STAY" in said("r20~old")[-1][2] and "subagents are still running" in said("r20~old")[-1][2]
-           and "retiring" not in said("r20~old")[-1][2])
-        ok("...the record names what holds it, so --retire acts on that one answer from its own process",
-           read("r20").get("held") == ["a-live"])
-        ok("...and the journal says the successor is live and this session is staying",
-           "stays for the 1 subagent" in open(jp20).read())
-        ok("...and the #alerts line says it is staying, not that it is retiring",
-           any(a[1:3] == ["--kind", "alerts"] and "staying for 1 subagent" in a[-1]
-               for a in msgs if isinstance(a, list) and len(a) > 4))
-        n20 = len(said("r20~old"))
-        ok("a retried --ready re-derives, but says nothing twice: no second STAY message, no second journal line",
-           ready("r20") == 0 and len(said("r20~old")) == n20
-           and open(jp20).read().count("this session stays for the") == 1)
-        panes[pre] = IDLE                               # idle from the first read: only the stay holds it now
-        t0, n20 = clk[0], len(said("r20~old"))
-        ok("RETIREMENT WAITS: while a subagent is alive the predecessor keeps its window, and it ends only "
-           "once the last one is done", retire("r20") == 0 and 600 <= clk[0] - t0 < 600 + 600 + 60
-           and pre not in wins.values() and wins.get("r20") == suc and read("r20") is None)
-        ok("...the final handoff message comes at the END of the stay, not at cutover",
-           len(said("r20~old")) == n20 + 1 and "retiring" in said("r20~old")[-1][2])
-        ok("...and the journal says what ended it", "last subagent finished" in open(jp20).read())
-
-        os.environ["CC_HANDOFF_AGENT_IDLE"] = "100000"  # nothing in the fixture ever goes quiet now
-        os.environ["CC_HANDOFF_AGENT_MAX"] = "300"
-        r = cutover_sub("r21")
-        pre = r["predecessor"]["tmux"]
-        jp21 = os.path.expanduser("~/.cc/state/r21/planning-handoff.md")
-        panes[pre] = IDLE
-        t0 = clk[0]
-        ok("a stay is BOUNDED: a subagent that never finishes does not keep the window forever",
-           retire("r21") == 0 and 300 <= clk[0] - t0 < 300 + 600 + 60 and pre not in wins.values()
-           and read("r21") is None)
-        ok("...and the journal says the wait ran out, not that the work finished",
-           "the wait ran out" in open(jp21).read())
-        r = cutover_sub("r22")
-        pre = r["predecessor"]["tmux"]
-        dead.add("r22~old")                             # /exit was typed: nobody is left to hand a report to
-        t0 = clk[0]
-        ok("a stay ends the moment that session is gone — a report has nowhere to go either way",
-           retire("r22") == 0 and clk[0] - t0 < 300 and read("r22") is None)
-        ok("the sweep's clock waits a stay out too: cutover plus the stay's cap, then the stay's own end",
-           drain_start({"cutover": 1000, "held": ["a"]}, 3600) == 4600
-           and drain_start({"cutover": 1000}, 3600) == 1000
-           and drain_start({"cutover": 1000, "held": ["a"], "drain_from": 5000}, 3600) == 5000)
-        for k, v in env3.items():
-            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-
-        time.time, time.sleep = real_t, real_s
-        os.environ["CC_HANDOFF_RETIRE_GRACE"] = "0"
-        os.environ["CC_HANDOFF_DRAIN"] = "0"
-        for k, v in env2.items():
-            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-        os.environ.pop("CC_HANDOFF", None)
-
-        # ---- --event: cc-context measures and says which LINE was crossed; the PHASE is decided here
-        ov0 = os.environ.get("CC_HANDOFF_OVERLAP")
-        os.environ["CC_HANDOFF_OVERLAP"] = "1"
-        wins["e1/t"] = "@e1"
-        ok("the journal line is a nudge, not a phase", event("e1/t", "journal", live=True) == ""
-           and read("e1/t") is None)
-        ok("no live window, no phase — a headless worker's loop is its handoff", event("e1/t", "handoff") == "")
-        ok("the handoff line starts the successor ALONGSIDE, work in flight or not",
-           event("e1/t", "handoff", 41.0, "sid-e", "uncommitted work in t", live=True) == "overlap"
-           and read("e1/t")["live"] == "predecessor")
-        ok("...and what is unfinished RIGHT NOW goes into its brief",
-           "uncommitted work in t" in open(brief_path("e1/t")).read())
-        ok("...while it is open, no second phase is taken for that target",
-           event("e1/t", "ceiling", live=True) == "")
-        clear("e1/t")
-        wins.pop("e1/t~next", None)
-        os.environ["CC_HANDOFF_OVERLAP"] = "0"
-        ok("with the overlap off the event fails INTO the old path — and it is ours to run",
-           event("e1/t", "handoff", live=True) == "replace"
-           and any(isinstance(a, list) and a[-2:] == ["--replace", "e1/t"] for a in msgs))
-        ok("...which is the one that HAS to wait for idle, so work in flight defers it",
-           event("e1/t", "handoff", busy="uncommitted work in t", live=True) == "")
-        ok("a planning session has no stop-then-restart path to fall into", event("e1", "ceiling", live=True) == "")
-        # ---- a headless cc-loop iteration takes NO phase, ever. Its window is live because the LOOP is in it.
-        wins["e1"] = "@e1p"
-        os.environ["CC_HANDOFF_OVERLAP"] = "1"
-        os.environ["CC_ROLE"] = "worker"
-        ok("the trigger is a no-op for a worker iteration — its loop is its handoff, and an overlap here left "
-           "an interactive successor sitting in the track window (2026-09-01, spend-tracker)",
-           event("e1/t", "handoff", 41.0, "sid-w", live=True) == "" and read("e1/t") is None)
-        ok("...at the ceiling too: nothing about a worker is worth a second session",
-           event("e1/t", "ceiling", 61.0, "sid-w", live=True) == "" and read("e1/t") is None)
-        ok("...and asked outright, --overlap refuses it rather than half-starting one",
-           start("e1/t", pct=61.0) == 1 and read("e1/t") is None and "e1/t~next" not in wins)
-        os.environ.pop("CC_ROLE", None)
-        ok("a planning session at the same line still gets its successor",
-           event("e1", "handoff", 41.0, "sid-p", live=True) == "overlap" and read("e1") is not None)
-        clear("e1")
-        wins.pop("e1~next", None)
-        os.environ["CC_HANDOFF_OVERLAP"] = "0"
-        ok("a session that already took a phase only runs the watchdog",
-           event("e1/t", "ceiling", live=True, taken=True) == "")
-        os.environ["CC_HANDOFF"] = "somebody-elses-handoff"
-        ok("the SUCCESSOR never drives the handoff it is the second half of",
-           event("e1/t", "ceiling", live=True) == "" and read("e1/t") is None)
-        # …while it is OPEN. $CC_HANDOFF outlives the handoff (it dies with the successor's PROCESS), so read
-        # as a bare flag it made the overlap a one-shot per target and the box's own handoff had to be started
-        # by hand — 2026-09-01. <id>.done, the marker retirement leaves, is the whole difference.
-        os.environ["CC_HANDOFF_OVERLAP"] = "1"
-        open(os.path.join(HANDOFF, "somebody-elses-handoff.done"), "w").write("{}")
-        ok("once its own handoff has RETIRED, the successor hands off in ITS turn",
-           event("e1/t", "handoff", live=True) == "overlap" and read("e1/t") is not None)
-        clear("e1/t")
-        wins.pop("e1/t~next", None)
-        os.environ["CC_HANDOFF"] = "../../../etc/passwd"
-        ok("a $CC_HANDOFF that is not a record id holds like an open one — no path is built from it either",
-           mid_handoff() and event("e1/t", "handoff", live=True) == "" and read("e1/t") is None)
-        os.environ.pop("CC_HANDOFF", None)
-
-        # ---- an overlap that DIED is tried again at the next five-percent line, not waited out to the ceiling.
-        # 2026-09-05: the 40% overlap died on a permission prompt, the predecessor's handoff was already "taken",
-        # and there was nothing between it and 60%.
-        wins["e2/t"] = "@e2"
-        ok("the 40% line still starts the first overlap, exactly as before",
-           event("e2/t", "handoff", 41.0, live=True) == "overlap")
-        abandon("e2/t")
-        ok("an abandoned overlap leaves the predecessor in charge, and the LEDGER is what says so",
-           read("e2/t") is None and retryable("e2/t"))
-        ok("a phase already taken is still not re-taken by an ordinary crossing",
-           event("e2/t", "handoff", 46.0, live=True, taken=True) == "" and read("e2/t") is None)
-        ok("...but the 45% line is a RETRY: it starts a second overlap, the same way 40% started the first",
-           event("e2/t", "handoff", 46.0, live=True, taken=True, retry=True) == "overlap"
-           and read("e2/t") is not None)
-        ok("a retry line while an overlap is OPEN starts nothing — one successor at a time, never a chain",
-           event("e2/t", "handoff", 51.0, live=True, taken=True, retry=True) == ""
-           and read("e2/t")["pct_at_start"] == 46.0)
-        abandon("e2/t")
-        ok("...and the next line does the same again if that attempt dies too",
-           event("e2/t", "handoff", 51.0, live=True, taken=True, retry=True) == "overlap"
-           and read("e2/t")["pct_at_start"] == 51.0)
-        ok("every attempt is its own overlap on the ledger, so a count of them is still a `wc -l`",
-           len([l for l in open(os.path.join(RECORDS, "handoffs.jsonl"))
-                if json.loads(l).get("target") == "e2/t" and json.loads(l).get("kind") == "overlap-started"]) == 3)
-        clear("e2/t")
-        wins.pop("e2/t~next", None)
-        cutover("e3/t")
-        os.environ.pop("CC_HANDOFF", None)
-        clear("e3/t")                              # as retirement leaves it: cut over, no record left
-        ok("a target that CUT OVER is never retried — the successor holds that window now, and a second "
-           "overlap would be started against IT",
-           last_overlap("e3/t") and not retryable("e3/t")     # it HAD one: "no rows" says no too, and differently
-           and event("e3/t", "handoff", 46.0, live=True, taken=True, retry=True) == "")
-        ok("...and a target that never had an overlap at all is not 'retryable' either", not retryable("e4/t"))
-        os.environ["CC_HANDOFF_OVERLAP"] = "0"
-
-        # ---- --sweep: what no session is left to finish. It only ever UN-GATES, so a wrong "gone" is the
-        # expensive direction and every case below is about not taking one.
-        os.environ["CC_HANDOFF_DRAIN"] = "600"           # the section's grace stays 0: a real drain, or every
-        r = cutover("s1")                                # fresh cutover below reads as "outlived its drain"
-        ok("a record whose predecessor is still there is left alone", sweep() == 0 and read("s1") is not None)
-        pw = wins["s1~old"]
-        del wins["s1~old"]                              # the predecessor is gone: --retire never got to finish
-        ok("one sweep alone never finalizes — a single misread must not un-gate the successor",
-           sweep() == 0 and read("s1") is not None and bool(read("s1").get("gone_since")))
-        wins["s1~old"] = pw                             # it came back: the "gone" was a misread
-        ok("...a predecessor seen again withdraws the stamp",
-           sweep() == 0 and read("s1") is not None and not read("s1").get("gone_since"))
-        del wins["s1~old"]
-        sweep()                                         # strike one: the stamp
-        rr = read("s1"); rr["gone_since"] = time.time() - 301; write(rr)   # a sweep later, still nobody
-        ok("a predecessor gone past the grace is finalized (two sweeps apart)", sweep() == 0 and read("s1") is None)
-        ok("...and the handover leaves one line in #alerts (owner, 2026-09-01) — as an `alerts` kind, which is "
-           "the rung that lands there",
-           any(a[1:3] == ["--kind", "alerts"] for a in msgs if isinstance(a, list)))
-        ok("...with the marker cc-guard reads, so the survivor is not gated by the record of its own success",
-           os.path.exists(done_path(r["id"])))
-        ok("...and the successor is left holding the target's window name",
-           wins.get("s1") == r["successor"]["tmux"] and "s1~next" not in wins)
-        ok("...one ledger line, saying it was swept",
-           [json.loads(l)["kind"] for l in open(os.path.join(RECORDS, "handoffs.jsonl"))][-1] == "overlap-swept")
-        ok("...and a swept record is not swept again", sweep() == 0 and read("s1") is None)
-
-        r = cutover("s5")
-        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
-        ok("a cut-over predecessor still inside its drain is left alone",
-           sweep() == 0 and read("s5") is not None and pre in wins.values())
-        rr = read("s5"); rr["cutover"] = time.time() - 601; rr["phase"] = "retired"; write(rr)
-        me[0] = pre
-        ok("...past drain+grace, under --retire's own fence: never the sweep's own pane",
-           sweep() == 0 and read("s5") is not None and pre in wins.values())
-        me[0] = ""
-        ok("...and otherwise the SWEEP ends it (its --retire died, or refused from the predecessor's own pane): "
-           "no `~old` at phase retired forever, and its successor can hand off in its turn",
-           sweep() == 0 and read("s5") is None and pre not in wins.values() and wins.get("s5") == suc
-           and os.path.exists(done_path(r["id"])))
-        r = cutover("s6")
-        pre, suc = r["predecessor"]["tmux"], r["successor"]["tmux"]
-        rr = read("s6"); rr["cutover"] = time.time() - 601; rr["held"] = ["a-live"]; write(rr)
-        ok("a predecessor STAYING for its subagents is not swept away mid-stay — it is past nothing yet",
-           sweep() == 0 and read("s6") is not None and pre in wins.values())
-        rr = read("s6"); rr.pop("held"); rr["drain_from"] = time.time() - 601; write(rr)
-        ok("...and once the stay is over it drains and is ended like any other",
-           sweep() == 0 and read("s6") is None and pre not in wins.values() and wins.get("s6") == suc)
-        os.environ["CC_HANDOFF_DRAIN"] = "0"
-
-        os.environ.pop("CC_HANDOFF", None)
-        told = sum(1 for m in msgs if m and m[0] == "notify")
-        wins["s2"] = "@s2"
-        start("s2")
-        ok("an overlap still inside its deadline is not swept", sweep() == 0 and read("s2") is not None)
-        rr = read("s2")
-        rr["deadline"] = time.time() - 1
-        write(rr)
-        ok("an overdue overlap that never reached --ready expires",
-           sweep() == 0 and read("s2") is None and "s2~next" not in wins)
-        ok("...QUIETLY: its predecessor never stopped working, so there is nothing to tell the owner",
-           sum(1 for m in msgs if m and m[0] == "notify") == told)
-        wins["s2"] = "@s2"
-        start("s2")
-        rr = read("s2"); rr["deadline"] = time.time() - 1; write(rr)
-        wins["s2-moved"] = wins.pop("s2~next")           # the successor's window no longer carries its name
-        ok("an expiry finds the successor by the id the record names when its name is gone",
-           sweep() == 0 and read("s2") is None and rr["successor"]["tmux"] not in wins.values())
-
-        # 2026-09-01 05:15Z: six `~next` windows sat parked for hours with no record. Their predecessors had
-        # EXITED before --ready — a bare shell still holding `<target>` — so the sweep finalized the record but
-        # the successor never got the name, and nothing pointed at it again.
-        wins["s4"] = "@s4"
-        start("s4")
-        r = read("s4")
-        dead.add("s4")                                  # the predecessor exited: its window is an empty shell
-        r["started"] = time.time() - 200
-        r["gone_since"] = time.time() - 301
-        write(r)
-        ok("a predecessor that exited before --ready: its empty shell goes, and the successor takes the name",
-           sweep() == 0 and read("s4") is None and "@s4" not in wins.values()
-           and wins.get("s4") == r["successor"]["tmux"] and "s4~next" not in wins)
-        ok("...so no `~next` window outlives its record", not any(n.endswith("~next") for n in wins))
-
-        wins["z1~next"] = "@z1"                          # a successor window with no record at all
-        ages["@z1"] = 3 * 3600
-        wins["z2~old"] = "@z2"
-        ages["@z2"] = 60
-        n0 = posts()
-        ok("a `~next` or `~old` window with no record, older than the overlap window, is reported once",
-           sweep() == 0 and posts() == n0 + 1 and sweep() == 0 and posts() == n0 + 1
-           and "z1~next" in wins and any("main:z1~next" in a[-1] for a in msgs if isinstance(a, list)))
-        ok("...a young one is not (its record may be a moment away)",
-           not any("main:z2~old" in a[-1] for a in msgs if isinstance(a, list)))
-        import io, contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            status()
-        ok("...and --status lists it, for whoever reads the box", "z1~next" in buf.getvalue() and "orphan" in buf.getvalue())
-        wins.pop("z1~next"); wins.pop("z2~old")
-
-        wins["s3"] = "@s3"
-        start("s3")
-        keep_tmux = tmux
-        tmux = lambda *a, **k: None                     # noqa: E731 — the tmux server cannot be read at all
-        ok("with tmux unreadable nothing is swept: every window would look gone",
-           sweep() == 0 and read("s3") is not None)
-        tmux = keep_tmux
-        clear("s3")
-        wins.pop("s3~next", None)
-        if role0 is not None:
-            os.environ["CC_ROLE"] = role0    # the caller's role back: a --go worker running the gates keeps it
-        if ov0 is None:
-            os.environ.pop("CC_HANDOFF_OVERLAP", None)
-        else:
-            os.environ["CC_HANDOFF_OVERLAP"] = ov0
-
-        # a corrupt record reads exactly like a missing one: the predecessor is in charge
-        os.makedirs(HANDOFF, exist_ok=True)
-        with open(path("r1"), "w") as fh:
-            fh.write("{not json")
-        ok("a corrupt record is not an open overlap", read("r1") is None and read_all() == [])
-
-        # ---- --brief: ONE packet, and the journal read from the END. Its own home, its own state dir, its
-        # own board and PR list: nothing here is this box's, and the case that matters is the one it CANNOT
-        # have read — an entry buried under 140 kB of history it must never touch.
-        home0 = os.environ.get("HOME")
-        dev0 = DEV
-        bh = os.path.join(d, "briefhome")
-        os.environ["HOME"] = bh
-        DEV = os.path.join(bh, "dev")
-        os.makedirs(os.path.join(DEV, "r9", ".git"), exist_ok=True)   # the target's own checkout, for gh
-        jd = os.path.join(bh, ".cc", "state", "r9", "t9")
-        os.makedirs(jd, exist_ok=True)
-        jpath = os.path.join(jd, "progress.md")
-        with open(jpath, "w") as fh:
-            fh.write("## 2026-01-01 00:0xZ — journal at 30% ctx (the OLD one)\nOLD-ENTRY-NEVER-READ\n")
-            fh.write("a line of history\n" * 8000)                    # ~140 kB between the two entries
-            fh.write("## 2026-01-02 00:0xZ — journal at 31% ctx (the LAST one)\nKEPT-ENTRY\n")
-            fh.write("- 01:0xZ: DATED-LINE-AFTER-IT\n")
-        os.makedirs(os.path.join(STATE, "r9", "t9"), exist_ok=True)
-        with open(os.path.join(STATE, "r9", "t9", "loop.log"), "w") as fh:
-            fh.write("older line\n2026-01-02T01:00:00Z iter 2/3 LAST-LOOP-LINE\n")
-        os.makedirs(os.path.join(STATE, "land"), exist_ok=True)
-        with open(os.path.join(STATE, "land", "r9-5.json"), "w") as fh:
-            json.dump({"repo": "r9", "pr": 5, "stage": "gates", "attempts": 1, "queued_at": "2026-01-02T00:00:00Z"}, fh)
-        wins["lane7"] = "@70"                                          # a lane the #154 queue left running
-        now = time.time()
-        write({"id": "b0", "target": "r9/t9", "phase": "overlap", "live": "predecessor",
-               "predecessor": {"session_id": "sid-9", "tmux": "@9", "window": "r9/t9"},
-               "successor": {"session_id": "s9", "tmux": "@10", "window": "r9/t9~next"},
-               "started": now, "deadline": now + 600, "phases": []})
-        calls = []
-        ghcwd = []
-
-        def out(argv, timeout=25, cwd=None, fail=""):                  # the three helpers a brief reads
-            calls.append(list(argv))
-            if argv[0] == "gh":
-                ghcwd.append(cwd)
-            if argv[0].endswith("cc-board"):
-                return ("r9  base:main  /x\n"
-                        "  \u25b6 t9 [running]  AN-OPEN-ROW\n      task: KEEP-ME\n"
-                        "  \u2713 t8 [merged]  A-FINISHED-ROW\n      task: DROP-ME\n")
-            if argv[0] == "gh":
-                return "5      track/t9      MERGEABLE\n"
-            if argv[0].endswith("cc-scope"):
-                return "· a1  OPEN-ASK-TEXT [t9]\n· a2  SECOND-OPEN-ASK\n"
-            return ""
-
-        import contextlib, io as _io
-        buf = _io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = brief("r9/t9")
-        b = buf.getvalue()
-        text, nread, anchor = tail_entry(jpath)
-        ok("--brief prints every section",
-           rc == 0 and all(h in b for h in ("== journal", "== board", "== land", "== workers",
-                                            "== open PRs", "== scope", "== who")))
-        ok("...the journal section is the LAST 'journal at N%' entry and the dated lines after it",
-           "KEPT-ENTRY" in b and "DATED-LINE-AFTER-IT" in b and "the LAST one" in b
-           and anchor == "last 'journal at N%' entry")
-        jsec = b.split("== journal — ")[1].split("\n== ")[0] if "== journal — " in b else ""
-        ok("...and it is the CHECKPOINT VIEW (cc-lib view, 8 kB cap): its header names 1 of 2 entries and the ask that reaches the older one, "
-           "and the 140 kB between the two marked entries is neither read into the packet nor over the cap",
-           jsec.startswith("checkpoint view: 1 of 2 entries of") and "older entries: cc-lib ask --object r9/t9 --need history" in jsec
-           and len(jsec.encode()) <= VIEW_CAP + 200)
-        jv, jl = journal_view(jpath)
-        bin0 = BIN
-        globals()["BIN"] = os.path.join(d, "no-such-bin")
-        try:
-            jnone = journal_view(jpath)
-        finally:
-            globals()["BIN"] = bin0
-        ok("...journal_view returns the body and the label; with no cc-lib beside this file it returns nothing, and the brief falls back to the tail",
-           jv is not None and "KEPT-ENTRY" in jv and jl.startswith("1 of 2 entries") and jnone == (None, None))
-        ok("...and it never reads past that entry: the one before it is in the file and not in the packet",
-           "OLD-ENTRY-NEVER-READ" not in b and "the OLD one" not in b
-           and nread < os.path.getsize(jpath) and nread <= BRIEF_CAP)
-        ok("...the board is trimmed to the rows that are not finished, notes and all",
-           "AN-OPEN-ROW" in b and "KEEP-ME" in b and "A-FINISHED-ROW" not in b and "DROP-ME" not in b)
-        ok("...a live lane names its window, its PR and its waiter pid, and the queue its job and stage",
-           "lane7" in b and "@70" in b and "PR 7" in b and "4242" in b and "PR 5" in b and "stage gates" in b)
-        ok("...a live worker is one line, the last of its loop.log", "LAST-LOOP-LINE" in b and "older line" not in b)
-        ok("...the open PRs, the predecessor's window, tmux id and session are all in it",
-           "track/t9" in b and "MERGEABLE" in b
-           and "main:r9/t9" in b and "@9" in b and "sid-9" in b and "id b0" in b)
-        ok("...and the open asks are the asks themselves, not a bare count",
-           "OPEN-ASK-TEXT" in b and "a1" in b and "SECOND-OPEN-ASK" in b and "a2" in b)
-        ok("...and the helpers are asked once each, for this repo only — cc-scope with `list`, not `count`",
-           [c[-2:] for c in calls if c[0].endswith("cc-board")] == [["show", "r9"]]
-           and [c[-2:] for c in calls if c[0].endswith("cc-scope")] == [["list", "r9"]])
-        # ---- the packet's size, into the failures ledger: its own ledger dir, the band either side of this packet
-        env0 = {k: os.environ.get(k) for k in ("CC_FAILURES", "CC_BRIEF_PACKET_BAND")}
-        os.environ["CC_FAILURES"] = os.path.join(d, "brief-failures")
-        pled = os.path.join(d, "brief-failures", "r9.jsonl")
-        pledger = lambda: [json.loads(ln) for ln in open(pled)] if os.path.isfile(pled) else []
-        size, ncalls, ngh = len(b.encode()), len(calls), len(ghcwd)
-        try:
-            os.environ["CC_BRIEF_PACKET_BAND"] = str(size + 64)       # the "m left" line may shift a byte between calls
-            with contextlib.redirect_stdout(_io.StringIO()):
-                brief("r9/t9")
-            under = pledger()
-            os.environ["CC_BRIEF_PACKET_BAND"] = str(size - 64)
-            with contextlib.redirect_stdout(_io.StringIO()):
-                brief("r9/t9"); brief("r9/t9")
-            over = pledger()
-        finally:
-            for k, v in env0.items():
-                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
-            del calls[ncalls:], ghcwd[ngh:]                           # the cases below count the first brief's helper calls
-        ok("a packet under CC_BRIEF_PACKET_BAND writes no failures record", under == [])
-        ok("...one over it writes one spend/handoff-packet-over-band record under its repo, keyed on the handoff, "
-           "and a second brief of the same handoff writes none",
-           len(over) == 1 and over[0]["kind"] == PACKET_KIND and over[0]["writer"] == "cc-handoff"
-           and over[0]["links"]["source"] == "brief:r9/t9:b0")
-
-        # THE OTHER JOURNAL SHAPE, which is the common one: a track's `progress.md` carries no
-        # "journal at N%" line anywhere, so a rule that only knows that marker hands the successor the
-        # banner and 64 kB of raw tail — every track target, every time. It cuts on the last dated entry.
-        tj = os.path.join(jd, "track-shaped.md")
-        with open(tj, "w") as fh:
-            fh.write("## 2026-01-01 iteration 1\nEARLIEST-ENTRY\n")
-            fh.write("a line of history\n" * 8000)                    # ~140 kB, no marker in any of it
-            fh.write("## 2026-01-02 iteration 2\nMIDDLE-ENTRY\n")
-            fh.write("## 2026-01-03 iteration 3\nLAST-TRACK-ENTRY\n- 01:0xZ: AND-THE-LINES-AFTER-IT\n")
-        ttext, tread, tanchor = tail_entry(tj)
-        ok("a journal with no 'journal at N%' line cuts on the last dated entry instead",
-           tanchor == "last dated entry" and ttext.startswith("## 2026-01-03")
-           and "LAST-TRACK-ENTRY" in ttext and "AND-THE-LINES-AFTER-IT" in ttext)
-        ok("...and not on the raw tail: neither the entry before it nor the banner is in the packet",
-           "MIDDLE-ENTRY" not in ttext and "EARLIEST-ENTRY" not in ttext
-           and "the tail follows" not in ttext and tread < os.path.getsize(tj) and tread <= BRIEF_CAP)
-
-        # THE PLANNING SHAPE IS BOTH AT ONCE: a marked entry, then runs of unmarked "## OVERLAP STARTED" /
-        # "FINAL" / "TAKEOVER" entries, pages of them. Stopping at the first page that held two whole unmarked
-        # headings started the packet BELOW the marked entry the successor is told to read (review of #181).
-        pj = os.path.join(jd, "planning-shaped.md")
-        with open(pj, "w") as fh:
-            fh.write("## 2026-01-01 05:00Z - journal at 30% ctx\nOLDER-MARKED-ENTRY\n")
-            fh.write("filler that is never read\n" * 2000)
-            fh.write("## 2026-01-02 05:00Z - journal at 31% ctx\nTHE-MARKED-ENTRY-TO-KEEP\n")
-            for i in range(3):
-                fh.write("## 2026-01-02 0%d:00Z - OVERLAP STARTED\n" % (6 + i))
-                fh.write("an unmarked entry after the marked one\n" * 120)
-            fh.write("## 2026-01-02 09:00Z - TAKEOVER\n- 09:1xZ: THE-LAST-DATED-LINE\n")
-        ptext, pread, panchor = tail_entry(pj)
-        ok("a marked entry buried under pages of unmarked ones is still where the packet starts",
-           panchor == "last 'journal at N%' entry" and "THE-MARKED-ENTRY-TO-KEEP" in ptext
-           and ptext.startswith("## 2026-01-02 05:00Z"))
-        ok("...with every unmarked entry after it kept, and the marked entry before it left out",
-           "OVERLAP STARTED" in ptext and "THE-LAST-DATED-LINE" in ptext
-           and "OLDER-MARKED-ENTRY" not in ptext and pread <= BRIEF_CAP)
-
-
-        # WHERE gh IS ASKED IS PART OF THE ANSWER. It resolves a repo from its cwd, and --brief is run from
-        # wherever the caller stands: from another repo's checkout that printed that repo's PRs under this
-        # one's heading, and from a dir that is no checkout it printed none — read as "nothing is open".
-        ok("gh is asked inside the target's own checkout, not wherever the caller happens to be",
-           ghcwd == [os.path.join(DEV, "r9")])
-        ok("...a target with no checkout to ask in says so, and never shows an empty PR list",
-           prs("r-none").startswith("(unavailable:") and "r-none" in prs("r-none"))
-        ok("...and a helper that could not run says so too, while one that ran is passed through",
-           real_out(["false"], fail="(unavailable: x)") == "(unavailable: x)"
-           and real_out(["printf", "hi"], fail="(unavailable: x)") == "hi"
-           and real_out(["no-such-binary-here"], fail="(unavailable: x)") == "(unavailable: x)")
-        clear("r9/t9")
-        wins.pop("lane7", None)
-        DEV = dev0
-        if home0 is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = home0
-
-        # INDEX-AT-WRITE: the line journal() appends is in the library's index when it returns — `cc-lib ask` finds
-        # it as a checkpoint under the target's own journal, and had nothing to re-read itself (re-read absent from
-        # COVERAGE: the hook did it, not the ask). Its own HOME with one registered board, and the baseline pass
-        # first, so the only stale source a lazy ask could catch up on is the entry.
-        lhome = os.path.join(d, "libhome"); os.makedirs(os.path.join(lhome, ".cc", "boards"))
-        with open(os.path.join(lhome, ".cc", "boards", "r19.json"), "w") as fh:
-            json.dump({"repo": "r19", "path": os.path.join(lhome, "dev", "r19"), "tracks": {}, "log": []}, fh)
-        home0 = os.environ.get("HOME"); os.environ["HOME"] = lhome
-        try:
-            lib = os.path.join(BIN, "cc-lib")
-            subprocess.run([lib, "index"], capture_output=True, text=True, timeout=60)
-            journal("r19", "handoff: the zebrafish successor is live and owns r19")
-            o = subprocess.run([lib, "ask", "--repo", "r19", "--need", "history", "zebrafish successor"],
-                               capture_output=True, text=True, timeout=60).stdout
-            ok("a handoff line is indexed as it is written: cc-lib ask finds it as a checkpoint in the planning journal, "
-               "with nothing left for the ask to re-read",
-               "zebrafish successor" in o and "checkpoint" in o and "planning-handoff.md" in o
-               and "OUTCOME answered" in o and "re-read" not in o)
-        finally:
-            if home0 is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = home0
-
-    if nlo is not None:
-        os.environ["CC_NOTIFY_LOG_ONLY"] = nlo
-    print(f"cc-handoff selfcheck: {p} passed, {f} failed")
-    return 1 if f else 0
+    """The cases are core/tests/handoff_selfcheck.py, run in THIS namespace so their `global` rebinds and stubs land on
+    the tool as they did when the body was here. Exit 1 on any failure."""
+    path = os.path.join(os.path.dirname(BIN), "tests", "handoff_selfcheck.py")
+    with open(path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), path, "exec"), globals())
+    return globals()["run_selfcheck"]()
 
 
 # ---- cli -----------------------------------------------------------------------------------------------
@@ -3097,17 +1569,11 @@ def main(argv):
     i = 0
     while i < len(rest):
         a = rest[i]
-        if a in ("--pct", "--session", "--why", "--in-flight", "--level"):
+        if a in ("--session", "--why", "--in-flight"):
             opt[a[2:].replace("-", "_")] = rest[i + 1] if i + 1 < len(rest) else ""
             i += 1
-        elif a == "--over":                 # its value is optional: bare --over = that session's own handoff line
-            if i + 1 < len(rest) and not rest[i + 1].startswith("-"):
-                opt["over"] = rest[i + 1]
-                i += 1
-            else:
-                opt["over"] = "any"
-        elif a in ("--forced", "--over-ceiling", "--json", "--live", "--taken", "--retry"):
-            opt[a.lstrip("-").replace("-", "_")] = True
+        elif a in ("--forced", "--json"):
+            opt[a.lstrip("-")] = True
         elif a.startswith("--"):
             print(f"cc-handoff: unknown option {a}", file=sys.stderr)
             return 1
@@ -3122,49 +1588,17 @@ def main(argv):
         if not target:
             print("cc-handoff: --overlap needs a target", file=sys.stderr)
             return 1
-        if not enabled():
-            print("cc-handoff: the overlapping handoff is off — the owner turns it on with CC_HANDOFF_OVERLAP=1 "
-                  "in ~/.cc/config (the channel layer mutes the non-live session since 2026-08-31)", file=sys.stderr)
-            return 1
-        try:
-            pct = float(opt.get("pct"))
-        except (TypeError, ValueError):
-            pct = None
-        return start(target, pct, opt.get("session", ""), opt.get("in_flight", ""))
+        return start(target, opt.get("session", ""), opt.get("in_flight", ""))
     if cmd == "--kick":                            # internal: the detached child start() leaves behind
         return kick(target, pos[1] if len(pos) > 1 else "") if target else 1
     if cmd == "--ready":
         return ready(target, bool(opt.get("forced")))
-    if cmd == "--replace":
-        return replace(target, opt.get("over")) if target else 1
     if cmd == "--sweep":
         return sweep()
-    if cmd == "--event":
-        if not target:
-            return 1
-        try:
-            pct = float(opt.get("pct"))
-        except (TypeError, ValueError):
-            pct = None
-        import contextlib
-        with contextlib.redirect_stdout(sys.stderr):   # stdout is the answer; a phase's own words are not
-            act = event(target, opt.get("level", ""), pct, opt.get("session", ""),
-                        opt.get("in_flight", ""), bool(opt.get("live")), bool(opt.get("taken")),
-                        bool(opt.get("retry")))
-        print(json.dumps({"action": act}))
-        return 0
     if cmd == "--abandon":
         return abandon(target, opt.get("why", "")) if target else 1
-    if cmd == "--due":
-        return due(target, bool(opt.get("over_ceiling"))) if target else 1
     if cmd == "--retire":
         return retire(target) if target else 1
-    if cmd == "--relay":                           # the hook's payload on stdin; never a word unless it blocks
-        try:
-            payload = json.load(sys.stdin)
-            return relay(payload if isinstance(payload, dict) else {})
-        except Exception:
-            return 0
     if cmd == "--brief":
         if not target:
             print(f"cc-handoff: --brief needs a target ({SHAPES})", file=sys.stderr)

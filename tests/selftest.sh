@@ -215,7 +215,7 @@ chk(){   # `chk cc-foo`: that tool's own selfcheck as one case here, or a · lin
 # selfcheck is CPU and the stanzas it sits between are mostly waiting on tmux, so running them side by side is
 # nearly free: the six below were ~2 min of this suite, serially, on one core.
 # THE WINDOW IS THE WHOLE OF THE RULE. A tool's selfcheck inherits whatever this file has exported where its `chk`
-# sits — CC_CTX_RECORDS at the cc-context block, CC_HANDOFF_DIR/RETIRE_GRACE at cc-handoff's, CC_SLACK_DIR before
+# sits — CC_STATUSLINE_DIR at the cc-context block, CC_HANDOFF_DIR/RETIRE_GRACE at cc-handoff's, CC_SLACK_DIR before
 # the tail — so a tool may be started early ONLY from a point with no export, unset or cd between there and its
 # chk. Move a `prefetch` line across one of those and the tool runs under a different environment and quietly
 # proves something else, which is the one trade this suite must never make.
@@ -539,83 +539,49 @@ mkdir -p ~/.cc/state/${REPO}_canary; "$B/cc" rm $REPO ../${REPO}_canary >/dev/nu
 rmdir ~/.cc/state/${REPO}_canary 2>/dev/null
 "$B/cc" $REPO --go "x" >/dev/null 2>&1; [ $? != 0 ] && [ ! -d ~/.cc/worktrees/$REPO/--go ] && ok "cc refuses a track named --go" || bad "track '--go' created"
 fi
-# w1's session and its transcript, and the Stop payload that names them: cc-context's cases stand on these
-export CC_CTX_RECORDS="$T/ctx" CC_CTX_BOX_MODEL=   # records under $T, and this box's own model never sizes a fixture
+# w1's session and its transcript: cc-context's cases stand on these
+export CC_STATUSLINE_DIR="$T/statusline" CC_CONTEXT_HANDOFF_TOKENS=150000 CC_CTX_BOX_MODEL=   # status-line files under $T, and this box's own model never sizes a fixture
+mkdir -p "$CC_STATUSLINE_DIR"
 PD=~/.claude/projects/$REPO-ctx; mkdir -p "$PD"    # a transcript for the session the board names for w1 (and see H2: it must exist before a relaunch)
 sid=$("$B/cc-board" get $REPO w1 session_id)
 printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":19000,"output_tokens":5}}}\n' > "$PD/$sid.jsonl"
-pay(){ printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"%s}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 "${1:-}"; }
 if stanza "cc-context (the real number, and what refuses to run without it)"; then
 chk cc-context
 chk cc-statusline   # the harness's own per-turn file cc-context prefers over its transcript estimate
 chk cc-sandbox   # real bwrap on a scratch repo: secrets and sockets absent inside, git whole, off = untouched
 "$B/cc-context" $REPO w1 2>&1 | grep -q '^10%  20k/200k' && ok "a track's number is read off the session the board names" || bad "cc-context $REPO w1: $("$B/cc-context" $REPO w1 2>&1) (fixture sid $sid, board sid $("$B/cc-board" get $REPO w1 session_id))"
-out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
-{ [ $rc = 0 ] && grep -q 'under 90%' <<<"$out" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
-  && ok "handoff --over leaves a session that is not full alone" || bad "handoff --over 90 at 10%: rc=$rc $out"
+"$B/cc-context" $REPO w1 --over 90 >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "--over N at 10% says under, exit 1" || bad "--over 90 at 10%: rc=$rc"
+"$B/cc-context" $REPO w1 --over >/dev/null 2>&1; rc=$?; [ $rc = 1 ] && ok "a bare --over reads the hand-off line: 20k is under it" || bad "bare --over: rc=$rc"
 mv "$PD/$sid.jsonl" "$T/tx.jsonl"                  # nothing measurable: the answer is 'no', not a guess
-out=$("$B/cc" handoff $REPO w1 --over 90 2>&1); rc=$?
-{ [ $rc = 1 ] && grep -q 'not handing off on a guess' <<<"$out" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
-  && ok "an unmeasurable context refuses the handoff instead of guessing" || bad "unmeasurable handoff: rc=$rc $out"
+out=$("$B/cc-context" $REPO w1 --over 90 2>&1); rc=$?
+{ [ $rc = 2 ] && grep -q 'no transcript' <<<"$out"; } && ok "an unmeasurable context is exit 2, never a guess" || bad "unmeasurable: rc=$rc $out"
 mv "$T/tx.jsonl" "$PD/$sid.jsonl"
-# the Stop hook is the only place the transcript path is handed over: it must record from the payload
+# the harness's own number wins while it is fresh: a status-line file for w1's session, past the 150k line
+printf '{"session_id":"%s","used":180000,"window":1000000,"pct":18,"model":"claude-opus-5","raw":{"cwd":"%s"}}' "$sid" ~/.cc/worktrees/$REPO/w1 > "$CC_STATUSLINE_DIR/$sid.json"
+out=$("$B/cc-context" $REPO w1 2>&1)
+{ grep -q '^18%  180k/1M' <<<"$out" && grep -q 'window from statusline' <<<"$out" && grep -q 'hand off' <<<"$out"; } \
+  && ok "a fresh status-line file is the number, and past the line it says hand off" || bad "statusline: $out"
+"$B/cc-context" $REPO w1 --over >/dev/null 2>&1; rc=$?; [ $rc = 0 ] && ok "...and a bare --over exits 0 past the line" || bad "bare --over past the line: rc=$rc"
+"$B/cc-context" --all 2>/dev/null | grep -q "^$REPO	w1	18	180000	1000000	statusline	[0-9]*	handoff	-$" \
+  && ok "--all names the track off the file's cwd, nine columns" || bad "--all: $("$B/cc-context" --all 2>&1)"
+lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 18% handoff!" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column: $lsout"
+rm -f "$CC_STATUSLINE_DIR/$sid.json"
+# A HEADLESS WORKER DRAWS NO STATUS LINE. `claude -p` — every `--go` track — writes no status-line file at all, so
+# --all built from that directory alone listed no worker: `cc ls`'s ctx column and the dashboard's Context block
+# were blank for exactly the sessions nobody is watching. With none there, the track's own transcript is the number.
+hsl=~/.claude/projects/$(readlink -f ~/.cc/worktrees/$REPO/w1 | tr '/.' '-'); mkdir -p "$hsl"; cp "$PD/$sid.jsonl" "$hsl/$sid.jsonl"
+"$B/cc-context" --all 2>/dev/null | grep -q "^$REPO	w1	10	20010	200000	transcript	[0-9]*	-	-$" \
+  && ok "a track with no status-line file is still listed, off its transcript" || bad "--all fallback: $("$B/cc-context" --all 2>&1 | grep "	w1	")"
+rm -rf "$hsl"
+# the Stop hook: it commits, and answers nothing — no context decision rides on it any more
+echo ctx > ~/.cc/worktrees/$REPO/w1/ctx.txt
 d0=$(printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' "$sid" "$PD/$sid.jsonl" ~/.cc/worktrees/$REPO/w1 \
   | ( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" ))
-[ -s "$T/ctx/$sid.json" ] && grep -q '"pct": 10' "$T/ctx/$sid.json" && ok "the Stop hook records the measurement it was handed" || bad "no record from the Stop hook"
-# read off the hook's STDOUT, like the over-the-line case below: the record's `name` is the tmux window the
-# suite runs in, and a track called a-decision-… made a grep for 'decision' on the record red (2026-09-12)
-{ ! grep -q '"decision": "block"' <<<"$d0"; } && ! grep -q '"say"' "$T/ctx/$sid.json" \
-  && ok "under the journal line the session is left alone" || bad "a session under the line was told something: $d0"
-# over the line: the hook answers on stdout with the Stop decision that makes the session journal (once)
-rm -f "$T/ctx/$sid.json"
-# the fixture is 20k of a 200k window, so the floors (60k/90k) are lowered out of the way for these cases.
-# CC_HANDOFF_OVERLAP=0 is PINNED, like the overlap section below pins it per command. These four cases assert
-# the classic stop-then-restart path (PENDING, deferred while work is in flight), and `cc-context` takes that
-# path only when the overlap is off — or when $CC_HANDOFF is set, which is the trap. Unpinned they read the
-# key from the BOX's ~/.cc/config, so once the owner turned overlapping handoffs on they stopped exercising
-# the deferral they were written for and started asserting against the overlap path.
-# MEASURED 2026-08-31, because the number is the argument: main gave 163/0 to the one session holding
-# $CC_HANDOFF and 159/4 to every worker, the owner, and every fresh session. Five consecutive workers saw the
-# red, called it "pre-existing, not mine" — each correctly — and none could prove it, because the only session
-# placed to adjudicate was the one that could not reproduce it. A suite must assert the path it NAMES, not the
-# one the box happens to be configured for. The overlap path has its own cases below and in `cc-context
-# selfcheck`; this path must keep working because the new one fails INTO it.
-CTXP="CC_CONTEXT_WARN_MIN=0 CC_CONTEXT_HANDOFF_MIN=0 CC_HANDOFF_OVERLAP=0"
-export CC_HANDOFF_OVERLAP=0   # for the calls in this section that do not go through $CTXP
-d1=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=5 CC_CONTEXT_HANDOFF_PCT=45 "$B/cc-checkpoint" ))
-{ grep -q '"decision": "block"' <<<"$d1" && grep -q "state/$REPO/w1/progress.md" <<<"$d1"; } \
-  && ok "over the journal line the hook tells the session to write its handoff entry" || bad "no Stop decision: $d1"
-d2=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=5 CC_CONTEXT_HANDOFF_PCT=45 "$B/cc-checkpoint" ))
-[ -z "$d2" ] && ok "it is said once, not every turn" || bad "the session was told twice: $d2"
-d3=$(pay ',"stop_hook_active":true' | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2 "$B/cc-checkpoint" ))
-[ -z "$d3" ] && ok "never while a Stop hook is already holding the session" || bad "blocked a session that was already held: $d3"
-# past the handoff line with something in flight: PENDING, and the session keeps working — nothing is restarted
-d4=$(pay ',"background_tasks":[{"id":"x"}]' | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2 "$B/cc-checkpoint" ))
-{ grep -q 'PENDING' <<<"$d4" && grep -q 'background task' <<<"$d4" && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
-  && ok "past the handoff line with work in flight the handoff is pending, not taken" || bad "pending handoff: $d4"
-grep -q '"pending": true' "$T/ctx/$sid.json" && ok "the pending handoff is on the record" || bad "no pending flag: $(cat "$T/ctx/$sid.json")"
-# the durable record: one countable line per crossing, which line fired, and no prose to parse
-[ "$("$B/cc-context" --handoffs 2>/dev/null | wc -l)" = 2 ] && ok "every crossing is one countable line on the ledger" || bad "ledger: $("$B/cc-context" --handoffs)"
-"$B/cc-context" --handoffs | cut -f2 | tr '\n' ' ' | grep -q 'journal handoff-deferred' \
-  && ok "the ledger says which line fired" || bad "ledger kinds: $("$B/cc-context" --handoffs | cut -f2 | tr '\n' ' ')"
-# THE SAME LINE FROM A WORKER, with the overlap ON and the window live — because the LOOP is what is in that
-# window; the `claude -p` inside it is headless. Nothing is handed off: it is told to END ITS TURN, and one fixed
-# line goes into the journal, which is what stops cc-loop reading an iteration that ended itself as a refusal.
-# 2026-09-01, spend-tracker: the overlap here started an INTERACTIVE successor that finished the work, ran
-# `cc done`, and then sat in the track window forever with the Home tally showing the track RUNNING.
-rm -f "$T/ctx/$sid.json"; jw=~/.cc/state/$REPO/w1/progress.md; : > "$jw"
-d5=$(pay | ( cd ~/.cc/worktrees/$REPO/w1 && env $CTXP CC_HANDOFF_OVERLAP=1 CC_CONTEXT_WARN_PCT=1 CC_CONTEXT_HANDOFF_PCT=2 CC_ROLE=worker "$B/cc-checkpoint" ))
-{ grep -q 'END YOUR TURN' <<<"$d5" && ! grep -q 'PENDING' <<<"$d5" && grep -q '^- cc-context: iteration stopped at ' "$jw" \
-  && [ -z "$(wins "$REPO/w1~next")" ] && tmux list-windows -t main -F '#W' | grep -qx "$REPO/w1"; } \
-  && ok "a worker at the handoff line is told to end its turn and its journal is marked — no successor, nothing restarted" \
-  || bad "worker at the handoff line: $d5 / journal: $(cat "$jw")"
-out=$("$B/cc" handoff $REPO w1 --over 2>&1); rc=$?
-{ [ $rc = 0 ] && grep -q 'under the handoff line' <<<"$out"; } && ok "a bare --over uses that session's own handoff line" || bad "bare --over: rc=$rc $out"
-lsout=$("$B/cc" ls 2>/dev/null); grep -q "w1.*ctx 10%" <<<"$lsout" && ok "cc ls shows how full each track is" || bad "cc ls has no ctx column"
-( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" </dev/null )   # no payload (run by hand): still commits, records nothing new
+{ [ -z "$d0" ] && [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ]; } \
+  && ok "given a Stop payload the hook commits and says nothing on stdout" || bad "the hook said: [$d0] / dirty: $(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)"
+echo more > ~/.cc/worktrees/$REPO/w1/ctx2.txt
+( cd ~/.cc/worktrees/$REPO/w1 && "$B/cc-checkpoint" </dev/null )   # no payload (run by hand): still commits
 [ -z "$(git -C ~/.cc/worktrees/$REPO/w1 status --porcelain)" ] && ok "the hook still commits when it is given no payload" || bad "checkpoint broke without a Stop payload"
-
-unset CC_HANDOFF_OVERLAP   # the overlap section below decides for itself, per command
 fi
 if stanza "cc-brief (the shape of a brief, checked at the door instead of remembered)"; then
 chk cc-brief
@@ -1222,17 +1188,17 @@ grep -q -- '"\$CLAUDE" --permission-mode auto --remote-control' "$B/cc-rc" \
   && ok "…and so does the box's own boot session (cc-rc)" || bad "cc-rc still starts in manual mode"
 rm -rf "$AM" "$GH/.cc/worktrees/other" "$GH/.cc/state/other"; rm -f "$GH/.cc/boards/other".*   # leave the stub HOME as this stanza found it
 fi
-export CC_HANDOFF_DIR="$T/handoff" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records, never a 2-min grace or a 10-min drain
+export CC_HANDOFF_DIR="$T/handoff" CC_CTX_RECORDS="$T/ctx" CC_HANDOFF_RETIRE_GRACE=1 CC_HANDOFF_DRAIN=1   # never the box's own records — CC_CTX_RECORDS is
+                                          # where cc-handoff puts its ledger and handoff.log, and without it every run of this suite appended _cctest rows to the owner's own handoffs.jsonl,
+                                          # which the Home tab counts as handoffs today; it moved here from the cc-context block when that block stopped needing it
 if stanza "overlapping handoff: two sessions, one cwd, exactly one of them live"; then
 chk cc-handoff
 st=$("$B/cc" handoff --status 2>&1); grep -q "no overlapping handoff is open" <<<"$st" && ok "cc handoff --status delegates by target" || bad "cc handoff --status: [$st]"
-out=$(CC_HANDOFF_OVERLAP=0 "$B/cc" handoff --overlap "$REPO" 2>&1); rc=$?
-{ [ $rc != 0 ] && grep -q "CC_HANDOFF_OVERLAP" <<<"$out"; } && ok "the overlap path is off until it is turned on (the old handoff is untouched)" || bad "overlap not gated by config: $out"
 # a real predecessor window; the successor's `claude` is /bin/true, so its pane falls through to the wrapper shell
 for t in hq hs hx hz; do mkdir -p ~/.cc/worktrees/$REPO/$t; done   # the successor's pane IS `cc __runnext` (exec: claude must be the pane's
                                           # direct child for cc-msg), and that cds into the track's worktree or exits
 tmux new-window -d -t main -n "$REPO/hx" -c "$T" "bash -c 'sleep 300; :'"   # a real child: `pane_live` is what tells a session from a bare shell
-out=$(CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hx" --session sid-pre --in-flight "uncommitted work in hx" 2>&1)
+out=$("$B/cc" handoff --overlap "$REPO/hx" --session sid-pre --in-flight "uncommitted work in hx" 2>&1)
 hid=$(jq -r .id "$T/handoff/$REPO--hx.json" 2>/dev/null)
 { [ -n "$hid" ] && [ "$(jq -r .live "$T/handoff/$REPO--hx.json")" = predecessor ]; } && ok "the record names the predecessor as live from the first instant" || bad "overlap record: $out"
 grep -q "uncommitted work in hx" "$T/handoff/$REPO--hx.brief" 2>/dev/null && ok "the successor's brief carries what is unfinished RIGHT NOW" || bad "successor brief has no in-flight checklist"
@@ -1242,7 +1208,7 @@ tmux list-windows -t main -F '#W' | grep -qx "$REPO/hx~next" && ok "the successo
 # channels confirmation until a human noticed (2026-09-01 02:10Z; the 2026-08-28 incident, again).
 tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>/dev/null | grep -q "CC_HANDOFF_WINDOW='$REPO/hx~next'" \
   && ok "the successor is started knowing its OWN window, so it accepts its own dialog and does not park on it" || bad "no CC_HANDOFF_WINDOW on the successor: $(tmux display-message -p -t "$REPO/hx~next" '#{pane_start_command}' 2>&1)"
-CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hx" >/dev/null 2>&1 && bad "a second overlap was allowed for one target" || ok "an overlap is refused while one is open — one successor at a time"
+"$B/cc" handoff --overlap "$REPO/hx" >/dev/null 2>&1 && bad "a second overlap was allowed for one target" || ok "an overlap is refused while one is open — one successor at a time"
 # the guard, from BOTH sides of the record. cwd is $T: no marker, so only the record can gate.
 h(){ printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s","session_id":"%s"}' "$1" "$T" "${3:-}" | env CC_HANDOFF="${2:-}" "$B/cc-guard" >/dev/null 2>&1; echo $?; }
 miss=""; for c in "gh pr merge 1" "git push origin HEAD" "cc r t --go x" "cc done r t" "sudo apt install x"; do
@@ -1272,7 +1238,7 @@ for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hx"
 # by a human), so the old wait-it-out never completed on its own: on 2026-08-31 a retired session ran on for
 # 35 minutes as a second live voice, its window still the ACTIVE one. The grace expires into a kill.
 tmux new-window -d -t main -n "$REPO/hz" -c "$T" "bash -c 'sleep 300; :'"
-CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hz" --session sid-pre-z >/dev/null 2>&1
+"$B/cc" handoff --overlap "$REPO/hz" --session sid-pre-z >/dev/null 2>&1
 hz=$(jq -r .id "$T/handoff/$REPO--hz.json" 2>/dev/null); pz=$(jq -r .predecessor.tmux "$T/handoff/$REPO--hz.json" 2>/dev/null); sz=$(jq -r .successor.tmux "$T/handoff/$REPO--hz.json" 2>/dev/null)
 CC_HANDOFF="$hz" "$B/cc-handoff" --ready "$REPO/hz" >/dev/null 2>&1     # --ready fires --retire in the background
 for _ in $(seq 60); do [ -f "$T/handoff/$REPO--hz.json" ] || break; sleep 0.5; done
@@ -1282,24 +1248,13 @@ w=$(tmux list-windows -t main -F '#{window_id} #W')
 [ ! -f "$T/handoff/$REPO--hz.json" ] && ok "...and the record is cleared, so nothing is gated by it any more" || bad "record survived the retirement"
 [ "$(h "cc r t --go x" "$hz")" = 0 ] && ok "TONIGHT'S CASE: a COMPLETED handoff does not brick the session that won it (it still dispatches, PRs and pushes)" || bad "the survivor of a completed handoff is gated"
 [ "$(h "cc r t --go x" "no-such-record")" = 2 ] && ok "...while a record missing for any OTHER reason gates exactly as before" || bad "an unbacked CC_HANDOFF was let through"
-# TONIGHT'S OTHER HALF, end to end: that survivor must also be able to hand ITSELF off. $CC_HANDOFF dies with
-# the successor's process, not with the handoff, so read as a bare flag it silenced cc-context and cc-handoff
-# for the rest of that session's life — the box could overlap a target exactly ONCE, and on 2026-09-01 the
-# planning session sat past the hand-off line all evening at 51.5% until a human started the handoff by hand.
-ev=$(CC_HANDOFF="$hz" CC_HANDOFF_OVERLAP=1 "$B/cc-handoff" --event "$REPO/hz" --level handoff --pct 51.5 --live 2>/dev/null)
-{ [ "$(jq -r .action <<<"$ev")" = overlap ] && [ -f "$T/handoff/$REPO--hz.json" ]; } \
-  && ok "TONIGHT'S CASE: past the hand-off line, the survivor of a RETIRED handoff opens one of its own — the overlap is not a one-shot" || bad "no overlap opened for the survivor: [$ev]"
-"$B/cc-handoff" --abandon "$REPO/hz" >/dev/null 2>&1
-ev=$(CC_HANDOFF="$hz-still-open" CC_HANDOFF_OVERLAP=1 "$B/cc-handoff" --event "$REPO/hz" --level handoff --pct 51.5 --live 2>/dev/null)
-{ [ "$(jq -r .action <<<"$ev")" = "" ] && [ ! -f "$T/handoff/$REPO--hz.json" ]; } \
-  && ok "...while a handoff still OPEN keeps its successor out of it — the rule only relaxes once <id>.done is there" || bad "an open handoff did not hold: [$ev]"
 for id in $(tmux list-windows -t main -F '#{window_id} #W' | awk -v r="$REPO/hz" '$2==r || $2==r"~next" || $2==r"~old"{print $1}'); do tmux kill-window -t "$id"; done
 
 # THE SWEEP, on real windows. Every phase above is driven by a session's own Stop hook — which is exactly what
 # a session that CRASHED no longer has. On 2026-08-31 a retirement dying between the marker and the record
 # would have left the survivor gated with nothing left to reap it; the cc-reconcile timer is what reaps it now.
 tmux new-window -d -t main -n "$REPO/hs" -c "$T" "bash -c 'sleep 300; :'"
-CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hs" --session sid-pre-s >/dev/null 2>&1
+"$B/cc" handoff --overlap "$REPO/hs" --session sid-pre-s >/dev/null 2>&1
 hs=$(jq -r .id "$T/handoff/$REPO--hs.json" 2>/dev/null); ss=$(jq -r .successor.tmux "$T/handoff/$REPO--hs.json" 2>/dev/null)
 "$B/cc-handoff" --sweep >/dev/null 2>&1
 [ -f "$T/handoff/$REPO--hs.json" ] && ok "the sweep leaves an overlap that is inside its deadline alone" || bad "a live overlap was swept"
@@ -1319,7 +1274,7 @@ tmux list-windows -t main -F '#{window_id} #W' | grep -qx "$ss $REPO/hs" && ok "
 # the other half: an overlap that never reached --ready expires QUIETLY — its predecessor never stopped working
 nb=$(cat "$CC_NOTIFY_LOG" 2>/dev/null | wc -l)
 tmux new-window -d -t main -n "$REPO/hq" -c "$T" "bash -c 'sleep 300; :'"
-CC_HANDOFF_OVERLAP=1 "$B/cc" handoff --overlap "$REPO/hq" --session sid-pre-q >/dev/null 2>&1
+"$B/cc" handoff --overlap "$REPO/hq" --session sid-pre-q >/dev/null 2>&1
 python3 - "$T/handoff/$REPO--hq.json" <<'EOP'
 import json, sys, time
 r = json.load(open(sys.argv[1])); r["deadline"] = time.time() - 600
@@ -2532,7 +2487,7 @@ printf '{"is_error":false,"num_turns":1,"total_cost_usd":0.001,"result":"ok"}'
 F
 chmod +x "$T/probeclaude"
 ME(){ env -u TMUX TMUX_TMPDIR="$T" HOME="$MH" CC_TMUX_SESSION=_ccmodel CC_MODEL_PROC=cat \
-      CC_NOTIFY_LOG="$MH/.cc/notify.log" CC_LIMIT_STAMP="$MH/.cc/state/claude-limit" \
+      CC_NOTIFY_LOG="$MH/.cc/notify.log" CC_LIMIT_STAMP="$MH/.cc/state/claude-limit" CC_STATUSLINE_DIR="$MH/.cc/state/statusline" \
       CC_MODEL_PRIMARY='claude-fable-5[1m]' CC_MODEL_FALLBACK=claude-opus-5 "$@"; }
 M(){ ME "$B/cc-model" "$@"; }
 muntil(){   # how `cc-model status` must render the override's own until: the clock alone today, dated on any other

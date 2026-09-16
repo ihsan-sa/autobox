@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """cc-scope — the ask ledger: every ask the owner makes is written down, and 'done' is measured against it.
 
-The board tracks what the BOX decided to do. Nothing tracked what the OWNER asked for, so a compound ask
-("do X, and also Y") was closed on X, and a standing rule said once in a thread was forgotten by the next
-session. This is the missing half: one row per ask, opened when it is made, closed only against evidence.
+The board tracks what the BOX decided to do; this is the other half, one row per ask, opened when it is made
+and closed only against evidence. A compound ask ("do X, and also Y") gets closed on X, and a standing rule
+said once in a thread is forgotten by the next session — the ledger is what stops both. Rows are written by
+hand: `add` for one ask, `import` for a seed file.
 
 Ledger: ~/.cc/scope/<repo>.json  (sidecar like the board — never in git, so no merge noise).
-Every owner message the capture path saw is logged to ~/.cc/scope/seen.log whether it was captured or not:
-the classifier below is a filter, not an oracle, and `cc-scope missed` is how a miss is found and added.
 
 An ask moves  open → claimed → merged → delivered → verified,  or leaves the queue as  declined.
 
@@ -30,31 +29,16 @@ legitimate answer — but it must say why, in its own words, and the reason stay
 `--why` is therefore required. An omission leaves an open item; a decision leaves a reason; the two can never
 be mistaken for each other, which is the whole point of writing the asks down.
 
-A CHECK THAT CANNOT RUN IS NOT A CHECK THAT FAILED. Ask a69's check was a script in its track's state dir;
-the track finished, the janitor took the dir, and for five days the row read "merged, NOT delivered — its
-check has not passed" while nothing about the ask had changed and nobody had measured anything. Both states
-are rc≠0 and they mean opposite things, so they are now told apart: rc 126/127 is "no answer", it exits 3,
-it says so on every line you read, and it never overwrites a check that once passed. The other half is that
-a check should outlive its track — `check-cmd --script` copies the script in beside the ledger, and a check
-that runs a script out of a directory which dies with its track is refused.
+A CHECK THAT CANNOT RUN IS NOT A CHECK THAT FAILED. Both are rc≠0 and they mean opposite things, so they are
+told apart: rc 126/127 is "no answer", it exits 3, it says so on every line you read, and it never overwrites
+a check that once passed. The other half is that a check should outlive its track — `check-cmd --script`
+copies the script in beside the ledger, and a check that runs a script out of a directory which dies with its
+track (a track's state dir, its worktree, /tmp) is refused.
 
-A CHECK IS NOT REPLACED IN SILENCE. Ask a342's orch registered a check that read the live mail log; an hour
-later another seat wrote over its checks/ script with one that ran a selftest, and `deliver` passed it on a
-fixture (2026-09-12). So check-cmd will not replace a row's check without `--replace "<why>"`, prints the one
-that is there when it refuses, and keeps the reason in the row's notes. And every script under checks/ a check
-runs is fingerprinted when it is registered: `deliver` refuses (exit 3) to run one edited since.
-
-KEPT BEFORE IT IS CLASSIFIED. The classifier below is a filter and it has been wrong: "Ok well do whatever
-you need to speed up the whole landing and review process" (2026-09-08) was dropped whole because the
-sentence opened with an acknowledgement, and the only copy left of it was a seen.log line clipped at 160
-characters and waiting to be trimmed. So every turn whose PROVENANCE says the owner wrote it is written to
-~/.cc/scope/turns.jsonl in full, with its source, BEFORE the classifier runs. One the classifier keeps is
-disposed of on the spot; one it skips stays PENDING until a person or a session says what it was — `classify`
-(run the classifier over it again), `promote` (open the ask from the kept text, nothing retyped), or `dismiss
---why`. Compaction moves disposed records to turns-archive.jsonl and never touches a pending one: nothing
-leaves that file for being old. Machine turns are excluded by provenance, not by wording, and are not kept at
-all — see NOT_A_PERSON. What IS kept has its tokens redacted first (cc-slack's pattern) and one absurd
-paste cut at TURN_MAX; `missed` prints the size of the record, because nothing ages out of it.
+A CHECK IS NOT REPLACED IN SILENCE. check-cmd will not replace a row's check without `--replace "<why>"`,
+prints the one that is there when it refuses, and keeps the reason in the row's notes. Every script under
+checks/ a check runs is fingerprinted when it is registered: `deliver` refuses (exit 3) to run one edited
+since, because a check quietly written over by another seat passed an ask on a fixture (a342, 2026-09-12).
 
   cc-scope add <repo> "<ask>" [--src REF] [--track T] [--done-when "..."] [--check "<cmd>"] [--who W] [--at ISO]
   cc-scope list [<repo>] [--all] [--status S] [--track T] [--json]   unsettled asks (all repos if none named)
@@ -71,23 +55,17 @@ paste cut at TURN_MAX; `missed` prints the size of the record, because nothing a
   cc-scope decline <repo> <id> --why "<why it should not be built>"  a decision, kept in the ledger
   cc-scope track|note <repo> <id> "<text>"                           link an ask to a track / add a note
   cc-scope check <repo> [--track T]                                  exit 1 while anything is unsettled
-  cc-scope capture <repo> [--src REF] [--who W]                      classify a message on stdin
-  cc-scope missed [<repo>] [--since H] [--all] [--full] [--json]     his turns nobody has classified yet
-  cc-scope classify [<repo>] [--id T]                                run the classifier over them again
-  cc-scope promote <turn> [--track T] [--done-when …] [--check …]    open the ask from the kept text
-  cc-scope dismiss <turn> --why "<why it is not an ask>"             it was not an ask, and here is why
   cc-scope digest [<repo>] · count [<repo>] · import <repo> <file> · selfcheck
-  cc-scope hook                                                      UserPromptSubmit hook (always 0; speaks only for cc-handoff --relay)
+  cc-scope hook                                                      a no-op kept for a settings file that still names it
 
 Exit, for the commands a caller acts on: 0 did it · 1 the check ran and FAILED · 2 the row names no check ·
 3 the check COULD NOT RUN, or was not run because its script changed since it was registered, so nothing was
 measured either way.
 """
-import sys, os, re, json, time, fcntl, hashlib, calendar, shutil, shlex, subprocess
+import sys, os, re, json, time, fcntl, hashlib, shutil, shlex, subprocess
 
 HOME = os.path.expanduser("~")
 SCOPE = os.environ.get("CC_SCOPE_DIR", os.path.join(HOME, ".cc", "scope"))
-SEEN = "seen.log"
 STATES = ["open", "claimed", "merged", "delivered", "verified", "declined"]
 # Off the queue. `merged` is deliberately NOT here — that is the whole fix: code on the default branch is
 # still work until something observes it. Declined is settled and STAYS VISIBLE — see the header.
@@ -97,20 +75,6 @@ MARK = {"open": "·", "claimed": "▸", "merged": "→", "delivered": "✓", "ve
 EXAMPLES = "systemctl --user is-active <unit> · test bin/x -nt <the merge> · a grep of what the tab renders"
 CHECK_TIMEOUT = 300  # a verification is meant to be CHEAP: one grep, one systemctl is-active, one curl
 MAXTEXT = 800          # a whole essay is not an ask; the source ref is how you read the rest
-SEEN_KEEP = 400        # lines of seen.log kept — enough to catch a miss the same day
-TURNS = "turns.jsonl"                  # the record: every owner turn in full, written before it is classified
-TURNS_ARCHIVE = "turns-archive.jsonl"  # where compaction puts the DISPOSED ones — nothing is ever deleted
-TURNS_KEEP = 400                       # records in the live file before disposed ones are archived out of it
-TURN_MAX = 100000                      # one turn's text: an ask is not 100 KB, and a paste that size is not
-                                       # made more useful by keeping every byte of it forever
-# A TOKEN HE PASTED IS NOT KEPT. This record holds what he typed, in full, for as long as nobody disposes of
-# it — and a terminal is where people paste credentials. The pattern is cc-slack's own SECRET_RE ("what a
-# tool preview relayed to Slack must never carry"), COPIED and not imported: this runs in the
-# UserPromptSubmit hook on every prompt, and importing that file to borrow one regex would cost every
-# session a parse of it. The selfcheck reads cc-slack's source and holds this copy to it, so it cannot
-# drift in silence.
-SECRET_RE = re.compile(r"(xox[abpsr]-[A-Za-z0-9-]+|Authorization:\s*\S+(?:\s+\S+)?|Bearer\s+[A-Za-z0-9._~+/=-]{8,}"
-                       r"|AKIA[0-9A-Z]{12,}|gh[pousr]_[A-Za-z0-9]{20,})")
 # bash's own two codes for "there was nothing to run": 127 not found, 126 found but not executable. A check
 # that comes back either of these did not answer the question — see CANNOT RUN in the header.
 CANNOT_RUN = (126, 127)
@@ -155,18 +119,14 @@ def repos():
     except OSError: return []
 
 
-# ---- what counts as an ask -------------------------------------------------------------------------
-# Deterministic, no LLM: the capture path runs on every prompt and must be cheap, silent and predictable.
-# It keeps DIRECTIVES — the things that outlive the reply. A plain question is answered in the reply and
-# would bury the ledger, so it is logged to seen.log and not opened; `missed` is where you go looking.
+# ---- the directives inside an ask ------------------------------------------------------------------
+# Deterministic, no LLM. A compound ask is where scope goes missing, so a row keeps the separate
+# directive sentences beside its text and `show` prints them.
 _ACKS = (r"thanks?|thx|ty|ok(?:ay)?|k|cool|nice|great|good|sure|yes|yeah|yep|no|nope|perfect|lgtm|"
          r"got ?it|right|agreed|👍|👌|🙏|🎉|❤️")
-ACK = re.compile(r"^\W*(?:%s)\b" % _ACKS, re.I)
-# AN ACKNOWLEDGEMENT CAN OPEN A REAL INSTRUCTION. A sentence beginning with one used to be dropped whole, so
-# "Ok well do whatever you need to speed up the whole landing and review process" (2026-09-08) never
-# reached the cue that is plainly in it. The lead is stripped and what follows is judged on its own; what is
-# KEPT is still his sentence, ack and all. A bare ack strips to nothing and stays out, and `is_ask` keeps its
-# own floor under the short ones ("ok cool, thanks a lot").
+# AN ACKNOWLEDGEMENT CAN OPEN A REAL INSTRUCTION: "ok well do whatever you need to speed the landing up"
+# is one. The lead is stripped and what follows is judged on its own; what is KEPT is still the whole
+# sentence, ack and all. A bare ack strips to nothing and carries no cue of its own.
 ACK_LEAD = re.compile(r"^\W*(?:%s)\b[\s,.:;!—–-]*" % _ACKS, re.I)
 CUE_START = re.compile(r"^\W*(add|allow|always|answer|archive|ask|attach|be|break|build|cancel|change|"
                        r"check|clean|close|come|connect|cut|delete|deny|deploy|describe|disable|do|don'?t|"
@@ -204,14 +164,6 @@ def parts_of(text):
         # begin with an ack word ("no longer …") and stripping it would lose one.
         if core and (CUE_START.match(core) or CUE_ANY.search(s)): out.append(s[:200])
     return out
-
-
-def is_ask(text):
-    t = text.strip()
-    if not t or t.startswith(("!", "/")): return False        # a free ! command / slash command is not an ask
-    if len(t.split()) < 3 and ACK.match(t): return False
-    if ACK.match(t) and len(t.split()) < 6: return False       # "thanks, that looks great"
-    return bool(parts_of(t))
 
 
 def norm(text):
@@ -470,299 +422,13 @@ def line(repo, a, many=False):
     return "%s %s%-4s %s%s%s%s" % (MARK.get(a["status"], "?"), head, a["id"], a["text"][:96], tail, flag, why)
 
 
-# ---- capture ---------------------------------------------------------------------------------------
-TAG = re.compile(r"<channel\s([^>]*)>", re.S)
-ATTR = re.compile(r'(\w+)="([^"]*)"')
-
-
-def strip_tag(text):
-    """Slack arrives wrapped in a <channel …> tag. Returns (body, attrs) — the tag carries who is speaking
-    (role=owner|member) and where, both of which decide whether this is an owner ask and how to cite it."""
-    m = TAG.search(text)
-    if not m: return text.strip(), {}
-    attrs = dict(ATTR.findall(m.group(1)))
-    body = (text[:m.start()] + text[m.end():])
-    body = re.sub(r"</channel>", "", body).strip()
-    return body, attrs
-
-
-def log_seen(repo, decision, text, src):
-    try:
-        os.makedirs(SCOPE, exist_ok=True)
-        p = os.path.join(SCOPE, SEEN)
-        with open(p, "a") as f:
-            f.write("%s\t%s\t%s\t%s\t%s\n" % (now(), repo, decision, src or "-",
-                                              " ".join(text.split())[:160]))
-        with open(p) as f: lines = f.readlines()
-        if len(lines) > SEEN_KEEP * 2:                      # trim in batches, not on every write
-            with open(p + ".tmp", "w") as f: f.writelines(lines[-SEEN_KEEP:])
-            os.replace(p + ".tmp", p)
-    except OSError: pass
-
-
-# ---- the record: kept before it is classified ------------------------------------------------------
-# seen.log is a trail for a person to read: one line per turn, clipped at 160 characters and trimmed to the
-# last SEEN_KEEP lines — which is how the only copy of a real ask went missing. This is the record itself:
-# full text, who, where, and what was eventually decided about it. Nothing leaves it for being old.
-
-def redact(text):
-    """Tokens out, before anything writes the turn down. Idempotent — running it twice changes nothing."""
-    return SECRET_RE.sub("[redacted]", text or "")
-
-
-def turns_path(name=TURNS): return os.path.join(SCOPE, name)
-
-
-def read_turns(name=TURNS):
-    out = []
-    try:
-        with open(turns_path(name)) as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln: continue
-                try: out.append(json.loads(ln))
-                except ValueError: continue        # one half-written line is not a reason to lose the rest
-    except OSError: pass
-    return out
-
-
-def write_turns(recs):
-    tmp = turns_path() + ".tmp"
-    with open(tmp, "w") as f:
-        for r in recs: f.write(json.dumps(r) + "\n")
-    os.replace(tmp, turns_path())
-
-
-def compact_turns():
-    """Move the DISPOSED records to the archive and keep every pending one. The caller holds the lock.
-    A file that is all pending simply grows: turns nobody has classified are a backlog, and trimming them
-    by age is the bug this record exists to end."""
-    recs = read_turns()
-    if len(recs) <= TURNS_KEEP: return 0
-    gone = [r for r in recs if r.get("disposed")]
-    if not gone: return 0
-    with open(turns_path(TURNS_ARCHIVE), "a") as f:
-        for r in gone: f.write(json.dumps(r) + "\n")
-    write_turns([r for r in recs if not r.get("disposed")])
-    return len(gone)
-
-
-def keep_turn(repo, text, who="owner", src=""):
-    """Write one owner turn down, in full, before anything judges it. Returns its id, or "" if it could not
-    be written — the hook must never break a session, so this raises nothing."""
-    try:
-        os.makedirs(SCOPE, exist_ok=True)
-        text = redact(text)                             # every caller's text, not just the capture path's
-        if len(text) > TURN_MAX:
-            text = text[:TURN_MAX] + " … [%d characters not kept: one turn over %d]" % (
-                len(text) - TURN_MAX, TURN_MAX)
-        ts = now()
-        with Lock("turns"):
-            p = turns_path()
-            seq = os.path.getsize(p) if os.path.exists(p) else 0
-            tid = "t" + hashlib.sha1(("%s|%s|%d" % (ts, text, seq)).encode()).hexdigest()[:8]
-            with open(p, "a") as f:
-                f.write(json.dumps({"id": tid, "ts": ts, "repo": repo, "who": who, "src": src,
-                                    "text": text, "disposed": "", "why": "", "ask": ""}) + "\n")
-            compact_turns()
-        return tid
-    except OSError: return ""
-
-
-def dispose_turn(tid, how, why="", ask=""):
-    """What the turn turned out to be: classified, promoted or dismissed. A record already disposed of keeps
-    the first answer given — this is a log of what was decided, not a field to overwrite."""
-    try:
-        with Lock("turns"):
-            recs = read_turns()
-            for r in recs:
-                if r.get("id") == tid and not r.get("disposed"):
-                    r.update(disposed=how, why=why, ask=ask, closed=now())
-                    write_turns(recs)
-                    return True
-    except OSError: pass
-    return False
-
-
-def get_turn(tid):
-    for name in (TURNS, TURNS_ARCHIVE):
-        for r in read_turns(name):
-            if r.get("id") == tid: return r
-    sys.exit("cc-scope: no kept turn %s — `cc-scope missed --all` lists the ones still waiting" % tid)
-
-
-def turns_size():
-    """(pending, rows, bytes) of the live record. Nothing ages out of that file, so the one place it is read
-    is the place that has to say how big it has become — before it is somebody's surprise."""
-    try: b = os.path.getsize(turns_path())
-    except OSError: b = 0
-    recs = read_turns()
-    return sum(1 for r in recs if not r.get("disposed")), len(recs), b
-
-
-def human(b):
-    for u in ("B", "KB", "MB", "GB"):
-        if b < 1024 or u == "GB": return "%d %s" % (b, u) if u == "B" else "%.1f %s" % (b, u)
-        b /= 1024.0
-
-
-def pending_turns(repo=None, since=0.0):
-    """The turns nobody has answered for yet, oldest first."""
-    out = []
-    for r in read_turns():
-        if r.get("disposed"): continue
-        if repo and r.get("repo") != repo: continue
-        if since:
-            try:
-                if calendar.timegm(time.strptime(r.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ")) < since: continue
-            except ValueError: continue
-        out.append(r)
-    return out
-
-
-# The Slack path: a channel message reaches the session as a user turn, so the UserPromptSubmit hook sees it
-# with its <channel …> tag intact and `capture` takes the rest from there — no hook inside cc-slack. If a
-# delivery ever bypasses that turn, one line in cc-slack's deliver() closes the gap and nothing else changes:
-#   subprocess.run([f"{BIN}/cc-scope", "capture", repo, "--src", f"slack {chan} {thread_ts}"], input=text, text=True)
-# A REACTION CARRIES NO WORDS OF HIS. cc-slack hands a session a 👍 on one of ITS OWN messages as a message
-# of its own — `👍 on your 13:26 reply: "…"`, tagged kind="reaction" — and everything after the colon is our
-# reply quoted back, up to sixty characters of it. The classifier read those sixty characters as the owner's
-# and opened a row: one on our own "Fix on its way", two more on our own "rather than". All three were
-# read and declined by hand, and while they sat there they counted toward the open-ask number the pulse
-# reports. Most 👍 miss the cues and are skipped as no-directive, which is why this looked intermittent —
-# it was never the reaction, it was whichever of our sentences the excerpt happened to cut. So it is decided
-# on the tag, which is the fact, and never on the shape of the quote: approving what was already said is the
-# whole of a reaction, and a 👎 or a removal says just as little that belongs in a ledger of requests. It is
-# still logged, because it IS the owner speaking and `missed` is where a wrong call gets found.
-REACTION = "reaction"
-
-
-def capture(repo, text, who="owner", src=""):
-    """PROVENANCE, THEN KEEP, THEN CLASSIFY — in that order, because the classifier is the part that has
-    been wrong. Everything the provenance rules accept as his is on disk in full before `is_ask` is asked
-    anything, and a turn it skips stays pending in that record instead of surviving only as a clipped log
-    line. What provenance excludes — a member, a machine, a reaction, which carries no words of his — is not
-    kept at all: this is a record of what the OWNER said, and padding it makes it useless."""
-    body, attrs = strip_tag(text)
-    body = redact(body)                                 # before the record, the ledger and seen.log alike
-    if attrs:
-        if attrs.get("role") and attrs["role"] != "owner":
-            log_seen(repo, "skip:not-owner", body, src); return None, False   # the ledger is the OWNER's asks
-        who = attrs.get("user") or who
-        if not src and attrs.get("channel"):
-            src = "slack %s %s" % (attrs["channel"], attrs.get("thread_ts") or attrs.get("ts") or "")
-        if attrs.get("kind") == REACTION:
-            log_seen(repo, "skip:reaction", body, src); return None, False    # our own reply, quoted back
-    if not_a_person(text, attrs): return None, False    # the hook's own gate, and the same one for `capture`
-    tid = keep_turn(repo, body, who, src.strip())
-    if not is_ask(body):
-        log_seen(repo, "skip:no-directive", body, src)
-        return None, False                              # the record stays pending until somebody disposes of it
-    aid, repeated = add(repo, body, who=who, src=src.strip())
-    dispose_turn(tid, "classified", ask="%s %s" % (repo, aid))
-    log_seen(repo, "kept:%s%s" % (aid, "+" if repeated else ""), body, src)
-    return aid, repeated
-
-
-def repo_of(cwd):
-    """A session's repo from its cwd: ~/dev/<repo> or ~/.cc/worktrees/<repo>/<track>."""
-    cwd = os.path.realpath(cwd or "")
-    for base, depth in ((os.path.join(HOME, "dev"), 1), (os.path.join(HOME, ".cc", "worktrees"), 1)):
-        base = os.path.realpath(base)
-        if cwd == base or cwd.startswith(base + os.sep):
-            rest = cwd[len(base):].strip(os.sep).split(os.sep)
-            if rest and rest[0]: return rest[0]
-    return ""
-
-
-def worker_cwd(cwd):
-    """A track worktree (marker .cc/track) is a WORKER: its prompts are the task it was dispatched with,
-    not asks the owner made. Same marker cc-guard walks, for the same reason — the marker is the truth."""
-    d = os.path.realpath(cwd or "")
-    while d and d != "/":
-        if os.path.exists(os.path.join(d, ".cc", "track")): return True
-        d = os.path.dirname(d)
-    return False
-
-
-# ---- what is not a person asking ------------------------------------------------------------------
-# Everything below reached UserPromptSubmit as a user turn and opened a row somebody then had to decline by
-# hand (a28, a29, a54, a60, a61, a63 on 2026-08-31). The ledger is the authority on what the OWNER asked
-# for, so a wrong row costs more than a missed one. Matched on the start of the prompt — every one of these
-# wrappers leads — and NOT written to seen.log: that file is 400 lines of owner messages the classifier may
-# have got wrong, and one night of task-notifications is enough to flush a real miss out of it.
-NOT_A_PERSON = (
-    "<task-notification",           # the harness reporting a background task or subagent finished
-    "<cross-session-message",       # a peer session writing into this one over its socket
-    "[SYSTEM NOTIFICATION",         # the harness in its own voice: limits, restarts, context
-    "[Cross-session idle notice]",  # the idle sweep saying another session went quiet
-    "<command-name",                # a slash command the session ran — the invocation, not an ask
-    "<local-command-stdout",        # ...and its output, handed back as the next turn
-    "[cc-handoff]",                 # a prompt cc-handoff typed into a session: it tags every one (its MACHINE)
-)
-
-# The harness also speaks in plain sentences, with no wrapper to lead with, and those turns carry real
-# imperatives: "Your claude.ai usage limit has reset. Continue the task you were working on…" opened a row
-# in FOUR repos' ledgers within a minute of the same reset on 2026-09-04, one of them splitting out a
-# sub-directive, and every one was declined by hand. Only the wording gives these away, so they are matched at
-# the start of the prompt and loosely — the harness rewords them between versions — and never mid-sentence,
-# which is what keeps an owner ask ABOUT the limit ("the usage limit keeps eating the queue, fix it") a row.
-HARNESS_NOTICE = re.compile(r"""(?ix) ^\s* (
-      (your\ \S+\ )? usage\ limit\ has\ reset                # the reset that wakes a stopped session back up
-    | (claude\ )? usage\ limit\ reached                      # the limit itself, and its auto-continue banner
-    | [\w.\ ]{0,20} limit\ reached [^\n]{0,40}? now\ using  # a reroute: "Opus limit reached · now using Sonnet"
-    | this\ session\ is\ being\ continued                    # the banner a resumed session opens with
-    | continue\ from\ where\ you\ left\ off                  # ...and the bare nudge that resumes one
-)""")
-
-
-def not_a_person(text, attrs):
-    """True when this prompt was written by a machine. `attrs` is the <channel …> tag if there was one:
-    a Slack message is an owner ask only when a real owner really typed it in a real channel. `inject` is a
-    local, unauthenticated door any process on the box may use and it stamps role="owner" chat_id="local",
-    which is how the board watchdog's own line became an owner ask (a54)."""
-    if text.lstrip().startswith(NOT_A_PERSON): return True
-    if HARNESS_NOTICE.match(text): return True
-    if attrs:
-        if attrs.get("role") != "owner": return True                        # member, bot, anything but him
-        if attrs.get("chat_id") == "local" or attrs.get("channel") == "local": return True   # injected here
-        if attrs.get("source", "cc-slack") != "cc-slack": return True       # absent = the ordinary Slack path
-    return False
-
-
-def relayed(payload):
-    """`cc-handoff --relay`, with the hook's own payload: it answers with a block decision (JSON on stdout) when
-    this session is the RETIRING side of a handoff and the prompt went to its successor, and with nothing
-    otherwise. Its stdout is handed back as ours; any failure is no decision — the hook must never break a session."""
-    try:
-        r = subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-handoff"), "--relay"],
-                           input=json.dumps(payload), capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and r.stdout.strip():
-            sys.stdout.write(r.stdout); sys.stdout.flush()
-            return True
-    except Exception: pass
-    return False
-
-
+# ---- the hook that is no longer one -----------------------------------------------------------------
 def hook():
-    """UserPromptSubmit. Prints NOTHING of its own (stdout would land in the session's context) and always exits
-    0: a ledger that can break a session is worse than no ledger. The one thing it passes through is cc-handoff's
-    --relay decision — a prompt typed into a retiring session goes to its successor and is blocked here."""
-    try:
-        payload = json.load(sys.stdin)
-        text = payload.get("prompt") or ""
-        cwd = payload.get("cwd") or os.getcwd()
-        if not text.strip(): return
-        if relayed(payload): return                          # the successor's ask now, not this session's
-        _, attrs = strip_tag(text)
-        if not_a_person(text, attrs): return                 # machine chatter, not an ask — see NOT_A_PERSON
-        if not attrs:                                        # no channel tag: a prompt typed into the session
-            # "steward" too (a source name older code may still write): its one-shot prompt was a machine's event, not a person's ask, and it arrives
-            # with no channel tag — captured, it would file the event as an ask against repo "box".
-            if os.environ.get("CC_ROLE") in ("worker", "member", "steward") or worker_cwd(cwd): return
-        repo = repo_of(cwd) or os.environ.get("CC_REPO") or "box"
-        src = "slack" if attrs else "terminal %s" % (payload.get("session_id") or "")[:8]
-        capture(repo, text, src="" if attrs else src)
+    """A NO-OP. The live ~/.claude/settings.json may still name `cc-scope hook` as a UserPromptSubmit hook:
+    `cc-settings apply` only ADDS hooks and cannot drop one, so until the owner takes that row out by hand a
+    missing subcommand would put usage text on stderr into every session, on every prompt. It is no longer in
+    the managed config, so a fresh box never registers it. Drain stdin, print nothing, exit 0."""
+    try: sys.stdin.read()
     except Exception: pass
 
 
@@ -797,10 +463,6 @@ def main(argv):
                        check=chk, at=opt(args, "--at"))
         print("%s %s%s" % (repo, aid, " (asked again)" if rep else ""))
 
-    elif cmd == "capture":
-        repo = args[0]
-        aid, rep = capture(repo, sys.stdin.read(), who=opt(args, "--who", "owner"), src=opt(args, "--src"))
-        print("%s %s" % (repo, aid + (" (asked again)" if rep else "")) if aid else "not an ask (logged)")
 
     elif cmd == "list":
         status, track, everything = opt(args, "--status") or None, opt(args, "--track") or None, flag(args, "--all")
@@ -1026,69 +688,6 @@ def main(argv):
         if n: print("• 📋 %d ask%s of yours still open%s" % (n, "" if n == 1 else "s",
                                                             " (%s)" % why if why else ""))
 
-    elif cmd == "missed":
-        # Read out of the RECORD, not out of seen.log: these are the turns themselves, so anything listed
-        # here can be promoted verbatim. Pending only — a turn somebody has already answered for is not a miss.
-        everything, full = flag(args, "--all"), flag(args, "--full")
-        since = float(opt(args, "--since", "24")) * 3600
-        repo = args[0] if args else None
-        rows = pending_turns(repo, 0 if everything else time.time() - since)
-        pend, total, size = turns_size()
-        if js:
-            print(json.dumps({"pending": pend, "rows": total, "bytes": size, "turns": rows}, indent=2)); return
-        when = "all of them" if everything else "last %gh" % (since / 3600)
-        # The whole file, not this repo's slice: it is one record and its growth is one number.
-        print("record: %d pending of %d rows, %s (%s)" % (pend, total, human(size), turns_path()))
-        if not rows: print("nothing of his is waiting to be classified (%s)" % when); return
-        print("owner turns kept, never classified (%s) — `promote <id>` or `dismiss <id> --why`:" % when)
-        # A clipped list that does not say it is clipped is how this went wrong the first time.
-        if len(rows) > 40: print("  … %d older ones not printed — --json has every one" % (len(rows) - 40))
-        for r in rows[-40:]:
-            print("  %s %s %s  %s" % (r["id"], r["ts"], r["repo"], r.get("src") or "-"))
-            print("      %s" % (r["text"] if full else " ".join(r["text"].split())[:160]))
-
-    elif cmd == "promote":
-        # The whole point of keeping the turn: the row is opened from HIS text, dated when he sent it, with
-        # the thread it came from. Nothing is retyped and nothing is paraphrased.
-        r = get_turn(args[0])
-        if r.get("disposed"):
-            sys.exit("cc-scope: %s was already %s%s" % (r["id"], r["disposed"],
-                                                        " (%s)" % (r.get("ask") or r.get("why")) if
-                                                        (r.get("ask") or r.get("why")) else ""))
-        chk = opt(args, "--check")
-        refuse_doomed(r["repo"], "<new>", chk)
-        aid, rep = add(r["repo"], r["text"], who=r.get("who") or "owner", src=r.get("src", ""),
-                       track=opt(args, "--track"), done_when=opt(args, "--done-when"),
-                       check=chk, at=r.get("ts", ""))
-        dispose_turn(r["id"], "promoted", ask="%s %s" % (r["repo"], aid))
-        print("%s %s%s ← %s" % (r["repo"], aid, " (asked again)" if rep else "", r["id"]))
-
-    elif cmd == "dismiss":
-        why = opt(args, "--why")
-        if not why: sys.exit("cc-scope: dismiss needs --why — a turn leaves the list with a reason, like a decline")
-        r = get_turn(args[0])
-        if r.get("disposed"): sys.exit("cc-scope: %s was already %s" % (r["id"], r["disposed"]))
-        dispose_turn(r["id"], "dismissed", why=why)
-        print("%s dismissed: %s" % (r["id"], why))
-
-    elif cmd == "classify":
-        # The classifier is a filter that has been wrong and will be again, so this is how a session runs the
-        # current one over what an older one skipped. Only the turns it now keeps move; the rest stay pending,
-        # which is the honest answer rather than a second silent drop.
-        tid = opt(args, "--id")
-        rows = [get_turn(tid)] if tid else pending_turns(args[0] if args else None)
-        rows = [r for r in rows if not r.get("disposed")]
-        kept = 0
-        for r in rows:
-            if not is_ask(r["text"]): continue
-            aid, _ = add(r["repo"], r["text"], who=r.get("who") or "owner", src=r.get("src", ""),
-                         at=r.get("ts", ""))
-            dispose_turn(r["id"], "classified", ask="%s %s" % (r["repo"], aid))
-            print("  %s %s ← %s  %s" % (r["repo"], aid, r["id"], " ".join(r["text"].split())[:80]))
-            kept += 1
-        print("cc-scope: %d of %d pending turn(s) opened a row, %d still waiting" %
-              (kept, len(rows), len(rows) - kept))
-
     elif cmd == "import":         # seed/replay: <at>TAB<src>TAB<track>TAB<status>TAB<evidence>TAB<text>
         repo, f = args[0], args[1]
         n = new = 0
@@ -1119,7 +718,7 @@ def main(argv):
 
 # ---- selfcheck -------------------------------------------------------------------------------------
 def selfcheck():
-    global SCOPE, TURNS_KEEP, TURN_MAX
+    global SCOPE
     import tempfile, shutil, io
     SCOPE = tempfile.mkdtemp(prefix="cc-scope-selfcheck-")
     _fl = os.environ.get("CC_FAILURES")
@@ -1134,12 +733,6 @@ def selfcheck():
     def t(n, cond): ok(n) if cond else bad(n)
     try:
         R = "_scopetest"
-        t("an imperative is an ask", is_ask("add a scope ledger to the digest"))
-        t("a standing rule is an ask", is_ask("from now on lead with the TLDR"))
-        t("a complaint that names the fix is an ask", is_ask("the thread marks aren't working reliably, make them stick"))
-        t("a bare thanks is not an ask", not is_ask("thanks!"))
-        t("an ack with a few words is not an ask", not is_ask("ok cool, thanks a lot"))
-        t("a ! command is not an ask", not is_ask("!status"))
         # A check runs with this file's own bin dir on PATH, so a row may name a sibling tool plainly (review of
         # the rc=127 landings, 2026-09-02): scrub PATH entirely and a bare sibling name still resolves.
         _sib = os.path.basename(os.path.realpath(__file__))
@@ -1152,9 +745,13 @@ def selfcheck():
               run_check(R, {"check": "command -v definitely-not-a-tool-xyz >/dev/null"})[0] != 0)
         finally:
             os.environ["PATH"] = _keep
-        t("a plain question is not opened as an ask", not is_ask("how full is the context?"))
         t("a compound ask keeps both parts",
           len(parts_of("react with :ok_hand: in #approvals. this should also remove it from the board.")) == 2)
+        # An ack can OPEN a real instruction, and the whole sentence is what is kept — ack and all.
+        miss = "Ok well do whatever you need to speed up the whole landing and review process"
+        t("a directive behind an acknowledgement is kept whole", parts_of(miss) == [miss])
+        t("...while an ack that only compliments carries no directive at all",
+          parts_of("ok cool, thanks a lot") == [])
 
         a1, rep = add(R, "make the digest show open asks", src="slack #demo 1788")
         t("add opens an ask", a1 == "a1" and not rep)
@@ -1428,269 +1025,16 @@ def selfcheck():
         t("a row from before fingerprints that runs a script under checks/ is not run either",
           quiet(["deliver", R, aJ]) == 3)
 
-        aid, _ = capture(R, '<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.2" '
-                            'user="ada.byron" role="owner" channel="#demo">\nplease put the open asks on Home',
-                         src="")
-        t("an owner Slack message is captured with its thread as the source",
-          aid and get(R, aid)["src"].startswith("slack #demo 17.1"))
-        t("a member's message is not an owner ask",
-          capture(R, '<channel source="cc-slack" role="member" channel="#help" user="sam">fix the printer')[0] is None)
-        t("a skipped message is still logged, so a miss can be found",
-          "skip:not-owner" in open(os.path.join(SCOPE, SEEN)).read())
-
-        # ---- A REACTION IS NOT AN ASK -----------------------------------------------------------------
-        # The three that were really in a repo's ledger here, verbatim. Every cue word in them
-        # is OURS — cc-slack quotes sixty characters of the message that was reacted to — and each one was
-        # read and declined by hand. `is_ask(said)` is the half that matters: it holds each fixture to
-        # carrying a directive, so these cases fail if they ever stop testing what they were written for.
-        def reacted(said, kind="reaction"):
-            return ('<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.3" user="ada.byron" '
-                    '%srole="owner" channel="#demo">\n%s' % ('kind="%s" ' % kind if kind else "", said))
-        thumbs = {
-            "our own 'Fix on its way'":
-                '👍 on your 23:19 reply: "Agreed, that is the prompt\'s first line. Fix on its way: eac"',
-            "our own 'rather than' in a name we proposed":
-                '👍 on your 13:26 reply: "#demo-ask — it says what you do there rather than what answ"',
-            "our own 'rather than' in a promise we made":
-                '👍 on your 16:29 reply: "Will do — I\'ll lift it myself at cutover rather than asking "',
-        }
-        for whose, said in thumbs.items():
-            t("a reaction is not an ask when the cue inside it is %s" % whose,
-              is_ask(said) and capture(R, reacted(said))[0] is None)
-        t("...and a 👎, or one taken off again, says just as little that belongs in a ledger of requests",
-          capture(R, reacted('👎 on your 09:02 reply: "hold the deploy rather than landing it now"'))[0] is None
-          and capture(R, reacted('👍 taken off your 09:02 reply: "hold the deploy rather than landing '
-                                 'it now"'))[0] is None)
-        t("...decided on the tag and never on the shape of the quote: the same words untagged still open a row",
-          capture(R, reacted('👍 on your 11:00 reply: "we should rename it rather than minting a new one"',
-                             kind=""))[0] is not None)
-        t("...and the skip is logged like any other, so a wrong call is still findable",
-          "skip:reaction" in open(os.path.join(SCOPE, SEEN)).read())
-        # The three real ones were declined by hand. `add` puts a DECLINED row back on the queue when
-        # the same text arrives again, so a reaction landing twice must not walk that path.
-        already = thumbs["our own 'Fix on its way'"]
-        aRx, _ = add(R, already)                      # the row exactly as the old capture path opened it
-        quiet(["decline", R, aRx, "--why", "a 👍 on my own reply, captured as an ask"])
-        t("a reaction already declined by hand is not re-opened when the same one arrives again",
-          capture(R, reacted(already))[0] is None and get(R, aRx)["status"] == "declined")
-        t("...and it is skipped through the hook too, while a real ask in that thread still records",
-          hook_asks(reacted(thumbs["our own 'rather than' in a promise we made"])) == 0
-          and hook_asks('<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.4" user="ada.byron" '
-                        'role="owner" channel="#demo">rename the channel rather than minting a second one') == 1)
-
-        t("the hook is silent on a worker's own task prompt", capture_worker_silent())
-
-        # ---- ONLY A PERSON OPENS A ROW ----------------------------------------------------------------
-        # One case per shape in NOT_A_PERSON. `would_have` is the half that matters: each fixture carries a
-        # real directive, so before the skip list every one of these opened a row that was declined by hand.
-        def would_have(x): return is_ask(strip_tag(x)[0])
-        def skipped(x): return would_have(x) and hook_asks(x) == 0
-        t("a harness task-notification is not an ask",
-          skipped("<task-notification>\n<task-id>b9j3x</task-id>\n"
-                  "<summary>the digest is not working, you must restart it</summary>\n</task-notification>"))
-        t("a peer session's cross-session-message is not an ask",
-          skipped('<cross-session-message from="uds:/run/user/1000/cc-socks/505378.sock" from-name="dev-2b">'
-                  "\nplease add the failing track to the board."))
-        t("a SYSTEM NOTIFICATION is not an ask",
-          skipped("[SYSTEM NOTIFICATION] the session is near its context limit and must be restarted before the next task"))
-        t("a cross-session idle notice is not an ask",
-          skipped('[Cross-session idle notice] "demo-01" is idle now; you should check what it left behind'))
-        t("a slash-command block is not an ask",
-          skipped("<command-name>/gates</command-name>\n<command-args>please run the gates and open the PR</command-args>"))
-        t("a local command's own stdout is not an ask",
-          skipped("<local-command-stdout>from now on the gates must be green before a PR</local-command-stdout>"))
-        t("the board watchdog talking to itself through inject is not an owner ask",
-          skipped('<channel source="cc-slack" chat_id="local" thread_ts="" ts="1788229590.5" user="local" '
-                  'role="owner" channel="local" target="demo">board watchdog: demo/worker-sandbox — '
-                  "it is waiting on you; ccbox refuses demo by design and runs claude with no "
-                  "cc-guard inside. (set to waiting)"))
-        t("a non-owner Slack message is not an ask, through the hook too",
-          skipped('<channel source="cc-slack" chat_id="C9" ts="18.1" user="sam" role="member" '
-                  'channel="#help">please fix the printer'))
-        # cc-handoff types a prompt into a session at both ends of a handoff — the successor's opening prompt
-        # and the retiring session's stop message — and each opened a row that session then declined by hand
-        # (a121, a126, a131; a132). It leads every prompt it types with `[cc-handoff]` (its MACHINE), so what
-        # is matched here is the tag: the first two fixtures are shaped like today's prompts, the third is a
-        # sentence this file has never seen, and all three are skipped the same way.
-        t("the prompt that starts a successor session is not an owner ask",
-          skipped("[cc-handoff] 9f2c1a7b04d3: you are the SUCCESSOR for myrepo/x — your brief is in your "
-                  "system prompt. Start now: run `cc-handoff --brief myrepo/x` first, and ask the "
-                  "predecessor what the packet did not answer."))
-        t("the stop message the retiring session gets is not either",
-          skipped("[cc-handoff] Handoff complete: your successor is live and owns this target now. Append "
-                  "your final entry to the journal — what is done, what is next, gotchas — and stop. You "
-                  "are no longer the live session: anything typed here is relayed to your successor."))
-        t("...nor is a prompt cc-handoff types later, in wording this file has never been taught",
-          skipped("[cc-handoff] your predecessor left the branch unpushed. Push it before you journal."))
-        # The harness's plain-sentence notices — no wrapper, and each one carries a real instruction, which
-        # is why the reset notice opened a row in four repos' ledgers on 2026-09-04. One case per notice.
-        t("the usage-limit reset notice is not an ask",
-          skipped("Your claude.ai usage limit has reset. Continue the task you were working on when the "
-                  "limit was reached; do not repeat work that is already complete."))
-        t("nor is the limit being hit, however the harness words it",
-          skipped("Claude usage limit reached. Your limit will reset at 3pm. Continue the task you were "
-                  "on then; do not repeat work that is already complete."))
-        t("nor a model reroute banner",
-          skipped("Opus limit reached · now using Sonnet 4. Keep going with the task you were given; "
-                  "do not start over."))
-        t("nor the banner a resumed session opens with",
-          skipped("This session is being continued from a previous conversation that ran out of context. "
-                  "The summary below covers the earlier portion. Please continue the conversation from "
-                  "where it left off without asking the user any further questions."))
-        # ...and the four things the filter must never eat.
-        t("an owner ask ABOUT the usage limit still records",
-          hook_asks("the usage limit keeps eating the queue — make cc-loop wait for the reset instead "
-                    "of dying") == 1)
-        t("an owner ask that merely starts with the word cc-handoff still records",
-          hook_asks("cc-handoff leaves the old window alive after a retire — please fix that before the "
-                    "next one") == 1)
-        t("an owner prompt typed in the terminal still records",
-          hook_asks("add the skip list to the ask-capture hook") == 1)
-        t("an owner Slack message still records",
-          hook_asks('<channel source="cc-slack" chat_id="C1" thread_ts="17.1" ts="17.2" user="ada.byron" '
-                    'role="owner" channel="#demo">put the open asks on Home, please') == 1)
-        # ---- THE RETIRING SIDE OF A HANDOFF: cc-handoff --relay decides (payload over stdin), the hook hands it back
-        retired = {"id": "fixture", "target": "_hooktest", "live": "successor", "phase": "retired",
-                   "predecessor": {"session_id": "sid-retired", "tmux": "", "window": "_hooktest~old"},
-                   "successor": {"session_id": "sid-live", "tmux": "", "window": "_hooktest"}}
-        n, out = hook_run("please add the relay case to the hook", sid="sid-retired", record=retired)
-        t("a prompt into a RETIRED session comes back blocked with the pointer, and opens no row",
-          n == 0 and '"block"' in out and "use window _hooktest" in out)
-        t("...and from any other session the same prompt is neither blocked nor lost",
-          hook_run("please add the relay case to the hook", record=retired) == (1, ""))
-        # ---- KEPT BEFORE IT IS CLASSIFIED --------------------------------------------------------------
-        # The real miss, verbatim (2026-09-08 01:0xZ). One sentence, opening with an ack, with every
-        # cue it carries sitting behind that ack — so it was skipped, and the only copy of it left was a
-        # seen.log line clipped at 160 characters.
-        miss = "Ok well do whatever you need to speed up the whole landing and review process"
-        t("a directive that opens with an acknowledgement is an ask", is_ask(miss))
-        t("...and what is kept is his whole sentence, ack and all", parts_of(miss) == [miss])
-        t("...while a bare ack, and an ack that only compliments, are still not asks",
-          not is_ask("thanks!") and not is_ask("ok cool, thanks a lot")
-          and not is_ask("nice, this is exactly what I was hoping for, really good work"))
-
-        # `rec` is how every case below reads the record back, and it answers {} rather than raising: a
-        # missing record is the failure these cases exist to report, and one that ends the run reports
-        # nothing about the cases after it.
-        def rec(txt):
-            r = [x for x in read_turns() if x["text"] == txt]
-            return r[0] if len(r) == 1 else {}
-
-        aM, _ = capture(R, '<channel source="cc-slack" chat_id="C1" thread_ts="19.1" ts="19.2" '
-                           'user="ada.byron" role="owner" channel="#demo">\n' + miss)
-        rM = rec(miss)
-        t("that exact message is kept in full, with its thread, and opens a row",
-          aM and rM and rM["src"].startswith("slack #demo 19.1")
-          and rM["disposed"] == "classified" and get(R, aM)["text"] == miss)
-
-        # ...and one the classifier skips is kept just the same, and stays PENDING until somebody answers for it
-        skipped_turn = "ok, ship it"
-        capture(R, skipped_turn, src="terminal ab12cd34")
-        pend = rec(skipped_turn)
-        t("a turn the classifier skips opens no row and is kept anyway",
-          not is_ask(skipped_turn) and pend and not pend["disposed"])
-        t("...and it is what `missed` lists, by an id you can act on",
-          pend and pend["id"] in run_capture(["missed", R, "--all"]))
-        before = len(load(R)["asks"])
-        if pend: quiet(["promote", pend["id"]])
-        prom = [a for a in load(R)["asks"].values() if a["text"] == skipped_turn]
-        t("promote opens the ask from the kept text — his words, his source, the time he sent it",
-          len(load(R)["asks"]) == before + 1 and len(prom) == 1 and pend
-          and prom[0]["src"] == "terminal ab12cd34" and prom[0]["asked"] == pend["ts"])
-        t("...and the record is disposed of, so it drops off the missed list",
-          pend and get_turn(pend["id"])["disposed"] == "promoted"
-          and pend["id"] not in run_capture(["missed", R, "--all"]))
-
-        capture(R, "ok nice one", src="terminal ab12cd34")
-        dmr = rec("ok nice one")
-        dm = dmr.get("id", "nothing-was-kept")
+        # `hook` is a no-op now: it drains its payload, says nothing and exits 0, whatever it is given.
+        _stdin, _ledgers = sys.stdin, repos()
         try:
-            quiet(["dismiss", dm]); bad("dismiss without a reason is refused")
-        except SystemExit as e: t("dismiss without a reason is refused", "--why" in str(e))
-        t("a dismissed turn leaves the list with the reason on the record",
-          bool(dmr) and quiet(["dismiss", dm, "--why", "an ack on its own, nothing asked"]) == 0
-          and get_turn(dm)["disposed"] == "dismissed" and dm not in run_capture(["missed", R, "--all"]))
-        # A turn an OLDER classifier skipped: `classify` is how a session runs today's over the backlog.
-        tC = keep_turn(R, "please put the ask count on the tab", "ada.byron", "terminal old")
-        t("classify runs the classifier again and opens the rows it now keeps",
-          quiet(["classify", R]) == 0 and get_turn(tC)["disposed"] == "classified"
-          and any(a["text"] == "please put the ask count on the tab" for a in load(R)["asks"].values()))
-
-        # ---- A TOKEN HE PASTED IS NOT KEPT ------------------------------------------------------------
-        # split so the file itself never holds a token shape: GitHub push protection refused the public publish on it
-        tok = "xox" + "b-2222222222-3333333333-abcdefghijklmnop"
-        capture(R, "the deploy token is %s by the way" % tok, src="terminal ab12cd34")
-        rT = [r for r in read_turns() if r["text"].startswith("the deploy token is")]
-        t("a token in a turn is redacted before the turn is written down",
-          len(rT) == 1 and tok not in rT[0]["text"] and "[redacted]" in rT[0]["text"])
-        if rT: quiet(["promote", rT[0]["id"]])
-        aT = [a for a in load(R)["asks"].values() if a["text"].startswith("the deploy token is")]
-        t("...and the ask promoted from it carries the redacted text, not the token",
-          len(aT) == 1 and tok not in aT[0]["text"] and "[redacted]" in aT[0]["text"])
-        t("...and the token is nowhere in the record or the log beside it",
-          not any(tok in json.dumps(r) for r in read_turns())
-          and tok not in open(os.path.join(SCOPE, SEEN)).read())
-        # THE COPY MUST NOT DRIFT. cc-slack owns this pattern; its source is parsed (never imported — that
-        # would cost every prompt a parse of the whole file) and this copy is held to it character for character.
-        sib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc-slack")
-        theirs = ""
-        try:
-            import ast
-            for nd in ast.walk(ast.parse(io.open(sib, encoding="utf-8").read())):
-                if (isinstance(nd, ast.Assign) and getattr(nd.targets[0], "id", "") == "SECRET_RE"
-                        and isinstance(nd.value, ast.Call) and nd.value.args):
-                    theirs = ast.literal_eval(nd.value.args[0])
-        except Exception: theirs = ""
-        t("the secret pattern is cc-slack's own, not a copy that has drifted away from it",
-          SECRET_RE.pattern == theirs if theirs else not os.path.exists(sib))
-
-        keep_max, TURN_MAX = TURN_MAX, 200
-        try:
-            tB = keep_turn(R, "ok, " + "x" * 400, "ada.byron", "terminal ab12cd34")
-            t("one absurd paste is cut, and the record says how much of it was not kept",
-              len(get_turn(tB)["text"]) < 400 and "204 characters not kept" in get_turn(tB)["text"])
+            sys.stdin = io.StringIO(json.dumps({"prompt": "add the ask count to the tab", "cwd": SCOPE}))
+            hrc, hout = run_capture_err(["hook"])
         finally:
-            TURN_MAX = keep_max
+            sys.stdin = _stdin
+        t("hook is a silent no-op: it prints nothing, exits 0 and opens no row",
+          hrc == 0 and hout == "" and repos() == _ledgers and not os.path.exists(path("box")))
 
-        # ---- COMPACTION ARCHIVES DISPOSED RECORDS, IT DOES NOT TRIM BY AGE -----------------------------
-        # seen.log keeps its last 400 lines, so a real ask aged out of the only copy of it. The way out of
-        # this file is being disposed of, and even then the record is appended to the archive, not dropped.
-        keep_n, TURNS_KEEP = TURNS_KEEP, 6
-        try:
-            stays = keep_turn(R, "ok whatever you think is best, your call", "ada.byron", "terminal ab12cd34")
-            gone = [keep_turn(R, "filler turn %d" % i, "ada.byron", "terminal ab12cd34") for i in range(10)]
-            for g in gone: dispose_turn(g, "dismissed", why="filler")
-            keep_turn(R, "one more, which puts the file over the threshold", "ada.byron", "terminal ab12cd34")
-            live = {r["id"] for r in read_turns()}
-            t("a pending turn survives compaction however big the file gets",
-              stays in live and get_turn(stays)["text"].startswith("ok whatever"))
-            t("...and the disposed ones are archived, not deleted",
-              not (set(gone) & live) and set(gone) <= {r["id"] for r in read_turns(TURNS_ARCHIVE)})
-        finally:
-            TURNS_KEEP = keep_n
-
-        out = run_capture(["missed", R, "--all"])
-        t("`missed` says how big the record has got — pending, rows and bytes, on one line",
-          re.search(r"record: \d+ pending of \d+ rows, [\d.]+ ?\w+ \(", out))
-        # .get(), not [], all the way through: a json form that lost the numbers is what this case is for,
-        # and it should say so rather than end the run on a KeyError.
-        jm = json.loads(run_capture(["missed", R, "--all", "--json"]))
-        t("...and the json form carries the same three numbers beside the turns",
-          isinstance(jm, dict) and jm.get("rows") == len(read_turns())
-          and jm.get("pending") == len(pending_turns())
-          and jm.get("bytes") == os.path.getsize(turns_path())
-          and [x["id"] for x in jm.get("turns", [])] == [x["id"] for x in pending_turns(R)])
-
-        # A MACHINE'S TURN IS NOT KEPT — decided on provenance, never on how the sentence reads.
-        was = len(read_turns())
-        t("a machine's turn is not kept at all, though a real one right after it is",
-          hook_asks("Your claude.ai usage limit has reset. Continue the task you were working on when the "
-                    "limit was reached.") == 0
-          and hook_asks("<task-notification>\n<summary>the digest is down, restart it</summary>\n"
-                        "</task-notification>") == 0
-          and len(read_turns()) == was
-          and hook_asks("ok well do whatever you need to speed the landing up") == 1
-          and len(read_turns()) == was + 1)
 
         n = int(run_capture(["count", R]))
         t("count is the number of unsettled asks", n == len(select(R)))
@@ -1726,54 +1070,6 @@ def run_capture_err(argv):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf): rc = main(argv) or 0
     return rc, buf.getvalue()
-
-
-def hook_asks(text):
-    return hook_run(text)[0]
-
-
-def hook_run(text, sid="selfcheck", record=None):
-    """Run the UserPromptSubmit hook over one prompt: (rows the ledger gained, what it printed). The hook's
-    other two guards are neutralised: the selfcheck usually runs inside a worker's worktree, which would
-    pass every skip case for entirely the wrong reason and fail the two that must still record. Hermetic:
-    `cc-handoff --relay` reads CC_HANDOFF_DIR, and here that is the temp dir — `record` (a handoff record) or
-    nothing — never the box's own."""
-    import tempfile, shutil, io, contextlib
-    d = tempfile.mkdtemp(prefix="cc-scope-hooktest-")       # under /tmp: no .cc/track marker, no repo name
-    keep, old = {k: os.environ.get(k) for k in ("CC_ROLE", "CC_REPO", "CC_HANDOFF_DIR")}, sys.stdin
-    os.environ.pop("CC_ROLE", None); os.environ["CC_REPO"] = "_hooktest"; os.environ["CC_HANDOFF_DIR"] = d
-    if record: json.dump(record, open(os.path.join(d, "fixture.json"), "w"))
-    try:
-        before = len(load("_hooktest")["asks"])
-        sys.stdin = io.StringIO(json.dumps({"prompt": text, "cwd": d, "session_id": sid}))
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf): hook()
-        return len(load("_hooktest")["asks"]) - before, buf.getvalue()
-    finally:
-        sys.stdin = old
-        for k, v in keep.items(): os.environ.pop(k, None) if v is None else os.environ.update({k: v})
-        shutil.rmtree(d, ignore_errors=True)
-
-
-def capture_worker_silent():
-    """The hook must ignore a track worktree — cc dispatches workers by writing their task into the prompt.
-    Hermetic like hook_run: CC_HANDOFF_DIR is this temp dir, never the box's own. On 2026-09-04 a landing's gate
-    ran this case from a retiring session's shell; `cc-handoff --relay` matched the box's real record by
-    $TMUX_PANE and typed the fixture prompt into the live successor, twice, where it read as the owner's ask."""
-    import tempfile, shutil, io, contextlib
-    d = tempfile.mkdtemp()
-    keep = os.environ.get("CC_HANDOFF_DIR"); os.environ["CC_HANDOFF_DIR"] = d
-    try:
-        os.makedirs(os.path.join(d, ".cc")); open(os.path.join(d, ".cc", "track"), "w").write("r\nt\n")
-        payload = json.dumps({"prompt": "build the ledger and open a PR", "cwd": d, "session_id": "x"})
-        old = sys.stdin; sys.stdin = io.StringIO(payload)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf): hook()
-        sys.stdin = old
-        return buf.getvalue() == "" and not os.path.exists(path(repo_of(d) or "box"))
-    finally:
-        os.environ.pop("CC_HANDOFF_DIR", None) if keep is None else os.environ.update({"CC_HANDOFF_DIR": keep})
-        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

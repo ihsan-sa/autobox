@@ -83,4 +83,4 @@ Split by **kind**, not by the surface the text appeared on. Answering is `~/CLAU
     cc myapp step2 --go "…"                     headless worker → PR → ping in #myapp
 
 ## Nothing answers?
-`cc slack status` → `journalctl --user -u cc-slackd -n 30`. A session started before `cc slack on` has no channel: restart it — `cc handoff <repo> <track>` for a track, `cc rc restart` for the box, `tmux kill-window -t main:<repo>` then `cc <repo>` for a planning session.
+`cc slack status` → `journalctl --user -u cc-slackd -n 30`. A session started before `cc slack on` has no channel: restart it — `cc handoff <repo> <track>` for a track (a fresh session takes over, then retires it), `cc rc restart` for the box, `tmux kill-window -t main:<repo>` then `cc <repo>` for a planning session.

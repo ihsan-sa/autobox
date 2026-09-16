@@ -14,8 +14,8 @@
 # re-reads its own output to prove `permissions` came through byte-identical before it replaces anything. A
 # missing deny rule is named and printed for the owner to paste; it is never written.
 #
-# PROVEN COST (2026-08-31): the UserPromptSubmit hook was canonical in config/ for days and never applied to the
-# live file, so the ask ledger captured nothing automatically — 27 rows were typed in by hand. The audit had been
+# PROVEN COST (2026-08-31): a hook was canonical in config/ for days and never applied to the live file, so the
+# gate it registers never ran once and nothing the box did depended on it. The audit had been
 # failing on it the whole time, as "27 lines differ", where a theme change weighed exactly as much as a missing
 # gate. Nobody acted on it. Naming the subset is what turns that report into something anyone can act on.
 set -uo pipefail
@@ -210,7 +210,7 @@ selfcheck(){
   t(){ if "$@" >/dev/null 2>&1; then echo 0; else echo 1; fi; }   # a case that PRINTS (jq -e) must not leak into the verdict
   M="$R/config/claude-managed.json"; DEF="$R/config/claude-settings.json"
   k "$(t jq -e . "$M")" "the managed manifest is valid json"
-  k "$(t test "$(jq '.hooks | length' "$M")" -eq 5)" "the manifest names five hook registrations"
+  k "$(t test "$(jq '.hooks | length' "$M")" -eq 4)" "the manifest names four hook registrations"
   k "$(t test -n "$(jq -r '.statusLine.command // empty' "$M")")" "the manifest names a statusLine command"
   # the shipped default must satisfy the subset itself, or a fresh box installs a file that is already wrong
   S="$DEF"; scan
@@ -232,10 +232,10 @@ selfcheck(){
   k "$(t grep -q 'bin/cc-native' <<<"$(ctl_miss)")" "…and a hook missing from that list is named; the shipped list is its control"
   CL="$R/tests/control-layer"
   # THE PROVEN CASE: canonical in config/, absent from the live file. It must be NAMED, not counted.
-  jq 'del(.hooks.UserPromptSubmit)' "$DEF" > "$d/no-scope.json"; S="$d/no-scope.json"
-  scan; k "$(t grep -q "^hook${US}UserPromptSubmit" <<<"$MISSING")" "a missing UserPromptSubmit hook is detected"
+  jq 'del(.hooks.Stop)' "$DEF" > "$d/no-stop.json"; S="$d/no-stop.json"
+  scan; k "$(t grep -q "^hook${US}Stop" <<<"$MISSING")" "a missing Stop hook is detected"
   out=$(check); rc=$?
-  k "$(t grep -q 'UserPromptSubmit' <<<"$out")" "…and check names it in one line: ${out}"
+  k "$(t grep -q 'Stop' <<<"$out")" "…and check names it in one line: ${out}"
   k "$(t test "$rc" -ne 0)" "…and check exits non-zero, so a caller can gate on it"
   # unrelated settings are NOT drift: theme, model, a custom key and EXTRA allow/deny rules all pass
   jq '.theme="dark" | .model="other" | .permissions.allow += ["Bash(cowsay:*)"]
@@ -244,8 +244,8 @@ selfcheck(){
   k "$(t test "$UNRELATED" -gt 0)" "…while the unrelated lines are still counted as context ($UNRELATED)"
   # $HOME / ${HOME} / ~ / the literal path are one registration — two of the original 27 "differing lines"
   jq --arg h "$HOME" '.hooks.PreToolUse[0].hooks[0].command = $h + "/bin/cc-guard"
-                      | .hooks.Stop[0].hooks[0].command = "~/bin/cc-checkpoint"
-                      | .hooks.UserPromptSubmit[0].hooks[0].command = "${HOME}/bin/cc-scope  hook"' "$DEF" > "$d/expanded.json"
+                      | .hooks.PreToolUse[1].hooks[0].command = "~/bin/cc-native"
+                      | .hooks.Stop[0].hooks[0].command = "${HOME}/bin/cc-checkpoint  "' "$DEF" > "$d/expanded.json"
   S="$d/expanded.json"; scan
   k "$(t test -z "$MISSING")" "\$HOME, \${HOME}, ~ and the literal path are all the same registration"
   # a required deny rule that has gone missing is reported, by name
@@ -256,7 +256,7 @@ selfcheck(){
   jq '.hooks.PreToolUse[0].matcher = "Bash"' "$DEF" > "$d/narrow.json"; S="$d/narrow.json"
   scan; k "$(t grep -q "^hook${US}PreToolUse" <<<"$MISSING")" "a narrowed PreToolUse matcher is drift, not a match"
   # an EXTRA hook of the user's own, alongside the managed ones, is not drift either
-  jq '.hooks.Stop[0].hooks += [{type:"command", command:"$HOME/bin/mine"}]' "$DEF" > "$d/extra-hook.json"
+  jq '.hooks.PreToolUse[0].hooks += [{type:"command", command:"$HOME/bin/mine"}]' "$DEF" > "$d/extra-hook.json"
   S="$d/extra-hook.json"; scan
   k "$(t test -z "$MISSING")" "a user's own extra hook alongside a managed one is preserved, not drift"
   # a settings file that does not exist at all is its own answer, not a crash
@@ -285,9 +285,9 @@ selfcheck(){
   # carrying the owner's own permissions, hooks and keys, and check what came out the other side.
   jq --arg h "$HOME" '.theme="dark" | .customKey={a:1}
       | .permissions.allow += ["Bash(cowsay:*)"] | .permissions.deny += ["Bash(git push --force:*)"]
-      | .hooks.Stop[0].hooks += [{type:"command", command:($h + "/bin/mine")}]
-      | del(.hooks.UserPromptSubmit)' "$DEF" > "$d/live.json"
-  add_hook "$d/live.json" UserPromptSubmit "" '$HOME/bin/cc-scope hook' > "$d/applied.json"
+      | .hooks.PreToolUse[0].hooks += [{type:"command", command:($h + "/bin/mine")}]
+      | del(.hooks.Stop)' "$DEF" > "$d/live.json"
+  add_hook "$d/live.json" Stop "" '$HOME/bin/cc-checkpoint' > "$d/applied.json"
   k "$(t jq -e . "$d/applied.json")" "add_hook produces valid json"
   k "$(t diff <(jq -S .permissions "$d/live.json") <(jq -S .permissions "$d/applied.json"))" \
      "a write leaves \`permissions\` byte-identical — allow and deny both"
@@ -298,10 +298,10 @@ selfcheck(){
   k "$(t test -z "$MISSING")" "…and the file it wrote now satisfies the managed subset"
   # scoped to .hooks: a top-level key can carry the same {type:"command", command:…} shape (statusLine does)
   # without being a hook registration at all, and counting the whole file would count that key too.
-  k "$(t test "$(jq '[.hooks | .. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 6)" \
-     "…with exactly one registration added, not a duplicate of the five that were there"
+  k "$(t test "$(jq '[.hooks | .. | objects | select(.type? == "command") | .command] | length' "$d/applied.json")" -eq 5)" \
+     "…with exactly one registration added, not a duplicate of the four that were there"
   # a second run is a no-op: apply must never stack the same registration twice
-  add_hook "$d/applied.json" UserPromptSubmit "" '$HOME/bin/cc-scope hook' > "$d/twice.json"
+  add_hook "$d/applied.json" Stop "" '$HOME/bin/cc-checkpoint' > "$d/twice.json"
   S="$d/twice.json"; scan
   k "$(t test -z "$MISSING")" "applying twice still satisfies the subset (scan matches on content, not count)"
   # set_statusline is the OTHER mutation apply() can make: it sets a missing statusLine and touches nothing else

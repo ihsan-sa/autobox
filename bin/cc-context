@@ -1,144 +1,57 @@
 #!/usr/bin/env python3
-"""cc-context — how full a Claude session's context REALLY is, read off its own transcript.
+"""cc-context — how full a Claude session's context is, and whether it is past the hand-off line.
 
   cc-context                       the session this runs inside ($CLAUDE_CODE_SESSION_ID), else the newest
-                                   transcript for this cwd
-  cc-context <repo> <track>        that track's session (session id from the board)
-  cc-context <address>             one session by its ADDRESS — `<repo>` a session a person steers,
-                                   `<repo>@<alias>` an orchestrator, `<repo>/<track>` a track. An orch owns no
-                                   board row and shares its checkout with the session a person steers, so it is
-                                   found through the record it last wrote, never through that directory
+                                   session for this cwd
+  cc-context <repo> <track>        that track's session (session id from the board); `<repo>/<track>` is the same
+  cc-context <repo>                the newest session in ~/dev/<repo> — the one a person steers, or an
+                                   orchestrator beside it: whichever wrote its status-line file last
   cc-context --transcript PATH | --session ID
-  cc-context --true <target>       ask the session ITSELF: types /context into that idle pane and reads its
-                                   number. A busy pane falls back to THAT TARGET'S estimate below (a bare
-                                   `repo/track` is the same pair as the two-word form); a target with nothing
-                                   of its own to fall back to is refused, never answered about the caller's cwd.
-                                   Everything downstream — the line, --json, --over, the level — then reads THAT
-                                   number, so the handoff thresholds are decided on the pane's own reading
-  cc-context --all                 TSV of every recorded session: session track pct used window src age level
-                                   pending. Column one is the session, not the repo — `<repo>` and
-                                   `<repo>@<alias>` are two live sessions in one checkout
-  cc-context --record              stdin = a Stop hook payload -> measure, record, and tell the session
-  cc-context --thresholds          "<journal> <handoff> <ceiling>" in TOKENS, for $CC_CTX_WINDOW (else 1M)
-  cc-context --handoffs [--json]   the durable handoff record: one countable line per crossing
-  cc-context selfcheck             fixtures for the parser, the window chain and the record store
-    also: --json · -q (exit code only) · --over [PCT] (exit 0 at/over, 1 under, 2 unmeasurable;
-          bare = that session's own handoff line, floors and window included)
+  cc-context --all                 TSV, one row per session active in the last day:
+                                   repo track pct used window src age level -  (level: handoff or -).
+                                   A session with a status-line file is read off it (src statusline); a track
+                                   worktree with none — every headless `--go` worker — off its transcript
+                                   (src transcript), or `cc ls` and the dashboard would show no track at all.
+                                   --all --json: the same rows, each also carrying ts (ISO-8601 UTC of the
+                                   session's last activity) and level as handoff or null
+  cc-context selfcheck
+    also: --json · -q (exit code only) · --over [PCT] (exit 0 at/over, 1 under, 2 unmeasurable; bare = the
+          hand-off line)
 
-THREE LINES, EACH A PERCENTAGE OF THE WINDOW CAPPED AT AN ABSOLUTE TOKEN COUNT, WITH A FLOOR UNDER IT
-(all nine in ~/.cc/config) — 60k / 90k / 120k on a 200k window, 112k / 150k / 225k on a 1M one:
-  30%, at most 112.5k, never under 60k   journal — told once to append its handoff entry now
-  40%, at most 150k,   never under 90k   hand off — due, but only when nothing is in flight
-  60%, at most 225k                      ceiling — hand off regardless of what is in flight
-            CC_CONTEXT_{WARN,HANDOFF}_PCT · CC_CONTEXT_{WARN,HANDOFF}_MIN · CC_CONTEXT_CEILING_PCT
-            CC_CONTEXT_{WARN,HANDOFF,CEILING}_MAX
-…AND A RETRY LINE EVERY FIVE PERCENT OF THE WINDOW BETWEEN THE HANDOFF LINE AND THE CEILING (100k and 110k on
-200k; one, at 200k, on 1M — the cap shortens that band, so the first retry still comes 50k after the handoff
-line and what follows is tighter than it was, not sparser; CC_CONTEXT_RETRY_PCT, 0 for none). A handoff can
-DIE — the one started at 01:35Z on 2026-09-05 sat on a permission prompt and was abandoned — and until then
-the session that had taken it had nothing left before the ceiling: `handed_off` made every later turn
-'already taken'. Each of these lines is one more crossing, sent
-with --retry, and the ceiling is the last of them so a dead overlap cannot take its teeth with it. Whether a
-crossing MEANS a new attempt is cc-handoff's call (its `retryable`: only an overlap that ended with the
-predecessor still in charge is tried again); a crossing while one is open is only the watchdog, as before.
+THE NUMBER IS THE HARNESS'S OWN when it has one: cc-statusline writes ~/.cc/state/statusline/<session-id>.json
+every turn with the harness's used/window/pct, and a file fresher than STATUSLINE_MAX_AGE is the answer
+(window from "statusline"). Without one — a headless worker has no status line; a session that has not ended
+a turn has no file — the transcript is read. USED = the last assistant entry's input + cache_creation +
+cache_read; a compact_boundary after it means its postTokens instead; sidechain (subagent) entries never
+count. WINDOW is the first evidence found, and the source is always printed: env CC_CTX_WINDOW · the
+session's own compact_boundary.preTokens · the transcript's cost-state model ids ([1m] survives there) · the
+live claude process's --model · the box's own model (cc-model) when it is the same family, which also raises a
+suffix-less id to the size the box runs that family at · else 200k, flagged as assumed. Used above the window
+raises the window.
 
-AN ABSOLUTE LINE, NOT A SHARE OF THE WINDOW (2026-09-08). A percentage alone put the handoff at 400k on a 1M
-window, and that is wrong twice over. SHARP: degradation tracks ABSOLUTE tokens, not the fraction used, and
-there is no plateau to sit just below — Chroma's "Context Rot" finds it at every input length tested, and
-NoLiMa has 10 of 12 long-context models below half their short-context score by 32k. Past roughly 150k the
-answers are worse whatever the window says it can hold. CHEAP: every wake re-reads the whole context as cache,
-so a session carrying 400k pays for 400k on each of its turns all day, and cache reads are where this box's
-money goes. A 1M window therefore buys room for ONE long task, not a longer idle life — which is what a
-percentage of it was quietly selling.
+THE HAND-OFF LINE IS ONE ABSOLUTE NUMBER: CC_CONTEXT_HANDOFF_TOKENS (~/.cc/config, default 150000). Past it
+answers degrade whatever the window holds, and every wake re-reads the whole context as cache, so a session
+past the line hands off (`cc-handoff --overlap <target>`) as a spend choice of its own. This file measures
+and says; it decides nothing and interrupts nobody. The level column and a bare --over read the same line.
 
-AND A FLOOR UNDER IT. A bare percentage of a SMALL window lands under what a session needs to do anything
-(30% of 128k is 38k, most of it prompt and tools). The floor reads: as low as we can sit, but never so low
-that a session is handed off before it can work — 60k/90k on a 200k model, where the caps never bite and this
-change moved nothing.
-
-PENDING, NOT IMMEDIATE. Crossing the handoff line sets a handoff PENDING; it does not restart anything. The
-restart happens at the first turn where nothing is in flight — no background or scheduled task, no unfinished
-merge/rebase, nothing uncommitted or unpushed in any worktree of this repo (see `in_flight`, which is
-deliberately pessimistic: a wrong "idle" reading is a handoff in the middle of something, and mid-task state
-lives in no file). The ceiling goes anyway: past it, what a degraded session gets wrong costs more than
-the in-flight state it drops. A HEADLESS WORKER is never restarted or handed off from here — its loop already
-gives it a fresh context — so it is told to journal and END ITS TURN, and one fixed line goes into the journal
-saying so, which is what stops cc-loop reading an iteration that ended itself as a refusal (`worker`, `MARK`).
-CC_ROLE=worker is the tell, not the tmux window: the loop HOLDS the track's window while the session inside it
-is headless, and reading the window as live is what handed spend-tracker an interactive successor (2026-09-01).
-
-THIS FILE MEASURES; IT DECIDES NO PHASES (review rec #8, 2026-08-31). Crossing a line emits ONE event —
-`cc-handoff --event <target> --level …` — and cc-handoff, which owns the whole handoff lifecycle, decides what
-it means: start a successor ALONGSIDE (CC_HANDOFF_OVERLAP=1: it reads the journal, asks what the journal
-missed, and takes over only when it says so), fall back to the stop-then-restart path above, or nothing. The
-deadline of an open overlap is policed by the same event, from the predecessor's own Stop hook, which already
-runs every turn — no new timer. What comes back is recorded here, and the session is told in the same reply.
-Because an overlap interrupts nobody there is nothing to defer on, so the "PENDING, deferred again" loop above
-cannot happen while it is on; `in_flight` is kept, demoted to the successor's opening checklist.
-
-THE RECORD. Every crossing appends one JSON line to ~/.cc/state/context/handoffs.jsonl: when, which session,
-repo/track, the percentage and the token count, and which line fired (journal · handoff · ceiling, the
-`-deferred` forms when something was in flight, and the `-retry` forms for a second or later attempt). Countable with `wc -l`, so a reader never parses prose.
-
-The message is delivered through the Stop hook's own reply channel: `{"decision":"block","reason":…}` makes
-the session continue and do what the reason says (verified 2026-08-30 — it works headless too), and the
-payload's `stop_hook_active` is what stops that from repeating. It is said once per line crossed, and only to
-a session that HAS a journal to write (a track): an owner's conversation is not interrupted to write one.
-
-WHY A TOOL AND NOT A GUESS. Handing off (`cc handoff`) costs a session its working memory, so it must happen
-on evidence: too early wastes a good context, too late and auto-compaction has already thrown work away.
-Nothing in the box knew the number — the decision was a human's hunch about how long a session had been up.
-
-THE STOP HOOK CANNOT TELL YOU (verified empirically 2026-08-30, Claude Code 2.1.251, by wiring a hook that
-dumps its stdin). The whole payload is: session_id, transcript_path, cwd, prompt_id, permission_mode,
-hook_event_name, stop_hook_active, last_assistant_message, background_tasks, session_crons. No token counts,
-no percentage. What it does give is `transcript_path`, and the transcript holds the truth.
-
-THE STATUS LINE CAN (2026-09-05). Claude Code's own `statusLine` command (cc-statusline) runs after most
-turns with the harness's OWN context/cost figures on stdin — no re-deriving them off a transcript — and
-writes them to ~/.cc/state/statusline/<session-id>.json. `statusline_measure()` below reads that file and is
-tried FIRST, everywhere this file measures a session: fresh (STATUSLINE_MAX_AGE seconds) and present beats
-the transcript estimate, which takes over exactly as before when it is stale or missing. window_src reads
-"statusline" when it was, so the answer never hides which one it is — same rule as "pane" for --true below.
-
-USED = the last assistant entry's `message.usage`: input_tokens + cache_creation + cache_read. That IS the
-prompt the model just saw, cache or not. If a `compact_boundary` follows it (Claude compacted after the last
-answer) its `compactMetadata.postTokens` is the number instead — the old figure describes a context that no
-longer exists. Sidechain (subagent) entries never count: they have their own window.
-
-WINDOW is the part worth being honest about, because the transcript's `message.model` has the `[1m]` beta
-suffix stripped — "claude-opus-5" alone cannot tell 200k from 1M, and getting that wrong reports 75% at 15%.
-Sources, in order, first one wins, and the source is always printed:
-  env         CC_CTX_WINDOW
-  compacted   this session's own `compact_boundary.preTokens` — where IT actually hit the wall
-  cost-state  the transcript's `cost-state.modelUsage` keys, the exact model id, suffix and all
-  process     the live `claude` process's --model, matched by session id, or by cwd for a headless
-              worker (`claude -p` is given no --session-id, so its id is nowhere on its command line)
-  cc-model    the model the box currently starts sessions with, when it is the same family — it also RAISES a
-              process/cost-state window: a headless worker is launched `--model claude-opus-5` with no suffix
-              while the box runs that same family at 1M, and one box does not run one family at two sizes
-  assumed     nothing said: 200k, flagged as an assumption in every output (never silently)
-Then evidence overrides all of it: used above the window means the window is bigger, so it is raised.
-
-Records: ~/.cc/state/context/<session-id>.json (the Stop hook writes one per turn; pruned after 7 days),
-plus the append-only handoffs.jsonl above, which is never pruned.
-Env: CC_CTX_WINDOW · CC_CTX_BOX_MODEL · CC_CTX_RECORDS (a test run keeps its records out of the box's) ·
-CC_STATUSLINE_DIR (where cc-statusline's per-session files are read from).
+Env: CC_CTX_WINDOW · CC_CTX_BOX_MODEL (empty = never ask the box; the selfcheck sets it) · CC_STATUSLINE_DIR ·
+CC_CONTEXT_HANDOFF_TOKENS.
 """
 import glob, json, os, re, shutil, subprocess, sys, time
 
 STATE = os.path.expanduser("~/.cc/state")
-RECORDS = os.environ.get("CC_CTX_RECORDS") or os.path.join(STATE, "context")
-HANDOFF = os.environ.get("CC_HANDOFF_DIR") or os.path.join(STATE, "handoff")
+DEV = os.path.expanduser("~/dev")
 STATUSLINE_DIR = os.environ.get("CC_STATUSLINE_DIR") or os.path.join(STATE, "statusline")
 STATUSLINE_MAX_AGE = 120   # seconds: fresher is trusted as this turn's; older is a session that has moved on
+LISTED_MAX_AGE = 86400     # --all: a file older than a day is a session that is gone
 PROJECTS = os.path.expanduser("~/.claude/projects")
+WORKTREES = os.path.expanduser("~/.cc/worktrees")   # <repo>/<track>: every track's own tree, and nothing else lives here
 BIN = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_WINDOW = 200_000
 BIG_WINDOW = 1_000_000
 TAIL = 256 * 1024          # enough for many turns; grown when no assistant entry is in it
 MAX_TAIL = 32 * 1024 * 1024
-PRUNE_AFTER = 7 * 86400
+ADDRESS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(/[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$")
 
 
 def cfg(name, default):
@@ -156,43 +69,19 @@ def cfg(name, default):
         return default
 
 
-def thresholds(window=BIG_WINDOW):
-    """The three lines, in TOKENS, for a window: min(a percentage of it, an absolute cap), with a floor under
-    the first two. Degradation tracks absolute tokens, not the fraction used, and every wake re-reads the whole
-    context as cache — so a bigger window buys neither sharpness nor cheaper turns, and the cap is what stops a
-    1M session from sitting on 400k all day. The floor is the other end of the same rule: a bare percentage of
-    a small window lands under what a session needs to work at all (30% of 128k is 38k, most of it prompt and
-    tools). On 200k the caps never bite and nothing has moved. The ceiling never sits under the handoff line."""
-    j = min(window * cfg("CC_CONTEXT_WARN_PCT", 30.0) / 100, cfg("CC_CONTEXT_WARN_MAX", 112500))
-    h = min(window * cfg("CC_CONTEXT_HANDOFF_PCT", 40.0) / 100, cfg("CC_CONTEXT_HANDOFF_MAX", 150000))
-    c = min(window * cfg("CC_CONTEXT_CEILING_PCT", 60.0) / 100, cfg("CC_CONTEXT_CEILING_MAX", 225000))
-    j = max(j, cfg("CC_CONTEXT_WARN_MIN", 60000))
-    h = max(h, cfg("CC_CONTEXT_HANDOFF_MIN", 90000))
-    return j, h, max(c, h)
+def handoff_line():
+    """The hand-off line in tokens: CC_CONTEXT_HANDOFF_TOKENS, env else ~/.cc/config, default 150k."""
+    return cfg("CC_CONTEXT_HANDOFF_TOKENS", 150000)
 
 
-def retry_lines(window=BIG_WINDOW):
-    """The retry lines between the handoff line and the ceiling, in TOKENS: one every CC_CONTEXT_RETRY_PCT of
-    the window (5 -> 45, 50, 55 on the defaults). A handoff that died leaves the session with nothing before
-    the ceiling, which is what let one abandoned overlap park a session for the rest of its life. 0 = none."""
-    _, h, c = thresholds(window)
-    step = window * cfg("CC_CONTEXT_RETRY_PCT", 5.0) / 100
-    if step <= 0:
-        return []
-    out, x = [], h + step
-    while x < c and len(out) < 64:
-        out.append(x)
-        x += step
-    return out
+def judge(m):
+    """Add the line and the level to a measurement: level is "handoff" at or past the line, else None."""
+    m["handoff_line"] = handoff_line()
+    m["level"] = "handoff" if m["used"] >= m["handoff_line"] else None
+    return m
 
 
-LEVELS = ["journal", "handoff", "ceiling"]
-
-
-def level_of(used, window):
-    j, h, c = thresholds(window)
-    return "ceiling" if used >= c else ("handoff" if used >= h else ("journal" if used >= j else None))
-
+# ---- the transcript estimate ---------------------------------------------------------------------------
 
 def human(n):
     if n >= 1_000_000:
@@ -200,7 +89,6 @@ def human(n):
     if n >= 1000:
         return f"{round(n/1000)}k"
     return str(n)
-
 
 def tail_lines(path, nbytes):
     """The last <=nbytes of a file as whole lines (a truncated first line is dropped)."""
@@ -212,7 +100,6 @@ def tail_lines(path, nbytes):
     if start:
         buf = buf.split(b"\n", 1)[1] if b"\n" in buf else b""
     return [l for l in buf.decode("utf-8", "replace").split("\n") if l.strip()]
-
 
 def scan(lines):
     """Last assistant usage, last compact boundary, last cost-state, the session's cwd."""
@@ -243,15 +130,12 @@ def scan(lines):
                 cost_models = list(mu)
     return usage, model, compact, compact_at, seen_assistant_at, cost_models, cwd
 
-
 def window_from_model(model):
     return BIG_WINDOW if model and "[1m]" in model else DEFAULT_WINDOW
-
 
 def family(model):
     m = re.search(r"fable|opus|sonnet|haiku", model or "", re.I)
     return m.group(0).lower() if m else None
-
 
 def process_model(session_id, cwd=None):
     """The --model a live session was launched with — the only place the [1m] suffix survives.
@@ -285,6 +169,7 @@ def process_model(session_id, cwd=None):
             continue
     return by_cwd[0] if len(set(by_cwd)) == 1 else None
 
+_BOX = {}   # the answer below, asked once per run: --all measures every live track, and a fork per row cost 2 s of `cc ls`
 
 def box_model():
     """What the box starts sessions with now: the model override, else the settings default.
@@ -292,19 +177,21 @@ def box_model():
     v = os.environ.get("CC_CTX_BOX_MODEL")
     if v is not None:
         return v or None
-    try:
-        m = subprocess.run([os.path.join(BIN, "cc-model"), "current"],
-                           capture_output=True, text=True, timeout=10).stdout.strip()
-        if m:
-            return m
-    except Exception:
-        pass
-    try:
-        with open(os.path.expanduser("~/.claude/settings.json")) as f:
-            return (json.load(f).get("model") or "").strip() or None
-    except Exception:
-        return None
-
+    if "m" not in _BOX:
+        m = None
+        try:
+            m = subprocess.run([os.path.join(BIN, "cc-model"), "current"],
+                               capture_output=True, text=True, timeout=10).stdout.strip() or None
+        except Exception:
+            pass
+        if not m:
+            try:
+                with open(os.path.expanduser("~/.claude/settings.json")) as f:
+                    m = (json.load(f).get("model") or "").strip() or None
+            except Exception:
+                m = None
+        _BOX["m"] = m
+    return _BOX["m"]
 
 def measure(path, session_id=None):
     """{used, window, pct, ...} for a transcript, or None when it holds no usable turn yet."""
@@ -356,57 +243,11 @@ def measure(path, session_id=None):
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
-# ---- the pane's own number ---------------------------------------------------------------------
-# measure() above is an ESTIMATE: it sums the last turn's usage off the transcript and infers the window from
-# whatever evidence it can find. The session itself knows both exactly, and /context prints them — so when the
-# pane is IDLE we can simply ask it (owner, 2026-09-01: "a good way for the system to verify context for the
-# sake of handoffs"). cc-msg --ask owns the keyboard rule: it refuses a busy pane and one holding a dialog, and
-# it never spools, because a /context typed by some later drain answers to nobody.
-
-PANE_TOKENS = re.compile(r"([\d.,]+)\s*([kKmM])?\s*/\s*([\d.,]+)\s*([kKmM])?\s*tokens\s*\((\d+(?:\.\d+)?)\s*%\)")
-
-
-def _tokens(n, suffix):
-    return int(float(n.replace(",", "")) * {"k": 1000, "m": 1_000_000}.get((suffix or "").lower(), 1))
-
-
-def pane_ask(target, cmd="/context"):
-    """What `cmd` draws in that target's pane, or None when the pane would not take it."""
-    try:
-        r = subprocess.run([os.path.join(BIN, "cc-msg"), "--ask", target, cmd],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=90)
-    except Exception:
-        return None
-    return r.stdout if r.returncode == 0 and r.stdout.strip() else None
-
-
-def pane_measure(target):
-    """{used, window, pct, ...} read off the session's OWN /context, or None when the pane did not answer.
-    The LAST match wins: an older /context can still be scrolled up the pane, and the one just typed is at the
-    bottom. The percentage is the session's own, not one recomputed here — asking it and then not believing it
-    would be the estimate again with extra steps."""
-    out = pane_ask(target)
-    if not out:
-        return None
-    hits = PANE_TOKENS.findall(out)
-    if not hits:
-        return None
-    used_n, used_s, win_n, win_s, pct = hits[-1]
-    used, window = _tokens(used_n, used_s), _tokens(win_n, win_s)
-    if window <= 0:
-        return None
-    return {"used": used, "window": window, "pct": float(pct),
-            "model": None, "window_src": "pane", "compacted": False,
-            "transcript": None, "session_id": None,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-
-
-# ---- the status line's own number --------------------------------------------------------------
+# ---- the status line's own number ----------------------------------------------------------------------
 # cc-statusline (Claude Code's own statusLine command) writes ~/.cc/state/statusline/<session-id>.json every
-# turn from the harness's OWN figures. Preferred over measure()'s transcript estimate whenever it exists and
-# is fresh enough to describe the CURRENT turn — trusting the file's own "pct", exactly as pane_measure()
-# trusts the pane's: asking for the real number and then recomputing it here would be the estimate again with
-# extra steps.
+# turn from the harness's OWN figures. Preferred over measure()'s transcript estimate whenever it exists and is
+# fresh enough to describe the CURRENT turn — trusting the file's own pct: asking for the real number and then
+# recomputing it here would be the estimate again with extra steps.
 
 def statusline_measure(sid):
     """{used, window, pct, model, window_src: "statusline", ...} from that session's own status-line file, or
@@ -439,12 +280,10 @@ def transcript_for_session(sid):
     hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
     return max(hits, key=os.path.getmtime) if hits else None
 
-
 def transcript_for_cwd(cwd):
     d = os.path.join(PROJECTS, re.sub(r"[/.]", "-", os.path.realpath(cwd)))
     hits = [p for p in glob.glob(os.path.join(d, "*.jsonl"))]
     return max(hits, key=os.path.getmtime) if hits else None
-
 
 def board_get(repo, track, field):
     try:
@@ -453,23 +292,6 @@ def board_get(repo, track, field):
         return r.stdout.strip()
     except Exception:
         return ""
-
-
-def session_at(target):
-    """The newest RECORD written under this address -> its session id, or None. The only way to ask about a
-    session that owns no board row and does not own its working directory alone: an orchestrator shares
-    ~/dev/<repo> with the planning session, so "the newest transcript in that directory" answers for whichever
-    of the two stopped last — which is the misreading this address exists to end."""
-    # EITHER SPELLING. A record is stored under the window name `<repo>@<alias>`, and what a person reads and
-    # copies is `<alias>@<repo>` (shown), so an address typed back from a listing has to find its own session.
-    # Both are tried against the records themselves rather than guessed at from the string, so nothing is
-    # resolved that no session has actually written.
-    for want in (target, flipped(target)):
-        for d in records():
-            if (d.get("target") or "") == want and d.get("session_id"):
-                return d["session_id"]
-    return None
-
 
 def resolve(repo=None, track=None, sid=None, cwd=None):
     """-> (transcript_path, session_id) or (None, None)."""
@@ -488,473 +310,112 @@ def resolve(repo=None, track=None, sid=None, cwd=None):
         sid = board_get(repo, track, "session_id")
         p = transcript_for_session(sid) if sid else None
         if not p:
-            p = transcript_for_cwd(os.path.expanduser(f"~/.cc/worktrees/{repo}/{track}"))
+            p = transcript_for_cwd(os.path.join(WORKTREES, repo, track))
         return p, (sid or None)
     p = transcript_for_cwd(cwd or os.getcwd())
     return p, (os.path.basename(p)[:-6] if p else None)
 
-
-# ---- records -----------------------------------------------------------------------------------
-
 def track_of(cwd):
-    try:
-        with open(os.path.join(cwd, ".cc/track")) as f:
-            repo, track = [l.strip() for l in f.read().splitlines()[:2]]
-        return repo, track
-    except Exception:
+    """(repo, track) off the .cc/track marker at cwd OR IN ANY DIRECTORY ABOVE IT, the way cc-guard walks. A
+    session's cwd is often a subdirectory of its worktree (~/.cc/worktrees/<repo>/<track>/core); read only at
+    the raw cwd, the marker was missed, and the row printed `- -` for a track that is right there."""
+    d = os.path.realpath(cwd)
+    while True:
+        try:
+            with open(os.path.join(d, ".cc/track")) as f:
+                repo, track = [l.strip() for l in f.read().splitlines()[:2]]
+                return repo, track
+        except Exception:
+            pass
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, None
+        d = parent
+
+
+
+# ---- the sessions with a status-line file, for --all and for `cc-context <repo>` ----------------------------
+
+def named(cwd):
+    """(repo, track) a cwd names: a track's worktree by its .cc/track marker, a checkout under ~/dev by its
+    directory name (track None), else (None, None)."""
+    if not cwd:
         return None, None
+    repo, track = track_of(cwd)
+    if repo:
+        return repo, track
+    dev = os.path.realpath(DEV) + "/"
+    rc = os.path.realpath(cwd)
+    if rc.startswith(dev):
+        return rc[len(dev):].split("/", 1)[0], None
+    return None, None
 
 
-def git(cwd, *args):
-    try:
-        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=20)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception:
-        return None
-
-
-def in_flight(payload, cwd):
-    """Why this session must NOT be restarted right now, or None. Deliberately pessimistic: a wrong 'idle'
-    reading is a handoff in the middle of something, and the state a session holds mid-task is in nobody's
-    file. Anything git cannot answer counts as busy."""
-    if payload.get("background_tasks"):
-        return "a background task is still running"
-    if payload.get("session_crons"):
-        return "a scheduled task is pending"
-    if payload.get("stop_hook_active"):
-        return "another Stop hook is holding the session"
-    top = git(cwd, "rev-parse", "--show-toplevel")
-    if not top:
-        return None                                   # not a repo: git has nothing half-done to lose
-    wts = git(cwd, "worktree", "list", "--porcelain")
-    if wts is None:
-        return "git could not be read"
-    for l in wts.splitlines():                        # every worktree of this repo: a planning session's
-        if not l.startswith("worktree "):             # own conflict resolution happens inside a track's
+def track_rows(now, seen):
+    """The live tracks --all would otherwise miss: a headless `claude -p` worker — every `--go` track — draws no
+    status line and writes no file, so the transcript in its worktree's own project dir is the only number there
+    is. One row per track worktree not already `seen` whose newest transcript answered inside LISTED_MAX_AGE."""
+    rows = []
+    for wt in glob.glob(os.path.join(WORKTREES, "*", "*")):
+        repo, track = os.path.basename(os.path.dirname(wt)), os.path.basename(wt)
+        if (repo, track) in seen:
+            continue                      # its own status-line file is the better number, stale or not
+        p = transcript_for_cwd(wt)
+        if not p:
             continue
-        w = l.split(" ", 1)[1]
-        gd = git(w, "rev-parse", "--absolute-git-dir")
-        if gd is None:
-            return f"git could not be read in {os.path.basename(w)}"
-        for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply"):
-            if os.path.exists(os.path.join(gd, marker)):
-                return f"a merge/rebase is unfinished in {os.path.basename(w)}"
-        st = git(w, "status", "--porcelain")
-        if st is None:
-            return f"git could not be read in {os.path.basename(w)}"
-        if st:
-            return f"uncommitted work in {os.path.basename(w)}"
-        ahead = git(w, "rev-list", "--count", "@{upstream}..HEAD")
-        if ahead and ahead != "0":
-            return f"unpushed commits in {os.path.basename(w)}"
-    return None
+        mtime = os.path.getmtime(p)
+        if now - mtime > LISTED_MAX_AGE:
+            continue                      # a worktree nobody has worked in since yesterday is not a session
+        m = measure(p, os.path.basename(p)[:-6])
+        if not m:
+            continue
+        rows.append({"session_id": m["session_id"], "repo": repo, "track": track, "cwd": wt, "used": m["used"],
+                     "window": m["window"], "pct": m["pct"], "model": m.get("model"), "src": "transcript",
+                     "age": int(now - mtime), "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))})
+    return rows
 
 
-def ledger(m, kind, why=""):
-    """One countable line per crossing — the App Home's handoff count is a `wc -l`, not a prose search."""
-    os.makedirs(RECORDS, exist_ok=True)
-    row = {"ts": m["ts"], "kind": kind, "session_id": m.get("session_id"), "repo": m.get("repo"),
-           "track": m.get("track"), "pct": m["pct"], "used": m["used"], "window": m["window"],
-           "model": m.get("model"), "cwd": m.get("cwd")}
-    if why:
-        row["why"] = why
-    with open(os.path.join(RECORDS, "handoffs.jsonl"), "a") as f:
-        f.write(json.dumps(row) + "\n")
-
-
-def handoffs():
-    """Every crossing ever recorded, oldest first. The App Home's count is len() of this."""
-    out = []
-    try:
-        with open(os.path.join(RECORDS, "handoffs.jsonl")) as f:
-            for l in f:
-                try:
-                    out.append(json.loads(l))
-                except Exception:
-                    continue                       # one bad line never hides the rest
-    except OSError:
-        pass
-    return out
-
-
-def have_window(target):
-    """Is there a live tmux window for this target? A headless worker has none — its loop is its handoff.
-    By TARGET (`<repo>`, `<repo>@<alias>` or `<repo>/<track>`), not by repo+track: a planning session has a
-    window too, and used to be told "there is no interactive session to restart here", which was simply untrue
-    of it. The window name IS the address, so an orchestrator answers here on its own name and not the repo's."""
-    try:
-        r = subprocess.run(["tmux", "list-windows", "-t", "main", "-F", "#W"],
-                           capture_output=True, text=True, timeout=10)
-        return target in r.stdout.split()
-    except Exception:
-        return False
-
-
-def overlap_open(target):
-    """Is an overlapping handoff already open here? Only whether the record is THERE — cc-handoff owns its
-    shape — so a turn does not fork a process for the sessions (nearly all of them) that have no overlap."""
-    return os.path.exists(os.path.join(HANDOFF, target.replace("/", "--") + ".json"))
-
-
-def worker():
-    """A headless cc-loop iteration (CC_ROLE=worker, exported by cc-loop around its `claude -p`; a Stop hook
-    inherits it). There is no interactive session here to restart, and none worth starting a successor beside:
-    the loop's NEXT iteration, reading the journal, is the handoff. The tmux window is not the tell — the LOOP
-    holds the track's window while the session inside it is headless, which is how spend-tracker's iteration
-    read as live, opened an overlap, and left an interactive successor sitting in the track window long after
-    the loop was done (2026-09-01). cc-handoff refuses the same way; this is the half that decides what the
-    session is TOLD."""
-    return os.environ.get("CC_ROLE") == "worker"
-
-
-MARK = "- cc-context: iteration stopped at "     # cc-loop greps this prefix (`ctx_stopped`) — the contract
-                                                 # between the two files, and the reason it is a fixed string.
-
-
-def mark_journal(m, lvl):
-    """A worker told to hand off ends its turn — write that in the JOURNAL, as a line nothing has to interpret.
-    cc-loop reads it and carries straight on to the next iteration: an iteration that ended ITSELF is neither a
-    refusal nor a reroute, and rerunning it would redo work the next fresh context can already read (the loop
-    misread exactly that on spend-tracker). Written here rather than asked of the model, because a marker a
-    model paraphrases is not a marker. Never raises: a note that cannot be written must not break a session."""
-    try:
-        pth = journal_path(m)
-        os.makedirs(os.path.dirname(pth), exist_ok=True)
-        with open(pth, "a") as f:
-            # unique per iteration ON PURPOSE: cc-loop's journal diff drops a line byte-identical to an earlier one,
-            # and two stops at the same rounded percentage would otherwise write the same line (review of #164).
-            who = f"{m.get('ts') or ''}, session {(m.get('session_id') or '?')[:8]}"
-            f.write(f"{MARK}{m['pct']:.0f}% of its context window ({lvl}, {who}) — it journalled and ended its turn; "
-                    f"the next iteration continues from this journal.\n")
-    except Exception:
-        pass
-
-
-def mid_handoff():
-    """Is this session the second half of a handoff that is STILL OPEN? $CC_HANDOFF is exported into a
-    successor by `cc __runnext` and outlives the handoff itself — it says "born a successor", not "still
-    being handed off". Read as a bare flag it silences this file for the REST of that session's life: on
-    2026-09-01 the planning session won an overlap in the morning and then sat past the hand-off line all
-    evening at 51.5% with no event ever emitted. <id>.done is the marker cc-guard already un-gates on; see
-    cc-handoff.mid_handoff for the long version. Unaccountable id -> still held: a session must never police
-    the handoff it is the second half of, and every failure here falls that way."""
-    hid = os.environ.get("CC_HANDOFF") or ""
-    if not hid:
-        return False
-    return not (re.match(r"^[A-Za-z0-9_-]{1,64}$", hid)
-                and os.path.exists(os.path.join(HANDOFF, hid + ".done")))
-
-
-def event(target, m, level, busy="", live=False, taken=False, retry=False):
-    """THE ONE CALL OUT. This file measures a context and says which LINE was crossed; cc-handoff owns every
-    phase that follows — the deadline of an overlap already open, whether this crossing starts one, whether it
-    falls back to the stop-then-restart path, and the sweep for records no session is left to finish. Before
-    review rec #8 that decision was made here, from a third file's building blocks, and `cc` held a fourth
-    piece of it. The level always goes out, even when this session can take no more phases (`taken`), because
-    the watchdog for an overlap already open decides on it: at the ceiling it FORCES the cutover, below it
-    abandons. -> the action cc-handoff took: "overlap", "replace", or "" (nothing).
-    Answered on stdout as JSON so a phase's own words cannot be mistaken for the answer; anything unreadable
-    reads as "" — the session is then simply TOLD, which is the direction every failure here must fall."""
-    argv = [os.path.join(BIN, "cc-handoff"), "--event", target, "--level", level or "",
-            "--pct", f"{m['pct']:.1f}"]
-    if taken:
-        argv += ["--taken"]                # this session has already taken a phase, or a Stop hook is holding
-                                           # it: the watchdog still runs on the level, nothing new starts
-    if m.get("session_id"):
-        argv += ["--session", m["session_id"]]
-    if busy:
-        argv += ["--in-flight", busy]      # what a journal always omits: what is unfinished RIGHT NOW
-    if live:
-        argv += ["--live"]                 # no live tmux window = a headless worker: its loop is its handoff
-    if retry:
-        argv += ["--retry"]                # a line above the handoff line: the attempt already taken may be dead
-    try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=90)
-        return (json.loads(r.stdout or "{}") or {}).get("action") or ""
-    except Exception:
-        return ""
-
-
-def journal_parts(m):
-    """The path segments of the journal this session hands off through — ONE PER ADDRESS, and cc-handoff's
-    journal_for() resolves the same file for the same address, by the same rule. An orchestrator and the
-    session a person steers share a repo and a checkout, so under one `planning-handoff.md` each would have
-    read the other's handoff entry as the account of its own work.
-
-    Canonical `-handoff.md`, unless the only file there is a legacy `-handover.md`. No prompt ever told an
-    orch's own session where its running notes belonged, so at least one (lessons@lessons-site) kept a
-    `-handover.md`; cc-handoff --brief reads that file, and this side NAMES the journal a session writes and
-    APPENDS the worker's stop marker to it — so if only one of the two learns the old name the history forks,
-    the successor reading one half and the session writing the other. Resolved against STATE, the root
-    journal_path() opens, so a selfcheck's own fixtures decide it and the box's real journals are never read."""
-    if m.get("track"):
-        return [str(m["repo"]), str(m["track"]), "progress.md"]
-    alias = (m.get("target") or "").partition("@")[2]
-    canon = [str(m["repo"]), f"{alias or 'planning'}-handoff.md"]
-    legacy = [str(m["repo"]), f"{alias or 'planning'}-handover.md"]
-    if not os.path.exists(os.path.join(STATE, *canon)) and os.path.exists(os.path.join(STATE, *legacy)):
-        return legacy
-    return canon
-
-
-def journal_of(m):
-    return "~/.cc/state/" + "/".join(journal_parts(m))
-
-
-def journal_path(m):
-    """The same file journal_of() NAMES, as a path something can open. Built from STATE so a selfcheck writes
-    its fixtures into a temp dir and never into the box's real journals."""
-    return os.path.join(STATE, *journal_parts(m))
-
-
-def told(m, lvl, deferred="", restartable=True, overlapped=False, ending=False):
-    """What the session is told when it crosses a line — the Stop hook's reason."""
-    s = (f"CONTEXT {m['pct']:.0f}% ({human(m['used'])} of {human(m['window'])}). Append a dated handoff entry to "
-         f"{journal_of(m)} now, while there is still room to write a good one: what is done, what is next "
-         f"(ordered), gotchas. Write it from what you already know — do not go looking, and a line or two is "
-         f"enough if that is all there is. A fresh session starts from that file and from nothing else.")
-    if lvl == "journal":
-        return s + " Then carry on."
-    if overlapped:
-        return s + (" Your SUCCESSOR is already running alongside you, in this same directory, and it is not "
-                    "live yet: it has the box's own packet (`cc-handoff --brief`) and will message you ONCE for "
-                    "what no file holds. Answer that batch in ONE turn — a turn of yours costs a whole context, "
-                    "and eighteen of them is what the last handover cost — then carry on: nothing is being "
-                    "restarted underneath you, and it takes over only when it says so.")
-    # `ending` is the WORKER's branch and only the worker's, before `deferred`: a worker with anything
-    # uncommitted was told a handoff was PENDING and to carry on — the one thing it must not do at its ceiling.
-    # Gated on `not restartable` it also caught planning sessions and windowless interactive ones, telling them
-    # a loop that does not exist would continue them (review of #164). What is in flight goes into the entry.
-    if ending:
-        return s + (f" Put what is unfinished right now into it — {deferred}." if deferred else "") + \
-            (" Then END YOUR TURN — do not start anything new, and do not hand off: there is no interactive "
-             "session to restart here, so this entry IS the handoff. The loop begins the next iteration from "
-             "it and from nothing else.")
-    if deferred:
-        return s + (f" A handoff is now PENDING: it happens at the first turn with nothing in flight, and right "
-                    f"now {deferred}. Finish that; nothing is being restarted underneath you.")
-    if not restartable:
-        return s + (" There is no interactive session to restart here, so this entry IS the handoff — the next "
-                    "session starts from it and from nothing else.")
-    return s + " This session is being handed off now."
-
-
-def session_name(repo, track):
-    """What a person calls this session: its tmux window (`<repo>`, `<repo>@<alias>`, `<repo>/<track>`),
-    read through the pane the Stop hook runs in. A headless worker's window is its track's, which is right. With
-    no pane, the parts that are known: repo/track for a track, repo@alias for an orch, the repo for a session a
-    person steers. Never raises and never blocks: a name is a label, not a measurement.
-    THE TRACK IS ASKED FIRST, and that is not a detail. $CC_SLACK_ALIAS is the ORCHESTRATOR's, and it leaks
-    into everything that orch launches — the same leak that turns a sibling's selfcheck red from an orch shell.
-    A track has its own worktree, its own window and its own row: read alias-first, a track spawned under an
-    orch answered to the orch's name, and the two are different things."""
-    pane = os.environ.get("TMUX_PANE") or ""
-    if pane:
-        try:
-            r = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#W"], capture_output=True,
-                               text=True, timeout=2)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-        except (OSError, subprocess.SubprocessError):
-            pass
-    alias = os.environ.get("CC_SLACK_ALIAS") or ""
-    if repo and track:
-        return f"{repo}/{track}"
-    if repo and alias:
-        return f"{repo}@{alias}"
-    return repo or ""
-
-
-# The address grammar, spelled the same way cc-handoff spells it (cc-handoff.TARGET_RE) — copied rather than
-# imported, because these two files call each other through argv and neither may fail to load with the other.
-# A selfcheck case here holds the copy to the original so the two cannot drift.
-ADDRESS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(@[a-z0-9-]{2,20}|/[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$")
-SUFFIXES = ("~next", "~old")            # the two sides of a handoff in flight; both measure AS their target
-
-
-def flipped(addr):
-    """The two halves of an orch address swapped: `<repo>@<alias>` <-> `<alias>@<repo>`; anything else unchanged.
-    One function, two callers, opposite directions — `shown` prints a name and `session_at` takes one back."""
-    head, sep, track = str(addr or "").partition("/")
-    left, at, right = head.partition("@")
-    return (f"{right}@{left}" + sep + track) if at and left and right else str(addr or "")
-
-
-def shown(addr):
-    """WHAT A PERSON IS CALLED THIS SESSION: an orch reads `<alias>@<repo>` — dashboard@myrepo, the dashboard orch
-    OF myrepo (owner, 2026-09-06, thread 1788680869). DISPLAY ONLY, and that split is the whole point: `address()`
-    below is still the tmux window name, still the key the record is stored under, and still what cc-reconcile's wake matches
-    against tmux and what `cc ls` joins on, so `--all`'s first column is left exactly as it was. This names the
-    `name` field, which is a label — the dashboard's session row prints it and nothing keys on it."""
-    return flipped(addr)
-
-
-def address(repo, track):
-    """THE ONE KEY A SESSION IS RECORDED UNDER: its tmux window name in `main`, which is exactly what
-    cc-handoff takes as a target and what the Slack layer routes on.
-    NO TWO LIVE SESSIONS MAY SHARE ONE. A planning session and an orchestrator run in the SAME worktree, with
-    the same repo and no track between them, so under the bare repo name they were one key: two live sessions,
-    two very different percentages, and whichever wrote last was read as both (2026-09-07, in front of the
-    owner). The alias is what separates them and it is in the window name, which is why the name is the key.
-    A track keeps `<repo>/<track>` whoever spawned it. The two sides of a handoff in flight deliberately DO
-    share a key — one address, one session live at a time — so the suffix comes off."""
-    name = session_name(repo, track)
-    for suf in SUFFIXES:
-        if name.endswith(suf):
-            name = name[:-len(suf)]
-    fallback = f"{repo}/{track}" if (repo and track) else (repo or "")
-    if track:
-        return fallback                 # a track is its worktree's, never its spawner's
-    if not repo:
-        return name if ADDRESS_RE.match(name or "") else ""
-    # A window renamed by hand, or one whose name is not about this session's repo at all, decides nothing:
-    # the record must stay findable under the repo the session is actually in.
-    if name == repo or (name.startswith(repo + "@") and ADDRESS_RE.match(name)):
-        return name
-    return fallback
-
-
-def record(payload):
-    """Called by the Stop hook. Never raises: a measurement must not be able to break a session."""
-    sid = payload.get("session_id") or ""
-    path = payload.get("transcript_path") or ""
-    cwd = payload.get("cwd") or ""
-    if not path or not os.path.exists(path):
-        path = transcript_for_session(sid) if sid else None
-    if not path or not os.path.exists(path):
-        return None
-    m = statusline_measure(sid) or measure(path, sid)
-    if not m:
-        return None
-    root = git(cwd, "rev-parse", "--show-toplevel") if cwd else ""
-    repo, track = track_of(root or cwd or "")
-    if not repo and cwd and os.path.dirname(os.path.realpath(cwd)) == os.path.expanduser("~/dev"):
-        repo = os.path.basename(os.path.realpath(cwd))   # a planning session: ~/dev/<repo>, no track marker
-    name = session_name(repo, track)
-    m.update({"cwd": cwd, "repo": repo, "track": track, "level": level_of(m["used"], m["window"]),
-              "name": shown(name), "target": address(repo, track)})
-    os.makedirs(RECORDS, exist_ok=True)
-    p = os.path.join(RECORDS, (sid or os.path.basename(path)[:-6]) + ".json")
-    was = {}
-    try:
-        with open(p) as f:
-            was = json.load(f) or {}
-    except Exception:
-        pass
-    m["told"] = was.get("told")
-    m["handed_off"] = was.get("handed_off")
-    lvl = m["level"]
-    # Only a session with a journal to write is ever interrupted — an owner's conversation is not.
-    # never twice: once a handoff is taken, this session is being replaced and has nothing left to be told
-    # THE ADDRESS, not the bare repo: `<repo>` and `<repo>@<alias>` are two live sessions in one worktree, and
-    # under one key each was told about the other's crossing and gated by the other's overlap.
-    target = m["target"]
-    # THE CROSSING IS THIS SESSION'S OWN WINDOW'S, OR IT IS NOBODY'S HANDOFF. address() falls back to the repo
-    # when the window is named for something else, so the record stays findable — but the event opens an overlap
-    # on the TARGET's window, and the session in that window is then somebody else: 2026-09-09 04:26Z the `box`
-    # window's session (cwd ~/dev/<repo>) crossed 22%, and cc-handoff recorded the `<repo>` window's session — a
-    # different one, at 9% — as the predecessor to retire (raised-handoff-fires-on-a-stale-session-id). The
-    # suffix comes off exactly as address() takes it off: both sides of a handoff measure as their target.
-    own = name
-    for suf in SUFFIXES:
-        if own.endswith(suf):
-            own = own[:-len(suf)]
-    own = (own == target)
-    # no window = a headless worker: its loop is its handoff. So is a cc-loop ITERATION that happens to have
-    # one — the loop occupies the track's window while the session inside it is headless (worker).
-    live = bool(repo) and have_window(target) and not worker()
-    # Anything the crossing MEANS is cc-handoff's to decide (review rec #8) — including the deadline of an
-    # overlap already open, which is why this fires with no level too. Never from the successor of an OPEN
-    # handoff: a session must not police, abandon or restart the handoff it is itself the second half of. Only
-    # while it is open, though — once it retires the successor is the only session left and must hand ITSELF
-    # off in turn (mid_handoff; reading $CC_HANDOFF as a bare flag is what stopped that all of 2026-09-01).
-    # cc-handoff refuses the same way — this is the cheap half of the rule, so the one session in a hundred
-    # that IS mid-handoff does not fork a process every turn to be told no.
-    act = ""
-    taken = bool(m["handed_off"]) or bool(payload.get("stop_hook_active"))
-    fresh = bool(lvl) and bool(repo) and not taken
-    # A RETRY LINE. Every five percent between the handoff line and the ceiling — and the ceiling itself, last
-    # of them — is one more crossing for a session whose handoff was TAKEN and then died: without it
-    # `handed_off` read as "already taken" for the rest of that session's life, which is how the overlap
-    # started at 01:35Z on 2026-09-05 and later abandoned left the box with nothing to try. What is remembered
-    # is the highest line already crossed IN TOKENS, with the window it was measured against: each line fires
-    # once, a turn between two of them fires nothing, and a WINDOW CORRECTION — 150k read as 75% of an assumed
-    # 200k, then the evidence says 1M — re-keys the lines rather than carrying a stale reading across them,
-    # which would leave the ceiling as the only line again. Whether a crossing MEANS a new attempt is
-    # cc-handoff's call.
-    lines = retry_lines(m["window"]) + [thresholds(m["window"])[2]]
-    crossed = max([x for x in lines if m["used"] >= x], default=0)
-    was_crossed = (was.get("retried") or 0) if was.get("retried_window") == m["window"] else 0
-    m["retried"], m["retried_window"] = max(crossed, was_crossed), m["window"]
-    retry = bool(lvl in ("handoff", "ceiling") and repo and m["handed_off"] and crossed > was_crossed
-                 and not payload.get("stop_hook_active") and not overlap_open(target))
-    busy = in_flight(payload, cwd) if ((fresh or retry) and lvl != "ceiling") else None   # the ceiling goes regardless
-    # …and never from a worker either: cc-handoff refuses it a phase (its `worker`), so forking that process
-    # every turn, for what is a large share of this box's sessions, only buys a "no". Same cheap half of the
-    # rule as mid_handoff above — the authoritative half stays over there.
-    if repo and own and not mid_handoff() and not worker() and ((fresh and lvl != "journal") or retry
-                                                               or overlap_open(target)):
-        act = event(target, m, lvl or "", busy or "", live, taken, retry)
-    if fresh or retry:
-        kind = (lvl + "-retry") if (retry and not fresh) else lvl
-        if act == "overlap":                           # a successor is coming up alongside: nothing is restarted
-            m["handed_off"] = m["ts"]
-            m["told"] = lvl
-            m["say"] = told(m, lvl, overlapped=True)
-            ledger(m, kind)
-        elif act == "replace":                         # the old path: it will ask this session to journal and exit
-            m["handed_off"] = m["ts"]
-            ledger(m, kind)
-        elif fresh and (LEVELS.index(lvl) > LEVELS.index(was.get("told") or LEVELS[0]) or not was.get("told")):
-            restartable = bool(live) and bool(track)   # only a track has the stop-then-restart path
-            m["told"] = lvl                            # said once per line crossed, not once per turn
-            m["say"] = told(m, lvl, busy or "", restartable, ending=worker())
-            ledger(m, lvl if lvl == "journal" else lvl + "-deferred",
-                   busy or ("no live session to restart" if not restartable else ""))
-            if worker() and track and lvl != "journal":
-                mark_journal(m, lvl)               # …and the loop reads that line instead of classifying the run
-    m["pending"] = bool(lvl and lvl != "journal" and not m["handed_off"])
-    tmp = p + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(m, f)
-    os.replace(tmp, p)
+def sessions(tracks=False):
+    """Every status-line file under LISTED_MAX_AGE with a usable number, newest first: session_id, repo,
+    track, cwd, used, window, pct, model, src, age, ts (ISO-8601 UTC of the file's own mtime — the session's last
+    activity, which age is measured from). A file that holds nulls (a session barely started) is skipped.
+    With tracks=True (--all), a live track worktree with no status-line file is added from its transcript."""
+    rows = []
     now = time.time()
-    for old in glob.glob(os.path.join(RECORDS, "*.json")):
+    for p in glob.glob(os.path.join(STATUSLINE_DIR, "*.json")):
         try:
-            if now - os.path.getmtime(old) > PRUNE_AFTER:
-                os.remove(old)
-        except OSError:
-            pass
-    return m
-
-
-def records():
-    out = []
-    for p in sorted(glob.glob(os.path.join(RECORDS, "*.json"))):
-        try:
+            mtime = os.path.getmtime(p)
             with open(p) as f:
                 d = json.load(f)
-            d["age"] = int(time.time() - os.path.getmtime(p))
-            out.append(d)
         except Exception:
             continue
-    out.sort(key=lambda d: d["age"])
-    return out
-
-
-def newest_per_track(rs):
-    """A track keeps its name across handoffs but not its session id: newest record wins."""
-    best = {}
-    for d in rs:
-        if not d.get("repo") or not d.get("track"):
+        age = now - mtime
+        if age > LISTED_MAX_AGE or not isinstance(d, dict):
             continue
-        k = (d["repo"], d["track"])
-        if k not in best:                                # records() is already newest-first
-            best[k] = d
-    return best
+        used, window, pct = d.get("used"), d.get("window"), d.get("pct")
+        if not isinstance(used, (int, float)) or not isinstance(window, (int, float)) or window <= 0 \
+                or not isinstance(pct, (int, float)):
+            continue
+        cwd = (d.get("raw") or {}).get("cwd") or ""
+        repo, track = named(cwd)
+        rows.append({"session_id": d.get("session_id") or os.path.basename(p)[:-5], "repo": repo, "track": track,
+                     "cwd": cwd, "used": int(used), "window": int(window), "pct": float(pct),
+                     "model": d.get("model"), "src": "statusline", "age": int(age),
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))})
+    if tracks:
+        rows += track_rows(now, {(r["repo"], r["track"]) for r in rows})
+    rows.sort(key=lambda r: r["age"])
+    return rows
 
 
-# ---- output ------------------------------------------------------------------------------------
+def newest_in(cwd):
+    """The session id of the newest status-line file whose cwd is this directory, or None."""
+    want = os.path.realpath(cwd)
+    for r in sessions():
+        if r["cwd"] and os.path.realpath(r["cwd"]) == want:
+            return r["session_id"]
+    return None
+
 
 def line(m):
     s = f"{m['pct']:.0f}%  {human(m['used'])}/{human(m['window'])}"
@@ -965,19 +426,15 @@ def line(m):
         s += " — NO evidence for the window, so the % may be wrong"
     if m.get("compacted"):
         s += "  (just compacted)"
-    lvl = m.get("level") or level_of(m["used"], m["window"])
-    if lvl:
-        s += {"journal": "  — journal a handoff", "handoff": "  — hand off",
-              "ceiling": "  — hand off NOW (ceiling)"}[lvl]
-    if m.get("pending"):
-        s += "  (handoff pending)"
+    if m.get("level"):
+        s += f"  — hand off (past the {human(m['handoff_line'])} line)"
     return s
 
 
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return selfcheck()
-    as_json = quiet = do_all = do_record = do_handoffs = do_true = False
+    as_json = quiet = do_all = False
     over = None
     path = sid = repo = track = None
     args = []
@@ -989,22 +446,9 @@ def main(argv):
             quiet = True
         elif a == "--all":
             do_all = True
-        elif a == "--thresholds":
-            try:                                  # the window to read them for: the same env every measurement
-                w = float(os.environ.get("CC_CTX_WINDOW") or BIG_WINDOW)      # source honours, else the 1M one
-            except ValueError:                                                # the box's sessions actually run
-                w = BIG_WINDOW
-            print(" ".join(f"{x:g}" for x in thresholds(w)))
-            return 0
-        elif a == "--record":
-            do_record = True
-        elif a == "--handoffs":
-            do_handoffs = True
-        elif a == "--true":
-            do_true = True
         elif a == "--over":
             over = float(argv.pop(0)) if argv and not argv[0].startswith("-") and argv[0][:1].isdigit() \
-                else "level"                      # bare --over = the handoff line for THAT session's window
+                else "line"                       # bare --over = the hand-off line
         elif a == "--transcript":
             path = argv.pop(0)
         elif a == "--session":
@@ -1019,107 +463,57 @@ def main(argv):
             args.append(a)
     if len(args) >= 2:
         repo, track = args[0], args[1]
-    elif len(args) == 1 and not do_true and ADDRESS_RE.match(args[0]):
-        # ONE ADDRESS. `<repo>/<track>` is the pair spelled in one word; `<repo>@<alias>` names an orchestrator,
-        # which has no board row and no worktree of its own, so it is found through the record it last wrote.
-        a0 = args[0]
-        if "/" in a0:
-            repo, track = a0.split("/", 1)
-        else:
-            sid = session_at(a0)
-            # No record means we cannot say whose session this is — refuse. Falling through would call
-            # resolve(None, None, None), which answers about the CALLER's own cwd and labels it with the
-            # address that was asked for: one session read as another, which is what this whole change exists
-            # to end. The --true path below already refuses here; this keeps the two consistent.
-            if not sid:
-                print(f"cc-context: no session has recorded under {a0} — it has not stopped a turn yet, "
-                      f"or that is not a live address (cc-handoff --status {a0})", file=sys.stderr)
-                return 2
-
-    if do_record:
-        try:
-            payload = json.load(sys.stdin)
-            m = record(payload if isinstance(payload, dict) else {})
-            if m and m.get("say"):   # the Stop hook's own reply channel: the session continues and does this
-                print(json.dumps({"decision": "block", "reason": m["say"]}))
-        except Exception:
-            pass
-        return 0
-
-    if do_handoffs:
-        hs = handoffs()
-        if as_json:
-            print(json.dumps(hs, indent=2))
-            return 0
-        for h in hs:
-            who = h.get("target") or f"{h.get('repo') or '-'}/{h.get('track') or '-'}"
-            print(f"{h.get('ts')}\t{h.get('kind')}\t{who}"
-                  f"\t{h.get('pct')}\t{h.get('used')}\t{h.get('window')}\t{h.get('session_id') or '-'}")
-        return 0
+    elif len(args) == 1:
+        if not ADDRESS_RE.match(args[0]):
+            print(f"cc-context: '{args[0]}' is not <repo>, <repo>/<track> or <repo> <track> (an orchestrator "
+                  f"shares its checkout: `cc-context <repo>` is the newest session there)", file=sys.stderr)
+            return 2
+        repo, track = (args[0].split("/", 1) + [None])[:2]
 
     if do_all:
-        rs = records()
+        hl = handoff_line()
+        rows = []
+        for r in sessions(tracks=True):
+            over = r["used"] >= hl
+            rows.append({"repo": r["repo"] or "-", "track": r["track"] or "-", "pct": r["pct"], "used": r["used"],
+                         "window": r["window"], "src": r["src"], "age": r["age"],
+                         "level": "handoff" if over else None, "ts": r["ts"]})
         if as_json:
-            print(json.dumps(rs, indent=2))
-            return 0
-        for d in rs:
-            # COLUMN ONE IS THE SESSION, not the repo: `<repo>` for one a person steers and `<repo>@<alias>`
-            # for an orchestrator, so the two that share a worktree are two rows a reader can tell apart.
-            # The track stays in column two and the count is unchanged — the callers that read this by
-            # position (`cc ls`, the Slack tracker line) key on the first two columns and neither moves.
-            who = d.get("target") or d.get("repo") or "-"
-            if d.get("track") and who.endswith("/" + d["track"]):
-                who = who[:-(len(d["track"]) + 1)]
-            print(f"{who or '-'}\t{d.get('track') or '-'}\t{d['pct']:.0f}\t{d['used']}"
-                  f"\t{d['window']}\t{d['window_src']}\t{d['age']}\t{d.get('level') or '-'}"
-                  f"\t{'pending' if d.get('pending') else '-'}")
+            print(json.dumps(rows, indent=2))
+        else:
+            for row in rows:
+                print(f"{row['repo']}\t{row['track']}\t{row['pct']:.0f}\t{row['used']}\t{row['window']}"
+                      f"\t{row['src']}\t{row['age']}\t{row['level'] or '-'}\t-")
         return 0
 
-    m = None
-    if do_true:
-        # A TARGET, ALWAYS: --true types at a keyboard, and the one keyboard it must never type at is its own
-        # caller's. `<repo> <track>` and a bare `<target>` (`box`, `repo/track`) are the same tmux window name.
-        target = f"{repo}/{track}" if repo and track else (args[0] if args else None)
-        if not target:
-            print("cc-context: --true needs a target — the tmux window to ask (<repo> <track>, or box)",
-                  file=sys.stderr)
-            return 2
-        m = pane_measure(target)          # None = the pane was busy, in a dialog, or gone: fall back to the estimate
-        if not m and not path and not sid and not (repo and track):
-            # …TO THE TARGET'S OWN ESTIMATE, never the caller's. `--true repo/track` names the session in one
-            # word, so split it back into the pair resolve() wants; with nothing to go on resolve() returns the
-            # newest transcript for THIS process's cwd, which is the session that typed the command — a
-            # different number, a different level, and a different --over answer, reported as if it were the
-            # target's. A target with no slash (`box`) names no board row, so there is nothing to fall back to.
-            if "/" in target:
-                repo, track = target.split("/", 1)
-            elif session_at(target):
-                sid = session_at(target)      # an orchestrator: no board row, but a record of its own
-            else:
-                if not quiet:
-                    print(f"cc-context: {target}'s pane would not answer, and nothing has recorded under "
-                          f"`{target}` to estimate from", file=sys.stderr)
-                return 2
-    if not m:
-        if not path:
+    if not path:
+        if repo and not track:                    # the newest session in that checkout, by its status-line file
+            cwd = os.path.join(DEV, repo)
+            sid = sid or newest_in(cwd)
+            path = transcript_for_session(sid) if sid else transcript_for_cwd(cwd)
+            sid = sid or (os.path.basename(path)[:-6] if path else None)
+        else:
             path, sid = resolve(repo, track, sid)
+    m = statusline_measure(sid)
+    if not m:
         if not path or not os.path.exists(path):
             if not quiet:
-                what = f"{repo}/{track}" if repo else (sid or os.getcwd())
+                what = f"{repo}/{track}" if track else (repo or sid or os.getcwd())
                 print(f"cc-context: no transcript for {what}", file=sys.stderr)
             return 2
-        m = statusline_measure(sid) or measure(path, sid)
+        m = measure(path, sid)
         if not m:
             if not quiet:
                 print(f"cc-context: {path} has no answered turn yet", file=sys.stderr)
             return 2
+    judge(m)
     if as_json:
         print(json.dumps(m, indent=2))
     elif not quiet:
         print(line(m))
     if over is not None:
-        if over == "level":
-            return 0 if (m.get("level") or level_of(m["used"], m["window"])) in ("handoff", "ceiling") else 1
+        if over == "line":
+            return 0 if m["level"] else 1
         return 0 if m["pct"] >= over else 1
     return 0
 
@@ -1150,31 +544,22 @@ def selfcheck():
             "model": model, "usage": {"input_tokens": inp, "cache_creation_input_tokens": cc,
                                       "cache_read_input_tokens": cr, "output_tokens": out}}}
 
+    def run(argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
     env0 = os.environ.pop("CC_CTX_WINDOW", None)
     sid0 = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)   # resolve() reads it: the session RUNNING the test is not a fixture
-    pane0 = os.environ.pop("TMUX_PANE", None)  # …nor is its window: record() now asks whether the crossing's window is the
-                                               # target's own, and the pane running the test is never a fixture's
     box0 = os.environ.get("CC_CTX_BOX_MODEL")
     os.environ["CC_CTX_BOX_MODEL"] = ""        # hermetic: what THIS box runs must not decide a fixture's window
-    role0 = os.environ.pop("CC_ROLE", None)    # a --go worker runs these gates as often as a session does, and
-                                               # every case below would take the worker branch if its own role
-                                               # leaked in. Same trap as $CC_HANDOFF, restored at the end.
-    # …AND NEITHER MUST THE BOX'S OWN ~/.cc/config. cfg() reads through cc-config, and cc-config reads the live file
-    # unless CC_CONFIG names another; every threshold case below asserts the 30/40/60 defaults, so a
-    # CC_CONTEXT_HANDOFF_PCT=15 set on the box (2026-09-08, 18:50Z) turned this selfcheck red on main's own tree
-    # and in every landing's gate after it. The config this run reads is an EMPTY file of its own.
+    # …and neither must the box's own ~/.cc/config: cfg() reads through cc-config, and a hand-off line set there
+    # would move the line asserted below. This run reads an EMPTY config of its own.
     cfg0 = os.environ.get("CC_CONFIG")
     cfgd = tempfile.mkdtemp(prefix="cc-context-selfcheck-")
     os.environ["CC_CONFIG"] = os.path.join(cfgd, "config"); open(os.environ["CC_CONFIG"], "w").close()
-    hnd0 = os.environ.pop("CC_HANDOFF", None)  # …and WHO IS RUNNING THE TEST must not decide it either. The overlap
-                                               # cases below are the only ones that read this, and they read it off
-                                               # the ambient environment: `not os.environ.get("CC_HANDOFF")` is how a
-                                               # successor is stopped from policing the handoff it is half of. So a
-                                               # selfcheck run BY a successor silently took that branch, no overlap
-                                               # ever started, and the run died on an empty list — 2026-08-31, which
-                                               # is how a green main looked like four red cases and blocked every
-                                               # landing that session could attempt. A gate that fails on who is
-                                               # holding it is not a gate.
+    hl0 = os.environ.pop("CC_CONTEXT_HANDOFF_TOKENS", None)
 
     # used = input + cache_creation + cache_read of the LAST assistant turn
     t = tx([asst("claude-opus-5", 5, 100, 200), asst("claude-opus-5", 10, 1000, 9000)])
@@ -1238,634 +623,122 @@ def selfcheck():
     big = tx([asst("claude-opus-5", 1, 2, 3)] + [{"type": "user", "pad": "x" * 4000} for _ in range(200)])
     ok("tail grows past 256k of padding", measure(big)["used"] == 6)
 
-    # records: written from a Stop payload, read back newest-first per track
+    # the hand-off line: one absolute number, and the level and the printed line read it
+    ok("the hand-off line defaults to 150k tokens", handoff_line() == 150000)
+    os.environ["CC_CONTEXT_HANDOFF_TOKENS"] = "100000"
+    ok("...and CC_CONTEXT_HANDOFF_TOKENS moves it", handoff_line() == 100000)
+    del os.environ["CC_CONTEXT_HANDOFF_TOKENS"]
+    m = judge(measure(tx([asst("claude-opus-5", 0, 0, 149999)])))
+    ok("one token under the line is no level, and the line says nothing about handing off",
+       m["level"] is None and "hand off" not in line(m))
+    m = judge(measure(tx([asst("claude-opus-5", 0, 0, 150000)])))
+    ok("at the line the level is handoff and the line says so",
+       m["level"] == "handoff" and "hand off (past the 150k line)" in line(m))
+
+    # --over: a percentage, or the line itself; unmeasurable is 2, never a guess
+    t = tx([asst("claude-opus-5", 10, 1000, 9000)])                       # 10010 of an assumed 200k = 5%
+    ok("--over N exits 0 at/over N", run(["--transcript", t, "--over", "5"])[0] == 0)
+    ok("...and 1 under it", run(["--transcript", t, "--over", "90"])[0] == 1)
+    ok("a bare --over is the hand-off line: 10k is under it", run(["--transcript", t, "--over"])[0] == 1)
+    os.environ["CC_CONTEXT_HANDOFF_TOKENS"] = "10000"
+    ok("...and over it once the line is moved under the reading", run(["--transcript", t, "--over"])[0] == 0)
+    del os.environ["CC_CONTEXT_HANDOFF_TOKENS"]
+    rc, out, err = run(["--transcript", os.path.join(cfgd, "none.jsonl"), "--over", "90"])
+    ok("no transcript is exit 2 and says so", rc == 2 and out == "" and "no transcript" in err)
+    rc, out, err = run(["--json", "--transcript", t])
+    ok("--json carries the line and the level", rc == 0 and json.loads(out)["handoff_line"] == 150000
+       and json.loads(out)["level"] is None)
+    ok("an address with an @ in it is refused, not answered about the caller",
+       run(["repo@alias"])[0] == 2 and "not <repo>" in run(["repo@alias"])[2])
+
     with tempfile.TemporaryDirectory() as d:
-        global RECORDS, HANDOFF, STATE, PROJECTS, session_name
-        keeps, STATE = STATE, os.path.join(d, "state")     # mark_journal writes a real file: not the box's
-        keep, RECORDS = RECORDS, os.path.join(d, "context")
-        keeph, HANDOFF = HANDOFF, os.path.join(d, "handoff")   # mid_handoff() reads <id>.done from here: a
-        os.makedirs(HANDOFF, exist_ok=True)                    # fixture must never write into the box's own
-        t = tx([asst("claude-opus-5", 10, 1000, 9000)])
-        r = record({"session_id": "sid-1", "transcript_path": t, "cwd": d})
-        ok("record writes a measurement", r and r["used"] == 10010)
-        ok("record file is keyed by session id", os.path.exists(os.path.join(RECORDS, "sid-1.json")))
-        ok("a payload with no transcript records nothing", record({"session_id": "x"}) is None)
-        os.makedirs(os.path.join(d, "wt/.cc"), exist_ok=True)
-        with open(os.path.join(d, "wt/.cc/track"), "w") as fh:
-            fh.write("repo1\ntrack1\n")
-        record({"session_id": "sid-2", "transcript_path": t, "cwd": os.path.join(d, "wt")})
-        rs = records()
-        ok("--all lists both records", len(rs) == 2)
-        best = newest_per_track(rs)
-        ok("repo/track comes off the .cc/track marker", ("repo1", "track1") in best)
-
-        # the session's NAME and its ADDRESS: the tmux window when the hook runs in one; otherwise the parts
-        # that are known. EVERY KIND THE BOX STARTS gets an address here, and no two of them share one.
-        envN = {k: os.environ.pop(k, None) for k in ("TMUX_PANE", "CC_SLACK_ALIAS", "HOME")}
-        try:
-            home = os.path.realpath(d)                    # a fake ~/dev: a session a person steers, and an orch
-            os.environ["HOME"] = home                     # beside it, are both `~/dev/<repo>` with no track marker
-            os.makedirs(os.path.join(home, "dev", "repo2"), exist_ok=True)
-            plan = os.path.join(home, "dev", "repo2")
-            wt = os.path.join(d, "wt")
-            r2 = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
-            ok("with no pane a track session is named repo/track",
-               bool(r2) and r2.get("name") == "repo1/track1" and r2.get("target") == "repo1/track1")
-            rp = record({"session_id": "sid-p", "transcript_path": t, "cwd": plan})
-            ok("a session a person steers is addressed by its repo alone",
-               bool(rp) and rp.get("target") == "repo2" and not rp.get("track"))
-            os.environ["CC_SLACK_ALIAS"] = "dash"
-            r3 = record({"session_id": "sid-o", "transcript_path": t, "cwd": plan})
-            ok("an orch with no pane is ADDRESSED repo@alias — the alias is the only thing between it "
-               "and the session a person steers in the same worktree, so without it they were one key",
-               bool(r3) and r3.get("target") == "repo2@dash")
-            # …AND NAMED THE OTHER WAY ROUND (owner, 2026-09-06, thread 1788680869: "naming for suborch should be
-            # dashboard@myrepo not the other way around"). `name` is the label the dashboard's session row prints;
-            # `target` is the key, the tmux window and what cc-reconcile's wake matches, so only the label flips.
-            ok("…and NAMED alias@repo, which is a label and not the key — the two differ for an orch and for "
-               "nothing else", r3.get("name") == "dash@repo2" and r3.get("name") != r3.get("target")
-               and rp.get("name") == rp.get("target") == "repo2")
-            ok("…so the two live sessions sharing that worktree are two addresses, not one",
-               rp.get("target") != r3.get("target"))
-            r3b = record({"session_id": "sid-2", "transcript_path": t, "cwd": wt})
-            ok("$CC_SLACK_ALIAS leaks into everything an orch launches, and it does NOT rename the TRACKS it "
-               "launches: a track is addressed by its own worktree, whoever spawned it",
-               bool(r3b) and r3b.get("name") == "repo1/track1" and r3b.get("target") == "repo1/track1")
-            os.environ["TMUX_PANE"] = "%999999"           # a pane tmux does not know: the name falls back, nothing raises
-            r4 = record({"session_id": "sid-o", "transcript_path": t, "cwd": plan})
-            ok("a pane tmux cannot name falls back to the parts, never raises",
-               bool(r4) and r4.get("name") == "dash@repo2" and r4.get("target") == "repo2@dash")
-            # TYPED BACK. The name printed above is what a person copies into `cc-context <address>`, so the
-            # record store answers to it — tried against the records, never guessed from the string. The control
-            # is the lookup this replaced: exact-match only, which could not find a session by its own name.
-            ok("the name a person is shown is accepted back: `cc-context dash@repo2` finds the session recorded "
-               "under repo2@dash, and the stored spelling still finds it too",
-               session_at("dash@repo2") == "sid-o" and session_at("repo2@dash") == "sid-o")
-            ok("control: without the flip an exact match on the shown name finds nothing, which is a live orch "
-               "unreachable by the only name the box prints for it",
-               not [d for d in records() if (d.get("target") or "") == "dash@repo2"])
-            ok("…and a name that is nobody's is still nobody's, either way round",
-               session_at("nosuch@repo2") is None and flipped("repo1/track1") == "repo1/track1"
-               and flipped("repo2") == "repo2")
-        finally:
-            for k, v in envN.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
-
-        # THE GRAMMAR IS HELD TO CC-HANDOFF'S OWN. The two files call each other through argv and neither may
-        # fail to load with the other, so the shapes are spelled twice; asked of the sibling itself, over the
-        # names that matter, they must agree exactly. An address this file mints and that one refuses is a
-        # session that measures fine and can never be handed off — which is the whole of this row.
-        shapes = ["r1", "r1@dash", "r1/t1", "r1@d", "r1@DASH", "r1/t1/x", "../etc", "r1@dash/t1", "r1~next", "r1@"]
-        henv = dict(os.environ, CC_HANDOFF_DIR=os.path.join(d, "nohandoff"), CC_CTX_RECORDS=RECORDS)
-        agree = []
-        for n in shapes:
-            try:
-                r = subprocess.run([os.path.join(BIN, "cc-handoff"), "--status", n], capture_output=True,
-                                   text=True, env=henv, timeout=30)
-                theirs = "is not a target" not in (r.stdout + r.stderr)
-            except Exception:
-                theirs = None
-            agree.append((n, theirs, bool(ADDRESS_RE.match(n))))
-        ok("every address this file mints is one cc-handoff takes, and every shape it refuses is refused here "
-           "too — asked of cc-handoff itself, not of a copy of its regex",
-           all(t == m for _, t, m in agree) and [n for n, t, _ in agree if t] == ["r1", "r1@dash", "r1/t1"])
-
-        # --all: ONE ROW PER LIVE SESSION, and a reader can tell two in one worktree apart
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            main(["--all"])
-        rows = [l.split("\t") for l in buf.getvalue().splitlines() if l.strip()]
-        who = [r[0] for r in rows]
-        ok("--all keeps its nine columns, so the callers that read it by position are untouched",
-           bool(rows) and all(len(r) == 9 for r in rows))
-        ok("--all gives the orch and the session a person steers beside it two different first columns — one "
-           "bare key for both is how one's percentage was read as the other's",
-           "repo2" in who and "repo2@dash" in who)
-        ok("a track keeps the repo in column one and its own name in column two",
-           any(r[0] == "repo1" and r[1] == "track1" for r in rows))
-        ok("no two rows share an address", len(who) == len(set(f"{r[0]}\t{r[1]}" for r in rows)))
-
-        # …and one can be ASKED for by that address, which is the other half of telling them apart
-        ok("an orch's own session is found through the record it wrote, not through the worktree it shares",
-           session_at("repo2@dash") == "sid-o" and session_at("repo2") == "sid-p")
-        ok("…and it hands off through a journal of its own — one file for both would have handed each the "
-           "other's handoff entry as the account of its own work (nothing on disk yet: the canonical name)",
-           journal_of({"repo": "repo2", "target": "repo2@dash"}) == "~/.cc/state/repo2/dash-handoff.md"
-           and journal_of({"repo": "repo2", "target": "repo2"}) == "~/.cc/state/repo2/planning-handoff.md"
-           and journal_of({"repo": "repo2", "track": "t1", "target": "repo2/t1"})
-           == "~/.cc/state/repo2/t1/progress.md")
-
-        # A JOURNAL KEPT UNDER THE LEGACY NAME IS THE ONE THIS SIDE MUST NAME AND WRITE. No prompt ever told an
-        # orch's own session where its running notes belonged, so at least one (lessons@lessons-site) kept a
-        # `-handover.md`; cc-handoff --brief now reads that file. The naming/append side has to resolve it the
-        # same way or the history forks — the successor reading 230 kB of real history, this session writing a
-        # fresh `-handoff.md` beside it. The last two cases are the negative control: both go red on a write
-        # side that ignores the legacy file.
-        mo = {"repo": "repo3", "target": "repo3@o", "pct": 61.0, "used": 610000, "window": 1000000,
-              "ts": "2026-09-07T00:00:00Z", "session_id": "sid-legacy"}
-        os.makedirs(os.path.join(STATE, "repo3"), exist_ok=True)
-        ok("a fresh address, neither name on disk, is still told the canonical one",
-           journal_of(mo) == "~/.cc/state/repo3/o-handoff.md")
-        jlegacy = os.path.join(STATE, "repo3", "o-handover.md")
-        with open(jlegacy, "w") as fh:
-            fh.write("legacy journal\n")
-        ok("...a legacy '-handover.md' alone is the file this session is TOLD to write — the same one "
-           "cc-handoff --brief reads back",
-           journal_of(mo) == "~/.cc/state/repo3/o-handover.md"
-           and "~/.cc/state/repo3/o-handover.md" in told(mo, "handoff"))
-        mark_journal(mo, "handoff")
-        ok("...and a worker's stop marker lands IN it, with no canonical file minted beside it",
-           MARK in open(jlegacy).read()
-           and not os.path.exists(os.path.join(STATE, "repo3", "o-handoff.md")))
-        with open(os.path.join(STATE, "repo3", "o-handoff.md"), "w") as fh:
-            fh.write("canonical journal\n")
-        ok("...but the canonical name wins the moment it exists too, so the two never fork",
-           journal_of(mo) == "~/.cc/state/repo3/o-handoff.md")
-
-        # the three lines: a percentage each, capped at an absolute token count, with a floor under the first two
-        # THE LIVE CONFIG IS OUT OF REACH: a HOME whose ~/.cc/config sets CC_CONTEXT_HANDOFF_PCT — the edit that
-        # turned this selfcheck red on every landing's gate on 2026-09-08 — changes nothing here, because the run
-        # reads the empty file pinned above; the same knob written INTO that file is read, so the pin is a file
-        # cc-config honours and not a reader that stopped reading. 12, not the 15 the box set: on a 1M window
-        # 15% and the 150k cap are the same number, and a case that cannot tell them apart proves nothing.
-        homed = tempfile.mkdtemp(prefix="cc-context-home-"); os.makedirs(os.path.join(homed, ".cc"))
-        with open(os.path.join(homed, ".cc", "config"), "w") as fh:
-            fh.write("CC_CONTEXT_HANDOFF_PCT=12\n")
-        home0 = os.environ.get("HOME"); os.environ["HOME"] = homed
-        try:
-            unread = thresholds(BIG_WINDOW)[1]
-            with open(os.environ["CC_CONFIG"], "w") as fh:
-                fh.write("CC_CONTEXT_HANDOFF_PCT=10\n")
-            read = thresholds(BIG_WINDOW)[1]
-            open(os.environ["CC_CONFIG"], "w").close()
-        finally:
-            os.environ["HOME"] = home0 if home0 is not None else ""
-            shutil.rmtree(homed, ignore_errors=True)
-        ok("this selfcheck never reads the box's ~/.cc/config: a handoff line set there does not move the line here, "
-           "and the same knob in the run's own pinned file does", unread == 150000 and read == 100000)
-        ok("the 1M window is capped at 112k/150k/225k, not 30/40/60 of it",
-           thresholds(BIG_WINDOW) == (112500.0, 150000.0, 225000.0))
-        ok("...and a window past 1M buys no more room either — the cap is absolute, not relative",
-           thresholds(2_000_000) == (112500.0, 150000.0, 225000.0))
-        ok("the floors hold a 200k window up, where the caps never bite: this change moved nothing there",
-           thresholds(DEFAULT_WINDOW) == (60000.0, 90000.0, 120000.0))
-        ok("on 128k the floor is the whole rule", thresholds(128000) == (60000.0, 90000.0, 90000.0))
-        ok("the ceiling is never under the handoff", thresholds(100000)[2] >= thresholds(100000)[1])
-        ok("the retry lines still land strictly between the two capped lines",
-           bool(retry_lines(BIG_WINDOW)) and all(thresholds(BIG_WINDOW)[1] < x < thresholds(BIG_WINDOW)[2]
-                                                 for x in retry_lines(BIG_WINDOW)))
-        for k, v in (("CC_CONTEXT_WARN_MAX", "150000"), ("CC_CONTEXT_HANDOFF_MAX", "200000"),
-                     ("CC_CONTEXT_CEILING_MAX", "300000")):
-            os.environ[k] = v
-        ok("each cap has its own override", thresholds(BIG_WINDOW) == (150000.0, 200000.0, 300000.0))
-        ok("...and raising them still cannot move a 200k window: the percentage is the smaller of the two there",
-           thresholds(DEFAULT_WINDOW) == (60000.0, 90000.0, 120000.0))
-        os.environ["CC_CONTEXT_HANDOFF_MAX"] = "50000"
-        ok("...and a cap under the floor loses: a session is never handed off before it can work",
-           thresholds(BIG_WINDOW)[1] == 90000.0)
-        for k in ("CC_CONTEXT_WARN_MAX", "CC_CONTEXT_HANDOFF_MAX", "CC_CONTEXT_CEILING_MAX"):
-            os.environ.pop(k, None)
-        ok("levels, in order", [level_of(u, BIG_WINDOW) for u in (112499, 112500, 150000, 225000)]
-                               == [None, "journal", "handoff", "ceiling"])
-        ok("the same rule fires on a 200k model", level_of(60000, DEFAULT_WINDOW) == "journal")
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            os.environ["CC_CTX_WINDOW"] = str(BIG_WINDOW)
-            main(["--thresholds"])
-            os.environ["CC_CTX_WINDOW"] = str(DEFAULT_WINDOW)
-            main(["--thresholds"])
-            os.environ.pop("CC_CTX_WINDOW")
-        ok("--thresholds prints the lines in TOKENS, for the window asked about",
-           buf.getvalue().split("\n")[:2] == ["112500 150000 225000", "60000 90000 120000"])
-
-        # nothing real is ever restarted or started from a selfcheck: the ONE shell-out is stubbed. It stands
-        # in for cc-handoff, which owns the phases — so this fixture answers exactly as that CLI does, with the
-        # action it took, and these cases assert what THIS file does with the answer, never what cc-handoff
-        # decides (that has its own selfcheck, and selftest.sh drives the two together on real windows).
-        # The crossing fixtures below are about the MACHINERY — which line fires, what is said, what is
-        # started, what lands on the ledger — not about where the lines sit (asserted above). Pin the caps out
-        # of the way so they keep reading in round percentages of the 1M window, 300k/400k/600k, and so the
-        # retry ladder still has three rungs to walk. Put back where the stubs are.
-        for k, v in (("CC_CONTEXT_WARN_MAX", "300000"), ("CC_CONTEXT_HANDOFF_MAX", "400000"),
-                     ("CC_CONTEXT_CEILING_MAX", "600000")):
-            os.environ[k] = v
-        global have_window, overlap_open, event
-        hw0, ev0, oo0 = have_window, event, overlap_open
-        live, events, started, on, tried = [True], [], [], [False], []
-        have_window = lambda t: live[0]
-
-        def event(t, m, level, busy="", live_=False, taken=False, retry=False):   # noqa: F811 — the stub, restored below
-            events.append((t, level, busy, live_, taken, retry))
-            if not level or level == "journal" or not live_ or any(x[0] == t for x in started):
-                return ""
-            if taken and not (retry and any(x == t for x in tried)):
-                return ""                        # cc-handoff's `retryable`: only an attempt that DIED is remade
-            if on[0]:
-                started.append((t, busy))
-                tried.append(t)
-                return "overlap"
-            return "replace" if "/" in t and not busy else ""
-
-        def overlap_open(t):                 # noqa: F811
-            return on[0] and any(x[0] == t for x in started)
-
-        wt = os.path.join(d, "wt")
-        subprocess.run(["git", "init", "-q", wt], check=False)      # a real repo: in_flight reads git, not a flag
-
-        def at(used, sid, **extra):
-            t2 = tx([asst("claude-opus-5", 0, 0, used),
-                     {"type": "cost-state", "modelUsage": {"claude-opus-5[1m]": {"inputTokens": 1}}}])
-            return record({"session_id": sid, "transcript_path": t2, "cwd": wt, **extra})
-
-        r = at(320000, "sid-3")
-        ok("crossing the journal line tells the session", r["level"] == "journal" and "handoff entry" in r["say"])
-        ok("the message names the journal, not the tool", "repo1/track1/progress.md" in r["say"])
-        ok("the same line is not said twice", not at(320000, "sid-3").get("say"))
-
-        # the handoff line with work in flight: PENDING, and nothing is restarted underneath the session
-        r = at(420000, "sid-3")
-        ok("in flight -> the handoff is pending, not taken", r["pending"] and not r["handed_off"]
-           and events[-1][1:3] == ("handoff", in_flight({}, wt)))
-        ok("the session is told what it is waiting on", "PENDING" in r["say"] and "uncommitted work" in r["say"])
-        n0 = len([e for e in events if e[1] == "handoff" and not e[2]])
-        r = at(420000, "sid-3", background_tasks=[{"id": "1"}])
-        ok("a background task counts as in flight", r["pending"] and not r["handed_off"]
-           and len([e for e in events if e[1] == "handoff" and not e[2]]) == n0)
-
-        # the ceiling goes regardless: past it, a degraded session costs more than the state it drops
-        r = at(650000, "sid-3")
-        ok("the ceiling hands off with work still in flight", r["level"] == "ceiling" and r["handed_off"]
-           and events[-1][1:3] == ("ceiling", ""))
-        n1 = len(events)
-        ok("a handoff already taken is never taken twice", at(650000, "sid-3")["handed_off"] == r["handed_off"]
-           and len(events) == n1)                       # and with nothing open to watch, not even a fork goes out
-
-        # nothing in flight: the pending handoff is taken at the next turn
-        for a in (["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
-            subprocess.run(["git", "-C", wt, *a], check=False, capture_output=True)
-        ok("a committed worktree is not in flight", in_flight({}, wt) is None)
-        r = at(420000, "sid-6")
-        ok("idle -> the handoff is executed", r["handed_off"] and events[-1][1:3] == ("handoff", ""))
-
-        # a headless worker has no window to restart; its loop is the handoff, so it is told to journal
-        live[0] = False
-        r = at(420000, "sid-7")
-        ok("no live session -> told, never restarted", not r["handed_off"] and "IS the handoff" in r["say"]
-           and events[-1][3] is False)                  # the fact goes out with the event; the phase is not ours
-        live[0] = True
-
-        n3 = len(events)
-        r = at(420000, "sid-8", stop_hook_active=True)
-        ok("never while a Stop hook is already holding the session", "say" not in r
-           and not r["handed_off"] and len(events) == n3)   # held = taken: with nothing open, not even a fork
-        t9 = tx([asst("claude-opus-5", 0, 0, 470000),
-                 {"type": "cost-state", "modelUsage": {"claude-opus-5[1m]": {"inputTokens": 1}}}])
-        n2 = len(events)
-        r = record({"session_id": "sid-9", "transcript_path": t9, "cwd": d})
-        ok("a session with no journal is not interrupted", r["level"] == "handoff" and "say" not in r
-           and len(events) == n2)                       # …and nothing outside this file was even asked
-
-        # the durable record: one countable line per crossing, no prose to parse
-        hs = handoffs()
-        ok("every crossing is on the ledger, and only crossings", len(hs) == 5)
-        ok("the ledger says which line fired", [h["kind"] for h in hs]
-           == ["journal", "handoff-deferred", "ceiling", "handoff", "handoff-deferred"])
-        ok("a ledger line carries when/who/how full", all(h.get("ts") and h.get("pct") and h.get("used")
-                                                          and h.get("window") and h.get("session_id") for h in hs))
-        ok("repo and track are on it, so a count can be per track",
-           all(h["repo"] == "repo1" and h["track"] == "track1" for h in hs))
-        ok("a deferred line says what it was waiting on", any("uncommitted" in (h.get("why") or "") for h in hs))
-        ok("the ledger outlives the per-session records", os.path.exists(os.path.join(RECORDS, "handoffs.jsonl")))
-
-        # ---- the overlapping handoff: the successor starts ALONGSIDE, so nothing has to be idle ----
-        ok("these cases read $CC_HANDOFF off the environment, so the caller's own must not be in it — a "
-           "successor running the gates would otherwise see every case below take the successor branch",
-           "CC_HANDOFF" not in os.environ)
-        on[0] = True
-        subprocess.run(["git", "-C", wt, "worktree", "list"], check=False, capture_output=True)
-        open(os.path.join(wt, "dirty.txt"), "w").write("x")     # in flight again: today this deferred forever
-        ok("work in flight still defers the OLD path", in_flight({}, wt))
-        r = at(420000, "sid-10")
-        ok("the overlap starts with work in flight — nothing to defer on",
-           r["handed_off"] and started == [("repo1/track1", in_flight({}, wt))])
-        ok("the session is told its successor is alive, not that it is being restarted",
-           "SUCCESSOR" in r["say"] and "not live yet" in r["say"] and "PENDING" not in r["say"])
-        ok("in_flight is demoted to the successor's opening checklist", "uncommitted work" in started[0][1])
-        r2 = at(430000, "sid-10")
-        ok("an overlap is never started twice for one target", len(started) == 1 and not r2.get("say"))
-        # the deadline of an open overlap is the same event, with no level: this file has nothing to say about
-        # a turn that crossed nothing, but cc-handoff still has a watchdog to run on it
-        ok("an open overlap is handed the turn even when no line was crossed",
-           at(100000, "sid-10") and events[-1][:2] == ("repo1/track1", ""))
-        ok("...and once a phase is taken the MEASUREMENT still goes out, flagged, so the watchdog can decide "
-           "on it: at the ceiling it forces the cutover instead of abandoning",
-           at(650000, "sid-10") and events[-1][:2] == ("repo1/track1", "ceiling") and events[-1][4] is True)
-
-        os.environ["CC_HANDOFF"] = "x"       # the SUCCESSOR shares this cwd: it must not police its own handoff
-        n = len(events)
-        at(420000, "sid-11")
-        ok("the successor never even emits the event for a handoff it is half of",
-           len(events) == n and len(started) == 1)
-        # …but only while that handoff is OPEN. $CC_HANDOFF lives as long as the successor's process, so read
-        # as a bare flag it silenced this file for the rest of that session's life and the box could overlap a
-        # target exactly once, ever — 2026-09-01, the planning session sat past the hand-off line all evening
-        # at 51.5% and the handoff had to be started by hand. <id>.done is the difference (cc-guard:84).
-        open(os.path.join(HANDOFF, "x.done"), "w").write("{}")
-        started.clear()                      # …which is also what retiring did: the record was cleared with it
-        n = len(events)
-        r = at(420000, "sid-12")
-        ok("a session whose own handoff has RETIRED hands off in its turn — no overlap is a one-shot",
-           len(events) == n + 1 and len(started) == 1 and r["handed_off"] and "SUCCESSOR" in r["say"])
-        os.environ["CC_HANDOFF"] = "../../etc/passwd"
-        n, ns = len(events), len(started)
-        at(430000, "sid-13")
-        ok("a $CC_HANDOFF we cannot account for still holds — failure falls towards not policing your own",
-           len(events) == n and len(started) == ns)
-        os.environ.pop("CC_HANDOFF", None)
-
-        # ---- a retry line. An overlap can DIE — the one at 01:35Z on 2026-09-05 sat on a permission prompt
-        # and was abandoned — and `handed_off` then read as "already taken" for the rest of that session's
-        # life: no event, at any percentage, ever again. Every five percent above the handoff line is now one
-        # more crossing, and the ceiling is the last of them.
-        ok("the retry lines sit between the handoff line and the ceiling",
-           retry_lines(BIG_WINDOW) == [450000, 500000, 550000])
-        ok("...on a small window they follow the floors, not the raw percentages",
-           retry_lines(DEFAULT_WINDOW) == [100000.0, 110000.0])
-        os.environ["CC_CONTEXT_RETRY_PCT"] = "0"
-        ok("...and the step turns them off", retry_lines(BIG_WINDOW) == [])
-        os.environ.pop("CC_CONTEXT_RETRY_PCT")
-        started.clear()
-        r = at(420000, "sid-r")                        # 42%: the handoff line, unchanged
-        ok("the first crossing is the 40% one, exactly as before",
-           r["handed_off"] and len(started) == 1 and events[-1][5] is False)
-        n = len(events)
-        r = at(430000, "sid-r")
-        ok("a turn between two lines crosses nothing new", len(events) == n + 1
-           and events[-1][5] is False and len(started) == 1)
-        started.clear()                                # --abandon: the record is gone, the predecessor carries on
-        n = len(events)
-        at(435000, "sid-r")
-        ok("with the overlap gone and no line crossed, nothing goes out at all", len(events) == n)
-        r = at(455000, "sid-r")
-        ok("the 45% line retries: a new overlap, and the session hears about that one too",
-           events[-1][5] is True and len(started) == 1 and "SUCCESSOR" in r["say"])
-        r2 = at(465000, "sid-r")
-        ok("a crossing while an overlap is open starts nothing", len(started) == 1 and not r2.get("say")
-           and events[-1][5] is False)
-        started.clear()
-        r = at(505000, "sid-r")
-        ok("...and 50 does the same again if that attempt dies too",
-           events[-1][5] is True and len(started) == 1 and r["handed_off"])
-        started.clear()
-        r = at(555000, "sid-r")
-        ok("...and 55", events[-1][5] is True and len(started) == 1)
-        started.clear()
-        n, ns = len(events), len(started)
-        at(560000, "sid-r")
-        ok("there is no line between 55% and the ceiling", len(events) == n and len(started) == ns)
-        r = at(605000, "sid-r")
-        ok("the ceiling is the LAST of the lines: a dead overlap does not take its teeth with it",
-           events[-1][1] == "ceiling" and events[-1][5] is True and len(started) == 1)
-        ok("each attempt is its own line on the ledger",
-           len([h for h in handoffs() if h.get("kind") == "handoff-retry"]) == 3
-           and len([h for h in handoffs() if h.get("kind") == "ceiling-retry"]) == 1)
-        started.clear()
-        n = len(events)
-        at(650000, "sid-r")
-        ok("...and it is still crossed only once", len(events) == n)
-        # …and the lines are remembered in TOKENS, not as a count of them: a session measured at 150k while its
-        # window is still ASSUMED 200k is past all three of that window's lines, and reading that back as three
-        # of the 1M window's lines after the correction would put the ceiling back to being the only one left.
-        started.clear()
-        os.environ["CC_CTX_WINDOW"] = str(DEFAULT_WINDOW)
-        r = at(150000, "sid-w")
-        ok("150k against an assumed 200k window is past every line that window has",
-           r["window"] == DEFAULT_WINDOW and r["handed_off"] and len(started) == 1)
-        started.clear()                                # the overlap dies again, and the window is corrected
-        os.environ["CC_CTX_WINDOW"] = str(BIG_WINDOW)
-        r = at(455000, "sid-w")
-        ok("a window CORRECTION re-keys the lines: 45% of the REAL window still retries",
-           r["window"] == BIG_WINDOW and events[-1][5] is True and len(started) == 1)
-        os.environ.pop("CC_CTX_WINDOW")
-
-        # ---- a cc-loop ITERATION is headless even though its window is live: the LOOP holds the track's tmux
-        # window while the session inside it is `claude -p`. Reading that window as live is what opened an
-        # overlap on spend-tracker and left an INTERACTIVE successor sitting in the track window long after the
-        # loop had finished, with the Home tally showing the track RUNNING over a stale board (2026-09-01).
-        started.clear()
-        os.environ["CC_ROLE"] = "worker"
-        jrn = os.path.join(STATE, "repo1", "track1", "progress.md")
-        n, ne = len(started), len(events)
-        r = at(420000, "sid-14")
-        ok("a worker takes no phase, live window or not — no successor, and not even a fork to be told no",
-           len(started) == n and len(events) == ne and not r["handed_off"])
-        ok("it is told to journal and END ITS TURN: the loop's next iteration is the handoff",
-           "END YOUR TURN" in r["say"] and "IS the handoff" in r["say"] and "SUCCESSOR" not in r["say"])
-        ok("...and the journal is MARKED, by this file, in a line cc-loop greps — not in prose a model chose",
-           open(jrn).read().startswith(MARK) and open(jrn).read().count("\n") == 1)
-        r = at(320000, "sid-15")
-        ok("the 30% nudge is not an ending: it says carry on, and nothing is marked",
-           "carry on" in r["say"] and open(jrn).read().count("\n") == 1)
-        r = at(420000, "sid-15b")
-        ls = open(jrn).read().splitlines()
-        ok("a second stop at the same percentage and level writes a DIFFERENT line: cc-loop's journal diff drops "
-           "a byte-identical one, and the iteration would be read as a refusal again",
-           len(ls) == 2 and ls[0] != ls[1] and all(x.startswith(MARK) for x in ls))
-        os.environ.pop("CC_ROLE", None)
-        r = at(420000, "sid-16")
-        ok("a planning session in the same window still gets its successor",
-           len(started) == n + 1 and r["handed_off"] and "SUCCESSOR" in r["say"])
-        live[0] = False
-        r = at(420000, "sid-17")
-        ok("a NON-worker that cannot be restarted still hears PENDING, not END YOUR TURN (review of #164): a "
-           "planning or windowless session with work in flight has no loop coming to continue it",
-           "PENDING" in (r.get("say") or "") and "END YOUR TURN" not in (r.get("say") or ""))
-        live[0] = True
-        # ---- 2026-09-09 04:26Z: a session in a window named for something else (`box`, cwd ~/dev/<repo>) crossed
-        # its line, the crossing was addressed to `<repo>` by the fallback, and the overlap retired the session
-        # that actually sat in the `<repo>` window. The record still says what it said; the event does not go.
-        sn0 = session_name
-        try:
-            session_name = lambda repo, track: "box"
-            n, ne = len(started), len(events)
-            r = at(420000, "sid-18")
-            ok("a crossing in a window that is not the target's own opens nothing: no event, no successor, and "
-               "the session is told rather than handed off",
-               len(started) == n and len(events) == ne and not r["handed_off"] and r["target"] == "repo1/track1"
-               and r["name"] == "box" and bool(r.get("say")))
-            session_name = lambda repo, track: "repo1/track1~next"
-            r = at(420000, "sid-19")
-            ok("…while a side of a handoff in flight is still its target's window, suffix and all, and its "
-               "crossing still goes out", len(events) == ne + 1 and events[-1][0] == "repo1/track1")
-        finally:
-            session_name = sn0
-
-        on[0] = False
-        os.remove(os.path.join(wt, "dirty.txt"))
-        have_window, event, overlap_open = hw0, ev0, oo0
-        for k in ("CC_CONTEXT_WARN_MAX", "CC_CONTEXT_HANDOFF_MAX", "CC_CONTEXT_CEILING_MAX"):
-            os.environ.pop(k, None)
-
-        # ---- the status line's own number: preferred when fresh, ignored when stale, absent or incomplete ----
-        global STATUSLINE_DIR
+        global STATUSLINE_DIR, DEV, WORKTREES
         sl_keep, STATUSLINE_DIR = STATUSLINE_DIR, os.path.join(d, "statusline")
-        os.makedirs(STATUSLINE_DIR, exist_ok=True)
+        dev_keep, DEV = DEV, os.path.join(d, "dev")
+        wt_keep, WORKTREES = WORKTREES, os.path.join(d, "worktrees")   # hermetic: --all's transcript fallback must not read the box's own live tracks
+        os.makedirs(STATUSLINE_DIR)
+        # ---- the status line's own number: preferred when fresh, ignored when stale, absent or incomplete ----
         tpath = tx([asst("claude-sonnet-5", 10, 100, 200)])          # a transcript reading nowhere near 40%
-        base = measure(tpath, "sid-sl")
-        ok("sanity: the transcript alone reads nowhere near the statusline fixture below", base["pct"] < 5)
+        ok("sanity: the transcript alone reads nowhere near the statusline fixture below",
+           measure(tpath, "sid-sl")["pct"] < 5)
         sl_file = os.path.join(STATUSLINE_DIR, "sid-sl.json")
         with open(sl_file, "w") as fh:
             json.dump({"used": 400000, "window": 1000000, "pct": 40.0, "model": "claude-opus-5", "raw": {}}, fh)
-        m = statusline_measure("sid-sl") or measure(tpath, "sid-sl")
+        m = statusline_measure("sid-sl")
         ok("a fresh statusline file is preferred over the transcript estimate",
-           m["used"] == 400000 and m["window"] == 1000000 and m["pct"] == 40.0)
-        ok("...and the source says so, same rule as the pane's own number for --true",
-           m["window_src"] == "statusline")
-
-        # the two calls above build statusline_measure(sid) or measure(...) themselves — that expression is
-        # this test's, not the tool's. record() is the Stop hook's real call site: prove IT prefers the file.
-        r = record({"session_id": "sid-sl", "transcript_path": tpath, "cwd": d})
-        ok("record() — the real call site, not this test's own expression — takes the statusline path",
-           r and r["window_src"] == "statusline" and r["used"] == 400000)
-
+           m and m["used"] == 400000 and m["window"] == 1000000 and m["pct"] == 40.0
+           and m["window_src"] == "statusline")
+        rc, out, _ = run(["--transcript", tpath, "--session", "sid-sl"])
+        ok("...and main() takes it, line and all: 400k is past the line",
+           rc == 0 and out.startswith("40%  400k/1M") and "window from statusline" in out and "hand off" in out)
         old = time.time() - STATUSLINE_MAX_AGE - 5
         os.utime(sl_file, (old, old))
-        m = statusline_measure("sid-sl") or measure(tpath, "sid-sl")
-        ok("a stale statusline file is ignored — the transcript estimate takes over, exactly as before",
-           m["window_src"] != "statusline" and m["pct"] < 5)
-
-        m = statusline_measure("sid-none") or measure(tpath, "sid-none")
-        ok("no statusline file at all also falls back to the transcript estimate", m["window_src"] != "statusline")
-
+        ok("a stale statusline file is ignored — the transcript estimate takes over",
+           statusline_measure("sid-sl") is None and run(["--transcript", tpath, "--session", "sid-sl"])[1].startswith("0%"))
+        ok("no statusline file at all also falls back to the transcript estimate", statusline_measure("sid-none") is None)
         with open(os.path.join(STATUSLINE_DIR, "sid-partial.json"), "w") as fh:
             json.dump({"used": None, "window": None, "pct": None, "model": "claude-opus-5", "raw": {}}, fh)
         ok("a file that is there but has nothing usable yet (a session barely started) is not preferred either",
            statusline_measure("sid-partial") is None)
-        STATUSLINE_DIR = sl_keep
 
-        RECORDS, HANDOFF, STATE = keep, keeph, keeps
+        # ---- --all and `cc-context <repo>`: the sessions with a status-line file, named by their cwd ----
+        wt = os.path.join(d, "wt"); os.makedirs(os.path.join(wt, ".cc"))
+        with open(os.path.join(wt, ".cc/track"), "w") as fh:
+            fh.write("repo1\ntrack1\n")
+        os.makedirs(os.path.join(DEV, "repo2"))
+        def sl(sid, used, cwd, age=0):
+            pth = os.path.join(STATUSLINE_DIR, sid + ".json")
+            with open(pth, "w") as fh:
+                json.dump({"session_id": sid, "used": used, "window": 1000000, "pct": used / 10000,
+                           "model": "claude-opus-5", "raw": {"cwd": cwd}}, fh)
+            if age:
+                os.utime(pth, (time.time() - age, time.time() - age))
+        sl("sid-t", 160000, wt)                                    # a track, past the line
+        sl("sid-r", 20000, os.path.join(DEV, "repo2"), age=30)     # a session a person steers, well under it
+        sl("sid-r-old", 30000, os.path.join(DEV, "repo2"), age=60)   # older in the same checkout
+        sl("sid-gone", 50000, wt, age=LISTED_MAX_AGE + 60)         # a day old: not a session any more
+        sl("sid-x", 70000, os.path.join(d, "elsewhere"), age=90)   # a cwd that names nothing
+        os.makedirs(os.path.join(wt, "core"))
+        sl("sid-sub", 40000, os.path.join(wt, "core"), age=100)    # a session standing INSIDE its worktree, not at its root
+        rows = run(["--all"])[1].rstrip("\n").split("\n")
+        cols = [r.split("\t") for r in rows]
+        # six rows: the five above and sid-sl from the block before — stale for the 120 s rule, under a day
+        ok("--all keeps its nine columns, one row per live file, newest first",
+           len(cols) == 6 and all(len(c) == 9 for c in cols) and cols[0][0] == "repo1" and cols[5][3] == "400000")
+        ok("a track is named repo/track off its .cc/track marker, and past the line its level says handoff",
+           cols[0][:3] == ["repo1", "track1", "16"] and cols[0][5] == "statusline" and cols[0][7] == "handoff")
+        ok("a checkout under ~/dev is named by its repo alone, track -, level -",
+           [c[:2] for c in cols[1:3]] == [["repo2", "-"], ["repo2", "-"]] and cols[1][7] == "-")
+        ok("a cwd that names nothing is still a row, with - for both", cols[3][:2] == ["-", "-"])
+        ok("a cwd BELOW the worktree names its track too: the marker is found by walking up",
+           cols[4][:3] == ["repo1", "track1", "4"] and cols[4][5] == "statusline")
+        ok("a file over a day old is not listed", not any("sid-gone" in r or c[3] == "50000" for r, c in zip(rows, cols)))
+        jrows = json.loads(run(["--all", "--json"])[1])
+        ok("--all --json is the same rows as the TSV, each carrying a ts the TSV has no room for",
+           len(jrows) == 6 and all(r.get("ts", "").endswith("Z") for r in jrows)
+           and jrows[0]["repo"] == "repo1" and jrows[0]["level"] == "handoff" and jrows[1]["level"] is None)
+        ok("`cc-context <repo>` is the NEWEST session in that checkout, not the older one beside it",
+           newest_in(os.path.join(DEV, "repo2")) == "sid-r"
+           and run(["repo2"])[1].startswith("2%  20k/1M"))
+        ok("...and a checkout nothing has written under is 'no transcript', exit 2",
+           run(["repo3"])[0] == 2)
+        STATUSLINE_DIR, DEV, WORKTREES = sl_keep, dev_keep, wt_keep
 
     if env0 is not None:
         os.environ["CC_CTX_WINDOW"] = env0
     if sid0 is not None:
         os.environ["CLAUDE_CODE_SESSION_ID"] = sid0
-    if pane0 is not None:
-        os.environ["TMUX_PANE"] = pane0
     if cfg0 is None:
         os.environ.pop("CC_CONFIG", None)
     else:
         os.environ["CC_CONFIG"] = cfg0
     shutil.rmtree(cfgd, ignore_errors=True)
-    if hnd0 is not None:
-        os.environ["CC_HANDOFF"] = hnd0        # put the caller's own handoff back: it gates them, and it is not ours
-    if role0 is not None:
-        os.environ["CC_ROLE"] = role0
+    if hl0 is not None:
+        os.environ["CC_CONTEXT_HANDOFF_TOKENS"] = hl0
     if box0 is None:
         os.environ.pop("CC_CTX_BOX_MODEL", None)
     else:
         os.environ["CC_CTX_BOX_MODEL"] = box0
-    # ---- --true: the pane's own number, and what happens when the pane will not give it ----------
-    import contextlib, io
-    PANE = """> /context
-  ⎿  claude-opus-5 · 137k/1M tokens (14%)
-     System prompt: 3.1k tokens
-"""
-    real_ask = pane_ask
-    try:
-        globals()["pane_ask"] = lambda target, cmd="/context": PANE
-        tm = pane_measure("demo/t1")
-        ok("--true reads the session's OWN number off an idle pane, window and all",
-           bool(tm) and tm["used"] == 137000 and tm["window"] == 1_000_000
-           and tm["pct"] == 14.0 and tm["window_src"] == "pane")
-        globals()["pane_ask"] = lambda target, cmd="/context": "37k/200k tokens (18%)\n" + PANE
-        tm = pane_measure("demo/t1")
-        ok("…the LAST /context on the pane wins: an older one is still scrolled above the one just typed",
-           bool(tm) and tm["pct"] == 14.0 and tm["window"] == 1_000_000)
-        globals()["pane_ask"] = lambda target, cmd="/context": None
-        ok("a pane that is busy, holding a dialog or gone gives no number at all — cc-msg --ask refused it, "
-           "and a number invented here would be exactly the estimate this flag exists to replace",
-           pane_measure("demo/t1") is None)
-
-        # the fallback and the preference, through the CLI, against one transcript fixture
-        px = tx([asst("claude-opus-5", 100, 0, 359_900)])
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            rc = main(["--true", "--transcript", px, "demo/t1"])
-        ok("--true against a pane that refused falls back to the transcript estimate, and says the window came "
-           "from the transcript's evidence rather than from the pane",
-           rc == 0 and "window from" in out.getvalue() and "from pane" not in out.getvalue()
-           and "36%" in out.getvalue())
-        globals()["pane_ask"] = lambda target, cmd="/context": PANE
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            rc = main(["--true", "--transcript", px, "demo/t1"])
-        ok("…and when the pane DOES answer, its number is the one reported — 14%, not the transcript's 36%",
-           rc == 0 and "14%" in out.getvalue() and "window from pane" in out.getvalue())
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            over_true = main(["--true", "--over", "30", "-q", "--transcript", px, "demo/t1"])
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            over_est = main(["--over", "30", "-q", "--transcript", px])
-        ok("…and THE THRESHOLDS ARE DECIDED ON IT: the same transcript is over the 30% line on the estimate and "
-           "under it on the pane's own reading, so --over answers differently — which is the whole point of "
-           "asking the session instead of guessing at it",
-           over_true == 1 and over_est == 0)
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            rc = main(["--true"])
-        ok("--true with no target is an error: it types at a keyboard, and the one keyboard it must never type "
-           "at is its own caller's", rc == 2 and "needs a target" in err.getvalue())
-        # …and a bare run from INSIDE a session is about that session, not about whichever of two sessions in
-        # its cwd wrote last: the successor's first `cc-context` during an overlap reported the predecessor's
-        # number as its own (2026-09-09). The harness exports the id; with it unset the cwd's newest still answers.
-        pj0, PROJECTS = PROJECTS, os.path.join(d, "projects")
-        try:
-            cw = os.path.join(d, "two-sessions")
-            os.makedirs(cw, exist_ok=True)
-            pd = os.path.join(PROJECTS, re.sub(r"[/.]", "-", os.path.realpath(cw)))
-            os.makedirs(pd, exist_ok=True)
-            for nm, mt in (("sid-mine", 1000), ("sid-theirs", 2000)):     # theirs is the NEWER transcript
-                fp = os.path.join(pd, nm + ".jsonl")
-                open(fp, "w").write("{}\n")
-                os.utime(fp, (mt, mt))
-            os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-mine"
-            mine = resolve(cwd=cw)
-            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
-            theirs = resolve(cwd=cw)
-            ok("a bare run inside a session measures THAT session's transcript, though another in the same cwd "
-               "wrote later", mine[1] == "sid-mine" and mine[0].endswith("sid-mine.jsonl"))
-            ok("…and with no session id in the environment the cwd's newest transcript still answers",
-               theirs[1] == "sid-theirs")
-        finally:
-            PROJECTS = pj0
-        # …and the FALLBACK belongs to the target too. No --transcript here: this is the documented bare form,
-        # and resolve() with nothing to go on returns the newest transcript for whatever cwd this process is in.
-        globals()["pane_ask"] = lambda target, cmd="/context": None
-        real_res, seen = resolve, []
-        try:
-            globals()["resolve"] = lambda repo=None, track=None, sid=None, cwd=None: \
-                (seen.append((repo, track, sid)) or (None, None))
-            err = io.StringIO()
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-                rc = main(["--true", "demo/t1"])
-            ok("a bare `--true <repo>/<track>` whose pane refuses estimates from THAT TRACK'S transcript — the "
-               "one word is split back into the pair, never left as None for resolve() to answer with the "
-               "CALLER'S cwd, which is a different session's percentage, level and --over answer",
-               seen == [("demo", "t1", None)] and rc == 2 and "no transcript for demo/t1" in err.getvalue())
-            del seen[:]
-            err = io.StringIO()
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-                rc = main(["--true", "box"])
-            ok("…and a target with nothing of its own to fall back to is REFUSED rather than estimated: `box` "
-               "names no board row and has recorded nothing, so the caller's own cwd is not its answer",
-               seen == [] and rc == 2 and "nothing has recorded under `box`" in err.getvalue())
-        finally:
-            globals()["resolve"] = real_res
-        os.remove(px)
-    finally:
-        globals()["pane_ask"] = real_ask
 
     print(f"cc-context selfcheck: {p} passed, {f} failed")
     return 1 if f else 0

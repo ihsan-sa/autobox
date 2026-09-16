@@ -44,7 +44,7 @@ else echo "check.sh: · $PART_WHY"; fi
 if part_here compile-and-manifests; then
 # mail/*.py by name: the loop above finds bin/cc-mail, which is a symlink to mail/receiver.py, so the receiver
 # is compiled — but mail/selfcheck.py is reached by nothing under bin/ and would go uncompiled.
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" mail/*.py tests/slack_selfcheck.py tests/member_v2.py tests/member_broker.py tests/member_import.py "$@"
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "${py[@]}" mail/*.py tests/slack_selfcheck.py tests/handoff_selfcheck.py tests/member_v2.py tests/member_broker.py tests/member_import.py "$@"
 for f in slack/*.json config/claude-settings.json config/units.json config/claude-managed.json; do jq -e . "$f" >/dev/null; done
 # the agent types (templates/home/agents/ -> ~/.claude/agents/). Nothing else reads these files: a frontmatter the
 # harness rejects takes out every spawn of that type at dispatch time, with no earlier signal. install.sh's own case
