@@ -124,5 +124,6 @@ How the conversation itself works — channels, threads, marks, who may do what,
     cc-graphs serve | stop | status      tokens + vitals in a browser, on 127.0.0.1:5190 (loopback)
     cc-spend  |  --by repo|track|model   token spend, biggest first    cc-spend phantoms    spend nobody watches
     cc-spend cache [--days N]            cache-read tokens per session per day, biggest first
+    cc-wakes [--from D --to D]           cache reads per wake-up: kind × cause, and what they re-read (handoff, re-read, base)
     cc-lib ask --object '#71' --need current "…"   read the record before you claim: a PR's landing tally, a row and its
                                          journal, a rule — capped, cited, with COVERAGE and a ticket; `cc-lib --help`

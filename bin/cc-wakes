@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""cc-wakes — what each wake-up of each session carried: cache-read tokens, dollars at list, and why it woke.
+
+WHY. Cache reads are most of the bill, and a context pays for what it holds again on every later request: a
+handoff that re-reads a whole journal, or a file read twice. cc-spend's ledger folds a session to a row a day;
+this walks the same transcripts request by request, so a change to what a wake-up carries is scored on one
+window before and after, the way cc-replay scores a landing patch.
+
+A WAKE-UP is a prompt that made at least one request (deduped on requestId), up to the next prompt. Its cost is
+those requests' cache reads, and dollars at list off cc-spend's own rates table, imported and never copied.
+Its CAUSE, off the prompt text:
+  handoff  a successor's kick ("you are the SUCCESSOR"), or a worker's `# TASK` past "Iteration 1 of"
+  start    any other first prompt of a context: a spawn, a review round, a first iteration, a fresh seat
+  pulse    a machine's line: pulse, task notification, card, hook, cron fire, local relay, another session
+  person   a <channel> line from a real channel with role owner or member, or later terminal text with no marker
+Its KIND: subagent/builder|reviewer|other (under <session>/subagents/, by .meta.json), review or landing (a
+landing's scratch checkout), worker (a worktree), planning or orch (a dev checkout; orch when a kick or pulse
+names <repo>@<alias>), member, steward, other.
+
+WHAT A CACHE READ RE-READS: what the context held at the request before. Each piece is filed under a class, its
+tokens estimated as bytes / BYTES_PER_TOKEN, and a read is split in this order:
+  base     system prompt, tools, memory: the first request's input less the first prompt. MEASURED, so a
+           successor's system-prompt brief is here, not in handoff
+  handoff  a handoff prompt, and every journal read by anyone: `cc-handoff --brief`, cc-lib, *-handoff.md, progress.md
+  reread   a Read, or a cat/head/tail/sed -n/nl, of files all already read in this context, any slice of them
+  pulse, person   those wake-ups' prompt text, and the same kinds of message queued mid-turn
+  work     own output and every other tool result, filled LAST: an estimate that runs long comes out of work
+  unattr   what is left: harness reminders, dropped thinking, images, estimate error. Printed, never hidden.
+A compact boundary resets the context to base.
+
+THE TRACE is rebuilt whole each run into ~/.cc/state/<repo>/replay/wakes-<from>..<to>.tsv, one sorted row per
+wake-up, on box-local days as in every cc-spend view: the same records and window give the same bytes. A closing
+line puts the total beside cc-spend's ledger for the same days.
+
+  cc-wakes [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--repo R]   rebuild the trace, print its tables
+                                          default: the last 7 box days. Every session on the box is read;
+                                          R only names the trace's directory, default the cwd's repo
+  cc-wakes selfcheck                     synthetic transcripts in a HOME of its own, never this box's
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+_s = importlib.util.spec_from_loader("ccspend", importlib.machinery.SourceFileLoader("ccspend", f"{BIN}/cc-spend"))
+S = importlib.util.module_from_spec(_s)
+_s.loader.exec_module(S)
+
+# Fitted 2026-09-15 on this box: median bytes per token of 82 lone tool results of 4 kB or more, against how much
+# the next request's input grew less the output between (p25 2.15, p75 2.45).
+BYTES_PER_TOKEN = 2.3
+CLASSES = ("base", "handoff", "reread", "pulse", "person", "work")
+COLS = (["ts", "session", "kind", "cause", "requests", "cache_read", "usd", "rd_usd"]
+        + ["rd_" + c for c in CLASSES] + ["rd_unattr", "handoff_bytes", "rereads", "ctx_base"])
+MACHINE = re.compile(r"\s*(\[cc-|\[Cross-session|pulse:|<task-notification>|Stop hook|Another Claude session"
+                     r"|usage limit|<scheduled)")
+ORCH = re.compile(r"(?:SUCCESSOR|engineer) for [\w.-]+@[\w-]+")
+JOURNAL = re.compile(r"cc-handoff\s+--brief|cc-lib\s+(?:ask|view|get)\b|[\w.-]-handoff\.md|progress\.md")
+READ_SEG = re.compile(r"\s*(?:cat|head|tail|nl|sed\s+-n)\s(?=.*\s[~\w.-]*[/.]\w)")
+
+
+def text_of(content):
+    """(prompt text, tool results) of one user message's content."""
+    if isinstance(content, str):
+        return content, []
+    blocks = [b for b in content or [] if isinstance(b, dict)]
+    res = [b for b in blocks if b.get("type") == "tool_result"]
+    return ("" if res else "".join(b.get("text", "") for b in blocks if b.get("type") == "text")), res
+
+
+def kind_of(path, cwd, texts):
+    if os.path.basename(os.path.dirname(path)) == "subagents":
+        try:
+            with open(path[:-len(".jsonl")] + ".meta.json") as f:
+                at = json.load(f).get("agentType") or ""
+        except (OSError, ValueError):
+            at = ""
+        return "subagent/" + ("builder" if at == "builder" else "reviewer" if at.endswith("reviewer") else "other")
+    if cwd.startswith(S.WTS + "/"):
+        return "worker"
+    track = S.place(cwd)[1]
+    if track == "session":
+        return "orch" if any(ORCH.search(t[:400]) for t in texts) else "planning"
+    if track in ("member", "steward", "review"):
+        return track
+    return "other" if track == "-" else "landing"
+
+
+def cause_of(txt, first, fired):
+    head = txt.lstrip()[:400]
+    if "you are the SUCCESSOR" in head:
+        return "handoff"
+    if head.startswith("# TASK"):
+        m = re.search(r"\bIteration (\d+) of \d+", txt)
+        return "handoff" if m and int(m.group(1)) > 1 else "start"
+    ch = re.match(r"<channel [^>]*>", head)
+    if ch:
+        real = 'chat_id="local"' not in ch.group(0) and re.search(r'role="(?:owner|member)"', ch.group(0))
+        return "person" if real else "pulse"
+    if fired or MACHINE.match(head):
+        return "pulse"
+    return "start" if first else "person"
+
+
+def class_of_use(block, cwd, keys, wake):
+    """The class a tool call's RESULT is carried under, noting a re-read on the wake-up that made it."""
+    inp, name = block.get("input") or {}, block.get("name")
+    if name == "Read":
+        s = inp.get("file_path") or ""
+        paths = [s]
+    elif name == "Bash":
+        s = inp.get("command") or ""
+        paths = [os.path.normpath(os.path.join(cwd, os.path.expanduser(t.strip("'\""))))
+                 for seg in re.split(r"&&|\|\||[;\n|]", s) if READ_SEG.match(seg) for t in seg.split()[1:]
+                 if t[0] != "-" and re.search(r"[/.]\w", t) and not re.search(r"[<>$`(]", t)]
+    else:
+        return "work"
+    if JOURNAL.search(s):
+        return "handoff"
+    if paths and all(p in keys for p in paths):
+        wake["rereads"] += 1
+        return "reread"
+    keys.update(paths)
+    return "work"
+
+
+def walk(path, seen):
+    """Every wake-up of one transcript, in order, with its cost and what its cache reads re-read."""
+    recs = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                recs.append(json.loads(line))
+            except ValueError:
+                pass
+    sub = os.path.basename(os.path.dirname(path)) == "subagents"
+    cwd = next((r["cwd"] for r in recs if r.get("cwd")), "")
+    texts = [t for t in (text_of((r.get("message") or {}).get("content"))[0]
+                         for r in recs[:400] if r.get("type") == "user") if t][:3]
+    kind, stem = kind_of(path, cwd, texts), os.path.basename(path)[:-len(".jsonl")][:14]
+    ctx, pend, keys, uses, wakes = dict.fromkeys(CLASSES, 0.0), dict.fromkeys(CLASSES, 0.0), set(), {}, []
+    wake, base, fired = None, None, False
+
+    def new_wake(cause):
+        w = dict.fromkeys(COLS, 0)
+        w.update(ts=None, session=stem, kind=kind, cause=cause, usd=0.0, rd_usd=0.0)
+        wakes.append(w)
+        return w
+
+    def add(cls, n):
+        pend[cls] += n / BYTES_PER_TOKEN
+        if cls == "handoff" and wake:
+            wake["handoff_bytes"] += n
+
+    for r in recs:
+        t = r.get("type")
+        if t == "system":
+            if r.get("subtype") == "compact_boundary":
+                ctx, pend, keys = dict.fromkeys(CLASSES, 0.0), dict.fromkeys(CLASSES, 0.0), set()
+                ctx["base"] = base or 0.0
+            fired = fired or r.get("subtype") == "scheduled_task_fire"
+            continue
+        if r.get("isSidechain") and not sub:
+            continue                       # a subagent's own file carries it
+        msg = r.get("message") or {}
+        if t == "user":
+            txt, results = text_of(msg.get("content"))
+            if txt.strip() and not r.get("isMeta"):
+                wake = new_wake(cause_of(txt, not wakes, fired))
+                fired = False
+                add({"handoff": "handoff", "pulse": "pulse", "person": "person"}.get(wake["cause"], "work"),
+                    len(txt.encode()))
+            for b in results:
+                c = b.get("content")
+                add(uses.pop(b.get("tool_use_id"), "work"), len(c.encode()) if isinstance(c, str) else
+                    sum(len((x.get("text") or "").encode()) for x in c or [] if isinstance(x, dict)))
+        elif t == "attachment":
+            a = r.get("attachment") or {}
+            if a.get("type") == "queued_command" and isinstance(a.get("prompt"), str):
+                c = cause_of(a["prompt"], False, False)
+                add(c if c in CLASSES else "work", len(a["prompt"].encode()))
+        elif t == "assistant":
+            wake = wake or new_wake("start")
+            for b in msg.get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    uses[b.get("id")] = class_of_use(b, r.get("cwd") or cwd, keys, wake)
+            rid, u = r.get("requestId") or msg.get("id"), msg.get("usage") or {}
+            key = (r.get("sessionId") or stem, rid)
+            if not rid or not u or key in seen:
+                continue
+            seen.add(key)
+            rd = int(u.get("cache_read_input_tokens") or 0)
+            if base is None:
+                total = rd + int(u.get("cache_creation_input_tokens") or 0) + int(u.get("input_tokens") or 0)
+                base = ctx["base"] = max(total - sum(pend.values()), 0.0)
+                wake["ctx_base"] = base
+            left = float(rd)
+            for c in CLASSES:
+                part = min(ctx[c], left)
+                wake["rd_" + c] += part
+                left -= part
+            wake["rd_unattr"] += left
+            for c in CLASSES:
+                ctx[c] += pend[c]
+            pend = dict.fromkeys(CLASSES, 0.0)
+            pend["work"] += int(u.get("output_tokens") or 0)
+            model, rate = msg.get("model") or "-", S.rate(msg.get("model"))
+            wake["ts"] = wake["ts"] or S.parse_ts(r.get("timestamp"))
+            wake["requests"] += 1
+            wake["cache_read"] += rd
+            wake["usd"] += S.usd(model, u, u.get("speed") == "fast") or 0.0
+            wake["rd_usd"] += rd * rate[2] / 1e6 if rate else 0.0
+    return [w for w in wakes if w["requests"] and w["ts"]]
+
+
+def build(window):
+    """The window's wake-ups, as sorted TSV lines, off every transcript that could hold one."""
+    t0 = datetime.strptime(min(window), "%Y-%m-%d").replace(tzinfo=S.tz()[1]).timestamp()
+    paths = []
+    for root, _dirs, files in os.walk(S.PROJ):
+        for f in files:
+            p = os.path.join(root, f)
+            if f.endswith(".jsonl") and os.path.getmtime(p) >= t0:
+                paths.append(p)
+    seen, lines = set(), []
+    for p in sorted(paths):
+        for w in walk(p, seen):
+            if S.local_day(w["ts"]) in window:
+                w["ts"] = S.iso(w["ts"])
+                lines.append("\t".join(f"{w[c]:.4f}" if c in ("usd", "rd_usd") else
+                                       str(round(w[c])) if isinstance(w[c], float) else str(w[c]) for c in COLS))
+    return sorted(lines)
+
+
+def report(rows, window, ledger_rd):
+    num = lambda r, c: float(r[c])
+    print(f"cc-wakes {window[0]}..{window[-1]} ({S.tz()[0]}) — {len(rows)} wake-up(s); tokens are cache reads, "
+          f"USD an estimate at list; pieces at {BYTES_PER_TOKEN} bytes/token")
+    groups = {}
+    for r in rows:
+        g = groups.setdefault((r["kind"], r["cause"]), [0, 0.0, 0.0])
+        g[0], g[1], g[2] = g[0] + 1, g[1] + num(r, "cache_read"), g[2] + num(r, "usd")
+    S.table([[k, c, n, S.hn(rd), f"{usd:.2f}", S.hn(rd / n)] for (k, c), (n, rd, usd) in sorted(groups.items())],
+            ["kind", "cause", "wake-ups", "cache rd", "est $", "rd/wake"])
+    total = sum(num(r, "cache_read") for r in rows) or 1.0
+    share = lambda r, c: num(r, "rd_usd") * num(r, c) / num(r, "cache_read") if num(r, "cache_read") else 0.0
+    print("\n  cache read by what it re-read")
+    S.table([[c[3:], S.hn(sum(num(r, c) for r in rows)), f"{100 * sum(num(r, c) for r in rows) / total:.1f}%",
+              f"{sum(share(r, c) for r in rows):.2f}"] for c in ["rd_" + x for x in CLASSES] + ["rd_unattr"]],
+            ["class", "cache rd", "share", "read $"])
+    print("\n  per handoff and per re-read (carried = cache reads of it over the rest of its context)")
+    out = []
+    for k in sorted({r["kind"] for r in rows}):
+        rs = [r for r in rows if r["kind"] == k]
+        h, rr = sum(r["cause"] == "handoff" for r in rs), sum(num(r, "rereads") for r in rs)
+        per = lambda n, c: S.hn(sum(num(r, c) for r in rs) / n) if n else "-"
+        usd = lambda n, c: f"{sum(share(r, c) for r in rs) / n:.2f}" if n else "-"
+        hb = [num(r, "ctx_base") for r in rs if r["cause"] == "handoff"]
+        out.append([k, h, per(h, "handoff_bytes"), per(h, "rd_handoff"), usd(h, "rd_handoff"),
+                    S.hn(sum(hb) / len(hb)) if hb else "-", int(rr), per(rr, "rd_reread"), usd(rr, "rd_reread")])
+    S.table(out, ["kind", "handoffs", "bytes/h", "rd/h", "$/h", "base/h", "re-reads", "rd/re-read", "$/re-read"])
+    diff = f" ({100 * (total - ledger_rd) / ledger_rd:+.1f}%)" if ledger_rd and rows else ""
+    print(f"\n  cache read {S.hn(total if rows else 0)} here, {S.hn(ledger_rd)} in cc-spend's ledger{diff}")
+
+
+def selfcheck():
+    """Each case writes its own session's transcript into a HOME of its own and reads back only that session's
+    rows, asserting what is kept and what is not."""
+    home, day = tempfile.mkdtemp(prefix="cc-wakes."), "2026-01-10"
+    proj, dev, wt = os.path.join(home, ".claude", "projects"), os.path.join(home, "dev", "r1"), \
+        os.path.join(home, ".cc", "worktrees", "r1", "t1")
+    n = [0]
+
+    def rec(t, cwd, d=day, **kw):
+        n[0] += 1
+        return dict(type=t, cwd=cwd, sessionId="sid", timestamp=f"{d}T10:{n[0] % 60:02d}:00Z", **kw)
+    def user(content, cwd=dev, **kw):
+        return rec("user", cwd, message={"role": "user", "content": content}, **kw)
+    def asst(rid, rd, cwd=dev, cw=0, out=0, uses=(), **kw):
+        blocks = [{"type": "tool_use", "id": i, "name": nm, "input": inp} for i, nm, inp in uses]
+        return rec("assistant", cwd, requestId=rid, message={"model": "claude-opus-5", "content": blocks, "usage": {
+            "input_tokens": 0, "output_tokens": out, "cache_read_input_tokens": rd, "cache_creation_input_tokens": cw}},
+            **kw)
+    result = lambda i, size: user([{"type": "tool_result", "tool_use_id": i, "content": "x" * size}])
+    def put(rel, recs):                   # one JSON line per record; a one-record list is a .meta.json too
+        p = os.path.join(proj, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in recs))
+
+    kick = "[cc-handoff] ab: you are the SUCCESSOR for r1 - go".ljust(229) + "."
+    relay = '<channel source="cc-slack" chat_id="{}" user="u" role="owner">hi</channel>'
+    brief = [("t1", "Bash", {"command": "cc-handoff --brief r1"})]
+    put("-p/s1.jsonl", [user(kick), asst("a1", 10000, cw=100, out=50, uses=brief), result("t1", 2300),
+                        asst("a2", 10150), asst("a2", 10150), user(relay.format("C1")), asst("a3", 12000), user(relay.format("local")), asst("a4", 12100)])
+    put("-p/s2.jsonl", [user(kick.replace("for r1", "for r1@al")), asst("b1", 500)])
+    put("-p/s2p.jsonl", [user(kick), asst("b2", 500)])
+    rd = [("Read", {"file_path": "/x/f"}), ("Read", {"file_path": "/x/f", "offset": 5}),
+          ("Bash", {"command": "sed -n 1,5p /x/g 2>/dev/null"}), ("Bash", {"command": "cd /x && tail -3 /x/g"}),
+          ("Read", {"file_path": "/x/h"}), ("Bash", {"command": "cat /x/f /x/k"})]
+    s3 = [user("look"), asst("c0", 1000)]
+    for i, (nm, inp) in enumerate(rd):
+        s3 += [asst(f"c{i + 1}", 5000, uses=[(f"u{i}", nm, inp)]), result(f"u{i}", 230)]
+    put("-p/s3.jsonl", s3 + [asst("c9", 5000)])
+    put("-w/w1.jsonl", [user("# TASK\ngo\n# THIS ITERATION\nIteration 1 of 3.", wt), asst("d1", 100, wt)])
+    put("-w/w2.jsonl", [user("# TASK\ngo\n# THIS ITERATION\nIteration 2 of 3.", wt), asst("e1", 100, wt)])
+    put("-p/s5.jsonl", [user("spawn it"), asst("f1", 100), asst("sub1", 7777, isSidechain=True)])
+    put("-p/s5/subagents/agent-1.jsonl", [user("build", isSidechain=True), asst("sub1", 7777, isSidechain=True)])
+    put("-p/s5/subagents/agent-1.meta.json", [{"agentType": "builder"}])
+    put("-p/s6.jsonl", [user("old"), asst("g1", 300, d="2026-01-09"), user("<command-name>/model</command-name>"),
+                        user("new"), asst("g2", 400)])
+    put("-p/s7.jsonl", [user("hello"), asst("h1", 10), user("<task-notification> done"), asst("h2", 10),
+                        rec("system", dev, subtype="scheduled_task_fire"), user("Re-mark the row"), asst("h3", 10),
+                        user("what now"), asst("h4", 10)])
+
+    def run():
+        env = dict(os.environ, HOME=home, TZ="UTC")
+        p = subprocess.run([sys.executable, os.path.realpath(__file__), "--from", day, "--to", day, "--repo", "r1"],
+                           env=env, capture_output=True, text=True)
+        trace = os.path.join(home, ".cc", "state", "r1", "replay", f"wakes-{day}..{day}.tsv")
+        with open(trace) as f:
+            return p.stdout + p.stderr, f.read()
+
+    (out1, tsv1), (out2, tsv2) = run(), run()
+    rows = [dict(zip(COLS, line.split("\t"))) for line in tsv1.splitlines()[1:]]
+    of = lambda s: [r for r in rows if r["session"] == s]
+    s1, s3 = of("s1"), of("s3")
+    cases = [
+        ("a successor's kick is a handoff wake-up, its brief is carried as handoff, a split response counts once",
+         [(r["kind"], r["cause"]) for r in s1][:1] == [("planning", "handoff")] and s1[0]["requests"] == "2"
+         and s1[0]["cache_read"] == "20150" and s1[0]["rd_handoff"] == "100" and s1[0]["handoff_bytes"] == "2530"
+         and s1[1]["rd_handoff"] == "1100" and abs(float(s1[0]["rd_usd"]) - 0.010075) < 1e-4),
+        ("a real channel's owner line is a person; the same line relayed locally is a pulse",
+         [r["cause"] for r in s1] == ["handoff", "person", "pulse"]),
+        ("a kick naming <repo>@<alias> makes an orch; one naming the repo alone a planning seat",
+         [r["kind"] for r in of("s2") + of("s2p")] == ["orch", "planning"]),
+        ("a file read again, any slice, is a re-read carried to the end; a new file, or one new among old, is not",
+         [r["rereads"] for r in s3] == ["2"] and s3[0]["rd_reread"] == "600"),
+        ("a worker's second iteration is a handoff, its first a start",
+         [(r["kind"], r["cause"]) for r in of("w2") + of("w1")] == [("worker", "handoff"), ("worker", "start")]),
+        ("a subagent's file is its own kind and counts its request; the parent's sidechain copy is not counted",
+         [(r["kind"], r["cache_read"]) for r in of("agent-1")] == [("subagent/builder", "7777")]
+         and [r["cache_read"] for r in of("s5")] == ["100"]),
+        ("a wake-up outside the window is left out, and a prompt that made no request is no wake-up",
+         [(r["cause"], r["cache_read"]) for r in of("s6")] == [("person", "400")]),
+        ("a task notification and a cron fire are pulses; later text with no marker is a person",
+         [r["cause"] for r in of("s7")] == ["start", "pulse", "pulse", "person"]),
+        ("the same records give the same bytes, table and trace", out1 == out2 and tsv1 == tsv2 and "handoff" in out1),
+    ]
+    bad = [name for name, ok in cases if not ok]
+    print("\n".join(("  ok   " if ok else "  FAIL ") + name for name, ok in cases) + ("\n" + out1 if bad else ""))
+    print(f"cc-wakes selfcheck: {len(cases) - len(bad)} passed, {len(bad)} failed")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if argv == ["selfcheck"]:
+        return selfcheck()
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    opts = dict(zip(argv[::2], argv[1::2]))
+    if len(argv) % 2 or set(opts) - {"--from", "--to", "--repo"}:
+        print("usage: cc-wakes [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--repo R] | selfcheck | --help", file=sys.stderr)
+        return 2
+    try:
+        to = datetime.strptime(opts.get("--to") or S.local_days(1)[0], "%Y-%m-%d").date()
+        frm = datetime.strptime(opts["--from"], "%Y-%m-%d").date() if "--from" in opts else to - timedelta(days=6)
+    except ValueError:
+        print("cc-wakes: dates are YYYY-MM-DD", file=sys.stderr)
+        return 2
+    repo = opts.get("--repo") or S.place(os.getcwd())[0]
+    if frm > to or repo in ("-", ""):
+        print("cc-wakes: --from after --to, or no repo here: name one with --repo", file=sys.stderr)
+        return 2
+    window = [(frm + timedelta(days=i)).isoformat() for i in range((to - frm).days + 1)]
+    lines = build(window)
+    out = os.path.join(S.STATE, repo, "replay", f"wakes-{window[0]}..{window[-1]}.tsv")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out + ".tmp", "w") as f:
+        f.write("#" + "\t".join(COLS) + "\n" + "".join(line + "\n" for line in lines))
+    os.replace(out + ".tmp", out)
+    rows = [dict(zip(COLS, line.split("\t"))) for line in lines]
+    report(rows, window, sum(r["cache_read"] for r in S.read_local_rows(window)))
+    print(f"  trace: {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        os._exit(0)
