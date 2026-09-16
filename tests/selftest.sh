@@ -3008,6 +3008,35 @@ h5=$( cd "$GD" && git add -A && git commit -qm five >/dev/null 2>&1 && git rev-p
   && ok "a run of ONE half records under its own name, beside the whole run's and never over it, and each says which half it was" \
   || bad "the half is not in the record's name: $(ls "$GR" | tr '\n' ' ')"
 
+# …AND ONLY A TREE THE RUN ACTUALLY TESTED. green.sh takes the tree as it is SOURCED — a suite's first act — and
+# green_record files nothing when the tree at the end is a different one. On 2026-09-15 a self-review edit moved
+# core/bin/cc-wakes seven minutes before a detached selftest.sh ended: the record was filed under the post-edit
+# tree nothing had run, cc-green read it back as green, and the next iteration re-ran the ~22-minute suite by hand.
+# The cases above call green_record in THIS process, where the start tree is this checkout's and the record's is a
+# fixture's, so they never meet the guard. This one is a stub suite in a repo of its own, sourcing green.sh at its
+# start and recording at its end exactly as check.sh does, run twice off ONE fixture: once with a file moving under
+# it, once still. Both, because a guard that never fires and a guard that always does look alike from the green side.
+GM="$T/greenmoved"; mkdir -p "$GM/repo/tests" "$GM/rec"
+( cd "$GM/repo" && git init -q && git config user.email t@t && git config user.name t \
+  && echo one > a.txt && git add -A && git commit -qm init ) >/dev/null 2>&1
+{ echo '#!/usr/bin/env bash'
+  echo 'set -e; SELF=$(readlink -f "$0"); cd "$(dirname "$SELF")/.."'     # what check.sh and check-extra.sh do…
+  echo ". \"$(dirname "$SELF")/green.sh\""                                # …and they source it before a single case
+  echo '[ -z "${MOVE:-}" ] || echo moved > a.txt'                         # the edit that lands while the suite runs
+  echo 'green_record "$SELF" ""'                                          # CC_SUITE_PART is unset by green.sh, so
+  echo 'echo STUB-OK'                                                     # this child records under the plain name
+} > "$GM/repo/tests/check.sh"; chmod +x "$GM/repo/tests/check.sh"
+gmov=$( cd "$GM/repo" && MOVE=1 CC_GREEN_DIR="$GM/rec" ./tests/check.sh 2>&1 ); gmrc=$?
+{ [ "$gmrc" != 0 ] && [ -z "$(ls -A "$GM/rec")" ] && grep -q 'a\.txt' <<<"$gmov" && ! grep -q STUB-OK <<<"$gmov"; } \
+  && ok "a tree that moved while the suite ran gets NO record: the suite names the file that moved and exits non-zero" \
+  || bad "a moved tree was recorded, or passed quietly: rc=$gmrc records=[$(ls -A "$GM/rec" | tr '\n' ' ')] out=[$(tr '\n' ' ' <<<"$gmov")]"
+( cd "$GM/repo" && git checkout -q -- a.txt )        # the same stub on the same fixture, with nothing moving
+gsti=$( cd "$GM/repo" && CC_GREEN_DIR="$GM/rec" ./tests/check.sh 2>&1 ); gsrc=$?
+gmt=$( cd "$GM/repo" && git add -A && git commit -qm still >/dev/null 2>&1 && git rev-parse "HEAD^{tree}" )
+{ [ "$gsrc" = 0 ] && grep -q "\"tree\": \"$gmt\"" "$GM/rec/check.sh-${gmt:0:12}.json" 2>/dev/null; } \
+  && ok "...and a still tree records what it always did, so what the guard refuses is the move and not the run" \
+  || bad "a still tree filed no record: rc=$gsrc out=[$(tr '\n' ' ' <<<"$gsti")] records=[$(ls -A "$GM/rec" | tr '\n' ' ')]"
+
 # THE REACH OF A CHANGE (tests/green.sh, land_scope): what the landing's CC_LAND_CHANGED turns into here. Its own
 # bin/ of four stubs: a leaf, a caller that runs it, a talker that only names it in a comment, and cc, which runs both.
 SB="$T/scopebin"; mkdir -p "$SB"

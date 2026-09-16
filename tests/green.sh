@@ -18,6 +18,16 @@
 # It is written by the SUITE, on green, and by nothing else. It is not a signature: anything running as this user
 # can write one by hand, and no file on this box can stop it. It is evidence of content, which is what the second
 # run was buying.
+#
+# …AND IT NAMES THE TREE THE RUN STARTED ON. The hash is taken twice: once as this file is sourced, which is a
+# suite's first act and so is the content it is about to test, and once by green_record when the suite has passed.
+# The two agree and there is a record; they differ and the checkout moved while the suite ran, so no record is
+# written, the files that moved are named, and green_record RETURNS NON-ZERO — which is how a run that cannot be
+# recorded also stops being reported as green. On 2026-09-15 a self-review edit moved core/bin/cc-wakes seven
+# minutes before a detached selftest.sh ended: the record was filed under the post-edit tree the suite never ran,
+# cc-green read it back as green, and the next iteration re-ran the ~22-minute suite by hand to earn a real one.
+# Rerunning is the whole remedy — nothing here tries to work out whether what moved is something the suite would
+# have cared about, because that judgement is exactly what the second run is for.
 green_tree(){     # $1 = a repo root → the git tree its working copy WOULD commit, or nothing if that cannot be taken
   local idx tree
   idx=$(mktemp "${TMPDIR:-/tmp}/cc-green.XXXXXX" 2>/dev/null) || return 0
@@ -33,8 +43,29 @@ green_tree(){     # $1 = a repo root → the git tree its working copy WOULD com
 # suite would have filed a different tree. Two algorithms is how a green comes to name content it did not pass on,
 # which is worse than no green at all. So there is one, here, and both callers go through it.
 
+# WHERE THE START TREE COMES FROM: the sourcing script's own path — SELF, which every suite here sets before it
+# sources this file, then $0, then this file's own path, taking the first that resolves inside a checkout. It is
+# held per PROCESS, so each of a landing's three gates carries its own start and a gate that begins after an edit
+# is judged from where IT began rather than from where the run did. A caller that files a record for some OTHER
+# repo — selftest.sh's own green_record cases, cc-green's stub gates in /tmp — never matches this root and is left
+# alone, because a tree taken in this checkout says nothing about a tree in a fixture. Sourcing this file now costs
+# one green_tree (~90 ms on this repo), including in tools like cc-green that file no record of their own.
+GREEN_START_ROOT=""; GREEN_START_TREE=""
+green_start(){   # sets the two above, or leaves them empty where the sourcing script is in no checkout at all (an
+                 # interactive shell): the guard in green_record then never fires and a record is filed as before
+  local c self root
+  for c in "${SELF:-}" "${0:-}" "${BASH_SOURCE[0]:-}"; do
+    [ -n "$c" ] || continue
+    self=$(readlink -f "$c" 2>/dev/null) || continue
+    root=$(cd "$(dirname "$self")" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || continue
+    [ -n "$root" ] || continue
+    GREEN_START_ROOT=$root; GREEN_START_TREE=$(green_tree "$root"); return 0
+  done
+  return 0; }
+green_start   # …here, as the file is sourced, and nowhere else: any later is a tree something has had time to move
+
 green_record(){   # $1 = the suite that just passed, as it was invoked ("$0"); $2 = the scope it ran at ("" = everything)
-  local self root rel dir tree scope part
+  local self root rel dir tree scope part moved
   self=$(readlink -f "$1" 2>/dev/null) || return 0
   root=$(cd "$(dirname "$self")" && git rev-parse --show-toplevel 2>/dev/null) || return 0
   [ -n "$root" ] || return 0
@@ -42,6 +73,18 @@ green_record(){   # $1 = the suite that just passed, as it was invoked ("$0"); $
   dir="${CC_GREEN_DIR:-$HOME/.cc/state/land/green}"
   tree=$(green_tree "$root")
   [ -n "$tree" ] && [ -n "$rel" ] || return 0
+  # THE TREE THE RUN STARTED ON, or no record at all (green_start above, and the note at the top of this file).
+  # Same repo and a different tree means this checkout moved while the suite ran: whatever passed, passed on
+  # content that is not here any more, so there is nothing to file and this is the run's own failure to report.
+  if [ -n "$GREEN_START_ROOT" ] && [ "$root" = "$GREEN_START_ROOT" ] &&
+     [ -n "$GREEN_START_TREE" ] && [ "$tree" != "$GREEN_START_TREE" ]; then
+    moved=$(cd "$root" && git diff --name-only "$GREEN_START_TREE" "$tree" 2>/dev/null | tr '\n' ' ') || moved=""
+    { echo "$rel passed, but not on what this checkout now holds: it started on ${GREEN_START_TREE:0:12} and ends on ${tree:0:12}."
+      echo "  moved while it ran: ${moved:-<unnameable>}"
+      echo "  No record is filed — one would name a tree nothing has run on. Run this gate again as the tree is now."
+    } >&2
+    return 1
+  fi
   mkdir -p "$dir" 2>/dev/null || return 0
   scope=${2:-}; scope=${scope//[\"\\]/}
   # …AND WHICH HALF IT WAS. A record of the portable half must never answer an ask about the whole gate, so the
@@ -52,7 +95,9 @@ green_record(){   # $1 = the suite that just passed, as it was invoked ("$0"); $
   printf '{"suite": "%s", "tree": "%s", "scope": "%s", "part": "%s", "at": "%s"}\n' \
     "$rel" "$tree" "$scope" "$part" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     > "$dir/$(basename "$rel")${part:+-$part}-${tree:0:12}.json" 2>/dev/null
-  return 0   # a record is an optimisation and never a result: nothing here can fail a run that passed
+  return 0   # a record WRITTEN is an optimisation and never a result: past the tree check above, nothing here can
+             # fail a run that passed. The tree check is the one thing that can, and it fails a run that passed on
+             # content this checkout no longer holds — which is not the run the record would have claimed.
 }
 
 # HOW FAR A CHANGE REACHES. cc-land hands a suite the paths a PR changes (CC_LAND_CHANGED, space-separated, as git
