@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # cc-green — the tree you are about to hand over, and whether a suite has already passed on THAT tree.
 #
-#   cc-green                 per gate: green on this working copy, or not, and why not. exit 1 if any is not
+#   cc-green                 per gate: green on this working copy, or not, and why not; then the recurring defects
+#                            below. exit 1 if any gate is not green or the diff carries one
 #   cc-green run             …and run the ones that are not, unscoped, one run per worktree, into a log it names.
 #                            exit 3 and no second suite when a run is already going on this root
 #   cc-green wait [SECONDS]  block on that run, SECONDS at most (default 540, under a foreground tool call). Ended,
@@ -47,6 +48,12 @@
 #           will be, so a scoped record is reported as not green and `run` always runs unscoped.
 #   clock   a record is spent for GREEN_TTL and then it is not. A PR that waits longer than that in the queue
 #           loses it, which is not a failure — it is the box refusing to trust a six-hour-old answer.
+#
+# THE RECURRING DEFECTS. The report also looks at the diff against origin/HEAD for each defect class the landing
+# review has stopped two or more PRs for, and a class it finds holds the hand-over like a gate that has not run. No
+# model call. The classes come from the record, not from here: tests/recurring_defects.py counts the recorded
+# LAND-AFTER-FIX reviews (~/.cc/state/land/reviews, and the review-<pr>.md briefs in live track dirs, which it copies
+# there) against config/recurring-defects.json, which says how each class is placed and how it shows in a diff.
 #
 # AND WHAT A GATE MUST READ TO BE RUN HERE AT ALL. A record is written from the WORKING COPY, and spent by a
 # landing that has checked the head out — so a gate reads the files in front of it, never `HEAD`, or it answers a
@@ -353,13 +360,17 @@ main(){
     note_ran "$tree"          # …and only now, so a moved tree gets no note
   fi
   echo "cc-green: what a landing would find on ${tree:0:12}"
-  if report "$r" "$tree"; then
+  local gates=0 defects=0
+  report "$r" "$tree" || gates=1
+  python3 "$CORE/tests/recurring_defects.py" check "$r" || defects=1
+  if [ "$gates$defects" = 00 ]; then
     echo "cc-green: green on ${tree:0:12} — hand over now. Anything you edit from here is a tree nothing has passed on,"
     echo "  and the landing runs every gate above again."
     return 0
   fi
-  echo "cc-green: NOT green on ${tree:0:12}. \`cc-green run\` runs what is missing; the landing will otherwise run it"
-  echo "  for you, on its own queue, where it is the slowest thing in the flow."
+  [ "$defects" = 0 ] || echo "cc-green: the diff carries a defect the review keeps stopping PRs for — fix it, or mark an added line of that file \`recurring-defect-ok: <class> — <why>\`."
+  [ "$gates" = 0 ] || { echo "cc-green: NOT green on ${tree:0:12}. \`cc-green run\` runs what is missing; the landing will otherwise run it"
+                        echo "  for you, on its own queue, where it is the slowest thing in the flow."; }
   return 1
 }
 
@@ -370,6 +381,7 @@ selfcheck(){
   nt(){ if "$@" >/dev/null 2>&1; then echo 1; else echo 0; fi; }   # …and one that must NOT hold: `t !` runs `!` as a command
   D=$(mktemp -d); trap 'rm -rf "$D"' RETURN
   export CC_FAILURES="$D/failures"   # every record a case below writes goes to a scratch ledger, never the box's own
+  export CC_REVIEWS_DIR="$D/reviews" CC_STATE_BASE="$D/state"   # …and the review record the report reads is a scratch one
 
   # A fixture repo with a stub gate of its own. Every case below builds the state it asserts on: nothing here
   # reads this box's record directory, and no real suite is ever run.
@@ -703,6 +715,21 @@ EOS
   k "$(nt kill -0 "$gpid")" "…and the gate goes with it, rather than running on as an orphan"
   k "$(t flock -n "$(ls "$D2"/run-*.lock)" true)" "…so the root's lock is free, and the next run is not a second suite"
   k "$(nt grep -qx check.sh "$D/interrupted.log")" "…and the suite it interrupted never finished"
+  rm -rf "$D2"
+
+  # THE RECURRING DEFECTS: every catalogue class against its own fixtures, then the report holding a hand-over on one.
+  out=$(python3 "$CORE/tests/recurring_defects.py" selftest 2>&1); rc=$?
+  k "$rc" "every recurring-defect class goes red on its fixture diff and holds its suppressed cases ($(tail -1 <<<"$out"))"
+  [ "$rc" = 0 ] || grep -A3 FAIL <<<"$out"
+  D2=$(mktemp -d); R=$(newrepo defects); mkdir -p "$R/bin" "$D/reviews"
+  ( cd "$R" && git update-ref refs/remotes/origin/main HEAD && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  for p in 1 2; do printf 'VERDICT: LAND-AFTER-FIX\n\n1. x:1 — the tick never asks cc-pause is <repo>\n' > "$D/reviews/r-$p-00000000000$p.md"; done
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
+  k "$(t test "$rc" = 0 -a -n "$(grep 'clean   recurring defects' <<<"$out")")" "a green tree whose diff carries no recurring defect is green, and says it looked"
+  printf '#!/usr/bin/env bash\ncc "$repo" "$row" --go "$brief"\n' > "$R/bin/cc-tick"
+  ( cd "$R" && git add -A && git commit -qm tick && CC_GREEN_DIR="$D2" ./core/tests/check.sh ) >/dev/null 2>&1
+  out=$( cd "$R" && CC_GREEN_DIR="$D2" "$SELF" 2>&1 ); rc=$?
+  k "$(t test "$rc" = 1 -a -n "$(grep 'DEFECT  pause-hold-missing at bin/cc-tick:2' <<<"$out")")" "a green tree whose diff launches with no pause check is NOT green, and names the line"
   rm -rf "$D2"
 
   echo "cc-green selfcheck: $((n - f)) passed, $f failed"

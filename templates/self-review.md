@@ -26,6 +26,11 @@ slowest thing in the flow. A gate that long outlives a foreground tool call, so 
 run >/dev/null 2>&1 &` — then `cc-green wait` until its exit is not 3 (still going), and read the log it names; a
 background job that dies with your iteration leaves you with no run and no record.
 
+`cc-green` also reads your diff for each defect class the landing review has stopped two or more PRs for, and names
+the line; a class it names holds the hand-over like a gate that has not run. The classes come from the recorded
+reviews, not from this file — `core/tests/recurring_defects.py` says how. Fix it, or mark an added line of that file
+`recurring-defect-ok: <class> — <why>` when it is answered some other way.
+
 **Fix everything above BEFORE that run, and edit nothing after it.** A doc fix, a comment, a rebuilt artefact —
 each makes a tree nothing has passed on, and reasoning about how harmless it was does not change that. Of the 34
 gate-landings inside one record window on 2026-09-07, 7 spent a record; 11 had run the gate green and then moved
